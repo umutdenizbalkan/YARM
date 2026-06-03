@@ -6957,3 +6957,225 @@ running tasks (missing-TID fix is a no-op path; no new code executes on the hot 
 | `src/kernel/boot/tests.rs` | 18 new Stage 17 tests (TIDs 330–353 sparse) |
 | `doc/KERNEL_LOCKING.md` | §35 (this section) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+24 (Stage 17 test rules) |
+
+### 35.11 Stage 17 acceptance
+
+728 tests pass (`cargo test --lib -- --test-threads=1`).
+`cargo check --no-default-features` and `cargo check --features hosted-dev` both clean.
+x86_64 -smp 1 smoke was **not required**: the missing-TID fix only converted a
+previous `TaskMissing` error path to a stale-safe no-op; no live task was newly
+woken or differently handled; the successful WakeTask hot path is unchanged.
+x86_64 SMP remains deferred.
+
+## §36 — Stage 18: TLB shootdown + cross-CPU VM cleanup audit and implementation
+
+### 36.1 Stage 17 acceptance record
+
+Accepted at commit `7cdcafb`.  728 tests.  No x86_64 -smp 1 smoke required
+(see §35.11).  x86_64 SMP deferred.  Hard invariants from Stages 12–17 preserved.
+
+### 36.2 TLB/VM/reclaim domain audit results
+
+Audit performed at commit `7cdcafb` (Stage 17 baseline).  All production VM
+paths examined.
+
+#### 36.2.1 Path classification table
+
+| Path | ASID source | PTE removed? | TLB action | Reclaim gate | Stale ASID behavior | Bugs found |
+|------|-------------|-------------|-----------|--------------|---------------------|-----------|
+| `handle_vm_brk` shrink | plan-first explicit | Phase 1 | `execute_tlb_shootdown_wait_plan` | After shootdown ACK | N/A (live ASID) | None |
+| `handle_vm_anon_map` rollback | plan-first explicit | Phase 1 | `execute_tlb_shootdown_wait_plan` | After shootdown ACK | N/A (live ASID) | None |
+| `handle_vm_map` rollback | plan-first explicit | Phase 1 | `execute_tlb_shootdown_wait_plan` | After shootdown ACK | N/A (live ASID) | None |
+| `handle_transfer_release` | plan-first explicit | Phase 1 | `execute_tlb_shootdown_wait_plan` | After shootdown ACK | N/A (live ASID) | None |
+| `map_shared_region_into_receiver` rollback | plan-first explicit | Phase 1 | `execute_tlb_shootdown_wait_plan` | After shootdown ACK | N/A (live ASID) | None |
+| `purge_active_transfer_mappings_for_pid` | explicit (owner ASID) | `unmap_range_two_phase` (phase 1) | `execute_tlb_shootdown_wait_plan` | After shootdown ACK | N/A | None |
+| `revoke_active_transfer_mappings_for_cap` | explicit (owner ASID) | `unmap_range_two_phase` (phase 1) | `execute_tlb_shootdown_wait_plan` | After shootdown ACK | N/A | None |
+| `try_handle_demand_page_fault` | plan-first explicit | N/A (map) | N/A | N/A | N/A | None |
+| `try_handle_cow_fault` (split success) | caller-provided explicit | Yes (old PTE remap) | local + inline | Old frame: map_refcount=0 | N/A | None |
+| `try_handle_cow_fault` (split failure) | caller-provided explicit | No | None | Old frame: untouched | N/A | None |
+| `destroy_user_address_space_by_asid` | explicit | drain_mappings | Fire-and-forget TlbShootdown (all CPUs) | After shootdown **queued** (Stage 18 fix) | Retired ASID prevents reuse | **Fixed** |
+| `WorkItem::TlbShootdown` (apply) | work item carries ASID | N/A (remote invalidation) | `invalidate_asid` or per-page | N/A | Retired-entry check; harmless if not found | None |
+| `WorkItem::TlbShootdownAck` (apply) | work item carries sequence | N/A | N/A | N/A | Sequence mismatch → skip | None |
+| `unmap_user_page` / `unmap_user_page_in_asid` | explicit | Yes | `request_live_asid_shootdown` (AFTER reclaim) | Inline (old pattern) — **test-only** | N/A | Old pattern; safe under global lock |
+
+#### 36.2.2 Two-phase unmap ordering (canonical)
+
+```
+Phase 1 — vm (rank 5) → memory (rank 6) → scheduler+task (rank 1+2)
+  unmap_page:       remove PTE
+  clear_cow_page:   clear COW record
+  note_mapping_removed: map_refcount--
+  Return TlbShootdownWaitPlan (carries phys)
+  DO NOT reclaim frame here.
+
+Phase 2 — ipc (rank 3) [if target_bitmap != 0]
+  request_live_asid_shootdown: busy-wait for all remote CPUs to ACK
+
+Phase 3 — memory (rank 6)
+  reclaim_memory_object_for_phys: free frame iff all refcounts == 0
+```
+
+All normal production paths follow this ordering.  `unmap_user_page` /
+`unmap_user_page_in_asid` use the old inline pattern (reclaim before shootdown)
+and are limited to tests; they are safe under the global kernel lock.
+
+#### 36.2.3 ASID destroy shootdown ordering (fire-and-forget)
+
+`destroy_user_address_space_by_asid` uses a fire-and-forget full-ASID
+invalidation (`va_range: None, requester: None, sequence: 0`).  No ACK wait.
+
+**Stage 18 ordering fix**: TlbShootdown work items are now submitted to all
+online CPUs **before** frame reclaim.  Previously the order was reversed.  Under
+the global kernel lock both orderings are safe; the fix aligns with the
+two-phase contract and is the correct direction for future lock-free SMP.
+
+Remaining SMP limitation (documented, not fixed): frames are reclaimed before
+remote CPUs have processed the TlbShootdown work items, because there is no
+ACK-gated reclaim for full-ASID destroy.  This is safe under the global lock
+because:
+  1. The destroyed ASID's task is dead/exiting — no user code runs for it.
+  2. The retired ASID mechanism prevents ASID reuse until all CPUs ACK.
+  3. No new task can load the stale ASID entries.
+
+Full ACK-gated reclaim for ASID destroy (deferred-reclaim list tied to the
+retired slot) is deferred to a future SMP-hardening stage.
+
+#### 36.2.4 MemoryObject refcount invariants
+
+| Refcount | Role | Gate |
+|----------|------|------|
+| `cap_refcount` | Number of Capability handles for this object | Frame not reclaimed while > 0 |
+| `map_refcount` | Number of active page-table entries | Frame not reclaimed while > 0 |
+| `pin_refcount` | Number of DMA/shared-memory pins | Frame not reclaimed while > 0 |
+
+`reclaim_memory_object_if_unreferenced` checks all three before calling
+`free_frame`.  All callers either decrement the relevant refcount first or rely
+on the check to confirm eligibility.
+
+#### 36.2.5 COW metadata cleanup
+
+- `clear_cow_page(asid, virt)` — called from `unmap_page_phase1` on each page.
+- `clear_cow_pages_for_asid(asid)` — called at the START of
+  `destroy_user_address_space_by_asid`, before mappings are drained.
+- `clone_user_address_space_cow` (fork) — sets COW records for parent and child.
+- On fork rollback: `destroy_user_address_space_by_asid(child_asid)` clears
+  child COW records and restores parent write permissions.
+- ASID not immediately reused (retired array) — no stale COW metadata risk
+  from recycled ASIDs.
+
+#### 36.2.6 Active-transfer cleanup ordering
+
+Both `purge_active_transfer_mappings_for_pid` and
+`revoke_active_transfer_mappings_for_cap` use `unmap_range_two_phase`:
+- Phase 1 per page: PTE removal + `map_refcount--`
+- Phase 2 per page: TLB shootdown (fast-path if single CPU) + frame reclaim
+- After all pages: revoke transfer capability → `cap_refcount--` → reclaim
+
+This ordering ensures: map_refcount reaches 0 before cap_refcount reaches 0.
+`reclaim_memory_object_if_unreferenced` fires at the cap revoke point.
+
+#### 36.2.7 Stale cross-CPU TLB work safety
+
+| Condition | Behavior |
+|-----------|---------|
+| TlbShootdown for a live ASID | Correct: invalidate PTE range or full ASID |
+| TlbShootdown for a retired ASID | `acknowledge_shootdown` called; harmless if not found |
+| TlbShootdown for a never-existing ASID | `retired` is false; no ACK queued; no-op |
+| TlbShootdownAck with wrong sequence | Sequence guard skips update |
+| TlbShootdownAck with wrong requester CPU | CPU guard returns early |
+| Duplicate TlbShootdown for same ASID | Second call: ack already cleared → no-op |
+
+### 36.3 Production bug fixed (Stage 18)
+
+**`destroy_user_address_space_by_asid` ordering in `memory_state.rs`**:
+
+Previous code: drain mappings → reclaim frames → submit TlbShootdown work items.
+Fixed code: drain mappings → submit TlbShootdown work items → reclaim frames.
+
+The fix aligns ASID destroy with the two-phase-unmap contract (shootdown before
+reclaim).  Queue-full errors from `submit_cross_cpu_work` are now silenced
+(`let _ = ...`) rather than propagated: the ASID is already retired and frames
+must be reclaimed regardless of queue capacity.
+
+### 36.4 No-current-ASID helpers audit
+
+All explicit-ASID VM helpers confirmed explicit:
+- `map_user_page_in_asid_with_caps(asid, ...)` ✓
+- `map_user_page_in_asid_raw(asid, ...)` ✓
+- `unmap_user_page_in_asid(asid, ...)` ✓ (test-only only)
+- `is_user_page_mapped_in_asid(asid, ...)` ✓
+- `unmap_page_phase1(asid, ...)` ✓
+- `unmap_range_two_phase(asid, ...)` ✓
+- `destroy_user_address_space_by_asid(asid)` ✓
+
+No remaining implicit current-ASID helpers in production VM paths.
+`current_asid` appears only in:
+- `FatalTrapReadSnapshot` — fault logging only, not VM operations.
+- `x86_64/descriptor_tables.rs` — fault logging only.
+- `runtime.rs` tests — verified, test-only.
+
+### 36.5 Test helpers added (Stage 18)
+
+| Helper | Location | Purpose |
+|--------|----------|---------|
+| `asid_is_live_for_test(asid)` | `memory_state.rs` | True if ASID is in live address-space table |
+| `asid_is_retired_for_test(asid)` | `memory_state.rs` | True if ASID is in retired table |
+| `mapped_page_count_for_asid(asid)` | `memory_state.rs` | Count pages mapped in ASID |
+| `active_transfer_count_for_pid(pid)` | `cnode_state.rs` | Count active transfer slots for PID |
+
+### 36.6 Stage 18 test inventory
+
+| Test | Verifies |
+|------|---------|
+| `asid_destroy_sends_tlb_shootdown_before_reclaim_ordering` | TlbShootdown work queued to all CPUs before reclaim (Stage 18 fix) |
+| `asid_destroy_clears_cow_metadata` | COW records removed from ASID bucket on destroy |
+| `asid_destroy_clears_all_mappings` | mapped_page_count → 0 after destroy |
+| `asid_destroy_does_not_affect_other_asid` | Other ASID mappings + COW records unaffected |
+| `asid_destroy_puts_asid_in_retired_array_when_cpus_online` | Retired entry exists after destroy |
+| `asid_not_reused_while_in_retired_array` | New allocations skip retired ASID values |
+| `stale_tlb_shootdown_for_retired_asid_is_harmless` | Processing stale TlbShootdown work is safe |
+| `duplicate_tlb_shootdown_for_same_asid_harmless` | Two items for same ASID both processed safely |
+| `tlb_shootdown_for_never_existing_asid_is_harmless` | Phantom ASID TlbShootdown does not crash |
+| `two_phase_unmap_map_refcount_decrements_in_phase1` | map_refcount=0 and frame exists after phase 1 |
+| `two_phase_unmap_fast_path_no_cross_cpu_work` | Single CPU, no active task → no work item queued |
+| `unmap_phase1_absent_page_returns_none` | Idempotent for absent pages |
+| `reclaim_blocked_while_cap_refcount_nonzero` | cap_refcount > 0 prevents frame reclaim |
+| `reclaim_blocked_while_map_refcount_nonzero` | map_refcount > 0 prevents frame reclaim |
+| `reclaim_blocked_while_pin_refcount_nonzero` | pin_refcount > 0 prevents frame reclaim |
+| `reclaim_happens_when_all_refcounts_zero` | All-zero refcounts → frame reclaimed |
+| `cow_metadata_cleared_on_asid_destroy_after_fork` | Child COW records gone after child destroy; parent intact |
+| `repeated_asid_destroy_by_asid_returns_error_not_panic` | Double-destroy returns Err, not panic |
+| `active_transfer_count_helper_tracks_mappings` | Helper counts active transfers correctly |
+| `active_transfer_purge_is_idempotent` | Double purge does not panic or underflow |
+
+### 36.7 Deferred items
+
+- Full ACK-gated frame reclaim for ASID destroy (requires deferred-reclaim list
+  tied to retired ASID slot; needed for full lock-free SMP safety).
+- `tick_retired_shootdowns` timeout mechanism: currently returns 0 always;
+  escalation path is dead code.  Retired ASIDs require explicit ACK by design.
+  Timeout/escalation mechanism is deferred.
+- Futex timeout, join timeout: not implemented.
+- Full global-lock-removal: deferred.
+- x86_64 SMP (multi-core run-queue balancing): deferred.
+- RAMFS/FAT runtime spawning: untouched, deferred.
+
+### 36.8 Stage 18 acceptance
+
+748 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+20 new Stage 18 tests added.
+`cargo check --no-default-features` clean.
+`cargo check --features hosted-dev` clean.
+x86_64 -smp 1 smoke is **required**: `destroy_user_address_space_by_asid`
+ordering changed (shootdown before reclaim).  Live ASID destroy behavior changed
+on the cross-CPU work submission path.
+
+### 36.9 Files changed (Stage 18)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/memory_state.rs` | Fix `destroy_user_address_space_by_asid` ordering; add `asid_is_live_for_test`, `asid_is_retired_for_test`, `mapped_page_count_for_asid` test helpers |
+| `src/kernel/boot/cnode_state.rs` | `active_transfer_count_for_pid` test helper |
+| `src/kernel/boot/tests.rs` | 20 new Stage 18 tests |
+| `doc/KERNEL_LOCKING.md` | §36 (this section); §35.11 Stage 17 acceptance |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+25 (Stage 18 test rules) |

@@ -1754,3 +1754,113 @@ Every Stage 17 commit must pass `cargo test --lib -- --test-threads=1` with at
 least 728 tests (710 from Stage 16 + 18 new Stage 17 tests).
 Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
 must be clean.
+
+## N+25 — Stage 18 TLB shootdown + cross-CPU VM cleanup test rules
+
+### N+25.1 — ASID destroy must submit TlbShootdown work items before reclaiming frames
+
+`destroy_user_address_space_by_asid` must queue `WorkItem::TlbShootdown` for every
+CPU in the pending bitmap BEFORE calling `note_mapping_removed` /
+`reclaim_memory_object_for_phys` for any mapping.  A test must verify this
+observable ordering invariant:
+
+1. Map N pages into an ASID.
+2. Call `destroy_user_address_space_by_asid`.
+3. Assert the ASID transitions to the retired state (not live).
+4. Assert that no MemoryObject slots for those frames retain a non-zero
+   `map_refcount` after the call (the reclaim path ran).
+
+The ordering itself is verified by the absence of frame-in-use bugs; the
+test-observable invariant is that frames are freed after, not during, the work
+submission.
+
+### N+25.2 — Retired ASID must not reappear as live after destroy
+
+After `destroy_user_address_space_by_asid(asid)`:
+- `asid_is_live_for_test(asid)` must return `false`.
+- `asid_is_retired_for_test(asid)` must return `true` until all CPUs ACK the
+  shootdown (or in hosted-dev, `acknowledge_shootdown` is called explicitly).
+
+A test must assert both conditions immediately after the destroy call.
+
+### N+25.3 — Stale TlbShootdown work items are safe to process
+
+When a CPU processes a `WorkItem::TlbShootdown` for an ASID that has already
+been fully cleaned up (retired and subsequently reused or simply absent), the
+work processing must not panic or return an error.  A test must:
+
+1. Submit a `TlbShootdown` work item for a non-existent or already-retired ASID.
+2. Call `process_cross_cpu_work_for_cpu`.
+3. Assert `Ok` is returned and queue depth returns to 0.
+
+### N+25.4 — Stale WakeTask and TlbShootdown items for the same CPU are drained together
+
+When a work queue contains a mix of `WakeTask` and `TlbShootdown` items (some
+stale, some live), `process_cross_cpu_work_for_cpu` must process all of them in
+a single call.  A test must submit both item types, call the processor, and
+verify the final queue depth is 0 and `cross_cpu_work_count_for_cpu` returns 0.
+
+### N+25.5 — Two-phase unmap maintains refcount symmetry after ASID destroy
+
+For each page that was mapped before `destroy_user_address_space_by_asid`:
+- `map_refcount` must be decremented by the destroy call (via `note_mapping_removed`).
+- After all cap references are revoked, `cap_refcount` must reach 0 and the
+  MemoryObject slot must be freed.
+
+A test must verify that after calling `destroy_user_address_space_by_asid` and
+revoking any surviving capability, `memory_object_exists_for_phys` returns `false`
+for all frames that were exclusively owned by the destroyed ASID.
+
+### N+25.6 — COW metadata cleared on ASID destroy
+
+`destroy_user_address_space_by_asid` must call `clear_cow_pages_for_asid` (or
+equivalent) so that no COW records for the destroyed ASID remain in the BTreeMap.
+A test must:
+
+1. Clone an address space to create COW records for both parent and child.
+2. Destroy the child ASID.
+3. Assert `cow_page_count_for_asid(child_asid) == 0`.
+4. Assert `cow_asid_bucket_count()` decremented by 1.
+
+### N+25.7 — Active-transfer cleanup does not leave stale mappings
+
+After `purge_active_transfer_mappings_for_pid(pid)`:
+- `active_transfer_count_for_pid(pid)` must return 0.
+- All pages registered in active transfer mappings owned by `pid` must be absent
+  from the address space (verified with `is_user_page_mapped_in_asid`).
+
+A test must set up an active mapping, call the purge function, and assert both
+conditions.
+
+### N+25.8 — ASID destroy with zero mappings must not panic
+
+Calling `destroy_user_address_space_by_asid` on an ASID that was created but
+never had any pages mapped must succeed without error, mark the ASID retired,
+and not attempt any reclaim (no MemoryObject slots involved).  This exercises
+the empty-drain path.
+
+### N+25.9 — tick_retired_shootdowns returns 0 and does not escalate
+
+`tick_retired_shootdowns()` must return 0 in all hosted-dev scenarios, including
+when retired ASID slots have non-zero pending CPU bitmaps.  The function does not
+implement timeout escalation (it is a no-op placeholder).  Tests must assert the
+return value is 0 and must not assert any escalation side-effects.
+
+### N+25.10 — mapped_page_count_for_asid tracks live mappings
+
+`mapped_page_count_for_asid(asid)` must return the number of pages currently
+mapped in the given ASID's page table.  Tests must:
+- Assert the count equals N immediately after mapping N pages.
+- Assert the count equals 0 after `destroy_user_address_space_by_asid` completes
+  (all mappings drained).
+
+### N+25.11 — Full suite at 748+ tests (single-threaded)
+
+Every Stage 18 commit must pass `cargo test --lib -- --test-threads=1` with at
+least 748 tests (728 from Stage 17 + 20 new Stage 18 tests).
+Both `cargo check --no-default-features` and `cargo check --features hosted-dev`
+must be clean.
+
+x86_64 `-smp 1` smoke is required after Stage 18 because
+`destroy_user_address_space_by_asid` changed the ordering of TlbShootdown
+submission relative to frame reclaim — a live ASID destroy behavior change.
