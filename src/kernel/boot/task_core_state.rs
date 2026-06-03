@@ -89,6 +89,27 @@ impl KernelState {
         matches!(self.task_status(tid), Some(TaskStatus::Exited(_)))
     }
 
+    /// Return true if the task is in `TaskStatus::Runnable`.
+    #[cfg(test)]
+    pub(crate) fn task_is_runnable(&self, tid: u64) -> bool {
+        self.task_status(tid) == Some(TaskStatus::Runnable)
+    }
+
+    /// Return true if the task is in `TaskStatus::Blocked(_)`.
+    #[cfg(test)]
+    pub(crate) fn task_is_blocked(&self, tid: u64) -> bool {
+        matches!(self.task_status(tid), Some(TaskStatus::Blocked(_)))
+    }
+
+    /// Return the `WaitReason` if the task is `Blocked`, else `None`.
+    #[cfg(test)]
+    pub(crate) fn task_blocked_reason(&self, tid: u64) -> Option<crate::kernel::task::WaitReason> {
+        match self.task_status(tid) {
+            Some(TaskStatus::Blocked(reason)) => Some(reason),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn cspace_for_cnode(&self, cnode: CNodeId) -> Option<&CapabilitySpace> {
         self.capability

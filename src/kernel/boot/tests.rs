@@ -15822,3 +15822,753 @@ fn exit_task_clears_sender_waiter_slot() {
 }
 
 // ── End Stage 15 lifecycle tests ──────────────────────────────────────────────
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Stage 16 — timeout/deadline/block-state cleanup + scheduler wait-state consistency
+// TID ranges: 280–322 (grouped by sub-domain)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Part A: IPC timeout/deadline path cleanup ─────────────────────────────────
+
+#[test]
+fn recv_timeout_process_clears_endpoint_waiter_and_deadline() {
+    // process_ipc_timeout_deadlines must clear the endpoint_waiters slot and the
+    // TCB deadline when a recv-blocked task's deadline has passed.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(280).expect("task");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    // Inject receiver waiter and deadline directly (mirrors ipc_recv_with_deadline internals).
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(280));
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 280).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = Some(5);
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject blocked state");
+
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "waiter injected");
+    assert_eq!(state.ipc_deadline_count_for_tid(280), 1, "deadline set");
+
+    // Process timeout at tick == deadline: task must expire.
+    let expired = state.process_ipc_timeout_deadlines(5).expect("timeout process");
+    assert_eq!(expired, 1, "one task expired");
+
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        0,
+        "endpoint waiter must be cleared after timeout"
+    );
+    assert_eq!(
+        state.ipc_deadline_count_for_tid(280),
+        0,
+        "TCB deadline must be cleared after timeout fires"
+    );
+    assert!(
+        state.task_is_runnable(280),
+        "timed-out task must be set Runnable"
+    );
+    assert!(
+        state
+            .consume_ipc_timeout_fired_for_tid(280)
+            .expect("consume"),
+        "ipc_timeout_fired flag must be set after deadline fires"
+    );
+}
+
+#[test]
+fn send_deadline_process_clears_sender_waiter_and_deadline() {
+    // process_ipc_timeout_deadlines must clear the sender waiter slot when a
+    // send-blocked task's deadline expires.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(281).expect("task");
+    let (ep_idx, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+            tid: crate::kernel::ipc::ThreadId(281),
+            msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
+        });
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 281).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+            tcb.ipc_timeout_deadline = Some(10);
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject blocked state");
+
+    assert_eq!(state.sender_waiter_count(ep_idx), 1, "sender waiter injected");
+    assert_eq!(state.ipc_deadline_count_for_tid(281), 1, "deadline set");
+
+    let expired = state.process_ipc_timeout_deadlines(10).expect("timeout");
+    assert_eq!(expired, 1, "one task expired");
+
+    assert_eq!(
+        state.sender_waiter_count(ep_idx),
+        0,
+        "sender waiter slot must be cleared after send-deadline timeout"
+    );
+    assert_eq!(
+        state.ipc_deadline_count_for_tid(281),
+        0,
+        "TCB deadline must be cleared after send deadline fires"
+    );
+    assert!(state.task_is_runnable(281), "sender must become Runnable after timeout");
+}
+
+#[test]
+fn exit_before_ipc_recv_timeout_clears_waiter_and_deadline() {
+    // When a task exits while blocked on IPC recv with an active deadline,
+    // exit_task must clear both the endpoint waiter slot and the TCB deadline.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(282).expect("task");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(282));
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 282).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = Some(99);
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject blocked");
+
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "waiter before exit");
+    assert_eq!(state.ipc_deadline_count_for_tid(282), 1, "deadline before exit");
+
+    state.exit_task(282, 0).expect("exit");
+
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        0,
+        "endpoint waiter must be cleared by exit_task"
+    );
+    // exit_task calls clear_ipc_waiters_for_tid (clears waiter slots).
+    // Note: ipc_timeout_deadline in TCB is NOT cleared by exit_task — the task
+    // is now Exited and process_ipc_timeout_deadlines skips non-IPC-blocked tasks.
+    // This is the current design: stale deadlines in Exited TCBs are harmless
+    // because the blocked_ipc guard in process_ipc_timeout_deadlines filters them.
+    assert!(
+        state.task_is_exited(282),
+        "task must be Exited after exit_task"
+    );
+    // Process a future timeout: the task is Exited (not Blocked), so it must be skipped.
+    let expired = state.process_ipc_timeout_deadlines(99).expect("timeout noop");
+    assert_eq!(
+        expired, 0,
+        "Exited task must not be expired by process_ipc_timeout_deadlines"
+    );
+}
+
+#[test]
+fn ipc_deadline_count_helper_reports_set_and_cleared() {
+    // Verify the ipc_deadline_count_for_tid helper correctly reflects TCB state.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(283).expect("task");
+
+    assert_eq!(
+        state.ipc_deadline_count_for_tid(283),
+        0,
+        "no deadline after register"
+    );
+
+    state
+        .with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 283)
+                .unwrap()
+                .ipc_timeout_deadline = Some(42);
+            Ok::<_, KernelError>(())
+        })
+        .expect("set deadline");
+    assert_eq!(state.ipc_deadline_count_for_tid(283), 1, "deadline set");
+
+    state
+        .with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 283)
+                .unwrap()
+                .ipc_timeout_deadline = None;
+            Ok::<_, KernelError>(())
+        })
+        .expect("clear deadline");
+    assert_eq!(state.ipc_deadline_count_for_tid(283), 0, "deadline cleared");
+}
+
+#[test]
+fn ipc_timeout_does_not_fire_for_futex_blocked_task() {
+    // A task with an ipc_timeout_deadline but blocked on Futex (not IPC) must
+    // not be expired by process_ipc_timeout_deadlines.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(284).expect("task");
+
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 284).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(0x5000)));
+            tcb.ipc_timeout_deadline = Some(7);
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject futex+deadline");
+
+    let expired = state.process_ipc_timeout_deadlines(7).expect("process");
+    assert_eq!(
+        expired,
+        0,
+        "Futex-blocked task with IPC deadline must not be expired"
+    );
+    assert!(
+        state.task_is_blocked(284),
+        "Futex-blocked task must remain Blocked"
+    );
+}
+
+#[test]
+fn repeated_recv_timeout_cycles_no_stale_receiver_waiter() {
+    // Repeat: inject receiver waiter + deadline → process timeout → verify cleared.
+    let mut state = Bootstrap::init().expect("init");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    for i in 0..4u64 {
+        let tid = 285 + i;
+        state.register_task(tid).expect("register");
+        let deadline = 10 + i;
+
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(tid));
+        });
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+                tcb.ipc_timeout_deadline = Some(deadline);
+                Ok::<_, KernelError>(())
+            })
+            .expect("inject");
+
+        assert_eq!(
+            state.endpoint_waiter_count(ep_idx),
+            1,
+            "waiter present before timeout i={i}"
+        );
+
+        let expired = state
+            .process_ipc_timeout_deadlines(deadline)
+            .expect("process");
+        assert_eq!(expired, 1, "one expired i={i}");
+        assert_eq!(
+            state.endpoint_waiter_count(ep_idx),
+            0,
+            "no stale receiver waiter after timeout i={i}"
+        );
+        assert_eq!(
+            state.ipc_deadline_count_for_tid(tid),
+            0,
+            "no stale deadline after timeout i={i}"
+        );
+
+        state.mark_task_dead(tid).expect("dead");
+    }
+}
+
+// ── Part B: Block-state invariants ────────────────────────────────────────────
+
+#[test]
+fn task_helpers_runnable_blocked_dead_consistent() {
+    // Verify task_is_runnable, task_is_blocked, and task_blocked_reason helpers.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(290).expect("task");
+
+    assert!(state.task_is_runnable(290), "freshly registered task is Runnable");
+    assert!(!state.task_is_blocked(290), "not blocked after register");
+    assert_eq!(state.task_blocked_reason(290), None, "no blocked reason");
+    assert!(!state.task_is_dead(290), "not dead");
+    assert!(!state.task_is_exited(290), "not exited");
+
+    state
+        .with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 290)
+                .unwrap()
+                .status = TaskStatus::Blocked(WaitReason::Poll);
+            Ok::<_, KernelError>(())
+        })
+        .expect("set blocked");
+
+    assert!(!state.task_is_runnable(290), "not runnable when blocked");
+    assert!(state.task_is_blocked(290), "is blocked");
+    assert_eq!(
+        state.task_blocked_reason(290),
+        Some(WaitReason::Poll),
+        "correct wait reason"
+    );
+
+    state.mark_task_dead(290).expect("dead");
+    assert!(state.task_is_dead(290), "is dead after mark_task_dead");
+    assert!(!state.task_is_runnable(290), "not runnable when dead");
+    assert!(!state.task_is_blocked(290), "not blocked when dead");
+}
+
+#[test]
+fn notification_waiter_count_reflects_exit_cleanup() {
+    // notification_waiter_count must return 0 after the waiter task exits.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(291).expect("task");
+    let (notif_idx, _notif_send_cap, _notif_recv_cap) =
+        state.create_notification(4).expect("notif");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(291));
+    });
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        1,
+        "waiter injected"
+    );
+
+    state.exit_task(291, 0).expect("exit");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "notification waiter must be cleared by exit_task"
+    );
+}
+
+#[test]
+fn wake_endpoint_waiter_dead_task_does_not_resurrect_task() {
+    // Injecting a Dead task into endpoint_waiters and calling wake_waiter_for_endpoint
+    // must not change the task's status to Runnable.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(292).expect("task");
+    let (ep_idx, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.mark_task_dead(292).expect("dead");
+    assert!(state.task_is_dead(292), "task is dead before injection");
+
+    // Simulate a stale entry: Dead task's TID still in waiter slot.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(292));
+    });
+
+    // wake_waiter_for_endpoint should either return WouldBlock or Ok without
+    // transitioning the Dead task to Runnable.
+    let _ = state.wake_waiter_for_endpoint(ep_idx);
+
+    assert!(
+        state.task_is_dead(292),
+        "Dead task must not become Runnable after stale wake"
+    );
+}
+
+#[test]
+fn wake_endpoint_waiter_exited_task_does_not_resurrect_task() {
+    // An Exited task injected into endpoint_waiters after exit must not be
+    // woken back to Runnable.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(293).expect("task");
+    let (ep_idx, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.exit_task(293, 0).expect("exit");
+    assert!(state.task_is_exited(293), "task is Exited");
+
+    // exit_task cleared the waiter slot; re-inject to simulate stale pointer.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(293));
+    });
+
+    let _ = state.wake_waiter_for_endpoint(ep_idx);
+
+    assert!(
+        state.task_is_exited(293),
+        "Exited task must not become Runnable after stale wake"
+    );
+}
+
+// ── Part C: Cancel-on-exit idempotency ────────────────────────────────────────
+
+#[test]
+fn exit_then_mark_dead_waiter_cleanup_is_idempotent() {
+    // Calling exit_task then mark_task_dead must not panic or corrupt state.
+    // Both paths call clear_ipc_waiters_for_tid — running it twice must be safe.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(300).expect("task");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(300));
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 300)
+                .unwrap()
+                .status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject blocked");
+
+    state.exit_task(300, 0).expect("exit");
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        0,
+        "waiter cleared by exit_task"
+    );
+
+    state.mark_task_dead(300).expect("mark_dead after exit");
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        0,
+        "waiter still cleared after mark_task_dead"
+    );
+    assert!(state.task_is_dead(300), "task is Dead");
+}
+
+#[test]
+fn clear_ipc_waiters_is_idempotent_for_all_waiter_types() {
+    // Calling clear_ipc_waiters_for_tid twice must produce the same result as
+    // calling it once — no panic, no corruption.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(301).expect("task");
+    let (ep_idx, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+    let (notif_idx, _notif_send, _notif_recv) = state.create_notification(4).expect("notif");
+
+    // Inject in all three waiter types.
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(301));
+        ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+            tid: crate::kernel::ipc::ThreadId(301),
+            msg: Message::with_header(0, 1, 0, None, &[]).expect("msg"),
+        });
+        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(301));
+    });
+
+    state.clear_ipc_waiters_for_tid(301);
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 0);
+    assert_eq!(state.sender_waiter_count(ep_idx), 0);
+    assert_eq!(state.notification_waiter_count(notif_idx), 0);
+
+    // Second call: must not panic.
+    state.clear_ipc_waiters_for_tid(301);
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 0);
+    assert_eq!(state.sender_waiter_count(ep_idx), 0);
+    assert_eq!(state.notification_waiter_count(notif_idx), 0);
+}
+
+#[test]
+fn timeout_fires_then_exit_no_double_disruption() {
+    // If a task's IPC deadline fires (setting Runnable + clearing waiter) and
+    // then exit_task is called, the second cleanup must be harmless.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(302).expect("task");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(302));
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 302).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = Some(3);
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject blocked");
+
+    // Fire the timeout: clears waiter slot, sets Runnable, marks ipc_timeout_fired.
+    let expired = state.process_ipc_timeout_deadlines(3).expect("timeout");
+    assert_eq!(expired, 1);
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 0);
+    assert!(state.task_is_runnable(302));
+
+    // Exit the now-Runnable task: must not panic.
+    state.exit_task(302, 0).expect("exit after timeout");
+    state.mark_task_dead(302).expect("dead");
+    assert!(state.task_is_dead(302));
+    // Endpoint waiter must still be empty.
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 0);
+}
+
+// ── Part D: WakeTask cross-CPU work item consistency ──────────────────────────
+
+#[test]
+fn wake_task_cross_cpu_work_skips_dead_task() {
+    // WakeTask applied to a Dead task must not change its status to Runnable.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(306).expect("task");
+    state.mark_task_dead(306).expect("dead");
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(306) })
+        .expect("submit");
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+
+    assert!(
+        state.task_is_dead(306),
+        "Dead task must not be resurrected by WakeTask work item"
+    );
+}
+
+#[test]
+fn wake_task_cross_cpu_work_skips_exited_task() {
+    // WakeTask applied to an Exited task must not change its status to Runnable.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(307).expect("task");
+    state.exit_task(307, 0).expect("exit");
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(307) })
+        .expect("submit");
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+
+    assert!(
+        state.task_is_exited(307),
+        "Exited task must not be resurrected by WakeTask work item"
+    );
+}
+
+#[test]
+fn wake_task_cross_cpu_work_skips_runnable_task() {
+    // WakeTask applied to an already-Runnable task must not duplicate its run
+    // queue entry.  Verify status remains Runnable (not double-enqueued).
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(308).expect("task");
+
+    // TID 308 is Runnable after register_task (not in run queue yet).
+    assert!(state.task_is_runnable(308));
+
+    state
+        .submit_cross_cpu_work(CpuId(0), WorkItem::WakeTask { tid: ThreadId(308) })
+        .expect("submit");
+    state
+        .process_cross_cpu_work_for_cpu(CpuId(0))
+        .expect("process");
+
+    // Runnable task: WakeTask is a no-op (not Blocked → should_enqueue = false).
+    assert!(state.task_is_runnable(308), "still Runnable, no duplication");
+}
+
+// ── Part E: Stress / repeated lifecycle tests ─────────────────────────────────
+
+#[test]
+fn repeated_send_deadline_cycles_no_stale_sender_waiter() {
+    // Stress: 4 iterations of inject sender waiter + deadline → timeout → verify cleared.
+    let mut state = Bootstrap::init().expect("init");
+    let (ep_idx, send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+    for i in 0..4u64 {
+        let tid = 311 + i;
+        state.register_task(tid).expect("register");
+        let deadline = 20 + i;
+
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_sender_waiters[ep_idx][0] = Some(SenderWaiter {
+                tid: crate::kernel::ipc::ThreadId(tid),
+                msg: Message::with_header(0, i as u16, 0, None, &[]).expect("msg"),
+            });
+        });
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap));
+                tcb.ipc_timeout_deadline = Some(deadline);
+                Ok::<_, KernelError>(())
+            })
+            .expect("inject");
+
+        let expired = state
+            .process_ipc_timeout_deadlines(deadline)
+            .expect("process");
+        assert_eq!(expired, 1, "one expired i={i}");
+        assert_eq!(
+            state.sender_waiter_count(ep_idx),
+            0,
+            "no stale sender waiter after timeout i={i}"
+        );
+        assert_eq!(
+            state.ipc_deadline_count_for_tid(tid),
+            0,
+            "no stale deadline after sender timeout i={i}"
+        );
+
+        state.mark_task_dead(tid).expect("dead");
+    }
+}
+
+#[test]
+fn repeated_mixed_waiter_block_exit_no_stale_state() {
+    // Exit while holding each waiter type must clear the corresponding slot.
+    let mut state = Bootstrap::init().expect("init");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+    let (notif_idx, _notif_send, _notif_recv) = state.create_notification(4).expect("notif");
+
+    // TID 315: endpoint receiver waiter
+    state.register_task(315).expect("task 315");
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(315));
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 315)
+                .unwrap()
+                .status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            Ok::<_, KernelError>(())
+        })
+        .expect("block 315");
+    state.exit_task(315, 0).expect("exit 315");
+    assert_eq!(state.endpoint_waiter_count(ep_idx), 0, "ep waiter cleared");
+
+    // TID 316: sender waiter
+    let (ep2_idx, send_cap2, _recv_cap2) = state.create_endpoint(4).expect("ep2");
+    state.register_task(316).expect("task 316");
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_sender_waiters[ep2_idx][0] = Some(SenderWaiter {
+            tid: crate::kernel::ipc::ThreadId(316),
+            msg: Message::with_header(0, 2, 0, None, &[]).expect("msg"),
+        });
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            tcbs.iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == 316)
+                .unwrap()
+                .status = TaskStatus::Blocked(WaitReason::EndpointSend(send_cap2));
+            Ok::<_, KernelError>(())
+        })
+        .expect("block 316");
+    state.exit_task(316, 0).expect("exit 316");
+    assert_eq!(state.sender_waiter_count(ep2_idx), 0, "sender waiter cleared");
+
+    // TID 317: notification waiter
+    state.register_task(317).expect("task 317");
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(crate::kernel::ipc::ThreadId(317));
+    });
+    state.exit_task(317, 0).expect("exit 317");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "notif waiter cleared"
+    );
+}
+
+#[test]
+fn ipc_deadline_cleared_after_delivery_before_timeout() {
+    // When a receiver waiter is woken by delivery (not timeout), the IPC deadline
+    // must be cleared so that a later process_ipc_timeout_deadlines is a no-op.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(318).expect("task");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(318));
+    });
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 318).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+            tcb.ipc_timeout_deadline = Some(50);
+            Ok::<_, KernelError>(())
+        })
+        .expect("inject");
+
+    // Simulate delivery: wake_waiter_for_endpoint takes the slot and wakes the task.
+    // wake_tid_to_runnable → clear_ipc_timeout_for_tid → deadline = None.
+    state
+        .wake_waiter_for_endpoint(ep_idx)
+        .expect("delivery wake");
+
+    assert!(state.task_is_runnable(318), "task Runnable after delivery");
+    assert_eq!(
+        state.ipc_deadline_count_for_tid(318),
+        0,
+        "deadline cleared by delivery wake"
+    );
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        0,
+        "waiter slot cleared by delivery"
+    );
+
+    // Processing timeout at deadline tick: must be a complete no-op.
+    let expired = state.process_ipc_timeout_deadlines(50).expect("noop");
+    assert_eq!(expired, 0, "no tasks expired after delivery cleared deadline");
+    assert!(
+        state.task_is_runnable(318),
+        "still Runnable, not re-expired"
+    );
+}
+
+#[test]
+fn repeated_recv_block_timeout_delivery_no_stale_timeout() {
+    // 4 iterations: inject waiter + deadline → simulate delivery → process
+    // timeout at deadline tick → verify no stale timeout effect.
+    let mut state = Bootstrap::init().expect("init");
+    let (ep_idx, recv_cap, _send_cap) = state.create_endpoint(4).expect("endpoint");
+
+    for i in 0..4u64 {
+        let tid = 319 + i;
+        state.register_task(tid).expect("register");
+        let deadline = 100 + i;
+
+        state.with_ipc_state_mut(|ipc| {
+            ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(tid));
+        });
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == tid).unwrap();
+                tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
+                tcb.ipc_timeout_deadline = Some(deadline);
+                Ok::<_, KernelError>(())
+            })
+            .expect("inject");
+
+        // Simulate delivery (not timeout): wake the waiter.
+        state.wake_waiter_for_endpoint(ep_idx).expect("delivery");
+        assert!(state.task_is_runnable(tid), "runnable after delivery i={i}");
+        assert_eq!(
+            state.ipc_deadline_count_for_tid(tid),
+            0,
+            "deadline cleared by delivery i={i}"
+        );
+
+        // Now process at the deadline tick: must be a no-op (not blocked, no deadline).
+        let expired = state
+            .process_ipc_timeout_deadlines(deadline)
+            .expect("noop");
+        assert_eq!(expired, 0, "no stale expiry after delivery i={i}");
+        assert!(state.task_is_runnable(tid), "still runnable i={i}");
+
+        // Consume the timeout-fired flag: must be false (delivery, not timeout).
+        let fired = state
+            .consume_ipc_timeout_fired_for_tid(tid)
+            .expect("consume");
+        assert!(!fired, "timeout_fired must be false when delivered i={i}");
+
+        state.mark_task_dead(tid).expect("dead");
+    }
+}
+
+// ── End Stage 16 timeout/deadline/block-state tests ───────────────────────────

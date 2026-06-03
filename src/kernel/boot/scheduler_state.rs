@@ -412,16 +412,24 @@ impl KernelState {
                 Ok(())
             }
             WorkItem::WakeTask { tid } => {
-                self.with_tcbs_mut(|tcbs| {
+                // Guard: only transition Blocked → Runnable.  Dead/Exited/Runnable/Running
+                // tasks must not be forcibly re-enqueued by a stale cross-CPU wake item.
+                let should_enqueue = self.with_tcbs_mut(|tcbs| {
                     let tcb = tcbs
                         .iter_mut()
                         .flatten()
                         .find(|tcb| tcb.tid.0 == tid.0)
                         .ok_or(KernelError::TaskMissing)?;
+                    if !matches!(tcb.status, TaskStatus::Blocked(_)) {
+                        return Ok::<bool, KernelError>(false);
+                    }
                     tcb.status = TaskStatus::Runnable;
-                    Ok::<_, KernelError>(())
+                    Ok(true)
                 })?;
-                self.enqueue_on_cpu(cpu, tid.0)
+                if should_enqueue {
+                    self.enqueue_on_cpu(cpu, tid.0)?;
+                }
+                Ok(())
             }
         }
     }
