@@ -84,6 +84,28 @@ impl KernelState {
         });
     }
 
+    /// Stage 20: clear a previously-set waiter Reply CapId in the global record.
+    ///
+    /// Called by `rollback_materialized_recv_cap` when a recv-delivery copy fails
+    /// after the Reply cap was materialized: the receiver-cnode slot is being
+    /// fast-revoked, so the global record must no longer reference it.  Leaves the
+    /// `ReplyCapRecord` itself intact (the reply is still live and re-deliverable);
+    /// only the stale waiter_cap_id is dropped.  Generation-guarded so a stale call
+    /// cannot disturb a record that was already reused.
+    pub(crate) fn clear_reply_cap_waiter_cap(&mut self, reply_index: usize, reply_generation: u64) {
+        self.with_ipc_state_mut(|ipc| {
+            if reply_index >= super::MAX_REPLY_CAPS {
+                return;
+            }
+            if ipc.reply_cap_generations[reply_index] != reply_generation {
+                return;
+            }
+            if let Some(record) = &mut ipc.reply_caps[reply_index] {
+                record.waiter_cap_id = None;
+            }
+        });
+    }
+
     pub(crate) fn revoke_reply_caps_for_caller(&mut self, caller_tid: u64) -> usize {
         self.with_ipc_state_mut(|ipc| {
             let mut revoked = 0usize;
@@ -124,6 +146,29 @@ impl KernelState {
                 }
             }
         });
+    }
+
+    /// Return the `waiter_cap_id` recorded in the global `ReplyCapRecord` at
+    /// `reply_index`, or `None` if the slot is empty or the field is unset.
+    #[cfg(test)]
+    pub(crate) fn reply_cap_record_waiter_cap(&self, reply_index: usize) -> Option<CapId> {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(reply_index)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|record| record.waiter_cap_id)
+        })
+    }
+
+    /// Return whether the global `ReplyCapRecord` at `reply_index` is present.
+    #[cfg(test)]
+    pub(crate) fn reply_cap_record_present(&self, reply_index: usize) -> bool {
+        self.with_ipc_state(|ipc| {
+            ipc.reply_caps
+                .get(reply_index)
+                .map(|slot| slot.is_some())
+                .unwrap_or(false)
+        })
     }
 
     /// Count non-None endpoint_waiters slots for test assertions.

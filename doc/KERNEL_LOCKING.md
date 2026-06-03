@@ -7265,3 +7265,186 @@ accounting in hosted-dev paths; no cross-CPU or live-boot behavior changed.
 | `src/kernel/boot/tests.rs` | 9 new Stage 19 cap/cnode domain tests |
 | `doc/KERNEL_LOCKING.md` | §37 (this section); §36.8 Stage 18 acceptance recorded above |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+26 (Stage 19 test rules) |
+
+### 37.8 Stage 19 acceptance (consolidated record)
+
+Recorded here for the Stage 20 audit trail.
+
+- **Accepted without x86_64 smoke.** Reason: pure `cap_refcount` accounting; no
+  cross-CPU path and no live boot/runtime path changed. 757 tests pass.
+- **Bug:** `grant_capability_task_to_task_with_rights` rollback leaked
+  `cap_refcount` for `MemoryObject`/`DmaRegion` caps when the delegation link
+  table was full. `mint_capability_in_cnode` had already incremented
+  `cap_refcount`, but the rollback used `fast_revoke_reply_cap_in_cnode` (which
+  clears the cnode slot only and intentionally does **not** touch `cap_refcount`),
+  leaving a permanent `+1` leak on every link-table-full grant.
+- **Fix:** after the successful `fast_revoke_reply_cap_in_cnode` in the rollback
+  path, explicitly call `adjust_memory_object_cap_refcount(object, -1)` followed
+  by `reclaim_memory_object_if_unreferenced(object)`, guarded on the `bool` return
+  of the fast-revoke so the decrement only happens when a slot was actually
+  cleared.
+- **Deferred (still deferred at Stage 20):** x86_64 SMP / `smp.rs`; RAMFS/FAT
+  runtime spawning.
+
+---
+
+## §38 — Stage 20: IPC cap-transfer / reply-cap / transfer-envelope lifetime hardening
+
+Stage 20 audits the IPC-mediated capability lifetime: reply caps, transfer caps,
+transfer envelopes, recv-v2 cap materialization, blocked send/call/recv paths,
+timeout/error cleanup, exit/death cleanup, cnode-cleanup interaction, and
+`MemoryObject cap_refcount` symmetry during transfer.
+
+### 38.1 IPC cap lifetime domain map
+
+| Object | Global registry | Receiver-cnode slot | Lifetime owner | Consumed/cleaned by |
+|--------|-----------------|---------------------|----------------|---------------------|
+| Reply cap | `ipc.reply_caps[idx]` + `reply_cap_generations[idx]` | minted on recv-materialize (`waiter_cap_id`) and on caller mint (`caller_cap_id`) | caller (record), replier+caller (cnode slots) | `ipc_reply` (consume record + fast-revoke both slots), `revoke_reply_caps_for_caller` (exit/death/restart), `maybe_cleanup_process_cnode_for_pid` (cnode) |
+| Transfer envelope | `ipc.transfer_envelopes[idx]` + `transfer_envelope_generations[idx]` | n/a (handle only) | source task (until taken) | `take_transfer_envelope` (recv materialize / error cleanup), `purge_transfer_envelopes_for_pid` (process teardown) |
+| Transfer cap (materialized) | n/a | minted into receiver cnode via grant | receiver task | `revoke_capability_in_cnode` (cnode teardown / rollback), Stage 20 `rollback_materialized_recv_cap` on failed copy |
+| Active transfer mapping | `ipc.active_transfer_mappings[idx]` | n/a | owner task | `remove_active_transfer_mapping`, `revoke_active_transfer_mappings_for_cap`, `purge_active_transfer_mappings_for_pid` |
+
+### 38.2 Lock-rank table (IPC cap paths)
+
+Rank order (must not invert): scheduler(1) < task(2) < ipc(3) < capability(4) < vm(5) < memory(6).
+
+| Operation | Locks acquired (in order) | Notes |
+|-----------|---------------------------|-------|
+| `stash_transfer_envelope` | ipc(3) read, memory(6) (validate + pin), ipc(3) write | cap resolve via capability(4) read between |
+| `take_transfer_envelope` | ipc(3) read, memory(6) (unpin), ipc(3) write | no cap mint/revoke here |
+| `materialize_received_*` (transfer) | ipc(3) take, capability(4) grant (mint + link), memory(6) refcount | mint done **outside** ipc lock |
+| `materialize_received_*` (reply) | ipc(3) take, ipc(3) liveness, capability(4) mint, ipc(3) set waiter_cap | mint outside ipc lock |
+| `rollback_materialized_recv_cap` | capability(4) resolve, capability(4) revoke/fast-revoke, memory(6) refcount, ipc(3) clear waiter_cap | inverse of materialize; no lock held across mint/revoke |
+| `ipc_reply` | task(2), ipc(3) consume record, capability(4) fast-revoke ×2, ipc(3) deliver | record consumed under ipc(3); fast-revoke under capability(4) — never simultaneously held |
+| `create_reply_cap_for_caller` | ipc(3) reserve slot, capability(4) mint, ipc(3) persist cap_id | mint outside ipc lock |
+
+**Invariant 8 confirmed:** no cap mint or revoke is performed while `ipc_state_lock`
+is held. All mint/revoke calls (`mint_capability_in_cnode`,
+`revoke_capability_in_cnode`, `fast_revoke_reply_cap_in_cnode`,
+`grant_*`) run outside `with_ipc_state*` closures.
+
+### 38.3 Transfer-envelope lifecycle table
+
+| State | Set by | pin_refcount delta (shared_region) | Transition |
+|-------|--------|-----------------------------------|------------|
+| Created | `stash_transfer_envelope` | `+1` | → MappedReceiver / Released / Revoked |
+| Released | `take_transfer_envelope` (transition guard) | `-1` | terminal (slot cleared) |
+| (purge) | `purge_transfer_envelopes_for_pid` | `-1` if shared_region | slot cleared, telemetry revoked++ |
+
+Generation-tagged handle (`(generation << 16) | idx`) makes a stale/replayed
+handle return `None` from `take_transfer_envelope` → consumed/cleaned exactly once.
+
+### 38.4 Reply-cap lifecycle table
+
+| Phase | Function | Global record | caller cnode | replier/waiter cnode |
+|-------|----------|---------------|--------------|----------------------|
+| create | `create_reply_cap_for_caller` | reserve + set `caller_cap_id` | mint (SEND) | — |
+| materialize | `materialize_received_message_cap` (reply branch) | set `waiter_cap_id` | — | mint (SEND) |
+| reply | `ipc_reply` | consume (`= None`) | fast-revoke `caller_cap_id` | fast-revoke `waiter_cap_id` |
+| rollback (Stage 20) | `rollback_materialized_recv_cap` | clear `waiter_cap_id` (record stays live) | — | fast-revoke waiter slot |
+| exit/death/restart | `revoke_reply_caps_for_caller` | clear records where task is caller | (cnode at death) | (cnode at death) |
+
+Generation bump on reuse (`reply_cap_generations[idx]`) makes a stale reply CapId
+resolve to `StaleCapability`/`InvalidCapability` → reply cap is one-shot.
+
+### 38.5 cap_refcount transition table
+
+| Path | cap delta | envelope delta | reply-cap delta | owner | cleanup trigger | lock order | tests |
+|------|-----------|----------------|-----------------|-------|-----------------|------------|-------|
+| IpcSend cap transfer success | +1 dest | consumed | none | dest task | — | ipc→cap | `stage20_transfer_cap_materialize_success_sets_cap_refcount_to_two` |
+| IpcSend cap transfer failure | 0 | cleaned | none | source task | error return | ipc→cap | `stage20_failed_transfer_send_cleans_envelope_and_keeps_refcount` |
+| IpcCall reply cap creation | 0 | none | +1 | caller | ipc_reply/revoke | cap | `stage20_reply_cap_creation_does_not_change_memory_cap_refcount` |
+| IpcCall timeout/error | 0 | cleaned | −1 | caller | timeout/error | cap | `reply_cap_record_is_single_use_and_routes_reply_to_bound_endpoint` |
+| IpcReply with cap transfer | +1 dest | consumed | −1 | dest task | — | ipc→cap | `stage20_reply_cap_double_revoke_is_idempotent` |
+| recv-v2 blocked delivery | +1 dest | consumed | — | dest task | waiter wake | ipc→cap | `stage20_transfer_cap_materialize_success_sets_cap_refcount_to_two` |
+| recv copy-fault after materialize (Stage 20 fix) | 0 (rolled back) | consumed | clear waiter_cap | dest task | copy fault | cap→ipc | `stage20_rollback_materialized_transfer_cap_restores_cap_refcount`, `stage20_rollback_materialized_reply_cap_clears_slot_and_waiter_id` |
+| send timeout | 0 | cleaned | none | sender | timer | ipc→cap | `process_ipc_timeout_deadlines` (existing) |
+| task exit while waiting | 0 | cleaned | −1 | task | exit_task/death | ipc→cap | `process_cleanup_purges_transfer_envelopes_and_unpins_memory` (existing) |
+| cnode teardown | 0 | cleaned | −1 | task | mark_task_dead | cap | `process_cleanup_*` (existing) |
+| double rollback / double take | 0 (no underflow) | no-op | no-op | — | idempotent | cap/ipc | `stage20_rollback_materialized_transfer_cap_double_call_is_harmless`, `stage20_transfer_envelope_double_take_is_harmless` |
+
+### 38.6 Production bug fixed (Stage 20)
+
+**Bug — recv-v2 cap materialized before failable user-memory copy, with no
+rollback.** Both recv-delivery paths materialize the transferred/reply cap into
+the receiver's cnode (and consume the transfer envelope) **before** the
+metadata/payload `copy_to_user` that can fault:
+
+- `complete_blocked_recv_for_waiter` (blocked-waiter delivery): cap materialized,
+  then meta `copy_to_user` could return `Err` with no rollback —
+  `src/kernel/syscall.rs` (meta-copy failure branch).
+- `handle_ipc_recv_result_with_empty_error` (immediate recv): cap materialized,
+  then recv-v2 meta `copy_to_current_user` (`?`) and the undersized-buffer
+  (`user_len < app_payload.len()`) branch returned `Err` with no rollback.
+
+When the copy faulted the message was dropped and the receiver stayed blocked,
+but the freshly-minted cap leaked in the receiver's cnode — an asymmetric
+`cap_refcount`/cnode-slot leak — and for Reply caps a dangling global
+`waiter_cap_id` pointed at an orphaned slot (which `ipc_reply` would then attempt
+to fast-revoke).
+
+**Fix.** Added `KernelState::rollback_materialized_recv_cap`
+(`src/kernel/boot/transfer_state.rs`), the inverse of the materialization mint:
+
+- Reply cap → `fast_revoke_reply_cap_in_cnode` (no `cap_refcount`) + clear the
+  global `waiter_cap_id` via the new generation-guarded
+  `clear_reply_cap_waiter_cap` (`src/kernel/boot/ipc_state.rs`). The
+  `ReplyCapRecord` stays live (the reply was never consumed by the mint), so the
+  reply remains re-deliverable.
+- Transfer cap → `revoke_capability_in_cnode` (removes delegation link,
+  decrements `cap_refcount`, reclaims if unreferenced).
+
+Wired into all three post-materialization copy-failure branches. Double-call is
+harmless (returns `false`, never underflows) because the slot lookup fails on the
+second call.
+
+### 38.7 Invariants enforced (Stage 20)
+
+1. Transfer envelope consumed exactly once or cleaned exactly once
+   (generation-tagged handle; double take → `None`).
+2. Reply cap is one-shot — cannot be reused after revoke/materialization
+   (record consumed + generation bump).
+3. Failed cap transfer restores `MemoryObject cap_refcount` (Stage 19 grant
+   rollback + Stage 20 materialize rollback).
+4. Failed materialization/copy leaves no cnode slot leak (Stage 20 rollback).
+5. Timeout cleanup removes waiter and cap/envelope state
+   (`process_ipc_timeout_deadlines` + `take`/`purge`).
+6. Exit/death cleanup removes waiter and reply-cap/envelope state
+   (`revoke_reply_caps_for_caller` + `maybe_cleanup_process_cnode_for_pid`).
+7. No cap delivered to Dead/Exited/Missing task — `rollback_materialized_recv_cap`
+   returns `false` when `task_cnode` is missing; `clear_ipc_waiters_for_tid`
+   removes dead tasks from waiter slots before delivery.
+8. No cap mint/revoke under `ipc_state_lock` (see §38.2).
+9. recv-v2 metadata/reply-cap behavior unchanged on the success path; rollback
+   only affects the failure (dropped-message) path.
+10. Cap-transfer preserves payload bytes and opcode semantics (materialize
+    happens after payload validation; rollback does not alter delivered bytes).
+11. Active-transfer mappings remain two-phase and refcount-safe (registration does
+    not touch `cap_refcount`).
+12. Double cleanup is harmless / returns a stable error, never underflows.
+
+### 38.8 Files changed (Stage 20)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/transfer_state.rs` | `rollback_materialized_recv_cap` helper (inverse of recv-materialize mint) |
+| `src/kernel/boot/ipc_state.rs` | `clear_reply_cap_waiter_cap` (generation-guarded); `#[cfg(test)]` reply-record accessors |
+| `src/kernel/syscall.rs` | rollback wired into `complete_blocked_recv_for_waiter` (meta-copy fault) and `handle_ipc_recv_result_with_empty_error` (meta-copy fault + undersized buffer) |
+| `src/kernel/boot/tests.rs` | 10 new Stage 20 tests |
+| `doc/KERNEL_LOCKING.md` | §37.8 Stage 19 acceptance (consolidated); §38 (this section) |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+27 (Stage 20 test rules) |
+| `doc/CAPABILITY_DOMAIN_RULES.md` | IPC cap-transfer lifetime rules |
+
+### 38.9 Stage 20 acceptance
+
+767 tests pass single-threaded (757 Stage 19 baseline + 10 = 767).
+`cargo check --no-default-features` clean. `cargo check --features hosted-dev`
+clean. `git diff --check` clean.
+
+x86_64 `-smp 1` smoke **not required**: the only behavioral change is on the IPC
+recv copy-fault error path (a previously-leaking slot is now revoked); the success
+path, syscall ABI, `SYSCALL_COUNT`, and SpawnV5 semantics are unchanged; no
+cross-CPU, trap/timer/bootstrap, SMP, or live boot path is touched.
+
+**Deferred (still deferred at Stage 20):** x86_64 SMP / `smp.rs`; RAMFS/FAT
+runtime spawning; full global-lock removal.

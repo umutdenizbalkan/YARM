@@ -99,6 +99,78 @@ impl KernelState {
         Some(envelope)
     }
 
+    /// Stage 20: roll back a Reply/transfer cap that was just materialized into a
+    /// receiver's cnode when a *subsequent* user-memory copy in the recv-delivery
+    /// path fails.
+    ///
+    /// The delivery path materializes the cap (minting it into the receiver's cnode
+    /// and consuming the transfer envelope) *before* the metadata/payload `copy_to_user`
+    /// that may fault.  If that copy faults the message is dropped and the receiver
+    /// stays blocked, but without this rollback the freshly-minted cap would leak in
+    /// the receiver's cnode (and, for Reply caps, leave a dangling `waiter_cap_id` in
+    /// the global record) — an asymmetric `cap_refcount`/cnode-slot leak on every
+    /// faulting delivery.
+    ///
+    /// This is the inverse of `mint_capability_in_cnode` for the materialized slot:
+    ///   - Reply cap: clear the receiver cnode slot via `fast_revoke_reply_cap_in_cnode`
+    ///     (no `cap_refcount` to adjust) and clear the global `waiter_cap_id` so the
+    ///     record no longer points at a now-revoked slot.  The reply remains live and
+    ///     re-deliverable (the global `ReplyCapRecord` was never consumed by mint).
+    ///   - Transfer cap (MemoryObject/DmaRegion): `revoke_capability_in_cnode`, which
+    ///     removes the delegation link, decrements `cap_refcount`, and reclaims the
+    ///     object if it became unreferenced — exactly undoing the materialization
+    ///     mint+link.
+    ///
+    /// The materialized object is resolved from the receiver's cnode so callers only
+    /// need the receiver tid, the minted CapId, and whether it is a Reply cap.
+    /// Returns `true` if a slot was cleared.
+    pub(crate) fn rollback_materialized_recv_cap(
+        &mut self,
+        receiver_tid: u64,
+        materialized_cap: CapId,
+        is_reply_cap: bool,
+    ) -> bool {
+        let Some(receiver_cnode) = self.task_cnode(receiver_tid) else {
+            return false;
+        };
+        let Some(cap_object) = self
+            .capability_for_cnode_local(receiver_cnode, materialized_cap)
+            .map(|cap| cap.object)
+        else {
+            return false;
+        };
+        if is_reply_cap {
+            let cleared = self.fast_revoke_reply_cap_in_cnode(
+                receiver_cnode,
+                materialized_cap,
+                cap_object,
+            );
+            if let CapObject::Reply { index, generation } = cap_object {
+                // Drop the now-stale waiter_cap_id so ipc_reply does not try to
+                // fast-revoke a slot we just cleared.
+                self.clear_reply_cap_waiter_cap(index, generation);
+            }
+            crate::yarm_log!(
+                "IPC_RECV_MATERIALIZE_ROLLBACK kind=reply receiver_tid={} cap={} cleared={}",
+                receiver_tid,
+                materialized_cap.0,
+                cleared
+            );
+            cleared
+        } else {
+            let ok = self
+                .revoke_capability_in_cnode(receiver_cnode, materialized_cap)
+                .is_ok();
+            crate::yarm_log!(
+                "IPC_RECV_MATERIALIZE_ROLLBACK kind=transfer receiver_tid={} cap={} ok={}",
+                receiver_tid,
+                materialized_cap.0,
+                ok
+            );
+            ok
+        }
+    }
+
     fn validate_transfer_record_metadata(
         &self,
         source_tid: ThreadId,
