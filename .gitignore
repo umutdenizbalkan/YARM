@@ -7,3 +7,4 @@
 /rustc-ice-*.txt
 *.log
 scripts/__pycache__/
+/.claude/

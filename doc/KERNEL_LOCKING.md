@@ -7179,3 +7179,89 @@ on the cross-CPU work submission path.
 | `src/kernel/boot/tests.rs` | 20 new Stage 18 tests |
 | `doc/KERNEL_LOCKING.md` | §36 (this section); §35.11 Stage 17 acceptance |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+25 (Stage 18 test rules) |
+
+---
+
+## §37 — Stage 19: capability/cnode lifetime audit + cap_refcount symmetry
+
+### 37.1 Scope
+
+Full audit of the capability/cnode domain focusing on:
+
+- `cap_refcount` increment/decrement symmetry for `MemoryObject` and `DmaRegion` caps.
+- Correctness of the `grant_capability_task_to_task_with_rights` rollback path.
+- `Reply` cap behavior: no `cap_refcount` side-effects.
+- `revoke_reply_caps_for_caller` and task exit cleanup.
+- `cnode_teardown` cascade: `revoke_capability_in_cnode` cascades to delegated descendants.
+- `fork` cap inheritance: `cap_refcount` incremented per inherited cap.
+
+### 37.2 Confirmed-correct invariants (no bug)
+
+| Path | Invariant | Verified |
+|------|-----------|---------|
+| `adjust_memory_object_cap_refcount(CapObject::Reply{..}, delta)` | No-op: early return on `_ => return` arm | Test `reply_cap_mint_does_not_increment_memory_object_refcount` |
+| `create_reply_cap_for_caller` | Mints `CapObject::Reply` cap; `cap_refcount` unchanged | Test above |
+| `revoke_reply_caps_for_caller` | Clears global `ReplyCapRecord` slot; cnode cleanup handled later by `maybe_cleanup_process_cnode_for_pid` | Confirmed correct; no double-free risk |
+| `ipc_reply` fast-revoke | Both replier cnode slot and caller cnode slot are cleared via `fast_revoke_reply_cap_in_cnode`; no `cap_refcount` change (Reply caps have none) | Existing test coverage |
+| `inherit_parent_capabilities_for_fork` | Uses `grant_capability_task_to_task_with_rights` which calls `mint_capability_in_cnode` → `cap_refcount` incremented per inherited cap | Test `fork_cap_inheritance_increments_refcount` |
+| `revoke_capability_in_cnode` cascade | Revoking a source cap cascades to all delegated descendants via `collect_delegated_descendants`, decrementing `cap_refcount` for each | Test `cnode_teardown_releases_all_cap_refcounts` |
+
+### 37.3 Bug confirmed and fixed
+
+**`grant_capability_task_to_task_with_rights` rollback leaks `cap_refcount`**
+
+Location: `src/kernel/boot/capability_state.rs`, rollback path in `grant_capability_task_to_task_with_rights`.
+
+Pre-fix behavior: when `record_delegated_capability_link` returned `CapabilityFull` (delegation link table full), the rollback called `fast_revoke_reply_cap_in_cnode` to clear the cnode slot, but did NOT call `adjust_memory_object_cap_refcount(attenuated.object, -1)`. This left `cap_refcount` permanently inflated by 1 for each failed delegation attempt.
+
+Impact: repeated failed delegation (e.g. during fork with a full link table) would accumulate cap_refcount inflation, preventing `reclaim_memory_object_if_unreferenced` from ever freeing the frame even after all real references were dropped.
+
+Fix: after `fast_revoke_reply_cap_in_cnode` returns `true` (slot was cleared), call `adjust_memory_object_cap_refcount(attenuated.object, -1)` and `reclaim_memory_object_if_unreferenced(attenuated.object)` to maintain symmetry with the earlier `mint_capability_in_cnode` call.
+
+```rust
+let revoked = self.fast_revoke_reply_cap_in_cnode(dest_cnode, delegated_cap, attenuated.object);
+if revoked {
+    self.adjust_memory_object_cap_refcount(attenuated.object, -1);
+    self.reclaim_memory_object_if_unreferenced(attenuated.object);
+}
+```
+
+### 37.4 `exit_task` vs `mark_task_dead` cnode cleanup distinction
+
+`exit_task` sets status to `TaskStatus::Exited(code)` and calls `revoke_reply_caps_for_caller`, but does NOT call `maybe_cleanup_process_cnode_for_pid`.
+
+`mark_task_dead` sets status to `TaskStatus::Dead` and calls `maybe_cleanup_process_cnode_for_pid` directly.
+
+`maybe_cleanup_process_cnode_for_pid` guards on `status != TaskStatus::Dead`; if any thread in the process group has status `Exited` (not `Dead`), the guard triggers and cleanup is skipped. Cnode teardown requires `mark_task_dead` (or the process-level supervisor cleanup path that calls it).
+
+### 37.5 Stage 19 test inventory
+
+| Test | Verifies |
+|------|---------|
+| `cap_refcount_increment_on_mint` | `mint_capability_in_cnode` increments `cap_refcount` to 1 |
+| `cap_refcount_decrement_on_revoke` | `revoke_capability_in_cnode` decrements to 0 and reclaims |
+| `reply_cap_mint_does_not_increment_memory_object_refcount` | `adjust_memory_object_cap_refcount` is a no-op for `CapObject::Reply` |
+| `revoke_reply_cap_record_clears_global_slot` | `revoke_reply_caps_for_caller` clears global slot; idempotent on second call |
+| `task_exit_clears_reply_cap_records` | `exit_task` calls `revoke_reply_caps_for_caller` |
+| `cnode_teardown_releases_all_cap_refcounts` | `mark_task_dead` → cnode teardown cascades through delegated descendants; MemoryObject reclaimed |
+| `double_revoke_capability_is_safe` | Double revoke returns `Err`, no panic, no underflow |
+| `fork_cap_inheritance_increments_refcount` | Fork: child inherits cap → `cap_refcount` = 2 |
+| `grant_cap_with_rights_link_fail_decrements_cap_refcount` | Rollback restores `cap_refcount` when delegation link table is full (regression for Stage 19 bug fix) |
+
+### 37.6 Stage 19 acceptance
+
+757 tests pass single-threaded (`cargo test --lib -- --test-threads=1`).
+9 new Stage 19 tests added (748 Stage 18 baseline + 9 = 757).
+`cargo check --no-default-features` clean.
+`cargo check --features hosted-dev` clean.
+x86_64 -smp 1 smoke not required: Stage 19 changes are pure capability/refcount
+accounting in hosted-dev paths; no cross-CPU or live-boot behavior changed.
+
+### 37.7 Files changed (Stage 19)
+
+| File | Change |
+|------|--------|
+| `src/kernel/boot/capability_state.rs` | Fix rollback path in `grant_capability_task_to_task_with_rights`: add `adjust_memory_object_cap_refcount` + `reclaim_memory_object_if_unreferenced` after successful fast-revoke |
+| `src/kernel/boot/tests.rs` | 9 new Stage 19 cap/cnode domain tests |
+| `doc/KERNEL_LOCKING.md` | §37 (this section); §36.8 Stage 18 acceptance recorded above |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+26 (Stage 19 test rules) |
