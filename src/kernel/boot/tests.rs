@@ -18053,6 +18053,204 @@ fn stage20_clear_reply_cap_waiter_cap_generation_guard() {
         .expect("join");
 }
 
+// ── Stage 24 Part B: endpoint / reply-cap revoke + cnode-teardown audit ─────
+
+#[test]
+fn stage24_cnode_teardown_with_endpoint_cap_does_not_leave_receiver_waiter() {
+    // A task blocked as an endpoint receiver must not be left as a stranded
+    // endpoint_waiter after mark_task_dead.  clear_ipc_waiters_for_tid (called by
+    // mark_task_dead) clears the receiver waiter slot for the dying tid.
+    std::thread::Builder::new()
+        .name("stage24_ep_recv_waiter_teardown".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("task1");
+            let (endpoint_idx, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+            // Inject task 1 as the endpoint receiver waiter.
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(1));
+            });
+            assert_eq!(
+                state.endpoint_waiter_count(endpoint_idx),
+                1,
+                "precondition: task 1 is the endpoint receiver waiter"
+            );
+
+            state.mark_task_dead(1).expect("mark dead");
+
+            assert_eq!(
+                state.endpoint_waiter_count(endpoint_idx),
+                0,
+                "mark_task_dead must clear the dead task's endpoint receiver waiter"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage24_cnode_teardown_with_endpoint_cap_does_not_leave_sender_waiter() {
+    // A task blocked as an endpoint sender must not be left as a stranded
+    // sender waiter after mark_task_dead.
+    std::thread::Builder::new()
+        .name("stage24_ep_send_waiter_teardown".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("task1");
+            let (endpoint_idx, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+            let msg = Message::new(0, b"blocked-send").expect("msg");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+                    tid: ThreadId(1),
+                    msg,
+                });
+            });
+            assert_eq!(
+                state.sender_waiter_count(endpoint_idx),
+                1,
+                "precondition: task 1 is queued as an endpoint sender waiter"
+            );
+
+            state.mark_task_dead(1).expect("mark dead");
+
+            assert_eq!(
+                state.sender_waiter_count(endpoint_idx),
+                0,
+                "mark_task_dead must clear the dead task's endpoint sender waiter"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage24_reply_cap_cnode_teardown_clears_global_record() {
+    // mark_task_dead(caller) calls revoke_reply_caps_for_caller, which clears the
+    // global ReplyCapRecord keyed on caller_tid.  After teardown the global slot
+    // must be empty (no lingering record referencing a destroyed cnode).
+    std::thread::Builder::new()
+        .name("stage24_reply_cap_teardown".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("caller task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+                .expect("create reply cap");
+            assert!(
+                state.reply_cap_record_present(0),
+                "precondition: global reply record present for caller tid 1"
+            );
+
+            state.mark_task_dead(1).expect("mark dead");
+
+            assert!(
+                !state.reply_cap_record_present(0),
+                "mark_task_dead(caller) must clear the global reply record"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage24_stale_reply_cap_cannot_be_reused_after_cnode_teardown() {
+    // After the caller is torn down, the Reply CapId held by the replier is stale:
+    // the global record is gone, so ipc_reply must return a stable StaleCapability
+    // error rather than delivering or panicking.
+    std::thread::Builder::new()
+        .name("stage24_stale_reply_cap".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("caller task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            // Reply cap minted into the current (task 0 = replier) cnode.
+            let reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap, None)
+                .expect("create reply cap");
+
+            // Caller (task 1) dies: global record cleared by revoke_reply_caps_for_caller.
+            state.mark_task_dead(1).expect("mark dead");
+
+            assert_eq!(
+                state.ipc_reply(reply_cap, Message::new(0, b"stale").expect("msg")),
+                Err(KernelError::StaleCapability),
+                "stale reply cap after caller teardown must be a stable error"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage24_endpoint_cap_revoke_does_not_affect_unrelated_endpoint() {
+    // Endpoint caps are multi-owner (send cap is delegated cross-process during
+    // spawn).  Revoking a cap for one endpoint must clear only that cnode slot and
+    // must NOT destroy the endpoint object, nor disturb a second, unrelated
+    // endpoint.
+    std::thread::Builder::new()
+        .name("stage24_ep_revoke_isolation".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let cnode = state.current_task_cnode().expect("task0 cnode");
+
+            let (ep_a, _send_a, recv_a) = state.create_endpoint(4).expect("endpoint A");
+            let (ep_b, _send_b, _recv_b) = state.create_endpoint(4).expect("endpoint B");
+            assert_ne!(ep_a, ep_b, "two distinct endpoints");
+
+            let gen_a_before = state.with_ipc_state(|ipc| ipc.endpoint_generations[ep_a]);
+            let gen_b_before = state.with_ipc_state(|ipc| ipc.endpoint_generations[ep_b]);
+
+            // Revoke one cap (the receive cap) of endpoint A.
+            state
+                .revoke_capability_in_cnode(cnode, recv_a)
+                .expect("revoke recv cap A");
+
+            // Endpoint A object must still exist (multi-owner: send cap still live),
+            // and its generation must be unchanged (revoke does not destroy it).
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoints[ep_a].is_some()),
+                "endpoint A object must survive single-cap revoke (multi-owner)"
+            );
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.endpoint_generations[ep_a]),
+                gen_a_before,
+                "endpoint A generation must be unchanged by cap revoke"
+            );
+
+            // Endpoint B must be entirely unaffected.
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoints[ep_b].is_some()),
+                "unrelated endpoint B must remain present"
+            );
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.endpoint_generations[ep_b]),
+                gen_b_before,
+                "unrelated endpoint B generation must be unchanged"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
 #[test]
 fn stage20_transfer_envelope_double_take_is_harmless() {
     // Invariant 1/12: an envelope is consumed exactly once; a second take returns

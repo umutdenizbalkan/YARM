@@ -2381,12 +2381,82 @@ fn handle_spawn_process(
     Ok(())
 }
 
-/// Kernel-side staging buffer for ELF images supplied via SpawnProcessFromUserBuf.
+/// Kernel-side staging buffer for ELF images supplied via SpawnProcessFromUserBuf
+/// and SpawnFromInitramfsFile.
 ///
-/// Access is serialised in practice: only PM calls this syscall, and only once
-/// during early startup.  A proper per-call allocation would require a kernel
-/// heap; the static buffer avoids that dependency at the cost of exclusivity.
-static mut VFS_ELF_STAGING: [u8; 128 * 1024] = [0u8; 128 * 1024];
+/// A proper per-call allocation would require a kernel heap; the static buffer
+/// avoids that dependency at the cost of exclusivity.  Rather than rely on an
+/// out-of-band "single caller" comment guarding a `static mut`, the buffer is
+/// wrapped in [`TakeOnceStagingBuffer`], which encodes exclusive access in the
+/// type system: the only way to obtain a mutable view is via `try_take`, which
+/// uses an atomic claim flag.  The claim is released when the returned
+/// [`StagingBufferClaim`] guard is dropped, so the buffer can be reused by the
+/// next spawn syscall (PM issues one spawn at a time, and a syscall handler runs
+/// to completion before the next is dispatched).  If a claim is somehow already
+/// outstanding the handler returns a stable error instead of aliasing the buffer.
+static VFS_ELF_STAGING: TakeOnceStagingBuffer<{ 128 * 1024 }> = TakeOnceStagingBuffer::new();
+
+/// A statically-allocated byte buffer that hands out at most one outstanding
+/// mutable claim at a time.
+///
+/// The single-use ("take-once") invariant is enforced by an [`AtomicBool`]:
+/// `try_take` atomically flips `claimed` from `false` to `true`, returning a
+/// guard on success and `None` if a claim is already outstanding.  Dropping the
+/// guard resets the flag, allowing reuse on the next call.  This replaces a raw
+/// `static mut` and the `static_mut_refs` lint exposure with a type whose only
+/// safe access path is exclusive by construction.
+struct TakeOnceStagingBuffer<const N: usize> {
+    claimed: core::sync::atomic::AtomicBool,
+    data: core::cell::UnsafeCell<[u8; N]>,
+}
+
+// SAFETY: the only access to `data` is through `try_take`, which uses the atomic
+// `claimed` flag to guarantee that at most one `StagingBufferClaim` exists at a
+// time.  No two threads can obtain overlapping mutable references to `data`.
+unsafe impl<const N: usize> Sync for TakeOnceStagingBuffer<N> {}
+
+impl<const N: usize> TakeOnceStagingBuffer<N> {
+    const fn new() -> Self {
+        Self {
+            claimed: core::sync::atomic::AtomicBool::new(false),
+            data: core::cell::UnsafeCell::new([0u8; N]),
+        }
+    }
+
+    /// Atomically claim exclusive access to the buffer.  Returns `None` if a
+    /// claim is already outstanding.
+    fn try_take(&'static self) -> Option<StagingBufferClaim<'static, N>> {
+        use core::sync::atomic::Ordering;
+        self.claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .ok()
+            .map(|_| StagingBufferClaim { buf: self })
+    }
+}
+
+/// RAII guard proving exclusive access to a [`TakeOnceStagingBuffer`].  Not
+/// `Clone`/`Copy`: only one can exist at a time.  Releases the claim on drop.
+struct StagingBufferClaim<'a, const N: usize> {
+    buf: &'a TakeOnceStagingBuffer<N>,
+}
+
+impl<'a, const N: usize> StagingBufferClaim<'a, N> {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: holding this guard means `claimed == true` and (because
+        // `try_take` is the only producer and the flag is reset only on drop)
+        // no other `StagingBufferClaim` for the same buffer exists, so this is
+        // the unique mutable reference to `data`.
+        unsafe { &mut *self.buf.data.get() }
+    }
+}
+
+impl<'a, const N: usize> Drop for StagingBufferClaim<'a, N> {
+    fn drop(&mut self) {
+        self.buf
+            .claimed
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+}
 
 fn handle_spawn_process_from_user_buf(
     kernel: &mut KernelState,
@@ -2408,10 +2478,10 @@ fn handle_spawn_process_from_user_buf(
         return Err(SyscallError::InvalidArgs);
     }
     validate_user_region(elf_user_ptr as u64, elf_len as u64)?;
-    // SAFETY: single-caller invariant (see buffer comment above); raw pointer avoids
-    // the static_mut_refs lint while keeping the same semantics.
-    let staging_ptr = &raw mut VFS_ELF_STAGING;
-    let staging = unsafe { &mut *staging_ptr };
+    // Exclusive, type-checked access to the shared ELF staging buffer; the claim
+    // is released when `staging_claim` drops at end of handler.
+    let mut staging_claim = VFS_ELF_STAGING.try_take().ok_or(SyscallError::Internal)?;
+    let staging = staging_claim.as_mut_slice();
     kernel
         .copy_from_current_user_into_slice(elf_user_ptr, elf_len, staging)
         .map_err(SyscallError::from)?;
@@ -2587,8 +2657,10 @@ fn handle_spawn_from_initramfs_file(
         data.len()
     );
 
-    let staging_ptr = &raw mut VFS_ELF_STAGING;
-    let staging = unsafe { &mut *staging_ptr };
+    // Exclusive, type-checked access to the shared ELF staging buffer; the claim
+    // is released when `staging_claim` drops at end of handler.
+    let mut staging_claim = VFS_ELF_STAGING.try_take().ok_or(SyscallError::Internal)?;
+    let staging = staging_claim.as_mut_slice();
     let elf_len = data.len();
     if elf_len == 0 || elf_len > staging.len() {
         return Err(SyscallError::InvalidArgs);
@@ -3584,6 +3656,62 @@ mod tests {
         assert_eq!(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, 29);
         assert_eq!(SYSCALL_COUNT, 30);
         assert_eq!(IPC_REGISTER_WORDS, 2);
+    }
+
+    // ── Stage 24 Part A: TakeOnceStagingBuffer exclusive-claim semantics ─────
+
+    #[test]
+    fn stage24_vfs_elf_staging_first_claim_succeeds() {
+        // A fresh take-once buffer hands out a claim on the first attempt.
+        static BUF: TakeOnceStagingBuffer<64> = TakeOnceStagingBuffer::new();
+        let claim = BUF.try_take();
+        assert!(
+            claim.is_some(),
+            "first try_take on an unclaimed buffer must return Some"
+        );
+        // Keep the claim alive until end of scope so the second-claim test below
+        // is independent of drop ordering within this test.
+        drop(claim);
+    }
+
+    #[test]
+    fn stage24_vfs_elf_staging_second_claim_fails() {
+        // While a claim is outstanding, a second try_take must fail (None),
+        // proving exclusive access is enforced by the atomic flag.
+        static BUF: TakeOnceStagingBuffer<64> = TakeOnceStagingBuffer::new();
+        let first = BUF.try_take();
+        assert!(first.is_some(), "first claim must succeed");
+        let second = BUF.try_take();
+        assert!(
+            second.is_none(),
+            "second try_take while a claim is outstanding must return None"
+        );
+        // Hold `first` across the assertion so the buffer stays claimed.
+        drop(first);
+    }
+
+    #[test]
+    fn stage24_vfs_elf_staging_claim_reusable_after_drop() {
+        // The RAII guard releases the claim on drop so the shared buffer can be
+        // reused by the next spawn syscall.  (PM issues one spawn at a time and
+        // each handler runs to completion, releasing the claim before the next.)
+        static BUF: TakeOnceStagingBuffer<64> = TakeOnceStagingBuffer::new();
+        {
+            let mut claim = BUF.try_take().expect("first claim");
+            claim.as_mut_slice()[0] = 0xAB;
+        } // claim dropped here -> released
+        let mut reclaim = BUF.try_take().expect("claim must be reusable after drop");
+        // Buffer contents persist across claims (it is not zeroed on release);
+        // only exclusivity is enforced.
+        assert_eq!(reclaim.as_mut_slice()[0], 0xAB);
+    }
+
+    #[test]
+    fn stage24_vfs_elf_staging_as_mut_slice_has_full_length() {
+        // as_mut_slice exposes exactly N bytes of the backing array.
+        static BUF: TakeOnceStagingBuffer<128> = TakeOnceStagingBuffer::new();
+        let mut claim = BUF.try_take().expect("claim");
+        assert_eq!(claim.as_mut_slice().len(), 128);
     }
 
     #[test]

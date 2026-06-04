@@ -7907,3 +7907,173 @@ number — explicitly **out of scope** by the hard ABI invariant); x86_64 SMP /
 - Stage 23 tests + Stage 22 notification tests pass single-threaded
   (`RUST_MIN_STACK=8388608`).
 - `git diff --check` clean.
+
+### 41.8 Stage 23 acceptance — re-confirmed at Stage 24 (Part 0)
+
+Re-verified at the start of Stage 24 before any new work:
+
+- **Stage 23 accepted without smoke**: audit-only stage; **no production code was
+  changed** in Stage 23 (only docs + tests), so no x86_64 smoke was or is required.
+- `SYSCALL_COUNT == 30` confirmed (frozen by
+  `syscall_abi_numbers_are_frozen`); 22 live `Syscall` variants; no new syscall
+  numbers were added.
+- Notification teardown remains reachable **only** via the direct revoke helpers
+  (`revoke_capability_in_cnode` / `revoke_capability_direct_in_process_cnode` →
+  `destroy_notification_for_revoked_cap`) and cnode teardown
+  (`maybe_cleanup_process_cnode_for_pid`). No generic user-facing cap release
+  syscall exists; `TransferRelease` (NR=4) is MemoryObject-scoped and returns
+  `InvalidArgs` for Notification caps.
+- A **live notification create/release syscall surface remains deferred** (would
+  require a new syscall number — out of scope by the hard ABI invariant).
+
+## §42 Stage 24 — VFS ELF staging soundness (TakeOnceStagingBuffer) + endpoint/reply-cap revoke audit
+
+### 42.0 Stage 23 acceptance confirmation
+
+See §41.8. Stage 23 accepted, audit-only, no production code changed,
+`SYSCALL_COUNT == 30` confirmed, live notification syscall deferred.
+
+### 42.1 Part A — VFS ELF staging static-mut soundness
+
+**Before.** `src/kernel/syscall.rs` defined the ELF staging buffer as a raw
+`static mut VFS_ELF_STAGING: [u8; 128 * 1024]`. Two handlers
+(`handle_spawn_process_from_user_buf`, `handle_spawn_from_initramfs_file`)
+obtained a `&mut` to it via `&raw mut` + `unsafe { &mut * }`. The exclusivity
+invariant ("only PM calls this, serialised") lived **only in a comment** — there
+was no machine-checked guard against two overlapping `&mut` references, which is
+exactly the unsoundness `static mut` invites (and the reason for the
+`static_mut_refs` lint).
+
+**After.** The buffer is wrapped in a typed take-once container:
+
+```rust
+struct TakeOnceStagingBuffer<const N: usize> {
+    claimed: AtomicBool,
+    data: UnsafeCell<[u8; N]>,
+}
+unsafe impl<const N: usize> Sync for TakeOnceStagingBuffer<N> {}
+```
+
+- `try_take(&'static self) -> Option<StagingBufferClaim<'static, N>>` flips
+  `claimed` from `false → true` with a single `compare_exchange(AcqRel,
+  Relaxed)`. The **only** way to obtain a mutable view is through the returned
+  guard, so exclusive access is encoded in the type system rather than in a
+  comment.
+- `StagingBufferClaim::as_mut_slice(&mut self) -> &mut [u8]` is the sole `unsafe`
+  deref; its safety argument is local and trivially true (holding the guard ⇒
+  `claimed == true` ⇒ no other guard exists).
+- The guard is **not** `Clone`/`Copy`: at most one can exist per buffer.
+
+**One-shot vs. reuse semantics (deliberate deviation from the literal design
+note).** The Stage 24 design sketch suggested "no Drop release; the buffer stays
+claimed after use." That cannot be used here: **both** spawn handlers share this
+one buffer and the system spawns many processes over its lifetime (PM calls
+`SpawnProcessFromUserBuf` once per process). A permanently-claimed buffer would
+make every spawn after the first fail. The real soundness invariant is **mutual
+exclusion per call**, not "used exactly once ever". `StagingBufferClaim`
+therefore **releases the claim on `Drop`** (a `Release` store), so the next spawn
+syscall can reclaim it. This is sound because a syscall handler runs to
+completion before the next syscall is dispatched (single in-flight spawn at a
+time), so claims never overlap; if they ever did, the second caller gets `None`
+and the handler returns a stable `SyscallError::Internal` instead of aliasing
+the buffer.
+
+**no_std/freestanding.** `AtomicBool`, `UnsafeCell` come from `core`; no heap,
+no `std`. `cargo check --no-default-features` is clean.
+
+### 42.2 Part B — endpoint / reply-cap revoke + cnode-teardown audit
+
+Audit-only (no production code changed in Part B). Findings:
+
+1. **Endpoint ownership: multi-owner (delegable cross-process).** Unlike
+   Notification (single-owner, see §40.2), endpoint caps ARE granted across
+   processes: the spawn path mints a SEND + RECEIVE pair and then
+   `grant_capability_task_to_task_with_rights(..., SEND)` delegates the send cap
+   to the parent PID while the service keeps the receive cap. Revoking **one**
+   endpoint cap must therefore **not** destroy the shared object.
+
+2. **`destroy_endpoint` exists** (`ipc_state.rs:1238`) and fully tears an
+   endpoint down (clears object, receiver waiter, sender-waiter queue, bumps
+   generation, clears `fault_handler_endpoint`). It is **not** wired into
+   `revoke_capability_in_cnode` — by design (point 1). Endpoints are otherwise
+   effectively permanent once created (no user syscall destroys them); this is
+   the intended design, not a gap.
+
+3. **`revoke_capability_in_cnode` does nothing endpoint-specific** beyond
+   clearing the cnode slot and the usual transfer/delegation bookkeeping. Correct
+   for a multi-owner object: only `destroy_notification_for_revoked_cap` and the
+   MemoryObject refcount/reclaim paths are special-cased.
+
+4. **`clear_ipc_waiters_for_tid` clears ALL endpoint waiters for the tid** —
+   receiver (`endpoint_waiters`), every sender slot
+   (`endpoint_sender_waiters[*][*]`), and notification waiters
+   (`ipc_state.rs:128`).
+
+5. **No stranded waiter after `exit_task` / `mark_task_dead`.** Both call
+   `clear_ipc_waiters_for_tid(tid)`, so a dying task that was blocked as an
+   endpoint receiver or sender is removed from the waiter slots. Confirmed by the
+   two Stage 24 teardown tests.
+
+6. **Reply caps at cnode teardown.** `mark_task_dead` / `exit_task` call
+   `revoke_reply_caps_for_caller(tid)` **before** cnode teardown; that clears the
+   global `reply_caps[idx]` record for every record whose `caller_tid == tid`.
+   Cnode teardown (`maybe_cleanup_process_cnode_for_pid`) then iterates live caps
+   and calls `revoke_capability_in_cnode`, which clears Reply cap **cnode slots**
+   (no special global-record handling needed — the global record is already gone
+   for the caller, and `ipc_reply` consumes it for the replier).
+
+7. **Stale `waiter_cap_id` cannot cause unsoundness.** Global reply records are
+   generation-guarded (`reply_cap_generations[idx]`). A `waiter_cap_id` that
+   points into a torn-down replier cnode is only consulted inside `ipc_reply`,
+   which first resolves the reply cap in the **current** (replier) cnode — a dead
+   replier cannot call it. Any stale Reply CapId resolves to
+   `StaleCapability`/`InvalidCapability` once the record is `None` or its
+   generation has advanced. Confirmed by
+   `stage24_stale_reply_cap_cannot_be_reused_after_cnode_teardown`.
+
+### 42.3 Bugs fixed
+
+- **Part A (soundness hardening):** removed the raw `static mut` +
+  `unsafe { &mut * }` aliasing exposure in `src/kernel/syscall.rs` (the two
+  spawn handlers, formerly at `syscall.rs:2413` and `syscall.rs:2590`). No
+  behavioral change for the legitimate single-in-flight path; an overlapping
+  claim now fails closed with `SyscallError::Internal` instead of aliasing.
+- **Part B:** no bugs found. The audit confirms the existing teardown paths are
+  complete (waiters cleared, reply records cleared, generations guard stale caps).
+
+### 42.4 Helpers / wrappers added
+
+- `TakeOnceStagingBuffer<const N: usize>` (+ `unsafe impl Sync`), `try_take`.
+- `StagingBufferClaim<'a, const N: usize>` (+ `as_mut_slice`, `Drop`). All in
+  `src/kernel/syscall.rs`.
+
+### 42.5 Ownership semantics summary (Endpoint vs Notification)
+
+| Object | Owners | Cross-process delegation | Revoke-one-cap destroys object? |
+|--------|--------|--------------------------|----------------------------------|
+| Notification | single-owner | never | yes (`destroy_notification_for_revoked_cap`) |
+| Endpoint | multi-owner | yes (spawn delegates SEND to parent) | no (object persists; `destroy_endpoint` is a separate explicit path) |
+| Reply | one-shot, caller+replier slots | never | n/a (consumed by `ipc_reply` or cleared by `revoke_reply_caps_for_caller`) |
+
+### 42.6 Deferred (Stage 24)
+
+- No user-facing endpoint **destroy** syscall (endpoints are effectively
+  permanent once created; a destroy surface would need a new syscall number —
+  out of scope by the ABI invariant).
+- Live notification create/release syscall (carried over from §41.6).
+- x86_64 SMP / `smp.rs`; RAMFS/FAT runtime spawning; full global-lock removal.
+
+### 42.7 x86_64 smoke decision
+
+Part A changes `syscall.rs` but is **behavior-preserving** for the single
+in-flight spawn path (same bytes copied into the same buffer; only the access is
+now type-checked). Part B changed no production code. No live boot/runtime
+behavior change → **no x86_64 `-smp 1` smoke required**. Confirmed instead by the
+full hosted-dev test suite (no regression).
+
+### 42.8 Stage 24 acceptance
+
+- `cargo check --no-default-features` + `cargo check --features hosted-dev` clean.
+- 9 new Stage 24 tests pass single-threaded (`RUST_MIN_STACK=8388608`).
+- Full hosted-dev suite green; `git diff --check` clean.
+- `SYSCALL_COUNT == 30` unchanged; no ABI change.
