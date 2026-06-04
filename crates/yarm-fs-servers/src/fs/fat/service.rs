@@ -418,5 +418,9 @@ mod tests {
         assert!(doc.contains("sample image"));
         assert!(doc.contains("read-only"));
         assert!(doc.contains("VfsError::Unsupported"));
+        assert!(doc.contains("Production write-path audit"));
+        assert!(doc.contains("memory-backed FAT write only"));
+        assert!(doc.contains("no `BLK_OP_WRITE` request/reply"));
+        assert!(doc.contains("VFS write payload unavailable"));
     }
 }

@@ -30,17 +30,18 @@ future block-backed integration:
 - block size calculation from `s_log_block_size`;
 - group descriptor table lookup, including 64-bit inode-table high bits when enabled;
 - inode lookup by inode number;
-- extent-header validation for depth-0 extent trees;
-- regular-file reads through initialized extents;
+- extent-header validation for depth-0 leaves and bounded depth-1+ extent-index traversal
+  (`EXT4_MAX_EXTENT_DEPTH` guard);
+- regular-file reads through initialized extents, with sparse holes left as zero-filled bytes;
 - linear directory entry parsing with ext4 file-type bytes;
-- root-relative path lookup.
+- root-relative path lookup;
+- small inline symlink target reads.
 
 ## Rejected/unsupported ext4 features
 
 The parser rejects unknown incompatible feature bits and returns an explicit
 `UnsupportedFeature(mask)` error. The current read core does not implement:
 
-- extent index/internal nodes (extent depth > 0);
 - legacy indirect block maps;
 - htree indexed-directory acceleration (linear entries are parsed when present);
 - journal replay or JBD2 transactions;
@@ -66,6 +67,9 @@ Focused tests cover:
 - required incompatible feature rejection;
 - root directory parsing;
 - path lookup;
-- extent-backed regular-file read;
+- depth-0 and depth-1 extent-backed regular-file reads;
+- sparse extent hole zero-fill behavior;
+- invalid extent depth and invalid extent block-pointer rejection;
+- inline symlink reads;
 - existing service write/stat smoke behavior;
 - ext4 server binary build/check.

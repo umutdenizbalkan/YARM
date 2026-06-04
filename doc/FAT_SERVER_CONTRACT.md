@@ -29,6 +29,7 @@ Current write support is intentionally narrow and regular-file-only:
 
 - overwrites within an existing cluster chain;
 - appends/growth that allocate free clusters, zero freshly allocated clusters, and link the FAT chain;
+- FAT32 FSInfo free-count/next-free maintenance when a valid FSInfo sector is present;
 - directory-entry file-size updates after successful growth;
 - best-effort rollback of newly allocated clusters when cluster allocation fails before linkage.
 
@@ -46,6 +47,29 @@ Unsupported mutating operations such as `mkdir` and `unlink` are still rejected 
 - FAT12/FAT16 fixed root directories and FAT32 root directory cluster chains are
   supported. Deleted entries are ignored, `0x00` terminates a directory, and volume
   labels are not exposed as files.
+
+## Production write-path audit
+
+Current classification:
+
+- **A. memory-backed FAT write only:** implemented through `BlockDevice::write_exact_at` for
+  `MemBlockDevice`; hosted tests can verify exact bytes and metadata updates.
+- **C. production block-write unavailable due missing userspace/block ABI:** the FAT production
+  path currently uses `crates/yarm-ipc-abi/src/block_abi.rs`, which exposes `BLK_OP_GET_INFO` and
+  `BLK_OP_READ` plus `BlkReadRequest`/`BlkReadReply`, but no `BLK_OP_WRITE` request/reply carrying
+  sector payload bytes.
+- **D. VFS write payload unavailable due length-only contract:** `VFS_OP_WRITE` decodes to fd,
+  buffer pointer, and length only at the server boundary; filesystem servers cannot safely read the
+  caller buffer bytes without a separate copy/shared-buffer contract.
+- **E. kernel/ABI change required:** wiring a real production FAT write path requires an existing
+  userspace-facing block write operation with payload/shared-buffer semantics and a VFS write payload
+  transfer contract. Those are outside this filesystem-only scope.
+- **F. deferred:** do not fake persistence through blkcache/block stubs. The lower block-backend SG
+  ABI has write-shaped metadata for blkcache-to-driver traffic, but the current blkcache service
+  returns unsupported for frontend read/write buffer operations and does not provide a ready
+  filesystem-facing sector-write client API.
+
+Therefore production IPC-backed FAT writes remain blocked and are not wired in this stage.
 
 ## Production backend selection
 
@@ -114,8 +138,9 @@ When enabled, the smoke marker block counts `INIT_FAT_SPAWN_BEGIN`,
 - The existing blkcache/block stack still exposes truthful stub behavior in some
   driver paths; FAT mount fails clearly when the backend cannot return real sector
   data.
-- Production IPC-backed FAT writes are not enabled because the current block ABI has
-  `BLK_OP_READ`/info operations but no write request/reply contract.
+- Production IPC-backed FAT writes are not enabled because the current filesystem-facing block ABI
+  has `BLK_OP_READ`/info operations but no write request/reply contract carrying sector bytes.
 - Truncation/shrinking, create, mkdir, rename, and unlink remain unsupported.
-- FAT32 FSInfo free-count/next-free updates are not yet implemented; allocation scans the FAT.
+- FAT32 allocation still scans the FAT for a free cluster; FSInfo is maintained opportunistically
+  when present but is not trusted as the allocator source of truth.
 - FAT writes are not journaled and are not crash-safe across power loss or mid-write failure.

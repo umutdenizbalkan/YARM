@@ -10,6 +10,11 @@ use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 const SECTOR_512: usize = 512;
 const MAX_OPEN_FDS: usize = 32;
 const MAX_PATH_COMPONENTS: usize = 32;
+const FAT_OPEN_PATH_MAX: usize = 96;
+const FAT32_FSINFO_FREE_UNKNOWN: u32 = 0xffff_ffff;
+const FAT32_FSINFO_LEAD_SIG: u32 = 0x4161_5252;
+const FAT32_FSINFO_STRUCT_SIG: u32 = 0x6141_7272;
+const FAT32_FSINFO_TRAIL_SIG: u32 = 0xaa55_0000;
 const ATTR_READ_ONLY: u8 = 0x01;
 const ATTR_HIDDEN: u8 = 0x02;
 const ATTR_SYSTEM: u8 = 0x04;
@@ -42,6 +47,7 @@ pub struct FatLayout {
     pub root_cluster: u32,
     pub cluster_count: u32,
     pub fat_type: FatType,
+    pub fsinfo_sector: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,6 +251,8 @@ struct OpenFd {
     fd: u64,
     entry: usize,
     offset: u64,
+    path_len: u8,
+    path: [u8; FAT_OPEN_PATH_MAX],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,11 +478,86 @@ impl<D: BlockDevice> FatFs<D> {
         )
     }
 
+    fn fsinfo_offset(&self) -> Option<u64> {
+        self.layout
+            .fsinfo_sector
+            .map(|sector| self.sector_offset(u32::from(sector)))
+    }
+
+    fn read_fat32_fsinfo(&self) -> Result<Option<(u32, u32)>, FatError> {
+        if self.layout.fat_type != FatType::Fat32 {
+            return Ok(None);
+        }
+        let Some(offset) = self.fsinfo_offset() else {
+            return Ok(None);
+        };
+        let mut raw = [0u8; SECTOR_512];
+        self.read_at(offset, &mut raw)?;
+        let lead = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let struc = u32::from_le_bytes([raw[484], raw[485], raw[486], raw[487]]);
+        let trail = u32::from_le_bytes([raw[508], raw[509], raw[510], raw[511]]);
+        if lead != FAT32_FSINFO_LEAD_SIG
+            || struc != FAT32_FSINFO_STRUCT_SIG
+            || trail != FAT32_FSINFO_TRAIL_SIG
+        {
+            return Ok(None);
+        }
+        Ok(Some((
+            u32::from_le_bytes([raw[488], raw[489], raw[490], raw[491]]),
+            u32::from_le_bytes([raw[492], raw[493], raw[494], raw[495]]),
+        )))
+    }
+
+    fn write_fat32_fsinfo(&mut self, free_count: u32, next_free: u32) -> Result<(), FatError> {
+        let Some(offset) = self.fsinfo_offset() else {
+            return Ok(());
+        };
+        if self.read_fat32_fsinfo()?.is_none() {
+            return Ok(());
+        }
+        self.write_at(offset + 488, &free_count.to_le_bytes())?;
+        self.write_at(offset + 492, &next_free.to_le_bytes())
+    }
+
+    fn note_fat32_cluster_allocated(&mut self, cluster: u32) -> Result<(), FatError> {
+        let Some((free_count, _)) = self.read_fat32_fsinfo()? else {
+            return Ok(());
+        };
+        let next_free = if cluster + 1 < self.layout.cluster_count + 2 {
+            cluster + 1
+        } else {
+            2
+        };
+        let free_count = if free_count == FAT32_FSINFO_FREE_UNKNOWN {
+            FAT32_FSINFO_FREE_UNKNOWN
+        } else {
+            free_count.saturating_sub(1)
+        };
+        self.write_fat32_fsinfo(free_count, next_free)
+    }
+
+    fn note_fat32_cluster_freed(&mut self, cluster: u32) -> Result<(), FatError> {
+        let Some((free_count, _)) = self.read_fat32_fsinfo()? else {
+            return Ok(());
+        };
+        let free_count = if free_count == FAT32_FSINFO_FREE_UNKNOWN {
+            FAT32_FSINFO_FREE_UNKNOWN
+        } else {
+            free_count.saturating_add(1)
+        };
+        self.write_fat32_fsinfo(free_count, cluster)
+    }
+
+    pub fn fat32_fsinfo_values(&self) -> Result<Option<(u32, u32)>, FatError> {
+        self.read_fat32_fsinfo()
+    }
+
     fn allocate_cluster(&mut self) -> Result<u32, FatError> {
         for cluster in 2..self.layout.cluster_count + 2 {
             if self.fat_entry(cluster)? == 0 {
                 self.set_fat_entry(cluster, self.eoc_marker())?;
                 self.write_cluster_zeroed(cluster)?;
+                self.note_fat32_cluster_allocated(cluster)?;
                 return Ok(cluster);
             }
         }
@@ -793,6 +876,7 @@ impl<D: BlockDevice> FatFs<D> {
                     Err(err) => {
                         for c in allocated {
                             let _ = self.set_fat_entry(c, 0);
+                            let _ = self.note_fat32_cluster_freed(c);
                         }
                         return Err(err);
                     }
@@ -903,6 +987,13 @@ impl FatLayout {
         } else {
             0
         };
+        let fsinfo_raw = u16::from_le_bytes([boot[48], boot[49]]);
+        let fsinfo_sector =
+            if fat_type == FatType::Fat32 && fsinfo_raw != 0 && fsinfo_raw < reserved {
+                Some(fsinfo_raw)
+            } else {
+                None
+            };
         match fat_type {
             FatType::Fat32 => {
                 if root_entries != 0 || root_cluster < 2 {
@@ -930,6 +1021,7 @@ impl FatLayout {
             root_cluster,
             cluster_count: clusters,
             fat_type,
+            fsinfo_sector,
         })
     }
 }
@@ -988,6 +1080,9 @@ impl FatBackend {
     pub fn list_dir(&self, path: &[u8]) -> Result<Vec<DirEntryInfo>, FatError> {
         self.fs.list_dir(path)
     }
+    pub fn fat32_fsinfo_values(&self) -> Result<Option<(u32, u32)>, FatError> {
+        self.fs.fat32_fsinfo_values()
+    }
     pub fn write_path(&mut self, path: &[u8], data: &[u8]) -> Result<(), VfsError> {
         self.fs
             .write_file_at_path(path, 0, data)
@@ -1001,16 +1096,10 @@ impl FatBackend {
             .position(|s| s.map(|o| o.fd == fd).unwrap_or(false))
             .ok_or(VfsError::BadFd)?;
         let open = self.open_fds[slot_idx].ok_or(VfsError::BadFd)?;
-        let path = self
-            .entries
-            .get(open.entry)
-            .ok_or(VfsError::BadFd)?
-            .name
-            .clone();
-        let path_bytes = alloc::format!("/{}", path).into_bytes();
+        let path = &open.path[..open.path_len as usize];
         let updated = self
             .fs
-            .write_file_at_path(path_bytes.as_slice(), open.offset, data)
+            .write_file_at_path(path, open.offset, data)
             .map_err(VfsError::from)?;
         if let Some(entry) = self.entries.get_mut(open.entry) {
             *entry = updated;
@@ -1038,11 +1127,18 @@ impl VfsBackend for FatBackend {
         let idx = self.entries.len();
         self.entries.push(entry);
         self.next_fd = self.next_fd.saturating_add(1);
+        if path.len() > FAT_OPEN_PATH_MAX {
+            return Err(VfsError::NameTooLong);
+        }
         if let Some(slot) = self.open_fds.iter_mut().find(|s| s.is_none()) {
+            let mut stored_path = [0u8; FAT_OPEN_PATH_MAX];
+            stored_path[..path.len()].copy_from_slice(path);
             *slot = Some(OpenFd {
                 fd,
                 entry: idx,
                 offset: 0,
+                path_len: path.len() as u8,
+                path: stored_path,
             });
             Ok(fd)
         } else {
@@ -1184,6 +1280,15 @@ const ATTR_ARCHIVE: u8 = 0x20;
 mod tests {
     use super::*;
     use crate::fs::common::vfs_ipc::VfsBackend;
+
+    #[test]
+    fn mem_block_device_write_persists_sector_contents() {
+        let mut dev = MemBlockDevice::new(vec![0u8; SECTOR_512 * 2]);
+        dev.write_exact_at(512, b"sector").unwrap();
+        let mut out = [0u8; 6];
+        dev.read_exact_at(512, &mut out).unwrap();
+        assert_eq!(&out, b"sector");
+    }
 
     #[test]
     fn fat12_bpb_parse_succeeds() {
@@ -1328,11 +1433,7 @@ mod tests {
         let fd2 = b.openat_path(b"/one.txt").unwrap();
         let mut all = [0u8; 6];
         assert_eq!(b.read_into(fd2, 6, &mut all).unwrap(), (6, 6));
-        assert_eq!(
-            &all,
-            b"ONE
-++"
-        );
+        assert_eq!(&all, b"ONE\n++");
     }
 
     #[test]
@@ -1368,6 +1469,28 @@ mod tests {
         let mut out = [0u8; 2];
         assert_eq!(b.read_into(fd, 2, &mut out).unwrap(), (2, 2));
         assert_eq!(&out, b"AA");
+    }
+
+    #[test]
+    fn fat32_fsinfo_free_count_and_next_free_update_on_allocation() {
+        let mut img = image(FatType::Fat32);
+        write_fat32_fsinfo_sector(&mut img[SECTOR_512..2 * SECTOR_512], 10, 5);
+        let mut b = FatBackend::from_image(img).unwrap();
+        assert_eq!(b.fat32_fsinfo_values().unwrap(), Some((10, 5)));
+        b.write_path(b"/root.txt", &vec![b'R'; 700]).unwrap();
+        assert_eq!(b.fat32_fsinfo_values().unwrap(), Some((9, 6)));
+    }
+
+    #[test]
+    fn open_subdirectory_file_write_uses_original_path() {
+        let mut b = FatBackend::from_image(image(FatType::Fat12)).unwrap();
+        let fd = b.openat_path(b"/sub/inner.txt").unwrap();
+        assert_eq!(b.write_bytes(fd, b"XY").unwrap(), 2);
+        assert_eq!(b.statx_path(b"/sub/inner.txt"), Ok(5));
+        let fd2 = b.openat_path(b"/sub/inner.txt").unwrap();
+        let mut out = [0u8; 5];
+        assert_eq!(b.read_into(fd2, 5, &mut out).unwrap(), (5, 5));
+        assert_eq!(&out, b"XYN12");
     }
 
     fn image(kind: FatType) -> Vec<u8> {
@@ -1533,11 +1656,27 @@ fn format_boot(
     if kind == FatType::Fat32 {
         img[36..40].copy_from_slice(&spf.to_le_bytes());
         img[44..48].copy_from_slice(&root_cluster.to_le_bytes());
+        if reserved > 1 {
+            img[48..50].copy_from_slice(&1u16.to_le_bytes());
+            write_fat32_fsinfo_sector(
+                &mut img[SECTOR_512..2 * SECTOR_512],
+                FAT32_FSINFO_FREE_UNKNOWN,
+                2,
+            );
+        }
     } else {
         img[22..24].copy_from_slice(&(spf as u16).to_le_bytes());
     }
     img[510] = 0x55;
     img[511] = 0xaa;
+}
+
+fn write_fat32_fsinfo_sector(dst: &mut [u8], free_count: u32, next_free: u32) {
+    dst[0..4].copy_from_slice(&FAT32_FSINFO_LEAD_SIG.to_le_bytes());
+    dst[484..488].copy_from_slice(&FAT32_FSINFO_STRUCT_SIG.to_le_bytes());
+    dst[488..492].copy_from_slice(&free_count.to_le_bytes());
+    dst[492..496].copy_from_slice(&next_free.to_le_bytes());
+    dst[508..512].copy_from_slice(&FAT32_FSINFO_TRAIL_SIG.to_le_bytes());
 }
 
 fn set_fat12(img: &mut [u8], cluster: u32, value: u32) {
