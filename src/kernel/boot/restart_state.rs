@@ -74,6 +74,7 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.revoke_reply_caps_for_caller(tid);
+        let _ = self.revoke_reply_caps_for_replier(tid);
         self.clear_ipc_waiters_for_tid(tid);
         self.report_task_exit_to_supervisor(tid, code, token)?;
         if let Some(robust) = robust {
@@ -148,6 +149,7 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.revoke_reply_caps_for_caller(tid);
+        let _ = self.revoke_reply_caps_for_replier(tid);
         self.clear_ipc_waiters_for_tid(tid);
         let _ = self.release_kernel_context(tid);
         let _ = self.revoke_driver_runtime_caps(tid);

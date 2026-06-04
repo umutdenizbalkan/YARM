@@ -8077,3 +8077,237 @@ full hosted-dev test suite (no regression).
 - 9 new Stage 24 tests pass single-threaded (`RUST_MIN_STACK=8388608`).
 - Full hosted-dev suite green; `git diff --check` clean.
 - `SYSCALL_COUNT == 30` unchanged; no ABI change.
+
+#### 42.8.1 Stage 24 acceptance (recorded at Stage 25A)
+
+- **Accepted without x86_64 smoke.** Part A (`TakeOnceStagingBuffer`) is a
+  behavior-preserving replacement of the raw `static mut VFS_ELF_STAGING`:
+  mutual-exclusion-per-call with `Drop`-release, identical bytes copied into the
+  identical buffer for the single in-flight spawn path. No live boot/runtime
+  behavior change, so no `-smp 1` smoke was required (§42.7).
+- **Endpoint / reply-cap audit found no production bugs.** Endpoints are
+  multi-owner (delegated cross-process at spawn); reply records are cleared by
+  `revoke_reply_caps_for_caller(tid)` on teardown but **can linger** after a
+  replier teardown until the caller exits. Generation guards prevent any safety
+  bug — the deferral was a lifecycle-hygiene / bounded-capacity item, addressed
+  in Stage 25C below.
+- **803-test baseline** confirmed at acceptance (latest commit `2b3266d`).
+- **Still deferred** at Stage 24 acceptance: x86_64 SMP / `smp.rs`; RAMFS/FAT
+  runtime spawning.
+
+## §43 Stage 25 — reply-cap replier-exit cleanup + endpoint permanence certification + deferred live-surface map
+
+### 43.0 Carried-forward context
+
+Stage 24 accepted (see §42.8.1). The one Stage 24 deferral with code impact was:
+**reply records involving a torn-down replier linger until the caller exits.**
+This is safe (generation guards) but is a lifecycle-hygiene / bounded-capacity
+issue. Stage 25C closes it; 25D certifies endpoint permanence; 25E maps the
+remaining deferred live cap-release surface.
+
+### 43.1 Reply-cap global record audit (Stage 25B)
+
+`ReplyCapRecord` (`src/kernel/boot/defs.rs:205`) fields:
+
+| Field | Meaning |
+|-------|---------|
+| `caller_tid: ThreadId` | the task that issued the IpcCall (owns the caller-side Reply cap) |
+| `reply_endpoint: CapObject` | endpoint the reply is delivered through |
+| `responder_tid: Option<ThreadId>` | **the replier** — the task expected to call `ipc_reply` (`None` = any receiver may reply) |
+| `caller_cap_id: CapId` | Reply CapId minted into the caller's cnode |
+| `waiter_cap_id: Option<CapId>` | Reply CapId minted into the waiter/replier's cnode on materialization |
+
+Findings:
+
+- The replier is identified by **`responder_tid`**.
+- `revoke_reply_caps_for_caller(tid)` (`ipc_state.rs:109`) matches on
+  **`record.caller_tid.0 == tid`** and sets the slot to `None`. It does NOT
+  match on `responder_tid`.
+- **Before Stage 25C: no `revoke_reply_caps_for_replier(tid)` existed** — nothing
+  cleared a record keyed on `responder_tid`.
+- A record **could linger after the replier's `mark_task_dead`/`exit_task`**:
+  teardown only ran the caller-keyed revoke, so a record where
+  `responder_tid == dead_replier` but `caller_tid` is still live survived until
+  the caller itself exited (or the reply was consumed).
+- Lingering records are **bounded** by `MAX_REPLY_CAPS` — the global table is a
+  fixed array; the worst case is slot pressure, not unbounded growth.
+- A lingering record **holds no cnode slot, no cap_refcount, and cannot wake a
+  dead task**: the caller-side cnode slot is owned by the caller (cleared at
+  caller teardown); the replier-side `waiter_cap_id` slot is cleared by the
+  replier's own cnode teardown; `ipc_reply` resolves the reply cap in the
+  **current (replier)** cnode first, so a dead replier can never deliver; and
+  `resolve_reply_index` rejects any cap whose slot is `None` or whose generation
+  advanced (`StaleCapability`).
+- **Classification: I — safe lingering record** (bounded, generation-guarded,
+  no slot/refcount/wake hazard). Stage 25C clears it proactively for hygiene and
+  to free the slot earlier.
+
+### 43.2 Stage 25C — replier-exit reply-record cleanup (FIX)
+
+Added `revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize`
+(`ipc_state.rs`), a mirror of `revoke_reply_caps_for_caller` that filters on
+`record.responder_tid == Some(tid)` and sets matching slots to `None` under
+`ipc_state_lock` (rank 3). Wired into `exit_task` and `mark_task_dead`
+(`restart_state.rs`) immediately after the existing
+`revoke_reply_caps_for_caller(tid)` call, so a teardown clears records from
+**both** sides.
+
+**Generation handling.** Like `revoke_reply_caps_for_caller`, the helper sets
+the slot to `None` rather than bumping the generation. Setting the slot to `None`
+is already sufficient to invalidate any outstanding Reply cap:
+`resolve_reply_index` returns `StaleCapability` whenever the slot is empty,
+**before** the generation is consulted. The generation is bumped on the next
+slot *reuse* by `create_reply_cap_for_caller` Phase 1. Mirroring the caller path
+exactly keeps the two teardown directions symmetric and behavior-identical.
+
+**Idempotency.** All four orderings are no-ops past the first clear:
+
+- caller exits first → `for_caller` clears the slot → later `for_replier`
+  (caller's teardown, or the replier's own) sees `None` → 0 revoked.
+- replier exits first → `for_replier` clears the slot → later caller teardown's
+  `for_caller` sees `None` → 0 revoked.
+- both helpers run in one teardown: the second sees the slot already `None`.
+- An unrelated record (different caller and different replier) is untouched.
+
+### 43.3 Reply-cap lifecycle table (Stage 25)
+
+| Event | Global `reply_caps[idx]` record | Caller cnode slot | Replier cnode slot | Generation |
+|-------|---------------------------------|-------------------|--------------------|------------|
+| IpcCall create (`create_reply_cap_for_caller`) | reserved (slot `None`→`Some`) | Reply cap minted (`caller_cap_id`) | — | bumped on reserve |
+| recv-v2 materialization | `waiter_cap_id` set | — | Reply cap minted | unchanged |
+| IpcReply success (`ipc_reply`) | consumed (`Some`→`None`) | fast-revoked via `caller_cap_id` | fast-revoked via `waiter_cap_id` | unchanged (bumped on next reuse) |
+| Caller exit (`revoke_reply_caps_for_caller`) | cleared if `caller_tid == tid` | cleared by caller cnode teardown | — | bumped on next reuse |
+| **Replier exit (NEW, `revoke_reply_caps_for_replier`)** | **cleared if `responder_tid == Some(tid)`** | — | cleared by replier cnode teardown | bumped on next reuse |
+| Timeout / error | record NOT touched by `process_ipc_timeout_deadlines`; rollback paths clear `waiter_cap_id` only | per-path | per-path | unchanged |
+| Cnode teardown | already-`None` for the torn-down side (cleared above); `revoke_capability_in_cnode` clears the cnode slot only | cleared | cleared | unchanged |
+| Stale generation guard | `resolve_reply_index` → `StaleCapability` when slot `None` or generation advanced | n/a | n/a | guards reuse |
+
+### 43.4 Stage 25D — endpoint permanence certification
+
+Audit answers:
+
+1. **Is there a `destroy_endpoint` helper?** Yes (`ipc_state.rs:1238`): clears
+   object, receiver waiter, sender-waiter queue, bumps generation, clears
+   `fault_handler_endpoint`. Called **only from tests** today, never from
+   production teardown.
+2. **Does `revoke_capability_in_cnode` do anything for `CapObject::Endpoint`?**
+   No. Only `CapObject::Notification` (single-owner) is destroyed on revoke via
+   `destroy_notification_for_revoked_cap`; MemoryObject has refcount/reclaim
+   handling. Endpoint revoke clears the cnode slot only — correct for a
+   multi-owner object.
+3. **Endpoint generation for stale detection?** Yes —
+   `endpoint_generations[idx]`; `resolve_endpoint_index` returns
+   `StaleCapability` on mismatch.
+4. **`MAX_ENDPOINTS`?** `256` (`boot/mod.rs:62`). Bounded; current boot
+   services use a small fixed number, so practical exhaustion does not occur.
+5. **Permanent by design?** Yes — endpoints are kernel-owned IPC rendezvous
+   objects, deliberately multi-owner (the spawn path delegates the SEND cap to
+   the parent while the service keeps RECEIVE).
+
+**Certification.**
+
+- Endpoints are **permanent-once-created kernel-owned IPC rendezvous objects.**
+- A single Endpoint cap revoke does **not** destroy the object (multi-owner by
+  design).
+- Bounded by `MAX_ENDPOINTS` (256); current boot services use a small fixed
+  number.
+- Endpoint receiver waiters and sender waiters are cleaned by
+  `clear_ipc_waiters_for_tid` on task exit/death (and by
+  `process_ipc_timeout_deadlines` on timeout).
+- **`destroy_endpoint` was deliberately NOT wired** into cnode teardown:
+  ownership is multi-owner, so destroying the object on one owner's teardown
+  would break the surviving owner(s). Future endpoint teardown would require
+  refcount or owner tracking; deferred.
+
+#### 43.4.1 Endpoint permanence table
+
+| Event | Endpoint object | Generation | Receiver waiter | Sender waiter |
+|-------|-----------------|------------|-----------------|---------------|
+| create (`create_endpoint`) | allocated | bumped | — | — |
+| SEND cap delegation (spawn) | unchanged | unchanged | — | — |
+| cap revoke (`revoke_capability_in_cnode`) | **unchanged** (multi-owner) | unchanged | unchanged | unchanged |
+| cnode teardown | unchanged | unchanged | cleared for tid | cleared for tid |
+| task exit receive-blocked | unchanged | unchanged | **cleared** (`clear_ipc_waiters_for_tid`) | — |
+| task exit send-blocked | unchanged | unchanged | — | **cleared** |
+| timeout cleanup | unchanged | unchanged | cleared (`process_ipc_timeout_deadlines`) | cleared |
+| future destroy blocker | would need `destroy_endpoint` wiring | bumped on destroy | cleared | cleared |
+
+### 43.5 Deferred live cap release/destroy surface (Stage 25E)
+
+- **No generic user-facing cap release syscall today.** `SYSCALL_COUNT == 30`,
+  unchanged this stage.
+- **Notification create/destroy live surface deferred** — there is no
+  `sys_notification_destroy` user syscall; destruction happens implicitly via
+  `destroy_notification_for_revoked_cap` on the single-owner cap revoke
+  (Stage 22) and on cnode teardown.
+- **Endpoint teardown deferred** — endpoints are permanent-once-created for the
+  current architecture (§43.4). No user syscall destroys an endpoint.
+- **Any future live surface must be folded into an existing control-plane
+  opcode, not a new syscall number** (ABI invariant: `SYSCALL_COUNT` frozen).
+- **Candidate existing opcodes:** none today is a clean fit. `TransferRelease`
+  (transfer NR=4) is **MemoryObject-scoped** and must NOT become a generic cap
+  release without an explicit design — its semantics are tied to transfer
+  envelope / pin lifecycle, not arbitrary cap destruction. There is no existing
+  generic "object control" / "resource management" opcode to extend; **a new
+  opcode (in a future ABI version) would be required** for a generic cap-release
+  surface.
+- **Stage 23 finding carried forward:** the live notification/cap release
+  surface is classified **E — missing/deferred** (no production code; surface
+  intentionally absent under the current ABI).
+
+### 43.6 Fixes made
+
+- `revoke_reply_caps_for_replier` added (`ipc_state.rs`) and wired into
+  `exit_task` and `mark_task_dead` (`restart_state.rs`) so reply records are
+  cleared proactively from the replier side, not only the caller side. Closes
+  the Stage 24 lifecycle-hygiene deferral (audit classification **I**).
+- No safety bug existed beforehand (generation guards); this is a
+  bounded-capacity / hygiene improvement, not a soundness fix.
+- Endpoint side: no code change — certified permanent-by-design; `destroy_endpoint`
+  intentionally left unwired (multi-owner).
+
+### 43.7 Tests added (Stage 25)
+
+`src/kernel/boot/tests.rs`:
+
+- `stage25c_replier_exit_clears_global_reply_record`
+- `stage25c_caller_exit_still_clears_global_reply_record`
+- `stage25c_caller_exits_first_then_replier_exit_is_idempotent`
+- `stage25c_replier_exits_first_then_caller_cleanup_is_idempotent`
+- `stage25c_both_exit_no_leak_no_underflow`
+- `stage25c_stale_waiter_cap_id_cleared_on_replier_teardown`
+- `stage25c_reply_cap_cannot_be_reused_after_replier_teardown`
+- `stage25c_unrelated_reply_record_unaffected`
+- `stage25c_cnode_teardown_with_reply_cap_remains_safe`
+- `stage25d_endpoint_cap_revoke_does_not_destroy_shared_endpoint`
+- `stage25d_task_exit_clears_endpoint_receiver_waiter`
+- `stage25d_task_exit_clears_endpoint_sender_waiter`
+- `stage25d_repeated_waiter_cleanup_idempotent`
+- `stage25d_endpoint_remains_after_one_owner_cnode_teardown`
+- `stage25d_unrelated_endpoint_unaffected_by_other_endpoint_revoke`
+
+### 43.8 Deferred blockers (Stage 25)
+
+- Generic user-facing cap-release syscall: requires a new ABI opcode (frozen
+  `SYSCALL_COUNT`); deferred.
+- Endpoint destroy live surface: requires refcount/owner tracking; deferred.
+- Notification destroy live syscall: deferred (implicit-only today).
+- x86_64 SMP / `smp.rs`: still deferred.
+- RAMFS/FAT runtime spawning: still deferred.
+
+### 43.9 x86_64 smoke decision (Stage 25)
+
+The only production change is `revoke_reply_caps_for_replier` + two call sites in
+`restart_state.rs`. It runs under the same `ipc_state_lock` (rank 3) as the
+existing caller-side revoke and only sets already-bounded global array slots to
+`None` (no wake, no scheduler mutation, no new lock acquisition order). It is a
+proactive-cleanup superset of behavior that was previously deferred to caller
+exit — observable runtime behavior for live boot is unchanged (records are
+cleared either way; only the timing is earlier). **No x86_64 `-smp 1` smoke
+required**; confirmed instead by the full hosted-dev suite (no regression).
+
+### 43.10 Still deferred
+
+- x86_64 SMP / `smp.rs` — deferred.
+- RAMFS/FAT runtime spawning — deferred.
+- Full global-lock removal — not claimed.

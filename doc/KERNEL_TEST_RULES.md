@@ -2264,3 +2264,83 @@ transfer-envelope, trap/timer/bootstrap/BT2, SMP/`smp.rs`, entering/exiting TID
 trap logic, `handle_trap_with_cpu`, VFS_READ_SHARED_REPLY_ENABLED/syscall27,
 Phase 3B MemoryObject zero-copy spawn, and RAMFS/FAT runtime spawning are all
 unchanged.
+
+## Rule N+32 — Stage 25: replier-exit reply-cap cleanup + endpoint permanence certification test rules
+
+Stage 25 adds `revoke_reply_caps_for_replier(tid)` (mirror of
+`revoke_reply_caps_for_caller`, keyed on `ReplyCapRecord.responder_tid`) and wires
+it into `exit_task` and `mark_task_dead`, so reply records are cleared proactively
+from the replier side, not only when the (possibly long-lived) caller exits. It
+also certifies endpoints as permanent-once-created multi-owner objects
+(KERNEL_LOCKING.md §43). The only production change is the new replier-side revoke
+helper and its two call sites in `restart_state.rs`.
+
+### N+32.1 — Replier teardown clears the global reply record
+
+A test must assert that tearing down the replier (`mark_task_dead(replier)`),
+while the caller is still alive, clears the global `reply_caps[idx]` record whose
+`responder_tid == replier`. See
+`stage25c_replier_exit_clears_global_reply_record`. A regression test must confirm
+the existing caller-side clearing still works
+(`stage25c_caller_exit_still_clears_global_reply_record`).
+
+### N+32.2 — Both teardown directions are idempotent (no leak, no underflow)
+
+Tests must cover all interleavings: caller-first-then-replier and
+replier-first-then-caller must each be a no-op past the first clear (0 revoked on
+the second call); a single teardown that runs both helpers must not leak or
+underflow. See `stage25c_caller_exits_first_then_replier_exit_is_idempotent`,
+`stage25c_replier_exits_first_then_caller_cleanup_is_idempotent`,
+`stage25c_both_exit_no_leak_no_underflow`.
+
+### N+32.3 — Stale reply cap after replier teardown is a stable error
+
+A test must assert that the materialized `waiter_cap_id` does not outlive the
+replier (record gone after teardown) and that a Reply cap whose record was cleared
+by replier teardown resolves to a stable `StaleCapability` error from `ipc_reply`
+(never a panic or stale delivery). See
+`stage25c_stale_waiter_cap_id_cleared_on_replier_teardown`,
+`stage25c_reply_cap_cannot_be_reused_after_replier_teardown`.
+
+### N+32.4 — Replier revoke is selective; full teardown remains safe
+
+A test must assert `revoke_reply_caps_for_replier` clears only records whose
+`responder_tid` matches, leaving unrelated records intact
+(`stage25c_unrelated_reply_record_unaffected`), and that the full
+`mark_task_dead` path (including cnode teardown) with a held reply cap remains
+safe (`stage25c_cnode_teardown_with_reply_cap_remains_safe`).
+
+### N+32.5 — Endpoint permanence: cap revoke and one-owner teardown do not destroy the object
+
+Tests must assert that a single endpoint cap revoke clears only the cnode slot,
+leaving the multi-owner endpoint object and its generation intact
+(`stage25d_endpoint_cap_revoke_does_not_destroy_shared_endpoint`); that tearing
+down one owner's cnode leaves the shared endpoint present
+(`stage25d_endpoint_remains_after_one_owner_cnode_teardown`); and that revoking a
+cap of one endpoint does not disturb an unrelated endpoint
+(`stage25d_unrelated_endpoint_unaffected_by_other_endpoint_revoke`).
+`destroy_endpoint` must NOT be wired into cnode teardown (multi-owner by design).
+
+### N+32.6 — Endpoint waiter cleanup on exit is complete and idempotent
+
+Tests must assert that `exit_task` clears a task's endpoint receiver waiter and
+sender waiter (`stage25d_task_exit_clears_endpoint_receiver_waiter`,
+`stage25d_task_exit_clears_endpoint_sender_waiter`) and that repeated
+`clear_ipc_waiters_for_tid` for an already-cleared tid is a stable no-op
+(`stage25d_repeated_waiter_cleanup_idempotent`).
+
+### N+32.7 — Lock rank, ABI, and no-smoke
+
+`revoke_reply_caps_for_replier` runs under `ipc_state_lock` (rank 3), identical to
+the caller-side revoke; it only sets bounded global array slots to `None` (no
+wake, no scheduler mutation, no new lock acquisition). It is a proactive-cleanup
+superset of previously-deferred behavior, so observable live-boot behavior is
+unchanged → x86_64 `-smp 1` smoke is NOT required. `cargo check
+--no-default-features` and `cargo check --features hosted-dev` must be clean; the
+full hosted-dev suite must pass single-threaded (`RUST_MIN_STACK=8388608`);
+`git diff --check` must be clean. Syscall ABI / `SYSCALL_COUNT` (30), SpawnV5,
+PM/init/service boot, IPC recv-v2/reply-cap/transfer-envelope, trap/timer/
+bootstrap/BT2, SMP/`smp.rs`, entering/exiting TID trap logic, `handle_trap_with_cpu`,
+VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn,
+notification single-owner semantics, endpoint multi-owner semantics, and RAMFS/FAT
+runtime spawning are all unchanged.
