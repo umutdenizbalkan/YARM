@@ -106,8 +106,39 @@ pub fn handle_trap_entry_shared(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
     context: ArchTrapContext,
-    frame: Option<&mut TrapFrame>,
+    mut frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
+    // Stage 29: pre-global-lock split-dispatch seam (whitelist-only, default-deny).
+    //
+    // For a syscall trap whose number is on the `syscall_split` whitelist (today
+    // ONLY `ControlPlaneSetCnodeSlots` / NR 8), service it via per-domain split
+    // helpers WITHOUT taking the global `with_cpu` lock, writing the result into
+    // the frame here (`set_ok(slots, pid, 0)`). The split path never blocks,
+    // yields, schedules, or switches tasks, so `task_switched` stays `false` for
+    // the arch return-register writeback exactly as on the global-lock path.
+    //
+    // Every other syscall (and any classification/precondition miss, or an absent
+    // requester TID) returns `None` and falls through to the UNCHANGED global-lock
+    // dispatch below. This is gated on the trap being a syscall so non-syscall
+    // events (page faults, timer/external IRQs) never enter the seam.
+    if matches!(decode_trap_context(context), TrapEvent::Syscall) {
+        if let Some(frame) = frame.as_deref_mut() {
+            if let Some(result) =
+                crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
+            {
+                crate::yarm_log!(
+                    "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result={}",
+                    frame.syscall_num(),
+                    cpu.0,
+                    if result.is_ok() { "ok" } else { "err" }
+                );
+                // task_switched == false (no scheduler interaction); skip the
+                // global lock entirely.
+                return result;
+            }
+        }
+    }
+
     // Stage L4A: architecture-neutral recv-timeout split-read staging for trap
     // paths that enter through SharedKernel-owned dispatch.
     //

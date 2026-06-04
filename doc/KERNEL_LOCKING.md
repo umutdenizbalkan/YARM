@@ -8779,3 +8779,185 @@ No live trap/syscall dispatch behavior changed (bridge is helper-only; default-d
 fallback keeps every live syscall on the global-lock path). **x86_64 smoke not
 required.** Full suite intentionally not run (helper-only stage); focused Stage 28
 + Stage 27 tests pass.
+
+### 46.10 Stage 28 acceptance record
+
+- **Accepted at commit `0d720b7`** (`Stage 28: split-dispatch bridge scaffold +
+  trap/syscall seam audit`) on `claude/ecstatic-feynman-9ZZwC`.
+- **Delivered:** the whitelist-only split-dispatch bridge scaffold in
+  `src/kernel/syscall_split.rs` (`SplitEligibleSyscall`, `classify_split_eligible`,
+  `try_split_dispatch`), default-deny `_ => None`, sole whitelist variant
+  `ControlPlaneCnodeSlots` (NR 8). 8 unit tests; `SYSCALL_COUNT == 30` preserved.
+- **Helper-only — exact blocker:** there was no *pre-global-lock result-writeback
+  contract*. The candidate handler writes a two-register payload
+  (`set_ok(slots, pid, 0)`); the bridge returned only `Result<(), KernelError>` and
+  did not own `&mut TrapFrame`. The existing `handle_trap_entry_shared` pre-lock
+  seam staged only diagnostic fault / recv-timeout data.
+- **Stage 29 target (this stage):** introduce that result-writeback contract and
+  live-wire ONLY `ControlPlaneSetCnodeSlots` / NR 8.
+- **Still deferred after Stage 28:** x86_64 SMP (`smp.rs`) and RAMFS/FAT runtime
+  spawning remain out of scope; IPC/Spawn/VM/futex/fault stay on the global lock.
+
+## §47 Stage 29 — live-wire ControlPlaneSetCnodeSlots split dispatch (NR 8)
+
+Stage 29 introduces the smallest safe **pre-global-lock syscall result-writeback
+seam** and live-wires exactly one whitelisted syscall —
+`ControlPlaneSetCnodeSlots` / NR 8 — through the Stage 28 split-dispatch bridge.
+This is the first live syscall extraction from the global `SpinLock<KernelState>`.
+
+### 47.1 Seam audit result
+
+The audit confirmed three facts. (1) The architecture-neutral
+`handle_trap_entry_shared` (`src/arch/trap_entry.rs`) already owns `&mut TrapFrame`
+*before* the global lock is taken (`shared.with_cpu(...)`), and on x86_64 the
+trap frame's `syscall_num()` / `arg(i)` are already populated at this seam (the
+existing recv-timeout staging reads them here). (2) `TrapFrame::set_ok` / `set_err`
+(`src/kernel/trapframe.rs`) are pure return-register writes with no global-lock
+dependency, so they may be called directly from the pre-lock seam. (3) The requester
+TID the old handler read via `current_tid(kernel)` is value-equivalent to
+`SharedKernel::current_tid_split_read(cpu)` (scheduler lock only; proven in
+`runtime.rs` Stage 4T+6 tests), so the split path needs no global lock to obtain it.
+
+### 47.2 Result-writeback contract
+
+`set_ok` / `set_err` are architecture-neutral and safe to call directly from the
+split seam, so **no new contract type was added.** Instead Stage 29 adds one
+function, `try_split_dispatch_into_frame(shared, cpu, frame)` in
+`src/kernel/syscall_split.rs`, which:
+
+1. Default-denies by syscall number (`classify_split_eligible_nr_only`) — fast gate,
+   no lock.
+2. Reads the requester TID via `current_tid_split_read(cpu)`; on `None` returns
+   `None` so the global-lock path produces the canonical `Internal` error.
+3. Decodes `(target_pid, slots)` from the frame exactly as
+   `handle_control_plane_set_cnode_slots` does (`arg(SYSCALL_ARG_CAP)` /
+   `arg(SYSCALL_ARG_PTR)`), then calls `try_split_dispatch` (Stage 28).
+4. On `Ok(())` writes `frame.set_ok(slots, target_pid, 0)` — byte-for-byte the old
+   handler's encoding — and returns `Some(Ok(()))`.
+5. On a domain error returns `Some(Err(TrapHandleError::Syscall(SyscallError::from(
+   kernel_err))))` — exactly the value the old `Err(SyscallError)` return became at
+   the trap boundary. NR 8's domain errors were never user-recoverable: the old
+   handler returned `Err` (never `set_err`), so the arch stub treats them as the
+   same propagated/fatal error on both paths.
+
+### 47.3 Live-wired: yes — NR 8 only
+
+`handle_trap_entry_shared` now calls `try_split_dispatch_into_frame` BEFORE
+`with_cpu`, gated on `TrapEvent::Syscall`. `Some(result)` ⇒ the seam wrote the
+frame and we `return result`, skipping the global lock entirely. `None` ⇒ the
+existing global-lock dispatch runs UNCHANGED. The whitelist remains default-deny
+with the single member NR 8; `SYSCALL_COUNT == 30` and the syscall ABI are
+unchanged. A low-noise serial breadcrumb (`YARM_LOCK_SPLIT_DISPATCH nr=8 ...`) is
+emitted on the split path.
+
+### 47.4 Before/after path for NR 8
+
+```
+BEFORE (Stage 28, global-lock):
+  hw vector → IDT stub → entering_tid (with_cpu) → build frame
+    → dispatch_trap_entry_with_shared_kernel → handle_trap_entry_shared
+        → shared.with_cpu(cpu, |k| handle_trap_event_… )      [GLOBAL LOCK]
+            → handle_trap(Syscall) → dispatch → handle_control_plane_set_cnode_slots
+                → frame.set_ok(slots, pid, 0)
+    → exiting_tid (with_cpu) → task_switched=false → write_trap_returns → iretq
+
+AFTER (Stage 29, split, NR 8 only):
+  hw vector → IDT stub → entering_tid (with_cpu) → build frame
+    → dispatch_trap_entry_with_shared_kernel → handle_trap_entry_shared
+        → try_split_dispatch_into_frame(shared, cpu, frame)   [NO GLOBAL LOCK]
+            → current_tid_split_read (sched lock) + split-mut helper
+              (task rank 2 → bootcfg → cap rank 4)
+            → frame.set_ok(slots, pid, 0)  → return
+    → exiting_tid (with_cpu) → task_switched=false → write_trap_returns → iretq
+```
+
+The `entering_tid` / `exiting_tid` snapshots and the `task_switched` writeback
+branch are bit-for-bit identical; only the *logical handler* moved off the global
+lock. The split path performs no scheduler interaction, so
+`entering_tid == exiting_tid` (`task_switched == false`) is preserved and the
+`write_trap_returns_to_saved_regs` branch (not the GPR branch) flushes the frame.
+
+### 47.5 Fallback for all other syscalls
+
+Every non-whitelisted syscall number returns `None` from the seam and is dispatched
+by the unchanged `shared.with_cpu(...)` → `handle_trap` → `dispatch` global-lock
+path. A whitelisted syscall with a failed precondition (`target_pid == 0` /
+`slots == 0`) or an absent requester TID also returns `None`, deferring the
+canonical error encoding to the global-lock path. Adding the live seam therefore
+cannot change the behavior of any syscall other than a fully-valid NR 8.
+
+### 47.6 Why IPC / Spawn / VM / futex / fault remain deferred
+
+Unchanged from §46.4: IPC (G/F) and futex (F) block/yield/schedule and must stay
+inside the global-lock dispatch so the `dispatch` WouldBlock-reschedule epilogue and
+arch `task_switched` writeback remain correct; Spawn/fork/exec (H) span
+task+cap+vm+memory(+ipc) with partial-commit rollback not expressible as a single
+ascending-rank split; VM map/unmap/brk (I) cross vm+memory+cap with TLB-shootdown
+waits; fault/trap (K) is the arch boundary. None is a single-ascending-rank,
+non-blocking, trapframe-encodable mutation, so none is whitelisted.
+
+### 47.7 Why entering/exiting TID untouched
+
+The `entering_tid` / `exiting_tid` snapshots in the x86_64 shared trap path
+(`descriptor_tables.rs`) stay on the global-lock `with_cpu(cpu, |k| k.current_tid())`
+path (hard invariant; Stage 4T+6R revert rationale). The Stage 29 seam reads
+`current_tid_split_read(cpu)` only *internally* to identify the requester; it does
+not touch the arch `entering_tid` / `exiting_tid` reads or the `task_switched`
+computation that drives the GPR-vs-return-register writeback branch.
+
+### 47.8 Why handle_trap_with_cpu retained
+
+`SharedKernel::handle_trap_with_cpu` is retained unchanged (hard invariant). It is
+the global-lock dispatch entry for non-shared/raw trap paths and the fallback for
+every non-NR-8 syscall. The split seam is purely additive and does not replace it.
+
+### 47.9 Smoke requirement
+
+Because NR 8 is now live-wired, x86_64 `-smp 1` smoke IS required. The live
+bare-metal `kernel_boot` binary builds clean for `targets/x86_64-yarm-none.json`
+(`-Z build-std`, `-Z json-target-spec`). QEMU is **not installed in this remote
+execution environment** (`qemu-system-x86_64` absent); the smoke run is therefore
+**deferred to CI / manual run**. Acceptance markers to verify there:
+`X86_BOOTSTRAP_TIMER_IRQ_EOI_ONLY=0`, `X86_BOOTSTRAP_SCHEDULER_READY=1`,
+`X86_BOOTSTRAP_TIMER_STARTED=1`, `ENTER_USER=3`, `STARTUP_INSTALL_FINAL=9`,
+`PM_ELF_ZC_DONE` (image_id 7/8/9, total=3, zc_pages>0), `PM_ELF_ZC_FAIL=0`,
+`INITRAMFS_SRV_ENTRY=1`, `DEVFS_SRV_ENTRY=1`, `VFS_SRV_ENTRY=1`,
+`DRIVER_MANAGER_READY=1`, `BLKCACHE_SRV_READY=1`, `VIRTIO_BLK_SRV_READY=1`,
+fallback=0 / TID mismatch=0 / fatal-ish=0 / oom/capacity=0. The new split path also
+emits `YARM_LOCK_SPLIT_DISPATCH nr=8 cpu=0 result=ok` whenever the control plane
+resizes a process cnode.
+
+### 47.10 Still deferred
+
+x86_64 SMP (`src/arch/x86_64/smp.rs`) and RAMFS/FAT runtime spawning remain out of
+scope and untouched. No claim of full global-lock removal is made: only NR 8 is
+extracted; all other syscalls remain on the global lock.
+
+### 47.11 Tests added (20)
+
+In `src/kernel/syscall_split.rs` (`mod tests`), all prefixed `stage29_`:
+behavior-equivalence — `…_ok_return_lanes`, `…_missing_task_error`,
+`…_bad_requester_class_error`, `…_missing_cnode_error`, `…_duplicate_update_ok`,
+`…_capacity_resize_ok`, `…_error_code_preserved`, `…_no_scheduler_side_effect`,
+`…_no_ipc_side_effect`; fallback safety — `stage29_only_nr8_is_split_eligible`,
+`stage29_ipc_send_not_eligible`, `stage29_spawnv5_not_eligible`,
+`stage29_vm_map_not_eligible`, `stage29_futex_not_eligible`,
+`stage29_syscall_count_still_30`, `stage29_whitelist_exhaustive`;
+result-writeback — `stage29_split_result_ok_encodes_same_as_old_path`,
+`stage29_split_result_err_encodes_same_as_old_path`,
+`stage29_split_result_no_task_switch`,
+`stage29_split_dispatch_fallback_path_unchanged`.
+
+### 47.12 Path/syscall table
+
+| path/syscall | class | old path | new path | global lock? | result writeback | task_switched | smoke? |
+|---|---|---|---|---|---|---|---|
+| ControlPlaneSetCnodeSlots / NR 8 | J | global-lock → handle_trap | split-dispatch bridge | no (split) | set_ok(slots,pid,0) | false | yes |
+| IPC send/recv/call/reply | G | global-lock | unchanged | yes | unchanged | may block | deferred |
+| IPC recv-timeout | F | pre-lock split-read | unchanged | yes for handler | unchanged | may block | deferred |
+| SpawnV5 | H | global-lock | unchanged | yes | unchanged | yes | deferred |
+| fork/exec | H | global-lock | unchanged | yes | unchanged | yes | deferred |
+| VM map/unmap/brk/anon | I | global-lock | unchanged | yes | unchanged | false | deferred |
+| futex | F | global-lock | unchanged | yes | unchanged | may block | deferred |
+| fault/trap | K | global-lock | unchanged | yes | unchanged | varies | deferred |
+| fallback default | L | global-lock | unchanged | yes | unchanged | varies | N/A |

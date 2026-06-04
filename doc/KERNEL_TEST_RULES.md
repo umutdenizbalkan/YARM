@@ -2485,3 +2485,60 @@ clean. x86_64 entering/exiting TID logic, `handle_trap_with_cpu`,
 trap/timer/bootstrap/BT2, SMP/`smp.rs`, SpawnV5, PM/init/service boot,
 VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn, and
 RAMFS/FAT runtime spawning are all unchanged.
+
+## Rule N+36 — Stage 29: live-wire ControlPlaneSetCnodeSlots split dispatch (NR 8) test rules
+
+Stage 29 live-wires exactly one whitelisted syscall — `ControlPlaneSetCnodeSlots` /
+NR 8 — through the Stage 28 split-dispatch bridge via the new pre-global-lock
+result-writeback seam `try_split_dispatch_into_frame` in
+`src/kernel/syscall_split.rs`, called from `handle_trap_entry_shared`
+(`src/arch/trap_entry.rs`) before `with_cpu`.
+
+### N+36.1 — Behavior equivalence (≥8)
+
+Tests must prove the split seam produces the SAME observable result as the old
+global-lock handler for NR 8: on success `set_ok(slots, target_pid, 0)` (ret0 ==
+slots, ret1 == target_pid, ret2 == 0, no error) AND the capability domain is
+actually resized; on a domain error the seam returns
+`TrapHandleError::Syscall(SyscallError::from(kernel_err))` and writes NO success
+payload. Cover missing-task, bad-requester-class (MissingRight), missing/created
+cnode, duplicate update, capacity resize, error-code preservation, and
+no-scheduler / no-IPC side-effects.
+
+### N+36.2 — Fallback safety (≥6)
+
+Every non-whitelisted syscall must return `None` from
+`try_split_dispatch_into_frame` (IPC send/recv, SpawnV5, VM map, futex), and an
+exhaustive 0..SYSCALL_COUNT walk must show ONLY NR 8 is split-eligible
+(`classify_split_eligible_nr_only`). `SYSCALL_COUNT == 30` must be guarded
+explicitly (`stage29_syscall_count_still_30`). A whitelisted syscall with a failed
+precondition or absent requester TID must also fall back (`None`).
+
+### N+36.3 — Result-writeback equivalence (≥4)
+
+Tests must compare the seam's success lanes against a reference
+`frame.set_ok(slots, pid, 0)`; compare the seam's error against the underlying
+split-mut helper's `Result` (no divergence); prove `entering_tid == exiting_tid`
+across the seam (`task_switched == false`); and prove the `None` fallback path still
+reaches the global-lock dispatch.
+
+### N+36.4 — Live-wire constraints
+
+The seam must call `set_ok` / `set_err` directly (they are architecture-neutral pure
+register writes; no new contract type). It must read the requester TID via
+`current_tid_split_read(cpu)` (value-equivalent to the old `current_tid`). It must
+NOT block, yield, schedule, switch tasks, or copy user memory. It must be gated on
+`TrapEvent::Syscall`. A `None` return must leave the existing global-lock path
+byte-for-byte UNCHANGED. The whitelist must not be broadened beyond NR 8.
+
+### N+36.5 — Smoke, suite, invariants
+
+Because NR 8 is live-wired, x86_64 `-smp 1` smoke IS required; if QEMU is
+unavailable it is deferred to CI/manual with the §47.9 markers documented. The live
+`kernel_boot` binary must build clean for `targets/x86_64-yarm-none.json`. The full
+test suite must pass single-threaded (`--test-threads=1`; the multi-threaded run is
+unsupported because tests share global static state). x86_64 entering/exiting TID
+logic, `handle_trap_with_cpu`, the trap boundary, SMP/`smp.rs`, SpawnV5, PM/init/
+service boot, VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject
+zero-copy spawn, and RAMFS/FAT runtime spawning must all be unchanged. `git diff
+--check` must be clean.
