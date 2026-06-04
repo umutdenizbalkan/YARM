@@ -2542,3 +2542,19 @@ logic, `handle_trap_with_cpu`, the trap boundary, SMP/`smp.rs`, SpawnV5, PM/init
 service boot, VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject
 zero-copy spawn, and RAMFS/FAT runtime spawning must all be unchanged. `git diff
 --check` must be clean.
+
+### Rule N+37 (Stage 30)
+
+Every debug-only safety guard added to arch/runtime code (C1 `borrow_kernel_for_boot`
+raw-borrow window, arch timer/trap `debug_assert!`) must have a corresponding test
+that: (a) sets the guard state, (b) asserts the detection function returns the
+expected value, and (c) clears state so subsequent tests are not contaminated. If
+the guard fires a `debug_assert!`/panic in double-set scenarios, a `#[should_panic]`
+test must prove it. All guard tests must pass with `--test-threads=1` (the
+`AtomicBool` guard is process-global and not thread-isolated). Validation-status
+labels on split helpers must be accurate: `TRAP_FORBIDDEN` helpers must not be
+called from the pre-global-lock trap seam; `LIVE_TRAP_SMOKE_X86_64` helpers must
+have a smoke-validated call path. The boot-guard `BOOT_RAW_BORROW_ACTIVE` static,
+begin/end helpers, and `BootRawKernelBorrowGuard` must all be
+`#[cfg(any(debug_assertions, test))]` with zero release-build cost. `SYSCALL_COUNT
+== 30` must be confirmed by a stage30_ test.

@@ -866,6 +866,14 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
     regs: *mut X86SavedRegs,
     interrupt_frame: *mut X86InterruptStackFrame,
 ) {
+    // Stage 30 / Review C1: in debug builds, assert no boot raw-borrow window is
+    // live. A timer/trap reaching with_cpu during that window would alias the boot
+    // &mut KernelState (UB). Compiles to nothing in release; zero ISR overhead.
+    #[cfg(any(debug_assertions, test))]
+    debug_assert!(
+        !crate::runtime::boot_raw_borrow_is_active(),
+        "x86_64 trap/timer ISR fired during boot raw-borrow window — aliasing &mut KernelState risk"
+    );
     let cpu_apic = raw_current_apic_id() as u64;
     let previous_depth = TRAP_DISPATCH_DEPTH.fetch_add(1, Ordering::AcqRel);
     let frame = unsafe { &*interrupt_frame };

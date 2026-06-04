@@ -140,6 +140,11 @@ pub(crate) fn try_split_dispatch(
     }
 }
 
+/// # Validation status
+/// - LIVE_TRAP_SMOKE_X86_64 — entry point for the NR 8 live split-dispatch path;
+///   called from `handle_trap_entry_shared` before the global lock; x86_64 smoke
+///   validated (Stage 29 / 29A, marker `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok`).
+///
 /// Stage 29 live-wire seam: try to service a syscall through the split
 /// (no-global-lock) path AND write its result into the trap frame.
 ///
