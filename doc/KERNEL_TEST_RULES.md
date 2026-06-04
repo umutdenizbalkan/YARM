@@ -2389,3 +2389,52 @@ entering/exiting TID trap logic, `handle_trap_with_cpu`,
 VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn,
 notification single-owner / endpoint multi-owner semantics, and RAMFS/FAT runtime
 spawning are all unchanged.
+
+## Rule N+34 — Stage 27: first mutating global-lock extraction (`control_plane_set_process_cnode_slots`) test rules
+
+### N+34.1 — A split-mutation helper must match global-locked behavior
+
+The first mutating extraction (`control_plane_set_process_cnode_slots_split_mut`)
+must produce the **same final state and the same errors** as the global-locked
+`control_plane_set_process_cnode_slots` / `_planned` path. Covered by
+`stage27_split_mut_helper_matches_global_lock_behavior_for_success` (a
+system-server resize ends at the requested capacity) and
+`stage27_split_mut_duplicate_update_preserves_existing_behavior` (re-apply is a
+stable success). The two preserved error returns are asserted by
+`stage27_split_mut_missing_process_returns_stable_error` (`TaskMissing` for an
+absent requester TID) and `stage27_split_mut_missing_cnode_returns_stable_error`
+(`MissingRight` for an App resizing another process's cnode).
+
+### N+34.2 — Two-phase task(read)→capability(mutate), no rank inversion
+
+The mutating helper must take the task lock (rank 2) only to **snapshot**, release
+it, then take the capability lock (rank 4) to **apply** — never holding the
+capability lock while acquiring the task lock, and never acquiring the outer global
+`SpinLock<KernelState>` (no `with` / `with_cpu`). It must touch **only** the task
+(read) and capability (mutate) domains plus a boot-config limits snapshot.
+`stage27_split_mut_no_scheduler_wake_side_effect` asserts scheduler runnable count
+and dispatch telemetry are unchanged; `stage27_split_mut_no_ipc_side_effect`
+asserts a planted IPC notification waiter is undisturbed;
+`stage27_split_mut_two_processes_isolated` asserts resizing one process's cnode
+leaves another's untouched.
+
+### N+34.3 — Helper-only extraction must document its live-wiring blocker
+
+When a mutating extraction is proven by direct tests but **not** rewired at the live
+callsite, the blocker must be documented (here: the `…_via_syscall` → `handle_trap`
+trap-dispatch seam is class F+I and must keep entering the global lock). No full
+global-lock-removal is claimed.
+
+### N+34.4 — ABI guard, no-smoke, invariants
+
+`SYSCALL_COUNT == 30` is unchanged (no opcode added/removed; the extraction is a
+pure refactor plus an additive helper). No live boot/runtime/trap path is rewired,
+so x86_64 `-smp 1` smoke is NOT required. `cargo check --no-default-features` and
+`cargo check --features hosted-dev` must be clean; the Stage 27 tests must pass
+single-threaded (`RUST_MIN_STACK=8388608`); `git diff --check` must be clean.
+Syscall ABI / `SYSCALL_COUNT` (30), SpawnV5, PM/init/service boot, IPC
+recv-v2/reply-cap/transfer-envelope, trap/timer/bootstrap/BT2, SMP/`smp.rs`,
+entering/exiting TID trap logic, `handle_trap_with_cpu`,
+VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn,
+notification single-owner / endpoint multi-owner semantics, and RAMFS/FAT runtime
+spawning are all unchanged.

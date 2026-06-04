@@ -8375,7 +8375,7 @@ deferred.
 | runtime.rs `*_split_read` / `*_split_mut` (≈30 helpers) | scheduler/task/ipc/cap/fault/telemetry/boot reads & diag muts | A | 1 each | already domain-lock-only; the extraction template |
 | runtime.rs:283 `handle_trap_with_cpu` | trap dispatch entry | E | all (via handle_trap) | trap boundary; do not touch |
 | runtime.rs:269/273 `ipc_recv_*_split_bridge` | IPC recv timeout bridge | D | scheduler+ipc+task | multi-domain blocking recv; deferred |
-| runtime.rs:293 `control_plane_set_process_cnode_slots_via_syscall` | cap control plane | C | task→capability | partly split via `_planned`; mutation, deferred this stage |
+| runtime.rs:293 `control_plane_set_process_cnode_slots_via_syscall` | cap control plane | C | task→capability | Stage 27: `_split_mut` helper extracted (task(2)→cap(4), no global lock); live callsite still global-locked via `handle_trap` seam (F+I) |
 | arch/trap_entry.rs:149 `.with_cpu` | arch trap dispatch | E | all | trap boundary; do not touch |
 | arch/x86_64/descriptor_tables.rs:904/932 `.with_cpu(current_tid)` | x86_64 entering/exiting TID | E | scheduler/task | hard-invariant trap TID logic; do not touch |
 | arch/{aarch64,x86_64}/boot.rs `.with` / `borrow_kernel_for_boot` | boot/ERET | E | all | boot single-CPU; do not touch |
@@ -8466,3 +8466,131 @@ stage — the helpers are additive and currently exercised only by the new unit
 tests). No live boot/runtime behavior changes, so the hard-invariant smoke trigger
 ("x86_64 smoke only if live boot/runtime behavior changes") is not met. Confirmed
 instead by the full hosted-dev suite (no regression).
+
+### 44.10 Stage 26 acceptance
+
+**Stage 26 accepted without smoke.** Summary of accepted state:
+
+- Two read-only extractions landed:
+  - `notification_waiter_count_split_read` — ipc domain, **rank 3**.
+  - `cnode_registered_split_read` — capability domain, **rank 4**.
+- Global-lock callsite audit complete; the A–G classification table is recorded
+  in §44.3, with the per-class approximate counts in the same section.
+- Class **C** candidate identified for the next stage:
+  `control_plane_set_process_cnode_slots` (task read → capability mutate).
+- Baseline: **821 tests pass** at Stage 26; `SYSCALL_COUNT == 30` unchanged.
+- No live boot/runtime/trap path rewired (helpers additive), so no x86_64 smoke.
+- SMP and RAMFS/FAT runtime spawning remain deferred (classes G / out-of-scope).
+
+## 45. Stage 27 — first mutating global-lock extraction (`control_plane_set_process_cnode_slots`)
+
+Stage 27 performs the **first mutating** domain-lock extraction: it lifts the
+control-plane CNode-slot create/resize out of the global `SpinLock<KernelState>`
+into a two-phase **task(read, rank 2) → capability(mutate, rank 4)** protocol that
+never acquires the outer global lock and never calls `with` / `with_cpu`.
+
+### 45.1 Audit result — domains touched
+
+`control_plane_set_process_cnode_slots` (`src/kernel/boot/capability_lifecycle_state.rs:32`)
+and its Stage-5B plan-first variant `_planned` (`:72`) touch exactly two domains:
+
+- **Task (read, rank 2):** requester class and requester pid (`task_class`,
+  `process_id`). In the `_planned` variant these are pre-snapshotted into a
+  `ControlPlaneCnodePlan` by the caller so the capability mutation never re-enters
+  the task lock.
+- **Capability (mutate, rank 4):** the pid→cnode registration table
+  (`capability.process_cnodes`) and the CNode-slot table
+  (`capability.cnode_spaces` / each `CapabilitySpace`). Create path =
+  `ensure_cnode_space_with_slots` + `set_process_cnode_for_pid`; resize path =
+  `resize_cnode_slots`.
+- **Boot-config (read):** runtime capacity limits (`runtime_capacity_config`,
+  reads `boot_config.capacity_profile`) for slot-capacity bounds checks.
+
+It does **not** touch scheduler / IPC / VM / memory. Confirmed by the Stage 27
+side-effect tests (`..no_scheduler_wake_side_effect`, `..no_ipc_side_effect`).
+
+Errors returned (all preserved by the extraction): `TaskMissing` (requester TID
+has no task), `MissingRight` (non-system-server requester whose pid != target, or
+non-system-server target of class `App`), `WrongObject` / `CapabilityFull` (slot
+normalization), `CapabilityFull` (global pool exhausted / cspace alloc/grow),
+`TaskTableFull` (no free cnode-space slot for a new registration).
+
+### 45.2 Before / after call path
+
+- **Before:** `SharedKernel::control_plane_set_process_cnode_slots_via_syscall`
+  (`runtime.rs:288`) → `with(|state| state.…_via_syscall(..))` →
+  `KernelState::…_via_syscall` (`fault_state.rs:350`) builds a `TrapFrame` and
+  calls `handle_trap()`. The syscall handler `handle_control_plane_set_cnode_slots`
+  (`syscall.rs:2062`) snapshots the task plan then calls
+  `control_plane_set_process_cnode_slots_planned`. The entire sequence runs under
+  the **global lock** via `with`/`with_cpu` (the `via_syscall` wrapper internally
+  calls `handle_trap` — the F+I blocker recorded in §44.3 line for runtime.rs:293).
+- **After (new path):** `SharedKernel::control_plane_set_process_cnode_slots_split_mut`
+  (`runtime.rs`, Stage 27 section):
+  1. **Phase 1 — task snapshot (rank 2):** `task_class_from_raw` +
+     `process_id_from_raw` each acquire and **release** `task_state_lock`; build a
+     `ControlPlaneCnodePlan`. `TaskMissing` if the requester has no task.
+  2. **Phase 1b — boot-config snapshot:** `runtime_capacity_config_split_read`
+     (boot_config lock only).
+  3. **Phase 2 — capability mutation (rank 4):**
+     `control_plane_set_process_cnode_slots_apply_from_raw`
+     (`orchestrator_state.rs`) acquires **only** `capability_state_lock` and
+     applies the create/resize, faithfully mirroring `_planned`.
+
+  The outer global `SpinLock<KernelState>` is never taken; no `with`/`with_cpu`.
+
+### 45.3 Snapshot / apply protocol and lock order
+
+Lock order is **task(2) → boot_config → capability(4)**, never inverted: the
+capability lock is acquired only after both reads have released their own locks, so
+the capability lock is never held while taking the task lock. Each phase takes a
+single domain lock and releases it before the next, so the helper cannot itself
+create a rank inversion.
+
+### 45.4 Live-wired or helper-only
+
+**Helper-only this stage (live callsite NOT rewired).** Rationale (documented
+blocker): the production callsite reaches the logic through
+`…_via_syscall` → `handle_trap()` (class **F+I** in §44.3 / §44.1 — it internally
+calls `handle_trap`, so it must keep entering the global lock via `with_cpu`). The
+syscall ABI path (`Syscall::ControlPlaneSetCnodeSlots`, `SYSCALL_COUNT == 30`) and
+SpawnV5/PM/init/service boot behavior must be preserved exactly, and rewiring the
+trap-dispatch wrapper is out of scope and would touch the trap boundary (hard
+invariant). The new `_split_mut` helper is therefore proven correct by direct unit
+tests and is ready to become the live path once the surrounding trap-dispatch seam
+is itself extracted (future stage). No live boot/runtime behavior changes this
+stage, so **no x86_64 smoke** is required.
+
+### 45.5 Extraction table
+
+| path | old lock | new lock | domains | mutation? | live-wired? | tests |
+|------|----------|----------|---------|-----------|-------------|-------|
+| `control_plane_set_process_cnode_slots` | `SharedKernel::with` | task→cap split | task,cap | yes | no (helper-only; trap-seam blocker) | stage27_split_mut_* (7) |
+| task snapshot | `SharedKernel::with` | `task_class_from_raw` + `process_id_from_raw` only | task | read | — | stage27_split_mut_missing_process_returns_stable_error |
+| capability apply | `SharedKernel::with` | `control_plane_set_process_cnode_slots_apply_from_raw` (capability lock) | capability | yes | — | stage27_split_mut_helper_matches_global_lock_behavior_for_success |
+
+### 45.6 Errors preserved
+
+`TaskMissing`, `MissingRight`, `WrongObject`, `CapabilityFull`, `TaskTableFull` —
+all produced at the same decision points as the global `_planned` path. The
+`apply_from_raw` helper reuses `normalize_requested_cnode_slots` and the exact
+`CapabilityDeriveError → KernelError` mapping from `resize_cnode_slots`.
+
+### 45.7 Tests added (7)
+
+`stage27_split_mut_helper_matches_global_lock_behavior_for_success`,
+`stage27_split_mut_missing_process_returns_stable_error`,
+`stage27_split_mut_missing_cnode_returns_stable_error`,
+`stage27_split_mut_duplicate_update_preserves_existing_behavior`,
+`stage27_split_mut_two_processes_isolated`,
+`stage27_split_mut_no_scheduler_wake_side_effect`,
+`stage27_split_mut_no_ipc_side_effect`
+(in `src/kernel/boot/tests.rs`, module `stage27_split_mut_tests`).
+
+### 45.8 Deferred blockers
+
+- Live-wiring the syscall callsite: blocked on the `via_syscall` → `handle_trap`
+  trap-dispatch seam (class F+I); deferred to a future trap-seam extraction stage.
+- Multi-domain syscalls / IPC recv-timeout bridge (D), trap/arch/boot entry (E),
+  SpawnV5/fork/exec (F), x86_64 SMP (G), RAMFS/FAT runtime spawning — all remain
+  deferred. Full global-lock removal is **not** claimed.
