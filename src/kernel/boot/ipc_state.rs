@@ -119,6 +119,40 @@ impl KernelState {
         })
     }
 
+    /// Clear every global `ReplyCapRecord` whose `responder_tid` (the replier) is
+    /// `tid`.  Mirror of `revoke_reply_caps_for_caller` but keyed on the *replier*
+    /// side so that a record involving a torn-down replier is freed proactively at
+    /// the replier's own exit/death — not only when the (possibly long-lived)
+    /// caller eventually exits.
+    ///
+    /// Lock-rank: runs under `ipc_state_lock` (rank 3), identical to
+    /// `revoke_reply_caps_for_caller`.  Clears matching slots in place; no wake,
+    /// no scheduler mutation, no further lock acquisition.
+    ///
+    /// Generation: like the caller-side revoke, the slot is set to `None` (not
+    /// generation-bumped).  An empty slot already invalidates any outstanding
+    /// Reply cap — `resolve_reply_index` returns `StaleCapability` when the slot
+    /// is `None`, before the generation is consulted; the generation is bumped on
+    /// the next slot reuse by `create_reply_cap_for_caller`.
+    ///
+    /// Idempotent: a slot already cleared by a prior caller- or replier-side
+    /// revoke is `None` and is skipped, so repeated/interleaved teardown is a
+    /// no-op past the first clear.
+    pub(crate) fn revoke_reply_caps_for_replier(&mut self, tid: u64) -> usize {
+        self.with_ipc_state_mut(|ipc| {
+            let mut revoked = 0usize;
+            for slot in ipc.reply_caps.iter_mut() {
+                if slot.is_some_and(|record| {
+                    record.responder_tid.is_some_and(|responder| responder.0 == tid)
+                }) {
+                    *slot = None;
+                    revoked += 1;
+                }
+            }
+            revoked
+        })
+    }
+
     /// Remove `tid` from all IPC waiter slots.
     ///
     /// Must be called on task exit and death so a dead task cannot be found as

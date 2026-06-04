@@ -19165,3 +19165,518 @@ fn stage23_no_live_notification_release_syscall_documented() {
 }
 
 // ── End Stage 23 notification revoke/release surface audit tests ───────────────
+
+// ── Stage 25C: replier-exit reply-record cleanup ──────────────────────────────
+
+#[test]
+fn stage25c_replier_exit_clears_global_reply_record() {
+    // revoke_reply_caps_for_replier (wired into mark_task_dead) must clear the
+    // global ReplyCapRecord keyed on responder_tid when the replier tears down,
+    // even though the caller is still alive.
+    std::thread::Builder::new()
+        .name("stage25c_replier_exit".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("caller task");
+            state.register_task(2).expect("replier task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            // The recv cap must resolve in the caller's (task 1) cnode.
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            // Caller = task 1, replier (responder) = task 2.
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(2)))
+                .expect("create reply cap");
+            assert!(
+                state.reply_cap_record_present(0),
+                "precondition: global reply record present (caller=1, replier=2)"
+            );
+
+            // Replier (task 2) dies while caller (task 1) is still alive.
+            state.mark_task_dead(2).expect("mark replier dead");
+
+            assert!(
+                !state.reply_cap_record_present(0),
+                "replier teardown must clear the global reply record keyed on responder_tid"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_caller_exit_still_clears_global_reply_record() {
+    // Regression guard: adding the replier-side revoke must not break the
+    // existing caller-side clearing. Caller teardown still clears its record.
+    std::thread::Builder::new()
+        .name("stage25c_caller_exit".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("caller task");
+            state.register_task(2).expect("replier task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(2)))
+                .expect("create reply cap");
+            assert!(state.reply_cap_record_present(0));
+
+            // Caller (task 1) dies first.
+            state.mark_task_dead(1).expect("mark caller dead");
+
+            assert!(
+                !state.reply_cap_record_present(0),
+                "caller teardown must still clear the global reply record"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_caller_exits_first_then_replier_exit_is_idempotent() {
+    // Caller exits first (clears the record); the later replier teardown finds
+    // the slot already None and is a no-op (no underflow, no panic).
+    std::thread::Builder::new()
+        .name("stage25c_caller_first_replier_idem".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("caller task");
+            state.register_task(2).expect("replier task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(2)))
+                .expect("create reply cap");
+
+            state.mark_task_dead(1).expect("caller dead");
+            assert!(!state.reply_cap_record_present(0), "record cleared by caller exit");
+
+            // Replier teardown: slot already None → 0 revoked, no-op.
+            let revoked = state.revoke_reply_caps_for_replier(2);
+            assert_eq!(revoked, 0, "replier revoke after caller cleared must be a no-op");
+            state.mark_task_dead(2).expect("replier dead is idempotent");
+            assert!(!state.reply_cap_record_present(0));
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_replier_exits_first_then_caller_cleanup_is_idempotent() {
+    // Replier exits first (clears the record via the new path); the later caller
+    // teardown finds the slot already None and is a no-op.
+    std::thread::Builder::new()
+        .name("stage25c_replier_first_caller_idem".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("caller task");
+            state.register_task(2).expect("replier task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(2)))
+                .expect("create reply cap");
+
+            state.mark_task_dead(2).expect("replier dead");
+            assert!(!state.reply_cap_record_present(0), "record cleared by replier exit");
+
+            // Caller teardown: slot already None → 0 revoked, no-op.
+            let revoked = state.revoke_reply_caps_for_caller(1);
+            assert_eq!(revoked, 0, "caller revoke after replier cleared must be a no-op");
+            state.mark_task_dead(1).expect("caller dead is idempotent");
+            assert!(!state.reply_cap_record_present(0));
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_both_exit_no_leak_no_underflow() {
+    // Both helpers running in one teardown (mark_task_dead calls both
+    // for_caller and for_replier): the second sees the slot already None.
+    // No leak (record gone), no underflow (revoke counts are sane).
+    std::thread::Builder::new()
+        .name("stage25c_both_exit".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("self task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            let recv_cap = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            // Caller and replier are the same task (self-reply edge case).
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap, Some(ThreadId(1)))
+                .expect("create reply cap");
+            assert!(state.reply_cap_record_present(0));
+
+            // mark_task_dead(1) runs both revoke_reply_caps_for_caller(1) and
+            // revoke_reply_caps_for_replier(1); the first clears, the second no-ops.
+            state.mark_task_dead(1).expect("mark dead");
+            assert!(!state.reply_cap_record_present(0), "record must be gone, not leaked");
+
+            // Re-running both directly is still a clean no-op.
+            assert_eq!(state.revoke_reply_caps_for_caller(1), 0);
+            assert_eq!(state.revoke_reply_caps_for_replier(1), 0);
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_stale_waiter_cap_id_cleared_on_replier_teardown() {
+    // A materialized waiter_cap_id pointing into the replier's cnode must not
+    // outlive the replier: once the replier tears down, the whole record (and
+    // thus its waiter_cap_id) is gone.
+    std::thread::Builder::new()
+        .name("stage25c_stale_waiter_cap".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(2).expect("replier task");
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            // Caller = task 0 (current), replier = task 2.
+            let reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+                .expect("create reply cap");
+            let reply_index = 0usize;
+            let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
+            state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
+            assert_eq!(
+                state.reply_cap_record_waiter_cap(reply_index),
+                Some(reply_cap),
+                "precondition: waiter_cap_id set"
+            );
+
+            state.mark_task_dead(2).expect("replier dead");
+
+            assert!(
+                !state.reply_cap_record_present(reply_index),
+                "replier teardown clears the record; the stale waiter_cap_id is gone with it"
+            );
+            assert_eq!(
+                state.reply_cap_record_waiter_cap(reply_index),
+                None,
+                "no lingering waiter_cap_id after replier teardown"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_reply_cap_cannot_be_reused_after_replier_teardown() {
+    // After the replier is torn down the global record is gone, so the Reply
+    // CapId is stale: ipc_reply must return a stable StaleCapability error.
+    std::thread::Builder::new()
+        .name("stage25c_no_reuse_after_replier_teardown".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(2).expect("replier task");
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            // Reply cap minted into the current (task 0) cnode; responder = task 2.
+            let reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+                .expect("create reply cap");
+
+            state.mark_task_dead(2).expect("replier dead");
+
+            assert_eq!(
+                state.ipc_reply(reply_cap, Message::new(0, b"stale").expect("msg")),
+                Err(KernelError::StaleCapability),
+                "stale reply cap after replier teardown must be a stable error"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_unrelated_reply_record_unaffected() {
+    // revoke_reply_caps_for_replier must only clear records whose responder_tid
+    // matches; an unrelated record (different replier) survives.
+    std::thread::Builder::new()
+        .name("stage25c_unrelated_record".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(2).expect("replier 2");
+            state.register_task(3).expect("replier 3");
+            let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            // Record A: replier = task 2 (slot 0).
+            let _reply_a = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(2)))
+                .expect("reply A");
+            // Record B: replier = task 3 (slot 1).
+            let _reply_b = state
+                .create_reply_cap_for_caller(ThreadId(0), recv_cap, Some(ThreadId(3)))
+                .expect("reply B");
+            assert!(state.reply_cap_record_present(0));
+            assert!(state.reply_cap_record_present(1));
+
+            // Tear down replier 2 only.
+            let revoked = state.revoke_reply_caps_for_replier(2);
+            assert_eq!(revoked, 1, "exactly the one record for replier 2 must be cleared");
+            assert!(!state.reply_cap_record_present(0), "replier-2 record cleared");
+            assert!(
+                state.reply_cap_record_present(1),
+                "unrelated replier-3 record must be unaffected"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25c_cnode_teardown_with_reply_cap_remains_safe() {
+    // Full mark_task_dead path (which includes cnode teardown via
+    // maybe_cleanup_process_cnode_for_pid) with a reply cap held by the dying
+    // replier must remain safe: record cleared, no panic, generation guard intact.
+    std::thread::Builder::new()
+        .name("stage25c_cnode_teardown_safe".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("caller task");
+            state.register_task(2).expect("replier task");
+            let (_eid, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            // Grant the receive cap to the caller (task 1) so create_reply_cap_for_caller
+            // can resolve it, and also to the replier (task 2) so it owns a cnode cap.
+            let recv_cap_t1 = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            let _recv_cap_t2 = state
+                .grant_capability_task_to_task(0, recv_cap_global, 2)
+                .expect("grant recv to t2");
+            let _reply_cap = state
+                .create_reply_cap_for_caller(ThreadId(1), recv_cap_t1, Some(ThreadId(2)))
+                .expect("create reply cap");
+            assert!(state.reply_cap_record_present(0));
+
+            // Full teardown of the replier (clears record + cnode).
+            state.mark_task_dead(2).expect("mark replier dead");
+
+            assert!(
+                !state.reply_cap_record_present(0),
+                "record cleared after full replier teardown"
+            );
+            // Caller teardown afterward is still a clean no-op.
+            state.mark_task_dead(1).expect("mark caller dead");
+            assert!(!state.reply_cap_record_present(0));
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+// ── Stage 25D: endpoint permanence certification ──────────────────────────────
+
+#[test]
+fn stage25d_endpoint_cap_revoke_does_not_destroy_shared_endpoint() {
+    // Revoking a single endpoint cap must clear only the cnode slot; the shared
+    // multi-owner endpoint object survives with its generation unchanged.
+    std::thread::Builder::new()
+        .name("stage25d_revoke_no_destroy".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let cnode = state.current_task_cnode().expect("task0 cnode");
+            let (ep, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let gen_before = state.with_ipc_state(|ipc| ipc.endpoint_generations[ep]);
+
+            state
+                .revoke_capability_in_cnode(cnode, recv_cap)
+                .expect("revoke recv cap");
+
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoints[ep].is_some()),
+                "endpoint object must survive single-cap revoke (multi-owner)"
+            );
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.endpoint_generations[ep]),
+                gen_before,
+                "endpoint generation must be unchanged by cap revoke"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25d_task_exit_clears_endpoint_receiver_waiter() {
+    // A task blocked as an endpoint receiver must be removed from the receiver
+    // waiter slot on exit_task (via clear_ipc_waiters_for_tid).
+    std::thread::Builder::new()
+        .name("stage25d_exit_clears_recv_waiter".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("task1");
+            let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[ep] = Some(ThreadId(1));
+            });
+            assert_eq!(state.endpoint_waiter_count(ep), 1, "precondition: receiver waiter");
+
+            state.exit_task(1, 0).expect("exit task 1");
+
+            assert_eq!(
+                state.endpoint_waiter_count(ep),
+                0,
+                "exit_task must clear the dead task's endpoint receiver waiter"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25d_task_exit_clears_endpoint_sender_waiter() {
+    // A task queued as an endpoint sender must be removed from the sender waiter
+    // queue on exit_task.
+    std::thread::Builder::new()
+        .name("stage25d_exit_clears_send_waiter".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("task1");
+            let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let msg = Message::new(0, b"blocked-send").expect("msg");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_sender_waiters[ep][0] = Some(SenderWaiter { tid: ThreadId(1), msg });
+            });
+            assert_eq!(state.sender_waiter_count(ep), 1, "precondition: sender waiter");
+
+            state.exit_task(1, 0).expect("exit task 1");
+
+            assert_eq!(
+                state.sender_waiter_count(ep),
+                0,
+                "exit_task must clear the dead task's endpoint sender waiter"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25d_repeated_waiter_cleanup_idempotent() {
+    // Clearing endpoint waiters for a tid that has already been cleared is a
+    // stable no-op.
+    std::thread::Builder::new()
+        .name("stage25d_repeated_cleanup".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("task1");
+            let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_waiters[ep] = Some(ThreadId(1));
+            });
+
+            state.clear_ipc_waiters_for_tid(1);
+            assert_eq!(state.endpoint_waiter_count(ep), 0, "first clear removes waiter");
+            // Repeated clears must not panic or resurrect anything.
+            state.clear_ipc_waiters_for_tid(1);
+            state.clear_ipc_waiters_for_tid(1);
+            assert_eq!(state.endpoint_waiter_count(ep), 0, "repeated clear is a no-op");
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25d_endpoint_remains_after_one_owner_cnode_teardown() {
+    // Endpoint is multi-owner: tearing down one owner's cnode (the receiver) must
+    // not destroy the shared endpoint object held by another owner.
+    std::thread::Builder::new()
+        .name("stage25d_endpoint_survives_owner_teardown".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            state.register_task(1).expect("owner task");
+            let (ep, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+            // Delegate the receive cap to task 1; task 0 keeps the send cap.
+            let _recv_cap_t1 = state
+                .grant_capability_task_to_task(0, recv_cap_global, 1)
+                .expect("grant recv to t1");
+            let gen_before = state.with_ipc_state(|ipc| ipc.endpoint_generations[ep]);
+
+            // Tear down task 1 (one owner).
+            state.mark_task_dead(1).expect("mark task 1 dead");
+
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoints[ep].is_some()),
+                "endpoint object must survive teardown of one owner (multi-owner)"
+            );
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.endpoint_generations[ep]),
+                gen_before,
+                "endpoint generation must be unchanged by one owner's teardown"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+#[test]
+fn stage25d_unrelated_endpoint_unaffected_by_other_endpoint_revoke() {
+    // Revoking a cap of endpoint A must not disturb a second, unrelated endpoint B.
+    std::thread::Builder::new()
+        .name("stage25d_endpoint_isolation".into())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            let mut state = Bootstrap::init().expect("init");
+            let cnode = state.current_task_cnode().expect("task0 cnode");
+            let (ep_a, _send_a, recv_a) = state.create_endpoint(4).expect("endpoint A");
+            let (ep_b, _send_b, _recv_b) = state.create_endpoint(4).expect("endpoint B");
+            assert_ne!(ep_a, ep_b);
+            let gen_b_before = state.with_ipc_state(|ipc| ipc.endpoint_generations[ep_b]);
+
+            state
+                .revoke_capability_in_cnode(cnode, recv_a)
+                .expect("revoke recv cap A");
+
+            assert!(
+                state.with_ipc_state(|ipc| ipc.endpoints[ep_b].is_some()),
+                "unrelated endpoint B must remain present"
+            );
+            assert_eq!(
+                state.with_ipc_state(|ipc| ipc.endpoint_generations[ep_b]),
+                gen_b_before,
+                "unrelated endpoint B generation must be unchanged"
+            );
+        })
+        .expect("spawn")
+        .join()
+        .expect("join");
+}
+
+// ── End Stage 25 tests ────────────────────────────────────────────────────────
