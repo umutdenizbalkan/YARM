@@ -10,12 +10,65 @@ use crate::kernel::boot::{
 use crate::kernel::capabilities::CapId;
 use crate::kernel::ipc::Message;
 use crate::kernel::task::{FaultPolicy, TaskClass};
+#[cfg(any(debug_assertions, test))]
+use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
 use crate::kernel::lock::{SpinLock, SpinLockIrq};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::trap::{FaultInfo, Trap};
 use crate::kernel::trapframe::TrapFrame;
+
+/// Stage 30 / Review-finding C1: debug-only guard for the raw `&mut KernelState`
+/// aliasing window opened by [`SharedKernel::borrow_kernel_for_boot`].
+///
+/// If a timer ISR or trap entry fires and calls `with` / `with_cpu` while the raw
+/// boot borrow is live, the two mutable references alias — undefined behavior.
+/// This flag lets arch trap/timer entry points `debug_assert!` no such race
+/// is in progress. Zero cost in release: the static, helpers, and all
+/// `debug_assert!` callers are `#[cfg(any(debug_assertions, test))]`.
+#[cfg(any(debug_assertions, test))]
+static BOOT_RAW_BORROW_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Open the boot raw-borrow window (debug/test only).
+///
+/// Asserts the window was not already open (no double-borrow).
+#[cfg(any(debug_assertions, test))]
+pub fn begin_boot_raw_borrow_window() {
+    let was_active = BOOT_RAW_BORROW_ACTIVE.swap(true, Ordering::SeqCst);
+    debug_assert!(
+        !was_active,
+        "borrow_kernel_for_boot called while a raw boot borrow is already live — aliasing &mut KernelState"
+    );
+}
+
+/// Close the boot raw-borrow window (debug/test only).
+#[cfg(any(debug_assertions, test))]
+pub fn end_boot_raw_borrow_window() {
+    BOOT_RAW_BORROW_ACTIVE.store(false, Ordering::SeqCst);
+}
+
+/// Report whether the boot raw-borrow window is currently open (debug/test only).
+#[cfg(any(debug_assertions, test))]
+pub fn boot_raw_borrow_is_active() -> bool {
+    BOOT_RAW_BORROW_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// RAII guard that closes the boot raw-borrow window on drop (debug/test only).
+///
+/// The live arch boot path never returns (ERET), so the window is intentionally
+/// not closed in production — the flag becomes irrelevant after ERET since all
+/// further KernelState access goes through `with` / `with_cpu`. This guard is
+/// useful in test/returning paths where dropping it restores a clean state.
+#[cfg(any(debug_assertions, test))]
+pub struct BootRawKernelBorrowGuard;
+
+#[cfg(any(debug_assertions, test))]
+impl Drop for BootRawKernelBorrowGuard {
+    fn drop(&mut self) {
+        end_boot_raw_borrow_window();
+    }
+}
 
 /// Pre-read snapshot of diagnostic data for the fatal-trap log path.
 ///
@@ -69,6 +122,9 @@ impl SharedKernel {
         Ok(f(&mut guard))
     }
 
+    /// # Validation status
+    /// - LIVE_TRAP_SMOKE_X86_64 — called from the pre-global-lock recv-timeout
+    ///   trap seam (`handle_trap_entry_shared`); reads only the scheduler tick.
     pub fn scheduler_tick_now_split_read(&self) -> u64 {
         // Stage 2B split: read scheduler tick directly under scheduler lock.
         crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read");
@@ -98,6 +154,10 @@ impl SharedKernel {
             .flatten()
     }
 
+    /// # Validation status
+    /// - TRAP_FORBIDDEN / REQUIRES_AUTHORITATIVE_TID — stale at the pre-global-lock
+    ///   x86_64 trap seam (Stage 29A proof: returned tid 0 instead of running requester).
+    ///   Trap-seam requester identity must use `current_tid_authoritative`.
     pub fn current_tid_split_read(&self, cpu: CpuId) -> Option<u64> {
         // Phase L5A split: read the scheduler's per-CPU current TID directly
         // under the scheduler lock.  This intentionally avoids the global
@@ -112,6 +172,7 @@ impl SharedKernel {
             .map(|tid| tid.0)
     }
 
+    /// # Validation status: UNIT_ONLY — staged read helper, not on the trap path.
     pub fn online_cpu_count_split_read(&self) -> usize {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
@@ -124,6 +185,7 @@ impl SharedKernel {
         kernel_ref(&sched.scheduler).online_cpu_count()
     }
 
+    /// # Validation status: UNIT_ONLY — staged read helper, not on the trap path.
     pub fn present_cpu_count_split_read(&self) -> usize {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
@@ -136,6 +198,7 @@ impl SharedKernel {
         kernel_ref(&sched.scheduler).present_cpu_count()
     }
 
+    /// # Validation status: UNIT_ONLY — immutable boot-config read, not on the trap path.
     pub fn capacity_profile_split_read(&self) -> KernelCapacityProfile {
         // Phase L8B split: read immutable boot configuration under only the
         // boot_config lock domain. This intentionally avoids the global
@@ -154,6 +217,9 @@ impl SharedKernel {
         KernelState::runtime_capacity_config_for_profile(profile)
     }
 
+    /// # Validation status
+    /// - LIVE_TRAP_SMOKE_X86_64 — called from `handle_trap_entry_shared` pre-lock seam
+    ///   to record fault diagnostics; mutates only `fault_state_lock` domain.
     fn with_fault_split_mut<R>(&self, f: impl FnOnce(&mut FaultSubsystem) -> R) -> R {
         // Stage 3B-A helper-only split mutation: use only fault_state_lock and
         // mutate only diagnostic fault bookkeeping. Do not acquire the outer
@@ -185,6 +251,9 @@ impl SharedKernel {
         });
     }
 
+    /// # Validation status
+    /// - LIVE_OFF_TRAP — mutates only telemetry counters under `telemetry_state_lock`;
+    ///   called from off-trap kernel code, not the pre-global-lock trap seam.
     fn with_telemetry_split_mut<R>(&self, f: impl FnOnce(&mut TelemetrySubsystem) -> R) -> R {
         // Stage 3C-B helper-only split mutation: use only telemetry_state_lock
         // and mutate only simple diagnostic telemetry counters. Do not acquire
@@ -278,6 +347,9 @@ impl SharedKernel {
         self.with_telemetry_split_read(|telemetry| telemetry.tlb_shootdown_timeout_count)
     }
 
+    /// # Validation status
+    /// - LIVE_OFF_TRAP — pre-reads scheduler tick, then falls back to global lock for recv;
+    ///   not a standalone trap-seam path.
     pub fn ipc_recv_with_deadline_split_bridge(
         &self,
         recv_cap: CapId,
@@ -396,6 +468,7 @@ impl SharedKernel {
 
     // ── Stage 26 split-read helpers ──────────────────────────────────────────
 
+    /// # Validation status: LIVE_OFF_TRAP — reads IPC domain lock (rank 3); off-trap use only.
     pub fn notification_waiter_count_split_read(&self, notification_idx: usize) -> usize {
         // STAGE 26: extracted from global lock, uses only domain ipc (rank 3) lock.
         // Reads the notification-waiter presence for `notification_idx` through
@@ -414,6 +487,7 @@ impl SharedKernel {
         }
     }
 
+    /// # Validation status: LIVE_OFF_TRAP — reads capability domain lock (rank 4); off-trap use only.
     pub fn cnode_registered_split_read(&self, pid: u64) -> bool {
         // STAGE 26: extracted from global lock, uses only domain capability (rank 4) lock.
         // Checks whether a CNode space is registered for `pid` through
@@ -429,8 +503,12 @@ impl SharedKernel {
         }
     }
 
-    // ── Stage 27 split-mutation helper ───────────────────────────────────────
+    // ── Stage 27 / 29 split-mutation helpers ─────────────────────────────────
 
+    /// # Validation status
+    /// - LIVE_TRAP_SMOKE_X86_64 — used by `try_split_dispatch_into_frame` for the
+    ///   NR 8 live-wired split path; x86_64 smoke validated (Stage 29 / 29A).
+    ///
     /// STAGE 27: first mutating global-lock extraction for
     /// `control_plane_set_process_cnode_slots`. Performs the two-phase
     /// task(read) → capability(mutate) protocol WITHOUT acquiring the outer
@@ -497,20 +575,40 @@ impl SharedKernel {
 
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
     ///
-    /// This exists solely for AArch64 boot code that must pass `&mut KernelState`
-    /// to a callback that eventually calls `yarm_aarch64_enter_user_mode_eret -> !`.
-    /// Holding the `SpinLock` across an ERET that never returns would leave
+    /// # Validation status
+    /// - LIVE_OFF_TRAP — called only from single-CPU arch boot, never from the trap
+    ///   path. Opens a raw `&mut KernelState` aliasing window (Review finding C1).
+    ///
+    /// This exists solely for AArch64/x86_64 boot code that must pass
+    /// `&mut KernelState` to a callback that eventually ERETs into user space and
+    /// never returns. Holding the `SpinLock` across that ERET would leave
     /// `held = true` permanently, deadlocking all subsequent trap handlers.
     ///
-    /// # Safety
+    /// # Canonical safety contract (Review finding C1)
     /// * Must only be called during single-CPU boot before any trap handler can
-    ///   concurrently call `SharedKernel::with` or `with_cpu`.
+    ///   concurrently call `SharedKernel::with` or `with_cpu`. On both archs the
+    ///   raw `TRAP_KERNEL_STATE_PTR` is installed only AFTER this borrow, and
+    ///   external interrupts stay masked until later in boot; the LAPIC/timer
+    ///   deadline is far beyond the boot window, so no timer ISR fires during it.
+    ///   If a timer ISR DID fire and reach `with_cpu`, it would build a second
+    ///   `&mut KernelState` aliasing this one — undefined behavior.
     /// * The returned reference must not be used after the ERET to user space;
     ///   from that point all KernelState access must go through `with` / `with_cpu`.
     /// * `TRAP_KERNEL_STATE_PTR` must remain null while this reference is live so
     ///   that the trap fallback path cannot also yield `&mut KernelState`.
+    ///
+    /// The debug-only `BOOT_RAW_BORROW_ACTIVE` flag (set here, asserted at arch
+    /// timer/trap entry) enforces the no-concurrent-access contract under
+    /// `debug_assertions`/`test`. The live boot path is non-returning, so the
+    /// window is never explicitly closed in production; the flag becomes
+    /// irrelevant after the ERET (see [`begin_boot_raw_borrow_window`]).
+    ///
+    /// # Safety
+    /// See canonical safety contract above; delegated to the caller.
     #[cfg(not(feature = "hosted-dev"))]
     pub(crate) unsafe fn borrow_kernel_for_boot(&self) -> &mut KernelState {
+        #[cfg(any(debug_assertions, test))]
+        begin_boot_raw_borrow_window();
         // SAFETY: delegated to caller (see doc comment above).
         unsafe { &mut *self.state.data_ptr() }
     }

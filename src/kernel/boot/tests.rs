@@ -20160,3 +20160,86 @@ mod stage29a_live_split_dispatch_tests {
         assert_eq!(SYSCALL_COUNT, 30, "Stage 29A must not change SYSCALL_COUNT");
     }
 }
+
+// ── Stage 30: borrow_kernel_for_boot debug guard + split-helper validation ──────
+#[cfg(test)]
+mod stage30_boot_guard_tests {
+    use crate::runtime::{
+        begin_boot_raw_borrow_window, boot_raw_borrow_is_active, end_boot_raw_borrow_window,
+        BootRawKernelBorrowGuard,
+    };
+
+    #[test]
+    fn stage30_boot_raw_borrow_guard_begin_sets_active() {
+        // Ensure the window flag is clear before the test (may be dirty from
+        // a previous test that didn't clean up).
+        end_boot_raw_borrow_window();
+        begin_boot_raw_borrow_window();
+        assert!(
+            boot_raw_borrow_is_active(),
+            "begin_boot_raw_borrow_window must set the active flag"
+        );
+        // Clean up so subsequent tests start clean.
+        end_boot_raw_borrow_window();
+    }
+
+    #[test]
+    fn stage30_boot_raw_borrow_guard_end_clears_active() {
+        end_boot_raw_borrow_window();
+        begin_boot_raw_borrow_window();
+        assert!(boot_raw_borrow_is_active());
+        end_boot_raw_borrow_window();
+        assert!(
+            !boot_raw_borrow_is_active(),
+            "end_boot_raw_borrow_window must clear the active flag"
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn stage30_boot_raw_borrow_guard_double_begin_panics() {
+        // The second begin while the window is already open represents a
+        // double-borrow of &mut KernelState — this must panic in debug mode.
+        end_boot_raw_borrow_window();
+        begin_boot_raw_borrow_window();
+        begin_boot_raw_borrow_window(); // must panic
+    }
+
+    #[test]
+    fn stage30_raii_guard_clears_on_drop() {
+        end_boot_raw_borrow_window();
+        begin_boot_raw_borrow_window();
+        assert!(boot_raw_borrow_is_active());
+        {
+            let _guard = BootRawKernelBorrowGuard;
+            assert!(boot_raw_borrow_is_active(), "still active while guard is held");
+        }
+        assert!(
+            !boot_raw_borrow_is_active(),
+            "BootRawKernelBorrowGuard::drop must clear the flag"
+        );
+    }
+
+    #[test]
+    fn stage30_timer_guard_detects_active_window_in_test() {
+        // Simulate what the arch timer ISR debug_assert checks: if the boot
+        // raw-borrow window is active, boot_raw_borrow_is_active() returns true.
+        end_boot_raw_borrow_window();
+        assert!(
+            !boot_raw_borrow_is_active(),
+            "guard must be inactive before the simulated timer fires"
+        );
+        begin_boot_raw_borrow_window();
+        assert!(
+            boot_raw_borrow_is_active(),
+            "timer ISR debug_assert would trigger: window is active"
+        );
+        end_boot_raw_borrow_window();
+    }
+
+    #[test]
+    fn stage30_syscall_count_still_30() {
+        use crate::kernel::syscall::SYSCALL_COUNT;
+        assert_eq!(SYSCALL_COUNT, 30, "Stage 30 must not change SYSCALL_COUNT");
+    }
+}

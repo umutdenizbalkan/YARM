@@ -643,6 +643,14 @@ fn write_trapframe_back_to_vector_frame(
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_vector_entry(kind: u64, frame: *mut Aarch64VectorFrame) {
+    // Stage 30 / Review C1: in debug builds, assert no boot raw-borrow window is
+    // live. A trap/timer reaching with_cpu during that window would alias the boot
+    // &mut KernelState (UB). Compiles to nothing in release; zero vector overhead.
+    #[cfg(any(debug_assertions, test))]
+    debug_assert!(
+        !crate::runtime::boot_raw_borrow_is_active(),
+        "aarch64 trap/timer vector fired during boot raw-borrow window — aliasing &mut KernelState risk"
+    );
     trap_trace_line("YARM_AARCH64_VECTOR_ENTRY");
     trap_trace_line("YARM_AARCH64_BOOT_MARKER stage=exception");
     let Some(frame) = (unsafe { frame.as_mut() }) else {

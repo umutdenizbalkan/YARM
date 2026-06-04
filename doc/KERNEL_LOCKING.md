@@ -8961,3 +8961,148 @@ result-writeback — `stage29_split_result_ok_encodes_same_as_old_path`,
 | futex | F | global-lock | unchanged | yes | unchanged | may block | deferred |
 | fault/trap | K | global-lock | unchanged | yes | unchanged | varies | deferred |
 | fallback default | L | global-lock | unchanged | yes | unchanged | varies | N/A |
+
+## §47.13 Stage 29 / 29A acceptance record
+
+**Accepted at commit `bf1a1e4`** (Stage 29A, branch `claude/ecstatic-feynman-9ZZwC`).
+
+- `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok` count = 1 in x86_64 `-smp 1` smoke.
+- `PM_NR8_SELF_PROBE_OK pid=3 slots=520` emitted — PM self-probe confirmed NR 8
+  went through the real arch syscall trap, not a direct function call.
+- All Phase3B / service-entry / fallback=0 / TID-mismatch=0 health markers intact.
+- SYSCALL_COUNT == 30; no ABI changes.
+
+**Stale-TID lesson (Stage 29A finding):** `current_tid_split_read(cpu)` reads the
+scheduler's per-CPU current slot under the scheduler lock WITHOUT first binding
+`current_cpu`. At the pre-global-lock x86_64 trap point this is stale — it can
+return tid 0 (the previous occupant) instead of the running requester. Trap-seam
+requester identity MUST use `current_tid_authoritative(cpu)`, which takes the
+global lock just long enough to set `current_cpu` and read `current_tid()`. The
+split-dispatch *mutation* still runs lock-free via the per-domain split-mut helper.
+
+x86_64 SMP still deferred. RAMFS/FAT spawning still deferred.
+
+---
+
+## §48 Stage 30 — borrow_kernel_for_boot debug guard + split-helper validation labels
+
+### 48.1 Purpose
+
+Stage 30 implements two safety guardrails (Review findings C1 and C2) before
+expanding live trap-seam split dispatch to more syscalls.
+
+**C1** — `borrow_kernel_for_boot` opens a raw `&mut KernelState` aliasing window
+with no debug guard. If a timer ISR or trap entry fired and called `with_cpu`
+during that window, two `&mut KernelState` references would exist simultaneously
+— undefined behavior.
+
+**C2** — Split-read/split-mut helpers lacked explicit validation-status labels
+making it easy to misuse them (e.g., the Stage 29A regression used the
+TRAP_FORBIDDEN `current_tid_split_read` from the trap seam).
+
+### 48.2 borrow_kernel_for_boot canonical safety contract
+
+`borrow_kernel_for_boot` must only be called during single-CPU boot:
+
+1. Before the arch trap handler is installed (`TRAP_KERNEL_STATE_PTR` is null while
+   the borrow is live, so the trap fallback cannot also yield `&mut KernelState`).
+2. Before external interrupts are unmasked for normal operation (LAPIC/timer
+   deadline is far beyond the boot window; no timer ISR fires during it).
+3. The returned `&mut KernelState` must not be used after the ERET to user space.
+
+If a timer ISR DID fire during the window and reach `with_cpu`, it would build a
+second aliasing `&mut KernelState` — UB.
+
+### 48.3 Debug guard design
+
+New items in `src/runtime.rs` under `#[cfg(any(debug_assertions, test))]`:
+
+```
+BOOT_RAW_BORROW_ACTIVE: AtomicBool      — global flag, zero release cost
+begin_boot_raw_borrow_window()          — sets flag; debug_asserts no double-borrow
+end_boot_raw_borrow_window()            — clears flag
+boot_raw_borrow_is_active() -> bool     — current flag value
+BootRawKernelBorrowGuard                — RAII: Drop clears flag (test/returning paths)
+```
+
+`borrow_kernel_for_boot` calls `begin_boot_raw_borrow_window()` unconditionally
+(no-op in release). The live boot path is non-returning (ERET), so the window is
+intentionally never closed in production — the flag becomes irrelevant after ERET
+since all subsequent KernelState access goes through `with` / `with_cpu`.
+
+### 48.4 Arch timer/trap guard wiring
+
+At the **top** of each arch trap/vector entry (before any `SharedKernel` access):
+
+- **x86_64**: `yarm_x86_dispatch_trap_from_stub` (`src/arch/x86_64/descriptor_tables.rs`)
+- **AArch64**: `yarm_aarch64_vector_entry` (`src/arch/aarch64/boot.rs`)
+- **RISC-V**: not wired — does not call `borrow_kernel_for_boot`
+
+```rust
+#[cfg(any(debug_assertions, test))]
+debug_assert!(
+    !crate::runtime::boot_raw_borrow_is_active(),
+    "trap/timer fired during boot raw-borrow window — aliasing &mut KernelState risk"
+);
+```
+
+Compiles to nothing in release. Zero ISR/vector overhead in production.
+
+### 48.5 Split-helper validation-status labels
+
+Policy: each split helper carries a one-line `# Validation status` doc comment
+using this vocabulary:
+
+| Tag | Meaning |
+|---|---|
+| `UNIT_ONLY` | hosted-dev/test only; never on arch trap path |
+| `LIVE_OFF_TRAP` | called from off-trap kernel code (boot, control-plane) |
+| `LIVE_TRAP_SMOKE_X86_64` | on pre/post-global-lock trap seam; x86_64 smoke validated |
+| `TRAP_FORBIDDEN` | MUST NOT be called from pre-global-lock trap seam (stale data) |
+| `HELPER_ONLY` | scaffold/helper; not yet wired to live trap path |
+| `REQUIRES_AUTHORITATIVE_TID` | trap-seam callers must use `current_tid_authoritative` |
+
+Applied labels (Stage 30):
+
+| helper | status |
+|---|---|
+| `current_tid_split_read` | TRAP_FORBIDDEN / REQUIRES_AUTHORITATIVE_TID |
+| `current_tid_authoritative` | (existing Stage 29A doc; authoritative for trap seam) |
+| `scheduler_tick_now_split_read` | LIVE_TRAP_SMOKE_X86_64 |
+| `with_fault_split_mut` | LIVE_TRAP_SMOKE_X86_64 |
+| `with_telemetry_split_mut` | LIVE_OFF_TRAP |
+| `ipc_recv_with_deadline_split_bridge` | LIVE_OFF_TRAP |
+| `notification_waiter_count_split_read` | LIVE_OFF_TRAP |
+| `cnode_registered_split_read` | LIVE_OFF_TRAP |
+| `control_plane_set_process_cnode_slots_split_mut` | LIVE_TRAP_SMOKE_X86_64 |
+| `try_split_dispatch_into_frame` | LIVE_TRAP_SMOKE_X86_64 |
+| `online_cpu_count_split_read` | UNIT_ONLY |
+| `present_cpu_count_split_read` | UNIT_ONLY |
+| `capacity_profile_split_read` | UNIT_ONLY |
+| `borrow_kernel_for_boot` | LIVE_OFF_TRAP (raw aliasing window, C1) |
+
+### 48.6 No live syscall expansion in Stage 30
+
+The split-dispatch whitelist remains NR 8 only. IPC, SpawnV5, VM, futex, fault,
+and SMP paths remain entirely on the global lock.
+
+### 48.7 Smoke decision
+
+All additions are `#[cfg(any(debug_assertions, test))]` / `debug_assert!` and
+compile to nothing in release. No release/live timer/trap/bootstrap behavior
+changed. x86_64 smoke is deferred for Stage 30.
+
+### 48.8 Still deferred
+
+x86_64 SMP; RAMFS/FAT runtime spawning; live split-dispatch expansion beyond NR 8.
+
+### 48.9 Tests added (Stage 30)
+
+6 tests in `src/kernel/boot/tests.rs` module `stage30_boot_guard_tests`:
+`stage30_boot_raw_borrow_guard_begin_sets_active`,
+`stage30_boot_raw_borrow_guard_end_clears_active`,
+`stage30_boot_raw_borrow_guard_double_begin_panics` (`#[should_panic]`),
+`stage30_raii_guard_clears_on_drop`,
+`stage30_timer_guard_detects_active_window_in_test`,
+`stage30_syscall_count_still_30`.
+All pass single-threaded. Full lib suite: 871 passed, 0 failed.
