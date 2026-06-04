@@ -2199,3 +2199,68 @@ pass single-threaded (`RUST_MIN_STACK=8388608`), and `git diff --check` must be
 clean. Syscall ABI / `SYSCALL_COUNT` (30), SpawnV5, IPC recv-v2/reply-cap/
 transfer-envelope, trap/timer/bootstrap, SMP/`smp.rs`, VFS/syscall27, and the
 live IRQ-delivery success path are all unchanged.
+
+## Rule N+31 — Stage 24: VFS ELF staging take-once + endpoint/reply-cap revoke audit test rules
+
+Stage 24 has two parts. Part A replaces the raw `static mut VFS_ELF_STAGING`
+with the typed `TakeOnceStagingBuffer`, encoding exclusive (mutual-exclusion)
+access in the type system. Part B is an audit of endpoint/reply-cap revoke and
+cnode-teardown surfaces (KERNEL_LOCKING.md §42). No production code changed in
+Part B; the only production change is Part A's soundness wrapper, which is
+behavior-preserving for the legitimate single-in-flight spawn path.
+
+### N+31.1 — Take-once buffer: first claim succeeds, second fails
+
+Tests must assert that `TakeOnceStagingBuffer::try_take` returns `Some` on the
+first call and `None` while a claim is outstanding (exclusive access enforced by
+the atomic flag). Use a local `static` instance for determinism — do **not**
+depend on the live `VFS_ELF_STAGING` static (its claim state is shared with the
+real handlers). See `stage24_vfs_elf_staging_first_claim_succeeds`,
+`stage24_vfs_elf_staging_second_claim_fails`.
+
+### N+31.2 — Take-once buffer: reusable after drop
+
+A test must assert the RAII guard releases the claim on `Drop` so the shared
+buffer is reusable by the next spawn syscall (the buffer is NOT a permanent
+one-shot — both spawn handlers reuse it across many process spawns). See
+`stage24_vfs_elf_staging_claim_reusable_after_drop`. A test must also confirm
+`as_mut_slice` exposes exactly `N` bytes
+(`stage24_vfs_elf_staging_as_mut_slice_has_full_length`).
+
+### N+31.3 — Endpoint waiter teardown leaves no stranded receiver/sender
+
+Tests must assert that after `mark_task_dead`, a task that was the endpoint
+receiver waiter (`endpoint_waiters`) or an endpoint sender waiter
+(`endpoint_sender_waiters`) is removed (`clear_ipc_waiters_for_tid` runs in the
+exit path). See
+`stage24_cnode_teardown_with_endpoint_cap_does_not_leave_receiver_waiter`,
+`stage24_cnode_teardown_with_endpoint_cap_does_not_leave_sender_waiter`.
+
+### N+31.4 — Reply-cap global record cleared at caller teardown; stale cap is a stable error
+
+A test must assert that `mark_task_dead(caller)` clears the global
+`reply_caps[idx]` record (via `revoke_reply_caps_for_caller`), and a separate
+test must assert that a Reply cap left in the replier's cnode after the caller is
+torn down resolves to a stable `StaleCapability` error from `ipc_reply` (never a
+panic or a stale delivery). See `stage24_reply_cap_cnode_teardown_clears_global_record`,
+`stage24_stale_reply_cap_cannot_be_reused_after_cnode_teardown`.
+
+### N+31.5 — Endpoint cap revoke is isolated (multi-owner object survives)
+
+A test must assert that revoking one endpoint cap clears only that cnode slot and
+does NOT destroy the endpoint object (endpoints are multi-owner / delegated
+cross-process), nor bump its generation, nor disturb an unrelated endpoint. See
+`stage24_endpoint_cap_revoke_does_not_affect_unrelated_endpoint`.
+
+### N+31.6 — Behavior-preserving production change; no smoke
+
+Part A is behavior-preserving for the single-in-flight spawn path; Part B changed
+no production code. No live boot/runtime behavior change → x86_64 `-smp 1` smoke
+is NOT required. `cargo check --no-default-features` and `cargo check --features
+hosted-dev` must be clean; the full hosted-dev suite must pass single-threaded
+(`RUST_MIN_STACK=8388608`); `git diff --check` must be clean. Syscall ABI /
+`SYSCALL_COUNT` (30), SpawnV5, PM/init/service boot, IPC recv-v2/reply-cap/
+transfer-envelope, trap/timer/bootstrap/BT2, SMP/`smp.rs`, entering/exiting TID
+trap logic, `handle_trap_with_cpu`, VFS_READ_SHARED_REPLY_ENABLED/syscall27,
+Phase 3B MemoryObject zero-copy spawn, and RAMFS/FAT runtime spawning are all
+unchanged.
