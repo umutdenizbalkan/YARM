@@ -1462,10 +1462,12 @@ impl KernelState {
     /// delivery. Returns the snapshotted waiter TID (if any) so the caller can
     /// unblock it outside the lock; `None` if the slot was already empty.
     ///
-    /// Currently exercised by the Stage 21 lifetime tests and available as the
-    /// teardown primitive for future capability-revoke wiring; allow dead_code
-    /// in non-test builds until that wiring lands.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Stage 22: wired into the capability-revoke / cnode-teardown / task-exit
+    /// cleanup paths via `revoke_capability_in_cnode` and
+    /// `revoke_capability_direct_in_process_cnode` (see
+    /// `capability_lifecycle_state.rs`). Callers invoke this AFTER releasing
+    /// `capability_state_lock` (rank 4) so the `ipc_state_lock` (rank 3) acquired
+    /// here never inverts the cap→ipc rank ordering.
     pub(crate) fn destroy_notification(
         &mut self,
         notification_idx: usize,
@@ -1494,6 +1496,42 @@ impl KernelState {
             ipc.notification_generations[notification_idx] = next_gen;
             Ok::<Option<ThreadId>, KernelError>(waiter)
         })
+    }
+
+    /// Stage 22: wake a waiter that was parked on a notification destroyed by a
+    /// capability revoke / cnode teardown.
+    ///
+    /// `destroy_notification` snapshots and clears the waiter slot under
+    /// `ipc_state_lock` (rank 3) and returns the TID so the caller can unblock it
+    /// AFTER the lock is released. This must run outside both `ipc_state_lock`
+    /// and `capability_state_lock` (rank 4) to preserve lock-rank ordering.
+    ///
+    /// Wake gating mirrors `signal_notification`: only a task still `Blocked(_)`
+    /// is transitioned to `Runnable` and enqueued. A snapshotted TID can race
+    /// against a timeout / exit that already moved the task out of `Blocked`, so
+    /// a Dead/Exited/Runnable/Running/Faulted task must NOT be resurrected or
+    /// double-enqueued. Once runnable, the woken task re-resolves its recv cap and
+    /// observes the destroyed object (generation mismatch → stale error), so no
+    /// extra cancellation signalling is needed here.
+    pub(crate) fn wake_destroyed_notification_waiter(
+        &mut self,
+        waiter_tid: ThreadId,
+    ) -> Result<(), KernelError> {
+        let should_enqueue = self.with_tcbs_mut(|tcbs| {
+            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == waiter_tid.0) else {
+                return Ok::<bool, KernelError>(false);
+            };
+            if matches!(tcb.status, TaskStatus::Blocked(_)) {
+                tcb.status = TaskStatus::Runnable;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })?;
+        if should_enqueue {
+            self.enqueue_task(waiter_tid.0)?;
+        }
+        Ok(())
     }
 
     pub fn route_external_irq(&mut self, irq_line: u16) -> Result<(), KernelError> {

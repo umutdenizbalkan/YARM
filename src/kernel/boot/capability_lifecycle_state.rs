@@ -332,8 +332,40 @@ impl KernelState {
         if let Some(capability) = source_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
+            self.destroy_notification_for_revoked_cap(capability.object);
         }
         Ok(())
+    }
+
+    /// Stage 22: tear down a Notification object whose cap was just revoked.
+    ///
+    /// Notification caps are single-owner per object (the creator mints exactly a
+    /// SIGNAL + a RECEIVE cap into its own cnode; Notification caps are never
+    /// granted cross-process and carry no refcount — see `create_notification`).
+    /// Revoking ANY Notification cap therefore destroys the underlying object.
+    ///
+    /// Lock-rank: the caller (`revoke_capability_in_cnode` /
+    /// `revoke_capability_direct_in_process_cnode`) has already released
+    /// `capability_state_lock` (rank 4) before reaching here; `destroy_notification`
+    /// acquires `ipc_state_lock` (rank 3) on its own, preserving cap→ipc ordering.
+    ///
+    /// Idempotent: the paired second cap (or a double-revoke) re-enters with the
+    /// object slot already `None`; `destroy_notification` then returns
+    /// `WrongObject`, which is swallowed here as a benign no-op. The snapshotted
+    /// waiter (if any) is unblocked outside both locks via
+    /// `wake_destroyed_notification_waiter`.
+    fn destroy_notification_for_revoked_cap(&mut self, object: CapObject) {
+        let CapObject::Notification { index, .. } = object else {
+            return;
+        };
+        match self.destroy_notification(index) {
+            Ok(Some(waiter_tid)) => {
+                let _ = self.wake_destroyed_notification_waiter(waiter_tid);
+            }
+            // Object already gone (paired cap / double-revoke) or out of range:
+            // benign no-op — nothing left to tear down.
+            Ok(None) | Err(_) => {}
+        }
     }
 
     pub(crate) fn record_delegated_capability_link(
@@ -398,6 +430,7 @@ impl KernelState {
         if let Some(capability) = revoked_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
             self.reclaim_memory_object_if_unreferenced(capability.object);
+            self.destroy_notification_for_revoked_cap(capability.object);
         }
     }
 
