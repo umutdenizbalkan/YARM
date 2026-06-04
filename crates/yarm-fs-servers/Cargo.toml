@@ -34,7 +34,6 @@ path = "src/bin/initramfs_srv.rs"
 [[bin]]
 name = "ext4_srv"
 path = "src/bin/ext4_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "fat_srv"

@@ -3,8 +3,9 @@
 
 # FAT Filesystem Server Contract
 
-`yarm-fs-servers` includes a read-only FAT server exported as `run_fat()` and built by
-`crates/yarm-fs-servers/src/bin/fat_srv.rs`.
+`yarm-fs-servers` includes a FAT server exported as `run_fat()` and built by
+`crates/yarm-fs-servers/src/bin/fat_srv.rs`. The parser and hosted memory-image backend now support
+limited regular-file writes; production IPC writes remain gated on a future block-write ABI.
 
 ## Supported formats
 
@@ -19,13 +20,22 @@
 
 ## VFS behavior
 
-The server implements read-only `openat`, `read`, `close`, and `statx` through the
+The server implements `openat`, `read`, `write`, `close`, and `statx` through the
 existing common filesystem service wrapper. Directory traversal is available in the
 FAT core for path lookup and hosted tests; there is currently no separate VFS
 `readdir` opcode in the shared request contract.
 
-Unsupported mutating operations such as write, mkdir, and unlink are rejected with
-`VfsError::Unsupported`. The server must not fake successful writes.
+Current write support is intentionally narrow and regular-file-only:
+
+- overwrites within an existing cluster chain;
+- appends/growth that allocate free clusters, zero freshly allocated clusters, and link the FAT chain;
+- directory-entry file-size updates after successful growth;
+- best-effort rollback of newly allocated clusters when cluster allocation fails before linkage.
+
+The current VFS write request carries only a length, so service-level `write` persists zero bytes like
+RAMFS. Tests and filesystem-internal users can call `write_path`/`write_bytes` for exact byte payloads.
+Unsupported mutating operations such as `mkdir` and `unlink` are still rejected with
+`VfsError::Unsupported`.
 
 ## Names and directories
 
@@ -104,6 +114,8 @@ When enabled, the smoke marker block counts `INIT_FAT_SPAWN_BEGIN`,
 - The existing blkcache/block stack still exposes truthful stub behavior in some
   driver paths; FAT mount fails clearly when the backend cannot return real sector
   data.
-- FAT writes, allocation, truncation, mkdir, rename, and unlink are intentionally
-  unsupported and return `VfsError::Unsupported` where the current VFS/backend
-  surface exposes them.
+- Production IPC-backed FAT writes are not enabled because the current block ABI has
+  `BLK_OP_READ`/info operations but no write request/reply contract.
+- Truncation/shrinking, create, mkdir, rename, and unlink remain unsupported.
+- FAT32 FSInfo free-count/next-free updates are not yet implemented; allocation scans the FAT.
+- FAT writes are not journaled and are not crash-safe across power loss or mid-write failure.

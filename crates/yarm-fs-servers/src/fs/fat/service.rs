@@ -3,10 +3,10 @@
 
 use super::super::common::service::FsService;
 use super::super::common::vfs_ipc::{
-    CloseRequest, ReadWriteRequest, VfsError, close_message, openat_inline_message, read_message,
-    statx_inline_message,
+    close_message, openat_inline_message, read_message, statx_inline_message, CloseRequest,
+    ReadWriteRequest, VfsError,
 };
-use super::fs::{FAT_HELLO_PATH, FatBackend, FatBackendKind, FatError};
+use super::fs::{FatBackend, FatBackendKind, FatError, FAT_HELLO_PATH};
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type FatService = FsService<FatBackend>;
@@ -316,7 +316,8 @@ mod tests {
         assert_eq!(n, 13);
         assert_eq!(inline, 13);
         assert_eq!(svc.backend_mut().statx_path(FAT_HELLO_PATH), Ok(13));
-        assert_eq!(svc.backend_mut().write(fd, 1), Err(VfsError::Unsupported));
+        assert_eq!(svc.backend_mut().write(fd, 1), Ok(1));
+        assert_eq!(svc.backend_mut().statx_path(FAT_HELLO_PATH), Ok(14));
     }
 
     #[test]
@@ -325,7 +326,10 @@ mod tests {
         assert_eq!(default.prefix(), b"/fat");
         assert_eq!(default.device_id, 1);
         assert!(default.readonly);
-        assert_eq!(default.block_cap_source, FatBlockCapSource::ServiceExtraCap0);
+        assert_eq!(
+            default.block_cap_source,
+            FatBlockCapSource::ServiceExtraCap0
+        );
 
         for (prefix, device_id, readonly) in [
             (b"/fat".as_slice(), 1u32, true),
@@ -338,7 +342,10 @@ mod tests {
             assert_eq!(decoded.prefix(), prefix);
             assert_eq!(decoded.device_id, device_id);
             assert_eq!(decoded.readonly, readonly);
-            assert_eq!(decoded.block_cap_source, FatBlockCapSource::ServiceExtraCap0);
+            assert_eq!(
+                decoded.block_cap_source,
+                FatBlockCapSource::ServiceExtraCap0
+            );
             assert_eq!(decoded, configured);
         }
 
