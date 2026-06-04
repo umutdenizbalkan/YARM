@@ -375,6 +375,41 @@ impl SharedKernel {
         unsafe { KernelState::is_group_leader_from_raw(self.state.data_ptr() as *const _, tid) }
     }
 
+    // ── Stage 26 split-read helpers ──────────────────────────────────────────
+
+    pub fn notification_waiter_count_split_read(&self, notification_idx: usize) -> usize {
+        // STAGE 26: extracted from global lock, uses only domain ipc (rank 3) lock.
+        // Reads the notification-waiter presence for `notification_idx` through
+        // ipc_state_lock only. Does not acquire the outer SharedKernel lock and
+        // does not mutate any state.
+        // Lock order: ipc (rank 3). Forbidden caller-held locks: none with rank ≤ 3.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `notification_waiter_count_from_raw` uses `addr_of!`
+        // to derive raw field pointers without creating a whole-KernelState
+        // reference; the ipc lock serializes access to the `ipc` field.
+        unsafe {
+            KernelState::notification_waiter_count_from_raw(
+                self.state.data_ptr() as *const _,
+                notification_idx,
+            )
+        }
+    }
+
+    pub fn cnode_registered_split_read(&self, pid: u64) -> bool {
+        // STAGE 26: extracted from global lock, uses only domain capability (rank 4) lock.
+        // Checks whether a CNode space is registered for `pid` through
+        // capability_state_lock only. Does not acquire the outer SharedKernel
+        // lock and does not mutate any state.
+        // Lock order: capability (rank 4). Forbidden caller-held locks: none with rank ≤ 4.
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `cnode_registered_from_raw` uses `addr_of!` to derive
+        // raw field pointers without creating a whole-KernelState reference; the
+        // capability lock serializes access to the `capability` field.
+        unsafe {
+            KernelState::cnode_registered_from_raw(self.state.data_ptr() as *const _, pid)
+        }
+    }
+
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
     ///
     /// This exists solely for AArch64 boot code that must pass `&mut KernelState`
@@ -1219,5 +1254,116 @@ mod tests {
             "is_group_leader_split_read must match global for unknown TID"
         );
         assert!(!kernel.is_group_leader_split_read(999));
+    }
+
+    // ── Stage 26 split-read extraction tests ────────────────────────────────
+
+    #[test]
+    fn stage26_global_lock_audit_syscall_count_unchanged() {
+        // Stage 26 ABI guard: the global-lock callsite audit + two domain-lock
+        // extractions are pure refactoring and must not alter the syscall ABI.
+        assert_eq!(
+            crate::kernel::syscall::SYSCALL_COUNT,
+            30,
+            "Stage 26 must not change SYSCALL_COUNT"
+        );
+    }
+
+    #[test]
+    fn stage26_notification_waiter_count_split_read_matches_global() {
+        // Stage 26: prove notification_waiter_count_split_read (ipc lock only,
+        // rank 3) returns the same value as the globally-locked
+        // notification_waiter_count() accessor, both with and without a waiter.
+        use crate::kernel::ipc::ThreadId;
+
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+
+        let notif_idx = kernel.with(|state| {
+            state.register_task(610).expect("task");
+            let (idx, _send, _recv) = state.create_notification(4).expect("notif");
+            idx
+        });
+
+        // Before a waiter is injected: both paths report 0.
+        let before_global = kernel.with(|state| state.notification_waiter_count(notif_idx));
+        assert_eq!(
+            kernel.notification_waiter_count_split_read(notif_idx),
+            before_global,
+            "split-read must match global before waiter"
+        );
+        assert_eq!(kernel.notification_waiter_count_split_read(notif_idx), 0);
+
+        // Inject a waiter through the ipc domain.
+        kernel.with(|state| {
+            state.with_ipc_state_mut(|ipc| {
+                ipc.notification_waiters[notif_idx] = Some(ThreadId(610));
+            });
+        });
+
+        let after_global = kernel.with(|state| state.notification_waiter_count(notif_idx));
+        assert_eq!(
+            kernel.notification_waiter_count_split_read(notif_idx),
+            after_global,
+            "split-read must match global after waiter"
+        );
+        assert_eq!(kernel.notification_waiter_count_split_read(notif_idx), 1);
+
+        // Adjacent path regression: a different (empty) notification slot still
+        // reads 0 via the split-read helper.
+        let other_idx = if notif_idx == 0 { 1 } else { 0 };
+        assert_eq!(kernel.notification_waiter_count_split_read(other_idx), 0);
+    }
+
+    #[test]
+    fn stage26_cnode_registered_split_read_matches_global() {
+        // Stage 26: prove cnode_registered_split_read (capability lock only,
+        // rank 4) agrees with the globally-locked cnode_slot_capacity() presence
+        // check, both before and after a CNode is created.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        const PID: u64 = 620;
+
+        // Before CNode creation: both paths report "not registered".
+        let before_global = kernel.with(|state| {
+            use crate::kernel::capabilities::CNodeId;
+            state.cnode_slot_capacity(CNodeId(621)).is_some()
+        });
+        assert_eq!(
+            kernel.cnode_registered_split_read(621),
+            before_global,
+            "split-read must match global before creation"
+        );
+        assert!(!kernel.cnode_registered_split_read(621));
+
+        // Create a CNode via the control plane (same setup as Stage 5A test).
+        kernel.with(|state| {
+            state
+                .register_task_with_class(PID, TaskClass::SystemServer)
+                .expect("system server");
+            state
+                .register_task_with_class(621, TaskClass::App)
+                .expect("target");
+            state.enqueue_current_cpu(PID).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(PID) {
+                state.yield_current().expect("switch");
+            }
+        });
+        kernel
+            .control_plane_set_process_cnode_slots_via_syscall(621, 8)
+            .expect("create cnode");
+
+        let after_global = kernel.with(|state| {
+            use crate::kernel::capabilities::CNodeId;
+            state.cnode_slot_capacity(CNodeId(621)).is_some()
+        });
+        assert_eq!(
+            kernel.cnode_registered_split_read(621),
+            after_global,
+            "split-read must match global after creation"
+        );
+        assert!(kernel.cnode_registered_split_read(621));
+
+        // Adjacent path regression: an unrelated pid is still unregistered.
+        assert!(!kernel.cnode_registered_split_read(999));
     }
 }

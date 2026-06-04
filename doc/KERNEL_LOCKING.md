@@ -8311,3 +8311,158 @@ required**; confirmed instead by the full hosted-dev suite (no regression).
 - x86_64 SMP / `smp.rs` — deferred.
 - RAMFS/FAT runtime spawning — deferred.
 - Full global-lock removal — not claimed.
+
+### 43.11 Stage 25 acceptance (recorded at Stage 26)
+
+- **Accepted without x86_64 smoke.** The only production change was
+  `revoke_reply_caps_for_replier(tid)` (added in Stage 25C) plus its two call
+  sites in `restart_state.rs`; it runs under `ipc_state_lock` (rank 3) and only
+  clears already-bounded reply-record array slots (no wake, no scheduler
+  mutation, no new lock acquisition). See §43.9 for the smoke rationale.
+- **`revoke_reply_caps_for_replier` added** — proactive replier-exit reply-record
+  cleanup; a timing superset of behavior previously deferred to caller exit.
+- **Endpoints certified permanent-once-created** (§43.4): no live endpoint destroy
+  path exists; endpoint slots/generations are stable for the kernel lifetime once
+  created, which is what makes the Stage 26 split-read of `ipc` array slots sound.
+- **818-test baseline** carried into Stage 26 (full hosted-dev suite, no
+  regression).
+- x86_64 SMP / `smp.rs` still deferred; RAMFS/FAT runtime spawning still deferred.
+
+## §44 Stage 26 — global-lock callsite audit + two domain-lock-only extractions
+
+Stage 26 audits every `SharedKernel::with` / `with_cpu` (global-lock) acquisition
+site, classifies each, and extracts two further read-only paths to acquire only a
+single domain lock — continuing the split-read program established in Stages 2–5.
+**No claim of full global-lock removal is made**; this is preparatory
+finer-grained locking.
+
+### 44.1 Stage 25 acceptance
+
+Recorded in §43.11 above (accepted without smoke; 818-test baseline carried
+forward).
+
+### 44.2 Global-lock architecture summary
+
+- **Type:** the global lock is `SpinLock<KernelState>`, owned by `SharedKernel`
+  (`src/runtime.rs`). `KernelState` (`src/kernel/boot/mod.rs`) embeds one
+  `SpinLockIrq<()>` (or `SpinLockIrq<SchedulerState>`) per domain — scheduler(1),
+  task(2), ipc(3), capability(4), vm(5), memory(6), driver(7), fault(8),
+  restart(9), telemetry(10), boot_config(11).
+- **Acquisition pattern:** closure-based. `SharedKernel::with(|state| …)` and
+  `with_cpu(cpu, |state| …)` lock the whole `KernelState` and hand the closure a
+  `&mut KernelState`. Inside, domain methods (`with_ipc_state`,
+  `with_capability_state`, `with_tcbs`, `with_scheduler_state`,
+  `with_memory_state`, …) re-acquire the per-domain lock.
+- **Domain locks inside vs. independent:** historically always *inside* the global
+  lock. The split-read/split-mut helpers (`*_split_read`, `*_split_mut` on
+  `SharedKernel`, backed by `KernelState::*_from_raw`) are the *only* paths that
+  acquire a domain lock *without* the global lock, deriving raw field pointers via
+  `core::ptr::addr_of!` so no `&KernelState` whole-struct reference is created.
+- **Pre-existing global-lock-free paths:** scheduler tick / current-TID / topology
+  reads (Stage 2B–L7A), boot-config reads (L8B), fault/telemetry split mut+read
+  (3B/3C/4T+5), task ASID/class/exists, cnode slot capacity, process-id and
+  group-leader reads (Stages 4T+7 / 5A / 5B).
+
+### 44.3 Callsite audit table (A–G)
+
+Classification key: **A** already split / domain-only; **B** read-only candidate;
+**C** simple 1–2-domain mutation candidate; **D** complex multi-domain deferred;
+**E** trap/arch boundary deferred; **F** Spawn/fork/exec deferred; **G** SMP
+deferred.
+
+| file:line | handler/context | class | domains | notes |
+| --- | --- | --- | --- | --- |
+| runtime.rs `*_split_read` / `*_split_mut` (≈30 helpers) | scheduler/task/ipc/cap/fault/telemetry/boot reads & diag muts | A | 1 each | already domain-lock-only; the extraction template |
+| runtime.rs:283 `handle_trap_with_cpu` | trap dispatch entry | E | all (via handle_trap) | trap boundary; do not touch |
+| runtime.rs:269/273 `ipc_recv_*_split_bridge` | IPC recv timeout bridge | D | scheduler+ipc+task | multi-domain blocking recv; deferred |
+| runtime.rs:293 `control_plane_set_process_cnode_slots_via_syscall` | cap control plane | C | task→capability | partly split via `_planned`; mutation, deferred this stage |
+| arch/trap_entry.rs:149 `.with_cpu` | arch trap dispatch | E | all | trap boundary; do not touch |
+| arch/x86_64/descriptor_tables.rs:904/932 `.with_cpu(current_tid)` | x86_64 entering/exiting TID | E | scheduler/task | hard-invariant trap TID logic; do not touch |
+| arch/{aarch64,x86_64}/boot.rs `.with` / `borrow_kernel_for_boot` | boot/ERET | E | all | boot single-CPU; do not touch |
+| syscall.rs handlers (inside `handle_trap` closure) | all syscalls | D/F | varies | run under the global lock via `with_cpu`; SpawnV5/fork/exec are F; multi-domain are D |
+| boot/*_state.rs `with_*_state[_mut]` (domain helpers) | domain accessors | A | 1 each | domain-granular; called inside global lock today |
+| smp.rs cross-CPU work | SMP | G | ipc(mailbox) | SMP deferred |
+| **NEW** runtime.rs `notification_waiter_count_split_read` | ipc waiter read | **B→A** | ipc(3) | extracted this stage |
+| **NEW** runtime.rs `cnode_registered_split_read` | cnode presence read | **B→A** | capability(4) | extracted this stage |
+
+Approximate counts: **A** ≈ 32 (30 pre-existing split helpers + 2 new), **B** 2
+(the two extracted this stage, now A), **C** 1, **D** several (IPC recv bridge,
+multi-domain syscalls), **E** ~8 (trap/arch/boot entries), **F** Spawn/fork/exec
+syscall family, **G** SMP cross-CPU work. The bulk of remaining `with`/`with_cpu`
+*call sites* in the codebase are inside `#[cfg(test)]` modules (class A test
+scaffolding, not production paths).
+
+### 44.4 Two extracted paths (before / after)
+
+**Extraction 1 — `notification_waiter_count_split_read` (ipc, rank 3):**
+- *Before:* the only way to read whether a notification slot has a waiter was the
+  `#[cfg(test)]` `KernelState::notification_waiter_count`, reached through
+  `SharedKernel::with(|state| state.notification_waiter_count(idx))` — i.e. under
+  the **global lock**, which then re-acquires `ipc_state_lock`.
+- *After:* `SharedKernel::notification_waiter_count_split_read(idx)` calls
+  `KernelState::notification_waiter_count_from_raw`, which derives raw field
+  pointers via `addr_of!` and acquires **only** `ipc_state_lock` (rank 3). The
+  outer global `SpinLock<KernelState>` is never taken.
+
+**Extraction 2 — `cnode_registered_split_read` (capability, rank 4):**
+- *Before:* CNode presence for a pid was only observable through
+  `SharedKernel::with(|state| state.cnode_slot_capacity(CNodeId(pid)).is_some())`
+  — under the **global lock**, which re-acquires `capability_state_lock`.
+- *After:* `SharedKernel::cnode_registered_split_read(pid)` calls
+  `KernelState::cnode_registered_from_raw`, acquiring **only**
+  `capability_state_lock` (rank 4) (mirrors the existing
+  `cnode_slot_capacity_from_raw`). The global lock is never taken.
+
+### 44.5 Lock-rank ordering analysis
+
+- *Extraction 1* takes exactly one lock, ipc (rank 3), and releases it before
+  return. No lock of rank ≤ 3 may be held by the caller when invoking it
+  (documented in the helper). It is read-only: it never mutates `ipc`, never wakes
+  a task, never touches the scheduler. Soundness rests on Stage 25's endpoint/
+  notification permanence — slot storage is stable for the kernel lifetime, so the
+  raw-pointer read under the ipc lock cannot race a structural move.
+- *Extraction 2* takes exactly one lock, capability (rank 4), and releases it
+  before return. No lock of rank ≤ 4 may be held by the caller. It is read-only:
+  it only scans `capability.cnode_spaces` for a matching `CNodeId`. Same
+  single-domain, no-inversion property as the Stage 5A `cnode_slot_capacity`
+  split-read it parallels.
+- Both helpers acquire a **single** domain lock, so they cannot create a
+  rank-inversion by themselves; the documented caller constraint prevents an
+  inversion against an already-held lower-rank lock.
+
+### 44.6 What remains under the global lock and why
+
+- **Trap/arch entry** (`handle_trap_with_cpu`, arch `with_cpu`, entering/exiting
+  TID reads): hard invariant — must not touch. Class E.
+- **SpawnV5 / fork / exec**: multi-domain atomic construction; hard invariant.
+  Class F.
+- **Multi-domain syscalls and the IPC recv-timeout bridge**: need atomicity across
+  3+ domains (scheduler + task + ipc, etc.); extracting them safely requires a
+  staged lock-acquisition protocol not in scope here. Class D.
+- **SMP cross-CPU work**: SMP still deferred. Class G.
+
+### 44.7 Progress toward finer-grained locking (not completion)
+
+Stage 26 extends the split-read surface from ~30 to ~32 domain-lock-only helpers
+and proves two more observable reads do not need the global lock. This is
+incremental progress, **not** a global-lock-removal claim: every mutation path and
+every trap/Spawn/SMP path still serializes on `SpinLock<KernelState>`.
+
+### 44.8 Deferred (complex / trap / SMP / Spawn)
+
+- Multi-domain syscall handlers and the IPC recv-timeout bridge (D).
+- Trap/arch/boot entry and entering/exiting TID logic (E).
+- SpawnV5 / fork / exec (F).
+- x86_64 SMP / `smp.rs` (G).
+- RAMFS/FAT runtime spawning.
+- Full global-lock removal — not claimed.
+
+### 44.9 x86_64 smoke decision (Stage 26)
+
+**No x86_64 `-smp 1` smoke required.** Stage 26 adds only two read-only
+`SharedKernel` split-read helpers plus their `*_from_raw` backings; nothing on any
+live boot/runtime/trap path is modified (no production caller is rewired this
+stage — the helpers are additive and currently exercised only by the new unit
+tests). No live boot/runtime behavior changes, so the hard-invariant smoke trigger
+("x86_64 smoke only if live boot/runtime behavior changes") is not met. Confirmed
+instead by the full hosted-dev suite (no regression).
