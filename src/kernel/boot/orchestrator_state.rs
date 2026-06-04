@@ -560,4 +560,55 @@ impl KernelState {
             .map(|tcb| tcb.thread_group_id.0 == tid)
             .unwrap_or(false)
     }
+
+    // ── Stage 26 split-read helpers ──────────────────────────────────────────
+
+    /// STAGE 26: extracted from global lock, uses only domain ipc (rank 3) lock.
+    ///
+    /// Read whether the notification slot at `notification_idx` has a registered
+    /// waiter, returning `1` if so and `0` otherwise (matching the test-only
+    /// `notification_waiter_count` probe). Acquires only `ipc_state_lock`; does
+    /// not acquire the outer `SharedKernel` lock.
+    ///
+    /// # Safety
+    /// `state` must be the raw pointer of the `KernelState` storage owned by the
+    /// calling `SharedKernel`. `addr_of!` derives raw field pointers without
+    /// creating a reference to the whole `KernelState`; `ipc_state_lock`
+    /// serializes access to the `ipc` field.
+    pub(crate) unsafe fn notification_waiter_count_from_raw(
+        state: *const KernelState,
+        notification_idx: usize,
+    ) -> usize {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).ipc_state_lock) };
+        let _guard = lock_ref.lock();
+        let ipc: &IpcSubsystem = kernel_ref(unsafe { &*core::ptr::addr_of!((*state).ipc) });
+        usize::from(
+            ipc.notification_waiters
+                .get(notification_idx)
+                .and_then(|w| *w)
+                .is_some(),
+        )
+    }
+
+    /// STAGE 26: extracted from global lock, uses only domain capability (rank 4) lock.
+    ///
+    /// Read whether a CNode space is registered for process `pid`. Acquires only
+    /// `capability_state_lock`; does not acquire the outer `SharedKernel` lock.
+    ///
+    /// # Safety
+    /// `state` must be the raw pointer of the `KernelState` storage owned by the
+    /// calling `SharedKernel`. `addr_of!` derives raw field pointers without
+    /// creating a reference to the whole `KernelState`; `capability_state_lock`
+    /// serializes access to the `capability` field.
+    pub(crate) unsafe fn cnode_registered_from_raw(state: *const KernelState, pid: u64) -> bool {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        let cnode = CNodeId(pid);
+        kernel_ref(&capability.cnode_spaces)
+            .iter()
+            .flatten()
+            .any(|space| space.id == cnode)
+    }
 }

@@ -2344,3 +2344,48 @@ bootstrap/BT2, SMP/`smp.rs`, entering/exiting TID trap logic, `handle_trap_with_
 VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn,
 notification single-owner semantics, endpoint multi-owner semantics, and RAMFS/FAT
 runtime spawning are all unchanged.
+
+## Rule N+33 — Stage 26: global-lock callsite audit + domain-lock-only extraction test rules
+
+### N+33.1 — Every new split-read helper must match its global-locked equivalent
+
+For each path extracted out of the global lock onto a single domain lock, a test
+must prove the split-read helper returns the **same value** as the globally-locked
+accessor, both before and after the relevant state is created/mutated. The two
+Stage 26 extractions are covered by
+`stage26_notification_waiter_count_split_read_matches_global` (ipc, rank 3) and
+`stage26_cnode_registered_split_read_matches_global` (capability, rank 4). Each
+test also asserts an adjacent-path no-regression case (an unrelated, empty slot or
+unrelated pid still reads the default).
+
+### N+33.2 — Extractions must be single-domain and read-only
+
+A Stage-26-style extraction may acquire **exactly one** domain lock (no rank
+inversion possible from a single lock) and must not mutate state, wake a task, or
+touch the scheduler. The helper doc must name the domain rank and the forbidden
+caller-held lock ranks (≤ its own rank). Soundness for ipc array-slot reads relies
+on Stage 25 endpoint/notification permanence (slot storage stable for the kernel
+lifetime).
+
+### N+33.3 — ABI guard
+
+A dedicated test (`stage26_global_lock_audit_syscall_count_unchanged`) must assert
+`SYSCALL_COUNT == 30`. The audit + extractions are pure refactoring: no syscall
+opcode is added or removed.
+
+### N+33.4 — Lock rank, no global-lock-removal claim, and no-smoke
+
+The two new helpers each take a single domain lock (ipc rank 3 / capability rank 4)
+via `*_from_raw` + `addr_of!`, never the outer `SpinLock<KernelState>` global lock.
+**No full global-lock-removal is claimed** — every mutation, trap, Spawn/fork/exec,
+and SMP path still serializes on the global lock. The helpers are additive and (this
+stage) exercised only by the new unit tests, so no live boot/runtime/trap path
+changes → x86_64 `-smp 1` smoke is NOT required. `cargo check --no-default-features`
+and `cargo check --features hosted-dev` must be clean; the full hosted-dev suite must
+pass single-threaded (`RUST_MIN_STACK=8388608`); `git diff --check` must be clean.
+Syscall ABI / `SYSCALL_COUNT` (30), SpawnV5, PM/init/service boot, IPC
+recv-v2/reply-cap/transfer-envelope, trap/timer/bootstrap/BT2, SMP/`smp.rs`,
+entering/exiting TID trap logic, `handle_trap_with_cpu`,
+VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn,
+notification single-owner / endpoint multi-owner semantics, and RAMFS/FAT runtime
+spawning are all unchanged.
