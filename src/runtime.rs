@@ -2,8 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::{
-    BootConfigSubsystem, FaultSubsystem, KernelCapacityProfile, KernelError, KernelState,
-    KernelStorage, RuntimeCapacityConfig, SchedulerState, TelemetrySubsystem, TrapHandleError,
+    BootConfigSubsystem, ControlPlaneCnodePlan, FaultSubsystem, KernelCapacityProfile, KernelError,
+    KernelState, KernelStorage, RuntimeCapacityConfig, SchedulerState, TelemetrySubsystem,
+    TrapHandleError,
     kernel_mut, kernel_ref,
 };
 use crate::kernel::capabilities::CapId;
@@ -407,6 +408,72 @@ impl SharedKernel {
         // capability lock serializes access to the `capability` field.
         unsafe {
             KernelState::cnode_registered_from_raw(self.state.data_ptr() as *const _, pid)
+        }
+    }
+
+    // ── Stage 27 split-mutation helper ───────────────────────────────────────
+
+    /// STAGE 27: first mutating global-lock extraction for
+    /// `control_plane_set_process_cnode_slots`. Performs the two-phase
+    /// task(read) → capability(mutate) protocol WITHOUT acquiring the outer
+    /// `SharedKernel` lock and without calling `with`/`with_cpu`.
+    ///
+    /// Phase 1 (task snapshot, rank 2): read the requester's class and pid via
+    /// the existing `task_class_from_raw` / `process_id_from_raw` split-reads,
+    /// which each acquire and RELEASE `task_state_lock` before returning. No task
+    /// lock is held past this point.
+    ///
+    /// Phase 1b (boot-config snapshot): read the runtime capacity limits via
+    /// `runtime_capacity_config_split_read` (boot_config lock only).
+    ///
+    /// Phase 2 (capability mutation, rank 4): apply the create/resize through
+    /// `control_plane_set_process_cnode_slots_apply_from_raw`, which acquires
+    /// ONLY `capability_state_lock`.
+    ///
+    /// Lock order is therefore task(2) → boot_config → capability(4), never
+    /// inverted: the capability lock is acquired only after both reads have
+    /// released their locks. Behavior and error returns are identical to the
+    /// global-locked `control_plane_set_process_cnode_slots_via_syscall` /
+    /// `_planned` path:
+    /// - `TaskMissing` if the requester TID has no task (matches the global path's
+    ///   `task_class().ok_or(TaskMissing)`).
+    /// - `MissingRight` / `WrongObject` / `CapabilityFull` / `TaskTableFull`
+    ///   exactly as the capability apply phase produces them.
+    ///
+    /// SAFETY: `state.data_ptr()` is the stable `KernelState` storage owned by
+    /// this `SharedKernel`. Each `*_from_raw` helper derives raw field pointers
+    /// without creating a whole-`KernelState` reference; the per-domain locks
+    /// serialize access to their respective fields.
+    pub fn control_plane_set_process_cnode_slots_split_mut(
+        &self,
+        requester_tid: u64,
+        target_pid: u64,
+        slot_capacity: usize,
+    ) -> Result<(), KernelError> {
+        let state = self.state.data_ptr();
+        // Phase 1: task-domain snapshot (rank 2), lock released on return.
+        let requester_class = unsafe {
+            KernelState::task_class_from_raw(state as *const _, requester_tid)
+        }
+        .ok_or(KernelError::TaskMissing)?;
+        let requester_pid =
+            unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
+                .unwrap_or(requester_tid);
+        let plan = ControlPlaneCnodePlan {
+            requester_class,
+            requester_pid,
+        };
+        // Phase 1b: boot-config snapshot (boot_config lock only).
+        let limits = self.runtime_capacity_config_split_read();
+        // Phase 2: capability-domain mutation (rank 4), task lock already released.
+        unsafe {
+            KernelState::control_plane_set_process_cnode_slots_apply_from_raw(
+                state,
+                &plan,
+                target_pid,
+                slot_capacity,
+                limits,
+            )
         }
     }
 

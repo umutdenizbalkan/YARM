@@ -611,4 +611,166 @@ impl KernelState {
             .flatten()
             .any(|space| space.id == cnode)
     }
+
+    // ── Stage 27 split-mutation helper ───────────────────────────────────────
+
+    /// STAGE 27: first mutating global-lock extraction. Apply a CNode-slot
+    /// create/resize for `target_pid` under only the capability domain lock
+    /// (rank 4), using a task-domain snapshot (`plan`) and a boot-config snapshot
+    /// (`limits`) taken by the caller BEFORE this call.
+    ///
+    /// This is the capability-domain "apply" phase of
+    /// `SharedKernel::control_plane_set_process_cnode_slots_split_mut`. It
+    /// reproduces `control_plane_set_process_cnode_slots_planned` exactly — same
+    /// authorization check, same create-vs-resize branching, same error returns —
+    /// but acquires ONLY `capability_state_lock` and never re-enters the task
+    /// lock (the requester class/pid come from `plan`) nor the boot-config lock
+    /// (the capacity limits come from `limits`). This preserves task(2) →
+    /// capability(4) ordering with no inversion and no global lock.
+    ///
+    /// Errors preserved (identical to `_planned`):
+    /// - `MissingRight`  — non-system-server requester whose pid != target_pid,
+    ///   or a non-system-server target of class `App`.
+    /// - `WrongObject` / `CapabilityFull` — from slot-capacity normalization.
+    /// - `CapabilityFull` — global pool exhausted, or cspace alloc/grow failure.
+    /// - `TaskTableFull` — no free cnode-space slot for a new registration.
+    /// - `TaskMissing` — resize target cnode-space vanished (race; unchanged).
+    ///
+    /// # Safety
+    /// `state` must be the raw pointer of the `KernelState` storage owned by the
+    /// calling `SharedKernel`. `addr_of!` derives raw field pointers without
+    /// creating a reference to the whole `KernelState`; `capability_state_lock`
+    /// serializes access to the `capability` field for the whole mutation.
+    pub(crate) unsafe fn control_plane_set_process_cnode_slots_apply_from_raw(
+        state: *mut KernelState,
+        plan: &ControlPlaneCnodePlan,
+        target_pid: u64,
+        slot_capacity: usize,
+        limits: RuntimeCapacityConfig,
+    ) -> Result<(), KernelError> {
+        let requester_is_system_server = plan.requester_class == TaskClass::SystemServer;
+        if !requester_is_system_server && plan.requester_pid != target_pid {
+            return Err(KernelError::MissingRight);
+        }
+        // Non-system-server may only resize its OWN cnode (requester_pid ==
+        // target_pid guaranteed above); the class guard matches `_planned`.
+        if !requester_is_system_server {
+            match plan.requester_class {
+                TaskClass::Driver | TaskClass::SystemServer => {}
+                TaskClass::App => return Err(KernelError::MissingRight),
+            }
+        }
+
+        let max_total_cnode_slots = limits.max_total_cnode_slots;
+        let bounded_slot_capacity =
+            Self::normalize_requested_cnode_slots(slot_capacity, limits)?;
+        let target_cnode = CNodeId(target_pid);
+
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &mut CapabilitySubsystem =
+            unsafe { &mut *core::ptr::addr_of_mut!((*state).capability) };
+
+        // Existing-cnode lookup matches `process_cnode_for_pid`: it queries the
+        // pid→cnode registration table (`process_cnodes`), NOT `cnode_spaces`.
+        let existing_cnode = capability
+            .process_cnodes
+            .iter()
+            .flatten()
+            .find(|record| record.pid == target_pid)
+            .map(|record| record.cnode);
+
+        if let Some(existing_cnode) = existing_cnode {
+            // Resize path: bound against all OTHER reserved cnode slots.
+            let reserved_other_slots: usize = capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .filter(|space| space.id != existing_cnode)
+                .map(|space| space.slot_capacity)
+                .sum();
+            if reserved_other_slots.saturating_add(bounded_slot_capacity) > max_total_cnode_slots {
+                return Err(KernelError::CapabilityFull);
+            }
+            let space = capability
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == existing_cnode)
+                .ok_or(KernelError::TaskMissing)?;
+            kernel_mut(&mut space.cspace)
+                .resize_slots(bounded_slot_capacity)
+                .map_err(|err| match err {
+                    CapabilityDeriveError::SpaceFull => KernelError::CapabilityFull,
+                    CapabilityDeriveError::AllocFailed => KernelError::CapabilityFull,
+                    CapabilityDeriveError::InvalidSlot => KernelError::WrongObject,
+                    _ => KernelError::WrongObject,
+                })?;
+            space.slot_capacity = bounded_slot_capacity;
+            Ok(())
+        } else {
+            // Create path: ensure cnode space then register the pid→cnode record.
+            if capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .any(|space| space.id == target_cnode)
+            {
+                // Space already present (no process_cnode record): register only.
+                return Self::register_process_cnode_in(capability, target_pid, target_cnode);
+            }
+            let reserved_slots: usize = capability
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .map(|space| space.slot_capacity)
+                .sum();
+            if reserved_slots.saturating_add(bounded_slot_capacity) > max_total_cnode_slots {
+                return Err(KernelError::CapabilityFull);
+            }
+            let Some(slot) = capability
+                .cnode_spaces
+                .iter_mut()
+                .find(|slot| slot.is_none())
+            else {
+                return Err(KernelError::TaskTableFull);
+            };
+            let cspace = CapabilitySpace::try_with_slots(bounded_slot_capacity)
+                .map_err(|_| KernelError::CapabilityFull)?;
+            *slot = Some(CNodeSpace {
+                id: target_cnode,
+                slot_capacity: bounded_slot_capacity,
+                cspace: store_kernel_value(cspace),
+            });
+            Self::register_process_cnode_in(capability, target_pid, target_cnode)
+        }
+    }
+
+    /// Insert or update a pid→cnode registration in the given capability
+    /// subsystem (caller already holds the capability lock). Mirrors
+    /// `set_process_cnode_for_pid` exactly.
+    fn register_process_cnode_in(
+        capability: &mut CapabilitySubsystem,
+        pid: u64,
+        cnode: CNodeId,
+    ) -> Result<(), KernelError> {
+        if let Some(record) = capability
+            .process_cnodes
+            .iter_mut()
+            .flatten()
+            .find(|record| record.pid == pid)
+        {
+            record.cnode = cnode;
+            return Ok(());
+        }
+        if let Some(slot) = capability
+            .process_cnodes
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        {
+            *slot = Some(ProcessCNodeRecord { pid, cnode });
+            return Ok(());
+        }
+        Err(KernelError::TaskTableFull)
+    }
 }

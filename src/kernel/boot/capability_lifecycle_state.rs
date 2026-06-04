@@ -11,7 +11,7 @@ impl KernelState {
     ///
     /// Global pool accounting (`max_total_cnode_slots`) is enforced by the
     /// caller before committing create/resize.
-    fn normalize_requested_cnode_slots(
+    pub(crate) fn normalize_requested_cnode_slots(
         slot_capacity: usize,
         limits: RuntimeCapacityConfig,
     ) -> Result<usize, KernelError> {

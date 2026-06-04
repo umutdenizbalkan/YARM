@@ -19680,3 +19680,249 @@ fn stage25d_unrelated_endpoint_unaffected_by_other_endpoint_revoke() {
 }
 
 // ── End Stage 25 tests ────────────────────────────────────────────────────────
+
+// ── Stage 27: first mutating global-lock extraction ───────────────────────────
+// control_plane_set_process_cnode_slots_split_mut: task(read,2) → capability(mut,4)
+
+#[cfg(test)]
+mod stage27_split_mut_tests {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    /// Run `body` on a dedicated 8 MiB-stack thread (kernel tests need deep stacks).
+    fn on_kernel_thread(name: &str, body: impl FnOnce(SharedKernel) + Send + 'static) {
+        std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+                body(shared);
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    #[test]
+    fn stage27_split_mut_helper_matches_global_lock_behavior_for_success() {
+        // A system-server requester resizing an App target's existing cnode must
+        // produce the SAME final slot capacity as the global-locked path.
+        on_kernel_thread("stage27_success", |kernel| {
+            const SS: u64 = 2700;
+            const APP: u64 = 2701;
+            let (app_cnode, requested) = kernel.with(|state| {
+                state
+                    .register_task_with_class(SS, TaskClass::SystemServer)
+                    .expect("system server");
+                state
+                    .register_task_with_class(APP, TaskClass::App)
+                    .expect("app");
+                let app_cnode = state.process_cnode_for_pid(APP).expect("app cnode");
+                let before = state.cnode_slot_capacity(app_cnode).expect("capacity");
+                (app_cnode, before.saturating_add(8))
+            });
+
+            kernel
+                .control_plane_set_process_cnode_slots_split_mut(SS, APP, requested)
+                .expect("split-mut resize");
+
+            kernel.with(|state| {
+                assert_eq!(
+                    state.cnode_slot_capacity(app_cnode),
+                    Some(requested),
+                    "split-mut must apply the same resize as the global path"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn stage27_split_mut_missing_process_returns_stable_error() {
+        // A requester TID with no task must return TaskMissing — identical to
+        // control_plane_set_process_cnode_slots(requester_tid, ..).
+        on_kernel_thread("stage27_missing_proc", |kernel| {
+            const ABSENT_REQUESTER: u64 = 2799;
+            const TARGET: u64 = 2701;
+            let err = kernel
+                .control_plane_set_process_cnode_slots_split_mut(ABSENT_REQUESTER, TARGET, 8)
+                .expect_err("absent requester must fail");
+            assert_eq!(err, KernelError::TaskMissing);
+        });
+    }
+
+    #[test]
+    fn stage27_split_mut_missing_cnode_returns_stable_error() {
+        // A non-system-server App requester resizing ANOTHER process's cnode must
+        // be rejected with MissingRight (the App authorization guard), matching
+        // the global path's non_system_server rejection.
+        on_kernel_thread("stage27_missing_cnode", |kernel| {
+            const APP_A: u64 = 2710;
+            const APP_B: u64 = 2711;
+            kernel.with(|state| {
+                state
+                    .register_task_with_class(APP_A, TaskClass::App)
+                    .expect("app a");
+                state
+                    .register_task_with_class(APP_B, TaskClass::App)
+                    .expect("app b");
+            });
+            let err = kernel
+                .control_plane_set_process_cnode_slots_split_mut(APP_A, APP_B, 16)
+                .expect_err("app cannot resize another process cnode");
+            assert_eq!(err, KernelError::MissingRight);
+        });
+    }
+
+    #[test]
+    fn stage27_split_mut_duplicate_update_preserves_existing_behavior() {
+        // Applying the same resize twice is idempotent in effect: capacity ends at
+        // the requested value, and a no-op-sized re-apply still succeeds (matches
+        // the global resize_cnode_slots behavior).
+        on_kernel_thread("stage27_duplicate", |kernel| {
+            const SS: u64 = 2720;
+            const APP: u64 = 2721;
+            let (app_cnode, requested) = kernel.with(|state| {
+                state
+                    .register_task_with_class(SS, TaskClass::SystemServer)
+                    .expect("system server");
+                state
+                    .register_task_with_class(APP, TaskClass::App)
+                    .expect("app");
+                let app_cnode = state.process_cnode_for_pid(APP).expect("app cnode");
+                let before = state.cnode_slot_capacity(app_cnode).expect("capacity");
+                (app_cnode, before.saturating_add(4))
+            });
+
+            kernel
+                .control_plane_set_process_cnode_slots_split_mut(SS, APP, requested)
+                .expect("first resize");
+            kernel
+                .control_plane_set_process_cnode_slots_split_mut(SS, APP, requested)
+                .expect("duplicate resize is a stable no-op-sized success");
+
+            kernel.with(|state| {
+                assert_eq!(state.cnode_slot_capacity(app_cnode), Some(requested));
+            });
+        });
+    }
+
+    #[test]
+    fn stage27_split_mut_two_processes_isolated() {
+        // Resizing one process's cnode must not perturb another process's cnode.
+        on_kernel_thread("stage27_isolated", |kernel| {
+            const SS: u64 = 2730;
+            const APP_X: u64 = 2731;
+            const APP_Y: u64 = 2732;
+            let (cx, cy, x_before, y_before, x_target) = kernel.with(|state| {
+                state
+                    .register_task_with_class(SS, TaskClass::SystemServer)
+                    .expect("system server");
+                state
+                    .register_task_with_class(APP_X, TaskClass::App)
+                    .expect("app x");
+                state
+                    .register_task_with_class(APP_Y, TaskClass::App)
+                    .expect("app y");
+                let cx = state.process_cnode_for_pid(APP_X).expect("cnode x");
+                let cy = state.process_cnode_for_pid(APP_Y).expect("cnode y");
+                let x_before = state.cnode_slot_capacity(cx).expect("x cap");
+                let y_before = state.cnode_slot_capacity(cy).expect("y cap");
+                (cx, cy, x_before, y_before, x_before.saturating_add(8))
+            });
+
+            kernel
+                .control_plane_set_process_cnode_slots_split_mut(SS, APP_X, x_target)
+                .expect("resize x");
+
+            kernel.with(|state| {
+                assert_eq!(state.cnode_slot_capacity(cx), Some(x_target), "x resized");
+                assert_eq!(
+                    state.cnode_slot_capacity(cy),
+                    Some(y_before),
+                    "y must be untouched"
+                );
+                assert_ne!(x_before, x_target, "test must actually change x");
+            });
+        });
+    }
+
+    #[test]
+    fn stage27_split_mut_no_scheduler_wake_side_effect() {
+        // The split-mut path must NOT enqueue/dispatch any task: scheduler runnable
+        // counts and dispatch-call telemetry must be unchanged across the call.
+        on_kernel_thread("stage27_no_sched", |kernel| {
+            const SS: u64 = 2740;
+            const APP: u64 = 2741;
+            let (cpu, requested) = kernel.with(|state| {
+                state
+                    .register_task_with_class(SS, TaskClass::SystemServer)
+                    .expect("system server");
+                state
+                    .register_task_with_class(APP, TaskClass::App)
+                    .expect("app");
+                let app_cnode = state.process_cnode_for_pid(APP).expect("app cnode");
+                let before = state.cnode_slot_capacity(app_cnode).expect("capacity");
+                (state.current_cpu(), before.saturating_add(8))
+            });
+
+            let runnable_before = kernel.with(|state| state.runnable_count_on_for_test(cpu));
+            let dispatch_before = kernel.with(|state| state.lock_order_snapshot_for_test().2);
+
+            kernel
+                .control_plane_set_process_cnode_slots_split_mut(SS, APP, requested)
+                .expect("split-mut resize");
+
+            let runnable_after = kernel.with(|state| state.runnable_count_on_for_test(cpu));
+            let dispatch_after = kernel.with(|state| state.lock_order_snapshot_for_test().2);
+
+            assert_eq!(
+                runnable_before, runnable_after,
+                "split-mut must not change scheduler runnable count"
+            );
+            assert_eq!(
+                dispatch_before, dispatch_after,
+                "split-mut must not trigger a scheduler dispatch"
+            );
+        });
+    }
+
+    #[test]
+    fn stage27_split_mut_no_ipc_side_effect() {
+        // The split-mut path touches only the capability domain: a planted IPC
+        // notification waiter must remain exactly as left.
+        on_kernel_thread("stage27_no_ipc", |kernel| {
+            const SS: u64 = 2750;
+            const APP: u64 = 2751;
+            const NOTIF_IDX: usize = 0;
+            let requested = kernel.with(|state| {
+                state
+                    .register_task_with_class(SS, TaskClass::SystemServer)
+                    .expect("system server");
+                state
+                    .register_task_with_class(APP, TaskClass::App)
+                    .expect("app");
+                state.with_ipc_state_mut(|ipc| {
+                    ipc.notification_waiters[NOTIF_IDX] = Some(ThreadId(SS));
+                });
+                let app_cnode = state.process_cnode_for_pid(APP).expect("app cnode");
+                let before = state.cnode_slot_capacity(app_cnode).expect("capacity");
+                before.saturating_add(8)
+            });
+
+            let waiter_before =
+                kernel.with(|state| state.notification_waiter_count(NOTIF_IDX));
+
+            kernel
+                .control_plane_set_process_cnode_slots_split_mut(SS, APP, requested)
+                .expect("split-mut resize");
+
+            let waiter_after =
+                kernel.with(|state| state.notification_waiter_count(NOTIF_IDX));
+            assert_eq!(waiter_before, 1, "precondition: waiter planted");
+            assert_eq!(
+                waiter_before, waiter_after,
+                "split-mut must not disturb IPC notification waiters"
+            );
+        });
+    }
+}
