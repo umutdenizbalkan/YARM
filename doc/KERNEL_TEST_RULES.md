@@ -2136,3 +2136,66 @@ holding one (`create_notification` is not invoked from any syscall handler). The
 waiter wake is gated to `Blocked(_)` only (strictly safer). Syscall ABI,
 `SYSCALL_COUNT`, SpawnV5, trap/timer/bootstrap, SMP/`smp.rs`, VFS/syscall27, and
 the live IRQ-delivery success path are all unchanged.
+
+## Rule N+30 — Stage 23: notification live revoke/release surface audit test rules
+
+Stage 23 is an audit stage that proves whether a user-facing
+capability-release / capability-revoke syscall can reach the Stage 22
+Notification teardown. Audit result (KERNEL_LOCKING.md §41): **no generic
+cap-release syscall exists**; the only release-shaped syscall is `TransferRelease`
+(NR = 4), which is MemoryObject/transfer-scoped and cannot target a Notification
+cap; and `create_notification` has no syscall caller. Teardown is reachable only
+via the direct revoke helpers and the task/process-exit cnode-teardown path.
+Tests must not fake a live cap-release syscall.
+
+### N+30.1 — Reachable revoke surface destroys object + routes
+
+A test must assert that the direct revoke helper (`revoke_capability_in_cnode`),
+the only reachable teardown surface, frees `notifications[idx]` AND tears down the
+IRQ route in one pass. See `stage23_revoke_notification_cap_destroys_object_and_routes`.
+
+### N+30.2 — Task-exit cnode cleanup is the closest live-path equivalent
+
+A test must assert that `mark_task_dead` + `maybe_cleanup_process_cnode_for_pid`
+(the task/process-exit teardown) frees a notification object held in the dying
+task's cnode and tears down its route. See
+`stage23_cnode_cleanup_on_task_exit_destroys_notification`.
+
+### N+30.3 — Idempotent double-revoke
+
+A test must assert a second revoke of the now-empty slot is a safe error with no
+double-destroy and no second generation bump. See
+`stage23_notification_cleanup_idempotent_double_revoke`.
+
+### N+30.4 — `TransferRelease` cannot target a Notification cap
+
+A test must assert the only user release syscall's gate fails for a Notification
+cap: `active_transfer_mapping_for(owner, notif_cap)` is `None`, so
+`handle_transfer_release` errors before `revoke_capability_in_cnode`, leaving the
+notification object alive. Must also assert `SYSCALL_COUNT == 30` (no cap-release
+syscall number added). See
+`stage23_transfer_release_syscall_cannot_target_notification_cap`.
+
+### N+30.5 — Stale cap after revoke cannot signal or recv
+
+A test must assert post-revoke that an external IRQ on the old line is a benign
+repeatable no-op and a recv via the stale RECEIVE cap is a stable repeatable
+error. See `stage23_stale_notification_cap_after_revoke_cannot_signal_or_recv`.
+
+### N+30.6 — Documented missing live surface
+
+A `#[test]` must document (with `assert_eq!(SYSCALL_COUNT, 30)` and an
+`assert!(true, "...")`) that no live user-facing notification release/revoke
+syscall exists and that adding one is deferred (would need a new syscall number,
+out of scope by the ABI invariant). See
+`stage23_no_live_notification_release_syscall_documented`.
+
+### N+30.7 — No production change; no smoke
+
+Stage 23 changes no production code (audit + tests + docs only), so x86_64
+`-smp 1` smoke is NOT required. `cargo check --no-default-features` and `cargo
+check --features hosted-dev` must be clean, the Stage 23 + Stage 22 tests must
+pass single-threaded (`RUST_MIN_STACK=8388608`), and `git diff --check` must be
+clean. Syscall ABI / `SYSCALL_COUNT` (30), SpawnV5, IPC recv-v2/reply-cap/
+transfer-envelope, trap/timer/bootstrap, SMP/`smp.rs`, VFS/syscall27, and the
+live IRQ-delivery success path are all unchanged.
