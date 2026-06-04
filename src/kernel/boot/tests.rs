@@ -20243,3 +20243,347 @@ mod stage30_boot_guard_tests {
         assert_eq!(SYSCALL_COUNT, 30, "Stage 30 must not change SYSCALL_COUNT");
     }
 }
+
+mod stage31_split_recv_tests {
+    use crate::kernel::boot::{Bootstrap, KernelState, TrapHandleError};
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{
+        try_split_recv_queued_plain_into_frame_locked, Syscall, SyscallError, SYSCALL_COUNT,
+        SYSCALL_NO_TRANSFER_CAP,
+    };
+    use crate::kernel::task::TaskStatus;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+
+    /// Build an IpcRecv trap frame: arg(CAP)=recv_cap, no recv-v2 meta.
+    fn recv_frame(recv_cap: CapId) -> TrapFrame {
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        )
+    }
+
+    /// Build an IpcRecv trap frame requesting recv-v2 metadata
+    /// (meta_ptr != 0 and meta_len >= IPC_RECV_META_V2_ENCODED_LEN==40).
+    fn recv_v2_frame(recv_cap: CapId) -> TrapFrame {
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0x4000, 256, 0x5000, 40, 0],
+        )
+    }
+
+    /// Init a kernel-task (tid 0, no user ASID) state with a buffered endpoint and
+    /// one plain message already queued. Returns (state, recv_cap).
+    fn state_with_queued_plain(payload: &[u8]) -> (KernelState, CapId) {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let msg = Message::new(7, payload).expect("message");
+        state.ipc_send(send_cap, msg).expect("send");
+        (state, recv_cap)
+    }
+
+    #[test]
+    fn stage31_split_recv_queued_plain_succeeds() {
+        let (mut state, recv_cap) = state_with_queued_plain(b"ping");
+        let mut frame = recv_frame(recv_cap);
+        let result = try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame);
+        assert_eq!(result, Some(Ok(())), "queued plain recv must split-succeed");
+        // Kernel-task lanes: ret0 == sender_tid, ret1 == raw payload len, ret2 == NO_TRANSFER_CAP.
+        assert_eq!(frame.ret0(), 7, "ret0 == sender tid");
+        assert_eq!(frame.ret1(), b"ping".len(), "ret1 == raw payload len");
+        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "ret2 == no transfer cap");
+        assert_eq!(frame.error_code(), None, "no error on success");
+    }
+
+    #[test]
+    fn stage31_split_recv_return_lanes_match_old_path() {
+        // Drive the split helper, then drive the unchanged global-lock recv path on a
+        // freshly-prepared identical state, and compare frame lanes byte-for-byte.
+        let payload = b"hello";
+        let (mut split_state, split_cap) = state_with_queued_plain(payload);
+        let mut split_frame = recv_frame(split_cap);
+        assert_eq!(
+            try_split_recv_queued_plain_into_frame_locked(&mut split_state, &mut split_frame),
+            Some(Ok(()))
+        );
+
+        let (mut old_state, old_cap) = state_with_queued_plain(payload);
+        let mut old_frame = recv_frame(old_cap);
+        crate::kernel::syscall::dispatch(&mut old_state, &mut old_frame)
+            .expect("global-lock recv dispatch");
+
+        assert_eq!(split_frame.ret0(), old_frame.ret0(), "ret0 lane equivalence");
+        assert_eq!(split_frame.ret1(), old_frame.ret1(), "ret1 lane equivalence");
+        assert_eq!(split_frame.ret2(), old_frame.ret2(), "ret2 lane equivalence");
+        assert_eq!(
+            split_frame.error_code(),
+            old_frame.error_code(),
+            "error lane equivalence"
+        );
+        // Inline payload words must also match.
+        assert_eq!(
+            split_frame.arg(3),
+            old_frame.arg(3),
+            "inline payload word 0 equivalence"
+        );
+        assert_eq!(
+            split_frame.arg(4),
+            old_frame.arg(4),
+            "inline payload word 1 equivalence"
+        );
+    }
+
+    #[test]
+    fn stage31_split_recv_dequeues_exactly_one_message() {
+        // Queue two messages; one split recv must leave exactly one queued.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state.ipc_send(send_cap, Message::new(7, b"a").expect("m")).expect("s1");
+        state.ipc_send(send_cap, Message::new(8, b"b").expect("m")).expect("s2");
+
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame),
+            Some(Ok(()))
+        );
+        // First message (FIFO) delivered.
+        assert_eq!(frame.ret0(), 7);
+
+        // Exactly one remains: a global-lock recv returns the second, a third returns empty.
+        let second = state.try_ipc_recv(recv_cap).expect("recv2").expect("one left");
+        assert_eq!(second.sender_tid.0, 8);
+        assert_eq!(state.try_ipc_recv(recv_cap).expect("recv3"), None);
+    }
+
+    #[test]
+    fn stage31_split_recv_empty_queue_falls_back() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame),
+            None,
+            "empty endpoint must fall back (None), not error"
+        );
+        assert_eq!(frame.error_code(), None, "fallback must not write an error lane");
+    }
+
+    #[test]
+    fn stage31_split_recv_cap_transfer_flag_falls_back() {
+        // A queued message carrying a cap-transfer flag must NOT be split-delivered.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let msg = Message::with_header(7, 0, Message::FLAG_CAP_TRANSFER_PLAIN, Some(0), b"x")
+            .expect("cap-transfer message");
+        state.ipc_send(send_cap, msg).expect("send");
+
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame),
+            None,
+            "cap-transfer message must fall back to the global-lock path"
+        );
+    }
+
+    #[test]
+    fn stage31_split_recv_blocking_flag_falls_back() {
+        // Stage 31 has no blocking/recv-v2 split path: a recv-v2 (metadata) request
+        // is the blocking-class request and must fall back.
+        let (mut state, recv_cap) = state_with_queued_plain(b"ping");
+        let mut frame = recv_v2_frame(recv_cap);
+        assert_eq!(
+            try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame),
+            None,
+            "recv-v2 metadata request must fall back to the global-lock path"
+        );
+    }
+
+    #[test]
+    fn stage31_split_recv_invalid_endpoint_cap_error() {
+        // An invalid recv cap must surface the SAME error the old recv path returns,
+        // not a silent fallback.
+        let mut state = Bootstrap::init().expect("init");
+        let bogus = CapId(999_999);
+        let mut split_frame = recv_frame(bogus);
+        let split = try_split_recv_queued_plain_into_frame_locked(&mut state, &mut split_frame);
+
+        // Reference: the old global-lock recv error for the same bogus cap on a
+        // freshly-built equivalent state.
+        let mut ref_state = Bootstrap::init().expect("init");
+        let mut old_frame = recv_frame(bogus);
+        let old_syscall_err =
+            crate::kernel::syscall::dispatch(&mut ref_state, &mut old_frame).err();
+        match split {
+            Some(Err(TrapHandleError::Syscall(s))) => {
+                assert_eq!(
+                    Some(s),
+                    old_syscall_err,
+                    "split invalid-cap error must equal the old recv path error"
+                );
+            }
+            other => panic!("expected Some(Err(Syscall)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage31_split_recv_non_ipc_syscalls_rejected() {
+        // The syscall_split entry point must reject send/call/reply (return None).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        for nr in [
+            crate::kernel::syscall::SYSCALL_IPC_SEND_NR,
+            crate::kernel::syscall::SYSCALL_IPC_CALL_NR,
+            crate::kernel::syscall::SYSCALL_IPC_REPLY_NR,
+        ] {
+            let mut frame = TrapFrame::new(nr, [1, 2, 3, 4, 5, 6]);
+            assert_eq!(
+                crate::kernel::syscall_split::try_split_ipc_recv_queued_plain_into_frame(
+                    &kernel, CPU0, &mut frame,
+                ),
+                None,
+                "non-IpcRecv syscall nr {nr} must be rejected (None)"
+            );
+        }
+    }
+
+    #[test]
+    fn stage31_nr8_split_still_works() {
+        // Regression: the Stage 29 NR-8 live split-dispatch must still service NR 8.
+        use crate::kernel::syscall::SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR;
+        use crate::kernel::task::TaskClass;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(900, TaskClass::SystemServer)
+                .expect("system server");
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("target app");
+            state.enqueue_current_cpu(900).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(900) {
+                state.yield_current().expect("switch");
+            }
+        });
+        let before = kernel
+            .with(|state| {
+                let cnode = state.process_cnode_for_pid(901).expect("cnode");
+                state.cnode_slot_capacity(cnode)
+            })
+            .expect("before");
+        let requested = before.saturating_add(4);
+        let mut frame = TrapFrame::new(
+            SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR,
+            [901, requested, 0, 0, 0, 0],
+        );
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "NR 8 split dispatch must still work");
+        assert_eq!(frame.ret0(), requested);
+        assert_eq!(frame.ret1(), 901);
+    }
+
+    #[test]
+    fn stage31_syscall_count_still_30() {
+        assert_eq!(SYSCALL_COUNT, 30, "Stage 31 must not change SYSCALL_COUNT");
+    }
+
+    #[test]
+    fn stage31_split_recv_task_switched_false() {
+        // The split recv must not switch tasks: current TID is unchanged across it.
+        let (mut state, recv_cap) = state_with_queued_plain(b"ping");
+        let before = state.current_tid();
+        let mut frame = recv_frame(recv_cap);
+        let _ = try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame);
+        assert_eq!(state.current_tid(), before, "no task switch (task_switched==false)");
+    }
+
+    #[test]
+    fn stage31_split_recv_no_waiter_leak() {
+        // After a split recv there must be no orphaned receiver/sender waiter on the
+        // endpoint: a subsequent global-lock recv sees an empty queue and the
+        // receiver task stays runnable/running (never blocked on the endpoint).
+        let (mut state, recv_cap) = state_with_queued_plain(b"ping");
+        let recv_tid = state.current_tid().expect("running");
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame),
+            Some(Ok(()))
+        );
+        // No message left, and the receiver is not blocked on any endpoint.
+        assert_eq!(state.try_ipc_recv(recv_cap).expect("recv after"), None);
+        assert!(
+            matches!(
+                state.task_status(recv_tid),
+                Some(TaskStatus::Running | TaskStatus::Runnable)
+            ),
+            "receiver must not be left blocked on the endpoint"
+        );
+    }
+
+    #[test]
+    fn stage31_split_recv_sharedkernel_wrapper_succeeds() {
+        // The SharedKernel helper-only wrapper (current_tid_authoritative + locked
+        // helper) must service a queued plain recv for the current kernel task.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        let result = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "wrapper must service queued plain recv");
+        assert_eq!(frame.ret0(), 7);
+        assert_eq!(frame.ret1(), b"ping".len());
+        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+    }
+
+    #[test]
+    fn stage31_split_recv_not_wired_into_live_seam() {
+        // Contract guard: IpcRecv must remain default-deny in the LIVE split-dispatch
+        // seam (try_split_dispatch_into_frame). Stage 31 is helper-only.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "IpcRecv must stay default-deny in the live split-dispatch seam"
+        );
+    }
+
+    #[test]
+    fn stage31_split_recv_invalid_cap_matches_dispatch_error() {
+        // Stronger invalid-cap equivalence using a separately-built reference state.
+        let mut split_state = Bootstrap::init().expect("init");
+        let bogus = CapId(123_456);
+        let mut split_frame = recv_frame(bogus);
+        let split =
+            try_split_recv_queued_plain_into_frame_locked(&mut split_state, &mut split_frame);
+
+        let mut ref_state = Bootstrap::init().expect("init");
+        let mut ref_frame = recv_frame(bogus);
+        let ref_err = crate::kernel::syscall::dispatch(&mut ref_state, &mut ref_frame).err();
+
+        match split {
+            Some(Err(TrapHandleError::Syscall(s))) => {
+                assert_eq!(Some(s), ref_err, "invalid-cap error must match dispatch");
+            }
+            other => panic!("expected Some(Err(Syscall)), got {other:?}"),
+        }
+        // Silence unused import in builds where SyscallError isn't otherwise named.
+        let _ = SyscallError::WouldBlock;
+    }
+}

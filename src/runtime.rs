@@ -364,6 +364,44 @@ impl SharedKernel {
         self.with(|state| state.ipc_recv_until_deadline(recv_cap, deadline))
     }
 
+    /// # Validation status
+    /// - HELPER_ONLY — Stage 31 queued-plain IPC recv fast-path attempt. NOT wired
+    ///   into the live trap seam (`try_split_dispatch_into_frame`); exercised by unit
+    ///   tests only. See `doc/KERNEL_LOCKING.md` §49 for the blocker.
+    ///
+    /// Stage 31: attempt to service an `IpcRecv` for the narrowest split-safe case
+    /// — a plain (no cap/reply) message already queued on a buffered endpoint,
+    /// delivered to a kernel-task (no user ASID) receiver, with no recv-v2 metadata.
+    ///
+    /// Lock order: [no lock] → `current_tid_authoritative` (takes+releases the
+    /// global lock for the TID read) → [no lock]. The dequeue + writeback then runs
+    /// under the global lock via `with` for THIS helper-only path because endpoint-
+    /// cap resolution (capability domain, rank 4) and the user-copy path are not yet
+    /// split-extracted; the dequeue itself touches only the IPC domain
+    /// (`ipc_state_lock`, rank 3) inside `ipc_try_recv_queued_plain_endpoint_only`.
+    /// No scheduler wake/yield/switch occurs (`task_switched` stays `false`): a
+    /// sender-waiter refill is rejected (→ `None`) so no wake plan is produced.
+    ///
+    /// Forbidden under ipc_state_lock: scheduler lock, capability lock, VM lock,
+    /// user-copy. (The user-ASID receiver case — which would need a user copy — is
+    /// rejected before any dequeue.)
+    ///
+    /// Returns `Some(Ok(()))` when a plain message was dequeued and the frame
+    /// written; `Some(Err(e))` when the recv cap was invalid (same error as the old
+    /// path); `None` for every non-split-eligible case (fall back to global lock).
+    pub fn try_split_ipc_recv_queued_plain_into_frame(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+    ) -> Option<Result<(), TrapHandleError>> {
+        // Authoritative requester-TID read (binds current_cpu, then releases).
+        // Mirrors the Stage 29A trap-seam discipline: never current_tid_split_read.
+        let _requester_tid = self.current_tid_authoritative(cpu)?;
+        self.with(|state| {
+            crate::kernel::syscall::try_split_recv_queued_plain_into_frame_locked(state, frame)
+        })
+    }
+
     pub fn handle_trap_with_cpu(
         &self,
         cpu: CpuId,

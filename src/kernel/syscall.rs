@@ -14,7 +14,7 @@ use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
 use super::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 use crate::arch::syscall_abi;
-use crate::kernel::boot::UserImageSpec;
+use crate::kernel::boot::{TrapHandleError, UserImageSpec};
 use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskClass};
 use yarm_srv_common::{cpio::CpioArchive, elf::ElfImageInfo};
 
@@ -1921,6 +1921,122 @@ fn should_strip_inline_opcode_prefix(msg: &Message) -> bool {
     msg.opcode == OPCODE_INLINE
         && ((msg.flags & Message::FLAG_REPLY_CAP) != 0
             || (msg.flags & Message::FLAG_CAP_TRANSFER) != 0)
+}
+
+/// Stage 31: queued-plain IPC recv fast-path attempt (helper-only).
+///
+/// Tries to service an `IpcRecv` syscall for the **narrowest** split-safe case:
+/// a plain (no cap-transfer / no reply-cap) message already queued on a buffered
+/// endpoint, delivered to a **kernel task (no user ASID)** receiver, with **no
+/// recv-v2 metadata** requested. For that exact case it dequeues one message and
+/// writes the trap-frame return lanes **byte-for-byte identical** to the
+/// kernel-task branch of [`handle_ipc_recv_result_with_empty_error`]:
+/// `set_ok(sender_tid, raw_len, NO_TRANSFER_CAP)` plus the two inline payload
+/// words from [`pack_register_payload`].
+///
+/// Returns:
+/// * `Some(Ok(()))`  — a plain message was dequeued and the frame was written.
+/// * `Some(Err(e))`  — the recv cap was invalid; `e` is the *same* error the old
+///   global-lock recv path returned for that cap (matches byte-for-byte).
+/// * `None`          — the case is NOT split-eligible (default-deny): empty queue,
+///   recv-v2 requested, cap-transfer/reply-cap flagged message at head,
+///   user-ASID receiver (would require a forbidden user-memory copy),
+///   sender-waiter refill, blocking, timeout, or a non-endpoint object.
+///
+/// ## Why helper-only (not live-wired)
+///
+/// The realistic live receivers on the x86_64 boot path (PM/init/VFS servers) are
+/// **user-ASID** tasks. Their plain-recv writeback requires `copy_to_current_user`
+/// (a user-memory copy) and possibly shared-memory mapping — both explicitly
+/// forbidden under the Stage 31 split lock rules, and neither the capability
+/// domain (endpoint-cap resolution, rank 4) nor the user-copy path has a proven
+/// split extraction yet. This helper therefore returns `None` for every user-ASID
+/// receiver, so it can only ever fast-path a kernel-task receiver. It is exercised
+/// by unit tests directly and is intentionally NOT routed through
+/// `try_split_dispatch_into_frame`; see `doc/KERNEL_LOCKING.md` §49.
+///
+/// Lock note: this function takes `&mut KernelState`, so the caller's lock
+/// discipline determines the lock domains touched. The dequeue itself is performed
+/// by `ipc_try_recv_queued_plain_endpoint_only`, which mutates only the IPC domain
+/// (`ipc_state_lock`, rank 3). No scheduler wake, yield, or task switch occurs
+/// (`task_switched` stays `false`): a sender-waiter refill is rejected (→ `None`)
+/// so no deferred wake plan is ever produced here.
+pub(crate) fn try_split_recv_queued_plain_into_frame_locked(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
+
+    // Default-deny recv-v2: a recv-v2 request would require metadata
+    // materialization into the caller's meta buffer (user copy). Match the same
+    // predicate handle_ipc_recv uses to detect a recv-v2 request.
+    let recv_v2_request = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) != 0
+        && frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) >= IPC_RECV_META_V2_ENCODED_LEN;
+    if recv_v2_request {
+        return None;
+    }
+
+    // Resolve + validate the endpoint receive capability exactly as
+    // handle_ipc_recv does. A validation failure is a real error the old path
+    // returned, so surface it (Some(Err)); the caller must NOT fall back, since
+    // the global path would produce the identical error.
+    if let Err(e) = validate_endpoint_right(kernel, cap, CapRights::RECEIVE) {
+        return Some(Err(TrapHandleError::Syscall(e)));
+    }
+    let endpoint_cap = kernel
+        .current_task_cnode()
+        .and_then(|cnode| kernel.capability_for_cnode_local(cnode, cap))
+        .and_then(|capability| {
+            kernel.capability_object_live(capability.object).map(|_| capability)
+        });
+    let Some(endpoint_cap) = endpoint_cap else {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidCapability)));
+    };
+    let endpoint = endpoint_cap.object;
+
+    // Default-deny any user-ASID receiver: their plain-recv writeback needs a
+    // user-memory copy (copy_to_current_user), which is forbidden on the split
+    // path. Only a kernel task (no user ASID) is split-safe.
+    match current_task_has_user_asid(kernel) {
+        Ok(false) => {}
+        // user-ASID receiver, or no current task → not split-eligible here.
+        Ok(true) | Err(_) => return None,
+    }
+
+    // Attempt the IPC-domain-only dequeue of a plain queued message. Any
+    // ineligible case (empty queue, sender-waiter present, cap-transfer/reply-cap
+    // message, non-buffered endpoint, …) returns None → caller falls back.
+    let received = match try_endpoint_split_recv(kernel, endpoint) {
+        Ok(Some((msg, IpcSchedulerPlan::None))) => msg,
+        // A sender-waiter refill would require a deferred scheduler wake — defer
+        // the whole case to the global-lock path in Stage 31.
+        Ok(Some((_, _))) => return None,
+        Ok(None) => return None,
+        Err(_) => return None,
+    };
+
+    // Kernel-task plain-message writeback — byte-for-byte identical to the
+    // `else` (no user ASID) branch of handle_ipc_recv_result_with_empty_error
+    // for a plain message:
+    //   recv_meta_flags == 0, recv_local_transfer == None,
+    //   encode_transfer_cap_ret(frame, None) => ret2 = NO_TRANSFER_CAP,
+    //   set_ok(sender, raw_len, ret2), inline payload words packed.
+    let sender = match sender_tid_to_ret(received.sender_tid.0) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(TrapHandleError::Syscall(e))),
+    };
+    if encode_transfer_cap_ret(frame, None).is_err() {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+    }
+    let raw_len = received.as_slice().len();
+    frame.set_ok(sender, raw_len, frame.ret2());
+    let words = match pack_register_payload(received.as_slice()) {
+        Ok(w) => w,
+        Err(_) => return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
+    };
+    frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
+    frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
+    Some(Ok(()))
 }
 
 /// Validates the (addr, len, prot) triple shared by VmMap and VmAnonMap.

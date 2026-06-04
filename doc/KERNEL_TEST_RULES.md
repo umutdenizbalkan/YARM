@@ -2558,3 +2558,43 @@ have a smoke-validated call path. The boot-guard `BOOT_RAW_BORROW_ACTIVE` static
 begin/end helpers, and `BootRawKernelBorrowGuard` must all be
 `#[cfg(any(debug_assertions, test))]` with zero release-build cost. `SYSCALL_COUNT
 == 30` must be confirmed by a stage30_ test.
+
+### Rule N+38 (Stage 31)
+
+The first IPC live fast-path split candidate — `IpcRecv` of a plain message
+already queued on a buffered endpoint — must be **default-deny outside the single
+proven case** and, when not provably split-safe on the live trap seam, must be
+**helper-only** (NOT wired into `try_split_dispatch_into_frame`). A Stage 31 split
+recv test suite (`stage31_` prefix) must prove all of:
+
+(a) **Behavior:** a queued plain message to a kernel-task (no user ASID) receiver
+is dequeued and the frame return lanes are written byte-for-byte identical to the
+unchanged `syscall::dispatch` recv path — ret0/ret1/ret2 + error lane + both inline
+payload words (`stage31_split_recv_return_lanes_match_old_path`). Exactly one
+message is dequeued per call (`stage31_split_recv_dequeues_exactly_one_message`).
+
+(b) **Fallback (return None, no error written):** empty endpoint
+(WouldBlock-class), recv-v2 metadata request, cap-transfer / reply-cap message,
+sender-waiter refill, and any non-IpcRecv IPC syscall (send/call/reply) must all
+fall back. A fallback must NOT write an error lane.
+
+(c) **Error equivalence:** an invalid recv cap must return the SAME error the old
+global-lock recv path returns (`Some(Err(TrapHandleError::Syscall(..)))`), proven
+against a freshly-built reference state, not a silent fallback.
+
+(d) **No scheduler/waiter side effects:** `task_switched` stays `false` (current
+TID unchanged across the call); no orphaned receiver/sender waiter is left on the
+endpoint; no sender-wake plan is produced (the refill case is rejected).
+
+(e) **Live-seam contract guard:** a test must assert that IpcRecv remains
+default-deny in `try_split_dispatch_into_frame` (helper-only), and the Stage 29
+NR-8 live split-dispatch must still work (`stage31_nr8_split_still_works`).
+
+(f) **ABI / invariants:** `SYSCALL_COUNT == 30` confirmed by a stage31_ test; no
+syscall numbers added; Stages 12–30 behavior preserved. If helper-only, the exact
+live-wiring blocker (user-copy + capability-domain resolution not split-extracted)
+must be documented in `doc/KERNEL_LOCKING.md` §49. No full global-lock-removal
+claim. x86_64 smoke is required only if the path is live-wired; a helper-only
+Stage 31 defers smoke and must keep the `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok`
+marker as the live split indicator. All stage31_ tests must pass with
+`--test-threads=1`.
