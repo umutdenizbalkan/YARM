@@ -7578,3 +7578,204 @@ success path (`route_external_irq` for a live, bound notification) are unchanged
 **Deferred (still deferred at Stage 21):** wiring `destroy_notification` into a
 capability-revoke / process-teardown path; x86_64 SMP / `smp.rs`; RAMFS/FAT
 runtime spawning; full global-lock removal.
+
+## 40. Stage 22 — wire `destroy_notification` into cap revoke / cnode teardown
+
+### 40.0 Stage 21 acceptance (recorded; confirmation)
+
+Stage 21 was **accepted without x86_64 smoke** — see §39.7. Recap of why:
+the only behavioral changes were on the notification wake/destroy paths.
+`signal_notification` was made *stricter* (it now wakes only a `Blocked(_)`
+waiter — strictly safer, never looser), and `destroy_notification` was added as
+a new teardown primitive that, at Stage 21, was **not yet on any live boot
+path**. The `create_notification` slot-reuse sanitise and the
+`route_external_irq` destroyed-target no-op are defence-in-depth. x86_64 SMP /
+`smp.rs` remained deferred; RAMFS/FAT runtime spawning remained deferred.
+
+### 40.1 Goal
+
+Stage 21 left `destroy_notification` unwired: a revoked Notification cap, a
+cnode teardown, or a task exit freed the cap slot but **leaked** the underlying
+`notifications[idx]` object and left any `irq_routes` entry targeting it intact.
+Stage 22 wires the teardown into the capability-revoke path so that destroying a
+Notification cap also frees the object, tears down IRQ routes, clears the
+waiter, and bumps the generation.
+
+### 40.2 Ownership semantics decision
+
+**Notification caps are single-owner per object: revoke → destroy immediately.**
+
+Audit findings:
+- `create_notification` mints **exactly two** caps for one object — a `SIGNAL`
+  cap and a `RECEIVE` cap — both into the creator's active cnode. It never mints
+  more, and it is never invoked from a live syscall handler (only tests / test
+  scenarios / posix-compat sim).
+- There is **no** `notification_refcount` field on `IpcSubsystem`
+  (`defs.rs:247–250`); MemoryObject/DmaRegion are the only cap objects with
+  `cap_refcount`.
+- `grant_capability_task_to_task_with_rights` is **not** invoked with a
+  Notification cap anywhere in non-test code; Notification caps are not granted
+  cross-process.
+
+Because there is no refcount and notifications are not delegated cross-process,
+revoking **any** Notification cap destroys the object. The paired second cap (and
+any double-revoke) re-enters with the object slot already `None`, which
+`destroy_notification` reports as `WrongObject` — swallowed as a benign no-op, so
+there is no double-destroy and no spurious second generation bump.
+
+### 40.3 Notification cap lifecycle map
+
+| path | cap Δ | object Δ | waiter Δ | route Δ | gen Δ | lock order | tests |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `create_notification` | mints SIGNAL+RECEIVE | allocates slot | sanitised → None | sanitised → None | bump | ipc (rank 3) then cap (rank 4) | `create_notification_both_domains_visible_after_two_phase_create` |
+| Notification cap revoke (`revoke_capability_in_cnode`) | slot cleared + gen-bumped | **freed** | cleared + woken | **torn down** | bump | cap (rank 4) released → ipc (rank 3) | `stage22_notification_cap_revoke_destroys_object` |
+| Notification cap release (`revoke_capability_direct_in_process_cnode`) | slot cleared | **freed** (idempotent) | cleared + woken | **torn down** | bump (first only) | cap (rank 4) released → ipc (rank 3) | `stage22_cnode_teardown_destroys_notification_object` |
+| cnode teardown (`maybe_cleanup_process_cnode_for_pid`) | every live cap revoked in a loop | **freed** via revoke loop | cleared + woken | **torn down** | bump | per-revoke cap → ipc | `stage22_cnode_teardown_destroys_notification_object` |
+| task exit cnode cleanup (`mark_task_dead`/`exit_task` → teardown) | inherits revoke loop | **freed** | cleared + woken | **torn down** | bump | per-revoke cap → ipc | `stage22_cnode_teardown_destroys_notification_object` |
+| `destroy_notification` direct | n/a | freed | cleared (returned) | torn down | bump | ipc (rank 3) | `stage21_destroy_notification_clears_waiter_and_invalidates_caps` |
+| IRQ route register (`bind_irq_notification`) | requires SIGNAL | unchanged | unchanged | set | n/a | cap (resolve) → ipc (store) | `stage21_irq_route_registration_and_teardown` |
+| IRQ route delivery after destroy (`route_external_irq`) | n/a | unchanged (None) | unchanged | benign no-op | n/a | ipc | `stage22_route_after_revoke_is_benign_noop` |
+| slot reuse after destroy (`create_notification`) | new SIGNAL+RECEIVE | reallocated | None | None | bump | ipc then cap | `stage22_create_notification_after_revoke_reuses_slot_cleanly` |
+
+### 40.4 Lock-rank separation (cap → ipc)
+
+The hard constraint: `destroy_notification` acquires `ipc_state_lock` (rank 3),
+and it must never be reached while `capability_state_lock` (rank 4) is held —
+acquiring rank 3 under rank 4 inverts the global ordering
+`scheduler(1) < task(2) < ipc(3) < capability(4) < vm(5) < memory(6)`.
+
+| step | lock held | rank |
+| --- | --- | --- |
+| read source cap from cnode | `capability_state_lock` | 4 |
+| revoke cap from cnode (clear slot, bump cnode gen) | `capability_state_lock` | 4 |
+| **release** `capability_state_lock` | — | — |
+| `adjust_memory_object_cap_refcount` / `reclaim_…` (MemoryObject only) | memory | 6 (separate) |
+| `destroy_notification_for_revoked_cap` → `destroy_notification` | `ipc_state_lock` | 3 |
+| `wake_destroyed_notification_waiter` (Blocked-only) | task | 2 |
+
+This mirrors exactly the existing MemoryObject teardown: both
+`adjust_memory_object_cap_refcount` and the new Notification teardown run
+**after** the cap-lock critical section closes, each acquiring only its own
+domain lock.
+
+### 40.5 `destroy_notification` callsite table
+
+| caller | when | wake target handling |
+| --- | --- | --- |
+| `revoke_capability_in_cnode` → `destroy_notification_for_revoked_cap` | a Notification cap is revoked (after cap-lock release) | snapshotted waiter woken via `wake_destroyed_notification_waiter` |
+| `revoke_capability_direct_in_process_cnode` → `destroy_notification_for_revoked_cap` | a delegated/direct Notification cap is revoked | same |
+| (transitively) `maybe_cleanup_process_cnode_for_pid` | cnode teardown loop calls `revoke_capability_in_cnode` per live cap | same |
+| Stage 21 tests | direct primitive exercise | test asserts returned waiter |
+
+### 40.6 Waiter wake decision
+
+When `destroy_notification` returns `Some(waiter_tid)`, Stage 22 **wakes** the
+waiter (Option C-ish): `wake_destroyed_notification_waiter` transitions the task
+`Blocked(_) → Runnable` and enqueues it — but **only** if it is still
+`Blocked(_)`, reusing the exact Blocked-only gate from `signal_notification`
+(§39.4 invariant 1). A Dead/Exited/Runnable/Running/Faulted task is a no-op; a
+missing TID is a no-op. The woken task re-resolves its RECEIVE cap and observes
+the destroyed object (generation mismatch → `StaleCapability`/`WrongObject`), so
+no separate cancellation error code is needed. This prevents a waiter from being
+left parked forever on an object that no longer exists.
+
+### 40.7 IRQ route teardown table
+
+| event | route state | delivery outcome |
+| --- | --- | --- |
+| `bind_irq_notification(line, cap)` | `irq_routes[line] = Some(idx)` | live notification signalled |
+| Notification cap revoke | `irq_routes[line] = None` (inside `destroy_notification`) | route gone → immediate no-op |
+| forced stale route after revoke (defence-in-depth) | `irq_routes[line] = Some(idx)` but object `None` | `signal_notification` → `WrongObject` swallowed → benign no-op |
+| slot reuse via `create_notification` | stale routes to slot pre-cleared | no cross-generation retarget |
+
+### 40.8 Stale cap / generation behavior
+
+- After revoke, the pre-revoke generation fails `capability_object_live` and
+  `resolve_notification_index` (generation mismatch).
+- A `try_ipc_recv` via the stale RECEIVE cap returns a **stable** error
+  (`StaleCapability`), repeatable across calls, never a panic.
+- A second revoke of the now-empty cnode slot returns `InvalidCapability` (slot
+  cleared); `destroy_notification`'s `WrongObject` is swallowed, so the
+  generation is **not** bumped a second time (no double-destroy).
+
+### 40.9 Fixes made (Stage 22)
+
+1. **Revoked Notification objects / IRQ routes leaked.**
+   `revoke_capability_in_cnode` (`capability_lifecycle_state.rs:332–335`) and
+   `revoke_capability_direct_in_process_cnode` (`…:398–402`) handled only
+   MemoryObject/DmaRegion refcount teardown; a revoked Notification cap left
+   `notifications[idx]`, its `irq_routes` entries, and any parked waiter intact.
+   **Fix:** both paths now call the new
+   `destroy_notification_for_revoked_cap(object)` after the cap-lock critical
+   section closes, which invokes `destroy_notification(index)` for
+   `CapObject::Notification` and wakes the returned waiter. Cnode teardown and
+   task exit inherit the fix because `maybe_cleanup_process_cnode_for_pid` revokes
+   every live cap through `revoke_capability_in_cnode`.
+
+### 40.10 Helpers added (Stage 22)
+
+| helper | file | role |
+| --- | --- | --- |
+| `destroy_notification_for_revoked_cap` | `capability_lifecycle_state.rs` | match `CapObject::Notification`, call `destroy_notification`, wake waiter; idempotent (swallows `WrongObject`/`None`) |
+| `wake_destroyed_notification_waiter` | `ipc_state.rs` | Blocked-only `→ Runnable` + enqueue of a destroyed-notification waiter, outside ipc/cap locks |
+
+### 40.11 Invariants enforced (Stage 22)
+
+1. Revoking any Notification cap frees the object, tears down its routes, clears
+   and wakes its waiter, and bumps the generation — atomically per
+   `ipc_state_lock` critical section.
+2. `destroy_notification` is reached only **after** `capability_state_lock` is
+   released, preserving the cap(4) → ipc(3) rank ordering.
+3. Teardown is idempotent: the paired cap / double-revoke is a benign no-op, no
+   double-destroy, no spurious second generation bump.
+4. The destroyed-notification waiter wake reuses the Stage 21 Blocked-only gate;
+   no Dead/Exited resurrection, no double-enqueue.
+5. An unrelated notification is wholly unaffected by another's revoke.
+6. Live IRQ delivery success path (`route_external_irq` to a live, bound
+   notification) is unchanged.
+
+### 40.12 Stage 22 test inventory
+
+| Test | Asserts |
+| --- | --- |
+| `stage22_notification_cap_revoke_destroys_object` | revoke frees object + bumps gen + cap non-live |
+| `stage22_notification_cap_revoke_tears_down_irq_route` | revoke clears `irq_routes` entry |
+| `stage22_notification_cap_revoke_clears_waiter` | revoke clears waiter + wakes Blocked→Runnable |
+| `stage22_cnode_teardown_destroys_notification_object` | `mark_task_dead` → teardown frees object |
+| `stage22_signal_after_revoke_is_stable_noop` | post-revoke external IRQ is a repeatable no-op |
+| `stage22_wait_after_revoke_is_stable_error` | post-revoke recv via stale cap = stable error |
+| `stage22_route_after_revoke_is_benign_noop` | forced stale route to destroyed object = no-op |
+| `stage22_create_notification_after_revoke_reuses_slot_cleanly` | reused slot: fresh gen, no route, no waiter, live cap |
+| `stage22_double_revoke_notification_cap_is_safe` | second revoke = safe error, no double-destroy |
+| `stage22_notification_cap_revoke_does_not_affect_unrelated_notification` | unrelated notification intact + still delivers |
+
+### 40.13 Files changed (Stage 22)
+
+| File | Change |
+| --- | --- |
+| `src/kernel/boot/ipc_state.rs` | removed `dead_code` attr from `destroy_notification`; added `wake_destroyed_notification_waiter` |
+| `src/kernel/boot/capability_lifecycle_state.rs` | added `destroy_notification_for_revoked_cap`; called from both revoke paths after cap-lock release |
+| `src/kernel/boot/tests.rs` | 10 new Stage 22 tests |
+| `doc/KERNEL_LOCKING.md` | §40 (this section), incl. §40.0 Stage 21 acceptance confirmation |
+| `doc/KERNEL_TEST_RULES.md` | Rule N+29 (Stage 22 test rules) |
+
+### 40.14 Stage 22 acceptance
+
+788 tests pass single-threaded (778 Stage 21 baseline + 10 = 788),
+`RUST_MIN_STACK=8388608`. `cargo check --no-default-features` clean (no
+`dead_code` warning for `destroy_notification` — it is now reachable on the
+non-test revoke path). `cargo check --features hosted-dev` clean.
+`git diff --check` clean.
+
+x86_64 `-smp 1` smoke **not required**: `destroy_notification` is reached only
+from the capability-revoke / cnode-teardown / task-exit cleanup paths. On the
+live boot path no service revokes a Notification cap or tears down a cnode that
+holds one (`create_notification` is not invoked from any syscall handler;
+notifications are exercised by tests and the hosted posix-compat sim only). The
+wake is gated to Blocked-only (strictly safer). Syscall ABI, `SYSCALL_COUNT`,
+SpawnV5, trap/timer/bootstrap, SMP/`smp.rs`, VFS/syscall27, and the live
+IRQ-delivery success path are all unchanged.
+
+**Deferred (still deferred at Stage 22):** a live-syscall `create_notification` /
+notification-destroy surface; x86_64 SMP / `smp.rs`; RAMFS/FAT runtime spawning;
+full global-lock removal.

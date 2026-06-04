@@ -2066,3 +2066,73 @@ on the notification wake/destroy paths — the wake now refuses a non-Blocked wa
 (strictly safer), and `destroy_notification` is a new teardown primitive not yet
 wired into a live boot path. Syscall ABI, `SYSCALL_COUNT`, SpawnV5,
 trap/timer/bootstrap, SMP, and the live IRQ-delivery success path are unchanged.
+
+## Rule N+29 — Stage 22: `destroy_notification` revoke-wiring test rules
+
+Stage 22 wires `destroy_notification` into the capability-revoke / cnode-teardown
+/ task-exit cleanup paths. Notification caps are single-owner per object (no
+refcount, never granted cross-process), so revoking any Notification cap destroys
+the object. Tests must cover the revoke teardown, its idempotence, the lock-rank
+separation outcomes, and stale-cap stability.
+
+### N+29.1 — Cap revoke destroys the object and bumps generation
+
+A test must assert that revoking a Notification cap via `revoke_capability_in_cnode`
+frees `notifications[idx]`, bumps `notification_generations[idx]`, and renders the
+pre-revoke generation non-live via `capability_object_live`. See
+`stage22_notification_cap_revoke_destroys_object`.
+
+### N+29.2 — Cap revoke tears down IRQ routes and clears+wakes the waiter
+
+A test must assert revoke clears every `irq_routes` entry targeting the slot, and
+that a parked `Blocked(_)` waiter is cleared and woken to `Runnable` (reusing the
+Stage 21 Blocked-only gate). See `stage22_notification_cap_revoke_tears_down_irq_route`,
+`stage22_notification_cap_revoke_clears_waiter`.
+
+### N+29.3 — Cnode teardown / task exit inherit the destroy
+
+A test must assert that `mark_task_dead` followed by
+`maybe_cleanup_process_cnode_for_pid` frees a notification object held in the
+dying process's cnode (the teardown loop revokes every live cap). See
+`stage22_cnode_teardown_destroys_notification_object`.
+
+### N+29.4 — Idempotence: double-revoke is safe, no double-destroy
+
+A test must assert a second revoke of the now-empty cnode slot returns an error
+(`InvalidCapability`) and does NOT bump the generation a second time —
+`destroy_notification`'s `WrongObject` is swallowed. See
+`stage22_double_revoke_notification_cap_is_safe`.
+
+### N+29.5 — Stale-cap stability after revoke
+
+Tests must assert post-revoke that: an external IRQ on the old line is a stable,
+repeatable no-op; a recv via the stale RECEIVE cap returns a stable, repeatable
+error (never a panic); a forced stale route at the freed slot is a benign no-op.
+See `stage22_signal_after_revoke_is_stable_noop`,
+`stage22_wait_after_revoke_is_stable_error`,
+`stage22_route_after_revoke_is_benign_noop`.
+
+### N+29.6 — Slot reuse and isolation
+
+Tests must assert a fresh `create_notification` reusing a freed slot starts clean
+(fresh generation, no inherited route, no stale waiter, live cap), and that
+revoking one notification leaves an unrelated notification fully intact and still
+delivering. See `stage22_create_notification_after_revoke_reuses_slot_cleanly`,
+`stage22_notification_cap_revoke_does_not_affect_unrelated_notification`.
+
+### N+29.7 — Full suite at 788+ tests (single-threaded)
+
+Every Stage 22 commit must pass `cargo test --lib --features hosted-dev --
+--test-threads=1` with at least 788 tests (778 from Stage 21 + 10 new Stage 22
+tests). Both `cargo check --no-default-features` and `cargo check --features
+hosted-dev` must be clean (the latter no longer needs a `dead_code` allow on
+`destroy_notification` — it is now reachable on the non-test revoke path), and
+`git diff --check` must be clean.
+
+x86_64 `-smp 1` smoke is NOT required after Stage 22: `destroy_notification` is
+reached only from the capability-revoke / cnode-teardown / task-exit cleanup
+paths, and no live boot service revokes a Notification cap or tears down a cnode
+holding one (`create_notification` is not invoked from any syscall handler). The
+waiter wake is gated to `Blocked(_)` only (strictly safer). Syscall ABI,
+`SYSCALL_COUNT`, SpawnV5, trap/timer/bootstrap, SMP/`smp.rs`, VFS/syscall27, and
+the live IRQ-delivery success path are all unchanged.

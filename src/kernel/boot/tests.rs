@@ -18487,3 +18487,293 @@ fn stage21_irq_delivery_to_destroyed_notification_is_safe_noop() {
 }
 
 // ── End Stage 21 notification / IRQ-route lifetime tests ──────────────────────
+
+// ── Stage 22: destroy_notification wiring into cap revoke / cnode teardown ────
+//
+// Ownership decision: Notification caps are single-owner per object — the
+// creator mints exactly one SIGNAL + one RECEIVE cap into its own cnode (see
+// `create_notification`), Notification caps are never granted cross-process,
+// and there is no refcount. Revoking ANY Notification cap therefore destroys
+// the underlying object immediately. `destroy_notification` is idempotent, so
+// revoking the paired cap (or a double-revoke) is a benign WrongObject no-op.
+
+#[test]
+fn stage22_notification_cap_revoke_destroys_object() {
+    // Revoking a Notification cap frees the object slot and bumps the generation.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let gen_before = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
+        "object present before revoke"
+    );
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+        "notification object freed by cap revoke"
+    );
+    let gen_after = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+    assert_ne!(gen_before, gen_after, "generation bumped on revoke-destroy");
+    let live = CapObject::Notification {
+        index: notif_idx,
+        generation: gen_before,
+    };
+    assert!(
+        state.capability_object_live(live).is_none(),
+        "pre-revoke generation no longer live"
+    );
+}
+
+#[test]
+fn stage22_notification_cap_revoke_tears_down_irq_route() {
+    // Revoking a Notification cap removes any IRQ route targeting it.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(20, notif_cap).expect("bind");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+        Some(notif_idx),
+        "route registered before revoke"
+    );
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[20]),
+        None,
+        "IRQ route torn down by cap revoke"
+    );
+}
+
+#[test]
+fn stage22_notification_cap_revoke_clears_waiter() {
+    // Revoking a Notification cap clears a parked waiter and wakes it (Blocked ->
+    // Runnable), mirroring the signal-path Blocked-only wake guard.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(2201).expect("task");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    stage21_block_on_notification(&mut state, 2201);
+    state.with_ipc_state_mut(|ipc| {
+        ipc.notification_waiters[notif_idx] = Some(ThreadId(2201));
+    });
+    assert_eq!(state.notification_waiter_count(notif_idx), 1, "waiter before revoke");
+    assert!(state.task_is_blocked(2201), "blocked before revoke");
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "waiter slot cleared by revoke-destroy"
+    );
+    assert!(
+        state.task_is_runnable(2201),
+        "Blocked waiter woken to Runnable by revoke-destroy"
+    );
+}
+
+#[test]
+fn stage22_cnode_teardown_destroys_notification_object() {
+    // mark_task_dead -> maybe_cleanup_process_cnode_for_pid revokes every live
+    // cap (including both notification caps), tearing down the object.
+    let mut state = Bootstrap::init().expect("init");
+    let pid = state.current_tid().expect("current tid");
+    let (notif_idx, _notif_cap, _recv) = state.create_notification(4).expect("notif");
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
+        "object present before teardown"
+    );
+
+    state.mark_task_dead(pid).expect("dead");
+    state.maybe_cleanup_process_cnode_for_pid(pid);
+
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+        "notification object freed by cnode teardown"
+    );
+}
+
+#[test]
+fn stage22_signal_after_revoke_is_stable_noop() {
+    // After revoke (object destroyed + route cleared), an external IRQ on the old
+    // line is a stable no-op (no route -> immediate Ok), repeatable.
+    let mut state = Bootstrap::init().expect("init");
+    let (_notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(21, notif_cap).expect("bind");
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    state.route_external_irq(21).expect("noop1");
+    state.route_external_irq(21).expect("noop2");
+    state.route_external_irq(21).expect("noop3");
+}
+
+#[test]
+fn stage22_wait_after_revoke_is_stable_error() {
+    // After revoke, a recv via the stale RECEIVE cap fails with a stable error
+    // (generation mismatch -> StaleCapability), repeatable, never a panic.
+    let mut state = Bootstrap::init().expect("init");
+    let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    let first = state.try_ipc_recv(recv_cap);
+    assert!(first.is_err(), "recv via stale cap errors: {first:?}");
+    let second = state.try_ipc_recv(recv_cap);
+    assert_eq!(first, second, "stale-cap recv error is stable across calls");
+}
+
+#[test]
+fn stage22_route_after_revoke_is_benign_noop() {
+    // Defence-in-depth: force a stale route back at the freed slot after revoke;
+    // route_external_irq must swallow the dead-object case as a benign no-op.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(22, notif_cap).expect("bind");
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[22]),
+        None,
+        "route cleared by revoke"
+    );
+
+    state.with_ipc_state_mut(|ipc| {
+        ipc.irq_routes[22] = Some(notif_idx);
+    });
+    state
+        .route_external_irq(22)
+        .expect("stale route to destroyed notification is a benign no-op");
+}
+
+#[test]
+fn stage22_create_notification_after_revoke_reuses_slot_cleanly() {
+    // After revoke+destroy, a fresh create reusing the same slot starts clean:
+    // no stale waiter, no inherited route, fresh generation, live cap.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(23, notif_cap).expect("bind");
+    let gen_first = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    let (new_idx, new_cap, _new_recv) = state.create_notification(4).expect("recreate");
+    assert_eq!(new_idx, notif_idx, "lowest free slot reused");
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[23]),
+        None,
+        "no route inherited by reused slot"
+    );
+    assert_eq!(
+        state.notification_waiter_count(new_idx),
+        0,
+        "no stale waiter on reused slot"
+    );
+    let gen_new = state.with_ipc_state(|ipc| ipc.notification_generations[new_idx]);
+    assert_ne!(gen_first, gen_new, "fresh generation on reused slot");
+    let new_obj = state
+        .current_task_capability(new_cap)
+        .expect("new cap resolves")
+        .object;
+    assert!(
+        state.capability_object_live(new_obj).is_some(),
+        "freshly created cap is live"
+    );
+}
+
+#[test]
+fn stage22_double_revoke_notification_cap_is_safe() {
+    // First revoke destroys the object; revoking the (now empty) slot a second
+    // time is a safe error, never a double-destroy or panic.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let cnode = state.current_task_cnode().expect("cnode");
+
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("first revoke");
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+        "object gone after first revoke"
+    );
+    let gen_after_first = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+
+    // Second revoke of the now-empty slot: InvalidCapability (slot cleared), and
+    // destroy_notification's WrongObject is swallowed — no extra generation bump.
+    let second = state.revoke_capability_in_cnode(cnode, notif_cap);
+    assert!(second.is_err(), "second revoke of empty slot errors: {second:?}");
+    let gen_after_second = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+    assert_eq!(
+        gen_after_first, gen_after_second,
+        "no double-destroy: generation unchanged by second revoke"
+    );
+}
+
+#[test]
+fn stage22_notification_cap_revoke_does_not_affect_unrelated_notification() {
+    // Revoking one notification's cap must not disturb a second, unrelated
+    // notification (object, route, generation all intact).
+    let mut state = Bootstrap::init().expect("init");
+    let (idx_a, cap_a, _recv_a) = state.create_notification(4).expect("notif a");
+    let (idx_b, cap_b, recv_b) = state.create_notification(4).expect("notif b");
+    assert_ne!(idx_a, idx_b, "distinct slots");
+    state.bind_irq_notification(24, cap_a).expect("bind a");
+    state.bind_irq_notification(25, cap_b).expect("bind b");
+    let gen_b_before = state.with_ipc_state(|ipc| ipc.notification_generations[idx_b]);
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, cap_a)
+        .expect("revoke a");
+
+    // A torn down, B intact.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[idx_a].is_none()),
+        "A destroyed"
+    );
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[idx_b].is_some()),
+        "B still alive"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[25]),
+        Some(idx_b),
+        "B route untouched"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.notification_generations[idx_b]),
+        gen_b_before,
+        "B generation untouched"
+    );
+    // B still delivers: signal via its route, drain via its recv cap.
+    state.route_external_irq(25).expect("irq b");
+    assert!(
+        state.try_ipc_recv(recv_b).expect("recv b").is_some(),
+        "B still delivers after A revoked"
+    );
+}
+
+// ── End Stage 22 destroy_notification wiring tests ────────────────────────────
