@@ -19926,3 +19926,237 @@ mod stage27_split_mut_tests {
         });
     }
 }
+
+// ===========================================================================
+// Stage 29A — live NR-8 split-dispatch proof (the smoke marker root cause).
+//
+// Root cause (Part 1): NR 8 (`ControlPlaneSetCnodeSlots`) was never invoked
+// through the real syscall trap during a smoke boot — the only userspace caller
+// was `#[cfg(test)]`, so the live split seam never ran and the
+// `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok` marker stayed at zero. The fix adds
+// a one-shot PM boot-time self-probe that issues NR 8 through the real trap.
+// These tests pin the seam's classification and result-writeback contract.
+// ===========================================================================
+mod stage29a_live_split_dispatch_tests {
+    use super::*;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{
+        Syscall, SyscallError, SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, SYSCALL_COUNT,
+        SYSCALL_IPC_RECV_NR, SYSCALL_IPC_SEND_NR, SYSCALL_SPAWN_PROCESS_NR, SYSCALL_VM_MAP_NR,
+    };
+    use crate::kernel::syscall_split::{classify_split_eligible, try_split_dispatch_into_frame};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+
+    fn decode(nr: usize) -> Syscall {
+        Syscall::decode(nr).expect("decode syscall nr")
+    }
+
+    /// Boot a SharedKernel with a SystemServer requester (900) running as the
+    /// current task and an App target (901) — mirrors the live PM self-probe
+    /// shape (a privileged control-plane requester driving NR 8).
+    fn shared_with_requester() -> (SharedKernel, u64, u64) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(900, TaskClass::SystemServer)
+                .expect("system server");
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("target app");
+            state.enqueue_current_cpu(900).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(900) {
+                state.yield_current().expect("switch");
+            }
+        });
+        (kernel, 900, 901)
+    }
+
+    fn cnode_slots_frame(target_pid: u64, slots: usize) -> TrapFrame {
+        TrapFrame::new(
+            SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR,
+            [target_pid as usize, slots, 0, 0, 0, 0],
+        )
+    }
+
+    #[test]
+    fn stage29a_nr8_still_split_eligible() {
+        // NR 8 with valid args must classify as Some (split-eligible).
+        let syscall = decode(SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR);
+        assert!(
+            classify_split_eligible(syscall, 900, [901, 8, 0, 0, 0, 0]).is_some(),
+            "NR 8 with valid args must be split-eligible"
+        );
+    }
+
+    #[test]
+    fn stage29a_non_nr8_still_fallback() {
+        // A representative set of non-NR-8 syscalls must classify as None so they
+        // fall back to the unchanged global-lock path.
+        for nr in [
+            SYSCALL_IPC_SEND_NR,
+            SYSCALL_IPC_RECV_NR,
+            SYSCALL_SPAWN_PROCESS_NR,
+            SYSCALL_VM_MAP_NR,
+        ] {
+            let syscall = decode(nr);
+            assert_eq!(
+                classify_split_eligible(syscall, 900, [1, 2, 3, 4, 5, 6]),
+                None,
+                "syscall nr {nr} must fall back (None) — not split-eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn stage29a_split_writes_set_ok_lanes() {
+        // The live seam must service NR 8 and write the exact success lanes the
+        // old global-lock handler produced: set_ok(slots, pid, 0).
+        let (kernel, _requester, target) = shared_with_requester();
+        let before = kernel
+            .with(|state| {
+                let cnode = state.process_cnode_for_pid(target).expect("cnode");
+                state.cnode_slot_capacity(cnode)
+            })
+            .expect("before capacity");
+        let requested = before.saturating_add(4);
+        let mut frame = cnode_slots_frame(target, requested);
+
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "seam must service NR 8");
+        assert_eq!(frame.ret0(), requested, "ret0 == slots");
+        assert_eq!(frame.ret1(), target as usize, "ret1 == target pid");
+        assert_eq!(frame.ret2(), 0, "ret2 == 0");
+        assert_eq!(frame.error_code(), None, "no error on success");
+
+        let after = kernel.with(|state| {
+            let cnode = state.process_cnode_for_pid(target).expect("cnode");
+            state.cnode_slot_capacity(cnode)
+        });
+        assert_eq!(after, Some(requested), "capability domain actually resized");
+    }
+
+    #[test]
+    fn stage29a_self_probe_grow_own_cnode_is_ok() {
+        // Root-cause-targeted: model the live PM self-probe exactly — the running
+        // requester resizes ITS OWN cnode upward. This must succeed (result=ok)
+        // and is the call shape the boot-time probe drives through the real trap.
+        let (kernel, requester, _target) = shared_with_requester();
+        let before = kernel
+            .with(|state| {
+                let cnode = state.process_cnode_for_pid(requester).expect("cnode");
+                state.cnode_slot_capacity(cnode)
+            })
+            .expect("before capacity");
+        let grown = before.saturating_add(8);
+        let mut frame = cnode_slots_frame(requester, grown);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "self-targeted grow must succeed (result=ok), exactly as the PM probe"
+        );
+        assert_eq!(frame.ret0(), grown, "ret0 == grown slots");
+        assert_eq!(frame.ret1(), requester as usize, "ret1 == requester pid");
+        let after = kernel.with(|state| {
+            let cnode = state.process_cnode_for_pid(requester).expect("cnode");
+            state.cnode_slot_capacity(cnode)
+        });
+        assert_eq!(after, Some(grown), "requester's own cnode resized");
+    }
+
+    #[test]
+    fn stage29a_self_probe_no_task_switch() {
+        // The probe path must not switch tasks — current TID is unchanged across
+        // it, so task_switched stays false (the arch return-writeback invariant).
+        let (kernel, requester, _target) = shared_with_requester();
+        let before_tid = kernel.current_tid_split_read(CPU0);
+        assert_eq!(before_tid, Some(requester));
+        let mut frame = cnode_slots_frame(requester, 600);
+        let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let after_tid = kernel.current_tid_split_read(CPU0);
+        assert_eq!(after_tid, Some(requester), "no task switch across the probe");
+    }
+
+    #[test]
+    fn stage29a_err_path_returns_syscall_error() {
+        // On a domain error the seam returns TrapHandleError::Syscall(..) and never
+        // writes a success payload — proving result=err is reported faithfully.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("app requester");
+            state
+                .register_task_with_class(902, TaskClass::App)
+                .expect("app target");
+            state.enqueue_current_cpu(901).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(901) {
+                state.yield_current().expect("switch");
+            }
+        });
+        // App 901 targeting a DIFFERENT pid 902 → MissingRight.
+        let mut frame = cnode_slots_frame(902, 16);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Err(TrapHandleError::Syscall(SyscallError::from(
+                KernelError::MissingRight
+            ))))
+        );
+        assert_eq!(frame.ret0(), 0, "no success payload on error");
+        assert_eq!(frame.ret1(), 0, "no success payload on error");
+    }
+
+    #[test]
+    fn stage29a_authoritative_requester_read_matches_global_current_tid() {
+        // Root-cause-targeted (classification C): the live x86_64 smoke showed the
+        // seam's old `current_tid_split_read(cpu)` returning a STALE requester (tid 0)
+        // at the pre-global-lock trap point, while the authoritative with_cpu read
+        // returned the real running task. That stale tid made the control-plane
+        // permission check resolve the wrong requester → MissingRight (result=err).
+        // The fix reads the requester via `current_tid_authoritative(cpu)`, which
+        // must equal the global-lock handler's `current_tid()`.
+        let (kernel, requester, _target) = shared_with_requester();
+        let authoritative = kernel.current_tid_authoritative(CPU0);
+        let global = kernel.with_cpu(CPU0, |k| k.current_tid()).unwrap_or(None);
+        assert_eq!(
+            authoritative, global,
+            "authoritative requester read must equal the global-lock current_tid"
+        );
+        assert_eq!(authoritative, Some(requester));
+    }
+
+    #[test]
+    fn stage29a_self_probe_resolves_requester_and_succeeds() {
+        // End-to-end shape of the live PM boot probe: the running SystemServer
+        // requester resizes its own cnode upward. With the authoritative requester
+        // read the seam must classify the requester correctly and return result=ok,
+        // proving the smoke marker `nr=8 result=ok` can be emitted.
+        let (kernel, requester, _target) = shared_with_requester();
+        let before = kernel
+            .with(|state| {
+                let cnode = state.process_cnode_for_pid(requester).expect("cnode");
+                state.cnode_slot_capacity(cnode)
+            })
+            .expect("before capacity");
+        let grown = before.saturating_add(8);
+        let mut frame = cnode_slots_frame(requester, grown);
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            Some(Ok(())),
+            "self-grow by the resolved running requester must be result=ok"
+        );
+        assert_eq!(frame.ret0(), grown);
+        assert_eq!(frame.ret1(), requester as usize);
+    }
+
+    #[test]
+    fn stage29a_syscall_count_still_30() {
+        assert_eq!(SYSCALL_COUNT, 30, "Stage 29A must not change SYSCALL_COUNT");
+    }
+}

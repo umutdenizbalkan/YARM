@@ -52,6 +52,10 @@ pub mod syscall {
     const SYSCALL_IPC_RECV_TIMEOUT_NR: usize = 5;
     const SYSCALL_IPC_CALL_NR: usize = 6;
     const SYSCALL_IPC_REPLY_NR: usize = 7;
+    /// Control-plane: resize a process cnode (NR 8). Already part of the frozen
+    /// syscall ABI; this constant only re-exposes the existing number, it does
+    /// not add a syscall.
+    pub const SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR: usize = 8;
     const SYSCALL_FUTEX_WAIT_NR: usize = 9;
     const SYSCALL_YIELD_NR: usize = 0;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
@@ -820,6 +824,35 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+    /// Resize a process cnode via the control-plane syscall (NR 8).
+    ///
+    /// This is the userspace stub for the already-frozen `ControlPlaneSetCnodeSlots`
+    /// syscall: `arg0 = target_pid`, `arg1 = slot_capacity`. It enters the kernel
+    /// through the normal architecture syscall trap, exactly as any other syscall,
+    /// so on x86_64 (-smp 1) it flows through `handle_trap_entry_shared` →
+    /// `try_split_dispatch_into_frame` (the NR-8 split-dispatch seam).
+    #[inline]
+    pub fn control_plane_set_cnode_slots(
+        target_pid: u64,
+        slot_capacity: usize,
+    ) -> core::result::Result<usize, SyscallError> {
+        // SAFETY: Uses architecture syscall ABI to enter kernel. The kernel
+        // validates requester rights and target pid before mutating the cnode.
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR,
+                [target_pid as usize, slot_capacity, 0, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        // ret0 == resized slot capacity on success (the kernel writes
+        // set_ok(slot_capacity, target_pid, 0)).
+        Ok(ret.ret0)
     }
 }
 

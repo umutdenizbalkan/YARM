@@ -176,10 +176,19 @@ pub(crate) fn try_split_dispatch_into_frame(
     }
 
     // The requester TID is what the global-lock handler reads via
-    // `current_tid(kernel)` (i.e. `kernel.current_tid()`); `current_tid_split_read`
-    // is value-equivalent under the scheduler lock alone. If it is unavailable,
-    // fall back so the global-lock path produces the canonical `Internal` error.
-    let requester_tid = shared.current_tid_split_read(cpu)?;
+    // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
+    //
+    // Stage 29A: this MUST use the authoritative `current_tid_authoritative(cpu)`
+    // read, NOT `current_tid_split_read(cpu)`. At the live x86_64 pre-global-lock
+    // trap point the split-read of the scheduler's per-CPU current slot is stale
+    // (it can observe a prior task such as tid 0 instead of the running requester),
+    // which made the requester-class permission check resolve the wrong task and
+    // return `MissingRight`. The authoritative read binds `current_cpu` first and
+    // returns the same task the global-lock handler sees. It is a read-only
+    // current-task snapshot (no dispatch/yield/switch); the domain mutation below
+    // still runs lock-free via the split-mut helper. If unavailable, fall back so
+    // the global-lock path produces the canonical `Internal` error.
+    let requester_tid = shared.current_tid_authoritative(cpu)?;
 
     // Decode args identically to `handle_control_plane_set_cnode_slots`.
     let mut args = [0u64; 6];
