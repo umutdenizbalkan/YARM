@@ -2669,6 +2669,36 @@ pub fn run() {
         service.seed_bootstrap_lifecycle_record(ctx.task_id - 2, 3);
     }
 
+    // Stage 29A boot-time self-probe: exercise the control-plane cnode-slots
+    // syscall (NR 8) ONCE through the real architecture syscall trap so the live
+    // split-dispatch seam (`try_split_dispatch_into_frame`) runs during boot.
+    //
+    // PM resizes ITS OWN cnode (target_pid == ctx.task_id) to a capacity at or
+    // above its current size (default 512 → request 520). Resizing one's own
+    // cnode is always permission-allowed (requester_pid == target_pid), a grow
+    // preserves every existing capability entry, and the global cnode-slot budget
+    // (max_tasks * 512) has ample headroom for an 8-slot bump on a single task.
+    // No external behavior changes: no new caps are minted, no IPC is sent, and
+    // no task switch occurs (the split path never blocks/yields/schedules).
+    {
+        const PM_SELF_PROBE_CNODE_SLOTS: usize = 520;
+        match yarm_user_rt::syscall::control_plane_set_cnode_slots(
+            ctx.task_id,
+            PM_SELF_PROBE_CNODE_SLOTS,
+        ) {
+            Ok(slots) => yarm_user_rt::user_log!(
+                "PM_NR8_SELF_PROBE_OK pid={} slots={}",
+                ctx.task_id,
+                slots
+            ),
+            Err(e) => yarm_user_rt::user_log!(
+                "PM_NR8_SELF_PROBE_ERR pid={} err={:?}",
+                ctx.task_id,
+                e
+            ),
+        }
+    }
+
     loop {
         // SAFETY: direct syscall wrapper call; PM owns its recv endpoint capability.
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {

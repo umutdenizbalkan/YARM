@@ -80,6 +80,24 @@ impl SharedKernel {
         sched.timer.current_ticks().0
     }
 
+    /// Authoritative current-TID read for the *live* trap path (x86_64 -smp 1).
+    ///
+    /// Stage 29A: `current_tid_split_read` reads the scheduler's per-CPU current
+    /// slot WITHOUT first binding `current_cpu` to the trapping CPU. At the live
+    /// x86_64 pre-global-lock trap point that read is stale (it can observe a prior
+    /// task, e.g. tid 0, instead of the running requester) — exactly the
+    /// value-divergence the Stage 4T+6R revert documented. This helper takes the
+    /// global lock only to set `current_cpu` and read `current_tid()`, which is the
+    /// same authoritative value the global-lock syscall handler resolves via
+    /// `current_tid(kernel)`. It performs NO dispatch, yield, or task switch — it is
+    /// a read-only current-task snapshot. The split-dispatch *mutation* still runs
+    /// lock-free via the per-domain split-mut helper after this read releases.
+    pub fn current_tid_authoritative(&self, cpu: CpuId) -> Option<u64> {
+        self.with_cpu(cpu, |kernel| kernel.current_tid())
+            .ok()
+            .flatten()
+    }
+
     pub fn current_tid_split_read(&self, cpu: CpuId) -> Option<u64> {
         // Phase L5A split: read the scheduler's per-CPU current TID directly
         // under the scheduler lock.  This intentionally avoids the global
