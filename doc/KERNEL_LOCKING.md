@@ -9106,3 +9106,188 @@ x86_64 SMP; RAMFS/FAT runtime spawning; live split-dispatch expansion beyond NR 
 `stage30_timer_guard_detects_active_window_in_test`,
 `stage30_syscall_count_still_30`.
 All pass single-threaded. Full lib suite: 871 passed, 0 failed.
+
+### 48.10 Stage 30 terminal acceptance record
+
+**Accepted at commit `77af2cb`** (Stage 30, branch `claude/ecstatic-feynman-9ZZwC`).
+
+- **`BOOT_RAW_BORROW_ACTIVE` debug guard:** `borrow_kernel_for_boot` now opens a
+  debug-only "raw borrow active" window (`begin_boot_raw_borrow_window` /
+  `end_boot_raw_borrow_window`, RAII guard). If a timer ISR reaches `with_cpu`
+  while the window is active, a `debug_assert!` fires — surfacing the C1 aliasing
+  hazard (a second `&mut KernelState` aliasing the boot borrow) in debug/test
+  builds. Compiles to nothing in release; no live timer/trap/bootstrap change.
+- **Validation-status labels:** every split helper now carries a
+  `# Validation status` doc label (`LIVE_TRAP_SMOKE_X86_64`, `LIVE_OFF_TRAP`,
+  `UNIT_ONLY`, `TRAP_FORBIDDEN`, `HELPER_ONLY`), so a reader can tell at a glance
+  whether a helper is proven on the live trap seam, off-trap only, unit-only, or
+  forbidden at the trap seam.
+- **`current_tid_split_read` TRAP_FORBIDDEN lesson (carried forward):** the
+  scheduler per-CPU current-slot split read is stale at the pre-global-lock x86_64
+  trap seam (Stage 29A returned tid 0 instead of the running requester). Any new
+  trap-seam split path MUST read requester identity via
+  `current_tid_authoritative(cpu)`. Stage 31 obeys this.
+- **Stage 31 target:** the first IPC live fast-path candidate — `IpcRecv` of a
+  plain message already queued on a buffered endpoint, non-blocking, no cap
+  transfer, no recv-v2 metadata, no sender wake. Default-deny for every other IPC
+  case.
+- **Still deferred:** x86_64 SMP (`smp.rs`); RAMFS/FAT runtime spawning.
+
+## §49 Stage 31 — IPC queued plain recv fast-path split (helper-only)
+
+### 49.1 Stage 30 acceptance (Part 0)
+
+Recorded in §48.10 above: accepted at `77af2cb`; `BOOT_RAW_BORROW_ACTIVE` guard;
+validation-status labels; `current_tid_split_read` TRAP_FORBIDDEN lesson carried
+forward.
+
+### 49.2 IPC recv case classification (Part 1 audit)
+
+`IpcRecv` is **NR 2** (`SYSCALL_IPC_RECV_NR == 2`). Args:
+`arg(SYSCALL_ARG_CAP)=recv endpoint cap`, `arg(SYSCALL_ARG_PTR)=user payload ptr`,
+`arg(SYSCALL_ARG_LEN)=user payload len`, `arg(SYSCALL_ARG_INLINE_PAYLOAD0)=meta
+ptr (recv-v2)`, `arg(SYSCALL_ARG_INLINE_PAYLOAD1)=meta len (recv-v2)`. A recv-v2
+request is detected as `meta_ptr != 0 && meta_len >= 40`.
+
+The endpoint queue dequeue is already domain-split: `try_endpoint_split_recv` →
+`ipc_try_recv_queued_plain_endpoint_only` (Stage 4C/4D scaffolding) mutates only
+`ipc_state_lock` (rank 3) and returns `Received(msg)` for a plain queued message,
+`ReceivedWithSenderWake(msg, tid)` when a plain sender waiter must be refilled, or
+`Ineligible(reason)` otherwise. What is NOT split today is the *writeback*
+(`handle_ipc_recv_result_with_empty_error`): for a user-ASID receiver it requires
+`copy_to_current_user` (user-memory copy) and possibly shared-memory mapping; for
+a kernel task (no user ASID) it is a pure register write
+(`set_ok(sender, raw_len, NO_TRANSFER_CAP)` + two inline payload words).
+
+Case audit:
+
+| case | class | disposition |
+|---|---|---|
+| A queued plain, no cap, no meta, kernel-task | candidate | split (helper) |
+| A' queued plain, no cap, no meta, **user-ASID** | needs user-copy | fallback |
+| B queued + sender-waiter refill | scheduler interaction | defer (None) |
+| C recv-v2 metadata | cap/meta materialization | defer (None) |
+| D cap-transfer receive | cap domain | defer (None) |
+| E reply-cap materialization | cap domain | defer (None) |
+| F empty endpoint / WouldBlock | not an error | fallback (None) |
+| G timeout receive | deadline logic | defer (None) |
+| H blocking receive | scheduler interaction | defer (None) |
+| I invalid cap / fault | error | match old error (Some(Err)) |
+| J non-IpcRecv IPC (send/call/reply) | out of scope | reject (None) |
+
+### 49.3 Exact split coverage
+
+Stage 31 splits **only case A**: a plain (no `FLAG_CAP_TRANSFER` /
+`FLAG_CAP_TRANSFER_PLAIN` / `FLAG_REPLY_CAP`, no transferred cap) message already
+queued on a buffered endpoint, delivered to a **kernel-task receiver (no user
+ASID)**, with **no recv-v2 metadata** requested and **no sender-waiter refill**.
+Sender wake is **NOT** included — any `ReceivedWithSenderWake` result is rejected
+(→ `None`) and falls back to the global path.
+
+### 49.4 Live-wired vs helper-only — DECISION: helper-only
+
+`try_split_recv_queued_plain_into_frame_locked` (in `src/kernel/syscall.rs`) and
+the `SharedKernel::try_split_ipc_recv_queued_plain_into_frame` wrapper (in
+`src/runtime.rs`), plus the `syscall_split::try_split_ipc_recv_queued_plain_into_frame`
+entry point, are added with full tests but are **intentionally NOT wired** into
+`try_split_dispatch_into_frame`. IpcRecv stays default-deny in the live seam.
+
+**Blocker (why not live-wired):** the realistic live x86_64 receivers (PM, init,
+VFS and other servers) are **user-ASID** tasks. Their plain-recv writeback needs
+`copy_to_current_user` (a user-memory copy), which is forbidden under the Stage 31
+split lock rules, and endpoint-cap resolution crosses the capability domain
+(rank 4) which has no proven split extraction yet. The helper rejects every
+user-ASID receiver (case A'), so it can only ever fast-path a kernel-task
+receiver — which the live boot path does not exercise. Wiring it live would gate a
+fast path that never fires while adding a trap-seam branch, with no smoke
+coverage. Helper-only keeps the proven dequeue+writeback equivalence available for
+a future stage that first extracts the capability-resolution and user-copy domains.
+
+### 49.5 Fallback / split matrix
+
+| case | split? | reason | lock domains | writeback | fallback? |
+|---|---|---|---|---|---|
+| queued plain recv (kernel task) | yes (Stage 31, helper-only) | fast-path, no deps | ipc rank 3 | set_ok(sender,len,NO_CAP) + inline words | no |
+| queued plain recv (user ASID) | no | needs user-copy | — | — | yes |
+| empty endpoint | no | WouldBlock → fallback | — | — | yes |
+| blocking recv | no | scheduler interaction | — | — | yes |
+| recv-timeout | no | deadline logic | — | — | yes |
+| recv-v2 metadata | no | cap/meta materialization | — | — | yes |
+| cap-transfer recv | no | cap domain needed | — | — | yes |
+| reply-cap materialization | no | cap domain needed | — | — | yes |
+| sender-waiter refill | no (Stage 31) | scheduler interaction | — | — | yes |
+| invalid cap | no/error | match old error | — | same error | yes |
+| non-IpcRecv IPC | no | out of scope | — | — | yes |
+
+### 49.6 Lock order
+
+```
+[no lock] → current_tid_authoritative (takes+releases global) →
+            ipc_state_lock (rank 3, via ipc_try_recv_queued_plain_endpoint_only) →
+            [release] → [no lock]
+```
+
+Forbidden under `ipc_state_lock`: scheduler lock, capability lock, VM lock,
+user-copy. `task_switched` is always `false` (no dispatch / yield / switch); no
+deferred wake plan is produced because the sender-waiter-refill case is rejected.
+(NOTE: the helper-only `SharedKernel` wrapper currently performs cap-resolution +
+dequeue + writeback under the global `with` lock, because the capability domain is
+not yet split-extracted; the *dequeue itself* still touches only the IPC domain.
+This is the blocker that keeps Stage 31 helper-only — see §49.4.)
+
+### 49.7 Return / writeback equivalence
+
+The split writeback reproduces the kernel-task (no-user-ASID) branch of
+`handle_ipc_recv_result_with_empty_error` for a plain message exactly:
+`recv_meta_flags == 0`, `materialize_received_message_cap → None`,
+`encode_transfer_cap_ret(frame, None)` ⇒ `ret2 = NO_TRANSFER_CAP`,
+`set_ok(sender, msg.as_slice().len(), ret2)`, and the two inline payload words from
+`pack_register_payload(msg.as_slice())`. Proven by
+`stage31_split_recv_return_lanes_match_old_path`, which drives the unchanged
+`syscall::dispatch` recv path on an identical state and asserts ret0/ret1/ret2 +
+error lane + both inline payload words are byte-for-byte equal.
+
+### 49.8 Rejected cases and why
+
+recv-v2 (would materialize metadata into the user meta buffer); cap-transfer /
+reply-cap (capability domain mutation outside ipc rank 3); user-ASID receiver
+(forbidden user copy); sender-waiter refill (scheduler wake); empty queue /
+timeout / blocking (no message, scheduler interaction); non-IpcRecv (out of
+scope). Invalid cap is NOT rejected to fallback — it returns the same `Some(Err(
+TrapHandleError::Syscall(..)))` the old path produced, proven by
+`stage31_split_recv_invalid_endpoint_cap_error`.
+
+### 49.9 Smoke requirement
+
+Not required for Stage 31: the path is **helper-only**, not wired into the live
+trap seam, so it changes no live trap behavior. The existing NR-8 live split-
+dispatch is untouched (`stage31_nr8_split_still_works` regression). x86_64 smoke
+is deferred for Stage 31; `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok` continues to be
+the live split marker. No `ipc_recv_queued_plain` live marker is emitted because
+the path is not live-wired.
+
+### 49.10 Still deferred
+
+x86_64 SMP (`smp.rs`); RAMFS/FAT runtime spawning; live-wiring the IPC recv split
+(blocked on capability-domain + user-copy split extraction); sender-wake refill;
+recv-v2 / cap-transfer / timeout / blocking recv splits.
+
+### 49.11 Tests added (Stage 31)
+
+15 tests in `src/kernel/boot/tests.rs` module `stage31_split_recv_tests`:
+`stage31_split_recv_queued_plain_succeeds`,
+`stage31_split_recv_return_lanes_match_old_path`,
+`stage31_split_recv_dequeues_exactly_one_message`,
+`stage31_split_recv_empty_queue_falls_back`,
+`stage31_split_recv_cap_transfer_flag_falls_back`,
+`stage31_split_recv_blocking_flag_falls_back`,
+`stage31_split_recv_invalid_endpoint_cap_error`,
+`stage31_split_recv_non_ipc_syscalls_rejected`,
+`stage31_nr8_split_still_works`,
+`stage31_syscall_count_still_30`,
+`stage31_split_recv_task_switched_false`,
+`stage31_split_recv_no_waiter_leak`,
+`stage31_split_recv_sharedkernel_wrapper_succeeds`,
+`stage31_split_recv_not_wired_into_live_seam`,
+`stage31_split_recv_invalid_cap_matches_dispatch_error`.
+All pass single-threaded. Full lib suite: 886 passed, 0 failed.

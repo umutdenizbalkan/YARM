@@ -215,6 +215,50 @@ pub(crate) fn try_split_dispatch_into_frame(
     }
 }
 
+/// # Validation status
+/// - HELPER_ONLY — Stage 31 queued-plain IPC recv fast-path. NOT wired into the
+///   live trap seam below (`try_split_dispatch_into_frame` does NOT route IpcRecv
+///   here); exercised by unit tests only. See `doc/KERNEL_LOCKING.md` §49.
+///
+/// Stage 31 split-recv seam (helper-only): attempt to service an `IpcRecv` for a
+/// plain queued message on a buffered endpoint, delivered to a kernel-task
+/// receiver, with no recv-v2 metadata. Default-deny for every other case.
+///
+// Lock order: [no lock] → current_tid_authoritative (takes+releases global) →
+//             ipc_state_lock (rank 3) → [release] → [no lock]
+// Forbidden under ipc_state_lock: scheduler lock, capability lock, VM lock, user-copy
+// task_switched: always false (no dispatch/yield/switch)
+///
+/// Returns:
+/// * `Some(Ok(()))` — a plain message was dequeued; success lanes are written into
+///   `frame` byte-for-byte as the kernel-task branch of the old recv path
+///   (`set_ok(sender, raw_len, NO_TRANSFER_CAP)` + inline payload words).
+/// * `Some(Err(e))` — the recv cap was invalid; `e` is the same error the old
+///   global-lock recv path returned.
+/// * `None` — NOT split-eligible (default-deny): empty queue, recv-v2, cap-transfer
+///   or reply-cap message, user-ASID receiver (would require a forbidden user copy),
+///   sender-waiter refill, blocking, timeout, or a non-IpcRecv syscall.
+///
+/// Why NOT live-wired: the realistic live x86_64 receivers (PM/init/VFS) are
+/// user-ASID tasks whose plain-recv writeback needs `copy_to_current_user`, which
+/// is forbidden on the split path, and endpoint-cap resolution (capability domain,
+/// rank 4) has no proven split extraction yet. The helper rejects every user-ASID
+/// receiver, so it can only ever fast-path a kernel-task receiver. It is kept
+/// helper-only and tested directly; see §49.
+#[allow(dead_code)] // Stage 31: helper-only, intentionally not wired into the live seam.
+pub(crate) fn try_split_ipc_recv_queued_plain_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    // Number-only default-deny gate: only IpcRecv is considered here.
+    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+    if !matches!(syscall, Syscall::IpcRecv) {
+        return None;
+    }
+    shared.try_split_ipc_recv_queued_plain_into_frame(cpu, frame)
+}
+
 /// Number-only split eligibility classifier (no arg validation, no lock).
 ///
 /// Used by [`try_split_dispatch_into_frame`] as the fast default-deny gate before
