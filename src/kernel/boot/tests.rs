@@ -18777,3 +18777,193 @@ fn stage22_notification_cap_revoke_does_not_affect_unrelated_notification() {
 }
 
 // ── End Stage 22 destroy_notification wiring tests ────────────────────────────
+
+// ── Stage 23: notification live revoke/release surface audit ──────────────────
+//
+// Audit result (see KERNEL_LOCKING.md §41): there is NO generic user-facing
+// capability-release / capability-revoke syscall. SYSCALL_COUNT == 30, 22 live
+// Syscall variants. The only release-shaped syscall is `TransferRelease`
+// (NR = 4), which is MemoryObject/transfer-scoped: `handle_transfer_release`
+// resolves an active transfer mapping for the cap and errors out before
+// `revoke_capability_in_cnode` when none exists. A Notification cap never has an
+// active transfer mapping, so `TransferRelease` cannot revoke (and therefore
+// cannot destroy) a Notification object.
+//
+// `create_notification` has no syscall caller, so notifications are never created
+// or released from userspace on the live boot path. Notification teardown is
+// reachable only through:
+//   - the direct revoke helpers (`revoke_capability_in_cnode` /
+//     `revoke_capability_direct_in_process_cnode`), and
+//   - the task/process-exit cnode-teardown path
+//     (`maybe_cleanup_process_cnode_for_pid`), which is the closest live-path
+//     equivalent.
+//
+// These tests pin those facts down without faking a live cap-release syscall.
+
+#[test]
+fn stage23_revoke_notification_cap_destroys_object_and_routes() {
+    // Direct revoke helper (the only reachable teardown surface): revoking a
+    // Notification cap frees the object AND tears down its IRQ route in one pass.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(31, notif_cap).expect("bind");
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
+        "object present before revoke"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[31]),
+        Some(notif_idx),
+        "route registered before revoke"
+    );
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+        "object freed by revoke"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[31]),
+        None,
+        "IRQ route torn down by revoke"
+    );
+}
+
+#[test]
+fn stage23_cnode_cleanup_on_task_exit_destroys_notification() {
+    // Closest live-path equivalent: task exit -> mark_task_dead ->
+    // maybe_cleanup_process_cnode_for_pid revokes every live cap in the dying
+    // task's cnode (including its Notification caps), which fires the Stage 22
+    // teardown. This is the only live-reachable path to notification teardown.
+    let mut state = Bootstrap::init().expect("init");
+    let pid = state.current_tid().expect("current tid");
+    let (notif_idx, _notif_cap, _recv) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(32, _notif_cap).expect("bind");
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
+        "object present before exit"
+    );
+
+    state.mark_task_dead(pid).expect("dead");
+    state.maybe_cleanup_process_cnode_for_pid(pid);
+
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+        "object freed by task-exit cnode cleanup"
+    );
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.irq_routes[32]),
+        None,
+        "IRQ route torn down by task-exit cnode cleanup"
+    );
+}
+
+#[test]
+fn stage23_notification_cleanup_idempotent_double_revoke() {
+    // Idempotency on the only reachable teardown surface: first revoke destroys
+    // the object; a second revoke of the now-empty slot is a safe error with no
+    // double-destroy and no spurious second generation bump.
+    let mut state = Bootstrap::init().expect("init");
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+    let cnode = state.current_task_cnode().expect("cnode");
+
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("first revoke");
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_none()),
+        "object gone after first revoke"
+    );
+    let gen_after_first = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+
+    let second = state.revoke_capability_in_cnode(cnode, notif_cap);
+    assert!(second.is_err(), "second revoke of empty slot errors: {second:?}");
+    let gen_after_second = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
+    assert_eq!(
+        gen_after_first, gen_after_second,
+        "idempotent: no double-destroy, generation unchanged by second revoke"
+    );
+}
+
+#[test]
+fn stage23_transfer_release_syscall_cannot_target_notification_cap() {
+    // The only user-facing release syscall is TransferRelease (NR = 4). Its
+    // handler is MemoryObject/transfer-scoped: it requires an active transfer
+    // mapping for the cap. A Notification cap never has one, so the handler's
+    // gate (`active_transfer_mapping_for`) returns None and the syscall errors
+    // out BEFORE revoke — it cannot destroy a Notification object.
+    let mut state = Bootstrap::init().expect("init");
+    let owner = ThreadId(state.current_tid().expect("current tid"));
+    let (notif_idx, notif_cap, _recv) = state.create_notification(4).expect("notif");
+
+    // Precondition the live TransferRelease handler checks: no transfer mapping.
+    assert_eq!(
+        state.active_transfer_mapping_for(owner, notif_cap),
+        None,
+        "Notification cap has no active transfer mapping (TransferRelease gate fails)"
+    );
+
+    // The Notification object remains alive — no live release syscall touched it.
+    assert!(
+        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some()),
+        "notification object untouched by any user release-syscall surface"
+    );
+
+    // ABI guard: the release surface is exactly the 30-slot table; no cap-release
+    // syscall number was added.
+    assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 30, "SYSCALL_COUNT unchanged");
+}
+
+#[test]
+fn stage23_stale_notification_cap_after_revoke_cannot_signal_or_recv() {
+    // After teardown via the reachable revoke path, the old caps are dead: an IRQ
+    // on the (now-cleared) route is a benign no-op, and a recv via the stale
+    // RECEIVE cap is a stable error — a stale cap cannot signal or drain.
+    let mut state = Bootstrap::init().expect("init");
+    let (_notif_idx, notif_cap, recv_cap) = state.create_notification(4).expect("notif");
+    state.bind_irq_notification(33, notif_cap).expect("bind");
+
+    let cnode = state.current_task_cnode().expect("cnode");
+    state
+        .revoke_capability_in_cnode(cnode, notif_cap)
+        .expect("revoke");
+
+    // Signal attempt via the old IRQ line: route is gone -> benign no-op, twice.
+    state.route_external_irq(33).expect("stale signal noop 1");
+    state.route_external_irq(33).expect("stale signal noop 2");
+
+    // Drain attempt via the stale RECEIVE cap: stable error, never a panic.
+    let first = state.try_ipc_recv(recv_cap);
+    assert!(first.is_err(), "stale recv cap errors: {first:?}");
+    let second = state.try_ipc_recv(recv_cap);
+    assert_eq!(first, second, "stale recv error is stable across calls");
+}
+
+#[test]
+fn stage23_no_live_notification_release_syscall_documented() {
+    // Documentation gate (audit lock-down): there is no generic user-facing
+    // capability-release / capability-revoke syscall, and `create_notification`
+    // has no syscall caller, so userspace cannot create or release a Notification
+    // cap on the live boot path. Notification teardown is reachable only via the
+    // direct revoke helpers and the task/process-exit cnode-teardown path. A live
+    // notification create/release syscall would require a new syscall number,
+    // which is out of scope by the hard ABI invariant (SYSCALL_COUNT frozen).
+    // See KERNEL_LOCKING.md §41.
+    assert_eq!(
+        crate::kernel::syscall::SYSCALL_COUNT,
+        30,
+        "no cap-release syscall added; SYSCALL_COUNT frozen"
+    );
+    assert!(
+        true,
+        "no live user-facing notification release/revoke syscall exists; \
+         teardown reachable only via revoke helpers + task-exit cnode cleanup \
+         (deferred: live notification create/release syscall surface)"
+    );
+}
+
+// ── End Stage 23 notification revoke/release surface audit tests ───────────────

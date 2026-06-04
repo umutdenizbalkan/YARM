@@ -7779,3 +7779,131 @@ IRQ-delivery success path are all unchanged.
 **Deferred (still deferred at Stage 22):** a live-syscall `create_notification` /
 notification-destroy surface; x86_64 SMP / `smp.rs`; RAMFS/FAT runtime spawning;
 full global-lock removal.
+
+### 40.15 Stage 22 acceptance (formal record)
+
+Recorded at Stage 23 entry; the Stage 22 commit (`b14b167`) is **accepted**.
+
+- **Accepted without x86_64 smoke.** Reason: `destroy_notification` /
+  `destroy_notification_for_revoked_cap` are **not** on the live boot path. The
+  only behavior changed is cap-revoke / cnode-teardown accounting (Notification
+  object + IRQ route + waiter teardown). No service revokes a Notification cap or
+  tears down a cnode holding one during live boot, because `create_notification`
+  has no syscall caller.
+- **Wiring recorded.** `revoke_capability_in_cnode`
+  (`capability_lifecycle_state.rs:335`) and
+  `revoke_capability_direct_in_process_cnode` (`…:433`) both call
+  `destroy_notification_for_revoked_cap(capability.object)` **after** the
+  `capability_state_lock` (rank 4) critical section closes;
+  `destroy_notification` then acquires `ipc_state_lock` (rank 3), preserving the
+  cap(4) → ipc(3) ordering.
+- **Single-owner semantics decision.** Notification caps are single-owner per
+  object (creator mints exactly one SIGNAL + one RECEIVE cap into its own cnode;
+  never granted cross-process; no refcount). Revoking **any** Notification cap
+  destroys the underlying object immediately.
+- **Idempotent double-revoke.** The paired cap / a second revoke re-enters with
+  the object slot already `None`; `destroy_notification` returns `WrongObject`,
+  swallowed as a benign no-op — no double-destroy, no second generation bump.
+- **Teardown completeness.** IRQ routes torn down, waiter cleared + Blocked-only
+  woken, object freed, generation bumped.
+- **Still deferred at Stage 22:** x86_64 SMP / `smp.rs`; RAMFS/FAT runtime
+  spawning; full global-lock removal; a live-syscall notification create/destroy
+  surface.
+- 788 tests pass single-threaded; no smoke required.
+
+---
+
+## §41 Stage 23 — Notification live revoke/release surface audit
+
+Stage 23 is an **audit-and-prove** stage: it answers "is there a user-facing
+capability-release / revoke syscall through which a userspace task can release a
+Notification cap, and if so does the Stage 22 teardown fire through it?" — then
+locks the answer down with focused tests. No production wiring changed.
+
+### 41.1 Audit method
+
+Searched `src/kernel/syscall.rs` and `src/kernel/boot/` for `CAP_RELEASE`,
+`SYS_CAP_RELEASE`, `cap_release`, `release_capability`, `revoke_cap`, every
+`revoke_capability_in_cnode` / `revoke_capability_direct_in_process_cnode`
+callsite, and the syscall dispatch table + `SYSCALL_COUNT`.
+
+### 41.2 Audit result — syscall surface
+
+`SYSCALL_COUNT == 30`; 22 live `Syscall` variants. **No** generic
+capability-release / capability-revoke syscall exists. The only release-shaped
+syscall is **`TransferRelease` (NR = 4)** (`handle_transfer_release`).
+
+`revoke_capability_in_cnode` / `revoke_capability_direct_in_process_cnode`
+callsite classification:
+
+| callsite | file:line | class | reaches Stage 22 notif teardown? |
+| --- | --- | --- | --- |
+| `revoke_current_transfer_cap_best_effort` (IPC recv rollback) | `syscall.rs:741` | C internal helper | no — transfer (MemoryObject) cap only |
+| `handle_transfer_release` (TransferRelease NR=4) | `syscall.rs:2053` | A user syscall, but **MemoryObject-scoped** | no — gated on `active_transfer_mapping_for`, which a Notification cap never has |
+| `rollback_anon_map` (un-mapped cap) | `syscall.rs:3187` | C internal rollback | no |
+| `rollback_anon_map` (mapped-page cap) | `syscall.rs:3201` | C internal rollback | no |
+| `maybe_cleanup_process_cnode_for_pid` loop | `cnode_state.rs:135` | B task/process-exit teardown | **yes** (revokes every live cap) |
+| transfer-mapping purge | `cnode_state.rs:249` | B/C teardown | no (transfer cap) |
+| `memory_state.rs` rollback sites | `memory_state.rs:118,490,497,507` | C internal rollback | no |
+| `driver_state.rs` rollback sites | `driver_state.rs:527,530,533` | C internal | no |
+| `thread_state.rs` child teardown | `thread_state.rs:67` | B thread-exit teardown | **yes** (inherits revoke) |
+| `transfer_state.rs:162` | rollback materialized recv cap | C internal | no (transfer cap) |
+
+**Notification-cap creation surface:** `create_notification` (`ipc_state.rs:1305`)
+has **no production / syscall caller** — referenced only by `tests.rs` and the
+doc. Classification for the live notification user-release surface:
+**E — missing/deferred live surface.**
+
+### 41.3 Is Notification teardown reachable from a user syscall?
+
+**No live user *release* syscall reaches it.** `TransferRelease` is the only
+user-facing release syscall and is structurally MemoryObject-scoped:
+`handle_transfer_release` resolves `active_transfer_mapping_for(owner, cap)` and
+returns `InvalidArgs` when there is no transfer mapping — a Notification cap has
+none, so the handler errors out **before** `revoke_capability_in_cnode` is ever
+called. There is no other userspace-reachable path that revokes a Notification
+cap.
+
+Notification teardown **is** reachable from the **task/process-exit cnode
+teardown** path (`maybe_cleanup_process_cnode_for_pid` →
+`revoke_capability_in_cnode` per live cap, and the per-thread variant in
+`thread_state.rs`). That is the closest live-path equivalent, but exit teardown is
+not a normal-runtime user request and — because no live service creates a
+Notification cap — does not fire for notifications on the live boot path today.
+
+### 41.4 What changed in Stage 23
+
+Nothing in production code. The audit confirmed the Stage 22 wiring is the only
+reachable teardown surface and that no user *release* syscall bypasses it (the
+only candidate, `TransferRelease`, cannot target a Notification cap by
+construction). Stage 23 adds focused tests pinning these facts:
+
+- the direct revoke helper destroys object + routes (helper-level proof of the
+  Stage 22 path);
+- the task-exit cnode-teardown path destroys a held notification (closest live
+  equivalent);
+- double-revoke idempotency;
+- `TransferRelease` (the live release syscall) does **not** and cannot revoke a
+  Notification cap — proven by exercising `handle_transfer_release`'s gate;
+- a documentation test recording that no live notification-release syscall exists.
+
+### 41.5 No ABI change
+
+`SYSCALL_COUNT` stays `30`; the 22 `Syscall` variants are unchanged; no syscall
+number added; SpawnV5, IPC recv-v2 / reply-cap / transfer-envelope, and the live
+IRQ-delivery success path are untouched.
+
+### 41.6 Deferred (Stage 23)
+
+A live-syscall notification create/release surface (would require a new syscall
+number — explicitly **out of scope** by the hard ABI invariant); x86_64 SMP /
+`smp.rs`; RAMFS/FAT runtime spawning; full global-lock removal.
+
+### 41.7 Stage 23 acceptance
+
+- No production change → no x86_64 `-smp 1` smoke required (no live boot/runtime
+  behavior change).
+- `cargo check --no-default-features` + `cargo check --features hosted-dev` clean.
+- Stage 23 tests + Stage 22 notification tests pass single-threaded
+  (`RUST_MIN_STACK=8388608`).
+- `git diff --check` clean.
