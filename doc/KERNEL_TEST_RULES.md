@@ -2438,3 +2438,50 @@ entering/exiting TID trap logic, `handle_trap_with_cpu`,
 VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn,
 notification single-owner / endpoint multi-owner semantics, and RAMFS/FAT runtime
 spawning are all unchanged.
+
+## Rule N+35 — Stage 28: trap/syscall dispatch seam audit + split-dispatch bridge scaffold test rules
+
+### N+35.1 — The split-dispatch whitelist must be default-deny
+
+`try_split_dispatch` / `classify_split_eligible` (`src/kernel/syscall_split.rs`)
+must return `Some(..)` ONLY for explicitly whitelisted syscalls and `None` for
+every other syscall (`_ => None` default arm). The acceptance proof must exhaust
+the decodable syscall space: `stage28_split_dispatch_fallback_preserved_for_unwhitelisted`
+walks every `Syscall::decode(nr)` for `nr < SYSCALL_COUNT` and asserts `None`, and
+the targeted-reject tests assert `None` for representative dangerous classes —
+`stage28_split_dispatch_whitelist_rejects_ipc_send`, `…_rejects_ipc_recv`,
+`…_rejects_spawnv5`, `…_rejects_vm_map`. A non-whitelisted syscall returning
+`Some` is a test failure.
+
+### N+35.2 — A whitelisted candidate must service via its proven split helper
+
+The sole whitelisted candidate (`ControlPlaneSetCnodeSlots`) must dispatch through
+the Stage 27 `control_plane_set_process_cnode_slots_split_mut` helper and produce
+the same final state as the global-locked path.
+`stage28_split_dispatch_whitelist_accepts_cnode_slots_syscall` asserts it is
+classified eligible and that the split dispatch resizes the target cnode;
+`stage28_stage27_split_mut_helper_still_works` is the regression guard that the
+delegated Stage 27 helper still resizes and still returns `TaskMissing` for an
+absent requester.
+
+### N+35.3 — Helper-only bridge must document the exact arch blocker
+
+A trap/syscall split-dispatch bridge that is NOT live-wired must record the exact
+missing arch abstraction (here: a pre-global-lock trapframe result-writeback seam
+that owns `frame.set_ok(slots, pid, 0)`, plus preservation of the x86_64
+`entering_tid`/`exiting_tid`/`task_switched` snapshots). The bridge must not touch
+the `TrapFrame`, must not block/yield/schedule, and must not copy user memory.
+
+### N+35.4 — ABI guard, no-smoke, invariants
+
+`SYSCALL_COUNT == 30` is unchanged (the bridge is additive; no opcode
+added/removed). `stage28_syscall_count_unchanged` is the explicit guard. No live
+trap/syscall dispatch path is rewired (default-deny fallback keeps every live
+syscall on the global-lock path), so x86_64 `-smp 1` smoke is NOT required and the
+full suite is intentionally not run. `cargo check --no-default-features` and
+`cargo check --features hosted-dev` must be clean; the Stage 28 and Stage 27 tests
+must pass single-threaded (`RUST_MIN_STACK=8388608`); `git diff --check` must be
+clean. x86_64 entering/exiting TID logic, `handle_trap_with_cpu`,
+trap/timer/bootstrap/BT2, SMP/`smp.rs`, SpawnV5, PM/init/service boot,
+VFS_READ_SHARED_REPLY_ENABLED/syscall27, Phase 3B MemoryObject zero-copy spawn, and
+RAMFS/FAT runtime spawning are all unchanged.

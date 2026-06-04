@@ -8594,3 +8594,188 @@ all produced at the same decision points as the global `_planned` path. The
 - Multi-domain syscalls / IPC recv-timeout bridge (D), trap/arch/boot entry (E),
   SpawnV5/fork/exec (F), x86_64 SMP (G), RAMFS/FAT runtime spawning — all remain
   deferred. Full global-lock removal is **not** claimed.
+
+### 45.9 Stage 27 acceptance (recorded by Stage 28)
+
+Stage 27 is **accepted without x86_64 smoke** (helper-only; no live trap/runtime
+behavior changed). Summary of the accepted state:
+
+- `SharedKernel::control_plane_set_process_cnode_slots_split_mut` (`runtime.rs:447`)
+  is implemented and proven correct: two-phase task(read, rank 2) → boot-config
+  (read) → capability(mutate, rank 4), with no outer global lock and no
+  `with`/`with_cpu`.
+- **Helper-only**: the live syscall callsite was NOT rewired (§45.4). The blocker
+  is the `…_via_syscall` → `handle_trap()` trap-dispatch seam (class **F+I**),
+  which must keep entering the global lock via `with_cpu` and owns the trapframe
+  result writeback.
+- Baseline at acceptance: **828 tests pass** (`cargo test --lib --features
+  hosted-dev`); `SYSCALL_COUNT == 30`; SpawnV5 / PM / init / service boot
+  preserved.
+- SMP / RAMFS-FAT runtime spawning remain **deferred**; no full global-lock
+  removal claim.
+
+## §46 Stage 28 — trap/syscall dispatch seam audit + split-dispatch bridge scaffold
+
+Stage 28 audits the full trap/syscall dispatch seam and lands a **whitelist-only**
+`try_split_dispatch` bridge (`src/kernel/syscall_split.rs`) that classifies the one
+proven-safe mutating syscall (`ControlPlaneSetCnodeSlots`, NR 8) as eligible for
+servicing via the Stage 27 split-mut helper without the global lock. The bridge is
+**helper-only** (NOT live-wired); the exact arch blocker is documented below.
+
+### 46.1 Trap/syscall seam audit — where the global lock is grabbed
+
+The global `SpinLock<KernelState>` is taken inside `SharedKernel::with` /
+`with_cpu` (`runtime.rs:57` / `:62`). The x86_64 trap entry path is:
+
+```
+hardware vector → IDT stub (descriptor_tables.rs)
+  → save GPRs, read CR2 for #PF, current_cpu_id()                 [arch, untouched]
+  → entering_tid = shared.with_cpu(cpu, |k| k.current_tid())      [GLOBAL LOCK, transient]
+  → build_trap_frame_from_saved_regs(regs, iret_frame, vector)    [arch, untouched]
+  → dispatch_trap_entry_with_shared_kernel(shared, cpu, ctx, &mut frame)
+      → handle_trap_entry_shared (trap_entry.rs:105)
+          → [PRE-LOCK SEAM] recv-timeout staging (scheduler split-read),
+            page-fault diagnostic split-mut bookkeeping                 [no global lock]
+          → shared.with_cpu(cpu, |kernel| handle_trap_entry_…(kernel,…))  [GLOBAL LOCK]
+              → KernelState::handle_trap_event_… → handle_trap(Trap::Syscall, frame)
+                  → syscall::dispatch(kernel, frame)
+                      → Syscall::decode(frame.syscall_num())
+                      → match → handle_control_plane_set_cnode_slots(kernel, frame)
+                          → frame.set_ok(slot_capacity, target_pid, 0)   [TRAPFRAME WRITE]
+  → exiting_tid = shared.with_cpu(cpu, |k| k.current_tid())       [GLOBAL LOCK, transient]
+  → task_switched = entering_tid != exiting_tid
+  → if task_switched: write_task_gprs_to_saved_regs(regs, &frame)
+    else if syscall:  write_trap_returns_to_saved_regs(regs, &frame)  [reads frame.ret*]
+  → flush_trap_context_to_iret_frame(iret_frame, &frame)              [arch, untouched]
+  → iretq                                                             [arch, untouched]
+```
+
+- **Before the global lock:** arch register save, CR2 read, `current_cpu_id`,
+  the `entering_tid` snapshot (`with_cpu`→`current_tid`), trap-frame construction
+  from saved regs, and the `handle_trap_entry_shared` PRE-LOCK SEAM (recv-timeout
+  scheduler split-read + page-fault diagnostic split-mut). This seam takes only
+  per-domain locks and does **not** write the syscall result.
+- **After the global lock exits:** the `exiting_tid` snapshot, `task_switched`
+  computation, the GPR/return-register writeback to saved regs
+  (`write_task_gprs_to_saved_regs` / `write_trap_returns_to_saved_regs`), the
+  iret-frame flush, and `iretq`.
+- **What the lock wraps:** the global lock wraps only the *logical* handler
+  (`handle_trap` → `dispatch`), which both reads the trap frame args AND writes the
+  result registers (`frame.set_ok(..)`). It does not wrap the arch register save
+  or the iret-frame flush — those bracket it. `current_tid` is per-CPU scheduler
+  state read via `with_cpu` under the global lock (Stage 4T+6R deliberately kept
+  this on the global-lock path after the split-read variant broke the x86_64
+  service chain in smoke).
+
+### 46.2 Split-dispatch bridge design
+
+`src/kernel/syscall_split.rs`:
+
+- `enum SplitEligibleSyscall` — whitelist of eligible syscalls. Currently the
+  single variant `ControlPlaneCnodeSlots { requester_tid, target_pid, slots }`.
+- `classify_split_eligible(syscall, requester_tid, args) -> Option<…>` — maps a
+  decoded `Syscall` + raw `[u64;6]` args to a descriptor; `_ => None` default-deny.
+  For the control-plane syscall it also pre-validates `target_pid != 0 && slots
+  != 0`, returning `None` on a precondition miss so the canonical `InvalidArgs`
+  encoding is produced by the global-lock fallback.
+- `try_split_dispatch(shared, syscall, requester_tid, args) -> Option<Result<(),
+  KernelError>>` — returns `Some(result)` only for whitelisted syscalls (serviced
+  via `control_plane_set_process_cnode_slots_split_mut`), else `None`. The bridge
+  itself never blocks, yields, schedules, or copies user memory.
+
+**Fallback guarantee.** `_ => None` is the default arm. Any syscall not on the
+whitelist — all IPC, Spawn/fork/exec, VM, futex — returns `None`, and the caller
+falls back to the unchanged global-lock dispatch. Adding the bridge therefore
+cannot change the behavior of any non-whitelisted syscall.
+
+### 46.3 Whitelist / classification table
+
+| syscall/path | class | domains | trapframe? | block? | split eligible? | action |
+|--------------|-------|---------|------------|--------|-----------------|--------|
+| `control_plane_set_cnode_slots` (NR 8) | A (helper-only / B) | task(2)→bootcfg→cap(4) | yes (`set_ok(slots,pid,0)`) | no | **yes (whitelisted)** | classify+`try_split_dispatch` → `…_split_mut`; helper-only |
+| `notification_waiter_count` | C (read split done §44/§26) | ipc(3) | n/a (not syscall-visible) | no | n/a (helper, not a syscall) | split-read helper only |
+| IPC send (NR 1) | G | ipc(3)+task+sched | yes | yes (can block) | no | global-lock fallback |
+| IPC recv (NR 2) | F/G | ipc(3)+task+sched | yes | yes (blocks) | no | global-lock fallback |
+| IPC call (NR 6) | F/G | ipc(3)+task+sched | yes | yes (blocks) | no | global-lock fallback |
+| IPC reply (NR 7) | G | ipc(3)+task+sched | yes | maybe (wakes) | no | global-lock fallback |
+| IPC recv-timeout (NR 5) | F/D | ipc(3)+sched(1) | yes | yes (blocks/deadline) | no | global-lock fallback (recv-timeout staging only, §L4A) |
+| SpawnV5 (NR 23/24/26/29) | H | task+cap+vm+mem+ipc | yes | no but heavy | no | global-lock fallback |
+| fork/exec (NR 12) | H | task+cap+vm+mem | yes | no but heavy | no | global-lock fallback |
+| VM map / anon-map / brk (NR 3/13/14) | I | vm(5)+mem(6)+cap | yes | no (shootdown wait) | no | global-lock fallback |
+| futex wait/wake (NR 9/10) | F | sched+task | yes | wait blocks | no | global-lock fallback |
+| fault / trap paths | J | varies | n/a | varies | no (arch boundary) | untouched |
+
+### 46.4 Why dangerous classes remain deferred
+
+- **IPC (G/F):** touch ipc(3)+task(2)+scheduler(1), can block/yield/schedule, and
+  must run inside the global-lock dispatch so the `dispatch` WouldBlock-reschedule
+  epilogue (`syscall.rs:3500`) and the arch `task_switched` writeback stay correct.
+- **Spawn/fork/exec (H):** span task+capability+vm+memory(+ipc) domains with
+  partial-commit rollback; not expressible as a single ascending-rank split.
+- **VM map/unmap/brk (I):** cross vm(5)+memory(6)+capability(4) with TLB-shootdown
+  waits; multi-domain and latency-sensitive.
+- **futex (F):** blocks/wakes via the scheduler.
+- **fault/trap (J):** arch boundary — never touched.
+
+### 46.5 x86_64 entering/exiting TID — untouched, and why
+
+The `entering_tid` / `exiting_tid` snapshots in the x86_64 shared trap path
+(`descriptor_tables.rs:903` / `:931`) remain on the global-lock
+`with_cpu(cpu, |k| k.current_tid())` path. Stage 4T+6 converted them to
+`current_tid_split_read` and that broke the x86_64 service chain in smoke (Stage
+4T+6R revert); they are a hard invariant ("do not touch x86_64 entering/exiting
+TID logic") and Stage 28 leaves them exactly as-is. `task_switched` detection
+drives the GPR-vs-return-register writeback branch, so it must observe the same
+scheduler state the dispatch saw.
+
+### 46.6 `handle_trap_with_cpu` — retained, and why
+
+`SharedKernel::handle_trap_with_cpu` (`runtime.rs:277`) is retained unchanged. It
+is the global-lock dispatch entry used by non-shared/raw trap paths and is a hard
+invariant ("do not remove handle_trap_with_cpu"). The split bridge is purely
+additive and does not replace or alter it.
+
+### 46.7 Live-wired or helper-only — decision + blocker
+
+**Helper-only this stage (NOT live-wired).** The whitelisted candidate's
+production handler writes a *non-trivial trapframe payload*
+(`frame.set_ok(slot_capacity, target_pid, 0)` — two meaningful return registers).
+`try_split_dispatch` returns only the logical `Result<(), KernelError>` and
+deliberately does not touch the `TrapFrame`.
+
+**Exact missing arch abstraction.** To live-wire safely the x86_64 arch seam would
+need, *before* the global lock:
+1. A pre-lock result-writeback contract: a seam that has both `&mut TrapFrame` and
+   the decoded args and is authorized to call `frame.set_ok(slots, pid, 0)` /
+   `set_err(code)` itself. The existing `handle_trap_entry_shared` pre-lock seam
+   (`trap_entry.rs:105`) only stages diagnostic fault / recv-timeout data and owns
+   no result-writeback contract.
+2. Preservation of `entering_tid` / `exiting_tid` / `task_switched`: the
+   control-plane syscall never switches tasks, so the split path must still make
+   `task_switched == false` observable so the `write_trap_returns_to_saved_regs`
+   branch (not the GPR branch) flushes the frame.
+
+Both are arch-sensitive and fall under the "do not touch x86_64 entering/exiting
+TID logic" / "do not touch the trap boundary" hard invariants. Until that
+result-writeback abstraction exists, the bridge stays helper-only and is proven by
+unit tests (§46.8). Because no live trap/runtime dispatch behavior changed, **no
+x86_64 smoke is required**.
+
+### 46.8 Tests added (8)
+
+In `src/kernel/syscall_split.rs` (`mod tests`):
+`stage28_split_dispatch_whitelist_accepts_cnode_slots_syscall`,
+`stage28_split_dispatch_whitelist_rejects_ipc_send`,
+`stage28_split_dispatch_whitelist_rejects_ipc_recv`,
+`stage28_split_dispatch_whitelist_rejects_spawnv5`,
+`stage28_split_dispatch_whitelist_rejects_vm_map`,
+`stage28_split_dispatch_fallback_preserved_for_unwhitelisted`,
+`stage28_syscall_count_unchanged`,
+`stage28_stage27_split_mut_helper_still_works`.
+
+### 46.9 Smoke decision
+
+No live trap/syscall dispatch behavior changed (bridge is helper-only; default-deny
+fallback keeps every live syscall on the global-lock path). **x86_64 smoke not
+required.** Full suite intentionally not run (helper-only stage); focused Stage 28
++ Stage 27 tests pass.

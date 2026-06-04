@@ -13,6 +13,7 @@ pub mod scheduler;
 pub mod scheduler_timer;
 pub mod smp;
 pub mod syscall;
+pub mod syscall_split;
 pub mod task;
 pub mod time;
 pub mod topology;
