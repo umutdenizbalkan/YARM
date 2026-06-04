@@ -301,15 +301,33 @@ mod framing_tests {
 
 pub const EXT4_SUPERBLOCK_OFFSET: usize = 1024;
 const EXT4_MAGIC: u16 = 0xef53;
+const EXT4_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
 const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
+const EXT4_FEATURE_INCOMPAT_INLINE_DATA: u32 = 0x8000;
+const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+const EXT4_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
+const EXT4_FEATURE_RO_COMPAT_HUGE_FILE: u32 = 0x0008;
+const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
+const EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0040;
+const EXT4_FEATURE_RO_COMPAT_BIGALLOC: u32 = 0x0200;
+const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 const EXT4_SUPPORTED_INCOMPAT: u32 = EXT4_FEATURE_INCOMPAT_FILETYPE
     | EXT4_FEATURE_INCOMPAT_EXTENTS
     | EXT4_FEATURE_INCOMPAT_64BIT
     | EXT4_FEATURE_INCOMPAT_FLEX_BG;
+const EXT4_SUPPORTED_RO_COMPAT: u32 = EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER
+    | EXT4_FEATURE_RO_COMPAT_LARGE_FILE
+    | EXT4_FEATURE_RO_COMPAT_HUGE_FILE
+    | EXT4_FEATURE_RO_COMPAT_DIR_NLINK
+    | EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE;
 const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
+const EXT4_NDIR_BLOCKS: usize = 12;
+const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+const EXT4_INDEX_FL: u32 = 0x0000_1000;
+const EXT4_SYMLINK_LIMIT: u8 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ext4ImageError {
@@ -331,6 +349,7 @@ pub struct Ext4Superblock {
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
     pub inode_size: u16,
+    pub feature_compat: u32,
     pub feature_incompat: u32,
     pub feature_ro_compat: u32,
 }
@@ -348,10 +367,31 @@ impl Ext4Superblock {
         if magic != EXT4_MAGIC {
             return Err(Ext4ImageError::BadMagic);
         }
+        let feature_compat = le_u32(sb, 92)?;
         let feature_incompat = le_u32(sb, 96)?;
+        let feature_ro_compat = le_u32(sb, 100)?;
         let unsupported = feature_incompat & !EXT4_SUPPORTED_INCOMPAT;
         if unsupported != 0 {
             return Err(Ext4ImageError::UnsupportedFeature(unsupported));
+        }
+        if (feature_incompat & EXT4_FEATURE_INCOMPAT_INLINE_DATA) != 0 {
+            return Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_INCOMPAT_INLINE_DATA,
+            ));
+        }
+        let unsupported_ro = feature_ro_compat & !EXT4_SUPPORTED_RO_COMPAT;
+        if unsupported_ro != 0 {
+            return Err(Ext4ImageError::UnsupportedFeature(unsupported_ro));
+        }
+        if (feature_ro_compat & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM) != 0 {
+            return Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_RO_COMPAT_METADATA_CSUM,
+            ));
+        }
+        if (feature_ro_compat & EXT4_FEATURE_RO_COMPAT_BIGALLOC) != 0 {
+            return Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_RO_COMPAT_BIGALLOC,
+            ));
         }
         let blocks_lo = le_u32(sb, 4)? as u64;
         let blocks_hi = le_u32(sb, 336).unwrap_or(0) as u64;
@@ -363,8 +403,9 @@ impl Ext4Superblock {
             blocks_per_group: le_u32(sb, 32)?,
             inodes_per_group: le_u32(sb, 40)?,
             inode_size: if inode_size == 0 { 128 } else { inode_size },
+            feature_compat,
             feature_incompat,
-            feature_ro_compat: le_u32(sb, 100)?,
+            feature_ro_compat,
         })
     }
 }
@@ -402,6 +443,7 @@ struct Extent {
 struct ParsedInode {
     mode: u16,
     size: u64,
+    flags: u32,
     block: [u8; 60],
 }
 
@@ -426,8 +468,17 @@ pub struct Ext4Image<'a> {
 impl<'a> Ext4Image<'a> {
     pub fn mount(image: &'a [u8]) -> Result<Self, Ext4ImageError> {
         let sb = Ext4Superblock::parse(image)?;
-        if sb.block_size() < 1024 || sb.blocks_per_group == 0 || sb.inodes_per_group == 0 {
+        if sb.log_block_size > 6
+            || sb.block_size() < 1024
+            || sb.blocks_per_group == 0
+            || sb.inodes_per_group == 0
+            || sb.inode_size < 128
+        {
             return Err(Ext4ImageError::Malformed);
+        }
+        let image_blocks = (image.len() as u64) / sb.block_size();
+        if sb.blocks_count > image_blocks {
+            return Err(Ext4ImageError::Io);
         }
         let desc_size = if (sb.feature_incompat & EXT4_FEATURE_INCOMPAT_64BIT) != 0 {
             le_u16(
@@ -495,10 +546,10 @@ impl<'a> Ext4Image<'a> {
             .block_offset(inode_table)?
             .checked_add(index as usize * self.sb.inode_size as usize)
             .ok_or(Ext4ImageError::Io)?;
-        let raw = self
-            .image
-            .get(off..off + self.sb.inode_size as usize)
+        let inode_end = off
+            .checked_add(self.sb.inode_size as usize)
             .ok_or(Ext4ImageError::Io)?;
+        let raw = self.image.get(off..inode_end).ok_or(Ext4ImageError::Io)?;
         let size_lo = le_u32(raw, 4)? as u64;
         let size_hi = le_u32(raw, 108).unwrap_or(0) as u64;
         let mut block = [0u8; 60];
@@ -506,12 +557,63 @@ impl<'a> Ext4Image<'a> {
         Ok(ParsedInode {
             mode: le_u16(raw, 0)?,
             size: size_lo | (size_hi << 32),
+            flags: le_u32(raw, 32)?,
             block,
         })
     }
 
     fn extents(&self, inode: &ParsedInode) -> Result<alloc::vec::Vec<Extent>, Ext4ImageError> {
-        self.parse_extent_tree(&inode.block, 0)
+        if (inode.flags & EXT4_EXTENTS_FL) != 0 || inode.block[0..2] == 0xf30au16.to_le_bytes() {
+            self.parse_extent_tree(&inode.block, 0)
+        } else {
+            self.indirect_extents(inode)
+        }
+    }
+
+    fn indirect_extents(
+        &self,
+        inode: &ParsedInode,
+    ) -> Result<alloc::vec::Vec<Extent>, Ext4ImageError> {
+        let block_size = self.sb.block_size() as usize;
+        let blocks_needed = usize::try_from(inode.size.div_ceil(self.sb.block_size()))
+            .map_err(|_| Ext4ImageError::UnsupportedLayout)?;
+        let mut out = alloc::vec::Vec::new();
+        for logical in 0..core::cmp::min(blocks_needed, EXT4_NDIR_BLOCKS) {
+            let ptr = le_u32(&inode.block, logical * 4)?;
+            if ptr != 0 {
+                out.push(Extent {
+                    logical: logical as u32,
+                    len: 1,
+                    start: u64::from(ptr),
+                });
+            }
+        }
+        if blocks_needed > EXT4_NDIR_BLOCKS {
+            let single = le_u32(&inode.block, EXT4_NDIR_BLOCKS * 4)?;
+            let ptrs_per_block = block_size / 4;
+            let remaining = blocks_needed - EXT4_NDIR_BLOCKS;
+            if single != 0 {
+                let raw = self.block_bytes(u64::from(single))?;
+                for idx in 0..core::cmp::min(remaining, ptrs_per_block) {
+                    let ptr = le_u32(raw, idx * 4)?;
+                    if ptr != 0 {
+                        out.push(Extent {
+                            logical: (EXT4_NDIR_BLOCKS + idx) as u32,
+                            len: 1,
+                            start: u64::from(ptr),
+                        });
+                    }
+                }
+            }
+            if remaining > ptrs_per_block {
+                let double = le_u32(&inode.block, (EXT4_NDIR_BLOCKS + 1) * 4)?;
+                let triple = le_u32(&inode.block, (EXT4_NDIR_BLOCKS + 2) * 4)?;
+                if double != 0 || triple != 0 {
+                    return Err(Ext4ImageError::UnsupportedLayout);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn parse_extent_tree(
@@ -564,6 +666,7 @@ impl<'a> Ext4Image<'a> {
         let inode = self.inode(inode)?;
         if inode.file_type() == Ext4FileType::Directory
             || inode.file_type() == Ext4FileType::Regular
+            || (inode.file_type() == Ext4FileType::Symlink && inode.size > 60)
         {
             let mut out = alloc::vec![0u8; inode.size as usize];
             for ex in self.extents(&inode)? {
@@ -592,7 +695,7 @@ impl<'a> Ext4Image<'a> {
     }
 
     pub fn read_file(&self, path: &[u8]) -> Result<alloc::vec::Vec<u8>, Ext4ImageError> {
-        let inode = self.lookup_path(path)?;
+        let inode = self.lookup_path_follow(path)?;
         let meta = self.inode(inode)?;
         if meta.file_type() != Ext4FileType::Regular {
             return Err(Ext4ImageError::IsDirectory);
@@ -615,25 +718,76 @@ impl<'a> Ext4Image<'a> {
         if meta.file_type() != Ext4FileType::Directory {
             return Err(Ext4ImageError::NotDirectory);
         }
+        let _dir_index_linear_fallback = (meta.flags & EXT4_INDEX_FL) != 0
+            && (self.sb.feature_compat & EXT4_FEATURE_COMPAT_DIR_INDEX) != 0;
         parse_dir_entries(self.read_inode_bytes(inode)?.as_slice())
     }
 
     pub fn lookup_path(&self, path: &[u8]) -> Result<u32, Ext4ImageError> {
+        self.lookup_path_inner(path, false, 0)
+    }
+
+    pub fn lookup_path_follow(&self, path: &[u8]) -> Result<u32, Ext4ImageError> {
+        self.lookup_path_inner(path, true, 0)
+    }
+
+    fn lookup_path_inner(
+        &self,
+        path: &[u8],
+        follow_final: bool,
+        depth: u8,
+    ) -> Result<u32, Ext4ImageError> {
+        if depth > EXT4_SYMLINK_LIMIT {
+            return Err(Ext4ImageError::UnsupportedLayout);
+        }
         if path == b"/" || path.is_empty() {
             return Ok(2);
         }
+        let comps: alloc::vec::Vec<&[u8]> = path
+            .split(|b| *b == b'/')
+            .filter(|c| !c.is_empty())
+            .collect();
         let mut current = 2u32;
-        for comp in path.split(|b| *b == b'/').filter(|c| !c.is_empty()) {
+        let mut prefix = alloc::vec::Vec::new();
+        prefix.push(b'/');
+        for (idx, comp) in comps.iter().enumerate() {
             let inode = self.inode(current)?;
             if inode.file_type() != Ext4FileType::Directory {
                 return Err(Ext4ImageError::NotDirectory);
             }
             let entries = parse_dir_entries(self.read_inode_bytes(current)?.as_slice())?;
-            current = entries
+            let next = entries
                 .iter()
-                .find(|e| e.name() == comp)
+                .find(|e| e.name() == *comp)
                 .map(|e| e.inode)
                 .ok_or(Ext4ImageError::NotFound)?;
+            let next_inode = self.inode(next)?;
+            let is_last = idx == comps.len() - 1;
+            if next_inode.file_type() == Ext4FileType::Symlink && (!is_last || follow_final) {
+                let target = self.read_inode_bytes(next)?;
+                let mut resolved = alloc::vec::Vec::new();
+                if target.first().copied() == Some(b'/') {
+                    resolved.extend_from_slice(target.as_slice());
+                } else {
+                    resolved.extend_from_slice(prefix.as_slice());
+                    if !prefix.ends_with(b"/") {
+                        resolved.push(b'/');
+                    }
+                    resolved.extend_from_slice(target.as_slice());
+                }
+                for tail in comps.iter().skip(idx + 1) {
+                    if !resolved.ends_with(b"/") {
+                        resolved.push(b'/');
+                    }
+                    resolved.extend_from_slice(tail);
+                }
+                return self.lookup_path_inner(resolved.as_slice(), follow_final, depth + 1);
+            }
+            current = next;
+            if !prefix.ends_with(b"/") {
+                prefix.push(b'/');
+            }
+            prefix.extend_from_slice(comp);
         }
         Ok(current)
     }
@@ -819,16 +973,124 @@ mod image_tests {
         assert_eq!(fs.read_file(b"/depth1.bin"), Err(Ext4ImageError::Io));
     }
 
+    #[test]
+    fn ext4_legacy_direct_block_file_read_work() {
+        let img = tiny_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(
+            fs.read_file(b"/direct.bin").unwrap(),
+            b"direct block file\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn ext4_legacy_single_indirect_file_read_work() {
+        let img = tiny_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        let bytes = fs.read_file(b"/single.bin").unwrap();
+        assert_eq!(bytes.len(), 13 * 1024);
+        assert!(bytes[..12 * 1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&bytes[12 * 1024..12 * 1024 + 15], b"single indirect");
+    }
+
+    #[test]
+    fn ext4_legacy_indirect_sparse_hole_reads_as_zeroes() {
+        let img = tiny_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        let bytes = fs.read_file(b"/sparsei.bin").unwrap();
+        assert_eq!(bytes.len(), 2048);
+        assert!(bytes[..1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&bytes[1024..1036], b"indirect gap");
+    }
+
+    #[test]
+    fn ext4_invalid_legacy_block_pointer_is_rejected() {
+        let mut img = tiny_ext4_image();
+        put_u32(&mut img, 5 * 1024 + 15 * 128 + 40, 99_999);
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(fs.read_file(b"/direct.bin"), Err(Ext4ImageError::Io));
+    }
+
+    #[test]
+    fn ext4_double_indirect_remains_unsupported() {
+        let img = tiny_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(
+            fs.read_file(b"/double.bin"),
+            Err(Ext4ImageError::UnsupportedLayout)
+        );
+    }
+
+    #[test]
+    fn ext4_external_symlink_read_work() {
+        let img = tiny_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        let target = long_symlink_target();
+        assert_eq!(fs.read_symlink(b"/longlink").unwrap(), target);
+    }
+
+    #[test]
+    fn ext4_final_symlink_path_resolution_works_and_loops_are_rejected() {
+        let img = tiny_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(
+            fs.read_file(b"/link").unwrap(),
+            b"hello from ext4\n".to_vec()
+        );
+        assert_eq!(
+            fs.read_file(b"/loop"),
+            Err(Ext4ImageError::UnsupportedLayout)
+        );
+    }
+
+    #[test]
+    fn ext4_metadata_csum_and_bigalloc_are_rejected() {
+        let mut img = tiny_ext4_image();
+        put_u32(
+            &mut img,
+            EXT4_SUPERBLOCK_OFFSET + 100,
+            EXT4_FEATURE_RO_COMPAT_METADATA_CSUM,
+        );
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_RO_COMPAT_METADATA_CSUM
+            ))
+        ));
+        put_u32(
+            &mut img,
+            EXT4_SUPERBLOCK_OFFSET + 100,
+            EXT4_FEATURE_RO_COMPAT_BIGALLOC,
+        );
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_RO_COMPAT_BIGALLOC
+            ))
+        ));
+    }
+
+    #[test]
+    fn ext4_small_inode_size_is_rejected() {
+        let mut img = tiny_ext4_image();
+        put_u16(&mut img, EXT4_SUPERBLOCK_OFFSET + 88, 64);
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::Malformed)
+        ));
+    }
+
     fn tiny_ext4_image() -> alloc::vec::Vec<u8> {
-        let mut img = alloc::vec![0u8; 40 * 1024];
+        let mut img = alloc::vec![0u8; 80 * 1024];
         let sb = EXT4_SUPERBLOCK_OFFSET;
-        put_u32(&mut img, sb, 16); // inodes
-        put_u32(&mut img, sb + 4, 40); // blocks
+        put_u32(&mut img, sb, 32); // inodes
+        put_u32(&mut img, sb + 4, 80); // blocks
         put_u32(&mut img, sb + 24, 0); // 1KiB blocks
         put_u32(&mut img, sb + 32, 8192);
-        put_u32(&mut img, sb + 40, 16);
+        put_u32(&mut img, sb + 40, 32);
         put_u16(&mut img, sb + 56, EXT4_MAGIC);
         put_u16(&mut img, sb + 88, 128);
+        put_u32(&mut img, sb + 92, EXT4_FEATURE_COMPAT_DIR_INDEX);
         put_u32(
             &mut img,
             sb + 96,
@@ -836,10 +1098,54 @@ mod image_tests {
         );
         put_u32(&mut img, 2 * 1024 + 8, 5); // inode table block
         write_inode(&mut img, 5 * 1024 + 128, 0x4000, 1024, 20);
+        put_u32(&mut img, 5 * 1024 + 128 + 32, EXT4_INDEX_FL);
         write_inode(&mut img, 5 * 1024 + 11 * 128, 0x8000, 16, 21);
         write_depth1_inode(&mut img, 5 * 1024 + 12 * 128, 0x8000, 17, 22);
         write_inode_logical(&mut img, 5 * 1024 + 13 * 128, 0x8000, 2048, 1, 25);
         write_inline_symlink_inode(&mut img, 5 * 1024 + 14 * 128, b"hello.txt");
+        write_indirect_inode(&mut img, 5 * 1024 + 15 * 128, 0x8000, 18, &[26], 0, 0, 0);
+        write_indirect_inode(
+            &mut img,
+            5 * 1024 + 16 * 128,
+            0x8000,
+            13 * 1024,
+            &[0; 12],
+            31,
+            0,
+            0,
+        );
+        write_indirect_inode(
+            &mut img,
+            5 * 1024 + 17 * 128,
+            0x8000,
+            2048,
+            &[0, 27],
+            0,
+            0,
+            0,
+        );
+        write_indirect_inode(
+            &mut img,
+            5 * 1024 + 18 * 128,
+            0x8000,
+            270 * 1024,
+            &[0; 12],
+            0,
+            33,
+            0,
+        );
+        let long_target = long_symlink_target();
+        write_indirect_inode(
+            &mut img,
+            5 * 1024 + 19 * 128,
+            0xa000,
+            long_target.len() as u32,
+            &[34],
+            0,
+            0,
+            0,
+        );
+        write_inline_symlink_inode(&mut img, 5 * 1024 + 20 * 128, b"loop");
         write_dirent(&mut img[20 * 1024..20 * 1024 + 12], 2, b".", 2, 12);
         write_dirent(&mut img[20 * 1024 + 12..20 * 1024 + 24], 2, b"..", 2, 12);
         write_dirent(
@@ -863,11 +1169,58 @@ mod image_tests {
             1,
             20,
         );
-        write_dirent(&mut img[20 * 1024 + 84..21 * 1024], 15, b"link", 7, 940);
+        write_dirent(
+            &mut img[20 * 1024 + 84..20 * 1024 + 104],
+            15,
+            b"link",
+            7,
+            20,
+        );
+        write_dirent(
+            &mut img[20 * 1024 + 104..20 * 1024 + 124],
+            16,
+            b"direct.bin",
+            1,
+            20,
+        );
+        write_dirent(
+            &mut img[20 * 1024 + 124..20 * 1024 + 144],
+            17,
+            b"single.bin",
+            1,
+            20,
+        );
+        write_dirent(
+            &mut img[20 * 1024 + 144..20 * 1024 + 164],
+            18,
+            b"sparsei.bin",
+            1,
+            20,
+        );
+        write_dirent(
+            &mut img[20 * 1024 + 164..20 * 1024 + 184],
+            19,
+            b"double.bin",
+            1,
+            20,
+        );
+        write_dirent(
+            &mut img[20 * 1024 + 184..20 * 1024 + 204],
+            20,
+            b"longlink",
+            7,
+            20,
+        );
+        write_dirent(&mut img[20 * 1024 + 204..21 * 1024], 21, b"loop", 7, 820);
         write_leaf_extent_block(&mut img[22 * 1024..23 * 1024], 0, 1, 24);
         img[21 * 1024..21 * 1024 + 16].copy_from_slice(b"hello from ext4\n");
         img[24 * 1024..24 * 1024 + 17].copy_from_slice(b"depth one extent\n");
         img[25 * 1024..25 * 1024 + 16].copy_from_slice(b"after sparse gap");
+        img[26 * 1024..26 * 1024 + 18].copy_from_slice(b"direct block file\n");
+        img[27 * 1024..27 * 1024 + 12].copy_from_slice(b"indirect gap");
+        put_u32(&mut img, 31 * 1024, 32);
+        img[32 * 1024..32 * 1024 + 15].copy_from_slice(b"single indirect");
+        img[34 * 1024..34 * 1024 + long_target.len()].copy_from_slice(long_target.as_slice());
         img
     }
 
@@ -918,10 +1271,34 @@ mod image_tests {
         put_u32(dst, 20, start);
     }
 
+    fn write_indirect_inode(
+        img: &mut [u8],
+        off: usize,
+        mode: u16,
+        size: u32,
+        direct: &[u32],
+        single: u32,
+        double: u32,
+        triple: u32,
+    ) {
+        put_u16(img, off, mode);
+        put_u32(img, off + 4, size);
+        for (idx, ptr) in direct.iter().copied().enumerate().take(12) {
+            put_u32(img, off + 40 + idx * 4, ptr);
+        }
+        put_u32(img, off + 40 + 12 * 4, single);
+        put_u32(img, off + 40 + 13 * 4, double);
+        put_u32(img, off + 40 + 14 * 4, triple);
+    }
+
     fn write_inline_symlink_inode(img: &mut [u8], off: usize, target: &[u8]) {
         put_u16(img, off, 0xa000);
         put_u32(img, off + 4, target.len() as u32);
         img[off + 40..off + 40 + target.len()].copy_from_slice(target);
+    }
+
+    fn long_symlink_target() -> alloc::vec::Vec<u8> {
+        b"/this/is/a/long/external/symlink/target/that/exceeds/sixty/bytes".to_vec()
     }
 
     fn write_dirent(dst: &mut [u8], inode: u32, name: &[u8], file_type: u8, rec_len: u16) {
