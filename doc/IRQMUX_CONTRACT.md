@@ -42,6 +42,30 @@ In addition to the IRQMUX-1 statuses, version 2 defines `Unauthorized`,
 `GrantNotFound`, `GrantStale`, `GrantMismatch`, and `RightsMissing`. Unknown
 rights bits and malformed/reserved fields are rejected as `BadRequest`.
 
+## Driver-manager IRQ grant audit
+
+The IRQMUX-2 userspace integration audit classifies the existing driver-manager
+model as follows:
+
+- **A — driver identity available:** driver manager registers and addresses a
+  driver by task ID; IRQMUX uses that value as the placeholder `driver_id`.
+- **B — IRQ grant exists but lacks an IRQMUX token:** the live `GRANT_IRQ`
+  request identifies a driver and IRQ line and returns a transferred IRQ
+  capability, but it does not return an IRQMUX grant ID, generation, vector,
+  trigger mode, polarity, or rights mask.
+- **C — existing grant identity is not sufficient:** the line and transferred
+  capability are enough for the current driver-manager operation, but not for
+  IRQMUX's explicit line/vector/configuration ownership checks.
+- **D — IRQMUX therefore keeps its own authorization table:** the bounded table
+  stores the opaque grant key, exact interrupt configuration, and rights until
+  protected capability-backed authorization is integrated.
+- **E — live driver-manager behavior remains unchanged:** IRQMUX-2 adds only the
+  shared descriptor-construction helper and contract tests; it does not alter
+  `REGISTER`, `GRANT_IRQ`, `GRANT_DMA`, `RESTARTED`, spawning, or boot policy.
+- **F — no docs-only blocker:** the userspace placeholder model is executable
+  and tested, while authenticating the grant authority and validating kernel
+  IRQ capabilities are explicitly deferred integration work.
+
 ## Grant descriptor and driver-manager relationship
 
 The shared `IrqGrantDescriptor` contains:

@@ -77,20 +77,31 @@ mod tests {
     }
 
     #[test]
-    fn driver_manager_irq_grant_descriptor_rejects_invalid_placeholder_identity() {
-        assert_eq!(
-            make_irqmux_grant_descriptor(
-                0,
-                7,
-                3,
-                9,
-                48,
-                crate::irqmux_abi::IRQ_GRANT_RIGHT_ALL,
-                IrqTriggerMode::Edge,
-                IrqPolarity::High,
-            ),
-            None
+    fn driver_manager_irq_grant_descriptor_rejects_invalid_placeholder_fields() {
+        let valid = (
+            100,
+            7,
+            3,
+            9,
+            48,
+            crate::irqmux_abi::IRQ_GRANT_RIGHT_ALL,
+            IrqTriggerMode::Edge,
+            IrqPolarity::High,
         );
+        for (grant_id, driver_id, generation, rights) in [
+            (0, valid.1, valid.2, valid.5),
+            (valid.0, 0, valid.2, valid.5),
+            (valid.0, valid.1, 0, valid.5),
+            (valid.0, valid.1, valid.2, 0),
+            (valid.0, valid.1, valid.2, valid.5 | (1 << 31)),
+        ] {
+            assert_eq!(
+                make_irqmux_grant_descriptor(
+                    grant_id, driver_id, generation, valid.3, valid.4, rights, valid.6, valid.7,
+                ),
+                None
+            );
+        }
     }
 
     #[test]

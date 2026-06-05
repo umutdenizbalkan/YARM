@@ -4,6 +4,12 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_std)]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
+#[cfg(not(feature = "hosted-dev"))]
+yarm_server_runtime::install_freestanding_allocator!(
+    256 * 1024,
+    "irqmux server freestanding allocator OOM"
+);
+
 #[inline]
 fn run() -> ! {
     yarm_user_rt::user_log!("IRQMUX_BIN_ENTRY_START");
