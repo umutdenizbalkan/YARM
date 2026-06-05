@@ -31,7 +31,6 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "netmgr_srv"
 path = "src/bin/netmgr_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "socket_srv"
