@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-# VFS shared-I/O contract (FS-11 through FS-14 scaffold)
+# VFS shared-I/O contract (FS-11 through FS-15 scaffold)
 
 ## Status and scope
 
 `VFS_SHARED_IO_ENABLED` is the umbrella name for a future userspace VFS/filesystem transfer path.
-FS-11 through FS-14 define service-ABI records, exact inline write payloads, typed read/write plans,
-a borrowed test-only shared-buffer model, validation helpers, ownership rules, and cleanup requirements
-only. They do **not** define or enable a runtime feature
+FS-11 through FS-15 define service-ABI records, exact inline write payloads, typed read/write plans,
+a borrowed test-only shared-buffer model, and a helper-only lifecycle/cleanup state machine. These are
+design and test scaffolding only. They do **not** define or enable a runtime feature
 switch, advertise a capability, transfer/map a MemoryObject, or change live filesystem dispatch.
 
 The umbrella is split into independently staged capabilities:
@@ -136,6 +136,81 @@ that a mapping exists.
   inline opcode. Fallback must be a new attempt with its own cleanup state; it may not reuse a
   mapping after cleanup.
 
+## FS-15 helper-only lifecycle state machine
+
+`VfsSharedIoLifecycle` models one future shared request. It is not connected to `VfsService`, process
+lifecycle notifications, a capability table, or a mapper. The state transitions are:
+
+| State | Meaning | Permitted next step |
+|---|---|---|
+| `Reserved` | wire descriptor passed format/access validation | validate live handle generation and map |
+| `MappedForReadReply` | helper granted temporary FS-write direction | begin request |
+| `MappedForWriteRequest` | helper granted temporary FS-read-only direction | begin request |
+| `InFlight` | backend may access only the validated direction/range | complete or terminal cleanup |
+| `Completed` | byte count is recorded but cleanup token is still live | success cleanup or competing exit cleanup |
+| `Cleaned` | first terminal path released the handle and consumed cleanup | optional independent inline fallback |
+
+Cancellation, timeout, requester exit, and server exit are terminal reasons rather than extra states:
+they all converge on `Cleaned`. The terminal-reason vocabulary is `Success`, `BackendError`,
+`Unsupported`, `Cancelled`, `Timeout`, `RequesterExit`, `ServerExit`, `StaleHandle`, `BadDescriptor`,
+`DuplicateReply`, and `FallbackInline`. Validation errors that occur before accepting a mapping are
+returned without pretending that a live mapping existed.
+
+### Handle and generation model
+
+`VfsSharedIoHandleTable<N>` is a fixed-capacity userspace helper table. Handles are one-based opaque
+slot numbers. Allocation activates a slot; exactly-once cleanup releases it and increments a nonzero
+generation. A descriptor is accepted at the mapping transition only when both handle and generation
+match an active slot. Old descriptors therefore become stale immediately after cleanup, and reuse of
+the same handle requires the new generation. Zero handle/generation, wrong access direction, an
+out-of-range handle, or an inactive generation is rejected.
+
+This table models correlation and invalidation only. It is not a kernel cap table and does not grant
+mapping authority.
+
+### Exactly-once cleanup token
+
+Each `VfsSharedIoLifecycle` contains one logical cleanup token. `cleanup(reason)` behaves as follows:
+
+1. The first terminal path validates and releases the active handle, records the reason, transitions
+   to `Cleaned`, and returns `Won(reason)`.
+2. Later cleanup attempts do not release again or change the winner; they return
+   `AlreadyCleaned(original_reason)`.
+3. Access authorization after `Cleaned` returns `AccessAfterCleanup`; a completion after `Completed`
+   or `Cleaned` returns `DuplicateReply`.
+4. `Success` cleanup is legal only after `Completed`. Error, cancel, timeout, and exit cleanup may win
+   before completion.
+5. Inline fallback is a separate one-shot attempt. It requires the fallback request flag and completed
+   cleanup first. It is rejected before cleanup and after success, cancellation, or either endpoint
+   exit. Timeout, backend-error, unsupported, and descriptor-failure winners may permit it.
+
+### Read and write lifecycle
+
+For `READ_SHARED_REPLY`, descriptor validation requires FS-write access. The backend may write only
+while `InFlight`, may report a short EOF completion, and must then clean up before a reply/fallback
+path can cease using the shared object. Cleanup invalidates the generation and all later FS access.
+
+For `WRITE_SHARED_REQUEST`, descriptor validation requires exactly FS-read-only access. The backend
+may consume an immutable range while `InFlight` and may complete fewer bytes than requested for a
+partial write. FS-write direction is rejected. Success/error cleanup invalidates access in the same
+way as the read lifecycle.
+
+### Race model
+
+| Race | Helper result |
+|---|---|
+| timeout then late completion | timeout wins cleanup; completion is `DuplicateReply` |
+| cancel then late completion | cancellation wins cleanup; completion is `DuplicateReply` |
+| duplicate cancel/cleanup | original reason is returned; no second release |
+| requester exit before backend access | requester-exit cleanup releases and invalidates the handle |
+| requester exit after completion but before reply consumption | requester exit may win the still-live cleanup token |
+| server exit before completion | server-exit cleanup releases and invalidates the handle |
+| timeout then fallback | timeout cleanup must complete first; fallback is then one-shot |
+| reuse after exit/cleanup | same handle may be allocated only with its incremented generation |
+
+These are deterministic helper tests, not hooks into actual timeout clocks or process-exit delivery.
+A live implementation must preserve the same first-winner semantics under concurrency.
+
 ## Ownership and permissions
 
 | Stage | Object owner | FS permission | FS obligation | Retention after reply |
@@ -183,19 +258,29 @@ requested length.
    validation, and RAMFS inline helper proof; live dispatch and mapping remain disabled.
 4. **FS-14:** typed shared-read plan, checked read completion, borrowed test buffer, and RAMFS shared
    read/write proofs; still no live mapping, routing, cancellation, or cleanup state machine.
-5. **FS-15 lifecycle design:** specify mapping states, cancellation/timeout races, process exits,
-   stale handles, revocation, and exactly-once cleanup before enabling either capability.
-6. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
+5. **FS-15:** helper lifecycle states, generation invalidation, first-winner cleanup, fallback gating,
+   and deterministic cancel/timeout/exit race tests; no live mapper or process hooks.
+6. **FS-16 gated experiment:** add the first RAMFS-only live experiment behind a disabled-by-default
+   local service capability after defining the real transfer/mapping adapter and concurrency model.
+7. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
    and advertise only the read capability after lifecycle tests pass.
-7. **Write enablement:** independently implement read-only request-buffer mapping for
+8. **Write enablement:** independently implement read-only request-buffer mapping for
    `WRITE_SHARED_REQUEST`; only then connect writable filesystems to the FS-12 block path.
-8. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
+9. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
    has routing, permissions, cancellation, cleanup, and process-exit tests. Supporting one stage does
    not imply support for the other.
 
+## Requirements before production enablement
+
+Neither capability may be advertised until a real userspace transfer primitive supplies object type,
+rights, size, generation, mapping, revocation, cancellation, and process-exit notifications. The live
+implementation must prove concurrent first-winner cleanup, stale-handle rejection, no access after
+cleanup, partial completion accounting, and fallback only after unmap/release. RAMFS must be the first
+gated backend; FAT production writes and ext4 writes remain out of scope until that experiment passes.
+
 ## Explicit non-changes
 
-FS-14 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
+FS-15 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
 init/PM/supervisor/driver-manager policy, runtime service spawn order, FAT production writes, ext4
 writes, the FS-12 block stack, or the ext4 FS-10 read-side matrix. Kernel/global-lock work is
 untouched. No QEMU smoke is required because no runtime behavior is enabled.

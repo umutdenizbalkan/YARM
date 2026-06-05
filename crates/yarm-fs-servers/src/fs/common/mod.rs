@@ -3,5 +3,6 @@
 
 pub mod fs;
 pub mod service;
+pub mod shared_io_lifecycle;
 pub mod vfs_service;
 pub mod vfs_ipc;
