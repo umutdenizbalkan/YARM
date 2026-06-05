@@ -4,11 +4,15 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_std)]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
+#[cfg(not(feature = "hosted-dev"))]
+yarm_server_runtime::install_freestanding_allocator!(
+    256 * 1024,
+    "irqmux server freestanding allocator OOM"
+);
+
 #[inline]
-fn run() -> ! {
-    yarm_user_rt::user_log!("IRQMUX_BIN_ENTRY_START");
+fn run() {
     yarm_driver_servers::run_irqmux();
-    unreachable!("irqmux service loop must remain resident")
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -19,7 +23,20 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
-    run()
+    yarm_user_rt::user_log!("IRQMUX_BIN_ENTRY_START");
+    run();
+    let ctx = yarm_server_runtime::user_rt::runtime::startup_context();
+    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
+        yarm_user_rt::user_log!("IRQMUX_RECV_CAP cap={}", recv_cap);
+        yarm_user_rt::user_log!("IRQMUX_BLOCKING_RECV_LOOP");
+        loop {
+            let _ = unsafe { yarm_server_runtime::user_rt::syscall::ipc_recv_v2(recv_cap) };
+        }
+    }
+    yarm_user_rt::user_log!("IRQMUX_NO_RECV_CAP");
+    loop {
+        let _ = yarm_server_runtime::user_rt::syscall::yield_now();
+    }
 }
 
 #[cfg(not(feature = "hosted-dev"))]
