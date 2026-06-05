@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use yarm_fs_servers::fs::ext4::fs::Ext4Image;
+use yarm_fs_servers::fs::ext4::fs::{Ext4Image, Ext4ImageError};
 
 #[test]
 #[ignore = "development-only: requires mke2fs, debugfs, e2fsck, and tune2fs"]
@@ -20,6 +20,7 @@ fn real_indexed_directories_support_uuid_and_stored_checksum_seeds() {
     for stored_seed in [false, true] {
         run_probe(stored_seed);
     }
+    run_meta_bg_rejection_probe();
 }
 
 fn run_probe(stored_seed: bool) {
@@ -89,6 +90,35 @@ fn run_probe(stored_seed: bool) {
     drop(cleanup);
 }
 
+fn run_meta_bg_rejection_probe() {
+    let image = unique_path("meta-bg").with_extension("img");
+    let cleanup = FileCleanup(image.clone());
+    let file = fs::File::create(&image).expect("create meta_bg probe image");
+    file.set_len(64 * 1024 * 1024)
+        .expect("size meta_bg probe image");
+    run(
+        Command::new("mke2fs")
+            .args([
+                "-q",
+                "-t",
+                "ext4",
+                "-F",
+                "-O",
+                "meta_bg,^resize_inode,^orphan_file",
+            ])
+            .arg(&image),
+        "mke2fs meta_bg",
+    );
+
+    let bytes = fs::read(&image).expect("read generated meta_bg image");
+    assert!(matches!(
+        Ext4Image::mount(&bytes),
+        Err(Ext4ImageError::UnsupportedFeature(0x0010))
+    ));
+
+    drop(cleanup);
+}
+
 fn tool_available(tool: &str) -> bool {
     Command::new(tool).arg("-V").output().is_ok()
 }
@@ -117,6 +147,13 @@ fn unique_path(profile: &str) -> PathBuf {
 }
 
 struct Cleanup([PathBuf; 3]);
+struct FileCleanup(PathBuf);
+
+impl Drop for FileCleanup {
+    fn drop(&mut self) {
+        remove_if_present(&self.0);
+    }
+}
 
 impl Drop for Cleanup {
     fn drop(&mut self) {

@@ -5,7 +5,6 @@ use super::super::common::fs::{FdRecord, ServiceFsBackend, MAX_SERVICE_FDS, MAX_
 use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
 use super::dir::find_inode_index;
-use super::file::checked_append;
 use super::inode::Ext4Inode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BlockCache;
@@ -17,7 +16,6 @@ impl BlockCache {
     fn get(&self, _fd: u64) -> Option<u64> {
         None
     }
-    fn put(&mut self, _fd: u64, _len: u64) {}
 }
 
 /// Compatibility path-id constant used by mount/policy/interop tests.
@@ -45,8 +43,6 @@ pub struct Ext4Backend {
     fds: [Option<FdRecord>; MAX_SERVICE_FDS],
     inodes: [Option<Ext4Inode>; MAX_SERVICE_INODES],
     paths: [Option<PathRecord>; MAX_SERVICE_INODES],
-    max_file_len: u64,
-    journal_seq: u64,
     cache: BlockCache,
 }
 
@@ -63,18 +59,12 @@ impl Ext4Backend {
             fds: [None; MAX_SERVICE_FDS],
             inodes: [None; MAX_SERVICE_INODES],
             paths: [None; MAX_SERVICE_INODES],
-            max_file_len: 16 * 1024 * 1024,
-            journal_seq: 0,
             cache: BlockCache::new(),
         };
         backend.seed_path(EXT4_DEMO_PATH_PTR, EXT4_DEMO_PATH);
         backend.seed_path(EXT4_SERVICE_PATH_PTR, EXT4_SERVICE_PATH);
         backend.seed_path(EXT4_OVERSIZE_PATH_PTR, EXT4_OVERSIZE_PATH);
         backend
-    }
-
-    pub const fn journal_seq(&self) -> u64 {
-        self.journal_seq
     }
 
     fn alloc_fd(&mut self, inode: u64) -> Result<u64, VfsError> {
@@ -176,17 +166,9 @@ impl VfsBackend for Ext4Backend {
         Ok(core::cmp::min(len, file_len))
     }
 
-    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
-        let inode = self.inode_for_fd(fd).ok_or(VfsError::BadFd)?;
-        let idx = find_inode_index(&self.inodes, inode).ok_or(VfsError::BadFd)?;
-        let Some(mut inode_slot) = self.inodes[idx] else {
-            return Err(VfsError::BadFd);
-        };
-        inode_slot.file_len = checked_append(inode_slot.file_len, len, self.max_file_len)?;
-        self.inodes[idx] = Some(inode_slot);
-        self.journal_seq = self.journal_seq.saturating_add(1);
-        self.cache.put(fd, inode_slot.file_len);
-        Ok(len)
+    fn write(&mut self, fd: u64, _len: u64) -> Result<u64, VfsError> {
+        self.inode_for_fd(fd).ok_or(VfsError::BadFd)?;
+        Err(VfsError::Unsupported)
     }
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
@@ -303,6 +285,7 @@ pub const EXT4_SUPERBLOCK_OFFSET: usize = 1024;
 const EXT4_MAGIC: u16 = 0xef53;
 const EXT4_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
+const EXT4_FEATURE_INCOMPAT_META_BG: u32 = 0x0010;
 const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
 const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
@@ -391,6 +374,13 @@ impl Ext4Superblock {
         let feature_incompat = le_u32(sb, 96)?;
         let feature_ro_compat = le_u32(sb, 100)?;
         let metadata_csum_seed = (feature_incompat & EXT4_FEATURE_INCOMPAT_CSUM_SEED) != 0;
+        if (feature_incompat & EXT4_FEATURE_INCOMPAT_META_BG) != 0 {
+            // meta_bg relocates descriptor blocks outside the contiguous primary table.
+            // Reject it before generic feature masking so the failure is stable and explicit.
+            return Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_INCOMPAT_META_BG,
+            ));
+        }
         let unsupported = feature_incompat & !EXT4_SUPPORTED_INCOMPAT;
         if unsupported != 0 {
             return Err(Ext4ImageError::UnsupportedFeature(unsupported));
@@ -1924,6 +1914,77 @@ mod image_tests {
             Ext4Image::mount(img.as_slice()),
             Err(Ext4ImageError::UnsupportedFeature(0x8000_0000))
         ));
+    }
+
+    #[test]
+    fn ext4_meta_bg_is_rejected_explicitly() {
+        let mut img = mkfs_style_ext4_image();
+        let incompat = le_u32(&img, EXT4_SUPERBLOCK_OFFSET + 96).unwrap();
+        put_u32(
+            &mut img,
+            EXT4_SUPERBLOCK_OFFSET + 96,
+            incompat | EXT4_FEATURE_INCOMPAT_META_BG,
+        );
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_INCOMPAT_META_BG
+            ))
+        ));
+    }
+
+    #[test]
+    fn ext4_read_side_support_matrix_is_frozen() {
+        let checksummed = metadata_csum_ext4_image();
+        let fs = Ext4Image::mount(checksummed.as_slice())
+            .expect("mount UUID-seeded 64bit/flex_bg metadata_csum fixture");
+        assert_eq!(
+            fs.read_file(b"/indexed/nested.bin").unwrap(),
+            b"nested indexed payload\n"
+        );
+        assert_eq!(
+            fs.read_file(b"/double.bin"),
+            Err(Ext4ImageError::UnsupportedLayout)
+        );
+
+        let stored_seed = metadata_csum_seed_ext4_image(0x2468_ace0);
+        let fs = Ext4Image::mount(stored_seed.as_slice())
+            .expect("mount stored-seed metadata_csum fixture");
+        assert_eq!(fs.lookup_path(b"/indexed/other.bin"), Ok(20));
+
+        let legacy = tiny_ext4_image();
+        let fs = Ext4Image::mount(legacy.as_slice()).expect("mount non-checksummed legacy fixture");
+        assert!(fs.read_file(b"/double.bin").is_ok());
+
+        let mut triple = tiny_ext4_image();
+        put_u32(
+            &mut triple,
+            5 * 1024 + 18 * 128 + 4,
+            ((12 + 256 + 65_536 + 1) * 1024) as u32,
+        );
+        let fs = Ext4Image::mount(triple.as_slice()).expect("mount triple-indirect fixture");
+        assert_eq!(
+            fs.read_file(b"/double.bin"),
+            Err(Ext4ImageError::UnsupportedLayout)
+        );
+
+        for (offset, feature) in [
+            (100, EXT4_FEATURE_RO_COMPAT_BIGALLOC),
+            (96, EXT4_FEATURE_INCOMPAT_INLINE_DATA),
+            (96, EXT4_FEATURE_INCOMPAT_META_BG),
+        ] {
+            let mut image = mkfs_style_ext4_image();
+            let current = le_u32(&image, EXT4_SUPERBLOCK_OFFSET + offset).unwrap();
+            put_u32(
+                &mut image,
+                EXT4_SUPERBLOCK_OFFSET + offset,
+                current | feature,
+            );
+            assert!(matches!(
+                Ext4Image::mount(image.as_slice()),
+                Err(Ext4ImageError::UnsupportedFeature(mask)) if mask == feature
+            ));
+        }
     }
 
     #[test]

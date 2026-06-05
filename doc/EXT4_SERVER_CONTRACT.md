@@ -11,6 +11,50 @@ loop, and the existing `EXT4_SRV_ENTRY`, `EXT4_BIN_BEFORE_RUN`, `EXT4_MOUNT_READ
 `EXT4_MOUNT_FAILED`-style markers. Runtime spawning remains deferred. This work does not alter the
 init/PM/VFS service spawn order or the kernel syscall ABI.
 
+## FS-10 read-side freeze
+
+The ext4 read side is frozen at the following contract before shared-I/O and write-pipeline design:
+
+- **Supported mount profiles:** strictly read-only ext4 with checked 1-64 KiB blocks, 32/64-byte
+  descriptors, `64bit`, `flex_bg`, extents, file types, indexed directories, and the documented
+  read-only-compatible feature set. `flex_bg` is supported through absolute inode-table locations.
+- **Supported checksum profiles:** UUID-derived `metadata_csum` and stored `metadata_csum_seed`, with
+  validation of the primary superblock, every consumed group descriptor and inode, linear/indexed
+  directory blocks, dx roots/nodes, and external extent blocks before use.
+- **Supported file block maps:** initialized/unwritten extents, bounded external extent trees, sparse
+  holes, and direct/singly/doubly-indirect legacy maps on non-checksummed images.
+- **Supported directory behavior:** linear lookup/enumeration and htree lookup/enumeration through at
+  most two dx-node levels. Native routing covers signed/unsigned legacy, half-MD4, and TEA hashes;
+  SipHash/unknown versions use validated exhaustive indexed-leaf traversal. Exact names are always
+  verified.
+- **Supported symlinks:** inline and external-block targets plus bounded relative/absolute path
+  resolution and loop rejection.
+- **Malformed-image policy:** checked descriptor/inode-table spans, block and file offsets, extent and
+  indirect ranges, dx count/limit/order/pointers, aligned block-local dirents, checksum tails, file
+  sizes, and symlink traversal bounds. Unsafe or unclear layouts return stable errors.
+- **Explicitly unsupported:** `meta_bg`, triple-indirect maps, checksummed legacy indirect maps,
+  htree depths above two dx-node levels, encrypted/SipHash routing, encryption, casefolding,
+  `inline_data`, `bigalloc`, verity, extended attributes, journal replay, allocation, mutation, and
+  every ext4 write operation.
+
+The public demo `Ext4Backend` now returns `VfsError::Unsupported` for every valid write request and
+leaves file metadata unchanged. This prevents service tests from implying writable ext4 support.
+
+## meta_bg audit and decision
+
+`INCOMPAT_META_BG` (`0x0010`) is rejected explicitly at mount with
+`UnsupportedFeature(0x0010)`. The current descriptor reader deliberately supports only the
+contiguous primary descriptor table. Correct `meta_bg` support must instead locate descriptor
+blocks according to `s_first_meta_bg`, descriptors-per-block, metablock-group boundaries, and the
+applicable backup/sparse-super placement rules; it must then bounds-check each discovered block and
+validate each descriptor with `metadata_csum` when enabled. Interactions with 64-bit descriptor
+sizes and flex-group inode-table placement also need multi-metablock-group fixtures.
+
+A one-group image that merely carries the feature bit is not proof that distributed discovery is
+correct. Therefore FS-10 chooses explicit rejection rather than a limited profile that could
+silently read the wrong group descriptor. Unit tests lock the exact error, and the ignored
+`mke2fs` probe confirms the same decision against a generated `meta_bg` image.
+
 ## Read-only support matrix
 
 The image reader supports a deliberately bounded read-only profile:
@@ -159,11 +203,10 @@ The reader still does not implement:
 
 ## Write and journaling safety
 
-General writable ext4 is **not enabled**. The existing `Ext4Backend` service is a hosted/demo VFS
-backend used by service-contract tests; it is not a crash-safe image writer and is not wired to
-mutate ext4 media. Journal presence does not enable replay or writes. A future block-backed mount
-must remain read-only until JBD2 replay/transaction handling and a complete metadata mutation design
-exist.
+General writable ext4 is **not enabled**. The hosted/demo `Ext4Backend` rejects valid write requests
+with `VfsError::Unsupported`; it does not mutate synthetic metadata or ext4 media. Journal presence
+does not enable replay or writes. A future block-backed mount must remain read-only until JBD2
+replay/transaction handling and a complete metadata mutation design exist.
 
 ## Focused test coverage
 
@@ -180,4 +223,6 @@ The ext4 suite covers the mkfs-style profile above plus the smaller parser fixtu
 - CRC32C helper vectors, UUID-derived and stored checksum-seed acceptance, stored-seed mismatch,
   seed-without-`metadata_csum` rejection, unsupported checksum type rejection, and corruption of
   superblocks, descriptors, inodes, directory leaves, dx roots/nodes, and external extent blocks;
-- freestanding `ext4_srv` build/check behavior.
+- explicit `meta_bg`, `bigalloc`, `inline_data`, triple-indirect, and checksummed legacy-indirect
+  rejection plus the frozen supported-profile regression test;
+- read-only backend write rejection and freestanding `ext4_srv` build/check behavior.
