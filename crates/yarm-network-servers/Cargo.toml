@@ -11,6 +11,7 @@ default = ["hosted-dev"]
 hosted-dev = []
 
 [dependencies]
+yarm-ipc-abi = { path = "../yarm-ipc-abi" }
 yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false }
 yarm-user-rt = { path = "../yarm-user-rt" }
 
@@ -35,7 +36,6 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "socket_srv"
 path = "src/bin/socket_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "tcpip_srv"
