@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm_user_rt::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
-    VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
-    VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE, VfsV1Args,
+    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsReadSharedRequest, VfsV1Args,
+    VfsWriteSharedRequest, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL,
+    VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ,
+    VFS_OP_READ_SHARED_REPLY, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE,
+    VFS_OP_WRITE_SHARED_REQUEST,
 };
+use yarm_user_rt::ipc::Message;
 
 pub use yarm_srv_common::vfs_core::*;
 
@@ -24,7 +26,8 @@ pub fn openat_inline_message(
     }
     .encode()
     .ok_or(VfsError::NameTooLong)?;
-    Message::with_header(0, VFS_OP_OPENAT, 0, None, &payload[..len]).map_err(|_| VfsError::Malformed)
+    Message::with_header(0, VFS_OP_OPENAT, 0, None, &payload[..len])
+        .map_err(|_| VfsError::Malformed)
 }
 
 pub fn close_message(req: CloseRequest) -> Result<Message, VfsError> {
@@ -58,6 +61,22 @@ pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsError> {
         &ReadWriteArgs::new(req.fd, req.buf_ptr, req.len).encode(),
     )
     .map_err(|_| VfsError::Malformed)
+}
+
+/// Helper-only encoder for the reserved READ_SHARED_REPLY service request.
+/// The live VFS service intentionally does not dispatch this opcode in FS-11.
+pub fn read_shared_message(req: VfsReadSharedRequest) -> Result<Message, VfsError> {
+    let payload = req.encode().map_err(|_| VfsError::Malformed)?;
+    Message::with_header(0, VFS_OP_READ_SHARED_REPLY, 0, None, &payload)
+        .map_err(|_| VfsError::Malformed)
+}
+
+/// Helper-only encoder for the reserved WRITE_SHARED_REQUEST service request.
+/// The live VFS service intentionally does not dispatch this opcode in FS-11.
+pub fn write_shared_message(req: VfsWriteSharedRequest) -> Result<Message, VfsError> {
+    let payload = req.encode().map_err(|_| VfsError::Malformed)?;
+    Message::with_header(0, VFS_OP_WRITE_SHARED_REQUEST, 0, None, &payload)
+        .map_err(|_| VfsError::Malformed)
 }
 
 pub fn statx_inline_message(
@@ -185,4 +204,60 @@ pub fn dispatch_once<S: FilesystemService>(
     request: Message,
 ) -> Result<Message, VfsError> {
     service.dispatch(request)
+}
+
+#[cfg(test)]
+mod shared_io_tests {
+    use super::*;
+    use yarm_ipc_abi::vfs_abi::{
+        VfsSharedBufferDescriptor, VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE,
+    };
+
+    #[test]
+    fn shared_message_helpers_encode_without_enabling_dispatch() {
+        let read = VfsReadSharedRequest {
+            fd: 3,
+            file_offset: 0,
+            requested_len: 64,
+            request_id: 11,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(5, 1, 0, 64, VFS_SHARED_BUFFER_FS_WRITE),
+        };
+        let message = read_shared_message(read).expect("read shared message");
+        assert_eq!(message.opcode, VFS_OP_READ_SHARED_REPLY);
+        assert_eq!(VfsReadSharedRequest::decode(message.as_slice()), Ok(read));
+
+        let write = VfsWriteSharedRequest {
+            fd: 4,
+            file_offset: 128,
+            requested_len: 32,
+            request_id: 12,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(6, 2, 8, 32, VFS_SHARED_BUFFER_FS_READ),
+        };
+        let message = write_shared_message(write).expect("write shared message");
+        assert_eq!(message.opcode, VFS_OP_WRITE_SHARED_REQUEST);
+        assert_eq!(VfsWriteSharedRequest::decode(message.as_slice()), Ok(write));
+    }
+
+    #[test]
+    fn legacy_inline_read_write_messages_are_unchanged() {
+        let request = ReadWriteRequest {
+            fd: 7,
+            buf_ptr: 8,
+            len: 9,
+        };
+        let read = read_message(request).expect("legacy read");
+        let write = write_message(request).expect("legacy write");
+        assert_eq!(read.opcode, VFS_OP_READ);
+        assert_eq!(write.opcode, VFS_OP_WRITE);
+        assert_eq!(
+            ReadWriteArgs::decode(read.as_slice()),
+            Ok(ReadWriteArgs::new(7, 8, 9))
+        );
+        assert_eq!(
+            ReadWriteArgs::decode(write.as_slice()),
+            Ok(ReadWriteArgs::new(7, 8, 9))
+        );
+    }
 }

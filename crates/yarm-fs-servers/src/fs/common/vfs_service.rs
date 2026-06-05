@@ -5,10 +5,9 @@ use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE,
-    VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL,
-    VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX,
-    VFS_OP_WRITE, VfsV1Args,
+    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsV1Args, VFS_OP_CLOSE, VFS_OP_DUP,
+    VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
+    VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE,
 };
 use yarm_user_rt::ipc::Message;
 
@@ -375,8 +374,14 @@ impl<B: VfsBackend> VfsService<B> {
                     payload[..8].copy_from_slice(&read_len.to_le_bytes());
                     payload[8..16].copy_from_slice(&0u64.to_le_bytes());
                     payload[16..16 + inline_len].copy_from_slice(&inline[..inline_len]);
-                    return Message::with_header(0, VFS_OP_READ, 0, None, &payload[..16 + inline_len])
-                        .map_err(|_| VfsError::Malformed);
+                    return Message::with_header(
+                        0,
+                        VFS_OP_READ,
+                        0,
+                        None,
+                        &payload[..16 + inline_len],
+                    )
+                    .map_err(|_| VfsError::Malformed);
                 }
             }
             VfsRequest::Write { fd, len, .. } => VfsReply::WriteLen(self.backend.write(fd, len)?),
@@ -429,5 +434,46 @@ impl<B: VfsBackend> VfsService<B> {
         };
         self.op_sequence = self.op_sequence.saturating_add(1);
         reply.to_message()
+    }
+}
+
+#[cfg(test)]
+mod shared_io_dispatch_tests {
+    use super::*;
+    use crate::fs::common::vfs_ipc::{read_shared_message, write_shared_message};
+    use yarm_ipc_abi::vfs_abi::{
+        VfsReadSharedRequest, VfsSharedBufferDescriptor, VfsWriteSharedRequest,
+        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE,
+    };
+
+    #[test]
+    fn shared_io_opcodes_remain_unsupported_by_live_dispatch() {
+        let read = read_shared_message(VfsReadSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 16,
+            request_id: 1,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(1, 1, 0, 16, VFS_SHARED_BUFFER_FS_WRITE),
+        })
+        .expect("read shared message");
+        assert!(matches!(
+            VfsService::<InMemoryBackend>::parse_request(read),
+            Err(VfsError::Unsupported)
+        ));
+
+        let write = write_shared_message(VfsWriteSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 16,
+            request_id: 2,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(2, 1, 0, 16, VFS_SHARED_BUFFER_FS_READ),
+        })
+        .expect("write shared message");
+        assert!(matches!(
+            VfsService::<InMemoryBackend>::parse_request(write),
+            Err(VfsError::Unsupported)
+        ));
     }
 }
