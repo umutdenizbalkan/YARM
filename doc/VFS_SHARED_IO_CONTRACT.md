@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-# VFS shared-I/O contract (FS-11 through FS-18 scaffold)
+# VFS shared-I/O contract (FS-11 through FS-19 scaffold)
 
 ## Status and scope
 
 `VFS_SHARED_IO_ENABLED` is the umbrella name for a future userspace VFS/filesystem transfer path.
-FS-11 through FS-18 define service-ABI records, exact inline write payloads, typed read/write plans,
+FS-11 through FS-19 define service-ABI records, exact inline write payloads, typed read/write plans,
 a borrowed test-only shared-buffer model, a helper-only lifecycle/cleanup state machine, and the
 direction-safe adapter boundary required by a future real mapper. These are
 design and test scaffolding only. They do **not** define or enable a runtime feature
@@ -401,6 +401,19 @@ kind, rights, object size, VFS handle generation, request identity, or a generic
 writable buffer. `UnsupportedSharedIoMapper` remains the production default, RAMFS live shared I/O
 remains disabled, FAT production writes remain unwired, and ext4 remains read-only.
 
+## FS-19 mapper ABI design decision
+
+The detailed missing-metadata table, receive option analysis, validation ownership, generic writable
+buffer design, VFS/shared-region frame, and cancellation/exit/revocation matrix are frozen in
+[`VFS_SHARED_IO_MAPPER_REQUIREMENTS.md`](VFS_SHARED_IO_MAPPER_REQUIREMENTS.md).
+
+FS-19 recommends a separately reviewed, versioned mapped-receive ABI (recv-v3 or equivalent) that
+returns authoritative object kind, effective rights, exact object/region sizes, object generation,
+actual mapping permissions, and an unforgeable cleanup identity without changing legacy recv-v2. A
+userspace broker may provide allocation and policy, but cannot be the security authority without
+kernel-backed object metadata. No syscall number or wire layout is selected and no live support is
+enabled in this pass.
+
 ## Ownership and permissions
 
 | Stage | Object owner | FS permission | FS obligation | Retention after reply |
@@ -457,13 +470,15 @@ requested length.
    production mapper unsupported.
 8. **FS-18:** add typed wrappers for the frozen legacy receive-map-intent and transfer-release
    register layouts, plus a metadata-only at-most-once successful release token; keep live routing disabled.
-9. **FS-19 decision point:** design the missing object-introspection, generic writable shared-buffer,
-   and VFS/shared-region framing ABI before attempting a concrete mapper.
-10. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
+9. **FS-19:** freeze the missing metadata, validation, writable-buffer, framing, and lifecycle
+   requirements; recommend a separate versioned mapped-receive kernel ABI design task.
+10. **FS-20:** stop live shared-I/O work until that separately scoped ABI is reviewed; userspace-only
+   work may prototype non-authoritative broker policy but must not enable a mapper.
+11. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
    and advertise only the read capability after lifecycle tests pass.
-11. **Write enablement:** independently implement read-only request-buffer mapping for
+12. **Write enablement:** independently implement read-only request-buffer mapping for
    `WRITE_SHARED_REQUEST`; only then connect writable filesystems to the FS-12 block path.
-12. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
+13. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
    has routing, permissions, cancellation, cleanup, and process-exit tests. Supporting one stage does
    not imply support for the other.
 
@@ -478,7 +493,7 @@ gated backend; FAT production writes and ext4 writes remain out of scope until t
 
 ## Explicit non-changes
 
-FS-18 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
+FS-19 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
 init/PM/supervisor/driver-manager policy, runtime service spawn order, FAT production writes, ext4
 writes, the FS-12 block stack, or the ext4 FS-10 read-side matrix. Kernel/global-lock work is
 untouched. No QEMU smoke is required because no runtime behavior is enabled.
