@@ -56,33 +56,62 @@ The fixture exercises:
 - an external-block symlink and path resolution through that symlink;
 - malformed first-data-block, inode-size, flex_bg inode-table, extent-overlap, and cross-block
   directory-record rejection;
-- stable `metadata_csum`, `bigalloc`, and `inline_data` feature rejection.
+- a fully checksummed `metadata_csum` variant plus `bigalloc` and `inline_data` rejection.
 
-A one-off development probe also confirmed that the parser mounts and reads a file from a real
-`mke2fs` image created with the otherwise common ext4 defaults but with `metadata_csum` and
-`orphan_file` disabled. External tools are intentionally not part of the default test suite.
+Development-only probes confirmed that the parser mounts and reads files from real `mke2fs`
+images both with the common UUID-seeded `metadata_csum` profile and with `metadata_csum` disabled.
+External tools are intentionally not part of the default test suite.
 
 ## Feature and metadata-checksum policy
 
 The accepted feature set includes `filetype`, `extents`, `64bit`, `flex_bg`, `dir_index`,
-`sparse_super`, `large_file`, `huge_file`, `dir_nlink`, and `extra_isize`. Unknown incompatible
-features and unsupported read-affecting read-only-compatible features are rejected.
+`sparse_super`, `large_file`, `huge_file`, `dir_nlink`, `extra_isize`, and the UUID-seeded
+`metadata_csum` profile. Unknown incompatible features and unsupported read-affecting
+read-only-compatible features are rejected.
 
-A small heap-free/no-`std` CRC32C Castagnoli helper remains covered by empty-input, `123456789`, and
-incremental-update vectors. It is checksum groundwork only. **No `metadata_csum` image is partially
-validated or accepted.** Mount rejects `metadata_csum` immediately with
-`UnsupportedFeature(metadata_csum)`, regardless of checksum-field contents. Full acceptance remains
-blocked until checksums are validated together for every metadata type consumed by reads:
+The heap-free/no-`std` CRC32C Castagnoli implementation uses ext4's uncomplemented running CRC
+state. The checksum seed for the accepted profile is `crc32c(~0, filesystem_uuid)`. Multi-byte
+inode numbers, inode generations, and block-group numbers enter the CRC as their little-endian
+on-disk byte representation. The standard complemented empty-input/`123456789` vectors and
+incremental update equivalence remain covered by tests.
 
-- primary superblock;
-- group descriptors;
-- inodes;
-- directory leaves and dx nodes;
-- external extent blocks.
+When `metadata_csum` is present, the reader validates every checksummed metadata structure that it
+trusts before parsing it:
 
-This stable rejection avoids presenting a bad checksum as a different policy result and avoids any
-claim that validating only one metadata structure makes the image safe. `metadata_csum_seed` also
-remains unsupported.
+- **Primary superblock:** CRC32C from `~0` over bytes before `s_checksum`; the UUID is already inside
+  the superblock. Only checksum type `1` (CRC32C) is accepted.
+- **Group descriptors:** UUID-derived seed, little-endian group number, and the complete descriptor
+  with `bg_checksum` treated as zero; the stored lower 16 bits are checked. Every primary-table
+  descriptor is validated during mount, including 64-byte descriptors.
+- **Inodes:** UUID-derived seed, little-endian inode number, inode generation, and the complete inode
+  with low/high checksum fields treated as zero. 128-byte inodes use the low 16 bits; sufficiently
+  large inodes with `i_extra_isize >= 4` validate all 32 bits.
+- **Linear directory leaves:** UUID-derived seed, owning directory inode number/generation, and the
+  block bytes before the required 12-byte `ext4_dir_entry_tail`.
+- **Htree dx roots/nodes:** the same owning-inode prefix, the valid header/entry region, and the
+  required zeroed 8-byte dx tail. Validation occurs before routing through each root or node.
+- **Htree directory leaves:** the linear directory-tail formula above, before exact-name matching.
+- **External extent blocks:** UUID-derived seed, owning inode number/generation, and bytes through
+  the extent tail position derived from `eh_max`; inode-resident extent roots rely on the inode
+  checksum and do not have a separate extent-tail checksum.
+
+Any mismatch returns `ChecksumMismatch`. Malformed or absent checksum tails return `Malformed`.
+Checksum validation is performed at the read point, not merely at mount, so later inode, directory,
+dx, and external extent reads cannot introduce unchecked metadata.
+
+### Accepted and rejected metadata_csum profiles
+
+`metadata_csum` mounts are accepted for extent-backed regular files, directories, and external
+symlinks using the metadata forms listed above. Indexed directories are accepted for lookup through
+the supported two dx-node levels. Indexed-directory enumeration remains unsupported because the
+current `read_dir` API does not flatten htree leaves.
+
+Legacy direct/singly/doubly-indirect files remain available on non-`metadata_csum` images, but are
+rejected with `UnsupportedLayout` when encountered on an accepted `metadata_csum` mount: ext4 does
+not define metadata checksums for those legacy pointer blocks, so the parser cannot satisfy its
+"validate every trusted metadata block" policy. `metadata_csum_seed` is also rejected; support is
+currently limited to the UUID-derived seed rule. Bitmaps, journal blocks, backup superblocks, and
+extended-attribute blocks are not validated because the read-only parser does not consume them.
 
 ## Unsupported and deferred features
 
@@ -91,8 +120,9 @@ The reader still does not implement:
 - native half-MD4, TEA, or SipHash htree hash calculation (validated exhaustive fallback is used);
 - htree depths greater than two `dx_node` levels;
 - triple-indirect legacy block maps;
-- `metadata_csum`, `bigalloc`, `inline_data`, encryption, casefolding, verity, compression-style
-  profiles, `meta_bg`, or other unknown required features;
+- `metadata_csum_seed`, metadata-checksummed legacy indirect pointer blocks, `bigalloc`,
+  `inline_data`, encryption, casefolding, verity, compression-style profiles, `meta_bg`, or other
+  unknown required features;
 - journal replay or JBD2 transactions;
 - block/inode allocation, directory mutation, create, unlink, rename, truncate, or any ext4 write.
 
@@ -113,5 +143,7 @@ The ext4 suite covers the mkfs-style profile above plus the smaller parser fixtu
 - direct, singly indirect, doubly indirect, sparse indirect, and triple-indirect rejection paths;
 - linear and indexed directory lookup, up to two dx-node levels, malformed counts, and bad leaves;
 - inline/external symlinks, nested path resolution, and symlink-loop bounds;
-- CRC32C helper vectors and conservative metadata-checksum rejection;
+- CRC32C helper vectors, valid metadata-checksum acceptance, unsupported checksum type/seed
+  rejection, and corruption of superblocks, descriptors, inodes, directory leaves, dx roots/nodes,
+  and external extent blocks;
 - freestanding `ext4_srv` build/check behavior.

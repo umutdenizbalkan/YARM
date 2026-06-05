@@ -306,6 +306,7 @@ const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 const EXT4_FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
 const EXT4_FEATURE_INCOMPAT_FLEX_BG: u32 = 0x0200;
+const EXT4_FEATURE_INCOMPAT_CSUM_SEED: u32 = 0x2000;
 const EXT4_FEATURE_INCOMPAT_INLINE_DATA: u32 = 0x8000;
 const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
 const EXT4_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
@@ -332,6 +333,13 @@ const EXT4_DX_ROOT_INFO_OFFSET: usize = 24;
 const EXT4_DX_ROOT_ENTRIES_OFFSET: usize = 32;
 const EXT4_DX_NODE_ENTRIES_OFFSET: usize = 8;
 const EXT4_DX_MAX_INDIRECT_LEVELS: u8 = 2;
+const EXT4_SUPERBLOCK_CHECKSUM_OFFSET: usize = 1020;
+const EXT4_INODE_CHECKSUM_LO_OFFSET: usize = 124;
+const EXT4_INODE_EXTRA_ISIZE_OFFSET: usize = 128;
+const EXT4_INODE_CHECKSUM_HI_OFFSET: usize = 130;
+const EXT4_DIR_TAIL_SIZE: usize = 12;
+const EXT4_DX_TAIL_SIZE: usize = 8;
+const EXT4_CHECKSUM_TYPE_CRC32C: u8 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ext4ImageError {
@@ -358,6 +366,9 @@ pub struct Ext4Superblock {
     pub feature_compat: u32,
     pub feature_incompat: u32,
     pub feature_ro_compat: u32,
+    pub uuid: [u8; 16],
+    pub checksum_seed: u32,
+    pub metadata_csum: bool,
     pub hash_seed: [u32; 4],
     pub default_hash_version: u8,
 }
@@ -378,6 +389,11 @@ impl Ext4Superblock {
         let feature_compat = le_u32(sb, 92)?;
         let feature_incompat = le_u32(sb, 96)?;
         let feature_ro_compat = le_u32(sb, 100)?;
+        if (feature_incompat & EXT4_FEATURE_INCOMPAT_CSUM_SEED) != 0 {
+            return Err(Ext4ImageError::UnsupportedFeature(
+                EXT4_FEATURE_INCOMPAT_CSUM_SEED,
+            ));
+        }
         let unsupported = feature_incompat & !EXT4_SUPPORTED_INCOMPAT;
         if unsupported != 0 {
             return Err(Ext4ImageError::UnsupportedFeature(unsupported));
@@ -394,15 +410,6 @@ impl Ext4Superblock {
         if unsupported_ro != 0 {
             return Err(Ext4ImageError::UnsupportedFeature(unsupported_ro));
         }
-        if metadata_csum {
-            // Do not partially validate or accept metadata_csum images. The reader
-            // trusts group descriptors, inodes, directory/dx blocks, and external
-            // extent blocks, so the feature stays gated until all of those checksum
-            // formats are covered together.
-            return Err(Ext4ImageError::UnsupportedFeature(
-                EXT4_FEATURE_RO_COMPAT_METADATA_CSUM,
-            ));
-        }
         if (feature_ro_compat & EXT4_FEATURE_RO_COMPAT_BIGALLOC) != 0 {
             return Err(Ext4ImageError::UnsupportedFeature(
                 EXT4_FEATURE_RO_COMPAT_BIGALLOC,
@@ -415,6 +422,17 @@ impl Ext4Superblock {
             0
         };
         let inode_size = le_u16(sb, 88).unwrap_or(128);
+        let mut uuid = [0u8; 16];
+        uuid.copy_from_slice(sb.get(104..120).ok_or(Ext4ImageError::Io)?);
+        if metadata_csum {
+            if sb.get(373).copied() != Some(EXT4_CHECKSUM_TYPE_CRC32C) {
+                return Err(Ext4ImageError::UnsupportedFeature(
+                    EXT4_FEATURE_RO_COMPAT_METADATA_CSUM,
+                ));
+            }
+            validate_superblock_checksum(sb)?;
+        }
+        let checksum_seed = crc32c_update(!0, &uuid);
         Ok(Self {
             inodes_count: le_u32(sb, 0)?,
             blocks_count: blocks_lo | (blocks_hi << 32),
@@ -426,6 +444,9 @@ impl Ext4Superblock {
             feature_compat,
             feature_incompat,
             feature_ro_compat,
+            uuid,
+            checksum_seed,
+            metadata_csum,
             hash_seed: [
                 le_u32(sb, 236)?,
                 le_u32(sb, 240)?,
@@ -469,6 +490,8 @@ struct Extent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ParsedInode {
+    number: u32,
+    generation: u32,
     mode: u16,
     size: u64,
     flags: u32,
@@ -572,6 +595,11 @@ impl<'a> Ext4Image<'a> {
         let start = self.block_offset(table_block)?;
         let end = start.checked_add(bytes).ok_or(Ext4ImageError::Io)?;
         self.image.get(start..end).ok_or(Ext4ImageError::Io)?;
+        if self.sb.metadata_csum {
+            for group in 0..self.group_count()? {
+                self.group_desc(group)?;
+            }
+        }
         Ok(())
     }
 
@@ -600,7 +628,11 @@ impl<'a> Ext4Image<'a> {
         let end = start
             .checked_add(self.desc_size as usize)
             .ok_or(Ext4ImageError::Io)?;
-        self.image.get(start..end).ok_or(Ext4ImageError::Io)
+        let descriptor = self.image.get(start..end).ok_or(Ext4ImageError::Io)?;
+        if self.sb.metadata_csum {
+            validate_group_descriptor_checksum(self.sb.checksum_seed, group, descriptor)?;
+        }
+        Ok(descriptor)
     }
 
     fn inode_table_block(&self, group: u32) -> Result<u64, Ext4ImageError> {
@@ -645,11 +677,16 @@ impl<'a> Ext4Image<'a> {
             .checked_add(self.sb.inode_size as usize)
             .ok_or(Ext4ImageError::Io)?;
         let raw = self.image.get(off..inode_end).ok_or(Ext4ImageError::Io)?;
+        if self.sb.metadata_csum {
+            validate_inode_checksum(self.sb.checksum_seed, inode, raw)?;
+        }
         let size_lo = le_u32(raw, 4)? as u64;
         let size_hi = le_u32(raw, 108).unwrap_or(0) as u64;
         let mut block = [0u8; 60];
         block.copy_from_slice(raw.get(40..100).ok_or(Ext4ImageError::Malformed)?);
         Ok(ParsedInode {
+            number: inode,
+            generation: le_u32(raw, 100)?,
             mode: le_u16(raw, 0)?,
             size: size_lo | (size_hi << 32),
             flags: le_u32(raw, 32)?,
@@ -659,7 +696,11 @@ impl<'a> Ext4Image<'a> {
 
     fn extents(&self, inode: &ParsedInode) -> Result<alloc::vec::Vec<Extent>, Ext4ImageError> {
         if (inode.flags & EXT4_EXTENTS_FL) != 0 || inode.block[0..2] == 0xf30au16.to_le_bytes() {
-            self.parse_extent_tree(&inode.block, 0)
+            self.parse_extent_tree(inode, &inode.block, 0, false)
+        } else if self.sb.metadata_csum {
+            // Legacy indirect metadata blocks have no metadata_csum checksum format.
+            // Keep accepted metadata_csum mounts limited to extent-backed objects.
+            Err(Ext4ImageError::UnsupportedLayout)
         } else {
             self.indirect_extents(inode)
         }
@@ -759,10 +800,20 @@ impl<'a> Ext4Image<'a> {
 
     fn parse_extent_tree(
         &self,
+        inode: &ParsedInode,
         raw: &[u8],
         recursion_depth: u16,
+        external: bool,
     ) -> Result<alloc::vec::Vec<Extent>, Ext4ImageError> {
         let header_depth = extent_header_depth(raw)?;
+        if external && self.sb.metadata_csum {
+            validate_extent_block_checksum(
+                self.sb.checksum_seed,
+                inode.number,
+                inode.generation,
+                raw,
+            )?;
+        }
         if header_depth > EXT4_MAX_EXTENT_DEPTH || recursion_depth > EXT4_MAX_EXTENT_DEPTH {
             return Err(Ext4ImageError::UnsupportedLayout);
         }
@@ -791,7 +842,7 @@ impl<'a> Ext4Image<'a> {
             if extent_header_depth(child)? + 1 != header_depth {
                 return Err(Ext4ImageError::Malformed);
             }
-            out.extend(self.parse_extent_tree(child, recursion_depth + 1)?);
+            out.extend(self.parse_extent_tree(inode, child, recursion_depth + 1, true)?);
         }
         Ok(out)
     }
@@ -888,12 +939,16 @@ impl<'a> Ext4Image<'a> {
         if meta.file_type() != Ext4FileType::Directory {
             return Err(Ext4ImageError::NotDirectory);
         }
-        let _dir_index_linear_fallback = (meta.flags & EXT4_INDEX_FL) != 0
+        let indexed = (meta.flags & EXT4_INDEX_FL) != 0
             && (self.sb.feature_compat & EXT4_FEATURE_COMPAT_DIR_INDEX) != 0;
-        parse_dir_entries(
-            self.read_inode_bytes(inode)?.as_slice(),
-            self.sb.block_size() as usize,
-        )
+        let bytes = self.read_inode_bytes(inode)?;
+        if self.sb.metadata_csum {
+            if indexed {
+                return Err(Ext4ImageError::UnsupportedLayout);
+            }
+            self.validate_linear_directory_blocks(&meta, &bytes)?;
+        }
+        parse_dir_entries(bytes.as_slice(), self.sb.block_size() as usize)
     }
 
     fn lookup_dir_entry_inode(&self, dir_inode: u32, name: &[u8]) -> Result<u32, Ext4ImageError> {
@@ -911,14 +966,15 @@ impl<'a> Ext4Image<'a> {
                 Err(err) => return Err(err),
             }
         }
-        parse_dir_entries(
-            self.read_inode_bytes(dir_inode)?.as_slice(),
-            self.sb.block_size() as usize,
-        )?
-        .iter()
-        .find(|e| e.name() == name)
-        .map(|e| e.inode)
-        .ok_or(Ext4ImageError::NotFound)
+        let bytes = self.read_inode_bytes(dir_inode)?;
+        if self.sb.metadata_csum {
+            self.validate_linear_directory_blocks(&inode, &bytes)?;
+        }
+        parse_dir_entries(bytes.as_slice(), self.sb.block_size() as usize)?
+            .iter()
+            .find(|e| e.name() == name)
+            .map(|e| e.inode)
+            .ok_or(Ext4ImageError::NotFound)
     }
 
     fn htree_lookup_inode(
@@ -947,8 +1003,22 @@ impl<'a> Ext4Image<'a> {
             return Err(Ext4ImageError::UnsupportedLayout);
         }
 
+        if self.sb.metadata_csum {
+            validate_dx_block_checksum(
+                self.sb.checksum_seed,
+                dir_inode.number,
+                dir_inode.generation,
+                root,
+                EXT4_DX_ROOT_ENTRIES_OFFSET,
+            )?;
+        }
         let hash = ext4_dir_hash(hash_version, name, self.sb.hash_seed);
-        let root_entries = parse_dx_entries(root, EXT4_DX_ROOT_ENTRIES_OFFSET, block_size)?;
+        let root_entries = parse_dx_entries(
+            root,
+            EXT4_DX_ROOT_ENTRIES_OFFSET,
+            block_size,
+            self.sb.metadata_csum,
+        )?;
         let mut candidates = alloc::vec::Vec::new();
         for idx in dx_candidates(root_entries.as_slice(), hash) {
             candidates.push(root_entries[idx].1);
@@ -959,7 +1029,21 @@ impl<'a> Ext4Image<'a> {
             for logical in candidates {
                 let node = directory_logical_block(&bytes, block_size, logical)?;
                 validate_dx_node_header(node, block_size)?;
-                let entries = parse_dx_entries(node, EXT4_DX_NODE_ENTRIES_OFFSET, block_size)?;
+                if self.sb.metadata_csum {
+                    validate_dx_block_checksum(
+                        self.sb.checksum_seed,
+                        dir_inode.number,
+                        dir_inode.generation,
+                        node,
+                        EXT4_DX_NODE_ENTRIES_OFFSET,
+                    )?;
+                }
+                let entries = parse_dx_entries(
+                    node,
+                    EXT4_DX_NODE_ENTRIES_OFFSET,
+                    block_size,
+                    self.sb.metadata_csum,
+                )?;
                 for idx in dx_candidates(entries.as_slice(), hash) {
                     children.push(entries[idx].1);
                 }
@@ -968,7 +1052,7 @@ impl<'a> Ext4Image<'a> {
         }
 
         for logical in candidates {
-            if let Some(inode) = self.scan_htree_leaf(&bytes, logical, name)? {
+            if let Some(inode) = self.scan_htree_leaf(dir_inode, &bytes, logical, name)? {
                 return Ok(Some(inode));
             }
         }
@@ -977,17 +1061,46 @@ impl<'a> Ext4Image<'a> {
 
     fn scan_htree_leaf(
         &self,
+        dir_inode: &ParsedInode,
         directory: &[u8],
         logical: u32,
         name: &[u8],
     ) -> Result<Option<u32>, Ext4ImageError> {
         let leaf = directory_logical_block(directory, self.sb.block_size() as usize, logical)?;
+        if self.sb.metadata_csum {
+            validate_directory_block_checksum(
+                self.sb.checksum_seed,
+                dir_inode.number,
+                dir_inode.generation,
+                leaf,
+            )?;
+        }
         for entry in parse_dir_entries(leaf, self.sb.block_size() as usize)? {
             if entry.name() == name {
                 return Ok(Some(entry.inode));
             }
         }
         Ok(None)
+    }
+
+    fn validate_linear_directory_blocks(
+        &self,
+        inode: &ParsedInode,
+        bytes: &[u8],
+    ) -> Result<(), Ext4ImageError> {
+        let block_size = self.sb.block_size() as usize;
+        for block in bytes.chunks(block_size) {
+            if block.len() != block_size {
+                return Err(Ext4ImageError::Malformed);
+            }
+            validate_directory_block_checksum(
+                self.sb.checksum_seed,
+                inode.number,
+                inode.generation,
+                block,
+            )?;
+        }
+        Ok(())
     }
 
     fn read_inode_bytes_by_meta(
@@ -1066,11 +1179,14 @@ fn parse_dx_entries(
     block: &[u8],
     entries_offset: usize,
     block_size: usize,
+    metadata_csum: bool,
 ) -> Result<alloc::vec::Vec<(u32, u32)>, Ext4ImageError> {
     let limit = le_u16(block, entries_offset)? as usize;
     let count = le_u16(block, entries_offset + 2)? as usize;
+    let tail_size = if metadata_csum { EXT4_DX_TAIL_SIZE } else { 0 };
     let capacity = block_size
         .checked_sub(entries_offset)
+        .and_then(|bytes| bytes.checked_sub(tail_size))
         .ok_or(Ext4ImageError::Malformed)?
         / 8;
     if limit == 0 || count == 0 || count > limit || limit > capacity {
@@ -1290,7 +1406,6 @@ fn parse_dir_entries(
     Ok(out)
 }
 
-#[cfg(test)]
 fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for byte in bytes {
         crc ^= u32::from(*byte);
@@ -1304,6 +1419,179 @@ fn crc32c_update(mut crc: u32, bytes: &[u8]) -> u32 {
 #[cfg(test)]
 fn crc32c(bytes: &[u8]) -> u32 {
     !crc32c_update(!0, bytes)
+}
+
+fn validate_superblock_checksum(sb: &[u8]) -> Result<(), Ext4ImageError> {
+    let stored = le_u32(sb, EXT4_SUPERBLOCK_CHECKSUM_OFFSET)?;
+    let calculated = crc32c_update(
+        !0,
+        sb.get(..EXT4_SUPERBLOCK_CHECKSUM_OFFSET)
+            .ok_or(Ext4ImageError::Io)?,
+    );
+    checksum_matches(stored, calculated)
+}
+
+fn validate_group_descriptor_checksum(
+    seed: u32,
+    group: u32,
+    descriptor: &[u8],
+) -> Result<(), Ext4ImageError> {
+    let stored = le_u16(descriptor, 30)?;
+    let mut calculated = crc32c_update(seed, &group.to_le_bytes());
+    calculated = crc32c_update(
+        calculated,
+        descriptor.get(..30).ok_or(Ext4ImageError::Malformed)?,
+    );
+    calculated = crc32c_update(calculated, &[0, 0]);
+    calculated = crc32c_update(
+        calculated,
+        descriptor.get(32..).ok_or(Ext4ImageError::Malformed)?,
+    );
+    checksum_matches(u32::from(stored), calculated & 0xffff)
+}
+
+fn inode_has_high_checksum(raw: &[u8]) -> Result<bool, Ext4ImageError> {
+    if raw.len() <= EXT4_INODE_EXTRA_ISIZE_OFFSET {
+        return Ok(false);
+    }
+    let extra_isize = le_u16(raw, EXT4_INODE_EXTRA_ISIZE_OFFSET)? as usize;
+    Ok(extra_isize >= 4 && raw.len() >= EXT4_INODE_CHECKSUM_HI_OFFSET + 2)
+}
+
+fn validate_inode_checksum(seed: u32, inode: u32, raw: &[u8]) -> Result<(), Ext4ImageError> {
+    if raw.len() < 128 {
+        return Err(Ext4ImageError::Malformed);
+    }
+    let generation = le_u32(raw, 100)?;
+    let stored_lo = le_u16(raw, EXT4_INODE_CHECKSUM_LO_OFFSET)?;
+    let has_high = inode_has_high_checksum(raw)?;
+    let stored_hi = if has_high {
+        le_u16(raw, EXT4_INODE_CHECKSUM_HI_OFFSET)?
+    } else {
+        0
+    };
+    let mut calculated = metadata_checksum_prefix(seed, inode, generation);
+    calculated = crc32c_update(
+        calculated,
+        raw.get(..EXT4_INODE_CHECKSUM_LO_OFFSET)
+            .ok_or(Ext4ImageError::Malformed)?,
+    );
+    calculated = crc32c_update(calculated, &[0, 0]);
+    if has_high {
+        calculated = crc32c_update(
+            calculated,
+            raw.get(EXT4_INODE_CHECKSUM_LO_OFFSET + 2..EXT4_INODE_CHECKSUM_HI_OFFSET)
+                .ok_or(Ext4ImageError::Malformed)?,
+        );
+        calculated = crc32c_update(calculated, &[0, 0]);
+        calculated = crc32c_update(
+            calculated,
+            raw.get(EXT4_INODE_CHECKSUM_HI_OFFSET + 2..)
+                .ok_or(Ext4ImageError::Malformed)?,
+        );
+    } else {
+        calculated = crc32c_update(
+            calculated,
+            raw.get(EXT4_INODE_CHECKSUM_LO_OFFSET + 2..)
+                .ok_or(Ext4ImageError::Malformed)?,
+        );
+    }
+    let stored = u32::from(stored_lo) | (u32::from(stored_hi) << 16);
+    if has_high {
+        checksum_matches(stored, calculated)
+    } else {
+        checksum_matches(stored, calculated & 0xffff)
+    }
+}
+
+fn validate_directory_block_checksum(
+    seed: u32,
+    inode: u32,
+    generation: u32,
+    block: &[u8],
+) -> Result<(), Ext4ImageError> {
+    if block.len() < EXT4_DIR_TAIL_SIZE {
+        return Err(Ext4ImageError::Malformed);
+    }
+    let tail_offset = block.len() - EXT4_DIR_TAIL_SIZE;
+    if le_u32(block, tail_offset)? != 0
+        || le_u16(block, tail_offset + 4)? as usize != EXT4_DIR_TAIL_SIZE
+        || block.get(tail_offset + 6).copied() != Some(0)
+        || block.get(tail_offset + 7).copied() != Some(0xde)
+    {
+        return Err(Ext4ImageError::Malformed);
+    }
+    let stored = le_u32(block, tail_offset + 8)?;
+    let mut calculated = metadata_checksum_prefix(seed, inode, generation);
+    calculated = crc32c_update(
+        calculated,
+        block.get(..tail_offset).ok_or(Ext4ImageError::Malformed)?,
+    );
+    checksum_matches(stored, calculated)
+}
+
+fn validate_dx_block_checksum(
+    seed: u32,
+    inode: u32,
+    generation: u32,
+    block: &[u8],
+    entries_offset: usize,
+) -> Result<(), Ext4ImageError> {
+    if block.len() < EXT4_DX_TAIL_SIZE {
+        return Err(Ext4ImageError::Malformed);
+    }
+    let count = le_u16(block, entries_offset + 2)? as usize;
+    let used_end = entries_offset
+        .checked_add(count.checked_mul(8).ok_or(Ext4ImageError::Malformed)?)
+        .ok_or(Ext4ImageError::Malformed)?;
+    let tail_offset = block.len() - EXT4_DX_TAIL_SIZE;
+    if used_end > tail_offset || le_u32(block, tail_offset)? != 0 {
+        return Err(Ext4ImageError::Malformed);
+    }
+    let stored = le_u32(block, tail_offset + 4)?;
+    let mut calculated = metadata_checksum_prefix(seed, inode, generation);
+    calculated = crc32c_update(
+        calculated,
+        block.get(..used_end).ok_or(Ext4ImageError::Malformed)?,
+    );
+    calculated = crc32c_update(calculated, &[0; EXT4_DX_TAIL_SIZE]);
+    checksum_matches(stored, calculated)
+}
+
+fn validate_extent_block_checksum(
+    seed: u32,
+    inode: u32,
+    generation: u32,
+    block: &[u8],
+) -> Result<(), Ext4ImageError> {
+    let max_entries = le_u16(block, 4)? as usize;
+    let tail_offset = 12usize
+        .checked_add(
+            max_entries
+                .checked_mul(12)
+                .ok_or(Ext4ImageError::Malformed)?,
+        )
+        .ok_or(Ext4ImageError::Malformed)?;
+    let stored = le_u32(block, tail_offset)?;
+    let mut calculated = metadata_checksum_prefix(seed, inode, generation);
+    calculated = crc32c_update(
+        calculated,
+        block.get(..tail_offset).ok_or(Ext4ImageError::Malformed)?,
+    );
+    checksum_matches(stored, calculated)
+}
+
+fn metadata_checksum_prefix(seed: u32, inode: u32, generation: u32) -> u32 {
+    let checksum = crc32c_update(seed, &inode.to_le_bytes());
+    crc32c_update(checksum, &generation.to_le_bytes())
+}
+
+fn checksum_matches(stored: u32, calculated: u32) -> Result<(), Ext4ImageError> {
+    if stored == calculated {
+        Ok(())
+    } else {
+        Err(Ext4ImageError::ChecksumMismatch)
+    }
 }
 
 fn le_u16(bytes: &[u8], off: usize) -> Result<u16, Ext4ImageError> {
@@ -1513,13 +1801,94 @@ mod image_tests {
     }
 
     #[test]
-    fn ext4_metadata_csum_is_rejected_before_partial_checksum_parsing() {
-        let mut img = tiny_ext4_image();
-        put_u32(
-            &mut img,
-            EXT4_SUPERBLOCK_OFFSET + 100,
-            EXT4_FEATURE_RO_COMPAT_METADATA_CSUM,
+    fn ext4_metadata_csum_profile_validates_every_trusted_metadata_type() {
+        let img = metadata_csum_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount metadata_csum fixture");
+        assert!(fs.superblock().metadata_csum);
+        assert_eq!(
+            fs.read_file(b"/indexed/nested.bin").unwrap(),
+            b"nested indexed payload\n".to_vec()
         );
+        assert_eq!(
+            fs.read_file(b"/depth.bin").unwrap(),
+            b"depth-one data\n".to_vec()
+        );
+        assert_eq!(
+            fs.read_file(b"/external-link").unwrap(),
+            b"nested indexed payload\n".to_vec()
+        );
+        assert_eq!(
+            fs.read_file(b"/double.bin"),
+            Err(Ext4ImageError::UnsupportedLayout)
+        );
+    }
+
+    #[test]
+    fn ext4_metadata_csum_corruption_is_rejected_at_each_read_point() {
+        let mut img = metadata_csum_ext4_image();
+        img[EXT4_SUPERBLOCK_OFFSET + 16] ^= 1;
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::ChecksumMismatch)
+        ));
+
+        let mut img = metadata_csum_ext4_image();
+        img[REALISTIC_BLOCK_SIZE + 12] ^= 1;
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::ChecksumMismatch)
+        ));
+
+        let mut img = metadata_csum_ext4_image();
+        img[realistic_inode_offset(20) + 8] ^= 1;
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount before inode read");
+        assert_eq!(
+            fs.read_file(b"/indexed/nested.bin"),
+            Err(Ext4ImageError::ChecksumMismatch)
+        );
+
+        let mut img = metadata_csum_ext4_image();
+        img[16 * REALISTIC_BLOCK_SIZE + 8] ^= 1;
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount before directory read");
+        assert_eq!(fs.read_dir(b"/"), Err(Ext4ImageError::ChecksumMismatch));
+
+        let mut img = metadata_csum_ext4_image();
+        img[20 * REALISTIC_BLOCK_SIZE + EXT4_DX_ROOT_INFO_OFFSET + 4] ^= 1;
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount before dx read");
+        assert_eq!(
+            fs.lookup_path(b"/indexed/nested.bin"),
+            Err(Ext4ImageError::ChecksumMismatch)
+        );
+
+        let mut img = metadata_csum_ext4_image();
+        img[21 * REALISTIC_BLOCK_SIZE + EXT4_DX_NODE_ENTRIES_OFFSET + 4] ^= 1;
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount before dx-node read");
+        assert_eq!(
+            fs.lookup_path(b"/indexed/nested.bin"),
+            Err(Ext4ImageError::ChecksumMismatch)
+        );
+
+        let mut img = metadata_csum_ext4_image();
+        img[24 * REALISTIC_BLOCK_SIZE + 8] ^= 1;
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount before leaf read");
+        assert_eq!(
+            fs.lookup_path(b"/indexed/nested.bin"),
+            Err(Ext4ImageError::ChecksumMismatch)
+        );
+
+        let mut img = metadata_csum_ext4_image();
+        img[31 * REALISTIC_BLOCK_SIZE + 8] ^= 1;
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount before extent read");
+        assert_eq!(
+            fs.read_file(b"/depth.bin"),
+            Err(Ext4ImageError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn ext4_metadata_csum_requires_crc32c_checksum_type() {
+        let mut img = metadata_csum_ext4_image();
+        img[EXT4_SUPERBLOCK_OFFSET + 373] = 0xff;
         assert!(matches!(
             Ext4Image::mount(img.as_slice()),
             Err(Ext4ImageError::UnsupportedFeature(
@@ -1527,15 +1896,17 @@ mod image_tests {
             ))
         ));
 
-        // A malformed/reserved checksum field does not change the stable policy:
-        // no metadata_csum profile reaches partial metadata validation.
-        img[EXT4_SUPERBLOCK_OFFSET + 373] = 0xff;
-        put_u32(&mut img, EXT4_SUPERBLOCK_OFFSET + 1020, 0xdead_beef);
+        let mut img = metadata_csum_ext4_image();
+        let incompat = le_u32(&img, EXT4_SUPERBLOCK_OFFSET + 96).unwrap();
+        put_u32(
+            &mut img,
+            EXT4_SUPERBLOCK_OFFSET + 96,
+            incompat | EXT4_FEATURE_INCOMPAT_CSUM_SEED,
+        );
         assert!(matches!(
             Ext4Image::mount(img.as_slice()),
-            Err(Ext4ImageError::UnsupportedFeature(
-                EXT4_FEATURE_RO_COMPAT_METADATA_CSUM
-            ))
+            Err(Ext4ImageError::UnsupportedFeature(mask))
+                if mask == EXT4_FEATURE_INCOMPAT_CSUM_SEED
         ));
     }
 
@@ -1867,6 +2238,125 @@ mod image_tests {
 
     fn realistic_external_symlink_target() -> &'static [u8] {
         b"/////////////////////////////////////////////////////////////////indexed/nested.bin"
+    }
+
+    fn metadata_csum_ext4_image() -> alloc::vec::Vec<u8> {
+        let mut img = mkfs_style_ext4_image();
+        let sb = EXT4_SUPERBLOCK_OFFSET;
+        let ro = le_u32(&img, sb + 100).unwrap() | EXT4_FEATURE_RO_COMPAT_METADATA_CSUM;
+        put_u32(&mut img, sb + 100, ro);
+        img[sb + 104..sb + 120].copy_from_slice(b"YARM-ext4-csum!!");
+        img[sb + 373] = EXT4_CHECKSUM_TYPE_CRC32C;
+        let seed = crc32c_update(!0, &img[sb + 104..sb + 120]);
+
+        // Linear directory leaves reserve the final 12-byte checksum dirent.
+        put_u16(
+            &mut img,
+            16 * REALISTIC_BLOCK_SIZE + 132 + 4,
+            (REALISTIC_BLOCK_SIZE - 132 - EXT4_DIR_TAIL_SIZE) as u16,
+        );
+        set_directory_tail(&mut img, 16, 2, seed);
+        for block in 23..27 {
+            put_u16(
+                &mut img,
+                block * REALISTIC_BLOCK_SIZE + 4,
+                (REALISTIC_BLOCK_SIZE - EXT4_DIR_TAIL_SIZE) as u16,
+            );
+            set_directory_tail(&mut img, block, 12, seed);
+        }
+
+        set_dx_tail(&mut img, 20, 12, EXT4_DX_ROOT_ENTRIES_OFFSET, seed);
+        set_dx_tail(&mut img, 21, 12, EXT4_DX_NODE_ENTRIES_OFFSET, seed);
+        set_dx_tail(&mut img, 22, 12, EXT4_DX_NODE_ENTRIES_OFFSET, seed);
+        set_extent_tail(&mut img, 31, 14, seed);
+
+        for inode in [2, 12, 13, 14, 18, 19, 20] {
+            set_inode_checksum(&mut img, inode, seed);
+        }
+        for group in 0..2 {
+            set_group_descriptor_checksum(&mut img, group, seed);
+        }
+        put_u32(&mut img, sb + EXT4_SUPERBLOCK_CHECKSUM_OFFSET, 0);
+        let checksum = crc32c_update(!0, &img[sb..sb + EXT4_SUPERBLOCK_CHECKSUM_OFFSET]);
+        put_u32(&mut img, sb + EXT4_SUPERBLOCK_CHECKSUM_OFFSET, checksum);
+        img
+    }
+
+    fn set_group_descriptor_checksum(img: &mut [u8], group: u32, seed: u32) {
+        let off = REALISTIC_BLOCK_SIZE + group as usize * 64;
+        put_u16(img, off + 30, 0);
+        let descriptor = &img[off..off + 64];
+        let mut checksum = crc32c_update(seed, &group.to_le_bytes());
+        checksum = crc32c_update(checksum, &descriptor[..30]);
+        checksum = crc32c_update(checksum, &[0, 0]);
+        checksum = crc32c_update(checksum, &descriptor[32..]);
+        put_u16(img, off + 30, checksum as u16);
+    }
+
+    fn set_inode_checksum(img: &mut [u8], inode: u32, seed: u32) {
+        let off = realistic_inode_offset(inode);
+        put_u16(img, off + EXT4_INODE_EXTRA_ISIZE_OFFSET, 32);
+        put_u16(img, off + EXT4_INODE_CHECKSUM_LO_OFFSET, 0);
+        put_u16(img, off + EXT4_INODE_CHECKSUM_HI_OFFSET, 0);
+        let raw = &img[off..off + 256];
+        let generation = le_u32(raw, 100).unwrap();
+        let mut checksum = metadata_checksum_prefix(seed, inode, generation);
+        checksum = crc32c_update(checksum, &raw[..EXT4_INODE_CHECKSUM_LO_OFFSET]);
+        checksum = crc32c_update(checksum, &[0, 0]);
+        checksum = crc32c_update(
+            checksum,
+            &raw[EXT4_INODE_CHECKSUM_LO_OFFSET + 2..EXT4_INODE_CHECKSUM_HI_OFFSET],
+        );
+        checksum = crc32c_update(checksum, &[0, 0]);
+        checksum = crc32c_update(checksum, &raw[EXT4_INODE_CHECKSUM_HI_OFFSET + 2..]);
+        put_u16(img, off + EXT4_INODE_CHECKSUM_LO_OFFSET, checksum as u16);
+        put_u16(
+            img,
+            off + EXT4_INODE_CHECKSUM_HI_OFFSET,
+            (checksum >> 16) as u16,
+        );
+    }
+
+    fn set_directory_tail(img: &mut [u8], block: usize, inode: u32, seed: u32) {
+        let off = block * REALISTIC_BLOCK_SIZE;
+        let tail = off + REALISTIC_BLOCK_SIZE - EXT4_DIR_TAIL_SIZE;
+        put_u32(img, tail, 0);
+        put_u16(img, tail + 4, EXT4_DIR_TAIL_SIZE as u16);
+        img[tail + 6] = 0;
+        img[tail + 7] = 0xde;
+        put_u32(img, tail + 8, 0);
+        let generation = 0;
+        let mut checksum = metadata_checksum_prefix(seed, inode, generation);
+        checksum = crc32c_update(checksum, &img[off..tail]);
+        put_u32(img, tail + 8, checksum);
+    }
+
+    fn set_dx_tail(img: &mut [u8], block: usize, inode: u32, entries_offset: usize, seed: u32) {
+        let off = block * REALISTIC_BLOCK_SIZE;
+        put_u16(
+            img,
+            off + entries_offset,
+            ((REALISTIC_BLOCK_SIZE - entries_offset - EXT4_DX_TAIL_SIZE) / 8) as u16,
+        );
+        let count = le_u16(img, off + entries_offset + 2).unwrap() as usize;
+        let used_end = off + entries_offset + count * 8;
+        let tail = off + REALISTIC_BLOCK_SIZE - EXT4_DX_TAIL_SIZE;
+        put_u32(img, tail, 0);
+        put_u32(img, tail + 4, 0);
+        let mut checksum = metadata_checksum_prefix(seed, inode, 0);
+        checksum = crc32c_update(checksum, &img[off..used_end]);
+        checksum = crc32c_update(checksum, &[0; EXT4_DX_TAIL_SIZE]);
+        put_u32(img, tail + 4, checksum);
+    }
+
+    fn set_extent_tail(img: &mut [u8], block: usize, inode: u32, seed: u32) {
+        let off = block * REALISTIC_BLOCK_SIZE;
+        let max = le_u16(img, off + 4).unwrap() as usize;
+        let tail = off + 12 + max * 12;
+        put_u32(img, tail, 0);
+        let mut checksum = metadata_checksum_prefix(seed, inode, 0);
+        checksum = crc32c_update(checksum, &img[off..tail]);
+        put_u32(img, tail, checksum);
     }
 
     fn mkfs_style_ext4_image() -> alloc::vec::Vec<u8> {
