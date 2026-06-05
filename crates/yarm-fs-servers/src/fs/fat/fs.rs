@@ -124,11 +124,12 @@ impl BlockDevice for MemBlockDevice {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcBlockDevice {
     pub device_id: u64,
     pub send_cap: u32,
     pub reply_recv_cap: u32,
+    next_write_request_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +227,107 @@ impl BlockDevice for IpcBlockDevice {
         }
         Ok(())
     }
+
+    fn write_exact_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FatError> {
+        use yarm_ipc_abi::block_abi::BLK_SECTOR_SIZE;
+
+        let sector_size = BLK_SECTOR_SIZE as usize;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if offset % u64::from(BLK_SECTOR_SIZE) != 0 || bytes.len() % sector_size != 0 {
+            return Err(FatError::Unsupported);
+        }
+        for (index, sector) in bytes.chunks_exact(sector_size).enumerate() {
+            let lba = offset / u64::from(BLK_SECTOR_SIZE)
+                + u64::try_from(index).map_err(|_| FatError::Io)?;
+            let sector: &[u8; 512] = sector.try_into().map_err(|_| FatError::Io)?;
+            self.write_sector(lba, sector)?;
+        }
+        Ok(())
+    }
+}
+
+impl IpcBlockDevice {
+    fn allocate_write_request_id(&mut self) -> u32 {
+        let request_id = self.next_write_request_id.max(1);
+        self.next_write_request_id = request_id.wrapping_add(1).max(1);
+        request_id
+    }
+
+    fn write_sector(&mut self, lba: u64, sector: &[u8; 512]) -> Result<(), FatError> {
+        use yarm_ipc_abi::block_abi::{BlkWriteReply, BLK_OP_WRITE};
+        use yarm_user_rt::ipc::Message;
+
+        let device_id = self.device_id;
+        let send_cap = self.send_cap;
+        let reply_recv_cap = self.reply_recv_cap;
+        let request_id = self.allocate_write_request_id();
+        send_sector_write_chunks(device_id, request_id, lba, sector, |request| {
+            let payload = request.encode().map_err(|_| FatError::Unsupported)?;
+            let msg = Message::with_header(0, BLK_OP_WRITE, 0, None, &payload)
+                .map_err(|_| FatError::Io)?;
+            unsafe { yarm_user_rt::syscall::ipc_call(send_cap, reply_recv_cap, &msg) }
+                .map_err(|_| FatError::Io)?;
+            let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) }
+                .map_err(|_| FatError::Io)?
+                .ok_or(FatError::Io)?;
+            BlkWriteReply::decode(reply.as_slice()).ok_or(FatError::Io)
+        })
+    }
+}
+
+fn send_sector_write_chunks<F>(
+    device_id: u64,
+    request_id: u32,
+    lba: u64,
+    sector: &[u8; 512],
+    mut exchange: F,
+) -> Result<(), FatError>
+where
+    F: FnMut(
+        &yarm_ipc_abi::block_abi::BlkWriteRequest,
+    ) -> Result<yarm_ipc_abi::block_abi::BlkWriteReply, FatError>,
+{
+    use yarm_ipc_abi::block_abi::{
+        BlkStatus, BlkWriteRequest, BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST, BLK_WRITE_MAX_CHUNK_BYTES,
+    };
+
+    let mut offset = 0usize;
+    while offset < sector.len() {
+        let len = core::cmp::min(BLK_WRITE_MAX_CHUNK_BYTES, sector.len() - offset);
+        let mut data = [0u8; BLK_WRITE_MAX_CHUNK_BYTES];
+        data[..len].copy_from_slice(&sector[offset..offset + len]);
+        let mut flags = 0;
+        if offset == 0 {
+            flags |= BLK_WRITE_F_FIRST;
+        }
+        if offset + len == sector.len() {
+            flags |= BLK_WRITE_F_LAST;
+        }
+        let request = BlkWriteRequest {
+            request_id,
+            flags,
+            device_id,
+            lba,
+            sector_offset: offset as u32,
+            data_len: len as u32,
+            data,
+        };
+        request.validate().map_err(|_| FatError::Unsupported)?;
+        let reply = exchange(&request)?;
+        let committed = u32::from(offset + len == sector.len());
+        if reply.request_id != request_id
+            || reply.status != BlkStatus::Success
+            || reply.bytes_accepted != len as u32
+            || reply.sector_committed != committed
+            || reply.lba != lba
+        {
+            return Err(FatError::Io);
+        }
+        offset += len;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1062,6 +1164,7 @@ impl FatBackend {
                 device_id,
                 send_cap,
                 reply_recv_cap,
+                next_write_request_id: 1,
             }))?,
             entries: Vec::new(),
             open_fds: [None; MAX_OPEN_FDS],
@@ -1073,6 +1176,12 @@ impl FatBackend {
     }
     pub const fn backend_kind(&self) -> FatBackendKind {
         self.fs.device.kind()
+    }
+    pub fn memory_image(&self) -> Option<&[u8]> {
+        match &self.fs.device {
+            FatBlockDevice::Mem(device) => Some(device.as_bytes()),
+            FatBlockDevice::Ipc(_) => None,
+        }
     }
     pub fn lookup_entry(&self, path: &[u8]) -> Result<DirEntryInfo, FatError> {
         self.fs.lookup(path)
@@ -1288,6 +1397,77 @@ mod tests {
         let mut out = [0u8; 6];
         dev.read_exact_at(512, &mut out).unwrap();
         assert_eq!(&out, b"sector");
+    }
+
+    #[test]
+    fn ipc_block_write_rejects_unaligned_or_partial_sectors() {
+        let mut device = IpcBlockDevice {
+            device_id: 7,
+            send_cap: 8,
+            reply_recv_cap: 9,
+            next_write_request_id: 1,
+        };
+        assert_eq!(
+            device.write_exact_at(1, &[0u8; 512]),
+            Err(FatError::Unsupported)
+        );
+        assert_eq!(
+            device.write_exact_at(0, &[0u8; 511]),
+            Err(FatError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn ipc_sector_write_emits_valid_fs12_chunks() {
+        use yarm_ipc_abi::block_abi::{
+            BlkStatus, BlkWriteReply, BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST,
+        };
+
+        let mut sector = [0u8; 512];
+        for (index, byte) in sector.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut observed = Vec::new();
+        send_sector_write_chunks(7, 41, 9, &sector, |request| {
+            observed.push(*request);
+            Ok(BlkWriteReply {
+                request_id: request.request_id,
+                status: BlkStatus::Success,
+                bytes_accepted: request.data_len,
+                sector_committed: u32::from(request.flags & BLK_WRITE_F_LAST != 0),
+                lba: request.lba,
+            })
+        })
+        .expect("write chunks");
+
+        assert_eq!(observed.len(), 6);
+        assert_ne!(observed[0].flags & BLK_WRITE_F_FIRST, 0);
+        assert_ne!(observed.last().unwrap().flags & BLK_WRITE_F_LAST, 0);
+        let mut rebuilt = [0u8; 512];
+        for request in observed {
+            let start = request.sector_offset as usize;
+            rebuilt[start..start + request.data_len as usize].copy_from_slice(request.chunk());
+        }
+        assert_eq!(rebuilt, sector);
+    }
+
+    #[test]
+    fn ipc_sector_write_rejects_inconsistent_backend_reply() {
+        use yarm_ipc_abi::block_abi::{BlkStatus, BlkWriteReply};
+
+        let sector = [0x5au8; 512];
+        assert_eq!(
+            send_sector_write_chunks(7, 41, 9, &sector, |request| {
+                Ok(BlkWriteReply {
+                    request_id: request.request_id,
+                    status: BlkStatus::Success,
+                    bytes_accepted: request.data_len.saturating_sub(1),
+                    sector_committed: 0,
+                    lba: request.lba,
+                })
+            }),
+            Err(FatError::Io)
+        );
     }
 
     #[test]

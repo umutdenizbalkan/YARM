@@ -491,9 +491,24 @@ implementation must prove concurrent first-winner cleanup, stale-handle rejectio
 cleanup, partial completion accounting, and fallback only after unmap/release. RAMFS must be the first
 gated backend; FAT production writes and ext4 writes remain out of scope until that experiment passes.
 
+## FS-20 bounded FAT inline-write route
+
+FS-20 does not resume live shared-memory work. It adds a separate, bounded FAT-only route for
+`VFS_OP_WRITE_INLINE = 28`: one request carries 1–96 exact bytes and uses current-offset semantics.
+The FAT IPC block adapter now has a validated whole-sector chunked `BLK_OP_WRITE` client, but the
+FAT-only inline route remains gated to memory images because the current inline block-read ABI cannot
+return a complete sector for required read-modify-write. The generic `VfsService` still rejects opcode 28, while opcodes
+26 (`READ_SHARED_REPLY`) and 27 (`WRITE_SHARED_REQUEST`) remain unsupported everywhere in live
+service dispatch. Larger writes still need explicit inline fragmentation or a future, separately
+reviewed shared-region ABI.
+
+This route does not make `VFS_SHARED_IO_ENABLED` true, does not advertise shared-I/O capabilities,
+and does not change RAMFS or read-only ext4 behavior.
+
 ## Explicit non-changes
 
-FS-19 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
-init/PM/supervisor/driver-manager policy, runtime service spawn order, FAT production writes, ext4
-writes, the FS-12 block stack, or the ext4 FS-10 read-side matrix. Kernel/global-lock work is
-untouched. No QEMU smoke is required because no runtime behavior is enabled.
+FS-20 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
+init/PM/supervisor/driver-manager policy, runtime service spawn order, ext4 writes, or the ext4 FS-10
+read-side matrix. It does not enable IPC-backed FAT file mutation: only the FAT memory-image inline
+route and a standalone whole-sector FS-12 client are added. Kernel/global-lock work is untouched. No
+QEMU smoke is required because default production/shared-I/O behavior is unchanged.
