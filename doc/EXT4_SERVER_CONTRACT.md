@@ -29,9 +29,9 @@ The image reader supports a deliberately bounded read-only profile:
 - legacy direct, singly indirect, and doubly indirect block maps with sparse-hole zero fill;
 - ordinary directory parsing with block-local, aligned `rec_len` and bounded `name_len` checks;
 - indexed-directory lookup and enumeration through dx roots and up to two `dx_node` levels;
-- signed/unsigned legacy-hash routing, collision-adjacent candidate scans, and exact final name
-  verification;
-- validated exhaustive leaf fallback for half-MD4, TEA, SipHash, and unknown hash versions;
+- native signed/unsigned legacy, half-MD4, and TEA htree hashes using the superblock hash seed;
+- hash-aware dx subtree selection, collision-continuation leaf scans, and exact final name verification;
+- validated exhaustive leaf fallback for SipHash and unknown hash versions;
 - root-relative nested path lookup, inline/external symlink reads, and bounded symlink traversal.
 
 All reads use checked integer, block, image, inode-table, extent, indirect-pointer, htree logical
@@ -58,9 +58,17 @@ The fixture exercises:
   directory-record rejection;
 - a fully checksummed `metadata_csum` variant plus `bigalloc` and `inline_data` rejection.
 
-Development-only probes confirmed that the parser mounts and reads files from real `mke2fs`
-images both with the common UUID-seeded `metadata_csum` profile and with `metadata_csum` disabled.
-External tools are intentionally not part of the default test suite.
+An ignored development-only integration probe generates a 32 MiB `mke2fs` image in the system
+temporary directory, creates 600 files, runs `e2fsck -D` to build a real indexed directory, and
+verifies hash-routed lookup plus unique enumeration for both UUID-derived and stored
+`metadata_csum_seed` profiles. The probe skips gracefully when e2fsprogs tools are unavailable,
+commits no image, and is not run by default. Run it explicitly with:
+
+```sh
+cargo test -p yarm-fs-servers --test ext4_real_image_probe -- --ignored --nocapture
+```
+
+It requires `mke2fs`, `debugfs`, `e2fsck`, and `tune2fs`.
 
 ## Feature and metadata-checksum policy
 
@@ -104,6 +112,23 @@ Any mismatch returns `ChecksumMismatch`. Malformed or absent checksum tails retu
 Checksum validation is performed at the read point, not merely at mount, so later inode, directory,
 dx, and external extent reads cannot introduce unchecked metadata.
 
+### Htree hash routing
+
+The reader implements ext4 hash versions `0` through `5`: signed legacy, signed half-MD4, signed
+TEA, unsigned legacy, unsigned half-MD4, and unsigned TEA. Half-MD4 and TEA use the four-word
+`s_hash_seed`; an all-zero seed selects the ext4/e2fsprogs default MD4 initialization words. Input
+bytes use the version-specific signed or unsigned interpretation, chunk padding matches
+`str2hashbuf`, and the resulting major hash is normalized to an even 31-bit htree key.
+
+Lookup selects the last dx range whose raw stored hash is not greater than the target. A following dx
+entry with its low collision bit set is scanned as a continuation leaf/subtree; the raw comparison is
+intentional so `target|1` does not replace the primary `target` range. Every candidate still requires
+an exact final dirent name match. Malformed hash ordering remains rejected by dx parsing.
+
+SipHash (`6`) needs encrypted-directory key material that this reader does not possess. SipHash and
+unknown versions therefore retain validated exhaustive indexed-leaf traversal rather than false
+hash routing. Enumeration remains exhaustive by design and is unaffected by hash-version support.
+
 ### Accepted and rejected metadata_csum profiles
 
 `metadata_csum` mounts are accepted for extent-backed regular files, directories, and external
@@ -124,7 +149,7 @@ extended-attribute blocks are not validated because the read-only parser does no
 
 The reader still does not implement:
 
-- native half-MD4, TEA, or SipHash htree hash calculation (validated exhaustive fallback is used);
+- SipHash routing for encrypted directories (validated exhaustive fallback is used);
 - htree depths greater than two `dx_node` levels;
 - triple-indirect legacy block maps;
 - metadata-checksummed legacy indirect pointer blocks, `bigalloc`, `inline_data`, encryption,
@@ -147,6 +172,8 @@ The ext4 suite covers the mkfs-style profile above plus the smaller parser fixtu
 - superblock, feature-mask, block-size, descriptor, inode-table, and 64bit high-field handling;
 - depth-0/depth-1 extents, sparse holes, unwritten extents, overlap rejection, and bad pointers;
 - direct, singly indirect, doubly indirect, sparse indirect, and triple-indirect rejection paths;
+- legacy/half-MD4/TEA signed and unsigned hash vectors, hash-routed lookup, collision continuation,
+  unsupported-version fallback, and hash-order rejection;
 - linear directory enumeration plus indexed lookup/enumeration through two dx-node levels,
   deterministic de-duplication, malformed counts, invalid leaves, and checksum corruption;
 - inline/external symlinks, nested path resolution, and symlink-loop bounds;

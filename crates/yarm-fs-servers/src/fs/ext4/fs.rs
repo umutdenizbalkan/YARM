@@ -1368,21 +1368,16 @@ fn dx_candidates(entries: &[(u32, u32)], hash: Option<u32>) -> alloc::vec::Vec<u
     let target = hash & !1;
     let mut selected = 0usize;
     for idx in 1..entries.len() {
-        if (entries[idx].0 & !1) > target {
+        // Compare the raw stored hash. A continuation entry uses target|1 and
+        // must remain after the primary target range rather than replacing it.
+        if entries[idx].0 > target {
             break;
         }
         selected = idx;
     }
-    let mut first = selected;
-    while first > 0 && (entries[first].0 & !1) == (entries[first - 1].0 & !1) {
-        first -= 1;
-    }
-    let mut out = alloc::vec::Vec::new();
-    let mut idx = first;
-    while idx < entries.len() {
-        if idx > selected && (entries[idx].0 & 1) == 0 {
-            break;
-        }
+    let mut out = alloc::vec![selected];
+    let mut idx = selected + 1;
+    while idx < entries.len() && (entries[idx].0 & 1) != 0 {
         out.push(idx);
         idx += 1;
     }
@@ -1416,14 +1411,39 @@ fn validate_dx_node_header(block: &[u8], block_size: usize) -> Result<(), Ext4Im
     Ok(())
 }
 
-fn ext4_dir_hash(version: u8, name: &[u8], _seed: [u32; 4]) -> Option<u32> {
+fn ext4_dir_hash(version: u8, name: &[u8], seed: [u32; 4]) -> Option<u32> {
+    let mut state = if seed.iter().any(|word| *word != 0) {
+        seed
+    } else {
+        [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476]
+    };
     let hash = match version {
         0 => legacy_dir_hash(name, true),
+        1 | 4 => {
+            let signed = version == 1;
+            let mut offset = 0usize;
+            while offset < name.len() {
+                let input = str2hashbuf(&name[offset..], name.len() - offset, 8, signed);
+                half_md4_transform(&mut state, &input);
+                offset += 32;
+            }
+            state[1]
+        }
+        2 | 5 => {
+            let signed = version == 2;
+            let mut offset = 0usize;
+            while offset < name.len() {
+                let input = str2hashbuf(&name[offset..], name.len() - offset, 4, signed);
+                tea_transform(&mut state, &input);
+                offset += 16;
+            }
+            state[0]
+        }
         3 => legacy_dir_hash(name, false),
-        // Half-MD4, TEA, and SipHash remain safely searchable by validated
-        // exhaustive leaf traversal; returning None prevents false routing.
-        1 | 2 | 4 | 5 | 6 => return None,
-        _ => return None,
+        // SipHash requires the encrypted-directory key and therefore cannot be
+        // reproduced from the on-disk hash seed alone. Unknown versions retain
+        // the validated exhaustive-leaf fallback.
+        6 | _ => return None,
     };
     let hash = hash & !1;
     Some(if hash == 0xffff_fffe {
@@ -1437,11 +1457,7 @@ fn legacy_dir_hash(name: &[u8], signed: bool) -> u32 {
     let mut hash0 = 0x12a3_fe2du32;
     let mut hash1 = 0x37ab_e8f9u32;
     for byte in name {
-        let value = if signed {
-            i32::from(*byte as i8) as u32
-        } else {
-            u32::from(*byte)
-        };
+        let value = hash_byte(*byte, signed);
         let mut hash = hash1.wrapping_add(hash0 ^ value.wrapping_mul(7_152_373));
         if hash & 0x8000_0000 != 0 {
             hash = hash.wrapping_sub(0x7fff_ffff);
@@ -1450,6 +1466,118 @@ fn legacy_dir_hash(name: &[u8], signed: bool) -> u32 {
         hash0 = hash;
     }
     hash0 << 1
+}
+
+fn hash_byte(byte: u8, signed: bool) -> u32 {
+    if signed {
+        i32::from(byte as i8) as u32
+    } else {
+        u32::from(byte)
+    }
+}
+
+fn str2hashbuf(message: &[u8], remaining_len: usize, words: usize, signed: bool) -> [u32; 8] {
+    let len = remaining_len;
+    let mut output = [0u32; 8];
+    let mut pad = len as u32 | ((len as u32) << 8);
+    pad |= pad << 16;
+    output[..words].fill(pad);
+
+    let mut value = pad;
+    let capped = core::cmp::min(len, words * 4);
+    let mut word = 0usize;
+    for (idx, byte) in message
+        .get(..capped)
+        .unwrap_or(message)
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        value = hash_byte(byte, signed).wrapping_add(value << 8);
+        if idx % 4 == 3 {
+            output[word] = value;
+            word += 1;
+            value = pad;
+        }
+    }
+    if capped % 4 != 0 && word < words {
+        output[word] = value;
+    }
+    output
+}
+
+fn tea_transform(state: &mut [u32; 4], input: &[u32; 8]) {
+    let mut sum = 0u32;
+    let mut b0 = state[0];
+    let mut b1 = state[1];
+    for _ in 0..16 {
+        sum = sum.wrapping_add(0x9e37_79b9);
+        b0 = b0.wrapping_add(
+            ((b1 << 4).wrapping_add(input[0]))
+                ^ b1.wrapping_add(sum)
+                ^ ((b1 >> 5).wrapping_add(input[1])),
+        );
+        b1 = b1.wrapping_add(
+            ((b0 << 4).wrapping_add(input[2]))
+                ^ b0.wrapping_add(sum)
+                ^ ((b0 >> 5).wrapping_add(input[3])),
+        );
+    }
+    state[0] = state[0].wrapping_add(b0);
+    state[1] = state[1].wrapping_add(b1);
+}
+
+fn half_md4_transform(state: &mut [u32; 4], input: &[u32; 8]) {
+    let mut a = state[0];
+    let mut b = state[1];
+    let mut c = state[2];
+    let mut d = state[3];
+
+    macro_rules! round {
+        ($func:expr, $target:ident, $x:ident, $y:ident, $z:ident, $word:expr, $shift:expr) => {{
+            $target = $target
+                .wrapping_add($func($x, $y, $z))
+                .wrapping_add($word)
+                .rotate_left($shift);
+        }};
+    }
+    let f = |x: u32, y: u32, z: u32| z ^ (x & (y ^ z));
+    let g = |x: u32, y: u32, z: u32| (x & y).wrapping_add((x ^ y) & z);
+    let h = |x: u32, y: u32, z: u32| x ^ y ^ z;
+
+    round!(f, a, b, c, d, input[0], 3);
+    round!(f, d, a, b, c, input[1], 7);
+    round!(f, c, d, a, b, input[2], 11);
+    round!(f, b, c, d, a, input[3], 19);
+    round!(f, a, b, c, d, input[4], 3);
+    round!(f, d, a, b, c, input[5], 7);
+    round!(f, c, d, a, b, input[6], 11);
+    round!(f, b, c, d, a, input[7], 19);
+
+    const K2: u32 = 0x5a82_7999;
+    round!(g, a, b, c, d, input[1].wrapping_add(K2), 3);
+    round!(g, d, a, b, c, input[3].wrapping_add(K2), 5);
+    round!(g, c, d, a, b, input[5].wrapping_add(K2), 9);
+    round!(g, b, c, d, a, input[7].wrapping_add(K2), 13);
+    round!(g, a, b, c, d, input[0].wrapping_add(K2), 3);
+    round!(g, d, a, b, c, input[2].wrapping_add(K2), 5);
+    round!(g, c, d, a, b, input[4].wrapping_add(K2), 9);
+    round!(g, b, c, d, a, input[6].wrapping_add(K2), 13);
+
+    const K3: u32 = 0x6ed9_eba1;
+    round!(h, a, b, c, d, input[3].wrapping_add(K3), 3);
+    round!(h, d, a, b, c, input[7].wrapping_add(K3), 9);
+    round!(h, c, d, a, b, input[2].wrapping_add(K3), 11);
+    round!(h, b, c, d, a, input[6].wrapping_add(K3), 15);
+    round!(h, a, b, c, d, input[1].wrapping_add(K3), 3);
+    round!(h, d, a, b, c, input[5].wrapping_add(K3), 9);
+    round!(h, c, d, a, b, input[0].wrapping_add(K3), 11);
+    round!(h, b, c, d, a, input[4].wrapping_add(K3), 15);
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
 }
 
 fn extent_header_depth(raw: &[u8]) -> Result<u16, Ext4ImageError> {
@@ -2015,7 +2143,7 @@ mod image_tests {
         );
 
         let mut img = metadata_csum_ext4_image();
-        img[24 * REALISTIC_BLOCK_SIZE + 8] ^= 1;
+        img[23 * REALISTIC_BLOCK_SIZE + 8] ^= 1;
         let fs = Ext4Image::mount(img.as_slice()).expect("mount before leaf read");
         assert_eq!(
             fs.lookup_path(b"/indexed/nested.bin"),
@@ -2092,7 +2220,7 @@ mod image_tests {
                 .read_dir(b"/indexed")
                 .expect("enumerate indexed directory");
             let names: alloc::vec::Vec<&[u8]> = entries.iter().map(Ext4DirEntry::name).collect();
-            assert_eq!(names, [b".".as_slice(), b"..", b"other.bin", b"nested.bin"]);
+            assert_eq!(names, [b".".as_slice(), b"..", b"nested.bin", b"other.bin"]);
             for (idx, entry) in entries.iter().enumerate() {
                 assert!(!entries[..idx]
                     .iter()
@@ -2244,6 +2372,90 @@ mod image_tests {
     }
 
     #[test]
+    fn ext4_native_htree_hashes_match_e2fsprogs_vectors() {
+        let zero_seed = [0u32; 4];
+        assert_eq!(
+            ext4_dir_hash(0, b"target.bin", zero_seed),
+            Some(0x318e_a834)
+        );
+        assert_eq!(
+            ext4_dir_hash(1, b"target.bin", zero_seed),
+            Some(0x811f_3776)
+        );
+        assert_eq!(
+            ext4_dir_hash(2, b"target.bin", zero_seed),
+            Some(0xc8ef_3d6c)
+        );
+        assert_eq!(
+            ext4_dir_hash(3, b"target.bin", zero_seed),
+            Some(0x318e_a834)
+        );
+        assert_eq!(
+            ext4_dir_hash(4, b"target.bin", zero_seed),
+            Some(0x811f_3776)
+        );
+        assert_eq!(
+            ext4_dir_hash(5, b"target.bin", zero_seed),
+            Some(0xc8ef_3d6c)
+        );
+        assert_eq!(ext4_dir_hash(6, b"target.bin", zero_seed), None);
+        assert_eq!(ext4_dir_hash(0xff, b"target.bin", zero_seed), None);
+
+        let seed = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+        assert_eq!(ext4_dir_hash(1, b"target.bin", seed), Some(0x811f_3776));
+        assert_eq!(ext4_dir_hash(2, b"target.bin", seed), Some(0xc8ef_3d6c));
+
+        let long = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        assert_eq!(ext4_dir_hash(1, long, zero_seed), Some(0x9f6d_c676));
+        assert_eq!(ext4_dir_hash(2, long, zero_seed), Some(0xca7d_fe38));
+        assert_eq!(ext4_dir_hash(4, long, zero_seed), Some(0x9f6d_c676));
+        assert_eq!(ext4_dir_hash(5, long, zero_seed), Some(0xca7d_fe38));
+    }
+
+    #[test]
+    fn ext4_native_hash_versions_route_to_selected_leaf() {
+        for version in 0..=5 {
+            let mut img = tiny_ext4_image();
+            put_u32(&mut img, 5 * 1024 + 21 * 128 + 4, 3 * 1024);
+            put_u16(&mut img, 5 * 1024 + 21 * 128 + 56, 3);
+            img[35 * 1024 + EXT4_DX_ROOT_INFO_OFFSET + 4] = version;
+            let hash = ext4_dir_hash(version, b"target.bin", [0; 4]).unwrap();
+            put_u16(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 2, 2);
+            put_u32(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 8, hash);
+            put_u32(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 12, 2);
+            img[36 * 1024..37 * 1024].fill(0);
+            put_u16(&mut img, 36 * 1024 + 4, 1024);
+            write_dirent(&mut img[37 * 1024..38 * 1024], 23, b"target.bin", 1, 1024);
+            let fs = Ext4Image::mount(img.as_slice()).expect("mount routed htree fixture");
+            assert_eq!(fs.lookup_path(b"/indexed/target.bin"), Ok(23));
+            assert_eq!(
+                fs.lookup_path(b"/indexed/missing.bin"),
+                Err(Ext4ImageError::NotFound)
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_htree_collision_continuation_scans_adjacent_leaf() {
+        let mut img = tiny_ext4_image();
+        put_u32(&mut img, 5 * 1024 + 21 * 128 + 4, 3 * 1024);
+        put_u16(&mut img, 5 * 1024 + 21 * 128 + 56, 3);
+        let hash = ext4_dir_hash(0, b"target.bin", [0; 4]).unwrap();
+        put_u16(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 2, 2);
+        put_u32(
+            &mut img,
+            35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 8,
+            hash | 1,
+        );
+        put_u32(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 12, 2);
+        img[36 * 1024..37 * 1024].fill(0);
+        put_u16(&mut img, 36 * 1024 + 4, 1024);
+        write_dirent(&mut img[37 * 1024..38 * 1024], 23, b"target.bin", 1, 1024);
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount collision fixture");
+        assert_eq!(fs.lookup_path(b"/indexed/target.bin"), Ok(23));
+    }
+
+    #[test]
     fn ext4_htree_indexed_directory_lookup_uses_index_leaf_scan() {
         let img = tiny_ext4_image();
         let fs = Ext4Image::mount(img.as_slice()).expect("mount");
@@ -2259,7 +2471,7 @@ mod image_tests {
     }
 
     #[test]
-    fn ext4_htree_legacy_hash_selects_leaf_and_unsupported_hash_falls_back() {
+    fn ext4_htree_legacy_hash_selects_leaf_and_siphash_falls_back() {
         let mut img = tiny_ext4_image();
         put_u32(&mut img, 5 * 1024 + 21 * 128 + 4, 3 * 1024);
         put_u16(&mut img, 5 * 1024 + 21 * 128 + 56, 3);
@@ -2273,9 +2485,34 @@ mod image_tests {
         let fs = Ext4Image::mount(img.as_slice()).expect("mount");
         assert_eq!(fs.lookup_path(b"/indexed/target.bin"), Ok(23));
 
-        img[35 * 1024 + EXT4_DX_ROOT_INFO_OFFSET + 4] = 2;
+        img[35 * 1024 + EXT4_DX_ROOT_INFO_OFFSET + 4] = 6;
         let fs = Ext4Image::mount(img.as_slice()).expect("mount");
         assert_eq!(fs.lookup_path(b"/indexed/target.bin"), Ok(23));
+    }
+
+    #[test]
+    fn ext4_htree_hash_order_violation_is_rejected() {
+        let mut img = tiny_ext4_image();
+        put_u32(&mut img, 5 * 1024 + 21 * 128 + 4, 3 * 1024);
+        put_u16(&mut img, 5 * 1024 + 21 * 128 + 56, 3);
+        put_u16(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 2, 3);
+        put_u32(
+            &mut img,
+            35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 8,
+            0x8000_0000,
+        );
+        put_u32(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 12, 2);
+        put_u32(
+            &mut img,
+            35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 16,
+            0x4000_0000,
+        );
+        put_u32(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 20, 1);
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount hash-order fixture");
+        assert_eq!(
+            fs.lookup_path(b"/indexed/target.bin"),
+            Err(Ext4ImageError::Malformed)
+        );
     }
 
     #[test]
@@ -2732,19 +2969,19 @@ mod image_tests {
         write_realistic_dx_node(realistic_block_mut(&mut img, 21), &[(0, 2)]);
         write_realistic_dx_node(
             realistic_block_mut(&mut img, 22),
-            &[(0, 3), (0x8000_0000, 4)],
+            &[(0, 3), (0x7000_0000, 4)],
         );
         write_dirent(
             realistic_block_mut(&mut img, 23),
             20,
-            b"other.bin",
+            b"nested.bin",
             1,
             REALISTIC_BLOCK_SIZE as u16,
         );
         write_dirent(
             realistic_block_mut(&mut img, 24),
             20,
-            b"nested.bin",
+            b"other.bin",
             1,
             REALISTIC_BLOCK_SIZE as u16,
         );
