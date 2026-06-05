@@ -6,10 +6,15 @@ use yarm_ipc_abi::vfs_abi::{
     VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
     VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_READ_SHARED_REPLY, VFS_OP_SENDFILE,
     VFS_OP_STATX, VFS_OP_WRITE, VFS_OP_WRITE_INLINE, VFS_OP_WRITE_SHARED_REQUEST,
-    VfsReadSharedRequest, VfsV1Args, VfsWriteInlineReply, VfsWriteInlineRequest,
-    VfsWriteSharedReply, VfsWriteSharedRequest,
+    VFS_SHARED_IO_STATUS_OK, VfsReadSharedReply, VfsReadSharedRequest, VfsV1Args,
+    VfsWriteInlineReply, VfsWriteInlineRequest, VfsWriteSharedReply, VfsWriteSharedRequest,
 };
 use yarm_user_rt::ipc::Message;
+
+#[cfg(test)]
+use yarm_ipc_abi::vfs_abi::{
+    VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsSharedBufferDescriptor,
+};
 
 pub use yarm_srv_common::vfs_core::*;
 
@@ -64,6 +69,116 @@ pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsError> {
     .map_err(|_| VfsError::Malformed)
 }
 
+/// Helper-only decoded READ_SHARED_REPLY plan. It describes future mapping work but does not map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfsReadSharedPlan {
+    request: VfsReadSharedRequest,
+}
+
+impl VfsReadSharedPlan {
+    pub fn decode(opcode: u16, payload: &[u8]) -> Result<Self, VfsError> {
+        if opcode != VFS_OP_READ_SHARED_REPLY {
+            return Err(VfsError::Unsupported);
+        }
+        let request = VfsReadSharedRequest::decode(payload).map_err(|_| VfsError::Malformed)?;
+        Ok(Self { request })
+    }
+
+    pub const fn request(self) -> VfsReadSharedRequest {
+        self.request
+    }
+
+    pub fn completion(self, bytes_read: usize) -> Result<VfsReadSharedReply, VfsError> {
+        let bytes_read = u64::try_from(bytes_read).map_err(|_| VfsError::Malformed)?;
+        if bytes_read > self.request.requested_len {
+            return Err(VfsError::Malformed);
+        }
+        Ok(VfsReadSharedReply {
+            request_id: self.request.request_id,
+            bytes_completed: bytes_read,
+            status: VFS_SHARED_IO_STATUS_OK,
+            flags: 0,
+        })
+    }
+}
+
+/// Borrowed test double for a future shared-object mapping.
+///
+/// This type is test-only: it validates descriptor identity, direction, and actual backing bounds,
+/// but it is not a capability, mapping, revocation, or cleanup implementation.
+#[cfg(test)]
+pub struct VfsSharedIoTestBuffer<'a> {
+    object_handle: u64,
+    object_generation: u64,
+    bytes: &'a mut [u8],
+}
+
+#[cfg(test)]
+impl<'a> VfsSharedIoTestBuffer<'a> {
+    pub fn new(object_handle: u64, object_generation: u64, bytes: &'a mut [u8]) -> Self {
+        Self {
+            object_handle,
+            object_generation,
+            bytes,
+        }
+    }
+
+    fn range(
+        &self,
+        descriptor: VfsSharedBufferDescriptor,
+        requested_len: u64,
+        required_access: u32,
+    ) -> Result<core::ops::Range<usize>, VfsError> {
+        descriptor
+            .validate(required_access, requested_len)
+            .map_err(|_| VfsError::Malformed)?;
+        if descriptor.object_handle != self.object_handle
+            || descriptor.object_generation != self.object_generation
+        {
+            return Err(VfsError::Malformed);
+        }
+        let start = usize::try_from(descriptor.buffer_offset).map_err(|_| VfsError::Malformed)?;
+        let length = usize::try_from(requested_len).map_err(|_| VfsError::Malformed)?;
+        let end = start.checked_add(length).ok_or(VfsError::Malformed)?;
+        if end > self.bytes.len() {
+            return Err(VfsError::Malformed);
+        }
+        Ok(start..end)
+    }
+
+    pub fn write_read_reply(
+        &mut self,
+        request: VfsReadSharedRequest,
+        source: &[u8],
+    ) -> Result<usize, VfsError> {
+        let range = self.range(
+            request.buffer,
+            request.requested_len,
+            VFS_SHARED_BUFFER_FS_WRITE,
+        )?;
+        if source.len() > range.len() {
+            return Err(VfsError::Malformed);
+        }
+        let end = range.start + source.len();
+        self.bytes[range.start..end].copy_from_slice(source);
+        Ok(source.len())
+    }
+
+    pub fn read_write_request(&self, request: VfsWriteSharedRequest) -> Result<&[u8], VfsError> {
+        let range = self.range(
+            request.buffer,
+            request.requested_len,
+            VFS_SHARED_BUFFER_FS_READ,
+        )?;
+        Ok(&self.bytes[range])
+    }
+
+    pub fn read_for_assert(&self, offset: usize, len: usize) -> Result<&[u8], VfsError> {
+        let end = offset.checked_add(len).ok_or(VfsError::Malformed)?;
+        self.bytes.get(offset..end).ok_or(VfsError::Malformed)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsWritePayload<'a> {
     Inline(VfsWriteInlineRequest<'a>),
@@ -107,6 +222,12 @@ pub fn write_inline_message(req: VfsWriteInlineRequest<'_>) -> Result<Message, V
 pub fn write_inline_reply_message(reply: VfsWriteInlineReply) -> Result<Message, VfsError> {
     let payload = reply.encode().map_err(|_| VfsError::Malformed)?;
     Message::with_header(0, VFS_OP_WRITE_INLINE, 0, None, &payload).map_err(|_| VfsError::Malformed)
+}
+
+pub fn read_shared_reply_message(reply: VfsReadSharedReply) -> Result<Message, VfsError> {
+    let payload = reply.encode().map_err(|_| VfsError::Malformed)?;
+    Message::with_header(0, VFS_OP_READ_SHARED_REPLY, 0, None, &payload)
+        .map_err(|_| VfsError::Malformed)
 }
 
 pub fn write_shared_reply_message(reply: VfsWriteSharedReply) -> Result<Message, VfsError> {
@@ -338,6 +459,69 @@ mod shared_io_tests {
         };
         let message = write_inline_reply_message(reply).expect("inline reply");
         assert_eq!(VfsWriteInlineReply::decode(message.as_slice()), Ok(reply));
+    }
+
+    #[test]
+    fn read_shared_plan_completes_and_test_buffer_enforces_direction() {
+        let request = VfsReadSharedRequest {
+            fd: 3,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 91,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(21, 4, 2, 8, VFS_SHARED_BUFFER_FS_WRITE),
+        };
+        let message = read_shared_message(request).expect("shared read message");
+        let plan = VfsReadSharedPlan::decode(message.opcode, message.as_slice()).expect("plan");
+        assert_eq!(plan.request(), request);
+
+        let mut storage = [0u8; 16];
+        let mut buffer = VfsSharedIoTestBuffer::new(21, 4, &mut storage);
+        assert_eq!(buffer.write_read_reply(request, b"read"), Ok(4));
+        assert_eq!(buffer.read_for_assert(2, 4), Ok(b"read".as_slice()));
+
+        let reply = plan.completion(4).expect("completion");
+        let message = read_shared_reply_message(reply).expect("reply message");
+        assert_eq!(VfsReadSharedReply::decode(message.as_slice()), Ok(reply));
+        assert_eq!(plan.completion(9), Err(VfsError::Malformed));
+
+        let mut wrong = request;
+        wrong.buffer.access = VFS_SHARED_BUFFER_FS_READ;
+        assert_eq!(
+            buffer.write_read_reply(wrong, b"read"),
+            Err(VfsError::Malformed)
+        );
+    }
+
+    #[test]
+    fn test_buffer_checks_identity_actual_bounds_and_write_read_only_access() {
+        let mut storage = *b"0123456789abcdef";
+        let buffer = VfsSharedIoTestBuffer::new(30, 7, &mut storage);
+        let request = VfsWriteSharedRequest {
+            fd: 4,
+            file_offset: 0,
+            requested_len: 5,
+            request_id: 92,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(30, 7, 3, 5, VFS_SHARED_BUFFER_FS_READ),
+        };
+        assert_eq!(buffer.read_write_request(request), Ok(b"34567".as_slice()));
+
+        let mut stale = request;
+        stale.buffer.object_generation = 8;
+        assert_eq!(buffer.read_write_request(stale), Err(VfsError::Malformed));
+
+        let mut outside = request;
+        outside.buffer.buffer_offset = 14;
+        outside.buffer.buffer_len = 5;
+        assert_eq!(buffer.read_write_request(outside), Err(VfsError::Malformed));
+
+        let mut writable = request;
+        writable.buffer.access = VFS_SHARED_BUFFER_FS_WRITE;
+        assert_eq!(
+            buffer.read_write_request(writable),
+            Err(VfsError::Malformed)
+        );
     }
 
     #[test]

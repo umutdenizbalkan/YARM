@@ -499,9 +499,13 @@ impl VfsBackend for RamFsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs::common::vfs_ipc::{VfsWritePayload, write_inline_message, write_shared_message};
+    use crate::fs::common::vfs_ipc::{
+        VfsReadSharedPlan, VfsSharedIoTestBuffer, VfsWritePayload, read_shared_message,
+        write_inline_message, write_shared_message,
+    };
     use yarm_ipc_abi::vfs_abi::{
-        VFS_SHARED_BUFFER_FS_READ, VFS_WRITE_INLINE_MAX_BYTES, VfsSharedBufferDescriptor,
+        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VFS_SHARED_IO_F_CURRENT_OFFSET,
+        VFS_WRITE_INLINE_MAX_BYTES, VfsReadSharedRequest, VfsSharedBufferDescriptor,
         VfsWriteInlineRequest, VfsWriteSharedRequest,
     };
 
@@ -641,6 +645,125 @@ mod tests {
         let mut out = [0u8; 32];
         let read = fs.read_bytes(fd, &mut out).expect("read back");
         assert_eq!(&out[..read], b"real write payload");
+    }
+
+    #[test]
+    fn ramfs_shared_read_proves_exact_and_short_eof_completions() {
+        let mut fs = RamFsBackend::new();
+        fs.create_file(b"/ram/shared-read").expect("create");
+        let write_fd = fs.open_path(b"/ram/shared-read").expect("open write");
+        fs.write_bytes(write_fd, b"shared read bytes")
+            .expect("seed file");
+        fs.close_fd(write_fd).expect("close write");
+        let read_fd = fs.open_path(b"/ram/shared-read").expect("open read");
+
+        let mut storage = [0xa5; 32];
+        let mut shared = VfsSharedIoTestBuffer::new(50, 3, &mut storage);
+        let first = VfsReadSharedRequest {
+            fd: read_fd,
+            file_offset: 0,
+            requested_len: 12,
+            request_id: 51,
+            flags: VFS_SHARED_IO_F_CURRENT_OFFSET,
+            buffer: VfsSharedBufferDescriptor::new(50, 3, 4, 12, VFS_SHARED_BUFFER_FS_WRITE),
+        };
+        let message = read_shared_message(first).expect("read helper");
+        let plan = VfsReadSharedPlan::decode(message.opcode, message.as_slice()).expect("plan");
+        let mut scratch = [0u8; 12];
+        let read = fs.read_bytes(read_fd, &mut scratch).expect("RAMFS read");
+        assert_eq!(
+            shared.write_read_reply(plan.request(), &scratch[..read]),
+            Ok(read)
+        );
+        assert_eq!(
+            plan.completion(read).expect("completion").bytes_completed,
+            12
+        );
+        assert_eq!(
+            shared.read_for_assert(4, 12),
+            Ok(b"shared read ".as_slice())
+        );
+
+        let second = VfsReadSharedRequest {
+            requested_len: 12,
+            request_id: 52,
+            buffer: VfsSharedBufferDescriptor::new(50, 3, 16, 12, VFS_SHARED_BUFFER_FS_WRITE),
+            ..first
+        };
+        let message = read_shared_message(second).expect("short read helper");
+        let plan = VfsReadSharedPlan::decode(message.opcode, message.as_slice()).expect("plan");
+        let read = fs
+            .read_bytes(read_fd, &mut scratch)
+            .expect("short EOF read");
+        assert_eq!(read, 5);
+        shared
+            .write_read_reply(plan.request(), &scratch[..read])
+            .expect("copy short read");
+        assert_eq!(
+            plan.completion(read).expect("completion").bytes_completed,
+            5
+        );
+        assert_eq!(shared.read_for_assert(16, 5), Ok(b"bytes".as_slice()));
+        assert_eq!(shared.read_for_assert(21, 7), Ok([0xa5; 7].as_slice()));
+    }
+
+    #[test]
+    fn ramfs_shared_read_rejects_wrong_direction_and_small_actual_object() {
+        let request = VfsReadSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 53,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(51, 4, 0, 8, VFS_SHARED_BUFFER_FS_READ),
+        };
+        let mut storage = [0u8; 4];
+        let mut shared = VfsSharedIoTestBuffer::new(51, 4, &mut storage);
+        assert_eq!(
+            shared.write_read_reply(request, b"data"),
+            Err(VfsError::Malformed)
+        );
+
+        let mut right_direction = request;
+        right_direction.buffer.access = VFS_SHARED_BUFFER_FS_WRITE;
+        assert_eq!(
+            shared.write_read_reply(right_direction, b"data"),
+            Err(VfsError::Malformed)
+        );
+    }
+
+    #[test]
+    fn ramfs_shared_write_consumes_exact_read_only_caller_bytes() {
+        let mut fs = RamFsBackend::new();
+        fs.create_file(b"/ram/shared-write").expect("create");
+        let fd = fs.open_path(b"/ram/shared-write").expect("open");
+        let mut caller_storage = *b"xxcaller shared bytesyy";
+        let shared = VfsSharedIoTestBuffer::new(60, 9, &mut caller_storage);
+        let request = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 19,
+            request_id: 61,
+            flags: VFS_SHARED_IO_F_CURRENT_OFFSET,
+            buffer: VfsSharedBufferDescriptor::new(60, 9, 2, 19, VFS_SHARED_BUFFER_FS_READ),
+        };
+        let message = write_shared_message(request).expect("write helper");
+        let payload = VfsWritePayload::decode(message.opcode, message.as_slice()).expect("decode");
+        let decoded = match payload {
+            VfsWritePayload::Shared(decoded) => decoded,
+            VfsWritePayload::Inline(_) => panic!("expected shared payload"),
+        };
+        let bytes = shared
+            .read_write_request(decoded)
+            .expect("read-only shared view");
+        assert_eq!(bytes, b"caller shared bytes");
+        assert_eq!(fs.write_bytes(fd, bytes), Ok(bytes.len()));
+
+        fs.close_fd(fd).expect("close");
+        let fd = fs.open_path(b"/ram/shared-write").expect("reopen");
+        let mut out = [0u8; 24];
+        let read = fs.read_bytes(fd, &mut out).expect("read back");
+        assert_eq!(&out[..read], b"caller shared bytes");
     }
 
     #[test]

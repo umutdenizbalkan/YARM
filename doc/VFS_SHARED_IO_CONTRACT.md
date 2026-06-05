@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-# VFS shared-I/O contract (FS-11 through FS-13 scaffold)
+# VFS shared-I/O contract (FS-11 through FS-14 scaffold)
 
 ## Status and scope
 
 `VFS_SHARED_IO_ENABLED` is the umbrella name for a future userspace VFS/filesystem transfer path.
-FS-11 through FS-13 define service-ABI records, exact inline write payloads, validation helpers,
-ownership rules, and cleanup requirements only. They do **not** define or enable a runtime feature
+FS-11 through FS-14 define service-ABI records, exact inline write payloads, typed read/write plans,
+a borrowed test-only shared-buffer model, validation helpers, ownership rules, and cleanup requirements
+only. They do **not** define or enable a runtime feature
 switch, advertise a capability, transfer/map a MemoryObject, or change live filesystem dispatch.
 
 The umbrella is split into independently staged capabilities:
 
 | Capability | Data producer | Shared-buffer permission held by FS | Status |
 |---|---|---|---|
-| `READ_SHARED_REPLY` | filesystem server | write access to the requested range | ABI/helper scaffold only |
-| `WRITE_SHARED_REQUEST` | requester/VFS | read-only for the requested range | ABI/helper scaffold only |
+| `READ_SHARED_REPLY` | filesystem server | write access to the requested range | helper plan and RAMFS proof only |
+| `WRITE_SHARED_REQUEST` | requester/VFS | read-only for the requested range | helper plan and RAMFS proof only |
 
 The stages must remain separate. A read reply requires the filesystem server to write caller-owned
 memory, while a write request requires the filesystem server to consume caller-owned memory without
@@ -31,8 +32,9 @@ The existing live path is classified as follows:
 - **B — inline/write-length path:** `VFS_OP_WRITE` carries only `fd`, an untrusted caller virtual
   address, and length. The live filesystem backend interface receives only `fd` and `len`; it does
   not receive write payload bytes. Existing `WriteLen` replies remain unchanged.
-- **C — missing `READ_SHARED_REPLY`:** no live shared object transfer/mapping contract currently
-  lets an FS server write a read result into requester-owned memory.
+- **C — helper read plan:** FS-14 adds decoded `VfsReadSharedPlan`, checked completion replies, and a
+  RAMFS test proof, but no live shared object transfer/mapping contract currently lets an FS server
+  write a read result into requester-owned memory.
 - **D — helper write payload path:** FS-13 adds a bounded exact-byte inline representation and a
   typed shared-write plan, but neither is accepted by live `VfsService` dispatch.
 - **E — missing shared mapping:** no live transfer/mapping contract lets an FS server read the
@@ -44,7 +46,7 @@ The existing live path is classified as follows:
 
 The existing `VFS_OP_READ` (`12`) and `VFS_OP_WRITE` (`13`) numbers and their live behavior are
 unchanged. Service opcodes `26` and `27` remain reserved for helper-only shared protocols. Opcode
-`28` is reserved for the FS-13 bounded inline write helper. The current `VfsService` intentionally
+`28` is reserved for the FS-13 bounded inline write helper. FS-14 does not add opcodes. The current `VfsService` intentionally
 returns `Unsupported` for all three.
 
 ## FS-13 exact write-payload representation
@@ -72,6 +74,30 @@ nonzero requested length, checked `buffer_offset + buffer_len`, sufficient descr
 flags, and exactly `VFS_SHARED_BUFFER_FS_READ`. Supplying FS write access is rejected. The generation
 is still only a correlation value; it is not a capability slot and cannot prove object freshness
 until a real transfer layer validates it.
+
+## FS-14 helper-only shared-buffer proof
+
+`VfsReadSharedPlan` decodes only opcode `26`, retains the validated `VfsReadSharedRequest`, and builds
+an OK `VfsReadSharedReply` only when `bytes_read <= requested_len`. The filesystem-common
+`read_shared_reply_message` helper encodes the completion without adding live dispatch.
+
+`VfsSharedIoTestBuffer` is compiled only for tests and borrows a byte slice. It models enough of a
+future mapping to check the opaque handle and generation, descriptor access direction, checked
+object range, and the actual backing-object bounds:
+
+- `write_read_reply` accepts only `VFS_SHARED_BUFFER_FS_WRITE` and copies at most the requested range;
+- `read_write_request` accepts only `VFS_SHARED_BUFFER_FS_READ` and returns an immutable slice;
+- stale identity, wrong direction, overflow, or a descriptor extending beyond the borrowed object is
+  rejected before RAMFS is called.
+
+This test double is not a capability, mapping, ownership-transfer, revocation, cancellation, or
+exactly-once cleanup implementation. It must not be reused as live mapping code.
+
+RAMFS tests prove exact shared reads, short EOF reads without exposing untouched tail bytes, actual
+object-bound rejection, and exact shared writes from an immutable caller view. The earlier bounded
+inline-write proof remains in place. These tests call `RamFsBackend::read_bytes`/`write_bytes`
+directly after helper decoding; opcodes `26`, `27`, and `28` remain unsupported by live
+`VfsService`.
 
 ## ABI scaffold
 
@@ -154,18 +180,22 @@ requested length.
 2. **FS-12:** userspace block/blkcache/virtio sector-write contract below filesystems; no VFS shared
    mapping is implied by that work.
 3. **FS-13:** bounded inline write bytes, typed inline/shared plans, stricter shared descriptor
-   validation, and RAMFS helper proof; live dispatch and mapping remain disabled.
-4. **Read stage:** implement transfer/mapping and exactly-once cleanup for `READ_SHARED_REPLY`, retain
-   inline fallback, then advertise only the read capability after focused lifecycle tests.
-5. **Write stage:** independently implement read-only request-buffer mapping for
+   validation, and RAMFS inline helper proof; live dispatch and mapping remain disabled.
+4. **FS-14:** typed shared-read plan, checked read completion, borrowed test buffer, and RAMFS shared
+   read/write proofs; still no live mapping, routing, cancellation, or cleanup state machine.
+5. **FS-15 lifecycle design:** specify mapping states, cancellation/timeout races, process exits,
+   stale handles, revocation, and exactly-once cleanup before enabling either capability.
+6. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
+   and advertise only the read capability after lifecycle tests pass.
+7. **Write enablement:** independently implement read-only request-buffer mapping for
    `WRITE_SHARED_REQUEST`; only then connect writable filesystems to the FS-12 block path.
-6. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
+8. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
    has routing, permissions, cancellation, cleanup, and process-exit tests. Supporting one stage does
    not imply support for the other.
 
 ## Explicit non-changes
 
-FS-13 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
+FS-14 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
 init/PM/supervisor/driver-manager policy, runtime service spawn order, FAT production writes, ext4
 writes, the FS-12 block stack, or the ext4 FS-10 read-side matrix. Kernel/global-lock work is
 untouched. No QEMU smoke is required because no runtime behavior is enabled.
