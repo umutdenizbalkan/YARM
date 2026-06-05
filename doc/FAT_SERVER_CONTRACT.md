@@ -3,8 +3,11 @@
 
 # FAT Filesystem Server Contract
 
-`yarm-fs-servers` includes a read-only FAT server exported as `run_fat()` and built by
-`crates/yarm-fs-servers/src/bin/fat_srv.rs`.
+`yarm-fs-servers` includes a FAT server exported as `run_fat()` and built by
+`crates/yarm-fs-servers/src/bin/fat_srv.rs`. The parser and hosted memory-image backend now support
+bounded regular-file writes for memory-backed images. FS-20 adds a FAT-only exact-inline service
+route and a whole-sector FS-12 write client, but production IPC-backed FAT mutation remains blocked
+by the lack of a usable whole-sector read/RMW contract.
 
 ## Supported formats
 
@@ -19,13 +22,26 @@
 
 ## VFS behavior
 
-The server implements read-only `openat`, `read`, `close`, and `statx` through the
+The server implements `openat`, `read`, `write`, `close`, and `statx` through the
 existing common filesystem service wrapper. Directory traversal is available in the
 FAT core for path lookup and hosted tests; there is currently no separate VFS
 `readdir` opcode in the shared request contract.
 
-Unsupported mutating operations such as write, mkdir, and unlink are rejected with
-`VfsError::Unsupported`. The server must not fake successful writes.
+Current write support is intentionally narrow and regular-file-only:
+
+- overwrites within an existing cluster chain;
+- appends/growth that allocate free clusters, zero freshly allocated clusters, and link the FAT chain;
+- FAT32 FSInfo free-count/next-free maintenance when a valid FSInfo sector is present;
+- directory-entry file-size updates after successful growth;
+- best-effort rollback of newly allocated clusters when cluster allocation fails before linkage.
+
+The legacy `VFS_OP_WRITE = 13` request remains length-only and retains its historical zero-fill
+behavior. The FAT service additionally handles `VFS_OP_WRITE_INLINE = 28` with an exact payload of
+1–96 bytes, current-open-file-offset semantics, and a typed completion reply. This narrow route is
+FAT-specific: the generic `VfsService` still rejects opcode 28, and shared opcodes 26/27 remain
+unsupported. Filesystem-internal callers may also use `write_path`/`write_bytes`.
+Unsupported mutating operations such as `mkdir` and `unlink` are still rejected with
+`VfsError::Unsupported`.
 
 ## Names and directories
 
@@ -36,6 +52,35 @@ Unsupported mutating operations such as write, mkdir, and unlink are rejected wi
 - FAT12/FAT16 fixed root directories and FAT32 root directory cluster chains are
   supported. Deleted entries are ignored, `0x00` terminates a directory, and volume
   labels are not exposed as files.
+
+## Production write-path audit
+
+FS-20 connects the two bounded userspace pieces already frozen by earlier stages:
+
+- **Exact VFS payload:** the FAT service, and only the FAT service, decodes
+  `VFS_OP_WRITE_INLINE = 28` and passes the 1–96 payload bytes to `FatBackend::write_bytes` at the
+  open file description's current offset. Explicit-offset writes are not enabled. The route is
+  currently gated to `MemoryImage`; IPC-backed FAT returns `VfsError::Unsupported` before mutation.
+- **Sector-write client:** `IpcBlockDevice::write_exact_at` accepts only aligned whole 512-byte
+  sectors and sends each sector as the FS-12 ordered `BLK_OP_WRITE = 0x0203` chunk transaction.
+  Every chunk reply is checked for request id, LBA, accepted length, status, and final commit marker.
+- **Write ordering:** writes are synchronous and write-through. FAT allocation, FAT-chain, file-data,
+  directory-entry, and optional FSInfo updates are issued in the existing core order; there is no
+  journal or atomic multi-sector transaction.
+- **Compatibility:** legacy length-only `VFS_OP_WRITE = 13` is unchanged. The shared-memory umbrella
+  remains disabled, and `READ_SHARED_REPLY`/`WRITE_SHARED_REQUEST` opcodes 26/27 remain unsupported.
+
+The practical supported profile is therefore memory-backed overwrite or append/growth of an
+already existing regular file, with at most 96 exact bytes per VFS inline request. Larger writes
+require caller-side request fragmentation today; no shared mapping is implied.
+
+A production IPC FAT mount cannot safely use this route yet. FAT metadata and short file writes are
+sub-sector updates and require read-modify-write. The current `BlkReadRequest` requires a
+sector-multiple `byte_len`, while the 128-byte inline `BlkReadReply` can carry only 120 data bytes;
+there is no read chunk offset/assembler corresponding to FS-12 writes. Consequently no valid
+512-byte sector read can be requested through this ABI, and inventing a partial read contract here
+would exceed FS-20's scope. The whole-sector write client is retained and tested, but FAT IPC inline
+writes remain explicitly rejected until the read-side sector transfer contract is repaired.
 
 ## Production backend selection
 
@@ -104,6 +149,10 @@ When enabled, the smoke marker block counts `INIT_FAT_SPAWN_BEGIN`,
 - The existing blkcache/block stack still exposes truthful stub behavior in some
   driver paths; FAT mount fails clearly when the backend cannot return real sector
   data.
-- FAT writes, allocation, truncation, mkdir, rename, and unlink are intentionally
-  unsupported and return `VfsError::Unsupported` where the current VFS/backend
-  surface exposes them.
+- Exact inline writes are limited to 96 bytes per request and memory-backed images. IPC-backed FAT
+  mutation remains blocked by the contradictory inline sector-read limits described above.
+- There is no multi-request atomicity, crash-safe ordering, or shared-buffer large-write path.
+- Truncation/shrinking, create, mkdir, rename, and unlink remain unsupported.
+- FAT32 allocation still scans the FAT for a free cluster; FSInfo is maintained opportunistically
+  when present but is not trusted as the allocator source of truth.
+- FAT writes are not journaled and are not crash-safe across power loss or mid-write failure.

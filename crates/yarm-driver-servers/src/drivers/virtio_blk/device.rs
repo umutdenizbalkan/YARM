@@ -134,6 +134,16 @@ impl VirtqChain {
     }
 }
 
+pub fn build_write_chain(tag: u32, sector: u64, len: u32) -> VirtqChain {
+    VirtqChain::from_request(VirtioBlkReqFrame {
+        op: VIRTIO_BLK_OP_WRITE,
+        _reserved: 0,
+        sector,
+        len,
+        tag,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtioBlkRequest {
     pub sector: u64,
@@ -173,11 +183,49 @@ impl VirtioBlkDevice {
     }
 
     pub fn write(&mut self, req: VirtioBlkRequest) -> Result<u32, ()> {
-        if req.sector >= self.sectors {
+        if req.sector >= self.sectors || req.len == 0 || !req.len.is_multiple_of(self.sector_size) {
             return Err(());
         }
+        let sector_count = (req.len / self.sector_size) as u64;
+        req.sector
+            .checked_add(sector_count)
+            .filter(|end| *end <= self.sectors)
+            .ok_or(())?;
         self.writes = self.writes.saturating_add(1);
         Ok(req.len)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtioBlkMemoryDevice<const SECTORS: usize> {
+    storage: [[u8; 512]; SECTORS],
+    pub device: VirtioBlkDevice,
+}
+
+impl<const SECTORS: usize> Default for VirtioBlkMemoryDevice<SECTORS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const SECTORS: usize> VirtioBlkMemoryDevice<SECTORS> {
+    pub const fn new() -> Self {
+        Self {
+            storage: [[0; 512]; SECTORS],
+            device: VirtioBlkDevice::new(SECTORS as u64, 512),
+        }
+    }
+
+    pub fn write_sector(&mut self, sector: u64, data: &[u8; 512]) -> Result<u32, ()> {
+        self.device.write(VirtioBlkRequest { sector, len: 512 })?;
+        let slot = self.storage.get_mut(sector as usize).ok_or(())?;
+        *slot = *data;
+        Ok(512)
+    }
+
+    pub fn read_sector(&mut self, sector: u64) -> Result<[u8; 512], ()> {
+        self.device.read(VirtioBlkRequest { sector, len: 512 })?;
+        self.storage.get(sector as usize).copied().ok_or(())
     }
 }
 
@@ -296,5 +344,26 @@ mod tests {
             tag: chain.request.tag,
         });
         assert_eq!(q.take_last_used().expect("used").done_len, 64);
+    }
+
+    #[test]
+    fn write_request_builder_uses_virtio_write_opcode() {
+        let chain = build_write_chain(0x44, 7, 512);
+        assert_eq!(chain.request.op, VIRTIO_BLK_OP_WRITE);
+        assert_eq!(chain.request.sector, 7);
+        assert_eq!(chain.request.len, 512);
+        assert_eq!(chain.data.len, 512);
+    }
+
+    #[test]
+    fn memory_device_write_then_read_and_overwrite_are_exact() {
+        let mut device = VirtioBlkMemoryDevice::<4>::new();
+        let first = [0x5a; 512];
+        let second = core::array::from_fn(|index| index as u8);
+        assert_eq!(device.write_sector(2, &first), Ok(512));
+        assert_eq!(device.read_sector(2), Ok(first));
+        assert_eq!(device.write_sector(2, &second), Ok(512));
+        assert_eq!(device.read_sector(2), Ok(second));
+        assert_eq!(device.write_sector(4, &first), Err(()));
     }
 }

@@ -10,6 +10,11 @@ use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 const SECTOR_512: usize = 512;
 const MAX_OPEN_FDS: usize = 32;
 const MAX_PATH_COMPONENTS: usize = 32;
+const FAT_OPEN_PATH_MAX: usize = 96;
+const FAT32_FSINFO_FREE_UNKNOWN: u32 = 0xffff_ffff;
+const FAT32_FSINFO_LEAD_SIG: u32 = 0x4161_5252;
+const FAT32_FSINFO_STRUCT_SIG: u32 = 0x6141_7272;
+const FAT32_FSINFO_TRAIL_SIG: u32 = 0xaa55_0000;
 const ATTR_READ_ONLY: u8 = 0x01;
 const ATTR_HIDDEN: u8 = 0x02;
 const ATTR_SYSTEM: u8 = 0x04;
@@ -42,6 +47,7 @@ pub struct FatLayout {
     pub root_cluster: u32,
     pub cluster_count: u32,
     pub fat_type: FatType,
+    pub fsinfo_sector: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,7 @@ pub enum FatError {
     Io,
     Malformed,
     Unsupported,
+    NoSpace,
     InvalidPath,
     NotFound,
     IsDirectory,
@@ -63,7 +70,7 @@ impl From<FatError> for VfsError {
             FatError::Malformed | FatError::BadCluster | FatError::ClusterLoop => {
                 VfsError::Malformed
             }
-            FatError::Unsupported | FatError::Io => VfsError::Unsupported,
+            FatError::Unsupported | FatError::Io | FatError::NoSpace => VfsError::Unsupported,
             FatError::InvalidPath
             | FatError::NotFound
             | FatError::IsDirectory
@@ -75,6 +82,9 @@ impl From<FatError> for VfsError {
 pub trait BlockDevice {
     fn len(&self) -> u64;
     fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FatError>;
+    fn write_exact_at(&mut self, _offset: u64, _bytes: &[u8]) -> Result<(), FatError> {
+        Err(FatError::Unsupported)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +99,9 @@ impl MemBlockDevice {
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
         &mut self.bytes
     }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 impl BlockDevice for MemBlockDevice {
@@ -102,13 +115,21 @@ impl BlockDevice for MemBlockDevice {
         out.copy_from_slice(src);
         Ok(())
     }
+    fn write_exact_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FatError> {
+        let start = usize::try_from(offset).map_err(|_| FatError::Io)?;
+        let end = start.checked_add(bytes.len()).ok_or(FatError::Io)?;
+        let dst = self.bytes.get_mut(start..end).ok_or(FatError::Io)?;
+        dst.copy_from_slice(bytes);
+        Ok(())
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IpcBlockDevice {
     pub device_id: u64,
     pub send_cap: u32,
     pub reply_recv_cap: u32,
+    next_write_request_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,6 +167,12 @@ impl BlockDevice for FatBlockDevice {
             Self::Ipc(device) => device.read_exact_at(offset, out),
         }
     }
+    fn write_exact_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FatError> {
+        match self {
+            Self::Mem(device) => device.write_exact_at(offset, bytes),
+            Self::Ipc(device) => device.write_exact_at(offset, bytes),
+        }
+    }
 }
 
 impl BlockDevice for IpcBlockDevice {
@@ -155,7 +182,7 @@ impl BlockDevice for IpcBlockDevice {
 
     fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FatError> {
         use yarm_ipc_abi::block_abi::{
-            BLK_IPC_MAX_DATA_BYTES, BLK_OP_READ, BLK_SECTOR_SIZE, BlkReadRequest, BlkStatus,
+            BlkReadRequest, BlkStatus, BLK_IPC_MAX_DATA_BYTES, BLK_OP_READ, BLK_SECTOR_SIZE,
         };
         use yarm_user_rt::ipc::Message;
         if offset % u64::from(BLK_SECTOR_SIZE) != 0 || out.len() % BLK_SECTOR_SIZE as usize != 0 {
@@ -200,6 +227,107 @@ impl BlockDevice for IpcBlockDevice {
         }
         Ok(())
     }
+
+    fn write_exact_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FatError> {
+        use yarm_ipc_abi::block_abi::BLK_SECTOR_SIZE;
+
+        let sector_size = BLK_SECTOR_SIZE as usize;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if offset % u64::from(BLK_SECTOR_SIZE) != 0 || bytes.len() % sector_size != 0 {
+            return Err(FatError::Unsupported);
+        }
+        for (index, sector) in bytes.chunks_exact(sector_size).enumerate() {
+            let lba = offset / u64::from(BLK_SECTOR_SIZE)
+                + u64::try_from(index).map_err(|_| FatError::Io)?;
+            let sector: &[u8; 512] = sector.try_into().map_err(|_| FatError::Io)?;
+            self.write_sector(lba, sector)?;
+        }
+        Ok(())
+    }
+}
+
+impl IpcBlockDevice {
+    fn allocate_write_request_id(&mut self) -> u32 {
+        let request_id = self.next_write_request_id.max(1);
+        self.next_write_request_id = request_id.wrapping_add(1).max(1);
+        request_id
+    }
+
+    fn write_sector(&mut self, lba: u64, sector: &[u8; 512]) -> Result<(), FatError> {
+        use yarm_ipc_abi::block_abi::{BlkWriteReply, BLK_OP_WRITE};
+        use yarm_user_rt::ipc::Message;
+
+        let device_id = self.device_id;
+        let send_cap = self.send_cap;
+        let reply_recv_cap = self.reply_recv_cap;
+        let request_id = self.allocate_write_request_id();
+        send_sector_write_chunks(device_id, request_id, lba, sector, |request| {
+            let payload = request.encode().map_err(|_| FatError::Unsupported)?;
+            let msg = Message::with_header(0, BLK_OP_WRITE, 0, None, &payload)
+                .map_err(|_| FatError::Io)?;
+            unsafe { yarm_user_rt::syscall::ipc_call(send_cap, reply_recv_cap, &msg) }
+                .map_err(|_| FatError::Io)?;
+            let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) }
+                .map_err(|_| FatError::Io)?
+                .ok_or(FatError::Io)?;
+            BlkWriteReply::decode(reply.as_slice()).ok_or(FatError::Io)
+        })
+    }
+}
+
+fn send_sector_write_chunks<F>(
+    device_id: u64,
+    request_id: u32,
+    lba: u64,
+    sector: &[u8; 512],
+    mut exchange: F,
+) -> Result<(), FatError>
+where
+    F: FnMut(
+        &yarm_ipc_abi::block_abi::BlkWriteRequest,
+    ) -> Result<yarm_ipc_abi::block_abi::BlkWriteReply, FatError>,
+{
+    use yarm_ipc_abi::block_abi::{
+        BlkStatus, BlkWriteRequest, BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST, BLK_WRITE_MAX_CHUNK_BYTES,
+    };
+
+    let mut offset = 0usize;
+    while offset < sector.len() {
+        let len = core::cmp::min(BLK_WRITE_MAX_CHUNK_BYTES, sector.len() - offset);
+        let mut data = [0u8; BLK_WRITE_MAX_CHUNK_BYTES];
+        data[..len].copy_from_slice(&sector[offset..offset + len]);
+        let mut flags = 0;
+        if offset == 0 {
+            flags |= BLK_WRITE_F_FIRST;
+        }
+        if offset + len == sector.len() {
+            flags |= BLK_WRITE_F_LAST;
+        }
+        let request = BlkWriteRequest {
+            request_id,
+            flags,
+            device_id,
+            lba,
+            sector_offset: offset as u32,
+            data_len: len as u32,
+            data,
+        };
+        request.validate().map_err(|_| FatError::Unsupported)?;
+        let reply = exchange(&request)?;
+        let committed = u32::from(offset + len == sector.len());
+        if reply.request_id != request_id
+            || reply.status != BlkStatus::Success
+            || reply.bytes_accepted != len as u32
+            || reply.sector_committed != committed
+            || reply.lba != lba
+        {
+            return Err(FatError::Io);
+        }
+        offset += len;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +353,19 @@ struct OpenFd {
     fd: u64,
     entry: usize,
     offset: u64,
+    path_len: u8,
+    path: [u8; FAT_OPEN_PATH_MAX],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirEntryLocation {
+    offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LocatedDirEntry {
+    entry: DirEntryInfo,
+    loc: DirEntryLocation,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +392,10 @@ impl<D: BlockDevice> FatFs<D> {
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FatError> {
         self.device.read_exact_at(offset, out)
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), FatError> {
+        self.device.write_exact_at(offset, bytes)
     }
 
     fn sector_offset(&self, lba: u32) -> u64 {
@@ -376,6 +521,171 @@ impl<D: BlockDevice> FatFs<D> {
         Ok(data)
     }
 
+    fn eoc_marker(&self) -> u32 {
+        match self.layout.fat_type {
+            FatType::Fat12 => 0x0fff,
+            FatType::Fat16 => 0xffff,
+            FatType::Fat32 => 0x0fff_ffff,
+        }
+    }
+
+    fn set_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), FatError> {
+        if cluster >= self.layout.cluster_count + 2 {
+            return Err(FatError::BadCluster);
+        }
+        let fat_byte = match self.layout.fat_type {
+            FatType::Fat12 => u64::from(cluster) + u64::from(cluster / 2),
+            FatType::Fat16 => u64::from(cluster) * 2,
+            FatType::Fat32 => u64::from(cluster) * 4,
+        };
+        for fat_idx in 0..self.layout.fat_count {
+            let fat_lba = self
+                .layout
+                .fat_start_lba
+                .checked_add(u32::from(fat_idx) * self.layout.sectors_per_fat)
+                .ok_or(FatError::Malformed)?;
+            let off = self
+                .sector_offset(fat_lba)
+                .checked_add(fat_byte)
+                .ok_or(FatError::Malformed)?;
+            match self.layout.fat_type {
+                FatType::Fat12 => {
+                    let mut raw = [0u8; 2];
+                    self.read_at(off, &mut raw)?;
+                    let mut word = u16::from_le_bytes(raw);
+                    if cluster & 1 == 0 {
+                        word = (word & 0xf000) | (value as u16 & 0x0fff);
+                    } else {
+                        word = (word & 0x000f) | ((value as u16 & 0x0fff) << 4);
+                    }
+                    self.write_at(off, &word.to_le_bytes())?;
+                }
+                FatType::Fat16 => self.write_at(off, &(value as u16).to_le_bytes())?,
+                FatType::Fat32 => {
+                    let mut raw = [0u8; 4];
+                    self.read_at(off, &mut raw)?;
+                    let old = u32::from_le_bytes(raw) & 0xf000_0000;
+                    self.write_at(off, &(old | (value & 0x0fff_ffff)).to_le_bytes())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_cluster_zeroed(&mut self, cluster: u32) -> Result<(), FatError> {
+        let zero = vec![0u8; self.cluster_size()];
+        self.write_at(
+            self.sector_offset(self.cluster_lba(cluster)?),
+            zero.as_slice(),
+        )
+    }
+
+    fn fsinfo_offset(&self) -> Option<u64> {
+        self.layout
+            .fsinfo_sector
+            .map(|sector| self.sector_offset(u32::from(sector)))
+    }
+
+    fn read_fat32_fsinfo(&self) -> Result<Option<(u32, u32)>, FatError> {
+        if self.layout.fat_type != FatType::Fat32 {
+            return Ok(None);
+        }
+        let Some(offset) = self.fsinfo_offset() else {
+            return Ok(None);
+        };
+        let mut raw = [0u8; SECTOR_512];
+        self.read_at(offset, &mut raw)?;
+        let lead = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        let struc = u32::from_le_bytes([raw[484], raw[485], raw[486], raw[487]]);
+        let trail = u32::from_le_bytes([raw[508], raw[509], raw[510], raw[511]]);
+        if lead != FAT32_FSINFO_LEAD_SIG
+            || struc != FAT32_FSINFO_STRUCT_SIG
+            || trail != FAT32_FSINFO_TRAIL_SIG
+        {
+            return Ok(None);
+        }
+        Ok(Some((
+            u32::from_le_bytes([raw[488], raw[489], raw[490], raw[491]]),
+            u32::from_le_bytes([raw[492], raw[493], raw[494], raw[495]]),
+        )))
+    }
+
+    fn write_fat32_fsinfo(&mut self, free_count: u32, next_free: u32) -> Result<(), FatError> {
+        let Some(offset) = self.fsinfo_offset() else {
+            return Ok(());
+        };
+        if self.read_fat32_fsinfo()?.is_none() {
+            return Ok(());
+        }
+        self.write_at(offset + 488, &free_count.to_le_bytes())?;
+        self.write_at(offset + 492, &next_free.to_le_bytes())
+    }
+
+    fn note_fat32_cluster_allocated(&mut self, cluster: u32) -> Result<(), FatError> {
+        let Some((free_count, _)) = self.read_fat32_fsinfo()? else {
+            return Ok(());
+        };
+        let next_free = if cluster + 1 < self.layout.cluster_count + 2 {
+            cluster + 1
+        } else {
+            2
+        };
+        let free_count = if free_count == FAT32_FSINFO_FREE_UNKNOWN {
+            FAT32_FSINFO_FREE_UNKNOWN
+        } else {
+            free_count.saturating_sub(1)
+        };
+        self.write_fat32_fsinfo(free_count, next_free)
+    }
+
+    fn note_fat32_cluster_freed(&mut self, cluster: u32) -> Result<(), FatError> {
+        let Some((free_count, _)) = self.read_fat32_fsinfo()? else {
+            return Ok(());
+        };
+        let free_count = if free_count == FAT32_FSINFO_FREE_UNKNOWN {
+            FAT32_FSINFO_FREE_UNKNOWN
+        } else {
+            free_count.saturating_add(1)
+        };
+        self.write_fat32_fsinfo(free_count, cluster)
+    }
+
+    pub fn fat32_fsinfo_values(&self) -> Result<Option<(u32, u32)>, FatError> {
+        self.read_fat32_fsinfo()
+    }
+
+    fn allocate_cluster(&mut self) -> Result<u32, FatError> {
+        for cluster in 2..self.layout.cluster_count + 2 {
+            if self.fat_entry(cluster)? == 0 {
+                self.set_fat_entry(cluster, self.eoc_marker())?;
+                self.write_cluster_zeroed(cluster)?;
+                self.note_fat32_cluster_allocated(cluster)?;
+                return Ok(cluster);
+            }
+        }
+        Err(FatError::NoSpace)
+    }
+
+    fn chain_clusters(&self, start: u32) -> Result<Vec<u32>, FatError> {
+        if start == 0 {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut cur = start;
+        let limit = self.layout.cluster_count.saturating_add(1);
+        for _ in 0..limit {
+            if out.contains(&cur) {
+                return Err(FatError::ClusterLoop);
+            }
+            out.push(cur);
+            match self.next_cluster(cur)? {
+                Some(next) => cur = next,
+                None => return Ok(out),
+            }
+        }
+        Err(FatError::ClusterLoop)
+    }
+
     fn read_root_dir(&self) -> Result<Vec<u8>, FatError> {
         match self.layout.fat_type {
             FatType::Fat12 | FatType::Fat16 => {
@@ -452,6 +762,126 @@ impl<D: BlockDevice> FatFs<D> {
         entries
     }
 
+    fn parse_dir_entries_with_offsets(
+        &self,
+        bytes: &[u8],
+        base_offset: u64,
+    ) -> Vec<LocatedDirEntry> {
+        let mut entries = Vec::new();
+        let mut lfn_parts: Vec<(u8, String)> = Vec::new();
+        let mut lfn_checksum: Option<u8> = None;
+        for (idx, raw) in bytes.chunks_exact(32).enumerate() {
+            if raw[0] == 0x00 {
+                break;
+            }
+            if raw[0] == 0xe5 {
+                lfn_parts.clear();
+                lfn_checksum = None;
+                continue;
+            }
+            let attr = raw[11];
+            if attr == ATTR_LFN {
+                let seq = raw[0] & 0x1f;
+                let checksum = raw[13];
+                if lfn_checksum.map(|c| c != checksum).unwrap_or(false) {
+                    lfn_parts.clear();
+                }
+                lfn_checksum = Some(checksum);
+                lfn_parts.push((seq, decode_lfn_part(raw)));
+                continue;
+            }
+            if (attr & ATTR_VOLUME_ID) != 0 {
+                lfn_parts.clear();
+                lfn_checksum = None;
+                continue;
+            }
+            let short = decode_short_name(raw);
+            if short.is_empty() {
+                lfn_parts.clear();
+                lfn_checksum = None;
+                continue;
+            }
+            let mut name = short.clone();
+            if let Some(sum) = lfn_checksum {
+                if lfn_checksum_valid(raw, sum) {
+                    lfn_parts.sort_by_key(|(seq, _)| *seq);
+                    let mut full = String::new();
+                    for (_, part) in lfn_parts.iter() {
+                        full.push_str(part);
+                    }
+                    if !full.is_empty() {
+                        name = full;
+                    }
+                }
+            }
+            lfn_parts.clear();
+            lfn_checksum = None;
+            let lo = u16::from_le_bytes([raw[26], raw[27]]) as u32;
+            let hi = u16::from_le_bytes([raw[20], raw[21]]) as u32;
+            entries.push(LocatedDirEntry {
+                entry: DirEntryInfo {
+                    name,
+                    short_name: short,
+                    start_cluster: (hi << 16) | lo,
+                    size: u32::from_le_bytes([raw[28], raw[29], raw[30], raw[31]]),
+                    attr,
+                },
+                loc: DirEntryLocation {
+                    offset: base_offset + (idx as u64 * 32),
+                },
+            });
+        }
+        entries
+    }
+
+    fn dir_bytes_and_base(&self, entry: &DirEntryInfo) -> Result<(Vec<u8>, u64), FatError> {
+        if entry.start_cluster == 0 {
+            Ok((
+                self.read_root_dir()?,
+                self.sector_offset(self.layout.root_dir_start_lba),
+            ))
+        } else {
+            Ok((
+                self.read_chain(entry.start_cluster, None)?,
+                self.sector_offset(self.cluster_lba(entry.start_cluster)?),
+            ))
+        }
+    }
+
+    fn lookup_located(&self, path: &[u8]) -> Result<LocatedDirEntry, FatError> {
+        let comps = normalized_components(path)?;
+        if comps.is_empty() {
+            return Err(FatError::InvalidPath);
+        }
+        let mut current = DirEntryInfo {
+            name: String::from("/"),
+            short_name: String::from("/"),
+            start_cluster: if self.layout.fat_type == FatType::Fat32 {
+                self.layout.root_cluster
+            } else {
+                0
+            },
+            size: 0,
+            attr: ATTR_DIRECTORY,
+        };
+        for (idx, comp) in comps.iter().enumerate() {
+            if !current.is_dir() {
+                return Err(FatError::NotDirectory);
+            }
+            let (bytes, base) = self.dir_bytes_and_base(&current)?;
+            let found = self
+                .parse_dir_entries_with_offsets(bytes.as_slice(), base)
+                .into_iter()
+                .find(|e| name_eq(&e.entry.name, comp) || name_eq(&e.entry.short_name, comp))
+                .ok_or(FatError::NotFound)?;
+            if idx == comps.len() - 1 {
+                return Ok(found);
+            }
+            current = found.entry;
+        }
+        Err(FatError::NotFound)
+    }
+
     pub fn list_dir(&self, path: &[u8]) -> Result<Vec<DirEntryInfo>, FatError> {
         let entry = self.lookup(path)?;
         if !entry.is_dir() {
@@ -515,6 +945,84 @@ impl<D: BlockDevice> FatFs<D> {
         let start = offset as usize;
         out[..to_read].copy_from_slice(&data[start..start + to_read]);
         Ok(to_read)
+    }
+
+    pub fn write_file_at_path(
+        &mut self,
+        path: &[u8],
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<DirEntryInfo, FatError> {
+        let located = self.lookup_located(path)?;
+        let mut entry = located.entry;
+        if entry.is_dir() {
+            return Err(FatError::IsDirectory);
+        }
+        if bytes.is_empty() {
+            return Ok(entry);
+        }
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .ok_or(FatError::Unsupported)?;
+        if end > u64::from(u32::MAX) {
+            return Err(FatError::Unsupported);
+        }
+        let cluster_size = self.cluster_size();
+        let needed_clusters = (end as usize).div_ceil(cluster_size);
+        let mut chain = self.chain_clusters(entry.start_cluster)?;
+        if chain.len() < needed_clusters {
+            let mut allocated = Vec::new();
+            while chain.len() + allocated.len() < needed_clusters {
+                match self.allocate_cluster() {
+                    Ok(c) => allocated.push(c),
+                    Err(err) => {
+                        for c in allocated {
+                            let _ = self.set_fat_entry(c, 0);
+                            let _ = self.note_fat32_cluster_freed(c);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            let mut previous = chain.last().copied();
+            for cluster in allocated.iter().copied() {
+                if let Some(prev) = previous {
+                    self.set_fat_entry(prev, cluster)?;
+                } else {
+                    entry.start_cluster = cluster;
+                }
+                previous = Some(cluster);
+                chain.push(cluster);
+            }
+            if let Some(last) = previous {
+                self.set_fat_entry(last, self.eoc_marker())?;
+            }
+        }
+        let mut written = 0usize;
+        while written < bytes.len() {
+            let absolute = offset as usize + written;
+            let cluster_idx = absolute / cluster_size;
+            let in_cluster = absolute % cluster_size;
+            let n = core::cmp::min(bytes.len() - written, cluster_size - in_cluster);
+            let cluster = chain[cluster_idx];
+            let write_off = self
+                .sector_offset(self.cluster_lba(cluster)?)
+                .checked_add(in_cluster as u64)
+                .ok_or(FatError::Malformed)?;
+            self.write_at(write_off, &bytes[written..written + n])?;
+            written += n;
+        }
+        if end > u64::from(entry.size) {
+            entry.size = end as u32;
+            let mut raw = [0u8; 4];
+            raw.copy_from_slice(&entry.size.to_le_bytes());
+            self.write_at(located.loc.offset + 28, &raw)?;
+            let lo = (entry.start_cluster as u16).to_le_bytes();
+            let hi = ((entry.start_cluster >> 16) as u16).to_le_bytes();
+            self.write_at(located.loc.offset + 20, &hi)?;
+            self.write_at(located.loc.offset + 26, &lo)?;
+        }
+        Ok(entry)
     }
 }
 
@@ -581,6 +1089,13 @@ impl FatLayout {
         } else {
             0
         };
+        let fsinfo_raw = u16::from_le_bytes([boot[48], boot[49]]);
+        let fsinfo_sector =
+            if fat_type == FatType::Fat32 && fsinfo_raw != 0 && fsinfo_raw < reserved {
+                Some(fsinfo_raw)
+            } else {
+                None
+            };
         match fat_type {
             FatType::Fat32 => {
                 if root_entries != 0 || root_cluster < 2 {
@@ -608,6 +1123,7 @@ impl FatLayout {
             root_cluster,
             cluster_count: clusters,
             fat_type,
+            fsinfo_sector,
         })
     }
 }
@@ -648,6 +1164,7 @@ impl FatBackend {
                 device_id,
                 send_cap,
                 reply_recv_cap,
+                next_write_request_id: 1,
             }))?,
             entries: Vec::new(),
             open_fds: [None; MAX_OPEN_FDS],
@@ -660,14 +1177,46 @@ impl FatBackend {
     pub const fn backend_kind(&self) -> FatBackendKind {
         self.fs.device.kind()
     }
+    pub fn memory_image(&self) -> Option<&[u8]> {
+        match &self.fs.device {
+            FatBlockDevice::Mem(device) => Some(device.as_bytes()),
+            FatBlockDevice::Ipc(_) => None,
+        }
+    }
     pub fn lookup_entry(&self, path: &[u8]) -> Result<DirEntryInfo, FatError> {
         self.fs.lookup(path)
     }
     pub fn list_dir(&self, path: &[u8]) -> Result<Vec<DirEntryInfo>, FatError> {
         self.fs.list_dir(path)
     }
-    pub fn write_path(&mut self, _path: &[u8], _data: &[u8]) -> Result<(), VfsError> {
-        Err(VfsError::Unsupported)
+    pub fn fat32_fsinfo_values(&self) -> Result<Option<(u32, u32)>, FatError> {
+        self.fs.fat32_fsinfo_values()
+    }
+    pub fn write_path(&mut self, path: &[u8], data: &[u8]) -> Result<(), VfsError> {
+        self.fs
+            .write_file_at_path(path, 0, data)
+            .map(|_| ())
+            .map_err(VfsError::from)
+    }
+    pub fn write_bytes(&mut self, fd: u64, data: &[u8]) -> Result<usize, VfsError> {
+        let slot_idx = self
+            .open_fds
+            .iter()
+            .position(|s| s.map(|o| o.fd == fd).unwrap_or(false))
+            .ok_or(VfsError::BadFd)?;
+        let open = self.open_fds[slot_idx].ok_or(VfsError::BadFd)?;
+        let path = &open.path[..open.path_len as usize];
+        let updated = self
+            .fs
+            .write_file_at_path(path, open.offset, data)
+            .map_err(VfsError::from)?;
+        if let Some(entry) = self.entries.get_mut(open.entry) {
+            *entry = updated;
+        }
+        if let Some(slot) = self.open_fds.get_mut(slot_idx).and_then(Option::as_mut) {
+            slot.offset = slot.offset.saturating_add(data.len() as u64);
+        }
+        Ok(data.len())
     }
     pub fn mkdir_path(&mut self, _path: &[u8]) -> Result<(), VfsError> {
         Err(VfsError::Unsupported)
@@ -687,11 +1236,18 @@ impl VfsBackend for FatBackend {
         let idx = self.entries.len();
         self.entries.push(entry);
         self.next_fd = self.next_fd.saturating_add(1);
+        if path.len() > FAT_OPEN_PATH_MAX {
+            return Err(VfsError::NameTooLong);
+        }
         if let Some(slot) = self.open_fds.iter_mut().find(|s| s.is_none()) {
+            let mut stored_path = [0u8; FAT_OPEN_PATH_MAX];
+            stored_path[..path.len()].copy_from_slice(path);
             *slot = Some(OpenFd {
                 fd,
                 entry: idx,
                 offset: 0,
+                path_len: path.len() as u8,
+                path: stored_path,
             });
             Ok(fd)
         } else {
@@ -733,8 +1289,10 @@ impl VfsBackend for FatBackend {
         }
         Ok((n as u64, n))
     }
-    fn write(&mut self, _fd: u64, _len: u64) -> Result<u64, VfsError> {
-        Err(VfsError::Unsupported)
+    fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
+        let capped = usize::try_from(len).map_err(|_| VfsError::Unsupported)?;
+        let zeroes = vec![0u8; capped];
+        self.write_bytes(fd, zeroes.as_slice()).map(|n| n as u64)
     }
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         Ok(u64::from(
@@ -831,6 +1389,86 @@ const ATTR_ARCHIVE: u8 = 0x20;
 mod tests {
     use super::*;
     use crate::fs::common::vfs_ipc::VfsBackend;
+
+    #[test]
+    fn mem_block_device_write_persists_sector_contents() {
+        let mut dev = MemBlockDevice::new(vec![0u8; SECTOR_512 * 2]);
+        dev.write_exact_at(512, b"sector").unwrap();
+        let mut out = [0u8; 6];
+        dev.read_exact_at(512, &mut out).unwrap();
+        assert_eq!(&out, b"sector");
+    }
+
+    #[test]
+    fn ipc_block_write_rejects_unaligned_or_partial_sectors() {
+        let mut device = IpcBlockDevice {
+            device_id: 7,
+            send_cap: 8,
+            reply_recv_cap: 9,
+            next_write_request_id: 1,
+        };
+        assert_eq!(
+            device.write_exact_at(1, &[0u8; 512]),
+            Err(FatError::Unsupported)
+        );
+        assert_eq!(
+            device.write_exact_at(0, &[0u8; 511]),
+            Err(FatError::Unsupported)
+        );
+    }
+
+    #[test]
+    fn ipc_sector_write_emits_valid_fs12_chunks() {
+        use yarm_ipc_abi::block_abi::{
+            BlkStatus, BlkWriteReply, BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST,
+        };
+
+        let mut sector = [0u8; 512];
+        for (index, byte) in sector.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut observed = Vec::new();
+        send_sector_write_chunks(7, 41, 9, &sector, |request| {
+            observed.push(*request);
+            Ok(BlkWriteReply {
+                request_id: request.request_id,
+                status: BlkStatus::Success,
+                bytes_accepted: request.data_len,
+                sector_committed: u32::from(request.flags & BLK_WRITE_F_LAST != 0),
+                lba: request.lba,
+            })
+        })
+        .expect("write chunks");
+
+        assert_eq!(observed.len(), 6);
+        assert_ne!(observed[0].flags & BLK_WRITE_F_FIRST, 0);
+        assert_ne!(observed.last().unwrap().flags & BLK_WRITE_F_LAST, 0);
+        let mut rebuilt = [0u8; 512];
+        for request in observed {
+            let start = request.sector_offset as usize;
+            rebuilt[start..start + request.data_len as usize].copy_from_slice(request.chunk());
+        }
+        assert_eq!(rebuilt, sector);
+    }
+
+    #[test]
+    fn ipc_sector_write_rejects_inconsistent_backend_reply() {
+        use yarm_ipc_abi::block_abi::{BlkStatus, BlkWriteReply};
+
+        let sector = [0x5au8; 512];
+        assert_eq!(
+            send_sector_write_chunks(7, 41, 9, &sector, |request| {
+                Ok(BlkWriteReply {
+                    request_id: request.request_id,
+                    status: BlkStatus::Success,
+                    bytes_accepted: request.data_len.saturating_sub(1),
+                    sector_committed: 0,
+                    lba: request.lba,
+                })
+            }),
+            Err(FatError::Io)
+        );
+    }
 
     #[test]
     fn fat12_bpb_parse_succeeds() {
@@ -947,12 +1585,92 @@ mod tests {
         assert!(fs.lookup(b"/hello.txt").unwrap().is_file());
     }
     #[test]
-    fn unsupported_write_mkdir_unlink_return_readonly_error() {
+    fn mkdir_unlink_remain_unsupported_after_write_support() {
         let mut b = FatBackend::from_image(image(FatType::Fat12)).unwrap();
-        let fd = b.openat_path(b"/hello.txt").unwrap();
-        assert_eq!(b.write(fd, 1), Err(VfsError::Unsupported));
         assert_eq!(b.mkdir_path(b"/x"), Err(VfsError::Unsupported));
         assert_eq!(b.unlink_path(b"/hello.txt"), Err(VfsError::Unsupported));
+    }
+
+    #[test]
+    fn overwrite_existing_file_bytes_and_read_back() {
+        let mut b = FatBackend::from_image(image(FatType::Fat12)).unwrap();
+        b.write_path(b"/one.txt", b"TWO!").unwrap();
+        assert_eq!(b.statx_path(b"/one.txt"), Ok(4));
+        let fd = b.openat_path(b"/one.txt").unwrap();
+        let mut out = [0u8; 4];
+        assert_eq!(b.read_into(fd, 4, &mut out).unwrap(), (4, 4));
+        assert_eq!(&out, b"TWO!");
+    }
+
+    #[test]
+    fn append_grows_file_within_same_cluster_and_updates_size() {
+        let mut b = FatBackend::from_image(image(FatType::Fat12)).unwrap();
+        let fd = b.openat_path(b"/one.txt").unwrap();
+        let mut out = [0u8; 4];
+        assert_eq!(b.read_into(fd, 4, &mut out).unwrap(), (4, 4));
+        assert_eq!(b.write_bytes(fd, b"++").unwrap(), 2);
+        assert_eq!(b.statx_path(b"/one.txt"), Ok(6));
+        let fd2 = b.openat_path(b"/one.txt").unwrap();
+        let mut all = [0u8; 6];
+        assert_eq!(b.read_into(fd2, 6, &mut all).unwrap(), (6, 6));
+        assert_eq!(&all, b"ONE\n++");
+    }
+
+    #[test]
+    fn append_grows_file_across_cluster_boundary_and_links_chain() {
+        let mut b = FatBackend::from_image(image(FatType::Fat12)).unwrap();
+        let payload = vec![b'Z'; 700];
+        b.write_path(b"/one.txt", payload.as_slice()).unwrap();
+        assert_eq!(b.statx_path(b"/one.txt"), Ok(700));
+        let entry = b.lookup_entry(b"/one.txt").unwrap();
+        assert_eq!(b.layout().fat_type, FatType::Fat12);
+        assert!(b.fs.next_cluster(entry.start_cluster).unwrap().is_some());
+        let fd = b.openat_path(b"/one.txt").unwrap();
+        let mut out = vec![0u8; 700];
+        assert_eq!(
+            b.read_into(fd, 700, out.as_mut_slice()).unwrap(),
+            (700, 700)
+        );
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn cluster_exhaustion_returns_stable_error_without_unrelated_corruption() {
+        let mut img = image(FatType::Fat12);
+        for c in 7..19 {
+            set_fat12(&mut img, c, 0x0fff);
+        }
+        let mut b = FatBackend::from_image(img).unwrap();
+        assert_eq!(
+            b.write_path(b"/one.txt", &vec![b'X'; 4096]),
+            Err(VfsError::Unsupported)
+        );
+        let fd = b.openat_path(b"/hello.txt").unwrap();
+        let mut out = [0u8; 2];
+        assert_eq!(b.read_into(fd, 2, &mut out).unwrap(), (2, 2));
+        assert_eq!(&out, b"AA");
+    }
+
+    #[test]
+    fn fat32_fsinfo_free_count_and_next_free_update_on_allocation() {
+        let mut img = image(FatType::Fat32);
+        write_fat32_fsinfo_sector(&mut img[SECTOR_512..2 * SECTOR_512], 10, 5);
+        let mut b = FatBackend::from_image(img).unwrap();
+        assert_eq!(b.fat32_fsinfo_values().unwrap(), Some((10, 5)));
+        b.write_path(b"/root.txt", &vec![b'R'; 700]).unwrap();
+        assert_eq!(b.fat32_fsinfo_values().unwrap(), Some((9, 6)));
+    }
+
+    #[test]
+    fn open_subdirectory_file_write_uses_original_path() {
+        let mut b = FatBackend::from_image(image(FatType::Fat12)).unwrap();
+        let fd = b.openat_path(b"/sub/inner.txt").unwrap();
+        assert_eq!(b.write_bytes(fd, b"XY").unwrap(), 2);
+        assert_eq!(b.statx_path(b"/sub/inner.txt"), Ok(5));
+        let fd2 = b.openat_path(b"/sub/inner.txt").unwrap();
+        let mut out = [0u8; 5];
+        assert_eq!(b.read_into(fd2, 5, &mut out).unwrap(), (5, 5));
+        assert_eq!(&out, b"XYN12");
     }
 
     fn image(kind: FatType) -> Vec<u8> {
@@ -1118,11 +1836,27 @@ fn format_boot(
     if kind == FatType::Fat32 {
         img[36..40].copy_from_slice(&spf.to_le_bytes());
         img[44..48].copy_from_slice(&root_cluster.to_le_bytes());
+        if reserved > 1 {
+            img[48..50].copy_from_slice(&1u16.to_le_bytes());
+            write_fat32_fsinfo_sector(
+                &mut img[SECTOR_512..2 * SECTOR_512],
+                FAT32_FSINFO_FREE_UNKNOWN,
+                2,
+            );
+        }
     } else {
         img[22..24].copy_from_slice(&(spf as u16).to_le_bytes());
     }
     img[510] = 0x55;
     img[511] = 0xaa;
+}
+
+fn write_fat32_fsinfo_sector(dst: &mut [u8], free_count: u32, next_free: u32) {
+    dst[0..4].copy_from_slice(&FAT32_FSINFO_LEAD_SIG.to_le_bytes());
+    dst[484..488].copy_from_slice(&FAT32_FSINFO_STRUCT_SIG.to_le_bytes());
+    dst[488..492].copy_from_slice(&free_count.to_le_bytes());
+    dst[492..496].copy_from_slice(&next_free.to_le_bytes());
+    dst[508..512].copy_from_slice(&FAT32_FSINFO_TRAIL_SIG.to_le_bytes());
 }
 
 fn set_fat12(img: &mut [u8], cluster: u32, value: u32) {

@@ -3,13 +3,77 @@
 
 use super::super::common::service::FsService;
 use super::super::common::vfs_ipc::{
-    CloseRequest, ReadWriteRequest, VfsError, close_message, openat_inline_message, read_message,
-    statx_inline_message,
+    close_message, openat_inline_message, read_message, statx_inline_message,
+    write_inline_reply_message, CloseRequest, ReadWriteRequest, VfsError,
 };
-use super::fs::{FAT_HELLO_PATH, FatBackend, FatBackendKind, FatError};
+use super::fs::{FatBackend, FatBackendKind, FatError, FAT_HELLO_PATH};
+use yarm_ipc_abi::vfs_abi::{
+    VfsWriteInlineReply, VfsWriteInlineRequest, VFS_OP_WRITE_INLINE,
+    VFS_SHARED_IO_F_CURRENT_OFFSET, VFS_SHARED_IO_STATUS_OK,
+};
+use yarm_srv_common::service_loop::RequestResponseService;
 use yarm_srv_common::vfs_reply::VfsReply;
+use yarm_user_rt::ipc::Message;
 
-pub type FatService = FsService<FatBackend>;
+#[derive(Debug)]
+pub struct FatService {
+    inner: FsService<FatBackend>,
+    inline_writes: usize,
+}
+
+impl FatService {
+    pub const fn with_backend(backend: FatBackend) -> Self {
+        Self {
+            inner: FsService::with_backend(backend),
+            inline_writes: 0,
+        }
+    }
+
+    pub const fn handled_count(&self) -> usize {
+        self.inner.handled_count() + self.inline_writes
+    }
+
+    pub const fn backend(&self) -> &FatBackend {
+        self.inner.backend()
+    }
+
+    pub fn backend_mut(&mut self) -> &mut FatBackend {
+        self.inner.backend_mut()
+    }
+
+    pub fn handle(&mut self, request: Message) -> Result<Message, VfsError> {
+        if request.opcode != VFS_OP_WRITE_INLINE {
+            return self.inner.handle(request);
+        }
+        let inline =
+            VfsWriteInlineRequest::decode(request.as_slice()).map_err(|_| VfsError::Malformed)?;
+        if self.backend().backend_kind() != FatBackendKind::MemoryImage
+            || inline.flags & VFS_SHARED_IO_F_CURRENT_OFFSET == 0
+        {
+            return Err(VfsError::Unsupported);
+        }
+        let bytes_written = self.backend_mut().write_bytes(inline.fd, inline.bytes)?;
+        self.inline_writes = self.inline_writes.saturating_add(1);
+        write_inline_reply_message(VfsWriteInlineReply {
+            request_id: inline.request_id,
+            bytes_completed: bytes_written as u64,
+            status: VFS_SHARED_IO_STATUS_OK,
+            flags: 0,
+        })
+    }
+}
+
+impl RequestResponseService<Message, Message> for FatService {
+    type Error = VfsError;
+
+    fn service_name(&self) -> &'static str {
+        "fat"
+    }
+
+    fn handle(&mut self, request: Message) -> Result<Message, Self::Error> {
+        FatService::handle(self, request)
+    }
+}
 
 pub const FAT_DEFAULT_BLOCK_DEVICE_ID: u64 = 1;
 pub const FAT_DEFAULT_MOUNT_PREFIX: &[u8] = b"/fat";
@@ -281,8 +345,14 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
-    use crate::fs::common::vfs_ipc::VfsBackend;
+    use crate::fs::common::vfs_ipc::{write_inline_message, VfsBackend};
+    use yarm_ipc_abi::vfs_abi::{
+        VfsWriteInlineReply, VFS_OP_READ_SHARED_REPLY, VFS_OP_WRITE_SHARED_REQUEST,
+        VFS_SHARED_IO_F_CURRENT_OFFSET,
+    };
 
     #[test]
     fn fat_service_chooses_ipc_block_backend_when_config_present() {
@@ -316,7 +386,81 @@ mod tests {
         assert_eq!(n, 13);
         assert_eq!(inline, 13);
         assert_eq!(svc.backend_mut().statx_path(FAT_HELLO_PATH), Ok(13));
-        assert_eq!(svc.backend_mut().write(fd, 1), Err(VfsError::Unsupported));
+        assert_eq!(svc.backend_mut().write(fd, 1), Ok(1));
+        assert_eq!(svc.backend_mut().statx_path(FAT_HELLO_PATH), Ok(14));
+    }
+
+    #[test]
+    fn fat_service_routes_exact_inline_overwrite_and_persists_image() {
+        let mut svc = FatService::with_backend(FatBackend::new());
+        let fd = svc.backend_mut().openat_path(FAT_HELLO_PATH).expect("open");
+        let request = write_inline_message(VfsWriteInlineRequest {
+            fd,
+            file_offset: 0,
+            request_id: 11,
+            flags: VFS_SHARED_IO_F_CURRENT_OFFSET,
+            bytes: b"Exact",
+        })
+        .expect("inline request");
+        let reply = svc.handle(request).expect("inline write");
+        assert_eq!(reply.opcode, VFS_OP_WRITE_INLINE);
+        assert_eq!(
+            VfsWriteInlineReply::decode(reply.as_slice()).expect("reply"),
+            VfsWriteInlineReply {
+                request_id: 11,
+                bytes_completed: 5,
+                status: VFS_SHARED_IO_STATUS_OK,
+                flags: 0,
+            }
+        );
+
+        let image = svc.backend().memory_image().expect("memory image").to_vec();
+        let mut remounted = FatBackend::from_image(image).expect("remount");
+        let fd = remounted.openat_path(FAT_HELLO_PATH).expect("reopen");
+        let mut out = [0u8; 13];
+        let (read, inline) = remounted.read_into(fd, 13, &mut out).expect("read back");
+        assert_eq!((read, inline), (13, 13));
+        assert_eq!(&out[..5], b"Exact");
+        assert_eq!(remounted.statx_path(FAT_HELLO_PATH), Ok(13));
+    }
+
+    #[test]
+    fn fat_service_inline_append_crosses_cluster_and_updates_size() {
+        let mut backend = FatBackend::new();
+        let seed = vec![0x31; 500];
+        backend.write_path(FAT_HELLO_PATH, &seed).expect("seed");
+        let fd = backend.openat_path(FAT_HELLO_PATH).expect("open");
+        let mut consumed = vec![0u8; 500];
+        assert_eq!(backend.read_into(fd, 500, &mut consumed), Ok((500, 500)));
+        let mut svc = FatService::with_backend(backend);
+        let suffix = [0x7au8; 30];
+        let request = write_inline_message(VfsWriteInlineRequest {
+            fd,
+            file_offset: 0,
+            request_id: 12,
+            flags: VFS_SHARED_IO_F_CURRENT_OFFSET,
+            bytes: &suffix,
+        })
+        .expect("inline append");
+        svc.handle(request).expect("append");
+
+        let image = svc.backend().memory_image().expect("memory image").to_vec();
+        let mut remounted = FatBackend::from_image(image).expect("remount");
+        assert_eq!(remounted.statx_path(FAT_HELLO_PATH), Ok(530));
+        let fd = remounted.openat_path(FAT_HELLO_PATH).expect("reopen");
+        let mut all = vec![0u8; 530];
+        assert_eq!(remounted.read_into(fd, 530, &mut all), Ok((530, 530)));
+        assert_eq!(&all[..500], seed.as_slice());
+        assert_eq!(&all[500..], suffix.as_slice());
+    }
+
+    #[test]
+    fn fat_inline_route_does_not_enable_shared_opcodes() {
+        let mut svc = FatService::with_backend(FatBackend::new());
+        for opcode in [VFS_OP_READ_SHARED_REPLY, VFS_OP_WRITE_SHARED_REQUEST] {
+            let message = Message::with_header(0, opcode, 0, None, &[]).expect("message");
+            assert_eq!(svc.handle(message), Err(VfsError::Unsupported));
+        }
     }
 
     #[test]
@@ -325,7 +469,10 @@ mod tests {
         assert_eq!(default.prefix(), b"/fat");
         assert_eq!(default.device_id, 1);
         assert!(default.readonly);
-        assert_eq!(default.block_cap_source, FatBlockCapSource::ServiceExtraCap0);
+        assert_eq!(
+            default.block_cap_source,
+            FatBlockCapSource::ServiceExtraCap0
+        );
 
         for (prefix, device_id, readonly) in [
             (b"/fat".as_slice(), 1u32, true),
@@ -338,7 +485,10 @@ mod tests {
             assert_eq!(decoded.prefix(), prefix);
             assert_eq!(decoded.device_id, device_id);
             assert_eq!(decoded.readonly, readonly);
-            assert_eq!(decoded.block_cap_source, FatBlockCapSource::ServiceExtraCap0);
+            assert_eq!(
+                decoded.block_cap_source,
+                FatBlockCapSource::ServiceExtraCap0
+            );
             assert_eq!(decoded, configured);
         }
 
@@ -411,5 +561,10 @@ mod tests {
         assert!(doc.contains("sample image"));
         assert!(doc.contains("read-only"));
         assert!(doc.contains("VfsError::Unsupported"));
+        assert!(doc.contains("Production write-path audit"));
+        assert!(doc.contains("VFS_OP_WRITE_INLINE = 28"));
+        assert!(doc.contains("BLK_OP_WRITE = 0x0203"));
+        assert!(doc.contains("1–96 payload bytes"));
+        assert!(doc.contains("opcodes 26/27 remain unsupported"));
     }
 }
