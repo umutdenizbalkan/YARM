@@ -21,8 +21,12 @@ pub enum VfsSharedIoAdapterError {
     Lifecycle(VfsSharedIoLifecycleError),
     UnsupportedMapping,
     StaleHandle,
+    WrongObject,
+    MissingRights,
     BadRange,
     WrongDirection,
+    MapFailure,
+    ReleaseFailure,
     AccessAfterCleanup,
 }
 
@@ -33,6 +37,10 @@ impl From<VfsSharedIoLifecycleError> for VfsSharedIoAdapterError {
 }
 
 /// Direction-safe mapping boundary. A write request can only expose an immutable slice.
+///
+/// A production implementation must resolve an adapter-owned opaque handle/generation registry,
+/// validate the transferred object type, rights, size, and descriptor range, and release the
+/// receive-time mapping exactly once. The descriptor handle is never implicitly a raw VA or cap slot.
 pub trait VfsSharedIoMapper {
     fn with_read_reply_buffer<R>(
         &mut self,
@@ -376,6 +384,28 @@ mod tests {
         assert_eq!(
             with_read_reply_buffer(&lifecycle, &handles, &mut stale, |_| ()),
             Err(VfsSharedIoAdapterError::StaleHandle)
+        );
+    }
+
+    #[test]
+    fn production_mapper_rejects_both_directions_and_release() {
+        let descriptor = VfsSharedBufferDescriptor::new(1, 1, 0, 4, VFS_SHARED_BUFFER_FS_WRITE);
+        let mut mapper = UnsupportedSharedIoMapper;
+        assert_eq!(
+            mapper.with_read_reply_buffer(descriptor, 4, |_| ()),
+            Err(VfsSharedIoAdapterError::UnsupportedMapping)
+        );
+        let write_descriptor = VfsSharedBufferDescriptor {
+            access: VFS_SHARED_BUFFER_FS_READ,
+            ..descriptor
+        };
+        assert_eq!(
+            mapper.with_write_request_buffer(write_descriptor, 4, |_| ()),
+            Err(VfsSharedIoAdapterError::UnsupportedMapping)
+        );
+        assert_eq!(
+            mapper.release(descriptor),
+            Err(VfsSharedIoAdapterError::UnsupportedMapping)
         );
     }
 

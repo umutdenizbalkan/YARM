@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-# VFS shared-I/O contract (FS-11 through FS-16 scaffold)
+# VFS shared-I/O contract (FS-11 through FS-17 scaffold)
 
 ## Status and scope
 
 `VFS_SHARED_IO_ENABLED` is the umbrella name for a future userspace VFS/filesystem transfer path.
-FS-11 through FS-16 define service-ABI records, exact inline write payloads, typed read/write plans,
+FS-11 through FS-17 define service-ABI records, exact inline write payloads, typed read/write plans,
 a borrowed test-only shared-buffer model, a helper-only lifecycle/cleanup state machine, and the
 direction-safe adapter boundary required by a future real mapper. These are
 design and test scaffolding only. They do **not** define or enable a runtime feature
@@ -268,6 +268,85 @@ direction, descriptor arithmetic, and actual borrowed-object bounds. Adapter-lev
 This borrowed adapter is not a production mapping implementation and is never installed in live
 `VfsService`.
 
+## FS-17 transfer/map/unmap/revoke audit
+
+FS-17 audited `yarm-user-rt`, `yarm-srv-common`, the userspace IPC ABI, existing filesystem services,
+and the frozen kernel syscall surface without changing kernel code. A complete production
+`VfsSharedIoMapper` cannot be implemented safely from the userspace APIs currently exposed.
+
+### Feasibility classification
+
+- **A — real generic userspace adapter possible now:** no.
+- **B — specialized MemoryObject path:** yes. `initramfs_srv` can create a read-only initramfs
+  file-slice MemoryObject and transfer it for the specialized spawn/file-grant flow. That path neither
+  creates requester-owned writable shared buffers nor maps arbitrary objects into an FS server.
+- **C — cap-transfer metadata without a usable generic mapper:** yes. Receive metadata can report a
+  materialized transferred cap, and `SharedMemoryRegion` encodes only offset/length. Neither proves
+  the object type, rights, size, mapping address, or VFS generation.
+- **D — missing userspace wrappers/protocol:** yes. The frozen kernel surface contains receive-time
+  shared-region map intent and transfer-release behavior, but `yarm-user-rt` hardcodes its default
+  receive intent, does not return mapped base/length, and exposes no transfer-release wrapper.
+- **E — potentially missing kernel/capability/VM contract:** yes for the full required profile. There
+  is no userspace object-info query that proves MemoryObject/shared-buffer type, rights, and size, and
+  no general userspace helper for creating and retaining a transferable requester-owned writable
+  object suitable for read replies. These gaps require a separately scoped ABI design unless an
+  existing privileged service can provide an equivalent contract.
+- **F — unsafe/unclear:** therefore the real adapter remains deferred.
+
+The existing shared-memory receive path is not wire-compatible with simply dispatching reserved VFS
+opcode `26` or `27`: shared-region delivery uses its own transport opcode and maps a transferred
+region at receive time. A userspace framing convention must bind the mapped region to the VFS
+operation, request ID, direction, and local handle generation without treating a local cap number or
+virtual address as the ABI's opaque handle.
+
+### Required userspace shared-object adapter ABI
+
+A future implementation should expose the following deliberately typed operations.
+
+#### `yarm-user-rt`
+
+1. A receive API taking an explicit mapping intent: read-only for `WRITE_SHARED_REQUEST`, or
+   read/write for `READ_SHARED_REPLY`.
+2. A receive result containing the application framing metadata, materialized local transfer cap,
+   mapped base, mapped length, and the exact transferred region length.
+3. A transfer-release wrapper over the already-frozen release syscall, with stable distinction
+   between stale cap, bad mapping, and release failure.
+4. A safe borrowed mapping guard whose drop/explicit close path cannot silently double-release and
+   which never exposes mutable bytes for a read-only intent.
+5. Deadline/cancellation variants with the same rollback guarantees as ordinary receive.
+
+Adding these wrappers does not itself require changing syscall numbers, but it must preserve the
+existing register ABI exactly and requires focused userspace tests.
+
+#### Userspace service/IPC contract
+
+1. A framing format that preserves VFS opcode, request ID, direction, descriptor offset/length, and
+   generation while the bulk bytes are delivered through the shared-region transport.
+2. A service-local registry mapping opaque `(handle, generation)` to the received local cap, mapped
+   base/length, rights/direction, owner/request identity, and cleanup state.
+3. An object-validation source. If userspace cannot query object kind/rights/size, a dedicated trusted
+   shared-buffer service or a new separately reviewed object-info ABI is required.
+4. An allocation/ownership path for requester-owned writable buffers used by `READ_SHARED_REPLY`;
+   the specialized read-only initramfs file-slice constructor is insufficient.
+5. Revocation and process-exit delivery routed to the owning filesystem request, not merely a generic
+   supervisor notification.
+
+#### `VfsSharedIoMapper`
+
+The concrete mapper must resolve only through that registry, verify object kind, generation, rights,
+size, descriptor range, request identity, and direction, and then expose a scoped borrow. `release`
+must unmap/revoke exactly once and invalidate the registry entry even when timeout, cancellation, or
+endpoint exit wins. Errors map to `UnsupportedMapping`, `StaleHandle`, `WrongObject`, `MissingRights`,
+`BadRange`, `WrongDirection`, `MapFailure`, `ReleaseFailure`, or `AccessAfterCleanup`.
+
+### FS-17 implementation decision
+
+No real mapper or userspace syscall wrapper is added in FS-17 because the full object creation,
+introspection, framing, and lifecycle binding contract is incomplete. `UnsupportedSharedIoMapper`
+remains the production default. Its regression test verifies that mutable read-reply access,
+immutable write-request access, and release all return `UnsupportedMapping`. Live `VfsService`
+continues to reject opcodes `26`, `27`, and `28`.
+
 ## Ownership and permissions
 
 | Stage | Object owner | FS permission | FS obligation | Retention after reply |
@@ -319,13 +398,17 @@ requested length.
    and deterministic cancel/timeout/exit race tests; no live mapper or process hooks.
 6. **FS-16:** define the direction-safe mapper boundary and borrowed test adapter; defer the
    RAMFS-only live experiment because no general userspace mapping primitive exists.
-7. **FS-17 external dependency:** add or expose the real userspace transfer/map/unmap/revoke adapter,
-   then revisit a disabled-by-default RAMFS-only route.
-8. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
+7. **FS-17:** audit the dormant transfer-map/release surface and document the missing userspace
+   wrappers, framing, registry, object introspection, and writable-object creation contract; keep the
+   production mapper unsupported.
+8. **FS-18 decision point:** either add only the safe `yarm-user-rt` wrappers around the frozen
+   receive-intent/release ABI and keep live routing disabled, or create a separate kernel/ABI design
+   task for object introspection and generic shared-buffer creation.
+9. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
    and advertise only the read capability after lifecycle tests pass.
-9. **Write enablement:** independently implement read-only request-buffer mapping for
+10. **Write enablement:** independently implement read-only request-buffer mapping for
    `WRITE_SHARED_REQUEST`; only then connect writable filesystems to the FS-12 block path.
-10. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
+11. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
    has routing, permissions, cancellation, cleanup, and process-exit tests. Supporting one stage does
    not imply support for the other.
 
@@ -340,7 +423,7 @@ gated backend; FAT production writes and ext4 writes remain out of scope until t
 
 ## Explicit non-changes
 
-FS-16 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
+FS-17 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
 init/PM/supervisor/driver-manager policy, runtime service spawn order, FAT production writes, ext4
 writes, the FS-12 block stack, or the ext4 FS-10 read-side matrix. Kernel/global-lock work is
 untouched. No QEMU smoke is required because no runtime behavior is enabled.
