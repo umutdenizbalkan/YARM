@@ -217,6 +217,18 @@ impl VfsSharedIoLifecycle {
         self.bytes_completed
     }
 
+    pub const fn descriptor(&self) -> VfsSharedBufferDescriptor {
+        self.descriptor
+    }
+
+    pub const fn requested_len(&self) -> u64 {
+        self.requested_len
+    }
+
+    pub const fn direction(&self) -> VfsSharedIoDirection {
+        self.direction
+    }
+
     pub fn map<const N: usize>(
         &mut self,
         handles: &VfsSharedIoHandleTable<N>,

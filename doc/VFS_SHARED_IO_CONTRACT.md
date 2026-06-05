@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-# VFS shared-I/O contract (FS-11 through FS-15 scaffold)
+# VFS shared-I/O contract (FS-11 through FS-16 scaffold)
 
 ## Status and scope
 
 `VFS_SHARED_IO_ENABLED` is the umbrella name for a future userspace VFS/filesystem transfer path.
-FS-11 through FS-15 define service-ABI records, exact inline write payloads, typed read/write plans,
-a borrowed test-only shared-buffer model, and a helper-only lifecycle/cleanup state machine. These are
+FS-11 through FS-16 define service-ABI records, exact inline write payloads, typed read/write plans,
+a borrowed test-only shared-buffer model, a helper-only lifecycle/cleanup state machine, and the
+direction-safe adapter boundary required by a future real mapper. These are
 design and test scaffolding only. They do **not** define or enable a runtime feature
 switch, advertise a capability, transfer/map a MemoryObject, or change live filesystem dispatch.
 
@@ -211,6 +212,62 @@ way as the read lifecycle.
 These are deterministic helper tests, not hooks into actual timeout clocks or process-exit delivery.
 A live implementation must preserve the same first-winner semantics under concurrency.
 
+## FS-16 userspace mapping adapter boundary
+
+`VfsSharedIoMapper` is the boundary between a validated `VfsSharedIoLifecycle` and any future
+userspace object mapper. It has two deliberately asymmetric operations:
+
+- `with_read_reply_buffer` exposes a temporary mutable slice only for `READ_SHARED_REPLY`;
+- `with_write_request_buffer` exposes only an immutable slice for `WRITE_SHARED_REQUEST`.
+
+The access wrappers first require the lifecycle to be `InFlight`, validate the active opaque
+handle/generation through `VfsSharedIoHandleTable`, and enforce the matching direction. Only then can
+the mapper resolve the descriptor range. `cleanup_shared_io` calls the adapter's `release` boundary
+before consuming the FS-15 cleanup token; repeated cleanup observes `Cleaned` and does not release the
+adapter twice. After cleanup, lifecycle authorization fails before the adapter is invoked.
+
+`UnsupportedSharedIoMapper` is the production-safe default boundary: both operations return
+`UnsupportedMapping`. It prevents an opaque descriptor handle from being mistaken for a kernel cap
+slot while allowing future service code to depend on a stable interface.
+
+### Mapping audit and decision
+
+The current userspace runtime can receive transferred-cap metadata and has a specialized API to
+create a read-only initramfs file-slice MemoryObject for process spawning. It does **not** expose a
+general operation that maps an arbitrary transferred MemoryObject into an FS server, requests
+FS-write permission for a read reply, queries object size/rights/generation, or revokes/unmaps that
+mapping. The opaque shared-I/O handle therefore cannot currently be associated safely with real
+bytes.
+
+Classification:
+
+- **A — real mapping adapter today:** no;
+- **B — test adapter:** yes;
+- **C — external dependency:** a userspace-visible transfer/map/unmap/revoke primitive with object
+  type, rights, size, and generation validation is required;
+- **D — unsafe shortcut:** interpreting `object_handle` as a capability slot or caller virtual address
+  is explicitly forbidden.
+
+Because that dependency is absent, FS-16 does not add the proposed RAMFS live route or a local live
+feature flag. Default and test-configured `VfsService` routing remain unchanged and opcodes `26`,
+`27`, and `28` remain `Unsupported`.
+
+### Test adapter and RAMFS proofs
+
+`BorrowedSharedIoTestMapper` is compiled only for tests. It checks handle/generation identity,
+direction, descriptor arithmetic, and actual borrowed-object bounds. Adapter-level tests prove:
+
+- RAMFS data can be read into a mutable read-reply range before cleanup;
+- immutable write-request bytes can be consumed by RAMFS and read back exactly;
+- wrong lifecycle direction, stale adapter generation, and an out-of-bounds range are rejected;
+- cleanup calls the adapter release boundary exactly once and revokes subsequent access;
+- duplicate cleanup remains idempotent without a second adapter release;
+- the unsupported production mapper is explicit; and
+- timeout cleanup remains idempotent and permits one flagged inline fallback.
+
+This borrowed adapter is not a production mapping implementation and is never installed in live
+`VfsService`.
+
 ## Ownership and permissions
 
 | Stage | Object owner | FS permission | FS obligation | Retention after reply |
@@ -260,19 +317,22 @@ requested length.
    read/write proofs; still no live mapping, routing, cancellation, or cleanup state machine.
 5. **FS-15:** helper lifecycle states, generation invalidation, first-winner cleanup, fallback gating,
    and deterministic cancel/timeout/exit race tests; no live mapper or process hooks.
-6. **FS-16 gated experiment:** add the first RAMFS-only live experiment behind a disabled-by-default
-   local service capability after defining the real transfer/mapping adapter and concurrency model.
-7. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
+6. **FS-16:** define the direction-safe mapper boundary and borrowed test adapter; defer the
+   RAMFS-only live experiment because no general userspace mapping primitive exists.
+7. **FS-17 external dependency:** add or expose the real userspace transfer/map/unmap/revoke adapter,
+   then revisit a disabled-by-default RAMFS-only route.
+8. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
    and advertise only the read capability after lifecycle tests pass.
-8. **Write enablement:** independently implement read-only request-buffer mapping for
+9. **Write enablement:** independently implement read-only request-buffer mapping for
    `WRITE_SHARED_REQUEST`; only then connect writable filesystems to the FS-12 block path.
-9. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
+10. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
    has routing, permissions, cancellation, cleanup, and process-exit tests. Supporting one stage does
    not imply support for the other.
 
 ## Requirements before production enablement
 
-Neither capability may be advertised until a real userspace transfer primitive supplies object type,
+Neither capability may be advertised until a real implementation of `VfsSharedIoMapper` is backed
+by a userspace transfer primitive that supplies object type,
 rights, size, generation, mapping, revocation, cancellation, and process-exit notifications. The live
 implementation must prove concurrent first-winner cleanup, stale-handle rejection, no access after
 cleanup, partial completion accounting, and fallback only after unmap/release. RAMFS must be the first
@@ -280,7 +340,7 @@ gated backend; FAT production writes and ext4 writes remain out of scope until t
 
 ## Explicit non-changes
 
-FS-15 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
+FS-16 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
 init/PM/supervisor/driver-manager policy, runtime service spawn order, FAT production writes, ext4
 writes, the FS-12 block stack, or the ext4 FS-10 read-side matrix. Kernel/global-lock work is
 untouched. No QEMU smoke is required because no runtime behavior is enabled.
