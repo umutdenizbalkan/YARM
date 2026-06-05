@@ -499,6 +499,11 @@ impl VfsBackend for RamFsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::common::vfs_ipc::{VfsWritePayload, write_inline_message, write_shared_message};
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_SHARED_BUFFER_FS_READ, VFS_WRITE_INLINE_MAX_BYTES, VfsSharedBufferDescriptor,
+        VfsWriteInlineRequest, VfsWriteSharedRequest,
+    };
 
     #[test]
     fn empty_root_exists() {
@@ -612,5 +617,60 @@ mod tests {
         assert_eq!(fs.write_bytes(fd, b"1234"), Ok(4));
         assert_eq!(fs.write_bytes(fd, b"5"), Err(RamFsError::Capacity));
         assert_eq!(fs.create_file(b"/ram/b"), Err(RamFsError::Capacity));
+    }
+
+    #[test]
+    fn ramfs_inline_write_payload_helper_writes_exact_bytes() {
+        let mut fs = RamFsBackend::new();
+        fs.create_file(b"/ram/payload").expect("create");
+        let fd = fs.open_path(b"/ram/payload").expect("open");
+        let request = VfsWriteInlineRequest {
+            fd,
+            file_offset: 0,
+            request_id: 41,
+            flags: 0,
+            bytes: b"real write payload",
+        };
+        let message = write_inline_message(request).expect("encode inline payload");
+        let payload = VfsWritePayload::decode(message.opcode, message.as_slice()).expect("decode");
+        let (decoded_fd, _, _, bytes) = payload.inline_parts().expect("inline bytes");
+        assert_eq!(fs.write_bytes(decoded_fd, bytes), Ok(bytes.len()));
+
+        fs.close_fd(fd).expect("close");
+        let fd = fs.open_path(b"/ram/payload").expect("reopen");
+        let mut out = [0u8; 32];
+        let read = fs.read_bytes(fd, &mut out).expect("read back");
+        assert_eq!(&out[..read], b"real write payload");
+    }
+
+    #[test]
+    fn ramfs_oversized_inline_requires_shared_plan_but_mapping_stays_unavailable() {
+        let oversized = [0u8; VFS_WRITE_INLINE_MAX_BYTES + 1];
+        let inline = VfsWriteInlineRequest {
+            fd: 1,
+            file_offset: 0,
+            request_id: 42,
+            flags: 0,
+            bytes: &oversized,
+        };
+        assert_eq!(write_inline_message(inline), Err(VfsError::Malformed));
+
+        let shared = VfsWriteSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: oversized.len() as u64,
+            request_id: 43,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(
+                9,
+                2,
+                0,
+                oversized.len() as u64,
+                VFS_SHARED_BUFFER_FS_READ,
+            ),
+        };
+        let message = write_shared_message(shared).expect("shared helper");
+        let payload = VfsWritePayload::decode(message.opcode, message.as_slice()).expect("decode");
+        assert_eq!(payload.inline_parts(), Err(VfsError::Unsupported));
     }
 }

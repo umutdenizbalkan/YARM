@@ -77,6 +77,9 @@ pub const VFS_OP_READ_SHARED_REPLY: u16 = 26;
 /// FS-11 reserved service opcode for the helper-only WRITE_SHARED_REQUEST protocol.
 /// No router or filesystem backend dispatches this opcode yet.
 pub const VFS_OP_WRITE_SHARED_REQUEST: u16 = 27;
+/// FS-13 reserved service opcode for a bounded helper-only inline write payload.
+/// Live VFS dispatch continues to use the legacy length-only `VFS_OP_WRITE` path.
+pub const VFS_OP_WRITE_INLINE: u16 = 28;
 pub const VFS_OPENAT_INLINE_PATH_MAX: usize = 96;
 pub const VFS_OPENAT_INLINE_PATH_HEADER_BYTES: usize = 25;
 pub const VFS_OPENAT_INLINE_PATH_MAX_BYTES: usize =
@@ -282,6 +285,79 @@ impl ReadWriteArgs {
     }
 }
 
+/// Header bytes in a helper-only inline write request.
+pub const VFS_WRITE_INLINE_HEADER_BYTES: usize = 32;
+/// Maximum exact write bytes carried in one 128-byte service IPC message.
+pub const VFS_WRITE_INLINE_MAX_BYTES: usize = 128 - VFS_WRITE_INLINE_HEADER_BYTES;
+
+/// Helper-only exact-byte write request. This does not replace the live length-only write opcode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VfsWriteInlineRequest<'a> {
+    pub fd: u64,
+    pub file_offset: u64,
+    pub request_id: u64,
+    pub flags: u32,
+    pub bytes: &'a [u8],
+}
+
+impl<'a> VfsWriteInlineRequest<'a> {
+    pub const MAX_BYTES: usize = VFS_WRITE_INLINE_MAX_BYTES;
+
+    pub fn encode(self) -> Result<([u8; 128], usize), VfsCodecError> {
+        self.validate()?;
+        let mut out = [0u8; 128];
+        out[0..8].copy_from_slice(&self.fd.to_le_bytes());
+        out[8..16].copy_from_slice(&self.file_offset.to_le_bytes());
+        out[16..24].copy_from_slice(&self.request_id.to_le_bytes());
+        out[24..28].copy_from_slice(&self.flags.to_le_bytes());
+        out[28..32].copy_from_slice(&(self.bytes.len() as u32).to_le_bytes());
+        out[32..32 + self.bytes.len()].copy_from_slice(self.bytes);
+        Ok((out, VFS_WRITE_INLINE_HEADER_BYTES + self.bytes.len()))
+    }
+
+    pub fn decode(payload: &'a [u8]) -> Result<Self, VfsCodecError> {
+        if payload.len() < VFS_WRITE_INLINE_HEADER_BYTES {
+            return Err(VfsCodecError::Malformed);
+        }
+        let data_len = decode_u32_at(payload, 28)? as usize;
+        if data_len == 0 || data_len > VFS_WRITE_INLINE_MAX_BYTES {
+            return Err(VfsCodecError::InvalidDescriptor);
+        }
+        if payload.len() != VFS_WRITE_INLINE_HEADER_BYTES + data_len {
+            return Err(VfsCodecError::Malformed);
+        }
+        let value = Self {
+            fd: decode_u64_at(payload, 0)?,
+            file_offset: decode_u64_at(payload, 8)?,
+            request_id: decode_u64_at(payload, 16)?,
+            flags: decode_u32_at(payload, 24)?,
+            bytes: &payload[32..],
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(self) -> Result<(), VfsCodecError> {
+        if self.request_id == 0 || self.bytes.is_empty() {
+            return Err(VfsCodecError::InvalidDescriptor);
+        }
+        if self.bytes.len() > VFS_WRITE_INLINE_MAX_BYTES {
+            return Err(VfsCodecError::InvalidDescriptor);
+        }
+        validate_write_flags(self.flags, self.file_offset)
+    }
+}
+
+fn validate_write_flags(flags: u32, file_offset: u64) -> Result<(), VfsCodecError> {
+    if flags & !VFS_SHARED_IO_F_KNOWN != 0 {
+        return Err(VfsCodecError::UnsupportedFlags);
+    }
+    if flags & VFS_SHARED_IO_F_CURRENT_OFFSET != 0 && file_offset != 0 {
+        return Err(VfsCodecError::Malformed);
+    }
+    Ok(())
+}
+
 /// Shared-I/O capability bits advertised by a future VFS/filesystem handshake.
 /// FS-11 defines the wire model only; no live endpoint advertises either bit.
 pub const VFS_SHARED_IO_CAP_READ_SHARED_REPLY: u32 = 1 << 0;
@@ -345,7 +421,11 @@ impl VfsSharedBufferDescriptor {
     }
 
     pub fn validate(self, required_access: u32, requested_len: u64) -> Result<(), VfsCodecError> {
-        if self.object_handle == 0 || self.buffer_len < requested_len {
+        if self.object_handle == 0
+            || self.object_generation == 0
+            || requested_len == 0
+            || self.buffer_len < requested_len
+        {
             return Err(VfsCodecError::InvalidDescriptor);
         }
         if self.access & !VFS_SHARED_BUFFER_ACCESS_KNOWN != 0 {
@@ -399,12 +479,10 @@ macro_rules! shared_request {
             pub const ENCODED_LEN: usize = 80;
 
             pub fn validate(self) -> Result<(), VfsCodecError> {
-                if self.flags & !VFS_SHARED_IO_F_KNOWN != 0 {
-                    return Err(VfsCodecError::UnsupportedFlags);
+                if self.request_id == 0 {
+                    return Err(VfsCodecError::InvalidDescriptor);
                 }
-                if self.flags & VFS_SHARED_IO_F_CURRENT_OFFSET != 0 && self.file_offset != 0 {
-                    return Err(VfsCodecError::Malformed);
-                }
+                validate_write_flags(self.flags, self.file_offset)?;
                 self.buffer.validate($required_access, self.requested_len)
             }
 
@@ -489,6 +567,7 @@ macro_rules! shared_reply {
 
 shared_reply!(VfsReadSharedReply);
 shared_reply!(VfsWriteSharedReply);
+shared_reply!(VfsWriteInlineReply);
 
 fn decode_u64_at(bytes: &[u8], offset: usize) -> Result<u64, VfsCodecError> {
     let input = bytes
@@ -866,7 +945,7 @@ mod tests {
         };
         let (encoded, len) = args.encode().expect("encode");
         assert_eq!(len, 22); // 17 header + 5 prefix bytes
-                             // bytes 0-7: cap LE
+        // bytes 0-7: cap LE
         assert_eq!(
             &encoded[0..8],
             &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
@@ -1282,5 +1361,87 @@ mod tests {
 
         let legacy = ReadWriteArgs::new(1, 2, 3);
         assert_eq!(ReadWriteArgs::decode(&legacy.encode()), Ok(legacy));
+    }
+
+    #[test]
+    fn inline_write_request_and_reply_roundtrip_exact_bytes() {
+        let request = VfsWriteInlineRequest {
+            fd: 44,
+            file_offset: 0,
+            request_id: 55,
+            flags: VFS_SHARED_IO_F_CURRENT_OFFSET,
+            bytes: b"exact inline payload",
+        };
+        let (encoded, len) = request.encode().expect("encode inline write");
+        assert_eq!(VfsWriteInlineRequest::decode(&encoded[..len]), Ok(request));
+        let reply = VfsWriteInlineReply {
+            request_id: request.request_id,
+            bytes_completed: request.bytes.len() as u64,
+            status: VFS_SHARED_IO_STATUS_OK,
+            flags: 0,
+        };
+        assert_eq!(
+            VfsWriteInlineReply::decode(&reply.encode().expect("encode reply")),
+            Ok(reply)
+        );
+    }
+
+    #[test]
+    fn inline_write_rejects_empty_oversized_unknown_flags_and_bad_lengths() {
+        let empty = VfsWriteInlineRequest {
+            fd: 1,
+            file_offset: 0,
+            request_id: 1,
+            flags: 0,
+            bytes: b"",
+        };
+        assert_eq!(empty.encode(), Err(VfsCodecError::InvalidDescriptor));
+
+        let oversized = [0u8; VFS_WRITE_INLINE_MAX_BYTES + 1];
+        let request = VfsWriteInlineRequest {
+            bytes: &oversized,
+            ..empty
+        };
+        assert_eq!(request.encode(), Err(VfsCodecError::InvalidDescriptor));
+
+        let request = VfsWriteInlineRequest {
+            bytes: b"x",
+            flags: 1 << 31,
+            ..empty
+        };
+        assert_eq!(request.encode(), Err(VfsCodecError::UnsupportedFlags));
+
+        let request = VfsWriteInlineRequest {
+            bytes: b"x",
+            request_id: 2,
+            ..empty
+        };
+        let (encoded, len) = request.encode().expect("encode");
+        assert_eq!(
+            VfsWriteInlineRequest::decode(&encoded[..len - 1]),
+            Err(VfsCodecError::Malformed)
+        );
+    }
+
+    #[test]
+    fn shared_write_requires_nonzero_generation_length_and_read_only_access() {
+        let mut request = write_shared_request();
+        request.buffer.object_generation = 0;
+        assert_eq!(request.encode(), Err(VfsCodecError::InvalidDescriptor));
+
+        let mut request = write_shared_request();
+        request.requested_len = 0;
+        assert_eq!(request.encode(), Err(VfsCodecError::InvalidDescriptor));
+
+        let mut request = write_shared_request();
+        request.buffer.access = VFS_SHARED_BUFFER_FS_WRITE;
+        assert_eq!(request.encode(), Err(VfsCodecError::PermissionMismatch));
+    }
+
+    #[test]
+    fn inline_write_opcode_is_reserved_without_changing_legacy_write() {
+        assert_eq!(VFS_OP_WRITE, 13);
+        assert_eq!(VFS_OP_WRITE_INLINE, 28);
+        assert_eq!(VFS_WRITE_INLINE_MAX_BYTES, 96);
     }
 }

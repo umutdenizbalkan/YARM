@@ -5,9 +5,10 @@ use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
 };
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsV1Args, VFS_OP_CLOSE, VFS_OP_DUP,
+    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
     VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
     VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE,
+    VfsV1Args,
 };
 use yarm_user_rt::ipc::Message;
 
@@ -440,10 +441,12 @@ impl<B: VfsBackend> VfsService<B> {
 #[cfg(test)]
 mod shared_io_dispatch_tests {
     use super::*;
-    use crate::fs::common::vfs_ipc::{read_shared_message, write_shared_message};
+    use crate::fs::common::vfs_ipc::{
+        read_shared_message, write_inline_message, write_shared_message,
+    };
     use yarm_ipc_abi::vfs_abi::{
-        VfsReadSharedRequest, VfsSharedBufferDescriptor, VfsWriteSharedRequest,
-        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE,
+        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsReadSharedRequest,
+        VfsSharedBufferDescriptor, VfsWriteInlineRequest, VfsWriteSharedRequest,
     };
 
     #[test]
@@ -473,6 +476,19 @@ mod shared_io_dispatch_tests {
         .expect("write shared message");
         assert!(matches!(
             VfsService::<InMemoryBackend>::parse_request(write),
+            Err(VfsError::Unsupported)
+        ));
+
+        let inline = write_inline_message(VfsWriteInlineRequest {
+            fd: 1,
+            file_offset: 0,
+            request_id: 3,
+            flags: 0,
+            bytes: b"not live",
+        })
+        .expect("inline write message");
+        assert!(matches!(
+            VfsService::<InMemoryBackend>::parse_request(inline),
             Err(VfsError::Unsupported)
         ));
     }

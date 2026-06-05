@@ -2,11 +2,12 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm_ipc_abi::vfs_abi::{
-    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsReadSharedRequest, VfsV1Args,
-    VfsWriteSharedRequest, VFS_OP_CLOSE, VFS_OP_DUP, VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL,
-    VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL, VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ,
-    VFS_OP_READ_SHARED_REPLY, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE,
-    VFS_OP_WRITE_SHARED_REQUEST,
+    OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
+    VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
+    VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_READ_SHARED_REPLY, VFS_OP_SENDFILE,
+    VFS_OP_STATX, VFS_OP_WRITE, VFS_OP_WRITE_INLINE, VFS_OP_WRITE_SHARED_REQUEST,
+    VfsReadSharedRequest, VfsV1Args, VfsWriteInlineReply, VfsWriteInlineRequest,
+    VfsWriteSharedReply, VfsWriteSharedRequest,
 };
 use yarm_user_rt::ipc::Message;
 
@@ -61,6 +62,57 @@ pub fn write_message(req: ReadWriteRequest) -> Result<Message, VfsError> {
         &ReadWriteArgs::new(req.fd, req.buf_ptr, req.len).encode(),
     )
     .map_err(|_| VfsError::Malformed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsWritePayload<'a> {
+    Inline(VfsWriteInlineRequest<'a>),
+    Shared(VfsWriteSharedRequest),
+}
+
+impl<'a> VfsWritePayload<'a> {
+    pub fn decode(opcode: u16, payload: &'a [u8]) -> Result<Self, VfsError> {
+        match opcode {
+            VFS_OP_WRITE_INLINE => VfsWriteInlineRequest::decode(payload)
+                .map(Self::Inline)
+                .map_err(|_| VfsError::Malformed),
+            VFS_OP_WRITE_SHARED_REQUEST => VfsWriteSharedRequest::decode(payload)
+                .map(Self::Shared)
+                .map_err(|_| VfsError::Malformed),
+            _ => Err(VfsError::Unsupported),
+        }
+    }
+
+    /// Returns exact inline bytes. Shared payloads remain unavailable until mapping exists.
+    pub fn inline_parts(self) -> Result<(u64, u64, u32, &'a [u8]), VfsError> {
+        match self {
+            Self::Inline(request) => Ok((
+                request.fd,
+                request.file_offset,
+                request.flags,
+                request.bytes,
+            )),
+            Self::Shared(_) => Err(VfsError::Unsupported),
+        }
+    }
+}
+
+/// Helper-only exact-byte inline write message. Live VFS dispatch does not handle opcode 28.
+pub fn write_inline_message(req: VfsWriteInlineRequest<'_>) -> Result<Message, VfsError> {
+    let (payload, len) = req.encode().map_err(|_| VfsError::Malformed)?;
+    Message::with_header(0, VFS_OP_WRITE_INLINE, 0, None, &payload[..len])
+        .map_err(|_| VfsError::Malformed)
+}
+
+pub fn write_inline_reply_message(reply: VfsWriteInlineReply) -> Result<Message, VfsError> {
+    let payload = reply.encode().map_err(|_| VfsError::Malformed)?;
+    Message::with_header(0, VFS_OP_WRITE_INLINE, 0, None, &payload).map_err(|_| VfsError::Malformed)
+}
+
+pub fn write_shared_reply_message(reply: VfsWriteSharedReply) -> Result<Message, VfsError> {
+    let payload = reply.encode().map_err(|_| VfsError::Malformed)?;
+    Message::with_header(0, VFS_OP_WRITE_SHARED_REQUEST, 0, None, &payload)
+        .map_err(|_| VfsError::Malformed)
 }
 
 /// Helper-only encoder for the reserved READ_SHARED_REPLY service request.
@@ -210,7 +262,7 @@ pub fn dispatch_once<S: FilesystemService>(
 mod shared_io_tests {
     use super::*;
     use yarm_ipc_abi::vfs_abi::{
-        VfsSharedBufferDescriptor, VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE,
+        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsSharedBufferDescriptor,
     };
 
     #[test]
@@ -259,5 +311,57 @@ mod shared_io_tests {
             ReadWriteArgs::decode(write.as_slice()),
             Ok(ReadWriteArgs::new(7, 8, 9))
         );
+    }
+
+    #[test]
+    fn inline_write_payload_helper_preserves_exact_bytes_and_replies() {
+        let request = VfsWriteInlineRequest {
+            fd: 9,
+            file_offset: 0,
+            request_id: 77,
+            flags: 0,
+            bytes: b"payload bytes",
+        };
+        let message = write_inline_message(request).expect("inline message");
+        assert_eq!(message.opcode, VFS_OP_WRITE_INLINE);
+        let decoded = VfsWritePayload::decode(message.opcode, message.as_slice()).expect("decode");
+        assert_eq!(
+            decoded.inline_parts(),
+            Ok((9, 0, 0, b"payload bytes".as_slice()))
+        );
+
+        let reply = VfsWriteInlineReply {
+            request_id: 77,
+            bytes_completed: 13,
+            status: 0,
+            flags: 0,
+        };
+        let message = write_inline_reply_message(reply).expect("inline reply");
+        assert_eq!(VfsWriteInlineReply::decode(message.as_slice()), Ok(reply));
+    }
+
+    #[test]
+    fn shared_write_payload_decodes_but_cannot_expose_bytes_without_mapping() {
+        let request = VfsWriteSharedRequest {
+            fd: 4,
+            file_offset: 0,
+            requested_len: 32,
+            request_id: 12,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(6, 2, 8, 32, VFS_SHARED_BUFFER_FS_READ),
+        };
+        let message = write_shared_message(request).expect("shared write message");
+        let decoded = VfsWritePayload::decode(message.opcode, message.as_slice()).expect("decode");
+        assert_eq!(decoded, VfsWritePayload::Shared(request));
+        assert_eq!(decoded.inline_parts(), Err(VfsError::Unsupported));
+
+        let reply = VfsWriteSharedReply {
+            request_id: request.request_id,
+            bytes_completed: 0,
+            status: 5,
+            flags: 0,
+        };
+        let message = write_shared_reply_message(reply).expect("shared reply");
+        assert_eq!(VfsWriteSharedReply::decode(message.as_slice()), Ok(reply));
     }
 }
