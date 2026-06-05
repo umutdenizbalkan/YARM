@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-# VFS shared-I/O contract (FS-11 through FS-17 scaffold)
+# VFS shared-I/O contract (FS-11 through FS-18 scaffold)
 
 ## Status and scope
 
 `VFS_SHARED_IO_ENABLED` is the umbrella name for a future userspace VFS/filesystem transfer path.
-FS-11 through FS-17 define service-ABI records, exact inline write payloads, typed read/write plans,
+FS-11 through FS-18 define service-ABI records, exact inline write payloads, typed read/write plans,
 a borrowed test-only shared-buffer model, a helper-only lifecycle/cleanup state machine, and the
 direction-safe adapter boundary required by a future real mapper. These are
 design and test scaffolding only. They do **not** define or enable a runtime feature
@@ -347,6 +347,60 @@ remains the production default. Its regression test verifies that mutable read-r
 immutable write-request access, and release all return `UnsupportedMapping`. Live `VfsService`
 continues to reject opcodes `26`, `27`, and `28`.
 
+## FS-18 frozen receive/release wrapper audit
+
+FS-18 adds only a typed `yarm-user-rt` wrapper layer around the existing register ABI. It does not
+change syscall numbers, register meanings, kernel code, or live VFS routing.
+
+### ABI classification
+
+- **A — receive-map-intent ABI:** supported through the legacy `IpcRecv` layout. Argument 4 accepts
+  historical default read/write (`0`), explicit read-only (`READ=0x1`), or explicit read/write
+  (`READ|WRITE=0x3`).
+- **B — transfer-release ABI:** supported. Syscall `4` takes local transfer cap, mapped base, and
+  mapped length; zero base and length select the kernel's active-mapping-record fast path.
+- **C — complete mapped receive metadata:** no. The caller knows the requested mapping base, result
+  lane 1 returns the page-rounded mapped length, and result lane 2 returns the receiver-local cap.
+- **D — partial metadata only:** yes. The portable register result does not return the exact unrounded
+  transferred region length or an independently verifiable delivered opcode.
+- **E — direction-safe borrowed slice guard:** not yet safe. Object type, rights, exact region length,
+  and protocol identity remain unverified.
+- **F — metadata-only release guard:** supported. `TransferReleaseToken` is non-copyable, performs no
+  syscall in `Drop`, retries after a failed release, and rejects a second successful release.
+- **G — missing generic mapper ABI:** object introspection, generic writable shared-buffer creation,
+  framing, generation binding, cancellation, and process-exit integration remain absent.
+
+### Wrappers added
+
+`yarm-user-rt::syscall::shared_transfer` exposes:
+
+- `IpcRecvMapIntent::{DefaultReadWrite, ReadOnly, ReadWrite}` with the frozen bit values;
+- unsafe `ipc_recv_transfer_with_map_intent`, which uses the legacy receive registers and requires the
+  caller's endpoint protocol to guarantee the next message is `OPCODE_SHARED_MEM`;
+- `MappedTransferRecv`, containing sender TID, receiver-local transfer cap, caller-provided mapped
+  base, page-rounded mapped length, and requested direction;
+- `TransferReleaseRequest::{explicit, active}` and unsafe `transfer_release`; and
+- a metadata-only `TransferReleaseToken` for explicit, retryable, at-most-once release through the
+  wrapper. It deliberately exposes no byte slice.
+
+The mapped receive wrapper is unsafe because the legacy result does not identify the delivered
+opcode. A plain cap-transfer message could otherwise be misclassified as an auto-mapped shared
+transfer. The wrapper also requires a page-aligned, reserved target range and a capacity large enough
+for the sender's region. Kernel validation remains authoritative.
+
+### recv-v2 limitation
+
+The current frozen syscall layout cannot combine recv-v2 metadata with explicit map intent: recv-v2
+uses argument 4 for metadata-buffer length, while shared-memory receive interprets argument 4 as map
+intent. FS-18 therefore leaves `ipc_recv`, `ipc_recv_v2`, and timed receive behavior unchanged and
+uses the legacy receive layout only in the new protocol-constrained wrapper. No mapped-base or exact
+region-length fields are invented.
+
+These wrappers are necessary but insufficient for `VfsSharedIoMapper`: they do not establish object
+kind, rights, object size, VFS handle generation, request identity, or a generic requester-owned
+writable buffer. `UnsupportedSharedIoMapper` remains the production default, RAMFS live shared I/O
+remains disabled, FAT production writes remain unwired, and ext4 remains read-only.
+
 ## Ownership and permissions
 
 | Stage | Object owner | FS permission | FS obligation | Retention after reply |
@@ -401,14 +455,15 @@ requested length.
 7. **FS-17:** audit the dormant transfer-map/release surface and document the missing userspace
    wrappers, framing, registry, object introspection, and writable-object creation contract; keep the
    production mapper unsupported.
-8. **FS-18 decision point:** either add only the safe `yarm-user-rt` wrappers around the frozen
-   receive-intent/release ABI and keep live routing disabled, or create a separate kernel/ABI design
-   task for object introspection and generic shared-buffer creation.
-9. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
+8. **FS-18:** add typed wrappers for the frozen legacy receive-map-intent and transfer-release
+   register layouts, plus a metadata-only at-most-once successful release token; keep live routing disabled.
+9. **FS-19 decision point:** design the missing object-introspection, generic writable shared-buffer,
+   and VFS/shared-region framing ABI before attempting a concrete mapper.
+10. **Read enablement:** implement transfer/mapping for `READ_SHARED_REPLY`, retain inline fallback,
    and advertise only the read capability after lifecycle tests pass.
-10. **Write enablement:** independently implement read-only request-buffer mapping for
+11. **Write enablement:** independently implement read-only request-buffer mapping for
    `WRITE_SHARED_REQUEST`; only then connect writable filesystems to the FS-12 block path.
-11. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
+12. **Umbrella enablement:** consider `VFS_SHARED_IO_ENABLED` true only when the selected sub-capability
    has routing, permissions, cancellation, cleanup, and process-exit tests. Supporting one stage does
    not imply support for the other.
 
@@ -423,7 +478,7 @@ gated backend; FAT production writes and ext4 writes remain out of scope until t
 
 ## Explicit non-changes
 
-FS-17 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
+FS-18 does not change kernel syscall ABI or `SYSCALL_COUNT`, IPC internals, VM/capability internals,
 init/PM/supervisor/driver-manager policy, runtime service spawn order, FAT production writes, ext4
 writes, the FS-12 block stack, or the ext4 FS-10 read-side matrix. Kernel/global-lock work is
 untouched. No QEMU smoke is required because no runtime behavior is enabled.
