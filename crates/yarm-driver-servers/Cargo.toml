@@ -36,7 +36,6 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "irqmux_srv"
 path = "src/bin/irqmux_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "uart_srv"
