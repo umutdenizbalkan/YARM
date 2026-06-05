@@ -328,6 +328,8 @@ const EXT4_NDIR_BLOCKS: usize = 12;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
 const EXT4_SYMLINK_LIMIT: u8 = 8;
+const EXT4_DX_ROOT_INFO_OFFSET: usize = 24;
+const EXT4_DX_ROOT_ENTRIES_OFFSET: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ext4ImageError {
@@ -488,19 +490,47 @@ impl<'a> Ext4Image<'a> {
                 254,
             )
             .unwrap_or(64)
-            .max(32)
         } else {
             32
         };
-        Ok(Self {
+        if desc_size < 32 || desc_size % 8 != 0 || u64::from(desc_size) > sb.block_size() {
+            return Err(Ext4ImageError::Malformed);
+        }
+        let mounted = Self {
             image,
             sb,
             desc_size,
-        })
+        };
+        mounted.validate_group_descriptor_table()?;
+        Ok(mounted)
     }
 
     pub const fn superblock(&self) -> Ext4Superblock {
         self.sb
+    }
+
+    fn group_count(&self) -> Result<u32, Ext4ImageError> {
+        if self.sb.blocks_per_group == 0 {
+            return Err(Ext4ImageError::Malformed);
+        }
+        let groups = self
+            .sb
+            .blocks_count
+            .saturating_add(u64::from(self.sb.blocks_per_group) - 1)
+            / u64::from(self.sb.blocks_per_group);
+        u32::try_from(groups).map_err(|_| Ext4ImageError::UnsupportedLayout)
+    }
+
+    fn validate_group_descriptor_table(&self) -> Result<(), Ext4ImageError> {
+        let groups = self.group_count()? as usize;
+        let bytes = groups
+            .checked_mul(self.desc_size as usize)
+            .ok_or(Ext4ImageError::Io)?;
+        let table_block = if self.sb.block_size() == 1024 { 2 } else { 1 };
+        let start = self.block_offset(table_block)?;
+        let end = start.checked_add(bytes).ok_or(Ext4ImageError::Io)?;
+        self.image.get(start..end).ok_or(Ext4ImageError::Io)?;
+        Ok(())
     }
 
     fn block_offset(&self, block: u64) -> Result<usize, Ext4ImageError> {
@@ -513,6 +543,9 @@ impl<'a> Ext4Image<'a> {
     }
 
     fn group_desc(&self, group: u32) -> Result<&'a [u8], Ext4ImageError> {
+        if group >= self.group_count()? {
+            return Err(Ext4ImageError::Io);
+        }
         let table_block = if self.sb.block_size() == 1024 { 2 } else { 1 };
         let start = self
             .block_offset(table_block)?
@@ -531,7 +564,11 @@ impl<'a> Ext4Image<'a> {
         } else {
             0
         };
-        Ok(lo | (hi << 32))
+        let block = lo | (hi << 32);
+        if block == 0 || block >= self.sb.blocks_count {
+            return Err(Ext4ImageError::Io);
+        }
+        Ok(block)
     }
 
     fn inode(&self, inode: u32) -> Result<ParsedInode, Ext4ImageError> {
@@ -655,6 +692,9 @@ impl<'a> Ext4Image<'a> {
     }
 
     fn block_bytes(&self, block: u64) -> Result<&'a [u8], Ext4ImageError> {
+        if block >= self.sb.blocks_count {
+            return Err(Ext4ImageError::Io);
+        }
         let start = self.block_offset(block)?;
         let end = start
             .checked_add(self.sb.block_size() as usize)
@@ -663,13 +703,27 @@ impl<'a> Ext4Image<'a> {
     }
 
     fn read_inode_bytes(&self, inode: u32) -> Result<alloc::vec::Vec<u8>, Ext4ImageError> {
-        let inode = self.inode(inode)?;
+        self.read_inode_bytes_from_meta(self.inode(inode)?)
+    }
+
+    fn read_inode_bytes_from_meta(
+        &self,
+        inode: ParsedInode,
+    ) -> Result<alloc::vec::Vec<u8>, Ext4ImageError> {
         if inode.file_type() == Ext4FileType::Directory
             || inode.file_type() == Ext4FileType::Regular
             || (inode.file_type() == Ext4FileType::Symlink && inode.size > 60)
         {
             let mut out = alloc::vec![0u8; inode.size as usize];
             for ex in self.extents(&inode)? {
+                if ex
+                    .start
+                    .checked_add(u64::from(ex.len))
+                    .map(|end| end > self.sb.blocks_count)
+                    .unwrap_or(true)
+                {
+                    return Err(Ext4ImageError::Io);
+                }
                 let src = self.block_offset(ex.start)?;
                 let dst = ex.logical as usize * self.sb.block_size() as usize;
                 if dst >= out.len() {
@@ -723,6 +777,98 @@ impl<'a> Ext4Image<'a> {
         parse_dir_entries(self.read_inode_bytes(inode)?.as_slice())
     }
 
+    fn lookup_dir_entry_inode(&self, dir_inode: u32, name: &[u8]) -> Result<u32, Ext4ImageError> {
+        let inode = self.inode(dir_inode)?;
+        if inode.file_type() != Ext4FileType::Directory {
+            return Err(Ext4ImageError::NotDirectory);
+        }
+        if (inode.flags & EXT4_INDEX_FL) != 0
+            && (self.sb.feature_compat & EXT4_FEATURE_COMPAT_DIR_INDEX) != 0
+        {
+            match self.htree_lookup_inode(&inode, name) {
+                Ok(Some(found)) => return Ok(found),
+                Ok(None) => return Err(Ext4ImageError::NotFound),
+                Err(Ext4ImageError::UnsupportedLayout) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        parse_dir_entries(self.read_inode_bytes(dir_inode)?.as_slice())?
+            .iter()
+            .find(|e| e.name() == name)
+            .map(|e| e.inode)
+            .ok_or(Ext4ImageError::NotFound)
+    }
+
+    fn htree_lookup_inode(
+        &self,
+        dir_inode: &ParsedInode,
+        name: &[u8],
+    ) -> Result<Option<u32>, Ext4ImageError> {
+        let bytes = self.read_inode_bytes_by_meta(dir_inode)?;
+        let block_size = self.sb.block_size() as usize;
+        if bytes.len() < block_size || block_size < EXT4_DX_ROOT_ENTRIES_OFFSET + 8 {
+            return Err(Ext4ImageError::Malformed);
+        }
+        if le_u32(&bytes, EXT4_DX_ROOT_INFO_OFFSET)? != 0 {
+            return Err(Ext4ImageError::UnsupportedLayout);
+        }
+        let hash_version = *bytes
+            .get(EXT4_DX_ROOT_INFO_OFFSET + 4)
+            .ok_or(Ext4ImageError::Malformed)?;
+        let info_len = *bytes
+            .get(EXT4_DX_ROOT_INFO_OFFSET + 5)
+            .ok_or(Ext4ImageError::Malformed)? as usize;
+        let indirect_levels = *bytes
+            .get(EXT4_DX_ROOT_INFO_OFFSET + 6)
+            .ok_or(Ext4ImageError::Malformed)?;
+        if !matches!(hash_version, 0 | 1 | 2 | 3) {
+            return Err(Ext4ImageError::UnsupportedLayout);
+        }
+        if info_len < 8 || indirect_levels != 0 {
+            return Err(Ext4ImageError::UnsupportedLayout);
+        }
+        let limit = le_u16(&bytes, EXT4_DX_ROOT_ENTRIES_OFFSET)? as usize;
+        let count = le_u16(&bytes, EXT4_DX_ROOT_ENTRIES_OFFSET + 2)? as usize;
+        if count == 0 || count > limit {
+            return Err(Ext4ImageError::Malformed);
+        }
+        let entries_bytes = count.checked_mul(8).ok_or(Ext4ImageError::Io)?;
+        let entries_end = EXT4_DX_ROOT_ENTRIES_OFFSET
+            .checked_add(entries_bytes)
+            .ok_or(Ext4ImageError::Io)?;
+        if entries_end > block_size {
+            return Err(Ext4ImageError::Malformed);
+        }
+        let mut last_hash = 0u32;
+        for idx in 0..count {
+            let off = EXT4_DX_ROOT_ENTRIES_OFFSET + idx * 8;
+            let hash = le_u32(&bytes, off)?;
+            if idx > 0 && hash < last_hash {
+                return Err(Ext4ImageError::Malformed);
+            }
+            last_hash = hash;
+            let logical_block = le_u32(&bytes, off + 4)? as usize;
+            let start = logical_block
+                .checked_mul(block_size)
+                .ok_or(Ext4ImageError::Io)?;
+            let end = start.checked_add(block_size).ok_or(Ext4ImageError::Io)?;
+            let leaf = bytes.get(start..end).ok_or(Ext4ImageError::Io)?;
+            for entry in parse_dir_entries(leaf)? {
+                if entry.name() == name {
+                    return Ok(Some(entry.inode));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_inode_bytes_by_meta(
+        &self,
+        inode: &ParsedInode,
+    ) -> Result<alloc::vec::Vec<u8>, Ext4ImageError> {
+        self.read_inode_bytes_from_meta(*inode)
+    }
+
     pub fn lookup_path(&self, path: &[u8]) -> Result<u32, Ext4ImageError> {
         self.lookup_path_inner(path, false, 0)
     }
@@ -755,12 +901,7 @@ impl<'a> Ext4Image<'a> {
             if inode.file_type() != Ext4FileType::Directory {
                 return Err(Ext4ImageError::NotDirectory);
             }
-            let entries = parse_dir_entries(self.read_inode_bytes(current)?.as_slice())?;
-            let next = entries
-                .iter()
-                .find(|e| e.name() == *comp)
-                .map(|e| e.inode)
-                .ok_or(Ext4ImageError::NotFound)?;
+            let next = self.lookup_dir_entry_inode(current, comp)?;
             let next_inode = self.inode(next)?;
             let is_last = idx == comps.len() - 1;
             if next_inode.file_type() == Ext4FileType::Symlink && (!is_last || follow_final) {
@@ -1080,6 +1221,99 @@ mod image_tests {
         ));
     }
 
+    #[test]
+    fn ext4_64bit_descriptor_size_parses_low_inode_table() {
+        let mut img = tiny_ext4_image();
+        let incompat = EXT4_FEATURE_INCOMPAT_FILETYPE
+            | EXT4_FEATURE_INCOMPAT_EXTENTS
+            | EXT4_FEATURE_INCOMPAT_64BIT;
+        put_u32(&mut img, EXT4_SUPERBLOCK_OFFSET + 96, incompat);
+        put_u16(&mut img, EXT4_SUPERBLOCK_OFFSET + 254, 64);
+        assert_eq!(
+            Ext4Image::mount(img.as_slice())
+                .unwrap()
+                .read_file(b"/hello.txt")
+                .unwrap(),
+            b"hello from ext4\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn ext4_64bit_high_inode_table_out_of_image_is_rejected() {
+        let mut img = tiny_ext4_image();
+        let incompat = EXT4_FEATURE_INCOMPAT_FILETYPE
+            | EXT4_FEATURE_INCOMPAT_EXTENTS
+            | EXT4_FEATURE_INCOMPAT_64BIT;
+        put_u32(&mut img, EXT4_SUPERBLOCK_OFFSET + 96, incompat);
+        put_u16(&mut img, EXT4_SUPERBLOCK_OFFSET + 254, 64);
+        put_u32(&mut img, 2 * 1024 + 8, 0);
+        put_u32(&mut img, 2 * 1024 + 40, 1);
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(fs.read_dir(b"/"), Err(Ext4ImageError::Io));
+    }
+
+    #[test]
+    fn ext4_bad_64bit_descriptor_size_or_table_bounds_are_rejected() {
+        let mut img = tiny_ext4_image();
+        let incompat = EXT4_FEATURE_INCOMPAT_FILETYPE
+            | EXT4_FEATURE_INCOMPAT_EXTENTS
+            | EXT4_FEATURE_INCOMPAT_64BIT;
+        put_u32(&mut img, EXT4_SUPERBLOCK_OFFSET + 96, incompat);
+        put_u16(&mut img, EXT4_SUPERBLOCK_OFFSET + 254, 24);
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::Malformed)
+        ));
+
+        let mut img = tiny_ext4_image();
+        put_u32(&mut img, EXT4_SUPERBLOCK_OFFSET + 96, incompat);
+        put_u16(&mut img, EXT4_SUPERBLOCK_OFFSET + 254, 1024);
+        put_u32(&mut img, EXT4_SUPERBLOCK_OFFSET + 32, 1);
+        assert!(matches!(
+            Ext4Image::mount(img.as_slice()),
+            Err(Ext4ImageError::Io)
+        ));
+    }
+
+    #[test]
+    fn ext4_htree_indexed_directory_lookup_uses_index_leaf_scan() {
+        let img = tiny_ext4_image();
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(fs.lookup_path(b"/indexed/target.bin"), Ok(23));
+        assert_eq!(
+            fs.read_file(b"/indexed/target.bin").unwrap(),
+            b"indexed target\n".to_vec()
+        );
+        assert_eq!(
+            fs.lookup_path(b"/indexed/missing"),
+            Err(Ext4ImageError::NotFound)
+        );
+    }
+
+    #[test]
+    fn ext4_malformed_htree_count_or_leaf_pointer_rejected() {
+        let mut img = tiny_ext4_image();
+        put_u16(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 2, 2);
+        put_u16(&mut img, 35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET, 1);
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(
+            fs.lookup_path(b"/indexed/target.bin"),
+            Err(Ext4ImageError::Malformed)
+        );
+
+        let mut img = tiny_ext4_image();
+        put_u32(
+            &mut img,
+            35 * 1024 + EXT4_DX_ROOT_ENTRIES_OFFSET + 4,
+            99_999,
+        );
+        let fs = Ext4Image::mount(img.as_slice()).expect("mount");
+        assert_eq!(
+            fs.lookup_path(b"/indexed/target.bin"),
+            Err(Ext4ImageError::Io)
+        );
+    }
+
     fn tiny_ext4_image() -> alloc::vec::Vec<u8> {
         let mut img = alloc::vec![0u8; 80 * 1024];
         let sb = EXT4_SUPERBLOCK_OFFSET;
@@ -1146,6 +1380,17 @@ mod image_tests {
             0,
         );
         write_inline_symlink_inode(&mut img, 5 * 1024 + 20 * 128, b"loop");
+        write_extent_inode_with_len_flags(
+            &mut img,
+            5 * 1024 + 21 * 128,
+            0x4000,
+            2048,
+            0,
+            2,
+            35,
+            EXT4_INDEX_FL,
+        );
+        write_inode(&mut img, 5 * 1024 + 22 * 128, 0x8000, 15, 37);
         write_dirent(&mut img[20 * 1024..20 * 1024 + 12], 2, b".", 2, 12);
         write_dirent(&mut img[20 * 1024 + 12..20 * 1024 + 24], 2, b"..", 2, 12);
         write_dirent(
@@ -1211,7 +1456,14 @@ mod image_tests {
             7,
             20,
         );
-        write_dirent(&mut img[20 * 1024 + 204..21 * 1024], 21, b"loop", 7, 820);
+        write_dirent(
+            &mut img[20 * 1024 + 204..20 * 1024 + 224],
+            21,
+            b"loop",
+            7,
+            20,
+        );
+        write_dirent(&mut img[20 * 1024 + 224..21 * 1024], 22, b"indexed", 2, 800);
         write_leaf_extent_block(&mut img[22 * 1024..23 * 1024], 0, 1, 24);
         img[21 * 1024..21 * 1024 + 16].copy_from_slice(b"hello from ext4\n");
         img[24 * 1024..24 * 1024 + 17].copy_from_slice(b"depth one extent\n");
@@ -1221,6 +1473,9 @@ mod image_tests {
         put_u32(&mut img, 31 * 1024, 32);
         img[32 * 1024..32 * 1024 + 15].copy_from_slice(b"single indirect");
         img[34 * 1024..34 * 1024 + long_target.len()].copy_from_slice(long_target.as_slice());
+        write_htree_root_block(&mut img[35 * 1024..36 * 1024], 1);
+        write_dirent(&mut img[36 * 1024..37 * 1024], 23, b"target.bin", 1, 1024);
+        img[37 * 1024..37 * 1024 + 15].copy_from_slice(b"indexed target\n");
         img
     }
 
@@ -1238,6 +1493,7 @@ mod image_tests {
     ) {
         put_u16(img, off, mode);
         put_u32(img, off + 4, size);
+        put_u32(img, off + 32, EXT4_EXTENTS_FL);
         put_u16(img, off + 40, 0xf30a);
         put_u16(img, off + 42, 1);
         put_u16(img, off + 44, 4);
@@ -1248,9 +1504,33 @@ mod image_tests {
         put_u32(img, off + 60, extent_block);
     }
 
+    fn write_extent_inode_with_len_flags(
+        img: &mut [u8],
+        off: usize,
+        mode: u16,
+        size: u32,
+        logical: u32,
+        len: u16,
+        extent_block: u32,
+        extra_flags: u32,
+    ) {
+        put_u16(img, off, mode);
+        put_u32(img, off + 4, size);
+        put_u32(img, off + 32, EXT4_EXTENTS_FL | extra_flags);
+        put_u16(img, off + 40, 0xf30a);
+        put_u16(img, off + 42, 1);
+        put_u16(img, off + 44, 4);
+        put_u16(img, off + 46, 0);
+        put_u32(img, off + 52, logical);
+        put_u16(img, off + 56, len);
+        put_u16(img, off + 58, 0);
+        put_u32(img, off + 60, extent_block);
+    }
+
     fn write_depth1_inode(img: &mut [u8], off: usize, mode: u16, size: u32, child_block: u32) {
         put_u16(img, off, mode);
         put_u32(img, off + 4, size);
+        put_u32(img, off + 32, EXT4_EXTENTS_FL);
         put_u16(img, off + 40, 0xf30a);
         put_u16(img, off + 42, 1);
         put_u16(img, off + 44, 4);
@@ -1299,6 +1579,19 @@ mod image_tests {
 
     fn long_symlink_target() -> alloc::vec::Vec<u8> {
         b"/this/is/a/long/external/symlink/target/that/exceeds/sixty/bytes".to_vec()
+    }
+
+    fn write_htree_root_block(dst: &mut [u8], leaf_logical: u32) {
+        write_dirent(&mut dst[0..12], 22, b".", 2, 12);
+        write_dirent(&mut dst[12..24], 2, b"..", 2, 12);
+        put_u32(dst, EXT4_DX_ROOT_INFO_OFFSET, 0);
+        dst[EXT4_DX_ROOT_INFO_OFFSET + 4] = 0;
+        dst[EXT4_DX_ROOT_INFO_OFFSET + 5] = 8;
+        dst[EXT4_DX_ROOT_INFO_OFFSET + 6] = 0;
+        dst[EXT4_DX_ROOT_INFO_OFFSET + 7] = 0;
+        put_u16(dst, EXT4_DX_ROOT_ENTRIES_OFFSET, 123);
+        put_u16(dst, EXT4_DX_ROOT_ENTRIES_OFFSET + 2, 1);
+        put_u32(dst, EXT4_DX_ROOT_ENTRIES_OFFSET + 4, leaf_logical);
     }
 
     fn write_dirent(dst: &mut [u8], inode: u32, name: &[u8], file_type: u8, rec_len: u16) {
