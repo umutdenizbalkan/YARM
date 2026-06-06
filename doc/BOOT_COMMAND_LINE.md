@@ -256,3 +256,15 @@ BOOTCMD-2 does not change:
    live spawning.
 3. A later explicitly staged task may connect init selection to PM requests
    without moving policy into the kernel.
+
+## MANIFEST-1 status
+
+MANIFEST-1 adds the helper-only text service-list parser described in
+`doc/SERVICE_MANIFEST.md`. The parser accepts a bounded UTF-8, one-absolute-path-
+per-line format and rejects the whole file on any invalid line. It is not called
+by boot capture, init, PM, VFS, or the initramfs service request loop.
+
+The `yarm.manifest=/boot/services-core.txt` option therefore remains a future
+selection mechanism: BOOTCMD-3 must first provide an immutable compatible
+handoff to init. CPIO existence and ELF validation remain deferred to
+MANIFEST-2. No live service ordering or fallback policy changed in MANIFEST-1.
