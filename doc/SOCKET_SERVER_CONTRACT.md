@@ -98,3 +98,9 @@ socket_srv -> tcpip_srv -> netmgr -> virtio_net
 
 NET-2 can add the bounded `netmgr` device/route registry without real packets. NET-3 can instead
 clean up a fake `virtio_net` packet queue/service boundary without real hardware networking.
+
+## Integration design
+
+The design-only future IPC, capability, ownership, packet-lifecycle, loopback, and boot-placement
+boundaries are documented in [`NETWORK_STACK_INTEGRATION.md`](NETWORK_STACK_INTEGRATION.md). That
+document does not enable live service wiring or change this contract's current behavior.

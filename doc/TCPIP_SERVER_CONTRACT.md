@@ -115,3 +115,9 @@ socket_srv -> tcpip_srv -> netmgr_srv -> virtio_net_srv / other NIC drivers
 
 NET-3 can define a fake NIC packet service boundary without hardware networking. NET-5 can instead
 clean up DHCP/DNS stubs with strict userspace ABIs and no real network I/O.
+
+## Integration design
+
+The design-only future IPC, capability, ownership, packet-lifecycle, loopback, and boot-placement
+boundaries are documented in [`NETWORK_STACK_INTEGRATION.md`](NETWORK_STACK_INTEGRATION.md). That
+document does not enable live service wiring or change this contract's current behavior.

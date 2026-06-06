@@ -131,3 +131,9 @@ socket_srv
 
 NET-4 now supplies the planning-only `tcpip_srv` boundary. The recommended next userspace task is
 NET-3: define a fake `virtio_net` packet service boundary without real hardware networking.
+
+## Integration design
+
+The design-only future IPC, capability, ownership, packet-lifecycle, loopback, and boot-placement
+boundaries are documented in [`NETWORK_STACK_INTEGRATION.md`](NETWORK_STACK_INTEGRATION.md). That
+document does not enable live service wiring or change this contract's current behavior.

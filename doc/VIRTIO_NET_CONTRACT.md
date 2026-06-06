@@ -115,3 +115,9 @@ NET-3 adds none of the following:
 A future integration may register device metadata with `netmgr_srv`, let `tcpip_srv` consume
 netmgr route lookup, and connect a separately designed packet-transfer boundary between
 `tcpip_srv` and NIC drivers. Real hardware work remains a distinct later task.
+
+## Integration design
+
+The design-only future IPC, capability, ownership, packet-lifecycle, loopback, and boot-placement
+boundaries are documented in [`NETWORK_STACK_INTEGRATION.md`](NETWORK_STACK_INTEGRATION.md). That
+document does not enable live service wiring or change this contract's current behavior.
