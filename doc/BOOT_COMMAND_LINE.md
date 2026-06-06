@@ -281,3 +281,10 @@ BOOTCMD-3 remains required before init can receive `yarm.manifest=`. The future
 flow is command-line handoff, manifest text read, MANIFEST-1 syntax validation,
 MANIFEST-2 archive/ELF validation, init-owned fallback selection, and only then
 PM-owned spawning.
+
+## Raspberry Pi 5 example profile
+
+`profiles/rpi5/` contains a documentation-only future service-manifest example.
+It is not a BOOTCMD handoff implementation and is not consumed by runtime or
+image-building code. See `profiles/rpi5/README.md` for the strict current-path
+list and deferred Raspberry Pi 5 driver goals.

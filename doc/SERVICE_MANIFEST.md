@@ -272,3 +272,14 @@ The intended staged flow is:
 6. PM performs spawning, and the supervisor retains restart authority.
 
 None of these steps is live-wired by MANIFEST-2.
+
+## Raspberry Pi 5 documentation profile
+
+A strict v1-compatible, non-runtime example is available at
+`profiles/rpi5/services-core.manifest`, with scope and deferred Pi hardware
+services documented in `profiles/rpi5/README.md`. The example uses the current
+packed name `/sbin/vfs_server` and deliberately omits service paths that are not
+yet guaranteed by common CPIO staging.
+
+The profile does not claim Raspberry Pi 5 boot support and is not consumed by
+MANIFEST-1, MANIFEST-2, init, PM, or any image-building script.
