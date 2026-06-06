@@ -465,7 +465,7 @@ mod tests {
     #[test]
     fn tcpip_link_down_route_returns_link_down() {
         let mut resolver = FakeNetmgrResolver::new();
-        let device = device(1, false, 1500);
+        let device = device(11, false, 1500);
         resolver.register_device(device);
         resolver.add_route(1, device, 0, 0, 0, 0);
         let mut service = TcpipService::new(resolver);

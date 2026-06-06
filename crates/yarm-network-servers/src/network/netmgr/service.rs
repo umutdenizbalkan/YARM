@@ -2,13 +2,44 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm_ipc_abi::netmgr_abi::{
-    Ipv4Address, Ipv4Route, NetDevice, NetmgrCodecError, NetmgrRequest, NetmgrResponse,
-    NetmgrStatus, ipv4_prefix_matches,
+    Ipv4Address, Ipv4Route, NET_DEVICE_FLAG_LOOPBACK, NET_DEVICE_FLAG_VIRTUAL,
+    NETMGR_DEVICE_ID_LOOPBACK, NETMGR_IPV4_LOOPBACK, NETMGR_IPV4_LOOPBACK_PREFIX,
+    NETMGR_OWNER_ID_SYSTEM, NETMGR_ROUTE_ID_LOOPBACK, NETMGR_SYSTEM_GENERATION, NetDevice,
+    NetmgrCodecError, NetmgrRequest, NetmgrResponse, NetmgrStatus, ipv4_prefix_matches, mask_ipv4,
 };
 
 pub const MAX_NET_DEVICES: usize = 16;
 pub const MAX_IPV4_ADDRS: usize = 32;
 pub const MAX_ROUTES: usize = 32;
+
+pub const LOOPBACK_DEVICE: NetDevice = NetDevice {
+    device_id: NETMGR_DEVICE_ID_LOOPBACK,
+    owner_id: NETMGR_OWNER_ID_SYSTEM,
+    generation: NETMGR_SYSTEM_GENERATION,
+    mac: [0x02, 0, 0, 0, 0, 1],
+    mtu: 9_000,
+    flags: NET_DEVICE_FLAG_VIRTUAL | NET_DEVICE_FLAG_LOOPBACK,
+    link_up: true,
+};
+
+pub const LOOPBACK_ADDRESS: Ipv4Address = Ipv4Address {
+    device_id: NETMGR_DEVICE_ID_LOOPBACK,
+    address: NETMGR_IPV4_LOOPBACK,
+    prefix_len: NETMGR_IPV4_LOOPBACK_PREFIX,
+    generation: NETMGR_SYSTEM_GENERATION,
+    owner_id: NETMGR_OWNER_ID_SYSTEM,
+};
+
+pub const LOOPBACK_ROUTE: Ipv4Route = Ipv4Route {
+    route_id: NETMGR_ROUTE_ID_LOOPBACK,
+    destination: mask_ipv4(NETMGR_IPV4_LOOPBACK, NETMGR_IPV4_LOOPBACK_PREFIX),
+    prefix_len: NETMGR_IPV4_LOOPBACK_PREFIX,
+    gateway: 0,
+    device_id: NETMGR_DEVICE_ID_LOOPBACK,
+    metric: 0,
+    generation: NETMGR_SYSTEM_GENERATION,
+    owner_id: NETMGR_OWNER_ID_SYSTEM,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetmgrService {
@@ -19,10 +50,16 @@ pub struct NetmgrService {
 
 impl NetmgrService {
     pub const fn new() -> Self {
+        let mut devices = [None; MAX_NET_DEVICES];
+        devices[0] = Some(LOOPBACK_DEVICE);
+        let mut addresses = [None; MAX_IPV4_ADDRS];
+        addresses[0] = Some(LOOPBACK_ADDRESS);
+        let mut routes = [None; MAX_ROUTES];
+        routes[0] = Some(LOOPBACK_ROUTE);
         Self {
-            devices: [None; MAX_NET_DEVICES],
-            addresses: [None; MAX_IPV4_ADDRS],
-            routes: [None; MAX_ROUTES],
+            devices,
+            addresses,
+            routes,
         }
     }
 
@@ -78,6 +115,9 @@ impl NetmgrService {
     }
 
     fn register_device(&mut self, device: NetDevice) -> NetmgrResponse {
+        if device.flags & NET_DEVICE_FLAG_LOOPBACK != 0 {
+            return NetmgrResponse::status(NetmgrStatus::InvalidState);
+        }
         if self.device_index(device.device_id).is_some() {
             return NetmgrResponse::status(NetmgrStatus::AlreadyExists);
         }
@@ -234,6 +274,9 @@ impl NetmgrService {
             return NetmgrResponse::status(NetmgrStatus::NotFound);
         };
         let route = self.routes[index].expect("route index contains route");
+        if route.device_id == NETMGR_DEVICE_ID_LOOPBACK {
+            return NetmgrResponse::status(NetmgrStatus::InvalidState);
+        }
         if route.owner_id != owner_id {
             return NetmgrResponse::status(NetmgrStatus::OwnerMismatch);
         }
@@ -297,6 +340,9 @@ impl NetmgrService {
         owner_id: u64,
         generation: u32,
     ) -> Result<usize, NetmgrStatus> {
+        if device_id == NETMGR_DEVICE_ID_LOOPBACK {
+            return Err(NetmgrStatus::InvalidState);
+        }
         let Some(index) = self.device_index(device_id) else {
             return Err(NetmgrStatus::NotFound);
         };
@@ -480,9 +526,68 @@ mod tests {
     }
 
     #[test]
+    fn netmgr_initializes_protected_loopback_policy() {
+        let mut service = NetmgrService::new();
+        assert_eq!(service.device_count(), 1);
+        assert_eq!(service.address_count(), 1);
+        assert_eq!(service.route_count(), 1);
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::GetDevice {
+                    device_id: NETMGR_DEVICE_ID_LOOPBACK,
+                })
+                .device,
+            Some(LOOPBACK_DEVICE)
+        );
+        assert!(LOOPBACK_DEVICE.link_up);
+        assert_eq!(service.addresses[0], Some(LOOPBACK_ADDRESS));
+        let lookup = service.handle_request(NetmgrRequest::LookupRoute {
+            destination: NETMGR_IPV4_LOOPBACK,
+        });
+        assert_eq!(lookup.status, NetmgrStatus::Ok);
+        assert_eq!(lookup.route, Some(LOOPBACK_ROUTE));
+    }
+
+    #[test]
+    fn netmgr_rejects_normal_mutation_of_loopback() {
+        let mut service = NetmgrService::new();
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::UnregisterDevice {
+                    device_id: NETMGR_DEVICE_ID_LOOPBACK,
+                    owner_id: 10,
+                    generation: 1,
+                })
+                .status,
+            NetmgrStatus::InvalidState
+        );
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::SetLinkState {
+                    device_id: NETMGR_DEVICE_ID_LOOPBACK,
+                    owner_id: 10,
+                    generation: 1,
+                    link_up: false,
+                })
+                .status,
+            NetmgrStatus::InvalidState
+        );
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::RemoveRoute {
+                    route_id: NETMGR_ROUTE_ID_LOOPBACK,
+                    owner_id: NETMGR_OWNER_ID_SYSTEM,
+                    generation: NETMGR_SYSTEM_GENERATION,
+                })
+                .status,
+            NetmgrStatus::InvalidState
+        );
+    }
+
+    #[test]
     fn netmgr_register_duplicate_get_and_unregister_device() {
         let mut service = NetmgrService::new();
-        let device = device(1, 10, 1);
+        let device = device(12, 10, 1);
         register(&mut service, device);
         assert_eq!(
             service
@@ -492,21 +597,21 @@ mod tests {
         );
         assert_eq!(
             service
-                .handle_request(NetmgrRequest::GetDevice { device_id: 1 })
+                .handle_request(NetmgrRequest::GetDevice { device_id: 12 })
                 .device,
             Some(device)
         );
         assert_eq!(
             service
                 .handle_request(NetmgrRequest::UnregisterDevice {
-                    device_id: 1,
+                    device_id: 12,
                     owner_id: 10,
                     generation: 1,
                 })
                 .status,
             NetmgrStatus::Ok
         );
-        assert_eq!(service.device_count(), 0);
+        assert_eq!(service.device_count(), 1);
     }
 
     #[test]
@@ -540,7 +645,7 @@ mod tests {
                 .status,
             NetmgrStatus::Ok
         );
-        assert_eq!((service.address_count(), service.route_count()), (0, 0));
+        assert_eq!((service.address_count(), service.route_count()), (1, 1));
     }
 
     #[test]
@@ -581,14 +686,14 @@ mod tests {
                 .status,
             NetmgrStatus::Ok
         );
-        assert_eq!(service.address_count(), 1);
+        assert_eq!(service.address_count(), 2);
         assert_eq!(
             service
                 .handle_request(NetmgrRequest::RemoveIpv4Address { address })
                 .status,
             NetmgrStatus::Ok
         );
-        assert_eq!(service.address_count(), 0);
+        assert_eq!(service.address_count(), 1);
     }
 
     #[test]
@@ -621,7 +726,7 @@ mod tests {
                 .status,
             NetmgrStatus::Ok
         );
-        assert_eq!(service.route_count(), 0);
+        assert_eq!(service.route_count(), 1);
     }
 
     #[test]
@@ -643,6 +748,100 @@ mod tests {
                 })
                 .route,
             Some(default)
+        );
+    }
+
+    #[test]
+    fn netmgr_default_route_prefix_zero_and_metric_regression() {
+        let mut service = NetmgrService::new();
+        let device = device(13, 130, 1);
+        register(&mut service, device);
+        let higher_metric = route(20, device, 0, 0, 50);
+        let lower_metric = route(21, device, 0, 0, 10);
+        assert_eq!(higher_metric.destination, 0);
+        assert_eq!(lower_metric.destination, 0);
+        for route in [higher_metric, lower_metric] {
+            assert_eq!(
+                service
+                    .handle_request(NetmgrRequest::AddRoute { route })
+                    .status,
+                NetmgrStatus::Ok
+            );
+        }
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::LookupRoute {
+                    destination: ipv4(203, 0, 113, 8),
+                })
+                .route,
+            Some(lower_metric)
+        );
+    }
+
+    #[test]
+    fn netmgr_specific_route_beats_default_and_down_specific_falls_back() {
+        let mut service = NetmgrService::new();
+        let default_device = device(14, 140, 1);
+        let specific_device = device(15, 150, 1);
+        register(&mut service, default_device);
+        register(&mut service, specific_device);
+        let default = route(30, default_device, 0, 0, 100);
+        let specific = route(31, specific_device, ipv4(10, 1, 0, 0), 16, 1);
+        for route in [default, specific] {
+            assert_eq!(
+                service
+                    .handle_request(NetmgrRequest::AddRoute { route })
+                    .status,
+                NetmgrStatus::Ok
+            );
+        }
+        let destination = ipv4(10, 1, 2, 3);
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::LookupRoute { destination })
+                .route,
+            Some(specific)
+        );
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::SetLinkState {
+                    device_id: specific_device.device_id,
+                    owner_id: specific_device.owner_id,
+                    generation: specific_device.generation,
+                    link_up: false,
+                })
+                .status,
+            NetmgrStatus::Ok
+        );
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::LookupRoute { destination })
+                .route,
+            Some(default)
+        );
+    }
+
+    #[test]
+    fn netmgr_only_link_down_default_returns_link_down() {
+        let mut service = NetmgrService::new();
+        let mut device = device(16, 160, 1);
+        device.link_up = false;
+        register(&mut service, device);
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::AddRoute {
+                    route: route(40, device, 0, 0, 0),
+                })
+                .status,
+            NetmgrStatus::Ok
+        );
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::LookupRoute {
+                    destination: ipv4(8, 8, 8, 8),
+                })
+                .status,
+            NetmgrStatus::LinkDown
         );
     }
 
@@ -715,8 +914,8 @@ mod tests {
     #[test]
     fn netmgr_device_table_enforces_capacity() {
         let mut service = NetmgrService::new();
-        for index in 0..MAX_NET_DEVICES {
-            register(&mut service, device(index as u32 + 1, index as u64 + 1, 1));
+        for index in 0..MAX_NET_DEVICES - 1 {
+            register(&mut service, device(index as u32 + 2, index as u64 + 2, 1));
         }
         assert_eq!(
             service
@@ -735,15 +934,21 @@ mod tests {
         let second = device(21, 201, 1);
         register(&mut service, first);
         register(&mut service, second);
-        let first_response = service.handle_request(NetmgrRequest::ListDevices { start_index: 0 });
+        let loopback_response =
+            service.handle_request(NetmgrRequest::ListDevices { start_index: 0 });
+        assert_eq!(loopback_response.device, Some(LOOPBACK_DEVICE));
+        assert_eq!(loopback_response.value, 1);
+        let first_response = service.handle_request(NetmgrRequest::ListDevices {
+            start_index: loopback_response.value as u16,
+        });
         assert_eq!(first_response.device, Some(first));
-        assert_eq!(first_response.value, 1);
+        assert_eq!(first_response.value, 2);
         let second_response = service.handle_request(NetmgrRequest::ListDevices {
             start_index: first_response.value as u16,
         });
         assert_eq!(second_response.device, Some(second));
         assert_eq!(second_response.value, u32::MAX);
-        assert_eq!(second_response.auxiliary, 2);
+        assert_eq!(second_response.auxiliary, 3);
     }
 
     #[test]
@@ -751,7 +956,7 @@ mod tests {
         let mut service = NetmgrService::new();
         let device = device(22, 220, 1);
         register(&mut service, device);
-        for index in 0..MAX_IPV4_ADDRS {
+        for index in 0..MAX_IPV4_ADDRS - 1 {
             assert_eq!(
                 service
                     .handle_request(NetmgrRequest::AddIpv4Address {
@@ -769,7 +974,7 @@ mod tests {
                 .status,
             NetmgrStatus::TableFull
         );
-        for index in 0..MAX_ROUTES {
+        for index in 0..MAX_ROUTES - 1 {
             assert_eq!(
                 service
                     .handle_request(NetmgrRequest::AddRoute {

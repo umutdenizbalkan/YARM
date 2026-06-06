@@ -23,7 +23,19 @@ pub const NETMGR_OP_GET_STATUS: u16 = 11;
 
 pub const NET_DEVICE_FLAG_BROADCAST: u32 = 1 << 0;
 pub const NET_DEVICE_FLAG_MULTICAST: u32 = 1 << 1;
-pub const NET_DEVICE_FLAG_ALL: u32 = NET_DEVICE_FLAG_BROADCAST | NET_DEVICE_FLAG_MULTICAST;
+pub const NET_DEVICE_FLAG_VIRTUAL: u32 = 1 << 2;
+pub const NET_DEVICE_FLAG_LOOPBACK: u32 = 1 << 3;
+pub const NET_DEVICE_FLAG_ALL: u32 = NET_DEVICE_FLAG_BROADCAST
+    | NET_DEVICE_FLAG_MULTICAST
+    | NET_DEVICE_FLAG_VIRTUAL
+    | NET_DEVICE_FLAG_LOOPBACK;
+
+pub const NETMGR_DEVICE_ID_LOOPBACK: u32 = 1;
+pub const NETMGR_ROUTE_ID_LOOPBACK: u32 = u32::MAX;
+pub const NETMGR_OWNER_ID_SYSTEM: u64 = u64::MAX;
+pub const NETMGR_SYSTEM_GENERATION: u32 = 1;
+pub const NETMGR_IPV4_LOOPBACK: u32 = u32::from_be_bytes([127, 0, 0, 1]);
+pub const NETMGR_IPV4_LOOPBACK_PREFIX: u8 = 8;
 
 pub const NETMGR_RESPONSE_F_DEVICE: u8 = 1 << 0;
 pub const NETMGR_RESPONSE_F_ADDRESS: u8 = 1 << 1;
@@ -788,6 +800,9 @@ mod tests {
         assert_eq!(NETMGR_WIRE_LEN, 128);
         assert_eq!(NETMGR_OP_REGISTER_DEVICE, 1);
         assert_eq!(NETMGR_OP_GET_STATUS, 11);
+        assert_eq!(NETMGR_DEVICE_ID_LOOPBACK, 1);
+        assert_eq!(NETMGR_IPV4_LOOPBACK, u32::from_be_bytes([127, 0, 0, 1]));
+        assert_eq!(NETMGR_IPV4_LOOPBACK_PREFIX, 8);
         assert_eq!(NetmgrStatus::Ok as u32, 0);
         assert_eq!(NetmgrStatus::LinkDown as u32, 8);
         assert_eq!(NetmgrStatus::StaleGeneration as u32, 10);
