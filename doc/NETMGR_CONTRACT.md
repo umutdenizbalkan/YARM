@@ -22,6 +22,8 @@ nonzero reserved byte. Operations cover:
 - changing link state;
 - adding and removing IPv4 addresses;
 - adding, removing, and looking up IPv4 routes;
+- reading the first IPv4 address assigned to a device;
+- checking whether an IPv4 address is assigned to a device;
 - reading registry counts.
 
 Device-scoped mutations carry an owner identifier and generation. These are opaque userspace
@@ -57,8 +59,14 @@ device, an IPv4 address, prefix length, owner, and generation. Prefixes from 0 t
 accepted; address zero is not accepted as an interface address. Add and remove operations require the current
 device owner and generation. Duplicate device/address/prefix tuples return `AlreadyExists`.
 
-Address records are metadata only. NET-2 performs no duplicate-address detection, ARP, NDP,
-DHCP, source-address selection, interface configuration, or packet emission.
+Address records are metadata only. NET-7 adds two read-only v1 queries: first-address lookup
+returns the first table entry for a registered device, and membership lookup returns the exact
+matching address record. Both return `NotFound` for a missing device or absent address; neither
+requires owner/generation because it does not mutate state. The protected `lo0` record is visible
+to both queries.
+
+NET-2/7 performs no duplicate-address detection, ARP, NDP, DHCP, source-address policy beyond the
+deterministic first-record query, interface configuration, or packet emission.
 
 ## IPv4 route table
 
@@ -96,6 +104,18 @@ A future ABI v2 may add subscriptions for link up/down, device register/unregist
 add/remove, and route add/remove events. That design must specify endpoint and capability
 validation, bounded backpressure, replay versus drop policy, event ordering, and cleanup when a
 subscriber exits before notification delivery can be enabled.
+
+## NET-7 tcpip resolver use
+
+`tcpip_srv` may now use the netmgr wire protocol through an explicitly configured
+`NetmgrIpcRouteResolver`. Route planning queries `LOOKUP_ROUTE`, then `GET_DEVICE` for MTU/link
+metadata, and uses the read-only address queries for source selection and explicit-source
+membership. This is ordinary userspace request/reply IPC only. Netmgr remains polling-only and
+owns no packet bytes or packet queue.
+
+NET-7 does not assign startup slots or distribute endpoint capabilities. The default tcpip service
+configuration remains unsupported until a later runtime policy explicitly provisions the netmgr
+request and reply endpoints.
 
 ## Service process behavior
 

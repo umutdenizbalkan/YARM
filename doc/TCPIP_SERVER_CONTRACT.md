@@ -41,11 +41,18 @@ number does not implement that protocol.
 A resolved route contains route ID, output device ID, optional gateway, and device MTU. Lookup can
 report `Unsupported`, `NoRoute`, or `LinkDown`.
 
-The production NET-4 server uses `UnsupportedRouteResolver` because no live `netmgr_srv` endpoint
-is wired into `tcpip_srv`. It therefore returns `Unsupported` for route-dependent operations
-until a later userspace service-wiring task supplies a resolver. Tests use a fake resolver backed
-by `NetmgrService`, so longest-prefix, metric, route-ID, and link-state semantics are exercised
-without adding live service IPC.
+NET-7 adds `NetmgrIpcRouteResolver`, a bounded request/reply implementation of this trait. It
+strictly encodes netmgr requests, validates reply opcode and the full 128-byte response, performs
+route lookup followed by device lookup for MTU/link metadata, and uses the new read-only address
+queries for source selection and membership checks. Netmgr `NotFound`, `LinkDown`, and
+`Unsupported` statuses map to stable tcpip resolver outcomes; transport and malformed-reply
+failures map safely to `Unsupported` rather than panicking.
+
+`TcpipServiceConfig` accepts an optional explicit `NetmgrIpcEndpoint` containing request-send and
+reply-receive capability IDs plus a bounded reply timeout. The default configuration still selects
+`UnsupportedRouteResolver`. No startup slot is assigned and the `tcpip_srv` binary does not infer
+one, so runtime endpoint provisioning/spawn policy remains deferred. Tests use an in-process wire
+transport backed by `NetmgrService` to exercise the same codecs and planner behavior.
 
 ## Transmit-plan behavior
 
@@ -90,6 +97,13 @@ It remains in a receive loop, replies when a reply capability is provided, and y
 when no receive endpoint exists. Malformed messages return `BadRequest`; unknown operations return
 `Unsupported`.
 
+## NET-7 userspace IPC resolver boundary
+
+NET-7 is still planning-only. When explicitly configured, the resolver issues netmgr route,
+device, first-address, and address-membership queries; it does not create a packet or call a
+netdev service. Netmgr v1 remains polling/request-reply only, and no notification endpoint,
+subscription, blocking wakeup, or runtime service wiring is introduced.
+
 ## Explicitly deferred networking
 
 NET-4 does not provide:
@@ -104,7 +118,7 @@ NET-4 does not provide:
 - ARP or NDP;
 - DHCP or DNS protocols;
 - `virtio_net` or other NIC-driver I/O;
-- live `tcpip_srv` to `netmgr_srv` IPC;
+- runtime provisioning of a netmgr endpoint to `tcpip_srv`;
 - socket notifications, blocking operations, poll, or select integration.
 
 The intended future userspace layering remains:

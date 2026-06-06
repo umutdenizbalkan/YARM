@@ -39,6 +39,12 @@ return because no receive endpoint exists, the wrapper uses the standard
 post-run `yield_now()` fallback. This keeps the task resident without creating
 a second IPC consumer.
 
+Ordinary fs, driver, network, UI, and compatibility binaries must not copy a control-plane
+fallback that reads `startup_context().process_manager_service_recv_ep` and starts another receive
+loop. Only a control-plane binary with an explicitly documented startup-capability contract may
+own that post-`run()` form. An ordinary service consumes its receive endpoint inside
+`run_<service>()` or uses only the defensive yield/assertion fallback described above.
+
 ## RISC-V userspace ELF alignment
 
 RISC-V userspace and server ELFs use `targets/riscv64-yarm-user-none.json`.

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use super::netmgr_resolver::{
+    NetmgrIpcEndpoint, NetmgrIpcRouteResolver, SyscallNetmgrIpcTransport,
+};
 use yarm_ipc_abi::tcpip_abi::{
     Ipv4SendSpec, TCPIP_DEFAULT_TTL, TCPIP_IPV4_HEADER_ALLOWANCE, TcpipCodecError, TcpipRequest,
     TcpipResponse, TcpipStatus, valid_destination,
@@ -52,6 +55,62 @@ impl TcpipRouteResolver for UnsupportedRouteResolver {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TcpipServiceConfig {
+    pub netmgr_endpoint: Option<NetmgrIpcEndpoint>,
+}
+
+impl TcpipServiceConfig {
+    pub const fn with_netmgr_endpoint(netmgr_endpoint: NetmgrIpcEndpoint) -> Self {
+        Self {
+            netmgr_endpoint: Some(netmgr_endpoint),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfiguredRouteResolver {
+    Unsupported(UnsupportedRouteResolver),
+    Netmgr(NetmgrIpcRouteResolver<SyscallNetmgrIpcTransport>),
+}
+
+impl ConfiguredRouteResolver {
+    pub const fn from_config(config: TcpipServiceConfig) -> Self {
+        match config.netmgr_endpoint {
+            Some(endpoint) => Self::Netmgr(NetmgrIpcRouteResolver::new(
+                SyscallNetmgrIpcTransport::new(endpoint),
+            )),
+            None => Self::Unsupported(UnsupportedRouteResolver),
+        }
+    }
+}
+
+impl TcpipRouteResolver for ConfiguredRouteResolver {
+    fn lookup_ipv4_route(
+        &mut self,
+        destination: u32,
+    ) -> Result<ResolvedIpv4Route, RouteResolveError> {
+        match self {
+            Self::Unsupported(resolver) => resolver.lookup_ipv4_route(destination),
+            Self::Netmgr(resolver) => resolver.lookup_ipv4_route(destination),
+        }
+    }
+
+    fn first_ipv4_address(&mut self, device_id: u32) -> Option<u32> {
+        match self {
+            Self::Unsupported(resolver) => resolver.first_ipv4_address(device_id),
+            Self::Netmgr(resolver) => resolver.first_ipv4_address(device_id),
+        }
+    }
+
+    fn has_ipv4_address(&mut self, device_id: u32, address: u32) -> bool {
+        match self {
+            Self::Unsupported(resolver) => resolver.has_ipv4_address(device_id, address),
+            Self::Netmgr(resolver) => resolver.has_ipv4_address(device_id, address),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpipStats {
     pub planned: u64,
@@ -63,6 +122,12 @@ pub struct TcpipService<R> {
     resolver: R,
     default_ttl: u8,
     stats: TcpipStats,
+}
+
+impl TcpipService<ConfiguredRouteResolver> {
+    pub const fn from_config(config: TcpipServiceConfig) -> Self {
+        Self::new(ConfiguredRouteResolver::from_config(config))
+    }
 }
 
 impl<R: TcpipRouteResolver> TcpipService<R> {
@@ -240,7 +305,7 @@ fn apply_route(response: &mut TcpipResponse, route: ResolvedIpv4Route, destinati
 
 pub fn run() {
     yarm_user_rt::user_log!("TCPIP_SRV_ENTRY");
-    let mut service = TcpipService::new(UnsupportedRouteResolver);
+    let mut service = TcpipService::from_config(TcpipServiceConfig::default());
     yarm_user_rt::user_log!(
         "TCPIP_READY mode=planning-only default_ttl={}",
         service.default_ttl()
@@ -635,6 +700,36 @@ mod tests {
         assert_eq!(set.effective_ttl, 99);
         let status = service.handle_request(TcpipRequest::GetStatus { request_id: 3 });
         assert_eq!(status.effective_ttl, 99);
+    }
+
+    #[test]
+    fn tcpip_explicit_netmgr_endpoint_selects_ipc_resolver_without_startup_inference() {
+        assert_eq!(NetmgrIpcEndpoint::new(0, 2, 0), None);
+        assert_eq!(NetmgrIpcEndpoint::new(1, 0, 0), None);
+        let endpoint = NetmgrIpcEndpoint::new(1, 2, 5).expect("valid endpoint");
+        let service = TcpipService::from_config(TcpipServiceConfig::with_netmgr_endpoint(endpoint));
+        assert!(matches!(
+            service.resolver,
+            ConfiguredRouteResolver::Netmgr(_)
+        ));
+    }
+
+    #[test]
+    fn tcpip_default_config_keeps_production_resolver_unsupported() {
+        let mut service = TcpipService::from_config(TcpipServiceConfig::default());
+        assert!(matches!(
+            service.resolver,
+            ConfiguredRouteResolver::Unsupported(_)
+        ));
+        assert_eq!(
+            service
+                .handle_request(TcpipRequest::RouteIpv4 {
+                    request_id: 1,
+                    destination: ipv4(10, 0, 0, 1),
+                })
+                .status,
+            TcpipStatus::Unsupported
+        );
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub const NETMGR_OP_ADD_ROUTE: u16 = 8;
 pub const NETMGR_OP_REMOVE_ROUTE: u16 = 9;
 pub const NETMGR_OP_LOOKUP_ROUTE: u16 = 10;
 pub const NETMGR_OP_GET_STATUS: u16 = 11;
+pub const NETMGR_OP_GET_FIRST_IPV4_ADDR_FOR_DEVICE: u16 = 12;
+pub const NETMGR_OP_CHECK_IPV4_ADDR_ON_DEVICE: u16 = 13;
 
 pub const NET_DEVICE_FLAG_BROADCAST: u32 = 1 << 0;
 pub const NET_DEVICE_FLAG_MULTICAST: u32 = 1 << 1;
@@ -192,6 +194,13 @@ pub enum NetmgrRequest {
         destination: u32,
     },
     GetStatus,
+    GetFirstIpv4AddressForDevice {
+        device_id: u32,
+    },
+    CheckIpv4AddressOnDevice {
+        device_id: u32,
+        address: u32,
+    },
 }
 
 impl NetmgrRequest {
@@ -260,6 +269,18 @@ impl NetmgrRequest {
                 NETMGR_OP_LOOKUP_ROUTE
             }
             Self::GetStatus => NETMGR_OP_GET_STATUS,
+            Self::GetFirstIpv4AddressForDevice { device_id } => {
+                require_nonzero(device_id)?;
+                write_u32(&mut payload, 96, device_id);
+                NETMGR_OP_GET_FIRST_IPV4_ADDR_FOR_DEVICE
+            }
+            Self::CheckIpv4AddressOnDevice { device_id, address } => {
+                require_nonzero(device_id)?;
+                require_nonzero(address)?;
+                write_u32(&mut payload, 96, device_id);
+                write_u32(&mut payload, 100, address);
+                NETMGR_OP_CHECK_IPV4_ADDR_ON_DEVICE
+            }
         };
         Ok((opcode, payload))
     }
@@ -350,6 +371,21 @@ impl NetmgrRequest {
             NETMGR_OP_GET_STATUS => {
                 require_zero(payload)?;
                 Ok(Self::GetStatus)
+            }
+            NETMGR_OP_GET_FIRST_IPV4_ADDR_FOR_DEVICE => {
+                require_zero(&payload[..96])?;
+                require_zero(&payload[100..])?;
+                Ok(Self::GetFirstIpv4AddressForDevice {
+                    device_id: read_nonzero_u32(payload, 96)?,
+                })
+            }
+            NETMGR_OP_CHECK_IPV4_ADDR_ON_DEVICE => {
+                require_zero(&payload[..96])?;
+                require_zero(&payload[104..])?;
+                Ok(Self::CheckIpv4AddressOnDevice {
+                    device_id: read_nonzero_u32(payload, 96)?,
+                    address: read_nonzero_u32(payload, 100)?,
+                })
             }
             _ => Err(NetmgrCodecError::UnsupportedOpcode),
         }
@@ -745,6 +781,11 @@ mod tests {
                 destination: u32::from_be_bytes([10, 0, 0, 8]),
             },
             NetmgrRequest::GetStatus,
+            NetmgrRequest::GetFirstIpv4AddressForDevice { device_id: 7 },
+            NetmgrRequest::CheckIpv4AddressOnDevice {
+                device_id: 7,
+                address: u32::from_be_bytes([10, 0, 0, 2]),
+            },
         ];
         for request in requests {
             let (opcode, encoded) = request.encode().expect("encode request");
@@ -777,6 +818,33 @@ mod tests {
     }
 
     #[test]
+    fn netmgr_address_queries_reject_invalid_ids_and_reserved_bytes() {
+        assert_eq!(
+            NetmgrRequest::GetFirstIpv4AddressForDevice { device_id: 0 }.encode(),
+            Err(NetmgrCodecError::Malformed)
+        );
+        assert_eq!(
+            NetmgrRequest::CheckIpv4AddressOnDevice {
+                device_id: 7,
+                address: 0,
+            }
+            .encode(),
+            Err(NetmgrCodecError::Malformed)
+        );
+        let (opcode, mut payload) = NetmgrRequest::CheckIpv4AddressOnDevice {
+            device_id: 7,
+            address: u32::from_be_bytes([10, 0, 0, 2]),
+        }
+        .encode()
+        .expect("encode query");
+        payload[104] = 1;
+        assert_eq!(
+            NetmgrRequest::decode(opcode, &payload),
+            Err(NetmgrCodecError::Malformed)
+        );
+    }
+
+    #[test]
     fn netmgr_rejects_unknown_opcode() {
         assert_eq!(
             NetmgrRequest::decode(0xffff, &[0; NETMGR_WIRE_LEN]),
@@ -800,6 +868,8 @@ mod tests {
         assert_eq!(NETMGR_WIRE_LEN, 128);
         assert_eq!(NETMGR_OP_REGISTER_DEVICE, 1);
         assert_eq!(NETMGR_OP_GET_STATUS, 11);
+        assert_eq!(NETMGR_OP_GET_FIRST_IPV4_ADDR_FOR_DEVICE, 12);
+        assert_eq!(NETMGR_OP_CHECK_IPV4_ADDR_ON_DEVICE, 13);
         assert_eq!(NETMGR_DEVICE_ID_LOOPBACK, 1);
         assert_eq!(NETMGR_IPV4_LOOPBACK, u32::from_be_bytes([127, 0, 0, 1]));
         assert_eq!(NETMGR_IPV4_LOOPBACK_PREFIX, 8);

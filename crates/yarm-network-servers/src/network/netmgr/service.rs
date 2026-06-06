@@ -101,6 +101,12 @@ impl NetmgrService {
             } => self.remove_route(route_id, owner_id, generation),
             NetmgrRequest::LookupRoute { destination } => self.lookup_route(destination),
             NetmgrRequest::GetStatus => self.get_status(),
+            NetmgrRequest::GetFirstIpv4AddressForDevice { device_id } => {
+                self.get_first_ipv4_address_for_device(device_id)
+            }
+            NetmgrRequest::CheckIpv4AddressOnDevice { device_id, address } => {
+                self.check_ipv4_address_on_device(device_id, address)
+            }
         }
     }
 
@@ -321,6 +327,32 @@ impl NetmgrService {
         } else {
             NetmgrResponse::status(NetmgrStatus::NotFound)
         }
+    }
+
+    fn get_first_ipv4_address_for_device(&self, device_id: u32) -> NetmgrResponse {
+        if self.device_index(device_id).is_none() {
+            return NetmgrResponse::status(NetmgrStatus::NotFound);
+        }
+        self.addresses
+            .iter()
+            .flatten()
+            .copied()
+            .find(|address| address.device_id == device_id)
+            .map(|address| response_with_address(NetmgrStatus::Ok, address))
+            .unwrap_or_else(|| NetmgrResponse::status(NetmgrStatus::NotFound))
+    }
+
+    fn check_ipv4_address_on_device(&self, device_id: u32, ipv4: u32) -> NetmgrResponse {
+        if self.device_index(device_id).is_none() {
+            return NetmgrResponse::status(NetmgrStatus::NotFound);
+        }
+        self.addresses
+            .iter()
+            .flatten()
+            .copied()
+            .find(|address| address.device_id == device_id && address.address == ipv4)
+            .map(|address| response_with_address(NetmgrStatus::Ok, address))
+            .unwrap_or_else(|| NetmgrResponse::status(NetmgrStatus::NotFound))
     }
 
     fn get_status(&self) -> NetmgrResponse {
@@ -997,6 +1029,56 @@ mod tests {
                 })
                 .status,
             NetmgrStatus::TableFull
+        );
+    }
+
+    #[test]
+    fn netmgr_ipv4_queries_cover_loopback_missing_device_and_no_address() {
+        let mut service = NetmgrService::new();
+        let first = service.handle_request(NetmgrRequest::GetFirstIpv4AddressForDevice {
+            device_id: NETMGR_DEVICE_ID_LOOPBACK,
+        });
+        assert_eq!(first.status, NetmgrStatus::Ok);
+        assert_eq!(first.address, Some(LOOPBACK_ADDRESS));
+
+        let member = service.handle_request(NetmgrRequest::CheckIpv4AddressOnDevice {
+            device_id: NETMGR_DEVICE_ID_LOOPBACK,
+            address: NETMGR_IPV4_LOOPBACK,
+        });
+        assert_eq!(member.status, NetmgrStatus::Ok);
+        assert_eq!(member.address, Some(LOOPBACK_ADDRESS));
+
+        for request in [
+            NetmgrRequest::GetFirstIpv4AddressForDevice { device_id: 99 },
+            NetmgrRequest::CheckIpv4AddressOnDevice {
+                device_id: 99,
+                address: NETMGR_IPV4_LOOPBACK,
+            },
+        ] {
+            assert_eq!(
+                service.handle_request(request).status,
+                NetmgrStatus::NotFound
+            );
+        }
+
+        let empty_device = device(15, 150, 1);
+        register(&mut service, empty_device);
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::GetFirstIpv4AddressForDevice {
+                    device_id: empty_device.device_id,
+                })
+                .status,
+            NetmgrStatus::NotFound
+        );
+        assert_eq!(
+            service
+                .handle_request(NetmgrRequest::CheckIpv4AddressOnDevice {
+                    device_id: empty_device.device_id,
+                    address: ipv4(192, 0, 2, 15),
+                })
+                .status,
+            NetmgrStatus::NotFound
         );
     }
 

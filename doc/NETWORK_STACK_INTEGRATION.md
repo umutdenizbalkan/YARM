@@ -156,7 +156,7 @@ borrowed for the call, or transferred. Silence must never imply ownership.
 
 ### `tcpip_srv` to `netmgr_srv`
 
-The first live boundary should use existing netmgr v1 request/reply semantics
+NET-7 provides a bounded `NetmgrIpcRouteResolver` that can use netmgr v1 request/reply semantics
 for:
 
 - destination route lookup;
@@ -164,8 +164,10 @@ for:
 - local IPv4 address lookup or bounded device-address enumeration;
 - registry status when diagnostic counts are needed.
 
-NET-7 should adapt `TcpipRouteResolver` to an IPC-backed implementation without
-changing route ranking. `tcpip_srv` must treat route replies as snapshots:
+The resolver strictly validates wire replies and does not change route ranking. It is activated
+only by an explicit `TcpipServiceConfig` endpoint; the default production configuration remains
+unsupported because no runtime slot or spawn wiring is assigned. `tcpip_srv` must treat route
+replies as snapshots:
 link, address, route, owner, or generation state can change immediately after a
 reply. Before an eventual transmit, stale metadata may require one bounded
 retry or a deterministic error; unbounded retry is forbidden.
@@ -409,11 +411,11 @@ requirement does not grant execute or service capabilities.
 These stages are suggestions, not commitments. Each needs its own scope review,
 ABI tests, capability policy, and failure-mode documentation.
 
-### NET-7 — live tcpip-to-netmgr route lookup, no packets
+### NET-7 — tcpip-to-netmgr resolver foundation, no packets
 
-Implement an IPC-backed `TcpipRouteResolver` using existing netmgr v1 route,
-device, and address queries. Preserve deterministic route/source selection and
-keep tcpip packet output unsupported.
+Implemented as a bounded IPC-capable resolver with strict reply decoding and explicit endpoint
+configuration. Runtime capability provisioning remains a later policy task; tcpip packet output
+stays unsupported.
 
 ### NET-8 — tested IPv4/UDP packet builder
 
