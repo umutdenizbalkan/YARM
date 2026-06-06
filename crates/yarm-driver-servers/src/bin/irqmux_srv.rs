@@ -11,10 +11,8 @@ yarm_server_runtime::install_freestanding_allocator!(
 );
 
 #[inline]
-fn run() -> ! {
-    yarm_user_rt::user_log!("IRQMUX_BIN_ENTRY_START");
+fn run() {
     yarm_driver_servers::run_irqmux();
-    unreachable!("irqmux service loop must remain resident")
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -25,7 +23,10 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
-    run()
+    yarm_user_rt::user_log!("IRQMUX_BIN_ENTRY_START");
+    yarm_user_rt::user_log!("IRQMUX_BEFORE_RUN");
+    run();
+    unreachable!("irqmux server resident service loop returned")
 }
 
 #[cfg(not(feature = "hosted-dev"))]

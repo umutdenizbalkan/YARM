@@ -21,12 +21,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "dhcp_srv"
 path = "src/bin/dhcp_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "dns_srv"
 path = "src/bin/dns_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "netmgr_srv"

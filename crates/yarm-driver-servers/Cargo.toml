@@ -26,12 +26,10 @@ path = "src/bin/blkcache_srv.rs"
 [[bin]]
 name = "console_driver"
 path = "src/bin/console_driver.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "input_srv"
 path = "src/bin/input_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "irqmux_srv"
@@ -40,7 +38,6 @@ path = "src/bin/irqmux_srv.rs"
 [[bin]]
 name = "uart_srv"
 path = "src/bin/uart_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "virtio_blk_srv"
@@ -49,7 +46,6 @@ path = "src/bin/virtio_blk_srv.rs"
 [[bin]]
 name = "virtio_gpu_srv"
 path = "src/bin/virtio_gpu_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "virtio_net_srv"

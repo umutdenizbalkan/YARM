@@ -14,7 +14,7 @@ posix-compat = ["yarm-server-runtime/posix-compat"]
 [dependencies]
 yarm-ipc-abi = { path = "../yarm-ipc-abi" }
 yarm-user-rt = { path = "../yarm-user-rt" }
-yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false, features = ["hosted-dev"] }
+yarm-server-runtime = { path = "../yarm-server-runtime", default-features = false }
 
 [lib]
 path = "src/lib.rs"
@@ -22,4 +22,4 @@ path = "src/lib.rs"
 [[bin]]
 name = "posix_compat_srv"
 path = "src/bin/posix_compat_srv.rs"
-required-features = ["hosted-dev", "posix-compat"]
+required-features = ["posix-compat"]

@@ -20,14 +20,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "compositor_srv"
 path = "src/bin/compositor_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "display_srv"
 path = "src/bin/display_srv.rs"
-required-features = ["hosted-dev"]
 
 [[bin]]
 name = "shell_srv"
 path = "src/bin/shell_srv.rs"
-required-features = ["hosted-dev"]

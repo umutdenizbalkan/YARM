@@ -4,6 +4,12 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_std)]
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
+#[cfg(not(feature = "hosted-dev"))]
+yarm_server_runtime::install_freestanding_allocator!(
+    256 * 1024,
+    "posix compat server freestanding allocator OOM"
+);
+
 #[inline]
 #[cfg(not(test))]
 fn run() {
@@ -21,6 +27,17 @@ fn main() {
 
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
+pub extern "C" fn yarm_user_entry() -> ! {
+    yarm_user_rt::user_log!("POSIX_COMPAT_BIN_ENTRY_START");
+    yarm_user_rt::user_log!("POSIX_COMPAT_BEFORE_RUN");
+    run();
+    loop {
+        let _ = yarm_server_runtime::user_rt::syscall::yield_now();
+    }
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start(
     startup_task_id: u64,
     startup_proc_mgr_request_send_cap: u64,
@@ -29,43 +46,14 @@ pub extern "C" fn _start(
     startup_slots_len: usize,
     _startup_slots_reserved: usize,
 ) -> ! {
-    // Startup ABI slot contract:
-    //   0 => task_id / tid
-    //   1 => process-manager request send cap
-    //   2 => process-manager reply recv cap
-    let mut slots = [
+    yarm_server_runtime::user_rt::runtime::enter_user_entrypoint(
         startup_task_id,
         startup_proc_mgr_request_send_cap,
         startup_proc_mgr_reply_recv_cap,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
-    if startup_slots_ptr != 0 && startup_slots_len >= slots.len() {
-        // SAFETY: kernel contract provides startup block pointer + count.
-        let src = startup_slots_ptr as *const u64;
-        let mut index = 0usize;
-        while index < slots.len() {
-            // SAFETY: bounded by `slots.len()` and guarded by pointer/len check.
-            slots[index] = unsafe { core::ptr::read(src.add(index)) };
-            index += 1;
-        }
-    }
-    yarm_server_runtime::install_startup_arg_slots(slots);
-    run();
-    loop {}
+        startup_slots_ptr,
+        startup_slots_len,
+        yarm_user_entry,
+    )
 }
 
 #[cfg(not(feature = "hosted-dev"))]

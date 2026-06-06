@@ -26,18 +26,7 @@ pub extern "C" fn yarm_user_entry() -> ! {
     yarm_user_rt::user_log!("BLKCACHE_BIN_ENTRY_START");
     yarm_user_rt::user_log!("BLKCACHE_BEFORE_RUN");
     run();
-    let ctx = yarm_server_runtime::user_rt::runtime::startup_context();
-    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
-        yarm_user_rt::user_log!("BLKCACHE_RECV_CAP cap={}", recv_cap);
-        yarm_user_rt::user_log!("BLKCACHE_BLOCKING_RECV_LOOP");
-        loop {
-            let _ = unsafe { yarm_server_runtime::user_rt::syscall::ipc_recv_v2(recv_cap) };
-        }
-    }
-    yarm_user_rt::user_log!("BLKCACHE_NO_RECV_CAP");
-    loop {
-        let _ = yarm_server_runtime::user_rt::syscall::yield_now();
-    }
+    unreachable!("blkcache server resident service loop returned")
 }
 
 #[cfg(not(feature = "hosted-dev"))]

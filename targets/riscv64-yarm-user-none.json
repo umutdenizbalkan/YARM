@@ -1,5 +1,5 @@
 {
-  "llvm-target": "riscv64gc-unknown-none-elf",
+  "llvm-target": "riscv64-unknown-none-elf",
   "arch": "riscv64",
   "vendor": "yarm",
   "os": "none",
@@ -17,7 +17,11 @@
   "linker-flavor": "gnu-lld",
   "linker": "rust-lld",
   "pre-link-args": {
-    "gnu-lld": ["-Ttargets/riscv64-yarm-user-none.ld"]
+    "gnu-lld": [
+      "-Ttargets/riscv64-yarm-user-none.ld",
+      "-zmax-page-size=0x1000",
+      "-zcommon-page-size=0x1000"
+    ]
   },
   "llvm-abiname": "lp64d",
   "max-atomic-width": 64

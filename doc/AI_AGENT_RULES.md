@@ -193,11 +193,13 @@ return a hard error, not silently skip the segment.
 
 ### 4.5 Use the aligned CPIO packer for boot-service payloads
 
-The standard `cpio` tool aligns file data to 4 bytes only. Always use
-`scripts/pack-initramfs-aligned.py` (or `common_create_initramfs_aligned`) for
-CPIO archives that include boot service ELFs that need zero-copy loading.
+The standard `cpio` tool aligns file data to 4 bytes only. Every QEMU CPIO
+archive containing ELF payloads must use `scripts/pack-initramfs-aligned.py` (or
+`common_create_initramfs_aligned`). The rule applies to `/init`, every `/sbin/*`
+ELF, and any ELF added later, not only services currently loaded zero-copy.
 
-Verify alignment with the `ALIGN_PROOF` lines printed to stderr by the packer.
+Verify one `ALIGN_PROOF ... alignment_mod=0 aligned=true` line per ELF. Missing
+Python, a missing packer, or any unaligned ELF is a hard packing error.
 
 ### 4.6 Do not give child tasks MemoryObject caps
 

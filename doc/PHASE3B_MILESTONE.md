@@ -151,11 +151,12 @@ Kernel target (`targets/aarch64-yarm-none.json`) and x86_64 targets unchanged.
 
 ### Fix C: Page-Aligned CPIO Packer
 
-New `scripts/pack-initramfs-aligned.py`: Python 3 CPIO newc packer that inserts
-zero-data padding entries (`._padNNNN\x00`, 10-byte name) before designated files
-so their file data lands at a 4096-byte boundary.
+`scripts/pack-initramfs-aligned.py` is a Python 3 CPIO newc packer that inserts
+zero-data padding entries (`._padNNNN\x00`, 10-byte name) before every ELF file
+so its file data lands at a 4096-byte boundary. Additional non-ELF paths may still
+be requested with `--align`.
 
-Usage: `pack-initramfs-aligned.py <rootfs_dir> <output.cpio> [--align <archive_path>]...`
+Usage: `pack-initramfs-aligned.py <rootfs_dir> <output.cpio> [--align <additional-path>]...`
 
 Padding math: given H = `round_up(110 + namesize_of_next_entry, 4)` (header+name
 overhead of the next real entry):
@@ -166,20 +167,16 @@ needed = target_pos_after_pad - current_pos
 data_size = needed - PAD_HEADER_OVERHEAD   # PAD_HEADER_OVERHEAD = 120 bytes
 ```
 
-Prints `ALIGN_PROOF path=<p> data_offset=<N> aligned=<true|false>` to stderr.
-Exits nonzero if any requested alignment fails.
+Prints `ALIGN_PROOF path=<p> data_offset=<N> alignment_mod=<N> aligned=<true|false>`
+to stderr for every ELF. It exits nonzero if any aligned payload fails validation.
 
 `common_create_initramfs_aligned()` in `scripts/lib/build-qemu-artifacts-common.sh`
-calls the packer with:
-```
---align sbin/driver_manager
---align sbin/blkcache_srv
---align sbin/virtio_blk_srv
-```
-Falls back to `common_create_initramfs_newc` if python3 or the packer is absent.
+uses automatic ELF detection rather than a fixed late-service list. Missing Python
+or a missing packer is a hard error; the QEMU path does not fall back to an
+unaligned archive.
 
-Both `scripts/build-qemu-aarch64-artifacts.sh` and `scripts/build-qemu-x86_64-artifacts.sh`
-now call `common_create_initramfs_aligned`.
+The x86_64, AArch64, and RISC-V QEMU artifact scripts all call
+`common_create_initramfs_aligned`.
 
 ---
 

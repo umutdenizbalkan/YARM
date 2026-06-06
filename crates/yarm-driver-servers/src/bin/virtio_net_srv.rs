@@ -7,14 +7,12 @@
 #[cfg(not(feature = "hosted-dev"))]
 yarm_server_runtime::install_freestanding_allocator!(
     256 * 1024,
-    "virtio_net server freestanding allocator OOM"
+    "virtio net server freestanding allocator OOM"
 );
 
 #[inline]
-fn run() -> ! {
-    yarm_user_rt::user_log!("VIRTIO_NET_BIN_ENTRY_START");
+fn run() {
     yarm_driver_servers::run_virtio_net();
-    unreachable!("virtio_net service loop must remain resident")
 }
 
 #[cfg(feature = "hosted-dev")]
@@ -25,7 +23,10 @@ fn main() {
 #[cfg(not(feature = "hosted-dev"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_user_entry() -> ! {
-    run()
+    yarm_user_rt::user_log!("VIRTIO_NET_BIN_ENTRY_START");
+    yarm_user_rt::user_log!("VIRTIO_NET_BEFORE_RUN");
+    run();
+    unreachable!("virtio net server resident service loop returned")
 }
 
 #[cfg(not(feature = "hosted-dev"))]

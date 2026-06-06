@@ -93,7 +93,7 @@ common_stage_blkcache_server_elf || true
 common_stage_virtio_blk_server_elf || true
 common_stage_driver_manager_elf || true
 common_verify_initramfs_stage_paths || true
-common_create_initramfs_newc
+common_create_initramfs_aligned
 
 if [[ -f "$KERNEL_ELF" ]]; then
   if command -v llvm-objcopy >/dev/null 2>&1; then

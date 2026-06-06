@@ -55,7 +55,7 @@ Smoke-visible markers for the RAMFS path are:
 - `INIT_RAMFS_SPAWN_OK`
 - `PM_IMAGE_ID_11_RAMFS_SRV path=...`
 - `RAMFS_BIN_ENTRY_START`
-- `RAMFS_BIN_BEFORE_RUN`
+- `RAMFS_BEFORE_RUN`
 - `RAMFS_SRV_ENTRY`
 - `RAMFS_CONFIG_FOUND prefix=...`
 - `RAMFS_CONFIG_DEFAULT prefix=/ram reason=missing-config`
