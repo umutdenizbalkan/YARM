@@ -1666,6 +1666,14 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
 
         if let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) {
             crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB P1");
+            let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes(
+                crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]),
+            );
+            crate::yarm_log!(
+                "YARM_BOOT_CMDLINE_CAPTURE arch=aarch64 len={} truncated={}",
+                captured.raw_cmdline().len(),
+                captured.cmdline_was_truncated() as u8
+            );
             if let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) {
                 crate::yarm_log!(
                     "YARM_AARCH64_DTB memory_start=0x{:x} memory_len=0x{:x} initrd_start=0x{:x} initrd_end=0x{:x} gic_cpu_if_base=0x{:x}",

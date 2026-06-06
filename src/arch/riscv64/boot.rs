@@ -18,6 +18,10 @@ boot_stack_riscv64_end:
     .type _start,@function
 _start:
     la sp, boot_stack_riscv64_end
+    // OpenSBI enters the boot hart with a0=hartid and a1=FDT pointer. The
+    // common kernel entry accepts one architecture boot-information pointer;
+    // YARM does not consume the primary hart ID here, so forward a1 narrowly.
+    mv a0, a1
     .weak yarm_kernel_main
     call yarm_kernel_main
 1:
@@ -550,9 +554,22 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn prepare_arch_boot(start_info_ptr: usize) {
     let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
+        let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes(&[]);
+        crate::yarm_log!(
+            "YARM_BOOT_CMDLINE_CAPTURE arch=riscv64 len={} truncated={} source=missing_dtb",
+            captured.raw_cmdline().len(),
+            captured.cmdline_was_truncated() as u8
+        );
         return;
     };
-    let _ = dtb;
+    let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes(
+        crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]),
+    );
+    crate::yarm_log!(
+        "YARM_BOOT_CMDLINE_CAPTURE arch=riscv64 len={} truncated={}",
+        captured.raw_cmdline().len(),
+        captured.cmdline_was_truncated() as u8
+    );
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
