@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use yarm_srv_common::cpio::{CpioArchive, CpioError};
+
 pub const SERVICE_MANIFEST_MAX_BYTES: usize = 8192;
 pub const SERVICE_MANIFEST_MAX_LINE_BYTES: usize = 256;
 pub const SERVICE_MANIFEST_MAX_PATH_BYTES: usize = 255;
@@ -91,6 +93,96 @@ pub enum ServiceManifestError {
     ContainsWhitespace { line: usize },
     DuplicatePath { line: usize },
     UnsupportedInlineComment { line: usize },
+}
+
+pub const ELF_IDENT_BYTES: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceManifestArchiveError {
+    ArchiveMalformed {
+        source: CpioError,
+    },
+    ArchiveLookupFailed {
+        entry: ServiceManifestEntry,
+        source: CpioError,
+    },
+    MissingPath {
+        entry: ServiceManifestEntry,
+    },
+    NotRegularFile {
+        entry: ServiceManifestEntry,
+    },
+    TooSmall {
+        entry: ServiceManifestEntry,
+        file_len: usize,
+    },
+    NotElf {
+        entry: ServiceManifestEntry,
+    },
+}
+
+impl ServiceManifestArchiveError {
+    pub const fn entry(&self) -> Option<&ServiceManifestEntry> {
+        match self {
+            Self::ArchiveMalformed { .. } => None,
+            Self::ArchiveLookupFailed { entry, .. }
+            | Self::MissingPath { entry }
+            | Self::NotRegularFile { entry }
+            | Self::TooSmall { entry, .. }
+            | Self::NotElf { entry } => Some(entry),
+        }
+    }
+}
+
+/// Validates that every parsed service path names a regular ELF file in a
+/// read-only `newc` CPIO archive.
+///
+/// This helper performs no VFS operations and has no spawning side effects. It
+/// checks only archive structure, existence, regular-file type, ELF-ident size,
+/// and ELF magic. Full ELF parsing and data alignment remain separate concerns.
+pub fn validate_service_manifest_archive(
+    manifest: &ServiceManifest,
+    cpio_bytes: &[u8],
+) -> Result<(), ServiceManifestArchiveError> {
+    let archive = CpioArchive::new(cpio_bytes);
+
+    // Preflight the full archive so malformed entries after a requested file do
+    // not go unnoticed merely because `find` returned early.
+    for entry in archive.entries() {
+        entry.map_err(|source| ServiceManifestArchiveError::ArchiveMalformed { source })?;
+    }
+
+    for manifest_entry in manifest.entries() {
+        let path = core::str::from_utf8(manifest_entry.path())
+            .expect("service manifest paths were validated as UTF-8");
+        let archive_entry = archive
+            .find(path)
+            .map_err(|source| ServiceManifestArchiveError::ArchiveLookupFailed {
+                entry: *manifest_entry,
+                source,
+            })?
+            .ok_or(ServiceManifestArchiveError::MissingPath {
+                entry: *manifest_entry,
+            })?;
+        if !archive_entry.is_regular_file() {
+            return Err(ServiceManifestArchiveError::NotRegularFile {
+                entry: *manifest_entry,
+            });
+        }
+        let file_data = archive_entry.file_data();
+        if file_data.len() < ELF_IDENT_BYTES {
+            return Err(ServiceManifestArchiveError::TooSmall {
+                entry: *manifest_entry,
+                file_len: file_data.len(),
+            });
+        }
+        if &file_data[..4] != b"\x7fELF" {
+            return Err(ServiceManifestArchiveError::NotElf {
+                entry: *manifest_entry,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Parses the helper-only v1 service-list format.
@@ -309,5 +401,142 @@ mod tests {
                 Err(ServiceManifestError::InvalidPath { line: 1 })
             );
         }
+    }
+
+    fn push_hex(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(format!("{value:08x}").as_bytes());
+    }
+
+    fn push_cpio_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
+        let name_len = name.len() + 1;
+        out.extend_from_slice(b"070701");
+        for value in [
+            0,
+            mode,
+            0,
+            0,
+            1,
+            0,
+            data.len() as u32,
+            0,
+            0,
+            0,
+            0,
+            name_len as u32,
+            0,
+        ] {
+            push_hex(out, value);
+        }
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+    }
+
+    fn finish_cpio(out: &mut Vec<u8>) {
+        push_cpio_entry(out, "TRAILER!!!", 0, &[]);
+    }
+
+    fn elf_stub(tag: u8) -> [u8; ELF_IDENT_BYTES] {
+        let mut bytes = [0; ELF_IDENT_BYTES];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = tag;
+        bytes
+    }
+
+    #[test]
+    fn archive_validation_accepts_absolute_paths_and_init() {
+        let manifest = parse_service_manifest(b"/init\n/sbin/foo\n").expect("manifest");
+        let mut cpio = Vec::new();
+        push_cpio_entry(&mut cpio, "init", 0o100755, &elf_stub(1));
+        push_cpio_entry(&mut cpio, "sbin/foo", 0o100755, &elf_stub(2));
+        finish_cpio(&mut cpio);
+        assert_eq!(validate_service_manifest_archive(&manifest, &cpio), Ok(()));
+    }
+
+    #[test]
+    fn archive_validation_rejects_missing_path_with_source_line() {
+        let manifest =
+            parse_service_manifest(b"# first\n/sbin/present\n/sbin/missing\n").expect("manifest");
+        let mut cpio = Vec::new();
+        push_cpio_entry(&mut cpio, "sbin/present", 0o100755, &elf_stub(1));
+        finish_cpio(&mut cpio);
+        let error = validate_service_manifest_archive(&manifest, &cpio).expect_err("missing");
+        assert_eq!(error.entry().expect("entry").path(), b"/sbin/missing");
+        assert_eq!(error.entry().expect("entry").source_line(), 3);
+        assert!(matches!(
+            error,
+            ServiceManifestArchiveError::MissingPath { .. }
+        ));
+    }
+
+    #[test]
+    fn archive_validation_rejects_non_regular_file() {
+        let manifest = parse_service_manifest(b"/sbin/foo\n").expect("manifest");
+        let mut cpio = Vec::new();
+        push_cpio_entry(&mut cpio, "sbin/foo", 0o040755, &elf_stub(1));
+        finish_cpio(&mut cpio);
+        assert!(matches!(
+            validate_service_manifest_archive(&manifest, &cpio),
+            Err(ServiceManifestArchiveError::NotRegularFile { .. })
+        ));
+    }
+
+    #[test]
+    fn archive_validation_rejects_zero_length_and_tiny_files() {
+        for data in [&[][..], b"\x7fELFtiny".as_slice()] {
+            let manifest = parse_service_manifest(b"/sbin/foo\n").expect("manifest");
+            let mut cpio = Vec::new();
+            push_cpio_entry(&mut cpio, "sbin/foo", 0o100755, data);
+            finish_cpio(&mut cpio);
+            assert!(matches!(
+                validate_service_manifest_archive(&manifest, &cpio),
+                Err(ServiceManifestArchiveError::TooSmall { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn archive_validation_rejects_non_elf() {
+        let manifest = parse_service_manifest(b"/sbin/foo\n").expect("manifest");
+        let mut cpio = Vec::new();
+        push_cpio_entry(&mut cpio, "sbin/foo", 0o100755, b"not an elf image!");
+        finish_cpio(&mut cpio);
+        assert!(matches!(
+            validate_service_manifest_archive(&manifest, &cpio),
+            Err(ServiceManifestArchiveError::NotElf { .. })
+        ));
+    }
+
+    #[test]
+    fn archive_validation_rejects_malformed_archive() {
+        let manifest = parse_service_manifest(b"/sbin/foo\n").expect("manifest");
+        let error = validate_service_manifest_archive(&manifest, b"not-cpio")
+            .expect_err("malformed archive");
+        assert!(matches!(
+            error,
+            ServiceManifestArchiveError::ArchiveMalformed {
+                source: CpioError::InvalidMagic | CpioError::Truncated
+            }
+        ));
+    }
+
+    #[test]
+    fn archive_preflight_rejects_corruption_after_requested_file() {
+        let manifest = parse_service_manifest(b"/sbin/foo\n").expect("manifest");
+        let mut cpio = Vec::new();
+        push_cpio_entry(&mut cpio, "sbin/foo", 0o100755, &elf_stub(1));
+        cpio.extend_from_slice(b"truncated-next-header");
+        assert!(matches!(
+            validate_service_manifest_archive(&manifest, &cpio),
+            Err(ServiceManifestArchiveError::ArchiveMalformed {
+                source: CpioError::Truncated
+            })
+        ));
     }
 }

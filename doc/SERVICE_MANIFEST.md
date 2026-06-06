@@ -46,9 +46,9 @@ Audit classification:
 - **E:** runtime wiring remains deferred; and
 - **F:** no parser blocker was found.
 
-The existing CPIO archive API can support later existence checks, but combining
-archive/ELF validation with the v1 syntax parser would unnecessarily couple two
-stages. That work is deferred to MANIFEST-2.
+The existing CPIO archive API supports a separate existence/ELF validation
+stage. MANIFEST-2 implements that stage below without coupling it to v1 syntax
+parsing or live policy.
 
 ## V1 syntax
 
@@ -170,11 +170,11 @@ Design an immutable, compatible handoff of raw command-line bytes or the
 selected manifest path to init. Do not overload capability fields, SpawnV5, or
 existing startup slots.
 
-### MANIFEST-2
+### MANIFEST-2 (implemented)
 
-Add helper-only validation that every parsed path exists in a supplied CPIO
-archive and, where appropriate, has a valid ELF header. It must remain separate
-from VFS and spawning.
+Helper-only validation now checks that every parsed path exists in a supplied
+CPIO archive and has regular-file ELF-ident metadata. It remains separate from
+VFS and spawning; details follow below.
 
 ### Later versioned extensions
 
@@ -207,3 +207,68 @@ MANIFEST-1 does not change:
 - driver-manager behavior;
 - boot command-line capture; or
 - CPIO packer alignment behavior.
+
+## MANIFEST-2 archive and ELF validation
+
+MANIFEST-2 adds the helper-only API:
+
+```text
+validate_service_manifest_archive(&ServiceManifest, cpio_bytes)
+```
+
+The helper preflights the complete `newc` archive and then validates every
+manifest entry. For each service path it requires:
+
+- an archive entry with the same path;
+- a regular-file mode;
+- at least 16 bytes, the ELF identification size; and
+- the leading magic bytes `0x7f`, `E`, `L`, `F`.
+
+`CpioArchive::find` already accepts absolute paths by removing one leading `/`,
+so `/sbin/foo` resolves to the CPIO entry `sbin/foo`, and `/init` resolves to
+`init`. No additional path normalization is performed by MANIFEST-2 because the
+MANIFEST-1 syntax parser has already rejected relative paths, parent components,
+empty components, whitespace, and control characters.
+
+The validator is read-only. It does not parse ELF headers or program headers,
+check target architecture, call VFS, call PM, spawn a service, or change init
+policy. Errors distinguish:
+
+- malformed archive;
+- archive lookup failure;
+- missing path;
+- non-regular entry;
+- file shorter than ELF ident; and
+- non-ELF magic.
+
+Entry-specific errors retain the fixed `ServiceManifestEntry`, including the
+path and original manifest line number.
+
+### CPIO truncation handling
+
+The shared `newc` iterator now reports `CpioError::Truncated` when fewer than 110
+header bytes remain before a trailer or when the archive ends without a
+`TRAILER!!!` entry. This is a read-only parser correction required to keep a
+malformed archive distinct from a valid archive with a missing service path.
+
+### Alignment is not validated here
+
+MANIFEST-2 does not replace or duplicate build-time `ALIGN_PROOF`. The current
+CPIO entry API does not expose a file-data offset, and runtime ELF existence
+validation should not become a second packer policy. Every packed ELF must still
+receive 4096-byte data alignment from the CPIO packer and emit its mandatory
+alignment proof.
+
+### Future live flow remains deferred
+
+The intended staged flow is:
+
+1. BOOTCMD-3 gives init an immutable raw command line or manifest path.
+2. Init reads the selected manifest text from CPIO.
+3. `parse_service_manifest` validates the complete v1 syntax.
+4. `validate_service_manifest_archive` verifies that all selected files exist
+   and have regular-file ELF-ident metadata.
+5. Init applies development fallback or hardened fail-closed policy.
+6. PM performs spawning, and the supervisor retains restart authority.
+
+None of these steps is live-wired by MANIFEST-2.

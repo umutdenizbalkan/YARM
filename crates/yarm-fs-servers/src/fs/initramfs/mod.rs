@@ -20,9 +20,10 @@ pub use manifest::{
 };
 pub use service::{InitramfsService, run};
 pub use service_manifest::{
-    SERVICE_MANIFEST_MAX_BYTES, SERVICE_MANIFEST_MAX_ENTRIES, SERVICE_MANIFEST_MAX_LINE_BYTES,
-    SERVICE_MANIFEST_MAX_PATH_BYTES, ServiceManifest, ServiceManifestEntry, ServiceManifestError,
-    parse_service_manifest,
+    ELF_IDENT_BYTES, SERVICE_MANIFEST_MAX_BYTES, SERVICE_MANIFEST_MAX_ENTRIES,
+    SERVICE_MANIFEST_MAX_LINE_BYTES, SERVICE_MANIFEST_MAX_PATH_BYTES, ServiceManifest,
+    ServiceManifestArchiveError, ServiceManifestEntry, ServiceManifestError,
+    parse_service_manifest, validate_service_manifest_archive,
 };
 
 static BOOT_INITRD_PTR: AtomicUsize = AtomicUsize::new(0);

@@ -266,5 +266,18 @@ by boot capture, init, PM, VFS, or the initramfs service request loop.
 
 The `yarm.manifest=/boot/services-core.txt` option therefore remains a future
 selection mechanism: BOOTCMD-3 must first provide an immutable compatible
-handoff to init. CPIO existence and ELF validation remain deferred to
-MANIFEST-2. No live service ordering or fallback policy changed in MANIFEST-1.
+handoff to init. MANIFEST-2 subsequently added helper-only CPIO existence and
+ELF-ident validation. No live service ordering or fallback policy changed.
+
+## MANIFEST-2 status
+
+MANIFEST-2 adds a helper-only validator that checks a parsed service manifest
+against raw initramfs CPIO bytes. It verifies complete archive parsing, absolute
+path lookup, regular-file type, minimum ELF-ident size, and ELF magic. It does
+not call VFS, init policy, PM, or any spawning path, and it does not replace the
+CPIO packer's mandatory 4096-byte `ALIGN_PROOF` checks.
+
+BOOTCMD-3 remains required before init can receive `yarm.manifest=`. The future
+flow is command-line handoff, manifest text read, MANIFEST-1 syntax validation,
+MANIFEST-2 archive/ELF validation, init-owned fallback selection, and only then
+PM-owned spawning.

@@ -95,7 +95,17 @@ impl<'a> Iterator for CpioEntries<'a> {
         if self.done || self.errored {
             return None;
         }
-        let header = self.bytes.get(self.off..self.off + 110)?;
+        let Some(header_end) = self.off.checked_add(110) else {
+            self.errored = true;
+            return Some(Err(CpioError::Truncated));
+        };
+        let header = match self.bytes.get(self.off..header_end) {
+            Some(header) => header,
+            None => {
+                self.errored = true;
+                return Some(Err(CpioError::Truncated));
+            }
+        };
         if &header[0..6] != b"070701" {
             self.errored = true;
             return Some(Err(CpioError::InvalidMagic));
@@ -234,5 +244,20 @@ mod tests {
         let e = it.next().expect("one").expect("ok");
         assert_eq!(e.name, b"ab");
         assert_eq!(e.file_data(), b"123");
+    }
+
+    #[test]
+    fn short_archive_is_truncated() {
+        let mut entries = CpioArchive::new(b"not-cpio").entries();
+        assert!(matches!(entries.next(), Some(Err(CpioError::Truncated))));
+    }
+
+    #[test]
+    fn missing_trailer_is_truncated() {
+        let mut out = Vec::new();
+        push_entry(&mut out, "init", 0o100755, b"\x7fELF....");
+        let mut entries = CpioArchive::new(&out).entries();
+        assert!(entries.next().expect("init").is_ok());
+        assert!(matches!(entries.next(), Some(Err(CpioError::Truncated))));
     }
 }
