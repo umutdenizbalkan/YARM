@@ -1,0 +1,8 @@
+# Raspberry Pi 5 future bare-metal core service example.
+# This file is not consumed by the current runtime.
+
+/sbin/initramfs_srv
+/sbin/devfs_srv
+/sbin/vfs_server
+/sbin/driver_manager
+/sbin/blkcache_srv

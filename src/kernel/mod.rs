@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub mod boot;
+pub(crate) mod boot_command_line;
 pub mod capabilities;
 pub mod frame_allocator;
 pub mod global_allocator;

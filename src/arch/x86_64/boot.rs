@@ -1002,6 +1002,54 @@ struct PvhModuleSummary {
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn capture_pvh_command_line(start_info_ptr: usize) {
+    use crate::kernel::boot_command_line::{
+        BOOT_COMMAND_LINE_MAX_BYTES, set_raw_cmdline_from_bytes,
+    };
+
+    if start_info_ptr == 0 {
+        let captured = set_raw_cmdline_from_bytes(&[]);
+        crate::yarm_log!(
+            "YARM_BOOT_CMDLINE_CAPTURE arch=x86_64 len={} truncated={}",
+            captured.raw_cmdline().len(),
+            captured.cmdline_was_truncated() as u8
+        );
+        return;
+    }
+    let start_info = unsafe { &*(start_info_ptr as *const PvhStartInfo) };
+    let physical = start_info.cmdline_paddr;
+    let read_len = BOOT_COMMAND_LINE_MAX_BYTES + 1;
+    let direct_map_limit = crate::arch::platform_layout::KERNEL_PHYS_DIRECT_MAP_BYTES;
+    if start_info._magic != PVH_MAGIC
+        || physical == 0
+        || physical > direct_map_limit.saturating_sub(read_len as u64)
+    {
+        let captured = set_raw_cmdline_from_bytes(&[]);
+        crate::yarm_log!(
+            "YARM_BOOT_CMDLINE_CAPTURE arch=x86_64 len={} truncated={} source=absent_or_invalid",
+            captured.raw_cmdline().len(),
+            captured.cmdline_was_truncated() as u8
+        );
+        return;
+    }
+
+    let virtual_address = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+        .saturating_add(physical);
+    // SAFETY: valid PVH physical boot data is covered by the bootstrap direct
+    // map. Reading MAX+1 bytes lets fixed storage distinguish exact-fit input
+    // from an unterminated/overlong source without allocating.
+    let source = unsafe {
+        core::slice::from_raw_parts(virtual_address as *const u8, read_len)
+    };
+    let captured = set_raw_cmdline_from_bytes(source);
+    crate::yarm_log!(
+        "YARM_BOOT_CMDLINE_CAPTURE arch=x86_64 len={} truncated={}",
+        captured.raw_cmdline().len(),
+        captured.cmdline_was_truncated() as u8
+    );
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 fn read_pvh_module_summary(start_info_ptr: usize) -> Option<PvhModuleSummary> {
     if start_info_ptr == 0 {
         return None;
@@ -1344,6 +1392,7 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
     crate::arch::x86_64::console::write_line("KM0");
     crate::arch::x86_64::console::write_line("KM1");
     log_pvh_boot_metadata(start_info_ptr);
+    capture_pvh_command_line(start_info_ptr);
     crate::arch::x86_64::console::write_line("KM2");
     let (regions, used) = collect_pvh_usable_regions(start_info_ptr);
     store_prepared_boot_memory_map(&regions[..used]);

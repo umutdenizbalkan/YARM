@@ -5,6 +5,8 @@
 pub mod aarch64;
 pub mod boot_entry;
 pub mod cpu_mapping;
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) mod fdt;
 pub mod hal;
 pub mod hal_adapters;
 pub mod irq_description;
