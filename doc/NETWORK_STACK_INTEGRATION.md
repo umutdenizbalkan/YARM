@@ -16,6 +16,11 @@ spawn policy, or driver-manager policy. Names for future requests and events in
 this document are descriptive drafts, not assigned opcodes or ABI commitments.
 A later task must define and review each wire format before implementation.
 
+NET-5 now defines strict, standalone no-network stub contracts for
+[`dhcp_srv`](DHCP_SERVER_CONTRACT.md) and
+[`dns_srv`](DNS_SERVER_CONTRACT.md). These stubs do not alter the service graph
+or add live integration.
+
 ## Current layer responsibilities
 
 ### `socket_srv`

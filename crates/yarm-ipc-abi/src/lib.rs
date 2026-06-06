@@ -7,6 +7,8 @@ pub mod blkcache_abi;
 pub mod block_abi;
 pub mod block_backend_abi;
 pub mod devfs_abi;
+pub mod dhcp_abi;
+pub mod dns_abi;
 pub mod driver_abi;
 pub mod irqmux_abi;
 pub mod netdev_abi;
