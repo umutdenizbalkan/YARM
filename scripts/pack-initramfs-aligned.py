@@ -2,17 +2,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Umut Deniz Balkan
 #
-# pack-initramfs-aligned.py — CPIO newc packer that aligns specified file
-# data payloads to PAGE_ALIGN (4096-byte) boundaries within the archive.
+# pack-initramfs-aligned.py — CPIO newc packer that aligns every ELF file
+# data payload to PAGE_ALIGN (4096-byte) boundaries within the archive.
 #
 # Usage:
 #   pack-initramfs-aligned.py <rootfs_dir> <output_cpio> \
-#       [--align <archive_path>] ...
+#       [--align <additional-archive-path>] ...
 #
 # Entries are packed in sorted order (equivalent to `find . | sort`).
-# For each --align target, a zero-data padding entry is inserted immediately
-# before it so that the target's file data starts at a multiple of 4096 bytes
-# from the start of the archive.  The padding entry uses a name of the form
+# Every regular file beginning with the ELF magic is aligned automatically.
+# Each --align target is also aligned, even when it is not an ELF. A zero-data
+# padding entry is inserted immediately before an aligned target so that its
+# file data starts at a multiple of 4096 bytes from the archive start. The
+# padding entry uses a name of the form
 # `._padNNNN\0` (namesize=10) which the initramfs_srv ignores (unknown name).
 #
 # The archive is terminated by the standard TRAILER!!! entry.
@@ -156,8 +158,17 @@ def collect_entries(rootfs_dir):
     return entries
 
 
+def is_elf_file(fs_path):
+    """Return whether `fs_path` is a regular ELF file."""
+    try:
+        with open(fs_path, "rb") as file:
+            return file.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
 def pack(rootfs_dir, output_path, align_set):
-    """Create the CPIO archive at output_path."""
+    """Create the CPIO archive and align every ELF payload."""
     entries = collect_entries(rootfs_dir)
     out = bytearray()
     ino = 1
@@ -168,7 +179,7 @@ def pack(rootfs_dir, output_path, align_set):
         name_bytes = arc_name.encode("utf-8") + b"\x00"
         namesize = len(name_bytes)
 
-        needs_align = (arc_name in align_set)
+        needs_align = arc_name in align_set or (not is_dir and is_elf_file(fs_path))
         if needs_align:
             pad_counter += 1
             insert_alignment_pad(out, namesize, pad_counter)
@@ -192,10 +203,14 @@ def pack(rootfs_dir, output_path, align_set):
             aligned = (data_off % PAGE_ALIGN == 0)
             alignment_results[arc_name] = data_off
             status = "true" if aligned else "false"
+            proof_path = "/" + arc_name.removeprefix("./")
             print(
-                f"ALIGN_PROOF path={arc_name} data_offset={data_off} aligned={status}",
+                f"ALIGN_PROOF path={proof_path} data_offset={data_off} "
+                f"alignment_mod={data_off % PAGE_ALIGN} aligned={status}",
                 file=sys.stderr,
             )
+            if not aligned:
+                raise RuntimeError(f"unaligned payload for {proof_path}: {data_off}")
 
         ino += 1
 
@@ -214,13 +229,13 @@ def pack(rootfs_dir, output_path, align_set):
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="CPIO newc packer with 4096-byte file-data alignment support"
+        description="CPIO newc packer with mandatory 4096-byte ELF data alignment"
     )
     parser.add_argument("rootfs_dir", help="Root filesystem directory to pack")
     parser.add_argument("output_cpio", help="Output CPIO archive path")
     parser.add_argument(
         "--align", action="append", default=[], metavar="ARCHIVE_PATH",
-        help="Archive path to align to 4096-byte boundary (can repeat)",
+        help="Additional archive path to align (ELF files are automatic)",
     )
     args = parser.parse_args()
 

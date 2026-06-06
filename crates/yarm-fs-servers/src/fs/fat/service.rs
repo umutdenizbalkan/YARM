@@ -546,7 +546,7 @@ mod tests {
         assert!(pm_src.contains("PM_IMAGE_ID_10_FAT_SRV"));
         assert!(pm_src.contains("/initramfs/sbin/fat_srv"));
         assert!(fat_bin_src.contains("FAT_BIN_ENTRY_START"));
-        assert!(fat_bin_src.contains("FAT_BIN_BEFORE_RUN"));
+        assert!(fat_bin_src.contains("FAT_BEFORE_RUN"));
     }
 
     #[test]

@@ -509,7 +509,7 @@ mod tests {
         assert!(initramfs_src.contains("INITRAMFS_RAMFS_SRV_PATH"));
         assert!(initramfs_src.contains("sbin/ramfs_srv"));
         assert!(ramfs_bin_src.contains("RAMFS_BIN_ENTRY_START"));
-        assert!(ramfs_bin_src.contains("RAMFS_BIN_BEFORE_RUN"));
+        assert!(ramfs_bin_src.contains("RAMFS_BEFORE_RUN"));
     }
 
     #[test]
@@ -521,7 +521,7 @@ mod tests {
             "INIT_RAMFS_SPAWN_OK",
             "PM_IMAGE_ID_11_RAMFS_SRV",
             "RAMFS_BIN_ENTRY_START",
-            "RAMFS_BIN_BEFORE_RUN",
+            "RAMFS_BEFORE_RUN",
             "RAMFS_CONFIG_FOUND prefix=...",
             "RAMFS_CONFIG_DEFAULT prefix=/ram reason=missing-config",
             "RAMFS_MOUNT_READY prefix=...",

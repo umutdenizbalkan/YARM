@@ -68,6 +68,7 @@ version = "0.1.0"
 name = "yarm-network-servers"
 version = "0.1.0"
 dependencies = [
+ "yarm-ipc-abi",
  "yarm-server-runtime",
  "yarm-user-rt",
 ]
