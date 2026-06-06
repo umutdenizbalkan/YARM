@@ -54,4 +54,3 @@ required-features = ["hosted-dev"]
 [[bin]]
 name = "virtio_net_srv"
 path = "src/bin/virtio_net_srv.rs"
-required-features = ["hosted-dev"]

@@ -9,6 +9,7 @@ pub mod block_backend_abi;
 pub mod devfs_abi;
 pub mod driver_abi;
 pub mod irqmux_abi;
+pub mod netdev_abi;
 pub mod netmgr_abi;
 pub mod process_abi;
 pub mod socket_abi;
