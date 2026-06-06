@@ -13,4 +13,5 @@ pub mod netmgr_abi;
 pub mod process_abi;
 pub mod socket_abi;
 pub mod supervisor_abi;
+pub mod tcpip_abi;
 pub mod vfs_abi;

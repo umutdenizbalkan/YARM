@@ -39,4 +39,3 @@ path = "src/bin/socket_srv.rs"
 [[bin]]
 name = "tcpip_srv"
 path = "src/bin/tcpip_srv.rs"
-required-features = ["hosted-dev"]
