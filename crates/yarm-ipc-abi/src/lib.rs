@@ -10,6 +10,7 @@ pub mod devfs_abi;
 pub mod dhcp_abi;
 pub mod dns_abi;
 pub mod driver_abi;
+pub mod gpio_abi;
 pub mod irqmux_abi;
 pub mod netdev_abi;
 pub mod netmgr_abi;
