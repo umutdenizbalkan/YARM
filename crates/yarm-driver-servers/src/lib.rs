@@ -4,10 +4,14 @@
 #![no_std]
 
 pub mod drivers;
-pub use drivers::{blkcache, input, irqmux, uart, virtio_blk, virtio_gpu, virtio_net};
+pub use drivers::{blkcache, input, irqmux, rp1_gpio, uart, virtio_blk, virtio_gpu, virtio_net};
 
 pub fn run_input() {
     drivers::input::run();
+}
+
+pub fn run_rp1_gpio() {
+    drivers::rp1_gpio::run();
 }
 
 pub fn run_irqmux() {
@@ -45,6 +49,7 @@ mod tests {
         let blkcache_src = include_str!("drivers/blkcache/service.rs");
         let virtio_gpu_src = include_str!("drivers/virtio_gpu/service.rs");
         let virtio_net_src = include_str!("drivers/virtio_net/service.rs");
+        let rp1_gpio_src = include_str!("drivers/rp1_gpio/service.rs");
         let legacy_drivers = ["yarm", "::services::", "drivers::"].concat();
 
         for src in [
@@ -55,6 +60,7 @@ mod tests {
             blkcache_src,
             virtio_gpu_src,
             virtio_net_src,
+            rp1_gpio_src,
         ] {
             assert!(
                 !src.contains(legacy_drivers.as_str()),
@@ -116,6 +122,13 @@ mod tests {
                 "bin/virtio_net_srv.rs",
                 "run_virtio_net",
             ),
+            (
+                "rp1_gpio_srv",
+                "name = \"rp1_gpio_srv\"",
+                "path = \"src/bin/rp1_gpio_srv.rs\"",
+                "bin/rp1_gpio_srv.rs",
+                "run_rp1_gpio",
+            ),
         ];
 
         for (bin_name, name_entry, path_entry, bin_path, run_fn) in expected_bins {
@@ -136,6 +149,7 @@ mod tests {
                 "bin/virtio_blk_srv.rs" => include_str!("bin/virtio_blk_srv.rs"),
                 "bin/virtio_gpu_srv.rs" => include_str!("bin/virtio_gpu_srv.rs"),
                 "bin/virtio_net_srv.rs" => include_str!("bin/virtio_net_srv.rs"),
+                "bin/rp1_gpio_srv.rs" => include_str!("bin/rp1_gpio_srv.rs"),
                 _ => panic!("unexpected bin path in parity table: {bin_path}"),
             };
             assert!(

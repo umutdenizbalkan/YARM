@@ -50,3 +50,7 @@ path = "src/bin/virtio_gpu_srv.rs"
 [[bin]]
 name = "virtio_net_srv"
 path = "src/bin/virtio_net_srv.rs"
+
+[[bin]]
+name = "rp1_gpio_srv"
+path = "src/bin/rp1_gpio_srv.rs"
