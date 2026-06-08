@@ -23619,3 +23619,277 @@ mod stage33_34 {
         );
     }
 }
+
+// ===========================================================================
+// Stage 35 — receive ABI adapters over canonical RecvRequest
+//
+// Verifies that the full-path handlers (handle_ipc_recv, handle_ipc_recv_timeout)
+// correctly build canonical RecvRequest objects and that the v2 meta detection,
+// timeout branching, and regression behavior are equivalent to previous behavior.
+// ===========================================================================
+mod stage35 {
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::recv_core::{
+        FallbackReason, RecvBlockingPolicy, RecvMetaTarget, RecvPayloadTarget, RecvPlan,
+        RecvRequest, RecvRequestKind, plan_recv_core,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CAP0: CapId = CapId(1);
+
+    fn recv_frame(recv_cap: CapId) -> TrapFrame {
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        )
+    }
+
+    fn recv_timeout_frame(recv_cap: CapId, timeout_ticks: u64) -> TrapFrame {
+        TrapFrame::new(
+            Syscall::IpcRecvTimeout as usize,
+            [recv_cap.0 as usize, 0, 0, timeout_ticks as usize, 0, 0],
+        )
+    }
+
+    fn kernel_with_queued_plain(payload: &[u8]) -> (SharedKernel, CapId) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, payload).expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        (kernel, recv_cap)
+    }
+
+    // ── A. Adapter request shape tests ──────────────────────────────────────
+
+    #[test]
+    fn stage35_ipc_recv_adapter_kernel_task_has_register_target() {
+        // from_legacy_ipc_recv with is_kernel_task=true → KernelRegister payload target.
+        let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0x1000, 64, 0, 0, true);
+        assert_eq!(req.kind, RecvRequestKind::LegacyRecv);
+        assert_eq!(req.payload_target, RecvPayloadTarget::KernelRegister);
+        assert_eq!(req.meta_target, RecvMetaTarget::None);
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelPlainEligible);
+    }
+
+    #[test]
+    fn stage35_ipc_recv_adapter_user_asid_has_user_memory_target() {
+        // from_legacy_ipc_recv with is_kernel_task=false → UserMemory payload target.
+        let req = RecvRequest::from_legacy_ipc_recv(1, CAP0, 0x4000, 256, 0, 0, false);
+        assert_eq!(
+            req.payload_target,
+            RecvPayloadTarget::UserMemory {
+                ptr: 0x4000,
+                len: 256
+            }
+        );
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics)
+        );
+    }
+
+    #[test]
+    fn stage35_ipc_recv_adapter_v2_meta_detected_when_len_sufficient() {
+        // meta_ptr ≠ 0 and meta_len ≥ 40 → V2 meta target.
+        let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, 0x5000, 40, true);
+        assert_eq!(
+            req.meta_target,
+            RecvMetaTarget::V2 {
+                ptr: 0x5000,
+                len: 40
+            }
+        );
+        // Even a kernel task falls back when V2 meta is present (user meta-copy).
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy)
+        );
+    }
+
+    #[test]
+    fn stage35_ipc_recv_adapter_no_meta_when_len_too_small() {
+        // meta_len < 40 → None meta target (no v2 write will occur).
+        let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, 0x5000, 39, true);
+        assert_eq!(req.meta_target, RecvMetaTarget::None);
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelPlainEligible);
+    }
+
+    #[test]
+    fn stage35_ipc_recv_adapter_no_meta_when_ptr_zero() {
+        // meta_ptr == 0 → None meta target regardless of meta_len.
+        let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, 0, 40, true);
+        assert_eq!(req.meta_target, RecvMetaTarget::None);
+    }
+
+    // ── B. Timeout adapter request shape tests ───────────────────────────────
+
+    #[test]
+    fn stage35_timeout_adapter_zero_ticks_is_nonblocking() {
+        // timeout_ticks == 0 → NonblockingProbe kind + NoWait blocking policy.
+        let req = RecvRequest::from_ipc_recv_timeout(0, CAP0, 0, 0, 0, None, true);
+        assert_eq!(req.kind, RecvRequestKind::NonblockingProbe);
+        assert_eq!(req.blocking, RecvBlockingPolicy::NoWait);
+    }
+
+    #[test]
+    fn stage35_timeout_adapter_nonzero_ticks_is_deadline() {
+        // timeout_ticks > 0 → TimedRecv kind + Deadline blocking policy.
+        let req = RecvRequest::from_ipc_recv_timeout(0, CAP0, 0, 0, 100, None, true);
+        assert_eq!(req.kind, RecvRequestKind::TimedRecv);
+        assert!(matches!(req.blocking, RecvBlockingPolicy::Deadline(_)));
+    }
+
+    #[test]
+    fn stage35_timeout_adapter_preread_deadline_captured() {
+        // When preread_deadline is Some, the Deadline carries that absolute value.
+        let preread: u64 = 99_999;
+        let req = RecvRequest::from_ipc_recv_timeout(0, CAP0, 0, 0, 50, Some(preread), true);
+        assert_eq!(req.blocking, RecvBlockingPolicy::Deadline(preread));
+    }
+
+    // ── C. Equivalence: v2 detection matches inline check ────────────────────
+
+    #[test]
+    fn stage35_v2_detection_canonical_matches_inline() {
+        // The canonical meta_target check must agree with the old inline:
+        //   frame.arg(INLINE0) != 0 && frame.arg(INLINE1) >= 40
+        // for all representative (meta_ptr, meta_len) pairs.
+        let cases: &[(usize, usize, bool)] = &[
+            (0x5000, 40, true),  // v2 request
+            (0x5000, 41, true),  // v2 request (larger len)
+            (0x5000, 39, false), // too short — not v2
+            (0, 40, false),      // zero ptr — not v2
+            (0, 0, false),       // both zero — not v2
+        ];
+        for &(meta_ptr, meta_len, expected_v2) in cases {
+            let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, meta_ptr, meta_len, true);
+            let canonical_v2 = matches!(req.meta_target, RecvMetaTarget::V2 { .. });
+            assert_eq!(
+                canonical_v2, expected_v2,
+                "canonical v2 detection mismatch for (ptr={meta_ptr:#x}, len={meta_len})"
+            );
+        }
+    }
+
+    // ── D. Regression tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn stage35_kernel_plain_path_still_live() {
+        // Stage 32B/33+34 live split path must still deliver messages after Stage 35.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"stage35");
+        let mut frame = recv_frame(recv_cap);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "kernel-plain split path must still be live"
+        );
+        assert_eq!(frame.ret0(), 7, "sender tid");
+        assert_eq!(frame.ret1(), b"stage35".len(), "payload len");
+        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+    }
+
+    #[test]
+    fn stage35_user_asid_still_fallback_before_dequeue() {
+        // A user-ASID receiver must fall back (None) on the split path — queue untouched.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(5, b"alive").expect("m"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, None, "user-ASID recv must fall back before dequeue");
+        // Confirm the message is still in the queue by unbinding and receiving.
+        kernel.with(|state| state.unbind_task_asid(0).expect("unbind"));
+        let mut frame2 = recv_frame(recv_cap);
+        let result2 =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame2);
+        assert_eq!(
+            result2,
+            Some(Ok(())),
+            "message still present after fallback"
+        );
+        assert_eq!(frame2.ret0(), 5, "same message delivered");
+    }
+
+    #[test]
+    fn stage35_ipc_recv_timeout_zero_ticks_empty_queue_returns_none() {
+        // timeout_ticks == 0 on an empty queue — no blocking, returns WouldBlock.
+        // The split path falls back; the global-lock try_ipc_recv returns None → WouldBlock.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            recv_cap
+        });
+        // Global-lock: try_ipc_recv with empty queue returns None.
+        let msg = kernel.with(|state| state.try_ipc_recv(recv_cap).expect("try_ipc_recv"));
+        assert!(
+            msg.is_none(),
+            "empty queue must return None from try_ipc_recv"
+        );
+    }
+
+    #[test]
+    fn stage35_ipc_recv_timeout_nonblocking_adapter_shape() {
+        // Confirm the adapter shape for the timeout=0 case used inside
+        // handle_ipc_recv_timeout.
+        let req = RecvRequest::from_ipc_recv_timeout(0, CAP0, 0x1000, 64, 0, None, false);
+        assert_eq!(req.kind, RecvRequestKind::NonblockingProbe);
+        assert_eq!(req.blocking, RecvBlockingPolicy::NoWait);
+        // User-ASID always falls back regardless.
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics)
+        );
+    }
+
+    #[test]
+    fn stage35_syscall_count_still_30() {
+        // Stage 35 must not add any new public syscall.
+        assert_eq!(
+            SYSCALL_COUNT, 30,
+            "SYSCALL_COUNT must remain 30 after Stage 35"
+        );
+    }
+
+    #[test]
+    fn stage35_recv_v3_still_helper_only() {
+        // recv_shared_v3 adapter always falls back with SharedV3HelperOnly.
+        #[cfg(test)]
+        {
+            use crate::kernel::recv_core::RecvMapIntent;
+            let req = RecvRequest::future_shared_v3(
+                0,
+                CAP0,
+                0x1000,
+                64,
+                0x2000,
+                crate::kernel::recv_core::recv_shared_v3::V3_MIN_OUTPUT_LEN as usize,
+                RecvMapIntent::ReadOnly,
+                None,
+            );
+            assert_eq!(
+                plan_recv_core(&req),
+                RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly)
+            );
+        }
+    }
+}

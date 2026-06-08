@@ -1092,9 +1092,29 @@ fn try_endpoint_split_recv(
 }
 
 fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    use crate::kernel::recv_core::{RecvMetaTarget, RecvRequest};
+
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let recv_tid = kernel.current_tid().unwrap_or(0);
     crate::yarm_log!("IPC_RECV_ENTER tid={} cap={}", recv_tid, cap.0);
+
+    // Stage 35: build canonical request for decode/planning; this is the same
+    // logic the split path uses, now also exercised on the full-path entry.
+    let is_kernel_task = matches!(current_task_has_user_asid(kernel), Ok(false));
+    let request = RecvRequest::from_legacy_ipc_recv(
+        recv_tid as u64,
+        cap,
+        frame.arg(SYSCALL_ARG_PTR),
+        frame.arg(SYSCALL_ARG_LEN),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
+        frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+        is_kernel_task,
+    );
+    crate::yarm_log!(
+        "YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task={}",
+        is_kernel_task
+    );
+
     if let Err(e) = validate_endpoint_right(kernel, cap, CapRights::RECEIVE) {
         clear_blocked_recv_state(kernel, recv_tid, "error");
         crate::yarm_log!(
@@ -1145,16 +1165,21 @@ fn handle_ipc_recv(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     if let IpcSchedulerPlan::WakeSender(wake_tid) = split_scheduler_plan {
         let _ = kernel.apply_split_sender_wake_plan(wake_tid);
     }
-    let recv_v2_request = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) != 0
-        && frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) >= IPC_RECV_META_V2_ENCODED_LEN;
+    // Stage 35: use canonical meta_target to detect recv-v2 instead of raw frame
+    // arg checks — semantically identical to the previous inline check.
+    let recv_v2_request = matches!(request.meta_target, RecvMetaTarget::V2 { .. });
     if received.is_none() {
         if recv_v2_request {
+            let (meta_user_ptr, meta_user_len) = match request.meta_target {
+                RecvMetaTarget::V2 { ptr, len } => (ptr, len),
+                _ => unreachable!("recv_v2_request is true only when meta_target is V2"),
+            };
             let state = BlockedRecvState {
                 recv_cap: cap,
                 payload_user_ptr: frame.arg(SYSCALL_ARG_PTR),
                 payload_user_len: frame.arg(SYSCALL_ARG_LEN),
-                meta_user_ptr: frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0),
-                meta_user_len: frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1),
+                meta_user_ptr,
+                meta_user_len,
                 recv_abi: RecvAbiVariant::RecvV2,
             };
             kernel.with_tcb_mut(recv_tid, |tcb| {
@@ -1199,6 +1224,8 @@ fn handle_ipc_recv_timeout(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
+    use crate::kernel::recv_core::{RecvBlockingPolicy, RecvRequest};
+
     let cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let recv_tid = kernel.current_tid().unwrap_or(0);
     validate_endpoint_right(kernel, cap, CapRights::RECEIVE)?;
@@ -1246,6 +1273,25 @@ fn handle_ipc_recv_timeout(
             None
         }
     };
+    // Stage 35: build canonical request for decode/planning.  The adapter
+    // captures timeout_ticks==0 as NonblockingProbe/NoWait and timeout_ticks>0
+    // as TimedRecv/Deadline.  We use request.blocking below to replace the
+    // inline timeout_ticks==0 check; deadline fallback logic is unchanged.
+    let is_kernel_task = matches!(current_task_has_user_asid(kernel), Ok(false));
+    let request = RecvRequest::from_ipc_recv_timeout(
+        recv_tid as u64,
+        cap,
+        user_ptr,
+        user_len,
+        timeout_ticks,
+        preread_deadline,
+        is_kernel_task,
+    );
+    crate::yarm_log!(
+        "YARM_RECV_CORE_ADAPTER kind=legacy_timeout is_kernel_task={} blocking={:?}",
+        is_kernel_task,
+        request.blocking
+    );
     // Stage 4G/4I/4J: try the split recv path regardless of timeout_ticks.
     // If a plain message is already queued, delivery is immediate — the deadline is
     // irrelevant.  Ineligible cases (non-plain message, complex sender state, empty
@@ -1256,16 +1302,30 @@ fn handle_ipc_recv_timeout(
         split_recv_succeeded = true;
         try_recv_scheduler_plan = plan;
         Some(msg)
-    } else if timeout_ticks == 0 {
-        kernel.try_ipc_recv(cap).map_err(SyscallError::from)?
-    } else if let Some(deadline) = preread_deadline {
-        kernel
-            .ipc_recv_until_deadline(cap, deadline)
-            .map_err(SyscallError::from)?
     } else {
-        kernel
-            .ipc_recv_with_deadline(cap, timeout_ticks)
-            .map_err(SyscallError::from)?
+        // Stage 35: use request.blocking to classify the timeout case instead of
+        // the raw timeout_ticks==0 check.  Deadline logic is preserved as-is:
+        // preread_deadline takes priority over ipc_recv_with_deadline.
+        match request.blocking {
+            RecvBlockingPolicy::NoWait => kernel.try_ipc_recv(cap).map_err(SyscallError::from)?,
+            RecvBlockingPolicy::Deadline(_) => {
+                if let Some(deadline) = preread_deadline {
+                    kernel
+                        .ipc_recv_until_deadline(cap, deadline)
+                        .map_err(SyscallError::from)?
+                } else {
+                    kernel
+                        .ipc_recv_with_deadline(cap, timeout_ticks)
+                        .map_err(SyscallError::from)?
+                }
+            }
+            RecvBlockingPolicy::WaitForever => {
+                // ipc_recv_timeout never produces WaitForever; treat as timed.
+                kernel
+                    .ipc_recv_with_deadline(cap, timeout_ticks)
+                    .map_err(SyscallError::from)?
+            }
+        }
     };
     // Apply deferred scheduler plan from Stage 4D/4G/4I split recv refill if any.
     if let IpcSchedulerPlan::WakeSender(wake_tid) = try_recv_scheduler_plan {
@@ -1274,14 +1334,15 @@ fn handle_ipc_recv_timeout(
     // Skip the timeout-fired check when the split path already delivered a message.
     // A stale ipc_timeout_fired flag from a prior syscall must not corrupt the result
     // of an immediate split recv that succeeded before any blocking occurred.
-    let timed_out = if timeout_ticks == 0 || split_recv_succeeded {
-        false
-    } else {
-        let fired = kernel
-            .consume_ipc_timeout_fired_for_tid(waiter_tid)
-            .map_err(SyscallError::from)?;
-        fired || received.is_none()
-    };
+    let timed_out =
+        if matches!(request.blocking, RecvBlockingPolicy::NoWait) || split_recv_succeeded {
+            false
+        } else {
+            let fired = kernel
+                .consume_ipc_timeout_fired_for_tid(waiter_tid)
+                .map_err(SyscallError::from)?;
+            fired || received.is_none()
+        };
     if timed_out {
         clear_blocked_recv_state(kernel, waiter_tid, "timeout");
     } else if received.is_some() {
