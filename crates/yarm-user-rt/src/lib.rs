@@ -4,6 +4,7 @@
 #![no_std]
 
 mod arch;
+pub mod recv_v3_draft;
 
 #[macro_export]
 macro_rules! user_log {

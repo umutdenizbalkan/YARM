@@ -25360,3 +25360,384 @@ mod stage38 {
         );
     }
 }
+
+mod stage40 {
+    //! Stage 40+41: recv_shared_v3 ABI contract, object metadata audit, and
+    //! disabled-dispatch scaffold.
+    //!
+    //! Tests cover:
+    //!   A. ABI record validation (request + output)
+    //!   B. from_v3_abi_request kernel adapter
+    //!   C. plan_recv_core always returns SharedV3HelperOnly
+    //!   D. Invariants: SYSCALL_COUNT, no public v3 dispatch
+    //!   E. Regression: stage38 / stage37 live paths unchanged
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::recv_core::{
+        FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
+        RecvPlan, RecvRequest, RecvRequestKind,
+        plan_recv_core,
+        recv_shared_v3::{
+            validate_v3_request, validate_v3_output_record,
+            RecvSharedV3Error, RecvSharedV3Output, RecvSharedV3Request,
+            MAP_READ, MAP_WRITE, V3_MIN_OUTPUT_LEN, V3_MIN_REQUEST_LEN, V3_VERSION,
+        },
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+    use crate::kernel::syscall_split::try_split_dispatch_into_frame;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CAP1: CapId = CapId(1);
+
+    fn minimal_req() -> RecvSharedV3Request {
+        RecvSharedV3Request {
+            version: V3_VERSION,
+            record_len: V3_MIN_REQUEST_LEN,
+            endpoint_cap: 1,
+            payload_ptr: 0x1000,
+            payload_len: 128,
+            metadata_ptr: 0,
+            metadata_len: 0,
+            map_intent: 0,
+            flags: 0,
+            timeout_ticks: u64::MAX,
+            reserved: [0; 2],
+        }
+    }
+
+    fn minimal_out() -> RecvSharedV3Output {
+        RecvSharedV3Output {
+            version: V3_VERSION,
+            record_len: V3_MIN_OUTPUT_LEN,
+            abi_version: 10,
+            result_status: 0,
+            sender_tid: 0,
+            message_len: 0,
+            message_flags: 0,
+            transferred_cap: u64::MAX,
+            object_kind: 0,
+            object_generation: 0,
+            effective_rights: 0,
+            exact_object_size: 0,
+            region_offset: 0,
+            exact_region_len: 0,
+            mapped_base: 0,
+            page_rounded_mapped_len: 0,
+            actual_mapping_perm: 0,
+            cleanup_token: 0,
+            request_id: 0,
+        }
+    }
+
+    // ── A. ABI record validation ─────────────────────────────────────────────
+
+    #[test]
+    fn stage40_abi_valid_request_accepted() {
+        assert_eq!(validate_v3_request(&minimal_req()), Ok(()));
+    }
+
+    #[test]
+    fn stage40_abi_bad_version_rejected() {
+        let mut req = minimal_req();
+        req.version = 0;
+        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::BadVersion));
+    }
+
+    #[test]
+    fn stage40_abi_short_record_rejected() {
+        let mut req = minimal_req();
+        req.record_len = V3_MIN_REQUEST_LEN - 1;
+        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::ShortRecord));
+    }
+
+    #[test]
+    fn stage40_abi_nonzero_reserved_rejected() {
+        let mut req = minimal_req();
+        req.reserved[0] = 1;
+        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::NonzeroReserved));
+    }
+
+    #[test]
+    fn stage40_abi_nonzero_flags_rejected() {
+        let mut req = minimal_req();
+        req.flags = 0xFF;
+        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::NonzeroReserved));
+    }
+
+    #[test]
+    fn stage40_abi_map_intent_without_metadata_rejected() {
+        let mut req = minimal_req();
+        req.map_intent = MAP_READ;
+        req.metadata_ptr = 0;
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::MetaMapIntentConflict)
+        );
+    }
+
+    #[test]
+    fn stage40_abi_unknown_map_intent_bits_rejected() {
+        let mut req = minimal_req();
+        req.map_intent = 0x10;
+        req.metadata_ptr = 0x2000;
+        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::BadMapIntent));
+    }
+
+    #[test]
+    fn stage40_abi_read_only_map_intent_accepted() {
+        let mut req = minimal_req();
+        req.map_intent = MAP_READ;
+        req.metadata_ptr = 0x2000;
+        req.metadata_len = V3_MIN_OUTPUT_LEN as u64;
+        assert_eq!(validate_v3_request(&req), Ok(()));
+    }
+
+    #[test]
+    fn stage40_abi_read_write_map_intent_accepted() {
+        let mut req = minimal_req();
+        req.map_intent = MAP_READ | MAP_WRITE;
+        req.metadata_ptr = 0x2000;
+        req.metadata_len = V3_MIN_OUTPUT_LEN as u64;
+        assert_eq!(validate_v3_request(&req), Ok(()));
+    }
+
+    #[test]
+    fn stage40_abi_valid_output_accepted() {
+        assert_eq!(validate_v3_output_record(&minimal_out()), Ok(()));
+    }
+
+    #[test]
+    fn stage40_abi_output_bad_version_rejected() {
+        let mut out = minimal_out();
+        out.version = 1;
+        assert_eq!(
+            validate_v3_output_record(&out),
+            Err(RecvSharedV3Error::BadVersion)
+        );
+    }
+
+    #[test]
+    fn stage40_abi_output_short_record_rejected() {
+        let mut out = minimal_out();
+        out.record_len = V3_MIN_OUTPUT_LEN - 1;
+        assert_eq!(
+            validate_v3_output_record(&out),
+            Err(RecvSharedV3Error::BadOutputRecord)
+        );
+    }
+
+    // ── B. from_v3_abi_request kernel adapter ────────────────────────────────
+
+    #[test]
+    fn stage40_adapter_valid_request_yields_shared_v3_future() {
+        let req = RecvRequest::from_v3_abi_request(5, &minimal_req()).unwrap();
+        assert_eq!(req.kind, RecvRequestKind::SharedV3Future);
+        assert_eq!(req.requester_tid, 5);
+        assert_eq!(req.recv_cap, CAP1);
+    }
+
+    #[test]
+    fn stage40_adapter_bad_version_returns_error() {
+        let mut abi = minimal_req();
+        abi.version = 99;
+        assert_eq!(
+            RecvRequest::from_v3_abi_request(0, &abi),
+            Err(RecvSharedV3Error::BadVersion)
+        );
+    }
+
+    #[test]
+    fn stage40_adapter_no_timeout_is_wait_forever() {
+        let req = RecvRequest::from_v3_abi_request(0, &minimal_req()).unwrap();
+        assert_eq!(req.blocking, RecvBlockingPolicy::WaitForever);
+    }
+
+    #[test]
+    fn stage40_adapter_zero_timeout_is_no_wait() {
+        let mut abi = minimal_req();
+        abi.timeout_ticks = 0;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(req.blocking, RecvBlockingPolicy::NoWait);
+    }
+
+    #[test]
+    fn stage40_adapter_nonzero_timeout_is_deadline() {
+        let mut abi = minimal_req();
+        abi.timeout_ticks = 12345;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(req.blocking, RecvBlockingPolicy::Deadline(12345));
+    }
+
+    #[test]
+    fn stage40_adapter_no_map_intent_is_none() {
+        let req = RecvRequest::from_v3_abi_request(0, &minimal_req()).unwrap();
+        assert_eq!(req.map_intent, RecvMapIntent::None);
+    }
+
+    #[test]
+    fn stage40_adapter_read_only_map_intent() {
+        let mut abi = minimal_req();
+        abi.map_intent = MAP_READ;
+        abi.metadata_ptr = 0x2000;
+        abi.metadata_len = V3_MIN_OUTPUT_LEN as u64;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(req.map_intent, RecvMapIntent::ReadOnly);
+    }
+
+    #[test]
+    fn stage40_adapter_read_write_map_intent() {
+        let mut abi = minimal_req();
+        abi.map_intent = MAP_READ | MAP_WRITE;
+        abi.metadata_ptr = 0x2000;
+        abi.metadata_len = V3_MIN_OUTPUT_LEN as u64;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(req.map_intent, RecvMapIntent::ReadWrite);
+    }
+
+    #[test]
+    fn stage40_adapter_without_metadata_sets_none_meta_target() {
+        let req = RecvRequest::from_v3_abi_request(0, &minimal_req()).unwrap();
+        assert_eq!(req.meta_target, RecvMetaTarget::None);
+    }
+
+    #[test]
+    fn stage40_adapter_with_metadata_sets_v3future_meta_target() {
+        let mut abi = minimal_req();
+        abi.metadata_ptr = 0x8000;
+        abi.metadata_len = V3_MIN_OUTPUT_LEN as u64;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(
+            req.meta_target,
+            RecvMetaTarget::V3Future {
+                ptr: 0x8000,
+                len: V3_MIN_OUTPUT_LEN as usize,
+            }
+        );
+    }
+
+    #[test]
+    fn stage40_adapter_short_metadata_len_gives_none_meta_target() {
+        let mut abi = minimal_req();
+        abi.metadata_ptr = 0x8000;
+        abi.metadata_len = (V3_MIN_OUTPUT_LEN - 1) as u64;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(req.meta_target, RecvMetaTarget::None);
+    }
+
+    #[test]
+    fn stage40_adapter_payload_target_is_user_memory() {
+        let req = RecvRequest::from_v3_abi_request(0, &minimal_req()).unwrap();
+        assert_eq!(
+            req.payload_target,
+            RecvPayloadTarget::UserMemory { ptr: 0x1000, len: 128 }
+        );
+    }
+
+    // ── C. plan always returns SharedV3HelperOnly ────────────────────────────
+
+    #[test]
+    fn stage40_plan_valid_adapter_request_returns_helper_only() {
+        let req = RecvRequest::from_v3_abi_request(0, &minimal_req()).unwrap();
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly)
+        );
+    }
+
+    #[test]
+    fn stage40_plan_v3_with_metadata_still_helper_only() {
+        let mut abi = minimal_req();
+        abi.metadata_ptr = 0x8000;
+        abi.metadata_len = V3_MIN_OUTPUT_LEN as u64;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly)
+        );
+    }
+
+    #[test]
+    fn stage40_plan_v3_with_read_map_intent_still_helper_only() {
+        let mut abi = minimal_req();
+        abi.map_intent = MAP_READ;
+        abi.metadata_ptr = 0x8000;
+        abi.metadata_len = V3_MIN_OUTPUT_LEN as u64;
+        let req = RecvRequest::from_v3_abi_request(0, &abi).unwrap();
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly)
+        );
+    }
+
+    // ── D. Invariants ────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage40_syscall_count_still_30() {
+        assert_eq!(SYSCALL_COUNT, 30, "Stage 40+41 must not add any public syscall");
+    }
+
+    #[test]
+    fn stage40_no_public_v3_dispatch_reachable() {
+        // No syscall number exists for recv_shared_v3.  A split-dispatch frame
+        // with cap 0 on a kernel task must return None (no message, fallback)
+        // or an error — never a v3-specific delivery.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut frame = TrapFrame::new(Syscall::IpcRecv as usize, [0, 0, 0, 0, 0, 0]);
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        // v3 has no syscall number; result must be None (fallback) or an error —
+        // never a successful v3 delivery.
+        assert!(
+            result.is_none() || result.is_some_and(|r| r.is_err()),
+            "no v3 dispatch should have occurred"
+        );
+    }
+
+    // ── E. Regression ────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage40_kernel_plain_path_still_live() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(3, b"stage40").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 3);
+        assert_eq!(frame.ret1(), b"stage40".len());
+    }
+
+    #[test]
+    fn stage40_user_plain_path_still_live() {
+        use crate::kernel::vm::{PageFlags, VirtAddr};
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(6, b"").expect("m"))
+                .expect("send");
+            let (asid, _) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 6);
+    }
+}

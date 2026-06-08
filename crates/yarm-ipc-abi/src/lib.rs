@@ -19,3 +19,4 @@ pub mod socket_abi;
 pub mod supervisor_abi;
 pub mod tcpip_abi;
 pub mod vfs_abi;
+pub mod recv_shared_v3_abi;
