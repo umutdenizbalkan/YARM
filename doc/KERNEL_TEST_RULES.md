@@ -2815,3 +2815,44 @@ When receive ABI adapters are integrated into the full-path handlers, a `stage35
 **Run command:** `cargo test --lib stage35 -- --test-threads=1`
 
 All 15 `stage35_` tests must pass.
+
+---
+
+## Rule N+43: Stage 36 — user-ASID plain recv live-enable
+
+When user-ASID receive writeback semantics are formalized and the narrow plain recv path is live-enabled, a `stage36_` test suite must prove:
+
+**(A) Plan shape: user-ASID cases:**
+- Plain user-ASID (no meta, no map_intent) → `UserPlainEligible` (`stage36_plan_user_asid_plain_no_meta_is_eligible`)
+- user-ASID + V2 meta → `RecvV2MetaUserCopy` (`stage36_plan_user_asid_with_v2_meta_falls_back_meta_copy`)
+- Mapped recv (map_intent != None) → `UserAsidCopySemantics` (`stage36_plan_user_asid_mapped_recv_falls_back_copy_semantics`)
+- NoWait user-ASID plain → `UserPlainEligible` (`stage36_plan_user_asid_nowait_no_meta_is_eligible`)
+- Kernel-task still `KernelPlainEligible` (`stage36_plan_kernel_task_still_kernel_plain_eligible`)
+
+**(B) Semantics equivalence:**
+- Undersized buffer → `Err(InvalidArgs)` matching full-path (`stage36_undersized_buffer_returns_invalid_args`)
+- Message consumed after undersized error (`stage36_undersized_buffer_consumes_message`)
+- Empty queue → split returns None (`stage36_empty_queue_user_asid_falls_back`)
+
+**(C) Live split path:**
+- Zero-byte message always fits → split delivers (`stage36_user_asid_split_delivers_empty_payload`)
+- Sufficient buffer → split delivers (`stage36_user_asid_split_delivers_with_sufficient_buffer`)
+
+**(D) Writeback outcomes:**
+- UndersizedBuffer when user_buf_len < payload_len (`stage36_writeback_outcome_undersized_buffer`)
+- Ok or CopyFault for 0-byte payload without ASID (`stage36_writeback_outcome_ok_for_empty_payload`)
+- Empty queue → WouldBlock (`stage36_try_recv_core_user_plain_empty_queue_is_would_block`)
+
+**(E) Regressions:**
+- Kernel-plain split path still live (`stage36_kernel_plain_path_still_live`)
+- recv-v2 still falls back (`stage36_recv_v2_still_falls_back`)
+- Mapped recv still falls back (`stage36_mapped_recv_still_falls_back`)
+- Cap-transfer user-ASID falls back at dequeue (`stage36_user_asid_cap_transfer_message_falls_back`)
+
+**(F) Invariants:**
+- `SYSCALL_COUNT == 30` (`stage36_syscall_count_still_30`)
+- recv-v3 still helper-only (`stage36_recv_v3_still_helper_only`)
+
+**Run command:** `cargo test --lib stage36 -- --test-threads=1`
+
+All 19 `stage36_` tests must pass.

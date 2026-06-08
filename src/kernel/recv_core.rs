@@ -27,13 +27,19 @@
 //! - **HELPER-ONLY**: [`recv_shared_v3`] request/output validation scaffold.
 //! - **NOT ADDED**: any new public syscall number.
 //!
-//! # User-ASID copy-failure semantics (Stage 33 formalization)
+//! # User-ASID copy-failure semantics (Stage 33 formalization, Stage 36 live-enable)
 //!
-//! See `doc/KERNEL_LOCKING.md §52` for the complete copy-failure semantics
-//! table.  The current full path dequeues before copying user memory, so a
-//! `copy_to_current_user` fault **consumes the message** (it is not requeued).
-//! Until a preflight or rollback path is proven safe, user-ASID live recv
-//! stays on the global-lock path under `FallbackReason::UserAsidCopySemantics`.
+//! See `doc/KERNEL_LOCKING.md §52` for the Stage 33+34 copy-failure semantics
+//! table and `doc/KERNEL_LOCKING.md §54` for the Stage 36 semantics proof and
+//! live-enable documentation.
+//!
+//! **Stage 36 change:** narrow user-ASID plain recv (no meta, no map_intent)
+//! is now eligible for the split path via [`try_recv_core_user_plain`] and
+//! [`execute_user_asid_plain_writeback`].  The copy-failure semantics are
+//! **proven equivalent** to the full path: dequeue happens first (under
+//! `ipc_state_lock`), then the copy runs after the lock is released.  A copy
+//! fault consumes the message and records a user fault — identical to the
+//! global-lock full path.  See `doc/KERNEL_LOCKING.md §54` for the proof table.
 
 use super::boot::{IpcEndpointRecvResult, IpcEndpointSplitRejectReason, KernelError, KernelState};
 use super::capabilities::{CapId, CapObject};
@@ -342,10 +348,11 @@ impl RecvRequest {
 /// `doc/KERNEL_LOCKING.md §52`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackReason {
-    /// Receiver has a user ASID.  The current full path dequeues before
-    /// copying user memory; a copy fault consumes the message (lost).
-    /// Until a preflight or rollback path is proven safe, user-ASID live
-    /// recv stays on the global-lock path.
+    /// Receiver has a user ASID and the request shape is not narrow-plain-eligible:
+    /// either `map_intent != None` (mapped receive) or some other case that
+    /// prevents split-path dispatch.  Plain user-ASID recv without map_intent
+    /// is now `UserPlainEligible` (see §54); only mapped/non-plain requests
+    /// remain here.
     UserAsidCopySemantics,
     /// recv-v2 metadata output pointer present; requires user-copy.
     RecvV2MetaUserCopy,
@@ -375,20 +382,23 @@ pub enum RecvSchedulerWakePlan {
 /// How the received payload should be written after the IPC dequeue.
 ///
 /// The plan carries everything needed for the writeback so it can be applied
-/// lock-free after `ipc_state_lock` (rank 3) is released.
+/// after `ipc_state_lock` (rank 3) is released.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvWritebackPlan {
     /// Kernel task: write `sender_tid` into `ret0`, `raw_len` into `ret1`,
     /// and pack the inline payload words into `arg[3]`/`arg[4]`.
     KernelRegister { sender_tid: usize, raw_len: usize },
-    /// User-ASID task: copy `app_payload_len` bytes to `ptr` in user space.
+    /// User-ASID task: copy the message payload to `ptr` in user space.
     ///
-    /// **Currently disabled.** Produced only by the adapter constructors for
-    /// documentation; [`try_recv_core_kernel_plain`] never reaches here.
-    #[allow(dead_code)]
+    /// `user_buf_len` is the **capacity** of the caller's buffer (from
+    /// `RecvPayloadTarget::UserMemory.len`).  The actual payload to copy is
+    /// `delivery.msg.as_slice()`.  The undersized check (`user_buf_len <
+    /// payload.len()`) is performed by [`execute_user_asid_plain_writeback`].
+    ///
+    /// **Stage 36:** live-enabled for narrow plain recv (no meta, no map).
     UserMemory {
         ptr: usize,
-        app_payload_len: usize,
+        user_buf_len: usize,
         sender_tid: usize,
     },
 }
@@ -427,35 +437,47 @@ pub enum RecvOutcome {
 
 /// Split-eligibility plan based on the **request shape alone**.
 ///
-/// No IPC state is read here; the actual dequeue (via
-/// [`try_recv_core_kernel_plain`]) may still produce a fallback for
-/// reasons determined at dequeue time (empty queue, sender-waiter, etc.).
+/// No IPC state is read here; the actual dequeue may still produce a fallback
+/// for reasons determined at dequeue time (empty queue, sender-waiter, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvPlan {
-    /// The request shape is compatible with the fast kernel-plain split path.
+    /// Kernel task (no user ASID), no meta: compatible with the fast
+    /// kernel-plain split path.  Execute via [`try_recv_core_kernel_plain`].
     KernelPlainEligible,
+    /// **Stage 36:** User-ASID plain recv (no meta, no map_intent).
+    /// Compatible with the user-plain split path.
+    /// Execute via [`try_recv_core_user_plain`] then
+    /// [`execute_user_asid_plain_writeback`].  Copy-failure semantics proven
+    /// equivalent to the full path (see `doc/KERNEL_LOCKING.md §54`).
+    UserPlainEligible,
     /// The request requires the global-lock full path.
     FallbackRequired(FallbackReason),
 }
 
-/// Check whether a receive request is eligible for the fast kernel-plain
-/// split path based on its **shape alone**.
+/// Check whether a receive request is eligible for a split path based on its
+/// **shape alone**.
 ///
 /// This is a pure function: no kernel state is accessed.  The actual dequeue
 /// may still fall back for runtime reasons (empty queue, cap-transfer message
 /// at queue head, etc.).
+///
+/// # Return values
+///
+/// - [`RecvPlan::KernelPlainEligible`] — kernel task, no meta; use
+///   [`try_recv_core_kernel_plain`].
+/// - [`RecvPlan::UserPlainEligible`] — user-ASID, no meta, no map_intent;
+///   use [`try_recv_core_user_plain`] + [`execute_user_asid_plain_writeback`].
+///   Copy-failure semantics proven equivalent to full path (§54).
+/// - [`RecvPlan::FallbackRequired`] — everything else; use global-lock path.
 pub(crate) fn plan_recv_core(request: &RecvRequest) -> RecvPlan {
     // Future v3 is helper-only: never route to live engine.
     if matches!(request.kind, RecvRequestKind::SharedV3Future) {
         return RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly);
     }
 
-    // User-ASID copy-failure semantics blocker (§52).
-    if matches!(request.payload_target, RecvPayloadTarget::UserMemory { .. }) {
-        return RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics);
-    }
-
     // recv-v2 or v3 metadata pointer: requires a user-copy for metadata.
+    // Checked BEFORE the payload_target match so that user-ASID+meta requests
+    // get the more specific RecvV2MetaUserCopy reason instead of UserAsidCopySemantics.
     if matches!(
         request.meta_target,
         RecvMetaTarget::V2 { .. } | RecvMetaTarget::V3Future { .. }
@@ -463,7 +485,20 @@ pub(crate) fn plan_recv_core(request: &RecvRequest) -> RecvPlan {
         return RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy);
     }
 
-    RecvPlan::KernelPlainEligible
+    match request.payload_target {
+        RecvPayloadTarget::KernelRegister => RecvPlan::KernelPlainEligible,
+        RecvPayloadTarget::UserMemory { .. } => {
+            // Mapped receive (map_intent != None) requires page-table operations
+            // and region-descriptor copy not yet split-extracted.
+            if request.map_intent != RecvMapIntent::None {
+                return RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics);
+            }
+            // Stage 36: narrow eligible path — plain (no meta, no map_intent)
+            // user-ASID recv.  Copy-failure semantics proven equivalent to the
+            // global-lock full path; see doc/KERNEL_LOCKING.md §54.
+            RecvPlan::UserPlainEligible
+        }
+    }
 }
 
 // ─── Core execution ───────────────────────────────────────────────────────────
@@ -544,6 +579,132 @@ pub(crate) fn try_recv_core_kernel_plain(
             }
             _ => RecvOutcome::WouldBlock,
         },
+    }
+}
+
+// ─── Stage 36: user-ASID plain recv execution ────────────────────────────────
+
+/// Outcome of a user-ASID plain writeback attempt (`execute_user_asid_plain_writeback`).
+///
+/// The caller in `syscall.rs` maps each variant to the appropriate frame state
+/// and error/fault path — matching the global-lock full path exactly (§54).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvUserWritebackOutcome {
+    /// Payload copied successfully.  Caller should call
+    /// `frame.set_ok(sender_tid, copied_len, frame.ret2())`.
+    Ok,
+    /// User buffer capacity (`user_buf_len`) was smaller than the message
+    /// payload.  Message consumed.  Caller should return `Err(InvalidArgs)`.
+    UndersizedBuffer,
+    /// `copy_to_current_user` returned `UserMemoryFault`.  Message consumed.
+    /// Caller should call `record_user_fault(kernel, frame, user_ptr, Write)`
+    /// and return `Ok(())`.
+    CopyFault { user_ptr: usize },
+}
+
+/// Execute the fast user-ASID plain split recv path.
+///
+/// Attempts to dequeue one plain (unflagged) message from `endpoint` under
+/// the IPC domain (`ipc_state_lock`, rank 3) and returns a [`RecvDelivery`]
+/// with a `UserMemory` writeback plan.  The ipc_state_lock is released before
+/// this function returns.  The actual user-space copy is performed by the
+/// caller via [`execute_user_asid_plain_writeback`].
+///
+/// # Preconditions (caller-enforced via [`plan_recv_core`])
+///
+/// - `request.payload_target == UserMemory { .. }`
+/// - `request.meta_target == None`
+/// - `request.map_intent == None`
+/// - No capability lock or `ipc_state_lock` held by caller.
+///
+/// # Lock order
+///
+/// Acquires and releases `ipc_state_lock` (rank 3) only.
+/// Must not be called while holding scheduler (1), task (2), or cap (4) locks.
+pub(crate) fn try_recv_core_user_plain(
+    kernel: &mut KernelState,
+    request: &RecvRequest,
+    endpoint: CapObject,
+) -> RecvOutcome {
+    let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
+        Ok(idx) => idx,
+        Err(e) => return RecvOutcome::Error(e),
+    };
+
+    match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
+        IpcEndpointRecvResult::Received(msg) => {
+            kernel.note_endpoint_only_queued_recv_split();
+            let sender_tid = match usize::try_from(msg.sender_tid.0) {
+                Ok(s) => s,
+                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
+            };
+            let (ptr, user_buf_len) = match request.payload_target {
+                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
+                // Unreachable: plan_recv_core guarantees UserMemory here.
+                _ => unreachable!("try_recv_core_user_plain: non-UserMemory payload_target"),
+            };
+            RecvOutcome::Delivered(RecvDelivery {
+                writeback: RecvWritebackPlan::UserMemory {
+                    ptr,
+                    user_buf_len,
+                    sender_tid,
+                },
+                scheduler: RecvSchedulerWakePlan::None,
+                msg,
+            })
+        }
+
+        IpcEndpointRecvResult::ReceivedWithSenderWake(_msg, _wake_tid) => {
+            kernel.note_endpoint_only_queued_recv_split();
+            RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+        }
+
+        IpcEndpointRecvResult::Ineligible(reason) => match reason {
+            IpcEndpointSplitRejectReason::EmptyQueue
+            | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
+            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage => {
+                RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)
+            }
+            IpcEndpointSplitRejectReason::SenderWaiterPresent => {
+                RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+            }
+            _ => RecvOutcome::WouldBlock,
+        },
+    }
+}
+
+/// Perform the user-space copy for a dequeued plain message.
+///
+/// Called after the ipc_state_lock (rank 3) is released.  The global lock
+/// (state spinlock) may still be held by the caller — that is not prohibited
+/// by the hard rules, which only forbid holding `ipc_state_lock` or the
+/// capability lock during user copies.
+///
+/// Returns [`RecvUserWritebackOutcome`]; the caller applies frame writes and
+/// fault recording based on the outcome.  This matches the global-lock full
+/// path semantics exactly (see `doc/KERNEL_LOCKING.md §54`):
+///
+/// - Undersized buffer → `UndersizedBuffer` (message consumed, same as full path `Err(InvalidArgs)`)
+/// - `UserMemoryFault` → `CopyFault` (message consumed, same as full path `record_user_fault + Ok()`)
+/// - Success → `Ok` (message delivered to user)
+pub(crate) fn execute_user_asid_plain_writeback(
+    kernel: &mut KernelState,
+    delivery: &RecvDelivery,
+) -> RecvUserWritebackOutcome {
+    let (ptr, user_buf_len) = match delivery.writeback {
+        RecvWritebackPlan::UserMemory {
+            ptr, user_buf_len, ..
+        } => (ptr, user_buf_len),
+        _ => unreachable!("execute_user_asid_plain_writeback: non-UserMemory plan"),
+    };
+    let payload = delivery.msg.as_slice();
+    if user_buf_len < payload.len() {
+        return RecvUserWritebackOutcome::UndersizedBuffer;
+    }
+    match kernel.copy_to_current_user(ptr, payload) {
+        Ok(()) => RecvUserWritebackOutcome::Ok,
+        Err(KernelError::UserMemoryFault) => RecvUserWritebackOutcome::CopyFault { user_ptr: ptr },
+        Err(_) => RecvUserWritebackOutcome::CopyFault { user_ptr: ptr },
     }
 }
 
@@ -854,12 +1015,15 @@ mod tests {
     // it.  See doc/KERNEL_LOCKING.md §52 for the full semantics table.
 
     #[test]
-    fn recv_core_plan_user_asid_returns_fallback_copy_semantics() {
+    fn recv_core_plan_user_asid_plain_is_eligible() {
+        // Stage 36: plain user-ASID recv (no meta, no map_intent) is now
+        // UserPlainEligible.  Copy-failure semantics proven equivalent to full
+        // path; see doc/KERNEL_LOCKING.md §54.
         let req = RecvRequest::from_legacy_ipc_recv(1, CAP0, 0x4000, 128, 0, 0, false);
         assert_eq!(
             plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics),
-            "user-ASID recv must fall back (copy-failure semantics not formalized)"
+            RecvPlan::UserPlainEligible,
+            "plain user-ASID recv must be UserPlainEligible (Stage 36)"
         );
     }
 
