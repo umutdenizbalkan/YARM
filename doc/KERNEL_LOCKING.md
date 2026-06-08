@@ -10548,3 +10548,53 @@ tests; the full kernel-dispatch cap-transfer proof is deferred to a future stage
 - No production service loop uses recv_shared_v3.
 - No new syscall numbers. `SYSCALL_COUNT == 31` unchanged.
 - Blocking, map_intent, and object metadata remain disabled.
+
+
+## §60 Stage 46: cap-transfer recv_shared_v3 proof via real send path
+
+### 60.1 Blocker resolved
+
+Stage 45 documented (§59.4) that cap-transfer proof through `dispatch()` was blocked
+because the boot-level `ipc_send` helper does not call `stash_transfer_envelope`.
+Stage 46 resolves this by using `dispatch(IpcSend)` which calls the real
+`handle_ipc_send` → `stash_transfer_handle` → `stash_transfer_envelope` path.
+
+### 60.2 Proof fixture (mod stage46 in src/kernel/boot/tests.rs)
+
+**Send phase (no user ASID):**
+- `dispatch(IpcSend)` with `arg5 = mem_cap` (capability to transfer).
+- `handle_ipc_send`: `sender_has_user_asid = false` → inline payload path.
+- `stash_transfer_handle` → `stash_transfer_envelope` stashes the envelope.
+- Message enqueued with `FLAG_CAP_TRANSFER` and stash handle embedded.
+- Telemetry: `cap_transfer_stage4e_enqueued` incremented (observable proof of stash call).
+
+**Receive phase (user ASID set up after send):**
+- `dispatch(RecvSharedV3)` on same task/endpoint.
+- `try_recv_core_user_plain` dequeues the `FLAG_CAP_TRANSFER` message.
+- `extract_cap_transfer_plan` produces `Some(plan)` from the message flags.
+- `materialize_received_message_cap` → `materialize_received_transfer_cap` →
+  `take_transfer_envelope(stash_handle, endpoint, receiver_tid)` → succeeds.
+- `grant_task_to_task_with_rights` mints cap into receiver cnode.
+- `write_v3_output_to_user` writes non-sentinel `transferred_cap` to metadata buffer.
+- `frame.set_ok(..., xfer_cap_out)` also carries the cap in `ret2`.
+
+### 60.3 Proven assertions
+
+- `result_status == RECV_V3_STATUS_OK`
+- `transferred_cap != SYSCALL_NO_TRANSFER_CAP` (u64::MAX)
+- `message_flags & FLAG_CAP_TRANSFER != 0`
+- `frame.ret2() == transferred_cap` (register path and metadata path agree)
+- `resolve_current_task_capability(CapId(transferred_cap))` succeeds and returns
+  `CapObject::MemoryObject` (cap is live in receiver cnode)
+
+### 60.4 Negative proof (stage46_direct_enqueue_phony_cap_transfer_fails_materialization)
+
+Boot-level `ipc_send` with a phony `FLAG_CAP_TRANSFER` handle (not stashed) causes
+`take_transfer_envelope` to return `None`, resulting in `Err(SyscallError::InvalidCapability)`
+from `dispatch(RecvSharedV3)`. This proves `stash_transfer_envelope` is required.
+
+### 60.5 FUTURE / remaining blockers
+
+- `object_kind`, `object_generation`, `effective_rights`, `exact_object_size` remain 0.
+- No production service loop uses recv_shared_v3.
+- `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.
