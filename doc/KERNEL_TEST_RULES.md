@@ -3113,3 +3113,48 @@ correct authoritative fields to the user-supplied metadata buffer, and the user-
 - `cargo test -p yarm-user-rt --lib recv_v3` (19 user-rt tests total)
 
 All tests must pass.
+
+
+## Rule N+50: Stage 46 — cap-transfer recv_shared_v3 proof via real handle_ipc_send path
+
+Stage 46 closes the cap-transfer blocker documented in Rule N+49(C): uses
+`dispatch(IpcSend)` (which calls `handle_ipc_send` → `stash_transfer_handle` →
+`stash_transfer_envelope`) to send a cap-transfer message, then proves
+`dispatch(RecvSharedV3)` materializes the cap and writes a non-sentinel
+`transferred_cap` to the output metadata buffer.
+
+**(A) Kernel dispatch tests (2 in `mod stage46`):**
+
+- `stage46_cap_transfer_through_real_send_path` — Full chain proof:
+  - Sends via `dispatch(IpcSend)` with `arg5 = mem_cap` (inline payload, no user ASID).
+  - Asserts `cap_transfer_stage4e_enqueued` incremented by 1 (proves `stash_transfer_envelope` was called).
+  - Sets up user ASID + mapped page at VA 0x1_0000.
+  - Receives via `dispatch(RecvSharedV3)`.
+  - Asserts: `result_status == OK`, `transferred_cap != u64::MAX`, `message_flags & FLAG_CAP_TRANSFER != 0`.
+  - Asserts `frame.ret2() == transferred_cap` (register and metadata agree).
+  - Resolves materialized cap: must be `CapObject::MemoryObject`.
+
+- `stage46_direct_enqueue_phony_cap_transfer_fails_materialization` — Negative / blocker documentation:
+  - Uses boot-level `state.ipc_send()` with a phony `FLAG_CAP_TRANSFER` handle (not stashed).
+  - `recv_shared_v3` dispatch must return `Err(SyscallError::InvalidCapability)` because
+    `take_transfer_envelope` returns `None` for the un-stashed handle.
+  - Proves `stash_transfer_envelope` is required for cap transfer to succeed.
+
+**(B) user-rt test (`crates/yarm-user-rt/src/syscall/recv_v3.rs`):**
+
+- `from_output_stage46_cap_transfer_output_roundtrip` — Proves `from_output()` decodes
+  a kernel-style output with `transferred_cap = 42` (non-sentinel) into
+  `RecvSharedV3Delivery { has_transfer_cap() == true, transferred_cap == Some(42) }`.
+
+**(C) Cap-transfer object identity proof — deferred:**
+- `object_kind`, `object_generation`, `effective_rights`, `exact_object_size` remain 0
+  (FUTURE fields; object introspection not yet implemented).
+- Existing ipc_recv / recv-v2 cap-transfer behavior unchanged (covered by prior tests).
+- No production services migrated. `SYSCALL_COUNT == 31` unchanged.
+
+**Run commands:**
+- `cargo test --lib stage46 -- --test-threads=1` (2 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (27 user-rt tests total)
+- `cargo test --features hosted-dev --lib -- --test-threads=1` (1128 total)
+
+All tests must pass.

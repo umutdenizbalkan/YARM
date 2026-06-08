@@ -184,54 +184,40 @@ fn transfer_envelope_handles_are_single_use_and_replay_safe() {
     let first = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
         .expect("stash first");
-    assert!(
-        state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_some()
-    );
-    assert!(
-        state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_none()
-    );
+    assert!(state
+        .take_transfer_envelope(first, endpoint, ThreadId(0))
+        .is_some());
+    assert!(state
+        .take_transfer_envelope(first, endpoint, ThreadId(0))
+        .is_none());
 
     let second = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
         .expect("stash second");
     assert_ne!(first, second);
-    assert!(
-        state
-            .take_transfer_envelope(first, endpoint, ThreadId(0))
-            .is_none()
-    );
+    assert!(state
+        .take_transfer_envelope(first, endpoint, ThreadId(0))
+        .is_none());
     let wrong_endpoint = CapObject::Endpoint {
         index: usize::MAX,
         generation: 1,
     };
-    assert!(
-        state
-            .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
-            .is_none()
-    );
-    assert!(
-        state
-            .take_transfer_envelope(second, endpoint, ThreadId(0))
-            .is_some()
-    );
+    assert!(state
+        .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
+        .is_none());
+    assert!(state
+        .take_transfer_envelope(second, endpoint, ThreadId(0))
+        .is_some());
 
     let bound = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(9)), None)
         .expect("stash bound");
-    assert!(
-        state
-            .take_transfer_envelope(bound, endpoint, ThreadId(8))
-            .is_none()
-    );
-    assert!(
-        state
-            .take_transfer_envelope(bound, endpoint, ThreadId(9))
-            .is_some()
-    );
+    assert!(state
+        .take_transfer_envelope(bound, endpoint, ThreadId(8))
+        .is_none());
+    assert!(state
+        .take_transfer_envelope(bound, endpoint, ThreadId(9))
+        .is_some());
 }
 
 #[test]
@@ -3894,13 +3880,11 @@ fn revoke_isolated_to_owning_cnode_space() {
             .revoke(cap),
         Ok(())
     );
-    assert!(
-        state
-            .cspace_for_cnode(cnode1)
-            .expect("cspace1")
-            .get(cap)
-            .is_none()
-    );
+    assert!(state
+        .cspace_for_cnode(cnode1)
+        .expect("cspace1")
+        .get(cap)
+        .is_none());
     let remaining = state
         .cspace_for_cnode(cnode2)
         .expect("cspace2")
@@ -3947,30 +3931,22 @@ fn revoke_source_capability_cascades_to_delegated_descendants() {
     let delegated_task2 = state
         .grant_capability_task_to_task_with_rights(1, delegated_task1, 2, CapRights::READ)
         .expect("delegate task2");
-    assert!(
-        state
-            .resolve_capability_for_task(1, delegated_task1)
-            .is_ok()
-    );
-    assert!(
-        state
-            .resolve_capability_for_task(2, delegated_task2)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(1, delegated_task1)
+        .is_ok());
+    assert!(state
+        .resolve_capability_for_task(2, delegated_task2)
+        .is_ok());
 
     let root_cnode = state.task_cnode(0).expect("root cnode");
     assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
     assert!(state.resolve_capability_for_task(0, root).is_err());
-    assert!(
-        state
-            .resolve_capability_for_task(1, delegated_task1)
-            .is_err()
-    );
-    assert!(
-        state
-            .resolve_capability_for_task(2, delegated_task2)
-            .is_err()
-    );
+    assert!(state
+        .resolve_capability_for_task(1, delegated_task1)
+        .is_err());
+    assert!(state
+        .resolve_capability_for_task(2, delegated_task2)
+        .is_err());
 }
 
 #[test]
@@ -4414,14 +4390,12 @@ fn revoked_unmapped_memory_object_reclaims_frame() {
         .revoke_capability_in_cnode(cnode, mem_cap)
         .expect("revoke mem cap");
 
-    assert!(
-        state
-            .memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .all(|entry| entry.id != id)
-    );
+    assert!(state
+        .memory
+        .memory_objects
+        .iter()
+        .flatten()
+        .all(|entry| entry.id != id));
 
     let (_next_id, next_cap) = state.alloc_anonymous_memory_object().expect("next anon");
     let next_phys = state
@@ -4940,15 +4914,13 @@ fn delegate_device_server_caps_configures_driver_record() {
     assert!(state.capability_for_cnode(driver_cnode, irq_cap).is_some());
     assert!(state.capability_for_cnode(driver_cnode, dma_cap).is_some());
     assert!(state.capability_for_cnode(driver_cnode, iova_cap).is_some());
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                34,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE,
-            )
-            .is_ok()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            34,
+            crate::kernel::vm::PAGE_SIZE * 8,
+            crate::kernel::vm::PAGE_SIZE,
+        )
+        .is_ok());
 }
 
 #[test]
@@ -5512,38 +5484,26 @@ fn delegate_driver_bundle_uses_standard_window_and_revokes_caps() {
         .expect("bundle");
 
     let driver_cnode = state.task_cnode(59).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.irq_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.dma_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.iova_cap)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.irq_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.dma_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.iova_cap)
+        .is_some());
 
     state.revoke_driver_runtime_caps(59).expect("revoke");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.irq_cap)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.dma_cap)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, bundle.iova_cap)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.irq_cap)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.dma_cap)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, bundle.iova_cap)
+        .is_none());
 }
 
 #[test]
@@ -5804,26 +5764,18 @@ fn driver_record_accepts_multiple_irq_and_dma_caps() {
 
     state.revoke_driver_runtime_caps(44).expect("revoke");
     let driver_cnode = state.task_cnode(44).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq_a)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq_b)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_dma_a)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_dma_b)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq_a)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq_b)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_dma_a)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_dma_b)
+        .is_none());
 }
 
 #[test]
@@ -5897,22 +5849,16 @@ fn dma_region_cap_enforces_window_constraints() {
     let mut state = Bootstrap::init().expect("init");
     let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
-            .is_ok()
-    );
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
-            .is_err()
-    );
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+        .is_ok());
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+        .is_err());
     assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_err()
-    );
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+        .is_err());
 }
 
 #[test]
@@ -5929,29 +5875,23 @@ fn dma_region_cap_uses_parent_memory_object_length() {
         .expect("memory object present");
     entry.len = crate::kernel::vm::PAGE_SIZE * 4;
 
-    assert!(
-        state
-            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-            .is_ok()
-    );
-    assert!(
-        state
-            .mint_dma_region_cap(
-                mem_cap,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
-    assert!(
-        state
-            .mint_dma_region_cap(
-                mem_cap,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE * 2
-            )
-            .is_err()
-    );
+    assert!(state
+        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+        .is_ok());
+    assert!(state
+        .mint_dma_region_cap(
+            mem_cap,
+            crate::kernel::vm::PAGE_SIZE * 3,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
+    assert!(state
+        .mint_dma_region_cap(
+            mem_cap,
+            crate::kernel::vm::PAGE_SIZE * 3,
+            crate::kernel::vm::PAGE_SIZE * 2
+        )
+        .is_err());
 }
 
 #[test]
@@ -6060,15 +6000,13 @@ fn driver_restart_revokes_runtime_caps() {
     let token = state.exit_task(22, 1).expect("exit");
     state.restart_task(22, token).expect("restart");
 
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                22,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            22,
+            crate::kernel::vm::PAGE_SIZE * 8,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_err());
 }
 
 #[test]
@@ -6116,26 +6054,22 @@ fn detach_iova_space_revokes_dma_window_validation() {
             crate::kernel::vm::PAGE_SIZE,
         )
         .expect("window");
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            31,
+            crate::kernel::vm::PAGE_SIZE * 2,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
 
     state.detach_driver_iova_space(31).expect("detach");
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                31,
-                crate::kernel::vm::PAGE_SIZE * 2,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            31,
+            crate::kernel::vm::PAGE_SIZE * 2,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_err());
 }
 
 #[test]
@@ -6158,21 +6092,15 @@ fn revoke_driver_runtime_caps_revokes_from_driver_cnode() {
 
     state.revoke_driver_runtime_caps(32).expect("revoke");
     let driver_cnode = state.task_cnode(32).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_dma)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_iova)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_dma)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_iova)
+        .is_none());
 }
 
 #[test]
@@ -6186,11 +6114,9 @@ fn stale_driver_caps_are_rejected_after_revocation() {
     state.revoke_driver_runtime_caps(33).expect("revoke");
 
     let driver_cnode = state.task_cnode(33).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, delegated_irq)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, delegated_irq)
+        .is_none());
     assert!(state.grant_driver_irq(33, irq).is_ok());
 }
 
@@ -6218,16 +6144,12 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
         .validate_driver_bundle_live(111, first_bundle)
         .expect("bundle live");
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+        .is_some());
 
     let token = state.exit_task(111, 5).expect("exit");
     state.restart_task(111, token).expect("restart");
@@ -6237,26 +6159,20 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
         Err(KernelError::StaleCapability)
     );
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
-            .is_none()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+        .is_none());
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+        .is_none());
     assert!(matches!(
         state.grant_driver_irq(111, first_bundle.irq_cap),
         Err(KernelError::InvalidCapability | KernelError::WrongObject)
     ));
 
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
+        .is_none());
     let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
     let second_bundle = state
@@ -6277,16 +6193,12 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
     assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
     assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
+        .is_some());
 }
 
 #[test]
@@ -6312,15 +6224,13 @@ fn checked_bundle_helper_validates_bundle_and_dma_window() {
     state
         .validate_driver_bundle_live(121, bundle)
         .expect("bundle live");
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                121,
-                crate::kernel::vm::PAGE_SIZE * 8,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            121,
+            crate::kernel::vm::PAGE_SIZE * 8,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
 }
 
 #[test]
@@ -6387,24 +6297,20 @@ fn iova_window_validation_requires_iova_space_and_range() {
         )
         .expect("window");
 
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 4,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_ok()
-    );
-    assert!(
-        state
-            .validate_driver_dma_iova(
-                12,
-                crate::kernel::vm::PAGE_SIZE * 3,
-                crate::kernel::vm::PAGE_SIZE
-            )
-            .is_err()
-    );
+    assert!(state
+        .validate_driver_dma_iova(
+            12,
+            crate::kernel::vm::PAGE_SIZE * 4,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_ok());
+    assert!(state
+        .validate_driver_dma_iova(
+            12,
+            crate::kernel::vm::PAGE_SIZE * 3,
+            crate::kernel::vm::PAGE_SIZE
+        )
+        .is_err());
 }
 
 #[test]
@@ -6976,27 +6882,19 @@ fn fork_child_inherits_parent_endpoint_caps_with_same_rights() {
         })
         .map(|(id, _)| *id)
         .expect("recv cap");
-    assert!(
-        state
-            .capability_for_cnode(child_cnode, inherited_send)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(child_cnode, inherited_recv)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(child_cnode, inherited_send)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(child_cnode, inherited_recv)
+        .is_some());
     let parent_cnode = state.task_cnode(39).expect("parent cnode");
-    assert!(
-        state
-            .capability_for_cnode(parent_cnode, send_parent)
-            .is_some()
-    );
-    assert!(
-        state
-            .capability_for_cnode(parent_cnode, recv_parent)
-            .is_some()
-    );
+    assert!(state
+        .capability_for_cnode(parent_cnode, send_parent)
+        .is_some());
+    assert!(state
+        .capability_for_cnode(parent_cnode, recv_parent)
+        .is_some());
 }
 
 #[test]
@@ -7025,17 +6923,13 @@ fn fork_child_does_not_inherit_kernel_caps() {
     let child_caps = state
         .snapshot_live_capabilities_for_task(child_tid)
         .expect("child caps");
-    assert!(
-        !child_caps
-            .iter()
-            .any(|(_id, cap)| matches!(cap.object, CapObject::Kernel))
-    );
+    assert!(!child_caps
+        .iter()
+        .any(|(_id, cap)| matches!(cap.object, CapObject::Kernel)));
     let child_cnode = state.task_cnode(child_tid).expect("child cnode");
-    assert!(
-        state
-            .capability_for_cnode(child_cnode, kernel_cap)
-            .is_none()
-    );
+    assert!(state
+        .capability_for_cnode(child_cnode, kernel_cap)
+        .is_none());
 }
 
 #[test]
@@ -8826,11 +8720,9 @@ fn process_teardown_reclaims_process_cnode_space_and_delegated_descendants() {
     let delegated_cap = state
         .grant_capability_task_to_task_with_rights(730, source_cap, 731, CapRights::READ)
         .expect("delegate");
-    assert!(
-        state
-            .resolve_capability_for_task(731, delegated_cap)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(731, delegated_cap)
+        .is_ok());
 
     state.mark_task_dead(730).expect("teardown source process");
 
@@ -8874,11 +8766,9 @@ fn process_teardown_reclaims_multi_hop_delegated_graph_without_touching_unrelate
 
     assert!(state.resolve_capability_for_task(741, mid_cap).is_ok());
     assert!(state.resolve_capability_for_task(742, leaf_cap).is_ok());
-    assert!(
-        state
-            .resolve_capability_for_task(743, unrelated_cap)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(743, unrelated_cap)
+        .is_ok());
 
     state.mark_task_dead(740).expect("teardown source");
 
@@ -8891,11 +8781,9 @@ fn process_teardown_reclaims_multi_hop_delegated_graph_without_touching_unrelate
         state.resolve_capability_for_task(742, leaf_cap),
         Err(KernelError::InvalidCapability)
     );
-    assert!(
-        state
-            .resolve_capability_for_task(743, unrelated_cap)
-            .is_ok()
-    );
+    assert!(state
+        .resolve_capability_for_task(743, unrelated_cap)
+        .is_ok());
 }
 
 #[test]
@@ -13432,7 +13320,7 @@ fn ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none() {
 #[test]
 fn staged_deadline_consumed_by_recv_timeout_dispatch() {
     use super::super::syscall::{
-        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR, dispatch,
+        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
     };
     use core::sync::atomic::Ordering;
     std::thread::Builder::new()
@@ -13490,7 +13378,7 @@ fn staged_deadline_cleared_on_try_recv_dispatch() {
     // unconditionally swaps SPLIT_RECV_TIMEOUT_DEADLINE to 0, preventing a
     // stale deadline from being picked up by a later timed recv call.
     use super::super::syscall::{
-        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR, dispatch,
+        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
     };
     use core::sync::atomic::Ordering;
     std::thread::Builder::new()
@@ -19831,11 +19719,9 @@ fn stage20_transfer_envelope_double_take_is_harmless() {
         1
     );
 
-    assert!(
-        state
-            .take_transfer_envelope(handle, endpoint, ThreadId(0))
-            .is_some()
-    );
+    assert!(state
+        .take_transfer_envelope(handle, endpoint, ThreadId(0))
+        .is_some());
     let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
     assert_eq!(
         state.memory.memory_objects[slot].expect("obj").pin_refcount,
@@ -19843,11 +19729,9 @@ fn stage20_transfer_envelope_double_take_is_harmless() {
         "pin_refcount must drop to 0 after take"
     );
     // Second take is a no-op: returns None, pin_refcount stays 0 (no underflow).
-    assert!(
-        state
-            .take_transfer_envelope(handle, endpoint, ThreadId(0))
-            .is_none()
-    );
+    assert!(state
+        .take_transfer_envelope(handle, endpoint, ThreadId(0))
+        .is_none());
     let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
     assert_eq!(
         state.memory.memory_objects[slot].expect("obj").pin_refcount,
@@ -19926,11 +19810,9 @@ fn stage20_active_transfer_mapping_is_two_phase_and_refcount_safe() {
         2,
         "mapping registration must not touch cap_refcount"
     );
-    assert!(
-        state
-            .active_transfer_mapping_for(ThreadId(1), derived)
-            .is_some()
-    );
+    assert!(state
+        .active_transfer_mapping_for(ThreadId(1), derived)
+        .is_some());
 
     assert!(state.remove_active_transfer_mapping(ThreadId(1), derived));
     assert!(
@@ -21595,8 +21477,8 @@ mod stage29a_live_split_dispatch_tests {
     use super::*;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::{
-        SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, SYSCALL_COUNT, SYSCALL_IPC_RECV_NR,
-        SYSCALL_IPC_SEND_NR, SYSCALL_SPAWN_PROCESS_NR, SYSCALL_VM_MAP_NR, Syscall, SyscallError,
+        Syscall, SyscallError, SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, SYSCALL_COUNT,
+        SYSCALL_IPC_RECV_NR, SYSCALL_IPC_SEND_NR, SYSCALL_SPAWN_PROCESS_NR, SYSCALL_VM_MAP_NR,
     };
     use crate::kernel::syscall_split::{classify_split_eligible, try_split_dispatch_into_frame};
     use crate::kernel::trapframe::TrapFrame;
@@ -21829,8 +21711,8 @@ mod stage29a_live_split_dispatch_tests {
 #[cfg(test)]
 mod stage30_boot_guard_tests {
     use crate::runtime::{
-        BootRawKernelBorrowGuard, begin_boot_raw_borrow_window, boot_raw_borrow_is_active,
-        end_boot_raw_borrow_window,
+        begin_boot_raw_borrow_window, boot_raw_borrow_is_active, end_boot_raw_borrow_window,
+        BootRawKernelBorrowGuard,
     };
 
     #[test]
@@ -21917,8 +21799,8 @@ mod stage31_split_recv_tests {
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::{
-        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError,
-        try_split_recv_queued_plain_into_frame_locked,
+        try_split_recv_queued_plain_into_frame_locked, Syscall, SyscallError, SYSCALL_COUNT,
+        SYSCALL_NO_TRANSFER_CAP,
     };
     use crate::kernel::task::TaskStatus;
     use crate::kernel::trapframe::TrapFrame;
@@ -22296,11 +22178,11 @@ mod stage32_cap_resolution_tests {
     use crate::kernel::capabilities::{CapId, CapObject, CapRights};
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
+    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
     use crate::kernel::task::TaskClass;
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::{
-        EndpointRecvCapSnapshot, IpcRecvQueuedPlainWritebackPlan, MAX_PLAIN_PAYLOAD, SharedKernel,
+        EndpointRecvCapSnapshot, IpcRecvQueuedPlainWritebackPlan, SharedKernel, MAX_PLAIN_PAYLOAD,
     };
     use std::vec::Vec;
 
@@ -22629,7 +22511,9 @@ mod stage32_cap_resolution_tests {
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
             kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
-            Some(Err(TrapHandleError::Syscall(SyscallError::InvalidCapability))),
+            Some(Err(TrapHandleError::Syscall(
+                SyscallError::InvalidCapability
+            ))),
             "cap-transfer message dequeued; invalid handle → InvalidCapability"
         );
     }
@@ -22996,11 +22880,11 @@ mod stage33_34 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
-        RecvPlan, RecvRequest, RecvRequestKind, plan_recv_core,
+        plan_recv_core, FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget,
+        RecvPayloadTarget, RecvPlan, RecvRequest, RecvRequestKind,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
+    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
 
@@ -23075,10 +22959,7 @@ mod stage33_34 {
         );
         // Stage 37 update: user-ASID + V2 meta + no map_intent is now UserPlainV2Eligible
         // (live recv-v2 split path; meta-first copy ordering proven equivalent §55).
-        assert_eq!(
-            plan_recv_core(&req),
-            RecvPlan::UserPlainV2Eligible,
-        );
+        assert_eq!(plan_recv_core(&req), RecvPlan::UserPlainV2Eligible,);
     }
 
     #[test]
@@ -23226,10 +23107,7 @@ mod stage33_34 {
             }
         );
         // Stage 37 update: user-ASID + V2 meta + no map_intent → UserPlainV2Eligible.
-        assert_eq!(
-            plan_recv_core(&req),
-            RecvPlan::UserPlainV2Eligible
-        );
+        assert_eq!(plan_recv_core(&req), RecvPlan::UserPlainV2Eligible);
     }
 
     #[test]
@@ -23572,10 +23450,7 @@ mod stage33_34 {
         // Stage 36 update: plain user-ASID recv (no meta, no map_intent) is now
         // UserPlainEligible.  UserAsidCopySemantics is now only for mapped recv.
         let req = RecvRequest::from_legacy_ipc_recv(3, CAP0, 0x1000, 64, 0, 0, false);
-        assert_eq!(
-            plan_recv_core(&req),
-            RecvPlan::UserPlainEligible,
-        );
+        assert_eq!(plan_recv_core(&req), RecvPlan::UserPlainEligible,);
     }
 
     #[test]
@@ -23647,11 +23522,11 @@ mod stage35 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        FallbackReason, RecvBlockingPolicy, RecvMetaTarget, RecvPayloadTarget, RecvPlan,
-        RecvRequest, RecvRequestKind, plan_recv_core,
+        plan_recv_core, FallbackReason, RecvBlockingPolicy, RecvMetaTarget, RecvPayloadTarget,
+        RecvPlan, RecvRequest, RecvRequestKind,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
+    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
 
@@ -23839,7 +23714,10 @@ mod stage35 {
         // Message was consumed; queue is now empty.
         kernel.with(|state| state.unbind_task_asid(0).expect("unbind"));
         let empty = kernel.with(|state| state.try_ipc_recv(recv_cap).expect("try_ipc_recv"));
-        assert!(empty.is_none(), "message consumed on split path (not preserved)");
+        assert!(
+            empty.is_none(),
+            "message consumed on split path (not preserved)"
+        );
     }
 
     #[test]
@@ -23920,12 +23798,12 @@ mod stage36 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
+        execute_user_asid_plain_writeback, plan_recv_core, try_recv_core_user_plain,
         FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
         RecvPlan, RecvRequest, RecvRequestKind, RecvUserWritebackOutcome,
-        execute_user_asid_plain_writeback, plan_recv_core, try_recv_core_user_plain,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
+    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
 
@@ -23933,11 +23811,17 @@ mod stage36 {
     const CAP0: CapId = CapId(1);
 
     fn recv_frame(recv_cap: CapId) -> TrapFrame {
-        TrapFrame::new(Syscall::IpcRecv as usize, [recv_cap.0 as usize, 0, 0, 0, 0, 0])
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        )
     }
 
     fn recv_frame_with_buf(recv_cap: CapId, ptr: usize, len: usize) -> TrapFrame {
-        TrapFrame::new(Syscall::IpcRecv as usize, [recv_cap.0 as usize, ptr, len, 0, 0, 0])
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, ptr, len, 0, 0, 0],
+        )
     }
 
     fn kernel_with_queued_plain(payload: &[u8]) -> (SharedKernel, CapId) {
@@ -24045,7 +23929,10 @@ mod stage36 {
         // Verify queue is now empty.
         kernel.with(|state| state.unbind_task_asid(0).expect("unbind"));
         let empty = kernel.with(|state| state.try_ipc_recv(recv_cap).expect("try_ipc_recv"));
-        assert!(empty.is_none(), "message consumed by split path after UndersizedBuffer");
+        assert!(
+            empty.is_none(),
+            "message consumed by split path after UndersizedBuffer"
+        );
     }
 
     #[test]
@@ -24085,7 +23972,11 @@ mod stage36 {
         assert_eq!(result, Some(Ok(())), "empty payload → split delivers");
         assert_eq!(frame.ret0(), 3, "sender tid in ret0");
         assert_eq!(frame.ret1(), 0, "payload len 0 in ret1");
-        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "no transfer cap");
+        assert_eq!(
+            frame.ret2() as u64,
+            SYSCALL_NO_TRANSFER_CAP,
+            "no transfer cap"
+        );
     }
 
     #[test]
@@ -24165,7 +24056,10 @@ mod stage36 {
                 let wb = execute_user_asid_plain_writeback(&mut state, &delivery);
                 // Both Ok and CopyFault are acceptable for 0-byte copy without ASID.
                 assert!(
-                    matches!(wb, RecvUserWritebackOutcome::Ok | RecvUserWritebackOutcome::CopyFault { .. }),
+                    matches!(
+                        wb,
+                        RecvUserWritebackOutcome::Ok | RecvUserWritebackOutcome::CopyFault { .. }
+                    ),
                     "0-byte payload with no ASID: Ok or CopyFault"
                 );
             }
@@ -24200,7 +24094,11 @@ mod stage36 {
         let mut frame = recv_frame(recv_cap);
         let result =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
-        assert_eq!(result, Some(Ok(())), "kernel-plain split path must still be live");
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "kernel-plain split path must still be live"
+        );
         assert_eq!(frame.ret0(), 7, "sender tid");
         assert_eq!(frame.ret1(), b"stage36".len(), "payload len");
         assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
@@ -24216,7 +24114,10 @@ mod stage36 {
         );
         let result =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
-        assert_eq!(result, None, "recv-v2 must still fall back (meta user-copy)");
+        assert_eq!(
+            result, None,
+            "recv-v2 must still fall back (meta user-copy)"
+        );
     }
 
     #[test]
@@ -24283,7 +24184,9 @@ mod stage36 {
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         assert_eq!(
             result,
-            Some(Err(TrapHandleError::Syscall(SyscallError::InvalidCapability))),
+            Some(Err(TrapHandleError::Syscall(
+                SyscallError::InvalidCapability
+            ))),
             "cap-transfer message dequeued; invalid handle → InvalidCapability"
         );
     }
@@ -24294,12 +24197,12 @@ mod stage37 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
+        execute_user_asid_plain_v2_writeback, plan_recv_core, try_recv_core_user_plain_v2,
         FallbackReason, RecvMapIntent, RecvMetaTarget, RecvPlan, RecvRequest,
-        RecvV2WritebackOutcome, RecvWritebackPlan, execute_user_asid_plain_v2_writeback,
-        plan_recv_core, try_recv_core_user_plain_v2,
+        RecvV2WritebackOutcome, RecvWritebackPlan,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
+    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
     use crate::kernel::trapframe::TrapFrame;
     use crate::kernel::vm::{PageFlags, VirtAddr};
     use crate::runtime::SharedKernel;
@@ -24308,10 +24211,22 @@ mod stage37 {
     const CAP0: CapId = CapId(1);
     const META_LEN: usize = 40;
 
-    fn recv_v2_frame(recv_cap: CapId, payload_ptr: usize, payload_len: usize, meta_ptr: usize) -> TrapFrame {
+    fn recv_v2_frame(
+        recv_cap: CapId,
+        payload_ptr: usize,
+        payload_len: usize,
+        meta_ptr: usize,
+    ) -> TrapFrame {
         TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, payload_ptr, payload_len, meta_ptr, META_LEN, 0],
+            [
+                recv_cap.0 as usize,
+                payload_ptr,
+                payload_len,
+                meta_ptr,
+                META_LEN,
+                0,
+            ],
         )
     }
 
@@ -24412,8 +24327,17 @@ mod stage37 {
         match outcome {
             crate::kernel::recv_core::RecvOutcome::Delivered(delivery) => {
                 assert!(
-                    matches!(delivery.writeback, RecvWritebackPlan::UserMemoryV2 { ptr: 0x1000, user_buf_len: 64, meta_ptr: 0x2000, .. }),
-                    "UserMemoryV2 plan with correct ptrs: {:?}", delivery.writeback
+                    matches!(
+                        delivery.writeback,
+                        RecvWritebackPlan::UserMemoryV2 {
+                            ptr: 0x1000,
+                            user_buf_len: 64,
+                            meta_ptr: 0x2000,
+                            ..
+                        }
+                    ),
+                    "UserMemoryV2 plan with correct ptrs: {:?}",
+                    delivery.writeback
                 );
             }
             other => panic!("expected Delivered, got {other:?}"),
@@ -24567,9 +24491,7 @@ mod stage37 {
         let sender_tid = delivery.msg.sender_tid.0;
         let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
         assert_eq!(wb, RecvV2WritebackOutcome::Ok, "writeback succeeds");
-        let meta = state
-            .read_user_memory(0, 0x3000, 40)
-            .expect("read meta");
+        let meta = state.read_user_memory(0, 0x3000, 40).expect("read meta");
         let meta_sender = u64::from_le_bytes(meta[0..8].try_into().expect("sender bytes"));
         assert_eq!(meta_sender, sender_tid, "meta[0..8] = sender_tid");
     }
@@ -24603,12 +24525,19 @@ mod stage37 {
         let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
         // payload ptr=0x4000 is not mapped → PayloadCopyFault, but meta is written first.
         assert!(
-            matches!(wb, RecvV2WritebackOutcome::Ok | RecvV2WritebackOutcome::PayloadCopyFault { .. }),
+            matches!(
+                wb,
+                RecvV2WritebackOutcome::Ok | RecvV2WritebackOutcome::PayloadCopyFault { .. }
+            ),
             "meta written; payload either ok or fault: {wb:?}"
         );
         let meta = state.read_user_memory(0, 0x3000, 40).expect("read meta");
         let meta_len = u32::from_le_bytes(meta[12..16].try_into().expect("len bytes"));
-        assert_eq!(meta_len, payload.len() as u32, "meta[12..16] = payload.len()");
+        assert_eq!(
+            meta_len,
+            payload.len() as u32,
+            "meta[12..16] = payload.len()"
+        );
     }
 
     #[test]
@@ -24637,7 +24566,11 @@ mod stage37 {
             other => panic!("expected Delivered, got {other:?}"),
         };
         let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
-        assert_eq!(wb, RecvV2WritebackOutcome::Ok, "empty payload+mapped meta → Ok");
+        assert_eq!(
+            wb,
+            RecvV2WritebackOutcome::Ok,
+            "empty payload+mapped meta → Ok"
+        );
         let meta = state.read_user_memory(0, 0x5000, 40).expect("read meta");
         let transfer_cap = u64::from_le_bytes(meta[16..24].try_into().expect("cap bytes"));
         assert_eq!(
@@ -24675,7 +24608,10 @@ mod stage37 {
         assert_eq!(wb, RecvV2WritebackOutcome::Ok);
         let meta = state.read_user_memory(0, 0x5000, 40).expect("read meta");
         let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().expect("flag bytes"));
-        assert_eq!(recv_meta_flags, 0, "meta[24..32] = 0 for plain (no reply/transfer flags)");
+        assert_eq!(
+            recv_meta_flags, 0,
+            "meta[24..32] = 0 for plain (no reply/transfer flags)"
+        );
     }
 
     // ── E. Live split path integration ───────────────────────────────────────
@@ -24690,7 +24626,11 @@ mod stage37 {
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         assert_eq!(result, Some(Ok(())), "empty payload v2 split must succeed");
         assert_eq!(frame.ret0(), 0, "recv-v2 ret0 must be 0 (not sender tid)");
-        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "no transfer cap");
+        assert_eq!(
+            frame.ret2() as u64,
+            SYSCALL_NO_TRANSFER_CAP,
+            "no transfer cap"
+        );
     }
 
     #[test]
@@ -24743,9 +24683,8 @@ mod stage37 {
             recv_cap
         });
         let mut frame = recv_v2_frame(recv_cap, 0x8000, 64, 0x9000);
-        let _ = crate::kernel::syscall_split::try_split_dispatch_into_frame(
-            &kernel, CPU0, &mut frame,
-        );
+        let _ =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         // Queue must now be empty.
         kernel.with(|state| state.unbind_task_asid(0).expect("unbind"));
         let empty = kernel.with(|state| state.try_ipc_recv(recv_cap).expect("try_recv"));
@@ -24875,12 +24814,12 @@ mod stage38 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        FallbackReason, RecvMapIntent, RecvOutcome, RecvPlan, RecvRequest,
-        RecvSchedulerWakePlan, RecvWritebackPlan, plan_recv_core,
-        try_recv_core_kernel_plain, try_recv_core_user_plain,
+        plan_recv_core, try_recv_core_kernel_plain, try_recv_core_user_plain, FallbackReason,
+        RecvMapIntent, RecvOutcome, RecvPlan, RecvRequest, RecvSchedulerWakePlan,
+        RecvWritebackPlan,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+    use crate::kernel::syscall::{Syscall, SYSCALL_COUNT};
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::task::{TaskStatus, WaitReason};
     use crate::kernel::trapframe::TrapFrame;
@@ -24943,24 +24882,28 @@ mod stage38 {
                 .capability_for_cnode_local(cnode, recv_cap)
                 .map(|c| c.object)
                 .expect("resolve endpoint");
-            let request =
-                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
             try_recv_core_kernel_plain(state, &request, endpoint)
         });
         // Stage 42+43: must be Delivered with cap_transfer.is_some().
         match outcome {
             RecvOutcome::Delivered(ref d) => {
-                assert!(d.cap_transfer.is_some(), "cap_transfer must be Some for FLAG_CAP_TRANSFER");
+                assert!(
+                    d.cap_transfer.is_some(),
+                    "cap_transfer must be Some for FLAG_CAP_TRANSFER"
+                );
             }
             other => panic!("stage42: expected Delivered, got {other:?}"),
         }
 
         // Message is dequeued; queue count must be 0.
         kernel.with(|state| {
-            let queued = state.with_ipc_state(|ipc| {
-                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
-            });
-            assert_eq!(queued, 0, "cap-transfer message must be dequeued in stage42");
+            let queued =
+                state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
+            assert_eq!(
+                queued, 0,
+                "cap-transfer message must be dequeued in stage42"
+            );
         });
     }
 
@@ -24982,21 +24925,22 @@ mod stage38 {
                 .capability_for_cnode_local(cnode, recv_cap)
                 .map(|c| c.object)
                 .expect("endpoint");
-            let request =
-                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
             try_recv_core_kernel_plain(state, &request, endpoint)
         });
         match outcome {
             RecvOutcome::Delivered(ref d) => {
                 assert!(d.cap_transfer.is_some(), "reply-cap must set cap_transfer");
-                assert!(d.cap_transfer.unwrap().is_reply_cap, "is_reply_cap must be true");
+                assert!(
+                    d.cap_transfer.unwrap().is_reply_cap,
+                    "is_reply_cap must be true"
+                );
             }
             other => panic!("stage42: expected Delivered, got {other:?}"),
         }
         kernel.with(|state| {
-            let queued = state.with_ipc_state(|ipc| {
-                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
-            });
+            let queued =
+                state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
             assert_eq!(queued, 0, "reply-cap message must be dequeued in stage42");
         });
     }
@@ -25007,14 +24951,9 @@ mod stage38 {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let (recv_cap, endpoint_idx) = kernel.with(|state| {
             let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
-            let msg = Message::with_header(
-                0,
-                0x42,
-                Message::FLAG_CAP_TRANSFER_PLAIN,
-                Some(99),
-                b"cpln",
-            )
-            .expect("cap-transfer-plain msg");
+            let msg =
+                Message::with_header(0, 0x42, Message::FLAG_CAP_TRANSFER_PLAIN, Some(99), b"cpln")
+                    .expect("cap-transfer-plain msg");
             state.ipc_send(send_cap, msg).expect("send");
             (recv_cap, endpoint_idx)
         });
@@ -25024,21 +24963,25 @@ mod stage38 {
                 .capability_for_cnode_local(cnode, recv_cap)
                 .map(|c| c.object)
                 .expect("endpoint");
-            let request =
-                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
             try_recv_core_kernel_plain(state, &request, endpoint)
         });
         match outcome {
             RecvOutcome::Delivered(ref d) => {
-                assert!(d.cap_transfer.is_some(), "FLAG_CAP_TRANSFER_PLAIN must set cap_transfer");
+                assert!(
+                    d.cap_transfer.is_some(),
+                    "FLAG_CAP_TRANSFER_PLAIN must set cap_transfer"
+                );
             }
             other => panic!("stage42: expected Delivered, got {other:?}"),
         }
         kernel.with(|state| {
-            let queued = state.with_ipc_state(|ipc| {
-                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
-            });
-            assert_eq!(queued, 0, "FLAG_CAP_TRANSFER_PLAIN message must be dequeued in stage42");
+            let queued =
+                state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
+            assert_eq!(
+                queued, 0,
+                "FLAG_CAP_TRANSFER_PLAIN message must be dequeued in stage42"
+            );
         });
     }
 
@@ -25110,14 +25053,16 @@ mod stage38 {
             try_recv_core_kernel_plain(state, &request, endpoint)
         });
         assert!(
-            matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)),
+            matches!(
+                outcome,
+                RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+            ),
             "cap-transfer sender-waiter must still fall back"
         );
         // Plain message must remain at queue head (not dequeued)
         kernel.with(|state| {
-            let queued = state.with_ipc_state(|ipc| {
-                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
-            });
+            let queued =
+                state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
             assert_eq!(queued, 1, "plain message at head must remain queued");
         });
     }
@@ -25179,9 +25124,17 @@ mod stage38 {
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
         let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
-        assert_eq!(result, Some(Ok(())), "split must deliver 'first' successfully");
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "split must deliver 'first' successfully"
+        );
         assert_eq!(frame.ret0(), 0, "sender_tid of 'first' must be 0");
-        assert_eq!(frame.ret1(), b"first".len(), "payload length must match 'first'");
+        assert_eq!(
+            frame.ret1(),
+            b"first".len(),
+            "payload length must match 'first'"
+        );
 
         kernel.with(|state| {
             assert_eq!(
@@ -25219,9 +25172,8 @@ mod stage38 {
         assert_eq!(result, Some(Ok(())));
 
         kernel.with(|state| {
-            let queued = state.with_ipc_state(|ipc| {
-                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
-            });
+            let queued =
+                state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
             assert_eq!(queued, 1, "'second' must be refilled into queue");
         });
     }
@@ -25253,15 +25205,20 @@ mod stage38 {
                 .capability_for_cnode_local(cnode, recv_cap)
                 .map(|c| c.object)
                 .expect("endpoint");
-            let request =
-                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0x1000, 128, 0, 0, false);
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0x1000, 128, 0, 0, false);
             try_recv_core_user_plain(state, &request, endpoint)
         });
         match outcome {
             RecvOutcome::Delivered(delivery) => {
                 assert_eq!(delivery.msg.as_slice(), b"hello");
-                assert!(matches!(delivery.scheduler, RecvSchedulerWakePlan::WakeSender(_)));
-                assert!(matches!(delivery.writeback, RecvWritebackPlan::UserMemory { .. }));
+                assert!(matches!(
+                    delivery.scheduler,
+                    RecvSchedulerWakePlan::WakeSender(_)
+                ));
+                assert!(matches!(
+                    delivery.writeback,
+                    RecvWritebackPlan::UserMemory { .. }
+                ));
             }
             other => panic!("expected Delivered, got {other:?}"),
         }
@@ -25271,7 +25228,8 @@ mod stage38 {
 
     #[test]
     fn stage38_plan_user_asid_mapped_recv_still_falls_back_copy_semantics() {
-        let req = RecvRequest::from_legacy_mapped_recv(1, CAP0, 0x4000, 128, RecvMapIntent::ReadWrite);
+        let req =
+            RecvRequest::from_legacy_mapped_recv(1, CAP0, 0x4000, 128, RecvMapIntent::ReadWrite);
         assert_eq!(
             plan_recv_core(&req),
             RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics)
@@ -25282,8 +25240,14 @@ mod stage38 {
     fn stage38_plan_shared_v3_still_helper_only() {
         use crate::kernel::recv_core::recv_shared_v3::V3_MIN_OUTPUT_LEN;
         let req = RecvRequest::future_shared_v3(
-            1, CAP0, 0x1000, 128, 0x2000, V3_MIN_OUTPUT_LEN as usize,
-            RecvMapIntent::ReadOnly, None,
+            1,
+            CAP0,
+            0x1000,
+            128,
+            0x2000,
+            V3_MIN_OUTPUT_LEN as usize,
+            RecvMapIntent::ReadOnly,
+            None,
         );
         assert_eq!(
             plan_recv_core(&req),
@@ -25295,7 +25259,14 @@ mod stage38 {
     fn stage38_plan_user_asid_v3_meta_falls_back_meta_copy() {
         // V3Future meta with user-ASID → RecvV2MetaUserCopy (helper-only).
         let req = RecvRequest::future_shared_v3(
-            1, CAP0, 0x1000, 128, 0x2000, 80, RecvMapIntent::None, None,
+            1,
+            CAP0,
+            0x1000,
+            128,
+            0x2000,
+            80,
+            RecvMapIntent::None,
+            None,
         );
         assert_eq!(
             plan_recv_core(&req),
@@ -25362,13 +25333,25 @@ mod stage38 {
             state.bind_task_asid(0, asid).expect("bind");
             let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
             state
-                .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x1_0000), PageFlags::USER_RW)
+                .map_user_page_in_asid_with_caps(
+                    asid,
+                    mem_cap,
+                    VirtAddr(0x1_0000),
+                    PageFlags::USER_RW,
+                )
                 .expect("map");
             recv_cap
         });
         let mut frame = TrapFrame::new(
             Syscall::IpcRecv as usize,
-            [recv_cap.0 as usize, 0x1_0040_usize, 64, 0x1_0000_usize, 40, 0],
+            [
+                recv_cap.0 as usize,
+                0x1_0040_usize,
+                64,
+                0x1_0000_usize,
+                40,
+                0,
+            ],
         );
         let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         assert_eq!(result, Some(Ok(())));
@@ -25377,15 +25360,24 @@ mod stage38 {
 
     #[test]
     fn stage38_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 31, "Stage 38+39 must not add any public syscall");
+        assert_eq!(
+            SYSCALL_COUNT, 31,
+            "Stage 38+39 must not add any public syscall"
+        );
     }
 
     #[test]
     fn stage38_recv_shared_v3_remains_helper_only() {
         use crate::kernel::recv_core::recv_shared_v3::V3_MIN_OUTPUT_LEN;
         let req = RecvRequest::future_shared_v3(
-            1, CAP0, 0x1000, 64, 0x2000, V3_MIN_OUTPUT_LEN as usize,
-            RecvMapIntent::ReadOnly, None,
+            1,
+            CAP0,
+            0x1000,
+            64,
+            0x2000,
+            V3_MIN_OUTPUT_LEN as usize,
+            RecvMapIntent::ReadOnly,
+            None,
         );
         assert_eq!(
             plan_recv_core(&req),
@@ -25410,17 +25402,17 @@ mod stage40 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
-        RecvPlan, RecvRequest, RecvRequestKind,
         plan_recv_core,
         recv_shared_v3::{
-            validate_v3_request, validate_v3_output_record,
-            RecvSharedV3Error, RecvSharedV3Output, RecvSharedV3Request,
-            MAP_READ, MAP_WRITE, V3_MIN_OUTPUT_LEN, V3_MIN_REQUEST_LEN, V3_VERSION,
+            validate_v3_output_record, validate_v3_request, RecvSharedV3Error, RecvSharedV3Output,
+            RecvSharedV3Request, MAP_READ, MAP_WRITE, V3_MIN_OUTPUT_LEN, V3_MIN_REQUEST_LEN,
+            V3_VERSION,
         },
+        FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
+        RecvPlan, RecvRequest, RecvRequestKind,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+    use crate::kernel::syscall::{Syscall, SYSCALL_COUNT};
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
@@ -25479,28 +25471,40 @@ mod stage40 {
     fn stage40_abi_bad_version_rejected() {
         let mut req = minimal_req();
         req.version = 0;
-        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::BadVersion));
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::BadVersion)
+        );
     }
 
     #[test]
     fn stage40_abi_short_record_rejected() {
         let mut req = minimal_req();
         req.record_len = V3_MIN_REQUEST_LEN - 1;
-        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::ShortRecord));
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::ShortRecord)
+        );
     }
 
     #[test]
     fn stage40_abi_nonzero_reserved_rejected() {
         let mut req = minimal_req();
         req.reserved[0] = 1;
-        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::NonzeroReserved));
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::NonzeroReserved)
+        );
     }
 
     #[test]
     fn stage40_abi_nonzero_flags_rejected() {
         let mut req = minimal_req();
         req.flags = 0xFF;
-        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::NonzeroReserved));
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::NonzeroReserved)
+        );
     }
 
     #[test]
@@ -25519,7 +25523,10 @@ mod stage40 {
         let mut req = minimal_req();
         req.map_intent = 0x10;
         req.metadata_ptr = 0x2000;
-        assert_eq!(validate_v3_request(&req), Err(RecvSharedV3Error::BadMapIntent));
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::BadMapIntent)
+        );
     }
 
     #[test]
@@ -25668,7 +25675,10 @@ mod stage40 {
         let req = RecvRequest::from_v3_abi_request(0, &minimal_req()).unwrap();
         assert_eq!(
             req.payload_target,
-            RecvPayloadTarget::UserMemory { ptr: 0x1000, len: 128 }
+            RecvPayloadTarget::UserMemory {
+                ptr: 0x1000,
+                len: 128
+            }
         );
     }
 
@@ -25712,7 +25722,10 @@ mod stage40 {
 
     #[test]
     fn stage40_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 31, "Stage 40+41 must not add any public syscall");
+        assert_eq!(
+            SYSCALL_COUNT, 31,
+            "Stage 40+41 must not add any public syscall"
+        );
     }
 
     #[test]
@@ -25791,11 +25804,11 @@ mod stage42 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        RecvCapTransferPlan, RecvDelivery, RecvOutcome, RecvRequest, RecvSchedulerWakePlan,
-        RecvWritebackPlan, try_recv_core_kernel_plain, try_recv_core_user_plain,
+        try_recv_core_kernel_plain, try_recv_core_user_plain, RecvCapTransferPlan, RecvDelivery,
+        RecvOutcome, RecvRequest, RecvSchedulerWakePlan, RecvWritebackPlan,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, Syscall};
+    use crate::kernel::syscall::{Syscall, SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR};
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
@@ -25807,7 +25820,10 @@ mod stage42 {
 
     #[test]
     fn stage42_syscall_count_is_31() {
-        assert_eq!(SYSCALL_COUNT, 31, "Stage 42+43 must add NR 30 (recv_shared_v3)");
+        assert_eq!(
+            SYSCALL_COUNT, 31,
+            "Stage 42+43 must add NR 30 (recv_shared_v3)"
+        );
     }
 
     #[test]
@@ -25825,7 +25841,11 @@ mod stage42 {
 
     #[test]
     fn stage42_variant_count_is_23() {
-        assert_eq!(Syscall::VARIANT_COUNT, 23, "Stage 42+43 adds RecvSharedV3 variant");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 42+43 adds RecvSharedV3 variant"
+        );
     }
 
     #[test]
@@ -25846,9 +25866,8 @@ mod stage42 {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let (recv_cap, endpoint_idx) = kernel.with(|state| {
             let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
-            let msg =
-                Message::with_header(0, 0x42, Message::FLAG_CAP_TRANSFER, Some(77), b"xfr")
-                    .expect("cap msg");
+            let msg = Message::with_header(0, 0x42, Message::FLAG_CAP_TRANSFER, Some(77), b"xfr")
+                .expect("cap msg");
             state.ipc_send(send_cap, msg).expect("send");
             (recv_cap, endpoint_idx)
         });
@@ -25868,8 +25887,8 @@ mod stage42 {
         );
         // Message is dequeued.
         kernel.with(|state| {
-            let q = state
-                .with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
+            let q =
+                state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
             assert_eq!(q, 0, "message must be consumed from queue");
         });
     }
@@ -25908,9 +25927,8 @@ mod stage42 {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let recv_cap = kernel.with(|state| {
             let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
-            let msg =
-                Message::with_header(0, 0x33, Message::FLAG_CAP_TRANSFER, Some(42), b"plan")
-                    .expect("msg");
+            let msg = Message::with_header(0, 0x33, Message::FLAG_CAP_TRANSFER, Some(42), b"plan")
+                .expect("msg");
             state.ipc_send(send_cap, msg).expect("send");
             recv_cap
         });
@@ -25928,7 +25946,10 @@ mod stage42 {
             RecvOutcome::Delivered(delivery) => {
                 let plan = delivery.cap_transfer.expect("cap_transfer must be Some");
                 assert_eq!(plan.raw_handle, 42, "raw_handle must equal enqueued handle");
-                assert!(!plan.is_reply_cap, "FLAG_CAP_TRANSFER → is_reply_cap must be false");
+                assert!(
+                    !plan.is_reply_cap,
+                    "FLAG_CAP_TRANSFER → is_reply_cap must be false"
+                );
             }
             other => panic!("expected Delivered, got {other:?}"),
         }
@@ -25959,7 +25980,10 @@ mod stage42 {
             RecvOutcome::Delivered(delivery) => {
                 let plan = delivery.cap_transfer.expect("cap_transfer must be Some");
                 assert_eq!(plan.raw_handle, 88);
-                assert!(plan.is_reply_cap, "FLAG_REPLY_CAP → is_reply_cap must be true");
+                assert!(
+                    plan.is_reply_cap,
+                    "FLAG_REPLY_CAP → is_reply_cap must be true"
+                );
             }
             other => panic!("expected Delivered, got {other:?}"),
         }
@@ -26052,10 +26076,12 @@ mod stage44 {
     //!   D. Field guards: timeout_ticks != 0 → WouldBlock, map_intent != 0 → InvalidArgs
     //!   E. Regression: IpcRecv (NR 2) still dispatches
 
-    use crate::kernel::syscall::{SyscallError, Syscall, SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, dispatch};
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{
+        dispatch, Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR,
+    };
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::trapframe::TrapFrame;
     use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr};
@@ -26097,7 +26123,11 @@ mod stage44 {
     /// the returned endpoint before the function returns.
     fn kernel_with_v3_env(
         enqueue_payload: Option<&[u8]>,
-    ) -> (crate::kernel::boot::KernelState, crate::kernel::capabilities::CapId, Asid) {
+    ) -> (
+        crate::kernel::boot::KernelState,
+        crate::kernel::capabilities::CapId,
+        Asid,
+    ) {
         let mut state = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind asid to task 0");
@@ -26159,7 +26189,7 @@ mod stage44 {
         let mut frame = TrapFrame::zeroed();
         frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
         frame.set_arg(0, 0x1000usize); // req_ptr — never read at this length
-        frame.set_arg(1, 63usize);    // 63 < 64 = RECV_V3_MIN_REQUEST_LEN
+        frame.set_arg(1, 63usize); // 63 < 64 = RECV_V3_MIN_REQUEST_LEN
         let err = dispatch(&mut state, &mut frame).unwrap_err();
         assert!(
             matches!(err, SyscallError::InvalidArgs),
@@ -26196,15 +26226,8 @@ mod stage44 {
         //   [0x1_0080 .. 0x1_0100): payload output buffer (128 bytes)
         const PAYLOAD_VA: u64 = 0x1_0080;
         const PAYLOAD_CAP: u64 = 128;
-        let req_bytes = build_v3_request_bytes(
-            recv_cap.0 as u64,
-            PAYLOAD_VA,
-            PAYLOAD_CAP,
-            0,
-            0,
-            0,
-            0,
-        );
+        let req_bytes =
+            build_v3_request_bytes(recv_cap.0 as u64, PAYLOAD_VA, PAYLOAD_CAP, 0, 0, 0, 0);
         state
             .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
             .expect("write req bytes");
@@ -26230,8 +26253,15 @@ mod stage44 {
     fn stage44_timeout_nonzero_returns_would_block() {
         // timeout_ticks != 0 is rejected before the endpoint check.
         let (mut state, recv_cap, asid) = kernel_with_v3_env(None);
-        let req_bytes =
-            build_v3_request_bytes(recv_cap.0 as u64, 0, 0, 0, 0, 0, 1 /* timeout_ticks = 1 */);
+        let req_bytes = build_v3_request_bytes(
+            recv_cap.0 as u64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1, /* timeout_ticks = 1 */
+        );
         state
             .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
             .expect("write req bytes");
@@ -26314,7 +26344,7 @@ mod stage45 {
 
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::Message;
-    use crate::kernel::syscall::{Syscall, dispatch};
+    use crate::kernel::syscall::{dispatch, Syscall};
     use crate::kernel::trapframe::TrapFrame;
     use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr};
 
@@ -26332,7 +26362,7 @@ mod stage45 {
         metadata_len: u64,
     ) -> [u8; 80] {
         let mut buf = [0u8; 80];
-        buf[0..4].copy_from_slice(&3u32.to_le_bytes());  // RECV_V3_VERSION
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes()); // RECV_V3_VERSION
         buf[4..8].copy_from_slice(&64u32.to_le_bytes()); // RECV_V3_MIN_REQUEST_LEN
         buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
         buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
@@ -26353,7 +26383,11 @@ mod stage45 {
     /// If `enqueue_payload` is Some, one plain IPC message is queued before return.
     fn kernel_with_metadata_env(
         enqueue_payload: Option<&[u8]>,
-    ) -> (crate::kernel::boot::KernelState, crate::kernel::capabilities::CapId, Asid) {
+    ) -> (
+        crate::kernel::boot::KernelState,
+        crate::kernel::capabilities::CapId,
+        Asid,
+    ) {
         let mut state = Bootstrap::init().expect("init");
         let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(0, asid).expect("bind asid");
@@ -26439,9 +26473,18 @@ mod stage45 {
         let transferred_cap = u64::from_le_bytes(out_bytes[32..40].try_into().unwrap());
 
         assert_eq!(version, RECV_V3_VERSION, "version must be RECV_V3_VERSION");
-        assert_eq!(record_len, 80, "record_len must be 80 (RECV_V3_MIN_OUTPUT_LEN)");
-        assert_eq!(abi_version, RECV_V3_ABI_VERSION, "abi_version must be RECV_V3_ABI_VERSION");
-        assert_eq!(result_status, RECV_V3_STATUS_OK, "result_status must be STATUS_OK");
+        assert_eq!(
+            record_len, 80,
+            "record_len must be 80 (RECV_V3_MIN_OUTPUT_LEN)"
+        );
+        assert_eq!(
+            abi_version, RECV_V3_ABI_VERSION,
+            "abi_version must be RECV_V3_ABI_VERSION"
+        );
+        assert_eq!(
+            result_status, RECV_V3_STATUS_OK,
+            "result_status must be STATUS_OK"
+        );
         assert_eq!(sender_tid, 0, "sender_tid must be task 0");
         assert_eq!(
             message_len,
@@ -26489,5 +26532,213 @@ mod stage45 {
         assert_eq!(message_len, 7);
         assert_eq!(message_flags, 0);
         assert_eq!(transferred_cap, None, "plain message must have no cap");
+    }
+}
+
+#[cfg(test)]
+mod stage46 {
+    //! Stage 46: cap-transfer proof via real handle_ipc_send → stash_transfer_envelope path.
+    //!
+    //! Stage 45 proved recv_shared_v3 plain receive and output metadata fields.
+    //! Cap-transfer was blocked because the boot-level `ipc_send` helper bypasses
+    //! `stash_transfer_envelope`; only `handle_ipc_send` (the real syscall path
+    //! reached via `dispatch`) sets it up.
+    //!
+    //! Tests:
+    //!   A. Real send path: dispatch(IpcSend) enqueues with stash_transfer_envelope;
+    //!      dispatch(RecvSharedV3) materializes the cap and writes a non-sentinel
+    //!      transferred_cap to the output metadata buffer.  Telemetry counter proves
+    //!      stash_transfer_envelope was exercised.
+    //!   B. Negative: direct-enqueue (boot-level ipc_send) with a phony
+    //!      FLAG_CAP_TRANSFER handle bypasses the stash, so recv_shared_v3 dispatch
+    //!      fails with InvalidCapability when take_transfer_envelope returns None.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::{CapId, CapObject};
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{dispatch, Syscall, SyscallError, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
+
+    // FLAG_CAP_TRANSFER bit in the u32 message_flags field of the output metadata.
+    const FLAG_CAP_TRANSFER_BIT: u32 = 1; // Message::FLAG_CAP_TRANSFER = 1 << 0
+    const RECV_V3_STATUS_OK: u32 = 0;
+
+    fn build_v3_req(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes()); // version
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes()); // record_len (min request len)
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        // map_intent @ 48..52: 0, flags @ 52..56: 0, timeout_ticks @ 56..64: 0
+        buf
+    }
+
+    fn setup_recv_page(state: &mut crate::kernel::boot::KernelState) -> Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_mem_id, map_cap) = state.alloc_anonymous_memory_object().expect("map mem");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                map_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map page at 0x1_0000");
+        asid
+    }
+
+    // ── A. Primary proof ─────────────────────────────────────────────────────
+
+    #[test]
+    fn stage46_cap_transfer_through_real_send_path() {
+        // Proves the full cap-transfer dispatch chain for recv_shared_v3 (NR 30):
+        //   dispatch(IpcSend) → handle_ipc_send → stash_transfer_handle →
+        //   stash_transfer_envelope (telemetry incremented) →
+        //   message enqueued with FLAG_CAP_TRANSFER
+        //   dispatch(RecvSharedV3) → try_recv_core_user_plain → delivery.cap_transfer Some →
+        //   materialize_received_message_cap → materialize_received_transfer_cap →
+        //   take_transfer_envelope → grant_task_to_task_with_rights →
+        //   CapId materialized in receiver cnode → written to output metadata
+
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        // Memory object to be transferred to the receiver.
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xA000))
+            .expect("mem obj");
+
+        let before_telemetry = state.ipc_path_telemetry();
+
+        // Phase 1: send via real handle_ipc_send (no user ASID yet → inline payload path).
+        // arg5 = mem_cap.0 triggers FLAG_CAP_TRANSFER stash inside stash_transfer_handle.
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,                                   // user_ptr: 0 (inline registers)
+                4,                                   // payload len: 4 bytes
+                super::inline_payload_word(b"s46!"), // arg3: inline payload
+                0,
+                mem_cap.0 as usize, // arg5: cap to transfer
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send dispatch");
+        assert_eq!(send_frame.error_code(), None, "ipc_send must succeed");
+
+        // Telemetry: stage4e counter incremented → proves stash_transfer_envelope was called.
+        let after_send = state.ipc_path_telemetry();
+        assert_eq!(
+            after_send.cap_transfer_stage4e_enqueued
+                - before_telemetry.cap_transfer_stage4e_enqueued,
+            1,
+            "stage4e cap_transfer counter must increment (stash_transfer_envelope exercised)"
+        );
+
+        // Phase 2: set up user ASID for recv request bytes and output metadata.
+        // Page layout: @0x1_0000 request (80 B), @0x1_0100 payload buf, @0x1_0200 output
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 80);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write request");
+
+        // Phase 3: recv via dispatch(RecvSharedV3) materializes the transferred cap.
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv_shared_v3 dispatch");
+        assert_eq!(recv_frame.error_code(), None, "recv must succeed");
+
+        // Phase 4: verify output metadata — all cap-transfer fields.
+        let out_bytes = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 40)
+            .expect("read output metadata");
+        let result_status = u32::from_le_bytes(out_bytes[12..16].try_into().unwrap());
+        let message_flags = u32::from_le_bytes(out_bytes[28..32].try_into().unwrap());
+        let transferred_cap = u64::from_le_bytes(out_bytes[32..40].try_into().unwrap());
+
+        assert_eq!(result_status, RECV_V3_STATUS_OK, "result_status must be OK");
+        assert_ne!(
+            transferred_cap, SYSCALL_NO_TRANSFER_CAP,
+            "transferred_cap must be non-sentinel after real cap transfer"
+        );
+        assert_ne!(
+            message_flags & FLAG_CAP_TRANSFER_BIT,
+            0,
+            "FLAG_CAP_TRANSFER must be set in output message_flags"
+        );
+        // TrapFrame ret2 carries the same materialized cap ID as the output metadata.
+        assert_eq!(
+            recv_frame.ret2() as u64,
+            transferred_cap,
+            "frame.ret2() must match output metadata transferred_cap"
+        );
+
+        // Phase 5: materialized cap resolves as MemoryObject in the receiver's cnode.
+        let resolved = state
+            .capability_service()
+            .resolve_current_task_capability(CapId(transferred_cap))
+            .expect("materialized cap must be accessible in cnode");
+        assert!(
+            matches!(resolved.object, CapObject::MemoryObject { .. }),
+            "materialized cap must be a MemoryObject"
+        );
+    }
+
+    // ── B. Negative: direct-enqueue bypasses stash → materialization fails ───
+
+    #[test]
+    fn stage46_direct_enqueue_phony_cap_transfer_fails_materialization() {
+        // Proves and documents the §59.4 blocker from Stage 45:
+        // boot-level ipc_send bypasses stash_transfer_envelope, so
+        // take_transfer_envelope returns None for the un-stashed handle, and
+        // recv_shared_v3 dispatch returns InvalidCapability.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+
+        // Directly enqueue a FLAG_CAP_TRANSFER message with a phony un-stashed handle.
+        let phony_handle: u64 = 0xDEAD_BEEF_CAFE;
+        let msg =
+            Message::with_header(0, 0, Message::FLAG_CAP_TRANSFER, Some(phony_handle), b"neg")
+                .expect("msg");
+        state.ipc_send(send_cap, msg).expect("direct enqueue");
+
+        // Set up user ASID for recv.
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 80);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write request");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+
+        // Must fail: take_transfer_envelope returns None for the un-stashed phony handle.
+        let result = dispatch(&mut state, &mut recv_frame);
+        assert_eq!(
+            result,
+            Err(SyscallError::InvalidCapability),
+            "recv_shared_v3 must fail with InvalidCapability when cap was not stashed"
+        );
     }
 }

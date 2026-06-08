@@ -13,7 +13,7 @@ use yarm_ipc_abi::recv_shared_v3_abi::{
     RECV_V3_VERSION,
 };
 
-use super::{SyscallError, decode_syscall_error};
+use super::{decode_syscall_error, SyscallError};
 
 /// NR 30: non-blocking `recv_shared_v3` added in Stage 42+43.
 pub const SYSCALL_RECV_SHARED_V3_NR: usize = 30;
@@ -201,9 +201,9 @@ mod tests {
     use super::*;
     use core::mem::size_of;
     use yarm_ipc_abi::recv_shared_v3_abi::{
-        RecvSharedV3Output, RECV_V3_MIN_OUTPUT_LEN, RECV_V3_MIN_REQUEST_LEN, RECV_V3_NO_TRANSFER_CAP,
-        RECV_V3_STATUS_BAD_REQUEST, RECV_V3_STATUS_INVALID_CAP, RECV_V3_STATUS_OK,
-        RECV_V3_STATUS_TIMED_OUT, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION,
+        RecvSharedV3Output, RECV_V3_MIN_OUTPUT_LEN, RECV_V3_MIN_REQUEST_LEN,
+        RECV_V3_NO_TRANSFER_CAP, RECV_V3_STATUS_BAD_REQUEST, RECV_V3_STATUS_INVALID_CAP,
+        RECV_V3_STATUS_OK, RECV_V3_STATUS_TIMED_OUT, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION,
     };
 
     #[test]
@@ -279,7 +279,10 @@ mod tests {
     #[test]
     fn request_encodes_nonblocking_no_map() {
         let buf = encode_nonblocking_request(7, 0x1000, 128, 0x2000, 80);
-        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), RECV_V3_VERSION);
+        assert_eq!(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            RECV_V3_VERSION
+        );
         assert_eq!(
             u32::from_le_bytes(buf[4..8].try_into().unwrap()),
             RECV_V3_MIN_REQUEST_LEN
@@ -289,8 +292,16 @@ mod tests {
         assert_eq!(u64::from_le_bytes(buf[24..32].try_into().unwrap()), 128);
         assert_eq!(u64::from_le_bytes(buf[32..40].try_into().unwrap()), 0x2000);
         assert_eq!(u64::from_le_bytes(buf[40..48].try_into().unwrap()), 80);
-        assert_eq!(u32::from_le_bytes(buf[48..52].try_into().unwrap()), 0, "map_intent");
-        assert_eq!(u32::from_le_bytes(buf[52..56].try_into().unwrap()), 0, "flags");
+        assert_eq!(
+            u32::from_le_bytes(buf[48..52].try_into().unwrap()),
+            0,
+            "map_intent"
+        );
+        assert_eq!(
+            u32::from_le_bytes(buf[52..56].try_into().unwrap()),
+            0,
+            "flags"
+        );
         assert_eq!(
             u64::from_le_bytes(buf[56..64].try_into().unwrap()),
             0,
@@ -424,8 +435,8 @@ mod tests {
         //         @12 result_status(u32), @16 sender_tid(u64), @24 message_len(u32),
         //         @28 message_flags(u32), @32 transferred_cap(u64), @40..80 zeros (FUTURE).
         let mut wire = [0u8; 80];
-        wire[0..4].copy_from_slice(&3u32.to_le_bytes());   // RECV_V3_VERSION
-        wire[4..8].copy_from_slice(&80u32.to_le_bytes());  // RECV_V3_MIN_OUTPUT_LEN
+        wire[0..4].copy_from_slice(&3u32.to_le_bytes()); // RECV_V3_VERSION
+        wire[4..8].copy_from_slice(&80u32.to_le_bytes()); // RECV_V3_MIN_OUTPUT_LEN
         wire[8..12].copy_from_slice(&10u32.to_le_bytes()); // RECV_V3_ABI_VERSION
         wire[12..16].copy_from_slice(&0u32.to_le_bytes()); // RECV_V3_STATUS_OK
         wire[16..24].copy_from_slice(&7u64.to_le_bytes()); // sender_tid = 7
@@ -462,6 +473,26 @@ mod tests {
         assert_eq!(delivery.message_len, 5);
     }
 
+    // ── Stage 46: from_output roundtrip with cap-transfer output ────────────
+
+    #[test]
+    fn from_output_stage46_cap_transfer_output_roundtrip() {
+        // Simulate what the kernel writes to the output buffer after materializing
+        // a transferred capability (Stage 46 proof: transferred_cap = some_cap_id != u64::MAX).
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.sender_tid = 0;
+        output.message_len = 4;
+        output.message_flags = 1; // FLAG_CAP_TRANSFER bit (1 << 0)
+        output.transferred_cap = 42; // materialized cap ID (non-sentinel)
+        let delivery = RecvSharedV3Delivery::from_output(&output)
+            .expect("STATUS_OK with non-sentinel cap must produce Some(delivery)");
+        assert!(delivery.has_transfer_cap(), "has_transfer_cap must be true");
+        assert_eq!(delivery.transferred_cap, Some(42));
+        assert_eq!(delivery.message_flags, 1);
+        assert_eq!(delivery.message_len, 4);
+    }
+
     #[test]
     fn from_output_and_manual_decode_agree_on_plain_message() {
         // Stage 45: prove that from_output() agrees with the manual field decode path
@@ -474,8 +505,8 @@ mod tests {
         output.transferred_cap = RECV_V3_NO_TRANSFER_CAP;
 
         // from_output helper path.
-        let via_helper = RecvSharedV3Delivery::from_output(&output)
-            .expect("helper must decode OK status");
+        let via_helper =
+            RecvSharedV3Delivery::from_output(&output).expect("helper must decode OK status");
 
         // Manual decode path (mirrors ipc_recv_shared_v3_nonblocking internals).
         let manual = RecvSharedV3Delivery {
@@ -489,6 +520,9 @@ mod tests {
             },
         };
 
-        assert_eq!(via_helper, manual, "from_output and manual decode must agree");
+        assert_eq!(
+            via_helper, manual,
+            "from_output and manual decode must agree"
+        );
     }
 }
