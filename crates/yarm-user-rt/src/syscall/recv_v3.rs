@@ -27,7 +27,7 @@ pub const SYSCALL_RECV_SHARED_V3_NR: usize = 30;
 const STATUS_SENTINEL_UNWRITTEN: u32 = 0xFF_FF_FF_FF;
 
 /// Decoded delivery result from a successful `recv_shared_v3` call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RecvSharedV3Delivery {
     /// Thread ID of the message sender.
     pub sender_tid: u64,
@@ -38,6 +38,12 @@ pub struct RecvSharedV3Delivery {
     /// Materialized local capability ID when the sender transferred one;
     /// `None` when no capability was transferred.
     pub transferred_cap: Option<u64>,
+    /// Kind of the transferred capability (Stage 47+48); 0 when none.
+    pub object_kind: u32,
+    /// Object generation of the transferred cap (Stage 47+48); 0 when unavailable.
+    pub object_generation: u64,
+    /// Effective rights on the receiver-local transferred cap (Stage 47+48); 0 when none.
+    pub effective_rights: u32,
 }
 
 impl RecvSharedV3Delivery {
@@ -60,6 +66,9 @@ impl RecvSharedV3Delivery {
             message_len: output.message_len,
             message_flags: output.message_flags,
             transferred_cap,
+            object_kind: output.object_kind,
+            object_generation: output.object_generation,
+            effective_rights: output.effective_rights,
         })
     }
 
@@ -73,6 +82,24 @@ impl RecvSharedV3Delivery {
     #[inline]
     pub const fn status(&self) -> u32 {
         RECV_V3_STATUS_OK
+    }
+
+    /// Returns the kind discriminant of the transferred capability (Stage 47+48).
+    #[inline]
+    pub const fn object_kind(&self) -> u32 {
+        self.object_kind
+    }
+
+    /// Returns the object generation of the transferred capability (Stage 47+48).
+    #[inline]
+    pub const fn object_generation(&self) -> u64 {
+        self.object_generation
+    }
+
+    /// Returns the effective rights on the receiver-local cap (Stage 47+48).
+    #[inline]
+    pub const fn effective_rights(&self) -> u32 {
+        self.effective_rights
     }
 }
 
@@ -189,6 +216,9 @@ pub unsafe fn ipc_recv_shared_v3_nonblocking(
                 message_len: output.message_len,
                 message_flags: output.message_flags,
                 transferred_cap,
+                object_kind: output.object_kind,
+                object_generation: output.object_generation,
+                effective_rights: output.effective_rights,
             }))
         }
         RECV_V3_STATUS_WOULD_BLOCK => Ok(None),
@@ -215,9 +245,8 @@ mod tests {
     fn delivery_has_transfer_cap_true_when_some() {
         let d = RecvSharedV3Delivery {
             sender_tid: 1,
-            message_len: 0,
-            message_flags: 0,
             transferred_cap: Some(42),
+            ..Default::default()
         };
         assert!(d.has_transfer_cap());
     }
@@ -226,9 +255,7 @@ mod tests {
     fn delivery_has_transfer_cap_false_when_none() {
         let d = RecvSharedV3Delivery {
             sender_tid: 1,
-            message_len: 0,
-            message_flags: 0,
-            transferred_cap: None,
+            ..Default::default()
         };
         assert!(!d.has_transfer_cap());
     }
@@ -238,8 +265,7 @@ mod tests {
         let d = RecvSharedV3Delivery {
             sender_tid: 99,
             message_len: 7,
-            message_flags: 0,
-            transferred_cap: None,
+            ..Default::default()
         };
         assert_eq!(d.sender_tid, 99);
         assert_eq!(d.message_len, 7);
@@ -248,22 +274,15 @@ mod tests {
     #[test]
     fn output_accessor_message_flags() {
         let d = RecvSharedV3Delivery {
-            sender_tid: 0,
-            message_len: 0,
             message_flags: 0xDEAD,
-            transferred_cap: None,
+            ..Default::default()
         };
         assert_eq!(d.message_flags, 0xDEAD);
     }
 
     #[test]
     fn delivery_status_is_always_ok() {
-        let d = RecvSharedV3Delivery {
-            sender_tid: 0,
-            message_len: 0,
-            message_flags: 0,
-            transferred_cap: None,
-        };
+        let d = RecvSharedV3Delivery::default();
         assert_eq!(d.status(), RECV_V3_STATUS_OK);
     }
 
@@ -347,6 +366,7 @@ mod tests {
             message_len: output.message_len,
             message_flags: output.message_flags,
             transferred_cap,
+            ..Default::default()
         };
         assert!(!delivery.has_transfer_cap());
         assert_eq!(delivery.transferred_cap, None);
@@ -363,10 +383,8 @@ mod tests {
             Some(output.transferred_cap)
         };
         let delivery = RecvSharedV3Delivery {
-            sender_tid: 0,
-            message_len: 0,
-            message_flags: 0,
             transferred_cap,
+            ..Default::default()
         };
         assert!(delivery.has_transfer_cap());
         assert_eq!(delivery.transferred_cap, Some(17));
@@ -467,6 +485,7 @@ mod tests {
             } else {
                 Some(transferred_cap_raw)
             },
+            ..Default::default()
         };
         assert!(!delivery.has_transfer_cap());
         assert_eq!(delivery.sender_tid, 7);
@@ -518,11 +537,84 @@ mod tests {
             } else {
                 Some(output.transferred_cap)
             },
+            object_kind: output.object_kind,
+            object_generation: output.object_generation,
+            effective_rights: output.effective_rights,
         };
 
         assert_eq!(
             via_helper, manual,
             "from_output and manual decode must agree"
         );
+    }
+
+    // ── Stage 47+48: object metadata accessors ───────────────────────────────
+
+    #[test]
+    fn object_kind_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            object_kind: 1,
+            ..Default::default()
+        };
+        assert_eq!(d.object_kind(), 1);
+    }
+
+    #[test]
+    fn object_generation_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            object_generation: 0xDEAD_BEEF_CAFE_0001,
+            ..Default::default()
+        };
+        assert_eq!(d.object_generation(), 0xDEAD_BEEF_CAFE_0001);
+    }
+
+    #[test]
+    fn effective_rights_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            effective_rights: 0x07,
+            ..Default::default()
+        };
+        assert_eq!(d.effective_rights(), 0x07);
+    }
+
+    #[test]
+    fn from_output_decodes_object_kind_memory_object() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 5;
+        output.object_kind = 1; // RecvSharedV3ObjectKind::MemoryObject
+        output.object_generation = 0;
+        output.effective_rights = 0x07;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.object_kind(), 1, "MemoryObject kind");
+        assert_eq!(d.object_generation(), 0, "MemoryObject has no generation");
+        assert_eq!(d.effective_rights(), 0x07, "READ|WRITE|MAP");
+    }
+
+    #[test]
+    fn from_output_object_metadata_zero_when_no_cap() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = RECV_V3_NO_TRANSFER_CAP;
+        // kernel writes zeros for all object fields when there is no transfer
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert!(!d.has_transfer_cap());
+        assert_eq!(d.object_kind(), 0);
+        assert_eq!(d.object_generation(), 0);
+        assert_eq!(d.effective_rights(), 0);
+    }
+
+    #[test]
+    fn from_output_endpoint_kind_and_generation() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 7;
+        output.object_kind = 2; // RecvSharedV3ObjectKind::Endpoint
+        output.object_generation = 0x0000_0000_0000_0042;
+        output.effective_rights = 0x08; // SEND
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.object_kind(), 2);
+        assert_eq!(d.object_generation(), 0x42);
+        assert_eq!(d.effective_rights(), 0x08);
     }
 }

@@ -3158,3 +3158,64 @@ Stage 46 closes the cap-transfer blocker documented in Rule N+49(C): uses
 - `cargo test --features hosted-dev --lib -- --test-threads=1` (1128 total)
 
 All tests must pass.
+
+## Rule N+51: Stage 47+48 — object metadata for transferred caps in recv_shared_v3
+
+Stage 47+48 implements the three object-introspection fields in the
+`RecvSharedV3Output` buffer that were previously FUTURE/zero:
+`object_kind`, `object_generation`, and `effective_rights`. `exact_object_size`
+remains 0 (FUTURE; Stage 49).
+
+**ABI constraints (frozen):**
+- `object_kind` @40 (u32): `RecvSharedV3ObjectKind` discriminant (0=Unknown, 1=MemoryObject, 2=Endpoint, 3=ReplyCap, 4=Notification, 0xFF=Other).
+- C-layout padding @44-47: always zero.
+- `object_generation` @48 (u64): generation from Endpoint/Notification/Reply caps; 0 for MemoryObject (no generation field).
+- `effective_rights` @56 (u32): `CapRights::bits() as u32` on the receiver-local materialized cap; 0 if no cap.
+- C-layout padding @60-63: always zero.
+- `exact_object_size` @64 (u64): always 0 (FUTURE).
+
+**Kernel implementation (`src/kernel/syscall.rs`):**
+- `write_v3_output_to_user` extended with `object_kind: u32`, `object_generation: u64`, `effective_rights: u32` params; fills bytes [40..60].
+- `recv_v3_object_kind(obj: CapObject) -> u32` maps variant to discriminant.
+- `recv_v3_object_generation(obj: CapObject) -> u64` returns generation or 0.
+- WouldBlock call site passes `0, 0, 0` for the three new params.
+- OK/Delivered call site computes metadata via `kernel.capability_service().resolve_current_task_capability(CapId(cap_id_raw))` on the materialized cap.
+
+**(A) Kernel dispatch tests (2 in `mod stage47`):**
+
+- `stage47_object_kind_and_rights_for_transferred_memory_object` — Full-path proof:
+  - Sends a MemoryObject cap via `dispatch(IpcSend)`.
+  - Receives via `dispatch(RecvSharedV3)`.
+  - Reads the full 80-byte output and asserts:
+    - `object_kind @40 == 1` (MemoryObject)
+    - `padding @44 == 0` (C-layout gap)
+    - `object_generation @48 == 0` (MemoryObject has no generation)
+    - `effective_rights @56 == 0x07` (READ|WRITE|MAP for anonymous MemoryObject)
+    - `padding @60 == 0` (C-layout gap)
+    - `exact_object_size @64 == 0` (FUTURE)
+
+- `stage47_plain_message_object_metadata_is_zero` — Proves that when no cap is
+  transferred all object introspection fields are zero in the output buffer.
+
+**(B) user-rt tests (`crates/yarm-user-rt/src/syscall/recv_v3.rs`, 5 new tests):**
+
+- `object_kind_accessor_returns_field` — accessor passes through the field.
+- `object_generation_accessor_returns_field` — accessor passes through the field.
+- `effective_rights_accessor_returns_field` — accessor passes through the field.
+- `from_output_decodes_object_kind_memory_object` — `from_output()` reads `object_kind=1, object_generation=0, effective_rights=0x07` from the output struct.
+- `from_output_object_metadata_zero_when_no_cap` — `from_output()` decodes zeros for all object fields when `transferred_cap == NO_TRANSFER_CAP`.
+- `from_output_endpoint_kind_and_generation` — decodes `object_kind=2` (Endpoint), non-zero generation, and `effective_rights=0x08` (SEND).
+
+**(C) ABI crate tests (`crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`, 4 new tests):**
+- `abi_cap_rights_constants_match_cap_rights_bits` — `RECV_V3_CAP_RIGHTS_*` constants match `CapRights::bits()` values.
+- `abi_object_kind_values_are_stable` — enum discriminants are frozen.
+- `abi_object_kind_anonymous_memory_object_is_one` — `MemoryObject == 1`.
+- `abi_effective_rights_read_write_map_combo` — `READ | WRITE | MAP == 0x07`.
+
+**Run commands:**
+- `cargo test --lib stage47 -- --test-threads=1` (2 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (33 user-rt tests total)
+- `cargo test -p yarm-ipc-abi --lib recv_shared_v3` (ABI crate tests)
+- `cargo test --features hosted-dev --lib -- --test-threads=1` (all kernel tests)
+
+All tests must pass.

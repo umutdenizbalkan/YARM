@@ -4051,8 +4051,15 @@ fn parse_v3_request_bytes(
 ///
 /// `out_ptr == 0` or `out_len < 80` — silently skip (caller may call with
 /// metadata_ptr/metadata_len from the request without a null check).
-/// All FUTURE fields (object_kind, object_generation, effective_rights,
-/// exact_object_size, region_offset) are written as zero.
+///
+/// Byte layout (must match `#[repr(C)] RecvSharedV3Output` field offsets):
+///   [0..40]   authoritative fields (version … transferred_cap)
+///   [40..44]  object_kind (u32)
+///   [44..48]  0 (C-layout padding before u64)
+///   [48..56]  object_generation (u64)
+///   [56..60]  effective_rights (u32)
+///   [60..64]  0 (C-layout padding before u64)
+///   [64..80]  exact_object_size + region_offset — always 0 (FUTURE)
 fn write_v3_output_to_user(
     kernel: &mut KernelState,
     out_ptr: u64,
@@ -4062,6 +4069,9 @@ fn write_v3_output_to_user(
     message_len: u32,
     message_flags: u32,
     transferred_cap: u64,
+    object_kind: u32,
+    object_generation: u64,
+    effective_rights: u32,
 ) {
     use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
     if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
@@ -4076,8 +4086,36 @@ fn write_v3_output_to_user(
     out[24..28].copy_from_slice(&message_len.to_le_bytes());
     out[28..32].copy_from_slice(&message_flags.to_le_bytes());
     out[32..40].copy_from_slice(&transferred_cap.to_le_bytes());
-    // bytes [40..80]: FUTURE fields — all zero in Stage 42+43.
+    // Stage 47+48 object introspection fields.
+    out[40..44].copy_from_slice(&object_kind.to_le_bytes());
+    // out[44..48]: C-layout padding (already 0).
+    out[48..56].copy_from_slice(&object_generation.to_le_bytes());
+    out[56..60].copy_from_slice(&effective_rights.to_le_bytes());
+    // out[60..80]: exact_object_size + region_offset — FUTURE, always 0.
     let _ = kernel.copy_to_current_user(out_ptr as usize, &out);
+}
+
+/// Map a [`CapObject`] variant to its `RecvSharedV3ObjectKind` discriminant.
+fn recv_v3_object_kind(obj: crate::kernel::capabilities::CapObject) -> u32 {
+    use crate::kernel::capabilities::CapObject;
+    match obj {
+        CapObject::MemoryObject { .. } => 1,
+        CapObject::Endpoint { .. } => 2,
+        CapObject::Reply { .. } => 3,
+        CapObject::Notification { .. } => 4,
+        _ => 0xFF,
+    }
+}
+
+/// Return the object generation stored in a [`CapObject`], or 0 if unavailable.
+fn recv_v3_object_generation(obj: crate::kernel::capabilities::CapObject) -> u64 {
+    use crate::kernel::capabilities::CapObject;
+    match obj {
+        CapObject::Endpoint { generation, .. } => generation,
+        CapObject::Notification { generation, .. } => generation,
+        CapObject::Reply { generation, .. } => generation,
+        _ => 0,
+    }
 }
 
 /// Stage 42+43: handle the `recv_shared_v3` syscall (NR 30).
@@ -4182,6 +4220,9 @@ fn handle_recv_shared_v3(
                 0,
                 0,
                 SYSCALL_NO_TRANSFER_CAP,
+                0,
+                0,
+                0,
             );
             crate::yarm_log!("RECV_V3_WOULD_BLOCK tid={}", caller_tid);
             return Err(SyscallError::WouldBlock);
@@ -4216,6 +4257,20 @@ fn handle_recv_shared_v3(
             let message_flags_raw = delivery.msg.flags as u32;
             let xfer_cap_out = materialized_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
 
+            // Stage 47+48: resolve object metadata from the materialized cap.
+            let (obj_kind, obj_gen, eff_rights) = match materialized_cap {
+                Some(cap_id_raw) => kernel
+                    .capability_service()
+                    .resolve_current_task_capability(CapId(cap_id_raw))
+                    .map(|cap| (
+                        recv_v3_object_kind(cap.object),
+                        recv_v3_object_generation(cap.object),
+                        u32::from(cap.rights_bits()),
+                    ))
+                    .unwrap_or((0, 0, 0)),
+                None => (0, 0, 0),
+            };
+
             match execute_user_asid_plain_writeback(kernel, &delivery) {
                 RecvUserWritebackOutcome::Ok => {
                     write_v3_output_to_user(
@@ -4227,6 +4282,9 @@ fn handle_recv_shared_v3(
                         payload_len as u32,
                         message_flags_raw,
                         xfer_cap_out,
+                        obj_kind,
+                        obj_gen,
+                        eff_rights,
                     );
                     frame.set_ok(
                         usize::try_from(sender_tid_raw).unwrap_or(0),

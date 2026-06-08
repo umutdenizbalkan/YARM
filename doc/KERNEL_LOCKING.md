@@ -10593,8 +10593,62 @@ Boot-level `ipc_send` with a phony `FLAG_CAP_TRANSFER` handle (not stashed) caus
 `take_transfer_envelope` to return `None`, resulting in `Err(SyscallError::InvalidCapability)`
 from `dispatch(RecvSharedV3)`. This proves `stash_transfer_envelope` is required.
 
-### 60.5 FUTURE / remaining blockers
+### 60.5 FUTURE / remaining blockers (resolved in Stage 47+48)
 
-- `object_kind`, `object_generation`, `effective_rights`, `exact_object_size` remain 0.
+- `object_kind`, `object_generation`, `effective_rights` implemented in Stage 47+48 (see §61).
+- `exact_object_size` remains 0 (FUTURE; Stage 49).
+- No production service loop uses recv_shared_v3.
+- `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.
+
+## §61 Stage 47+48: object metadata for transferred caps in recv_shared_v3
+
+### 61.1 Goal
+
+Fill the three object-introspection fields in the `RecvSharedV3Output` 80-byte buffer
+that §60.5 identified as remaining FUTURE/zero.  `exact_object_size` stays 0.
+
+### 61.2 ABI layout (frozen since Stage 42+43)
+
+| Offset | Width | Field | Stage 47+48 status |
+|--------|-------|-------|--------------------|
+| 40 | 4 | `object_kind` (u32) | **Authoritative** — `RecvSharedV3ObjectKind` discriminant |
+| 44 | 4 | C-layout padding | Always zero |
+| 48 | 8 | `object_generation` (u64) | **Authoritative** for Endpoint/Notification/Reply; 0 for MemoryObject |
+| 56 | 4 | `effective_rights` (u32) | **Authoritative** — `CapRights::bits() as u32` on receiver-local cap |
+| 60 | 4 | C-layout padding | Always zero |
+| 64 | 8 | `exact_object_size` (u64) | 0 (FUTURE, Stage 49) |
+| 72 | 8 | `region_offset` (u64) | 0 (FUTURE) |
+
+### 61.3 Kernel implementation
+
+**`write_v3_output_to_user`** extended with three new parameters:
+- `object_kind: u32` → `out[40..44]`
+- `object_generation: u64` → `out[48..56]`
+- `effective_rights: u32` → `out[56..60]`
+
+**`recv_v3_object_kind(obj: CapObject) -> u32`:** maps CapObject variant to RecvSharedV3ObjectKind discriminant (MemoryObject→1, Endpoint→2, Reply→3, Notification→4, other→0xFF).
+
+**`recv_v3_object_generation(obj: CapObject) -> u64`:** returns the `generation` field for Endpoint/Notification/Reply; 0 for all other variants (MemoryObject has no generation).
+
+**Call sites in `handle_recv_shared_v3`:**
+- WouldBlock path: passes `0, 0, 0` (no cap).
+- OK/Delivered path: resolves the materialized cap via `kernel.capability_service().resolve_current_task_capability(CapId(cap_id_raw))`, extracts `recv_v3_object_kind(cap.object)`, `recv_v3_object_generation(cap.object)`, `u32::from(cap.rights_bits())`.
+
+### 61.4 Proven assertions (mod stage47 in src/kernel/boot/tests.rs)
+
+**Primary proof (MemoryObject transfer):**
+- `object_kind @40 == 1` (RecvSharedV3ObjectKind::MemoryObject)
+- `padding @44 == 0`
+- `object_generation @48 == 0` (MemoryObject has no generation field)
+- `effective_rights @56 == 0x07` (READ|WRITE|MAP on anonymous MemoryObject)
+- `padding @60 == 0`
+- `exact_object_size @64 == 0` (FUTURE)
+
+**Negative proof (plain message, no cap):**
+- All five introspection fields are 0.
+
+### 61.5 FUTURE / remaining blockers
+
+- `exact_object_size` for MemoryObject (Stage 49 — requires authoritative size in CapObject).
 - No production service loop uses recv_shared_v3.
 - `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.
