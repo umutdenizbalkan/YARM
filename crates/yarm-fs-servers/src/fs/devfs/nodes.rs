@@ -122,9 +122,7 @@ impl DevFsBackend {
         let (full_path, full_len) = Self::normalize_node_path(path)?;
 
         // Reject duplicates against built-ins.
-        if &full_path[..full_len] == DEV_CONSOLE_PATH
-            || &full_path[..full_len] == DEV_NULL_PATH
-        {
+        if &full_path[..full_len] == DEV_CONSOLE_PATH || &full_path[..full_len] == DEV_NULL_PATH {
             return Err(DevNodeRegisterError::Duplicate);
         }
 
@@ -429,8 +427,14 @@ mod tests {
     #[test]
     fn byte_path_lookup_rejects_unknown_paths() {
         let mut backend = DevFsBackend::new();
-        assert_eq!(backend.openat_path(b"/dev/unknown"), Err(VfsError::InvalidPath));
-        assert_eq!(backend.statx_path(b"/dev/unknown"), Err(VfsError::InvalidPath));
+        assert_eq!(
+            backend.openat_path(b"/dev/unknown"),
+            Err(VfsError::InvalidPath)
+        );
+        assert_eq!(
+            backend.statx_path(b"/dev/unknown"),
+            Err(VfsError::InvalidPath)
+        );
     }
 
     // ── Dynamic node registration ───────────────────────────────────────────

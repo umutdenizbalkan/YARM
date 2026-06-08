@@ -92,9 +92,7 @@ impl KernelState {
 
     #[cfg(test)]
     pub(crate) fn cow_page_count_for_asid(&self, asid: Asid) -> usize {
-        self.with_memory_state(|memory| {
-            memory.cow_pages.get(&asid.0).map_or(0, |s| s.len())
-        })
+        self.with_memory_state(|memory| memory.cow_pages.get(&asid.0).map_or(0, |s| s.len()))
     }
 
     #[cfg(test)]
@@ -406,15 +404,10 @@ impl KernelState {
     /// restores the PTE write bit and clears any COW record that was added for
     /// the page, leaving `map_refcount` and `cap_refcount` unchanged (net-zero
     /// note_mapping_removed / note_mapping_inserted pair on the same frame).
-    fn restore_parent_write_permissions(
-        &mut self,
-        parent_asid: Asid,
-        wp_virts: &[VirtAddr],
-    ) {
+    fn restore_parent_write_permissions(&mut self, parent_asid: Asid, wp_virts: &[VirtAddr]) {
         for &virt in wp_virts {
-            let current = self.with_user_spaces(|spaces| {
-                spaces.get(parent_asid).and_then(|a| a.resolve(virt))
-            });
+            let current = self
+                .with_user_spaces(|spaces| spaces.get(parent_asid).and_then(|a| a.resolve(virt)));
             if let Some(mapping) = current {
                 let mut restored = mapping.flags;
                 restored.write = true;
@@ -442,7 +435,9 @@ impl KernelState {
                 for offset in 0..crate::kernel::vm::PAGE_SIZE as u64 {
                     let key = (asid.0, old_phys.0 + offset);
                     if let Some(value) = memory.user_memory.get(&key).copied() {
-                        memory.user_memory.insert((asid.0, new_phys.0 + offset), value);
+                        memory
+                            .user_memory
+                            .insert((asid.0, new_phys.0 + offset), value);
                     }
                 }
             });
@@ -456,11 +451,7 @@ impl KernelState {
             let dst =
                 Self::phys_to_direct_map_ptr(new_phys.0).ok_or(KernelError::UserMemoryFault)?;
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    src as *const u8,
-                    dst,
-                    crate::kernel::vm::PAGE_SIZE,
-                );
+                core::ptr::copy_nonoverlapping(src as *const u8, dst, crate::kernel::vm::PAGE_SIZE);
             }
             Ok(())
         }
@@ -500,9 +491,14 @@ impl KernelState {
         }
         let mut flags = mapping.flags;
         flags.write = true;
-        if let Err(e) =
-            self.map_user_page_in_asid_raw(asid, page, Mapping { phys: new_phys, flags })
-        {
+        if let Err(e) = self.map_user_page_in_asid_raw(
+            asid,
+            page,
+            Mapping {
+                phys: new_phys,
+                flags,
+            },
+        ) {
             if let Some(cnode) = self.current_task_cnode() {
                 let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
             }
@@ -614,7 +610,9 @@ impl KernelState {
         if file_len == 0 {
             return Err(KernelError::Vm(VmError::Misaligned));
         }
-        let file_end = file_data_offset.checked_add(file_len).ok_or(KernelError::WrongObject)?;
+        let file_end = file_data_offset
+            .checked_add(file_len)
+            .ok_or(KernelError::WrongObject)?;
         if file_end > initrd.len() {
             return Err(KernelError::WrongObject);
         }
@@ -622,7 +620,8 @@ impl KernelState {
         let initrd_virt_raw = initrd.as_ptr() as u64;
         let initrd_phys_base = Self::normalize_initrd_phys_ptr_static(initrd_virt_raw)
             .map_err(|_| KernelError::WrongObject)?;
-        let file_phys_raw = initrd_phys_base.checked_add(file_data_offset as u64)
+        let file_phys_raw = initrd_phys_base
+            .checked_add(file_data_offset as u64)
             .ok_or(KernelError::WrongObject)?;
         // Round physical address down to page boundary.
         let page_size = PAGE_SIZE as u64;
@@ -635,11 +634,7 @@ impl KernelState {
             initrd_offset: file_data_offset as u64,
             file_len: file_len as u64,
         };
-        self.create_memory_object_with_len_and_kind(
-            PhysAddr(phys_page_start),
-            len_pages,
-            kind,
-        )
+        self.create_memory_object_with_len_and_kind(PhysAddr(phys_page_start), len_pages, kind)
     }
 
     /// Translate an initrd virtual pointer to a physical address.
@@ -648,7 +643,9 @@ impl KernelState {
         let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
         let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
         if virt_base > phys_base && raw_ptr >= virt_base {
-            let off = raw_ptr.checked_sub(virt_base).ok_or(KernelError::WrongObject)?;
+            let off = raw_ptr
+                .checked_sub(virt_base)
+                .ok_or(KernelError::WrongObject)?;
             let phys = phys_base.checked_add(off).ok_or(KernelError::WrongObject)?;
             return Ok(phys);
         }
@@ -672,7 +669,9 @@ impl KernelState {
         if let Some((rs, re)) = crate::kernel::frame_allocator::is_pa_in_pt_pool(pa) {
             crate::yarm_log!(
                 "PMEM_ALLOC_PT_POOL_BUG pa=0x{:x} pt_range=0x{:x}..0x{:x}",
-                pa, rs, re
+                pa,
+                rs,
+                re
             );
             panic!("PMEM_ALLOC_PT_POOL_BUG: main frame allocator returned a PT-pool PA");
         }
@@ -702,12 +701,21 @@ impl KernelState {
         if let Some((rs, re)) = crate::kernel::frame_allocator::is_pa_in_pt_pool(phys.0) {
             crate::yarm_log!(
                 "PMEM_ALLOC_PT_POOL_BUG_CONTIG pa=0x{:x} pt_range=0x{:x}..0x{:x} pages={}",
-                phys.0, rs, re, pages
+                phys.0,
+                rs,
+                re,
+                pages
             );
-            panic!("PMEM_ALLOC_PT_POOL_BUG_CONTIG: main contiguous allocator returned a PT-pool PA");
+            panic!(
+                "PMEM_ALLOC_PT_POOL_BUG_CONTIG: main contiguous allocator returned a PT-pool PA"
+            );
         }
         #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
-        crate::yarm_log!("PMEM_ALLOC_FRAME pa=0x{:x} owner=user_contig pages={}", phys.0, pages);
+        crate::yarm_log!(
+            "PMEM_ALLOC_FRAME pa=0x{:x} owner=user_contig pages={}",
+            phys.0,
+            pages
+        );
         self.create_memory_object_with_len(phys, total_len)
     }
 
@@ -1082,19 +1090,26 @@ impl KernelState {
         if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
-        let (old, current_phys) = self.with_user_spaces_mut(|spaces| -> Result<_, KernelError> {
-            let aspace = spaces
-                .get_mut(asid)
-                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-            let current_phys = aspace
-                .resolve(virt)
-                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
-                .phys;
-            let old = aspace
-                .map_page(virt, Mapping { phys: current_phys, flags: new_flags })
-                .map_err(KernelError::Vm)?;
-            Ok((old, current_phys))
-        })?;
+        let (old, current_phys) =
+            self.with_user_spaces_mut(|spaces| -> Result<_, KernelError> {
+                let aspace = spaces
+                    .get_mut(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+                let current_phys = aspace
+                    .resolve(virt)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                    .phys;
+                let old = aspace
+                    .map_page(
+                        virt,
+                        Mapping {
+                            phys: current_phys,
+                            flags: new_flags,
+                        },
+                    )
+                    .map_err(KernelError::Vm)?;
+                Ok((old, current_phys))
+            })?;
         if let Some(old_mapping) = old {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(old_mapping.phys);
@@ -1114,19 +1129,26 @@ impl KernelState {
         virt: VirtAddr,
         new_flags: PageFlags,
     ) -> Result<Option<Mapping>, KernelError> {
-        let (old, current_phys) = self.with_user_spaces_mut(|spaces| -> Result<_, KernelError> {
-            let aspace = spaces
-                .get_mut(asid)
-                .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
-            let current_phys = aspace
-                .resolve(virt)
-                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
-                .phys;
-            let old = aspace
-                .map_page(virt, Mapping { phys: current_phys, flags: new_flags })
-                .map_err(KernelError::Vm)?;
-            Ok((old, current_phys))
-        })?;
+        let (old, current_phys) =
+            self.with_user_spaces_mut(|spaces| -> Result<_, KernelError> {
+                let aspace = spaces
+                    .get_mut(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+                let current_phys = aspace
+                    .resolve(virt)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                    .phys;
+                let old = aspace
+                    .map_page(
+                        virt,
+                        Mapping {
+                            phys: current_phys,
+                            flags: new_flags,
+                        },
+                    )
+                    .map_err(KernelError::Vm)?;
+                Ok((old, current_phys))
+            })?;
         if let Some(old_mapping) = old {
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(old_mapping.phys);
@@ -1154,8 +1176,6 @@ impl KernelState {
     /// Return the number of pages currently mapped in `asid`.
     #[cfg(test)]
     pub(crate) fn mapped_page_count_for_asid(&self, asid: Asid) -> usize {
-        self.with_user_spaces(|spaces| {
-            spaces.get(asid).map_or(0, |aspace| aspace.mappings())
-        })
+        self.with_user_spaces(|spaces| spaces.get(asid).map_or(0, |aspace| aspace.mappings()))
     }
 }

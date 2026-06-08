@@ -692,7 +692,10 @@ fn spawn_user_task_from_image_registers_asid_and_class() {
     assert_eq!(tcb.user_context.instruction_ptr, VirtAddr(0x8000));
     // stack_ptr is below stack_top (startup_args are placed on the stack before first entry).
     let sp = tcb.user_context.stack_ptr;
-    assert!(sp.0 <= stack_top.0, "stack_ptr must be at or below stack_top");
+    assert!(
+        sp.0 <= stack_top.0,
+        "stack_ptr must be at or below stack_top"
+    );
     assert!(
         sp.0 > stack_top.0 - 64 * crate::kernel::vm::PAGE_SIZE as u64,
         "stack_ptr must be within the allocated stack region"
@@ -790,10 +793,14 @@ fn capability_snapshot_for_task_includes_live_endpoint_caps() {
         .snapshot_live_capabilities_for_task(91)
         .expect("snapshot");
     assert!(caps.iter().any(|(id, cap)| {
-        *id == send_child && matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::SEND)
+        *id == send_child
+            && matches!(cap.object, CapObject::Endpoint { .. })
+            && cap.has_right(CapRights::SEND)
     }));
     assert!(caps.iter().any(|(id, cap)| {
-        *id == recv_child && matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::RECEIVE)
+        *id == recv_child
+            && matches!(cap.object, CapObject::Endpoint { .. })
+            && cap.has_right(CapRights::RECEIVE)
     }));
 }
 
@@ -830,7 +837,10 @@ fn supervisor_fault_slot_cap_can_register_supervisor_endpoint() {
         .report_task_exit_to_supervisor(1, 7, 9)
         .expect("report");
     let msg = state.ipc_recv(recv_root).expect("recv").expect("msg");
-    assert_eq!(msg.opcode, yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED);
+    assert_eq!(
+        msg.opcode,
+        yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED
+    );
 }
 
 #[test]
@@ -1295,14 +1305,7 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
     assert_eq!(&pre[..3], b"pre");
     let mut recv_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
-        [
-            recv_cap.0 as usize,
-            payload_ptr,
-            16,
-            meta_ptr,
-            40,
-            0,
-        ],
+        [recv_cap.0 as usize, payload_ptr, 16, meta_ptr, 40, 0],
     );
     state
         .handle_trap(Trap::Syscall, Some(&mut recv_frame))
@@ -1327,9 +1330,18 @@ fn run_recv_v2_blocked_waiter_direct_delivery_consumes_exactly_once() {
         u16::from_le_bytes(meta[10..12].try_into().expect("msg flags")),
         0
     );
-    assert_eq!(u16::from_le_bytes(meta[8..10].try_into().expect("opcode")), 0x1234);
-    assert_eq!(u64::from_le_bytes(meta[16..24].try_into().expect("cap")), u64::MAX);
-    assert_eq!(u64::from_le_bytes(meta[32..40].try_into().expect("sender")), 7);
+    assert_eq!(
+        u16::from_le_bytes(meta[8..10].try_into().expect("opcode")),
+        0x1234
+    );
+    assert_eq!(
+        u64::from_le_bytes(meta[16..24].try_into().expect("cap")),
+        u64::MAX
+    );
+    assert_eq!(
+        u64::from_le_bytes(meta[32..40].try_into().expect("sender")),
+        7
+    );
 
     state.yield_current().expect("switch sender");
     state.yield_current().expect("switch receiver");
@@ -1391,20 +1403,36 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     state.bind_task_asid(1, asid1).expect("bind1");
     state.bind_task_asid(2, asid2).expect("bind2");
     state
-        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x3000),
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map req buffers");
     state
-        .map_user_page(aspace2, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace2,
+            VirtAddr(0x4000),
+            Mapping {
+                phys: PhysAddr(0xB000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map recv buffers");
 
-    let (_req_eid, req_send_cap_global, req_recv_cap_global) = state.create_endpoint(4).expect("req ep");
+    let (_req_eid, req_send_cap_global, req_recv_cap_global) =
+        state.create_endpoint(4).expect("req ep");
     let req_send_cap_t1 = state
         .grant_capability_task_to_task(0, req_send_cap_global, 1)
         .expect("dup req send to requester");
     let req_recv_cap_t2 = state
         .grant_capability_task_to_task(0, req_recv_cap_global, 2)
         .expect("dup req recv to receiver");
-    let (_reply_eid, _reply_send, reply_recv_cap_global) = state.create_endpoint(4).expect("reply ep");
+    let (_reply_eid, _reply_send, reply_recv_cap_global) =
+        state.create_endpoint(4).expect("reply ep");
     let reply_recv_cap_t1 = state
         .grant_capability_task_to_task(0, reply_recv_cap_global, 1)
         .expect("dup reply recv to requester");
@@ -1416,7 +1444,14 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     }
     let mut call = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
-        [req_send_cap_t1.0 as usize, 0, 0, 0, 0, reply_recv_cap_t1.0 as usize],
+        [
+            req_send_cap_t1.0 as usize,
+            0,
+            0,
+            0,
+            0,
+            reply_recv_cap_t1.0 as usize,
+        ],
     );
     state
         .handle_trap(Trap::Syscall, Some(&mut call))
@@ -1477,13 +1512,28 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
         .read_user_memory_for_asid(asid1, 0x3080, 40)
         .expect("read reply meta");
     assert_eq!(&payload[..2], b"rp");
-    assert_eq!(u16::from_le_bytes(meta[8..10].try_into().expect("opcode")), 0x44);
-    assert_eq!(u16::from_le_bytes(meta[10..12].try_into().expect("flags")), 0);
-    assert_eq!(u64::from_le_bytes(meta[16..24].try_into().expect("cap")), u64::MAX);
-    assert_eq!(u64::from_le_bytes(meta[32..40].try_into().expect("sender")), 2);
+    assert_eq!(
+        u16::from_le_bytes(meta[8..10].try_into().expect("opcode")),
+        0x44
+    );
+    assert_eq!(
+        u16::from_le_bytes(meta[10..12].try_into().expect("flags")),
+        0
+    );
+    assert_eq!(
+        u64::from_le_bytes(meta[16..24].try_into().expect("cap")),
+        u64::MAX
+    );
+    assert_eq!(
+        u64::from_le_bytes(meta[32..40].try_into().expect("sender")),
+        2
+    );
 
     // No duplicate reply queued.
-    assert_eq!(state.ipc_recv(reply_recv_cap_t1).expect("follow-up recv"), None);
+    assert_eq!(
+        state.ipc_recv(reply_recv_cap_t1).expect("follow-up recv"),
+        None
+    );
     // One-shot reply cap consumption.  After ipc_reply the Reply cap is revoked
     // from the replier's cnode (reply-cap cnode exhaustion fix), so a replay
     // returns InvalidCapability instead of StaleCapability / WrongObject.
@@ -1491,7 +1541,9 @@ fn run_ipc_reply_wakes_blocked_recv_v2_waiter_without_duplicate_enqueue() {
     assert!(
         matches!(
             state.ipc_reply(receiver_local_reply_cap, replay),
-            Err(KernelError::WrongObject | KernelError::StaleCapability | KernelError::InvalidCapability)
+            Err(KernelError::WrongObject
+                | KernelError::StaleCapability
+                | KernelError::InvalidCapability)
         ),
         "reusing one-shot reply cap must fail"
     );
@@ -1706,9 +1758,9 @@ fn run_ipc_call_reply_cap_materialization_survives_more_than_255_cycles() {
         // Simulate server dispatching ipc_reply.  With the fix this also revokes
         // the Reply cap from the cnode, recycling the slot.
         let msg = Message::new(0, b"ok").expect("reply msg");
-        state.ipc_reply(reply_cap, msg).unwrap_or_else(|err| {
-            panic!("ipc_reply failed at cycle {cycle}: {err:?}")
-        });
+        state
+            .ipc_reply(reply_cap, msg)
+            .unwrap_or_else(|err| panic!("ipc_reply failed at cycle {cycle}: {err:?}"));
 
         // Drain the message so the endpoint does not back up.
         let received = state
@@ -1831,7 +1883,9 @@ fn run_ipc_call_reply_cap_materialization_survives_more_than_1024_cycles() {
     // If cnode slots leaked in either task, create_endpoint (mints 2 caps) would
     // fail with CapabilityFull / TaskMissing for the exhausted cnode.
     while state.current_tid() != Some(0) {
-        state.yield_current().expect("navigate to task0 for final check");
+        state
+            .yield_current()
+            .expect("navigate to task0 for final check");
     }
     state
         .create_endpoint(1)
@@ -1948,7 +2002,11 @@ fn run_ipc_nested_call_reply_survives_vfs_exec_sized_read_loop() {
             .ipc_recv(pm_reply_recv)
             .expect("PM drain ok")
             .expect("reply expected at PM");
-        assert_eq!(received.as_slice(), b"data", "wrong payload at cycle {cycle}");
+        assert_eq!(
+            received.as_slice(),
+            b"data",
+            "wrong payload at cycle {cycle}"
+        );
         // All three tasks remain in the queue via on_preempt auto-re-enqueue.
         // Do NOT call enqueue_current_cpu here.
     }
@@ -2070,7 +2128,9 @@ fn run_recv_v2_materializes_reply_cap_once_per_message() {
     // If cnode slots leaked in either task, create_endpoint (mints 2 caps)
     // or grant would fail with CapabilityFull / TaskMissing.
     while state.current_tid() != Some(0) {
-        state.yield_current().expect("navigate to task 0 for final check");
+        state
+            .yield_current()
+            .expect("navigate to task 0 for final check");
     }
     let (_, _, probe_recv) = state
         .create_endpoint(1)
@@ -2281,7 +2341,9 @@ fn run_endpoint_only_plain_recv_rejects_transfer_and_reply_messages_without_dequ
         let mut state = Bootstrap::init_boxed().expect("init");
         let (endpoint_idx, send_cap, _recv_cap) = state.create_endpoint(2).expect("endpoint");
         let msg = Message::with_header(7, 0x44, flags, Some(99), b"cap").expect("flagged msg");
-        state.ipc_send(send_cap, msg).expect("queue flagged message");
+        state
+            .ipc_send(send_cap, msg)
+            .expect("queue flagged message");
 
         assert_eq!(
             state.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx),
@@ -2365,7 +2427,9 @@ fn run_endpoint_only_plain_recv_two_phase_refills_plain_sender_waiter() {
     );
 
     // Phase 2 (outside ipc_state_lock): apply wake plan to unblock the sender.
-    state.apply_split_sender_wake_plan(wake_tid).expect("wake sender");
+    state
+        .apply_split_sender_wake_plan(wake_tid)
+        .expect("wake sender");
     assert_eq!(
         state.task_status(0),
         Some(TaskStatus::Runnable),
@@ -2476,13 +2540,7 @@ fn run_ipc_recv_syscall_split_two_phase_refills_plain_sender_waiter() {
     assert_eq!(state.current_tid(), Some(1));
     let payload_ptr = 0x3000usize;
     let meta_ptr = 0x4000usize;
-    let asid = map_ipc_recv_syscall_buffers_for_task(
-        &mut state,
-        1,
-        payload_ptr,
-        meta_ptr,
-        0xA000,
-    );
+    let asid = map_ipc_recv_syscall_buffers_for_task(&mut state, 1, payload_ptr, meta_ptr, 0xA000);
 
     // Dispatch IpcRecv: Stage 4D split path should deliver "first" and wake sender 0.
     let mut frame = TrapFrame::new(
@@ -2544,24 +2602,18 @@ fn run_ipc_recv_timeout_try_recv_uses_split_path() {
 
     let payload_ptr = 0x3000usize;
     let meta_ptr = 0x4000usize;
-    let asid = map_ipc_recv_syscall_buffers_for_task(
-        &mut state,
-        0,
-        payload_ptr,
-        meta_ptr,
-        0xB000,
-    );
+    let asid = map_ipc_recv_syscall_buffers_for_task(&mut state, 0, payload_ptr, meta_ptr, 0xB000);
 
     // Dispatch IpcRecvTimeout with timeout_ticks=0 (Stage 4G try-recv path).
     let mut frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecvTimeout as usize,
         [
             recv_cap.0 as usize,  // arg[0] = cap
-            payload_ptr,           // arg[1] = user_ptr
-            Message::MAX_PAYLOAD,  // arg[2] = user_len
-            0,                     // arg[3] = timeout_ticks = 0 (try-recv)
-            meta_ptr,              // arg[4] = meta_ptr
-            40,                    // arg[5] = meta_len
+            payload_ptr,          // arg[1] = user_ptr
+            Message::MAX_PAYLOAD, // arg[2] = user_len
+            0,                    // arg[3] = timeout_ticks = 0 (try-recv)
+            meta_ptr,             // arg[4] = meta_ptr
+            40,                   // arg[5] = meta_len
         ],
     );
     state
@@ -2614,24 +2666,18 @@ fn run_ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued()
 
     let payload_ptr = 0x3000usize;
     let meta_ptr = 0x4000usize;
-    let asid = map_ipc_recv_syscall_buffers_for_task(
-        &mut state,
-        0,
-        payload_ptr,
-        meta_ptr,
-        0xC000,
-    );
+    let asid = map_ipc_recv_syscall_buffers_for_task(&mut state, 0, payload_ptr, meta_ptr, 0xC000);
 
     // Dispatch IpcRecvTimeout with timeout_ticks=1000 (nonzero — Stage 4I path).
     let mut frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecvTimeout as usize,
         [
-            recv_cap.0 as usize,   // arg[0] = cap
-            payload_ptr,            // arg[1] = user_ptr
-            Message::MAX_PAYLOAD,   // arg[2] = user_len
-            1000,                   // arg[3] = timeout_ticks (nonzero)
-            meta_ptr,               // arg[4] = meta_ptr
-            40,                     // arg[5] = meta_len
+            recv_cap.0 as usize,  // arg[0] = cap
+            payload_ptr,          // arg[1] = user_ptr
+            Message::MAX_PAYLOAD, // arg[2] = user_len
+            1000,                 // arg[3] = timeout_ticks (nonzero)
+            meta_ptr,             // arg[4] = meta_ptr
+            40,                   // arg[5] = meta_len
         ],
     );
     state
@@ -2639,12 +2685,24 @@ fn run_ipc_recv_timeout_syscall_nonzero_timeout_uses_split_when_message_queued()
         .expect("ipc recv timeout Stage 4I");
 
     assert_eq!(frame.error_code(), None, "Stage 4I recv must succeed");
-    assert_eq!(state.current_tid(), before_tid, "sender tid must not change");
-    assert_eq!(state.task_status(0), before_status, "task status must not change");
+    assert_eq!(
+        state.current_tid(),
+        before_tid,
+        "sender tid must not change"
+    );
+    assert_eq!(
+        state.task_status(0),
+        before_status,
+        "task status must not change"
+    );
     let payload = state
         .read_user_memory_for_asid(asid, payload_ptr, 7)
         .expect("payload copy");
-    assert_eq!(&payload[..7], b"timed4i", "Stage 4I must deliver queued payload");
+    assert_eq!(
+        &payload[..7],
+        b"timed4i",
+        "Stage 4I must deliver queued payload"
+    );
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
         0,
@@ -2719,7 +2777,10 @@ fn run_endpoint_only_plain_send_enqueues_without_scheduler_mutation() {
     );
     assert_eq!(state.current_tid(), before_tid);
     assert_eq!(state.task_status(0), before_status);
-    assert_eq!(state.ipc_path_telemetry().queued_sends, before_telemetry.queued_sends);
+    assert_eq!(
+        state.ipc_path_telemetry().queued_sends,
+        before_telemetry.queued_sends
+    );
 
     let received = state.ipc_recv(recv_cap).expect("recv").expect("msg");
     assert_eq!(received.sender_tid, ThreadId(7));
@@ -2779,8 +2840,12 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
     });
 
     let mut sender_waiter_state = Bootstrap::init_boxed().expect("sender waiter init");
-    sender_waiter_state.register_task(1).expect("register sender2");
-    sender_waiter_state.enqueue_current_cpu(1).expect("enqueue sender2");
+    sender_waiter_state
+        .register_task(1)
+        .expect("register sender2");
+    sender_waiter_state
+        .enqueue_current_cpu(1)
+        .expect("enqueue sender2");
     let (sender_waiter_idx, send_cap, _recv_cap) =
         sender_waiter_state.create_endpoint(1).expect("endpoint");
     sender_waiter_state
@@ -2809,8 +2874,7 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
         (Message::FLAG_CAP_TRANSFER, "FLAG_CAP_TRANSFER"),
         (Message::FLAG_CAP_TRANSFER_PLAIN, "FLAG_CAP_TRANSFER_PLAIN"),
     ] {
-        let msg = Message::with_header(0, 0x55, flags, Some(99), b"cap")
-            .expect(desc);
+        let msg = Message::with_header(0, 0x55, flags, Some(99), b"cap").expect(desc);
         assert_eq!(
             transfer_state.ipc_try_send_queued_plain_endpoint_only(transfer_idx, msg),
             IpcEndpointSendResult::Enqueued,
@@ -2818,8 +2882,7 @@ fn run_endpoint_only_plain_send_rejects_waiters_transfer_and_full_queue() {
         );
     }
     assert_eq!(
-        transfer_state
-            .with_ipc_state(|ipc| ipc.endpoints[transfer_idx].as_ref().unwrap().queued()),
+        transfer_state.with_ipc_state(|ipc| ipc.endpoints[transfer_idx].as_ref().unwrap().queued()),
         2,
         "both cap-transfer messages must be queued via Stage 4E"
     );
@@ -2964,7 +3027,11 @@ fn run_ipc_send_syscall_cap_transfer_uses_stage4e_buffered_enqueue() {
 
     assert_eq!(frame.error_code(), None, "send must succeed");
     // Stage 4E must have fired: no scheduler mutation, tid unchanged.
-    assert_eq!(state.current_tid(), before_tid, "Stage 4E must not context-switch");
+    assert_eq!(
+        state.current_tid(),
+        before_tid,
+        "Stage 4E must not context-switch"
+    );
     // Telemetry: exactly one Stage 4E send, including cap-transfer counter.
     let after_telemetry = state.ipc_path_telemetry();
     assert_eq!(
@@ -2973,7 +3040,8 @@ fn run_ipc_send_syscall_cap_transfer_uses_stage4e_buffered_enqueue() {
         "Stage 4E must increment queued_sends"
     );
     assert_eq!(
-        after_telemetry.cap_transfer_stage4e_enqueued - before_telemetry.cap_transfer_stage4e_enqueued,
+        after_telemetry.cap_transfer_stage4e_enqueued
+            - before_telemetry.cap_transfer_stage4e_enqueued,
         1,
         "cap_transfer_stage4e_enqueued must be incremented"
     );
@@ -3190,7 +3258,9 @@ fn run_ipc_send_syscall_sender_waiter_and_full_queue_fall_back_to_full_path() {
 
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointSend(send_cap_task1)))
+        Some(TaskStatus::Blocked(WaitReason::EndpointSend(
+            send_cap_task1
+        )))
     );
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
@@ -3272,11 +3342,7 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
     });
 
     let msg = Message::new(7, b"hello").expect("msg");
-    let result = state.ipc_try_send_to_plain_receiver_endpoint_only(
-        endpoint_idx,
-        ThreadId(1),
-        msg,
-    );
+    let result = state.ipc_try_send_to_plain_receiver_endpoint_only(endpoint_idx, ThreadId(1), msg);
 
     let recv_tid = match result {
         IpcEndpointSendResult::EnqueuedWakeReceiver(tid) => tid,
@@ -3303,7 +3369,9 @@ fn run_endpoint_only_plain_send_to_waiting_receiver_enqueues_and_returns_wake_pl
     );
 
     // Apply deferred wake plan.
-    state.apply_split_receiver_wake_plan(recv_tid).expect("wake");
+    state
+        .apply_split_receiver_wake_plan(recv_tid)
+        .expect("wake");
     assert_eq!(
         state.task_status(1),
         Some(TaskStatus::Runnable),
@@ -3345,7 +3413,9 @@ fn run_ipc_send_syscall_split_delivers_to_waiting_plain_receiver() {
     assert_eq!(state.current_tid(), Some(0));
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_task1)))
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            recv_cap_task1
+        )))
     );
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
@@ -3483,7 +3553,9 @@ fn ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mut
     std::thread::Builder::new()
         .name("ipc_recv_syscall_uses_endpoint_only_plain_queued_branch".into())
         .stack_size(8 * 1024 * 1024)
-        .spawn(run_ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation)
+        .spawn(
+            run_ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler_mutation,
+        )
         .expect("spawn test thread")
         .join()
         .expect("join test thread");
@@ -3501,13 +3573,7 @@ fn run_ipc_recv_syscall_uses_endpoint_only_plain_queued_branch_without_scheduler
     );
     let payload_ptr = 0x3000usize;
     let meta_ptr = 0x4000usize;
-    let asid = map_ipc_recv_syscall_buffers_for_task(
-        &mut state,
-        0,
-        payload_ptr,
-        meta_ptr,
-        0xA000,
-    );
+    let asid = map_ipc_recv_syscall_buffers_for_task(&mut state, 0, payload_ptr, meta_ptr, 0xA000);
     let before_tid = state.current_tid();
     let before_status = state.task_status(0);
     let before_queued_recvs = state.ipc_path_telemetry().queued_recvs;
@@ -3575,19 +3641,13 @@ fn run_ipc_recv_syscall_transfer_message_falls_back_to_full_path() {
         let handle = state
             .stash_transfer_envelope(ThreadId(0), transfer_source, endpoint, None, None)
             .expect("transfer envelope");
-        let msg = Message::with_header(0, 0x44, flags, Some(handle), b"cap")
-            .expect("transfer msg");
+        let msg = Message::with_header(0, 0x44, flags, Some(handle), b"cap").expect("transfer msg");
         state.ipc_send(send_cap, msg).expect("queue transfer msg");
 
         let payload_ptr = 0x3000usize;
         let meta_ptr = 0x4000usize;
-        let _asid = map_ipc_recv_syscall_buffers_for_task(
-            &mut state,
-            0,
-            payload_ptr,
-            meta_ptr,
-            0xC000,
-        );
+        let _asid =
+            map_ipc_recv_syscall_buffers_for_task(&mut state, 0, payload_ptr, meta_ptr, 0xC000);
         let mut frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcRecv as usize,
             [
@@ -3604,7 +3664,10 @@ fn run_ipc_recv_syscall_transfer_message_falls_back_to_full_path() {
             .expect("ipc recv syscall");
 
         assert_eq!(frame.error_code(), None);
-        assert_ne!(frame.ret2() as u64, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP);
+        assert_ne!(
+            frame.ret2() as u64,
+            crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP
+        );
         assert_eq!(
             state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()),
             0,
@@ -3654,13 +3717,7 @@ fn run_ipc_recv_syscall_sender_waiter_fallback_preserves_refill_and_wake() {
 
     let payload_ptr = 0x5000usize;
     let meta_ptr = 0x6000usize;
-    let asid = map_ipc_recv_syscall_buffers_for_task(
-        &mut state,
-        1,
-        payload_ptr,
-        meta_ptr,
-        0xE000,
-    );
+    let asid = map_ipc_recv_syscall_buffers_for_task(&mut state, 1, payload_ptr, meta_ptr, 0xE000);
     let mut frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [
@@ -5698,7 +5755,10 @@ fn yield_current_to_is_single_step_for_ipc_handoff() {
         .ipc_path_telemetry()
         .scheduler_yield_calls
         .saturating_sub(yield_calls_before);
-    assert_eq!(yield_delta, 1, "one-shot handoff must fire exactly one yield");
+    assert_eq!(
+        yield_delta, 1,
+        "one-shot handoff must fire exactly one yield"
+    );
     // Telemetry confirms the rendezvous handoff was counted.
     let t = state.ipc_path_telemetry();
     assert_eq!(t.rendezvous_handoffs, 1);
@@ -6713,8 +6773,12 @@ fn futex_wait_blocks_current_and_wake_requeues_waiter() {
     state.idle_re_enqueue_for_test().expect("re-enqueue idle");
     // Initialize the futex word in the hosted-dev user_memory HashMap for both
     // address spaces so copy_from_user succeeds for both task1 and idle.
-    state.write_user_memory(1, 0x1000, &3u32.to_ne_bytes()).expect("init futex word task1");
-    state.write_user_memory(0, 0x1000, &3u32.to_ne_bytes()).expect("init futex word task0");
+    state
+        .write_user_memory(1, 0x1000, &3u32.to_ne_bytes())
+        .expect("init futex word task1");
+    state
+        .write_user_memory(0, 0x1000, &3u32.to_ne_bytes())
+        .expect("init futex word task0");
 
     assert!(state.futex_wait_current(0x1000, 3, 3).expect("wait"));
     assert_eq!(
@@ -6900,19 +6964,39 @@ fn fork_child_inherits_parent_endpoint_caps_with_same_rights() {
     let child_cnode = state.task_cnode(child_tid).expect("child cnode");
     let inherited_send = child_caps
         .iter()
-        .find(|(_id, cap)| matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::SEND))
+        .find(|(_id, cap)| {
+            matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::SEND)
+        })
         .map(|(id, _)| *id)
         .expect("send cap");
     let inherited_recv = child_caps
         .iter()
-        .find(|(_id, cap)| matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::RECEIVE))
+        .find(|(_id, cap)| {
+            matches!(cap.object, CapObject::Endpoint { .. }) && cap.has_right(CapRights::RECEIVE)
+        })
         .map(|(id, _)| *id)
         .expect("recv cap");
-    assert!(state.capability_for_cnode(child_cnode, inherited_send).is_some());
-    assert!(state.capability_for_cnode(child_cnode, inherited_recv).is_some());
+    assert!(
+        state
+            .capability_for_cnode(child_cnode, inherited_send)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(child_cnode, inherited_recv)
+            .is_some()
+    );
     let parent_cnode = state.task_cnode(39).expect("parent cnode");
-    assert!(state.capability_for_cnode(parent_cnode, send_parent).is_some());
-    assert!(state.capability_for_cnode(parent_cnode, recv_parent).is_some());
+    assert!(
+        state
+            .capability_for_cnode(parent_cnode, send_parent)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(parent_cnode, recv_parent)
+            .is_some()
+    );
 }
 
 #[test]
@@ -6931,18 +7015,27 @@ fn fork_child_does_not_inherit_kernel_caps() {
         .expect("parent");
     let parent_cnode = state.task_cnode(40).expect("parent cnode");
     let kernel_cap = state
-        .mint_capability_in_cnode(parent_cnode, Capability::new(CapObject::Kernel, CapRights::READ))
+        .mint_capability_in_cnode(
+            parent_cnode,
+            Capability::new(CapObject::Kernel, CapRights::READ),
+        )
         .expect("mint kernel cap");
 
     let child_tid = state.fork_user_process_cow(40).expect("fork");
     let child_caps = state
         .snapshot_live_capabilities_for_task(child_tid)
         .expect("child caps");
-    assert!(!child_caps
-        .iter()
-        .any(|(_id, cap)| matches!(cap.object, CapObject::Kernel)));
+    assert!(
+        !child_caps
+            .iter()
+            .any(|(_id, cap)| matches!(cap.object, CapObject::Kernel))
+    );
     let child_cnode = state.task_cnode(child_tid).expect("child cnode");
-    assert!(state.capability_for_cnode(child_cnode, kernel_cap).is_none());
+    assert!(
+        state
+            .capability_for_cnode(child_cnode, kernel_cap)
+            .is_none()
+    );
 }
 
 #[test]
@@ -7029,12 +7122,21 @@ fn fork_cow_map_refcount_incremented_for_shared_pages() {
         .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x1000), PageFlags::USER_RW)
         .expect("map parent");
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before fork");
-    assert_eq!(state.memory.memory_objects[slot].expect("mo").map_refcount, 1);
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot before fork");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("mo").map_refcount,
+        1
+    );
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after clone");
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot after clone");
     assert_eq!(
         state.memory.memory_objects[slot].expect("mo").map_refcount,
         2,
@@ -7060,17 +7162,26 @@ fn fork_cow_cap_refcount_incremented_after_inherit() {
             ..Default::default()
         })
         .expect("parent");
-    state.yield_current_to(ThreadId(42)).expect("switch to task42");
+    state
+        .yield_current_to(ThreadId(42))
+        .expect("switch to task42");
 
     let (mo_id, _mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before fork");
-    assert_eq!(state.memory.memory_objects[slot].expect("mo").cap_refcount, 1);
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot before fork");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("mo").cap_refcount,
+        1
+    );
 
     let child_tid = state.fork_user_process_cow(42).expect("fork");
     let _ = child_tid;
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after fork");
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot after fork");
     assert_eq!(
         state.memory.memory_objects[slot].expect("mo").cap_refcount,
         2,
@@ -7107,7 +7218,9 @@ fn fork_child_exit_does_not_reclaim_shared_frame_while_parent_alive() {
     let _ = state.destroy_user_address_space_by_asid(child_asid);
     // Revoke child's inherited cap.
     let child_cnode = state.task_cnode(child_tid).expect("child cnode");
-    let child_caps = state.snapshot_live_capabilities_for_task(child_tid).expect("caps");
+    let child_caps = state
+        .snapshot_live_capabilities_for_task(child_tid)
+        .expect("caps");
     for (cap_id, cap) in &child_caps {
         if matches!(cap.object, CapObject::MemoryObject { id } if id == mo_id) {
             let _ = state.revoke_capability_in_cnode(child_cnode, *cap_id);
@@ -7120,7 +7233,9 @@ fn fork_child_exit_does_not_reclaim_shared_frame_while_parent_alive() {
         "MemoryObject must survive child exit while parent still holds cap and mapping"
     );
     assert!(
-        state.is_user_page_mapped_in_asid(parent_asid, VirtAddr(0x2000)).unwrap_or(false),
+        state
+            .is_user_page_mapped_in_asid(parent_asid, VirtAddr(0x2000))
+            .unwrap_or(false),
         "parent page must remain mapped after child exits"
     );
 }
@@ -7165,7 +7280,9 @@ fn fork_parent_exit_does_not_reclaim_while_child_maps_frame() {
         "MemoryObject must survive parent exit while child still holds cap and mapping"
     );
     assert!(
-        state.is_user_page_mapped_in_asid(child_asid, VirtAddr(0x3000)).unwrap_or(false),
+        state
+            .is_user_page_mapped_in_asid(child_asid, VirtAddr(0x3000))
+            .unwrap_or(false),
         "child page must remain mapped after parent exits"
     );
 }
@@ -7186,7 +7303,9 @@ fn fork_both_exit_reclaims_shared_frame() {
             ..Default::default()
         })
         .expect("parent");
-    state.yield_current_to(ThreadId(45)).expect("switch to task45");
+    state
+        .yield_current_to(ThreadId(45))
+        .expect("switch to task45");
 
     let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
     state
@@ -7199,7 +7318,10 @@ fn fork_both_exit_reclaims_shared_frame() {
     // Exit child: destroy child asid, revoke child caps.
     let _ = state.destroy_user_address_space_by_asid(child_asid);
     let child_cnode = state.task_cnode(child_tid).expect("child cnode");
-    for (cap_id, cap) in state.snapshot_live_capabilities_for_task(child_tid).expect("caps") {
+    for (cap_id, cap) in state
+        .snapshot_live_capabilities_for_task(child_tid)
+        .expect("caps")
+    {
         if matches!(cap.object, CapObject::MemoryObject { id } if id == mo_id) {
             let _ = state.revoke_capability_in_cnode(child_cnode, cap_id);
         }
@@ -7246,7 +7368,9 @@ fn fork_cow_write_fault_gives_child_private_frame() {
         .expect("map parent");
 
     // COW clone: parent and child share the frame (both read-only in PTE).
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
     // Both should be COW-marked and read-only.
     assert!(state.is_cow_page(parent_asid, VirtAddr(0x5000)));
@@ -7260,19 +7384,27 @@ fn fork_cow_write_fault_gives_child_private_frame() {
 
     // Child should now map a NEW private frame (different from original_phys).
     let child_mapping = state
-        .with_user_spaces(|spaces| spaces.get(child_asid).and_then(|a| a.resolve(VirtAddr(0x5000))))
+        .with_user_spaces(|spaces| {
+            spaces
+                .get(child_asid)
+                .and_then(|a| a.resolve(VirtAddr(0x5000)))
+        })
         .expect("child mapping after fault");
     assert_ne!(
-        child_mapping.phys,
-        original_phys,
+        child_mapping.phys, original_phys,
         "child must get a private frame after COW fault"
     );
-    assert!(child_mapping.flags.write, "child's new private frame must be writable");
+    assert!(
+        child_mapping.flags.write,
+        "child's new private frame must be writable"
+    );
 
     // Parent's mapping must still point to the original shared frame.
     let parent_mapping = state
         .with_user_spaces(|spaces| {
-            spaces.get(parent_asid).and_then(|a| a.resolve(VirtAddr(0x5000)))
+            spaces
+                .get(parent_asid)
+                .and_then(|a| a.resolve(VirtAddr(0x5000)))
         })
         .expect("parent mapping after child fault");
     assert_eq!(
@@ -7313,7 +7445,9 @@ fn fork_cow_write_fault_does_not_reclaim_shared_frame_while_parent_maps() {
         .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x6000), PageFlags::USER_RW)
         .expect("map parent");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
     // Child writes → COW split.
     state
@@ -7326,7 +7460,9 @@ fn fork_cow_write_fault_does_not_reclaim_shared_frame_while_parent_maps() {
         "shared frame must not be reclaimed while parent still maps it"
     );
     assert!(
-        state.is_user_page_mapped_in_asid(parent_asid, VirtAddr(0x6000)).unwrap_or(false),
+        state
+            .is_user_page_mapped_in_asid(parent_asid, VirtAddr(0x6000))
+            .unwrap_or(false),
         "parent mapping must be intact after child COW fault"
     );
 
@@ -7357,7 +7493,14 @@ fn fork_failed_clone_restores_parent_write_permissions() {
     for page in 0..writable_pages {
         let va = VirtAddr(0x10_0000 + (page * PAGE_SIZE) as u64);
         state
-            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .map_user_page_in_asid_raw(
+                parent_asid,
+                va,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
             .expect("map parent page");
     }
 
@@ -7400,7 +7543,14 @@ fn fork_failed_clone_leaves_no_parent_cow_records() {
     for page in 0..writable_pages {
         let va = VirtAddr(0x20_0000 + (page * PAGE_SIZE) as u64);
         state
-            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .map_user_page_in_asid_raw(
+                parent_asid,
+                va,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
             .expect("map");
     }
 
@@ -7428,12 +7578,27 @@ fn fork_read_only_page_shared_without_cow_marking() {
     let phys = state
         .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
         .expect("phys");
-    let ro_flags = PageFlags { read: true, write: false, execute: false, user: true, cache_policy: CachePolicy::WriteBack };
+    let ro_flags = PageFlags {
+        read: true,
+        write: false,
+        execute: false,
+        user: true,
+        cache_policy: CachePolicy::WriteBack,
+    };
     state
-        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x7000), Mapping { phys, flags: ro_flags })
+        .map_user_page_in_asid_raw(
+            parent_asid,
+            VirtAddr(0x7000),
+            Mapping {
+                phys,
+                flags: ro_flags,
+            },
+        )
         .expect("map ro");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
     // Neither parent nor child should have a COW record for this page.
     assert!(
@@ -7447,7 +7612,9 @@ fn fork_read_only_page_shared_without_cow_marking() {
 
     // Child should still see the page mapped.
     assert!(
-        state.is_user_page_mapped_in_asid(child_asid, VirtAddr(0x7000)).unwrap_or(false),
+        state
+            .is_user_page_mapped_in_asid(child_asid, VirtAddr(0x7000))
+            .unwrap_or(false),
         "child must have the read-only page mapped"
     );
 
@@ -7470,7 +7637,9 @@ fn fork_cow_split_old_frame_eventually_freed_after_both_exit() {
             ..Default::default()
         })
         .expect("parent");
-    state.yield_current_to(ThreadId(51)).expect("switch to task51");
+    state
+        .yield_current_to(ThreadId(51))
+        .expect("switch to task51");
 
     let (shared_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
     state
@@ -7511,7 +7680,10 @@ fn fork_cow_split_old_frame_eventually_freed_after_both_exit() {
     // Child exits: destroy child asid, revoke child caps for shared_mo.
     let _ = state.destroy_user_address_space_by_asid(child_asid);
     let child_cnode = state.task_cnode(child_tid).expect("child cnode");
-    for (cap_id, cap) in state.snapshot_live_capabilities_for_task(child_tid).expect("caps") {
+    for (cap_id, cap) in state
+        .snapshot_live_capabilities_for_task(child_tid)
+        .expect("caps")
+    {
         if matches!(cap.object, CapObject::MemoryObject { id } if id == shared_mo_id) {
             let _ = state.revoke_capability_in_cnode(child_cnode, cap_id);
         }
@@ -7556,7 +7728,9 @@ fn cow_clone_copies_parent_content_to_child() {
         .write_user_memory_for_asid(parent_asid, 0x1000, &[0xAA, 0xBB, 0xCC])
         .expect("write parent content");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
     let child_bytes = state
         .read_user_memory_for_asid(child_asid, 0x1000, 3)
@@ -7587,7 +7761,9 @@ fn cow_fault_preserves_parent_content_and_copies_to_child() {
             ..Default::default()
         })
         .expect("parent");
-    state.yield_current_to(ThreadId(61)).expect("switch to task61");
+    state
+        .yield_current_to(ThreadId(61))
+        .expect("switch to task61");
 
     let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
     state
@@ -7598,7 +7774,9 @@ fn cow_fault_preserves_parent_content_and_copies_to_child() {
         .write_user_memory_for_asid(parent_asid, 0x2000, &[0x11, 0x22, 0x33])
         .expect("write parent content");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
     // Child triggers a COW fault — gets a new private frame with copied content.
     state
@@ -7645,11 +7823,20 @@ fn cow_tracked_beyond_old_array_limit() {
     for page in 0..110usize {
         let va = VirtAddr(0x30_0000 + (page * PAGE_SIZE) as u64);
         state
-            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .map_user_page_in_asid_raw(
+                parent_asid,
+                va,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
             .expect("map page");
     }
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone must succeed");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone must succeed");
 
     assert_eq!(
         state.cow_page_count(),
@@ -7681,21 +7868,40 @@ fn cow_pages_map_cleared_after_both_asids_destroyed() {
     for page in 0..4usize {
         let va = VirtAddr(0x40_0000 + (page * PAGE_SIZE) as u64);
         state
-            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .map_user_page_in_asid_raw(
+                parent_asid,
+                va,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
             .expect("map");
     }
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
     assert_eq!(state.cow_page_count(), 8, "4 pages × 2 = 8 records total");
-    assert_eq!(state.cow_asid_bucket_count(), 2, "2 ASID buckets after clone");
+    assert_eq!(
+        state.cow_asid_bucket_count(),
+        2,
+        "2 ASID buckets after clone"
+    );
 
-    state.destroy_user_address_space_by_asid(child_asid).expect("destroy child");
+    state
+        .destroy_user_address_space_by_asid(child_asid)
+        .expect("destroy child");
     assert_eq!(
         state.cow_page_count_for_asid(child_asid),
         0,
         "child COW records must be gone after child ASID destroyed"
     );
-    assert_eq!(state.cow_asid_bucket_count(), 1, "only parent bucket remains");
+    assert_eq!(
+        state.cow_asid_bucket_count(),
+        1,
+        "only parent bucket remains"
+    );
 
     // Restore parent write permissions so we can destroy it cleanly.
     for page in 0..4usize {
@@ -7703,7 +7909,11 @@ fn cow_pages_map_cleared_after_both_asids_destroyed() {
         let _ = state.try_handle_cow_fault(parent_asid, va);
     }
     let _ = state.destroy_user_address_space_by_asid(parent_asid);
-    assert_eq!(state.cow_page_count(), 0, "map must be empty after all ASIDs destroyed");
+    assert_eq!(
+        state.cow_page_count(),
+        0,
+        "map must be empty after all ASIDs destroyed"
+    );
     assert_eq!(state.cow_asid_bucket_count(), 0, "no ASID buckets remain");
 }
 
@@ -7727,7 +7937,14 @@ fn cow_fork_exit_cycles_do_not_grow_metadata() {
     for page in 0..3usize {
         let va = VirtAddr(0x50_0000 + (page * PAGE_SIZE) as u64);
         state
-            .map_user_page_in_asid_raw(parent_asid, va, Mapping { phys, flags: PageFlags::USER_RW })
+            .map_user_page_in_asid_raw(
+                parent_asid,
+                va,
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
             .expect("map");
     }
 
@@ -7735,8 +7952,14 @@ fn cow_fork_exit_cycles_do_not_grow_metadata() {
         let child_asid = state
             .clone_user_address_space_cow(parent_asid)
             .unwrap_or_else(|e| panic!("clone cycle {cycle} failed: {e:?}"));
-        assert_eq!(state.cow_asid_bucket_count(), 2, "cycle {cycle}: 2 buckets after clone");
-        state.destroy_user_address_space_by_asid(child_asid).expect("destroy child");
+        assert_eq!(
+            state.cow_asid_bucket_count(),
+            2,
+            "cycle {cycle}: 2 buckets after clone"
+        );
+        state
+            .destroy_user_address_space_by_asid(child_asid)
+            .expect("destroy child");
         // After child destroy, parent still has its COW records; restore write
         // permissions before next cycle so parent can be re-cloned.
         for page in 0..3usize {
@@ -7747,7 +7970,10 @@ fn cow_fork_exit_cycles_do_not_grow_metadata() {
                 .map_user_page_in_asid_raw(
                     parent_asid,
                     va,
-                    Mapping { phys, flags: PageFlags::USER_RW },
+                    Mapping {
+                        phys,
+                        flags: PageFlags::USER_RW,
+                    },
                 )
                 .expect("re-map for next cycle");
         }
@@ -7772,16 +7998,35 @@ fn cow_child_exits_first_parent_records_intact() {
         .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
         .expect("phys");
     state
-        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x1000), Mapping { phys, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            parent_asid,
+            VirtAddr(0x1000),
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
     assert_eq!(state.cow_page_count_for_asid(parent_asid), 1);
     assert_eq!(state.cow_page_count_for_asid(child_asid), 1);
 
-    state.destroy_user_address_space_by_asid(child_asid).expect("destroy child");
-    assert_eq!(state.cow_page_count_for_asid(child_asid), 0, "child records gone");
-    assert_eq!(state.cow_page_count_for_asid(parent_asid), 1, "parent record intact");
+    state
+        .destroy_user_address_space_by_asid(child_asid)
+        .expect("destroy child");
+    assert_eq!(
+        state.cow_page_count_for_asid(child_asid),
+        0,
+        "child records gone"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(parent_asid),
+        1,
+        "parent record intact"
+    );
 
     // Parent's COW record is still active — is_cow_page must return true.
     assert!(
@@ -7803,14 +8048,33 @@ fn cow_parent_exits_first_child_records_intact() {
         .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
         .expect("phys");
     state
-        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x2000), Mapping { phys, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            parent_asid,
+            VirtAddr(0x2000),
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
-    state.destroy_user_address_space_by_asid(parent_asid).expect("destroy parent");
-    assert_eq!(state.cow_page_count_for_asid(parent_asid), 0, "parent records gone");
-    assert_eq!(state.cow_page_count_for_asid(child_asid), 1, "child record intact");
+    state
+        .destroy_user_address_space_by_asid(parent_asid)
+        .expect("destroy parent");
+    assert_eq!(
+        state.cow_page_count_for_asid(parent_asid),
+        0,
+        "parent records gone"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(child_asid),
+        1,
+        "child record intact"
+    );
 
     assert!(
         state.is_cow_page(child_asid, VirtAddr(0x2000)),
@@ -7843,10 +8107,17 @@ fn cow_split_success_removes_faulting_record() {
         .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x3000), PageFlags::USER_RW)
         .expect("map");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
 
-    assert!(state.is_cow_page(child_asid, VirtAddr(0x3000)), "child page is COW before fault");
-    state.try_handle_cow_fault(child_asid, VirtAddr(0x3000)).expect("cow fault");
+    assert!(
+        state.is_cow_page(child_asid, VirtAddr(0x3000)),
+        "child page is COW before fault"
+    );
+    state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x3000))
+        .expect("cow fault");
     assert!(
         !state.is_cow_page(child_asid, VirtAddr(0x3000)),
         "child COW record removed after successful split"
@@ -7881,27 +8152,48 @@ fn cow_both_sides_split_independently() {
             ..Default::default()
         })
         .expect("helper");
-    state.yield_current_to(ThreadId(169)).expect("switch to 169");
+    state
+        .yield_current_to(ThreadId(169))
+        .expect("switch to 169");
 
     let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
     // Map the test page directly in parent_asid; helper_asid stack pages
     // are never COW-marked because we clone parent_asid, not helper_asid.
-    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
     state
-        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x4000), Mapping { phys, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            parent_asid,
+            VirtAddr(0x4000),
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
     assert_eq!(state.cow_page_count(), 2);
 
     // Child splits first.
-    state.try_handle_cow_fault(child_asid, VirtAddr(0x4000)).expect("child fault");
-    assert_eq!(state.cow_page_count(), 1, "child record gone, parent remains");
+    state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x4000))
+        .expect("child fault");
+    assert_eq!(
+        state.cow_page_count(),
+        1,
+        "child record gone, parent remains"
+    );
     assert!(!state.is_cow_page(child_asid, VirtAddr(0x4000)));
     assert!(state.is_cow_page(parent_asid, VirtAddr(0x4000)));
 
     // Parent splits.
-    state.try_handle_cow_fault(parent_asid, VirtAddr(0x4000)).expect("parent fault");
+    state
+        .try_handle_cow_fault(parent_asid, VirtAddr(0x4000))
+        .expect("parent fault");
     assert_eq!(state.cow_page_count(), 0, "both records gone");
     assert_eq!(state.cow_asid_bucket_count(), 0, "no ASID buckets remain");
 
@@ -7921,27 +8213,56 @@ fn cow_duplicate_mark_is_idempotent() {
         .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
         .expect("phys");
     state
-        .map_user_page_in_asid_raw(asid, VirtAddr(0x5000), Mapping { phys, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            asid,
+            VirtAddr(0x5000),
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map");
 
     // Manually mark the same page twice.
-    let child_asid = state.clone_user_address_space_cow(asid).expect("first clone");
+    let child_asid = state
+        .clone_user_address_space_cow(asid)
+        .expect("first clone");
     let _ = state.destroy_user_address_space_by_asid(child_asid);
 
     // Re-protect parent for second clone.
     let phys2 = state
         .with_user_spaces(|spaces| {
-            spaces.get(asid).and_then(|a| a.resolve(VirtAddr(0x5000))).map(|m| m.phys)
+            spaces
+                .get(asid)
+                .and_then(|a| a.resolve(VirtAddr(0x5000)))
+                .map(|m| m.phys)
         })
         .unwrap_or(phys);
     state
-        .map_user_page_in_asid_raw(asid, VirtAddr(0x5000), Mapping { phys: phys2, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            asid,
+            VirtAddr(0x5000),
+            Mapping {
+                phys: phys2,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("re-map");
 
-    let child_asid2 = state.clone_user_address_space_cow(asid).expect("second clone");
+    let child_asid2 = state
+        .clone_user_address_space_cow(asid)
+        .expect("second clone");
     // Each (asid, virt) pair appears exactly once in the BTreeSet.
-    assert_eq!(state.cow_page_count_for_asid(asid), 1, "parent has exactly 1 record");
-    assert_eq!(state.cow_page_count_for_asid(child_asid2), 1, "child has exactly 1 record");
+    assert_eq!(
+        state.cow_page_count_for_asid(asid),
+        1,
+        "parent has exactly 1 record"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(child_asid2),
+        1,
+        "child has exactly 1 record"
+    );
 
     let _ = state.destroy_user_address_space_by_asid(child_asid2);
 }
@@ -7959,32 +8280,76 @@ fn cow_asid_isolation_lookup_not_confused() {
     state.bind_task_asid(71, asid_b).expect("bind b");
 
     let (_mo_a, cap_a) = state.alloc_anonymous_memory_object().expect("mo_a");
-    let phys_a = state.resolve_memory_object_phys(cap_a, PageFlags::USER_RW).expect("phys_a");
+    let phys_a = state
+        .resolve_memory_object_phys(cap_a, PageFlags::USER_RW)
+        .expect("phys_a");
     let (_mo_b, cap_b) = state.alloc_anonymous_memory_object().expect("mo_b");
-    let phys_b = state.resolve_memory_object_phys(cap_b, PageFlags::USER_RW).expect("phys_b");
+    let phys_b = state
+        .resolve_memory_object_phys(cap_b, PageFlags::USER_RW)
+        .expect("phys_b");
 
     // Both ASIDs map the same virtual address 0x6000 (to different phys frames).
     state
-        .map_user_page_in_asid_raw(asid_a, VirtAddr(0x6000), Mapping { phys: phys_a, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            asid_a,
+            VirtAddr(0x6000),
+            Mapping {
+                phys: phys_a,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map a");
     state
-        .map_user_page_in_asid_raw(asid_b, VirtAddr(0x6000), Mapping { phys: phys_b, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            asid_b,
+            VirtAddr(0x6000),
+            Mapping {
+                phys: phys_b,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map b");
 
     let child_a = state.clone_user_address_space_cow(asid_a).expect("clone_a");
     let child_b = state.clone_user_address_space_cow(asid_b).expect("clone_b");
 
     // Mark ASID-A's page COW (it was done by clone); verify it doesn't bleed to ASID-B.
-    assert!(state.is_cow_page(asid_a, VirtAddr(0x6000)), "asid_a page is COW");
-    assert!(state.is_cow_page(asid_b, VirtAddr(0x6000)), "asid_b page is COW");
-    assert!(state.is_cow_page(child_a, VirtAddr(0x6000)), "child_a page is COW");
-    assert!(state.is_cow_page(child_b, VirtAddr(0x6000)), "child_b page is COW");
+    assert!(
+        state.is_cow_page(asid_a, VirtAddr(0x6000)),
+        "asid_a page is COW"
+    );
+    assert!(
+        state.is_cow_page(asid_b, VirtAddr(0x6000)),
+        "asid_b page is COW"
+    );
+    assert!(
+        state.is_cow_page(child_a, VirtAddr(0x6000)),
+        "child_a page is COW"
+    );
+    assert!(
+        state.is_cow_page(child_b, VirtAddr(0x6000)),
+        "child_b page is COW"
+    );
 
     // Destroy child_a — must not affect asid_b or child_b records.
-    state.destroy_user_address_space_by_asid(child_a).expect("destroy child_a");
-    assert_eq!(state.cow_page_count_for_asid(child_a), 0, "child_a records gone");
-    assert_eq!(state.cow_page_count_for_asid(child_b), 1, "child_b record untouched");
-    assert_eq!(state.cow_page_count_for_asid(asid_b), 1, "asid_b record untouched");
+    state
+        .destroy_user_address_space_by_asid(child_a)
+        .expect("destroy child_a");
+    assert_eq!(
+        state.cow_page_count_for_asid(child_a),
+        0,
+        "child_a records gone"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(child_b),
+        1,
+        "child_b record untouched"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(asid_b),
+        1,
+        "asid_b record untouched"
+    );
 
     let _ = state.destroy_user_address_space_by_asid(child_b);
     let _ = state.destroy_user_address_space_by_asid(asid_a);
@@ -8003,19 +8368,37 @@ fn cow_large_asid_clear_leaves_other_asid_intact() {
     state.bind_task_asid(73, asid_b).expect("bind b");
 
     let (_mo_a, cap_a) = state.alloc_anonymous_memory_object().expect("mo_a");
-    let phys_a = state.resolve_memory_object_phys(cap_a, PageFlags::USER_RW).expect("phys_a");
+    let phys_a = state
+        .resolve_memory_object_phys(cap_a, PageFlags::USER_RW)
+        .expect("phys_a");
     let (_mo_b, cap_b) = state.alloc_anonymous_memory_object().expect("mo_b");
-    let phys_b = state.resolve_memory_object_phys(cap_b, PageFlags::USER_RW).expect("phys_b");
+    let phys_b = state
+        .resolve_memory_object_phys(cap_b, PageFlags::USER_RW)
+        .expect("phys_b");
 
     // Map 50 pages in asid_a and 1 page in asid_b at different virtual addresses.
     for page in 0..50usize {
         let va = VirtAddr(0x70_0000 + (page * PAGE_SIZE) as u64);
         state
-            .map_user_page_in_asid_raw(asid_a, va, Mapping { phys: phys_a, flags: PageFlags::USER_RW })
+            .map_user_page_in_asid_raw(
+                asid_a,
+                va,
+                Mapping {
+                    phys: phys_a,
+                    flags: PageFlags::USER_RW,
+                },
+            )
             .expect("map a");
     }
     state
-        .map_user_page_in_asid_raw(asid_b, VirtAddr(0x80_0000), Mapping { phys: phys_b, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            asid_b,
+            VirtAddr(0x80_0000),
+            Mapping {
+                phys: phys_b,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map b");
 
     let child_a = state.clone_user_address_space_cow(asid_a).expect("clone_a");
@@ -8027,10 +8410,24 @@ fn cow_large_asid_clear_leaves_other_asid_intact() {
     assert_eq!(state.cow_page_count_for_asid(child_b), 1);
 
     // Destroy child_a (50-record bucket) — O(log num_asids) bucket removal.
-    state.destroy_user_address_space_by_asid(child_a).expect("destroy child_a");
-    assert_eq!(state.cow_page_count_for_asid(child_a), 0, "child_a records gone");
-    assert_eq!(state.cow_page_count_for_asid(asid_b), 1, "asid_b unaffected");
-    assert_eq!(state.cow_page_count_for_asid(child_b), 1, "child_b unaffected");
+    state
+        .destroy_user_address_space_by_asid(child_a)
+        .expect("destroy child_a");
+    assert_eq!(
+        state.cow_page_count_for_asid(child_a),
+        0,
+        "child_a records gone"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(asid_b),
+        1,
+        "asid_b unaffected"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(child_b),
+        1,
+        "child_b unaffected"
+    );
 
     let _ = state.destroy_user_address_space_by_asid(child_b);
     let _ = state.destroy_user_address_space_by_asid(asid_a);
@@ -8047,9 +8444,18 @@ fn cow_map_empty_bucket_removed_after_last_entry_cleared() {
     state.bind_task_asid(74, parent_asid).expect("bind");
 
     let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
     state
-        .map_user_page_in_asid_raw(parent_asid, VirtAddr(0x9000), Mapping { phys, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            parent_asid,
+            VirtAddr(0x9000),
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map");
 
     let (helper_asid75, _) = state.create_user_address_space().expect("helper asid75");
@@ -8065,17 +8471,35 @@ fn cow_map_empty_bucket_removed_after_last_entry_cleared() {
         .expect("helper task for cnode");
     state.yield_current_to(ThreadId(75)).expect("switch to 75");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("clone");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
     assert_eq!(state.cow_asid_bucket_count(), 2, "2 buckets after clone");
 
     // COW-fault the child page: removes child's entry, collapses empty bucket.
-    state.try_handle_cow_fault(child_asid, VirtAddr(0x9000)).expect("child cow fault");
-    assert_eq!(state.cow_page_count_for_asid(child_asid), 0, "child entry removed");
-    assert_eq!(state.cow_asid_bucket_count(), 1, "empty child bucket collapsed");
+    state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x9000))
+        .expect("child cow fault");
+    assert_eq!(
+        state.cow_page_count_for_asid(child_asid),
+        0,
+        "child entry removed"
+    );
+    assert_eq!(
+        state.cow_asid_bucket_count(),
+        1,
+        "empty child bucket collapsed"
+    );
 
     // COW-fault the parent page (it re-mapped itself after the child split).
-    state.try_handle_cow_fault(parent_asid, VirtAddr(0x9000)).expect("parent cow fault");
-    assert_eq!(state.cow_page_count_for_asid(parent_asid), 0, "parent entry removed");
+    state
+        .try_handle_cow_fault(parent_asid, VirtAddr(0x9000))
+        .expect("parent cow fault");
+    assert_eq!(
+        state.cow_page_count_for_asid(parent_asid),
+        0,
+        "parent entry removed"
+    );
     assert_eq!(state.cow_asid_bucket_count(), 0, "all buckets gone");
 
     let _ = state.destroy_user_address_space_by_asid(child_asid);
@@ -8596,8 +9020,7 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
     let meta_ptr: usize = 0x4080;
 
     // Main endpoint: task 0 (PM) sends requests, task 1 (VFS) receives.
-    let (_ep_eid, ep_send_cap, ep_recv_cap) =
-        state.create_endpoint(2).expect("ipc endpoint");
+    let (_ep_eid, ep_send_cap, ep_recv_cap) = state.create_endpoint(2).expect("ipc endpoint");
     let ep_recv_cap_t1 = state
         .grant_capability_task_to_task(0, ep_recv_cap, 1)
         .expect("grant ep_recv_cap to VFS");
@@ -8641,9 +9064,7 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
         );
         state
             .handle_trap(Trap::Syscall, Some(&mut recv_frame))
-            .unwrap_or_else(|err| {
-                panic!("cycle {cycle}: VFS IpcRecv handle_trap failed: {err:?}")
-            });
+            .unwrap_or_else(|err| panic!("cycle {cycle}: VFS IpcRecv handle_trap failed: {err:?}"));
         // After blocking, handle_trap calls dispatch_next_task which switches to task 0.
         assert_ne!(
             state.current_tid(),
@@ -8672,19 +9093,17 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
         let mut call_frame = TrapFrame::new(
             crate::kernel::syscall::Syscall::IpcCall as usize,
             [
-                ep_send_cap.0 as usize,     // SYSCALL_ARG_CAP (endpoint send cap)
-                0,                           // SYSCALL_ARG_PTR (no user payload; len=0)
-                0,                           // SYSCALL_ARG_LEN (0-byte payload)
-                0,                           // SYSCALL_ARG_INLINE_PAYLOAD0
-                0,                           // SYSCALL_ARG_INLINE_PAYLOAD1
-                reply_recv_cap.0 as usize,  // SYSCALL_ARG_TRANSFER_CAP (PM reply recv)
+                ep_send_cap.0 as usize,    // SYSCALL_ARG_CAP (endpoint send cap)
+                0,                         // SYSCALL_ARG_PTR (no user payload; len=0)
+                0,                         // SYSCALL_ARG_LEN (0-byte payload)
+                0,                         // SYSCALL_ARG_INLINE_PAYLOAD0
+                0,                         // SYSCALL_ARG_INLINE_PAYLOAD1
+                reply_recv_cap.0 as usize, // SYSCALL_ARG_TRANSFER_CAP (PM reply recv)
             ],
         );
         state
             .handle_trap(Trap::Syscall, Some(&mut call_frame))
-            .unwrap_or_else(|err| {
-                panic!("cycle {cycle}: PM IpcCall handle_trap failed: {err:?}")
-            });
+            .unwrap_or_else(|err| panic!("cycle {cycle}: PM IpcCall handle_trap failed: {err:?}"));
         assert_eq!(
             state.current_tid(),
             Some(0),
@@ -8702,10 +9121,8 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
         let meta_bytes = state
             .read_user_memory_for_asid(asid1, meta_ptr, 40)
             .unwrap_or_else(|err| panic!("cycle {cycle}: read VFS meta failed: {err:?}"));
-        let waiter_cap_raw =
-            u64::from_le_bytes(meta_bytes[16..24].try_into().expect("cap field"));
-        let meta_flags =
-            u64::from_le_bytes(meta_bytes[24..32].try_into().expect("flags field"));
+        let waiter_cap_raw = u64::from_le_bytes(meta_bytes[16..24].try_into().expect("cap field"));
+        let meta_flags = u64::from_le_bytes(meta_bytes[24..32].try_into().expect("flags field"));
         assert_ne!(
             waiter_cap_raw,
             crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
@@ -8730,9 +9147,7 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
         let reply_msg = Message::new(1, b"ok").expect("reply msg");
         state
             .ipc_reply(waiter_reply_cap, reply_msg)
-            .unwrap_or_else(|err| {
-                panic!("cycle {cycle}: VFS ipc_reply failed: {err:?}")
-            });
+            .unwrap_or_else(|err| panic!("cycle {cycle}: VFS ipc_reply failed: {err:?}"));
 
         // ── Step 8: task 0 (PM) drains the reply ─────────────────────────────
         // yield_current from task 1 → on_preempt re-enqueues task 1 → task 0 dispatched.
@@ -8754,7 +9169,9 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
     // If direct-mint works correctly, ipc_reply fast-revokes the minted Reply cap
     // each cycle → occupancy returns to baseline (no cumulative leak).
     while state.current_tid() != Some(1) {
-        state.yield_current().expect("switch to VFS final occupancy check");
+        state
+            .yield_current()
+            .expect("switch to VFS final occupancy check");
     }
     let final_t1_occupancy = state
         .cnode_occupied_slots(t1_cnode)
@@ -8774,9 +9191,7 @@ fn run_ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
         .expect("PM cnode exhausted after 1536 direct-mint cycles");
     state
         .grant_capability_task_to_task(0, probe_recv, 1)
-        .expect(
-            "VFS cnode exhausted after 1536 direct-mint cycles: Reply cap slot leak detected",
-        );
+        .expect("VFS cnode exhausted after 1536 direct-mint cycles: Reply cap slot leak detected");
 }
 
 // ── Phase 3A: ipc_reply transfer-cap tests ────────────────────────────────────
@@ -8813,12 +9228,24 @@ fn run_ipc_reply_with_cap_materializes_receiver_local_memory_object_cap() {
     // Map buffers for both tasks.  task 0 buffer at 0x3000 (payload+meta),
     // task 1 buffer at 0x4000 (recv payload+meta + reply payload).
     state
-        .map_user_page(aspace0, VirtAddr(0x3000),
-            Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace0,
+            VirtAddr(0x3000),
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map task0 page");
     state
-        .map_user_page(aspace1, VirtAddr(0x4000),
-            Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x4000),
+            Mapping {
+                phys: PhysAddr(0xB000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map task1 page");
 
     // Request endpoint (task 0 → task 1) and reply endpoint (task 1 → task 0).
@@ -8851,7 +9278,9 @@ fn run_ipc_reply_with_cap_materializes_receiver_local_memory_object_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [req_recv_cap_t1.0 as usize, 0x4000, 32, 0x4080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_req)).expect("task1 ipc_recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_req))
+        .expect("task1 ipc_recv");
 
     // ── Navigate to task 0 ────────────────────────────────────────────────────
     while state.current_tid() != Some(0) {
@@ -8862,14 +9291,17 @@ fn run_ipc_reply_with_cap_materializes_receiver_local_memory_object_cap() {
     let mut ipc_call_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
         [
-            req_send_cap_t0.0 as usize,   // send cap
-            0x3000,                        // payload ptr (can be zeroed)
-            0,                             // payload len = 0
-            0, 0,
+            req_send_cap_t0.0 as usize, // send cap
+            0x3000,                     // payload ptr (can be zeroed)
+            0,                          // payload len = 0
+            0,
+            0,
             reply_recv_cap_t0.0 as usize, // reply-recv cap (arg5)
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut ipc_call_frame)).expect("task0 ipc_call");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut ipc_call_frame))
+        .expect("task0 ipc_call");
 
     // ── Navigate back to task 1 ───────────────────────────────────────────────
     while state.current_tid() != Some(1) {
@@ -8877,30 +9309,42 @@ fn run_ipc_reply_with_cap_materializes_receiver_local_memory_object_cap() {
     }
 
     // Read the reply cap from the meta buffer that task 1 received.
-    let req_meta = state.read_user_memory_for_asid(asid1, 0x4080, 40).expect("read req meta");
+    let req_meta = state
+        .read_user_memory_for_asid(asid1, 0x4080, 40)
+        .expect("read req meta");
     let req_meta_flags = u64::from_le_bytes(req_meta[24..32].try_into().expect("flags"));
     assert_ne!(req_meta_flags & 1, 0, "reply-cap flag must be set");
-    let reply_cap_t1 = CapId(u64::from_le_bytes(req_meta[16..24].try_into().expect("reply cap")));
+    let reply_cap_t1 = CapId(u64::from_le_bytes(
+        req_meta[16..24].try_into().expect("reply cap"),
+    ));
     assert!(
-        state.capability_service().resolve_current_task_capability(reply_cap_t1).is_some(),
+        state
+            .capability_service()
+            .resolve_current_task_capability(reply_cap_t1)
+            .is_some(),
         "task1 must own the materialized reply cap"
     );
 
     // Write a small reply payload to task 1's memory.
-    state.write_user_memory_for_asid(asid1, 0x4000, &[0xAA, 0xBB]).expect("write payload");
+    state
+        .write_user_memory_for_asid(asid1, 0x4000, &[0xAA, 0xBB])
+        .expect("write payload");
 
     // task 1 calls ipc_reply with the MemoryObject cap as transfer cap (arg5).
     let mut ipc_reply_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcReply as usize,
         [
-            reply_cap_t1.0 as usize,     // arg0 = reply cap
-            0x4000,                       // arg1 = payload ptr
-            2,                            // arg2 = payload len
-            0, 0,
-            mo_cap_t1.0 as usize,        // arg5 = transfer cap (MemoryObject)
+            reply_cap_t1.0 as usize, // arg0 = reply cap
+            0x4000,                  // arg1 = payload ptr
+            2,                       // arg2 = payload len
+            0,
+            0,
+            mo_cap_t1.0 as usize, // arg5 = transfer cap (MemoryObject)
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut ipc_reply_frame)).expect("task1 ipc_reply");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut ipc_reply_frame))
+        .expect("task1 ipc_reply");
     assert_eq!(ipc_reply_frame.error_code(), None, "ipc_reply must succeed");
 
     // ── Navigate to task 0 ────────────────────────────────────────────────────
@@ -8913,38 +9357,51 @@ fn run_ipc_reply_with_cap_materializes_receiver_local_memory_object_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [
             reply_recv_cap_t0.0 as usize, // recv cap
-            0x3000,                        // payload ptr
-            32,                            // payload buf len
-            0x3080,                        // meta ptr
-            40,                            // meta len
+            0x3000,                       // payload ptr
+            32,                           // payload buf len
+            0x3080,                       // meta ptr
+            40,                           // meta len
             0,
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_reply_frame)).expect("task0 ipc_recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_reply_frame))
+        .expect("task0 ipc_recv");
 
     // Read back and verify.
-    let payload = state.read_user_memory_for_asid(asid0, 0x3000, 2).expect("read payload");
-    assert_eq!(&payload[..2], &[0xAA, 0xBB], "payload must be forwarded verbatim");
+    let payload = state
+        .read_user_memory_for_asid(asid0, 0x3000, 2)
+        .expect("read payload");
+    assert_eq!(
+        &payload[..2],
+        &[0xAA, 0xBB],
+        "payload must be forwarded verbatim"
+    );
 
-    let meta = state.read_user_memory_for_asid(asid0, 0x3080, 40).expect("read reply meta");
+    let meta = state
+        .read_user_memory_for_asid(asid0, 0x3080, 40)
+        .expect("read reply meta");
     let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().expect("recv_meta_flags"));
     let received_cap_id = u64::from_le_bytes(meta[16..24].try_into().expect("cap_id_field"));
 
     // SYSCALL_RECV_META_TRANSFERRED_CAP = 1 << 1 = 2
     assert_ne!(
-        recv_meta_flags & 2, 0,
+        recv_meta_flags & 2,
+        0,
         "receiver must see SYSCALL_RECV_META_TRANSFERRED_CAP flag; recv_meta_flags={}",
         recv_meta_flags
     );
     assert_ne!(
-        received_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        received_cap_id,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
         "receiver must have a materialized MemoryObject cap"
     );
 
     // Verify that task 0 now owns a MemoryObject cap.
     let received_cap = CapId(received_cap_id);
     let t0_cnode = state.current_task_cnode().expect("task0 cnode");
-    let cap_entry = state.capability_for_cnode(t0_cnode, received_cap)
+    let cap_entry = state
+        .capability_for_cnode(t0_cnode, received_cap)
         .expect("materialized cap must exist in task0's cnode");
     assert!(
         matches!(cap_entry.object, CapObject::MemoryObject { .. }),
@@ -9002,22 +9459,16 @@ fn run_reply_transfer_cap_endpoint_binding_rejects_wrong_receiver_or_forged_cont
 
     // ── Wrong endpoint ────────────────────────────────────────────────────────
     // take_transfer_envelope validates that the stored endpoint matches.
-    let not_found = state.take_transfer_envelope(
-        handle, ep2_obj, crate::kernel::ipc::ThreadId(1)
-    );
+    let not_found = state.take_transfer_envelope(handle, ep2_obj, crate::kernel::ipc::ThreadId(1));
     assert!(not_found.is_none(), "wrong endpoint must be rejected");
 
     // ── Wrong receiver ────────────────────────────────────────────────────────
-    let not_found2 = state.take_transfer_envelope(
-        handle, ep1_obj, crate::kernel::ipc::ThreadId(2)
-    );
+    let not_found2 = state.take_transfer_envelope(handle, ep1_obj, crate::kernel::ipc::ThreadId(2));
     assert!(not_found2.is_none(), "wrong receiver tid must be rejected");
 
     // ── Forged handle (bad generation) ────────────────────────────────────────
     let forged = handle ^ 0x0001_0000; // flip a generation bit
-    let not_found3 = state.take_transfer_envelope(
-        forged, ep1_obj, crate::kernel::ipc::ThreadId(1)
-    );
+    let not_found3 = state.take_transfer_envelope(forged, ep1_obj, crate::kernel::ipc::ThreadId(1));
     assert!(not_found3.is_none(), "forged handle must be rejected");
 
     // ── Correct credentials succeed ───────────────────────────────────────────
@@ -9025,13 +9476,18 @@ fn run_reply_transfer_cap_endpoint_binding_rejects_wrong_receiver_or_forged_cont
         .take_transfer_envelope(handle, ep1_obj, crate::kernel::ipc::ThreadId(1))
         .expect("correct credentials must succeed");
     assert_eq!(envelope.source_cap, mo_cap);
-    assert!(matches!(envelope.source_object, CapObject::MemoryObject { .. }));
+    assert!(matches!(
+        envelope.source_object,
+        CapObject::MemoryObject { .. }
+    ));
 
     // ── Envelope is one-shot: second take must fail ───────────────────────────
-    let second_take = state.take_transfer_envelope(
-        handle, ep1_obj, crate::kernel::ipc::ThreadId(1)
+    let second_take =
+        state.take_transfer_envelope(handle, ep1_obj, crate::kernel::ipc::ThreadId(1));
+    assert!(
+        second_take.is_none(),
+        "envelope must be consumed after first take"
     );
-    assert!(second_take.is_none(), "envelope must be consumed after first take");
 }
 
 /// Phase 3A: Verify that the initramfs FILE_GRANT_RO ipc_reply path carries the
@@ -9061,21 +9517,37 @@ fn run_initramfs_file_grant_ro_reply_carries_cap() {
     state.bind_task_asid(0, asid0).expect("bind asid0");
     state.bind_task_asid(1, asid1).expect("bind asid1");
 
-    state.map_user_page(aspace0, VirtAddr(0x5000),
-        Mapping { phys: PhysAddr(0xD000), flags: PageFlags::USER_RW })
+    state
+        .map_user_page(
+            aspace0,
+            VirtAddr(0x5000),
+            Mapping {
+                phys: PhysAddr(0xD000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map vfs page");
-    state.map_user_page(aspace1, VirtAddr(0x6000),
-        Mapping { phys: PhysAddr(0xE000), flags: PageFlags::USER_RW })
+    state
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x6000),
+            Mapping {
+                phys: PhysAddr(0xE000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map initramfs_srv page");
 
     let (_ep_id, ep_send_t0, ep_recv_global) = state.create_endpoint(4).expect("ep");
-    let ep_recv_t1 = state.grant_capability_task_to_task(0, ep_recv_global, 1)
+    let ep_recv_t1 = state
+        .grant_capability_task_to_task(0, ep_recv_global, 1)
         .expect("grant ep recv to initramfs_srv");
     let (_rep_id, _rep_send, reply_recv_t0) = state.create_endpoint(4).expect("reply ep");
 
     // MemoryObject representing the CPIO file slice (created by initramfs_srv via syscall 28).
     let (_mo_id, mo_global) = state.alloc_anonymous_memory_object().expect("alloc mo");
-    let mo_cap_t1 = state.grant_capability_task_to_task(0, mo_global, 1)
+    let mo_cap_t1 = state
+        .grant_capability_task_to_task(0, mo_global, 1)
         .expect("grant mo cap to initramfs_srv");
 
     // Enqueue task 1 only; task 0 is already the current task.
@@ -9089,7 +9561,9 @@ fn run_initramfs_file_grant_ro_reply_carries_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [ep_recv_t1.0 as usize, 0x6000, 32, 0x6080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut srv_recv)).expect("initramfs_srv ipc_recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut srv_recv))
+        .expect("initramfs_srv ipc_recv");
 
     // VFS sends the FILE_GRANT_RO request via ipc_call.
     while state.current_tid() != Some(0) {
@@ -9097,7 +9571,9 @@ fn run_initramfs_file_grant_ro_reply_carries_cap() {
     }
     // Write a 10-byte FileGrantRoArgs payload to VFS memory.
     let grant_args_bytes = [0u8; 10];
-    state.write_user_memory_for_asid(asid0, 0x5000, &grant_args_bytes).expect("write grant args");
+    state
+        .write_user_memory_for_asid(asid0, 0x5000, &grant_args_bytes)
+        .expect("write grant args");
 
     let mut call_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
@@ -9105,20 +9581,29 @@ fn run_initramfs_file_grant_ro_reply_carries_cap() {
             ep_send_t0.0 as usize,
             0x5000, // payload ptr
             10,     // payload len
-            0, 0,
+            0,
+            0,
             reply_recv_t0.0 as usize, // reply recv cap
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("vfs ipc_call");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut call_frame))
+        .expect("vfs ipc_call");
 
     // initramfs_srv wakes up, reads the reply cap from meta.
     while state.current_tid() != Some(1) {
-        state.yield_current().expect("navigate to initramfs_srv for reply");
+        state
+            .yield_current()
+            .expect("navigate to initramfs_srv for reply");
     }
-    let meta1 = state.read_user_memory_for_asid(asid1, 0x6080, 40).expect("read initramfs meta");
+    let meta1 = state
+        .read_user_memory_for_asid(asid1, 0x6080, 40)
+        .expect("read initramfs meta");
     let meta_flags1 = u64::from_le_bytes(meta1[24..32].try_into().expect("flags"));
     assert_ne!(meta_flags1 & 1, 0, "initramfs_srv must see reply-cap flag");
-    let reply_cap_t1 = CapId(u64::from_le_bytes(meta1[16..24].try_into().expect("reply cap")));
+    let reply_cap_t1 = CapId(u64::from_le_bytes(
+        meta1[16..24].try_into().expect("reply cap"),
+    ));
 
     // Write a FileGrantRoReply-like payload (12 bytes: file_len=1024, status=0).
     let file_len: u64 = 1024;
@@ -9126,21 +9611,30 @@ fn run_initramfs_file_grant_ro_reply_carries_cap() {
     let mut reply_payload = [0u8; 12];
     reply_payload[0..8].copy_from_slice(&file_len.to_le_bytes());
     reply_payload[8..12].copy_from_slice(&status.to_le_bytes());
-    state.write_user_memory_for_asid(asid1, 0x6000, &reply_payload).expect("write reply payload");
+    state
+        .write_user_memory_for_asid(asid1, 0x6000, &reply_payload)
+        .expect("write reply payload");
 
     // initramfs_srv replies with the MemoryObject cap (FLAG_CAP_TRANSFER_PLAIN path).
     let mut reply_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcReply as usize,
         [
             reply_cap_t1.0 as usize, // reply cap
-            0x6000,                   // payload ptr
-            12,                       // payload len
-            0, 0,
-            mo_cap_t1.0 as usize,    // transfer cap = MemoryObject
+            0x6000,                  // payload ptr
+            12,                      // payload len
+            0,
+            0,
+            mo_cap_t1.0 as usize, // transfer cap = MemoryObject
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut reply_frame)).expect("initramfs_srv ipc_reply");
-    assert_eq!(reply_frame.error_code(), None, "ipc_reply with cap must succeed");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut reply_frame))
+        .expect("initramfs_srv ipc_reply");
+    assert_eq!(
+        reply_frame.error_code(),
+        None,
+        "ipc_reply with cap must succeed"
+    );
 
     // VFS receives the reply.
     while state.current_tid() != Some(0) {
@@ -9150,28 +9644,50 @@ fn run_initramfs_file_grant_ro_reply_carries_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [reply_recv_t0.0 as usize, 0x5000, 32, 0x5080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut vfs_recv)).expect("vfs ipc_recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut vfs_recv))
+        .expect("vfs ipc_recv");
 
-    let reply_meta = state.read_user_memory_for_asid(asid0, 0x5080, 40).expect("read reply meta");
-    let reply_payload_recv = state.read_user_memory_for_asid(asid0, 0x5000, 12).expect("read reply payload");
-    let recv_meta_flags = u64::from_le_bytes(reply_meta[24..32].try_into().expect("recv_meta_flags"));
+    let reply_meta = state
+        .read_user_memory_for_asid(asid0, 0x5080, 40)
+        .expect("read reply meta");
+    let reply_payload_recv = state
+        .read_user_memory_for_asid(asid0, 0x5000, 12)
+        .expect("read reply payload");
+    let recv_meta_flags =
+        u64::from_le_bytes(reply_meta[24..32].try_into().expect("recv_meta_flags"));
     let received_cap_id = u64::from_le_bytes(reply_meta[16..24].try_into().expect("cap_id"));
 
     // Payload must arrive intact (no OPCODE_INLINE stripping).
-    assert_eq!(&reply_payload_recv[..12], &reply_payload[..12],
-        "FileGrantRoReply payload must be delivered verbatim without stripping");
+    assert_eq!(
+        &reply_payload_recv[..12],
+        &reply_payload[..12],
+        "FileGrantRoReply payload must be delivered verbatim without stripping"
+    );
 
     // SYSCALL_RECV_META_TRANSFERRED_CAP = 2.
-    assert_ne!(recv_meta_flags & 2, 0, "VFS must see TRANSFERRED_CAP flag; flags={}", recv_meta_flags);
-    assert_ne!(received_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
-        "VFS must receive a materialized MemoryObject cap");
+    assert_ne!(
+        recv_meta_flags & 2,
+        0,
+        "VFS must see TRANSFERRED_CAP flag; flags={}",
+        recv_meta_flags
+    );
+    assert_ne!(
+        received_cap_id,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "VFS must receive a materialized MemoryObject cap"
+    );
 
     // Verify VFS received a MemoryObject cap (has_cap=true).
     let t0_cnode = state.task_cnode(0).expect("task0 cnode");
-    let mo_entry = state.capability_for_cnode(t0_cnode, CapId(received_cap_id))
+    let mo_entry = state
+        .capability_for_cnode(t0_cnode, CapId(received_cap_id))
         .expect("materialized cap must be in VFS cnode");
-    assert!(matches!(mo_entry.object, CapObject::MemoryObject { .. }),
-        "cap must be a MemoryObject, got {:?}", mo_entry.object);
+    assert!(
+        matches!(mo_entry.object, CapObject::MemoryObject { .. }),
+        "cap must be a MemoryObject, got {:?}",
+        mo_entry.object
+    );
 }
 
 /// Phase 3A: Verify that a two-hop cap relay (server→relay→client) delivers the
@@ -9206,12 +9722,36 @@ fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
     state.bind_task_asid(2, asid2).expect("bind2");
 
     // Map buffers.
-    state.map_user_page(aspace0, VirtAddr(0x2000),
-        Mapping { phys: PhysAddr(0xF000), flags: PageFlags::USER_RW }).expect("page0");
-    state.map_user_page(aspace1, VirtAddr(0x3000),
-        Mapping { phys: PhysAddr(0x10000), flags: PageFlags::USER_RW }).expect("page1");
-    state.map_user_page(aspace2, VirtAddr(0x4000),
-        Mapping { phys: PhysAddr(0x11000), flags: PageFlags::USER_RW }).expect("page2");
+    state
+        .map_user_page(
+            aspace0,
+            VirtAddr(0x2000),
+            Mapping {
+                phys: PhysAddr(0xF000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("page0");
+    state
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x3000),
+            Mapping {
+                phys: PhysAddr(0x10000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("page1");
+    state
+        .map_user_page(
+            aspace2,
+            VirtAddr(0x4000),
+            Mapping {
+                phys: PhysAddr(0x11000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("page2");
 
     // PM → VFS endpoint and reply endpoint.
     let (_ep_pm_vfs, ep_pm_vfs_send_t0, ep_pm_vfs_recv_global) =
@@ -9256,7 +9796,9 @@ fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [ep_vfs_init_recv_t2.0 as usize, 0x4000, 32, 0x4080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut t2_recv)).expect("task2 recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut t2_recv))
+        .expect("task2 recv");
 
     // ── VFS (task 1) blocks on PM→VFS endpoint ────────────────────────────────
     while state.current_tid() != Some(1) {
@@ -9266,7 +9808,9 @@ fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [ep_pm_vfs_recv_t1.0 as usize, 0x3000, 32, 0x3080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut t1_recv_pm)).expect("task1 recv from PM");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut t1_recv_pm))
+        .expect("task1 recv from PM");
 
     // ── PM (task 0) sends request to VFS via ipc_call ─────────────────────────
     while state.current_tid() != Some(0) {
@@ -9274,37 +9818,61 @@ fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
     }
     let mut pm_call = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
-        [ep_pm_vfs_send_t0_g.0 as usize, 0x2000, 0, 0, 0,
-         reply_pm_vfs_recv_t0.0 as usize],
+        [
+            ep_pm_vfs_send_t0_g.0 as usize,
+            0x2000,
+            0,
+            0,
+            0,
+            reply_pm_vfs_recv_t0.0 as usize,
+        ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut pm_call)).expect("pm ipc_call");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut pm_call))
+        .expect("pm ipc_call");
 
     // ── VFS (task 1) forwards request to initramfs_srv ────────────────────────
     while state.current_tid() != Some(1) {
         state.yield_current().expect("nav to task1 relay forward");
     }
     // Read the PM→VFS reply cap from meta.
-    let meta_pm_vfs = state.read_user_memory_for_asid(asid1, 0x3080, 40).expect("meta_pm_vfs");
+    let meta_pm_vfs = state
+        .read_user_memory_for_asid(asid1, 0x3080, 40)
+        .expect("meta_pm_vfs");
     let flags_pm_vfs = u64::from_le_bytes(meta_pm_vfs[24..32].try_into().expect("flags"));
     assert_ne!(flags_pm_vfs & 1, 0, "VFS must see reply-cap from PM");
-    let client_reply_cap_t1 = CapId(u64::from_le_bytes(meta_pm_vfs[16..24].try_into().expect("client_reply_cap")));
+    let client_reply_cap_t1 = CapId(u64::from_le_bytes(
+        meta_pm_vfs[16..24].try_into().expect("client_reply_cap"),
+    ));
 
     // VFS calls initramfs_srv via ipc_call.
     let mut vfs_call = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
-        [ep_vfs_init_send_t1_g.0 as usize, 0x3000, 0, 0, 0,
-         reply_vfs_init_recv_t1_g.0 as usize],
+        [
+            ep_vfs_init_send_t1_g.0 as usize,
+            0x3000,
+            0,
+            0,
+            0,
+            reply_vfs_init_recv_t1_g.0 as usize,
+        ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut vfs_call)).expect("vfs ipc_call");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut vfs_call))
+        .expect("vfs ipc_call");
 
     // ── initramfs_srv (task 2) receives VFS request and replies with MO cap ───
     while state.current_tid() != Some(2) {
         state.yield_current().expect("nav to task2 reply");
     }
-    let meta_t2 = state.read_user_memory_for_asid(asid2, 0x4080, 40).expect("meta_t2");
+    let meta_t2 = state
+        .read_user_memory_for_asid(asid2, 0x4080, 40)
+        .expect("meta_t2");
     let flags_t2 = u64::from_le_bytes(meta_t2[24..32].try_into().expect("flags_t2"));
     assert_ne!(flags_t2 & 1, 0, "initramfs_srv must see reply-cap");
-    let reply_cap_t2 = CapId(u64::from_le_bytes(meta_t2[16..24].try_into().expect("reply_cap_t2")));
+    let reply_cap_t2 = CapId(u64::from_le_bytes(
+        meta_t2[16..24].try_into().expect("reply_cap_t2"),
+    ));
 
     // Write 12-byte reply payload.
     let file_len: u64 = 65536; // large enough that low bytes are zero
@@ -9312,15 +9880,30 @@ fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
     let mut payload_t2 = [0u8; 12];
     payload_t2[0..8].copy_from_slice(&file_len.to_le_bytes());
     payload_t2[8..12].copy_from_slice(&status.to_le_bytes());
-    state.write_user_memory_for_asid(asid2, 0x4000, &payload_t2).expect("write t2 payload");
+    state
+        .write_user_memory_for_asid(asid2, 0x4000, &payload_t2)
+        .expect("write t2 payload");
 
     // initramfs_srv replies with MemoryObject cap.
     let mut t2_reply = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcReply as usize,
-        [reply_cap_t2.0 as usize, 0x4000, 12, 0, 0, mo_cap_t2.0 as usize],
+        [
+            reply_cap_t2.0 as usize,
+            0x4000,
+            12,
+            0,
+            0,
+            mo_cap_t2.0 as usize,
+        ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut t2_reply)).expect("initramfs_srv ipc_reply");
-    assert_eq!(t2_reply.error_code(), None, "initramfs_srv ipc_reply must succeed");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut t2_reply))
+        .expect("initramfs_srv ipc_reply");
+    assert_eq!(
+        t2_reply.error_code(),
+        None,
+        "initramfs_srv ipc_reply must succeed"
+    );
 
     // ── VFS (task 1) receives the reply from initramfs_srv (with MO cap) ──────
     while state.current_tid() != Some(1) {
@@ -9328,49 +9911,84 @@ fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
     }
     let mut t1_recv_reply = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
-        [reply_vfs_init_recv_t1_g.0 as usize, 0x3100, 32, 0x3180, 40, 0],
+        [
+            reply_vfs_init_recv_t1_g.0 as usize,
+            0x3100,
+            32,
+            0x3180,
+            40,
+            0,
+        ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut t1_recv_reply)).expect("vfs recv reply from initramfs");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut t1_recv_reply))
+        .expect("vfs recv reply from initramfs");
 
     // VFS must have received the MemoryObject cap.
-    let meta_vfs_from_init = state.read_user_memory_for_asid(asid1, 0x3180, 40)
+    let meta_vfs_from_init = state
+        .read_user_memory_for_asid(asid1, 0x3180, 40)
         .expect("meta_vfs_from_init");
-    let flags_vfs_from_init = u64::from_le_bytes(meta_vfs_from_init[24..32].try_into().expect("flags"));
+    let flags_vfs_from_init =
+        u64::from_le_bytes(meta_vfs_from_init[24..32].try_into().expect("flags"));
     let vfs_mo_cap_id = u64::from_le_bytes(meta_vfs_from_init[16..24].try_into().expect("cap_id"));
 
-    assert_ne!(flags_vfs_from_init & 2, 0,
-        "VFS must see TRANSFERRED_CAP after initramfs_srv reply; flags={}", flags_vfs_from_init);
-    assert_ne!(vfs_mo_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
-        "VFS must receive a materialized MO cap from initramfs_srv");
+    assert_ne!(
+        flags_vfs_from_init & 2,
+        0,
+        "VFS must see TRANSFERRED_CAP after initramfs_srv reply; flags={}",
+        flags_vfs_from_init
+    );
+    assert_ne!(
+        vfs_mo_cap_id,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "VFS must receive a materialized MO cap from initramfs_srv"
+    );
 
     // Verify it's a MemoryObject in VFS's cnode.
     let t1_cnode = state.task_cnode(1).expect("t1 cnode");
-    let vfs_mo_entry = state.capability_for_cnode(t1_cnode, CapId(vfs_mo_cap_id))
+    let vfs_mo_entry = state
+        .capability_for_cnode(t1_cnode, CapId(vfs_mo_cap_id))
         .expect("VFS must own the materialized MO cap");
-    assert!(matches!(vfs_mo_entry.object, CapObject::MemoryObject { .. }),
-        "VFS-local cap must be a MemoryObject; got {:?}", vfs_mo_entry.object);
+    assert!(
+        matches!(vfs_mo_entry.object, CapObject::MemoryObject { .. }),
+        "VFS-local cap must be a MemoryObject; got {:?}",
+        vfs_mo_entry.object
+    );
 
     // Also verify payload is intact (no stripping).
-    let payload_vfs_from_init = state.read_user_memory_for_asid(asid1, 0x3100, 12)
+    let payload_vfs_from_init = state
+        .read_user_memory_for_asid(asid1, 0x3100, 12)
         .expect("payload_vfs_from_init");
-    assert_eq!(&payload_vfs_from_init[..12], &payload_t2[..12],
-        "VFS_FILE_GRANT_RO_RELAY: payload must be forwarded verbatim (no OPCODE_INLINE strip)");
+    assert_eq!(
+        &payload_vfs_from_init[..12],
+        &payload_t2[..12],
+        "VFS_FILE_GRANT_RO_RELAY: payload must be forwarded verbatim (no OPCODE_INLINE strip)"
+    );
 
     // ── VFS relays the reply (with its local MO cap) to PM ────────────────────
     // VFS must call ipc_reply with the vfs_mo_cap_id as the transfer cap.
-    state.write_user_memory_for_asid(asid1, 0x3100, &payload_t2).expect("write relay payload");
+    state
+        .write_user_memory_for_asid(asid1, 0x3100, &payload_t2)
+        .expect("write relay payload");
     let mut t1_relay_reply = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcReply as usize,
         [
             client_reply_cap_t1.0 as usize, // PM→VFS reply cap
-            0x3100,                          // payload (same FileGrantRoReply bytes)
+            0x3100,                         // payload (same FileGrantRoReply bytes)
             12,
-            0, 0,
-            vfs_mo_cap_id as usize,         // transfer cap = VFS-local MO cap
+            0,
+            0,
+            vfs_mo_cap_id as usize, // transfer cap = VFS-local MO cap
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut t1_relay_reply)).expect("vfs relay ipc_reply");
-    assert_eq!(t1_relay_reply.error_code(), None, "VFS relay ipc_reply must succeed");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut t1_relay_reply))
+        .expect("vfs relay ipc_reply");
+    assert_eq!(
+        t1_relay_reply.error_code(),
+        None,
+        "VFS relay ipc_reply must succeed"
+    );
 
     // ── PM (task 0) receives the final reply with MemoryObject cap ────────────
     while state.current_tid() != Some(0) {
@@ -9380,27 +9998,47 @@ fn run_vfs_file_grant_ro_relay_preserves_transferred_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [reply_pm_vfs_recv_t0.0 as usize, 0x2000, 32, 0x2080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut pm_recv)).expect("pm ipc_recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut pm_recv))
+        .expect("pm ipc_recv");
 
-    let pm_meta = state.read_user_memory_for_asid(asid0, 0x2080, 40).expect("pm_meta");
+    let pm_meta = state
+        .read_user_memory_for_asid(asid0, 0x2080, 40)
+        .expect("pm_meta");
     let pm_flags = u64::from_le_bytes(pm_meta[24..32].try_into().expect("pm_flags"));
     let pm_cap_id = u64::from_le_bytes(pm_meta[16..24].try_into().expect("pm_cap_id"));
-    let pm_payload = state.read_user_memory_for_asid(asid0, 0x2000, 12).expect("pm_payload");
+    let pm_payload = state
+        .read_user_memory_for_asid(asid0, 0x2000, 12)
+        .expect("pm_payload");
 
-    assert_ne!(pm_flags & 2, 0,
-        "PM must see TRANSFERRED_CAP; pm_flags={}", pm_flags);
-    assert_ne!(pm_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
-        "PM must receive a materialized cap");
+    assert_ne!(
+        pm_flags & 2,
+        0,
+        "PM must see TRANSFERRED_CAP; pm_flags={}",
+        pm_flags
+    );
+    assert_ne!(
+        pm_cap_id,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "PM must receive a materialized cap"
+    );
 
     // Payload must still be intact.
-    assert_eq!(&pm_payload[..12], &payload_t2[..12],
-        "PM_VFS_GRANT_RO_RECEIVED: FileGrantRoReply payload must arrive intact");
+    assert_eq!(
+        &pm_payload[..12],
+        &payload_t2[..12],
+        "PM_VFS_GRANT_RO_RECEIVED: FileGrantRoReply payload must arrive intact"
+    );
 
     let t0_cnode = state.task_cnode(0).expect("t0 cnode");
-    let pm_mo = state.capability_for_cnode(t0_cnode, CapId(pm_cap_id))
+    let pm_mo = state
+        .capability_for_cnode(t0_cnode, CapId(pm_cap_id))
         .expect("PM must own a materialized MO cap");
-    assert!(matches!(pm_mo.object, CapObject::MemoryObject { .. }),
-        "PM cap must be a MemoryObject; got {:?}", pm_mo.object);
+    assert!(
+        matches!(pm_mo.object, CapObject::MemoryObject { .. }),
+        "PM cap must be a MemoryObject; got {:?}",
+        pm_mo.object
+    );
 }
 
 /// Phase 3A: Specifically verify that PM receives a MemoryObject cap after the
@@ -9431,18 +10069,37 @@ fn run_pm_file_grant_ro_receives_memory_object_cap() {
     let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(0, asid0).expect("bind0");
     state.bind_task_asid(1, asid1).expect("bind1");
-    state.map_user_page(aspace0, VirtAddr(0x7000),
-        Mapping { phys: PhysAddr(0x12000), flags: PageFlags::USER_RW }).expect("pm_page");
-    state.map_user_page(aspace1, VirtAddr(0x8000),
-        Mapping { phys: PhysAddr(0x13000), flags: PageFlags::USER_RW }).expect("srv_page");
+    state
+        .map_user_page(
+            aspace0,
+            VirtAddr(0x7000),
+            Mapping {
+                phys: PhysAddr(0x12000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("pm_page");
+    state
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x8000),
+            Mapping {
+                phys: PhysAddr(0x13000),
+                flags: PageFlags::USER_RW,
+            },
+        )
+        .expect("srv_page");
 
     let (_, ep_send_t0, ep_recv_global) = state.create_endpoint(4).expect("ep");
-    let ep_recv_t1 = state.grant_capability_task_to_task(0, ep_recv_global, 1)
+    let ep_recv_t1 = state
+        .grant_capability_task_to_task(0, ep_recv_global, 1)
         .expect("grant ep recv");
     let (_, _, reply_recv_t0) = state.create_endpoint(4).expect("reply ep");
 
     let (_, mo_global) = state.alloc_anonymous_memory_object().expect("mo");
-    let mo_cap_t1 = state.grant_capability_task_to_task(0, mo_global, 1).expect("grant mo");
+    let mo_cap_t1 = state
+        .grant_capability_task_to_task(0, mo_global, 1)
+        .expect("grant mo");
 
     // Enqueue task 1 only; task 0 is already the current task.
     state.enqueue_current_cpu(1).expect("enqueue1");
@@ -9455,7 +10112,9 @@ fn run_pm_file_grant_ro_receives_memory_object_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [ep_recv_t1.0 as usize, 0x8000, 32, 0x8080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut t1_recv)).expect("t1 recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut t1_recv))
+        .expect("t1 recv");
 
     // PM sends FILE_GRANT_RO request via ipc_call.
     while state.current_tid() != Some(0) {
@@ -9463,32 +10122,60 @@ fn run_pm_file_grant_ro_receives_memory_object_cap() {
     }
     let mut pm_call = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
-        [ep_send_t0.0 as usize, 0x7000, 0, 0, 0, reply_recv_t0.0 as usize],
+        [
+            ep_send_t0.0 as usize,
+            0x7000,
+            0,
+            0,
+            0,
+            reply_recv_t0.0 as usize,
+        ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut pm_call)).expect("pm ipc_call");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut pm_call))
+        .expect("pm ipc_call");
 
     // task 1 reads reply cap and replies with MemoryObject cap.
     while state.current_tid() != Some(1) {
         state.yield_current().expect("nav to task1 reply");
     }
-    let meta1 = state.read_user_memory_for_asid(asid1, 0x8080, 40).expect("meta1");
+    let meta1 = state
+        .read_user_memory_for_asid(asid1, 0x8080, 40)
+        .expect("meta1");
     let flags1 = u64::from_le_bytes(meta1[24..32].try_into().expect("flags1"));
     assert_ne!(flags1 & 1, 0, "server must see reply-cap");
-    let reply_cap_t1 = CapId(u64::from_le_bytes(meta1[16..24].try_into().expect("reply_cap")));
+    let reply_cap_t1 = CapId(u64::from_le_bytes(
+        meta1[16..24].try_into().expect("reply_cap"),
+    ));
 
     // FileGrantRoReply payload: file_len=0x1_0000 (65536), status=0.
     // Low 2 bytes of file_len are 0x00,0x00 → opcode would be 0 even under old OPCODE_INLINE
     // stripping, but FLAG_CAP_TRANSFER_PLAIN avoids stripping entirely.
     let mut reply_payload = [0u8; 12];
     reply_payload[0..8].copy_from_slice(&65536u64.to_le_bytes());
-    state.write_user_memory_for_asid(asid1, 0x8000, &reply_payload).expect("write reply");
+    state
+        .write_user_memory_for_asid(asid1, 0x8000, &reply_payload)
+        .expect("write reply");
 
     let mut t1_reply = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcReply as usize,
-        [reply_cap_t1.0 as usize, 0x8000, 12, 0, 0, mo_cap_t1.0 as usize],
+        [
+            reply_cap_t1.0 as usize,
+            0x8000,
+            12,
+            0,
+            0,
+            mo_cap_t1.0 as usize,
+        ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut t1_reply)).expect("t1 ipc_reply");
-    assert_eq!(t1_reply.error_code(), None, "ipc_reply with cap must succeed");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut t1_reply))
+        .expect("t1 ipc_reply");
+    assert_eq!(
+        t1_reply.error_code(),
+        None,
+        "ipc_reply with cap must succeed"
+    );
 
     // PM receives reply with MO cap.
     while state.current_tid() != Some(0) {
@@ -9498,40 +10185,63 @@ fn run_pm_file_grant_ro_receives_memory_object_cap() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [reply_recv_t0.0 as usize, 0x7000, 32, 0x7080, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut pm_recv)).expect("pm recv");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut pm_recv))
+        .expect("pm recv");
 
-    let pm_meta = state.read_user_memory_for_asid(asid0, 0x7080, 40).expect("pm_meta");
+    let pm_meta = state
+        .read_user_memory_for_asid(asid0, 0x7080, 40)
+        .expect("pm_meta");
     let pm_flags = u64::from_le_bytes(pm_meta[24..32].try_into().expect("pm_flags"));
     let pm_cap_id = u64::from_le_bytes(pm_meta[16..24].try_into().expect("pm_cap_id"));
-    let pm_payload_recv = state.read_user_memory_for_asid(asid0, 0x7000, 12)
+    let pm_payload_recv = state
+        .read_user_memory_for_asid(asid0, 0x7000, 12)
         .expect("pm_payload");
 
     // PM checks: opcode == 0 (success indicator from VFS convention).
     let pm_opcode = u16::from_le_bytes(pm_meta[8..10].try_into().expect("pm_opcode"));
-    assert_eq!(pm_opcode, 0,
-        "PM_VFS_GRANT_RO_RECEIVED: grant_reply.opcode must be 0 (success); got {}", pm_opcode);
+    assert_eq!(
+        pm_opcode, 0,
+        "PM_VFS_GRANT_RO_RECEIVED: grant_reply.opcode must be 0 (success); got {}",
+        pm_opcode
+    );
 
     // PM checks: transferred_cap.is_some() == true.
-    assert_ne!(pm_flags & 2, 0,
-        "PM_VFS_GRANT_RO_RECEIVED: transferred_cap must be present; pm_flags={}", pm_flags);
-    assert_ne!(pm_cap_id, crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
-        "PM must receive a valid cap id");
+    assert_ne!(
+        pm_flags & 2,
+        0,
+        "PM_VFS_GRANT_RO_RECEIVED: transferred_cap must be present; pm_flags={}",
+        pm_flags
+    );
+    assert_ne!(
+        pm_cap_id,
+        crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP,
+        "PM must receive a valid cap id"
+    );
 
     // Payload intact: FileGrantRoReply correctly decoded.
-    assert_eq!(&pm_payload_recv[..12], &reply_payload[..12],
-        "PM_VFS_GRANT_RO_RECEIVED: FileGrantRoReply payload must arrive intact without truncation");
+    assert_eq!(
+        &pm_payload_recv[..12],
+        &reply_payload[..12],
+        "PM_VFS_GRANT_RO_RECEIVED: FileGrantRoReply payload must arrive intact without truncation"
+    );
 
     let file_len_decoded = u64::from_le_bytes(pm_payload_recv[0..8].try_into().expect("file_len"));
-    assert_eq!(file_len_decoded, 65536,
-        "file_len must be decoded correctly from intact payload");
+    assert_eq!(
+        file_len_decoded, 65536,
+        "file_len must be decoded correctly from intact payload"
+    );
 
     // PM must own a MemoryObject cap.
     let t0_cnode = state.task_cnode(0).expect("t0 cnode");
-    let pm_mo = state.capability_for_cnode(t0_cnode, CapId(pm_cap_id))
+    let pm_mo = state
+        .capability_for_cnode(t0_cnode, CapId(pm_cap_id))
         .expect("PM must own the materialized MO cap after FILE_GRANT_RO");
-    assert!(matches!(pm_mo.object, CapObject::MemoryObject { .. }),
+    assert!(
+        matches!(pm_mo.object, CapObject::MemoryObject { .. }),
         "PM_ELF_ZC: cap must be a MemoryObject for spawn_from_memory_object; got {:?}",
-        pm_mo.object);
+        pm_mo.object
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -9620,7 +10330,10 @@ fn vm_anon_map_rejects_overflow_range() {
             let addr2 = usize::MAX & !(PAGE_SIZE - 1);
             let mut frame2 = vm_anon_map_frame(addr2, PAGE_SIZE, 0x1);
             let r2 = state.handle_trap(Trap::Syscall, Some(&mut frame2));
-            assert!(syscall_failed(r2, &frame2), "page-aligned overflow range must fail");
+            assert!(
+                syscall_failed(r2, &frame2),
+                "page-aligned overflow range must fail"
+            );
         })
         .expect("spawn")
         .join()
@@ -9636,7 +10349,10 @@ fn vm_anon_map_maps_one_page_successfully() {
             let addr = 0x1_0000;
             let mut frame = vm_anon_map_frame(addr, PAGE_SIZE, 0x1);
             let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
-            assert!(syscall_succeeded(r, &frame), "single-page anon map must succeed");
+            assert!(
+                syscall_succeeded(r, &frame),
+                "single-page anon map must succeed"
+            );
             assert_eq!(frame.ret0(), addr, "ret0 must be the mapped address");
             assert_eq!(frame.ret1(), PAGE_SIZE, "ret1 must be the mapped length");
         })
@@ -9655,7 +10371,10 @@ fn vm_anon_map_maps_multiple_pages_successfully() {
             let len = 4 * PAGE_SIZE;
             let mut frame = vm_anon_map_frame(addr, len, 0x3); // PROT_READ|WRITE
             let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
-            assert!(syscall_succeeded(r, &frame), "multi-page anon map must succeed");
+            assert!(
+                syscall_succeeded(r, &frame),
+                "multi-page anon map must succeed"
+            );
             assert_eq!(frame.ret0(), addr);
             assert_eq!(frame.ret1(), len);
         })
@@ -9674,9 +10393,16 @@ fn vm_anon_map_returns_addr_and_rounded_len() {
             // PAGE_SIZE+1 rounds up to 2*PAGE_SIZE
             let mut frame = vm_anon_map_frame(addr, PAGE_SIZE + 1, 0x1);
             let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
-            assert!(syscall_succeeded(r, &frame), "non-page-multiple len must succeed");
+            assert!(
+                syscall_succeeded(r, &frame),
+                "non-page-multiple len must succeed"
+            );
             assert_eq!(frame.ret0(), addr, "ret0 must be addr");
-            assert_eq!(frame.ret1(), 2 * PAGE_SIZE, "ret1 must be rounded-up map_len");
+            assert_eq!(
+                frame.ret1(),
+                2 * PAGE_SIZE,
+                "ret1 must be rounded-up map_len"
+            );
         })
         .expect("spawn")
         .join()
@@ -9692,7 +10418,10 @@ fn vm_anon_map_rejects_unknown_prot_bits() {
             // prot=0x8 has no defined PROT bit → must fail (same as VmMap)
             let mut frame = vm_anon_map_frame(0x1000, PAGE_SIZE, 0x8);
             let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
-            assert!(syscall_failed(r, &frame), "unknown prot bits must fail like VmMap");
+            assert!(
+                syscall_failed(r, &frame),
+                "unknown prot bits must fail like VmMap"
+            );
         })
         .expect("spawn")
         .join()
@@ -9715,7 +10444,10 @@ fn vm_anon_map_preserves_stack_guard_page_behavior() {
                     guard_mem_cap,
                     VirtAddr(0x4000),
                     PageFlags {
-                        read: true, write: false, execute: false, user: true,
+                        read: true,
+                        write: false,
+                        execute: false,
+                        user: true,
                         cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
                     },
                 )
@@ -9791,7 +10523,10 @@ fn vm_anon_map_explicit_asid_map_helper_maps_and_query_returns_correct_state() {
             let explicit_unmapped = state
                 .is_user_page_mapped_in_asid(asid, unmapped_virt)
                 .expect("explicit-ASID unmapped check");
-            assert!(!explicit_unmapped, "unmapped page must not appear mapped via explicit-ASID");
+            assert!(
+                !explicit_unmapped,
+                "unmapped page must not appear mapped via explicit-ASID"
+            );
         })
         .expect("spawn")
         .join()
@@ -9854,10 +10589,7 @@ fn vm_anon_map_unmap_idempotent_on_already_unmapped_page() {
 
             // Unmap a page that was never mapped — must succeed with None.
             let result = state.unmap_user_page_in_asid(asid, virt);
-            assert!(
-                result.is_ok(),
-                "unmap of unmapped page must not return Err"
-            );
+            assert!(result.is_ok(), "unmap of unmapped page must not return Err");
             assert_eq!(
                 result.unwrap(),
                 None,
@@ -9963,7 +10695,10 @@ fn tlb_shootdown_request_plan_has_no_remote_targets_in_single_cpu() {
             let plan = state.compute_tlb_shootdown_request_plan(asid, virt);
 
             assert_eq!(plan.asid, asid, "plan must record the requested ASID");
-            assert_eq!(plan.virt, virt, "plan must record the requested virt address");
+            assert_eq!(
+                plan.virt, virt,
+                "plan must record the requested virt address"
+            );
             assert_eq!(
                 plan.target_cpu_bitmap, 0,
                 "single-CPU context: requester is the only CPU, target bitmap must be 0"
@@ -10017,23 +10752,39 @@ fn vm_page_map_progress_rollback_covers_only_mapped_range() {
             let (_, cap1) = state.alloc_anonymous_memory_object().expect("alloc 1");
             let (_, cap2) = state.alloc_anonymous_memory_object().expect("alloc 2");
             state
-                .map_user_page_in_asid_with_caps(asid, cap1, VirtAddr(base as u64), PageFlags::USER_RW)
+                .map_user_page_in_asid_with_caps(
+                    asid,
+                    cap1,
+                    VirtAddr(base as u64),
+                    PageFlags::USER_RW,
+                )
                 .expect("map page 1");
             state
-                .map_user_page_in_asid_with_caps(asid, cap2, VirtAddr(page2 as u64), PageFlags::USER_RW)
+                .map_user_page_in_asid_with_caps(
+                    asid,
+                    cap2,
+                    VirtAddr(page2 as u64),
+                    PageFlags::USER_RW,
+                )
                 .expect("map page 2");
 
             // Confirm initial state: pages 1 and 2 mapped, page 3 not.
             assert!(
-                state.is_user_page_mapped_in_asid(asid, VirtAddr(base as u64)).expect("pre-check 1"),
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(base as u64))
+                    .expect("pre-check 1"),
                 "page 1 must be mapped"
             );
             assert!(
-                state.is_user_page_mapped_in_asid(asid, VirtAddr(page2 as u64)).expect("pre-check 2"),
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(page2 as u64))
+                    .expect("pre-check 2"),
                 "page 2 must be mapped"
             );
             assert!(
-                !state.is_user_page_mapped_in_asid(asid, VirtAddr(page3 as u64)).expect("pre-check 3"),
+                !state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(page3 as u64))
+                    .expect("pre-check 3"),
                 "page 3 must not be mapped"
             );
 
@@ -10045,15 +10796,21 @@ fn vm_page_map_progress_rollback_covers_only_mapped_range() {
 
             // After rollback of page 1 only: page 2 must remain mapped.
             assert!(
-                !state.is_user_page_mapped_in_asid(asid, VirtAddr(base as u64)).expect("post-check 1"),
+                !state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(base as u64))
+                    .expect("post-check 1"),
                 "page 1 must be unmapped after partial rollback"
             );
             assert!(
-                state.is_user_page_mapped_in_asid(asid, VirtAddr(page2 as u64)).expect("post-check 2"),
+                state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(page2 as u64))
+                    .expect("post-check 2"),
                 "page 2 must remain mapped (rollback did not reach it)"
             );
             assert!(
-                !state.is_user_page_mapped_in_asid(asid, VirtAddr(page3 as u64)).expect("post-check 3"),
+                !state
+                    .is_user_page_mapped_in_asid(asid, VirtAddr(page3 as u64))
+                    .expect("post-check 3"),
                 "page 3 was never mapped and must remain absent"
             );
         })
@@ -10223,8 +10980,14 @@ fn tlb_shootdown_wait_plan_captures_correct_phys_and_fields() {
                 .expect("unmap_page_phase1 must not error");
             let plan = plan.expect("plan must be Some for a mapped page");
 
-            assert_eq!(plan.asid, asid, "plan must record the ASID of the unmapped page");
-            assert_eq!(plan.virt, virt, "plan must record the virtual address of the unmapped page");
+            assert_eq!(
+                plan.asid, asid,
+                "plan must record the ASID of the unmapped page"
+            );
+            assert_eq!(
+                plan.virt, virt,
+                "plan must record the virtual address of the unmapped page"
+            );
             assert_eq!(
                 plan.phys, expected_phys,
                 "plan must carry the physical frame to reclaim in phase 3"
@@ -10460,7 +11223,12 @@ fn vm_brk_two_phase_shrink_removes_mapped_pages_and_updates_bounds() {
             for virt in [page1, page2, page3] {
                 let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
                 state
-                    .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(virt as u64), PageFlags::USER_RW)
+                    .map_user_page_in_asid_with_caps(
+                        asid,
+                        cap,
+                        VirtAddr(virt as u64),
+                        PageFlags::USER_RW,
+                    )
                     .expect("map page");
             }
             state
@@ -10483,7 +11251,8 @@ fn vm_brk_two_phase_shrink_removes_mapped_pages_and_updates_bounds() {
                     !state
                         .is_user_page_mapped_in_asid(asid, VirtAddr(virt as u64))
                         .expect("post-shrink check"),
-                    "page at {:#x} must not be mapped after two-phase shrink", virt
+                    "page at {:#x} must not be mapped after two-phase shrink",
+                    virt
                 );
             }
             assert_eq!(
@@ -10515,7 +11284,12 @@ fn vm_brk_two_phase_shrink_non_page_aligned_preserves_partial_page() {
             for virt in [base, page2] {
                 let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
                 state
-                    .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(virt as u64), PageFlags::USER_RW)
+                    .map_user_page_in_asid_with_caps(
+                        asid,
+                        cap,
+                        VirtAddr(virt as u64),
+                        PageFlags::USER_RW,
+                    )
                     .expect("map page");
             }
             state
@@ -10579,7 +11353,12 @@ fn vm_brk_two_phase_shrink_empty_unmap_range_preserves_page() {
 
             let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
             state
-                .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(base as u64), PageFlags::USER_RW)
+                .map_user_page_in_asid_with_caps(
+                    asid,
+                    cap,
+                    VirtAddr(base as u64),
+                    PageFlags::USER_RW,
+                )
                 .expect("map page");
             state
                 .set_task_brk_bounds(0, base, brk_end)
@@ -10678,7 +11457,12 @@ fn vm_brk_two_phase_shrink_single_page_updates_to_base() {
 
             let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
             state
-                .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(base as u64), PageFlags::USER_RW)
+                .map_user_page_in_asid_with_caps(
+                    asid,
+                    cap,
+                    VirtAddr(base as u64),
+                    PageFlags::USER_RW,
+                )
                 .expect("map page");
             state
                 .set_task_brk_bounds(0, base, brk_end)
@@ -10748,7 +11532,8 @@ fn vm_anon_map_stage6_plan_first_asid_maps_pages_correctly() {
                     state
                         .is_user_page_mapped_in_asid(asid, virt)
                         .expect("page check"),
-                    "page at offset {} must be mapped after stage-6 anon map", i
+                    "page at offset {} must be mapped after stage-6 anon map",
+                    i
                 );
             }
         })
@@ -10831,7 +11616,8 @@ fn vm_anon_map_stage6_rollback_two_phase_removes_pages() {
                     !state
                         .is_user_page_mapped_in_asid(asid, virt)
                         .expect("post-rollback check"),
-                    "page at {:#x} must be absent after two-phase rollback", virt.0
+                    "page at {:#x} must be absent after two-phase rollback",
+                    virt.0
                 );
             }
         })
@@ -11140,7 +11926,10 @@ fn transfer_release_stage7_multi_page_all_unmapped() {
                 [caps[0].0 as usize, 0, 0, 0, 0, 0],
             );
             let r = state.handle_trap(Trap::Syscall, Some(&mut frame));
-            assert!(syscall_succeeded(r, &frame), "multi-page release must succeed");
+            assert!(
+                syscall_succeeded(r, &frame),
+                "multi-page release must succeed"
+            );
 
             for i in 0..n_pages {
                 let virt = VirtAddr((base + i * PAGE_SIZE) as u64);
@@ -11148,7 +11937,8 @@ fn transfer_release_stage7_multi_page_all_unmapped() {
                     !state
                         .is_user_page_mapped_in_asid(asid, virt)
                         .expect("post-release check"),
-                    "page {} must be absent after multi-page TransferRelease", i
+                    "page {} must be absent after multi-page TransferRelease",
+                    i
                 );
             }
         })
@@ -11323,7 +12113,8 @@ fn map_shared_region_stage7_rollback_two_phase_on_partial_failure() {
                     !state
                         .is_user_page_mapped_in_asid(asid, virt)
                         .expect("post-rollback check"),
-                    "page at {:#x} must be absent after two-phase rollback", virt.0
+                    "page at {:#x} must be absent after two-phase rollback",
+                    virt.0
                 );
             }
         })
@@ -11352,10 +12143,7 @@ fn vm_anon_map_stage9_success_pages_have_correct_refcounts() {
             let (mut state, _asid) = setup_task0_with_known_asid();
 
             let mut frame = vm_anon_map_frame(0x10_0000, 2 * PAGE_SIZE, 0x3);
-            let r = state.handle_trap(
-                crate::kernel::trap::Trap::Syscall,
-                Some(&mut frame),
-            );
+            let r = state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut frame));
             assert!(
                 syscall_succeeded(r, &frame),
                 "VmAnonMap of 2 pages must succeed"
@@ -11392,10 +12180,7 @@ fn vm_anon_map_stage9_rollback_leaves_address_space_clean() {
 
             // First: successfully map one page.
             let mut frame1 = vm_anon_map_frame(0x20_0000, PAGE_SIZE, 0x3);
-            let r1 = state.handle_trap(
-                crate::kernel::trap::Trap::Syscall,
-                Some(&mut frame1),
-            );
+            let r1 = state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut frame1));
             assert!(
                 syscall_succeeded(r1, &frame1),
                 "first VmAnonMap must succeed"
@@ -11411,10 +12196,7 @@ fn vm_anon_map_stage9_rollback_leaves_address_space_clean() {
 
             // Map again at a different address — must also succeed.
             let mut frame2 = vm_anon_map_frame(0x30_0000, PAGE_SIZE, 0x3);
-            let r2 = state.handle_trap(
-                crate::kernel::trap::Trap::Syscall,
-                Some(&mut frame2),
-            );
+            let r2 = state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut frame2));
             assert!(
                 syscall_succeeded(r2, &frame2),
                 "second VmAnonMap at a different address must succeed"
@@ -11453,10 +12235,7 @@ fn vm_anon_map_stage9_progress_plan_base_and_end_match_args() {
             const N: usize = 4;
             let base = 0x40_0000usize;
             let mut frame = vm_anon_map_frame(base, N * PAGE_SIZE, 0x3);
-            let r = state.handle_trap(
-                crate::kernel::trap::Trap::Syscall,
-                Some(&mut frame),
-            );
+            let r = state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut frame));
             assert!(
                 syscall_succeeded(r, &frame),
                 "multi-page VmAnonMap must succeed"
@@ -11492,16 +12271,11 @@ fn vm_anon_map_stage9_rollback_cap_freed_after_unmap() {
 
             // Map one page via VmAnonMap.
             let mut frame = vm_anon_map_frame(0x50_0000, PAGE_SIZE, 0x3);
-            let r = state.handle_trap(
-                crate::kernel::trap::Trap::Syscall,
-                Some(&mut frame),
-            );
+            let r = state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut frame));
             assert!(syscall_succeeded(r, &frame), "VmAnonMap must succeed");
 
             // Record how many MemoryObjects exist before cleanup.
-            let before = state.with_memory_state(|mem| {
-                mem.memory_objects.iter().flatten().count()
-            });
+            let before = state.with_memory_state(|mem| mem.memory_objects.iter().flatten().count());
 
             // Simulate rollback: phase-1 unmap, find cap, revoke, shootdown.
             let virt = VirtAddr(0x50_0000);
@@ -11516,9 +12290,7 @@ fn vm_anon_map_stage9_rollback_cap_freed_after_unmap() {
             }
 
             // The MemoryObject must have been freed (count decremented by 1).
-            let after = state.with_memory_state(|mem| {
-                mem.memory_objects.iter().flatten().count()
-            });
+            let after = state.with_memory_state(|mem| mem.memory_objects.iter().flatten().count());
             assert_eq!(
                 after,
                 before - 1,
@@ -11563,7 +12335,10 @@ fn demand_page_stage8_explicit_asid_maps_into_faulting_task_address_space() {
     state.bind_task_asid(0, asid).expect("bind");
     state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
 
-    let fault = FaultInfo { addr: VirtAddr(0x5001), access: FaultAccess::Read };
+    let fault = FaultInfo {
+        addr: VirtAddr(0x5001),
+        access: FaultAccess::Read,
+    };
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("demand page fault handled");
@@ -11587,7 +12362,10 @@ fn demand_page_stage8_task_without_asid_falls_through_to_task_fault() {
     // task 0 has no ASID bound after Bootstrap::init()
     state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
 
-    let fault = FaultInfo { addr: VirtAddr(0x5000), access: FaultAccess::Write };
+    let fault = FaultInfo {
+        addr: VirtAddr(0x5000),
+        access: FaultAccess::Write,
+    };
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("page fault handled");
@@ -11603,7 +12381,10 @@ fn demand_page_stage8_execute_fault_not_demand_mapped() {
     state.bind_task_asid(0, asid).expect("bind");
     state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
 
-    let fault = FaultInfo { addr: VirtAddr(0x5000), access: FaultAccess::Execute };
+    let fault = FaultInfo {
+        addr: VirtAddr(0x5000),
+        access: FaultAccess::Execute,
+    };
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("page fault handled");
@@ -11640,7 +12421,10 @@ fn demand_page_stage8_already_mapped_page_skips_remap() {
         .expect("pre-mapped")
         .phys;
 
-    let fault = FaultInfo { addr: VirtAddr(0x5000), access: FaultAccess::Write };
+    let fault = FaultInfo {
+        addr: VirtAddr(0x5000),
+        access: FaultAccess::Write,
+    };
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("demand page handled");
@@ -11652,7 +12436,10 @@ fn demand_page_stage8_already_mapped_page_skips_remap() {
         .resolve(VirtAddr(0x5000))
         .expect("still mapped")
         .phys;
-    assert_eq!(pre_phys, post_phys, "physical address must not change for already-mapped page");
+    assert_eq!(
+        pre_phys, post_phys,
+        "physical address must not change for already-mapped page"
+    );
     assert_eq!(state.task_status(0), Some(TaskStatus::Running));
 }
 
@@ -11665,7 +12452,10 @@ fn demand_page_stage8_mapped_page_has_user_rw_flags() {
     state.bind_task_asid(0, asid).expect("bind");
     state.set_task_brk_bounds(0, 0x1000, 0x9000).expect("brk");
 
-    let fault = FaultInfo { addr: VirtAddr(0x3001), access: FaultAccess::Write };
+    let fault = FaultInfo {
+        addr: VirtAddr(0x3001),
+        access: FaultAccess::Write,
+    };
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("demand page");
@@ -11697,7 +12487,10 @@ fn demand_page_stage8_stack_region_demand_maps() {
         }
     });
 
-    let fault = FaultInfo { addr: VirtAddr(0xFF_F001), access: FaultAccess::Write };
+    let fault = FaultInfo {
+        addr: VirtAddr(0xFF_F001),
+        access: FaultAccess::Write,
+    };
     state
         .handle_trap_event(TrapEvent::PageFault(fault), None)
         .expect("stack demand page");
@@ -11780,7 +12573,9 @@ fn vm_map_stage10_maps_into_non_current_address_space() {
             // target (target_asid) is not the current task's ASID.
             let (current_asid, _current_cap) =
                 state.create_user_address_space().expect("current aspace");
-            state.bind_task_asid(0, current_asid).expect("bind current asid");
+            state
+                .bind_task_asid(0, current_asid)
+                .expect("bind current asid");
 
             let target_va = VirtAddr(0x50_0000);
             let mut frame = TrapFrame::new(
@@ -11827,14 +12622,20 @@ fn memory_object_cap_refcount_increments_on_alloc_decrements_on_revoke() {
     let (mut state, _asid) = setup_task0_with_known_asid();
     let (mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("alloc");
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after alloc");
-    let refcount_after_alloc = state.with_memory_state(|mem| {
-        mem.memory_objects[slot].expect("obj").cap_refcount
-    });
-    assert_eq!(refcount_after_alloc, 1, "cap_refcount must be 1 after alloc");
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot after alloc");
+    let refcount_after_alloc =
+        state.with_memory_state(|mem| mem.memory_objects[slot].expect("obj").cap_refcount);
+    assert_eq!(
+        refcount_after_alloc, 1,
+        "cap_refcount must be 1 after alloc"
+    );
 
     let cnode = state.current_task_cnode().expect("cnode");
-    state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+    state
+        .revoke_capability_in_cnode(cnode, mem_cap)
+        .expect("revoke");
 
     // After revoke, the slot should be None (frame freed, object reclaimed).
     let slot_after = state.memory_object_slot_by_id(mo_id);
@@ -11863,7 +12664,11 @@ fn memory_object_map_refcount_increments_on_map_decrements_on_unmap() {
                 let o = mem.memory_objects[slot].expect("obj");
                 (o.cap_refcount, o.map_refcount)
             });
-            assert_eq!(after_map, (1, 1), "cap_refcount=1, map_refcount=1 after map");
+            assert_eq!(
+                after_map,
+                (1, 1),
+                "cap_refcount=1, map_refcount=1 after map"
+            );
 
             // Phase-1 unmap decrements map_refcount.
             let wait_plan = state
@@ -11882,10 +12687,14 @@ fn memory_object_map_refcount_increments_on_map_decrements_on_unmap() {
 
             // Revoke cap → cap_refcount=0.
             let cnode = state.current_task_cnode().expect("cnode");
-            state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+            state
+                .revoke_capability_in_cnode(cnode, mem_cap)
+                .expect("revoke");
 
             // Now execute the TLB shootdown — frame must be freed.
-            state.execute_tlb_shootdown_wait_plan(wait_plan).expect("phase2");
+            state
+                .execute_tlb_shootdown_wait_plan(wait_plan)
+                .expect("phase2");
 
             // MemoryObject must be reclaimed.
             assert!(
@@ -11917,7 +12726,9 @@ fn memory_object_frame_not_reclaimed_while_cap_refcount_nonzero() {
                 .unmap_page_phase1(asid, virt)
                 .expect("phase1")
                 .expect("was mapped");
-            state.execute_tlb_shootdown_wait_plan(wait_plan).expect("phase2");
+            state
+                .execute_tlb_shootdown_wait_plan(wait_plan)
+                .expect("phase2");
 
             // MemoryObject must still exist because cap_refcount=1.
             let slot = state.memory_object_slot_by_id(mo_id);
@@ -11928,7 +12739,9 @@ fn memory_object_frame_not_reclaimed_while_cap_refcount_nonzero() {
 
             // Now revoke the cap → cap_refcount=0, frame freed.
             let cnode = state.current_task_cnode().expect("cnode");
-            state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+            state
+                .revoke_capability_in_cnode(cnode, mem_cap)
+                .expect("revoke");
             assert!(
                 state.memory_object_slot_by_id(mo_id).is_none(),
                 "MemoryObject must be reclaimed after cap revoke"
@@ -11956,7 +12769,9 @@ fn memory_object_frame_not_reclaimed_while_map_refcount_nonzero() {
 
             // Revoke the cap (cap_refcount → 0). Page is still mapped (map_refcount=1).
             let cnode = state.current_task_cnode().expect("cnode");
-            state.revoke_capability_in_cnode(cnode, mem_cap).expect("revoke");
+            state
+                .revoke_capability_in_cnode(cnode, mem_cap)
+                .expect("revoke");
 
             // MemoryObject must still exist because map_refcount=1.
             let slot = state.memory_object_slot_by_id(mo_id);
@@ -11966,14 +12781,19 @@ fn memory_object_frame_not_reclaimed_while_map_refcount_nonzero() {
             );
             let obj = state.with_memory_state(|mem| mem.memory_objects[slot.unwrap()].unwrap());
             assert_eq!(obj.cap_refcount, 0, "cap_refcount must be 0 after revoke");
-            assert_eq!(obj.map_refcount, 1, "map_refcount must still be 1 (page still mapped)");
+            assert_eq!(
+                obj.map_refcount, 1,
+                "map_refcount must still be 1 (page still mapped)"
+            );
 
             // Unmap the page → map_refcount=0, then phase2 frees the frame.
             let wait_plan = state
                 .unmap_page_phase1(asid, virt)
                 .expect("phase1")
                 .expect("was mapped");
-            state.execute_tlb_shootdown_wait_plan(wait_plan).expect("phase2");
+            state
+                .execute_tlb_shootdown_wait_plan(wait_plan)
+                .expect("phase2");
             assert!(
                 state.memory_object_slot_by_id(mo_id).is_none(),
                 "MemoryObject must be reclaimed after both refcounts reach zero"
@@ -12009,9 +12829,8 @@ fn vm_map_stage10_rollback_via_phase1_unmap_cleans_pages() {
                 caps.push(mem_cap);
             }
 
-            let before_count = state.with_memory_state(|mem| {
-                mem.memory_objects.iter().flatten().count()
-            });
+            let before_count =
+                state.with_memory_state(|mem| mem.memory_objects.iter().flatten().count());
 
             // Roll them back exactly as rollback_anon_map does for VmMap:
             for i in 0..2 {
@@ -12026,9 +12845,8 @@ fn vm_map_stage10_rollback_via_phase1_unmap_cleans_pages() {
                 }
             }
 
-            let after_count = state.with_memory_state(|mem| {
-                mem.memory_objects.iter().flatten().count()
-            });
+            let after_count =
+                state.with_memory_state(|mem| mem.memory_objects.iter().flatten().count());
             assert_eq!(
                 after_count,
                 before_count - 2,
@@ -12040,9 +12858,7 @@ fn vm_map_stage10_rollback_via_phase1_unmap_cleans_pages() {
             for i in 0..2 {
                 let va = VirtAddr((base + i * PAGE_SIZE) as u64);
                 assert!(
-                    !state
-                        .is_user_page_mapped_in_asid(asid, va)
-                        .expect("check"),
+                    !state.is_user_page_mapped_in_asid(asid, va).expect("check"),
                     "page {} must not be mapped after rollback",
                     i
                 );
@@ -12093,7 +12909,10 @@ fn active_transfer_stage11_purge_unmaps_pages_and_frees_frames() {
 
     // Record state before purge.
     let slot_before = state.memory_object_slot_by_id(mo_id);
-    assert!(slot_before.is_some(), "MemoryObject must exist before purge");
+    assert!(
+        slot_before.is_some(),
+        "MemoryObject must exist before purge"
+    );
 
     // Purge all active mappings for pid 1 (simulates process exit).
     state.exit_task(1, 0).expect("exit task1");
@@ -12128,7 +12947,9 @@ fn active_transfer_stage11_purge_tolerates_already_unmapped_pages() {
     state.bind_task_asid(1, asid1).expect("bind1");
 
     let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-    let mem_cap_task1 = state.grant_capability_task_to_task(0, mem_cap, 1).expect("grant");
+    let mem_cap_task1 = state
+        .grant_capability_task_to_task(0, mem_cap, 1)
+        .expect("grant");
 
     state.enqueue_current_cpu(1).expect("enqueue");
     state.yield_current().expect("switch to task1");
@@ -12171,7 +12992,9 @@ fn active_transfer_stage11_purge_does_not_disturb_other_pids() {
 
     // Map and register for task1.
     let (_id1, cap1) = state.alloc_anonymous_memory_object().expect("mem1");
-    let cap1_t1 = state.grant_capability_task_to_task(0, cap1, 1).expect("grant1");
+    let cap1_t1 = state
+        .grant_capability_task_to_task(0, cap1, 1)
+        .expect("grant1");
     state.enqueue_current_cpu(1).expect("enqueue1");
     state.yield_current().expect("switch to task1");
     state
@@ -12184,7 +13007,9 @@ fn active_transfer_stage11_purge_does_not_disturb_other_pids() {
     // Map and register for task2.
     state.yield_current().expect("switch to task0");
     let (_id2, cap2) = state.alloc_anonymous_memory_object().expect("mem2");
-    let cap2_t2 = state.grant_capability_task_to_task(0, cap2, 2).expect("grant2");
+    let cap2_t2 = state
+        .grant_capability_task_to_task(0, cap2, 2)
+        .expect("grant2");
     state.enqueue_current_cpu(2).expect("enqueue2");
     state.yield_current().expect("switch to task2");
     state
@@ -12277,8 +13102,12 @@ fn active_transfer_stage11_revoke_does_not_touch_unrelated_cap_mapping() {
     // Two independent memory objects and caps for task1.
     let (_id_a, cap_a) = state.alloc_anonymous_memory_object().expect("mem_a");
     let (_id_b, cap_b) = state.alloc_anonymous_memory_object().expect("mem_b");
-    let cap_a_t1 = state.grant_capability_task_to_task(0, cap_a, 1).expect("grant_a");
-    let cap_b_t1 = state.grant_capability_task_to_task(0, cap_b, 1).expect("grant_b");
+    let cap_a_t1 = state
+        .grant_capability_task_to_task(0, cap_a, 1)
+        .expect("grant_a");
+    let cap_b_t1 = state
+        .grant_capability_task_to_task(0, cap_b, 1)
+        .expect("grant_b");
 
     state.enqueue_current_cpu(1).expect("enqueue");
     state.yield_current().expect("switch to task1");
@@ -12381,7 +13210,10 @@ fn shared_static_ref_is_consistent_with_init_result() {
                 Some(shared) => {
                     // If already init, SharedKernel::with must still work.
                     let online = shared.with(|k| k.online_cpu_count());
-                    assert!(online >= 1, "shared_static_ref returned Some with unusable state");
+                    assert!(
+                        online >= 1,
+                        "shared_static_ref returned Some with unusable state"
+                    );
                 }
             }
         })
@@ -12462,13 +13294,18 @@ fn ipc_recv_until_deadline_with_queued_message_succeeds_immediately() {
             // Message::new(sender_tid, bytes) — first arg is sender_tid, not opcode.
             let msg = Message::new(99, b"ping").expect("msg");
             // ipc_send on a buffered endpoint queues immediately (no sender-block).
-            state.ipc_send(send_cap, msg).expect("send to buffered endpoint");
+            state
+                .ipc_send(send_cap, msg)
+                .expect("send to buffered endpoint");
 
             // Message is now queued; ipc_recv_until_deadline must return it.
             let result = state
                 .ipc_recv_until_deadline(recv_cap, u64::MAX)
                 .expect("until_deadline should not fail");
-            assert!(result.is_some(), "queued message must be returned immediately");
+            assert!(
+                result.is_some(),
+                "queued message must be returned immediately"
+            );
             assert_eq!(result.unwrap().sender_tid, ThreadId(99));
         })
         .expect("spawn")
@@ -12553,7 +13390,10 @@ fn ipc_recv_with_deadline_split_bridge_returns_none_when_no_sender() {
             let (_eid, _send_cap, recv_cap) =
                 shared.with(|s| s.create_endpoint(2)).expect("endpoint");
             let result = shared.ipc_recv_with_deadline_split_bridge(recv_cap, 1);
-            assert!(result.is_ok(), "split bridge must not error with a valid cap");
+            assert!(
+                result.is_ok(),
+                "split bridge must not error with a valid cap"
+            );
             assert_eq!(result.unwrap(), None, "no sender present; must return None");
         })
         .expect("spawn")
@@ -12591,10 +13431,10 @@ fn ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none() {
 
 #[test]
 fn staged_deadline_consumed_by_recv_timeout_dispatch() {
-    use core::sync::atomic::Ordering;
     use super::super::syscall::{
-        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR, dispatch,
     };
+    use core::sync::atomic::Ordering;
     std::thread::Builder::new()
         .name("staged_deadline_consumed".into())
         .stack_size(8 * 1024 * 1024)
@@ -12649,10 +13489,10 @@ fn staged_deadline_cleared_on_try_recv_dispatch() {
     // Even when timeout_ticks == 0 (try-recv path), handle_ipc_recv_timeout
     // unconditionally swaps SPLIT_RECV_TIMEOUT_DEADLINE to 0, preventing a
     // stale deadline from being picked up by a later timed recv call.
-    use core::sync::atomic::Ordering;
     use super::super::syscall::{
-        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR, dispatch,
     };
+    use core::sync::atomic::Ordering;
     std::thread::Builder::new()
         .name("staged_deadline_cleared_try_recv".into())
         .stack_size(8 * 1024 * 1024)
@@ -12750,22 +13590,28 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     let mut recv_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [
-            recv_cap_task1.0 as usize,  // arg[0] = cap
-            payload_ptr,                 // arg[1] = payload_ptr (SYSCALL_ARG_PTR)
-            Message::MAX_PAYLOAD,        // arg[2] = payload_len (SYSCALL_ARG_LEN)
-            meta_ptr,                    // arg[3] = meta_ptr (INLINE_PAYLOAD0, != 0 → recv-v2)
-            40,                          // arg[4] = meta_len (INLINE_PAYLOAD1, >= 40 → recv-v2)
-            0,                           // arg[5]
+            recv_cap_task1.0 as usize, // arg[0] = cap
+            payload_ptr,               // arg[1] = payload_ptr (SYSCALL_ARG_PTR)
+            Message::MAX_PAYLOAD,      // arg[2] = payload_len (SYSCALL_ARG_LEN)
+            meta_ptr,                  // arg[3] = meta_ptr (INLINE_PAYLOAD0, != 0 → recv-v2)
+            40,                        // arg[4] = meta_len (INLINE_PAYLOAD1, >= 40 → recv-v2)
+            0,                         // arg[5]
         ],
     );
     // Queue is empty → task 1 blocks with blocked_recv_state.recv_abi = RecvV2.
     state
         .handle_trap(Trap::Syscall, Some(&mut recv_frame))
         .expect("recv blocks");
-    assert_eq!(state.current_tid(), Some(0), "task 0 must be current after task 1 blocks");
+    assert_eq!(
+        state.current_tid(),
+        Some(0),
+        "task 0 must be current after task 1 blocks"
+    );
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_task1))),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            recv_cap_task1
+        ))),
         "task 1 must be blocked on recv"
     );
     assert_eq!(
@@ -12784,10 +13630,10 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         crate::kernel::syscall::Syscall::IpcSend as usize,
         [
             send_cap.0 as usize,
-            0,                           // user_ptr_or_offset (0 = inline payload)
-            6,                           // len = 6
-            inline_payload_word(b"4kstg"),  // inline payload bytes [0..8]
-            0,                           // inline payload bytes [8..16] (unused)
+            0,                             // user_ptr_or_offset (0 = inline payload)
+            6,                             // len = 6
+            inline_payload_word(b"4kstg"), // inline payload bytes [0..8]
+            0,                             // inline payload bytes [8..16] (unused)
             crate::kernel::syscall::SYSCALL_NO_TRANSFER_CAP as usize,
         ],
     );
@@ -12796,7 +13642,11 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         .expect("ipc send Stage 4K");
 
     assert_eq!(send_frame.error_code(), None, "Stage 4K send must succeed");
-    assert_eq!(state.task_status(0), before_status0, "sender must not change status");
+    assert_eq!(
+        state.task_status(0),
+        before_status0,
+        "sender must not change status"
+    );
     // Receiver must be woken.
     assert_eq!(
         state.task_status(1),
@@ -12824,7 +13674,11 @@ fn run_ipc_send_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     let payload = state
         .read_user_memory_for_asid(asid1, payload_ptr, 6)
         .expect("read receiver payload");
-    assert_eq!(&payload[..6], b"4kstg\0", "Stage 4K must write payload to receiver user memory");
+    assert_eq!(
+        &payload[..6],
+        b"4kstg\0",
+        "Stage 4K must write payload to receiver user memory"
+    );
 }
 
 #[test]
@@ -12862,19 +13716,25 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
     let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind task1 asid");
     let payload_ptr = 0x3000usize;
-    let meta_ptr   = 0x4000usize;
+    let meta_ptr = 0x4000usize;
     state
         .map_user_page(
             aspace1,
             VirtAddr(payload_ptr as u64),
-            Mapping { phys: PhysAddr(0x9000), flags: PageFlags::USER_RW },
+            Mapping {
+                phys: PhysAddr(0x9000),
+                flags: PageFlags::USER_RW,
+            },
         )
         .expect("map payload page");
     state
         .map_user_page(
             aspace1,
             VirtAddr(meta_ptr as u64),
-            Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW },
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
         )
         .expect("map meta page");
 
@@ -12894,11 +13754,19 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
             0,
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_frame)).expect("recv blocks");
-    assert_eq!(state.current_tid(), Some(0), "task 0 must be current after task 1 blocks");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+        .expect("recv blocks");
+    assert_eq!(
+        state.current_tid(),
+        Some(0),
+        "task 0 must be current after task 1 blocks"
+    );
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_task1))),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            recv_cap_task1
+        ))),
         "task 1 must be blocked on recv"
     );
     assert_eq!(
@@ -12909,7 +13777,7 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
 
     // Record telemetry counters before Stage 4O delivery.
     let before_split_recv_v2 = state.ipc_path_telemetry().split_recv_v2_deliveries;
-    let before_cap_transfer   = state.ipc_path_telemetry().cap_transfer_recv_v2_deliveries;
+    let before_cap_transfer = state.ipc_path_telemetry().cap_transfer_recv_v2_deliveries;
 
     // Task 0 sends via IpcSend with transfer_cap.  Stage 4O fires: recv-v2 blocked receiver
     // → complete_blocked_recv_for_waiter delivers payload + materializes cap into task 1's
@@ -12918,14 +13786,16 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
         crate::kernel::syscall::Syscall::IpcSend as usize,
         [
             send_cap.0 as usize,
-            0,                                // user_ptr_or_offset = 0 (inline)
-            4,                                // len = 4 bytes (2-byte opcode prefix + b"4o")
+            0,                                  // user_ptr_or_offset = 0 (inline)
+            4,                                  // len = 4 bytes (2-byte opcode prefix + b"4o")
             inline_payload_word(b"\x00\x004o"), // opcode=0 (2 bytes) + payload b"4o" (2 bytes)
-            0,                                // inline payload [8..16]
-            transfer_cap.0 as usize,          // transfer cap (FLAG_CAP_TRANSFER)
+            0,                                  // inline payload [8..16]
+            transfer_cap.0 as usize,            // transfer cap (FLAG_CAP_TRANSFER)
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut send_frame)).expect("Stage 4O ipc_send");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut send_frame))
+        .expect("Stage 4O ipc_send");
 
     assert_eq!(send_frame.error_code(), None, "Stage 4O send must succeed");
 
@@ -12961,7 +13831,11 @@ fn run_ipc_send_syscall_cap_transfer_delivers_directly_to_recv_v2_blocked_receiv
     let payload_bytes = state
         .read_user_memory_for_asid(asid1, payload_ptr, 2)
         .expect("read payload");
-    assert_eq!(&payload_bytes[..2], b"4o", "Stage 4O must write payload to receiver user memory");
+    assert_eq!(
+        &payload_bytes[..2],
+        b"4o",
+        "Stage 4O must write payload to receiver user memory"
+    );
     // Meta must indicate SYSCALL_RECV_META_TRANSFERRED_CAP (bit 1).
     let meta_bytes = state
         .read_user_memory_for_asid(asid1, meta_ptr, 40)
@@ -13021,14 +13895,20 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
         .map_user_page(
             aspace_map_cap1,
             VirtAddr(payload_ptr as u64),
-            Mapping { phys: PhysAddr(0x9000), flags: PageFlags::USER_RW },
+            Mapping {
+                phys: PhysAddr(0x9000),
+                flags: PageFlags::USER_RW,
+            },
         )
         .expect("map payload page");
     state
         .map_user_page(
             aspace_map_cap1,
             VirtAddr(meta_ptr as u64),
-            Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW },
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
         )
         .expect("map meta page");
 
@@ -13039,19 +13919,27 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     let mut recv_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [
-            recv_cap_a_task1.0 as usize,  // arg[0] = recv cap
-            payload_ptr,                    // arg[1] = payload_ptr
-            Message::MAX_PAYLOAD,           // arg[2] = payload_len
-            meta_ptr,                       // arg[3] = meta_ptr (>0 → recv-v2)
-            40,                             // arg[4] = meta_len (≥40 → recv-v2)
+            recv_cap_a_task1.0 as usize, // arg[0] = recv cap
+            payload_ptr,                 // arg[1] = payload_ptr
+            Message::MAX_PAYLOAD,        // arg[2] = payload_len
+            meta_ptr,                    // arg[3] = meta_ptr (>0 → recv-v2)
+            40,                          // arg[4] = meta_len (≥40 → recv-v2)
             0,
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_frame)).expect("recv blocks");
-    assert_eq!(state.current_tid(), Some(0), "task 0 must be current after task 1 blocks");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+        .expect("recv blocks");
+    assert_eq!(
+        state.current_tid(),
+        Some(0),
+        "task 0 must be current after task 1 blocks"
+    );
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_a_task1))),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            recv_cap_a_task1
+        ))),
         "task 1 must be blocked on recv"
     );
     assert_eq!(
@@ -13067,17 +13955,23 @@ fn run_ipc_call_syscall_delivers_directly_to_recv_v2_blocked_receiver() {
     let mut call_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
         [
-            send_cap_a.0 as usize,          // arg[0] = endpoint send cap
-            0,                               // arg[1] = user_ptr (0 = inline payload path)
-            0,                               // arg[2] = payload len = 0
-            0,                               // arg[3] = inline payload word 0
-            0,                               // arg[4] = inline payload word 1
-            reply_recv_cap_b.0 as usize,    // arg[5] = reply_recv_cap
+            send_cap_a.0 as usize,       // arg[0] = endpoint send cap
+            0,                           // arg[1] = user_ptr (0 = inline payload path)
+            0,                           // arg[2] = payload len = 0
+            0,                           // arg[3] = inline payload word 0
+            0,                           // arg[4] = inline payload word 1
+            reply_recv_cap_b.0 as usize, // arg[5] = reply_recv_cap
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("ipc call Stage 4L");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut call_frame))
+        .expect("ipc call Stage 4L");
 
-    assert_eq!(call_frame.error_code(), None, "Stage 4L IpcCall must succeed");
+    assert_eq!(
+        call_frame.error_code(),
+        None,
+        "Stage 4L IpcCall must succeed"
+    );
 
     // Receiver must be woken to Runnable.
     assert_eq!(
@@ -13143,50 +14037,98 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
     state.bind_task_asid(1, asid1).expect("bind1");
     state.bind_task_asid(2, asid2).expect("bind2");
     state
-        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x3000),
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map req payload page");
     state
-        .map_user_page(aspace1, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x4000),
+            Mapping {
+                phys: PhysAddr(0xB000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map req meta page");
     state
-        .map_user_page(aspace2, VirtAddr(0x5000), Mapping { phys: PhysAddr(0xC000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace2,
+            VirtAddr(0x5000),
+            Mapping {
+                phys: PhysAddr(0xC000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map rep payload page");
     state
-        .map_user_page(aspace2, VirtAddr(0x6000), Mapping { phys: PhysAddr(0xD000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace2,
+            VirtAddr(0x6000),
+            Mapping {
+                phys: PhysAddr(0xD000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map rep meta page");
 
     // Two endpoints: req_ep (task1→task2 request) and reply_ep (task2→task1 reply).
     let (req_eidx, req_send, req_recv) = state.create_endpoint(4).expect("req_ep");
-    let req_send_t1 = state.grant_capability_task_to_task(0, req_send, 1).expect("req_send t1");
-    let req_recv_t2 = state.grant_capability_task_to_task(0, req_recv, 2).expect("req_recv t2");
+    let req_send_t1 = state
+        .grant_capability_task_to_task(0, req_send, 1)
+        .expect("req_send t1");
+    let req_recv_t2 = state
+        .grant_capability_task_to_task(0, req_recv, 2)
+        .expect("req_recv t2");
     let (reply_eidx, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply_ep");
-    let reply_recv_t1 = state.grant_capability_task_to_task(0, reply_recv, 1).expect("reply_recv t1");
+    let reply_recv_t1 = state
+        .grant_capability_task_to_task(0, reply_recv, 1)
+        .expect("reply_recv t1");
 
     // Task 1: IpcCall → sends request with FLAG_REPLY_CAP, then immediately
     // blocks on recv-v2 for the reply (request-send only ABI; recv is separate).
     state.enqueue_current_cpu(2).expect("enqueue2");
     state.enqueue_current_cpu(1).expect("enqueue1");
     state.dispatch_next_task().expect("dispatch");
-    while state.current_tid() != Some(1) { state.yield_current().expect("to t1"); }
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("to t1");
+    }
 
     let mut call_frame = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcCall as usize,
         [req_send_t1.0 as usize, 0, 0, 0, 0, reply_recv_t1.0 as usize],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("ipc_call");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut call_frame))
+        .expect("ipc_call");
 
     // Task 2: receive the request via recv-v2, obtain the local reply cap.
-    while state.current_tid() != Some(2) { state.yield_current().expect("to t2"); }
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("to t2");
+    }
     let mut recv_req = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [req_recv_t2.0 as usize, 0x5000, 8, 0x6000, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_req)).expect("recv request");
-    let req_meta = state.read_user_memory_for_asid(asid2, 0x6000, 40).expect("req meta");
-    let local_reply_cap = CapId(u64::from_le_bytes(req_meta[16..24].try_into().expect("cap field")));
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_req))
+        .expect("recv request");
+    let req_meta = state
+        .read_user_memory_for_asid(asid2, 0x6000, 40)
+        .expect("req meta");
+    let local_reply_cap = CapId(u64::from_le_bytes(
+        req_meta[16..24].try_into().expect("cap field"),
+    ));
     assert!(
         matches!(
-            state.capability_service().resolve_current_task_capability(local_reply_cap)
+            state
+                .capability_service()
+                .resolve_current_task_capability(local_reply_cap)
                 .map(|c| c.object),
             Some(CapObject::Reply { .. })
         ),
@@ -13194,23 +14136,33 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
     );
 
     // Task 1: block on recv-v2 on the reply endpoint (empty queue → blocks).
-    while state.current_tid() != Some(1) { state.yield_current().expect("to t1"); }
+    while state.current_tid() != Some(1) {
+        state.yield_current().expect("to t1");
+    }
     let mut recv_reply = TrapFrame::new(
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [reply_recv_t1.0 as usize, 0x3000, 8, 0x4000, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_reply)).expect("recv reply blocks");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_reply))
+        .expect("recv reply blocks");
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(reply_recv_t1))),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            reply_recv_t1
+        ))),
         "task 1 must be blocked on reply recv"
     );
     let before_reply_split = state.ipc_path_telemetry().ipc_reply_split_deliveries;
 
     // Task 2: issue IpcReply — should trigger ipc_reply recv-v2 direct delivery.
-    while state.current_tid() != Some(2) { state.yield_current().expect("to t2"); }
+    while state.current_tid() != Some(2) {
+        state.yield_current().expect("to t2");
+    }
     let reply_msg = Message::with_header(2, 0x77, 0, None, b"ok").expect("reply msg");
-    state.ipc_reply(local_reply_cap, reply_msg).expect("ipc_reply");
+    state
+        .ipc_reply(local_reply_cap, reply_msg)
+        .expect("ipc_reply");
 
     // Task 1 must be woken to Runnable.
     assert_eq!(
@@ -13237,7 +14189,9 @@ fn run_ipc_reply_increments_split_delivery_telemetry_for_recv_v2_waiter() {
         "ipc_reply recv-v2 path must increment ipc_reply_split_deliveries"
     );
     // Payload must be in task 1's user buffer.
-    let payload = state.read_user_memory_for_asid(asid1, 0x3000, 2).expect("reply payload");
+    let payload = state
+        .read_user_memory_for_asid(asid1, 0x3000, 2)
+        .expect("reply payload");
     assert_eq!(&payload[..2], b"ok");
     // Request endpoint must be unused after the round trip.
     assert_eq!(
@@ -13282,32 +14236,75 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
     state.bind_task_asid(2, asid2).expect("bind2");
     // Task 1: payload page 0x3000 + meta page 0x4000 for recv-v2 reply receive.
     state
-        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x3000),
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map t1 payload");
     state
-        .map_user_page(aspace1, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x4000),
+            Mapping {
+                phys: PhysAddr(0xB000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map t1 meta");
     // Task 2: req recv payload 0x5000, req recv meta 0x6000, reply send payload 0x7000.
     state
-        .map_user_page(aspace2, VirtAddr(0x5000), Mapping { phys: PhysAddr(0xC000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace2,
+            VirtAddr(0x5000),
+            Mapping {
+                phys: PhysAddr(0xC000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map t2 recv payload");
     state
-        .map_user_page(aspace2, VirtAddr(0x6000), Mapping { phys: PhysAddr(0xD000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace2,
+            VirtAddr(0x6000),
+            Mapping {
+                phys: PhysAddr(0xD000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map t2 recv meta");
     state
-        .map_user_page(aspace2, VirtAddr(0x7000), Mapping { phys: PhysAddr(0xE000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace2,
+            VirtAddr(0x7000),
+            Mapping {
+                phys: PhysAddr(0xE000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map t2 reply payload");
 
     // Request endpoint (task1→task2) and reply endpoint (task2→task1).
     let (req_eidx, req_send, req_recv) = state.create_endpoint(4).expect("req_ep");
-    let req_send_t1 = state.grant_capability_task_to_task(0, req_send, 1).expect("req_send t1");
-    let req_recv_t2 = state.grant_capability_task_to_task(0, req_recv, 2).expect("req_recv t2");
+    let req_send_t1 = state
+        .grant_capability_task_to_task(0, req_send, 1)
+        .expect("req_send t1");
+    let req_recv_t2 = state
+        .grant_capability_task_to_task(0, req_recv, 2)
+        .expect("req_recv t2");
     let (reply_eidx, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply_ep");
-    let reply_recv_t1 = state.grant_capability_task_to_task(0, reply_recv, 1).expect("reply_recv t1");
+    let reply_recv_t1 = state
+        .grant_capability_task_to_task(0, reply_recv, 1)
+        .expect("reply_recv t1");
 
     // MemoryObject cap to transfer in the reply (task 0 owns it; grant to task 2).
     let (_, mo_cap_global) = state.alloc_anonymous_memory_object().expect("mo");
-    let mo_cap_t2 = state.grant_capability_task_to_task(0, mo_cap_global, 2).expect("grant mo t2");
+    let mo_cap_t2 = state
+        .grant_capability_task_to_task(0, mo_cap_global, 2)
+        .expect("grant mo t2");
 
     state.enqueue_current_cpu(2).expect("enqueue2");
     state.enqueue_current_cpu(1).expect("enqueue1");
@@ -13321,7 +14318,9 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
         crate::kernel::syscall::Syscall::IpcCall as usize,
         [req_send_t1.0 as usize, 0, 0, 0, 0, reply_recv_t1.0 as usize],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut call_frame)).expect("ipc_call");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut call_frame))
+        .expect("ipc_call");
 
     // Task 2: IpcRecv (recv-v2) dequeues the request; reads local reply cap from meta.
     while state.current_tid() != Some(2) {
@@ -13331,12 +14330,20 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [req_recv_t2.0 as usize, 0x5000, 8, 0x6000, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_req)).expect("recv request");
-    let req_meta = state.read_user_memory_for_asid(asid2, 0x6000, 40).expect("req meta");
-    let local_reply_cap = CapId(u64::from_le_bytes(req_meta[16..24].try_into().expect("cap field")));
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_req))
+        .expect("recv request");
+    let req_meta = state
+        .read_user_memory_for_asid(asid2, 0x6000, 40)
+        .expect("req meta");
+    let local_reply_cap = CapId(u64::from_le_bytes(
+        req_meta[16..24].try_into().expect("cap field"),
+    ));
     assert!(
         matches!(
-            state.capability_service().resolve_current_task_capability(local_reply_cap)
+            state
+                .capability_service()
+                .resolve_current_task_capability(local_reply_cap)
                 .map(|c| c.object),
             Some(CapObject::Reply { .. })
         ),
@@ -13351,10 +14358,14 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [reply_recv_t1.0 as usize, 0x3000, 8, 0x4000, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_reply)).expect("reply recv blocks");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_reply))
+        .expect("reply recv blocks");
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(reply_recv_t1))),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            reply_recv_t1
+        ))),
         "task 1 must be blocked recv-v2 on reply endpoint"
     );
     assert_eq!(
@@ -13364,7 +14375,9 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
     );
 
     // Write the reply payload to task 2's user memory before the reply syscall.
-    state.write_user_memory_for_asid(asid2, 0x7000, b"rm").expect("write reply payload");
+    state
+        .write_user_memory_for_asid(asid2, 0x7000, b"rm")
+        .expect("write reply payload");
     let split_before = state.ipc_path_telemetry().ipc_reply_split_deliveries;
 
     // Task 2: IpcReply with mo_cap_t2 as transfer cap — Stage 4M fires.
@@ -13375,13 +14388,16 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
         crate::kernel::syscall::Syscall::IpcReply as usize,
         [
             local_reply_cap.0 as usize, // arg0 = reply cap
-            0x7000,                      // arg1 = payload ptr (task 2 user memory)
-            2,                           // arg2 = payload len
-            0, 0,
-            mo_cap_t2.0 as usize,       // arg5 = transfer cap (MemoryObject)
+            0x7000,                     // arg1 = payload ptr (task 2 user memory)
+            2,                          // arg2 = payload len
+            0,
+            0,
+            mo_cap_t2.0 as usize, // arg5 = transfer cap (MemoryObject)
         ],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut reply_frame)).expect("ipc_reply with cap");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut reply_frame))
+        .expect("ipc_reply with cap");
     assert_eq!(reply_frame.error_code(), None, "ipc_reply must succeed");
 
     // Phase 5: requester must be Runnable.
@@ -13408,10 +14424,18 @@ fn run_ipc_reply_with_cap_transfer_delivers_directly_to_recv_v2_blocked_requeste
         "Stage 4M must increment ipc_reply_split_deliveries"
     );
     // FLAG_CAP_TRANSFER_PLAIN does not strip any bytes — payload lands verbatim.
-    let payload = state.read_user_memory_for_asid(asid1, 0x3000, 2).expect("reply payload");
-    assert_eq!(&payload[..2], b"rm", "reply payload must be in requester user buffer");
+    let payload = state
+        .read_user_memory_for_asid(asid1, 0x3000, 2)
+        .expect("reply payload");
+    assert_eq!(
+        &payload[..2],
+        b"rm",
+        "reply payload must be in requester user buffer"
+    );
     // Meta must indicate a transferred cap (SYSCALL_RECV_META_TRANSFERRED_CAP bit).
-    let meta = state.read_user_memory_for_asid(asid1, 0x4000, 40).expect("reply meta");
+    let meta = state
+        .read_user_memory_for_asid(asid1, 0x4000, 40)
+        .expect("reply meta");
     let meta_flags = u64::from_le_bytes(meta[24..32].try_into().expect("meta flags"));
     assert_ne!(
         meta_flags & crate::kernel::syscall::SYSCALL_RECV_META_TRANSFERRED_CAP as u64,
@@ -13476,18 +14500,24 @@ fn run_transfer_envelope_bound_receiver_cleanup_requires_receiver_tid() {
 
     // Cleanup with sender_tid must fail — this is what BUG 1/BUG 2 did wrong.
     assert!(
-        state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_none(),
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .is_none(),
         "take with sender_tid must be rejected when envelope is bound to receiver_tid"
     );
     // Envelope still occupies its slot (not consumed above).
     // Correct cleanup with receiver_tid must succeed.
     assert!(
-        state.take_transfer_envelope(handle, endpoint, ThreadId(7)).is_some(),
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(7))
+            .is_some(),
         "take with bound receiver_tid must succeed"
     );
     // Second take of the same handle is replay-safe — slot is now gone.
     assert!(
-        state.take_transfer_envelope(handle, endpoint, ThreadId(7)).is_none(),
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(7))
+            .is_none(),
         "second take of same handle must return None (one-shot)"
     );
 }
@@ -13521,7 +14551,9 @@ fn run_transfer_envelope_unbound_cleanup_accepts_any_tid() {
 
     // Cleanup with sender_tid must succeed when envelope is unbound.
     assert!(
-        state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_some(),
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .is_some(),
         "take with sender_tid must succeed when envelope is unbound"
     );
 }
@@ -13557,10 +14589,24 @@ fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
     let (asid1, aspace1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind1");
     state
-        .map_user_page(aspace1, VirtAddr(0x3000), Mapping { phys: PhysAddr(0xA000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x3000),
+            Mapping {
+                phys: PhysAddr(0xA000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map payload");
     state
-        .map_user_page(aspace1, VirtAddr(0x4000), Mapping { phys: PhysAddr(0xB000), flags: PageFlags::USER_RW })
+        .map_user_page(
+            aspace1,
+            VirtAddr(0x4000),
+            Mapping {
+                phys: PhysAddr(0xB000),
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map meta");
 
     let (reply_eidx, _reply_send, reply_recv) = state.create_endpoint(4).expect("reply_ep");
@@ -13588,10 +14634,14 @@ fn run_ipc_reply_recv_v2_phase4_clears_waiter_slot_before_phase5_wake() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [reply_recv_t1.0 as usize, 0x3000, 8, 0x4000, 40, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut recv_reply)).expect("recv blocks");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_reply))
+        .expect("recv blocks");
     assert_eq!(
         state.task_status(1),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(reply_recv_t1))),
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            reply_recv_t1
+        ))),
         "task 1 must be blocked on reply recv"
     );
     // Phase 1 precondition: waiter slot is populated.
@@ -13670,7 +14720,11 @@ fn sync_endpoint_phase4_helper_delivers_legacy_message_under_ipc_state_lock() {
         .expect("recv trap");
     // Receiver is now blocked in the endpoint waiter slot.
     let waiter_tid = state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]);
-    assert_eq!(waiter_tid, Some(ThreadId(80)), "receiver must be in waiter slot");
+    assert_eq!(
+        waiter_tid,
+        Some(ThreadId(80)),
+        "receiver must be in waiter slot"
+    );
 
     // Now call the Phase 4 helper directly (legacy, recv_v2_completed=false).
     let msg = Message::new(1, b"st4m").expect("msg");
@@ -13761,7 +14815,11 @@ fn sync_endpoint_phase4_helper_rejects_mismatched_waiter() {
 
     let msg = Message::new(1, b"stale").expect("msg");
     let result = state.ipc_try_send_sync_endpoint_only(eid, ThreadId(82), msg, false);
-    assert_eq!(result, Err(KernelError::WrongObject), "must reject mismatched waiter");
+    assert_eq!(
+        result,
+        Err(KernelError::WrongObject),
+        "must reject mismatched waiter"
+    );
 }
 
 // ── Stage 4R tests ────────────────────────────────────────────────────────────
@@ -13789,7 +14847,10 @@ fn stage4r_sender_waiter_registered_via_ipc_state_lock() {
     let registered = state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0]);
     assert_eq!(
         registered,
-        Some(SenderWaiter { tid: ThreadId(0), msg }),
+        Some(SenderWaiter {
+            tid: ThreadId(0),
+            msg
+        }),
         "enqueue_sender_waiter must register waiter under ipc_state_lock"
     );
 }
@@ -13890,13 +14951,18 @@ fn stage4r_sender_waiter_fifo_order_preserved() {
 
     // Task 1 blocks second → slot [1].
     let msg1 = Message::new(1, b"second").expect("msg1");
-    assert_eq!(state.ipc_send(send_cap_t1, msg1), Err(KernelError::WouldBlock));
+    assert_eq!(
+        state.ipc_send(send_cap_t1, msg1),
+        Err(KernelError::WouldBlock)
+    );
 
     // Verify FIFO order in IPC state.
-    let (slot0, slot1) = state.with_ipc_state(|ipc| (
-        ipc.endpoint_sender_waiters[eid][0],
-        ipc.endpoint_sender_waiters[eid][1],
-    ));
+    let (slot0, slot1) = state.with_ipc_state(|ipc| {
+        (
+            ipc.endpoint_sender_waiters[eid][0],
+            ipc.endpoint_sender_waiters[eid][1],
+        )
+    });
     assert_eq!(
         slot0.map(|w| w.tid),
         Some(ThreadId(0)),
@@ -13912,8 +14978,14 @@ fn stage4r_sender_waiter_fifo_order_preserved() {
     while state.current_tid() != Some(3) {
         state.yield_current().expect("yield to receiver");
     }
-    let first = state.ipc_recv(recv_cap_t3).expect("recv1").expect("first msg");
-    let second = state.ipc_recv(recv_cap_t3).expect("recv2").expect("second msg");
+    let first = state
+        .ipc_recv(recv_cap_t3)
+        .expect("recv1")
+        .expect("first msg");
+    let second = state
+        .ipc_recv(recv_cap_t3)
+        .expect("recv2")
+        .expect("second msg");
     assert_eq!(first.as_slice(), b"first");
     assert_eq!(second.as_slice(), b"second");
 }
@@ -13943,28 +15015,50 @@ fn stage4r_no_orphaned_sender_waiter_when_queue_full() {
     });
 
     // Record the pre-filled state for comparison.
-    let filled_count_before =
-        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().filter(|s| s.is_some()).count());
-    let queue_len =
-        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].len());
-    assert_eq!(filled_count_before, queue_len, "all slots must be pre-filled");
+    let filled_count_before = state.with_ipc_state(|ipc| {
+        ipc.endpoint_sender_waiters[eid]
+            .iter()
+            .filter(|s| s.is_some())
+            .count()
+    });
+    let queue_len = state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].len());
+    assert_eq!(
+        filled_count_before, queue_len,
+        "all slots must be pre-filled"
+    );
 
     // The send must fail with EndpointQueueFull (propagated from enqueue_sender_waiter).
     let result = state.ipc_send(send_cap, Message::new(0, b"x").expect("msg"));
     assert_eq!(result, Err(KernelError::EndpointQueueFull));
 
     // IPC invariant: no new entry with TID=0 was leaked into the full queue.
-    let tid0_present =
-        state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().any(|s| s.map(|w| w.tid) == Some(ThreadId(0))));
-    assert!(!tid0_present, "no orphaned SenderWaiter for the failed sender must exist");
+    let tid0_present = state.with_ipc_state(|ipc| {
+        ipc.endpoint_sender_waiters[eid]
+            .iter()
+            .any(|s| s.map(|w| w.tid) == Some(ThreadId(0)))
+    });
+    assert!(
+        !tid0_present,
+        "no orphaned SenderWaiter for the failed sender must exist"
+    );
 
     // Every pre-filled entry must be unchanged.
     let all_unchanged = state.with_ipc_state(|ipc| {
-        ipc.endpoint_sender_waiters[eid].iter().enumerate().all(|(i, slot)| {
-            *slot == Some(SenderWaiter { tid: ThreadId(100 + i as u64), msg: dummy_msg })
-        })
+        ipc.endpoint_sender_waiters[eid]
+            .iter()
+            .enumerate()
+            .all(|(i, slot)| {
+                *slot
+                    == Some(SenderWaiter {
+                        tid: ThreadId(100 + i as u64),
+                        msg: dummy_msg,
+                    })
+            })
     });
-    assert!(all_unchanged, "pre-filled sender waiters must be unchanged after failed enqueue");
+    assert!(
+        all_unchanged,
+        "pre-filled sender waiters must be unchanged after failed enqueue"
+    );
 }
 
 // ── Stage 4S tests ────────────────────────────────────────────────────────────
@@ -13974,12 +15068,8 @@ fn stage4s_ipc_recv_endpoint_take_empty_queue_no_waiter_returns_none() {
     // ipc_recv_endpoint_take on an empty endpoint with no sender waiters must return
     // (None, SchedulerWakePlan::None) — no message, no wake side-effect.
     let mut state = Bootstrap::init().expect("init");
-    let (eid, _send_cap, _recv_cap) = state
-        .create_endpoint(4)
-        .expect("buffered endpoint");
-    let (msg, plan) = state
-        .ipc_recv_endpoint_take(eid)
-        .expect("take ok");
+    let (eid, _send_cap, _recv_cap) = state.create_endpoint(4).expect("buffered endpoint");
+    let (msg, plan) = state.ipc_recv_endpoint_take(eid).expect("take ok");
     assert!(msg.is_none(), "empty endpoint must yield no message");
     assert_eq!(plan, super::SchedulerWakePlan::None, "no wake plan");
     // Endpoint queue must be untouched.
@@ -13994,17 +15084,17 @@ fn stage4s_ipc_recv_endpoint_take_queued_message_no_waiter() {
     // ipc_recv_endpoint_take dequeues the message and returns None wake plan when
     // there are no sender waiters.
     let mut state = Bootstrap::init().expect("init");
-    let (eid, send_cap, _recv_cap) = state
-        .create_endpoint(4)
-        .expect("buffered endpoint");
+    let (eid, send_cap, _recv_cap) = state.create_endpoint(4).expect("buffered endpoint");
     let msg = Message::new(0, b"hello").expect("msg");
     state.ipc_send(send_cap, msg).expect("send ok");
 
-    let (received, plan) = state
-        .ipc_recv_endpoint_take(eid)
-        .expect("take ok");
+    let (received, plan) = state.ipc_recv_endpoint_take(eid).expect("take ok");
     assert_eq!(received.unwrap().as_slice(), b"hello");
-    assert_eq!(plan, super::SchedulerWakePlan::None, "no sender waiter → no wake");
+    assert_eq!(
+        plan,
+        super::SchedulerWakePlan::None,
+        "no sender waiter → no wake"
+    );
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
         0,
@@ -14037,11 +15127,17 @@ fn stage4s_ipc_recv_endpoint_take_direct_delivery_from_sender_waiter() {
         "sender waiter must be registered"
     );
 
-    let (received, plan) = state
-        .ipc_recv_endpoint_take(eid)
-        .expect("take ok");
-    assert_eq!(received.unwrap().as_slice(), b"direct", "must get sender's message");
-    assert_eq!(plan, super::SchedulerWakePlan::Wake(ThreadId(0)), "must wake the sender");
+    let (received, plan) = state.ipc_recv_endpoint_take(eid).expect("take ok");
+    assert_eq!(
+        received.unwrap().as_slice(),
+        b"direct",
+        "must get sender's message"
+    );
+    assert_eq!(
+        plan,
+        super::SchedulerWakePlan::Wake(ThreadId(0)),
+        "must wake the sender"
+    );
     // Sender waiter slot must be cleared.
     assert!(
         state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid].iter().all(Option::is_none)),
@@ -14066,16 +15162,16 @@ fn stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter() {
     state.enqueue_current_cpu(1).expect("enqueue1");
 
     // depth=1: one slot in endpoint queue.
-    let (eid, send_cap, _recv_cap) = state
-        .create_endpoint(1)
-        .expect("buffered depth=1");
+    let (eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("buffered depth=1");
     let send_cap_t1 = state
         .grant_capability_task_to_task(0, send_cap, 1)
         .expect("grant send to t1");
 
     // Fill the endpoint queue from task 0.
     let msg_queued = Message::new(0, b"queued").expect("queued");
-    state.ipc_send(send_cap, msg_queued).expect("send queued ok");
+    state
+        .ipc_send(send_cap, msg_queued)
+        .expect("send queued ok");
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoints[eid].as_ref().unwrap().queued()),
         1
@@ -14085,7 +15181,10 @@ fn stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter() {
     state.yield_current().expect("yield to t1");
     assert_eq!(state.current_tid(), Some(1));
     let msg_waiter = Message::new(1, b"waiter").expect("waiter msg");
-    assert_eq!(state.ipc_send(send_cap_t1, msg_waiter), Err(KernelError::WouldBlock));
+    assert_eq!(
+        state.ipc_send(send_cap_t1, msg_waiter),
+        Err(KernelError::WouldBlock)
+    );
     assert!(
         state.with_ipc_state(|ipc| ipc.endpoint_sender_waiters[eid][0].is_some()),
         "sender waiter registered"
@@ -14096,9 +15195,7 @@ fn stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter() {
         state.yield_current().expect("yield back");
     }
 
-    let (received, plan) = state
-        .ipc_recv_endpoint_take(eid)
-        .expect("take ok");
+    let (received, plan) = state.ipc_recv_endpoint_take(eid).expect("take ok");
     // Must get the originally queued message.
     assert_eq!(received.unwrap().as_slice(), b"queued");
     // Sender waiter's message must have been refilled into the endpoint.
@@ -14107,9 +15204,7 @@ fn stage4s_ipc_recv_endpoint_take_refill_from_sender_waiter() {
         1,
         "endpoint must be refilled with waiter's message"
     );
-    let refilled = state
-        .ipc_recv_endpoint_take(eid)
-        .expect("second take");
+    let refilled = state.ipc_recv_endpoint_take(eid).expect("second take");
     assert_eq!(refilled.0.unwrap().as_slice(), b"waiter");
     // Sender must be woken.
     assert_eq!(plan, super::SchedulerWakePlan::Wake(ThreadId(1)));
@@ -14127,9 +15222,7 @@ fn stage4s_try_ipc_recv_delegates_to_endpoint_take() {
     state.register_task(1).expect("task1");
     state.enqueue_current_cpu(1).expect("enqueue1");
 
-    let (eid, send_cap, recv_cap) = state
-        .create_endpoint(2)
-        .expect("buffered depth=2");
+    let (eid, send_cap, recv_cap) = state.create_endpoint(2).expect("buffered depth=2");
 
     let msg = Message::new(0, b"probe").expect("msg");
     state.ipc_send(send_cap, msg).expect("send ok");
@@ -14152,9 +15245,7 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
     state.register_task(1).expect("receiver task");
     state.enqueue_current_cpu(1).expect("enqueue1");
 
-    let (eid, _send_cap, recv_cap) = state
-        .create_endpoint(4)
-        .expect("buffered endpoint");
+    let (eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("buffered endpoint");
     let recv_cap_t1 = state
         .grant_capability_task_to_task(0, recv_cap, 1)
         .expect("grant recv to t1");
@@ -14166,7 +15257,9 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
         crate::kernel::syscall::Syscall::IpcRecv as usize,
         [recv_cap_t1.0 as usize, 8, 0xE000, 0, 0, 0],
     );
-    state.handle_trap(Trap::Syscall, Some(&mut tf)).expect("recv trap");
+    state
+        .handle_trap(Trap::Syscall, Some(&mut tf))
+        .expect("recv trap");
     assert_eq!(
         state.with_ipc_state(|ipc| ipc.endpoint_waiters[eid]),
         Some(ThreadId(1)),
@@ -14189,7 +15282,9 @@ fn stage4s_ipc_reply_non_recv_v2_enqueues_and_wakes_atomically() {
             .map(super::SchedulerWakePlan::Wake)
             .unwrap_or(super::SchedulerWakePlan::None)
     });
-    state.apply_scheduler_wake_plan(wake_plan).expect("apply wake");
+    state
+        .apply_scheduler_wake_plan(wake_plan)
+        .expect("apply wake");
 
     // Receiver waiter slot must be cleared inside the closure (atomic with enqueue).
     assert_eq!(
@@ -14222,9 +15317,7 @@ fn stage4s_sender_waiter_compaction_shifts_queue_left() {
     state.enqueue_current_cpu(2).expect("enqueue2");
 
     // depth=1: one message fits in the endpoint queue.
-    let (eid, send_cap, _recv_cap) = state
-        .create_endpoint(1)
-        .expect("buffered depth=1");
+    let (eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("buffered depth=1");
     let send_cap_t1 = state
         .grant_capability_task_to_task(0, send_cap, 1)
         .expect("grant send to t1");
@@ -14240,11 +15333,17 @@ fn stage4s_sender_waiter_compaction_shifts_queue_left() {
     state.yield_current().expect("yield t1");
     assert_eq!(state.current_tid(), Some(1));
     let m1 = Message::new(1, b"m1").expect("m1");
-    assert_eq!(state.ipc_send(send_cap_t1, m1), Err(KernelError::WouldBlock));
+    assert_eq!(
+        state.ipc_send(send_cap_t1, m1),
+        Err(KernelError::WouldBlock)
+    );
 
     // Task 2 blocks as sender-waiter[1].
     let m2 = Message::new(2, b"m2").expect("m2");
-    assert_eq!(state.ipc_send(send_cap_t2, m2), Err(KernelError::WouldBlock));
+    assert_eq!(
+        state.ipc_send(send_cap_t2, m2),
+        Err(KernelError::WouldBlock)
+    );
 
     // Back to task 0.
     while state.current_tid() != Some(0) {
@@ -14267,7 +15366,10 @@ fn stage4s_sender_waiter_compaction_shifts_queue_left() {
         Some(ThreadId(2)),
         "after first take, slot[0] must hold the second waiter"
     );
-    assert!(slot1_after.is_none(), "slot[1] must be None after compaction");
+    assert!(
+        slot1_after.is_none(),
+        "slot[1] must be None after compaction"
+    );
 
     // Second take: dequeues m1 (now in endpoint), refills from slot[0] (m2).
     let (r1, _plan1) = state.ipc_recv_endpoint_take(eid).expect("take1");
@@ -14310,12 +15412,18 @@ fn stage4t_ipc_recv_handles_sparse_sender_waiter_queue() {
     state.yield_current().expect("yield to t1");
     assert_eq!(state.current_tid(), Some(1));
     let m1 = Message::new(1, b"from_t1").expect("m1");
-    assert_eq!(state.ipc_send(send_cap_t1, m1), Err(KernelError::WouldBlock));
+    assert_eq!(
+        state.ipc_send(send_cap_t1, m1),
+        Err(KernelError::WouldBlock)
+    );
 
     // After WouldBlock, dispatch_next_task ran → current is now task 2.
     // Task 2 blocks as sender_waiter[1].
     let m2 = Message::new(2, b"from_t2").expect("m2");
-    assert_eq!(state.ipc_send(send_cap_t2, m2), Err(KernelError::WouldBlock));
+    assert_eq!(
+        state.ipc_send(send_cap_t2, m2),
+        Err(KernelError::WouldBlock)
+    );
 
     // Both waiter slots must be occupied before we introduce the gap.
     assert!(
@@ -14340,9 +15448,7 @@ fn stage4t_ipc_recv_handles_sparse_sender_waiter_queue() {
 
     // ipc_recv_endpoint_take must find t2 at slot[1] rather than treating the
     // None at slot[0] as "no waiters".
-    let (received, plan) = state
-        .ipc_recv_endpoint_take(eid)
-        .expect("take ok");
+    let (received, plan) = state.ipc_recv_endpoint_take(eid).expect("take ok");
 
     assert_eq!(
         received.unwrap().as_slice(),
@@ -14404,10 +15510,11 @@ fn cap_domain_lock_read_sees_minted_capability() {
     );
 
     // Direct with_capability_state confirms the lock itself reflects the mutation.
-    let cnode_count = state.with_capability_state(|cap| {
-        cap.cnode_spaces.iter().flatten().count()
-    });
-    assert!(cnode_count >= 1, "at least one cnode space must be visible via with_capability_state");
+    let cnode_count = state.with_capability_state(|cap| cap.cnode_spaces.iter().flatten().count());
+    assert!(
+        cnode_count >= 1,
+        "at least one cnode space must be visible via with_capability_state"
+    );
 }
 
 #[test]
@@ -14418,13 +15525,11 @@ fn cap_domain_with_task_then_capability_reads_consistent_state() {
     // must observe the updated counts from both domains atomically.
     let mut state = Bootstrap::init().expect("init");
 
-    let (tasks_before, cnodes_before) =
-        state.lock_order_task_capability_snapshot_for_test();
+    let (tasks_before, cnodes_before) = state.lock_order_task_capability_snapshot_for_test();
 
     state.register_task(55).expect("new task");
 
-    let (tasks_after, cnodes_after) =
-        state.lock_order_task_capability_snapshot_for_test();
+    let (tasks_after, cnodes_after) = state.lock_order_task_capability_snapshot_for_test();
 
     assert_eq!(
         tasks_after,
@@ -14492,7 +15597,10 @@ fn cap_rights_grant_cannot_widen_rights_beyond_source() {
     let generation = state.with_ipc_state(|ipc| ipc.endpoint_generations[endpoint_idx]);
     let send_only_cap = state
         .mint_capability_for_current_context(Capability::new(
-            CapObject::Endpoint { index: endpoint_idx, generation },
+            CapObject::Endpoint {
+                index: endpoint_idx,
+                generation,
+            },
             CapRights::SEND,
         ))
         .expect("mint send-only");
@@ -14531,31 +15639,52 @@ fn create_endpoint_both_domains_visible_after_two_phase_create() {
 
     // IPC domain: endpoint slot must be occupied.
     let ep_present = state.with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].is_some());
-    assert!(ep_present, "endpoint must be present in ipc domain after create_endpoint");
+    assert!(
+        ep_present,
+        "endpoint must be present in ipc domain after create_endpoint"
+    );
 
     // Capability domain: send and recv caps must resolve correctly.
     let s = state
         .resolve_capability_for_task(0, send_cap)
         .expect("send cap must resolve");
-    assert!(s.has_right(CapRights::SEND), "send cap must carry SEND right");
-    assert!(!s.has_right(CapRights::RECEIVE), "send cap must not carry RECEIVE right");
+    assert!(
+        s.has_right(CapRights::SEND),
+        "send cap must carry SEND right"
+    );
+    assert!(
+        !s.has_right(CapRights::RECEIVE),
+        "send cap must not carry RECEIVE right"
+    );
 
     let r = state
         .resolve_capability_for_task(0, recv_cap)
         .expect("recv cap must resolve");
-    assert!(r.has_right(CapRights::RECEIVE), "recv cap must carry RECEIVE right");
-    assert!(!r.has_right(CapRights::SEND), "recv cap must not carry SEND right");
+    assert!(
+        r.has_right(CapRights::RECEIVE),
+        "recv cap must carry RECEIVE right"
+    );
+    assert!(
+        !r.has_right(CapRights::SEND),
+        "recv cap must not carry SEND right"
+    );
 
     // Both caps must reference the same endpoint index.
     match s.object {
         CapObject::Endpoint { index, .. } => {
-            assert_eq!(index, endpoint_idx, "send cap index must match created endpoint")
+            assert_eq!(
+                index, endpoint_idx,
+                "send cap index must match created endpoint"
+            )
         }
         _ => panic!("send cap object type wrong"),
     }
     match r.object {
         CapObject::Endpoint { index, .. } => {
-            assert_eq!(index, endpoint_idx, "recv cap index must match created endpoint")
+            assert_eq!(
+                index, endpoint_idx,
+                "recv cap index must match created endpoint"
+            )
         }
         _ => panic!("recv cap object type wrong"),
     }
@@ -14569,8 +15698,7 @@ fn create_notification_both_domains_visible_after_two_phase_create() {
     let (notif_idx, signal_cap, recv_cap) = state.create_notification(4).expect("notification");
 
     // IPC domain: notification slot must be occupied.
-    let notif_present =
-        state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some());
+    let notif_present = state.with_ipc_state(|ipc| ipc.notifications[notif_idx].is_some());
     assert!(
         notif_present,
         "notification must be present in ipc domain after create_notification"
@@ -14580,12 +15708,18 @@ fn create_notification_both_domains_visible_after_two_phase_create() {
     let s = state
         .resolve_capability_for_task(0, signal_cap)
         .expect("signal cap must resolve");
-    assert!(s.has_right(CapRights::SIGNAL), "signal cap must carry SIGNAL right");
+    assert!(
+        s.has_right(CapRights::SIGNAL),
+        "signal cap must carry SIGNAL right"
+    );
 
     let r = state
         .resolve_capability_for_task(0, recv_cap)
         .expect("recv cap must resolve");
-    assert!(r.has_right(CapRights::RECEIVE), "notification recv cap must carry RECEIVE right");
+    assert!(
+        r.has_right(CapRights::RECEIVE),
+        "notification recv cap must carry RECEIVE right"
+    );
 
     // Both caps must reference the same notification index.
     match s.object {
@@ -14619,7 +15753,10 @@ fn ipc_timeout_deadline_cleared_in_tcb_after_deadline_fires() {
     let first = state
         .ipc_recv_with_deadline(recv_cap, 1)
         .expect("deadline recv must not fail synchronously");
-    assert_eq!(first, None, "no message in queue; should return None and block");
+    assert_eq!(
+        first, None,
+        "no message in queue; should return None and block"
+    );
     assert_eq!(
         state.task_status(blocked_tid),
         Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
@@ -14635,7 +15772,9 @@ fn ipc_timeout_deadline_cleared_in_tcb_after_deadline_fires() {
         "ipc_timeout_deadline must be set in TCB while blocked with deadline"
     );
 
-    state.handle_trap(Trap::TimerInterrupt, None).expect("timer trap");
+    state
+        .handle_trap(Trap::TimerInterrupt, None)
+        .expect("timer trap");
 
     // After the timer fires the deadline field must have been cleared.
     let deadline_after = state
@@ -14694,7 +15833,9 @@ fn user_task_cnode_isolated_from_system_server_cnode() {
 
     // Revoke cap1 from task 1's cnode.
     let cnode1 = state.task_cnode(1).expect("task1 cnode");
-    state.revoke_capability_in_cnode(cnode1, cap1).expect("revoke cap1");
+    state
+        .revoke_capability_in_cnode(cnode1, cap1)
+        .expect("revoke cap1");
 
     // cap1 must now be absent from task 1's cnode.
     assert!(
@@ -14757,7 +15898,9 @@ fn task_exit_supervisor_report_message_visible_via_ipc_state() {
     // the fix the message must be immediately visible via with_ipc_state.
     let mut state = Bootstrap::init().expect("init");
     let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
-    state.set_supervisor_endpoint(recv_cap).expect("set supervisor endpoint");
+    state
+        .set_supervisor_endpoint(recv_cap)
+        .expect("set supervisor endpoint");
 
     state
         .report_task_exit_to_supervisor(7, 99, 55)
@@ -14770,7 +15913,10 @@ fn task_exit_supervisor_report_message_visible_via_ipc_state() {
             .map(|ep| super::kernel_ref(ep).queued())
             .unwrap_or(0)
     });
-    assert_eq!(queued, 1, "exactly one message must be in supervisor endpoint after report_task_exit");
+    assert_eq!(
+        queued, 1,
+        "exactly one message must be in supervisor endpoint after report_task_exit"
+    );
 }
 
 #[test]
@@ -14779,7 +15925,9 @@ fn transfer_revoke_supervisor_report_message_visible_via_ipc_state() {
     // same direct self.ipc.endpoints bypass.
     let mut state = Bootstrap::init().expect("init");
     let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
-    state.set_supervisor_endpoint(recv_cap).expect("set supervisor endpoint");
+    state
+        .set_supervisor_endpoint(recv_cap)
+        .expect("set supervisor endpoint");
 
     state
         .report_transfer_revoke_to_supervisor(7, 12, 0xA000, 4096)
@@ -14791,7 +15939,10 @@ fn transfer_revoke_supervisor_report_message_visible_via_ipc_state() {
             .map(|ep| super::kernel_ref(ep).queued())
             .unwrap_or(0)
     });
-    assert_eq!(queued, 1, "exactly one message must be in supervisor endpoint after report_transfer_revoke");
+    assert_eq!(
+        queued, 1,
+        "exactly one message must be in supervisor endpoint after report_transfer_revoke"
+    );
 }
 
 #[test]
@@ -14800,7 +15951,9 @@ fn fault_handler_report_message_visible_via_ipc_state() {
     // self.ipc.endpoints directly (bypassing ipc_state_lock).
     let mut state = Bootstrap::init().expect("init");
     let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
-    state.set_fault_handler(recv_cap).expect("set fault handler");
+    state
+        .set_fault_handler(recv_cap)
+        .expect("set fault handler");
 
     let fault = super::super::trap::FaultInfo {
         addr: VirtAddr(0xDEAD),
@@ -14814,7 +15967,10 @@ fn fault_handler_report_message_visible_via_ipc_state() {
             .map(|ep| super::kernel_ref(ep).queued())
             .unwrap_or(0)
     });
-    assert_eq!(queued, 1, "fault report message must be enqueued in fault handler endpoint");
+    assert_eq!(
+        queued, 1,
+        "fault report message must be enqueued in fault handler endpoint"
+    );
 }
 
 #[test]
@@ -14831,11 +15987,18 @@ fn register_task_tcb_and_class_consistent_after_allocation() {
 
     // task_class must be Some(App) — the default class.
     let class = state.task_class(42);
-    assert_eq!(class, Some(TaskClass::App), "task class must be App after register_task");
+    assert_eq!(
+        class,
+        Some(TaskClass::App),
+        "task class must be App after register_task"
+    );
 
     // Both must be visible via their lock-protected accessors.
     let tcb_exists = state.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == 42));
-    assert!(tcb_exists, "TCB must be visible via with_tcbs after register_task");
+    assert!(
+        tcb_exists,
+        "TCB must be visible via with_tcbs after register_task"
+    );
 }
 
 #[test]
@@ -14892,8 +16055,9 @@ fn exit_task_leaves_exited_status_not_runnable_in_queue() {
     );
 
     // The run queue on CPU 0 must not contain TID 20.
-    let runnable = state
-        .with_scheduler_state(|sched| super::kernel_ref(&sched.scheduler).runnable_count_on(super::CpuId(0)));
+    let runnable = state.with_scheduler_state(|sched| {
+        super::kernel_ref(&sched.scheduler).runnable_count_on(super::CpuId(0))
+    });
     // task20 was enqueued then exited; the scheduler may have removed it or not,
     // but if it's still in the queue it would be stale.  Verify by confirming
     // that no scheduler operation is required for task20 to stay in Exited state
@@ -14956,23 +16120,32 @@ fn ipc_timeout_not_fired_when_message_delivered_before_deadline() {
     state.idle_re_enqueue_for_test().expect("re-enqueue idle");
 
     // Task 1 blocks on recv with a long future deadline.
-    let first = state.ipc_recv_with_deadline(recv_cap_t1, 100).expect("deadline recv");
+    let first = state
+        .ipc_recv_with_deadline(recv_cap_t1, 100)
+        .expect("deadline recv");
     assert_eq!(first, None, "no message yet");
     assert_eq!(
         state.task_status(blocked_tid),
-        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap_t1)))
+        Some(TaskStatus::Blocked(WaitReason::EndpointReceive(
+            recv_cap_t1
+        )))
     );
 
     // Deliver a message BEFORE the deadline fires (no timer tick here).
     // Task 0 is now current and holds send_cap.
     assert_eq!(state.current_tid(), Some(0));
-    state.ipc_send(send_cap, Message::new(99, b"early").expect("msg")).expect("send");
+    state
+        .ipc_send(send_cap, Message::new(99, b"early").expect("msg"))
+        .expect("send");
 
     // ipc_timeout_fired must not be set — the timeout never fired.
     let timeout_fired = state
         .consume_ipc_timeout_fired_for_tid(blocked_tid)
         .expect("consume");
-    assert!(!timeout_fired, "timeout_fired must be false when message delivered before deadline");
+    assert!(
+        !timeout_fired,
+        "timeout_fired must be false when message delivered before deadline"
+    );
 }
 
 // ── VM / memory-lifecycle domain lock tests (Stage 4T+3) ─────────────────────
@@ -14994,7 +16167,11 @@ fn memory_lifecycle_note_mapping_inserted_increments_map_refcount_via_with_memor
             .find(|obj| obj.phys == phys)
             .map(|obj| obj.map_refcount)
     });
-    assert_eq!(before, Some(0), "map_refcount must be 0 before note_mapping_inserted");
+    assert_eq!(
+        before,
+        Some(0),
+        "map_refcount must be 0 before note_mapping_inserted"
+    );
 
     state.note_mapping_inserted(phys);
 
@@ -15006,7 +16183,11 @@ fn memory_lifecycle_note_mapping_inserted_increments_map_refcount_via_with_memor
             .find(|obj| obj.phys == phys)
             .map(|obj| obj.map_refcount)
     });
-    assert_eq!(after, Some(1), "map_refcount must be 1 after note_mapping_inserted");
+    assert_eq!(
+        after,
+        Some(1),
+        "map_refcount must be 1 after note_mapping_inserted"
+    );
 }
 
 #[test]
@@ -15029,7 +16210,11 @@ fn memory_lifecycle_note_mapping_removed_decrements_map_refcount_via_with_memory
             .find(|obj| obj.phys == phys)
             .map(|obj| obj.map_refcount)
     });
-    assert_eq!(after, Some(0), "map_refcount must be 0 after insert→remove round-trip");
+    assert_eq!(
+        after,
+        Some(0),
+        "map_refcount must be 0 after insert→remove round-trip"
+    );
 }
 
 #[test]
@@ -15042,38 +16227,51 @@ fn memory_lifecycle_cap_refcount_delta_visible_via_with_memory_state() {
     let (mo_id, _cap) = state.create_memory_object(phys).expect("memory object");
     let cap_obj = CapObject::MemoryObject { id: mo_id };
 
-    let base = state.with_memory_state(|memory| {
-        memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .find(|obj| obj.id == mo_id)
-            .map(|obj| obj.cap_refcount)
-    }).expect("refcount readable");
+    let base = state
+        .with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|obj| obj.id == mo_id)
+                .map(|obj| obj.cap_refcount)
+        })
+        .expect("refcount readable");
 
     state.adjust_memory_object_cap_refcount(cap_obj, 1);
 
-    let incremented = state.with_memory_state(|memory| {
-        memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .find(|obj| obj.id == mo_id)
-            .map(|obj| obj.cap_refcount)
-    }).expect("refcount readable after increment");
-    assert_eq!(incremented, base + 1, "cap_refcount must increase by 1 after delta +1");
+    let incremented = state
+        .with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|obj| obj.id == mo_id)
+                .map(|obj| obj.cap_refcount)
+        })
+        .expect("refcount readable after increment");
+    assert_eq!(
+        incremented,
+        base + 1,
+        "cap_refcount must increase by 1 after delta +1"
+    );
 
     state.adjust_memory_object_cap_refcount(cap_obj, -1);
 
-    let restored = state.with_memory_state(|memory| {
-        memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .find(|obj| obj.id == mo_id)
-            .map(|obj| obj.cap_refcount)
-    }).expect("refcount readable after decrement");
-    assert_eq!(restored, base, "cap_refcount must restore to base after delta -1");
+    let restored = state
+        .with_memory_state(|memory| {
+            memory
+                .memory_objects
+                .iter()
+                .flatten()
+                .find(|obj| obj.id == mo_id)
+                .map(|obj| obj.cap_refcount)
+        })
+        .expect("refcount readable after decrement");
+    assert_eq!(
+        restored, base,
+        "cap_refcount must restore to base after delta -1"
+    );
 }
 
 #[test]
@@ -15098,14 +16296,23 @@ fn vm_domain_unmap_in_asid_removes_mapping_visible_via_with_user_spaces() {
         .expect("map");
 
     let mapped = state.with_user_spaces(|spaces| {
-        spaces.get(asid).and_then(|aspace| aspace.resolve(virt)).is_some()
+        spaces
+            .get(asid)
+            .and_then(|aspace| aspace.resolve(virt))
+            .is_some()
     });
-    assert!(mapped, "page must be present via with_user_spaces after map_user_page_in_asid_raw");
+    assert!(
+        mapped,
+        "page must be present via with_user_spaces after map_user_page_in_asid_raw"
+    );
 
     state.unmap_user_page_in_asid(asid, virt).expect("unmap");
 
     let still_mapped = state.with_user_spaces(|spaces| {
-        spaces.get(asid).and_then(|aspace| aspace.resolve(virt)).is_some()
+        spaces
+            .get(asid)
+            .and_then(|aspace| aspace.resolve(virt))
+            .is_some()
     });
     assert!(
         !still_mapped,
@@ -15124,7 +16331,11 @@ fn vm_domain_is_user_page_mapped_in_asid_reflects_mapping_state() {
     state.bind_task_asid(1, asid).expect("bind asid");
     state.enqueue_current_cpu(1).expect("enqueue");
     state.dispatch_next_task().expect("dispatch to task1");
-    assert_eq!(state.current_tid(), Some(1), "task1 must be current after dispatch");
+    assert_eq!(
+        state.current_tid(),
+        Some(1),
+        "task1 must be current after dispatch"
+    );
 
     let phys = PhysAddr(0x7F000);
     let virt = VirtAddr(0x3000_0000);
@@ -15143,7 +16354,10 @@ fn vm_domain_is_user_page_mapped_in_asid_reflects_mapping_state() {
     let mapped = state
         .is_user_page_mapped_in_asid(asid, virt)
         .expect("query after map");
-    assert!(mapped, "is_user_page_mapped_in_asid must return true after mapping");
+    assert!(
+        mapped,
+        "is_user_page_mapped_in_asid must return true after mapping"
+    );
 
     state.unmap_user_page_in_asid(asid, virt).expect("unmap");
 
@@ -15183,7 +16397,11 @@ fn vm_domain_map_page_increments_memory_object_map_refcount_consistent_end_to_en
             .find(|obj| obj.phys == phys)
             .map(|obj| obj.map_refcount)
     });
-    assert_eq!(refcount_before, Some(0), "map_refcount must be 0 before map");
+    assert_eq!(
+        refcount_before,
+        Some(0),
+        "map_refcount must be 0 before map"
+    );
 
     state
         .map_user_page_in_asid_raw(asid, virt, Mapping { phys, flags })
@@ -15349,13 +16567,19 @@ fn exit_task_clears_endpoint_receiver_waiter_slot() {
     state.with_ipc_state_mut(|ipc| {
         ipc.endpoint_waiters[ep_idx] = Some(crate::kernel::ipc::ThreadId(200));
     });
-    state.with_tcbs_mut(|tcbs| {
-        let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 200).unwrap();
-        tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(ep_recv_cap));
-        Ok::<_, KernelError>(())
-    }).expect("set blocked");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 200).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(ep_recv_cap));
+            Ok::<_, KernelError>(())
+        })
+        .expect("set blocked");
 
-    assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "waiter slot occupied before exit");
+    assert_eq!(
+        state.endpoint_waiter_count(ep_idx),
+        1,
+        "waiter slot occupied before exit"
+    );
 
     state.exit_task(200, 0).expect("exit");
 
@@ -15391,7 +16615,10 @@ fn exit_task_clears_notification_waiter_slot() {
     });
 
     let waiter_before = state.with_ipc_state(|ipc| ipc.notification_waiters[notif_idx]);
-    assert!(waiter_before.is_some(), "notification waiter slot occupied before exit");
+    assert!(
+        waiter_before.is_some(),
+        "notification waiter slot occupied before exit"
+    );
 
     state.exit_task(201, 0).expect("exit");
 
@@ -15445,7 +16672,9 @@ fn join_thread_reap_triggers_process_cnode_cleanup() {
         .expect("leader");
     state.dispatch_next_task().expect("dispatch");
     // Spawn a joiner thread in the same process.
-    let joiner = state.spawn_user_thread(210, 0xCAFE_2000, 0x8200_0000, 0x5010).expect("joiner");
+    let joiner = state
+        .spawn_user_thread(210, 0xCAFE_2000, 0x8200_0000, 0x5010)
+        .expect("joiner");
     while state.current_tid() != Some(joiner) {
         state.yield_current().expect("yield");
     }
@@ -15497,7 +16726,9 @@ fn join_thread_immediate_reap_when_target_already_exited() {
         })
         .expect("leader");
     state.dispatch_next_task().expect("dispatch");
-    let joiner = state.spawn_user_thread(211, 0xCAFE_3000, 0x8300_0000, 0x5010).expect("joiner");
+    let joiner = state
+        .spawn_user_thread(211, 0xCAFE_3000, 0x8300_0000, 0x5010)
+        .expect("joiner");
     state.dispatch_next_task().expect("dispatch2");
 
     // Exit leader before joiner calls join.
@@ -15507,7 +16738,11 @@ fn join_thread_immediate_reap_when_target_already_exited() {
     // Joiner calls join: target already Exited → immediate reap.
     let code = state.join_thread(211).expect("join immediate");
     assert_eq!(code, Some(77));
-    assert_eq!(state.task_is_dead(211), true, "must be Dead after immediate join");
+    assert_eq!(
+        state.task_is_dead(211),
+        true,
+        "must be Dead after immediate join"
+    );
     assert_eq!(state.join_waiter_count(211), 0, "no stale join waiters");
 
     // Cleanup the joiner.
@@ -15550,36 +16785,54 @@ fn robust_futex_wake_works_when_exit_is_externally_driven() {
         .expect("victim");
 
     // Make waiter current.
-    state.yield_current_to(ThreadId(220)).expect("switch to 220");
+    state
+        .yield_current_to(ThreadId(220))
+        .expect("switch to 220");
 
     // Register a robust futex on victim with a known user-space address.
     let futex_addr: usize = 0x6000;
     // Map a page in victim's ASID so the address is valid for victim.
     let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
     state
         .map_user_page_in_asid_raw(
             asid_victim,
             VirtAddr(futex_addr as u64),
-            Mapping { phys, flags: PageFlags::USER_RW },
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
         )
         .expect("map futex page");
 
     // Register robust futex list for victim.
-    state.set_robust_futex_head(221, futex_addr, 1).expect("robust");
+    state
+        .set_robust_futex_head(221, futex_addr, 1)
+        .expect("robust");
 
     // Block waiter on the futex address by directly setting TCB status.
-    state.with_tcbs_mut(|tcbs| {
-        let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 220).unwrap();
-        tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(futex_addr as u64)));
-        Ok::<_, KernelError>(())
-    }).expect("block waiter");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == 220).unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::Futex(VirtAddr(futex_addr as u64)));
+            Ok::<_, KernelError>(())
+        })
+        .expect("block waiter");
 
-    assert_eq!(state.futex_waiter_count(futex_addr), 1, "one waiter before exit");
+    assert_eq!(
+        state.futex_waiter_count(futex_addr),
+        1,
+        "one waiter before exit"
+    );
 
     // Exit victim while waiter (220) is current — simulates external exit.
     // The current task is 220, not 221.
-    assert!(state.current_tid() != Some(221), "exit is externally driven");
+    assert!(
+        state.current_tid() != Some(221),
+        "exit is externally driven"
+    );
     state.exit_task(221, 0).expect("exit victim");
 
     // The robust futex wake in exit_task must have woken the waiter.
@@ -15612,9 +16865,18 @@ fn repeated_fork_exit_cycles_leave_no_cow_records() {
         state.bind_task_asid(tid, asid).expect("bind");
 
         let (_mo, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-        let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+        let phys = state
+            .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+            .expect("phys");
         state
-            .map_user_page_in_asid_raw(asid, VirtAddr(0x6000), Mapping { phys, flags: PageFlags::USER_RW })
+            .map_user_page_in_asid_raw(
+                asid,
+                VirtAddr(0x6000),
+                Mapping {
+                    phys,
+                    flags: PageFlags::USER_RW,
+                },
+            )
             .expect("map");
 
         let child_asid = state.clone_user_address_space_cow(asid).expect("clone");
@@ -15655,22 +16917,34 @@ fn joiner_exits_while_waiting_does_not_leave_stale_waiter() {
         })
         .expect("leader");
     state.dispatch_next_task().expect("dispatch");
-    let joiner = state.spawn_user_thread(232, 0xCAFE_4000, 0x8400_0000, 0x5010).expect("joiner");
+    let joiner = state
+        .spawn_user_thread(232, 0xCAFE_4000, 0x8400_0000, 0x5010)
+        .expect("joiner");
     while state.current_tid() != Some(joiner) {
         state.yield_current().expect("yield");
     }
     // Block joiner in Join wait.
-    state.with_tcbs_mut(|tcbs| {
-        let tcb = tcbs.iter_mut().flatten().find(|t| t.tid.0 == joiner).unwrap();
-        tcb.status = TaskStatus::Blocked(WaitReason::Join(ThreadId(232)));
-        Ok::<_, KernelError>(())
-    }).expect("block joiner");
+    state
+        .with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|t| t.tid.0 == joiner)
+                .unwrap();
+            tcb.status = TaskStatus::Blocked(WaitReason::Join(ThreadId(232)));
+            Ok::<_, KernelError>(())
+        })
+        .expect("block joiner");
     assert_eq!(state.join_waiter_count(232), 1, "joiner waiting");
 
     // Joiner exits before target.
     state.exit_task(joiner, 1).expect("joiner exits first");
     // The joiner's status changes from Blocked(Join) to Exited; no longer counted.
-    assert_eq!(state.join_waiter_count(232), 0, "joiner no longer in join wait");
+    assert_eq!(
+        state.join_waiter_count(232),
+        0,
+        "joiner no longer in join wait"
+    );
 
     // Target exits now: wake_joiners_for must find no blocked joiners.
     state.exit_task(232, 2).expect("target exits");
@@ -15732,9 +17006,18 @@ fn memory_object_reclaimed_after_all_refs_released_on_task_exit() {
     state.yield_current_to(ThreadId(250)).expect("switch");
 
     let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
     state
-        .map_user_page_in_asid_raw(asid, VirtAddr(0x8000), Mapping { phys, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            asid,
+            VirtAddr(0x8000),
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map");
 
     let (cap_ref, map_ref, _pin_ref) = state.memory_object_refcounts(phys).expect("refcounts");
@@ -15762,18 +17045,43 @@ fn asid_cow_metadata_cleared_on_address_space_destroy() {
     state.bind_task_asid(260, asid).expect("bind");
 
     let (_mo, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-    let phys = state.resolve_memory_object_phys(mem_cap, PageFlags::USER_RW).expect("phys");
+    let phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
     state
-        .map_user_page_in_asid_raw(asid, VirtAddr(0x9000), Mapping { phys, flags: PageFlags::USER_RW })
+        .map_user_page_in_asid_raw(
+            asid,
+            VirtAddr(0x9000),
+            Mapping {
+                phys,
+                flags: PageFlags::USER_RW,
+            },
+        )
         .expect("map");
 
     let child_asid = state.clone_user_address_space_cow(asid).expect("clone");
-    assert_eq!(state.cow_page_count_for_asid(asid), 1, "parent has COW record");
-    assert_eq!(state.cow_page_count_for_asid(child_asid), 1, "child has COW record");
+    assert_eq!(
+        state.cow_page_count_for_asid(asid),
+        1,
+        "parent has COW record"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(child_asid),
+        1,
+        "child has COW record"
+    );
 
     let _ = state.destroy_user_address_space_by_asid(child_asid);
-    assert_eq!(state.cow_page_count_for_asid(child_asid), 0, "child records cleared");
-    assert_eq!(state.cow_page_count_for_asid(asid), 1, "parent record intact");
+    assert_eq!(
+        state.cow_page_count_for_asid(child_asid),
+        0,
+        "child records cleared"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(asid),
+        1,
+        "parent record intact"
+    );
 
     let _ = state.destroy_user_address_space_by_asid(asid);
     assert_eq!(state.cow_page_count(), 0, "all records cleared");
@@ -15810,7 +17118,11 @@ fn exit_task_clears_sender_waiter_slot() {
         });
     });
 
-    assert_eq!(state.sender_waiter_count(ep_idx), 1, "sender waiter before exit");
+    assert_eq!(
+        state.sender_waiter_count(ep_idx),
+        1,
+        "sender waiter before exit"
+    );
 
     state.exit_task(270, 0).expect("exit");
 
@@ -15856,7 +17168,9 @@ fn recv_timeout_process_clears_endpoint_waiter_and_deadline() {
     assert_eq!(state.ipc_deadline_count_for_tid(280), 1, "deadline set");
 
     // Process timeout at tick == deadline: task must expire.
-    let expired = state.process_ipc_timeout_deadlines(5).expect("timeout process");
+    let expired = state
+        .process_ipc_timeout_deadlines(5)
+        .expect("timeout process");
     assert_eq!(expired, 1, "one task expired");
 
     assert_eq!(
@@ -15905,7 +17219,11 @@ fn send_deadline_process_clears_sender_waiter_and_deadline() {
         })
         .expect("inject blocked state");
 
-    assert_eq!(state.sender_waiter_count(ep_idx), 1, "sender waiter injected");
+    assert_eq!(
+        state.sender_waiter_count(ep_idx),
+        1,
+        "sender waiter injected"
+    );
     assert_eq!(state.ipc_deadline_count_for_tid(281), 1, "deadline set");
 
     let expired = state.process_ipc_timeout_deadlines(10).expect("timeout");
@@ -15921,7 +17239,10 @@ fn send_deadline_process_clears_sender_waiter_and_deadline() {
         0,
         "TCB deadline must be cleared after send deadline fires"
     );
-    assert!(state.task_is_runnable(281), "sender must become Runnable after timeout");
+    assert!(
+        state.task_is_runnable(281),
+        "sender must become Runnable after timeout"
+    );
 }
 
 #[test]
@@ -15946,7 +17267,11 @@ fn exit_before_ipc_recv_timeout_clears_waiter_and_deadline() {
         .expect("inject blocked");
 
     assert_eq!(state.endpoint_waiter_count(ep_idx), 1, "waiter before exit");
-    assert_eq!(state.ipc_deadline_count_for_tid(282), 1, "deadline before exit");
+    assert_eq!(
+        state.ipc_deadline_count_for_tid(282),
+        1,
+        "deadline before exit"
+    );
 
     state.exit_task(282, 0).expect("exit");
 
@@ -15965,7 +17290,9 @@ fn exit_before_ipc_recv_timeout_clears_waiter_and_deadline() {
         "task must be Exited after exit_task"
     );
     // Process a future timeout: the task is Exited (not Blocked), so it must be skipped.
-    let expired = state.process_ipc_timeout_deadlines(99).expect("timeout noop");
+    let expired = state
+        .process_ipc_timeout_deadlines(99)
+        .expect("timeout noop");
     assert_eq!(
         expired, 0,
         "Exited task must not be expired by process_ipc_timeout_deadlines"
@@ -16027,8 +17354,7 @@ fn ipc_timeout_does_not_fire_for_futex_blocked_task() {
 
     let expired = state.process_ipc_timeout_deadlines(7).expect("process");
     assert_eq!(
-        expired,
-        0,
+        expired, 0,
         "Futex-blocked task with IPC deadline must not be expired"
     );
     assert!(
@@ -16093,7 +17419,10 @@ fn task_helpers_runnable_blocked_dead_consistent() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(290).expect("task");
 
-    assert!(state.task_is_runnable(290), "freshly registered task is Runnable");
+    assert!(
+        state.task_is_runnable(290),
+        "freshly registered task is Runnable"
+    );
     assert!(!state.task_is_blocked(290), "not blocked after register");
     assert_eq!(state.task_blocked_reason(290), None, "no blocked reason");
     assert!(!state.task_is_dead(290), "not dead");
@@ -16364,7 +17693,10 @@ fn wake_task_cross_cpu_work_skips_runnable_task() {
         .expect("process");
 
     // Runnable task: WakeTask is a no-op (not Blocked → should_enqueue = false).
-    assert!(state.task_is_runnable(308), "still Runnable, no duplication");
+    assert!(
+        state.task_is_runnable(308),
+        "still Runnable, no duplication"
+    );
 }
 
 // ── Part E: Stress / repeated lifecycle tests ─────────────────────────────────
@@ -16459,7 +17791,11 @@ fn repeated_mixed_waiter_block_exit_no_stale_state() {
         })
         .expect("block 316");
     state.exit_task(316, 0).expect("exit 316");
-    assert_eq!(state.sender_waiter_count(ep2_idx), 0, "sender waiter cleared");
+    assert_eq!(
+        state.sender_waiter_count(ep2_idx),
+        0,
+        "sender waiter cleared"
+    );
 
     // TID 317: notification waiter
     state.register_task(317).expect("task 317");
@@ -16514,7 +17850,10 @@ fn ipc_deadline_cleared_after_delivery_before_timeout() {
 
     // Processing timeout at deadline tick: must be a complete no-op.
     let expired = state.process_ipc_timeout_deadlines(50).expect("noop");
-    assert_eq!(expired, 0, "no tasks expired after delivery cleared deadline");
+    assert_eq!(
+        expired, 0,
+        "no tasks expired after delivery cleared deadline"
+    );
     assert!(
         state.task_is_runnable(318),
         "still Runnable, not re-expired"
@@ -16555,9 +17894,7 @@ fn repeated_recv_block_timeout_delivery_no_stale_timeout() {
         );
 
         // Now process at the deadline tick: must be a no-op (not blocked, no deadline).
-        let expired = state
-            .process_ipc_timeout_deadlines(deadline)
-            .expect("noop");
+        let expired = state.process_ipc_timeout_deadlines(deadline).expect("noop");
         assert_eq!(expired, 0, "no stale expiry after delivery i={i}");
         assert!(state.task_is_runnable(tid), "still runnable i={i}");
 
@@ -16654,11 +17991,11 @@ fn cross_cpu_wake_apply_result_blocked_task_becomes_runnable() {
     let result = state
         .apply_cross_cpu_wake_task(CpuId(0), ThreadId(335))
         .expect("apply");
-    assert_eq!(
-        result,
-        crate::kernel::smp::CrossCpuWakeApplyResult::Applied
+    assert_eq!(result, crate::kernel::smp::CrossCpuWakeApplyResult::Applied);
+    assert!(
+        state.task_is_runnable(335),
+        "task must be Runnable after Applied"
     );
-    assert!(state.task_is_runnable(335), "task must be Runnable after Applied");
 }
 
 #[test]
@@ -16738,7 +18075,11 @@ fn process_cross_cpu_work_missing_tid_not_an_error() {
         .process_cross_cpu_work_for_cpu(CpuId(0))
         .expect("must succeed even for missing TID");
     assert_eq!(processed, 1, "one item processed");
-    assert_eq!(state.cross_cpu_work_count_for_cpu(CpuId(0)), 0, "queue empty");
+    assert_eq!(
+        state.cross_cpu_work_count_for_cpu(CpuId(0)),
+        0,
+        "queue empty"
+    );
 }
 
 #[test]
@@ -16770,7 +18111,10 @@ fn process_cross_cpu_work_exited_task_no_resurrection() {
         .process_cross_cpu_work_for_cpu(CpuId(0))
         .expect("process");
 
-    assert!(state.task_is_exited(338), "Exited task must not be resurrected");
+    assert!(
+        state.task_is_exited(338),
+        "Exited task must not be resurrected"
+    );
 }
 
 #[test]
@@ -16793,7 +18137,10 @@ fn process_cross_cpu_work_blocked_task_becomes_runnable() {
         .process_cross_cpu_work_for_cpu(CpuId(0))
         .expect("process");
     assert_eq!(processed, 1);
-    assert!(state.task_is_runnable(340), "blocked task must become Runnable");
+    assert!(
+        state.task_is_runnable(340),
+        "blocked task must become Runnable"
+    );
 }
 
 // Part D — mixed/duplicate items
@@ -16852,7 +18199,10 @@ fn duplicate_wake_task_items_for_same_tid_are_harmless() {
         .process_cross_cpu_work_for_cpu(CpuId(0))
         .expect("process");
     assert_eq!(processed, 2, "both items processed");
-    assert!(state.task_is_runnable(343), "task Runnable after first wake");
+    assert!(
+        state.task_is_runnable(343),
+        "task Runnable after first wake"
+    );
 }
 
 // Part E — stress cycles
@@ -16879,7 +18229,10 @@ fn repeated_wake_task_drain_cycles_no_stale_state() {
             .process_cross_cpu_work_for_cpu(CpuId(0))
             .expect("drain");
 
-        assert!(state.task_is_runnable(tid), "runnable after wake cycle i={i}");
+        assert!(
+            state.task_is_runnable(tid),
+            "runnable after wake cycle i={i}"
+        );
         assert_eq!(
             state.cross_cpu_work_count_for_cpu(CpuId(0)),
             0,
@@ -16951,7 +18304,9 @@ fn work_queue_full_then_drain_then_refill() {
         state
             .submit_cross_cpu_work(
                 CpuId(0),
-                WorkItem::WakeTask { tid: ThreadId(5000 + i as u64) },
+                WorkItem::WakeTask {
+                    tid: ThreadId(5000 + i as u64),
+                },
             )
             .expect("fill");
     }
@@ -16971,7 +18326,9 @@ fn work_queue_full_then_drain_then_refill() {
         state
             .submit_cross_cpu_work(
                 CpuId(0),
-                WorkItem::WakeTask { tid: ThreadId(6000 + i as u64) },
+                WorkItem::WakeTask {
+                    tid: ThreadId(6000 + i as u64),
+                },
             )
             .expect("refill");
     }
@@ -17003,28 +18360,49 @@ fn asid_destroy_sends_tlb_shootdown_before_reclaim_ordering() {
 
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
     // Map a page so there is something to drain.
-    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("memobj");
+    let (_mem_id, mem_cap) = state
+        .create_memory_object(PhysAddr(0xC000))
+        .expect("memobj");
     state
         .map_user_page_with_caps(
             aspace_cap,
             mem_cap,
             VirtAddr(0x5000),
-            PageFlags { read: true, write: false, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            PageFlags {
+                read: true,
+                write: false,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map");
 
-    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("destroy");
 
     // TLB shootdown work items must already be in the queues.
     let count0 = state.cross_cpu_work_count_for_cpu(CpuId(0));
     let count1 = state.cross_cpu_work_count_for_cpu(CpuId(1));
-    assert!(count0 >= 1, "CPU 0 must have a TlbShootdown work item queued");
-    assert!(count1 >= 1, "CPU 1 must have a TlbShootdown work item queued");
+    assert!(
+        count0 >= 1,
+        "CPU 0 must have a TlbShootdown work item queued"
+    );
+    assert!(
+        count1 >= 1,
+        "CPU 1 must have a TlbShootdown work item queued"
+    );
 
     // ASID must be retired (not live).
-    assert!(!state.asid_is_live_for_test(asid), "ASID must not be live after destroy");
-    assert!(state.asid_is_retired_for_test(asid), "ASID must be retired after destroy");
+    assert!(
+        !state.asid_is_live_for_test(asid),
+        "ASID must not be live after destroy"
+    );
+    assert!(
+        state.asid_is_retired_for_test(asid),
+        "ASID must be retired after destroy"
+    );
 }
 
 #[test]
@@ -17041,9 +18419,15 @@ fn asid_destroy_clears_cow_metadata() {
             .or_default()
             .insert(0x7000_u64);
     });
-    assert_eq!(state.cow_page_count_for_asid(asid), 1, "COW record injected");
+    assert_eq!(
+        state.cow_page_count_for_asid(asid),
+        1,
+        "COW record injected"
+    );
 
-    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("destroy");
     assert_eq!(
         state.cow_page_count_for_asid(asid),
         0,
@@ -17056,22 +18440,35 @@ fn asid_destroy_clears_all_mappings() {
     // All pages must be removed from the address space on destroy.
     let mut state = Bootstrap::init().expect("init");
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
-    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xD000)).expect("memobj");
+    let (_mem_id, mem_cap) = state
+        .create_memory_object(PhysAddr(0xD000))
+        .expect("memobj");
     state
         .map_user_page_with_caps(
             aspace_cap,
             mem_cap,
             VirtAddr(0x1000),
-            PageFlags { read: true, write: true, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map");
 
     assert_eq!(state.mapped_page_count_for_asid(asid), 1, "one page mapped");
-    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("destroy");
     // ASID is gone from live table; mapped_page_count_for_asid returns 0 for
     // a non-existent ASID (with_user_spaces get returns None → 0).
-    assert_eq!(state.mapped_page_count_for_asid(asid), 0, "all mappings cleared");
+    assert_eq!(
+        state.mapped_page_count_for_asid(asid),
+        0,
+        "all mappings cleared"
+    );
 }
 
 #[test]
@@ -17080,16 +18477,25 @@ fn asid_destroy_does_not_affect_other_asid() {
     let mut state = Bootstrap::init().expect("init");
     let (asid_a, aspace_a) = state.create_user_address_space().expect("asid_a");
     let (asid_b, _aspace_b) = state.create_user_address_space().expect("asid_b");
-    let (_mem_id, mem_cap_a) = state.create_memory_object(PhysAddr(0xE000)).expect("memobj_a");
-    let (_mem_id2, mem_cap_b) = state.create_memory_object(PhysAddr(0xF000)).expect("memobj_b");
+    let (_mem_id, mem_cap_a) = state
+        .create_memory_object(PhysAddr(0xE000))
+        .expect("memobj_a");
+    let (_mem_id2, mem_cap_b) = state
+        .create_memory_object(PhysAddr(0xF000))
+        .expect("memobj_b");
 
     state
         .map_user_page_with_caps(
             aspace_a,
             mem_cap_a,
             VirtAddr(0x1000),
-            PageFlags { read: true, write: true, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map a");
     state
@@ -17097,8 +18503,13 @@ fn asid_destroy_does_not_affect_other_asid() {
             asid_b,
             mem_cap_b,
             VirtAddr(0x2000),
-            PageFlags { read: true, write: true, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map b");
 
@@ -17107,12 +18518,22 @@ fn asid_destroy_does_not_affect_other_asid() {
         memory.cow_pages.entry(asid_b.0).or_default().insert(0x2000);
     });
 
-    state.destroy_user_address_space(aspace_a).expect("destroy a");
+    state
+        .destroy_user_address_space(aspace_a)
+        .expect("destroy a");
 
     assert!(!state.asid_is_live_for_test(asid_a), "asid_a not live");
     assert!(state.asid_is_live_for_test(asid_b), "asid_b still live");
-    assert_eq!(state.mapped_page_count_for_asid(asid_b), 1, "asid_b page intact");
-    assert_eq!(state.cow_page_count_for_asid(asid_b), 1, "asid_b COW record intact");
+    assert_eq!(
+        state.mapped_page_count_for_asid(asid_b),
+        1,
+        "asid_b page intact"
+    );
+    assert_eq!(
+        state.cow_page_count_for_asid(asid_b),
+        1,
+        "asid_b COW record intact"
+    );
 }
 
 #[test]
@@ -17123,12 +18544,20 @@ fn asid_destroy_puts_asid_in_retired_array_when_cpus_online() {
 
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
     assert!(state.asid_is_live_for_test(asid), "live before destroy");
-    assert!(!state.asid_is_retired_for_test(asid), "not retired before destroy");
+    assert!(
+        !state.asid_is_retired_for_test(asid),
+        "not retired before destroy"
+    );
 
-    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("destroy");
 
     assert!(!state.asid_is_live_for_test(asid), "not live after destroy");
-    assert!(state.asid_is_retired_for_test(asid), "retired after destroy");
+    assert!(
+        state.asid_is_retired_for_test(asid),
+        "retired after destroy"
+    );
 }
 
 #[test]
@@ -17138,7 +18567,9 @@ fn asid_not_reused_while_in_retired_array() {
     state.bring_up_cpu(CpuId(1)).expect("cpu1");
 
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
-    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("destroy");
     assert!(state.asid_is_retired_for_test(asid));
 
     // Allocate several new address spaces; none should have the same ASID.
@@ -17161,14 +18592,21 @@ fn stale_tlb_shootdown_for_retired_asid_is_harmless() {
     state.bring_up_cpu(CpuId(1)).expect("cpu1");
 
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
-    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("destroy");
     assert!(state.asid_is_retired_for_test(asid));
 
     // Inject an additional stale TlbShootdown work item on top of the real one.
     state
         .submit_cross_cpu_work(
             CpuId(0),
-            WorkItem::TlbShootdown { asid, va_range: None, requester: None, sequence: 0 },
+            WorkItem::TlbShootdown {
+                asid,
+                va_range: None,
+                requester: None,
+                sequence: 0,
+            },
         )
         .expect("stale item");
 
@@ -17187,19 +18625,29 @@ fn duplicate_tlb_shootdown_for_same_asid_harmless() {
     let mut state = Bootstrap::init().expect("init");
 
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
-    state.destroy_user_address_space(aspace_cap).expect("destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("destroy");
 
     // Submit a second duplicate shootdown.
     state
         .submit_cross_cpu_work(
             CpuId(0),
-            WorkItem::TlbShootdown { asid, va_range: None, requester: None, sequence: 0 },
+            WorkItem::TlbShootdown {
+                asid,
+                va_range: None,
+                requester: None,
+                sequence: 0,
+            },
         )
         .expect("duplicate submit");
 
     state.set_current_cpu(CpuId(0)).expect("cpu0");
     let result = state.process_cross_cpu_work_for_cpu(CpuId(0));
-    assert!(result.is_ok(), "duplicate TlbShootdown must not error: {result:?}");
+    assert!(
+        result.is_ok(),
+        "duplicate TlbShootdown must not error: {result:?}"
+    );
 }
 
 #[test]
@@ -17222,7 +18670,10 @@ fn tlb_shootdown_for_never_existing_asid_is_harmless() {
         .expect("submit phantom");
 
     let result = state.process_cross_cpu_work_for_cpu(CpuId(0));
-    assert!(result.is_ok(), "phantom ASID TlbShootdown must not error: {result:?}");
+    assert!(
+        result.is_ok(),
+        "phantom ASID TlbShootdown must not error: {result:?}"
+    );
 }
 
 // Part C — Two-phase unmap ordering and frame reclaim
@@ -17233,14 +18684,23 @@ fn two_phase_unmap_map_refcount_decrements_in_phase1() {
     // The frame must still exist (not yet reclaimed).
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
-    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xA000)).expect("memobj");
+    let (_mem_id, mem_cap) = state
+        .create_memory_object(PhysAddr(0xA000))
+        .expect("memobj");
     let phys = PhysAddr(0xA000);
 
     state
         .map_user_page_in_asid_with_caps(
-            asid, mem_cap, VirtAddr(0x3000),
-            PageFlags { read: true, write: false, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            asid,
+            mem_cap,
+            VirtAddr(0x3000),
+            PageFlags {
+                read: true,
+                write: false,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map");
 
@@ -17254,11 +18714,16 @@ fn two_phase_unmap_map_refcount_decrements_in_phase1() {
         .expect("page was mapped");
     assert_eq!(plan.phys, phys);
 
-    let refcounts = state.memory_object_refcounts(phys).expect("still exists after phase1");
+    let refcounts = state
+        .memory_object_refcounts(phys)
+        .expect("still exists after phase1");
     assert_eq!(refcounts.1, 0, "map_refcount == 0 after phase1");
 
     // Frame still exists (not reclaimed) until phase 2/3.
-    assert!(state.memory_object_exists_for_phys(phys), "frame must exist between phases");
+    assert!(
+        state.memory_object_exists_for_phys(phys),
+        "frame must exist between phases"
+    );
 
     // Phase 2+3: shootdown + reclaim.
     state.execute_tlb_shootdown_wait_plan(plan).expect("phase2");
@@ -17276,13 +18741,22 @@ fn two_phase_unmap_fast_path_no_cross_cpu_work() {
     // target_cpu_bitmap is 0 → fast path, no cross-CPU work item queued.
     let mut state = Bootstrap::init().expect("init");
     let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
-    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xB000)).expect("memobj");
+    let (_mem_id, mem_cap) = state
+        .create_memory_object(PhysAddr(0xB000))
+        .expect("memobj");
 
     state
         .map_user_page_in_asid_with_caps(
-            asid, mem_cap, VirtAddr(0x4000),
-            PageFlags { read: true, write: false, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            asid,
+            mem_cap,
+            VirtAddr(0x4000),
+            PageFlags {
+                read: true,
+                write: false,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map");
 
@@ -17341,8 +18815,12 @@ fn reclaim_blocked_while_map_refcount_nonzero() {
 
     // Lower cap_refcount to 0, manually bump map_refcount to 1.
     state.with_memory_state_mut(|memory| {
-        if let Some(obj) = memory.memory_objects.iter_mut().flatten()
-            .find(|o| o.phys == phys) {
+        if let Some(obj) = memory
+            .memory_objects
+            .iter_mut()
+            .flatten()
+            .find(|o| o.phys == phys)
+        {
             obj.cap_refcount = 0;
             obj.map_refcount = 1;
         }
@@ -17362,8 +18840,12 @@ fn reclaim_blocked_while_pin_refcount_nonzero() {
     let (_, _cap) = state.create_memory_object(phys).expect("memobj");
 
     state.with_memory_state_mut(|memory| {
-        if let Some(obj) = memory.memory_objects.iter_mut().flatten()
-            .find(|o| o.phys == phys) {
+        if let Some(obj) = memory
+            .memory_objects
+            .iter_mut()
+            .flatten()
+            .find(|o| o.phys == phys)
+        {
             obj.cap_refcount = 0;
             obj.pin_refcount = 1;
         }
@@ -17384,8 +18866,12 @@ fn reclaim_happens_when_all_refcounts_zero() {
 
     // Manually zero all refcounts.
     state.with_memory_state_mut(|memory| {
-        if let Some(obj) = memory.memory_objects.iter_mut().flatten()
-            .find(|o| o.phys == phys) {
+        if let Some(obj) = memory
+            .memory_objects
+            .iter_mut()
+            .flatten()
+            .find(|o| o.phys == phys)
+        {
             obj.cap_refcount = 0;
             obj.map_refcount = 0;
             obj.pin_refcount = 0;
@@ -17408,19 +18894,33 @@ fn cow_metadata_cleared_on_asid_destroy_after_fork() {
     let mut state = Bootstrap::init().expect("init");
     state.register_task(0).expect("idle");
     let (parent_asid, _parent_cap) = state.create_user_address_space().expect("parent asid");
-    let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0x15000)).expect("memobj");
+    let (_mem_id, mem_cap) = state
+        .create_memory_object(PhysAddr(0x15000))
+        .expect("memobj");
     state
         .map_user_page_in_asid_with_caps(
-            parent_asid, mem_cap, VirtAddr(0x1000),
-            PageFlags { read: true, write: true, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            parent_asid,
+            mem_cap,
+            VirtAddr(0x1000),
+            PageFlags {
+                read: true,
+                write: true,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map parent");
 
-    let child_asid = state.clone_user_address_space_cow(parent_asid).expect("fork");
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("fork");
     let parent_cow = state.cow_page_count_for_asid(parent_asid);
     let child_cow = state.cow_page_count_for_asid(child_asid);
-    assert!(parent_cow > 0 || child_cow > 0, "fork must produce COW records");
+    assert!(
+        parent_cow > 0 || child_cow > 0,
+        "fork must produce COW records"
+    );
 
     // Destroy child: child COW records gone, parent unaffected.
     let _ = state.destroy_user_address_space_by_asid(child_asid);
@@ -17442,7 +18942,9 @@ fn repeated_asid_destroy_by_asid_returns_error_not_panic() {
     // must return Err (InvalidAsid), not panic.
     let mut state = Bootstrap::init().expect("init");
     let (asid, aspace_cap) = state.create_user_address_space().expect("asid");
-    state.destroy_user_address_space(aspace_cap).expect("first destroy");
+    state
+        .destroy_user_address_space(aspace_cap)
+        .expect("first destroy");
 
     let result = state.destroy_user_address_space_by_asid(asid);
     assert!(
@@ -17460,15 +18962,24 @@ fn active_transfer_count_helper_tracks_mappings() {
     let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind1");
     let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-    let mem_cap_t1 = state.grant_capability_task_to_task(0, mem_cap, 1).expect("grant");
+    let mem_cap_t1 = state
+        .grant_capability_task_to_task(0, mem_cap, 1)
+        .expect("grant");
     state.enqueue_current_cpu(1).expect("enqueue");
     state.yield_current().expect("switch");
 
     state
         .map_user_page_in_asid_with_caps(
-            asid1, mem_cap_t1, VirtAddr(0x6000),
-            PageFlags { read: true, write: false, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            asid1,
+            mem_cap_t1,
+            VirtAddr(0x6000),
+            PageFlags {
+                read: true,
+                write: false,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map");
     state
@@ -17476,7 +18987,11 @@ fn active_transfer_count_helper_tracks_mappings() {
         .expect("register transfer");
     state.note_shared_mem_mapped(PAGE_SIZE);
 
-    assert_eq!(state.active_transfer_count_for_pid(1), 1, "one transfer registered");
+    assert_eq!(
+        state.active_transfer_count_for_pid(1),
+        1,
+        "one transfer registered"
+    );
 
     state.purge_active_transfer_mappings_for_pid(1);
     assert_eq!(
@@ -17495,15 +19010,24 @@ fn active_transfer_purge_is_idempotent() {
     let (asid1, _map_cap1) = state.create_user_address_space().expect("asid1");
     state.bind_task_asid(1, asid1).expect("bind1");
     let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
-    let mem_cap_t1 = state.grant_capability_task_to_task(0, mem_cap, 1).expect("grant");
+    let mem_cap_t1 = state
+        .grant_capability_task_to_task(0, mem_cap, 1)
+        .expect("grant");
     state.enqueue_current_cpu(1).expect("enqueue");
     state.yield_current().expect("switch");
 
     state
         .map_user_page_in_asid_with_caps(
-            asid1, mem_cap_t1, VirtAddr(0x7000),
-            PageFlags { read: true, write: false, execute: false, user: true,
-                        cache_policy: crate::kernel::vm::CachePolicy::WriteBack },
+            asid1,
+            mem_cap_t1,
+            VirtAddr(0x7000),
+            PageFlags {
+                read: true,
+                write: false,
+                execute: false,
+                user: true,
+                cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+            },
         )
         .expect("map");
     state
@@ -17548,10 +19072,17 @@ fn cap_refcount_decrement_on_revoke() {
     let (mo_id, cap) = state.alloc_anonymous_memory_object().expect("alloc");
     let cnode = state.current_task_cnode().expect("cnode");
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before revoke");
-    assert_eq!(state.memory.memory_objects[slot].expect("obj").cap_refcount, 1);
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot before revoke");
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").cap_refcount,
+        1
+    );
 
-    state.revoke_capability_in_cnode(cnode, cap).expect("revoke");
+    state
+        .revoke_capability_in_cnode(cnode, cap)
+        .expect("revoke");
 
     // cap_refcount reached 0 → MemoryObject must be reclaimed.
     assert!(
@@ -17607,7 +19138,10 @@ fn revoke_reply_cap_record_clears_global_slot() {
 
     // A second call must return 0 (already cleared).
     let revoked_again = state.revoke_reply_caps_for_caller(0);
-    assert_eq!(revoked_again, 0, "second revoke of already-cleared slot must return 0");
+    assert_eq!(
+        revoked_again, 0,
+        "second revoke of already-cleared slot must return 0"
+    );
 }
 
 #[test]
@@ -17690,8 +19224,13 @@ fn double_revoke_capability_is_safe() {
     let cnode = state.current_task_cnode().expect("cnode");
 
     // First revoke: should succeed and reclaim the MemoryObject.
-    state.revoke_capability_in_cnode(cnode, cap).expect("first revoke");
-    assert!(state.memory_object_slot_by_id(mo_id).is_none(), "reclaimed after first revoke");
+    state
+        .revoke_capability_in_cnode(cnode, cap)
+        .expect("first revoke");
+    assert!(
+        state.memory_object_slot_by_id(mo_id).is_none(),
+        "reclaimed after first revoke"
+    );
 
     // Second revoke on the same now-empty slot: must return Err(InvalidCapability),
     // not panic, and must not underflow any refcount.
@@ -17718,11 +19257,15 @@ fn fork_cap_inheritance_increments_refcount() {
             ..Default::default()
         })
         .expect("parent");
-    state.yield_current_to(ThreadId(51)).expect("switch to task51");
+    state
+        .yield_current_to(ThreadId(51))
+        .expect("switch to task51");
 
     let (mo_id, _mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot before fork");
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot before fork");
     assert_eq!(
         state.memory.memory_objects[slot].expect("mo").cap_refcount,
         1,
@@ -17731,7 +19274,9 @@ fn fork_cap_inheritance_increments_refcount() {
 
     let _child_tid = state.fork_user_process_cow(51).expect("fork");
 
-    let slot = state.memory_object_slot_by_id(mo_id).expect("slot after fork");
+    let slot = state
+        .memory_object_slot_by_id(mo_id)
+        .expect("slot after fork");
     assert_eq!(
         state.memory.memory_objects[slot].expect("mo").cap_refcount,
         2,
@@ -17865,7 +19410,9 @@ fn stage20_transfer_cap_materialize_success_sets_cap_refcount_to_two() {
     );
     // Envelope is consumed: a second take returns None.
     assert!(
-        state.take_transfer_envelope(handle, endpoint, ThreadId(1)).is_none(),
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(1))
+            .is_none(),
         "envelope must be consumed exactly once"
     );
     // The materialized cap is a fresh slot in the receiver cnode.
@@ -18035,7 +19582,10 @@ fn stage20_clear_reply_cap_waiter_cap_generation_guard() {
             let reply_index = 0usize;
             let reply_gen = state.with_ipc_state(|ipc| ipc.reply_cap_generations[reply_index]);
             state.set_reply_cap_waiter_cap(reply_index, reply_gen, reply_cap);
-            assert_eq!(state.reply_cap_record_waiter_cap(reply_index), Some(reply_cap));
+            assert_eq!(
+                state.reply_cap_record_waiter_cap(reply_index),
+                Some(reply_cap)
+            );
 
             // A clear with a stale generation must be ignored.
             state.clear_reply_cap_waiter_cap(reply_index, reply_gen.wrapping_sub(1));
@@ -18269,13 +19819,23 @@ fn stage20_transfer_envelope_double_take_is_harmless() {
             mem_cap,
             endpoint,
             None,
-            Some(TransferSharedRegion { offset: 0x2000, len: PAGE_SIZE as u64 }),
+            Some(TransferSharedRegion {
+                offset: 0x2000,
+                len: PAGE_SIZE as u64,
+            }),
         )
         .expect("stash");
     let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
-    assert_eq!(state.memory.memory_objects[slot].expect("obj").pin_refcount, 1);
+    assert_eq!(
+        state.memory.memory_objects[slot].expect("obj").pin_refcount,
+        1
+    );
 
-    assert!(state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_some());
+    assert!(
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .is_some()
+    );
     let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
     assert_eq!(
         state.memory.memory_objects[slot].expect("obj").pin_refcount,
@@ -18283,7 +19843,11 @@ fn stage20_transfer_envelope_double_take_is_harmless() {
         "pin_refcount must drop to 0 after take"
     );
     // Second take is a no-op: returns None, pin_refcount stays 0 (no underflow).
-    assert!(state.take_transfer_envelope(handle, endpoint, ThreadId(0)).is_none());
+    assert!(
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .is_none()
+    );
     let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
     assert_eq!(
         state.memory.memory_objects[slot].expect("obj").pin_refcount,
@@ -18318,7 +19882,9 @@ fn stage20_failed_transfer_send_cleans_envelope_and_keeps_refcount() {
     let t_created = state.ipc_path_telemetry().transfer_records_created;
     // Error path takes the envelope back with the bound receiver tid.
     assert!(
-        state.take_transfer_envelope(handle, endpoint, ThreadId(1)).is_some(),
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(1))
+            .is_some(),
         "error cleanup must take the envelope exactly once"
     );
     let t_mat = state.ipc_path_telemetry().transfer_records_materialized;
@@ -18328,7 +19894,10 @@ fn stage20_failed_transfer_send_cleans_envelope_and_keeps_refcount() {
         let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
         state.memory.memory_objects[slot].expect("obj").cap_refcount
     };
-    assert_eq!(after, before, "failed transfer must not change source cap_refcount");
+    assert_eq!(
+        after, before,
+        "failed transfer must not change source cap_refcount"
+    );
 }
 
 #[test]
@@ -18357,11 +19926,17 @@ fn stage20_active_transfer_mapping_is_two_phase_and_refcount_safe() {
         2,
         "mapping registration must not touch cap_refcount"
     );
-    assert!(state.active_transfer_mapping_for(ThreadId(1), derived).is_some());
+    assert!(
+        state
+            .active_transfer_mapping_for(ThreadId(1), derived)
+            .is_some()
+    );
 
     assert!(state.remove_active_transfer_mapping(ThreadId(1), derived));
     assert!(
-        state.active_transfer_mapping_for(ThreadId(1), derived).is_none(),
+        state
+            .active_transfer_mapping_for(ThreadId(1), derived)
+            .is_none(),
         "mapping must be removed exactly once"
     );
     // Removal of a non-existent mapping is a harmless false.
@@ -18389,7 +19964,10 @@ fn stage20_reply_cap_creation_does_not_change_memory_cap_refcount() {
 
             let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
             let after = state.memory.memory_objects[slot].expect("obj").cap_refcount;
-            assert_eq!(before, after, "reply-cap creation must not touch MemoryObject cap_refcount");
+            assert_eq!(
+                before, after,
+                "reply-cap creation must not touch MemoryObject cap_refcount"
+            );
         })
         .expect("spawn")
         .join()
@@ -18433,7 +20011,11 @@ fn stage21_signal_wakes_waiting_task_exactly_once() {
         ipc.notification_waiters[notif_idx] = Some(ThreadId(2101));
     });
     assert!(state.task_is_blocked(2101), "waiter blocked before signal");
-    assert_eq!(state.notification_waiter_count(notif_idx), 1, "waiter present");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        1,
+        "waiter present"
+    );
 
     state.route_external_irq(9).expect("irq");
     assert!(state.task_is_runnable(2101), "waiter woken to Runnable");
@@ -18446,7 +20028,11 @@ fn stage21_signal_wakes_waiting_task_exactly_once() {
     // Second IRQ: no registered waiter, task already Runnable, must stay Runnable.
     state.route_external_irq(9).expect("irq2");
     assert!(state.task_is_runnable(2101), "no double-wake");
-    assert_eq!(state.notification_waiter_count(notif_idx), 0, "still no waiter");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "still no waiter"
+    );
 }
 
 #[test]
@@ -18523,7 +20109,11 @@ fn stage21_mark_task_dead_clears_notification_waiter() {
     state.with_ipc_state_mut(|ipc| {
         ipc.notification_waiters[notif_idx] = Some(ThreadId(2105));
     });
-    assert_eq!(state.notification_waiter_count(notif_idx), 1, "before death");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        1,
+        "before death"
+    );
 
     state.mark_task_dead(2105).expect("dead");
     assert_eq!(
@@ -18555,7 +20145,11 @@ fn stage21_destroy_notification_clears_waiter_and_invalidates_caps() {
     });
 
     let waiter = state.destroy_notification(notif_idx).expect("destroy");
-    assert_eq!(waiter, Some(ThreadId(2106)), "destroy returns snapshotted waiter");
+    assert_eq!(
+        waiter,
+        Some(ThreadId(2106)),
+        "destroy returns snapshotted waiter"
+    );
     assert_eq!(
         state.notification_waiter_count(notif_idx),
         0,
@@ -18606,12 +20200,20 @@ fn stage21_wait_before_signal_registers_then_wakes() {
     state.with_ipc_state_mut(|ipc| {
         ipc.notification_waiters[notif_idx] = Some(ThreadId(2108));
     });
-    assert_eq!(state.notification_waiter_count(notif_idx), 1, "waiter registered");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        1,
+        "waiter registered"
+    );
     assert!(state.task_is_blocked(2108), "blocked before signal");
 
     state.route_external_irq(13).expect("irq");
     assert!(state.task_is_runnable(2108), "signal woke waiter");
-    assert_eq!(state.notification_waiter_count(notif_idx), 0, "waiter consumed");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        0,
+        "waiter consumed"
+    );
 }
 
 #[test]
@@ -18762,7 +20364,11 @@ fn stage22_notification_cap_revoke_clears_waiter() {
     state.with_ipc_state_mut(|ipc| {
         ipc.notification_waiters[notif_idx] = Some(ThreadId(2201));
     });
-    assert_eq!(state.notification_waiter_count(notif_idx), 1, "waiter before revoke");
+    assert_eq!(
+        state.notification_waiter_count(notif_idx),
+        1,
+        "waiter before revoke"
+    );
     assert!(state.task_is_blocked(2201), "blocked before revoke");
 
     let cnode = state.current_task_cnode().expect("cnode");
@@ -18922,7 +20528,10 @@ fn stage22_double_revoke_notification_cap_is_safe() {
     // Second revoke of the now-empty slot: InvalidCapability (slot cleared), and
     // destroy_notification's WrongObject is swallowed — no extra generation bump.
     let second = state.revoke_capability_in_cnode(cnode, notif_cap);
-    assert!(second.is_err(), "second revoke of empty slot errors: {second:?}");
+    assert!(
+        second.is_err(),
+        "second revoke of empty slot errors: {second:?}"
+    );
     let gen_after_second = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
     assert_eq!(
         gen_after_first, gen_after_second,
@@ -19079,7 +20688,10 @@ fn stage23_notification_cleanup_idempotent_double_revoke() {
     let gen_after_first = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
 
     let second = state.revoke_capability_in_cnode(cnode, notif_cap);
-    assert!(second.is_err(), "second revoke of empty slot errors: {second:?}");
+    assert!(
+        second.is_err(),
+        "second revoke of empty slot errors: {second:?}"
+    );
     let gen_after_second = state.with_ipc_state(|ipc| ipc.notification_generations[notif_idx]);
     assert_eq!(
         gen_after_first, gen_after_second,
@@ -19113,7 +20725,11 @@ fn stage23_transfer_release_syscall_cannot_target_notification_cap() {
 
     // ABI guard: the release surface is exactly the 30-slot table; no cap-release
     // syscall number was added.
-    assert_eq!(crate::kernel::syscall::SYSCALL_COUNT, 30, "SYSCALL_COUNT unchanged");
+    assert_eq!(
+        crate::kernel::syscall::SYSCALL_COUNT,
+        30,
+        "SYSCALL_COUNT unchanged"
+    );
 }
 
 #[test]
@@ -19260,11 +20876,17 @@ fn stage25c_caller_exits_first_then_replier_exit_is_idempotent() {
                 .expect("create reply cap");
 
             state.mark_task_dead(1).expect("caller dead");
-            assert!(!state.reply_cap_record_present(0), "record cleared by caller exit");
+            assert!(
+                !state.reply_cap_record_present(0),
+                "record cleared by caller exit"
+            );
 
             // Replier teardown: slot already None → 0 revoked, no-op.
             let revoked = state.revoke_reply_caps_for_replier(2);
-            assert_eq!(revoked, 0, "replier revoke after caller cleared must be a no-op");
+            assert_eq!(
+                revoked, 0,
+                "replier revoke after caller cleared must be a no-op"
+            );
             state.mark_task_dead(2).expect("replier dead is idempotent");
             assert!(!state.reply_cap_record_present(0));
         })
@@ -19293,11 +20915,17 @@ fn stage25c_replier_exits_first_then_caller_cleanup_is_idempotent() {
                 .expect("create reply cap");
 
             state.mark_task_dead(2).expect("replier dead");
-            assert!(!state.reply_cap_record_present(0), "record cleared by replier exit");
+            assert!(
+                !state.reply_cap_record_present(0),
+                "record cleared by replier exit"
+            );
 
             // Caller teardown: slot already None → 0 revoked, no-op.
             let revoked = state.revoke_reply_caps_for_caller(1);
-            assert_eq!(revoked, 0, "caller revoke after replier cleared must be a no-op");
+            assert_eq!(
+                revoked, 0,
+                "caller revoke after replier cleared must be a no-op"
+            );
             state.mark_task_dead(1).expect("caller dead is idempotent");
             assert!(!state.reply_cap_record_present(0));
         })
@@ -19330,7 +20958,10 @@ fn stage25c_both_exit_no_leak_no_underflow() {
             // mark_task_dead(1) runs both revoke_reply_caps_for_caller(1) and
             // revoke_reply_caps_for_replier(1); the first clears, the second no-ops.
             state.mark_task_dead(1).expect("mark dead");
-            assert!(!state.reply_cap_record_present(0), "record must be gone, not leaked");
+            assert!(
+                !state.reply_cap_record_present(0),
+                "record must be gone, not leaked"
+            );
 
             // Re-running both directly is still a clean no-op.
             assert_eq!(state.revoke_reply_caps_for_caller(1), 0);
@@ -19437,8 +21068,14 @@ fn stage25c_unrelated_reply_record_unaffected() {
 
             // Tear down replier 2 only.
             let revoked = state.revoke_reply_caps_for_replier(2);
-            assert_eq!(revoked, 1, "exactly the one record for replier 2 must be cleared");
-            assert!(!state.reply_cap_record_present(0), "replier-2 record cleared");
+            assert_eq!(
+                revoked, 1,
+                "exactly the one record for replier 2 must be cleared"
+            );
+            assert!(
+                !state.reply_cap_record_present(0),
+                "replier-2 record cleared"
+            );
             assert!(
                 state.reply_cap_record_present(1),
                 "unrelated replier-3 record must be unaffected"
@@ -19539,7 +21176,11 @@ fn stage25d_task_exit_clears_endpoint_receiver_waiter() {
             state.with_ipc_state_mut(|ipc| {
                 ipc.endpoint_waiters[ep] = Some(ThreadId(1));
             });
-            assert_eq!(state.endpoint_waiter_count(ep), 1, "precondition: receiver waiter");
+            assert_eq!(
+                state.endpoint_waiter_count(ep),
+                1,
+                "precondition: receiver waiter"
+            );
 
             state.exit_task(1, 0).expect("exit task 1");
 
@@ -19567,9 +21208,16 @@ fn stage25d_task_exit_clears_endpoint_sender_waiter() {
             let (ep, _send_cap, _recv_cap) = state.create_endpoint(4).expect("endpoint");
             let msg = Message::new(0, b"blocked-send").expect("msg");
             state.with_ipc_state_mut(|ipc| {
-                ipc.endpoint_sender_waiters[ep][0] = Some(SenderWaiter { tid: ThreadId(1), msg });
+                ipc.endpoint_sender_waiters[ep][0] = Some(SenderWaiter {
+                    tid: ThreadId(1),
+                    msg,
+                });
             });
-            assert_eq!(state.sender_waiter_count(ep), 1, "precondition: sender waiter");
+            assert_eq!(
+                state.sender_waiter_count(ep),
+                1,
+                "precondition: sender waiter"
+            );
 
             state.exit_task(1, 0).expect("exit task 1");
 
@@ -19600,11 +21248,19 @@ fn stage25d_repeated_waiter_cleanup_idempotent() {
             });
 
             state.clear_ipc_waiters_for_tid(1);
-            assert_eq!(state.endpoint_waiter_count(ep), 0, "first clear removes waiter");
+            assert_eq!(
+                state.endpoint_waiter_count(ep),
+                0,
+                "first clear removes waiter"
+            );
             // Repeated clears must not panic or resurrect anything.
             state.clear_ipc_waiters_for_tid(1);
             state.clear_ipc_waiters_for_tid(1);
-            assert_eq!(state.endpoint_waiter_count(ep), 0, "repeated clear is a no-op");
+            assert_eq!(
+                state.endpoint_waiter_count(ep),
+                0,
+                "repeated clear is a no-op"
+            );
         })
         .expect("spawn")
         .join()
@@ -19909,15 +21565,13 @@ mod stage27_split_mut_tests {
                 before.saturating_add(8)
             });
 
-            let waiter_before =
-                kernel.with(|state| state.notification_waiter_count(NOTIF_IDX));
+            let waiter_before = kernel.with(|state| state.notification_waiter_count(NOTIF_IDX));
 
             kernel
                 .control_plane_set_process_cnode_slots_split_mut(SS, APP, requested)
                 .expect("split-mut resize");
 
-            let waiter_after =
-                kernel.with(|state| state.notification_waiter_count(NOTIF_IDX));
+            let waiter_after = kernel.with(|state| state.notification_waiter_count(NOTIF_IDX));
             assert_eq!(waiter_before, 1, "precondition: waiter planted");
             assert_eq!(
                 waiter_before, waiter_after,
@@ -19941,8 +21595,8 @@ mod stage29a_live_split_dispatch_tests {
     use super::*;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::{
-        Syscall, SyscallError, SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, SYSCALL_COUNT,
-        SYSCALL_IPC_RECV_NR, SYSCALL_IPC_SEND_NR, SYSCALL_SPAWN_PROCESS_NR, SYSCALL_VM_MAP_NR,
+        SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, SYSCALL_COUNT, SYSCALL_IPC_RECV_NR,
+        SYSCALL_IPC_SEND_NR, SYSCALL_SPAWN_PROCESS_NR, SYSCALL_VM_MAP_NR, Syscall, SyscallError,
     };
     use crate::kernel::syscall_split::{classify_split_eligible, try_split_dispatch_into_frame};
     use crate::kernel::trapframe::TrapFrame;
@@ -20084,7 +21738,11 @@ mod stage29a_live_split_dispatch_tests {
         let mut frame = cnode_slots_frame(requester, 600);
         let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         let after_tid = kernel.current_tid_split_read(CPU0);
-        assert_eq!(after_tid, Some(requester), "no task switch across the probe");
+        assert_eq!(
+            after_tid,
+            Some(requester),
+            "no task switch across the probe"
+        );
     }
 
     #[test]
@@ -20171,8 +21829,8 @@ mod stage29a_live_split_dispatch_tests {
 #[cfg(test)]
 mod stage30_boot_guard_tests {
     use crate::runtime::{
-        begin_boot_raw_borrow_window, boot_raw_borrow_is_active, end_boot_raw_borrow_window,
-        BootRawKernelBorrowGuard,
+        BootRawKernelBorrowGuard, begin_boot_raw_borrow_window, boot_raw_borrow_is_active,
+        end_boot_raw_borrow_window,
     };
 
     #[test]
@@ -20218,7 +21876,10 @@ mod stage30_boot_guard_tests {
         assert!(boot_raw_borrow_is_active());
         {
             let _guard = BootRawKernelBorrowGuard;
-            assert!(boot_raw_borrow_is_active(), "still active while guard is held");
+            assert!(
+                boot_raw_borrow_is_active(),
+                "still active while guard is held"
+            );
         }
         assert!(
             !boot_raw_borrow_is_active(),
@@ -20256,8 +21917,8 @@ mod stage31_split_recv_tests {
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::{
-        try_split_recv_queued_plain_into_frame_locked, Syscall, SyscallError, SYSCALL_COUNT,
-        SYSCALL_NO_TRANSFER_CAP,
+        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError,
+        try_split_recv_queued_plain_into_frame_locked,
     };
     use crate::kernel::task::TaskStatus;
     use crate::kernel::trapframe::TrapFrame;
@@ -20301,7 +21962,11 @@ mod stage31_split_recv_tests {
         // Kernel-task lanes: ret0 == sender_tid, ret1 == raw payload len, ret2 == NO_TRANSFER_CAP.
         assert_eq!(frame.ret0(), 7, "ret0 == sender tid");
         assert_eq!(frame.ret1(), b"ping".len(), "ret1 == raw payload len");
-        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "ret2 == no transfer cap");
+        assert_eq!(
+            frame.ret2() as u64,
+            SYSCALL_NO_TRANSFER_CAP,
+            "ret2 == no transfer cap"
+        );
         assert_eq!(frame.error_code(), None, "no error on success");
     }
 
@@ -20322,9 +21987,21 @@ mod stage31_split_recv_tests {
         crate::kernel::syscall::dispatch(&mut old_state, &mut old_frame)
             .expect("global-lock recv dispatch");
 
-        assert_eq!(split_frame.ret0(), old_frame.ret0(), "ret0 lane equivalence");
-        assert_eq!(split_frame.ret1(), old_frame.ret1(), "ret1 lane equivalence");
-        assert_eq!(split_frame.ret2(), old_frame.ret2(), "ret2 lane equivalence");
+        assert_eq!(
+            split_frame.ret0(),
+            old_frame.ret0(),
+            "ret0 lane equivalence"
+        );
+        assert_eq!(
+            split_frame.ret1(),
+            old_frame.ret1(),
+            "ret1 lane equivalence"
+        );
+        assert_eq!(
+            split_frame.ret2(),
+            old_frame.ret2(),
+            "ret2 lane equivalence"
+        );
         assert_eq!(
             split_frame.error_code(),
             old_frame.error_code(),
@@ -20348,8 +22025,12 @@ mod stage31_split_recv_tests {
         // Queue two messages; one split recv must leave exactly one queued.
         let mut state = Bootstrap::init().expect("init");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
-        state.ipc_send(send_cap, Message::new(7, b"a").expect("m")).expect("s1");
-        state.ipc_send(send_cap, Message::new(8, b"b").expect("m")).expect("s2");
+        state
+            .ipc_send(send_cap, Message::new(7, b"a").expect("m"))
+            .expect("s1");
+        state
+            .ipc_send(send_cap, Message::new(8, b"b").expect("m"))
+            .expect("s2");
 
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
@@ -20360,7 +22041,10 @@ mod stage31_split_recv_tests {
         assert_eq!(frame.ret0(), 7);
 
         // Exactly one remains: a global-lock recv returns the second, a third returns empty.
-        let second = state.try_ipc_recv(recv_cap).expect("recv2").expect("one left");
+        let second = state
+            .try_ipc_recv(recv_cap)
+            .expect("recv2")
+            .expect("one left");
         assert_eq!(second.sender_tid.0, 8);
         assert_eq!(state.try_ipc_recv(recv_cap).expect("recv3"), None);
     }
@@ -20375,7 +22059,11 @@ mod stage31_split_recv_tests {
             None,
             "empty endpoint must fall back (None), not error"
         );
-        assert_eq!(frame.error_code(), None, "fallback must not write an error lane");
+        assert_eq!(
+            frame.error_code(),
+            None,
+            "fallback must not write an error lane"
+        );
     }
 
     #[test]
@@ -20504,7 +22192,11 @@ mod stage31_split_recv_tests {
         let before = state.current_tid();
         let mut frame = recv_frame(recv_cap);
         let _ = try_split_recv_queued_plain_into_frame_locked(&mut state, &mut frame);
-        assert_eq!(state.current_tid(), before, "no task switch (task_switched==false)");
+        assert_eq!(
+            state.current_tid(),
+            before,
+            "no task switch (task_switched==false)"
+        );
     }
 
     #[test]
@@ -20544,7 +22236,11 @@ mod stage31_split_recv_tests {
         });
         let mut frame = recv_frame(recv_cap);
         let result = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
-        assert_eq!(result, Some(Ok(())), "wrapper must service queued plain recv");
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "wrapper must service queued plain recv"
+        );
         assert_eq!(frame.ret0(), 7);
         assert_eq!(frame.ret1(), b"ping".len());
         assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
@@ -20600,18 +22296,21 @@ mod stage32_cap_resolution_tests {
     use crate::kernel::capabilities::{CapId, CapObject, CapRights};
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
     use crate::kernel::task::TaskClass;
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::{
-        EndpointRecvCapSnapshot, IpcRecvQueuedPlainWritebackPlan, SharedKernel, MAX_PLAIN_PAYLOAD,
+        EndpointRecvCapSnapshot, IpcRecvQueuedPlainWritebackPlan, MAX_PLAIN_PAYLOAD, SharedKernel,
     };
     use std::vec::Vec;
 
     const CPU0: CpuId = CpuId(0);
 
     fn recv_frame(recv_cap: CapId) -> TrapFrame {
-        TrapFrame::new(Syscall::IpcRecv as usize, [recv_cap.0 as usize, 0, 0, 0, 0, 0])
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        )
     }
 
     fn recv_v2_frame(recv_cap: CapId) -> TrapFrame {
@@ -20651,10 +22350,16 @@ mod stage32_cap_resolution_tests {
             matches!(snapshot.endpoint, CapObject::Endpoint { .. }),
             "snapshot endpoint object is an Endpoint"
         );
-        assert!(snapshot.rights.contains(CapRights::RECEIVE), "carries RECEIVE");
+        assert!(
+            snapshot.rights.contains(CapRights::RECEIVE),
+            "carries RECEIVE"
+        );
         assert_eq!(snapshot.requester_tid, 0, "requester tid captured");
         assert_eq!(snapshot.requester_pid, 0, "requester pid captured");
-        assert!(snapshot.endpoint_index().is_some(), "endpoint index present");
+        assert!(
+            snapshot.endpoint_index().is_some(),
+            "endpoint index present"
+        );
     }
 
     #[test]
@@ -20663,7 +22368,11 @@ mod stage32_cap_resolution_tests {
         let err = kernel
             .resolve_endpoint_recv_cap_split_read(0, CapId(999_999))
             .expect_err("missing cap must error");
-        assert_eq!(err, KernelError::InvalidCapability, "missing cap → InvalidCapability");
+        assert_eq!(
+            err,
+            KernelError::InvalidCapability,
+            "missing cap → InvalidCapability"
+        );
     }
 
     #[test]
@@ -20671,8 +22380,7 @@ mod stage32_cap_resolution_tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         // An AddressSpace map cap is a non-endpoint object in the active cnode.
         let aspace_cap = kernel.with(|state| {
-            let (_asid, aspace_map_cap) =
-                state.create_user_address_space().expect("aspace");
+            let (_asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
             aspace_map_cap
         });
         let err = kernel
@@ -20692,7 +22400,11 @@ mod stage32_cap_resolution_tests {
         let err = kernel
             .resolve_endpoint_recv_cap_split_read(0, send_cap)
             .expect_err("send-only endpoint cap must error");
-        assert_eq!(err, KernelError::MissingRight, "no RECEIVE right → MissingRight");
+        assert_eq!(
+            err,
+            KernelError::MissingRight,
+            "no RECEIVE right → MissingRight"
+        );
     }
 
     #[test]
@@ -20710,7 +22422,10 @@ mod stage32_cap_resolution_tests {
             .with(|state| state.try_ipc_recv(recv_cap))
             .expect("recv")
             .expect("message still queued after cap resolution");
-        assert_eq!(got.sender_tid.0, 7, "queued message intact (no IPC mutation)");
+        assert_eq!(
+            got.sender_tid.0, 7,
+            "queued message intact (no IPC mutation)"
+        );
     }
 
     #[test]
@@ -20805,7 +22520,11 @@ mod stage32_cap_resolution_tests {
         assert_eq!(result, Some(Ok(())), "cap resolve + dequeue must succeed");
         assert_eq!(frame.ret0(), 7, "ret0 == sender tid");
         assert_eq!(frame.ret1(), b"ping".len(), "ret1 == raw payload len");
-        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "ret2 == no transfer cap");
+        assert_eq!(
+            frame.ret2() as u64,
+            SYSCALL_NO_TRANSFER_CAP,
+            "ret2 == no transfer cap"
+        );
         assert_eq!(frame.error_code(), None, "no error on success");
     }
 
@@ -20822,7 +22541,11 @@ mod stage32_cap_resolution_tests {
         let ref_err = crate::kernel::syscall::dispatch(&mut ref_state, &mut ref_frame).err();
         match split {
             Some(Err(TrapHandleError::Syscall(s))) => {
-                assert_eq!(Some(s), ref_err, "split invalid-cap error must equal old path");
+                assert_eq!(
+                    Some(s),
+                    ref_err,
+                    "split invalid-cap error must equal old path"
+                );
             }
             other => panic!("expected Some(Err(Syscall)), got {other:?}"),
         }
@@ -20832,18 +22555,14 @@ mod stage32_cap_resolution_tests {
     fn stage32_integrated_wrong_object_matches_old_path() {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let aspace_cap = kernel.with(|state| {
-            let (_asid, aspace_map_cap) =
-                state.create_user_address_space().expect("aspace");
+            let (_asid, aspace_map_cap) = state.create_user_address_space().expect("aspace");
             aspace_map_cap
         });
         let mut frame = recv_frame(aspace_cap);
         let split = kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame);
 
         let mut ref_state = Bootstrap::init().expect("init");
-        let ref_aspace = ref_state
-            .create_user_address_space()
-            .expect("aspace ref")
-            .1;
+        let ref_aspace = ref_state.create_user_address_space().expect("aspace ref").1;
         let mut ref_frame = recv_frame(ref_aspace);
         let ref_err = crate::kernel::syscall::dispatch(&mut ref_state, &mut ref_frame).err();
         match split {
@@ -20900,9 +22619,8 @@ mod stage32_cap_resolution_tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let recv_cap = kernel.with(|state| {
             let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
-            let msg =
-                Message::with_header(7, 0, Message::FLAG_CAP_TRANSFER_PLAIN, Some(0), b"x")
-                    .expect("cap-transfer message");
+            let msg = Message::with_header(7, 0, Message::FLAG_CAP_TRANSFER_PLAIN, Some(0), b"x")
+                .expect("cap-transfer message");
             state.ipc_send(send_cap, msg).expect("send");
             recv_cap
         });
@@ -20951,15 +22669,26 @@ mod stage32_cap_resolution_tests {
         assert_eq!(split_frame.ret0(), old_frame.ret0(), "ret0 equivalence");
         assert_eq!(split_frame.ret1(), old_frame.ret1(), "ret1 equivalence");
         assert_eq!(split_frame.ret2(), old_frame.ret2(), "ret2 equivalence");
-        assert_eq!(split_frame.arg(3), old_frame.arg(3), "inline word 0 equivalence");
-        assert_eq!(split_frame.arg(4), old_frame.arg(4), "inline word 1 equivalence");
+        assert_eq!(
+            split_frame.arg(3),
+            old_frame.arg(3),
+            "inline word 0 equivalence"
+        );
+        assert_eq!(
+            split_frame.arg(4),
+            old_frame.arg(4),
+            "inline word 1 equivalence"
+        );
     }
 
     // ── Writeback plan tests (Part 7, ≥4) ────────────────────────────────────
 
     fn sample_snapshot() -> EndpointRecvCapSnapshot {
         EndpointRecvCapSnapshot {
-            endpoint: CapObject::Endpoint { index: 0, generation: 1 },
+            endpoint: CapObject::Endpoint {
+                index: 0,
+                generation: 1,
+            },
             rights: CapRights::RECEIVE,
             requester_tid: 0,
             requester_pid: 0,
@@ -20969,8 +22698,8 @@ mod stage32_cap_resolution_tests {
     #[test]
     fn stage32_writeback_plan_stores_payload() {
         let snap = sample_snapshot();
-        let plan = IpcRecvQueuedPlainWritebackPlan::for_kernel_task(&snap, 7, b"ping")
-            .expect("plan");
+        let plan =
+            IpcRecvQueuedPlainWritebackPlan::for_kernel_task(&snap, 7, b"ping").expect("plan");
         assert_eq!(plan.payload(), b"ping", "plan captures payload bytes");
         assert_eq!(plan.payload_len(), 4, "payload len captured");
         assert_eq!(plan.sender_tid(), 7, "sender tid captured");
@@ -21011,14 +22740,18 @@ mod stage32_cap_resolution_tests {
         let snap = kernel
             .resolve_endpoint_recv_cap_split_read(0, recv_cap)
             .expect("resolve");
-        let plan = IpcRecvQueuedPlainWritebackPlan::for_kernel_task(&snap, 7, b"abcd")
-            .expect("plan");
+        let plan =
+            IpcRecvQueuedPlainWritebackPlan::for_kernel_task(&snap, 7, b"abcd").expect("plan");
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
             kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
             Some(Ok(()))
         );
-        assert_eq!(frame.ret0() as u64, plan.sender_tid(), "ret0 == plan sender");
+        assert_eq!(
+            frame.ret0() as u64,
+            plan.sender_tid(),
+            "ret0 == plan sender"
+        );
         assert_eq!(frame.ret1(), plan.payload_len(), "ret1 == plan payload len");
         assert_eq!(frame.ret2() as u64, plan.ret_cap(), "ret2 == plan ret_cap");
     }
@@ -21030,8 +22763,7 @@ mod stage32_cap_resolution_tests {
         // by stage32_integrated_user_asid_receiver_fallback). Here we assert the
         // for_kernel_task plan is always flagged kernel-task (user path disabled).
         let snap = sample_snapshot();
-        let plan = IpcRecvQueuedPlainWritebackPlan::for_kernel_task(&snap, 7, b"x")
-            .expect("plan");
+        let plan = IpcRecvQueuedPlainWritebackPlan::for_kernel_task(&snap, 7, b"x").expect("plan");
         assert!(
             plan.is_kernel_task(),
             "scaffolded plan only supports the kernel-task branch"
@@ -21092,7 +22824,11 @@ mod stage32_cap_resolution_tests {
         );
         assert_eq!(frame.ret0(), 7, "sender tid lane");
         assert_eq!(frame.ret1(), b"ping".len(), "payload len lane");
-        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "no transfer cap");
+        assert_eq!(
+            frame.ret2() as u64,
+            SYSCALL_NO_TRANSFER_CAP,
+            "no transfer cap"
+        );
     }
 
     #[test]
@@ -21110,7 +22846,11 @@ mod stage32_cap_resolution_tests {
         let mut frame = recv_frame(recv_cap);
         let result =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
-        assert_eq!(result, Some(Ok(())), "live seam services kernel-task queued plain recv");
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "live seam services kernel-task queued plain recv"
+        );
         assert_eq!(frame.ret0(), 7);
         assert_eq!(frame.ret1(), b"pong".len());
         assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
@@ -21236,5 +22976,646 @@ mod stage32_cap_resolution_tests {
     #[test]
     fn stage32b_syscall_count_30() {
         assert_eq!(SYSCALL_COUNT, 30, "Stage 32B must not change SYSCALL_COUNT");
+    }
+}
+
+// ── Stage 33+34: Canonical receive core + recv_shared_v3 adapter scaffold ─────
+//
+// Tests are organized in the groups specified in the Stage 33+34 task:
+//   A. Legacy ipc_recv adapter tests
+//   B. IpcRecvTimeout adapter tests
+//   C. recv-v2 adapter tests
+//   D. Copy-failure semantics tests (document current behavior)
+//   E. recv_shared_v3 design tests (helper-only; no syscall dispatch)
+//   F. Regression tests (Stage 32B/NR8/user-ASID/full IPC)
+mod stage33_34 {
+    use crate::kernel::boot::{Bootstrap, TrapHandleError};
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::recv_core::{
+        FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
+        RecvPlan, RecvRequest, RecvRequestKind, plan_recv_core,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CAP0: CapId = CapId(1);
+
+    fn recv_frame(recv_cap: CapId) -> TrapFrame {
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        )
+    }
+
+    fn recv_v2_frame(recv_cap: CapId) -> TrapFrame {
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0x4000, 256, 0x5000, 40, 0],
+        )
+    }
+
+    fn kernel_with_queued_plain(payload: &[u8]) -> (SharedKernel, CapId) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, payload).expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        (kernel, recv_cap)
+    }
+
+    // ── A. Legacy ipc_recv adapter tests ────────────────────────────────────
+
+    #[test]
+    fn stage33_legacy_adapter_kernel_task_plan_eligible() {
+        let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, 0, 0, true);
+        assert_eq!(req.kind, RecvRequestKind::LegacyRecv);
+        assert_eq!(req.payload_target, RecvPayloadTarget::KernelRegister);
+        assert_eq!(req.meta_target, RecvMetaTarget::None);
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelPlainEligible);
+    }
+
+    #[test]
+    fn stage33_legacy_adapter_user_asid_plan_fallback() {
+        let req = RecvRequest::from_legacy_ipc_recv(3, CAP0, 0x4000, 256, 0, 0, false);
+        assert_eq!(
+            req.payload_target,
+            RecvPayloadTarget::UserMemory {
+                ptr: 0x4000,
+                len: 256
+            }
+        );
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics),
+            "user-ASID recv must fall back through plan_recv_core"
+        );
+    }
+
+    #[test]
+    fn stage33_legacy_adapter_v2_meta_detected() {
+        let req = RecvRequest::from_legacy_ipc_recv(1, CAP0, 0x1000, 128, 0x2000, 40, false);
+        assert_eq!(
+            req.meta_target,
+            RecvMetaTarget::V2 {
+                ptr: 0x2000,
+                len: 40
+            }
+        );
+        // v2 meta with user-ASID: both user-ASID and meta-copy blockers; user-ASID wins.
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics),
+        );
+    }
+
+    #[test]
+    fn stage33_legacy_adapter_v2_meta_kernel_task_fallback_on_meta() {
+        // Kernel-task with v2 meta pointer → meta-copy fallback.
+        let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, 0x2000, 40, true);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy),
+        );
+    }
+
+    #[test]
+    fn stage33_legacy_adapter_invalid_cap_matches_old_path_error() {
+        // An invalid recv cap through the LIVE seam returns the same error as
+        // the global-lock path (not a fallback None, but Some(Err(...))).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut frame = recv_frame(CapId(987_654));
+        let split =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let mut ref_state = Bootstrap::init().expect("init");
+        let mut ref_frame = recv_frame(CapId(987_654));
+        let ref_err = crate::kernel::syscall::dispatch(&mut ref_state, &mut ref_frame).err();
+        match (split, ref_err) {
+            (Some(Err(TrapHandleError::Syscall(s))), Some(r)) => {
+                assert_eq!(
+                    s, r,
+                    "Stage 33 live seam error must equal global-lock recv error"
+                );
+            }
+            other => panic!("invalid-cap result divergence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage33_kernel_task_queued_plain_recv_through_canonical_core() {
+        // The Stage 32B live seam now routes through the canonical recv_core.
+        // Behavior must be byte-for-byte identical to Stage 32B.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"pong");
+        let mut frame = recv_frame(recv_cap);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "canonical core must service kernel-task queued plain"
+        );
+        assert_eq!(frame.ret0(), 7, "ret0 = sender tid");
+        assert_eq!(frame.ret1(), b"pong".len(), "ret1 = payload len");
+        assert_eq!(
+            frame.ret2() as u64,
+            SYSCALL_NO_TRANSFER_CAP,
+            "ret2 = NO_TRANSFER_CAP"
+        );
+    }
+
+    #[test]
+    fn stage33_canonical_core_fallback_for_user_asid() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind asid");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "canonical core must fall back for user-ASID receiver (copy-failure semantics)"
+        );
+    }
+
+    #[test]
+    fn stage33_canonical_core_fallback_for_recv_v2() {
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
+        let mut frame = recv_v2_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "canonical core must fall back for recv-v2 (meta user-copy required)"
+        );
+    }
+
+    // ── B. IpcRecvTimeout adapter tests ─────────────────────────────────────
+
+    #[test]
+    fn stage33_timeout_adapter_zero_ticks_is_nonblocking_probe() {
+        let req = RecvRequest::from_ipc_recv_timeout(5, CAP0, 0, 0, 0, None, true);
+        assert_eq!(req.kind, RecvRequestKind::NonblockingProbe);
+        assert_eq!(req.blocking, RecvBlockingPolicy::NoWait);
+        // Shape is eligible (kernel task, no meta)
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelPlainEligible);
+    }
+
+    #[test]
+    fn stage33_timeout_adapter_nonzero_ticks_is_timed_recv() {
+        let req = RecvRequest::from_ipc_recv_timeout(5, CAP0, 0x4000, 256, 100, Some(9999), false);
+        assert_eq!(req.kind, RecvRequestKind::TimedRecv);
+        assert_eq!(req.blocking, RecvBlockingPolicy::Deadline(9999));
+        // User-ASID → fallback
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics)
+        );
+    }
+
+    #[test]
+    fn stage33_timeout_adapter_full_path_behavior_unchanged() {
+        // IpcRecvTimeout (NR 5) is NOT on the split-eligible list and must still
+        // fall back to the global-lock path through the live seam.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "IpcRecvTimeout must fall back through live seam (NR 5 not split-eligible)"
+        );
+    }
+
+    // ── C. recv-v2 adapter tests ─────────────────────────────────────────────
+
+    #[test]
+    fn stage33_recv_v2_adapter_meta_target_populated() {
+        let req = RecvRequest::from_recv_v2(2, CAP0, 0x1000, 64, 0x2000, 40, false);
+        assert_eq!(
+            req.meta_target,
+            RecvMetaTarget::V2 {
+                ptr: 0x2000,
+                len: 40
+            }
+        );
+        assert_eq!(
+            req.payload_target,
+            RecvPayloadTarget::UserMemory {
+                ptr: 0x1000,
+                len: 64
+            }
+        );
+        // Still falls back (user-ASID check fires first)
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics)
+        );
+    }
+
+    #[test]
+    fn stage33_recv_v2_adapter_small_meta_len_yields_no_meta() {
+        let req = RecvRequest::from_recv_v2(2, CAP0, 0x1000, 64, 0x2000, 5, false);
+        assert_eq!(req.meta_target, RecvMetaTarget::None);
+    }
+
+    #[test]
+    fn stage33_recv_v2_full_path_still_fallback_via_seam() {
+        // A recv-v2 IpcRecv request (NR 2 with meta pointer) must still fall
+        // back through the LIVE seam.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
+        let mut frame = recv_v2_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "recv-v2 must fall back via live seam (meta user-copy required)"
+        );
+    }
+
+    // ── D. Copy-failure semantics tests ──────────────────────────────────────
+    //
+    // These tests document the current copy-failure behavior.  They verify
+    // observable invariants WITHOUT changing the behavior.
+    // See doc/KERNEL_LOCKING.md §52 for the full semantics table.
+
+    #[test]
+    fn stage33_copy_failure_user_asid_recv_falls_back_not_dequeues() {
+        // A user-ASID recv on the split path returns None (fallback).
+        // The queue is NOT dequeued on the split path; the global-lock path
+        // handles the dequeue with its own copy semantics.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"data").expect("m"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind asid");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        // Split path falls back — message stays in queue.
+        let split =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(split, None, "user-ASID recv must fall back (not dequeue)");
+        // Message is still in the queue (not consumed by the split path).
+        // Verify by unbinding the ASID and trying again as a kernel task.
+        kernel.with(|state| state.unbind_task_asid(0).expect("unbind"));
+        let mut frame2 = recv_frame(recv_cap);
+        let split2 =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame2);
+        assert_eq!(split2, Some(Ok(())), "message still present after fallback");
+        assert_eq!(frame2.ret0(), 7, "same message delivered");
+    }
+
+    #[test]
+    fn stage33_copy_failure_plan_fallback_reason_is_copy_semantics() {
+        // The documented blocker reason is UserAsidCopySemantics.
+        let req = RecvRequest::from_legacy_ipc_recv(1, CAP0, 0x4000, 128, 0, 0, false);
+        match plan_recv_core(&req) {
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics) => {}
+            other => panic!("expected UserAsidCopySemantics, got {other:?}"),
+        }
+    }
+
+    // ── E. recv_shared_v3 design tests ───────────────────────────────────────
+    //
+    // These tests verify the v3 request/output scaffold.  No syscall dispatch
+    // is added; SYSCALL_COUNT remains 30.
+
+    #[test]
+    fn stage33_recv_v3_no_syscall_added() {
+        assert_eq!(
+            SYSCALL_COUNT, 30,
+            "Stage 33+34 must not add a public syscall"
+        );
+    }
+
+    #[test]
+    fn stage33_recv_v3_future_adapter_is_helper_only() {
+        // The future_shared_v3 adapter always falls back (SharedV3HelperOnly).
+        let req = RecvRequest::future_shared_v3(
+            1,
+            CAP0,
+            0x1000,
+            64,
+            0x2000,
+            crate::kernel::recv_core::recv_shared_v3::V3_MIN_OUTPUT_LEN as usize,
+            RecvMapIntent::ReadOnly,
+            Some(500),
+        );
+        assert_eq!(req.kind, RecvRequestKind::SharedV3Future);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly),
+        );
+    }
+
+    #[test]
+    fn stage33_recv_v3_request_validates_version() {
+        use crate::kernel::recv_core::recv_shared_v3::*;
+        let mut req = RecvSharedV3Request {
+            version: V3_VERSION,
+            record_len: V3_MIN_REQUEST_LEN,
+            endpoint_cap: 1,
+            payload_ptr: 0x1000,
+            payload_len: 64,
+            metadata_ptr: 0,
+            metadata_len: 0,
+            map_intent: 0,
+            flags: 0,
+            timeout_ticks: u64::MAX,
+            reserved: [0; 2],
+        };
+        assert_eq!(validate_v3_request(&req), Ok(()));
+        req.version = 99;
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::BadVersion)
+        );
+    }
+
+    #[test]
+    fn stage33_recv_v3_request_rejects_short_record() {
+        use crate::kernel::recv_core::recv_shared_v3::*;
+        let req = RecvSharedV3Request {
+            version: V3_VERSION,
+            record_len: V3_MIN_REQUEST_LEN - 1,
+            endpoint_cap: 1,
+            payload_ptr: 0,
+            payload_len: 0,
+            metadata_ptr: 0,
+            metadata_len: 0,
+            map_intent: 0,
+            flags: 0,
+            timeout_ticks: 0,
+            reserved: [0; 2],
+        };
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::ShortRecord)
+        );
+    }
+
+    #[test]
+    fn stage33_recv_v3_request_rejects_nonzero_reserved() {
+        use crate::kernel::recv_core::recv_shared_v3::*;
+        let mut req = RecvSharedV3Request {
+            version: V3_VERSION,
+            record_len: V3_MIN_REQUEST_LEN,
+            endpoint_cap: 1,
+            payload_ptr: 0,
+            payload_len: 0,
+            metadata_ptr: 0,
+            metadata_len: 0,
+            map_intent: 0,
+            flags: 0,
+            timeout_ticks: u64::MAX,
+            reserved: [0; 2],
+        };
+        req.reserved[1] = 0xDEAD;
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::NonzeroReserved)
+        );
+    }
+
+    #[test]
+    fn stage33_recv_v3_request_rejects_map_intent_without_metadata_buffer() {
+        use crate::kernel::recv_core::recv_shared_v3::*;
+        let req = RecvSharedV3Request {
+            version: V3_VERSION,
+            record_len: V3_MIN_REQUEST_LEN,
+            endpoint_cap: 1,
+            payload_ptr: 0x1000,
+            payload_len: 64,
+            metadata_ptr: 0, // ← no buffer
+            metadata_len: 0,
+            map_intent: MAP_READ, // ← wants mapping
+            flags: 0,
+            timeout_ticks: u64::MAX,
+            reserved: [0; 2],
+        };
+        assert_eq!(
+            validate_v3_request(&req),
+            Err(RecvSharedV3Error::MetaMapIntentConflict)
+        );
+    }
+
+    #[test]
+    fn stage33_recv_v3_request_parses_read_only_intent() {
+        use crate::kernel::recv_core::recv_shared_v3::*;
+        let req = RecvSharedV3Request {
+            version: V3_VERSION,
+            record_len: V3_MIN_REQUEST_LEN,
+            endpoint_cap: 1,
+            payload_ptr: 0x1000,
+            payload_len: 64,
+            metadata_ptr: 0x8000,
+            metadata_len: V3_MIN_OUTPUT_LEN as u64,
+            map_intent: MAP_READ,
+            flags: 0,
+            timeout_ticks: u64::MAX,
+            reserved: [0; 2],
+        };
+        assert_eq!(validate_v3_request(&req), Ok(()));
+        assert_eq!(req.map_intent & MAP_WRITE, 0);
+        assert_ne!(req.map_intent & MAP_READ, 0);
+    }
+
+    #[test]
+    fn stage33_recv_v3_request_parses_read_write_intent() {
+        use crate::kernel::recv_core::recv_shared_v3::*;
+        let req = RecvSharedV3Request {
+            version: V3_VERSION,
+            record_len: V3_MIN_REQUEST_LEN,
+            endpoint_cap: 1,
+            payload_ptr: 0x1000,
+            payload_len: 64,
+            metadata_ptr: 0x8000,
+            metadata_len: V3_MIN_OUTPUT_LEN as u64,
+            map_intent: MAP_READ | MAP_WRITE,
+            flags: 0,
+            timeout_ticks: u64::MAX,
+            reserved: [0; 2],
+        };
+        assert_eq!(validate_v3_request(&req), Ok(()));
+        assert_ne!(req.map_intent & MAP_WRITE, 0);
+    }
+
+    #[test]
+    fn stage33_recv_v3_output_record_version_checked() {
+        use crate::kernel::recv_core::recv_shared_v3::*;
+        let mut out = RecvSharedV3Output {
+            version: V3_VERSION,
+            record_len: V3_MIN_OUTPUT_LEN,
+            abi_version: 10,
+            result_status: 0,
+            sender_tid: 0,
+            message_len: 0,
+            message_flags: 0,
+            transferred_cap: u64::MAX,
+            object_kind: 0,
+            object_generation: 0,
+            effective_rights: 0,
+            exact_object_size: 0,
+            region_offset: 0,
+            exact_region_len: 0,
+            mapped_base: 0,
+            page_rounded_mapped_len: 0,
+            actual_mapping_perm: 0,
+            cleanup_token: 0,
+            request_id: 0,
+        };
+        assert_eq!(validate_v3_output_record(&out), Ok(()));
+        out.version = 0;
+        assert_eq!(
+            validate_v3_output_record(&out),
+            Err(RecvSharedV3Error::BadVersion)
+        );
+        out.version = V3_VERSION;
+        out.record_len = V3_MIN_OUTPUT_LEN - 1;
+        assert_eq!(
+            validate_v3_output_record(&out),
+            Err(RecvSharedV3Error::BadOutputRecord)
+        );
+    }
+
+    // ── F. Regression tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn stage33_syscall_count_still_30() {
+        assert_eq!(
+            SYSCALL_COUNT, 30,
+            "Stage 33+34 must not change SYSCALL_COUNT"
+        );
+    }
+
+    #[test]
+    fn stage33_nr8_split_still_live() {
+        // NR 8 (ControlPlaneSetCnodeSlots) split dispatch must still work
+        // unchanged after Stage 33 changes.
+        use crate::kernel::task::TaskClass;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let target = kernel.with(|state| {
+            state
+                .register_task_with_class(900, TaskClass::SystemServer)
+                .expect("ss");
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("app");
+            state.enqueue_current_cpu(900).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(900) {
+                state.yield_current().expect("switch");
+            }
+            901u64
+        });
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR,
+            [target as usize, 16, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            Some(Ok(())),
+            "NR 8 (ControlPlaneSetCnodeSlots) must still work after Stage 33"
+        );
+        assert_eq!(frame.ret0(), 16);
+        assert_eq!(frame.ret1(), target as usize);
+    }
+
+    #[test]
+    fn stage33_stage32b_kernel_plain_path_still_live() {
+        // Stage 32B behavior preserved: kernel-task plain recv services via live seam.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"hello");
+        let mut frame = recv_frame(recv_cap);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "Stage 32B kernel-plain path must still be live"
+        );
+        assert_eq!(frame.ret0(), 7);
+        assert_eq!(frame.ret1(), b"hello".len());
+        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+    }
+
+    #[test]
+    fn stage33_user_asid_fallback_reason_explicit() {
+        // The documented fallback reason for user-ASID is UserAsidCopySemantics.
+        let req = RecvRequest::from_legacy_ipc_recv(3, CAP0, 0x1000, 64, 0, 0, false);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics),
+        );
+    }
+
+    #[test]
+    fn stage33_cap_plan_markers_through_canonical_core() {
+        // The cap_plan marker should still emit for a kernel-task attempt.
+        // (Tested indirectly by verifying the split seam still succeeds.)
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"mark");
+        let mut frame = recv_frame(recv_cap);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "cap_plan markers still emit through canonical core"
+        );
+    }
+
+    #[test]
+    fn stage33_empty_queue_fallback() {
+        // Empty endpoint falls back (None) — same as Stage 32B.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "empty endpoint must fall back through canonical core"
+        );
+    }
+
+    #[test]
+    fn stage33_full_ipc_round_trip_still_works() {
+        // Full IPC test to verify no regressions in the global-lock path.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(8).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(42, b"roundtrip").expect("m"))
+                .expect("send");
+            let received = state.ipc_recv(recv_cap).expect("recv").expect("message");
+            assert_eq!(received.sender_tid.0, 42);
+            assert_eq!(received.as_slice(), b"roundtrip");
+        });
+    }
+
+    #[test]
+    fn stage33_recv_core_metadata_v2_min_len_constant() {
+        // Verify META_V2_MIN_LEN stays aligned with the syscall ABI constant.
+        assert_eq!(
+            crate::kernel::recv_core::META_V2_MIN_LEN,
+            40,
+            "META_V2_MIN_LEN must equal IPC_RECV_META_V2_ENCODED_LEN (40 bytes)"
+        );
     }
 }

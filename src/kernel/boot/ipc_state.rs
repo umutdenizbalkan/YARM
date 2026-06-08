@@ -2,9 +2,8 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{
-    IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason,
-    IpcFastpathResult, KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES,
-    NotificationObject,
+    IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason, IpcFastpathResult,
+    KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject,
     ReplyCapRecord, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
@@ -66,7 +65,12 @@ impl KernelState {
     /// the waiter's cnode (without delegation tracking).  `ipc_reply` later reads
     /// this value to fast-revoke the exact cnode slot using a kernel-controlled
     /// CapId rather than the user-supplied argument.
-    pub(crate) fn set_reply_cap_waiter_cap(&mut self, reply_index: usize, reply_generation: u64, cap: CapId) {
+    pub(crate) fn set_reply_cap_waiter_cap(
+        &mut self,
+        reply_index: usize,
+        reply_generation: u64,
+        cap: CapId,
+    ) {
         self.with_ipc_state_mut(|ipc| {
             if reply_index >= super::MAX_REPLY_CAPS {
                 return;
@@ -78,7 +82,9 @@ impl KernelState {
                 record.waiter_cap_id = Some(cap);
                 crate::yarm_log!(
                     "IPC_RECV_REPLY_CAP_WAITER_CAP_SET reply_index={} reply_gen={} cap={}",
-                    reply_index, reply_generation, cap.0
+                    reply_index,
+                    reply_generation,
+                    cap.0
                 );
             }
         });
@@ -143,7 +149,9 @@ impl KernelState {
             let mut revoked = 0usize;
             for slot in ipc.reply_caps.iter_mut() {
                 if slot.is_some_and(|record| {
-                    record.responder_tid.is_some_and(|responder| responder.0 == tid)
+                    record
+                        .responder_tid
+                        .is_some_and(|responder| responder.0 == tid)
                 }) {
                     *slot = None;
                     revoked += 1;
@@ -209,7 +217,12 @@ impl KernelState {
     #[cfg(test)]
     pub(crate) fn endpoint_waiter_count(&self, endpoint_idx: usize) -> usize {
         self.with_ipc_state(|ipc| {
-            if ipc.endpoint_waiters.get(endpoint_idx).and_then(|w| *w).is_some() {
+            if ipc
+                .endpoint_waiters
+                .get(endpoint_idx)
+                .and_then(|w| *w)
+                .is_some()
+            {
                 1
             } else {
                 0
@@ -236,8 +249,7 @@ impl KernelState {
             tcbs.iter()
                 .flatten()
                 .filter(|tcb| {
-                    tcb.status
-                        == TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))
+                    tcb.status == TaskStatus::Blocked(WaitReason::Futex(VirtAddr(addr as u64)))
                 })
                 .count()
         })
@@ -267,7 +279,13 @@ impl KernelState {
             tcbs.iter()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
-                .map_or(0, |tcb| if tcb.ipc_timeout_deadline.is_some() { 1 } else { 0 })
+                .map_or(0, |tcb| {
+                    if tcb.ipc_timeout_deadline.is_some() {
+                        1
+                    } else {
+                        0
+                    }
+                })
         })
     }
 
@@ -280,9 +298,9 @@ impl KernelState {
                 .flatten()
                 .filter(|tcb| {
                     tcb.status
-                        == TaskStatus::Blocked(WaitReason::Join(
-                            crate::kernel::ipc::ThreadId(target_tid),
-                        ))
+                        == TaskStatus::Blocked(WaitReason::Join(crate::kernel::ipc::ThreadId(
+                            target_tid,
+                        )))
                 })
                 .count()
         })
@@ -293,10 +311,11 @@ impl KernelState {
     /// Returns 0 for an out-of-range `cpu` rather than propagating an error, so
     /// tests can call this unconditionally as a queue-depth probe.
     #[cfg(test)]
-    pub(crate) fn cross_cpu_work_count_for_cpu(&self, cpu: crate::kernel::scheduler::CpuId) -> usize {
-        self.with_ipc_state(|ipc| {
-            ipc.cross_cpu_work.pending_for_cpu(cpu).unwrap_or(0)
-        })
+    pub(crate) fn cross_cpu_work_count_for_cpu(
+        &self,
+        cpu: crate::kernel::scheduler::CpuId,
+    ) -> usize {
+        self.with_ipc_state(|ipc| ipc.cross_cpu_work.pending_for_cpu(cpu).unwrap_or(0))
     }
 
     fn clear_ipc_timeout_for_tid(&mut self, tid: u64) -> Result<(), KernelError> {
@@ -340,7 +359,10 @@ impl KernelState {
                 .and_then(Option::as_ref)
                 .ok_or(KernelError::WrongObject)?;
             let queue = &mut ipc.endpoint_sender_waiters[endpoint_idx];
-            if let Some(slot) = queue[..MAX_ENDPOINT_SENDER_WAITERS].iter_mut().find(|s| s.is_none()) {
+            if let Some(slot) = queue[..MAX_ENDPOINT_SENDER_WAITERS]
+                .iter_mut()
+                .find(|s| s.is_none())
+            {
                 *slot = Some(waiter);
                 return Ok(());
             }
@@ -462,10 +484,13 @@ impl KernelState {
         msg: crate::kernel::ipc::Message,
     ) -> Result<(), KernelError> {
         self.with_ipc_state_mut(|ipc| {
-            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
+            let Some(ep_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+            else {
                 return Err(KernelError::WrongObject);
             };
-            kernel_mut(ep_storage).send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
+            kernel_mut(ep_storage)
+                .send(msg)
+                .map_err(|_| KernelError::EndpointQueueFull)?;
             Ok(())
         })?;
         let _ = self.wake_waiter_for_endpoint(endpoint_idx);
@@ -653,8 +678,7 @@ impl KernelState {
                 let split_unsafe_flags = Message::FLAG_CAP_TRANSFER
                     | Message::FLAG_CAP_TRANSFER_PLAIN
                     | Message::FLAG_REPLY_CAP;
-                if (message.flags & split_unsafe_flags) != 0
-                    || message.transferred_cap().is_some()
+                if (message.flags & split_unsafe_flags) != 0 || message.transferred_cap().is_some()
                 {
                     return IpcEndpointRecvResult::Ineligible(
                         IpcEndpointSplitRejectReason::TransferOrReplyCapMessage,
@@ -686,10 +710,7 @@ impl KernelState {
                     ep.send(waiter_msg)
                         .expect("one slot must be free after recv dequeue");
                 }
-                crate::yarm_log!(
-                    "IPC_RECV_SPLIT_REFILL_QUEUED waiter_tid={}",
-                    waiter_tid.0
-                );
+                crate::yarm_log!("IPC_RECV_SPLIT_REFILL_QUEUED waiter_tid={}", waiter_tid.0);
                 return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
             }
 
@@ -1326,11 +1347,17 @@ impl KernelState {
             Ok::<_, KernelError>((slot, next_gen))
         })?;
         let send_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Endpoint { index: endpoint_idx, generation },
+            CapObject::Endpoint {
+                index: endpoint_idx,
+                generation,
+            },
             CapRights::SEND,
         ))?;
         let recv_cap = self.mint_capability_for_active_cnode(Capability::new(
-            CapObject::Endpoint { index: endpoint_idx, generation },
+            CapObject::Endpoint {
+                index: endpoint_idx,
+                generation,
+            },
             CapRights::RECEIVE,
         ))?;
         Ok((endpoint_idx, send_cap, recv_cap))
@@ -1457,7 +1484,10 @@ impl KernelState {
         // `apply_cross_cpu_wake_task` guard and the WakeTask work-item policy.
         if let Some(waiter_tid) = opt_waiter_tid {
             let should_enqueue = self.with_tcbs_mut(|tcbs| {
-                let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == waiter_tid.0)
+                let Some(tcb) = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == waiter_tid.0)
                 else {
                     // Missing TID (recycled/never registered): silent no-op.
                     return Ok::<bool, KernelError>(false);
@@ -1552,7 +1582,11 @@ impl KernelState {
         waiter_tid: ThreadId,
     ) -> Result<(), KernelError> {
         let should_enqueue = self.with_tcbs_mut(|tcbs| {
-            let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == waiter_tid.0) else {
+            let Some(tcb) = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == waiter_tid.0)
+            else {
                 return Ok::<bool, KernelError>(false);
             };
             if matches!(tcb.status, TaskStatus::Blocked(_)) {
@@ -1766,7 +1800,9 @@ impl KernelState {
             }
         }
         let queued = self.with_ipc_state_mut(|ipc| {
-            let Some(endpoint_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
+            let Some(endpoint_storage) =
+                ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+            else {
                 return Err(KernelError::WrongObject);
             };
             let endpoint = kernel_mut(endpoint_storage);
@@ -1855,7 +1891,9 @@ impl KernelState {
             }
             if !recv_v2_completed {
                 // Legacy path: deliver message via endpoint queue.
-                let Some(endpoint_storage) = ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut) else {
+                let Some(endpoint_storage) =
+                    ipc.endpoints.get_mut(endpoint_idx).and_then(Option::as_mut)
+                else {
                     return Err(KernelError::WrongObject);
                 };
                 let endpoint = kernel_mut(endpoint_storage);
@@ -1867,11 +1905,12 @@ impl KernelState {
                     expected_receiver_tid.0,
                     endpoint_idx
                 );
-                endpoint.send(msg).map_err(|_| KernelError::EndpointQueueFull)?;
+                endpoint
+                    .send(msg)
+                    .map_err(|_| KernelError::EndpointQueueFull)?;
             }
             ipc.endpoint_waiters[endpoint_idx] = None;
-            ipc.telemetry.rendezvous_handoffs =
-                ipc.telemetry.rendezvous_handoffs.saturating_add(1);
+            ipc.telemetry.rendezvous_handoffs = ipc.telemetry.rendezvous_handoffs.saturating_add(1);
             crate::yarm_log!(
                 "IPC_SEND_SYNC_CLEAR_WAITER receiver_tid={}",
                 expected_receiver_tid.0
@@ -1903,15 +1942,19 @@ impl KernelState {
 
     pub(crate) fn note_cap_transfer_recv_v2_delivery(&mut self) {
         self.with_ipc_state_mut(|ipc| {
-            ipc.telemetry.cap_transfer_recv_v2_deliveries =
-                ipc.telemetry.cap_transfer_recv_v2_deliveries.saturating_add(1);
+            ipc.telemetry.cap_transfer_recv_v2_deliveries = ipc
+                .telemetry
+                .cap_transfer_recv_v2_deliveries
+                .saturating_add(1);
         });
     }
 
     pub(crate) fn note_cap_transfer_stage4e_enqueued(&mut self) {
         self.with_ipc_state_mut(|ipc| {
-            ipc.telemetry.cap_transfer_stage4e_enqueued =
-                ipc.telemetry.cap_transfer_stage4e_enqueued.saturating_add(1);
+            ipc.telemetry.cap_transfer_stage4e_enqueued = ipc
+                .telemetry
+                .cap_transfer_stage4e_enqueued
+                .saturating_add(1);
         });
     }
 
@@ -1951,23 +1994,21 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
-        let (endpoint_mode, waiter_tid) = self
-            .with_ipc_state(|ipc| {
-                let mode = ipc
-                    .endpoints
-                    .get(endpoint_idx)
-                    .and_then(Option::as_ref)
-                    .map(|e| e.mode());
-                let waiter = ipc.endpoint_waiters[endpoint_idx];
-                (mode, waiter)
-            });
+        let (endpoint_mode, waiter_tid) = self.with_ipc_state(|ipc| {
+            let mode = ipc
+                .endpoints
+                .get(endpoint_idx)
+                .and_then(Option::as_ref)
+                .map(|e| e.mode());
+            let waiter = ipc.endpoint_waiters[endpoint_idx];
+            (mode, waiter)
+        });
         let endpoint_mode = endpoint_mode.ok_or(KernelError::WrongObject)?;
         let inline_sync_handoff =
             endpoint_mode == EndpointMode::Synchronous && waiter_tid.is_some();
         if !inline_sync_handoff {
             self.with_ipc_state_mut(|ipc| {
-                ipc.telemetry.fastpath_attempts =
-                    ipc.telemetry.fastpath_attempts.saturating_add(1);
+                ipc.telemetry.fastpath_attempts = ipc.telemetry.fastpath_attempts.saturating_add(1);
             });
         }
 
@@ -1976,17 +2017,16 @@ impl KernelState {
         let switched = if inline_sync_handoff {
             true
         } else if waiter_tid.is_some() {
-            self.apply_scheduler_handoff_plan(
-                super::SchedulerHandoffPlan::YieldTo(waiter_tid.expect("checked is_some")),
-            )?
+            self.apply_scheduler_handoff_plan(super::SchedulerHandoffPlan::YieldTo(
+                waiter_tid.expect("checked is_some"),
+            ))?
         } else {
             false
         };
 
         if switched && !inline_sync_handoff {
             self.with_ipc_state_mut(|ipc| {
-                ipc.telemetry.fastpath_switches =
-                    ipc.telemetry.fastpath_switches.saturating_add(1);
+                ipc.telemetry.fastpath_switches = ipc.telemetry.fastpath_switches.saturating_add(1);
                 ipc.telemetry.scheduler_fastpath_handoffs =
                     ipc.telemetry.scheduler_fastpath_handoffs.saturating_add(1);
             });
@@ -2119,9 +2159,8 @@ impl KernelState {
         }
         if let CapObject::Notification { .. } = capability.object {
             let notif_idx = self.resolve_notification_index(capability.object)?;
-            let result = self.with_ipc_state_mut(|ipc| {
-                ipc.notifications[notif_idx].as_mut().map(|n| n.recv())
-            });
+            let result = self
+                .with_ipc_state_mut(|ipc| ipc.notifications[notif_idx].as_mut().map(|n| n.recv()));
             return result.ok_or(KernelError::WrongObject);
         }
 
@@ -2168,9 +2207,8 @@ impl KernelState {
         if let CapObject::Notification { .. } = capability.object {
             let notif_idx = self.resolve_notification_index(capability.object)?;
             // Try immediate recv under ipc_state_lock.
-            let immediate = self.with_ipc_state_mut(|ipc| {
-                ipc.notifications[notif_idx].as_mut().map(|n| n.recv())
-            });
+            let immediate = self
+                .with_ipc_state_mut(|ipc| ipc.notifications[notif_idx].as_mut().map(|n| n.recv()));
             match immediate {
                 None => return Err(KernelError::WrongObject),
                 Some(Some(msg)) => return Ok(Some(msg)),

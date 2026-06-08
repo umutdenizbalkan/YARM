@@ -119,4 +119,11 @@ impl KernelState {
         })
         .ok_or(KernelError::TaskMissing)
     }
+
+    pub fn unbind_task_asid(&mut self, tid: u64) -> Result<(), KernelError> {
+        self.with_tcb_mut(tid, |tcb| {
+            tcb.asid = None;
+        })
+        .ok_or(KernelError::TaskMissing)
+    }
 }

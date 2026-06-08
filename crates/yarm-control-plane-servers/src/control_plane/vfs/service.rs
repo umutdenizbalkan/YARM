@@ -35,7 +35,9 @@ const VFS_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 
 #[cfg(all(test, feature = "legacy-tests"))]
 fn path_bytes_from_id(path_id: u64) -> Option<&'static [u8]> {
-    use yarm_fs_servers::devfs::{DEV_CONSOLE_PATH, DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH, DEV_NULL_PATH_PTR};
+    use yarm_fs_servers::devfs::{
+        DEV_CONSOLE_PATH, DEV_CONSOLE_PATH_PTR, DEV_NULL_PATH, DEV_NULL_PATH_PTR,
+    };
     use yarm_fs_servers::initramfs::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
     match path_id {
         DEV_NULL_PATH_PTR => Some(DEV_NULL_PATH),
@@ -228,8 +230,7 @@ pub fn run_request_loop_over_kernel_ipc(
         server_recv_cap,
         server_send_cap,
         client_recv_cap,
-        openat_inline_message(0, path, 0, 0)
-        .map_err(|_| VfsError::Malformed)?,
+        openat_inline_message(0, path, 0, 0).map_err(|_| VfsError::Malformed)?,
     )?;
     let fd = decode_fd_reply(open_reply)?;
 
@@ -266,8 +267,7 @@ pub fn run_request_loop_over_kernel_ipc(
             len: 32,
         })
         .map_err(|_| VfsError::Malformed)?,
-        statx_inline_message(0, path, 0, 0)
-        .map_err(|_| VfsError::Malformed)?,
+        statx_inline_message(0, path, 0, 0).map_err(|_| VfsError::Malformed)?,
         ioctl_message(fd, 0x1234, 0x55).map_err(|_| VfsError::Malformed)?,
         fcntl_message(fd, 3, 9).map_err(|_| VfsError::Malformed)?,
         poll_message(0x9000, 2, 10).map_err(|_| VfsError::Malformed)?,
@@ -341,7 +341,9 @@ fn route_for_test(
         }
         VFS_OP_READ | VFS_OP_CLOSE | yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK => {
             let args = ReadWriteArgs::decode(msg.as_slice()).map_err(|_| VFS_STATUS_ERR_CODEC)?;
-            fd_table.lookup(args.fd, client_id).ok_or(VFS_STATUS_ERR_BAD_FD)
+            fd_table
+                .lookup(args.fd, client_id)
+                .ok_or(VFS_STATUS_ERR_BAD_FD)
         }
         _ => Err(VFS_STATUS_ERR_UNKNOWN_OP),
     }
@@ -351,7 +353,7 @@ fn route_for_test(
 mod service_level_tests {
     use super::*;
     use yarm_fs_servers::common::vfs_ipc::{
-        close_message, openat_inline_message, read_message, CloseRequest, ReadWriteRequest,
+        CloseRequest, ReadWriteRequest, close_message, openat_inline_message, read_message,
     };
     use yarm_ipc_abi::vfs_abi::{VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_NO_MOUNT};
 
@@ -414,7 +416,12 @@ mod service_level_tests {
         let mounts = super::super::mount_table::VfsMountTable::new();
         let mut fds = super::super::fd_table::VfsFdTable::new();
         assert!(fds.insert(7, 11, "devfs", 100));
-        let read = read_message(ReadWriteRequest { fd: 7, buf_ptr: 0, len: 1 }).expect("read");
+        let read = read_message(ReadWriteRequest {
+            fd: 7,
+            buf_ptr: 0,
+            len: 1,
+        })
+        .expect("read");
         let close = close_message(CloseRequest { fd: 7 }).expect("close");
         assert!(matches!(
             route_for_test(&mounts, &fds, &read, 200),
@@ -433,7 +440,12 @@ mod service_level_tests {
         let mut fds = super::super::fd_table::VfsFdTable::new();
         assert!(fds.insert(9, 12, "root", 300));
         fds.remove(9, 300);
-        let read = read_message(ReadWriteRequest { fd: 9, buf_ptr: 0, len: 1 }).expect("read");
+        let read = read_message(ReadWriteRequest {
+            fd: 9,
+            buf_ptr: 0,
+            len: 1,
+        })
+        .expect("read");
         let close = close_message(CloseRequest { fd: 9 }).expect("close");
         assert!(matches!(
             route_for_test(&mounts, &fds, &read, 300),
@@ -452,7 +464,12 @@ mod service_level_tests {
         assert!(fds.insert(3, 10, "initramfs", 1));
         fds.remove(3, 1);
         assert!(fds.insert(3, 20, "devfs", 2));
-        let read = read_message(ReadWriteRequest { fd: 3, buf_ptr: 0, len: 1 }).expect("read");
+        let read = read_message(ReadWriteRequest {
+            fd: 3,
+            buf_ptr: 0,
+            len: 1,
+        })
+        .expect("read");
         assert!(matches!(
             route_for_test(&mounts, &fds, &read, 1),
             Err(VFS_STATUS_ERR_BAD_FD)
@@ -473,7 +490,12 @@ mod service_level_tests {
         assert_eq!(backend.closes, 1);
         assert!(fds.lookup(11, 1000).is_none());
 
-        let read = read_message(ReadWriteRequest { fd: 11, buf_ptr: 0, len: 1 }).expect("read");
+        let read = read_message(ReadWriteRequest {
+            fd: 11,
+            buf_ptr: 0,
+            len: 1,
+        })
+        .expect("read");
         assert!(matches!(
             route_for_test(&mounts, &fds, &read, 1000),
             Err(VFS_STATUS_ERR_BAD_FD)
@@ -527,7 +549,8 @@ mod service_level_tests {
             0,
             None,
             &encoded,
-        ).expect("bulk msg");
+        )
+        .expect("bulk msg");
 
         // Same client can route.
         assert!(route_for_test(&mounts, &fds, &bulk_msg, 100).is_ok());
@@ -547,9 +570,9 @@ mod service_level_tests {
         fds.remove(9, 300);
 
         let encoded = BulkReadArgs::new(9, 4096, 0).encode();
-        let bulk_msg = yarm_user_rt::ipc::Message::with_header(
-            300, VFS_OP_READ_BULK, 0, None, &encoded,
-        ).expect("bulk msg");
+        let bulk_msg =
+            yarm_user_rt::ipc::Message::with_header(300, VFS_OP_READ_BULK, 0, None, &encoded)
+                .expect("bulk msg");
 
         assert!(matches!(
             route_for_test(&mounts, &fds, &bulk_msg, 300),
@@ -577,7 +600,8 @@ pub fn run() {
     let devfs_send = ctx.service_extra_cap_1.unwrap_or(0);
     yarm_user_rt::user_log!(
         "VFS_ROUTE_INIT initramfs_send={} devfs_send={}",
-        initramfs_send, devfs_send
+        initramfs_send,
+        devfs_send
     );
 
     let mut mount_table = super::mount_table::VfsMountTable::new();
@@ -602,39 +626,46 @@ pub fn run() {
     yarm_user_rt::user_log!(
         "VFS_BACKEND_REPLY_CAP cap={} shared_with_main_recv={}",
         backend_reply_recv_cap,
-        if backend_reply_recv_cap == recv_cap { 1 } else { 0 }
+        if backend_reply_recv_cap == recv_cap {
+            1
+        } else {
+            0
+        }
     );
     yarm_user_rt::user_log!("VFS_SRV_BLOCKING_RECV_LOOP");
 
     loop {
         // Receive client request; recv_v2 opcode/payload are sourced from kernel
         // out-meta decode (no userspace raw-lane/opcode-prefix heuristics).
-        let (msg, client_reply_cap) =
-            match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
-                Ok(Some(received)) => {
-                    let Some(reply_cap) = received.reply_cap else { continue; };
-                    (received.message, reply_cap)
-                },
-                _ => {
-                    let _ = yarm_user_rt::syscall::yield_now();
+        let (msg, client_reply_cap) = match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) }
+        {
+            Ok(Some(received)) => {
+                let Some(reply_cap) = received.reply_cap else {
                     continue;
-                }
-            };
+                };
+                (received.message, reply_cap)
+            }
+            _ => {
+                let _ = yarm_user_rt::syscall::yield_now();
+                continue;
+            }
+        };
 
         yarm_user_rt::user_log!(
             "VFS_RECV_GOT_MSG opcode={} reply_cap={}",
-            msg.opcode, client_reply_cap
+            msg.opcode,
+            client_reply_cap
         );
         let client_id = msg.sender_tid.0;
 
         // ── VFS_OP_MOUNT_REGISTER — handled locally, never forwarded ────────
         if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_MOUNT_REGISTER {
+            use super::mount_table::MountRegisterError;
             use yarm_ipc_abi::vfs_abi::{
                 MountRegisterArgs, VFS_MOUNT_STATUS_ERR_DUPLICATE, VFS_MOUNT_STATUS_ERR_FULL,
                 VFS_MOUNT_STATUS_ERR_INVALID_CAP, VFS_MOUNT_STATUS_ERR_INVALID_PREFIX,
                 VFS_MOUNT_STATUS_OK,
             };
-            use super::mount_table::MountRegisterError;
 
             let status: u32 = match MountRegisterArgs::decode(msg.as_slice()) {
                 None => {
@@ -644,7 +675,8 @@ pub fn run() {
                 Some(args) => {
                     yarm_user_rt::user_log!(
                         "VFS_MOUNT_REGISTER_REQUEST cap={} flags={}",
-                        args.backend_send_cap, args.flags
+                        args.backend_send_cap,
+                        args.flags
                     );
                     let cap32 = args.backend_send_cap as u32;
                     match mount_table.insert_dynamic(args.prefix, cap32, args.flags as u32) {
@@ -669,9 +701,7 @@ pub fn run() {
                         }
                         Err(MountRegisterError::PrefixTooLong)
                         | Err(MountRegisterError::InvalidPrefix) => {
-                            yarm_user_rt::user_log!(
-                                "VFS_MOUNT_REGISTER_ERR reason=invalid-prefix"
-                            );
+                            yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_ERR reason=invalid-prefix");
                             VFS_MOUNT_STATUS_ERR_INVALID_PREFIX
                         }
                     }
@@ -691,11 +721,9 @@ pub fn run() {
         // Error variants carry a canonical VFS_STATUS_ERR_* code.
         let route: Result<(u32, super::mount_table::MountLabel), u32> = 'route: {
             use yarm_ipc_abi::vfs_abi::{
-                OpenAtInlinePath, ReadWriteArgs, StatxInlinePath,
-                VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
-                VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC,
-                VFS_STATUS_ERR_INVALID_PATH, VFS_STATUS_ERR_NO_MOUNT,
-                VFS_STATUS_ERR_UNKNOWN_OP,
+                OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_OPENAT,
+                VFS_OP_READ, VFS_OP_STATX, VFS_STATUS_ERR_BAD_FD, VFS_STATUS_ERR_CODEC,
+                VFS_STATUS_ERR_INVALID_PATH, VFS_STATUS_ERR_NO_MOUNT, VFS_STATUS_ERR_UNKNOWN_OP,
             };
             match msg.opcode {
                 VFS_OP_STATX | VFS_OP_OPENAT => {
@@ -711,9 +739,7 @@ pub fn run() {
                     let norm = match super::path::normalize(raw_path) {
                         Ok(n) => n,
                         Err(e) => {
-                            yarm_user_rt::user_log!(
-                                "VFS_PATH_NORM_REJECT reason={}", e.as_str()
-                            );
+                            yarm_user_rt::user_log!("VFS_PATH_NORM_REJECT reason={}", e.as_str());
                             break 'route Err(VFS_STATUS_ERR_INVALID_PATH);
                         }
                     };
@@ -722,7 +748,8 @@ pub fn run() {
                     if let Some((send_cap, label)) = mount_table.route(path) {
                         yarm_user_rt::user_log!(
                             "VFS_ROUTE_LOOKUP path={} target={}",
-                            path_str, label.as_str()
+                            path_str,
+                            label.as_str()
                         );
                         Ok((send_cap, label))
                     } else {
@@ -733,23 +760,29 @@ pub fn run() {
                 VFS_OP_READ | VFS_OP_CLOSE | yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK => {
                     match ReadWriteArgs::decode(msg.as_slice()) {
                         Ok(args) => {
-                            if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id)
-                            {
+                            if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id) {
                                 if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
                                     if VFS_BULK_READ_TRACE {
                                         // Decode full BulkReadArgs to log requested_len.
-                                        let requested = yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(msg.as_slice())
+                                        let requested =
+                                            yarm_ipc_abi::vfs_abi::BulkReadArgs::decode(
+                                                msg.as_slice(),
+                                            )
                                             .map(|b| b.requested_len)
                                             .unwrap_or(0);
                                         yarm_user_rt::user_log!(
                                             "VFS_FORWARD_BULK_READ op={} fd={} requested={} target={} mode=transfer_buffer",
-                                            msg.opcode, args.fd, requested, label.as_str()
+                                            msg.opcode,
+                                            args.fd,
+                                            requested,
+                                            label.as_str()
                                         );
                                     }
                                 } else {
                                     yarm_user_rt::user_log!(
                                         "VFS_ROUTE_FD_LOOKUP fd={} target={}",
-                                        args.fd, label.as_str()
+                                        args.fd,
+                                        label.as_str()
                                     );
                                 }
                                 Ok((send_cap, label))
@@ -757,7 +790,8 @@ pub fn run() {
                                 if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_READ_BULK {
                                     yarm_user_rt::user_log!(
                                         "VFS_BULK_READ_DENIED fd={} reason=ownership client_id={}",
-                                        args.fd, client_id
+                                        args.fd,
+                                        client_id
                                     );
                                 } else {
                                     yarm_user_rt::user_log!("VFS_ROUTE_BAD_FD fd={}", args.fd);
@@ -779,13 +813,15 @@ pub fn run() {
                             if let Some((send_cap, label)) = fd_table.lookup(args.fd, client_id) {
                                 yarm_user_rt::user_log!(
                                     "VFS_FILE_GRANT_RO_FORWARD fd={} target={}",
-                                    args.fd, label.as_str()
+                                    args.fd,
+                                    label.as_str()
                                 );
                                 Ok((send_cap, label))
                             } else {
                                 yarm_user_rt::user_log!(
                                     "VFS_FILE_GRANT_RO_BAD_FD fd={} client_id={}",
-                                    args.fd, client_id
+                                    args.fd,
+                                    client_id
                                 );
                                 Err(VFS_STATUS_ERR_BAD_FD)
                             }
@@ -822,7 +858,13 @@ pub fn run() {
             backend_send_cap,
             backend_reply_recv_cap
         );
-        match unsafe { yarm_user_rt::syscall::ipc_call(backend_send_cap, backend_reply_recv_cap, &forwarded_msg) } {
+        match unsafe {
+            yarm_user_rt::syscall::ipc_call(
+                backend_send_cap,
+                backend_reply_recv_cap,
+                &forwarded_msg,
+            )
+        } {
             Ok(()) => {
                 yarm_user_rt::user_log!("VFS_FORWARD_CALL_SENT op={} status=ok", msg.opcode);
             }
@@ -874,7 +916,8 @@ pub fn run() {
                         if fd_table.insert(fd, backend_send_cap, target_label.as_str(), client_id) {
                             yarm_user_rt::user_log!(
                                 "VFS_FD_TRACK fd={} backend={}",
-                                fd, backend_send_cap
+                                fd,
+                                backend_send_cap
                             );
                         }
                     }
@@ -896,7 +939,9 @@ pub fn run() {
                     // Log before remove; target_label is owned so no borrow conflict.
                     yarm_user_rt::user_log!(
                         "VFS_FD_CLOSE fd={} target={} status={}",
-                        closed_fd, target_label.as_str(), status
+                        closed_fd,
+                        target_label.as_str(),
+                        status
                     );
                     if status == 0 {
                         fd_table.remove(closed_fd, client_id);
@@ -906,7 +951,8 @@ pub fn run() {
                     if VFS_BULK_READ_TRACE {
                         yarm_user_rt::user_log!(
                             "VFS_ROUTE_BULK_REPLY op={} status=0 len={}",
-                            msg.opcode, response.len
+                            msg.opcode,
+                            response.len
                         );
                     }
                 } else if msg.opcode == yarm_ipc_abi::vfs_abi::VFS_OP_FILE_GRANT_RO {
@@ -917,12 +963,19 @@ pub fn run() {
                         response.transferred_cap().is_some()
                     );
                 } else {
-                    yarm_user_rt::user_log!("VFS_ROUTE_REPLY op={} status=0 len={}", msg.opcode, response.len);
+                    yarm_user_rt::user_log!(
+                        "VFS_ROUTE_REPLY op={} status=0 len={}",
+                        msg.opcode,
+                        response.len
+                    );
                 }
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &response) };
             }
             Ok(None) => {
-                yarm_user_rt::user_log!("VFS_BACKEND_REPLY_RECV_FAIL op={} err=would_block_or_timeout", msg.opcode);
+                yarm_user_rt::user_log!(
+                    "VFS_BACKEND_REPLY_RECV_FAIL op={} err=would_block_or_timeout",
+                    msg.opcode
+                );
                 yarm_user_rt::user_log!("VFS_ROUTE_REPLY status=1 len=4");
                 let err = vfs_error_reply(yarm_ipc_abi::vfs_abi::VFS_STATUS_ERR_BACKEND);
                 let _ = unsafe { yarm_user_rt::syscall::ipc_reply(client_reply_cap, &err) };
@@ -1045,7 +1098,7 @@ mod tests {
             server_send,
             client_recv,
             openat_inline_message(0, path_bytes_from_id(0x4444).unwrap_or(b"/invalid"), 0, 0)
-            .expect("open"),
+                .expect("open"),
             0,
         )
         .expect("roundtrip");
@@ -1100,7 +1153,12 @@ mod tests {
             server_recv,
             server_send,
             client_recv,
-            openat_inline_message(0, path_bytes_from_id(DEV_NULL_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
+            openat_inline_message(
+                0,
+                path_bytes_from_id(DEV_NULL_PATH_PTR).unwrap_or(b"/invalid"),
+                0,
+                0,
+            )
             .expect("open msg"),
         )
         .expect("open devfs");
@@ -1135,7 +1193,7 @@ mod tests {
             server_send,
             client_recv,
             openat_inline_message(0, path_bytes_from_id(0xABCD).unwrap_or(b"/invalid"), 0, 0)
-            .expect("open msg"),
+                .expect("open msg"),
         )
         .expect("open ramfs");
         let ram_fd = decode_fd_reply(open_ram).expect("fd");
@@ -1174,7 +1232,13 @@ mod tests {
                         server_recv,
                         server_send,
                         client_recv,
-                        openat_inline_message(0, path_bytes_from_id(INITRAMFS_BOOT_MARKER_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
+                        openat_inline_message(
+                            0,
+                            path_bytes_from_id(INITRAMFS_BOOT_MARKER_PATH_PTR)
+                                .unwrap_or(b"/invalid"),
+                            0,
+                            0,
+                        )
                         .expect("open msg"),
                     )
                     .expect("open initramfs");
@@ -1214,7 +1278,12 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_inline_message(0, path_bytes_from_id(DEV_NULL_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
+                            openat_inline_message(
+                                0,
+                                path_bytes_from_id(DEV_NULL_PATH_PTR).unwrap_or(b"/invalid"),
+                                0,
+                                0,
+                            )
                             .expect("open null"),
                         )
                         .expect("open null reply"),
@@ -1252,7 +1321,12 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_inline_message(0, path_bytes_from_id(DEV_CONSOLE_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
+                            openat_inline_message(
+                                0,
+                                path_bytes_from_id(DEV_CONSOLE_PATH_PTR).unwrap_or(b"/invalid"),
+                                0,
+                                0,
+                            )
                             .expect("open console"),
                         )
                         .expect("open console reply"),
@@ -1296,7 +1370,12 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_inline_message(0, path_bytes_from_id(0xCAFE).unwrap_or(b"/invalid"), 0, 0)
+                            openat_inline_message(
+                                0,
+                                path_bytes_from_id(0xCAFE).unwrap_or(b"/invalid"),
+                                0,
+                                0,
+                            )
                             .expect("open ramfs"),
                         )
                         .expect("open ramfs reply"),
@@ -1324,7 +1403,12 @@ mod tests {
                         server_recv,
                         server_send,
                         client_recv,
-                        statx_inline_message(0, path_bytes_from_id(0xCAFE).unwrap_or(b"/invalid"), 0, 0)
+                        statx_inline_message(
+                            0,
+                            path_bytes_from_id(0xCAFE).unwrap_or(b"/invalid"),
+                            0,
+                            0,
+                        )
                         .expect("stat ramfs"),
                     )
                     .expect("stat ramfs reply");
@@ -1349,7 +1433,13 @@ mod tests {
                             server_recv,
                             server_send,
                             client_recv,
-                            openat_inline_message(0, path_bytes_from_id(INITRAMFS_BOOT_MARKER_PATH_PTR).unwrap_or(b"/invalid"), 0, 0)
+                            openat_inline_message(
+                                0,
+                                path_bytes_from_id(INITRAMFS_BOOT_MARKER_PATH_PTR)
+                                    .unwrap_or(b"/invalid"),
+                                0,
+                                0,
+                            )
                             .expect("open init"),
                         )
                         .expect("open init reply"),

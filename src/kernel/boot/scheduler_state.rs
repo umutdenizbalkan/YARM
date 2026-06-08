@@ -144,14 +144,19 @@ impl KernelState {
     /// Usage: call under a domain lock to compute the plan, then call
     /// `apply_scheduler_wake_plan` after releasing the lock.
     #[allow(dead_code)]
-    pub(crate) fn compute_wake_plan_for_tid(&self, tid: crate::kernel::ipc::ThreadId) -> super::SchedulerWakePlan {
+    pub(crate) fn compute_wake_plan_for_tid(
+        &self,
+        tid: crate::kernel::ipc::ThreadId,
+    ) -> super::SchedulerWakePlan {
         let status = match self.task_status(tid.0) {
             Some(s) => s,
             None => return super::SchedulerWakePlan::None,
         };
         match status {
             TaskStatus::Blocked(_) => super::SchedulerWakePlan::Wake(tid),
-            TaskStatus::Running if self.current_tid() != Some(tid.0) => super::SchedulerWakePlan::Wake(tid),
+            TaskStatus::Running if self.current_tid() != Some(tid.0) => {
+                super::SchedulerWakePlan::Wake(tid)
+            }
             _ => super::SchedulerWakePlan::None,
         }
     }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::super::common::fs::{FdRecord, ServiceFsBackend, MAX_SERVICE_FDS, MAX_SERVICE_INODES};
+use super::super::common::fs::{FdRecord, MAX_SERVICE_FDS, MAX_SERVICE_INODES, ServiceFsBackend};
 use super::super::common::vfs_ipc::{VfsBackend, VfsError};
 
 use super::dir::find_inode_index;
@@ -1899,9 +1899,11 @@ mod image_tests {
         let img = tiny_ext4_image();
         let fs = Ext4Image::mount(img.as_slice()).expect("mount");
         let entries = fs.read_dir(b"/").unwrap();
-        assert!(entries
-            .iter()
-            .any(|e| e.name() == b"hello.txt" && e.file_type == Ext4FileType::Regular));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name() == b"hello.txt" && e.file_type == Ext4FileType::Regular)
+        );
     }
 
     #[test]
@@ -2283,9 +2285,11 @@ mod image_tests {
             let names: alloc::vec::Vec<&[u8]> = entries.iter().map(Ext4DirEntry::name).collect();
             assert_eq!(names, [b".".as_slice(), b"..", b"nested.bin", b"other.bin"]);
             for (idx, entry) in entries.iter().enumerate() {
-                assert!(!entries[..idx]
-                    .iter()
-                    .any(|prior| prior.inode == entry.inode && prior.name() == entry.name()));
+                assert!(
+                    !entries[..idx]
+                        .iter()
+                        .any(|prior| prior.inode == entry.inode && prior.name() == entry.name())
+                );
             }
             assert_eq!(fs.lookup_path(b"/indexed/nested.bin"), Ok(20));
             assert_eq!(
@@ -2666,9 +2670,11 @@ mod image_tests {
 
         let double = fs.read_file(b"/double.bin").expect("double indirect");
         let double_logical = EXT4_NDIR_BLOCKS + REALISTIC_BLOCK_SIZE / 4;
-        assert!(double[..double_logical * REALISTIC_BLOCK_SIZE]
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(
+            double[..double_logical * REALISTIC_BLOCK_SIZE]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
         assert_eq!(
             &double
                 [double_logical * REALISTIC_BLOCK_SIZE..double_logical * REALISTIC_BLOCK_SIZE + 16],
@@ -2750,11 +2756,12 @@ mod image_tests {
         // block contains non-zero bytes.
         put_u16(&mut img, sparse_inode + 56, 0x8001);
         let fs = Ext4Image::mount(img.as_slice()).expect("mount unwritten extent fixture");
-        assert!(fs
-            .read_file(b"/sparse.bin")
-            .unwrap()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(
+            fs.read_file(b"/sparse.bin")
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
 
         let mut img = mkfs_style_ext4_image();
         let sparse_inode = realistic_inode_offset(13);

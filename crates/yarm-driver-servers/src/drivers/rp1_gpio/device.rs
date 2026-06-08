@@ -12,10 +12,9 @@
 //! Hardware sequencing follows `pinctrl-rp1.c` (raspberrypi/linux).
 
 use super::regs::{
-    fsel, gpio_ctrl, pad_ctrl, GpioBankRegs, PadsBankRegs, SysRioBankFull,
-    GPIO_BANK0_OFFSET, GPIO_BANK1_OFFSET, GPIO_BANK2_OFFSET,
-    PADS_BANK0_OFFSET, PADS_BANK1_OFFSET, PADS_BANK2_OFFSET,
-    RIO_BANK0_OFFSET, RIO_BANK1_OFFSET, RIO_BANK2_OFFSET,
+    GPIO_BANK0_OFFSET, GPIO_BANK1_OFFSET, GPIO_BANK2_OFFSET, GpioBankRegs, PADS_BANK0_OFFSET,
+    PADS_BANK1_OFFSET, PADS_BANK2_OFFSET, PadsBankRegs, RIO_BANK0_OFFSET, RIO_BANK1_OFFSET,
+    RIO_BANK2_OFFSET, SysRioBankFull, fsel, gpio_ctrl, pad_ctrl,
 };
 
 // ---------------------------------------------------------------------------
@@ -24,7 +23,7 @@ use super::regs::{
 
 const BANK0_PINS: usize = 28; // GPIO  0–27  (40-pin header)
 const BANK1_PINS: usize = 20; // GPIO 28–47  (internal / extended)
-const BANK2_PINS: usize = 6;  // GPIO 48–53  (internal)
+const BANK2_PINS: usize = 6; // GPIO 48–53  (internal)
 
 /// Total number of GPIO pins across all three RP1 IO-banks.
 pub const TOTAL_GPIOS: usize = BANK0_PINS + BANK1_PINS + BANK2_PINS; // 54
@@ -88,9 +87,9 @@ pub trait GpioDriver {
 ///
 /// No heap allocation is used; the struct lives on the server task's stack.
 pub struct Rp1GpioDriver {
-    gpio:  [*mut GpioBankRegs;   3],
-    rio:   [*mut SysRioBankFull; 3],
-    pads:  [*mut PadsBankRegs;   3],
+    gpio: [*mut GpioBankRegs; 3],
+    rio: [*mut SysRioBankFull; 3],
+    pads: [*mut PadsBankRegs; 3],
 }
 
 // SAFETY: The RP1 PCIe BAR is mapped exclusively into this server process's
@@ -226,14 +225,13 @@ impl GpioDriver for Rp1GpioDriver {
                 self.rio_bank(bank).clr.oe.write(mask);
 
                 // Step 2: switch GPIO_CTRL to GPIO function.
-                self.gpio_bank(bank).gpio[idx].ctrl.modify(|v| {
-                    (v & !gpio_ctrl::FUNCSEL_MASK) | fsel::GPIO
-                });
+                self.gpio_bank(bank).gpio[idx]
+                    .ctrl
+                    .modify(|v| (v & !gpio_ctrl::FUNCSEL_MASK) | fsel::GPIO);
 
                 // Step 3: enable pad input buffer; clear OD (output-disable).
-                self.pads_bank(bank).gpio[idx].modify(|v| {
-                    (v & !pad_ctrl::OUTPUT_DISABLE) | pad_ctrl::INPUT_ENABLE
-                });
+                self.pads_bank(bank).gpio[idx]
+                    .modify(|v| (v & !pad_ctrl::OUTPUT_DISABLE) | pad_ctrl::INPUT_ENABLE);
             }
 
             PinMode::Output { initial_level } => {
@@ -245,9 +243,9 @@ impl GpioDriver for Rp1GpioDriver {
                 }
 
                 // Step 2: switch GPIO_CTRL to GPIO function.
-                self.gpio_bank(bank).gpio[idx].ctrl.modify(|v| {
-                    (v & !gpio_ctrl::FUNCSEL_MASK) | fsel::GPIO
-                });
+                self.gpio_bank(bank).gpio[idx]
+                    .ctrl
+                    .modify(|v| (v & !gpio_ctrl::FUNCSEL_MASK) | fsel::GPIO);
 
                 // Step 3: enable the output driver atomically.
                 self.rio_bank(bank).set.oe.write(mask);

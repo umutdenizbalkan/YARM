@@ -1,21 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm_user_rt::ipc::Message;
+use super::super::common::service::FsService;
 use super::super::common::vfs_ipc::VfsError;
 use super::super::common::vfs_ipc::{
     ReadWriteRequest, openat_inline_message, read_message, statx_inline_message, write_message,
 };
-use yarm_ipc_abi::vfs_abi::{ReadWriteArgs, VFS_OP_READ};
-use super::super::common::service::FsService;
-use yarm_srv_common::cpio::CpioArchive;
-use yarm_srv_common::service_loop::run_typed_request_loop;
-use yarm_srv_common::vfs_core::VfsBackend;
 use super::archive::{
     INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_DRIVER_MANAGER_PATH, InitramfsBackend, InitramfsMetrics,
 };
 use super::install_boot_initrd_bytes;
+use yarm_ipc_abi::vfs_abi::{ReadWriteArgs, VFS_OP_READ};
+use yarm_srv_common::cpio::CpioArchive;
+use yarm_srv_common::service_loop::run_typed_request_loop;
+use yarm_srv_common::vfs_core::VfsBackend;
 use yarm_srv_common::vfs_reply::VfsReply;
+use yarm_user_rt::ipc::Message;
 
 /// Trace gate for hot-path initramfs bulk-read per-request logs.
 /// Set to `true` only when debugging Phase 2B transfer-buffer bulk reads.
@@ -43,7 +43,8 @@ fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource, usize) 
         if initrd_len > 0 && initrd_len < (256 * 1024 * 1024) {
             yarm_user_rt::user_log!(
                 "INITRAMFS_STARTUP_INITRD source=ro-mem ptr=0x{:x} len={}",
-                initrd_ptr, initrd_len
+                initrd_ptr,
+                initrd_len
             );
             // SAFETY: The kernel mapped this physical memory as read-only into our
             // address space at startup (startup slots 15/16). The mapping is permanent
@@ -77,7 +78,11 @@ fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource, usize) 
     }
     // No kernel-provided initrd mapping: fall back to placeholder.
     // This means VFS exec (image_id 7-9) will be unavailable.
-    (InitramfsBackend::new(8192), InitramfsBackendSource::Placeholder, 0)
+    (
+        InitramfsBackend::new(8192),
+        InitramfsBackendSource::Placeholder,
+        0,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,17 +200,21 @@ pub fn run() {
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
                 Ok(Some(received)) => {
                     let msg = received.message;
-                    let Some(reply_cap) = received.reply_cap else { continue; };
+                    let Some(reply_cap) = received.reply_cap else {
+                        continue;
+                    };
                     yarm_user_rt::user_log!(
                         "INITRAMFS_SRV_GOT_MSG opcode={} reply_cap={}",
-                        msg.opcode, reply_cap
+                        msg.opcode,
+                        reply_cap
                     );
                     if msg.opcode == VFS_OP_READ {
                         let payload = msg.as_slice();
                         if let Ok(args) = ReadWriteArgs::decode(payload) {
                             yarm_user_rt::user_log!(
                                 "INITRAMFS_READ fd={} requested={}",
-                                args.fd, args.len
+                                args.fd,
+                                args.len
                             );
                         }
                     }
@@ -219,7 +228,8 @@ pub fn run() {
                             if INITRAMFS_READ_BULK_TRACE {
                                 yarm_user_rt::user_log!(
                                     "INITRAMFS_READ_BULK fd={} requested={}",
-                                    args.fd, args.requested_len
+                                    args.fd,
+                                    args.requested_len
                                 );
                             }
                             // Validate requested_len
@@ -256,10 +266,7 @@ pub fn run() {
                             let file_len_opt = svc.backend().file_len_for_fd(args.fd);
                             match (cpio_name_opt, file_len_opt) {
                                 (Some(cpio_name), Some(file_len)) => {
-                                    let max_len = core::cmp::min(
-                                        args.requested_len as usize,
-                                        4096,
-                                    );
+                                    let max_len = core::cmp::min(args.requested_len as usize, 4096);
                                     // SAFETY: initramfs_write_to_pm_buf delegates to kernel
                                     // syscall nr=27 with arg5=PM_BOOTSTRAP_TID (3), which writes
                                     // to PM's address space at dst_ptr.  The kernel validates the
@@ -275,31 +282,44 @@ pub fn run() {
                                     match result {
                                         Ok(copied_len) => {
                                             let eof = copied_len == 0
-                                                || args.offset.saturating_add(copied_len as u64) >= file_len;
+                                                || args.offset.saturating_add(copied_len as u64)
+                                                    >= file_len;
                                             let reply = yarm_ipc_abi::vfs_abi::BulkReadReply {
                                                 copied_len: copied_len as u64,
                                                 eof,
                                             };
                                             let reply_bytes = reply.encode();
-                                            let response = yarm_user_rt::ipc::Message::new(0, &reply_bytes)
-                                                .unwrap_or_else(|_| yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"));
+                                            let response =
+                                                yarm_user_rt::ipc::Message::new(0, &reply_bytes)
+                                                    .unwrap_or_else(|_| {
+                                                        yarm_user_rt::ipc::Message::new(1, &[])
+                                                            .expect("err msg")
+                                                    });
                                             if INITRAMFS_READ_BULK_TRACE {
                                                 yarm_user_rt::user_log!(
                                                     "INITRAMFS_READ_BULK_REPLY fd={} copied={} eof={}",
-                                                    args.fd, copied_len, eof
+                                                    args.fd,
+                                                    copied_len,
+                                                    eof
                                                 );
                                             }
-                                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                                            let _ = unsafe {
+                                                yarm_user_rt::syscall::ipc_reply(
+                                                    reply_cap, &response,
+                                                )
+                                            };
                                         }
                                         Err(e) => {
                                             yarm_user_rt::user_log!(
                                                 "INITRAMFS_READ_BULK_FAIL fd={} reason={:?}",
-                                                args.fd, e
+                                                args.fd,
+                                                e
                                             );
                                             let _ = unsafe {
                                                 yarm_user_rt::syscall::ipc_reply(
                                                     reply_cap,
-                                                    &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+                                                    &yarm_user_rt::ipc::Message::new(1, &[])
+                                                        .expect("err msg"),
                                                 )
                                             };
                                         }
@@ -313,7 +333,8 @@ pub fn run() {
                                     let _ = unsafe {
                                         yarm_user_rt::syscall::ipc_reply(
                                             reply_cap,
-                                            &yarm_user_rt::ipc::Message::new(1, &[]).expect("err msg"),
+                                            &yarm_user_rt::ipc::Message::new(1, &[])
+                                                .expect("err msg"),
                                         )
                                     };
                                 }
@@ -339,21 +360,24 @@ pub fn run() {
                                         // SAFETY: cpio_name is a static/long-lived byte slice from the CPIO archive.
                                         let result = unsafe {
                                             yarm_user_rt::syscall::create_initramfs_file_slice_mo(
-                                                cpio_name,
-                                                0,
+                                                cpio_name, 0,
                                             )
                                         };
                                         match result {
                                             Ok((cap_id, file_len)) => {
                                                 yarm_user_rt::user_log!(
                                                     "INITRAMFS_FILE_GRANT_RO_REPLY path={} len={} cap={}",
-                                                    core::str::from_utf8(cpio_name).unwrap_or("<utf8err>"),
-                                                    file_len, cap_id
-                                                );
-                                                let reply_bytes = yarm_ipc_abi::vfs_abi::FileGrantRoReply {
+                                                    core::str::from_utf8(cpio_name)
+                                                        .unwrap_or("<utf8err>"),
                                                     file_len,
-                                                    status: 0,
-                                                }.encode();
+                                                    cap_id
+                                                );
+                                                let reply_bytes =
+                                                    yarm_ipc_abi::vfs_abi::FileGrantRoReply {
+                                                        file_len,
+                                                        status: 0,
+                                                    }
+                                                    .encode();
                                                 // Build reply with transferred MemoryObject cap.
                                                 let response = Message::with_header(
                                                     0,
@@ -361,15 +385,21 @@ pub fn run() {
                                                     Message::FLAG_CAP_TRANSFER,
                                                     Some(cap_id as u64),
                                                     &reply_bytes,
-                                                ).unwrap_or_else(|_| Message::new(1, &[]).expect("err msg"));
+                                                )
+                                                .unwrap_or_else(|_| {
+                                                    Message::new(1, &[]).expect("err msg")
+                                                });
                                                 let _ = unsafe {
-                                                    yarm_user_rt::syscall::ipc_reply(reply_cap, &response)
+                                                    yarm_user_rt::syscall::ipc_reply(
+                                                        reply_cap, &response,
+                                                    )
                                                 };
                                             }
                                             Err(e) => {
                                                 yarm_user_rt::user_log!(
                                                     "INITRAMFS_FILE_GRANT_RO_FAIL fd={} reason={:?}",
-                                                    args.fd, e
+                                                    args.fd,
+                                                    e
                                                 );
                                                 let _ = unsafe {
                                                     yarm_user_rt::syscall::ipc_reply(
@@ -425,19 +455,21 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloc::boxed::Box;
-    use alloc::format;
-    use alloc::vec;
-use alloc::vec::Vec;
-    use super::super::archive::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
     use super::super::super::common::vfs_ipc::{
         CloseRequest, MountNamespacePolicy, MountRouter, close_message, openat_inline_message,
         read_message, statx_inline_message,
     };
     use super::super::super::common::vfs_service::VfsService;
     use super::super::super::devfs::{DEV_CONSOLE_PATH_PTR, DevFsBackend};
-    use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_READ};
+    use super::super::archive::{INITRAMFS_BOOT_MARKER_PATH, INITRAMFS_BOOT_MARKER_PATH_PTR};
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::format;
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use yarm_ipc_abi::vfs_abi::{
+        OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_READ,
+    };
     use yarm_srv_common::vfs_reply::VfsReply as DecodedReply;
 
     fn push_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
@@ -450,9 +482,13 @@ use alloc::vec::Vec;
         out.extend_from_slice(&h);
         out.extend_from_slice(name.as_bytes());
         out.push(0);
-        while out.len() % 4 != 0 { out.push(0); }
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
         out.extend_from_slice(data);
-        while out.len() % 4 != 0 { out.push(0); }
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
     }
 
     #[test]
@@ -470,8 +506,7 @@ use alloc::vec::Vec;
 
     #[test]
     fn initramfs_protocol_vectors_match_frozen_vfs_codec() {
-        let open = openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
-        .expect("open");
+        let open = openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("open");
         assert_eq!(open.opcode, VFS_OP_OPENAT);
         let decoded_open = OpenAtInlinePath::decode(open.as_slice()).expect("decode open");
         assert_eq!(decoded_open.path, INITRAMFS_BOOT_MARKER_PATH);
@@ -485,8 +520,7 @@ use alloc::vec::Vec;
         assert_eq!(read.opcode, VFS_OP_READ);
         assert_eq!(read.as_slice(), &ReadWriteArgs::new(10, 0, 32).encode());
 
-        let statx = statx_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
-        .expect("statx");
+        let statx = statx_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("statx");
         let decoded_statx = StatxInlinePath::decode(statx.as_slice()).expect("decode statx");
         assert_eq!(decoded_statx.path, INITRAMFS_BOOT_MARKER_PATH);
     }
@@ -509,7 +543,9 @@ use alloc::vec::Vec;
         );
 
         let open_init = svc
-            .handle_request(openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("open"))
+            .handle_request(
+                openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("open"),
+            )
             .expect("initramfs open");
         assert_eq!(open_init.opcode, VFS_OP_OPENAT);
 
@@ -520,7 +556,12 @@ use alloc::vec::Vec;
     #[test]
     fn inline_statx_routes_to_initramfs_by_real_path_bytes() {
         let mut cpio_data = Vec::new();
-        push_entry(&mut cpio_data, "sbin/driver_manager", 0o100755, &[0xAA; 256]);
+        push_entry(
+            &mut cpio_data,
+            "sbin/driver_manager",
+            0o100755,
+            &[0xAA; 256],
+        );
         push_entry(&mut cpio_data, "TRAILER!!!", 0, &[]);
         let leaked: &'static [u8] = Box::leak(cpio_data.into_boxed_slice());
         let router = MountRouter::new(
@@ -548,8 +589,7 @@ use alloc::vec::Vec;
 
         let open = svc
             .handle_request(
-                openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
-                .expect("open"),
+                openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("open"),
             )
             .expect("open reply");
         let fd = decode_reply_u64(open);
@@ -585,8 +625,7 @@ use alloc::vec::Vec;
         svc.mount(INITRAMFS_BOOT_MARKER_PATH_PTR, 2).expect("mount");
         let open = svc
             .handle_request(
-                openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0)
-                .expect("open"),
+                openat_inline_message(0, INITRAMFS_BOOT_MARKER_PATH, 0, 0).expect("open"),
             )
             .expect("open reply");
         let fd = decode_reply_u64(open);
@@ -629,12 +668,24 @@ use alloc::vec::Vec;
         push_entry(&mut cpio, "init", 0o100755, b"\x7fELFinit-binary");
         push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
         let leaked: &'static [u8] = Box::leak(cpio.into_boxed_slice());
-        let mut svc = InitramfsService::with_backend(InitramfsBackend::from_cpio_newc_static(leaked));
+        let mut svc =
+            InitramfsService::with_backend(InitramfsBackend::from_cpio_newc_static(leaked));
         let fd = decode_reply_u64(
-            svc.handle(openat_inline_message(0, b"/initramfs/init", 0, 0).expect("open")).expect("open r")
+            svc.handle(openat_inline_message(0, b"/initramfs/init", 0, 0).expect("open"))
+                .expect("open r"),
         );
-        let reply = svc.handle(read_message(ReadWriteRequest { fd, buf_ptr: 0, len: 64 }).expect("read")).expect("read r");
-        let (status, n, bytes) = DecodedReply::decode_read_extended(reply.as_slice()).expect("decode");
+        let reply = svc
+            .handle(
+                read_message(ReadWriteRequest {
+                    fd,
+                    buf_ptr: 0,
+                    len: 64,
+                })
+                .expect("read"),
+            )
+            .expect("read r");
+        let (status, n, bytes) =
+            DecodedReply::decode_read_extended(reply.as_slice()).expect("decode");
         assert_eq!(status, 0);
         assert_eq!(n, 15);
         assert_eq!(&bytes[..n as usize], b"\x7fELFinit-binary");
@@ -659,13 +710,18 @@ use alloc::vec::Vec;
     #[test]
     fn build_runtime_backend_uses_cpio_when_startup_slots_set() {
         let mut cpio_data = Vec::new();
-        push_entry(&mut cpio_data, "sbin/driver_manager", 0o100755, b"\x7fELFdriver");
+        push_entry(
+            &mut cpio_data,
+            "sbin/driver_manager",
+            0o100755,
+            b"\x7fELFdriver",
+        );
         push_entry(&mut cpio_data, "TRAILER!!!", 0, &[]);
         let leaked: &'static [u8] = Box::leak(cpio_data.into_boxed_slice());
 
         let mut slots = [0u64; 18];
-        slots[15] = leaked.as_ptr() as u64;  // initrd_ptr
-        slots[16] = leaked.len() as u64;     // initrd_len
+        slots[15] = leaked.as_ptr() as u64; // initrd_ptr
+        slots[16] = leaked.len() as u64; // initrd_len
         yarm_user_rt::runtime::install_startup_arg_slots(slots);
 
         let (_backend, source, entries) = build_runtime_backend();
@@ -695,23 +751,36 @@ use alloc::vec::Vec;
     #[test]
     fn initramfs_read_returns_elf_magic_for_cpio_backed_driver_manager() {
         let mut cpio_data = Vec::new();
-        push_entry(&mut cpio_data, "sbin/driver_manager", 0o100755, b"\x7fELFdm-binary");
+        push_entry(
+            &mut cpio_data,
+            "sbin/driver_manager",
+            0o100755,
+            b"\x7fELFdm-binary",
+        );
         push_entry(&mut cpio_data, "TRAILER!!!", 0, &[]);
         let leaked: &'static [u8] = Box::leak(cpio_data.into_boxed_slice());
 
-        let mut svc = InitramfsService::with_backend(
-            InitramfsBackend::from_cpio_newc_static(leaked)
-        );
+        let mut svc =
+            InitramfsService::with_backend(InitramfsBackend::from_cpio_newc_static(leaked));
         use super::super::archive::INITRAMFS_DRIVER_MANAGER_PATH;
         let fd = decode_reply_u64(
             svc.handle(
-                openat_inline_message(0, INITRAMFS_DRIVER_MANAGER_PATH, 0, 0).expect("open")
-            ).expect("open r")
+                openat_inline_message(0, INITRAMFS_DRIVER_MANAGER_PATH, 0, 0).expect("open"),
+            )
+            .expect("open r"),
         );
-        let reply = svc.handle(
-            read_message(ReadWriteRequest { fd, buf_ptr: 0, len: 64 }).expect("read")
-        ).expect("read r");
-        let (status, n, bytes) = DecodedReply::decode_read_extended(reply.as_slice()).expect("decode");
+        let reply = svc
+            .handle(
+                read_message(ReadWriteRequest {
+                    fd,
+                    buf_ptr: 0,
+                    len: 64,
+                })
+                .expect("read"),
+            )
+            .expect("read r");
+        let (status, n, bytes) =
+            DecodedReply::decode_read_extended(reply.as_slice()).expect("decode");
         assert_eq!(status, 0);
         assert!(n >= 4);
         assert_eq!(&bytes[..4], b"\x7fELF");

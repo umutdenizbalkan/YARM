@@ -3,13 +3,13 @@
 
 #[cfg(test)]
 use super::clone_thread_hook;
-use crate::yarm_compat_servers::{
-    LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, PosixErrno,
-};
 #[cfg(test)]
 use crate::kernel::boot::KernelState;
 #[cfg(test)]
 use crate::kernel::task::ThreadGroupId as MuslThreadGroupId;
+use crate::yarm_compat_servers::{
+    LINUX_NR_BRK, LINUX_NR_MMAP, LINUX_NR_MPROTECT, LINUX_NR_MUNMAP, PosixErrno,
+};
 
 #[cfg(not(test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +203,10 @@ pub fn spawn_musl_thread(
 }
 
 #[cfg(not(test))]
-pub fn spawn_musl_thread(parent_tid: u64, spec: MuslThreadSpec) -> Result<MuslThreadState, PosixErrno> {
+pub fn spawn_musl_thread(
+    parent_tid: u64,
+    spec: MuslThreadSpec,
+) -> Result<MuslThreadState, PosixErrno> {
     let _ = (parent_tid, validate_musl_thread_spec(spec)?);
     Err(PosixErrno::NoSys)
 }
@@ -679,12 +682,8 @@ mod tests {
             },
         )
         .expect("thread");
-        crate::yarm_compat_servers::sysdeps::set_tls_hook(
-            &mut kernel,
-            state.tid,
-            0x3000_0100,
-        )
-        .expect("set tls");
+        crate::yarm_compat_servers::sysdeps::set_tls_hook(&mut kernel, state.tid, 0x3000_0100)
+            .expect("set tls");
 
         let refreshed = validate_musl_thread_state(
             &kernel,

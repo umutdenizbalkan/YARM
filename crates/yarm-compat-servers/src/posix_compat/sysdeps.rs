@@ -19,7 +19,11 @@ mod tests {
         let src = include_str!("sysdeps/service_hooks.rs");
         let legacy_proc = ["crate::kernel::process::", "ProcessService"].concat();
         let legacy_fs = ["crate::service_common::service::", "FsService"].concat();
-        let legacy_socket = ["crate::yarm_network_servers::socket::service::", "SocketAdapterService"].concat();
+        let legacy_socket = [
+            "crate::yarm_network_servers::socket::service::",
+            "SocketAdapterService",
+        ]
+        .concat();
         assert!(
             !src.contains(legacy_proc.as_str()),
             "posix service hooks should not couple to in-process ProcessService"

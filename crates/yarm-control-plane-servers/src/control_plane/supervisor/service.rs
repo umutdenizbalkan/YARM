@@ -1162,10 +1162,7 @@ pub fn run() {
             // Query PM lifecycle table for the supervisor's own TID to establish
             // truthful supervision metadata before entering the event loop.
             let supervisor_tid = startup.task_id;
-            yarm_user_rt::user_log!(
-                "SUPERVISOR_LIFECYCLE_QUERY tid={}",
-                supervisor_tid
-            );
+            yarm_user_rt::user_log!("SUPERVISOR_LIFECYCLE_QUERY tid={}", supervisor_tid);
             match query_lifecycle_via_process_manager(process_manager_caps, supervisor_tid) {
                 Ok(Some(reply)) if reply.is_found() => {
                     yarm_user_rt::user_log!(
@@ -1178,10 +1175,7 @@ pub fn run() {
                     );
                 }
                 Ok(Some(_)) | Ok(None) => {
-                    yarm_user_rt::user_log!(
-                        "SUPERVISOR_LIFECYCLE_MISSING tid={}",
-                        supervisor_tid
-                    );
+                    yarm_user_rt::user_log!("SUPERVISOR_LIFECYCLE_MISSING tid={}", supervisor_tid);
                 }
                 Err(err) => {
                     yarm_user_rt::user_log!(
@@ -1431,8 +1425,8 @@ fn query_lifecycle_via_process_manager(
     let Some(reply_msg) = reply_result.map_err(|_| KernelError::WrongObject)? else {
         return Ok(None);
     };
-    let reply = LifecycleQueryReply::decode(reply_msg.as_slice())
-        .map_err(|_| KernelError::WrongObject)?;
+    let reply =
+        LifecycleQueryReply::decode(reply_msg.as_slice()).map_err(|_| KernelError::WrongObject)?;
     Ok(Some(reply))
 }
 

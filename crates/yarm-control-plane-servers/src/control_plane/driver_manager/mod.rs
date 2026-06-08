@@ -3,4 +3,6 @@
 
 pub mod service;
 
-pub use service::{DriverRecord, DriverRegistry, DriverService, DriverClass, DriverLiveness, handle_request, run};
+pub use service::{
+    DriverClass, DriverLiveness, DriverRecord, DriverRegistry, DriverService, handle_request, run,
+};

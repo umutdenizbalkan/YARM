@@ -367,7 +367,9 @@ mod tests {
                 state
                     .set_thread_tls_base(tid_a, 0xAAA0_0000)
                     .expect("set tls a");
-                state.enqueue_on_cpu(CpuId(1), tid_a).expect("enqueue a on cpu1");
+                state
+                    .enqueue_on_cpu(CpuId(1), tid_a)
+                    .expect("enqueue a on cpu1");
                 state.set_current_cpu(CpuId(1)).expect("switch cpu1");
                 let _ = state.dispatch_next_task().expect("dispatch a");
                 assert_eq!(state.current_tid(), Some(tid_a));

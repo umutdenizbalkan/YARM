@@ -46,10 +46,7 @@ pub extern "C" fn yarm_user_entry() -> ! {
         yarm_user_rt::user_log!("INIT_IDLE_PARK_FUTEX_BEGIN");
         match yarm::user_rt::syscall::futex_wait(INIT_IDLE_FUTEX.as_ptr(), observed, observed) {
             Ok(blocked) => {
-                yarm_user_rt::user_log!(
-                    "INIT_IDLE_PARK_FUTEX_RETURN ret={}",
-                    usize::from(blocked)
-                );
+                yarm_user_rt::user_log!("INIT_IDLE_PARK_FUTEX_RETURN ret={}", usize::from(blocked));
                 if blocked {
                     continue;
                 }

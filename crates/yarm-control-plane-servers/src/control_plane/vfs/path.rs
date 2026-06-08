@@ -206,7 +206,10 @@ mod tests {
 
     #[test]
     fn canonical_mount_paths_are_unchanged() {
-        assert_eq!(norm(b"/initramfs/boot-marker").unwrap(), b"/initramfs/boot-marker");
+        assert_eq!(
+            norm(b"/initramfs/boot-marker").unwrap(),
+            b"/initramfs/boot-marker"
+        );
         assert_eq!(norm(b"/dev/null").unwrap(), b"/dev/null");
         assert_eq!(norm(b"/dev/console").unwrap(), b"/dev/console");
     }

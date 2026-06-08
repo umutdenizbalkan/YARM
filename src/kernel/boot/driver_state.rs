@@ -26,15 +26,13 @@ pub struct DriverRedelegationDebug {
 impl KernelState {
     fn owner_tid_for_cap(&self, cap: CapId) -> Option<u64> {
         self.with_tcbs(|tcbs| {
-            tcbs.iter()
-                .flatten()
-                .find_map(|tcb| {
-                    let pid = tcb.thread_group_id.0;
-                    let cnode = self
-                        .process_cnode_for_pid(pid)
-                        .unwrap_or(crate::kernel::capabilities::CNodeId(pid));
-                    self.capability_for_cnode(cnode, cap).map(|_| tcb.tid.0)
-                })
+            tcbs.iter().flatten().find_map(|tcb| {
+                let pid = tcb.thread_group_id.0;
+                let cnode = self
+                    .process_cnode_for_pid(pid)
+                    .unwrap_or(crate::kernel::capabilities::CNodeId(pid));
+                self.capability_for_cnode(cnode, cap).map(|_| tcb.tid.0)
+            })
         })
     }
 
@@ -151,7 +149,9 @@ impl KernelState {
     }
 
     fn mint_irq_cap_for_task(&mut self, source_tid: u64, line: u16) -> Result<CapId, KernelError> {
-        let source_cnode = self.task_cnode(source_tid).ok_or(KernelError::TaskMissing)?;
+        let source_cnode = self
+            .task_cnode(source_tid)
+            .ok_or(KernelError::TaskMissing)?;
         self.mint_capability_in_cnode(
             source_cnode,
             Capability::new(CapObject::Irq { line }, CapRights::SIGNAL),
@@ -257,16 +257,18 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
 
-        let source_cnode = self.task_cnode(source_tid).ok_or(KernelError::TaskMissing)?;
+        let source_cnode = self
+            .task_cnode(source_tid)
+            .ok_or(KernelError::TaskMissing)?;
         self.mint_capability_in_cnode(
             source_cnode,
             Capability::new(
-            CapObject::DmaRegion {
-                id,
-                offset: offset as u64,
-                len: len as u64,
-            },
-            CapRights::MAP | CapRights::READ | CapRights::WRITE,
+                CapObject::DmaRegion {
+                    id,
+                    offset: offset as u64,
+                    len: len as u64,
+                },
+                CapRights::MAP | CapRights::READ | CapRights::WRITE,
             ),
         )
     }
@@ -327,11 +329,16 @@ impl KernelState {
         let source_irq_cap = self.mint_irq_cap_for_task(source_tid, plan.irq_line)?;
         let irq_cap = self.grant_driver_irq_from(source_tid, plan.server_tid.0, source_irq_cap)?;
 
-        let source_dma_cap =
-            self.mint_dma_region_cap_for_task(source_tid, plan.mem_cap, plan.dma_offset, plan.dma_len)?;
+        let source_dma_cap = self.mint_dma_region_cap_for_task(
+            source_tid,
+            plan.mem_cap,
+            plan.dma_offset,
+            plan.dma_len,
+        )?;
         let dma_cap = self.grant_driver_dma_from(source_tid, plan.server_tid.0, source_dma_cap)?;
 
-        let iova_cap = self.grant_driver_iova_space_from(source_tid, plan.server_tid.0, plan.iova_cap)?;
+        let iova_cap =
+            self.grant_driver_iova_space_from(source_tid, plan.server_tid.0, plan.iova_cap)?;
         self.configure_driver_dma_window(plan.server_tid.0, plan.iova_base, plan.iova_len)?;
 
         Ok((irq_cap, dma_cap, iova_cap))

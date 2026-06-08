@@ -6,21 +6,21 @@ use crate::kernel::boot::KernelState;
 #[cfg(test)]
 use crate::kernel::capabilities::CapId;
 #[cfg(test)]
-use crate::kernel::trapframe::TrapFrame;
-#[cfg(test)]
 use crate::kernel::ipc::Message;
-use crate::yarm_compat_servers::{POSIX_COMPAT_ABI_VERSION, PosixErrno};
-use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
-use yarm_user_rt::syscall::IpcTransport;
-use yarm_user_rt::ipc::Message as RuntimeMessage;
-#[cfg(not(test))]
-use yarm_user_rt::runtime::startup_context;
+#[cfg(test)]
+use crate::kernel::trapframe::TrapFrame;
 #[cfg(test)]
 use crate::yarm_compat_servers::{
     LINUX_NR_CLOSE, LINUX_NR_CONNECT, LINUX_NR_EXIT, LINUX_NR_GETPID, LINUX_NR_GETPPID,
     LINUX_NR_OPENAT, LINUX_NR_READ, LINUX_NR_SENDTO, LINUX_NR_SOCKET, LINUX_NR_WRITE,
     PosixServiceBindings, dispatch,
 };
+use crate::yarm_compat_servers::{POSIX_COMPAT_ABI_VERSION, PosixErrno};
+use yarm_ipc_abi::process_abi::PROC_OP_GETPID;
+use yarm_user_rt::ipc::Message as RuntimeMessage;
+#[cfg(not(test))]
+use yarm_user_rt::runtime::startup_context;
+use yarm_user_rt::syscall::IpcTransport;
 
 /// Runtime-facing sysdeps client that speaks to process/vfs managers through
 /// the POSIX compatibility syscall dispatch and IPC bindings.
@@ -193,15 +193,20 @@ impl<'a> PosixSysdepsContext<'a> {
         let reply_cap = self
             .process_manager_reply_recv_cap
             .ok_or(PosixErrno::NoSys)?;
-        getpid_via_process_manager_ipc(self.runtime_transport, self.startup_tid, request_cap, reply_cap)
-            .map_err(|err| {
-                crate::yarm_log!(
-                    "posix-compat getpid IPC failed: task_id={} err={:?}",
-                    self.startup_tid,
-                    err
-                );
-                map_getpid_ipc_error(err)
-            })
+        getpid_via_process_manager_ipc(
+            self.runtime_transport,
+            self.startup_tid,
+            request_cap,
+            reply_cap,
+        )
+        .map_err(|err| {
+            crate::yarm_log!(
+                "posix-compat getpid IPC failed: task_id={} err={:?}",
+                self.startup_tid,
+                err
+            );
+            map_getpid_ipc_error(err)
+        })
     }
 
     #[cfg(test)]
@@ -241,7 +246,12 @@ impl<'a> PosixSysdepsContext<'a> {
     }
 
     #[cfg(not(test))]
-    pub fn openat_hook(&mut self, _path_ptr: usize, _flags: u32, _mode: u32) -> Result<i32, PosixErrno> {
+    pub fn openat_hook(
+        &mut self,
+        _path_ptr: usize,
+        _flags: u32,
+        _mode: u32,
+    ) -> Result<i32, PosixErrno> {
         Err(PosixErrno::NoSys)
     }
 
@@ -254,13 +264,25 @@ impl<'a> PosixSysdepsContext<'a> {
     ) -> Result<i32, PosixErrno> {
         let fd = self.run_syscall(
             LINUX_NR_SOCKET,
-            [domain as usize, sock_type as usize, protocol as usize, 0, 0, 0],
+            [
+                domain as usize,
+                sock_type as usize,
+                protocol as usize,
+                0,
+                0,
+                0,
+            ],
         )?;
         i32::try_from(fd).map_err(|_| PosixErrno::Inval)
     }
 
     #[cfg(not(test))]
-    pub fn socket_hook(&mut self, _domain: i32, _sock_type: i32, _protocol: i32) -> Result<i32, PosixErrno> {
+    pub fn socket_hook(
+        &mut self,
+        _domain: i32,
+        _sock_type: i32,
+        _protocol: i32,
+    ) -> Result<i32, PosixErrno> {
         Err(PosixErrno::NoSys)
     }
 
@@ -271,15 +293,17 @@ impl<'a> PosixSysdepsContext<'a> {
         addr_ptr: usize,
         addr_len: usize,
     ) -> Result<(), PosixErrno> {
-        self.run_syscall(
-            LINUX_NR_CONNECT,
-            [fd as usize, addr_ptr, addr_len, 0, 0, 0],
-        )
-        .map(|_| ())
+        self.run_syscall(LINUX_NR_CONNECT, [fd as usize, addr_ptr, addr_len, 0, 0, 0])
+            .map(|_| ())
     }
 
     #[cfg(not(test))]
-    pub fn connect_hook(&mut self, _fd: i32, _addr_ptr: usize, _addr_len: usize) -> Result<(), PosixErrno> {
+    pub fn connect_hook(
+        &mut self,
+        _fd: i32,
+        _addr_ptr: usize,
+        _addr_len: usize,
+    ) -> Result<(), PosixErrno> {
         Err(PosixErrno::NoSys)
     }
 
@@ -326,14 +350,16 @@ impl<'a> PosixSysdepsContext<'a> {
         buf_ptr: usize,
         buf_len: usize,
     ) -> Result<usize, PosixErrno> {
-        self.run_syscall(
-            LINUX_NR_READ,
-            [fd as usize, buf_ptr, buf_len, 0, 0, 0],
-        )
+        self.run_syscall(LINUX_NR_READ, [fd as usize, buf_ptr, buf_len, 0, 0, 0])
     }
 
     #[cfg(not(test))]
-    pub fn read_hook(&mut self, _fd: i32, _buf_ptr: usize, _buf_len: usize) -> Result<usize, PosixErrno> {
+    pub fn read_hook(
+        &mut self,
+        _fd: i32,
+        _buf_ptr: usize,
+        _buf_len: usize,
+    ) -> Result<usize, PosixErrno> {
         Err(PosixErrno::NoSys)
     }
 
@@ -344,14 +370,16 @@ impl<'a> PosixSysdepsContext<'a> {
         buf_ptr: usize,
         buf_len: usize,
     ) -> Result<usize, PosixErrno> {
-        self.run_syscall(
-            LINUX_NR_WRITE,
-            [fd as usize, buf_ptr, buf_len, 0, 0, 0],
-        )
+        self.run_syscall(LINUX_NR_WRITE, [fd as usize, buf_ptr, buf_len, 0, 0, 0])
     }
 
     #[cfg(not(test))]
-    pub fn write_hook(&mut self, _fd: i32, _buf_ptr: usize, _buf_len: usize) -> Result<usize, PosixErrno> {
+    pub fn write_hook(
+        &mut self,
+        _fd: i32,
+        _buf_ptr: usize,
+        _buf_len: usize,
+    ) -> Result<usize, PosixErrno> {
         Err(PosixErrno::NoSys)
     }
 
@@ -413,8 +441,9 @@ fn getpid_via_process_manager_ipc(
         return Err(GetPidIpcError::MissingBindings);
     }
     let request_payload = startup_tid.to_le_bytes();
-    let request = RuntimeMessage::with_header(startup_tid, PROC_OP_GETPID, 0, None, &request_payload)
-        .map_err(|_| GetPidIpcError::ProtocolMismatch)?;
+    let request =
+        RuntimeMessage::with_header(startup_tid, PROC_OP_GETPID, 0, None, &request_payload)
+            .map_err(|_| GetPidIpcError::ProtocolMismatch)?;
     transport
         .send(request_cap, &request)
         .map_err(|_| GetPidIpcError::Transport)?;
@@ -429,11 +458,11 @@ fn getpid_via_process_manager_ipc(
 mod tests {
     use super::*;
     use crate::kernel::boot::Bootstrap;
-    use crate::yarm_compat_servers::socket_errno_test_helpers::{
-        assert_errno_hook_result, assert_socket_request_shape, setup_socket_ipc_fixture,
-        SocketErrnoCase,
-    };
     use crate::std::thread;
+    use crate::yarm_compat_servers::socket_errno_test_helpers::{
+        SocketErrnoCase, assert_errno_hook_result, assert_socket_request_shape,
+        setup_socket_ipc_fixture,
+    };
     use yarm_ipc_abi::process_abi::{PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID};
     use yarm_ipc_abi::socket_abi::{
         ConnectArgs, SOCKET_OP_CONNECT, SOCKET_OP_SENDTO, SOCKET_OP_SOCKET, SendToArgs,
@@ -458,11 +487,7 @@ mod tests {
     }
 
     impl IpcTransport for StubTransport {
-        fn send(
-            &mut self,
-            _ep_cap: u32,
-            _msg: &RuntimeMessage,
-        ) -> Result<(), SyscallError> {
+        fn send(&mut self, _ep_cap: u32, _msg: &RuntimeMessage) -> Result<(), SyscallError> {
             Ok(())
         }
 
@@ -715,7 +740,11 @@ mod tests {
                 .ipc_recv(socket_req_recv)
                 .expect("recv sendto req")
                 .expect("sendto req");
-            assert_socket_request_shape(sendto_req.opcode, sendto_req.as_slice(), SocketErrnoCase::Sendto);
+            assert_socket_request_shape(
+                sendto_req.opcode,
+                sendto_req.as_slice(),
+                SocketErrnoCase::Sendto,
+            );
         });
     }
 
@@ -746,7 +775,11 @@ mod tests {
                 .ipc_recv(socket_req_recv)
                 .expect("recv connect req")
                 .expect("connect req");
-            assert_socket_request_shape(connect_req.opcode, connect_req.as_slice(), SocketErrnoCase::Connect);
+            assert_socket_request_shape(
+                connect_req.opcode,
+                connect_req.as_slice(),
+                SocketErrnoCase::Connect,
+            );
         });
     }
 
@@ -777,7 +810,11 @@ mod tests {
                 .ipc_recv(socket_req_recv)
                 .expect("recv socket req")
                 .expect("socket req");
-            assert_socket_request_shape(socket_req.opcode, socket_req.as_slice(), SocketErrnoCase::Socket);
+            assert_socket_request_shape(
+                socket_req.opcode,
+                socket_req.as_slice(),
+                SocketErrnoCase::Socket,
+            );
         });
     }
 
@@ -809,7 +846,7 @@ mod tests {
                             None,
                             &(-errno).to_le_bytes(),
                         )
-                            .expect("error reply"),
+                        .expect("error reply"),
                     )
                     .expect("seed error reply");
 
@@ -821,7 +858,10 @@ mod tests {
                         assert_errno_hook_result(ctx.connect_hook(1001, 0xCAFE, 16), case);
                     }
                     SocketErrnoCase::Sendto => {
-                        assert_errno_hook_result(ctx.sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16), case);
+                        assert_errno_hook_result(
+                            ctx.sendto_hook(1001, 0xBEEF, 7, 0, 0xD00D, 16),
+                            case,
+                        );
                     }
                 }
 

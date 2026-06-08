@@ -197,7 +197,7 @@ impl KernelState {
 
     #[cfg(feature = "posix-compat")]
     pub(crate) fn scheduler_tick_advance(&mut self) -> u64 {
-        self.with_scheduler_state_mut(|sched| sched.timer.tick_and_check().0 .0)
+        self.with_scheduler_state_mut(|sched| sched.timer.tick_and_check().0.0)
     }
 
     pub(crate) fn with_ipc_state<R>(&self, f: impl FnOnce(&IpcSubsystem) -> R) -> R {
@@ -526,10 +526,7 @@ impl KernelState {
     /// Same requirements as `task_class_from_raw`. `task_state_lock` serializes
     /// access to the `tcbs` array; `addr_of!` avoids a reference to the whole
     /// `KernelState`.
-    pub(crate) unsafe fn process_id_from_raw(
-        state: *const KernelState,
-        tid: u64,
-    ) -> Option<u64> {
+    pub(crate) unsafe fn process_id_from_raw(state: *const KernelState, tid: u64) -> Option<u64> {
         let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
         let _guard = lock_ref.lock();
         let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
@@ -546,10 +543,7 @@ impl KernelState {
     /// # Safety
     /// Same requirements as `task_class_from_raw`. `task_state_lock` serializes
     /// access to the `tcbs` array.
-    pub(crate) unsafe fn is_group_leader_from_raw(
-        state: *const KernelState,
-        tid: u64,
-    ) -> bool {
+    pub(crate) unsafe fn is_group_leader_from_raw(state: *const KernelState, tid: u64) -> bool {
         let lock_ref = unsafe { &*core::ptr::addr_of!((*state).task_state_lock) };
         let _guard = lock_ref.lock();
         let tcbs: &[Option<ThreadControlBlock>; MAX_TASKS] =
@@ -720,8 +714,7 @@ impl KernelState {
         }
 
         let max_total_cnode_slots = limits.max_total_cnode_slots;
-        let bounded_slot_capacity =
-            Self::normalize_requested_cnode_slots(slot_capacity, limits)?;
+        let bounded_slot_capacity = Self::normalize_requested_cnode_slots(slot_capacity, limits)?;
         let target_cnode = CNodeId(target_pid);
 
         let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };

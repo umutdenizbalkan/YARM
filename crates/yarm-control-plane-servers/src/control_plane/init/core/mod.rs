@@ -8,6 +8,8 @@ mod policy;
 use alloc::boxed::Box;
 #[cfg(test)]
 use yarm::kernel::boot::{KernelError, KernelState, UserImageSpec};
+#[cfg(test)]
+use yarm::kernel::capabilities::{CapObject, Capability};
 use yarm_fs_servers::common::service::FsService;
 use yarm_fs_servers::common::vfs_ipc::{
     ReadWriteRequest, openat_inline_message, statx_inline_message, write_message,
@@ -28,8 +30,6 @@ use yarm_srv_common::vfs_reply::VfsReply;
 use yarm_user_rt::capability::CapId;
 #[cfg(test)]
 use yarm_user_rt::capability::CapRights;
-#[cfg(test)]
-use yarm::kernel::capabilities::{CapObject, Capability};
 #[cfg(not(test))]
 use yarm_user_rt::runtime::KernelIpcError as KernelError;
 #[cfg(test)]

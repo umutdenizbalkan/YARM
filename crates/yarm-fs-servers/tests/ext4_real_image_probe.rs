@@ -82,9 +82,11 @@ fn run_probe(stored_seed: bool) {
     assert!(entries.iter().any(|entry| entry.name() == b"file0000.bin"));
     assert!(entries.iter().any(|entry| entry.name() == b"file0599.bin"));
     for (index, entry) in entries.iter().enumerate() {
-        assert!(!entries[..index]
-            .iter()
-            .any(|prior| prior.inode == entry.inode && prior.name() == entry.name()));
+        assert!(
+            !entries[..index]
+                .iter()
+                .any(|prior| prior.inode == entry.inode && prior.name() == entry.name())
+        );
     }
 
     drop(cleanup);

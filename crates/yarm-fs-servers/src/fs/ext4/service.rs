@@ -3,8 +3,8 @@
 
 use super::super::common::service::FsService;
 use super::super::common::vfs_ipc::{openat_inline_message, statx_inline_message};
-use super::fs::Ext4Backend;
 use super::fs::EXT4_DEMO_PATH;
+use super::fs::Ext4Backend;
 use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type Ext4Service = FsService<Ext4Backend>;
@@ -37,7 +37,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::super::super::common::vfs_ipc::{
-        write_message, ReadWriteRequest, VfsBackend, VfsError,
+        ReadWriteRequest, VfsBackend, VfsError, write_message,
     };
     use super::super::{EXT4_OVERSIZE_PATH, EXT4_SERVICE_PATH};
     use super::*;

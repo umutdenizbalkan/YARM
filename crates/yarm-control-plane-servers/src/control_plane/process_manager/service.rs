@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use alloc::vec::Vec;
 #[cfg(test)]
 use yarm::kernel::boot::KernelState;
 #[cfg(test)]
@@ -9,16 +10,13 @@ use yarm::kernel::boot::{KernelError, TrapHandleError};
 use yarm::kernel::process::{ProcessManager, ProcessManagerError as KernelProcessManagerError};
 #[cfg(test)]
 use yarm::kernel::syscall::SyscallError as KernelSyscallError;
-use alloc::vec::Vec;
 use yarm_ipc_abi::process_abi::{
-    ExecuteRestartReply, ExecuteRestartRequest, LIFECYCLE_STATE_SPAWNED,
-    LifecycleQueryReply, LifecycleQueryRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT,
-    PROC_OP_GETPID, PROC_OP_GETPPID, PROC_OP_LIFECYCLE_QUERY,
-    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4,
-    PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2, RegisterSupervisedTask,
-    SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs,
-    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args,
-    encode_spawn_v5_reply,
+    ExecuteRestartReply, ExecuteRestartRequest, LIFECYCLE_STATE_SPAWNED, LifecycleQueryReply,
+    LifecycleQueryRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
+    PROC_OP_LIFECYCLE_QUERY, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
+    PROC_OP_SPAWN_V4, PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
+    RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs,
+    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args, encode_spawn_v5_reply,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -32,11 +30,6 @@ const PM_VFS_READ_APPEND_TRACE: bool = false;
 const PM_VFS_BULK_READ_CHUNK_TRACE: bool = false;
 /// Gate for Phase 2B VFS-transfer per-chunk logs (hot-path).
 const PM_VFS_BULK_READ_TRANSFER_CHUNK_TRACE: bool = false;
-#[cfg(not(test))]
-use yarm_user_rt::vfs_client::{
-    build_bulk_read_message, build_close_message, build_openat_message, build_read_message,
-    build_statx_message,
-};
 use yarm_user_rt::process::{
     ProcessError as ProcessManagerError, ProcessId, ProcessManagerOps, WaitResult,
 };
@@ -45,6 +38,11 @@ use yarm_user_rt::runtime::{KernelIpcError, RuntimeStateAccess, TrapIpcError};
 #[cfg(test)]
 use yarm_user_rt::syscall::SyscallError;
 use yarm_user_rt::task::TaskClass;
+#[cfg(not(test))]
+use yarm_user_rt::vfs_client::{
+    build_bulk_read_message, build_close_message, build_openat_message, build_read_message,
+    build_statx_message,
+};
 
 #[cfg(test)]
 const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
@@ -196,7 +194,11 @@ impl KernelProcessSpawnBackend {
     }
 
     fn spawn(&self, image_id: u64, parent_pid: u64) -> Result<u64, ProcessManagerError> {
-        yarm_user_rt::user_log!("PM_HANDLE_SPAWN_V5_BEGIN image_id={} parent_pid={}", image_id, parent_pid);
+        yarm_user_rt::user_log!(
+            "PM_HANDLE_SPAWN_V5_BEGIN image_id={} parent_pid={}",
+            image_id,
+            parent_pid
+        );
         // SAFETY: Delegates to kernel spawn_process syscall (nr=23).
         let result = unsafe {
             yarm_user_rt::syscall::spawn_process(image_id, parent_pid)
@@ -206,11 +208,20 @@ impl KernelProcessSpawnBackend {
         result
     }
 
-    fn spawn_with_caps(&self, image_id: u64, parent_pid: u64, service_caps: [u64; 4]) -> Result<(u64, u32, u32), ProcessManagerError> {
+    fn spawn_with_caps(
+        &self,
+        image_id: u64,
+        parent_pid: u64,
+        service_caps: [u64; 4],
+    ) -> Result<(u64, u32, u32), ProcessManagerError> {
         yarm_user_rt::user_log!(
             "PM_SPAWN_CAP_BEGIN image_id={} parent_pid={} caps=[{},{},{},{}]",
-            image_id, parent_pid,
-            service_caps[0], service_caps[1], service_caps[2], service_caps[3]
+            image_id,
+            parent_pid,
+            service_caps[0],
+            service_caps[1],
+            service_caps[2],
+            service_caps[3]
         );
         let mut startup_args = [0u64; 18];
         startup_args[13] = service_caps[0];
@@ -219,8 +230,12 @@ impl KernelProcessSpawnBackend {
         startup_args[16] = service_caps[3];
         // SAFETY: Delegates to kernel spawn_process syscall with startup_args.
         let result = unsafe {
-            yarm_user_rt::syscall::spawn_process_with_startup_caps(image_id, parent_pid, &startup_args)
-                .map_err(|_| ProcessManagerError::TableFull)
+            yarm_user_rt::syscall::spawn_process_with_startup_caps(
+                image_id,
+                parent_pid,
+                &startup_args,
+            )
+            .map_err(|_| ProcessManagerError::TableFull)
         };
         yarm_user_rt::user_log!("PM_SPAWN_CAP_RESULT ok={}", result.is_ok() as u8);
         result
@@ -946,8 +961,10 @@ impl ProcessService {
                     .map_err(|_| ProcessManagerError::Malformed)?;
                 yarm_user_rt::user_log!(
                     "PM_SPAWN_V5_CAP_DECODE image_id={} parent_pid={} cap0={} cap1={}",
-                    args.image_id, args.parent_pid,
-                    args.service_caps[0], args.service_caps[1]
+                    args.image_id,
+                    args.parent_pid,
+                    args.service_caps[0],
+                    args.service_caps[1]
                 );
                 Ok(ProcessRequest::SpawnV5Cap(SpawnV5CapRequest {
                     parent_pid: ProcessId(args.parent_pid),
@@ -1205,8 +1222,14 @@ impl ProcessService {
                                     req.image_id
                                 );
                                 let encoded = encode_spawn_v5_reply(0, 0);
-                                return Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
-                                    .map_err(|_| ProcessManagerError::Malformed);
+                                return Message::with_header(
+                                    0,
+                                    PROC_OP_SPAWN_V5_CAP,
+                                    0,
+                                    None,
+                                    &encoded,
+                                )
+                                .map_err(|_| ProcessManagerError::Malformed);
                             }
                             let (t, c, s) = match unsafe {
                                 pm_vfs_spawn_inline(
@@ -1239,8 +1262,11 @@ impl ProcessService {
                     };
                     // PM's own send cap: prefer spawner_cap (set when parent got a
                     // delegated copy); fall back to caller_cap when parent_pid == 0.
-                    let pm_send_cap =
-                        if spawner_cap != 0 { spawner_cap } else { caller_cap as u32 };
+                    let pm_send_cap = if spawner_cap != 0 {
+                        spawner_cap
+                    } else {
+                        caller_cap as u32
+                    };
                     // Record in lifecycle table regardless of image_id so PM always
                     // has a complete view of spawned services.
                     let recorded = self.lifecycle_table.record(ServiceLifecycleRecord {
@@ -1252,12 +1278,19 @@ impl ProcessService {
                     });
                     yarm_user_rt::user_log!(
                         "PM_LIFECYCLE_RECORD image_id={} tid={} pm_service_send_cap={} parent_tid={} state=spawned recorded={}",
-                        req.image_id, tid, pm_send_cap, req.parent_pid.0, recorded as u8
+                        req.image_id,
+                        tid,
+                        pm_send_cap,
+                        req.parent_pid.0,
+                        recorded as u8
                     );
                     let encoded = encode_spawn_v5_reply(tid, caller_cap);
                     yarm_user_rt::user_log!(
                         "PM_SPAWN_V5_CAP_REPLY tid={} caller_cap={} pm_send_cap={} len={}",
-                        tid, caller_cap, pm_send_cap, encoded.len()
+                        tid,
+                        caller_cap,
+                        pm_send_cap,
+                        encoded.len()
                     );
                     Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
                         .map_err(|_| ProcessManagerError::Malformed)
@@ -1415,10 +1448,7 @@ unsafe fn pm_vfs_spawn_inline(
         10 => b"/initramfs/sbin/fat_srv",
         11 => b"/initramfs/sbin/ramfs_srv",
         _ => {
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}",
-                image_id
-            );
+            yarm_user_rt::user_log!("PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}", image_id);
             return Err(ProcessManagerError::Unsupported);
         }
     };
@@ -1431,7 +1461,9 @@ unsafe fn pm_vfs_spawn_inline(
     let path_log = core::str::from_utf8(path_label).unwrap_or("<path-bytes>");
     yarm_user_rt::user_log!(
         "PM_VFS_SPAWN_IMAGE_BEGIN image_id={} path={} parent_pid={}",
-        image_id, path_log, parent_pid
+        image_id,
+        path_log,
+        parent_pid
     );
     let ctx = yarm_user_rt::runtime::startup_context();
     let reply_recv_cap = ctx
@@ -1476,7 +1508,8 @@ unsafe fn pm_vfs_spawn_inline(
                 // Hard error (NotFound, Malformed) — no fallback.
                 yarm_user_rt::user_log!(
                     "PM_ELF_ZC_FAIL image_id={} reason=phase3a_hard_err err={:?}",
-                    image_id, e
+                    image_id,
+                    e
                 );
                 return Err(e);
             }
@@ -1484,20 +1517,16 @@ unsafe fn pm_vfs_spawn_inline(
     }
 
     let image = match pm_image_cpio_name(image_id) {
-        Some(cpio_name) => {
-            unsafe {
-                pm_read_all_via_vfs_bulk(
-                    image_id,
-                    vfs_send_cap,
-                    reply_recv_cap,
-                    path_label,
-                    cpio_name,
-                )
-            }?
-        }
-        None => {
-            unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?
-        }
+        Some(cpio_name) => unsafe {
+            pm_read_all_via_vfs_bulk(
+                image_id,
+                vfs_send_cap,
+                reply_recv_cap,
+                path_label,
+                cpio_name,
+            )
+        }?,
+        None => unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?,
     };
     if image.is_empty() {
         yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
@@ -1508,13 +1537,16 @@ unsafe fn pm_vfs_spawn_inline(
         let first4_end = core::cmp::min(image.len(), 4);
         yarm_user_rt::user_log!(
             "PM_VFS_SPAWN_FAIL image_id={} err=bad-elf-magic first4={:x?}",
-            image_id, &image[..first4_end]
+            image_id,
+            &image[..first4_end]
         );
         return Err(ProcessManagerError::Malformed);
     }
     yarm_user_rt::user_log!(
         "PM_VFS_SPAWN_FROM_VFS_BYTES image_id={} len={} first4={:x?}",
-        image_id, image.len(), &image[..4]
+        image_id,
+        image.len(),
+        &image[..4]
     );
     let image_len = image.len();
     let result = unsafe {
@@ -1536,7 +1568,10 @@ unsafe fn pm_vfs_spawn_inline(
         Ok((tid, caller_cap, spawner_cap)) => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_RESULT image_id={} tid={} caller_cap={} spawner_cap={}",
-                image_id, tid, caller_cap, spawner_cap
+                image_id,
+                tid,
+                caller_cap,
+                spawner_cap
             );
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_IMAGE_SELECTED image_id={} source=vfs",
@@ -1545,10 +1580,7 @@ unsafe fn pm_vfs_spawn_inline(
             Ok((tid, caller_cap, spawner_cap))
         }
         Err(e) => {
-            yarm_user_rt::user_log!(
-                "PM_VFS_SPAWN_FAIL image_id={} err={:?}",
-                image_id, e
-            );
+            yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err={:?}", image_id, e);
             Err(ProcessManagerError::TableFull)
         }
     }
@@ -1607,7 +1639,10 @@ unsafe fn pm_vfs_call_u64(
             Ok(reply)
         }
         Ok(None) => {
-            yarm_user_rt::user_log!("PM_VFS_REPLY_RECV_FAIL op={} err=timed_out_or_would_block", op);
+            yarm_user_rt::user_log!(
+                "PM_VFS_REPLY_RECV_FAIL op={} err=timed_out_or_would_block",
+                op
+            );
             Err(ProcessManagerError::WouldBlock)
         }
         Err(e) => {
@@ -1642,7 +1677,8 @@ unsafe fn pm_vfs_call_full(
             let transferred_cap = received.transferred_cap;
             yarm_user_rt::user_log!(
                 "PM_VFS_REPLY_FULL op={} len={} transferred_cap={}",
-                op, received.message.len,
+                op,
+                received.message.len,
                 transferred_cap.unwrap_or(0)
             );
             Ok((received.message, transferred_cap))
@@ -1675,7 +1711,11 @@ unsafe fn pm_try_grant_ro_and_spawn(
 ) -> Result<(u64, u32, u32), ProcessManagerError> {
     let path_str = core::str::from_utf8(vfs_path).unwrap_or("<path>");
 
-    yarm_user_rt::user_log!("PM_VFS_GRANT_RO_BEGIN image_id={} path={}", image_id, path_str);
+    yarm_user_rt::user_log!(
+        "PM_VFS_GRANT_RO_BEGIN image_id={} path={}",
+        image_id,
+        path_str
+    );
 
     // ── 1. OPENAT via VFS to get fd ──────────────────────────────────────────
     let open_msg = build_openat_message(vfs_path, 0).map_err(|_| ProcessManagerError::Malformed)?;
@@ -1684,7 +1724,8 @@ unsafe fn pm_try_grant_ro_and_spawn(
         Err(e) => {
             yarm_user_rt::user_log!(
                 "PM_ELF_ZC_FAIL image_id={} reason=openat_fail err={:?}",
-                image_id, e
+                image_id,
+                e
             );
             return Err(e);
         }
@@ -1706,30 +1747,33 @@ unsafe fn pm_try_grant_ro_and_spawn(
         0,
         None,
         &grant_payload,
-    ).map_err(|_| ProcessManagerError::Malformed)?;
+    )
+    .map_err(|_| ProcessManagerError::Malformed)?;
 
-    let (grant_reply, transferred_cap) = match unsafe {
-        pm_vfs_call_full(vfs_send_cap, reply_recv_cap, &grant_msg)
-    } {
-        Ok(r) => r,
-        Err(e) => {
-            yarm_user_rt::user_log!(
-                "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_ipc_fail err={:?}",
-                image_id, e
-            );
-            // Close fd on error.
-            if let Ok(close_msg) = build_close_message(fd) {
-                let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+    let (grant_reply, transferred_cap) =
+        match unsafe { pm_vfs_call_full(vfs_send_cap, reply_recv_cap, &grant_msg) } {
+            Ok(r) => r,
+            Err(e) => {
+                yarm_user_rt::user_log!(
+                    "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_ipc_fail err={:?}",
+                    image_id,
+                    e
+                );
+                // Close fd on error.
+                if let Ok(close_msg) = build_close_message(fd) {
+                    let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
 
     // Check reply status: non-zero opcode or no transferred cap → unsupported.
     if grant_reply.opcode != 0 || transferred_cap.is_none() {
         yarm_user_rt::user_log!(
             "PM_ELF_ZC_FAIL image_id={} reason=grant_ro_unsupported opcode={} has_cap={}",
-            image_id, grant_reply.opcode, transferred_cap.is_some()
+            image_id,
+            grant_reply.opcode,
+            transferred_cap.is_some()
         );
         if let Ok(close_msg) = build_close_message(fd) {
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -1746,7 +1790,9 @@ unsafe fn pm_try_grant_ro_and_spawn(
 
     yarm_user_rt::user_log!(
         "PM_VFS_GRANT_RO_RECEIVED image_id={} len={} cap={}",
-        image_id, file_len, mo_cap
+        image_id,
+        file_len,
+        mo_cap
     );
 
     // Close fd — we have the cap now.
@@ -1757,12 +1803,7 @@ unsafe fn pm_try_grant_ro_and_spawn(
     // ── 3. Spawn from MemoryObject cap (kernel syscall nr=29) ────────────────
     // SAFETY: mo_cap is a valid MemoryObject cap minted by the kernel.
     let result = unsafe {
-        yarm_user_rt::syscall::spawn_from_memory_object(
-            image_id,
-            mo_cap,
-            parent_pid,
-            startup_args,
-        )
+        yarm_user_rt::syscall::spawn_from_memory_object(image_id, mo_cap, parent_pid, startup_args)
     };
     match result {
         Ok((tid, caller_cap, spawner_cap)) => {
@@ -1770,7 +1811,10 @@ unsafe fn pm_try_grant_ro_and_spawn(
             // Emit a distinct PM-side marker for the user-space log so as not to double-count.
             yarm_user_rt::user_log!(
                 "PM_SPAWN_FROM_MO_DONE image_id={} tid={} caller_cap={} spawner_cap={}",
-                image_id, tid, caller_cap, spawner_cap
+                image_id,
+                tid,
+                caller_cap,
+                spawner_cap
             );
             Ok((tid, caller_cap, spawner_cap))
         }
@@ -1785,7 +1829,8 @@ unsafe fn pm_try_grant_ro_and_spawn(
         Err(e) => {
             yarm_user_rt::user_log!(
                 "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_err err={:?}",
-                image_id, e
+                image_id,
+                e
             );
             Err(ProcessManagerError::Malformed)
         }
@@ -1850,14 +1895,16 @@ unsafe fn pm_read_all_via_vfs_bulk(
     if stat_payload.len() != 8 {
         yarm_user_rt::user_log!(
             "PM_VFS_REPLY_DECODE_FAIL op=STATX image_id={} reason=bad_len expected=8 actual={}",
-            image_id, stat_payload.len()
+            image_id,
+            stat_payload.len()
         );
         return Err(ProcessManagerError::Malformed);
     }
     let file_len = decode_u64(stat_payload).ok_or(ProcessManagerError::Malformed)? as usize;
     yarm_user_rt::user_log!(
         "PM_VFS_REPLY_DECODE op=STATX image_id={} file_len={}",
-        image_id, file_len
+        image_id,
+        file_len
     );
 
     // ── 2. OPENAT via VFS for fd lifecycle tracking ───────────────────────────
@@ -1868,7 +1915,8 @@ unsafe fn pm_read_all_via_vfs_bulk(
         Err(e) => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_FAIL image_id={} stage=bulk-openat reason={:?}",
-                image_id, e
+                image_id,
+                e
             );
             return Err(e);
         }
@@ -1885,7 +1933,9 @@ unsafe fn pm_read_all_via_vfs_bulk(
     };
     yarm_user_rt::user_log!(
         "PM_VFS_OPENAT_DECODE image_id={} path={} fd={}",
-        image_id, path_str, fd
+        image_id,
+        path_str,
+        fd
     );
 
     // ── 3. Phase 2B: attempt VFS-mediated transfer-buffer bulk read ───────────
@@ -1893,7 +1943,9 @@ unsafe fn pm_read_all_via_vfs_bulk(
     // (reply opcode ≠ 0 or copied_len=0+eof=false) fall back to Phase 2A.
     yarm_user_rt::user_log!(
         "PM_VFS_READ_BULK_BEGIN image_id={} fd={} expected={} chunk=4096 mode=vfs_transfer",
-        image_id, fd, file_len
+        image_id,
+        fd,
+        file_len
     );
 
     let mut out = Vec::with_capacity(file_len);
@@ -1925,14 +1977,13 @@ unsafe fn pm_read_all_via_vfs_bulk(
         };
 
         // Send VFS_OP_READ_BULK and receive reply.
-        let bulk_reply = match unsafe {
-            pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &bulk_msg)
-        } {
+        let bulk_reply = match unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &bulk_msg) } {
             Ok(r) => r,
             Err(e) => {
                 yarm_user_rt::user_log!(
                     "PM_VFS_READ_BULK_FAIL image_id={} stage=ipc_call reason={:?}",
-                    image_id, e
+                    image_id,
+                    e
                 );
                 phase2b_unsupported = true;
                 break 'phase2b;
@@ -1943,7 +1994,8 @@ unsafe fn pm_read_all_via_vfs_bulk(
         if bulk_reply.opcode != 0 {
             yarm_user_rt::user_log!(
                 "PM_VFS_READ_BULK_VFS_UNSUPPORTED image_id={} fallback=phase2a opcode={}",
-                image_id, bulk_reply.opcode
+                image_id,
+                bulk_reply.opcode
             );
             phase2b_unsupported = true;
             break 'phase2b;
@@ -1977,7 +2029,8 @@ unsafe fn pm_read_all_via_vfs_bulk(
         if bytes_copied > 4096 || bytes_copied > bulk_buf.len() {
             yarm_user_rt::user_log!(
                 "PM_VFS_READ_BULK_FAIL image_id={} stage=phase2b reason=copied_len_overflow copied={}",
-                image_id, bytes_copied
+                image_id,
+                bytes_copied
             );
             let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -1988,7 +2041,10 @@ unsafe fn pm_read_all_via_vfs_bulk(
             // Real EOF (file shorter than STATX reported).
             yarm_user_rt::user_log!(
                 "PM_VFS_READ_BULK_FAIL image_id={} stage=eof_early_phase2b total={} expected={} offset={}",
-                image_id, out.len(), file_len, offset
+                image_id,
+                out.len(),
+                file_len,
+                offset
             );
             let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -2004,7 +2060,11 @@ unsafe fn pm_read_all_via_vfs_bulk(
         if PM_VFS_BULK_READ_TRANSFER_CHUNK_TRACE {
             yarm_user_rt::user_log!(
                 "PM_VFS_READ_BULK_TRANSFER_CHUNK image_id={} bytes={} total={} expected={} chunk_n={}",
-                image_id, bytes_copied, out.len(), file_len, chunk_count
+                image_id,
+                bytes_copied,
+                out.len(),
+                file_len,
+                chunk_count
             );
         }
     }
@@ -2013,7 +2073,10 @@ unsafe fn pm_read_all_via_vfs_bulk(
     if phase2b_unsupported && out.is_empty() {
         yarm_user_rt::user_log!(
             "PM_VFS_READ_BULK_PHASE2A_BEGIN image_id={} fd={} expected={} chunk=4096 cpio={}",
-            image_id, fd, file_len, cpio_str
+            image_id,
+            fd,
+            file_len,
+            cpio_str
         );
 
         offset = 0;
@@ -2038,17 +2101,22 @@ unsafe fn pm_read_all_via_vfs_bulk(
                         "PM_VFS_READ_BULK_UNSUPPORTED image_id={} fallback=inline reason=kernel_no_cpio",
                         image_id
                     );
-                    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                    let close_msg =
+                        build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
                     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
-                    return unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, vfs_path) };
+                    return unsafe {
+                        pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, vfs_path)
+                    };
                 }
                 // NOT-FOUND: file missing from CPIO — real error, no fallback.
                 Err(yarm_user_rt::syscall::SyscallError::Internal) => {
                     yarm_user_rt::user_log!(
                         "PM_VFS_READ_BULK_FAIL image_id={} stage=syscall reason=not_found offset={}",
-                        image_id, offset
+                        image_id,
+                        offset
                     );
-                    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                    let close_msg =
+                        build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
                     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
                     return Err(ProcessManagerError::Malformed);
                 }
@@ -2056,9 +2124,12 @@ unsafe fn pm_read_all_via_vfs_bulk(
                 Err(e) => {
                     yarm_user_rt::user_log!(
                         "PM_VFS_READ_BULK_FAIL image_id={} stage=syscall reason={:?} offset={}",
-                        image_id, e, offset
+                        image_id,
+                        e,
+                        offset
                     );
-                    let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                    let close_msg =
+                        build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
                     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
                     return Err(ProcessManagerError::Malformed);
                 }
@@ -2067,9 +2138,13 @@ unsafe fn pm_read_all_via_vfs_bulk(
             if bytes_copied == 0 {
                 yarm_user_rt::user_log!(
                     "PM_VFS_READ_BULK_FAIL image_id={} stage=eof_early total={} expected={} offset={}",
-                    image_id, out.len(), file_len, offset
+                    image_id,
+                    out.len(),
+                    file_len,
+                    offset
                 );
-                let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
+                let close_msg =
+                    build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
                 let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
                 return Err(ProcessManagerError::Malformed);
             }
@@ -2081,14 +2156,20 @@ unsafe fn pm_read_all_via_vfs_bulk(
             if PM_VFS_BULK_READ_CHUNK_TRACE {
                 yarm_user_rt::user_log!(
                     "PM_VFS_READ_BULK_CHUNK image_id={} bytes={} total={} expected={} chunk_n={}",
-                    image_id, bytes_copied, out.len(), file_len, chunk_count
+                    image_id,
+                    bytes_copied,
+                    out.len(),
+                    file_len,
+                    chunk_count
                 );
             }
         }
 
         yarm_user_rt::user_log!(
             "PM_VFS_READ_BULK_PHASE2A_DONE image_id={} total={} chunks={}",
-            image_id, out.len(), chunk_count
+            image_id,
+            out.len(),
+            chunk_count
         );
     }
 
@@ -2103,15 +2184,25 @@ unsafe fn pm_read_all_via_vfs_bulk(
     // ── 6. Verify and log completion ──────────────────────────────────────────
     {
         let first4_end = core::cmp::min(out.len(), 4);
-        let mode = if used_phase2b { "vfs_transfer" } else { "phase2a_bridge" };
+        let mode = if used_phase2b {
+            "vfs_transfer"
+        } else {
+            "phase2a_bridge"
+        };
         yarm_user_rt::user_log!(
             "PM_VFS_READ_BULK_DONE image_id={} total={} first4={:x?} chunks={} mode={}",
-            image_id, out.len(), &out[..first4_end], chunk_count, mode
+            image_id,
+            out.len(),
+            &out[..first4_end],
+            chunk_count,
+            mode
         );
         // Emit the legacy completion marker so smoke scripts and existing greps pass.
         yarm_user_rt::user_log!(
             "PM_VFS_READ_DONE image_id={} total={} first4={:x?}",
-            image_id, out.len(), &out[..first4_end]
+            image_id,
+            out.len(),
+            &out[..first4_end]
         );
     }
 
@@ -2154,14 +2245,18 @@ unsafe fn pm_read_all_via_vfs(
         Ok(reply) => {
             yarm_user_rt::user_log!(
                 "PM_VFS_OPENAT_RETURN image_id={} path={} result=ok len={}",
-                image_id, path_str, reply.len
+                image_id,
+                path_str,
+                reply.len
             );
             reply
         }
         Err(err) => {
             yarm_user_rt::user_log!(
                 "PM_VFS_OPENAT_RETURN image_id={} path={} result=err err={:?}",
-                image_id, path_str, err
+                image_id,
+                path_str,
+                err
             );
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=openat_call_fail",
@@ -2178,14 +2273,19 @@ unsafe fn pm_read_all_via_vfs(
             let preview_len = core::cmp::min(slice.len(), 8);
             yarm_user_rt::user_log!(
                 "PM_VFS_OPENAT_DECODE image_id={} path={} fd={} raw_len={} raw_bytes={:x?}",
-                image_id, path_str, v, open_reply.len, &slice[..preview_len]
+                image_id,
+                path_str,
+                v,
+                open_reply.len,
+                &slice[..preview_len]
             );
             v
         }
         None => {
             yarm_user_rt::user_log!(
                 "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=bad_fd_decode raw_len={}",
-                image_id, open_reply.len
+                image_id,
+                open_reply.len
             );
             return Err(ProcessManagerError::Malformed);
         }
@@ -2196,7 +2296,11 @@ unsafe fn pm_read_all_via_vfs(
     // OPENAT-decode and first READ is bracketed by PM_VFS_READ_BEGIN.
     yarm_user_rt::user_log!(
         "PM_VFS_READ_BEGIN image_id={} path={} fd={} expected={} chunk={}",
-        image_id, path_str, fd, file_len, Message::MAX_PAYLOAD - 16
+        image_id,
+        path_str,
+        fd,
+        file_len,
+        Message::MAX_PAYLOAD - 16
     );
 
     // READ loop: accumulate file_len bytes in chunks.  Each iteration must make
@@ -2214,7 +2318,9 @@ unsafe fn pm_read_all_via_vfs(
             Err(err) => {
                 yarm_user_rt::user_log!(
                     "PM_VFS_SPAWN_FAIL image_id={} stage=after-openat reason=build_read_msg_fail fd={} err={:?}",
-                    image_id, fd, err
+                    image_id,
+                    fd,
+                    err
                 );
                 return Err(ProcessManagerError::Malformed);
             }
@@ -2227,7 +2333,10 @@ unsafe fn pm_read_all_via_vfs(
             let preview_len = core::cmp::min(payload.len(), 16);
             yarm_user_rt::user_log!(
                 "PM_VFS_READ_REPLY_RAW fd={} requested={} len={} first16={:x?}",
-                fd, to_read, payload.len(), &payload[..preview_len]
+                fd,
+                to_read,
+                payload.len(),
+                &payload[..preview_len]
             );
         }
 
@@ -2235,13 +2344,12 @@ unsafe fn pm_read_all_via_vfs(
 
         if read_len == 0 {
             // Premature EOF: backend signalled zero bytes before file_len reached.
-            yarm_user_rt::user_log!(
-                "PM_VFS_READ_EOF total={} expected={}",
-                out.len(), file_len
-            );
+            yarm_user_rt::user_log!("PM_VFS_READ_EOF total={} expected={}", out.len(), file_len);
             yarm_user_rt::user_log!(
                 "PM_VFS_READ_NO_PROGRESS fd={} total={} expected={} reason=premature_eof",
-                fd, out.len(), file_len
+                fd,
+                out.len(),
+                file_len
             );
             let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -2257,7 +2365,10 @@ unsafe fn pm_read_all_via_vfs(
             if PM_VFS_READ_APPEND_TRACE {
                 yarm_user_rt::user_log!(
                     "PM_VFS_READ_APPEND bytes={} total={} expected={} first4={:x?}",
-                    copy_len, out.len(), file_len, first4
+                    copy_len,
+                    out.len(),
+                    file_len,
+                    first4
                 );
             }
         }
@@ -2267,7 +2378,11 @@ unsafe fn pm_read_all_via_vfs(
             // placeholder backend.  No progress means we can never complete.
             yarm_user_rt::user_log!(
                 "PM_VFS_READ_NO_PROGRESS fd={} total={} expected={} read_len={} inline_len={}",
-                fd, prev_len, file_len, read_len, inline.len()
+                fd,
+                prev_len,
+                file_len,
+                read_len,
+                inline.len()
             );
             let close_msg = build_close_message(fd).map_err(|_| ProcessManagerError::Malformed)?;
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -2279,7 +2394,9 @@ unsafe fn pm_read_all_via_vfs(
         let first4_end = core::cmp::min(out.len(), 4);
         yarm_user_rt::user_log!(
             "PM_VFS_READ_DONE image_id={} total={} first4={:x?}",
-            image_id, out.len(), &out[..first4_end]
+            image_id,
+            out.len(),
+            &out[..first4_end]
         );
     }
 
@@ -2650,9 +2767,7 @@ pub fn run() {
     if raw_sup_tid != 0 {
         service.seed_bootstrap_lifecycle_record(raw_sup_tid, 1);
     } else {
-        yarm_user_rt::user_log!(
-            "PM_LIFECYCLE_BOOTSTRAP_SKIP image_id=1 reason=missing_slot"
-        );
+        yarm_user_rt::user_log!("PM_LIFECYCLE_BOOTSTRAP_SKIP image_id=1 reason=missing_slot");
         // Supervisor is always spawned immediately before PM in the boot
         // sequence, so its TID is ctx.task_id - 1 deterministically.
         service.seed_bootstrap_lifecycle_record(ctx.task_id - 1, 1);
@@ -2662,9 +2777,7 @@ pub fn run() {
     if raw_init_tid != 0 {
         service.seed_bootstrap_lifecycle_record(raw_init_tid, 3);
     } else {
-        yarm_user_rt::user_log!(
-            "PM_LIFECYCLE_BOOTSTRAP_SKIP image_id=3 reason=missing_slot"
-        );
+        yarm_user_rt::user_log!("PM_LIFECYCLE_BOOTSTRAP_SKIP image_id=3 reason=missing_slot");
         // Init is spawned two slots before PM in the deterministic boot order.
         service.seed_bootstrap_lifecycle_record(ctx.task_id - 2, 3);
     }
@@ -2686,16 +2799,12 @@ pub fn run() {
             ctx.task_id,
             PM_SELF_PROBE_CNODE_SLOTS,
         ) {
-            Ok(slots) => yarm_user_rt::user_log!(
-                "PM_NR8_SELF_PROBE_OK pid={} slots={}",
-                ctx.task_id,
-                slots
-            ),
-            Err(e) => yarm_user_rt::user_log!(
-                "PM_NR8_SELF_PROBE_ERR pid={} err={:?}",
-                ctx.task_id,
-                e
-            ),
+            Ok(slots) => {
+                yarm_user_rt::user_log!("PM_NR8_SELF_PROBE_OK pid={} slots={}", ctx.task_id, slots)
+            }
+            Err(e) => {
+                yarm_user_rt::user_log!("PM_NR8_SELF_PROBE_ERR pid={} err={:?}", ctx.task_id, e)
+            }
         }
     }
 
@@ -3094,10 +3203,22 @@ mod tests {
             resolve_spawn_load_source(6).ok(),
             Some(SpawnLoadSource::DirectInitrd)
         );
-        assert_eq!(resolve_spawn_load_source(7).ok(), Some(SpawnLoadSource::Vfs));
-        assert_eq!(resolve_spawn_load_source(8).ok(), Some(SpawnLoadSource::Vfs));
-        assert_eq!(resolve_spawn_load_source(9).ok(), Some(SpawnLoadSource::Vfs));
-        assert_eq!(resolve_spawn_load_source(10), Err(ProcessManagerError::Unsupported));
+        assert_eq!(
+            resolve_spawn_load_source(7).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(8).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(9).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(10),
+            Err(ProcessManagerError::Unsupported)
+        );
     }
 
     #[test]
@@ -3164,7 +3285,7 @@ mod tests {
     fn make_extended_reply(data: &[u8]) -> Vec<u8> {
         let mut payload = Vec::with_capacity(16 + data.len());
         payload.extend_from_slice(&(data.len() as u64).to_le_bytes()); // read_len
-        payload.extend_from_slice(&0u64.to_le_bytes());                 // status
+        payload.extend_from_slice(&0u64.to_le_bytes()); // status
         payload.extend_from_slice(data);
         payload
     }

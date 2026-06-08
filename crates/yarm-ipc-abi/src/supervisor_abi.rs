@@ -105,8 +105,6 @@ impl TransferRevokedEvent {
     }
 }
 
-
-
 pub const fn encode_task_exited_event(
     tid: u64,
     exit_code: u64,

@@ -3,7 +3,9 @@
 
 #![no_std]
 
-use yarm::yarm_control_plane_servers::init::{InitRuntimeBootConfig, run_minimum_profile_with_kernel};
+use yarm::yarm_control_plane_servers::init::{
+    InitRuntimeBootConfig, run_minimum_profile_with_kernel,
+};
 
 fn main() {
     let mut kernel = yarm::kernel::boot::Bootstrap::init().expect("init");
@@ -22,8 +24,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use yarm::yarm_control_plane_servers::init::{InitRuntimeBootConfig, run_with_kernel};
     use yarm::init::InitBootPhase;
+    use yarm::yarm_control_plane_servers::init::{InitRuntimeBootConfig, run_with_kernel};
 
     #[test]
     fn core_profile_smoke_path_is_stable() {

@@ -671,11 +671,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         }
 
         let Some(handoff_off) = prepare_trampoline_for_cpu(kernel, cpu) else {
-            crate::yarm_log!(
-                "YARM_SMP_AP_PREPARE_FAILED cpu={} apic_id={}",
-                cpu.0,
-                cpu.0
-            );
+            crate::yarm_log!("YARM_SMP_AP_PREPARE_FAILED cpu={} apic_id={}", cpu.0, cpu.0);
             continue;
         };
 

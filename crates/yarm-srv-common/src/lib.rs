@@ -3,8 +3,8 @@
 
 #![no_std]
 
-pub mod decode;
 pub mod cpio;
+pub mod decode;
 pub mod elf;
 pub mod log;
 pub mod service_loop;

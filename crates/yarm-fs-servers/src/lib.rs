@@ -28,7 +28,6 @@ pub fn run_fat() {
     fs::fat::run();
 }
 
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -39,13 +38,7 @@ mod tests {
         let ext4_src = include_str!("fs/ext4/service.rs");
         let fat_src = include_str!("fs/fat/service.rs");
         let legacy_fs = ["yarm", "::services::", "fs::"].concat();
-        for src in [
-            devfs_src,
-            initramfs_src,
-            ramfs_src,
-            ext4_src,
-            fat_src,
-        ] {
+        for src in [devfs_src, initramfs_src, ramfs_src, ext4_src, fat_src] {
             assert!(
                 !src.contains(legacy_fs.as_str()),
                 "workspace scoped fs impl must not delegate to legacy fs namespace"
