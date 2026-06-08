@@ -2785,3 +2785,33 @@ All `stage33_` tests must pass. The full lib test (`cargo test --lib --
 --test-threads=1`) must pass with 0 failures. Multi-threaded runs (> 1 thread) may
 abort due to the pre-existing large-KernelState stack/allocator interaction;
 single-threaded runs are authoritative.
+
+### Rule N+42 (Stage 35)
+
+When receive ABI adapters are integrated into the full-path handlers, a `stage35_` test suite must prove:
+
+**(A) Adapter request shape:**
+- `from_legacy_ipc_recv` with `is_kernel_task=true` → `KernelRegister` payload target + `KernelPlainEligible` plan (`stage35_ipc_recv_adapter_kernel_task_has_register_target`)
+- `from_legacy_ipc_recv` with `is_kernel_task=false` → `UserMemory` payload target + `UserAsidCopySemantics` fallback (`stage35_ipc_recv_adapter_user_asid_has_user_memory_target`)
+- `from_legacy_ipc_recv` with `meta_ptr ≠ 0, meta_len ≥ 40` → `RecvMetaTarget::V2` + `RecvV2MetaUserCopy` fallback (`stage35_ipc_recv_adapter_v2_meta_detected_when_len_sufficient`)
+- `meta_len < 40` → `RecvMetaTarget::None` (`stage35_ipc_recv_adapter_no_meta_when_len_too_small`)
+- `meta_ptr == 0` → `RecvMetaTarget::None` regardless of meta_len (`stage35_ipc_recv_adapter_no_meta_when_ptr_zero`)
+
+**(B) Timeout adapter shape:**
+- `timeout_ticks == 0` → `NonblockingProbe` + `NoWait` (`stage35_timeout_adapter_zero_ticks_is_nonblocking`)
+- `timeout_ticks > 0` → `TimedRecv` + `Deadline` (`stage35_timeout_adapter_nonzero_ticks_is_deadline`)
+- `preread_deadline = Some(abs)` → `Deadline(abs)` (`stage35_timeout_adapter_preread_deadline_captured`)
+
+**(C) Equivalence:**
+- Canonical `meta_target` v2 detection must agree with the old inline `frame.arg(INLINE0) != 0 && frame.arg(INLINE1) >= 40` for all representative (ptr, len) pairs (`stage35_v2_detection_canonical_matches_inline`)
+
+**(D) Regression:**
+- Stage 32B kernel-plain live split still works (`stage35_kernel_plain_path_still_live`)
+- User-ASID falls back before dequeue; message preserved in queue (`stage35_user_asid_still_fallback_before_dequeue`)
+- `timeout_ticks == 0` on empty queue returns None from `try_ipc_recv` (`stage35_ipc_recv_timeout_zero_ticks_empty_queue_returns_none`)
+- `recv_shared_v3` adapter still helper-only (`stage35_recv_v3_still_helper_only`)
+- `SYSCALL_COUNT == 30` (`stage35_syscall_count_still_30`)
+
+**Run command:** `cargo test --lib stage35 -- --test-threads=1`
+
+All 15 `stage35_` tests must pass.

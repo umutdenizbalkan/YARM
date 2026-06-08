@@ -9844,3 +9844,43 @@ grep -c 'YARM_RECV_CORE_ADAPTER kind=legacy' $LOG        # matches LIVE count
 grep -c 'YARM_RECV_CORE_FALLBACK' $LOG                   # >= 0 (user-ASID recvs)
 grep -c 'YARM_RECV_CORE_FALLBACK.*SharedV3' $LOG         # 0 (no v3 syscall)
 ```
+
+## §53 Stage 35 — Receive ABI adapters over canonical RecvRequest
+
+### 53.1 Overview
+
+Stage 35 integrates the canonical `RecvRequest` adapters (defined in Stage 33+34) into the existing full-path receive syscall handlers (`handle_ipc_recv`, `handle_ipc_recv_timeout`).
+
+**No behavior change.** The global-lock full path is authoritative for all execution. The adapters are used only for:
+- Structured decode of frame arguments (replaces inline `frame.arg()` checks for v2/timeout detection)
+- Telemetry markers at the full-path entry
+- Paving the way for future live-routing of eligible cases
+
+**Invariants preserved:**
+- `SYSCALL_COUNT == 30`
+- Public ABI register layout unchanged
+- user-ASID recv falls back before dequeue
+- recv-v2 stays on global-lock path
+- Stage 32B kernel-plain live split still works
+
+### 53.2 Adapter integration points
+
+| Handler | Adapter used | Change |
+|---|---|---|
+| `handle_ipc_recv` | `from_legacy_ipc_recv` | v2 detection via `request.meta_target` instead of raw frame arg check |
+| `handle_ipc_recv_timeout` | `from_ipc_recv_timeout` | timeout branch via `request.blocking` instead of `timeout_ticks == 0` |
+| split path (`try_split_recv_queued_plain_with_snapshot_locked`) | `from_legacy_ipc_recv` | unchanged (already canonical since Stage 33+34) |
+
+### 53.3 Telemetry markers (Stage 35)
+
+- `YARM_RECV_CORE_ADAPTER kind=legacy_full_path is_kernel_task=<bool>` — emitted at entry to `handle_ipc_recv`
+- `YARM_RECV_CORE_ADAPTER kind=legacy_timeout is_kernel_task=<bool> blocking=<policy>` — emitted at entry to `handle_ipc_recv_timeout`
+
+### 53.4 Live vs fallback matrix (cumulative Stage 33+34+35)
+
+| Syscall | Receiver type | Path | Stage |
+|---|---|---|---|
+| ipc_recv (NR2) | kernel task, queued plain | LIVE split + canonical core | 33+34 |
+| ipc_recv (NR2) | user-ASID | global-lock (canonical adapter decode) | 35 |
+| ipc_recv (NR2) | v2 meta | global-lock (canonical adapter decode) | 35 |
+| ipc_recv_timeout (NR5) | any | global-lock (canonical adapter decode) | 35 |
