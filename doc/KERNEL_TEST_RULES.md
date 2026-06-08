@@ -2944,3 +2944,67 @@ refill is live-enabled, a `stage38_` test suite must prove:
 **Run command:** `cargo test --lib stage38 -- --test-threads=1`
 
 All `stage38_` tests must pass.
+
+---
+
+## Rule N+46: Stage 40+41 — recv_shared_v3 ABI contract + disabled dispatch scaffold
+
+**Scope:** `mod stage40` in `src/kernel/boot/tests.rs` and `#[cfg(test)] mod tests` in
+`crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs` and
+`crates/yarm-user-rt/src/recv_v3_draft.rs`.
+
+All tests must be deterministic at `--test-threads=1` and must NOT add any live
+syscall dispatch.  `SYSCALL_COUNT` must remain 30.
+
+**(A) ABI record validation (kernel `recv_shared_v3` module):**
+- Valid request accepted (`stage40_abi_valid_request_accepted`)
+- Bad version rejected (`stage40_abi_bad_version_rejected`)
+- Short record rejected (`stage40_abi_short_record_rejected`)
+- Nonzero reserved rejected (`stage40_abi_nonzero_reserved_rejected`)
+- Nonzero flags rejected (`stage40_abi_nonzero_flags_rejected`)
+- map_intent without metadata rejected (`stage40_abi_map_intent_without_metadata_rejected`)
+- Unknown map intent bits rejected (`stage40_abi_unknown_map_intent_bits_rejected`)
+- Read-only map intent accepted (`stage40_abi_read_only_map_intent_accepted`)
+- Read-write map intent accepted (`stage40_abi_read_write_map_intent_accepted`)
+- Valid output accepted (`stage40_abi_valid_output_accepted`)
+- Output bad version rejected (`stage40_abi_output_bad_version_rejected`)
+- Output short record rejected (`stage40_abi_output_short_record_rejected`)
+
+**(B) from_v3_abi_request kernel adapter:**
+- Valid request → SharedV3Future kind + correct tid/cap (`stage40_adapter_valid_request_yields_shared_v3_future`)
+- Bad version → Err (`stage40_adapter_bad_version_returns_error`)
+- timeout=MAX → WaitForever (`stage40_adapter_no_timeout_is_wait_forever`)
+- timeout=0 → NoWait (`stage40_adapter_zero_timeout_is_no_wait`)
+- timeout=N → Deadline(N) (`stage40_adapter_nonzero_timeout_is_deadline`)
+- No map_intent → RecvMapIntent::None (`stage40_adapter_no_map_intent_is_none`)
+- MAP_READ → ReadOnly (`stage40_adapter_read_only_map_intent`)
+- MAP_READ|MAP_WRITE → ReadWrite (`stage40_adapter_read_write_map_intent`)
+- No metadata → None meta target (`stage40_adapter_without_metadata_sets_none_meta_target`)
+- With metadata (≥80 bytes) → V3Future meta target (`stage40_adapter_with_metadata_sets_v3future_meta_target`)
+- Short metadata len → None meta target (`stage40_adapter_short_metadata_len_gives_none_meta_target`)
+- Payload target is UserMemory (`stage40_adapter_payload_target_is_user_memory`)
+
+**(C) plan always returns SharedV3HelperOnly:**
+- Valid adapter request (`stage40_plan_valid_adapter_request_returns_helper_only`)
+- With metadata (`stage40_plan_v3_with_metadata_still_helper_only`)
+- With read map intent (`stage40_plan_v3_with_read_map_intent_still_helper_only`)
+
+**(D) Invariants:**
+- `SYSCALL_COUNT == 30` (`stage40_syscall_count_still_30`)
+- No public v3 dispatch reachable (`stage40_no_public_v3_dispatch_reachable`)
+
+**(E) Regression:**
+- Kernel-plain path still live (`stage40_kernel_plain_path_still_live`)
+- User-plain path still live (`stage40_user_plain_path_still_live`)
+
+**(F) yarm-ipc-abi recv_shared_v3_abi tests:**
+- All 15 `abi_*` and `recv_shared_v3_abi::tests::*` tests in the ABI crate must pass.
+- Run: `cargo test -p yarm-ipc-abi`
+
+**(G) yarm-user-rt draft module tests:**
+- All `recv_v3_draft::tests::*` tests must pass.
+- Run: `cargo test -p yarm-user-rt` (when yarm-user-rt has a test harness).
+
+**Run command:** `cargo test --lib stage40 -- --test-threads=1`
+
+All 31 `stage40_` tests must pass.

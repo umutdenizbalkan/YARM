@@ -324,6 +324,55 @@ impl RecvRequest {
     /// syscall dispatch path and does NOT add a public syscall number.  It
     /// exists solely to model future v3 requests for design validation and
     /// adapter equivalence tests.
+    /// Build a `RecvRequest` from a validated `RecvSharedV3Request` ABI record.
+    ///
+    /// Calls `validate_v3_request` internally; returns `Err` on validation failure.
+    /// The resulting request always has `kind = SharedV3Future`, so
+    /// `plan_recv_core` will return `FallbackRequired(SharedV3HelperOnly)` —
+    /// no live syscall dispatch is triggered (Stage 40+41 scaffold).
+    pub(crate) fn from_v3_abi_request(
+        requester_tid: u64,
+        abi: &recv_shared_v3::RecvSharedV3Request,
+    ) -> Result<Self, recv_shared_v3::RecvSharedV3Error> {
+        recv_shared_v3::validate_v3_request(abi)?;
+        let map_intent = if abi.map_intent == 0 {
+            RecvMapIntent::None
+        } else if abi.map_intent & recv_shared_v3::MAP_WRITE != 0 {
+            RecvMapIntent::ReadWrite
+        } else {
+            RecvMapIntent::ReadOnly
+        };
+        let blocking = match abi.timeout_ticks {
+            0 => RecvBlockingPolicy::NoWait,
+            u64::MAX => RecvBlockingPolicy::WaitForever,
+            dl => RecvBlockingPolicy::Deadline(dl),
+        };
+        let payload_target = RecvPayloadTarget::UserMemory {
+            ptr: abi.payload_ptr as usize,
+            len: abi.payload_len as usize,
+        };
+        let meta_target = if abi.metadata_ptr != 0
+            && abi.metadata_len >= recv_shared_v3::V3_MIN_OUTPUT_LEN as u64
+        {
+            RecvMetaTarget::V3Future {
+                ptr: abi.metadata_ptr as usize,
+                len: abi.metadata_len as usize,
+            }
+        } else {
+            RecvMetaTarget::None
+        };
+        Ok(RecvRequest {
+            kind: RecvRequestKind::SharedV3Future,
+            requester_tid,
+            recv_cap: CapId(abi.endpoint_cap),
+            payload_target,
+            meta_target,
+            blocking,
+            transfer: RecvTransferPolicy::LegacyFull,
+            map_intent,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn future_shared_v3(
         requester_tid: u64,

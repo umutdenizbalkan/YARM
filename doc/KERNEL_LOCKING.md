@@ -10267,3 +10267,165 @@ Plain sender-waiter + plain queued message is now handled via `Delivered + WakeS
 | ipc_recv (NR2) | any + OPCODE_SHARED_MEM | any | global-lock | 38+39 blocker |
 | ipc_recv (NR2) | user-ASID + V2 meta + map_intent | any | global-lock | 37 |
 | ipc_recv (NR5) | any | any | global-lock | 35 |
+
+---
+
+## §57 Stage 40+41: recv_shared_v3 ABI contract + object metadata audit + disabled dispatch scaffold
+
+### 57.1 Overview
+
+Stage 40+41 finalises the internal `recv_shared_v3` metadata contract against
+the §56.9 gap table, defines stable ABI structs/constants in `yarm-ipc-abi`,
+adds a non-test kernel adapter (`RecvRequest::from_v3_abi_request`), and adds
+draft helpers in `yarm-user-rt`.  No public syscall dispatch is added; `SYSCALL_COUNT`
+remains 30.
+
+**Files changed:**
+- `crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs` — new: stable ABI structs, constants, validation
+- `crates/yarm-ipc-abi/src/lib.rs` — add `pub mod recv_shared_v3_abi`
+- `src/kernel/recv_core.rs` — add `RecvRequest::from_v3_abi_request` (non-test adapter)
+- `crates/yarm-user-rt/src/recv_v3_draft.rs` — new: draft builder + output helpers
+- `crates/yarm-user-rt/src/lib.rs` — add `pub mod recv_v3_draft`
+- `src/kernel/boot/tests.rs` — add `mod stage40` (31 tests)
+
+### 57.2 Metadata availability table (Stage 40+41)
+
+This table refines §56.9 with full authoritative classification.
+
+| Output field | Status | Source | Blocker before population |
+|---|---|---|---|
+| `sender_tid` | **Authoritative** | `msg.sender_tid.0` | None |
+| `message_len` | **Authoritative** | `msg.as_slice().len()` | None |
+| `message_flags` | **Authoritative** | `msg.flags` | None |
+| `result_status` | **Authoritative** | kernel result | None |
+| `abi_version` | **Authoritative** | `SYSCALL_ABI_VERSION = 10` | None |
+| `transferred_cap` | Available, but not on split path | CapId after `take_transfer_envelope` + `grant_task_to_task_with_rights` | Cap materialization on split path (§56.2 blockers) |
+| `region_offset` | Available (OPCODE_SHARED_MEM only) | `SharedMemoryRegion.offset` | Requires OPCODE_SHARED_MEM message path |
+| `mapped_base` | Available after VM mapping | result of `map_shared_region_into_receiver` | vm_state_lock (rank 5) on split path |
+| `page_rounded_mapped_len` | Available after VM mapping | `mapped_len` from mapper | Same as above |
+| `actual_mapping_perm` | Available after VM mapping | `recv_map_flags` | Same as above |
+| `object_kind` | **FUTURE (unavailable)** | Kernel does not surface cap type in IPC transfer envelope | Object introspection API needed |
+| `object_generation` | **FUTURE (unavailable)** | Not in transfer envelope today | Same |
+| `effective_rights` | **FUTURE (unavailable)** | Not in transfer envelope today | Same |
+| `exact_object_size` | **FUTURE (unavailable)** | Not in IPC message | Same |
+| `exact_region_len` | **FUTURE (unavailable)** | `SharedMemoryRegion.len` is app-provided, not kernel-verified | Kernel must verify against object size |
+| `cleanup_token` | **FUTURE (unavailable)** | No cleanup token concept in kernel | New object type needed |
+| `request_id` | **FUTURE (unavailable)** | VFS shared I/O not implemented | VFS_SHARED_IO stage |
+
+**Summary:** 4 fields are authoritative now (`sender_tid`, `message_len`, `message_flags`, result metadata).
+3 fields are available only on specific transfer paths (cap, mapping).
+7 fields are genuinely unavailable and would require new kernel object model work.
+
+### 57.3 ABI contract (yarm-ipc-abi/src/recv_shared_v3_abi.rs)
+
+**Request record** (`RecvSharedV3Request`, 64 bytes minimum):
+
+| Offset | Field | Type | Notes |
+|---|---|---|---|
+| 0 | `version` | u32 | Must equal `RECV_V3_VERSION` = 3 |
+| 4 | `record_len` | u32 | Must be ≥ `RECV_V3_MIN_REQUEST_LEN` = 64 |
+| 8 | `endpoint_cap` | u64 | Endpoint capability ID |
+| 16 | `payload_ptr` | u64 | User payload buffer pointer |
+| 24 | `payload_len` | u64 | User payload buffer capacity |
+| 32 | `metadata_ptr` | u64 | Output record pointer (0 if not needed) |
+| 40 | `metadata_len` | u64 | Output record capacity |
+| 48 | `map_intent` | u32 | `MAP_READ=0x1`, `MAP_WRITE=0x2`, or 0 |
+| 52 | `flags` | u32 | Reserved; must be 0 |
+| 56 | `timeout_ticks` | u64 | 0=no-wait, `u64::MAX`=forever |
+| 64 | `reserved[0..2]` | [u64;2] | Must be 0 |
+
+**Output record** (`RecvSharedV3Output`, 80 bytes minimum):
+
+| Offset | Field | Type | Populated now? |
+|---|---|---|---|
+| 0 | `version` | u32 | Yes (= 3) |
+| 4 | `record_len` | u32 | Yes (≥ 80) |
+| 8 | `abi_version` | u32 | Yes (= 10) |
+| 12 | `result_status` | u32 | Yes |
+| 16 | `sender_tid` | u64 | Yes |
+| 24 | `message_len` | u32 | Yes |
+| 28 | `message_flags` | u32 | Yes |
+| 32 | `transferred_cap` | u64 | Partial (after cap-transfer stage) |
+| 40 | `object_kind` | u32 | No (0 = Unknown) |
+| 44 | _pad_ | u32 | — |
+| 48 | `object_generation` | u64 | No (0) |
+| 56 | `effective_rights` | u32 | No (0) |
+| 60 | _pad_ | u32 | — |
+| 64 | `exact_object_size` | u64 | No (0) |
+| (see struct) | … remaining fields | … | See §57.2 |
+
+**Constants defined:**
+- `RECV_V3_VERSION = 3`, `RECV_V3_MIN_REQUEST_LEN = 64`, `RECV_V3_MIN_OUTPUT_LEN = 80`
+- `RECV_V3_MAP_READ = 0x1`, `RECV_V3_MAP_WRITE = 0x2`
+- `RECV_V3_NO_TRANSFER_CAP = u64::MAX` (sentinel)
+- `RECV_V3_FIELD_UNAVAILABLE = 0` (sentinel for FUTURE fields)
+- `RECV_V3_ABI_VERSION = 10`
+- Status constants: `OK=0`, `WOULD_BLOCK=1`, `TIMED_OUT=2`, `INVALID_CAP=3`, `BAD_REQUEST=4`
+- `RecvSharedV3ObjectKind` enum: `Unknown=0`, `MemoryObject=1`, `Endpoint=2`, `ReplyCap=3`, `Notification=4`, `Other=0xFF`
+
+### 57.4 Kernel adapter: RecvRequest::from_v3_abi_request
+
+```
+RecvRequest::from_v3_abi_request(requester_tid: u64, abi: &RecvSharedV3Request)
+  -> Result<RecvRequest, RecvSharedV3Error>
+```
+
+- Calls `validate_v3_request` first (rejects bad version/length/reserved/flags/map_intent)
+- Maps `map_intent` u32 → `RecvMapIntent` enum
+- Maps `timeout_ticks` → `RecvBlockingPolicy` (0=NoWait, MAX=WaitForever, else Deadline)
+- Sets `payload_target = UserMemory { ptr, len }`
+- Sets `meta_target = V3Future { ptr, len }` if `metadata_ptr != 0` and `metadata_len >= 80`, else `None`
+- Returns `RecvRequest { kind: SharedV3Future, ... }`
+- `plan_recv_core` will return `FallbackRequired(SharedV3HelperOnly)` for any `SharedV3Future` request — no live dispatch
+
+### 57.5 user-rt draft module: recv_v3_draft
+
+`crates/yarm-user-rt/src/recv_v3_draft.rs` provides:
+- Re-exports of all `recv_shared_v3_abi` types and constants
+- `RecvSharedV3Builder` — builder pattern for constructing request records
+- `alloc_output()` — zeroed output record
+- `output_is_ok()`, `output_has_transfer_cap()`, `output_has_mapping()` — status helpers
+
+**No syscall invocation.** Draft; expect breaking changes before Stage 42.
+
+### 57.6 Disabled dispatch invariants
+
+1. `SYSCALL_COUNT == 30` — no new syscall number assigned
+2. `plan_recv_core` returns `SharedV3HelperOnly` for ALL `SharedV3Future` requests
+3. No NR (syscall number) allocated for `recv_shared_v3`
+4. The split-dispatch table does not contain any v3 routing
+5. `RecvRequest::future_shared_v3` (test-only constructor) continues to produce the same plan result
+
+### 57.7 Blockers before live public recv_shared_v3
+
+1. **Cap materialization on split path** — cap lock (rank 4) after ipc_state_lock (rank 3) released; rollback semantics unproven (§56.2)
+2. **Object introspection** — `object_kind`, `object_generation`, `effective_rights`, `exact_object_size` not in transfer envelope
+3. **Exact region length verification** — `SharedMemoryRegion.len` is app-provided
+4. **VM mapping on split path** — vm_state_lock (rank 5) + TLB shootdown rollback
+5. **Cleanup token** — no cleanup token object model in kernel today
+6. **VFS shared I/O** — `request_id` field requires VFS_SHARED_IO stage
+7. **Wire layout lock** — `#[repr(C)]` not yet applied; must be added before live syscall with guarantee of no layout change
+
+### 57.8 Relation to old ipc_recv / recv-v2 / VFS_SHARED_IO
+
+- `ipc_recv` (NR2) and `recv-v2` (via NR2 with meta args) are unchanged; their live paths
+  and fallback semantics are preserved (§55, §56).
+- `recv_shared_v3` is a distinct future syscall — the old NR2 register ABI is not reused.
+  When live, it will receive a new NR.
+- `VFS_SHARED_IO`: `request_id` / `region_offset` / `exact_region_len` fields in
+  `RecvSharedV3Output` are reserved for VFS shared I/O integration.  They are
+  always zero until that stage is implemented.
+
+### 57.9 Next recommended stage
+
+**Stage 42 options (choose one):**
+
+A. **Cap-transfer materialization on split path** — prove rollback semantics, add
+   `take_transfer_envelope` / `grant_task_to_task_with_rights` under correct lock order;
+   then `transferred_cap` becomes authoritative in output.
+
+B. **Object introspection API** — extend transfer envelope to carry object kind,
+   generation, effective rights; populate FUTURE fields in output.
+
+C. **Live recv_shared_v3 dispatch (if A complete)** — assign NR, add `#[repr(C)]`,
+   wire split-dispatch table to v3 adapter, live-enable with `SYSCALL_COUNT = 31`.
