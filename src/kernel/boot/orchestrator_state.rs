@@ -612,6 +612,64 @@ impl KernelState {
             .any(|space| space.id == cnode)
     }
 
+    // ── Stage 32 endpoint-cap resolution split-read helpers ──────────────────
+
+    /// STAGE 32: capability-domain (rank 4) phase of endpoint receive-cap
+    /// resolution. Looks up `cap` in the cnode registered for `requester_pid`
+    /// under ONLY `capability_state_lock`, validates it is a live-eligible
+    /// `Endpoint` carrying `CapRights::RECEIVE`, and returns the resolved
+    /// `(CapObject::Endpoint, rights)`.
+    ///
+    /// This reproduces the capability-side of the global-lock `IpcRecv`
+    /// resolution (`validate_endpoint_right` + the `capability_for_cnode_local`
+    /// re-lookup in `handle_ipc_recv`) WITHOUT the IPC-domain generation
+    /// liveness check (`capability_object_live`, which acquires `ipc_state_lock`):
+    /// the endpoint generation is returned in the object so the caller can revalidate
+    /// it later under `ipc_state_lock` during dequeue. No mutation. No task lock.
+    /// No IPC lock. The caller MUST have already read `requester_pid` under the
+    /// task lock (and released it) — see `process_id_from_raw`.
+    ///
+    /// Error mapping matches the old path's `validate_endpoint_right`:
+    /// - cnode missing / slot empty → `InvalidCapability`
+    /// - object is not an `Endpoint` → `WrongObject`
+    /// - endpoint without `RECEIVE` right → `MissingRight`
+    ///
+    /// # Safety
+    /// `state` must be the raw pointer of the `KernelState` storage owned by the
+    /// calling `SharedKernel`. `addr_of!` derives a raw pointer to the
+    /// `capability` field without creating a whole-`KernelState` reference;
+    /// `capability_state_lock` serializes access to that field.
+    pub(crate) unsafe fn resolve_endpoint_recv_cap_in_pid_from_raw(
+        state: *const KernelState,
+        requester_pid: u64,
+        cap: CapId,
+    ) -> Result<(CapObject, CapRights), KernelError> {
+        let lock_ref = unsafe { &*core::ptr::addr_of!((*state).capability_state_lock) };
+        let _guard = lock_ref.lock();
+        let capability: &CapabilitySubsystem =
+            unsafe { &*core::ptr::addr_of!((*state).capability) };
+        let cnode = kernel_ref(&capability.process_cnodes)
+            .iter()
+            .flatten()
+            .find(|record| record.pid == requester_pid)
+            .map(|record| record.cnode)
+            .ok_or(KernelError::InvalidCapability)?;
+        let capability_obj = capability
+            .cnode_spaces
+            .iter()
+            .flatten()
+            .find(|space| space.id == cnode)
+            .and_then(|space| kernel_ref(&space.cspace).get(cap))
+            .ok_or(KernelError::InvalidCapability)?;
+        if !matches!(capability_obj.object, CapObject::Endpoint { .. }) {
+            return Err(KernelError::WrongObject);
+        }
+        if !capability_obj.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+        Ok((capability_obj.object, capability_obj.rights()))
+    }
+
     // ── Stage 27 split-mutation helper ───────────────────────────────────────
 
     /// STAGE 27: first mutating global-lock extraction. Apply a CNode-slot

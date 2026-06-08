@@ -9291,3 +9291,223 @@ recv-v2 / cap-transfer / timeout / blocking recv splits.
 `stage31_split_recv_not_wired_into_live_seam`,
 `stage31_split_recv_invalid_cap_matches_dispatch_error`.
 All pass single-threaded. Full lib suite: 886 passed, 0 failed.
+
+### 49.12 Stage 31 terminal acceptance record (Part 0 of Stage 32)
+
+**Accepted as helper-only at commit `424162b`** (Stage 31, branch
+`claude/ecstatic-feynman-9ZZwC`).
+
+- **What landed:** `try_split_recv_queued_plain_into_frame_locked`
+  (`src/kernel/syscall.rs`), the `SharedKernel::try_split_ipc_recv_queued_plain_into_frame`
+  wrapper (`src/runtime.rs`), and the `syscall_split::try_split_ipc_recv_queued_plain_into_frame`
+  entry point. `IpcRecv` is **NR 2** (`SYSCALL_IPC_RECV_NR == 2`).
+- **Why NOT live-wired (both blockers, see §49.4):**
+  1. **Capability-domain blocker** — endpoint-cap resolution crosses the
+     capability domain (rank 4) and had **no proven split extraction** at Stage 31;
+     the helper resolved the cap under the global `with` lock.
+  2. **User-copy blocker** — realistic x86_64 receivers (PM/init/VFS) are
+     **user-ASID** tasks whose plain-recv writeback needs `copy_to_current_user`
+     **outside `ipc_state_lock`**, which had no split-safe writeback plan.
+- **Baseline:** 886 tests, 0 failed. x86_64 smoke health: NR 8 live split marker
+  (`YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok`) ×1, fallback=0, Phase3B ×3; no IPC
+  recv live marker (path not live-wired).
+- **Stage 32 target:** extract the capability-domain endpoint-cap resolution into a
+  phase-separated split-read helper; integrate it into the Stage 31 helper before
+  the IPC dequeue; design/scaffold the user-copy-outside-`ipc_state_lock` recv
+  writeback seam. Do NOT live-wire `IpcRecv` unless both blockers are fully solved
+  and tested.
+- **Still deferred:** x86_64 SMP (`smp.rs`); RAMFS/FAT runtime spawning.
+
+## §50 Stage 32 — endpoint-cap resolution split + IPC recv user-writeback seam
+
+### 50.1 Stage 31 acceptance (Part 0)
+
+Recorded in §49.12 above: accepted as helper-only at `424162b`; both live-wiring
+blockers (capability-domain resolution, user-copy-outside-ipc-lock) carried
+forward as the Stage 32 work items.
+
+### 50.2 Endpoint-cap resolution audit (Part 1)
+
+The global-lock `IpcRecv` path (`handle_ipc_recv`, `src/kernel/syscall.rs`)
+resolves the receive cap in two steps, both inside the global `with` lock:
+
+1. `validate_endpoint_right(kernel, cap, CapRights::RECEIVE)` — looks the cap up in
+   the **current task's cnode** (`current_task_cnode` → `with_task_then_capability`,
+   which holds task(2) **and** capability(4) **simultaneously**), then checks it is
+   an `Endpoint` (`WrongObject` otherwise) carrying `RECEIVE` (`MissingRight`
+   otherwise); a missing cnode/slot is `InvalidCapability`. It also calls
+   `capability_object_live`, which for an `Endpoint` reads
+   `ipc.endpoint_generations[index]` under **`ipc_state_lock` (rank 3)**.
+2. A second `capability_for_cnode_local(...).and_then(capability_object_live)`
+   re-lookup yields the `CapObject::Endpoint { index, generation }` used for the
+   dequeue.
+
+**Fields needed for the dequeue:** the `CapObject::Endpoint { index, generation }`
+(the `index` selects the queue; the `generation` revalidates liveness in
+`resolve_endpoint_index` under `ipc_state_lock`) plus the requester identity.
+
+**Locks crossed (old path):** task(2)+capability(4) **held together** in
+`current_task_cnode`, plus ipc(3) for the generation liveness check
+(`capability_object_live`). Stage 32 phase-separates these: pid under task(2)
+read+release, cnode+cap+rights under capability(4) read+release, and the generation
+liveness check is deferred to the ipc(3) dequeue phase.
+
+**Errors (exact `SyscallError`):** `InvalidCapability` (missing cnode/slot),
+`WrongObject` (non-endpoint, also `StaleCapability` via `From<KernelError>`),
+`MissingRight` (no RECEIVE). The split helper returns `KernelError`; the
+integration maps it through `SyscallError::from` to the same codes.
+
+**Copy ordering (old path, `handle_ipc_recv_result_with_empty_error`):** the
+message is **dequeued first** (consumed from the endpoint queue), THEN
+`copy_to_current_user` runs for a user-ASID receiver. On `UserMemoryFault` the
+path records a user fault and returns `Ok(())` — **the message is NOT requeued; it
+is consumed/lost.** For a kernel task (no user ASID) the writeback is a pure
+register write (`set_ok(sender, raw_len, NO_TRANSFER_CAP)` + two inline payload
+words) with no copy and no failure mode.
+
+### 50.3 Split helper implemented (Part 2)
+
+- **`EndpointRecvCapSnapshot`** (`src/runtime.rs`) — small immutable `Copy` struct:
+  `{ endpoint: CapObject, rights: CapRights, requester_tid: u64, requester_pid: u64 }`,
+  plus `endpoint_index()`.
+- **`KernelState::resolve_endpoint_recv_cap_in_pid_from_raw(state, requester_pid, cap)`**
+  (`src/kernel/boot/orchestrator_state.rs`) — capability-domain (rank 4) phase:
+  acquires ONLY `capability_state_lock`, finds the requester pid's cnode, looks up
+  + validates the cap (`Endpoint` + `RECEIVE`), returns `(CapObject, CapRights)`.
+  No mutation, no IPC lock, no task lock.
+- **`SharedKernel::resolve_endpoint_recv_cap_split_read(requester_tid, cap)`**
+  (`src/runtime.rs`) — orchestrates Phase 1 (`process_id_from_raw`, task(2)
+  read+release) → Phase 2 (capability(4) read+release), returns
+  `Result<EndpointRecvCapSnapshot, KernelError>`.
+
+**Lock order:** `task(2) [read+release] → capability(4) [read+release]`. No nested
+locks. **ipc(3) is acquired only AFTER this function returns** (the dequeue phase).
+No global lock required. No capability mutation.
+
+### 50.4 Integration into the Stage 31 helper (Part 3)
+
+`SharedKernel::try_split_ipc_recv_queued_plain_into_frame` (`src/runtime.rs`) now:
+
+1. reads the authoritative requester TID (`current_tid_authoritative`),
+2. calls `resolve_endpoint_recv_cap_split_read` — on `Err(e)` returns
+   `Some(Err(TrapHandleError::Syscall(SyscallError::from(e))))` (same error as the
+   old path; **no fallback**),
+3. on `Ok(snapshot)` releases the capability lock and acquires the IPC domain (via
+   the global `with` for this helper-only path) to run
+   `try_split_recv_queued_plain_with_snapshot_locked`
+   (`src/kernel/syscall.rs`), which revalidates recv-v2 default-deny, rejects
+   user-ASID receivers, revalidates endpoint liveness + dequeues under
+   `ipc_state_lock` (rank 3) via `try_endpoint_split_recv`/`resolve_endpoint_index`,
+   and writes the kernel-task lanes byte-for-byte identical to the old path.
+
+**The capability lock and the IPC lock are NEVER held simultaneously.** The
+generation-based liveness revalidation happens under `ipc_state_lock` inside
+`resolve_endpoint_index`; a stale snapshot (generation mismatch / vanished
+endpoint) returns `None` (fallback), never a wrong-endpoint dequeue. The
+monolithic Stage 31 helper `try_split_recv_queued_plain_into_frame_locked` is
+retained unchanged for Stage 31 regression tests.
+
+### 50.5 Writeback plan (Part 4) — SCAFFOLDED, user-ASID DEFERRED
+
+`IpcRecvQueuedPlainWritebackPlan` + `MAX_PLAIN_PAYLOAD == 128` (`src/runtime.rs`)
+captures `{ payload[128], payload_len, sender_tid, ret_cap, user_payload_ptr,
+user_payload_len, is_kernel_task, endpoint }`, with a `for_kernel_task`
+constructor (rejects payloads > `MAX_PLAIN_PAYLOAD`) and accessors. The intended
+protocol: resolve cap (cap lock only) → under `ipc_state_lock` dequeue + copy
+payload into `plan.payload[]` → release lock → outside all locks write the
+trap-frame lanes (kernel task) or `copy_to_current_user` (user ASID).
+
+**User-ASID path is DEFERRED (not wired).** Matching the old path's
+**message-consumed-on-copy-fail** semantics across a post-dequeue,
+post-lock-release `copy_to_current_user` is not yet proven safe in this helper
+(the dequeue would already have consumed the message before the copy is attempted
+outside the lock, and there is no rollback/requeue path here). The integrated
+helper therefore continues to reject every user-ASID receiver (returns `None` /
+fallback). The plan struct is scaffolded and unit-tested for the kernel-task
+branch so a future stage can wire the user copy once the failure semantics are
+matched.
+
+**Copy failure semantics (documented):** old path — dequeue, then copy; on copy
+fault the message is consumed (lost), a user fault is recorded, syscall returns
+`Ok(())`. Split path — for the only enabled (kernel-task) case there is **no
+user copy and no copy-failure mode**; the user-ASID case is fallback-only, so the
+unsafe post-dequeue copy is never reached on the split path.
+
+### 50.6 Fallback matrix (Part 6)
+
+Default-deny (helper returns `None`, caller falls back to the global path) for:
+user-ASID receiver (writeback plan incomplete); `ReceivedWithSenderWake`
+(sender-waiter refill needs a scheduler wake); empty endpoint / `WouldBlock`;
+cap-transfer / reply-cap message at head; recv-v2 metadata request; timeout /
+blocking recv; endpoint generation mismatch (revalidated under `ipc_state_lock`,
+mismatch → `None`); all non-`IpcRecv` IPC syscalls; SpawnV5 / VM / futex / fault.
+Invalid/wrong-object/missing-right cap is NOT a fallback — it returns
+`Some(Err(..))` with the same error the old path produced.
+
+| case | cap resolution | ipc dequeue | user-copy | split status | fallback reason |
+|---|---|---|---|---|---|
+| kernel-task queued plain recv, valid cap | cap(4) split | ipc(3) split | none | helper-only | user-ASID user-copy blocker remains |
+| user-ASID queued plain recv, valid cap | cap(4) split | ipc(3) split | outside ipc lock | deferred | copy failure semantics |
+| invalid cap | cap(4) split → Err | N/A | N/A | helper returns Err | match old error |
+| wrong object | cap(4) split → Err | N/A | N/A | helper returns Err | match old error |
+| missing right | cap(4) split → Err | N/A | N/A | helper returns Err | match old error |
+| empty endpoint | cap(4) split + ipc(3) → empty | N/A | N/A | fallback | WouldBlock path |
+| cap-transfer | N/A | N/A | N/A | fallback | cap domain interaction |
+| recv-v2 | N/A | N/A | N/A | fallback | metadata materialization |
+| sender-waiter refill | N/A | ipc(3) → ReceivedWithSenderWake | N/A | fallback | scheduler interaction |
+| timeout/blocking | N/A | N/A | N/A | fallback | scheduler interaction |
+
+### 50.7 Tests added (Part 7)
+
+24 tests in `src/kernel/boot/tests.rs` module `stage32_cap_resolution_tests`:
+
+- **Cap resolution (9):** `stage32_cap_resolution_valid_endpoint_recv_right`,
+  `stage32_cap_resolution_missing_cap_error`,
+  `stage32_cap_resolution_wrong_object_error`,
+  `stage32_cap_resolution_missing_recv_right_error`,
+  `stage32_cap_resolution_no_ipc_lock_required`,
+  `stage32_cap_resolution_no_cap_mutation`,
+  `stage32_cap_resolution_two_processes_isolated`,
+  `stage32_cap_resolution_invalid_cap_id_error`,
+  `stage32_cap_resolution_unknown_requester_error`.
+- **Integration (8):** `stage32_integrated_queued_recv_valid_cap_succeeds`,
+  `stage32_integrated_invalid_cap_matches_old_path_error`,
+  `stage32_integrated_wrong_object_matches_old_path`,
+  `stage32_integrated_empty_endpoint_fallback`,
+  `stage32_integrated_user_asid_receiver_fallback`,
+  `stage32_integrated_cap_transfer_fallback`,
+  `stage32_integrated_recv_v2_fallback`,
+  `stage32_integrated_lanes_match_old_path`.
+- **Writeback plan (4):** `stage32_writeback_plan_stores_payload`,
+  `stage32_writeback_plan_bounds_payload_len`,
+  `stage32_writeback_plan_kernel_task_writeback`,
+  `stage32_writeback_plan_user_asid_disabled`.
+- **Regression (3):** `stage32_nr8_split_still_works`,
+  `stage32_ipc_recv_not_wired_into_live_seam`, `stage32_syscall_count_still_30`.
+
+All pass single-threaded. Full lib suite: 910 passed, 0 failed, 2 ignored.
+
+### 50.8 x86_64 smoke decision
+
+Not required for Stage 32: the path remains **helper-only**, not wired into the
+live trap seam (`try_split_dispatch_into_frame`), so it changes no live trap
+behavior. `IpcRecv` stays default-deny in the live seam
+(`stage32_ipc_recv_not_wired_into_live_seam`). The NR-8 live split-dispatch is
+untouched (`stage32_nr8_split_still_works`); `YARM_LOCK_SPLIT_DISPATCH nr=8
+result=ok` remains the live split marker. No `ipc_recv_queued_plain` live marker is
+emitted because the path is not live-wired.
+
+### 50.9 Remaining blockers for live-wiring IpcRecv
+
+1. **User-ASID writeback** — match the old path's message-consumed-on-copy-fail
+   semantics for a post-dequeue `copy_to_current_user` performed outside
+   `ipc_state_lock` (the plan struct exists; the user branch is disabled).
+2. **Sender-waiter refill** — `ReceivedWithSenderWake` needs a deferred scheduler
+   wake (still fallback).
+3. **Live-seam wiring + x86_64 smoke** — only after (1)/(2) so the fast path
+   actually fires on the real (user-ASID server) boot path with smoke coverage.
+
+### 50.10 Still deferred
+
+x86_64 SMP (`smp.rs`); RAMFS/FAT runtime spawning; recv-v2 / cap-transfer /
+timeout / blocking recv splits; live-wiring the IPC recv split.

@@ -7,7 +7,7 @@ use crate::kernel::boot::{
     TrapHandleError,
     kernel_mut, kernel_ref,
 };
-use crate::kernel::capabilities::CapId;
+use crate::kernel::capabilities::{CapId, CapObject, CapRights};
 use crate::kernel::ipc::Message;
 use crate::kernel::task::{FaultPolicy, TaskClass};
 #[cfg(any(debug_assertions, test))]
@@ -80,6 +80,151 @@ impl Drop for BootRawKernelBorrowGuard {
 pub struct FatalTrapReadSnapshot {
     pub current_tid: u64,
     pub current_asid: u64,
+}
+
+/// Stage 32: immutable, `Copy` snapshot of a resolved endpoint **receive**
+/// capability.
+///
+/// Produced by [`SharedKernel::resolve_endpoint_recv_cap_split_read`] (and the
+/// `KernelState` raw helper it delegates to) using a strict phase-separated
+/// lock protocol — task lock (rank 2) read+release, then capability lock
+/// (rank 4) read+release — with NO IPC lock and NO mutation. It captures
+/// exactly what the IPC dequeue phase needs: the resolved endpoint object
+/// (`index`, `generation`) so the IPC domain can revalidate liveness under
+/// `ipc_state_lock`, plus the requester identity for telemetry/debug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointRecvCapSnapshot {
+    /// Resolved endpoint object (`CapObject::Endpoint { index, generation }`).
+    /// The `index`/`generation` let the IPC dequeue phase revalidate liveness
+    /// (`resolve_endpoint_index`) under `ipc_state_lock` before dequeue.
+    pub endpoint: CapObject,
+    /// The receive capability's rights (always includes `RECEIVE`).
+    pub rights: CapRights,
+    /// Requester thread id (the receiving task).
+    pub requester_tid: u64,
+    /// Requester process id (thread-group id) whose cnode the cap was found in.
+    pub requester_pid: u64,
+}
+
+impl EndpointRecvCapSnapshot {
+    /// The endpoint slot index, if the captured object is an `Endpoint`.
+    pub fn endpoint_index(&self) -> Option<usize> {
+        match self.endpoint {
+            CapObject::Endpoint { index, .. } => Some(index),
+            _ => None,
+        }
+    }
+}
+
+/// Stage 32: maximum plain inline payload a split queued-plain recv writeback
+/// plan can carry. Sized to the IPC message payload bound
+/// (`Message::MAX_PAYLOAD == 128`).
+pub const MAX_PLAIN_PAYLOAD: usize = 128;
+
+/// Stage 32: scaffolded writeback plan for a split queued-plain IPC recv.
+///
+/// Captures everything needed to perform the trap-frame writeback for one
+/// dequeued plain message **outside** all locks, so that a future stage can do
+/// the user-memory copy (`copy_to_current_user`) after releasing
+/// `ipc_state_lock`. The plan is filled under `ipc_state_lock` (payload bytes +
+/// return metadata), then applied lock-free.
+///
+/// Status (Stage 32): SCAFFOLDED. The kernel-task writeback (register-only) is
+/// equivalent to the live helper path; the user-ASID branch is left DISABLED
+/// (`is_kernel_task == false` ⇒ the integrated helper returns `None` / fallback)
+/// because matching the old path's "message-consumed-on-copy-fail" semantics
+/// across a post-dequeue user-copy is not yet proven safe. See
+/// `doc/KERNEL_LOCKING.md` §50.
+#[derive(Debug, Clone, Copy)]
+pub struct IpcRecvQueuedPlainWritebackPlan {
+    /// Payload bytes (fixed-size inline, sized to `MAX_PLAIN_PAYLOAD`).
+    payload: [u8; MAX_PLAIN_PAYLOAD],
+    /// Valid length of `payload`.
+    payload_len: usize,
+    /// Sender TID return lane (`ret0`).
+    sender_tid: u64,
+    /// Transfer-cap return lane (`ret2`); always `NO_TRANSFER_CAP` for a plain
+    /// message.
+    ret_cap: u64,
+    /// User payload destination pointer (from `SYSCALL_ARG_PTR`); only used on
+    /// the (currently disabled) user-ASID branch.
+    user_payload_ptr: u64,
+    /// User payload destination length (from `SYSCALL_ARG_LEN`).
+    user_payload_len: usize,
+    /// `true` if the receiver is a kernel task (register-only writeback, no
+    /// user copy). `false` ⇒ user-ASID receiver, currently DISABLED.
+    is_kernel_task: bool,
+    /// Endpoint object for debug/logging.
+    endpoint: CapObject,
+}
+
+impl IpcRecvQueuedPlainWritebackPlan {
+    /// `NO_TRANSFER_CAP` sentinel for the transfer-cap return lane.
+    pub const NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
+
+    /// Build a kernel-task plan from a dequeued plain message. Returns `None`
+    /// when the payload exceeds `MAX_PLAIN_PAYLOAD` (cannot be represented).
+    pub fn for_kernel_task(
+        snapshot: &EndpointRecvCapSnapshot,
+        sender_tid: u64,
+        msg_payload: &[u8],
+    ) -> Option<Self> {
+        if msg_payload.len() > MAX_PLAIN_PAYLOAD {
+            return None;
+        }
+        let mut payload = [0u8; MAX_PLAIN_PAYLOAD];
+        payload[..msg_payload.len()].copy_from_slice(msg_payload);
+        Some(Self {
+            payload,
+            payload_len: msg_payload.len(),
+            sender_tid,
+            ret_cap: Self::NO_TRANSFER_CAP,
+            user_payload_ptr: 0,
+            user_payload_len: 0,
+            is_kernel_task: true,
+            endpoint: snapshot.endpoint,
+        })
+    }
+
+    /// Valid payload slice captured by the plan.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload[..self.payload_len]
+    }
+
+    /// Payload length.
+    pub fn payload_len(&self) -> usize {
+        self.payload_len
+    }
+
+    /// Sender TID return lane.
+    pub fn sender_tid(&self) -> u64 {
+        self.sender_tid
+    }
+
+    /// Transfer-cap return lane.
+    pub fn ret_cap(&self) -> u64 {
+        self.ret_cap
+    }
+
+    /// Whether the receiver is a kernel task (register-only writeback).
+    pub fn is_kernel_task(&self) -> bool {
+        self.is_kernel_task
+    }
+
+    /// User payload destination pointer (user-ASID branch only).
+    pub fn user_payload_ptr(&self) -> u64 {
+        self.user_payload_ptr
+    }
+
+    /// User payload destination length (user-ASID branch only).
+    pub fn user_payload_len(&self) -> usize {
+        self.user_payload_len
+    }
+
+    /// Endpoint object captured for debug/logging.
+    pub fn endpoint(&self) -> CapObject {
+        self.endpoint
+    }
 }
 
 #[derive(Debug)]
@@ -396,9 +541,32 @@ impl SharedKernel {
     ) -> Option<Result<(), TrapHandleError>> {
         // Authoritative requester-TID read (binds current_cpu, then releases).
         // Mirrors the Stage 29A trap-seam discipline: never current_tid_split_read.
-        let _requester_tid = self.current_tid_authoritative(cpu)?;
+        let requester_tid = self.current_tid_authoritative(cpu)?;
+
+        // Stage 32: resolve the endpoint receive cap via the phase-separated
+        // split-read (task(2) read+release → capability(4) read+release), with
+        // NO ipc lock and NO global lock held. A resolution failure is a real
+        // error the old path returned — surface it (Some(Err)); the caller must
+        // NOT fall back, since the global path produces the identical error.
+        let recv_cap = CapId(frame.arg(crate::kernel::syscall::SYSCALL_ARG_CAP) as u64);
+        let snapshot = match self.resolve_endpoint_recv_cap_split_read(requester_tid, recv_cap) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                return Some(Err(TrapHandleError::Syscall(
+                    crate::kernel::syscall::SyscallError::from(e),
+                )));
+            }
+        };
+
+        // Stage 32: the cap lock is RELEASED; only now acquire the IPC domain
+        // (via the global `with` for this helper-only path) for the dequeue +
+        // kernel-task writeback. The snapshot's endpoint object is revalidated
+        // for liveness under ipc_state_lock inside the dequeue. The capability
+        // lock and the IPC lock are NEVER held simultaneously.
         self.with(|state| {
-            crate::kernel::syscall::try_split_recv_queued_plain_into_frame_locked(state, frame)
+            crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked(
+                state, frame, &snapshot,
+            )
         })
     }
 
@@ -609,6 +777,65 @@ impl SharedKernel {
                 limits,
             )
         }
+    }
+
+    /// # Validation status
+    /// - HELPER_ONLY — Stage 32 endpoint receive-cap resolution split-read.
+    ///   Used by the Stage 31 queued-plain recv helper before the IPC dequeue;
+    ///   NOT wired into the live trap seam. See `doc/KERNEL_LOCKING.md` §50.
+    ///
+    /// STAGE 32: resolve a `requester_tid`'s endpoint **receive** capability
+    /// `cap` WITHOUT acquiring the outer `SharedKernel` lock, the IPC lock, or
+    /// holding the task and capability locks simultaneously.
+    ///
+    /// Phase 1 (task snapshot, rank 2): read the requester's pid via
+    /// `process_id_from_raw`, which acquires and RELEASES `task_state_lock`
+    /// before returning. The task lock is NOT held past this point. A missing
+    /// task surfaces as `InvalidCapability` (the old path resolves the cnode via
+    /// the requester pid; an unknown requester has no cnode → invalid cap).
+    ///
+    /// Phase 2 (capability resolution, rank 4): look up + validate the cap in the
+    /// requester pid's cnode via `resolve_endpoint_recv_cap_in_pid_from_raw`,
+    /// which acquires ONLY `capability_state_lock`. No mutation. No IPC lock.
+    ///
+    /// Lock order: task(2) [read+release] → capability(4) [read+release].
+    /// No nested locks. ipc(3) is acquired only AFTER this function returns
+    /// (during the dequeue phase). No global lock required.
+    ///
+    /// Errors map to the old global-lock `IpcRecv` cap-resolution (`SyscallError`
+    /// via `From<KernelError>`): `InvalidCapability` (missing cnode/slot),
+    /// `WrongObject` (non-endpoint), `MissingRight` (no RECEIVE right). The
+    /// IPC-domain generation liveness check is intentionally deferred to the
+    /// caller's dequeue phase (it requires `ipc_state_lock`).
+    ///
+    /// SAFETY: `state.data_ptr()` is the stable `KernelState` storage owned by
+    /// this `SharedKernel`. Each `*_from_raw` helper derives raw field pointers
+    /// without creating a whole-`KernelState` reference; the per-domain locks
+    /// serialize access to their respective fields.
+    pub fn resolve_endpoint_recv_cap_split_read(
+        &self,
+        requester_tid: u64,
+        cap: CapId,
+    ) -> Result<EndpointRecvCapSnapshot, KernelError> {
+        let state = self.state.data_ptr();
+        // Phase 1: task-domain snapshot (rank 2), lock released on return.
+        let requester_pid =
+            unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
+                .ok_or(KernelError::InvalidCapability)?;
+        // Phase 2: capability-domain resolution (rank 4), task lock released.
+        let (endpoint, rights) = unsafe {
+            KernelState::resolve_endpoint_recv_cap_in_pid_from_raw(
+                state as *const _,
+                requester_pid,
+                cap,
+            )
+        }?;
+        Ok(EndpointRecvCapSnapshot {
+            endpoint,
+            rights,
+            requester_tid,
+            requester_pid,
+        })
     }
 
     /// Borrow `&mut KernelState` directly, bypassing the `SpinLock`.
