@@ -19995,10 +19995,11 @@ mod stage29a_live_split_dispatch_tests {
     #[test]
     fn stage29a_non_nr8_still_fallback() {
         // A representative set of non-NR-8 syscalls must classify as None so they
-        // fall back to the unchanged global-lock path.
+        // fall back to the unchanged global-lock path. (IpcRecv / NR 2 is now
+        // split-eligible via Stage 32B and is therefore excluded from this set; its
+        // own classification + deferral is covered by the stage32b_ tests.)
         for nr in [
             SYSCALL_IPC_SEND_NR,
-            SYSCALL_IPC_RECV_NR,
             SYSCALL_SPAWN_PROCESS_NR,
             SYSCALL_VM_MAP_NR,
         ] {
@@ -20009,6 +20010,11 @@ mod stage29a_live_split_dispatch_tests {
                 "syscall nr {nr} must fall back (None) — not split-eligible"
             );
         }
+        // Stage 32B: IpcRecv (NR 2) is now split-eligible at classification time.
+        assert!(
+            classify_split_eligible(decode(SYSCALL_IPC_RECV_NR), 900, [1, 2, 3, 4, 5, 6]).is_some(),
+            "IpcRecv (NR 2) must be split-eligible (Stage 32B)"
+        );
     }
 
     #[test]
@@ -20545,9 +20551,10 @@ mod stage31_split_recv_tests {
     }
 
     #[test]
-    fn stage31_split_recv_not_wired_into_live_seam() {
-        // Contract guard: IpcRecv must remain default-deny in the LIVE split-dispatch
-        // seam (try_split_dispatch_into_frame). Stage 31 is helper-only.
+    fn stage31_split_recv_live_wired_kernel_task_stage32b() {
+        // Stage 32B update: this was the Stage 31 "not-wired" guard. IpcRecv for a
+        // kernel-task receiver of a queued plain message is now LIVE-WIRED into
+        // try_split_dispatch_into_frame and serviced there (no global lock).
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let recv_cap = kernel.with(|state| {
             let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
@@ -20559,8 +20566,8 @@ mod stage31_split_recv_tests {
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
-            None,
-            "IpcRecv must stay default-deny in the live split-dispatch seam"
+            Some(Ok(())),
+            "IpcRecv kernel-task queued plain is serviced by the live seam (Stage 32B)"
         );
     }
 
@@ -21069,19 +21076,165 @@ mod stage32_cap_resolution_tests {
     }
 
     #[test]
-    fn stage32_ipc_recv_not_wired_into_live_seam() {
-        // IpcRecv must remain default-deny in the LIVE split-dispatch seam.
+    fn stage32b_ipc_recv_live_wired_into_seam_kernel_task() {
+        // Stage 32B: IpcRecv (NR 2) for a kernel-task receiver of a queued plain
+        // message is now LIVE-WIRED into try_split_dispatch_into_frame, returning the
+        // serviced result (no global lock). The boot current task (tid 0) is a kernel
+        // task (no user ASID), so the seam services it.
         let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
         let mut frame = recv_frame(recv_cap);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         assert_eq!(
-            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
-            None,
-            "IpcRecv must stay default-deny in the live split-dispatch seam"
+            result,
+            Some(Ok(())),
+            "IpcRecv kernel-task queued plain must be serviced by the live seam"
         );
+        assert_eq!(frame.ret0(), 7, "sender tid lane");
+        assert_eq!(frame.ret1(), b"ping".len(), "payload len lane");
+        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "no transfer cap");
     }
 
     #[test]
     fn stage32_syscall_count_still_30() {
         assert_eq!(SYSCALL_COUNT, 30, "Stage 32 must not change SYSCALL_COUNT");
+    }
+
+    // ── Stage 32B: live-wire kernel-task IpcRecv split + classification ───────
+
+    #[test]
+    fn stage32b_ipc_recv_live_kernel_task_queued_plain() {
+        // The live seam (try_split_dispatch_into_frame) services a kernel-task
+        // queued-plain IpcRecv and writes the canonical kernel-task return lanes.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"pong");
+        let mut frame = recv_frame(recv_cap);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "live seam services kernel-task queued plain recv");
+        assert_eq!(frame.ret0(), 7);
+        assert_eq!(frame.ret1(), b"pong".len());
+        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP);
+    }
+
+    #[test]
+    fn stage32b_ipc_recv_user_asid_still_fallback() {
+        // A user-ASID receiver must still fall back (None) through the LIVE seam —
+        // the user-copy writeback blocker is unchanged for Stage 32B.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"ping").expect("m"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind asid");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "user-ASID receiver must fall back through the live seam"
+        );
+    }
+
+    #[test]
+    fn stage32b_ipc_recv_empty_queue_still_fallback() {
+        // An empty endpoint must fall back (None) through the LIVE seam (would block).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            recv_cap
+        });
+        let mut frame = recv_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "empty endpoint must fall back through the live seam"
+        );
+    }
+
+    #[test]
+    fn stage32b_ipc_recv_v2_fallback() {
+        // A recv-v2 metadata request must fall back (None) through the LIVE seam.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
+        let mut frame = recv_v2_frame(recv_cap);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "recv-v2 must fall back through the live seam"
+        );
+    }
+
+    #[test]
+    fn stage32b_ipc_recv_invalid_cap_matches_old_path_error() {
+        // An invalid recv cap is NOT a fallback: the live seam returns the same
+        // Some(Err(..)) the global-lock path produces.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let mut frame = recv_frame(CapId(987_654));
+        let split =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        let mut ref_state = Bootstrap::init().expect("init");
+        let mut ref_frame = recv_frame(CapId(987_654));
+        let ref_err = crate::kernel::syscall::dispatch(&mut ref_state, &mut ref_frame).err();
+        match (split, ref_err) {
+            (Some(Err(TrapHandleError::Syscall(s))), Some(r)) => {
+                assert_eq!(s, r, "live seam error must equal global-lock recv error");
+            }
+            other => panic!("invalid-cap divergence: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage32b_ipc_recv_timeout_nr_not_split_eligible() {
+        // IpcRecvTimeout (NR 5) is NOT in the split-eligible NR set: the live seam
+        // returns None and defers to the global-lock path.
+        let (kernel, recv_cap) = kernel_with_queued_plain(b"ping");
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "IpcRecvTimeout must fall back (not split-eligible)"
+        );
+    }
+
+    #[test]
+    fn stage32b_nr8_regression() {
+        // NR 8 (ControlPlaneSetCnodeSlots) split dispatch must still work unchanged.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let target = kernel.with(|state| {
+            state
+                .register_task_with_class(900, TaskClass::SystemServer)
+                .expect("system server");
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("target app");
+            state.enqueue_current_cpu(900).expect("enqueue");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(900) {
+                state.yield_current().expect("switch");
+            }
+            901u64
+        });
+        let requested = 16usize;
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR,
+            [target as usize, requested, 0, 0, 0, 0],
+        );
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            Some(Ok(())),
+            "NR 8 split dispatch must still succeed"
+        );
+        assert_eq!(frame.ret0(), requested);
+        assert_eq!(frame.ret1(), target as usize);
+    }
+
+    #[test]
+    fn stage32b_syscall_count_30() {
+        assert_eq!(SYSCALL_COUNT, 30, "Stage 32B must not change SYSCALL_COUNT");
     }
 }

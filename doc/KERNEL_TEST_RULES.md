@@ -2653,3 +2653,40 @@ Stage 29 NR-8 live split-dispatch must still work (`stage32_nr8_split_still_work
 numbers added; Stages 12–31 behavior preserved. x86_64 smoke is deferred (the path
 stays helper-only); the `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok` marker remains the
 live split indicator. All stage32_ tests must pass with `--test-threads=1`.
+
+### Rule N+40 (Stage 32B)
+
+When the kernel-task IpcRecv queued-plain split is **live-wired** into
+`try_split_dispatch_into_frame`, a `stage32b_` test suite must prove the live-wire
+is safe AND default-deny-preserving:
+
+(a) **Live kernel-task path:** a kernel-task receiver of a queued plain message,
+routed through `try_split_dispatch_into_frame` (NOT just the helper), must return
+`Some(Ok(()))` and write the canonical kernel-task lanes
+(`set_ok(sender, raw_len, NO_TRANSFER_CAP)`) —
+`stage32b_ipc_recv_live_kernel_task_queued_plain`,
+`stage32b_ipc_recv_live_wired_into_seam_kernel_task`.
+
+(b) **Fallback preservation through the LIVE seam:** every non-serviceable case must
+return `None` from `try_split_dispatch_into_frame` (NOT a fabricated `Some(Err)`),
+so the global-lock path handles it unchanged — user-ASID receiver
+(`stage32b_ipc_recv_user_asid_still_fallback`), empty queue
+(`stage32b_ipc_recv_empty_queue_still_fallback`), recv-v2
+(`stage32b_ipc_recv_v2_fallback`). An invalid cap is NOT a fallback: it must return
+the SAME `Some(Err)` the global-lock path produces
+(`stage32b_ipc_recv_invalid_cap_matches_old_path_error`).
+
+(c) **Classification:** NR 2 must pass the NR-only split gate and classify as
+`IpcRecvKernelTask` (`stage32b_ipc_recv_classify_nr2_eligible`); the arg-only
+`try_split_dispatch` must still defer IpcRecv to `None`
+(`stage32b_arg_only_dispatch_defers_ipc_recv`); IpcRecvTimeout (NR 5) must NOT be
+split-eligible (`stage32b_ipc_recv_timeout_nr_not_in_whitelist`,
+`stage32b_ipc_recv_timeout_nr_not_split_eligible`); IpcSend/IpcCall/IpcReply stay
+default-deny (`stage32b_ipc_send_call_reply_not_split_eligible`).
+
+(d) **ABI + NR-8 regression:** NR-8 split dispatch must still succeed
+(`stage32b_nr8_regression`); `SYSCALL_COUNT == 30`
+(`stage32b_syscall_count_30`); no syscall numbers added; Stages 12–32 behavior
+preserved. Telemetry markers must be low-noise (LIVE path only):
+`YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan|writeback result=ok`. All
+`stage32b_` tests must pass with `--test-threads=1`.

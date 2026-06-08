@@ -9511,3 +9511,163 @@ emitted because the path is not live-wired.
 
 x86_64 SMP (`smp.rs`); RAMFS/FAT runtime spawning; recv-v2 / cap-transfer /
 timeout / blocking recv splits; live-wiring the IPC recv split.
+
+### 50.11 Stage 32B — live-wire kernel-task IpcRecv split (decision)
+
+**Decision: LIVE-WIRED for the kernel-task queued-plain case only.** Stage 32's
+§50.9 listed the live-wiring blockers as (1) user-ASID writeback semantics and
+(2) sender-waiter refill scheduler wake. Both blockers apply ONLY to cases the
+helper already rejects with `None`. The kernel-task queued-plain case has **no
+remaining blocker**: it performs no user copy (register-only writeback, no
+copy-failure mode) and no scheduler wake (sender-waiter refill →
+`ReceivedWithSenderWake` is rejected to `None`). It is therefore safe to live-wire
+that single case while every other case keeps falling back to the unchanged
+global-lock path.
+
+**Wiring (additive, default-deny-preserving):**
+
+- `classify_split_eligible_nr_only` (`src/kernel/syscall_split.rs`) now admits
+  `Syscall::IpcRecv` (NR 2) through the cheap NR gate, alongside NR 8.
+- `try_split_dispatch_into_frame` routes IpcRecv to
+  `try_split_ipc_recv_queued_plain_into_frame` (the thin wrapper →
+  `SharedKernel::try_split_ipc_recv_queued_plain_into_frame`) **before** the global
+  lock. The helper's `Option<Result<…>>` is returned **directly**:
+  - `Some(Ok(()))` — kernel-task queued-plain recv serviced; lanes written.
+  - `Some(Err(e))` — cap-resolution error identical to the old path (NOT a
+    fallback — the old path raised the same error).
+  - `None` — every other case (user-ASID, empty queue, sender-wake, cap-transfer,
+    recv-v2) propagates UNCHANGED to the global-lock fallback. The split path never
+    converts a would-be-fallback into a `Some(Err)`.
+- The arg-only `classify_split_eligible` maps IpcRecv to
+  `SplitEligibleSyscall::IpcRecvKernelTask`; the arg-only `try_split_dispatch`
+  returns `None` for it (it has no `cpu`/`frame` to service a recv), deferring to
+  the frame-level seam. This keeps the arg-only entry point's behavior unchanged.
+
+**ABI/scheduler invariants:** `SYSCALL_COUNT == 30` unchanged; no syscall numbers
+added; NR 8 live split untouched; `task_switched == false` on the recv split path
+(no dispatch/yield/switch), so `entering_tid == exiting_tid` holds for the arch
+return-register writeback exactly as before.
+
+### 50.12 Full IPC receive path classification (Stage 32B)
+
+| case | NR | split status | reason |
+|---|---|---|---|
+| IpcRecv, kernel-task, queued plain, no sender wake | 2 | **LIVE (32B)** | no user-copy, no scheduler |
+| IpcRecv, user-ASID, queued plain | 2 | HELPER_ONLY → fallback | user-copy writeback (post-dequeue copy-fail semantics) |
+| IpcRecv, queued plain, sender-wake needed | 2 | FALLBACK | `ReceivedWithSenderWake` → scheduler wake |
+| IpcRecv, empty endpoint, would block | 2 | FALLBACK | blocking path (`WouldBlock`) |
+| IpcRecv, cap-transfer / reply-cap msg | 2 | FALLBACK | cap domain materialization |
+| IpcRecv, recv-v2 flags set | 2 | FALLBACK | meta-buffer user copy |
+| IpcRecv, invalid/wrong-object/missing-right cap | 2 | LIVE-Err | `Some(Err)` == old-path error (not a fallback) |
+| IpcRecvTimeout, timeout=0, queued plain | 5 | FALLBACK | NR 5 not in split whitelist (`try_ipc_recv` path; no split-seam) |
+| IpcRecvTimeout, timeout=0, empty | 5 | FALLBACK | `WouldBlock`/non-blocking poll, global lock |
+| IpcRecvTimeout, timeout>0, queued plain | 5 | FALLBACK | global lock (deadline pre-read already staged pre-lock) |
+| IpcRecvTimeout, timeout>0, blocking | 5 | FALLBACK | deadline block + timer interaction |
+| IpcSend | 1 | FALLBACK | sender path (enqueue + receiver wake) |
+| IpcCall | 6 | FALLBACK | sender + reply-cap alloc + recv |
+| IpcReply | 7 | FALLBACK | reply-cap consume + sender wake |
+
+Notes from the audit:
+- **IpcRecvTimeout (NR 5)** internally *does* attempt `try_endpoint_split_recv`
+  (the IPC-domain queued-plain dequeue) inside the global-lock handler
+  `handle_ipc_recv_timeout`, including for `timeout == 0`. But NR 5 is **not** put
+  on the pre-global-lock split whitelist in Stage 32B: its handler additionally
+  consults the per-CPU `SPLIT_RECV_TIMEOUT_DEADLINE`, the `ipc_timeout_fired`
+  flag, and (for the empty/blocking case) the deadline scheduler path — none of
+  which the recv split-seam models. A unified treatment is the Stage 33 work item.
+- The `timeout == 0` "behaves like non-blocking IpcRecv when the queue has a
+  message" semantics ARE present (immediate delivery via the in-handler split
+  recv), but only on the global-lock path for now.
+- **recv-v2** adds a metadata-buffer materialization (`meta_user_ptr` /
+  `meta_user_len`, `IPC_RECV_META_V2_ENCODED_LEN`) on top of plain recv — a user
+  copy — so it stays fallback for all variants.
+
+### 50.13 Per-phase telemetry markers (Stage 32B)
+
+Emitted only on the LIVE split recv path (kept low-noise — at most one line per
+phase per serviced recv; fallbacks and propagated errors stay silent):
+
+- `YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan result=ok endpoint_idx={idx}` —
+  after the phase-separated cap resolution (task(2)→cap(4), no ipc lock) succeeds.
+  Emitted in `SharedKernel::try_split_ipc_recv_queued_plain_into_frame`
+  (`src/runtime.rs`).
+- `YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=writeback result=ok target=kernel` —
+  after a plain message was dequeued under `ipc_state_lock` and the kernel-task
+  return lanes were written (only on `Some(Ok(()))`).
+- `YARM_LOCK_SPLIT_DISPATCH nr=2 cpu={cpu} result=ok` — emitted by the existing
+  `handle_trap_entry_shared` seam (`src/arch/trap_entry.rs`) whenever the routed
+  IpcRecv split returns `Some(_)` (shared with the NR-8 marker line).
+
+The `cap_plan` marker can fire on an attempt that later falls back at the dequeue
+phase (e.g. empty queue) — it marks only that cap resolution cleared, not a full
+delivery. The `phase=writeback` + `nr=2 result=ok` dispatch markers mark a fully
+serviced split recv.
+
+### 50.14 Manual x86_64 smoke grep commands
+
+```
+grep -c 'YARM_LOCK_SPLIT_DISPATCH nr=8.*result=ok' $LOG               # >= 1 (NR 8 live)
+grep -c 'YARM_LOCK_SPLIT_IPC_RECV.*phase=writeback.*result=ok' $LOG   # >= 0 (boot-dependent)
+grep -c 'YARM_LOCK_SPLIT_DISPATCH nr=2 .*result=ok' $LOG              # >= 0 (boot-dependent)
+grep -c 'YARM_LOCK_SPLIT_STAGE2N_FALLBACK' $LOG                       # 0
+grep -c 'YARM_LOCK_SPLIT_CURRENT_TID_MISMATCH' $LOG                   # 0
+```
+
+The realistic x86_64 service receivers (PM/init/VFS) are **user-ASID** tasks, so
+they keep falling back and the `nr=2` recv markers may legitimately be `0` on a
+given boot — the kernel-task split recv only fires when a kernel task receives a
+plain queued message. The `nr=8 result=ok` count and all Phase3B / service-entry /
+fallback=0 / TID-mismatch=0 health markers remain the load-bearing live assertions.
+
+## §51 Stage 33 — Canonical internal IPC receive engine (plan)
+
+**Goal:** collapse the three receive entry points (IpcRecv, IpcRecvTimeout,
+recv-v2) onto **one** internal receive engine, so split-eligibility, dequeue,
+writeback, and wake are decided in exactly one place instead of three divergent
+per-variant handlers.
+
+**Public ABIs unchanged.** No syscall numbers added; `SYSCALL_COUNT == 30` stays.
+
+**Adapter pattern.** Each syscall variant decodes its frame into a single request
+descriptor:
+
+```text
+RecvRequest {
+    kind:         RecvKind,       // PlainRecv | TimedRecv | RecvV2
+    cap:          CapId,          // endpoint receive cap
+    timeout:      Option<u64>,    // None = block forever, Some(0) = poll, Some(n) = deadline
+    v2_meta_ptr:  u64,            // recv-v2 metadata buffer (0 otherwise)
+    v2_meta_len:  usize,
+    payload_ptr:  u64,            // user payload dst (user-ASID receiver)
+    payload_len:  usize,
+}
+```
+
+**Internal engine responsibilities (one consistent implementation):**
+1. cap resolution — phase-separated split-read (task(2)→cap(4), reuse Stage 32
+   `resolve_endpoint_recv_cap_split_read`);
+2. dequeue — IPC-domain-only queued-plain attempt (reuse `try_endpoint_split_recv`);
+3. writeback — kernel-task register-only (live) OR user-ASID copy (gated on the
+   formalized copy-failure semantics, see prerequisite);
+4. wake — deferred sender-waiter wake applied AFTER all locks release;
+5. block/deadline — only when the dequeue did not deliver.
+
+**This enables:**
+- **IpcRecvTimeout `timeout==0` fast path** — same as plain recv when the queue is
+  non-empty (today it is serviced only on the global-lock path); the engine lets
+  NR 5 share the pre-global-lock recv split-seam.
+- **recv-v2 fast path** for kernel-task receivers (no user meta copy needed when
+  the receiver is a kernel task), once the engine owns metadata materialization.
+
+**Prerequisite (carried from §50.9):** formalize user-ASID writeback
+copy-failure semantics — the old path dequeues then copies, and on
+`copy_to_current_user` fault the message is consumed (lost), a user fault is
+recorded, and the syscall returns `Ok(())`. A post-lock-release copy in the engine
+must reproduce that exactly (or introduce a proven requeue/rollback) before the
+user-ASID writeback can move onto the split path. Until then the engine keeps the
+user-ASID writeback on the global-lock path while sharing cap-resolution/dequeue.
+
+**Sequencing:** Stage 33 is a refactor-then-extend: first land the engine behind
+the current behavior (no live-wire change), prove value-equivalence via the
+existing per-variant tests, then incrementally move the timeout=0 and recv-v2
+kernel-task fast paths onto the split seam with x86_64 smoke coverage.

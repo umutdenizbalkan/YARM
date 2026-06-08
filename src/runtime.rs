@@ -510,9 +510,11 @@ impl SharedKernel {
     }
 
     /// # Validation status
-    /// - HELPER_ONLY — Stage 31 queued-plain IPC recv fast-path attempt. NOT wired
-    ///   into the live trap seam (`try_split_dispatch_into_frame`); exercised by unit
-    ///   tests only. See `doc/KERNEL_LOCKING.md` §49 for the blocker.
+    /// - LIVE_TRAP_SMOKE_X86_64 (Stage 32B) — now wired into the live trap seam via
+    ///   `try_split_dispatch_into_frame` (NR 2 → here). The helper fast-paths ONLY a
+    ///   kernel-task receiver of a queued plain message; every other case returns
+    ///   `None` and falls back to the unchanged global-lock path. See
+    ///   `doc/KERNEL_LOCKING.md` §50.11.
     ///
     /// Stage 31: attempt to service an `IpcRecv` for the narrowest split-safe case
     /// — a plain (no cap/reply) message already queued on a buffered endpoint,
@@ -557,17 +559,32 @@ impl SharedKernel {
                 )));
             }
         };
+        // Stage 32B per-phase telemetry: cap plan resolved (task(2)→cap(4), no ipc
+        // lock). Low-noise — emitted once per attempt that clears cap resolution.
+        crate::yarm_log!(
+            "YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan result=ok endpoint_idx={}",
+            snapshot.endpoint_index().map(|i| i as i64).unwrap_or(-1)
+        );
 
         // Stage 32: the cap lock is RELEASED; only now acquire the IPC domain
         // (via the global `with` for this helper-only path) for the dequeue +
         // kernel-task writeback. The snapshot's endpoint object is revalidated
         // for liveness under ipc_state_lock inside the dequeue. The capability
         // lock and the IPC lock are NEVER held simultaneously.
-        self.with(|state| {
+        let result = self.with(|state| {
             crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked(
                 state, frame, &snapshot,
             )
-        })
+        });
+        // Stage 32B per-phase telemetry: only mark the LIVE success path (a plain
+        // message was dequeued and the kernel-task lanes were written). Fallbacks
+        // (`None`) and propagated errors stay silent to keep boot-log noise low.
+        if matches!(result, Some(Ok(()))) {
+            crate::yarm_log!(
+                "YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=writeback result=ok target=kernel"
+            );
+        }
+        result
     }
 
     pub fn handle_trap_with_cpu(
