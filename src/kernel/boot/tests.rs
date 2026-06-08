@@ -24859,3 +24859,504 @@ mod stage37 {
         );
     }
 }
+
+mod stage38 {
+    use crate::kernel::boot::{Bootstrap, KernelError, TrapHandleError};
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::recv_core::{
+        FallbackReason, RecvMapIntent, RecvOutcome, RecvPlan, RecvRequest,
+        RecvSchedulerWakePlan, RecvWritebackPlan, plan_recv_core,
+        try_recv_core_kernel_plain, try_recv_core_user_plain,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+    use crate::kernel::syscall_split::try_split_dispatch_into_frame;
+    use crate::kernel::task::{TaskStatus, WaitReason};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{PageFlags, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CAP0: CapId = CapId(1);
+
+    // ── Helper: kernel with a plain message queued and a plain sender-waiter ──
+
+    /// Creates a SharedKernel with:
+    /// - task 0 blocked as sender-waiter (message = `second`)
+    /// - task 1 as current (kernel task, no ASID)
+    /// - endpoint queue holds `first`
+    /// - returns `(kernel, recv_cap_for_task1)`
+    fn kernel_with_queued_plain_and_plain_sender_waiter(
+        first: &[u8],
+        second: &[u8],
+    ) -> (SharedKernel, CapId) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap_task1 = kernel.with(|state| {
+            state.register_task(1).expect("register task 1");
+            state.enqueue_current_cpu(1).expect("enqueue task 1");
+            // depth=1 so second send blocks task 0
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("endpoint");
+            let recv_cap1 = state
+                .grant_capability_task_to_task(0, recv_cap, 1)
+                .expect("grant recv cap to task 1");
+            state
+                .ipc_send(send_cap, Message::new(0, first).expect("first"))
+                .expect("queue first");
+            // second send → Err(WouldBlock) → task 0 blocked, task 1 dispatched
+            let _ = state.ipc_send(send_cap, Message::new(0, second).expect("second"));
+            recv_cap1
+        });
+        (kernel, recv_cap_task1)
+    }
+
+    // ── A. Cap-transfer fallback (message stays queued, not dequeued) ──────────
+
+    #[test]
+    fn stage38_cap_transfer_flag_at_head_returns_fallback_before_dequeue() {
+        // plan_recv_core returns KernelPlainEligible (shape only),
+        // but try_recv_core_kernel_plain returns FallbackRequired(CapTransfer).
+        // Message must NOT be dequeued.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, endpoint_idx) = kernel.with(|state| {
+            let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg = Message::with_header(0, 0x42, Message::FLAG_CAP_TRANSFER, Some(99), b"cap")
+                .expect("cap msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            (recv_cap, endpoint_idx)
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("resolve endpoint");
+            let request =
+                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        assert!(
+            matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)),
+            "cap-transfer message must return CapTransfer fallback"
+        );
+
+        // Message must still be in the queue
+        kernel.with(|state| {
+            let queued = state.with_ipc_state(|ipc| {
+                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
+            });
+            assert_eq!(queued, 1, "cap-transfer message must remain queued");
+        });
+    }
+
+    #[test]
+    fn stage38_reply_cap_flag_at_head_returns_fallback_before_dequeue() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, endpoint_idx) = kernel.with(|state| {
+            let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg = Message::with_header(0, 0x42, Message::FLAG_REPLY_CAP, Some(99), b"rc")
+                .expect("reply-cap msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            (recv_cap, endpoint_idx)
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request =
+                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        assert!(matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)));
+        kernel.with(|state| {
+            let queued = state.with_ipc_state(|ipc| {
+                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
+            });
+            assert_eq!(queued, 1, "reply-cap message must remain queued");
+        });
+    }
+
+    #[test]
+    fn stage38_cap_transfer_plain_flag_at_head_returns_fallback() {
+        // FLAG_CAP_TRANSFER_PLAIN also falls back before dequeue.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, endpoint_idx) = kernel.with(|state| {
+            let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg = Message::with_header(
+                0,
+                0x42,
+                Message::FLAG_CAP_TRANSFER_PLAIN,
+                Some(99),
+                b"cpln",
+            )
+            .expect("cap-transfer-plain msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            (recv_cap, endpoint_idx)
+        });
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request =
+                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        assert!(matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)));
+        kernel.with(|state| {
+            let queued = state.with_ipc_state(|ipc| {
+                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
+            });
+            assert_eq!(queued, 1);
+        });
+    }
+
+    #[test]
+    fn stage38_cap_transfer_split_dispatch_returns_none() {
+        // cap-transfer at queue head → split dispatch returns None (fallback).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg = Message::with_header(0, 0x42, Message::FLAG_CAP_TRANSFER, Some(99), b"c")
+                .expect("msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, None, "cap-transfer at head → split dispatch must return None");
+    }
+
+    // ── B. Sender-waiter with cap-transfer message → still falls back ─────────
+
+    #[test]
+    fn stage38_sender_waiter_cap_transfer_message_still_falls_back() {
+        // A plain message is at queue head. A sender-waiter has a cap-transfer
+        // message. ipc_try_recv_queued_plain_endpoint_only must NOT proceed with
+        // the two-phase refill → returns Ineligible(SenderWaiterPresent).
+        // This maps to FallbackRequired(SenderWaiterWake).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, endpoint_idx) = kernel.with(|state| {
+            use crate::kernel::boot::SenderWaiter;
+            use crate::kernel::ipc::ThreadId;
+
+            let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(1).expect("ep");
+            // Queue plain message at head
+            state
+                .ipc_send(send_cap, Message::new(0, b"plain").expect("plain"))
+                .expect("send");
+            // Directly inject a cap-transfer sender-waiter at position 0
+            let cap_waiter_msg =
+                Message::with_header(42, 0x55, Message::FLAG_CAP_TRANSFER, Some(99), b"cap")
+                    .expect("cap waiter");
+            state.with_ipc_state_mut(|ipc| {
+                ipc.endpoint_sender_waiters[endpoint_idx][0] = Some(SenderWaiter {
+                    tid: ThreadId(42),
+                    msg: cap_waiter_msg,
+                });
+            });
+            (recv_cap, endpoint_idx)
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        assert!(
+            matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)),
+            "cap-transfer sender-waiter must still fall back"
+        );
+        // Plain message must remain at queue head (not dequeued)
+        kernel.with(|state| {
+            let queued = state.with_ipc_state(|ipc| {
+                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
+            });
+            assert_eq!(queued, 1, "plain message at head must remain queued");
+        });
+    }
+
+    // ── C. Sender-waiter with plain message → now delivers correctly ──────────
+
+    #[test]
+    fn stage38_try_recv_core_kernel_plain_sender_waiter_returns_delivered_with_wake() {
+        // Stage 38+39: ReceivedWithSenderWake now returns Delivered + WakeSender.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            state.register_task(1).expect("register task 1");
+            state.enqueue_current_cpu(1).expect("enqueue task 1");
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("ep");
+            let recv1 = state
+                .grant_capability_task_to_task(0, recv_cap, 1)
+                .expect("grant");
+            state
+                .ipc_send(send_cap, Message::new(0, b"first").expect("f"))
+                .expect("send first");
+            let _ = state.ipc_send(send_cap, Message::new(0, b"second").expect("s"));
+            recv1
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        match outcome {
+            RecvOutcome::Delivered(delivery) => {
+                assert_eq!(delivery.msg.as_slice(), b"first", "must deliver 'first'");
+                assert!(
+                    matches!(delivery.scheduler, RecvSchedulerWakePlan::WakeSender(_)),
+                    "scheduler must carry WakeSender plan"
+                );
+                assert!(
+                    matches!(delivery.writeback, RecvWritebackPlan::KernelRegister { .. }),
+                    "writeback must be KernelRegister for kernel task"
+                );
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage38_sender_waiter_plain_kernel_split_dispatch_delivers_first_wakes_sender() {
+        // Integration: try_split_dispatch_into_frame delivers 'first' to kernel-task
+        // receiver and wakes the blocked sender.
+        let (kernel, recv_cap) =
+            kernel_with_queued_plain_and_plain_sender_waiter(b"first", b"second");
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "split must deliver 'first' successfully");
+        assert_eq!(frame.ret0(), 0, "sender_tid of 'first' must be 0");
+        assert_eq!(frame.ret1(), b"first".len(), "payload length must match 'first'");
+
+        kernel.with(|state| {
+            assert_eq!(
+                state.task_status(0),
+                Some(TaskStatus::Runnable),
+                "sender 0 must be runnable after stage38 wake"
+            );
+        });
+    }
+
+    #[test]
+    fn stage38_sender_waiter_plain_kernel_second_in_queue_after_delivery() {
+        // After delivering 'first', 'second' (the refilled sender-waiter message)
+        // must be in the endpoint queue.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, endpoint_idx) = kernel.with(|state| {
+            state.register_task(1).expect("register task 1");
+            state.enqueue_current_cpu(1).expect("enqueue task 1");
+            let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(1).expect("ep");
+            let recv1 = state
+                .grant_capability_task_to_task(0, recv_cap, 1)
+                .expect("grant");
+            state
+                .ipc_send(send_cap, Message::new(0, b"first").expect("f"))
+                .expect("queue first");
+            let _ = state.ipc_send(send_cap, Message::new(0, b"second").expect("s"));
+            (recv1, endpoint_idx)
+        });
+
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+
+        kernel.with(|state| {
+            let queued = state.with_ipc_state(|ipc| {
+                ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
+            });
+            assert_eq!(queued, 1, "'second' must be refilled into queue");
+        });
+    }
+
+    #[test]
+    fn stage38_try_recv_core_user_plain_sender_waiter_returns_delivered_with_wake() {
+        // user-ASID receiver with plain sender-waiter → Delivered + WakeSender.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            state.register_task(1).expect("register task 1");
+            state.enqueue_current_cpu(1).expect("enqueue task 1");
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(1).expect("ep");
+            let recv1 = state
+                .grant_capability_task_to_task(0, recv_cap, 1)
+                .expect("grant");
+            state
+                .ipc_send(send_cap, Message::new(0, b"hello").expect("h"))
+                .expect("send");
+            let _ = state.ipc_send(send_cap, Message::new(0, b"world").expect("w"));
+            // Bind ASID to task 1 (current after task 0 blocked)
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(1, asid).expect("bind asid to task 1");
+            recv1
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request =
+                RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0x1000, 128, 0, 0, false);
+            try_recv_core_user_plain(state, &request, endpoint)
+        });
+        match outcome {
+            RecvOutcome::Delivered(delivery) => {
+                assert_eq!(delivery.msg.as_slice(), b"hello");
+                assert!(matches!(delivery.scheduler, RecvSchedulerWakePlan::WakeSender(_)));
+                assert!(matches!(delivery.writeback, RecvWritebackPlan::UserMemory { .. }));
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    // ── D. Plan model: cap-transfer/reply-cap/shared-mem fallback reasons ─────
+
+    #[test]
+    fn stage38_plan_user_asid_mapped_recv_still_falls_back_copy_semantics() {
+        let req = RecvRequest::from_legacy_mapped_recv(1, CAP0, 0x4000, 128, RecvMapIntent::ReadWrite);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics)
+        );
+    }
+
+    #[test]
+    fn stage38_plan_shared_v3_still_helper_only() {
+        use crate::kernel::recv_core::recv_shared_v3::V3_MIN_OUTPUT_LEN;
+        let req = RecvRequest::future_shared_v3(
+            1, CAP0, 0x1000, 128, 0x2000, V3_MIN_OUTPUT_LEN as usize,
+            RecvMapIntent::ReadOnly, None,
+        );
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly)
+        );
+    }
+
+    #[test]
+    fn stage38_plan_user_asid_v3_meta_falls_back_meta_copy() {
+        // V3Future meta with user-ASID → RecvV2MetaUserCopy (helper-only).
+        let req = RecvRequest::future_shared_v3(
+            1, CAP0, 0x1000, 128, 0x2000, 80, RecvMapIntent::None, None,
+        );
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly),
+            "V3Future always SharedV3HelperOnly regardless of meta"
+        );
+    }
+
+    // ── E. Regression: existing live paths unchanged ──────────────────────────
+
+    #[test]
+    fn stage38_kernel_plain_path_still_live() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(7, b"stage38").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 7, "sender tid");
+        assert_eq!(frame.ret1(), b"stage38".len());
+    }
+
+    #[test]
+    fn stage38_user_plain_path_still_live() {
+        use crate::kernel::vm::{PageFlags, VirtAddr};
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(9, b"").expect("m"))
+                .expect("send");
+            let (asid, _) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 9, "sender tid");
+    }
+
+    #[test]
+    fn stage38_user_v2_plain_path_still_live() {
+        // Stage 37 user-ASID recv-v2 path still works after Stage 38+39 changes.
+        use crate::kernel::vm::{PageFlags, VirtAddr};
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(5, b"").expect("m"))
+                .expect("send");
+            let (asid, _) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+            state
+                .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x1_0000), PageFlags::USER_RW)
+                .expect("map");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0x1_0040_usize, 64, 0x1_0000_usize, 40, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 0, "ret0=0 in recv-v2 mode");
+    }
+
+    #[test]
+    fn stage38_syscall_count_still_30() {
+        assert_eq!(SYSCALL_COUNT, 30, "Stage 38+39 must not add any public syscall");
+    }
+
+    #[test]
+    fn stage38_recv_shared_v3_remains_helper_only() {
+        use crate::kernel::recv_core::recv_shared_v3::V3_MIN_OUTPUT_LEN;
+        let req = RecvRequest::future_shared_v3(
+            1, CAP0, 0x1000, 64, 0x2000, V3_MIN_OUTPUT_LEN as usize,
+            RecvMapIntent::ReadOnly, None,
+        );
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly),
+            "recv_shared_v3 must remain helper-only in Stage 38+39"
+        );
+    }
+}

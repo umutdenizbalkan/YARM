@@ -2906,3 +2906,41 @@ the narrow user-ASID + V2 meta path is live-enabled, a `stage37_` test suite mus
 **Run command:** `cargo test --lib stage37 -- --test-threads=1`
 
 All 25 `stage37_` tests must pass.
+
+---
+
+## Rule N+45: Stage 38+39 — transfer/reply/shared audit + sender-waiter fix
+
+When the recv-core transfer/reply/shared semantics are audited and plain sender-waiter
+refill is live-enabled, a `stage38_` test suite must prove:
+
+**(A) Cap-transfer/reply-cap blocked before dequeue:**
+- `FLAG_CAP_TRANSFER` at head → `FallbackRequired(CapTransfer)`, message not dequeued (`stage38_cap_transfer_flag_at_head_returns_fallback_before_dequeue`)
+- `FLAG_REPLY_CAP` at head → `FallbackRequired(CapTransfer)`, message not dequeued (`stage38_reply_cap_flag_at_head_returns_fallback_before_dequeue`)
+- `FLAG_CAP_TRANSFER_PLAIN` at head → `FallbackRequired(CapTransfer)` (`stage38_cap_transfer_plain_flag_at_head_returns_fallback`)
+- Split dispatch returns None when cap-transfer at head (`stage38_cap_transfer_split_dispatch_returns_none`)
+
+**(B) Sender-waiter with cap-transfer still falls back:**
+- Cap-transfer sender-waiter → `FallbackRequired(SenderWaiterWake)`, plain head not dequeued (`stage38_sender_waiter_cap_transfer_message_still_falls_back`)
+
+**(C) Sender-waiter with plain message now live:**
+- `try_recv_core_kernel_plain` + plain sender-waiter → `Delivered + WakeSender` (`stage38_try_recv_core_kernel_plain_sender_waiter_returns_delivered_with_wake`)
+- Integration: split dispatch delivers 'first' + wakes sender (`stage38_sender_waiter_plain_kernel_split_dispatch_delivers_first_wakes_sender`)
+- 'second' in queue after delivery (`stage38_sender_waiter_plain_kernel_second_in_queue_after_delivery`)
+- `try_recv_core_user_plain` + plain sender-waiter → `Delivered + WakeSender` (`stage38_try_recv_core_user_plain_sender_waiter_returns_delivered_with_wake`)
+
+**(D) Plan model:**
+- Mapped recv still → `UserAsidCopySemantics` (`stage38_plan_user_asid_mapped_recv_still_falls_back_copy_semantics`)
+- v3 shared still → `SharedV3HelperOnly` (`stage38_plan_shared_v3_still_helper_only`)
+- v3 with user meta still → `SharedV3HelperOnly` (`stage38_plan_user_asid_v3_meta_falls_back_meta_copy`)
+
+**(E) Regression:**
+- kernel-plain path still live (`stage38_kernel_plain_path_still_live`)
+- user-plain path still live (`stage38_user_plain_path_still_live`)
+- user-v2 plain path still live (`stage38_user_v2_plain_path_still_live`)
+- recv_shared_v3 still helper-only (`stage38_recv_shared_v3_remains_helper_only`)
+- `SYSCALL_COUNT == 30` (`stage38_syscall_count_still_30`)
+
+**Run command:** `cargo test --lib stage38 -- --test-threads=1`
+
+All `stage38_` tests must pass.

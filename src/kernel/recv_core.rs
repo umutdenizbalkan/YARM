@@ -47,6 +47,18 @@
 //! [`execute_user_asid_plain_v2_writeback`].  Meta is written first (matching
 //! the full-path ordering), then payload.  All three failure modes (meta fault,
 //! payload undersized, payload fault) are reproduced exactly.  See §55.
+//!
+//! **Stage 38+39 change:** sender-waiter refill for plain messages is now
+//! handled correctly on the split path.  When [`ipc_try_recv_queued_plain_endpoint_only`]
+//! returns `ReceivedWithSenderWake(msg, wake_tid)`, the canonical core functions
+//! return [`RecvOutcome::Delivered`] with [`RecvSchedulerWakePlan::WakeSender`]
+//! instead of [`RecvOutcome::FallbackRequired`].  The caller
+//! (`try_split_recv_queued_plain_with_snapshot_locked`) applies the wake plan
+//! BEFORE writeback — matching the full-path order.  See §56.
+//!
+//! All three failure blockers that remain on the fallback list: cap-transfer
+//! messages (FLAG_CAP_TRANSFER / FLAG_REPLY_CAP), sender-waiters with
+//! cap-transfer messages, and mapped/shared receive.  See §56.
 
 use super::boot::{IpcEndpointRecvResult, IpcEndpointSplitRejectReason, KernelError, KernelState};
 use super::capabilities::{CapId, CapObject};
@@ -367,11 +379,30 @@ pub enum FallbackReason {
     RecvV2MetaUserCopy,
     /// Timeout/deadline path requires scheduler interaction.
     TimeoutScheduler,
-    /// Message at queue head had cap-transfer or reply-cap flags; the split
-    /// path does not perform cap materialization.
+    /// Message at queue head has cap-transfer or reply-cap flags
+    /// (`FLAG_CAP_TRANSFER`, `FLAG_CAP_TRANSFER_PLAIN`, or `FLAG_REPLY_CAP`).
+    /// The split path does not perform cap materialization (`take_transfer_envelope`
+    /// + cnode lock + `grant_task_to_task_with_rights` / `mint_capability_in_cnode`).
+    ///
+    /// **Rollback blocker:** for recv-v2 or undersized-buffer failures, the full
+    /// path rolls back the already-materialized cap via `rollback_materialized_recv_cap`
+    /// (requires re-taking capability lock rank 4 after the failed copy).  Proving
+    /// exact rollback semantics on the split path is deferred to a future stage.
+    ///
+    /// **Message not dequeued:** [`ipc_try_recv_queued_plain_endpoint_only`] rejects
+    /// cap-flagged messages before dequeuing; the message stays in queue for the
+    /// global-lock full path.
     CapTransfer,
-    /// Sender-waiter refill case: two-phase dequeue+refill happened under
-    /// `ipc_state_lock` but the deferred sender-wake is not yet split-safe.
+    /// Sender-waiter present but split-unsafe: either the sender-waiter's message
+    /// carries cap-transfer / reply-cap flags (requires capability materialization
+    /// on refill, which the split path cannot perform), or the sender-waiter queue
+    /// is sparse (position 0 is empty but later slots are occupied — indicates a
+    /// timed-out sender was removed without compacting the queue).
+    ///
+    /// Note: a sender-waiter with a **plain** (unflagged) message is now handled
+    /// correctly — the dequeued first message is returned as [`RecvOutcome::Delivered`]
+    /// with [`RecvSchedulerWakePlan::WakeSender`], applied before writeback.  Only
+    /// the cases above (complex message or sparse queue) still produce this fallback.
     SenderWaiterWake,
     /// Empty queue with a blocking policy; requires task block / scheduler.
     Blocking,
@@ -597,15 +628,25 @@ pub(crate) fn try_recv_core_kernel_plain(
             })
         }
 
-        IpcEndpointRecvResult::ReceivedWithSenderWake(_msg, _wake_tid) => {
-            // Two-phase refill (dequeue + sender-waiter re-enqueue) has already
-            // happened under ipc_state_lock. The deferred sender-wake cannot be
-            // applied on the split path, so we fall back to the global-lock path
-            // which will find the refilled message and apply the wake.
-            // This mirrors the existing behavior in
-            // try_split_recv_queued_plain_with_snapshot_locked.
+        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
+            // Stage 38+39: plain sender-waiter refill — deliver original message
+            // to receiver and carry deferred wake in RecvSchedulerWakePlan::WakeSender.
+            // The caller applies apply_split_sender_wake_plan(wake_tid) BEFORE the
+            // writeback, matching the full-path order (§56).
             kernel.note_endpoint_only_queued_recv_split();
-            RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+            let sender_tid = match usize::try_from(msg.sender_tid.0) {
+                Ok(s) => s,
+                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
+            };
+            let raw_len = msg.as_slice().len();
+            RecvOutcome::Delivered(RecvDelivery {
+                writeback: RecvWritebackPlan::KernelRegister {
+                    sender_tid,
+                    raw_len,
+                },
+                scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
+                msg,
+            })
         }
 
         IpcEndpointRecvResult::Ineligible(reason) => match reason {
@@ -694,9 +735,25 @@ pub(crate) fn try_recv_core_user_plain(
             })
         }
 
-        IpcEndpointRecvResult::ReceivedWithSenderWake(_msg, _wake_tid) => {
+        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
             kernel.note_endpoint_only_queued_recv_split();
-            RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+            let sender_tid = match usize::try_from(msg.sender_tid.0) {
+                Ok(s) => s,
+                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
+            };
+            let (ptr, user_buf_len) = match request.payload_target {
+                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
+                _ => unreachable!("try_recv_core_user_plain: ReceivedWithSenderWake: non-UserMemory payload_target"),
+            };
+            RecvOutcome::Delivered(RecvDelivery {
+                writeback: RecvWritebackPlan::UserMemory {
+                    ptr,
+                    user_buf_len,
+                    sender_tid,
+                },
+                scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
+                msg,
+            })
         }
 
         IpcEndpointRecvResult::Ineligible(reason) => match reason {
@@ -830,9 +887,31 @@ pub(crate) fn try_recv_core_user_plain_v2(
             })
         }
 
-        IpcEndpointRecvResult::ReceivedWithSenderWake(_msg, _wake_tid) => {
+        IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
             kernel.note_endpoint_only_queued_recv_split();
-            RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+            let sender_tid = match usize::try_from(msg.sender_tid.0) {
+                Ok(s) => s,
+                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
+            };
+            let (ptr, user_buf_len) = match request.payload_target {
+                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
+                _ => unreachable!("try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-UserMemory payload_target"),
+            };
+            let (meta_ptr, meta_len) = match request.meta_target {
+                RecvMetaTarget::V2 { ptr, len } => (ptr, len),
+                _ => unreachable!("try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-V2 meta_target"),
+            };
+            RecvOutcome::Delivered(RecvDelivery {
+                writeback: RecvWritebackPlan::UserMemoryV2 {
+                    ptr,
+                    user_buf_len,
+                    sender_tid,
+                    meta_ptr,
+                    meta_len,
+                },
+                scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
+                msg,
+            })
         }
 
         IpcEndpointRecvResult::Ineligible(reason) => match reason {

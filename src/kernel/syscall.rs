@@ -2160,7 +2160,8 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
     snapshot: &crate::runtime::EndpointRecvCapSnapshot,
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::recv_core::{
-        RecvOutcome, RecvPlan, RecvUserWritebackOutcome, RecvV2WritebackOutcome, RecvWritebackPlan,
+        RecvOutcome, RecvPlan, RecvSchedulerWakePlan, RecvUserWritebackOutcome,
+        RecvV2WritebackOutcome, RecvWritebackPlan,
         execute_user_asid_plain_writeback, execute_user_asid_plain_v2_writeback,
         plan_recv_core, try_recv_core_kernel_plain, try_recv_core_user_plain,
         try_recv_core_user_plain_v2,
@@ -2212,6 +2213,13 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
 
     match outcome {
         RecvOutcome::Delivered(delivery) => {
+            // Stage 38+39: apply deferred sender-waiter wake BEFORE writeback —
+            // matching the full-path order in handle_ipc_recv (§56): wake applied
+            // before handle_ipc_recv_result, i.e. before any copy operation.
+            // ipc_state_lock already released; scheduler lock (rank 1) is safe.
+            if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
+                let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+            }
             match delivery.writeback {
                 RecvWritebackPlan::KernelRegister {
                     sender_tid,
