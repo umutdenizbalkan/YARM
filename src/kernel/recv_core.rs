@@ -459,7 +459,7 @@ pub enum RecvWritebackPlan {
 }
 
 /// A message delivery produced by the canonical receive engine.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecvDelivery {
     /// The dequeued message.
     pub msg: Message,
@@ -470,7 +470,7 @@ pub struct RecvDelivery {
 }
 
 /// Outcome of a `try_recv_core_kernel_plain` call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecvOutcome {
     /// A plain message was dequeued; caller applies `delivery.writeback` and
     /// `delivery.scheduler` to the frame and scheduler respectively.
