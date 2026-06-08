@@ -9884,3 +9884,89 @@ Stage 35 integrates the canonical `RecvRequest` adapters (defined in Stage 33+34
 | ipc_recv (NR2) | user-ASID | global-lock (canonical adapter decode) | 35 |
 | ipc_recv (NR2) | v2 meta | global-lock (canonical adapter decode) | 35 |
 | ipc_recv_timeout (NR5) | any | global-lock (canonical adapter decode) | 35 |
+
+## §54 Stage 36 — Formalize user-ASID receive writeback semantics, live-enable narrow path
+
+### 54.1 Overview
+
+Stage 36 **formally audits** the copy-failure semantics for user-ASID plain receive and **live-enables** the narrow eligible path (no meta, no map_intent) on the canonical split path.
+
+**Changes:**
+- `RecvPlan::UserPlainEligible` added to `recv_core.rs` — new plan variant for eligible user-ASID plain recv
+- `plan_recv_core` restructured: meta check fires BEFORE the `UserMemory`/`KernelRegister` split, so user-ASID + V2 meta → `RecvV2MetaUserCopy` (not `UserAsidCopySemantics` as in Stage 35)
+- `try_recv_core_user_plain` — new function, dequeues under `ipc_state_lock` (rank 3), returns `RecvDelivery` with `UserMemory` writeback plan
+- `execute_user_asid_plain_writeback` — new function, performs user-space copy after lock release
+- `RecvUserWritebackOutcome` — new enum: `Ok`, `UndersizedBuffer`, `CopyFault`
+- `RecvWritebackPlan::UserMemory.user_buf_len` — renamed from `app_payload_len`; stores user buffer capacity
+- `try_split_recv_queued_plain_with_snapshot_locked` updated to handle `UserPlainEligible`
+
+**Invariants preserved:**
+- `SYSCALL_COUNT == 30` (no new public syscall)
+- Public ABI register layout unchanged
+- Kernel-plain split path behavior unchanged
+- recv-v2 still falls back (meta user-copy required)
+- Mapped recv still falls back (map_intent != None → `UserAsidCopySemantics`)
+- Cap-transfer messages fall back at dequeue time (`FallbackRequired(CapTransfer)`)
+
+### 54.2 Copy-failure semantics proof table
+
+| Scenario | Full-path (global-lock) | Split-path (Stage 36) | Verdict |
+|---|---|---|---|
+| Successful copy | `copy_to_current_user` → `Ok` → `frame.set_ok(sender, len, ret2)` | Same: `RecvUserWritebackOutcome::Ok` → `frame.set_ok` | **Equivalent** |
+| Undersized buffer | dequeue → `user_len < payload.len()` → rollback cap → `Err(InvalidArgs)` | dequeue → `user_buf_len < payload.len()` → `UndersizedBuffer` → `Err(InvalidArgs)` | **Equivalent** (message consumed in both) |
+| UserMemoryFault on copy | dequeue → `copy_to_current_user` → `UserMemoryFault` → `record_user_fault` + `Ok(())` | dequeue → `copy_to_current_user` → `CopyFault` → `record_user_fault` + `Ok(())` | **Equivalent** (message consumed in both) |
+| Empty queue | `WouldBlock` → block or return `WouldBlock` to user | `WouldBlock` → `None` → fall back to global-lock path | **Equivalent** (same outcome) |
+| Cap-transfer at queue head | `Ineligible(TransferOrReplyCapMessage)` → handle on global-lock path | `FallbackRequired(CapTransfer)` → `None` → global-lock path | **Equivalent** (no dequeue on either path) |
+| Sender-waiter refill | `ReceivedWithSenderWake` → handle on global-lock path | `FallbackRequired(SenderWaiterWake)` → `None` → global-lock path | **Equivalent** |
+
+**Key invariant (Stage 36):** For plain messages (no flags), `app_payload = raw_payload` — no cap materialization, no prefix stripping.  The narrow eligible path requires no cap rollback on failure.
+
+### 54.3 Lock order (Stage 36 user-ASID plain path)
+
+```
+[no lock]
+  → current_tid_authoritative (takes+releases global lock)
+  → [no lock]
+  → resolve_endpoint_recv_cap_split_read (task(2) read+release → cap(4) read+release; no ipc lock)
+  → [no lock]
+  → self.with(|state| try_split_recv_queued_plain_with_snapshot_locked):
+      → try_recv_core_user_plain:
+          → ipc_state_lock (rank 3) acquired
+          → dequeue plain message
+          → ipc_state_lock (rank 3) released
+      → execute_user_asid_plain_writeback:
+          → copy_to_current_user (NO ipc_state_lock held ✓, NO capability lock held ✓)
+      → frame.set_ok / record_user_fault
+  → global lock released
+```
+
+**Hard constraints satisfied:**
+- `ipc_state_lock` (rank 3): NOT held during `copy_to_current_user` ✓
+- Capability lock (rank 4): NOT held during `copy_to_current_user` ✓
+
+### 54.4 Eligibility matrix (Stage 36 additions to §52 table)
+
+| Scenario | Eligible for split? | Reason |
+|---|---|---|
+| ipc_recv user-ASID plain (no meta, no map) | **YES** (Stage 36) | `UserPlainEligible` |
+| ipc_recv user-ASID + V2 meta | NO | `RecvV2MetaUserCopy` |
+| ipc_recv user-ASID + mapped recv | NO | `UserAsidCopySemantics` (map_intent) |
+| ipc_recv kernel task plain | YES (Stage 33+34) | `KernelPlainEligible` |
+| ipc_recv_timeout (any) | NO | NR5 not in split-dispatch table |
+| recv-v2 (any) | NO | `RecvV2MetaUserCopy` |
+
+### 54.5 Telemetry markers (Stage 36)
+
+- `YARM_RECV_CORE_PLAN plan=UserPlainEligible` — emitted when user-ASID plain recv is shape-eligible
+- `YARM_RECV_CORE_ADAPTER kind=user_plain` — emitted when try_recv_core_user_plain is called
+- `YARM_RECV_CORE_LIVE kind=user_plain` — emitted on successful user-ASID plain delivery
+
+### 54.6 Live vs fallback matrix (cumulative Stage 33+34+35+36)
+
+| Syscall | Receiver type | Path | Stage |
+|---|---|---|---|
+| ipc_recv (NR2) | kernel task, queued plain | LIVE split + canonical core | 33+34 |
+| ipc_recv (NR2) | user-ASID plain (no meta, no map) | **LIVE split + canonical core** | **36** |
+| ipc_recv (NR2) | user-ASID + V2 meta | global-lock | 35 |
+| ipc_recv (NR2) | user-ASID mapped recv | global-lock | 35 |
+| ipc_recv (NR5) | any | global-lock | 35 |

@@ -2160,10 +2160,11 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
     snapshot: &crate::runtime::EndpointRecvCapSnapshot,
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::recv_core::{
-        RecvOutcome, RecvPlan, RecvWritebackPlan, plan_recv_core, try_recv_core_kernel_plain,
+        RecvOutcome, RecvPlan, RecvUserWritebackOutcome, RecvWritebackPlan, execute_user_asid_plain_writeback,
+        plan_recv_core, try_recv_core_kernel_plain, try_recv_core_user_plain,
     };
 
-    // Stage 33: determine receiver class and build the canonical request.
+    // Determine receiver class and build the canonical request.
     let is_kernel_task = matches!(current_task_has_user_asid(kernel), Ok(false));
     let recv_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let request = crate::kernel::recv_core::RecvRequest::from_legacy_ipc_recv(
@@ -2176,34 +2177,40 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
         is_kernel_task,
     );
 
-    // Stage 33: planning pass — check request shape eligibility without
-    // touching IPC state.  User-ASID and recv-v2 fall back here.
-    match plan_recv_core(&request) {
-        RecvPlan::KernelPlainEligible => {}
+    // Planning pass — check request shape eligibility without touching IPC state.
+    let plan = plan_recv_core(&request);
+    crate::yarm_log!("YARM_RECV_CORE_PLAN plan={:?}", plan);
+
+    let endpoint = snapshot.endpoint;
+
+    // Execution pass: dispatch to kernel-plain or user-plain core.
+    // ipc_state_lock (rank 3) is acquired and released inside each core function.
+    let outcome = match plan {
+        RecvPlan::KernelPlainEligible => {
+            crate::yarm_log!("YARM_RECV_CORE_ADAPTER kind=kernel_plain");
+            try_recv_core_kernel_plain(kernel, &request, endpoint)
+        }
+        RecvPlan::UserPlainEligible => {
+            // Stage 36: narrow user-ASID plain recv on the split path.
+            // ipc_state_lock released before execute_user_asid_plain_writeback.
+            crate::yarm_log!("YARM_RECV_CORE_ADAPTER kind=user_plain");
+            try_recv_core_user_plain(kernel, &request, endpoint)
+        }
         RecvPlan::FallbackRequired(reason) => {
             crate::yarm_log!("YARM_RECV_CORE_FALLBACK reason={:?}", reason);
             return None;
         }
-    }
-
-    crate::yarm_log!("YARM_RECV_CORE_ADAPTER kind=legacy");
-
-    // Stage 33: execution pass — IPC-domain dequeue under ipc_state_lock only.
-    // resolve_endpoint_index inside the core revalidates endpoint liveness;
-    // a stale snapshot (generation mismatch / vanished endpoint) returns Error.
-    let endpoint = snapshot.endpoint;
-    let outcome = try_recv_core_kernel_plain(kernel, &request, endpoint);
+    };
 
     match outcome {
         RecvOutcome::Delivered(delivery) => {
-            // Stage 33: apply the kernel-register writeback plan — byte-for-byte
-            // identical to the no-user-ASID branch of
-            // handle_ipc_recv_result_with_empty_error.
             match delivery.writeback {
                 RecvWritebackPlan::KernelRegister {
                     sender_tid,
                     raw_len,
                 } => {
+                    // Kernel-task writeback — byte-for-byte identical to the
+                    // no-user-ASID branch of handle_ipc_recv_result_with_empty_error.
                     if encode_transfer_cap_ret(frame, None).is_err() {
                         return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
                     }
@@ -2216,10 +2223,33 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                     };
                     frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
                     frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
+                    crate::yarm_log!("YARM_RECV_CORE_LIVE kind=kernel_plain");
                 }
-                _ => return None,
+                RecvWritebackPlan::UserMemory { sender_tid, .. } => {
+                    // Stage 36: user-ASID plain writeback.
+                    // ipc_state_lock was released inside try_recv_core_user_plain.
+                    // Capability lock is NOT held here.  Both hard constraints satisfied.
+                    if encode_transfer_cap_ret(frame, None).is_err() {
+                        return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+                    }
+                    match execute_user_asid_plain_writeback(kernel, &delivery) {
+                        RecvUserWritebackOutcome::Ok => {
+                            let payload_len = delivery.msg.as_slice().len();
+                            frame.set_ok(sender_tid, payload_len, frame.ret2());
+                            crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain");
+                        }
+                        RecvUserWritebackOutcome::UndersizedBuffer => {
+                            // Message consumed; matches full-path Err(InvalidArgs) (§54).
+                            return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+                        }
+                        RecvUserWritebackOutcome::CopyFault { user_ptr } => {
+                            // Message consumed; matches full-path record_user_fault+Ok() (§54).
+                            record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
+                            return Some(Ok(()));
+                        }
+                    }
+                }
             }
-            crate::yarm_log!("YARM_RECV_CORE_LIVE kind=kernel_plain");
             Some(Ok(()))
         }
         RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) | RecvOutcome::TimedOut => None,
