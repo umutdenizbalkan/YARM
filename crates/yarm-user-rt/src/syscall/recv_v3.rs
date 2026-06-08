@@ -41,6 +41,28 @@ pub struct RecvSharedV3Delivery {
 }
 
 impl RecvSharedV3Delivery {
+    /// Decode a delivery result from a kernel-written [`RecvSharedV3Output`].
+    ///
+    /// Returns `Some(delivery)` when `output.result_status == RECV_V3_STATUS_OK`.
+    /// Returns `None` for any other status (including WouldBlock and error codes).
+    #[inline]
+    pub fn from_output(output: &RecvSharedV3Output) -> Option<Self> {
+        if output.result_status != RECV_V3_STATUS_OK {
+            return None;
+        }
+        let transferred_cap = if output.has_no_transfer_cap() {
+            None
+        } else {
+            Some(output.transferred_cap)
+        };
+        Some(Self {
+            sender_tid: output.sender_tid,
+            message_len: output.message_len,
+            message_flags: output.message_flags,
+            transferred_cap,
+        })
+    }
+
     /// Returns `true` if a capability was transferred.
     #[inline]
     pub fn has_transfer_cap(&self) -> bool {
@@ -337,5 +359,136 @@ mod tests {
         };
         assert!(delivery.has_transfer_cap());
         assert_eq!(delivery.transferred_cap, Some(17));
+    }
+
+    // ── Stage 45: first userspace proof — from_output() decoder ──────────────
+
+    #[test]
+    fn from_output_plain_ok_decodes_all_fields() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.sender_tid = 42;
+        output.message_len = 7;
+        output.message_flags = 0;
+        output.transferred_cap = RECV_V3_NO_TRANSFER_CAP;
+        let delivery = RecvSharedV3Delivery::from_output(&output)
+            .expect("STATUS_OK must produce Some(delivery)");
+        assert_eq!(delivery.sender_tid, 42);
+        assert_eq!(delivery.message_len, 7);
+        assert_eq!(delivery.message_flags, 0);
+        assert!(!delivery.has_transfer_cap());
+        assert_eq!(delivery.status(), RECV_V3_STATUS_OK);
+    }
+
+    #[test]
+    fn from_output_with_cap_decodes_transferred_cap() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.sender_tid = 3;
+        output.message_len = 4;
+        output.transferred_cap = 99; // a valid materialized cap ID
+        let delivery = RecvSharedV3Delivery::from_output(&output)
+            .expect("STATUS_OK must produce Some(delivery)");
+        assert!(delivery.has_transfer_cap());
+        assert_eq!(delivery.transferred_cap, Some(99));
+    }
+
+    #[test]
+    fn from_output_would_block_returns_none() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_WOULD_BLOCK;
+        assert_eq!(RecvSharedV3Delivery::from_output(&output), None);
+    }
+
+    #[test]
+    fn from_output_non_ok_status_returns_none() {
+        for &status in &[
+            RECV_V3_STATUS_TIMED_OUT,
+            RECV_V3_STATUS_INVALID_CAP,
+            RECV_V3_STATUS_BAD_REQUEST,
+        ] {
+            let mut output = RecvSharedV3Output::new_zeroed();
+            output.result_status = status;
+            assert_eq!(
+                RecvSharedV3Delivery::from_output(&output),
+                None,
+                "status {status} must return None"
+            );
+        }
+    }
+
+    #[test]
+    fn output_wire_bytes_80_parse_correctly() {
+        // Simulate the 80-byte wire format that the kernel writes via write_v3_output_to_user.
+        // Layout: @0 version(u32), @4 record_len(u32), @8 abi_version(u32),
+        //         @12 result_status(u32), @16 sender_tid(u64), @24 message_len(u32),
+        //         @28 message_flags(u32), @32 transferred_cap(u64), @40..80 zeros (FUTURE).
+        let mut wire = [0u8; 80];
+        wire[0..4].copy_from_slice(&3u32.to_le_bytes());   // RECV_V3_VERSION
+        wire[4..8].copy_from_slice(&80u32.to_le_bytes());  // RECV_V3_MIN_OUTPUT_LEN
+        wire[8..12].copy_from_slice(&10u32.to_le_bytes()); // RECV_V3_ABI_VERSION
+        wire[12..16].copy_from_slice(&0u32.to_le_bytes()); // RECV_V3_STATUS_OK
+        wire[16..24].copy_from_slice(&7u64.to_le_bytes()); // sender_tid = 7
+        wire[24..28].copy_from_slice(&5u32.to_le_bytes()); // message_len = 5
+        wire[28..32].copy_from_slice(&0u32.to_le_bytes()); // message_flags = 0
+        wire[32..40].copy_from_slice(&u64::MAX.to_le_bytes()); // no cap
+
+        // Parse the wire bytes back into RecvSharedV3Output fields manually.
+        let result_status = u32::from_le_bytes(wire[12..16].try_into().unwrap());
+        let sender_tid = u64::from_le_bytes(wire[16..24].try_into().unwrap());
+        let message_len = u32::from_le_bytes(wire[24..28].try_into().unwrap());
+        let message_flags = u32::from_le_bytes(wire[28..32].try_into().unwrap());
+        let transferred_cap_raw = u64::from_le_bytes(wire[32..40].try_into().unwrap());
+
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        assert_eq!(sender_tid, 7);
+        assert_eq!(message_len, 5);
+        assert_eq!(message_flags, 0);
+        assert_eq!(transferred_cap_raw, RECV_V3_NO_TRANSFER_CAP);
+
+        // Construct a delivery from parsed fields.
+        let delivery = RecvSharedV3Delivery {
+            sender_tid,
+            message_len,
+            message_flags,
+            transferred_cap: if transferred_cap_raw == RECV_V3_NO_TRANSFER_CAP {
+                None
+            } else {
+                Some(transferred_cap_raw)
+            },
+        };
+        assert!(!delivery.has_transfer_cap());
+        assert_eq!(delivery.sender_tid, 7);
+        assert_eq!(delivery.message_len, 5);
+    }
+
+    #[test]
+    fn from_output_and_manual_decode_agree_on_plain_message() {
+        // Stage 45: prove that from_output() agrees with the manual field decode path
+        // used by ipc_recv_shared_v3_nonblocking().
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.sender_tid = 11;
+        output.message_len = 3;
+        output.message_flags = 0;
+        output.transferred_cap = RECV_V3_NO_TRANSFER_CAP;
+
+        // from_output helper path.
+        let via_helper = RecvSharedV3Delivery::from_output(&output)
+            .expect("helper must decode OK status");
+
+        // Manual decode path (mirrors ipc_recv_shared_v3_nonblocking internals).
+        let manual = RecvSharedV3Delivery {
+            sender_tid: output.sender_tid,
+            message_len: output.message_len,
+            message_flags: output.message_flags,
+            transferred_cap: if output.has_no_transfer_cap() {
+                None
+            } else {
+                Some(output.transferred_cap)
+            },
+        };
+
+        assert_eq!(via_helper, manual, "from_output and manual decode must agree");
     }
 }

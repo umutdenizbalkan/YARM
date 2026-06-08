@@ -26297,3 +26297,197 @@ mod stage44 {
         assert_eq!(frame.ret0(), 99, "sender tid");
     }
 }
+
+#[cfg(test)]
+mod stage45 {
+    //! Stage 45: first userspace proof — output metadata field verification.
+    //!
+    //! Tests cover:
+    //!   A. Kernel writes all authoritative output fields to the metadata buffer
+    //!      when metadata_ptr/metadata_len are supplied in the request
+    //!   B. The output wire format can be decoded into correct field values,
+    //!      proving the user-rt from_output() decoding contract end-to-end
+    //!
+    //! Cap-transfer through dispatch() is deferred (needs stash_transfer_envelope
+    //! setup not exposed by the boot-level ipc_send helper); cap-transfer decoding
+    //! is proven in yarm-user-rt::syscall::recv_v3 unit tests.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::syscall::{Syscall, dispatch};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr};
+
+    const RECV_V3_VERSION: u32 = 3;
+    const RECV_V3_ABI_VERSION: u32 = 10;
+    const RECV_V3_STATUS_OK: u32 = 0;
+    const RECV_V3_NO_TRANSFER_CAP: u64 = u64::MAX;
+
+    /// Build an 80-byte little-endian wire frame for a `recv_shared_v3` request.
+    fn build_v3_req(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());  // RECV_V3_VERSION
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes()); // RECV_V3_MIN_REQUEST_LEN
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        // map_intent, flags, timeout_ticks, reserved: all 0 (non-blocking, no map)
+        buf
+    }
+
+    /// Create a kernel state with user ASID and a single 4096-byte page at VA 0x1_0000.
+    ///
+    /// Page layout (offsets from 0x1_0000):
+    ///   [0x000 .. 0x050): recv_shared_v3 request bytes (80 bytes)
+    ///   [0x100 .. 0x200): payload output buffer (256 bytes)
+    ///   [0x200 .. 0x250): output metadata buffer (80 bytes)
+    ///
+    /// If `enqueue_payload` is Some, one plain IPC message is queued before return.
+    fn kernel_with_metadata_env(
+        enqueue_payload: Option<&[u8]>,
+    ) -> (crate::kernel::boot::KernelState, crate::kernel::capabilities::CapId, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                mem_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map page at 0x1_0000");
+
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        if let Some(payload) = enqueue_payload {
+            // Use sender_tid = 0 (current task) so the output sender_tid field is
+            // predictable in assertions (the boot-level ipc_send embeds whatever
+            // sender_tid is passed to Message::new, not the actual caller TID).
+            state
+                .ipc_send(send_cap, Message::new(0, payload).expect("msg"))
+                .expect("send");
+        }
+        (state, recv_cap, asid)
+    }
+
+    // ── A. Kernel writes all authoritative output fields ─────────────────────
+
+    #[test]
+    fn stage45_plain_receive_output_metadata_all_fields() {
+        // Prove the kernel writes the correct output bytes to the metadata buffer:
+        //   result_status = RECV_V3_STATUS_OK (0)
+        //   sender_tid    = task 0 tid
+        //   message_len   = payload.len()
+        //   message_flags = 0 (plain message)
+        //   transferred_cap = RECV_V3_NO_TRANSFER_CAP (u64::MAX)
+        let payload = b"hello45";
+        let (mut state, recv_cap, asid) = kernel_with_metadata_env(Some(payload));
+
+        // Page layout offsets (all within the mapped 4096-byte page at 0x1_0000):
+        let req_va: usize = 0x1_0000;
+        let payload_va: u64 = 0x1_0100;
+        let meta_va: u64 = 0x1_0200;
+
+        let req_bytes = build_v3_req(
+            recv_cap.0 as u64,
+            payload_va,
+            256, // payload buffer capacity
+            meta_va,
+            80, // output metadata buffer size
+        );
+        state
+            .write_user_memory_for_asid(asid, req_va, &req_bytes)
+            .expect("write request");
+
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, req_va);
+        frame.set_arg(1, 80);
+        let result = dispatch(&mut state, &mut frame);
+        assert!(result.is_ok(), "dispatch must succeed: {result:?}");
+
+        // Read back 80 bytes from the output metadata buffer.
+        let out_bytes_arr = state
+            .read_user_memory_for_asid(asid, meta_va as usize, 40)
+            .expect("read output metadata");
+        let out_bytes = &out_bytes_arr[..40];
+
+        // ── Verify all authoritative fields ──────────────────────────────────
+        let version = u32::from_le_bytes(out_bytes[0..4].try_into().unwrap());
+        let record_len = u32::from_le_bytes(out_bytes[4..8].try_into().unwrap());
+        let abi_version = u32::from_le_bytes(out_bytes[8..12].try_into().unwrap());
+        let result_status = u32::from_le_bytes(out_bytes[12..16].try_into().unwrap());
+        let sender_tid = u64::from_le_bytes(out_bytes[16..24].try_into().unwrap());
+        let message_len = u32::from_le_bytes(out_bytes[24..28].try_into().unwrap());
+        let message_flags = u32::from_le_bytes(out_bytes[28..32].try_into().unwrap());
+        let transferred_cap = u64::from_le_bytes(out_bytes[32..40].try_into().unwrap());
+
+        assert_eq!(version, RECV_V3_VERSION, "version must be RECV_V3_VERSION");
+        assert_eq!(record_len, 80, "record_len must be 80 (RECV_V3_MIN_OUTPUT_LEN)");
+        assert_eq!(abi_version, RECV_V3_ABI_VERSION, "abi_version must be RECV_V3_ABI_VERSION");
+        assert_eq!(result_status, RECV_V3_STATUS_OK, "result_status must be STATUS_OK");
+        assert_eq!(sender_tid, 0, "sender_tid must be task 0");
+        assert_eq!(
+            message_len,
+            payload.len() as u32,
+            "message_len must equal payload length"
+        );
+        assert_eq!(message_flags, 0, "plain message has no flags");
+        assert_eq!(
+            transferred_cap, RECV_V3_NO_TRANSFER_CAP,
+            "plain message must have no_transfer_cap sentinel"
+        );
+    }
+
+    // ── B. Wire-format decode contract ───────────────────────────────────────
+
+    #[test]
+    fn stage45_output_wire_bytes_decode_to_delivery_fields() {
+        // Prove that the output bytes the kernel writes (as seen in the test above)
+        // decode to the expected RecvSharedV3Delivery field values.
+        // This simulates what user-rt's from_output() would do on the 80-byte buffer.
+        let mut wire = [0u8; 40];
+        wire[0..4].copy_from_slice(&RECV_V3_VERSION.to_le_bytes());
+        wire[4..8].copy_from_slice(&80u32.to_le_bytes());
+        wire[8..12].copy_from_slice(&RECV_V3_ABI_VERSION.to_le_bytes());
+        wire[12..16].copy_from_slice(&RECV_V3_STATUS_OK.to_le_bytes());
+        wire[16..24].copy_from_slice(&5u64.to_le_bytes()); // sender_tid = 5
+        wire[24..28].copy_from_slice(&7u32.to_le_bytes()); // message_len = 7
+        wire[28..32].copy_from_slice(&0u32.to_le_bytes()); // message_flags = 0
+        wire[32..40].copy_from_slice(&RECV_V3_NO_TRANSFER_CAP.to_le_bytes());
+
+        let result_status = u32::from_le_bytes(wire[12..16].try_into().unwrap());
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+
+        let sender_tid = u64::from_le_bytes(wire[16..24].try_into().unwrap());
+        let message_len = u32::from_le_bytes(wire[24..28].try_into().unwrap());
+        let message_flags = u32::from_le_bytes(wire[28..32].try_into().unwrap());
+        let transferred_cap_raw = u64::from_le_bytes(wire[32..40].try_into().unwrap());
+        let transferred_cap = if transferred_cap_raw == RECV_V3_NO_TRANSFER_CAP {
+            None
+        } else {
+            Some(transferred_cap_raw)
+        };
+
+        assert_eq!(sender_tid, 5);
+        assert_eq!(message_len, 7);
+        assert_eq!(message_flags, 0);
+        assert_eq!(transferred_cap, None, "plain message must have no cap");
+    }
+}

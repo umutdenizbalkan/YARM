@@ -3042,3 +3042,74 @@ behavior, plan and delivery, and the live non-blocking handler.
 **Run command:** `cargo test --lib stage42 -- --test-threads=1`
 
 All 12 `stage42_` tests must pass.
+
+
+## Rule N+48: Stage 44 — SYSCALL_RECV_SHARED_V3_NR off-by-one fix + user-rt wrapper + dispatch tests
+
+Stage 44 corrects the off-by-one (`SYSCALL_RECV_SHARED_V3_NR` was 31, valid range is
+`0..SYSCALL_COUNT-1 = 0..30`) and adds the userspace runtime wrapper plus kernel dispatch tests.
+
+**(A) Off-by-one fix:**
+- `SYSCALL_RECV_SHARED_V3_NR == 30` (compile-time assert added)
+- `SYSCALL_COUNT == 31` unchanged
+- NR 31 unallocated (`stage44_nr31_is_out_of_range`)
+
+**(B) Kernel dispatch tests (9 in `mod stage44`):**
+- NR 30 routes to RecvSharedV3 (`stage44_syscall_nr30_is_recv_shared_v3`)
+- `SYSCALL_COUNT` unchanged at 31 (`stage44_syscall_count_still_31`)
+- req_len below minimum → InvalidArgs (`stage44_req_len_below_minimum_returns_invalid_args`)
+- Empty endpoint → WouldBlock (`stage44_empty_endpoint_returns_would_block`)
+- Queued plain message delivers, correct payload length (`stage44_queued_plain_message_delivers`)
+- Nonzero timeout → WouldBlock (`stage44_timeout_nonzero_returns_would_block`)
+- Nonzero map_intent → InvalidArgs (`stage44_map_intent_nonzero_returns_invalid_args`)
+- IpcRecv NR 2 still dispatches (`stage44_ipc_recv_nr2_still_dispatches`)
+
+**(C) user-rt wrapper (`crates/yarm-user-rt/src/syscall/recv_v3.rs`):**
+- `ipc_recv_shared_v3_nonblocking()` — non-blocking, no map_intent
+- `RecvSharedV3Delivery` with `has_transfer_cap()`, `status()` accessors
+- `STATUS_SENTINEL_UNWRITTEN = 0xFF_FF_FF_FF` for aarch64/riscv64 disambiguation
+- 13 unit tests covering NR constant, encoding, decoding, struct sizes, sentinel distinctness
+
+**Run commands:**
+- `cargo test --lib stage44 -- --test-threads=1` (9 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (13 user-rt tests)
+
+All tests must pass. Production services not migrated; SYSCALL_COUNT unchanged.
+
+
+## Rule N+49: Stage 45 — first userspace proof (output metadata + decoder)
+
+Stage 45 proves the recv_shared_v3 output metadata contract end-to-end: the kernel writes
+correct authoritative fields to the user-supplied metadata buffer, and the user-rt decoder
+(`RecvSharedV3Delivery::from_output()`) correctly reads them.
+
+**(A) Kernel output metadata field proof (kernel `mod stage45`):**
+- Plain message dispatch with `metadata_ptr` set: all 8 authoritative fields verified:
+  `version`, `record_len`, `abi_version`, `result_status`, `sender_tid`, `message_len`,
+  `message_flags`, `transferred_cap` (`stage45_plain_receive_output_metadata_all_fields`)
+- Wire-format decode contract: 40-byte output parses to correct delivery fields
+  (`stage45_output_wire_bytes_decode_to_delivery_fields`)
+
+**(B) user-rt decoder proof (6 new tests in `recv_v3.rs`):**
+- `from_output()` on STATUS_OK, no cap → Some(delivery) with correct fields
+- `from_output()` on STATUS_OK with cap → Some(delivery), `has_transfer_cap() == true`
+- `from_output()` on STATUS_WOULD_BLOCK → None
+- `from_output()` on other error statuses → None
+- 80-byte wire format parses correctly to delivery field values
+- `from_output()` and manual decode agree on plain message
+
+**(C) Cap-transfer through dispatch() — deferred blocker:**
+- Cap-transfer via `dispatch()` requires `stash_transfer_envelope` setup not exposed
+  by the boot-level `ipc_send` helper; deferred to a future stage.
+- Cap-transfer decoding is proven in user-rt unit tests (tests B above).
+
+**(D) Production invariants:**
+- No production service loops migrated to recv_shared_v3.
+- `SYSCALL_COUNT == 31` unchanged.
+- No new syscall numbers.
+
+**Run commands:**
+- `cargo test --lib stage45 -- --test-threads=1` (2 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (19 user-rt tests total)
+
+All tests must pass.

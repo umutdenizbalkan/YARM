@@ -10499,3 +10499,52 @@ All three `try_recv_core_*` functions populate `RecvDelivery.cap_transfer` via `
 - Old NR2 (`ipc_recv` / recv-v2 / recv-timeout) ABI: unchanged; split path behavior identical to pre-stage-42 for all non-cap-transfer messages.
 - `FallbackReason::CapTransfer`: retained for external callers and the sender-waiter-with-cap-transfer case (still produces `SenderWaiterWake` fallback, deferred).
 - `#[repr(C)]` applied to `RecvSharedV3Request` and `RecvSharedV3Output` in `yarm-ipc-abi` to lock wire layout.
+
+
+## §59 Stage 44+45: user-rt wrapper and first userspace proof
+
+### 59.1 Stage 44 corrections
+
+- `SYSCALL_RECV_SHARED_V3_NR` was 31 in the Stage 42+43 commit; corrected to 30.
+  The exhaustive whitelist loop `for nr in 0..SYSCALL_COUNT` only covers 0..=30,
+  so NR 31 would never have been tested or dispatched.
+- compile-time assert `assert!(SYSCALL_RECV_SHARED_V3_NR < SYSCALL_COUNT)` added.
+- 9 hosted-dev dispatch tests added (`mod stage44`) covering WouldBlock, deliver, field guards.
+
+### 59.2 Stage 45 output metadata contract
+
+Stage 45 proves the kernel writes correct authoritative fields to the user-supplied
+`metadata_ptr` buffer:
+
+```
+@0  version (u32)         = RECV_V3_VERSION (3)
+@4  record_len (u32)      = 80 (RECV_V3_MIN_OUTPUT_LEN)
+@8  abi_version (u32)     = RECV_V3_ABI_VERSION (10)
+@12 result_status (u32)   = 0 (OK) or 1 (WouldBlock)
+@16 sender_tid (u64)      = authoritative sender thread ID
+@24 message_len (u32)     = authoritative payload byte count
+@28 message_flags (u32)   = raw message flags
+@32 transferred_cap (u64) = local cap ID or u64::MAX (RECV_V3_NO_TRANSFER_CAP)
+@40 ... (80 bytes total)  = zeros (FUTURE fields in Stage 42+43)
+```
+
+### 59.3 user-rt decoder (`RecvSharedV3Delivery::from_output`)
+
+- `from_output(&RecvSharedV3Output)` added to decode the kernel-written buffer.
+- Returns `Some(delivery)` only when `result_status == RECV_V3_STATUS_OK`.
+- Returns `None` for any other status (WouldBlock, timed-out, etc.).
+- `transferred_cap` field: `None` when `output.transferred_cap == RECV_V3_NO_TRANSFER_CAP`.
+
+### 59.4 Cap-transfer blocker
+
+Cap-transfer proof through `dispatch()` in hosted-dev requires `stash_transfer_envelope`
+to be set up before `ipc_send`. The boot-level `ipc_send` helper does NOT set up the
+envelope (that is done by the syscall handler path in `handle_ipc_send`). The decoder
+contract (from_output with a non-sentinel `transferred_cap`) is proven in user-rt unit
+tests; the full kernel-dispatch cap-transfer proof is deferred to a future stage.
+
+### 59.5 Production isolation
+
+- No production service loop uses recv_shared_v3.
+- No new syscall numbers. `SYSCALL_COUNT == 31` unchanged.
+- Blocking, map_intent, and object metadata remain disabled.
