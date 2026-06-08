@@ -4,7 +4,7 @@
 
 - ABI Version: `10`
 - Public syscall count: `16` (`0..=15`)
-- Kernel dispatch table count: `30` (`SYSCALL_COUNT`, slots `0..=29`)
+- Kernel dispatch table count: `31` (`SYSCALL_COUNT`, slots `0..=30`)
 
 ## Public ABI v10 syscall numbers
 
@@ -75,7 +75,8 @@ Status terms used by this matrix:
 | `27` | `InitramfsReadChunk` | privileged extension | SystemServer only | Phase 2A/2B bootstrap bridge; not part of public v10 count. |
 | `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v10 count. |
 | `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v10 count. |
-| `30+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 30`; not dispatched. |
+| `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 31); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
+| `31+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 31`; not dispatched. |
 
 ## ABI versioning and deprecation policy
 
@@ -124,14 +125,15 @@ They are not reserved gaps and are covered by the public ABI v10 matrix above.
   numbers with `InvalidNumber`.
 - `25`: reserved/unassigned in ABI v10. `Syscall::decode` rejects this number
   with `InvalidNumber`.
-- `30+`: outside the current kernel dispatch table and rejected with
+- `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 31).
+- `31+`: outside the current kernel dispatch table and rejected with
   `InvalidNumber`.
 
 ## Privileged kernel extensions
 
-The kernel currently declares `SYSCALL_COUNT = 30`, so dispatch-table slots
-`0..=29` are in range. This is deliberately a different concept from the
-public ABI count above: slots `23`, `24`, `26`, `27`, `28`, and `29` are
+The kernel currently declares `SYSCALL_COUNT = 31`, so dispatch-table slots
+`0..=30` are in range. This is deliberately a different concept from the
+public ABI count above: slots `23`, `24`, `26`, `27`, `28`, `29`, and `30` are
 non-public kernel extensions used by PM, SystemServer, and bootstrap service
 plumbing. They are documented here so integrators can distinguish reserved
 holes from implemented privileged paths.
@@ -144,6 +146,7 @@ holes from implemented privileged paths.
 | `27` | `InitramfsReadChunk` | SystemServer-only Phase 2A/2B bootstrap bridge. Non-`TaskClass::SystemServer` callers receive `MissingRight`. `arg5` target writes are limited to `0` (self) or PM TID `3`; other targets receive `MissingRight`. | `arg0=name_ptr`, `arg1=name_len`, `arg2=offset`, `arg3=dst_ptr`, `arg4=max_len` (clamped to `4096`), `arg5=target_tid` (`0` self, `3` PM). | On success, `ret0=0`, `ret1=bytes_copied`, `ret2=0`. EOF returns success with `ret1=0`. | Non-SystemServer or invalid target receives `MissingRight`; invalid names/pointers/UTF-8/initrd access return errors; file-not-found returns `Internal` rather than EOF. | Phase 2A/2B bootstrap bridge notes below |
 | `28` | `CreateInitramfsFileSliceMo` | SystemServer-only (`initramfs_srv`) Phase 3A bridge. Non-`TaskClass::SystemServer` callers receive `MissingRight`. | `arg0=name_ptr`, `arg1=name_len`, `arg2=flags` (reserved, must be `0`), `arg3..arg5` reserved/unused. | On success, `ret0=0`, `ret1=cap_id`, `ret2=file_len`. | Non-SystemServer receives `MissingRight`; empty/overlong names, nonzero flags, invalid user memory/UTF-8, missing/empty files, bounds failures, or MemoryObject/capability allocation failures return errors. | MemoryObject-backed initramfs spawn path |
 | `29` | `SpawnFromMemoryObject` | PM-only Phase 3A zero-copy spawn path. Caller TID must be PM bootstrap TID `3`; other callers receive `MissingRight`. | `arg0=image_id`, `arg1=mo_cap`, `arg2=parent_pid`, `arg3=startup_args_ptr`, `arg4=startup_args_count`, `arg5` reserved/unused. | On success, `ret0=0`, `ret1=spawned_tid`, `ret2=service send cap` or packed spawner/parent send caps. | Non-PM callers receive `MissingRight`; invalid caps, wrong object type/kind, invalid initrd slice bounds, malformed ELF/startup args, or spawn/load/capacity failures return errors. | Phase 3A MemoryObject zero-copy spawn path |
+| `30` | `RecvSharedV3` | Any user task with a RECEIVE-right capability. No class/TID gate. | `arg0=req_ptr` (ptr to `RecvSharedV3Request`, ≥64 bytes), `arg1=req_len`. Output written to `metadata_ptr` field inside the request struct. `timeout_ticks` must be 0 (non-blocking only); `map_intent` must be 0. | On success (message delivered): `ret0=V3_STATUS_OK(0)`, `ret1=sender_tid`, `ret2=0`; `RecvSharedV3Output` (80 bytes) written to `metadata_ptr`: `version=3`, `record_len=80`, `abi_version=10`, `result_status`, `sender_tid`, `message_len`, `message_flags`, `transferred_cap` (cap ID or `RECV_V3_NO_TRANSFER_CAP`). FUTURE fields (`object_kind`, `object_generation`, `effective_rights`, `exact_object_size`) are 0. | `req_len < 64` → `InvalidArgs`; `timeout_ticks != 0` → `WouldBlock`; `map_intent != 0` → `InvalidArgs`; invalid/wrong-type cap → `WrongObject`/`InvalidCapability`; empty queue → `WouldBlock`; cap materialization failure → `InvalidCapability`; user-copy fault to `metadata_ptr` → silent `Ok()` (dequeue-before-copy semantics); payload buffer undersized → `InvalidArgs` + cap rollback. See `KERNEL_LOCKING.md §58`. | Stage 42+43 non-blocking recv_shared_v3 |
 
 ## Syscalls `9..14` status
 

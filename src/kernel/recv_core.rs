@@ -62,7 +62,7 @@
 
 use super::boot::{IpcEndpointRecvResult, IpcEndpointSplitRejectReason, KernelError, KernelState};
 use super::capabilities::{CapId, CapObject};
-use super::ipc::Message;
+use super::ipc::{Message, ThreadId};
 
 /// Minimum metadata buffer length for a recv-v2 request.
 ///
@@ -410,6 +410,25 @@ impl RecvRequest {
 
 // ─── Outcome model ────────────────────────────────────────────────────────────
 
+/// Pending capability materialization for a cap-transfer or reply-cap message
+/// dequeued on the split path.
+///
+/// Produced by [`try_recv_core_user_plain`], [`try_recv_core_user_plain_v2`], and
+/// [`try_recv_core_kernel_plain`] when the dequeued message has
+/// `FLAG_CAP_TRANSFER`, `FLAG_CAP_TRANSFER_PLAIN`, or `FLAG_REPLY_CAP` set.
+///
+/// The caller in `syscall.rs` must call `materialize_received_message_cap` using
+/// this plan BEFORE executing the user-space writeback.  If the writeback
+/// subsequently fails, the caller must call `rollback_materialized_recv_cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvCapTransferPlan {
+    /// Raw transfer envelope handle from `msg.transferred_cap()`.
+    pub raw_handle: u64,
+    /// True when `FLAG_REPLY_CAP` is set (direct-mint path); false for
+    /// `FLAG_CAP_TRANSFER` / `FLAG_CAP_TRANSFER_PLAIN` (delegation path).
+    pub is_reply_cap: bool,
+}
+
 /// Why the canonical receive engine delegated to the global-lock full path.
 ///
 /// This enum is part of the documented copy-failure semantics table in
@@ -428,19 +447,13 @@ pub enum FallbackReason {
     RecvV2MetaUserCopy,
     /// Timeout/deadline path requires scheduler interaction.
     TimeoutScheduler,
-    /// Message at queue head has cap-transfer or reply-cap flags
-    /// (`FLAG_CAP_TRANSFER`, `FLAG_CAP_TRANSFER_PLAIN`, or `FLAG_REPLY_CAP`).
-    /// The split path does not perform cap materialization (`take_transfer_envelope`
-    /// + cnode lock + `grant_task_to_task_with_rights` / `mint_capability_in_cnode`).
-    ///
-    /// **Rollback blocker:** for recv-v2 or undersized-buffer failures, the full
-    /// path rolls back the already-materialized cap via `rollback_materialized_recv_cap`
-    /// (requires re-taking capability lock rank 4 after the failed copy).  Proving
-    /// exact rollback semantics on the split path is deferred to a future stage.
-    ///
-    /// **Message not dequeued:** [`ipc_try_recv_queued_plain_endpoint_only`] rejects
-    /// cap-flagged messages before dequeuing; the message stays in queue for the
-    /// global-lock full path.
+    /// Reserved — cap-transfer on the split path is now handled by
+    /// [`try_recv_core_user_plain`] / [`try_recv_core_user_plain_v2`] /
+    /// [`try_recv_core_kernel_plain`] using [`RecvCapTransferPlan`] in the
+    /// delivery.  This variant is no longer produced by those functions in
+    /// Stage 42+43.  It is kept for external callers that may still distinguish
+    /// the reason, and for the sender-waiter-with-cap-transfer fallback case
+    /// (deferred to a future stage).
     CapTransfer,
     /// Sender-waiter present but split-unsafe: either the sender-waiter's message
     /// carries cap-transfer / reply-cap flags (requires capability materialization
@@ -516,6 +529,10 @@ pub struct RecvDelivery {
     pub writeback: RecvWritebackPlan,
     /// Deferred sender wake to apply after all locks release.
     pub scheduler: RecvSchedulerWakePlan,
+    /// Stage 42+43: if `Some`, the caller must call `materialize_received_message_cap`
+    /// BEFORE the writeback, then `rollback_materialized_recv_cap` on writeback
+    /// failure (meta fault or undersized payload).
+    pub cap_transfer: Option<RecvCapTransferPlan>,
 }
 
 /// Outcome of a `try_recv_core_kernel_plain` call.
@@ -535,6 +552,19 @@ pub enum RecvOutcome {
     FallbackRequired(FallbackReason),
     /// Domain error identical to what the global-lock path would return.
     Error(KernelError),
+}
+
+// ─── Cap-transfer plan helper ─────────────────────────────────────────────────
+
+/// Extract a [`RecvCapTransferPlan`] from a dequeued message, if applicable.
+///
+/// Returns `Some` if the message has `FLAG_REPLY_CAP`, `FLAG_CAP_TRANSFER`, or
+/// `FLAG_CAP_TRANSFER_PLAIN` AND `transferred_cap()` is `Some`. Returns `None`
+/// for plain (unflagged) messages.
+fn extract_cap_transfer_plan(msg: &Message) -> Option<RecvCapTransferPlan> {
+    let raw_handle = msg.transferred_cap()?.0;
+    let is_reply_cap = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
+    Some(RecvCapTransferPlan { raw_handle, is_reply_cap })
 }
 
 // ─── Core planning ────────────────────────────────────────────────────────────
@@ -659,7 +689,9 @@ pub(crate) fn try_recv_core_kernel_plain(
         Err(e) => return RecvOutcome::Error(e),
     };
 
-    match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
+    // Stage 42+43: use cap-transfer–aware dequeue; cap materialization is deferred
+    // to the caller via RecvCapTransferPlan in the delivery.
+    match kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx) {
         IpcEndpointRecvResult::Received(msg) => {
             kernel.note_endpoint_only_queued_recv_split();
             let sender_tid = match usize::try_from(msg.sender_tid.0) {
@@ -667,6 +699,7 @@ pub(crate) fn try_recv_core_kernel_plain(
                 Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
             };
             let raw_len = msg.as_slice().len();
+            let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
                 writeback: RecvWritebackPlan::KernelRegister {
                     sender_tid,
@@ -674,20 +707,22 @@ pub(crate) fn try_recv_core_kernel_plain(
                 },
                 scheduler: RecvSchedulerWakePlan::None,
                 msg,
+                cap_transfer,
             })
         }
 
         IpcEndpointRecvResult::ReceivedWithSenderWake(msg, wake_tid) => {
             // Stage 38+39: plain sender-waiter refill — deliver original message
             // to receiver and carry deferred wake in RecvSchedulerWakePlan::WakeSender.
-            // The caller applies apply_split_sender_wake_plan(wake_tid) BEFORE the
-            // writeback, matching the full-path order (§56).
+            // Stage 42+43: cap_transfer populated for cap-flagged messages; the
+            // sender's refill was validated to be plain (§58).
             kernel.note_endpoint_only_queued_recv_split();
             let sender_tid = match usize::try_from(msg.sender_tid.0) {
                 Ok(s) => s,
                 Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
             };
             let raw_len = msg.as_slice().len();
+            let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
                 writeback: RecvWritebackPlan::KernelRegister {
                     sender_tid,
@@ -695,15 +730,13 @@ pub(crate) fn try_recv_core_kernel_plain(
                 },
                 scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
                 msg,
+                cap_transfer,
             })
         }
 
         IpcEndpointRecvResult::Ineligible(reason) => match reason {
             IpcEndpointSplitRejectReason::EmptyQueue
             | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
-            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage => {
-                RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)
-            }
             IpcEndpointSplitRejectReason::SenderWaiterPresent => {
                 RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
             }
@@ -761,7 +794,9 @@ pub(crate) fn try_recv_core_user_plain(
         Err(e) => return RecvOutcome::Error(e),
     };
 
-    match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
+    // Stage 42+43: use cap-transfer–aware dequeue; cap materialization is deferred
+    // to the caller via RecvCapTransferPlan in the delivery.
+    match kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx) {
         IpcEndpointRecvResult::Received(msg) => {
             kernel.note_endpoint_only_queued_recv_split();
             let sender_tid = match usize::try_from(msg.sender_tid.0) {
@@ -770,9 +805,9 @@ pub(crate) fn try_recv_core_user_plain(
             };
             let (ptr, user_buf_len) = match request.payload_target {
                 RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
-                // Unreachable: plan_recv_core guarantees UserMemory here.
                 _ => unreachable!("try_recv_core_user_plain: non-UserMemory payload_target"),
             };
+            let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
                 writeback: RecvWritebackPlan::UserMemory {
                     ptr,
@@ -781,6 +816,7 @@ pub(crate) fn try_recv_core_user_plain(
                 },
                 scheduler: RecvSchedulerWakePlan::None,
                 msg,
+                cap_transfer,
             })
         }
 
@@ -794,6 +830,7 @@ pub(crate) fn try_recv_core_user_plain(
                 RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
                 _ => unreachable!("try_recv_core_user_plain: ReceivedWithSenderWake: non-UserMemory payload_target"),
             };
+            let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
                 writeback: RecvWritebackPlan::UserMemory {
                     ptr,
@@ -802,15 +839,13 @@ pub(crate) fn try_recv_core_user_plain(
                 },
                 scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
                 msg,
+                cap_transfer,
             })
         }
 
         IpcEndpointRecvResult::Ineligible(reason) => match reason {
             IpcEndpointSplitRejectReason::EmptyQueue
             | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
-            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage => {
-                RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)
-            }
             IpcEndpointSplitRejectReason::SenderWaiterPresent => {
                 RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
             }
@@ -908,7 +943,9 @@ pub(crate) fn try_recv_core_user_plain_v2(
         Err(e) => return RecvOutcome::Error(e),
     };
 
-    match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
+    // Stage 42+43: use cap-transfer–aware dequeue; cap materialization is deferred
+    // to the caller via RecvCapTransferPlan in the delivery.
+    match kernel.ipc_try_recv_queued_with_cap_transfer(endpoint_idx) {
         IpcEndpointRecvResult::Received(msg) => {
             kernel.note_endpoint_only_queued_recv_split();
             let sender_tid = match usize::try_from(msg.sender_tid.0) {
@@ -923,6 +960,7 @@ pub(crate) fn try_recv_core_user_plain_v2(
                 RecvMetaTarget::V2 { ptr, len } => (ptr, len),
                 _ => unreachable!("try_recv_core_user_plain_v2: non-V2 meta_target"),
             };
+            let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
                 writeback: RecvWritebackPlan::UserMemoryV2 {
                     ptr,
@@ -933,6 +971,7 @@ pub(crate) fn try_recv_core_user_plain_v2(
                 },
                 scheduler: RecvSchedulerWakePlan::None,
                 msg,
+                cap_transfer,
             })
         }
 
@@ -950,6 +989,7 @@ pub(crate) fn try_recv_core_user_plain_v2(
                 RecvMetaTarget::V2 { ptr, len } => (ptr, len),
                 _ => unreachable!("try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-V2 meta_target"),
             };
+            let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
                 writeback: RecvWritebackPlan::UserMemoryV2 {
                     ptr,
@@ -960,15 +1000,13 @@ pub(crate) fn try_recv_core_user_plain_v2(
                 },
                 scheduler: RecvSchedulerWakePlan::WakeSender(wake_tid),
                 msg,
+                cap_transfer,
             })
         }
 
         IpcEndpointRecvResult::Ineligible(reason) => match reason {
             IpcEndpointSplitRejectReason::EmptyQueue
             | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
-            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage => {
-                RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)
-            }
             IpcEndpointSplitRejectReason::SenderWaiterPresent => {
                 RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
             }

@@ -3008,3 +3008,37 @@ syscall dispatch.  `SYSCALL_COUNT` must remain 30.
 **Run command:** `cargo test --lib stage40 -- --test-threads=1`
 
 All 31 `stage40_` tests must pass.
+
+
+## Rule N+47: Stage 42+43 — cap-transfer split path + live recv_shared_v3 dispatch (NR 31)
+
+Stage 42+43 proves cap-transfer materialization on the split path and wires syscall NR 31
+(`recv_shared_v3`). Tests must cover: syscall number allocation, cap-transfer dequeue
+behavior, plan and delivery, and the live non-blocking handler.
+
+**(A) Syscall ABI invariants:**
+- `SYSCALL_COUNT == 31` (`stage42_syscall_count_is_31`)
+- `SYSCALL_RECV_SHARED_V3_NR == 31` (`stage42_recv_shared_v3_nr_is_31`)
+- `RecvSharedV3` decodes from NR 31 (`stage42_recv_shared_v3_decodes_from_31`)
+- `VARIANT_COUNT == 23` (`stage42_variant_count_is_23`)
+- NR 30 slot is unoccupied (`stage42_no_unused_syscall_number_30`)
+
+**(B) Cap-transfer dequeue behavior:**
+- Cap-transfer message dequeued (not fallback) (`stage42_cap_transfer_message_dequeued_not_fallback`)
+- Reply-cap message dequeued (not fallback) (`stage42_reply_cap_message_dequeued_not_fallback`)
+- `RecvCapTransferPlan` populated for `FLAG_CAP_TRANSFER` (`stage42_cap_transfer_plan_populated_for_flag_cap_transfer`)
+- `RecvCapTransferPlan.is_reply_cap` for `FLAG_REPLY_CAP` (`stage42_cap_transfer_plan_reply_cap_flag`)
+- Plain message has no plan (`stage42_plain_message_has_no_cap_transfer_plan`)
+
+**(C) Regression: existing paths unchanged:**
+- Kernel-plain path still live (`stage42_kernel_plain_path_still_live`)
+- User-plain path still live (`stage42_user_plain_path_still_live`)
+
+**(D) Lock-order proof (see §58):**
+- ipc_state_lock (rank 3) always released before capability_lock (rank 4).
+- No lock held across user-memory copy.
+- Rollback only on meta fault or undersized buffer; no rollback on payload copy fault.
+
+**Run command:** `cargo test --lib stage42 -- --test-threads=1`
+
+All 12 `stage42_` tests must pass.

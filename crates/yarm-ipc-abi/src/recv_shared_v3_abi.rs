@@ -99,12 +99,13 @@ impl RecvSharedV3ObjectKind {
 
 /// Versioned request record for `recv_shared_v3`.
 ///
-/// Userspace constructs this record and will pass it to the kernel once a
-/// live syscall number is assigned.  Use [`validate_request`] to pre-validate
-/// before passing to the kernel.
+/// Userspace constructs this record and passes it to the kernel via syscall 31.
+/// Use [`validate_request`] to pre-validate before passing to the kernel.
 ///
-/// **Status: draft/not-live.**
+/// `#[repr(C)]` is applied here to lock the wire layout for Stage 42+43:
+/// the kernel reads this struct from user memory at fixed field offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct RecvSharedV3Request {
     /// Must equal [`RECV_V3_VERSION`].
     pub version: u32,
@@ -188,8 +189,11 @@ impl RecvSharedV3Request {
 ///
 /// Fields marked **FUTURE (unavailable)** are always zero in this stage.
 ///
-/// **Status: draft/not-live.**
+/// `#[repr(C)]` is applied here to lock the wire layout for Stage 42+43.
+/// The kernel writes 80 bytes (see [`RECV_V3_MIN_OUTPUT_LEN`]) at the
+/// fixed field offsets; userspace reads this record at those same offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub struct RecvSharedV3Output {
     /// Must equal [`RECV_V3_VERSION`] (kernel-written).
     pub version: u32,

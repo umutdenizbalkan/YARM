@@ -20588,7 +20588,7 @@ fn stage22_notification_cap_revoke_does_not_affect_unrelated_notification() {
 // ── Stage 23: notification live revoke/release surface audit ──────────────────
 //
 // Audit result (see KERNEL_LOCKING.md §41): there is NO generic user-facing
-// capability-release / capability-revoke syscall. SYSCALL_COUNT == 30, 22 live
+// capability-release / capability-revoke syscall. SYSCALL_COUNT == 31 (stage 42+43), 23 live
 // Syscall variants. The only release-shaped syscall is `TransferRelease`
 // (NR = 4), which is MemoryObject/transfer-scoped: `handle_transfer_release`
 // resolves an active transfer mapping for the cap and errors out before
@@ -20727,7 +20727,7 @@ fn stage23_transfer_release_syscall_cannot_target_notification_cap() {
     // syscall number was added.
     assert_eq!(
         crate::kernel::syscall::SYSCALL_COUNT,
-        30,
+        31,
         "SYSCALL_COUNT unchanged"
     );
 }
@@ -20769,7 +20769,7 @@ fn stage23_no_live_notification_release_syscall_documented() {
     // See KERNEL_LOCKING.md §41.
     assert_eq!(
         crate::kernel::syscall::SYSCALL_COUNT,
-        30,
+        31,
         "no cap-release syscall added; SYSCALL_COUNT frozen"
     );
     assert!(
@@ -21821,7 +21821,7 @@ mod stage29a_live_split_dispatch_tests {
 
     #[test]
     fn stage29a_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 29A must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 29A must not change SYSCALL_COUNT");
     }
 }
 
@@ -21907,7 +21907,7 @@ mod stage30_boot_guard_tests {
     #[test]
     fn stage30_syscall_count_still_30() {
         use crate::kernel::syscall::SYSCALL_COUNT;
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 30 must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 30 must not change SYSCALL_COUNT");
     }
 }
 
@@ -22182,7 +22182,7 @@ mod stage31_split_recv_tests {
 
     #[test]
     fn stage31_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 31 must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 31 must not change SYSCALL_COUNT");
     }
 
     #[test]
@@ -22615,7 +22615,9 @@ mod stage32_cap_resolution_tests {
 
     #[test]
     fn stage32_integrated_cap_transfer_fallback() {
-        // A queued message with a cap-transfer flag must fall back (None).
+        // Stage 42+43: cap-transfer messages are now dequeued on the split path
+        // (no longer fall back).  The transfer envelope for handle 0 doesn't
+        // exist, so materialize_received_message_cap returns InvalidCapability.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let recv_cap = kernel.with(|state| {
             let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
@@ -22627,8 +22629,8 @@ mod stage32_cap_resolution_tests {
         let mut frame = recv_frame(recv_cap);
         assert_eq!(
             kernel.try_split_ipc_recv_queued_plain_into_frame(CPU0, &mut frame),
-            None,
-            "cap-transfer message must fall back (None)"
+            Some(Err(TrapHandleError::Syscall(SyscallError::InvalidCapability))),
+            "cap-transfer message dequeued; invalid handle → InvalidCapability"
         );
     }
 
@@ -22833,7 +22835,7 @@ mod stage32_cap_resolution_tests {
 
     #[test]
     fn stage32_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 32 must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 32 must not change SYSCALL_COUNT");
     }
 
     // ── Stage 32B: live-wire kernel-task IpcRecv split + classification ───────
@@ -22976,7 +22978,7 @@ mod stage32_cap_resolution_tests {
 
     #[test]
     fn stage32b_syscall_count_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 32B must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 32B must not change SYSCALL_COUNT");
     }
 }
 
@@ -23071,11 +23073,11 @@ mod stage33_34 {
                 len: 40
             }
         );
-        // Stage 36 update: meta check fires before user-ASID check, so
-        // user-ASID + V2 meta now returns RecvV2MetaUserCopy (not UserAsidCopySemantics).
+        // Stage 37 update: user-ASID + V2 meta + no map_intent is now UserPlainV2Eligible
+        // (live recv-v2 split path; meta-first copy ordering proven equivalent §55).
         assert_eq!(
             plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy),
+            RecvPlan::UserPlainV2Eligible,
         );
     }
 
@@ -23305,12 +23307,12 @@ mod stage33_34 {
     // ── E. recv_shared_v3 design tests ───────────────────────────────────────
     //
     // These tests verify the v3 request/output scaffold.  No syscall dispatch
-    // is added; SYSCALL_COUNT remains 30.
+    // is added; SYSCALL_COUNT was 30 at stage 33+34 (now 31 after stage 42+43).
 
     #[test]
     fn stage33_recv_v3_no_syscall_added() {
         assert_eq!(
-            SYSCALL_COUNT, 30,
+            SYSCALL_COUNT, 31,
             "Stage 33+34 must not add a public syscall"
         );
     }
@@ -23510,7 +23512,7 @@ mod stage33_34 {
     #[test]
     fn stage33_syscall_count_still_30() {
         assert_eq!(
-            SYSCALL_COUNT, 30,
+            SYSCALL_COUNT, 31,
             "Stage 33+34 must not change SYSCALL_COUNT"
         );
     }
@@ -23872,8 +23874,8 @@ mod stage35 {
     fn stage35_syscall_count_still_30() {
         // Stage 35 must not add any new public syscall.
         assert_eq!(
-            SYSCALL_COUNT, 30,
-            "SYSCALL_COUNT must remain 30 after Stage 35"
+            SYSCALL_COUNT, 31,
+            "SYSCALL_COUNT is 31 (stage 42+43 added NR 31; stage 35 itself added none)"
         );
     }
 
@@ -23911,7 +23913,7 @@ mod stage35 {
 //   C. Live split path: user-ASID plain recv delivers or errors correctly
 //   D. Writeback outcome variants: Ok / UndersizedBuffer / CopyFault
 //   E. Regression: kernel-plain and recv-v2 paths unchanged
-//   F. Invariants: SYSCALL_COUNT still 30, v3 still helper-only
+//   F. Invariants: SYSCALL_COUNT == 31 (NR 31 added in stage 42+43), v3 dispatch wired
 // ===========================================================================
 mod stage36 {
     use crate::kernel::boot::{Bootstrap, TrapHandleError};
@@ -24233,7 +24235,7 @@ mod stage36 {
     #[test]
     fn stage36_syscall_count_still_30() {
         assert_eq!(
-            SYSCALL_COUNT, 30,
+            SYSCALL_COUNT, 31,
             "Stage 36 must not add any new public syscall"
         );
     }
@@ -24259,7 +24261,10 @@ mod stage36 {
 
     #[test]
     fn stage36_user_asid_cap_transfer_message_falls_back() {
-        // Cap-transfer messages for user-ASID must still fall back (CapTransfer at runtime).
+        // Stage 42+43: cap-transfer messages are now dequeued on the split path for
+        // user-ASID receivers (UserPlainEligible plan).  The transfer envelope for
+        // handle 0 doesn't exist, so materialize_received_message_cap returns
+        // InvalidCapability.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let recv_cap = kernel.with(|state| {
             let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
@@ -24272,10 +24277,15 @@ mod stage36 {
         });
         let mut frame = recv_frame(recv_cap);
         // plan_recv_core returns UserPlainEligible (shape check only).
-        // At dequeue time, TransferOrReplyCapMessage → FallbackRequired(CapTransfer) → None.
+        // At dequeue time the message is dequeued; cap materialization fails for
+        // handle 0 (no transfer envelope) → InvalidCapability.
         let result =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
-        assert_eq!(result, None, "cap-transfer message for user-ASID falls back at dequeue");
+        assert_eq!(
+            result,
+            Some(Err(TrapHandleError::Syscall(SyscallError::InvalidCapability))),
+            "cap-transfer message dequeued; invalid handle → InvalidCapability"
+        );
     }
 }
 
@@ -24854,7 +24864,7 @@ mod stage37 {
     #[test]
     fn stage37_syscall_count_still_30() {
         assert_eq!(
-            SYSCALL_COUNT, 30,
+            SYSCALL_COUNT, 31,
             "Stage 37 must not add any new public syscall"
         );
     }
@@ -24910,13 +24920,14 @@ mod stage38 {
         (kernel, recv_cap_task1)
     }
 
-    // ── A. Cap-transfer fallback (message stays queued, not dequeued) ──────────
+    // ── A. Cap-transfer delivery via split path (Stage 42+43: no longer falls back) ─
 
     #[test]
     fn stage38_cap_transfer_flag_at_head_returns_fallback_before_dequeue() {
-        // plan_recv_core returns KernelPlainEligible (shape only),
-        // but try_recv_core_kernel_plain returns FallbackRequired(CapTransfer).
-        // Message must NOT be dequeued.
+        // Stage 42+43: ipc_try_recv_queued_with_cap_transfer now DEQUEUES cap-transfer
+        // messages on the split path.  try_recv_core_kernel_plain returns Delivered
+        // with cap_transfer.is_some() rather than FallbackRequired(CapTransfer).
+        // Message is consumed; queue count becomes 0.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let (recv_cap, endpoint_idx) = kernel.with(|state| {
             let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
@@ -24936,22 +24947,26 @@ mod stage38 {
                 RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
             try_recv_core_kernel_plain(state, &request, endpoint)
         });
-        assert!(
-            matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)),
-            "cap-transfer message must return CapTransfer fallback"
-        );
+        // Stage 42+43: must be Delivered with cap_transfer.is_some().
+        match outcome {
+            RecvOutcome::Delivered(ref d) => {
+                assert!(d.cap_transfer.is_some(), "cap_transfer must be Some for FLAG_CAP_TRANSFER");
+            }
+            other => panic!("stage42: expected Delivered, got {other:?}"),
+        }
 
-        // Message must still be in the queue
+        // Message is dequeued; queue count must be 0.
         kernel.with(|state| {
             let queued = state.with_ipc_state(|ipc| {
                 ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
             });
-            assert_eq!(queued, 1, "cap-transfer message must remain queued");
+            assert_eq!(queued, 0, "cap-transfer message must be dequeued in stage42");
         });
     }
 
     #[test]
     fn stage38_reply_cap_flag_at_head_returns_fallback_before_dequeue() {
+        // Stage 42+43: reply-cap messages are also dequeued on the split path.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let (recv_cap, endpoint_idx) = kernel.with(|state| {
             let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
@@ -24971,18 +24986,24 @@ mod stage38 {
                 RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
             try_recv_core_kernel_plain(state, &request, endpoint)
         });
-        assert!(matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)));
+        match outcome {
+            RecvOutcome::Delivered(ref d) => {
+                assert!(d.cap_transfer.is_some(), "reply-cap must set cap_transfer");
+                assert!(d.cap_transfer.unwrap().is_reply_cap, "is_reply_cap must be true");
+            }
+            other => panic!("stage42: expected Delivered, got {other:?}"),
+        }
         kernel.with(|state| {
             let queued = state.with_ipc_state(|ipc| {
                 ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
             });
-            assert_eq!(queued, 1, "reply-cap message must remain queued");
+            assert_eq!(queued, 0, "reply-cap message must be dequeued in stage42");
         });
     }
 
     #[test]
     fn stage38_cap_transfer_plain_flag_at_head_returns_fallback() {
-        // FLAG_CAP_TRANSFER_PLAIN also falls back before dequeue.
+        // Stage 42+43: FLAG_CAP_TRANSFER_PLAIN is also dequeued on the split path.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let (recv_cap, endpoint_idx) = kernel.with(|state| {
             let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
@@ -25007,18 +25028,25 @@ mod stage38 {
                 RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
             try_recv_core_kernel_plain(state, &request, endpoint)
         });
-        assert!(matches!(outcome, RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)));
+        match outcome {
+            RecvOutcome::Delivered(ref d) => {
+                assert!(d.cap_transfer.is_some(), "FLAG_CAP_TRANSFER_PLAIN must set cap_transfer");
+            }
+            other => panic!("stage42: expected Delivered, got {other:?}"),
+        }
         kernel.with(|state| {
             let queued = state.with_ipc_state(|ipc| {
                 ipc.endpoints[endpoint_idx].as_ref().unwrap().queued()
             });
-            assert_eq!(queued, 1);
+            assert_eq!(queued, 0, "FLAG_CAP_TRANSFER_PLAIN message must be dequeued in stage42");
         });
     }
 
     #[test]
     fn stage38_cap_transfer_split_dispatch_returns_none() {
-        // cap-transfer at queue head → split dispatch returns None (fallback).
+        // Stage 42+43: cap-transfer at queue head is now handled on the split path.
+        // Materialization fails (raw handle 99 has no real transfer envelope), so
+        // try_split_dispatch_into_frame returns Some(Err(...)) rather than None.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let recv_cap = kernel.with(|state| {
             let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
@@ -25032,7 +25060,13 @@ mod stage38 {
             [recv_cap.0 as usize, 0, 0, 0, 0, 0],
         );
         let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
-        assert_eq!(result, None, "cap-transfer at head → split dispatch must return None");
+        // Stage 42+43: split path dequeues the cap-transfer message and attempts
+        // materialization; with a fake handle (99) the envelope lookup fails →
+        // Some(Err(InvalidCapability)).
+        assert!(
+            result.is_some() && result.unwrap().is_err(),
+            "stage42: cap-transfer with fake handle must produce an error, not None"
+        );
     }
 
     // ── B. Sender-waiter with cap-transfer message → still falls back ─────────
@@ -25343,7 +25377,7 @@ mod stage38 {
 
     #[test]
     fn stage38_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 38+39 must not add any public syscall");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 38+39 must not add any public syscall");
     }
 
     #[test]
@@ -25678,7 +25712,7 @@ mod stage40 {
 
     #[test]
     fn stage40_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 40+41 must not add any public syscall");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 40+41 must not add any public syscall");
     }
 
     #[test]
@@ -25739,5 +25773,270 @@ mod stage40 {
         let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 6);
+    }
+}
+
+mod stage42 {
+    //! Stage 42+43: cap-transfer through canonical receive core + conditional
+    //! recv_shared_v3 syscall 31.
+    //!
+    //! Tests cover:
+    //!   A. Audit: cap-transfer message dequeued on split path (not FallbackRequired)
+    //!   B. Plan/delivery model: cap_transfer field populated for cap-flagged messages
+    //!   C. Split path with cap-transfer: dequeues and cap_transfer.is_some()
+    //!   D. Invariants: SYSCALL_COUNT == 31, Syscall::decode(31) == RecvSharedV3
+    //!   E. Regression: stage38/stage40 kernel-plain and user-plain paths unchanged
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::recv_core::{
+        RecvCapTransferPlan, RecvDelivery, RecvOutcome, RecvRequest, RecvSchedulerWakePlan,
+        RecvWritebackPlan, try_recv_core_kernel_plain, try_recv_core_user_plain,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, Syscall};
+    use crate::kernel::syscall_split::try_split_dispatch_into_frame;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CAP1: CapId = CapId(1);
+
+    // ── D. Invariants ────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage42_syscall_count_is_31() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 42+43 must add NR 31 (recv_shared_v3)");
+    }
+
+    #[test]
+    fn stage42_recv_shared_v3_nr_is_31() {
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 31);
+    }
+
+    #[test]
+    fn stage42_recv_shared_v3_decodes_from_31() {
+        assert!(
+            matches!(Syscall::decode(31), Ok(Syscall::RecvSharedV3)),
+            "Syscall::decode(31) must return Ok(RecvSharedV3)"
+        );
+    }
+
+    #[test]
+    fn stage42_variant_count_is_23() {
+        assert_eq!(Syscall::VARIANT_COUNT, 23, "Stage 42+43 adds RecvSharedV3 variant");
+    }
+
+    #[test]
+    fn stage42_no_unused_syscall_number_30() {
+        // NR 30 is not allocated (gap between NR 29 and NR 31).
+        assert!(
+            matches!(Syscall::decode(30), Err(_)),
+            "NR 30 must remain unallocated"
+        );
+    }
+
+    // ── A. Audit: cap-transfer message dequeued on split path ────────────────
+
+    #[test]
+    fn stage42_cap_transfer_message_dequeued_not_fallback() {
+        // Stage 42+43: try_recv_core_kernel_plain uses ipc_try_recv_queued_with_cap_transfer.
+        // A queued FLAG_CAP_TRANSFER message must be returned as Delivered (not FallbackRequired).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, endpoint_idx) = kernel.with(|state| {
+            let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg =
+                Message::with_header(0, 0x42, Message::FLAG_CAP_TRANSFER, Some(77), b"xfr")
+                    .expect("cap msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            (recv_cap, endpoint_idx)
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        assert!(
+            matches!(outcome, RecvOutcome::Delivered(_)),
+            "cap-transfer message must be Delivered (not FallbackRequired) in stage42"
+        );
+        // Message is dequeued.
+        kernel.with(|state| {
+            let q = state
+                .with_ipc_state(|ipc| ipc.endpoints[endpoint_idx].as_ref().unwrap().queued());
+            assert_eq!(q, 0, "message must be consumed from queue");
+        });
+    }
+
+    #[test]
+    fn stage42_reply_cap_message_dequeued_not_fallback() {
+        // FLAG_REPLY_CAP is also handled on the split path.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, _endpoint_idx) = kernel.with(|state| {
+            let (endpoint_idx, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg = Message::with_header(0, 0x42, Message::FLAG_REPLY_CAP, Some(55), b"rc")
+                .expect("rc msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            (recv_cap, endpoint_idx)
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        assert!(
+            matches!(outcome, RecvOutcome::Delivered(_)),
+            "FLAG_REPLY_CAP message must be Delivered in stage42"
+        );
+    }
+
+    // ── B. Plan/delivery model: cap_transfer field populated ─────────────────
+
+    #[test]
+    fn stage42_cap_transfer_plan_populated_for_flag_cap_transfer() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg =
+                Message::with_header(0, 0x33, Message::FLAG_CAP_TRANSFER, Some(42), b"plan")
+                    .expect("msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            recv_cap
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        match outcome {
+            RecvOutcome::Delivered(delivery) => {
+                let plan = delivery.cap_transfer.expect("cap_transfer must be Some");
+                assert_eq!(plan.raw_handle, 42, "raw_handle must equal enqueued handle");
+                assert!(!plan.is_reply_cap, "FLAG_CAP_TRANSFER → is_reply_cap must be false");
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage42_cap_transfer_plan_reply_cap_flag() {
+        // FLAG_REPLY_CAP → is_reply_cap == true in the plan.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            let msg = Message::with_header(0, 0x33, Message::FLAG_REPLY_CAP, Some(88), b"rp")
+                .expect("msg");
+            state.ipc_send(send_cap, msg).expect("send");
+            recv_cap
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        match outcome {
+            RecvOutcome::Delivered(delivery) => {
+                let plan = delivery.cap_transfer.expect("cap_transfer must be Some");
+                assert_eq!(plan.raw_handle, 88);
+                assert!(plan.is_reply_cap, "FLAG_REPLY_CAP → is_reply_cap must be true");
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage42_plain_message_has_no_cap_transfer_plan() {
+        // Plain (unflagged) messages must still have cap_transfer == None.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(5, b"plain").expect("msg"))
+                .expect("send");
+            recv_cap
+        });
+
+        let outcome = kernel.with(|state| {
+            let cnode = state.current_task_cnode().expect("cnode");
+            let endpoint = state
+                .capability_for_cnode_local(cnode, recv_cap)
+                .map(|c| c.object)
+                .expect("endpoint");
+            let request = RecvRequest::from_legacy_ipc_recv(0, recv_cap, 0, 0, 0, 0, true);
+            try_recv_core_kernel_plain(state, &request, endpoint)
+        });
+        match outcome {
+            RecvOutcome::Delivered(delivery) => {
+                assert!(
+                    delivery.cap_transfer.is_none(),
+                    "plain message must have cap_transfer == None"
+                );
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    // ── E. Regression: stage38/stage40 live paths unchanged ──────────────────
+
+    #[test]
+    fn stage42_kernel_plain_path_still_live() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(11, b"stage42").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 11, "sender tid");
+        assert_eq!(frame.ret1(), b"stage42".len());
+    }
+
+    #[test]
+    fn stage42_user_plain_path_still_live() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(12, b"").expect("m"))
+                .expect("send");
+            let (asid, _) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 12, "sender tid");
     }
 }
