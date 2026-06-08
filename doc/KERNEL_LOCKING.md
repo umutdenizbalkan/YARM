@@ -9970,3 +9970,300 @@ Stage 36 **formally audits** the copy-failure semantics for user-ASID plain rece
 | ipc_recv (NR2) | user-ASID + V2 meta | global-lock | 35 |
 | ipc_recv (NR2) | user-ASID mapped recv | global-lock | 35 |
 | ipc_recv (NR5) | any | global-lock | 35 |
+
+## §55 Stage 37 — recv-v2 metadata writeback semantics audit and live-enable
+
+### 55.1 Overview
+
+Stage 37 **formally audits** the metadata writeback semantics for recv-v2 plain queued
+messages and **live-enables** the narrow eligible path (user-ASID + V2 meta + no
+map_intent) on the canonical split path.
+
+**Changes:**
+- `RecvPlan::UserPlainV2Eligible` added to `recv_core.rs` — new plan variant for
+  user-ASID + V2 meta + no map_intent
+- `plan_recv_core` restructured: meta check now per-payload-target; for
+  `UserMemory` + V2 meta + no map_intent → `UserPlainV2Eligible` (Stage 37)
+- `try_recv_core_user_plain_v2` — dequeues under `ipc_state_lock` (rank 3), extracts
+  both `UserMemory` and `V2` targets, returns `RecvDelivery` with `UserMemoryV2` plan
+- `execute_user_asid_plain_v2_writeback` — builds 40-byte meta struct, copies meta
+  FIRST, then payload; returns `RecvV2WritebackOutcome`
+- `RecvV2WritebackOutcome` — new enum: `Ok`, `PayloadUndersized`, `MetaCopyFault`,
+  `PayloadCopyFault`
+- `RecvWritebackPlan::UserMemoryV2` — new variant carrying meta_ptr, meta_len,
+  payload ptr, payload buf_len, sender_tid
+
+**Invariants preserved:**
+- `SYSCALL_COUNT == 30` (no new public syscall)
+- Public ABI register layout unchanged
+- Kernel-plain and user-plain split path behaviors unchanged
+- Cap-transfer/reply-cap/sender-waiter-refill/shared receive still fall back
+- recv-v3 still helper-only
+- Mapped recv still falls back (map_intent != None → `UserAsidCopySemantics`)
+
+### 55.2 recv-v2 plain metadata writeback semantics proof table
+
+Meta struct layout (40 bytes, written to `meta_ptr`):
+
+| Offset | Field | Value for plain message |
+|---|---|---|
+| [0..8] | sender_tid | `msg.sender_tid.0` (little-endian u64) |
+| [8..10] | opcode | `msg.opcode` (little-endian u16) |
+| [10..12] | flags | `msg.flags` (little-endian u16) |
+| [12..16] | payload_len | `app_payload.len() as u32` (little-endian u32) |
+| [16..24] | transfer_cap | `Message::NO_TRANSFER_CAP` = `u64::MAX` |
+| [24..32] | recv_meta_flags | `0u64` (no FLAG_REPLY_CAP, no FLAG_CAP_TRANSFER for plain) |
+| [32..40] | sender_tid2 | `msg.sender_tid.0` (little-endian u64, duplicate slot) |
+
+Copy ordering: meta FIRST, payload SECOND. This matches the full-path order in
+`handle_ipc_recv_result_with_empty_error` which writes `out_meta_ptr` before `payload_ptr`.
+
+Equivalence proof for each outcome:
+
+| Scenario | Full-path (global-lock) | Split-path (Stage 37) | Verdict |
+|---|---|---|---|
+| Meta copy succeeds, payload fits | write meta → copy payload → `set_ok(0, len, ret2)` | write meta → copy payload → `RecvV2WritebackOutcome::Ok` → `set_ok(0, len, ret2)` | **Equivalent** |
+| Meta copy fault | write meta → `UserMemoryFault` → `Err(PageFault)` (no rollback for plain) | `execute_user_asid_plain_v2_writeback` → `MetaCopyFault` → `Err(PageFault)` | **Equivalent** (message consumed in both) |
+| Meta ok, payload undersized | write meta → `user_len < payload.len()` → `Err(InvalidArgs)` | meta ok → `PayloadUndersized` → `Err(InvalidArgs)` | **Equivalent** (message consumed in both) |
+| Meta ok, payload copy fault | write meta → payload `UserMemoryFault` → `record_user_fault` + `Ok(())` | meta ok → `PayloadCopyFault` → `record_user_fault` + `Ok(())` | **Equivalent** (message consumed in both) |
+| Empty queue | `WouldBlock` → block or return `WouldBlock` | `WouldBlock` → `None` → global-lock fallback | **Equivalent** |
+| `ret0` value on success | `0` (recv_v2_meta_written = true branch) | `frame.set_ok(0, payload_len, frame.ret2())` | **Equivalent** |
+| `transfer_cap` field | `frame.ret2() as u64` after `encode_transfer_cap_ret(frame, None)` = `SYSCALL_NO_TRANSFER_CAP` | `Message::NO_TRANSFER_CAP` = `u64::MAX` = `SYSCALL_NO_TRANSFER_CAP` | **Equivalent** |
+| `recv_meta_flags` field | `0u64` for plain (no FLAG_REPLY_CAP, no FLAG_CAP_TRANSFER) | `0u64.to_le_bytes()` hardcoded | **Equivalent** |
+
+**Key invariant (Stage 37):** For plain messages, `recv_meta_flags = 0`,
+`recv_local_transfer = None`, no cap materialization needed. The split path requires
+no cap rollback on any failure path.
+
+### 55.3 Lock order (Stage 37 user-ASID + V2 meta plain path)
+
+```
+[no lock]
+  → current_tid_authoritative (takes+releases global lock)
+  → [no lock]
+  → resolve_endpoint_recv_cap_split_read (task(2) read+release → cap(4) read+release; no ipc lock)
+  → [no lock]
+  → self.with(|state| try_split_recv_queued_plain_with_snapshot_locked):
+      → try_recv_core_user_plain_v2:
+          → ipc_state_lock (rank 3) acquired
+          → dequeue plain message
+          → ipc_state_lock (rank 3) released
+      → execute_user_asid_plain_v2_writeback:
+          → build 40-byte meta struct (stack-local, no lock)
+          → copy_to_current_user (meta)   [NO ipc_state_lock held ✓, NO capability lock held ✓]
+          → copy_to_current_user (payload) [NO ipc_state_lock held ✓, NO capability lock held ✓]
+      → frame.set_ok / Err(PageFault) / Err(InvalidArgs) / record_user_fault
+  → global lock released
+```
+
+**Hard constraints satisfied:**
+- `ipc_state_lock` (rank 3): NOT held during either `copy_to_current_user` call ✓
+- Capability lock (rank 4): NOT held during either `copy_to_current_user` call ✓
+- Meta struct built on stack — no allocation, no lock ✓
+
+### 55.4 Eligibility matrix (Stage 37 additions to §54 table)
+
+| Scenario | Eligible for split? | Plan | Reason |
+|---|---|---|---|
+| ipc_recv user-ASID plain (no meta, no map) | YES (Stage 36) | `UserPlainEligible` | plain writeback |
+| ipc_recv user-ASID + V2 meta (no map) | **YES (Stage 37)** | **`UserPlainV2Eligible`** | meta-first + payload writeback |
+| ipc_recv user-ASID + V2 meta + map_intent | NO | `UserAsidCopySemantics` | map_intent != None |
+| ipc_recv user-ASID + V3Future meta | NO | `RecvV2MetaUserCopy` | V3Future helper-only |
+| ipc_recv kernel task + V2 meta | NO | `RecvV2MetaUserCopy` | kernel-register target |
+| ipc_recv user-ASID mapped recv | NO | `UserAsidCopySemantics` | map_intent |
+| ipc_recv kernel task plain | YES (Stage 33+34) | `KernelPlainEligible` | register writeback |
+| ipc_recv_timeout (any) | NO | — | NR5 not in split-dispatch table |
+| recv-v2 (ipc_recv NR2 from non-user-ASID) | NO | `RecvV2MetaUserCopy` | meta user-copy |
+
+### 55.5 Telemetry markers (Stage 37)
+
+- `YARM_RECV_CORE_ADAPTER kind=user_plain_v2` — emitted when `UserPlainV2Eligible` plan is dispatched
+- `YARM_RECV_CORE_LIVE kind=user_plain_v2` — emitted on successful user-ASID V2 delivery
+- `YARM_RECV_CORE_V2_WRITEBACK result=ok` — meta+payload copy succeeded
+- `YARM_RECV_CORE_V2_WRITEBACK result=meta_fault` — meta copy faulted (→ `PageFault`)
+- `YARM_RECV_CORE_V2_WRITEBACK result=payload_fault` — payload copy faulted (→ `record_user_fault`)
+- `YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized` — payload buffer too small (→ `InvalidArgs`)
+
+### 55.6 Live vs fallback matrix (cumulative Stage 33+34+35+36+37)
+
+| Syscall | Receiver type | Path | Stage |
+|---|---|---|---|
+| ipc_recv (NR2) | kernel task, queued plain | LIVE split + canonical core | 33+34 |
+| ipc_recv (NR2) | user-ASID plain (no meta, no map) | LIVE split + canonical core | 36 |
+| ipc_recv (NR2) | user-ASID + V2 meta (no map) | **LIVE split + canonical core** | **37** |
+| ipc_recv (NR2) | user-ASID + V2 meta + map_intent | global-lock | 37 |
+| ipc_recv (NR2) | user-ASID + V3Future meta | global-lock | 37 |
+| ipc_recv (NR2) | user-ASID mapped recv | global-lock | 35 |
+| ipc_recv (NR5) | any | global-lock | 35 |
+
+## §56 Stage 38+39 — recv-core transfer/reply/shared audit + sender-waiter fix
+
+### 56.1 Overview
+
+Stage 38+39 audits the full-path semantics for cap-transfer, reply-cap, mapped/shared
+receive, and sender-waiter refill. Based on the audit, it live-enables the plain
+sender-waiter refill case on the canonical split path (blocking the latent message-loss
+bug). Cap-transfer, reply-cap, and mapped/shared receive remain on the global-lock
+fallback path with documented blockers.
+
+**Changes:**
+- `try_recv_core_kernel_plain`, `try_recv_core_user_plain`, `try_recv_core_user_plain_v2`:
+  `ReceivedWithSenderWake(msg, wake_tid)` now returns `Delivered` with
+  `RecvSchedulerWakePlan::WakeSender(wake_tid)` instead of `FallbackRequired(SenderWaiterWake)`
+- `try_split_recv_queued_plain_with_snapshot_locked`: applies sender-wake plan BEFORE
+  writeback when `delivery.scheduler == WakeSender(wake_tid)`, matching full-path order
+- `FallbackReason::CapTransfer` doc updated to describe cap-transfer + reply-cap blockers
+- `FallbackReason::SenderWaiterWake` doc updated to reflect narrowed semantics (only
+  cap-transfer sender-waiter or sparse queue still falls back; plain now promoted)
+
+**Invariants preserved:**
+- `SYSCALL_COUNT == 30`
+- cap-transfer/reply-cap/mapped/shared receive still fall back
+- recv-v3 still helper-only
+
+### 56.2 Audit: cap-transfer receive semantics
+
+**Full-path order for cap-transfer messages:**
+1. `ipc_recv(cap)` — dequeues the message (including cap-transfer)
+2. `materialize_received_message_cap` — acquires transfer envelope + capability lock (rank 4) + grants/mints cap
+3. If materialization fails → `return Err(InvalidCapability)` — message consumed, no rollback possible
+4. Meta copy (if recv-v2): write 40-byte meta struct; if fault → `rollback_materialized_recv_cap` (re-takes cap lock) + `return Err(PageFault)`
+5. Undersized buffer: `rollback_materialized_recv_cap` + `return Err(InvalidArgs)`
+6. Payload copy fault: `record_user_fault + Ok()` — cap **not** rolled back by design
+
+**Split path:** `ipc_try_recv_queued_plain_endpoint_only` rejects cap-flagged messages
+(`FLAG_CAP_TRANSFER`, `FLAG_CAP_TRANSFER_PLAIN`, `FLAG_REPLY_CAP`) with
+`TransferOrReplyCapMessage` **before dequeuing**. Message stays in queue for the full path.
+This is correct: no message loss, no lock violation.
+
+**Blocker for split-path cap-transfer (Stage 38+39 conclusion — NOT live):**
+- Materialization requires capability lock (rank 4) after ipc_state_lock (rank 3) released: allowed by lock rank.
+- Rollback on copy failure (meta fault or undersized buffer) requires re-taking capability lock after copy attempt.
+- Proving exact rollback semantics and tests covering all failure paths is deferred.
+- **This path is explicitly NOT live-enabled.**
+
+### 56.3 Audit: reply-cap materialization semantics
+
+**Additional steps vs cap-transfer:**
+1. `take_transfer_envelope` — retrieves underlying Reply object handle
+2. `capability_object_live(reply_object)` — generation check
+3. `mint_capability_in_cnode` — direct mint (bypasses delegation-link table)
+4. `set_reply_cap_waiter_cap` — records CapId in global ReplyCapRecord for `ipc_reply` fast-revoke
+
+**Rollback on copy failure:** same as cap-transfer — `rollback_materialized_recv_cap` with `is_reply=true`.
+
+**Blocker for split-path reply-cap:** same as cap-transfer + generation liveness check + ReplyCapRecord mutation.
+**NOT live-enabled.**
+
+### 56.4 Audit: mapped/shared receive (OPCODE_SHARED_MEM) semantics
+
+Messages with `msg.opcode == OPCODE_SHARED_MEM` carry `FLAG_CAP_TRANSFER` (the
+memory object capability is the transferred cap). They are already rejected by the
+`TransferOrReplyCapMessage` check before any opcode inspection.
+
+Even if cap-transfer were handled: the shared-memory path requires:
+1. Decode `SharedMemoryRegion` from message payload (offset + len)
+2. Validate transfer_cap presence and rights
+3. `attenuate_transfer_cap_for_recv_intent` — capability domain mutation
+4. `map_shared_region_into_receiver` — VM page-table operations (vm_state_lock rank 5)
+5. `register_active_transfer_mapping` — bookkeeping
+6. Multi-phase rollback: TLB shootdown + cap revoke on any failure
+
+**Missing from IPC model:** `exact_region_len` (v3 FUTURE field) and
+`exact_object_size` (v3 FUTURE field) cannot be populated from `SharedMemoryRegion.len`
+alone (len is application-provided, not kernel-verified against object bounds).
+
+**NOT live-enabled.**
+
+### 56.5 Sender-waiter refill: semantics proof table
+
+| Scenario | Full path (handle_ipc_recv) | Split path (Stage 38+39) | Verdict |
+|---|---|---|---|
+| Plain message at head, plain sender-waiter | dequeue first + refill second; wake sender BEFORE `handle_ipc_recv_result` | dequeue first + refill second; `RecvSchedulerWakePlan::WakeSender`; wake BEFORE writeback | **Equivalent** |
+| Plain message at head, cap-transfer sender-waiter | dequeue first; sender-waiter stays (not handled by split) | `Ineligible(SenderWaiterPresent)` → `FallbackRequired(SenderWaiterWake)` → global path | **Equivalent** (fallback) |
+| Cap-transfer at queue head | dequeue; materialize; copy | `TransferOrReplyCapMessage` → `FallbackRequired(CapTransfer)` → global path | **Equivalent** (no dequeue on split) |
+| Wake ordering: plain sender-waiter | wake BEFORE copy (apply_split_sender_wake_plan at line 1165) | wake BEFORE writeback (`delivery.scheduler` applied before `match delivery.writeback`) | **Equivalent** |
+
+### 56.6 Lock order (Stage 38+39 sender-waiter fix)
+
+```
+[no lock]
+  → current_tid_authoritative (takes+releases global lock)
+  → resolve_endpoint_recv_cap_split_read (task(2)→cap(4), no ipc lock)
+  → self.with(|state| try_split_recv_queued_plain_with_snapshot_locked):
+      → try_recv_core_*:
+          → ipc_state_lock (rank 3) acquired
+          → dequeue first message + refill sender's message (two-phase)
+          → ipc_state_lock (rank 3) released
+      → apply_split_sender_wake_plan(wake_tid):
+          → scheduler_state (rank 1) acquired
+          → wake sender (set Runnable)
+          → scheduler_state released
+          (NO ipc_state_lock held ✓, NO capability lock held ✓)
+      → writeback (user copy / register write):
+          (NO ipc_state_lock held ✓, NO capability lock held ✓)
+```
+
+### 56.7 FallbackReason update: SenderWaiterWake narrowed
+
+`FallbackReason::SenderWaiterWake` is now produced only when:
+- Sender-waiter's message has cap-transfer/reply-cap flags, OR
+- Sender-waiter queue is sparse (gap at position 0 indicates timed-out sender)
+
+Plain sender-waiter + plain queued message is now handled via `Delivered + WakeSender`.
+
+### 56.8 Eligibility matrix (Stage 38+39 additions)
+
+| Scenario | Eligible? | Plan | Reason |
+|---|---|---|---|
+| kernel-task + plain + plain sender-waiter | **YES (Stage 38+39)** | `KernelPlainEligible` + `WakeSender` | sender wake deferred via delivery |
+| user-ASID + plain + plain sender-waiter | **YES (Stage 38+39)** | `UserPlainEligible` + `WakeSender` | same |
+| user-ASID + V2 meta + plain sender-waiter | **YES (Stage 38+39)** | `UserPlainV2Eligible` + `WakeSender` | same |
+| any + cap-transfer sender-waiter | NO | `SenderWaiterWake` fallback | cap materialization required |
+| cap-transfer at queue head | NO | `CapTransfer` fallback | not dequeued on split |
+| reply-cap at queue head | NO | `CapTransfer` fallback | not dequeued on split |
+| OPCODE_SHARED_MEM | NO | `CapTransfer` fallback (via FLAG_CAP_TRANSFER) | VM mapping required |
+
+### 56.9 v3 known vs missing metadata table
+
+| v3 output field | Available from kernel | Source | Blocker |
+|---|---|---|---|
+| `sender_tid` | YES | `msg.sender_tid.0` | None |
+| `message_len` | YES | `app_payload.len()` | None |
+| `message_flags` | YES | `msg.flags` | None |
+| `transferred_cap` | PARTIAL | local CapId after materialization | cap materialization not yet on split path |
+| `object_kind` | NO | FUTURE | kernel doesn't surface cap type in IPC msg |
+| `object_generation` | NO | FUTURE | not in transfer envelope today |
+| `effective_rights` | NO | FUTURE | not in transfer envelope today |
+| `exact_object_size` | NO | FUTURE | not in IPC message |
+| `region_offset` | YES (OPCODE_SHARED_MEM only) | `SharedMemoryRegion.offset` | only for OPCODE_SHARED_MEM messages |
+| `exact_region_len` | NO | FUTURE | `SharedMemoryRegion.len` is app-provided, not kernel-verified |
+| `mapped_base` | YES (after map) | returned by `map_shared_region_into_receiver` | requires VM mapping |
+| `page_rounded_mapped_len` | YES (after map) | `mapped_len` from mapper | requires VM mapping |
+| `actual_mapping_perm` | YES (after map) | `recv_map_flags` | requires VM mapping |
+| `cleanup_token` | NO | FUTURE | no cleanup token identity in kernel today |
+| `request_id` | NO | FUTURE | VFS shared I/O request ID not implemented |
+
+### 56.10 Blockers before public v3 syscall
+
+1. **Cap-transfer materialization on split path** — rollback semantics not yet proven for all failure paths
+2. **Object kind/rights/size surfaced in transfer envelope** — kernel does not yet include these in the transfer envelope
+3. **Exact region length** — `SharedMemoryRegion.len` is application-provided; kernel does not verify against object bounds
+4. **Cleanup token identity** — no cleanup token concept in kernel today
+5. **VM mapping on split path** — vm_state_lock (rank 5) acquisition and TLB shootdown rollback not yet split-extracted
+
+### 56.11 Live vs fallback matrix (cumulative Stage 33+34+35+36+37+38+39)
+
+| Syscall | Receiver type | Sender-waiter? | Path | Stage |
+|---|---|---|---|---|
+| ipc_recv (NR2) | kernel task, queued plain | none | LIVE split | 33+34 |
+| ipc_recv (NR2) | kernel task, queued plain | plain | **LIVE split + wake** | **38+39** |
+| ipc_recv (NR2) | user-ASID plain (no meta, no map) | none | LIVE split | 36 |
+| ipc_recv (NR2) | user-ASID plain (no meta, no map) | plain | **LIVE split + wake** | **38+39** |
+| ipc_recv (NR2) | user-ASID + V2 meta (no map) | none | LIVE split | 37 |
+| ipc_recv (NR2) | user-ASID + V2 meta (no map) | plain | **LIVE split + wake** | **38+39** |
+| ipc_recv (NR2) | any + cap-transfer msg | any | global-lock | 38+39 blocker |
+| ipc_recv (NR2) | any + reply-cap msg | any | global-lock | 38+39 blocker |
+| ipc_recv (NR2) | any + OPCODE_SHARED_MEM | any | global-lock | 38+39 blocker |
+| ipc_recv (NR2) | user-ASID + V2 meta + map_intent | any | global-lock | 37 |
+| ipc_recv (NR5) | any | any | global-lock | 35 |
