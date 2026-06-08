@@ -10,13 +10,13 @@
 
 use super::device::{GpioDriver, PinMode, Rp1GpioDriver, TOTAL_GPIOS};
 use yarm_ipc_abi::gpio_abi::{
-    GpioReadPinReply, GpioReadPinRequest, GpioSetFunctionRequest, GpioSetPinModeRequest,
-    GpioStatus, GpioStatusReply, GpioWritePinRequest, GPIO_MODE_ALT_FUNC, GPIO_MODE_INPUT,
-    GPIO_MODE_OUTPUT, GPIO_OP_READ_PIN, GPIO_OP_SET_FUNCTION, GPIO_OP_SET_PIN_MODE,
-    GPIO_OP_WRITE_PIN,
+    GPIO_MODE_ALT_FUNC, GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GPIO_OP_READ_PIN, GPIO_OP_SET_FUNCTION,
+    GPIO_OP_SET_PIN_MODE, GPIO_OP_WRITE_PIN, GpioReadPinReply, GpioReadPinRequest,
+    GpioSetFunctionRequest, GpioSetPinModeRequest, GpioStatus, GpioStatusReply,
+    GpioWritePinRequest,
 };
 use yarm_user_rt::ipc::Message;
-use yarm_user_rt::runtime::{startup_arg_slot, startup_context, STARTUP_SLOT_SERVICE_EXTRA_CAP_0};
+use yarm_user_rt::runtime::{STARTUP_SLOT_SERVICE_EXTRA_CAP_0, startup_arg_slot, startup_context};
 
 /// Run the GPIO service loop.
 ///
@@ -34,8 +34,7 @@ pub fn run() {
     // The driver-manager stores the RP1 PCIe BAR virtual address in slot 13
     // before spawning this server.  Reading via `startup_arg_slot` bypasses
     // the `cap_from_slot` truncation so values > u32::MAX are preserved.
-    let bar_vaddr = startup_arg_slot(STARTUP_SLOT_SERVICE_EXTRA_CAP_0)
-        .unwrap_or(0) as usize;
+    let bar_vaddr = startup_arg_slot(STARTUP_SLOT_SERVICE_EXTRA_CAP_0).unwrap_or(0) as usize;
 
     if bar_vaddr == 0 {
         // BAR not configured — deployment error; fail silently so the
@@ -86,29 +85,29 @@ fn handle(driver: &Rp1GpioDriver, msg: &Message, reply_cap: u32) {
 
         GPIO_OP_SET_PIN_MODE => {
             let status = match GpioSetPinModeRequest::decode(msg.as_slice()) {
-                Some(req) if (req.pin as usize) < TOTAL_GPIOS => {
-                    match req.mode {
-                        GPIO_MODE_INPUT => {
-                            driver.set_pin_mode(req.pin as usize, PinMode::Input);
-                            GpioStatusReply::ok()
-                        }
-                        GPIO_MODE_OUTPUT => {
-                            driver.set_pin_mode(
-                                req.pin as usize,
-                                PinMode::Output { initial_level: req.initial_level != 0 },
-                            );
-                            GpioStatusReply::ok()
-                        }
-                        GPIO_MODE_ALT_FUNC => {
-                            driver.set_pin_mode(
-                                req.pin as usize,
-                                PinMode::AltFunction(req.function as u32),
-                            );
-                            GpioStatusReply::ok()
-                        }
-                        _ => GpioStatusReply::err(GpioStatus::InvalidMode),
+                Some(req) if (req.pin as usize) < TOTAL_GPIOS => match req.mode {
+                    GPIO_MODE_INPUT => {
+                        driver.set_pin_mode(req.pin as usize, PinMode::Input);
+                        GpioStatusReply::ok()
                     }
-                }
+                    GPIO_MODE_OUTPUT => {
+                        driver.set_pin_mode(
+                            req.pin as usize,
+                            PinMode::Output {
+                                initial_level: req.initial_level != 0,
+                            },
+                        );
+                        GpioStatusReply::ok()
+                    }
+                    GPIO_MODE_ALT_FUNC => {
+                        driver.set_pin_mode(
+                            req.pin as usize,
+                            PinMode::AltFunction(req.function as u32),
+                        );
+                        GpioStatusReply::ok()
+                    }
+                    _ => GpioStatusReply::err(GpioStatus::InvalidMode),
+                },
                 Some(_) => GpioStatusReply::err(GpioStatus::InvalidPin),
                 None => GpioStatusReply::err(GpioStatus::InvalidPin),
             };
@@ -127,28 +126,29 @@ fn handle(driver: &Rp1GpioDriver, msg: &Message, reply_cap: u32) {
             reply_status(reply_cap, GPIO_OP_WRITE_PIN, status);
         }
 
-        GPIO_OP_READ_PIN => {
-            match GpioReadPinRequest::decode(msg.as_slice()) {
-                Some(req) if (req.pin as usize) < TOTAL_GPIOS => {
-                    let level = driver.read_pin(req.pin as usize);
-                    let reply_payload =
-                        GpioReadPinReply { pin: req.pin, level: level as u8, _pad: [0; 2] }
-                            .encode();
-                    if let Ok(reply) =
-                        Message::with_header(0, GPIO_OP_READ_PIN, 0, None, &reply_payload)
-                    {
-                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
-                    }
+        GPIO_OP_READ_PIN => match GpioReadPinRequest::decode(msg.as_slice()) {
+            Some(req) if (req.pin as usize) < TOTAL_GPIOS => {
+                let level = driver.read_pin(req.pin as usize);
+                let reply_payload = GpioReadPinReply {
+                    pin: req.pin,
+                    level: level as u8,
+                    _pad: [0; 2],
                 }
-                Some(_) | None => {
-                    reply_status(
-                        reply_cap,
-                        GPIO_OP_READ_PIN,
-                        GpioStatusReply::err(GpioStatus::InvalidPin),
-                    );
+                .encode();
+                if let Ok(reply) =
+                    Message::with_header(0, GPIO_OP_READ_PIN, 0, None, &reply_payload)
+                {
+                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
                 }
             }
-        }
+            Some(_) | None => {
+                reply_status(
+                    reply_cap,
+                    GPIO_OP_READ_PIN,
+                    GpioStatusReply::err(GpioStatus::InvalidPin),
+                );
+            }
+        },
 
         _ => {
             // Unknown opcode — send a generic error status.
@@ -176,7 +176,7 @@ fn reply_status(reply_cap: u32, opcode: u16, status: GpioStatusReply) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm_ipc_abi::gpio_abi::{GpioStatus, GpioStatusReply, GPIO_MODE_INPUT, GPIO_MODE_OUTPUT};
+    use yarm_ipc_abi::gpio_abi::{GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GpioStatus, GpioStatusReply};
 
     #[test]
     fn gpio_status_reply_ok_encodes_zero() {
@@ -192,7 +192,12 @@ mod tests {
     #[test]
     fn set_pin_mode_decode_round_trips_all_modes() {
         for mode in [GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GPIO_MODE_ALT_FUNC] {
-            let req = GpioSetPinModeRequest { pin: 10, mode, function: 2, initial_level: 1 };
+            let req = GpioSetPinModeRequest {
+                pin: 10,
+                mode,
+                function: 2,
+                initial_level: 1,
+            };
             assert_eq!(GpioSetPinModeRequest::decode(&req.encode()), Some(req));
         }
     }
@@ -200,14 +205,22 @@ mod tests {
     #[test]
     fn write_pin_request_round_trips_high_and_low() {
         for level in [0u8, 1u8] {
-            let req = GpioWritePinRequest { pin: 5, level, _pad: [0; 2] };
+            let req = GpioWritePinRequest {
+                pin: 5,
+                level,
+                _pad: [0; 2],
+            };
             assert_eq!(GpioWritePinRequest::decode(&req.encode()), Some(req));
         }
     }
 
     #[test]
     fn read_pin_reply_encodes_pin_and_level() {
-        let reply = GpioReadPinReply { pin: 17, level: 1, _pad: [0; 2] };
+        let reply = GpioReadPinReply {
+            pin: 17,
+            level: 1,
+            _pad: [0; 2],
+        };
         let enc = reply.encode();
         assert_eq!(enc[0], 17);
         assert_eq!(enc[1], 1);

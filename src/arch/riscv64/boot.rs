@@ -108,7 +108,12 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
         .find("/init")
         .ok()
         .flatten()
-        .or_else(|| yarm_srv_common::cpio::CpioArchive::new(bytes).find("init").ok().flatten())?;
+        .or_else(|| {
+            yarm_srv_common::cpio::CpioArchive::new(bytes)
+                .find("init")
+                .ok()
+                .flatten()
+        })?;
     let file_data = entry.file_data();
     if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
         crate::yarm_log!(
@@ -176,7 +181,9 @@ pub fn bootstrap_first_user_task(
     crate::yarm_log!("INIT_FIRST_PT_LOAD_VADDR value={:#x}", init_first_pt_load);
     crate::yarm_log!("INIT_SELECTED_ENTRY value={:#x}", init_entry);
     if init_entry == init_first_pt_load {
-        crate::yarm_log!("INIT_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+        crate::yarm_log!(
+            "INIT_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong"
+        );
     }
     crate::yarm_log!(
         "YARM_INITRD_INIT_ELF_SELECTED entry={:#x} source={}",
@@ -192,11 +199,19 @@ pub fn bootstrap_first_user_task(
         let (_, sup_first_pt_load, sup_heap) =
             kernel.load_elf_pt_load_segments(sup_asid, sup_bytes)?;
         let sup_entry = sup_elf_info.entry as usize;
-        crate::yarm_log!("SUPERVISOR_ELF_HEADER_ENTRY value={:#x}", sup_elf_info.entry);
-        crate::yarm_log!("SUPERVISOR_FIRST_PT_LOAD_VADDR value={:#x}", sup_first_pt_load);
+        crate::yarm_log!(
+            "SUPERVISOR_ELF_HEADER_ENTRY value={:#x}",
+            sup_elf_info.entry
+        );
+        crate::yarm_log!(
+            "SUPERVISOR_FIRST_PT_LOAD_VADDR value={:#x}",
+            sup_first_pt_load
+        );
         crate::yarm_log!("SUPERVISOR_SELECTED_ENTRY value={:#x}", sup_entry);
         if sup_entry == sup_first_pt_load {
-            crate::yarm_log!("SUPERVISOR_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+            crate::yarm_log!(
+                "SUPERVISOR_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong"
+            );
         }
         Some((sup_asid, sup_entry, sup_heap))
     } else {
@@ -209,14 +224,15 @@ pub fn bootstrap_first_user_task(
         let pm_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(2, pm_bytes)
             .map_err(|_| crate::kernel::boot::KernelError::WrongObject)?;
         let (pm_asid, _) = kernel.create_user_address_space()?;
-        let (_, pm_first_pt_load, pm_heap) =
-            kernel.load_elf_pt_load_segments(pm_asid, pm_bytes)?;
+        let (_, pm_first_pt_load, pm_heap) = kernel.load_elf_pt_load_segments(pm_asid, pm_bytes)?;
         let pm_entry = pm_elf_info.entry as usize;
         crate::yarm_log!("PM_ELF_HEADER_ENTRY value={:#x}", pm_elf_info.entry);
         crate::yarm_log!("PM_FIRST_PT_LOAD_VADDR value={:#x}", pm_first_pt_load);
         crate::yarm_log!("PM_SELECTED_ENTRY value={:#x}", pm_entry);
         if pm_entry == pm_first_pt_load {
-            crate::yarm_log!("PM_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+            crate::yarm_log!(
+                "PM_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong"
+            );
         }
         Some((pm_asid, pm_entry, pm_heap))
     } else {
@@ -234,84 +250,152 @@ pub fn bootstrap_first_user_task(
 
     let (_, pm_inbound_send_root, pm_inbound_recv_root) = kernel.create_endpoint(16)?;
     let pm_inbound_send_init = kernel.grant_capability_task_to_task_with_rights(
-        0, pm_inbound_send_root, RING3_INIT_SERVER_TID,
+        0,
+        pm_inbound_send_root,
+        RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::SEND,
     )?;
-    crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok", RING3_INIT_SERVER_TID, pm_inbound_send_init.0);
+    crate::yarm_log!(
+        "CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok",
+        RING3_INIT_SERVER_TID,
+        pm_inbound_send_init.0
+    );
     let pm_inbound_send_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, pm_inbound_send_root, RING3_SUPERVISOR_TID,
+            0,
+            pm_inbound_send_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::SEND,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
     let pm_inbound_recv_pm = if pm_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, pm_inbound_recv_root, RING3_PM_SERVER_TID,
+            0,
+            pm_inbound_recv_root,
+            RING3_PM_SERVER_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=17 cap={} rights=RECEIVE result=ok", RING3_PM_SERVER_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=17 cap={} rights=RECEIVE result=ok",
+            RING3_PM_SERVER_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     let (_, _, init_reply_recv_root) = kernel.create_endpoint(8)?;
     let init_reply_recv_init = kernel.grant_capability_task_to_task_with_rights(
-        0, init_reply_recv_root, RING3_INIT_SERVER_TID,
+        0,
+        init_reply_recv_root,
+        RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::RECEIVE,
     )?;
-    crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_INIT_SERVER_TID, init_reply_recv_init.0);
+    crate::yarm_log!(
+        "CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok",
+        RING3_INIT_SERVER_TID,
+        init_reply_recv_init.0
+    );
 
     // Dedicated PM outbound reply endpoint: PM receives on startup slot 2.
     let (_, _, pm_outbound_reply_recv_root) = kernel.create_endpoint(8)?;
     let pm_outbound_reply_recv_pm = if pm_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, pm_outbound_reply_recv_root, RING3_PM_SERVER_TID,
+            0,
+            pm_outbound_reply_recv_root,
+            RING3_PM_SERVER_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_PM_SERVER_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok",
+            RING3_PM_SERVER_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     let (_, _, sup_fault_recv_root) = kernel.create_endpoint(8)?;
     let sup_fault_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_fault_recv_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_fault_recv_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=3 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=3 cap={} rights=RECEIVE result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     // EP4: Supervisor control — supervisor SEND (slot 4), supervisor RECV (slot 5).
     let (_, sup_ctrl_send_root, sup_ctrl_recv_root) = kernel.create_endpoint(8)?;
     let sup_ctrl_send_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_ctrl_send_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_ctrl_send_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::SEND,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=4 cap={} rights=SEND result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=4 cap={} rights=SEND result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
     let sup_ctrl_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_ctrl_recv_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_ctrl_recv_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=5 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=5 cap={} rights=RECEIVE result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     // EP5: Supervisor PM reply — supervisor gets RECV (slot 2); distinct from init's EP2.
     let (_, _, sup_pm_reply_recv_root) = kernel.create_endpoint(8)?;
     let sup_pm_reply_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_pm_reply_recv_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_pm_reply_recv_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     if let Some(fault_cap) = sup_fault_recv_sup {
         kernel.set_supervisor_endpoint_for_task(RING3_SUPERVISOR_TID, fault_cap)?;
@@ -320,11 +404,21 @@ pub fn bootstrap_first_user_task(
     if let Some((sup_asid, sup_entry, sup_heap)) = supervisor_aei {
         let mut sup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         sup_args[0] = RING3_SUPERVISOR_TID;
-        if let Some(c) = pm_inbound_send_sup   { sup_args[1] = c.0; }
-        if let Some(c) = sup_pm_reply_recv_sup { sup_args[2] = c.0; }
-        if let Some(c) = sup_fault_recv_sup    { sup_args[3] = c.0; }
-        if let Some(c) = sup_ctrl_send_sup     { sup_args[4] = c.0; }
-        if let Some(c) = sup_ctrl_recv_sup     { sup_args[5] = c.0; }
+        if let Some(c) = pm_inbound_send_sup {
+            sup_args[1] = c.0;
+        }
+        if let Some(c) = sup_pm_reply_recv_sup {
+            sup_args[2] = c.0;
+        }
+        if let Some(c) = sup_fault_recv_sup {
+            sup_args[3] = c.0;
+        }
+        if let Some(c) = sup_ctrl_send_sup {
+            sup_args[4] = c.0;
+        }
+        if let Some(c) = sup_ctrl_recv_sup {
+            sup_args[5] = c.0;
+        }
         sup_args[8] = RING3_INIT_SERVER_TID;
         for n in 0..10usize {
             crate::yarm_log!("SUP_STARTUP_SLOT slot={} value={}", n, sup_args[n]);
@@ -344,8 +438,12 @@ pub fn bootstrap_first_user_task(
     if let Some((pm_asid, pm_entry, pm_heap)) = pm_aei {
         let mut pm_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         pm_args[0] = RING3_PM_SERVER_TID;
-        if let Some(c) = pm_outbound_reply_recv_pm { pm_args[2] = c.0; }
-        if let Some(c) = pm_inbound_recv_pm { pm_args[17] = c.0; }
+        if let Some(c) = pm_outbound_reply_recv_pm {
+            pm_args[2] = c.0;
+        }
+        if let Some(c) = pm_inbound_recv_pm {
+            pm_args[17] = c.0;
+        }
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: RING3_PM_SERVER_TID,
             entry: pm_entry,
@@ -366,7 +464,10 @@ pub fn bootstrap_first_user_task(
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
-        init_args[0], init_args[1], init_args[2], init_args[3]
+        init_args[0],
+        init_args[1],
+        init_args[2],
+        init_args[3]
     );
     kernel.spawn_user_task_from_image(UserImageSpec {
         tid: RING3_INIT_SERVER_TID,
@@ -416,7 +517,11 @@ struct SecondaryHartHandoff {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 impl SecondaryHartHandoff {
     const fn empty() -> Self {
-        Self { hart_id: usize::MAX, stack_top: 0, ack: RISCV64_SECONDARY_ACK_EMPTY }
+        Self {
+            hart_id: usize::MAX,
+            stack_top: 0,
+            ack: RISCV64_SECONDARY_ACK_EMPTY,
+        }
     }
 }
 
@@ -443,19 +548,29 @@ extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
     if handoff_ptr != 0 {
         let handoff = handoff_ptr as *mut SecondaryHartHandoff;
         unsafe {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).ack), RISCV64_SECONDARY_ACK_PARKED);
+            core::ptr::write_volatile(
+                core::ptr::addr_of_mut!((*handoff).ack),
+                RISCV64_SECONDARY_ACK_PARKED,
+            );
         }
     }
     crate::arch::riscv64::console::write_line("YARM_RISCV64_SMP_SECONDARY_PARKED");
     loop {
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
     }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn secondary_stack_top(slot: usize) -> usize {
     let stacks = core::ptr::addr_of_mut!(RISCV64_SECONDARY_STACKS) as *mut SecondaryHartStack;
-    unsafe { stacks.add(slot).cast::<u8>().add(RISCV64_SECONDARY_STACK_BYTES) as usize }
+    unsafe {
+        stacks
+            .add(slot)
+            .cast::<u8>()
+            .add(RISCV64_SECONDARY_STACK_BYTES) as usize
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -464,8 +579,14 @@ fn prepare_secondary_handoff(slot: usize, hart_id: usize) -> usize {
     let handoff = unsafe { handoffs.add(slot) };
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).hart_id), hart_id);
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).stack_top), secondary_stack_top(slot));
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*handoff).ack), RISCV64_SECONDARY_ACK_START_REQUESTED);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*handoff).stack_top),
+            secondary_stack_top(slot),
+        );
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!((*handoff).ack),
+            RISCV64_SECONDARY_ACK_START_REQUESTED,
+        );
     }
     handoff as usize
 }
@@ -516,11 +637,18 @@ fn release_qemu_virt_secondaries_with_hsm() {
                 let acked = wait_for_secondary_ack(slot);
                 crate::yarm_log!(
                     "YARM_RISCV64_SMP_HART_START hart={} ret=0 ack={} state=parked_not_online entry=0x{:x} handoff=0x{:x}",
-                    hart_id, acked as u8, entry_addr, handoff_ptr
+                    hart_id,
+                    acked as u8,
+                    entry_addr,
+                    handoff_ptr
                 );
             }
             Err(err) => {
-                crate::yarm_log!("YARM_RISCV64_SMP_HART_START hart={} err={:?} ack=0 state=not_started", hart_id, err);
+                crate::yarm_log!(
+                    "YARM_RISCV64_SMP_HART_START hart={} err={:?} ack=0 state=not_started",
+                    hart_id,
+                    err
+                );
             }
         }
     }

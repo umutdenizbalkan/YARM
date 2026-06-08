@@ -624,8 +624,7 @@ impl KernelState {
 
         // All steps below must destroy child_asid on failure to prevent leaking
         // the cloned address space when post-clone task setup fails.
-        let result =
-            self.fork_complete_post_clone(parent, parent_class, child_asid, parent_tid);
+        let result = self.fork_complete_post_clone(parent, parent_class, child_asid, parent_tid);
         if result.is_err() {
             let _ = self.destroy_user_address_space_by_asid(child_asid);
         }

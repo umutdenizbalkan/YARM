@@ -7,10 +7,7 @@
 // PM sequentially reads each ELF binary via VFS into a Vec<u8> before spawning.
 // PM heap target is 256 KiB. Runtime ELF staging Vecs are reclaimed between spawns by the free-list allocator.
 #[cfg(not(feature = "hosted-dev"))]
-yarm::install_freestanding_allocator!(
-    256 * 1024,
-    "process manager freestanding allocator OOM"
-);
+yarm::install_freestanding_allocator!(256 * 1024, "process manager freestanding allocator OOM");
 
 #[inline]
 fn run() {

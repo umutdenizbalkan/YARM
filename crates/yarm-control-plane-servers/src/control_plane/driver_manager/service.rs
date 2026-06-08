@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+#[cfg(test)]
+use yarm::kernel::boot::{KernelError, KernelState};
 use yarm_ipc_abi::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
 };
-#[cfg(test)]
-use yarm::kernel::boot::{KernelError, KernelState};
 use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::Message;
 use yarm_user_rt::runtime::{DriverControlOps, KernelIpcError};
@@ -16,7 +16,9 @@ use yarm_user_rt::runtime::{DriverControlOps, KernelIpcError};
 
 fn read_u64(payload: &[u8], offset: usize) -> Result<u64, KernelIpcError> {
     let end = offset.checked_add(8).ok_or(KernelIpcError::WrongObject)?;
-    let bytes = payload.get(offset..end).ok_or(KernelIpcError::WrongObject)?;
+    let bytes = payload
+        .get(offset..end)
+        .ok_or(KernelIpcError::WrongObject)?;
     let mut arr = [0u8; 8];
     arr.copy_from_slice(bytes);
     Ok(u64::from_le_bytes(arr))
@@ -95,9 +97,10 @@ impl DriverRegistry {
     /// the table is full.
     pub fn register(&mut self, tid: u64) -> Result<(), KernelIpcError> {
         // Duplicate: return Ok without creating a second entry.
-        if self.records[..self.len].iter().any(|r| {
-            r.map(|rec| rec.tid == tid).unwrap_or(false)
-        }) {
+        if self.records[..self.len]
+            .iter()
+            .any(|r| r.map(|rec| rec.tid == tid).unwrap_or(false))
+        {
             return Ok(());
         }
         if self.len >= MAX_DRIVERS {
@@ -140,7 +143,9 @@ impl<'a> KernelDriverControl<'a> {
 #[cfg(test)]
 impl DriverControlOps for KernelDriverControl<'_> {
     fn register_driver(&mut self, tid: u64) -> Result<(), KernelIpcError> {
-        self.kernel.register_driver(tid).map_err(map_kernel_ipc_error)
+        self.kernel
+            .register_driver(tid)
+            .map_err(map_kernel_ipc_error)
     }
 
     fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelIpcError> {
@@ -348,8 +353,8 @@ pub fn run() {
             // SAFETY: driver_manager owns its startup-provided service recv endpoint.
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
                 Ok(Some(received)) => {
-                let msg = received.message;
-                let reply_cap = received.reply_cap;
+                    let msg = received.message;
+                    let reply_cap = received.reply_cap;
                     yarm_user_rt::user_log!(
                         "DRIVER_MANAGER_GOT_MSG opcode={} reply_cap={}",
                         msg.opcode,
@@ -359,16 +364,11 @@ pub fn run() {
                         Ok(reply) => {
                             if let Some(cap) = reply_cap {
                                 // SAFETY: kernel validates reply capability rights/object.
-                                let _ = unsafe {
-                                    yarm_user_rt::syscall::ipc_reply(cap, &reply)
-                                };
+                                let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
                             }
                         }
                         Err(e) => {
-                            yarm_user_rt::user_log!(
-                                "DRIVER_MANAGER_HANDLE_ERR err={:?}",
-                                e
-                            );
+                            yarm_user_rt::user_log!("DRIVER_MANAGER_HANDLE_ERR err={:?}", e);
                         }
                     }
                 }
@@ -440,13 +440,17 @@ mod tests {
             state.register_task(5).expect("task");
             let mut runtime = KernelDriverControl { kernel: &mut state };
 
-            let register = Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &5u64.to_le_bytes())
-                .expect("register");
-            let irq = Message::with_header(0, DRIVER_OP_GRANT_IRQ, 0, None, &pack_driver_pair(5, 2))
-                .expect("irq");
+            let register =
+                Message::with_header(0, DRIVER_OP_REGISTER, 0, None, &5u64.to_le_bytes())
+                    .expect("register");
+            let irq =
+                Message::with_header(0, DRIVER_OP_GRANT_IRQ, 0, None, &pack_driver_pair(5, 2))
+                    .expect("irq");
 
             let mut service = DriverService::new();
-            let handled = service.handle_batch(&mut runtime, [register, irq]).expect("batch");
+            let handled = service
+                .handle_batch(&mut runtime, [register, irq])
+                .expect("batch");
             assert_eq!(handled, 2);
             assert_eq!(service.handled_count(), 2);
         });

@@ -2,9 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
-use crate::kernel::ipc::ThreadId;
-use crate::kernel::capabilities::{CapId, CapRights};
 use crate::arch::hal::Hal;
+use crate::kernel::capabilities::{CapId, CapRights};
+use crate::kernel::ipc::ThreadId;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{TaskStatus, ThreadGroupId, UserRegisterContext, WaitReason};
 use crate::kernel::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
@@ -457,8 +457,12 @@ impl KernelState {
         crate::yarm_log!(
             "ZC_FEASIBILITY image_id={} initrd_phys=0x{:x} file_off=0x{:x} \
              file_phys=0x{:x} offset_in_page={} feasible={}",
-            image_id, initrd_phys_base, file_initrd_offset,
-            file_phys_start, offset_in_page, zc_feasible
+            image_id,
+            initrd_phys_base,
+            file_initrd_offset,
+            file_phys_start,
+            offset_in_page,
+            zc_feasible
         );
 
         if !zc_feasible {
@@ -467,7 +471,8 @@ impl KernelState {
             let copied_pages = Self::count_elf_load_pages(image).unwrap_or(0);
             crate::yarm_log!(
                 "ZC_FALLBACK image_id={} reason=cpio_file_data_unaligned copied_pages={}",
-                image_id, copied_pages
+                image_id,
+                copied_pages
             );
             let (entry, first, heap) = self.load_elf_pt_load_segments(asid, image)?;
             return Ok((entry, first, heap, 0, copied_pages));
@@ -487,8 +492,12 @@ impl KernelState {
         if phnum == 0 || phentsize < ELF64_PHDR_SIZE {
             return Err(KernelError::WrongObject);
         }
-        let table_size = phnum.checked_mul(phentsize).ok_or(KernelError::WrongObject)?;
-        let phend = phoff.checked_add(table_size).ok_or(KernelError::WrongObject)?;
+        let table_size = phnum
+            .checked_mul(phentsize)
+            .ok_or(KernelError::WrongObject)?;
+        let phend = phoff
+            .checked_add(table_size)
+            .ok_or(KernelError::WrongObject)?;
         if phend > image.len() {
             return Err(KernelError::WrongObject);
         }
@@ -520,14 +529,18 @@ impl KernelState {
                 first_pt_load_vaddr = p_vaddr;
             }
             saw_pt_load = true;
-            let seg_end = p_vaddr.checked_add(p_memsz as u64).ok_or(KernelError::WrongObject)?;
+            let seg_end = p_vaddr
+                .checked_add(p_memsz as u64)
+                .ok_or(KernelError::WrongObject)?;
             if seg_end > max_loaded_end {
                 max_loaded_end = seg_end;
             }
             if p_filesz > p_memsz {
                 return Err(KernelError::WrongObject);
             }
-            let file_end = p_offset.checked_add(p_filesz).ok_or(KernelError::WrongObject)?;
+            let file_end = p_offset
+                .checked_add(p_filesz)
+                .ok_or(KernelError::WrongObject)?;
             if file_end > image.len() {
                 return Err(KernelError::WrongObject);
             }
@@ -541,8 +554,15 @@ impl KernelState {
                 "ZC_SEG_BEGIN image_id={} seg={} p_offset=0x{:x} p_vaddr=0x{:x} \
                  p_filesz={} p_memsz={} p_flags=0x{:x} file_data_phys=0x{:x} \
                  offset_in_page={}",
-                image_id, seg_idx, p_offset, p_vaddr, p_filesz, p_memsz,
-                p_flags_raw, file_phys_start, file_phys_start & (page_size - 1)
+                image_id,
+                seg_idx,
+                p_offset,
+                p_vaddr,
+                p_filesz,
+                p_memsz,
+                p_flags_raw,
+                file_phys_start,
+                file_phys_start & (page_size - 1)
             );
 
             let mut seg_zc = 0usize;
@@ -557,7 +577,10 @@ impl KernelState {
                     crate::yarm_log!(
                         "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x0 \
                          reason=wx_rejected pflags=0x{:x}",
-                        image_id, seg_idx, va, combined_pflags
+                        image_id,
+                        seg_idx,
+                        va,
+                        combined_pflags
                     );
                     return Err(KernelError::WrongObject);
                 }
@@ -595,10 +618,15 @@ impl KernelState {
 
                 crate::yarm_log!(
                     "ZC_PAGE image_id={} seg={} va=0x{:x} src_phys=0x{:x} reason={}",
-                    image_id, seg_idx, va, initrd_phys_of_page, reason
+                    image_id,
+                    seg_idx,
+                    va,
+                    initrd_phys_of_page,
+                    reason
                 );
 
-                let existing = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
+                let existing =
+                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va));
                 if existing.is_some() {
                     // Page already mapped by an earlier overlapping segment — skip.
                 } else if can_zc {
@@ -606,7 +634,10 @@ impl KernelState {
                     self.map_user_page_in_asid_raw(
                         asid,
                         VirtAddr(va),
-                        Mapping { phys: PhysAddr(initrd_phys_of_page), flags },
+                        Mapping {
+                            phys: PhysAddr(initrd_phys_of_page),
+                            flags,
+                        },
                     )?;
                     zc_pages += 1;
                     seg_zc += 1;
@@ -617,7 +648,10 @@ impl KernelState {
                     self.map_user_page_in_asid_raw(
                         asid,
                         VirtAddr(va),
-                        Mapping { phys: PhysAddr(phys), flags: stage_flags },
+                        Mapping {
+                            phys: PhysAddr(phys),
+                            flags: stage_flags,
+                        },
                     )?;
                     copied_pages += 1;
                     seg_copied += 1;
@@ -628,7 +662,12 @@ impl KernelState {
             crate::yarm_log!(
                 "ZC_SEG_DONE image_id={} seg={} p_vaddr=0x{:x} p_flags=0x{:x} \
                  zc_pages={} copied_pages={}",
-                image_id, seg_idx, p_vaddr, p_flags_raw, seg_zc, seg_copied
+                image_id,
+                seg_idx,
+                p_vaddr,
+                p_flags_raw,
+                seg_zc,
+                seg_copied
             );
 
             // Copy ELF file bytes into non-ZC pages only.
@@ -698,7 +737,9 @@ impl KernelState {
             }
             let p_vaddr = read_u64_le(image, base + 16)?;
             let p_memsz = read_u64_le(image, base + 40)?;
-            let seg_end = p_vaddr.checked_add(p_memsz).ok_or(KernelError::WrongObject)?;
+            let seg_end = p_vaddr
+                .checked_add(p_memsz)
+                .ok_or(KernelError::WrongObject)?;
             let page_start = p_vaddr & !(page_size - 1);
             let page_end_va = (seg_end + page_size - 1) & !(page_size - 1);
             let mut va = page_start;
@@ -706,14 +747,16 @@ impl KernelState {
                 let combined_pflags =
                     Self::load_page_elf_pflags(image, phoff, phentsize, phnum, va, va + page_size)?;
                 let final_flags = Self::page_flags_from_elf_pflags(combined_pflags)?;
-                let phys =
-                    crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
-                        .ok_or(KernelError::UserMemoryFault)?
-                        .addr();
+                let phys = crate::arch::selected_isa::page_table::resolve_page(asid, VirtAddr(va))
+                    .ok_or(KernelError::UserMemoryFault)?
+                    .addr();
                 self.map_user_page_in_asid_raw(
                     asid,
                     VirtAddr(va),
-                    Mapping { phys: PhysAddr(phys), flags: final_flags },
+                    Mapping {
+                        phys: PhysAddr(phys),
+                        flags: final_flags,
+                    },
                 )?;
                 va += page_size;
             }
@@ -724,7 +767,13 @@ impl KernelState {
             .ok_or(KernelError::WrongObject)?
             & !(page_size - 1);
 
-        Ok((entry as usize, first_pt_load_vaddr as usize, heap_base as usize, zc_pages, copied_pages))
+        Ok((
+            entry as usize,
+            first_pt_load_vaddr as usize,
+            heap_base as usize,
+            zc_pages,
+            copied_pages,
+        ))
     }
 
     fn maybe_switch_kernel_context(
@@ -917,7 +966,11 @@ impl KernelState {
             ) {
                 Ok(local_cap) => {
                     spec.startup_args[12] = local_cap.0;
-                    crate::yarm_log!("KSPAWN_RECV_CAP_DELEGATED tid={} local_cap={}", spec.tid, local_cap.0);
+                    crate::yarm_log!(
+                        "KSPAWN_RECV_CAP_DELEGATED tid={} local_cap={}",
+                        spec.tid,
+                        local_cap.0
+                    );
                 }
                 Err(e) => {
                     crate::yarm_log!("KSPAWN_RECV_CAP_DELEGATE_FAIL tid={} err={:?}", spec.tid, e);
@@ -963,10 +1016,20 @@ impl KernelState {
                 ) {
                     Ok(local_cap) => {
                         spec.startup_args[13 + i] = local_cap.0;
-                        crate::yarm_log!("KSPAWN_EXTRA_CAP_DELEGATED tid={} slot={} local_cap={}", spec.tid, 13 + i, local_cap.0);
+                        crate::yarm_log!(
+                            "KSPAWN_EXTRA_CAP_DELEGATED tid={} slot={} local_cap={}",
+                            spec.tid,
+                            13 + i,
+                            local_cap.0
+                        );
                     }
                     Err(e) => {
-                        crate::yarm_log!("KSPAWN_EXTRA_CAP_DELEGATE_FAIL tid={} slot={} err={:?}", spec.tid, 13 + i, e);
+                        crate::yarm_log!(
+                            "KSPAWN_EXTRA_CAP_DELEGATE_FAIL tid={} slot={} err={:?}",
+                            spec.tid,
+                            13 + i,
+                            e
+                        );
                     }
                 }
             }

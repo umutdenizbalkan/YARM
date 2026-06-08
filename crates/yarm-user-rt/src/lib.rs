@@ -19,8 +19,7 @@ pub fn __user_log_emit(args: core::fmt::Arguments<'_>) {
 
 pub mod ipc {
     pub use yarm_ipc_abi::vfs_abi::{
-        ReadWriteArgs, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX,
-        VFS_OP_WRITE,
+        ReadWriteArgs, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_STATX, VFS_OP_WRITE,
     };
     pub use yarm_kernel::ipc::{IpcError, Message, SharedMemoryRegion, ThreadId, TransferCapId};
 }
@@ -105,11 +104,14 @@ pub mod syscall {
         fn recv_v2(
             &mut self,
             ep_cap: u32,
-         ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
+        ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
             match self.recv(ep_cap) {
-                Ok(Some(msg)) => {
-                    Ok(Some(ReceivedMessage { message: msg, reply_cap: None, transferred_cap: msg.transferred_cap().map(|c| c.0 as u32), sender_tid: msg.sender_tid.0 }))
-                }
+                Ok(Some(msg)) => Ok(Some(ReceivedMessage {
+                    message: msg,
+                    reply_cap: None,
+                    transferred_cap: msg.transferred_cap().map(|c| c.0 as u32),
+                    sender_tid: msg.sender_tid.0,
+                })),
                 Ok(None) => Ok(None),
                 Err(e) => Err(e),
             }
@@ -153,7 +155,7 @@ pub mod syscall {
         fn recv_v2(
             &mut self,
             ep_cap: u32,
-         ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
+        ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
             // SAFETY: forwards directly to syscall wrapper.
             unsafe { ipc_recv_v2(ep_cap) }
         }
@@ -174,8 +176,7 @@ pub mod syscall {
                     let bytes = s.as_bytes();
                     let available = MAX_LOG_LEN - self.len;
                     let to_copy = bytes.len().min(available);
-                    self.buf[self.len..self.len + to_copy]
-                        .copy_from_slice(&bytes[..to_copy]);
+                    self.buf[self.len..self.len + to_copy].copy_from_slice(&bytes[..to_copy]);
                     self.len += to_copy;
                     Ok(())
                 }
@@ -252,14 +253,20 @@ pub mod syscall {
     #[inline]
     pub unsafe fn ipc_recv_v2(
         ep_cap: u32,
-     ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
+    ) -> core::result::Result<Option<ReceivedMessage>, SyscallError> {
         // Receive buffer is sized for legacy inline-request framing cases where the
         // kernel may strip a request prefix before exposing payload via out-meta.
         // Userspace decodes payload/opcode exclusively from IpcRecvMetaV2.
         const FRAMED_MAX: usize = 2 + Message::MAX_PAYLOAD;
         let mut payload = [0u8; FRAMED_MAX];
         let mut meta = IpcRecvMetaV2 {
-            status: u64::MAX, opcode: 0, flags: 0, payload_len: 0, cap_id: SYSCALL_NO_TRANSFER_CAP, recv_meta_flags: 0, sender_tid: 0
+            status: u64::MAX,
+            opcode: 0,
+            flags: 0,
+            payload_len: 0,
+            cap_id: SYSCALL_NO_TRANSFER_CAP,
+            recv_meta_flags: 0,
+            sender_tid: 0,
         };
         let args = [
             ep_cap as usize,
@@ -274,12 +281,20 @@ pub mod syscall {
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             let err = decode_syscall_error(ret.error);
-            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+            return if matches!(err, SyscallError::WouldBlock) {
+                Ok(None)
+            } else {
+                Err(err)
+            };
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
         if ret.ret0 != 0 && meta.status == u64::MAX {
             let err = decode_syscall_error(ret.ret0);
-            return if matches!(err, SyscallError::WouldBlock) { Ok(None) } else { Err(err) };
+            return if matches!(err, SyscallError::WouldBlock) {
+                Ok(None)
+            } else {
+                Err(err)
+            };
         }
         let payload_len = meta.payload_len as usize;
         if payload_len > Message::MAX_PAYLOAD || payload_len > FRAMED_MAX {
@@ -306,10 +321,25 @@ pub mod syscall {
         } else {
             None
         };
-        let flags = if transferred_cap.is_some() { Message::FLAG_CAP_TRANSFER } else { 0 };
-        let msg = Message::with_header(meta.sender_tid, opcode, flags, transferred_cap.map(|c| c as u64), msg_payload)
-            .map_err(|_| SyscallError::InvalidArgs)?;
-        Ok(Some(ReceivedMessage { message: msg, reply_cap, transferred_cap, sender_tid: meta.sender_tid }))
+        let flags = if transferred_cap.is_some() {
+            Message::FLAG_CAP_TRANSFER
+        } else {
+            0
+        };
+        let msg = Message::with_header(
+            meta.sender_tid,
+            opcode,
+            flags,
+            transferred_cap.map(|c| c as u64),
+            msg_payload,
+        )
+        .map_err(|_| SyscallError::InvalidArgs)?;
+        Ok(Some(ReceivedMessage {
+            message: msg,
+            reply_cap,
+            transferred_cap,
+            sender_tid: meta.sender_tid,
+        }))
     }
 
     #[inline]
@@ -319,7 +349,13 @@ pub mod syscall {
     ) -> core::result::Result<Option<Message>, SyscallError> {
         let mut payload = [0u8; 2 + Message::MAX_PAYLOAD];
         let mut meta = IpcRecvMetaV2 {
-            status: u64::MAX, opcode: 0, flags: 0, payload_len: 0, cap_id: SYSCALL_NO_TRANSFER_CAP, recv_meta_flags: 0, sender_tid: 0
+            status: u64::MAX,
+            opcode: 0,
+            flags: 0,
+            payload_len: 0,
+            cap_id: SYSCALL_NO_TRANSFER_CAP,
+            recv_meta_flags: 0,
+            sender_tid: 0,
         };
         let args = [
             ep_cap as usize,
@@ -375,8 +411,14 @@ pub mod syscall {
         } else {
             0
         };
-        let msg = Message::with_header(meta.sender_tid, meta.opcode, flags, transfer_cap, &payload[..len])
-            .map_err(|_| SyscallError::InvalidArgs)?;
+        let msg = Message::with_header(
+            meta.sender_tid,
+            meta.opcode,
+            flags,
+            transfer_cap,
+            &payload[..len],
+        )
+        .map_err(|_| SyscallError::InvalidArgs)?;
         Ok(Some(msg))
     }
 
@@ -494,12 +536,12 @@ pub mod syscall {
         startup_args: &[u64; 18],
     ) -> core::result::Result<(u64, u32, u32), SyscallError> {
         let args = [
-            image_id as usize,                // arg0 = image_id
-            elf_ptr as usize,                 // arg1 = elf_user_ptr
-            elf_len,                          // arg2 = elf_len
-            parent_pid as usize,             // arg3 = parent_pid
-            startup_args.as_ptr() as usize,  // arg4 = startup_args_ptr
-            startup_args.len(),              // arg5 = startup_args_count
+            image_id as usize,              // arg0 = image_id
+            elf_ptr as usize,               // arg1 = elf_user_ptr
+            elf_len,                        // arg2 = elf_len
+            parent_pid as usize,            // arg3 = parent_pid
+            startup_args.as_ptr() as usize, // arg4 = startup_args_ptr
+            startup_args.len(),             // arg5 = startup_args_count
         ];
         // SAFETY: Uses architecture syscall ABI; elf_ptr lifetime covers the call.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR, args) };
@@ -530,12 +572,12 @@ pub mod syscall {
             return Err(SyscallError::InvalidArgs);
         }
         let args = [
-            image_id as usize,               // arg0 = image_id
-            name.as_ptr() as usize,          // arg1 = name_ptr
-            name.len(),                      // arg2 = name_len
-            parent_pid as usize,             // arg3 = parent_pid
-            startup_args.as_ptr() as usize,  // arg4 = startup_args_ptr
-            startup_args.len(),              // arg5 = startup_args_count
+            image_id as usize,              // arg0 = image_id
+            name.as_ptr() as usize,         // arg1 = name_ptr
+            name.len(),                     // arg2 = name_len
+            parent_pid as usize,            // arg3 = parent_pid
+            startup_args.as_ptr() as usize, // arg4 = startup_args_ptr
+            startup_args.len(),             // arg5 = startup_args_count
         ];
         #[cfg(all(target_arch = "aarch64", not(test)))]
         {
@@ -558,7 +600,10 @@ pub mod syscall {
             }
             crate::user_log!(
                 "SPAWN26_RTLIB_STACK_BEFORE sp=0x{:x} fp=0x{:x} lr=0x{:x} saved_lr=0x{:x}",
-                sp, fp, lr, saved_lr
+                sp,
+                fp,
+                lr,
+                saved_lr
             );
         }
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR, args) };
@@ -583,11 +628,19 @@ pub mod syscall {
             }
             crate::user_log!(
                 "SPAWN26_RTLIB_STACK_AFTER sp=0x{:x} fp=0x{:x} lr=0x{:x} saved_lr=0x{:x}",
-                sp, fp, lr, saved_lr
+                sp,
+                fp,
+                lr,
+                saved_lr
             );
             crate::user_log!(
                 "AARCH64_SYSCALL26_RETURN x0={} x1={} x2={} x3={} x4={} x5={}",
-                ret.ret0, ret.ret1, ret.ret2, ret.ret3, ret.ret4, ret.ret5
+                ret.ret0,
+                ret.ret1,
+                ret.ret2,
+                ret.ret3,
+                ret.ret4,
+                ret.ret5
             );
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -652,11 +705,11 @@ pub mod syscall {
         let max_len = core::cmp::min(dst.len(), 4096);
         let args = [
             name.as_ptr() as usize,    // arg0 = name_ptr
-            name.len(),                 // arg1 = name_len
-            offset as usize,            // arg2 = offset
-            dst.as_mut_ptr() as usize,  // arg3 = dst_ptr (self-ASID)
-            max_len,                    // arg4 = max_len
-            0,                          // arg5 = target_tid (0 = self)
+            name.len(),                // arg1 = name_len
+            offset as usize,           // arg2 = offset
+            dst.as_mut_ptr() as usize, // arg3 = dst_ptr (self-ASID)
+            max_len,                   // arg4 = max_len
+            0,                         // arg5 = target_tid (0 = self)
         ];
         // SAFETY: Uses architecture syscall ABI; name and dst lifetimes cover the call.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_INITRAMFS_READ_CHUNK_NR, args) };
@@ -693,12 +746,12 @@ pub mod syscall {
         const PM_BOOTSTRAP_TID: usize = 3;
         let clamped_len = core::cmp::min(max_len, 4096);
         let args = [
-            name.as_ptr() as usize,  // arg0 = name_ptr
-            name.len(),               // arg1 = name_len
-            offset as usize,          // arg2 = offset
-            pm_dst_ptr,               // arg3 = dst_ptr (PM's VA)
-            clamped_len,              // arg4 = max_len
-            PM_BOOTSTRAP_TID,         // arg5 = target_tid = PM_TID (Phase 2B bridge)
+            name.as_ptr() as usize, // arg0 = name_ptr
+            name.len(),             // arg1 = name_len
+            offset as usize,        // arg2 = offset
+            pm_dst_ptr,             // arg3 = dst_ptr (PM's VA)
+            clamped_len,            // arg4 = max_len
+            PM_BOOTSTRAP_TID,       // arg5 = target_tid = PM_TID (Phase 2B bridge)
         ];
         // SAFETY: name lifetime covers the call; pm_dst_ptr validated by kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_INITRAMFS_READ_CHUNK_NR, args) };
@@ -728,15 +781,16 @@ pub mod syscall {
         flags: u64,
     ) -> core::result::Result<(u32, u64), SyscallError> {
         let args = [
-            name.as_ptr() as usize,  // arg0 = name_ptr
-            name.len(),               // arg1 = name_len
-            flags as usize,           // arg2 = flags (reserved, must be 0)
+            name.as_ptr() as usize, // arg0 = name_ptr
+            name.len(),             // arg1 = name_len
+            flags as usize,         // arg2 = flags (reserved, must be 0)
             0,
             0,
             0,
         ];
         // SAFETY: Uses architecture syscall ABI; name lifetime covers the call.
-        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, args) };
+        let ret =
+            unsafe { crate::arch::raw_syscall(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, args) };
         #[cfg(target_arch = "x86_64")]
         if ret.error != 0 {
             return Err(decode_syscall_error(ret.error));
@@ -766,11 +820,11 @@ pub mod syscall {
         startup_args: &[u64; 18],
     ) -> core::result::Result<(u64, u32, u32), SyscallError> {
         let args = [
-            image_id as usize,               // arg0 = image_id
-            mo_cap as usize,                 // arg1 = mo_cap
-            parent_pid as usize,             // arg2 = parent_pid
-            startup_args.as_ptr() as usize,  // arg3 = startup_args_ptr
-            startup_args.len(),              // arg4 = startup_args_count
+            image_id as usize,              // arg0 = image_id
+            mo_cap as usize,                // arg1 = mo_cap
+            parent_pid as usize,            // arg2 = parent_pid
+            startup_args.as_ptr() as usize, // arg3 = startup_args_ptr
+            startup_args.len(),             // arg4 = startup_args_count
             0,
         ];
         // SAFETY: Uses architecture syscall ABI; startup_args lifetime covers the call.
@@ -883,27 +937,26 @@ pub mod runtime {
     pub const STARTUP_SLOT_PM_REQUEST_RECV_CAP: usize = 17;
     const STARTUP_SLOT_COUNT: usize = 18;
 
-    static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] =
-        [
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-            AtomicU64::new(0),
-        ];
+    static STARTUP_ARG_SLOTS: [AtomicU64; STARTUP_SLOT_COUNT] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct StartupContext {
@@ -1060,7 +1113,10 @@ pub mod runtime {
         }
         user_log!(
             "STARTUP_INSTALL_FINAL task_id={} pm_send={} pm_reply={} slots_len={}",
-            slots[0], slots[1], slots[2], startup_slots_len
+            slots[0],
+            slots[1],
+            slots[2],
+            startup_slots_len
         );
         install_startup_arg_slots(slots);
     }
@@ -1189,7 +1245,8 @@ pub mod runtime {
         // `None` for optional endpoint caps.
         let task_id = STARTUP_ARG_SLOTS[STARTUP_SLOT_TASK_ID].load(Ordering::Relaxed);
         let process_manager_request_send_cap = cap_from_slot(
-            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP].load(Ordering::Relaxed),
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REQUEST_SEND_CAP]
+                .load(Ordering::Relaxed),
         );
         let process_manager_reply_recv_cap = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_REPLY_RECV_CAP].load(Ordering::Relaxed),
@@ -1219,7 +1276,8 @@ pub mod runtime {
             STARTUP_ARG_SLOTS[STARTUP_SLOT_SUPERVISOR_RESTART_WINDOW_TICKS].load(Ordering::Relaxed),
         );
         let process_manager_restart_control_send_cap = cap_from_slot(
-            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP].load(Ordering::Relaxed),
+            STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_RESTART_CONTROL_SEND_CAP]
+                .load(Ordering::Relaxed),
         );
         let process_manager_service_recv_ep = cap_from_slot(
             STARTUP_ARG_SLOTS[STARTUP_SLOT_PROCESS_MANAGER_SERVICE_RECV_EP].load(Ordering::Relaxed),
@@ -1397,7 +1455,10 @@ mod tests {
                 .process_manager_reply_recv_cap
                 .map(u64::from)
                 .unwrap_or(0),
-            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
+            original
+                .supervisor_fault_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
             original
                 .supervisor_control_send_ep
                 .map(u64::from)
@@ -1411,8 +1472,14 @@ mod tests {
             original.init_tid.unwrap_or(0),
             original.supervisor_tid.unwrap_or(0),
             original.supervisor_restart_window_ticks.unwrap_or(0),
-            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
-            original.process_manager_service_recv_ep.map(u64::from).unwrap_or(0),
+            original
+                .process_manager_restart_control_send_cap
+                .map(|v| v as u64)
+                .unwrap_or(0),
+            original
+                .process_manager_service_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
             0,
             0,
             0,
@@ -1436,14 +1503,8 @@ mod tests {
 
     #[test]
     fn ipc_call_prepare_preserves_cap_transfer_fields() {
-        let msg = Message::with_header(
-            0,
-            7,
-            Message::FLAG_CAP_TRANSFER,
-            Some(65551),
-            &[1, 2],
-        )
-        .unwrap();
+        let msg =
+            Message::with_header(0, 7, Message::FLAG_CAP_TRANSFER, Some(65551), &[1, 2]).unwrap();
         let (_frame, _len, tx_cap, flags) = ipc_call_prepare(&msg);
         assert_eq!(tx_cap, Some(65551));
         assert_ne!(flags & Message::FLAG_CAP_TRANSFER, 0);
@@ -1454,8 +1515,7 @@ mod tests {
         let original = startup_context();
 
         install_startup_arg_slots([
-            42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            0xC001000, // slot 15 = initrd_ptr
+            42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xC001000, // slot 15 = initrd_ptr
             4096,      // slot 16 = initrd_len
             0,
         ]);
@@ -1463,9 +1523,7 @@ mod tests {
         assert_eq!(ctx.initrd_ptr, Some(0xC001000u64));
         assert_eq!(ctx.initrd_len, Some(4096u64));
 
-        install_startup_arg_slots([
-            42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ]);
+        install_startup_arg_slots([42, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let ctx2 = startup_context();
         assert_eq!(ctx2.initrd_ptr, None);
         assert_eq!(ctx2.initrd_len, None);
@@ -1473,18 +1531,39 @@ mod tests {
         // Restore original
         install_startup_arg_slots([
             original.task_id,
-            original.process_manager_request_send_cap.map(u64::from).unwrap_or(0),
-            original.process_manager_reply_recv_cap.map(u64::from).unwrap_or(0),
-            original.supervisor_fault_recv_ep.map(u64::from).unwrap_or(0),
-            original.supervisor_control_send_ep.map(u64::from).unwrap_or(0),
-            original.supervisor_control_recv_ep.map(u64::from).unwrap_or(0),
+            original
+                .process_manager_request_send_cap
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .process_manager_reply_recv_cap
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .supervisor_fault_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .supervisor_control_send_ep
+                .map(u64::from)
+                .unwrap_or(0),
+            original
+                .supervisor_control_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
             original.init_alert_send_ep.map(u64::from).unwrap_or(0),
             original.init_alert_recv_ep.map(u64::from).unwrap_or(0),
             original.init_tid.unwrap_or(0),
             original.supervisor_tid.unwrap_or(0),
             original.supervisor_restart_window_ticks.unwrap_or(0),
-            original.process_manager_restart_control_send_cap.map(|v| v as u64).unwrap_or(0),
-            original.process_manager_service_recv_ep.map(u64::from).unwrap_or(0),
+            original
+                .process_manager_restart_control_send_cap
+                .map(|v| v as u64)
+                .unwrap_or(0),
+            original
+                .process_manager_service_recv_ep
+                .map(u64::from)
+                .unwrap_or(0),
             0,
             0,
             original.initrd_ptr.unwrap_or(0),
@@ -1492,5 +1571,4 @@ mod tests {
             original.pm_request_recv_cap.map(u64::from).unwrap_or(0),
         ]);
     }
-
 }

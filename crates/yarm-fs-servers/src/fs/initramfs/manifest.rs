@@ -309,12 +309,12 @@ pub fn build_core_service_elf_launch_plan(
     images: &[(&[u8], &[u8])],
 ) -> Result<CoreServiceElfLaunchPlan, InitramfsManifestError> {
     let manifest = parse_core_service_manifest(manifest_bytes)?;
-    let init_path =
-        manifest_path_from_ptr(manifest.init.path_ptr).ok_or(InitramfsManifestError::MissingImagePayload)?;
+    let init_path = manifest_path_from_ptr(manifest.init.path_ptr)
+        .ok_or(InitramfsManifestError::MissingImagePayload)?;
     let proc_mgr_path = manifest_path_from_ptr(manifest.process_manager.path_ptr)
         .ok_or(InitramfsManifestError::MissingImagePayload)?;
-    let vfs_path =
-        manifest_path_from_ptr(manifest.vfs.path_ptr).ok_or(InitramfsManifestError::MissingImagePayload)?;
+    let vfs_path = manifest_path_from_ptr(manifest.vfs.path_ptr)
+        .ok_or(InitramfsManifestError::MissingImagePayload)?;
     let supervisor_path = manifest_path_from_ptr(manifest.supervisor.path_ptr)
         .ok_or(InitramfsManifestError::MissingImagePayload)?;
     Ok(CoreServiceElfLaunchPlan {
@@ -331,8 +331,8 @@ pub fn build_core_service_elf_launch_plan(
         posix_compat: manifest
             .posix_compat
             .map(|entry| {
-                let path =
-                    manifest_path_from_ptr(entry.path_ptr).ok_or(InitramfsManifestError::MissingImagePayload)?;
+                let path = manifest_path_from_ptr(entry.path_ptr)
+                    .ok_or(InitramfsManifestError::MissingImagePayload)?;
                 let image = resolve_manifest_image(images, path)?;
                 build_service_launch_plan(entry, image)
             })

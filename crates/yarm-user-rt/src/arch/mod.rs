@@ -30,7 +30,15 @@ mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub(crate) use riscv64::raw_syscall;
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
 mod unsupported;
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+#[cfg(not(any(
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    target_arch = "riscv64"
+)))]
 pub(crate) use unsupported::raw_syscall;

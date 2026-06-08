@@ -2,9 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use yarm::kernel::boot::{KernelError, KernelState};
+use yarm_srv_common::service_loop::RequestResponseService;
 use yarm_user_rt::capability::CapId;
 use yarm_user_rt::ipc::{Message, ThreadId};
-use yarm_srv_common::service_loop::RequestResponseService;
 
 /// Executes a synthetic client/server IPC roundtrip inside the same kernel-owned
 /// control-flow for migration harnesses and deterministic tests.

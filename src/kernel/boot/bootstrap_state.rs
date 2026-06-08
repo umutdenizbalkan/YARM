@@ -112,8 +112,7 @@ impl Bootstrap {
         if end <= start {
             return;
         }
-        let idx =
-            BOOT_EXTRA_RESERVED_COUNT.load(core::sync::atomic::Ordering::Acquire);
+        let idx = BOOT_EXTRA_RESERVED_COUNT.load(core::sync::atomic::Ordering::Acquire);
         if idx < MAX_BOOT_EXTRA_RESERVED {
             BOOT_EXTRA_RESERVED_STARTS[idx].store(start, core::sync::atomic::Ordering::Release);
             BOOT_EXTRA_RESERVED_ENDS[idx].store(end, core::sync::atomic::Ordering::Release);
@@ -129,7 +128,10 @@ impl Bootstrap {
 
     pub fn install_boot_initrd_bytes(bytes: &'static [u8]) {
         BOOT_INITRD_LEN.store(bytes.len(), core::sync::atomic::Ordering::Release);
-        BOOT_INITRD_PTR.store(bytes.as_ptr() as usize, core::sync::atomic::Ordering::Release);
+        BOOT_INITRD_PTR.store(
+            bytes.as_ptr() as usize,
+            core::sync::atomic::Ordering::Release,
+        );
     }
 
     pub fn boot_initrd_bytes() -> Option<&'static [u8]> {
@@ -289,8 +291,16 @@ impl Bootstrap {
             sorted[j] = key;
         }
 
-        let mut pt_out = [MemoryRegion { start: 0, len: 0, usable: false }; MAX_BOOT_MEMORY_REGIONS];
-        let mut main_out = [MemoryRegion { start: 0, len: 0, usable: false }; MAX_BOOT_MEMORY_REGIONS];
+        let mut pt_out = [MemoryRegion {
+            start: 0,
+            len: 0,
+            usable: false,
+        }; MAX_BOOT_MEMORY_REGIONS];
+        let mut main_out = [MemoryRegion {
+            start: 0,
+            len: 0,
+            usable: false,
+        }; MAX_BOOT_MEMORY_REGIONS];
         let mut pt_len = 0usize;
         let mut main_len = 0usize;
         let mut remaining_pt = (pt_pages as u64) * PAGE;
@@ -299,25 +309,41 @@ impl Bootstrap {
             let (start, len) = sorted[i];
             if remaining_pt == 0 {
                 if main_len < MAX_BOOT_MEMORY_REGIONS {
-                    main_out[main_len] = MemoryRegion { start, len, usable: true };
+                    main_out[main_len] = MemoryRegion {
+                        start,
+                        len,
+                        usable: true,
+                    };
                     main_len += 1;
                 }
             } else if len <= remaining_pt {
                 if pt_len < MAX_BOOT_MEMORY_REGIONS {
-                    pt_out[pt_len] = MemoryRegion { start, len, usable: true };
+                    pt_out[pt_len] = MemoryRegion {
+                        start,
+                        len,
+                        usable: true,
+                    };
                     pt_len += 1;
                 }
                 remaining_pt -= len;
             } else {
                 // Split: first `remaining_pt` bytes → PT pool, remainder → main.
                 if pt_len < MAX_BOOT_MEMORY_REGIONS {
-                    pt_out[pt_len] = MemoryRegion { start, len: remaining_pt, usable: true };
+                    pt_out[pt_len] = MemoryRegion {
+                        start,
+                        len: remaining_pt,
+                        usable: true,
+                    };
                     pt_len += 1;
                 }
                 let main_start = start + remaining_pt;
                 let main_region_len = len - remaining_pt;
                 if main_region_len > 0 && main_len < MAX_BOOT_MEMORY_REGIONS {
-                    main_out[main_len] = MemoryRegion { start: main_start, len: main_region_len, usable: true };
+                    main_out[main_len] = MemoryRegion {
+                        start: main_start,
+                        len: main_region_len,
+                        usable: true,
+                    };
                     main_len += 1;
                 }
                 remaining_pt = 0;
@@ -353,7 +379,9 @@ impl Bootstrap {
                         main_r.start,
                         main_end
                     );
-                    panic!("PMEM_ALLOC_POOL_OVERLAP_BUG: PT pool and main pool overlap — same physical page in both allocators");
+                    panic!(
+                        "PMEM_ALLOC_POOL_OVERLAP_BUG: PT pool and main pool overlap — same physical page in both allocators"
+                    );
                 }
             }
         }
@@ -427,11 +455,7 @@ impl Bootstrap {
             }
             crate::kernel::frame_allocator::register_reserved_range(start, end)
                 .map_err(|_| KernelError::MemoryObjectFull)?;
-            crate::yarm_log!(
-                "PMEM_RESERVE_RANGE start=0x{:x} end=0x{:x}",
-                start,
-                end
-            );
+            crate::yarm_log!("PMEM_RESERVE_RANGE start=0x{:x} end=0x{:x}", start, end);
         }
 
         let mut frame_allocator = PhysicalFrameAllocator::new_uninit();
@@ -702,8 +726,11 @@ impl Bootstrap {
         }
 
         // Step 1: initialize KernelState into BOOTSTRAP_KERNEL_STATE.
-        let state_ref =
-            Self::init_static_with_boot_memory_map(capacity_profile, boot_regions, reserved_ranges)?;
+        let state_ref = Self::init_static_with_boot_memory_map(
+            capacity_profile,
+            boot_regions,
+            reserved_ranges,
+        )?;
 
         // Step 2: move the KernelState bytes out of BOOTSTRAP_KERNEL_STATE.
         // After this ptr::read the &'static mut ref must not be used again;
@@ -765,7 +792,11 @@ mod tests {
     const PAGE: u64 = 0x1000;
 
     fn region(start: u64, pages: usize) -> MemoryRegion {
-        MemoryRegion { start, len: pages as u64 * PAGE, usable: true }
+        MemoryRegion {
+            start,
+            len: pages as u64 * PAGE,
+            usable: true,
+        }
     }
 
     // ── split_sanitized_for_pt_pool correctness ──────────────────────────────
@@ -773,8 +804,7 @@ mod tests {
     #[test]
     fn split_produces_disjoint_pools() {
         let input = [region(0x1000_0000, 512)];
-        let (pt, pt_len, main, main_len) =
-            Bootstrap::split_sanitized_for_pt_pool(&input, 256);
+        let (pt, pt_len, main, main_len) = Bootstrap::split_sanitized_for_pt_pool(&input, 256);
         let pt_s = &pt[..pt_len];
         let main_s = &main[..main_len];
         for pt_r in pt_s.iter().filter(|r| r.usable && r.len > 0) {
@@ -784,7 +814,10 @@ mod tests {
                 assert!(
                     pt_end <= main_r.start || main_end <= pt_r.start,
                     "PT [{:#x}..{:#x}) overlaps main [{:#x}..{:#x})",
-                    pt_r.start, pt_end, main_r.start, main_end
+                    pt_r.start,
+                    pt_end,
+                    main_r.start,
+                    main_end
                 );
             }
         }
@@ -794,23 +827,30 @@ mod tests {
     fn split_pt_slice_contains_exactly_pt_pool_pages() {
         let input = [region(0x2000_0000, 512)];
         let pt_pages: usize = 256;
-        let (pt, pt_len, _, _) =
-            Bootstrap::split_sanitized_for_pt_pool(&input, pt_pages);
-        let total_pt: u64 =
-            pt[..pt_len].iter().filter(|r| r.usable).map(|r| r.len / PAGE).sum();
+        let (pt, pt_len, _, _) = Bootstrap::split_sanitized_for_pt_pool(&input, pt_pages);
+        let total_pt: u64 = pt[..pt_len]
+            .iter()
+            .filter(|r| r.usable)
+            .map(|r| r.len / PAGE)
+            .sum();
         assert_eq!(total_pt, pt_pages as u64);
     }
 
     #[test]
     fn split_conserves_total_pages() {
         let input = [region(0x3000_0000, 128), region(0x3100_0000, 256)];
-        let (pt, pt_len, main, main_len) =
-            Bootstrap::split_sanitized_for_pt_pool(&input, 64);
+        let (pt, pt_len, main, main_len) = Bootstrap::split_sanitized_for_pt_pool(&input, 64);
         let total_in: u64 = input.iter().map(|r| r.len / PAGE).sum();
-        let total_pt: u64 =
-            pt[..pt_len].iter().filter(|r| r.usable).map(|r| r.len / PAGE).sum();
-        let total_main: u64 =
-            main[..main_len].iter().filter(|r| r.usable).map(|r| r.len / PAGE).sum();
+        let total_pt: u64 = pt[..pt_len]
+            .iter()
+            .filter(|r| r.usable)
+            .map(|r| r.len / PAGE)
+            .sum();
+        let total_main: u64 = main[..main_len]
+            .iter()
+            .filter(|r| r.usable)
+            .map(|r| r.len / PAGE)
+            .sum();
         assert_eq!(total_pt + total_main, total_in);
     }
 
@@ -818,22 +858,29 @@ mod tests {
     fn split_pt_capped_when_input_smaller_than_pt_pool() {
         // Fewer input pages than requested PT quota: all pages go to PT, main is empty.
         let input = [region(0x4000_0000, 16)];
-        let (pt, pt_len, main, main_len) =
-            Bootstrap::split_sanitized_for_pt_pool(&input, 256);
-        let total_pt: u64 =
-            pt[..pt_len].iter().filter(|r| r.usable).map(|r| r.len / PAGE).sum();
-        let total_main: u64 =
-            main[..main_len].iter().filter(|r| r.usable).map(|r| r.len / PAGE).sum();
+        let (pt, pt_len, main, main_len) = Bootstrap::split_sanitized_for_pt_pool(&input, 256);
+        let total_pt: u64 = pt[..pt_len]
+            .iter()
+            .filter(|r| r.usable)
+            .map(|r| r.len / PAGE)
+            .sum();
+        let total_main: u64 = main[..main_len]
+            .iter()
+            .filter(|r| r.usable)
+            .map(|r| r.len / PAGE)
+            .sum();
         assert_eq!(total_pt, 16, "all small input should be PT pool");
-        assert_eq!(total_main, 0, "main pool should be empty when input exhausted by PT quota");
+        assert_eq!(
+            total_main, 0,
+            "main pool should be empty when input exhausted by PT quota"
+        );
     }
 
     #[test]
     fn split_across_multiple_regions_preserves_disjoint_invariant() {
         // Two physically separate regions totalling more than PT quota.
         let input = [region(0x5000_0000, 64), region(0x6000_0000, 512)];
-        let (pt, pt_len, main, main_len) =
-            Bootstrap::split_sanitized_for_pt_pool(&input, 100);
+        let (pt, pt_len, main, main_len) = Bootstrap::split_sanitized_for_pt_pool(&input, 100);
         let pt_s = &pt[..pt_len];
         let main_s = &main[..main_len];
         for pt_r in pt_s.iter().filter(|r| r.usable && r.len > 0) {
@@ -843,7 +890,10 @@ mod tests {
                 assert!(
                     pt_end <= main_r.start || main_end <= pt_r.start,
                     "PT [{:#x}..{:#x}) overlaps main [{:#x}..{:#x}) after multi-region split",
-                    pt_r.start, pt_end, main_r.start, main_end
+                    pt_r.start,
+                    pt_end,
+                    main_r.start,
+                    main_end
                 );
             }
         }
@@ -856,8 +906,7 @@ mod tests {
         // The output of split_sanitized_for_pt_pool must always pass the
         // disjoint assertion — this is the contract the boot path depends on.
         let input = [region(0x7000_0000, 512)];
-        let (pt, pt_len, main, main_len) =
-            Bootstrap::split_sanitized_for_pt_pool(&input, 256);
+        let (pt, pt_len, main, main_len) = Bootstrap::split_sanitized_for_pt_pool(&input, 256);
         Bootstrap::assert_pools_disjoint(&pt[..pt_len], &main[..main_len]);
     }
 
@@ -872,8 +921,16 @@ mod tests {
     #[should_panic(expected = "PMEM_ALLOC_POOL_OVERLAP_BUG")]
     fn assert_pools_disjoint_panics_on_partial_overlap() {
         // PT region [0x9000_0000 .. 0x9000_4000), main [0x9000_2000 .. 0x9000_6000)
-        let pt_r = MemoryRegion { start: 0x9000_0000, len: 4 * PAGE, usable: true };
-        let main_r = MemoryRegion { start: 0x9000_2000, len: 4 * PAGE, usable: true };
+        let pt_r = MemoryRegion {
+            start: 0x9000_0000,
+            len: 4 * PAGE,
+            usable: true,
+        };
+        let main_r = MemoryRegion {
+            start: 0x9000_2000,
+            len: 4 * PAGE,
+            usable: true,
+        };
         Bootstrap::assert_pools_disjoint(&[pt_r], &[main_r]);
     }
 
@@ -881,7 +938,11 @@ mod tests {
     fn assert_pools_disjoint_passes_when_adjacent_but_not_overlapping() {
         // End of PT == start of main: must NOT be treated as overlap.
         let pt_r = region(0xA000_0000, 4);
-        let main_r = MemoryRegion { start: 0xA000_0000 + 4 * PAGE, len: 4 * PAGE, usable: true };
+        let main_r = MemoryRegion {
+            start: 0xA000_0000 + 4 * PAGE,
+            len: 4 * PAGE,
+            usable: true,
+        };
         Bootstrap::assert_pools_disjoint(&[pt_r], &[main_r]);
     }
 }

@@ -289,7 +289,9 @@ impl KernelState {
                 .iter_mut()
                 .flatten()
                 .find(|space| space.id == cnode)
-                .map(|space| kernel_mut(&mut space.cspace).fast_revoke_reply_slot(cap, expected_object))
+                .map(|space| {
+                    kernel_mut(&mut space.cspace).fast_revoke_reply_slot(cap, expected_object)
+                })
                 .unwrap_or(false)
         })
     }

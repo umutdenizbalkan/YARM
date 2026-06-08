@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use crate::control_plane::init::{
-    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
-};
-use yarm_fs_servers::fat::service::FatMountConfig;
-use yarm_fs_servers::ramfs::service::RamFsMountConfig;
-use yarm_ipc_abi::vfs_abi::{MountRegisterArgs, VFS_MOUNT_STATUS_OK, VFS_OP_MOUNT_REGISTER};
-use yarm_ipc_abi::blkcache_abi::{
-    RegisterBackendArgs, BLKCACHE_OP_REGISTER_BACKEND,
-};
-use yarm_ipc_abi::block_abi::{BlkGetInfoReply, BlkGetInfoRequest, BlkStatus, BLK_OP_GET_INFO};
 #[cfg(test)]
 use super::super::process_manager::service::ProcessService;
 #[cfg(test)]
@@ -21,6 +11,9 @@ use super::super::supervisor::SupervisorService;
 use super::super::vfs::service::run_request_loop as run_vfs_request_loop;
 #[cfg(test)]
 use crate::control_plane::init::InitService;
+use crate::control_plane::init::{
+    CoreLaunchStrategy, CoreServiceGraph, CoreServiceImagePlan, InitBootPhase,
+};
 #[cfg(test)]
 use yarm::kernel::boot::{KernelError, KernelState};
 #[cfg(test)]
@@ -31,12 +24,17 @@ use yarm_fs_servers::common::vfs_ipc::InMemoryBackend;
 use yarm_fs_servers::devfs::service::run_request_loop as run_devfs_request_loop;
 #[cfg(test)]
 use yarm_fs_servers::devfs::{DevFsBackend, DevFsService};
+use yarm_fs_servers::fat::service::FatMountConfig;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::build_core_service_elf_launch_plan;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::service::run_request_loop as run_initramfs_request_loop;
 #[cfg(test)]
 use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd_bytes};
+use yarm_fs_servers::ramfs::service::RamFsMountConfig;
+use yarm_ipc_abi::blkcache_abi::{BLKCACHE_OP_REGISTER_BACKEND, RegisterBackendArgs};
+use yarm_ipc_abi::block_abi::{BLK_OP_GET_INFO, BlkGetInfoReply, BlkGetInfoRequest, BlkStatus};
+use yarm_ipc_abi::vfs_abi::{MountRegisterArgs, VFS_MOUNT_STATUS_OK, VFS_OP_MOUNT_REGISTER};
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
 
@@ -178,8 +176,8 @@ pub fn run_minimum_profile_with_kernel(
         .map_err(|_| KernelError::WrongObject)?;
 
     let mut control_vfs = FsService::with_backend(InMemoryBackend::new());
-    let control_vfs_summary = run_vfs_request_loop(&mut control_vfs, 0x1000)
-        .map_err(|_| KernelError::WrongObject)?;
+    let control_vfs_summary =
+        run_vfs_request_loop(&mut control_vfs, 0x1000).map_err(|_| KernelError::WrongObject)?;
 
     let mut devfs = DevFsService::with_backend(DevFsBackend::default());
     let devfs_summary = run_devfs_request_loop(&mut devfs).map_err(|_| KernelError::WrongObject)?;
@@ -259,7 +257,9 @@ fn resolve_core_image_plan(
                 process_manager_entry: launch.process_manager.validated_entry as usize,
                 vfs_entry: launch.vfs.validated_entry as usize,
                 supervisor_entry: launch.supervisor.validated_entry as usize,
-                posix_compat_entry: launch.posix_compat.map(|plan| plan.validated_entry as usize),
+                posix_compat_entry: launch
+                    .posix_compat
+                    .map(|plan| plan.validated_entry as usize),
             })
         }
     }
@@ -277,13 +277,9 @@ fn spawn_v5_cap(
     };
     let args = SpawnV5CapArgs::new(parent_pid, image_id, service_caps);
     let encoded = args.encode();
-    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
-        0,
-        PROC_OP_SPAWN_V5_CAP,
-        0,
-        None,
-        &encoded,
-    ) else {
+    let Ok(msg) =
+        yarm_user_rt::ipc::Message::with_header(0, PROC_OP_SPAWN_V5_CAP, 0, None, &encoded)
+    else {
         return None;
     };
     // SAFETY: Uses kernel-provided startup caps for PM IPC request.
@@ -389,13 +385,9 @@ fn register_ramfs_mount_with_vfs(
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=encode");
         return false;
     };
-    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
-        0,
-        VFS_OP_MOUNT_REGISTER,
-        0,
-        None,
-        &payload[..len],
-    ) else {
+    let Ok(msg) =
+        yarm_user_rt::ipc::Message::with_header(0, VFS_OP_MOUNT_REGISTER, 0, None, &payload[..len])
+    else {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=message");
         return false;
     };
@@ -450,13 +442,9 @@ fn register_fat_mount_with_vfs(
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=encode");
         return false;
     };
-    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
-        0,
-        VFS_OP_MOUNT_REGISTER,
-        0,
-        None,
-        &payload[..len],
-    ) else {
+    let Ok(msg) =
+        yarm_user_rt::ipc::Message::with_header(0, VFS_OP_MOUNT_REGISTER, 0, None, &payload[..len])
+    else {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=message");
         return false;
     };
@@ -511,7 +499,8 @@ pub fn run() {
 
     // --- Spawn initramfs_srv (image_id=4) ---
     yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_BEGIN");
-    let Some((child_tid, initramfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 4, [0, 0, 0, 0], 0) else {
+    let Some((child_tid, initramfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 4, [0, 0, 0, 0], 0)
+    else {
         yarm_user_rt::user_log!("INIT_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
     };
@@ -520,11 +509,16 @@ pub fn run() {
 
     // --- Spawn devfs_srv (image_id=5) ---
     yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_BEGIN");
-    let Some((devfs_child_tid, devfs_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 5, [0, 0, 0, 0], 0) else {
+    let Some((devfs_child_tid, devfs_send_cap)) =
+        spawn_v5_cap(pm_send, pm_recv, 5, [0, 0, 0, 0], 0)
+    else {
         yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
     };
-    yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_V5_CALL_RETURN ok=1 child_tid={}", devfs_child_tid);
+    yarm_user_rt::user_log!(
+        "INIT_DEVFS_SPAWN_V5_CALL_RETURN ok=1 child_tid={}",
+        devfs_child_tid
+    );
     yarm_user_rt::user_log!("INIT_DEVFS_SPAWN_CAPS recv_cap={}", devfs_send_cap);
 
     // --- Spawn vfs_server (image_id=6) passing initramfs and devfs send caps ---
@@ -532,17 +526,24 @@ pub fn run() {
     // allowing init to send directly to vfs_server without going through PM.
     yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_BEGIN");
     let Some((vfs_child_tid, vfs_recv_cap)) = spawn_v5_cap(
-        pm_send, pm_recv, 6,
+        pm_send,
+        pm_recv,
+        6,
         [initramfs_send_cap, devfs_send_cap, 0, 0],
         1,
     ) else {
         yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
     };
-    yarm_user_rt::user_log!("INIT_VFS_SPAWN_V5_CALL_RETURN ok=1 child_tid={}", vfs_child_tid);
+    yarm_user_rt::user_log!(
+        "INIT_VFS_SPAWN_V5_CALL_RETURN ok=1 child_tid={}",
+        vfs_child_tid
+    );
     yarm_user_rt::user_log!(
         "INIT_VFS_SPAWN_CAPS recv_cap={} initramfs_send={} devfs_send={}",
-        vfs_recv_cap, initramfs_send_cap, devfs_send_cap
+        vfs_recv_cap,
+        initramfs_send_cap,
+        devfs_send_cap
     );
 
     // --- Spawn ramfs_srv (image_id=11) and register /ram with VFS when available. ---
@@ -583,8 +584,7 @@ pub fn run() {
     // No service caps required at spawn time. VFS-backed late services are
     // wired post-spawn through explicit IPC registration flows.
     yarm_user_rt::user_log!("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_BEGIN");
-    let Some((dm_child_tid, _dm_send_cap)) =
-        spawn_v5_cap(pm_send, pm_recv, 7, [0, 0, 0, 0], 0)
+    let Some((dm_child_tid, _dm_send_cap)) = spawn_v5_cap(pm_send, pm_recv, 7, [0, 0, 0, 0], 0)
     else {
         yarm_user_rt::user_log!("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_RETURN ok=0 child_tid=0");
         return;
@@ -652,11 +652,15 @@ pub fn run() {
         Some(init_virtio_blk_send_cap),
         &register_backend_payload,
     ) else {
-        yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1");
+        yarm_user_rt::user_log!(
+            "INIT_BLKCACHE_REGISTER_BACKEND_SMOKE_RETURN ok=0 status=2 backend_id=1"
+        );
         return;
     };
     yarm_user_rt::user_log!("INIT_BLKCACHE_REGISTER_BACKEND_SEND_NO_REPLY");
-    let _ = unsafe { yarm_user_rt::syscall::ipc_send(init_blkcache_send_cap as u32, &register_backend_msg) };
+    let _ = unsafe {
+        yarm_user_rt::syscall::ipc_send(init_blkcache_send_cap as u32, &register_backend_msg)
+    };
 
     // NOTE: Keep SpawnV5/PM reply traffic isolated until the full service spawn
     // chain is complete. Since ipc_call is now send-only and replies are consumed
@@ -685,9 +689,7 @@ pub fn run() {
         let vfs_send = vfs_recv_cap as u32;
         yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_BEGIN");
         // SAFETY: vfs_send and pm_recv are kernel-provided startup caps.
-        match unsafe {
-            yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/dev/null")
-        } {
+        match unsafe { yarm_user_rt::vfs_client::vfs_statx(vfs_send, pm_recv, b"/dev/null") } {
             Ok(status) => {
                 yarm_user_rt::user_log!("INIT_VFS_DEV_SMOKE_CALL_RETURN ok=1 status={}", status)
             }
@@ -733,45 +735,57 @@ pub fn run() {
         }
     }
 
-
     yarm_user_rt::user_log!("INIT_BLKCACHE_SMOKE_BEGIN");
     let get_info_req = BlkGetInfoRequest { device_id: 0 };
     let get_info_payload = get_info_req.encode();
-    let Ok(get_info_msg) = yarm_user_rt::ipc::Message::with_header(
-        0,
-        BLK_OP_GET_INFO,
-        0,
-        None,
-        &get_info_payload,
-    ) else {
-        yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::InvalidRequest as u32);
+    let Ok(get_info_msg) =
+        yarm_user_rt::ipc::Message::with_header(0, BLK_OP_GET_INFO, 0, None, &get_info_payload)
+    else {
+        yarm_user_rt::user_log!(
+            "INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}",
+            BlkStatus::InvalidRequest as u32
+        );
         return;
     };
     // SAFETY: init_blkcache_send_cap is the caller-local delegated send cap.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &get_info_msg) };
+    let _ = unsafe {
+        yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &get_info_msg)
+    };
     // SAFETY: pm_recv is init's startup-provided reply endpoint.
     let get_info_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
     match get_info_reply {
         Ok(Some(reply_msg)) => match BlkGetInfoReply::decode(reply_msg.as_slice()) {
             Some(resp) => {
-                yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=1 status={}", resp.status as u32);
+                yarm_user_rt::user_log!(
+                    "INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=1 status={}",
+                    resp.status as u32
+                );
             }
             None => {
-                yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::InvalidRequest as u32);
+                yarm_user_rt::user_log!(
+                    "INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}",
+                    BlkStatus::InvalidRequest as u32
+                );
             }
         },
         Ok(None) => {
-            yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::NotReady as u32);
+            yarm_user_rt::user_log!(
+                "INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}",
+                BlkStatus::NotReady as u32
+            );
         }
         Err(_e) => {
-            yarm_user_rt::user_log!("INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}", BlkStatus::DeviceUnavailable as u32);
+            yarm_user_rt::user_log!(
+                "INIT_BLKCACHE_GET_INFO_SMOKE_RETURN ok=0 status={}",
+                BlkStatus::DeviceUnavailable as u32
+            );
         }
     }
 
     // --- Spawn read-only fat_srv (image_id=10) once blkcache cap is available. ---
     {
-        let fat_mount_config = FatMountConfig::new(b"/fat", 1, true)
-            .unwrap_or_else(FatMountConfig::default_compat);
+        let fat_mount_config =
+            FatMountConfig::new(b"/fat", 1, true).unwrap_or_else(FatMountConfig::default_compat);
         let (fat_prefix_word, fat_meta_word) = fat_mount_config.encode_startup_words();
         yarm_user_rt::user_log!("INIT_FAT_SPAWN_BEGIN");
         let Some((fat_child_tid, init_fat_send_cap)) = spawn_v5_cap(
@@ -813,12 +827,12 @@ pub fn run() {
 mod tests {
     use super::*;
     use yarm::ipc_abi::process_abi::{decode_spawn_v5_reply, encode_spawn_v5_reply};
+    use yarm::std::vec::Vec;
     use yarm_fs_servers::initramfs::ManifestEntryWire;
     use yarm_fs_servers::initramfs::{
         INITRAMFS_INIT_PATH_PTR, INITRAMFS_PROC_MGR_PATH_PTR, INITRAMFS_SUPERVISOR_PATH_PTR,
         INITRAMFS_VFS_PATH_PTR,
     };
-    use yarm::std::vec::Vec;
 
     const MANIFEST_MAGIC: u32 = 0x5941_524D;
     const MANIFEST_VERSION_V1: u16 = 1;

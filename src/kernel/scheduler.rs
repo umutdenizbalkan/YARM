@@ -326,7 +326,10 @@ impl PriorityScheduler {
                 if !self.membership_tracking_exhausted {
                     self.membership_remove(preferred);
                 }
-                self.current = Some(ScheduledTask { tid: preferred, priority });
+                self.current = Some(ScheduledTask {
+                    tid: preferred,
+                    priority,
+                });
                 return Some(preferred);
             }
         }

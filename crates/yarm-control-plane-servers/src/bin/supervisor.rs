@@ -5,10 +5,7 @@
 #![cfg_attr(not(feature = "hosted-dev"), no_main)]
 
 #[cfg(not(feature = "hosted-dev"))]
-yarm::install_freestanding_allocator!(
-    256 * 1024,
-    "supervisor freestanding allocator OOM"
-);
+yarm::install_freestanding_allocator!(256 * 1024, "supervisor freestanding allocator OOM");
 
 #[inline]
 fn run() {

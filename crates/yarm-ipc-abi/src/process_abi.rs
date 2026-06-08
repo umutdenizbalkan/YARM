@@ -79,11 +79,23 @@ impl LifecycleQueryReply {
     pub const ENCODED_LEN: usize = 19;
 
     pub const fn not_found() -> Self {
-        Self { found: 0, tid: 0, image_id: 0, state: 0, restart_supported: 0 }
+        Self {
+            found: 0,
+            tid: 0,
+            image_id: 0,
+            state: 0,
+            restart_supported: 0,
+        }
     }
 
     pub const fn found(tid: u64, image_id: u64, state: u8) -> Self {
-        Self { found: 1, tid, image_id, state, restart_supported: 0 }
+        Self {
+            found: 1,
+            tid,
+            image_id,
+            state,
+            restart_supported: 0,
+        }
     }
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
@@ -143,7 +155,10 @@ impl ExecuteRestartRequest {
         let mut token = [0u8; 8];
         tid.copy_from_slice(&payload[..8]);
         token.copy_from_slice(&payload[8..16]);
-        Ok(Self::new(u64::from_le_bytes(tid), u64::from_le_bytes(token)))
+        Ok(Self::new(
+            u64::from_le_bytes(tid),
+            u64::from_le_bytes(token),
+        ))
     }
 }
 
@@ -233,7 +248,10 @@ pub struct TaskRestartTokenReply {
 
 impl TaskRestartTokenReply {
     pub const fn new(found: bool, token: u64) -> Self {
-        Self { found: found as u8, token }
+        Self {
+            found: found as u8,
+            token,
+        }
     }
     pub const fn encode(self) -> [u8; 9] {
         let mut out = [0u8; 9];
@@ -255,10 +273,17 @@ impl TaskRestartTokenReply {
         }
         let mut token = [0u8; 8];
         token.copy_from_slice(&payload[1..9]);
-        Ok(Self { found: payload[0], token: u64::from_le_bytes(token) })
+        Ok(Self {
+            found: payload[0],
+            token: u64::from_le_bytes(token),
+        })
     }
     pub const fn found_token(self) -> Option<u64> {
-        if self.found == 1 { Some(self.token) } else { None }
+        if self.found == 1 {
+            Some(self.token)
+        } else {
+            None
+        }
     }
 }
 
@@ -347,7 +372,11 @@ impl SpawnV5CapArgs {
     pub const ENCODED_LEN: usize = 48;
 
     pub const fn new(parent_pid: u64, image_id: u64, service_caps: [u64; 4]) -> Self {
-        Self { parent_pid, image_id, service_caps }
+        Self {
+            parent_pid,
+            image_id,
+            service_caps,
+        }
     }
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
@@ -375,7 +404,11 @@ impl SpawnV5CapArgs {
             a.copy_from_slice(&payload[16 + i * 8..24 + i * 8]);
             caps[i] = u64::from_le_bytes(a);
         }
-        Ok(Self { parent_pid, image_id, service_caps: caps })
+        Ok(Self {
+            parent_pid,
+            image_id,
+            service_caps: caps,
+        })
     }
 }
 
@@ -389,7 +422,10 @@ impl SpawnV5CapResult {
     pub const ENCODED_LEN: usize = 16;
 
     pub const fn new(pid: u64, service_send_cap: u64) -> Self {
-        Self { pid, service_send_cap }
+        Self {
+            pid,
+            service_send_cap,
+        }
     }
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
@@ -408,12 +444,18 @@ impl SpawnV5CapResult {
         let pid = u64::from_le_bytes(a);
         a.copy_from_slice(&payload[8..16]);
         let service_send_cap = u64::from_le_bytes(a);
-        Ok(Self { pid, service_send_cap })
+        Ok(Self {
+            pid,
+            service_send_cap,
+        })
     }
 }
 
 #[inline]
-pub fn encode_spawn_v5_reply(child_tid: u64, service_send_cap: u64) -> [u8; SpawnV5CapResult::ENCODED_LEN] {
+pub fn encode_spawn_v5_reply(
+    child_tid: u64,
+    service_send_cap: u64,
+) -> [u8; SpawnV5CapResult::ENCODED_LEN] {
     SpawnV5CapResult::new(child_tid, service_send_cap).encode()
 }
 
@@ -703,7 +745,10 @@ mod tests {
         assert_eq!(found.found_token(), Some(0xAA55));
 
         let missing = TaskRestartTokenReply::new(false, 0);
-        assert_eq!(TaskRestartTokenReply::decode(&missing.encode()), Ok(missing));
+        assert_eq!(
+            TaskRestartTokenReply::decode(&missing.encode()),
+            Ok(missing)
+        );
         assert_eq!(missing.found_token(), None);
     }
 
@@ -808,7 +853,10 @@ mod tests {
     #[test]
     fn lifecycle_query_reply_rejects_short_payload() {
         let short = [0u8; LifecycleQueryReply::ENCODED_LEN - 1];
-        assert_eq!(LifecycleQueryReply::decode(&short), Err(ProcCodecError::Malformed));
+        assert_eq!(
+            LifecycleQueryReply::decode(&short),
+            Err(ProcCodecError::Malformed)
+        );
     }
 
     #[test]
@@ -817,7 +865,10 @@ mod tests {
         let encoded = encode_spawn_v5_reply(10_000, 65_540);
         assert_eq!(
             encoded,
-            [0x10, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00]
+            [
+                0x10, 0x27, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00,
+                0x00, 0x00
+            ]
         );
         let decoded = decode_spawn_v5_reply(&encoded).expect("decode");
         assert_eq!(decoded.pid, 10_000);
@@ -828,7 +879,10 @@ mod tests {
     fn spawn_v5_reply_decode_rejects_non_exact_payload_len() {
         let short = [0u8; SpawnV5CapResult::ENCODED_LEN - 1];
         let long = [0u8; SpawnV5CapResult::ENCODED_LEN + 1];
-        assert_eq!(decode_spawn_v5_reply(&short), Err(ProcCodecError::Malformed));
+        assert_eq!(
+            decode_spawn_v5_reply(&short),
+            Err(ProcCodecError::Malformed)
+        );
         assert_eq!(decode_spawn_v5_reply(&long), Err(ProcCodecError::Malformed));
     }
 }

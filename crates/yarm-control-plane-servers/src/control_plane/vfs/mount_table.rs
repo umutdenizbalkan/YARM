@@ -132,8 +132,8 @@ impl VfsMountTable {
             return Err(MountRegisterError::InvalidSendCap);
         }
 
-        let norm = super::path::normalize(raw_prefix)
-            .map_err(|_| MountRegisterError::InvalidPrefix)?;
+        let norm =
+            super::path::normalize(raw_prefix).map_err(|_| MountRegisterError::InvalidPrefix)?;
         let base = norm.as_bytes();
 
         // Build the stored prefix: normalized base + trailing '/' (except root).
@@ -414,7 +414,9 @@ mod tests {
             prefix[1] = b'a' + i as u8;
             prefix[2] = b'0' + i as u8;
             prefix[3] = b'/';
-            table.insert_dynamic(&prefix, (i + 1) as u32, 0).expect("fill");
+            table
+                .insert_dynamic(&prefix, (i + 1) as u32, 0)
+                .expect("fill");
         }
         assert_eq!(table.len(), MAX_MOUNT_ENTRIES);
         let err = table.insert_dynamic(b"/z", 99, 0).unwrap_err();
@@ -460,7 +462,9 @@ mod tests {
     fn mount_table_flags_are_stored_and_not_visible_via_route() {
         // flags are internal; route() does not return them (reserved for future use).
         let mut table = VfsMountTable::new();
-        table.insert_dynamic(b"/mnt", 3, 0xDEAD_BEEF).expect("insert");
+        table
+            .insert_dynamic(b"/mnt", 3, 0xDEAD_BEEF)
+            .expect("insert");
         let (cap, _) = table.route(b"/mnt/file").unwrap();
         assert_eq!(cap, 3);
     }

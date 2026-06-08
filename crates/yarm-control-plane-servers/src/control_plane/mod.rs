@@ -174,7 +174,11 @@ mod tests {
 
     #[test]
     fn openat_reply_empty_returns_none() {
-        assert_eq!(decode_u64_from_payload(&[]), None, "empty payload must return None");
+        assert_eq!(
+            decode_u64_from_payload(&[]),
+            None,
+            "empty payload must return None"
+        );
     }
 
     #[test]

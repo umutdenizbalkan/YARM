@@ -24,7 +24,12 @@ pub fn mmap_hook(
 }
 
 #[cfg(not(test))]
-pub fn mmap_hook(_aspace_cap: u32, _addr: usize, _len: usize, _prot: usize) -> Result<usize, PosixErrno> {
+pub fn mmap_hook(
+    _aspace_cap: u32,
+    _addr: usize,
+    _len: usize,
+    _prot: usize,
+) -> Result<usize, PosixErrno> {
     Err(PosixErrno::NoSys)
 }
 

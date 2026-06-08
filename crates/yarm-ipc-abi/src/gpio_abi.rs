@@ -59,7 +59,11 @@ impl GpioSetFunctionRequest {
         if b.len() < Self::ENCODED_LEN {
             return None;
         }
-        Some(Self { pin: b[0], function: b[1], _pad: [0; 2] })
+        Some(Self {
+            pin: b[0],
+            function: b[1],
+            _pad: [0; 2],
+        })
     }
 }
 
@@ -88,7 +92,12 @@ impl GpioSetPinModeRequest {
         if b.len() < Self::ENCODED_LEN {
             return None;
         }
-        Some(Self { pin: b[0], mode: b[1], function: b[2], initial_level: b[3] })
+        Some(Self {
+            pin: b[0],
+            mode: b[1],
+            function: b[2],
+            initial_level: b[3],
+        })
     }
 }
 
@@ -112,7 +121,11 @@ impl GpioWritePinRequest {
         if b.len() < Self::ENCODED_LEN {
             return None;
         }
-        Some(Self { pin: b[0], level: b[1], _pad: [0; 2] })
+        Some(Self {
+            pin: b[0],
+            level: b[1],
+            _pad: [0; 2],
+        })
     }
 }
 
@@ -135,7 +148,10 @@ impl GpioReadPinRequest {
         if b.len() < Self::ENCODED_LEN {
             return None;
         }
-        Some(Self { pin: b[0], _pad: [0; 3] })
+        Some(Self {
+            pin: b[0],
+            _pad: [0; 3],
+        })
     }
 }
 
@@ -161,7 +177,11 @@ impl GpioReadPinReply {
         if b.len() < Self::ENCODED_LEN {
             return None;
         }
-        Some(Self { pin: b[0], level: b[1], _pad: [0; 2] })
+        Some(Self {
+            pin: b[0],
+            level: b[1],
+            _pad: [0; 2],
+        })
     }
 }
 
@@ -192,11 +212,17 @@ impl GpioStatusReply {
     pub const ENCODED_LEN: usize = 4;
 
     pub const fn ok() -> Self {
-        Self { status: GpioStatus::Ok as u8, _pad: [0; 3] }
+        Self {
+            status: GpioStatus::Ok as u8,
+            _pad: [0; 3],
+        }
     }
 
     pub const fn err(s: GpioStatus) -> Self {
-        Self { status: s as u8, _pad: [0; 3] }
+        Self {
+            status: s as u8,
+            _pad: [0; 3],
+        }
     }
 
     pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
@@ -207,7 +233,10 @@ impl GpioStatusReply {
         if b.len() < Self::ENCODED_LEN {
             return None;
         }
-        Some(Self { status: b[0], _pad: [0; 3] })
+        Some(Self {
+            status: b[0],
+            _pad: [0; 3],
+        })
     }
 }
 
@@ -230,14 +259,27 @@ mod tests {
 
     #[test]
     fn set_function_request_round_trips() {
-        let req = GpioSetFunctionRequest { pin: 17, function: 5, _pad: [0; 2] };
+        let req = GpioSetFunctionRequest {
+            pin: 17,
+            function: 5,
+            _pad: [0; 2],
+        };
         assert_eq!(GpioSetFunctionRequest::decode(&req.encode()), Some(req));
     }
 
     #[test]
     fn set_pin_mode_request_round_trips() {
-        for (mode, func, level) in [(GPIO_MODE_INPUT, 0, 0), (GPIO_MODE_OUTPUT, 0, 1), (GPIO_MODE_ALT_FUNC, 3, 0)] {
-            let req = GpioSetPinModeRequest { pin: 4, mode, function: func, initial_level: level };
+        for (mode, func, level) in [
+            (GPIO_MODE_INPUT, 0, 0),
+            (GPIO_MODE_OUTPUT, 0, 1),
+            (GPIO_MODE_ALT_FUNC, 3, 0),
+        ] {
+            let req = GpioSetPinModeRequest {
+                pin: 4,
+                mode,
+                function: func,
+                initial_level: level,
+            };
             assert_eq!(GpioSetPinModeRequest::decode(&req.encode()), Some(req));
         }
     }
@@ -245,14 +287,22 @@ mod tests {
     #[test]
     fn write_pin_request_round_trips() {
         for level in [0u8, 1u8] {
-            let req = GpioWritePinRequest { pin: 27, level, _pad: [0; 2] };
+            let req = GpioWritePinRequest {
+                pin: 27,
+                level,
+                _pad: [0; 2],
+            };
             assert_eq!(GpioWritePinRequest::decode(&req.encode()), Some(req));
         }
     }
 
     #[test]
     fn read_pin_reply_round_trips() {
-        let reply = GpioReadPinReply { pin: 3, level: 1, _pad: [0; 2] };
+        let reply = GpioReadPinReply {
+            pin: 3,
+            level: 1,
+            _pad: [0; 2],
+        };
         assert_eq!(GpioReadPinReply::decode(&reply.encode()), Some(reply));
     }
 

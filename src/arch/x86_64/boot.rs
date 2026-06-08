@@ -444,7 +444,6 @@ boot_idt_ptr:
     "#
 );
 
-
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
@@ -504,7 +503,12 @@ fn load_init_elf_from_initramfs_vfs() -> Option<alloc::vec::Vec<u8>> {
         .find("/init")
         .ok()
         .flatten()
-        .or_else(|| yarm_srv_common::cpio::CpioArchive::new(bytes).find("init").ok().flatten())?;
+        .or_else(|| {
+            yarm_srv_common::cpio::CpioArchive::new(bytes)
+                .find("init")
+                .ok()
+                .flatten()
+        })?;
     let file_data = entry.file_data();
     crate::yarm_log!("YARM_INITRD_INIT_FOUND len={}", file_data.len());
     if file_data.len() > INITRD_INIT_ELF_MAX_SIZE {
@@ -568,17 +572,24 @@ pub fn bootstrap_first_user_task(
         Some(img) => (img, "initrd"),
         None => (&init_fallback, "synthetic"),
     };
-    let init_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(0, init_bytes)
-        .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR parse_init_elf_header: {:?}", e); crate::kernel::boot::KernelError::WrongObject })?;
+    let init_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(0, init_bytes).map_err(|e| {
+        crate::yarm_log!("BOOTSTRAP_ERROR parse_init_elf_header: {:?}", e);
+        crate::kernel::boot::KernelError::WrongObject
+    })?;
     let (_, init_first_pt_load, init_heap) = kernel
         .load_elf_pt_load_segments(init_asid, init_bytes)
-        .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e); e })?;
+        .map_err(|e| {
+            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e);
+            e
+        })?;
     let init_entry = init_elf_info.entry as usize;
     crate::yarm_log!("INIT_ELF_HEADER_ENTRY value={:#x}", init_elf_info.entry);
     crate::yarm_log!("INIT_FIRST_PT_LOAD_VADDR value={:#x}", init_first_pt_load);
     crate::yarm_log!("INIT_SELECTED_ENTRY value={:#x}", init_entry);
     if init_entry == init_first_pt_load {
-        crate::yarm_log!("INIT_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+        crate::yarm_log!(
+            "INIT_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong"
+        );
     }
     crate::yarm_log!(
         "YARM_INITRD_INIT_ELF_SELECTED entry={:#x} source={}",
@@ -588,10 +599,16 @@ pub fn bootstrap_first_user_task(
 
     let supervisor_image = load_supervisor_elf_from_initramfs_vfs();
     let supervisor_aei: Option<(_, usize, usize)> = if let Some(ref sup_bytes) = supervisor_image {
-        let sup_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(1, sup_bytes)
-            .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR parse_supervisor_elf_header: {:?}", e); crate::kernel::boot::KernelError::WrongObject })?;
+        let sup_elf_info =
+            yarm_srv_common::elf::ElfImageInfo::parse(1, sup_bytes).map_err(|e| {
+                crate::yarm_log!("BOOTSTRAP_ERROR parse_supervisor_elf_header: {:?}", e);
+                crate::kernel::boot::KernelError::WrongObject
+            })?;
         let (sup_asid, _) = kernel.create_user_address_space().map_err(|e| {
-            crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_supervisor_asid err={:?}", e);
+            crate::yarm_log!(
+                "YARM_FIRST_USER_FAIL step=create_supervisor_asid err={:?}",
+                e
+            );
             e
         })?;
         let (_, sup_first_pt_load, sup_heap) = kernel
@@ -601,11 +618,19 @@ pub fn bootstrap_first_user_task(
                 e
             })?;
         let sup_entry = sup_elf_info.entry as usize;
-        crate::yarm_log!("SUPERVISOR_ELF_HEADER_ENTRY value={:#x}", sup_elf_info.entry);
-        crate::yarm_log!("SUPERVISOR_FIRST_PT_LOAD_VADDR value={:#x}", sup_first_pt_load);
+        crate::yarm_log!(
+            "SUPERVISOR_ELF_HEADER_ENTRY value={:#x}",
+            sup_elf_info.entry
+        );
+        crate::yarm_log!(
+            "SUPERVISOR_FIRST_PT_LOAD_VADDR value={:#x}",
+            sup_first_pt_load
+        );
         crate::yarm_log!("SUPERVISOR_SELECTED_ENTRY value={:#x}", sup_entry);
         if sup_entry == sup_first_pt_load {
-            crate::yarm_log!("SUPERVISOR_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+            crate::yarm_log!(
+                "SUPERVISOR_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong"
+            );
         }
         Some((sup_asid, sup_entry, sup_heap))
     } else {
@@ -615,8 +640,10 @@ pub fn bootstrap_first_user_task(
 
     let pm_image = load_pm_elf_from_initramfs_vfs();
     let pm_aei: Option<(_, usize, usize)> = if let Some(ref pm_bytes) = pm_image {
-        let pm_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(2, pm_bytes)
-            .map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR parse_pm_elf_header: {:?}", e); crate::kernel::boot::KernelError::WrongObject })?;
+        let pm_elf_info = yarm_srv_common::elf::ElfImageInfo::parse(2, pm_bytes).map_err(|e| {
+            crate::yarm_log!("BOOTSTRAP_ERROR parse_pm_elf_header: {:?}", e);
+            crate::kernel::boot::KernelError::WrongObject
+        })?;
         let (pm_asid, _) = kernel.create_user_address_space().map_err(|e| {
             crate::yarm_log!("YARM_FIRST_USER_FAIL step=create_pm_asid err={:?}", e);
             e
@@ -632,7 +659,9 @@ pub fn bootstrap_first_user_task(
         crate::yarm_log!("PM_FIRST_PT_LOAD_VADDR value={:#x}", pm_first_pt_load);
         crate::yarm_log!("PM_SELECTED_ENTRY value={:#x}", pm_entry);
         if pm_entry == pm_first_pt_load {
-            crate::yarm_log!("PM_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong");
+            crate::yarm_log!(
+                "PM_ENTRY_EQUALS_FIRST_PT_LOAD_WARN: ELF e_entry matches first PT_LOAD base; entry may be wrong"
+            );
         }
         Some((pm_asid, pm_entry, pm_heap))
     } else {
@@ -650,84 +679,152 @@ pub fn bootstrap_first_user_task(
 
     let (_, pm_inbound_send_root, pm_inbound_recv_root) = kernel.create_endpoint(16)?;
     let pm_inbound_send_init = kernel.grant_capability_task_to_task_with_rights(
-        0, pm_inbound_send_root, RING3_INIT_SERVER_TID,
+        0,
+        pm_inbound_send_root,
+        RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::SEND,
     )?;
-    crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok", RING3_INIT_SERVER_TID, pm_inbound_send_init.0);
+    crate::yarm_log!(
+        "CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok",
+        RING3_INIT_SERVER_TID,
+        pm_inbound_send_init.0
+    );
     let pm_inbound_send_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, pm_inbound_send_root, RING3_SUPERVISOR_TID,
+            0,
+            pm_inbound_send_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::SEND,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=1 cap={} rights=SEND result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
     let pm_inbound_recv_pm = if pm_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, pm_inbound_recv_root, RING3_PM_SERVER_TID,
+            0,
+            pm_inbound_recv_root,
+            RING3_PM_SERVER_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=17 cap={} rights=RECEIVE result=ok", RING3_PM_SERVER_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=17 cap={} rights=RECEIVE result=ok",
+            RING3_PM_SERVER_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     let (_, _, init_reply_recv_root) = kernel.create_endpoint(8)?;
     let init_reply_recv_init = kernel.grant_capability_task_to_task_with_rights(
-        0, init_reply_recv_root, RING3_INIT_SERVER_TID,
+        0,
+        init_reply_recv_root,
+        RING3_INIT_SERVER_TID,
         crate::kernel::capabilities::CapRights::RECEIVE,
     )?;
-    crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_INIT_SERVER_TID, init_reply_recv_init.0);
+    crate::yarm_log!(
+        "CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok",
+        RING3_INIT_SERVER_TID,
+        init_reply_recv_init.0
+    );
 
     // Dedicated PM outbound reply endpoint: PM receives on startup slot 2.
     let (_, _, pm_outbound_reply_recv_root) = kernel.create_endpoint(8)?;
     let pm_outbound_reply_recv_pm = if pm_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, pm_outbound_reply_recv_root, RING3_PM_SERVER_TID,
+            0,
+            pm_outbound_reply_recv_root,
+            RING3_PM_SERVER_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_PM_SERVER_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok",
+            RING3_PM_SERVER_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     let (_, _, sup_fault_recv_root) = kernel.create_endpoint(8)?;
     let sup_fault_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_fault_recv_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_fault_recv_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=3 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=3 cap={} rights=RECEIVE result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     // EP4: Supervisor control — supervisor SEND (slot 4), supervisor RECV (slot 5).
     let (_, sup_ctrl_send_root, sup_ctrl_recv_root) = kernel.create_endpoint(8)?;
     let sup_ctrl_send_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_ctrl_send_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_ctrl_send_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::SEND,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=4 cap={} rights=SEND result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=4 cap={} rights=SEND result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
     let sup_ctrl_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_ctrl_recv_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_ctrl_recv_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=5 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=5 cap={} rights=RECEIVE result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     // EP5: Supervisor PM reply — supervisor gets RECV (slot 2); distinct from init's EP2.
     let (_, _, sup_pm_reply_recv_root) = kernel.create_endpoint(8)?;
     let sup_pm_reply_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
-            0, sup_pm_reply_recv_root, RING3_SUPERVISOR_TID,
+            0,
+            sup_pm_reply_recv_root,
+            RING3_SUPERVISOR_TID,
             crate::kernel::capabilities::CapRights::RECEIVE,
         )?;
-        crate::yarm_log!("CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok", RING3_SUPERVISOR_TID, c.0);
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=2 cap={} rights=RECEIVE result=ok",
+            RING3_SUPERVISOR_TID,
+            c.0
+        );
         Some(c)
-    } else { None };
+    } else {
+        None
+    };
 
     if let Some(fault_cap) = sup_fault_recv_sup {
         kernel.set_supervisor_endpoint_for_task(RING3_SUPERVISOR_TID, fault_cap)?;
@@ -736,11 +833,21 @@ pub fn bootstrap_first_user_task(
     if let Some((sup_asid, sup_entry, sup_heap)) = supervisor_aei {
         let mut sup_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         sup_args[0] = RING3_SUPERVISOR_TID;
-        if let Some(c) = pm_inbound_send_sup   { sup_args[1] = c.0; }
-        if let Some(c) = sup_pm_reply_recv_sup { sup_args[2] = c.0; }
-        if let Some(c) = sup_fault_recv_sup    { sup_args[3] = c.0; }
-        if let Some(c) = sup_ctrl_send_sup     { sup_args[4] = c.0; }
-        if let Some(c) = sup_ctrl_recv_sup     { sup_args[5] = c.0; }
+        if let Some(c) = pm_inbound_send_sup {
+            sup_args[1] = c.0;
+        }
+        if let Some(c) = sup_pm_reply_recv_sup {
+            sup_args[2] = c.0;
+        }
+        if let Some(c) = sup_fault_recv_sup {
+            sup_args[3] = c.0;
+        }
+        if let Some(c) = sup_ctrl_send_sup {
+            sup_args[4] = c.0;
+        }
+        if let Some(c) = sup_ctrl_recv_sup {
+            sup_args[5] = c.0;
+        }
         sup_args[8] = RING3_INIT_SERVER_TID;
         for n in 0..10usize {
             crate::yarm_log!("SUP_STARTUP_SLOT slot={} value={}", n, sup_args[n]);
@@ -760,8 +867,12 @@ pub fn bootstrap_first_user_task(
     if let Some((pm_asid, pm_entry, pm_heap)) = pm_aei {
         let mut pm_args = UserImageSpec::DEFAULT_STARTUP_ARGS;
         pm_args[0] = RING3_PM_SERVER_TID;
-        if let Some(c) = pm_outbound_reply_recv_pm { pm_args[2] = c.0; }
-        if let Some(c) = pm_inbound_recv_pm { pm_args[17] = c.0; }
+        if let Some(c) = pm_outbound_reply_recv_pm {
+            pm_args[2] = c.0;
+        }
+        if let Some(c) = pm_inbound_recv_pm {
+            pm_args[17] = c.0;
+        }
         kernel.spawn_user_task_from_image(UserImageSpec {
             tid: RING3_PM_SERVER_TID,
             entry: pm_entry,
@@ -782,21 +893,33 @@ pub fn bootstrap_first_user_task(
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,
-        init_args[0], init_args[1], init_args[2], init_args[3]
+        init_args[0],
+        init_args[1],
+        init_args[2],
+        init_args[3]
     );
-    kernel.spawn_user_task_from_image(UserImageSpec {
-        tid: RING3_INIT_SERVER_TID,
-        entry: init_entry,
-        asid: Some(init_asid),
-        class: TaskClass::SystemServer,
-        startup_args: init_args,
-        ..Default::default()
-    }).map_err(|e| { crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e); e })?;
+    kernel
+        .spawn_user_task_from_image(UserImageSpec {
+            tid: RING3_INIT_SERVER_TID,
+            entry: init_entry,
+            asid: Some(init_asid),
+            class: TaskClass::SystemServer,
+            startup_args: init_args,
+            ..Default::default()
+        })
+        .map_err(|e| {
+            crate::yarm_log!("BOOTSTRAP_ERROR: {:?}", e);
+            e
+        })?;
     crate::yarm_log!("BOOTSTRAP_STAGE: after stack allocation");
     kernel.set_task_brk_bounds(RING3_INIT_SERVER_TID, init_heap, init_heap)?;
     crate::yarm_log!(
         "YARM_INIT_DONE arch=x86_64 phase={} image_id=0x{:x} seeded=0 initramfs_handled=1 devfs_handled=0",
-        if init_source == "initrd" { "initrd_init_elf" } else { "kernel_static_init_elf" },
+        if init_source == "initrd" {
+            "initrd_init_elf"
+        } else {
+            "kernel_static_init_elf"
+        },
         INITRAMFS_HELLO_WORLD_IMAGE_ID
     );
     Ok(())
@@ -918,10 +1041,7 @@ pub fn enter_dispatched_user_task_if_available(
             // spawn time (spawn_user_task_from_image in exec_state.rs) to
             // satisfy the x86-64 SysV ABI requirement at function entry.  Use
             // it directly here — no further adjustment is needed.
-            crate::yarm_log!(
-                "X86_ENTER_USER_RSP stack=0x{:x}",
-                context.stack_ptr.0,
-            );
+            crate::yarm_log!("X86_ENTER_USER_RSP stack=0x{:x}", context.stack_ptr.0,);
             super::descriptor_tables::enter_user_mode_iret(
                 context.instruction_ptr.0,
                 context.stack_ptr.0,
@@ -1033,14 +1153,12 @@ fn capture_pvh_command_line(start_info_ptr: usize) {
         return;
     }
 
-    let virtual_address = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
-        .saturating_add(physical);
+    let virtual_address =
+        crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE.saturating_add(physical);
     // SAFETY: valid PVH physical boot data is covered by the bootstrap direct
     // map. Reading MAX+1 bytes lets fixed storage distinguish exact-fit input
     // from an unterminated/overlong source without allocating.
-    let source = unsafe {
-        core::slice::from_raw_parts(virtual_address as *const u8, read_len)
-    };
+    let source = unsafe { core::slice::from_raw_parts(virtual_address as *const u8, read_len) };
     let captured = set_raw_cmdline_from_bytes(source);
     crate::yarm_log!(
         "YARM_BOOT_CMDLINE_CAPTURE arch=x86_64 len={} truncated={}",

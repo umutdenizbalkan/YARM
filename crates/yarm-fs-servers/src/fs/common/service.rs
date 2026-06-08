@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use yarm_user_rt::ipc::Message;
 use super::vfs_ipc::{VfsBackend, VfsError};
 use super::vfs_service::VfsService;
 use yarm_srv_common::service_loop::RequestResponseService;
+use yarm_user_rt::ipc::Message;
 
 #[derive(Debug)]
 pub struct FsService<B: VfsBackend> {
@@ -53,8 +53,8 @@ impl<B: VfsBackend> RequestResponseService<Message, Message> for FsService<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::vfs_ipc::{InMemoryBackend, openat_inline_message};
+    use super::*;
     use yarm_srv_common::service_loop::run_typed_request_loop;
 
     #[test]
@@ -63,10 +63,8 @@ mod tests {
         let replies = run_typed_request_loop(
             &mut svc,
             [
-                openat_inline_message(0, b"/dev/console", 0, 0)
-                .expect("open"),
-                openat_inline_message(0, b"/dev/null", 0, 0)
-                .expect("open"),
+                openat_inline_message(0, b"/dev/console", 0, 0).expect("open"),
+                openat_inline_message(0, b"/dev/null", 0, 0).expect("open"),
             ],
         )
         .expect("loop");

@@ -352,7 +352,9 @@ impl KernelState {
         user_ptr: usize,
         src: &[u8],
     ) -> Result<(), KernelError> {
-        let asid = self.task_asid(target_tid).ok_or(KernelError::UserMemoryFault)?;
+        let asid = self
+            .task_asid(target_tid)
+            .ok_or(KernelError::UserMemoryFault)?;
         let page_size = crate::kernel::vm::PAGE_SIZE;
         let len = src.len();
         let mut done = 0usize;

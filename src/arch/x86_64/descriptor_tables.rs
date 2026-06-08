@@ -722,16 +722,16 @@ fn write_task_gprs_to_saved_regs(
 ) {
     let regs = unsafe { &mut *regs };
     // Step 1: restore full GPR snapshot from TCB (zero for new tasks).
-    regs.rax = trap_frame.user_gpr(0) as u64;  // [0] = rax
-    regs.rbx = trap_frame.user_gpr(1) as u64;  // [1] = rbx
-    regs.rcx = trap_frame.user_gpr(2) as u64;  // [2] = rcx
-    regs.rdx = trap_frame.user_gpr(3) as u64;  // [3] = rdx
-    regs.rsi = trap_frame.user_gpr(4) as u64;  // [4] = rsi
-    regs.rdi = trap_frame.user_gpr(5) as u64;  // [5] = rdi
-    regs.rbp = trap_frame.user_gpr(6) as u64;  // [6] = rbp
-    regs.r8  = trap_frame.user_gpr(7) as u64;  // [7] = r8
-    regs.r9  = trap_frame.user_gpr(8) as u64;  // [8] = r9
-    regs.r10 = trap_frame.user_gpr(9) as u64;  // [9] = r10
+    regs.rax = trap_frame.user_gpr(0) as u64; // [0] = rax
+    regs.rbx = trap_frame.user_gpr(1) as u64; // [1] = rbx
+    regs.rcx = trap_frame.user_gpr(2) as u64; // [2] = rcx
+    regs.rdx = trap_frame.user_gpr(3) as u64; // [3] = rdx
+    regs.rsi = trap_frame.user_gpr(4) as u64; // [4] = rsi
+    regs.rdi = trap_frame.user_gpr(5) as u64; // [5] = rdi
+    regs.rbp = trap_frame.user_gpr(6) as u64; // [6] = rbp
+    regs.r8 = trap_frame.user_gpr(7) as u64; // [7] = r8
+    regs.r9 = trap_frame.user_gpr(8) as u64; // [8] = r9
+    regs.r10 = trap_frame.user_gpr(9) as u64; // [9] = r10
     regs.r11 = trap_frame.user_gpr(10) as u64; // [10] = r11
     regs.r12 = trap_frame.user_gpr(11) as u64; // [11] = r12
     regs.r13 = trap_frame.user_gpr(12) as u64; // [12] = r13
@@ -740,15 +740,14 @@ fn write_task_gprs_to_saved_regs(
     // Step 2: new task detection — all user_gprs are zero AND arg(0) is the
     // non-zero task_id written at spawn time.  Deliver startup args through
     // the x86-64 System V function-call ABI registers.
-    let is_new_task = trap_frame.user_gprs.iter().all(|&g| g == 0)
-        && trap_frame.arg(0) != 0;
+    let is_new_task = trap_frame.user_gprs.iter().all(|&g| g == 0) && trap_frame.arg(0) != 0;
     if is_new_task {
-        regs.rdi = trap_frame.arg(0) as u64;  // rdi = arg0 (task_id)
-        regs.rsi = trap_frame.arg(1) as u64;  // rsi = arg1 (pm_send cap)
-        regs.rdx = trap_frame.arg(2) as u64;  // rdx = arg2 (pm_reply_recv cap)
-        regs.rcx = trap_frame.arg(3) as u64;  // rcx = arg3 (startup_slots_ptr)
-        regs.r8  = trap_frame.arg(4) as u64;  // r8  = arg4 (slots_len)
-        regs.r9  = trap_frame.arg(5) as u64;  // r9  = arg5 (reserved)
+        regs.rdi = trap_frame.arg(0) as u64; // rdi = arg0 (task_id)
+        regs.rsi = trap_frame.arg(1) as u64; // rsi = arg1 (pm_send cap)
+        regs.rdx = trap_frame.arg(2) as u64; // rdx = arg2 (pm_reply_recv cap)
+        regs.rcx = trap_frame.arg(3) as u64; // rcx = arg3 (startup_slots_ptr)
+        regs.r8 = trap_frame.arg(4) as u64; // r8  = arg4 (slots_len)
+        regs.r9 = trap_frame.arg(5) as u64; // r9  = arg5 (reserved)
         // Caller-saved scratch registers: clear to a defined state.
         regs.rax = 0;
         regs.rbx = 0;
@@ -908,9 +907,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         // The unit-test value-equivalence proof was insufficient: smoke behavior
         // is the acceptance criterion. Both entering_tid and exiting_tid reads
         // are restored to the global-lock with_cpu path (Class F).
-        let entering_tid: Option<u64> = shared
-            .with_cpu(cpu, |k| k.current_tid())
-            .unwrap_or(None);
+        let entering_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
         let mut trap_frame =
             unsafe { build_trap_frame_from_saved_regs(regs, interrupt_frame, vector) };
         if let Err(err) = crate::arch::trap_entry::dispatch_trap_entry_with_shared_kernel(
@@ -936,9 +933,7 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         }
         // Stage 4T+6R: reverted to conservative with_cpu→current_tid path.
         // See entering_tid comment above for the revert rationale.
-        let exiting_tid: Option<u64> = shared
-            .with_cpu(cpu, |k| k.current_tid())
-            .unwrap_or(None);
+        let exiting_tid: Option<u64> = shared.with_cpu(cpu, |k| k.current_tid()).unwrap_or(None);
         let task_switched = entering_tid != exiting_tid;
         if matches!(exiting_tid, None | Some(0)) {
             // The scheduler uses TID 0 as its idle/supervisor sentinel.  It has
@@ -1803,8 +1798,13 @@ mod tests {
             ss: KERNEL_DATA_SELECTOR as u64,
         };
         let mut frame = frame;
-        let result =
-            dispatch_trap_from_stub_for_test(&mut kernel, VEC_SYSCALL as u64, 0, &mut regs, &mut frame);
+        let result = dispatch_trap_from_stub_for_test(
+            &mut kernel,
+            VEC_SYSCALL as u64,
+            0,
+            &mut regs,
+            &mut frame,
+        );
         assert_eq!(
             result,
             Err(crate::kernel::boot::TrapHandleError::Syscall(
@@ -1870,12 +1870,12 @@ mod tests {
         let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
         // Startup ABI: arg0=task_id, arg1=pm_send, arg2=pm_reply,
         //              arg3=slots_ptr, arg4=slots_len, arg5=reserved
-        trap.set_arg(0, 0xAA);   // -> RDI
-        trap.set_arg(1, 0xBB);   // -> RSI
-        trap.set_arg(2, 0xCC);   // -> RDX
-        trap.set_arg(3, 0xDD);   // -> RCX
-        trap.set_arg(4, 0xEE);   // -> R8
-        trap.set_arg(5, 0xFF);   // -> R9
+        trap.set_arg(0, 0xAA); // -> RDI
+        trap.set_arg(1, 0xBB); // -> RSI
+        trap.set_arg(2, 0xCC); // -> RDX
+        trap.set_arg(3, 0xDD); // -> RCX
+        trap.set_arg(4, 0xEE); // -> R8
+        trap.set_arg(5, 0xFF); // -> R9
         // user_gprs all zero → new-task detection fires
 
         let mut regs = X86SavedRegs::default();
@@ -1885,8 +1885,8 @@ mod tests {
         assert_eq!(regs.rsi, 0xBB, "arg1 must go to RSI");
         assert_eq!(regs.rdx, 0xCC, "arg2 must go to RDX");
         assert_eq!(regs.rcx, 0xDD, "arg3 must go to RCX");
-        assert_eq!(regs.r8,  0xEE, "arg4 must go to R8");
-        assert_eq!(regs.r9,  0xFF, "arg5 must go to R9");
+        assert_eq!(regs.r8, 0xEE, "arg4 must go to R8");
+        assert_eq!(regs.r9, 0xFF, "arg5 must go to R9");
         // Scratch registers must be cleared
         assert_eq!(regs.rax, 0);
         assert_eq!(regs.rbx, 0);
@@ -1902,11 +1902,11 @@ mod tests {
         // RDI/RSI/RDX/RCX/R8/R9 assignment.
         for (slot, expected_reg) in [
             (0usize, "rdi"),
-            (1,      "rsi"),
-            (2,      "rdx"),
-            (3,      "rcx"),
-            (4,      "r8"),
-            (5,      "r9"),
+            (1, "rsi"),
+            (2, "rdx"),
+            (3, "rcx"),
+            (4, "r8"),
+            (5, "r9"),
         ] {
             let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
             let sentinel = 0x1000_0000 + slot as usize;
@@ -1921,8 +1921,8 @@ mod tests {
                 1 => regs.rsi as usize,
                 2 => regs.rdx as usize,
                 3 => regs.rcx as usize,
-                4 => regs.r8  as usize,
-                5 => regs.r9  as usize,
+                4 => regs.r8 as usize,
+                5 => regs.r9 as usize,
                 _ => unreachable!(),
             };
             assert_eq!(
@@ -1940,13 +1940,13 @@ mod tests {
         // snapshot written back without the new-task arg override.
         let mut trap = crate::kernel::trapframe::TrapFrame::zeroed();
         // Non-zero user_gprs[0] disables new-task detection.
-        trap.set_user_gpr(0,  0x1);     // rax = 1 (non-zero -> resumed task)
-        trap.set_user_gpr(11, 0xCAFE);  // r12
-        trap.set_user_gpr(12, 0xBEEF);  // r13
-        trap.set_user_gpr(13, 0xDEAD);  // r14
-        trap.set_user_gpr(14, 0x1234);  // r15
-        trap.set_user_gpr(1,  0xABCD);  // rbx
-        trap.set_user_gpr(6,  0x5678);  // rbp
+        trap.set_user_gpr(0, 0x1); // rax = 1 (non-zero -> resumed task)
+        trap.set_user_gpr(11, 0xCAFE); // r12
+        trap.set_user_gpr(12, 0xBEEF); // r13
+        trap.set_user_gpr(13, 0xDEAD); // r14
+        trap.set_user_gpr(14, 0x1234); // r15
+        trap.set_user_gpr(1, 0xABCD); // rbx
+        trap.set_user_gpr(6, 0x5678); // rbp
         // Set arg0 non-zero — must NOT trigger new-task path.
         trap.set_arg(0, 0xFF);
 
@@ -1961,7 +1961,10 @@ mod tests {
         assert_eq!(regs.rbx, 0xABCD, "rbx must be restored from user_gpr[1]");
         assert_eq!(regs.rbp, 0x5678, "rbp must be restored from user_gpr[6]");
         // Startup args must NOT be injected into RDI/RSI/etc for a resumed task.
-        assert_ne!(regs.rdi, 0xFF, "startup args must not override resumed task RDI");
+        assert_ne!(
+            regs.rdi, 0xFF,
+            "startup args must not override resumed task RDI"
+        );
     }
 
     // -----------------------------------------------------------------------

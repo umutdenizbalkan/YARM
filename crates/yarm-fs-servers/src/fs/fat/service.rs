@@ -3,13 +3,13 @@
 
 use super::super::common::service::FsService;
 use super::super::common::vfs_ipc::{
-    close_message, openat_inline_message, read_message, statx_inline_message,
-    write_inline_reply_message, CloseRequest, ReadWriteRequest, VfsError,
+    CloseRequest, ReadWriteRequest, VfsError, close_message, openat_inline_message, read_message,
+    statx_inline_message, write_inline_reply_message,
 };
-use super::fs::{FatBackend, FatBackendKind, FatError, FAT_HELLO_PATH};
+use super::fs::{FAT_HELLO_PATH, FatBackend, FatBackendKind, FatError};
 use yarm_ipc_abi::vfs_abi::{
-    VfsWriteInlineReply, VfsWriteInlineRequest, VFS_OP_WRITE_INLINE,
-    VFS_SHARED_IO_F_CURRENT_OFFSET, VFS_SHARED_IO_STATUS_OK,
+    VFS_OP_WRITE_INLINE, VFS_SHARED_IO_F_CURRENT_OFFSET, VFS_SHARED_IO_STATUS_OK,
+    VfsWriteInlineReply, VfsWriteInlineRequest,
 };
 use yarm_srv_common::service_loop::RequestResponseService;
 use yarm_srv_common::vfs_reply::VfsReply;
@@ -348,10 +348,10 @@ mod tests {
     use alloc::vec;
 
     use super::*;
-    use crate::fs::common::vfs_ipc::{write_inline_message, VfsBackend};
+    use crate::fs::common::vfs_ipc::{VfsBackend, write_inline_message};
     use yarm_ipc_abi::vfs_abi::{
-        VfsWriteInlineReply, VFS_OP_READ_SHARED_REPLY, VFS_OP_WRITE_SHARED_REQUEST,
-        VFS_SHARED_IO_F_CURRENT_OFFSET,
+        VFS_OP_READ_SHARED_REPLY, VFS_OP_WRITE_SHARED_REQUEST, VFS_SHARED_IO_F_CURRENT_OFFSET,
+        VfsWriteInlineReply,
     };
 
     #[test]

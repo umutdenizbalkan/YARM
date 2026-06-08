@@ -4,20 +4,19 @@
 use crate::kernel::boot::{
     BootConfigSubsystem, ControlPlaneCnodePlan, FaultSubsystem, KernelCapacityProfile, KernelError,
     KernelState, KernelStorage, RuntimeCapacityConfig, SchedulerState, TelemetrySubsystem,
-    TrapHandleError,
-    kernel_mut, kernel_ref,
+    TrapHandleError, kernel_mut, kernel_ref,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights};
 use crate::kernel::ipc::Message;
-use crate::kernel::task::{FaultPolicy, TaskClass};
-#[cfg(any(debug_assertions, test))]
-use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
 use crate::kernel::lock::{SpinLock, SpinLockIrq};
 use crate::kernel::scheduler::CpuId;
+use crate::kernel::task::{FaultPolicy, TaskClass};
 use crate::kernel::trap::{FaultInfo, Trap};
 use crate::kernel::trapframe::TrapFrame;
+#[cfg(any(debug_assertions, test))]
+use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Stage 30 / Review-finding C1: debug-only guard for the raw `&mut KernelState`
 /// aliasing window opened by [`SharedKernel::borrow_kernel_for_boot`].
@@ -616,9 +615,7 @@ impl SharedKernel {
         // this SharedKernel. `task_asid_for_tid_from_raw` derives raw field pointers
         // without creating a whole-KernelState reference; the task lock serializes
         // access to the TCB array.
-        unsafe {
-            KernelState::task_asid_for_tid_from_raw(self.state.data_ptr() as *const _, tid)
-        }
+        unsafe { KernelState::task_asid_for_tid_from_raw(self.state.data_ptr() as *const _, tid) }
     }
 
     pub fn fatal_trap_read_snapshot(&self, cpu: CpuId) -> FatalTrapReadSnapshot {
@@ -632,7 +629,10 @@ impl SharedKernel {
         } else {
             0
         };
-        FatalTrapReadSnapshot { current_tid, current_asid }
+        FatalTrapReadSnapshot {
+            current_tid,
+            current_asid,
+        }
     }
 
     // ── Stage 5A split-read helpers ──────────────────────────────────────────
@@ -664,9 +664,7 @@ impl SharedKernel {
         // this SharedKernel. `cnode_slot_capacity_from_raw` uses `addr_of!` to derive
         // raw field pointers without creating a whole-KernelState reference; the
         // capability lock serializes access to the `capability` field.
-        unsafe {
-            KernelState::cnode_slot_capacity_from_raw(self.state.data_ptr() as *const _, pid)
-        }
+        unsafe { KernelState::cnode_slot_capacity_from_raw(self.state.data_ptr() as *const _, pid) }
     }
 
     // ── Stage 5B split-read helpers ──────────────────────────────────────────
@@ -721,9 +719,7 @@ impl SharedKernel {
         // this SharedKernel. `cnode_registered_from_raw` uses `addr_of!` to derive
         // raw field pointers without creating a whole-KernelState reference; the
         // capability lock serializes access to the `capability` field.
-        unsafe {
-            KernelState::cnode_registered_from_raw(self.state.data_ptr() as *const _, pid)
-        }
+        unsafe { KernelState::cnode_registered_from_raw(self.state.data_ptr() as *const _, pid) }
     }
 
     // ── Stage 27 / 29 split-mutation helpers ─────────────────────────────────
@@ -771,10 +767,9 @@ impl SharedKernel {
     ) -> Result<(), KernelError> {
         let state = self.state.data_ptr();
         // Phase 1: task-domain snapshot (rank 2), lock released on return.
-        let requester_class = unsafe {
-            KernelState::task_class_from_raw(state as *const _, requester_tid)
-        }
-        .ok_or(KernelError::TaskMissing)?;
+        let requester_class =
+            unsafe { KernelState::task_class_from_raw(state as *const _, requester_tid) }
+                .ok_or(KernelError::TaskMissing)?;
         let requester_pid =
             unsafe { KernelState::process_id_from_raw(state as *const _, requester_tid) }
                 .unwrap_or(requester_tid);
@@ -1163,7 +1158,10 @@ mod tests {
         assert_eq!(kernel.last_fault_split_read(), None);
         assert_eq!(kernel.last_fault_frame_split_read(), None);
 
-        let fault = FaultInfo { addr: VirtAddr(0xDEAD_0000), access: FaultAccess::Write };
+        let fault = FaultInfo {
+            addr: VirtAddr(0xDEAD_0000),
+            access: FaultAccess::Write,
+        };
         kernel.record_fault_split_mut(fault);
 
         // Split-read must match the global-lock read.
@@ -1212,7 +1210,10 @@ mod tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
 
         let (count0, timeout0) = kernel.with(|state| {
-            (state.tlb_shootdown_count(), state.tlb_shootdown_timeout_count())
+            (
+                state.tlb_shootdown_count(),
+                state.tlb_shootdown_timeout_count(),
+            )
         });
 
         // Initial values match.
@@ -1223,7 +1224,10 @@ mod tests {
         kernel.increment_tlb_shootdown_count_split_mut();
         kernel.add_tlb_shootdown_timeout_count_split_mut(5);
 
-        assert_eq!(kernel.tlb_shootdown_count_split_read(), count0.wrapping_add(1));
+        assert_eq!(
+            kernel.tlb_shootdown_count_split_read(),
+            count0.wrapping_add(1)
+        );
         assert_eq!(
             kernel.tlb_shootdown_timeout_count_split_read(),
             timeout0.wrapping_add(5)
@@ -1340,7 +1344,10 @@ mod tests {
             "exiting_tid must equal entering_tid when no task switch"
         );
         let task_switched = entering_tid != exiting_tid;
-        assert!(!task_switched, "task_switched must be false for same-task return");
+        assert!(
+            !task_switched,
+            "task_switched must be false for same-task return"
+        );
     }
 
     #[test]
@@ -1351,7 +1358,9 @@ mod tests {
         let offline_cpu = CpuId(7);
 
         let split = kernel.current_tid_split_read(offline_cpu);
-        let conservative = kernel.with_cpu(offline_cpu, |k| k.current_tid()).unwrap_or(None);
+        let conservative = kernel
+            .with_cpu(offline_cpu, |k| k.current_tid())
+            .unwrap_or(None);
         assert_eq!(
             split, None,
             "offline CPU must return None from current_tid_split_read"
@@ -1420,7 +1429,10 @@ mod tests {
             "entering_tid must equal exiting_tid when no task switch"
         );
         let task_switched = entering_tid != exiting_tid;
-        assert!(!task_switched, "task_switched must be false for same-task return");
+        assert!(
+            !task_switched,
+            "task_switched must be false for same-task return"
+        );
     }
 
     #[test]
@@ -1430,7 +1442,9 @@ mod tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let offline_cpu = CpuId(7);
 
-        let entering_tid = kernel.with_cpu(offline_cpu, |k| k.current_tid()).unwrap_or(None);
+        let entering_tid = kernel
+            .with_cpu(offline_cpu, |k| k.current_tid())
+            .unwrap_or(None);
         assert_eq!(
             entering_tid, None,
             "offline CPU must return None from with_cpu→current_tid"
@@ -1478,7 +1492,8 @@ mod tests {
 
         let snapshot = kernel.fatal_trap_read_snapshot(cpu);
         let asid_via_split = kernel.task_asid_for_tid_split_read(74);
-        let asid_via_global = kernel.with(|state| state.task_asid(74).map(|a| a.0 as u64).unwrap_or(0));
+        let asid_via_global =
+            kernel.with(|state| state.task_asid(74).map(|a| a.0 as u64).unwrap_or(0));
 
         assert_eq!(
             snapshot.current_asid, asid_via_split,
@@ -1551,7 +1566,10 @@ mod tests {
             kernel.with(|state| state.task_class(502)),
             "task_class_split_read must match global for SystemServer"
         );
-        assert_eq!(kernel.task_class_split_read(502), Some(TaskClass::SystemServer));
+        assert_eq!(
+            kernel.task_class_split_read(502),
+            Some(TaskClass::SystemServer)
+        );
 
         // Unknown TID still returns None from both paths.
         assert_eq!(
@@ -1570,8 +1588,7 @@ mod tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
 
         // Before registration.
-        let absent_via_global =
-            kernel.with(|state| state.task_class(511)).is_some();
+        let absent_via_global = kernel.with(|state| state.task_class(511)).is_some();
         assert_eq!(
             kernel.task_exists_split_read(511),
             absent_via_global,
@@ -1584,8 +1601,7 @@ mod tests {
             state.register_task(511).expect("task511");
         });
 
-        let present_via_global =
-            kernel.with(|state| state.task_class(511)).is_some();
+        let present_via_global = kernel.with(|state| state.task_class(511)).is_some();
         assert_eq!(
             kernel.task_exists_split_read(511),
             present_via_global,
@@ -1643,7 +1659,10 @@ mod tests {
             after_global,
             "cnode_slot_capacity_split_read must match global after creation"
         );
-        assert_eq!(kernel.cnode_slot_capacity_split_read(521), Some(requested_slots));
+        assert_eq!(
+            kernel.cnode_slot_capacity_split_read(521),
+            Some(requested_slots)
+        );
     }
 
     #[test]

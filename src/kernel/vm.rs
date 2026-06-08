@@ -269,11 +269,7 @@ pub struct AddressSpace {
 }
 
 impl AddressSpace {
-    fn isolate_page_entry_at(
-        &mut self,
-        idx: usize,
-        virt: VirtAddr,
-    ) -> Result<usize, VmError> {
+    fn isolate_page_entry_at(&mut self, idx: usize, virt: VirtAddr) -> Result<usize, VmError> {
         let entry = self.entries[idx].expect("entry");
         let page_offset = ((virt.0 - entry.virt.0) / PAGE_SIZE as u64) as usize;
         if page_offset >= entry.pages {
@@ -447,22 +443,25 @@ impl AddressSpace {
                     return Err(VmError::Full);
                 }
                 arch_map_page(self.asid, virt, mapping)?;
-                let prev_merge = i > 0 && self.entries[i - 1].is_some_and(|prev| {
-                    prev.mapping.flags == mapping.flags
-                        && Self::entry_end_virt(&prev) == virt.0
-                        && prev.mapping.phys.0 + (prev.pages as u64 * PAGE_SIZE as u64) == mapping.phys.0
-                });
+                let prev_merge = i > 0
+                    && self.entries[i - 1].is_some_and(|prev| {
+                        prev.mapping.flags == mapping.flags
+                            && Self::entry_end_virt(&prev) == virt.0
+                            && prev.mapping.phys.0 + (prev.pages as u64 * PAGE_SIZE as u64)
+                                == mapping.phys.0
+                    });
                 if prev_merge {
                     let prev = self.entries[i - 1].as_mut().expect("prev");
                     prev.pages += 1;
                     return Ok(None);
                 }
 
-                let next_merge = i < self.len && self.entries[i].is_some_and(|next| {
-                    next.mapping.flags == mapping.flags
-                        && virt.0 + PAGE_SIZE as u64 == next.virt.0
-                        && mapping.phys.0 + PAGE_SIZE as u64 == next.mapping.phys.0
-                });
+                let next_merge = i < self.len
+                    && self.entries[i].is_some_and(|next| {
+                        next.mapping.flags == mapping.flags
+                            && virt.0 + PAGE_SIZE as u64 == next.virt.0
+                            && mapping.phys.0 + PAGE_SIZE as u64 == next.mapping.phys.0
+                    });
                 if next_merge {
                     let next = self.entries[i].as_mut().expect("next");
                     next.virt = virt;
@@ -1033,9 +1032,11 @@ mod tests {
         }
         assert_eq!(aspace.mappings(), 1);
         assert!(aspace.resolve(base).is_some());
-        assert!(aspace
-            .resolve(VirtAddr(base.0 + (127 * PAGE_SIZE) as u64))
-            .is_some());
+        assert!(
+            aspace
+                .resolve(VirtAddr(base.0 + (127 * PAGE_SIZE) as u64))
+                .is_some()
+        );
         assert_eq!(aspace.resolve(VirtAddr(base.0 - PAGE_SIZE as u64)), None);
     }
 

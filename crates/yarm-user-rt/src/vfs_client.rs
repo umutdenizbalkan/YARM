@@ -15,8 +15,8 @@
 
 use crate::ipc::Message;
 use yarm_ipc_abi::vfs_abi::{
-    BulkReadArgs, OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VfsV1Args,
-    VFS_OP_CLOSE, VFS_OP_OPENAT, VFS_OP_READ, VFS_OP_READ_BULK, VFS_OP_STATX,
+    BulkReadArgs, OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_OPENAT,
+    VFS_OP_READ, VFS_OP_READ_BULK, VFS_OP_STATX, VfsV1Args,
 };
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -186,7 +186,6 @@ pub unsafe fn vfs_read(
     }
 }
 
-
 /// Send a `VFS_OP_CLOSE` request for `fd` to `vfs_send_cap` and return the
 /// reply status (0 = success).  Uses a zero-tick deadline.
 ///
@@ -211,9 +210,7 @@ pub unsafe fn vfs_close(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yarm_ipc_abi::vfs_abi::{
-        OpenAtInlinePath, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX,
-    };
+    use yarm_ipc_abi::vfs_abi::{OpenAtInlinePath, StatxInlinePath, VFS_OP_OPENAT, VFS_OP_STATX};
 
     // ── build_statx_message ──────────────────────────────────────────────────
 
@@ -352,7 +349,7 @@ mod tests {
 
     #[test]
     fn build_close_sets_opcode_and_fd() {
-        use yarm_ipc_abi::vfs_abi::{VfsV1Args, VFS_OP_CLOSE};
+        use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VfsV1Args};
         let msg = build_close_message(9).expect("build");
         assert_eq!(msg.opcode, VFS_OP_CLOSE);
         let args = VfsV1Args::decode(msg.as_slice()).expect("decode");
@@ -364,7 +361,7 @@ mod tests {
 
     #[test]
     fn build_close_fd_zero_encodes() {
-        use yarm_ipc_abi::vfs_abi::{VfsV1Args, VFS_OP_CLOSE};
+        use yarm_ipc_abi::vfs_abi::{VFS_OP_CLOSE, VfsV1Args};
         let msg = build_close_message(0).expect("build");
         assert_eq!(msg.opcode, VFS_OP_CLOSE);
         let args = VfsV1Args::decode(msg.as_slice()).expect("decode");

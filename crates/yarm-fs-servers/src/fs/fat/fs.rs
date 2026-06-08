@@ -182,7 +182,7 @@ impl BlockDevice for IpcBlockDevice {
 
     fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> Result<(), FatError> {
         use yarm_ipc_abi::block_abi::{
-            BlkReadRequest, BlkStatus, BLK_IPC_MAX_DATA_BYTES, BLK_OP_READ, BLK_SECTOR_SIZE,
+            BLK_IPC_MAX_DATA_BYTES, BLK_OP_READ, BLK_SECTOR_SIZE, BlkReadRequest, BlkStatus,
         };
         use yarm_user_rt::ipc::Message;
         if offset % u64::from(BLK_SECTOR_SIZE) != 0 || out.len() % BLK_SECTOR_SIZE as usize != 0 {
@@ -256,7 +256,7 @@ impl IpcBlockDevice {
     }
 
     fn write_sector(&mut self, lba: u64, sector: &[u8; 512]) -> Result<(), FatError> {
-        use yarm_ipc_abi::block_abi::{BlkWriteReply, BLK_OP_WRITE};
+        use yarm_ipc_abi::block_abi::{BLK_OP_WRITE, BlkWriteReply};
         use yarm_user_rt::ipc::Message;
 
         let device_id = self.device_id;
@@ -290,7 +290,7 @@ where
     ) -> Result<yarm_ipc_abi::block_abi::BlkWriteReply, FatError>,
 {
     use yarm_ipc_abi::block_abi::{
-        BlkStatus, BlkWriteRequest, BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST, BLK_WRITE_MAX_CHUNK_BYTES,
+        BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST, BLK_WRITE_MAX_CHUNK_BYTES, BlkStatus, BlkWriteRequest,
     };
 
     let mut offset = 0usize;
@@ -1420,7 +1420,7 @@ mod tests {
     #[test]
     fn ipc_sector_write_emits_valid_fs12_chunks() {
         use yarm_ipc_abi::block_abi::{
-            BlkStatus, BlkWriteReply, BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST,
+            BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST, BlkStatus, BlkWriteReply,
         };
 
         let mut sector = [0u8; 512];

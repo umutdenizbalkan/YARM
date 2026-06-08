@@ -377,13 +377,21 @@ mod tests {
 
         // Must dispatch through the split path and mutate the capability domain.
         let result = try_split_dispatch(&kernel, syscall, requester, args);
-        assert_eq!(result, Some(Ok(())), "split dispatch must service the syscall");
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "split dispatch must service the syscall"
+        );
 
         let after = kernel.with(|state| {
             let cnode = state.process_cnode_for_pid(target).expect("cnode");
             state.cnode_slot_capacity(cnode)
         });
-        assert_eq!(after, Some(requested), "split path must resize the target cnode");
+        assert_eq!(
+            after,
+            Some(requested),
+            "split path must resize the target cnode"
+        );
     }
 
     #[test]
@@ -632,11 +640,8 @@ mod tests {
         // bogus frame payload. Compare seam vs direct helper.
         let mut frame = cnode_slots_frame(unregistered_pid, 16);
         let seam = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
-        let direct = kernel.control_plane_set_process_cnode_slots_split_mut(
-            900,
-            unregistered_pid,
-            16,
-        );
+        let direct =
+            kernel.control_plane_set_process_cnode_slots_split_mut(900, unregistered_pid, 16);
         match (seam, direct) {
             (Some(Ok(())), Ok(())) => {
                 // Create path succeeded: the frame must carry the canonical lanes.
@@ -644,8 +649,16 @@ mod tests {
                 assert_eq!(frame.ret1(), unregistered_pid as usize);
             }
             (Some(Err(TrapHandleError::Syscall(s))), Err(k)) => {
-                assert_eq!(s, SyscallError::from(k), "seam error must equal helper error");
-                assert_eq!(frame.error_code(), None, "seam never writes set_err for hard errors");
+                assert_eq!(
+                    s,
+                    SyscallError::from(k),
+                    "seam error must equal helper error"
+                );
+                assert_eq!(
+                    frame.error_code(),
+                    None,
+                    "seam never writes set_err for hard errors"
+                );
             }
             (seam, direct) => panic!("seam/direct divergence: {seam:?} vs {direct:?}"),
         }
@@ -663,9 +676,15 @@ mod tests {
             .expect("before");
         let requested = before.saturating_add(6);
         let mut f1 = cnode_slots_frame(target, requested);
-        assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut f1), Some(Ok(())));
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f1),
+            Some(Ok(()))
+        );
         let mut f2 = cnode_slots_frame(target, requested);
-        assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut f2), Some(Ok(())));
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f2),
+            Some(Ok(()))
+        );
         assert_eq!(f2.ret0(), requested);
         assert_eq!(f2.ret1(), target as usize);
         let after = kernel.with(|state| {
@@ -687,11 +706,17 @@ mod tests {
             .expect("base");
         let grow1 = base.saturating_add(2);
         let mut f1 = cnode_slots_frame(target, grow1);
-        assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut f1), Some(Ok(())));
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f1),
+            Some(Ok(()))
+        );
         assert_eq!(f1.ret0(), grow1);
         let grow2 = grow1.saturating_add(5);
         let mut f2 = cnode_slots_frame(target, grow2);
-        assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut f2), Some(Ok(())));
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut f2),
+            Some(Ok(()))
+        );
         assert_eq!(f2.ret0(), grow2);
         let after = kernel.with(|state| {
             let cnode = state.process_cnode_for_pid(target).expect("cnode");
@@ -724,7 +749,11 @@ mod tests {
         let mut frame = cnode_slots_frame(target, 12);
         let _ = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         let after_tid = kernel.current_tid_split_read(CPU0);
-        assert_eq!(after_tid, Some(requester), "no task switch (task_switched==false)");
+        assert_eq!(
+            after_tid,
+            Some(requester),
+            "no task switch (task_switched==false)"
+        );
     }
 
     #[test]
@@ -751,10 +780,10 @@ mod tests {
 
     #[test]
     fn stage29_only_nr8_is_split_eligible() {
-        assert!(classify_split_eligible_nr_only(
-            decode(SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR)
-        )
-        .is_some());
+        assert!(
+            classify_split_eligible_nr_only(decode(SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR))
+                .is_some()
+        );
     }
 
     #[test]
@@ -773,7 +802,10 @@ mod tests {
     fn stage29_spawnv5_not_eligible() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
         let mut frame = TrapFrame::new(SYSCALL_SPAWN_PROCESS_NR, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut frame), None);
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None
+        );
         assert!(classify_split_eligible_nr_only(decode(SYSCALL_SPAWN_PROCESS_NR)).is_none());
     }
 
@@ -781,7 +813,10 @@ mod tests {
     fn stage29_vm_map_not_eligible() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
         let mut frame = TrapFrame::new(SYSCALL_VM_MAP_NR, [1, 2, 3, 4, 5, 6]);
-        assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut frame), None);
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None
+        );
         assert!(classify_split_eligible_nr_only(decode(SYSCALL_VM_MAP_NR)).is_none());
     }
 
@@ -795,15 +830,18 @@ mod tests {
             crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR,
             [1, 2, 3, 4, 5, 6],
         );
-        assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut frame), None);
-        assert!(classify_split_eligible_nr_only(
-            decode(crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR)
-        )
-        .is_none());
-        assert!(classify_split_eligible_nr_only(
-            decode(crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR)
-        )
-        .is_none());
+        assert_eq!(
+            try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None
+        );
+        assert!(
+            classify_split_eligible_nr_only(decode(crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR))
+                .is_none()
+        );
+        assert!(
+            classify_split_eligible_nr_only(decode(crate::kernel::syscall::SYSCALL_FUTEX_WAKE_NR))
+                .is_none()
+        );
     }
 
     #[test]

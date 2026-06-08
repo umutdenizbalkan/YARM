@@ -140,11 +140,8 @@ impl KernelState {
             return false;
         };
         if is_reply_cap {
-            let cleared = self.fast_revoke_reply_cap_in_cnode(
-                receiver_cnode,
-                materialized_cap,
-                cap_object,
-            );
+            let cleared =
+                self.fast_revoke_reply_cap_in_cnode(receiver_cnode, materialized_cap, cap_object);
             if let CapObject::Reply { index, generation } = cap_object {
                 // Drop the now-stale waiter_cap_id so ipc_reply does not try to
                 // fast-revoke a slot we just cleared.

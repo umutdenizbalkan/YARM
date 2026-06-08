@@ -214,7 +214,12 @@ impl InitramfsBackend {
     /// primitive (`initramfs_write_to_pm_buf` / syscall nr=27 with arg5=PM_TID).
     pub fn cpio_name_for_fd(&self, fd: u64) -> Option<&'static [u8]> {
         let inode = self.inode_for_fd(fd).ok()?;
-        Some(inode.path.strip_prefix(b"/initramfs/").unwrap_or(inode.path))
+        Some(
+            inode
+                .path
+                .strip_prefix(b"/initramfs/")
+                .unwrap_or(inode.path),
+        )
     }
 
     /// Returns the total file length for an open fd.
@@ -250,7 +255,6 @@ impl InitramfsBackend {
         Err(VfsError::BadFd)
     }
 
-
     fn is_placeholder_mode(&self) -> bool {
         self.cpio.is_none()
     }
@@ -269,7 +273,9 @@ impl InitramfsBackend {
         Ok(())
     }
 
-    fn statx_value(file_len: u64) -> u64 { file_len }
+    fn statx_value(file_len: u64) -> u64 {
+        file_len
+    }
 
     fn metadata_by_path(&self, path: &[u8]) -> Result<u64, VfsError> {
         let inode_idx = self.lookup_by_path(path)?;
@@ -284,7 +290,10 @@ impl VfsBackend for InitramfsBackend {
             self.metrics.error_count = self.metrics.error_count.saturating_add(1);
             return Err(err);
         }
-        match self.lookup_by_path(path).and_then(|inode_idx| self.alloc_handle(inode_idx)) {
+        match self
+            .lookup_by_path(path)
+            .and_then(|inode_idx| self.alloc_handle(inode_idx))
+        {
             Ok(fd) => {
                 self.metrics.open_count = self.metrics.open_count.saturating_add(1);
                 Ok(fd)
@@ -330,8 +339,15 @@ impl VfsBackend for InitramfsBackend {
             Some(c) => c,
             None => return Ok((self.read(fd, len)?, 0)),
         };
-        let name = inode.path.strip_prefix(b"/initramfs/").unwrap_or(inode.path);
-        let Some(entry) = yarm_srv_common::cpio::CpioArchive::new(cpio).find(core::str::from_utf8(name).unwrap_or("")).ok().flatten() else {
+        let name = inode
+            .path
+            .strip_prefix(b"/initramfs/")
+            .unwrap_or(inode.path);
+        let Some(entry) = yarm_srv_common::cpio::CpioArchive::new(cpio)
+            .find(core::str::from_utf8(name).unwrap_or(""))
+            .ok()
+            .flatten()
+        else {
             return Ok((0, 0));
         };
         let handle = self
@@ -384,8 +400,8 @@ impl VfsBackend for InitramfsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::format;
     use alloc::boxed::Box;
+    use alloc::format;
     use alloc::vec::Vec;
 
     fn push_entry(out: &mut Vec<u8>, name: &str, mode: u32, data: &[u8]) {
@@ -421,7 +437,9 @@ mod tests {
     #[test]
     fn initramfs_openat_path_accepts_real_bytes() {
         let mut fs = InitramfsBackend::new(4096);
-        let fd = fs.openat_path(INITRAMFS_BOOT_MARKER_PATH).expect("open path");
+        let fd = fs
+            .openat_path(INITRAMFS_BOOT_MARKER_PATH)
+            .expect("open path");
         assert_eq!(fd, 10);
     }
 
@@ -508,8 +526,14 @@ mod tests {
     #[test]
     fn initramfs_placeholder_rejects_late_exec_paths() {
         let mut fs = InitramfsBackend::new(4096);
-        assert_eq!(fs.statx_path(INITRAMFS_DRIVER_MANAGER_PATH), Err(VfsError::Unsupported));
-        assert_eq!(fs.openat_path(INITRAMFS_DRIVER_MANAGER_PATH), Err(VfsError::Unsupported));
+        assert_eq!(
+            fs.statx_path(INITRAMFS_DRIVER_MANAGER_PATH),
+            Err(VfsError::Unsupported)
+        );
+        assert_eq!(
+            fs.openat_path(INITRAMFS_DRIVER_MANAGER_PATH),
+            Err(VfsError::Unsupported)
+        );
     }
 
     #[test]
@@ -519,11 +543,13 @@ mod tests {
         push_entry(&mut cpio, "TRAILER!!!", 0, &[]);
         let leaked: &'static [u8] = Box::leak(cpio.into_boxed_slice());
         let mut fs = InitramfsBackend::from_cpio_newc_static(leaked);
-        assert_eq!(fs.statx_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("stat"), 10);
+        assert_eq!(
+            fs.statx_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("stat"),
+            10
+        );
         let fd = fs.openat_path(INITRAMFS_DRIVER_MANAGER_PATH).expect("open");
         assert!(fd >= 10);
     }
-
 
     // ── Phase 2B bulk-read helper method tests ─────────────────────────────
 
@@ -580,5 +606,4 @@ mod tests {
         fs.close(fd).expect("close");
         assert!(fs.cpio_name_for_fd(fd).is_none());
     }
-
 }

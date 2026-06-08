@@ -28,7 +28,6 @@ fn aarch64_trap_trace(args: core::fmt::Arguments) {
 
 macro_rules! trap_trace { ($($arg:tt)*) => { aarch64_trap_trace(format_args!($($arg)*)) }; }
 
-
 #[inline(always)]
 fn idle_no_eret_loop() -> ! {
     crate::yarm_log!("SCHED_ENTER_IDLE_HLT");
@@ -107,8 +106,12 @@ fn restore_arch_thread_state(
     trap_trace!(
         "AARCH64_FIRST_ENTRY_ARGS tid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x}",
         current_tid,
-        frame.arg(0), frame.arg(1), frame.arg(2),
-        frame.arg(3), frame.arg(4), frame.arg(5)
+        frame.arg(0),
+        frame.arg(1),
+        frame.arg(2),
+        frame.arg(3),
+        frame.arg(4),
+        frame.arg(5)
     );
     trap_trace!(
         "AARCH64_CONTEXT_RESTORE_FULL tid={} elr=0x{:016x} sp=0x{:016x} x0=0x{:016x} x1=0x{:016x} x29=0x{:016x} x30=0x{:016x} ctx_ptr=0x{:x}",
@@ -264,8 +267,8 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             // syscall handler sets frame.error = WouldBlock so is_error() is true,
             // causing needs_plus4 = false and saved_pc = SVC. The task then retries
             // the SVC on wakeup when the message is in the queue.
-            let ipc_recv_ok = nr == crate::kernel::syscall::Syscall::IpcRecv as usize
-                && !f.is_error();
+            let ipc_recv_ok =
+                nr == crate::kernel::syscall::Syscall::IpcRecv as usize && !f.is_error();
             (nr, ipc_recv_ok)
         } else {
             (0, false)
@@ -530,9 +533,18 @@ mod tests {
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0), 7);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1), 8);
         assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2), 9);
-        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3), 10);
-        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X4), 11);
-        assert_eq!(frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X5), 12);
+        assert_eq!(
+            frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X3),
+            10
+        );
+        assert_eq!(
+            frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X4),
+            11
+        );
+        assert_eq!(
+            frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X5),
+            12
+        );
 
         frame.set_err(5);
         export_syscall_result_to_user_gprs(&mut frame);

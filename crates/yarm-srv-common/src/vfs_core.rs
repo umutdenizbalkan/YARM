@@ -243,7 +243,6 @@ impl<A: VfsBackend, B: VfsBackend> MountRouter<A, B> {
 }
 
 impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         let normalized = normalize_path(path)?;
         self.route_by_path_bytes(normalized.as_slice())
@@ -261,7 +260,6 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
     fn write(&mut self, fd: u64, len: u64) -> Result<u64, VfsError> {
         self.route_by_fd(fd).write(fd, len)
     }
-
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         let normalized = normalize_path(path)?;
@@ -317,7 +315,6 @@ impl<A: VfsBackend, B: VfsBackend> VfsBackend for MountRouter<A, B> {
 }
 
 impl VfsBackend for InMemoryBackend {
-
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         if path.is_empty() {
             return Err(VfsError::InvalidPath);
@@ -347,7 +344,6 @@ impl VfsBackend for InMemoryBackend {
         }
         Ok(len)
     }
-
 
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         if path.is_empty() {
