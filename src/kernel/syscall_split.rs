@@ -502,7 +502,7 @@ mod tests {
     fn stage28_syscall_count_unchanged() {
         // ABI guard: the split-dispatch scaffold is pure additive infrastructure
         // and must not alter the syscall ABI.
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 28 must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 28 must not change SYSCALL_COUNT");
     }
 
     #[test]
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn stage29_syscall_count_still_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 29 must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 29 must not change SYSCALL_COUNT");
     }
 
     #[test]
@@ -1025,6 +1025,6 @@ mod tests {
 
     #[test]
     fn stage32b_syscall_count_30() {
-        assert_eq!(SYSCALL_COUNT, 30, "Stage 32B must not change SYSCALL_COUNT");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 42+43 adds RecvSharedV3 (NR 31); stage32b invariant updated");
     }
 }

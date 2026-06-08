@@ -47,8 +47,11 @@ pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
 /// Phase 3A: Spawn a process from a MemoryObject capability (zero-copy ELF load path).
 /// Only callable by PM (TID=3).
 pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
-pub const SYSCALL_COUNT: usize = 30;
-const _: [(); SYSCALL_COUNT] = [(); 30];
+/// Stage 42+43: versioned receive with cap-transfer through canonical receive core.
+/// Non-blocking only in this stage (timeout_ticks == 0 required).
+pub const SYSCALL_RECV_SHARED_V3_NR: usize = 31;
+pub const SYSCALL_COUNT: usize = 31;
+const _: [(); SYSCALL_COUNT] = [(); 31];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -113,10 +116,13 @@ pub enum Syscall {
     CreateInitramfsFileSliceMo = SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR,
     /// Phase 3A: Spawn a process from a MemoryObject capability.
     SpawnFromMemoryObject = SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR,
+    /// Stage 42+43: versioned receive with cap-transfer on the split path.
+    /// Non-blocking only in this stage; full blocking requires a future stage.
+    RecvSharedV3 = SYSCALL_RECV_SHARED_V3_NR,
 }
 
 impl Syscall {
-    pub const VARIANT_COUNT: usize = 22;
+    pub const VARIANT_COUNT: usize = 23;
     pub const fn number(self) -> usize {
         self as usize
     }
@@ -145,6 +151,7 @@ impl Syscall {
             SYSCALL_INITRAMFS_READ_CHUNK_NR => Ok(Self::InitramfsReadChunk),
             SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR => Ok(Self::CreateInitramfsFileSliceMo),
             SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR => Ok(Self::SpawnFromMemoryObject),
+            SYSCALL_RECV_SHARED_V3_NR => Ok(Self::RecvSharedV3),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -2213,6 +2220,41 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
 
     match outcome {
         RecvOutcome::Delivered(delivery) => {
+            // Stage 42+43: materialize capability FIRST, before sender wake and
+            // before any user-space writeback — matching the full-path order in
+            // handle_ipc_recv_result_with_empty_error (§58):
+            //   1. materialize cap (no user-memory access)
+            //   2. wake sender (scheduler, rank 1)
+            //   3. user-space writeback (payload / meta copy)
+            //   4. rollback cap on writeback failure (meta fault or undersized payload)
+            // ipc_state_lock already released; capability lock (rank 4) is safe.
+            let receiver_tid = snapshot.requester_tid;
+            let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
+            let materialized_cap: Option<u64> = if let Some(_plan) = delivery.cap_transfer {
+                let endpoint = snapshot.endpoint;
+                match materialize_received_message_cap(
+                    kernel,
+                    endpoint,
+                    receiver_tid,
+                    delivery.msg.sender_tid.0,
+                    &delivery.msg,
+                ) {
+                    Ok(local_cap) => {
+                        if encode_transfer_cap_ret(frame, local_cap).is_err() {
+                            return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+                        }
+                        crate::yarm_log!("YARM_RECV_CORE_CAP_MATERIALIZE receiver_tid={} local_cap={}", receiver_tid, local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP));
+                        local_cap
+                    }
+                    Err(e) => return Some(Err(TrapHandleError::Syscall(e))),
+                }
+            } else {
+                if encode_transfer_cap_ret(frame, None).is_err() {
+                    return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+                }
+                None
+            };
+
             // Stage 38+39: apply deferred sender-waiter wake BEFORE writeback —
             // matching the full-path order in handle_ipc_recv (§56): wake applied
             // before handle_ipc_recv_result, i.e. before any copy operation.
@@ -2220,6 +2262,7 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
             if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
                 let _ = kernel.apply_split_sender_wake_plan(wake_tid);
             }
+
             match delivery.writeback {
                 RecvWritebackPlan::KernelRegister {
                     sender_tid,
@@ -2227,9 +2270,7 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                 } => {
                     // Kernel-task writeback — byte-for-byte identical to the
                     // no-user-ASID branch of handle_ipc_recv_result_with_empty_error.
-                    if encode_transfer_cap_ret(frame, None).is_err() {
-                        return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
-                    }
+                    // encode_transfer_cap_ret already called above; ret2 is set.
                     frame.set_ok(sender_tid, raw_len, frame.ret2());
                     let words = match pack_register_payload(delivery.msg.as_slice()) {
                         Ok(w) => w,
@@ -2242,12 +2283,9 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                     crate::yarm_log!("YARM_RECV_CORE_LIVE kind=kernel_plain");
                 }
                 RecvWritebackPlan::UserMemory { sender_tid, .. } => {
-                    // Stage 36: user-ASID plain writeback.
-                    // ipc_state_lock was released inside try_recv_core_user_plain.
-                    // Capability lock is NOT held here.  Both hard constraints satisfied.
-                    if encode_transfer_cap_ret(frame, None).is_err() {
-                        return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
-                    }
+                    // Stage 36+42+43: user-ASID plain writeback.
+                    // ipc_state_lock released inside try_recv_core_user_plain.
+                    // Capability lock NOT held here.  encode_transfer_cap_ret already called.
                     match execute_user_asid_plain_writeback(kernel, &delivery) {
                         RecvUserWritebackOutcome::Ok => {
                             let payload_len = delivery.msg.as_slice().len();
@@ -2255,43 +2293,57 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                             crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain");
                         }
                         RecvUserWritebackOutcome::UndersizedBuffer => {
-                            // Message consumed; matches full-path Err(InvalidArgs) (§54).
+                            // Stage 42+43: rollback materialized cap (matches full path §58).
+                            if let Some(cap_id) = materialized_cap {
+                                kernel.rollback_materialized_recv_cap(
+                                    receiver_tid, CapId(cap_id), is_reply_cap,
+                                );
+                                let _ = encode_transfer_cap_ret(frame, None);
+                            }
                             return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
                         }
                         RecvUserWritebackOutcome::CopyFault { user_ptr } => {
-                            // Message consumed; matches full-path record_user_fault+Ok() (§54).
+                            // No rollback on payload copy fault (matches full path §54/§58).
                             record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
                             return Some(Ok(()));
                         }
                     }
                 }
                 RecvWritebackPlan::UserMemoryV2 { .. } => {
-                    // Stage 37: user-ASID recv-v2 plain writeback (meta-first ordering).
-                    // ipc_state_lock was released inside try_recv_core_user_plain_v2.
-                    // Capability lock is NOT held here.  Both hard constraints satisfied.
-                    if encode_transfer_cap_ret(frame, None).is_err() {
-                        return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
-                    }
+                    // Stage 37+42+43: user-ASID recv-v2 plain writeback (meta-first ordering).
+                    // ipc_state_lock released inside try_recv_core_user_plain_v2.
+                    // Capability lock NOT held here.  encode_transfer_cap_ret already called.
                     match execute_user_asid_plain_v2_writeback(kernel, &delivery) {
                         RecvV2WritebackOutcome::Ok => {
-                            // recv-v2 mode: ret0=0 (metadata in meta struct, not ret0).
                             let payload_len = delivery.msg.as_slice().len();
                             frame.set_ok(0, payload_len, frame.ret2());
                             crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain_v2");
                             crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=ok");
                         }
                         RecvV2WritebackOutcome::PayloadUndersized => {
-                            // Meta written; payload too small. Matches full-path Err(InvalidArgs) (§55).
+                            // Stage 42+43: rollback materialized cap (matches full path §58).
                             crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized");
+                            if let Some(cap_id) = materialized_cap {
+                                kernel.rollback_materialized_recv_cap(
+                                    receiver_tid, CapId(cap_id), is_reply_cap,
+                                );
+                                let _ = encode_transfer_cap_ret(frame, None);
+                            }
                             return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
                         }
                         RecvV2WritebackOutcome::MetaCopyFault { .. } => {
-                            // Matches full-path return Err(SyscallError::from(UserMemoryFault)) = PageFault (§55).
+                            // Stage 42+43: rollback materialized cap (matches full path §58).
                             crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=meta_fault");
+                            if let Some(cap_id) = materialized_cap {
+                                kernel.rollback_materialized_recv_cap(
+                                    receiver_tid, CapId(cap_id), is_reply_cap,
+                                );
+                                let _ = encode_transfer_cap_ret(frame, None);
+                            }
                             return Some(Err(TrapHandleError::Syscall(SyscallError::PageFault)));
                         }
                         RecvV2WritebackOutcome::PayloadCopyFault { user_ptr } => {
-                            // Meta written; payload fault. Matches full-path record_user_fault+Ok() (§55).
+                            // No rollback on payload copy fault (matches full path §55/§58).
                             crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_fault");
                             record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
                             return Some(Ok(()));
@@ -3946,6 +3998,264 @@ fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(
     Ok(())
 }
 
+// ── Stage 42+43: recv_shared_v3 helpers ──────────────────────────────────────
+
+/// Parse a `RecvSharedV3Request` from a raw byte buffer at the wire-format offsets.
+///
+/// Bytes below 64 are required; bytes [64..80] (the `reserved` fields) default
+/// to zero when absent so validation still passes for a minimal 64-byte record.
+fn parse_v3_request_bytes(
+    buf: &[u8],
+) -> crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request {
+    use crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request;
+    macro_rules! u32le {
+        ($off:expr) => {
+            u32::from_le_bytes([buf[$off], buf[$off + 1], buf[$off + 2], buf[$off + 3]])
+        };
+    }
+    macro_rules! u64le {
+        ($off:expr) => {
+            if buf.len() >= $off + 8 {
+                u64::from_le_bytes([
+                    buf[$off],
+                    buf[$off + 1],
+                    buf[$off + 2],
+                    buf[$off + 3],
+                    buf[$off + 4],
+                    buf[$off + 5],
+                    buf[$off + 6],
+                    buf[$off + 7],
+                ])
+            } else {
+                0u64
+            }
+        };
+    }
+    RecvSharedV3Request {
+        version:       u32le!(0),
+        record_len:    u32le!(4),
+        endpoint_cap:  u64le!(8),
+        payload_ptr:   u64le!(16),
+        payload_len:   u64le!(24),
+        metadata_ptr:  u64le!(32),
+        metadata_len:  u64le!(40),
+        map_intent:    u32le!(48),
+        flags:         u32le!(52),
+        timeout_ticks: u64le!(56),
+        reserved:      [u64le!(64), u64le!(72)],
+    }
+}
+
+/// Write a v3 output record to user memory at `out_ptr` if the buffer is valid.
+///
+/// `out_ptr == 0` or `out_len < 80` — silently skip (caller may call with
+/// metadata_ptr/metadata_len from the request without a null check).
+/// All FUTURE fields (object_kind, object_generation, effective_rights,
+/// exact_object_size, region_offset) are written as zero.
+fn write_v3_output_to_user(
+    kernel: &mut KernelState,
+    out_ptr: u64,
+    out_len: u64,
+    result_status: u32,
+    sender_tid: u64,
+    message_len: u32,
+    message_flags: u32,
+    transferred_cap: u64,
+) {
+    use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
+    if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
+        return;
+    }
+    let mut out = [0u8; 80];
+    out[0..4].copy_from_slice(&V3_VERSION.to_le_bytes());
+    out[4..8].copy_from_slice(&(V3_MIN_OUTPUT_LEN as u32).to_le_bytes());
+    out[8..12].copy_from_slice(&(SYSCALL_ABI_VERSION as u32).to_le_bytes());
+    out[12..16].copy_from_slice(&result_status.to_le_bytes());
+    out[16..24].copy_from_slice(&sender_tid.to_le_bytes());
+    out[24..28].copy_from_slice(&message_len.to_le_bytes());
+    out[28..32].copy_from_slice(&message_flags.to_le_bytes());
+    out[32..40].copy_from_slice(&transferred_cap.to_le_bytes());
+    // bytes [40..80]: FUTURE fields — all zero in Stage 42+43.
+    let _ = kernel.copy_to_current_user(out_ptr as usize, &out);
+}
+
+/// Stage 42+43: handle the `recv_shared_v3` syscall (NR 31).
+///
+/// # Constraints (Stage 42+43)
+///
+/// - **Non-blocking only**: `timeout_ticks` must be 0.  Blocking paths require
+///   `RecvAbiVariant::RecvSharedV3` in task.rs — deferred to a future stage.
+/// - **No mapped receive**: `map_intent` must be 0.  VM mapping on the split
+///   path is not yet proven equivalent.
+/// - **Cap-transfer**: fully supported via the canonical receive core
+///   (`ipc_try_recv_queued_with_cap_transfer`); rollback on writeback failure.
+///
+/// # ABI
+///
+/// - `arg0` = `req_ptr` — pointer to a `RecvSharedV3Request` record in user space.
+/// - `arg1` = `req_len` — byte length of the record (≥ 64 required).
+/// - Output written to `request.metadata_ptr` (if non-null, len ≥ 80).
+/// - Frame registers on success: `ret0` = sender_tid, `ret1` = message_len,
+///   `ret2` = transferred_cap (or `SYSCALL_NO_TRANSFER_CAP`).
+fn handle_recv_shared_v3(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    use crate::kernel::recv_core::recv_shared_v3::{validate_v3_request, V3_MIN_REQUEST_LEN};
+    use crate::kernel::recv_core::{
+        RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvOutcome, RecvPayloadTarget,
+        RecvRequest, RecvRequestKind, RecvSchedulerWakePlan, RecvTransferPolicy,
+        RecvUserWritebackOutcome, execute_user_asid_plain_writeback, try_recv_core_user_plain,
+    };
+
+    const V3_STATUS_OK: u32 = 0;
+    const V3_STATUS_WOULD_BLOCK: u32 = 1;
+
+    let req_ptr = frame.arg(0);
+    let req_len = frame.arg(1);
+
+    if req_len < V3_MIN_REQUEST_LEN as usize {
+        return Err(SyscallError::InvalidArgs);
+    }
+    let read_len = req_len.min(80);
+    let mut req_bytes = [0u8; 80];
+    kernel
+        .copy_from_current_user_into_slice(req_ptr, read_len, &mut req_bytes[..read_len])
+        .map_err(|_| SyscallError::PageFault)?;
+
+    let req = parse_v3_request_bytes(&req_bytes);
+
+    if validate_v3_request(&req).is_err() {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    // Stage 42+43: blocking not implemented — full blocking requires
+    // RecvAbiVariant::RecvSharedV3 in task.rs and wake-path changes.
+    if req.timeout_ticks != 0 {
+        return Err(SyscallError::WouldBlock);
+    }
+
+    // Mapped receive is not yet on the split path.
+    if req.map_intent != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let caller_tid = current_tid(kernel)?;
+    let recv_cap = CapId(req.endpoint_cap);
+
+    validate_endpoint_right(kernel, recv_cap, CapRights::RECEIVE)?;
+    let endpoint_cap = kernel
+        .current_task_cnode()
+        .and_then(|cnode| kernel.capability_for_cnode_local(cnode, recv_cap))
+        .and_then(|cap| kernel.capability_object_live(cap.object).map(|_| cap));
+    let Some(ep_cap) = endpoint_cap else {
+        return Err(SyscallError::InvalidCapability);
+    };
+    let endpoint = ep_cap.object;
+
+    let request = RecvRequest {
+        kind: RecvRequestKind::NonblockingProbe,
+        requester_tid: caller_tid,
+        recv_cap,
+        payload_target: RecvPayloadTarget::UserMemory {
+            ptr: req.payload_ptr as usize,
+            len: req.payload_len as usize,
+        },
+        meta_target: RecvMetaTarget::None,
+        blocking: RecvBlockingPolicy::NoWait,
+        transfer: RecvTransferPolicy::LegacyFull,
+        map_intent: RecvMapIntent::None,
+    };
+
+    crate::yarm_log!("RECV_V3_ENTER tid={} cap={}", caller_tid, recv_cap.0);
+    let outcome = try_recv_core_user_plain(kernel, &request, endpoint);
+
+    match outcome {
+        RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) => {
+            write_v3_output_to_user(
+                kernel,
+                req.metadata_ptr,
+                req.metadata_len,
+                V3_STATUS_WOULD_BLOCK,
+                0,
+                0,
+                0,
+                SYSCALL_NO_TRANSFER_CAP,
+            );
+            crate::yarm_log!("RECV_V3_WOULD_BLOCK tid={}", caller_tid);
+            return Err(SyscallError::WouldBlock);
+        }
+        RecvOutcome::TimedOut => return Err(SyscallError::TimedOut),
+        RecvOutcome::Error(e) => return Err(SyscallError::from(e)),
+        RecvOutcome::Delivered(delivery) => {
+            // Cap materialization BEFORE writeback — matches full-path §58 ordering.
+            let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
+            let materialized_cap: Option<u64> = if let Some(_plan) = delivery.cap_transfer {
+                match materialize_received_message_cap(
+                    kernel,
+                    endpoint,
+                    caller_tid,
+                    delivery.msg.sender_tid.0,
+                    &delivery.msg,
+                ) {
+                    Ok(cap) => cap,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                None
+            };
+
+            // Deferred sender wake BEFORE writeback — matches §58 ordering.
+            if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
+                let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+            }
+
+            let payload_len = delivery.msg.as_slice().len();
+            let sender_tid_raw = delivery.msg.sender_tid.0;
+            let message_flags_raw = delivery.msg.flags as u32;
+            let xfer_cap_out = materialized_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
+
+            match execute_user_asid_plain_writeback(kernel, &delivery) {
+                RecvUserWritebackOutcome::Ok => {
+                    write_v3_output_to_user(
+                        kernel,
+                        req.metadata_ptr,
+                        req.metadata_len,
+                        V3_STATUS_OK,
+                        sender_tid_raw,
+                        payload_len as u32,
+                        message_flags_raw,
+                        xfer_cap_out,
+                    );
+                    frame.set_ok(
+                        usize::try_from(sender_tid_raw).unwrap_or(0),
+                        payload_len,
+                        usize::try_from(xfer_cap_out).unwrap_or(usize::MAX),
+                    );
+                    crate::yarm_log!("RECV_V3_LIVE tid={} sender={}", caller_tid, sender_tid_raw);
+                }
+                RecvUserWritebackOutcome::UndersizedBuffer => {
+                    // Rollback cap — buffer too small, message consumed, §58.
+                    if let Some(cap_id) = materialized_cap {
+                        kernel.rollback_materialized_recv_cap(
+                            caller_tid,
+                            CapId(cap_id),
+                            is_reply_cap,
+                        );
+                    }
+                    return Err(SyscallError::InvalidArgs);
+                }
+                RecvUserWritebackOutcome::CopyFault { user_ptr } => {
+                    // No rollback on payload copy fault — message consumed, §58.
+                    record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
+                    return Ok(());
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
     if frame.syscall_num() == SYSCALL_YIELD_NR {
@@ -3988,6 +4298,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame),
         Syscall::CreateInitramfsFileSliceMo => handle_create_initramfs_file_slice_mo(kernel, frame),
         Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame),
+        Syscall::RecvSharedV3 => handle_recv_shared_v3(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
@@ -4146,7 +4457,8 @@ mod tests {
         assert_eq!(SYSCALL_INITRAMFS_READ_CHUNK_NR, 27);
         assert_eq!(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, 28);
         assert_eq!(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, 29);
-        assert_eq!(SYSCALL_COUNT, 30);
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 31);
+        assert_eq!(SYSCALL_COUNT, 31);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 

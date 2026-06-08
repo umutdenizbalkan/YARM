@@ -1748,7 +1748,7 @@ mod tests {
         // extractions are pure refactoring and must not alter the syscall ABI.
         assert_eq!(
             crate::kernel::syscall::SYSCALL_COUNT,
-            30,
+            31,
             "Stage 26 must not change SYSCALL_COUNT"
         );
     }

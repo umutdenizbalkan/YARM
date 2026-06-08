@@ -10429,3 +10429,72 @@ B. **Object introspection API** — extend transfer envelope to carry object kin
 
 C. **Live recv_shared_v3 dispatch (if A complete)** — assign NR, add `#[repr(C)]`,
    wire split-dispatch table to v3 adapter, live-enable with `SYSCALL_COUNT = 31`.
+
+---
+
+## §58 Stage 42+43: cap-transfer split path + live recv_shared_v3 dispatch (NR 31)
+
+Stage 42+43 implements options A+C from §57.9 in a single stage:
+
+### 58.1 Cap-transfer split-path proof
+
+**Lock order (all three split-core functions):**
+
+1. `ipc_state_lock` (rank 3) — acquired for dequeue via `ipc_try_recv_queued_with_cap_transfer`; released before any cap operation.
+2. `capability_lock` (rank 4) — acquired inside `materialize_received_message_cap` / `rollback_materialized_recv_cap`; no ipc lock held.
+3. `scheduler_lock` (rank 1) — acquired inside `apply_split_sender_wake_plan`; after ipc lock release, before or after cap lock (sender wake does not touch capability domain).
+
+This satisfies the canonical lock order: scheduler(1) → task(2) → ipc_state(3) → capability(4) → vm(5) → memory(6). No lock is ever held across a user-memory copy.
+
+**Operation order per delivery:**
+1. Dequeue message (ipc lock acquired and released).
+2. Materialize cap from `RecvCapTransferPlan` — `take_transfer_envelope` + `grant_task_to_task_with_rights` (capability lock only).
+3. Wake sender if `RecvSchedulerWakePlan::WakeSender` (scheduler lock only).
+4. User-space writeback (payload/meta copy; no kernel lock held).
+5. On writeback failure (meta fault or undersized buffer): `rollback_materialized_recv_cap` (capability lock only).
+
+**No rollback on payload copy fault**: payload copy failure is defined as a silent truncation with `Ok()` return (dequeue-before-copy semantics, §54); the cap has already been transferred and the message dequeued.
+
+### 58.2 Rollback semantics table
+
+| Writeback outcome | Cap rollback? | Reason |
+|---|---|---|
+| `Ok` | No | Message delivered successfully |
+| `UndersizedBuffer` | Yes | Meta-first: meta buffer too small; message not useful to receiver |
+| `CopyFault` (meta) | Yes | Meta copy fault; receiver cannot read message |
+| `CopyFault` (payload) | No | Payload copy fault treated as silent truncation (§54); message "delivered" |
+
+### 58.3 `ipc_try_recv_queued_with_cap_transfer`
+
+New `ipc_state.rs` helper, identical to `ipc_try_recv_queued_plain_endpoint_only` except:
+- **Does NOT call `split_unsafe_flags`** on the receiver's message — cap-flagged messages are dequeued.
+- Still rejects a **sender-waiter** whose **refill message** has cap-transfer/reply-cap flags (`SenderWaiterPresent` fallback); that path requires cap materialization under the ipc lock which the split path cannot do.
+
+### 58.4 `RecvCapTransferPlan` and `extract_cap_transfer_plan`
+
+```rust
+pub struct RecvCapTransferPlan {
+    pub raw_handle: u64,    // raw value from msg.transferred_cap()
+    pub is_reply_cap: bool, // true iff FLAG_REPLY_CAP set
+}
+fn extract_cap_transfer_plan(msg: &Message) -> Option<RecvCapTransferPlan>
+```
+
+All three `try_recv_core_*` functions populate `RecvDelivery.cap_transfer` via `extract_cap_transfer_plan`.
+
+### 58.5 `handle_recv_shared_v3` (NR 31 dispatch)
+
+- **Non-blocking only**: `timeout_ticks != 0` → `WouldBlock` (blocking requires task-state changes).
+- **No mapped receive**: `map_intent != 0` → `InvalidArgs` (vm lock on split path not proven).
+- Uses `try_recv_core_user_plain` with the canonical request built from the v3 ABI record.
+- Writes `RecvSharedV3Output` (80 bytes) to `metadata_ptr` on success.
+- `transferred_cap` field in output is populated when cap materialization succeeds; `RECV_V3_NO_TRANSFER_CAP` (u64::MAX) when no cap transfer.
+- `object_kind`, `object_generation`, `effective_rights`, `exact_object_size` remain 0 (FUTURE fields; object introspection not yet implemented — §57.2 rows B/C).
+
+### 58.6 Invariants
+
+- `SYSCALL_COUNT == 31`: confirmed by internal compile-time assertion and 12 stage42 tests.
+- `SYSCALL_RECV_SHARED_V3_NR == 31`: added to syscall.rs and asserted in tests.
+- Old NR2 (`ipc_recv` / recv-v2 / recv-timeout) ABI: unchanged; split path behavior identical to pre-stage-42 for all non-cap-transfer messages.
+- `FallbackReason::CapTransfer`: retained for external callers and the sender-waiter-with-cap-transfer case (still produces `SenderWaiterWake` fallback, deferred).
+- `#[repr(C)]` applied to `RecvSharedV3Request` and `RecvSharedV3Output` in `yarm-ipc-abi` to lock wire layout.
