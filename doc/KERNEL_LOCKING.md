@@ -10432,7 +10432,7 @@ C. **Live recv_shared_v3 dispatch (if A complete)** — assign NR, add `#[repr(C
 
 ---
 
-## §58 Stage 42+43: cap-transfer split path + live recv_shared_v3 dispatch (NR 31)
+## §58 Stage 42+43: cap-transfer split path + live recv_shared_v3 dispatch (NR 30)
 
 Stage 42+43 implements options A+C from §57.9 in a single stage:
 
@@ -10482,7 +10482,7 @@ fn extract_cap_transfer_plan(msg: &Message) -> Option<RecvCapTransferPlan>
 
 All three `try_recv_core_*` functions populate `RecvDelivery.cap_transfer` via `extract_cap_transfer_plan`.
 
-### 58.5 `handle_recv_shared_v3` (NR 31 dispatch)
+### 58.5 `handle_recv_shared_v3` (NR 30 dispatch)
 
 - **Non-blocking only**: `timeout_ticks != 0` → `WouldBlock` (blocking requires task-state changes).
 - **No mapped receive**: `map_intent != 0` → `InvalidArgs` (vm lock on split path not proven).
@@ -10494,7 +10494,8 @@ All three `try_recv_core_*` functions populate `RecvDelivery.cap_transfer` via `
 ### 58.6 Invariants
 
 - `SYSCALL_COUNT == 31`: confirmed by internal compile-time assertion and 12 stage42 tests.
-- `SYSCALL_RECV_SHARED_V3_NR == 31`: added to syscall.rs and asserted in tests.
+- `SYSCALL_RECV_SHARED_V3_NR == 30`: added to syscall.rs and asserted in tests.
+- compile-time: `assert!(SYSCALL_RECV_SHARED_V3_NR < SYSCALL_COUNT)` ensures NR is in-range.
 - Old NR2 (`ipc_recv` / recv-v2 / recv-timeout) ABI: unchanged; split path behavior identical to pre-stage-42 for all non-cap-transfer messages.
 - `FallbackReason::CapTransfer`: retained for external callers and the sender-waiter-with-cap-transfer case (still produces `SenderWaiterWake` fallback, deferred).
 - `#[repr(C)]` applied to `RecvSharedV3Request` and `RecvSharedV3Output` in `yarm-ipc-abi` to lock wire layout.

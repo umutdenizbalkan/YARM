@@ -75,7 +75,7 @@ Status terms used by this matrix:
 | `27` | `InitramfsReadChunk` | privileged extension | SystemServer only | Phase 2A/2B bootstrap bridge; not part of public v10 count. |
 | `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v10 count. |
 | `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v10 count. |
-| `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 31); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
+| `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 30); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
 | `31+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 31`; not dispatched. |
 
 ## ABI versioning and deprecation policy
@@ -125,7 +125,7 @@ They are not reserved gaps and are covered by the public ABI v10 matrix above.
   numbers with `InvalidNumber`.
 - `25`: reserved/unassigned in ABI v10. `Syscall::decode` rejects this number
   with `InvalidNumber`.
-- `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 31).
+- `30`: `RecvSharedV3` — Stage 42+43 live non-blocking recv_shared_v3 extension (NR 30).
 - `31+`: outside the current kernel dispatch table and rejected with
   `InvalidNumber`.
 

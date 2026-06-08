@@ -23875,7 +23875,7 @@ mod stage35 {
         // Stage 35 must not add any new public syscall.
         assert_eq!(
             SYSCALL_COUNT, 31,
-            "SYSCALL_COUNT is 31 (stage 42+43 added NR 31; stage 35 itself added none)"
+            "SYSCALL_COUNT is 31 (stage 42+43 added NR 30; stage 35 itself added none)"
         );
     }
 
@@ -23913,7 +23913,7 @@ mod stage35 {
 //   C. Live split path: user-ASID plain recv delivers or errors correctly
 //   D. Writeback outcome variants: Ok / UndersizedBuffer / CopyFault
 //   E. Regression: kernel-plain and recv-v2 paths unchanged
-//   F. Invariants: SYSCALL_COUNT == 31 (NR 31 added in stage 42+43), v3 dispatch wired
+//   F. Invariants: SYSCALL_COUNT == 31 (NR 30 added in stage 42+43), v3 dispatch wired
 // ===========================================================================
 mod stage36 {
     use crate::kernel::boot::{Bootstrap, TrapHandleError};
@@ -25784,7 +25784,7 @@ mod stage42 {
     //!   A. Audit: cap-transfer message dequeued on split path (not FallbackRequired)
     //!   B. Plan/delivery model: cap_transfer field populated for cap-flagged messages
     //!   C. Split path with cap-transfer: dequeues and cap_transfer.is_some()
-    //!   D. Invariants: SYSCALL_COUNT == 31, Syscall::decode(31) == RecvSharedV3
+    //!   D. Invariants: SYSCALL_COUNT == 31, Syscall::decode(30) == RecvSharedV3
     //!   E. Regression: stage38/stage40 kernel-plain and user-plain paths unchanged
 
     use crate::kernel::boot::Bootstrap;
@@ -25807,19 +25807,19 @@ mod stage42 {
 
     #[test]
     fn stage42_syscall_count_is_31() {
-        assert_eq!(SYSCALL_COUNT, 31, "Stage 42+43 must add NR 31 (recv_shared_v3)");
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 42+43 must add NR 30 (recv_shared_v3)");
     }
 
     #[test]
-    fn stage42_recv_shared_v3_nr_is_31() {
-        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 31);
+    fn stage42_recv_shared_v3_nr_is_30() {
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30);
     }
 
     #[test]
-    fn stage42_recv_shared_v3_decodes_from_31() {
+    fn stage42_recv_shared_v3_decodes_from_30() {
         assert!(
-            matches!(Syscall::decode(31), Ok(Syscall::RecvSharedV3)),
-            "Syscall::decode(31) must return Ok(RecvSharedV3)"
+            matches!(Syscall::decode(30), Ok(Syscall::RecvSharedV3)),
+            "Syscall::decode(30) must return Ok(RecvSharedV3)"
         );
     }
 
@@ -25829,11 +25829,11 @@ mod stage42 {
     }
 
     #[test]
-    fn stage42_no_unused_syscall_number_30() {
-        // NR 30 is not allocated (gap between NR 29 and NR 31).
+    fn stage42_no_unused_syscall_number_31() {
+        // NR 31 is not allocated (above SYSCALL_COUNT-1=30).
         assert!(
-            matches!(Syscall::decode(30), Err(_)),
-            "NR 30 must remain unallocated"
+            matches!(Syscall::decode(31), Err(_)),
+            "NR 31 must remain unallocated"
         );
     }
 
@@ -26038,5 +26038,262 @@ mod stage42 {
         let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         assert_eq!(result, Some(Ok(())));
         assert_eq!(frame.ret0(), 12, "sender tid");
+    }
+}
+
+#[cfg(test)]
+mod stage44 {
+    //! Stage 44: recv_shared_v3 dispatch tests (NR 30).
+    //!
+    //! Tests cover:
+    //!   A. Invariants: NR 30 == RecvSharedV3, SYSCALL_COUNT still 31, NR 31 unallocated
+    //!   B. Request validation: req_len below minimum → InvalidArgs before memory read
+    //!   C. Dispatch: empty endpoint → WouldBlock; queued plain message → delivers
+    //!   D. Field guards: timeout_ticks != 0 → WouldBlock, map_intent != 0 → InvalidArgs
+    //!   E. Regression: IpcRecv (NR 2) still dispatches
+
+    use crate::kernel::syscall::{SyscallError, Syscall, SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, dispatch};
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall_split::try_split_dispatch_into_frame;
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+
+    /// Build an 80-byte little-endian wire frame for a `recv_shared_v3` request.
+    fn build_v3_request_bytes(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+        map_intent: u32,
+        timeout_ticks: u64,
+    ) -> [u8; 80] {
+        let version: u32 = 3; // RECV_V3_VERSION
+        let record_len: u32 = 64; // RECV_V3_MIN_REQUEST_LEN
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&version.to_le_bytes());
+        buf[4..8].copy_from_slice(&record_len.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf[48..52].copy_from_slice(&map_intent.to_le_bytes());
+        // flags @ 52: 0 (reserved, already zeroed)
+        buf[56..64].copy_from_slice(&timeout_ticks.to_le_bytes());
+        // reserved @ 64..80: already zeroed
+        buf
+    }
+
+    /// Create a kernel state with a user ASID (bound to task 0) and a page mapped
+    /// at VA `0x1_0000`.  Returns `(state, recv_cap, asid)`.
+    ///
+    /// If `enqueue_payload` is `Some(data)`, one plain IPC message is queued on
+    /// the returned endpoint before the function returns.
+    fn kernel_with_v3_env(
+        enqueue_payload: Option<&[u8]>,
+    ) -> (crate::kernel::boot::KernelState, crate::kernel::capabilities::CapId, Asid) {
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid to task 0");
+
+        let (_mem_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                mem_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map req page at 0x1_0000");
+
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        if let Some(payload) = enqueue_payload {
+            state
+                .ipc_send(send_cap, Message::new(7, payload).expect("msg"))
+                .expect("send");
+        }
+        (state, recv_cap, asid)
+    }
+
+    // ── A. Invariants ────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage44_syscall_nr30_is_recv_shared_v3() {
+        assert!(
+            matches!(Syscall::decode(30), Ok(Syscall::RecvSharedV3)),
+            "Syscall::decode(30) must return Ok(RecvSharedV3)"
+        );
+    }
+
+    #[test]
+    fn stage44_syscall_count_still_31() {
+        assert_eq!(SYSCALL_COUNT, 31, "stage44 must not change SYSCALL_COUNT");
+    }
+
+    #[test]
+    fn stage44_nr31_is_out_of_range() {
+        assert!(
+            matches!(Syscall::decode(31), Err(_)),
+            "NR 31 must remain unallocated after stage 44"
+        );
+    }
+
+    // ── B. Request validation ─────────────────────────────────────────────────
+
+    #[test]
+    fn stage44_req_len_below_minimum_returns_invalid_args() {
+        // req_len < RECV_V3_MIN_REQUEST_LEN (64) → InvalidArgs before any memory read.
+        let mut state = Bootstrap::init().expect("init");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1000usize); // req_ptr — never read at this length
+        frame.set_arg(1, 63usize);    // 63 < 64 = RECV_V3_MIN_REQUEST_LEN
+        let err = dispatch(&mut state, &mut frame).unwrap_err();
+        assert!(
+            matches!(err, SyscallError::InvalidArgs),
+            "req_len below minimum must return InvalidArgs, got {err:?}"
+        );
+    }
+
+    // ── C. Dispatch ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage44_empty_endpoint_returns_would_block() {
+        let (mut state, recv_cap, asid) = kernel_with_v3_env(None);
+        let req_bytes = build_v3_request_bytes(recv_cap.0 as u64, 0, 0, 0, 0, 0, 0);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req bytes");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000usize);
+        frame.set_arg(1, 80usize);
+        let err = dispatch(&mut state, &mut frame).unwrap_err();
+        assert!(
+            matches!(err, SyscallError::WouldBlock),
+            "empty endpoint must return WouldBlock, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stage44_queued_plain_message_delivers() {
+        let payload = b"stage44";
+        let (mut state, recv_cap, asid) = kernel_with_v3_env(Some(payload));
+        // Layout within the mapped page at 0x1_0000 (4096 bytes):
+        //   [0x1_0000 .. 0x1_0050): recv_shared_v3 request (80 bytes)
+        //   [0x1_0080 .. 0x1_0100): payload output buffer (128 bytes)
+        const PAYLOAD_VA: u64 = 0x1_0080;
+        const PAYLOAD_CAP: u64 = 128;
+        let req_bytes = build_v3_request_bytes(
+            recv_cap.0 as u64,
+            PAYLOAD_VA,
+            PAYLOAD_CAP,
+            0,
+            0,
+            0,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req bytes");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000usize);
+        frame.set_arg(1, 80usize);
+        let result = dispatch(&mut state, &mut frame);
+        assert!(
+            result.is_ok(),
+            "queued plain message must deliver: {result:?}"
+        );
+        assert_eq!(
+            frame.ret1(),
+            payload.len(),
+            "ret1 must hold the payload length"
+        );
+    }
+
+    // ── D. Field guards ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stage44_timeout_nonzero_returns_would_block() {
+        // timeout_ticks != 0 is rejected before the endpoint check.
+        let (mut state, recv_cap, asid) = kernel_with_v3_env(None);
+        let req_bytes =
+            build_v3_request_bytes(recv_cap.0 as u64, 0, 0, 0, 0, 0, 1 /* timeout_ticks = 1 */);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req bytes");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000usize);
+        frame.set_arg(1, 80usize);
+        let err = dispatch(&mut state, &mut frame).unwrap_err();
+        assert!(
+            matches!(err, SyscallError::WouldBlock),
+            "nonzero timeout must return WouldBlock, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stage44_map_intent_nonzero_returns_invalid_args() {
+        // map_intent != 0 is rejected (mapped receive not yet implemented).
+        // metadata_ptr is provided so that validate_v3_request passes; the kernel's
+        // own "Mapped receive is not yet on the split path" guard fires instead.
+        let (mut state, recv_cap, asid) = kernel_with_v3_env(None);
+        let req_bytes = build_v3_request_bytes(
+            recv_cap.0 as u64,
+            0,
+            0,
+            0x2000, // metadata_ptr — non-zero so validate_v3_request passes
+            80,     // metadata_len
+            0x1,    // RECV_V3_MAP_READ
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req bytes");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000usize);
+        frame.set_arg(1, 80usize);
+        let err = dispatch(&mut state, &mut frame).unwrap_err();
+        assert!(
+            matches!(err, SyscallError::InvalidArgs),
+            "nonzero map_intent must return InvalidArgs, got {err:?}"
+        );
+    }
+
+    // ── E. Regression ────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage44_ipc_recv_nr2_still_dispatches() {
+        // IpcRecv (NR 2) must still be routed correctly through the split path.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+            state
+                .ipc_send(send_cap, Message::new(99, b"").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result = try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret0(), 99, "sender tid");
     }
 }
