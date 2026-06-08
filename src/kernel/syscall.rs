@@ -49,7 +49,7 @@ pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
 pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
 /// Stage 42+43: versioned receive with cap-transfer through canonical receive core.
 /// Non-blocking only in this stage (timeout_ticks == 0 required).
-pub const SYSCALL_RECV_SHARED_V3_NR: usize = 31;
+pub const SYSCALL_RECV_SHARED_V3_NR: usize = 30;
 pub const SYSCALL_COUNT: usize = 31;
 const _: [(); SYSCALL_COUNT] = [(); 31];
 pub const SYSCALL_ARG_CAP: usize = 0;
@@ -158,6 +158,7 @@ impl Syscall {
 }
 
 const _: () = assert!(SYSCALL_SPAWN_PROCESS_NR < SYSCALL_COUNT);
+const _: () = assert!(SYSCALL_RECV_SHARED_V3_NR < SYSCALL_COUNT);
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
 const _: () = assert!(SYSCALL_ARG_TRANSFER_CAP < syscall_abi::TRAPFRAME_ARG_REGS);
 const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLOAD1);
@@ -4079,7 +4080,7 @@ fn write_v3_output_to_user(
     let _ = kernel.copy_to_current_user(out_ptr as usize, &out);
 }
 
-/// Stage 42+43: handle the `recv_shared_v3` syscall (NR 31).
+/// Stage 42+43: handle the `recv_shared_v3` syscall (NR 30).
 ///
 /// # Constraints (Stage 42+43)
 ///
@@ -4457,7 +4458,7 @@ mod tests {
         assert_eq!(SYSCALL_INITRAMFS_READ_CHUNK_NR, 27);
         assert_eq!(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, 28);
         assert_eq!(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, 29);
-        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 31);
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30);
         assert_eq!(SYSCALL_COUNT, 31);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }

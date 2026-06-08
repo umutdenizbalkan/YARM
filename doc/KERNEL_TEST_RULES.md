@@ -3010,18 +3010,18 @@ syscall dispatch.  `SYSCALL_COUNT` must remain 30.
 All 31 `stage40_` tests must pass.
 
 
-## Rule N+47: Stage 42+43 — cap-transfer split path + live recv_shared_v3 dispatch (NR 31)
+## Rule N+47: Stage 42+43 — cap-transfer split path + live recv_shared_v3 dispatch (NR 30)
 
-Stage 42+43 proves cap-transfer materialization on the split path and wires syscall NR 31
+Stage 42+43 proves cap-transfer materialization on the split path and wires syscall NR 30
 (`recv_shared_v3`). Tests must cover: syscall number allocation, cap-transfer dequeue
 behavior, plan and delivery, and the live non-blocking handler.
 
 **(A) Syscall ABI invariants:**
 - `SYSCALL_COUNT == 31` (`stage42_syscall_count_is_31`)
-- `SYSCALL_RECV_SHARED_V3_NR == 31` (`stage42_recv_shared_v3_nr_is_31`)
-- `RecvSharedV3` decodes from NR 31 (`stage42_recv_shared_v3_decodes_from_31`)
+- `SYSCALL_RECV_SHARED_V3_NR == 30` (`stage42_recv_shared_v3_nr_is_30`)
+- `RecvSharedV3` decodes from NR 30 (`stage42_recv_shared_v3_decodes_from_30`)
 - `VARIANT_COUNT == 23` (`stage42_variant_count_is_23`)
-- NR 30 slot is unoccupied (`stage42_no_unused_syscall_number_30`)
+- NR 31 slot is unoccupied (`stage42_no_unused_syscall_number_31`)
 
 **(B) Cap-transfer dequeue behavior:**
 - Cap-transfer message dequeued (not fallback) (`stage42_cap_transfer_message_dequeued_not_fallback`)
