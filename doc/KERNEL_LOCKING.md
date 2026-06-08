@@ -9970,3 +9970,128 @@ Stage 36 **formally audits** the copy-failure semantics for user-ASID plain rece
 | ipc_recv (NR2) | user-ASID + V2 meta | global-lock | 35 |
 | ipc_recv (NR2) | user-ASID mapped recv | global-lock | 35 |
 | ipc_recv (NR5) | any | global-lock | 35 |
+
+## §55 Stage 37 — recv-v2 metadata writeback semantics audit and live-enable
+
+### 55.1 Overview
+
+Stage 37 **formally audits** the metadata writeback semantics for recv-v2 plain queued
+messages and **live-enables** the narrow eligible path (user-ASID + V2 meta + no
+map_intent) on the canonical split path.
+
+**Changes:**
+- `RecvPlan::UserPlainV2Eligible` added to `recv_core.rs` — new plan variant for
+  user-ASID + V2 meta + no map_intent
+- `plan_recv_core` restructured: meta check now per-payload-target; for
+  `UserMemory` + V2 meta + no map_intent → `UserPlainV2Eligible` (Stage 37)
+- `try_recv_core_user_plain_v2` — dequeues under `ipc_state_lock` (rank 3), extracts
+  both `UserMemory` and `V2` targets, returns `RecvDelivery` with `UserMemoryV2` plan
+- `execute_user_asid_plain_v2_writeback` — builds 40-byte meta struct, copies meta
+  FIRST, then payload; returns `RecvV2WritebackOutcome`
+- `RecvV2WritebackOutcome` — new enum: `Ok`, `PayloadUndersized`, `MetaCopyFault`,
+  `PayloadCopyFault`
+- `RecvWritebackPlan::UserMemoryV2` — new variant carrying meta_ptr, meta_len,
+  payload ptr, payload buf_len, sender_tid
+
+**Invariants preserved:**
+- `SYSCALL_COUNT == 30` (no new public syscall)
+- Public ABI register layout unchanged
+- Kernel-plain and user-plain split path behaviors unchanged
+- Cap-transfer/reply-cap/sender-waiter-refill/shared receive still fall back
+- recv-v3 still helper-only
+- Mapped recv still falls back (map_intent != None → `UserAsidCopySemantics`)
+
+### 55.2 recv-v2 plain metadata writeback semantics proof table
+
+Meta struct layout (40 bytes, written to `meta_ptr`):
+
+| Offset | Field | Value for plain message |
+|---|---|---|
+| [0..8] | sender_tid | `msg.sender_tid.0` (little-endian u64) |
+| [8..10] | opcode | `msg.opcode` (little-endian u16) |
+| [10..12] | flags | `msg.flags` (little-endian u16) |
+| [12..16] | payload_len | `app_payload.len() as u32` (little-endian u32) |
+| [16..24] | transfer_cap | `Message::NO_TRANSFER_CAP` = `u64::MAX` |
+| [24..32] | recv_meta_flags | `0u64` (no FLAG_REPLY_CAP, no FLAG_CAP_TRANSFER for plain) |
+| [32..40] | sender_tid2 | `msg.sender_tid.0` (little-endian u64, duplicate slot) |
+
+Copy ordering: meta FIRST, payload SECOND. This matches the full-path order in
+`handle_ipc_recv_result_with_empty_error` which writes `out_meta_ptr` before `payload_ptr`.
+
+Equivalence proof for each outcome:
+
+| Scenario | Full-path (global-lock) | Split-path (Stage 37) | Verdict |
+|---|---|---|---|
+| Meta copy succeeds, payload fits | write meta → copy payload → `set_ok(0, len, ret2)` | write meta → copy payload → `RecvV2WritebackOutcome::Ok` → `set_ok(0, len, ret2)` | **Equivalent** |
+| Meta copy fault | write meta → `UserMemoryFault` → `Err(PageFault)` (no rollback for plain) | `execute_user_asid_plain_v2_writeback` → `MetaCopyFault` → `Err(PageFault)` | **Equivalent** (message consumed in both) |
+| Meta ok, payload undersized | write meta → `user_len < payload.len()` → `Err(InvalidArgs)` | meta ok → `PayloadUndersized` → `Err(InvalidArgs)` | **Equivalent** (message consumed in both) |
+| Meta ok, payload copy fault | write meta → payload `UserMemoryFault` → `record_user_fault` + `Ok(())` | meta ok → `PayloadCopyFault` → `record_user_fault` + `Ok(())` | **Equivalent** (message consumed in both) |
+| Empty queue | `WouldBlock` → block or return `WouldBlock` | `WouldBlock` → `None` → global-lock fallback | **Equivalent** |
+| `ret0` value on success | `0` (recv_v2_meta_written = true branch) | `frame.set_ok(0, payload_len, frame.ret2())` | **Equivalent** |
+| `transfer_cap` field | `frame.ret2() as u64` after `encode_transfer_cap_ret(frame, None)` = `SYSCALL_NO_TRANSFER_CAP` | `Message::NO_TRANSFER_CAP` = `u64::MAX` = `SYSCALL_NO_TRANSFER_CAP` | **Equivalent** |
+| `recv_meta_flags` field | `0u64` for plain (no FLAG_REPLY_CAP, no FLAG_CAP_TRANSFER) | `0u64.to_le_bytes()` hardcoded | **Equivalent** |
+
+**Key invariant (Stage 37):** For plain messages, `recv_meta_flags = 0`,
+`recv_local_transfer = None`, no cap materialization needed. The split path requires
+no cap rollback on any failure path.
+
+### 55.3 Lock order (Stage 37 user-ASID + V2 meta plain path)
+
+```
+[no lock]
+  → current_tid_authoritative (takes+releases global lock)
+  → [no lock]
+  → resolve_endpoint_recv_cap_split_read (task(2) read+release → cap(4) read+release; no ipc lock)
+  → [no lock]
+  → self.with(|state| try_split_recv_queued_plain_with_snapshot_locked):
+      → try_recv_core_user_plain_v2:
+          → ipc_state_lock (rank 3) acquired
+          → dequeue plain message
+          → ipc_state_lock (rank 3) released
+      → execute_user_asid_plain_v2_writeback:
+          → build 40-byte meta struct (stack-local, no lock)
+          → copy_to_current_user (meta)   [NO ipc_state_lock held ✓, NO capability lock held ✓]
+          → copy_to_current_user (payload) [NO ipc_state_lock held ✓, NO capability lock held ✓]
+      → frame.set_ok / Err(PageFault) / Err(InvalidArgs) / record_user_fault
+  → global lock released
+```
+
+**Hard constraints satisfied:**
+- `ipc_state_lock` (rank 3): NOT held during either `copy_to_current_user` call ✓
+- Capability lock (rank 4): NOT held during either `copy_to_current_user` call ✓
+- Meta struct built on stack — no allocation, no lock ✓
+
+### 55.4 Eligibility matrix (Stage 37 additions to §54 table)
+
+| Scenario | Eligible for split? | Plan | Reason |
+|---|---|---|---|
+| ipc_recv user-ASID plain (no meta, no map) | YES (Stage 36) | `UserPlainEligible` | plain writeback |
+| ipc_recv user-ASID + V2 meta (no map) | **YES (Stage 37)** | **`UserPlainV2Eligible`** | meta-first + payload writeback |
+| ipc_recv user-ASID + V2 meta + map_intent | NO | `UserAsidCopySemantics` | map_intent != None |
+| ipc_recv user-ASID + V3Future meta | NO | `RecvV2MetaUserCopy` | V3Future helper-only |
+| ipc_recv kernel task + V2 meta | NO | `RecvV2MetaUserCopy` | kernel-register target |
+| ipc_recv user-ASID mapped recv | NO | `UserAsidCopySemantics` | map_intent |
+| ipc_recv kernel task plain | YES (Stage 33+34) | `KernelPlainEligible` | register writeback |
+| ipc_recv_timeout (any) | NO | — | NR5 not in split-dispatch table |
+| recv-v2 (ipc_recv NR2 from non-user-ASID) | NO | `RecvV2MetaUserCopy` | meta user-copy |
+
+### 55.5 Telemetry markers (Stage 37)
+
+- `YARM_RECV_CORE_ADAPTER kind=user_plain_v2` — emitted when `UserPlainV2Eligible` plan is dispatched
+- `YARM_RECV_CORE_LIVE kind=user_plain_v2` — emitted on successful user-ASID V2 delivery
+- `YARM_RECV_CORE_V2_WRITEBACK result=ok` — meta+payload copy succeeded
+- `YARM_RECV_CORE_V2_WRITEBACK result=meta_fault` — meta copy faulted (→ `PageFault`)
+- `YARM_RECV_CORE_V2_WRITEBACK result=payload_fault` — payload copy faulted (→ `record_user_fault`)
+- `YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized` — payload buffer too small (→ `InvalidArgs`)
+
+### 55.6 Live vs fallback matrix (cumulative Stage 33+34+35+36+37)
+
+| Syscall | Receiver type | Path | Stage |
+|---|---|---|---|
+| ipc_recv (NR2) | kernel task, queued plain | LIVE split + canonical core | 33+34 |
+| ipc_recv (NR2) | user-ASID plain (no meta, no map) | LIVE split + canonical core | 36 |
+| ipc_recv (NR2) | user-ASID + V2 meta (no map) | **LIVE split + canonical core** | **37** |
+| ipc_recv (NR2) | user-ASID + V2 meta + map_intent | global-lock | 37 |
+| ipc_recv (NR2) | user-ASID + V3Future meta | global-lock | 37 |
+| ipc_recv (NR2) | user-ASID mapped recv | global-lock | 35 |
+| ipc_recv (NR5) | any | global-lock | 35 |

@@ -27,11 +27,12 @@
 //! - **HELPER-ONLY**: [`recv_shared_v3`] request/output validation scaffold.
 //! - **NOT ADDED**: any new public syscall number.
 //!
-//! # User-ASID copy-failure semantics (Stage 33 formalization, Stage 36 live-enable)
+//! # User-ASID copy-failure semantics (Stage 33 formalization, Stage 36+37 live-enable)
 //!
 //! See `doc/KERNEL_LOCKING.md §52` for the Stage 33+34 copy-failure semantics
-//! table and `doc/KERNEL_LOCKING.md §54` for the Stage 36 semantics proof and
-//! live-enable documentation.
+//! table, `doc/KERNEL_LOCKING.md §54` for the Stage 36 semantics proof and
+//! live-enable documentation, and `doc/KERNEL_LOCKING.md §55` for the Stage 37
+//! recv-v2 metadata writeback semantics proof.
 //!
 //! **Stage 36 change:** narrow user-ASID plain recv (no meta, no map_intent)
 //! is now eligible for the split path via [`try_recv_core_user_plain`] and
@@ -40,6 +41,12 @@
 //! `ipc_state_lock`), then the copy runs after the lock is released.  A copy
 //! fault consumes the message and records a user fault — identical to the
 //! global-lock full path.  See `doc/KERNEL_LOCKING.md §54` for the proof table.
+//!
+//! **Stage 37 change:** user-ASID recv-v2 plain recv (V2 meta, no map_intent)
+//! is now eligible for the split path via [`try_recv_core_user_plain_v2`] and
+//! [`execute_user_asid_plain_v2_writeback`].  Meta is written first (matching
+//! the full-path ordering), then payload.  All three failure modes (meta fault,
+//! payload undersized, payload fault) are reproduced exactly.  See §55.
 
 use super::boot::{IpcEndpointRecvResult, IpcEndpointSplitRejectReason, KernelError, KernelState};
 use super::capabilities::{CapId, CapObject};
@@ -349,12 +356,14 @@ impl RecvRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackReason {
     /// Receiver has a user ASID and the request shape is not narrow-plain-eligible:
-    /// either `map_intent != None` (mapped receive) or some other case that
-    /// prevents split-path dispatch.  Plain user-ASID recv without map_intent
-    /// is now `UserPlainEligible` (see §54); only mapped/non-plain requests
-    /// remain here.
+    /// `map_intent != None` (mapped receive).  Plain user-ASID recv without
+    /// map_intent is now `UserPlainEligible` (see §54); plain recv-v2 without
+    /// map_intent is now `UserPlainV2Eligible` (see §55).  Only mapped/non-plain
+    /// requests remain here.
     UserAsidCopySemantics,
-    /// recv-v2 metadata output pointer present; requires user-copy.
+    /// recv-v2 or v3-future metadata output pointer with a kernel-task receiver,
+    /// or v3-future meta with a user-ASID receiver.  User-ASID + V2 meta +
+    /// no map_intent is promoted to [`RecvPlan::UserPlainV2Eligible`] (Stage 37).
     RecvV2MetaUserCopy,
     /// Timeout/deadline path requires scheduler interaction.
     TimeoutScheduler,
@@ -400,6 +409,21 @@ pub enum RecvWritebackPlan {
         ptr: usize,
         user_buf_len: usize,
         sender_tid: usize,
+    },
+    /// User-ASID task with recv-v2 metadata: write the 40-byte `IpcRecvMetaV2`
+    /// struct to `meta_ptr` first, then copy the payload to `ptr`.
+    ///
+    /// `meta_ptr`/`meta_len` are the caller's meta buffer (`RecvMetaTarget::V2`).
+    /// `user_buf_len` is the payload buffer capacity.  Both copies are performed
+    /// by [`execute_user_asid_plain_v2_writeback`] in meta-first order.
+    ///
+    /// **Stage 37:** live-enabled for user-ASID plain recv-v2 (no map).
+    UserMemoryV2 {
+        ptr: usize,
+        user_buf_len: usize,
+        sender_tid: usize,
+        meta_ptr: usize,
+        meta_len: usize,
     },
 }
 
@@ -450,6 +474,12 @@ pub enum RecvPlan {
     /// [`execute_user_asid_plain_writeback`].  Copy-failure semantics proven
     /// equivalent to the full path (see `doc/KERNEL_LOCKING.md §54`).
     UserPlainEligible,
+    /// **Stage 37:** User-ASID recv-v2 plain recv (V2 meta, no map_intent).
+    /// Compatible with the user-plain-v2 split path.
+    /// Execute via [`try_recv_core_user_plain_v2`] then
+    /// [`execute_user_asid_plain_v2_writeback`].  Meta-first copy ordering and
+    /// all three failure modes proven equivalent to the full path (see §55).
+    UserPlainV2Eligible,
     /// The request requires the global-lock full path.
     FallbackRequired(FallbackReason),
 }
@@ -468,6 +498,9 @@ pub enum RecvPlan {
 /// - [`RecvPlan::UserPlainEligible`] — user-ASID, no meta, no map_intent;
 ///   use [`try_recv_core_user_plain`] + [`execute_user_asid_plain_writeback`].
 ///   Copy-failure semantics proven equivalent to full path (§54).
+/// - [`RecvPlan::UserPlainV2Eligible`] — user-ASID, V2 meta, no map_intent;
+///   use [`try_recv_core_user_plain_v2`] + [`execute_user_asid_plain_v2_writeback`].
+///   Meta-first ordering and all failure modes proven equivalent (§55).
 /// - [`RecvPlan::FallbackRequired`] — everything else; use global-lock path.
 pub(crate) fn plan_recv_core(request: &RecvRequest) -> RecvPlan {
     // Future v3 is helper-only: never route to live engine.
@@ -475,28 +508,35 @@ pub(crate) fn plan_recv_core(request: &RecvRequest) -> RecvPlan {
         return RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly);
     }
 
-    // recv-v2 or v3 metadata pointer: requires a user-copy for metadata.
-    // Checked BEFORE the payload_target match so that user-ASID+meta requests
-    // get the more specific RecvV2MetaUserCopy reason instead of UserAsidCopySemantics.
-    if matches!(
-        request.meta_target,
-        RecvMetaTarget::V2 { .. } | RecvMetaTarget::V3Future { .. }
-    ) {
-        return RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy);
-    }
-
     match request.payload_target {
-        RecvPayloadTarget::KernelRegister => RecvPlan::KernelPlainEligible,
+        RecvPayloadTarget::KernelRegister => {
+            // Kernel task: V2/V3 meta would require a user-copy for meta struct;
+            // no user ASID exists to copy to.
+            if matches!(
+                request.meta_target,
+                RecvMetaTarget::V2 { .. } | RecvMetaTarget::V3Future { .. }
+            ) {
+                return RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy);
+            }
+            RecvPlan::KernelPlainEligible
+        }
         RecvPayloadTarget::UserMemory { .. } => {
             // Mapped receive (map_intent != None) requires page-table operations
             // and region-descriptor copy not yet split-extracted.
             if request.map_intent != RecvMapIntent::None {
                 return RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics);
             }
-            // Stage 36: narrow eligible path — plain (no meta, no map_intent)
-            // user-ASID recv.  Copy-failure semantics proven equivalent to the
-            // global-lock full path; see doc/KERNEL_LOCKING.md §54.
-            RecvPlan::UserPlainEligible
+            match request.meta_target {
+                // V3Future meta is helper-only; fall back regardless of payload target.
+                RecvMetaTarget::V3Future { .. } => {
+                    RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy)
+                }
+                // Stage 37: V2 meta + user-ASID + no map_intent → live recv-v2 split path.
+                // Meta-first copy ordering and failure modes proven equivalent (§55).
+                RecvMetaTarget::V2 { .. } => RecvPlan::UserPlainV2Eligible,
+                // Stage 36: no meta + user-ASID + no map_intent → live plain split path (§54).
+                RecvMetaTarget::None => RecvPlan::UserPlainEligible,
+            }
         }
     }
 }
@@ -705,6 +745,183 @@ pub(crate) fn execute_user_asid_plain_writeback(
         Ok(()) => RecvUserWritebackOutcome::Ok,
         Err(KernelError::UserMemoryFault) => RecvUserWritebackOutcome::CopyFault { user_ptr: ptr },
         Err(_) => RecvUserWritebackOutcome::CopyFault { user_ptr: ptr },
+    }
+}
+
+// ─── Stage 37: user-ASID recv-v2 plain recv execution ────────────────────────
+
+/// Outcome of a user-ASID recv-v2 plain writeback attempt.
+///
+/// The caller in `syscall.rs` maps each variant to the exact frame state and
+/// return value that the global-lock full path produces (§55).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvV2WritebackOutcome {
+    /// Meta struct and payload both copied successfully.
+    /// Caller should call `frame.set_ok(0, payload_len, frame.ret2())`.
+    /// (`ret0 = 0` in recv-v2 mode, matching the full path.)
+    Ok,
+    /// Meta copy succeeded but the user payload buffer was too small.
+    /// Message consumed.  Caller should return `Err(InvalidArgs)`.
+    PayloadUndersized,
+    /// `copy_to_current_user` returned `UserMemoryFault` for the **meta** buffer.
+    /// Message consumed.  Caller should return `Err(SyscallError::PageFault)`,
+    /// matching the full-path `return Err(SyscallError::from(copy_err))` (§55).
+    MetaCopyFault { meta_ptr: usize },
+    /// Meta copy succeeded but `copy_to_current_user` failed for the payload.
+    /// Message consumed.  Caller should call `record_user_fault(kernel, frame,
+    /// user_ptr, Write)` and return `Ok(())`.
+    PayloadCopyFault { user_ptr: usize },
+}
+
+/// Execute the fast user-ASID recv-v2 plain split recv path.
+///
+/// Attempts to dequeue one plain (unflagged) message from `endpoint` under
+/// the IPC domain (`ipc_state_lock`, rank 3) and returns a [`RecvDelivery`]
+/// with a `UserMemoryV2` writeback plan containing both the meta and payload
+/// buffer pointers.  The ipc_state_lock is released before this function returns.
+/// The actual copies are performed by the caller via
+/// [`execute_user_asid_plain_v2_writeback`].
+///
+/// # Preconditions (caller-enforced via [`plan_recv_core`])
+///
+/// - `request.payload_target == UserMemory { .. }`
+/// - `request.meta_target == V2 { .. }`
+/// - `request.map_intent == None`
+/// - No capability lock or `ipc_state_lock` held by caller.
+///
+/// # Lock order
+///
+/// Acquires and releases `ipc_state_lock` (rank 3) only.
+pub(crate) fn try_recv_core_user_plain_v2(
+    kernel: &mut KernelState,
+    request: &RecvRequest,
+    endpoint: CapObject,
+) -> RecvOutcome {
+    let endpoint_idx = match kernel.resolve_endpoint_index(endpoint) {
+        Ok(idx) => idx,
+        Err(e) => return RecvOutcome::Error(e),
+    };
+
+    match kernel.ipc_try_recv_queued_plain_endpoint_only(endpoint_idx) {
+        IpcEndpointRecvResult::Received(msg) => {
+            kernel.note_endpoint_only_queued_recv_split();
+            let sender_tid = match usize::try_from(msg.sender_tid.0) {
+                Ok(s) => s,
+                Err(_) => return RecvOutcome::Error(KernelError::TaskMissing),
+            };
+            let (ptr, user_buf_len) = match request.payload_target {
+                RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
+                _ => unreachable!("try_recv_core_user_plain_v2: non-UserMemory payload_target"),
+            };
+            let (meta_ptr, meta_len) = match request.meta_target {
+                RecvMetaTarget::V2 { ptr, len } => (ptr, len),
+                _ => unreachable!("try_recv_core_user_plain_v2: non-V2 meta_target"),
+            };
+            RecvOutcome::Delivered(RecvDelivery {
+                writeback: RecvWritebackPlan::UserMemoryV2 {
+                    ptr,
+                    user_buf_len,
+                    sender_tid,
+                    meta_ptr,
+                    meta_len,
+                },
+                scheduler: RecvSchedulerWakePlan::None,
+                msg,
+            })
+        }
+
+        IpcEndpointRecvResult::ReceivedWithSenderWake(_msg, _wake_tid) => {
+            kernel.note_endpoint_only_queued_recv_split();
+            RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+        }
+
+        IpcEndpointRecvResult::Ineligible(reason) => match reason {
+            IpcEndpointSplitRejectReason::EmptyQueue
+            | IpcEndpointSplitRejectReason::ReceiverWaiterPresent => RecvOutcome::WouldBlock,
+            IpcEndpointSplitRejectReason::TransferOrReplyCapMessage => {
+                RecvOutcome::FallbackRequired(FallbackReason::CapTransfer)
+            }
+            IpcEndpointSplitRejectReason::SenderWaiterPresent => {
+                RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)
+            }
+            _ => RecvOutcome::WouldBlock,
+        },
+    }
+}
+
+/// Perform the user-space copies for a dequeued recv-v2 plain message.
+///
+/// Called after the ipc_state_lock (rank 3) is released.  Copy ordering
+/// matches the global-lock full path **exactly** (§55): meta struct is written
+/// first, payload second.  All three failure modes are reproduced:
+///
+/// - Meta `UserMemoryFault` → `MetaCopyFault` (message consumed; caller returns
+///   `Err(PageFault)`, matching the full-path `return Err(SyscallError::from(copy_err))`)
+/// - Payload undersized (after meta succeeds) → `PayloadUndersized` (message consumed;
+///   caller returns `Err(InvalidArgs)`)
+/// - Payload `UserMemoryFault` (after meta succeeds) → `PayloadCopyFault` (message
+///   consumed; caller calls `record_user_fault + Ok()`)
+///
+/// For plain messages: `recv_meta_flags = 0`, `recv_local_transfer = None`,
+/// no cap rollback on any failure.  `app_payload = msg.as_slice()` (no prefix
+/// stripping).  Transfer-cap field in meta = `Message::NO_TRANSFER_CAP`.
+pub(crate) fn execute_user_asid_plain_v2_writeback(
+    kernel: &mut KernelState,
+    delivery: &RecvDelivery,
+) -> RecvV2WritebackOutcome {
+    let (ptr, user_buf_len, meta_ptr) = match delivery.writeback {
+        RecvWritebackPlan::UserMemoryV2 {
+            ptr,
+            user_buf_len,
+            meta_ptr,
+            ..
+        } => (ptr, user_buf_len, meta_ptr),
+        _ => unreachable!("execute_user_asid_plain_v2_writeback: non-UserMemoryV2 plan"),
+    };
+    let msg = &delivery.msg;
+    let app_payload = msg.as_slice();
+
+    // Build the 40-byte IpcRecvMetaV2 struct.
+    // Layout and ordering MUST match handle_ipc_recv_result_with_empty_error (§55):
+    //   [0..8]   sender as u64 (= msg.sender_tid.0; same value since 64-bit usize)
+    //   [8..10]  app_opcode = msg.opcode (no prefix stripping for plain messages)
+    //   [10..12] msg.flags
+    //   [12..16] app_payload.len() as u32
+    //   [16..24] Message::NO_TRANSFER_CAP (plain: recv_local_transfer = None)
+    //   [24..32] 0u64 (recv_meta_flags = 0 for plain: no reply/transfer flags)
+    //   [32..40] msg.sender_tid.0 (raw sender TID)
+    let mut meta = [0u8; META_V2_MIN_LEN];
+    meta[0..8].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+    meta[8..10].copy_from_slice(&msg.opcode.to_le_bytes());
+    meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
+    meta[12..16].copy_from_slice(&(app_payload.len() as u32).to_le_bytes());
+    meta[16..24].copy_from_slice(&Message::NO_TRANSFER_CAP.to_le_bytes());
+    meta[24..32].copy_from_slice(&0u64.to_le_bytes());
+    meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+
+    // Copy meta FIRST — matching full-path ordering (§55).
+    // On fault: message consumed, caller returns Err(PageFault) (no cap rollback for plain).
+    match kernel.copy_to_current_user(meta_ptr, &meta) {
+        Ok(()) => {}
+        Err(KernelError::UserMemoryFault) => {
+            return RecvV2WritebackOutcome::MetaCopyFault { meta_ptr }
+        }
+        Err(_) => return RecvV2WritebackOutcome::MetaCopyFault { meta_ptr },
+    }
+
+    // Undersized buffer check — after meta copy succeeds; message consumed on failure.
+    if user_buf_len < app_payload.len() {
+        return RecvV2WritebackOutcome::PayloadUndersized;
+    }
+
+    // Copy payload SECOND — matching full-path ordering (§55).
+    // On fault: message consumed, caller calls record_user_fault + Ok().
+    match kernel.copy_to_current_user(ptr, app_payload) {
+        Ok(()) => RecvV2WritebackOutcome::Ok,
+        Err(KernelError::UserMemoryFault) => {
+            RecvV2WritebackOutcome::PayloadCopyFault { user_ptr: ptr }
+        }
+        Err(_) => RecvV2WritebackOutcome::PayloadCopyFault { user_ptr: ptr },
     }
 }
 

@@ -2824,7 +2824,7 @@ When user-ASID receive writeback semantics are formalized and the narrow plain r
 
 **(A) Plan shape: user-ASID cases:**
 - Plain user-ASID (no meta, no map_intent) → `UserPlainEligible` (`stage36_plan_user_asid_plain_no_meta_is_eligible`)
-- user-ASID + V2 meta → `RecvV2MetaUserCopy` (`stage36_plan_user_asid_with_v2_meta_falls_back_meta_copy`)
+- user-ASID + V2 meta → `UserPlainV2Eligible` (`stage36_plan_user_asid_with_v2_meta_is_v2_eligible`) [updated Stage 37: user-ASID+V2+no-map now promoted]
 - Mapped recv (map_intent != None) → `UserAsidCopySemantics` (`stage36_plan_user_asid_mapped_recv_falls_back_copy_semantics`)
 - NoWait user-ASID plain → `UserPlainEligible` (`stage36_plan_user_asid_nowait_no_meta_is_eligible`)
 - Kernel-task still `KernelPlainEligible` (`stage36_plan_kernel_task_still_kernel_plain_eligible`)
@@ -2856,3 +2856,53 @@ When user-ASID receive writeback semantics are formalized and the narrow plain r
 **Run command:** `cargo test --lib stage36 -- --test-threads=1`
 
 All 19 `stage36_` tests must pass.
+
+---
+
+## Rule N+44: Stage 37 — recv-v2 metadata writeback semantics audit and live-enable
+
+When recv-v2 metadata writeback semantics for plain queued messages are formalized and
+the narrow user-ASID + V2 meta path is live-enabled, a `stage37_` test suite must prove:
+
+**(A) Plan shape:**
+- user-ASID + V2 meta + no map_intent → `UserPlainV2Eligible` (`stage37_plan_user_asid_v2_meta_no_map_is_v2_eligible`)
+- user-ASID + V2 meta + map_intent → `UserAsidCopySemantics` (`stage37_plan_user_asid_v2_meta_with_map_falls_back_copy_semantics`)
+- kernel-task + V2 meta still → `RecvV2MetaUserCopy` (`stage37_plan_kernel_task_v2_meta_still_fallback`)
+- user-ASID + no meta still → `UserPlainEligible` (`stage37_plan_user_asid_no_meta_still_plain_eligible`)
+- kernel-task + no meta still → `KernelPlainEligible` (`stage37_plan_kernel_task_no_meta_still_kernel_plain_eligible`)
+
+**(B) `try_recv_core_user_plain_v2` shape:**
+- Delivers queued plain message with `UserMemoryV2` writeback plan (`stage37_try_recv_core_user_plain_v2_delivers_message`)
+- Empty queue returns `WouldBlock` (`stage37_try_recv_core_user_plain_v2_empty_queue_is_would_block`)
+
+**(C) Writeback outcomes:**
+- Meta copy fault when no ASID → `MetaCopyFault` (`stage37_writeback_v2_meta_fault_when_no_asid`)
+- Payload undersized after meta success → `PayloadUndersized` (`stage37_writeback_v2_payload_undersized_after_meta_success`)
+- Zero-byte payload with ASID → `Ok` (`stage37_writeback_v2_ok_for_empty_payload_with_asid`)
+
+**(D) Meta struct fields:**
+- Bytes [0..8] = sender_tid (`stage37_meta_struct_sender_field_is_sender_tid`)
+- Bytes [12..16] = payload_len as u32 (`stage37_meta_struct_payload_len_field`)
+- Bytes [16..24] = `Message::NO_TRANSFER_CAP` = `u64::MAX` (`stage37_meta_struct_transfer_cap_field_is_no_transfer_cap`)
+- Bytes [24..32] = 0 (recv_meta_flags = 0 for plain) (`stage37_meta_struct_flags_field_is_zero_for_plain`)
+
+**(E) Integration (split path end-to-end):**
+- `ret0 == 0` on success in recv-v2 mode (`stage37_user_asid_v2_split_ret0_is_zero_on_success`)
+- Zero-byte payload delivers via split (`stage37_user_asid_v2_split_delivers_empty_payload`)
+- Meta fault → `Err(PageFault)` returned (`stage37_user_asid_v2_meta_fault_returns_page_fault`)
+- Meta fault consumes message (dequeue already happened) (`stage37_user_asid_v2_meta_fault_consumes_message`)
+- Payload undersized → `Err(InvalidArgs)` returned (`stage37_user_asid_v2_payload_undersized_returns_invalid_args`)
+- Empty queue → split returns None → falls back (`stage37_empty_queue_v2_user_asid_falls_back`)
+
+**(F) Regressions:**
+- Kernel-plain split path still live (`stage37_kernel_plain_path_still_live`)
+- User-plain (no meta) split path still live (`stage37_user_plain_path_still_live`)
+- Mapped recv still falls back (`stage37_mapped_recv_still_falls_back`)
+- recv-v3 still helper-only (`stage37_recv_v3_still_helper_only`)
+
+**(G) Invariants:**
+- `SYSCALL_COUNT == 30` (`stage37_syscall_count_still_30`)
+
+**Run command:** `cargo test --lib stage37 -- --test-threads=1`
+
+All 25 `stage37_` tests must pass.

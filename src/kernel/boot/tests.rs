@@ -23223,10 +23223,10 @@ mod stage33_34 {
                 len: 64
             }
         );
-        // Stage 36 update: meta check fires first → RecvV2MetaUserCopy.
+        // Stage 37 update: user-ASID + V2 meta + no map_intent → UserPlainV2Eligible.
         assert_eq!(
             plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy)
+            RecvPlan::UserPlainV2Eligible
         );
     }
 
@@ -23974,12 +23974,14 @@ mod stage36 {
     }
 
     #[test]
-    fn stage36_plan_user_asid_with_v2_meta_falls_back_meta_copy() {
-        // user-ASID + V2 meta: meta check fires first → RecvV2MetaUserCopy.
+    fn stage36_plan_user_asid_with_v2_meta_is_v2_eligible() {
+        // Stage 37: user-ASID + V2 meta + no map_intent → UserPlainV2Eligible.
+        // (Formerly asserted RecvV2MetaUserCopy; Stage 37 live-enables this path.)
         let req = RecvRequest::from_legacy_ipc_recv(1, CAP0, 0x4000, 128, 0x5000, 40, false);
         assert_eq!(
             plan_recv_core(&req),
-            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy)
+            RecvPlan::UserPlainV2Eligible,
+            "user-ASID + V2 meta + no map_intent → UserPlainV2Eligible (Stage 37)"
         );
     }
 
@@ -24274,5 +24276,586 @@ mod stage36 {
         let result =
             crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
         assert_eq!(result, None, "cap-transfer message for user-ASID falls back at dequeue");
+    }
+}
+
+mod stage37 {
+    use crate::kernel::boot::{Bootstrap, TrapHandleError};
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::Message;
+    use crate::kernel::recv_core::{
+        FallbackReason, RecvMapIntent, RecvMetaTarget, RecvPlan, RecvRequest,
+        RecvV2WritebackOutcome, RecvWritebackPlan, execute_user_asid_plain_v2_writeback,
+        plan_recv_core, try_recv_core_user_plain_v2,
+    };
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{PageFlags, VirtAddr};
+    use crate::runtime::SharedKernel;
+
+    const CPU0: CpuId = CpuId(0);
+    const CAP0: CapId = CapId(1);
+    const META_LEN: usize = 40;
+
+    fn recv_v2_frame(recv_cap: CapId, payload_ptr: usize, payload_len: usize, meta_ptr: usize) -> TrapFrame {
+        TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, payload_ptr, payload_len, meta_ptr, META_LEN, 0],
+        )
+    }
+
+    fn kernel_with_user_asid_v2_and_queued_plain(
+        payload: &[u8],
+    ) -> (SharedKernel, CapId, usize, usize) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (recv_cap, meta_ptr, payload_ptr) = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, payload).expect("msg"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind asid");
+            let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+            state
+                .map_user_page_in_asid_with_caps(
+                    asid,
+                    mem_cap,
+                    VirtAddr(0x1_0000),
+                    PageFlags::USER_RW,
+                )
+                .expect("map user page");
+            let meta_ptr = 0x1_0000usize;
+            let payload_ptr = meta_ptr + 64;
+            (recv_cap, meta_ptr, payload_ptr)
+        });
+        (kernel, recv_cap, meta_ptr, payload_ptr)
+    }
+
+    // ── A. Plan shape: Stage 37 additions ────────────────────────────────────
+
+    #[test]
+    fn stage37_plan_user_asid_v2_meta_no_map_is_v2_eligible() {
+        // User-ASID + V2 meta + no map_intent → UserPlainV2Eligible (Stage 37).
+        let req = RecvRequest::from_legacy_ipc_recv(1, CAP0, 0x4000, 128, 0x5000, 40, false);
+        assert_eq!(plan_recv_core(&req), RecvPlan::UserPlainV2Eligible);
+    }
+
+    #[test]
+    fn stage37_plan_user_asid_v2_meta_with_map_falls_back_copy_semantics() {
+        // Mapped recv + V2 meta: map_intent check fires before meta → UserAsidCopySemantics.
+        let req =
+            RecvRequest::from_legacy_mapped_recv(1, CAP0, 0x4000, 128, RecvMapIntent::ReadOnly);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics),
+            "mapped recv + V2 meta → UserAsidCopySemantics (map_intent check first)"
+        );
+    }
+
+    #[test]
+    fn stage37_plan_kernel_task_v2_meta_still_fallback() {
+        // Kernel task + V2 meta → RecvV2MetaUserCopy (no user ASID to copy to).
+        let req = RecvRequest::from_recv_v2(1, CAP0, 0, 0, 0x5000, 40, true);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::RecvV2MetaUserCopy),
+            "kernel-task + V2 meta must still fall back"
+        );
+    }
+
+    #[test]
+    fn stage37_plan_user_asid_no_meta_still_plain_eligible() {
+        // Stage 36 path unaffected: user-ASID + no meta → UserPlainEligible.
+        let req = RecvRequest::from_legacy_ipc_recv(1, CAP0, 0x4000, 128, 0, 0, false);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::UserPlainEligible,
+            "Stage 36 user-plain path unchanged"
+        );
+    }
+
+    #[test]
+    fn stage37_plan_kernel_task_no_meta_still_kernel_plain_eligible() {
+        // Stage 33+34 path unaffected: kernel task + no meta → KernelPlainEligible.
+        let req = RecvRequest::from_legacy_ipc_recv(0, CAP0, 0, 0, 0, 0, true);
+        assert_eq!(plan_recv_core(&req), RecvPlan::KernelPlainEligible);
+    }
+
+    // ── B. Semantics: try_recv_core_user_plain_v2 ────────────────────────────
+
+    #[test]
+    fn stage37_try_recv_core_user_plain_v2_delivers_message() {
+        // Dequeue succeeds → Delivered with UserMemoryV2 writeback plan.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(5, b"hi").expect("msg"))
+            .expect("send");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x1000, 64, 0x2000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(delivery) => {
+                assert!(
+                    matches!(delivery.writeback, RecvWritebackPlan::UserMemoryV2 { ptr: 0x1000, user_buf_len: 64, meta_ptr: 0x2000, .. }),
+                    "UserMemoryV2 plan with correct ptrs: {:?}", delivery.writeback
+                );
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage37_try_recv_core_user_plain_v2_empty_queue_is_would_block() {
+        // Empty queue → WouldBlock (same as Stage 36).
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x1000, 64, 0x2000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        assert!(
+            matches!(outcome, crate::kernel::recv_core::RecvOutcome::WouldBlock),
+            "empty queue → WouldBlock"
+        );
+    }
+
+    // ── C. Semantics: execute_user_asid_plain_v2_writeback outcomes ──────────
+
+    #[test]
+    fn stage37_writeback_v2_meta_fault_when_no_asid() {
+        // No user ASID bound → meta copy fails with UserMemoryFault → MetaCopyFault.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(1, b"").expect("msg"))
+            .expect("send");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x1000, 64, 0x2000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(delivery) => {
+                let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
+                assert_eq!(
+                    wb,
+                    RecvV2WritebackOutcome::MetaCopyFault { meta_ptr: 0x2000 },
+                    "meta copy without ASID → MetaCopyFault"
+                );
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage37_writeback_v2_payload_undersized_after_meta_success() {
+        // Meta copy succeeds, payload too small → PayloadUndersized.
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _map) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x2000), PageFlags::USER_RW)
+            .expect("map meta page");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(3, b"hello").expect("msg"))
+            .expect("send");
+        // user_buf_len=2 < payload_len=5 → PayloadUndersized after meta succeeds.
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x1000, 2, 0x2000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(delivery) => {
+                let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
+                assert_eq!(
+                    wb,
+                    RecvV2WritebackOutcome::PayloadUndersized,
+                    "meta ok, payload buf too small → PayloadUndersized"
+                );
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stage37_writeback_v2_ok_for_empty_payload_with_asid() {
+        // Meta copy + empty payload: both succeed when meta page is mapped.
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _map) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x2000), PageFlags::USER_RW)
+            .expect("map meta page");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(9, b"").expect("msg"))
+            .expect("send");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x1000, 0, 0x2000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(delivery) => {
+                let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
+                assert_eq!(
+                    wb,
+                    RecvV2WritebackOutcome::Ok,
+                    "meta page mapped + empty payload → Ok"
+                );
+            }
+            other => panic!("expected Delivered, got {other:?}"),
+        }
+    }
+
+    // ── D. Meta struct content verification ──────────────────────────────────
+
+    #[test]
+    fn stage37_meta_struct_sender_field_is_sender_tid() {
+        // meta[0..8] = sender_tid.0 as u64 (little-endian).
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _map) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x3000), PageFlags::USER_RW)
+            .expect("map meta page");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(99, b"").expect("msg"))
+            .expect("send");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x4000, 0, 0x3000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        let delivery = match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(d) => d,
+            other => panic!("expected Delivered, got {other:?}"),
+        };
+        let sender_tid = delivery.msg.sender_tid.0;
+        let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
+        assert_eq!(wb, RecvV2WritebackOutcome::Ok, "writeback succeeds");
+        let meta = state
+            .read_user_memory(0, 0x3000, 40)
+            .expect("read meta");
+        let meta_sender = u64::from_le_bytes(meta[0..8].try_into().expect("sender bytes"));
+        assert_eq!(meta_sender, sender_tid, "meta[0..8] = sender_tid");
+    }
+
+    #[test]
+    fn stage37_meta_struct_payload_len_field() {
+        // meta[12..16] = app_payload.len() as u32.
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _map) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x3000), PageFlags::USER_RW)
+            .expect("map meta page");
+        let payload = b"ab";
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(7, payload).expect("msg"))
+            .expect("send");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x4000, 64, 0x3000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        let delivery = match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(d) => d,
+            other => panic!("expected Delivered, got {other:?}"),
+        };
+        let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
+        // payload ptr=0x4000 is not mapped → PayloadCopyFault, but meta is written first.
+        assert!(
+            matches!(wb, RecvV2WritebackOutcome::Ok | RecvV2WritebackOutcome::PayloadCopyFault { .. }),
+            "meta written; payload either ok or fault: {wb:?}"
+        );
+        let meta = state.read_user_memory(0, 0x3000, 40).expect("read meta");
+        let meta_len = u32::from_le_bytes(meta[12..16].try_into().expect("len bytes"));
+        assert_eq!(meta_len, payload.len() as u32, "meta[12..16] = payload.len()");
+    }
+
+    #[test]
+    fn stage37_meta_struct_transfer_cap_field_is_no_transfer_cap() {
+        // meta[16..24] = SYSCALL_NO_TRANSFER_CAP for plain messages.
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _map) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x5000), PageFlags::USER_RW)
+            .expect("map meta page");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(1, b"").expect("msg"))
+            .expect("send");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x6000, 0, 0x5000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        let delivery = match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(d) => d,
+            other => panic!("expected Delivered, got {other:?}"),
+        };
+        let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
+        assert_eq!(wb, RecvV2WritebackOutcome::Ok, "empty payload+mapped meta → Ok");
+        let meta = state.read_user_memory(0, 0x5000, 40).expect("read meta");
+        let transfer_cap = u64::from_le_bytes(meta[16..24].try_into().expect("cap bytes"));
+        assert_eq!(
+            transfer_cap, SYSCALL_NO_TRANSFER_CAP,
+            "meta[16..24] = NO_TRANSFER_CAP for plain messages"
+        );
+    }
+
+    #[test]
+    fn stage37_meta_struct_flags_field_is_zero_for_plain() {
+        // meta[24..32] = recv_meta_flags = 0 for plain messages.
+        let mut state = Bootstrap::init().expect("init");
+        let (asid, _map) = state.create_user_address_space().expect("aspace");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid, mem_cap, VirtAddr(0x5000), PageFlags::USER_RW)
+            .expect("map meta page");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        state
+            .ipc_send(send_cap, Message::new(1, b"").expect("msg"))
+            .expect("send");
+        let req = RecvRequest::from_recv_v2(0, recv_cap, 0x6000, 0, 0x5000, 40, false);
+        let endpoint = state
+            .current_task_cnode()
+            .and_then(|cn| state.capability_for_cnode_local(cn, recv_cap))
+            .expect("cap")
+            .object;
+        let outcome = try_recv_core_user_plain_v2(&mut state, &req, endpoint);
+        let delivery = match outcome {
+            crate::kernel::recv_core::RecvOutcome::Delivered(d) => d,
+            other => panic!("expected Delivered, got {other:?}"),
+        };
+        let wb = execute_user_asid_plain_v2_writeback(&mut state, &delivery);
+        assert_eq!(wb, RecvV2WritebackOutcome::Ok);
+        let meta = state.read_user_memory(0, 0x5000, 40).expect("read meta");
+        let recv_meta_flags = u64::from_le_bytes(meta[24..32].try_into().expect("flag bytes"));
+        assert_eq!(recv_meta_flags, 0, "meta[24..32] = 0 for plain (no reply/transfer flags)");
+    }
+
+    // ── E. Live split path integration ───────────────────────────────────────
+
+    #[test]
+    fn stage37_user_asid_v2_split_ret0_is_zero_on_success() {
+        // In recv-v2 mode, ret0 must be 0 (metadata goes in meta struct, not ret0).
+        let (kernel, recv_cap, meta_ptr, payload_ptr) =
+            kernel_with_user_asid_v2_and_queued_plain(b"");
+        let mut frame = recv_v2_frame(recv_cap, payload_ptr, 64, meta_ptr);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "empty payload v2 split must succeed");
+        assert_eq!(frame.ret0(), 0, "recv-v2 ret0 must be 0 (not sender tid)");
+        assert_eq!(frame.ret2() as u64, SYSCALL_NO_TRANSFER_CAP, "no transfer cap");
+    }
+
+    #[test]
+    fn stage37_user_asid_v2_split_delivers_empty_payload() {
+        // Zero-byte recv-v2: meta written, payload copy is no-op → delivers.
+        let (kernel, recv_cap, meta_ptr, payload_ptr) =
+            kernel_with_user_asid_v2_and_queued_plain(b"");
+        let mut frame = recv_v2_frame(recv_cap, payload_ptr, 64, meta_ptr);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        assert_eq!(frame.ret1(), 0, "payload len = 0");
+    }
+
+    #[test]
+    fn stage37_user_asid_v2_meta_fault_returns_page_fault() {
+        // Meta ptr not mapped → MetaCopyFault → Err(SyscallError::PageFault).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(5, b"").expect("msg"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind asid");
+            // No page mapped at meta_ptr (0x9000) → meta copy will fault.
+            recv_cap
+        });
+        let mut frame = recv_v2_frame(recv_cap, 0x8000, 64, 0x9000);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Err(TrapHandleError::Syscall(SyscallError::PageFault))),
+            "unmapped meta ptr → Err(PageFault)"
+        );
+    }
+
+    #[test]
+    fn stage37_user_asid_v2_meta_fault_consumes_message() {
+        // After meta fault, message is consumed (not re-deliverable).
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(5, b"").expect("msg"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind asid");
+            recv_cap
+        });
+        let mut frame = recv_v2_frame(recv_cap, 0x8000, 64, 0x9000);
+        let _ = crate::kernel::syscall_split::try_split_dispatch_into_frame(
+            &kernel, CPU0, &mut frame,
+        );
+        // Queue must now be empty.
+        kernel.with(|state| state.unbind_task_asid(0).expect("unbind"));
+        let empty = kernel.with(|state| state.try_ipc_recv(recv_cap).expect("try_recv"));
+        assert!(empty.is_none(), "message consumed after meta fault");
+    }
+
+    #[test]
+    fn stage37_user_asid_v2_payload_undersized_returns_invalid_args() {
+        // Meta ok, payload buffer too small → Err(InvalidArgs), matching full path.
+        let (kernel, recv_cap, meta_ptr, _) = kernel_with_user_asid_v2_and_queued_plain(b"hello");
+        // payload_len=2 < message payload (5 bytes) → InvalidArgs after meta copy.
+        let mut frame = recv_v2_frame(recv_cap, 0x8000, 2, meta_ptr);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
+            "payload undersized → Err(InvalidArgs)"
+        );
+    }
+
+    #[test]
+    fn stage37_empty_queue_v2_user_asid_falls_back() {
+        // Empty queue → WouldBlock → split returns None.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, _send, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            recv_cap
+        });
+        let mut frame = recv_v2_frame(recv_cap, 0x1000, 64, 0x2000);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, None, "empty queue → fallback (None)");
+    }
+
+    // ── F. Regression: earlier paths unchanged ────────────────────────────────
+
+    #[test]
+    fn stage37_kernel_plain_path_still_live() {
+        use crate::runtime::SharedKernel;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(7, b"stage37").expect("m"))
+                .expect("send");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "kernel-plain split still live");
+        assert_eq!(frame.ret0(), 7, "sender tid");
+        assert_eq!(frame.ret1(), b"stage37".len());
+    }
+
+    #[test]
+    fn stage37_user_plain_path_still_live() {
+        use crate::runtime::SharedKernel;
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let recv_cap = kernel.with(|state| {
+            let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+            state
+                .ipc_send(send_cap, Message::new(9, b"").expect("m"))
+                .expect("send");
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind");
+            recv_cap
+        });
+        let mut frame = TrapFrame::new(
+            Syscall::IpcRecv as usize,
+            [recv_cap.0 as usize, 0, 0, 0, 0, 0],
+        );
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "Stage 36 user-plain path still live");
+        assert_eq!(frame.ret0(), 9, "sender tid");
+    }
+
+    #[test]
+    fn stage37_mapped_recv_still_falls_back() {
+        let req =
+            RecvRequest::from_legacy_mapped_recv(1, CAP0, 0x4000, 128, RecvMapIntent::ReadWrite);
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::UserAsidCopySemantics)
+        );
+    }
+
+    #[test]
+    fn stage37_recv_v3_still_helper_only() {
+        use crate::kernel::recv_core::recv_shared_v3::V3_MIN_OUTPUT_LEN;
+        let req = RecvRequest::future_shared_v3(
+            1,
+            CAP0,
+            0x1000,
+            64,
+            0x2000,
+            V3_MIN_OUTPUT_LEN as usize,
+            RecvMapIntent::None,
+            None,
+        );
+        assert_eq!(
+            plan_recv_core(&req),
+            RecvPlan::FallbackRequired(FallbackReason::SharedV3HelperOnly)
+        );
+    }
+
+    // ── G. Invariants ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage37_syscall_count_still_30() {
+        assert_eq!(
+            SYSCALL_COUNT, 30,
+            "Stage 37 must not add any new public syscall"
+        );
     }
 }

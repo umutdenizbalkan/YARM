@@ -2160,8 +2160,10 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
     snapshot: &crate::runtime::EndpointRecvCapSnapshot,
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::recv_core::{
-        RecvOutcome, RecvPlan, RecvUserWritebackOutcome, RecvWritebackPlan, execute_user_asid_plain_writeback,
+        RecvOutcome, RecvPlan, RecvUserWritebackOutcome, RecvV2WritebackOutcome, RecvWritebackPlan,
+        execute_user_asid_plain_writeback, execute_user_asid_plain_v2_writeback,
         plan_recv_core, try_recv_core_kernel_plain, try_recv_core_user_plain,
+        try_recv_core_user_plain_v2,
     };
 
     // Determine receiver class and build the canonical request.
@@ -2195,6 +2197,12 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
             // ipc_state_lock released before execute_user_asid_plain_writeback.
             crate::yarm_log!("YARM_RECV_CORE_ADAPTER kind=user_plain");
             try_recv_core_user_plain(kernel, &request, endpoint)
+        }
+        RecvPlan::UserPlainV2Eligible => {
+            // Stage 37: user-ASID recv-v2 plain recv (meta+payload) on split path.
+            // ipc_state_lock released before execute_user_asid_plain_v2_writeback.
+            crate::yarm_log!("YARM_RECV_CORE_ADAPTER kind=user_plain_v2");
+            try_recv_core_user_plain_v2(kernel, &request, endpoint)
         }
         RecvPlan::FallbackRequired(reason) => {
             crate::yarm_log!("YARM_RECV_CORE_FALLBACK reason={:?}", reason);
@@ -2244,6 +2252,39 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                         }
                         RecvUserWritebackOutcome::CopyFault { user_ptr } => {
                             // Message consumed; matches full-path record_user_fault+Ok() (§54).
+                            record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
+                            return Some(Ok(()));
+                        }
+                    }
+                }
+                RecvWritebackPlan::UserMemoryV2 { .. } => {
+                    // Stage 37: user-ASID recv-v2 plain writeback (meta-first ordering).
+                    // ipc_state_lock was released inside try_recv_core_user_plain_v2.
+                    // Capability lock is NOT held here.  Both hard constraints satisfied.
+                    if encode_transfer_cap_ret(frame, None).is_err() {
+                        return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+                    }
+                    match execute_user_asid_plain_v2_writeback(kernel, &delivery) {
+                        RecvV2WritebackOutcome::Ok => {
+                            // recv-v2 mode: ret0=0 (metadata in meta struct, not ret0).
+                            let payload_len = delivery.msg.as_slice().len();
+                            frame.set_ok(0, payload_len, frame.ret2());
+                            crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain_v2");
+                            crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=ok");
+                        }
+                        RecvV2WritebackOutcome::PayloadUndersized => {
+                            // Meta written; payload too small. Matches full-path Err(InvalidArgs) (§55).
+                            crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized");
+                            return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
+                        }
+                        RecvV2WritebackOutcome::MetaCopyFault { .. } => {
+                            // Matches full-path return Err(SyscallError::from(UserMemoryFault)) = PageFault (§55).
+                            crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=meta_fault");
+                            return Some(Err(TrapHandleError::Syscall(SyscallError::PageFault)));
+                        }
+                        RecvV2WritebackOutcome::PayloadCopyFault { user_ptr } => {
+                            // Meta written; payload fault. Matches full-path record_user_fault+Ok() (§55).
+                            crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_fault");
                             record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
                             return Some(Ok(()));
                         }
