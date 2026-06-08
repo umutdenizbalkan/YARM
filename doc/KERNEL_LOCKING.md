@@ -9671,3 +9671,176 @@ user-ASID writeback on the global-lock path while sharing cap-resolution/dequeue
 the current behavior (no live-wire change), prove value-equivalence via the
 existing per-variant tests, then incrementally move the timeout=0 and recv-v2
 kernel-task fast paths onto the split seam with x86_64 smoke coverage.
+
+## §52 Stage 33+34 — recv_core: canonical receive engine + recv_shared_v3 scaffold
+
+### 52.1 Overview
+
+Stage 33+34 lands the **canonical internal IPC receive engine** (`src/kernel/recv_core.rs`) and the **recv_shared_v3 design scaffold** (helper-only, no public syscall).
+
+The primary goals:
+1. Formalize the internal request/outcome model for all IPC receive paths.
+2. Route the Stage 32B kernel-task queued plain live path through the canonical core (the only currently-eligible path).
+3. Document and freeze current copy-failure semantics for user-ASID receivers.
+4. Design and scaffold `recv_shared_v3` as a future ABI — versioned structs, validation functions, test-only adapter — without adding a public syscall.
+
+**Hard invariants preserved:**
+- `SYSCALL_COUNT == 30` — no new public syscall.
+- No public `recv_shared_v3` syscall dispatch.
+- ipc_state_lock NOT held during copies to user memory.
+- capability lock NOT held during copies to user memory.
+- Public ABIs (ipc_recv, ipc_recv_timeout, recv-v2, IpcSend/IpcCall/IpcReply, SpawnV5, VFS) unchanged.
+- Phase2B, Phase3B, startup slots, Stage 30 raw-borrow guard, Stage 29 NR8 behavior, Stage 32B split behavior: all preserved.
+
+### 52.2 Receive-path classification table
+
+| Entry point | NR | Split eligible now? | Core path | Fallback reason (if not eligible) |
+|---|---|---|---|---|
+| ipc_recv kernel task (queued plain) | 2 | YES | `try_recv_core_kernel_plain` | — |
+| ipc_recv user-ASID receiver | 2 | NO | global-lock | UserAsidCopySemantics |
+| ipc_recv_timeout (any) | 5 | NO | global-lock | UserAsidCopySemantics or RecvV2MetaUserCopy |
+| recv-v2 (meta write) | 2 | NO | global-lock | RecvV2MetaUserCopy |
+| mapped recv (MemoryObject) | 2 | NO | global-lock | UserAsidCopySemantics |
+| recv_shared_v3 | — | N/A (future) | none (helper-only) | SharedV3HelperOnly |
+
+### 52.3 Canonical request model
+
+```rust
+pub(crate) struct RecvRequest {
+    pub(crate) kind:           RecvRequestKind,
+    pub(crate) requester_tid:  u64,
+    pub(crate) recv_cap:       CapId,
+    pub(crate) payload_target: RecvPayloadTarget,
+    pub(crate) meta_target:    RecvMetaTarget,
+    pub(crate) blocking:       RecvBlockingPolicy,
+    pub(crate) transfer:       RecvTransferPolicy,
+    pub(crate) map_intent:     RecvMapIntent,
+}
+
+pub(crate) enum RecvRequestKind    { LegacyRecv, LegacyTimedRecv, SharedV3Future }
+pub(crate) enum RecvPayloadTarget  { KernelRegister, UserMemory { ptr, len } }
+pub(crate) enum RecvMetaTarget     { None, V2 { ptr, len }, V3Future { ptr, len } }
+pub(crate) enum RecvBlockingPolicy { WaitForever, Timed { ticks }, NonBlocking }
+pub(crate) enum RecvTransferPolicy { LegacyFull }
+pub(crate) enum RecvMapIntent      { None, ReadOnly, ReadWrite }
+```
+
+### 52.4 Canonical outcome model
+
+```rust
+pub(crate) enum RecvOutcome {
+    Delivered(RecvDelivery),
+    WouldBlock,
+    TimedOut,
+    FallbackRequired(FallbackReason),
+    Error(KernelError),
+}
+
+pub(crate) struct RecvDelivery {
+    pub(crate) writeback:  RecvWritebackPlan,
+    pub(crate) scheduler:  RecvSchedulerWakePlan,
+    pub(crate) msg:        Message,
+}
+
+pub(crate) enum RecvWritebackPlan {
+    KernelRegister { sender_tid: usize, raw_len: usize },
+}
+
+pub(crate) enum RecvSchedulerWakePlan { None }
+
+pub(crate) enum FallbackReason {
+    UserAsidCopySemantics,
+    RecvV2MetaUserCopy,
+    SenderWaiterWake,
+    CapTransfer,
+    SharedV3HelperOnly,
+}
+```
+
+### 52.5 Adapter constructor map
+
+| Adapter | Source ABI | Notes |
+|---|---|---|
+| `RecvRequest::from_legacy_ipc_recv` | NR2 (ipc_recv) | Plain recv; detects kernel vs user-ASID via `is_kernel_task` |
+| `RecvRequest::from_ipc_recv_timeout` | NR5 (ipc_recv_timeout) | Encodes timeout ticks; always user-ASID for now |
+| `RecvRequest::from_recv_v2` | NR2 with v2 frame | Detects meta ptr/len; encodes V2 meta target |
+| `RecvRequest::from_legacy_mapped_recv` | NR2 with map intent | MemoryObject recv; always user-ASID |
+| `RecvRequest::future_shared_v3` | (none, `#[cfg(test)]`) | Design scaffold only; always returns SharedV3HelperOnly |
+
+### 52.6 Copy-failure semantics table
+
+The table below documents the **current observable behavior** of the global-lock
+receive path when a `copy_to_current_user` fault occurs. This behavior is
+**frozen** by Stage 33+34: no live path changes it. The table is the formal
+prerequisite for any future user-ASID writeback move onto the split seam.
+
+| Scenario | Dequeue order | On copy fault | Message fate | Syscall return |
+|---|---|---|---|---|
+| User-ASID ipc_recv, oversized payload | dequeue → size-check | `InvalidArgs` | message LOST | `Err(InvalidArgs)` |
+| User-ASID ipc_recv, copy fault | dequeue → copy | `copy_to_current_user` fault | message LOST | `Ok(())` + user fault recorded |
+| User-ASID recv-v2, meta copy fault | dequeue → meta copy | fault | message LOST | `Ok(())` + user fault recorded |
+| Kernel-task recv (split path) | dequeue under ipc_state_lock | N/A (no user copy) | delivered to registers | `Ok(())` |
+| User-ASID recv (split path) | — | N/A (falls back before dequeue) | message PRESERVED in queue | `None` (fallback) |
+
+**Key invariant guaranteed by Stage 33+34:** On the split path, `plan_recv_core`
+returns `FallbackRequired(UserAsidCopySemantics)` BEFORE `try_recv_core_kernel_plain`
+is called for any user-ASID receiver. The dequeue never runs for user-ASID on the
+split path, so no messages can be lost via split-path fallback.
+
+**Next step for enabling user-ASID on split path:** Introduce a
+post-lock-release copy path that either (a) proves rollback/requeue on fault, or
+(b) reproduces the current "dequeue-then-copy, lose on fault" semantics with the
+copy happening outside ipc_state_lock. Stage 35 tracking item.
+
+### 52.7 recv_shared_v3 design scaffold
+
+The `recv_shared_v3` module (`src/kernel/recv_core.rs`, submodule
+`recv_shared_v3`) defines versioned request/output structs and validation
+functions for a potential future shared-buffer receive ABI.
+
+**Key constants:**
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `V3_VERSION` | 3 | Required version field in request header |
+| `V3_MIN_REQUEST_LEN` | 64 | Minimum validated request record length |
+| `V3_MIN_OUTPUT_LEN` | 80 | Minimum validated output record length |
+| `MAP_READ` | 0x1 | map_intent flag: read access |
+| `MAP_WRITE` | 0x2 | map_intent flag: write access |
+
+**Why no public v3 syscall now:**
+- Shared-buffer recv requires stable user-ASID writeback semantics (§52.6).
+- The output record format is not finalized — field layout will evolve.
+- No driver or service currently requires v3.
+- Adding a syscall now would freeze an immature ABI before the design is ready.
+
+**Future metadata not yet available in recv_shared_v3 output:**
+- Sender ASID (not yet tracked in message metadata).
+- Transfer capability slot — requires capability-lock-safe writeback path.
+- Message sequence number — requires endpoint-level sequence tracking.
+
+### 52.8 Telemetry markers (Stage 33+34)
+
+New markers emitted on the canonical core path:
+
+- `YARM_RECV_CORE_ADAPTER kind=legacy` — emitted when `from_legacy_ipc_recv` adapter was used and `plan_recv_core` returned `KernelPlainEligible`. Marks that the request entered the canonical core.
+- `YARM_RECV_CORE_LIVE kind=kernel_plain` — emitted on successful delivery through `try_recv_core_kernel_plain`. One marker per delivered message on the split fast path.
+- `YARM_RECV_CORE_FALLBACK reason=<FallbackReason>` — emitted when `plan_recv_core` returns `FallbackRequired`. Identifies the specific deferral cause.
+
+### 52.9 Live vs fallback matrix (Stage 33+34)
+
+| Syscall | Receiver type | Path | Markers |
+|---|---|---|---|
+| ipc_recv (NR2) | kernel task, queued plain | LIVE split + canonical core | `ADAPTER kind=legacy`, `LIVE kind=kernel_plain` |
+| ipc_recv (NR2) | user-ASID | fallback to global-lock | `FALLBACK reason=UserAsidCopySemantics` |
+| ipc_recv (NR2) | v2 meta frame | fallback to global-lock | `FALLBACK reason=RecvV2MetaUserCopy` |
+| ipc_recv_timeout (NR5) | any | not split-eligible (NR gate) | — |
+
+### 52.10 Smoke grep commands (Stage 33+34)
+
+```
+grep -c 'YARM_RECV_CORE_LIVE kind=kernel_plain' $LOG     # >= 0 (boot-dependent)
+grep -c 'YARM_RECV_CORE_ADAPTER kind=legacy' $LOG        # matches LIVE count
+grep -c 'YARM_RECV_CORE_FALLBACK' $LOG                   # >= 0 (user-ASID recvs)
+grep -c 'YARM_RECV_CORE_FALLBACK.*SharedV3' $LOG         # 0 (no v3 syscall)
+```

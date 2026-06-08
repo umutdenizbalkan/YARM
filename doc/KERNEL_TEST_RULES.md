@@ -2690,3 +2690,98 @@ default-deny (`stage32b_ipc_send_call_reply_not_split_eligible`).
 preserved. Telemetry markers must be low-noise (LIVE path only):
 `YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan|writeback result=ok`. All
 `stage32b_` tests must pass with `--test-threads=1`.
+
+### Rule N+41 (Stage 33+34)
+
+When the **canonical internal receive engine** (`recv_core`) and the
+**recv_shared_v3 scaffold** are landed, a `stage33_` test suite must prove:
+
+**(A) Request model and adapter correctness:**
+
+- `from_legacy_ipc_recv` with a user-ASID `is_kernel_task=false` must produce a
+  request with `RecvPayloadTarget::UserMemory` and `RecvRequestKind::LegacyRecv`
+  (`stage33_legacy_adapter_user_asid_plan_fallback`).
+- `from_legacy_ipc_recv` with `is_kernel_task=true` must produce
+  `RecvPayloadTarget::KernelRegister` and plan as `KernelPlainEligible`
+  (`stage33_legacy_adapter_kernel_task_plan_eligible`).
+- `from_recv_v2` with a non-zero meta_ptr ≥ `META_V2_MIN_LEN` must set
+  `RecvMetaTarget::V2` (`stage33_recv_v2_adapter_meta_target_populated`,
+  `stage33_legacy_adapter_v2_meta_detected`).
+- `from_recv_v2` with a meta_len below `META_V2_MIN_LEN` must set
+  `RecvMetaTarget::None` (`stage33_recv_v2_adapter_small_meta_len_yields_no_meta`).
+- `from_ipc_recv_timeout` with `ticks > 0` must yield `RecvBlockingPolicy::Timed`
+  (`stage33_timeout_adapter_nonzero_ticks_is_timed_recv`).
+- `from_ipc_recv_timeout` with `ticks == 0` must yield `RecvBlockingPolicy::NonBlocking`
+  (`stage33_timeout_adapter_zero_ticks_is_nonblocking_probe`).
+
+**(B) Planning/eligibility:**
+
+- User-ASID recv plan must return `FallbackRequired(UserAsidCopySemantics)`
+  (`stage33_canonical_core_fallback_for_user_asid`,
+  `stage33_legacy_adapter_user_asid_plan_fallback`).
+- V2-meta recv plan must return `FallbackRequired(RecvV2MetaUserCopy)`
+  (`stage33_canonical_core_fallback_for_recv_v2`,
+  `stage33_legacy_adapter_v2_meta_kernel_task_fallback_on_meta`).
+- Kernel-task plain recv plan must return `KernelPlainEligible`
+  (`stage33_legacy_adapter_kernel_task_plan_eligible`).
+- `future_shared_v3` plan must return `FallbackRequired(SharedV3HelperOnly)`
+  (`stage33_recv_v3_future_adapter_is_helper_only`).
+- `META_V2_MIN_LEN == 40` constant confirmed
+  (`stage33_recv_core_metadata_v2_min_len_constant`).
+
+**(C) Canonical core execution (live path):**
+
+- `try_recv_core_kernel_plain` must deliver a queued plain message to a
+  kernel-task receiver, returning `RecvOutcome::Delivered` with
+  `RecvWritebackPlan::KernelRegister` (`stage33_kernel_task_queued_plain_recv_through_canonical_core`).
+- Empty queue must yield `RecvOutcome::WouldBlock` (`stage33_empty_queue_fallback`).
+- Invalid cap must yield `RecvOutcome::Error` (`stage33_legacy_adapter_invalid_cap_matches_old_path_error`).
+- Telemetry markers `YARM_RECV_CORE_ADAPTER kind=legacy` and
+  `YARM_RECV_CORE_LIVE kind=kernel_plain` must be emitted on the live path
+  (`stage33_cap_plan_markers_through_canonical_core`).
+
+**(D) Copy-failure semantics (documentation freeze):**
+
+- User-ASID recv on the split path must return `None` (fallback) WITHOUT dequeuing
+  (`stage33_copy_failure_user_asid_recv_falls_back_not_dequeues`).
+- The documented fallback reason must be `UserAsidCopySemantics`
+  (`stage33_copy_failure_plan_fallback_reason_is_copy_semantics`).
+
+**(E) recv_shared_v3 scaffold:**
+
+- `SYSCALL_COUNT == 30` — no new public syscall added (`stage33_recv_v3_no_syscall_added`).
+- `future_shared_v3` adapter is `#[cfg(test)]` only; it always falls back with
+  `SharedV3HelperOnly` (`stage33_recv_v3_future_adapter_is_helper_only`).
+- `V3_VERSION == 3` validated in request header; version 0 and mismatched versions rejected
+  (`stage33_recv_v3_request_validates_version`).
+- Short record (< `V3_MIN_REQUEST_LEN`) rejected
+  (`stage33_recv_v3_request_rejects_short_record`).
+- Nonzero reserved fields rejected (`stage33_recv_v3_request_rejects_nonzero_reserved`).
+- `MAP_READ` / `MAP_WRITE` map_intent bits round-trip correctly
+  (`stage33_recv_v3_request_parses_read_only_intent`,
+  `stage33_recv_v3_request_parses_read_write_intent`).
+- Unknown map_intent bits (outside `MAP_READ | MAP_WRITE`) rejected
+  (`stage33_recv_v3_request_rejects_map_intent_without_metadata_buffer` covers this
+  via the validate function).
+- Output record version checked; short output record rejected
+  (`stage33_recv_v3_output_record_version_checked`).
+
+**(F) Regression:**
+
+- Stage 32B kernel-plain live path still works through the new canonical core
+  (`stage33_stage32b_kernel_plain_path_still_live`).
+- NR-8 split dispatch still succeeds (`stage33_nr8_split_still_live`).
+- Full IPC round-trip (send + queued recv) still delivers the correct message
+  (`stage33_full_ipc_round_trip_still_works`).
+- `from_legacy_ipc_recv` and timeout adapter behavior is identical to the old
+  direct path (`stage33_timeout_adapter_full_path_behavior_unchanged`).
+- User-ASID fallback reason is explicitly confirmed via `plan_recv_core`
+  (`stage33_user_asid_fallback_reason_explicit`).
+- `SYSCALL_COUNT == 30` (`stage33_syscall_count_still_30`).
+
+**Run command:** `cargo test --lib stage33 -- --test-threads=1`
+
+All `stage33_` tests must pass. The full lib test (`cargo test --lib --
+--test-threads=1`) must pass with 0 failures. Multi-threaded runs (> 1 thread) may
+abort due to the pre-existing large-KernelState stack/allocator interaction;
+single-threaded runs are authoritative.

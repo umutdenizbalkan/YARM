@@ -10,6 +10,7 @@ pub mod ipc;
 pub mod lock;
 pub mod printk;
 pub mod process;
+pub mod recv_core;
 pub mod scheduler;
 pub mod scheduler_timer;
 pub mod smp;
