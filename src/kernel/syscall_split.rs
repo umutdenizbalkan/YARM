@@ -78,6 +78,18 @@ pub(crate) enum SplitEligibleSyscall {
         target_pid: u64,
         slots: usize,
     },
+    /// `Syscall::IpcRecv` (NR 2), kernel-task receiver of a queued plain message.
+    ///
+    /// Stage 32B: split eligibility for IpcRecv cannot be fully decided from the
+    /// syscall number + raw args alone — whether the receiver is a kernel task,
+    /// whether the endpoint has a queued plain message, and whether a sender-wake
+    /// or recv-v2 path applies are all resolved INSIDE
+    /// `try_split_ipc_recv_queued_plain_into_frame`. This variant therefore marks
+    /// IpcRecv as "attempt the split"; the helper itself returns `None` for every
+    /// case it cannot service (user-ASID receiver, empty queue, sender-wake,
+    /// cap-transfer, recv-v2), and that `None` propagates straight back to the
+    /// global-lock fallback. The variant carries no decoded args for that reason.
+    IpcRecvKernelTask,
     // Add others ONLY when the per-domain helper is proven safe.
 }
 
@@ -109,6 +121,13 @@ pub(crate) fn classify_split_eligible(
                 slots,
             })
         }
+        // Stage 32B: IpcRecv (NR 2) is split-eligible at classification time, but it
+        // is serviced through the frame-level seam
+        // (`try_split_dispatch_into_frame` → `try_split_ipc_recv_queued_plain_into_frame`),
+        // not through `try_split_dispatch` (which has no `cpu`/`frame`). The variant
+        // documents eligibility; `try_split_dispatch` returns `None` for it so the
+        // arg-only caller defers to the frame-level recv path / global-lock fallback.
+        Syscall::IpcRecv => Some(SplitEligibleSyscall::IpcRecvKernelTask),
         // Default-deny: every other syscall falls back to the global-lock path.
         _ => None,
     }
@@ -137,6 +156,10 @@ pub(crate) fn try_split_dispatch(
             target_pid,
             slots,
         )),
+        // IpcRecv is serviced by the frame-level seam, not this arg-only path.
+        // Returning `None` defers to `try_split_dispatch_into_frame`'s dedicated
+        // recv routing (and ultimately the global-lock fallback).
+        SplitEligibleSyscall::IpcRecvKernelTask => None,
     }
 }
 
@@ -180,6 +203,17 @@ pub(crate) fn try_split_dispatch_into_frame(
         return None;
     }
 
+    // Stage 32B: IpcRecv (NR 2) is routed to the dedicated queued-plain recv
+    // helper, which decides split eligibility INTERNALLY (kernel-task receiver,
+    // queued plain message, no sender-wake / recv-v2). Crucially, every case the
+    // helper cannot service returns `None`, and that `None` propagates UNCHANGED
+    // back to the global-lock fallback below — the split path never converts a
+    // would-be-fallback into a `Some(Err(..))` (it only returns `Some(Err)` for a
+    // cap-resolution error the old path would have raised identically).
+    if matches!(syscall, Syscall::IpcRecv) {
+        return try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame);
+    }
+
     // The requester TID is what the global-lock handler reads via
     // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
     //
@@ -216,13 +250,15 @@ pub(crate) fn try_split_dispatch_into_frame(
 }
 
 /// # Validation status
-/// - HELPER_ONLY — Stage 31 queued-plain IPC recv fast-path. NOT wired into the
-///   live trap seam below (`try_split_dispatch_into_frame` does NOT route IpcRecv
-///   here); exercised by unit tests only. See `doc/KERNEL_LOCKING.md` §49.
+/// - LIVE_TRAP_SMOKE_X86_64 (Stage 32B) — wired into the live trap seam:
+///   `try_split_dispatch_into_frame` routes IpcRecv (NR 2) here BEFORE the global
+///   lock. Only the kernel-task queued-plain case is serviced; every other case
+///   returns `None` and propagates to the unchanged global-lock fallback. See
+///   `doc/KERNEL_LOCKING.md` §50.11.
 ///
-/// Stage 31 split-recv seam (helper-only): attempt to service an `IpcRecv` for a
-/// plain queued message on a buffered endpoint, delivered to a kernel-task
-/// receiver, with no recv-v2 metadata. Default-deny for every other case.
+/// Stage 31 split-recv seam: attempt to service an `IpcRecv` for a plain queued
+/// message on a buffered endpoint, delivered to a kernel-task receiver, with no
+/// recv-v2 metadata. Default-deny for every other case.
 ///
 // Lock order: [no lock] → current_tid_authoritative (takes+releases global) →
 //             ipc_state_lock (rank 3) → [release] → [no lock]
@@ -239,13 +275,12 @@ pub(crate) fn try_split_dispatch_into_frame(
 ///   or reply-cap message, user-ASID receiver (would require a forbidden user copy),
 ///   sender-waiter refill, blocking, timeout, or a non-IpcRecv syscall.
 ///
-/// Why NOT live-wired: the realistic live x86_64 receivers (PM/init/VFS) are
+/// Stage 32B live-wire scope: the realistic live x86_64 receivers (PM/init/VFS) are
 /// user-ASID tasks whose plain-recv writeback needs `copy_to_current_user`, which
-/// is forbidden on the split path, and endpoint-cap resolution (capability domain,
-/// rank 4) has no proven split extraction yet. The helper rejects every user-ASID
-/// receiver, so it can only ever fast-path a kernel-task receiver. It is kept
-/// helper-only and tested directly; see §49.
-#[allow(dead_code)] // Stage 31: helper-only, intentionally not wired into the live seam.
+/// is still forbidden on the split path — those are rejected here (`None`) and fall
+/// back unchanged. Only a kernel-task receiver of a queued plain message is
+/// serviced on the split path; the endpoint-cap resolution is performed via the
+/// Stage 32 phase-separated split-read (`resolve_endpoint_recv_cap_split_read`).
 pub(crate) fn try_split_ipc_recv_queued_plain_into_frame(
     shared: &SharedKernel,
     cpu: CpuId,
@@ -269,6 +304,11 @@ pub(crate) fn try_split_ipc_recv_queued_plain_into_frame(
 fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
     match syscall {
         Syscall::ControlPlaneSetCnodeSlots => Some(syscall),
+        // Stage 32B: IpcRecv (NR 2) passes the NR gate so the live seam attempts the
+        // kernel-task queued-plain split via `try_split_ipc_recv_queued_plain_into_frame`.
+        // Final eligibility (kernel-task receiver, queued plain, no sender-wake/recv-v2)
+        // is decided inside that helper; ineligible cases return `None` → fallback.
+        Syscall::IpcRecv => Some(syscall),
         _ => None,
     }
 }
@@ -361,14 +401,21 @@ mod tests {
 
     #[test]
     fn stage28_split_dispatch_whitelist_rejects_ipc_recv() {
+        // Stage 32B: IpcRecv now classifies as `IpcRecvKernelTask` (it is serviced by
+        // the frame-level seam), but the ARG-ONLY `try_split_dispatch` path still
+        // returns `None` — IpcRecv is never serviced through this entry point; it
+        // defers to `try_split_dispatch_into_frame` / global-lock fallback.
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let syscall = decode(SYSCALL_IPC_RECV_NR);
         let args = [1, 2, 3, 4, 5, 6];
-        assert_eq!(classify_split_eligible(syscall, 1, args), None);
+        assert_eq!(
+            classify_split_eligible(syscall, 1, args),
+            Some(SplitEligibleSyscall::IpcRecvKernelTask)
+        );
         assert_eq!(
             try_split_dispatch(&kernel, syscall, 1, args),
             None,
-            "IPC recv must fall back to the global-lock path"
+            "IPC recv must not be serviced by the arg-only split path"
         );
     }
 
@@ -402,24 +449,36 @@ mod tests {
     fn stage28_split_dispatch_fallback_preserved_for_unwhitelisted() {
         // Every non-whitelisted syscall number must classify as None — the
         // default-deny contract. We exhaustively walk every decodable syscall and
-        // assert that only ControlPlaneSetCnodeSlots is ever eligible.
+        // assert that only ControlPlaneSetCnodeSlots and IpcRecv (Stage 32B) are
+        // ever eligible, and that the ARG-ONLY `try_split_dispatch` services none of
+        // them with zero args (IpcRecv is always deferred to the frame-level seam).
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         let args = [0u64; 6]; // zero args → even cnode-slots fails preconditions → None
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue; // gaps in the NR space are not valid syscalls
             };
-            // With zero args, NOTHING (including cnode-slots) is eligible.
-            assert_eq!(
-                classify_split_eligible(syscall, 1, args),
-                None,
-                "syscall nr {} must default-deny with zero args",
-                nr
-            );
+            // With zero args, only IpcRecv (NR 2, no arg preconditions) classifies
+            // eligible; cnode-slots fails its preconditions and everything else is
+            // default-deny.
+            if matches!(syscall, Syscall::IpcRecv) {
+                assert_eq!(
+                    classify_split_eligible(syscall, 1, args),
+                    Some(SplitEligibleSyscall::IpcRecvKernelTask),
+                    "IpcRecv must classify as split-eligible (frame-level serviced)"
+                );
+            } else {
+                assert_eq!(
+                    classify_split_eligible(syscall, 1, args),
+                    None,
+                    "syscall nr {} must default-deny with zero args",
+                    nr
+                );
+            }
             assert_eq!(
                 try_split_dispatch(&kernel, syscall, 1, args),
                 None,
-                "syscall nr {} must fall back to global-lock path with zero args",
+                "syscall nr {} must not be serviced by the arg-only split path with zero args",
                 nr
             );
         }
@@ -729,8 +788,13 @@ mod tests {
     #[test]
     fn stage29_futex_not_eligible() {
         let (kernel, _r, _t) = shared_with_control_plane_requester();
-        let mut frame = TrapFrame::new(SYSCALL_IPC_RECV_NR, [1, 2, 3, 4, 5, 6]);
-        // IPC recv stands in for any blocking syscall; also assert futex by number.
+        // Stage 32B: IpcRecv is now NR-eligible, so it can no longer stand in for a
+        // blocking syscall here. Use futex (which is genuinely never split-eligible)
+        // both by frame and by number.
+        let mut frame = TrapFrame::new(
+            crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR,
+            [1, 2, 3, 4, 5, 6],
+        );
         assert_eq!(try_split_dispatch_into_frame(&kernel, CPU0, &mut frame), None);
         assert!(classify_split_eligible_nr_only(
             decode(crate::kernel::syscall::SYSCALL_FUTEX_WAIT_NR)
@@ -749,14 +813,15 @@ mod tests {
 
     #[test]
     fn stage29_whitelist_exhaustive() {
-        // Iterate the full NR space; only NR 8 may be split-eligible.
+        // Iterate the full NR space; only NR 8 (cnode-slots) and NR 2 (IpcRecv,
+        // Stage 32B) may pass the NR-only split-eligibility gate.
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue;
             };
             let eligible = classify_split_eligible_nr_only(syscall).is_some();
-            if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR {
-                assert!(eligible, "NR 8 must be split-eligible");
+            if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR || nr == SYSCALL_IPC_RECV_NR {
+                assert!(eligible, "NR {nr} must be split-eligible");
             } else {
                 assert!(!eligible, "NR {nr} must NOT be split-eligible");
             }
@@ -853,5 +918,75 @@ mod tests {
             .expect("global-lock dispatch");
         assert_eq!(nr8.ret0(), requested);
         assert_eq!(nr8.ret1(), target as usize);
+    }
+
+    // ---- Stage 32B: IpcRecv classification ----
+
+    #[test]
+    fn stage32b_ipc_recv_classify_nr2_eligible() {
+        // NR 2 (IpcRecv) now passes the NR-only split-eligibility gate.
+        assert!(
+            classify_split_eligible_nr_only(decode(SYSCALL_IPC_RECV_NR)).is_some(),
+            "IpcRecv (NR 2) must be split-eligible at the NR gate"
+        );
+        // And the arg-level classifier maps it to the IpcRecvKernelTask variant.
+        assert_eq!(
+            classify_split_eligible(decode(SYSCALL_IPC_RECV_NR), 1, [0; 6]),
+            Some(SplitEligibleSyscall::IpcRecvKernelTask)
+        );
+    }
+
+    #[test]
+    fn stage32b_ipc_recv_timeout_nr_not_in_whitelist() {
+        // IpcRecvTimeout (NR 5) must NOT be split-eligible: it stays on the
+        // global-lock path (scheduler/deadline interaction).
+        assert!(
+            classify_split_eligible_nr_only(decode(
+                crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR
+            ))
+            .is_none(),
+            "IpcRecvTimeout must NOT be split-eligible"
+        );
+        assert_eq!(
+            classify_split_eligible(
+                decode(crate::kernel::syscall::SYSCALL_IPC_RECV_TIMEOUT_NR),
+                1,
+                [0; 6]
+            ),
+            None,
+            "IpcRecvTimeout must fall back"
+        );
+    }
+
+    #[test]
+    fn stage32b_ipc_send_call_reply_not_split_eligible() {
+        // The sender-side IPC syscalls stay default-deny.
+        for nr in [
+            SYSCALL_IPC_SEND_NR,
+            crate::kernel::syscall::SYSCALL_IPC_CALL_NR,
+            crate::kernel::syscall::SYSCALL_IPC_REPLY_NR,
+        ] {
+            assert!(
+                classify_split_eligible_nr_only(decode(nr)).is_none(),
+                "NR {nr} must NOT be split-eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn stage32b_arg_only_dispatch_defers_ipc_recv() {
+        // The arg-only try_split_dispatch must NEVER service IpcRecv: it returns
+        // None so the frame-level seam (and ultimately the global lock) handles it.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        assert_eq!(
+            try_split_dispatch(&kernel, decode(SYSCALL_IPC_RECV_NR), 1, [1, 0, 0, 0, 0, 0]),
+            None,
+            "arg-only dispatch must defer IpcRecv"
+        );
+    }
+
+    #[test]
+    fn stage32b_syscall_count_30() {
+        assert_eq!(SYSCALL_COUNT, 30, "Stage 32B must not change SYSCALL_COUNT");
     }
 }

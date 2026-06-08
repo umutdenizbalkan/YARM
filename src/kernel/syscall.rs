@@ -1961,6 +1961,12 @@ fn should_strip_inline_opcode_prefix(msg: &Message) -> bool {
 /// (`ipc_state_lock`, rank 3). No scheduler wake, yield, or task switch occurs
 /// (`task_switched` stays `false`): a sender-waiter refill is rejected (→ `None`)
 /// so no deferred wake plan is ever produced here.
+///
+/// Stage 32 note: the live `SharedKernel` wrapper now drives the equivalent
+/// dequeue+writeback through `try_split_recv_queued_plain_with_snapshot_locked`
+/// (cap pre-resolved via the split-read). This monolithic helper is retained
+/// unchanged for Stage 31 helper-semantics regression tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn try_split_recv_queued_plain_into_frame_locked(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -2021,6 +2027,81 @@ pub(crate) fn try_split_recv_queued_plain_into_frame_locked(
     //   recv_meta_flags == 0, recv_local_transfer == None,
     //   encode_transfer_cap_ret(frame, None) => ret2 = NO_TRANSFER_CAP,
     //   set_ok(sender, raw_len, ret2), inline payload words packed.
+    let sender = match sender_tid_to_ret(received.sender_tid.0) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(TrapHandleError::Syscall(e))),
+    };
+    if encode_transfer_cap_ret(frame, None).is_err() {
+        return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
+    }
+    let raw_len = received.as_slice().len();
+    frame.set_ok(sender, raw_len, frame.ret2());
+    let words = match pack_register_payload(received.as_slice()) {
+        Ok(w) => w,
+        Err(_) => return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs))),
+    };
+    frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD0, words[0]);
+    frame.set_arg(SYSCALL_ARG_INLINE_PAYLOAD1, words[1]);
+    Some(Ok(()))
+}
+
+/// Stage 32: queued-plain IPC recv split, IPC-domain dequeue + writeback phase,
+/// driven by a **pre-resolved** endpoint receive-cap snapshot.
+///
+/// The capability domain (rank 4) resolution has already been performed and its
+/// lock released by [`SharedKernel::resolve_endpoint_recv_cap_split_read`] before
+/// this function runs. This function therefore:
+///   1. revalidates recv-v2 default-deny from the frame,
+///   2. rejects any user-ASID receiver (the user-copy writeback blocker remains),
+///   3. revalidates endpoint liveness + dequeues one plain message under the IPC
+///      domain only (`ipc_state_lock`, rank 3) via `try_endpoint_split_recv`,
+///   4. writes the kernel-task return lanes byte-for-byte identical to the
+///      kernel-task branch of `handle_ipc_recv_result_with_empty_error`.
+///
+/// This NEVER re-resolves the cap (no capability lock), so the IPC lock is the
+/// only domain lock it touches. Generation-based liveness is revalidated inside
+/// `resolve_endpoint_index` (under `ipc_state_lock`): a stale generation yields
+/// `Err` → `None` (fallback), never a wrong-endpoint dequeue.
+///
+/// Return contract is identical to `try_split_recv_queued_plain_into_frame_locked`:
+/// `Some(Ok(()))` on a delivered plain message, `Some(Err(..))` on a writeback
+/// error the old path would also raise, `None` for any non-split-eligible case.
+pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+    snapshot: &crate::runtime::EndpointRecvCapSnapshot,
+) -> Option<Result<(), TrapHandleError>> {
+    // Default-deny recv-v2 (same predicate as handle_ipc_recv): metadata would
+    // require a user-meta-buffer copy.
+    let recv_v2_request = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) != 0
+        && frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) >= IPC_RECV_META_V2_ENCODED_LEN;
+    if recv_v2_request {
+        return None;
+    }
+
+    let endpoint = snapshot.endpoint;
+
+    // Default-deny any user-ASID receiver: their plain-recv writeback needs a
+    // user-memory copy (copy_to_current_user), which is not yet split-safe
+    // (Stage 32 writeback plan remains scaffolded — see KERNEL_LOCKING §50).
+    match current_task_has_user_asid(kernel) {
+        Ok(false) => {}
+        Ok(true) | Err(_) => return None,
+    }
+
+    // IPC-domain-only dequeue. resolve_endpoint_index (inside try_endpoint_split_recv)
+    // revalidates the endpoint generation under ipc_state_lock; a stale snapshot
+    // (generation mismatch / vanished endpoint) returns Err → None (fallback).
+    let received = match try_endpoint_split_recv(kernel, endpoint) {
+        Ok(Some((msg, IpcSchedulerPlan::None))) => msg,
+        // Sender-waiter refill needs a deferred wake — defer to the global path.
+        Ok(Some((_, _))) => return None,
+        Ok(None) => return None,
+        Err(_) => return None,
+    };
+
+    // Kernel-task plain-message writeback — byte-for-byte identical to the
+    // no-user-ASID branch of handle_ipc_recv_result_with_empty_error.
     let sender = match sender_tid_to_ret(received.sender_tid.0) {
         Ok(s) => s,
         Err(e) => return Some(Err(TrapHandleError::Syscall(e))),

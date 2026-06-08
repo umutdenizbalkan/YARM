@@ -2598,3 +2598,95 @@ claim. x86_64 smoke is required only if the path is live-wired; a helper-only
 Stage 31 defers smoke and must keep the `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok`
 marker as the live split indicator. All stage31_ tests must pass with
 `--test-threads=1`.
+
+### Rule N+39 (Stage 32)
+
+The endpoint-cap resolution split for the helper-only IPC queued-plain recv path
+must be **phase-separated and non-mutating**, and the user-ASID writeback must stay
+**default-deny** until its copy-failure semantics are proven. A Stage 32 test suite
+(`stage32_` prefix) must prove all of:
+
+(a) **Cap resolution lock discipline:** `resolve_endpoint_recv_cap_split_read`
+must resolve a valid endpoint RECEIVE cap into an `EndpointRecvCapSnapshot` carrying
+the resolved endpoint object + rights + requester identity
+(`stage32_cap_resolution_valid_endpoint_recv_right`); it must NOT touch the IPC
+domain (a message queued before resolution is still deliverable after —
+`stage32_cap_resolution_no_ipc_lock_required`); it must NOT mutate cap state
+(two resolutions yield identical snapshots — `stage32_cap_resolution_no_cap_mutation`);
+and it must respect per-process cnode isolation
+(`stage32_cap_resolution_two_processes_isolated`). The helper must never hold the
+task lock and capability lock simultaneously and never acquire `ipc_state_lock`
+(documented + enforced by the `_from_raw` phase split).
+
+(b) **Cap resolution error equivalence:** missing cap / out-of-range cap / unknown
+requester → `KernelError::InvalidCapability`; non-endpoint object →
+`WrongObject`; endpoint without RECEIVE → `MissingRight`
+(`stage32_cap_resolution_missing_cap_error`, `_invalid_cap_id_error`,
+`_unknown_requester_error`, `_wrong_object_error`, `_missing_recv_right_error`).
+
+(c) **Integration equivalence + fallback:** the integrated split path
+(`try_split_ipc_recv_queued_plain_into_frame` using the snapshot) must succeed for a
+kernel-task queued plain recv with lanes matching the old path
+(`stage32_integrated_queued_recv_valid_cap_succeeds`,
+`stage32_integrated_lanes_match_old_path`); preserve the old error code for invalid
+cap and wrong object (`stage32_integrated_invalid_cap_matches_old_path_error`,
+`_wrong_object_matches_old_path`); and fall back (return `None`) for empty endpoint,
+user-ASID receiver, cap-transfer message, and recv-v2 request
+(`stage32_integrated_empty_endpoint_fallback`, `_user_asid_receiver_fallback`,
+`_cap_transfer_fallback`, `_recv_v2_fallback`).
+
+(d) **Writeback plan scaffold:** the `IpcRecvQueuedPlainWritebackPlan` must capture
+payload bytes + return metadata (`stage32_writeback_plan_stores_payload`); reject a
+payload larger than `MAX_PLAIN_PAYLOAD` (`stage32_writeback_plan_bounds_payload_len`);
+produce kernel-task lanes equal to the integrated split path
+(`stage32_writeback_plan_kernel_task_writeback`); and keep the user-ASID branch
+DISABLED (kernel-task-only constructor — `stage32_writeback_plan_user_asid_disabled`).
+The user-ASID receiver case must remain fallback-only until the
+message-consumed-on-copy-fail semantics across a post-dequeue
+`copy_to_current_user` (outside `ipc_state_lock`) are matched and documented in
+`doc/KERNEL_LOCKING.md` §50.
+
+(e) **Live-seam contract + regression:** `IpcRecv` must remain default-deny in
+`try_split_dispatch_into_frame` (`stage32_ipc_recv_not_wired_into_live_seam`); the
+Stage 29 NR-8 live split-dispatch must still work (`stage32_nr8_split_still_works`);
+`SYSCALL_COUNT == 30` confirmed (`stage32_syscall_count_still_30`); no syscall
+numbers added; Stages 12–31 behavior preserved. x86_64 smoke is deferred (the path
+stays helper-only); the `YARM_LOCK_SPLIT_DISPATCH nr=8 result=ok` marker remains the
+live split indicator. All stage32_ tests must pass with `--test-threads=1`.
+
+### Rule N+40 (Stage 32B)
+
+When the kernel-task IpcRecv queued-plain split is **live-wired** into
+`try_split_dispatch_into_frame`, a `stage32b_` test suite must prove the live-wire
+is safe AND default-deny-preserving:
+
+(a) **Live kernel-task path:** a kernel-task receiver of a queued plain message,
+routed through `try_split_dispatch_into_frame` (NOT just the helper), must return
+`Some(Ok(()))` and write the canonical kernel-task lanes
+(`set_ok(sender, raw_len, NO_TRANSFER_CAP)`) —
+`stage32b_ipc_recv_live_kernel_task_queued_plain`,
+`stage32b_ipc_recv_live_wired_into_seam_kernel_task`.
+
+(b) **Fallback preservation through the LIVE seam:** every non-serviceable case must
+return `None` from `try_split_dispatch_into_frame` (NOT a fabricated `Some(Err)`),
+so the global-lock path handles it unchanged — user-ASID receiver
+(`stage32b_ipc_recv_user_asid_still_fallback`), empty queue
+(`stage32b_ipc_recv_empty_queue_still_fallback`), recv-v2
+(`stage32b_ipc_recv_v2_fallback`). An invalid cap is NOT a fallback: it must return
+the SAME `Some(Err)` the global-lock path produces
+(`stage32b_ipc_recv_invalid_cap_matches_old_path_error`).
+
+(c) **Classification:** NR 2 must pass the NR-only split gate and classify as
+`IpcRecvKernelTask` (`stage32b_ipc_recv_classify_nr2_eligible`); the arg-only
+`try_split_dispatch` must still defer IpcRecv to `None`
+(`stage32b_arg_only_dispatch_defers_ipc_recv`); IpcRecvTimeout (NR 5) must NOT be
+split-eligible (`stage32b_ipc_recv_timeout_nr_not_in_whitelist`,
+`stage32b_ipc_recv_timeout_nr_not_split_eligible`); IpcSend/IpcCall/IpcReply stay
+default-deny (`stage32b_ipc_send_call_reply_not_split_eligible`).
+
+(d) **ABI + NR-8 regression:** NR-8 split dispatch must still succeed
+(`stage32b_nr8_regression`); `SYSCALL_COUNT == 30`
+(`stage32b_syscall_count_30`); no syscall numbers added; Stages 12–32 behavior
+preserved. Telemetry markers must be low-noise (LIVE path only):
+`YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan|writeback result=ok`. All
+`stage32b_` tests must pass with `--test-threads=1`.
