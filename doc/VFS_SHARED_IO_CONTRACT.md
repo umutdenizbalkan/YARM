@@ -512,3 +512,79 @@ init/PM/supervisor/driver-manager policy, runtime service spawn order, ext4 writ
 read-side matrix. It does not enable IPC-backed FAT file mutation: only the FAT memory-image inline
 route and a standalone whole-sector FS-12 client are added. Kernel/global-lock work is untouched. No
 QEMU smoke is required because default production/shared-I/O behavior is unchanged.
+
+---
+
+## Stage 64 readiness audit (June 2026)
+
+### Scope
+
+This audit evaluates whether `recv_shared_v3` (NR 30, Stage 61+62) and the existing
+VFS shared-IO scaffold (FS-11 through FS-20) are ready for production use.
+No new Rust code is added; this section documents blockers only.
+
+### recv_shared_v3 map_intent=0 (plain receive)
+
+Stage 63 proved the plain-receive kernel dispatch path end-to-end:
+- `result_status = RECV_V3_STATUS_OK`
+- `transferred_cap` is materialized (DmaRegion cap)
+- `mapped_base = 0`, `cleanup_token = 0` (no mapping established)
+- No active transfer mapping registered
+- `RecvSharedV3Output` ABI struct decodes correctly
+- `RecvSharedV3Delivery::from_output()` produces `has_mapping() = false`
+
+### Readiness table
+
+| Capability | Status | Reason |
+|---|---|---|
+| `recv_shared_v3` plain receive (map_intent=0) | **Ready** | Proved in Stage 63; kernel dispatch + user-rt encode/decode both verified |
+| `recv_shared_v3` MAP_READ (map_intent=1) | **Ready** | Proved in Stage 61+62; mapping fields + cleanup_token populated correctly |
+| MAP_WRITE (map_intent=3) | **Blocked (intentional)** | Stage 60 RW gate hard-rejects; no plan to enable |
+| `VfsSharedIoLifecycle` state machine | **Helper-only** | Fully implemented; not connected to real kernel mapper |
+| `VfsSharedIoHandleTable<N>` | **Helper-only** | Correctly models exactly-once generation invalidation; userspace only |
+| `VfsSharedIoMapper` trait | **Helper-only** | `UnsupportedSharedIoMapper` for production; `BorrowedSharedIoTestMapper` for tests |
+| `WRITE_SHARED_REQUEST` (FS needs MAP_READ of caller buffer) | **Helper-only** | MAP_READ sufficient; but `VfsSharedBufferDescriptor.object_handle` is opaque and has no defined relationship to `recv_shared_v3`'s `cleanup_token` |
+| `READ_SHARED_REPLY` (FS needs MAP_WRITE to write into requester buffer) | **Blocked** | FS server would need MAP_WRITE of requester-owned memory; Stage 60 RW gate rejects `map_intent & WRITE != 0`; requires new kernel primitive |
+| Object type validation (MemoryObject vs DmaRegion vs other) | **Blocked** | `recv_shared_v3` writes `object_kind` to output but `VfsSharedBufferDescriptor` does not cross-reference it |
+| Effective rights validation | **Blocked** | `recv_shared_v3` writes `effective_rights` but no VFS code validates them |
+| Exact region length validation | **Blocked** | `exact_region_len` available from `recv_shared_v3` but not plumbed to VFS scaffold |
+| Requester-exit cleanup authority | **Blocked** | `VfsSharedIoTerminalReason::RequesterExit` exists in lifecycle; no kernel death notification |
+| Server-exit cleanup | **Blocked** | `VfsSharedIoTerminalReason::ServerExit` exists; no kernel signal |
+| Timeout/cancel | **Helper-only** | Terminal reason vocabulary complete; no kernel cancellation signal path |
+| Duplicate cleanup | **Ready** | `AlreadyCleaned` result; `recv_shared_v3` duplicate-release rejection also proved |
+| Inline fallback | **Helper-only** | Gated in lifecycle; no live dispatch path |
+| DmaRegion as buffer object type | **Helper-only** | `recv_shared_v3` fully supports DmaRegion; correct object for `WRITE_SHARED_REQUEST`; not wired to VFS scaffold |
+
+### Key blockers before Stage 65+66
+
+1. **`READ_SHARED_REPLY` MAP_WRITE**: requires a new kernel ABI that allows the FS receiver to map
+   requester-owned memory with write permission. The Stage 60 RW gate explicitly forbids this until
+   such an ABI is designed and reviewed. `WRITE_SHARED_REQUEST` (read-only for FS) does not require
+   this and is closer to ready.
+
+2. **`VfsSharedBufferDescriptor` ↔ `cleanup_token` binding**: `object_handle` in the descriptor is
+   opaque; it has no defined relationship to `recv_shared_v3`'s `cleanup_token`. A production wiring
+   must define how the receiver maps the descriptor handle to an active transfer record so that
+   `release_v3_cleanup_token` can be called at the right time.
+
+3. **Object introspection**: `recv_shared_v3` supplies `object_kind`, `effective_rights`, and
+   `exact_region_len`. The VFS scaffold does not validate these against the VFS request. A production
+   adapter must reject non-DmaRegion / non-MemoryObject caps and verify rights before granting access.
+
+4. **Process-exit and timeout signals**: the lifecycle state machine has terminal reasons for requester
+   exit, server exit, and timeout, but no kernel path notifies the FS server when the requester
+   terminates or a deadline expires. These are required for safe live operation.
+
+### Why VFS_SHARED_IO_ENABLED remains disabled
+
+Until blockers 1-4 are resolved (new kernel primitive for MAP_WRITE, defined descriptor-to-token
+binding, object introspection wiring, and process-exit/timeout signals), enabling
+`VFS_SHARED_IO_ENABLED` would expose:
+- no authoritative object type or rights check;
+- no safe memory ownership transfer for read replies;
+- no reliable cleanup on requester exit; and
+- potential double-free or stale mapping if the server continues using a buffer after the requester
+  has exited.
+
+`WRITE_SHARED_REQUEST` is closer to production-ready than `READ_SHARED_REPLY` because it requires
+only MAP_READ (already working), but the descriptor-to-token binding gap still applies.

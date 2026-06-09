@@ -11496,3 +11496,50 @@ array has zeros in positions 120-127.
 `stage61_syscall_count_still_31`,
 `stage61_vfs_shared_io_disabled`,
 `stage61_legacy_ipc_recv_unaffected`
+
+---
+
+## §70 Stage 63+64 — plain-receive adoption proof and VFS readiness audit
+
+### 70.1 Scope
+
+Stage 63 proves the recv_shared_v3 plain-receive kernel dispatch path (map_intent=0)
+end-to-end in hosted-dev. Stage 64 audits VFS shared-IO readiness against the
+recv_shared_v3 primitives now available.
+
+No new kernel code was added. All changes are:
+- `src/kernel/boot/tests.rs` — `mod stage63` (8 proof tests)
+- `crates/yarm-user-rt/src/syscall/recv_v3.rs` — 4 stage63 adoption tests
+- `doc/VFS_SHARED_IO_CONTRACT.md` — Stage 64 readiness audit
+
+### 70.2 Plain-receive output field invariants
+
+When recv_shared_v3 is dispatched with map_intent=0 (no mapping):
+- `result_status = RECV_V3_STATUS_OK`
+- `transferred_cap` is materialised (DmaRegion object_kind=5)
+- `mapped_base = 0`, `page_rounded_mapped_len = 0`, `actual_mapping_perm = 0`
+- `cleanup_token = RECV_V3_CLEANUP_TOKEN_NONE (0)`
+- No active transfer mapping is registered (`active_transfer_count == 0`)
+
+These are complementary to stage61_62 invariants (map_intent=1 path).
+
+### 70.3 VFS readiness conclusion (Stage 64)
+
+| Capability | Status |
+|---|---|
+| MAP_READ plain receive | Ready |
+| MAP_READ mapped receive + cleanup | Ready (Stage 61+62) |
+| MAP_WRITE | Blocked — RW gate |
+| WRITE_SHARED_REQUEST | Helper-only — descriptor↔token binding missing |
+| READ_SHARED_REPLY | Blocked — requires MAP_WRITE which is gated |
+| Process-exit/timeout/cancel signals | Blocked |
+
+VFS_SHARED_IO_ENABLED remains disabled. Full rationale in doc/VFS_SHARED_IO_CONTRACT.md §Stage 64.
+
+### 70.4 Invariants preserved
+
+- SYSCALL_COUNT = 31, NR 30 = RecvSharedV3, NR 4 = TransferRelease
+- VFS_SHARED_IO disabled
+- No MAP_WRITE enabled
+- No production service loops changed
+- No Drop-based cleanup added

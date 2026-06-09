@@ -3678,3 +3678,38 @@ in `yarm-user-rt` (14 in `recv_v3` + 3 in `shared_transfer`).
 - `cargo test --features hosted-dev stage60 --lib` (10 regression)
 
 All tests must pass.
+
+---
+
+### Rule N+60 — Stage 63+64: plain-receive adoption proof and VFS readiness
+
+**Coverage:** 8 kernel dispatch proof tests in `mod stage63`; 4 user-rt adoption tests in
+`yarm-user-rt`.
+
+**Kernel tests** (`src/kernel/boot/tests.rs`, `mod stage63`):
+- `stage63_plain_recv_result_status_ok`
+- `stage63_plain_recv_transferred_cap_present`
+- `stage63_plain_recv_mapped_base_zero`
+- `stage63_plain_recv_cleanup_token_zero`
+- `stage63_plain_recv_no_active_mapping_registered`
+- `stage63_plain_recv_from_output_via_abi_struct`
+- `stage63_syscall_count_still_31`
+- `stage63_vfs_shared_io_disabled`
+
+**User-rt adoption tests** (`crates/yarm-user-rt/src/syscall/recv_v3.rs`):
+- `stage63_adoption_encode_plain_recv_map_intent_zero`
+- `stage63_adoption_from_output_plain_recv_no_mapping`
+- `stage63_adoption_mapped_recv_delivery_differs_from_plain`
+- `stage63_adoption_encode_mapped_vs_plain_map_intent_differ`
+
+**VFS readiness:** Documented in `doc/VFS_SHARED_IO_CONTRACT.md` §Stage 64.
+No new Rust code in `yarm-fs-servers` (existing 207 tests unchanged).
+
+**Run commands:**
+- `cargo test --features hosted-dev "stage63::" --lib` (8 tests)
+- `cargo test -p yarm-user-rt --lib stage63` (4 tests)
+- `cargo test -p yarm-fs-servers --lib` (207 regression)
+- `cargo test --features hosted-dev "stage61_62::" --lib` (14 regression)
+- `cargo test --features hosted-dev "stage60::" --lib` (10 regression)
+
+All tests must pass.
