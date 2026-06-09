@@ -12,7 +12,8 @@ use super::shared_io_lifecycle::{
     VfsSharedIoDirection, VfsSharedIoHandleTable, VfsSharedIoLifecycle, VfsSharedIoLifecycleError,
 };
 use yarm_ipc_abi::vfs_abi::{
-    VFS_SHARED_BUFFER_FS_READ, VfsSharedBufferDescriptor, VfsWriteSharedRequest,
+    VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsReadSharedRequest,
+    VfsSharedBufferDescriptor, VfsWriteSharedRequest,
 };
 
 /// Gating constant for the WRITE_SHARED_REQUEST live route.
@@ -34,8 +35,6 @@ pub const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
 pub const VFS_SHARED_IO_ENABLED: bool =
     VFS_WRITE_SHARED_REQUEST_ENABLED && VFS_READ_SHARED_REPLY_ENABLED;
 
-#[cfg(test)]
-use yarm_ipc_abi::vfs_abi::VFS_SHARED_BUFFER_FS_WRITE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsSharedIoAdapterError {
@@ -313,6 +312,166 @@ impl VfsWriteSharedBinding {
     /// Returns `(generation, slot)` from the cleanup_token.
     ///
     /// `cleanup_token = (generation << 16) | slot_index` per the CapId encoding.
+    pub const fn cleanup_token_parts(&self) -> (u64, u64) {
+        (self.cleanup_token >> 16, self.cleanup_token & 0xFFFF)
+    }
+}
+
+// ── Stage 69+70: READ_SHARED_REPLY ↔ recv_shared_v3 MAP_WRITE binding ────────
+//
+// MAP_WRITE is currently rejected by the Stage 60 kernel gate
+// (`map_intent & WRITE != 0 → InvalidArgs`). This binding is helper-only:
+// tests exercise it via `BorrowedSharedIoTestMapper` which grants write access
+// without going through the kernel path. The kernel gate remains intact.
+
+/// Validation errors for the recv_shared_v3 → READ_SHARED_REPLY binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsReadSharedBindingError {
+    /// cleanup_token is 0 (RECV_V3_CLEANUP_TOKEN_NONE): no live mapping.
+    MissingCleanupToken,
+    /// transferred_cap is u64::MAX (RECV_V3_NO_TRANSFER_CAP): no cap transferred.
+    NoTransferCap,
+    /// actual_mapping_perm does not have the write bit set (perm & 0x2 == 0).
+    MappingNotWritable,
+    /// actual_mapping_perm has the execute bit set (perm & 0x4 != 0).
+    ExecutableMapping,
+    /// mapped_base is 0: mapping was not established.
+    MappingNotEstablished,
+    /// object_kind is not DmaRegion (5) or MemoryObject (1).
+    UnsupportedObjectKind,
+    /// descriptor.access is not VFS_SHARED_BUFFER_FS_WRITE.
+    WrongDescriptorAccess,
+    /// descriptor.object_handle does not equal cleanup_token.
+    DescriptorHandleMismatch,
+    /// descriptor.object_generation does not equal cleanup_token >> 16.
+    DescriptorGenerationMismatch,
+    /// page_rounded_mapped_len < buffer_offset + buffer_len.
+    MappingRangeTooShort,
+    /// exact_region_len is authoritative (> 0) and < buffer_offset + buffer_len.
+    ExactRegionLenInsufficient,
+    /// request_id is 0.
+    ZeroRequestId,
+}
+
+/// Helper-only validated binding between a `recv_shared_v3` MAP_WRITE delivery and a
+/// VFS `READ_SHARED_REPLY` descriptor.
+///
+/// ## Binding contract
+///
+/// The requester encodes the kernel cleanup_token into the descriptor as follows:
+/// - `descriptor.object_handle = cleanup_token` (the full 64-bit CapId)
+/// - `descriptor.object_generation = cleanup_token >> 16` (the generation part)
+///
+/// ## Constraints enforced
+///
+/// - `actual_mapping_perm & 0x2 != 0` (MAP_WRITE bit present).
+/// - `actual_mapping_perm & 0x4 == 0` (no execute bit).
+/// - `descriptor.access == VFS_SHARED_BUFFER_FS_WRITE`: FS writes into the buffer.
+/// - `descriptor.object_handle == cleanup_token`: binding cross-reference.
+/// - `page_rounded_mapped_len` covers the full descriptor range.
+/// - `exact_region_len` (if authoritative) covers the full descriptor range.
+///
+/// ## Kernel gate status
+///
+/// The Stage 60 kernel gate rejects `map_intent & WRITE != 0`. This struct is
+/// exercised only via the test mapper. Do not pass `actual_mapping_perm = 3` from a
+/// live recv_shared_v3 delivery until the gate is removed.
+pub struct VfsReadSharedBinding {
+    pub cleanup_token: u64,
+    pub transferred_cap: u64,
+    pub object_kind: u32,
+    pub exact_region_len: u64,
+    pub mapped_base: u64,
+    pub page_rounded_mapped_len: u64,
+    pub request_id: u64,
+    pub fd: u64,
+    pub file_offset: u64,
+    pub requested_len: u64,
+    descriptor: VfsSharedBufferDescriptor,
+}
+
+impl VfsReadSharedBinding {
+    const MAP_PERM_WRITE_BIT: u32 = 0x2;
+    const MAP_PERM_EXEC_BIT: u32 = 0x4;
+    const OBJECT_KIND_MEMORY_OBJECT: u32 = 1;
+    const OBJECT_KIND_DMA_REGION: u32 = 5;
+    const RECV_V3_CLEANUP_TOKEN_NONE: u64 = 0;
+    const RECV_V3_NO_TRANSFER_CAP: u64 = u64::MAX;
+
+    pub fn validate(
+        cleanup_token: u64,
+        transferred_cap: u64,
+        object_kind: u32,
+        exact_region_len: u64,
+        mapped_base: u64,
+        page_rounded_mapped_len: u64,
+        actual_mapping_perm: u32,
+        request: &VfsReadSharedRequest,
+    ) -> Result<Self, VfsReadSharedBindingError> {
+        use VfsReadSharedBindingError::*;
+
+        if cleanup_token == Self::RECV_V3_CLEANUP_TOKEN_NONE {
+            return Err(MissingCleanupToken);
+        }
+        if transferred_cap == Self::RECV_V3_NO_TRANSFER_CAP {
+            return Err(NoTransferCap);
+        }
+        if actual_mapping_perm & Self::MAP_PERM_WRITE_BIT == 0 {
+            return Err(MappingNotWritable);
+        }
+        if actual_mapping_perm & Self::MAP_PERM_EXEC_BIT != 0 {
+            return Err(ExecutableMapping);
+        }
+        if mapped_base == 0 {
+            return Err(MappingNotEstablished);
+        }
+        if object_kind != Self::OBJECT_KIND_MEMORY_OBJECT
+            && object_kind != Self::OBJECT_KIND_DMA_REGION
+        {
+            return Err(UnsupportedObjectKind);
+        }
+        let d = request.buffer;
+        if d.access != VFS_SHARED_BUFFER_FS_WRITE {
+            return Err(WrongDescriptorAccess);
+        }
+        if d.object_handle != cleanup_token {
+            return Err(DescriptorHandleMismatch);
+        }
+        if d.object_generation != cleanup_token >> 16 {
+            return Err(DescriptorGenerationMismatch);
+        }
+        let range_end = d
+            .buffer_offset
+            .checked_add(d.buffer_len)
+            .ok_or(MappingRangeTooShort)?;
+        if page_rounded_mapped_len < range_end {
+            return Err(MappingRangeTooShort);
+        }
+        if exact_region_len > 0 && exact_region_len < range_end {
+            return Err(ExactRegionLenInsufficient);
+        }
+        if request.request_id == 0 {
+            return Err(ZeroRequestId);
+        }
+        Ok(Self {
+            cleanup_token,
+            transferred_cap,
+            object_kind,
+            exact_region_len,
+            mapped_base,
+            page_rounded_mapped_len,
+            request_id: request.request_id,
+            fd: request.fd,
+            file_offset: request.file_offset,
+            requested_len: request.requested_len,
+            descriptor: d,
+        })
+    }
+
+    pub const fn descriptor(&self) -> VfsSharedBufferDescriptor {
+        self.descriptor
+    }
+
     pub const fn cleanup_token_parts(&self) -> (u64, u64) {
         (self.cleanup_token >> 16, self.cleanup_token & 0xFFFF)
     }

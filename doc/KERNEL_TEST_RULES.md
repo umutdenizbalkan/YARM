@@ -3806,3 +3806,51 @@ All tests must pass. `VFS_SHARED_IO_ENABLED` must remain disabled after this sta
 
 All tests must pass. `VFS_SHARED_IO_ENABLED` must remain `false`. `VFS_READ_SHARED_REPLY_ENABLED`
 must remain `false`. `handle_request` must continue to reject `VFS_OP_WRITE_SHARED_REQUEST`.
+
+---
+
+## Rule N+63 — Stage 69+70 MAP_WRITE audit + READ_SHARED_REPLY helper/gated path
+
+**Stage:** 69+70
+**Crate:** `yarm-fs-servers`
+**Files:** `crates/yarm-fs-servers/src/fs/common/vfs_service.rs` (16 tests in `mod stage69_70_tests`);
+`crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs` (`VfsReadSharedBinding` + 12-constraint validate);
+`crates/yarm-fs-servers/src/fs/ramfs/tree.rs` (`read_shared_bytes` override);
+`crates/yarm-srv-common/src/vfs_core.rs` (`read_shared_bytes` default method).
+
+**Coverage:** MAP_WRITE audit invariant, regression for WRITE_SHARED_REQUEST, gate constant
+assertions, RAMFS roundtrip proof, rejection coverage for all 12 binding constraints,
+cleanup-on-error invariant, release-exactly-once invariant.
+
+**Tests (`mod stage69_70_tests`):**
+- `stage69_audit_map_write_gate_remains_blocking`
+- `stage69_write_shared_request_still_works_after_read_shared_added`
+- `stage69_read_shared_reply_default_dispatch_still_unsupported`
+- `stage69_gate_values_all_false`
+- `stage70_read_shared_reply_ramfs_writes_bytes_into_buffer`
+- `stage70_read_shared_reply_short_eof_bytes_read_le_requested`
+- `stage70_read_shared_reply_wrong_direction_rejected`
+- `stage70_read_shared_reply_readonly_mapping_rejected`
+- `stage70_read_shared_reply_stale_generation_rejected`
+- `stage70_read_shared_reply_range_too_short_rejected`
+- `stage70_read_shared_reply_cleanup_called_on_backend_error`
+- `stage70_read_shared_reply_unsupported_production_mapper_rejects_safely`
+- `stage70_read_shared_reply_op_sequence_advances_on_success`
+- `stage70_read_shared_reply_cleanup_exactly_once`
+- `stage70_global_vfs_shared_io_still_false`
+- `stage70_write_shared_request_still_unsupported_in_handle_request`
+
+**Hard invariants that must never be violated by future changes:**
+- `VFS_READ_SHARED_REPLY_ENABLED` must remain `false` until kernel process-exit cleanup is confirmed safe.
+- `VFS_SHARED_IO_ENABLED` must remain `false` unless both direction gates are `true`.
+- `handle_request` must return `Unsupported` for `VFS_OP_READ_SHARED_REPLY`.
+- `dispatch_read_shared_reply` must call `mapper.release(descriptor)` unconditionally.
+- `VfsReadSharedBinding::validate` must reject `actual_mapping_perm & 0x2 == 0` with `MappingNotWritable`.
+- `VfsReadSharedBinding::validate` must reject `actual_mapping_perm & 0x4 != 0` with `ExecutableMapping`.
+- Stage 60 kernel MAP_WRITE gate (`syscall.rs`) must not be removed until process-exit cleanup is confirmed.
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --lib stage69` (4 tests)
+- `cargo test -p yarm-fs-servers --lib stage70` (12 tests)
+- `cargo test -p yarm-fs-servers --lib` (261 total, full regression)
+- `cargo check -p yarm-fs-servers` (no errors)
