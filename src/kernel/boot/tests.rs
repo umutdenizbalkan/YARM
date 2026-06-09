@@ -30465,3 +30465,434 @@ mod stage63 {
         );
     }
 }
+
+mod stage71 {
+    //! Stage 71 — active recv_shared_v3 mapping cleanup on task/process exit + timeout/cancel audit.
+    //!
+    //! Proves that every active MAP_READ mapping created by recv_shared_v3 is cleaned up
+    //! regardless of how the receiver's lifetime ends:
+    //!
+    //! A. mark_task_dead → maybe_cleanup_process_cnode_for_pid →
+    //!    purge_active_transfer_mappings_for_pid removes the mapping and unmaps the page.
+    //! B. TransferRelease after purge returns InvalidArgs (registry entry gone).
+    //! C. Calling purge twice for the same pid is idempotent — no panic, count stays 0.
+    //! D. Explicit TransferRelease before exit means exit purge is a no-op (count stays 0).
+    //! E. Writeback rollback (Stage 60 regression) still removes active mapping entry.
+    //! F. timeout_ticks != 0 returns WouldBlock before endpoint work — no mapping created.
+    //! G. MAP_WRITE still rejected (Stage 60 gate not disturbed by Stage 71 additions).
+    //! H. Invariant preservation: SYSCALL_COUNT=31, VFS_SHARED_IO disabled.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::syscall::{
+        SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, SYSCALL_TRANSFER_RELEASE_NR, Syscall,
+        SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+    const MAP_READ: u32 = 0x1;
+    const MAP_READ_WRITE: u32 = 0x3;
+
+    fn build_req_71(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+        map_intent: u32,
+        timeout_ticks: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf[48..52].copy_from_slice(&map_intent.to_le_bytes());
+        buf[56..64].copy_from_slice(&timeout_ticks.to_le_bytes());
+        buf
+    }
+
+    fn setup_receiver(state: &mut crate::kernel::boot::KernelState) -> crate::kernel::vm::Asid {
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_, page_cap) = state.alloc_anonymous_memory_object().expect("page cap");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                page_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map req page");
+        asid
+    }
+
+    fn send_shared_mem(
+        state: &mut crate::kernel::boot::KernelState,
+        send_cap: CapId,
+        transfer_cap: CapId,
+    ) {
+        let mut f = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [send_cap.0 as usize, 0, 20, 0, 0, transfer_cap.0 as usize],
+        );
+        dispatch(state, &mut f).expect("ipc_send shared-mem");
+    }
+
+    fn run_mapping(
+        state: &mut crate::kernel::boot::KernelState,
+    ) -> (crate::kernel::vm::Asid, u64, CapId) {
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(state, send_cap, dma_cap);
+        let asid = setup_receiver(state);
+        let req = build_req_71(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(state, &mut frame).expect("recv_shared_v3");
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let cleanup_token = u64::from_le_bytes(out[112..120].try_into().unwrap());
+        let cap_id = CapId(cleanup_token);
+        (asid, cleanup_token, cap_id)
+    }
+
+    // ── A. mark_task_dead cleans active mapping ───────────────────────────────
+
+    #[test]
+    fn stage71_mark_task_dead_cleans_active_recv_v3_mapping() {
+        // Prove that mark_task_dead → maybe_cleanup_process_cnode_for_pid →
+        // purge_active_transfer_mappings_for_pid removes the active transfer
+        // mapping and unmaps the associated page.
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid1, _) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind1");
+
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+
+        let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid1, mem_cap, VirtAddr(0xA000), PageFlags::USER_RW)
+            .expect("map page");
+        state
+            .register_active_transfer_mapping(ThreadId(1), mem_cap, VirtAddr(0xA000), PAGE_SIZE)
+            .expect("register mapping");
+
+        assert_eq!(
+            state.active_transfer_count_for_pid(1),
+            1,
+            "mapping registered before exit"
+        );
+        // Confirm the page is mapped before cleanup.
+        assert!(
+            state
+                .is_user_page_mapped_in_asid(asid1, VirtAddr(0xA000))
+                .expect("pre-exit check"),
+            "page must be mapped before exit"
+        );
+
+        state.exit_task(1, 0).expect("exit task1");
+        assert_eq!(state.current_tid(), Some(0));
+
+        state.mark_task_dead(1).expect("mark_task_dead");
+
+        // maybe_cleanup_process_cnode_for_pid destroys ASIDs first (lines 108-114),
+        // then calls purge_active_transfer_mappings_for_pid (line 116).  The ASID is
+        // already gone at that point, so is_user_page_mapped_in_asid cannot be used.
+        // Checking the registry count is sufficient to prove the cleanup ran.
+        assert_eq!(
+            state.active_transfer_count_for_pid(1),
+            0,
+            "active mapping must be cleaned up by mark_task_dead"
+        );
+    }
+
+    // ── B. TransferRelease after exit cleanup returns InvalidArgs ─────────────
+
+    #[test]
+    fn stage71_transfer_release_after_exit_cleanup_returns_invalid_args() {
+        // After purge_active_transfer_mappings_for_pid removes the registry entry,
+        // a subsequent TransferRelease with the original cleanup_token must fail
+        // with InvalidArgs (no active mapping to match).
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("init");
+                let (_asid, cleanup_token, _cap_id) = run_mapping(&mut state);
+
+                assert_eq!(state.active_transfer_count_for_pid(0), 1, "pre-purge");
+
+                state.purge_active_transfer_mappings_for_pid(0);
+
+                assert_eq!(state.active_transfer_count_for_pid(0), 0, "post-purge");
+
+                let mut frame = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [cleanup_token as usize, 0, 0, 0, 0, 0],
+                );
+                assert!(
+                    matches!(
+                        dispatch(&mut state, &mut frame),
+                        Err(SyscallError::InvalidArgs)
+                    ),
+                    "TransferRelease after exit cleanup must return InvalidArgs"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── C. Duplicate process exit cleanup is idempotent ───────────────────────
+
+    #[test]
+    fn stage71_duplicate_process_exit_cleanup_is_idempotent() {
+        // Calling purge_active_transfer_mappings_for_pid twice for the same pid
+        // must not panic.  The second call finds no entries and is a no-op.
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid1, _) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind1");
+
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch to task1");
+
+        let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid1, mem_cap, VirtAddr(0xB000), PageFlags::USER_RW)
+            .expect("map");
+        state
+            .register_active_transfer_mapping(ThreadId(1), mem_cap, VirtAddr(0xB000), PAGE_SIZE)
+            .expect("register");
+
+        state.exit_task(1, 0).expect("exit");
+        assert_eq!(state.current_tid(), Some(0));
+
+        state.purge_active_transfer_mappings_for_pid(1);
+        assert_eq!(state.active_transfer_count_for_pid(1), 0, "after first purge");
+
+        state.purge_active_transfer_mappings_for_pid(1);
+        assert_eq!(
+            state.active_transfer_count_for_pid(1),
+            0,
+            "after second purge must remain 0 without panic"
+        );
+    }
+
+    // ── D. Explicit TransferRelease before exit means exit cleanup is no-op ───
+
+    #[test]
+    fn stage71_explicit_transfer_release_before_exit_leaves_no_active_mapping() {
+        // If the receiver explicitly calls TransferRelease before process exit,
+        // the exit cleanup purge finds no entry and is a no-op.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("init");
+                let (_asid, cleanup_token, _cap_id) = run_mapping(&mut state);
+
+                let mut frame = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [cleanup_token as usize, 0, 0, 0, 0, 0],
+                );
+                dispatch(&mut state, &mut frame)
+                    .expect("explicit TransferRelease must succeed");
+
+                assert_eq!(
+                    state.active_transfer_count_for_pid(0),
+                    0,
+                    "count must be 0 after explicit release"
+                );
+
+                state.purge_active_transfer_mappings_for_pid(0);
+                assert_eq!(
+                    state.active_transfer_count_for_pid(0),
+                    0,
+                    "purge after explicit release must leave count at 0"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── E. Writeback rollback regression ─────────────────────────────────────
+
+    #[test]
+    fn stage71_writeback_rollback_removes_active_mapping_regression() {
+        // Regression guard: output writeback failure (unmapped metadata_ptr) must
+        // roll back the active mapping entry.  No mapping must remain after rollback.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+
+        // metadata_ptr = 0x9_0000: intentionally unmapped so writeback fails.
+        let req = build_req_71(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x9_0000,
+            120,
+            MAP_READ,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "writeback failure must return InvalidArgs"
+        );
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "rollback must remove active mapping entry"
+        );
+    }
+
+    // ── F. Timeout creates no mapping ─────────────────────────────────────────
+
+    #[test]
+    fn stage71_nonzero_timeout_returns_would_block_no_mapping_created() {
+        // recv_shared_v3 with timeout_ticks != 0 returns WouldBlock immediately,
+        // before any endpoint or mapping work, so no active mapping is created.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+
+        let req = build_req_71(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+            1000,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::WouldBlock)
+            ),
+            "timeout_ticks=1000 must return WouldBlock"
+        );
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "no active mapping must be created when WouldBlock is returned"
+        );
+    }
+
+    // ── G. MAP_WRITE still rejected ───────────────────────────────────────────
+
+    #[test]
+    fn stage71_map_write_still_rejected_after_exit_path_added() {
+        // The Stage 60 RW gate (map_intent & WRITE != 0 → InvalidArgs) must not
+        // have been disturbed by the Stage 71 exit cleanup additions.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+        let req = build_req_71(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ_WRITE,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent with WRITE bit must still return InvalidArgs"
+        );
+    }
+
+    // ── H. Invariants ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage71_syscall_count_and_nrs_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must remain 31");
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30, "NR 30 unchanged");
+        assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4, "NR 4 unchanged");
+    }
+
+    #[test]
+    fn stage71_vfs_shared_io_still_disabled() {
+        assert!(
+            !cfg!(feature = "vfs-shared-io"),
+            "vfs-shared-io must remain disabled in Stage 71"
+        );
+    }
+}

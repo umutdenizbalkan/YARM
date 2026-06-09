@@ -11680,3 +11680,64 @@ writable shared mapping could outlive a dead process. Gate removal requires:
 - No Drop-based cleanup added
 - FAT/ext4/blkcache production read/write behavior unchanged
 - No SpawnV5/Phase2B/Phase3B/startup slot changes
+
+---
+
+## §74 Stage 71 — active recv_shared_v3 mapping cleanup on task/process exit + timeout/cancel
+
+### 74.1 Scope
+
+Stage 71 audits and proves that every active MAP_READ mapping created by `recv_shared_v3`
+is cleaned up regardless of how the receiver's lifetime ends.  No new production kernel code
+was added; only tests and documentation.
+
+### 74.2 Cleanup paths confirmed
+
+| Path | Code location | Status |
+|---|---|---|
+| Explicit `TransferRelease` | `syscall.rs` `handle_transfer_release` | Confirmed — removes registry entry, unmaps, revokes cap |
+| Writeback rollback | `syscall.rs` ~4559-4604 | Confirmed — removes registry entry, unmaps, revokes cap |
+| Task/process exit | `restart_state.rs` `mark_task_dead` → `cnode_state.rs` `maybe_cleanup_process_cnode_for_pid` → `purge_active_transfer_mappings_for_pid` | **Confirmed** (Stage 71 audit) |
+| Cap revocation | `cnode_state.rs` `revoke_active_transfer_mappings_for_cap` | Confirmed |
+| Timeout (`timeout_ticks != 0`) | `syscall.rs` ~4252-4254 | Confirmed — `WouldBlock` returned before endpoint/mapping work; no mapping created |
+| Cancel / `RECV_V3_MAP_WRITE` gate | `syscall.rs` ~4266-4269 | Confirmed — `InvalidArgs` returned before mapping; no entry created |
+
+### 74.3 Call chain: process-exit cleanup
+
+```
+mark_task_dead(pid)
+  └─ maybe_cleanup_process_cnode_for_pid(pid)          [cnode_state.rs:67]
+       ├─ destroy ASIDs                                 [cnode_state.rs:108-114]
+       ├─ purge_transfer_envelopes_for_pid(pid)         [cnode_state.rs:115]
+       └─ purge_active_transfer_mappings_for_pid(pid)  [cnode_state.rs:116]
+            ├─ for each slot: find entries where owner_pid == pid
+            ├─ unmap_range_two_phase(asid, base, len)  tolerates absent pages/ASIDs
+            ├─ active_transfer_mappings[idx] = None
+            ├─ note_shared_mem_released(len)
+            ├─ revoke_capability_in_cnode(cnode, transfer_cap)
+            └─ note_transfer_record_revoked()
+```
+
+### 74.4 Lock ordering
+
+`purge_active_transfer_mappings_for_pid` holds ipc_state (rank 3) only transiently via
+`with_ipc_state` / `with_ipc_state_mut` closures; the lock is released before any
+rank-4 (capability_state) acquisition in `revoke_capability_in_cnode`.  No nested
+rank-3 + rank-4 hold occurs.  Lock ordering is not violated.
+
+### 74.5 Idempotency
+
+Calling `purge_active_transfer_mappings_for_pid` twice for the same pid is safe:
+the second call finds no entries and is a no-op.  `unmap_range_two_phase` also
+tolerates already-unmapped pages (silently skips them).
+
+### 74.6 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- NR 30 = `RecvSharedV3` (no change)
+- NR 4 = `TransferRelease` (no change)
+- All `recv_shared_v3` ABI field offsets unchanged
+- MAP_WRITE not enabled — Stage 60 gate intact
+- `VFS_SHARED_IO_ENABLED = false`
+- No Drop-based cleanup added
+- No SpawnV5/Phase2B/Phase3B/startup slot changes
