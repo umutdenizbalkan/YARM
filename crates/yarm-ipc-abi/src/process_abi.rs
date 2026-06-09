@@ -31,6 +31,31 @@ pub const PROC_OP_SPAWN_V5_CAP: u16 = 11;
 /// restart-token population is wired.
 pub const PROC_OP_LIFECYCLE_QUERY: u16 = 12;
 
+/// Stage 76: PM → VFS one-way push notification: a task has exited.
+///
+/// Payload: [`PmTaskExitedEvent`] (16 bytes, LE).
+/// This is a push-only opcode — PM sends it, VFS receives and handles it.
+/// No reply is expected or sent.
+///
+/// Production blocker: PM does not currently receive task-exit events from the
+/// kernel, and no PM→VFS send cap exists in the startup handoff.
+/// See `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` for the two-part blocker record.
+pub const PROC_OP_TASK_EXITED: u16 = 13;
+
+/// Stage 76: PM → VFS one-way push notification: a process (all threads) has exited.
+///
+/// Payload: [`PmProcessExitedEvent`] (16 bytes, LE).
+/// Push-only opcode: PM sends, VFS handles.  No reply.
+///
+/// Semantics: process-level exit covers all threads belonging to the process
+/// identified by `process_tid`.  VFS must clean up all lifecycles whose
+/// `requester_tid` matches any thread in that process.  In the current helper model
+/// (Stage 76) VFS only has per-tid granularity; process-level clean-up is a future
+/// extension once a process→tid membership table is available.
+///
+/// Production blocker: same as [`PROC_OP_TASK_EXITED`].
+pub const PROC_OP_PROCESS_EXITED: u16 = 14;
+
 /// `state` value for a service that was spawned and is running.
 pub const LIFECYCLE_STATE_SPAWNED: u8 = 0;
 
@@ -682,6 +707,104 @@ impl ProcV2Args {
         Ok(Self {
             arg0: u64::from_le_bytes(a0),
             arg1: u64::from_le_bytes(a1),
+        })
+    }
+}
+
+// ── Stage 76: PM-owned lifecycle push notifications ────────────────────────────
+
+/// Stage 76: payload for [`PROC_OP_TASK_EXITED`] — PM → VFS push notification.
+///
+/// Wire layout (16 bytes LE):
+/// ```text
+/// [0..8]   tid:       u64 LE — TID of the exited task
+/// [8..16]  exit_code: u64 LE — task exit code
+/// ```
+///
+/// PM sends this to VFS when a tracked task exits. VFS calls
+/// `deliver_requester_exit_if_tid_matches(tid, handles)` on each active lifecycle.
+/// No reply is sent by VFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmTaskExitedEvent {
+    pub tid: u64,
+    pub exit_code: u64,
+}
+
+impl PmTaskExitedEvent {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn new(tid: u64, exit_code: u64) -> Self {
+        Self { tid, exit_code }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..8].copy_from_slice(&self.tid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.exit_code.to_le_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut tid = [0u8; 8];
+        let mut code = [0u8; 8];
+        tid.copy_from_slice(&payload[..8]);
+        code.copy_from_slice(&payload[8..16]);
+        Ok(Self {
+            tid: u64::from_le_bytes(tid),
+            exit_code: u64::from_le_bytes(code),
+        })
+    }
+}
+
+/// Stage 76: payload for [`PROC_OP_PROCESS_EXITED`] — PM → VFS push notification.
+///
+/// Wire layout (16 bytes LE):
+/// ```text
+/// [0..8]   process_tid: u64 LE — root TID identifying the process
+/// [8..16]  exit_code:   u64 LE — process exit code
+/// ```
+///
+/// Sent when an entire process (all threads) has exited.  VFS must clean up all
+/// active lifecycles whose `requester_tid` matches `process_tid`.  In Stage 76
+/// this is handled at per-tid granularity; a process→thread membership table is
+/// a future extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmProcessExitedEvent {
+    pub process_tid: u64,
+    pub exit_code: u64,
+}
+
+impl PmProcessExitedEvent {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn new(process_tid: u64, exit_code: u64) -> Self {
+        Self {
+            process_tid,
+            exit_code,
+        }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..8].copy_from_slice(&self.process_tid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.exit_code.to_le_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut ptid = [0u8; 8];
+        let mut code = [0u8; 8];
+        ptid.copy_from_slice(&payload[..8]);
+        code.copy_from_slice(&payload[8..16]);
+        Ok(Self {
+            process_tid: u64::from_le_bytes(ptid),
+            exit_code: u64::from_le_bytes(code),
         })
     }
 }
