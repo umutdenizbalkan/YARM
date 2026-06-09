@@ -588,3 +588,73 @@ binding, object introspection wiring, and process-exit/timeout signals), enablin
 
 `WRITE_SHARED_REQUEST` is closer to production-ready than `READ_SHARED_REPLY` because it requires
 only MAP_READ (already working), but the descriptor-to-token binding gap still applies.
+
+---
+
+## Stage 65 — WRITE_SHARED_REQUEST binding to recv_shared_v3 MAP_READ
+
+### Scope
+
+Stage 65 defines the **binding contract** between a `recv_shared_v3` MAP_READ delivery and a VFS
+`WRITE_SHARED_REQUEST` descriptor, and implements a **helper-only** `VfsWriteSharedBinding` type
+that validates the cross-reference. No live VFS dispatch is changed. `VFS_SHARED_IO_ENABLED` remains
+disabled. `READ_SHARED_REPLY` remains blocked (requires MAP_WRITE). MAP_WRITE is not enabled.
+
+### Binding contract
+
+When a VFS `WRITE_SHARED_REQUEST` arrives, the requester must have previously called
+`recv_shared_v3` with `map_intent=1 (MAP_READ)`. The kernel populates `cleanup_token` as a full
+`u64` CapId value (`(generation << 16) | slot_index`).
+
+The binding contract is:
+
+```
+descriptor.object_handle     = cleanup_token          (full u64 CapId)
+descriptor.object_generation = cleanup_token >> 16    (generation field only)
+```
+
+`VfsWriteSharedBinding::validate()` enforces this by recomputing `expected_gen = cleanup_token >> 16`
+and comparing it to `descriptor.object_generation`. This provides a two-field cross-reference so
+that a stale or wrong-generation descriptor fails independently of a handle collision.
+
+### Constraints enforced by `VfsWriteSharedBinding::validate()`
+
+| Constraint | Error variant |
+|---|---|
+| `cleanup_token != 0` (token present) | `MissingCleanupToken` |
+| `transferred_cap != 0` (cap materialised) | `NoTransferCap` |
+| `actual_mapping_perm == MAP_PERM_READ_ONLY (1)` | `MappingNotReadOnly` |
+| `mapped_base != 0` (mapping established) | `MappingNotEstablished` |
+| `object_kind == OBJECT_KIND_DMA_REGION` | `UnsupportedObjectKind` |
+| `descriptor.access_flags & VFS_SHARED_BUFFER_FS_READ != 0` | `WrongDescriptorAccess` |
+| `descriptor.object_handle == cleanup_token` | `DescriptorHandleMismatch` |
+| `descriptor.object_generation == cleanup_token >> 16` | `DescriptorGenerationMismatch` |
+| `page_rounded_mapped_len >= exact_region_len` | `MappingRangeTooShort` |
+| `exact_region_len > 0` | `ExactRegionLenInsufficient` |
+| `request_id != 0` | `ZeroRequestId` |
+
+All 11 checks must pass. The first failing check returns immediately.
+
+### What remains blocked
+
+- `READ_SHARED_REPLY` is still blocked (requires MAP_WRITE, which the Stage 60 RW gate forbids).
+- MAP_WRITE is not enabled.
+- Live VFS dispatch still uses `UnsupportedSharedIoMapper`.
+- Process-exit and timeout signals are still unimplemented.
+
+### Test coverage
+
+21 `stage65_*` tests in `crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs`:
+
+- 11 rejection tests (one per error variant)
+- 1 acceptance test (`stage65_valid_write_shared_binding_accepted`)
+- 1 RAMFS roundtrip (`stage65_ramfs_consumes_immutable_bytes_via_binding_and_mapper`)
+- 1 direction-safety proof (`stage65_mapper_rejects_write_access_to_write_request_buffer`)
+- 1 lifecycle idempotency (`stage65_cleanup_idempotent_after_success`)
+- 1 fallback-gate (`stage65_cleanup_before_fallback_required_for_write_request`)
+- 1 production-mapper rejection (`stage65_production_mapper_rejects_write_shared_request`)
+- 1 READ_SHARED_REPLY still-blocked (`stage65_read_shared_reply_still_unsupported_by_production_mapper`)
+- 1 VFS_SHARED_IO disabled invariant (`stage65_vfs_shared_io_enabled_remains_disabled`)
+- 1 `cleanup_token_parts()` correctness (`stage65_cleanup_token_parts_decompose_correctly`)
+
+Total `yarm-fs-servers` tests after Stage 65: **228** (up from 207).
