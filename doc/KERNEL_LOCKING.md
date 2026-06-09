@@ -11031,3 +11031,174 @@ These are always zero in current responses (kernel gate not lifted).
 - Define output write failure rollback order.
 - Specify `attenuate_transfer_cap_for_recv_intent` + materialized cap interaction.
 - No production service loop uses recv_shared_v3.
+
+---
+
+## §66 Stage 56+57 — recv_shared_v3 cleanup-token lifecycle design + helper-only registry
+
+### 66.1 Scope
+
+Stage 56+57 designs and scaffolds the cleanup-token lifecycle for future
+`recv_shared_v3` map_intent / shared-memory mapping.  No live mapping is
+enabled; no VM is mutated; the map_intent gate remains disabled.
+
+### 66.2 Cleanup identity audit
+
+The following table classifies every field required to perform a correct
+cleanup of a receive-time shared-memory mapping.
+
+| Field | Classification |
+|---|---|
+| `receiver_tid` | Available now |
+| `receiver_asid` | Available now |
+| `receiver_local_cap` | Available now (after cap materialisation) |
+| `object_kind` | Available now |
+| `object_generation` | Available now |
+| `exact_region_len` | Available now (embedded in DmaRegion cap) |
+| `map_intent` | Available now (from request) |
+| `mapped_base` | Available after live mapping |
+| `mapped_len` | Available after live mapping |
+| `actual_mapping_perm` | Available after live mapping |
+| request/output generation | Not needed (cleanup token serves this role) |
+
+### 66.3 Helper-only types (src/kernel/recv_core.rs, mod recv_shared_v3)
+
+All types below are **helper-only**: no live syscall path creates, reads, or
+releases any of them.
+
+#### RecvV3CleanupIdentity
+
+Full kernel-internal cleanup identity with 10 fields covering both
+"available now" and "available after live mapping" categories.  Two methods:
+- `zeroed()` — `const fn` sentinel with `receiver_local_cap = u64::MAX`.
+- `is_mapped()` — `true` iff `mapped_base != 0 && mapped_len != 0`.
+
+#### RecvV3CleanupToken
+
+Opaque `u64` wrapper.  Encoding: `(slot_index + 1) | (generation << 16)`.
+
+- Bits 0..15: `slot_index + 1` (1-based; 0 = NONE sentinel).
+- Bits 16..47: per-slot generation counter (starts at 1 on first allocation;
+  skips 0 on wrapping).
+- `NONE` (0) is the sentinel for "no active mapping".
+- `is_valid()` — true iff raw != 0.
+- `raw()` — u64 for writing to `RecvSharedV3Output::cleanup_token`.
+
+#### RecvV3CleanupReleaseResult
+
+```
+Released        — slot freed successfully
+AlreadyReleased — same token, same generation, slot already free
+InvalidToken    — zero slot index or index ≥ capacity
+StaleGeneration — slot was recycled (generation advanced) since this token was issued
+```
+
+#### RecvV3CleanupRegistry
+
+Fixed-capacity (`RECV_V3_CLEANUP_REGISTRY_CAPACITY = 16`) no-heap registry.
+
+- `new()` — `const fn`, all slots empty (generation=0).
+- `allocate(identity)` — increments per-slot generation, sets `occupied`,
+  returns `Some(token)`; `None` when full.
+- `release(token)` — checks index, generation, occupied; returns
+  `RecvV3CleanupReleaseResult`.
+- `lookup(token)` — returns `Option<&RecvV3CleanupIdentity>`.
+- `count_occupied()` — number of currently occupied slots.
+
+### 66.4 Generation/stale semantics
+
+- Generation is incremented **on allocation** (not on release).
+- Duplicate release of an unrecycled slot → `AlreadyReleased` (generation
+  matches, slot not occupied).
+- After a new allocation on the same slot, old tokens → `StaleGeneration`
+  (generation no longer matches).
+- Generation never reaches 0 (wraps to 1), ensuring the token encoding
+  `slot_index_plus_one | (generation << 16)` is always nonzero for valid
+  tokens.
+
+### 66.5 ABI crate expansion (crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs)
+
+`RecvSharedV3CleanupIdentity` expanded with four post-mapping fields:
+- `mapped_base: u64` — mapped VA (0 until live mapping).
+- `mapped_len: u64` — page-rounded length (0 until live mapping).
+- `actual_mapping_perm: u32` — permissions granted (0 until live mapping).
+- `map_intent: u32` — flags from the request (available now).
+
+New method: `is_mapped()` — `true` iff `mapped_base != 0 && mapped_len != 0`.
+
+`none()` zeros all new fields.  `is_structurally_valid()` is unchanged (it
+tests pre-mapping fields only).  `is_active()` is unchanged (tests
+`transfer_token != 0`).
+
+### 66.6 map_intent gate unchanged
+
+The gate at `syscall.rs` (`if req.map_intent != 0 → InvalidArgs`) remains in
+place.  No `RecvV3CleanupRegistry` slot is ever occupied in the live path.
+
+### 66.7 Kernel write window unchanged
+
+`write_v3_output_to_user` writes a `[0u8; 88]` local array capped at
+`min(out_len, 88)` bytes.  Fields at offsets ≥ 88 (`mapped_base`, `cleanup_token`)
+are provably never written in the current stage.
+
+### 66.8 Proven assertions
+
+**(A) mod stage56 — 14 kernel tests (src/kernel/boot/tests.rs):**
+
+Token invariants: `stage56_token_none_is_invalid`
+
+Allocation: `stage56_allocate_gives_nonzero_token`,
+`stage56_token_encodes_slot_and_generation`
+
+Release: `stage56_release_valid_token_gives_released`,
+`stage56_duplicate_release_gives_already_released`,
+`stage56_stale_token_after_realloc_gives_stale_generation`,
+`stage56_none_token_gives_invalid_token`
+
+Capacity: `stage56_registry_full_returns_none`, `stage56_fill_release_refill`
+
+Lookup: `stage56_lookup_returns_correct_identity`,
+`stage56_lookup_after_release_returns_none`
+
+Independence: `stage56_two_slots_are_independent`
+
+Integration: `stage56_integration_map_plan_to_identity_and_token`,
+`stage56_rw_plan_to_identity_is_not_read_only`
+
+**(B) mod stage57 — 8 kernel tests (src/kernel/boot/tests.rs):**
+
+Syscall numbering: `stage57_syscall_count_still_31_and_nr_still_30`
+
+Gate: `stage57_map_intent_read_only_gate_still_disabled`,
+`stage57_map_intent_read_write_gate_still_disabled`
+
+Write window / no mapping: `stage57_plain_receive_write_window_is_88_no_mapping_fields`,
+`stage57_memory_object_transfer_no_mapping_output`,
+`stage57_dma_region_transfer_no_mapping_output`
+
+Token sentinel: `stage57_cleanup_token_none_matches_abi_sentinel`,
+`stage57_new_registry_has_zero_occupied_slots`
+
+**(C) ABI crate — 5 new tests (crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs):**
+
+`abi_cleanup_identity_none_has_all_new_fields_zero`,
+`abi_cleanup_identity_is_mapped_false_in_none`,
+`abi_cleanup_identity_is_mapped_requires_both_base_and_len`,
+`abi_cleanup_identity_is_active_and_is_mapped_are_independent`,
+`abi_cleanup_identity_full_round_trip`
+
+### 66.9 FUTURE / remaining blockers before map_intent live enablement
+
+1. Resolve `map_intent != 0` semantics for non-OPCODE_SHARED_MEM messages.
+2. Define output write failure rollback order (mapping established but
+   writeback fails).
+3. Specify `attenuate_transfer_cap_for_recv_intent` + materialized-cap
+   interaction.
+4. Extend `write_v3_output_to_user` write window to cover `mapped_base @88`,
+   `page_rounded_mapped_len @96`, `actual_mapping_perm @104`, and
+   `cleanup_token @112`.
+5. Wire `RecvV3CleanupRegistry` into the live dispatch path under a per-CPU
+   or per-process lock.
+6. Implement process-exit hook to call `purge_active_transfer_mappings_for_pid`
+   on every occupied slot for the exiting process.
+7. No production service loop uses recv_shared_v3.
