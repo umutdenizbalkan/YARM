@@ -57,28 +57,46 @@ pub const RECV_V3_STATUS_BAD_REQUEST: u32 = 4;
 
 // ── Object kind ──────────────────────────────────────────────────────────────
 
-/// Kind of a transferred capability.
+/// Kind of a transferred capability (available from Stage 47+48).
 ///
-/// All variants other than [`Unknown`](Self::Unknown) are **FUTURE
-/// (unavailable)**: the kernel does not populate
-/// `RecvSharedV3Output::object_kind` in Stage 40+41.  The field is always
-/// zero (`Unknown`) until object introspection is added.
+/// Populated in `RecvSharedV3Output::object_kind` whenever a cap is
+/// materialized.  [`Unknown`](Self::Unknown) (0) is written when no
+/// capability was transferred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RecvSharedV3ObjectKind {
-    /// Unknown / unavailable — field value 0.  Default in this stage.
+    /// No capability transferred, or kind is genuinely unrecognised.
     Unknown = 0,
-    /// FUTURE: the transferred cap is a memory object.
+    /// The transferred cap wraps a memory object (anonymous or file-backed).
     MemoryObject = 1,
-    /// FUTURE: the transferred cap is an endpoint.
+    /// The transferred cap wraps an IPC endpoint.
     Endpoint = 2,
-    /// FUTURE: the transferred cap is a reply capability.
+    /// The transferred cap is a one-shot reply capability.
     ReplyCap = 3,
-    /// FUTURE: the transferred cap is a notification object.
+    /// The transferred cap wraps a notification object.
     Notification = 4,
-    /// FUTURE: other or unrecognised kind (forward-compatibility sentinel).
+    /// Other or forward-compatibility kind not listed above.
     Other = 0xFF,
 }
+
+// ── Effective-rights bit constants ────────────────────────────────────────────
+
+/// Effective-rights bit: receiver may read from the transferred object.
+pub const RECV_V3_CAP_RIGHTS_READ: u32 = 0x01;
+/// Effective-rights bit: receiver may write to the transferred object.
+pub const RECV_V3_CAP_RIGHTS_WRITE: u32 = 0x02;
+/// Effective-rights bit: receiver may map the transferred object into its address space.
+pub const RECV_V3_CAP_RIGHTS_MAP: u32 = 0x04;
+/// Effective-rights bit: receiver may send on the transferred endpoint.
+pub const RECV_V3_CAP_RIGHTS_SEND: u32 = 0x08;
+/// Effective-rights bit: receiver may receive on the transferred endpoint.
+pub const RECV_V3_CAP_RIGHTS_RECEIVE: u32 = 0x10;
+/// Effective-rights bit: receiver may use the transferred cap for scheduling.
+pub const RECV_V3_CAP_RIGHTS_SCHEDULE: u32 = 0x20;
+/// Effective-rights bit: receiver may signal on the transferred notification.
+pub const RECV_V3_CAP_RIGHTS_SIGNAL: u32 = 0x40;
+/// Effective-rights bit: receiver may wait on the transferred notification.
+pub const RECV_V3_CAP_RIGHTS_WAIT: u32 = 0x80;
 
 impl RecvSharedV3ObjectKind {
     /// Convert a raw u32 field value, returning [`Unknown`](Self::Unknown) for
@@ -217,14 +235,19 @@ pub struct RecvSharedV3Output {
     /// [`RECV_V3_NO_TRANSFER_CAP`] if none transferred.
     pub transferred_cap: u64,
 
-    // ── FUTURE: object introspection ──────────────────────────────────────
-    /// **FUTURE (unavailable)**: transferred object kind; 0 now.
+    // ── Object introspection (Stage 47+48) ───────────────────────────────
+    /// Transferred capability kind; [`RecvSharedV3ObjectKind::Unknown`] (0) if none.
+    /// Populated whenever a cap is materialized (Stage 47+48).
     pub object_kind: u32,
-    /// **FUTURE (unavailable)**: transferred object generation; 0 now.
+    // 4 bytes C-layout padding for u64 alignment follow object_kind (offset 44-47).
+    /// Transferred capability object generation; 0 if unavailable (e.g. MemoryObject).
+    /// Populated for Endpoint / Notification / Reply caps; 0 for MemoryObject.
     pub object_generation: u64,
-    /// **FUTURE (unavailable)**: effective rights on transferred cap; 0 now.
+    /// Effective rights on the receiver-local transferred cap (`CapRights::bits` as u32).
+    /// 0 if no capability was transferred.
     pub effective_rights: u32,
-    /// **FUTURE (unavailable)**: exact object size in bytes; 0 now.
+    // 4 bytes C-layout padding for u64 alignment follow effective_rights (offset 60-63).
+    /// **FUTURE (unavailable)**: exact object size in bytes; always 0 now.
     pub exact_object_size: u64,
 
     // ── Shared-memory mapping (available after VM mapping on split path) ──
@@ -282,6 +305,25 @@ impl RecvSharedV3Output {
         RecvSharedV3ObjectKind::from_raw(self.object_kind)
     }
 }
+
+// ── Layout assertions ─────────────────────────────────────────────────────────
+
+// Verify that the #[repr(C)] struct field offsets match the byte positions
+// that write_v3_output_to_user writes.  These must agree with the 80-byte raw
+// buffer written by the kernel to the user's metadata_ptr.
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(RecvSharedV3Output, version) == 0);
+    assert!(offset_of!(RecvSharedV3Output, sender_tid) == 16);
+    assert!(offset_of!(RecvSharedV3Output, transferred_cap) == 32);
+    assert!(offset_of!(RecvSharedV3Output, object_kind) == 40);
+    // 4 bytes padding at 44-47 for u64 alignment
+    assert!(offset_of!(RecvSharedV3Output, object_generation) == 48);
+    assert!(offset_of!(RecvSharedV3Output, effective_rights) == 56);
+    // 4 bytes padding at 60-63 for u64 alignment
+    assert!(offset_of!(RecvSharedV3Output, exact_object_size) == 64);
+    assert!(offset_of!(RecvSharedV3Output, region_offset) == 72);
+};
 
 // ── Validation ────────────────────────────────────────────────────────────────
 
@@ -365,28 +407,40 @@ mod tests {
     fn abi_bad_version_rejected() {
         let mut req = minimal_req();
         req.version = 0;
-        assert_eq!(validate_request(&req), Err(RecvSharedV3ValidationError::BadVersion));
+        assert_eq!(
+            validate_request(&req),
+            Err(RecvSharedV3ValidationError::BadVersion)
+        );
     }
 
     #[test]
     fn abi_short_record_rejected() {
         let mut req = minimal_req();
         req.record_len = RECV_V3_MIN_REQUEST_LEN - 1;
-        assert_eq!(validate_request(&req), Err(RecvSharedV3ValidationError::ShortRecord));
+        assert_eq!(
+            validate_request(&req),
+            Err(RecvSharedV3ValidationError::ShortRecord)
+        );
     }
 
     #[test]
     fn abi_nonzero_reserved_rejected() {
         let mut req = minimal_req();
         req.reserved[1] = 42;
-        assert_eq!(validate_request(&req), Err(RecvSharedV3ValidationError::NonzeroReserved));
+        assert_eq!(
+            validate_request(&req),
+            Err(RecvSharedV3ValidationError::NonzeroReserved)
+        );
     }
 
     #[test]
     fn abi_nonzero_flags_rejected() {
         let mut req = minimal_req();
         req.flags = 1;
-        assert_eq!(validate_request(&req), Err(RecvSharedV3ValidationError::NonzeroReserved));
+        assert_eq!(
+            validate_request(&req),
+            Err(RecvSharedV3ValidationError::NonzeroReserved)
+        );
     }
 
     #[test]
@@ -394,7 +448,10 @@ mod tests {
         let mut req = minimal_req();
         req.map_intent = RECV_V3_MAP_READ;
         req.metadata_ptr = 0;
-        assert_eq!(validate_request(&req), Err(RecvSharedV3ValidationError::MetaMapIntentConflict));
+        assert_eq!(
+            validate_request(&req),
+            Err(RecvSharedV3ValidationError::MetaMapIntentConflict)
+        );
     }
 
     #[test]
@@ -402,19 +459,28 @@ mod tests {
         let mut req = minimal_req();
         req.map_intent = 0x10;
         req.metadata_ptr = 0x2000;
-        assert_eq!(validate_request(&req), Err(RecvSharedV3ValidationError::BadMapIntent));
+        assert_eq!(
+            validate_request(&req),
+            Err(RecvSharedV3ValidationError::BadMapIntent)
+        );
     }
 
     #[test]
     fn abi_read_only_map_intent_accepted() {
-        let req = RecvSharedV3Request::new_with_metadata(1, 0x1000, 128, 0x2000, 80, RECV_V3_MAP_READ);
+        let req =
+            RecvSharedV3Request::new_with_metadata(1, 0x1000, 128, 0x2000, 80, RECV_V3_MAP_READ);
         assert_eq!(validate_request(&req), Ok(()));
     }
 
     #[test]
     fn abi_read_write_map_intent_accepted() {
         let req = RecvSharedV3Request::new_with_metadata(
-            1, 0x1000, 128, 0x2000, 80, RECV_V3_MAP_READ | RECV_V3_MAP_WRITE,
+            1,
+            0x1000,
+            128,
+            0x2000,
+            80,
+            RECV_V3_MAP_READ | RECV_V3_MAP_WRITE,
         );
         assert_eq!(validate_request(&req), Ok(()));
     }
@@ -428,14 +494,20 @@ mod tests {
     fn abi_output_bad_version_rejected() {
         let mut out = minimal_out();
         out.version = 1;
-        assert_eq!(validate_output(&out), Err(RecvSharedV3ValidationError::BadVersion));
+        assert_eq!(
+            validate_output(&out),
+            Err(RecvSharedV3ValidationError::BadVersion)
+        );
     }
 
     #[test]
     fn abi_output_short_record_rejected() {
         let mut out = minimal_out();
         out.record_len = RECV_V3_MIN_OUTPUT_LEN - 1;
-        assert_eq!(validate_output(&out), Err(RecvSharedV3ValidationError::BadOutputRecord));
+        assert_eq!(
+            validate_output(&out),
+            Err(RecvSharedV3ValidationError::BadOutputRecord)
+        );
     }
 
     #[test]
@@ -447,10 +519,22 @@ mod tests {
 
     #[test]
     fn abi_object_kind_from_raw_roundtrip() {
-        assert_eq!(RecvSharedV3ObjectKind::from_raw(0), RecvSharedV3ObjectKind::Unknown);
-        assert_eq!(RecvSharedV3ObjectKind::from_raw(1), RecvSharedV3ObjectKind::MemoryObject);
-        assert_eq!(RecvSharedV3ObjectKind::from_raw(2), RecvSharedV3ObjectKind::Endpoint);
-        assert_eq!(RecvSharedV3ObjectKind::from_raw(99), RecvSharedV3ObjectKind::Unknown);
+        assert_eq!(
+            RecvSharedV3ObjectKind::from_raw(0),
+            RecvSharedV3ObjectKind::Unknown
+        );
+        assert_eq!(
+            RecvSharedV3ObjectKind::from_raw(1),
+            RecvSharedV3ObjectKind::MemoryObject
+        );
+        assert_eq!(
+            RecvSharedV3ObjectKind::from_raw(2),
+            RecvSharedV3ObjectKind::Endpoint
+        );
+        assert_eq!(
+            RecvSharedV3ObjectKind::from_raw(99),
+            RecvSharedV3ObjectKind::Unknown
+        );
     }
 
     #[test]
@@ -469,5 +553,46 @@ mod tests {
         assert_eq!(RECV_V3_MAP_READ, 0x1);
         assert_eq!(RECV_V3_MAP_WRITE, 0x2);
         assert_eq!(RECV_V3_NO_TRANSFER_CAP, u64::MAX);
+    }
+
+    #[test]
+    fn abi_cap_rights_constants_match_cap_rights_bits() {
+        // effective_rights field uses the same bit layout as CapRights::bits().
+        assert_eq!(RECV_V3_CAP_RIGHTS_READ, 0x01);
+        assert_eq!(RECV_V3_CAP_RIGHTS_WRITE, 0x02);
+        assert_eq!(RECV_V3_CAP_RIGHTS_MAP, 0x04);
+        assert_eq!(RECV_V3_CAP_RIGHTS_SEND, 0x08);
+        assert_eq!(RECV_V3_CAP_RIGHTS_RECEIVE, 0x10);
+        assert_eq!(RECV_V3_CAP_RIGHTS_SCHEDULE, 0x20);
+        assert_eq!(RECV_V3_CAP_RIGHTS_SIGNAL, 0x40);
+        assert_eq!(RECV_V3_CAP_RIGHTS_WAIT, 0x80);
+    }
+
+    #[test]
+    fn abi_object_kind_values_are_stable() {
+        assert_eq!(RecvSharedV3ObjectKind::Unknown as u32, 0);
+        assert_eq!(RecvSharedV3ObjectKind::MemoryObject as u32, 1);
+        assert_eq!(RecvSharedV3ObjectKind::Endpoint as u32, 2);
+        assert_eq!(RecvSharedV3ObjectKind::ReplyCap as u32, 3);
+        assert_eq!(RecvSharedV3ObjectKind::Notification as u32, 4);
+        assert_eq!(RecvSharedV3ObjectKind::Other as u32, 0xFF);
+    }
+
+    #[test]
+    fn abi_object_kind_anonymous_memory_object_is_one() {
+        // Stage 47+48: MemoryObject kind discriminant written by kernel.
+        let mut out = minimal_out();
+        out.object_kind = RecvSharedV3ObjectKind::MemoryObject as u32;
+        assert_eq!(
+            out.decoded_object_kind(),
+            RecvSharedV3ObjectKind::MemoryObject
+        );
+    }
+
+    #[test]
+    fn abi_effective_rights_read_write_map_combo() {
+        // Verify the expected rights combination for a transferred Anonymous MemoryObject.
+        let rwm = RECV_V3_CAP_RIGHTS_READ | RECV_V3_CAP_RIGHTS_WRITE | RECV_V3_CAP_RIGHTS_MAP;
+        assert_eq!(rwm, 0x07);
     }
 }

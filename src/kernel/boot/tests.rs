@@ -26742,3 +26742,213 @@ mod stage46 {
         );
     }
 }
+
+mod stage47 {
+    //! Stage 47+48: object metadata for transferred caps in recv_shared_v3.
+    //!
+    //! Verifies that after a real cap-transfer dispatch the output buffer at
+    //! offsets [40..72) carries authoritative metadata:
+    //!   - object_kind (u32 @40): 1 = MemoryObject
+    //!   - C-layout padding @44-47: always zero
+    //!   - object_generation (u64 @48): 0 for MemoryObject (no generation field)
+    //!   - effective_rights (u32 @56): bits of the receiver-local cap (0x07 = READ|WRITE|MAP)
+    //!   - C-layout padding @60-63: always zero
+    //!   - exact_object_size (u64 @64): 0 (FUTURE)
+    //!
+    //! Also verifies that a plain message (no cap transfer) writes zero for all
+    //! object introspection fields.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::syscall::{dispatch, Syscall, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
+
+    const RECV_V3_STATUS_OK: u32 = 0;
+
+    fn build_v3_req(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes()); // version
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes()); // record_len (min request len)
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        // map_intent @ 48..52: 0, flags @ 52..56: 0, timeout_ticks @ 56..64: 0
+        buf
+    }
+
+    fn setup_recv_page(state: &mut crate::kernel::boot::KernelState) -> Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_mem_id, map_cap) = state.alloc_anonymous_memory_object().expect("map mem");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                map_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map page at 0x1_0000");
+        asid
+    }
+
+    // ── A. Primary proof: object metadata for a transferred MemoryObject ─────
+
+    #[test]
+    fn stage47_object_kind_and_rights_for_transferred_memory_object() {
+        // After a real cap-transfer dispatch, the output buffer must contain:
+        //   object_kind @40 = 1 (MemoryObject)
+        //   object_generation @48 = 0 (MemoryObject has no generation)
+        //   effective_rights @56 = 0x07 (READ|WRITE|MAP on anonymous MemoryObject)
+        //   exact_object_size @64 = 0 (FUTURE)
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xA000))
+            .expect("mem obj");
+
+        // Phase 1: send with cap transfer via real dispatch.
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                super::inline_payload_word(b"s47!"),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send dispatch");
+        assert_eq!(send_frame.error_code(), None, "send must succeed");
+
+        // Phase 2: set up user ASID.
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 80);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write request");
+
+        // Phase 3: recv via dispatch(RecvSharedV3).
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+        assert_eq!(recv_frame.error_code(), None, "recv must succeed");
+
+        // Phase 4: read the full 80-byte output.
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 80)
+            .expect("read output");
+
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        let transferred_cap = u64::from_le_bytes(out[32..40].try_into().unwrap());
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        let padding_44 = u32::from_le_bytes(out[44..48].try_into().unwrap());
+        let object_generation = u64::from_le_bytes(out[48..56].try_into().unwrap());
+        let effective_rights = u32::from_le_bytes(out[56..60].try_into().unwrap());
+        let padding_60 = u32::from_le_bytes(out[60..64].try_into().unwrap());
+        let exact_object_size = u64::from_le_bytes(out[64..72].try_into().unwrap());
+
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        assert_ne!(transferred_cap, SYSCALL_NO_TRANSFER_CAP, "must have a cap");
+
+        // object_kind = 1 (MemoryObject discriminant from RecvSharedV3ObjectKind).
+        assert_eq!(object_kind, 1, "object_kind must be MemoryObject (1)");
+        // Padding bytes must be zero (C-layout gap after u32).
+        assert_eq!(padding_44, 0, "C-layout padding @44 must be zero");
+        // MemoryObject has no generation field → always 0.
+        assert_eq!(
+            object_generation, 0,
+            "MemoryObject object_generation must be 0"
+        );
+        // Anonymous MemoryObject carries READ|WRITE|MAP = 0x07.
+        assert_eq!(
+            effective_rights, 0x07,
+            "effective_rights must be READ|WRITE|MAP (0x07)"
+        );
+        // Padding bytes must be zero (C-layout gap after u32).
+        assert_eq!(padding_60, 0, "C-layout padding @60 must be zero");
+        // exact_object_size is FUTURE — always 0 until Stage 49.
+        assert_eq!(
+            exact_object_size, 0,
+            "exact_object_size must be 0 (FUTURE)"
+        );
+    }
+
+    // ── B. Plain message: object introspection fields must be zero ───────────
+
+    #[test]
+    fn stage47_plain_message_object_metadata_is_zero() {
+        // When no cap is transferred, all object introspection fields must be 0.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+
+        // Plain send — arg5 = SYSCALL_NO_TRANSFER_CAP (u64::MAX sentinel = no cap).
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                super::inline_payload_word(b"pln!"),
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("plain ipc_send dispatch");
+        assert_eq!(send_frame.error_code(), None, "send must succeed");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 80);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write request");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+        assert_eq!(recv_frame.error_code(), None, "recv must succeed");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 80)
+            .expect("read output");
+
+        let transferred_cap = u64::from_le_bytes(out[32..40].try_into().unwrap());
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        let object_generation = u64::from_le_bytes(out[48..56].try_into().unwrap());
+        let effective_rights = u32::from_le_bytes(out[56..60].try_into().unwrap());
+        let exact_object_size = u64::from_le_bytes(out[64..72].try_into().unwrap());
+
+        assert_eq!(
+            transferred_cap, SYSCALL_NO_TRANSFER_CAP,
+            "no cap transferred"
+        );
+        assert_eq!(object_kind, 0, "no cap → object_kind must be 0");
+        assert_eq!(
+            object_generation, 0,
+            "no cap → object_generation must be 0"
+        );
+        assert_eq!(effective_rights, 0, "no cap → effective_rights must be 0");
+        assert_eq!(
+            exact_object_size, 0,
+            "exact_object_size must be 0 (FUTURE)"
+        );
+    }
+}
