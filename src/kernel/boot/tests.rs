@@ -26885,8 +26885,7 @@ mod stage47 {
         assert_eq!(padding_60, 0, "C-layout padding @60 must be zero");
         // exact_object_size is now authoritative (Stage 49) — 1-page MemoryObject.
         assert_eq!(
-            exact_object_size,
-            PAGE_SIZE as u64,
+            exact_object_size, PAGE_SIZE as u64,
             "exact_object_size must equal PAGE_SIZE (authoritative since Stage 49)"
         );
     }
@@ -26942,10 +26941,7 @@ mod stage47 {
             "no cap transferred"
         );
         assert_eq!(object_kind, 0, "no cap → object_kind must be 0");
-        assert_eq!(
-            object_generation, 0,
-            "no cap → object_generation must be 0"
-        );
+        assert_eq!(object_generation, 0, "no cap → object_generation must be 0");
         assert_eq!(effective_rights, 0, "no cap → effective_rights must be 0");
         assert_eq!(exact_object_size, 0, "no cap → exact_object_size must be 0");
     }
@@ -27071,8 +27067,7 @@ mod stage49 {
 
         // create_memory_object creates a 1-page object → exact_object_size == PAGE_SIZE.
         assert_eq!(
-            exact_object_size,
-            PAGE_SIZE as u64,
+            exact_object_size, PAGE_SIZE as u64,
             "exact_object_size must equal PAGE_SIZE for a 1-page MemoryObject"
         );
         // region_offset stays 0 (FUTURE).
@@ -27276,8 +27271,7 @@ mod stage50 {
         assert_eq!(region_offset, 0, "region_offset must be 0 (FUTURE)");
         // DmaRegion.len is embedded in the cap — exact_region_len must equal PAGE_SIZE.
         assert_eq!(
-            exact_region_len,
-            PAGE_SIZE as u64,
+            exact_region_len, PAGE_SIZE as u64,
             "exact_region_len must equal PAGE_SIZE for a 1-page DmaRegion"
         );
     }
@@ -27328,8 +27322,14 @@ mod stage50 {
         let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
 
         // MemoryObject has exact_object_size; exact_region_len must be 0.
-        assert_eq!(exact_object_size, PAGE_SIZE as u64, "exact_object_size must be PAGE_SIZE");
-        assert_eq!(exact_region_len, 0, "MemoryObject → exact_region_len must be 0");
+        assert_eq!(
+            exact_object_size, PAGE_SIZE as u64,
+            "exact_object_size must be PAGE_SIZE"
+        );
+        assert_eq!(
+            exact_region_len, 0,
+            "MemoryObject → exact_region_len must be 0"
+        );
     }
 
     // ── C. Plain message: exact_region_len must be zero ──────────────────────
@@ -27600,13 +27600,21 @@ mod stage52 {
 
         assert_eq!(result_status, RECV_V3_STATUS_OK);
         assert_ne!(transferred_cap, SYSCALL_NO_TRANSFER_CAP, "must have a cap");
-        assert_eq!(object_kind, RECV_V3_DMA_REGION_KIND, "kind must be DmaRegion (5)");
-        assert_eq!(effective_rights, 0x07, "DmaRegion rights must be READ|WRITE|MAP (0x07)");
-        // DmaRegion has no separate object-size concept — exact_object_size must be 0.
-        assert_eq!(exact_object_size, 0, "exact_object_size must be 0 for DmaRegion");
         assert_eq!(
-            exact_region_len,
-            PAGE_SIZE as u64,
+            object_kind, RECV_V3_DMA_REGION_KIND,
+            "kind must be DmaRegion (5)"
+        );
+        assert_eq!(
+            effective_rights, 0x07,
+            "DmaRegion rights must be READ|WRITE|MAP (0x07)"
+        );
+        // DmaRegion has no separate object-size concept — exact_object_size must be 0.
+        assert_eq!(
+            exact_object_size, 0,
+            "exact_object_size must be 0 for DmaRegion"
+        );
+        assert_eq!(
+            exact_region_len, PAGE_SIZE as u64,
             "exact_region_len must equal PAGE_SIZE"
         );
     }
@@ -27655,9 +27663,18 @@ mod stage52 {
         let exact_object_size = u64::from_le_bytes(out[64..72].try_into().unwrap());
         let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
 
-        assert_eq!(object_kind, RECV_V3_MEMORY_OBJECT_KIND, "MemoryObject kind unchanged");
-        assert_eq!(exact_object_size, PAGE_SIZE as u64, "exact_object_size still authoritative");
-        assert_eq!(exact_region_len, 0, "exact_region_len must be 0 for MemoryObject");
+        assert_eq!(
+            object_kind, RECV_V3_MEMORY_OBJECT_KIND,
+            "MemoryObject kind unchanged"
+        );
+        assert_eq!(
+            exact_object_size, PAGE_SIZE as u64,
+            "exact_object_size still authoritative"
+        );
+        assert_eq!(
+            exact_region_len, 0,
+            "exact_region_len must be 0 for MemoryObject"
+        );
     }
 
     // ── D. Cleanup token: kernel write window is exactly 88 bytes ────────────
@@ -27714,8 +27731,7 @@ mod stage52 {
 
         let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
         assert_eq!(
-            exact_region_len,
-            PAGE_SIZE as u64,
+            exact_region_len, PAGE_SIZE as u64,
             "last 8 bytes of write window must contain exact_region_len"
         );
         // cleanup_token @112 is outside the write window — verified by
@@ -27763,5 +27779,349 @@ mod stage52 {
             exact_region_len, 0,
             "plain message → exact_region_len must be 0"
         );
+    }
+}
+
+mod stage54 {
+    //! Stage 54+55: map_intent/shared mapping audit + helper-only mapping plan.
+    //!
+    //! **Implementation decision: Option B (helper-only mapping plan).**
+    //!
+    //! The live `map_intent != 0 → InvalidArgs` gate remains unchanged.
+    //! `compute_recv_v3_mapping_plan` is a pure function that computes what
+    //! a mapped receive would do without performing any VM mutation.
+    //!
+    //! # Tests
+    //!
+    //! A. Gate: map_intent ReadOnly / ReadWrite still return InvalidArgs.
+    //! B. Regression: plain receive and SYSCALL_COUNT unchanged.
+    //! C. Plan: Skip when map_intent=0 or opcode is not OPCODE_SHARED_MEM.
+    //! D. Plan: Map shape correct for ReadOnly / ReadWrite / page-rounding.
+    //! E. Plan: InsufficientRights when MAP bit absent or WRITE requested but unavailable.
+    //! F. Plan: InvalidRegion for zero payload_ptr, zero region_len, or buffer too small.
+    //! G. Plan: region_len rounds up to page size correctly.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::recv_core::recv_shared_v3::{
+        compute_recv_v3_mapping_plan, RecvV3MappingPlan, CAP_RIGHT_MAP, CAP_RIGHT_WRITE, MAP_READ,
+        MAP_WRITE, OPCODE_SHARED_MEM_VALUE,
+    };
+    use crate::kernel::syscall::{
+        dispatch, Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP,
+        SYSCALL_RECV_SHARED_V3_NR,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr, PAGE_SIZE};
+
+    const RECV_V3_MAP_READ: u32 = 0x1;
+    const RECV_V3_MAP_WRITE: u32 = 0x2;
+
+    fn build_v3_req(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf
+    }
+
+    fn build_v3_req_with_map_intent(
+        endpoint_cap: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+        map_intent: u32,
+    ) -> [u8; 80] {
+        let mut buf = build_v3_req(endpoint_cap, 0x1_0100, 256, metadata_ptr, metadata_len);
+        buf[48..52].copy_from_slice(&map_intent.to_le_bytes());
+        buf
+    }
+
+    fn setup_recv_page(state: &mut crate::kernel::boot::KernelState) -> Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_mem_id, map_cap) = state.alloc_anonymous_memory_object().expect("map mem");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                map_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map page at 0x1_0000");
+        asid
+    }
+
+    // ── A. Gate: map_intent still returns InvalidArgs ─────────────────────────
+
+    #[test]
+    fn stage54_map_intent_read_only_still_invalid_args() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let asid = setup_recv_page(&mut state);
+        let req_bytes =
+            build_v3_req_with_map_intent(recv_cap.0 as u64, 0x1_0200, 88, RECV_V3_MAP_READ);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent=READ must still return InvalidArgs"
+        );
+    }
+
+    #[test]
+    fn stage54_map_intent_read_write_still_invalid_args() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req_with_map_intent(
+            recv_cap.0 as u64,
+            0x1_0200,
+            88,
+            RECV_V3_MAP_READ | RECV_V3_MAP_WRITE,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent=READ|WRITE must still return InvalidArgs"
+        );
+    }
+
+    // ── B. Regression: syscall count and plain receive unchanged ─────────────
+
+    #[test]
+    fn stage54_syscall_count_is_31_and_nr_is_30() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must not change");
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30, "NR must not change");
+    }
+
+    #[test]
+    fn stage54_plain_receive_unchanged() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x6161_6161,
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send");
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(&mut state, &mut frame).expect("plain recv must succeed");
+    }
+
+    // ── C. Plan: Skip cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn stage54_mapping_plan_skip_when_map_intent_zero() {
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            0, // map_intent = 0
+            0x4000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP | CAP_RIGHT_WRITE,
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(plan, RecvV3MappingPlan::Skip);
+    }
+
+    #[test]
+    fn stage54_mapping_plan_skip_when_opcode_not_shared_mem() {
+        let plan = compute_recv_v3_mapping_plan(
+            0, // opcode != OPCODE_SHARED_MEM_VALUE
+            MAP_READ,
+            0x4000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP,
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(plan, RecvV3MappingPlan::Skip);
+    }
+
+    // ── D. Plan: Map cases ────────────────────────────────────────────────────
+
+    #[test]
+    fn stage54_mapping_plan_read_only_for_map_read_intent() {
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ,
+            0x4000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP,
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(
+            plan,
+            RecvV3MappingPlan::Map {
+                map_va: 0x4000,
+                mapped_len: PAGE_SIZE as u64,
+                read_only: true,
+            }
+        );
+    }
+
+    #[test]
+    fn stage54_mapping_plan_read_write_for_map_readwrite_intent() {
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ | MAP_WRITE,
+            0x8000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP | CAP_RIGHT_WRITE,
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(
+            plan,
+            RecvV3MappingPlan::Map {
+                map_va: 0x8000,
+                mapped_len: PAGE_SIZE as u64,
+                read_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn stage54_mapping_plan_region_len_rounds_up_to_page() {
+        // region_len = 1 byte → mapped_len must be PAGE_SIZE.
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ,
+            0x4000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP,
+            1, // region_len = 1 byte
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(
+            plan,
+            RecvV3MappingPlan::Map {
+                map_va: 0x4000,
+                mapped_len: PAGE_SIZE as u64,
+                read_only: true,
+            }
+        );
+    }
+
+    // ── E. Plan: InsufficientRights cases ────────────────────────────────────
+
+    #[test]
+    fn stage54_mapping_plan_insufficient_rights_when_map_bit_missing() {
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ,
+            0x4000,
+            PAGE_SIZE as u64,
+            0x01, // READ only — MAP bit absent
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(plan, RecvV3MappingPlan::InsufficientRights);
+    }
+
+    #[test]
+    fn stage54_mapping_plan_insufficient_rights_when_write_requested_but_cap_read_only() {
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ | MAP_WRITE,
+            0x4000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP, // MAP but no WRITE
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(plan, RecvV3MappingPlan::InsufficientRights);
+    }
+
+    // ── F. Plan: InvalidRegion cases ─────────────────────────────────────────
+
+    #[test]
+    fn stage54_mapping_plan_invalid_region_when_payload_ptr_zero() {
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ,
+            0, // payload_ptr = 0
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP,
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(plan, RecvV3MappingPlan::InvalidRegion);
+    }
+
+    #[test]
+    fn stage54_mapping_plan_invalid_region_when_region_len_zero() {
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ,
+            0x4000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP,
+            0, // region_len = 0
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(plan, RecvV3MappingPlan::InvalidRegion);
+    }
+
+    #[test]
+    fn stage54_mapping_plan_invalid_region_when_payload_buf_too_small() {
+        // payload_len = PAGE_SIZE - 1 but region_len rounds up to PAGE_SIZE.
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ,
+            0x4000,
+            (PAGE_SIZE - 1) as u64, // payload_len < mapped_len
+            CAP_RIGHT_MAP,
+            1, // region_len = 1 → mapped_len = PAGE_SIZE
+            PAGE_SIZE as u64,
+        );
+        assert_eq!(plan, RecvV3MappingPlan::InvalidRegion);
     }
 }
