@@ -247,7 +247,11 @@ pub struct RecvSharedV3Output {
     /// 0 if no capability was transferred.
     pub effective_rights: u32,
     // 4 bytes C-layout padding for u64 alignment follow effective_rights (offset 60-63).
-    /// **FUTURE (unavailable)**: exact object size in bytes; always 0 now.
+    /// Exact object size in bytes (Stage 49): page-aligned byte length of the
+    /// transferred MemoryObject as stored in the kernel registry.
+    /// **0 for all non-MemoryObject cap kinds and when no cap was transferred.**
+    /// The value is always a non-zero multiple of the system page size when a
+    /// MemoryObject cap was transferred.
     pub exact_object_size: u64,
 
     // ── Shared-memory mapping (available after VM mapping on split path) ──
@@ -594,5 +598,22 @@ mod tests {
         // Verify the expected rights combination for a transferred Anonymous MemoryObject.
         let rwm = RECV_V3_CAP_RIGHTS_READ | RECV_V3_CAP_RIGHTS_WRITE | RECV_V3_CAP_RIGHTS_MAP;
         assert_eq!(rwm, 0x07);
+    }
+
+    #[test]
+    fn abi_exact_object_size_zero_when_no_cap() {
+        // Stage 49: exact_object_size must be 0 when no cap is transferred.
+        let out = minimal_out();
+        assert_eq!(
+            out.exact_object_size, 0,
+            "exact_object_size must be 0 when no cap"
+        );
+    }
+
+    #[test]
+    fn abi_exact_object_size_field_at_offset_64() {
+        // Layout assertion: exact_object_size lives at byte offset 64 in the output record.
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(RecvSharedV3Output, exact_object_size), 64);
     }
 }
