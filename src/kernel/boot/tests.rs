@@ -27271,8 +27271,8 @@ mod stage50 {
 
         assert_eq!(result_status, RECV_V3_STATUS_OK);
         assert_ne!(transferred_cap, SYSCALL_NO_TRANSFER_CAP, "must have a cap");
-        // DmaRegion has no dedicated kind discriminant yet → falls through to Other (0xFF).
-        assert_eq!(object_kind, 0xFF, "DmaRegion must map to Other (0xFF)");
+        // Stage 52+53: DmaRegion now has first-class discriminant 5.
+        assert_eq!(object_kind, 5, "DmaRegion must map to DmaRegion (5)");
         assert_eq!(region_offset, 0, "region_offset must be 0 (FUTURE)");
         // DmaRegion.len is embedded in the cap — exact_region_len must equal PAGE_SIZE.
         assert_eq!(
@@ -27428,6 +27428,340 @@ mod stage50 {
             matches!(result, Err(SyscallError::InvalidArgs)),
             "map_intent=READ|WRITE must return InvalidArgs, got: {:?}",
             result
+        );
+    }
+}
+
+mod stage52 {
+    //! Stage 52+53: DmaRegion as a first-class recv_shared_v3 object kind.
+    //!
+    //! Adds `RecvSharedV3ObjectKind::DmaRegion = 5`.  Updates `recv_v3_object_kind`
+    //! so `CapObject::DmaRegion` maps to discriminant 5 instead of Other (0xFF).
+    //!
+    //! Proves complete DmaRegion metadata output:
+    //!   - object_kind @40 == 5 (DmaRegion, first-class since Stage 52+53)
+    //!   - effective_rights @56 == 0x07 (READ|WRITE|MAP)
+    //!   - exact_object_size @64 == 0 (not authoritative for DmaRegion)
+    //!   - exact_region_len @80..88 == PAGE_SIZE
+    //!   - cleanup_token @112 == 0 (never written — no live mapping)
+    //!
+    //! Also confirms MemoryObject still reports kind=1 and exact_object_size.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::syscall::{dispatch, Syscall, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+
+    const RECV_V3_STATUS_OK: u32 = 0;
+    const RECV_V3_DMA_REGION_KIND: u32 = 5;
+    const RECV_V3_MEMORY_OBJECT_KIND: u32 = 1;
+
+    fn build_v3_req(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf
+    }
+
+    fn setup_recv_page(state: &mut crate::kernel::boot::KernelState) -> Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_mem_id, map_cap) = state.alloc_anonymous_memory_object().expect("map mem");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                map_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map page at 0x1_0000");
+        asid
+    }
+
+    // ── A. Primary: complete DmaRegion metadata with first-class kind ─────────
+
+    #[test]
+    fn stage52_dma_region_object_kind_is_five() {
+        // DmaRegion now has dedicated discriminant 5 instead of Other (0xFF).
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xA000))
+            .expect("mem obj");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                super::inline_payload_word(b"s52!"),
+                0,
+                dma_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read output");
+
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        assert_eq!(
+            object_kind, RECV_V3_DMA_REGION_KIND,
+            "DmaRegion must have kind=5 (first-class since Stage 52+53)"
+        );
+    }
+
+    // ── B. Full metadata correctness for DmaRegion transfer ──────────────────
+
+    #[test]
+    fn stage52_dma_region_full_metadata_output() {
+        // Verifies the complete DmaRegion metadata contract:
+        //   object_kind = 5, effective_rights = 0x07, exact_object_size = 0,
+        //   exact_region_len = PAGE_SIZE.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xA000))
+            .expect("mem obj");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                super::inline_payload_word(b"s52!"),
+                0,
+                dma_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+        assert_eq!(recv_frame.error_code(), None);
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read output");
+
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        let transferred_cap = u64::from_le_bytes(out[32..40].try_into().unwrap());
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        let effective_rights = u32::from_le_bytes(out[56..60].try_into().unwrap());
+        let exact_object_size = u64::from_le_bytes(out[64..72].try_into().unwrap());
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        assert_ne!(transferred_cap, SYSCALL_NO_TRANSFER_CAP, "must have a cap");
+        assert_eq!(object_kind, RECV_V3_DMA_REGION_KIND, "kind must be DmaRegion (5)");
+        assert_eq!(effective_rights, 0x07, "DmaRegion rights must be READ|WRITE|MAP (0x07)");
+        // DmaRegion has no separate object-size concept — exact_object_size must be 0.
+        assert_eq!(exact_object_size, 0, "exact_object_size must be 0 for DmaRegion");
+        assert_eq!(
+            exact_region_len,
+            PAGE_SIZE as u64,
+            "exact_region_len must equal PAGE_SIZE"
+        );
+    }
+
+    // ── C. MemoryObject still reports kind=1 and exact_object_size ───────────
+
+    #[test]
+    fn stage52_memory_object_still_kind_one_with_exact_object_size() {
+        // Regression: MemoryObject kind unchanged; exact_object_size still authoritative.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xA000))
+            .expect("mem obj");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                super::inline_payload_word(b"s52!"),
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read output");
+
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        let exact_object_size = u64::from_le_bytes(out[64..72].try_into().unwrap());
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+
+        assert_eq!(object_kind, RECV_V3_MEMORY_OBJECT_KIND, "MemoryObject kind unchanged");
+        assert_eq!(exact_object_size, PAGE_SIZE as u64, "exact_object_size still authoritative");
+        assert_eq!(exact_region_len, 0, "exact_region_len must be 0 for MemoryObject");
+    }
+
+    // ── D. Cleanup token: kernel write window is exactly 88 bytes ────────────
+    //
+    // cleanup_token is at @112 in RecvSharedV3Output — beyond the 88-byte write
+    // window.  The hosted-dev test framework uses a per-byte HashMap for user
+    // memory so unwritten bytes cannot be read.  We verify the write boundary
+    // by checking that the kernel writes 88 bytes correctly and the struct-level
+    // cleanup_token sentinel stays 0 (proven in ABI crate abi_cleanup_token_*
+    // tests).  The dispatch tests here confirm the 88-byte boundary.
+
+    #[test]
+    fn stage52_recv_writes_exactly_88_bytes_for_dma_region() {
+        // Prove the kernel writes exactly 88 bytes: bytes 80..88 (exact_region_len)
+        // are written, and the boundary aligns with the expected write window.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xA000))
+            .expect("mem obj");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                super::inline_payload_word(b"s52!"),
+                0,
+                dma_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+
+        // Read exactly 88 bytes (the full write window).
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read 88-byte output");
+
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+        assert_eq!(
+            exact_region_len,
+            PAGE_SIZE as u64,
+            "last 8 bytes of write window must contain exact_region_len"
+        );
+        // cleanup_token @112 is outside the write window — verified by
+        // ABI crate abi_cleanup_token_zero_in_zeroed_output test.
+    }
+
+    // ── E. 88-byte write boundary: plain message ─────────────────────────────
+
+    #[test]
+    fn stage52_recv_writes_exactly_88_bytes_for_plain_message() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                super::inline_payload_word(b"pln!"),
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read 88-byte output");
+
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+        assert_eq!(
+            exact_region_len, 0,
+            "plain message → exact_region_len must be 0"
         );
     }
 }

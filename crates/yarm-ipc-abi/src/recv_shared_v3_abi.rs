@@ -48,6 +48,13 @@ pub const RECV_V3_NO_TRANSFER_CAP: u64 = u64::MAX;
 /// Sentinel for FUTURE fields that are unavailable in this ABI version.
 pub const RECV_V3_FIELD_UNAVAILABLE: u64 = 0;
 
+/// Sentinel for `cleanup_token` when no live shared-memory mapping exists (Stage 54+).
+///
+/// The `cleanup_token` output field is always 0 in the current stage — no VM
+/// mapping is performed and no cleanup identity is allocated.  This sentinel
+/// must be tested before any cleanup action is taken in userspace.
+pub const RECV_V3_CLEANUP_TOKEN_NONE: u64 = 0;
+
 /// Syscall ABI version written into `RecvSharedV3Output::abi_version`.
 pub const RECV_V3_ABI_VERSION: u32 = 10;
 
@@ -64,7 +71,7 @@ pub const RECV_V3_STATUS_BAD_REQUEST: u32 = 4;
 
 // ── Object kind ──────────────────────────────────────────────────────────────
 
-/// Kind of a transferred capability (available from Stage 47+48).
+/// Kind of a transferred capability (available from Stage 47+48; DmaRegion from Stage 52+53).
 ///
 /// Populated in `RecvSharedV3Output::object_kind` whenever a cap is
 /// materialized.  [`Unknown`](Self::Unknown) (0) is written when no
@@ -82,6 +89,10 @@ pub enum RecvSharedV3ObjectKind {
     ReplyCap = 3,
     /// The transferred cap wraps a notification object.
     Notification = 4,
+    /// The transferred cap is a DmaRegion sub-region slice (Stage 52+53).
+    /// `exact_region_len` carries the authoritative sub-region byte length;
+    /// `exact_object_size` is 0 (DmaRegion has no separate object-size concept).
+    DmaRegion = 5,
     /// Other or forward-compatibility kind not listed above.
     Other = 0xFF,
 }
@@ -114,6 +125,7 @@ impl RecvSharedV3ObjectKind {
             2 => Self::Endpoint,
             3 => Self::ReplyCap,
             4 => Self::Notification,
+            5 => Self::DmaRegion,
             0xFF => Self::Other,
             _ => Self::Unknown,
         }
@@ -265,9 +277,8 @@ pub struct RecvSharedV3Output {
     /// Shared-memory region offset (0 if no OPCODE_SHARED_MEM transfer).
     pub region_offset: u64,
     /// Exact DmaRegion sub-region byte length (Stage 50): page-aligned byte length
-    /// embedded in the transferred DmaRegion capability.  Authoritative when a
-    /// DmaRegion cap was transferred (`object_kind == Other (0xFF)` in the current ABI;
-    /// DmaRegion has no dedicated kind discriminant yet).
+    /// embedded in the transferred DmaRegion capability.  Authoritative when
+    /// `object_kind == DmaRegion (5)` (Stage 52+53).
     /// **0 for MemoryObject, Endpoint, Notification, ReplyCap, and plain messages.**
     /// Only written when the caller provides at least [`RECV_V3_EXTENDED_OUTPUT_LEN`]
     /// bytes in `metadata_len`; reads as 0 from an 80-byte buffer.
@@ -323,6 +334,74 @@ impl RecvSharedV3Output {
     }
 }
 
+// ── Cleanup-token scaffold (helper-only, Stage 52+53) ────────────────────────
+
+/// Identity record for a future recv_shared_v3 cleanup obligation (Stage 54+).
+///
+/// **FUTURE (unavailable)**: no live mappings exist in the current stage; all
+/// instances of this type are conceptual scaffolding.  The corresponding
+/// `RecvSharedV3Output::cleanup_token` field is always 0 because:
+///   - No VM mapping is performed (`map_intent` returns `InvalidArgs`).
+///   - No per-mapping cleanup registry exists.
+///   - No process-exit hook for shared mappings is implemented.
+///   - No VFS shared-I/O lifecycle binding is implemented.
+///
+/// When live mapping is eventually enabled (Stage 54+), a non-zero
+/// `cleanup_token` in the output record will correspond to an entry in a
+/// kernel-side cleanup registry identified by the fields below.
+///
+/// Invariants that must hold when `is_active()` is true (future):
+///   - `receiver_cap != u64::MAX`
+///   - `object_kind != 0` (a recognised kind was transferred)
+///   - `region_len > 0` and `region_len % PAGE_SIZE == 0`
+///   - `transfer_token != 0` (non-zero distinguishes an active obligation)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvSharedV3CleanupIdentity {
+    /// Receiver-local materialized capability ID.
+    /// `u64::MAX` when no cleanup obligation exists (sentinel).
+    pub receiver_cap: u64,
+    /// Object kind discriminant of the transferred capability.
+    pub object_kind: u32,
+    /// Page-aligned byte length of the mapped region.
+    /// For `DmaRegion` this is the sub-region length; for `MemoryObject` the object size.
+    pub region_len: u64,
+    /// Opaque transfer-session token.  0 = no live mapping; non-zero = cleanup required.
+    pub transfer_token: u64,
+}
+
+impl RecvSharedV3CleanupIdentity {
+    /// Construct the sentinel value representing no active cleanup obligation.
+    pub const fn none() -> Self {
+        Self {
+            receiver_cap: u64::MAX,
+            object_kind: 0,
+            region_len: 0,
+            transfer_token: 0,
+        }
+    }
+
+    /// Returns `true` when this identity represents an active cleanup obligation.
+    ///
+    /// Always `false` in the current stage — no live mappings exist.
+    pub const fn is_active(&self) -> bool {
+        self.transfer_token != 0
+    }
+
+    /// Returns `true` if the identity satisfies the structural invariants
+    /// required for a future cleanup registration.
+    ///
+    /// Validates that `receiver_cap` is not the sentinel, `object_kind` is
+    /// non-zero, and `region_len` is a positive multiple of `page_size`.
+    /// Does NOT check against any live registry (none exists yet).
+    pub fn is_structurally_valid(&self, page_size: usize) -> bool {
+        self.receiver_cap != u64::MAX
+            && self.object_kind != 0
+            && self.region_len > 0
+            && page_size > 0
+            && self.region_len % page_size as u64 == 0
+    }
+}
+
 // ── Layout assertions ─────────────────────────────────────────────────────────
 
 // Verify that the #[repr(C)] struct field offsets match the byte positions
@@ -341,6 +420,9 @@ const _: () = {
     assert!(offset_of!(RecvSharedV3Output, exact_object_size) == 64);
     assert!(offset_of!(RecvSharedV3Output, region_offset) == 72);
     assert!(offset_of!(RecvSharedV3Output, exact_region_len) == 80);
+    // Fields beyond @88 are never written by the current kernel (write window = min(out_len,88)).
+    assert!(offset_of!(RecvSharedV3Output, mapped_base) == 88);
+    assert!(offset_of!(RecvSharedV3Output, cleanup_token) == 112);
 };
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -655,5 +737,102 @@ mod tests {
     fn abi_extended_output_len_is_88() {
         assert_eq!(RECV_V3_EXTENDED_OUTPUT_LEN, 88);
         assert!(RECV_V3_EXTENDED_OUTPUT_LEN > RECV_V3_MIN_OUTPUT_LEN);
+    }
+
+    // ── Stage 52+53: DmaRegion object kind ───────────────────────────────────
+
+    #[test]
+    fn abi_dma_region_kind_discriminant_is_five() {
+        // DmaRegion is now a first-class object kind with a stable discriminant.
+        assert_eq!(RecvSharedV3ObjectKind::DmaRegion as u32, 5);
+    }
+
+    #[test]
+    fn abi_object_kind_from_raw_dma_region() {
+        assert_eq!(
+            RecvSharedV3ObjectKind::from_raw(5),
+            RecvSharedV3ObjectKind::DmaRegion
+        );
+    }
+
+    #[test]
+    fn abi_object_kind_values_include_dma_region() {
+        assert_eq!(RecvSharedV3ObjectKind::Unknown as u32, 0);
+        assert_eq!(RecvSharedV3ObjectKind::MemoryObject as u32, 1);
+        assert_eq!(RecvSharedV3ObjectKind::Endpoint as u32, 2);
+        assert_eq!(RecvSharedV3ObjectKind::ReplyCap as u32, 3);
+        assert_eq!(RecvSharedV3ObjectKind::Notification as u32, 4);
+        assert_eq!(RecvSharedV3ObjectKind::DmaRegion as u32, 5);
+        assert_eq!(RecvSharedV3ObjectKind::Other as u32, 0xFF);
+    }
+
+    // ── Stage 52+53: cleanup-token scaffold ──────────────────────────────────
+
+    #[test]
+    fn abi_cleanup_token_none_sentinel_is_zero() {
+        assert_eq!(RECV_V3_CLEANUP_TOKEN_NONE, 0);
+    }
+
+    #[test]
+    fn abi_cleanup_token_zero_in_zeroed_output() {
+        let out = minimal_out();
+        assert_eq!(
+            out.cleanup_token, 0,
+            "cleanup_token must be 0 in zeroed output"
+        );
+    }
+
+    #[test]
+    fn abi_cleanup_identity_none_is_not_active() {
+        let identity = RecvSharedV3CleanupIdentity::none();
+        assert!(
+            !identity.is_active(),
+            "sentinel identity must not be active"
+        );
+    }
+
+    #[test]
+    fn abi_cleanup_identity_none_is_not_structurally_valid() {
+        let identity = RecvSharedV3CleanupIdentity::none();
+        assert!(
+            !identity.is_structurally_valid(4096),
+            "sentinel identity must fail structural validation"
+        );
+    }
+
+    #[test]
+    fn abi_cleanup_identity_structurally_valid_requires_page_aligned_len() {
+        let mut identity = RecvSharedV3CleanupIdentity::none();
+        identity.receiver_cap = 5;
+        identity.object_kind = RecvSharedV3ObjectKind::DmaRegion as u32;
+        identity.region_len = 4096; // exactly one page
+        identity.transfer_token = 0; // still not active, but structurally valid otherwise
+        assert!(
+            identity.is_structurally_valid(4096),
+            "page-aligned len with non-sentinel cap must be valid"
+        );
+        identity.region_len = 100; // not page-aligned
+        assert!(
+            !identity.is_structurally_valid(4096),
+            "non-page-aligned len must fail validation"
+        );
+    }
+
+    #[test]
+    fn abi_cleanup_identity_requires_non_sentinel_cap() {
+        let mut identity = RecvSharedV3CleanupIdentity::none();
+        identity.object_kind = RecvSharedV3ObjectKind::DmaRegion as u32;
+        identity.region_len = 4096;
+        // receiver_cap is still u64::MAX (sentinel) — must fail
+        assert!(
+            !identity.is_structurally_valid(4096),
+            "sentinel receiver_cap must fail structural validation"
+        );
+    }
+
+    #[test]
+    fn abi_cleanup_token_field_at_offset_112() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(RecvSharedV3Output, cleanup_token), 112);
     }
 }
