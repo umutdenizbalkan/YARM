@@ -4263,10 +4263,13 @@ fn handle_recv_shared_v3(
         return Err(SyscallError::InvalidArgs);
     }
 
-    // Stage 60: ReadWrite map_intent is not yet supported; reject the WRITE bit.
-    if req.map_intent & SYSCALL_RECV_MAP_INTENT_WRITE as u32 != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
+    // Stage 72: MAP_READ|MAP_WRITE (0x3) is permitted for the READ_SHARED_REPLY profile.
+    // Rights enforcement: compute_recv_v3_mapping_plan checks CAP_RIGHT_MAP + CAP_RIGHT_WRITE;
+    // InsufficientRights → rollback + InvalidArgs below.
+    // NX: hardcoded (execute: false) in all recv_shared_v3 page mappings.
+    // Cleanup: ActiveTransferMapping carries owner_tid+cap+base+len regardless of perm;
+    // purge_active_transfer_mappings_for_pid cleans both read-only and read-write mappings.
+    // WRITE-only (0x2) is already rejected: validate_v3_request above requires READ bit.
 
     let caller_tid = current_tid(kernel)?;
     let recv_cap = CapId(req.endpoint_cap);
