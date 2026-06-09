@@ -1329,4 +1329,89 @@ mod tests {
         };
         assert!(d.has_cleanup_token());
     }
+
+    // ── Stage 63: plain-receive adoption proof ────────────────────────────────
+    // These tests prove the user-rt wrapper contracts for the plain-receive path
+    // (map_intent=0).  No syscall is issued; they are pure encode/decode proofs.
+
+    #[test]
+    fn stage63_adoption_encode_plain_recv_map_intent_zero() {
+        // The encode_nonblocking_request helper must produce map_intent=0
+        // (no mapping requested).  This is the adoption proof that the plain-receive
+        // encoding path sets the correct intent discriminant.
+        let buf = encode_nonblocking_request(3, 0x1000, 128, 0x2000, 128);
+        let map_intent = u32::from_le_bytes(buf[48..52].try_into().unwrap());
+        assert_eq!(
+            map_intent, 0,
+            "plain receive must encode map_intent=0 (no mapping)"
+        );
+    }
+
+    #[test]
+    fn stage63_adoption_from_output_plain_recv_no_mapping() {
+        // Prove that from_output() on a kernel-written plain-receive output
+        // (mapping fields all zero) produces has_mapping()==false and
+        // has_cleanup_token()==false.
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.sender_tid = 1;
+        output.message_len = 0;
+        output.transferred_cap = 5; // materialized cap
+        output.object_kind = 5; // DmaRegion
+        output.exact_region_len = 4096;
+        // mapping fields stay at 0 (plain receive, map_intent=0)
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert!(!d.has_mapping(), "plain receive must not report a mapping");
+        assert!(
+            !d.has_cleanup_token(),
+            "plain receive must not have a cleanup token"
+        );
+        assert_eq!(d.mapped_base(), 0, "mapped_base must be 0");
+        assert_eq!(d.page_rounded_mapped_len(), 0, "mapped_len must be 0");
+        assert_eq!(d.cleanup_token(), 0, "cleanup_token must be 0");
+    }
+
+    #[test]
+    fn stage63_adoption_mapped_recv_delivery_differs_from_plain() {
+        // Prove that a mapped-receive delivery has_mapping()==true and
+        // has_cleanup_token()==true, while a plain-receive delivery does not.
+        let mut plain_output = RecvSharedV3Output::new_zeroed();
+        plain_output.result_status = RECV_V3_STATUS_OK;
+        plain_output.transferred_cap = 5;
+        plain_output.object_kind = 5;
+        let plain = RecvSharedV3Delivery::from_output(&plain_output).expect("plain");
+
+        let mut mapped_output = RecvSharedV3Output::new_zeroed();
+        mapped_output.result_status = RECV_V3_STATUS_OK;
+        mapped_output.transferred_cap = 5;
+        mapped_output.object_kind = 5;
+        mapped_output.mapped_base = 0x2_0000;
+        mapped_output.page_rounded_mapped_len = 4096;
+        mapped_output.actual_mapping_perm = 1;
+        mapped_output.cleanup_token = 0x0001_0005;
+        let mapped = RecvSharedV3Delivery::from_output(&mapped_output).expect("mapped");
+
+        assert!(!plain.has_mapping(), "plain must not have mapping");
+        assert!(mapped.has_mapping(), "mapped must have mapping");
+        assert!(!plain.has_cleanup_token(), "plain must not have token");
+        assert!(mapped.has_cleanup_token(), "mapped must have token");
+        assert_ne!(
+            plain.mapped_base(),
+            mapped.mapped_base(),
+            "mapped_base must differ"
+        );
+    }
+
+    #[test]
+    fn stage63_adoption_encode_mapped_vs_plain_map_intent_differ() {
+        // The two encoders must produce different map_intent values — this proves
+        // they are not accidentally interchangeable.
+        let plain_buf = encode_nonblocking_request(1, 0, 0, 0, 0);
+        let mapped_buf = encode_mapped_readonly_request(1, 0, 0, 0);
+        let plain_intent = u32::from_le_bytes(plain_buf[48..52].try_into().unwrap());
+        let mapped_intent = u32::from_le_bytes(mapped_buf[48..52].try_into().unwrap());
+        assert_eq!(plain_intent, 0, "plain encode must set map_intent=0");
+        assert_eq!(mapped_intent, 1, "mapped-read encode must set map_intent=1");
+        assert_ne!(plain_intent, mapped_intent, "intents must differ");
+    }
 }

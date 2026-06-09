@@ -30272,3 +30272,196 @@ mod stage61_62 {
         assert_eq!(msg.as_slice(), b"hello6162");
     }
 }
+
+mod stage63 {
+    //! Stage 63 — recv_shared_v3 plain-receive adoption proof.
+    //!
+    //! Proves that the kernel dispatch path for recv_shared_v3 with map_intent=0
+    //! (no mapping requested) correctly receives a DmaRegion-bearing shared-mem
+    //! message, materialises the transferred capability, and writes zeroes into
+    //! all mapping output fields (mapped_base, cleanup_token).
+    //!
+    //! This is orthogonal to stage61_62 (which proved map_intent=1).
+    //! The user-rt encode/decode adoption proof lives in
+    //! `crates/yarm-user-rt/src/syscall/recv_v3.rs` stage63_adoption tests.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::syscall::{
+        SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, SYSCALL_TRANSFER_RELEASE_NR,
+        Syscall, SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+    use yarm_ipc_abi::recv_shared_v3_abi::{
+        RECV_V3_CLEANUP_TOKEN_NONE, RECV_V3_STATUS_OK, RecvSharedV3Output,
+    };
+
+    fn setup_receiver(state: &mut crate::kernel::boot::KernelState) -> crate::kernel::vm::Asid {
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_, page_cap) = state.alloc_anonymous_memory_object().expect("page");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                page_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map req page");
+        asid
+    }
+
+    fn send_shared_mem(
+        state: &mut crate::kernel::boot::KernelState,
+        send_cap: CapId,
+        transfer_cap: CapId,
+    ) {
+        let mut f = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [send_cap.0 as usize, 0, 20, 0, 0, transfer_cap.0 as usize],
+        );
+        dispatch(state, &mut f).expect("ipc_send shared-mem");
+    }
+
+    /// Run a full recv_shared_v3 dispatch with map_intent=0 (plain receive).
+    ///
+    /// Sends a DmaRegion-bearing shared-mem message, then receives it without
+    /// requesting a mapping.  Returns (asid, raw_output_128) where bytes 0-119
+    /// are written by the kernel and bytes 120-127 are zero.
+    fn run_plain_recv(
+        state: &mut crate::kernel::boot::KernelState,
+    ) -> (crate::kernel::vm::Asid, [u8; 128]) {
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        // Send BEFORE binding ASID (kernel-task IPC path).
+        send_shared_mem(state, send_cap, dma_cap);
+        let asid = setup_receiver(state);
+
+        // Build request: map_intent=0 (no mapping), metadata_len=120 so the kernel
+        // writes all base + mapping fields (which will be 0 for a plain receive).
+        let mut req = [0u8; 80];
+        req[0..4].copy_from_slice(&3u32.to_le_bytes()); // version
+        req[4..8].copy_from_slice(&64u32.to_le_bytes()); // record_len
+        req[8..16].copy_from_slice(&recv_cap.0.to_le_bytes()); // endpoint_cap
+        req[16..24].copy_from_slice(&0x1_0100u64.to_le_bytes()); // payload_ptr (not written for skip_payload)
+        req[24..32].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // payload_len
+        req[32..40].copy_from_slice(&0x1_0200u64.to_le_bytes()); // metadata_ptr
+        req[40..48].copy_from_slice(&120u64.to_le_bytes()); // metadata_len = 120
+        // map_intent @ 48 = 0 (no mapping requested)
+
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(state, &mut frame).expect("recv_shared_v3 plain receive");
+
+        // Kernel writes ≤ RECV_V3_TOKEN_OUTPUT_LEN (120) bytes; read exactly 120.
+        let partial = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let mut raw = [0u8; 128];
+        raw[..120].copy_from_slice(&partial[..120]);
+        (asid, raw)
+    }
+
+    // ── A. Plain receive output fields ────────────────────────────────────────
+
+    #[test]
+    fn stage63_plain_recv_result_status_ok() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_asid, raw) = run_plain_recv(&mut state);
+        let status = u32::from_le_bytes(raw[12..16].try_into().unwrap());
+        assert_eq!(status, RECV_V3_STATUS_OK, "result_status must be OK (0)");
+    }
+
+    #[test]
+    fn stage63_plain_recv_transferred_cap_present() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_asid, raw) = run_plain_recv(&mut state);
+        let cap = u64::from_le_bytes(raw[32..40].try_into().unwrap());
+        assert_ne!(
+            cap,
+            u64::MAX,
+            "transferred_cap must be materialized (not NO_TRANSFER_CAP sentinel)"
+        );
+    }
+
+    #[test]
+    fn stage63_plain_recv_mapped_base_zero() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_asid, raw) = run_plain_recv(&mut state);
+        let mapped_base = u64::from_le_bytes(raw[88..96].try_into().unwrap());
+        assert_eq!(
+            mapped_base, 0,
+            "plain receive (map_intent=0) must produce mapped_base=0"
+        );
+    }
+
+    #[test]
+    fn stage63_plain_recv_cleanup_token_zero() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_asid, raw) = run_plain_recv(&mut state);
+        let token = u64::from_le_bytes(raw[112..120].try_into().unwrap());
+        assert_eq!(
+            token, RECV_V3_CLEANUP_TOKEN_NONE,
+            "plain receive must produce cleanup_token=0 (RECV_V3_CLEANUP_TOKEN_NONE)"
+        );
+    }
+
+    #[test]
+    fn stage63_plain_recv_no_active_mapping_registered() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_asid, _raw) = run_plain_recv(&mut state);
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "plain receive (map_intent=0) must not register an active transfer mapping"
+        );
+    }
+
+    // ── B. RecvSharedV3Output ABI struct parses plain receive correctly ───────
+
+    #[test]
+    fn stage63_plain_recv_from_output_via_abi_struct() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_asid, raw) = run_plain_recv(&mut state);
+        // raw is [u8; 128]; RecvSharedV3Output is repr(C), 128 bytes.
+        let output: RecvSharedV3Output = unsafe { core::mem::transmute(raw) };
+        assert_eq!(output.result_status, RECV_V3_STATUS_OK, "result_status");
+        assert_ne!(output.transferred_cap, u64::MAX, "cap materialized");
+        assert_eq!(output.mapped_base, 0, "mapped_base zero");
+        assert_eq!(output.page_rounded_mapped_len, 0, "mapped_len zero");
+        assert_eq!(output.actual_mapping_perm, 0, "mapping_perm zero");
+        assert_eq!(output.cleanup_token, RECV_V3_CLEANUP_TOKEN_NONE, "token zero");
+    }
+
+    // ── C. Invariants ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage63_syscall_count_still_31() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must remain 31");
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30, "NR 30 unchanged");
+        assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4, "NR 4 unchanged");
+    }
+
+    #[test]
+    fn stage63_vfs_shared_io_disabled() {
+        assert!(
+            !cfg!(feature = "vfs-shared-io"),
+            "vfs-shared-io must remain disabled in Stage 63"
+        );
+    }
+}
