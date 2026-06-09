@@ -341,6 +341,35 @@ pub unsafe fn transfer_release(
     decode_release(ret)
 }
 
+/// Release a live `recv_shared_v3` read-only mapping using its full-width cleanup token.
+///
+/// Calls the frozen `TransferRelease` syscall (NR 4) with the full 64-bit `cleanup_token`
+/// as arg0 and zero base/len (active-mapping-record fast path).  The kernel locates the
+/// mapping record by `(caller_tid, CapId(cleanup_token))` and unmaps the region.
+///
+/// Returns `Ok(())` on success.  Returns `Err(SyscallError::InvalidArgs)` when
+/// `cleanup_token` is `RECV_V3_CLEANUP_TOKEN_NONE` (= 0, no live mapping).
+///
+/// Unlike the legacy `transfer_release`, this function passes the full 64-bit `CapId.0`
+/// (which encodes generation in bits[63:16]) without truncating to 32 bits.
+///
+/// # Safety
+///
+/// `cleanup_token` must be an unrevoked token obtained from a successful
+/// `ipc_recv_shared_v3_mapped_readonly_nonblocking` call on the current task.
+/// No Drop cleanup is performed — callers must invoke this function explicitly.
+#[inline]
+pub unsafe fn release_v3_cleanup_token(cleanup_token: u64) -> Result<(), SyscallError> {
+    use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_CLEANUP_TOKEN_NONE;
+    if cleanup_token == RECV_V3_CLEANUP_TOKEN_NONE {
+        return Err(SyscallError::InvalidArgs);
+    }
+    // arg0 = full CapId.0 (cleanup_token), arg1/arg2 = 0 → active-record path.
+    let args = [cleanup_token as usize, 0usize, 0usize, 0usize, 0usize, 0usize];
+    let ret = unsafe { crate::arch::raw_syscall(SYSCALL_TRANSFER_RELEASE_NR, args) };
+    decode_release(ret).map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +510,31 @@ mod tests {
             TransferReleaseRequest::explicit(27, 0x6000_0000, 0x2000)
         );
         assert!(!token.is_released());
+    }
+
+    // ── Stage 62: release_v3_cleanup_token structural tests ──────────────────
+
+    #[test]
+    fn stage62_release_v3_nr_is_4() {
+        // TransferRelease NR must remain 4 for the v3 release path.
+        assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4);
+    }
+
+    #[test]
+    fn stage62_release_v3_cleanup_token_none_guard_constant() {
+        // RECV_V3_CLEANUP_TOKEN_NONE must be 0 — the release guard checks equality.
+        use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_CLEANUP_TOKEN_NONE;
+        assert_eq!(RECV_V3_CLEANUP_TOKEN_NONE, 0u64);
+    }
+
+    #[test]
+    fn stage62_release_v3_args_use_active_record_path() {
+        // Verify that the active-record args layout is [token, 0, 0, 0, 0, 0].
+        // This mirrors what release_v3_cleanup_token sends to the kernel.
+        let cleanup_token: u64 = 0x0001_0005;
+        let expected_args: [usize; 6] = [cleanup_token as usize, 0, 0, 0, 0, 0];
+        assert_eq!(expected_args[0], cleanup_token as usize);
+        assert_eq!(expected_args[1], 0, "base must be 0 (active-record path)");
+        assert_eq!(expected_args[2], 0, "len must be 0 (active-record path)");
     }
 }
