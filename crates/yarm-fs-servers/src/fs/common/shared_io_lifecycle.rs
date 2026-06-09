@@ -159,9 +159,22 @@ pub enum VfsSharedIoCleanupResult {
     AlreadyCleaned(VfsSharedIoTerminalReason),
 }
 
+/// Outcome of a TID-matched requester-exit delivery attempt.
+///
+/// `Matched` means the requester TID matched this lifecycle's stored TID.
+/// `NotMatched` means the TID did not match; the lifecycle state is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsSharedIoRequesterExitAction {
+    Matched(VfsSharedIoCleanupResult),
+    NotMatched,
+}
+
 /// One helper request and its single cleanup token.
 pub struct VfsSharedIoLifecycle {
     request_id: u64,
+    /// TID of the task that submitted this request. Used to correlate
+    /// `SUPERVISOR_OP_TASK_EXITED(tid)` notifications to active lifecycles.
+    requester_tid: u64,
     descriptor: VfsSharedBufferDescriptor,
     requested_len: u64,
     flags: u32,
@@ -176,6 +189,7 @@ pub struct VfsSharedIoLifecycle {
 impl VfsSharedIoLifecycle {
     pub fn reserve(
         request_id: u64,
+        requester_tid: u64,
         descriptor: VfsSharedBufferDescriptor,
         requested_len: u64,
         flags: u32,
@@ -189,6 +203,7 @@ impl VfsSharedIoLifecycle {
             .map_err(|_| VfsSharedIoLifecycleError::BadDescriptor)?;
         Ok(Self {
             request_id,
+            requester_tid,
             descriptor,
             requested_len,
             flags,
@@ -203,6 +218,10 @@ impl VfsSharedIoLifecycle {
 
     pub const fn request_id(&self) -> u64 {
         self.request_id
+    }
+
+    pub const fn requester_tid(&self) -> u64 {
+        self.requester_tid
     }
 
     pub const fn state(&self) -> VfsSharedIoState {
@@ -309,6 +328,28 @@ impl VfsSharedIoLifecycle {
         Ok(VfsSharedIoCleanupResult::Won(reason))
     }
 
+    /// Delivers RequesterExit only if `tid` matches this lifecycle's `requester_tid`.
+    ///
+    /// Returns `RequesterExitAction::NotMatched` (safe no-op) when `tid != self.requester_tid`.
+    /// Returns `RequesterExitAction::Matched(result)` when TID matches — equivalent to calling
+    /// `deliver_requester_exit` directly.
+    ///
+    /// This is the Stage 75 helper that models what VFS would do when it receives a
+    /// `SUPERVISOR_OP_TASK_EXITED(tid)` notification and scans its active lifecycle store.
+    /// Production wiring requires a VFS-side lifecycle store and supervisor→VFS notification
+    /// channel (both absent; see `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED`).
+    pub fn deliver_requester_exit_if_tid_matches<const N: usize>(
+        &mut self,
+        tid: u64,
+        handles: &mut VfsSharedIoHandleTable<N>,
+    ) -> Result<VfsSharedIoRequesterExitAction, VfsSharedIoLifecycleError> {
+        if tid != self.requester_tid {
+            return Ok(VfsSharedIoRequesterExitAction::NotMatched);
+        }
+        self.deliver_requester_exit(handles)
+            .map(VfsSharedIoRequesterExitAction::Matched)
+    }
+
     /// Delivers a helper-only requester-exit notification to this lifecycle state machine.
     ///
     /// This is the VFS-side entry point for `VfsSharedIoTerminalReason::RequesterExit`.
@@ -375,6 +416,28 @@ mod tests {
         let access = direction.required_access();
         let request = VfsSharedIoLifecycle::reserve(
             1,
+            0, // requester_tid: 0 in non-Stage-75 tests
+            descriptor(handle, access, len),
+            len,
+            flags,
+            direction,
+        )
+        .expect("reserve");
+        (handle, request)
+    }
+
+    fn lifecycle_with_tid<const N: usize>(
+        handles: &mut VfsSharedIoHandleTable<N>,
+        requester_tid: u64,
+        direction: VfsSharedIoDirection,
+        flags: u32,
+        len: u64,
+    ) -> (VfsSharedIoHandle, VfsSharedIoLifecycle) {
+        let handle = handles.allocate().expect("allocate handle");
+        let access = direction.required_access();
+        let request = VfsSharedIoLifecycle::reserve(
+            1,
+            requester_tid,
             descriptor(handle, access, len),
             len,
             flags,
@@ -411,6 +474,7 @@ mod tests {
         );
         let mut stale_request = VfsSharedIoLifecycle::reserve(
             2,
+            0, // requester_tid: 0 in stale-descriptor test
             descriptor(first, VFS_SHARED_BUFFER_FS_WRITE, 8),
             8,
             0,
@@ -431,6 +495,7 @@ mod tests {
         assert_eq!(
             VfsSharedIoLifecycle::reserve(
                 1,
+                0, // requester_tid: 0 in direction-validation test
                 descriptor(handle, VFS_SHARED_BUFFER_FS_READ, 8),
                 8,
                 0,
@@ -695,5 +760,242 @@ mod tests {
             new_handle.object_generation, old_handle.object_generation,
             "generation must advance"
         );
+    }
+
+    // ── Stage 75: TID-matched RequesterExit delivery ─────────────────────────
+    //
+    // These tests prove the VFS-side identity model for RequesterExit:
+    // `VfsSharedIoLifecycle::requester_tid` stores the requesting TID, and
+    // `deliver_requester_exit_if_tid_matches` dispatches by TID with a safe
+    // no-op on mismatch.  Production wiring (supervisor→VFS notification
+    // channel + VFS lifecycle store) is documented but not implemented here.
+
+    #[test]
+    fn stage75_lifecycle_requester_tid_stored() {
+        // requester_tid stored at reserve() time and readable via accessor.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, request) =
+            lifecycle_with_tid(&mut handles, 42, VfsSharedIoDirection::ReadReply, 0, 8);
+        assert_eq!(request.requester_tid(), 42);
+    }
+
+    #[test]
+    fn stage75_matched_tid_delivers_requester_exit() {
+        // TID matches → Matched(Won(RequesterExit)).
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) =
+            lifecycle_with_tid(&mut handles, 99, VfsSharedIoDirection::ReadReply, 0, 16);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        assert_eq!(request.state(), VfsSharedIoState::InFlight);
+        let action = request
+            .deliver_requester_exit_if_tid_matches(99, &mut handles)
+            .expect("deliver");
+        assert_eq!(
+            action,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            ))
+        );
+        assert_eq!(request.state(), VfsSharedIoState::Cleaned);
+    }
+
+    #[test]
+    fn stage75_unmatched_tid_is_safe_noop() {
+        // TID does not match → NotMatched; lifecycle state unchanged.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) =
+            lifecycle_with_tid(&mut handles, 7, VfsSharedIoDirection::ReadReply, 0, 8);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        let action = request
+            .deliver_requester_exit_if_tid_matches(8, &mut handles)
+            .expect("no-op");
+        assert_eq!(action, VfsSharedIoRequesterExitAction::NotMatched);
+        assert_eq!(
+            request.state(),
+            VfsSharedIoState::InFlight,
+            "state must be unchanged after NotMatched"
+        );
+    }
+
+    #[test]
+    fn stage75_duplicate_matched_tid_is_idempotent() {
+        // Calling deliver_requester_exit_if_tid_matches twice with a matching TID
+        // must return Matched(AlreadyCleaned) on the second call.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) =
+            lifecycle_with_tid(&mut handles, 5, VfsSharedIoDirection::ReadReply, 0, 8);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        let first = request
+            .deliver_requester_exit_if_tid_matches(5, &mut handles)
+            .expect("first");
+        let second = request
+            .deliver_requester_exit_if_tid_matches(5, &mut handles)
+            .expect("second");
+        assert_eq!(
+            first,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            ))
+        );
+        assert_eq!(
+            second,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::AlreadyCleaned(
+                VfsSharedIoTerminalReason::RequesterExit
+            ))
+        );
+    }
+
+    #[test]
+    fn stage75_explicit_cleanup_before_matched_tid_is_noop() {
+        // Success cleanup runs before TID-matched exit notification arrives.
+        // Exit must return Matched(AlreadyCleaned(Success)).
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) =
+            lifecycle_with_tid(&mut handles, 11, VfsSharedIoDirection::ReadReply, 0, 8);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        request.complete(8).expect("complete");
+        request
+            .cleanup(&mut handles, VfsSharedIoTerminalReason::Success)
+            .expect("success cleanup");
+        let action = request
+            .deliver_requester_exit_if_tid_matches(11, &mut handles)
+            .expect("exit after success");
+        assert_eq!(
+            action,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::AlreadyCleaned(
+                VfsSharedIoTerminalReason::Success
+            ))
+        );
+    }
+
+    #[test]
+    fn stage75_zero_tid_lifecycle_matches_only_zero_tid() {
+        // A lifecycle created with requester_tid=0 only matches TID 0.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) =
+            lifecycle_with_tid(&mut handles, 0, VfsSharedIoDirection::ReadReply, 0, 8);
+        let action_nonzero = request
+            .deliver_requester_exit_if_tid_matches(1, &mut handles)
+            .expect("nonzero no-op");
+        assert_eq!(action_nonzero, VfsSharedIoRequesterExitAction::NotMatched);
+        let action_zero = request
+            .deliver_requester_exit_if_tid_matches(0, &mut handles)
+            .expect("zero matches");
+        assert!(matches!(
+            action_zero,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(_))
+        ));
+    }
+
+    #[test]
+    fn stage75_generation_advances_after_tid_matched_exit() {
+        // After TID-matched exit, the slot generation advances and old descriptor is stale.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (old_handle, mut request) =
+            lifecycle_with_tid(&mut handles, 3, VfsSharedIoDirection::ReadReply, 0, 8);
+        let old_descriptor = descriptor(old_handle, VFS_SHARED_BUFFER_FS_WRITE, 8);
+        request
+            .deliver_requester_exit_if_tid_matches(3, &mut handles)
+            .expect("exit");
+        assert_eq!(
+            handles.validate(old_descriptor),
+            Err(VfsSharedIoLifecycleError::StaleHandle),
+            "slot must be released and descriptor stale"
+        );
+        let new_handle = handles.allocate().expect("reuse slot");
+        assert_eq!(new_handle.object_handle, old_handle.object_handle);
+        assert_ne!(new_handle.object_generation, old_handle.object_generation);
+    }
+
+    #[test]
+    fn stage75_read_reply_lifecycle_observes_tid_matched_exit() {
+        // ReadReply direction lifecycle is cleaned up by TID-matched exit.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle_with_tid(
+            &mut handles,
+            77,
+            VfsSharedIoDirection::ReadReply,
+            0,
+            32,
+        );
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        assert_eq!(request.direction(), VfsSharedIoDirection::ReadReply);
+        let action = request
+            .deliver_requester_exit_if_tid_matches(77, &mut handles)
+            .expect("exit");
+        assert_eq!(
+            action,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            ))
+        );
+    }
+
+    #[test]
+    fn stage75_write_request_lifecycle_unaffected_by_unmatched_tid() {
+        // WriteRequest lifecycle for TID=20 is not affected by exit notification for TID=21.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle_with_tid(
+            &mut handles,
+            20,
+            VfsSharedIoDirection::WriteRequest,
+            0,
+            8,
+        );
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        let action = request
+            .deliver_requester_exit_if_tid_matches(21, &mut handles)
+            .expect("no-op");
+        assert_eq!(action, VfsSharedIoRequesterExitAction::NotMatched);
+        assert_eq!(request.state(), VfsSharedIoState::InFlight);
+        assert_eq!(request.requester_tid(), 20);
+    }
+
+    #[test]
+    fn stage75_multiple_lifecycles_only_matched_tid_cleaned() {
+        // Two lifecycles with different TIDs: exit for TID A must not affect TID B's lifecycle.
+        let mut handles = VfsSharedIoHandleTable::<2>::new();
+        let (_, mut req_a) = lifecycle_with_tid(
+            &mut handles,
+            100,
+            VfsSharedIoDirection::ReadReply,
+            0,
+            8,
+        );
+        let (_, mut req_b) = lifecycle_with_tid(
+            &mut handles,
+            200,
+            VfsSharedIoDirection::ReadReply,
+            0,
+            8,
+        );
+        req_a.map(&handles).expect("map a");
+        req_a.begin().expect("begin a");
+        req_b.map(&handles).expect("map b");
+        req_b.begin().expect("begin b");
+
+        // Exit for TID 100 only cleans req_a.
+        let action_a = req_a
+            .deliver_requester_exit_if_tid_matches(100, &mut handles)
+            .expect("exit a");
+        let action_b = req_b
+            .deliver_requester_exit_if_tid_matches(100, &mut handles)
+            .expect("exit b no-op");
+
+        assert_eq!(
+            action_a,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            ))
+        );
+        assert_eq!(action_b, VfsSharedIoRequesterExitAction::NotMatched);
+        assert_eq!(req_a.state(), VfsSharedIoState::Cleaned);
+        assert_eq!(req_b.state(), VfsSharedIoState::InFlight);
     }
 }

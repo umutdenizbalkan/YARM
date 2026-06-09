@@ -3983,3 +3983,53 @@ buffers, rejects RO-perm, delivers short-EOF, and calls cleanup exactly once.
 - `cargo test --lib stage60 -- --test-threads=1` (kernel regression)
 - `cargo check --no-default-features` (no errors)
 - `cargo check -p yarm-fs-servers` (no errors)
+
+---
+
+## Rule N+67 — Stage 75: TID-matched RequesterExit identity model
+
+**Purpose:** Prove VFS-side identity model for RequesterExit delivery: `requester_tid` field
+in `VfsSharedIoLifecycle`, TID-matched delivery with `deliver_requester_exit_if_tid_matches`,
+safe no-op on mismatch, idempotency, and gate checks.  Documents exact missing infrastructure
+before `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` can be `true`.
+
+**Modules:**
+- `mod stage75` in `crates/yarm-fs-servers/src/fs/common/shared_io_lifecycle.rs` (10 tests)
+- `mod stage75_tests` in `crates/yarm-fs-servers/src/fs/common/vfs_service.rs` (8 tests)
+
+**Lifecycle tests (`mod stage75`, 10 total):**
+- `stage75_lifecycle_requester_tid_stored` — `requester_tid()` returns stored TID
+- `stage75_matched_tid_delivers_requester_exit` — TID match → `Matched(Won(RequesterExit))`
+- `stage75_unmatched_tid_is_safe_noop` — different TID → `NotMatched`, state unchanged
+- `stage75_duplicate_matched_tid_is_idempotent` — second call → `Matched(AlreadyCleaned)`
+- `stage75_explicit_cleanup_before_matched_tid_is_noop` — success cleanup before TID match → `Matched(AlreadyCleaned(Success))`
+- `stage75_zero_tid_lifecycle_matches_only_zero_tid` — TID=0 only matches TID=0
+- `stage75_generation_advances_after_tid_matched_exit` — generation increments after TID match
+- `stage75_read_reply_lifecycle_observes_tid_matched_exit` — ReadReply direction cleaned by TID exit
+- `stage75_write_request_lifecycle_unaffected_by_unmatched_tid` — WriteRequest not affected by wrong TID
+- `stage75_multiple_lifecycles_only_matched_tid_cleaned` — 2 lifecycles, 1 TID match, only that one cleaned
+
+**Dispatch tests (`mod stage75_tests`, 8 total):**
+- `stage75_supervisor_task_exit_notification_not_yet_wired` — `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED == false`
+- `stage75_vfs_shared_io_still_disabled` — `VFS_SHARED_IO_ENABLED == false`
+- `stage75_vfs_read_shared_reply_still_enabled` — `VFS_READ_SHARED_REPLY_ENABLED == true`
+- `stage75_write_shared_request_still_disabled` — `VFS_WRITE_SHARED_REQUEST_ENABLED == false`
+- `stage75_tid_matched_exit_cleans_lifecycle_in_vfs_context` — TID match in VfsService context
+- `stage75_unrelated_task_exit_does_not_affect_active_request` — wrong TID → NotMatched
+- `stage75_handle_request_unchanged_for_read_shared_opcode` — `handle_request` → `Unsupported`
+- `stage75_old_vfs_parse_request_accepts_standard_ops` — standard ops still parse correctly
+
+**Hard invariants:**
+- `VfsSharedIoLifecycle::requester_tid` must be set at `reserve()` time and never change.
+- `deliver_requester_exit_if_tid_matches(wrong_tid, handles)` must return `NotMatched` without touching state.
+- `deliver_requester_exit_if_tid_matches(matching_tid, handles)` must be idempotent.
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`; do not enable without both missing pieces.
+- `VFS_SHARED_IO_ENABLED = false`; unchanged.
+- `VFS_READ_SHARED_REPLY_ENABLED = true`; unchanged.
+- No startup slots changed; no Drop-based cleanup added; SYSCALL_COUNT=31 unchanged.
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --lib stage75 -- --test-threads=1` (10 lifecycle tests)
+- `cargo test -p yarm-fs-servers --lib stage75_tests -- --test-threads=1` (8 dispatch tests)
+- `cargo test -p yarm-fs-servers --lib -- --test-threads=1` (full 295-test regression)
+- `cargo check -p yarm-fs-servers` (no errors)

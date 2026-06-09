@@ -675,6 +675,7 @@ route for WRITE_SHARED_REQUEST. No global enable occurs. READ_SHARED_REPLY remai
 | `VFS_WRITE_SHARED_REQUEST_ENABLED` | `false` | WRITE_SHARED_REQUEST live route gate |
 | `VFS_READ_SHARED_REPLY_ENABLED` | `true` (Stage 73) | READ_SHARED_REPLY gate — enabled; live notification still helper-only |
 | `VFS_SHARED_IO_ENABLED` | `false` | Aggregate umbrella — `WRITE && READ`, so `false` |
+| `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` | `false` (Stage 75) | Supervisor→VFS task-exit channel — not yet wired |
 
 `VFS_SHARED_IO_ENABLED` is only `true` when both direction gates are `true`. Since
 `VFS_WRITE_SHARED_REQUEST_ENABLED` remains `false`, the umbrella remains `false`.
@@ -842,12 +843,18 @@ Total `yarm-fs-servers` tests after Stage 69+70: **261** (up from 245).
 ### Remaining blockers before global `VFS_SHARED_IO_ENABLED`
 
 1. **Process-exit cleanup** — ~~kernel must signal VFS server when a process holding a mapped~~
-   ~~receive exits~~ **CONFIRMED (Stage 71)**: the kernel cleanup path
-   `mark_task_dead` → `maybe_cleanup_process_cnode_for_pid` →
-   `purge_active_transfer_mappings_for_pid` exists and is proven correct (9 tests in
-   `mod stage71`).  VFS-side model: `VfsSharedIoLifecycle::deliver_requester_exit` added
-   (Stage 73); lifecycle invariants proven (7 tests).  Remaining production work: live
-   kernel→VFS notification via supervisor `SUPERVISOR_OP_TASK_EXITED`.
+   ~~receive exits~~ **IDENTITY PROVEN (Stage 75)**:
+   - Kernel cleanup path: `mark_task_dead` → `purge_active_transfer_mappings_for_pid` (Stage 71).
+   - VFS lifecycle model: `deliver_requester_exit` (Stage 73), `deliver_requester_exit_if_tid_matches`
+     (Stage 75); lifecycle proven with 7+10 tests.
+   - `VfsSharedIoLifecycle::requester_tid` field (Stage 75): stores the TID so exit events can
+     be correlated to active lifecycles by `deliver_requester_exit_if_tid_matches(tid, handles)`.
+   - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (Stage 75): two remaining pieces
+     before this can be enabled:
+     a. **Supervisor→VFS notification cap**: `InitFaultHandoff` needs a `vfs_task_exit_send_cap`
+        so the supervisor's `handle_task_exit` can forward `SUPERVISOR_OP_TASK_EXITED(tid)` to VFS.
+     b. **VFS-side lifecycle store**: `VfsService` needs a bounded table keyed by `requester_tid`
+        so it can look up and call `deliver_requester_exit_if_tid_matches` on notification.
 2. **Live MAP_WRITE delivery** — ~~the Stage 60 gate must be removed~~ **ENABLED (Stage 72)**:
    the Stage 60 blanket WRITE gate has been removed from `syscall.rs`.  `recv_shared_v3` with
    `map_intent=0x3` now maps memory writably when the transferred cap carries `CAP_RIGHT_WRITE`.
