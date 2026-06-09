@@ -11817,3 +11817,83 @@ rank 1 memory_state).
 active MAP_WRITE receive exits, the kernel cleans the mapping via
 `purge_active_transfer_mappings_for_pid` but does not yet notify the VFS server.  Until
 this notification path is implemented, `VFS_READ_SHARED_REPLY_ENABLED` remains `false`.
+
+---
+
+## §76 Stage 73+74 — RequesterExit helper model + VFS_READ_SHARED_REPLY_ENABLED
+
+### 76.1 Change summary
+
+Stage 73 adds the VFS-side entry point for requester-exit cleanup and enables the
+`VFS_READ_SHARED_REPLY_ENABLED` production gate.  No kernel changes are made.
+
+**New VFS method (`shared_io_lifecycle.rs`):**
+```rust
+pub fn deliver_requester_exit<const N: usize>(
+    &mut self,
+    handles: &mut VfsSharedIoHandleTable<N>,
+) -> Result<VfsSharedIoCleanupResult, VfsSharedIoLifecycleError> {
+    self.cleanup(handles, VfsSharedIoTerminalReason::RequesterExit)
+}
+```
+This is a thin wrapper over the existing `cleanup` path.  It models the VFS-side handler
+that will eventually be called when the supervisor delivers `SUPERVISOR_OP_TASK_EXITED`.
+
+**Flag change (`shared_io_adapter.rs`):**
+```rust
+pub const VFS_READ_SHARED_REPLY_ENABLED: bool = true;  // Stage 73
+```
+
+**VfsService dispatch tests (`vfs_service.rs`, `mod stage73_74_tests`, 9 tests):**
+confirm that `dispatch_read_shared_reply` correctly handles RW-perm buffers end-to-end,
+rejects RO-perm buffers with `PermissionDenied`, delivers short-EOF, and calls cleanup
+exactly once.
+
+### 76.2 Signal delivery classification
+
+The RequesterExit delivery model is classified **helper-only** (class C + D):
+
+- **Class C**: `deliver_requester_exit` is implemented and lifecycle invariants are proven
+  by 7 unit tests (`mod stage73` in `shared_io_lifecycle.rs`).
+- **Class D**: No live kernel→VFS notification path exists.  `mark_task_dead` in
+  `src/kernel/task.rs` calls `purge_active_transfer_mappings_for_pid` (kernel mapping
+  cleanup) but performs no userspace notification.  The supervisor
+  `SUPERVISOR_OP_TASK_EXITED` message path is not yet wired to call
+  `deliver_requester_exit`.
+
+Until Class D is resolved, `VFS_SHARED_IO_ENABLED` remains `false`.
+
+### 76.3 Lifecycle invariants proven (7 tests)
+
+| Test | Invariant |
+|---|---|
+| `stage73_requester_exit_before_completion_wins` | RequesterExit during Active state returns `Cleaned` |
+| `stage73_duplicate_requester_exit_is_idempotent` | Double RequesterExit returns `AlreadyCleaned` |
+| `stage73_success_cleanup_beats_requester_exit` | Success cleanup blocks subsequent RequesterExit |
+| `stage73_backend_error_beats_requester_exit` | BackendError cleanup blocks subsequent RequesterExit |
+| `stage73_requester_exit_blocks_inline_fallback` | RequesterExit prevents inline fallback transition |
+| `stage73_requester_exit_from_reserved_state` | RequesterExit from Reserved state is safe no-op |
+| `stage73_handle_generation_advances_after_requester_exit` | Generation counter increments after exit |
+
+### 76.4 Lock ordering
+
+No change to lock ordering.  `deliver_requester_exit` operates entirely within
+`VfsSharedIoLifecycle` state (no kernel locks held; VFS-side only).
+
+### 76.5 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- NR 30 = `RecvSharedV3` (no change)
+- NR 4 = `TransferRelease` (no change)
+- All `recv_shared_v3` ABI field offsets unchanged
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (Stage 73 — dispatch path enabled)
+- `VFS_SHARED_IO_ENABLED = false` (production umbrella still gated)
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = false` (WRITE direction still disabled)
+- No Drop-based cleanup added
+- No SpawnV5/Phase2B/Phase3B/startup slot changes
+
+### 76.6 Remaining work
+
+Live RequesterExit delivery: wire `SUPERVISOR_OP_TASK_EXITED` message in the VFS
+supervisor loop to call `deliver_requester_exit` on the affected lifecycle state,
+then enable `VFS_SHARED_IO_ENABLED = true` after full integration testing.
