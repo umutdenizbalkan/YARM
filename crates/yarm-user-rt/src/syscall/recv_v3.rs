@@ -44,6 +44,10 @@ pub struct RecvSharedV3Delivery {
     pub object_generation: u64,
     /// Effective rights on the receiver-local transferred cap (Stage 47+48); 0 when none.
     pub effective_rights: u32,
+    /// Exact byte size of the transferred MemoryObject (Stage 49); 0 for non-MemoryObject
+    /// caps and when no cap was transferred. Always a non-zero page-aligned multiple
+    /// when a MemoryObject was successfully transferred.
+    pub exact_object_size: u64,
 }
 
 impl RecvSharedV3Delivery {
@@ -69,6 +73,7 @@ impl RecvSharedV3Delivery {
             object_kind: output.object_kind,
             object_generation: output.object_generation,
             effective_rights: output.effective_rights,
+            exact_object_size: output.exact_object_size,
         })
     }
 
@@ -100,6 +105,19 @@ impl RecvSharedV3Delivery {
     #[inline]
     pub const fn effective_rights(&self) -> u32 {
         self.effective_rights
+    }
+
+    /// Returns the exact byte size of the transferred MemoryObject (Stage 49).
+    /// 0 when no MemoryObject was transferred or when the size is unavailable.
+    #[inline]
+    pub const fn exact_object_size(&self) -> u64 {
+        self.exact_object_size
+    }
+
+    /// Returns `true` when `exact_object_size` is authoritative (> 0).
+    #[inline]
+    pub const fn has_exact_object_size(&self) -> bool {
+        self.exact_object_size > 0
     }
 }
 
@@ -219,6 +237,7 @@ pub unsafe fn ipc_recv_shared_v3_nonblocking(
                 object_kind: output.object_kind,
                 object_generation: output.object_generation,
                 effective_rights: output.effective_rights,
+                exact_object_size: output.exact_object_size,
             }))
         }
         RECV_V3_STATUS_WOULD_BLOCK => Ok(None),
@@ -540,6 +559,7 @@ mod tests {
             object_kind: output.object_kind,
             object_generation: output.object_generation,
             effective_rights: output.effective_rights,
+            exact_object_size: output.exact_object_size,
         };
 
         assert_eq!(
@@ -616,5 +636,67 @@ mod tests {
         assert_eq!(d.object_kind(), 2);
         assert_eq!(d.object_generation(), 0x42);
         assert_eq!(d.effective_rights(), 0x08);
+    }
+
+    // ── Stage 49: exact_object_size accessors ────────────────────────────────
+
+    #[test]
+    fn exact_object_size_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            exact_object_size: 4096,
+            ..Default::default()
+        };
+        assert_eq!(d.exact_object_size(), 4096);
+    }
+
+    #[test]
+    fn has_exact_object_size_true_when_nonzero() {
+        let d = RecvSharedV3Delivery {
+            exact_object_size: 4096,
+            ..Default::default()
+        };
+        assert!(d.has_exact_object_size());
+    }
+
+    #[test]
+    fn has_exact_object_size_false_when_zero() {
+        let d = RecvSharedV3Delivery::default();
+        assert!(!d.has_exact_object_size());
+    }
+
+    #[test]
+    fn from_output_decodes_exact_object_size_for_memory_object() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 3;
+        output.object_kind = 1; // MemoryObject
+        output.effective_rights = 0x07;
+        output.exact_object_size = 4096; // 1 page
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.exact_object_size(), 4096);
+        assert!(d.has_exact_object_size());
+    }
+
+    #[test]
+    fn from_output_exact_object_size_zero_for_no_cap() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = u64::MAX; // no cap
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.exact_object_size(), 0);
+        assert!(!d.has_exact_object_size());
+    }
+
+    #[test]
+    fn from_output_exact_object_size_zero_for_endpoint() {
+        // Endpoint caps do not have a byte size — kernel writes 0 for non-MemoryObject kinds.
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 9;
+        output.object_kind = 2; // Endpoint
+        output.exact_object_size = 0;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.exact_object_size(), 0);
+        assert!(!d.has_exact_object_size());
     }
 }

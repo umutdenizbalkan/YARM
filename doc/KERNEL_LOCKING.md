@@ -10642,13 +10642,68 @@ that §60.5 identified as remaining FUTURE/zero.  `exact_object_size` stays 0.
 - `object_generation @48 == 0` (MemoryObject has no generation field)
 - `effective_rights @56 == 0x07` (READ|WRITE|MAP on anonymous MemoryObject)
 - `padding @60 == 0`
-- `exact_object_size @64 == 0` (FUTURE)
+- `exact_object_size @64 == PAGE_SIZE` (authoritative since Stage 49; updated from 0)
 
 **Negative proof (plain message, no cap):**
 - All five introspection fields are 0.
 
-### 61.5 FUTURE / remaining blockers
+### 61.5 FUTURE / remaining blockers (resolved in Stage 49)
 
-- `exact_object_size` for MemoryObject (Stage 49 — requires authoritative size in CapObject).
+- `exact_object_size` for MemoryObject implemented in Stage 49 (see §62).
+- No production service loop uses recv_shared_v3.
+- `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.
+
+## §62 Stage 49: exact_object_size for MemoryObject transfers in recv_shared_v3
+
+### 62.1 Goal
+
+Fill `exact_object_size @64` in the `RecvSharedV3Output` 80-byte buffer when the
+transferred cap resolves to a `CapObject::MemoryObject`. All other cap kinds and
+plain messages continue to receive 0.
+
+### 62.2 Authoritative size source
+
+`MemoryObject.len: usize` in `MemorySubsystem.memory_objects` (a `[Option<MemoryObject>; 512]`
+array). The `len` field is always > 0 and PAGE_SIZE-aligned (enforced at creation in
+`create_memory_object_with_len_and_kind`). Looked up by iterating the array and matching
+`entry.id == id` (where `id` is extracted from `CapObject::MemoryObject { id }`).
+
+`CapObject::MemoryObject` stores only `id: u64` — no size. The kernel registry is
+the sole authority.
+
+### 62.3 Kernel implementation
+
+**`recv_v3_exact_object_size(kernel: &KernelState, obj: CapObject) -> u64`:**
+- Pattern-matches on `CapObject::MemoryObject { id }` — returns 0 for all other variants.
+- Calls `kernel.with_memory_state(|memory| ...)` and linear-searches `memory_objects` by `id`.
+- Returns `entry.len as u64` or 0 if the object is not found (should not happen after materialization).
+
+**`write_v3_output_to_user`:** New `exact_object_size: u64` parameter fills `out[64..72]`.
+
+**`handle_recv_shared_v3` OK path:** Metadata computation block refactored to call
+`capability_service().resolve_current_task_capability()` first (releasing the borrow),
+then calls `recv_v3_exact_object_size(kernel, cap.object)` separately.
+
+### 62.4 Proven assertions (mod stage49 in src/kernel/boot/tests.rs)
+
+**Primary proof (1-page MemoryObject):**
+- `exact_object_size @64 == PAGE_SIZE` (create_memory_object defaults to 1 page)
+- `region_offset @72 == 0` (FUTURE)
+
+**Negative proof (plain message, no cap):**
+- `exact_object_size == 0`
+
+### 62.5 ABI semantics (frozen)
+
+- `exact_object_size` is authoritative for `object_kind == MemoryObject (1)` only.
+- For all other cap kinds (Endpoint, Notification, ReplyCap, Other) → 0.
+- For plain messages (no cap transferred) → 0.
+- The value is always a non-zero multiple of PAGE_SIZE when a MemoryObject was transferred.
+
+### 62.6 FUTURE / remaining blockers
+
+- `exact_region_len` (sub-region exact length for DmaRegion / shared mapping) — Stage 50+.
+- `map_intent` / shared-memory mapping — Stage 50+.
+- `cleanup_token` — future.
 - No production service loop uses recv_shared_v3.
 - `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.

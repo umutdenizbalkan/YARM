@@ -3213,9 +3213,58 @@ remains 0 (FUTURE; Stage 49).
 - `abi_effective_rights_read_write_map_combo` — `READ | WRITE | MAP == 0x07`.
 
 **Run commands:**
-- `cargo test --lib stage47 -- --test-threads=1` (2 kernel tests)
+- `cargo test --lib stage47 -- --test-threads=1` (2 kernel tests; exact_object_size assertion updated to PAGE_SIZE in Stage 49)
 - `cargo test -p yarm-user-rt --lib recv_v3` (33 user-rt tests total)
 - `cargo test -p yarm-ipc-abi --lib recv_shared_v3` (ABI crate tests)
 - `cargo test --features hosted-dev --lib -- --test-threads=1` (all kernel tests)
+
+All tests must pass.
+
+## Rule N+52: Stage 49 — exact_object_size for MemoryObject transfers in recv_shared_v3
+
+Stage 49 fills `exact_object_size @64` in the `RecvSharedV3Output` buffer with the
+page-aligned byte length of a transferred MemoryObject. All other cap kinds and plain
+messages receive 0.
+
+**Authoritative source:**
+`MemoryObject.len: usize` from `MemorySubsystem.memory_objects` (kernel registry).
+Accessed via `kernel.with_memory_state(|m| m.memory_objects.iter().flatten().find(...).map(|e| e.len as u64))`.
+
+**ABI semantics (frozen):**
+- `exact_object_size > 0` and `PAGE_SIZE`-aligned when `object_kind == MemoryObject`.
+- 0 for all other cap kinds (not fabricated — genuinely unavailable).
+- 0 for plain messages (no cap transferred).
+- `exact_region_len` (DmaRegion sub-range) remains 0 (FUTURE).
+
+**Kernel changes:**
+- `recv_v3_exact_object_size(kernel: &KernelState, obj: CapObject) -> u64` helper.
+- `write_v3_output_to_user` gains `exact_object_size: u64` param, writes `out[64..72]`.
+- `handle_recv_shared_v3` OK path refactored: capability resolved first (borrow released),
+  then `recv_v3_exact_object_size` called separately.
+- Stage 47 test updated: `exact_object_size @64 == PAGE_SIZE` (was 0/FUTURE).
+
+**(A) Kernel dispatch tests (2 in `mod stage49`):**
+
+- `stage49_exact_object_size_for_transferred_memory_object` — proves `exact_object_size == PAGE_SIZE`
+  for a 1-page anonymous MemoryObject, and `region_offset == 0` (still FUTURE).
+- `stage49_plain_message_exact_object_size_is_zero` — proves `exact_object_size == 0` when no cap.
+
+**(B) user-rt tests (6 new in `recv_v3.rs`):**
+- `exact_object_size_accessor_returns_field`
+- `has_exact_object_size_true_when_nonzero`
+- `has_exact_object_size_false_when_zero`
+- `from_output_decodes_exact_object_size_for_memory_object`
+- `from_output_exact_object_size_zero_for_no_cap`
+- `from_output_exact_object_size_zero_for_endpoint`
+
+**(C) ABI crate tests (2 new):**
+- `abi_exact_object_size_zero_when_no_cap`
+- `abi_exact_object_size_field_at_offset_64`
+
+**Run commands:**
+- `cargo test --lib stage49 -- --test-threads=1` (2 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (39 user-rt tests total)
+- `cargo test -p yarm-ipc-abi --lib recv_shared_v3` (22 ABI crate tests)
+- `cargo test --features hosted-dev --lib -- --test-threads=1` (1132 total)
 
 All tests must pass.

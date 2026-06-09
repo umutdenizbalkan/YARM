@@ -4059,7 +4059,8 @@ fn parse_v3_request_bytes(
 ///   [48..56]  object_generation (u64)
 ///   [56..60]  effective_rights (u32)
 ///   [60..64]  0 (C-layout padding before u64)
-///   [64..80]  exact_object_size + region_offset — always 0 (FUTURE)
+///   [64..72]  exact_object_size (u64) — authoritative for MemoryObject (Stage 49); 0 otherwise
+///   [72..80]  region_offset — always 0 (FUTURE)
 fn write_v3_output_to_user(
     kernel: &mut KernelState,
     out_ptr: u64,
@@ -4072,6 +4073,7 @@ fn write_v3_output_to_user(
     object_kind: u32,
     object_generation: u64,
     effective_rights: u32,
+    exact_object_size: u64,
 ) {
     use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
     if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
@@ -4091,7 +4093,10 @@ fn write_v3_output_to_user(
     // out[44..48]: C-layout padding (already 0).
     out[48..56].copy_from_slice(&object_generation.to_le_bytes());
     out[56..60].copy_from_slice(&effective_rights.to_le_bytes());
-    // out[60..80]: exact_object_size + region_offset — FUTURE, always 0.
+    // out[60..64]: C-layout padding (already 0).
+    // Stage 49: exact_object_size for MemoryObject; 0 for all other kinds.
+    out[64..72].copy_from_slice(&exact_object_size.to_le_bytes());
+    // out[72..80]: region_offset — FUTURE, always 0.
     let _ = kernel.copy_to_current_user(out_ptr as usize, &out);
 }
 
@@ -4116,6 +4121,29 @@ fn recv_v3_object_generation(obj: crate::kernel::capabilities::CapObject) -> u64
         CapObject::Reply { generation, .. } => generation,
         _ => 0,
     }
+}
+
+/// Return the exact byte size of a [`CapObject::MemoryObject`] from the kernel registry.
+///
+/// Returns the page-aligned byte length stored in `MemorySubsystem.memory_objects`.
+/// Returns 0 for all other cap kinds (not fabricated — genuinely unavailable).
+fn recv_v3_exact_object_size(
+    kernel: &KernelState,
+    obj: crate::kernel::capabilities::CapObject,
+) -> u64 {
+    use crate::kernel::capabilities::CapObject;
+    let CapObject::MemoryObject { id } = obj else {
+        return 0;
+    };
+    kernel.with_memory_state(|memory| {
+        memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.len as u64)
+            .unwrap_or(0)
+    })
 }
 
 /// Stage 42+43: handle the `recv_shared_v3` syscall (NR 30).
@@ -4223,6 +4251,7 @@ fn handle_recv_shared_v3(
                 0,
                 0,
                 0,
+                0,
             );
             crate::yarm_log!("RECV_V3_WOULD_BLOCK tid={}", caller_tid);
             return Err(SyscallError::WouldBlock);
@@ -4257,18 +4286,25 @@ fn handle_recv_shared_v3(
             let message_flags_raw = delivery.msg.flags as u32;
             let xfer_cap_out = materialized_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
 
-            // Stage 47+48: resolve object metadata from the materialized cap.
-            let (obj_kind, obj_gen, eff_rights) = match materialized_cap {
-                Some(cap_id_raw) => kernel
-                    .capability_service()
-                    .resolve_current_task_capability(CapId(cap_id_raw))
-                    .map(|cap| (
-                        recv_v3_object_kind(cap.object),
-                        recv_v3_object_generation(cap.object),
-                        u32::from(cap.rights_bits()),
-                    ))
-                    .unwrap_or((0, 0, 0)),
-                None => (0, 0, 0),
+            // Stage 47+48 + Stage 49: resolve object metadata from the materialized cap.
+            // Resolve capability first (borrows kernel briefly), then query size separately.
+            let (obj_kind, obj_gen, eff_rights, exact_obj_size) = match materialized_cap {
+                Some(cap_id_raw) => {
+                    let resolved = kernel
+                        .capability_service()
+                        .resolve_current_task_capability(CapId(cap_id_raw));
+                    if let Some(cap) = resolved {
+                        (
+                            recv_v3_object_kind(cap.object),
+                            recv_v3_object_generation(cap.object),
+                            u32::from(cap.rights_bits()),
+                            recv_v3_exact_object_size(kernel, cap.object),
+                        )
+                    } else {
+                        (0, 0, 0, 0)
+                    }
+                }
+                None => (0, 0, 0, 0),
             };
 
             match execute_user_asid_plain_writeback(kernel, &delivery) {
@@ -4285,6 +4321,7 @@ fn handle_recv_shared_v3(
                         obj_kind,
                         obj_gen,
                         eff_rights,
+                        exact_obj_size,
                     );
                     frame.set_ok(
                         usize::try_from(sender_tid_raw).unwrap_or(0),
