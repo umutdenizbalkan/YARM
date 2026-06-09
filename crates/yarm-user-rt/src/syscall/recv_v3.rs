@@ -3,17 +3,23 @@
 
 //! Non-blocking user-rt wrapper for the `recv_shared_v3` syscall (NR 30).
 //!
-//! This module implements the userspace half of the frozen Stage 42+43 ABI.
-//! Only the non-blocking (timeout_ticks == 0) path is exposed; blocking and
-//! map_intent require kernel work not yet complete.
+//! This module implements the userspace half of the Stage 42+43 and Stage 61+62 ABI.
+//! Only the non-blocking (timeout_ticks == 0) path is exposed; blocking requires
+//! kernel work not yet complete.
+//!
+//! Two public functions are provided:
+//! - [`ipc_recv_shared_v3_nonblocking`]: plain receive (no mapping, map_intent = 0).
+//! - [`ipc_recv_shared_v3_mapped_readonly_nonblocking`]: mapped read-only receive
+//!   (map_intent = READ, Stage 61+62). Returns mapping metadata including
+//!   `cleanup_token` for explicit release via `release_v3_cleanup_token`.
 
 use core::mem::size_of;
 use yarm_ipc_abi::recv_shared_v3_abi::{
-    RecvSharedV3ObjectKind, RecvSharedV3Output, RECV_V3_CLEANUP_TOKEN_NONE,
-    RECV_V3_MIN_REQUEST_LEN, RECV_V3_STATUS_OK, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION,
+    RECV_V3_CLEANUP_TOKEN_NONE, RECV_V3_MAP_READ, RECV_V3_MIN_REQUEST_LEN, RECV_V3_STATUS_OK,
+    RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION, RecvSharedV3ObjectKind, RecvSharedV3Output,
 };
 
-use super::{decode_syscall_error, SyscallError};
+use super::{SyscallError, decode_syscall_error};
 
 /// NR 30: non-blocking `recv_shared_v3` added in Stage 42+43.
 pub const SYSCALL_RECV_SHARED_V3_NR: usize = 30;
@@ -52,19 +58,18 @@ pub struct RecvSharedV3Delivery {
     /// non-DmaRegion caps and when no cap was transferred. Only populated when the
     /// caller provided at least 88 bytes for the output buffer.
     pub exact_region_len: u64,
-    /// VA where the shared region was mapped (Stage 54+); **always 0** in the
-    /// current stage — `map_intent != 0` still returns `InvalidArgs`.
+    /// VA where the shared region was mapped (Stage 61+62).  Non-zero only after
+    /// [`ipc_recv_shared_v3_mapped_readonly_nonblocking`]; always 0 after a plain
+    /// receive.
     pub mapped_base: u64,
-    /// Page-rounded byte length of the mapping (Stage 54+); **always 0** in the
-    /// current stage.
+    /// Page-rounded byte length of the mapping (Stage 61+62); 0 for plain receive.
     pub page_rounded_mapped_len: u64,
-    /// Actual mapping permissions granted (Stage 54+); **always 0** in the
-    /// current stage.  Bitmask of RECV_V3_MAP_READ (0x1) / RECV_V3_MAP_WRITE (0x2).
+    /// Actual mapping permissions granted (Stage 61+62); 0 for plain receive.
+    /// `0x1` = read-only.  Bitmask of RECV_V3_MAP_READ (0x1) / RECV_V3_MAP_WRITE (0x2).
     pub actual_mapping_perm: u32,
-    /// Raw cleanup token from the kernel output (Stage 54+).  **Always 0** in the
-    /// current stage — no live shared-memory mapping is performed and no cleanup
-    /// identity is allocated.  Check with [`RECV_V3_CLEANUP_TOKEN_NONE`] (= 0)
-    /// before taking any cleanup action.
+    /// Opaque cleanup token (Stage 61+62).  Non-zero after a successful mapped receive;
+    /// 0 ([`RECV_V3_CLEANUP_TOKEN_NONE`]) for plain receives.  Pass to
+    /// `release_v3_cleanup_token` when the mapping is no longer needed.
     pub cleanup_token: u64,
 }
 
@@ -162,53 +167,46 @@ impl RecvSharedV3Delivery {
         self.object_kind == RecvSharedV3ObjectKind::DmaRegion as u32
     }
 
-    /// Returns the raw cleanup token from the kernel output (Stage 54+).
+    /// Returns the raw cleanup token from the kernel output (Stage 61+62).
     ///
-    /// **Always 0** in the current stage — no live shared-memory mapping
-    /// is performed.  Callers must check against [`RECV_V3_CLEANUP_TOKEN_NONE`]
-    /// before acting on this value.
+    /// Non-zero after [`ipc_recv_shared_v3_mapped_readonly_nonblocking`].
+    /// Zero ([`RECV_V3_CLEANUP_TOKEN_NONE`]) after a plain receive.
+    /// Pass to `release_v3_cleanup_token` to unmap the region.
     #[inline]
     pub const fn cleanup_token(&self) -> u64 {
         self.cleanup_token
     }
 
-    /// Returns `true` when a non-zero cleanup token is present.
-    ///
-    /// Always `false` in the current stage (no live mapping exists).
+    /// Returns `true` when a non-zero cleanup token is present (Stage 61+62).
     #[inline]
     pub fn has_cleanup_token(&self) -> bool {
         self.cleanup_token != RECV_V3_CLEANUP_TOKEN_NONE
     }
 
-    /// VA where the shared region was mapped (Stage 54+).
+    /// VA where the shared region was mapped (Stage 61+62).
     ///
-    /// **Always 0** in the current stage — `map_intent != 0` returns
-    /// `InvalidArgs` and no VM mapping is performed.
+    /// Non-zero only after [`ipc_recv_shared_v3_mapped_readonly_nonblocking`];
+    /// 0 after a plain receive.
     #[inline]
     pub const fn mapped_base(&self) -> u64 {
         self.mapped_base
     }
 
-    /// Page-rounded byte length of the mapping (Stage 54+).
-    ///
-    /// **Always 0** in the current stage.
+    /// Page-rounded byte length of the mapping (Stage 61+62); 0 for plain receive.
     #[inline]
     pub const fn page_rounded_mapped_len(&self) -> u64 {
         self.page_rounded_mapped_len
     }
 
-    /// Actual permissions granted for the mapping (Stage 54+).
-    ///
-    /// **Always 0** in the current stage.
+    /// Actual permissions granted for the mapping (Stage 61+62); 0 for plain receive.
+    /// `0x1` = read-only.
     #[inline]
     pub const fn actual_mapping_perm(&self) -> u32 {
         self.actual_mapping_perm
     }
 
     /// Returns `true` when a live shared-memory mapping was established
-    /// (i.e. `mapped_base != 0`).
-    ///
-    /// **Always `false`** in the current stage.
+    /// (i.e. `mapped_base != 0`).  `true` after a successful mapped receive.
     #[inline]
     pub fn has_mapping(&self) -> bool {
         self.mapped_base != 0
@@ -239,6 +237,32 @@ fn encode_nonblocking_request(
     // flags @ 52:      0 (reserved)
     // timeout_ticks @ 56: 0 (non-blocking)
     // reserved @ 64:   0, 0
+    buf
+}
+
+/// Encode a non-blocking, READ-ONLY map-intent `recv_shared_v3` request as 80 bytes.
+///
+/// Sets `map_intent = RECV_V3_MAP_READ` (0x1) and `metadata_len` = the full
+/// `RecvSharedV3Output` struct size (≥ `RECV_V3_TOKEN_OUTPUT_LEN` = 120) so the
+/// kernel writes all live-mapping fields including `cleanup_token`.
+#[inline]
+fn encode_mapped_readonly_request(
+    endpoint_cap: u64,
+    payload_ptr: u64,
+    payload_len: u64,
+    metadata_ptr: u64,
+) -> [u8; 80] {
+    let metadata_len = size_of::<RecvSharedV3Output>() as u64;
+    let mut buf = [0u8; 80];
+    buf[0..4].copy_from_slice(&RECV_V3_VERSION.to_le_bytes());
+    buf[4..8].copy_from_slice(&RECV_V3_MIN_REQUEST_LEN.to_le_bytes());
+    buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+    buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+    buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+    buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+    buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+    buf[48..52].copy_from_slice(&(RECV_V3_MAP_READ as u32).to_le_bytes()); // map_intent = READ
+    // flags @ 52: 0, timeout_ticks @ 56: 0 (non-blocking)
     buf
 }
 
@@ -301,6 +325,111 @@ pub unsafe fn ipc_recv_shared_v3_nonblocking(
     // On aarch64/riscv64 the error code lands in ret.ret0 (x0/a0).  The
     // sentinel distinguishes "kernel returned an error without writing output"
     // from "kernel wrote output and status happens to look like an error code".
+    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+    let error: Option<SyscallError> = if output.result_status == STATUS_SENTINEL_UNWRITTEN {
+        Some(decode_syscall_error(ret.ret0))
+    } else {
+        None
+    };
+
+    if let Some(err) = error {
+        return if matches!(err, SyscallError::WouldBlock) {
+            Ok(None)
+        } else {
+            Err(err)
+        };
+    }
+
+    match output.result_status {
+        RECV_V3_STATUS_OK => {
+            let transferred_cap = if output.has_no_transfer_cap() {
+                None
+            } else {
+                Some(output.transferred_cap)
+            };
+            Ok(Some(RecvSharedV3Delivery {
+                sender_tid: output.sender_tid,
+                message_len: output.message_len,
+                message_flags: output.message_flags,
+                transferred_cap,
+                object_kind: output.object_kind,
+                object_generation: output.object_generation,
+                effective_rights: output.effective_rights,
+                exact_object_size: output.exact_object_size,
+                exact_region_len: output.exact_region_len,
+                mapped_base: output.mapped_base,
+                page_rounded_mapped_len: output.page_rounded_mapped_len,
+                actual_mapping_perm: output.actual_mapping_perm,
+                cleanup_token: output.cleanup_token,
+            }))
+        }
+        RECV_V3_STATUS_WOULD_BLOCK => Ok(None),
+        _ => Err(SyscallError::Internal),
+    }
+}
+
+/// Non-blocking READ-ONLY mapped receive on a `recv_shared_v3` endpoint (NR 30).
+///
+/// Sets `map_intent = RECV_V3_MAP_READ` (0x1) so the kernel maps the transferred
+/// `DmaRegion` or `MemoryObject` into the receiver's address space at `payload_ptr`
+/// (page-aligned, read-only).  The kernel must receive an `OPCODE_SHARED_MEM` message
+/// for the mapping to succeed; a plain inline message returns `Err(InvalidArgs)`.
+///
+/// On success, `delivery.has_mapping()` is `true` and `delivery.cleanup_token()` is
+/// non-zero.  Pass the token to `release_v3_cleanup_token` when the mapping is no
+/// longer needed.  No `Drop`-based cleanup is performed — callers must release
+/// explicitly.
+///
+/// Returns:
+/// - `Ok(Some(delivery))` — mapping established; `output` contains all metadata.
+/// - `Ok(None)` — no message ready (non-blocking WouldBlock).
+/// - `Err(e)` — kernel error (includes `InvalidArgs` if received message is not
+///   `OPCODE_SHARED_MEM` or map_intent is unsupported for this cap type).
+///
+/// # Safety
+///
+/// `payload_ptr` must be a page-aligned VA in the current task's address space
+/// with at least `payload_len` bytes of capacity; the kernel will install page
+/// table entries there.  `output` must be valid for the duration of this call.
+#[inline]
+pub unsafe fn ipc_recv_shared_v3_mapped_readonly_nonblocking(
+    endpoint_cap: u64,
+    payload_ptr: u64,
+    payload_len: u64,
+    output: &mut RecvSharedV3Output,
+) -> Result<Option<RecvSharedV3Delivery>, SyscallError> {
+    output.result_status = STATUS_SENTINEL_UNWRITTEN;
+
+    let req_bytes = encode_mapped_readonly_request(
+        endpoint_cap,
+        payload_ptr,
+        payload_len,
+        output as *mut RecvSharedV3Output as u64,
+    );
+
+    // SAFETY: req_bytes is on the caller's stack (a valid user VA).
+    //         output is valid for the duration of this call.
+    let ret = unsafe {
+        crate::arch::raw_syscall(
+            SYSCALL_RECV_SHARED_V3_NR,
+            [
+                req_bytes.as_ptr() as usize,
+                req_bytes.len(), // 80 >= RECV_V3_MIN_REQUEST_LEN (64)
+                0,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let error: Option<SyscallError> = if ret.error != 0 {
+        Some(decode_syscall_error(ret.error))
+    } else {
+        None
+    };
+
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let error: Option<SyscallError> = if output.result_status == STATUS_SENTINEL_UNWRITTEN {
         Some(decode_syscall_error(ret.ret0))
@@ -1039,5 +1168,165 @@ mod tests {
         assert_eq!(d.page_rounded_mapped_len(), 0);
         assert_eq!(d.actual_mapping_perm(), 0);
         assert!(!d.has_mapping());
+    }
+
+    // ── Stage 61+62: mapped read-only receive wrapper ────────────────────────
+
+    #[test]
+    fn stage61_encode_mapped_readonly_has_map_intent_one() {
+        let buf = encode_mapped_readonly_request(7, 0x2000, 4096, 0x3000);
+        let map_intent = u32::from_le_bytes(buf[48..52].try_into().unwrap());
+        assert_eq!(map_intent, 1, "map_intent must be RECV_V3_MAP_READ = 1");
+    }
+
+    #[test]
+    fn stage61_encode_mapped_readonly_timeout_is_zero() {
+        let buf = encode_mapped_readonly_request(0, 0, 0, 0);
+        let timeout = u64::from_le_bytes(buf[56..64].try_into().unwrap());
+        assert_eq!(timeout, 0, "timeout_ticks must be 0 (non-blocking)");
+    }
+
+    #[test]
+    fn stage61_encode_mapped_readonly_metadata_len_at_least_120() {
+        let buf = encode_mapped_readonly_request(1, 0x2000, 4096, 0x3000);
+        let metadata_len = u64::from_le_bytes(buf[40..48].try_into().unwrap());
+        use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_TOKEN_OUTPUT_LEN;
+        assert!(
+            metadata_len >= RECV_V3_TOKEN_OUTPUT_LEN as u64,
+            "metadata_len {metadata_len} must be >= RECV_V3_TOKEN_OUTPUT_LEN ({RECV_V3_TOKEN_OUTPUT_LEN})"
+        );
+    }
+
+    #[test]
+    fn stage61_encode_mapped_readonly_endpoint_cap_encoded() {
+        let buf = encode_mapped_readonly_request(42, 0, 0, 0);
+        assert_eq!(u64::from_le_bytes(buf[8..16].try_into().unwrap()), 42);
+    }
+
+    #[test]
+    fn stage61_encode_mapped_readonly_payload_ptr_encoded() {
+        let buf = encode_mapped_readonly_request(0, 0x4000, 0, 0);
+        assert_eq!(
+            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            0x4000
+        );
+    }
+
+    #[test]
+    fn stage61_encode_mapped_readonly_payload_len_encoded() {
+        let buf = encode_mapped_readonly_request(0, 0, 8192, 0);
+        assert_eq!(u64::from_le_bytes(buf[24..32].try_into().unwrap()), 8192);
+    }
+
+    #[test]
+    fn stage61_encode_mapped_readonly_flags_zero() {
+        let buf = encode_mapped_readonly_request(0, 0, 0, 0);
+        let flags = u32::from_le_bytes(buf[52..56].try_into().unwrap());
+        assert_eq!(flags, 0, "flags must be 0 (reserved)");
+    }
+
+    #[test]
+    fn stage61_from_output_with_live_mapping_has_mapping_true() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 7;
+        output.object_kind = 5; // DmaRegion
+        output.exact_region_len = 4096;
+        output.mapped_base = 0x2_0000;
+        output.page_rounded_mapped_len = 4096;
+        output.actual_mapping_perm = 1; // read-only
+        output.cleanup_token = 0x0001_0003; // generation=1, slot=3
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert!(d.has_mapping(), "has_mapping must be true when mapped_base != 0");
+        assert_eq!(d.mapped_base(), 0x2_0000);
+        assert_eq!(d.page_rounded_mapped_len(), 4096);
+        assert_eq!(d.actual_mapping_perm(), 1);
+    }
+
+    #[test]
+    fn stage61_from_output_cleanup_token_nonzero_has_token_true() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 5;
+        output.cleanup_token = 0x0001_0002; // nonzero token
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert!(d.has_cleanup_token(), "nonzero token must report has_cleanup_token");
+        assert_eq!(d.cleanup_token(), 0x0001_0002);
+    }
+
+    #[test]
+    fn stage61_from_output_full_mapping_roundtrip() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.sender_tid = 2;
+        output.transferred_cap = 9;
+        output.object_kind = 5; // DmaRegion
+        output.effective_rights = 0x07;
+        output.exact_region_len = 4096;
+        output.mapped_base = 0x2_0000;
+        output.page_rounded_mapped_len = 4096;
+        output.actual_mapping_perm = 1;
+        output.cleanup_token = 0x0001_0009;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.sender_tid, 2);
+        assert_eq!(d.transferred_cap, Some(9));
+        assert!(d.is_dma_region());
+        assert_eq!(d.exact_region_len(), 4096);
+        assert!(d.has_mapping());
+        assert_eq!(d.mapped_base(), 0x2_0000);
+        assert_eq!(d.page_rounded_mapped_len(), 4096);
+        assert_eq!(d.actual_mapping_perm(), 1);
+        assert!(d.has_cleanup_token());
+        assert_eq!(d.cleanup_token(), 0x0001_0009);
+    }
+
+    #[test]
+    fn stage61_from_output_actual_perm_read_only_is_one() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.mapped_base = 0x2_0000;
+        output.actual_mapping_perm = 1; // MAP_PERM_READ_ONLY sentinel
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.actual_mapping_perm(), 1, "read-only sentinel must be 1");
+    }
+
+    #[test]
+    fn stage61_from_output_plain_receive_has_no_mapping() {
+        // Plain receive (no map_intent) leaves mapping fields at 0.
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.sender_tid = 1;
+        output.transferred_cap = RECV_V3_CLEANUP_TOKEN_NONE; // no cap
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert!(!d.has_mapping(), "plain receive must not report mapping");
+        assert!(!d.has_cleanup_token(), "plain receive must not have cleanup token");
+        assert_eq!(d.mapped_base(), 0);
+        assert_eq!(d.page_rounded_mapped_len(), 0);
+        assert_eq!(d.cleanup_token(), 0);
+    }
+
+    #[test]
+    fn stage62_cleanup_token_none_is_zero() {
+        assert_eq!(
+            RECV_V3_CLEANUP_TOKEN_NONE, 0,
+            "RECV_V3_CLEANUP_TOKEN_NONE sentinel must be 0"
+        );
+    }
+
+    #[test]
+    fn stage62_cleanup_token_generation_in_high_bits() {
+        // CapId.0 = (generation << 16) | slot.  A freshly minted cap with generation=1
+        // and slot=2 yields CapId.0 = 0x0001_0002.  Bits[63:16] encode generation.
+        let token: u64 = 0x0001_0002;
+        let generation = token >> 16;
+        let slot = token & 0xFFFF;
+        assert_eq!(generation, 1, "generation in bits[63:16]");
+        assert_eq!(slot, 2, "slot in bits[15:0]");
+        // has_cleanup_token must be true for any nonzero token.
+        let d = RecvSharedV3Delivery {
+            cleanup_token: token,
+            ..Default::default()
+        };
+        assert!(d.has_cleanup_token());
     }
 }

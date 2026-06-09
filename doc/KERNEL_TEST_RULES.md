@@ -3647,3 +3647,34 @@ stale-token rejection, writeback-failure rollback, and RW gate.
 - `cargo test --features hosted-dev recv_v2 -- --test-threads=4` (regression)
 
 All tests must pass.
+
+---
+
+### Rule N+59 — Stage 61+62: recv_shared_v3 read-only mapped receive proof
+
+**Coverage:** 14 kernel dispatch proof tests in `mod stage61_62`; 17 user-rt tests
+in `yarm-user-rt` (14 in `recv_v3` + 3 in `shared_transfer`).
+
+**Kernel tests** (`src/kernel/boot/tests.rs`, `mod stage61_62`):
+- `stage61_kernel_dispatch_map_intent_one_populates_mapped_base`
+- `stage61_kernel_dispatch_map_intent_one_populates_mapped_len`
+- `stage61_kernel_dispatch_map_intent_one_actual_perm_read_only`
+- `stage61_kernel_dispatch_map_intent_one_cleanup_token_nonzero`
+- `stage61_kernel_dispatch_map_intent_one_result_status_ok`
+- `stage61_kernel_dispatch_map_intent_one_registers_active_mapping`
+- `stage61_v3_output_struct_size_is_128`
+- `stage61_v3_output_parses_via_abi_struct`
+- `stage61_cleanup_token_generation_in_bits_63_16`
+- `stage62_release_via_cleanup_token_removes_active_mapping`
+- `stage62_duplicate_release_rejected_via_v3_path`
+- `stage61_syscall_count_still_31`
+- `stage61_vfs_shared_io_disabled`
+- `stage61_legacy_ipc_recv_unaffected`
+
+**Run commands:**
+- `cargo test --features hosted-dev stage61 --lib` (14 tests)
+- `cargo test --features hosted-dev stage62 --lib` (regression subset)
+- `cargo test -p yarm-user-rt --lib` (109 tests, includes stage61/62 user-rt)
+- `cargo test --features hosted-dev stage60 --lib` (10 regression)
+
+All tests must pass.

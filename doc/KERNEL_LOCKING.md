@@ -11438,3 +11438,61 @@ mapping code is reached.
 `stage60_syscall_count_still_31`,
 `stage60_vfs_shared_io_disabled`,
 `stage60_legacy_ipc_recv_unaffected`
+
+---
+
+## §69 Stage 61+62 — recv_shared_v3 read-only mapped receive user-rt integration
+
+### 69.1 Scope
+
+Stage 61 proves that the kernel's read-only mapping path (NR 30 with
+`map_intent=1`) is reachable end-to-end from hosted-dev tests. Stage 62
+proves the cleanup path via the `TransferRelease` syscall (NR 4).
+
+No new kernel code was added. All changes are:
+- `crates/yarm-user-rt` — new public functions (`ipc_recv_shared_v3_mapped_readonly_nonblocking`, `release_v3_cleanup_token`)
+- `src/kernel/boot/tests.rs` — `mod stage61_62` (14 dispatch proof tests)
+
+### 69.2 hosted-dev read window
+
+`read_user_memory_for_asid(asid, ptr, len)` reads exactly `len` bytes from the
+hashmap-backed user memory. The kernel's `write_v3_output_to_user` writes at
+most `RECV_V3_TOKEN_OUTPUT_LEN = 120` bytes. Bytes 120-127 (`request_id`) are
+never written. Tests therefore read only 120 bytes; the returned `[u8; 128]`
+array has zeros in positions 120-127.
+
+### 69.3 Invariants preserved
+
+- SYSCALL_COUNT = 31 (unchanged)
+- NR 30 = RecvSharedV3, NR 4 = TransferRelease (unchanged)
+- VFS_SHARED_IO disabled (unchanged)
+- No read-write mapping enabled
+- No Drop-based cleanup
+- Old ipc_recv / recv-v2 / recv-timeout behavior unchanged
+- No SpawnV5, VFS, Phase2B/3B, startup slot changes
+
+### 69.4 Stage 61+62 tests (mod stage61_62, 14 tests)
+
+**(A) Kernel dispatch — mapping fields:**
+`stage61_kernel_dispatch_map_intent_one_populates_mapped_base`,
+`stage61_kernel_dispatch_map_intent_one_populates_mapped_len`,
+`stage61_kernel_dispatch_map_intent_one_actual_perm_read_only`,
+`stage61_kernel_dispatch_map_intent_one_cleanup_token_nonzero`,
+`stage61_kernel_dispatch_map_intent_one_result_status_ok`,
+`stage61_kernel_dispatch_map_intent_one_registers_active_mapping`
+
+**(B) ABI struct layout:**
+`stage61_v3_output_struct_size_is_128`,
+`stage61_v3_output_parses_via_abi_struct`
+
+**(C) Token encoding:**
+`stage61_cleanup_token_generation_in_bits_63_16`
+
+**(D) Release removes mapping:**
+`stage62_release_via_cleanup_token_removes_active_mapping`,
+`stage62_duplicate_release_rejected_via_v3_path`
+
+**(E) Invariants:**
+`stage61_syscall_count_still_31`,
+`stage61_vfs_shared_io_disabled`,
+`stage61_legacy_ipc_recv_unaffected`
