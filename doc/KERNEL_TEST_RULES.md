@@ -3268,3 +3268,66 @@ Accessed via `kernel.with_memory_state(|m| m.memory_objects.iter().flatten().fin
 - `cargo test --features hosted-dev --lib -- --test-threads=1` (1132 total)
 
 All tests must pass.
+
+## Rule N+53: Stage 50+51 — exact_region_len for DmaRegion transfers + map_intent audit
+
+**Summary:**  `exact_region_len @80..88` is filled with the authoritative DmaRegion
+sub-region byte length when the caller provides at least 88 bytes for `metadata_len`.
+`DmaRegion.len` is embedded in `CapObject::DmaRegion { id, offset, len }` — no registry
+lookup is needed.  `map_intent` remains gated and always returns `InvalidArgs`.
+
+**Constraints (verbatim):**
+- `SYSCALL_COUNT == 31` unchanged.
+- Syscall numbers unchanged.
+- Public ABI field offsets unchanged; only `exact_region_len @80..88` newly written.
+- `map_intent != 0 → InvalidArgs` gate unchanged.
+- No VM mapping performed.
+- No fabricated region length.
+
+**Kernel changes (`src/kernel/syscall.rs`):**
+- `recv_v3_exact_region_len(obj: CapObject) -> u64` helper: DmaRegion → len, else 0.
+- `write_v3_output_to_user` gains `exact_region_len: u64` param; buffer extended to 88 bytes;
+  writes `min(out_len, 88)` bytes so existing 80-byte callers are unaffected.
+- OK-path metadata tuple extended to 5 elements: `(obj_kind, obj_gen, eff_rights, exact_obj_size, exact_reg_len)`.
+
+**ABI crate changes (`crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`):**
+- `RECV_V3_EXTENDED_OUTPUT_LEN: u32 = 88` constant added.
+- `exact_region_len` field doc updated (authoritative for DmaRegion).
+- Layout assertion: `offset_of!(RecvSharedV3Output, exact_region_len) == 80`.
+
+**user-rt changes (`crates/yarm-user-rt/src/syscall/recv_v3.rs`):**
+- `exact_region_len: u64` field added to `RecvSharedV3Delivery`.
+- `exact_region_len()` and `has_exact_region_len()` accessors added.
+- `from_output()` and `ipc_recv_shared_v3_nonblocking` inline decode updated.
+- `from_output_and_manual_decode_agree_on_plain_message` updated.
+
+**(A) Kernel dispatch tests (5 in `mod stage50`):**
+
+- `stage50_exact_region_len_for_dma_region_transfer` — proves `exact_region_len == PAGE_SIZE`
+  for a 1-page DmaRegion (via `mint_dma_region_cap`), and `object_kind == 0xFF` (Other).
+- `stage50_memory_object_transfer_exact_region_len_is_zero` — MemoryObject has `exact_object_size`;
+  `exact_region_len` must be 0.
+- `stage50_plain_message_exact_region_len_is_zero` — no cap → 0.
+- `stage50_map_intent_read_only_remains_invalid_args` — map_intent=RECV_V3_MAP_READ → InvalidArgs.
+- `stage50_map_intent_read_write_remains_invalid_args` — map_intent=READ|WRITE → InvalidArgs.
+
+**(B) user-rt tests (6 new in `recv_v3.rs`):**
+- `exact_region_len_accessor_returns_field`
+- `has_exact_region_len_true_when_nonzero`
+- `has_exact_region_len_false_when_zero`
+- `from_output_decodes_exact_region_len_for_dma_region`
+- `from_output_exact_region_len_zero_for_no_cap`
+- `from_output_exact_region_len_zero_for_memory_object`
+
+**(C) ABI crate tests (3 new):**
+- `abi_exact_region_len_zero_when_no_cap`
+- `abi_exact_region_len_field_at_offset_80`
+- `abi_extended_output_len_is_88`
+
+**Run commands:**
+- `cargo test --lib stage50 -- --test-threads=1` (5 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (45 user-rt tests total)
+- `cargo test -p yarm-ipc-abi --lib recv_shared_v3` (25 ABI crate tests)
+- `cargo test --features hosted-dev --lib -- --test-threads=1` (1137 total)
+
+All tests must pass.

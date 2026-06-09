@@ -48,6 +48,10 @@ pub struct RecvSharedV3Delivery {
     /// caps and when no cap was transferred. Always a non-zero page-aligned multiple
     /// when a MemoryObject was successfully transferred.
     pub exact_object_size: u64,
+    /// Exact byte length of the transferred DmaRegion sub-region (Stage 50); 0 for
+    /// non-DmaRegion caps and when no cap was transferred. Only populated when the
+    /// caller provided at least 88 bytes for the output buffer.
+    pub exact_region_len: u64,
 }
 
 impl RecvSharedV3Delivery {
@@ -74,6 +78,7 @@ impl RecvSharedV3Delivery {
             object_generation: output.object_generation,
             effective_rights: output.effective_rights,
             exact_object_size: output.exact_object_size,
+            exact_region_len: output.exact_region_len,
         })
     }
 
@@ -118,6 +123,19 @@ impl RecvSharedV3Delivery {
     #[inline]
     pub const fn has_exact_object_size(&self) -> bool {
         self.exact_object_size > 0
+    }
+
+    /// Returns the exact byte length of the transferred DmaRegion sub-region (Stage 50).
+    /// 0 when no DmaRegion was transferred or when the buffer was < 88 bytes.
+    #[inline]
+    pub const fn exact_region_len(&self) -> u64 {
+        self.exact_region_len
+    }
+
+    /// Returns `true` when `exact_region_len` is authoritative (> 0).
+    #[inline]
+    pub const fn has_exact_region_len(&self) -> bool {
+        self.exact_region_len > 0
     }
 }
 
@@ -238,6 +256,7 @@ pub unsafe fn ipc_recv_shared_v3_nonblocking(
                 object_generation: output.object_generation,
                 effective_rights: output.effective_rights,
                 exact_object_size: output.exact_object_size,
+                exact_region_len: output.exact_region_len,
             }))
         }
         RECV_V3_STATUS_WOULD_BLOCK => Ok(None),
@@ -560,6 +579,7 @@ mod tests {
             object_generation: output.object_generation,
             effective_rights: output.effective_rights,
             exact_object_size: output.exact_object_size,
+            exact_region_len: output.exact_region_len,
         };
 
         assert_eq!(
@@ -698,5 +718,70 @@ mod tests {
         let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
         assert_eq!(d.exact_object_size(), 0);
         assert!(!d.has_exact_object_size());
+    }
+
+    // ── Stage 50: exact_region_len accessors ────────────────────────────────
+
+    #[test]
+    fn exact_region_len_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            exact_region_len: 4096,
+            ..Default::default()
+        };
+        assert_eq!(d.exact_region_len(), 4096);
+    }
+
+    #[test]
+    fn has_exact_region_len_true_when_nonzero() {
+        let d = RecvSharedV3Delivery {
+            exact_region_len: 4096,
+            ..Default::default()
+        };
+        assert!(d.has_exact_region_len());
+    }
+
+    #[test]
+    fn has_exact_region_len_false_when_zero() {
+        let d = RecvSharedV3Delivery::default();
+        assert!(!d.has_exact_region_len());
+    }
+
+    #[test]
+    fn from_output_decodes_exact_region_len_for_dma_region() {
+        // Simulate kernel writing exact_region_len into an 88-byte buffer.
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 11;
+        output.object_kind = 0xFF; // DmaRegion maps to Other (0xFF)
+        output.effective_rights = 0x07; // READ|WRITE|MAP
+        output.exact_region_len = 4096;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.exact_region_len(), 4096);
+        assert!(d.has_exact_region_len());
+    }
+
+    #[test]
+    fn from_output_exact_region_len_zero_for_no_cap() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = u64::MAX; // no cap
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.exact_region_len(), 0);
+        assert!(!d.has_exact_region_len());
+    }
+
+    #[test]
+    fn from_output_exact_region_len_zero_for_memory_object() {
+        // MemoryObject transfers have exact_object_size, not exact_region_len.
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 4;
+        output.object_kind = 1; // MemoryObject
+        output.exact_object_size = 4096;
+        output.exact_region_len = 0;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.exact_region_len(), 0);
+        assert!(!d.has_exact_region_len());
+        assert_eq!(d.exact_object_size(), 4096);
     }
 }

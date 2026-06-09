@@ -4052,6 +4052,9 @@ fn parse_v3_request_bytes(
 /// `out_ptr == 0` or `out_len < 80` — silently skip (caller may call with
 /// metadata_ptr/metadata_len from the request without a null check).
 ///
+/// Writes `min(out_len, 88)` bytes so callers that provide an 88-byte buffer
+/// receive the extended fields [80..88] without breaking existing 80-byte callers.
+///
 /// Byte layout (must match `#[repr(C)] RecvSharedV3Output` field offsets):
 ///   [0..40]   authoritative fields (version … transferred_cap)
 ///   [40..44]  object_kind (u32)
@@ -4061,6 +4064,8 @@ fn parse_v3_request_bytes(
 ///   [60..64]  0 (C-layout padding before u64)
 ///   [64..72]  exact_object_size (u64) — authoritative for MemoryObject (Stage 49); 0 otherwise
 ///   [72..80]  region_offset — always 0 (FUTURE)
+///   [80..88]  exact_region_len (u64) — authoritative for DmaRegion (Stage 50); 0 otherwise
+#[allow(clippy::too_many_arguments)]
 fn write_v3_output_to_user(
     kernel: &mut KernelState,
     out_ptr: u64,
@@ -4074,12 +4079,13 @@ fn write_v3_output_to_user(
     object_generation: u64,
     effective_rights: u32,
     exact_object_size: u64,
+    exact_region_len: u64,
 ) {
     use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
     if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
         return;
     }
-    let mut out = [0u8; 80];
+    let mut out = [0u8; 88];
     out[0..4].copy_from_slice(&V3_VERSION.to_le_bytes());
     out[4..8].copy_from_slice(&(V3_MIN_OUTPUT_LEN as u32).to_le_bytes());
     out[8..12].copy_from_slice(&(SYSCALL_ABI_VERSION as u32).to_le_bytes());
@@ -4097,7 +4103,10 @@ fn write_v3_output_to_user(
     // Stage 49: exact_object_size for MemoryObject; 0 for all other kinds.
     out[64..72].copy_from_slice(&exact_object_size.to_le_bytes());
     // out[72..80]: region_offset — FUTURE, always 0.
-    let _ = kernel.copy_to_current_user(out_ptr as usize, &out);
+    // Stage 50: exact_region_len for DmaRegion; 0 for all other kinds.
+    out[80..88].copy_from_slice(&exact_region_len.to_le_bytes());
+    let write_len = (out_len as usize).min(88);
+    let _ = kernel.copy_to_current_user(out_ptr as usize, &out[..write_len]);
 }
 
 /// Map a [`CapObject`] variant to its `RecvSharedV3ObjectKind` discriminant.
@@ -4144,6 +4153,18 @@ fn recv_v3_exact_object_size(
             .map(|entry| entry.len as u64)
             .unwrap_or(0)
     })
+}
+
+/// Return the exact byte length of a [`CapObject::DmaRegion`] sub-region.
+///
+/// The length is embedded directly in the cap — no registry lookup needed.
+/// Returns 0 for all other cap kinds (not fabricated — genuinely unavailable).
+fn recv_v3_exact_region_len(obj: crate::kernel::capabilities::CapObject) -> u64 {
+    use crate::kernel::capabilities::CapObject;
+    match obj {
+        CapObject::DmaRegion { len, .. } => len,
+        _ => 0,
+    }
 }
 
 /// Stage 42+43: handle the `recv_shared_v3` syscall (NR 30).
@@ -4252,6 +4273,7 @@ fn handle_recv_shared_v3(
                 0,
                 0,
                 0,
+                0,
             );
             crate::yarm_log!("RECV_V3_WOULD_BLOCK tid={}", caller_tid);
             return Err(SyscallError::WouldBlock);
@@ -4286,26 +4308,28 @@ fn handle_recv_shared_v3(
             let message_flags_raw = delivery.msg.flags as u32;
             let xfer_cap_out = materialized_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
 
-            // Stage 47+48 + Stage 49: resolve object metadata from the materialized cap.
+            // Stage 47+48 + Stage 49 + Stage 50: resolve object metadata from the materialized cap.
             // Resolve capability first (borrows kernel briefly), then query size separately.
-            let (obj_kind, obj_gen, eff_rights, exact_obj_size) = match materialized_cap {
-                Some(cap_id_raw) => {
-                    let resolved = kernel
-                        .capability_service()
-                        .resolve_current_task_capability(CapId(cap_id_raw));
-                    if let Some(cap) = resolved {
-                        (
-                            recv_v3_object_kind(cap.object),
-                            recv_v3_object_generation(cap.object),
-                            u32::from(cap.rights_bits()),
-                            recv_v3_exact_object_size(kernel, cap.object),
-                        )
-                    } else {
-                        (0, 0, 0, 0)
+            let (obj_kind, obj_gen, eff_rights, exact_obj_size, exact_reg_len) =
+                match materialized_cap {
+                    Some(cap_id_raw) => {
+                        let resolved = kernel
+                            .capability_service()
+                            .resolve_current_task_capability(CapId(cap_id_raw));
+                        if let Some(cap) = resolved {
+                            (
+                                recv_v3_object_kind(cap.object),
+                                recv_v3_object_generation(cap.object),
+                                u32::from(cap.rights_bits()),
+                                recv_v3_exact_object_size(kernel, cap.object),
+                                recv_v3_exact_region_len(cap.object),
+                            )
+                        } else {
+                            (0, 0, 0, 0, 0)
+                        }
                     }
-                }
-                None => (0, 0, 0, 0),
-            };
+                    None => (0, 0, 0, 0, 0),
+                };
 
             match execute_user_asid_plain_writeback(kernel, &delivery) {
                 RecvUserWritebackOutcome::Ok => {
@@ -4322,6 +4346,7 @@ fn handle_recv_shared_v3(
                         obj_gen,
                         eff_rights,
                         exact_obj_size,
+                        exact_reg_len,
                     );
                     frame.set_ok(
                         usize::try_from(sender_tid_raw).unwrap_or(0),

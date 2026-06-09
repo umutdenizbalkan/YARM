@@ -29,6 +29,13 @@ pub const RECV_V3_MIN_REQUEST_LEN: u32 = 64;
 /// Minimum byte length of a well-formed output record.
 pub const RECV_V3_MIN_OUTPUT_LEN: u32 = 80;
 
+/// Extended output record length that includes `exact_region_len` (Stage 50).
+///
+/// A caller providing at least this many bytes for `metadata_len` will receive
+/// the DmaRegion sub-region byte length at offset 80.  Callers with 80-byte
+/// buffers receive the original fields unchanged.
+pub const RECV_V3_EXTENDED_OUTPUT_LEN: u32 = 88;
+
 /// Map-intent flag: map the transferred region read-only.
 pub const RECV_V3_MAP_READ: u32 = 0x1;
 
@@ -257,7 +264,13 @@ pub struct RecvSharedV3Output {
     // ── Shared-memory mapping (available after VM mapping on split path) ──
     /// Shared-memory region offset (0 if no OPCODE_SHARED_MEM transfer).
     pub region_offset: u64,
-    /// **FUTURE (unavailable)**: exact unrounded region length; 0 now.
+    /// Exact DmaRegion sub-region byte length (Stage 50): page-aligned byte length
+    /// embedded in the transferred DmaRegion capability.  Authoritative when a
+    /// DmaRegion cap was transferred (`object_kind == Other (0xFF)` in the current ABI;
+    /// DmaRegion has no dedicated kind discriminant yet).
+    /// **0 for MemoryObject, Endpoint, Notification, ReplyCap, and plain messages.**
+    /// Only written when the caller provides at least [`RECV_V3_EXTENDED_OUTPUT_LEN`]
+    /// bytes in `metadata_len`; reads as 0 from an 80-byte buffer.
     pub exact_region_len: u64,
     /// Mapped virtual base address (0 if no mapping performed).
     pub mapped_base: u64,
@@ -327,6 +340,7 @@ const _: () = {
     // 4 bytes padding at 60-63 for u64 alignment
     assert!(offset_of!(RecvSharedV3Output, exact_object_size) == 64);
     assert!(offset_of!(RecvSharedV3Output, region_offset) == 72);
+    assert!(offset_of!(RecvSharedV3Output, exact_region_len) == 80);
 };
 
 // ── Validation ────────────────────────────────────────────────────────────────
@@ -554,6 +568,7 @@ mod tests {
         assert_eq!(RECV_V3_VERSION, 3);
         assert_eq!(RECV_V3_MIN_REQUEST_LEN, 64);
         assert_eq!(RECV_V3_MIN_OUTPUT_LEN, 80);
+        assert_eq!(RECV_V3_EXTENDED_OUTPUT_LEN, 88);
         assert_eq!(RECV_V3_MAP_READ, 0x1);
         assert_eq!(RECV_V3_MAP_WRITE, 0x2);
         assert_eq!(RECV_V3_NO_TRANSFER_CAP, u64::MAX);
@@ -615,5 +630,30 @@ mod tests {
         // Layout assertion: exact_object_size lives at byte offset 64 in the output record.
         use core::mem::offset_of;
         assert_eq!(offset_of!(RecvSharedV3Output, exact_object_size), 64);
+    }
+
+    // ── Stage 50: exact_region_len field ─────────────────────────────────────
+
+    #[test]
+    fn abi_exact_region_len_zero_when_no_cap() {
+        // Stage 50: exact_region_len must be 0 when no DmaRegion cap is transferred.
+        let out = minimal_out();
+        assert_eq!(
+            out.exact_region_len, 0,
+            "exact_region_len must be 0 when no cap"
+        );
+    }
+
+    #[test]
+    fn abi_exact_region_len_field_at_offset_80() {
+        // Layout assertion: exact_region_len lives at byte offset 80.
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(RecvSharedV3Output, exact_region_len), 80);
+    }
+
+    #[test]
+    fn abi_extended_output_len_is_88() {
+        assert_eq!(RECV_V3_EXTENDED_OUTPUT_LEN, 88);
+        assert!(RECV_V3_EXTENDED_OUTPUT_LEN > RECV_V3_MIN_OUTPUT_LEN);
     }
 }
