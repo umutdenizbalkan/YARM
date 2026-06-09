@@ -1286,6 +1286,10 @@ pub mod recv_shared_v3 {
         if req.map_intent & !known != 0 {
             return Err(RecvSharedV3Error::BadMapIntent);
         }
+        // WRITE without READ is not a valid mapping mode; all writable mappings are readable.
+        if req.map_intent & MAP_WRITE != 0 && req.map_intent & MAP_READ == 0 {
+            return Err(RecvSharedV3Error::BadMapIntent);
+        }
         Ok(())
     }
 

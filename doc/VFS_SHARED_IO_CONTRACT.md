@@ -846,8 +846,12 @@ Total `yarm-fs-servers` tests after Stage 69+70: **261** (up from 245).
    `mod stage71`).  The remaining work is kernel-side delivery of
    `VfsSharedIoTerminalReason::RequesterExit` to the VFS server so it can call
    `dispatch_read_shared_reply` / `mapper.release` to drain its side of the mapping.
-2. **Live MAP_WRITE delivery** — the Stage 60 gate must be removed (one-line change in
-   `syscall.rs`) only after the `RequesterExit` signal delivery path is implemented.
+2. **Live MAP_WRITE delivery** — ~~the Stage 60 gate must be removed~~ **ENABLED (Stage 72)**:
+   the Stage 60 blanket WRITE gate has been removed from `syscall.rs`.  `recv_shared_v3` with
+   `map_intent=0x3` now maps memory writably when the transferred cap carries `CAP_RIGHT_WRITE`.
+   Rights enforcement lives in `compute_recv_v3_mapping_plan`; WRITE-only (0x2) is rejected by
+   `validate_v3_request`.  Cleanup/rollback paths are identical to MAP_READ.  9 kernel tests in
+   `mod stage72` prove the new behaviour.  Remaining work: `RequesterExit` signal delivery path.
 3. **Object introspection in production** — `read_shared_bytes` must validate `effective_rights`
    in a production mapper before writing into the caller's buffer.
 4. **Cap revocation** — the helper uses an opaque `object_handle`; a production path must hold

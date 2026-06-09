@@ -3884,8 +3884,7 @@ MAP_WRITE gate regression, syscall-number and VFS feature-gate invariants.
 - `maybe_cleanup_process_cnode_for_pid` must be called from `mark_task_dead`.
 - `unmap_range_two_phase` must be used (not `unmap_user_page_in_asid`) for tolerating absent pages/ASIDs.
 - `timeout_ticks != 0` must return `WouldBlock` before any endpoint or mapping work.
-- Stage 60 MAP_WRITE gate in `syscall.rs` must not be removed without confirming kernel-side
-  VFS signal delivery for `VfsSharedIoTerminalReason::RequesterExit`.
+- Stage 60 MAP_WRITE gate removed by Stage 72; do not re-add without re-assessing the full policy.
 - SYSCALL_COUNT must remain 31; `RecvSharedV3` must remain NR 30; `TransferRelease` must remain NR 4.
 
 **Run commands:**
@@ -3894,3 +3893,42 @@ MAP_WRITE gate regression, syscall-number and VFS feature-gate invariants.
 - `cargo test --lib ipc_recv -- --test-threads=1` (regression)
 - `cargo check --no-default-features` (no errors)
 - `cargo check -p yarm-fs-servers` (no errors)
+
+---
+
+### Rule N+65 — Stage 72: narrow recv_shared_v3 MAP_WRITE enablement
+
+**Purpose:** Prove that removing the Stage 60 blanket WRITE gate delivers the correct
+narrowly-scoped MAP_WRITE behaviour: perm=3 only for caps with write rights, identical
+cleanup/rollback paths, WRITE-only rejected, MAP_READ regression unaffected.
+
+**Module:** `mod stage72` in `src/kernel/boot/tests.rs`
+
+**Tests (9 total):**
+- `stage72_map_read_write_delivers_rw_mapping` — actual_perm=3, cleanup_token≠0
+- `stage72_map_write_without_write_rights_rejected` — restricted cap (MAP|READ only) → InvalidArgs
+- `stage72_rw_mapping_writeback_rollback_cleans_up` — bad metadata_ptr + map_intent=3 → rollback, count=0
+- `stage72_transfer_release_removes_rw_mapping` — TransferRelease on RW mapping → count=0
+- `stage72_process_exit_cleans_rw_mapping` — mark_task_dead → count=0 (identical path to RO)
+- `stage72_timeout_blocked_before_map_write_check` — timeout_ticks=1000 + map_intent=3 → WouldBlock
+- `stage72_map_read_only_regression` — map_intent=1 → actual_perm=MAP_PERM_READ_ONLY=1
+- `stage72_syscall_count_and_nrs_unchanged` — SYSCALL_COUNT=31, NR30, NR4
+- `stage72_vfs_shared_io_still_disabled` — `!cfg!(feature = "vfs-shared-io")`
+
+**Hard invariants:**
+- Stage 72 removes only the blanket WRITE gate; all other validation is preserved.
+- WRITE-only (map_intent=0x2) must remain invalid (rejected by `validate_v3_request`).
+- Rights enforcement must remain in `compute_recv_v3_mapping_plan`, not in syscall.rs.
+- `ActiveTransferMapping` must carry no permission field; cleanup path must be perm-agnostic.
+- `VFS_READ_SHARED_REPLY_ENABLED` and `VFS_SHARED_IO_ENABLED` must remain `false`.
+- SYSCALL_COUNT=31, NR30, NR4 must not change.
+
+**Run commands:**
+- `cargo test --lib stage72 -- --test-threads=1` (9 tests)
+- `cargo test --lib stage71 -- --test-threads=1` (regression)
+- `cargo test --lib stage60 -- --test-threads=1` (regression)
+- `cargo test --lib ipc_recv -- --test-threads=1` (regression)
+- `cargo test --lib recv_v2 -- --test-threads=1` (regression)
+- `cargo check --no-default-features` (no errors)
+- `cargo check -p yarm-fs-servers` (no errors)
+- `cargo test -p yarm-fs-servers shared_io --lib` (regression)

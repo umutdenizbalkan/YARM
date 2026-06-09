@@ -24,8 +24,10 @@ pub const VFS_WRITE_SHARED_REQUEST_ENABLED: bool = false;
 
 /// Gating constant for the READ_SHARED_REPLY live route.
 ///
-/// Default: `false`. Blocked until MAP_WRITE is available (requires a new kernel ABI).
-/// The Stage 60 RW gate hard-rejects `map_intent & WRITE != 0`.
+/// Default: `false`. Kernel MAP_WRITE now enabled (Stage 72): the Stage 60 blanket gate has been
+/// removed from `syscall.rs`; `recv_shared_v3` with `map_intent=0x3` maps memory writably.
+/// Production VFS route remains disabled pending `VfsSharedIoTerminalReason::RequesterExit`
+/// signal delivery from kernel to VFS server.
 pub const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
 
 /// Global shared-I/O umbrella gate.
@@ -317,12 +319,12 @@ impl VfsWriteSharedBinding {
     }
 }
 
-// ── Stage 69+70: READ_SHARED_REPLY ↔ recv_shared_v3 MAP_WRITE binding ────────
+// ── Stage 69+70+72: READ_SHARED_REPLY ↔ recv_shared_v3 MAP_WRITE binding ─────
 //
-// MAP_WRITE is currently rejected by the Stage 60 kernel gate
-// (`map_intent & WRITE != 0 → InvalidArgs`). This binding is helper-only:
-// tests exercise it via `BorrowedSharedIoTestMapper` which grants write access
-// without going through the kernel path. The kernel gate remains intact.
+// Stage 72 removed the Stage 60 blanket WRITE gate. recv_shared_v3 with
+// map_intent=0x3 now maps memory writably when the cap has CAP_RIGHT_WRITE.
+// The production VFS route (VFS_READ_SHARED_REPLY_ENABLED) remains false
+// pending RequesterExit signal delivery from kernel to VFS server.
 
 /// Validation errors for the recv_shared_v3 → READ_SHARED_REPLY binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -373,9 +375,9 @@ pub enum VfsReadSharedBindingError {
 ///
 /// ## Kernel gate status
 ///
-/// The Stage 60 kernel gate rejects `map_intent & WRITE != 0`. This struct is
-/// exercised only via the test mapper. Do not pass `actual_mapping_perm = 3` from a
-/// live recv_shared_v3 delivery until the gate is removed.
+/// Stage 72 removed the Stage 60 WRITE gate.  `actual_mapping_perm = 3` is now
+/// delivered by a live recv_shared_v3 call when the transferred cap carries write
+/// rights.  The production VFS route remains gated behind `VFS_READ_SHARED_REPLY_ENABLED`.
 pub struct VfsReadSharedBinding {
     pub cleanup_token: u64,
     pub transferred_cap: u64,

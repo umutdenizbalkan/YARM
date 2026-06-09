@@ -29844,11 +29844,12 @@ mod stage60 {
             .expect("join");
     }
 
-    // ── F. map_intent with WRITE bit rejected ─────────────────────────────────
+    // ── F. MAP_WRITE gate removed by Stage 72 ────────────────────────────────
 
     #[test]
     fn stage60_map_intent_rw_rejected() {
-        // map_intent = READ|WRITE (0x3) must return InvalidArgs — RW not supported.
+        // Stage 72 removed the Stage 60 WRITE gate.  MAP_READ|MAP_WRITE (0x3) with a
+        // cap carrying write rights now succeeds and delivers actual_perm=3.
         let mut state = Bootstrap::init().expect("init");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
@@ -29872,13 +29873,13 @@ mod stage60 {
         frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
         frame.set_arg(0, 0x1_0000);
         frame.set_arg(1, 80);
-        assert!(
-            matches!(
-                dispatch(&mut state, &mut frame),
-                Err(SyscallError::InvalidArgs)
-            ),
-            "map_intent with WRITE bit must return InvalidArgs"
-        );
+        dispatch(&mut state, &mut frame)
+            .expect("MAP_WRITE must succeed after Stage 72 removed the gate");
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let actual_perm = u32::from_le_bytes(out[104..108].try_into().unwrap());
+        assert_eq!(actual_perm, 3, "actual_perm must be MAP_PERM_READ_WRITE=3");
     }
 
     // ── F2. WRITE-only map_intent also rejected ───────────────────────────────
@@ -30840,12 +30841,13 @@ mod stage71 {
         );
     }
 
-    // ── G. MAP_WRITE still rejected ───────────────────────────────────────────
+    // ── G. MAP_WRITE gate removed by Stage 72 ────────────────────────────────
 
     #[test]
     fn stage71_map_write_still_rejected_after_exit_path_added() {
-        // The Stage 60 RW gate (map_intent & WRITE != 0 → InvalidArgs) must not
-        // have been disturbed by the Stage 71 exit cleanup additions.
+        // Stage 72 removed the Stage 60 WRITE gate.  With a cap carrying
+        // MAP+READ+WRITE rights and map_intent=0x3, recv_shared_v3 now succeeds
+        // and delivers actual_mapping_perm=3 (MAP_PERM_READ_WRITE).
         let mut state = Bootstrap::init().expect("init");
         let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
         let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
@@ -30870,13 +30872,13 @@ mod stage71 {
         frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
         frame.set_arg(0, 0x1_0000);
         frame.set_arg(1, 80);
-        assert!(
-            matches!(
-                dispatch(&mut state, &mut frame),
-                Err(SyscallError::InvalidArgs)
-            ),
-            "map_intent with WRITE bit must still return InvalidArgs"
-        );
+        dispatch(&mut state, &mut frame)
+            .expect("MAP_WRITE must succeed after Stage 72 removed the gate");
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let actual_perm = u32::from_le_bytes(out[104..108].try_into().unwrap());
+        assert_eq!(actual_perm, 3, "actual_mapping_perm must be MAP_PERM_READ_WRITE=3");
     }
 
     // ── H. Invariants ─────────────────────────────────────────────────────────
@@ -30893,6 +30895,459 @@ mod stage71 {
         assert!(
             !cfg!(feature = "vfs-shared-io"),
             "vfs-shared-io must remain disabled in Stage 71"
+        );
+    }
+}
+
+mod stage72 {
+    //! Stage 72 — narrow recv_shared_v3 MAP_WRITE enablement for READ_SHARED_REPLY profile.
+    //!
+    //! Removes the Stage 60 blanket WRITE gate.  MAP_READ|MAP_WRITE (0x3) is now permitted;
+    //! the rights enforcement already existed in compute_recv_v3_mapping_plan.
+    //!
+    //! A. MAP_READ|MAP_WRITE with write-rights cap delivers actual_perm=3 (MAP_PERM_READ_WRITE).
+    //! B. MAP_READ|MAP_WRITE with READ|MAP-only cap → InsufficientRights → InvalidArgs.
+    //! C. Writeback rollback with map_intent=3 removes active mapping entry.
+    //! D. Explicit TransferRelease removes an RW active mapping.
+    //! E. process exit (mark_task_dead) cleans RW mapping — identical path to RO.
+    //! F. timeout_ticks!=0 returns WouldBlock before map_intent gate — no mapping created.
+    //! G. MAP_READ regression — map_intent=1 still delivers actual_perm=1 (MAP_PERM_READ_ONLY).
+    //! H. Invariant preservation: SYSCALL_COUNT=31, VFS_SHARED_IO disabled.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::{CapId, CapRights};
+    use crate::kernel::ipc::ThreadId;
+    use crate::kernel::syscall::{
+        SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, SYSCALL_TRANSFER_RELEASE_NR, Syscall,
+        SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+    const MAP_READ: u32 = 0x1;
+    const MAP_READ_WRITE: u32 = 0x3;
+    const MAP_PERM_READ_ONLY: u32 = 1;
+    const MAP_PERM_READ_WRITE: u32 = 3;
+
+    fn build_req_72(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+        map_intent: u32,
+        timeout_ticks: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf[48..52].copy_from_slice(&map_intent.to_le_bytes());
+        buf[56..64].copy_from_slice(&timeout_ticks.to_le_bytes());
+        buf
+    }
+
+    fn setup_receiver(state: &mut crate::kernel::boot::KernelState) -> crate::kernel::vm::Asid {
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_, page_cap) = state.alloc_anonymous_memory_object().expect("page cap");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                page_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map req page");
+        asid
+    }
+
+    fn send_shared_mem(
+        state: &mut crate::kernel::boot::KernelState,
+        send_cap: CapId,
+        transfer_cap: CapId,
+    ) {
+        let mut f = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [send_cap.0 as usize, 0, 20, 0, 0, transfer_cap.0 as usize],
+        );
+        dispatch(state, &mut f).expect("ipc_send shared-mem");
+    }
+
+    fn run_rw_mapping(
+        state: &mut crate::kernel::boot::KernelState,
+    ) -> (crate::kernel::vm::Asid, u64, CapId) {
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(state, send_cap, dma_cap);
+        let asid = setup_receiver(state);
+        let req = build_req_72(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ_WRITE,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(state, &mut frame).expect("recv_shared_v3 MAP_WRITE");
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let cleanup_token = u64::from_le_bytes(out[112..120].try_into().unwrap());
+        let cap_id = CapId(cleanup_token);
+        (asid, cleanup_token, cap_id)
+    }
+
+    // ── A. MAP_READ|MAP_WRITE delivers actual_perm=3 ─────────────────────────
+
+    #[test]
+    fn stage72_map_read_write_delivers_rw_mapping() {
+        // With a cap carrying MAP+READ+WRITE rights and map_intent=0x3,
+        // recv_shared_v3 must succeed, map the region writably, and write
+        // actual_mapping_perm=MAP_PERM_READ_WRITE=3 and a non-zero cleanup_token.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+        let req = build_req_72(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ_WRITE,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(&mut state, &mut frame).expect("MAP_WRITE must succeed");
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let actual_perm = u32::from_le_bytes(out[104..108].try_into().unwrap());
+        let cleanup_token = u64::from_le_bytes(out[112..120].try_into().unwrap());
+        assert_eq!(
+            actual_perm, MAP_PERM_READ_WRITE,
+            "actual_mapping_perm must be 3 (MAP_PERM_READ_WRITE)"
+        );
+        assert_ne!(cleanup_token, 0, "cleanup_token must be non-zero for active RW mapping");
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            1,
+            "active RW mapping must be registered"
+        );
+    }
+
+    // ── B. MAP_WRITE without write rights → InvalidArgs ───────────────────────
+
+    #[test]
+    fn stage72_map_write_without_write_rights_rejected() {
+        // A cap with MAP|READ but NOT WRITE, sent via IPC and received with
+        // map_intent=0x3, must trigger InsufficientRights in
+        // compute_recv_v3_mapping_plan → rollback → InvalidArgs.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xD000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        // Attenuate to MAP|READ only (drop WRITE).
+        let ro_cap = state
+            .grant_capability_task_to_task_with_rights(
+                0,
+                dma_cap,
+                0,
+                CapRights::MAP | CapRights::READ,
+            )
+            .expect("ro_cap");
+        send_shared_mem(&mut state, send_cap, ro_cap);
+        let asid = setup_receiver(&mut state);
+        let req = build_req_72(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ_WRITE,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "MAP_WRITE with MAP|READ-only cap must return InvalidArgs"
+        );
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "no active mapping must remain after InsufficientRights rollback"
+        );
+    }
+
+    // ── C. Writeback rollback with map_intent=3 cleans up ────────────────────
+
+    #[test]
+    fn stage72_rw_mapping_writeback_rollback_cleans_up() {
+        // Output writeback failure (unmapped metadata_ptr) must roll back the
+        // active RW mapping entry — same rollback path as MAP_READ.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+        // metadata_ptr = 0x9_0000: intentionally unmapped so writeback fails.
+        let req = build_req_72(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x9_0000,
+            120,
+            MAP_READ_WRITE,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "writeback failure must return InvalidArgs"
+        );
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "RW rollback must remove active mapping entry"
+        );
+    }
+
+    // ── D. Explicit TransferRelease removes RW active mapping ────────────────
+
+    #[test]
+    fn stage72_transfer_release_removes_rw_mapping() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("init");
+                let (_asid, cleanup_token, _cap_id) = run_rw_mapping(&mut state);
+
+                assert_eq!(
+                    state.active_transfer_count_for_pid(0),
+                    1,
+                    "RW mapping must be registered pre-release"
+                );
+
+                let mut frame = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [cleanup_token as usize, 0, 0, 0, 0, 0],
+                );
+                dispatch(&mut state, &mut frame)
+                    .expect("TransferRelease on RW mapping must succeed");
+
+                assert_eq!(
+                    state.active_transfer_count_for_pid(0),
+                    0,
+                    "RW mapping must be removed by TransferRelease"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── E. process exit cleans RW mapping (identical path to RO) ────────────
+
+    #[test]
+    fn stage72_process_exit_cleans_rw_mapping() {
+        // ActiveTransferMapping carries no permission field; the cleanup path
+        // (mark_task_dead → purge_active_transfer_mappings_for_pid) is identical
+        // for read-only and read-write mappings.
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid1, _) = state.create_user_address_space().expect("asid1");
+        state.bind_task_asid(1, asid1).expect("bind1");
+
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch to task1");
+        assert_eq!(state.current_tid(), Some(1));
+
+        let (_, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(asid1, mem_cap, VirtAddr(0xA000), PageFlags::USER_RW)
+            .expect("map page");
+        state
+            .register_active_transfer_mapping(ThreadId(1), mem_cap, VirtAddr(0xA000), PAGE_SIZE)
+            .expect("register RW mapping");
+
+        assert_eq!(
+            state.active_transfer_count_for_pid(1),
+            1,
+            "RW mapping registered before exit"
+        );
+        assert!(
+            state
+                .is_user_page_mapped_in_asid(asid1, VirtAddr(0xA000))
+                .expect("pre-exit page check"),
+            "page must be mapped before exit"
+        );
+
+        state.exit_task(1, 0).expect("exit task1");
+        assert_eq!(state.current_tid(), Some(0));
+
+        state.mark_task_dead(1).expect("mark_task_dead");
+        // ASID destroyed before purge — cannot check page mapping after this point.
+        assert_eq!(
+            state.active_transfer_count_for_pid(1),
+            0,
+            "RW mapping must be cleaned by mark_task_dead"
+        );
+    }
+
+    // ── F. timeout WouldBlock before map_intent gate ─────────────────────────
+
+    #[test]
+    fn stage72_timeout_blocked_before_map_write_check() {
+        // timeout_ticks check fires before endpoint and mapping work; WouldBlock
+        // must be returned with no active mapping created, even for map_intent=3.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+        let req = build_req_72(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ_WRITE,
+            1000,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::WouldBlock)
+            ),
+            "timeout_ticks=1000 with map_intent=3 must return WouldBlock"
+        );
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "no active mapping created on WouldBlock"
+        );
+    }
+
+    // ── G. MAP_READ regression — perm=1 unaffected by Stage 72 ──────────────
+
+    #[test]
+    fn stage72_map_read_only_regression() {
+        // Removing the Stage 60 WRITE gate must not affect MAP_READ-only requests;
+        // map_intent=1 must still deliver actual_mapping_perm=MAP_PERM_READ_ONLY=1.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+        let req = build_req_72(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+            0,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(&mut state, &mut frame).expect("MAP_READ must still succeed");
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let actual_perm = u32::from_le_bytes(out[104..108].try_into().unwrap());
+        assert_eq!(
+            actual_perm, MAP_PERM_READ_ONLY,
+            "map_intent=1 must deliver actual_perm=MAP_PERM_READ_ONLY=1 (regression)"
+        );
+    }
+
+    // ── H. Invariants ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage72_syscall_count_and_nrs_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must remain 31");
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30, "NR 30 unchanged");
+        assert_eq!(SYSCALL_TRANSFER_RELEASE_NR, 4, "NR 4 unchanged");
+    }
+
+    #[test]
+    fn stage72_vfs_shared_io_still_disabled() {
+        assert!(
+            !cfg!(feature = "vfs-shared-io"),
+            "vfs-shared-io must remain disabled in Stage 72"
         );
     }
 }

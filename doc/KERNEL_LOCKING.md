@@ -11737,7 +11737,83 @@ tolerates already-unmapped pages (silently skips them).
 - NR 30 = `RecvSharedV3` (no change)
 - NR 4 = `TransferRelease` (no change)
 - All `recv_shared_v3` ABI field offsets unchanged
-- MAP_WRITE not enabled — Stage 60 gate intact
+- MAP_WRITE not enabled — Stage 60 gate intact (removed by Stage 72)
 - `VFS_SHARED_IO_ENABLED = false`
 - No Drop-based cleanup added
 - No SpawnV5/Phase2B/Phase3B/startup slot changes
+
+---
+
+## §75 Stage 72 — narrow recv_shared_v3 MAP_WRITE enablement
+
+### 75.1 Change summary
+
+Stage 72 removes the Stage 60 blanket MAP_WRITE gate from `syscall.rs` (lines 4266-4269
+of the pre-Stage-72 file).  MAP_READ|MAP_WRITE (`map_intent = 0x3`) is now a valid
+request for the READ_SHARED_REPLY profile.
+
+**Single code change:**
+```rust
+// Before (Stage 60 gate — removed):
+if req.map_intent & SYSCALL_RECV_MAP_INTENT_WRITE as u32 != 0 {
+    return Err(SyscallError::InvalidArgs);
+}
+
+// After (Stage 72 comment — no gate):
+// Stage 72: MAP_READ|MAP_WRITE (0x3) is permitted for the READ_SHARED_REPLY profile.
+// Rights enforcement: compute_recv_v3_mapping_plan checks CAP_RIGHT_MAP + CAP_RIGHT_WRITE;
+// InsufficientRights → rollback + InvalidArgs below.
+// WRITE-only (0x2) is already rejected: validate_v3_request requires READ bit.
+```
+
+**Additional change in `recv_core.rs`:** `validate_v3_request` now explicitly rejects
+WRITE-only (`map_intent = 0x2`): WRITE without READ is not a valid mapping mode.
+
+### 75.2 Rights enforcement
+
+All rights enforcement pre-existed in `compute_recv_v3_mapping_plan` (`recv_core.rs`
+lines 1363-1397):
+
+| Cap rights | map_intent | Result |
+|---|---|---|
+| MAP + READ + WRITE | 0x3 | `Map { read_only: false }` → writable mapping |
+| MAP + READ (no WRITE) | 0x3 | `InsufficientRights` → rollback → `InvalidArgs` |
+| MAP + READ + WRITE | 0x1 | `Map { read_only: true }` → read-only mapping |
+| any | 0x2 | `BadMapIntent` from `validate_v3_request` → `InvalidArgs` |
+
+### 75.3 Page mapping
+
+`syscall.rs` line 4465 (unchanged): `write: !read_only`.  `execute: false` is hardcoded
+for all recv_shared_v3 mappings.
+
+### 75.4 Cleanup and rollback (identical to MAP_READ)
+
+`ActiveTransferMapping` carries `owner_tid, transfer_cap, base, len` — no permission
+field.  `purge_active_transfer_mappings_for_pid` cleans both RO and RW mappings via the
+same code path.  The rollback path (writeback failure, InsufficientRights) unmaps pages
+and removes the registry entry regardless of permission.
+
+### 75.5 Lock ordering
+
+No change to lock ordering.  The MAP_WRITE path acquires the same locks in the same
+order as MAP_READ (rank 4 capability_state → rank 3 ipc_state → rank 2 task_domain →
+rank 1 memory_state).
+
+### 75.6 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- NR 30 = `RecvSharedV3` (no change)
+- NR 4 = `TransferRelease` (no change)
+- All `recv_shared_v3` ABI field offsets unchanged
+- MAP_WRITE now enabled for caps with write rights
+- `VFS_SHARED_IO_ENABLED = false` (production VFS route still gated)
+- No Drop-based cleanup added
+- No SpawnV5/Phase2B/Phase3B/startup slot changes
+- WRITE-only (0x2) remains invalid — rejected by `validate_v3_request`
+
+### 75.7 Remaining work
+
+`VfsSharedIoTerminalReason::RequesterExit` signal delivery: when a process holding an
+active MAP_WRITE receive exits, the kernel cleans the mapping via
+`purge_active_transfer_mappings_for_pid` but does not yet notify the VFS server.  Until
+this notification path is implemented, `VFS_READ_SHARED_REPLY_ENABLED` remains `false`.
