@@ -2169,10 +2169,9 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::recv_core::{
         RecvOutcome, RecvPlan, RecvSchedulerWakePlan, RecvUserWritebackOutcome,
-        RecvV2WritebackOutcome, RecvWritebackPlan,
-        execute_user_asid_plain_writeback, execute_user_asid_plain_v2_writeback,
-        plan_recv_core, try_recv_core_kernel_plain, try_recv_core_user_plain,
-        try_recv_core_user_plain_v2,
+        RecvV2WritebackOutcome, RecvWritebackPlan, execute_user_asid_plain_v2_writeback,
+        execute_user_asid_plain_writeback, plan_recv_core, try_recv_core_kernel_plain,
+        try_recv_core_user_plain, try_recv_core_user_plain_v2,
     };
 
     // Determine receiver class and build the canonical request.
@@ -2244,7 +2243,11 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                         if encode_transfer_cap_ret(frame, local_cap).is_err() {
                             return Some(Err(TrapHandleError::Syscall(SyscallError::Internal)));
                         }
-                        crate::yarm_log!("YARM_RECV_CORE_CAP_MATERIALIZE receiver_tid={} local_cap={}", receiver_tid, local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP));
+                        crate::yarm_log!(
+                            "YARM_RECV_CORE_CAP_MATERIALIZE receiver_tid={} local_cap={}",
+                            receiver_tid,
+                            local_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP)
+                        );
                         local_cap
                     }
                     Err(e) => return Some(Err(TrapHandleError::Syscall(e))),
@@ -2297,7 +2300,9 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                             // Stage 42+43: rollback materialized cap (matches full path §58).
                             if let Some(cap_id) = materialized_cap {
                                 kernel.rollback_materialized_recv_cap(
-                                    receiver_tid, CapId(cap_id), is_reply_cap,
+                                    receiver_tid,
+                                    CapId(cap_id),
+                                    is_reply_cap,
                                 );
                                 let _ = encode_transfer_cap_ret(frame, None);
                             }
@@ -2323,10 +2328,14 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                         }
                         RecvV2WritebackOutcome::PayloadUndersized => {
                             // Stage 42+43: rollback materialized cap (matches full path §58).
-                            crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized");
+                            crate::yarm_log!(
+                                "YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized"
+                            );
                             if let Some(cap_id) = materialized_cap {
                                 kernel.rollback_materialized_recv_cap(
-                                    receiver_tid, CapId(cap_id), is_reply_cap,
+                                    receiver_tid,
+                                    CapId(cap_id),
+                                    is_reply_cap,
                                 );
                                 let _ = encode_transfer_cap_ret(frame, None);
                             }
@@ -2337,7 +2346,9 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                             crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=meta_fault");
                             if let Some(cap_id) = materialized_cap {
                                 kernel.rollback_materialized_recv_cap(
-                                    receiver_tid, CapId(cap_id), is_reply_cap,
+                                    receiver_tid,
+                                    CapId(cap_id),
+                                    is_reply_cap,
                                 );
                                 let _ = encode_transfer_cap_ret(frame, None);
                             }
@@ -4033,17 +4044,17 @@ fn parse_v3_request_bytes(
         };
     }
     RecvSharedV3Request {
-        version:       u32le!(0),
-        record_len:    u32le!(4),
-        endpoint_cap:  u64le!(8),
-        payload_ptr:   u64le!(16),
-        payload_len:   u64le!(24),
-        metadata_ptr:  u64le!(32),
-        metadata_len:  u64le!(40),
-        map_intent:    u32le!(48),
-        flags:         u32le!(52),
+        version: u32le!(0),
+        record_len: u32le!(4),
+        endpoint_cap: u64le!(8),
+        payload_ptr: u64le!(16),
+        payload_len: u64le!(24),
+        metadata_ptr: u64le!(32),
+        metadata_len: u64le!(40),
+        map_intent: u32le!(48),
+        flags: u32le!(52),
         timeout_ticks: u64le!(56),
-        reserved:      [u64le!(64), u64le!(72)],
+        reserved: [u64le!(64), u64le!(72)],
     }
 }
 
@@ -4052,8 +4063,8 @@ fn parse_v3_request_bytes(
 /// `out_ptr == 0` or `out_len < 80` — silently skip (caller may call with
 /// metadata_ptr/metadata_len from the request without a null check).
 ///
-/// Writes `min(out_len, 88)` bytes so callers that provide an 88-byte buffer
-/// receive the extended fields [80..88] without breaking existing 80-byte callers.
+/// Writes `min(out_len, 120)` bytes so callers with larger buffers receive
+/// new fields without breaking existing 80-byte or 88-byte callers.
 ///
 /// Byte layout (must match `#[repr(C)] RecvSharedV3Output` field offsets):
 ///   [0..40]   authoritative fields (version … transferred_cap)
@@ -4065,6 +4076,11 @@ fn parse_v3_request_bytes(
 ///   [64..72]  exact_object_size (u64) — authoritative for MemoryObject (Stage 49); 0 otherwise
 ///   [72..80]  region_offset — always 0 (FUTURE)
 ///   [80..88]  exact_region_len (u64) — authoritative for DmaRegion (Stage 50); 0 otherwise
+///   [88..96]  mapped_base (u64) — VA of live mapping; 0 if no mapping (Stage 58+59)
+///   [96..104] page_rounded_mapped_len (u64) — 0 if no mapping (Stage 58+59)
+///   [104..108] actual_mapping_perm (u32) — 1=RO, 3=RW, 0=none (Stage 58+59)
+///   [108..112] C-layout padding
+///   [112..120] cleanup_token (u64) — nonzero when mapping live (Stage 58+59)
 #[allow(clippy::too_many_arguments)]
 fn write_v3_output_to_user(
     kernel: &mut KernelState,
@@ -4080,12 +4096,16 @@ fn write_v3_output_to_user(
     effective_rights: u32,
     exact_object_size: u64,
     exact_region_len: u64,
+    mapped_base: u64,
+    page_rounded_mapped_len: u64,
+    actual_mapping_perm: u32,
+    cleanup_token: u64,
 ) {
     use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
     if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
         return;
     }
-    let mut out = [0u8; 88];
+    let mut out = [0u8; 120];
     out[0..4].copy_from_slice(&V3_VERSION.to_le_bytes());
     out[4..8].copy_from_slice(&(V3_MIN_OUTPUT_LEN as u32).to_le_bytes());
     out[8..12].copy_from_slice(&(SYSCALL_ABI_VERSION as u32).to_le_bytes());
@@ -4105,7 +4125,13 @@ fn write_v3_output_to_user(
     // out[72..80]: region_offset — FUTURE, always 0.
     // Stage 50: exact_region_len for DmaRegion; 0 for all other kinds.
     out[80..88].copy_from_slice(&exact_region_len.to_le_bytes());
-    let write_len = (out_len as usize).min(88);
+    // Stage 58+59: live mapping output fields (0 when no mapping).
+    out[88..96].copy_from_slice(&mapped_base.to_le_bytes());
+    out[96..104].copy_from_slice(&page_rounded_mapped_len.to_le_bytes());
+    out[104..108].copy_from_slice(&actual_mapping_perm.to_le_bytes());
+    // out[108..112]: C-layout padding (already 0).
+    out[112..120].copy_from_slice(&cleanup_token.to_le_bytes());
+    let write_len = (out_len as usize).min(120);
     let _ = kernel.copy_to_current_user(out_ptr as usize, &out[..write_len]);
 }
 
@@ -4191,7 +4217,7 @@ fn handle_recv_shared_v3(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    use crate::kernel::recv_core::recv_shared_v3::{validate_v3_request, V3_MIN_REQUEST_LEN};
+    use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_REQUEST_LEN, validate_v3_request};
     use crate::kernel::recv_core::{
         RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvOutcome, RecvPayloadTarget,
         RecvRequest, RecvRequestKind, RecvSchedulerWakePlan, RecvTransferPolicy,
@@ -4225,8 +4251,13 @@ fn handle_recv_shared_v3(
         return Err(SyscallError::WouldBlock);
     }
 
-    // Mapped receive is not yet on the split path.
-    if req.map_intent != 0 {
+    // Stage 58+59: map_intent is now live for DmaRegion read-only.
+    // When map_intent != 0 the caller must supply at least V3_LIVE_OUTPUT_LEN bytes
+    // so mapped_base, page_rounded_mapped_len, actual_mapping_perm, and cleanup_token
+    // can all be written.  Smaller buffers are rejected to prevent silent token loss.
+    if req.map_intent != 0
+        && req.metadata_len < crate::kernel::recv_core::recv_shared_v3::V3_LIVE_OUTPUT_LEN as u64
+    {
         return Err(SyscallError::InvalidArgs);
     }
 
@@ -4271,6 +4302,10 @@ fn handle_recv_shared_v3(
                 0,
                 0,
                 SYSCALL_NO_TRANSFER_CAP,
+                0,
+                0,
+                0,
+                0,
                 0,
                 0,
                 0,
@@ -4333,6 +4368,206 @@ fn handle_recv_shared_v3(
                     None => (0, 0, 0, 0, 0),
                 };
 
+            // Stage 58+59: live DmaRegion/MemoryObject read-only (or RW) mapping.
+            // Order: materialize cap → metadata → map pages → register token → output.
+            // On any failure: rollback mapped pages + cleanup slot + rollback cap.
+            let (mapped_base, mapped_len_out, actual_perm, cleanup_token, skip_payload) = if req
+                .map_intent
+                != 0
+            {
+                use crate::kernel::capabilities::CapObject;
+                use crate::kernel::recv_core::recv_shared_v3::{
+                    MAP_PERM_READ_ONLY, MAP_PERM_READ_WRITE, RecvV3MappingPlan,
+                    compute_recv_v3_mapping_plan,
+                };
+
+                let Some(cap_id_raw) = materialized_cap else {
+                    // map_intent requires a cap-transfer message
+                    return Err(SyscallError::InvalidArgs);
+                };
+                let cap_id = CapId(cap_id_raw);
+
+                // Use eff_rights (already resolved above) for plan computation.
+                let plan = compute_recv_v3_mapping_plan(
+                    delivery.msg.opcode,
+                    req.map_intent,
+                    req.payload_ptr,
+                    req.payload_len,
+                    eff_rights as u8,
+                    exact_reg_len,
+                    PAGE_SIZE as u64,
+                );
+
+                match plan {
+                    RecvV3MappingPlan::Map {
+                        map_va,
+                        mapped_len,
+                        read_only,
+                    } => {
+                        // Resolve physical start: mo.phys + dma.offset.
+                        // Separate cap lookup (Copy) and memory lookup (immutable borrow).
+                        let dma_fields = kernel
+                            .capability_service()
+                            .resolve_current_task_capability(cap_id)
+                            .and_then(|cap| match cap.object {
+                                CapObject::DmaRegion { id, offset, .. } => Some((id, offset)),
+                                CapObject::MemoryObject { id } => Some((id, 0u64)),
+                                _ => None,
+                            });
+                        let phys_start = dma_fields.and_then(|(mo_id, dma_offset)| {
+                            kernel.with_memory_state(|m| {
+                                m.memory_objects
+                                    .iter()
+                                    .flatten()
+                                    .find(|e| e.id == mo_id)
+                                    .map(|e| PhysAddr(e.phys.0 + dma_offset))
+                            })
+                        });
+                        let phys_start = match phys_start {
+                            Some(p) => p,
+                            None => {
+                                kernel.rollback_materialized_recv_cap(
+                                    caller_tid,
+                                    cap_id,
+                                    is_reply_cap,
+                                );
+                                return Err(SyscallError::InvalidArgs);
+                            }
+                        };
+
+                        let receiver_asid = match kernel.task_asid(caller_tid) {
+                            Some(a) => a,
+                            None => {
+                                kernel.rollback_materialized_recv_cap(
+                                    caller_tid,
+                                    cap_id,
+                                    is_reply_cap,
+                                );
+                                return Err(SyscallError::InvalidArgs);
+                            }
+                        };
+
+                        let map_flags = PageFlags {
+                            read: true,
+                            write: !read_only,
+                            execute: false,
+                            user: true,
+                            cache_policy: CachePolicy::WriteBack,
+                        };
+                        let num_pages = (mapped_len / PAGE_SIZE as u64) as usize;
+                        for page_idx in 0..num_pages {
+                            let virt = VirtAddr(map_va + page_idx as u64 * PAGE_SIZE as u64);
+                            let phys = PhysAddr(phys_start.0 + page_idx as u64 * PAGE_SIZE as u64);
+                            if kernel
+                                .map_user_page_in_asid_raw(
+                                    receiver_asid,
+                                    virt,
+                                    Mapping {
+                                        phys,
+                                        flags: map_flags,
+                                    },
+                                )
+                                .is_err()
+                            {
+                                let rollback_len = page_idx * PAGE_SIZE;
+                                if rollback_len > 0 {
+                                    kernel.unmap_range_two_phase(
+                                        receiver_asid,
+                                        map_va as usize,
+                                        rollback_len,
+                                    );
+                                }
+                                kernel.rollback_materialized_recv_cap(
+                                    caller_tid,
+                                    cap_id,
+                                    is_reply_cap,
+                                );
+                                return Err(SyscallError::InvalidArgs);
+                            }
+                        }
+
+                        if kernel
+                            .register_active_transfer_mapping(
+                                crate::kernel::ipc::ThreadId(caller_tid),
+                                cap_id,
+                                VirtAddr(map_va),
+                                mapped_len as usize,
+                            )
+                            .is_err()
+                        {
+                            kernel.unmap_range_two_phase(
+                                receiver_asid,
+                                map_va as usize,
+                                mapped_len as usize,
+                            );
+                            kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
+                            return Err(SyscallError::InvalidArgs);
+                        }
+
+                        crate::yarm_log!(
+                            "RECV_V3_MAPPED tid={} va=0x{:x} len={} ro={}",
+                            caller_tid,
+                            map_va,
+                            mapped_len,
+                            read_only
+                        );
+                        let perm = if read_only {
+                            MAP_PERM_READ_ONLY
+                        } else {
+                            MAP_PERM_READ_WRITE
+                        };
+                        // cleanup_token = cap ID (user passes this to future release call)
+                        (map_va, mapped_len, perm, xfer_cap_out, true)
+                    }
+                    RecvV3MappingPlan::Skip => {
+                        // map_intent != 0 but received message is not OPCODE_SHARED_MEM.
+                        kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
+                        return Err(SyscallError::InvalidArgs);
+                    }
+                    RecvV3MappingPlan::InvalidRegion | RecvV3MappingPlan::InsufficientRights => {
+                        kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
+                        return Err(SyscallError::InvalidArgs);
+                    }
+                }
+            } else {
+                (0u64, 0u64, 0u32, 0u64, false)
+            };
+
+            if skip_payload {
+                // Mapping done: payload_ptr is the mapping target VA, not an inline
+                // payload buffer. Skip copy. All info is in v3 metadata output.
+                write_v3_output_to_user(
+                    kernel,
+                    req.metadata_ptr,
+                    req.metadata_len,
+                    V3_STATUS_OK,
+                    sender_tid_raw,
+                    0,
+                    message_flags_raw,
+                    xfer_cap_out,
+                    obj_kind,
+                    obj_gen,
+                    eff_rights,
+                    exact_obj_size,
+                    exact_reg_len,
+                    mapped_base,
+                    mapped_len_out,
+                    actual_perm,
+                    cleanup_token,
+                );
+                frame.set_ok(
+                    usize::try_from(sender_tid_raw).unwrap_or(0),
+                    0,
+                    usize::try_from(xfer_cap_out).unwrap_or(usize::MAX),
+                );
+                crate::yarm_log!(
+                    "RECV_V3_LIVE_MAPPED tid={} sender={}",
+                    caller_tid,
+                    sender_tid_raw
+                );
+                return Ok(());
+            }
+
             match execute_user_asid_plain_writeback(kernel, &delivery) {
                 RecvUserWritebackOutcome::Ok => {
                     write_v3_output_to_user(
@@ -4349,6 +4584,10 @@ fn handle_recv_shared_v3(
                         eff_rights,
                         exact_obj_size,
                         exact_reg_len,
+                        0,
+                        0,
+                        0,
+                        0,
                     );
                     frame.set_ok(
                         usize::try_from(sender_tid_raw).unwrap_or(0),

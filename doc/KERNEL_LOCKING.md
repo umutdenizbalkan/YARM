@@ -11202,3 +11202,129 @@ Token sentinel: `stage57_cleanup_token_none_matches_abi_sentinel`,
 6. Implement process-exit hook to call `purge_active_transfer_mappings_for_pid`
    on every occupied slot for the exiting process.
 7. No production service loop uses recv_shared_v3.
+
+## §67 Stage 58+59 — recv_shared_v3 live map_intent audit + DmaRegion RO mapping
+
+### 67.1 Scope
+
+Stage 58+59 enables live `map_intent` mapping for `recv_shared_v3` (NR 30) with
+DmaRegion read-only as the primary candidate.  SYSCALL_COUNT=31 is unchanged.
+All hard constraints from §65/§66 remain in force.
+
+### 67.2 Audit classification
+
+- **A** (can implement): DmaRegion read-only mapping via
+  `map_user_page_in_asid_raw` using `PhysAddr(mo.phys.0 + dma.offset)`.
+- **B** (needs phys+offset resolution): Standard ASID lookup for the receiver
+  task; phys = MemoryObject base + DmaRegion offset.
+- **D** (VA selection): caller-provided via `payload_ptr` in the request struct.
+  No kernel VA allocator needed.
+
+### 67.3 Locking invariants
+
+- Physical address resolution for DmaRegion: sequential borrows.
+  `capability_service().resolve_current_task_capability(cap_id)` (first borrow,
+  released after extracting `(mo_id, dma_offset)`), then
+  `with_memory_state(|m| ...)` (second borrow, separate call).  No nested
+  lock-holding across both.
+- `map_user_page_in_asid_raw` is called with no IPC/cap lock held (both borrows
+  are released before the mapping loop begins).
+- `register_active_transfer_mapping` is called after all pages are mapped and
+  before any user writeback.  Rollback via `unmap_range_two_phase` is called on
+  failure before cap rollback.
+
+### 67.4 map_intent gate (metadata_len check)
+
+The old `if req.map_intent != 0 { return Err(InvalidArgs); }` gate is replaced
+by a minimum-metadata-length check:
+
+```
+if req.map_intent != 0 && req.metadata_len < V3_LIVE_OUTPUT_LEN (= 120) {
+    return Err(SyscallError::InvalidArgs);
+}
+```
+
+Callers must provide at least 120 bytes of metadata buffer when requesting live
+mapping; this guarantees `cleanup_token @112` can always be written.
+
+### 67.5 New constants (src/kernel/recv_core.rs, mod recv_shared_v3)
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `V3_LIVE_OUTPUT_LEN` | 120 | Minimum metadata_len for live mapping |
+| `MAP_PERM_READ_ONLY` | 1 | `actual_mapping_perm` for RO mappings |
+| `MAP_PERM_READ_WRITE` | 3 | `actual_mapping_perm` for RW mappings |
+
+### 67.6 write_v3_output_to_user extension
+
+`write_v3_output_to_user` now writes up to 120 bytes (previously 88).
+Four new trailing parameters carry the live-mapping fields:
+
+```
+mapped_base @88..96      (u64, VA of first mapped page)
+page_rounded_mapped_len @96..104 (u64)
+actual_mapping_perm @104..108    (u32; 1=RO, 3=RW)
+cleanup_token @112..120          (u64; cap ID as opaque token; 0 = no mapping)
+```
+
+Fields @108..112 are padding (reserved, written as 0).
+
+When `map_intent == 0`, all four trailing fields are 0 and `write_len =
+min(out_len, 120)`.  Callers with 88-byte buffers receive unchanged behaviour
+because `write_len = min(88, 120) = 88`.
+
+### 67.7 skip_payload flag
+
+When live mapping succeeds, `execute_user_asid_plain_writeback` is **skipped**
+(`skip_payload = true`) because `payload_ptr` is the mapping target VA, not a
+copy buffer.  Writing the `SharedMemoryRegion` encoding there would corrupt the
+mapped page (and fault for RO mappings in production).
+
+The frame's `ret1` (payload_len_copied) is set to 0 in the skip path.
+
+### 67.8 cleanup_token semantics
+
+`cleanup_token = xfer_cap_out` (the receiver-local cap ID as an opaque u64).
+This is the key used in `active_transfer_mappings` and matches the token
+returned by `register_active_transfer_mapping`.  Userspace passes this back
+to a future `release_shared_mapping` syscall.
+
+### 67.9 Proven assertions (mod stage58, mod stage59, src/kernel/boot/tests.rs)
+
+**(A) mod stage58 — 12 kernel tests:**
+
+Gate: `stage58_map_intent_requires_metadata_len_120`,
+`stage58_map_intent_read_write_also_requires_metadata_len_120`
+
+Mapping success: `stage58_dma_region_ro_mapping_result_status_ok`,
+`stage58_dma_region_ro_mapped_base_equals_payload_ptr`,
+`stage58_dma_region_ro_mapped_len_equals_page_size`,
+`stage58_dma_region_ro_actual_perm_is_1`
+
+Token: `stage58_dma_region_ro_cleanup_token_nonzero`,
+`stage58_dma_region_ro_cleanup_token_equals_transferred_cap`
+
+Registry: `stage58_active_transfer_count_increments_after_mapping`
+
+skip_payload: `stage58_mapping_skips_payload_copy_frame_payload_len_is_zero`
+
+Rejection: `stage58_map_intent_without_cap_message_rejected`,
+`stage58_map_intent_with_non_shared_mem_message_rejected`
+
+**(B) mod stage59 — 6 kernel tests:**
+
+Invariants: `stage59_syscall_count_still_31_and_nr_still_30`
+
+Regression: `stage59_plain_receive_write_window_still_88_bytes`,
+`stage59_dma_region_transfer_without_map_intent_unchanged`,
+`stage59_map_intent_small_buffer_still_invalid_args`,
+`stage59_vfs_shared_io_disabled`,
+`stage59_legacy_ipc_recv_unaffected_by_mapping`
+
+### 67.10 Test-ordering constraint
+
+All `send`/`ipc_send` calls in stage58/stage59 tests are issued **before**
+`setup_receiver`/`setup_recv_asid` (which binds task 0 to a user ASID).  After
+ASID binding, `IpcSend` from task 0 takes the user-ASID path and calls
+`copy_from_current_user`, which faults on `VA=0`.  The send must use the
+kernel-task path (no ASID bound) to avoid silent message-loss.

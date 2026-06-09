@@ -42,9 +42,15 @@ pub const RECV_V3_EXTENDED_OUTPUT_LEN: u32 = 88;
 /// A caller providing at least this many bytes for `metadata_len` will receive
 /// `mapped_base @88`, `page_rounded_mapped_len @96`, and
 /// `actual_mapping_perm @104` when live shared-memory mapping is enabled.
-/// **Currently all three fields are always 0** — `map_intent != 0` still
-/// returns `InvalidArgs` in the current stage.
 pub const RECV_V3_MAPPED_OUTPUT_LEN: u32 = 108;
+
+/// Full output record length including `cleanup_token @112` (Stage 58+59).
+///
+/// A caller **must** provide at least this many bytes for `metadata_len` when
+/// requesting `map_intent != 0`.  The kernel writes `mapped_base`, `mapped_len`,
+/// `actual_mapping_perm`, and `cleanup_token` only when the buffer is large
+/// enough; if the buffer is smaller the syscall returns `InvalidArgs`.
+pub const RECV_V3_TOKEN_OUTPUT_LEN: u32 = 120;
 
 /// Map-intent flag: map the transferred region read-only.
 pub const RECV_V3_MAP_READ: u32 = 0x1;
@@ -300,8 +306,9 @@ pub struct RecvSharedV3Output {
     /// Actual mapping permissions granted (0 if no mapping).
     pub actual_mapping_perm: u32,
 
-    // ── FUTURE ────────────────────────────────────────────────────────────
-    /// **FUTURE (unavailable)**: cleanup token identity; 0 now.
+    /// Opaque cleanup token (Stage 58+59): nonzero when a live mapping was
+    /// performed; 0 ([`RECV_V3_CLEANUP_TOKEN_NONE`]) when no mapping.
+    /// Pass to an explicit release call when the mapping is no longer needed.
     pub cleanup_token: u64,
     /// **FUTURE**: VFS shared I/O request ID / descriptor generation; 0 now.
     pub request_id: u64,
