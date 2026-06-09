@@ -11543,3 +11543,50 @@ VFS_SHARED_IO_ENABLED remains disabled. Full rationale in doc/VFS_SHARED_IO_CONT
 - No MAP_WRITE enabled
 - No production service loops changed
 - No Drop-based cleanup added
+
+---
+
+## §71 Stage 65 — VfsWriteSharedBinding contract and WRITE_SHARED_REQUEST helper bridge
+
+### 71.1 Scope
+
+Stage 65 defines and proves the binding contract between a `recv_shared_v3` MAP_READ delivery
+and a VFS `WRITE_SHARED_REQUEST` descriptor. No kernel code changed. No syscall numbers changed.
+No production service paths changed.
+
+All changes are in `crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs` (helper-only
+`VfsWriteSharedBinding` type + 21 stage65 tests).
+
+### 71.2 Binding contract (cross-reference invariants)
+
+When `recv_shared_v3` returns a MAP_READ delivery, the kernel populates `cleanup_token` as a
+full `u64` CapId: `(generation << 16) | slot_index`. The VFS requestor must encode:
+
+```
+descriptor.object_handle     = cleanup_token          // full u64 CapId
+descriptor.object_generation = cleanup_token >> 16    // generation only
+```
+
+`VfsWriteSharedBinding::validate()` checks both fields. A single-field match is insufficient:
+handle can collide across generations; generation alone does not uniquely identify a slot.
+
+### 71.3 Mapping permission invariant
+
+`actual_mapping_perm` from `recv_shared_v3` must equal `MAP_PERM_READ_ONLY = 1` for a
+WRITE_SHARED_REQUEST binding. The validate() function rejects any non-read-only permission.
+`BorrowedSharedIoTestMapper` enforces direction safety: `with_write_request_buffer` returns an
+immutable `&[u8]`; requesting mutable access via `with_read_reply_buffer` returns
+`WrongAccessDirection`.
+
+### 71.4 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- NR 30 = RecvSharedV3 (no change)
+- NR 4 = TransferRelease (no change)
+- All existing recv_shared_v3 ABI field offsets unchanged
+- MAP_WRITE not enabled (Stage 60 RW gate intact)
+- READ_SHARED_REPLY still blocked
+- VFS_SHARED_IO_ENABLED still disabled
+- No Drop-based cleanup added
+- No live VFS dispatch path changed
+- No FAT/ext4/blkcache production write behavior changed

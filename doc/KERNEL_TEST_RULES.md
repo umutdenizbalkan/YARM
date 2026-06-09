@@ -3713,3 +3713,51 @@ No new Rust code in `yarm-fs-servers` (existing 207 tests unchanged).
 - `cargo test --features hosted-dev "stage60::" --lib` (10 regression)
 
 All tests must pass.
+
+---
+
+### Rule N+61 — Stage 65: VfsWriteSharedBinding contract and WRITE_SHARED_REQUEST helper bridge
+
+**Crate:** `yarm-fs-servers`
+**File:** `crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs`
+
+**Coverage:** 21 new `stage65_*` tests proving the full `VfsWriteSharedBinding` lifecycle.
+
+**Rejection tests (one per error variant):**
+- `stage65_missing_cleanup_token_rejected` — `MissingCleanupToken`
+- `stage65_missing_transfer_cap_rejected` — `NoTransferCap`
+- `stage65_non_readonly_mapping_rejected` — `MappingNotReadOnly`
+- `stage65_zero_mapped_base_rejected` — `MappingNotEstablished`
+- `stage65_non_dma_object_kind_rejected` — `UnsupportedObjectKind`
+- `stage65_wrong_access_flag_rejected` — `WrongDescriptorAccess`
+- `stage65_descriptor_handle_mismatch_rejected` — `DescriptorHandleMismatch`
+- `stage65_descriptor_generation_mismatch_rejected` — `DescriptorGenerationMismatch`
+- `stage65_mapping_range_too_short_rejected` — `MappingRangeTooShort`
+- `stage65_zero_exact_region_len_rejected` — `ExactRegionLenInsufficient`
+- `stage65_zero_request_id_rejected` — `ZeroRequestId`
+
+**Acceptance and lifecycle tests:**
+- `stage65_valid_write_shared_binding_accepted` — all 11 checks pass, fields preserved
+- `stage65_cleanup_token_parts_decompose_correctly` — `cleanup_token_parts()` decomposes correctly
+- `stage65_ramfs_consumes_immutable_bytes_via_binding_and_mapper` — full RAMFS write roundtrip
+- `stage65_mapper_rejects_write_access_to_write_request_buffer` — direction safety enforced
+- `stage65_cleanup_idempotent_after_success` — lifecycle cleanup is idempotent
+- `stage65_cleanup_before_fallback_required_for_write_request` — fallback requires prior cleanup
+- `stage65_production_mapper_rejects_write_shared_request` — `UnsupportedSharedIoMapper` rejects
+- `stage65_read_shared_reply_still_unsupported_by_production_mapper` — READ_SHARED_REPLY blocked
+- `stage65_vfs_shared_io_enabled_remains_disabled` — VFS_SHARED_IO_ENABLED still false
+- `stage65_descriptor_accessor_returns_correct_fields` — `descriptor()` accessor correct
+
+**Binding contract under test:**
+- `descriptor.object_handle == cleanup_token` (full u64 CapId)
+- `descriptor.object_generation == cleanup_token >> 16` (generation field)
+- `actual_mapping_perm == MAP_PERM_READ_ONLY (1)` for WRITE_SHARED_REQUEST
+- `object_kind == OBJECT_KIND_DMA_REGION`
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --lib stage65` (21 tests)
+- `cargo test -p yarm-fs-servers --lib` (228 total, full regression)
+- `cargo test --features hosted-dev "stage63::" --lib` (8 kernel regression)
+- `cargo test -p yarm-user-rt --lib stage63` (4 user-rt regression)
+
+All tests must pass. `VFS_SHARED_IO_ENABLED` must remain disabled after this stage.
