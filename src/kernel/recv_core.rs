@@ -1379,6 +1379,249 @@ pub mod recv_shared_v3 {
             read_only: !wants_write,
         }
     }
+
+    // ── Stage 56+57: Cleanup-token registry (helper-only) ────────────────────
+
+    /// Fixed capacity of the helper-only cleanup registry.
+    ///
+    /// No live syscall path uses the registry; it exists only to validate
+    /// token-lifecycle semantics in tests.
+    pub const RECV_V3_CLEANUP_REGISTRY_CAPACITY: usize = 16;
+
+    /// Opaque cleanup token returned by [`RecvV3CleanupRegistry::allocate`].
+    ///
+    /// Encoding: `(slot_index + 1) | (generation << 16)`.
+    /// - `NONE` (0) is the sentinel for "no active mapping".
+    /// - `slot_index + 1` occupies bits 0..15 (values 1..=CAPACITY).
+    /// - `generation` occupies bits 16..47; starts at 1 so the first
+    ///   allocation of each slot always produces a nonzero token.
+    ///
+    /// The embedded generation prevents stale-release: a released slot
+    /// increments its generation before being reused, making old tokens
+    /// return [`RecvV3CleanupReleaseResult::StaleGeneration`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RecvV3CleanupToken(u64);
+
+    impl RecvV3CleanupToken {
+        /// Sentinel for "no active mapping / no cleanup needed".
+        pub const NONE: Self = Self(0);
+
+        /// Returns `true` when this token represents an active mapping obligation.
+        pub const fn is_valid(self) -> bool {
+            self.0 != 0
+        }
+
+        /// Returns the raw u64 value for writing to [`RecvSharedV3Output::cleanup_token`].
+        pub const fn raw(self) -> u64 {
+            self.0
+        }
+
+        fn slot_index(self) -> Option<usize> {
+            let low = self.0 & 0xFFFF;
+            if low == 0 {
+                None
+            } else {
+                Some((low - 1) as usize)
+            }
+        }
+
+        fn generation(self) -> u32 {
+            (self.0 >> 16) as u32
+        }
+    }
+
+    /// Full cleanup identity for a receive-time shared-memory mapping.
+    ///
+    /// **Kernel-internal / helper-only** — no live syscall path creates one.
+    /// Used in tests to validate token-lifecycle behaviour before live VM
+    /// mutation is permitted.
+    ///
+    /// # Field availability
+    ///
+    /// | Field | Available |
+    /// |---|---|
+    /// | `receiver_tid` | Now |
+    /// | `receiver_asid` | Now |
+    /// | `receiver_local_cap` | Now (after cap materialisation) |
+    /// | `object_kind` | Now |
+    /// | `object_generation` | Now |
+    /// | `exact_region_len` | Now (DmaRegion cap field) |
+    /// | `map_intent` | Now (request field) |
+    /// | `mapped_base` | After live mapping |
+    /// | `mapped_len` | After live mapping |
+    /// | `actual_mapping_perm` | After live mapping |
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RecvV3CleanupIdentity {
+        /// Receiver process/task TID.
+        pub receiver_tid: u64,
+        /// Receiver address-space ID.
+        pub receiver_asid: u64,
+        /// Receiver-local materialised capability ID (`u64::MAX` = none).
+        pub receiver_local_cap: u64,
+        /// Object kind discriminant of the transferred cap.
+        pub object_kind: u32,
+        /// Object generation of the transferred cap (0 if unavailable).
+        pub object_generation: u64,
+        /// Mapped VA in the receiver's address space (0 until live mapping).
+        pub mapped_base: u64,
+        /// Page-rounded mapped length in bytes (0 until live mapping).
+        pub mapped_len: u64,
+        /// Actual mapping permissions granted (0 until live mapping).
+        pub actual_mapping_perm: u32,
+        /// Exact sub-region length for DmaRegion caps; 0 for other kinds.
+        pub exact_region_len: u64,
+        /// Map intent flags from the request (`MAP_READ` / `MAP_READ|MAP_WRITE`).
+        pub map_intent: u32,
+    }
+
+    impl RecvV3CleanupIdentity {
+        /// Construct a zeroed identity; `receiver_local_cap` set to `u64::MAX` (sentinel).
+        pub const fn zeroed() -> Self {
+            Self {
+                receiver_tid: 0,
+                receiver_asid: 0,
+                receiver_local_cap: u64::MAX,
+                object_kind: 0,
+                object_generation: 0,
+                mapped_base: 0,
+                mapped_len: 0,
+                actual_mapping_perm: 0,
+                exact_region_len: 0,
+                map_intent: 0,
+            }
+        }
+
+        /// Returns `true` when both `mapped_base` and `mapped_len` are non-zero,
+        /// indicating that a live mapping has been recorded.
+        ///
+        /// Always `false` in the current stage (no live mapping exists).
+        pub const fn is_mapped(&self) -> bool {
+            self.mapped_base != 0 && self.mapped_len != 0
+        }
+    }
+
+    /// Result of a [`RecvV3CleanupRegistry::release`] call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RecvV3CleanupReleaseResult {
+        /// Token was valid and active; slot is now free for reuse.
+        Released,
+        /// Token encodes a valid, non-recycled slot that is already free.
+        /// (Duplicate release before any reallocation of this slot.)
+        AlreadyReleased,
+        /// Token encodes a zero slot index or an out-of-bounds index.
+        InvalidToken,
+        /// Token encodes a valid slot index whose generation has advanced
+        /// (the slot was recycled for a newer mapping after this token's
+        /// mapping was released).
+        StaleGeneration,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RecvV3CleanupSlot {
+        occupied: bool,
+        /// Per-slot generation counter. Incremented on every allocation.
+        /// Starts at 0; first allocation increments to 1 so the first
+        /// valid token is always nonzero.
+        generation: u32,
+        identity: RecvV3CleanupIdentity,
+    }
+
+    impl RecvV3CleanupSlot {
+        const EMPTY: Self = Self {
+            occupied: false,
+            generation: 0,
+            identity: RecvV3CleanupIdentity::zeroed(),
+        };
+    }
+
+    /// Fixed-capacity helper-only cleanup registry.
+    ///
+    /// Holds at most [`RECV_V3_CLEANUP_REGISTRY_CAPACITY`] simultaneous
+    /// mapping obligations.  No live syscall path uses this type; it exists
+    /// solely to prove token-lifecycle semantics in tests.
+    ///
+    /// # Token lifecycle
+    ///
+    /// 1. `allocate(identity)` → `Some(token)` if a free slot exists.
+    /// 2. `release(token)` → `Released` on success.
+    /// 3. Duplicate `release(token)` before slot reuse → `AlreadyReleased`.
+    /// 4. `release(old_token)` after slot reuse → `StaleGeneration`.
+    /// 5. `release(NONE)` or out-of-range → `InvalidToken`.
+    pub struct RecvV3CleanupRegistry {
+        slots: [RecvV3CleanupSlot; RECV_V3_CLEANUP_REGISTRY_CAPACITY],
+    }
+
+    impl RecvV3CleanupRegistry {
+        /// Create an empty registry with no occupied slots.
+        pub const fn new() -> Self {
+            Self {
+                slots: [RecvV3CleanupSlot::EMPTY; RECV_V3_CLEANUP_REGISTRY_CAPACITY],
+            }
+        }
+
+        /// Allocate a slot for `identity`, returning a fresh nonzero token.
+        ///
+        /// Returns `None` when all [`RECV_V3_CLEANUP_REGISTRY_CAPACITY`] slots
+        /// are occupied.  The returned token embeds the slot index and the
+        /// updated generation so that stale releases are detectable.
+        pub fn allocate(&mut self, identity: RecvV3CleanupIdentity) -> Option<RecvV3CleanupToken> {
+            for (i, slot) in self.slots.iter_mut().enumerate() {
+                if !slot.occupied {
+                    slot.generation = slot.generation.wrapping_add(1);
+                    if slot.generation == 0 {
+                        slot.generation = 1;
+                    }
+                    slot.occupied = true;
+                    slot.identity = identity;
+                    let token =
+                        RecvV3CleanupToken((i as u64 + 1) | ((slot.generation as u64) << 16));
+                    return Some(token);
+                }
+            }
+            None
+        }
+
+        /// Release a mapping obligation identified by `token`.
+        ///
+        /// See [`RecvV3CleanupReleaseResult`] for all possible outcomes.
+        pub fn release(&mut self, token: RecvV3CleanupToken) -> RecvV3CleanupReleaseResult {
+            let idx = match token.slot_index() {
+                None => return RecvV3CleanupReleaseResult::InvalidToken,
+                Some(i) => i,
+            };
+            if idx >= RECV_V3_CLEANUP_REGISTRY_CAPACITY {
+                return RecvV3CleanupReleaseResult::InvalidToken;
+            }
+            let slot = &mut self.slots[idx];
+            if token.generation() != slot.generation {
+                return RecvV3CleanupReleaseResult::StaleGeneration;
+            }
+            if !slot.occupied {
+                return RecvV3CleanupReleaseResult::AlreadyReleased;
+            }
+            slot.occupied = false;
+            RecvV3CleanupReleaseResult::Released
+        }
+
+        /// Return a reference to the identity bound to `token`, or `None` if
+        /// the token is invalid, stale, or the slot is already free.
+        pub fn lookup(&self, token: RecvV3CleanupToken) -> Option<&RecvV3CleanupIdentity> {
+            let idx = token.slot_index()?;
+            if idx >= RECV_V3_CLEANUP_REGISTRY_CAPACITY {
+                return None;
+            }
+            let slot = &self.slots[idx];
+            if token.generation() != slot.generation || !slot.occupied {
+                return None;
+            }
+            Some(&slot.identity)
+        }
+
+        /// Return the number of currently occupied slots.
+        pub fn count_occupied(&self) -> usize {
+            self.slots.iter().filter(|s| s.occupied).count()
+        }
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────

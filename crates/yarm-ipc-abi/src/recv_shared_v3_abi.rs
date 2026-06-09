@@ -346,63 +346,111 @@ impl RecvSharedV3Output {
 
 // ── Cleanup-token scaffold (helper-only, Stage 52+53) ────────────────────────
 
-/// Identity record for a future recv_shared_v3 cleanup obligation (Stage 54+).
+/// Identity record for a future recv_shared_v3 cleanup obligation (Stage 56+57).
 ///
 /// **FUTURE (unavailable)**: no live mappings exist in the current stage; all
 /// instances of this type are conceptual scaffolding.  The corresponding
 /// `RecvSharedV3Output::cleanup_token` field is always 0 because:
 ///   - No VM mapping is performed (`map_intent` returns `InvalidArgs`).
-///   - No per-mapping cleanup registry exists.
+///   - No per-mapping cleanup registry is used in the live path.
 ///   - No process-exit hook for shared mappings is implemented.
 ///   - No VFS shared-I/O lifecycle binding is implemented.
 ///
-/// When live mapping is eventually enabled (Stage 54+), a non-zero
-/// `cleanup_token` in the output record will correspond to an entry in a
-/// kernel-side cleanup registry identified by the fields below.
+/// When live mapping is eventually enabled, a non-zero `cleanup_token` in the
+/// output record will correspond to an entry in a kernel-side cleanup registry
+/// identified by the fields below.
 ///
-/// Invariants that must hold when `is_active()` is true (future):
-///   - `receiver_cap != u64::MAX`
-///   - `object_kind != 0` (a recognised kind was transferred)
-///   - `region_len > 0` and `region_len % PAGE_SIZE == 0`
-///   - `transfer_token != 0` (non-zero distinguishes an active obligation)
+/// # Field availability
+///
+/// | Field | Available |
+/// |---|---|
+/// | `receiver_cap` | Now (after cap materialisation) |
+/// | `object_kind` | Now |
+/// | `region_len` | Now (DmaRegion cap field / MemoryObject size) |
+/// | `transfer_token` | After live mapping (the returned cleanup token) |
+/// | `mapped_base` | After live mapping |
+/// | `mapped_len` | After live mapping |
+/// | `actual_mapping_perm` | After live mapping |
+/// | `map_intent` | Now (request field) |
+///
+/// # Invariants when `is_active()` is `true` (future)
+///
+/// - `receiver_cap != u64::MAX`
+/// - `object_kind != 0`
+/// - `region_len > 0` and `region_len % PAGE_SIZE == 0`
+/// - `transfer_token != 0`
+/// - `mapped_base != 0`
+/// - `mapped_len != 0`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvSharedV3CleanupIdentity {
-    /// Receiver-local materialized capability ID.
+    /// Receiver-local materialised capability ID.
     /// `u64::MAX` when no cleanup obligation exists (sentinel).
     pub receiver_cap: u64,
     /// Object kind discriminant of the transferred capability.
     pub object_kind: u32,
-    /// Page-aligned byte length of the mapped region.
-    /// For `DmaRegion` this is the sub-region length; for `MemoryObject` the object size.
+    /// Page-aligned byte length of the region.
+    /// For `DmaRegion` this is the sub-region length; for `MemoryObject` the
+    /// object size.
     pub region_len: u64,
-    /// Opaque transfer-session token.  0 = no live mapping; non-zero = cleanup required.
+    /// Opaque cleanup token returned by the kernel
+    /// (`RecvSharedV3Output::cleanup_token`).
+    /// 0 = no live mapping; non-zero = cleanup required.
     pub transfer_token: u64,
+    // ── Available after live mapping ────────────────────────────────────────
+    /// Mapped virtual base address in the receiver's address space.
+    /// 0 until a live mapping is established.
+    pub mapped_base: u64,
+    /// Page-rounded byte length of the mapping.
+    /// 0 until a live mapping is established.
+    pub mapped_len: u64,
+    /// Actual mapping permissions granted (bitmask of `RECV_V3_MAP_*` bits).
+    /// 0 until a live mapping is established.
+    pub actual_mapping_perm: u32,
+    /// Map intent flags from the original request (`RECV_V3_MAP_READ` etc.).
+    /// Available now (from the request); 0 when no mapping was requested.
+    pub map_intent: u32,
 }
 
 impl RecvSharedV3CleanupIdentity {
     /// Construct the sentinel value representing no active cleanup obligation.
+    ///
+    /// `receiver_cap` is set to `u64::MAX`; all other fields are 0.
     pub const fn none() -> Self {
         Self {
             receiver_cap: u64::MAX,
             object_kind: 0,
             region_len: 0,
             transfer_token: 0,
+            mapped_base: 0,
+            mapped_len: 0,
+            actual_mapping_perm: 0,
+            map_intent: 0,
         }
     }
 
-    /// Returns `true` when this identity represents an active cleanup obligation.
+    /// Returns `true` when this identity represents an active cleanup obligation
+    /// (i.e. `transfer_token != 0`).
     ///
     /// Always `false` in the current stage — no live mappings exist.
     pub const fn is_active(&self) -> bool {
         self.transfer_token != 0
     }
 
-    /// Returns `true` if the identity satisfies the structural invariants
-    /// required for a future cleanup registration.
+    /// Returns `true` when `mapped_base` and `mapped_len` are both non-zero,
+    /// indicating that mapping-phase fields have been populated.
     ///
-    /// Validates that `receiver_cap` is not the sentinel, `object_kind` is
-    /// non-zero, and `region_len` is a positive multiple of `page_size`.
-    /// Does NOT check against any live registry (none exists yet).
+    /// Always `false` in the current stage.
+    pub const fn is_mapped(&self) -> bool {
+        self.mapped_base != 0 && self.mapped_len != 0
+    }
+
+    /// Returns `true` if the pre-mapping structural invariants hold:
+    ///
+    /// - `receiver_cap != u64::MAX`
+    /// - `object_kind != 0`
+    /// - `region_len > 0` and a positive multiple of `page_size`
+    ///
+    /// Does NOT check `mapped_base`, `transfer_token`, or the live registry.
     pub fn is_structurally_valid(&self, page_size: usize) -> bool {
         self.receiver_cap != u64::MAX
             && self.object_kind != 0
@@ -878,5 +926,79 @@ mod tests {
         use core::mem::{offset_of, size_of};
         let field_end = offset_of!(RecvSharedV3Output, actual_mapping_perm) + size_of::<u32>();
         assert_eq!(field_end, RECV_V3_MAPPED_OUTPUT_LEN as usize);
+    }
+
+    // ── Stage 56+57: expanded RecvSharedV3CleanupIdentity ───────────────────
+
+    #[test]
+    fn abi_cleanup_identity_none_has_all_new_fields_zero() {
+        // Stage 56+57: none() must zero all post-mapping fields.
+        let id = RecvSharedV3CleanupIdentity::none();
+        assert_eq!(id.mapped_base, 0, "mapped_base must be 0 in none()");
+        assert_eq!(id.mapped_len, 0, "mapped_len must be 0 in none()");
+        assert_eq!(
+            id.actual_mapping_perm, 0,
+            "actual_mapping_perm must be 0 in none()"
+        );
+        assert_eq!(id.map_intent, 0, "map_intent must be 0 in none()");
+    }
+
+    #[test]
+    fn abi_cleanup_identity_is_mapped_false_in_none() {
+        // none() has mapped_base=0 and mapped_len=0, so is_mapped() must be false.
+        let id = RecvSharedV3CleanupIdentity::none();
+        assert!(!id.is_mapped(), "none() identity must not be mapped");
+    }
+
+    #[test]
+    fn abi_cleanup_identity_is_mapped_requires_both_base_and_len() {
+        let mut id = RecvSharedV3CleanupIdentity::none();
+        id.mapped_base = 0x4000;
+        assert!(!id.is_mapped(), "mapped_len=0 must keep is_mapped false");
+        id.mapped_base = 0;
+        id.mapped_len = 4096;
+        assert!(!id.is_mapped(), "mapped_base=0 must keep is_mapped false");
+        id.mapped_base = 0x4000;
+        assert!(id.is_mapped(), "both nonzero must make is_mapped true");
+    }
+
+    #[test]
+    fn abi_cleanup_identity_is_active_and_is_mapped_are_independent() {
+        let mut id = RecvSharedV3CleanupIdentity::none();
+        id.transfer_token = 1; // active (transfer_token != 0)
+        id.mapped_base = 0; // but not yet mapped
+        assert!(id.is_active(), "non-zero transfer_token must be active");
+        assert!(
+            !id.is_mapped(),
+            "zero mapped_base must keep is_mapped false"
+        );
+
+        id.transfer_token = 0; // not active
+        id.mapped_base = 0x4000;
+        id.mapped_len = 4096; // mapped but not active
+        assert!(!id.is_active(), "zero transfer_token must not be active");
+        assert!(id.is_mapped(), "nonzero base+len must be mapped");
+    }
+
+    #[test]
+    fn abi_cleanup_identity_full_round_trip() {
+        // Construct a fully populated identity and verify all fields.
+        let mut id = RecvSharedV3CleanupIdentity::none();
+        id.receiver_cap = 7;
+        id.object_kind = RecvSharedV3ObjectKind::DmaRegion as u32;
+        id.region_len = 4096;
+        id.transfer_token = 0x0001_0001; // nonzero → active
+        id.mapped_base = 0x8000;
+        id.mapped_len = 4096;
+        id.actual_mapping_perm = RECV_V3_MAP_READ;
+        id.map_intent = RECV_V3_MAP_READ;
+
+        assert!(id.is_active());
+        assert!(id.is_mapped());
+        assert!(id.is_structurally_valid(4096));
+        assert_eq!(id.actual_mapping_perm, RECV_V3_MAP_READ);
+        assert_eq!(id.map_intent, RECV_V3_MAP_READ);
+        assert_eq!(id.mapped_base, 0x8000);
+        assert_eq!(id.mapped_len, 4096);
     }
 }

@@ -3469,3 +3469,77 @@ All tests must pass.
 - `cargo test --features hosted-dev --lib -- --test-threads=1` (1156 total)
 
 All tests must pass.
+
+---
+
+## Rule N+56: Stage 56+57 — cleanup-token lifecycle design + helper-only registry
+
+**Constraints (verbatim):**
+- `SYSCALL_COUNT == 31` unchanged.
+- Syscall numbers unchanged.
+- Public ABI field offsets unchanged.
+- `map_intent != 0 → InvalidArgs` gate unchanged.
+- No live mapping, no VM mutation.
+- No live syscall uses `RecvV3CleanupRegistry`.
+- `cleanup_token @112` never written by kernel.
+- No Drop-based cleanup in user-rt.
+- No release syscall API.
+
+**Kernel changes (`src/kernel/recv_core.rs`, `mod recv_shared_v3`):**
+- `RECV_V3_CLEANUP_REGISTRY_CAPACITY: usize = 16`.
+- `RecvV3CleanupToken` — opaque `u64`; encoding `(slot+1) | (gen << 16)`; NONE = 0.
+- `RecvV3CleanupIdentity` — 10-field kernel-internal identity; `zeroed()`, `is_mapped()`.
+- `RecvV3CleanupReleaseResult` — Released / AlreadyReleased / InvalidToken / StaleGeneration.
+- `RecvV3CleanupRegistry` — fixed-capacity no-heap registry; `new()`, `allocate()`,
+  `release()`, `lookup()`, `count_occupied()`.
+
+**ABI crate changes (`crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`):**
+- `RecvSharedV3CleanupIdentity` expanded with `mapped_base`, `mapped_len`,
+  `actual_mapping_perm`, `map_intent`.
+- `none()` updated to zero all new fields.
+- `is_mapped()` method added.
+
+**user-rt changes:** none.
+
+**(A) Kernel tests — 14 in `mod stage56`, `src/kernel/boot/tests.rs`:**
+- `stage56_token_none_is_invalid`
+- `stage56_allocate_gives_nonzero_token`
+- `stage56_token_encodes_slot_and_generation`
+- `stage56_release_valid_token_gives_released`
+- `stage56_duplicate_release_gives_already_released`
+- `stage56_stale_token_after_realloc_gives_stale_generation`
+- `stage56_none_token_gives_invalid_token`
+- `stage56_registry_full_returns_none`
+- `stage56_fill_release_refill`
+- `stage56_lookup_returns_correct_identity`
+- `stage56_lookup_after_release_returns_none`
+- `stage56_two_slots_are_independent`
+- `stage56_integration_map_plan_to_identity_and_token`
+- `stage56_rw_plan_to_identity_is_not_read_only`
+
+**(B) Kernel tests — 8 in `mod stage57`, `src/kernel/boot/tests.rs`:**
+- `stage57_syscall_count_still_31_and_nr_still_30`
+- `stage57_map_intent_read_only_gate_still_disabled`
+- `stage57_map_intent_read_write_gate_still_disabled`
+- `stage57_plain_receive_write_window_is_88_no_mapping_fields`
+- `stage57_memory_object_transfer_no_mapping_output`
+- `stage57_dma_region_transfer_no_mapping_output`
+- `stage57_cleanup_token_none_matches_abi_sentinel`
+- `stage57_new_registry_has_zero_occupied_slots`
+
+**(C) ABI crate tests — 5 new, total 190, `crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`:**
+- `abi_cleanup_identity_none_has_all_new_fields_zero`
+- `abi_cleanup_identity_is_mapped_false_in_none`
+- `abi_cleanup_identity_is_mapped_requires_both_base_and_len`
+- `abi_cleanup_identity_is_active_and_is_mapped_are_independent`
+- `abi_cleanup_identity_full_round_trip`
+
+**Run commands:**
+- `cargo test --lib stage56 -- --test-threads=1` (14 kernel tests)
+- `cargo test --lib stage57 -- --test-threads=1` (8 kernel tests)
+- `cargo test -p yarm-ipc-abi --lib -- --test-threads=1` (190 ABI tests total)
+- `cargo test --lib ipc_recv -- --test-threads=1` (regression)
+- `cargo test --lib recv_v2 -- --test-threads=1` (regression)
+- `cargo test --features hosted-dev --lib -- --test-threads=1` (1178 total)
+
+All tests must pass.

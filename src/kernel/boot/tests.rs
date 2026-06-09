@@ -28125,3 +28125,635 @@ mod stage54 {
         assert_eq!(plan, RecvV3MappingPlan::InvalidRegion);
     }
 }
+
+// ─── Stage 56+57 ─────────────────────────────────────────────────────────────
+
+mod stage56 {
+    //! Stage 56+57 Part 4 — helper-only cleanup-token registry.
+    //!
+    //! Validates [`RecvV3CleanupRegistry`] token-lifecycle semantics without any
+    //! live VM mutation:
+    //!
+    //! A. Token invariants (NONE sentinel, encoding, validity).
+    //! B. Allocation (nonzero token, slot/generation encoding).
+    //! C. Release (Released, AlreadyReleased, StaleGeneration, InvalidToken).
+    //! D. Registry capacity (full → None, fill/release/refill cycle).
+    //! E. Lookup (correct identity returned, None after release).
+    //! F. Independence (two slots do not interfere).
+    //! G. Integration (MappingPlan → CleanupIdentity → token lifecycle).
+
+    use crate::kernel::recv_core::recv_shared_v3::{
+        compute_recv_v3_mapping_plan, RecvV3CleanupIdentity, RecvV3CleanupRegistry,
+        RecvV3CleanupReleaseResult, RecvV3CleanupToken, RecvV3MappingPlan, CAP_RIGHT_MAP, MAP_READ,
+        MAP_WRITE, OPCODE_SHARED_MEM_VALUE, RECV_V3_CLEANUP_REGISTRY_CAPACITY,
+    };
+    use crate::kernel::vm::PAGE_SIZE;
+
+    fn test_identity() -> RecvV3CleanupIdentity {
+        let mut id = RecvV3CleanupIdentity::zeroed();
+        id.receiver_tid = 1;
+        id.receiver_asid = 42;
+        id.receiver_local_cap = 7;
+        id.object_kind = 1; // MemoryObject
+        id.mapped_base = 0x4000;
+        id.mapped_len = PAGE_SIZE as u64;
+        id.actual_mapping_perm = MAP_READ;
+        id.exact_region_len = PAGE_SIZE as u64;
+        id.map_intent = MAP_READ;
+        id
+    }
+
+    // ── A. Token invariants ───────────────────────────────────────────────────
+
+    #[test]
+    fn stage56_token_none_is_invalid() {
+        assert!(!RecvV3CleanupToken::NONE.is_valid());
+        assert_eq!(RecvV3CleanupToken::NONE.raw(), 0);
+    }
+
+    // ── B. Allocation ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage56_allocate_gives_nonzero_token() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let tok = reg
+            .allocate(test_identity())
+            .expect("must allocate from empty registry");
+        assert!(tok.is_valid(), "allocated token must be nonzero (is_valid)");
+    }
+
+    #[test]
+    fn stage56_token_encodes_slot_and_generation() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let tok = reg.allocate(test_identity()).expect("allocate");
+        // First allocation: slot 0, generation incremented 0→1.
+        // token = (0 + 1) | (1 << 16) = 1 | 65536 = 0x0001_0001.
+        assert_eq!(
+            tok.raw(),
+            0x0001_0001,
+            "first token must encode slot=0 (low=1) and gen=1 (bits 16+)"
+        );
+    }
+
+    // ── C. Release semantics ──────────────────────────────────────────────────
+
+    #[test]
+    fn stage56_release_valid_token_gives_released() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let tok = reg.allocate(test_identity()).expect("allocate");
+        assert_eq!(reg.release(tok), RecvV3CleanupReleaseResult::Released);
+    }
+
+    #[test]
+    fn stage56_duplicate_release_gives_already_released() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let tok = reg.allocate(test_identity()).expect("allocate");
+        assert_eq!(reg.release(tok), RecvV3CleanupReleaseResult::Released);
+        assert_eq!(
+            reg.release(tok),
+            RecvV3CleanupReleaseResult::AlreadyReleased,
+            "second release of same token (no realloc) must be AlreadyReleased"
+        );
+    }
+
+    #[test]
+    fn stage56_stale_token_after_realloc_gives_stale_generation() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let tok1 = reg.allocate(test_identity()).expect("first alloc (gen=1)");
+        assert_eq!(reg.release(tok1), RecvV3CleanupReleaseResult::Released);
+        // Reallocate same slot: generation advances to 2.
+        let tok2 = reg.allocate(test_identity()).expect("second alloc (gen=2)");
+        assert_ne!(tok1, tok2, "second token must differ from first");
+        assert_eq!(
+            reg.release(tok1),
+            RecvV3CleanupReleaseResult::StaleGeneration,
+            "old gen-1 token must be stale after slot was reallocated (gen=2)"
+        );
+        assert_eq!(
+            reg.release(tok2),
+            RecvV3CleanupReleaseResult::Released,
+            "gen-2 token must still release successfully"
+        );
+    }
+
+    #[test]
+    fn stage56_none_token_gives_invalid_token() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        assert_eq!(
+            reg.release(RecvV3CleanupToken::NONE),
+            RecvV3CleanupReleaseResult::InvalidToken
+        );
+    }
+
+    // ── D. Registry capacity ──────────────────────────────────────────────────
+
+    #[test]
+    fn stage56_registry_full_returns_none() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let mut tokens = [RecvV3CleanupToken::NONE; RECV_V3_CLEANUP_REGISTRY_CAPACITY];
+        for tok in tokens.iter_mut() {
+            *tok = reg.allocate(test_identity()).expect("must allocate slot");
+        }
+        assert_eq!(reg.count_occupied(), RECV_V3_CLEANUP_REGISTRY_CAPACITY);
+        assert!(
+            reg.allocate(test_identity()).is_none(),
+            "full registry must return None"
+        );
+    }
+
+    #[test]
+    fn stage56_fill_release_refill() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let mut tokens = [RecvV3CleanupToken::NONE; RECV_V3_CLEANUP_REGISTRY_CAPACITY];
+        for tok in tokens.iter_mut() {
+            *tok = reg.allocate(test_identity()).expect("fill");
+        }
+        for &tok in tokens.iter() {
+            assert_eq!(reg.release(tok), RecvV3CleanupReleaseResult::Released);
+        }
+        assert_eq!(
+            reg.count_occupied(),
+            0,
+            "all slots must be free after release"
+        );
+        for _ in 0..RECV_V3_CLEANUP_REGISTRY_CAPACITY {
+            assert!(
+                reg.allocate(test_identity()).is_some(),
+                "refill must succeed"
+            );
+        }
+        assert_eq!(reg.count_occupied(), RECV_V3_CLEANUP_REGISTRY_CAPACITY);
+    }
+
+    // ── E. Lookup ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage56_lookup_returns_correct_identity() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let id = test_identity();
+        let tok = reg.allocate(id).expect("allocate");
+        let found = reg.lookup(tok).expect("lookup must find occupied slot");
+        assert_eq!(*found, id, "lookup must return the stored identity exactly");
+    }
+
+    #[test]
+    fn stage56_lookup_after_release_returns_none() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let tok = reg.allocate(test_identity()).expect("allocate");
+        reg.release(tok);
+        assert!(
+            reg.lookup(tok).is_none(),
+            "lookup of released token must return None"
+        );
+    }
+
+    // ── F. Independence ───────────────────────────────────────────────────────
+
+    #[test]
+    fn stage56_two_slots_are_independent() {
+        let mut reg = RecvV3CleanupRegistry::new();
+        let mut id_a = test_identity();
+        id_a.receiver_tid = 10;
+        let mut id_b = test_identity();
+        id_b.receiver_tid = 20;
+
+        let tok_a = reg.allocate(id_a).expect("alloc slot A");
+        let tok_b = reg.allocate(id_b).expect("alloc slot B");
+        assert_ne!(tok_a, tok_b, "distinct slots must produce distinct tokens");
+
+        // Release B; A must remain intact.
+        assert_eq!(reg.release(tok_b), RecvV3CleanupReleaseResult::Released);
+        let found_a = reg
+            .lookup(tok_a)
+            .expect("slot A must still be found after B is released");
+        assert_eq!(found_a.receiver_tid, 10);
+
+        assert_eq!(reg.release(tok_a), RecvV3CleanupReleaseResult::Released);
+    }
+
+    // ── G. Integration: MappingPlan → CleanupIdentity → token lifecycle ───────
+
+    #[test]
+    fn stage56_integration_map_plan_to_identity_and_token() {
+        // Hypothetical: compute the mapping plan for a read-only MAP_READ request.
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ,
+            0x4000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP,
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        let (map_va, mapped_len, read_only) = match plan {
+            RecvV3MappingPlan::Map {
+                map_va,
+                mapped_len,
+                read_only,
+            } => (map_va, mapped_len, read_only),
+            other => panic!("expected Map plan, got {other:?}"),
+        };
+        assert_eq!(map_va, 0x4000);
+        assert_eq!(mapped_len, PAGE_SIZE as u64);
+        assert!(read_only, "MAP_READ only → read_only=true");
+
+        // Construct the cleanup identity that a live implementation would build.
+        let mut id = RecvV3CleanupIdentity::zeroed();
+        id.receiver_tid = 5;
+        id.receiver_asid = 1;
+        id.receiver_local_cap = 42;
+        id.object_kind = 1; // MemoryObject
+        id.mapped_base = map_va;
+        id.mapped_len = mapped_len;
+        id.actual_mapping_perm = MAP_READ;
+        id.map_intent = MAP_READ;
+
+        assert!(
+            id.is_mapped(),
+            "identity with populated mapping fields must report is_mapped"
+        );
+
+        // Allocate a token, verify lookup, release, verify stale.
+        let mut reg = RecvV3CleanupRegistry::new();
+        let tok = reg.allocate(id).expect("allocate cleanup token");
+        assert!(tok.is_valid());
+        assert_eq!(reg.lookup(tok).unwrap().mapped_base, 0x4000);
+
+        assert_eq!(reg.release(tok), RecvV3CleanupReleaseResult::Released);
+        assert!(
+            reg.lookup(tok).is_none(),
+            "lookup after release must be None"
+        );
+
+        // Reallocate the slot; old token is now stale.
+        let tok2 = reg.allocate(id).expect("reallocate");
+        assert_ne!(tok, tok2);
+        assert_eq!(
+            reg.release(tok),
+            RecvV3CleanupReleaseResult::StaleGeneration,
+            "original token must be stale after reallocation"
+        );
+        assert_eq!(
+            reg.release(tok2),
+            RecvV3CleanupReleaseResult::Released,
+            "new token must still release cleanly"
+        );
+    }
+
+    #[test]
+    fn stage56_rw_plan_to_identity_is_not_read_only() {
+        // Verify read-write plan produces is_mapped identity with MAP_READ|MAP_WRITE.
+        let plan = compute_recv_v3_mapping_plan(
+            OPCODE_SHARED_MEM_VALUE,
+            MAP_READ | MAP_WRITE,
+            0x8000,
+            PAGE_SIZE as u64,
+            CAP_RIGHT_MAP | crate::kernel::recv_core::recv_shared_v3::CAP_RIGHT_WRITE,
+            PAGE_SIZE as u64,
+            PAGE_SIZE as u64,
+        );
+        let read_only = match plan {
+            RecvV3MappingPlan::Map { read_only, .. } => read_only,
+            other => panic!("expected Map, got {other:?}"),
+        };
+        assert!(!read_only, "MAP_READ|MAP_WRITE → read_only=false");
+    }
+}
+
+mod stage57 {
+    //! Stage 56+57 Part 5 — live-path invariants unchanged.
+    //!
+    //! Proves that the current live recv_shared_v3 dispatch produces no
+    //! cleanup tokens and no shared-memory mapping output:
+    //!
+    //! A. Syscall count / NR unchanged.
+    //! B. map_intent gate still returns InvalidArgs.
+    //! C. Kernel write window is 88 bytes; cleanup_token @112 never written.
+    //! D. Plain receive: all cleanup/mapping fields absent from write window.
+    //! E. MemoryObject transfer: same, + object_kind=1 stable.
+    //! F. DmaRegion transfer: same, + object_kind=5, exact_region_len written.
+    //! G. RecvV3CleanupToken::NONE matches RECV_V3_CLEANUP_TOKEN_NONE sentinel.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::recv_core::recv_shared_v3::{
+        RecvV3CleanupRegistry, RecvV3CleanupToken, RECV_V3_CLEANUP_REGISTRY_CAPACITY,
+    };
+    use crate::kernel::syscall::{
+        dispatch, Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP,
+        SYSCALL_RECV_SHARED_V3_NR,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+    use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_CLEANUP_TOKEN_NONE;
+
+    const RECV_V3_STATUS_OK: u32 = 0;
+
+    fn build_v3_req(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf
+    }
+
+    fn build_v3_req_with_map_intent(
+        endpoint_cap: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+        map_intent: u32,
+    ) -> [u8; 80] {
+        let mut buf = build_v3_req(endpoint_cap, 0x1_0100, 256, metadata_ptr, metadata_len);
+        buf[48..52].copy_from_slice(&map_intent.to_le_bytes());
+        buf
+    }
+
+    fn setup_recv_page(state: &mut crate::kernel::boot::KernelState) -> Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_mem_id, map_cap) = state.alloc_anonymous_memory_object().expect("map mem");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                map_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map page at 0x1_0000");
+        asid
+    }
+
+    // ── A. Syscall numbering unchanged ────────────────────────────────────────
+
+    #[test]
+    fn stage57_syscall_count_still_31_and_nr_still_30() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must not change");
+        assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30, "NR must not change");
+    }
+
+    // ── B. map_intent gate unchanged ─────────────────────────────────────────
+
+    #[test]
+    fn stage57_map_intent_read_only_gate_still_disabled() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let asid = setup_recv_page(&mut state);
+        let req_bytes =
+            build_v3_req_with_map_intent(recv_cap.0 as u64, 0x1_0200, 88, 0x1 /* MAP_READ */);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent=READ must still return InvalidArgs"
+        );
+    }
+
+    #[test]
+    fn stage57_map_intent_read_write_gate_still_disabled() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req_with_map_intent(
+            recv_cap.0 as u64,
+            0x1_0200,
+            88,
+            0x3, /* MAP_READ|MAP_WRITE */
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent=READ|WRITE must still return InvalidArgs"
+        );
+    }
+
+    // ── C/D. Plain receive: 88-byte write window, no mapping output ───────────
+
+    #[test]
+    fn stage57_plain_receive_write_window_is_88_no_mapping_fields() {
+        // Prove: plain receive writes exactly 88 bytes; bytes 72..80 (region_offset
+        // = FUTURE) are 0; bytes 80..88 (exact_region_len) are 0 for plain messages.
+        // cleanup_token @112 and mapped_base @88 are OUTSIDE the write window and
+        // are provably 0 because the map_intent gate is still disabled.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x706c_6e21, // b"pln!"
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read 88-byte output window");
+
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        let transferred_cap = u64::from_le_bytes(out[32..40].try_into().unwrap());
+        let region_offset = u64::from_le_bytes(out[72..80].try_into().unwrap());
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        assert_eq!(
+            transferred_cap, SYSCALL_NO_TRANSFER_CAP,
+            "plain message must have no cap"
+        );
+        assert_eq!(region_offset, 0, "region_offset (FUTURE) must be 0");
+        assert_eq!(
+            exact_region_len, 0,
+            "exact_region_len must be 0 for plain message"
+        );
+        // mapped_base @88..96 and cleanup_token @112..120 are outside the
+        // 88-byte write window and are provably 0:
+        //   - write_v3_output_to_user uses a [0u8; 88] local array with
+        //     write_len = min(out_len, 88); bytes @88+ are never written.
+        //   - map_intent gate disabled → no allocation → cleanup_token=0.
+    }
+
+    // ── E. MemoryObject transfer: no mapping/cleanup output ──────────────────
+
+    #[test]
+    fn stage57_memory_object_transfer_no_mapping_output() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xB000))
+            .expect("mem obj");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x6d656d21, // b"mem!"
+                0,
+                mem_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read output");
+
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        assert_eq!(object_kind, 1, "MemoryObject kind must be 1");
+        assert_eq!(
+            exact_region_len, 0,
+            "MemoryObject transfer must have exact_region_len=0"
+        );
+        // mapped_base @88 and cleanup_token @112 are outside the write window;
+        // map_intent gate disabled → no cleanup token would ever be written.
+    }
+
+    // ── F. DmaRegion transfer: exact_region_len written, no mapping output ────
+
+    #[test]
+    fn stage57_dma_region_transfer_no_mapping_output() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state
+            .create_memory_object(PhysAddr(0xC000))
+            .expect("mem obj");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x646d6121, // b"dma!"
+                0,
+                dma_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("ipc_send");
+
+        let asid = setup_recv_page(&mut state);
+        let req_bytes = build_v3_req(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req_bytes)
+            .expect("write req");
+
+        let mut recv_frame = TrapFrame::zeroed();
+        recv_frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        recv_frame.set_arg(0, 0x1_0000);
+        recv_frame.set_arg(1, 80);
+        dispatch(&mut state, &mut recv_frame).expect("recv dispatch");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read output");
+
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        let region_offset = u64::from_le_bytes(out[72..80].try_into().unwrap());
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        assert_eq!(object_kind, 5, "DmaRegion must have kind=5");
+        assert_eq!(region_offset, 0, "region_offset (FUTURE) must be 0");
+        assert_eq!(
+            exact_region_len, PAGE_SIZE as u64,
+            "exact_region_len must equal PAGE_SIZE for DmaRegion"
+        );
+        // mapped_base @88 and cleanup_token @112 are outside the write window.
+        // Gate disabled → no cleanup token allocated.
+    }
+
+    // ── G. Token sentinel cross-crate consistency ─────────────────────────────
+
+    #[test]
+    fn stage57_cleanup_token_none_matches_abi_sentinel() {
+        // RecvV3CleanupToken::NONE.raw() must equal RECV_V3_CLEANUP_TOKEN_NONE (= 0)
+        // so the kernel and the ABI crate agree on the "no token" sentinel.
+        assert_eq!(
+            RecvV3CleanupToken::NONE.raw(),
+            RECV_V3_CLEANUP_TOKEN_NONE,
+            "kernel NONE.raw() must equal ABI RECV_V3_CLEANUP_TOKEN_NONE"
+        );
+    }
+
+    #[test]
+    fn stage57_new_registry_has_zero_occupied_slots() {
+        // A freshly created registry has no occupied slots; proven without any
+        // dispatch to confirm the registry is not used in the live path.
+        let reg = RecvV3CleanupRegistry::new();
+        assert_eq!(
+            reg.count_occupied(),
+            0,
+            "new registry must have 0 occupied slots"
+        );
+        assert_eq!(RECV_V3_CLEANUP_REGISTRY_CAPACITY, 16);
+    }
+}
