@@ -11590,3 +11590,44 @@ immutable `&[u8]`; requesting mutable access via `with_read_reply_buffer` return
 - No Drop-based cleanup added
 - No live VFS dispatch path changed
 - No FAT/ext4/blkcache production write behavior changed
+
+---
+
+## §72 Stage 66+67+68 — Gated WRITE_SHARED_REQUEST live route in VfsService
+
+### 72.1 Scope
+
+Stages 66+67+68 add a gated live route `VfsService::dispatch_write_shared_request` and split
+shared-I/O feature flags into independently gated constants. No kernel code changed.
+
+Changes:
+- `crates/yarm-srv-common/src/vfs_core.rs` — `write_shared_bytes` default method on `VfsBackend`
+- `crates/yarm-fs-servers/src/fs/ramfs/tree.rs` — `RamFsBackend` override of `write_shared_bytes`
+- `crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs` — 3 feature flag constants
+- `crates/yarm-fs-servers/src/fs/common/vfs_service.rs` — `dispatch_write_shared_request` + 17 tests
+
+### 72.2 Feature gate model
+
+```
+VFS_WRITE_SHARED_REQUEST_ENABLED = false  // only WRITE direction gate
+VFS_READ_SHARED_REPLY_ENABLED    = false  // only READ direction gate (blocked by MAP_WRITE)
+VFS_SHARED_IO_ENABLED            = false  // = WRITE && READ → aggregate; always false currently
+```
+
+### 72.3 dispatch_write_shared_request invariants
+
+- `handle_request` still returns `Unsupported` for `VFS_OP_WRITE_SHARED_REQUEST` (unchanged).
+- `dispatch_write_shared_request` validates via `VfsWriteSharedBinding` before backend access.
+- `mapper.release(descriptor)` is called unconditionally after the access attempt.
+- `op_sequence` advances only on success.
+- `VFS_READ_SHARED_REPLY_ENABLED = false` and `VFS_SHARED_IO_ENABLED = false` remain.
+
+### 72.4 Production invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- recv_shared_v3 ABI field offsets unchanged
+- MAP_WRITE not enabled
+- READ_SHARED_REPLY still blocked
+- VFS_SHARED_IO_ENABLED = false
+- No Drop-based cleanup
+- FAT/ext4/blkcache production write behavior unchanged
