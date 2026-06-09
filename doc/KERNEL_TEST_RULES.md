@@ -4032,4 +4032,56 @@ before `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` can be `true`.
 - `cargo test -p yarm-fs-servers --lib stage75 -- --test-threads=1` (10 lifecycle tests)
 - `cargo test -p yarm-fs-servers --lib stage75_tests -- --test-threads=1` (8 dispatch tests)
 - `cargo test -p yarm-fs-servers --lib -- --test-threads=1` (full 295-test regression)
+
+---
+
+## Rule N+68 — Stage 76: PM-owned TaskExited/ProcessExited notification ABI
+
+**Purpose:** Define the PM-owned lifecycle notification contract. Prove ABI codec
+correctness for `PROC_OP_TASK_EXITED`/`PROC_OP_PROCESS_EXITED` message types, VFS handler
+dispatch via `handle_pm_task_exited`, idempotency, safe no-op on unmatched TID, and gate
+status. Documents the two infrastructure blockers before live wiring is possible.
+
+**Modules:**
+- `mod stage76_tests` in `crates/yarm-fs-servers/src/fs/common/vfs_service.rs` (18 tests)
+
+**Gate and opcode tests (7 total):**
+- `stage76_pm_task_exit_notification_gate_disabled` — `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED == false`
+- `stage76_supervisor_task_exit_notification_still_disabled` — supervisor gate unchanged
+- `stage76_vfs_shared_io_umbrella_still_disabled` — `VFS_SHARED_IO_ENABLED == false`
+- `stage76_read_shared_reply_still_enabled` — `VFS_READ_SHARED_REPLY_ENABLED == true`
+- `stage76_write_shared_request_still_disabled` — `VFS_WRITE_SHARED_REQUEST_ENABLED == false`
+- `stage76_proc_op_task_exited_is_13` — `PROC_OP_TASK_EXITED == 13u16`
+- `stage76_proc_op_process_exited_is_14` — `PROC_OP_PROCESS_EXITED == 14u16`
+
+**Codec tests (5 total):**
+- `stage76_pm_task_exited_event_encode_decode_roundtrip` — encode→decode yields same fields
+- `stage76_pm_task_exited_event_decode_short_payload_rejected` — <16-byte payload → error
+- `stage76_pm_process_exited_event_encode_decode_roundtrip` — encode→decode yields same fields
+- `stage76_pm_process_exited_event_decode_short_payload_rejected` — <16-byte payload → error
+- `stage76_pm_task_exited_event_le_byte_order` — LE byte ordering verified
+
+**Handler dispatch tests (6 total):**
+- `stage76_pm_task_exited_matched_tid_delivers_requester_exit` — TID match → `Matched(Won(RequesterExit))`
+- `stage76_pm_task_exited_matched_lifecycle_write_direction` — WriteRequest direction also works
+- `stage76_pm_task_exited_unmatched_tid_is_safe_noop` — wrong TID → `NotMatched`, then second call succeeds
+- `stage76_pm_task_exited_duplicate_matched_tid_is_idempotent` — second call → `Matched(AlreadyCleaned)`
+- `stage76_pm_task_exited_uses_separate_dispatch_not_handle_request` — helper route works end-to-end
+- `stage76_pm_and_vfs_opcodes_are_in_separate_endpoint_namespaces` — opcode isolation documented
+
+**Hard invariants:**
+- `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = false`; do not enable without both blockers resolved:
+  (A) PM→VFS send cap added to startup handoff; (B) PM wired to receive kernel task-exit events.
+- `PROC_OP_TASK_EXITED = 13`, `PROC_OP_PROCESS_EXITED = 14`; do not change these opcode values.
+- `PmTaskExitedEvent` and `PmProcessExitedEvent` wire layouts are 16 bytes LE; do not change.
+- `handle_pm_task_exited` must delegate to `deliver_requester_exit_if_tid_matches`; no state mutation on mismatch.
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`; unchanged from Stage 75.
+- `VFS_SHARED_IO_ENABLED = false`; unchanged.
+- `VFS_READ_SHARED_REPLY_ENABLED = true`; unchanged.
+- No startup slots changed; SYSCALL_COUNT = 31 unchanged; SpawnV5 ABI unchanged.
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --lib stage76_tests -- --test-threads=1` (18 tests)
+- `cargo test -p yarm-ipc-abi -- --test-threads=1` (190 process_abi + vfs_abi tests)
+- `cargo test -p yarm-fs-servers --lib -- --test-threads=1` (full 313-test regression)
 - `cargo check -p yarm-fs-servers` (no errors)

@@ -11980,4 +11980,96 @@ within VFS-space (no kernel locks held).
 
 Wire `SUPERVISOR_OP_TASK_EXITED` → VFS by adding the two missing pieces (§77.3).
 After both are in place, enable `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = true`
+
+---
+
+## §78 Stage 76 — PM-owned TaskExited/ProcessExited notification ABI
+
+### 78.1 Architectural decision
+
+PM should own lifecycle notifications; supervisor should own fault/restart policy only.
+Stage 76 defines the PM-owned push notification ABI and VFS handler entry point.
+Live wiring is not possible without new startup cap distribution (hard rule: do not
+invent unsafe startup slot semantics).
+
+### 78.2 New ABI contracts
+
+```rust
+// crates/yarm-ipc-abi/src/process_abi.rs
+pub const PROC_OP_TASK_EXITED:   u16 = 13;  // PM → VFS push, no reply
+pub const PROC_OP_PROCESS_EXITED: u16 = 14;  // PM → VFS push, no reply
+
+pub struct PmTaskExitedEvent { pub tid: u64, pub exit_code: u64 }
+// Wire: [0..8] tid LE, [8..16] exit_code LE (16 bytes total)
+
+pub struct PmProcessExitedEvent { pub process_tid: u64, pub exit_code: u64 }
+// Wire: [0..8] process_tid LE, [8..16] exit_code LE (16 bytes total)
+```
+
+VFS entry point (helper-only, gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED`):
+```rust
+// crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs
+pub fn handle_pm_task_exited<const N: usize>(
+    tid: u64,
+    lifecycle: &mut VfsSharedIoLifecycle,
+    handles: &mut VfsSharedIoHandleTable<N>,
+) -> Result<VfsSharedIoRequesterExitAction, VfsSharedIoLifecycleError>
+```
+
+### 78.3 Missing infrastructure (two blockers)
+
+**Blocker A — No PM→VFS send cap:**
+Startup context slots 0–17 are fully allocated. No `pm_to_vfs_task_exit_send_cap`
+field exists in `StartupContext` or `CoreServiceHandles`. PM and VFS are isolated at
+the capability level. Adding the channel requires: new `CoreServiceHandles` field, new
+init cap-distribution logic, and a VFS recv arm for `PROC_OP_TASK_EXITED` messages.
+
+**Blocker B — PM does not receive kernel task-exit events:**
+The kernel sends `SUPERVISOR_OP_TASK_EXITED` only to `faults.supervisor_endpoint`
+in `restart_state.rs`. PM has no registered endpoint with the kernel. PM currently
+learns of task exits only via `PROC_OP_WAITPID_V2` (parent polling) or
+`PROC_OP_LIFECYCLE_QUERY`. PM must be wired to receive kernel exit notifications
+before it can push `PROC_OP_TASK_EXITED` to VFS.
+
+Gate constant documenting both blockers:
+```rust
+pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
+```
+
+### 78.4 Signal flow (when both blockers resolved)
+
+```
+exit_task()
+  → report_task_exit_to_supervisor(tid, code, token)    [kernel, today]
+  → [future] report_task_exit_to_pm(tid, code)          [kernel, new]
+    → PM receives PROC_OP_TASK_EXITED equivalent
+    → PM pushes PmTaskExitedEvent via pm_to_vfs_notify_cap
+      → VFS receives on dedicated notify endpoint
+        → handle_pm_task_exited(tid, &mut lifecycle, &mut handles)
+          → deliver_requester_exit_if_tid_matches(tid, handles)
+```
+
+### 78.5 Lock ordering
+
+No change to lock ordering.  `handle_pm_task_exited` is entirely within VFS-space
+(no kernel locks held), same as `deliver_requester_exit_if_tid_matches` in §77.
+
+### 78.6 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- NR 30 = `RecvSharedV3` (no change)
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (unchanged from Stage 73)
+- `VFS_SHARED_IO_ENABLED = false` (unchanged)
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged from Stage 75)
+- `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = false` (Stage 76 documents gap)
+- No startup slots changed; no Drop-based cleanup added
+- 313 yarm-fs-servers tests pass (up from 295 after Stage 75)
+
+### 78.7 Remaining work
+
+Resolve Blocker A (add PM→VFS notification cap to startup handoff) and Blocker B
+(wire PM to receive kernel task-exit events). Then enable
+`VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true` and add a VFS recv loop arm for
+`PROC_OP_TASK_EXITED`. Add the bounded `requester_tid`-keyed lifecycle store to
+`VfsService` (see §77.3 blocker b) to complete the full PM-owned notification path.
 and add integration tests proving end-to-end signal delivery.

@@ -10,6 +10,7 @@
 
 use super::shared_io_lifecycle::{
     VfsSharedIoDirection, VfsSharedIoHandleTable, VfsSharedIoLifecycle, VfsSharedIoLifecycleError,
+    VfsSharedIoRequesterExitAction,
 };
 use yarm_ipc_abi::vfs_abi::{
     VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsReadSharedRequest,
@@ -61,6 +62,45 @@ pub const VFS_SHARED_IO_ENABLED: bool =
 /// and `deliver_requester_exit_if_tid_matches` dispatches by TID with safe no-op on mismatch.
 pub const VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
 
+/// Stage 76: PM → VFS task-exit notification channel (PM-owned lifecycle authority).
+///
+/// `false` (Stage 76): not yet wired. Two missing infrastructure pieces block enabling:
+///
+/// 1. **No PM→VFS send cap**: PM and VFS are isolated at the cap level. No
+///    `pm_to_vfs_task_exit_send_cap` exists in the startup handoff (`StartupContext`
+///    slots 0–17 are fully allocated).  A new cap distribution slot or a runtime
+///    cap-delegation mechanism must be added before PM can push events to VFS.
+///    Specifically: init's `CoreServiceHandles` would need a `pm_vfs_notify_send_cap` field,
+///    and VFS's service loop a dedicated recv arm for `PROC_OP_TASK_EXITED` messages.
+///
+/// 2. **PM does not receive kernel task-exit events**: the kernel sends
+///    `SUPERVISOR_OP_TASK_EXITED` only to the supervisor endpoint (`faults.supervisor_endpoint`
+///    in `restart_state.rs`).  PM has no registered endpoint with the kernel and learns of
+///    exits only via `PROC_OP_WAITPID_V2` or `PROC_OP_LIFECYCLE_QUERY` polling.
+///    PM must be wired to receive kernel task-exit notifications before it can push
+///    `PROC_OP_TASK_EXITED` to VFS.
+///
+/// ABI contract is defined (Stage 76): `PROC_OP_TASK_EXITED = 13` and
+/// `PROC_OP_PROCESS_EXITED = 14` with [`PmTaskExitedEvent`] / [`PmProcessExitedEvent`]
+/// 16-byte LE payloads. VFS entry point is `handle_pm_task_exited`.
+pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
+
+/// Stage 76: VFS entry point for a PM-pushed `PROC_OP_TASK_EXITED` event.
+///
+/// Gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` (currently `false`).
+/// When the gate is `false`, no production code path calls this function.
+/// Tests call it directly to prove the dispatch model is correct.
+///
+/// Dispatches to `deliver_requester_exit_if_tid_matches(tid, handles)` on the given lifecycle.
+/// Returns `NotMatched` if `tid` does not match `lifecycle.requester_tid()`.
+/// Returns `Matched(result)` on a TID match, where `result` is the cleanup outcome.
+pub fn handle_pm_task_exited<const N: usize>(
+    tid: u64,
+    lifecycle: &mut VfsSharedIoLifecycle,
+    handles: &mut VfsSharedIoHandleTable<N>,
+) -> Result<VfsSharedIoRequesterExitAction, VfsSharedIoLifecycleError> {
+    lifecycle.deliver_requester_exit_if_tid_matches(tid, handles)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsSharedIoAdapterError {
