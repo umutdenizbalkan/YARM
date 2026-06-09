@@ -11328,3 +11328,113 @@ All `send`/`ipc_send` calls in stage58/stage59 tests are issued **before**
 ASID binding, `IpcSend` from task 0 takes the user-ASID path and calls
 `copy_from_current_user`, which faults on `VA=0`.  The send must use the
 kernel-task path (no ASID bound) to avoid silent message-loss.
+
+---
+
+## §68 Stage 60 — recv_shared_v3 cleanup-token hardening + rollback audit
+
+### 68.1 Motivation
+
+Stage 58+59 delivered live DmaRegion read-only mapping through `recv_shared_v3`
+(NR 30).  Stage 60 hardens the two residual gaps identified in the audit:
+
+1. **Metadata writeback gap** — `write_v3_output_to_user` ignored the return
+   value of `copy_to_current_user`.  If the metadata buffer VA was unmapped, the
+   mapping was created and registered but the caller never received the
+   `cleanup_token`, making the mapping un-releasable (permanent leak).
+
+2. **RW gate gap** — `map_intent = READ|WRITE (0x3)` was not explicitly rejected;
+   RW mapping is not yet supported.
+
+### 68.2 cleanup_token generation safety
+
+`CapId.0 = (generation << 16) | slot_index` (INDEX_BITS = 16, defined in
+`crates/yarm-kernel/src/capability.rs`).  The cleanup_token returned to the
+caller is `xfer_cap_out = minted.0`, which encodes both slot and generation.
+
+`ActiveTransferMapping { transfer_cap: CapId, … }` stores the full CapId.
+`remove_active_transfer_mapping` matches on `(owner_tid, transfer_cap)` equality,
+so a stale token with a different generation cannot match a live entry.
+`CapabilitySpace::get` validates generation on lookup:
+`if slot.generation != id.generation() { return None; }`.
+
+No additional generation field in `ActiveTransferMapping` is needed; CapId
+already carries it.
+
+### 68.3 Changes to `write_v3_output_to_user`
+
+Return type changed from `()` to `bool`:
+
+- Returns `false` when `out_ptr == 0` or `out_len < V3_MIN_OUTPUT_LEN`.
+- Returns `kernel.copy_to_current_user(…).is_ok()`.
+
+Call sites:
+
+| Call site | Action |
+|---|---|
+| `WouldBlock` branch | `let _ = write_v3_output_to_user(…);` — no mapping to rollback |
+| `skip_payload` (live-mapping) branch | Checks `bool`; on `false` rolls back mapping+registry+cap |
+| `RecvUserWritebackOutcome::Ok` branch | `let _ = write_v3_output_to_user(…);` — payload already written |
+
+### 68.4 Rollback in the skip_payload branch
+
+After `write_v3_output_to_user` returns `false`:
+
+1. `kernel.unmap_range_two_phase(rb_asid, mapped_base, mapped_len_out)` — remove
+   page table entries.
+2. `kernel.remove_active_transfer_mapping(ThreadId(caller_tid), rb_cap)` — clear
+   registry entry so no dangling slot exists.
+3. `kernel.rollback_materialized_recv_cap(caller_tid, rb_cap, is_reply_cap)` —
+   revoke the materialized cap from receiver cnode.
+4. Return `Err(SyscallError::InvalidArgs)`.
+
+The `map_rollback: Option<(Asid, CapId)>` tuple is threaded through the mapping
+arm so the rollback path does not need a second cap lookup.
+
+### 68.5 RW gate
+
+Added immediately after the `metadata_len` gate:
+
+```rust
+if req.map_intent & SYSCALL_RECV_MAP_INTENT_WRITE as u32 != 0 {
+    return Err(SyscallError::InvalidArgs);
+}
+```
+
+This rejects `MAP_READ|MAP_WRITE (0x3)` and `MAP_WRITE (0x2)` before any
+mapping code is reached.
+
+### 68.6 Audit classifications
+
+| Classification | Assessment |
+|---|---|
+| A — can implement in hosted-dev | All Stage 60 changes |
+| B — new phys helper needed | None required |
+| C — not expressible in hosted-dev | Partial-page-fault rollback (documented only) |
+| D — locking | No new lock ordering; all changes within existing single-lock scope |
+
+### 68.7 Stage 60 tests (mod stage60, 10 tests)
+
+**(A) Token generation safety:**
+`stage60_cleanup_token_encodes_generation`
+
+**(B) Duplicate release rejected:**
+`stage60_duplicate_release_rejected`
+
+**(C) Stale token rejected:**
+`stage60_stale_token_release_rejected`
+
+**(D) Writeback rollback:**
+`stage60_output_writeback_fail_rolls_back_mapping`
+
+**(E) TransferRelease removes mapping:**
+`stage60_transfer_release_removes_active_mapping`
+
+**(F) RW gate:**
+`stage60_map_intent_rw_rejected`,
+`stage60_map_intent_write_only_rejected`
+
+**(G) Invariants:**
+`stage60_syscall_count_still_31`,
+`stage60_vfs_shared_io_disabled`,
+`stage60_legacy_ipc_recv_unaffected`
