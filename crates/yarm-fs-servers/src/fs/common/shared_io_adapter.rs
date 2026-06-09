@@ -41,6 +41,26 @@ pub const VFS_READ_SHARED_REPLY_ENABLED: bool = true;
 pub const VFS_SHARED_IO_ENABLED: bool =
     VFS_WRITE_SHARED_REQUEST_ENABLED && VFS_READ_SHARED_REPLY_ENABLED;
 
+/// Stage 75: supervisor→VFS task-exit notification channel.
+///
+/// `false` (Stage 75): not yet wired. Two missing pieces before this can become `true`:
+///
+/// 1. **VFS notification endpoint**: a supervisor capability pointing at VFS's endpoint
+///    must be added to the startup handoff and the supervisor forwarding path wired.
+///    Specifically: `InitFaultHandoff` needs a `vfs_task_exit_send_cap: Option<CapId>`,
+///    the supervisor's `handle_task_exit` must send `SUPERVISOR_OP_TASK_EXITED` to that
+///    cap when a non-supervisor task exits, and VFS's service loop must receive and decode it.
+///
+/// 2. **VFS-side lifecycle store**: `VfsService` currently has no persistent
+///    `VfsSharedIoLifecycle` store.  A bounded table keyed by `requester_tid`
+///    (now present in `VfsSharedIoLifecycle`) is needed so that on
+///    `SUPERVISOR_OP_TASK_EXITED(tid)`, VFS can look up affected lifecycles and call
+///    `deliver_requester_exit_if_tid_matches`.
+///
+/// Identity model is proven (Stage 75): `VfsSharedIoLifecycle::requester_tid` stores the TID,
+/// and `deliver_requester_exit_if_tid_matches` dispatches by TID with safe no-op on mismatch.
+pub const VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsSharedIoAdapterError {
@@ -603,6 +623,7 @@ mod tests {
         };
         VfsSharedIoLifecycle::reserve(
             1,
+            0, // requester_tid: 0 in adapter tests
             VfsSharedBufferDescriptor::new(
                 handle.object_handle,
                 handle.object_generation,

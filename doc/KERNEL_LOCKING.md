@@ -11897,3 +11897,87 @@ No change to lock ordering.  `deliver_requester_exit` operates entirely within
 Live RequesterExit delivery: wire `SUPERVISOR_OP_TASK_EXITED` message in the VFS
 supervisor loop to call `deliver_requester_exit` on the affected lifecycle state,
 then enable `VFS_SHARED_IO_ENABLED = true` after full integration testing.
+
+---
+
+## §77 Stage 75 — TID-matched RequesterExit identity model
+
+### 77.1 Change summary
+
+Stage 75 adds the VFS-side identity field and TID-matched dispatch helper that enable
+future live wiring of `SUPERVISOR_OP_TASK_EXITED` → `deliver_requester_exit`.
+
+No kernel changes are made.  No new caps or startup slots are added.
+
+**New field in `VfsSharedIoLifecycle`:**
+```rust
+requester_tid: u64  // TID of the requesting task; correlates to TaskExitedEvent.tid
+```
+
+**New method:**
+```rust
+pub fn deliver_requester_exit_if_tid_matches<const N: usize>(
+    &mut self,
+    tid: u64,
+    handles: &mut VfsSharedIoHandleTable<N>,
+) -> Result<VfsSharedIoRequesterExitAction, VfsSharedIoLifecycleError>
+```
+Returns `NotMatched` (safe no-op) when `tid != self.requester_tid`.
+Returns `Matched(result)` when TID matches — identical to `deliver_requester_exit`.
+
+**New constant:**
+```rust
+pub const VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
+```
+Documents and machine-checks that the notification channel is absent.
+
+### 77.2 Signal flow (current state)
+
+```
+Kernel: exit_task(tid) → report_task_exit_to_supervisor(tid, code, token)
+  → Message(0xEE, TaskExitedEvent{tid, exit_code, restart_token})
+  → supervisor_fault_recv_cap endpoint
+
+Supervisor: service_step() → handle_task_exit()
+  → ScheduledRestart / MarkedDead / Ignored
+  [NO forwarding to VFS]
+
+VFS: no notification endpoint, no lifecycle store
+```
+
+### 77.3 Missing production infrastructure
+
+Two blocking pieces before `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = true`:
+
+**A. Supervisor→VFS notification cap**
+`InitFaultHandoff` needs `vfs_task_exit_send_cap: Option<CapId>`.  The supervisor's
+`handle_task_exit` must send `SUPERVISOR_OP_TASK_EXITED(tid)` to that cap when a
+non-supervisor-managed task exits with an active shared-I/O lifecycle.
+
+**B. VFS-side lifecycle store**
+`VfsService` needs a bounded `[Option<VfsSharedIoLifecycle>; N]` keyed by `requester_tid`.
+On `SUPERVISOR_OP_TASK_EXITED(tid)` the service scans the store and calls
+`deliver_requester_exit_if_tid_matches(tid, handles)` on each entry.
+
+### 77.4 Lock ordering
+
+No change to lock ordering.  `deliver_requester_exit_if_tid_matches` is entirely
+within VFS-space (no kernel locks held).
+
+### 77.5 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- NR 30 = `RecvSharedV3` (no change)
+- NR 4 = `TransferRelease` (no change)
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (unchanged from Stage 73)
+- `VFS_SHARED_IO_ENABLED = false` (unchanged)
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (Stage 75 documents gap)
+- No Drop-based cleanup added
+- No startup slots changed
+- 295 yarm-fs-servers tests pass (up from 277 after Stage 73+74)
+
+### 77.6 Remaining work
+
+Wire `SUPERVISOR_OP_TASK_EXITED` → VFS by adding the two missing pieces (§77.3).
+After both are in place, enable `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = true`
+and add integration tests proving end-to-end signal delivery.

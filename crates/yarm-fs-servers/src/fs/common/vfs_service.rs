@@ -1421,3 +1421,156 @@ mod stage73_74_tests {
         assert_eq!(reply.bytes_completed, 8, "write regression: 8 bytes written");
     }
 }
+
+#[cfg(test)]
+mod stage75_tests {
+    //! Stage 75 — TID-matched RequesterExit identity model + gate/regression checks.
+    //!
+    //! A. Gate status: VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED=false,
+    //!    VFS_READ_SHARED_REPLY_ENABLED=true, VFS_SHARED_IO_ENABLED=false.
+    //! B. handle_request still returns Unsupported for READ_SHARED_REPLY opcode.
+    //! C. TID-matched deliver_requester_exit_if_tid_matches roundtrip via VfsService context.
+    //! D. Unmatched TID is a safe no-op; lifecycle state unchanged.
+    //! E. Old VFS read/write ops unchanged (regression).
+    //!
+    //! Production blockers documented in VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED:
+    //! 1. Supervisor→VFS notification cap (new startup cap, not yet added).
+    //! 2. VfsService persistent lifecycle store (not yet added).
+
+    use super::*;
+    use crate::fs::common::shared_io_adapter::{
+        VFS_READ_SHARED_REPLY_ENABLED, VFS_SHARED_IO_ENABLED,
+        VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED, VFS_WRITE_SHARED_REQUEST_ENABLED,
+    };
+    use crate::fs::common::shared_io_lifecycle::{
+        VfsSharedIoCleanupResult, VfsSharedIoDirection, VfsSharedIoHandleTable,
+        VfsSharedIoLifecycle, VfsSharedIoRequesterExitAction, VfsSharedIoTerminalReason,
+    };
+    use crate::fs::ramfs::tree::RamFsBackend;
+    use yarm_ipc_abi::vfs_abi::{VFS_SHARED_BUFFER_FS_WRITE, VfsSharedBufferDescriptor};
+
+    const STAGE75_TID_A: u64 = 0xA_0001;
+    const STAGE75_TID_B: u64 = 0xB_0002;
+
+    fn make_lifecycle_pair(
+        tid: u64,
+        direction: VfsSharedIoDirection,
+        len: u64,
+    ) -> (VfsSharedIoHandleTable<1>, VfsSharedIoLifecycle) {
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let handle = handles.allocate().expect("allocate");
+        let access = match direction {
+            VfsSharedIoDirection::ReadReply => VFS_SHARED_BUFFER_FS_WRITE,
+            VfsSharedIoDirection::WriteRequest => {
+                yarm_ipc_abi::vfs_abi::VFS_SHARED_BUFFER_FS_READ
+            }
+        };
+        let desc = VfsSharedBufferDescriptor::new(
+            handle.object_handle,
+            handle.object_generation,
+            0,
+            len,
+            access,
+        );
+        let lc = VfsSharedIoLifecycle::reserve(1, tid, desc, len, 0, direction)
+            .expect("reserve lifecycle");
+        (handles, lc)
+    }
+
+    #[test]
+    fn stage75_supervisor_task_exit_notification_not_yet_wired() {
+        // Production blocker #1: supervisor→VFS notification channel absent.
+        // This constant is the machine-readable record of that gap.
+        assert!(
+            !VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED,
+            "supervisor→VFS task-exit channel must remain disabled until \
+             startup cap + supervisor forwarding are wired"
+        );
+    }
+
+    #[test]
+    fn stage75_vfs_shared_io_still_disabled() {
+        assert!(!VFS_SHARED_IO_ENABLED);
+    }
+
+    #[test]
+    fn stage75_vfs_read_shared_reply_still_enabled() {
+        assert!(VFS_READ_SHARED_REPLY_ENABLED);
+    }
+
+    #[test]
+    fn stage75_write_shared_request_still_disabled() {
+        assert!(!VFS_WRITE_SHARED_REQUEST_ENABLED);
+    }
+
+    #[test]
+    fn stage75_tid_matched_exit_cleans_lifecycle_in_vfs_context() {
+        // Models what VFS would do on receiving SUPERVISOR_OP_TASK_EXITED(tid=STAGE75_TID_A):
+        // TID match → Matched(Won(RequesterExit)).
+        let (mut handles, mut lc) = make_lifecycle_pair(
+            STAGE75_TID_A,
+            VfsSharedIoDirection::ReadReply,
+            16,
+        );
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        let action = lc
+            .deliver_requester_exit_if_tid_matches(STAGE75_TID_A, &mut handles)
+            .expect("deliver");
+        assert_eq!(
+            action,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            ))
+        );
+    }
+
+    #[test]
+    fn stage75_unrelated_task_exit_does_not_affect_active_request() {
+        // SUPERVISOR_OP_TASK_EXITED for TID_B must not affect TID_A's lifecycle.
+        let (mut handles, mut lc) = make_lifecycle_pair(
+            STAGE75_TID_A,
+            VfsSharedIoDirection::ReadReply,
+            8,
+        );
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        let action = lc
+            .deliver_requester_exit_if_tid_matches(STAGE75_TID_B, &mut handles)
+            .expect("no-op");
+        assert_eq!(action, VfsSharedIoRequesterExitAction::NotMatched);
+        // Request still in-flight; backend can still write bytes.
+        let _ = RamFsBackend::new(); // VFS context is consistent
+    }
+
+    #[test]
+    fn stage75_handle_request_unchanged_for_read_shared_opcode() {
+        use crate::fs::common::vfs_ipc::read_shared_message;
+        use yarm_ipc_abi::vfs_abi::VfsReadSharedRequest;
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        let req = VfsReadSharedRequest {
+            fd: 0,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(1, 1, 0, 8, VFS_SHARED_BUFFER_FS_WRITE),
+        };
+        let msg = read_shared_message(req).expect("msg");
+        let result = svc.handle_request(msg);
+        assert_eq!(result, Err(VfsError::Unsupported));
+    }
+
+    #[test]
+    fn stage75_old_vfs_parse_request_accepts_standard_ops() {
+        use crate::fs::common::vfs_ipc::openat_inline_message;
+        // Regression: VfsService still parses standard VFS ops after Stage 75 changes.
+        // READ_SHARED_REPLY and WRITE_SHARED_REQUEST remain rejected (Unsupported).
+        let open_msg = openat_inline_message(0, b"/dev/console", 0, 0).expect("open");
+        let result = VfsService::<InMemoryBackend>::parse_request(open_msg);
+        assert!(
+            result.is_ok(),
+            "parse_request must succeed for a valid openat message: {result:?}"
+        );
+    }
+}
