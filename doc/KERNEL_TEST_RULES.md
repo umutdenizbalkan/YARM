@@ -3611,3 +3611,39 @@ not queued, no `Err` returned).  The send must use the kernel-task path.
 - `cargo test -p yarm-user-rt --lib -- recv_v3` (user-rt regression)
 
 All tests must pass.
+
+---
+
+## Rule N+58: Stage 60 — recv_shared_v3 cleanup-token hardening + rollback
+
+**Purpose:** Verify cleanup-token generation safety, duplicate-release rejection,
+stale-token rejection, writeback-failure rollback, and RW gate.
+
+**Hard invariants:**
+- SYSCALL_COUNT = 31, SYSCALL_RECV_SHARED_V3_NR = 30, SYSCALL_TRANSFER_RELEASE_NR = 4.
+- `write_v3_output_to_user` returns `bool`; `false` → rollback in skip_payload branch.
+- `cleanup_token = CapId.0` encodes generation in bits[63:16]; stale tokens auto-rejected.
+- `map_intent & WRITE != 0` → `InvalidArgs` before mapping code runs.
+- All send operations must occur before ASID binding (test-ordering constraint from Rule N+57).
+
+**Test list (mod stage60, 10 tests):**
+
+- `stage60_cleanup_token_encodes_generation`
+- `stage60_duplicate_release_rejected`
+- `stage60_stale_token_release_rejected`
+- `stage60_output_writeback_fail_rolls_back_mapping`
+- `stage60_transfer_release_removes_active_mapping`
+- `stage60_map_intent_rw_rejected`
+- `stage60_map_intent_write_only_rejected`
+- `stage60_syscall_count_still_31`
+- `stage60_vfs_shared_io_disabled`
+- `stage60_legacy_ipc_recv_unaffected`
+
+**Run commands:**
+- `cargo test --features hosted-dev "stage60::" -- --test-threads=4` (10 tests)
+- `cargo test --features hosted-dev "stage58::" -- --test-threads=4` (12 regression)
+- `cargo test --features hosted-dev "stage59::" -- --test-threads=4` (6 regression)
+- `cargo test --features hosted-dev ipc_recv -- --test-threads=4` (regression)
+- `cargo test --features hosted-dev recv_v2 -- --test-threads=4` (regression)
+
+All tests must pass.

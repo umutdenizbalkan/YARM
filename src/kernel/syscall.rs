@@ -4100,10 +4100,10 @@ fn write_v3_output_to_user(
     page_rounded_mapped_len: u64,
     actual_mapping_perm: u32,
     cleanup_token: u64,
-) {
+) -> bool {
     use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
     if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
-        return;
+        return false;
     }
     let mut out = [0u8; 120];
     out[0..4].copy_from_slice(&V3_VERSION.to_le_bytes());
@@ -4132,7 +4132,9 @@ fn write_v3_output_to_user(
     // out[108..112]: C-layout padding (already 0).
     out[112..120].copy_from_slice(&cleanup_token.to_le_bytes());
     let write_len = (out_len as usize).min(120);
-    let _ = kernel.copy_to_current_user(out_ptr as usize, &out[..write_len]);
+    kernel
+        .copy_to_current_user(out_ptr as usize, &out[..write_len])
+        .is_ok()
 }
 
 /// Map a [`CapObject`] variant to its `RecvSharedV3ObjectKind` discriminant.
@@ -4261,6 +4263,11 @@ fn handle_recv_shared_v3(
         return Err(SyscallError::InvalidArgs);
     }
 
+    // Stage 60: ReadWrite map_intent is not yet supported; reject the WRITE bit.
+    if req.map_intent & SYSCALL_RECV_MAP_INTENT_WRITE as u32 != 0 {
+        return Err(SyscallError::InvalidArgs);
+    }
+
     let caller_tid = current_tid(kernel)?;
     let recv_cap = CapId(req.endpoint_cap);
 
@@ -4293,7 +4300,7 @@ fn handle_recv_shared_v3(
 
     match outcome {
         RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) => {
-            write_v3_output_to_user(
+            let _ = write_v3_output_to_user(
                 kernel,
                 req.metadata_ptr,
                 req.metadata_len,
@@ -4371,10 +4378,16 @@ fn handle_recv_shared_v3(
             // Stage 58+59: live DmaRegion/MemoryObject read-only (or RW) mapping.
             // Order: materialize cap → metadata → map pages → register token → output.
             // On any failure: rollback mapped pages + cleanup slot + rollback cap.
-            let (mapped_base, mapped_len_out, actual_perm, cleanup_token, skip_payload) = if req
-                .map_intent
-                != 0
-            {
+            // Stage 60: 6th element (map_rollback) carries (Asid, CapId) for
+            // post-writeback rollback if copy_to_current_user fails.
+            let (
+                mapped_base,
+                mapped_len_out,
+                actual_perm,
+                cleanup_token,
+                skip_payload,
+                map_rollback,
+            ) = if req.map_intent != 0 {
                 use crate::kernel::capabilities::CapObject;
                 use crate::kernel::recv_core::recv_shared_v3::{
                     MAP_PERM_READ_ONLY, MAP_PERM_READ_WRITE, RecvV3MappingPlan,
@@ -4516,8 +4529,18 @@ fn handle_recv_shared_v3(
                         } else {
                             MAP_PERM_READ_WRITE
                         };
-                        // cleanup_token = cap ID (user passes this to future release call)
-                        (map_va, mapped_len, perm, xfer_cap_out, true)
+                        // cleanup_token = xfer_cap_out (full CapId.0, encodes slot+generation).
+                        // Stage 60: stale tokens are generation-safe because CapId encodes
+                        // generation in bits[63:16]; a revoked-then-reused slot has a
+                        // different CapId and will not match the stored active mapping entry.
+                        (
+                            map_va,
+                            mapped_len,
+                            perm,
+                            xfer_cap_out,
+                            true,
+                            Some((receiver_asid, cap_id)),
+                        )
                     }
                     RecvV3MappingPlan::Skip => {
                         // map_intent != 0 but received message is not OPCODE_SHARED_MEM.
@@ -4530,13 +4553,17 @@ fn handle_recv_shared_v3(
                     }
                 }
             } else {
-                (0u64, 0u64, 0u32, 0u64, false)
+                (0u64, 0u64, 0u32, 0u64, false, None)
             };
 
             if skip_payload {
                 // Mapping done: payload_ptr is the mapping target VA, not an inline
                 // payload buffer. Skip copy. All info is in v3 metadata output.
-                write_v3_output_to_user(
+                // Stage 60: if metadata writeback fails the caller never receives the
+                // cleanup_token, so it cannot call TransferRelease. Roll back the mapping,
+                // remove the registry entry, and revoke the materialized cap so no resources
+                // leak.
+                let wrote_ok = write_v3_output_to_user(
                     kernel,
                     req.metadata_ptr,
                     req.metadata_len,
@@ -4555,6 +4582,26 @@ fn handle_recv_shared_v3(
                     actual_perm,
                     cleanup_token,
                 );
+                if !wrote_ok {
+                    if let Some((rb_asid, rb_cap)) = map_rollback {
+                        kernel.unmap_range_two_phase(
+                            rb_asid,
+                            mapped_base as usize,
+                            mapped_len_out as usize,
+                        );
+                        kernel.remove_active_transfer_mapping(
+                            crate::kernel::ipc::ThreadId(caller_tid),
+                            rb_cap,
+                        );
+                        kernel.rollback_materialized_recv_cap(caller_tid, rb_cap, is_reply_cap);
+                    }
+                    crate::yarm_log!(
+                        "RECV_V3_WRITEBACK_FAIL_ROLLBACK tid={} cap={}",
+                        caller_tid,
+                        xfer_cap_out
+                    );
+                    return Err(SyscallError::InvalidArgs);
+                }
                 frame.set_ok(
                     usize::try_from(sender_tid_raw).unwrap_or(0),
                     0,
@@ -4570,7 +4617,7 @@ fn handle_recv_shared_v3(
 
             match execute_user_asid_plain_writeback(kernel, &delivery) {
                 RecvUserWritebackOutcome::Ok => {
-                    write_v3_output_to_user(
+                    let _ = write_v3_output_to_user(
                         kernel,
                         req.metadata_ptr,
                         req.metadata_len,

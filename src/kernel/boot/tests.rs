@@ -29545,3 +29545,417 @@ mod stage59 {
         assert_eq!(msg.as_slice(), b"hi", "legacy ipc_recv must still work");
     }
 }
+
+mod stage60 {
+    //! Stage 60 — recv_shared_v3 cleanup-token hardening + rollback audit.
+    //!
+    //! A. cleanup_token encodes slot+generation (CapId generation safety).
+    //! B. Duplicate TransferRelease on the same token is rejected.
+    //! C. Stale token (revoked cap ID with old generation) cannot match active mapping.
+    //! D. Output writeback failure rolls back mapping + registry + cap (no leak).
+    //! E. TransferRelease via NR30 cleanup_token removes active mapping entry.
+    //! F. map_intent with WRITE bit → InvalidArgs (RW not yet supported).
+    //! G. Invariant preservation: SYSCALL_COUNT=31, VFS_SHARED_IO disabled, old paths.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::capabilities::CapId;
+    use crate::kernel::syscall::{
+        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_MAP_INTENT_WRITE,
+        SYSCALL_RECV_SHARED_V3_NR, SYSCALL_TRANSFER_RELEASE_NR, Syscall, SyscallError, dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+    const MAP_READ: u32 = 0x1;
+    const MAP_READ_WRITE: u32 = 0x3;
+    const RECV_V3_STATUS_OK: u32 = 0;
+
+    fn build_req_60(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+        map_intent: u32,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf[48..52].copy_from_slice(&map_intent.to_le_bytes());
+        buf
+    }
+
+    fn setup_receiver(state: &mut crate::kernel::boot::KernelState) -> crate::kernel::vm::Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_, page_cap) = state.alloc_anonymous_memory_object().expect("page cap");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                page_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map req page");
+        asid
+    }
+
+    fn send_shared_mem(
+        state: &mut crate::kernel::boot::KernelState,
+        send_cap: CapId,
+        transfer_cap: CapId,
+    ) {
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [send_cap.0 as usize, 0, 20, 0, 0, transfer_cap.0 as usize],
+        );
+        dispatch(state, &mut send_frame).expect("ipc_send shared-mem");
+    }
+
+    // Perform a full RO DmaRegion mapping via recv_shared_v3 and return
+    // (asid, cleanup_token, transferred_cap_id).
+    fn run_mapping(
+        state: &mut crate::kernel::boot::KernelState,
+    ) -> (crate::kernel::vm::Asid, u64, CapId) {
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(state, send_cap, dma_cap);
+        let asid = setup_receiver(state);
+        let req = build_req_60(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(state, &mut frame).expect("recv_shared_v3");
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        let cleanup_token = u64::from_le_bytes(out[112..120].try_into().unwrap());
+        let cap_id = CapId(cleanup_token);
+        (asid, cleanup_token, cap_id)
+    }
+
+    // ── A. cleanup_token encodes generation ───────────────────────────────────
+
+    #[test]
+    fn stage60_cleanup_token_encodes_generation() {
+        // CapId.0 = (generation << 16) | slot_index.
+        // A freshly minted cap always has generation >= 1, so bits[63:16] must be nonzero.
+        let mut state = Bootstrap::init().expect("init");
+        let (_asid, cleanup_token, _cap_id) = run_mapping(&mut state);
+        assert_ne!(cleanup_token, 0, "cleanup_token must be nonzero");
+        // generation = cleanup_token >> 16; must be >= 1.
+        let generation = cleanup_token >> 16;
+        assert!(
+            generation >= 1,
+            "cleanup_token must encode a nonzero generation in bits[63:16], got {:#x}",
+            cleanup_token
+        );
+    }
+
+    // ── B. Duplicate TransferRelease rejected ─────────────────────────────────
+
+    #[test]
+    fn stage60_duplicate_release_rejected() {
+        // After a successful TransferRelease the active mapping entry is cleared.
+        // A second TransferRelease with the same token must fail (no active mapping).
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("init");
+                let (_asid, cleanup_token, _cap_id) = run_mapping(&mut state);
+
+                // First release: must succeed.
+                let mut frame1 = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [cleanup_token as usize, 0, 0, 0, 0, 0],
+                );
+                dispatch(&mut state, &mut frame1).expect("first TransferRelease must succeed");
+
+                // Second release: the registry entry is gone → must fail.
+                let mut frame2 = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [cleanup_token as usize, 0, 0, 0, 0, 0],
+                );
+                assert!(
+                    matches!(
+                        dispatch(&mut state, &mut frame2),
+                        Err(SyscallError::InvalidArgs)
+                    ),
+                    "duplicate TransferRelease must return InvalidArgs"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── C. Stale token release rejected ──────────────────────────────────────
+
+    #[test]
+    fn stage60_stale_token_release_rejected() {
+        // A stale CapId (different generation, same slot) cannot match the active
+        // mapping entry because CapId encodes generation in bits[63:16].
+        // Manufacture a stale token by decrementing the generation bits.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("init");
+                let (_asid, cleanup_token, _cap_id) = run_mapping(&mut state);
+
+                // Build a stale token: same slot index, generation-1.
+                // generation field is bits[63:16]; slot index is bits[15:0].
+                let slot_idx = cleanup_token & 0xFFFF;
+                let real_gen = cleanup_token >> 16;
+                // Stale: use generation 0 (always invalid) or real_gen-1.
+                let stale_gen = if real_gen > 1 { real_gen - 1 } else { 0 };
+                let stale_token = (stale_gen << 16) | slot_idx;
+
+                let mut frame = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [stale_token as usize, 0, 0, 0, 0, 0],
+                );
+                assert!(
+                    matches!(
+                        dispatch(&mut state, &mut frame),
+                        Err(SyscallError::InvalidArgs)
+                    ),
+                    "stale token (generation mismatch) must return InvalidArgs"
+                );
+
+                // Real token must still work (mapping not consumed by the stale attempt).
+                let mut frame2 = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [cleanup_token as usize, 0, 0, 0, 0, 0],
+                );
+                dispatch(&mut state, &mut frame2)
+                    .expect("real token must still release after stale attempt");
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── D. Output writeback failure rolls back mapping ────────────────────────
+
+    #[test]
+    fn stage60_output_writeback_fail_rolls_back_mapping() {
+        // If the metadata output pointer is unmapped, write_v3_output_to_user
+        // returns false and the kernel must roll back: unmap pages, remove registry
+        // entry, revoke cap.  No active transfer mapping should remain afterward.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+
+        // metadata_ptr = 0x9_0000: intentionally unmapped so copy_to_current_user fails.
+        let req = build_req_60(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x9_0000, // unmapped — writeback will fault
+            120,
+            MAP_READ,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+
+        let result = dispatch(&mut state, &mut frame);
+        // Must return InvalidArgs (not Ok) because writeback failed.
+        assert!(
+            matches!(result, Err(SyscallError::InvalidArgs)),
+            "writeback failure must return InvalidArgs, got {:?}",
+            result
+        );
+        // Active transfer mapping must have been cleaned up (rollback succeeded).
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "active transfer mapping must be removed after writeback rollback"
+        );
+    }
+
+    // ── E. TransferRelease removes active mapping entry ───────────────────────
+
+    #[test]
+    fn stage60_transfer_release_removes_active_mapping() {
+        // After recv_shared_v3 creates a live mapping, active_transfer_count = 1.
+        // TransferRelease with the cleanup_token must decrement it to 0.
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let mut state = Bootstrap::init().expect("init");
+                assert_eq!(state.active_transfer_count_for_pid(0), 0, "pre-condition");
+
+                let (_asid, cleanup_token, _cap_id) = run_mapping(&mut state);
+                assert_eq!(
+                    state.active_transfer_count_for_pid(0),
+                    1,
+                    "active mapping registered after recv_shared_v3"
+                );
+
+                let mut frame = TrapFrame::new(
+                    Syscall::TransferRelease as usize,
+                    [cleanup_token as usize, 0, 0, 0, 0, 0],
+                );
+                dispatch(&mut state, &mut frame).expect("TransferRelease must succeed");
+
+                assert_eq!(
+                    state.active_transfer_count_for_pid(0),
+                    0,
+                    "active mapping must be removed after TransferRelease"
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("join");
+    }
+
+    // ── F. map_intent with WRITE bit rejected ─────────────────────────────────
+
+    #[test]
+    fn stage60_map_intent_rw_rejected() {
+        // map_intent = READ|WRITE (0x3) must return InvalidArgs — RW not supported.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+        let req = build_req_60(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ_WRITE,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent with WRITE bit must return InvalidArgs"
+        );
+    }
+
+    // ── F2. WRITE-only map_intent also rejected ───────────────────────────────
+
+    #[test]
+    fn stage60_map_intent_write_only_rejected() {
+        // map_intent = WRITE (0x2) without READ must also return InvalidArgs.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+        let req = build_req_60(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            SYSCALL_RECV_MAP_INTENT_WRITE as u32,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent=WRITE-only must return InvalidArgs"
+        );
+    }
+
+    // ── G. Invariant preservation ─────────────────────────────────────────────
+
+    #[test]
+    fn stage60_syscall_count_still_31() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must remain 31");
+        assert_eq!(
+            SYSCALL_RECV_SHARED_V3_NR, 30,
+            "SYSCALL_RECV_SHARED_V3_NR must remain 30"
+        );
+        assert_eq!(
+            SYSCALL_TRANSFER_RELEASE_NR, 4,
+            "TransferRelease must remain NR 4"
+        );
+    }
+
+    #[test]
+    fn stage60_vfs_shared_io_disabled() {
+        assert!(
+            !cfg!(feature = "vfs-shared-io"),
+            "vfs-shared-io feature must remain disabled in Stage 60"
+        );
+    }
+
+    #[test]
+    fn stage60_legacy_ipc_recv_unaffected() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        state
+            .ipc_send(
+                send_cap,
+                crate::kernel::ipc::Message::new(9, b"hello60").expect("msg"),
+            )
+            .expect("send");
+        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(
+            msg.as_slice(),
+            b"hello60",
+            "legacy ipc_recv must still work"
+        );
+    }
+}
