@@ -10789,3 +10789,107 @@ No production service loop uses `map_intent`.
 - `cleanup_token` — future.
 - No production service loop uses recv_shared_v3.
 - `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.
+
+## §64 Stage 52+53 — DmaRegion first-class object kind + cleanup-token scaffold
+
+### 64.1 Overview
+
+Make `CapObject::DmaRegion` a first-class `RecvSharedV3ObjectKind` (discriminant 5).
+Design and document the cleanup-token semantics; add a helper-only scaffold struct
+(`RecvSharedV3CleanupIdentity`) with no live allocation.  Keep `map_intent` disabled.
+`SYSCALL_COUNT == 31` unchanged; no syscall numbers changed.
+
+### 64.2 DmaRegion object kind promotion
+
+`recv_v3_object_kind` previously fell through the catch-all `_ => 0xFF` for
+`CapObject::DmaRegion`.  A dedicated arm is now added:
+
+```rust
+CapObject::DmaRegion { .. } => 5,
+```
+
+`RecvSharedV3ObjectKind::DmaRegion = 5` is added to the ABI enum in
+`yarm-ipc-abi`.  Discriminant 5 is beyond the previous maximum (Notification=4) and
+does not conflict with any existing variant.
+
+The stage50 test `stage50_exact_region_len_for_dma_region_transfer` previously asserted
+`object_kind == 0xFF`; it has been updated to `object_kind == 5` to match the new
+canonical discriminant.
+
+### 64.3 Cleanup-token design audit
+
+The `cleanup_token` ABI field lives at offset @112 in `RecvSharedV3Output`.
+The kernel's write window is `min(out_len, 88)` bytes — `cleanup_token` is
+**never written by the kernel** in the current implementation.
+
+Allocation of a live cleanup token requires:
+
+1. A per-transfer kernel-allocated handle table entry.
+2. A corresponding release syscall (not yet designed).
+3. Token revocation semantics when the receiving task exits.
+4. Atomicity between token creation and cap transfer.
+
+None of the above are implemented.  `RECV_V3_CLEANUP_TOKEN_NONE = 0` is the sentinel
+for "no live cleanup token."
+
+### 64.4 RecvSharedV3CleanupIdentity scaffold (helper-only)
+
+`RecvSharedV3CleanupIdentity` is a **helper-only** struct in `yarm-ipc-abi`.
+It is never created by the kernel and never participates in live transfers:
+
+```rust
+pub struct RecvSharedV3CleanupIdentity {
+    pub receiver_cap:   u64,
+    pub object_kind:    u32,
+    pub region_len:     u64,
+    pub transfer_token: u64,
+}
+```
+
+- `none()` — returns a sentinel (receiver_cap = u64::MAX, others = 0).
+- `is_active()` — true iff `transfer_token != 0`.
+- `is_structurally_valid(page_size)` — precondition helper for future allocation code.
+
+No kernel path allocates or consumes a `RecvSharedV3CleanupIdentity`.
+
+### 64.5 map_intent gate unchanged
+
+The gate at `syscall.rs` ~line 4206 (`if req.map_intent != 0 → InvalidArgs`) remains
+in place.  Blockers are identical to those documented in §63.4.  No new blocker has
+been resolved.
+
+### 64.6 user-rt additions
+
+`RecvSharedV3Delivery` gains:
+
+- `cleanup_token: u64` field (always 0 — decoded from output but kernel never writes it).
+- `is_dma_region() -> bool` — true iff `object_kind == 5`.
+- `cleanup_token() -> u64` — const accessor.
+- `has_cleanup_token() -> bool` — true iff `cleanup_token != RECV_V3_CLEANUP_TOKEN_NONE`.
+
+### 64.7 Proven assertions (mod stage52 in src/kernel/boot/tests.rs)
+
+- `stage52_dma_region_object_kind_is_five` — object_kind @40 == 5 for DmaRegion transfer.
+- `stage52_dma_region_full_metadata_output` — all DmaRegion metadata fields correct
+  (kind=5, gen, rights, exact_region_len=PAGE_SIZE).
+- `stage52_memory_object_still_kind_one_with_exact_object_size` — promotion of DmaRegion
+  does not regress MemoryObject (kind=1, exact_object_size=PAGE_SIZE).
+- `stage52_recv_writes_exactly_88_bytes_for_dma_region` — write window is exactly 88 bytes;
+  no write beyond @88 occurs.
+- `stage52_recv_writes_exactly_88_bytes_for_plain_message` — plain message: same 88-byte
+  write window; no cap metadata.
+
+### 64.8 ABI semantics (frozen)
+
+- `object_kind = 5` is canonical for `CapObject::DmaRegion`; replaces `0xFF` (Other).
+- `cleanup_token @112` is never written; callers always read 0 for this field.
+- `RECV_V3_CLEANUP_TOKEN_NONE = 0` is the stable sentinel.
+- `RECV_V3_EXTENDED_OUTPUT_LEN = 88` remains the extended write boundary.
+- `SYSCALL_COUNT == 31` unchanged.
+
+### 64.9 FUTURE / remaining blockers
+
+- Cleanup-token live allocation — blocked (see §64.3).
+- `map_intent` / shared-memory mapping — blocked (see §63.4).
+- Release syscall for cleanup tokens — not yet designed.
+- No production service loop uses recv_shared_v3.

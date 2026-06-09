@@ -4117,6 +4117,8 @@ fn recv_v3_object_kind(obj: crate::kernel::capabilities::CapObject) -> u32 {
         CapObject::Endpoint { .. } => 2,
         CapObject::Reply { .. } => 3,
         CapObject::Notification { .. } => 4,
+        // Stage 52+53: DmaRegion is now a first-class object kind (discriminant 5).
+        CapObject::DmaRegion { .. } => 5,
         _ => 0xFF,
     }
 }

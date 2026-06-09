@@ -9,8 +9,8 @@
 
 use core::mem::size_of;
 use yarm_ipc_abi::recv_shared_v3_abi::{
-    RecvSharedV3Output, RECV_V3_MIN_REQUEST_LEN, RECV_V3_STATUS_OK, RECV_V3_STATUS_WOULD_BLOCK,
-    RECV_V3_VERSION,
+    RecvSharedV3ObjectKind, RecvSharedV3Output, RECV_V3_CLEANUP_TOKEN_NONE,
+    RECV_V3_MIN_REQUEST_LEN, RECV_V3_STATUS_OK, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION,
 };
 
 use super::{decode_syscall_error, SyscallError};
@@ -52,6 +52,11 @@ pub struct RecvSharedV3Delivery {
     /// non-DmaRegion caps and when no cap was transferred. Only populated when the
     /// caller provided at least 88 bytes for the output buffer.
     pub exact_region_len: u64,
+    /// Raw cleanup token from the kernel output (Stage 54+).  **Always 0** in the
+    /// current stage — no live shared-memory mapping is performed and no cleanup
+    /// identity is allocated.  Check with [`RECV_V3_CLEANUP_TOKEN_NONE`] (= 0)
+    /// before taking any cleanup action.
+    pub cleanup_token: u64,
 }
 
 impl RecvSharedV3Delivery {
@@ -79,6 +84,7 @@ impl RecvSharedV3Delivery {
             effective_rights: output.effective_rights,
             exact_object_size: output.exact_object_size,
             exact_region_len: output.exact_region_len,
+            cleanup_token: output.cleanup_token,
         })
     }
 
@@ -136,6 +142,30 @@ impl RecvSharedV3Delivery {
     #[inline]
     pub const fn has_exact_region_len(&self) -> bool {
         self.exact_region_len > 0
+    }
+
+    /// Returns `true` if the transferred capability is a DmaRegion (Stage 52+53).
+    #[inline]
+    pub fn is_dma_region(&self) -> bool {
+        self.object_kind == RecvSharedV3ObjectKind::DmaRegion as u32
+    }
+
+    /// Returns the raw cleanup token from the kernel output (Stage 54+).
+    ///
+    /// **Always 0** in the current stage — no live shared-memory mapping
+    /// is performed.  Callers must check against [`RECV_V3_CLEANUP_TOKEN_NONE`]
+    /// before acting on this value.
+    #[inline]
+    pub const fn cleanup_token(&self) -> u64 {
+        self.cleanup_token
+    }
+
+    /// Returns `true` when a non-zero cleanup token is present.
+    ///
+    /// Always `false` in the current stage (no live mapping exists).
+    #[inline]
+    pub fn has_cleanup_token(&self) -> bool {
+        self.cleanup_token != RECV_V3_CLEANUP_TOKEN_NONE
     }
 }
 
@@ -257,6 +287,7 @@ pub unsafe fn ipc_recv_shared_v3_nonblocking(
                 effective_rights: output.effective_rights,
                 exact_object_size: output.exact_object_size,
                 exact_region_len: output.exact_region_len,
+                cleanup_token: output.cleanup_token,
             }))
         }
         RECV_V3_STATUS_WOULD_BLOCK => Ok(None),
@@ -580,6 +611,7 @@ mod tests {
             effective_rights: output.effective_rights,
             exact_object_size: output.exact_object_size,
             exact_region_len: output.exact_region_len,
+            cleanup_token: output.cleanup_token,
         };
 
         assert_eq!(
@@ -783,5 +815,99 @@ mod tests {
         assert_eq!(d.exact_region_len(), 0);
         assert!(!d.has_exact_region_len());
         assert_eq!(d.exact_object_size(), 4096);
+    }
+
+    // ── Stage 52+53: DmaRegion first-class kind + cleanup token ─────────────
+
+    #[test]
+    fn is_dma_region_true_for_kind_five() {
+        let d = RecvSharedV3Delivery {
+            object_kind: 5,
+            ..Default::default()
+        };
+        assert!(d.is_dma_region());
+    }
+
+    #[test]
+    fn is_dma_region_false_for_memory_object() {
+        let d = RecvSharedV3Delivery {
+            object_kind: 1,
+            ..Default::default()
+        };
+        assert!(!d.is_dma_region());
+    }
+
+    #[test]
+    fn is_dma_region_false_when_no_cap() {
+        let d = RecvSharedV3Delivery::default();
+        assert!(!d.is_dma_region());
+    }
+
+    #[test]
+    fn from_output_dma_region_kind_five_decoded() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 7;
+        output.object_kind = 5; // DmaRegion
+        output.effective_rights = 0x07;
+        output.exact_region_len = 4096;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert!(d.is_dma_region(), "kind=5 must identify as DmaRegion");
+        assert_eq!(d.exact_region_len(), 4096);
+        assert_eq!(d.exact_object_size(), 0, "DmaRegion has no object size");
+    }
+
+    #[test]
+    fn cleanup_token_accessor_returns_zero_always() {
+        let d = RecvSharedV3Delivery::default();
+        assert_eq!(d.cleanup_token(), 0);
+        assert!(
+            !d.has_cleanup_token(),
+            "has_cleanup_token must be false (no live mapping)"
+        );
+    }
+
+    #[test]
+    fn from_output_cleanup_token_zero_for_dma_region() {
+        // cleanup_token field in RecvSharedV3Output is at @112, beyond the 88-byte write
+        // window; it is never written by the kernel and stays 0 from new_zeroed().
+        use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_CLEANUP_TOKEN_NONE;
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 8;
+        output.object_kind = 5; // DmaRegion
+        output.exact_region_len = 4096;
+        // cleanup_token stays at 0 (new_zeroed initialises all fields to 0)
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.cleanup_token(), RECV_V3_CLEANUP_TOKEN_NONE);
+        assert!(!d.has_cleanup_token());
+    }
+
+    #[test]
+    fn from_output_and_manual_decode_agree_on_dma_region() {
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.transferred_cap = 9;
+        output.object_kind = 5;
+        output.effective_rights = 0x07;
+        output.exact_region_len = 4096;
+
+        let via_helper = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        let manual = RecvSharedV3Delivery {
+            sender_tid: 0,
+            message_len: 0,
+            message_flags: 0,
+            transferred_cap: Some(9),
+            object_kind: 5,
+            object_generation: 0,
+            effective_rights: 0x07,
+            exact_object_size: 0,
+            exact_region_len: 4096,
+            cleanup_token: 0,
+        };
+        assert_eq!(
+            via_helper, manual,
+            "from_output and manual decode must agree"
+        );
     }
 }

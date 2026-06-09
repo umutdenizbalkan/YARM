@@ -3331,3 +3331,71 @@ lookup is needed.  `map_intent` remains gated and always returns `InvalidArgs`.
 - `cargo test --features hosted-dev --lib -- --test-threads=1` (1137 total)
 
 All tests must pass.
+
+## Rule N+54: Stage 52+53 — DmaRegion first-class object kind + cleanup-token scaffold
+
+**Summary:**  `CapObject::DmaRegion` is now dispatched to `RecvSharedV3ObjectKind::DmaRegion`
+(discriminant 5) instead of falling through to `Other (0xFF)`.  A helper-only
+`RecvSharedV3CleanupIdentity` scaffold struct is added to `yarm-ipc-abi` with no live
+allocation; `cleanup_token @112` is never written (beyond the 88-byte kernel write window).
+`map_intent` gate unchanged.  `SYSCALL_COUNT == 31` unchanged.
+
+**Constraints (verbatim):**
+- `SYSCALL_COUNT == 31` unchanged.
+- Syscall numbers unchanged.
+- Public ABI field offsets unchanged.
+- `map_intent != 0 → InvalidArgs` gate unchanged.
+- No live cleanup token allocation.
+- No Drop-based cleanup, no release syscall behavior.
+- `cleanup_token @112` never written by kernel.
+
+**Kernel changes (`src/kernel/syscall.rs`):**
+- `recv_v3_object_kind`: added `CapObject::DmaRegion { .. } => 5` arm before catch-all.
+- Stage50 test updated: `assert_eq!(object_kind, 5, ...)` (was `0xFF`).
+
+**ABI crate changes (`crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`):**
+- `RecvSharedV3ObjectKind::DmaRegion = 5` variant added.
+- `RECV_V3_CLEANUP_TOKEN_NONE: u64 = 0` constant added.
+- `RecvSharedV3CleanupIdentity` scaffold struct added (helper-only, never kernel-allocated).
+
+**user-rt changes (`crates/yarm-user-rt/src/syscall/recv_v3.rs`):**
+- `cleanup_token: u64` field added to `RecvSharedV3Delivery` (decoded but always 0).
+- `is_dma_region()`, `cleanup_token()`, `has_cleanup_token()` accessors added.
+- `from_output()` updated to decode `cleanup_token` from output struct.
+
+**(A) Kernel dispatch tests (5 in `mod stage52`, `src/kernel/boot/tests.rs`):**
+
+- `stage52_dma_region_object_kind_is_five` — DmaRegion cap transfer → object_kind @40 == 5.
+- `stage52_dma_region_full_metadata_output` — all metadata fields for DmaRegion are correct.
+- `stage52_memory_object_still_kind_one_with_exact_object_size` — MemoryObject unaffected.
+- `stage52_recv_writes_exactly_88_bytes_for_dma_region` — write window is exactly 88 bytes.
+- `stage52_recv_writes_exactly_88_bytes_for_plain_message` — plain message: same boundary.
+
+**(B) user-rt tests (7 new, `crates/yarm-user-rt/src/syscall/recv_v3.rs`):**
+- `is_dma_region_true_for_kind_five`
+- `is_dma_region_false_for_memory_object`
+- `is_dma_region_false_when_no_cap`
+- `from_output_dma_region_kind_five_decoded`
+- `cleanup_token_accessor_returns_zero_always`
+- `from_output_cleanup_token_zero_for_dma_region`
+- `from_output_and_manual_decode_agree_on_dma_region`
+
+**(C) ABI crate tests (10 new, `crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`):**
+- `abi_dma_region_kind_discriminant_is_five`
+- `abi_object_kind_from_raw_dma_region`
+- `abi_object_kind_values_include_dma_region`
+- `abi_cleanup_token_none_sentinel_is_zero`
+- `abi_cleanup_token_zero_in_zeroed_output`
+- `abi_cleanup_identity_none_is_not_active`
+- `abi_cleanup_identity_none_is_not_structurally_valid`
+- `abi_cleanup_identity_structurally_valid_requires_page_aligned_len`
+- `abi_cleanup_identity_requires_non_sentinel_cap`
+- `abi_cleanup_token_field_at_offset_112`
+
+**Run commands:**
+- `cargo test --lib stage52 -- --test-threads=1` (5 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (52 user-rt tests total)
+- `cargo test -p yarm-ipc-abi --lib recv_shared_v3` (35 ABI crate tests total)
+- `cargo test --features hosted-dev --lib -- --test-threads=1` (1142 total)
+
+All tests must pass.
