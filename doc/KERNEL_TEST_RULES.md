@@ -3543,3 +3543,71 @@ All tests must pass.
 - `cargo test --features hosted-dev --lib -- --test-threads=1` (1178 total)
 
 All tests must pass.
+
+## Rule N+57: Stage 58+59 — recv_shared_v3 live map_intent + DmaRegion RO mapping
+
+### Scope
+
+Stage 58+59 enables live `map_intent` mapping in `recv_shared_v3` (NR 30).
+DmaRegion read-only is the primary candidate.  SYSCALL_COUNT=31 is unchanged.
+
+### Hard invariants
+
+1. SYSCALL_COUNT == 31; NR 30 == RecvSharedV3.
+2. `map_intent != 0` with `metadata_len < 120` returns `InvalidArgs`.
+3. Mapping is only performed for `OPCODE_SHARED_MEM` messages carrying a
+   `DmaRegion` or `MemoryObject` cap; all other messages with `map_intent != 0`
+   return `InvalidArgs`.
+4. `cleanup_token` is always written when a live mapping succeeds; it equals the
+   receiver-local cap ID (opaque token).
+5. `execute_user_asid_plain_writeback` is skipped when mapping succeeds
+   (`skip_payload = true`); `frame.ret1` (payload_len_copied) is 0.
+6. `register_active_transfer_mapping` is called after all pages are mapped;
+   the count is observable via `active_transfer_count_for_pid`.
+7. VFS_SHARED_IO remains disabled.
+8. Plain receives (no `map_intent`) and DmaRegion transfers without `map_intent`
+   behave identically to Stage 56+57.
+9. Legacy `ipc_recv` (NR 2) is unaffected.
+
+### Test-ordering constraint
+
+`IpcSend` calls in stage58/stage59 tests must happen **before** any
+`setup_receiver`/`setup_recv_asid` call that binds a user ASID to task 0.
+After ASID binding, `IpcSend` from task 0 takes the user-ASID path and
+calls `copy_from_current_user(VA=0, len)`, which faults silently (message
+not queued, no `Err` returned).  The send must use the kernel-task path.
+
+### Tests
+
+**(A) Kernel tests — 12 in `mod stage58`, `src/kernel/boot/tests.rs`:**
+- `stage58_map_intent_requires_metadata_len_120`
+- `stage58_map_intent_read_write_also_requires_metadata_len_120`
+- `stage58_dma_region_ro_mapping_result_status_ok`
+- `stage58_dma_region_ro_mapped_base_equals_payload_ptr`
+- `stage58_dma_region_ro_mapped_len_equals_page_size`
+- `stage58_dma_region_ro_actual_perm_is_1`
+- `stage58_dma_region_ro_cleanup_token_nonzero`
+- `stage58_dma_region_ro_cleanup_token_equals_transferred_cap`
+- `stage58_active_transfer_count_increments_after_mapping`
+- `stage58_mapping_skips_payload_copy_frame_payload_len_is_zero`
+- `stage58_map_intent_without_cap_message_rejected`
+- `stage58_map_intent_with_non_shared_mem_message_rejected`
+
+**(B) Kernel tests — 6 in `mod stage59`, `src/kernel/boot/tests.rs`:**
+- `stage59_syscall_count_still_31_and_nr_still_30`
+- `stage59_plain_receive_write_window_still_88_bytes`
+- `stage59_dma_region_transfer_without_map_intent_unchanged`
+- `stage59_map_intent_small_buffer_still_invalid_args`
+- `stage59_vfs_shared_io_disabled`
+- `stage59_legacy_ipc_recv_unaffected_by_mapping`
+
+**Run commands:**
+- `cargo test --lib stage58 -- --test-threads=1` (12 kernel tests)
+- `cargo test --lib stage59 -- --test-threads=1` (6 kernel tests)
+- `cargo test --lib stage56 -- --test-threads=1` (14 regression)
+- `cargo test --lib ipc_recv -- --test-threads=1` (regression)
+- `cargo test --lib recv_v2 -- --test-threads=1` (regression)
+- `cargo test -p yarm-ipc-abi --lib -- recv_shared_v3` (ABI regression)
+- `cargo test -p yarm-user-rt --lib -- recv_v3` (user-rt regression)
+
+All tests must pass.

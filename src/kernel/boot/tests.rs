@@ -184,40 +184,54 @@ fn transfer_envelope_handles_are_single_use_and_replay_safe() {
     let first = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
         .expect("stash first");
-    assert!(state
-        .take_transfer_envelope(first, endpoint, ThreadId(0))
-        .is_some());
-    assert!(state
-        .take_transfer_envelope(first, endpoint, ThreadId(0))
-        .is_none());
+    assert!(
+        state
+            .take_transfer_envelope(first, endpoint, ThreadId(0))
+            .is_some()
+    );
+    assert!(
+        state
+            .take_transfer_envelope(first, endpoint, ThreadId(0))
+            .is_none()
+    );
 
     let second = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, None, None)
         .expect("stash second");
     assert_ne!(first, second);
-    assert!(state
-        .take_transfer_envelope(first, endpoint, ThreadId(0))
-        .is_none());
+    assert!(
+        state
+            .take_transfer_envelope(first, endpoint, ThreadId(0))
+            .is_none()
+    );
     let wrong_endpoint = CapObject::Endpoint {
         index: usize::MAX,
         generation: 1,
     };
-    assert!(state
-        .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
-        .is_none());
-    assert!(state
-        .take_transfer_envelope(second, endpoint, ThreadId(0))
-        .is_some());
+    assert!(
+        state
+            .take_transfer_envelope(second, wrong_endpoint, ThreadId(0))
+            .is_none()
+    );
+    assert!(
+        state
+            .take_transfer_envelope(second, endpoint, ThreadId(0))
+            .is_some()
+    );
 
     let bound = state
         .stash_transfer_envelope(ThreadId(0), mem_cap, endpoint, Some(ThreadId(9)), None)
         .expect("stash bound");
-    assert!(state
-        .take_transfer_envelope(bound, endpoint, ThreadId(8))
-        .is_none());
-    assert!(state
-        .take_transfer_envelope(bound, endpoint, ThreadId(9))
-        .is_some());
+    assert!(
+        state
+            .take_transfer_envelope(bound, endpoint, ThreadId(8))
+            .is_none()
+    );
+    assert!(
+        state
+            .take_transfer_envelope(bound, endpoint, ThreadId(9))
+            .is_some()
+    );
 }
 
 #[test]
@@ -3880,11 +3894,13 @@ fn revoke_isolated_to_owning_cnode_space() {
             .revoke(cap),
         Ok(())
     );
-    assert!(state
-        .cspace_for_cnode(cnode1)
-        .expect("cspace1")
-        .get(cap)
-        .is_none());
+    assert!(
+        state
+            .cspace_for_cnode(cnode1)
+            .expect("cspace1")
+            .get(cap)
+            .is_none()
+    );
     let remaining = state
         .cspace_for_cnode(cnode2)
         .expect("cspace2")
@@ -3931,22 +3947,30 @@ fn revoke_source_capability_cascades_to_delegated_descendants() {
     let delegated_task2 = state
         .grant_capability_task_to_task_with_rights(1, delegated_task1, 2, CapRights::READ)
         .expect("delegate task2");
-    assert!(state
-        .resolve_capability_for_task(1, delegated_task1)
-        .is_ok());
-    assert!(state
-        .resolve_capability_for_task(2, delegated_task2)
-        .is_ok());
+    assert!(
+        state
+            .resolve_capability_for_task(1, delegated_task1)
+            .is_ok()
+    );
+    assert!(
+        state
+            .resolve_capability_for_task(2, delegated_task2)
+            .is_ok()
+    );
 
     let root_cnode = state.task_cnode(0).expect("root cnode");
     assert_eq!(state.revoke_capability_in_cnode(root_cnode, root), Ok(()));
     assert!(state.resolve_capability_for_task(0, root).is_err());
-    assert!(state
-        .resolve_capability_for_task(1, delegated_task1)
-        .is_err());
-    assert!(state
-        .resolve_capability_for_task(2, delegated_task2)
-        .is_err());
+    assert!(
+        state
+            .resolve_capability_for_task(1, delegated_task1)
+            .is_err()
+    );
+    assert!(
+        state
+            .resolve_capability_for_task(2, delegated_task2)
+            .is_err()
+    );
 }
 
 #[test]
@@ -4390,12 +4414,14 @@ fn revoked_unmapped_memory_object_reclaims_frame() {
         .revoke_capability_in_cnode(cnode, mem_cap)
         .expect("revoke mem cap");
 
-    assert!(state
-        .memory
-        .memory_objects
-        .iter()
-        .flatten()
-        .all(|entry| entry.id != id));
+    assert!(
+        state
+            .memory
+            .memory_objects
+            .iter()
+            .flatten()
+            .all(|entry| entry.id != id)
+    );
 
     let (_next_id, next_cap) = state.alloc_anonymous_memory_object().expect("next anon");
     let next_phys = state
@@ -4914,13 +4940,15 @@ fn delegate_device_server_caps_configures_driver_record() {
     assert!(state.capability_for_cnode(driver_cnode, irq_cap).is_some());
     assert!(state.capability_for_cnode(driver_cnode, dma_cap).is_some());
     assert!(state.capability_for_cnode(driver_cnode, iova_cap).is_some());
-    assert!(state
-        .validate_driver_dma_iova(
-            34,
-            crate::kernel::vm::PAGE_SIZE * 8,
-            crate::kernel::vm::PAGE_SIZE,
-        )
-        .is_ok());
+    assert!(
+        state
+            .validate_driver_dma_iova(
+                34,
+                crate::kernel::vm::PAGE_SIZE * 8,
+                crate::kernel::vm::PAGE_SIZE,
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -5484,26 +5512,38 @@ fn delegate_driver_bundle_uses_standard_window_and_revokes_caps() {
         .expect("bundle");
 
     let driver_cnode = state.task_cnode(59).expect("driver cnode");
-    assert!(state
-        .capability_for_cnode(driver_cnode, bundle.irq_cap)
-        .is_some());
-    assert!(state
-        .capability_for_cnode(driver_cnode, bundle.dma_cap)
-        .is_some());
-    assert!(state
-        .capability_for_cnode(driver_cnode, bundle.iova_cap)
-        .is_some());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, bundle.irq_cap)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, bundle.dma_cap)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, bundle.iova_cap)
+            .is_some()
+    );
 
     state.revoke_driver_runtime_caps(59).expect("revoke");
-    assert!(state
-        .capability_for_cnode(driver_cnode, bundle.irq_cap)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, bundle.dma_cap)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, bundle.iova_cap)
-        .is_none());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, bundle.irq_cap)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, bundle.dma_cap)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, bundle.iova_cap)
+            .is_none()
+    );
 }
 
 #[test]
@@ -5764,18 +5804,26 @@ fn driver_record_accepts_multiple_irq_and_dma_caps() {
 
     state.revoke_driver_runtime_caps(44).expect("revoke");
     let driver_cnode = state.task_cnode(44).expect("driver cnode");
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_irq_a)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_irq_b)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_dma_a)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_dma_b)
-        .is_none());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_irq_a)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_irq_b)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_dma_a)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_dma_b)
+            .is_none()
+    );
 }
 
 #[test]
@@ -5849,16 +5897,22 @@ fn dma_region_cap_enforces_window_constraints() {
     let mut state = Bootstrap::init().expect("init");
     let (_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
 
-    assert!(state
-        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
-        .is_ok());
-    assert!(state
-        .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
-        .is_err());
+    assert!(
+        state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE)
+            .is_ok()
+    );
+    assert!(
+        state
+            .mint_dma_region_cap(mem_cap, 1, crate::kernel::vm::PAGE_SIZE)
+            .is_err()
+    );
     assert!(state.mint_dma_region_cap(mem_cap, 0, 0).is_err());
-    assert!(state
-        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-        .is_err());
+    assert!(
+        state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+            .is_err()
+    );
 }
 
 #[test]
@@ -5875,23 +5929,29 @@ fn dma_region_cap_uses_parent_memory_object_length() {
         .expect("memory object present");
     entry.len = crate::kernel::vm::PAGE_SIZE * 4;
 
-    assert!(state
-        .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
-        .is_ok());
-    assert!(state
-        .mint_dma_region_cap(
-            mem_cap,
-            crate::kernel::vm::PAGE_SIZE * 3,
-            crate::kernel::vm::PAGE_SIZE
-        )
-        .is_ok());
-    assert!(state
-        .mint_dma_region_cap(
-            mem_cap,
-            crate::kernel::vm::PAGE_SIZE * 3,
-            crate::kernel::vm::PAGE_SIZE * 2
-        )
-        .is_err());
+    assert!(
+        state
+            .mint_dma_region_cap(mem_cap, 0, crate::kernel::vm::PAGE_SIZE * 2)
+            .is_ok()
+    );
+    assert!(
+        state
+            .mint_dma_region_cap(
+                mem_cap,
+                crate::kernel::vm::PAGE_SIZE * 3,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_ok()
+    );
+    assert!(
+        state
+            .mint_dma_region_cap(
+                mem_cap,
+                crate::kernel::vm::PAGE_SIZE * 3,
+                crate::kernel::vm::PAGE_SIZE * 2
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -6000,13 +6060,15 @@ fn driver_restart_revokes_runtime_caps() {
     let token = state.exit_task(22, 1).expect("exit");
     state.restart_task(22, token).expect("restart");
 
-    assert!(state
-        .validate_driver_dma_iova(
-            22,
-            crate::kernel::vm::PAGE_SIZE * 8,
-            crate::kernel::vm::PAGE_SIZE
-        )
-        .is_err());
+    assert!(
+        state
+            .validate_driver_dma_iova(
+                22,
+                crate::kernel::vm::PAGE_SIZE * 8,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -6054,22 +6116,26 @@ fn detach_iova_space_revokes_dma_window_validation() {
             crate::kernel::vm::PAGE_SIZE,
         )
         .expect("window");
-    assert!(state
-        .validate_driver_dma_iova(
-            31,
-            crate::kernel::vm::PAGE_SIZE * 2,
-            crate::kernel::vm::PAGE_SIZE
-        )
-        .is_ok());
+    assert!(
+        state
+            .validate_driver_dma_iova(
+                31,
+                crate::kernel::vm::PAGE_SIZE * 2,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_ok()
+    );
 
     state.detach_driver_iova_space(31).expect("detach");
-    assert!(state
-        .validate_driver_dma_iova(
-            31,
-            crate::kernel::vm::PAGE_SIZE * 2,
-            crate::kernel::vm::PAGE_SIZE
-        )
-        .is_err());
+    assert!(
+        state
+            .validate_driver_dma_iova(
+                31,
+                crate::kernel::vm::PAGE_SIZE * 2,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -6092,15 +6158,21 @@ fn revoke_driver_runtime_caps_revokes_from_driver_cnode() {
 
     state.revoke_driver_runtime_caps(32).expect("revoke");
     let driver_cnode = state.task_cnode(32).expect("driver cnode");
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_irq)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_dma)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_iova)
-        .is_none());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_irq)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_dma)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_iova)
+            .is_none()
+    );
 }
 
 #[test]
@@ -6114,9 +6186,11 @@ fn stale_driver_caps_are_rejected_after_revocation() {
     state.revoke_driver_runtime_caps(33).expect("revoke");
 
     let driver_cnode = state.task_cnode(33).expect("driver cnode");
-    assert!(state
-        .capability_for_cnode(driver_cnode, delegated_irq)
-        .is_none());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, delegated_irq)
+            .is_none()
+    );
     assert!(state.grant_driver_irq(33, irq).is_ok());
 }
 
@@ -6144,12 +6218,16 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
         .validate_driver_bundle_live(111, first_bundle)
         .expect("bundle live");
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(state
-        .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
-        .is_some());
-    assert!(state
-        .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
-        .is_some());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+            .is_some()
+    );
 
     let token = state.exit_task(111, 5).expect("exit");
     state.restart_task(111, token).expect("restart");
@@ -6159,20 +6237,26 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
         Err(KernelError::StaleCapability)
     );
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(state
-        .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
-        .is_none());
-    assert!(state
-        .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
-        .is_none());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, first_bundle.irq_cap)
+            .is_none()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, first_bundle.dma_cap)
+            .is_none()
+    );
     assert!(matches!(
         state.grant_driver_irq(111, first_bundle.irq_cap),
         Err(KernelError::InvalidCapability | KernelError::WrongObject)
     ));
 
-    assert!(state
-        .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
-        .is_none());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, first_bundle.iova_cap)
+            .is_none()
+    );
     let iova_cap2 = state.create_iova_space_cap().expect("iova2");
 
     let second_bundle = state
@@ -6193,12 +6277,16 @@ fn delegation_checked_bundle_requires_redelegation_after_driver_restart() {
     assert_ne!(first_bundle.irq_cap, second_bundle.irq_cap);
     assert_ne!(first_bundle.dma_cap, second_bundle.dma_cap);
     let driver_cnode = state.task_cnode(111).expect("driver cnode");
-    assert!(state
-        .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
-        .is_some());
-    assert!(state
-        .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
-        .is_some());
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, second_bundle.irq_cap)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(driver_cnode, second_bundle.dma_cap)
+            .is_some()
+    );
 }
 
 #[test]
@@ -6224,13 +6312,15 @@ fn checked_bundle_helper_validates_bundle_and_dma_window() {
     state
         .validate_driver_bundle_live(121, bundle)
         .expect("bundle live");
-    assert!(state
-        .validate_driver_dma_iova(
-            121,
-            crate::kernel::vm::PAGE_SIZE * 8,
-            crate::kernel::vm::PAGE_SIZE
-        )
-        .is_ok());
+    assert!(
+        state
+            .validate_driver_dma_iova(
+                121,
+                crate::kernel::vm::PAGE_SIZE * 8,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_ok()
+    );
 }
 
 #[test]
@@ -6297,20 +6387,24 @@ fn iova_window_validation_requires_iova_space_and_range() {
         )
         .expect("window");
 
-    assert!(state
-        .validate_driver_dma_iova(
-            12,
-            crate::kernel::vm::PAGE_SIZE * 4,
-            crate::kernel::vm::PAGE_SIZE
-        )
-        .is_ok());
-    assert!(state
-        .validate_driver_dma_iova(
-            12,
-            crate::kernel::vm::PAGE_SIZE * 3,
-            crate::kernel::vm::PAGE_SIZE
-        )
-        .is_err());
+    assert!(
+        state
+            .validate_driver_dma_iova(
+                12,
+                crate::kernel::vm::PAGE_SIZE * 4,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_ok()
+    );
+    assert!(
+        state
+            .validate_driver_dma_iova(
+                12,
+                crate::kernel::vm::PAGE_SIZE * 3,
+                crate::kernel::vm::PAGE_SIZE
+            )
+            .is_err()
+    );
 }
 
 #[test]
@@ -6882,19 +6976,27 @@ fn fork_child_inherits_parent_endpoint_caps_with_same_rights() {
         })
         .map(|(id, _)| *id)
         .expect("recv cap");
-    assert!(state
-        .capability_for_cnode(child_cnode, inherited_send)
-        .is_some());
-    assert!(state
-        .capability_for_cnode(child_cnode, inherited_recv)
-        .is_some());
+    assert!(
+        state
+            .capability_for_cnode(child_cnode, inherited_send)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(child_cnode, inherited_recv)
+            .is_some()
+    );
     let parent_cnode = state.task_cnode(39).expect("parent cnode");
-    assert!(state
-        .capability_for_cnode(parent_cnode, send_parent)
-        .is_some());
-    assert!(state
-        .capability_for_cnode(parent_cnode, recv_parent)
-        .is_some());
+    assert!(
+        state
+            .capability_for_cnode(parent_cnode, send_parent)
+            .is_some()
+    );
+    assert!(
+        state
+            .capability_for_cnode(parent_cnode, recv_parent)
+            .is_some()
+    );
 }
 
 #[test]
@@ -6923,13 +7025,17 @@ fn fork_child_does_not_inherit_kernel_caps() {
     let child_caps = state
         .snapshot_live_capabilities_for_task(child_tid)
         .expect("child caps");
-    assert!(!child_caps
-        .iter()
-        .any(|(_id, cap)| matches!(cap.object, CapObject::Kernel)));
+    assert!(
+        !child_caps
+            .iter()
+            .any(|(_id, cap)| matches!(cap.object, CapObject::Kernel))
+    );
     let child_cnode = state.task_cnode(child_tid).expect("child cnode");
-    assert!(state
-        .capability_for_cnode(child_cnode, kernel_cap)
-        .is_none());
+    assert!(
+        state
+            .capability_for_cnode(child_cnode, kernel_cap)
+            .is_none()
+    );
 }
 
 #[test]
@@ -8720,9 +8826,11 @@ fn process_teardown_reclaims_process_cnode_space_and_delegated_descendants() {
     let delegated_cap = state
         .grant_capability_task_to_task_with_rights(730, source_cap, 731, CapRights::READ)
         .expect("delegate");
-    assert!(state
-        .resolve_capability_for_task(731, delegated_cap)
-        .is_ok());
+    assert!(
+        state
+            .resolve_capability_for_task(731, delegated_cap)
+            .is_ok()
+    );
 
     state.mark_task_dead(730).expect("teardown source process");
 
@@ -8766,9 +8874,11 @@ fn process_teardown_reclaims_multi_hop_delegated_graph_without_touching_unrelate
 
     assert!(state.resolve_capability_for_task(741, mid_cap).is_ok());
     assert!(state.resolve_capability_for_task(742, leaf_cap).is_ok());
-    assert!(state
-        .resolve_capability_for_task(743, unrelated_cap)
-        .is_ok());
+    assert!(
+        state
+            .resolve_capability_for_task(743, unrelated_cap)
+            .is_ok()
+    );
 
     state.mark_task_dead(740).expect("teardown source");
 
@@ -8781,9 +8891,11 @@ fn process_teardown_reclaims_multi_hop_delegated_graph_without_touching_unrelate
         state.resolve_capability_for_task(742, leaf_cap),
         Err(KernelError::InvalidCapability)
     );
-    assert!(state
-        .resolve_capability_for_task(743, unrelated_cap)
-        .is_ok());
+    assert!(
+        state
+            .resolve_capability_for_task(743, unrelated_cap)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -13320,7 +13432,7 @@ fn ipc_recv_with_deadline_split_bridge_zero_ticks_returns_none() {
 #[test]
 fn staged_deadline_consumed_by_recv_timeout_dispatch() {
     use super::super::syscall::{
-        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR, dispatch,
     };
     use core::sync::atomic::Ordering;
     std::thread::Builder::new()
@@ -13378,7 +13490,7 @@ fn staged_deadline_cleared_on_try_recv_dispatch() {
     // unconditionally swaps SPLIT_RECV_TIMEOUT_DEADLINE to 0, preventing a
     // stale deadline from being picked up by a later timed recv call.
     use super::super::syscall::{
-        dispatch, SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR,
+        SYSCALL_ARG_CAP, SYSCALL_ARG_INLINE_PAYLOAD0, SYSCALL_IPC_RECV_TIMEOUT_NR, dispatch,
     };
     use core::sync::atomic::Ordering;
     std::thread::Builder::new()
@@ -19719,9 +19831,11 @@ fn stage20_transfer_envelope_double_take_is_harmless() {
         1
     );
 
-    assert!(state
-        .take_transfer_envelope(handle, endpoint, ThreadId(0))
-        .is_some());
+    assert!(
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .is_some()
+    );
     let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
     assert_eq!(
         state.memory.memory_objects[slot].expect("obj").pin_refcount,
@@ -19729,9 +19843,11 @@ fn stage20_transfer_envelope_double_take_is_harmless() {
         "pin_refcount must drop to 0 after take"
     );
     // Second take is a no-op: returns None, pin_refcount stays 0 (no underflow).
-    assert!(state
-        .take_transfer_envelope(handle, endpoint, ThreadId(0))
-        .is_none());
+    assert!(
+        state
+            .take_transfer_envelope(handle, endpoint, ThreadId(0))
+            .is_none()
+    );
     let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
     assert_eq!(
         state.memory.memory_objects[slot].expect("obj").pin_refcount,
@@ -19810,9 +19926,11 @@ fn stage20_active_transfer_mapping_is_two_phase_and_refcount_safe() {
         2,
         "mapping registration must not touch cap_refcount"
     );
-    assert!(state
-        .active_transfer_mapping_for(ThreadId(1), derived)
-        .is_some());
+    assert!(
+        state
+            .active_transfer_mapping_for(ThreadId(1), derived)
+            .is_some()
+    );
 
     assert!(state.remove_active_transfer_mapping(ThreadId(1), derived));
     assert!(
@@ -21477,8 +21595,8 @@ mod stage29a_live_split_dispatch_tests {
     use super::*;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::{
-        Syscall, SyscallError, SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, SYSCALL_COUNT,
-        SYSCALL_IPC_RECV_NR, SYSCALL_IPC_SEND_NR, SYSCALL_SPAWN_PROCESS_NR, SYSCALL_VM_MAP_NR,
+        SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR, SYSCALL_COUNT, SYSCALL_IPC_RECV_NR,
+        SYSCALL_IPC_SEND_NR, SYSCALL_SPAWN_PROCESS_NR, SYSCALL_VM_MAP_NR, Syscall, SyscallError,
     };
     use crate::kernel::syscall_split::{classify_split_eligible, try_split_dispatch_into_frame};
     use crate::kernel::trapframe::TrapFrame;
@@ -21711,8 +21829,8 @@ mod stage29a_live_split_dispatch_tests {
 #[cfg(test)]
 mod stage30_boot_guard_tests {
     use crate::runtime::{
-        begin_boot_raw_borrow_window, boot_raw_borrow_is_active, end_boot_raw_borrow_window,
-        BootRawKernelBorrowGuard,
+        BootRawKernelBorrowGuard, begin_boot_raw_borrow_window, boot_raw_borrow_is_active,
+        end_boot_raw_borrow_window,
     };
 
     #[test]
@@ -21799,8 +21917,8 @@ mod stage31_split_recv_tests {
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::{
-        try_split_recv_queued_plain_into_frame_locked, Syscall, SyscallError, SYSCALL_COUNT,
-        SYSCALL_NO_TRANSFER_CAP,
+        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError,
+        try_split_recv_queued_plain_into_frame_locked,
     };
     use crate::kernel::task::TaskStatus;
     use crate::kernel::trapframe::TrapFrame;
@@ -22178,11 +22296,11 @@ mod stage32_cap_resolution_tests {
     use crate::kernel::capabilities::{CapId, CapObject, CapRights};
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
     use crate::kernel::task::TaskClass;
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::{
-        EndpointRecvCapSnapshot, IpcRecvQueuedPlainWritebackPlan, SharedKernel, MAX_PLAIN_PAYLOAD,
+        EndpointRecvCapSnapshot, IpcRecvQueuedPlainWritebackPlan, MAX_PLAIN_PAYLOAD, SharedKernel,
     };
     use std::vec::Vec;
 
@@ -22880,11 +22998,11 @@ mod stage33_34 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        plan_recv_core, FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget,
-        RecvPayloadTarget, RecvPlan, RecvRequest, RecvRequestKind,
+        FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
+        RecvPlan, RecvRequest, RecvRequestKind, plan_recv_core,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
 
@@ -23522,11 +23640,11 @@ mod stage35 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        plan_recv_core, FallbackReason, RecvBlockingPolicy, RecvMetaTarget, RecvPayloadTarget,
-        RecvPlan, RecvRequest, RecvRequestKind,
+        FallbackReason, RecvBlockingPolicy, RecvMetaTarget, RecvPayloadTarget, RecvPlan,
+        RecvRequest, RecvRequestKind, plan_recv_core,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
 
@@ -23798,12 +23916,12 @@ mod stage36 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        execute_user_asid_plain_writeback, plan_recv_core, try_recv_core_user_plain,
         FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
         RecvPlan, RecvRequest, RecvRequestKind, RecvUserWritebackOutcome,
+        execute_user_asid_plain_writeback, plan_recv_core, try_recv_core_user_plain,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
 
@@ -24197,12 +24315,12 @@ mod stage37 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        execute_user_asid_plain_v2_writeback, plan_recv_core, try_recv_core_user_plain_v2,
         FallbackReason, RecvMapIntent, RecvMetaTarget, RecvPlan, RecvRequest,
-        RecvV2WritebackOutcome, RecvWritebackPlan,
+        RecvV2WritebackOutcome, RecvWritebackPlan, execute_user_asid_plain_v2_writeback,
+        plan_recv_core, try_recv_core_user_plain_v2,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError};
     use crate::kernel::trapframe::TrapFrame;
     use crate::kernel::vm::{PageFlags, VirtAddr};
     use crate::runtime::SharedKernel;
@@ -24814,12 +24932,11 @@ mod stage38 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        plan_recv_core, try_recv_core_kernel_plain, try_recv_core_user_plain, FallbackReason,
-        RecvMapIntent, RecvOutcome, RecvPlan, RecvRequest, RecvSchedulerWakePlan,
-        RecvWritebackPlan,
+        FallbackReason, RecvMapIntent, RecvOutcome, RecvPlan, RecvRequest, RecvSchedulerWakePlan,
+        RecvWritebackPlan, plan_recv_core, try_recv_core_kernel_plain, try_recv_core_user_plain,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SYSCALL_COUNT};
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::task::{TaskStatus, WaitReason};
     use crate::kernel::trapframe::TrapFrame;
@@ -25402,17 +25519,16 @@ mod stage40 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        plan_recv_core,
-        recv_shared_v3::{
-            validate_v3_output_record, validate_v3_request, RecvSharedV3Error, RecvSharedV3Output,
-            RecvSharedV3Request, MAP_READ, MAP_WRITE, V3_MIN_OUTPUT_LEN, V3_MIN_REQUEST_LEN,
-            V3_VERSION,
-        },
         FallbackReason, RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvPayloadTarget,
-        RecvPlan, RecvRequest, RecvRequestKind,
+        RecvPlan, RecvRequest, RecvRequestKind, plan_recv_core,
+        recv_shared_v3::{
+            MAP_READ, MAP_WRITE, RecvSharedV3Error, RecvSharedV3Output, RecvSharedV3Request,
+            V3_MIN_OUTPUT_LEN, V3_MIN_REQUEST_LEN, V3_VERSION, validate_v3_output_record,
+            validate_v3_request,
+        },
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SYSCALL_COUNT};
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
@@ -25804,11 +25920,11 @@ mod stage42 {
     use crate::kernel::capabilities::CapId;
     use crate::kernel::ipc::Message;
     use crate::kernel::recv_core::{
-        try_recv_core_kernel_plain, try_recv_core_user_plain, RecvCapTransferPlan, RecvDelivery,
-        RecvOutcome, RecvRequest, RecvSchedulerWakePlan, RecvWritebackPlan,
+        RecvCapTransferPlan, RecvDelivery, RecvOutcome, RecvRequest, RecvSchedulerWakePlan,
+        RecvWritebackPlan, try_recv_core_kernel_plain, try_recv_core_user_plain,
     };
     use crate::kernel::scheduler::CpuId;
-    use crate::kernel::syscall::{Syscall, SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR};
+    use crate::kernel::syscall::{SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, Syscall};
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::trapframe::TrapFrame;
     use crate::runtime::SharedKernel;
@@ -26080,7 +26196,7 @@ mod stage44 {
     use crate::kernel::ipc::Message;
     use crate::kernel::scheduler::CpuId;
     use crate::kernel::syscall::{
-        dispatch, Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR,
+        SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, Syscall, SyscallError, dispatch,
     };
     use crate::kernel::syscall_split::try_split_dispatch_into_frame;
     use crate::kernel::trapframe::TrapFrame;
@@ -26344,7 +26460,7 @@ mod stage45 {
 
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::ipc::Message;
-    use crate::kernel::syscall::{dispatch, Syscall};
+    use crate::kernel::syscall::{Syscall, dispatch};
     use crate::kernel::trapframe::TrapFrame;
     use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr};
 
@@ -26556,7 +26672,7 @@ mod stage46 {
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::capabilities::{CapId, CapObject};
     use crate::kernel::ipc::Message;
-    use crate::kernel::syscall::{dispatch, Syscall, SyscallError, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError, dispatch};
     use crate::kernel::trapframe::TrapFrame;
     use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr};
 
@@ -26759,9 +26875,9 @@ mod stage47 {
     //! object introspection fields.
 
     use crate::kernel::boot::Bootstrap;
-    use crate::kernel::syscall::{dispatch, Syscall, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, Syscall, dispatch};
     use crate::kernel::trapframe::TrapFrame;
-    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+    use crate::kernel::vm::{Asid, CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
     const RECV_V3_STATUS_OK: u32 = 0;
 
@@ -26961,9 +27077,9 @@ mod stage49 {
     //!   B. Plain message (no cap) returns `exact_object_size == 0`.
 
     use crate::kernel::boot::Bootstrap;
-    use crate::kernel::syscall::{dispatch, Syscall, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, Syscall, dispatch};
     use crate::kernel::trapframe::TrapFrame;
-    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+    use crate::kernel::vm::{Asid, CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
     const RECV_V3_STATUS_OK: u32 = 0;
 
@@ -27139,9 +27255,9 @@ mod stage50 {
     //!   E. map_intent=READ_WRITE remains InvalidArgs.
 
     use crate::kernel::boot::Bootstrap;
-    use crate::kernel::syscall::{dispatch, Syscall, SyscallError, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, Syscall, SyscallError, dispatch};
     use crate::kernel::trapframe::TrapFrame;
-    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+    use crate::kernel::vm::{Asid, CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
     const RECV_V3_STATUS_OK: u32 = 0;
     const RECV_V3_MAP_READ: u32 = 0x1;
@@ -27448,9 +27564,9 @@ mod stage52 {
     //! Also confirms MemoryObject still reports kind=1 and exact_object_size.
 
     use crate::kernel::boot::Bootstrap;
-    use crate::kernel::syscall::{dispatch, Syscall, SYSCALL_NO_TRANSFER_CAP};
+    use crate::kernel::syscall::{SYSCALL_NO_TRANSFER_CAP, Syscall, dispatch};
     use crate::kernel::trapframe::TrapFrame;
-    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+    use crate::kernel::vm::{Asid, CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
 
     const RECV_V3_STATUS_OK: u32 = 0;
     const RECV_V3_DMA_REGION_KIND: u32 = 5;
@@ -27803,15 +27919,15 @@ mod stage54 {
 
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::recv_core::recv_shared_v3::{
-        compute_recv_v3_mapping_plan, RecvV3MappingPlan, CAP_RIGHT_MAP, CAP_RIGHT_WRITE, MAP_READ,
-        MAP_WRITE, OPCODE_SHARED_MEM_VALUE,
+        CAP_RIGHT_MAP, CAP_RIGHT_WRITE, MAP_READ, MAP_WRITE, OPCODE_SHARED_MEM_VALUE,
+        RecvV3MappingPlan, compute_recv_v3_mapping_plan,
     };
     use crate::kernel::syscall::{
-        dispatch, Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP,
-        SYSCALL_RECV_SHARED_V3_NR,
+        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_SHARED_V3_NR, Syscall, SyscallError,
+        dispatch,
     };
     use crate::kernel::trapframe::TrapFrame;
-    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, VirtAddr, PAGE_SIZE};
+    use crate::kernel::vm::{Asid, CachePolicy, PAGE_SIZE, PageFlags, VirtAddr};
 
     const RECV_V3_MAP_READ: u32 = 0x1;
     const RECV_V3_MAP_WRITE: u32 = 0x2;
@@ -28143,9 +28259,10 @@ mod stage56 {
     //! G. Integration (MappingPlan → CleanupIdentity → token lifecycle).
 
     use crate::kernel::recv_core::recv_shared_v3::{
-        compute_recv_v3_mapping_plan, RecvV3CleanupIdentity, RecvV3CleanupRegistry,
-        RecvV3CleanupReleaseResult, RecvV3CleanupToken, RecvV3MappingPlan, CAP_RIGHT_MAP, MAP_READ,
-        MAP_WRITE, OPCODE_SHARED_MEM_VALUE, RECV_V3_CLEANUP_REGISTRY_CAPACITY,
+        CAP_RIGHT_MAP, MAP_READ, MAP_WRITE, OPCODE_SHARED_MEM_VALUE,
+        RECV_V3_CLEANUP_REGISTRY_CAPACITY, RecvV3CleanupIdentity, RecvV3CleanupRegistry,
+        RecvV3CleanupReleaseResult, RecvV3CleanupToken, RecvV3MappingPlan,
+        compute_recv_v3_mapping_plan,
     };
     use crate::kernel::vm::PAGE_SIZE;
 
@@ -28436,14 +28553,14 @@ mod stage57 {
 
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::recv_core::recv_shared_v3::{
-        RecvV3CleanupRegistry, RecvV3CleanupToken, RECV_V3_CLEANUP_REGISTRY_CAPACITY,
+        RECV_V3_CLEANUP_REGISTRY_CAPACITY, RecvV3CleanupRegistry, RecvV3CleanupToken,
     };
     use crate::kernel::syscall::{
-        dispatch, Syscall, SyscallError, SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP,
-        SYSCALL_RECV_SHARED_V3_NR,
+        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_SHARED_V3_NR, Syscall, SyscallError,
+        dispatch,
     };
     use crate::kernel::trapframe::TrapFrame;
-    use crate::kernel::vm::{Asid, CachePolicy, PageFlags, PhysAddr, VirtAddr, PAGE_SIZE};
+    use crate::kernel::vm::{Asid, CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
     use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_CLEANUP_TOKEN_NONE;
 
     const RECV_V3_STATUS_OK: u32 = 0;
@@ -28755,5 +28872,676 @@ mod stage57 {
             "new registry must have 0 occupied slots"
         );
         assert_eq!(RECV_V3_CLEANUP_REGISTRY_CAPACITY, 16);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 58+59: recv_shared_v3 live DmaRegion read-only mapping
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod stage58 {
+    //! Stage 58+59 Part 5 — live DmaRegion read-only mapping through
+    //! `recv_shared_v3` (NR 30).
+    //!
+    //! Audit classification: A (can implement) + B (new phys helper needed).
+    //! VA-selection: caller-provided via `payload_ptr`; no kernel VA allocator needed.
+    //! Cleanup: `active_transfer_mappings` + `purge_active_transfer_mappings_for_pid`.
+    //!
+    //! A. map_intent gate: replaced by metadata_len check (< 120 → InvalidArgs).
+    //! B. Successful DmaRegion RO mapping: mapped_base, len, perm, token all set.
+    //! C. mapped_base == payload_ptr (caller-provided VA).
+    //! D. page_rounded_mapped_len == PAGE_SIZE.
+    //! E. actual_mapping_perm == 1 (read-only sentinel).
+    //! F. cleanup_token == transferred_cap (nonzero; cap ID as opaque token).
+    //! G. active_transfer_mapping slot registered after mapping.
+    //! H. Inline payload copy skipped when mapping done (payload_len out = 0).
+    //! I. map_intent without cap-transfer message → InvalidArgs.
+    //! J. map_intent with non-shared-mem message → InvalidArgs.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::syscall::{
+        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_SHARED_V3_NR, Syscall, SyscallError,
+        dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+    const MAP_READ: u32 = 0x1;
+    const MAP_READ_WRITE: u32 = 0x3;
+    const RECV_V3_STATUS_OK: u32 = 0;
+    const RECV_V3_STATUS_WOULD_BLOCK: u32 = 1;
+
+    fn build_req_58(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+        map_intent: u32,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf[48..52].copy_from_slice(&map_intent.to_le_bytes());
+        buf
+    }
+
+    // Setup: bind ASID to task 0 and map a single page at 0x1_0000 (for
+    // request struct + metadata output).  The mapping target VA (0x2_0000)
+    // is intentionally left unmapped — the kernel will install it.
+    fn setup_receiver(state: &mut crate::kernel::boot::KernelState) -> crate::kernel::vm::Asid {
+        let (asid, _aspace_cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind asid");
+        let (_, page_cap) = state.alloc_anonymous_memory_object().expect("page cap");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                page_cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map req page");
+        asid
+    }
+
+    // Send a kernel-task IpcSend with payload_len=20 (> IPC_REGISTER_BYTES=16)
+    // and the given transfer cap.  The kernel routes this to OPCODE_SHARED_MEM.
+    fn send_shared_mem(
+        state: &mut crate::kernel::boot::KernelState,
+        send_cap: crate::kernel::capabilities::CapId,
+        transfer_cap: crate::kernel::capabilities::CapId,
+    ) {
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,  // user_ptr_or_offset (0 for kernel task)
+                20, // payload_len > IPC_REGISTER_BYTES → shared-mem path
+                0,
+                0,
+                transfer_cap.0 as usize,
+            ],
+        );
+        dispatch(state, &mut send_frame).expect("ipc_send shared-mem");
+    }
+
+    // ── A. metadata_len gate ──────────────────────────────────────────────────
+
+    #[test]
+    fn stage58_map_intent_requires_metadata_len_120() {
+        // map_intent != 0 with metadata_len < 120 must return InvalidArgs.
+        // This replaces the old "gate disabled" check — the gate is now a
+        // metadata-length check to ensure cleanup_token can always be written.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let asid = setup_receiver(&mut state);
+        // Try metadata_len = 88 (too small; 120 required for map_intent)
+        let req = build_req_58(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            88,
+            MAP_READ,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent with metadata_len=88 < 120 must return InvalidArgs"
+        );
+    }
+
+    #[test]
+    fn stage58_map_intent_read_write_also_requires_metadata_len_120() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let asid = setup_receiver(&mut state);
+        let req = build_req_58(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            108,
+            MAP_READ_WRITE,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent=RW with metadata_len=108 < 120 must return InvalidArgs"
+        );
+    }
+
+    // ── B. Successful DmaRegion RO mapping ────────────────────────────────────
+
+    fn run_dma_ro_mapping(state: &mut crate::kernel::boot::KernelState) -> ([u8; 128], u64) {
+        // Returns (output bytes [0..120], xfer_cap_out)
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        // Send BEFORE binding user ASID: task 0 has no user ASID here, so the
+        // kernel-task IpcSend path is taken (len=20 > IPC_REGISTER_BYTES=16
+        // triggers OPCODE_SHARED_MEM without a user-memory copy).
+        send_shared_mem(state, send_cap, dma_cap);
+        let asid = setup_receiver(state);
+
+        // Request: payload_ptr = 0x2_0000 (mapping target), payload_len = PAGE_SIZE,
+        // metadata_ptr = 0x1_0200, metadata_len = 120, map_intent = MAP_READ.
+        let req = build_req_58(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(state, &mut frame).expect("recv_shared_v3 with map_intent");
+
+        let xfer_cap_out = frame.ret2() as u64;
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 120)
+            .expect("read output");
+        (out, xfer_cap_out)
+    }
+
+    #[test]
+    fn stage58_dma_region_ro_mapping_result_status_ok() {
+        let mut state = Bootstrap::init().expect("init");
+        let (out, _) = run_dma_ro_mapping(&mut state);
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        assert_eq!(result_status, RECV_V3_STATUS_OK, "result_status must be OK");
+    }
+
+    // ── C. mapped_base == payload_ptr ─────────────────────────────────────────
+
+    #[test]
+    fn stage58_dma_region_ro_mapped_base_equals_payload_ptr() {
+        let mut state = Bootstrap::init().expect("init");
+        let (out, _) = run_dma_ro_mapping(&mut state);
+        let mapped_base = u64::from_le_bytes(out[88..96].try_into().unwrap());
+        assert_eq!(
+            mapped_base, 0x2_0000,
+            "mapped_base must equal the receiver-provided payload_ptr"
+        );
+    }
+
+    // ── D. page_rounded_mapped_len == PAGE_SIZE ───────────────────────────────
+
+    #[test]
+    fn stage58_dma_region_ro_mapped_len_equals_page_size() {
+        let mut state = Bootstrap::init().expect("init");
+        let (out, _) = run_dma_ro_mapping(&mut state);
+        let mapped_len = u64::from_le_bytes(out[96..104].try_into().unwrap());
+        assert_eq!(
+            mapped_len, PAGE_SIZE as u64,
+            "page_rounded_mapped_len must equal PAGE_SIZE for a one-page DmaRegion"
+        );
+    }
+
+    // ── E. actual_mapping_perm == 1 (read-only) ───────────────────────────────
+
+    #[test]
+    fn stage58_dma_region_ro_actual_perm_is_1() {
+        let mut state = Bootstrap::init().expect("init");
+        let (out, _) = run_dma_ro_mapping(&mut state);
+        let perm = u32::from_le_bytes(out[104..108].try_into().unwrap());
+        assert_eq!(perm, 1u32, "actual_mapping_perm must be 1 (read-only)");
+    }
+
+    // ── F. cleanup_token nonzero and equals transferred_cap ───────────────────
+
+    #[test]
+    fn stage58_dma_region_ro_cleanup_token_nonzero() {
+        let mut state = Bootstrap::init().expect("init");
+        let (out, _) = run_dma_ro_mapping(&mut state);
+        let cleanup_token = u64::from_le_bytes(out[112..120].try_into().unwrap());
+        assert_ne!(
+            cleanup_token, 0,
+            "cleanup_token must be nonzero after a live mapping"
+        );
+    }
+
+    #[test]
+    fn stage58_dma_region_ro_cleanup_token_equals_transferred_cap() {
+        let mut state = Bootstrap::init().expect("init");
+        let (out, xfer_cap_out) = run_dma_ro_mapping(&mut state);
+        let cleanup_token = u64::from_le_bytes(out[112..120].try_into().unwrap());
+        let transferred_cap = u64::from_le_bytes(out[32..40].try_into().unwrap());
+        assert_ne!(xfer_cap_out, SYSCALL_NO_TRANSFER_CAP);
+        assert_eq!(
+            cleanup_token, transferred_cap,
+            "cleanup_token must equal transferred_cap (cap ID as opaque token)"
+        );
+        assert_eq!(
+            cleanup_token, xfer_cap_out,
+            "cleanup_token must also equal frame ret2 (xfer_cap_out)"
+        );
+    }
+
+    // ── G. active_transfer_mapping slot registered ────────────────────────────
+
+    #[test]
+    fn stage58_active_transfer_count_increments_after_mapping() {
+        let mut state = Bootstrap::init().expect("init");
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "no transfer mappings before"
+        );
+        run_dma_ro_mapping(&mut state);
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            1,
+            "exactly one active transfer mapping after DmaRegion RO mapping"
+        );
+    }
+
+    // ── H. Payload writeback skipped (payload_len out = 0) ────────────────────
+
+    #[test]
+    fn stage58_mapping_skips_payload_copy_frame_payload_len_is_zero() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+        // Send before ASID binding so the kernel-task path is taken.
+        send_shared_mem(&mut state, send_cap, dma_cap);
+        let asid = setup_receiver(&mut state);
+
+        let req = build_req_58(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(&mut state, &mut frame).expect("recv");
+        // ret1 is the payload length copied (0 when mapping skips inline copy)
+        assert_eq!(
+            frame.ret1(),
+            0,
+            "frame payload_len must be 0 when mapping replaces inline payload copy"
+        );
+    }
+
+    // ── I. map_intent without cap-transfer → InvalidArgs ─────────────────────
+
+    #[test]
+    fn stage58_map_intent_without_cap_message_rejected() {
+        // Send a plain inline message (no cap) before binding ASID; then recv
+        // with map_intent=READ.  The message delivers but materialized_cap=None → InvalidArgs.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+
+        // Send BEFORE ASID binding: kernel-task path reads payload from registers.
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x4141_4141u32 as usize,
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send plain");
+        let asid = setup_receiver(&mut state);
+
+        let req = build_req_58(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent with no transferred cap must return InvalidArgs"
+        );
+    }
+
+    // ── J. map_intent with non-shared-mem message → InvalidArgs ──────────────
+
+    #[test]
+    fn stage58_map_intent_with_non_shared_mem_message_rejected() {
+        // Send a small inline cap-transfer message (opcode = OPCODE_INLINE = 0,
+        // not OPCODE_SHARED_MEM = 1).  map_intent must return InvalidArgs because
+        // compute_recv_v3_mapping_plan returns Skip (wrong opcode).
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+
+        // Send BEFORE ASID binding: payload_len=4 → kernel-task inline path, OPCODE_INLINE.
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x4141_4141u32 as usize,
+                0,
+                dma_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send inline cap");
+        let asid = setup_receiver(&mut state);
+
+        let req = build_req_58(
+            recv_cap.0 as u64,
+            0x2_0000,
+            PAGE_SIZE as u64,
+            0x1_0200,
+            120,
+            MAP_READ,
+        );
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent with OPCODE_INLINE (non-shared-mem) must return InvalidArgs"
+        );
+    }
+}
+
+mod stage59 {
+    //! Stage 58+59 Part 5 — invariant preservation.
+    //!
+    //! Confirms that live mapping did not break any existing invariants:
+    //! SYSCALL_COUNT, NR30, old ipc_recv, plain v3 receive, DmaRegion
+    //! metadata, write-window semantics, VFS_SHARED_IO unchanged.
+
+    use crate::kernel::boot::Bootstrap;
+    use crate::kernel::syscall::{
+        SYSCALL_COUNT, SYSCALL_NO_TRANSFER_CAP, SYSCALL_RECV_SHARED_V3_NR, Syscall, SyscallError,
+        dispatch,
+    };
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+    const RECV_V3_STATUS_OK: u32 = 0;
+
+    fn build_v3_req_59(
+        endpoint_cap: u64,
+        payload_ptr: u64,
+        payload_len: u64,
+        metadata_ptr: u64,
+        metadata_len: u64,
+    ) -> [u8; 80] {
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&endpoint_cap.to_le_bytes());
+        buf[16..24].copy_from_slice(&payload_ptr.to_le_bytes());
+        buf[24..32].copy_from_slice(&payload_len.to_le_bytes());
+        buf[32..40].copy_from_slice(&metadata_ptr.to_le_bytes());
+        buf[40..48].copy_from_slice(&metadata_len.to_le_bytes());
+        buf
+    }
+
+    fn setup_recv_asid(state: &mut crate::kernel::boot::KernelState) -> crate::kernel::vm::Asid {
+        let (asid, _) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(0, asid).expect("bind");
+        let (_, cap) = state.alloc_anonymous_memory_object().expect("anon");
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                cap,
+                VirtAddr(0x1_0000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: CachePolicy::WriteBack,
+                },
+            )
+            .expect("map");
+        asid
+    }
+
+    // ── Syscall numbering unchanged ───────────────────────────────────────────
+
+    #[test]
+    fn stage59_syscall_count_still_31_and_nr_still_30() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must remain 31");
+        assert_eq!(
+            SYSCALL_RECV_SHARED_V3_NR, 30,
+            "SYSCALL_RECV_SHARED_V3_NR must remain 30"
+        );
+    }
+
+    // ── Plain receive write window ────────────────────────────────────────────
+
+    #[test]
+    fn stage59_plain_receive_write_window_still_88_bytes() {
+        // A plain receive (no map_intent, 88-byte output buffer) must still
+        // write only the fields at [0..88]; [88..120] must not be modified.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+
+        // Send BEFORE binding ASID: kernel-task inline path reads payload from registers.
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x5959_5959u32 as usize,
+                0,
+                SYSCALL_NO_TRANSFER_CAP as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send");
+        let asid = setup_recv_asid(&mut state);
+
+        let req = build_v3_req_59(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(&mut state, &mut frame).expect("recv");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read");
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        // For plain receive (no DmaRegion), exact_region_len must be 0.
+        assert_eq!(
+            exact_region_len, 0,
+            "exact_region_len must be 0 for plain message"
+        );
+    }
+
+    // ── DmaRegion transfer without map_intent still works ────────────────────
+
+    #[test]
+    fn stage59_dma_region_transfer_without_map_intent_unchanged() {
+        // A DmaRegion cap-transfer receive without map_intent (metadata_len=88)
+        // must still produce exact_region_len=PAGE_SIZE and mapped_base=0.
+        // This proves the old path is fully preserved.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let (_mem_id, mem_cap) = state.create_memory_object(PhysAddr(0xC000)).expect("mem");
+        let dma_cap = state
+            .mint_dma_region_cap(mem_cap, 0, PAGE_SIZE)
+            .expect("dma cap");
+
+        // Send BEFORE binding ASID: kernel-task inline path, OPCODE_INLINE.
+        let mut send_frame = TrapFrame::new(
+            Syscall::IpcSend as usize,
+            [
+                send_cap.0 as usize,
+                0,
+                4,
+                0x646d6100u32 as usize,
+                0,
+                dma_cap.0 as usize,
+            ],
+        );
+        dispatch(&mut state, &mut send_frame).expect("send");
+        let asid = setup_recv_asid(&mut state);
+
+        let req = build_v3_req_59(recv_cap.0 as u64, 0x1_0100, 256, 0x1_0200, 88);
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &req)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        dispatch(&mut state, &mut frame).expect("recv");
+
+        let out = state
+            .read_user_memory_for_asid(asid, 0x1_0200, 88)
+            .expect("read");
+        let result_status = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        let object_kind = u32::from_le_bytes(out[40..44].try_into().unwrap());
+        let exact_region_len = u64::from_le_bytes(out[80..88].try_into().unwrap());
+        assert_eq!(result_status, RECV_V3_STATUS_OK);
+        assert_eq!(object_kind, 5, "object_kind must be 5 (DmaRegion)");
+        assert_eq!(
+            exact_region_len, PAGE_SIZE as u64,
+            "exact_region_len must be PAGE_SIZE for DmaRegion"
+        );
+        // No map_intent → no mapping → active_transfer_count stays 0
+        assert_eq!(
+            state.active_transfer_count_for_pid(0),
+            0,
+            "no transfer mapping without map_intent"
+        );
+    }
+
+    // ── map_intent with small buffer still returns InvalidArgs ────────────────
+
+    #[test]
+    fn stage59_map_intent_small_buffer_still_invalid_args() {
+        // Even after live mapping is enabled, a caller with metadata_len < 120
+        // still gets InvalidArgs — the metadata_len gate protects cleanup_token.
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        let asid = setup_recv_asid(&mut state);
+        let mut buf = [0u8; 80];
+        buf[0..4].copy_from_slice(&3u32.to_le_bytes());
+        buf[4..8].copy_from_slice(&64u32.to_le_bytes());
+        buf[8..16].copy_from_slice(&recv_cap.0.to_le_bytes());
+        buf[32..40].copy_from_slice(&0x1_0200u64.to_le_bytes()); // metadata_ptr
+        buf[40..48].copy_from_slice(&88u64.to_le_bytes()); // metadata_len = 88 < 120
+        buf[48..52].copy_from_slice(&1u32.to_le_bytes()); // map_intent = MAP_READ
+        state
+            .write_user_memory_for_asid(asid, 0x1_0000, &buf)
+            .expect("write req");
+        let mut frame = TrapFrame::zeroed();
+        frame.set_syscall_num(Syscall::RecvSharedV3 as usize);
+        frame.set_arg(0, 0x1_0000);
+        frame.set_arg(1, 80);
+        assert!(
+            matches!(
+                dispatch(&mut state, &mut frame),
+                Err(SyscallError::InvalidArgs)
+            ),
+            "map_intent with metadata_len=88 must return InvalidArgs"
+        );
+    }
+
+    // ── VFS_SHARED_IO unchanged ───────────────────────────────────────────────
+
+    #[test]
+    fn stage59_vfs_shared_io_disabled() {
+        // VFS_SHARED_IO must remain disabled.
+        assert!(
+            !cfg!(feature = "vfs-shared-io"),
+            "vfs-shared-io feature must remain disabled in Stage 58+59"
+        );
+    }
+
+    // ── old ipc_recv path unchanged ───────────────────────────────────────────
+
+    #[test]
+    fn stage59_legacy_ipc_recv_unaffected_by_mapping() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("ep");
+        state
+            .ipc_send(
+                send_cap,
+                crate::kernel::ipc::Message::new(9, b"hi").expect("msg"),
+            )
+            .expect("send");
+        let msg = state.ipc_recv(recv_cap).expect("recv").expect("msg");
+        assert_eq!(msg.as_slice(), b"hi", "legacy ipc_recv must still work");
     }
 }

@@ -831,7 +831,9 @@ pub(crate) fn try_recv_core_user_plain(
             };
             let (ptr, user_buf_len) = match request.payload_target {
                 RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
-                _ => unreachable!("try_recv_core_user_plain: ReceivedWithSenderWake: non-UserMemory payload_target"),
+                _ => unreachable!(
+                    "try_recv_core_user_plain: ReceivedWithSenderWake: non-UserMemory payload_target"
+                ),
             };
             let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
@@ -986,7 +988,9 @@ pub(crate) fn try_recv_core_user_plain_v2(
             };
             let (ptr, user_buf_len) = match request.payload_target {
                 RecvPayloadTarget::UserMemory { ptr, len } => (ptr, len),
-                _ => unreachable!("try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-UserMemory payload_target"),
+                _ => unreachable!(
+                    "try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-UserMemory payload_target"
+                ),
             };
             let (meta_ptr, meta_len) = match request.meta_target {
                 RecvMetaTarget::V2 { ptr, len } => (ptr, len),
@@ -1075,7 +1079,7 @@ pub(crate) fn execute_user_asid_plain_v2_writeback(
     match kernel.copy_to_current_user(meta_ptr, &meta) {
         Ok(()) => {}
         Err(KernelError::UserMemoryFault) => {
-            return RecvV2WritebackOutcome::MetaCopyFault { meta_ptr }
+            return RecvV2WritebackOutcome::MetaCopyFault { meta_ptr };
         }
         Err(_) => return RecvV2WritebackOutcome::MetaCopyFault { meta_ptr },
     }
@@ -1133,6 +1137,18 @@ pub mod recv_shared_v3 {
 
     /// Minimum byte length of a v3 output record.
     pub const V3_MIN_OUTPUT_LEN: u32 = 80;
+
+    /// Minimum output length when live mapping is requested (`map_intent != 0`).
+    ///
+    /// Covers all mapping fields through `cleanup_token @112`.  Callers that
+    /// provide fewer than this many bytes while requesting mapping receive
+    /// `InvalidArgs`.  The extra bytes (through @119) are written as zero.
+    pub const V3_LIVE_OUTPUT_LEN: u32 = 120;
+
+    /// Actual mapping permission value for read-only mappings (output field).
+    pub const MAP_PERM_READ_ONLY: u32 = 1;
+    /// Actual mapping permission value for read-write mappings (output field).
+    pub const MAP_PERM_READ_WRITE: u32 = 3;
 
     /// Map intent flag: map the transferred region read-only.
     pub const MAP_READ: u32 = 0x1;
