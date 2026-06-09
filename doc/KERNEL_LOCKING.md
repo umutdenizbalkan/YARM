@@ -10700,10 +10700,92 @@ then calls `recv_v3_exact_object_size(kernel, cap.object)` separately.
 - For plain messages (no cap transferred) → 0.
 - The value is always a non-zero multiple of PAGE_SIZE when a MemoryObject was transferred.
 
-### 62.6 FUTURE / remaining blockers
+### 62.6 FUTURE / remaining blockers (resolved in Stage 50+51)
 
-- `exact_region_len` (sub-region exact length for DmaRegion / shared mapping) — Stage 50+.
-- `map_intent` / shared-memory mapping — Stage 50+.
+- `exact_region_len` for DmaRegion implemented in Stage 50+51 (see §63).
+- No production service loop uses recv_shared_v3.
+- `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.
+
+## §63 Stage 50+51: exact_region_len for DmaRegion transfers + map_intent audit
+
+### 63.1 Goal
+
+Fill `exact_region_len @80..88` in the `RecvSharedV3Output` extended buffer when the
+transferred cap resolves to a `CapObject::DmaRegion`.  All other cap kinds and plain
+messages get 0.  The field is outside the 80-byte minimum buffer — it is written only
+when the caller provides at least 88 bytes in `metadata_len`.
+
+Document map_intent blockers; keep the `map_intent != 0 → InvalidArgs` gate unchanged.
+
+### 63.2 Authoritative size source
+
+`DmaRegion.len: u64` is embedded directly in `CapObject::DmaRegion { id, offset, len }`.
+No registry lookup is needed — the length is the authoritative sub-region extent stored at
+`mint_dma_region_cap` time.  The value is always a non-zero PAGE_SIZE-multiple (enforced
+in `mint_dma_region_cap_for_task`: `!len.is_multiple_of(PAGE_SIZE) || len == 0 → Misaligned`).
+
+DmaRegion caps can be transferred via plain IPC cap-transfer (no shared region):
+`validate_transfer_record_metadata` returns `Ok(())` immediately when `shared_region = None`.
+
+### 63.3 Kernel implementation
+
+**`recv_v3_exact_region_len(obj: CapObject) -> u64`:**
+- Pattern-matches on `CapObject::DmaRegion { len, .. }` — returns 0 for all other variants.
+- No lock needed — `len` is stored inline in the CapObject.
+
+**`write_v3_output_to_user`:**
+- New `exact_region_len: u64` parameter.
+- Buffer extended from `[0u8; 80]` to `[0u8; 88]`.
+- Writes `out[80..88]` with `exact_region_len`.
+- Write length: `min(out_len as usize, 88)` so 80-byte callers receive only 80 bytes
+  (unchanged behaviour); 88-byte callers additionally receive `exact_region_len`.
+- `RECV_V3_EXTENDED_OUTPUT_LEN = 88` added to `yarm-ipc-abi` ABI crate.
+
+**`handle_recv_shared_v3` OK path:**
+Metadata computation tuple extended from 4 elements to 5:
+`(obj_kind, obj_gen, eff_rights, exact_obj_size, exact_reg_len)`.
+
+### 63.4 map_intent audit (blockers, gate unchanged)
+
+The gate `if req.map_intent != 0 { return Err(SyscallError::InvalidArgs); }` at
+`syscall.rs` ~line 4206 remains in place.  Full mapping requires:
+
+1. VA selection field missing from current ABI.
+2. Per-mapping cleanup on cap revoke — unaudited.
+3. Output fields beyond @88 need further buffer extension.
+4. Atomicity/rollback of mapping vs cap transfer undefined.
+
+No production service loop uses `map_intent`.
+
+### 63.5 Proven assertions (mod stage50 in src/kernel/boot/tests.rs)
+
+**A. Primary proof (DmaRegion, 88-byte buffer):**
+- `object_kind @40 == 0xFF` (DmaRegion has no dedicated kind discriminant — falls through to Other)
+- `exact_region_len @80..88 == PAGE_SIZE` (1-page DmaRegion via `mint_dma_region_cap`)
+
+**B. Negative proof (MemoryObject, 88-byte buffer):**
+- `exact_object_size @64 == PAGE_SIZE` (MemoryObject has exact_object_size)
+- `exact_region_len @80..88 == 0`
+
+**C. Negative proof (plain message, 88-byte buffer):**
+- `exact_region_len == 0`
+
+**D+E. map_intent gate still enforced:**
+- `map_intent = RECV_V3_MAP_READ → InvalidArgs`
+- `map_intent = RECV_V3_MAP_READ | RECV_V3_MAP_WRITE → InvalidArgs`
+
+### 63.6 ABI semantics (frozen)
+
+- `exact_region_len` is authoritative for `CapObject::DmaRegion` only.
+- For MemoryObject, Endpoint, Notification, ReplyCap, Other → 0.
+- For plain messages (no cap transferred) → 0.
+- Only present when `metadata_len >= RECV_V3_EXTENDED_OUTPUT_LEN (88)`.
+- The value is always a non-zero multiple of PAGE_SIZE when a DmaRegion was transferred.
+- DmaRegion maps to `object_kind = 0xFF (Other)` in the current ABI.
+
+### 63.7 FUTURE / remaining blockers
+
+- `map_intent` / shared-memory mapping — blocked (see §63.4).
 - `cleanup_token` — future.
 - No production service loop uses recv_shared_v3.
 - `SYSCALL_COUNT == 31` unchanged. No new syscall numbers.
