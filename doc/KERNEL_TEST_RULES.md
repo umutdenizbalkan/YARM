@@ -3920,7 +3920,7 @@ cleanup/rollback paths, WRITE-only rejected, MAP_READ regression unaffected.
 - WRITE-only (map_intent=0x2) must remain invalid (rejected by `validate_v3_request`).
 - Rights enforcement must remain in `compute_recv_v3_mapping_plan`, not in syscall.rs.
 - `ActiveTransferMapping` must carry no permission field; cleanup path must be perm-agnostic.
-- `VFS_READ_SHARED_REPLY_ENABLED` and `VFS_SHARED_IO_ENABLED` must remain `false`.
+- `VFS_READ_SHARED_REPLY_ENABLED` enabled to `true` by Stage 73; `VFS_SHARED_IO_ENABLED` must remain `false`.
 - SYSCALL_COUNT=31, NR30, NR4 must not change.
 
 **Run commands:**
@@ -3932,3 +3932,54 @@ cleanup/rollback paths, WRITE-only rejected, MAP_READ regression unaffected.
 - `cargo check --no-default-features` (no errors)
 - `cargo check -p yarm-fs-servers` (no errors)
 - `cargo test -p yarm-fs-servers shared_io --lib` (regression)
+
+---
+
+## Rule N+66 — Stage 73+74: RequesterExit helper model + VFS_READ_SHARED_REPLY_ENABLED
+
+**Purpose:** Prove the VFS-side `deliver_requester_exit` lifecycle invariants and confirm
+that `VFS_READ_SHARED_REPLY_ENABLED = true` is safe to enable: dispatch handles RW-perm
+buffers, rejects RO-perm, delivers short-EOF, and calls cleanup exactly once.
+
+**Modules:**
+- `mod stage73` in `crates/yarm-fs-servers/src/fs/common/shared_io_lifecycle.rs` (7 lifecycle tests)
+- `mod stage73_74_tests` in `crates/yarm-fs-servers/src/fs/common/vfs_service.rs` (9 dispatch tests)
+
+**Lifecycle tests (`mod stage73`, 7 total):**
+- `stage73_requester_exit_before_completion_wins` — RequesterExit during Active → `Cleaned`
+- `stage73_duplicate_requester_exit_is_idempotent` — double exit → `AlreadyCleaned`
+- `stage73_success_cleanup_beats_requester_exit` — success cleanup blocks later RequesterExit
+- `stage73_backend_error_beats_requester_exit` — error cleanup blocks later RequesterExit
+- `stage73_requester_exit_blocks_inline_fallback` — exit prevents `begin_inline_fallback`
+- `stage73_requester_exit_from_reserved_state` — Reserved-state exit is safe no-op
+- `stage73_handle_generation_advances_after_requester_exit` — generation counter advances
+
+**Dispatch tests (`mod stage73_74_tests`, 9 total):**
+- `stage74_vfs_read_shared_reply_enabled` — `VFS_READ_SHARED_REPLY_ENABLED == true`
+- `stage74_vfs_shared_io_still_disabled` — `VFS_SHARED_IO_ENABLED == false`
+- `stage74_write_shared_request_still_disabled` — `VFS_WRITE_SHARED_REQUEST_ENABLED == false`
+- `stage74_handle_request_rejects_read_shared_opcode` — `handle_request` → `Unsupported`
+- `stage74_read_shared_reply_with_kernel_rw_perm_delivers_bytes` — perm=3, RW buffer → bytes
+- `stage74_read_shared_reply_short_eof` — bytes_read ≤ requested (EOF case)
+- `stage74_read_shared_reply_cleanup_exactly_once` — release_count=1 after success
+- `stage74_read_shared_reply_readonly_perm_rejected` — perm=1 → `PermissionDenied`
+- `stage74_write_shared_request_regression` — `VFS_OP_WRITE_SHARED_REQUEST` still `Unsupported`
+
+**Hard invariants:**
+- `deliver_requester_exit` must be a thin wrapper over `cleanup(handles, RequesterExit)`.
+- Double RequesterExit must return `AlreadyCleaned` (idempotent — no panic, no double-free).
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (Stage 73); do not revert without re-auditing prerequisites.
+- `VFS_SHARED_IO_ENABLED = false`; do not enable until live `SUPERVISOR_OP_TASK_EXITED` wiring is proven.
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = false`; do not enable without separate stage.
+- `handle_request` must continue to reject `VFS_OP_READ_SHARED_REPLY` with `Unsupported`.
+- No Drop-based cleanup may be added.
+- SYSCALL_COUNT=31, NR30, NR4 must not change.
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --lib stage73 -- --test-threads=1` (7 lifecycle tests)
+- `cargo test -p yarm-fs-servers --lib stage73_74 -- --test-threads=1` (9 dispatch tests)
+- `cargo test -p yarm-fs-servers --lib -- --test-threads=1` (full 277-test regression)
+- `cargo test --lib stage72 -- --test-threads=1` (kernel regression)
+- `cargo test --lib stage60 -- --test-threads=1` (kernel regression)
+- `cargo check --no-default-features` (no errors)
+- `cargo check -p yarm-fs-servers` (no errors)

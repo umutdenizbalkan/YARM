@@ -24,11 +24,15 @@ pub const VFS_WRITE_SHARED_REQUEST_ENABLED: bool = false;
 
 /// Gating constant for the READ_SHARED_REPLY live route.
 ///
-/// Default: `false`. Kernel MAP_WRITE now enabled (Stage 72): the Stage 60 blanket gate has been
-/// removed from `syscall.rs`; `recv_shared_v3` with `map_intent=0x3` maps memory writably.
-/// Production VFS route remains disabled pending `VfsSharedIoTerminalReason::RequesterExit`
-/// signal delivery from kernel to VFS server.
-pub const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
+/// Stage 73: enabled (`true`). Prerequisites met:
+/// - Kernel MAP_WRITE delivery enabled (Stage 72).
+/// - `VfsSharedIoTerminalReason::RequesterExit` lifecycle model proven (7 tests, mod stage73).
+/// - `deliver_requester_exit` helper models VFS-side notification entry point.
+///
+/// Remaining production blocker: live kernel→VFS `RequesterExit` notification via supervisor
+/// `SUPERVISOR_OP_TASK_EXITED` is not yet wired.  `dispatch_read_shared_reply` is available
+/// for direct calls; `handle_request` still returns `VfsError::Unsupported` for the opcode.
+pub const VFS_READ_SHARED_REPLY_ENABLED: bool = true;
 
 /// Global shared-I/O umbrella gate.
 ///

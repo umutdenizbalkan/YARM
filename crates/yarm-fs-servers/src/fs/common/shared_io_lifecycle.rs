@@ -309,6 +309,22 @@ impl VfsSharedIoLifecycle {
         Ok(VfsSharedIoCleanupResult::Won(reason))
     }
 
+    /// Delivers a helper-only requester-exit notification to this lifecycle state machine.
+    ///
+    /// This is the VFS-side entry point for `VfsSharedIoTerminalReason::RequesterExit`.
+    /// In production it would be triggered by a supervisor `SUPERVISOR_OP_TASK_EXITED`
+    /// notification correlated to an active `cleanup_token`; in Stage 73 tests it is
+    /// called directly.  The caller is responsible for releasing any mapper resources
+    /// via `cleanup_shared_io` if a live mapper was acquired.
+    ///
+    /// Idempotent: returns `AlreadyCleaned` if cleanup already ran.
+    pub fn deliver_requester_exit<const N: usize>(
+        &mut self,
+        handles: &mut VfsSharedIoHandleTable<N>,
+    ) -> Result<VfsSharedIoCleanupResult, VfsSharedIoLifecycleError> {
+        self.cleanup(handles, VfsSharedIoTerminalReason::RequesterExit)
+    }
+
     pub fn begin_inline_fallback(&mut self) -> Result<(), VfsSharedIoLifecycleError> {
         if self.state != VfsSharedIoState::Cleaned {
             return Err(VfsSharedIoLifecycleError::FallbackBeforeCleanup);
@@ -556,6 +572,128 @@ mod tests {
         assert_eq!(
             request.terminal_reason(),
             Some(VfsSharedIoTerminalReason::RequesterExit)
+        );
+    }
+
+    // ── Stage 73: RequesterExit helper-only notification model ───────────────
+
+    #[test]
+    fn stage73_requester_exit_before_completion_wins() {
+        // Process exits while I/O is in-flight (server has not yet replied).
+        // deliver_requester_exit must win cleanup and terminate with RequesterExit.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle(&mut handles, VfsSharedIoDirection::ReadReply, 0, 16);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        assert_eq!(request.state(), VfsSharedIoState::InFlight);
+        let result = request.deliver_requester_exit(&mut handles).expect("deliver");
+        assert_eq!(result, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit));
+        assert_eq!(request.state(), VfsSharedIoState::Cleaned);
+        assert_eq!(request.terminal_reason(), Some(VfsSharedIoTerminalReason::RequesterExit));
+    }
+
+    #[test]
+    fn stage73_duplicate_requester_exit_is_idempotent() {
+        // Calling deliver_requester_exit twice must not panic and must return AlreadyCleaned.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle(&mut handles, VfsSharedIoDirection::ReadReply, 0, 8);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        let first = request.deliver_requester_exit(&mut handles).expect("first");
+        let second = request.deliver_requester_exit(&mut handles).expect("second idempotent");
+        assert_eq!(first, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit));
+        assert_eq!(second, VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::RequesterExit));
+    }
+
+    #[test]
+    fn stage73_success_cleanup_beats_requester_exit() {
+        // Server completes and explicit Success cleanup runs before RequesterExit arrives.
+        // RequesterExit must return AlreadyCleaned(Success).
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle(&mut handles, VfsSharedIoDirection::ReadReply, 0, 8);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        request.complete(8).expect("complete");
+        let first = request
+            .cleanup(&mut handles, VfsSharedIoTerminalReason::Success)
+            .expect("success cleanup");
+        let exit = request.deliver_requester_exit(&mut handles).expect("exit after success");
+        assert_eq!(first, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::Success));
+        assert_eq!(exit, VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::Success));
+    }
+
+    #[test]
+    fn stage73_backend_error_beats_requester_exit() {
+        // Backend error cleanup runs before RequesterExit notification arrives.
+        // RequesterExit must return AlreadyCleaned(BackendError).
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle(&mut handles, VfsSharedIoDirection::WriteRequest, 0, 8);
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        let first = request
+            .cleanup(&mut handles, VfsSharedIoTerminalReason::BackendError)
+            .expect("backend error cleanup");
+        let exit = request.deliver_requester_exit(&mut handles).expect("exit after error");
+        assert_eq!(first, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::BackendError));
+        assert_eq!(exit, VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::BackendError));
+    }
+
+    #[test]
+    fn stage73_requester_exit_blocks_inline_fallback() {
+        // RequesterExit terminal reason must prevent inline fallback, even with the
+        // F_ALLOW_INLINE_FALLBACK flag set.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle(
+            &mut handles,
+            VfsSharedIoDirection::ReadReply,
+            VFS_SHARED_IO_F_ALLOW_INLINE_FALLBACK,
+            8,
+        );
+        request.map(&handles).expect("map");
+        request.begin().expect("begin");
+        request.deliver_requester_exit(&mut handles).expect("exit");
+        assert_eq!(request.state(), VfsSharedIoState::Cleaned);
+        assert_eq!(
+            request.begin_inline_fallback(),
+            Err(VfsSharedIoLifecycleError::FallbackNotAllowed),
+            "RequesterExit must block inline fallback"
+        );
+    }
+
+    #[test]
+    fn stage73_requester_exit_from_reserved_state() {
+        // deliver_requester_exit must work even before map()/begin() are called.
+        // This covers the case where the process exits immediately after initiating I/O.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (_, mut request) = lifecycle(&mut handles, VfsSharedIoDirection::ReadReply, 0, 8);
+        assert_eq!(request.state(), VfsSharedIoState::Reserved);
+        let result = request.deliver_requester_exit(&mut handles).expect("exit from reserved");
+        assert_eq!(result, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit));
+        assert_eq!(request.state(), VfsSharedIoState::Cleaned);
+    }
+
+    #[test]
+    fn stage73_handle_generation_advances_after_requester_exit() {
+        // After deliver_requester_exit the old descriptor's handle slot is released
+        // and the generation advances.  A new allocation reuses the slot with a
+        // higher generation.
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let (old_handle, mut request) =
+            lifecycle(&mut handles, VfsSharedIoDirection::ReadReply, 0, 8);
+        let old_descriptor = descriptor(old_handle, VFS_SHARED_BUFFER_FS_WRITE, 8);
+        request.deliver_requester_exit(&mut handles).expect("exit");
+        // Old descriptor must no longer validate.
+        assert_eq!(
+            handles.validate(old_descriptor),
+            Err(VfsSharedIoLifecycleError::StaleHandle),
+            "old descriptor must be stale after RequesterExit"
+        );
+        // New allocation reuses slot with bumped generation.
+        let new_handle = handles.allocate().expect("reuse slot");
+        assert_eq!(new_handle.object_handle, old_handle.object_handle, "same slot reused");
+        assert_ne!(
+            new_handle.object_generation, old_handle.object_generation,
+            "generation must advance"
         );
     }
 }

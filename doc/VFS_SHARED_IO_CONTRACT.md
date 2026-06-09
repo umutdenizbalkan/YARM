@@ -673,11 +673,11 @@ route for WRITE_SHARED_REQUEST. No global enable occurs. READ_SHARED_REPLY remai
 | Constant | Value | Meaning |
 |---|---|---|
 | `VFS_WRITE_SHARED_REQUEST_ENABLED` | `false` | WRITE_SHARED_REQUEST live route gate |
-| `VFS_READ_SHARED_REPLY_ENABLED` | `false` | READ_SHARED_REPLY gate — blocked by MAP_WRITE |
+| `VFS_READ_SHARED_REPLY_ENABLED` | `true` (Stage 73) | READ_SHARED_REPLY gate — enabled; live notification still helper-only |
 | `VFS_SHARED_IO_ENABLED` | `false` | Aggregate umbrella — `WRITE && READ`, so `false` |
 
 `VFS_SHARED_IO_ENABLED` is only `true` when both direction gates are `true`. Since
-`VFS_READ_SHARED_REPLY_ENABLED` is blocked by the Stage 60 RW gate, the umbrella remains `false`.
+`VFS_WRITE_SHARED_REQUEST_ENABLED` remains `false`, the umbrella remains `false`.
 
 ### Live route: `VfsService::dispatch_write_shared_request`
 
@@ -808,9 +808,11 @@ The method performs:
 
 - `handle_request` still rejects `VFS_OP_READ_SHARED_REPLY` with `Unsupported`.
 - `handle_request` still rejects `VFS_OP_WRITE_SHARED_REQUEST` with `Unsupported`.
-- Stage 60 kernel MAP_WRITE gate untouched.
-- `VFS_READ_SHARED_REPLY_ENABLED = false` (unchanged).
-- `VFS_SHARED_IO_ENABLED = false` (unchanged).
+- Stage 60 kernel MAP_WRITE gate removed by Stage 72; `compute_recv_v3_mapping_plan` now
+  enforces rights (MAP+READ+WRITE required for RW mapping; InsufficientRights → InvalidArgs).
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (enabled Stage 73; prerequisites: Stage 72 MAP_WRITE
+  delivery + `deliver_requester_exit` helper model proven with 7 lifecycle tests).
+- `VFS_SHARED_IO_ENABLED = false` (unchanged — WRITE direction still disabled).
 - FAT/ext4/blkcache production read behavior unchanged.
 - No runtime spawn/policy changes.
 
@@ -843,16 +845,20 @@ Total `yarm-fs-servers` tests after Stage 69+70: **261** (up from 245).
    ~~receive exits~~ **CONFIRMED (Stage 71)**: the kernel cleanup path
    `mark_task_dead` → `maybe_cleanup_process_cnode_for_pid` →
    `purge_active_transfer_mappings_for_pid` exists and is proven correct (9 tests in
-   `mod stage71`).  The remaining work is kernel-side delivery of
-   `VfsSharedIoTerminalReason::RequesterExit` to the VFS server so it can call
-   `dispatch_read_shared_reply` / `mapper.release` to drain its side of the mapping.
+   `mod stage71`).  VFS-side model: `VfsSharedIoLifecycle::deliver_requester_exit` added
+   (Stage 73); lifecycle invariants proven (7 tests).  Remaining production work: live
+   kernel→VFS notification via supervisor `SUPERVISOR_OP_TASK_EXITED`.
 2. **Live MAP_WRITE delivery** — ~~the Stage 60 gate must be removed~~ **ENABLED (Stage 72)**:
    the Stage 60 blanket WRITE gate has been removed from `syscall.rs`.  `recv_shared_v3` with
    `map_intent=0x3` now maps memory writably when the transferred cap carries `CAP_RIGHT_WRITE`.
    Rights enforcement lives in `compute_recv_v3_mapping_plan`; WRITE-only (0x2) is rejected by
    `validate_v3_request`.  Cleanup/rollback paths are identical to MAP_READ.  9 kernel tests in
-   `mod stage72` prove the new behaviour.  Remaining work: `RequesterExit` signal delivery path.
-3. **Object introspection in production** — `read_shared_bytes` must validate `effective_rights`
+   `mod stage72` prove the new behaviour.
+3. **READ_SHARED_REPLY gate** — ~~blocked pending MAP_WRITE~~ **ENABLED (Stage 73)**:
+   `VFS_READ_SHARED_REPLY_ENABLED = true`.  `dispatch_read_shared_reply` is available for direct
+   calls.  `handle_request` still returns `VfsError::Unsupported` for the opcode (by design).
+   Production blocker: live `RequesterExit` notification (see blocker 1 above).
+4. **Object introspection in production** — `read_shared_bytes` must validate `effective_rights`
    in a production mapper before writing into the caller's buffer.
-4. **Cap revocation** — the helper uses an opaque `object_handle`; a production path must hold
-   and eventually revoke the kernel capability after use.
+5. **Cap revocation** — the helper uses an opaque `object_handle`; a production path must hold
+   and eventually revoke the kernel capability after use (via `TransferRelease` syscall).

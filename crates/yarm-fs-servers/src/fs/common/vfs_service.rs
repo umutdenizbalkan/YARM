@@ -833,9 +833,11 @@ mod stage66_68_tests {
 
     #[test]
     fn stage68_read_shared_reply_gate_disabled_by_default() {
+        // Stage 73 enabled VFS_READ_SHARED_REPLY_ENABLED after proving the RequesterExit
+        // lifecycle model (deliver_requester_exit helper + 7 tests).
         assert!(
-            !VFS_READ_SHARED_REPLY_ENABLED,
-            "VFS_READ_SHARED_REPLY_ENABLED must be false by default"
+            VFS_READ_SHARED_REPLY_ENABLED,
+            "VFS_READ_SHARED_REPLY_ENABLED must be true after Stage 73"
         );
     }
 
@@ -877,7 +879,7 @@ mod stage69_70_tests {
     const MAPPED_BASE: u64 = 0x2000;
     const MAPPED_LEN: u64 = 4096;
     const REGION_LEN: u64 = 4096;
-    // MAP_WRITE | MAP_READ — simulated; kernel gate still rejects actual map_intent=3.
+    // MAP_WRITE | MAP_READ — kernel MAP_WRITE gate removed by Stage 72; now live-deliverable.
     const PERM_RW: u32 = 3;
 
     fn read_request(fd: u64, len: u64) -> VfsReadSharedRequest {
@@ -926,9 +928,8 @@ mod stage69_70_tests {
 
     #[test]
     fn stage69_audit_map_write_gate_remains_blocking() {
-        // Stage 60 kernel MAP_WRITE gate: hard-rejects map_intent & 0x2 != 0.
-        // We prove the binding requires perm & 0x2 != 0, confirming no live kernel delivery
-        // can reach this path while the gate is intact.
+        // Stage 72 removed the Stage 60 WRITE gate, but VfsReadSharedBinding still requires
+        // actual_mapping_perm & WRITE != 0. A MAP_READ-only delivery (perm=1) is always rejected.
         use crate::fs::common::shared_io_adapter::{
             VfsReadSharedBinding, VfsReadSharedBindingError,
         };
@@ -936,13 +937,13 @@ mod stage69_70_tests {
         // actual_mapping_perm = 1 (MAP_READ only) — no WRITE bit → MappingNotWritable
         let result = VfsReadSharedBinding::validate(
             TOKEN, CAP, KIND_DMA, REGION_LEN, MAPPED_BASE, MAPPED_LEN,
-            1, // MAP_READ only; kernel gate blocks perm=3 from ever arriving
+            1, // MAP_READ only — binding always rejects; READ_SHARED_REPLY requires write perm
             &req,
         );
         assert_eq!(
             result.err(),
             Some(VfsReadSharedBindingError::MappingNotWritable),
-            "binding must reject MAP_READ-only perm — kernel gate means perm=3 never arrives"
+            "binding must reject MAP_READ-only perm even after Stage 72 removed the kernel gate"
         );
     }
 
@@ -984,8 +985,9 @@ mod stage69_70_tests {
 
     #[test]
     fn stage69_gate_values_all_false() {
+        // Stage 73 enabled VFS_READ_SHARED_REPLY_ENABLED; WRITE direction and umbrella still false.
         assert!(!VFS_WRITE_SHARED_REQUEST_ENABLED);
-        assert!(!VFS_READ_SHARED_REPLY_ENABLED);
+        assert!(VFS_READ_SHARED_REPLY_ENABLED);
         assert!(!VFS_SHARED_IO_ENABLED);
     }
 
@@ -1213,5 +1215,209 @@ mod shared_io_dispatch_tests {
             VfsService::<InMemoryBackend>::parse_request(inline),
             Err(VfsError::Unsupported)
         ));
+    }
+}
+
+#[cfg(test)]
+mod stage73_74_tests {
+    //! Stage 73+74 — RequesterExit helper-only model proof + gated VFS_READ_SHARED_REPLY path.
+    //!
+    //! A. Gate status: VFS_READ_SHARED_REPLY_ENABLED=true, VFS_SHARED_IO_ENABLED=false.
+    //! B. handle_request still returns Unsupported for the READ_SHARED_REPLY opcode.
+    //! C. dispatch_read_shared_reply full RAMFS roundtrip with kernel-live MAP_WRITE perm=3.
+    //! D. EOF short-read, exactly-once cleanup, readonly-perm rejected.
+    //! E. WRITE_SHARED_REQUEST regression unaffected.
+
+    use super::*;
+    use crate::fs::common::shared_io_adapter::{
+        BorrowedSharedIoTestMapper, VFS_READ_SHARED_REPLY_ENABLED,
+        VFS_SHARED_IO_ENABLED, VFS_WRITE_SHARED_REQUEST_ENABLED,
+    };
+    use crate::fs::common::vfs_ipc::read_shared_message;
+    use crate::fs::ramfs::tree::RamFsBackend;
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_SHARED_BUFFER_FS_WRITE, VFS_SHARED_IO_STATUS_OK,
+        VfsReadSharedRequest, VfsSharedBufferDescriptor,
+    };
+
+    // Distinct TOKEN from stage66-70 to avoid any slot collision in future refactors.
+    const TOKEN: u64 = 0x0005_0004; // gen=5, slot=4
+    const CAP: u64 = 17;
+    const KIND_DMA: u32 = 5;
+    const MAPPED_BASE: u64 = 0x4000;
+    const MAPPED_LEN: u64 = 4096;
+    const REGION_LEN: u64 = 4096;
+    // Stage 72 removed the WRITE gate; perm=3 can now arrive from a real recv_shared_v3 call.
+    const PERM_RW: u32 = 3;
+
+    fn read_request(fd: u64, len: u64) -> VfsReadSharedRequest {
+        VfsReadSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: len,
+            request_id: 1,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(
+                TOKEN,
+                TOKEN >> 16,
+                0,
+                len,
+                VFS_SHARED_BUFFER_FS_WRITE,
+            ),
+        }
+    }
+
+    fn ramfs_svc_with_content(path: &[u8], content: &[u8]) -> (VfsService<RamFsBackend>, u64) {
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(path).expect("create");
+        let fd = svc.backend_mut().open_path(path).expect("open write");
+        svc.backend_mut().write_bytes(fd, content).expect("seed");
+        svc.backend_mut().close_fd(fd).expect("close seed");
+        let fd = svc.backend_mut().open_path(path).expect("open read");
+        (svc, fd)
+    }
+
+    // ── A. Gate status ────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage74_vfs_read_shared_reply_enabled() {
+        assert!(
+            VFS_READ_SHARED_REPLY_ENABLED,
+            "VFS_READ_SHARED_REPLY_ENABLED must be true after Stage 73"
+        );
+    }
+
+    #[test]
+    fn stage74_vfs_shared_io_still_disabled() {
+        // Umbrella stays false: VFS_WRITE_SHARED_REQUEST_ENABLED is still false.
+        assert!(
+            !VFS_SHARED_IO_ENABLED,
+            "VFS_SHARED_IO_ENABLED must remain false until both direction gates pass"
+        );
+    }
+
+    #[test]
+    fn stage74_write_shared_request_still_disabled() {
+        assert!(
+            !VFS_WRITE_SHARED_REQUEST_ENABLED,
+            "VFS_WRITE_SHARED_REQUEST_ENABLED must remain false"
+        );
+    }
+
+    // ── B. handle_request still Unsupported ──────────────────────────────────
+
+    #[test]
+    fn stage74_handle_request_rejects_read_shared_opcode() {
+        let msg = read_shared_message(read_request(1, 8)).expect("msg");
+        assert_eq!(
+            VfsService::<InMemoryBackend>::parse_request(msg),
+            Err(VfsError::Unsupported),
+            "handle_request must not dispatch VFS_OP_READ_SHARED_REPLY even after Stage 73"
+        );
+    }
+
+    // ── C. dispatch_read_shared_reply full roundtrip ──────────────────────────
+
+    #[test]
+    fn stage74_read_shared_reply_with_kernel_rw_perm_delivers_bytes() {
+        // Stage 72 removed the WRITE gate; perm=3 is now live-deliverable from
+        // recv_shared_v3.  Prove end-to-end: bytes from RAMFS are written into buffer.
+        let (mut svc, fd) = ramfs_svc_with_content(b"/stage74a", b"stage74!");
+        let mut buf = [0u8; 8];
+        let mut mapper = BorrowedSharedIoTestMapper::new(TOKEN, TOKEN >> 16, &mut buf);
+        let reply = svc
+            .dispatch_read_shared_reply(
+                read_request(fd, 8),
+                TOKEN, CAP, KIND_DMA, REGION_LEN, MAPPED_BASE, MAPPED_LEN, PERM_RW,
+                &mut mapper,
+            )
+            .expect("dispatch must succeed with perm=3");
+        assert_eq!(reply.request_id, 1);
+        assert_eq!(reply.bytes_completed, 8);
+        assert_eq!(reply.status, VFS_SHARED_IO_STATUS_OK);
+        drop(mapper);
+        assert_eq!(&buf, b"stage74!");
+    }
+
+    // ── D. Edge cases ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage74_read_shared_reply_short_eof() {
+        // File has 5 bytes; request 8 → bytes_completed = 5 (EOF short read).
+        let (mut svc, fd) = ramfs_svc_with_content(b"/stage74b", b"short");
+        let mut buf = [0u8; 8];
+        let mut mapper = BorrowedSharedIoTestMapper::new(TOKEN, TOKEN >> 16, &mut buf);
+        let reply = svc
+            .dispatch_read_shared_reply(
+                read_request(fd, 8),
+                TOKEN, CAP, KIND_DMA, REGION_LEN, MAPPED_BASE, MAPPED_LEN, PERM_RW,
+                &mut mapper,
+            )
+            .expect("dispatch");
+        assert_eq!(reply.bytes_completed, 5);
+        assert_eq!(reply.status, VFS_SHARED_IO_STATUS_OK);
+        drop(mapper);
+        assert_eq!(&buf[..5], b"short");
+    }
+
+    #[test]
+    fn stage74_read_shared_reply_cleanup_exactly_once() {
+        let (mut svc, fd) = ramfs_svc_with_content(b"/stage74c", b"once74_!");
+        let mut buf = [0u8; 8];
+        let mut mapper = BorrowedSharedIoTestMapper::new(TOKEN, TOKEN >> 16, &mut buf);
+        svc.dispatch_read_shared_reply(
+            read_request(fd, 8),
+            TOKEN, CAP, KIND_DMA, REGION_LEN, MAPPED_BASE, MAPPED_LEN, PERM_RW,
+            &mut mapper,
+        )
+        .expect("dispatch");
+        assert_eq!(mapper.release_count(), 1, "release must be called exactly once");
+    }
+
+    #[test]
+    fn stage74_read_shared_reply_readonly_perm_rejected() {
+        // actual_mapping_perm=1 (MAP_READ only) must be rejected by VfsReadSharedBinding.
+        let (mut svc, fd) = ramfs_svc_with_content(b"/stage74d", b"xxxxxxxx");
+        let mut buf = [0u8; 8];
+        let mut mapper = BorrowedSharedIoTestMapper::new(TOKEN, TOKEN >> 16, &mut buf);
+        let result = svc.dispatch_read_shared_reply(
+            read_request(fd, 8),
+            TOKEN, CAP, KIND_DMA, REGION_LEN, MAPPED_BASE, MAPPED_LEN,
+            1, // MAP_READ only — VfsReadSharedBinding requires WRITE bit
+            &mut mapper,
+        );
+        assert!(result.is_err(), "MAP_READ-only perm must be rejected");
+    }
+
+    // ── E. WRITE_SHARED_REQUEST regression ────────────────────────────────────
+
+    #[test]
+    fn stage74_write_shared_request_regression() {
+        // dispatch_write_shared_request must be unaffected by Stage 73+74 changes.
+        use crate::fs::common::shared_io_adapter::BorrowedSharedIoTestMapper;
+        use yarm_ipc_abi::vfs_abi::{VFS_SHARED_BUFFER_FS_READ, VfsWriteSharedRequest};
+        let write_token: u64 = 0x0001_0001;
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/stage74e").expect("create");
+        let fd = svc.backend_mut().open_path(b"/stage74e").expect("open");
+        let mut storage = *b"reg74src";
+        let mut mapper = BorrowedSharedIoTestMapper::new(write_token, write_token >> 16, &mut storage);
+        let req = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 99,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(
+                write_token, write_token >> 16, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+            ),
+        };
+        let reply = svc
+            .dispatch_write_shared_request(
+                req, write_token, CAP, KIND_DMA, REGION_LEN, MAPPED_BASE, MAPPED_LEN, 1,
+                &mut mapper,
+            )
+            .expect("write dispatch must succeed");
+        assert_eq!(reply.bytes_completed, 8, "write regression: 8 bytes written");
     }
 }
