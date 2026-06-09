@@ -477,6 +477,21 @@ impl VfsBackend for RamFsBackend {
         }
     }
 
+    fn write_shared_bytes(&mut self, fd: u64, bytes: &[u8]) -> Result<u64, VfsError> {
+        match self.write_bytes(fd, bytes) {
+            Ok(written) => {
+                self.metrics.write_count = self.metrics.write_count.saturating_add(1);
+                self.metrics.bytes_written =
+                    self.metrics.bytes_written.saturating_add(written as u64);
+                Ok(written as u64)
+            }
+            Err(err) => {
+                self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+                Err(err.into())
+            }
+        }
+    }
+
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         match self.statx_path_value(path) {
             Ok(stat) => {

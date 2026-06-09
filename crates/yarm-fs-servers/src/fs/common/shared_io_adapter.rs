@@ -15,6 +15,25 @@ use yarm_ipc_abi::vfs_abi::{
     VFS_SHARED_BUFFER_FS_READ, VfsSharedBufferDescriptor, VfsWriteSharedRequest,
 };
 
+/// Gating constant for the WRITE_SHARED_REQUEST live route.
+///
+/// Default: `false`. Enabled only when a real mapper and process-exit/cancel signals exist.
+/// When false, `handle_request` still rejects WRITE_SHARED_REQUEST with `VfsError::Unsupported`.
+pub const VFS_WRITE_SHARED_REQUEST_ENABLED: bool = false;
+
+/// Gating constant for the READ_SHARED_REPLY live route.
+///
+/// Default: `false`. Blocked until MAP_WRITE is available (requires a new kernel ABI).
+/// The Stage 60 RW gate hard-rejects `map_intent & WRITE != 0`.
+pub const VFS_READ_SHARED_REPLY_ENABLED: bool = false;
+
+/// Global shared-I/O umbrella gate.
+///
+/// `true` only when BOTH directions are independently enabled. Not expected in this stage.
+/// Existing tests that assert `VFS_SHARED_IO_ENABLED == false` remain meaningful.
+pub const VFS_SHARED_IO_ENABLED: bool =
+    VFS_WRITE_SHARED_REQUEST_ENABLED && VFS_READ_SHARED_REPLY_ENABLED;
+
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::VFS_SHARED_BUFFER_FS_WRITE;
 

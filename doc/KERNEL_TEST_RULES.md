@@ -3761,3 +3761,48 @@ All tests must pass.
 - `cargo test -p yarm-user-rt --lib stage63` (4 user-rt regression)
 
 All tests must pass. `VFS_SHARED_IO_ENABLED` must remain disabled after this stage.
+
+---
+
+### Rule N+62 — Stage 66+67+68: gated WRITE_SHARED_REQUEST live route in VfsService
+
+**Crate:** `yarm-fs-servers`
+**Files:** `crates/yarm-fs-servers/src/fs/common/vfs_service.rs` (17 tests in `mod stage66_68_tests`);
+`crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs` (3 new constants);
+`crates/yarm-fs-servers/src/fs/ramfs/tree.rs` (`write_shared_bytes` override);
+`crates/yarm-srv-common/src/vfs_core.rs` (`write_shared_bytes` default method).
+
+**Coverage:** gated live dispatch route, RAMFS roundtrip proof, rejection coverage, invariant gates.
+
+**Live route tests (`mod stage66_68_tests`):**
+- `stage66_default_dispatch_still_rejects_write_shared_opcode`
+- `stage66_gated_dispatch_ramfs_write_shared_succeeds`
+- `stage66_gated_dispatch_bytes_written_match_file_contents`
+- `stage66_gated_dispatch_cleanup_performed_exactly_once`
+- `stage66_gated_dispatch_op_sequence_advances_on_success`
+- `stage66_gated_dispatch_missing_cleanup_token_rejected`
+- `stage66_gated_dispatch_stale_generation_rejected`
+- `stage66_gated_dispatch_wrong_object_handle_rejected`
+- `stage66_gated_dispatch_non_readonly_mapping_rejected`
+- `stage66_gated_dispatch_range_too_short_rejected`
+- `stage66_gated_dispatch_unsupported_production_mapper_rejected`
+- `stage66_gated_dispatch_cleanup_called_even_on_failed_write`
+- `stage67_read_shared_reply_still_unsupported_by_parse_request`
+- `stage68_write_shared_request_gate_disabled_by_default`
+- `stage68_read_shared_reply_gate_disabled_by_default`
+- `stage68_global_vfs_shared_io_disabled_by_default`
+- `stage68_global_gate_false_unless_both_direction_gates_true`
+
+**Gate constants:**
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = false` (WRITE direction only)
+- `VFS_READ_SHARED_REPLY_ENABLED = false` (blocked by MAP_WRITE)
+- `VFS_SHARED_IO_ENABLED = false` (aggregate = WRITE && READ)
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --lib stage66` (12 tests)
+- `cargo test -p yarm-fs-servers --lib stage6` (38 stage65+66+67+68 tests)
+- `cargo test -p yarm-fs-servers --lib` (245 total, full regression)
+- `cargo check -p yarm-fs-servers` (no errors)
+
+All tests must pass. `VFS_SHARED_IO_ENABLED` must remain `false`. `VFS_READ_SHARED_REPLY_ENABLED`
+must remain `false`. `handle_request` must continue to reject `VFS_OP_WRITE_SHARED_REQUEST`.

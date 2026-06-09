@@ -658,3 +658,77 @@ All 11 checks must pass. The first failing check returns immediately.
 - 1 `cleanup_token_parts()` correctness (`stage65_cleanup_token_parts_decompose_correctly`)
 
 Total `yarm-fs-servers` tests after Stage 65: **228** (up from 207).
+
+---
+
+## Stage 66+67+68 — Gated WRITE_SHARED_REQUEST live route in VfsService
+
+### Scope
+
+Stages 66+67+68 move VFS shared I/O from helper-only to a controlled, disabled-by-default live
+route for WRITE_SHARED_REQUEST. No global enable occurs. READ_SHARED_REPLY remains blocked.
+
+### Feature flag constants (in `shared_io_adapter.rs`)
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `VFS_WRITE_SHARED_REQUEST_ENABLED` | `false` | WRITE_SHARED_REQUEST live route gate |
+| `VFS_READ_SHARED_REPLY_ENABLED` | `false` | READ_SHARED_REPLY gate — blocked by MAP_WRITE |
+| `VFS_SHARED_IO_ENABLED` | `false` | Aggregate umbrella — `WRITE && READ`, so `false` |
+
+`VFS_SHARED_IO_ENABLED` is only `true` when both direction gates are `true`. Since
+`VFS_READ_SHARED_REPLY_ENABLED` is blocked by the Stage 60 RW gate, the umbrella remains `false`.
+
+### Live route: `VfsService::dispatch_write_shared_request`
+
+A new method `dispatch_write_shared_request<M: VfsSharedIoMapper>` is added to `VfsService<B>`.
+It is independent of `handle_request` — `handle_request` still rejects `VFS_OP_WRITE_SHARED_REQUEST`
+with `VfsError::Unsupported`.
+
+The method performs:
+1. `VfsWriteSharedBinding::validate()` — all 11 Stage 65 constraints enforced.
+2. `mapper.with_write_request_buffer(descriptor, len, |bytes| backend.write_shared_bytes(fd, bytes))`.
+3. `mapper.release(descriptor)` — cleanup unconditionally after access attempt.
+4. Returns `VfsWriteSharedReply { request_id, bytes_completed, status=OK, flags=0 }`.
+
+`backend.write_shared_bytes` is a new default method on `VfsBackend` (default: `Err(Unsupported)`).
+`RamFsBackend` overrides it to delegate to `write_bytes`, updating write metrics.
+
+### Production confirmations
+
+- `handle_request` rejects `VFS_OP_WRITE_SHARED_REQUEST` with `Unsupported` (unchanged).
+- `handle_request` rejects `VFS_OP_READ_SHARED_REPLY` with `Unsupported` (unchanged).
+- FAT/ext4/blkcache production write behavior unchanged.
+- No production service loops changed.
+- No runtime spawn/policy changes.
+
+### Test coverage
+
+17 `stage66_*` / `stage67_*` / `stage68_*` tests in `vfs_service.rs` (`mod stage66_68_tests`):
+
+- `stage66_default_dispatch_still_rejects_write_shared_opcode` — `handle_request` gate check
+- `stage66_gated_dispatch_ramfs_write_shared_succeeds` — RAMFS roundtrip
+- `stage66_gated_dispatch_bytes_written_match_file_contents` — file content verified
+- `stage66_gated_dispatch_cleanup_performed_exactly_once` — `release_count == 1`
+- `stage66_gated_dispatch_op_sequence_advances_on_success` — op_sequence tracking
+- `stage66_gated_dispatch_missing_cleanup_token_rejected` — `VfsError::Malformed`
+- `stage66_gated_dispatch_stale_generation_rejected` — `VfsError::PermissionDenied`
+- `stage66_gated_dispatch_wrong_object_handle_rejected` — `VfsError::PermissionDenied`
+- `stage66_gated_dispatch_non_readonly_mapping_rejected` — `VfsError::Malformed`
+- `stage66_gated_dispatch_range_too_short_rejected` — `VfsError::Malformed`
+- `stage66_gated_dispatch_unsupported_production_mapper_rejected` — `VfsError::Malformed`
+- `stage66_gated_dispatch_cleanup_called_even_on_failed_write` — no panic on failure
+- `stage67_read_shared_reply_still_unsupported_by_parse_request` — READ blocked
+- `stage68_write_shared_request_gate_disabled_by_default` — const assertion
+- `stage68_read_shared_reply_gate_disabled_by_default` — const assertion
+- `stage68_global_vfs_shared_io_disabled_by_default` — const assertion
+- `stage68_global_gate_false_unless_both_direction_gates_true` — aggregate logic
+
+Total `yarm-fs-servers` tests after Stage 66+67+68: **245** (up from 228).
+
+### Remaining blockers before global `VFS_SHARED_IO_ENABLED`
+
+1. **`READ_SHARED_REPLY` MAP_WRITE** — requires new kernel ABI; Stage 60 RW gate blocks.
+2. **Process-exit and timeout signals** — `VfsSharedIoTerminalReason::RequesterExit/ServerExit` exist in lifecycle; no kernel signal path.
+3. **Object introspection in production** — `write_shared_bytes` must validate `effective_rights` in production before granting access.
+4. **Cap revocation** — the current helper uses opaque `object_handle`; a production path must hold and eventually revoke the kernel capability after use.
