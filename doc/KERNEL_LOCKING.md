@@ -11631,3 +11631,52 @@ VFS_SHARED_IO_ENABLED            = false  // = WRITE && READ → aggregate; alwa
 - VFS_SHARED_IO_ENABLED = false
 - No Drop-based cleanup
 - FAT/ext4/blkcache production write behavior unchanged
+
+---
+
+## §73 Stage 69+70 — MAP_WRITE audit + READ_SHARED_REPLY helper/gated path
+
+### 73.1 Scope
+
+No kernel code changed. This section records the audit findings for MAP_WRITE and the
+implementation of the helper-only READ_SHARED_REPLY path in userspace.
+
+### 73.2 MAP_WRITE audit findings
+
+| Gap | Status |
+|---|---|
+| Stage 60 gate location | `syscall.rs` ~4266 — single line, intact |
+| MAP_PERM_READ_WRITE = 3 | Defined in `recv_core.rs`; unreachable via live delivery |
+| Writeback rollback | Present: unmap → remove registry → revoke cap (ordered) |
+| TransferRelease | Present: two-phase unmap + cap revocation |
+| Process-exit cleanup | **Not confirmed** — critical safety blocker |
+| NX enforcement | Hardcoded `execute: false`; unconditional |
+| Rights check | `cap_rights & CAP_RIGHT_WRITE` in planning; prevents escalation |
+
+**Verdict:** Stage 60 MAP_WRITE gate remains intact. The process-exit cleanup gap means a
+writable shared mapping could outlive a dead process. Gate removal requires:
+- Kernel sends `VfsSharedIoTerminalReason::RequesterExit` signal to VFS server on process exit.
+- VFS server calls `dispatch_read_shared_reply` / `mapper.release` on receiving the signal.
+
+### 73.3 New userspace symbols (no kernel change)
+
+- `VfsReadSharedBinding` (12 constraints, symmetric to `VfsWriteSharedBinding`)
+- `VfsReadSharedBindingError` (12 variants)
+- `VfsService::dispatch_read_shared_reply<M: VfsSharedIoMapper>` — helper-only, gated
+- `VfsBackend::read_shared_bytes` — new default method (returns `Unsupported`)
+- `RamFsBackend::read_shared_bytes` — overrides to delegate to `read_bytes` + metrics
+
+### 73.4 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- NR 30 = RecvSharedV3 (no change)
+- NR 4 = TransferRelease (no change)
+- All recv_shared_v3 ABI field offsets unchanged
+- MAP_WRITE not enabled — Stage 60 gate intact
+- `VFS_READ_SHARED_REPLY_ENABLED = false`
+- `VFS_SHARED_IO_ENABLED = false`
+- `handle_request` still rejects `VFS_OP_READ_SHARED_REPLY` with `Unsupported`
+- `handle_request` still rejects `VFS_OP_WRITE_SHARED_REQUEST` with `Unsupported`
+- No Drop-based cleanup added
+- FAT/ext4/blkcache production read/write behavior unchanged
+- No SpawnV5/Phase2B/Phase3B/startup slot changes

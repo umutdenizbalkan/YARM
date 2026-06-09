@@ -492,6 +492,20 @@ impl VfsBackend for RamFsBackend {
         }
     }
 
+    fn read_shared_bytes(&mut self, fd: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+        match self.read_bytes(fd, buf) {
+            Ok(read) => {
+                self.metrics.read_count = self.metrics.read_count.saturating_add(1);
+                self.metrics.bytes_read = self.metrics.bytes_read.saturating_add(read as u64);
+                Ok(read as u64)
+            }
+            Err(err) => {
+                self.metrics.error_count = self.metrics.error_count.saturating_add(1);
+                Err(err.into())
+            }
+        }
+    }
+
     fn statx_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
         match self.statx_path_value(path) {
             Ok(stat) => {

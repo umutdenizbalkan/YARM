@@ -732,3 +732,119 @@ Total `yarm-fs-servers` tests after Stage 66+67+68: **245** (up from 228).
 2. **Process-exit and timeout signals** — `VfsSharedIoTerminalReason::RequesterExit/ServerExit` exist in lifecycle; no kernel signal path.
 3. **Object introspection in production** — `write_shared_bytes` must validate `effective_rights` in production before granting access.
 4. **Cap revocation** — the current helper uses opaque `object_handle`; a production path must hold and eventually revoke the kernel capability after use.
+
+---
+
+## Stage 69+70 — MAP_WRITE audit + READ_SHARED_REPLY helper/gated path
+
+### Scope
+
+Stage 69 audits whether MAP_WRITE in recv_shared_v3 is safe to enable. Stage 70 implements a
+helper-only READ_SHARED_REPLY path (VfsReadSharedBinding + dispatch_read_shared_reply) using the
+existing BorrowedSharedIoTestMapper without touching the kernel MAP_WRITE gate.
+
+### MAP_WRITE audit verdict (Stage 69)
+
+| Item | Finding | Safe to enable? |
+|---|---|---|
+| Stage 60 gate location | `syscall.rs` ~4266: `if req.map_intent & WRITE != 0 { return Err(InvalidArgs) }` | Gate is intact |
+| MAP_PERM_READ_WRITE | Defined in `recv_core.rs` as `3`; currently unreachable | No change needed |
+| Rollback on writeback failure | Exists: unmap → remove registry → revoke cap | ✓ |
+| TransferRelease removes mapping | Yes: two-phase unmap + cap revocation | ✓ |
+| Process-exit cleanup | NOT confirmed — no kernel signal path identified | **Blocker** |
+| execute bit enforcement | Hardcoded `execute: false` for all shared mappings | ✓ |
+| Rights enforcement | `cap_rights & CAP_RIGHT_WRITE` check exists in planning | ✓ |
+
+**Verdict:** Do not remove Stage 60 MAP_WRITE gate. Process-exit cleanup gap means a writable
+mapping could outlive its owner process. Implement helper-only path via test mapper.
+
+### READ_SHARED_REPLY binding contract (VfsReadSharedBinding, 12 constraints)
+
+Defined in `crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs`.
+
+| Constraint | Field checked | Error variant |
+|---|---|---|
+| 1 | cleanup_token != 0 | `MissingCleanupToken` |
+| 2 | transferred_cap != u64::MAX | `NoTransferCap` |
+| 3 | actual_mapping_perm & 0x2 != 0 | `MappingNotWritable` |
+| 4 | actual_mapping_perm & 0x4 == 0 | `ExecutableMapping` |
+| 5 | mapped_base != 0 | `MappingNotEstablished` |
+| 6 | object_kind ∈ {1, 5} | `UnsupportedObjectKind` |
+| 7 | descriptor.access == VFS_SHARED_BUFFER_FS_WRITE | `WrongDescriptorAccess` |
+| 8 | descriptor.object_handle == cleanup_token | `DescriptorHandleMismatch` |
+| 9 | descriptor.object_generation == cleanup_token >> 16 | `DescriptorGenerationMismatch` |
+| 10 | page_rounded_mapped_len >= buffer_offset + buffer_len | `MappingRangeTooShort` |
+| 11 | exact_region_len == 0 or >= buffer_offset + buffer_len | `ExactRegionLenInsufficient` |
+| 12 | request_id != 0 | `ZeroRequestId` |
+
+Constraint 3 (`MappingNotWritable`) acts as the kernel gate mirror: the Stage 60 gate prevents
+`actual_mapping_perm = 3` from ever arriving via a live recv_shared_v3 delivery, so this
+binding is only reachable today via the test mapper.
+
+### Live route: `VfsService::dispatch_read_shared_reply`
+
+New method `dispatch_read_shared_reply<M: VfsSharedIoMapper>` added to `VfsService<B>`.
+`handle_request` still rejects `VFS_OP_READ_SHARED_REPLY` with `VfsError::Unsupported`.
+
+The method performs:
+1. `VfsReadSharedBinding::validate()` — all 12 constraints enforced.
+2. `mapper.with_read_reply_buffer(descriptor, len, |buf| backend.read_shared_bytes(fd, buf))`.
+3. `mapper.release(descriptor)` — cleanup unconditionally after access attempt.
+4. Returns `VfsReadSharedReply { request_id, bytes_completed, status=OK, flags=0 }`.
+
+`backend.read_shared_bytes` is a new default method on `VfsBackend` (default: `Err(Unsupported)`).
+`RamFsBackend` overrides it to delegate to `read_bytes`, updating read metrics.
+
+### Error mapping (dispatch_read_shared_reply)
+
+| Binding error | VfsError |
+|---|---|
+| `WrongDescriptorAccess` | `PermissionDenied` |
+| `DescriptorHandleMismatch` | `PermissionDenied` |
+| `DescriptorGenerationMismatch` | `PermissionDenied` |
+| All others | `Malformed` |
+
+### Production confirmations
+
+- `handle_request` still rejects `VFS_OP_READ_SHARED_REPLY` with `Unsupported`.
+- `handle_request` still rejects `VFS_OP_WRITE_SHARED_REQUEST` with `Unsupported`.
+- Stage 60 kernel MAP_WRITE gate untouched.
+- `VFS_READ_SHARED_REPLY_ENABLED = false` (unchanged).
+- `VFS_SHARED_IO_ENABLED = false` (unchanged).
+- FAT/ext4/blkcache production read behavior unchanged.
+- No runtime spawn/policy changes.
+
+### Test coverage
+
+16 `stage69_*` / `stage70_*` tests in `vfs_service.rs` (`mod stage69_70_tests`):
+
+- `stage69_audit_map_write_gate_remains_blocking` — proves perm=1 → MappingNotWritable
+- `stage69_write_shared_request_still_works_after_read_shared_added` — regression
+- `stage69_read_shared_reply_default_dispatch_still_unsupported` — handle_request gate
+- `stage69_gate_values_all_false` — all three feature gates are false
+- `stage70_read_shared_reply_ramfs_writes_bytes_into_buffer` — RAMFS roundtrip proof
+- `stage70_read_shared_reply_short_eof_bytes_read_le_requested` — EOF / short-read case
+- `stage70_read_shared_reply_wrong_direction_rejected` — `PermissionDenied` for FS_READ descriptor
+- `stage70_read_shared_reply_readonly_mapping_rejected` — `Malformed` for perm=1
+- `stage70_read_shared_reply_stale_generation_rejected` — `PermissionDenied` for stale gen
+- `stage70_read_shared_reply_range_too_short_rejected` — `Malformed` for range overflow
+- `stage70_read_shared_reply_cleanup_called_on_backend_error` — release_count=1 on error
+- `stage70_read_shared_reply_unsupported_production_mapper_rejects_safely` — `Malformed`
+- `stage70_read_shared_reply_op_sequence_advances_on_success` — op_sequence tracking
+- `stage70_read_shared_reply_cleanup_exactly_once` — release called exactly once
+- `stage70_global_vfs_shared_io_still_false` — VFS_SHARED_IO_ENABLED == false
+- `stage70_write_shared_request_still_unsupported_in_handle_request` — no regression
+
+Total `yarm-fs-servers` tests after Stage 69+70: **261** (up from 245).
+
+### Remaining blockers before global `VFS_SHARED_IO_ENABLED`
+
+1. **Process-exit cleanup** — kernel must signal VFS server when a process holding a mapped
+   receive exits; `VfsSharedIoTerminalReason::RequesterExit` exists in lifecycle but has no
+   delivery path.
+2. **Live MAP_WRITE delivery** — the Stage 60 gate must be removed (one-line change in
+   `syscall.rs`) only after process-exit cleanup is confirmed safe.
+3. **Object introspection in production** — `read_shared_bytes` must validate `effective_rights`
+   in a production mapper before writing into the caller's buffer.
+4. **Cap revocation** — the helper uses an opaque `object_handle`; a production path must hold
+   and eventually revoke the kernel capability after use.

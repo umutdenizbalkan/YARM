@@ -106,6 +106,9 @@ pub trait VfsBackend {
     fn write_shared_bytes(&mut self, _fd: u64, _bytes: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::Unsupported)
     }
+    fn read_shared_bytes(&mut self, _fd: u64, _buf: &mut [u8]) -> Result<u64, VfsError> {
+        Err(VfsError::Unsupported)
+    }
     fn statx_path(&mut self, _path: &[u8]) -> Result<u64, VfsError> {
         Err(VfsError::InvalidPath)
     }
