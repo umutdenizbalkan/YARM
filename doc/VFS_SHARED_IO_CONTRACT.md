@@ -839,11 +839,15 @@ Total `yarm-fs-servers` tests after Stage 69+70: **261** (up from 245).
 
 ### Remaining blockers before global `VFS_SHARED_IO_ENABLED`
 
-1. **Process-exit cleanup** — kernel must signal VFS server when a process holding a mapped
-   receive exits; `VfsSharedIoTerminalReason::RequesterExit` exists in lifecycle but has no
-   delivery path.
+1. **Process-exit cleanup** — ~~kernel must signal VFS server when a process holding a mapped~~
+   ~~receive exits~~ **CONFIRMED (Stage 71)**: the kernel cleanup path
+   `mark_task_dead` → `maybe_cleanup_process_cnode_for_pid` →
+   `purge_active_transfer_mappings_for_pid` exists and is proven correct (9 tests in
+   `mod stage71`).  The remaining work is kernel-side delivery of
+   `VfsSharedIoTerminalReason::RequesterExit` to the VFS server so it can call
+   `dispatch_read_shared_reply` / `mapper.release` to drain its side of the mapping.
 2. **Live MAP_WRITE delivery** — the Stage 60 gate must be removed (one-line change in
-   `syscall.rs`) only after process-exit cleanup is confirmed safe.
+   `syscall.rs`) only after the `RequesterExit` signal delivery path is implemented.
 3. **Object introspection in production** — `read_shared_bytes` must validate `effective_rights`
    in a production mapper before writing into the caller's buffer.
 4. **Cap revocation** — the helper uses an opaque `object_handle`; a production path must hold

@@ -3854,3 +3854,43 @@ cleanup-on-error invariant, release-exactly-once invariant.
 - `cargo test -p yarm-fs-servers --lib stage70` (12 tests)
 - `cargo test -p yarm-fs-servers --lib` (261 total, full regression)
 - `cargo check -p yarm-fs-servers` (no errors)
+
+---
+
+## Rule N+64 — Stage 71 active recv_shared_v3 mapping cleanup audit
+
+**Stage:** 71
+**Crate:** `yarm` (kernel)
+**Files:** `src/kernel/boot/tests.rs` (9 tests in `mod stage71`).
+
+**Coverage:** process-exit cleanup via `mark_task_dead`, `TransferRelease` after exit purge
+returns `InvalidArgs`, idempotent double-purge, explicit release before exit leaves no entry,
+writeback rollback regression, `timeout_ticks != 0` creates no mapping (`WouldBlock`),
+MAP_WRITE gate regression, syscall-number and VFS feature-gate invariants.
+
+**Tests (`mod stage71`):**
+- `stage71_mark_task_dead_cleans_active_recv_v3_mapping`
+- `stage71_transfer_release_after_exit_cleanup_returns_invalid_args`
+- `stage71_duplicate_process_exit_cleanup_is_idempotent`
+- `stage71_explicit_transfer_release_before_exit_leaves_no_active_mapping`
+- `stage71_writeback_rollback_removes_active_mapping_regression`
+- `stage71_nonzero_timeout_returns_would_block_no_mapping_created`
+- `stage71_map_write_still_rejected_after_exit_path_added`
+- `stage71_syscall_count_and_nrs_unchanged`
+- `stage71_vfs_shared_io_still_disabled`
+
+**Hard invariants that must never be violated by future changes:**
+- `purge_active_transfer_mappings_for_pid` must be called from `maybe_cleanup_process_cnode_for_pid`.
+- `maybe_cleanup_process_cnode_for_pid` must be called from `mark_task_dead`.
+- `unmap_range_two_phase` must be used (not `unmap_user_page_in_asid`) for tolerating absent pages/ASIDs.
+- `timeout_ticks != 0` must return `WouldBlock` before any endpoint or mapping work.
+- Stage 60 MAP_WRITE gate in `syscall.rs` must not be removed without confirming kernel-side
+  VFS signal delivery for `VfsSharedIoTerminalReason::RequesterExit`.
+- SYSCALL_COUNT must remain 31; `RecvSharedV3` must remain NR 30; `TransferRelease` must remain NR 4.
+
+**Run commands:**
+- `cargo test --lib stage71 -- --test-threads=1` (9 tests)
+- `cargo test --lib stage60 -- --test-threads=1` (regression)
+- `cargo test --lib ipc_recv -- --test-threads=1` (regression)
+- `cargo check --no-default-features` (no errors)
+- `cargo check -p yarm-fs-servers` (no errors)
