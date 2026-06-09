@@ -10893,3 +10893,141 @@ been resolved.
 - `map_intent` / shared-memory mapping — blocked (see §63.4).
 - Release syscall for cleanup tokens — not yet designed.
 - No production service loop uses recv_shared_v3.
+
+---
+
+## §65 Stage 54+55 — recv_shared_v3 map_intent/shared mapping audit + Option B helper implementation
+
+### 65.1 Audit scope
+
+Stage 54+55 performed a comprehensive audit of all infrastructure required to perform
+receive-time shared-memory mapping via `recv_shared_v3` (SYSCALL_RECV_SHARED_V3_NR = 30).
+
+All blocking infrastructure was confirmed present:
+
+| Requirement | Status | Location |
+|---|---|---|
+| Task-exit cleanup | Confirmed | `purge_active_transfer_mappings_for_pid` at `src/kernel/boot/cnode_state.rs:226` |
+| Two-phase rollback | Confirmed | `map_shared_region_into_receiver` (internal rollback on failure) |
+| Release syscall | Confirmed | `handle_transfer_release` (NR 4) |
+| TLB two-phase unmap | Confirmed | `unmap_page_phase1` + `execute_tlb_shootdown_wait_plan` |
+| Transfer map tracking | Confirmed | `register_active_transfer_mapping` / `remove_active_transfer_mapping` / `active_transfer_mapping_for` |
+| Cap attenuation | Confirmed | `attenuate_transfer_cap_for_recv_intent` |
+
+### 65.2 Implementation decision: Option B (helper-only mapping plan)
+
+Despite all infrastructure being confirmed available, three unresolved semantic ambiguities
+blocked live mapping (Option C):
+
+1. **map_intent != 0 with non-OPCODE_SHARED_MEM message**: unclear whether to fail, skip,
+   or return a partial result.
+2. **Output write failure after mapping**: if the kernel maps memory but then fails to write
+   the output record, the rollback order and error reporting semantics are undefined.
+3. **`attenuate_transfer_cap_for_recv_intent` + already-materialized cap interaction**:
+   the interaction between cap attenuation and receiver-side cap materialization is not
+   yet specified.
+
+Option B was chosen: implement a pure, side-effect-free planning function with no live VM
+mutation.
+
+### 65.3 compute_recv_v3_mapping_plan (pure function)
+
+Location: `src/kernel/recv_core.rs`, `mod recv_shared_v3`.
+
+```rust
+pub fn compute_recv_v3_mapping_plan(
+    msg_opcode: u16,
+    map_intent: u32,
+    payload_ptr: u64,
+    payload_len: u64,
+    cap_rights_bits: u8,
+    region_len: u64,
+    page_size: u64,
+) -> RecvV3MappingPlan
+```
+
+Rules:
+- Returns `Skip` if `map_intent == 0` or `msg_opcode != OPCODE_SHARED_MEM_VALUE`.
+- Returns `InvalidRegion` if `payload_ptr == 0`, `region_len == 0`, `page_size == 0`, or
+  `payload_len < page_aligned(region_len)`.
+- Returns `InsufficientRights` if the `MAP` bit is absent, or `WRITE` is requested but the
+  `WRITE` bit is absent from cap_rights.
+- Returns `Map { map_va, mapped_len, read_only }` otherwise.
+
+No lock is held during this call. No memory is mapped. No side effects.
+
+### 65.4 RecvV3MappingPlan enum
+
+```rust
+pub enum RecvV3MappingPlan {
+    Skip,
+    Map { map_va: u64, mapped_len: u64, read_only: bool },
+    InsufficientRights,
+    InvalidRegion,
+}
+```
+
+### 65.5 map_intent gate unchanged
+
+The gate at `syscall.rs` that returns `InvalidArgs` for any `map_intent != 0` request
+remains in place.  `compute_recv_v3_mapping_plan` is not called from the live dispatch path.
+
+### 65.6 ABI additions
+
+`RECV_V3_MAPPED_OUTPUT_LEN: u32 = 108` — output length constant covering the mapping output
+fields:
+- `mapped_base @88` (u64)
+- `page_rounded_mapped_len @96` (u64)
+- `actual_mapping_perm @104` (u32)
+
+The kernel never writes these fields.  They remain 0 in all current responses.
+
+### 65.7 user-rt additions
+
+`RecvSharedV3Delivery` gains:
+- `mapped_base: u64` field
+- `page_rounded_mapped_len: u64` field
+- `actual_mapping_perm: u32` field
+- `mapped_base() -> u64` — const accessor
+- `page_rounded_mapped_len() -> u64` — const accessor
+- `actual_mapping_perm() -> u32` — const accessor
+- `has_mapping() -> bool` — true iff `mapped_base != 0`
+
+These are always zero in current responses (kernel gate not lifted).
+
+### 65.8 Proven assertions (mod stage54 in src/kernel/boot/tests.rs)
+
+14 tests added:
+
+**Gate (A):**
+- `stage54_map_intent_read_only_still_invalid_args`
+- `stage54_map_intent_read_write_still_invalid_args`
+
+**Regression (B):**
+- `stage54_syscall_count_is_31_and_nr_is_30`
+- `stage54_plain_receive_unchanged`
+
+**Plan: Skip (C):**
+- `stage54_mapping_plan_skip_when_map_intent_zero`
+- `stage54_mapping_plan_skip_when_opcode_not_shared_mem`
+
+**Plan: Map (D):**
+- `stage54_mapping_plan_read_only_for_map_read_intent`
+- `stage54_mapping_plan_read_write_for_map_readwrite_intent`
+- `stage54_mapping_plan_region_len_rounds_up_to_page`
+
+**Plan: InsufficientRights (E):**
+- `stage54_mapping_plan_insufficient_rights_when_map_bit_missing`
+- `stage54_mapping_plan_insufficient_rights_when_write_requested_but_cap_read_only`
+
+**Plan: InvalidRegion (F):**
+- `stage54_mapping_plan_invalid_region_when_payload_ptr_zero`
+- `stage54_mapping_plan_invalid_region_when_region_len_zero`
+- `stage54_mapping_plan_invalid_region_when_payload_buf_too_small`
+
+### 65.9 FUTURE / remaining blockers for Option C
+
+- Resolve map_intent != 0 semantics for non-OPCODE_SHARED_MEM messages.
+- Define output write failure rollback order.
+- Specify `attenuate_transfer_cap_for_recv_intent` + materialized cap interaction.
+- No production service loop uses recv_shared_v3.

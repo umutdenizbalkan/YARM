@@ -36,6 +36,16 @@ pub const RECV_V3_MIN_OUTPUT_LEN: u32 = 80;
 /// buffers receive the original fields unchanged.
 pub const RECV_V3_EXTENDED_OUTPUT_LEN: u32 = 88;
 
+/// Mapped output record length: covers shared-mapping metadata through
+/// `actual_mapping_perm @104..108` (Stage 54+55).
+///
+/// A caller providing at least this many bytes for `metadata_len` will receive
+/// `mapped_base @88`, `page_rounded_mapped_len @96`, and
+/// `actual_mapping_perm @104` when live shared-memory mapping is enabled.
+/// **Currently all three fields are always 0** — `map_intent != 0` still
+/// returns `InvalidArgs` in the current stage.
+pub const RECV_V3_MAPPED_OUTPUT_LEN: u32 = 108;
+
 /// Map-intent flag: map the transferred region read-only.
 pub const RECV_V3_MAP_READ: u32 = 0x1;
 
@@ -834,5 +844,39 @@ mod tests {
     fn abi_cleanup_token_field_at_offset_112() {
         use core::mem::offset_of;
         assert_eq!(offset_of!(RecvSharedV3Output, cleanup_token), 112);
+    }
+
+    // ── Stage 54+55: mapped output length and field offsets ──────────────────
+
+    #[test]
+    fn abi_mapped_output_len_is_108() {
+        assert_eq!(RECV_V3_MAPPED_OUTPUT_LEN, 108);
+    }
+
+    #[test]
+    fn abi_mapped_base_at_offset_88() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(RecvSharedV3Output, mapped_base), 88);
+    }
+
+    #[test]
+    fn abi_page_rounded_mapped_len_at_offset_96() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(RecvSharedV3Output, page_rounded_mapped_len), 96);
+    }
+
+    #[test]
+    fn abi_actual_mapping_perm_at_offset_104() {
+        use core::mem::offset_of;
+        assert_eq!(offset_of!(RecvSharedV3Output, actual_mapping_perm), 104);
+    }
+
+    #[test]
+    fn abi_mapped_output_len_covers_actual_mapping_perm() {
+        // RECV_V3_MAPPED_OUTPUT_LEN = offset_of(actual_mapping_perm) + size_of::<u32>()
+        // = 104 + 4 = 108.
+        use core::mem::{offset_of, size_of};
+        let field_end = offset_of!(RecvSharedV3Output, actual_mapping_perm) + size_of::<u32>();
+        assert_eq!(field_end, RECV_V3_MAPPED_OUTPUT_LEN as usize);
     }
 }

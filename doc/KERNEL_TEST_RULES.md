@@ -3399,3 +3399,73 @@ allocation; `cleanup_token @112` is never written (beyond the 88-byte kernel wri
 - `cargo test --features hosted-dev --lib -- --test-threads=1` (1142 total)
 
 All tests must pass.
+
+---
+
+## Rule N+55: Stage 54+55 — recv_shared_v3 map_intent/shared mapping audit + Option B helper
+
+**Constraints (verbatim):**
+- `SYSCALL_COUNT == 31` unchanged.
+- Syscall numbers unchanged.
+- Public ABI field offsets unchanged.
+- `map_intent != 0 → InvalidArgs` gate unchanged.
+- No live mapping (Option C not implemented).
+- No VM mutation in `compute_recv_v3_mapping_plan`.
+- `mapped_base @88`, `page_rounded_mapped_len @96`, `actual_mapping_perm @104` never written by kernel.
+
+**Kernel changes (`src/kernel/recv_core.rs`, `mod recv_shared_v3`):**
+- `OPCODE_SHARED_MEM_VALUE: u16 = 1` — const matching `OPCODE_SHARED_MEM`.
+- `CAP_RIGHT_WRITE: u8 = 0x02`, `CAP_RIGHT_MAP: u8 = 0x04` — cap rights masks.
+- `RecvV3MappingPlan` enum (Skip / Map / InsufficientRights / InvalidRegion).
+- `compute_recv_v3_mapping_plan()` — pure planning function, no VM mutation.
+
+**ABI crate changes (`crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`):**
+- `RECV_V3_MAPPED_OUTPUT_LEN: u32 = 108` constant added.
+
+**user-rt changes (`crates/yarm-user-rt/src/syscall/recv_v3.rs`):**
+- `mapped_base: u64`, `page_rounded_mapped_len: u64`, `actual_mapping_perm: u32` fields
+  added to `RecvSharedV3Delivery`.
+- `mapped_base()`, `page_rounded_mapped_len()`, `actual_mapping_perm()`, `has_mapping()`
+  accessors added.
+- `from_output()` updated to decode mapping fields.
+
+**(A) Kernel dispatch tests (14 in `mod stage54`, `src/kernel/boot/tests.rs`):**
+
+- `stage54_map_intent_read_only_still_invalid_args`
+- `stage54_map_intent_read_write_still_invalid_args`
+- `stage54_syscall_count_is_31_and_nr_is_30`
+- `stage54_plain_receive_unchanged`
+- `stage54_mapping_plan_skip_when_map_intent_zero`
+- `stage54_mapping_plan_skip_when_opcode_not_shared_mem`
+- `stage54_mapping_plan_read_only_for_map_read_intent`
+- `stage54_mapping_plan_read_write_for_map_readwrite_intent`
+- `stage54_mapping_plan_region_len_rounds_up_to_page`
+- `stage54_mapping_plan_insufficient_rights_when_map_bit_missing`
+- `stage54_mapping_plan_insufficient_rights_when_write_requested_but_cap_read_only`
+- `stage54_mapping_plan_invalid_region_when_payload_ptr_zero`
+- `stage54_mapping_plan_invalid_region_when_region_len_zero`
+- `stage54_mapping_plan_invalid_region_when_payload_buf_too_small`
+
+**(B) user-rt tests (7 new, total 59, `crates/yarm-user-rt/src/syscall/recv_v3.rs`):**
+- `mapped_base_accessor_returns_field`
+- `has_mapping_true_when_mapped_base_nonzero`
+- `has_mapping_false_when_mapped_base_zero`
+- `page_rounded_mapped_len_accessor_returns_field`
+- `actual_mapping_perm_accessor_returns_field`
+- `from_output_decodes_mapping_fields`
+- `from_output_mapping_fields_zero_when_output_zeroed`
+
+**(C) ABI crate tests (5 new, total 40, `crates/yarm-ipc-abi/src/recv_shared_v3_abi.rs`):**
+- `abi_mapped_output_len_is_108`
+- `abi_mapped_base_at_offset_88`
+- `abi_page_rounded_mapped_len_at_offset_96`
+- `abi_actual_mapping_perm_at_offset_104`
+- `abi_mapped_output_len_covers_actual_mapping_perm`
+
+**Run commands:**
+- `cargo test --lib stage54 -- --test-threads=1` (14 kernel tests)
+- `cargo test -p yarm-user-rt --lib recv_v3` (59 user-rt tests total)
+- `cargo test -p yarm-ipc-abi --lib recv_shared_v3` (40 ABI crate tests total)
+- `cargo test --features hosted-dev --lib -- --test-threads=1` (1156 total)
+
+All tests must pass.

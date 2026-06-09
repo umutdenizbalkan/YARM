@@ -52,6 +52,15 @@ pub struct RecvSharedV3Delivery {
     /// non-DmaRegion caps and when no cap was transferred. Only populated when the
     /// caller provided at least 88 bytes for the output buffer.
     pub exact_region_len: u64,
+    /// VA where the shared region was mapped (Stage 54+); **always 0** in the
+    /// current stage — `map_intent != 0` still returns `InvalidArgs`.
+    pub mapped_base: u64,
+    /// Page-rounded byte length of the mapping (Stage 54+); **always 0** in the
+    /// current stage.
+    pub page_rounded_mapped_len: u64,
+    /// Actual mapping permissions granted (Stage 54+); **always 0** in the
+    /// current stage.  Bitmask of RECV_V3_MAP_READ (0x1) / RECV_V3_MAP_WRITE (0x2).
+    pub actual_mapping_perm: u32,
     /// Raw cleanup token from the kernel output (Stage 54+).  **Always 0** in the
     /// current stage — no live shared-memory mapping is performed and no cleanup
     /// identity is allocated.  Check with [`RECV_V3_CLEANUP_TOKEN_NONE`] (= 0)
@@ -84,6 +93,9 @@ impl RecvSharedV3Delivery {
             effective_rights: output.effective_rights,
             exact_object_size: output.exact_object_size,
             exact_region_len: output.exact_region_len,
+            mapped_base: output.mapped_base,
+            page_rounded_mapped_len: output.page_rounded_mapped_len,
+            actual_mapping_perm: output.actual_mapping_perm,
             cleanup_token: output.cleanup_token,
         })
     }
@@ -166,6 +178,40 @@ impl RecvSharedV3Delivery {
     #[inline]
     pub fn has_cleanup_token(&self) -> bool {
         self.cleanup_token != RECV_V3_CLEANUP_TOKEN_NONE
+    }
+
+    /// VA where the shared region was mapped (Stage 54+).
+    ///
+    /// **Always 0** in the current stage — `map_intent != 0` returns
+    /// `InvalidArgs` and no VM mapping is performed.
+    #[inline]
+    pub const fn mapped_base(&self) -> u64 {
+        self.mapped_base
+    }
+
+    /// Page-rounded byte length of the mapping (Stage 54+).
+    ///
+    /// **Always 0** in the current stage.
+    #[inline]
+    pub const fn page_rounded_mapped_len(&self) -> u64 {
+        self.page_rounded_mapped_len
+    }
+
+    /// Actual permissions granted for the mapping (Stage 54+).
+    ///
+    /// **Always 0** in the current stage.
+    #[inline]
+    pub const fn actual_mapping_perm(&self) -> u32 {
+        self.actual_mapping_perm
+    }
+
+    /// Returns `true` when a live shared-memory mapping was established
+    /// (i.e. `mapped_base != 0`).
+    ///
+    /// **Always `false`** in the current stage.
+    #[inline]
+    pub fn has_mapping(&self) -> bool {
+        self.mapped_base != 0
     }
 }
 
@@ -287,6 +333,9 @@ pub unsafe fn ipc_recv_shared_v3_nonblocking(
                 effective_rights: output.effective_rights,
                 exact_object_size: output.exact_object_size,
                 exact_region_len: output.exact_region_len,
+                mapped_base: output.mapped_base,
+                page_rounded_mapped_len: output.page_rounded_mapped_len,
+                actual_mapping_perm: output.actual_mapping_perm,
                 cleanup_token: output.cleanup_token,
             }))
         }
@@ -611,6 +660,9 @@ mod tests {
             effective_rights: output.effective_rights,
             exact_object_size: output.exact_object_size,
             exact_region_len: output.exact_region_len,
+            mapped_base: output.mapped_base,
+            page_rounded_mapped_len: output.page_rounded_mapped_len,
+            actual_mapping_perm: output.actual_mapping_perm,
             cleanup_token: output.cleanup_token,
         };
 
@@ -903,11 +955,89 @@ mod tests {
             effective_rights: 0x07,
             exact_object_size: 0,
             exact_region_len: 4096,
+            mapped_base: 0,
+            page_rounded_mapped_len: 0,
+            actual_mapping_perm: 0,
             cleanup_token: 0,
         };
         assert_eq!(
             via_helper, manual,
             "from_output and manual decode must agree"
         );
+    }
+
+    // ── Stage 54+55: mapped_base / mapped_len / actual_mapping_perm ──────────
+
+    #[test]
+    fn mapped_base_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            mapped_base: 0x4000,
+            ..Default::default()
+        };
+        assert_eq!(d.mapped_base(), 0x4000);
+    }
+
+    #[test]
+    fn has_mapping_true_when_mapped_base_nonzero() {
+        let d = RecvSharedV3Delivery {
+            mapped_base: 0x8000,
+            ..Default::default()
+        };
+        assert!(d.has_mapping(), "mapped_base != 0 must report has_mapping");
+    }
+
+    #[test]
+    fn has_mapping_false_when_mapped_base_zero() {
+        let d = RecvSharedV3Delivery::default();
+        assert!(!d.has_mapping(), "default delivery must not have mapping");
+    }
+
+    #[test]
+    fn page_rounded_mapped_len_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            page_rounded_mapped_len: 8192,
+            ..Default::default()
+        };
+        assert_eq!(d.page_rounded_mapped_len(), 8192);
+    }
+
+    #[test]
+    fn actual_mapping_perm_accessor_returns_field() {
+        let d = RecvSharedV3Delivery {
+            actual_mapping_perm: 0x1,
+            ..Default::default()
+        };
+        assert_eq!(d.actual_mapping_perm(), 0x1);
+    }
+
+    #[test]
+    fn from_output_decodes_mapping_fields() {
+        use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_STATUS_OK;
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        output.mapped_base = 0x4000;
+        output.page_rounded_mapped_len = 4096;
+        output.actual_mapping_perm = 0x1;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(d.mapped_base(), 0x4000);
+        assert_eq!(d.page_rounded_mapped_len(), 4096);
+        assert_eq!(d.actual_mapping_perm(), 0x1);
+        assert!(d.has_mapping());
+    }
+
+    #[test]
+    fn from_output_mapping_fields_zero_when_output_zeroed() {
+        use yarm_ipc_abi::recv_shared_v3_abi::RECV_V3_STATUS_OK;
+        let mut output = RecvSharedV3Output::new_zeroed();
+        output.result_status = RECV_V3_STATUS_OK;
+        let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
+        assert_eq!(
+            d.mapped_base(),
+            0,
+            "mapped_base must be 0 when kernel writes none"
+        );
+        assert_eq!(d.page_rounded_mapped_len(), 0);
+        assert_eq!(d.actual_mapping_perm(), 0);
+        assert!(!d.has_mapping());
     }
 }

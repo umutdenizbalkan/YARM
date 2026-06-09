@@ -564,7 +564,10 @@ pub enum RecvOutcome {
 fn extract_cap_transfer_plan(msg: &Message) -> Option<RecvCapTransferPlan> {
     let raw_handle = msg.transferred_cap()?.0;
     let is_reply_cap = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
-    Some(RecvCapTransferPlan { raw_handle, is_reply_cap })
+    Some(RecvCapTransferPlan {
+        raw_handle,
+        is_reply_cap,
+    })
 }
 
 // ─── Core planning ────────────────────────────────────────────────────────────
@@ -987,7 +990,9 @@ pub(crate) fn try_recv_core_user_plain_v2(
             };
             let (meta_ptr, meta_len) = match request.meta_target {
                 RecvMetaTarget::V2 { ptr, len } => (ptr, len),
-                _ => unreachable!("try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-V2 meta_target"),
+                _ => unreachable!(
+                    "try_recv_core_user_plain_v2: ReceivedWithSenderWake: non-V2 meta_target"
+                ),
             };
             let cap_transfer = extract_cap_transfer_plan(&msg);
             RecvOutcome::Delivered(RecvDelivery {
@@ -1277,6 +1282,102 @@ pub mod recv_shared_v3 {
             return Err(RecvSharedV3Error::BadOutputRecord);
         }
         Ok(())
+    }
+
+    // ── Stage 54+55: mapping plan ─────────────────────────────────────────────
+
+    /// IPC opcode for shared-memory messages (mirrors `OPCODE_SHARED_MEM` in
+    /// `syscall.rs`; mirrored here to avoid a circular import dependency).
+    pub const OPCODE_SHARED_MEM_VALUE: u16 = 1;
+
+    /// `CapRights::WRITE.bits()` — write right bit (mirrors yarm_kernel::capability).
+    pub const CAP_RIGHT_WRITE: u8 = 0x02;
+
+    /// `CapRights::MAP.bits()` — map right bit (mirrors yarm_kernel::capability).
+    pub const CAP_RIGHT_MAP: u8 = 0x04;
+
+    /// Result of computing a receive-time shared-memory mapping plan.
+    ///
+    /// **Helper-only / test-only.** No VM state is modified by
+    /// [`compute_recv_v3_mapping_plan`].  This enum documents the decision
+    /// that the kernel would make if live `map_intent` were enabled.
+    ///
+    /// The live mapping gate (`map_intent != 0 → InvalidArgs`) remains in
+    /// place; this type exists solely to validate the decision logic.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RecvV3MappingPlan {
+        /// No mapping applies: `map_intent == 0` or the message opcode is not
+        /// [`OPCODE_SHARED_MEM_VALUE`] (e.g. plain cap-transfer, plain message).
+        Skip,
+        /// Mapping would proceed with these parameters.
+        Map {
+            /// Mapping VA = `payload_ptr` (caller-supplied).
+            map_va: u64,
+            /// Page-rounded byte length of the mapping.
+            mapped_len: u64,
+            /// `true` when only `MAP_READ` was requested (no WRITE bit).
+            read_only: bool,
+        },
+        /// Cannot map: the transferred cap lacks a required right.
+        /// Either MAP right is absent, or WRITE was requested but the cap
+        /// has only READ|MAP.
+        InsufficientRights,
+        /// Cannot map: invalid region parameters.
+        /// Triggers on: `payload_ptr == 0`, `region_len == 0`,
+        /// page-rounding overflow, or `payload_len < mapped_len`.
+        InvalidRegion,
+    }
+
+    /// Compute the mapping plan for a future mapped `recv_shared_v3` call.
+    ///
+    /// **Pure / side-effect free** — no VM state is modified.  This function
+    /// is intended for planning-phase tests and design validation only.
+    ///
+    /// # Parameters
+    ///
+    /// - `msg_opcode` — opcode of the dequeued message.
+    /// - `map_intent` — raw `map_intent` field from the v3 request (0, `MAP_READ`,
+    ///   or `MAP_READ | MAP_WRITE`).
+    /// - `payload_ptr` — caller's payload buffer VA (proposed mapping base).
+    /// - `payload_len` — caller's payload buffer capacity in bytes.
+    /// - `cap_rights_bits` — `rights_bits()` of the materialized transferred cap.
+    /// - `region_len` — declared shared-memory region length in bytes (from
+    ///   `SharedMemoryRegion::len` in the message payload).
+    /// - `page_size` — page size in bytes (must be a power of two > 0).
+    pub fn compute_recv_v3_mapping_plan(
+        msg_opcode: u16,
+        map_intent: u32,
+        payload_ptr: u64,
+        payload_len: u64,
+        cap_rights_bits: u8,
+        region_len: u64,
+        page_size: u64,
+    ) -> RecvV3MappingPlan {
+        if map_intent == 0 || msg_opcode != OPCODE_SHARED_MEM_VALUE {
+            return RecvV3MappingPlan::Skip;
+        }
+        if payload_ptr == 0 || region_len == 0 || page_size == 0 {
+            return RecvV3MappingPlan::InvalidRegion;
+        }
+        let mapped_len = match region_len.checked_add(page_size - 1) {
+            Some(v) => v & !(page_size - 1),
+            None => return RecvV3MappingPlan::InvalidRegion,
+        };
+        if payload_len < mapped_len {
+            return RecvV3MappingPlan::InvalidRegion;
+        }
+        if (cap_rights_bits & CAP_RIGHT_MAP) == 0 {
+            return RecvV3MappingPlan::InsufficientRights;
+        }
+        let wants_write = (map_intent & MAP_WRITE) != 0;
+        if wants_write && (cap_rights_bits & CAP_RIGHT_WRITE) == 0 {
+            return RecvV3MappingPlan::InsufficientRights;
+        }
+        RecvV3MappingPlan::Map {
+            map_va: payload_ptr,
+            mapped_len,
+            read_only: !wants_write,
+        }
     }
 }
 
