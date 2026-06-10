@@ -1094,4 +1094,52 @@ Stage 80 does not change any VFS shared-I/O ABI, opcode routing, or gate flags. 
 - `python3 scripts/test_pack_initramfs_aligned.py` (4 CPIO alignment tests)
 - `cargo test -p yarm-fs-servers --features hosted-dev -- stage80` (8 FS backend tests)
 - `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 gate tests)
+
+## Stage 80R/81: Profile-gate optional FS live spawns and document kernel spawn-path blocker
+
+Stage 80R/81 addresses a QEMU smoke regression introduced by Stage 80 where attempting to
+live-spawn ramfs_srv/fat_srv/ext4_srv caused core services (blkcache, virtio_blk, driver_manager)
+to never appear. On AArch64, the kernel halted.
+
+### Root cause
+
+`spawn_image_path_for_image_id()` in `src/kernel/syscall.rs` covers image IDs 0–9 only. Attempting
+to spawn IDs 10/11/12 returns `SyscallError::InvalidArgs`. On AArch64 this halts the kernel via the
+trap handler. On x86_64, PM falls through a long Phase-2B VFS bulk-read failure path, corrupting the
+PM reply state needed by subsequent core spawns.
+
+### What Stage 80R/81 changes
+
+1. **Profile gate**: `const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;` added to `init/service.rs`.
+   All ramfs/fat/ext4 live spawn code is placed inside `if INIT_SPAWN_OPTIONAL_FS_SERVERS { ... }`.
+
+2. **SKIPPED markers**: When the gate is false, init emits:
+   - `INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled`
+   - `INIT_FAT_SPAWN_SKIPPED reason=profile_disabled`
+   - `INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled`
+
+3. **Spawn order**: The optional FS section now appears **after** driver_manager, blkcache, and
+   virtio_blk spawns and their smoke checks. Core-service startup is never gated on optional FS.
+
+4. **Blocker documented**: `init/service.rs` comments cite `spawn_image_path_for_image_id` and
+   `SyscallError::InvalidArgs` as the kernel blocker preventing live optional-FS spawns.
+
+5. **Smoke scripts**: `INIT_FAT_SPAWN_SKIPPED`, `INIT_RAMFS_SPAWN_SKIPPED`, `INIT_EXT4_SPAWN_SKIPPED`
+   added to informational marker lists. New EXT4 info section added. Core service checks unchanged.
+
+### What Stage 80R/81 does NOT change
+
+- Stage 80 CPIO staging (ramfs_srv/fat_srv/ext4_srv remain in initramfs).
+- ALIGN_PROOF coverage (`test_stage80_ramfs_fat_ext4_elfs_are_aligned_and_emit_proof` still passes).
+- PM image-ID table (`VFS_SERVICE_IMAGE_ID_MAX = 12`, all three CPIO path/name mappings intact).
+- All Stage 80 gate tests continue to pass.
+- Shared-I/O opcodes, `VFS_SHARED_IO_ENABLED`, `VFS_WRITE_SHARED_REQUEST_ENABLED`,
+  `VFS_READ_SHARED_REPLY_ENABLED` unchanged.
+- `SYSCALL_COUNT` remains 31; SpawnV5 ABI, Phase2B/Phase3B unchanged.
+- No kernel syscall/IPC/VM/cap internals modified.
+
+**Run commands:**
+- `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage81` (5 gate tests)
+- `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 regression checks)
+- `bash -n scripts/qemu-x86_64-core-smoke.sh && bash -n scripts/qemu-aarch64-core-smoke.sh`
 - `cargo test -p yarm-fs-servers --features hosted-dev` (full 368-test regression)

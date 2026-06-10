@@ -4387,4 +4387,120 @@ all remain `true`. These were set in Stage 78 and must not be altered in Stage 8
 - `python3 scripts/test_pack_initramfs_aligned.py` (4 CPIO alignment tests)
 - `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 gate tests)
 - `cargo test -p yarm-fs-servers --features hosted-dev -- stage80` (8 FS backend tests)
+
+---
+
+## Rule N+73 — Stage 80R/81: Profile-gate optional FS live spawns; never block core-service startup on unresolved kernel spawn-path entries
+
+### Background: regression introduced by Stage 80
+
+Stage 80 wired `init/service.rs` to spawn `ramfs_srv` (image_id=11) between the VFS spawn and
+the `driver_manager` spawn, and to spawn `fat_srv` (image_id=10) and `ext4_srv` (image_id=12)
+after `driver_manager`. On the next boot smoke run, these spawns caused the following regression:
+
+- `BLKCACHE_SRV_READY`, `VIRTIO_BLK_SRV_READY`, `DRIVER_MANAGER_READY`, `PM_ELF_ZC_DONE 7/8/9`
+  all became `=0` on x86_64 QEMU.
+- On AArch64 QEMU the kernel halted entirely after the first optional-FS spawn attempt.
+
+### Root cause: `spawn_image_path_for_image_id` kernel gap
+
+`src/kernel/syscall.rs::spawn_image_path_for_image_id()` maps image IDs to kernel-side ELF paths.
+It covers IDs 0–9 only. IDs 10, 11, and 12 return `None`, which propagates as
+`SyscallError::InvalidArgs` through both Phase 3A (`spawn_from_memory_object`, syscall nr=29) and
+Phase 2B (`handle_spawn_v4_cap_process`). On AArch64, `InvalidArgs` from a syscall reaches the
+AArch64 trap handler which calls `YARM_AARCH64_TRAP_HANDLE halting` — fatal for all subsequent
+tasks. On x86_64, PM catches the error but falls through a long Phase-2B VFS bulk-read chain before
+failing, delaying or corrupting PM reply state used by subsequent core-service spawns.
+
+Extending `spawn_image_path_for_image_id` to cover IDs 10/11/12 is a kernel behavior change
+deferred to the expanded-FS profile stage. It must not be done as part of Stage 80R/81.
+
+### Fix: profile gate `INIT_SPAWN_OPTIONAL_FS_SERVERS`
+
+All optional FS live spawns (ramfs_srv, fat_srv, ext4_srv) are now gated behind:
+
+```rust
+const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;
+```
+
+When `false`, `init/service.rs` emits log markers and continues without attempting any spawn:
+
+```
+INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled
+INIT_FAT_SPAWN_SKIPPED reason=profile_disabled
+INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled
+```
+
+The gated section appears **after** all core service spawns and smoke checks (driver_manager,
+blkcache, virtio_blk), so even when enabled in a future profile it cannot block core startup.
+
+### N+73.1 — `INIT_SPAWN_OPTIONAL_FS_SERVERS` must default `false` in the core profile
+
+`init/service.rs` must contain `const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;`.
+The gated live-spawn code must only be reachable when this constant is `true`.
+
+**Test:** `stage81_optional_fs_spawn_disabled_in_core_profile`
+
+### N+73.2 — SKIPPED log markers must be emitted when optional FS gate is false
+
+When `INIT_SPAWN_OPTIONAL_FS_SERVERS` is `false`, all three SKIPPED markers must be emitted:
+`INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled`, `INIT_FAT_SPAWN_SKIPPED reason=profile_disabled`,
+`INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled`.
+
+**Test:** `stage81_optional_fs_skipped_markers_present`
+
+### N+73.3 — `driver_manager` spawn must precede the optional FS section in source order
+
+`INIT_DRIVER_MANAGER_SPAWN_V5_CALL_BEGIN` must appear at a lower byte offset than
+`INIT_SPAWN_OPTIONAL_FS_SERVERS` in `init/service.rs`. Core services are never deferred for
+optional FS work.
+
+**Test:** `stage81_core_spawn_order_driver_manager_before_optional_fs`
+
+### N+73.4 — Kernel spawn-path blocker must be documented in init source
+
+`init/service.rs` must contain the string `spawn_image_path_for_image_id` and
+`SyscallError::InvalidArgs` as inline documentation of the kernel blocker that prevents live
+spawning of optional FS servers in the current core profile.
+
+**Test:** `stage81_kernel_spawn_path_table_blocker_documented`
+
+### N+73.5 — Optional FS live-spawn code must appear inside the gate, not before it
+
+`INIT_SPAWN_OPTIONAL_FS_SERVERS` (gate declaration) must appear at a lower byte offset than
+`INIT_RAMFS_SPAWN_BEGIN` in `init/service.rs`. Direct unconditional optional-FS spawn calls
+before the gate are forbidden.
+
+**Test:** `stage81_optional_fs_spawn_code_gates_not_direct_spawns`
+
+### N+73.6 — Stage 80 CPIO, PM, and FS backend artifacts must not be removed
+
+All Stage 80 artifacts must remain intact in Stage 80R/81:
+- CPIO staging: `sbin/ramfs_srv`, `sbin/fat_srv`, `sbin/ext4_srv` present in initramfs.
+- ALIGN_PROOF coverage: `test_stage80_ramfs_fat_ext4_elfs_are_aligned_and_emit_proof` must pass.
+- PM image-ID table: `VFS_SERVICE_IMAGE_ID_MAX = 12`, `12 => b"/initramfs/sbin/ext4_srv"`.
+- init spawn wiring (gated): `spawn_v5_cap(pm_send, pm_recv, 12, ...)` inside optional gate.
+- Stage 80 mod.rs tests: all five `stage80_*` tests must continue to pass.
+
+**Stage 80R/81 test inventory:**
+
+*`crates/yarm-control-plane-servers/src/control_plane/mod.rs` — `mod tests`:*
+- `stage81_optional_fs_spawn_disabled_in_core_profile`
+- `stage81_optional_fs_skipped_markers_present`
+- `stage81_core_spawn_order_driver_manager_before_optional_fs`
+- `stage81_kernel_spawn_path_table_blocker_documented`
+- `stage81_optional_fs_spawn_code_gates_not_direct_spawns`
+
+**Hard invariants:**
+- `INIT_SPAWN_OPTIONAL_FS_SERVERS = false` in all core profiles.
+- No kernel syscall/IPC/VM/cap internals changed.
+- `SYSCALL_COUNT` remains 31; `SpawnV5` ABI, Phase2B/Phase3B unchanged.
+- Core smoke scripts must not weaken existing `BLKCACHE_SRV_READY`, `VIRTIO_BLK_SRV_READY`,
+  `DRIVER_MANAGER_READY` checks.
+- Stage 80 CPIO/ALIGN_PROOF/PM/init artifacts preserved.
+
+**Run commands:**
+- `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage81` (5 gate tests)
+- `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 regression checks)
+- `bash -n scripts/qemu-x86_64-core-smoke.sh && bash -n scripts/qemu-aarch64-core-smoke.sh`
 - `cargo test -p yarm-fs-servers --features hosted-dev` (full regression)

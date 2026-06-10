@@ -302,6 +302,7 @@ if [[ -f "$LOGFILE" ]]; then
   FAT_SMOKE_EXPECTED=${FAT_SMOKE_EXPECTED:-0}
   FAT_MARKERS=(
     INIT_FAT_SPAWN_BEGIN
+    INIT_FAT_SPAWN_SKIPPED
     INIT_FAT_SPAWN_OK
     PM_IMAGE_ID_10_FAT_SRV
     FAT_CONFIG_FOUND
@@ -333,6 +334,7 @@ if [[ -f "$LOGFILE" ]]; then
   RAMFS_SMOKE_EXPECTED=${RAMFS_SMOKE_EXPECTED:-0}
   RAMFS_MARKERS=(
     INIT_RAMFS_SPAWN_BEGIN
+    INIT_RAMFS_SPAWN_SKIPPED
     INIT_RAMFS_SPAWN_OK
     PM_IMAGE_ID_11_RAMFS_SRV
     RAMFS_CONFIG_FOUND
@@ -372,6 +374,23 @@ if [[ -f "$LOGFILE" ]]; then
       exit 1
     fi
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# Optional EXT4 userspace spawn markers (profile-gated; informational only).
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  EXT4_MARKERS=(
+    INIT_EXT4_SPAWN_BEGIN
+    INIT_EXT4_SPAWN_SKIPPED
+    INIT_EXT4_SPAWN_OK
+    PM_IMAGE_ID_12_EXT4_SRV
+    EXT4_SRV_READY
+  )
+  for marker in "${EXT4_MARKERS[@]}"; do
+    count=$(log_count_pattern "$marker")
+    echo "[info] EXT4 smoke marker count: ${marker}=${count}"
+  done
 fi
 
 echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"

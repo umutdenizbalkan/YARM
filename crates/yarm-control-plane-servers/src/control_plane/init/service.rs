@@ -546,40 +546,6 @@ pub fn run() {
         devfs_send_cap
     );
 
-    // --- Spawn ramfs_srv (image_id=11) and register /ram with VFS when available. ---
-    {
-        let ramfs_mount_config = RamFsMountConfig::new(
-            b"/ram",
-            false,
-            yarm_fs_servers::ramfs::RAMFS_DEFAULT_MAX_BYTES as u32,
-        )
-        .unwrap_or_else(RamFsMountConfig::default_compat);
-        let (ramfs_prefix_word, ramfs_meta_word) = ramfs_mount_config.encode_startup_words();
-        yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_BEGIN");
-        if let Some((ramfs_child_tid, init_ramfs_send_cap)) = spawn_v5_cap(
-            pm_send,
-            pm_recv,
-            11,
-            [0, ramfs_prefix_word, ramfs_meta_word, 0],
-            1,
-        ) {
-            yarm_user_rt::user_log!(
-                "INIT_RAMFS_SPAWN_OK child_tid={} send_cap={} prefix={}",
-                ramfs_child_tid,
-                init_ramfs_send_cap,
-                alloc::string::String::from_utf8_lossy(ramfs_mount_config.prefix())
-            );
-            let _ = register_ramfs_mount_with_vfs(
-                vfs_recv_cap as u32,
-                pm_recv,
-                init_ramfs_send_cap,
-                ramfs_mount_config,
-            );
-        } else {
-            yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_RETURN ok=0 child_tid=0");
-        }
-    }
-
     // --- Spawn driver_manager (image_id=7) ---
     // No service caps required at spawn time. VFS-backed late services are
     // wired post-spawn through explicit IPC registration flows.
@@ -782,55 +748,120 @@ pub fn run() {
         }
     }
 
-    // --- Spawn read-only fat_srv (image_id=10) once blkcache cap is available. ---
-    {
-        let fat_mount_config =
-            FatMountConfig::new(b"/fat", 1, true).unwrap_or_else(FatMountConfig::default_compat);
-        let (fat_prefix_word, fat_meta_word) = fat_mount_config.encode_startup_words();
-        yarm_user_rt::user_log!("INIT_FAT_SPAWN_BEGIN");
-        let Some((fat_child_tid, init_fat_send_cap)) = spawn_v5_cap(
-            pm_send,
-            pm_recv,
-            10,
-            [init_blkcache_send_cap, fat_prefix_word, fat_meta_word, 0],
-            1,
-        ) else {
-            yarm_user_rt::user_log!("INIT_FAT_SPAWN_RETURN ok=0 child_tid=0");
-            return;
-        };
-        yarm_user_rt::user_log!(
-            "INIT_FAT_SPAWN_OK child_tid={} send_cap={} prefix={} device_id={}",
-            fat_child_tid,
-            init_fat_send_cap,
-            alloc::string::String::from_utf8_lossy(fat_mount_config.prefix()),
-            fat_mount_config.device_id
-        );
-        let _ = register_fat_mount_with_vfs(
-            vfs_recv_cap as u32,
-            pm_recv,
-            init_fat_send_cap,
-            fat_mount_config,
-        );
-    }
+    // ── Optional FS server live spawns (profile-gated) ───────────────────────
+    //
+    // ramfs_srv (11), fat_srv (10), and ext4_srv (12) are packed and aligned in
+    // the CPIO archive (Stage 80) and their PM image IDs are registered. However,
+    // live spawning in the core profile is DISABLED because:
+    //
+    //  KERNEL BLOCKER: spawn_image_path_for_image_id() in src/kernel/syscall.rs
+    //  only covers image IDs 0–9. IDs 10/11/12 return None → SyscallError::InvalidArgs.
+    //  On AArch64 this causes the trap handler to halt the kernel. On x86_64, PM
+    //  falls through a long Phase-2B VFS bulk-read chain before the spawn also fails,
+    //  delaying or corrupting the PM reply state before core services are spawned.
+    //  Adding entries 10/11/12 to spawn_image_path_for_image_id is a kernel behavior
+    //  change deferred to the expanded-FS profile stage.
+    //
+    //  STARTUP CONTRACT: ramfs/fat/ext4 do not yet have proven resident IPC recv
+    //  loops with established startup contracts for the core boot sequence.
+    //
+    //  SPAWN ORDER: optional FS spawns must come AFTER all core services
+    //  (driver_manager/blkcache/virtio_blk) and after VFS/blkcache smokes to
+    //  avoid interleaving VFS IPC with the PM spawn-reply stream.
+    //
+    // Set INIT_SPAWN_OPTIONAL_FS_SERVERS = true for the expanded-FS profile once:
+    //  (1) kernel spawn_image_path_for_image_id has entries for 10/11/12,
+    //  (2) each server has a proven resident IPC recv loop and startup contract,
+    //  (3) x86_64 and aarch64 smoke tests confirm the spawns succeed.
+    const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;
 
-    // --- Spawn ext4_srv (image_id=12) read-only. ---
-    // VFS mount registration deferred: ext4_srv has no live IPC request loop yet.
-    // Blocker: ext4/service.rs::run() runs a demo smoke and returns; it does not
-    // enter a kernel IPC receive loop. VFS cannot route requests to a non-listening
-    // service. Registration will be wired once a real recv loop is added.
-    {
-        yarm_user_rt::user_log!("INIT_EXT4_SPAWN_BEGIN");
-        if let Some((ext4_child_tid, _init_ext4_send_cap)) =
-            spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)
+    if INIT_SPAWN_OPTIONAL_FS_SERVERS {
+        // --- Spawn ramfs_srv (image_id=11) and register /ram with VFS. ---
         {
-            yarm_user_rt::user_log!(
-                "INIT_EXT4_SPAWN_OK child_tid={} mount_deferred=true reason=no-ipc-loop",
-                ext4_child_tid
-            );
-            yarm_user_rt::user_log!("EXT4_SRV_READY child_tid={}", ext4_child_tid);
-        } else {
-            yarm_user_rt::user_log!("INIT_EXT4_SPAWN_RETURN ok=0 child_tid=0");
+            let ramfs_mount_config = RamFsMountConfig::new(
+                b"/ram",
+                false,
+                yarm_fs_servers::ramfs::RAMFS_DEFAULT_MAX_BYTES as u32,
+            )
+            .unwrap_or_else(RamFsMountConfig::default_compat);
+            let (ramfs_prefix_word, ramfs_meta_word) = ramfs_mount_config.encode_startup_words();
+            yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_BEGIN");
+            if let Some((ramfs_child_tid, init_ramfs_send_cap)) = spawn_v5_cap(
+                pm_send,
+                pm_recv,
+                11,
+                [0, ramfs_prefix_word, ramfs_meta_word, 0],
+                1,
+            ) {
+                yarm_user_rt::user_log!(
+                    "INIT_RAMFS_SPAWN_OK child_tid={} send_cap={} prefix={}",
+                    ramfs_child_tid,
+                    init_ramfs_send_cap,
+                    alloc::string::String::from_utf8_lossy(ramfs_mount_config.prefix())
+                );
+                let _ = register_ramfs_mount_with_vfs(
+                    vfs_recv_cap as u32,
+                    pm_recv,
+                    init_ramfs_send_cap,
+                    ramfs_mount_config,
+                );
+            } else {
+                yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_RETURN ok=0 child_tid=0");
+            }
         }
+
+        // --- Spawn read-only fat_srv (image_id=10) with blkcache cap. ---
+        // Failure is non-fatal: log and continue to ext4 and alert loop.
+        {
+            let fat_mount_config =
+                FatMountConfig::new(b"/fat", 1, true).unwrap_or_else(FatMountConfig::default_compat);
+            let (fat_prefix_word, fat_meta_word) = fat_mount_config.encode_startup_words();
+            yarm_user_rt::user_log!("INIT_FAT_SPAWN_BEGIN");
+            if let Some((fat_child_tid, init_fat_send_cap)) = spawn_v5_cap(
+                pm_send,
+                pm_recv,
+                10,
+                [init_blkcache_send_cap, fat_prefix_word, fat_meta_word, 0],
+                1,
+            ) {
+                yarm_user_rt::user_log!(
+                    "INIT_FAT_SPAWN_OK child_tid={} send_cap={} prefix={} device_id={}",
+                    fat_child_tid,
+                    init_fat_send_cap,
+                    alloc::string::String::from_utf8_lossy(fat_mount_config.prefix()),
+                    fat_mount_config.device_id
+                );
+                let _ = register_fat_mount_with_vfs(
+                    vfs_recv_cap as u32,
+                    pm_recv,
+                    init_fat_send_cap,
+                    fat_mount_config,
+                );
+            } else {
+                yarm_user_rt::user_log!("INIT_FAT_SPAWN_RETURN ok=0 child_tid=0");
+            }
+        }
+
+        // --- Spawn ext4_srv (image_id=12) read-only. ---
+        // VFS mount registration deferred: ext4_srv has no live IPC request loop yet.
+        {
+            yarm_user_rt::user_log!("INIT_EXT4_SPAWN_BEGIN");
+            if let Some((ext4_child_tid, _init_ext4_send_cap)) =
+                spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)
+            {
+                yarm_user_rt::user_log!(
+                    "INIT_EXT4_SPAWN_OK child_tid={} mount_deferred=true reason=no-ipc-loop",
+                    ext4_child_tid
+                );
+                yarm_user_rt::user_log!("EXT4_SRV_READY child_tid={}", ext4_child_tid);
+            } else {
+                yarm_user_rt::user_log!("INIT_EXT4_SPAWN_RETURN ok=0 child_tid=0");
+            }
+        }
+    } else {
+        yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled");
+        yarm_user_rt::user_log!("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled");
+        yarm_user_rt::user_log!("INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled");
     }
 
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
