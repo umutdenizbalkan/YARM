@@ -12171,3 +12171,26 @@ left as `None` (lifecycle consumed via `cleanup`).
 - `handle_request` still rejects shared opcodes
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
 - 412 yarm-fs-servers tests pass (392 prior + 20 Stage 84)
+
+## Stage 85 — dispatch_shared_delivery locking model
+
+### 85.1 Threading and ownership
+
+`dispatch_shared_delivery` is a `&mut self` method on `VfsService<B>`.  It delegates to
+`handle_write_shared_request_gated` or `handle_read_shared_reply_gated` (Stage 84 gated methods),
+inheriting their ownership model:
+
+- The `Message` argument is consumed by value (decoded before the dispatch call).
+- The `RecvSharedV3Delivery` is borrowed immutably; no mutable delivery state is held.
+- All lifecycle slot operations continue to be single-threaded under `&mut self`.
+- `delivery.mapped_base == 0` is rejected before reaching the mapper (null-pointer guard).
+
+No new kernel locks, interior mutability, or concurrent access paths are introduced.
+
+### 85.2 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- STARTUP_SLOT_COUNT = 18 (no change)
+- `handle_request` still rejects shared opcodes
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
+- 436 yarm-fs-servers tests pass (412 prior + 24 Stage 85)
