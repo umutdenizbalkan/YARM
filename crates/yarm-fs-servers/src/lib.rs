@@ -661,3 +661,79 @@ mod stage89_tests {
         assert!(fd >= 10);
     }
 }
+
+#[cfg(test)]
+mod stage90_tests {
+    // ── Source-level invariants for the false SPAWN_FAIL fix ─────────────────
+
+    #[test]
+    fn stage90_init_drains_pm_recv_before_optional_spawns() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_PM_RECV_DRAIN_BEGIN"),
+            "init must log INIT_PM_RECV_DRAIN_BEGIN before optional FS spawns"
+        );
+        assert!(
+            src.contains("INIT_PM_RECV_DRAIN_DONE"),
+            "init must log INIT_PM_RECV_DRAIN_DONE with count after drain"
+        );
+    }
+
+    #[test]
+    fn stage90_drain_appears_before_ramfs_spawn_begin() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let drain_pos = src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let ramfs_begin_pos = src
+            .find("INIT_RAMFS_SPAWN_BEGIN")
+            .expect("INIT_RAMFS_SPAWN_BEGIN must be present");
+        assert!(
+            drain_pos < ramfs_begin_pos,
+            "pm_recv drain must appear before INIT_RAMFS_SPAWN_BEGIN"
+        );
+    }
+
+    #[test]
+    fn stage90_drain_appears_before_ext4_spawn_begin() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let drain_pos = src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let ext4_begin_pos = src
+            .find("INIT_EXT4_SPAWN_BEGIN")
+            .expect("INIT_EXT4_SPAWN_BEGIN must be present");
+        assert!(
+            drain_pos < ext4_begin_pos,
+            "pm_recv drain must appear before INIT_EXT4_SPAWN_BEGIN"
+        );
+    }
+
+    #[test]
+    fn stage90_blkcache_smoke_uses_blocking_recv_not_deadline_zero() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let smoke_pos = src
+            .find("INIT_BLKCACHE_SMOKE_BEGIN")
+            .expect("blkcache smoke marker must be present");
+        let drain_pos = src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let smoke_section = &src[smoke_pos..drain_pos];
+        assert!(
+            !smoke_section.contains("ipc_recv_with_deadline(pm_recv, 0)"),
+            "blkcache smoke must use blocking ipc_recv — not non-blocking deadline=0"
+        );
+        assert!(
+            smoke_section.contains("ipc_recv(pm_recv)"),
+            "blkcache smoke must use blocking ipc_recv(pm_recv)"
+        );
+    }
+}
