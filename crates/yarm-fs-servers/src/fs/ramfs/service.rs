@@ -247,8 +247,68 @@ pub fn run_with_config(config: RamFsStartupConfig) -> RamFsServiceStartup {
     }
 }
 
+fn run_resident_service_loop(svc: &mut RamFsService) {
+    let ctx = yarm_user_rt::runtime::startup_context();
+    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
+        yarm_user_rt::user_log!("RAMFS_SRV_RECV_CAP cap={}", recv_cap);
+        yarm_user_rt::user_log!("RAMFS_SRV_BLOCKING_RECV_LOOP");
+        loop {
+            // SAFETY: ramfs_srv owns its startup-provided service recv endpoint.
+            match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
+                Ok(Some(received)) => {
+                    let msg = received.message;
+                    let Some(reply_cap) = received.reply_cap else {
+                        continue;
+                    };
+                    let response = svc.handle(msg).unwrap_or_else(|_| {
+                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err-reply")
+                    });
+                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                }
+                _ => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+            }
+        }
+    } else {
+        yarm_user_rt::user_log!("RAMFS_SRV_NO_RECV_CAP_RESIDENT_YIELD");
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
+}
+
+pub fn run_resident(config: RamFsStartupConfig) {
+    yarm_user_rt::user_log!("RAMFS_SRV_ENTRY");
+    match service_from_startup_config(config) {
+        Ok((mut svc, mount_config)) => match run_request_loop(&mut svc) {
+            Ok(summary) => {
+                yarm_user_rt::user_log!(
+                    "RAMFS_MOUNT_READY prefix={} fd={} read_len={} write_len={} handled={}",
+                    alloc::string::String::from_utf8_lossy(mount_config.prefix()),
+                    summary.fd,
+                    summary.read_len,
+                    summary.write_len,
+                    summary.handled
+                );
+                yarm_user_rt::user_log!("RAMFS_SRV_READY");
+                run_resident_service_loop(&mut svc);
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!("RAMFS_MOUNT_FAILED reason={:?}", err);
+            }
+        },
+        Err(RamFsServiceStartup::MountFailed(err)) => {
+            yarm_user_rt::user_log!("RAMFS_MOUNT_FAILED startup reason={:?}", err);
+        }
+        Err(_) => {
+            yarm_user_rt::user_log!("RAMFS_MOUNT_FAILED startup reason=unknown");
+        }
+    }
+}
+
 pub fn run() {
-    let _ = run_with_config(startup_config_from_runtime());
+    run_resident(startup_config_from_runtime());
 }
 
 #[cfg(test)]

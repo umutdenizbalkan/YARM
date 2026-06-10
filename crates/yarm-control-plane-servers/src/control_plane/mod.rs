@@ -277,11 +277,24 @@ mod tests {
     // ── Stage 80R/81: optional FS profile gating ─────────────────────────────
 
     #[test]
-    fn stage81_optional_fs_spawn_disabled_in_core_profile() {
+    fn stage86_optional_fs_spawn_sub_gates_present() {
+        // Stage 86 lifts the Stage-81 "all-off" guard.  Verify the per-server sub-gates exist.
         let init_src = include_str!("init/service.rs");
         assert!(
-            init_src.contains("const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;"),
-            "core profile must have INIT_SPAWN_OPTIONAL_FS_SERVERS = false"
+            init_src.contains("INIT_SPAWN_OPTIONAL_FS_SERVERS"),
+            "init must define INIT_SPAWN_OPTIONAL_FS_SERVERS"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_RAMFS_SRV"),
+            "init must define INIT_SPAWN_RAMFS_SRV sub-gate"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_FAT_SRV"),
+            "init must define INIT_SPAWN_FAT_SRV sub-gate"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_EXT4_SRV"),
+            "init must define INIT_SPAWN_EXT4_SRV sub-gate"
         );
     }
 

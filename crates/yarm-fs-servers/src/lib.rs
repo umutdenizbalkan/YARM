@@ -193,14 +193,312 @@ mod stage80_tests {
     }
 
     #[test]
-    fn stage80_ext4_vfs_registration_deferred_blocker_no_ipc_loop() {
-        // ext4/service.rs::run() performs a smoke and returns — it does not
-        // enter a kernel ipc_recv loop. VFS mount registration is deferred.
-        // Blocker: add ipc_recv loop to ext4/service.rs before enabling.
+    fn stage86_ext4_recv_loop_blocker_lifted() {
+        // Stage 86 lifts the Stage-80 "no-ipc-loop" blocker.
+        // ext4/service.rs now has a resident ipc_recv_v2 loop after the smoke demo.
+        // VFS mount registration remains deferred (VFS_EXT4_LIVE_MOUNT_ENABLED = false).
         let ext4_service_src = include_str!("fs/ext4/service.rs");
         assert!(
-            !ext4_service_src.contains("ipc_recv("),
-            "ext4 service must NOT have ipc_recv yet — registration blocker still active"
+            ext4_service_src.contains("ipc_recv_v2("),
+            "ext4 service must have ipc_recv_v2 recv loop after Stage 86"
         );
+    }
+}
+
+#[cfg(test)]
+mod stage86_tests {
+    use crate::fs::common::shared_io_adapter::{
+        VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_EXT4_RECV_LOOP_ENABLED, VFS_FAT_SHARED_IO_ENABLED,
+        VFS_RAMFS_LIVE_MOUNT_ENABLED, VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED,
+    };
+    use crate::fs::ext4::service::Ext4Service;
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::fat::fs::FatBackend;
+    use crate::fs::ramfs::service::{
+        RamFsServiceStartup, RamFsStartupConfig, run_with_config, service_from_startup_config,
+    };
+    use crate::fs::common::vfs_ipc::{VfsError, openat_inline_message, write_message, ReadWriteRequest};
+    use yarm_srv_common::vfs_core::VfsBackend;
+    use yarm_srv_common::vfs_reply::VfsReply;
+
+    #[test]
+    fn stage86_gate_vfs_ramfs_live_mount_enabled() {
+        assert!(VFS_RAMFS_LIVE_MOUNT_ENABLED, "RAMFS live-mount gate must be true");
+    }
+
+    #[test]
+    fn stage86_gate_vfs_fat_shared_io_disabled() {
+        assert!(!VFS_FAT_SHARED_IO_ENABLED, "FAT shared-I/O gate must be false");
+    }
+
+    #[test]
+    fn stage86_gate_vfs_ext4_recv_loop_enabled() {
+        assert!(VFS_EXT4_RECV_LOOP_ENABLED, "ext4 recv-loop gate must be true");
+    }
+
+    #[test]
+    fn stage86_gate_vfs_ext4_live_mount_disabled() {
+        assert!(!VFS_EXT4_LIVE_MOUNT_ENABLED, "ext4 live-mount gate must be false");
+    }
+
+    #[test]
+    fn stage86_stage85_gate_still_enabled() {
+        assert!(VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED);
+    }
+
+    #[test]
+    fn stage86_ramfs_service_has_run_resident() {
+        let src = include_str!("fs/ramfs/service.rs");
+        assert!(src.contains("fn run_resident("), "ramfs/service.rs must export run_resident");
+        assert!(
+            src.contains("fn run_resident_service_loop("),
+            "ramfs/service.rs must have run_resident_service_loop"
+        );
+        assert!(src.contains("RAMFS_SRV_READY"), "ramfs/service.rs must emit RAMFS_SRV_READY");
+        assert!(src.contains("ipc_recv_v2("), "ramfs/service.rs must use ipc_recv_v2");
+    }
+
+    #[test]
+    fn stage86_ramfs_run_calls_run_resident() {
+        let src = include_str!("fs/ramfs/service.rs");
+        assert!(
+            src.contains("run_resident(startup_config_from_runtime())"),
+            "run() must call run_resident"
+        );
+    }
+
+    #[test]
+    fn stage86_ramfs_run_with_config_still_returns_startup() {
+        let result = run_with_config(RamFsStartupConfig::default_compat());
+        assert!(
+            matches!(result, RamFsServiceStartup::Mounted { .. }),
+            "run_with_config must still return Mounted for default_compat config"
+        );
+    }
+
+    #[test]
+    fn stage86_ramfs_service_from_startup_config_roundtrip() {
+        let config = RamFsStartupConfig::default_compat();
+        assert!(service_from_startup_config(config).is_ok());
+    }
+
+    #[test]
+    fn stage86_ext4_service_has_recv_loop() {
+        let src = include_str!("fs/ext4/service.rs");
+        assert!(src.contains("fn run_resident_service_loop("));
+        assert!(src.contains("ipc_recv_v2("));
+        assert!(src.contains("EXT4_SRV_READY"));
+    }
+
+    #[test]
+    fn stage86_ext4_srv_bin_still_has_stage80_markers() {
+        let src = include_str!("bin/ext4_srv.rs");
+        assert!(src.contains("EXT4_SRV_ENTRY"));
+        assert!(src.contains("EXT4_MOUNT_READY"));
+    }
+
+    #[test]
+    fn stage86_fat_backend_read_shared_bytes_wired() {
+        let mut backend = FatBackend::new();
+        let fd = backend.openat_path(crate::fs::fat::fs::FAT_HELLO_PATH).expect("open");
+        let mut buf = [0u8; 32];
+        let n = backend.read_shared_bytes(fd, &mut buf).expect("read_shared_bytes");
+        assert!(n <= 32);
+    }
+
+    #[test]
+    fn stage86_init_spawn_sub_gates_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(src.contains("INIT_SPAWN_RAMFS_SRV"));
+        assert!(src.contains("INIT_SPAWN_FAT_SRV"));
+        assert!(src.contains("INIT_SPAWN_EXT4_SRV"));
+    }
+
+    #[test]
+    fn stage86_init_spawn_fail_markers_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(src.contains("INIT_RAMFS_SPAWN_FAIL"));
+        assert!(src.contains("INIT_FAT_SPAWN_FAIL"));
+        assert!(src.contains("INIT_EXT4_SPAWN_FAIL"));
+    }
+
+    #[test]
+    fn stage86_ext4_backend_still_rejects_writes() {
+        let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+        let open = openat_inline_message(0, EXT4_SERVICE_PATH, 0, 0).expect("open");
+        let open_rep = svc.handle(open).expect("open rep");
+        let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
+            .expect("decode")
+            .as_u64();
+        let write = write_message(ReadWriteRequest { fd, buf_ptr: 0, len: 512 }).expect("write");
+        assert_eq!(svc.handle(write), Err(VfsError::Unsupported));
+    }
+}
+
+#[cfg(test)]
+mod stage87_tests {
+    use crate::fs::common::shared_io_adapter::VFS_RAMFS_LIVE_MOUNT_ENABLED;
+    use crate::fs::ramfs::service::{
+        RamFsMountConfig, RamFsServiceStartup, RamFsStartupConfig, run_with_config,
+        run_request_loop,
+    };
+    use crate::fs::ramfs::tree::RamFsBackend;
+    use crate::fs::common::service::FsService;
+
+    #[test]
+    fn stage87_ramfs_mount_enabled_gate() {
+        assert!(VFS_RAMFS_LIVE_MOUNT_ENABLED);
+    }
+
+    #[test]
+    fn stage87_ramfs_default_mount_prefix_is_ram() {
+        assert_eq!(RamFsMountConfig::default_compat().prefix(), b"/ram");
+    }
+
+    #[test]
+    fn stage87_ramfs_mount_config_encode_decode_roundtrip() {
+        let config = RamFsMountConfig::new(b"/ram", false, 65536).expect("new");
+        let (w0, w1) = config.encode_startup_words();
+        let decoded = RamFsMountConfig::decode_startup_words(w0, w1).expect("decode");
+        assert_eq!(decoded.prefix(), b"/ram");
+        assert!(!decoded.readonly);
+        assert_eq!(decoded.max_bytes, 65536);
+    }
+
+    #[test]
+    fn stage87_ramfs_mount_config_readonly_roundtrip() {
+        let config = RamFsMountConfig::new(b"/rom", true, 4096).expect("new");
+        let (w0, w1) = config.encode_startup_words();
+        let decoded = RamFsMountConfig::decode_startup_words(w0, w1).expect("decode");
+        assert_eq!(decoded.prefix(), b"/rom");
+        assert!(decoded.readonly);
+        assert_eq!(decoded.max_bytes, 4096);
+    }
+
+    #[test]
+    fn stage87_ramfs_run_with_config_default_compat_mounts() {
+        let result = run_with_config(RamFsStartupConfig::default_compat());
+        match result {
+            RamFsServiceStartup::Mounted { mount_config } => {
+                assert_eq!(mount_config.prefix(), b"/ram");
+            }
+            other => panic!("expected Mounted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn stage87_ramfs_run_with_config_missing_config_uses_default() {
+        let result = run_with_config(RamFsStartupConfig { mount_config: None });
+        assert!(matches!(result, RamFsServiceStartup::Mounted { .. }));
+    }
+
+    #[test]
+    fn stage87_ramfs_service_loop_summary_counts() {
+        type RamFsService = FsService<RamFsBackend>;
+        let mut svc = RamFsService::with_backend(RamFsBackend::new());
+        let summary = run_request_loop(&mut svc).expect("loop");
+        assert_eq!(summary.write_len, 64);
+        assert_eq!(summary.read_len, 32);
+        assert_eq!(summary.handled, 6);
+    }
+
+    #[test]
+    fn stage87_ramfs_resident_loop_source_has_blocking_marker() {
+        assert!(include_str!("fs/ramfs/service.rs").contains("RAMFS_SRV_BLOCKING_RECV_LOOP"));
+    }
+
+    #[test]
+    fn stage87_ramfs_resident_loop_source_has_no_recv_cap_path() {
+        assert!(
+            include_str!("fs/ramfs/service.rs").contains("RAMFS_SRV_NO_RECV_CAP_RESIDENT_YIELD")
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage88_tests {
+    use crate::fs::common::shared_io_adapter::{VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_FAT_SHARED_IO_ENABLED};
+    use crate::fs::fat::fs::FatBackend;
+    use crate::fs::fat::service::{FatServiceStartup, FatStartupConfig, service_from_startup_config};
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::ext4::service::Ext4Service;
+    use crate::fs::common::vfs_ipc::{VfsError, openat_inline_message, write_message, ReadWriteRequest};
+    use yarm_srv_common::vfs_core::VfsBackend;
+    use yarm_srv_common::vfs_reply::VfsReply;
+
+    #[test]
+    fn stage88_fat_shared_io_gate_disabled() {
+        assert!(!VFS_FAT_SHARED_IO_ENABLED);
+    }
+
+    #[test]
+    fn stage88_fat_read_shared_bytes_returns_valid_count() {
+        let mut backend = FatBackend::new();
+        let fd = backend.openat_path(crate::fs::fat::fs::FAT_HELLO_PATH).expect("open");
+        let mut buf = [0u8; 64];
+        let n = backend.read_shared_bytes(fd, &mut buf).expect("read_shared_bytes");
+        assert!(n <= 64);
+    }
+
+    #[test]
+    fn stage88_fat_read_shared_bytes_empty_buf_returns_zero() {
+        let mut backend = FatBackend::new();
+        let fd = backend.openat_path(crate::fs::fat::fs::FAT_HELLO_PATH).expect("open");
+        assert_eq!(backend.read_shared_bytes(fd, &mut []).expect("empty"), 0);
+    }
+
+    #[test]
+    fn stage88_fat_read_shared_bytes_bad_fd_returns_error() {
+        let mut backend = FatBackend::new();
+        assert_eq!(
+            backend.read_shared_bytes(9999, &mut [0u8; 32]),
+            Err(VfsError::BadFd)
+        );
+    }
+
+    #[test]
+    fn stage88_fat_no_block_backend_returns_no_block_backend() {
+        let result = service_from_startup_config(FatStartupConfig::production(None, Some(1), 1));
+        assert!(matches!(result, Err(FatServiceStartup::NoBlockBackend)));
+    }
+
+    #[test]
+    fn stage88_ext4_live_mount_still_disabled() {
+        assert!(!VFS_EXT4_LIVE_MOUNT_ENABLED);
+    }
+
+    #[test]
+    fn stage88_ext4_recv_loop_source_has_markers() {
+        let src = include_str!("fs/ext4/service.rs");
+        assert!(src.contains("EXT4_SRV_BLOCKING_RECV_LOOP"));
+        assert!(src.contains("EXT4_SRV_NO_RECV_CAP_RESIDENT_YIELD"));
+        assert!(src.contains("EXT4_SRV_READY"));
+    }
+
+    #[test]
+    fn stage88_ext4_backend_read_shared_bytes_not_overridden() {
+        let mut backend = Ext4Backend::new();
+        let fd = backend.openat_path(EXT4_SERVICE_PATH).expect("open");
+        assert_eq!(
+            backend.read_shared_bytes(fd, &mut [0u8; 32]),
+            Err(VfsError::Unsupported),
+            "ext4 must not override read_shared_bytes"
+        );
+    }
+
+    #[test]
+    fn stage88_ext4_service_write_still_unsupported_after_stage86() {
+        let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+        let open = openat_inline_message(0, EXT4_SERVICE_PATH, 0, 0).expect("open");
+        let open_rep = svc.handle(open).expect("open rep");
+        let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
+            .expect("decode")
+            .as_u64();
+        let write = write_message(ReadWriteRequest { fd, buf_ptr: 0, len: 512 }).expect("write");
+        assert_eq!(svc.handle(write), Err(VfsError::Unsupported));
     }
 }

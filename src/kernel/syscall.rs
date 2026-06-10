@@ -7624,13 +7624,26 @@ mod tests {
     }
 
     #[test]
-    fn stage81a_optional_fs_core_profile_still_disabled() {
-        // Regression: core profile must still have optional FS live spawns off.
+    fn stage86_optional_fs_spawn_gates_present() {
+        // Stage 86 lifts Stage-81 "all-off" guard: RAMFS and ext4 sub-gates are now true.
+        // The outer gate is derived from sub-gates (RAMFS || FAT || EXT4).
         let init_src =
             include_str!("../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
-            init_src.contains("const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;"),
-            "core profile must keep INIT_SPAWN_OPTIONAL_FS_SERVERS = false after Stage 81"
+            init_src.contains("INIT_SPAWN_OPTIONAL_FS_SERVERS"),
+            "init must define INIT_SPAWN_OPTIONAL_FS_SERVERS"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_RAMFS_SRV"),
+            "init must define INIT_SPAWN_RAMFS_SRV sub-gate"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_FAT_SRV"),
+            "init must define INIT_SPAWN_FAT_SRV sub-gate"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_EXT4_SRV"),
+            "init must define INIT_SPAWN_EXT4_SRV sub-gate"
         );
     }
 }
