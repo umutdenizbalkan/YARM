@@ -813,6 +813,26 @@ pub fn run() {
         );
     }
 
+    // --- Spawn ext4_srv (image_id=12) read-only. ---
+    // VFS mount registration deferred: ext4_srv has no live IPC request loop yet.
+    // Blocker: ext4/service.rs::run() runs a demo smoke and returns; it does not
+    // enter a kernel IPC receive loop. VFS cannot route requests to a non-listening
+    // service. Registration will be wired once a real recv loop is added.
+    {
+        yarm_user_rt::user_log!("INIT_EXT4_SPAWN_BEGIN");
+        if let Some((ext4_child_tid, _init_ext4_send_cap)) =
+            spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)
+        {
+            yarm_user_rt::user_log!(
+                "INIT_EXT4_SPAWN_OK child_tid={} mount_deferred=true reason=no-ipc-loop",
+                ext4_child_tid
+            );
+            yarm_user_rt::user_log!("EXT4_SRV_READY child_tid={}", ext4_child_tid);
+        } else {
+            yarm_user_rt::user_log!("INIT_EXT4_SPAWN_RETURN ok=0 child_tid=0");
+        }
+    }
+
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };

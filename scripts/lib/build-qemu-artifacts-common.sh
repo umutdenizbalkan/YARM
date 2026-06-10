@@ -344,9 +344,81 @@ common_stage_virtio_blk_server_elf() {
   echo "[ok] staged virtio blk server ELF as /sbin/virtio_blk_srv"
 }
 
+common_stage_ramfs_server_elf() {
+  if [[ ! -f "$RAMFS_SERVER_ELF" ]]; then
+    echo "[warn] ramfs server ELF missing: $RAMFS_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$RAMFS_SERVER_ELF" "$ROOTFS_DIR/sbin/ramfs_srv"
+  chmod +x "$ROOTFS_DIR/sbin/ramfs_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$RAMFS_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] ramfs server ELF has forbidden RWE PT_LOAD segment: $RAMFS_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $RAMFS_SERVER_ELF"
+  fi
+
+  echo "[ok] staged ramfs server ELF as /sbin/ramfs_srv"
+}
+
+common_stage_fat_server_elf() {
+  if [[ ! -f "$FAT_SERVER_ELF" ]]; then
+    echo "[warn] fat server ELF missing: $FAT_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$FAT_SERVER_ELF" "$ROOTFS_DIR/sbin/fat_srv"
+  chmod +x "$ROOTFS_DIR/sbin/fat_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$FAT_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] fat server ELF has forbidden RWE PT_LOAD segment: $FAT_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $FAT_SERVER_ELF"
+  fi
+
+  echo "[ok] staged fat server ELF as /sbin/fat_srv"
+}
+
+common_stage_ext4_server_elf() {
+  if [[ ! -f "$EXT4_SERVER_ELF" ]]; then
+    echo "[warn] ext4 server ELF missing: $EXT4_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$EXT4_SERVER_ELF" "$ROOTFS_DIR/sbin/ext4_srv"
+  chmod +x "$ROOTFS_DIR/sbin/ext4_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$EXT4_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] ext4 server ELF has forbidden RWE PT_LOAD segment: $EXT4_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $EXT4_SERVER_ELF"
+  fi
+
+  echo "[ok] staged ext4 server ELF as /sbin/ext4_srv"
+}
+
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor"; do
+  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor" "sbin/ramfs_srv" "sbin/fat_srv" "sbin/ext4_srv"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1

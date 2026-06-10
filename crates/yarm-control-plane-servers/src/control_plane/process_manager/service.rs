@@ -51,7 +51,7 @@ const PROCESS_MANAGER_ROUNDTRIP_RECV_TIMEOUT_TICKS: u64 = 1;
 const BOOTSTRAP_IMAGE_ID_MIN: u64 = 1;
 const BOOTSTRAP_SERVICE_IMAGE_ID_MAX: u64 = 6;
 const VFS_SERVICE_IMAGE_ID_MIN: u64 = 7;
-const VFS_SERVICE_IMAGE_ID_MAX: u64 = 9;
+const VFS_SERVICE_IMAGE_ID_MAX: u64 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpawnLoadSource {
@@ -1447,6 +1447,7 @@ unsafe fn pm_vfs_spawn_inline(
         9 => b"/initramfs/sbin/virtio_blk_srv",
         10 => b"/initramfs/sbin/fat_srv",
         11 => b"/initramfs/sbin/ramfs_srv",
+        12 => b"/initramfs/sbin/ext4_srv",
         _ => {
             yarm_user_rt::user_log!("PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}", image_id);
             return Err(ProcessManagerError::Unsupported);
@@ -1457,6 +1458,9 @@ unsafe fn pm_vfs_spawn_inline(
     }
     if image_id == 11 {
         yarm_user_rt::user_log!("PM_IMAGE_ID_11_RAMFS_SRV path=/initramfs/sbin/ramfs_srv");
+    }
+    if image_id == 12 {
+        yarm_user_rt::user_log!("PM_IMAGE_ID_12_EXT4_SRV path=/initramfs/sbin/ext4_srv");
     }
     let path_log = core::str::from_utf8(path_label).unwrap_or("<path-bytes>");
     yarm_user_rt::user_log!(
@@ -1857,6 +1861,7 @@ fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
         9 => Some(b"sbin/virtio_blk_srv"),
         10 => Some(b"sbin/fat_srv"),
         11 => Some(b"sbin/ramfs_srv"),
+        12 => Some(b"sbin/ext4_srv"),
         _ => None,
     }
 }
@@ -3215,10 +3220,34 @@ mod tests {
             resolve_spawn_load_source(9).ok(),
             Some(SpawnLoadSource::Vfs)
         );
+        // Stage 80: fat (10), ramfs (11), ext4 (12) all VFS-loaded.
         assert_eq!(
-            resolve_spawn_load_source(10),
+            resolve_spawn_load_source(10).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(11).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(12).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        // 13 is still out of range.
+        assert_eq!(
+            resolve_spawn_load_source(13),
             Err(ProcessManagerError::Unsupported)
         );
+    }
+
+    #[test]
+    fn stage80_pm_image_id_range_covers_fs_servers() {
+        // VFS_SERVICE_IMAGE_ID_MAX must cover fat(10), ramfs(11), ext4(12).
+        assert_eq!(VFS_SERVICE_IMAGE_ID_MAX, 12);
+        assert!(VFS_SERVICE_IMAGE_ID_MIN <= 10);
+        assert!(VFS_SERVICE_IMAGE_ID_MAX >= 12);
+        // ext4 write path still returns Unsupported (enforced by Ext4Backend, not PM).
+        // This test just verifies PM will route the spawn — backend safety is in ext4 tests.
     }
 
     #[test]

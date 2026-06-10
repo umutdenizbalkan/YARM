@@ -117,3 +117,90 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod stage80_tests {
+    use crate::fs::common::shared_io_adapter::{
+        VFS_READ_SHARED_REPLY_ENABLED, VFS_SHARED_IO_ENABLED, VFS_WRITE_SHARED_REQUEST_ENABLED,
+    };
+    use crate::fs::common::vfs_ipc::VfsError;
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::fat::service::{FatServiceStartup, FatStartupConfig, service_from_startup_config};
+    use crate::fs::ramfs::service::{RamFsServiceStartup, RamFsStartupConfig, run_with_config};
+    use yarm_srv_common::vfs_core::VfsBackend;
+
+    #[test]
+    fn stage80_ext4_write_path_remains_unsupported() {
+        let mut backend = Ext4Backend::new();
+        let fd = backend.openat_path(EXT4_SERVICE_PATH).expect("open");
+        assert_eq!(backend.write(fd, 512), Err(VfsError::Unsupported));
+        assert_eq!(backend.write(fd, 4096), Err(VfsError::Unsupported));
+    }
+
+    #[test]
+    fn stage80_ext4_backend_rejects_writes_of_all_sizes() {
+        let mut backend = Ext4Backend::new();
+        let fd = backend.openat_path(EXT4_SERVICE_PATH).expect("open");
+        for &len in &[1u64, 512, 4096, 65536, 16 * 1024 * 1024 + 1] {
+            assert_eq!(
+                backend.write(fd, len),
+                Err(VfsError::Unsupported),
+                "expected Unsupported for write len={len}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage80_fat_write_mode_guard_requires_block_backend() {
+        let result = service_from_startup_config(FatStartupConfig::production(None, Some(1), 1));
+        assert!(
+            matches!(result, Err(FatServiceStartup::NoBlockBackend)),
+            "fat production config with no block backend must return NoBlockBackend"
+        );
+    }
+
+    #[test]
+    fn stage80_vfs_shared_io_enabled_consistent_with_stage78() {
+        assert!(VFS_WRITE_SHARED_REQUEST_ENABLED);
+        assert!(VFS_READ_SHARED_REPLY_ENABLED);
+        assert!(VFS_SHARED_IO_ENABLED);
+    }
+
+    #[test]
+    fn stage80_ramfs_run_with_config_smoke_unchanged() {
+        let result = run_with_config(RamFsStartupConfig::default_compat());
+        assert!(
+            matches!(result, RamFsServiceStartup::Mounted { .. }),
+            "ramfs run_with_config must mount successfully with default_compat config"
+        );
+    }
+
+    #[test]
+    fn stage80_ext4_srv_bin_has_entry_and_ready_markers() {
+        let ext4_bin_src = include_str!("bin/ext4_srv.rs");
+        assert!(ext4_bin_src.contains("EXT4_SRV_ENTRY"));
+        assert!(ext4_bin_src.contains("EXT4_MOUNT_READY"));
+    }
+
+    #[test]
+    fn stage80_all_three_fs_server_bins_have_entry_markers() {
+        let ramfs_src = include_str!("bin/ramfs_srv.rs");
+        let fat_src = include_str!("bin/fat_srv.rs");
+        let ext4_src = include_str!("bin/ext4_srv.rs");
+        assert!(ramfs_src.contains("RAMFS_BIN_ENTRY_START"));
+        assert!(fat_src.contains("FAT_BIN_ENTRY_START"));
+        assert!(ext4_src.contains("EXT4_BIN_ENTRY_START"));
+    }
+
+    #[test]
+    fn stage80_ext4_vfs_registration_deferred_blocker_no_ipc_loop() {
+        // ext4/service.rs::run() performs a smoke and returns — it does not
+        // enter a kernel ipc_recv loop. VFS mount registration is deferred.
+        // Blocker: add ipc_recv loop to ext4/service.rs before enabling.
+        let ext4_service_src = include_str!("fs/ext4/service.rs");
+        assert!(
+            !ext4_service_src.contains("ipc_recv("),
+            "ext4 service must NOT have ipc_recv yet — registration blocker still active"
+        );
+    }
+}

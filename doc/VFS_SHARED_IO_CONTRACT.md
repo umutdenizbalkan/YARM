@@ -1052,3 +1052,46 @@ the test process. Therefore:
 **Run commands:**
 - `cargo test -p yarm-fs-servers --features hosted-dev -- stage79` (20 Stage 79 tests)
 - `cargo test -p yarm-fs-servers --features hosted-dev` (full 360-test regression)
+
+## Stage 80: ramfs_srv/fat_srv/ext4_srv CPIO staging, spawn wiring, and conservative VFS mount policy
+
+Stage 80 does not change any VFS shared-I/O ABI, opcode routing, or gate flags. The `VFS_WRITE_SHARED_REQUEST_ENABLED`,
+`VFS_READ_SHARED_REPLY_ENABLED`, and `VFS_SHARED_IO_ENABLED` constants established in Stage 78 remain
+`true` and unchanged.
+
+### What Stage 80 adds
+
+1. **CPIO archive staging**: `sbin/ramfs_srv`, `sbin/fat_srv`, and `sbin/ext4_srv` ELFs are added to
+   the initramfs CPIO archive. All three ELFs must be packed at 4096-byte-aligned data offsets, with
+   `ALIGN_PROOF path=/<name> data_offset=<N> alignment_mod=0 aligned=true` emitted for each.
+
+2. **PM image-ID table extension**: `VFS_SERVICE_IMAGE_ID_MAX` extended from 9 to 12.
+   Image IDs 10 (fat_srv), 11 (ramfs_srv), 12 (ext4_srv) are now within the VFS spawn range.
+   `pm_vfs_spawn_inline` maps `12 => b"/initramfs/sbin/ext4_srv"` and `pm_image_cpio_name` maps
+   `12 => Some(b"sbin/ext4_srv")`.
+
+3. **init spawn wiring**: `init/service.rs::run()` spawns ext4_srv via `spawn_v5_cap(pm_send, pm_recv, 12, ...)`.
+   Log markers: `INIT_EXT4_SPAWN_BEGIN`, `INIT_EXT4_SPAWN_OK child_tid=<N> mount_deferred=true reason=no-ipc-loop`,
+   `EXT4_SRV_READY`.
+
+4. **Conservative VFS mount policy**:
+   - ramfs: writable at `/ram` — live via `run_with_config(RamFsStartupConfig::default_compat())`.
+   - fat: read-only at `/fat` if block backend available; guarded by `FatStartupConfig::production(None, ...)`.
+   - ext4: spawned but VFS registration **deferred**. Blocker: `ext4/service.rs::run()` is a demo
+     smoke that returns without entering a kernel `ipc_recv` loop. VFS cannot route requests to a
+     non-listening service. Registration is wired only after a real recv loop is added.
+
+### What Stage 80 does NOT change
+
+- Shared-I/O opcodes 26, 27, 28 remain `Unsupported` in live `VfsService`.
+- `VFS_SHARED_IO_ENABLED`, `VFS_WRITE_SHARED_REQUEST_ENABLED`, `VFS_READ_SHARED_REPLY_ENABLED` unchanged.
+- `SYSCALL_COUNT` remains 31.
+- ext4 writes remain `Err(VfsError::Unsupported)` for all lengths.
+- FAT production writes remain guarded by `NoBlockBackend` error when no block backend is present.
+- No kernel syscall/IPC/VM/cap internals modified.
+
+**Run commands:**
+- `python3 scripts/test_pack_initramfs_aligned.py` (4 CPIO alignment tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev -- stage80` (8 FS backend tests)
+- `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 gate tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev` (full 368-test regression)

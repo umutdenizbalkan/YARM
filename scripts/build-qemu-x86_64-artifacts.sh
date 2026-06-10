@@ -22,6 +22,9 @@ VFS_SERVER_BIN=${VFS_SERVER_BIN:-vfs_server}
 BLKCACHE_SERVER_BIN=${BLKCACHE_SERVER_BIN:-blkcache_srv}
 VIRTIO_BLK_SERVER_BIN=${VIRTIO_BLK_SERVER_BIN:-virtio_blk_srv}
 DRIVER_MANAGER_BIN=${DRIVER_MANAGER_BIN:-driver_manager}
+RAMFS_SERVER_BIN=${RAMFS_SERVER_BIN:-ramfs_srv}
+FAT_SERVER_BIN=${FAT_SERVER_BIN:-fat_srv}
+EXT4_SERVER_BIN=${EXT4_SERVER_BIN:-ext4_srv}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
@@ -39,6 +42,9 @@ VFS_SERVER_ELF=${VFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD
 BLKCACHE_SERVER_ELF=${BLKCACHE_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${BLKCACHE_SERVER_BIN}}
 VIRTIO_BLK_SERVER_ELF=${VIRTIO_BLK_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${VIRTIO_BLK_SERVER_BIN}}
 DRIVER_MANAGER_ELF=${DRIVER_MANAGER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${DRIVER_MANAGER_BIN}}
+RAMFS_SERVER_ELF=${RAMFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${RAMFS_SERVER_BIN}}
+FAT_SERVER_ELF=${FAT_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${FAT_SERVER_BIN}}
+EXT4_SERVER_ELF=${EXT4_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${EXT4_SERVER_BIN}}
 KERNEL_ELF=${KERNEL_ELF:-target/${KERNEL_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
@@ -148,6 +154,15 @@ BLKCACHE_SERVER_BUILD_STATUS=$?
 echo "[info] building yarm-driver-servers/${VIRTIO_BLK_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
 cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p yarm-driver-servers --bin "$VIRTIO_BLK_SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
 VIRTIO_BLK_SERVER_BUILD_STATUS=$?
+echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${RAMFS_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$RAMFS_SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+RAMFS_SERVER_BUILD_STATUS=$?
+echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${FAT_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$FAT_SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+FAT_SERVER_BUILD_STATUS=$?
+echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${EXT4_SERVER_BIN} for ${SERVER_RUST_TARGET}" | tee -a "$BUILD_LOG"
+cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$EXT4_SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+EXT4_SERVER_BUILD_STATUS=$?
 set -e
 
 if [[ "$KERNEL_BUILD_STATUS" -ne 0 || \
@@ -159,7 +174,10 @@ if [[ "$KERNEL_BUILD_STATUS" -ne 0 || \
       "$VFS_SERVER_BUILD_STATUS" -ne 0 || \
       "$DRIVER_MANAGER_BUILD_STATUS" -ne 0 || \
       "$BLKCACHE_SERVER_BUILD_STATUS" -ne 0 || \
-      "$VIRTIO_BLK_SERVER_BUILD_STATUS" -ne 0 ]]; then
+      "$VIRTIO_BLK_SERVER_BUILD_STATUS" -ne 0 || \
+      "$RAMFS_SERVER_BUILD_STATUS" -ne 0 || \
+      "$FAT_SERVER_BUILD_STATUS" -ne 0 || \
+      "$EXT4_SERVER_BUILD_STATUS" -ne 0 ]]; then
   common_exit_if_strict_mode
 fi
 
@@ -172,6 +190,9 @@ common_stage_vfs_server_elf || true
 common_stage_blkcache_server_elf || true
 common_stage_virtio_blk_server_elf || true
 common_stage_driver_manager_elf || true
+common_stage_ramfs_server_elf || true
+common_stage_fat_server_elf || true
+common_stage_ext4_server_elf || true
 common_verify_initramfs_stage_paths || true
 # Phase 3B: use 4096-byte-aligned packer so late-service ELFs can be zero-copy loaded.
 common_create_initramfs_aligned
