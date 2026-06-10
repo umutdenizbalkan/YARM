@@ -958,3 +958,97 @@ lifecycle; duplicate exit is idempotent (AlreadyCleaned); unmatched TID is safe 
    in a production mapper before writing into the caller's buffer.
 5. **Cap revocation** — the helper uses an opaque `object_handle`; a production path must hold
    and eventually revoke the kernel capability after use (via `TransferRelease` syscall).
+
+## Stage 79 — RecvV3SharedIoMapper production bridge (RAMFS-only metadata proof)
+
+### What was added
+
+`RecvV3SharedIoMapper` in `shared_io_adapter.rs` is the first production-style `VfsSharedIoMapper`
+implementation. It wraps a `RecvSharedV3Delivery` (the userspace-decoded output of `recv_shared_v3`)
+and enforces the full direction/permission/range/liveness contract before any byte access.
+
+**Fields captured from delivery:** `cleanup_token`, `mapped_base`, `page_rounded_mapped_len`,
+`actual_mapping_perm`, plus a `released: bool` flag for at-most-once cleanup semantics.
+
+**Two constructors:**
+- `from_delivery(delivery: &RecvSharedV3Delivery)` — production path: takes all fields from delivery.
+- `from_fields(cleanup_token, mapped_base, page_rounded_mapped_len, actual_mapping_perm)` — test path.
+
+**Validation layers (ordered, all must pass before `from_raw_parts`):**
+1. `released` check → `AccessAfterCleanup`
+2. Direction check: `with_read_reply_buffer` requires `VFS_SHARED_BUFFER_FS_WRITE`; `with_write_request_buffer` requires `VFS_SHARED_BUFFER_FS_READ` → `WrongDirection`
+3. Descriptor cross-reference: `object_handle == cleanup_token` AND `object_generation == cleanup_token >> 16` → `StaleHandle`
+4. Permission check: write-request path requires `MAP_PERM_READ_ONLY (1)` exactly; read-reply path requires `MAP_PERM_WRITE_BIT (0x2)` set → `MissingRights`
+5. Range bounds: `buffer_offset + requested_len <= page_rounded_mapped_len`, overflow-safe → `BadRange`
+6. `from_raw_parts` / `from_raw_parts_mut` — only reached in production (real kernel-mapped VA).
+
+**Release contract (`release` method):**
+- Descriptor cross-reference checked first → `StaleHandle` on mismatch.
+- If `released` is already `true`: return `Ok(())` immediately (at-most-once, second call is free).
+- Set `released = true` **before** calling `release_v3_cleanup_token` (guards against panic/unwind).
+- `release_v3_cleanup_token` → `Ok(())` in production; in hosted-dev tests returns `SyscallError::Internal`
+  (Linux maps syscall NR=4 to `write(fd=token, ...)` → EBADF; RCX = return address → decode_release → Err).
+- Failure mapped to `VfsSharedIoAdapterError::ReleaseFailure`.
+
+### Byte-access blocker (hosted-dev)
+
+In `hosted-dev` (unit-test) builds, `mapped_base` is a synthetic value — it is NOT a valid virtual
+address. Calling `core::slice::from_raw_parts` on it would be undefined behaviour and would crash
+the test process. Therefore:
+
+- **All `RecvV3SharedIoMapper` tests exercise only error paths that return before the unsafe block.**
+- The validation layers (direction, stale handle, permission, range) all return errors before
+  `from_raw_parts` is reached; tests are structured to trigger one of these exits.
+- No test calls `with_read_reply_buffer` or `with_write_request_buffer` with a valid permission
+  path on a `RecvV3SharedIoMapper` — that would require a real kernel-mapped VA.
+- RAMFS byte-content proof in `stage79_tests` uses `BorrowedSharedIoTestMapper` (in-process backing
+  store), not `RecvV3SharedIoMapper`. This is the designated first proof backend for Stage 79.
+- Real end-to-end byte transfer requires a live `recv_shared_v3` delivery from the kernel.
+  That path is out of scope for hosted-dev unit tests.
+
+### Tests added (Stage 79)
+
+**`shared_io_adapter.rs` — `mod tests` (12 new tests):**
+
+| Test | What it proves |
+|---|---|
+| `stage79_recv_v3_mapper_from_delivery_constructs_with_all_fields` | `from_delivery` copies all fields; `!is_released()` |
+| `stage79_recv_v3_mapper_from_fields_is_not_released` | `from_fields` starts unreleased |
+| `stage79_write_request_wrong_direction_rejected` | FS_WRITE descriptor → `WrongDirection` (before stale check) |
+| `stage79_write_request_stale_handle_rejected` | wrong `object_handle` → `StaleHandle` |
+| `stage79_write_request_stale_generation_rejected` | wrong `object_generation` → `StaleHandle` |
+| `stage79_write_request_rw_perm_rejected` | `PERM_RW` on write-request path → `MissingRights` |
+| `stage79_write_request_bad_range_rejected` | `offset + len > page_rounded_len` → `BadRange` |
+| `stage79_read_reply_wrong_direction_rejected` | FS_READ descriptor → `WrongDirection` |
+| `stage79_read_reply_readonly_perm_rejected` | `PERM_RO` on read-reply path → `MissingRights` |
+| `stage79_release_stale_handle_rejected` | wrong handle → `StaleHandle`; `released` stays `false` |
+| `stage79_release_marks_released_and_blocks_subsequent_access` | release sets `released`; subsequent buffer call → `AccessAfterCleanup` |
+| `stage79_release_idempotent_second_call_returns_ok` | second `release` → `Ok(())` regardless of first outcome |
+
+**`vfs_service.rs` — `mod stage79_tests` (8 new tests):**
+
+| Test | What it proves |
+|---|---|
+| `stage79_recv_v3_mapper_implements_vfs_shared_io_mapper_trait` | compile-time trait bound satisfied |
+| `stage79_dispatch_write_shared_request_with_recv_v3_mapper_rw_perm_rejected` | wrong-perm mapper → `VfsError::Malformed`; no `from_raw_parts` |
+| `stage79_dispatch_read_shared_reply_with_recv_v3_mapper_ro_perm_rejected` | wrong-perm mapper → `VfsError::Malformed`; no `from_raw_parts` |
+| `stage79_byte_access_blocker_documented_and_gates_unchanged` | documents blocker; all three gate flags `true` |
+| `stage79_dispatch_write_shared_request_ramfs_regression` | RAMFS write via `BorrowedSharedIoTestMapper`; byte content verified |
+| `stage79_dispatch_read_shared_reply_ramfs_regression` | RAMFS read via `BorrowedSharedIoTestMapper`; byte content verified |
+| `stage79_handle_request_still_rejects_shared_opcodes` | shared opcodes → `VfsError::Unsupported` from `parse_request` |
+| `stage79_gate_values_unchanged_from_stage78` | all three direction/PM gate flags `true` |
+
+### Invariants frozen by Stage 79
+
+- `RecvV3SharedIoMapper::from_delivery` must copy all four delivery fields without modification.
+- `released` flag must be set BEFORE calling `release_v3_cleanup_token` (at-most-once guarantee).
+- All six validation layers must remain in order; none may be skipped or reordered.
+- `handle_request` must NOT route shared opcodes (unchanged from Stage 78).
+- `VFS_WRITE_SHARED_REQUEST_ENABLED`, `VFS_READ_SHARED_REPLY_ENABLED`, `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` all remain `true`.
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` remains `false`.
+- SYSCALL_COUNT, recv_shared_v3 ABI offsets, SpawnV5/Phase2B/Phase3B unchanged.
+- FAT/ext4/blkcache production behavior unchanged; shared I/O not enabled for those backends.
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --features hosted-dev -- stage79` (20 Stage 79 tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev` (full 360-test regression)
