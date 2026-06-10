@@ -4262,3 +4262,129 @@ after either outcome. The second call must return `Ok(())`.
 **Run commands:**
 - `cargo test -p yarm-fs-servers --features hosted-dev -- stage79` (20 Stage 79 tests)
 - `cargo test -p yarm-fs-servers --features hosted-dev` (full 360-test regression)
+
+---
+
+## Rule N+72 — Stage 80: ramfs_srv/fat_srv/ext4_srv CPIO staging, spawn wiring, and conservative mount policy
+
+**Context:** Stage 80 adds `ramfs_srv`, `fat_srv`, and `ext4_srv` to the CPIO initramfs archive,
+wires their spawn via the PM image-ID table, and documents conservative VFS mount policy.
+`ext4_srv` VFS registration is deliberately deferred: `ext4/service.rs::run()` is a demo smoke that
+returns without entering a kernel `ipc_recv` loop; VFS cannot route requests to a non-listening service.
+
+### N+72.1 — CPIO ELF alignment: all three FS server ELFs must be 4096-byte aligned
+
+All three ELFs (`sbin/ramfs_srv`, `sbin/fat_srv`, `sbin/ext4_srv`) must be packed with their data
+payloads at offsets divisible by `PAGE_ALIGN = 4096`. The packer must emit an `ALIGN_PROOF` marker
+to stderr for each, confirming `alignment_mod=0 aligned=true`.
+
+**Test:** `test_stage80_ramfs_fat_ext4_elfs_are_aligned_and_emit_proof` in
+`scripts/test_pack_initramfs_aligned.py`. Each ELF is synthetic (`b"\x7fELF" + name.encode() + b"\x00"*8`);
+`insert_alignment_pad` is exercised exactly as in production packing. The test verifies:
+- `sbin/ramfs_srv`, `sbin/fat_srv`, `sbin/ext4_srv` all present in CPIO offsets table.
+- `offsets[name] % PAGE_ALIGN == 0` for each.
+- `ALIGN_PROOF path=/<name> data_offset=<N> alignment_mod=0 aligned=true` in stderr.
+
+**Prohibited:** Packing the ELFs without calling `insert_alignment_pad`. Packing without the ALIGN_PROOF
+emit. Omitting any of the three from the CPIO archive.
+
+### N+72.2 — PM image-ID table: ext4_srv must be image_id=12; range max must be 12
+
+`VFS_SERVICE_IMAGE_ID_MAX` must be 12. `pm_vfs_spawn_inline` must map `12 => b"/initramfs/sbin/ext4_srv"`.
+`pm_image_cpio_name` must map `12 => Some(b"sbin/ext4_srv")`. Image IDs 10 (fat_srv) and 11 (ramfs_srv)
+must also be covered; all three must fall within `[VFS_SERVICE_IMAGE_ID_MIN, VFS_SERVICE_IMAGE_ID_MAX]`.
+
+**Test (source inspection):** `stage80_pm_image_id_range_covers_fs_servers` in
+`crates/yarm-control-plane-servers/src/control_plane/mod.rs` — asserts `const VFS_SERVICE_IMAGE_ID_MAX: u64 = 12;`
+in PM service source. `stage80_pm_ext4_cpio_path_registered` asserts both the `pm_vfs_spawn_inline`
+and `pm_image_cpio_name` match arms exist.
+
+**Prohibited:** Setting `VFS_SERVICE_IMAGE_ID_MAX` above 12 (no new image IDs added in Stage 80).
+Setting it below 12 (blocks fat/ramfs/ext4 spawn). Adding new syscalls (`SYSCALL_COUNT` must remain 31).
+
+### N+72.3 — init spawn wiring: ext4_srv spawned with image_id=12; mount deferred
+
+`init/service.rs::run()` must call `spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)` and log:
+- `INIT_EXT4_SPAWN_BEGIN` before the spawn call.
+- `INIT_EXT4_SPAWN_OK child_tid=<N> mount_deferred=true reason=no-ipc-loop` on success.
+- `EXT4_SRV_READY child_tid=<N>` on success.
+
+The `mount_deferred=true` and `reason=no-ipc-loop` tokens document the blocker: ext4's service loop
+is a demo smoke; it does not enter a kernel IPC receive loop. VFS registration cannot be wired until
+a real recv loop exists. Do NOT call `register_ext4_mount_with_vfs()` or any VFS mount registration
+path for ext4 in Stage 80.
+
+**Tests (source inspection):** `stage80_init_spawns_ext4_srv_with_image_id_12` and
+`stage80_init_ext4_vfs_mount_deferred_blocker_documented` in `control_plane/mod.rs`.
+
+**Prohibited:** Calling `register_ext4_mount_with_vfs()` in Stage 80. Omitting the blocker
+documentation in the init log. Placing stage80 tests inside `init/service.rs` — the `pub mod init`
+is `#[cfg(any(not(test), feature = "legacy-tests"))]` and those tests would never compile in normal
+test mode. All gate tests for init/PM behavior must use `include_str!()` source-inspection in
+`control_plane/mod.rs`.
+
+### N+72.4 — FS backend behavior: ext4 writes must remain Unsupported; FAT must guard no-block-backend
+
+`Ext4Backend::write(fd, len)` must return `Err(VfsError::Unsupported)` for all write lengths.
+`service_from_startup_config(FatStartupConfig::production(None, Some(1), 1))` must return
+`Err(FatServiceStartup::NoBlockBackend)`.
+`run_with_config(RamFsStartupConfig::default_compat())` must return `RamFsServiceStartup::Mounted { .. }`.
+
+**Tests:** `stage80_ext4_write_path_remains_unsupported`, `stage80_ext4_backend_rejects_writes_of_all_sizes`
+(sizes `[1u64, 512, 4096, 65536, 16*1024*1024+1]`), `stage80_fat_write_mode_guard_requires_block_backend`,
+`stage80_ramfs_run_with_config_smoke_unchanged` — all in `crates/yarm-fs-servers/src/lib.rs`
+`mod stage80_tests`.
+
+**Prohibited:** Enabling ext4 writes. Allowing FAT production writes without a block backend.
+Changing `VFS_SHARED_IO_ENABLED` (must remain true from Stage 78).
+
+### N+72.5 — Binary entry markers: all three FS server bins must have ENTRY and READY markers
+
+`sbin/ramfs_srv.rs` must contain `RAMFS_BIN_ENTRY_START`. `sbin/fat_srv.rs` must contain `FAT_BIN_ENTRY_START`.
+`sbin/ext4_srv.rs` must contain `EXT4_BIN_ENTRY_START`, `EXT4_SRV_ENTRY`, and `EXT4_MOUNT_READY`.
+`ext4/service.rs` must NOT contain `ipc_recv(` — the recv loop blocker must remain in place.
+
+**Tests:** `stage80_ext4_srv_bin_has_entry_and_ready_markers`, `stage80_all_three_fs_server_bins_have_entry_markers`,
+`stage80_ext4_vfs_registration_deferred_blocker_no_ipc_loop` in `mod stage80_tests`.
+
+### N+72.6 — VFS shared-I/O gate values must be unchanged from Stage 78
+
+`VFS_WRITE_SHARED_REQUEST_ENABLED`, `VFS_READ_SHARED_REPLY_ENABLED`, and `VFS_SHARED_IO_ENABLED` must
+all remain `true`. These were set in Stage 78 and must not be altered in Stage 80.
+
+**Test:** `stage80_vfs_shared_io_enabled_consistent_with_stage78` in `mod stage80_tests`.
+
+**Stage 80 test inventory:**
+
+*`scripts/test_pack_initramfs_aligned.py`:*
+- `test_stage80_ramfs_fat_ext4_elfs_are_aligned_and_emit_proof`
+
+*`crates/yarm-control-plane-servers/src/control_plane/mod.rs` — `mod tests`:*
+- `stage80_pm_image_id_range_covers_fs_servers`
+- `stage80_init_spawns_ext4_srv_with_image_id_12`
+- `stage80_init_ext4_vfs_mount_deferred_blocker_documented`
+- `stage80_pm_ext4_cpio_path_registered`
+- `stage80_syscall_count_unchanged`
+
+*`crates/yarm-fs-servers/src/lib.rs` — `mod stage80_tests`:*
+- `stage80_ext4_write_path_remains_unsupported`
+- `stage80_ext4_backend_rejects_writes_of_all_sizes`
+- `stage80_fat_write_mode_guard_requires_block_backend`
+- `stage80_vfs_shared_io_enabled_consistent_with_stage78`
+- `stage80_ramfs_run_with_config_smoke_unchanged`
+- `stage80_ext4_srv_bin_has_entry_and_ready_markers`
+- `stage80_all_three_fs_server_bins_have_entry_markers`
+- `stage80_ext4_vfs_registration_deferred_blocker_no_ipc_loop`
+
+**Hard invariants:**
+- `VFS_SERVICE_IMAGE_ID_MAX = 12`; `SYSCALL_COUNT = 31` — neither may change in Stage 80.
+- `ext4/service.rs` must NOT contain `ipc_recv(` until the recv-loop blocker is lifted.
+- `VFS_SHARED_IO_ENABLED` must remain `true` (unchanged from Stage 78).
+- CPIO archive must contain `sbin/ramfs_srv`, `sbin/fat_srv`, `sbin/ext4_srv` all at 4096-aligned offsets.
+- No kernel syscall/IPC/VM/cap internals changed by Stage 80.
+
+**Run commands:**
+- `python3 scripts/test_pack_initramfs_aligned.py` (4 CPIO alignment tests)
+- `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 gate tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev -- stage80` (8 FS backend tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev` (full regression)

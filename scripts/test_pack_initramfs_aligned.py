@@ -90,5 +90,41 @@ class AlignedInitramfsTests(unittest.TestCase):
             self.assertEqual(results["manifest"] % PACKER.PAGE_ALIGN, 0)
 
 
+    def test_stage80_ramfs_fat_ext4_elfs_are_aligned_and_emit_proof(self):
+        """Stage 80: sbin/ramfs_srv, sbin/fat_srv, sbin/ext4_srv all pack with
+        4096-byte alignment and emit ALIGN_PROOF aligned=true markers."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "root"
+            (root / "sbin").mkdir(parents=True)
+            (root / "init").write_bytes(b"\x7fELFinit")
+            for name in ("ramfs_srv", "fat_srv", "ext4_srv"):
+                (root / "sbin" / name).write_bytes(
+                    b"\x7fELF" + name.encode() + b"\x00" * 8
+                )
+            (root / "sbin" / "config").write_text("not an ELF")
+            output = Path(temp) / "initramfs.cpio"
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                results = PACKER.pack(root, output, set())
+
+            offsets = cpio_data_offsets(output.read_bytes())
+            for name in ("sbin/ramfs_srv", "sbin/fat_srv", "sbin/ext4_srv"):
+                self.assertIn(name, offsets, f"{name} must be present in CPIO")
+                self.assertEqual(
+                    offsets[name] % PACKER.PAGE_ALIGN,
+                    0,
+                    f"{name} payload must be 4096-byte aligned",
+                )
+                self.assertIn(
+                    f"ALIGN_PROOF path=/{name} data_offset={offsets[name]} "
+                    "alignment_mod=0 aligned=true",
+                    stderr.getvalue(),
+                    f"ALIGN_PROOF for /{name} must appear in stderr",
+                )
+            # non-ELF config must not appear in results
+            self.assertNotIn("sbin/config", results)
+
+
 if __name__ == "__main__":
     unittest.main()
