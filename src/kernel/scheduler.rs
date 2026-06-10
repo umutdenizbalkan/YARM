@@ -25,7 +25,7 @@ const _: () = assert!(MAX_RUN_QUEUE.is_power_of_two());
 /// back to the normal `ipc_recv_with_deadline` path, which is always correct.
 pub(crate) static SPLIT_RECV_TIMEOUT_DEADLINE: [core::sync::atomic::AtomicU64; MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; MAX_CPUS];
-const MEMBERSHIP_SLOTS: usize = 64;
+const MEMBERSHIP_SLOTS: usize = 256;
 const MEMBERSHIP_EMPTY: u8 = 0;
 const MEMBERSHIP_TOMBSTONE: u8 = 1;
 const MEMBERSHIP_FULL: u8 = 2;
@@ -164,6 +164,11 @@ impl PriorityScheduler {
                 _ => {}
             }
             idx = (idx + 1) & (MEMBERSHIP_SLOTS - 1);
+        }
+        if let Some(insert_idx) = first_tombstone {
+            self.membership_keys[insert_idx] = tid;
+            self.membership_state[insert_idx] = MEMBERSHIP_FULL;
+            return Ok(());
         }
         Err(())
     }
@@ -323,9 +328,6 @@ impl PriorityScheduler {
         // Scan queues in priority order for the preferred TID.
         for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
             if self.queues[Self::priority_index(priority)].remove_tid(preferred) {
-                if !self.membership_tracking_exhausted {
-                    self.membership_remove(preferred);
-                }
                 self.current = Some(ScheduledTask {
                     tid: preferred,
                     priority,
@@ -658,21 +660,60 @@ mod tests {
     }
 
     #[test]
-    fn membership_tracking_rebuilds_before_falling_back_to_linear_scan() {
+    fn membership_insert_reuses_tombstone_when_no_empty_slot_exists() {
+        let mut sched = PriorityScheduler::default();
+        for idx in 0..MEMBERSHIP_SLOTS {
+            sched.membership_keys[idx] = ThreadId(idx as u64 + 1);
+            sched.membership_state[idx] = MEMBERSHIP_FULL;
+        }
+        let tombstone = 7;
+        sched.membership_state[tombstone] = MEMBERSHIP_TOMBSTONE;
+
+        let inserted = ThreadId(MEMBERSHIP_SLOTS as u64 + 1);
+        assert_eq!(sched.membership_insert(inserted), Ok(()));
+        assert_eq!(sched.membership_keys[tombstone], inserted);
+        assert_eq!(sched.membership_state[tombstone], MEMBERSHIP_FULL);
+    }
+
+    #[test]
+    fn membership_capacity_covers_all_queues_plus_running_task() {
+        let mut sched = PriorityScheduler::default();
+        sched
+            .enqueue_with_priority(ThreadId(1), TaskPriority::Normal)
+            .expect("seed running task");
+        assert_eq!(sched.dispatch_next(), Some(ThreadId(1)));
+
+        let mut next_tid = 2;
+        for priority in [TaskPriority::High, TaskPriority::Normal, TaskPriority::Low] {
+            for _ in 0..MAX_RUN_QUEUE {
+                sched
+                    .enqueue_with_priority(ThreadId(next_tid), priority)
+                    .expect("fill legal run-queue capacity");
+                next_tid += 1;
+            }
+        }
+
+        assert_eq!(sched.runnable_count(), 3 * MAX_RUN_QUEUE);
+        assert!(!sched.membership_tracking_exhausted);
+        assert!(sched.membership_contains(ThreadId(1)));
+        for tid in 2..next_tid {
+            assert!(sched.membership_contains(ThreadId(tid)));
+        }
+    }
+
+    #[test]
+    fn membership_tracking_reuses_tombstones_without_linear_fallback() {
         let mut sched = PriorityScheduler::default();
         for tid in 1..=(MEMBERSHIP_SLOTS as u64) {
             sched
                 .enqueue_with_priority(ThreadId(tid), TaskPriority::Normal)
-                .expect("seed queue");
-        }
-
-        for _ in 0..MEMBERSHIP_SLOTS {
-            assert!(sched.dispatch_next().is_some());
-            assert!(sched.block_current().is_some());
+                .expect("seed task");
+            assert_eq!(sched.dispatch_next(), Some(ThreadId(tid)));
+            assert_eq!(sched.block_current(), Some(ThreadId(tid)));
         }
         assert_eq!(sched.runnable_count(), 0);
 
-        for tid in 1000..(1000 + MEMBERSHIP_SLOTS as u64) {
+        for tid in 1000..(1000 + MAX_RUN_QUEUE as u64) {
             sched
                 .enqueue_with_priority(ThreadId(tid), TaskPriority::Normal)
                 .expect("reused membership slot");
@@ -705,6 +746,12 @@ mod tests {
         // TID 1 was re-enqueued.
         assert_eq!(sched.runnable_count(), 1);
         assert!(sched.contains_tid(ThreadId(1)));
+        assert!(sched.membership_contains(ThreadId(2)));
+        assert_eq!(
+            sched.enqueue_with_priority(ThreadId(2), TaskPriority::Normal),
+            Err(SchedulerError::AlreadyQueued)
+        );
+        assert_eq!(sched.runnable_count(), 1);
     }
 
     #[test]
