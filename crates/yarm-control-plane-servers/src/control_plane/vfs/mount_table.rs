@@ -468,4 +468,123 @@ mod tests {
         let (cap, _) = table.route(b"/mnt/file").unwrap();
         assert_eq!(cap, 3);
     }
+
+    // ── Stage 87: VFS routing safety ─────────────────────────────────────────
+
+    fn make_boot_table() -> VfsMountTable {
+        // Representative table matching the YARM boot-time mount configuration:
+        //   /initramfs/ → initramfs_srv (cap=10, static boot mount)
+        //   /dev/       → devfs_srv     (cap=20, static boot mount)
+        //   /ram/       → ramfs_srv     (cap=30, dynamic — registered after RAMFS spawn)
+        // Not present: /fat (INIT_SPAWN_FAT_SRV=false), ext4 (VFS_EXT4_LIVE_MOUNT_ENABLED=false)
+        let mut table = VfsMountTable::new();
+        assert!(table.register(b"/initramfs/", "initramfs", 10));
+        assert!(table.register(b"/dev/", "devfs", 20));
+        table.insert_dynamic(b"/ram", 30, 0).expect("ramfs dynamic mount");
+        table
+    }
+
+    #[test]
+    fn stage87_routing_dev_routes_to_devfs() {
+        let table = make_boot_table();
+        let (cap, label) = table.route(b"/dev").expect("/dev must route to devfs");
+        assert_eq!(cap, 20);
+        assert_eq!(label.as_str(), "devfs");
+    }
+
+    #[test]
+    fn stage87_routing_dev_null_routes_to_devfs() {
+        let table = make_boot_table();
+        let (cap, label) = table.route(b"/dev/null").expect("/dev/null must route to devfs");
+        assert_eq!(cap, 20);
+        assert_eq!(label.as_str(), "devfs");
+    }
+
+    #[test]
+    fn stage87_routing_dev_console_routes_to_devfs() {
+        let table = make_boot_table();
+        let (cap, label) = table.route(b"/dev/console").expect("/dev/console must route to devfs");
+        assert_eq!(cap, 20);
+        assert_eq!(label.as_str(), "devfs");
+    }
+
+    #[test]
+    fn stage87_routing_ram_routes_to_ramfs() {
+        let table = make_boot_table();
+        let (cap, _) = table.route(b"/ram").expect("/ram must route to RAMFS");
+        assert_eq!(cap, 30);
+        let (cap, _) = table.route(b"/ram/file.txt").expect("/ram/file.txt must route to RAMFS");
+        assert_eq!(cap, 30);
+    }
+
+    #[test]
+    fn stage87_routing_fat_absent_when_not_registered() {
+        // /fat is not in the default boot table (INIT_SPAWN_FAT_SRV=false).
+        let table = make_boot_table();
+        assert!(
+            table.route(b"/fat").is_none(),
+            "/fat must return None when FAT is not registered (INIT_SPAWN_FAT_SRV=false)"
+        );
+        assert!(
+            table.route(b"/fat/hello.txt").is_none(),
+            "/fat/hello.txt must return None when FAT is not registered"
+        );
+    }
+
+    #[test]
+    fn stage87_routing_initramfs_paths_accessible() {
+        let table = make_boot_table();
+        let (cap, label) = table
+            .route(b"/initramfs/sbin/init")
+            .expect("/initramfs/sbin/init must route to initramfs");
+        assert_eq!(cap, 10);
+        assert_eq!(label.as_str(), "initramfs");
+        let (cap, _) = table
+            .route(b"/initramfs/boot-marker")
+            .expect("/initramfs/boot-marker must route to initramfs");
+        assert_eq!(cap, 10);
+    }
+
+    #[test]
+    fn stage87_routing_ext4_absent_by_default() {
+        // ext4 live-mount is disabled (VFS_EXT4_LIVE_MOUNT_ENABLED=false).
+        let table = make_boot_table();
+        assert!(
+            table.route(b"/ext4").is_none(),
+            "/ext4 must return None when ext4 live-mount is disabled"
+        );
+        assert!(
+            table.route(b"/mnt/ext4").is_none(),
+            "/mnt/ext4 must return None when ext4 live-mount is disabled"
+        );
+    }
+
+    #[test]
+    fn stage87_routing_devpts_longer_prefix_wins() {
+        // /dev/pts/ prefix should beat /dev/ when registered.
+        let mut table = make_boot_table();
+        table.insert_dynamic(b"/dev/pts", 25, 0).expect("devpts mount");
+
+        let (cap, _) = table.route(b"/dev/pts/0").expect("/dev/pts/0 must route");
+        assert_eq!(cap, 25, "/dev/pts/0 must match the longer /dev/pts/ prefix");
+
+        let (cap, _) = table.route(b"/dev/null").expect("/dev/null must route");
+        assert_eq!(cap, 20, "/dev/null must still match /dev/ prefix");
+    }
+
+    #[test]
+    fn stage87_routing_fat_enabled_when_dynamically_registered() {
+        // Prove that /fat is routable once fat_srv registers it via VFS_OP_MOUNT_REGISTER.
+        // This would happen if INIT_SPAWN_FAT_SRV were true and fat_srv reached READY.
+        let mut table = make_boot_table();
+        table.insert_dynamic(b"/fat", 40, 0).expect("fat dynamic mount");
+
+        let (cap, _) = table.route(b"/fat").expect("/fat must route once registered");
+        assert_eq!(cap, 40);
+        let (cap, _) = table.route(b"/fat/hello.txt").expect("/fat/hello.txt must route");
+        assert_eq!(cap, 40);
+        // Other routes remain unaffected.
+        let (cap, _) = table.route(b"/dev/null").expect("/dev/null still routes");
+        assert_eq!(cap, 20);
+    }
 }

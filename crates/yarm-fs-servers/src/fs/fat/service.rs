@@ -339,8 +339,81 @@ pub fn run_with_config(config: FatStartupConfig) -> FatServiceStartup {
     }
 }
 
+fn run_resident_service_loop(svc: &mut FatService) {
+    let ctx = yarm_user_rt::runtime::startup_context();
+    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
+        yarm_user_rt::user_log!("FAT_SRV_RECV_CAP cap={}", recv_cap);
+        yarm_user_rt::user_log!("FAT_SRV_BLOCKING_RECV_LOOP");
+        loop {
+            // SAFETY: fat_srv owns its startup-provided service recv endpoint.
+            match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
+                Ok(Some(received)) => {
+                    let msg = received.message;
+                    let Some(reply_cap) = received.reply_cap else {
+                        continue;
+                    };
+                    let response = svc.handle(msg).unwrap_or_else(|_| {
+                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err-reply")
+                    });
+                    let _ =
+                        unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                }
+                _ => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+            }
+        }
+    } else {
+        yarm_user_rt::user_log!("FAT_SRV_NO_RECV_CAP_RESIDENT_YIELD");
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
+}
+
+pub fn run_resident(config: FatStartupConfig) -> FatServiceStartup {
+    yarm_user_rt::user_log!("FAT_SRV_ENTRY");
+    match service_from_startup_config(config) {
+        Ok(mut svc) => {
+            let backend_kind = svc.backend().backend_kind();
+            let mount_config = config
+                .mount_config
+                .unwrap_or_else(FatMountConfig::default_compat);
+            match run_mount_smoke(&mut svc) {
+                Ok(()) => {
+                    yarm_user_rt::user_log!(
+                        "FAT_MOUNT_READY prefix={} device_id={}",
+                        alloc::string::String::from_utf8_lossy(mount_config.prefix()),
+                        mount_config.device_id
+                    );
+                    yarm_user_rt::user_log!("FAT_SRV_READY");
+                    run_resident_service_loop(&mut svc);
+                    FatServiceStartup::Mounted {
+                        backend_kind,
+                        mount_config,
+                    }
+                }
+                Err(err) => {
+                    yarm_user_rt::user_log!("FAT_MOUNT_FAILED reason={:?}", err);
+                    FatServiceStartup::MountFailed(FatError::Malformed)
+                }
+            }
+        }
+        Err(FatServiceStartup::NoBlockBackend) => {
+            yarm_user_rt::user_log!("FAT_NO_BLOCK_BACKEND");
+            yarm_user_rt::user_log!("FAT_MOUNT_FAILED reason=no-block-backend");
+            FatServiceStartup::NoBlockBackend
+        }
+        Err(FatServiceStartup::MountFailed(err)) => {
+            yarm_user_rt::user_log!("FAT_MOUNT_FAILED reason={:?}", err);
+            FatServiceStartup::MountFailed(err)
+        }
+        Err(other) => other,
+    }
+}
+
 pub fn run() {
-    let _ = run_with_config(startup_config_from_runtime());
+    let _ = run_resident(startup_config_from_runtime());
 }
 
 #[cfg(test)]

@@ -341,7 +341,7 @@ mod stage86_tests {
 
 #[cfg(test)]
 mod stage87_tests {
-    use crate::fs::common::shared_io_adapter::VFS_RAMFS_LIVE_MOUNT_ENABLED;
+    use crate::fs::common::shared_io_adapter::{VFS_FAT_LIVE_MOUNT_ENABLED, VFS_RAMFS_LIVE_MOUNT_ENABLED};
     use crate::fs::ramfs::service::{
         RamFsMountConfig, RamFsServiceStartup, RamFsStartupConfig, run_with_config,
         run_request_loop,
@@ -415,6 +415,209 @@ mod stage87_tests {
     fn stage87_ramfs_resident_loop_source_has_no_recv_cap_path() {
         assert!(
             include_str!("fs/ramfs/service.rs").contains("RAMFS_SRV_NO_RECV_CAP_RESIDENT_YIELD")
+        );
+    }
+
+    // ── Part B: FAT resident recv loop (infrastructure, spawn stays disabled) ──
+
+    #[test]
+    fn stage87_fat_live_mount_disabled_gate() {
+        assert!(
+            !VFS_FAT_LIVE_MOUNT_ENABLED,
+            "FAT live-mount gate must be false (no virtio_blk in default profile)"
+        );
+    }
+
+    #[test]
+    fn stage87_fat_resident_loop_source_markers() {
+        let src = include_str!("fs/fat/service.rs");
+        assert!(
+            src.contains("FAT_SRV_BLOCKING_RECV_LOOP"),
+            "fat/service.rs must have FAT_SRV_BLOCKING_RECV_LOOP"
+        );
+        assert!(
+            src.contains("FAT_SRV_NO_RECV_CAP_RESIDENT_YIELD"),
+            "fat/service.rs must have FAT_SRV_NO_RECV_CAP_RESIDENT_YIELD"
+        );
+        assert!(
+            src.contains("FAT_SRV_READY"),
+            "fat/service.rs must emit FAT_SRV_READY"
+        );
+        assert!(
+            src.contains("ipc_recv_v2("),
+            "fat/service.rs must use ipc_recv_v2 in resident loop"
+        );
+    }
+
+    #[test]
+    fn stage87_fat_run_calls_run_resident() {
+        let src = include_str!("fs/fat/service.rs");
+        assert!(
+            src.contains("run_resident(startup_config_from_runtime())"),
+            "fat/service.rs run() must call run_resident"
+        );
+    }
+
+    // ── Part D: Boot/smoke expectations ─────────────────────────────────────
+
+    #[test]
+    fn stage87_init_ramfs_spawn_ok_marker_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_RAMFS_SPAWN_OK"),
+            "init must log INIT_RAMFS_SPAWN_OK on success"
+        );
+        assert!(
+            src.contains("INIT_RAMFS_SPAWN_BEGIN"),
+            "init must log INIT_RAMFS_SPAWN_BEGIN"
+        );
+        assert!(
+            src.contains("INIT_SPAWN_RAMFS_SRV: bool = true"),
+            "RAMFS spawn must be enabled (Stage 86)"
+        );
+    }
+
+    #[test]
+    fn stage87_init_ext4_spawn_ok_marker_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_EXT4_SPAWN_OK"),
+            "init must log INIT_EXT4_SPAWN_OK on success"
+        );
+        assert!(
+            src.contains("INIT_EXT4_SPAWN_BEGIN"),
+            "init must log INIT_EXT4_SPAWN_BEGIN"
+        );
+        assert!(
+            src.contains("INIT_SPAWN_EXT4_SRV: bool = true"),
+            "ext4 spawn must be enabled (Stage 86)"
+        );
+    }
+
+    #[test]
+    fn stage87_init_fat_spawn_skipped_with_documented_blocker() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
+            "INIT_SPAWN_FAT_SRV must be false (needs block device)"
+        );
+        assert!(
+            src.contains("INIT_FAT_SPAWN_SKIPPED reason=server_disabled"),
+            "init must emit INIT_FAT_SPAWN_SKIPPED reason=server_disabled when FAT disabled"
+        );
+        assert!(
+            src.contains("needs block device"),
+            "init must document FAT blocker (needs block device)"
+        );
+    }
+
+    #[test]
+    fn stage87_ramfs_srv_entry_and_ready_markers_present() {
+        let src = include_str!("fs/ramfs/service.rs");
+        assert!(src.contains("RAMFS_SRV_ENTRY"), "ramfs must log RAMFS_SRV_ENTRY");
+        assert!(src.contains("RAMFS_SRV_READY"), "ramfs must log RAMFS_SRV_READY");
+        assert!(src.contains("RAMFS_MOUNT_READY"), "ramfs must log RAMFS_MOUNT_READY");
+    }
+
+    #[test]
+    fn stage87_ext4_srv_entry_and_ready_markers_present() {
+        // EXT4_SRV_ENTRY is logged by the binary entry point (bin/ext4_srv.rs).
+        // EXT4_SRV_READY is logged by the service loop (fs/ext4/service.rs).
+        let bin_src = include_str!("bin/ext4_srv.rs");
+        let svc_src = include_str!("fs/ext4/service.rs");
+        assert!(bin_src.contains("EXT4_SRV_ENTRY"), "ext4 binary must log EXT4_SRV_ENTRY");
+        assert!(svc_src.contains("EXT4_SRV_READY"), "ext4 service must log EXT4_SRV_READY");
+    }
+
+    // ── Part C: VFS routing safety ────────────────────────────────────────────
+
+    #[test]
+    fn stage87_vfs_routing_fat_gate_implies_no_fat_mount_at_boot() {
+        // VFS_FAT_LIVE_MOUNT_ENABLED=false + INIT_SPAWN_FAT_SRV=false mean fat_srv
+        // never spawns, so it never sends VFS_OP_MOUNT_REGISTER for /fat.
+        assert!(
+            !VFS_FAT_LIVE_MOUNT_ENABLED,
+            "/fat must not appear in the VFS mount table when FAT live-mount gate is disabled"
+        );
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
+            "INIT_SPAWN_FAT_SRV must be false to prevent /fat from entering the VFS mount table"
+        );
+    }
+
+    #[test]
+    fn stage87_vfs_routing_ramfs_enabled_for_slash_ram() {
+        // RAMFS is spawned and registers /ram when INIT_SPAWN_RAMFS_SRV=true.
+        assert!(
+            VFS_RAMFS_LIVE_MOUNT_ENABLED,
+            "/ram must be registered in the VFS mount table via RAMFS live-mount path"
+        );
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_SPAWN_RAMFS_SRV: bool = true"),
+            "INIT_SPAWN_RAMFS_SRV must be true so /ram is registered with the VFS"
+        );
+        assert!(
+            src.contains("register_ramfs_mount_with_vfs("),
+            "init must call register_ramfs_mount_with_vfs after successful RAMFS spawn"
+        );
+    }
+
+    #[test]
+    fn stage87_vfs_routing_init_passes_devfs_and_initramfs_caps_to_vfs() {
+        // devfs and initramfs send caps are passed to VFS at spawn time,
+        // allowing VFS to register /dev and /initramfs mounts internally.
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_DEVFS_SPAWN_V5_CALL_BEGIN"),
+            "init must spawn devfs_srv and obtain its send cap for VFS"
+        );
+        assert!(
+            src.contains("initramfs_send_cap, devfs_send_cap"),
+            "init must pass both initramfs_send_cap and devfs_send_cap to VFS at spawn"
+        );
+    }
+
+    #[test]
+    fn stage87_vfs_routing_fat_not_registered_when_init_spawn_disabled() {
+        // If INIT_SPAWN_FAT_SRV=false, the INIT_FAT_SPAWN_SKIPPED path is taken
+        // and register_fat_mount_with_vfs is never called.
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        // Gate must be false.
+        assert!(
+            src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
+            "INIT_SPAWN_FAT_SRV must be false to prevent /fat from entering the VFS mount table"
+        );
+        // When disabled, the skipped marker is emitted (not the register path).
+        assert!(
+            src.contains("INIT_FAT_SPAWN_SKIPPED reason=server_disabled"),
+            "init must emit INIT_FAT_SPAWN_SKIPPED when FAT spawn is disabled"
+        );
+        // Verify the call site comes after the gate declaration (no call outside the gate).
+        let gate_pos = src
+            .find("INIT_SPAWN_FAT_SRV: bool = false")
+            .expect("INIT_SPAWN_FAT_SRV gate must be present");
+        let skipped_pos = src
+            .rfind("INIT_FAT_SPAWN_SKIPPED reason=server_disabled")
+            .expect("skipped marker must be present");
+        assert!(
+            gate_pos < skipped_pos,
+            "FAT skipped marker must appear after the INIT_SPAWN_FAT_SRV gate"
         );
     }
 }

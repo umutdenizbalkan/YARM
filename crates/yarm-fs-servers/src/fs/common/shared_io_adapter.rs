@@ -145,6 +145,17 @@ pub const VFS_RAMFS_LIVE_MOUNT_ENABLED: bool = true;
 /// stub is available for integration tests.
 pub const VFS_FAT_SHARED_IO_ENABLED: bool = false;
 
+/// Stage 87: FAT live-mount path.
+///
+/// `false`: FAT server requires a virtio_blk block device not present in the
+/// default hosted-dev environment.  The resident recv loop is implemented in
+/// `fat/service.rs` (Stage 87) but `INIT_SPAWN_FAT_SRV` remains disabled until:
+///   (1) a block-device stub is available for integration tests, and
+///   (2) `VFS_FAT_SHARED_IO_ENABLED` is lifted to `true`.
+/// When `true` this gate allows `register_fat_mount_with_vfs` to be called
+/// after a successful FAT spawn and `/fat` is registered in the VFS mount table.
+pub const VFS_FAT_LIVE_MOUNT_ENABLED: bool = false;
+
 /// Stage 86: ext4 resident IPC recv loop.
 ///
 /// `true`: ext4/service.rs::run() now enters a resident `ipc_recv_v2` loop after
