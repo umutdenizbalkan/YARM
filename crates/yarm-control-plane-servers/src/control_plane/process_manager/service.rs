@@ -1737,7 +1737,22 @@ unsafe fn pm_try_grant_ro_and_spawn(
     let fd = match decode_u64(open_reply.as_slice()) {
         Some(v) => v,
         None => {
-            yarm_user_rt::user_log!("PM_ELF_ZC_FAIL image_id={} reason=bad_fd_decode", image_id);
+            let reply_payload = open_reply.as_slice();
+            let b0 = reply_payload.first().copied().unwrap_or(0xff);
+            let b1 = reply_payload.get(1).copied().unwrap_or(0xff);
+            let b2 = reply_payload.get(2).copied().unwrap_or(0xff);
+            let b3 = reply_payload.get(3).copied().unwrap_or(0xff);
+            yarm_user_rt::user_log!(
+                "PM_ELF_ZC_FAIL image_id={} reason=bad_fd_decode opcode={} flags={} payload_len={} bytes=[{:02x},{:02x},{:02x},{:02x}]",
+                image_id,
+                open_reply.opcode,
+                open_reply.flags,
+                reply_payload.len(),
+                b0,
+                b1,
+                b2,
+                b3
+            );
             return Err(ProcessManagerError::Malformed);
         }
     };
