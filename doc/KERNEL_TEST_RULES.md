@@ -4638,3 +4638,39 @@ let delivery = RecvSharedV3Delivery {
 ```
 
 **Run:** `cargo test -p yarm-fs-servers --lib stage84`
+
+## Stage 85 test rules — RAMFS live route/profile proof
+
+**Location:** `crates/yarm-fs-servers/src/fs/common/vfs_service.rs`, `mod stage85_tests`
+
+**All 24 tests share these invariants:**
+1. `VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED = true` — gate must be on.
+2. `dispatch_shared_delivery` is the only new method (no changes to `handle_request`).
+3. `parse_request` still returns `VfsError::Unsupported` for shared opcodes.
+4. All lifecycle slots are freed on both success and error paths.
+5. `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` — not changed.
+
+**Test groups:**
+
+1. **Gate:** `stage85_gate_constant_is_true` — `VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED == true`.
+2. **Wiring:** `stage85_dispatch_shared_delivery_is_callable` — returns `Unsupported` for unknown
+   opcode, proving the method exists.
+3. **Default preserved (2 tests):** `stage85_handle_request_still_rejects_write_shared`,
+   `stage85_handle_request_still_rejects_read_shared` — `parse_request` returns `Unsupported`.
+4. **WRITE_SHARED_REQUEST full lifecycle (1 test):** `stage85_write_shared_request_live_route_full_lifecycle`
+   — request→delivery→mapper→backend→cleanup→slot freed; backend bytes verified.
+5. **READ_SHARED_REPLY full lifecycle (1 test):** `stage85_read_shared_reply_live_route_full_lifecycle`
+   — heap buffer written by `read_shared_bytes`; slot freed.
+6. **RequesterExit (3 tests):** `stage85_requester_exit_pm_owned_via_deliver_all`,
+   `stage85_requester_exit_pm_owned_not_supervisor`, `stage85_requester_exit_inflight_slot_cleaned_by_deliver_all`.
+7. **Error behavior (8 tests):** malformed message, zero cleanup token, zero mapped_base,
+   short range, stale generation (→ `Malformed`), missing MAP_READ, missing MAP_WRITE,
+   backend error cleans slot, unknown opcode → `Unsupported`.
+8. **Regression (5 tests):** supervisor notification disabled, Stage 84 gate still true, prior
+   gate flags unchanged, `parse_request` still rejects both shared opcodes,
+   `SharedIoRouteReply` variant field checks.
+
+**Token convention:** Stage 85 uses `TW85 = 0x0085_0040` (write), `TR85 = 0x0085_0041` (read).
+`object_handle = token`, `object_generation = token >> 16`.  Heap-backed `ptr` as `mapped_base`.
+
+**Run:** `cargo test -p yarm-fs-servers --lib stage85`

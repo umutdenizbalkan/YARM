@@ -114,6 +114,22 @@ pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = true;
 /// Does **not** change SYSCALL_COUNT, startup slots, SpawnV5 ABI, or image IDs.
 pub const VFS_STAGE84_RAMFS_BRIDGE_ENABLED: bool = true;
 
+/// Stage 85: RAMFS live shared-I/O route/profile gate.
+///
+/// `true`: `VfsService::dispatch_shared_delivery` is active, wiring the RAMFS-only
+/// Stage 84 bridge into the normal VFS service-loop message path.  A
+/// `RecvSharedV3Delivery` + encoded `Message` is decoded by opcode and routed to
+/// `handle_write_shared_request_gated` or `handle_read_shared_reply_gated`.
+///
+/// This is a **profile proof**: it proves the Stage 84 bridge can be called from
+/// a live VFS route without changing the default `handle_request` path.
+///
+/// **RAMFS-only** (Stage 85): FAT/ext4/blkcache paths remain unchanged.
+/// `UnsupportedSharedIoMapper` remains the default outside this explicit gate.
+/// `handle_request` shared opcodes still return `VfsError::Unsupported`.
+/// Does **not** change SYSCALL_COUNT, startup slots, SpawnV5 ABI, or image IDs.
+pub const VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED: bool = true;
+
 /// Stage 76: VFS entry point for a PM-pushed `PROC_OP_TASK_EXITED` event.
 ///
 /// Gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` (enabled in Stage 77+78).

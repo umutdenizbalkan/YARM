@@ -1273,3 +1273,47 @@ returns `VfsError::Unsupported` for `VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_RE
 - `VFS_SHARED_IO_ENABLED = true` (unchanged)
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
 - 412 yarm-fs-servers tests pass (392 prior + 20 Stage 84)
+
+## Stage 85 — RAMFS live shared-I/O route/profile proof
+
+**Gate constant:** `VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED = true`
+(`crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs`)
+
+**What Stage 85 adds:**
+
+`dispatch_shared_delivery(&delivery, message)` — a new method on `VfsService<B>` that routes
+an incoming `RecvSharedV3Delivery` + opcode-bearing `Message` through the Stage 84 gated bridge.
+Returns `SharedIoRouteReply::WriteShared(VfsWriteSharedReply)` or
+`SharedIoRouteReply::ReadShared(VfsReadSharedReply)`.
+
+**Dispatch table:**
+- `VFS_OP_WRITE_SHARED_REQUEST` (27) → `handle_write_shared_request_gated`
+- `VFS_OP_READ_SHARED_REPLY` (26) → `handle_read_shared_reply_gated`
+- any other opcode → `VfsError::Unsupported`
+
+**`mapped_base == 0` guard:** `dispatch_shared_delivery` rejects `delivery.mapped_base == 0`
+with `VfsError::Malformed` before reaching the mapper (prevents null-pointer slice creation).
+
+**`handle_request` unchanged:** `parse_request` still returns `VfsError::Unsupported` for
+`VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_READ_SHARED_REPLY`.  Stage 85 only activates the
+new `dispatch_shared_delivery` route; the normal service-loop path is not altered.
+
+**RAMFS-only:** FAT/ext4/blkcache paths unchanged.  `UnsupportedSharedIoMapper` remains
+the default outside this explicit gate.
+
+**RequesterExit:** PM-owned via `deliver_requester_exit_all`.
+`VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` remains `false`.
+
+**Gate tests:** `cargo test -p yarm-fs-servers --lib stage85` (24 tests in `vfs_service.rs`).
+
+**Invariants preserved:**
+- SYSCALL_COUNT = 31 (no change)
+- STARTUP_SLOT_COUNT = 18 (no change)
+- SpawnV5 ABI, image IDs, initramfs packing: unchanged
+- `handle_request` / `parse_request` still rejects shared opcodes
+- `VFS_STAGE84_RAMFS_BRIDGE_ENABLED = true` (unchanged)
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = true` (unchanged)
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (unchanged)
+- `VFS_SHARED_IO_ENABLED = true` (unchanged)
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
+- 436 yarm-fs-servers tests pass (412 prior + 24 Stage 85)
