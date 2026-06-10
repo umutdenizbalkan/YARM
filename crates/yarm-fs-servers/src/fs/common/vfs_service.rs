@@ -2,8 +2,12 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::shared_io_adapter::{
-    VfsReadSharedBinding, VfsReadSharedBindingError, VfsSharedIoMapper, VfsWriteSharedBinding,
-    VfsWriteSharedBindingError,
+    RecvV3SharedIoMapper, VfsReadSharedBinding, VfsReadSharedBindingError, VfsSharedIoMapper,
+    VfsWriteSharedBinding, VfsWriteSharedBindingError, VFS_STAGE84_RAMFS_BRIDGE_ENABLED,
+};
+use super::shared_io_lifecycle::{
+    VfsSharedIoDirection, VfsSharedIoHandleTable, VfsSharedIoLifecycle,
+    VfsSharedIoRequesterExitAction, VfsSharedIoTerminalReason,
 };
 use super::vfs_ipc::{
     InMemoryBackend, MountNamespacePolicy, MountRecord, VfsBackend, VfsError, VfsRequest,
@@ -12,10 +16,12 @@ use yarm_ipc_abi::vfs_abi::{
     OpenAtInlinePath, ReadWriteArgs, StatxInlinePath, VFS_OP_CLOSE, VFS_OP_DUP,
     VFS_OP_EPOLL_CREATE1, VFS_OP_EPOLL_CTL, VFS_OP_EPOLL_PWAIT, VFS_OP_FCNTL, VFS_OP_IOCTL,
     VFS_OP_OPENAT, VFS_OP_POLL, VFS_OP_READ, VFS_OP_SENDFILE, VFS_OP_STATX, VFS_OP_WRITE,
-    VFS_SHARED_IO_STATUS_OK, VfsReadSharedReply, VfsReadSharedRequest, VfsV1Args,
+    VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VFS_SHARED_IO_STATUS_OK,
+    VfsReadSharedReply, VfsReadSharedRequest, VfsSharedBufferDescriptor, VfsV1Args,
     VfsWriteSharedReply, VfsWriteSharedRequest,
 };
 use yarm_user_rt::ipc::Message;
+use yarm_user_rt::syscall::recv_v3::RecvSharedV3Delivery;
 
 const MAX_MOUNTS: usize = 8;
 
@@ -105,12 +111,18 @@ impl VfsReply {
     }
 }
 
+/// Maximum concurrent shared-I/O requests tracked in the VfsService lifecycle store (Stage 84).
+pub const MAX_SHARED_IO_REQUESTS: usize = 4;
+
 #[derive(Debug)]
 pub struct VfsService<B: VfsBackend = InMemoryBackend> {
     backend: B,
     policy: MountNamespacePolicy,
     op_sequence: u64,
     mounts: [Option<MountRecord>; MAX_MOUNTS],
+    // Stage 84: per-request lifecycle/handle store.
+    shared_io_handles: VfsSharedIoHandleTable<MAX_SHARED_IO_REQUESTS>,
+    shared_io_requests: [Option<VfsSharedIoLifecycle>; MAX_SHARED_IO_REQUESTS],
 }
 
 impl Default for VfsService<InMemoryBackend> {
@@ -120,23 +132,27 @@ impl Default for VfsService<InMemoryBackend> {
 }
 
 impl VfsService<InMemoryBackend> {
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             backend: InMemoryBackend::new(),
             policy: MountNamespacePolicy::baseline(),
             op_sequence: 0,
             mounts: [None; MAX_MOUNTS],
+            shared_io_handles: VfsSharedIoHandleTable::new(),
+            shared_io_requests: core::array::from_fn(|_| None),
         }
     }
 }
 
 impl<B: VfsBackend> VfsService<B> {
-    pub const fn with_backend(backend: B) -> Self {
+    pub fn with_backend(backend: B) -> Self {
         Self {
             backend,
             policy: MountNamespacePolicy::baseline(),
             op_sequence: 0,
             mounts: [None; MAX_MOUNTS],
+            shared_io_handles: VfsSharedIoHandleTable::new(),
+            shared_io_requests: core::array::from_fn(|_| None),
         }
     }
 
@@ -377,6 +393,306 @@ impl<B: VfsBackend> VfsService<B> {
             status: VFS_SHARED_IO_STATUS_OK,
             flags: 0,
         })
+    }
+
+    // ── Stage 84: RAMFS-only shared-I/O service-loop bridge ──────────────────
+
+    /// Stage 84: gated WRITE_SHARED_REQUEST bridge with lifecycle tracking.
+    ///
+    /// Constructs a `RecvV3SharedIoMapper` from `delivery` metadata, drives the
+    /// lifecycle state machine (reserve → map → begin → complete → cleanup), and
+    /// dispatches to the backend via `write_shared_bytes`.  Gated by
+    /// `VFS_STAGE84_RAMFS_BRIDGE_ENABLED`.
+    ///
+    /// `delivery.sender_tid` is recorded in the lifecycle for RequesterExit
+    /// correlation via `deliver_requester_exit_all`.  The lifecycle slot is freed
+    /// before returning (success or error path).
+    pub fn handle_write_shared_request_gated(
+        &mut self,
+        delivery: &RecvSharedV3Delivery,
+        request: VfsWriteSharedRequest,
+    ) -> Result<VfsWriteSharedReply, VfsError> {
+        if !VFS_STAGE84_RAMFS_BRIDGE_ENABLED {
+            return Err(VfsError::Unsupported);
+        }
+        let slot_idx = self
+            .shared_io_requests
+            .iter()
+            .position(|s| s.is_none())
+            .ok_or(VfsError::NoFd)?;
+
+        let handle = self
+            .shared_io_handles
+            .allocate()
+            .map_err(|_| VfsError::NoFd)?;
+
+        let descriptor = VfsSharedBufferDescriptor::new(
+            handle.object_handle,
+            handle.object_generation,
+            request.buffer.buffer_offset,
+            request.buffer.buffer_len,
+            VFS_SHARED_BUFFER_FS_READ,
+        );
+
+        let lifecycle = VfsSharedIoLifecycle::reserve(
+            request.request_id,
+            delivery.sender_tid,
+            descriptor,
+            request.requested_len,
+            0,
+            VfsSharedIoDirection::WriteRequest,
+        )
+        .map_err(|_| VfsError::Malformed)?;
+
+        self.shared_io_requests[slot_idx] = Some(lifecycle);
+
+        // Bring lifecycle through map → begin before byte access.
+        let mut lifecycle = self.shared_io_requests[slot_idx].take().unwrap();
+        if let Err(_) = lifecycle.map(&self.shared_io_handles) {
+            let _ = lifecycle.cleanup(
+                &mut self.shared_io_handles,
+                VfsSharedIoTerminalReason::BackendError,
+            );
+            return Err(VfsError::Malformed);
+        }
+        if let Err(_) = lifecycle.begin() {
+            let _ = lifecycle.cleanup(
+                &mut self.shared_io_handles,
+                VfsSharedIoTerminalReason::BackendError,
+            );
+            return Err(VfsError::Malformed);
+        }
+
+        let mut mapper = RecvV3SharedIoMapper::from_delivery(delivery);
+        let fd = request.fd;
+        let request_id = request.request_id;
+        let requested_len = request.requested_len;
+        let request_buffer = request.buffer;
+
+        let write_result = mapper.with_write_request_buffer(
+            request_buffer,
+            requested_len,
+            |bytes| self.backend.write_shared_bytes(fd, bytes),
+        );
+        let _ = mapper.release(request_buffer);
+
+        let bytes_written = match write_result {
+            Ok(Ok(n)) => n,
+            _ => {
+                let _ = lifecycle.cleanup(
+                    &mut self.shared_io_handles,
+                    VfsSharedIoTerminalReason::BackendError,
+                );
+                return Err(VfsError::Malformed);
+            }
+        };
+
+        if let Err(_) = lifecycle.complete(bytes_written) {
+            let _ = lifecycle.cleanup(
+                &mut self.shared_io_handles,
+                VfsSharedIoTerminalReason::BackendError,
+            );
+            return Err(VfsError::Malformed);
+        }
+        let _ = lifecycle.cleanup(
+            &mut self.shared_io_handles,
+            VfsSharedIoTerminalReason::Success,
+        );
+
+        self.op_sequence = self.op_sequence.saturating_add(1);
+        Ok(VfsWriteSharedReply {
+            request_id,
+            bytes_completed: bytes_written,
+            status: VFS_SHARED_IO_STATUS_OK,
+            flags: 0,
+        })
+    }
+
+    /// Stage 84: gated READ_SHARED_REPLY bridge with lifecycle tracking.
+    ///
+    /// Mirrors `handle_write_shared_request_gated` for the read direction:
+    /// constructs `RecvV3SharedIoMapper` from `delivery`, drives the lifecycle
+    /// state machine, and dispatches via `read_shared_bytes`.  Gated by
+    /// `VFS_STAGE84_RAMFS_BRIDGE_ENABLED`.
+    pub fn handle_read_shared_reply_gated(
+        &mut self,
+        delivery: &RecvSharedV3Delivery,
+        request: VfsReadSharedRequest,
+    ) -> Result<VfsReadSharedReply, VfsError> {
+        if !VFS_STAGE84_RAMFS_BRIDGE_ENABLED {
+            return Err(VfsError::Unsupported);
+        }
+        let slot_idx = self
+            .shared_io_requests
+            .iter()
+            .position(|s| s.is_none())
+            .ok_or(VfsError::NoFd)?;
+
+        let handle = self
+            .shared_io_handles
+            .allocate()
+            .map_err(|_| VfsError::NoFd)?;
+
+        let descriptor = VfsSharedBufferDescriptor::new(
+            handle.object_handle,
+            handle.object_generation,
+            request.buffer.buffer_offset,
+            request.buffer.buffer_len,
+            VFS_SHARED_BUFFER_FS_WRITE,
+        );
+
+        let lifecycle = VfsSharedIoLifecycle::reserve(
+            request.request_id,
+            delivery.sender_tid,
+            descriptor,
+            request.requested_len,
+            0,
+            VfsSharedIoDirection::ReadReply,
+        )
+        .map_err(|_| VfsError::Malformed)?;
+
+        self.shared_io_requests[slot_idx] = Some(lifecycle);
+
+        let mut lifecycle = self.shared_io_requests[slot_idx].take().unwrap();
+        if let Err(_) = lifecycle.map(&self.shared_io_handles) {
+            let _ = lifecycle.cleanup(
+                &mut self.shared_io_handles,
+                VfsSharedIoTerminalReason::BackendError,
+            );
+            return Err(VfsError::Malformed);
+        }
+        if let Err(_) = lifecycle.begin() {
+            let _ = lifecycle.cleanup(
+                &mut self.shared_io_handles,
+                VfsSharedIoTerminalReason::BackendError,
+            );
+            return Err(VfsError::Malformed);
+        }
+
+        let mut mapper = RecvV3SharedIoMapper::from_delivery(delivery);
+        let fd = request.fd;
+        let request_id = request.request_id;
+        let requested_len = request.requested_len;
+        let request_buffer = request.buffer;
+
+        let read_result = mapper.with_read_reply_buffer(
+            request_buffer,
+            requested_len,
+            |buf| self.backend.read_shared_bytes(fd, buf),
+        );
+        let _ = mapper.release(request_buffer);
+
+        let bytes_read = match read_result {
+            Ok(Ok(n)) => n,
+            _ => {
+                let _ = lifecycle.cleanup(
+                    &mut self.shared_io_handles,
+                    VfsSharedIoTerminalReason::BackendError,
+                );
+                return Err(VfsError::Malformed);
+            }
+        };
+
+        if let Err(_) = lifecycle.complete(bytes_read) {
+            let _ = lifecycle.cleanup(
+                &mut self.shared_io_handles,
+                VfsSharedIoTerminalReason::BackendError,
+            );
+            return Err(VfsError::Malformed);
+        }
+        let _ = lifecycle.cleanup(
+            &mut self.shared_io_handles,
+            VfsSharedIoTerminalReason::Success,
+        );
+
+        self.op_sequence = self.op_sequence.saturating_add(1);
+        Ok(VfsReadSharedReply {
+            request_id,
+            bytes_completed: bytes_read,
+            status: VFS_SHARED_IO_STATUS_OK,
+            flags: 0,
+        })
+    }
+
+    /// Stage 84: scan every lifecycle slot and deliver RequesterExit for `tid`.
+    ///
+    /// Called when VFS receives a PM task-exit notification.  Iterates all
+    /// `shared_io_requests` slots, calling
+    /// `deliver_requester_exit_if_tid_matches` on each `Some` entry.  Matched
+    /// lifecycles are cleaned and their slot is freed.  Unmatched lifecycles are
+    /// returned to their slot unchanged.
+    ///
+    /// Returns the number of lifecycles that were cleaned by this call.
+    pub fn deliver_requester_exit_all(&mut self, tid: u64) -> usize {
+        let mut cleaned = 0usize;
+        for i in 0..MAX_SHARED_IO_REQUESTS {
+            if self.shared_io_requests[i].is_none() {
+                continue;
+            }
+            let mut lifecycle = self.shared_io_requests[i].take().unwrap();
+            match lifecycle
+                .deliver_requester_exit_if_tid_matches(tid, &mut self.shared_io_handles)
+            {
+                Ok(VfsSharedIoRequesterExitAction::Matched(_)) => {
+                    // Cleaned — slot stays None.
+                    cleaned += 1;
+                }
+                _ => {
+                    // Not matched or error — restore lifecycle.
+                    self.shared_io_requests[i] = Some(lifecycle);
+                }
+            }
+        }
+        cleaned
+    }
+
+    // Stage 84 test helpers — insert lifecycles directly for RequesterExit proof.
+
+    #[cfg(test)]
+    pub fn test_stage84_insert_inflight(
+        &mut self,
+        request_id: u64,
+        requester_tid: u64,
+        direction: VfsSharedIoDirection,
+        requested_len: u64,
+    ) -> Option<usize> {
+        use super::shared_io_lifecycle::VfsSharedIoLifecycleError;
+        let slot_idx = self.shared_io_requests.iter().position(|s| s.is_none())?;
+        let handle = self.shared_io_handles.allocate().ok()?;
+        let access = match direction {
+            VfsSharedIoDirection::WriteRequest => VFS_SHARED_BUFFER_FS_READ,
+            VfsSharedIoDirection::ReadReply => VFS_SHARED_BUFFER_FS_WRITE,
+        };
+        let descriptor = VfsSharedBufferDescriptor::new(
+            handle.object_handle,
+            handle.object_generation,
+            0,
+            requested_len,
+            access,
+        );
+        let mut lifecycle = VfsSharedIoLifecycle::reserve(
+            request_id,
+            requester_tid,
+            descriptor,
+            requested_len,
+            0,
+            direction,
+        )
+        .ok()?;
+        lifecycle.map(&self.shared_io_handles).ok()?;
+        lifecycle.begin().ok()?;
+        self.shared_io_requests[slot_idx] = Some(lifecycle);
+        Some(slot_idx)
+    }
+
+    #[cfg(test)]
+    pub fn test_stage84_slot_is_empty(&self, idx: usize) -> bool {
+        self.shared_io_requests.get(idx).map(|s| s.is_none()).unwrap_or(true)
+    }
+
+    #[cfg(test)]
+    pub fn test_stage84_active_count(&self) -> usize {
+        self.shared_io_requests.iter().filter(|s| s.is_some()).count()
     }
 
     pub fn parse_request(request: Message) -> Result<VfsRequest, VfsError> {
@@ -2982,6 +3298,484 @@ mod stage83_tests {
 
     #[test]
     fn stage83_gate_flags_unchanged_from_stage79() {
+        assert!(VFS_WRITE_SHARED_REQUEST_ENABLED);
+        assert!(VFS_READ_SHARED_REPLY_ENABLED);
+        assert!(VFS_SHARED_IO_ENABLED);
+    }
+}
+
+#[cfg(test)]
+mod stage84_tests {
+    //! Stage 84 — RAMFS-only shared-I/O service-loop bridge + lifecycle store.
+    //!
+    //! Tests the two gated methods (`handle_write_shared_request_gated`,
+    //! `handle_read_shared_reply_gated`), the `deliver_requester_exit_all` scanner,
+    //! the lifecycle store state, and all regression/gate invariants.
+
+    use super::*;
+    use alloc::vec;
+    use crate::fs::common::shared_io_adapter::{
+        VFS_READ_SHARED_REPLY_ENABLED, VFS_SHARED_IO_ENABLED, VFS_STAGE84_RAMFS_BRIDGE_ENABLED,
+        VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED, VFS_WRITE_SHARED_REQUEST_ENABLED,
+    };
+    use crate::fs::common::shared_io_lifecycle::VfsSharedIoDirection;
+    use crate::fs::common::vfs_ipc::{read_shared_message, write_shared_message};
+    use crate::fs::ramfs::tree::RamFsBackend;
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VFS_SHARED_IO_STATUS_OK,
+        VfsReadSharedRequest, VfsSharedBufferDescriptor, VfsWriteSharedRequest,
+    };
+    use yarm_user_rt::syscall::recv_v3::RecvSharedV3Delivery;
+
+    // Stage 84 tokens: generation = 0x84 (132), distinct slots per direction.
+    const TW84: u64 = 0x0084_0030; // write-request delivery token
+    const TR84: u64 = 0x0084_0031; // read-reply delivery token
+    const TE84: u64 = 0x0084_0032; // backend-error test token
+    const PERM_RO: u32 = 1; // MAP_READ only
+    const PERM_RW: u32 = 3; // MAP_READ | MAP_WRITE
+
+    fn wr_desc84(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_READ)
+    }
+
+    fn rr_desc84(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_WRITE)
+    }
+
+    fn wr_delivery84(
+        token: u64,
+        ptr: u64,
+        mapped_len: u64,
+        sender_tid: u64,
+    ) -> RecvSharedV3Delivery {
+        RecvSharedV3Delivery {
+            sender_tid,
+            cleanup_token: token,
+            mapped_base: ptr,
+            page_rounded_mapped_len: mapped_len,
+            actual_mapping_perm: PERM_RO,
+            ..Default::default()
+        }
+    }
+
+    fn rr_delivery84(
+        token: u64,
+        ptr: u64,
+        mapped_len: u64,
+        sender_tid: u64,
+    ) -> RecvSharedV3Delivery {
+        RecvSharedV3Delivery {
+            sender_tid,
+            cleanup_token: token,
+            mapped_base: ptr,
+            page_rounded_mapped_len: mapped_len,
+            actual_mapping_perm: PERM_RW,
+            ..Default::default()
+        }
+    }
+
+    /// Create a RAMFS service with an optionally seeded file and return an open fd.
+    fn ramfs_open_file(
+        path: &[u8],
+        seed_content: &[u8],
+    ) -> (VfsService<RamFsBackend>, u64) {
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(path).expect("create");
+        let wfd = svc.backend_mut().open_path(path).expect("open wr");
+        if !seed_content.is_empty() {
+            svc.backend_mut().write_bytes(wfd, seed_content).expect("seed");
+        }
+        svc.backend_mut().close_fd(wfd).expect("close wr");
+        let fd = svc.backend_mut().open_path(path).expect("reopen");
+        (svc, fd)
+    }
+
+    // ── 1. Gate constant ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stage84_gate_constant_is_true() {
+        assert!(
+            VFS_STAGE84_RAMFS_BRIDGE_ENABLED,
+            "VFS_STAGE84_RAMFS_BRIDGE_ENABLED must be true after Stage 84"
+        );
+    }
+
+    // ── 2. Lifecycle store ────────────────────────────────────────────────────
+
+    #[test]
+    fn stage84_vfs_service_new_has_empty_lifecycle_store() {
+        let svc = VfsService::<InMemoryBackend>::new();
+        assert_eq!(
+            svc.test_stage84_active_count(),
+            0,
+            "new VfsService must start with no active lifecycle slots"
+        );
+    }
+
+    // ── 3. Write byte proof ───────────────────────────────────────────────────
+
+    #[test]
+    fn stage84_write_shared_request_gated_byte_proof() {
+        // Bytes in a heap backing buffer are written to RAMFS via the gated bridge.
+        // mapped_base points to a real heap allocation; from_raw_parts is defined.
+        let mut backing = vec![0u8; 4096];
+        backing[..8].copy_from_slice(b"stage84w");
+        let ptr = backing.as_ptr() as u64;
+
+        let (mut svc, fd) = ramfs_open_file(b"/s84_wr_byte", b"");
+        let delivery = wr_delivery84(TW84, ptr, 4096, 10);
+        let request = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 84,
+            flags: 0,
+            buffer: wr_desc84(TW84, 0, 8),
+        };
+        let reply = svc
+            .handle_write_shared_request_gated(&delivery, request)
+            .expect("handle_write_shared_request_gated");
+        assert_eq!(reply.bytes_completed, 8);
+
+        svc.backend_mut().close_fd(fd).expect("close");
+        let rfd = svc.backend_mut().open_path(b"/s84_wr_byte").expect("reopen");
+        let mut out = [0u8; 8];
+        let n = svc.backend_mut().read_bytes(rfd, &mut out).expect("read");
+        assert_eq!(&out[..n], b"stage84w", "RAMFS file must contain bytes from heap backing");
+    }
+
+    // ── 4. Read byte proof ────────────────────────────────────────────────────
+
+    #[test]
+    fn stage84_read_shared_reply_gated_byte_proof() {
+        // RAMFS file bytes are written into a heap backing buffer via the gated bridge.
+        // After the call, backing[..8] contains the file content.
+        let mut backing = vec![0u8; 4096];
+        let ptr = backing.as_mut_ptr() as u64;
+
+        let (mut svc, fd) = ramfs_open_file(b"/s84_rr_byte", b"stage84r");
+        let delivery = rr_delivery84(TR84, ptr, 4096, 20);
+        let request = VfsReadSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 84,
+            flags: 0,
+            buffer: rr_desc84(TR84, 0, 8),
+        };
+        let reply = svc
+            .handle_read_shared_reply_gated(&delivery, request)
+            .expect("handle_read_shared_reply_gated");
+        assert_eq!(reply.bytes_completed, 8);
+        drop(svc);
+        assert_eq!(&backing[..8], b"stage84r", "heap backing must contain RAMFS file bytes");
+    }
+
+    // ── 5. op_sequence advances (write) ──────────────────────────────────────
+
+    #[test]
+    fn stage84_write_shared_request_gated_op_sequence_advances() {
+        let backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let (mut svc, fd) = ramfs_open_file(b"/s84_seq_wr", b"");
+        let seq_before = svc.op_sequence();
+        let delivery = wr_delivery84(TW84, ptr, 64, 10);
+        let request = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc84(TW84, 0, 8),
+        };
+        svc.handle_write_shared_request_gated(&delivery, request)
+            .expect("write gated");
+        assert_eq!(svc.op_sequence(), seq_before + 1);
+    }
+
+    // ── 6. op_sequence advances (read) ───────────────────────────────────────
+
+    #[test]
+    fn stage84_read_shared_reply_gated_op_sequence_advances() {
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_mut_ptr() as u64;
+        let (mut svc, fd) = ramfs_open_file(b"/s84_seq_rr", b"readback");
+        let seq_before = svc.op_sequence();
+        let delivery = rr_delivery84(TR84, ptr, 64, 20);
+        let request = VfsReadSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: rr_desc84(TR84, 0, 8),
+        };
+        svc.handle_read_shared_reply_gated(&delivery, request)
+            .expect("read gated");
+        assert_eq!(svc.op_sequence(), seq_before + 1);
+    }
+
+    // ── 7. Lifecycle slot freed after write success ───────────────────────────
+
+    #[test]
+    fn stage84_write_shared_request_gated_slot_freed_after_success() {
+        let backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let (mut svc, fd) = ramfs_open_file(b"/s84_slot_wr", b"");
+        let delivery = wr_delivery84(TW84, ptr, 64, 10);
+        let request = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc84(TW84, 0, 8),
+        };
+        svc.handle_write_shared_request_gated(&delivery, request)
+            .expect("write gated");
+        assert_eq!(svc.test_stage84_active_count(), 0, "lifecycle slot must be freed after success");
+    }
+
+    // ── 8. Lifecycle slot freed after read success ────────────────────────────
+
+    #[test]
+    fn stage84_read_shared_reply_gated_slot_freed_after_success() {
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_mut_ptr() as u64;
+        let (mut svc, fd) = ramfs_open_file(b"/s84_slot_rr", b"readdata");
+        let delivery = rr_delivery84(TR84, ptr, 64, 20);
+        let request = VfsReadSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: rr_desc84(TR84, 0, 8),
+        };
+        svc.handle_read_shared_reply_gated(&delivery, request)
+            .expect("read gated");
+        assert_eq!(svc.test_stage84_active_count(), 0, "lifecycle slot must be freed after success");
+    }
+
+    // ── 9. Reply fields (write) ───────────────────────────────────────────────
+
+    #[test]
+    fn stage84_write_shared_request_gated_reply_fields() {
+        let backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let (mut svc, fd) = ramfs_open_file(b"/s84_fields_wr", b"");
+        let delivery = wr_delivery84(TW84, ptr, 64, 10);
+        let request = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 42,
+            flags: 0,
+            buffer: wr_desc84(TW84, 0, 8),
+        };
+        let reply = svc
+            .handle_write_shared_request_gated(&delivery, request)
+            .expect("write gated");
+        assert_eq!(reply.request_id, 42);
+        assert_eq!(reply.status, VFS_SHARED_IO_STATUS_OK);
+        assert_eq!(reply.flags, 0);
+    }
+
+    // ── 10. Reply fields (read) ───────────────────────────────────────────────
+
+    #[test]
+    fn stage84_read_shared_reply_gated_reply_fields() {
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_mut_ptr() as u64;
+        let (mut svc, fd) = ramfs_open_file(b"/s84_fields_rr", b"replyfld");
+        let delivery = rr_delivery84(TR84, ptr, 64, 20);
+        let request = VfsReadSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 99,
+            flags: 0,
+            buffer: rr_desc84(TR84, 0, 8),
+        };
+        let reply = svc
+            .handle_read_shared_reply_gated(&delivery, request)
+            .expect("read gated");
+        assert_eq!(reply.request_id, 99);
+        assert_eq!(reply.status, VFS_SHARED_IO_STATUS_OK);
+        assert_eq!(reply.flags, 0);
+    }
+
+    // ── 11. Short requested_len: only prefix bytes are written ────────────────
+
+    #[test]
+    fn stage84_write_shared_request_gated_short_requested_len() {
+        // buffer_len=16 but requested_len=4 — only the first 4 bytes reach the file.
+        let mut backing = vec![0u8; 4096];
+        backing[..16].copy_from_slice(b"short-prefix-!!!");
+        let ptr = backing.as_ptr() as u64;
+        let (mut svc, fd) = ramfs_open_file(b"/s84_short_wr", b"");
+        let delivery = wr_delivery84(TW84, ptr, 4096, 10);
+        let request = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 4,
+            request_id: 1,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(TW84, TW84 >> 16, 0, 16, VFS_SHARED_BUFFER_FS_READ),
+        };
+        let reply = svc
+            .handle_write_shared_request_gated(&delivery, request)
+            .expect("write gated");
+        assert_eq!(reply.bytes_completed, 4);
+
+        svc.backend_mut().close_fd(fd).expect("close");
+        let rfd = svc.backend_mut().open_path(b"/s84_short_wr").expect("reopen");
+        let mut out = [0u8; 16];
+        let n = svc.backend_mut().read_bytes(rfd, &mut out).expect("read");
+        assert_eq!(n, 4, "file must contain only 4 bytes");
+        assert_eq!(&out[..4], b"shor", "only the requested prefix must be written");
+    }
+
+    // ── 12. RequesterExit: matched TID cleans lifecycle ───────────────────────
+
+    #[test]
+    fn stage84_requester_exit_all_matched_tid_cleans_lifecycle() {
+        let mut svc = VfsService::<InMemoryBackend>::new();
+        let slot = svc
+            .test_stage84_insert_inflight(1, 42, VfsSharedIoDirection::WriteRequest, 8)
+            .expect("insert inflight");
+        assert!(!svc.test_stage84_slot_is_empty(slot), "slot must be occupied before exit");
+        let cleaned = svc.deliver_requester_exit_all(42);
+        assert_eq!(cleaned, 1);
+        assert!(svc.test_stage84_slot_is_empty(slot), "slot must be freed after matched exit");
+    }
+
+    // ── 13. RequesterExit: unmatched TID is safe no-op ────────────────────────
+
+    #[test]
+    fn stage84_requester_exit_all_unmatched_tid_is_safe_noop() {
+        let mut svc = VfsService::<InMemoryBackend>::new();
+        let slot = svc
+            .test_stage84_insert_inflight(1, 42, VfsSharedIoDirection::WriteRequest, 8)
+            .expect("insert inflight");
+        let cleaned = svc.deliver_requester_exit_all(99);
+        assert_eq!(cleaned, 0, "unmatched TID must clean nothing");
+        assert!(
+            !svc.test_stage84_slot_is_empty(slot),
+            "lifecycle must survive unmatched requester exit"
+        );
+    }
+
+    // ── 14. RequesterExit: duplicate call is idempotent ───────────────────────
+
+    #[test]
+    fn stage84_requester_exit_all_duplicate_exit_is_idempotent() {
+        let mut svc = VfsService::<InMemoryBackend>::new();
+        svc.test_stage84_insert_inflight(1, 42, VfsSharedIoDirection::WriteRequest, 8)
+            .expect("insert inflight");
+        let first = svc.deliver_requester_exit_all(42);
+        let second = svc.deliver_requester_exit_all(42);
+        assert_eq!(first, 1);
+        assert_eq!(second, 0, "second call with same TID must clean nothing");
+        assert_eq!(svc.test_stage84_active_count(), 0);
+    }
+
+    // ── 15. RequesterExit: only matching slots are cleaned ────────────────────
+
+    #[test]
+    fn stage84_requester_exit_all_multiple_only_matched_cleaned() {
+        let mut svc = VfsService::<InMemoryBackend>::new();
+        svc.test_stage84_insert_inflight(1, 42, VfsSharedIoDirection::WriteRequest, 8)
+            .expect("insert tid=42");
+        svc.test_stage84_insert_inflight(2, 99, VfsSharedIoDirection::ReadReply, 8)
+            .expect("insert tid=99");
+        assert_eq!(svc.test_stage84_active_count(), 2);
+        let cleaned = svc.deliver_requester_exit_all(42);
+        assert_eq!(cleaned, 1, "only the tid=42 lifecycle must be cleaned");
+        assert_eq!(svc.test_stage84_active_count(), 1, "tid=99 lifecycle must remain");
+    }
+
+    // ── 16. Backend error cleans lifecycle slot ───────────────────────────────
+
+    #[test]
+    fn stage84_backend_error_cleans_lifecycle() {
+        // InMemoryBackend does not implement write_shared_bytes; a backend error must
+        // trigger lifecycle cleanup and free the lifecycle slot before returning.
+        let backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let delivery = wr_delivery84(TE84, ptr, 64, 99);
+        let request = VfsWriteSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc84(TE84, 0, 8),
+        };
+        let mut svc = VfsService::<InMemoryBackend>::new();
+        let result = svc.handle_write_shared_request_gated(&delivery, request);
+        assert_eq!(result, Err(VfsError::Malformed));
+        assert_eq!(
+            svc.test_stage84_active_count(),
+            0,
+            "lifecycle slot must be freed after backend error"
+        );
+    }
+
+    // ── 17. handle_request still rejects WRITE_SHARED_REQUEST ────────────────
+
+    #[test]
+    fn stage84_handle_request_still_rejects_write_shared() {
+        let msg = write_shared_message(VfsWriteSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc84(TW84, 0, 8),
+        })
+        .expect("encode msg");
+        assert_eq!(
+            VfsService::<InMemoryBackend>::parse_request(msg),
+            Err(VfsError::Unsupported),
+            "WRITE_SHARED_REQUEST must not be routed through handle_request after Stage 84"
+        );
+    }
+
+    // ── 18. handle_request still rejects READ_SHARED_REPLY ───────────────────
+
+    #[test]
+    fn stage84_handle_request_still_rejects_read_shared() {
+        let msg = read_shared_message(VfsReadSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: rr_desc84(TR84, 0, 8),
+        })
+        .expect("encode msg");
+        assert_eq!(
+            VfsService::<InMemoryBackend>::parse_request(msg),
+            Err(VfsError::Unsupported),
+            "READ_SHARED_REPLY must not be routed through handle_request after Stage 84"
+        );
+    }
+
+    // ── 19. VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED still false ─────────
+
+    #[test]
+    fn stage84_supervisor_task_exit_notification_still_disabled() {
+        assert!(
+            !VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED,
+            "VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED must remain false — supervisor→VFS cap not yet wired"
+        );
+    }
+
+    // ── 20. Prior gate flags unchanged from Stage 83 ─────────────────────────
+
+    #[test]
+    fn stage84_gate_flags_unchanged_from_stage83() {
         assert!(VFS_WRITE_SHARED_REQUEST_ENABLED);
         assert!(VFS_READ_SHARED_REPLY_ENABLED);
         assert!(VFS_SHARED_IO_ENABLED);

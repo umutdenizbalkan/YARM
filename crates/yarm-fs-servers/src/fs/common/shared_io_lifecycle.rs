@@ -87,6 +87,7 @@ impl HandleSlot {
 
 /// Fixed-capacity helper handle table. Handles are one-based slot indexes and generations advance
 /// whenever cleanup releases a slot.
+#[derive(Debug)]
 pub struct VfsSharedIoHandleTable<const N: usize> {
     slots: [HandleSlot; N],
 }
@@ -170,6 +171,7 @@ pub enum VfsSharedIoRequesterExitAction {
 }
 
 /// One helper request and its single cleanup token.
+#[derive(Debug)]
 pub struct VfsSharedIoLifecycle {
     request_id: u64,
     /// TID of the task that submitted this request. Used to correlate

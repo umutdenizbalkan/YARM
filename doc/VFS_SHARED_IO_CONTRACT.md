@@ -1218,3 +1218,58 @@ and `with_read_reply_buffer`.  Safety preconditions: `mapped_base` is nonzero an
 mapped length; range checked before pointer arithmetic; write bit verified for `_mut` variant;
 `released` flag ensures at-most-once access.  Unsafe is isolated to these two methods and documented
 inline.
+
+## Stage 84: RAMFS-only shared-I/O service-loop bridge + lifecycle store
+
+**Gate constant:** `VFS_STAGE84_RAMFS_BRIDGE_ENABLED = true` in `shared_io_adapter.rs`.
+
+**New per-request lifecycle/handle store in `VfsService`:**
+
+```rust
+shared_io_handles: VfsSharedIoHandleTable<MAX_SHARED_IO_REQUESTS>,  // N=4
+shared_io_requests: [Option<VfsSharedIoLifecycle>; MAX_SHARED_IO_REQUESTS],
+```
+
+`VfsService::new()` and `with_backend()` are now `fn` (not `const fn`) because
+`[Option<VfsSharedIoLifecycle>; N]` is not `Copy` and requires `core::array::from_fn`.
+
+**`handle_write_shared_request_gated(delivery, request)`:**
+1. Find a free lifecycle slot.
+2. Allocate an internal handle from `shared_io_handles`.
+3. Build an internal descriptor (`object_handle = handle.object_handle`).
+4. `VfsSharedIoLifecycle::reserve(request_id, delivery.sender_tid, descriptor, ...)`.
+5. Drive lifecycle: `map()` → `begin()` → byte access → `complete()` → `cleanup(Success)`.
+6. Construct `RecvV3SharedIoMapper::from_delivery(delivery)`.
+7. `mapper.with_write_request_buffer(request.buffer, requested_len, |bytes| backend.write_shared_bytes(fd, bytes))`.
+8. `mapper.release(request.buffer)` unconditionally after byte access.
+9. On any error, call `lifecycle.cleanup(..., BackendError)` before returning `Err(Malformed)`.
+10. Lifecycle slot is `None` (freed) before the method returns in all paths.
+
+**`handle_read_shared_reply_gated(delivery, request)`:** mirror of write path using
+`with_read_reply_buffer` and `read_shared_bytes`; `actual_mapping_perm = PERM_RW (3)` required.
+
+**`deliver_requester_exit_all(tid)`:** scans all lifecycle slots, calls
+`deliver_requester_exit_if_tid_matches(tid, &mut handles)` on each `Some` entry.
+Matched entries are freed; unmatched entries are restored. Returns count of cleaned slots.
+
+**Internal vs delivery descriptor duality:** the lifecycle's `descriptor` uses the internal
+handle table index (`object_handle = 1..N`).  The mapper validates against `request.buffer`
+(delivery-based descriptor with `object_handle = delivery.cleanup_token`).  These are
+independent — lifecycle tracks state with internal IDs; mapper accesses bytes with delivery IDs.
+
+**RAMFS-only:** production FAT/ext4/blkcache paths are unchanged.  `handle_request` still
+returns `VfsError::Unsupported` for `VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_READ_SHARED_REPLY`.
+`VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` remains `false`.
+
+**Gate tests:** `cargo test -p yarm-fs-servers --lib stage84` (20 tests in `vfs_service.rs`).
+
+**Invariants preserved:**
+- SYSCALL_COUNT = 31 (no change)
+- STARTUP_SLOT_COUNT = 18 (no change)
+- SpawnV5 ABI, image IDs, initramfs packing: unchanged
+- `handle_request` still rejects shared opcodes
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = true` (unchanged)
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (unchanged)
+- `VFS_SHARED_IO_ENABLED = true` (unchanged)
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
+- 412 yarm-fs-servers tests pass (392 prior + 20 Stage 84)

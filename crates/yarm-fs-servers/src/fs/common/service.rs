@@ -13,7 +13,7 @@ pub struct FsService<B: VfsBackend> {
 }
 
 impl<B: VfsBackend> FsService<B> {
-    pub const fn with_backend(backend: B) -> Self {
+    pub fn with_backend(backend: B) -> Self {
         Self {
             inner: VfsService::with_backend(backend),
             handled: 0,
