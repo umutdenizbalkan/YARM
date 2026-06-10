@@ -4116,7 +4116,7 @@ status. Documents the two infrastructure blockers before live wiring is possible
 
 **VFS tests (12 total):**
 - `stage77_vfs_pm_task_exit_notification_now_enabled` — gate = `true`
-- `stage77_vfs_shared_io_enabled_still_false` — umbrella gate unchanged
+- `stage77_vfs_shared_io_enabled_stage78` — umbrella gate enabled in Stage 78
 - `stage77_dispatch_pm_task_exited_push_matched_tid_delivers_requester_exit` — TID match → `Matched(Won(RequesterExit))`
 - `stage77_dispatch_pm_task_exited_push_unmatched_tid_is_safe_noop` — wrong TID → `NotMatched`
 - `stage77_dispatch_pm_task_exited_push_rejects_wrong_opcode` — `WrongOpcode` error
@@ -4135,10 +4135,63 @@ status. Documents the two infrastructure blockers before live wiring is possible
 - `report_task_exit_to_pm` called from `exit_task()` after `report_task_exit_to_supervisor()`.
 - No new syscalls; SYSCALL_COUNT = 31 unchanged.
 - STARTUP_SLOT_COUNT = 18 unchanged.
-- `VFS_SHARED_IO_ENABLED = false`; write direction not yet implemented.
+- `VFS_SHARED_IO_ENABLED = true` (Stage 78 enables; write prerequisites proven).
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`; unchanged.
 
 **Run commands:**
 - `cargo test -p yarm --lib --features hosted-dev -- stage77` (15 kernel tests)
 - `cargo test -p yarm-fs-servers --features hosted-dev -- stage77` (12 VFS tests)
-- `cargo test -p yarm-fs-servers --features hosted-dev` (full 325-test regression)
+- `cargo test -p yarm-fs-servers --features hosted-dev` (full 340-test regression)
+
+---
+
+## Rule N+70 — Stage 78: Final VFS shared-I/O readiness audit + global enable
+
+**Purpose:** Audit all VFS shared-I/O gates. Enable `VFS_WRITE_SHARED_REQUEST_ENABLED = true`
+and `VFS_SHARED_IO_ENABLED = true` after confirming all prerequisites. Prove RequesterExit for
+WRITE direction via PM push. Confirm `handle_request` still rejects shared opcodes.
+
+**Gate matrix (all pass):**
+
+| Gate | Value | Stage achieved |
+|------|-------|----------------|
+| `VFS_WRITE_SHARED_REQUEST_ENABLED` | `true` | Stage 78 |
+| `VFS_READ_SHARED_REPLY_ENABLED` | `true` | Stage 73 |
+| `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` | `true` | Stage 77+78 |
+| `VFS_SHARED_IO_ENABLED` | `true` | Stage 78 |
+| `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` | `false` | Stage 75 (PM model replaces) |
+
+**Production policy:** `handle_request` still returns `VfsError::Unsupported` for
+`VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_READ_SHARED_REPLY`. `UnsupportedSharedIoMapper`
+remains the production default. Gate `true` means helper prerequisites are proven, not that
+live routing is active.
+
+**VFS tests (15 total, mod stage78_tests):**
+- `stage78_write_shared_request_gate_now_enabled` — `VFS_WRITE_SHARED_REQUEST_ENABLED = true`
+- `stage78_read_shared_reply_gate_still_enabled` — `VFS_READ_SHARED_REPLY_ENABLED = true`
+- `stage78_pm_task_exit_notification_still_enabled` — `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true`
+- `stage78_global_vfs_shared_io_now_enabled` — `VFS_SHARED_IO_ENABLED = true`
+- `stage78_global_gate_requires_all_three_prerequisites` — conjunction invariant
+- `stage78_supervisor_exit_notification_still_disabled` — supervisor path unchanged
+- `stage78_handle_request_still_rejects_write_shared_despite_gate_true` — Unsupported
+- `stage78_handle_request_still_rejects_read_shared_despite_gate_true` — Unsupported
+- `stage78_write_direction_requester_exit_via_pm_push_cleans_lifecycle` — WRITE lifecycle cleaned
+- `stage78_write_direction_duplicate_requester_exit_idempotent` — AlreadyCleaned on second exit
+- `stage78_write_requester_exit_unmatched_tid_is_safe_noop` — NotMatched
+- `stage78_legacy_vfs_service_constructible` — service construction unchanged
+- `stage78_legacy_vfs_ramfs_read_write_unchanged` — RAMFS backend unchanged
+- `stage78_production_mapper_still_rejects_write_direction` — UnsupportedMapping
+- `stage78_production_mapper_still_rejects_read_direction` — UnsupportedMapping
+
+**Hard invariants:**
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = true`; do not revert without re-auditing prerequisites.
+- `VFS_SHARED_IO_ENABLED = WRITE && READ && PM`; definition must include all three gates.
+- `handle_request` must NOT route shared opcodes until a real `VfsSharedIoMapper` is added.
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`; unchanged.
+- SYSCALL_COUNT = 31; STARTUP_SLOT_COUNT = 18; both unchanged.
+- FAT/ext4/blkcache production behavior unchanged.
+
+**Run commands:**
+- `cargo test -p yarm-fs-servers --features hosted-dev -- stage78` (15 VFS tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev` (full 340-test regression)
+- `cargo check -p yarm-fs-servers` (no errors)

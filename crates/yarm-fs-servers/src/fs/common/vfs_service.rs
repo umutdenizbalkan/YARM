@@ -236,9 +236,9 @@ impl<B: VfsBackend> VfsService<B> {
 
     /// Gated live route for WRITE_SHARED_REQUEST backed by recv_shared_v3 MAP_READ.
     ///
-    /// **Production use:** call only when `VFS_WRITE_SHARED_REQUEST_ENABLED` is `true` (it is not,
-    /// by default). When the gate constant is false, no production code path calls this method.
-    /// Tests call it directly to prove the live route is correct.
+    /// **Production use:** call only when `VFS_WRITE_SHARED_REQUEST_ENABLED` is `true` (Stage 78:
+    /// it is). `handle_request` still returns `VfsError::Unsupported` for the opcode — no real
+    /// mapper exists yet. Tests call this method directly to prove the live route is correct.
     ///
     /// **What this does:**
     /// 1. Validates the recv_shared_v3 delivery metadata against the descriptor via
@@ -592,8 +592,8 @@ impl<B: VfsBackend> VfsService<B> {
 mod stage66_68_tests {
     use super::*;
     use crate::fs::common::shared_io_adapter::{
-        BorrowedSharedIoTestMapper, UnsupportedSharedIoMapper, VFS_READ_SHARED_REPLY_ENABLED,
-        VFS_SHARED_IO_ENABLED, VFS_WRITE_SHARED_REQUEST_ENABLED,
+        BorrowedSharedIoTestMapper, UnsupportedSharedIoMapper, VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED,
+        VFS_READ_SHARED_REPLY_ENABLED, VFS_SHARED_IO_ENABLED, VFS_WRITE_SHARED_REQUEST_ENABLED,
     };
     use crate::fs::common::vfs_ipc::{read_shared_message, write_shared_message};
     use crate::fs::ramfs::tree::RamFsBackend;
@@ -824,15 +824,17 @@ mod stage66_68_tests {
     }
 
     #[test]
-    fn stage68_write_shared_request_gate_disabled_by_default() {
+    fn stage68_write_shared_request_gate_enabled_stage78() {
+        // Stage 78 enabled VFS_WRITE_SHARED_REQUEST_ENABLED after proving all prerequisites:
+        // MAP_READ delivery, binding, RAMFS proof, RequesterExit model, PM notification.
         assert!(
-            !VFS_WRITE_SHARED_REQUEST_ENABLED,
-            "VFS_WRITE_SHARED_REQUEST_ENABLED must be false by default"
+            VFS_WRITE_SHARED_REQUEST_ENABLED,
+            "VFS_WRITE_SHARED_REQUEST_ENABLED must be true after Stage 78"
         );
     }
 
     #[test]
-    fn stage68_read_shared_reply_gate_disabled_by_default() {
+    fn stage68_read_shared_reply_gate_enabled_since_stage73() {
         // Stage 73 enabled VFS_READ_SHARED_REPLY_ENABLED after proving the RequesterExit
         // lifecycle model (deliver_requester_exit helper + 7 tests).
         assert!(
@@ -842,19 +844,22 @@ mod stage66_68_tests {
     }
 
     #[test]
-    fn stage68_global_vfs_shared_io_disabled_by_default() {
+    fn stage68_global_vfs_shared_io_enabled_stage78() {
+        // Stage 78: both direction gates and PM notification gate are true → umbrella true.
         assert!(
-            !VFS_SHARED_IO_ENABLED,
-            "VFS_SHARED_IO_ENABLED must be false — requires both WRITE and READ gates"
+            VFS_SHARED_IO_ENABLED,
+            "VFS_SHARED_IO_ENABLED must be true after Stage 78"
         );
     }
 
     #[test]
-    fn stage68_global_gate_false_unless_both_direction_gates_true() {
-        // Both must be true for global enable; since neither is, global is false.
+    fn stage68_global_gate_conjunction_of_all_three_prerequisites() {
+        // Global gate = WRITE && READ && PM; all three are true in Stage 78.
         assert_eq!(
             VFS_SHARED_IO_ENABLED,
-            VFS_WRITE_SHARED_REQUEST_ENABLED && VFS_READ_SHARED_REPLY_ENABLED
+            VFS_WRITE_SHARED_REQUEST_ENABLED
+                && VFS_READ_SHARED_REPLY_ENABLED
+                && VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED
         );
     }
 }
@@ -984,11 +989,11 @@ mod stage69_70_tests {
     }
 
     #[test]
-    fn stage69_gate_values_all_false() {
-        // Stage 73 enabled VFS_READ_SHARED_REPLY_ENABLED; WRITE direction and umbrella still false.
-        assert!(!VFS_WRITE_SHARED_REQUEST_ENABLED);
+    fn stage69_gate_values_snapshot() {
+        // Stage 78: WRITE gate enabled; READ has been true since Stage 73; umbrella now true.
+        assert!(VFS_WRITE_SHARED_REQUEST_ENABLED);
         assert!(VFS_READ_SHARED_REPLY_ENABLED);
-        assert!(!VFS_SHARED_IO_ENABLED);
+        assert!(VFS_SHARED_IO_ENABLED);
     }
 
     #[test]
@@ -1145,10 +1150,11 @@ mod stage69_70_tests {
     }
 
     #[test]
-    fn stage70_global_vfs_shared_io_still_false() {
+    fn stage70_global_vfs_shared_io_enabled_stage78() {
+        // Stage 78: both direction gates + PM notification are true → umbrella is true.
         assert!(
-            !VFS_SHARED_IO_ENABLED,
-            "VFS_SHARED_IO_ENABLED must remain false until both direction gates pass"
+            VFS_SHARED_IO_ENABLED,
+            "VFS_SHARED_IO_ENABLED must be true after Stage 78"
         );
     }
 
@@ -1288,19 +1294,20 @@ mod stage73_74_tests {
     }
 
     #[test]
-    fn stage74_vfs_shared_io_still_disabled() {
-        // Umbrella stays false: VFS_WRITE_SHARED_REQUEST_ENABLED is still false.
+    fn stage74_vfs_shared_io_enabled_stage78() {
+        // Stage 78 enabled VFS_WRITE_SHARED_REQUEST_ENABLED → umbrella is now true.
         assert!(
-            !VFS_SHARED_IO_ENABLED,
-            "VFS_SHARED_IO_ENABLED must remain false until both direction gates pass"
+            VFS_SHARED_IO_ENABLED,
+            "VFS_SHARED_IO_ENABLED must be true after Stage 78"
         );
     }
 
     #[test]
-    fn stage74_write_shared_request_still_disabled() {
+    fn stage74_write_shared_request_enabled_stage78() {
+        // Stage 78 proves WRITE prerequisites and enables the gate.
         assert!(
-            !VFS_WRITE_SHARED_REQUEST_ENABLED,
-            "VFS_WRITE_SHARED_REQUEST_ENABLED must remain false"
+            VFS_WRITE_SHARED_REQUEST_ENABLED,
+            "VFS_WRITE_SHARED_REQUEST_ENABLED must be true after Stage 78"
         );
     }
 
@@ -1489,8 +1496,8 @@ mod stage75_tests {
     }
 
     #[test]
-    fn stage75_vfs_shared_io_still_disabled() {
-        assert!(!VFS_SHARED_IO_ENABLED);
+    fn stage75_vfs_shared_io_enabled_stage78() {
+        assert!(VFS_SHARED_IO_ENABLED);
     }
 
     #[test]
@@ -1499,8 +1506,8 @@ mod stage75_tests {
     }
 
     #[test]
-    fn stage75_write_shared_request_still_disabled() {
-        assert!(!VFS_WRITE_SHARED_REQUEST_ENABLED);
+    fn stage75_write_shared_request_enabled_stage78() {
+        assert!(VFS_WRITE_SHARED_REQUEST_ENABLED);
     }
 
     #[test]
@@ -1647,8 +1654,8 @@ mod stage76_tests {
     }
 
     #[test]
-    fn stage76_vfs_shared_io_umbrella_still_disabled() {
-        assert!(!VFS_SHARED_IO_ENABLED);
+    fn stage76_vfs_shared_io_umbrella_enabled_stage78() {
+        assert!(VFS_SHARED_IO_ENABLED);
     }
 
     #[test]
@@ -1657,8 +1664,8 @@ mod stage76_tests {
     }
 
     #[test]
-    fn stage76_write_shared_request_still_disabled() {
-        assert!(!VFS_WRITE_SHARED_REQUEST_ENABLED);
+    fn stage76_write_shared_request_enabled_stage78() {
+        assert!(VFS_WRITE_SHARED_REQUEST_ENABLED);
     }
 
     // ── B. Opcode constants ────────────────────────────────────────────────────
@@ -1833,7 +1840,7 @@ mod stage76_tests {
 //   E. dispatch_pm_task_exited_push rejects short payload.
 //   F. decode_kernel_pm_task_exited decodes kernel push message.
 //   G. End-to-end data pipeline: kernel payload → decode → VFS dispatch → cleanup.
-//   H. VFS_SHARED_IO_ENABLED still false.
+//   H. VFS_SHARED_IO_ENABLED was false at Stage 77; Stage 78 enables it.
 //   I. PROC_OP_TASK_EXITED and KERNEL_OP_PM_TASK_EXITED are distinct opcodes.
 #[cfg(test)]
 mod stage77_vfs_tests {
@@ -1887,10 +1894,11 @@ mod stage77_vfs_tests {
     }
 
     #[test]
-    fn stage77_vfs_shared_io_enabled_still_false() {
+    fn stage77_vfs_shared_io_enabled_stage78() {
+        // Stage 78 enabled VFS_WRITE_SHARED_REQUEST_ENABLED → umbrella is now true.
         assert!(
-            !VFS_SHARED_IO_ENABLED,
-            "VFS_SHARED_IO_ENABLED must remain false (write direction not implemented)"
+            VFS_SHARED_IO_ENABLED,
+            "VFS_SHARED_IO_ENABLED must be true after Stage 78"
         );
     }
 
@@ -2051,5 +2059,235 @@ mod stage77_vfs_tests {
                 VfsSharedIoTerminalReason::RequesterExit
             ))
         );
+    }
+}
+
+// ── Stage 78: Final VFS shared-I/O readiness audit + conditional enable ────────
+//
+// Gate matrix verdict: ALL GATES PASS.
+//   WRITE: MAP_READ + binding + RAMFS proof + RequesterExit model + PM notification → true.
+//   READ:  MAP_WRITE + binding + RAMFS proof + RequesterExit model → true (since Stage 73).
+//   PM:    kernel→PM→VFS death path complete → true (since Stage 77+78).
+//   GLOBAL: VFS_SHARED_IO_ENABLED = WRITE && READ && PM = true.
+//
+// Policy: handle_request still rejects shared opcodes. VFS_SHARED_IO_ENABLED=true means
+// both direction helpers and PM notification are proven correct — NOT live production routing.
+// UnsupportedSharedIoMapper remains the production default until a real mapper is available.
+//
+// Tests:
+//   A. Gate constants reflect Stage 78: WRITE=true, READ=true, PM=true, GLOBAL=true.
+//   B. handle_request still rejects shared opcodes despite global gate being true.
+//   C. RequesterExit for WRITE direction via PM push (validates notification path for WRITE).
+//   D. Legacy VFS service construction and operation unchanged.
+//   E. Production mapper still rejects both shared directions.
+#[cfg(test)]
+mod stage78_tests {
+    use super::*;
+    use crate::fs::common::shared_io_adapter::{
+        dispatch_pm_task_exited_push, UnsupportedSharedIoMapper, VfsSharedIoAdapterError,
+        VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED, VFS_READ_SHARED_REPLY_ENABLED,
+        VFS_SHARED_IO_ENABLED, VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED,
+        VFS_WRITE_SHARED_REQUEST_ENABLED,
+    };
+    use crate::fs::common::shared_io_lifecycle::{
+        VfsSharedIoCleanupResult, VfsSharedIoDirection, VfsSharedIoHandleTable,
+        VfsSharedIoLifecycle, VfsSharedIoRequesterExitAction, VfsSharedIoTerminalReason,
+    };
+    use crate::fs::common::vfs_ipc::{read_shared_message, write_shared_message};
+    use crate::fs::ramfs::tree::RamFsBackend;
+    use yarm_ipc_abi::process_abi::{PROC_OP_TASK_EXITED, PmTaskExitedEvent};
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsSharedBufferDescriptor,
+        VfsReadSharedRequest, VfsWriteSharedRequest,
+    };
+
+    const TID_W: u64 = 0x7800_0001;
+    const TID_W2: u64 = 0x7800_0002;
+
+    fn write_lc_in_flight(tid: u64) -> (VfsSharedIoHandleTable<1>, VfsSharedIoLifecycle) {
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let handle = handles.allocate().expect("allocate");
+        let desc = VfsSharedBufferDescriptor::new(
+            handle.object_handle,
+            handle.object_generation,
+            0,
+            8,
+            VFS_SHARED_BUFFER_FS_READ,
+        );
+        let mut lc = VfsSharedIoLifecycle::reserve(
+            1, tid, desc, 8, 0, VfsSharedIoDirection::WriteRequest,
+        )
+        .expect("reserve");
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        (handles, lc)
+    }
+
+    // ── A. Gate constants ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stage78_write_shared_request_gate_now_enabled() {
+        assert!(
+            VFS_WRITE_SHARED_REQUEST_ENABLED,
+            "Stage 78: all WRITE prerequisites met — gate must be true"
+        );
+    }
+
+    #[test]
+    fn stage78_read_shared_reply_gate_still_enabled() {
+        assert!(VFS_READ_SHARED_REPLY_ENABLED);
+    }
+
+    #[test]
+    fn stage78_pm_task_exit_notification_still_enabled() {
+        assert!(VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED);
+    }
+
+    #[test]
+    fn stage78_global_vfs_shared_io_now_enabled() {
+        assert!(
+            VFS_SHARED_IO_ENABLED,
+            "Stage 78: all three prerequisites met — global gate must be true"
+        );
+    }
+
+    #[test]
+    fn stage78_global_gate_requires_all_three_prerequisites() {
+        assert_eq!(
+            VFS_SHARED_IO_ENABLED,
+            VFS_WRITE_SHARED_REQUEST_ENABLED
+                && VFS_READ_SHARED_REPLY_ENABLED
+                && VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED,
+            "global gate must be conjunction of WRITE, READ, and PM notification"
+        );
+    }
+
+    #[test]
+    fn stage78_supervisor_exit_notification_still_disabled() {
+        assert!(!VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED);
+    }
+
+    // ── B. handle_request still rejects shared opcodes ─────────────────────────
+
+    #[test]
+    fn stage78_handle_request_still_rejects_write_shared_despite_gate_true() {
+        let msg = write_shared_message(VfsWriteSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(1, 1, 0, 8, VFS_SHARED_BUFFER_FS_READ),
+        })
+        .expect("msg");
+        assert_eq!(
+            VfsService::<InMemoryBackend>::parse_request(msg),
+            Err(VfsError::Unsupported),
+            "handle_request must not dispatch WRITE_SHARED_REQUEST even with gate true"
+        );
+    }
+
+    #[test]
+    fn stage78_handle_request_still_rejects_read_shared_despite_gate_true() {
+        let msg = read_shared_message(VfsReadSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: VfsSharedBufferDescriptor::new(1, 1, 0, 8, VFS_SHARED_BUFFER_FS_WRITE),
+        })
+        .expect("msg");
+        assert_eq!(
+            VfsService::<InMemoryBackend>::parse_request(msg),
+            Err(VfsError::Unsupported),
+            "handle_request must not dispatch READ_SHARED_REPLY even with gate true"
+        );
+    }
+
+    // ── C. RequesterExit for WRITE direction via PM push ──────────────────────
+
+    #[test]
+    fn stage78_write_direction_requester_exit_via_pm_push_cleans_lifecycle() {
+        let (mut handles, mut lc) = write_lc_in_flight(TID_W);
+        let payload = PmTaskExitedEvent::new(TID_W, 0).encode();
+        let result =
+            dispatch_pm_task_exited_push(PROC_OP_TASK_EXITED, &payload, &mut lc, &mut handles)
+                .expect("dispatch");
+        assert_eq!(
+            result,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            )),
+            "WRITE lifecycle must be cleaned by RequesterExit via PM push"
+        );
+    }
+
+    #[test]
+    fn stage78_write_direction_duplicate_requester_exit_idempotent() {
+        let (mut handles, mut lc) = write_lc_in_flight(TID_W);
+        let payload = PmTaskExitedEvent::new(TID_W, 0).encode();
+        let first =
+            dispatch_pm_task_exited_push(PROC_OP_TASK_EXITED, &payload, &mut lc, &mut handles)
+                .expect("first");
+        assert!(matches!(
+            first,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(_))
+        ));
+        let second =
+            dispatch_pm_task_exited_push(PROC_OP_TASK_EXITED, &payload, &mut lc, &mut handles)
+                .expect("second");
+        assert!(matches!(
+            second,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::AlreadyCleaned(_))
+        ));
+    }
+
+    #[test]
+    fn stage78_write_requester_exit_unmatched_tid_is_safe_noop() {
+        let (mut handles, mut lc) = write_lc_in_flight(TID_W);
+        let payload = PmTaskExitedEvent::new(TID_W2, 0).encode(); // different TID
+        let result =
+            dispatch_pm_task_exited_push(PROC_OP_TASK_EXITED, &payload, &mut lc, &mut handles)
+                .expect("dispatch");
+        assert_eq!(result, VfsSharedIoRequesterExitAction::NotMatched);
+    }
+
+    // ── D. Legacy VFS service construction and operation unchanged ────────────
+
+    #[test]
+    fn stage78_legacy_vfs_service_constructible() {
+        let svc = VfsService::<RamFsBackend>::with_backend(RamFsBackend::new());
+        assert_eq!(svc.op_sequence(), 0, "fresh service must start at op_sequence 0");
+    }
+
+    #[test]
+    fn stage78_legacy_vfs_ramfs_read_write_unchanged() {
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/stage78rw").expect("create");
+        let wfd = svc.backend_mut().open_path(b"/stage78rw").expect("open write");
+        svc.backend_mut().write_bytes(wfd, b"stage78!").expect("write");
+        svc.backend_mut().close_fd(wfd).expect("close");
+        let rfd = svc.backend_mut().open_path(b"/stage78rw").expect("open read");
+        let mut buf = [0u8; 8];
+        let n = svc.backend_mut().read_bytes(rfd, &mut buf).expect("read");
+        assert_eq!(n, 8);
+        assert_eq!(&buf, b"stage78!");
+    }
+
+    // ── E. Production mapper still rejects shared directions ──────────────────
+
+    #[test]
+    fn stage78_production_mapper_still_rejects_write_direction() {
+        let desc = VfsSharedBufferDescriptor::new(1, 1, 0, 8, VFS_SHARED_BUFFER_FS_READ);
+        let result = UnsupportedSharedIoMapper.with_write_request_buffer(desc, 8, |_| ());
+        assert_eq!(result, Err(VfsSharedIoAdapterError::UnsupportedMapping));
+    }
+
+    #[test]
+    fn stage78_production_mapper_still_rejects_read_direction() {
+        let desc = VfsSharedBufferDescriptor::new(1, 1, 0, 8, VFS_SHARED_BUFFER_FS_WRITE);
+        let result = UnsupportedSharedIoMapper.with_read_reply_buffer(desc, 8, |_| ());
+        assert_eq!(result, Err(VfsSharedIoAdapterError::UnsupportedMapping));
     }
 }

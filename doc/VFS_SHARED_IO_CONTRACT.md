@@ -672,14 +672,16 @@ route for WRITE_SHARED_REQUEST. No global enable occurs. READ_SHARED_REPLY remai
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `VFS_WRITE_SHARED_REQUEST_ENABLED` | `false` | WRITE_SHARED_REQUEST live route gate |
-| `VFS_READ_SHARED_REPLY_ENABLED` | `true` (Stage 73) | READ_SHARED_REPLY gate — enabled; live notification still helper-only |
-| `VFS_SHARED_IO_ENABLED` | `false` | Aggregate umbrella — `WRITE && READ`, so `false` |
-| `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` | `false` (Stage 75) | Supervisor→VFS task-exit channel — not yet wired |
+| `VFS_WRITE_SHARED_REQUEST_ENABLED` | `true` (Stage 78) | WRITE_SHARED_REQUEST helper proven; prerequisites met |
+| `VFS_READ_SHARED_REPLY_ENABLED` | `true` (Stage 73) | READ_SHARED_REPLY gate — enabled; live notification via PM path |
+| `VFS_SHARED_IO_ENABLED` | `true` (Stage 78) | Aggregate umbrella — `WRITE && READ && PM` = `true` |
+| `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` | `false` (Stage 75) | Supervisor→VFS task-exit channel — PM model replaces |
 | `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` | `true` (Stage 77+78) | PM→VFS task-exit push notification channel — both blockers resolved |
 
-`VFS_SHARED_IO_ENABLED` is only `true` when both direction gates are `true`. Since
-`VFS_WRITE_SHARED_REQUEST_ENABLED` remains `false`, the umbrella remains `false`.
+`VFS_SHARED_IO_ENABLED` is `true` when all three gates are `true`. Stage 78 enables
+`VFS_WRITE_SHARED_REQUEST_ENABLED` after auditing all prerequisites. `handle_request` still
+rejects shared opcodes — `UnsupportedSharedIoMapper` is the production default. Gate `true`
+means helper-level prerequisites are proven, not that live production routing is active.
 
 ### Live route: `VfsService::dispatch_write_shared_request`
 
@@ -845,7 +847,70 @@ Total `yarm-fs-servers` tests after Stage 76: **313** (up from 295; +18 Stage 76
 
 Total `yarm-fs-servers` tests after Stage 77+78: **325** (up from 313; +12 Stage 77+78 tests).
 
-### Remaining blockers before global `VFS_SHARED_IO_ENABLED`
+Total `yarm-fs-servers` tests after Stage 78: **340** (up from 325; +15 Stage 78 tests).
+
+## Stage 78 — Final VFS shared-I/O readiness audit + global enable
+
+### Scope
+
+Stage 78 performs the final gate matrix audit and conditionally enables the global flag.
+No new kernel code is added. No live `handle_request` routing is changed.
+
+### Gate matrix audit (all pass)
+
+| Gate | Value | Resolved | Notes |
+|---|---|---|---|
+| `VFS_WRITE_SHARED_REQUEST_ENABLED` | **`true`** | Stage 78 | MAP_READ + binding + RAMFS + RequesterExit + PM notification |
+| `VFS_READ_SHARED_REPLY_ENABLED` | **`true`** | Stage 73 | MAP_WRITE + binding + RAMFS + RequesterExit |
+| `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` | **`true`** | Stage 77+78 | kernel→PM→VFS death path wired |
+| `VFS_SHARED_IO_ENABLED` | **`true`** | Stage 78 | `WRITE && READ && PM = true` |
+| `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` | `false` | Stage 75 | PM model replaces; unwired |
+
+### Policy decision
+
+`VFS_SHARED_IO_ENABLED = VFS_WRITE_SHARED_REQUEST_ENABLED && VFS_READ_SHARED_REPLY_ENABLED && VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED`
+
+All three are `true` in Stage 78. `VFS_SHARED_IO_ENABLED = true` means both direction helpers
+and the PM notification path are proven correct at the helper level. It does NOT mean
+`handle_request` routes shared opcodes in production. Both `VFS_OP_WRITE_SHARED_REQUEST` and
+`VFS_OP_READ_SHARED_REPLY` remain `VfsError::Unsupported` until a real `VfsSharedIoMapper` is
+available (see FS-17/FS-19 for mapper ABI design). `UnsupportedSharedIoMapper` remains the
+production default.
+
+### New Stage 78 tests (15 total, mod stage78_tests)
+
+**Gate constants (6):** both direction gates true, PM notification true, global gate true,
+conjunction invariant (WRITE && READ && PM), supervisor path still disabled.
+
+**handle_request routing (2):** still rejects WRITE_SHARED_REQUEST and READ_SHARED_REPLY
+even with `VFS_SHARED_IO_ENABLED = true`.
+
+**RequesterExit for WRITE direction (3):** `dispatch_pm_task_exited_push` cleans a WRITE
+lifecycle; duplicate exit is idempotent (AlreadyCleaned); unmatched TID is safe noop.
+
+**Legacy behavior (2):** VfsService construction unchanged; RAMFS read/write unchanged.
+
+**Production mapper (2):** `UnsupportedSharedIoMapper` still rejects both directions.
+
+### Production confirmations
+
+- `handle_request` still rejects `VFS_OP_WRITE_SHARED_REQUEST` with `Unsupported`.
+- `handle_request` still rejects `VFS_OP_READ_SHARED_REPLY` with `Unsupported`.
+- FAT/ext4/blkcache production behavior unchanged.
+- No runtime spawn/policy changes.
+- SYSCALL_COUNT = 31; STARTUP_SLOT_COUNT = 18; both unchanged.
+
+### Remaining work before live production routing
+
+1. **Real `VfsSharedIoMapper` implementation** — requires a separately reviewed userspace
+   transfer/map/unmap/revoke primitive with object type, rights, size, generation, and
+   process-exit integration (FS-17 through FS-19 requirements).
+2. **`VfsService` service loop integration** — wiring `dispatch_write_shared_request` and
+   `dispatch_read_shared_reply` into `handle_request` routing once a real mapper exists.
+3. **FAT/ext4 server migration** — RAMFS is the proof backend; FAT production writes and
+   ext4 writes remain out of scope until the mapper is proven in production.
+
+### Remaining blockers before global `VFS_SHARED_IO_ENABLED` (all resolved at Stage 78)
 
 1. **Process-exit cleanup** — ~~kernel must signal VFS server when a process holding a mapped~~
    ~~receive exits~~ **IDENTITY PROVEN (Stage 75)**:
