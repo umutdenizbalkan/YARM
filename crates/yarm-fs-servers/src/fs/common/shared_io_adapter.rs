@@ -19,6 +19,8 @@ use yarm_ipc_abi::vfs_abi::{
     VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsReadSharedRequest,
     VfsSharedBufferDescriptor, VfsWriteSharedRequest,
 };
+use yarm_user_rt::syscall::recv_v3::RecvSharedV3Delivery;
+use yarm_user_rt::syscall::shared_transfer::release_v3_cleanup_token;
 
 /// Gating constant for the WRITE_SHARED_REQUEST live route.
 ///
@@ -238,6 +240,189 @@ impl VfsSharedIoMapper for UnsupportedSharedIoMapper {
         _descriptor: VfsSharedBufferDescriptor,
     ) -> Result<(), VfsSharedIoAdapterError> {
         Err(VfsSharedIoAdapterError::UnsupportedMapping)
+    }
+}
+
+// ── Stage 79: Production VfsSharedIoMapper bridge ──────────────────────────────
+
+/// Stage 79: production `VfsSharedIoMapper` backed by a `recv_shared_v3` delivery.
+///
+/// Maps delivery metadata to direction-safe byte slice access.  Exposes the mapped
+/// region as `&[u8]` (write request) or `&mut [u8]` (read reply) via
+/// `core::slice::from_raw_parts[_mut]`.
+///
+/// ## Release contract
+///
+/// `release` calls `release_v3_cleanup_token(cleanup_token)` exactly once; the
+/// `released` flag is set on the first call regardless of syscall outcome (at-most-once
+/// semantics).  Subsequent accesses return `AccessAfterCleanup`.  No Drop cleanup —
+/// callers must call `release` explicitly.
+///
+/// ## Byte-access blocker (hosted-dev)
+///
+/// `with_write_request_buffer` and `with_read_reply_buffer` call
+/// `core::slice::from_raw_parts[_mut]` on `mapped_base` — a kernel-mapped VA.
+/// In hosted-dev unit tests `mapped_base` is a test constant; accessing it is
+/// undefined behaviour.  Byte content tests require a real YARM kernel integration
+/// harness.  Unit tests cover only error paths (direction, handle, perm, range)
+/// that reject before the unsafe slice creation.
+pub struct RecvV3SharedIoMapper {
+    cleanup_token: u64,
+    mapped_base: u64,
+    page_rounded_mapped_len: u64,
+    actual_mapping_perm: u32,
+    released: bool,
+}
+
+impl RecvV3SharedIoMapper {
+    const MAP_PERM_READ_ONLY: u32 = 1;
+    const MAP_PERM_WRITE_BIT: u32 = 0x2;
+
+    /// Construct from the natural production entry point.
+    pub fn from_delivery(delivery: &RecvSharedV3Delivery) -> Self {
+        Self {
+            cleanup_token: delivery.cleanup_token,
+            mapped_base: delivery.mapped_base,
+            page_rounded_mapped_len: delivery.page_rounded_mapped_len,
+            actual_mapping_perm: delivery.actual_mapping_perm,
+            released: false,
+        }
+    }
+
+    /// Construct from raw delivery metadata fields.
+    pub fn from_fields(
+        cleanup_token: u64,
+        mapped_base: u64,
+        page_rounded_mapped_len: u64,
+        actual_mapping_perm: u32,
+    ) -> Self {
+        Self {
+            cleanup_token,
+            mapped_base,
+            page_rounded_mapped_len,
+            actual_mapping_perm,
+            released: false,
+        }
+    }
+
+    pub const fn is_released(&self) -> bool {
+        self.released
+    }
+
+    fn write_slice_ptr(
+        &self,
+        descriptor: VfsSharedBufferDescriptor,
+        requested_len: u64,
+    ) -> Result<(*const u8, usize), VfsSharedIoAdapterError> {
+        if self.released {
+            return Err(VfsSharedIoAdapterError::AccessAfterCleanup);
+        }
+        if descriptor.access != VFS_SHARED_BUFFER_FS_READ {
+            return Err(VfsSharedIoAdapterError::WrongDirection);
+        }
+        if descriptor.object_handle != self.cleanup_token
+            || descriptor.object_generation != self.cleanup_token >> 16
+        {
+            return Err(VfsSharedIoAdapterError::StaleHandle);
+        }
+        if self.actual_mapping_perm != Self::MAP_PERM_READ_ONLY {
+            return Err(VfsSharedIoAdapterError::MissingRights);
+        }
+        self.byte_slice_ptr(descriptor.buffer_offset, requested_len)
+    }
+
+    fn read_slice_ptr(
+        &self,
+        descriptor: VfsSharedBufferDescriptor,
+        requested_len: u64,
+    ) -> Result<(*const u8, usize), VfsSharedIoAdapterError> {
+        if self.released {
+            return Err(VfsSharedIoAdapterError::AccessAfterCleanup);
+        }
+        if descriptor.access != VFS_SHARED_BUFFER_FS_WRITE {
+            return Err(VfsSharedIoAdapterError::WrongDirection);
+        }
+        if descriptor.object_handle != self.cleanup_token
+            || descriptor.object_generation != self.cleanup_token >> 16
+        {
+            return Err(VfsSharedIoAdapterError::StaleHandle);
+        }
+        if self.actual_mapping_perm & Self::MAP_PERM_WRITE_BIT == 0 {
+            return Err(VfsSharedIoAdapterError::MissingRights);
+        }
+        self.byte_slice_ptr(descriptor.buffer_offset, requested_len)
+    }
+
+    fn byte_slice_ptr(
+        &self,
+        buffer_offset: u64,
+        requested_len: u64,
+    ) -> Result<(*const u8, usize), VfsSharedIoAdapterError> {
+        let range_end = buffer_offset
+            .checked_add(requested_len)
+            .ok_or(VfsSharedIoAdapterError::BadRange)?;
+        if self.page_rounded_mapped_len < range_end {
+            return Err(VfsSharedIoAdapterError::BadRange);
+        }
+        let offset = usize::try_from(buffer_offset)
+            .map_err(|_| VfsSharedIoAdapterError::BadRange)?;
+        let base = usize::try_from(self.mapped_base)
+            .map_err(|_| VfsSharedIoAdapterError::BadRange)?;
+        let ptr = base
+            .checked_add(offset)
+            .ok_or(VfsSharedIoAdapterError::BadRange)?;
+        let len = usize::try_from(requested_len)
+            .map_err(|_| VfsSharedIoAdapterError::BadRange)?;
+        Ok((ptr as *const u8, len))
+    }
+}
+
+impl VfsSharedIoMapper for RecvV3SharedIoMapper {
+    fn with_read_reply_buffer<R>(
+        &mut self,
+        descriptor: VfsSharedBufferDescriptor,
+        requested_len: u64,
+        operation: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, VfsSharedIoAdapterError> {
+        let (ptr, len) = self.read_slice_ptr(descriptor, requested_len)?;
+        // SAFETY: ptr is within a kernel-mapped region with WRITE permission;
+        // mapping is live (not released); len bytes are within page_rounded_mapped_len.
+        // Not safe in hosted-dev tests — see struct doc blocker note.
+        let buf = unsafe { core::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+        Ok(operation(buf))
+    }
+
+    fn with_write_request_buffer<R>(
+        &mut self,
+        descriptor: VfsSharedBufferDescriptor,
+        requested_len: u64,
+        operation: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, VfsSharedIoAdapterError> {
+        let (ptr, len) = self.write_slice_ptr(descriptor, requested_len)?;
+        // SAFETY: ptr is within a kernel-mapped region with READ permission;
+        // mapping is live (not released); len bytes are within page_rounded_mapped_len.
+        // Not safe in hosted-dev tests — see struct doc blocker note.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        Ok(operation(bytes))
+    }
+
+    fn release(
+        &mut self,
+        descriptor: VfsSharedBufferDescriptor,
+    ) -> Result<(), VfsSharedIoAdapterError> {
+        if descriptor.object_handle != self.cleanup_token
+            || descriptor.object_generation != self.cleanup_token >> 16
+        {
+            return Err(VfsSharedIoAdapterError::StaleHandle);
+        }
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        // SAFETY: cleanup_token is from a recv_shared_v3 delivery;
+        // released flag ensures at-most-once semantics.
+        unsafe { release_v3_cleanup_token(self.cleanup_token) }
+            .map_err(|_| VfsSharedIoAdapterError::ReleaseFailure)
     }
 }
 
@@ -1251,5 +1436,168 @@ mod tests {
             Err(VfsSharedIoAdapterError::UnsupportedMapping),
             "UnsupportedSharedIoMapper must reject release — live mapping is disabled"
         );
+    }
+
+    // ── Stage 79: RecvV3SharedIoMapper unit tests ──────────────────────────────
+    //
+    // These tests cover only validation error paths that fail before from_raw_parts.
+    // Byte content access and successful release require a real YARM kernel mapping.
+    // In hosted-dev, release_v3_cleanup_token invokes a Linux syscall (NR 4 = write)
+    // that fails; release() returns ReleaseFailure but sets the released flag.
+
+    const TOKEN_79A: u64 = 0x0009_0007; // gen=9, slot=7
+    const BASE_79A: u64 = 0xB000;       // fake VA — not valid in hosted-dev
+    const LEN_79A: u64 = 4096;
+    const PERM_RO_79A: u32 = 1;
+    const PERM_RW_79A: u32 = 3;
+
+    fn wr_desc_79(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_READ)
+    }
+
+    fn rd_desc_79(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_WRITE)
+    }
+
+    #[test]
+    fn stage79_recv_v3_mapper_from_delivery_constructs_with_all_fields() {
+        use yarm_user_rt::syscall::recv_v3::RecvSharedV3Delivery;
+        let d = RecvSharedV3Delivery {
+            cleanup_token: TOKEN_79A,
+            mapped_base: BASE_79A,
+            page_rounded_mapped_len: LEN_79A,
+            actual_mapping_perm: PERM_RO_79A,
+            ..RecvSharedV3Delivery::default()
+        };
+        let m = RecvV3SharedIoMapper::from_delivery(&d);
+        assert!(!m.is_released());
+    }
+
+    #[test]
+    fn stage79_recv_v3_mapper_from_fields_is_not_released() {
+        let m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        assert!(!m.is_released());
+    }
+
+    #[test]
+    fn stage79_write_request_wrong_direction_rejected() {
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        // FS_WRITE access on a write-request mapper (expects FS_READ) → WrongDirection
+        let desc = VfsSharedBufferDescriptor::new(
+            TOKEN_79A, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_WRITE,
+        );
+        assert_eq!(
+            m.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::WrongDirection)
+        );
+    }
+
+    #[test]
+    fn stage79_write_request_stale_handle_rejected() {
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        let desc = VfsSharedBufferDescriptor::new(
+            TOKEN_79A + 1, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+        );
+        assert_eq!(
+            m.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::StaleHandle)
+        );
+    }
+
+    #[test]
+    fn stage79_write_request_stale_generation_rejected() {
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        let desc = VfsSharedBufferDescriptor::new(
+            TOKEN_79A, (TOKEN_79A >> 16) + 1, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+        );
+        assert_eq!(
+            m.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::StaleHandle)
+        );
+    }
+
+    #[test]
+    fn stage79_write_request_rw_perm_rejected() {
+        // Write requests require MAP_READ_ONLY (perm=1); RW perm → MissingRights.
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RW_79A);
+        assert_eq!(
+            m.with_write_request_buffer(wr_desc_79(TOKEN_79A, 0, 8), 8, |_| ()),
+            Err(VfsSharedIoAdapterError::MissingRights)
+        );
+    }
+
+    #[test]
+    fn stage79_write_request_bad_range_rejected() {
+        // page_rounded_mapped_len=8; offset=1 + len=8 → end=9 > 8 → BadRange.
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, 8, PERM_RO_79A);
+        let desc = VfsSharedBufferDescriptor::new(
+            TOKEN_79A, TOKEN_79A >> 16, 1, 8, VFS_SHARED_BUFFER_FS_READ,
+        );
+        assert_eq!(
+            m.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::BadRange)
+        );
+    }
+
+    #[test]
+    fn stage79_read_reply_wrong_direction_rejected() {
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RW_79A);
+        // FS_READ access on a read-reply mapper (expects FS_WRITE) → WrongDirection.
+        let desc = VfsSharedBufferDescriptor::new(
+            TOKEN_79A, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+        );
+        assert_eq!(
+            m.with_read_reply_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::WrongDirection)
+        );
+    }
+
+    #[test]
+    fn stage79_read_reply_readonly_perm_rejected() {
+        // Read replies require MAP_WRITE bit; RO perm (no write bit) → MissingRights.
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        assert_eq!(
+            m.with_read_reply_buffer(rd_desc_79(TOKEN_79A, 0, 8), 8, |_| ()),
+            Err(VfsSharedIoAdapterError::MissingRights)
+        );
+    }
+
+    #[test]
+    fn stage79_release_stale_handle_rejected() {
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        let wrong = VfsSharedBufferDescriptor::new(
+            TOKEN_79A + 1, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+        );
+        assert_eq!(m.release(wrong), Err(VfsSharedIoAdapterError::StaleHandle));
+        assert!(!m.is_released(), "stale-handle release must not mark as released");
+    }
+
+    #[test]
+    fn stage79_release_marks_released_and_blocks_subsequent_access() {
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        let desc = wr_desc_79(TOKEN_79A, 0, 8);
+        let r = m.release(desc);
+        // In hosted-dev: release_v3_cleanup_token invokes a Linux syscall that fails
+        // (RCX = return address ≠ 0 → decode_release sees error → ReleaseFailure).
+        // In production: Ok(()) when the kernel mapping is live.
+        assert!(
+            r == Ok(()) || r == Err(VfsSharedIoAdapterError::ReleaseFailure),
+            "release must return Ok or ReleaseFailure; got {r:?}"
+        );
+        assert!(m.is_released(), "released flag must be set after first release attempt");
+        assert_eq!(
+            m.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::AccessAfterCleanup),
+            "access after release must return AccessAfterCleanup"
+        );
+    }
+
+    #[test]
+    fn stage79_release_idempotent_second_call_returns_ok() {
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
+        let desc = wr_desc_79(TOKEN_79A, 0, 8);
+        let _ = m.release(desc); // first call (may fail in hosted-dev; sets released=true)
+        assert!(m.is_released());
+        assert_eq!(m.release(desc), Ok(()), "second release must return Ok without syscall");
     }
 }
