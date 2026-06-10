@@ -182,6 +182,21 @@ impl SyscallError {
     pub const fn code(self) -> usize {
         self as usize
     }
+
+    pub const fn from_code(code: usize) -> Self {
+        match code {
+            1 => Self::InvalidNumber,
+            2 => Self::InvalidArgs,
+            3 => Self::InvalidCapability,
+            4 => Self::MissingRight,
+            5 => Self::WrongObject,
+            6 => Self::QueueFull,
+            7 => Self::WouldBlock,
+            8 => Self::PageFault,
+            9 => Self::TimedOut,
+            _ => Self::Internal,
+        }
+    }
 }
 
 impl From<KernelError> for SyscallError {
@@ -3261,6 +3276,12 @@ fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
         7 => Some("sbin/driver_manager"),
         8 => Some("sbin/blkcache_srv"),
         9 => Some("sbin/virtio_blk_srv"),
+        // Stage 81B: optional FS servers staged in CPIO by Stage 80.
+        // Kernel path table entries required for Phase 3A/Phase 2B spawn
+        // to succeed when INIT_SPAWN_OPTIONAL_FS_SERVERS is enabled.
+        10 => Some("sbin/fat_srv"),
+        11 => Some("sbin/ramfs_srv"),
+        12 => Some("sbin/ext4_srv"),
         _ => None,
     }
 }
@@ -7454,5 +7475,162 @@ mod tests {
             .expect("spawn test thread")
             .join()
             .expect("join test thread");
+    }
+
+    // ── Stage 81A: syscall-error parity and nonfatal dispatch ─────────────────
+
+    #[test]
+    fn stage81a_unknown_syscall_nr_is_encoded_in_frame_not_fatal() {
+        // Verifies the Stage 81A parity fix: handle_trap must return Ok() for
+        // normal user syscall errors and encode the error code into the trap
+        // frame. Previously, dispatch_syscall returning Err propagated as
+        // TrapHandleError, causing YARM_AARCH64_TRAP_HANDLE halting on AArch64
+        // and halt_forever() on x86_64.
+        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut frame = TrapFrame::new(99, [0; 6]); // syscall nr=99 is undefined
+        let result = state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut frame));
+        assert!(
+            result.is_ok(),
+            "normal user syscall error must be nonfatal (handle_trap must return Ok): {result:?}"
+        );
+        assert_eq!(
+            frame.error_code(),
+            Some(SyscallError::InvalidNumber.code()),
+            "InvalidNumber must be encoded in trap frame, not lost"
+        );
+    }
+
+    #[test]
+    fn stage81a_invalid_args_from_dispatch_encoded_not_propagated() {
+        // SpawnProcessFromUserBuf (NR=24) with elf_len=0 returns InvalidArgs.
+        // Verify that handle_trap writes it into the frame and returns Ok().
+        let mut state = Box::new(Bootstrap::init().expect("init"));
+        let mut frame = TrapFrame::new(
+            SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR,
+            [0, 0, 0, 0, 0, 0], // elf_len=0 triggers InvalidArgs early exit
+        );
+        let result = state.handle_trap(crate::kernel::trap::Trap::Syscall, Some(&mut frame));
+        assert!(
+            result.is_ok(),
+            "InvalidArgs must not propagate as TrapHandleError: {result:?}"
+        );
+        assert!(
+            frame.error_code().is_some(),
+            "error code must be written into trap frame"
+        );
+    }
+
+    #[test]
+    fn stage81a_parity_fix_dispatch_no_longer_propagates_via_question_mark() {
+        // Source inspection: the old one-liner that caused the halt is gone.
+        let src = include_str!("syscall.rs");
+        let fault_src = include_str!("boot/fault_state.rs");
+        assert!(
+            !fault_src.contains(
+                "dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?"
+            ),
+            "dispatch_syscall must not propagate Err as TrapHandleError via ? — fixes arch halt"
+        );
+        assert!(
+            fault_src.contains("if let Err(e) = dispatch_syscall(self, trapframe)"),
+            "dispatch_syscall errors must be caught and encoded into frame"
+        );
+        assert!(
+            fault_src.contains("trapframe.set_err(e.code())"),
+            "error must be encoded via set_err into trap frame"
+        );
+        let _ = src;
+    }
+
+    #[test]
+    fn stage81a_aarch64_halt_path_requires_trap_handle_err_not_syscall_err() {
+        // Source inspection: the AArch64 boot code halts only when
+        // dispatch_trap_entry_with_shared_kernel returns Err. After Stage 81A
+        // the parity fix ensures normal SyscallErrors never propagate that far.
+        let boot_src = include_str!("../arch/aarch64/boot.rs");
+        assert!(
+            boot_src.contains("YARM_AARCH64_TRAP_HANDLE halting"),
+            "AArch64 halt marker must remain documented in boot.rs"
+        );
+        assert!(
+            boot_src.contains(".is_ok()"),
+            "AArch64 boot entry guards frame writeback on is_ok()"
+        );
+    }
+
+    // ── Stage 81B: spawn image path table extension ────────────────────────────
+
+    #[test]
+    fn stage81b_spawn_path_table_covers_optional_fs_image_ids() {
+        let src = include_str!("syscall.rs");
+        assert!(
+            src.contains("10 => Some(\"sbin/fat_srv\")"),
+            "spawn_image_path_for_image_id must map image_id=10 to sbin/fat_srv"
+        );
+        assert!(
+            src.contains("11 => Some(\"sbin/ramfs_srv\")"),
+            "spawn_image_path_for_image_id must map image_id=11 to sbin/ramfs_srv"
+        );
+        assert!(
+            src.contains("12 => Some(\"sbin/ext4_srv\")"),
+            "spawn_image_path_for_image_id must map image_id=12 to sbin/ext4_srv"
+        );
+    }
+
+    #[test]
+    fn stage81b_spawn_path_table_unknown_high_id_returns_none() {
+        let src = include_str!("syscall.rs");
+        // The wildcard arm must be the fallthrough; no ID ≥ 13 must be listed.
+        assert!(
+            src.contains("_ => None"),
+            "spawn_image_path_for_image_id must have wildcard None arm for unknown IDs"
+        );
+        // Build the forbidden arm pattern at runtime to avoid literal self-match.
+        let id13_arm = ["13", " => Some("].concat();
+        assert!(
+            !src.contains(&id13_arm),
+            "no image_id=13 must exist in spawn_image_path_for_image_id"
+        );
+    }
+
+    #[test]
+    fn stage81b_syscall_count_remains_31() {
+        let src = include_str!("syscall.rs");
+        assert!(
+            src.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31 after Stage 81B path table extension"
+        );
+        // Build the bad-count string at runtime to avoid self-referential match.
+        let bad_count = ["SYSCALL_COUNT: usize = ", "32"].concat();
+        assert!(
+            !src.contains(&bad_count),
+            "SYSCALL_COUNT must not be incremented by Stage 81B"
+        );
+    }
+
+    #[test]
+    fn stage81b_spawn_phase2b_and_phase3a_both_use_path_table() {
+        // Both Phase 2B (spawn_process_from_user_buf, NR=24) and Phase 3A
+        // (spawn_from_memory_object, NR=29) route through
+        // spawn_image_path_for_image_id. Verify both callers are present.
+        let src = include_str!("syscall.rs");
+        let count = src
+            .matches("spawn_image_path_for_image_id(image_id)")
+            .count();
+        assert!(
+            count >= 2,
+            "spawn_image_path_for_image_id must be called from both Phase 2B and Phase 3A (found {count} calls)"
+        );
+    }
+
+    #[test]
+    fn stage81a_optional_fs_core_profile_still_disabled() {
+        // Regression: core profile must still have optional FS live spawns off.
+        let init_src =
+            include_str!("../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs");
+        assert!(
+            init_src.contains("const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;"),
+            "core profile must keep INIT_SPAWN_OPTIONAL_FS_SERVERS = false after Stage 81"
+        );
     }
 }

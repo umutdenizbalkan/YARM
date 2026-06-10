@@ -4504,3 +4504,56 @@ All Stage 80 artifacts must remain intact in Stage 80R/81:
 - `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 regression checks)
 - `bash -n scripts/qemu-x86_64-core-smoke.sh && bash -n scripts/qemu-aarch64-core-smoke.sh`
 - `cargo test -p yarm-fs-servers --features hosted-dev` (full regression)
+
+---
+
+## Rule N+74 — Stage 81A: Syscall errors must be encoded in the trap frame, not propagated as TrapHandleError
+
+**Applies to:** `src/kernel/boot/fault_state.rs` `handle_trap`, all arch entry points.
+
+**Problem (pre-81A):** `dispatch_syscall(self, trapframe)?` inside `handle_trap` propagated any
+`SyscallError` as `TrapHandleError::Syscall(...)`. All three arch entry points treat
+`Err(TrapHandleError)` as a fatal kernel halt (AArch64: WFE loop; x86_64: `halt_forever()`; RISC-V:
+`?` propagation). A normal user error like `InvalidArgs` or `MissingRight` would lock up the CPU.
+
+**Rule:** The `Trap::Syscall` arm of `handle_trap` MUST encode errors into the frame
+(`trapframe.set_err(e.code())`) and return `Ok(())`. Never use `?` to propagate `SyscallError`
+out of `handle_trap` for the syscall case.
+
+**Kernel-internal wrappers** (e.g. `control_plane_set_process_cnode_slots_via_syscall`) that call
+`handle_trap` synthetically and need to observe policy-denial errors MUST read `frame.error_code()`
+after dispatch and translate it back to `Err(TrapHandleError::Syscall(...))` using
+`SyscallError::from_code(code)`.
+
+**Gate tests (in `src/kernel/syscall.rs`):**
+- `stage81a_unknown_syscall_nr_is_encoded_in_frame_not_fatal`
+- `stage81a_invalid_args_from_dispatch_encoded_not_propagated`
+- `stage81a_parity_fix_dispatch_no_longer_propagates_via_question_mark`
+- `stage81a_aarch64_halt_path_requires_trap_handle_err_not_syscall_err`
+
+**Run:** `cargo test --lib --features hosted-dev stage81a`
+
+---
+
+## Rule N+75 — Stage 81B: Kernel spawn path table must cover optional-FS image IDs 10/11/12
+
+**Applies to:** `spawn_image_path_for_image_id()` in `src/kernel/syscall.rs`.
+
+**Rule:** Image IDs 10 (`fat_srv`), 11 (`ramfs_srv`), 12 (`ext4_srv`) must have path-table entries
+so that Phase 2B (`handle_spawn_process_from_user_buf`, NR=24) and Phase 3A
+(`handle_spawn_from_memory_object`, NR=29) return valid CPIO paths instead of `InvalidArgs` when
+optional FS spawning is enabled. IDs ≥ 13 MUST still return `None`.
+
+**`INIT_SPAWN_OPTIONAL_FS_SERVERS` MUST remain `false` in all core profiles** — adding path-table
+entries does not enable live spawning.
+
+**`SYSCALL_COUNT` must remain 31; no syscall numbers changed.**
+
+**Gate tests (in `src/kernel/syscall.rs`):**
+- `stage81b_spawn_path_table_covers_optional_fs_image_ids`
+- `stage81b_spawn_path_table_unknown_high_id_returns_none`
+- `stage81b_syscall_count_remains_31`
+- `stage81b_spawn_phase2b_and_phase3a_both_use_path_table`
+- `stage81a_optional_fs_core_profile_still_disabled`
+
+**Run:** `cargo test --lib --features hosted-dev stage81b`

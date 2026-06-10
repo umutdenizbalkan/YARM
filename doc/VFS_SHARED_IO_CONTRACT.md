@@ -1143,3 +1143,24 @@ PM reply state needed by subsequent core spawns.
 - `cargo test -p yarm-control-plane-servers --features hosted-dev -- stage80` (5 regression checks)
 - `bash -n scripts/qemu-x86_64-core-smoke.sh && bash -n scripts/qemu-aarch64-core-smoke.sh`
 - `cargo test -p yarm-fs-servers --features hosted-dev` (full 368-test regression)
+
+---
+
+## Stage 81A+B: Kernel trap-error parity and optional-FS spawn path table
+
+**Stage 81A — Syscall error parity:**
+`handle_trap`'s `Trap::Syscall` arm now encodes errors into the trap frame
+(`trapframe.set_err(e.code())`) rather than propagating them as `TrapHandleError`. This prevents
+normal user-space errors (`InvalidArgs`, `MissingRight`, etc.) from triggering the fatal kernel halt
+paths in AArch64 (`WFE` spin), x86_64 (`halt_forever()`), and RISC-V (`?` propagation).
+
+Kernel-internal wrappers that synthesize a syscall trap and need to observe denial results
+(e.g. `control_plane_set_process_cnode_slots_via_syscall`) now read `frame.error_code()` after
+`handle_trap` returns and re-raise the error via `SyscallError::from_code`.
+
+**Stage 81B — Optional-FS spawn path table:**
+`spawn_image_path_for_image_id()` extended with `fat_srv` (10), `ramfs_srv` (11), `ext4_srv` (12).
+`INIT_SPAWN_OPTIONAL_FS_SERVERS` remains `false`; no live spawning in core profile.
+
+**Invariants preserved:** syscall numbers, `SYSCALL_COUNT`, `SpawnV5` ABI, Phase2B/Phase3B
+semantics, CPIO/ALIGN_PROOF artifacts, VFS shared-I/O opcodes — all unchanged.
