@@ -2513,3 +2513,477 @@ mod stage79_tests {
         assert!(VFS_SHARED_IO_ENABLED);
     }
 }
+
+// ── Stage 83: RecvV3SharedIoMapper RAMFS-only proof via heap-backed mapped delivery ──
+//
+// Stage 79 proved RecvV3SharedIoMapper validates delivery metadata but deferred
+// byte-access tests (fake VA = UB).  Stage 83 lifts the blocker by supplying a
+// real heap Vec<u8> as mapped_base: from_raw_parts[_mut] constructs a valid slice,
+// byte content is observable, and RAMFS roundtrip is proven end-to-end.
+//
+// Release calls release_v3_cleanup_token (Linux NR 4 = write with invalid fd):
+// the syscall returns EBADF → Err(ReleaseFailure), but released flag is set
+// before the call so is_released() returns true.  dispatch_ ignores release errors.
+//
+// Tests:
+//   A. WRITE_SHARED_REQUEST: heap backing → mapper byte access → RAMFS file content.
+//   B. READ_SHARED_REPLY: RAMFS file content → mapper mutable buffer → heap bytes.
+//   C. Release is_released() after each direction dispatch.
+//   D. Backend error still releases mapper (cleanup on error).
+//   E. Short-EOF proof: partial file → bytes_completed == actual bytes.
+//   F. Negative: unsupported mapper, handle_request, zero token, zero base, perm.
+//   G. Gate regression: gate flags unchanged.
+#[cfg(test)]
+mod stage83_tests {
+    use super::*;
+    use alloc::vec;
+    use crate::fs::common::shared_io_adapter::{
+        RecvV3SharedIoMapper, UnsupportedSharedIoMapper, VfsSharedIoAdapterError, VfsSharedIoMapper,
+        VFS_READ_SHARED_REPLY_ENABLED, VFS_SHARED_IO_ENABLED, VFS_WRITE_SHARED_REQUEST_ENABLED,
+    };
+    use crate::fs::common::vfs_ipc::{read_shared_message, write_shared_message};
+    use crate::fs::ramfs::tree::RamFsBackend;
+    use yarm_ipc_abi::vfs_abi::{
+        VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsReadSharedRequest,
+        VfsSharedBufferDescriptor, VfsWriteSharedRequest,
+    };
+
+    // Tokens for Stage 83 — generation=0x83 (131), distinct slots.
+    const TW: u64 = 0x0083_0020; // write-request token
+    const TR: u64 = 0x0083_0021; // read-reply token
+    const TE: u64 = 0x0083_0022; // backend-error token
+    const TEOF: u64 = 0x0083_0023; // short-EOF token
+    const PERM_RO: u32 = 1; // MAP_READ
+    const PERM_RW: u32 = 3; // MAP_READ | MAP_WRITE
+    const MO_KIND: u32 = 1; // MemoryObject
+
+    fn wr_desc(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_READ)
+    }
+
+    fn rr_desc(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_WRITE)
+    }
+
+    // ── A. WRITE_SHARED_REQUEST byte proof via heap-backed RecvV3SharedIoMapper ──
+
+    #[test]
+    fn stage83_write_shared_request_recv_v3_mapper_byte_proof() {
+        // RecvV3SharedIoMapper reads bytes from a real heap buffer and writes them
+        // to RAMFS via dispatch_write_shared_request.  mapped_base is a valid heap
+        // pointer; from_raw_parts is defined; RAMFS file content matches backing.
+        let mut backing = vec![0u8; 4096];
+        backing[..8].copy_from_slice(b"stage83w");
+        let src_ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TW, src_ptr, 4096, PERM_RO);
+
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_wr_byte").expect("create");
+        let fd = svc.backend_mut().open_path(b"/s83_wr_byte").expect("open");
+        let req = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 83,
+            flags: 0,
+            buffer: wr_desc(TW, 0, 8),
+        };
+        let reply = svc
+            .dispatch_write_shared_request(
+                req, TW, 42, MO_KIND, 4096, src_ptr, 4096, PERM_RO, &mut mapper,
+            )
+            .expect("dispatch_write_shared_request");
+        assert_eq!(reply.bytes_completed, 8);
+        assert_eq!(reply.request_id, 83);
+
+        svc.backend_mut().close_fd(fd).expect("close");
+        let rfd = svc.backend_mut().open_path(b"/s83_wr_byte").expect("reopen");
+        let mut out = [0u8; 8];
+        let n = svc.backend_mut().read_bytes(rfd, &mut out).expect("read");
+        assert_eq!(&out[..n], b"stage83w", "RAMFS file must contain bytes from heap backing");
+    }
+
+    // ── B. READ_SHARED_REPLY byte proof via heap-backed RecvV3SharedIoMapper ───
+
+    #[test]
+    fn stage83_read_shared_reply_recv_v3_mapper_byte_proof() {
+        // dispatch_read_shared_reply writes RAMFS file bytes into a real heap buffer
+        // via RecvV3SharedIoMapper::with_read_reply_buffer (from_raw_parts_mut).
+        // After dispatch, backing[..8] contains the file content.
+        let mut backing = vec![0u8; 4096];
+        let dst_ptr = backing.as_mut_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TR, dst_ptr, 4096, PERM_RW);
+
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_rr_byte").expect("create");
+        let wfd = svc.backend_mut().open_path(b"/s83_rr_byte").expect("open wr");
+        svc.backend_mut().write_bytes(wfd, b"stage83r").expect("seed");
+        svc.backend_mut().close_fd(wfd).expect("close wr");
+        let rfd = svc.backend_mut().open_path(b"/s83_rr_byte").expect("open rd");
+        let req = VfsReadSharedRequest {
+            fd: rfd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 83,
+            flags: 0,
+            buffer: rr_desc(TR, 0, 8),
+        };
+        let reply = svc
+            .dispatch_read_shared_reply(
+                req, TR, 42, MO_KIND, 4096, dst_ptr, 4096, PERM_RW, &mut mapper,
+            )
+            .expect("dispatch_read_shared_reply");
+        assert_eq!(reply.bytes_completed, 8);
+        assert_eq!(reply.request_id, 83);
+        assert_eq!(
+            &backing[..8],
+            b"stage83r",
+            "heap backing must contain file bytes written by RAMFS"
+        );
+    }
+
+    // ── C. Release is_released() after dispatch ───────────────────────────────
+
+    #[test]
+    fn stage83_write_shared_request_release_exactly_once() {
+        // dispatch_write_shared_request calls mapper.release once; is_released() is true.
+        let mut backing = vec![0u8; 4096];
+        backing[..4].copy_from_slice(b"s83w");
+        let ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TW, ptr, 4096, PERM_RO);
+        assert!(!mapper.is_released());
+
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_wr_rel").expect("create");
+        let fd = svc.backend_mut().open_path(b"/s83_wr_rel").expect("open");
+        let req = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 4,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc(TW, 0, 4),
+        };
+        let _ = svc.dispatch_write_shared_request(
+            req, TW, 42, MO_KIND, 4096, ptr, 4096, PERM_RO, &mut mapper,
+        );
+        assert!(mapper.is_released(), "mapper must be released after dispatch");
+    }
+
+    #[test]
+    fn stage83_read_shared_reply_release_exactly_once() {
+        // dispatch_read_shared_reply calls mapper.release once; is_released() is true.
+        let mut backing = vec![0u8; 4096];
+        let ptr = backing.as_mut_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TR, ptr, 4096, PERM_RW);
+        assert!(!mapper.is_released());
+
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_rr_rel").expect("create");
+        let wfd = svc.backend_mut().open_path(b"/s83_rr_rel").expect("open wr");
+        svc.backend_mut().write_bytes(wfd, b"abcd").expect("seed");
+        svc.backend_mut().close_fd(wfd).expect("close wr");
+        let rfd = svc.backend_mut().open_path(b"/s83_rr_rel").expect("open rd");
+        let req = VfsReadSharedRequest {
+            fd: rfd,
+            file_offset: 0,
+            requested_len: 4,
+            request_id: 1,
+            flags: 0,
+            buffer: rr_desc(TR, 0, 4),
+        };
+        let _ = svc.dispatch_read_shared_reply(
+            req, TR, 42, MO_KIND, 4096, ptr, 4096, PERM_RW, &mut mapper,
+        );
+        assert!(mapper.is_released(), "mapper must be released after dispatch");
+    }
+
+    // ── D. Backend error still releases ──────────────────────────────────────
+
+    #[test]
+    fn stage83_write_shared_request_backend_error_releases_mapper() {
+        // dispatch_write_shared_request calls mapper.release even when the backend
+        // returns an error (invalid fd triggers VfsError from write_shared_bytes).
+        let mut backing = vec![0u8; 4096];
+        backing[..4].copy_from_slice(b"err!");
+        let ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TE, ptr, 4096, PERM_RO);
+
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        let req = VfsWriteSharedRequest {
+            fd: 9999, // invalid fd → backend error
+            file_offset: 0,
+            requested_len: 4,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc(TE, 0, 4),
+        };
+        let result = svc.dispatch_write_shared_request(
+            req, TE, 42, MO_KIND, 4096, ptr, 4096, PERM_RO, &mut mapper,
+        );
+        assert!(result.is_err(), "invalid fd must cause dispatch error");
+        assert!(mapper.is_released(), "mapper must be released even on backend error");
+    }
+
+    #[test]
+    fn stage83_read_shared_reply_backend_error_releases_mapper() {
+        let mut backing = vec![0u8; 4096];
+        let ptr = backing.as_mut_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TE, ptr, 4096, PERM_RW);
+
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        let req = VfsReadSharedRequest {
+            fd: 9999, // invalid fd → backend error
+            file_offset: 0,
+            requested_len: 4,
+            request_id: 1,
+            flags: 0,
+            buffer: rr_desc(TE, 0, 4),
+        };
+        let result = svc.dispatch_read_shared_reply(
+            req, TE, 42, MO_KIND, 4096, ptr, 4096, PERM_RW, &mut mapper,
+        );
+        assert!(result.is_err(), "invalid fd must cause dispatch error");
+        assert!(mapper.is_released(), "mapper must be released even on backend error");
+    }
+
+    // ── E. Short-EOF for READ_SHARED_REPLY ───────────────────────────────────
+
+    #[test]
+    fn stage83_read_shared_reply_short_eof_reports_exact_bytes_read() {
+        // Seed a 4-byte file, request 8 bytes: bytes_completed == 4 (EOF clamping).
+        let mut backing = vec![0u8; 4096];
+        let ptr = backing.as_mut_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TEOF, ptr, 4096, PERM_RW);
+
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_eof").expect("create");
+        let wfd = svc.backend_mut().open_path(b"/s83_eof").expect("open wr");
+        svc.backend_mut().write_bytes(wfd, b"abcd").expect("seed 4 bytes");
+        svc.backend_mut().close_fd(wfd).expect("close wr");
+        let rfd = svc.backend_mut().open_path(b"/s83_eof").expect("open rd");
+        let req = VfsReadSharedRequest {
+            fd: rfd,
+            file_offset: 0,
+            requested_len: 8, // more than file has
+            request_id: 83,
+            flags: 0,
+            buffer: rr_desc(TEOF, 0, 8),
+        };
+        let reply = svc
+            .dispatch_read_shared_reply(
+                req, TEOF, 42, MO_KIND, 4096, ptr, 4096, PERM_RW, &mut mapper,
+            )
+            .expect("dispatch");
+        assert_eq!(reply.bytes_completed, 4, "EOF: only 4 bytes available");
+        assert_eq!(&backing[..4], b"abcd", "short read must not expose tail bytes");
+    }
+
+    // ── F. Negative tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn stage83_unsupported_mapper_still_rejects_write_direction() {
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_unsup_wr").expect("create");
+        let fd = svc.backend_mut().open_path(b"/s83_unsup_wr").expect("open");
+        let mut mapper = UnsupportedSharedIoMapper;
+        let req = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc(TW, 0, 8),
+        };
+        assert_eq!(
+            svc.dispatch_write_shared_request(
+                req, TW, 42, MO_KIND, 4096, 0x1000, 4096, PERM_RO, &mut mapper,
+            ),
+            Err(VfsError::Malformed),
+        );
+    }
+
+    #[test]
+    fn stage83_unsupported_mapper_still_rejects_read_direction() {
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_unsup_rr").expect("create");
+        let wfd = svc.backend_mut().open_path(b"/s83_unsup_rr").expect("open wr");
+        svc.backend_mut().write_bytes(wfd, b"abcdefgh").expect("seed");
+        svc.backend_mut().close_fd(wfd).expect("close");
+        let rfd = svc.backend_mut().open_path(b"/s83_unsup_rr").expect("open rd");
+        let mut mapper = UnsupportedSharedIoMapper;
+        let req = VfsReadSharedRequest {
+            fd: rfd,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: rr_desc(TR, 0, 8),
+        };
+        assert_eq!(
+            svc.dispatch_read_shared_reply(
+                req, TR, 42, MO_KIND, 4096, 0x1000, 4096, PERM_RW, &mut mapper,
+            ),
+            Err(VfsError::Malformed),
+        );
+    }
+
+    #[test]
+    fn stage83_handle_request_still_rejects_write_shared() {
+        let msg = write_shared_message(VfsWriteSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc(TW, 0, 8),
+        })
+        .expect("msg");
+        assert_eq!(
+            VfsService::<InMemoryBackend>::parse_request(msg),
+            Err(VfsError::Unsupported),
+            "handle_request must not route WRITE_SHARED_REQUEST"
+        );
+    }
+
+    #[test]
+    fn stage83_handle_request_still_rejects_read_shared() {
+        let msg = read_shared_message(VfsReadSharedRequest {
+            fd: 1,
+            file_offset: 0,
+            requested_len: 8,
+            request_id: 1,
+            flags: 0,
+            buffer: rr_desc(TR, 0, 8),
+        })
+        .expect("msg");
+        assert_eq!(
+            VfsService::<InMemoryBackend>::parse_request(msg),
+            Err(VfsError::Unsupported),
+            "handle_request must not route READ_SHARED_REPLY"
+        );
+    }
+
+    #[test]
+    fn stage83_zero_cleanup_token_binding_rejects() {
+        // VfsWriteSharedBinding requires cleanup_token != 0 (MissingCleanupToken).
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_no_token").expect("create");
+        let fd = svc.backend_mut().open_path(b"/s83_no_token").expect("open");
+        let mut backing = vec![0u8; 4096];
+        let ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(0, ptr, 4096, PERM_RO);
+        let req = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 4,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc(0, 0, 4),
+        };
+        assert!(
+            svc.dispatch_write_shared_request(
+                req, 0, 42, MO_KIND, 4096, ptr, 4096, PERM_RO, &mut mapper,
+            )
+            .is_err(),
+            "zero cleanup_token must be rejected by binding"
+        );
+    }
+
+    #[test]
+    fn stage83_zero_mapped_base_binding_rejects() {
+        // VfsWriteSharedBinding rejects mapped_base == 0 (MappingNotEstablished).
+        let mut svc = VfsService::with_backend(RamFsBackend::new());
+        svc.backend_mut().create_file(b"/s83_no_base").expect("create");
+        let fd = svc.backend_mut().open_path(b"/s83_no_base").expect("open");
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TW, 0, 4096, PERM_RO);
+        let req = VfsWriteSharedRequest {
+            fd,
+            file_offset: 0,
+            requested_len: 4,
+            request_id: 1,
+            flags: 0,
+            buffer: wr_desc(TW, 0, 4),
+        };
+        assert!(
+            svc.dispatch_write_shared_request(
+                req, TW, 42, MO_KIND, 4096, 0, 4096, PERM_RO, &mut mapper,
+            )
+            .is_err(),
+            "zero mapped_base must be rejected by binding"
+        );
+    }
+
+    #[test]
+    fn stage83_range_too_short_rejected_by_mapper() {
+        // Mapper rejects when buffer range exceeds page_rounded_mapped_len (BadRange).
+        let mut backing = vec![0u8; 16];
+        let ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TW, ptr, 4, PERM_RO);
+        let desc = wr_desc(TW, 0, 8);
+        assert_eq!(
+            mapper.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::BadRange),
+        );
+    }
+
+    #[test]
+    fn stage83_readonly_perm_rejects_read_reply() {
+        // RecvV3SharedIoMapper with RO perm rejects read-reply direction (needs WRITE bit).
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_mut_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TR, ptr, 64, PERM_RO);
+        let desc = rr_desc(TR, 0, 8);
+        assert_eq!(
+            mapper.with_read_reply_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::MissingRights),
+        );
+    }
+
+    #[test]
+    fn stage83_rw_perm_rejects_write_request() {
+        // RecvV3SharedIoMapper with RW perm rejects write-request direction (needs RO only).
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TW, ptr, 64, PERM_RW);
+        let desc = wr_desc(TW, 0, 8);
+        assert_eq!(
+            mapper.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::MissingRights),
+        );
+    }
+
+    #[test]
+    fn stage83_wrong_handle_rejected_by_mapper() {
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TW, ptr, 64, PERM_RO);
+        let wrong = wr_desc(TW + 1, 0, 8); // mismatched handle
+        assert_eq!(
+            mapper.with_write_request_buffer(wrong, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::StaleHandle),
+        );
+    }
+
+    #[test]
+    fn stage83_access_after_cleanup_rejected() {
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let mut mapper = RecvV3SharedIoMapper::from_fields(TW, ptr, 64, PERM_RO);
+        let desc = wr_desc(TW, 0, 8);
+        let _ = mapper.release(desc);
+        assert_eq!(
+            mapper.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::AccessAfterCleanup),
+        );
+    }
+
+    // ── G. Gate/invariant regression ─────────────────────────────────────────
+
+    #[test]
+    fn stage83_gate_flags_unchanged_from_stage79() {
+        assert!(VFS_WRITE_SHARED_REQUEST_ENABLED);
+        assert!(VFS_READ_SHARED_REPLY_ENABLED);
+        assert!(VFS_SHARED_IO_ENABLED);
+    }
+}

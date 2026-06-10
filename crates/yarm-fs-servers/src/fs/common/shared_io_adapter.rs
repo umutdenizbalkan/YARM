@@ -245,7 +245,7 @@ impl VfsSharedIoMapper for UnsupportedSharedIoMapper {
 
 // ── Stage 79: Production VfsSharedIoMapper bridge ──────────────────────────────
 
-/// Stage 79: production `VfsSharedIoMapper` backed by a `recv_shared_v3` delivery.
+/// Stage 79+83: production `VfsSharedIoMapper` backed by a `recv_shared_v3` delivery.
 ///
 /// Maps delivery metadata to direction-safe byte slice access.  Exposes the mapped
 /// region as `&[u8]` (write request) or `&mut [u8]` (read reply) via
@@ -258,14 +258,14 @@ impl VfsSharedIoMapper for UnsupportedSharedIoMapper {
 /// semantics).  Subsequent accesses return `AccessAfterCleanup`.  No Drop cleanup —
 /// callers must call `release` explicitly.
 ///
-/// ## Byte-access blocker (hosted-dev)
+/// ## Byte-access contract
 ///
 /// `with_write_request_buffer` and `with_read_reply_buffer` call
-/// `core::slice::from_raw_parts[_mut]` on `mapped_base` — a kernel-mapped VA.
-/// In hosted-dev unit tests `mapped_base` is a test constant; accessing it is
-/// undefined behaviour.  Byte content tests require a real YARM kernel integration
-/// harness.  Unit tests cover only error paths (direction, handle, perm, range)
-/// that reject before the unsafe slice creation.
+/// `core::slice::from_raw_parts[_mut]` on `mapped_base`.  In production this is a
+/// kernel-mapped VA with appropriate permissions.  Stage 83 unit tests supply a real
+/// heap-allocated backing buffer as `mapped_base`; the slice construction is defined
+/// and byte content is directly observable.  Stage 79 error-path tests use a fake VA
+/// constant and never reach the slice creation.
 pub struct RecvV3SharedIoMapper {
     cleanup_token: u64,
     mapped_base: u64,
@@ -1599,5 +1599,104 @@ mod tests {
         let _ = m.release(desc); // first call (may fail in hosted-dev; sets released=true)
         assert!(m.is_released());
         assert_eq!(m.release(desc), Ok(()), "second release must return Ok without syscall");
+    }
+}
+
+// ── Stage 83: RecvV3SharedIoMapper byte-access proof via heap backing ─────────
+//
+// Stage 79 left byte-access tests deferred (fake VA = UB). Stage 83 supplies a
+// real heap Vec<u8> as mapped_base so from_raw_parts[_mut] is valid.
+// Release calls release_v3_cleanup_token (NR 4 = write on Linux) with an
+// invalid fd; the syscall fails but the released flag is set beforehand.
+#[cfg(test)]
+mod stage83_adapter_tests {
+    use super::*;
+    use alloc::vec;
+
+    const TOKEN83A: u64 = 0x0083_0010; // gen=0x83, slot=0x10
+
+    fn wr_d(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(
+            token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_READ,
+        )
+    }
+
+    fn rr_d(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
+        VfsSharedBufferDescriptor::new(
+            token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_WRITE,
+        )
+    }
+
+    #[test]
+    fn stage83_write_request_heap_backing_byte_roundtrip() {
+        // with_write_request_buffer constructs a valid &[u8] from a real heap pointer.
+        // Proves the unsafe slice creation is defined when mapped_base is a heap VA.
+        let mut backing = vec![0u8; 64];
+        backing[..8].copy_from_slice(b"stage83a");
+        let ptr = backing.as_ptr() as u64;
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN83A, ptr, 64, 1);
+        let desc = wr_d(TOKEN83A, 0, 8);
+        let mut observed = [0u8; 8];
+        m.with_write_request_buffer(desc, 8, |bytes| {
+            observed.copy_from_slice(bytes);
+        })
+        .expect("write request with heap backing must succeed");
+        assert_eq!(&observed, b"stage83a");
+    }
+
+    #[test]
+    fn stage83_read_reply_heap_backing_byte_roundtrip() {
+        // with_read_reply_buffer constructs a valid &mut [u8] from a real heap pointer.
+        // Proves the unsafe mutable slice creation is defined when mapped_base is a heap VA.
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_mut_ptr() as u64;
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN83A + 1, ptr, 64, 3);
+        let desc = rr_d(TOKEN83A + 1, 0, 8);
+        m.with_read_reply_buffer(desc, 8, |buf| {
+            buf.copy_from_slice(b"stage83b");
+        })
+        .expect("read reply with heap backing must succeed");
+        assert_eq!(&backing[..8], b"stage83b");
+    }
+
+    #[test]
+    fn stage83_write_request_offset_within_heap_backing() {
+        // Slice with nonzero buffer_offset indexes into the heap backing correctly.
+        let mut backing = vec![0u8; 64];
+        backing[16..24].copy_from_slice(b"offset83");
+        let ptr = backing.as_ptr() as u64;
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN83A + 2, ptr, 64, 1);
+        let desc = wr_d(TOKEN83A + 2, 16, 8);
+        let mut observed = [0u8; 8];
+        m.with_write_request_buffer(desc, 8, |bytes| {
+            observed.copy_from_slice(bytes);
+        })
+        .expect("offset slice must succeed");
+        assert_eq!(&observed, b"offset83");
+    }
+
+    #[test]
+    fn stage83_release_sets_flag_before_syscall() {
+        // is_released() returns true after release(), even though the syscall fails in hosted-dev.
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN83A + 3, ptr, 64, 1);
+        assert!(!m.is_released());
+        let desc = wr_d(TOKEN83A + 3, 0, 8);
+        let _ = m.release(desc);
+        assert!(m.is_released());
+    }
+
+    #[test]
+    fn stage83_access_after_release_rejected_with_heap_backing() {
+        let mut backing = vec![0u8; 64];
+        let ptr = backing.as_ptr() as u64;
+        let mut m = RecvV3SharedIoMapper::from_fields(TOKEN83A + 4, ptr, 64, 1);
+        let desc = wr_d(TOKEN83A + 4, 0, 8);
+        let _ = m.release(desc);
+        assert_eq!(
+            m.with_write_request_buffer(desc, 8, |_| ()),
+            Err(VfsSharedIoAdapterError::AccessAfterCleanup),
+        );
     }
 }
