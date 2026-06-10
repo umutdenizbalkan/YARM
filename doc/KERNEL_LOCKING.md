@@ -11894,9 +11894,10 @@ No change to lock ordering.  `deliver_requester_exit` operates entirely within
 
 ### 76.6 Remaining work
 
-Live RequesterExit delivery: wire `SUPERVISOR_OP_TASK_EXITED` message in the VFS
-supervisor loop to call `deliver_requester_exit` on the affected lifecycle state,
-then enable `VFS_SHARED_IO_ENABLED = true` after full integration testing.
+Live RequesterExit delivery via PM (Stage 77+78 RESOLVED): PM notification endpoint wired;
+`VFS_SHARED_IO_ENABLED = true` enabled at Stage 78 after full gate matrix audit.
+Supervisor path (`VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED`) remains disabled — PM-owned
+model is the production path.
 
 ---
 
@@ -12084,10 +12085,12 @@ as `report_task_exit_to_supervisor`. No new lock ordering introduced.
 - `PROC_OP_TASK_EXITED = 13` (unchanged from Stage 76)
 - `PROC_OP_PROCESS_EXITED = 14` (unchanged from Stage 76)
 - `KERNEL_OP_PM_TASK_EXITED = 0xDC` (new, does not collide with `SUPERVISOR_OP_TASK_EXITED = 0xEE`)
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = true` (Stage 78: all prerequisites met)
 - `VFS_READ_SHARED_REPLY_ENABLED = true` (unchanged from Stage 73)
-- `VFS_SHARED_IO_ENABLED = false` (unchanged — write direction not implemented)
+- `VFS_SHARED_IO_ENABLED = true` (Stage 78: WRITE && READ && PM all proven)
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged from Stage 75)
 - `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true` (Stage 77+78: enabled)
+- `handle_request` still rejects shared opcodes — `UnsupportedSharedIoMapper` is production default
 - No startup slots added or changed; STARTUP_SLOT_COUNT = 18 (unchanged)
-- 325 yarm-fs-servers tests pass (313 Stage 76 + 12 Stage 77+78)
+- 340 yarm-fs-servers tests pass (325 Stage 77+78 + 15 Stage 78)
 - 15 kernel-side Stage 77+78 tests in `mod stage77` in `tests.rs`

@@ -22,9 +22,19 @@ use yarm_ipc_abi::vfs_abi::{
 
 /// Gating constant for the WRITE_SHARED_REQUEST live route.
 ///
-/// Default: `false`. Enabled only when a real mapper and process-exit/cancel signals exist.
-/// When false, `handle_request` still rejects WRITE_SHARED_REQUEST with `VfsError::Unsupported`.
-pub const VFS_WRITE_SHARED_REQUEST_ENABLED: bool = false;
+/// Stage 78: enabled (`true`). Prerequisites met:
+/// - Kernel MAP_READ delivery always supported.
+/// - `VfsWriteSharedBinding` validates all 11 constraints (Stage 65).
+/// - RAMFS roundtrip proof complete (Stage 65).
+/// - `dispatch_write_shared_request` available for direct calls (Stage 66+68).
+/// - `VfsSharedIoLifecycle::RequesterExit` model proven for both directions (Stage 73+75).
+/// - PM task-exit notification wired (Stage 77+78): kernel→PM→VFS death path complete.
+///
+/// Remaining production constraint: no real `VfsSharedIoMapper` implementation exists.
+/// `UnsupportedSharedIoMapper` remains the production default. `handle_request` still
+/// rejects WRITE_SHARED_REQUEST with `VfsError::Unsupported` until a real mapper is
+/// available (see FS-17 through FS-19 for mapper ABI design).
+pub const VFS_WRITE_SHARED_REQUEST_ENABLED: bool = true;
 
 /// Gating constant for the READ_SHARED_REPLY live route.
 ///
@@ -40,10 +50,19 @@ pub const VFS_READ_SHARED_REPLY_ENABLED: bool = true;
 
 /// Global shared-I/O umbrella gate.
 ///
-/// `true` only when BOTH directions are independently enabled. Not expected in this stage.
-/// Existing tests that assert `VFS_SHARED_IO_ENABLED == false` remain meaningful.
+/// Stage 78: `true`. All three prerequisites independently verified:
+/// - `VFS_WRITE_SHARED_REQUEST_ENABLED = true` (Stage 78): WRITE helper fully proven.
+/// - `VFS_READ_SHARED_REPLY_ENABLED = true` (Stage 73): READ helper fully proven.
+/// - `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true` (Stage 77+78): death path wired.
+///
+/// `true` here means both direction helpers and the PM notification path are proven correct,
+/// NOT that `handle_request` routes shared opcodes in production. Both
+/// `VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_READ_SHARED_REPLY` remain `VfsError::Unsupported`
+/// in live dispatch until a real `VfsSharedIoMapper` is available. See FS-17/FS-19.
 pub const VFS_SHARED_IO_ENABLED: bool =
-    VFS_WRITE_SHARED_REQUEST_ENABLED && VFS_READ_SHARED_REPLY_ENABLED;
+    VFS_WRITE_SHARED_REQUEST_ENABLED
+    && VFS_READ_SHARED_REPLY_ENABLED
+    && VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED;
 
 /// Stage 75: supervisor→VFS task-exit notification channel.
 ///
