@@ -540,3 +540,44 @@ transfer-buffer VFS path (Phase 2B), while the MemoryObject-based spawn helpers 
 - `INITRAMFS_READ_CHUNK_TRACE` in `src/kernel/syscall.rs` — per-chunk success/EOF log.
 - `PM_VFS_BULK_READ_CHUNK_TRACE` in PM service — Phase 2A per-chunk PM log.
 - `PM_VFS_BULK_READ_TRANSFER_CHUNK_TRACE` in PM service — Phase 2B per-chunk PM log.
+
+---
+
+## Stage 81A: Syscall error parity across AArch64 / x86_64 / RISC-V
+
+Prior to Stage 81A, any `SyscallError` from `dispatch_syscall` propagated via `?` out of
+`handle_trap` as `TrapHandleError::Syscall(...)`. All three arch entry points treat
+`Err(TrapHandleError)` as a fatal kernel halt (AArch64: WFE spin; x86_64: `halt_forever()`; RISC-V:
+`?` bubble to bare-metal context). A normal user error such as `InvalidArgs` or `MissingRight` would
+lock up the CPU rather than being returned to userspace.
+
+**Fix (Stage 81A):** `handle_trap`'s `Trap::Syscall` arm now calls
+`trapframe.set_err(e.code())` on error and returns `Ok(())`. The error is encoded into the trap
+frame's `error` field and written back to the user return registers by the arch return path.
+
+`SyscallError::from_code(code: usize) -> SyscallError` was added as a const reverse-mapping helper
+(mirrors the `#[repr(usize)]` discriminants; unknown codes map to `Internal`).
+
+Kernel-internal wrappers that call `handle_trap` synthetically and need to observe policy-denial
+results (e.g. `control_plane_set_process_cnode_slots_via_syscall`) read `frame.error_code()` after
+dispatch and re-raise `Err(TrapHandleError::Syscall(SyscallError::from_code(code)))`.
+
+**Invariants preserved:** syscall numbers, `SYSCALL_COUNT`, `SpawnV5` ABI, Phase2B/Phase3B
+semantics all unchanged.
+
+---
+
+## Stage 81B: Spawn image path table extended to optional-FS image IDs
+
+`spawn_image_path_for_image_id()` extended with entries for:
+
+| image_id | CPIO path |
+|----------|-----------|
+| `10` | `sbin/fat_srv` |
+| `11` | `sbin/ramfs_srv` |
+| `12` | `sbin/ext4_srv` |
+
+IDs ≥ 13 remain `None` (returns `InvalidArgs` from Phase 2B / Phase 3A spawn paths).
+
+`INIT_SPAWN_OPTIONAL_FS_SERVERS` remains `false` in all core profiles — no live spawning added.
+CPIO staging of optional-FS binaries is unchanged from Stage 80.

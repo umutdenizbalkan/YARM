@@ -728,4 +728,50 @@ mod tests {
         assert_eq!(last_restored_tls_base(CpuId(1)), Some(0xAAA0_0000));
         assert_eq!(last_restored_tls_base(CpuId(0)), Some(0xBBB0_0000));
     }
+
+    // ── Stage 81A: AArch64-specific parity coverage ───────────────────────────
+
+    #[test]
+    fn stage81a_aarch64_export_syscall_error_encodes_into_x0_not_propagates() {
+        // Verifies the AArch64-specific return path: export_syscall_result_to_user_gprs
+        // puts error codes in x0 (REG_X0) and zeroes x1..x5.
+        // After the Stage 81A parity fix, user syscall errors reach this path
+        // (encoded in frame.error_code) rather than causing a TrapHandleError halt.
+        let mut frame = TrapFrame::new(0, [0; 6]);
+        frame.set_err(crate::kernel::syscall::SyscallError::InvalidArgs.code());
+        export_syscall_result_to_user_gprs(&mut frame);
+        assert_eq!(
+            frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
+            crate::kernel::syscall::SyscallError::InvalidArgs.code(),
+            "InvalidArgs code must appear in x0 after export"
+        );
+        assert_eq!(
+            frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),
+            0,
+            "x1 must be zeroed for error returns"
+        );
+    }
+
+    #[test]
+    fn stage81a_aarch64_halt_source_requires_err_from_shared_kernel_dispatch() {
+        // Source inspection: the halt is guarded by is_ok() on the shared
+        // dispatch path. After the parity fix, dispatch_trap_entry_with_shared_kernel
+        // returns Ok for normal syscall errors (they are encoded in the frame).
+        let boot_src = include_str!("boot.rs");
+        assert!(
+            boot_src.contains("YARM_AARCH64_TRAP_HANDLE halting"),
+            "halt path must remain documented in aarch64/boot.rs"
+        );
+        assert!(
+            boot_src.contains(".is_ok()"),
+            "frame writeback must be guarded on is_ok() result"
+        );
+        let fault_src = include_str!("../../kernel/boot/fault_state.rs");
+        assert!(
+            !fault_src.contains(
+                "dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?"
+            ),
+            "parity fix must be present: dispatch errors must not propagate to AArch64 halt path"
+        );
+    }
 }

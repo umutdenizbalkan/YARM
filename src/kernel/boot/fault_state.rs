@@ -259,7 +259,15 @@ impl KernelState {
                 self.clear_last_fault();
                 let trapframe = frame.ok_or(TrapHandleError::MissingTrapFrame)?;
                 let _ = self.sync_current_thread_from_frame(trapframe);
-                dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?;
+                // Encode normal user syscall errors into the frame instead of
+                // propagating as TrapHandleError. All three arch entry points
+                // (AArch64 yarm_aarch64_vector_entry, x86_64 halt_forever,
+                // RISC-V) treat Err(TrapHandleError) as a fatal kernel halt.
+                // Normal SyscallError values (InvalidArgs, MissingRight, …)
+                // must be returned to userspace as x0/error_code, not halt the kernel.
+                if let Err(e) = dispatch_syscall(self, trapframe) {
+                    trapframe.set_err(e.code());
+                }
                 if trapframe.error_code() == Some(SyscallError::PageFault.code()) {
                     self.fault_current_task()
                         .map_err(SyscallError::from)
@@ -359,7 +367,15 @@ impl KernelState {
             Syscall::ControlPlaneSetCnodeSlots as usize,
             [target_pid_arg, slot_capacity, 0, 0, 0, 0],
         );
-        self.handle_trap(Trap::Syscall, Some(&mut frame))
+        // After the Stage 81A parity fix, handle_trap encodes syscall errors
+        // into the frame instead of propagating them as TrapHandleError.
+        // Translate the frame error code back so callers retain the expected
+        // Result<(), TrapHandleError> contract (policy denials stay visible).
+        self.handle_trap(Trap::Syscall, Some(&mut frame))?;
+        if let Some(code) = frame.error_code() {
+            return Err(TrapHandleError::Syscall(SyscallError::from_code(code)));
+        }
+        Ok(())
     }
 
     pub fn handle_selected_arch_trap_entry(
