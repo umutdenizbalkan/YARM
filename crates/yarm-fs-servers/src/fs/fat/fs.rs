@@ -1271,6 +1271,10 @@ impl VfsBackend for FatBackend {
         let (n, _) = self.read_into(fd, len, &mut buf)?;
         Ok(n)
     }
+    fn read_shared_bytes(&mut self, fd: u64, buf: &mut [u8]) -> Result<u64, VfsError> {
+        let (n, _) = self.read_into(fd, buf.len() as u64, buf)?;
+        Ok(n)
+    }
     fn read_into(&mut self, fd: u64, len: u64, out: &mut [u8]) -> Result<(u64, usize), VfsError> {
         let slot_idx = self
             .open_fds

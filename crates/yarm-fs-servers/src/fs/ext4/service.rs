@@ -9,9 +9,7 @@ use yarm_srv_common::vfs_reply::VfsReply;
 
 pub type Ext4Service = FsService<Ext4Backend>;
 
-pub fn run() {
-    let mut svc = Ext4Service::with_backend(Ext4Backend::new());
-
+fn run_demo_smoke(svc: &mut Ext4Service) {
     let open = openat_inline_message(0, EXT4_DEMO_PATH, 0, 0).expect("open");
     let open_rep = svc.handle(open).expect("open rep");
 
@@ -32,6 +30,44 @@ pub fn run() {
         file_len,
         svc.handled_count()
     );
+}
+
+fn run_resident_service_loop(svc: &mut Ext4Service) {
+    let ctx = yarm_user_rt::runtime::startup_context();
+    if let Some(recv_cap) = ctx.process_manager_service_recv_ep {
+        yarm_user_rt::user_log!("EXT4_SRV_RECV_CAP cap={}", recv_cap);
+        yarm_user_rt::user_log!("EXT4_SRV_BLOCKING_RECV_LOOP");
+        loop {
+            // SAFETY: ext4_srv owns its startup-provided service recv endpoint.
+            match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
+                Ok(Some(received)) => {
+                    let msg = received.message;
+                    let Some(reply_cap) = received.reply_cap else {
+                        continue;
+                    };
+                    let response = svc.handle(msg).unwrap_or_else(|_| {
+                        yarm_user_rt::ipc::Message::new(1, &[]).expect("err-reply")
+                    });
+                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                }
+                _ => {
+                    let _ = yarm_user_rt::syscall::yield_now();
+                }
+            }
+        }
+    } else {
+        yarm_user_rt::user_log!("EXT4_SRV_NO_RECV_CAP_RESIDENT_YIELD");
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
+        }
+    }
+}
+
+pub fn run() {
+    let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+    run_demo_smoke(&mut svc);
+    yarm_user_rt::user_log!("EXT4_SRV_READY");
+    run_resident_service_loop(&mut svc);
 }
 
 #[cfg(test)]

@@ -130,6 +130,36 @@ pub const VFS_STAGE84_RAMFS_BRIDGE_ENABLED: bool = true;
 /// Does **not** change SYSCALL_COUNT, startup slots, SpawnV5 ABI, or image IDs.
 pub const VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED: bool = true;
 
+/// Stage 86: RAMFS live-mount path enabled.
+///
+/// `true`: RAMFS server enters a resident `ipc_recv_v2` loop after bootstrap and
+/// registers /ram with the VFS mount table.  Gate kept separate so FAT/ext4
+/// live-mount can be enabled independently.
+pub const VFS_RAMFS_LIVE_MOUNT_ENABLED: bool = true;
+
+/// Stage 86: FAT shared-I/O live route.
+///
+/// `false`: FAT server requires a virtio_blk block device not available in the
+/// default hosted-dev environment.  `FatBackend::read_shared_bytes` is wired but
+/// the spawn gate (`INIT_SPAWN_FAT_SRV`) is disabled.  Enable once a block-device
+/// stub is available for integration tests.
+pub const VFS_FAT_SHARED_IO_ENABLED: bool = false;
+
+/// Stage 86: ext4 resident IPC recv loop.
+///
+/// `true`: ext4/service.rs::run() now enters a resident `ipc_recv_v2` loop after
+/// the smoke demo.  This lifts the Stage-80 "no-ipc-loop" blocker.
+/// VFS mount registration remains deferred (`VFS_EXT4_LIVE_MOUNT_ENABLED = false`)
+/// until the ext4 backend supports the full VFS write/stat contract.
+pub const VFS_EXT4_RECV_LOOP_ENABLED: bool = true;
+
+/// Stage 86: ext4 live VFS mount.
+///
+/// `false`: ext4 recv loop is present but VFS mount registration is not yet wired.
+/// Blocker: ext4 backend must pass the full VFS contract (write/stat roundtrip) before
+/// `register_ext4_mount_with_vfs` can be called from init.
+pub const VFS_EXT4_LIVE_MOUNT_ENABLED: bool = false;
+
 /// Stage 76: VFS entry point for a PM-pushed `PROC_OP_TASK_EXITED` event.
 ///
 /// Gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` (enabled in Stage 77+78).

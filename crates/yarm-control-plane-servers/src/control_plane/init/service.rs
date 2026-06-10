@@ -773,11 +773,18 @@ pub fn run() {
     //  (1) kernel spawn_image_path_for_image_id has entries for 10/11/12,
     //  (2) each server has a proven resident IPC recv loop and startup contract,
     //  (3) x86_64 and aarch64 smoke tests confirm the spawns succeed.
-    const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;
+    //
+    // Stage 86: per-server sub-gates.  RAMFS and ext4 have resident recv loops;
+    // FAT requires a virtio_blk block device not present in the default profile.
+    const INIT_SPAWN_RAMFS_SRV: bool = true;
+    const INIT_SPAWN_FAT_SRV: bool = false; // needs block device
+    const INIT_SPAWN_EXT4_SRV: bool = true;
+    const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool =
+        INIT_SPAWN_RAMFS_SRV || INIT_SPAWN_FAT_SRV || INIT_SPAWN_EXT4_SRV;
 
     if INIT_SPAWN_OPTIONAL_FS_SERVERS {
         // --- Spawn ramfs_srv (image_id=11) and register /ram with VFS. ---
-        {
+        if INIT_SPAWN_RAMFS_SRV {
             let ramfs_mount_config = RamFsMountConfig::new(
                 b"/ram",
                 false,
@@ -806,13 +813,16 @@ pub fn run() {
                     ramfs_mount_config,
                 );
             } else {
-                yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_RETURN ok=0 child_tid=0");
+                yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_FAIL ok=0 child_tid=0");
             }
+        } else {
+            yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_SKIPPED reason=server_disabled");
         }
 
         // --- Spawn read-only fat_srv (image_id=10) with blkcache cap. ---
-        // Failure is non-fatal: log and continue to ext4 and alert loop.
-        {
+        // INIT_SPAWN_FAT_SRV = false: needs virtio_blk block device.
+        // Non-fatal: log and continue to ext4 and alert loop.
+        if INIT_SPAWN_FAT_SRV {
             let fat_mount_config =
                 FatMountConfig::new(b"/fat", 1, true).unwrap_or_else(FatMountConfig::default_compat);
             let (fat_prefix_word, fat_meta_word) = fat_mount_config.encode_startup_words();
@@ -838,25 +848,30 @@ pub fn run() {
                     fat_mount_config,
                 );
             } else {
-                yarm_user_rt::user_log!("INIT_FAT_SPAWN_RETURN ok=0 child_tid=0");
+                yarm_user_rt::user_log!("INIT_FAT_SPAWN_FAIL ok=0 child_tid=0");
             }
+        } else {
+            yarm_user_rt::user_log!("INIT_FAT_SPAWN_SKIPPED reason=server_disabled");
         }
 
         // --- Spawn ext4_srv (image_id=12) read-only. ---
-        // VFS mount registration deferred: ext4_srv has no live IPC request loop yet.
-        {
+        // Stage 86: ext4_srv now has a resident ipc_recv_v2 loop (VFS_EXT4_RECV_LOOP_ENABLED).
+        // VFS mount registration remains deferred (VFS_EXT4_LIVE_MOUNT_ENABLED = false).
+        if INIT_SPAWN_EXT4_SRV {
             yarm_user_rt::user_log!("INIT_EXT4_SPAWN_BEGIN");
             if let Some((ext4_child_tid, _init_ext4_send_cap)) =
                 spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)
             {
                 yarm_user_rt::user_log!(
-                    "INIT_EXT4_SPAWN_OK child_tid={} mount_deferred=true reason=no-ipc-loop",
+                    "INIT_EXT4_SPAWN_OK child_tid={} mount_deferred=true reason=live-mount-disabled",
                     ext4_child_tid
                 );
                 yarm_user_rt::user_log!("EXT4_SRV_READY child_tid={}", ext4_child_tid);
             } else {
-                yarm_user_rt::user_log!("INIT_EXT4_SPAWN_RETURN ok=0 child_tid=0");
+                yarm_user_rt::user_log!("INIT_EXT4_SPAWN_FAIL ok=0 child_tid=0");
             }
+        } else {
+            yarm_user_rt::user_log!("INIT_EXT4_SPAWN_SKIPPED reason=server_disabled");
         }
     } else {
         yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled");
