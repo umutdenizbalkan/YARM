@@ -56,6 +56,14 @@ pub const PROC_OP_TASK_EXITED: u16 = 13;
 /// Production blocker: same as [`PROC_OP_TASK_EXITED`].
 pub const PROC_OP_PROCESS_EXITED: u16 = 14;
 
+/// Stage 77+78: Kernel → PM one-way push: a tracked task has exited.
+///
+/// Opcode sent by the kernel on PM's `pm_task_exit_endpoint` when any task exits.
+/// Payload: [`KernelPmTaskExitedPayload`] (16 bytes LE).
+/// No reply. This is the kernel-push direction; `PROC_OP_TASK_EXITED` (13) is the
+/// PM→VFS forwarding direction on a separate IPC endpoint.
+pub const KERNEL_OP_PM_TASK_EXITED: u16 = 0xDC;
+
 /// `state` value for a service that was spawned and is running.
 pub const LIFECYCLE_STATE_SPAWNED: u8 = 0;
 
@@ -707,6 +715,53 @@ impl ProcV2Args {
         Ok(Self {
             arg0: u64::from_le_bytes(a0),
             arg1: u64::from_le_bytes(a1),
+        })
+    }
+}
+
+// ── Stage 77+78: Kernel → PM task-exit payload ────────────────────────────────
+
+/// Stage 77+78: payload for [`KERNEL_OP_PM_TASK_EXITED`] — kernel → PM push.
+///
+/// Wire layout (16 bytes LE):
+/// ```text
+/// [0..8]   tid:       u64 LE — TID of the exited task
+/// [8..16]  exit_code: u64 LE — task exit code
+/// ```
+///
+/// The kernel sends this to PM's `pm_task_exit_endpoint` whenever any task exits.
+/// PM decodes it and, if it is a tracked task, forwards `PROC_OP_TASK_EXITED` to VFS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelPmTaskExitedPayload {
+    pub tid: u64,
+    pub exit_code: u64,
+}
+
+impl KernelPmTaskExitedPayload {
+    pub const ENCODED_LEN: usize = 16;
+
+    pub const fn new(tid: u64, exit_code: u64) -> Self {
+        Self { tid, exit_code }
+    }
+
+    pub fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        let mut out = [0u8; Self::ENCODED_LEN];
+        out[..8].copy_from_slice(&self.tid.to_le_bytes());
+        out[8..16].copy_from_slice(&self.exit_code.to_le_bytes());
+        out
+    }
+
+    pub fn decode(payload: &[u8]) -> Result<Self, ProcCodecError> {
+        if payload.len() < Self::ENCODED_LEN {
+            return Err(ProcCodecError::Malformed);
+        }
+        let mut tid = [0u8; 8];
+        let mut code = [0u8; 8];
+        tid.copy_from_slice(&payload[..8]);
+        code.copy_from_slice(&payload[8..16]);
+        Ok(Self {
+            tid: u64::from_le_bytes(tid),
+            exit_code: u64::from_le_bytes(code),
         })
     }
 }

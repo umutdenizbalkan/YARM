@@ -297,6 +297,9 @@ pub(crate) struct FaultSubsystem {
     pub(crate) last_fault_frame: Option<TrapFrame>,
     pub(crate) fault_handler_endpoint: Option<usize>,
     pub(crate) supervisor_endpoint: Option<usize>,
+    /// Stage 77+78: kernel-side endpoint index for delivering task-exit events to PM.
+    /// Registered via `set_pm_task_exit_endpoint_for_task`. `None` until wired.
+    pub(crate) pm_task_exit_endpoint: Option<usize>,
     pub(crate) fault_policy: FaultPolicy,
 }
 

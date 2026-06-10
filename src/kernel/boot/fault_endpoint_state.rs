@@ -110,6 +110,27 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 77+78: Register an endpoint for kernel→PM task-exit notifications.
+    ///
+    /// Mirrors `set_supervisor_endpoint_for_task`. The endpoint index is stored in
+    /// `FaultSubsystem::pm_task_exit_endpoint` and used by `report_task_exit_to_pm`.
+    pub fn set_pm_task_exit_endpoint_for_task(
+        &mut self,
+        tid: u64,
+        recv_cap: CapId,
+    ) -> Result<(), KernelError> {
+        let cnode = self.task_cnode(tid).ok_or(KernelError::TaskMissing)?;
+        let capability = self
+            .capability_for_cnode(cnode, recv_cap)
+            .ok_or(KernelError::InvalidCapability)?;
+        if !capability.has_right(CapRights::RECEIVE) {
+            return Err(KernelError::MissingRight);
+        }
+        let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        self.with_fault_state_mut(|faults| faults.pm_task_exit_endpoint = Some(endpoint_idx));
+        Ok(())
+    }
+
     pub fn bind_task_asid(&mut self, tid: u64, asid: Asid) -> Result<(), KernelError> {
         if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
             return Err(KernelError::Vm(VmError::InvalidAsid));

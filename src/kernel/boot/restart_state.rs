@@ -4,6 +4,7 @@
 use super::{KernelError, KernelState};
 use crate::kernel::ipc::Message;
 use crate::kernel::task::{RestartToken, TaskStatus, ThreadDetachState};
+use yarm_ipc_abi::process_abi::{KERNEL_OP_PM_TASK_EXITED, KernelPmTaskExitedPayload};
 use yarm_ipc_abi::supervisor_abi::{
     SUPERVISOR_OP_TASK_EXITED, SUPERVISOR_OP_TRANSFER_REVOKED, encode_task_exited_event,
     encode_transfer_revoked_event,
@@ -51,6 +52,21 @@ impl KernelState {
         self.send_message_to_endpoint_and_wake(endpoint_idx, msg)
     }
 
+    /// Stage 77+78: deliver a task-exit notification to PM's `pm_task_exit_endpoint`.
+    ///
+    /// Silent no-op when `pm_task_exit_endpoint` is `None` (not yet registered).
+    /// Sends `KERNEL_OP_PM_TASK_EXITED` with a 16-byte LE `KernelPmTaskExitedPayload`.
+    pub fn report_task_exit_to_pm(&mut self, tid: u64, code: u64) -> Result<(), KernelError> {
+        let Some(endpoint_idx) = self.with_fault_state(|faults| faults.pm_task_exit_endpoint)
+        else {
+            return Ok(());
+        };
+        let payload = KernelPmTaskExitedPayload::new(tid, code).encode();
+        let msg = Message::with_header(0, KERNEL_OP_PM_TASK_EXITED, 0, None, &payload)
+            .map_err(|_| KernelError::WrongObject)?;
+        self.send_message_to_endpoint_and_wake(endpoint_idx, msg)
+    }
+
     pub fn exit_task(&mut self, tid: u64, code: u64) -> Result<u64, KernelError> {
         let token = self.with_restart_state_mut(|restart| {
             let token = restart.next_restart_token;
@@ -77,6 +93,7 @@ impl KernelState {
         let _ = self.revoke_reply_caps_for_replier(tid);
         self.clear_ipc_waiters_for_tid(tid);
         self.report_task_exit_to_supervisor(tid, code, token)?;
+        self.report_task_exit_to_pm(tid, code)?;
         if let Some(robust) = robust {
             // Use futex_wake_on_exit: the addresses come from the task's own
             // robust list and are trusted user-space, but current_tid() may be

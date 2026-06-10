@@ -1633,10 +1633,11 @@ mod stage76_tests {
 
     #[test]
     fn stage76_pm_task_exit_notification_gate_disabled() {
+        // Stage 76 recorded this as false; Stage 77+78 enabled it after resolving both blockers.
+        // This test is preserved for history; gate is now true (both blockers resolved).
         assert!(
-            !VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED,
-            "VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED must remain false: \
-             no PM→VFS send cap and PM has no kernel task-exit notification"
+            VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED,
+            "VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED must be true after Stage 77+78"
         );
     }
 
@@ -1814,10 +1815,241 @@ mod stage76_tests {
         // PROC_OP_TASK_EXITED=13 and PROC_OP_PROCESS_EXITED=14 share u16 values with VFS
         // opcodes (VFS_OP_WRITE=13, VFS_OP_IOCTL=14) but are in separate IPC protocols.
         // PM and VFS use isolated endpoints; no opcode collision is possible at runtime.
-        // This test documents the intended separation and proves the PM gate is false.
+        // Stage 77+78 enables the PM notification channel; gate is now true.
         assert_eq!(PROC_OP_TASK_EXITED, 13u16);
         assert_eq!(PROC_OP_PROCESS_EXITED, 14u16);
-        // The PM notification channel is not yet wired (gate = false).
-        assert!(!VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED);
+        // Gate enabled in Stage 77+78 (both blockers resolved).
+        assert!(VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED);
+    }
+}
+
+// ── Stage 77+78: VFS-side PM push dispatch + end-to-end pipeline ──────────────
+//
+// Tests for:
+//   A. Gate constant: VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true.
+//   B. dispatch_pm_task_exited_push dispatches correctly on matching TID.
+//   C. dispatch_pm_task_exited_push returns NotMatched on wrong TID (safe noop).
+//   D. dispatch_pm_task_exited_push rejects wrong opcode.
+//   E. dispatch_pm_task_exited_push rejects short payload.
+//   F. decode_kernel_pm_task_exited decodes kernel push message.
+//   G. End-to-end data pipeline: kernel payload → decode → VFS dispatch → cleanup.
+//   H. VFS_SHARED_IO_ENABLED still false.
+//   I. PROC_OP_TASK_EXITED and KERNEL_OP_PM_TASK_EXITED are distinct opcodes.
+#[cfg(test)]
+mod stage77_vfs_tests {
+    use super::*;
+    use crate::fs::common::shared_io_adapter::{
+        decode_kernel_pm_task_exited, dispatch_pm_task_exited_push, handle_pm_task_exited,
+        VfsPmPushDispatchError, VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED, VFS_SHARED_IO_ENABLED,
+    };
+    use crate::fs::common::shared_io_lifecycle::{
+        VfsSharedIoCleanupResult, VfsSharedIoDirection, VfsSharedIoHandleTable,
+        VfsSharedIoLifecycle, VfsSharedIoRequesterExitAction, VfsSharedIoTerminalReason,
+    };
+    use yarm_ipc_abi::process_abi::{
+        KERNEL_OP_PM_TASK_EXITED, PROC_OP_TASK_EXITED, KernelPmTaskExitedPayload, PmTaskExitedEvent,
+    };
+    use yarm_ipc_abi::vfs_abi::{VFS_SHARED_BUFFER_FS_WRITE, VfsSharedBufferDescriptor};
+
+    const TID_C: u64 = 0x7700_0001;
+    const TID_D: u64 = 0x7700_0002;
+
+    fn lc_pair(
+        tid: u64,
+        direction: VfsSharedIoDirection,
+        len: u64,
+    ) -> (VfsSharedIoHandleTable<1>, VfsSharedIoLifecycle) {
+        let mut handles = VfsSharedIoHandleTable::<1>::new();
+        let handle = handles.allocate().expect("allocate");
+        let access = match direction {
+            VfsSharedIoDirection::ReadReply => VFS_SHARED_BUFFER_FS_WRITE,
+            VfsSharedIoDirection::WriteRequest => yarm_ipc_abi::vfs_abi::VFS_SHARED_BUFFER_FS_READ,
+        };
+        let desc = VfsSharedBufferDescriptor::new(
+            handle.object_handle,
+            handle.object_generation,
+            0,
+            len,
+            access,
+        );
+        let lc = VfsSharedIoLifecycle::reserve(1, tid, desc, len, 0, direction).expect("reserve");
+        (handles, lc)
+    }
+
+    // ── A. Gate ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_vfs_pm_task_exit_notification_now_enabled() {
+        assert!(
+            VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED,
+            "VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED must be true after Stage 77+78"
+        );
+    }
+
+    #[test]
+    fn stage77_vfs_shared_io_enabled_still_false() {
+        assert!(
+            !VFS_SHARED_IO_ENABLED,
+            "VFS_SHARED_IO_ENABLED must remain false (write direction not implemented)"
+        );
+    }
+
+    // ── B. Matched TID dispatch ───────────────────────────────────────────────
+
+    #[test]
+    fn stage77_dispatch_pm_task_exited_push_matched_tid_delivers_requester_exit() {
+        let (mut handles, mut lc) = lc_pair(TID_C, VfsSharedIoDirection::ReadReply, 8);
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        let payload = PmTaskExitedEvent::new(TID_C, 0).encode();
+        let result =
+            dispatch_pm_task_exited_push(PROC_OP_TASK_EXITED, &payload, &mut lc, &mut handles)
+                .expect("dispatch must succeed");
+        assert_eq!(
+            result,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            )),
+            "matched TID must deliver RequesterExit"
+        );
+    }
+
+    // ── C. Unmatched TID ─────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_dispatch_pm_task_exited_push_unmatched_tid_is_safe_noop() {
+        let (mut handles, mut lc) = lc_pair(TID_C, VfsSharedIoDirection::ReadReply, 8);
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        let payload = PmTaskExitedEvent::new(TID_D, 0).encode(); // different TID
+        let result =
+            dispatch_pm_task_exited_push(PROC_OP_TASK_EXITED, &payload, &mut lc, &mut handles)
+                .expect("dispatch must not error on mismatch");
+        assert_eq!(
+            result,
+            VfsSharedIoRequesterExitAction::NotMatched,
+            "unmatched TID must yield NotMatched (safe noop)"
+        );
+    }
+
+    // ── D. Wrong opcode ───────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_dispatch_pm_task_exited_push_rejects_wrong_opcode() {
+        let (mut handles, mut lc) = lc_pair(TID_C, VfsSharedIoDirection::ReadReply, 8);
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        let payload = PmTaskExitedEvent::new(TID_C, 0).encode();
+        let result = dispatch_pm_task_exited_push(0xFFFF, &payload, &mut lc, &mut handles);
+        assert_eq!(
+            result,
+            Err(VfsPmPushDispatchError::WrongOpcode),
+            "wrong opcode must be rejected"
+        );
+    }
+
+    // ── E. Short payload ─────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_dispatch_pm_task_exited_push_rejects_short_payload() {
+        let (mut handles, mut lc) = lc_pair(TID_C, VfsSharedIoDirection::ReadReply, 8);
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        let result = dispatch_pm_task_exited_push(
+            PROC_OP_TASK_EXITED,
+            &[0u8; 15], // too short
+            &mut lc,
+            &mut handles,
+        );
+        assert_eq!(
+            result,
+            Err(VfsPmPushDispatchError::Malformed),
+            "short payload must be rejected as Malformed"
+        );
+    }
+
+    // ── F. Kernel-push decode ─────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_decode_kernel_pm_task_exited_correct_opcode_and_payload() {
+        let payload = KernelPmTaskExitedPayload::new(TID_C, 99).encode();
+        let (tid, code) =
+            decode_kernel_pm_task_exited(KERNEL_OP_PM_TASK_EXITED, &payload).expect("decode");
+        assert_eq!(tid, TID_C);
+        assert_eq!(code, 99);
+    }
+
+    #[test]
+    fn stage77_decode_kernel_pm_task_exited_rejects_wrong_opcode() {
+        let payload = KernelPmTaskExitedPayload::new(TID_C, 0).encode();
+        assert_eq!(
+            decode_kernel_pm_task_exited(0xABCD, &payload),
+            Err(VfsPmPushDispatchError::WrongOpcode)
+        );
+    }
+
+    #[test]
+    fn stage77_decode_kernel_pm_task_exited_rejects_short_payload() {
+        assert_eq!(
+            decode_kernel_pm_task_exited(KERNEL_OP_PM_TASK_EXITED, &[0u8; 15]),
+            Err(VfsPmPushDispatchError::Malformed)
+        );
+    }
+
+    // ── G. End-to-end data pipeline ───────────────────────────────────────────
+
+    #[test]
+    fn stage77_kernel_pm_vfs_full_data_pipeline_tid_matches() {
+        // Simulates: kernel fires pm_task_exit_endpoint with KERNEL_OP_PM_TASK_EXITED
+        // → PM decodes it → PM encodes PROC_OP_TASK_EXITED → VFS dispatch → cleanup.
+        let (mut handles, mut lc) = lc_pair(TID_C, VfsSharedIoDirection::ReadReply, 8);
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+
+        // Step 1: simulate kernel→PM message decode.
+        let kernel_payload = KernelPmTaskExitedPayload::new(TID_C, 42).encode();
+        let (pm_tid, _pm_code) =
+            decode_kernel_pm_task_exited(KERNEL_OP_PM_TASK_EXITED, &kernel_payload)
+                .expect("PM decodes kernel push");
+
+        // Step 2: PM re-encodes as PROC_OP_TASK_EXITED for VFS.
+        let vfs_payload = PmTaskExitedEvent::new(pm_tid, 42).encode();
+
+        // Step 3: VFS dispatches.
+        let result =
+            dispatch_pm_task_exited_push(PROC_OP_TASK_EXITED, &vfs_payload, &mut lc, &mut handles)
+                .expect("VFS dispatch");
+        assert_eq!(
+            result,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            )),
+            "end-to-end: kernel tid must arrive at VFS RequesterExit"
+        );
+    }
+
+    // ── H. Opcode isolation ───────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_kernel_op_pm_task_exited_distinct_from_proc_op_task_exited() {
+        assert_ne!(
+            KERNEL_OP_PM_TASK_EXITED, PROC_OP_TASK_EXITED,
+            "KERNEL_OP_PM_TASK_EXITED (kernel→PM) must not collide with PROC_OP_TASK_EXITED (PM→VFS)"
+        );
+    }
+
+    #[test]
+    fn stage77_handle_pm_task_exited_direct_still_works() {
+        // Regression: the Stage 76 helper must still work directly (not just via dispatch).
+        let (mut handles, mut lc) = lc_pair(TID_C, VfsSharedIoDirection::ReadReply, 8);
+        lc.map(&handles).expect("map");
+        lc.begin().expect("begin");
+        let action = handle_pm_task_exited(TID_C, &mut lc, &mut handles).expect("direct call");
+        assert_eq!(
+            action,
+            VfsSharedIoRequesterExitAction::Matched(VfsSharedIoCleanupResult::Won(
+                VfsSharedIoTerminalReason::RequesterExit
+            ))
+        );
     }
 }

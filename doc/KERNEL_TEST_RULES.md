@@ -4070,8 +4070,7 @@ status. Documents the two infrastructure blockers before live wiring is possible
 - `stage76_pm_and_vfs_opcodes_are_in_separate_endpoint_namespaces` — opcode isolation documented
 
 **Hard invariants:**
-- `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = false`; do not enable without both blockers resolved:
-  (A) PM→VFS send cap added to startup handoff; (B) PM wired to receive kernel task-exit events.
+- `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true` (Stage 77+78: both blockers resolved).
 - `PROC_OP_TASK_EXITED = 13`, `PROC_OP_PROCESS_EXITED = 14`; do not change these opcode values.
 - `PmTaskExitedEvent` and `PmProcessExitedEvent` wire layouts are 16 bytes LE; do not change.
 - `handle_pm_task_exited` must delegate to `deliver_requester_exit_if_tid_matches`; no state mutation on mismatch.
@@ -4083,5 +4082,63 @@ status. Documents the two infrastructure blockers before live wiring is possible
 **Run commands:**
 - `cargo test -p yarm-fs-servers --lib stage76_tests -- --test-threads=1` (18 tests)
 - `cargo test -p yarm-ipc-abi -- --test-threads=1` (190 process_abi + vfs_abi tests)
-- `cargo test -p yarm-fs-servers --lib -- --test-threads=1` (full 313-test regression)
+- `cargo test -p yarm-fs-servers --lib -- --test-threads=1` (full 313-test regression; 325 after Stage 77+78)
 - `cargo check -p yarm-fs-servers` (no errors)
+
+---
+
+## Rule N+69 — Stage 77+78: Kernel→PM TaskExited + VFS dispatch wiring
+
+**Purpose:** Resolve both blockers from Stage 76. Add kernel-side `pm_task_exit_endpoint`,
+`report_task_exit_to_pm()`, and VFS-side `dispatch_pm_task_exited_push()`. Enable
+`VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true`. Prove end-to-end data pipeline.
+
+**Modules:**
+- `mod stage77` in `src/kernel/boot/tests.rs` (15 kernel tests)
+- `mod stage77_vfs_tests` in `crates/yarm-fs-servers/src/fs/common/vfs_service.rs` (12 VFS tests)
+
+**Kernel tests (15 total):**
+- `stage77_set_pm_task_exit_endpoint_requires_receive_cap` — SEND cap rejected; RECEIVE cap accepted
+- `stage77_set_pm_task_exit_endpoint_requires_existing_task` — unregistered TID rejected
+- `stage77_report_task_exit_to_pm_delivers_correct_opcode_and_tid` — `KERNEL_OP_PM_TASK_EXITED` + correct payload
+- `stage77_report_task_exit_to_pm_noop_when_unregistered` — silent success when endpoint is `None`
+- `stage77_exit_task_fires_pm_task_exit_endpoint` — `exit_task()` delivers message to PM endpoint
+- `stage77_exit_task_fires_supervisor_and_pm_endpoints_independently` — both endpoints receive separate messages
+- `stage77_exit_task_noop_pm_when_endpoint_not_registered` — no PM endpoint → `exit_task` still succeeds
+- `stage77_kernel_pm_task_exited_payload_encode_decode_roundtrip` — codec roundtrip
+- `stage77_kernel_pm_task_exited_payload_le_byte_order` — LE byte ordering verified
+- `stage77_kernel_pm_task_exited_payload_decode_rejects_short` — <16-byte rejected
+- `stage77_kernel_op_pm_task_exited_is_0xdc` — opcode value assertion
+- `stage77_kernel_op_pm_task_exited_distinct_from_supervisor_op` — no collision with `0xEE`
+- `stage77_kernel_pm_task_exited_payload_encoded_len_is_16` — payload size contract
+- `stage77_syscall_count_unchanged` — SYSCALL_COUNT = 31
+- `stage77_proc_op_task_exited_opcode_unchanged` — PROC_OP_TASK_EXITED = 13
+
+**VFS tests (12 total):**
+- `stage77_vfs_pm_task_exit_notification_now_enabled` — gate = `true`
+- `stage77_vfs_shared_io_enabled_still_false` — umbrella gate unchanged
+- `stage77_dispatch_pm_task_exited_push_matched_tid_delivers_requester_exit` — TID match → `Matched(Won(RequesterExit))`
+- `stage77_dispatch_pm_task_exited_push_unmatched_tid_is_safe_noop` — wrong TID → `NotMatched`
+- `stage77_dispatch_pm_task_exited_push_rejects_wrong_opcode` — `WrongOpcode` error
+- `stage77_dispatch_pm_task_exited_push_rejects_short_payload` — `Malformed` error
+- `stage77_decode_kernel_pm_task_exited_correct_opcode_and_payload` — decodes (tid, code) correctly
+- `stage77_decode_kernel_pm_task_exited_rejects_wrong_opcode` — `WrongOpcode` error
+- `stage77_decode_kernel_pm_task_exited_rejects_short_payload` — `Malformed` error
+- `stage77_kernel_pm_vfs_full_data_pipeline_tid_matches` — end-to-end: kernel payload → PM decode → VFS dispatch → cleanup
+- `stage77_kernel_op_pm_task_exited_distinct_from_proc_op_task_exited` — `0xDC` ≠ `13`
+- `stage77_handle_pm_task_exited_direct_still_works` — Stage 76 helper not broken
+
+**Hard invariants:**
+- `KERNEL_OP_PM_TASK_EXITED = 0xDC`; do not change.
+- `KernelPmTaskExitedPayload::ENCODED_LEN = 16`; do not change.
+- `FaultSubsystem::pm_task_exit_endpoint` initialized to `None` in bootstrap.
+- `report_task_exit_to_pm` called from `exit_task()` after `report_task_exit_to_supervisor()`.
+- No new syscalls; SYSCALL_COUNT = 31 unchanged.
+- STARTUP_SLOT_COUNT = 18 unchanged.
+- `VFS_SHARED_IO_ENABLED = false`; write direction not yet implemented.
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`; unchanged.
+
+**Run commands:**
+- `cargo test -p yarm --lib --features hosted-dev -- stage77` (15 kernel tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev -- stage77` (12 VFS tests)
+- `cargo test -p yarm-fs-servers --features hosted-dev` (full 325-test regression)

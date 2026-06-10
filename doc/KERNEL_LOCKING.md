@@ -11983,93 +11983,111 @@ After both are in place, enable `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED =
 
 ---
 
-## §78 Stage 76 — PM-owned TaskExited/ProcessExited notification ABI
+## §78 Stage 76+77+78 — PM-owned TaskExited/ProcessExited notification ABI + full wiring
 
 ### 78.1 Architectural decision
 
 PM should own lifecycle notifications; supervisor should own fault/restart policy only.
-Stage 76 defines the PM-owned push notification ABI and VFS handler entry point.
-Live wiring is not possible without new startup cap distribution (hard rule: do not
-invent unsafe startup slot semantics).
+Stage 76 defined the ABI. Stage 77+78 resolved both blockers and enabled the gate.
 
-### 78.2 New ABI contracts
+### 78.2 ABI contracts (all stages)
 
 ```rust
 // crates/yarm-ipc-abi/src/process_abi.rs
-pub const PROC_OP_TASK_EXITED:   u16 = 13;  // PM → VFS push, no reply
-pub const PROC_OP_PROCESS_EXITED: u16 = 14;  // PM → VFS push, no reply
+
+// Stage 77+78: Kernel → PM push
+pub const KERNEL_OP_PM_TASK_EXITED: u16 = 0xDC;
+
+pub struct KernelPmTaskExitedPayload { pub tid: u64, pub exit_code: u64 }
+// Wire: [0..8] tid LE, [8..16] exit_code LE (16 bytes)
+
+// Stage 76: PM → VFS push
+pub const PROC_OP_TASK_EXITED:   u16 = 13;
+pub const PROC_OP_PROCESS_EXITED: u16 = 14;
 
 pub struct PmTaskExitedEvent { pub tid: u64, pub exit_code: u64 }
-// Wire: [0..8] tid LE, [8..16] exit_code LE (16 bytes total)
-
 pub struct PmProcessExitedEvent { pub process_tid: u64, pub exit_code: u64 }
-// Wire: [0..8] process_tid LE, [8..16] exit_code LE (16 bytes total)
+// Both: [0..8] tid LE, [8..16] exit_code LE (16 bytes each)
 ```
 
-VFS entry point (helper-only, gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED`):
+Kernel-side additions (Stage 77+78):
+```rust
+// src/kernel/boot/defs.rs — FaultSubsystem
+pub(crate) pm_task_exit_endpoint: Option<usize>,
+
+// src/kernel/boot/fault_endpoint_state.rs
+pub fn set_pm_task_exit_endpoint_for_task(tid: u64, recv_cap: CapId) -> Result<(), KernelError>
+
+// src/kernel/boot/restart_state.rs
+pub fn report_task_exit_to_pm(tid: u64, code: u64) -> Result<(), KernelError>
+// Called from exit_task() after report_task_exit_to_supervisor()
+```
+
+VFS entry points:
 ```rust
 // crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs
 pub fn handle_pm_task_exited<const N: usize>(
-    tid: u64,
-    lifecycle: &mut VfsSharedIoLifecycle,
-    handles: &mut VfsSharedIoHandleTable<N>,
+    tid: u64, lifecycle: &mut VfsSharedIoLifecycle, handles: &mut VfsSharedIoHandleTable<N>,
 ) -> Result<VfsSharedIoRequesterExitAction, VfsSharedIoLifecycleError>
+
+pub fn dispatch_pm_task_exited_push<const N: usize>(
+    opcode: u16, payload: &[u8],
+    lifecycle: &mut VfsSharedIoLifecycle, handles: &mut VfsSharedIoHandleTable<N>,
+) -> Result<VfsSharedIoRequesterExitAction, VfsPmPushDispatchError>
+
+pub fn decode_kernel_pm_task_exited(opcode: u16, payload: &[u8]) -> Result<(u64, u64), VfsPmPushDispatchError>
 ```
 
-### 78.3 Missing infrastructure (two blockers)
+### 78.3 Blockers resolved (Stage 77+78)
 
-**Blocker A — No PM→VFS send cap:**
-Startup context slots 0–17 are fully allocated. No `pm_to_vfs_task_exit_send_cap`
-field exists in `StartupContext` or `CoreServiceHandles`. PM and VFS are isolated at
-the capability level. Adding the channel requires: new `CoreServiceHandles` field, new
-init cap-distribution logic, and a VFS recv arm for `PROC_OP_TASK_EXITED` messages.
+**Blocker A — PM→VFS send cap: RESOLVED**
+PM already has `vfs_send_cap` via `lifecycle_table.get_by_image_id(6).pm_service_send_cap`
+(image_id=6 = VFS). No new startup slot needed.
 
-**Blocker B — PM does not receive kernel task-exit events:**
-The kernel sends `SUPERVISOR_OP_TASK_EXITED` only to `faults.supervisor_endpoint`
-in `restart_state.rs`. PM has no registered endpoint with the kernel. PM currently
-learns of task exits only via `PROC_OP_WAITPID_V2` (parent polling) or
-`PROC_OP_LIFECYCLE_QUERY`. PM must be wired to receive kernel exit notifications
-before it can push `PROC_OP_TASK_EXITED` to VFS.
+**Blocker B — Kernel→PM task-exit delivery: RESOLVED (Stage 77+78)**
+`FaultSubsystem::pm_task_exit_endpoint: Option<usize>` added.
+`exit_task()` calls `report_task_exit_to_pm(tid, code)` after `report_task_exit_to_supervisor()`.
+Kernel sends `KERNEL_OP_PM_TASK_EXITED = 0xDC` with 16-byte LE payload to PM's endpoint.
+Tests prove end-to-end delivery.
 
-Gate constant documenting both blockers:
+Gate constant:
 ```rust
-pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
+pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = true;  // Stage 77+78: enabled
 ```
 
-### 78.4 Signal flow (when both blockers resolved)
+### 78.4 Signal flow (implemented)
 
 ```
-exit_task()
-  → report_task_exit_to_supervisor(tid, code, token)    [kernel, today]
-  → [future] report_task_exit_to_pm(tid, code)          [kernel, new]
-    → PM receives PROC_OP_TASK_EXITED equivalent
-    → PM pushes PmTaskExitedEvent via pm_to_vfs_notify_cap
-      → VFS receives on dedicated notify endpoint
-        → handle_pm_task_exited(tid, &mut lifecycle, &mut handles)
+exit_task(tid, code)
+  → report_task_exit_to_supervisor(tid, code, token)    [kernel]
+  → report_task_exit_to_pm(tid, code)                   [kernel, Stage 77+78]
+    → KERNEL_OP_PM_TASK_EXITED delivered to pm_task_exit_endpoint
+    → PM: decode_kernel_pm_task_exited(opcode, payload) → (tid, code)
+    → PM: encode PmTaskExitedEvent, send PROC_OP_TASK_EXITED to VFS
+      → VFS: dispatch_pm_task_exited_push(opcode, payload, lifecycle, handles)
+        → handle_pm_task_exited(tid, lifecycle, handles)
           → deliver_requester_exit_if_tid_matches(tid, handles)
 ```
 
 ### 78.5 Lock ordering
 
-No change to lock ordering.  `handle_pm_task_exited` is entirely within VFS-space
-(no kernel locks held), same as `deliver_requester_exit_if_tid_matches` in §77.
+No change to lock ordering. `handle_pm_task_exited` and `dispatch_pm_task_exited_push`
+are entirely within VFS-space (no kernel locks held).
+`report_task_exit_to_pm` holds `fault_state_lock` to read `pm_task_exit_endpoint`,
+then calls `send_message_to_endpoint_and_wake` under `ipc_state_lock` — same ordering
+as `report_task_exit_to_supervisor`. No new lock ordering introduced.
 
 ### 78.6 Invariants preserved
 
 - SYSCALL_COUNT = 31 (no change)
 - NR 30 = `RecvSharedV3` (no change)
+- `PROC_OP_TASK_EXITED = 13` (unchanged from Stage 76)
+- `PROC_OP_PROCESS_EXITED = 14` (unchanged from Stage 76)
+- `KERNEL_OP_PM_TASK_EXITED = 0xDC` (new, does not collide with `SUPERVISOR_OP_TASK_EXITED = 0xEE`)
 - `VFS_READ_SHARED_REPLY_ENABLED = true` (unchanged from Stage 73)
-- `VFS_SHARED_IO_ENABLED = false` (unchanged)
+- `VFS_SHARED_IO_ENABLED = false` (unchanged — write direction not implemented)
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged from Stage 75)
-- `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = false` (Stage 76 documents gap)
-- No startup slots changed; no Drop-based cleanup added
-- 313 yarm-fs-servers tests pass (up from 295 after Stage 75)
-
-### 78.7 Remaining work
-
-Resolve Blocker A (add PM→VFS notification cap to startup handoff) and Blocker B
-(wire PM to receive kernel task-exit events). Then enable
-`VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true` and add a VFS recv loop arm for
-`PROC_OP_TASK_EXITED`. Add the bounded `requester_tid`-keyed lifecycle store to
-`VfsService` (see §77.3 blocker b) to complete the full PM-owned notification path.
-and add integration tests proving end-to-end signal delivery.
+- `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true` (Stage 77+78: enabled)
+- No startup slots added or changed; STARTUP_SLOT_COUNT = 18 (unchanged)
+- 325 yarm-fs-servers tests pass (313 Stage 76 + 12 Stage 77+78)
+- 15 kernel-side Stage 77+78 tests in `mod stage77` in `tests.rs`
