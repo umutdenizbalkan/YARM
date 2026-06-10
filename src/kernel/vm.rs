@@ -25,7 +25,11 @@ impl VirtAddr {
     }
 
     pub const fn page_align_up(self) -> Self {
-        Self((self.0 + PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1))
+        let mask = PAGE_SIZE as u64 - 1;
+        match self.0.checked_add(mask) {
+            Some(v) => Self(v & !mask),
+            None => Self(u64::MAX & !mask),
+        }
     }
 }
 
@@ -250,6 +254,12 @@ struct Entry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainedMapping {
+    pub mapping: Mapping,
+    pub pages: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MappingEntry {
     pub virt: VirtAddr,
     pub mapping: Mapping,
@@ -424,10 +434,41 @@ impl AddressSpace {
         };
         match effective_exact_idx {
             Some(i) => {
-                let entry = self.entries[i].as_mut().expect("entry");
-                let old = entry.mapping;
-                arch_map_page(self.asid, virt, mapping)?;
-                entry.mapping = mapping;
+                let old = self.entries[i].as_ref().expect("entry").mapping;
+                // Bug 1 fix: right-split so the tail of a multi-page run keeps its
+                // own tracking entry — overwriting entry.mapping here would corrupt it.
+                if self.entries[i].as_ref().expect("entry").pages > 1 {
+                    if self.len >= MAX_MAPPINGS {
+                        return Err(VmError::Full);
+                    }
+                    let tail_pages = self.entries[i].as_ref().expect("entry").pages - 1;
+                    let tail_virt = VirtAddr(virt.0 + PAGE_SIZE as u64);
+                    let tail_phys = PhysAddr(old.phys.0 + PAGE_SIZE as u64);
+                    for shift_idx in (i + 1..self.len).rev() {
+                        self.entries[shift_idx + 1] = self.entries[shift_idx];
+                    }
+                    self.entries[i + 1] = Some(Entry {
+                        virt: tail_virt,
+                        mapping: Mapping { phys: tail_phys, flags: old.flags },
+                        pages: tail_pages,
+                    });
+                    self.entries[i].as_mut().expect("entry").pages = 1;
+                    self.len += 1;
+                }
+                // Bug 5 fix: BBM — unmap before remap for AArch64 compliance;
+                // also forces a TLB shootdown on x86_64 and RISC-V.
+                arch_unmap_page(self.asid, virt);
+                if let Err(e) = arch_map_page(self.asid, virt, mapping) {
+                    // Hardware is already unmapped; remove the stale software entry
+                    // so the shadow stays consistent.
+                    for shift_idx in i..self.len.saturating_sub(1) {
+                        self.entries[shift_idx] = self.entries[shift_idx + 1];
+                    }
+                    self.entries[self.len - 1] = None;
+                    self.len -= 1;
+                    return Err(e);
+                }
+                self.entries[i].as_mut().expect("entry").mapping = mapping;
                 Ok(Some(old))
             }
             None => {
@@ -451,8 +492,25 @@ impl AddressSpace {
                                 == mapping.phys.0
                     });
                 if prev_merge {
-                    let prev = self.entries[i - 1].as_mut().expect("prev");
-                    prev.pages += 1;
+                    // Bug 6 fix: also check if the new page bridges into the next
+                    // run so all three entries can be collapsed into one.
+                    let next_also_merges = i < self.len
+                        && self.entries[i].is_some_and(|next| {
+                            next.mapping.flags == mapping.flags
+                                && virt.0 + PAGE_SIZE as u64 == next.virt.0
+                                && mapping.phys.0 + PAGE_SIZE as u64 == next.mapping.phys.0
+                        });
+                    if next_also_merges {
+                        let next_pages = self.entries[i].expect("next").pages;
+                        self.entries[i - 1].as_mut().expect("prev").pages += 1 + next_pages;
+                        for shift_idx in i..self.len.saturating_sub(1) {
+                            self.entries[shift_idx] = self.entries[shift_idx + 1];
+                        }
+                        self.entries[self.len - 1] = None;
+                        self.len -= 1;
+                    } else {
+                        self.entries[i - 1].as_mut().expect("prev").pages += 1;
+                    }
                     return Ok(None);
                 }
 
@@ -492,14 +550,23 @@ impl AddressSpace {
         }
     }
 
-    pub fn unmap_page(&mut self, virt: VirtAddr) -> Option<Mapping> {
-        let idx = self.find_entry_containing(virt)?;
-        let entry = self.entries[idx]?;
+    pub fn unmap_page(&mut self, virt: VirtAddr) -> Result<Option<Mapping>, VmError> {
+        let Some(idx) = self.find_entry_containing(virt) else {
+            return Ok(None);
+        };
+        let entry = self.entries[idx].expect("entry after find_entry_containing");
         let page_offset = ((virt.0 - entry.virt.0) / PAGE_SIZE as u64) as usize;
         let old = Mapping {
             phys: PhysAddr(entry.mapping.phys.0 + (page_offset as u64 * PAGE_SIZE as u64)),
             flags: entry.mapping.flags,
         };
+        // Bug 3 fix: capacity check BEFORE touching hardware — splitting a
+        // middle-of-block page requires one extra tracking entry; reject early
+        // so hardware and software state never diverge.
+        let is_middle = entry.pages > 1 && page_offset > 0 && page_offset < entry.pages - 1;
+        if is_middle && self.len >= MAX_MAPPINGS {
+            return Err(VmError::Full);
+        }
         arch_unmap_page(self.asid, virt);
         if entry.pages == 1 {
             for shift_idx in idx..self.len.saturating_sub(1) {
@@ -507,21 +574,18 @@ impl AddressSpace {
             }
             self.entries[self.len - 1] = None;
             self.len -= 1;
-            return Some(old);
+            return Ok(Some(old));
         }
         if page_offset == 0 {
             let current = self.entries[idx].as_mut().expect("entry");
             current.virt = VirtAddr(current.virt.0 + PAGE_SIZE as u64);
             current.mapping.phys = PhysAddr(current.mapping.phys.0 + PAGE_SIZE as u64);
             current.pages -= 1;
-            return Some(old);
+            return Ok(Some(old));
         }
         if page_offset == entry.pages - 1 {
             self.entries[idx].as_mut().expect("entry").pages -= 1;
-            return Some(old);
-        }
-        if self.len >= MAX_MAPPINGS {
-            return Some(old);
+            return Ok(Some(old));
         }
         for shift_idx in (idx + 1..self.len).rev() {
             self.entries[shift_idx + 1] = self.entries[shift_idx];
@@ -542,7 +606,7 @@ impl AddressSpace {
             pages: right_pages,
         });
         self.len += 1;
-        Some(old)
+        Ok(Some(old))
     }
 
     /// Resolves a virtual address to its mapping.
@@ -580,12 +644,21 @@ impl AddressSpace {
             .any(|entry| entry.mapping.phys == phys)
     }
 
-    pub fn drain_mappings(&mut self) -> [Option<Mapping>; MAX_MAPPINGS] {
-        let mut drained = [None; MAX_MAPPINGS];
+    pub fn drain_mappings(&mut self) -> [Option<DrainedMapping>; MAX_MAPPINGS] {
+        let mut drained: [Option<DrainedMapping>; MAX_MAPPINGS] = [None; MAX_MAPPINGS];
         for (idx, slot) in self.entries.iter_mut().take(self.len).enumerate() {
             let Some(entry) = slot.take() else { continue };
-            arch_unmap_page(self.asid, entry.virt);
-            drained[idx] = Some(entry.mapping);
+            // Bug 2 fix: unmap every page in the run, not just the base VA.
+            for page in 0..entry.pages {
+                arch_unmap_page(
+                    self.asid,
+                    VirtAddr(entry.virt.0 + (page as u64 * PAGE_SIZE as u64)),
+                );
+            }
+            drained[idx] = Some(DrainedMapping {
+                mapping: entry.mapping,
+                pages: entry.pages,
+            });
         }
         for slot in self.entries.iter_mut().skip(self.len) {
             *slot = None;
@@ -716,7 +789,7 @@ impl AddressSpaceManager {
         &mut self,
         asid: Asid,
         pending_cpu_bitmap: CpuBitmap,
-    ) -> Result<[Option<Mapping>; MAX_MAPPINGS], VmError> {
+    ) -> Result<[Option<DrainedMapping>; MAX_MAPPINGS], VmError> {
         for slot in &mut self.entries {
             if slot.as_ref().is_some_and(|entry| entry.asid == asid)
                 && let Some(mut entry) = slot.take()
@@ -1087,8 +1160,8 @@ mod tests {
 
         assert_eq!(aspace.map_page(virt, first), Ok(None));
         assert_eq!(aspace.map_page(virt, second), Ok(Some(first)));
-        assert_eq!(aspace.unmap_page(virt), Some(second));
-        assert_eq!(aspace.unmap_page(virt), None);
+        assert_eq!(aspace.unmap_page(virt), Ok(Some(second)));
+        assert_eq!(aspace.unmap_page(virt), Ok(None));
     }
 
     #[test]
@@ -1142,5 +1215,376 @@ mod tests {
         let a = mgr.create_user_space().expect("asid a");
         let b = mgr.create_user_space().expect("asid b");
         assert_ne!(a, b);
+    }
+
+    // --- Bug 4 regression: page_align_up must not overflow near u64::MAX ---
+
+    #[test]
+    fn page_align_up_already_aligned_near_max_returns_self() {
+        let mask = PAGE_SIZE as u64 - 1;
+        let last_page_base = VirtAddr(u64::MAX & !mask);
+        assert_eq!(last_page_base.page_align_up(), last_page_base);
+    }
+
+    #[test]
+    fn page_align_up_saturates_on_overflow() {
+        let mask = PAGE_SIZE as u64 - 1;
+        // One byte into the last page — naive +mask would wrap u64.
+        let one_past = VirtAddr((u64::MAX & !mask) + 1);
+        let result = one_past.page_align_up();
+        assert_eq!(result.0 & mask, 0, "result must be page-aligned");
+        assert_eq!(result, VirtAddr(u64::MAX & !mask));
+    }
+
+    // --- Bug 1 regression: map_page must right-split multi-page entries ---
+
+    #[test]
+    fn remap_middle_page_of_multipage_block_splits_correctly() {
+        let mut aspace = AddressSpace::new_user();
+        let base = VirtAddr(0x10_000);
+        let flags = PageFlags::USER_RW;
+        for i in 0..3usize {
+            aspace
+                .map_page(
+                    VirtAddr(base.0 + (i as u64 * PAGE_SIZE as u64)),
+                    Mapping {
+                        phys: PhysAddr(0x20_000 + i as u64 * PAGE_SIZE as u64),
+                        flags,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(aspace.mappings(), 1);
+
+        let mid = VirtAddr(base.0 + PAGE_SIZE as u64);
+        let new_m = Mapping {
+            phys: PhysAddr(0x50_000),
+            flags: PageFlags::USER_RX,
+        };
+        let old = aspace.map_page(mid, new_m).unwrap();
+        assert_eq!(
+            old,
+            Some(Mapping {
+                phys: PhysAddr(0x21_000),
+                flags
+            })
+        );
+        assert_eq!(aspace.mappings(), 3);
+        assert_eq!(
+            aspace.resolve(base),
+            Some(Mapping {
+                phys: PhysAddr(0x20_000),
+                flags
+            })
+        );
+        assert_eq!(aspace.resolve(mid), Some(new_m));
+        assert_eq!(
+            aspace.resolve(VirtAddr(base.0 + 2 * PAGE_SIZE as u64)),
+            Some(Mapping {
+                phys: PhysAddr(0x22_000),
+                flags
+            })
+        );
+    }
+
+    #[test]
+    fn remap_first_page_of_multipage_block_leaves_tail_intact() {
+        let mut aspace = AddressSpace::new_user();
+        let base = VirtAddr(0x10_000);
+        let flags = PageFlags::USER_RW;
+        for i in 0..4usize {
+            aspace
+                .map_page(
+                    VirtAddr(base.0 + (i as u64 * PAGE_SIZE as u64)),
+                    Mapping {
+                        phys: PhysAddr(0x20_000 + i as u64 * PAGE_SIZE as u64),
+                        flags,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(aspace.mappings(), 1);
+
+        let new_m = Mapping {
+            phys: PhysAddr(0x90_000),
+            flags: PageFlags::USER_RX,
+        };
+        let old = aspace.map_page(base, new_m).unwrap();
+        assert_eq!(
+            old,
+            Some(Mapping {
+                phys: PhysAddr(0x20_000),
+                flags
+            })
+        );
+        assert_eq!(aspace.mappings(), 2);
+        assert_eq!(aspace.resolve(base), Some(new_m));
+        assert_eq!(
+            aspace.resolve(VirtAddr(base.0 + PAGE_SIZE as u64)),
+            Some(Mapping {
+                phys: PhysAddr(0x21_000),
+                flags
+            })
+        );
+        assert_eq!(
+            aspace.resolve(VirtAddr(base.0 + 3 * PAGE_SIZE as u64)),
+            Some(Mapping {
+                phys: PhysAddr(0x23_000),
+                flags
+            })
+        );
+    }
+
+    // --- Bug 5 regression: BBM — remap must not smash an existing PTE directly ---
+
+    #[test]
+    fn remap_single_page_returns_old_and_resolves_new() {
+        let mut aspace = AddressSpace::new_user();
+        let va = VirtAddr(0x5000);
+        let first = Mapping {
+            phys: PhysAddr(0xA_000),
+            flags: PageFlags::USER_RX,
+        };
+        let second = Mapping {
+            phys: PhysAddr(0xB_000),
+            flags: PageFlags::USER_RW,
+        };
+        aspace.map_page(va, first).unwrap();
+        let old = aspace.map_page(va, second).unwrap();
+        assert_eq!(old, Some(first));
+        assert_eq!(aspace.resolve(va), Some(second));
+        assert_eq!(aspace.mappings(), 1);
+    }
+
+    // --- Bug 6 regression: bridging page must trigger triple merge ---
+
+    #[test]
+    fn bridge_page_merges_prev_and_next_into_single_entry() {
+        let mut aspace = AddressSpace::new_user();
+        let flags = PageFlags::USER_RW;
+        aspace
+            .map_page(
+                VirtAddr(0x1000),
+                Mapping {
+                    phys: PhysAddr(0x10_000),
+                    flags,
+                },
+            )
+            .unwrap();
+        aspace
+            .map_page(
+                VirtAddr(0x3000),
+                Mapping {
+                    phys: PhysAddr(0x12_000),
+                    flags,
+                },
+            )
+            .unwrap();
+        assert_eq!(aspace.mappings(), 2);
+
+        aspace
+            .map_page(
+                VirtAddr(0x2000),
+                Mapping {
+                    phys: PhysAddr(0x11_000),
+                    flags,
+                },
+            )
+            .unwrap();
+        assert_eq!(aspace.mappings(), 1);
+        assert_eq!(
+            aspace.resolve(VirtAddr(0x1000)),
+            Some(Mapping {
+                phys: PhysAddr(0x10_000),
+                flags
+            })
+        );
+        assert_eq!(
+            aspace.resolve(VirtAddr(0x2000)),
+            Some(Mapping {
+                phys: PhysAddr(0x11_000),
+                flags
+            })
+        );
+        assert_eq!(
+            aspace.resolve(VirtAddr(0x3000)),
+            Some(Mapping {
+                phys: PhysAddr(0x12_000),
+                flags
+            })
+        );
+    }
+
+    #[test]
+    fn bridge_page_with_flags_mismatch_does_not_triple_merge() {
+        let mut aspace = AddressSpace::new_user();
+        aspace
+            .map_page(
+                VirtAddr(0x1000),
+                Mapping {
+                    phys: PhysAddr(0x10_000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .unwrap();
+        aspace
+            .map_page(
+                VirtAddr(0x3000),
+                Mapping {
+                    phys: PhysAddr(0x12_000),
+                    flags: PageFlags::USER_RX,
+                },
+            )
+            .unwrap();
+        // Bridge page shares flags with left but not right.
+        aspace
+            .map_page(
+                VirtAddr(0x2000),
+                Mapping {
+                    phys: PhysAddr(0x11_000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .unwrap();
+        // Left+bridge merge; right stays separate.
+        assert_eq!(aspace.mappings(), 2);
+    }
+
+    // --- Bug 3 regression: unmap middle page returns Err when at capacity ---
+
+    #[test]
+    fn unmap_middle_of_block_fails_at_capacity() {
+        let mut aspace = AddressSpace::new_user();
+        let flags = PageFlags::USER_RW;
+        // Build the 3-page block first (coalesces to 1 slot).
+        let triple_va = VirtAddr(0x1000_0000);
+        let triple_pa = PhysAddr(0x2000_0000);
+        for i in 0..3usize {
+            aspace
+                .map_page(
+                    VirtAddr(triple_va.0 + (i as u64 * PAGE_SIZE as u64)),
+                    Mapping {
+                        phys: PhysAddr(triple_pa.0 + (i as u64 * PAGE_SIZE as u64)),
+                        flags,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(aspace.mappings(), 1);
+        // Fill the remaining MAX_MAPPINGS - 1 slots with non-adjacent isolated pages
+        // in a VA/PA range that cannot merge with the triple block.
+        for i in 0..(MAX_MAPPINGS - 1) {
+            let va = VirtAddr(0x2000_0000_u64 + (i as u64 * 2 * PAGE_SIZE as u64));
+            let pa = PhysAddr(0x3000_0000_u64 + (i as u64 * 3 * PAGE_SIZE as u64));
+            aspace.map_page(va, Mapping { phys: pa, flags }).unwrap();
+        }
+        assert_eq!(aspace.mappings(), MAX_MAPPINGS);
+
+        // Unmapping the middle page would need to split into 2 entries → Full.
+        let mid_va = VirtAddr(triple_va.0 + PAGE_SIZE as u64);
+        assert_eq!(aspace.unmap_page(mid_va), Err(VmError::Full));
+        // Mapping is still intact — hardware was not touched.
+        assert_eq!(
+            aspace.resolve(mid_va),
+            Some(Mapping {
+                phys: PhysAddr(triple_pa.0 + PAGE_SIZE as u64),
+                flags
+            })
+        );
+    }
+
+    #[test]
+    fn unmap_page_returns_result_for_mapped_and_unmapped() {
+        let mut aspace = AddressSpace::new_user();
+        let va = VirtAddr(0x4000);
+        let m = Mapping {
+            phys: PhysAddr(0x9000),
+            flags: PageFlags::USER_RW,
+        };
+        aspace.map_page(va, m).unwrap();
+        assert_eq!(aspace.unmap_page(va), Ok(Some(m)));
+        assert_eq!(aspace.unmap_page(va), Ok(None));
+    }
+
+    // --- Bug 2 regression: drain_mappings must report correct page counts ---
+
+    #[test]
+    fn drain_mappings_reports_full_page_count_for_coalesced_run() {
+        let mut aspace = AddressSpace::new_kernel();
+        let base = VirtAddr(KERNEL_SPACE_BASE + PAGE_SIZE as u64);
+        for i in 0..5usize {
+            aspace
+                .map_page(
+                    VirtAddr(base.0 + (i as u64 * PAGE_SIZE as u64)),
+                    Mapping {
+                        phys: PhysAddr(0x1_000_000 + i as u64 * PAGE_SIZE as u64),
+                        flags: PageFlags::KERNEL_RW,
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(aspace.mappings(), 1);
+
+        let drained = aspace.drain_mappings();
+        assert_eq!(aspace.mappings(), 0);
+        let dm = drained[0].expect("first entry");
+        assert_eq!(dm.pages, 5);
+        assert_eq!(dm.mapping.phys, PhysAddr(0x1_000_000));
+        assert!(drained[1..].iter().all(|s| s.is_none()));
+    }
+
+    #[test]
+    fn drain_mappings_preserves_per_entry_page_counts() {
+        let mut aspace = AddressSpace::new_user();
+        let flags = PageFlags::USER_RW;
+        // Block A: 3 pages.
+        for i in 0..3usize {
+            aspace
+                .map_page(
+                    VirtAddr(0x1000 + (i as u64 * PAGE_SIZE as u64)),
+                    Mapping {
+                        phys: PhysAddr(0x10_000 + i as u64 * PAGE_SIZE as u64),
+                        flags,
+                    },
+                )
+                .unwrap();
+        }
+        // Block B: 1 page (non-adjacent).
+        aspace
+            .map_page(
+                VirtAddr(0x8000),
+                Mapping {
+                    phys: PhysAddr(0x80_000),
+                    flags,
+                },
+            )
+            .unwrap();
+        assert_eq!(aspace.mappings(), 2);
+
+        let drained = aspace.drain_mappings();
+        assert_eq!(aspace.mappings(), 0);
+        assert_eq!(drained[0].expect("block A").pages, 3);
+        assert_eq!(drained[0].expect("block A").mapping.phys, PhysAddr(0x10_000));
+        assert_eq!(drained[1].expect("block B").pages, 1);
+        assert_eq!(drained[1].expect("block B").mapping.phys, PhysAddr(0x80_000));
+        assert!(drained[2..].iter().all(|s| s.is_none()));
+    }
+
+    #[test]
+    fn drain_single_page_entry_produces_pages_one() {
+        let mut aspace = AddressSpace::new_user();
+        aspace
+            .map_page(
+                VirtAddr(0x1000),
+                Mapping {
+                    phys: PhysAddr(0xA_000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .unwrap();
+        let drained = aspace.drain_mappings();
+        let dm = drained[0].expect("single entry");
+        assert_eq!(dm.pages, 1);
+        assert_eq!(dm.mapping.phys, PhysAddr(0xA_000));
     }
 }
