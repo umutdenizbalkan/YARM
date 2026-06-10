@@ -4596,3 +4596,45 @@ release return value.
 - Plus 7 negative tests and 1 gate regression.
 
 **Run:** `cargo test -p yarm-fs-servers --lib stage83`
+
+## Stage 84 test rules
+
+**Module:** `stage84_tests` in `vfs_service.rs` (20 tests).
+
+**Coverage areas:**
+1. Gate constant: `VFS_STAGE84_RAMFS_BRIDGE_ENABLED = true`.
+2. Lifecycle store: `new()` produces 0 active slots.
+3. Write byte proof: heap backing content reaches RAMFS file via `handle_write_shared_request_gated`.
+4. Read byte proof: RAMFS file bytes reach heap backing via `handle_read_shared_reply_gated`.
+5–6. `op_sequence` advances exactly once per successful call (write and read directions).
+7–8. Lifecycle slot is `None` (freed) after success (write and read directions).
+9–10. Reply fields: `request_id`, `status == VFS_SHARED_IO_STATUS_OK`, `flags == 0`.
+11. Short `requested_len`: only the prefix bytes are written; `bytes_completed == requested_len`.
+12. RequesterExit matched TID: `deliver_requester_exit_all` cleans the slot; returns 1.
+13. RequesterExit unmatched TID: slot survives; returns 0.
+14. Duplicate RequesterExit: second call returns 0 (idempotent).
+15. Multiple slots: only the matching TID's slot is cleaned.
+16. Backend error: `handle_write_shared_request_gated` returns `Err(Malformed)` and frees the slot.
+17–18. `parse_request` still rejects `VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_READ_SHARED_REPLY`.
+19. `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`.
+20. Prior gate flags unchanged: `VFS_WRITE_SHARED_REQUEST_ENABLED`, `VFS_READ_SHARED_REPLY_ENABLED`,
+    `VFS_SHARED_IO_ENABLED`.
+
+**RequesterExit test infrastructure:** `test_stage84_insert_inflight(request_id, requester_tid,
+direction, requested_len)` — a `#[cfg(test)]` helper on `VfsService` that inserts an InFlight
+lifecycle directly into the lifecycle store using the service's own handle table.  This allows
+RequesterExit tests to run independently without needing to interrupt a live shared-I/O call.
+
+**Heap-backed delivery pattern:**
+```rust
+let mut backing = vec![0u8; 4096];
+let ptr = backing.as_mut_ptr() as u64; // or as_ptr() for WRITE_SHARED_REQUEST
+let delivery = RecvSharedV3Delivery {
+    sender_tid, cleanup_token: TOKEN, mapped_base: ptr,
+    page_rounded_mapped_len: 4096, actual_mapping_perm: 3, // or 1 for write
+    ..Default::default()
+};
+// request.buffer.object_handle == TOKEN, request.buffer.object_generation == TOKEN >> 16
+```
+
+**Run:** `cargo test -p yarm-fs-servers --lib stage84`

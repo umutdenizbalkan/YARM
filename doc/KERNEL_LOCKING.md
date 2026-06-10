@@ -12139,3 +12139,35 @@ FAT, ext4, and blkcache are unaffected.
 - `handle_request` still rejects shared opcodes
 - No startup slots changed; STARTUP_SLOT_COUNT = 18
 - 392 yarm-fs-servers tests pass (368 prior + 24 Stage 83)
+
+## 84. Stage 84: RAMFS-only shared-I/O service-loop bridge
+
+### 84.1 Locking model
+
+`VfsService` gains two new fields:
+- `shared_io_handles: VfsSharedIoHandleTable<4>` — internal handle allocator; no kernel lock.
+- `shared_io_requests: [Option<VfsSharedIoLifecycle>; 4]` — per-request lifecycle slots.
+
+Both fields are owned by `VfsService` and accessed only from the VFS service loop thread.
+No new kernel locks are introduced.  Lifecycle operations (`reserve/map/begin/complete/cleanup`)
+and handle-table operations (`allocate/validate/release`) are single-threaded with no interior
+mutability.
+
+`deliver_requester_exit_all` is called from the PM task-exit notification path (same thread);
+it takes each lifecycle by value, calls `deliver_requester_exit_if_tid_matches`, and
+restores unmatched lifecycles in place.  No concurrent access is possible.
+
+### 84.2 Lifecycle slot ownership
+
+Each slot in `shared_io_requests` is either `None` (free) or `Some(VfsSharedIoLifecycle)`.
+The gated methods take ownership via `.take()` before any mutable operation to avoid
+split borrows against `shared_io_handles`.  On success and on all error paths, the slot is
+left as `None` (lifecycle consumed via `cleanup`).
+
+### 84.3 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- STARTUP_SLOT_COUNT = 18 (no change)
+- `handle_request` still rejects shared opcodes
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
+- 412 yarm-fs-servers tests pass (392 prior + 20 Stage 84)

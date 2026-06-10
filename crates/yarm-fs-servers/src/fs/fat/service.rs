@@ -22,7 +22,7 @@ pub struct FatService {
 }
 
 impl FatService {
-    pub const fn with_backend(backend: FatBackend) -> Self {
+    pub fn with_backend(backend: FatBackend) -> Self {
         Self {
             inner: FsService::with_backend(backend),
             inline_writes: 0,

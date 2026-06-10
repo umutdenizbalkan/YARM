@@ -103,6 +103,17 @@ pub const VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
 /// and calls `handle_pm_task_exited(tid, lifecycle, handles)`.
 pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = true;
 
+/// Stage 84: RAMFS-only shared-I/O service-loop bridge.
+///
+/// `true`: the gated methods `handle_write_shared_request_gated` and
+/// `handle_read_shared_reply_gated` on `VfsService` are enabled.  These methods
+/// use the per-request lifecycle/handle store and `RecvV3SharedIoMapper` for byte access.
+///
+/// **RAMFS-only** (Stage 84): production FAT/ext4/blkcache paths remain unchanged.
+/// Does **not** globally enable `handle_request` shared-op routing.
+/// Does **not** change SYSCALL_COUNT, startup slots, SpawnV5 ABI, or image IDs.
+pub const VFS_STAGE84_RAMFS_BRIDGE_ENABLED: bool = true;
+
 /// Stage 76: VFS entry point for a PM-pushed `PROC_OP_TASK_EXITED` event.
 ///
 /// Gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` (enabled in Stage 77+78).
