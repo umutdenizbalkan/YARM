@@ -645,6 +645,7 @@ impl Bootstrap {
                     last_fault_frame: None,
                     fault_handler_endpoint: None,
                     supervisor_endpoint: None,
+                    pm_task_exit_endpoint: None,
                     fault_policy: FaultPolicy::KillTask,
                 },
             ));

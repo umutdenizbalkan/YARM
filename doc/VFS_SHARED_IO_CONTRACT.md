@@ -676,7 +676,7 @@ route for WRITE_SHARED_REQUEST. No global enable occurs. READ_SHARED_REPLY remai
 | `VFS_READ_SHARED_REPLY_ENABLED` | `true` (Stage 73) | READ_SHARED_REPLY gate — enabled; live notification still helper-only |
 | `VFS_SHARED_IO_ENABLED` | `false` | Aggregate umbrella — `WRITE && READ`, so `false` |
 | `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` | `false` (Stage 75) | Supervisor→VFS task-exit channel — not yet wired |
-| `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` | `false` (Stage 76) | PM→VFS task-exit push notification channel — not yet wired |
+| `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` | `true` (Stage 77+78) | PM→VFS task-exit push notification channel — both blockers resolved |
 
 `VFS_SHARED_IO_ENABLED` is only `true` when both direction gates are `true`. Since
 `VFS_WRITE_SHARED_REQUEST_ENABLED` remains `false`, the umbrella remains `false`.
@@ -843,6 +843,8 @@ Total `yarm-fs-servers` tests after Stage 69+70: **261** (up from 245).
 
 Total `yarm-fs-servers` tests after Stage 76: **313** (up from 295; +18 Stage 76 tests).
 
+Total `yarm-fs-servers` tests after Stage 77+78: **325** (up from 313; +12 Stage 77+78 tests).
+
 ### Remaining blockers before global `VFS_SHARED_IO_ENABLED`
 
 1. **Process-exit cleanup** — ~~kernel must signal VFS server when a process holding a mapped~~
@@ -863,12 +865,20 @@ Total `yarm-fs-servers` tests after Stage 76: **313** (up from 295; +18 Stage 76
      - `PROC_OP_TASK_EXITED = 13`: new PM→VFS push opcode with [`PmTaskExitedEvent`] 16-byte payload.
      - `PROC_OP_PROCESS_EXITED = 14`: new PM→VFS push opcode with [`PmProcessExitedEvent`] 16-byte payload.
      - `handle_pm_task_exited(tid, lifecycle, handles)`: VFS entry point for PM push events.
-     - `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = false` (Stage 76): two remaining infrastructure pieces:
-       a. **No PM→VFS send cap**: startup slots 0–17 are fully allocated; no `pm_to_vfs_task_exit_send_cap`
-          exists in `StartupContext`.  Init's `CoreServiceHandles` needs a new field.
-       b. **PM doesn't receive kernel task-exit events**: kernel sends `SUPERVISOR_OP_TASK_EXITED`
-          only to the supervisor.  PM currently learns of exits only via `PROC_OP_WAITPID_V2` polling.
-     - 18 tests in `mod stage76_tests` prove ABI codec, handler dispatch, idempotency, and gate status.
+     - `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED = true` (Stage 77+78): both blockers resolved:
+       a. **PM→VFS send cap RESOLVED**: PM already has `vfs_send_cap` via
+          `lifecycle_table.get_by_image_id(6).pm_service_send_cap` (image_id=6 = VFS).
+       b. **Kernel→PM task-exit delivery RESOLVED (Stage 77+78)**:
+          `FaultSubsystem::pm_task_exit_endpoint: Option<usize>` added.
+          `exit_task()` calls `report_task_exit_to_pm(tid, code)` (new) after
+          `report_task_exit_to_supervisor()`.  Kernel sends `KERNEL_OP_PM_TASK_EXITED = 0xDC`
+          with 16-byte LE payload (tid + exit_code) to PM's registered endpoint.
+          `set_pm_task_exit_endpoint_for_task(tid, recv_cap)` registers PM's recv endpoint.
+     - VFS dispatch added: `dispatch_pm_task_exited_push(opcode, payload, lifecycle, handles)` decodes
+       `PROC_OP_TASK_EXITED` and calls `handle_pm_task_exited`. PM decode helper:
+       `decode_kernel_pm_task_exited(opcode, payload)` for kernel→PM direction.
+     - 18 tests in `mod stage76_tests` + 12 tests in `mod stage77_vfs_tests` prove ABI codec,
+       handler dispatch, idempotency, pipeline, and gate status.
 2. **Live MAP_WRITE delivery** — ~~the Stage 60 gate must be removed~~ **ENABLED (Stage 72)**:
    the Stage 60 blanket WRITE gate has been removed from `syscall.rs`.  `recv_shared_v3` with
    `map_intent=0x3` now maps memory writably when the transferred cap carries `CAP_RIGHT_WRITE`.

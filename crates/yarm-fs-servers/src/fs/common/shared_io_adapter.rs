@@ -12,6 +12,9 @@ use super::shared_io_lifecycle::{
     VfsSharedIoDirection, VfsSharedIoHandleTable, VfsSharedIoLifecycle, VfsSharedIoLifecycleError,
     VfsSharedIoRequesterExitAction,
 };
+use yarm_ipc_abi::process_abi::{
+    KERNEL_OP_PM_TASK_EXITED, PROC_OP_TASK_EXITED, KernelPmTaskExitedPayload, PmTaskExitedEvent,
+};
 use yarm_ipc_abi::vfs_abi::{
     VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsReadSharedRequest,
     VfsSharedBufferDescriptor, VfsWriteSharedRequest,
@@ -62,36 +65,29 @@ pub const VFS_SHARED_IO_ENABLED: bool =
 /// and `deliver_requester_exit_if_tid_matches` dispatches by TID with safe no-op on mismatch.
 pub const VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
 
-/// Stage 76: PM → VFS task-exit notification channel (PM-owned lifecycle authority).
+/// Stage 77+78: PM → VFS task-exit notification channel (PM-owned lifecycle authority).
 ///
-/// `false` (Stage 76): not yet wired. Two missing infrastructure pieces block enabling:
+/// `true` (Stage 77+78): both blockers from Stage 76 are now resolved:
 ///
-/// 1. **No PM→VFS send cap**: PM and VFS are isolated at the cap level. No
-///    `pm_to_vfs_task_exit_send_cap` exists in the startup handoff (`StartupContext`
-///    slots 0–17 are fully allocated).  A new cap distribution slot or a runtime
-///    cap-delegation mechanism must be added before PM can push events to VFS.
-///    Specifically: init's `CoreServiceHandles` would need a `pm_vfs_notify_send_cap` field,
-///    and VFS's service loop a dedicated recv arm for `PROC_OP_TASK_EXITED` messages.
+/// 1. **PM→VFS send cap RESOLVED**: PM already has `vfs_send_cap` via
+///    `lifecycle_table.get_by_image_id(6).pm_service_send_cap` (image_id=6 = VFS).
+///    PM can send `PROC_OP_TASK_EXITED` to VFS on this existing cap.
 ///
-/// 2. **PM does not receive kernel task-exit events**: the kernel sends
-///    `SUPERVISOR_OP_TASK_EXITED` only to the supervisor endpoint (`faults.supervisor_endpoint`
-///    in `restart_state.rs`).  PM has no registered endpoint with the kernel and learns of
-///    exits only via `PROC_OP_WAITPID_V2` or `PROC_OP_LIFECYCLE_QUERY` polling.
-///    PM must be wired to receive kernel task-exit notifications before it can push
-///    `PROC_OP_TASK_EXITED` to VFS.
+/// 2. **Kernel→PM task-exit delivery RESOLVED**: `FaultSubsystem::pm_task_exit_endpoint`
+///    added in Stage 77+78. `exit_task()` calls `report_task_exit_to_pm()` after
+///    `report_task_exit_to_supervisor()`. Kernel sends `KERNEL_OP_PM_TASK_EXITED = 0xDC`
+///    (16-byte LE: tid+exit_code) to PM's registered endpoint. Tests prove end-to-end delivery.
 ///
-/// ABI contract is defined (Stage 76): `PROC_OP_TASK_EXITED = 13` and
-/// `PROC_OP_PROCESS_EXITED = 14` with [`PmTaskExitedEvent`] / [`PmProcessExitedEvent`]
-/// 16-byte LE payloads. VFS entry point is `handle_pm_task_exited`.
-pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = false;
+/// VFS dispatch entry point: `dispatch_pm_task_exited_push()` decodes `PROC_OP_TASK_EXITED`
+/// and calls `handle_pm_task_exited(tid, lifecycle, handles)`.
+pub const VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED: bool = true;
 
 /// Stage 76: VFS entry point for a PM-pushed `PROC_OP_TASK_EXITED` event.
 ///
-/// Gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` (currently `false`).
-/// When the gate is `false`, no production code path calls this function.
-/// Tests call it directly to prove the dispatch model is correct.
+/// Gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` (enabled in Stage 77+78).
+/// `dispatch_pm_task_exited_push()` decodes the wire message and calls this function.
+/// Tests may also call directly to exercise the per-lifecycle match logic.
 ///
-/// Dispatches to `deliver_requester_exit_if_tid_matches(tid, handles)` on the given lifecycle.
 /// Returns `NotMatched` if `tid` does not match `lifecycle.requester_tid()`.
 /// Returns `Matched(result)` on a TID match, where `result` is the cleanup outcome.
 pub fn handle_pm_task_exited<const N: usize>(
@@ -100,6 +96,54 @@ pub fn handle_pm_task_exited<const N: usize>(
     handles: &mut VfsSharedIoHandleTable<N>,
 ) -> Result<VfsSharedIoRequesterExitAction, VfsSharedIoLifecycleError> {
     lifecycle.deliver_requester_exit_if_tid_matches(tid, handles)
+}
+
+/// Errors returned by the VFS-side PM push dispatch functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsPmPushDispatchError {
+    /// Message opcode was not the expected push opcode.
+    WrongOpcode,
+    /// Payload too short to decode.
+    Malformed,
+}
+
+/// Stage 77+78: VFS-side dispatch for an incoming `PROC_OP_TASK_EXITED` push message.
+///
+/// Decodes the 16-byte `PmTaskExitedEvent` payload from `opcode` + `payload`, then calls
+/// `handle_pm_task_exited(tid, lifecycle, handles)`.  Returns `WrongOpcode` if `opcode !=
+/// PROC_OP_TASK_EXITED` and `Malformed` if the payload is too short.
+///
+/// Gated by `VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED` (now `true`).
+pub fn dispatch_pm_task_exited_push<const N: usize>(
+    opcode: u16,
+    payload: &[u8],
+    lifecycle: &mut VfsSharedIoLifecycle,
+    handles: &mut VfsSharedIoHandleTable<N>,
+) -> Result<VfsSharedIoRequesterExitAction, VfsPmPushDispatchError> {
+    if opcode != PROC_OP_TASK_EXITED {
+        return Err(VfsPmPushDispatchError::WrongOpcode);
+    }
+    let event =
+        PmTaskExitedEvent::decode(payload).map_err(|_| VfsPmPushDispatchError::Malformed)?;
+    handle_pm_task_exited(event.tid, lifecycle, handles)
+        .map_err(|_| VfsPmPushDispatchError::Malformed)
+}
+
+/// Stage 77+78: VFS-side decode for a kernel→PM `KERNEL_OP_PM_TASK_EXITED` message
+/// (arriving at PM's `pm_task_exit_endpoint`).
+///
+/// Returns the extracted `(tid, exit_code)` pair, or `Malformed` on payload error.
+/// PM calls this to decode the kernel push before forwarding to VFS via `PROC_OP_TASK_EXITED`.
+pub fn decode_kernel_pm_task_exited(
+    opcode: u16,
+    payload: &[u8],
+) -> Result<(u64, u64), VfsPmPushDispatchError> {
+    if opcode != KERNEL_OP_PM_TASK_EXITED {
+        return Err(VfsPmPushDispatchError::WrongOpcode);
+    }
+    let ev = KernelPmTaskExitedPayload::decode(payload)
+        .map_err(|_| VfsPmPushDispatchError::Malformed)?;
+    Ok((ev.tid, ev.exit_code))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -31351,3 +31351,252 @@ mod stage72 {
         );
     }
 }
+
+// ── Stage 77+78: kernel→PM task-exit notification ─────────────────────────────
+//
+// Tests for:
+//   A. `set_pm_task_exit_endpoint_for_task` — requires a RECEIVE cap; SEND rejected.
+//   B. `report_task_exit_to_pm` — delivers KERNEL_OP_PM_TASK_EXITED with correct payload.
+//   C. `exit_task` — fires pm_task_exit_endpoint alongside supervisor_endpoint.
+//   D. No notification when endpoint is unregistered (default None).
+//   E. `KernelPmTaskExitedPayload` encode/decode roundtrip.
+//   F. Opcode isolation: KERNEL_OP_PM_TASK_EXITED ≠ SUPERVISOR_OP_TASK_EXITED.
+//
+// Kernel hard invariants asserted here:
+//   - SYSCALL_COUNT = 31 (unchanged)
+//   - KERNEL_OP_PM_TASK_EXITED = 0xDC
+//   - Payload ENCODED_LEN = 16
+#[cfg(test)]
+mod stage77 {
+    use super::*;
+    use crate::kernel::boot::Bootstrap;
+    use yarm_ipc_abi::process_abi::{KERNEL_OP_PM_TASK_EXITED, KernelPmTaskExitedPayload};
+    use yarm_ipc_abi::supervisor_abi::SUPERVISOR_OP_TASK_EXITED;
+
+    // ── A. Registration ───────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_set_pm_task_exit_endpoint_requires_receive_cap() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register");
+        let (_eid, send_root, recv_root) = state.create_endpoint(4).expect("endpoint");
+        let send_cap = state
+            .grant_capability_task_to_task_with_rights(0, send_root, 1, CapRights::SEND)
+            .expect("grant send");
+        let recv_cap = state
+            .grant_capability_task_to_task_with_rights(0, recv_root, 1, CapRights::RECEIVE)
+            .expect("grant recv");
+        // SEND cap must be rejected.
+        assert!(
+            state
+                .set_pm_task_exit_endpoint_for_task(1, send_cap)
+                .is_err(),
+            "SEND cap must be rejected for pm_task_exit_endpoint"
+        );
+        // RECEIVE cap must succeed.
+        state
+            .set_pm_task_exit_endpoint_for_task(1, recv_cap)
+            .expect("RECEIVE cap must be accepted");
+    }
+
+    #[test]
+    fn stage77_set_pm_task_exit_endpoint_requires_existing_task() {
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, _send_root, recv_root) = state.create_endpoint(4).expect("endpoint");
+        // TID 99 not registered.
+        assert!(
+            state
+                .set_pm_task_exit_endpoint_for_task(99, CapId(recv_root.0))
+                .is_err(),
+            "unregistered TID must be rejected"
+        );
+    }
+
+    // ── B. Direct report ──────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_report_task_exit_to_pm_delivers_correct_opcode_and_tid() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register pm");
+        let (_eid, _send_root, recv_root) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task_with_rights(0, recv_root, 1, CapRights::RECEIVE)
+            .expect("grant recv");
+        state
+            .set_pm_task_exit_endpoint_for_task(1, recv_cap)
+            .expect("register");
+
+        state
+            .report_task_exit_to_pm(42, 7)
+            .expect("report must succeed");
+
+        let msg = state
+            .ipc_recv(recv_root)
+            .expect("recv ok")
+            .expect("message present");
+        assert_eq!(
+            msg.opcode, KERNEL_OP_PM_TASK_EXITED,
+            "opcode must be KERNEL_OP_PM_TASK_EXITED"
+        );
+        let ev =
+            KernelPmTaskExitedPayload::decode(msg.as_slice()).expect("payload must decode");
+        assert_eq!(ev.tid, 42, "tid mismatch");
+        assert_eq!(ev.exit_code, 7, "exit_code mismatch");
+    }
+
+    #[test]
+    fn stage77_report_task_exit_to_pm_noop_when_unregistered() {
+        let mut state = Bootstrap::init().expect("init");
+        // No endpoint registered; must silently succeed.
+        state
+            .report_task_exit_to_pm(99, 0)
+            .expect("noop must succeed when endpoint is None");
+    }
+
+    // ── C. exit_task fires both endpoints ────────────────────────────────────
+
+    #[test]
+    fn stage77_exit_task_fires_pm_task_exit_endpoint() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register pm");
+        state.register_task(5).expect("register target");
+
+        let (_eid, _send_root, recv_root) = state.create_endpoint(4).expect("endpoint");
+        let recv_cap = state
+            .grant_capability_task_to_task_with_rights(0, recv_root, 1, CapRights::RECEIVE)
+            .expect("grant recv");
+        state
+            .set_pm_task_exit_endpoint_for_task(1, recv_cap)
+            .expect("register pm endpoint");
+
+        state.exit_task(5, 99).expect("exit_task");
+
+        let msg = state
+            .ipc_recv(recv_root)
+            .expect("recv ok")
+            .expect("message must be queued for PM");
+        assert_eq!(msg.opcode, KERNEL_OP_PM_TASK_EXITED);
+        let ev = KernelPmTaskExitedPayload::decode(msg.as_slice()).expect("decode");
+        assert_eq!(ev.tid, 5);
+        assert_eq!(ev.exit_code, 99);
+    }
+
+    #[test]
+    fn stage77_exit_task_fires_supervisor_and_pm_endpoints_independently() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register pm");
+        state.register_task(2).expect("register supervisor");
+        state.register_task(5).expect("register target");
+
+        // PM endpoint.
+        let (_eid_pm, _pm_send, pm_recv_root) = state.create_endpoint(4).expect("pm endpoint");
+        let pm_recv_cap = state
+            .grant_capability_task_to_task_with_rights(0, pm_recv_root, 1, CapRights::RECEIVE)
+            .expect("grant pm recv");
+        state
+            .set_pm_task_exit_endpoint_for_task(1, pm_recv_cap)
+            .expect("register pm");
+
+        // Supervisor endpoint.
+        let (_eid_sv, _sv_send, sv_recv_root) = state.create_endpoint(4).expect("sv endpoint");
+        let sv_recv_cap = state
+            .grant_capability_task_to_task_with_rights(0, sv_recv_root, 2, CapRights::RECEIVE)
+            .expect("grant sv recv");
+        state
+            .set_supervisor_endpoint_for_task(2, sv_recv_cap)
+            .expect("register supervisor");
+
+        state.exit_task(5, 11).expect("exit_task");
+
+        let pm_msg = state
+            .ipc_recv(pm_recv_root)
+            .expect("pm recv ok")
+            .expect("pm message queued");
+        assert_eq!(pm_msg.opcode, KERNEL_OP_PM_TASK_EXITED);
+
+        let sv_msg = state
+            .ipc_recv(sv_recv_root)
+            .expect("sv recv ok")
+            .expect("sv message queued");
+        assert_eq!(sv_msg.opcode, SUPERVISOR_OP_TASK_EXITED);
+    }
+
+    #[test]
+    fn stage77_exit_task_noop_pm_when_endpoint_not_registered() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(5).expect("register target");
+        // No PM endpoint registered; exit_task must succeed without error.
+        state.exit_task(5, 0).expect("exit_task must succeed");
+    }
+
+    // ── D. Payload codec ─────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_kernel_pm_task_exited_payload_encode_decode_roundtrip() {
+        let ev = KernelPmTaskExitedPayload::new(0xDEAD_BEEF_1234_5678, 0xCAFE_BABE_0000_0001);
+        let encoded = ev.encode();
+        assert_eq!(encoded.len(), KernelPmTaskExitedPayload::ENCODED_LEN);
+        let decoded = KernelPmTaskExitedPayload::decode(&encoded).expect("decode");
+        assert_eq!(decoded.tid, ev.tid);
+        assert_eq!(decoded.exit_code, ev.exit_code);
+    }
+
+    #[test]
+    fn stage77_kernel_pm_task_exited_payload_le_byte_order() {
+        let ev = KernelPmTaskExitedPayload::new(0x0102_0304_0506_0708, 0x0A0B_0C0D_0E0F_1011);
+        let enc = ev.encode();
+        assert_eq!(&enc[..8], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_eq!(&enc[8..16], &[0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A]);
+    }
+
+    #[test]
+    fn stage77_kernel_pm_task_exited_payload_decode_rejects_short() {
+        assert!(
+            KernelPmTaskExitedPayload::decode(&[0u8; 15]).is_err(),
+            "15-byte payload must be rejected (need 16)"
+        );
+        assert!(
+            KernelPmTaskExitedPayload::decode(&[]).is_err(),
+            "empty payload must be rejected"
+        );
+        assert!(
+            KernelPmTaskExitedPayload::decode(&[0u8; 16]).is_ok(),
+            "16-byte payload must be accepted"
+        );
+    }
+
+    // ── E. Opcode isolation ───────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_kernel_op_pm_task_exited_is_0xdc() {
+        assert_eq!(KERNEL_OP_PM_TASK_EXITED, 0xDC);
+    }
+
+    #[test]
+    fn stage77_kernel_op_pm_task_exited_distinct_from_supervisor_op() {
+        assert_ne!(
+            KERNEL_OP_PM_TASK_EXITED,
+            SUPERVISOR_OP_TASK_EXITED,
+            "KERNEL_OP_PM_TASK_EXITED must not collide with SUPERVISOR_OP_TASK_EXITED"
+        );
+    }
+
+    #[test]
+    fn stage77_kernel_pm_task_exited_payload_encoded_len_is_16() {
+        assert_eq!(KernelPmTaskExitedPayload::ENCODED_LEN, 16);
+    }
+
+    // ── F. Hard invariants ────────────────────────────────────────────────────
+
+    #[test]
+    fn stage77_syscall_count_unchanged() {
+        use crate::kernel::syscall::SYSCALL_COUNT;
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must remain 31");
+    }
+
+    #[test]
+    fn stage77_proc_op_task_exited_opcode_unchanged() {
+        use yarm_ipc_abi::process_abi::PROC_OP_TASK_EXITED;
+        assert_eq!(PROC_OP_TASK_EXITED, 13, "PROC_OP_TASK_EXITED must remain 13");
+    }
+}
