@@ -33,9 +33,10 @@ pub const INITRAMFS_BLKCACHE_PATH: &[u8] = b"/initramfs/sbin/blkcache_srv";
 pub const INITRAMFS_VIRTIO_BLK_PATH: &[u8] = b"/initramfs/sbin/virtio_blk_srv";
 pub const INITRAMFS_FAT_SRV_PATH: &[u8] = b"/initramfs/sbin/fat_srv";
 pub const INITRAMFS_RAMFS_SRV_PATH: &[u8] = b"/initramfs/sbin/ramfs_srv";
+pub const INITRAMFS_EXT4_SRV_PATH: &[u8] = b"/initramfs/sbin/ext4_srv";
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
-const MAX_INITRAMFS_INODES: usize = 13;
+const MAX_INITRAMFS_INODES: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InitramfsInode {
@@ -134,6 +135,10 @@ impl InitramfsBackend {
                     path: INITRAMFS_RAMFS_SRV_PATH,
                     file_len: 1536,
                 }),
+                Some(InitramfsInode {
+                    path: INITRAMFS_EXT4_SRV_PATH,
+                    file_len: 1536,
+                }),
             ],
             metrics: InitramfsMetrics {
                 open_count: 0,
@@ -171,6 +176,7 @@ impl InitramfsBackend {
                 b"sbin/virtio_blk_srv" => INITRAMFS_VIRTIO_BLK_PATH,
                 b"sbin/fat_srv" => INITRAMFS_FAT_SRV_PATH,
                 b"sbin/ramfs_srv" => INITRAMFS_RAMFS_SRV_PATH,
+                b"sbin/ext4_srv" => INITRAMFS_EXT4_SRV_PATH,
                 _ => continue,
             };
             if let Some(idx) = backend.lookup_slot(path) {

@@ -502,3 +502,162 @@ mod stage88_tests {
         assert_eq!(svc.handle(write), Err(VfsError::Unsupported));
     }
 }
+
+#[cfg(test)]
+mod stage89_tests {
+    use crate::fs::initramfs::archive::{
+        InitramfsBackend, INITRAMFS_EXT4_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH,
+    };
+    use crate::fs::common::vfs_ipc::VfsBackend;
+
+    // ── Root-cause fix: ext4_srv path is now registered in the inode table ──
+
+    #[test]
+    fn stage89_initramfs_ext4_srv_path_openable() {
+        let mut fs = InitramfsBackend::new(4096);
+        let fd = fs
+            .openat_path(INITRAMFS_EXT4_SRV_PATH)
+            .expect("ext4_srv path must be openable after Stage-89 fix");
+        assert!(fd >= 10, "fd must be a valid handle");
+    }
+
+    #[test]
+    fn stage89_initramfs_ext4_srv_statx_returns_nonzero_size() {
+        let mut fs = InitramfsBackend::new(4096);
+        let size = fs
+            .statx_path(INITRAMFS_EXT4_SRV_PATH)
+            .expect("ext4_srv statx must succeed");
+        assert!(size > 0, "ext4_srv inode must have nonzero file_len");
+    }
+
+    #[test]
+    fn stage89_initramfs_max_inodes_is_14() {
+        // Validates that the inode table was bumped to accommodate ext4_srv.
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("const MAX_INITRAMFS_INODES: usize = 14;"),
+            "MAX_INITRAMFS_INODES must be 14 after adding ext4_srv"
+        );
+    }
+
+    #[test]
+    fn stage89_initramfs_ext4_srv_path_constant_defined() {
+        assert_eq!(INITRAMFS_EXT4_SRV_PATH, b"/initramfs/sbin/ext4_srv");
+    }
+
+    #[test]
+    fn stage89_initramfs_cpio_match_includes_ext4_srv() {
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("b\"sbin/ext4_srv\" => INITRAMFS_EXT4_SRV_PATH"),
+            "from_cpio_newc match must include ext4_srv arm"
+        );
+    }
+
+    // ── Spawn cap-value invariants ─────────────────────────────────────────
+
+    #[test]
+    fn stage89_ext4_spawn_service_caps_all_zero() {
+        // ext4_srv spawn uses [0, 0, 0, 0] — no prefix word or metadata.
+        let init_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            init_src.contains("spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)"),
+            "ext4_srv spawn must use all-zero service_caps [0,0,0,0]"
+        );
+    }
+
+    #[test]
+    fn stage89_ramfs_spawn_cap0_is_zero_cap1_is_prefix_word() {
+        // RAMFS spawn encodes mount-prefix in cap1 (intentional, not corruption).
+        let init_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            init_src.contains("[0, ramfs_prefix_word, ramfs_meta_word, 0]"),
+            "RAMFS spawn must use cap0=0, cap1=ramfs_prefix_word (mount-config encoding)"
+        );
+    }
+
+    // ── Sequential spawn ordering ──────────────────────────────────────────
+
+    #[test]
+    fn stage89_optional_spawns_are_sequential_ramfs_before_ext4() {
+        let init_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let ramfs_pos = init_src
+            .find("INIT_RAMFS_SPAWN_BEGIN")
+            .expect("INIT_RAMFS_SPAWN_BEGIN must be present");
+        let ext4_pos = init_src
+            .find("INIT_EXT4_SPAWN_BEGIN")
+            .expect("INIT_EXT4_SPAWN_BEGIN must be present");
+        assert!(
+            ramfs_pos < ext4_pos,
+            "RAMFS spawn must appear before EXT4 spawn (sequential ordering)"
+        );
+    }
+
+    #[test]
+    fn stage89_ramfs_reply_decoded_before_ext4_spawn() {
+        // RAMFS spawn is guarded by `if let Some(...)` — reply is decoded
+        // before the ext4 spawn block begins. Verify source order.
+        let init_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let ramfs_ok_pos = init_src
+            .find("INIT_RAMFS_SPAWN_OK")
+            .expect("INIT_RAMFS_SPAWN_OK must be present");
+        let ext4_begin_pos = init_src
+            .find("INIT_EXT4_SPAWN_BEGIN")
+            .expect("INIT_EXT4_SPAWN_BEGIN must be present");
+        assert!(
+            ramfs_ok_pos < ext4_begin_pos,
+            "RAMFS reply (INIT_RAMFS_SPAWN_OK) must be decoded before EXT4 spawn begins"
+        );
+    }
+
+    // ── PM bad_fd_decode regression ───────────────────────────────────────
+
+    #[test]
+    fn stage89_pm_bad_fd_decode_log_includes_diagnostic_fields() {
+        let pm_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+        );
+        assert!(
+            pm_src.contains("reason=bad_fd_decode opcode="),
+            "PM bad_fd_decode log must include opcode field for diagnostics"
+        );
+        assert!(
+            pm_src.contains("payload_len="),
+            "PM bad_fd_decode log must include payload_len field for diagnostics"
+        );
+        assert!(
+            pm_src.contains("bytes=["),
+            "PM bad_fd_decode log must include raw bytes for diagnostics"
+        );
+    }
+
+    #[test]
+    fn stage89_pm_vfs_grant_ro_received_marker_present() {
+        let pm_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+        );
+        assert!(
+            pm_src.contains("PM_VFS_GRANT_RO_RECEIVED image_id="),
+            "PM must emit PM_VFS_GRANT_RO_RECEIVED marker after successful FILE_GRANT_RO"
+        );
+    }
+
+    // ── RAMFS path still works after ext4 inode addition ──────────────────
+
+    #[test]
+    fn stage89_initramfs_ramfs_srv_path_still_openable() {
+        let mut fs = InitramfsBackend::new(4096);
+        let fd = fs
+            .openat_path(INITRAMFS_RAMFS_SRV_PATH)
+            .expect("ramfs_srv path must remain openable after inode table expansion");
+        assert!(fd >= 10);
+    }
+}
