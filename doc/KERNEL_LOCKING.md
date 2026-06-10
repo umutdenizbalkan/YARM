@@ -12094,3 +12094,48 @@ as `report_task_exit_to_supervisor`. No new lock ordering introduced.
 - No startup slots added or changed; STARTUP_SLOT_COUNT = 18 (unchanged)
 - 340 yarm-fs-servers tests pass (325 Stage 77+78 + 15 Stage 78)
 - 15 kernel-side Stage 77+78 tests in `mod stage77` in `tests.rs`
+
+## Stage 83: `RecvV3SharedIoMapper` RAMFS byte-access proof
+
+No kernel-side locking changes.  All work is in `yarm-fs-servers`.
+
+### 83.1 Mapper status
+
+`RecvV3SharedIoMapper` (Stage 79) is the production `VfsSharedIoMapper`.  It holds:
+- `cleanup_token: u64` — from recv_shared_v3 delivery
+- `mapped_base: u64` — kernel VA (or heap buffer in tests) of the shared region
+- `page_rounded_mapped_len: u64` — mapping length
+- `actual_mapping_perm: u32` — `1` = RO, `3` = RW
+- `released: bool` — at-most-once release guard
+
+`release` sets the flag before calling `release_v3_cleanup_token` (NR 4); the syscall
+failing in hosted-dev does not prevent `is_released()` from returning `true`.
+
+### 83.2 Unsafe boundary
+
+`with_write_request_buffer` calls `core::slice::from_raw_parts(ptr, len)`.
+`with_read_reply_buffer` calls `core::slice::from_raw_parts_mut(ptr as *mut u8, len)`.
+Preconditions checked before pointer arithmetic:
+- `released == false`
+- descriptor direction and handle/generation match cleanup_token
+- `actual_mapping_perm` has the required bit(s)
+- `buffer_offset + requested_len <= page_rounded_mapped_len`
+
+Stage 83 tests use a real heap `Vec<u8>` as `mapped_base`; the slice creation is defined.
+
+### 83.3 Production routing status
+
+`handle_request` still rejects `VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_READ_SHARED_REPLY`
+with `VfsError::Unsupported`.  `UnsupportedSharedIoMapper` remains the production default.
+FAT, ext4, and blkcache are unaffected.
+
+### 83.4 Invariants preserved
+
+- SYSCALL_COUNT = 31 (no change)
+- `VFS_WRITE_SHARED_REQUEST_ENABLED = true` (unchanged)
+- `VFS_READ_SHARED_REPLY_ENABLED = true` (unchanged)
+- `VFS_SHARED_IO_ENABLED = true` (unchanged)
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
+- `handle_request` still rejects shared opcodes
+- No startup slots changed; STARTUP_SLOT_COUNT = 18
+- 392 yarm-fs-servers tests pass (368 prior + 24 Stage 83)

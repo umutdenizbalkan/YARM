@@ -1164,3 +1164,57 @@ Kernel-internal wrappers that synthesize a syscall trap and need to observe deni
 
 **Invariants preserved:** syscall numbers, `SYSCALL_COUNT`, `SpawnV5` ABI, Phase2B/Phase3B
 semantics, CPIO/ALIGN_PROOF artifacts, VFS shared-I/O opcodes — all unchanged.
+
+---
+
+## Stage 83: `RecvV3SharedIoMapper` RAMFS-only byte-access proof
+
+**Mapper status:** `RecvV3SharedIoMapper` (implemented in Stage 79) is the first production
+`VfsSharedIoMapper`.  It is constructed from `RecvSharedV3Delivery` or raw fields, validates
+delivery metadata before constructing byte slices, and calls `release_v3_cleanup_token` exactly
+once (at-most-once flag set before the syscall call).
+
+**Byte-access blocker lifted (Stage 83):** Stage 79 tests used a fake VA constant as `mapped_base`
+and covered only error paths that fail before `from_raw_parts`.  Stage 83 supplies a real
+heap-allocated `Vec<u8>` as `mapped_base` in tests.  The unsafe slice construction is defined and
+byte content is directly observable.
+
+**WRITE_SHARED_REQUEST proof (Stage 83):**
+- MAP_READ delivery (`actual_mapping_perm = 1`).
+- Heap backing pre-filled with content; `with_write_request_buffer` reads via `from_raw_parts`.
+- `dispatch_write_shared_request` passes bytes to `RamFsBackend::write_shared_bytes`.
+- RAMFS file content verified to match backing bytes after dispatch.
+- `mapper.is_released() == true` after dispatch (release called exactly once).
+- Backend error path also releases mapper (`dispatch_write_shared_request` uses `let _ = release`).
+
+**READ_SHARED_REPLY proof (Stage 83):**
+- MAP_READ|MAP_WRITE delivery (`actual_mapping_perm = 3`).
+- `with_read_reply_buffer` provides `&mut [u8]` via `from_raw_parts_mut` to RAMFS.
+- `RamFsBackend::read_shared_bytes` writes file bytes into the mutable slice.
+- After dispatch, `backing[..n]` contains RAMFS file content.
+- Short-EOF: 4-byte file with 8-byte request → `bytes_completed = 4`.
+- `mapper.is_released() == true` after dispatch.
+
+**`handle_request` routing unchanged:** Both `VFS_OP_WRITE_SHARED_REQUEST` and
+`VFS_OP_READ_SHARED_REPLY` remain `VfsError::Unsupported` in live `handle_request`.
+`UnsupportedSharedIoMapper` is still the production default.
+
+**FAT/ext4/blkcache unchanged:** Stage 83 touches only `RecvV3SharedIoMapper` proof tests and
+documentation.  FAT, ext4, and blkcache production behavior is unaffected.
+
+**Remaining blockers before default `handle_request` routing:**
+1. VFS service loop integration: `handle_request` must decode shared-opcode messages and construct
+   a `RecvV3SharedIoMapper` from the recv_shared_v3 delivery that preceded the opcode.
+2. Per-request lifecycle store: `VfsService` needs a bounded lifecycle/handle table keyed by
+   requester TID for `RequesterExit` tracking.
+3. Supervisor task-exit notification: `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED` remains
+   `false` (blocked on supervisor→VFS endpoint wiring).
+
+**Gate tests:** `cargo test -p yarm-fs-servers --lib stage83` (24 tests, 19 in `vfs_service.rs`,
+5 in `shared_io_adapter.rs`).
+
+**Unsafe boundary:** `core::slice::from_raw_parts[_mut]` in `RecvV3SharedIoMapper::with_write_request_buffer`
+and `with_read_reply_buffer`.  Safety preconditions: `mapped_base` is nonzero and valid for the
+mapped length; range checked before pointer arithmetic; write bit verified for `_mut` variant;
+`released` flag ensures at-most-once access.  Unsafe is isolated to these two methods and documented
+inline.

@@ -4557,3 +4557,42 @@ entries does not enable live spawning.
 - `stage81a_optional_fs_core_profile_still_disabled`
 
 **Run:** `cargo test --lib --features hosted-dev stage81b`
+
+
+---
+
+## Rule N+76 — Stage 83: `RecvV3SharedIoMapper` byte-access proof uses real heap backing
+
+**Applies to:** `crates/yarm-fs-servers/src/fs/common/shared_io_adapter.rs` and `vfs_service.rs`.
+
+**Rule:** Tests for `RecvV3SharedIoMapper` byte access MUST use a real heap-allocated buffer
+(e.g. `vec![0u8; N]`) as `mapped_base`, not a fake VA constant.  Using a fake VA with
+`core::slice::from_raw_parts[_mut]` is undefined behaviour.  Error-path tests that reject
+before slice creation may use any non-zero `u64` constant.
+
+**Pattern:**
+```rust
+let mut backing = vec![0u8; 4096];
+let ptr = backing.as_ptr() as u64;         // or as_mut_ptr() for READ_SHARED_REPLY
+let mut mapper = RecvV3SharedIoMapper::from_fields(token, ptr, 4096, perm);
+// ... dispatch call ...
+// backing bytes are observable after dispatch (no live &mut [u8] exists)
+```
+
+**Release in hosted-dev:** `release_v3_cleanup_token` calls Linux NR 4 (`write`) with
+`cleanup_token` as fd (invalid) → EBADF → `Err(ReleaseFailure)`.  The `released` flag is set
+**before** the syscall, so `is_released()` returns `true`.  `dispatch_*` ignores release errors
+with `let _ = mapper.release(descriptor)`.  Tests verify `mapper.is_released() == true`, not the
+release return value.
+
+**Gate tests:**
+- `stage83_write_shared_request_recv_v3_mapper_byte_proof`
+- `stage83_read_shared_reply_recv_v3_mapper_byte_proof`
+- `stage83_write_shared_request_release_exactly_once`
+- `stage83_read_shared_reply_release_exactly_once`
+- `stage83_write_shared_request_backend_error_releases_mapper`
+- `stage83_read_shared_reply_backend_error_releases_mapper`
+- `stage83_read_shared_reply_short_eof_reports_exact_bytes_read`
+- Plus 7 negative tests and 1 gate regression.
+
+**Run:** `cargo test -p yarm-fs-servers --lib stage83`
