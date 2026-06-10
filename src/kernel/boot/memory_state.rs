@@ -6,7 +6,9 @@ use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::topology::CpuBitmap;
-use crate::kernel::vm::{Asid, Mapping, MappingEntry, PageFlags, PhysAddr, VirtAddr, VmError};
+use crate::kernel::vm::{
+    Asid, Mapping, MappingEntry, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SIZE,
+};
 
 impl KernelState {
     fn begin_live_tlb_shootdown_wait(&mut self, requester: CpuId, targets: CpuBitmap) -> u64 {
@@ -303,9 +305,13 @@ impl KernelState {
         }
 
         // Reclaim physical frames after shootdown work items have been queued.
-        for mapping in drained.into_iter().flatten() {
-            self.note_mapping_removed(mapping.phys);
-            self.reclaim_memory_object_for_phys(mapping.phys);
+        // Each DrainedMapping entry may cover multiple contiguous pages; reclaim all.
+        for dm in drained.into_iter().flatten() {
+            for page in 0..dm.pages {
+                let phys = PhysAddr(dm.mapping.phys.0 + (page as u64 * PAGE_SIZE as u64));
+                self.note_mapping_removed(phys);
+                self.reclaim_memory_object_for_phys(phys);
+            }
         }
 
         Ok(())
@@ -913,12 +919,11 @@ impl KernelState {
             return Err(KernelError::MissingRight);
         }
         let unmapped = self.with_user_spaces_mut(|spaces| {
-            Ok::<_, KernelError>(
-                spaces
-                    .get_mut(asid)
-                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
-                    .unmap_page(virt),
-            )
+            spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                .unmap_page(virt)
+                .map_err(KernelError::Vm)
         })?;
         if let Some(mapping) = unmapped {
             self.clear_cow_page(asid, virt);
@@ -935,12 +940,11 @@ impl KernelState {
         virt: VirtAddr,
     ) -> Result<Option<Mapping>, KernelError> {
         let unmapped = self.with_user_spaces_mut(|spaces| {
-            Ok::<_, KernelError>(
-                spaces
-                    .get_mut(asid)
-                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
-                    .unmap_page(virt),
-            )
+            spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                .unmap_page(virt)
+                .map_err(KernelError::Vm)
         })?;
         if let Some(mapping) = unmapped {
             self.clear_cow_page(asid, virt);
@@ -984,12 +988,11 @@ impl KernelState {
         virt: VirtAddr,
     ) -> Result<Option<super::TlbShootdownWaitPlan>, KernelError> {
         let unmapped = self.with_user_spaces_mut(|spaces| {
-            Ok::<_, KernelError>(
-                spaces
-                    .get_mut(asid)
-                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?
-                    .unmap_page(virt),
-            )
+            spaces
+                .get_mut(asid)
+                .ok_or(KernelError::Vm(VmError::InvalidAsid))?
+                .unmap_page(virt)
+                .map_err(KernelError::Vm)
         })?;
         let Some(mapping) = unmapped else {
             return Ok(None);
