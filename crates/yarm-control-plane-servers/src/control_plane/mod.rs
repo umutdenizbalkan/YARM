@@ -224,17 +224,18 @@ mod tests {
     #[test]
     fn stage80_init_spawns_ext4_srv_with_image_id_12() {
         let init_src = include_str!("init/service.rs");
+        // The ext4 spawn code exists inside the INIT_SPAWN_OPTIONAL_FS_SERVERS gate.
         assert!(
             init_src.contains("spawn_v5_cap(pm_send, pm_recv, 12,"),
-            "init run() must spawn ext4_srv with image_id=12"
+            "init run() must contain ext4_srv spawn with image_id=12 (inside optional gate)"
         );
         assert!(
             init_src.contains("INIT_EXT4_SPAWN_BEGIN"),
-            "init must log INIT_EXT4_SPAWN_BEGIN before spawning ext4_srv"
+            "init must contain INIT_EXT4_SPAWN_BEGIN (inside optional gate)"
         );
         assert!(
             init_src.contains("EXT4_SRV_READY"),
-            "init must log EXT4_SRV_READY after successful ext4_srv spawn"
+            "init must contain EXT4_SRV_READY (inside optional gate)"
         );
     }
 
@@ -266,16 +267,84 @@ mod tests {
 
     #[test]
     fn stage80_syscall_count_unchanged() {
-        // SYSCALL_COUNT=31 is in src/kernel/syscall.rs. Verify by checking the
-        // kernel boot tests which document the invariant in their comments.
-        // This test inspects the PM source, which references the 31-syscall count
-        // only indirectly; direct kernel tests are in src/kernel/boot/tests.rs.
-        // The count is verified here by asserting no new syscall tables were added
-        // in PM service.rs during Stage 80.
         let pm_src = include_str!("process_manager/service.rs");
         assert!(
             !pm_src.contains("SYSCALL_COUNT = 32"),
             "SYSCALL_COUNT must remain 31; Stage 80 must not add syscalls"
+        );
+    }
+
+    // ── Stage 80R/81: optional FS profile gating ─────────────────────────────
+
+    #[test]
+    fn stage81_optional_fs_spawn_disabled_in_core_profile() {
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("const INIT_SPAWN_OPTIONAL_FS_SERVERS: bool = false;"),
+            "core profile must have INIT_SPAWN_OPTIONAL_FS_SERVERS = false"
+        );
+    }
+
+    #[test]
+    fn stage81_optional_fs_skipped_markers_present() {
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled"),
+            "init must emit INIT_RAMFS_SPAWN_SKIPPED when optional FS is disabled"
+        );
+        assert!(
+            init_src.contains("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled"),
+            "init must emit INIT_FAT_SPAWN_SKIPPED when optional FS is disabled"
+        );
+        assert!(
+            init_src.contains("INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled"),
+            "init must emit INIT_EXT4_SPAWN_SKIPPED when optional FS is disabled"
+        );
+    }
+
+    #[test]
+    fn stage81_core_spawn_order_driver_manager_before_optional_fs() {
+        let init_src = include_str!("init/service.rs");
+        let dm_pos = init_src
+            .find("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_BEGIN")
+            .expect("INIT_DRIVER_MANAGER_SPAWN_V5_CALL_BEGIN must be present");
+        let optional_pos = init_src
+            .find("INIT_SPAWN_OPTIONAL_FS_SERVERS")
+            .expect("INIT_SPAWN_OPTIONAL_FS_SERVERS must be present");
+        assert!(
+            dm_pos < optional_pos,
+            "driver_manager spawn must appear before optional FS section in init/service.rs"
+        );
+    }
+
+    #[test]
+    fn stage81_kernel_spawn_path_table_blocker_documented() {
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("spawn_image_path_for_image_id"),
+            "init/service.rs must document the kernel spawn_image_path_for_image_id blocker"
+        );
+        assert!(
+            init_src.contains("SyscallError::InvalidArgs"),
+            "init/service.rs must document the InvalidArgs failure from the kernel path table"
+        );
+    }
+
+    #[test]
+    fn stage81_optional_fs_spawn_code_gates_not_direct_spawns() {
+        let init_src = include_str!("init/service.rs");
+        // INIT_RAMFS_SPAWN_BEGIN must only appear inside the INIT_SPAWN_OPTIONAL_FS_SERVERS gate.
+        // Verify by checking that INIT_SPAWN_OPTIONAL_FS_SERVERS appears before
+        // INIT_RAMFS_SPAWN_BEGIN in the source.
+        let gate_pos = init_src
+            .find("INIT_SPAWN_OPTIONAL_FS_SERVERS")
+            .expect("INIT_SPAWN_OPTIONAL_FS_SERVERS gate must be present");
+        let ramfs_begin_pos = init_src
+            .find("INIT_RAMFS_SPAWN_BEGIN")
+            .expect("INIT_RAMFS_SPAWN_BEGIN must be present inside optional gate");
+        assert!(
+            gate_pos < ramfs_begin_pos,
+            "INIT_RAMFS_SPAWN_BEGIN must appear after INIT_SPAWN_OPTIONAL_FS_SERVERS gate declaration"
         );
     }
 }
