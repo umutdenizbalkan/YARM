@@ -400,20 +400,21 @@ fn register_ramfs_mount_with_vfs(
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=ipc-call");
         return false;
     }
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) };
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) };
     let Ok(Some(reply_msg)) = reply else {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=no-reply");
         return false;
     };
-    if reply_msg.as_slice().len() < 4 {
+    let reply_payload = reply_msg.message.as_slice();
+    if reply_payload.len() < 4 {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_RAMFS_ERR reason=short-reply");
         return false;
     }
     let status = u32::from_le_bytes([
-        reply_msg.as_slice()[0],
-        reply_msg.as_slice()[1],
-        reply_msg.as_slice()[2],
-        reply_msg.as_slice()[3],
+        reply_payload[0],
+        reply_payload[1],
+        reply_payload[2],
+        reply_payload[3],
     ]);
     if status == VFS_MOUNT_STATUS_OK {
         yarm_user_rt::user_log!(
@@ -458,20 +459,21 @@ fn register_fat_mount_with_vfs(
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=ipc-call");
         return false;
     }
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) };
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) };
     let Ok(Some(reply_msg)) = reply else {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=no-reply");
         return false;
     };
-    if reply_msg.as_slice().len() < 4 {
+    let reply_payload = reply_msg.message.as_slice();
+    if reply_payload.len() < 4 {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_FAT_ERR reason=short-reply");
         return false;
     }
     let status = u32::from_le_bytes([
-        reply_msg.as_slice()[0],
-        reply_msg.as_slice()[1],
-        reply_msg.as_slice()[2],
-        reply_msg.as_slice()[3],
+        reply_payload[0],
+        reply_payload[1],
+        reply_payload[2],
+        reply_payload[3],
     ]);
     if status == VFS_MOUNT_STATUS_OK {
         yarm_user_rt::user_log!(
@@ -511,20 +513,21 @@ fn register_ext4_mount_with_vfs(
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=ipc-call");
         return false;
     }
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) };
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) };
     let Ok(Some(reply_msg)) = reply else {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=no-reply");
         return false;
     };
-    if reply_msg.as_slice().len() < 4 {
+    let reply_payload = reply_msg.message.as_slice();
+    if reply_payload.len() < 4 {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=short-reply");
         return false;
     }
     let status = u32::from_le_bytes([
-        reply_msg.as_slice()[0],
-        reply_msg.as_slice()[1],
-        reply_msg.as_slice()[2],
-        reply_msg.as_slice()[3],
+        reply_payload[0],
+        reply_payload[1],
+        reply_payload[2],
+        reply_payload[3],
     ]);
     if status == VFS_MOUNT_STATUS_OK {
         yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4");
@@ -862,13 +865,17 @@ pub fn run() {
                 yarm_fs_servers::ramfs::RAMFS_DEFAULT_MAX_BYTES as u32,
             )
             .unwrap_or_else(RamFsMountConfig::default_compat);
-            let (ramfs_prefix_word, ramfs_meta_word) = ramfs_mount_config.encode_startup_words();
+            // Stage 91: service_caps positions 1-3 must be zero for RAMFS.
+            // Passing config words (ramfs_prefix_word, ramfs_meta_word) in non-zero slots
+            // causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL: the kernel treats every non-zero
+            // service_caps entry as a capability ID to delegate into the child cspace.
+            // RAMFS falls back to default_compat (prefix=/ram) when config slots are zeroed.
             yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_BEGIN");
             if let Some((ramfs_child_tid, init_ramfs_send_cap)) = spawn_v5_cap(
                 pm_send,
                 pm_recv,
                 11,
-                [0, ramfs_prefix_word, ramfs_meta_word, 0],
+                [0, 0, 0, 0],
                 1,
             ) {
                 yarm_user_rt::user_log!(
@@ -896,13 +903,17 @@ pub fn run() {
         if INIT_SPAWN_FAT_SRV {
             let fat_mount_config =
                 FatMountConfig::new(b"/fat", 1, true).unwrap_or_else(FatMountConfig::default_compat);
-            let (fat_prefix_word, fat_meta_word) = fat_mount_config.encode_startup_words();
+            // Stage 91: only position 0 (blkcache cap) is a real capability.
+            // Passing fat_prefix_word/fat_meta_word in positions 1-2 causes
+            // KSPAWN_EXTRA_CAP_DELEGATE_FAIL — the kernel treats all non-zero
+            // service_caps entries as cap IDs to delegate. FAT srv reads its
+            // mount config from protocol messages, not startup slots.
             yarm_user_rt::user_log!("INIT_FAT_SPAWN_BEGIN");
             if let Some((fat_child_tid, init_fat_send_cap)) = spawn_v5_cap(
                 pm_send,
                 pm_recv,
                 10,
-                [init_blkcache_send_cap, fat_prefix_word, fat_meta_word, 0],
+                [init_blkcache_send_cap, 0, 0, 0],
                 1,
             ) {
                 yarm_user_rt::user_log!(

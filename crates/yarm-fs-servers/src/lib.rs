@@ -723,15 +723,15 @@ mod stage88_tests {
 
     #[test]
     fn stage88_fat_handoff_blkcache_cap_passed_in_spawn() {
-        // FAT cap handoff audit: init already passes init_blkcache_send_cap to fat_srv
-        // via service_extra_cap_0 at spawn time. This proves the cap handoff design is correct
-        // even though INIT_SPAWN_FAT_SRV remains false (no virtio_blk in hosted-dev).
+        // FAT cap handoff audit: init passes init_blkcache_send_cap to fat_srv via
+        // service_extra_cap_0 (position 0) at spawn time. Positions 1-3 must be zero —
+        // passing encoded mount-config words causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL.
         let src = include_str!(
             "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
         );
         assert!(
-            src.contains("[init_blkcache_send_cap, fat_prefix_word, fat_meta_word, 0]"),
-            "FAT spawn must pass init_blkcache_send_cap as service_extra_cap_0 (block-device handoff)"
+            src.contains("[init_blkcache_send_cap, 0, 0, 0]"),
+            "FAT spawn must pass init_blkcache_send_cap at position 0 only; positions 1-3 must be zero"
         );
         assert!(
             src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
@@ -860,13 +860,29 @@ mod stage89_tests {
 
     #[test]
     fn stage89_ramfs_spawn_cap0_is_zero_cap1_is_prefix_word() {
-        // RAMFS spawn encodes mount-prefix in cap1 (intentional, not corruption).
+        // Stage 91 fix: RAMFS spawn must use all-zero service_caps [0,0,0,0].
+        // Passing encoded config words (prefix_word, meta_word) in positions 1-2
+        // causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL — the kernel treats every non-zero
+        // service_caps entry as a cap ID. RAMFS falls back to default_compat (prefix=/ram).
         let init_src = include_str!(
             "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
         );
+        // Verify RAMFS spawn does NOT pass config words as cap slots.
         assert!(
-            init_src.contains("[0, ramfs_prefix_word, ramfs_meta_word, 0]"),
-            "RAMFS spawn must use cap0=0, cap1=ramfs_prefix_word (mount-config encoding)"
+            !init_src.contains("[0, ramfs_prefix_word, ramfs_meta_word, 0]"),
+            "RAMFS spawn must NOT use ramfs_prefix_word/ramfs_meta_word as service_caps (causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL)"
+        );
+        // Verify RAMFS spawn uses all-zero service_caps between RAMFS_SPAWN_BEGIN and RAMFS_SPAWN_OK.
+        let spawn_begin = init_src
+            .find("INIT_RAMFS_SPAWN_BEGIN")
+            .expect("INIT_RAMFS_SPAWN_BEGIN must be present");
+        let spawn_ok = init_src[spawn_begin..]
+            .find("INIT_RAMFS_SPAWN_OK")
+            .map(|off| spawn_begin + off)
+            .expect("INIT_RAMFS_SPAWN_OK must follow INIT_RAMFS_SPAWN_BEGIN");
+        assert!(
+            init_src[spawn_begin..spawn_ok].contains("[0, 0, 0, 0]"),
+            "RAMFS spawn must use all-zero service_caps [0,0,0,0]"
         );
     }
 
@@ -1221,14 +1237,20 @@ mod stage91_tests {
         let src = include_str!(
             "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
         );
-        // The function must exist and use a dedicated reply_recv_cap parameter.
+        // The function must exist and use blocking ipc_recv_v2 on the dedicated reply_recv_cap.
+        // Non-blocking ipc_recv_with_deadline(reply_recv_cap, 0) left stale VFS mount-status
+        // replies (4 bytes) on pm_recv, poisoning the next spawn's 16-byte SpawnV5 reply read.
         assert!(
             src.contains("fn register_ext4_mount_with_vfs("),
             "init/service.rs must define register_ext4_mount_with_vfs"
         );
         assert!(
-            src.contains("ipc_recv_with_deadline(reply_recv_cap"),
-            "register_ext4_mount_with_vfs must use ipc_recv_with_deadline(reply_recv_cap ...) not pm_recv"
+            src.contains("ipc_recv_v2(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must use blocking ipc_recv_v2(reply_recv_cap) not non-blocking deadline=0 poll"
+        );
+        assert!(
+            !src.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must NOT use non-blocking ipc_recv_with_deadline on reply_recv_cap"
         );
     }
 
@@ -1663,5 +1685,59 @@ mod stage91_tests {
             src.contains("const INIT_SPAWN_FAT_SRV: bool = false;"),
             "INIT_SPAWN_FAT_SRV must be false (no virtio_blk block device in default profile)"
         );
+    }
+
+    // ── Spawn/VFS reply size-mismatch proof ───────────────────────────────────
+
+    #[test]
+    fn stage91_vfs_mount_status_reply_size_differs_from_spawn_v5_result_size() {
+        // Proves that a VFS mount-status reply (4 bytes: u32 status) cannot be
+        // mistaken for a SpawnV5 reply (16 bytes: u64 pid + u64 service_send_cap).
+        // If register_*_mount_with_vfs uses a non-blocking poll (deadline=0) on
+        // reply_recv_cap, a delayed VFS mount-status reply may be left on pm_recv.
+        // The next spawn's ipc_recv_v2(pm_recv) picks up that 4-byte payload —
+        // SpawnV5CapResult::decode checks payload.len() == 16, fails (bad_len),
+        // and the spawn returns None (INIT_*_SPAWN_FAIL).
+        // Fix: all register functions must use blocking ipc_recv_v2(reply_recv_cap).
+        const VFS_MOUNT_STATUS_REPLY_BYTES: usize = core::mem::size_of::<u32>();
+        const SPAWN_V5_RESULT_BYTES: usize = 16; // pid: u64 + service_send_cap: u64
+        assert_ne!(
+            VFS_MOUNT_STATUS_REPLY_BYTES, SPAWN_V5_RESULT_BYTES,
+            "VFS mount-status reply and SpawnV5 result must have different sizes"
+        );
+        assert_eq!(VFS_MOUNT_STATUS_REPLY_BYTES, 4, "VFS mount-status is a u32 (4 bytes)");
+        assert_eq!(SPAWN_V5_RESULT_BYTES, 16, "SpawnV5 result is pid:u64 + cap:u64 (16 bytes)");
+    }
+
+    #[test]
+    fn stage91_no_blocking_recv_on_wrong_cap_in_register_functions() {
+        // Source-scan: none of the three register_*_mount_with_vfs functions may use
+        // ipc_recv_with_deadline (non-blocking) to receive the VFS mount-register reply.
+        // All must use ipc_recv_v2 (blocking) on reply_recv_cap.
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        for fn_name in &[
+            "fn register_ramfs_mount_with_vfs(",
+            "fn register_fat_mount_with_vfs(",
+            "fn register_ext4_mount_with_vfs(",
+        ] {
+            let fn_start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("{fn_name} must be defined in init/service.rs"));
+            let after_fn = &src[fn_start + 1..];
+            let fn_off = after_fn.find("\nfn ").unwrap_or(usize::MAX);
+            let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
+            let fn_body_end = fn_start + 1 + fn_off.min(pub_fn_off);
+            let fn_text = &src[fn_start..fn_body_end];
+            assert!(
+                fn_text.contains("ipc_recv_v2(reply_recv_cap"),
+                "{fn_name} must use blocking ipc_recv_v2(reply_recv_cap)"
+            );
+            assert!(
+                !fn_text.contains("ipc_recv_with_deadline(reply_recv_cap"),
+                "{fn_name} must NOT use non-blocking ipc_recv_with_deadline on reply_recv_cap"
+            );
+        }
     }
 }
