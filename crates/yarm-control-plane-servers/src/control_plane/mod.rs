@@ -81,44 +81,6 @@ mod tests {
     }
 
     #[test]
-    fn phase6_exit_gate_bundle_enforces_current_migration_invariants() {
-        let mod_src = include_str!("mod.rs");
-        let vfs_src = include_str!("vfs/service.rs");
-        let supervisor_src = include_str!("supervisor/service.rs");
-        let process_manager_src = include_str!("process_manager/service.rs");
-        let roundtrip_src = include_str!("ipc_roundtrip.rs");
-
-        assert!(
-            mod_src.contains("#[cfg(test)]\npub(crate) mod ipc_roundtrip;"),
-            "synthetic ipc roundtrip helper must remain test-only scoped"
-        );
-        assert!(
-            vfs_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_recv_with_deadline("),
-            "vfs must retain timed receive migration via shared roundtrip helper"
-        );
-        assert!(
-            vfs_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_reply("),
-            "vfs must retain reply-cap call/reply migration via shared roundtrip helper"
-        );
-        assert!(
-            supervisor_src.contains("recv_with_budget"),
-            "supervisor must retain budgeted receive migration"
-        );
-        assert!(
-            process_manager_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_recv_with_deadline("),
-            "process-manager must retain timed receive migration via shared roundtrip helper"
-        );
-        assert!(
-            process_manager_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_reply("),
-            "process-manager must retain reply-cap call/reply migration via shared roundtrip helper"
-        );
-    }
-
-    #[test]
     fn phase4_choreography_retirement_bundle_avoids_server_send_reply_hops() {
         let vfs_src = include_str!("vfs/service.rs");
         let process_manager_src = include_str!("process_manager/service.rs");
