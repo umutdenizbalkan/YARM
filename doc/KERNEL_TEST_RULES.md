@@ -5082,3 +5082,66 @@ labels present; Stage 100 FS gates unchanged.
 
 **Run:** `cargo test --lib stage102` and the full
 `cargo test --lib -- --test-threads=1`.
+
+---
+
+## Stage 103 — D1 cap-transfer recv split scaffold (helper-only)
+
+Stage 103 added the Phase A / B / C scaffold for the D1 cap-transfer recv
+split as **helper-only / default-off**. No live behavior change. See
+`doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §12` for the full record.
+
+New module: `src/kernel/cap_transfer_split.rs` — declared in
+`src/kernel/mod.rs` as `pub mod cap_transfer_split;`. Exposes:
+`CapTransferRecvClass`, `CapTransferRecvSnapshot`,
+`CapTransferMaterializeOutcome`, `CapTransferSplitResult`,
+`phase_a_take_transfer_envelope`, `phase_b_materialize_transfer_cap`,
+`materialize_split_transfer_cap_equivalent`.
+
+**Test rules introduced by the scaffold:**
+
+1. **Helper-only invariant.** The Stage 103 scaffold entry points must NOT
+   be referenced from `syscall.rs`, `runtime.rs`, or any other live trap /
+   syscall code path. The source-scan test
+   `stage103_helper_only_no_live_call_sites` enforces this. If a future PR
+   needs to live-wire, it must:
+   - delete this assertion in the same PR,
+   - replace it with a smoke-gated live-wire test, and
+   - include x86_64 `-smp 1` smoke (MUST_SMOKE).
+2. **Equivalence proof is the live-wire prerequisite.** Any change to
+   `materialize_received_transfer_cap` (the global-lock path) or to the
+   helper itself must keep
+   `stage103_equivalence_split_matches_direct_take_plus_grant` passing. The
+   test is the live-wire contract.
+3. **Reply-cap remains fallback.** Tests must continue to assert
+   `CapTransferSplitResult::FallbackRequired` for `FLAG_REPLY_CAP` messages
+   AND that the envelope is not consumed by the helper in that case. This
+   protects the global-lock fallback's preconditions.
+4. **Validation labels are load-bearing.** `D1_HELPER_ONLY`,
+   `D1_DEFAULT_OFF`, `FALLBACK_GLOBAL_LOCK` text in the module is asserted
+   by `stage103_validation_labels_present`. Removing labels without
+   migrating their assertions is a hard regression.
+
+**Test groups (kernel::cap_transfer_split::tests Stage 103 — 14 tests):**
+
+1. `stage103_classify_plain_message_returns_none`
+2. `stage103_classify_transfer_message`
+3. `stage103_classify_transfer_plain_message`
+4. `stage103_classify_reply_cap_message_not_d1_supported`
+5. `stage103_phase_a_consumes_envelope_and_captures_rights`
+6. `stage103_phase_a_rejects_endpoint_mismatch`
+7. `stage103_phase_b_mints_attenuated_cap_in_receiver_cnode`
+8. `stage103_equivalence_split_matches_direct_take_plus_grant`
+9. `stage103_equivalence_plain_message_returns_none`
+10. `stage103_equivalence_reply_cap_message_returns_fallback_required`
+11. `stage103_equivalence_no_envelope_returns_invalid_capability`
+12. `stage103_helper_only_no_live_call_sites`
+13. `stage103_validation_labels_present`
+14. `stage103_kernel_err_mapping_is_unchanged`
+
+**Invariants unchanged from Stage 102:** SYSCALL_COUNT = 31; NR 30
+RecvSharedV3 routed; NR 8 split whitelist intact; Stage 101 validation
+labels present; Stage 100 FS gates unchanged.
+
+**Run:** `cargo test --lib stage103` and the full
+`cargo test --lib -- --test-threads=1`.
