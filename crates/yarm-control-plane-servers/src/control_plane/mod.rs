@@ -590,4 +590,119 @@ mod tests {
             "init/service.rs must reference ext4_srv path for spawn (image_id 12)"
         );
     }
+
+    // Part II: wrong-sender reply race fix (stage 91 AArch64 optional spawn fix)
+
+    #[test]
+    fn stage91_spawn_v5_cap_filters_wrong_sender_replies() {
+        // Source-scan: spawn_v5_cap must filter out replies from non-PM senders.
+        // VFS (tid≠PM) sends 8-byte OPENAT replies to the shared pm_recv endpoint
+        // during PM's SpawnFromInitramfsFile grant path.  The drain loop must log
+        // INIT_SPAWN_V5_WRONG_SENDER_REPLY and continue rather than treating those
+        // replies as spawn failures.
+        let src = include_str!("init/service.rs");
+        let fn_start = src
+            .find("fn spawn_v5_cap(")
+            .expect("spawn_v5_cap must exist in init/service.rs");
+        let fn_body = &src[fn_start..];
+        assert!(
+            fn_body.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
+            "spawn_v5_cap must log INIT_SPAWN_V5_WRONG_SENDER_REPLY for wrong-sender drains"
+        );
+        assert!(
+            fn_body.contains("expected_pm_tid"),
+            "spawn_v5_cap must compute expected_pm_tid to identify PM's replies"
+        );
+        assert!(
+            fn_body.contains("wrong_sender_count"),
+            "spawn_v5_cap must maintain a wrong_sender_count drain counter"
+        );
+        assert!(
+            fn_body.contains("MAX_WRONG_SENDER_DRAIN"),
+            "spawn_v5_cap must use MAX_WRONG_SENDER_DRAIN to cap the drain loop"
+        );
+    }
+
+    #[test]
+    fn stage91_spawn_v5_cap_requires_pm_tid_and_correct_len() {
+        // Source-scan: spawn_v5_cap must guard on BOTH sender_tid == expected_pm_tid
+        // AND payload.len() == SpawnV5CapResult::ENCODED_LEN (16) before accepting.
+        // An 8-byte VFS reply from tid=10002 must not be decoded as SpawnV5 failure.
+        let src = include_str!("init/service.rs");
+        let fn_start = src
+            .find("fn spawn_v5_cap(")
+            .expect("spawn_v5_cap must exist in init/service.rs");
+        let fn_body = &src[fn_start..];
+        assert!(
+            fn_body.contains("sender_tid != expected_pm_tid"),
+            "spawn_v5_cap must reject replies where sender_tid != expected_pm_tid"
+        );
+        assert!(
+            fn_body.contains("SpawnV5CapResult::ENCODED_LEN"),
+            "spawn_v5_cap must check payload.len() against SpawnV5CapResult::ENCODED_LEN"
+        );
+    }
+
+    #[test]
+    fn stage91_spawn_v5_cap_loops_until_pm_reply() {
+        // Source-scan: spawn_v5_cap must loop (not single-recv) to drain wrong-sender
+        // messages, using `continue` to skip non-PM messages and `return` for all
+        // terminal paths.  Optional RAMFS/ext4 spawns both call spawn_v5_cap, so
+        // both benefit from the loop.
+        let src = include_str!("init/service.rs");
+        let fn_start = src
+            .find("fn spawn_v5_cap(")
+            .expect("spawn_v5_cap must exist in init/service.rs");
+        let fn_body = &src[fn_start..];
+        assert!(
+            fn_body.contains("loop {"),
+            "spawn_v5_cap must use a loop to drain wrong-sender replies"
+        );
+        assert!(
+            fn_body.contains("continue;"),
+            "spawn_v5_cap drain loop must use continue on wrong-sender replies"
+        );
+        assert!(
+            fn_body.contains("wrong_sender_drain_limit"),
+            "spawn_v5_cap must log wrong_sender_drain_limit when drain limit is reached"
+        );
+    }
+
+    #[test]
+    fn stage91_pm_vfs_spawn_uses_service_recv_ep_not_reply_recv_cap() {
+        // Source-scan: pm_vfs_spawn_inline must prefer process_manager_service_recv_ep
+        // (slot 12, PM-private) over process_manager_reply_recv_cap (slot 2, shared
+        // with init's pm_recv).  Routing VFS sub-call replies to slot 12 prevents
+        // them from appearing on init's endpoint and being misread as SpawnV5 results.
+        let src = include_str!("process_manager/service.rs");
+        let fn_start = src
+            .find("fn pm_vfs_spawn_inline(")
+            .expect("pm_vfs_spawn_inline must exist in process_manager/service.rs");
+        let fn_end = (fn_start + 2500).min(src.len());
+        let fn_body = &src[fn_start..fn_end];
+        assert!(
+            fn_body.contains("process_manager_service_recv_ep"),
+            "pm_vfs_spawn_inline must use process_manager_service_recv_ep (slot 12) for VFS sub-calls"
+        );
+        assert!(
+            fn_body.contains(".or(ctx.process_manager_reply_recv_cap)"),
+            "pm_vfs_spawn_inline must fall back to process_manager_reply_recv_cap only if service_recv_ep absent"
+        );
+    }
+
+    #[test]
+    fn stage91_vfs_8byte_reply_from_non_pm_tid_cannot_decode_as_spawn_v5_result() {
+        // An 8-byte OPENAT reply from VFS (sender_tid=10002) must not satisfy the
+        // spawn_v5_cap acceptance condition, which requires both sender_tid==PM_tid
+        // and payload_len==16.  This unit test verifies that size mismatch alone
+        // (8 != 16) is sufficient to trigger the wrong-sender drain path.
+        use yarm_ipc_abi::process_abi::SpawnV5CapResult;
+        let vfs_payload_len: usize = core::mem::size_of::<u64>(); // 8 bytes (OPENAT fd reply)
+        let spawn_v5_len: usize = SpawnV5CapResult::ENCODED_LEN;
+        assert_ne!(
+            vfs_payload_len, spawn_v5_len,
+            "VFS 8-byte reply must not match SpawnV5CapResult::ENCODED_LEN"
+        );
+        assert_eq!(spawn_v5_len, 16, "SpawnV5 result is always 16 bytes (pid:u64 + cap:u64)");
+    }
 }

@@ -1470,9 +1470,18 @@ unsafe fn pm_vfs_spawn_inline(
         parent_pid
     );
     let ctx = yarm_user_rt::runtime::startup_context();
+    // Prefer PM-private service recv ep (slot 12) so VFS sub-call replies do not
+    // land on init's shared pm_recv (slot 2), which would be received by init as a
+    // spurious SpawnV5 reply and cause INIT_RAMFS/EXT4_SPAWN_FAIL.
     let reply_recv_cap = ctx
-        .process_manager_reply_recv_cap
+        .process_manager_service_recv_ep
+        .or(ctx.process_manager_reply_recv_cap)
         .ok_or(ProcessManagerError::Unsupported)?;
+    if ctx.process_manager_service_recv_ep.is_none() {
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_REPLY_CAP_FALLBACK reason=no_service_recv_ep using_slot=2"
+        );
+    }
     yarm_user_rt::user_log!(
         "PM_VFS_CAPS send_cap={} reply_cap={}",
         vfs_send_cap,

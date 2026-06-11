@@ -284,84 +284,102 @@ fn spawn_v5_cap(
     };
     // SAFETY: Uses kernel-provided startup caps for PM IPC request.
     let _ = unsafe { yarm_user_rt::syscall::ipc_call(pm_send, pm_recv, &msg) };
-    yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_BEGIN cap={}", pm_recv);
-    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(pm_recv) };
-    match reply {
-        Ok(Some(received)) => {
-            let r = received.message;
-            let payload = r.as_slice();
-            yarm_user_rt::user_log!(
-                "INIT_SPAWN_V5_REPLY_RECV_OK status=na sender_tid={} payload_len={} opcode={} flags={}",
-                received.sender_tid,
-                payload.len(),
-                r.opcode,
-                r.flags
-            );
-            yarm_user_rt::user_log!(
-                "INIT_SPAWN_V5_REPLY_RECV_BYTES len={} bytes={:x?}",
-                payload.len(),
-                payload
-            );
-            yarm_user_rt::user_log!(
-                "INIT_SPAWN_V5_REPLY_DECODE_INPUT len={} bytes={:x?}",
-                payload.len(),
-                payload
-            );
-            if payload.len() != SpawnV5CapResult::ENCODED_LEN {
+    // PM tid is deterministically init_tid + 2 (init=1, supervisor=2, PM=3).
+    let expected_pm_tid = yarm_user_rt::runtime::startup_context().task_id + 2;
+    const MAX_WRONG_SENDER_DRAIN: usize = 16;
+    let mut wrong_sender_count: usize = 0;
+    loop {
+        yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_BEGIN cap={}", pm_recv);
+        let reply = unsafe { yarm_user_rt::syscall::ipc_recv_v2(pm_recv) };
+        match reply {
+            Ok(Some(received)) => {
+                let r = received.message;
+                let payload = r.as_slice();
                 yarm_user_rt::user_log!(
-                    "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=bad_len expected={} got={}",
-                    SpawnV5CapResult::ENCODED_LEN,
-                    payload.len()
+                    "INIT_SPAWN_V5_REPLY_RECV_OK status=na sender_tid={} payload_len={} opcode={} flags={}",
+                    received.sender_tid,
+                    payload.len(),
+                    r.opcode,
+                    r.flags
                 );
                 yarm_user_rt::user_log!(
-                    "INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=bad_len expected={} got={}",
-                    SpawnV5CapResult::ENCODED_LEN,
-                    payload.len()
+                    "INIT_SPAWN_V5_REPLY_RECV_BYTES len={} bytes={:x?}",
+                    payload.len(),
+                    payload
                 );
-                return None;
-            }
-            yarm_user_rt::user_log!(
-                "INIT_SPAWN_V5_REPLY_RECV len={} opcode={} flags={} bytes={:x?}",
-                r.len,
-                r.opcode,
-                r.flags,
-                payload
-            );
-            match decode_spawn_v5_reply(payload) {
-                Ok(result) => {
-                    if !spawn_v5_reply_is_success(result.pid, result.service_send_cap) {
+                yarm_user_rt::user_log!(
+                    "INIT_SPAWN_V5_REPLY_DECODE_INPUT len={} bytes={:x?}",
+                    payload.len(),
+                    payload
+                );
+                if received.sender_tid != expected_pm_tid
+                    || payload.len() != SpawnV5CapResult::ENCODED_LEN
+                {
+                    wrong_sender_count = wrong_sender_count.saturating_add(1);
+                    yarm_user_rt::user_log!(
+                        "INIT_SPAWN_V5_WRONG_SENDER_REPLY sender_tid={} payload_len={} expected_tid={} expected_len={} drain={}",
+                        received.sender_tid,
+                        payload.len(),
+                        expected_pm_tid,
+                        SpawnV5CapResult::ENCODED_LEN,
+                        wrong_sender_count
+                    );
+                    if wrong_sender_count >= MAX_WRONG_SENDER_DRAIN {
                         yarm_user_rt::user_log!(
-                            "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=zero_pid"
-                        );
-                        yarm_user_rt::user_log!(
-                            "INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=zero_pid"
+                            "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=wrong_sender_drain_limit drain={}",
+                            wrong_sender_count
                         );
                         return None;
                     }
-                    yarm_user_rt::user_log!(
-                        "INIT_SPAWN_V5_REPLY_DECODE ok=1 child_tid={}",
-                        result.pid
-                    );
-                    Some((result.pid, result.service_send_cap))
+                    continue;
                 }
-                Err(_) => {
-                    yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=decode_err");
-                    yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
-                    None
+                yarm_user_rt::user_log!(
+                    "INIT_SPAWN_V5_REPLY_RECV len={} opcode={} flags={} bytes={:x?}",
+                    r.len,
+                    r.opcode,
+                    r.flags,
+                    payload
+                );
+                match decode_spawn_v5_reply(payload) {
+                    Ok(result) => {
+                        if !spawn_v5_reply_is_success(result.pid, result.service_send_cap) {
+                            yarm_user_rt::user_log!(
+                                "INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0 reason=zero_pid"
+                            );
+                            yarm_user_rt::user_log!(
+                                "INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=zero_pid"
+                            );
+                            return None;
+                        }
+                        yarm_user_rt::user_log!(
+                            "INIT_SPAWN_V5_REPLY_DECODE ok=1 child_tid={}",
+                            result.pid
+                        );
+                        return Some((result.pid, result.service_send_cap));
+                    }
+                    Err(_) => {
+                        yarm_user_rt::user_log!(
+                            "INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=decode_err"
+                        );
+                        yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
+                        return None;
+                    }
                 }
             }
-        }
-        Ok(None) => {
-            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_ERR err=WouldBlockOrNoMessage");
-            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=recv_none");
-            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
-            None
-        }
-        Err(err) => {
-            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_ERR err={:?}", err);
-            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=recv_err");
-            yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
-            None
+            Ok(None) => {
+                yarm_user_rt::user_log!(
+                    "INIT_SPAWN_V5_REPLY_RECV_ERR err=WouldBlockOrNoMessage"
+                );
+                yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=recv_none");
+                yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
+                return None;
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_ERR err={:?}", err);
+                yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=recv_err");
+                yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
+                return None;
+            }
         }
     }
 }
