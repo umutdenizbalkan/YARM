@@ -587,4 +587,88 @@ mod tests {
         let (cap, _) = table.route(b"/dev/null").expect("/dev/null still routes");
         assert_eq!(cap, 20);
     }
+
+    // ── Stage 88: ext4 live read-only VFS route ──────────────────────────────
+
+    fn make_stage88_table() -> VfsMountTable {
+        // Stage 88: ext4 is dynamically registered after ext4_srv spawns successfully.
+        // Represents the VFS mount table state after INIT_EXT4_SPAWN_OK + VFS_MOUNT_REGISTER_EXT4_OK.
+        //   /initramfs/ → initramfs_srv (cap=10, static)
+        //   /dev/       → devfs_srv     (cap=20, static)
+        //   /ram/       → ramfs_srv     (cap=30, dynamic)
+        //   /ext4/      → ext4_srv      (cap=50, dynamic, readonly flags=1)
+        let mut table = make_boot_table();
+        table
+            .insert_dynamic(b"/ext4", 50, 1)
+            .expect("ext4 dynamic mount (Stage 88)");
+        table
+    }
+
+    #[test]
+    fn stage88_routing_ext4_dynamically_registered_routes_root() {
+        let table = make_stage88_table();
+        let (cap, _) = table.route(b"/ext4").expect("/ext4 must route after registration");
+        assert_eq!(cap, 50);
+    }
+
+    #[test]
+    fn stage88_routing_ext4_file_paths_route_to_ext4srv() {
+        let table = make_stage88_table();
+        let (cap, _) = table
+            .route(b"/ext4/file.bin")
+            .expect("/ext4/file.bin must route to ext4_srv");
+        assert_eq!(cap, 50);
+        let (cap, _) = table
+            .route(b"/ext4/service.bin")
+            .expect("/ext4/service.bin must route to ext4_srv");
+        assert_eq!(cap, 50);
+        let (cap, _) = table
+            .route(b"/ext4/oversize.bin")
+            .expect("/ext4/oversize.bin must route to ext4_srv");
+        assert_eq!(cap, 50);
+    }
+
+    #[test]
+    fn stage88_routing_ext4_does_not_shadow_other_mounts() {
+        let table = make_stage88_table();
+        // /dev still routes to devfs (cap=20).
+        let (cap, _) = table.route(b"/dev/null").expect("/dev/null must still route");
+        assert_eq!(cap, 20);
+        // /ram still routes to ramfs (cap=30).
+        let (cap, _) = table.route(b"/ram/file.txt").expect("/ram/file.txt must still route");
+        assert_eq!(cap, 30);
+        // /initramfs still routes to initramfs_srv (cap=10).
+        let (cap, _) = table
+            .route(b"/initramfs/boot-marker")
+            .expect("/initramfs/boot-marker must still route");
+        assert_eq!(cap, 10);
+    }
+
+    #[test]
+    fn stage88_routing_fat_still_absent_in_stage88_table() {
+        // FAT remains disabled (INIT_SPAWN_FAT_SRV=false, needs virtio_blk).
+        let table = make_stage88_table();
+        assert!(
+            table.route(b"/fat").is_none(),
+            "/fat must remain unroutable (FAT spawn disabled)"
+        );
+        assert!(
+            table.route(b"/fat/hello.txt").is_none(),
+            "/fat/hello.txt must remain unroutable"
+        );
+    }
+
+    #[test]
+    fn stage88_routing_ext4_absent_before_dynamic_registration() {
+        // Before ext4_srv spawns and registers, /ext4 is not in the table.
+        let table = make_boot_table();
+        assert!(
+            table.route(b"/ext4").is_none(),
+            "/ext4 must be absent from boot table before dynamic registration"
+        );
+        assert!(
+            table.route(b"/ext4/file.bin").is_none(),
+            "/ext4/file.bin must be absent before registration"
+        );
+    }
 }

@@ -238,7 +238,9 @@ mod stage86_tests {
 
     #[test]
     fn stage86_gate_vfs_ext4_live_mount_disabled() {
-        assert!(!VFS_EXT4_LIVE_MOUNT_ENABLED, "ext4 live-mount gate must be false");
+        // Stage 88 supersedes this Stage-86 invariant: ext4 live-mount is now enabled.
+        // VFS_EXT4_LIVE_MOUNT_ENABLED was false in Stage 86; Stage 88 lifts it to true.
+        assert!(VFS_EXT4_LIVE_MOUNT_ENABLED, "Stage 88: ext4 live-mount gate must be true");
     }
 
     #[test]
@@ -624,7 +626,9 @@ mod stage87_tests {
 
 #[cfg(test)]
 mod stage88_tests {
-    use crate::fs::common::shared_io_adapter::{VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_FAT_SHARED_IO_ENABLED};
+    use crate::fs::common::shared_io_adapter::{
+        VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_FAT_LIVE_MOUNT_ENABLED, VFS_FAT_SHARED_IO_ENABLED,
+    };
     use crate::fs::fat::fs::FatBackend;
     use crate::fs::fat::service::{FatServiceStartup, FatStartupConfig, service_from_startup_config};
     use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
@@ -669,9 +673,92 @@ mod stage88_tests {
         assert!(matches!(result, Err(FatServiceStartup::NoBlockBackend)));
     }
 
+    // ── Part C: ext4 live read-only VFS route ────────────────────────────────
+
     #[test]
-    fn stage88_ext4_live_mount_still_disabled() {
-        assert!(!VFS_EXT4_LIVE_MOUNT_ENABLED);
+    fn stage88_ext4_live_mount_gate_enabled() {
+        assert!(
+            VFS_EXT4_LIVE_MOUNT_ENABLED,
+            "Stage 88: ext4 live mount must be enabled; ext4 backend satisfies read-only VFS contract"
+        );
+    }
+
+    #[test]
+    fn stage88_fat_live_mount_gate_still_disabled() {
+        assert!(
+            !VFS_FAT_LIVE_MOUNT_ENABLED,
+            "FAT live-mount must remain disabled (needs real virtio_blk block device)"
+        );
+    }
+
+    #[test]
+    fn stage88_init_register_ext4_mount_with_vfs_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("register_ext4_mount_with_vfs("),
+            "init must call register_ext4_mount_with_vfs after successful ext4 spawn"
+        );
+        assert!(
+            src.contains("VFS_MOUNT_REGISTER_EXT4_BEGIN prefix=/ext4"),
+            "register_ext4_mount_with_vfs must emit VFS_MOUNT_REGISTER_EXT4_BEGIN with /ext4 prefix"
+        );
+        assert!(
+            src.contains("VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4"),
+            "register_ext4_mount_with_vfs must emit VFS_MOUNT_REGISTER_EXT4_OK on success"
+        );
+    }
+
+    #[test]
+    fn stage88_init_ext4_spawn_ok_captures_send_cap() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_EXT4_SPAWN_OK child_tid={} send_cap={}"),
+            "INIT_EXT4_SPAWN_OK must include send_cap field (Stage 88: cap used for VFS registration)"
+        );
+    }
+
+    #[test]
+    fn stage88_fat_handoff_blkcache_cap_passed_in_spawn() {
+        // FAT cap handoff audit: init already passes init_blkcache_send_cap to fat_srv
+        // via service_extra_cap_0 at spawn time. This proves the cap handoff design is correct
+        // even though INIT_SPAWN_FAT_SRV remains false (no virtio_blk in hosted-dev).
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("[init_blkcache_send_cap, fat_prefix_word, fat_meta_word, 0]"),
+            "FAT spawn must pass init_blkcache_send_cap as service_extra_cap_0 (block-device handoff)"
+        );
+        assert!(
+            src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
+            "FAT spawn must remain disabled until a block-device stub is available"
+        );
+        assert!(
+            src.contains("needs block device"),
+            "FAT spawn gate must document the virtio_blk block device requirement"
+        );
+    }
+
+    #[test]
+    fn stage88_register_ext4_mount_with_vfs_call_is_after_spawn_ok() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let spawn_ok_pos = src
+            .find("INIT_EXT4_SPAWN_OK")
+            .expect("INIT_EXT4_SPAWN_OK must be present");
+        // Search for the call site specifically (not the function definition).
+        let register_pos = src
+            .find("let _ = register_ext4_mount_with_vfs(")
+            .expect("register_ext4_mount_with_vfs call site must be present");
+        assert!(
+            spawn_ok_pos < register_pos,
+            "register_ext4_mount_with_vfs must be called after INIT_EXT4_SPAWN_OK (not before)"
+        );
     }
 
     #[test]

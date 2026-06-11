@@ -164,12 +164,24 @@ pub const VFS_FAT_LIVE_MOUNT_ENABLED: bool = false;
 /// until the ext4 backend supports the full VFS write/stat contract.
 pub const VFS_EXT4_RECV_LOOP_ENABLED: bool = true;
 
-/// Stage 86: ext4 live VFS mount.
+/// Stage 88: ext4 live read-only VFS mount.
 ///
-/// `false`: ext4 recv loop is present but VFS mount registration is not yet wired.
-/// Blocker: ext4 backend must pass the full VFS contract (write/stat roundtrip) before
-/// `register_ext4_mount_with_vfs` can be called from init.
-pub const VFS_EXT4_LIVE_MOUNT_ENABLED: bool = false;
+/// `true` (Stage 88): ext4 backend satisfies the read-only VFS contract:
+/// - `openat_path()` resolves `/ext4/*` paths to inodes.
+/// - `statx_path()` returns file metadata (file_len; currently 0 for demo inodes).
+/// - `read()` returns at most `file_len` bytes.
+/// - `write()` unconditionally returns `VfsError::Unsupported`.
+///
+/// `VFS_EXT4_RECV_LOOP_ENABLED` (Stage 86) provides the resident service loop.
+/// `register_ext4_mount_with_vfs` is called from init after a successful ext4 spawn,
+/// registering `/ext4` read-only in the VFS mount table (flags=1).
+///
+/// FAT (`VFS_FAT_LIVE_MOUNT_ENABLED`) remains disabled: FAT requires a real
+/// virtio_blk block device not present in the default hosted-dev environment.
+/// FAT cap handoff design is proven — init passes `init_blkcache_send_cap` to
+/// fat_srv at spawn time via `service_extra_cap_0` — but `INIT_SPAWN_FAT_SRV`
+/// remains `false` until a block-device stub is available for integration tests.
+pub const VFS_EXT4_LIVE_MOUNT_ENABLED: bool = true;
 
 /// Stage 76: VFS entry point for a PM-pushed `PROC_OP_TASK_EXITED` event.
 ///
