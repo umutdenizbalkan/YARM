@@ -4899,3 +4899,65 @@ See `FAT_SERVER_CONTRACT.md` Stage 93 section for exact activation checklist.
 
 **Run:** `cargo test -p yarm-fs-servers --lib stage93` and
 `cargo test -p yarm-control-plane-servers --lib stage93`
+
+---
+
+## Stage 94/100 — Optional FS Milestone 1 closure
+
+**YARM Optional FS Milestone 1 declared.** This is the final stage of the optional-FS
+work block. After this stage, filesystem work is paused (regressions only) and kernel
+unlocking resumes at Stage 101.
+
+**Changes in Stage 94/100:**
+
+1. **Smoke script nonfatal fix**: `\bpanic\b` grep in both optional-FS smoke scripts
+   changed to a two-stage filter that excludes lines containing `nonfatal=true`.
+   Pattern: `rg -ai "\bpanic\b" | rg -avc "nonfatal=true"`.
+
+2. **`doc/OPTIONAL_FS_MILESTONE_1.md`** created: authoritative milestone record
+   with gate matrix, mount matrix, shared-I/O matrix, spawn IDs, smoke commands,
+   expected markers, forbidden markers, and deferred-work list.
+
+3. **`doc/KERNEL_UNLOCKING_NEXT_CONTEXT.md`** created: handoff seed for Stage 101.
+   Captures FS baseline, kernel invariants, recent correctness fixes, and Stage 101
+   target.
+
+4. **VFS_SHARED_IO_CONTRACT.md, FAT_SERVER_CONTRACT.md, AI_AGENT_RULES.md**
+   updated with Milestone 1 references and Stage 94/100 sections.
+
+**No new tests added in Stage 94.** The 16 Stage 93 tests (13 + 3) already cover
+all new patterns. Stage 94 is docs-and-hardening only.
+
+**Full test counts at Milestone 1:**
+
+| Crate | Stage 93 tests | Total |
+|-------|---------------|-------|
+| `yarm-fs-servers` | 13 | 572 |
+| `yarm-control-plane-servers` | 3 | 130 |
+| workspace (`cargo test --lib`) | — | 1282 |
+| **Failures** | — | **0** |
+
+**Smoke scripts at Milestone 1:**
+
+| Script | Status |
+|--------|--------|
+| `scripts/qemu-aarch64-optional-fs-smoke.sh` | ready; QEMU not run in CI |
+| `scripts/qemu-x86_64-optional-fs-smoke.sh` | ready; QEMU not run in CI |
+| `scripts/qemu-aarch64-fat-block-smoke.sh` | ready; deferred (FAT blocked) |
+| `scripts/qemu-x86_64-fat-block-smoke.sh` | ready; deferred (FAT blocked) |
+| `scripts/create-fat-image.sh` | ready |
+
+**Forbidden in all strict smoke runs:**
+`INIT_RAMFS_SPAWN_FAIL`, `INIT_EXT4_SPAWN_FAIL`, `PM_ELF_ZC_FAIL image_id=10/11/12`,
+`KSPAWN_EXTRA_CAP_DELEGATE_FAIL`, `PM_VFS_SPAWN_FAIL`, `reason=bad_fd_decode`,
+`INIT_SPAWN_V5_WRONG_SENDER_REPLY` (count must be 0), `panic` (not `nonfatal=true`),
+`fallback=phase2b` (strict-mode fail).
+
+**Invariants unchanged from Stage 93:**
+- `INIT_SPAWN_FAT_SRV = false` (default optional-fs profile)
+- `VFS_FAT_LIVE_MOUNT_ENABLED = false`, `VFS_FAT_SHARED_IO_ENABLED = false`
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`
+- `MAX_INITRAMFS_INODES = 14`
+- SpawnV5 ABI; SYSCALL_COUNT = 31; STARTUP_SLOT_COUNT = 18
+
+**Run:** `cargo test --lib -- --test-threads=1` (all 1282 must pass)

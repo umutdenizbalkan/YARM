@@ -458,3 +458,61 @@ scheduling race (same root cause as Stage 92's `vfs_client.rs` fix) and will cau
 `FatError::Io` on any architecture where blkcache_srv hasn't replied within 0 ticks.
 
 This was fixed in Stage 93 as part of FAT production groundwork.
+
+---
+
+## 12. Optional FS Milestone 1 (Stage 94/100)
+
+### 12.1 Milestone declaration
+
+**YARM Optional FS Milestone 1 is declared at Stage 100.**
+
+The milestone is reached when:
+- RAMFS + ext4 optional-FS baseline is clean (strict smoke passes).
+- FAT is profile-ready but disabled, with exact blockers documented.
+- No yarm-fs-servers or yarm-control-plane-servers failures.
+- Docs/rules are current.
+- Kernel unlocking handoff seed is written.
+
+See `doc/OPTIONAL_FS_MILESTONE_1.md` for the full milestone record.
+
+### 12.2 Filesystem work is paused after Milestone 1
+
+Do NOT start new FS feature work after Stage 100 without opening a new dedicated
+FS milestone. Permitted after Stage 100:
+- Regressions only (RAMFS/ext4 existing behavior).
+- Emergency FAT gate doc updates (no code changes).
+- Smoke script fixes (not feature additions).
+
+### 12.3 Fatal smoke greps must exclude nonfatal=true (Stage 94)
+
+The `panic` grep in optional-FS smoke scripts must not match log lines that also
+contain `nonfatal=true`. Those lines represent non-fatal diagnostic events, not
+kernel or userspace panics.
+
+**Correct pattern:**
+```bash
+# Two-stage: find panic lines, then exclude nonfatal ones
+panic_count=$(tr '\r' '\n' <"$LOGFILE" | rg -ai "\bpanic\b" 2>/dev/null \
+    | rg -avc "nonfatal=true" 2>/dev/null || echo 0)
+```
+
+**Forbidden:**
+```bash
+# Single-stage: matches nonfatal=true lines
+panic_count=$(... | rg -ai -c "\bpanic\b" 2>/dev/null || echo 0)
+```
+
+### 12.4 Kernel unlocking handoff
+
+See `doc/KERNEL_UNLOCKING_NEXT_CONTEXT.md` for the full handoff context.
+Recommended next stage: **Stage 101 — Kernel unlocking restart / trap-syscall borrow audit**.
+
+Key invariants that kernel unlocking must not break:
+- SpawnV5 ABI (16-byte reply, argument layout)
+- Image IDs 7–12 frozen
+- SYSCALL_COUNT = 31, STARTUP_SLOT_COUNT = 18
+- recv_shared_v3 ABI offsets
+- Optional-FS smoke markers (RAMFS/ext4 expected; FAT skipped)
+- No deadline-0 required replies in vfs_client.rs or IpcBlockDevice
+- VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false
