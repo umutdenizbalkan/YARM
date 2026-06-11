@@ -2146,6 +2146,59 @@ impl KernelState {
         });
     }
 
+    /// Stage 105 / D2 audit helper — atomic recv-waiter publish under
+    /// `ipc_state_lock` (rank 3) only.
+    ///
+    /// VALIDATION: D2_HELPER_ONLY — not called from any live path.
+    ///
+    /// Semantics:
+    /// - Returns `QueueNonEmpty` if the endpoint queue is non-empty (the
+    ///   caller must dequeue rather than block).
+    /// - Returns `ReceiverAlreadyWaiting` if `endpoint_waiters[idx]` is
+    ///   already set.
+    /// - Returns `InvalidEndpoint` for an out-of-range index or a vacant
+    ///   endpoint slot.
+    /// - Returns `Published` after writing
+    ///   `endpoint_waiters[idx] = Some(receiver_tid)`.
+    ///
+    /// All four outcomes are decided inside the same critical section as the
+    /// write, which is the contract the D2 live split would rely on: any
+    /// sender enqueuing AFTER `Published` is observed sees the waiter, and
+    /// any sender enqueuing BEFORE sees `None` and writes to the queue (which
+    /// flips this helper from `Published` to `QueueNonEmpty` on the next
+    /// attempt — i.e. the receiver is steered to dequeue, no wake lost).
+    pub(crate) fn try_publish_recv_waiter_audit_only(
+        &mut self,
+        endpoint_idx: usize,
+        receiver_tid: ThreadId,
+        recv_cap: CapId,
+    ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
+        use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+        self.with_ipc_state_mut(|ipc| {
+            if endpoint_idx >= ipc.endpoints.len() {
+                return PublishWaiterOutcome::InvalidEndpoint;
+            }
+            let endpoint = match ipc.endpoints[endpoint_idx].as_ref() {
+                Some(e) => e,
+                None => return PublishWaiterOutcome::InvalidEndpoint,
+            };
+            if endpoint.queued() > 0 {
+                return PublishWaiterOutcome::QueueNonEmpty;
+            }
+            if ipc.endpoint_waiters[endpoint_idx].is_some() {
+                return PublishWaiterOutcome::ReceiverAlreadyWaiting;
+            }
+            ipc.endpoint_waiters[endpoint_idx] = Some(receiver_tid);
+            crate::yarm_log!(
+                "D2_RECV_WAITER_PUBLISH_AUDIT endpoint={} tid={} recv_cap={}",
+                endpoint_idx,
+                receiver_tid.0,
+                recv_cap.0
+            );
+            PublishWaiterOutcome::Published
+        })
+    }
+
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
         if msg.opcode != PROC_OP_EXECUTE_RESTART {
             return Err(KernelError::WrongObject);

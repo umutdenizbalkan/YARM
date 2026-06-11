@@ -114,6 +114,40 @@ No types are flagged as **obsolete** at Stage 101.
 
 ---
 
+## 6.3 Stage 105 / Pass 2 — D2 IPC recv blocking precursor (helper-only)
+
+New module `src/kernel/recv_waiter_split.rs` exposes Phase 1 of the D2 split
+as helper-only scaffold:
+
+| Type / fn | Status (Stage 105) | Notes |
+|-----------|--------------------|-------|
+| `PublishWaiterPlan` | **helper-only** (`D2_HELPER_ONLY` / `D2_DEFAULT_OFF`) | Phase 1 plan: endpoint_idx, receiver_tid, recv_cap. |
+| `PublishWaiterOutcome` | **helper-only** | `Published` / `ReceiverAlreadyWaiting` / `QueueNonEmpty` / `InvalidEndpoint`. |
+| `try_publish_recv_waiter` | **helper-only** | Single rank-3 critical section; decides outcome and writes `endpoint_waiters[idx]` atomically. |
+| `KernelState::try_publish_recv_waiter_audit_only` | **helper-only** | Kernel-side primitive. Source-scan asserts no live-path caller. |
+
+The canonical `block_current_on_receive_with_deadline` already orders
+scheduler block (rank 1) → TCB transition (rank 2) → publish (rank 3)
+sequentially with no nested locks; D2's live unlock replaces the single
+`&mut KernelState` body with three SharedKernel split-mut closures. Pass 3
+prerequisites in audit doc §15.4.
+
+## 6.4 Stage 105 / Pass 2 — D5 reply-cap split status (LIVE for non-shared-region reply arm)
+
+The reply-cap recv materialization Phase A / B / B' / C engine lives in
+`src/kernel/cap_transfer_split.rs`, live-wired via
+`syscall.rs::materialize_received_message_cap_routed`. Phase B' uses the new
+fallible `KernelState::try_set_reply_cap_waiter_cap` and rolls back the mint
+on stale-record races. Labels: `D5_LIVE_SPLIT`, `FALLBACK_GLOBAL_LOCK`.
+**NOT SMOKE-ACCEPTED** until x86_64 `-smp 1` + optional-FS strict smoke run.
+
+| Path | D5 status (Stage 105) | Owner |
+|------|------------------------|-------|
+| `FLAG_REPLY_CAP` (non-shared-region) | **live** (`d5_split_reply_materializations`, `d5_split_reply_rollbacks` telemetry) | router → `materialize_split_reply_cap_equivalent` |
+| Reply-cap with `OPCODE_SHARED_MEM` | **fallback to global lock** | canonical `materialize_received_message_cap` reply arm |
+| Sender-waiter cap-transfer (any flag) | **fallback to global lock** | unchanged |
+| Legacy full recv path / NR 30 handler | **unrouted this pass** | canonical helper |
+
 ## 6.2 Stage 104 — D1 cap-transfer recv split status (LIVE for transfer arm)
 
 The cap-transfer materialization Phase A / B / C engine lives in
