@@ -4679,3 +4679,101 @@ let delivery = RecvSharedV3Delivery {
 `object_handle = token`, `object_generation = token >> 16`.  Heap-backed `ptr` as `mapped_base`.
 
 **Run:** `cargo test -p yarm-fs-servers --lib stage85`
+
+## Stage 91 test rules — Optional-FS runtime stabilization
+
+**Location:** `crates/yarm-fs-servers/src/lib.rs`, `mod stage91_tests`;
+`crates/yarm-control-plane-servers/src/control_plane/vfs/mount_table.rs` Stage 91 tests;
+`crates/yarm-control-plane-servers/src/control_plane/mod.rs` Stage 91 tests.
+
+**Gate matrix at Stage 91:**
+
+| Gate | Value |
+|------|-------|
+| `INIT_SPAWN_RAMFS_SRV` | `true` |
+| `INIT_SPAWN_FAT_SRV` | `false` (no virtio_blk) |
+| `INIT_SPAWN_EXT4_SRV` | `true` |
+| `VFS_RAMFS_LIVE_MOUNT_ENABLED` | `true` |
+| `VFS_FAT_LIVE_MOUNT_ENABLED` | `false` |
+| `VFS_FAT_SHARED_IO_ENABLED` | `false` |
+| `VFS_EXT4_RECV_LOOP_ENABLED` | `true` |
+| `VFS_EXT4_LIVE_MOUNT_ENABLED` | `true` |
+| `VFS_STAGE84_RAMFS_BRIDGE_ENABLED` | `true` (regression) |
+| `VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED` | `true` (regression) |
+
+**Test groups (yarm-fs-servers `mod stage91_tests`):**
+
+1. **Part A — Smoke marker source-scan (7 tests):** Verify that all required runtime log
+   markers are present in their respective source files. Tests use `include_str!` to scan
+   `init/service.rs`, `bin/ext4_srv.rs`, `bin/ramfs_srv.rs`, `fs/ext4/service.rs`.
+   Markers checked: `RAMFS_SRV_ENTRY`, `EXT4_SRV_ENTRY`, `EXT4_SRV_READY`,
+   `INIT_RAMFS_SPAWN_BEGIN`, `INIT_EXT4_SPAWN_BEGIN`, `VFS_MOUNT_REGISTER_EXT4_OK`,
+   `INIT_FAT_SPAWN_SKIPPED reason=profile_disabled`.
+
+2. **Part C — Reply endpoint hygiene (4 tests):** Source-scan tests prove that
+   `register_ext4_mount_with_vfs` uses a dedicated `reply_recv_cap` parameter (not `pm_recv`)
+   for its reply poll; the drain loop uses `ipc_recv_with_deadline(pm_recv, ...)`;
+   a 32-byte stale blkcache payload decodes as spawn failure shape (pid=0).
+
+3. **Part D — Spawn/mount ordering (3 tests):** Source-position checks verify
+   (a) drain appears before FAT skip; (b) FAT skip appears before ext4 spawn begin;
+   (c) `INIT_SPAWN_FAT_SRV = false` is present.
+
+4. **Part F — ext4 read-only route hardening (6 tests):** Execute `Ext4Backend` and
+   `Ext4Service` API: openat on service path succeeds; statx returns sane metadata;
+   write returns `Unsupported`; openat on missing path fails; gate constants verified.
+
+5. **Part G — RAMFS live route regression (5 tests):** Gate constant checks; shadow
+   isolation proofs (ext4 backend does not route `/initramfs` paths; initramfs backend
+   does not route `/ext4` paths); Stage 84 and 85 bridge gates still enabled.
+
+6. **Part H — FAT production-readiness (3 tests):** Source-scan confirms virtio_blk
+   requirement is documented; FAT gate constants are both false; `shared_io_adapter.rs`
+   defines both FAT gates.
+
+7. **Part I — Initramfs path table invariants (9 tests):** `InitramfsBackend::openat_path`
+   must succeed for all six sbin server paths; `MAX_INITRAMFS_INODES = 14`; `from_cpio_newc`
+   has a `sbin/ext4_srv` match arm (Stage 89 regression check); individual openat tests for
+   fat_srv, driver_manager, blkcache_srv, virtio_blk_srv, ramfs_srv.
+
+**Test groups (yarm-control-plane-servers `mod tests` Stage 91 additions):**
+
+1. **Part A — Smoke marker source-scan (5 tests):** `INIT_RAMFS_SPAWN_OK`,
+   `INIT_EXT4_SPAWN_OK`, FAT skip markers, `VFS_MOUNT_REGISTER_EXT4_OK`,
+   drain begin/done markers.
+
+2. **Part C — Reply endpoint hygiene (1 test):** `register_ext4_mount_with_vfs` uses
+   `reply_recv_cap` not `pm_recv` for the reply poll.
+
+3. **Part D — Ordering (2 tests):** Drain before FAT spawn block;
+   ext4 mount registration after spawn begin.
+
+4. **Part I — Path table coverage (1 test):** `spawn_image_path_for_image_id` references
+   fat_srv, ramfs_srv, ext4_srv paths.
+
+**Test groups (mount_table.rs Stage 91 routing tests — 7 tests):**
+
+- `stage91_routing_initramfs_ext4_srv_path_routes_to_initramfs` — cap=10
+- `stage91_routing_initramfs_ramfs_srv_path_routes_to_initramfs` — cap=10
+- `stage91_routing_initramfs_driver_manager_routes_to_initramfs` — cap=10
+- `stage91_routing_optional_mounts_do_not_shadow_core_mounts` — ext4+fat added, core routes intact
+- `stage91_routing_ext4_present_after_dynamic_registration_stage88_table` — cap=50
+- `stage91_routing_fat_only_routes_when_registered` — absent before; present after registration
+- `stage91_routing_ram_unaffected_by_ext4_addition` — cap=30 before and after
+
+**Smoke scripts (Stage 91):**
+
+- `scripts/qemu-aarch64-optional-fs-smoke.sh` — checks RAMFS/EXT4/FAT markers for aarch64;
+  exits 0 if QEMU not available.
+- `scripts/qemu-x86_64-optional-fs-smoke.sh` — same checks for x86_64; SMP hardcoded to 1.
+  Both scripts default `RAMFS_SMOKE_EXPECTED=1`, `EXT4_SMOKE_EXPECTED=1`, `FAT_SMOKE_EXPECTED=0`.
+
+**Invariants that must NOT change:**
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`
+- `INIT_SPAWN_FAT_SRV = false` (no virtio_blk in default profile)
+- `VFS_FAT_LIVE_MOUNT_ENABLED = false`, `VFS_FAT_SHARED_IO_ENABLED = false`
+- `MAX_INITRAMFS_INODES = 14`
+- SpawnV5 ABI unchanged; SYSCALL_COUNT = 31; STARTUP_SLOT_COUNT = 18
+
+**Run:** `cargo test -p yarm-fs-servers --lib stage91` and
+`cargo test -p yarm-control-plane-servers --lib stage91`

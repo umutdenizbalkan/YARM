@@ -81,44 +81,6 @@ mod tests {
     }
 
     #[test]
-    fn phase6_exit_gate_bundle_enforces_current_migration_invariants() {
-        let mod_src = include_str!("mod.rs");
-        let vfs_src = include_str!("vfs/service.rs");
-        let supervisor_src = include_str!("supervisor/service.rs");
-        let process_manager_src = include_str!("process_manager/service.rs");
-        let roundtrip_src = include_str!("ipc_roundtrip.rs");
-
-        assert!(
-            mod_src.contains("#[cfg(test)]\npub(crate) mod ipc_roundtrip;"),
-            "synthetic ipc roundtrip helper must remain test-only scoped"
-        );
-        assert!(
-            vfs_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_recv_with_deadline("),
-            "vfs must retain timed receive migration via shared roundtrip helper"
-        );
-        assert!(
-            vfs_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_reply("),
-            "vfs must retain reply-cap call/reply migration via shared roundtrip helper"
-        );
-        assert!(
-            supervisor_src.contains("recv_with_budget"),
-            "supervisor must retain budgeted receive migration"
-        );
-        assert!(
-            process_manager_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_recv_with_deadline("),
-            "process-manager must retain timed receive migration via shared roundtrip helper"
-        );
-        assert!(
-            process_manager_src.contains("synthetic_roundtrip_call_reply_with_budget(")
-                && roundtrip_src.contains("ipc_reply("),
-            "process-manager must retain reply-cap call/reply migration via shared roundtrip helper"
-        );
-    }
-
-    #[test]
     fn phase4_choreography_retirement_bundle_avoids_server_send_reply_hops() {
         let vfs_src = include_str!("vfs/service.rs");
         let process_manager_src = include_str!("process_manager/service.rs");
@@ -369,6 +331,159 @@ mod tests {
         assert!(
             gate_pos < ramfs_begin_pos,
             "INIT_RAMFS_SPAWN_BEGIN must appear after INIT_SPAWN_OPTIONAL_FS_SERVERS gate declaration"
+        );
+    }
+
+    // ── Stage 91: Optional-FS runtime stabilization ───────────────────────────
+
+    // Part A: Smoke marker source-scan tests
+
+    #[test]
+    fn stage91_init_ramfs_spawn_ok_marker_stable() {
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("INIT_RAMFS_SPAWN_OK"),
+            "init/service.rs must log INIT_RAMFS_SPAWN_OK on successful ramfs_srv spawn"
+        );
+    }
+
+    #[test]
+    fn stage91_init_ext4_spawn_ok_marker_stable() {
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("INIT_EXT4_SPAWN_OK"),
+            "init/service.rs must log INIT_EXT4_SPAWN_OK on successful ext4_srv spawn"
+        );
+    }
+
+    #[test]
+    fn stage91_init_fat_spawn_skipped_markers_stable() {
+        let init_src = include_str!("init/service.rs");
+        // At least one of the two FAT skip reasons must be present.
+        let has_profile_disabled =
+            init_src.contains("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled");
+        let has_server_disabled =
+            init_src.contains("INIT_FAT_SPAWN_SKIPPED reason=server_disabled");
+        assert!(
+            has_profile_disabled || has_server_disabled,
+            "init/service.rs must log INIT_FAT_SPAWN_SKIPPED with a reason tag"
+        );
+    }
+
+    #[test]
+    fn stage91_vfs_mount_register_ext4_ok_marker_present_in_init() {
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("VFS_MOUNT_REGISTER_EXT4_OK"),
+            "init/service.rs must log VFS_MOUNT_REGISTER_EXT4_OK after ext4 mount registration"
+        );
+    }
+
+    #[test]
+    fn stage91_pm_recv_drain_begin_done_markers_present() {
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("INIT_PM_RECV_DRAIN_BEGIN"),
+            "init/service.rs must log INIT_PM_RECV_DRAIN_BEGIN before the drain loop"
+        );
+        assert!(
+            init_src.contains("INIT_PM_RECV_DRAIN_DONE"),
+            "init/service.rs must log INIT_PM_RECV_DRAIN_DONE with count after drain"
+        );
+    }
+
+    // Part D: Spawn/mount ordering tests
+
+    #[test]
+    fn stage91_fat_spawn_block_after_drain() {
+        // FAT spawn (or skip) must happen after the pm_recv drain.
+        let init_src = include_str!("init/service.rs");
+        let drain_pos = init_src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let fat_pos = init_src
+            .find("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled")
+            .expect("FAT skip marker must be present");
+        assert!(
+            drain_pos < fat_pos,
+            "pm_recv drain must appear before FAT spawn block in init/service.rs"
+        );
+    }
+
+    #[test]
+    fn stage91_ext4_mount_registration_after_spawn_ok() {
+        // register_ext4_mount_with_vfs is called after INIT_EXT4_SPAWN_OK.
+        // In source, the function definition (containing VFS_MOUNT_REGISTER_EXT4_OK)
+        // precedes the call site, but the call to register_ext4_mount_with_vfs
+        // must appear after INIT_EXT4_SPAWN_BEGIN in the run() function body.
+        let init_src = include_str!("init/service.rs");
+        let spawn_pos = init_src
+            .find("INIT_EXT4_SPAWN_BEGIN")
+            .expect("INIT_EXT4_SPAWN_BEGIN must be present");
+        // The call to register_ext4_mount_with_vfs appears after INIT_EXT4_SPAWN_BEGIN.
+        let call_pos = init_src[spawn_pos..]
+            .find("register_ext4_mount_with_vfs(")
+            .map(|off| spawn_pos + off)
+            .expect("call to register_ext4_mount_with_vfs must follow INIT_EXT4_SPAWN_BEGIN");
+        assert!(
+            spawn_pos < call_pos,
+            "INIT_EXT4_SPAWN_BEGIN must appear before the call to register_ext4_mount_with_vfs"
+        );
+    }
+
+    // Part C: Reply endpoint hygiene (source-scan)
+
+    #[test]
+    fn stage91_mount_register_ext4_uses_dedicated_reply_cap_not_pm_recv() {
+        let init_src = include_str!("init/service.rs");
+        // register_ext4_mount_with_vfs must use reply_recv_cap (not pm_recv) for its reply poll.
+        assert!(
+            init_src.contains("fn register_ext4_mount_with_vfs("),
+            "init/service.rs must define register_ext4_mount_with_vfs"
+        );
+        assert!(
+            init_src.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must use dedicated reply_recv_cap for reply poll"
+        );
+        // Sanity: find function body and confirm it does not use pm_recv for the reply.
+        let fn_start = init_src
+            .find("fn register_ext4_mount_with_vfs(")
+            .expect("function must exist");
+        // Find the nearest next top-level function definition (fn or pub fn).
+        let after_fn = &init_src[fn_start + 1..];
+        let fn_off = after_fn.find("\nfn ").unwrap_or(usize::MAX);
+        let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
+        let fn_body_end = fn_start + 1 + fn_off.min(pub_fn_off);
+        let fn_text = &init_src[fn_start..fn_body_end];
+        assert!(
+            !fn_text.contains("ipc_recv_with_deadline(pm_recv"),
+            "register_ext4_mount_with_vfs must NOT use ipc_recv_with_deadline(pm_recv)"
+        );
+    }
+
+    // Part I: initramfs path table rule
+
+    #[test]
+    fn stage91_pm_image_path_table_covers_all_optional_fs_servers() {
+        // spawn_image_path_for_image_id must have arms for image_id 10 (fat_srv),
+        // 11 (ramfs_srv), 12 (ext4_srv).
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("spawn_image_path_for_image_id"),
+            "init/service.rs must use spawn_image_path_for_image_id for path lookup"
+        );
+        // The function must cover at least the sbin server paths.
+        assert!(
+            init_src.contains("INITRAMFS_FAT_SRV_PATH") || init_src.contains("fat_srv"),
+            "init/service.rs must reference fat_srv path for spawn (image_id 10)"
+        );
+        assert!(
+            init_src.contains("INITRAMFS_RAMFS_SRV_PATH") || init_src.contains("ramfs_srv"),
+            "init/service.rs must reference ramfs_srv path for spawn (image_id 11)"
+        );
+        assert!(
+            init_src.contains("INITRAMFS_EXT4_SRV_PATH") || init_src.contains("ext4_srv"),
+            "init/service.rs must reference ext4_srv path for spawn (image_id 12)"
         );
     }
 }

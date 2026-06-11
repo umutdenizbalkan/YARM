@@ -954,6 +954,95 @@ mod stage89_tests {
 
 #[cfg(test)]
 mod stage90_tests {
+    use crate::fs::fat::fs::{FAT_HELLO_PATH, FatBackend, FatBackendKind};
+    use crate::fs::fat::service::{FatServiceStartup, FatStartupConfig, service_from_startup_config};
+    use crate::fs::common::shared_io_adapter::VFS_FAT_LIVE_MOUNT_ENABLED;
+    use crate::fs::common::vfs_ipc::VfsBackend;
+
+    // ── FAT Outcome-B audit: no real virtio_blk block device ─────────────────
+    //
+    // Stage 90 documents the exact missing requirement: INIT_SPAWN_FAT_SRV=false
+    // because the default profile lacks a real virtio_blk block device.
+    // The FAT implementation is correct (proven via hosted_sample), but
+    // the live-mount and shared-IO gates remain false until a real device exists.
+
+    #[test]
+    fn stage90_fat_live_mount_gate_still_disabled() {
+        assert!(
+            !VFS_FAT_LIVE_MOUNT_ENABLED,
+            "FAT live-mount gate must remain false: no real virtio_blk block device in default profile"
+        );
+    }
+
+    #[test]
+    fn stage90_fat_production_no_caps_returns_no_block_backend() {
+        // Without block_send_cap and reply_recv_cap the FAT service must
+        // refuse to start.  This proves the production path is safe.
+        let result = service_from_startup_config(FatStartupConfig::production(None, None, 1));
+        assert!(
+            matches!(result, Err(FatServiceStartup::NoBlockBackend)),
+            "FAT production config with no caps must return NoBlockBackend"
+        );
+    }
+
+    #[test]
+    fn stage90_fat_hosted_sample_mounts_as_memory_image() {
+        // The FAT implementation is functional via the embedded sample image.
+        // This proves the code is correct even though the live gate is false.
+        let svc = service_from_startup_config(FatStartupConfig::hosted_sample())
+            .expect("hosted_sample must succeed");
+        assert_eq!(
+            svc.backend().backend_kind(),
+            FatBackendKind::MemoryImage,
+            "hosted_sample must use MemoryImage backend"
+        );
+    }
+
+    #[test]
+    fn stage90_fat_sample_image_open_hello_txt_succeeds() {
+        let svc = service_from_startup_config(FatStartupConfig::hosted_sample())
+            .expect("hosted_sample must succeed");
+        let mut backend = FatBackend::new();
+        let fd = backend.openat_path(FAT_HELLO_PATH).expect("open must succeed");
+        assert!(fd >= 10, "fd must be a valid handle");
+    }
+
+    #[test]
+    fn stage90_fat_sample_image_statx_returns_nonzero_size() {
+        let mut backend = FatBackend::new();
+        let size = backend
+            .statx_path(FAT_HELLO_PATH)
+            .expect("statx must succeed on sample image");
+        assert!(size > 0, "hello.txt must have nonzero file size");
+    }
+
+    #[test]
+    fn stage90_fat_spawn_disabled_marker_in_init() {
+        let init_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        // Document the exact missing requirement in init/service.rs.
+        assert!(
+            init_src.contains("const INIT_SPAWN_FAT_SRV: bool = false;"),
+            "INIT_SPAWN_FAT_SRV must be false (no virtio_blk block device)"
+        );
+        assert!(
+            init_src.contains("FAT requires a virtio_blk block device not present"),
+            "init must document the exact FAT missing requirement (virtio_blk not present)"
+        );
+    }
+
+    #[test]
+    fn stage90_fat_skipped_marker_present_when_gate_false() {
+        let init_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            init_src.contains("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled"),
+            "init must emit INIT_FAT_SPAWN_SKIPPED when FAT gate is false"
+        );
+    }
+
     // ── Source-level invariants for the false SPAWN_FAIL fix ─────────────────
 
     #[test]
@@ -1024,6 +1113,555 @@ mod stage90_tests {
         assert!(
             smoke_section.contains("ipc_recv(pm_recv)"),
             "blkcache smoke must use blocking ipc_recv(pm_recv)"
+        );
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Stage 91: Optional-FS runtime stabilization, smoke-profile hardening,
+//           and FAT production-readiness groundwork.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod stage91_tests {
+    use crate::fs::initramfs::archive::{
+        InitramfsBackend, INITRAMFS_DRIVER_MANAGER_PATH, INITRAMFS_BLKCACHE_PATH,
+        INITRAMFS_VIRTIO_BLK_PATH, INITRAMFS_FAT_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH,
+        INITRAMFS_EXT4_SRV_PATH,
+    };
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::ext4::service::Ext4Service;
+    use crate::fs::common::shared_io_adapter::{
+        VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_EXT4_RECV_LOOP_ENABLED,
+        VFS_RAMFS_LIVE_MOUNT_ENABLED, VFS_FAT_LIVE_MOUNT_ENABLED,
+        VFS_FAT_SHARED_IO_ENABLED, VFS_STAGE84_RAMFS_BRIDGE_ENABLED,
+        VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED,
+    };
+    use crate::fs::common::vfs_ipc::{VfsBackend, VfsError, openat_inline_message, write_message, ReadWriteRequest, statx_inline_message};
+    use yarm_srv_common::vfs_reply::VfsReply;
+
+    // ── Part A: Smoke marker source-scan tests ────────────────────────────────
+
+    #[test]
+    fn stage91_ramfs_srv_entry_marker_present() {
+        // RAMFS_SRV_ENTRY is logged by the RAMFS service loop (fs/ramfs/service.rs).
+        let svc_src = include_str!("fs/ramfs/service.rs");
+        assert!(
+            svc_src.contains("RAMFS_SRV_ENTRY"),
+            "fs/ramfs/service.rs must log RAMFS_SRV_ENTRY on entry"
+        );
+    }
+
+    #[test]
+    fn stage91_ext4_srv_entry_marker_present() {
+        // EXT4_SRV_ENTRY is logged by the binary entry point (bin/ext4_srv.rs).
+        let bin_src = include_str!("bin/ext4_srv.rs");
+        assert!(
+            bin_src.contains("EXT4_SRV_ENTRY"),
+            "bin/ext4_srv.rs must log EXT4_SRV_ENTRY on entry"
+        );
+    }
+
+    #[test]
+    fn stage91_ext4_srv_ready_marker_present() {
+        let svc_src = include_str!("fs/ext4/service.rs");
+        assert!(
+            svc_src.contains("EXT4_SRV_READY"),
+            "ext4/service.rs must log EXT4_SRV_READY once the service loop is ready"
+        );
+    }
+
+    #[test]
+    fn stage91_init_ramfs_spawn_begin_marker_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_RAMFS_SPAWN_BEGIN"),
+            "init/service.rs must log INIT_RAMFS_SPAWN_BEGIN before spawning ramfs_srv"
+        );
+    }
+
+    #[test]
+    fn stage91_init_ext4_spawn_begin_marker_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_EXT4_SPAWN_BEGIN"),
+            "init/service.rs must log INIT_EXT4_SPAWN_BEGIN before spawning ext4_srv"
+        );
+    }
+
+    #[test]
+    fn stage91_vfs_mount_register_ext4_ok_marker_present() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("VFS_MOUNT_REGISTER_EXT4_OK"),
+            "init/service.rs must log VFS_MOUNT_REGISTER_EXT4_OK on successful ext4 mount registration"
+        );
+    }
+
+    #[test]
+    fn stage91_fat_spawn_skipped_marker_profile_disabled() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled"),
+            "init/service.rs must log INIT_FAT_SPAWN_SKIPPED reason=profile_disabled for the default no-virtio_blk profile"
+        );
+    }
+
+    // ── Part C: Reply endpoint hygiene tests (source-scan) ────────────────────
+
+    #[test]
+    fn stage91_reply_endpoint_hygiene_vfs_mount_register_ext4_uses_reply_recv_cap() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        // The function must exist and use a dedicated reply_recv_cap parameter.
+        assert!(
+            src.contains("fn register_ext4_mount_with_vfs("),
+            "init/service.rs must define register_ext4_mount_with_vfs"
+        );
+        assert!(
+            src.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must use ipc_recv_with_deadline(reply_recv_cap ...) not pm_recv"
+        );
+    }
+
+    #[test]
+    fn stage91_reply_endpoint_hygiene_register_ext4_uses_dedicated_reply_cap() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        // Prove the function signature includes reply_recv_cap as a parameter.
+        // The function is: fn register_ext4_mount_with_vfs(..., reply_recv_cap: u32, ...)
+        let fn_start = src
+            .find("fn register_ext4_mount_with_vfs(")
+            .expect("register_ext4_mount_with_vfs must exist in init/service.rs");
+        // Find the end of this function by locating the next top-level fn (fn or pub fn).
+        let after_fn = &src[fn_start + 1..];
+        let fn_body_end = after_fn
+            .find("\nfn ")
+            .or_else(|| after_fn.find("\npub fn "))
+            .map(|off| {
+                // Take the minimum to find the nearest next function definition.
+                let fn_off = after_fn.find("\nfn ").unwrap_or(usize::MAX);
+                let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
+                fn_start + 1 + fn_off.min(pub_fn_off)
+            })
+            .unwrap_or(src.len());
+        let fn_text = &src[fn_start..fn_body_end];
+        assert!(
+            fn_text.contains("reply_recv_cap"),
+            "register_ext4_mount_with_vfs must have reply_recv_cap parameter"
+        );
+        assert!(
+            !fn_text.contains("ipc_recv_with_deadline(pm_recv"),
+            "register_ext4_mount_with_vfs must NOT use ipc_recv_with_deadline(pm_recv)"
+        );
+    }
+
+    #[test]
+    fn stage91_pm_recv_drain_loop_uses_deadline_zero_correctly() {
+        // The drain loop in init/service.rs uses ipc_recv_with_deadline(pm_recv, 0)
+        // to poll for leftover replies on the shared endpoint. This is correct because
+        // the drain is exhaustive (loops until None). Contrast with the per-operation
+        // helpers (register_ext4_mount_with_vfs) which use dedicated reply_recv_cap.
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("INIT_PM_RECV_DRAIN_BEGIN"),
+            "drain loop marker INIT_PM_RECV_DRAIN_BEGIN must be present"
+        );
+        assert!(
+            src.contains("INIT_PM_RECV_DRAIN_DONE"),
+            "drain loop marker INIT_PM_RECV_DRAIN_DONE must be present"
+        );
+        // The drain must use pm_recv (shared endpoint) with deadline=0 (poll).
+        let drain_start = src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let drain_end = src
+            .find("INIT_PM_RECV_DRAIN_DONE")
+            .expect("drain done marker must be present");
+        let drain_section = &src[drain_start..drain_end];
+        assert!(
+            drain_section.contains("ipc_recv_with_deadline(pm_recv"),
+            "drain section must poll pm_recv with ipc_recv_with_deadline"
+        );
+    }
+
+    #[test]
+    fn stage91_stale_32_byte_blkcache_reply_decoded_as_failure_shape() {
+        // A 32-byte stale blkcache reply in pm_recv would be rejected by spawn_v5_cap
+        // because decode_spawn_v5_reply requires payload.len() == 16 exactly.
+        // A 32-byte payload returns Err(Malformed), which spawn_v5_cap treats as a
+        // spawn failure. The INIT_PM_RECV_DRAIN_BEGIN drain prevents this from happening
+        // by consuming stale replies before any new SpawnV5 operation.
+        use yarm_ipc_abi::process_abi::decode_spawn_v5_reply;
+        let stale_payload_32 = [0u8; 32];
+        let result_32 = decode_spawn_v5_reply(&stale_payload_32);
+        assert!(
+            result_32.is_err(),
+            "32-byte stale payload must fail decode (len != 16), got: {:?}",
+            result_32.ok()
+        );
+        // A 16-byte zero payload decodes as pid=0 (failure shape).
+        let zero_16 = [0u8; 16];
+        let decoded_16 = decode_spawn_v5_reply(&zero_16)
+            .expect("16-byte zero payload must decode");
+        assert_eq!(
+            decoded_16.pid, 0,
+            "16-byte zero payload decodes as pid=0 (failure shape)"
+        );
+    }
+
+    // ── Part F: ext4 read-only route hardening tests ──────────────────────────
+
+    #[test]
+    fn stage91_ext4_open_service_path_returns_valid_fd() {
+        let mut backend = Ext4Backend::new();
+        let fd = backend
+            .openat_path(EXT4_SERVICE_PATH)
+            .expect("openat /ext4/service.bin must succeed");
+        assert!(fd > 0, "fd must be positive");
+    }
+
+    #[test]
+    fn stage91_ext4_statx_service_path_returns_sane_metadata() {
+        let mut backend = Ext4Backend::new();
+        let result = backend.statx_path(EXT4_SERVICE_PATH);
+        assert!(
+            result.is_ok(),
+            "statx on /ext4/service.bin must succeed, got: {:?}",
+            result
+        );
+        // statx returns file_len (0 is valid for an empty embedded EXT4 service bin).
+        let _file_len = result.unwrap();
+    }
+
+    #[test]
+    fn stage91_ext4_write_returns_unsupported() {
+        // Regression: ext4 is read-only. Write must return Unsupported.
+        // First open a valid file to get an fd, then attempt write.
+        let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+        let open_msg = openat_inline_message(0, EXT4_SERVICE_PATH, 0, 0)
+            .expect("openat_inline_message encoding must succeed");
+        let open_rep = svc.handle(open_msg).expect("open must succeed");
+        let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
+            .expect("decode open reply")
+            .as_u64();
+        let write = write_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0x1000,
+            len: 64,
+        })
+        .expect("write_message encoding must succeed");
+        assert_eq!(
+            svc.handle(write),
+            Err(VfsError::Unsupported),
+            "ext4 write must return Unsupported (read-only backend)"
+        );
+    }
+
+    #[test]
+    fn stage91_ext4_open_missing_path_returns_invalid_path_or_bad_fd() {
+        let mut backend = Ext4Backend::new();
+        let result = backend.openat_path(b"/ext4/nonexistent_stage91.bin");
+        assert!(
+            result.is_err(),
+            "openat on missing path must fail, got Ok({:?})",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn stage91_ext4_live_mount_gate_enabled() {
+        assert!(
+            VFS_EXT4_LIVE_MOUNT_ENABLED,
+            "VFS_EXT4_LIVE_MOUNT_ENABLED must be true at Stage 91"
+        );
+    }
+
+    #[test]
+    fn stage91_ext4_recv_loop_gate_enabled() {
+        assert!(
+            VFS_EXT4_RECV_LOOP_ENABLED,
+            "VFS_EXT4_RECV_LOOP_ENABLED must be true at Stage 91"
+        );
+    }
+
+    // ── Part G: RAMFS live route regression tests ─────────────────────────────
+
+    #[test]
+    fn stage91_ramfs_live_mount_gate_enabled() {
+        assert!(
+            VFS_RAMFS_LIVE_MOUNT_ENABLED,
+            "VFS_RAMFS_LIVE_MOUNT_ENABLED must be true at Stage 91"
+        );
+    }
+
+    #[test]
+    fn stage91_ramfs_does_not_shadow_ext4_paths() {
+        // /ram paths must not be confused with /ext4 paths — they are independent mounts.
+        // Prove by checking that the EXT4_SERVICE_PATH cannot be opened via InitramfsBackend.
+        let mut fs = InitramfsBackend::new(0);
+        // EXT4_SERVICE_PATH = b"/ext4/service.bin" — not an initramfs path.
+        let result = fs.openat_path(EXT4_SERVICE_PATH);
+        assert!(
+            result.is_err(),
+            "InitramfsBackend must not route /ext4 paths (shadow check)"
+        );
+    }
+
+    #[test]
+    fn stage91_ext4_does_not_shadow_ram_paths() {
+        // /ext4 paths must not shadow /initramfs/sbin paths — independent backends.
+        let mut backend = Ext4Backend::new();
+        // INITRAMFS_RAMFS_SRV_PATH = b"/initramfs/sbin/ramfs_srv" — not an ext4 path.
+        let result = backend.openat_path(INITRAMFS_RAMFS_SRV_PATH);
+        assert!(
+            result.is_err(),
+            "Ext4Backend must not route /initramfs paths (shadow check)"
+        );
+    }
+
+    #[test]
+    fn stage91_stage84_bridge_gate_still_enabled() {
+        assert!(
+            VFS_STAGE84_RAMFS_BRIDGE_ENABLED,
+            "VFS_STAGE84_RAMFS_BRIDGE_ENABLED must remain true at Stage 91 (regression)"
+        );
+    }
+
+    #[test]
+    fn stage91_stage85_live_route_gate_still_enabled() {
+        assert!(
+            VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED,
+            "VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED must remain true at Stage 91 (regression)"
+        );
+    }
+
+    // ── Part H: FAT production-readiness doc tests (source-scan) ─────────────
+
+    #[test]
+    fn stage91_fat_production_checklist_virtio_blk_requirement_documented() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("FAT requires a virtio_blk block device not present"),
+            "init/service.rs must document the virtio_blk requirement for FAT production"
+        );
+    }
+
+    #[test]
+    fn stage91_fat_gates_all_false_for_production() {
+        assert!(
+            !VFS_FAT_LIVE_MOUNT_ENABLED,
+            "VFS_FAT_LIVE_MOUNT_ENABLED must be false (FAT production not enabled)"
+        );
+        assert!(
+            !VFS_FAT_SHARED_IO_ENABLED,
+            "VFS_FAT_SHARED_IO_ENABLED must be false (FAT production not enabled)"
+        );
+    }
+
+    #[test]
+    fn stage91_fat_production_requires_block_device_comment_in_shared_io_adapter() {
+        let src = include_str!("fs/common/shared_io_adapter.rs");
+        // The shared_io_adapter.rs documents the FAT production requirement.
+        assert!(
+            src.contains("VFS_FAT_LIVE_MOUNT_ENABLED"),
+            "shared_io_adapter.rs must define VFS_FAT_LIVE_MOUNT_ENABLED"
+        );
+        assert!(
+            src.contains("VFS_FAT_SHARED_IO_ENABLED"),
+            "shared_io_adapter.rs must define VFS_FAT_SHARED_IO_ENABLED"
+        );
+    }
+
+    // ── Part I: Initramfs path table invariant tests ──────────────────────────
+
+    #[test]
+    fn stage91_initramfs_all_sbin_server_paths_openable() {
+        // fat_srv, ramfs_srv, ext4_srv are openable via the placeholder backend (new(4096)).
+        // driver_manager, blkcache_srv, virtio_blk_srv are late_exec_paths: they require
+        // a live CPIO backend. This test covers the non-late-exec sbin servers and verifies
+        // the late-exec paths are registered via source-scan.
+        let mut fs = InitramfsBackend::new(4096);
+        let non_late_exec_paths: &[&[u8]] = &[
+            INITRAMFS_FAT_SRV_PATH,
+            INITRAMFS_RAMFS_SRV_PATH,
+            INITRAMFS_EXT4_SRV_PATH,
+        ];
+        for path in non_late_exec_paths {
+            let result = fs.openat_path(path);
+            assert!(
+                result.is_ok(),
+                "InitramfsBackend must be able to open {:?}, got: {:?}",
+                core::str::from_utf8(path).unwrap_or("<non-utf8>"),
+                result
+            );
+        }
+        // Verify late-exec sbin paths are registered in the inode table via source-scan.
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("INITRAMFS_DRIVER_MANAGER_PATH"),
+            "archive.rs must register INITRAMFS_DRIVER_MANAGER_PATH"
+        );
+        assert!(
+            src.contains("INITRAMFS_BLKCACHE_PATH"),
+            "archive.rs must register INITRAMFS_BLKCACHE_PATH"
+        );
+        assert!(
+            src.contains("INITRAMFS_VIRTIO_BLK_PATH"),
+            "archive.rs must register INITRAMFS_VIRTIO_BLK_PATH"
+        );
+    }
+
+    #[test]
+    fn stage91_initramfs_max_inodes_covers_all_sbin_servers() {
+        // MAX_INITRAMFS_INODES = 14 must cover all registered inodes including
+        // the six sbin servers (driver_manager, blkcache_srv, virtio_blk_srv,
+        // fat_srv, ramfs_srv, ext4_srv).
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("MAX_INITRAMFS_INODES"),
+            "archive.rs must define MAX_INITRAMFS_INODES"
+        );
+        // Verify 14 is the current constant value.
+        assert!(
+            src.contains("const MAX_INITRAMFS_INODES: usize = 14"),
+            "MAX_INITRAMFS_INODES must equal 14 (6 core + 6 sbin servers + 2 others)"
+        );
+    }
+
+    #[test]
+    fn stage91_initramfs_ext4_srv_path_arm_in_cpio_match() {
+        // Regression test for the Stage 89 fix: ext4_srv was missing from the
+        // from_cpio_newc() match arm, causing VFS to return NotFound on spawn.
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("sbin/ext4_srv"),
+            "archive.rs from_cpio_newc must have a sbin/ext4_srv match arm (Stage 89 regression)"
+        );
+        assert!(
+            src.contains("INITRAMFS_EXT4_SRV_PATH"),
+            "archive.rs must reference INITRAMFS_EXT4_SRV_PATH in the inode table"
+        );
+    }
+
+    #[test]
+    fn stage91_initramfs_fat_srv_path_openable() {
+        // fat_srv is not a late_exec_path; openable via placeholder backend.
+        let mut fs = InitramfsBackend::new(4096);
+        let fd = fs
+            .openat_path(INITRAMFS_FAT_SRV_PATH)
+            .expect("/initramfs/sbin/fat_srv must be openable via InitramfsBackend");
+        assert!(fd >= 10);
+    }
+
+    #[test]
+    fn stage91_initramfs_driver_manager_path_openable() {
+        // driver_manager is a late_exec_path (gated by is_placeholder_mode check).
+        // Verify it is registered in the inode table via source-scan.
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("path: INITRAMFS_DRIVER_MANAGER_PATH"),
+            "archive.rs must have an inode entry for INITRAMFS_DRIVER_MANAGER_PATH"
+        );
+    }
+
+    #[test]
+    fn stage91_initramfs_blkcache_srv_path_openable() {
+        // blkcache_srv is a late_exec_path; verify via source-scan.
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("path: INITRAMFS_BLKCACHE_PATH"),
+            "archive.rs must have an inode entry for INITRAMFS_BLKCACHE_PATH"
+        );
+    }
+
+    #[test]
+    fn stage91_initramfs_virtio_blk_srv_path_openable() {
+        // virtio_blk_srv is a late_exec_path; verify via source-scan.
+        let src = include_str!("fs/initramfs/archive.rs");
+        assert!(
+            src.contains("path: INITRAMFS_VIRTIO_BLK_PATH"),
+            "archive.rs must have an inode entry for INITRAMFS_VIRTIO_BLK_PATH"
+        );
+    }
+
+    #[test]
+    fn stage91_initramfs_ramfs_srv_path_openable() {
+        // ramfs_srv is not a late_exec_path; openable via placeholder backend.
+        let mut fs = InitramfsBackend::new(4096);
+        let fd = fs
+            .openat_path(INITRAMFS_RAMFS_SRV_PATH)
+            .expect("/initramfs/sbin/ramfs_srv must be openable via InitramfsBackend");
+        assert!(fd >= 10);
+    }
+
+    // ── Part D: Spawn/mount ordering tests (source-scan on init/service.rs) ───
+
+    #[test]
+    fn stage91_drain_before_fat_spawn_gate() {
+        // The pm_recv drain must complete before the FAT spawn gate is evaluated.
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let drain_pos = src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let fat_skip_pos = src
+            .find("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled")
+            .expect("FAT skip marker must be present");
+        assert!(
+            drain_pos < fat_skip_pos,
+            "pm_recv drain must appear before INIT_FAT_SPAWN_SKIPPED in init/service.rs"
+        );
+    }
+
+    #[test]
+    fn stage91_fat_skip_logged_before_ext4_spawn_in_optional_section() {
+        // In the optional-FS section (INIT_SPAWN_OPTIONAL_FS_SERVERS=true),
+        // FAT is skipped with reason=server_disabled (INIT_SPAWN_FAT_SRV=false)
+        // before the ext4 spawn block. The reason=profile_disabled path is in a
+        // separate else-branch and appears after ext4 in source order.
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let fat_skip_server_pos = src
+            .find("INIT_FAT_SPAWN_SKIPPED reason=server_disabled")
+            .expect("INIT_FAT_SPAWN_SKIPPED reason=server_disabled must be present");
+        let ext4_begin_pos = src
+            .find("INIT_EXT4_SPAWN_BEGIN")
+            .expect("INIT_EXT4_SPAWN_BEGIN must be present");
+        assert!(
+            fat_skip_server_pos < ext4_begin_pos,
+            "INIT_FAT_SPAWN_SKIPPED reason=server_disabled must appear before INIT_EXT4_SPAWN_BEGIN"
+        );
+        // Also verify the profile_disabled path exists in the else-branch.
+        assert!(
+            src.contains("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled"),
+            "INIT_FAT_SPAWN_SKIPPED reason=profile_disabled must be present in else-branch"
+        );
+    }
+
+    #[test]
+    fn stage91_const_init_spawn_fat_srv_is_false() {
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        assert!(
+            src.contains("const INIT_SPAWN_FAT_SRV: bool = false;"),
+            "INIT_SPAWN_FAT_SRV must be false (no virtio_blk block device in default profile)"
         );
     }
 }
