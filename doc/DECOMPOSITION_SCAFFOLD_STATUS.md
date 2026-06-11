@@ -110,6 +110,28 @@ No types are flagged as **obsolete** at Stage 101.
 
 ---
 
+## 6.1 Stage 102 — syscall module split status
+
+The mechanical syscall decomposition (map: `KERNEL_UNLOCKING_STAGE101_AUDIT.md
+§3`, progress: §11) began in Stage 102:
+
+| Target module | Status (Stage 102) |
+|---------------|--------------------|
+| `syscall/debug.rs` | **landed** (NR 15) |
+| `syscall/initramfs.rs` | **landed** (NR 27/28) |
+| `syscall/recv_shared_v3.rs` | next split target |
+| `syscall/sched.rs` | pending (trivial) |
+| `syscall/process.rs` | pending (big, mechanical) |
+| `syscall/dispatch.rs` | pending (after IPC group) |
+| `syscall/ipc.rs` / `syscall/ipc_recv_core.rs` | **frozen until D1 lands** — D1 landing area, do not churn |
+| `syscall/mm.rs` | frozen until D3 — D3 landing area |
+| `syscall/cap.rs` | pending (tiny; tied to syscall_split.rs tests) |
+
+`src/kernel/syscall.rs` remains the parent module (scripts and
+`include_str!` tests reference the path).
+
+---
+
 ## 7. Maintenance rule
 
 Any new plan / scaffold type added during kernel-unlocking work MUST be

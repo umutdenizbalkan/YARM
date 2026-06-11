@@ -472,3 +472,108 @@ scheduler / SMP work.
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`.
 - No deadline-0 required replies anywhere.
 - No new behavior changes in Stage 101.
+
+---
+
+## 11. Stage 102 — Mechanical syscall decomposition (first split landed)
+
+Stage 102 executed the first mechanical move from the §3 decomposition map.
+Zero behavior change; all moved code is byte-identical except for
+`pub(super)` visibility on the moved function signatures.
+
+### 11.1 Module layout decision
+
+`src/kernel/syscall.rs` **remains the parent module** (not converted to
+`syscall/mod.rs`). Reasons:
+
+- `scripts/check-kernel-arch-boundary.sh` and
+  `scripts/phase7-shared-ipc-gates.sh` reference `src/kernel/syscall.rs` by
+  path.
+- ~10 `include_str!("syscall.rs")` source-scan tests reference the file
+  relative to its own directory.
+- Rust supports the `syscall.rs` + `syscall/` directory layout natively, so
+  keeping the parent file avoids touching any external reference.
+
+### 11.2 What moved in Stage 102
+
+| New module | Contents | Lines | Visibility |
+|------------|----------|-------|------------|
+| `src/kernel/syscall/debug.rs` | `handle_debug_log` (NR 15) | ~55 | `pub(super)` |
+| `src/kernel/syscall/initramfs.rs` | `handle_initramfs_read_chunk` (NR 27), `handle_create_initramfs_file_slice_mo` (NR 28) | ~256 | `pub(super)` |
+
+The dispatch arms in `dispatch()` are textually unchanged; the parent
+re-imports the handlers via `use self::debug::...` / `use self::initramfs::...`.
+
+The `mod debug;` / `mod initramfs;` declarations sit AFTER the
+`syscall_trace!` macro definition — required by textual macro scoping
+(`debug.rs` invokes `syscall_trace!`, which expands to a reference to
+`AARCH64_SYSCALL_TRACE`, imported in `debug.rs` via `use super::`).
+
+### 11.3 Visibility compromises
+
+None beyond `pub(super)` on the three moved handler fns. The private parent
+helpers the moved code uses (`current_tid`, `validate_user_region`,
+`PM_BOOTSTRAP_TID`, `INITRAMFS_READ_CHUNK_TRACE`, `AARCH64_SYSCALL_TRACE`)
+remain private to the `syscall` parent module — child modules access them
+through normal Rust descendant-privacy via `use super::`.
+
+### 11.4 What remains in the parent (and why)
+
+| Group | Status | Blocker for moving |
+|-------|--------|--------------------|
+| NR constants + `Syscall` enum + `dispatch()` | stays for now | many `include_str!` scans + scripts reference syscall.rs content; move to `dispatch.rs` is safe but big-diff; do after IPC group |
+| IPC handlers (NR 1/2/4/5/6/7) | stays | densely interdependent helpers (`stash_transfer_handle`, `complete_blocked_recv_for_waiter`, `materialize_received_*`, recv-result writeback chain); this is the **D1 landing area** — do not churn it before D1 lands |
+| recv-core adapters (`try_split_recv_*`) | stays | called from `runtime.rs` via `crate::kernel::syscall::` paths; safe to move later with re-export |
+| VM handlers (NR 3/13/14) | stays | D3 landing area; same churn-avoidance argument |
+| cap/control-plane (NR 8) | stays | tiny; tied to syscall_split.rs whitelist tests |
+| sched (NR 0/9/10/11) | stays | small; trivial future move |
+| process/spawn (NR 12/23/24/26/29) | stays | largest group; depends on ELF/CPIO/zero-copy helpers; mechanical but big-diff |
+| recv_shared_v3 (NR 30) | stays | parse/encode helpers are self-contained, but the handler shares recv-core adapter calls with the Stage 36 path; candidate for the **next** split |
+| `#[cfg(test)] mod tests` | stays | include_str!-based source scans assume current layout |
+
+### 11.5 Recommended next split target
+
+`syscall/recv_shared_v3.rs` — the NR 30 parse/encode helpers
+(`parse_v3_request_bytes`, output-encode helper, object-kind mapping) plus
+`handle_recv_shared_v3` form a mostly self-contained group (~700 lines).
+After that: `syscall/sched.rs` (futex/spawn-thread, trivial), then
+`syscall/process.rs` (big but mechanical).
+
+**Do NOT move the IPC group before D1 lands** — moving it would force every
+D1 review diff to cross a file rename, defeating the reviewability goal.
+
+### 11.6 Stage 103 D1 landing area (exact files/functions)
+
+D1 (cap-transfer recv split, Phase A/B/C per §4.4) will touch exactly:
+
+- `src/kernel/recv_core.rs`
+  - `RecvCapTransferPlan` (extend with receiver-cnode snapshot)
+  - `extract_cap_transfer_plan` (unchanged or extended)
+  - `try_recv_core_kernel_plain` / `try_recv_core_user_plain` /
+    `try_recv_core_user_plain_v2` (Phase A: snapshot capture)
+- `src/kernel/syscall.rs`
+  - `materialize_received_message_cap` (split into Phase B function)
+  - `materialize_received_transfer_cap` (recv-v2 path equivalent)
+  - `try_split_recv_queued_plain_with_snapshot_locked` (writeback site;
+    Phase B call moves out of the global-lock closure)
+  - `rollback_materialized_recv_cap` callers (Phase C failure handling)
+- `src/runtime.rs`
+  - the `SharedKernel` seam that today wraps the whole recv in `with(...)`
+    (Phase A/B/C lock-release points)
+- `src/kernel/boot/capability_lifecycle_state.rs`
+  - `mint_capability_in_cnode` (Phase B rank-4 mutation; unchanged but its
+    lock-domain contract is the Phase B safety argument)
+
+Stage 102 deliberately did NOT touch any of these functions, so the Stage
+103 diff will be reviewable in isolation.
+
+### 11.7 Stage 102 test additions
+
+4 new source-scan/runtime tests in `kernel::syscall::tests`:
+
+1. `stage102_split_modules_exist_and_host_moved_handlers`
+2. `stage102_dispatch_arms_unchanged_for_moved_handlers`
+3. `stage102_moved_modules_do_not_define_abi_constants`
+4. `stage102_dispatch_runtime_routing_for_moved_handlers` — runtime proof
+   that NR 15 and NR 27 still route through `dispatch()` to the moved
+   bodies with identical results (ok-0 fast path; MissingRight gate).

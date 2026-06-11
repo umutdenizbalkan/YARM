@@ -5029,3 +5029,56 @@ guard their continued presence.
   `VFS_EXT4_LIVE_MOUNT_ENABLED = true`
 
 **Run:** `cargo test --lib -- --test-threads=1` (must remain green).
+
+---
+
+## Stage 102 — Mechanical syscall decomposition (first split)
+
+Stage 102 moved the first two low-risk syscall groups out of
+`src/kernel/syscall.rs` into child modules, with zero behavior change:
+
+- `src/kernel/syscall/debug.rs` — `handle_debug_log` (NR 15)
+- `src/kernel/syscall/initramfs.rs` — `handle_initramfs_read_chunk` (NR 27),
+  `handle_create_initramfs_file_slice_mo` (NR 28)
+
+`syscall.rs` remains the parent module; dispatch arms are textually
+unchanged; moved fns are `pub(super)`.
+
+**Test rules introduced by the split:**
+
+1. **Parent-module layout is load-bearing for source scans.** Any test using
+   `include_str!("syscall.rs")` sees ONLY the parent file, not child modules.
+   If a source-scan pattern targets code that has moved to a child module,
+   the test must `include_str!("syscall/<child>.rs")` instead. Check
+   `doc/DECOMPOSITION_SCAFFOLD_STATUS.md §6.1` for what lives where.
+2. **Scripts reference `src/kernel/syscall.rs` by path**
+   (`check-kernel-arch-boundary.sh`, `phase7-shared-ipc-gates.sh`). Patterns
+   those scripts check must stay in the parent file, or the scripts must be
+   updated in the same PR as the move.
+3. **`mod` declarations must follow `syscall_trace!`.** The child modules
+   invoke the `syscall_trace!` macro, which is textually scoped; the
+   `mod debug;` / `mod initramfs;` declarations must remain after the macro
+   definition in `syscall.rs`.
+4. **Do not churn the IPC group before D1.** `handle_ipc_*`,
+   `materialize_received_*`, `complete_blocked_recv_for_waiter`, and the
+   recv-result writeback chain stay in `syscall.rs` until the D1 cap-transfer
+   split lands (Stage 103) — see `KERNEL_UNLOCKING_STAGE101_AUDIT.md §11.6`.
+
+**Test groups (kernel::syscall::tests Stage 102 — 4 tests):**
+
+1. `stage102_split_modules_exist_and_host_moved_handlers` — bodies live in
+   child modules only; parent re-imports them.
+2. `stage102_dispatch_arms_unchanged_for_moved_handlers` — NR 15/27/28
+   dispatch arms textually unchanged.
+3. `stage102_moved_modules_do_not_define_abi_constants` — no ABI constants,
+   NR constants, or Syscall enum in child modules.
+4. `stage102_dispatch_runtime_routing_for_moved_handlers` — runtime routing
+   proof through `dispatch()` for NR 15 (ok-0 fast path) and NR 27
+   (MissingRight access gate).
+
+**Invariants unchanged from Stage 101:** SYSCALL_COUNT = 31; NR 30
+RecvSharedV3 routed; NR 8 split whitelist intact; Stage 101 validation
+labels present; Stage 100 FS gates unchanged.
+
+**Run:** `cargo test --lib stage102` and the full
+`cargo test --lib -- --test-threads=1`.
