@@ -1804,3 +1804,187 @@ mod stage91_tests {
         );
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Stage 92: AArch64 wrong-sender reply race elimination — vfs_client.rs
+//           blocking-recv fix.
+//
+// Root cause: vfs_client.rs IPC helpers used ipc_recv_with_deadline(..., 0)
+// (non-blocking).  On AArch64, delayed VFS replies arrived AFTER the
+// pre-spawn drain loop and were read by spawn_v5_cap's ipc_recv_v2 wait,
+// triggering INIT_SPAWN_V5_WRONG_SENDER_REPLY ×3.
+// Fix: switch all four helpers to ipc_recv_v2 (blocking) so replies are
+// always consumed inline before control returns to init.
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod stage92_tests {
+    const VFS_CLIENT_SRC: &str =
+        include_str!("../../yarm-user-rt/src/vfs_client.rs");
+
+    const INIT_SRC: &str = include_str!(
+        "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // ── 1. All four IPC helpers use blocking ipc_recv_v2 ────────────────────
+
+    #[test]
+    fn stage92_vfs_client_statx_uses_blocking_recv_v2() {
+        let fn_start = VFS_CLIENT_SRC
+            .find("pub unsafe fn vfs_statx(")
+            .expect("vfs_statx must be defined in vfs_client.rs");
+        let fn_body = &VFS_CLIENT_SRC[fn_start..];
+        assert!(
+            fn_body.contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_statx must use blocking ipc_recv_v2 to consume VFS reply"
+        );
+    }
+
+    #[test]
+    fn stage92_vfs_client_openat_uses_blocking_recv_v2() {
+        let fn_start = VFS_CLIENT_SRC
+            .find("pub unsafe fn vfs_openat(")
+            .expect("vfs_openat must be defined in vfs_client.rs");
+        let fn_body = &VFS_CLIENT_SRC[fn_start..];
+        assert!(
+            fn_body.contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_openat must use blocking ipc_recv_v2 to consume VFS reply"
+        );
+    }
+
+    #[test]
+    fn stage92_vfs_client_read_uses_blocking_recv_v2() {
+        let fn_start = VFS_CLIENT_SRC
+            .find("pub unsafe fn vfs_read(")
+            .expect("vfs_read must be defined in vfs_client.rs");
+        let fn_body = &VFS_CLIENT_SRC[fn_start..];
+        assert!(
+            fn_body.contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_read must use blocking ipc_recv_v2 to consume VFS reply"
+        );
+    }
+
+    #[test]
+    fn stage92_vfs_client_close_uses_blocking_recv_v2() {
+        let fn_start = VFS_CLIENT_SRC
+            .find("pub unsafe fn vfs_close(")
+            .expect("vfs_close must be defined in vfs_client.rs");
+        let fn_body = &VFS_CLIENT_SRC[fn_start..];
+        assert!(
+            fn_body.contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_close must use blocking ipc_recv_v2 to consume VFS reply"
+        );
+    }
+
+    // ── 2. No IPC helper uses non-blocking ipc_recv_with_deadline ───────────
+
+    #[test]
+    fn stage92_vfs_client_ipc_helpers_do_not_use_zero_deadline_recv() {
+        // None of the four IPC helpers (vfs_statx/openat/read/close) may call
+        // ipc_recv_with_deadline.  The encoding helpers (build_*) are pure and
+        // do not call any receive syscall.
+        let ipc_section_start = VFS_CLIENT_SRC
+            .find("// ── IPC helpers")
+            .expect("IPC helpers section comment must be present in vfs_client.rs");
+        let ipc_section = &VFS_CLIENT_SRC[ipc_section_start..];
+        // The test section begins after the IPC section; cut at #[cfg(test)].
+        let test_section_start = ipc_section.find("#[cfg(test)]").unwrap_or(ipc_section.len());
+        let ipc_only = &ipc_section[..test_section_start];
+        assert!(
+            !ipc_only.contains("ipc_recv_with_deadline"),
+            "vfs_client.rs IPC helpers must not use non-blocking ipc_recv_with_deadline (Stage 92 fix)"
+        );
+    }
+
+    // ── 3. IPC helpers decode via &received.message (not &received directly) ─
+
+    #[test]
+    fn stage92_vfs_client_ipc_helpers_decode_via_received_message_field() {
+        // After switching to ipc_recv_v2, callers must pass &received.message
+        // to decode_reply_u64, not &received (which is ReceivedMessage, not Message).
+        let ipc_section_start = VFS_CLIENT_SRC
+            .find("// ── IPC helpers")
+            .expect("IPC helpers section comment must be present");
+        let test_start = VFS_CLIENT_SRC
+            .find("#[cfg(test)]")
+            .unwrap_or(VFS_CLIENT_SRC.len());
+        let ipc_section = &VFS_CLIENT_SRC[ipc_section_start..test_start];
+        assert!(
+            ipc_section.contains("decode_reply_u64(&received.message)"),
+            "vfs_client.rs IPC helpers must call decode_reply_u64(&received.message)"
+        );
+    }
+
+    // ── 4. Module doc no longer claims non-blocking behavior ────────────────
+
+    #[test]
+    fn stage92_vfs_client_module_doc_says_blocking_not_deadline() {
+        // The module-level doc comment must not claim the helpers use
+        // ipc_recv_with_deadline (pre-Stage-92 wording).
+        let module_doc_end = VFS_CLIENT_SRC
+            .find("use crate::ipc::Message;")
+            .unwrap_or(0);
+        let module_doc = &VFS_CLIENT_SRC[..module_doc_end];
+        assert!(
+            !module_doc.contains("ipc_recv_with_deadline"),
+            "vfs_client.rs module doc must not reference ipc_recv_with_deadline after Stage 92 fix"
+        );
+        assert!(
+            module_doc.contains("ipc_recv_v2"),
+            "vfs_client.rs module doc must reference ipc_recv_v2 (blocking receive)"
+        );
+    }
+
+    // ── 5. spawn_v5_cap wrong-sender drain is defense-in-depth only ─────────
+
+    #[test]
+    fn stage92_spawn_v5_drain_loop_is_defense_in_depth_with_blocking_vfs_client() {
+        // With the Stage 92 fix, VFS replies are consumed by vfs_client.rs helpers
+        // before returning to init.  The wrong-sender drain loop in spawn_v5_cap
+        // remains as defense-in-depth but should fire 0 times in a clean run.
+        // Verify the loop is still present (not removed).
+        let fn_start = INIT_SRC
+            .find("fn spawn_v5_cap(")
+            .expect("spawn_v5_cap must remain in init/service.rs as defense-in-depth");
+        let fn_body = &INIT_SRC[fn_start..];
+        assert!(
+            fn_body.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
+            "wrong-sender drain loop must remain in spawn_v5_cap as defense-in-depth"
+        );
+        assert!(
+            fn_body.contains("MAX_WRONG_SENDER_DRAIN"),
+            "MAX_WRONG_SENDER_DRAIN must remain as the drain cap"
+        );
+    }
+
+    // ── 6. Smoke scripts enforce zero wrong-sender count in strict mode ──────
+
+    #[test]
+    fn stage92_smoke_script_aarch64_checks_zero_wrong_sender_count() {
+        let script = include_str!(
+            "../../../scripts/qemu-aarch64-optional-fs-smoke.sh"
+        );
+        assert!(
+            script.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
+            "aarch64 smoke script must check for INIT_SPAWN_V5_WRONG_SENDER_REPLY count"
+        );
+        assert!(
+            script.contains("QEMU_SMOKE_STRICT"),
+            "aarch64 smoke script must gate wrong-sender check on QEMU_SMOKE_STRICT"
+        );
+    }
+
+    #[test]
+    fn stage92_smoke_script_x86_64_checks_zero_wrong_sender_count() {
+        let script = include_str!(
+            "../../../scripts/qemu-x86_64-optional-fs-smoke.sh"
+        );
+        assert!(
+            script.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
+            "x86_64 smoke script must check for INIT_SPAWN_V5_WRONG_SENDER_REPLY count"
+        );
+        assert!(
+            script.contains("QEMU_SMOKE_STRICT"),
+            "x86_64 smoke script must gate wrong-sender check on QEMU_SMOKE_STRICT"
+        );
+    }
+}

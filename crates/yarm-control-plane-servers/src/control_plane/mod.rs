@@ -705,4 +705,99 @@ mod tests {
         );
         assert_eq!(spawn_v5_len, 16, "SpawnV5 result is always 16 bytes (pid:u64 + cap:u64)");
     }
+
+    // ── Stage 92: vfs_client.rs blocking-recv fix ─────────────────────────────
+
+    #[test]
+    fn stage92_vfs_client_all_ipc_helpers_use_ipc_recv_v2() {
+        // Root-cause fix: all four vfs_client.rs IPC helpers must use blocking
+        // ipc_recv_v2 so delayed VFS replies cannot appear on pm_recv during the
+        // subsequent spawn_v5_cap wait.
+        let src = include_str!("../../../yarm-user-rt/src/vfs_client.rs");
+
+        let statx_start = src
+            .find("pub unsafe fn vfs_statx(")
+            .expect("vfs_statx must be defined in vfs_client.rs");
+        assert!(
+            src[statx_start..].contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_statx must use blocking ipc_recv_v2(reply_recv_cap)"
+        );
+
+        let openat_start = src
+            .find("pub unsafe fn vfs_openat(")
+            .expect("vfs_openat must be defined in vfs_client.rs");
+        assert!(
+            src[openat_start..].contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_openat must use blocking ipc_recv_v2(reply_recv_cap)"
+        );
+
+        let read_start = src
+            .find("pub unsafe fn vfs_read(")
+            .expect("vfs_read must be defined in vfs_client.rs");
+        assert!(
+            src[read_start..].contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_read must use blocking ipc_recv_v2(reply_recv_cap)"
+        );
+
+        let close_start = src
+            .find("pub unsafe fn vfs_close(")
+            .expect("vfs_close must be defined in vfs_client.rs");
+        assert!(
+            src[close_start..].contains("ipc_recv_v2(reply_recv_cap)"),
+            "vfs_close must use blocking ipc_recv_v2(reply_recv_cap)"
+        );
+    }
+
+    #[test]
+    fn stage92_vfs_client_ipc_helpers_no_zero_deadline_recv() {
+        // Negative: none of the four IPC helpers may use ipc_recv_with_deadline.
+        // Non-blocking poll at deadline=0 was the root cause of Stage 92 wrong-sender
+        // race on AArch64 (delayed VFS replies missed by pre-spawn drain loop).
+        let src = include_str!("../../../yarm-user-rt/src/vfs_client.rs");
+        let ipc_start = src
+            .find("// ── IPC helpers")
+            .expect("IPC helpers section header must be present in vfs_client.rs");
+        let test_start = src.find("#[cfg(test)]").unwrap_or(src.len());
+        let ipc_section = &src[ipc_start..test_start];
+        assert!(
+            !ipc_section.contains("ipc_recv_with_deadline"),
+            "vfs_client.rs IPC helpers must not use ipc_recv_with_deadline after Stage 92 fix"
+        );
+    }
+
+    #[test]
+    fn stage92_smoke_aarch64_checks_spawn_fail_and_wrong_sender() {
+        let script =
+            include_str!("../../../../scripts/qemu-aarch64-optional-fs-smoke.sh");
+        assert!(
+            script.contains("INIT_RAMFS_SPAWN_FAIL"),
+            "aarch64 smoke script must check for INIT_RAMFS_SPAWN_FAIL"
+        );
+        assert!(
+            script.contains("INIT_EXT4_SPAWN_FAIL"),
+            "aarch64 smoke script must check for INIT_EXT4_SPAWN_FAIL"
+        );
+        assert!(
+            script.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
+            "aarch64 smoke script must enforce zero INIT_SPAWN_V5_WRONG_SENDER_REPLY in strict mode"
+        );
+    }
+
+    #[test]
+    fn stage92_smoke_x86_64_checks_spawn_fail_and_wrong_sender() {
+        let script =
+            include_str!("../../../../scripts/qemu-x86_64-optional-fs-smoke.sh");
+        assert!(
+            script.contains("INIT_RAMFS_SPAWN_FAIL"),
+            "x86_64 smoke script must check for INIT_RAMFS_SPAWN_FAIL"
+        );
+        assert!(
+            script.contains("INIT_EXT4_SPAWN_FAIL"),
+            "x86_64 smoke script must check for INIT_EXT4_SPAWN_FAIL"
+        );
+        assert!(
+            script.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
+            "x86_64 smoke script must enforce zero INIT_SPAWN_V5_WRONG_SENDER_REPLY in strict mode"
+        );
+    }
 }

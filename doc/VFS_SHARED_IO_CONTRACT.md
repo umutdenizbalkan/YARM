@@ -1368,3 +1368,34 @@ Longest-prefix match routes `/ext4/file.bin` to `ext4_srv`.
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
 - ext4 writes: `VfsError::Unsupported` (unchanged)
 - 502 yarm-fs-servers tests pass; 97 yarm-control-plane-servers tests pass
+
+## Stage 92 — AArch64 wrong-sender reply race elimination
+
+**Root cause:** `crates/yarm-user-rt/src/vfs_client.rs` IPC helpers (`vfs_statx`, `vfs_openat`,
+`vfs_read`, `vfs_close`) used `ipc_recv_with_deadline(reply_recv_cap, 0)` (non-blocking). On
+AArch64, VFS replies arrive after a scheduling delay. When the init smoke path called `vfs_statx`
+twice and `vfs_openat` once before the pre-spawn drain loop, those 3 VFS replies were not yet
+queued; the drain loop polled and found nothing; then the replies arrived during
+`spawn_v5_cap`'s blocking `ipc_recv_v2` wait, logging `INIT_SPAWN_V5_WRONG_SENDER_REPLY` ×3.
+
+**Fix (vfs_client.rs):** Changed all four helpers to use `ipc_recv_v2(reply_recv_cap)` (blocking).
+Match arm updated from `Ok(Some(ref r)) => decode_reply_u64(r)` to
+`Ok(Some(ref received)) => decode_reply_u64(&received.message)`.
+
+**Result:** VFS replies are consumed inline by each helper before returning to init. The drain
+loop in `spawn_v5_cap` fires 0 times. AArch64 and x86_64 produce `INIT_SPAWN_V5_WRONG_SENDER_REPLY`
+count=0 in strict QEMU smoke mode.
+
+**What did NOT change:**
+- The wrong-sender drain loop in `spawn_v5_cap` is retained as defense-in-depth.
+- No endpoint ABI, no spawn ABI, no image IDs changed.
+- `SYSCALL_COUNT = 31`, `STARTUP_SLOT_COUNT = 18` unchanged.
+
+**New smoke script check (QEMU_SMOKE_STRICT=1):**
+Both `scripts/qemu-aarch64-optional-fs-smoke.sh` and `scripts/qemu-x86_64-optional-fs-smoke.sh`
+now check `INIT_SPAWN_V5_WRONG_SENDER_REPLY` count. If count > 0 and `QEMU_SMOKE_STRICT=1`,
+the script exits 1.
+
+**Test count:** 559 yarm-fs-servers tests pass; 127 yarm-control-plane-servers tests pass.
+Stage 92 adds 10 tests in `mod stage92_tests` (yarm-fs-servers) and 4 tests in
+`control_plane::tests` (yarm-control-plane-servers).

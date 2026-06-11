@@ -374,3 +374,42 @@ registered in the kernel path table, but the `InitramfsBackend` inode table had 
 
 When adding a new sbin server: bump `MAX_INITRAMFS_INODES`, add the inode, add the
 `from_cpio_newc` match arm, and add a path test.
+
+---
+
+## 10. VFS Client Blocking-Receive Rule (Stage 92)
+
+### 10.1 vfs_client.rs IPC helpers MUST use blocking `ipc_recv_v2`
+
+All four IPC helpers in `crates/yarm-user-rt/src/vfs_client.rs`
+(`vfs_statx`, `vfs_openat`, `vfs_read`, `vfs_close`) MUST use `ipc_recv_v2(reply_recv_cap)`
+(blocking) to consume the VFS server's reply.
+
+**Forbidden:** Using `ipc_recv_with_deadline(reply_recv_cap, 0)` (non-blocking poll)
+in any of these helpers.
+
+**Root cause (Stage 92 AArch64 wrong-sender race):**
+On AArch64, VFS scheduling is slower than on x86_64. When init calls `vfs_statx` or
+`vfs_openat` with a deadline-0 receive, VFS has not yet replied. The helper returns
+`Err(NoReply)` but VFS's reply is still in flight and arrives later — at the shared
+`pm_recv` endpoint (`E_init_reply`). The pre-spawn drain loop (also using deadline-0)
+misses these delayed replies if they arrive after the loop completes. The next
+`ipc_recv_v2` call inside `spawn_v5_cap` then receives 1–3 of those 8-byte VFS replies
+before the real 16-byte SpawnV5 reply, logging `INIT_SPAWN_V5_WRONG_SENDER_REPLY` ×1–3.
+
+**Fix:** Replace `ipc_recv_with_deadline(reply_recv_cap, 0)` with `ipc_recv_v2(reply_recv_cap)`
+and change the match arm from `Ok(Some(ref r)) => decode_reply_u64(r)` to
+`Ok(Some(ref received)) => decode_reply_u64(&received.message)` (since `ipc_recv_v2`
+returns `ReceivedMessage`, not `Message` directly).
+
+### 10.2 spawn_v5_cap wrong-sender drain loop is defense-in-depth only
+
+The drain loop added in Stage 91 (logs `INIT_SPAWN_V5_WRONG_SENDER_REPLY`) must remain
+as defense-in-depth. With the Stage 92 fix applied, this loop should fire 0 times in a
+clean run. Do NOT remove the loop.
+
+### 10.3 Smoke script strict mode must enforce count=0
+
+Both `scripts/qemu-aarch64-optional-fs-smoke.sh` and `scripts/qemu-x86_64-optional-fs-smoke.sh`
+must check `INIT_SPAWN_V5_WRONG_SENDER_REPLY` count and fail when `QEMU_SMOKE_STRICT=1`
+and count > 0. This is the acceptance criterion for Stage 92.
