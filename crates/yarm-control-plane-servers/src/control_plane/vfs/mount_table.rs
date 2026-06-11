@@ -673,4 +673,98 @@ mod tests {
             "/ext4/file.bin must be absent before registration"
         );
     }
+
+    // ── Stage 91: VFS routing safety tests ───────────────────────────────────
+
+    #[test]
+    fn stage91_routing_initramfs_ext4_srv_path_routes_to_initramfs() {
+        // /initramfs/sbin/ext4_srv is an initramfs path, routed to initramfs_srv (cap=10).
+        let table = make_boot_table();
+        let (cap, _) = table
+            .route(b"/initramfs/sbin/ext4_srv")
+            .expect("/initramfs/sbin/ext4_srv must route (it's an initramfs path)");
+        assert_eq!(cap, 10, "/initramfs/sbin/ext4_srv must route to initramfs_srv (cap=10)");
+    }
+
+    #[test]
+    fn stage91_routing_initramfs_ramfs_srv_path_routes_to_initramfs() {
+        // /initramfs/sbin/ramfs_srv is an initramfs path, routed to initramfs_srv (cap=10).
+        let table = make_boot_table();
+        let (cap, _) = table
+            .route(b"/initramfs/sbin/ramfs_srv")
+            .expect("/initramfs/sbin/ramfs_srv must route (it's an initramfs path)");
+        assert_eq!(cap, 10, "/initramfs/sbin/ramfs_srv must route to initramfs_srv (cap=10)");
+    }
+
+    #[test]
+    fn stage91_routing_initramfs_driver_manager_routes_to_initramfs() {
+        // /initramfs/sbin/driver_manager is an initramfs path, routed to initramfs_srv (cap=10).
+        let table = make_boot_table();
+        let (cap, _) = table
+            .route(b"/initramfs/sbin/driver_manager")
+            .expect("/initramfs/sbin/driver_manager must route");
+        assert_eq!(cap, 10, "/initramfs/sbin/driver_manager must route to initramfs_srv (cap=10)");
+    }
+
+    #[test]
+    fn stage91_routing_optional_mounts_do_not_shadow_core_mounts() {
+        // After adding ext4 and fat (hypothetically) to the table,
+        // the core mounts (/initramfs, /dev, /ram) must remain unaffected.
+        let mut table = make_stage88_table();
+        // Hypothetically also register fat (as would happen if FAT were enabled).
+        table.insert_dynamic(b"/fat", 40, 0).expect("fat registration");
+
+        // Core mounts remain intact.
+        let (cap, _) = table.route(b"/initramfs/sbin/ext4_srv").expect("initramfs still routes");
+        assert_eq!(cap, 10, "/initramfs must still route to initramfs_srv");
+
+        let (cap, _) = table.route(b"/dev/null").expect("/dev/null must still route");
+        assert_eq!(cap, 20, "/dev must still route to devfs");
+
+        let (cap, _) = table.route(b"/ram/file.txt").expect("/ram/file.txt must still route");
+        assert_eq!(cap, 30, "/ram must still route to ramfs_srv");
+    }
+
+    #[test]
+    fn stage91_routing_ext4_present_after_dynamic_registration_stage88_table() {
+        // /ext4 is routable in the stage88 table (after ext4_srv registered).
+        let table = make_stage88_table();
+        let (cap, _) = table.route(b"/ext4/service.bin").expect("/ext4/service.bin must route");
+        assert_eq!(cap, 50, "/ext4 paths must route to ext4_srv (cap=50)");
+    }
+
+    #[test]
+    fn stage91_routing_fat_only_routes_when_registered() {
+        // /fat must not route before registration (FAT is disabled by default).
+        let table = make_boot_table();
+        assert!(
+            table.route(b"/fat").is_none(),
+            "/fat must not route before registration (INIT_SPAWN_FAT_SRV=false)"
+        );
+        assert!(
+            table.route(b"/fat/hello.txt").is_none(),
+            "/fat/hello.txt must not route before registration"
+        );
+
+        // After hypothetical registration (as would happen if FAT were enabled):
+        let mut table_with_fat = make_boot_table();
+        table_with_fat.insert_dynamic(b"/fat", 40, 0).expect("fat registration");
+        let (cap, _) = table_with_fat.route(b"/fat/hello.txt").expect("/fat/hello.txt must route after registration");
+        assert_eq!(cap, 40);
+    }
+
+    #[test]
+    fn stage91_routing_ram_unaffected_by_ext4_addition() {
+        // Adding /ext4 to the table must not affect /ram routing.
+        let table_before = make_boot_table();
+        let table_after = make_stage88_table();
+
+        let (cap_before, _) = table_before.route(b"/ram/test.txt").expect("/ram must route");
+        let (cap_after, _) = table_after.route(b"/ram/test.txt").expect("/ram must still route after ext4 added");
+        assert_eq!(
+            cap_before, cap_after,
+            "/ram routing cap must be identical before and after ext4 registration"
+        );
+        assert_eq!(cap_after, 30, "/ram must route to ramfs_srv (cap=30)");
+    }
 }

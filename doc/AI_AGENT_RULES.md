@@ -294,3 +294,83 @@ both the smoke scripts and this document.
 | `DRIVER_MANAGER_READY` | driver_manager | Initialization complete (must be exactly once) |
 | `BLKCACHE_SRV_READY` | blkcache_srv | Initialization complete (must be exactly once) |
 | `VIRTIO_BLK_SRV_READY` | virtio_blk_srv | Initialization complete (must be exactly once) |
+
+### Stage 88-91 optional-FS markers
+
+| Marker | Source | Meaning |
+|--------|--------|---------|
+| `INIT_PM_RECV_DRAIN_BEGIN` | init | Before draining pm_recv of stale replies |
+| `INIT_PM_RECV_DRAIN_DONE count=N` | init | After drain; N replies discarded |
+| `INIT_RAMFS_SPAWN_BEGIN` | init | Before spawning ramfs_srv (image_id=11) |
+| `INIT_RAMFS_SPAWN_OK child_tid=N` | init | ramfs_srv spawned successfully |
+| `INIT_RAMFS_SPAWN_FAIL` | init | ramfs_srv spawn failed (error) |
+| `RAMFS_SRV_ENTRY` | bin/ramfs_srv | ramfs_srv binary entry point reached |
+| `RAMFS_MOUNT_READY` | ramfs/service | RAMFS service loop ready; mount registered |
+| `VFS_MOUNT_REGISTER_RAMFS_OK` | init | VFS accepted RAMFS mount registration |
+| `INIT_EXT4_SPAWN_BEGIN` | init | Before spawning ext4_srv (image_id=12) |
+| `INIT_EXT4_SPAWN_OK child_tid=N` | init | ext4_srv spawned successfully |
+| `INIT_EXT4_SPAWN_FAIL` | init | ext4_srv spawn failed (error) |
+| `EXT4_SRV_ENTRY` | bin/ext4_srv | ext4_srv binary entry point reached |
+| `EXT4_SRV_READY` | ext4/service | ext4_srv service loop ready |
+| `VFS_MOUNT_REGISTER_EXT4_OK` | init | VFS accepted EXT4 mount registration |
+| `INIT_FAT_SPAWN_BEGIN` | init | Before spawning fat_srv (image_id=10) |
+| `INIT_FAT_SPAWN_SKIPPED reason=profile_disabled` | init | FAT skipped: no virtio_blk in profile |
+| `INIT_FAT_SPAWN_SKIPPED reason=server_disabled` | init | FAT skipped: INIT_SPAWN_FAT_SRV=false |
+| `INIT_FAT_SPAWN_OK child_tid=N` | init | fat_srv spawned (only if virtio_blk present) |
+| `FAT_MOUNT_READY` | fat/service | FAT service loop ready; mount registered |
+| `VFS_MOUNT_REGISTER_FAT_OK` | init | VFS accepted FAT mount registration |
+
+---
+
+## 8. Reply-Endpoint Hygiene Rule
+
+### 8.1 Do not reuse a shared reply endpoint across protocol phases without consuming all prior replies
+
+A shared reply endpoint (e.g., `pm_recv`) must have all pending replies consumed or explicitly
+drained before it is used for a new round of protocol traffic. A timeout/deadline-0 receive
+(`ipc_recv_with_deadline(ep, 0)`) is a poll that returns `None` if no message is pending at that
+instant. It does NOT guarantee the endpoint is clean — a reply arriving milliseconds later will
+be misinterpreted as the next operation's reply.
+
+**Correct pattern for shared endpoints:**
+1. If a service helper sends a non-blocking poll to a shared endpoint, drain the endpoint
+   exhaustively before starting the next protocol phase.
+2. The `INIT_PM_RECV_DRAIN_BEGIN` / `INIT_PM_RECV_DRAIN_DONE` pattern in `init/service.rs` is
+   the reference implementation.
+
+**Correct pattern for per-operation replies:**
+Use a dedicated reply-recv cap (not the shared endpoint) for protocol phases that need a clean
+reply window. The ext4 and FAT mount-register helpers each use their own `reply_recv_cap`
+argument, not `pm_recv`.
+
+**Forbidden:** Reusing `pm_recv` for a VFS mount-register reply without draining it first.
+This was the root cause of the "stale 32-byte blkcache reply misinterpreted as 16-byte SpawnV5
+reply" bug fixed in commit 234aed2.
+
+### 8.2 Deadline-0 receives on dedicated caps are safe
+
+A deadline-0 receive on a dedicated per-operation reply cap is safe: only the current
+operation's reply can arrive on that cap. The drain pattern is only required for shared
+endpoints.
+
+---
+
+## 9. Initramfs Path Table Rule
+
+Every server staged in the CPIO archive must be:
+1. Present in the CPIO with 4 KiB-aligned file data (`scripts/pack-initramfs-aligned.py`).
+2. Registered in `spawn_image_path_for_image_id()` so the kernel path table can map
+   image_id → CPIO path.
+3. Registered in `InitramfsBackend` inode/path table (`archive.rs`) so VFS can open/statx
+   it at `/initramfs/sbin/<name>`.
+4. Present in the `from_cpio_newc()` match arm so that live CPIO images update the synthetic
+   inode's `file_len`.
+5. Covered by an `openat_path`/`statx_path` test through the `InitramfsBackend` API.
+
+**The ext4_srv regression (fixed in commit 690951b):** `sbin/ext4_srv` was staged in CPIO and
+registered in the kernel path table, but the `InitramfsBackend` inode table had only 13 slots
+— `ext4_srv` was missing. VFS returned `NotFound` when PM tried to open
+`/initramfs/sbin/ext4_srv`, causing `PM_ELF_ZC_FAIL` on every ext4_srv spawn attempt.
+
+When adding a new sbin server: bump `MAX_INITRAMFS_INODES`, add the inode, add the
+`from_cpio_newc` match arm, and add a path test.
