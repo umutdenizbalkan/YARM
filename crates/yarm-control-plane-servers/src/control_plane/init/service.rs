@@ -718,7 +718,11 @@ pub fn run() {
         yarm_user_rt::syscall::ipc_call(init_blkcache_send_cap as u32, pm_recv, &get_info_msg)
     };
     // SAFETY: pm_recv is init's startup-provided reply endpoint.
-    let get_info_reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) };
+    // Use blocking ipc_recv so the reply is always consumed before optional FS
+    // spawns.  A deadline-zero non-blocking poll may return None if blkcache
+    // replies after the poll; the reply then sits on pm_recv and contaminates
+    // the next spawn_v5_cap recv, causing false SPAWN_FAIL for RAMFS/ext4.
+    let get_info_reply = unsafe { yarm_user_rt::syscall::ipc_recv(pm_recv) };
     match get_info_reply {
         Ok(Some(reply_msg)) => match BlkGetInfoReply::decode(reply_msg.as_slice()) {
             Some(resp) => {
@@ -783,6 +787,23 @@ pub fn run() {
         INIT_SPAWN_RAMFS_SRV || INIT_SPAWN_FAT_SRV || INIT_SPAWN_EXT4_SRV;
 
     if INIT_SPAWN_OPTIONAL_FS_SERVERS {
+        // Drain pm_recv of any stale replies accumulated during smoke calls.
+        // VFS client helpers use non-blocking ipc_recv_with_deadline(_, 0); if
+        // a service replied after the poll window, the reply is still queued on
+        // pm_recv.  Consuming all pending messages here prevents them from
+        // being misinterpreted as SpawnV5 replies for RAMFS/FAT/ext4.
+        yarm_user_rt::user_log!("INIT_PM_RECV_DRAIN_BEGIN");
+        let mut drain_count: u32 = 0;
+        loop {
+            match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(pm_recv, 0) } {
+                Ok(None) => break,
+                Ok(Some(_)) | Err(_) => {
+                    drain_count = drain_count.saturating_add(1);
+                }
+            }
+        }
+        yarm_user_rt::user_log!("INIT_PM_RECV_DRAIN_DONE count={}", drain_count);
+
         // --- Spawn ramfs_srv (image_id=11) and register /ram with VFS. ---
         if INIT_SPAWN_RAMFS_SRV {
             let ramfs_mount_config = RamFsMountConfig::new(
@@ -1079,5 +1100,93 @@ mod tests {
         assert_eq!(plan.process_manager_entry, 0x420000usize);
         assert_eq!(plan.vfs_entry, 0x430000usize);
         assert_eq!(plan.supervisor_entry, 0x440000usize);
+    }
+
+    // ── Stage 90: optional spawn reply decode regression tests ───────────────
+
+    #[test]
+    fn optional_spawn_image_id_11_ramfs_reply_decodes_as_success() {
+        let payload = encode_spawn_v5_reply(10_011, 65_541);
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert_eq!(decoded.pid, 10_011);
+        assert!(
+            spawn_v5_reply_is_success(decoded.pid, decoded.service_send_cap),
+            "ramfs (image_id=11) success reply must decode as success"
+        );
+    }
+
+    #[test]
+    fn optional_spawn_image_id_12_ext4_reply_decodes_as_success() {
+        let payload = encode_spawn_v5_reply(10_012, 65_542);
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert_eq!(decoded.pid, 10_012);
+        assert!(
+            spawn_v5_reply_is_success(decoded.pid, decoded.service_send_cap),
+            "ext4 (image_id=12) success reply must decode as success"
+        );
+    }
+
+    #[test]
+    fn pm_success_reply_cannot_decode_as_zero_pid() {
+        let payload = encode_spawn_v5_reply(9_999, 65_540);
+        let decoded = decode_spawn_v5_reply(&payload).expect("decode");
+        assert_ne!(decoded.pid, 0, "PM success reply must not decode as pid=0");
+        assert!(spawn_v5_reply_is_success(decoded.pid, decoded.service_send_cap));
+    }
+
+    #[test]
+    fn blkcache_reply_shape_32_bytes_fails_spawn_v5_decode() {
+        // BlkGetInfoReply is 32 bytes; SpawnV5CapResult expects exactly 16.
+        // A stale blkcache reply on pm_recv must fail decode and not silently
+        // produce ok=0 child_tid=0 (which would cause a false SPAWN_FAIL log).
+        let blk_reply_shape = [0u8; 32];
+        assert!(
+            decode_spawn_v5_reply(&blk_reply_shape).is_err(),
+            "32-byte blkcache reply shape must fail SpawnV5 decode (expected 16 bytes)"
+        );
+    }
+
+    #[test]
+    fn pm_recv_drain_marker_present_in_init_source() {
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("INIT_PM_RECV_DRAIN_BEGIN"),
+            "init must drain pm_recv before optional FS spawns"
+        );
+        assert!(
+            src.contains("INIT_PM_RECV_DRAIN_DONE"),
+            "init must log drain completion"
+        );
+    }
+
+    #[test]
+    fn pm_recv_drain_appears_before_ramfs_spawn_begin() {
+        let src = include_str!("service.rs");
+        let drain_pos = src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let ramfs_begin_pos = src
+            .find("INIT_RAMFS_SPAWN_BEGIN")
+            .expect("INIT_RAMFS_SPAWN_BEGIN must be present");
+        assert!(
+            drain_pos < ramfs_begin_pos,
+            "pm_recv drain must appear before INIT_RAMFS_SPAWN_BEGIN"
+        );
+    }
+
+    #[test]
+    fn blkcache_smoke_uses_blocking_ipc_recv_not_deadline_zero() {
+        let src = include_str!("service.rs");
+        let smoke_pos = src
+            .find("INIT_BLKCACHE_SMOKE_BEGIN")
+            .expect("blkcache smoke marker must be present");
+        let drain_pos = src
+            .find("INIT_PM_RECV_DRAIN_BEGIN")
+            .expect("drain marker must be present");
+        let smoke_section = &src[smoke_pos..drain_pos];
+        assert!(
+            !smoke_section.contains("ipc_recv_with_deadline(pm_recv, 0)"),
+            "blkcache smoke must not use non-blocking ipc_recv_with_deadline(pm_recv, 0) for GET_INFO reply"
+        );
     }
 }
