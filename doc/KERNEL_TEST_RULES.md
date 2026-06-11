@@ -4302,26 +4302,28 @@ and `pm_image_cpio_name` match arms exist.
 **Prohibited:** Setting `VFS_SERVICE_IMAGE_ID_MAX` above 12 (no new image IDs added in Stage 80).
 Setting it below 12 (blocks fat/ramfs/ext4 spawn). Adding new syscalls (`SYSCALL_COUNT` must remain 31).
 
-### N+72.3 — init spawn wiring: ext4_srv spawned with image_id=12; mount deferred
+### N+72.3 — init spawn wiring: ext4_srv spawned with image_id=12
 
-`init/service.rs::run()` must call `spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)` and log:
-- `INIT_EXT4_SPAWN_BEGIN` before the spawn call.
-- `INIT_EXT4_SPAWN_OK child_tid=<N> mount_deferred=true reason=no-ipc-loop` on success.
-- `EXT4_SRV_READY child_tid=<N>` on success.
+**Stage 80 (historical):** ext4 mount was deferred; logs included `mount_deferred=true reason=no-ipc-loop`.
 
-The `mount_deferred=true` and `reason=no-ipc-loop` tokens document the blocker: ext4's service loop
-is a demo smoke; it does not enter a kernel IPC receive loop. VFS registration cannot be wired until
-a real recv loop exists. Do NOT call `register_ext4_mount_with_vfs()` or any VFS mount registration
-path for ext4 in Stage 80.
+**Stage 88 (current):** ext4 live mount is enabled. `init/service.rs::run()` must:
+- Call `spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)`.
+- Log `INIT_EXT4_SPAWN_BEGIN` before the spawn call.
+- Log `INIT_EXT4_SPAWN_OK child_tid=<N> send_cap=<C>` on success.
+- Log `EXT4_SRV_READY child_tid=<N>` on success.
+- Call `register_ext4_mount_with_vfs(vfs_recv_cap, pm_recv, init_ext4_send_cap)` after spawn.
+- Log `VFS_MOUNT_REGISTER_EXT4_BEGIN prefix=/ext4` and `VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4`.
 
 **Tests (source inspection):** `stage80_init_spawns_ext4_srv_with_image_id_12` and
-`stage80_init_ext4_vfs_mount_deferred_blocker_documented` in `control_plane/mod.rs`.
+`stage88_init_ext4_vfs_mount_enabled_after_spawn_documented` in `control_plane/mod.rs`.
 
-**Prohibited:** Calling `register_ext4_mount_with_vfs()` in Stage 80. Omitting the blocker
-documentation in the init log. Placing stage80 tests inside `init/service.rs` — the `pub mod init`
-is `#[cfg(any(not(test), feature = "legacy-tests"))]` and those tests would never compile in normal
-test mode. All gate tests for init/PM behavior must use `include_str!()` source-inspection in
+**Prohibited:** Omitting `register_ext4_mount_with_vfs()` call after a successful ext4 spawn.
+Re-introducing `mount_deferred=true` or `no-ipc-loop` tokens (those blockers are resolved).
+Placing stage tests inside `init/service.rs` — use `include_str!()` source-inspection in
 `control_plane/mod.rs`.
+
+**Invariants:** `spawn_v5_cap` service_caps remain `[0,0,0,0]` (no config words for ext4).
+ext4 write operations must remain `Err(VfsError::Unsupported)`.
 
 ### N+72.4 — FS backend behavior: ext4 writes must remain Unsupported; FAT must guard no-block-backend
 
@@ -4342,10 +4344,10 @@ Changing `VFS_SHARED_IO_ENABLED` (must remain true from Stage 78).
 
 `sbin/ramfs_srv.rs` must contain `RAMFS_BIN_ENTRY_START`. `sbin/fat_srv.rs` must contain `FAT_BIN_ENTRY_START`.
 `sbin/ext4_srv.rs` must contain `EXT4_BIN_ENTRY_START`, `EXT4_SRV_ENTRY`, and `EXT4_MOUNT_READY`.
-`ext4/service.rs` must NOT contain `ipc_recv(` — the recv loop blocker must remain in place.
+`ext4/service.rs` must contain `ipc_recv_v2(` (resident recv loop, added in Stage 86; required for Stage 88 live mount).
 
-**Tests:** `stage80_ext4_srv_bin_has_entry_and_ready_markers`, `stage80_all_three_fs_server_bins_have_entry_markers`,
-`stage80_ext4_vfs_registration_deferred_blocker_no_ipc_loop` in `mod stage80_tests`.
+**Tests:** `stage80_ext4_srv_bin_has_entry_and_ready_markers`, `stage80_all_three_fs_server_bins_have_entry_markers`
+in `mod stage80_tests`. `stage86_ext4_recv_loop_blocker_lifted` in `mod stage86_tests`.
 
 ### N+72.6 — VFS shared-I/O gate values must be unchanged from Stage 78
 
@@ -4362,7 +4364,7 @@ all remain `true`. These were set in Stage 78 and must not be altered in Stage 8
 *`crates/yarm-control-plane-servers/src/control_plane/mod.rs` — `mod tests`:*
 - `stage80_pm_image_id_range_covers_fs_servers`
 - `stage80_init_spawns_ext4_srv_with_image_id_12`
-- `stage80_init_ext4_vfs_mount_deferred_blocker_documented`
+- `stage88_init_ext4_vfs_mount_enabled_after_spawn_documented` (renamed from `stage80_init_ext4_vfs_mount_deferred_blocker_documented` in Stage 89)
 - `stage80_pm_ext4_cpio_path_registered`
 - `stage80_syscall_count_unchanged`
 
@@ -4374,12 +4376,15 @@ all remain `true`. These were set in Stage 78 and must not be altered in Stage 8
 - `stage80_ramfs_run_with_config_smoke_unchanged`
 - `stage80_ext4_srv_bin_has_entry_and_ready_markers`
 - `stage80_all_three_fs_server_bins_have_entry_markers`
-- `stage80_ext4_vfs_registration_deferred_blocker_no_ipc_loop`
+- `stage80_ext4_vfs_registration_deferred_blocker_no_ipc_loop` *(removed in Stage 89; blocker lifted in Stage 86; mount enabled in Stage 88)*
+- `stage86_ext4_recv_loop_blocker_lifted` (in `mod stage86_tests`) — verifies `ipc_recv_v2` is present
+- `stage88_init_ext4_vfs_mount_enabled_after_spawn_documented` (in `mod tests`) — verifies Stage 88 live-mount state
 
 **Hard invariants:**
 - `VFS_SERVICE_IMAGE_ID_MAX = 12`; `SYSCALL_COUNT = 31` — neither may change in Stage 80.
-- `ext4/service.rs` must NOT contain `ipc_recv(` until the recv-loop blocker is lifted.
+- `ext4/service.rs` must contain `ipc_recv_v2(` (recv-loop blocker lifted in Stage 86).
 - `VFS_SHARED_IO_ENABLED` must remain `true` (unchanged from Stage 78).
+- ext4 write must remain `Err(VfsError::Unsupported)` (unchanged).
 - CPIO archive must contain `sbin/ramfs_srv`, `sbin/fat_srv`, `sbin/ext4_srv` all at 4096-aligned offsets.
 - No kernel syscall/IPC/VM/cap internals changed by Stage 80.
 

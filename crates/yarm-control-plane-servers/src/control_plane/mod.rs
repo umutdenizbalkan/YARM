@@ -240,15 +240,26 @@ mod tests {
     }
 
     #[test]
-    fn stage80_init_ext4_vfs_mount_deferred_blocker_documented() {
+    fn stage88_init_ext4_vfs_mount_enabled_after_spawn_documented() {
+        // Stage 88 supersedes the Stage-80 deferred-mount requirement.
+        // ext4 live mount is now enabled: register_ext4_mount_with_vfs() is called
+        // after a successful ext4 spawn and /ext4 is registered read-only with VFS.
         let init_src = include_str!("init/service.rs");
         assert!(
-            init_src.contains("mount_deferred=true"),
-            "init must document ext4 VFS mount deferral reason in log marker"
+            init_src.contains("register_ext4_mount_with_vfs("),
+            "init must call register_ext4_mount_with_vfs after successful ext4 spawn (Stage 88)"
         );
         assert!(
-            init_src.contains("no-ipc-loop"),
-            "init must document the specific blocker (no-ipc-loop) for ext4 VFS registration"
+            init_src.contains("VFS_MOUNT_REGISTER_EXT4_OK"),
+            "init must document VFS_MOUNT_REGISTER_EXT4_OK marker for /ext4 registration"
+        );
+        assert!(
+            !init_src.contains("mount_deferred=true"),
+            "mount_deferred=true must be absent (Stage 88: ext4 is live-mounted, not deferred)"
+        );
+        assert!(
+            !init_src.contains("no-ipc-loop"),
+            "no-ipc-loop blocker must be absent (lifted in Stage 86; mount wired in Stage 88)"
         );
     }
 
