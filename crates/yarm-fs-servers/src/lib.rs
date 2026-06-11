@@ -1740,4 +1740,67 @@ mod stage91_tests {
             );
         }
     }
+
+    #[test]
+    fn stage91_pm_vfs_spawn_prefers_service_recv_ep_for_vfs_subcalls() {
+        // Source-scan: pm_vfs_spawn_inline must prefer process_manager_service_recv_ep
+        // (slot 12, PM-private) over process_manager_reply_recv_cap (slot 2, shared
+        // with init's pm_recv endpoint cap 65537).
+        // This is the root-cause fix for INIT_RAMFS/EXT4_SPAWN_FAIL: VFS (tid=10002)
+        // sends 8-byte OPENAT replies to the shared endpoint during PM's grant path,
+        // and init reads those before PM's real 16-byte SpawnV5 reply.
+        let pm_src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/process_manager/service.rs"
+        );
+        let fn_start = pm_src
+            .find("fn pm_vfs_spawn_inline(")
+            .expect("pm_vfs_spawn_inline must exist in process_manager/service.rs");
+        let fn_end = (fn_start + 2500).min(pm_src.len());
+        let fn_body = &pm_src[fn_start..fn_end];
+        assert!(
+            fn_body.contains("process_manager_service_recv_ep"),
+            "pm_vfs_spawn_inline must use process_manager_service_recv_ep (slot 12)"
+        );
+        assert!(
+            fn_body.contains(".or(ctx.process_manager_reply_recv_cap)"),
+            "pm_vfs_spawn_inline must fall back to slot 2 only if service_recv_ep absent"
+        );
+        // Must NOT unconditionally use slot 2 as the primary VFS reply endpoint.
+        let slot2_only_pattern = "ctx\n        .process_manager_reply_recv_cap\n        .ok_or";
+        assert!(
+            !fn_body.contains(slot2_only_pattern),
+            "pm_vfs_spawn_inline must not use slot 2 as primary VFS reply endpoint"
+        );
+    }
+
+    #[test]
+    fn stage91_spawn_v5_cap_wrong_sender_drain_loop_present() {
+        // Source-scan: spawn_v5_cap in init/service.rs must contain the wrong-sender
+        // drain loop that guards against VFS 8-byte replies being misread as SpawnV5
+        // failures.  Both RAMFS (image_id=11) and ext4 (image_id=12) spawns call
+        // spawn_v5_cap, so both are protected by this loop.
+        let src = include_str!(
+            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
+        let fn_start = src
+            .find("fn spawn_v5_cap(")
+            .expect("spawn_v5_cap must exist in init/service.rs");
+        let fn_body = &src[fn_start..];
+        assert!(
+            fn_body.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
+            "spawn_v5_cap must log INIT_SPAWN_V5_WRONG_SENDER_REPLY"
+        );
+        assert!(
+            fn_body.contains("expected_pm_tid"),
+            "spawn_v5_cap must compute expected_pm_tid (init_tid + 2)"
+        );
+        assert!(
+            fn_body.contains("MAX_WRONG_SENDER_DRAIN"),
+            "spawn_v5_cap must cap the drain loop with MAX_WRONG_SENDER_DRAIN"
+        );
+        assert!(
+            fn_body.contains("loop {"),
+            "spawn_v5_cap must use a loop to drain wrong-sender replies before accepting"
+        );
+    }
 }
