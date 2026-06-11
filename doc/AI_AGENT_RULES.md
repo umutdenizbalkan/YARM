@@ -413,3 +413,48 @@ clean run. Do NOT remove the loop.
 Both `scripts/qemu-aarch64-optional-fs-smoke.sh` and `scripts/qemu-x86_64-optional-fs-smoke.sh`
 must check `INIT_SPAWN_V5_WRONG_SENDER_REPLY` count and fail when `QEMU_SMOKE_STRICT=1`
 and count > 0. This is the acceptance criterion for Stage 92.
+
+---
+
+## 11. Official FS Profile Matrix (Stage 93)
+
+### 11.1 Profile definitions
+
+| Profile | RAMFS | ext4 | FAT | Block device | Default? |
+|---------|-------|------|-----|--------------|----------|
+| `core` | disabled | disabled | disabled | none | no |
+| `optional-fs` | ✓ live | ✓ read-only | disabled | none | **YES** |
+| `fat-block` | ✓ live | ✓ read-only | ✓ read-only | virtio-blk required | no |
+| `full-fs-experimental` | ✓ | ✓ | ✓ (future) | virtio-blk | future |
+
+**Current default is `optional-fs`:** RAMFS + ext4 live, FAT disabled.
+
+### 11.2 Gate constants per profile
+
+| Constant | optional-fs | fat-block |
+|----------|-------------|-----------|
+| `INIT_SPAWN_RAMFS_SRV` | `true` | `true` |
+| `INIT_SPAWN_FAT_SRV` | **`false`** | `true` |
+| `INIT_SPAWN_EXT4_SRV` | `true` | `true` |
+| `VFS_FAT_LIVE_MOUNT_ENABLED` | **`false`** | `true` |
+| `VFS_FAT_SHARED_IO_ENABLED` | **`false`** | **`false`** (until read proven) |
+| `VFS_EXT4_LIVE_MOUNT_ENABLED` | `true` | `true` |
+| `VFS_RAMFS_LIVE_MOUNT_ENABLED` | `true` | `true` |
+
+### 11.3 Forbidden patterns in smoke strict mode (`QEMU_SMOKE_STRICT=1`)
+
+All profiles: `INIT_SPAWN_V5_WRONG_SENDER_REPLY`, `KSPAWN_EXTRA_CAP_DELEGATE_FAIL`,
+`PM_VFS_SPAWN_FAIL`, `reason=bad_fd_decode`, `panic`.
+
+`optional-fs` profile (FAT disabled): `INIT_FAT_SPAWN_OK` must be absent.
+
+`fat-block` profile: `INIT_FAT_SPAWN_FAIL`, `FAT_MOUNT_FAILED`, `PM_ELF_ZC_FAIL image_id=10`.
+
+### 11.4 IpcBlockDevice blocking-receive rule
+
+`IpcBlockDevice::read_exact_at` and `write_sector` in `crates/yarm-fs-servers/src/fs/fat/fs.rs`
+MUST use `ipc_recv_v2` (blocking). Using `ipc_recv_with_deadline(_, 0)` is a
+scheduling race (same root cause as Stage 92's `vfs_client.rs` fix) and will cause
+`FatError::Io` on any architecture where blkcache_srv hasn't replied within 0 ticks.
+
+This was fixed in Stage 93 as part of FAT production groundwork.

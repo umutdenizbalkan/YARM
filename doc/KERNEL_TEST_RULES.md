@@ -4837,3 +4837,65 @@ and count > 0, the script sets `smoke_fail=1`.
 
 **Run:** `cargo test -p yarm-fs-servers --lib stage92` and
 `cargo test -p yarm-control-plane-servers --lib stage92`
+
+---
+
+## Stage 93 — FAT production virtio-blk profile + official FS profile matrix
+
+**Problem:** FAT `IpcBlockDevice::read_exact_at` and `write_sector` used
+`ipc_recv_with_deadline(_, 0)` (non-blocking, deadline=0 ticks). Same root cause as
+Stage 92: blkcache_srv may not have processed the `BLK_OP_READ` request within 0 ticks;
+the non-blocking poll would return `None` → `FatError::Io` immediately.
+
+**Fix:** Changed both methods to `ipc_recv_v2` (blocking). Scoped to
+`impl BlockDevice for IpcBlockDevice` in `crates/yarm-fs-servers/src/fs/fat/fs.rs`.
+
+**Official FS profiles defined (see `AI_AGENT_RULES.md` Rule 11):**
+- `optional-fs` (default): RAMFS + ext4 live, FAT disabled
+- `fat-block`: RAMFS + ext4 + FAT, requires virtio-blk device
+- `core` and `full-fs-experimental` documented as future profiles
+
+**New scripts:**
+- `scripts/create-fat-image.sh` — creates 1 MiB FAT image (mtools or mkfs.fat)
+- `scripts/qemu-aarch64-fat-block-smoke.sh` — fat-block profile smoke for aarch64
+- `scripts/qemu-x86_64-fat-block-smoke.sh` — fat-block profile smoke for x86_64
+
+**Optional-FS smoke hardening:**
+Both `scripts/qemu-*-optional-fs-smoke.sh` now check:
+`KSPAWN_EXTRA_CAP_DELEGATE_FAIL`, `PM_VFS_SPAWN_FAIL`, `reason=bad_fd_decode`,
+`fallback=phase2b` (strict), `panic` — all unconditionally set `smoke_fail=1`.
+
+**Test groups (yarm-fs-servers `mod stage93_tests` — 13 tests):**
+
+1. `stage93_ipc_block_device_read_uses_blocking_recv_v2` — read uses ipc_recv_v2
+2. `stage93_ipc_block_device_write_uses_blocking_recv_v2` — write uses ipc_recv_v2
+3. `stage93_fat_live_mount_gate_is_false_in_default_profile` — VFS_FAT_LIVE_MOUNT_ENABLED=false
+4. `stage93_fat_shared_io_gate_is_false_in_default_profile` — VFS_FAT_SHARED_IO_ENABLED=false
+5. `stage93_init_spawn_fat_srv_is_false_in_default_profile` — INIT_SPAWN_FAT_SRV=false
+6. `stage93_ext4_rejects_unknown_opcode_as_unsupported` — opcode 0x4242 → Unsupported
+7. `stage93_ext4_rejects_write_inline_opcode_28_as_unsupported` — VFS_OP_WRITE_INLINE → Unsupported
+8. `stage93_ext4_read_returns_zero_for_empty_file` — empty file → bytes_read=0
+9. `stage93_ext4_write_returns_unsupported_after_read` — write after open → Unsupported
+10. `stage93_optional_fs_smoke_scripts_check_kspawn_fail` — scripts check KSPAWN/PM_VFS/bad_fd
+11. `stage93_fat_block_smoke_script_aarch64_has_virtio_blk_args` — aarch64 fat smoke
+12. `stage93_fat_block_smoke_script_x86_64_has_virtio_blk_args` — x86_64 fat smoke
+13. `stage93_create_fat_image_script_exists_with_mtools_path` — create-fat-image.sh
+
+**Test groups (yarm-control-plane-servers `control_plane::tests` Stage 93 — 3 tests):**
+
+1. `stage93_ipc_block_device_no_zero_deadline_recv_in_fat_fs` — no deadline=0 in IpcBlockDevice impl
+2. `stage93_fat_default_profile_all_gates_disabled` — all three FAT gates false
+3. `stage93_smoke_scripts_check_all_fatal_patterns` — scripts check all fatal patterns
+
+**FAT status: profile-ready (blocked on virtio-blk round-trip proof).**
+See `FAT_SERVER_CONTRACT.md` Stage 93 section for exact activation checklist.
+
+**Invariants unchanged from Stage 92:**
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`
+- `INIT_SPAWN_FAT_SRV = false` (default optional-fs profile)
+- `VFS_FAT_LIVE_MOUNT_ENABLED = false`, `VFS_FAT_SHARED_IO_ENABLED = false`
+- `MAX_INITRAMFS_INODES = 14`
+- SpawnV5 ABI; SYSCALL_COUNT = 31; STARTUP_SLOT_COUNT = 18
+
+**Run:** `cargo test -p yarm-fs-servers --lib stage93` and
+`cargo test -p yarm-control-plane-servers --lib stage93`

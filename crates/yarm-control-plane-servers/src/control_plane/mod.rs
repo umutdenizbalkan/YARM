@@ -800,4 +800,70 @@ mod tests {
             "x86_64 smoke script must enforce zero INIT_SPAWN_V5_WRONG_SENDER_REPLY in strict mode"
         );
     }
+
+    // ── Stage 93: FAT production groundwork ──────────────────────────────────
+
+    #[test]
+    fn stage93_ipc_block_device_no_zero_deadline_recv_in_fat_fs() {
+        // Both IpcBlockDevice::read_exact_at and write_sector must use ipc_recv_v2
+        // (blocking) to receive blkcache replies.  Same root cause as Stage 92's
+        // vfs_client.rs fix: deadline=0 is non-blocking and returns immediately
+        // if blkcache_srv hasn't yet processed the request.
+        let src = include_str!("../../../yarm-fs-servers/src/fs/fat/fs.rs");
+        let impl_start = src
+            .find("impl BlockDevice for IpcBlockDevice")
+            .expect("IpcBlockDevice impl must be present in fat/fs.rs");
+        let impl_body = &src[impl_start..];
+        assert!(
+            !impl_body.contains("ipc_recv_with_deadline"),
+            "IpcBlockDevice must not use ipc_recv_with_deadline (deadline-0 race same as Stage 92)"
+        );
+        assert!(
+            impl_body.contains("ipc_recv_v2(self.reply_recv_cap)"),
+            "IpcBlockDevice::read_exact_at must use ipc_recv_v2"
+        );
+        assert!(
+            impl_body.contains("ipc_recv_v2(reply_recv_cap)"),
+            "IpcBlockDevice::write_sector must use ipc_recv_v2"
+        );
+    }
+
+    #[test]
+    fn stage93_fat_default_profile_all_gates_disabled() {
+        // All three FAT production gates must be false in the default optional-fs profile.
+        let pm_src = include_str!("process_manager/service.rs");
+        let shared_src = include_str!("../../../yarm-fs-servers/src/fs/common/shared_io_adapter.rs");
+        let init_src = include_str!("init/service.rs");
+        assert!(
+            init_src.contains("const INIT_SPAWN_FAT_SRV: bool = false"),
+            "INIT_SPAWN_FAT_SRV must be false in default profile"
+        );
+        assert!(
+            shared_src.contains("VFS_FAT_LIVE_MOUNT_ENABLED: bool = false"),
+            "VFS_FAT_LIVE_MOUNT_ENABLED must be false in default profile"
+        );
+        assert!(
+            shared_src.contains("VFS_FAT_SHARED_IO_ENABLED: bool = false"),
+            "VFS_FAT_SHARED_IO_ENABLED must be false in default profile"
+        );
+        assert!(
+            pm_src.contains("12 => b\"/initramfs/sbin/ext4_srv\""),
+            "PM must still map image_id=12 to ext4_srv (regression guard)"
+        );
+    }
+
+    #[test]
+    fn stage93_smoke_scripts_check_all_fatal_patterns() {
+        let aarch64 = include_str!("../../../../scripts/qemu-aarch64-optional-fs-smoke.sh");
+        let x86_64 = include_str!("../../../../scripts/qemu-x86_64-optional-fs-smoke.sh");
+        for (arch, script) in &[("aarch64", aarch64), ("x86_64", x86_64)] {
+            for pattern in &["KSPAWN_EXTRA_CAP_DELEGATE_FAIL", "PM_VFS_SPAWN_FAIL",
+                             "reason=bad_fd_decode", "fallback=phase2b", "panic"] {
+                assert!(
+                    script.contains(pattern),
+                    "{arch} optional-FS smoke must check for {pattern}"
+                );
+            }
+        }
+    }
 }
