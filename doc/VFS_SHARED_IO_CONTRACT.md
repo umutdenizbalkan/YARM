@@ -1399,3 +1399,57 @@ the script exits 1.
 **Test count:** 559 yarm-fs-servers tests pass; 127 yarm-control-plane-servers tests pass.
 Stage 92 adds 10 tests in `mod stage92_tests` (yarm-fs-servers) and 4 tests in
 `control_plane::tests` (yarm-control-plane-servers).
+
+## Stage 93 — FAT production virtio-blk profile + official FS profile matrix
+
+**Changes in Stage 93:**
+
+1. **IpcBlockDevice blocking-recv fix** (`fat/fs.rs`): `read_exact_at` and `write_sector`
+   now use `ipc_recv_v2` (blocking) instead of `ipc_recv_with_deadline(_, 0)`. Same
+   root cause as Stage 92: deadline=0 = non-blocking poll; blkcache_srv reply arrives
+   after the poll returns, causing `FatError::Io` on any slow scheduler.
+
+2. **Official FS profile matrix** (see `AI_AGENT_RULES.md` Rule 11):
+
+   | Profile | RAMFS | ext4 | FAT | Block device |
+   |---------|-------|------|-----|--------------|
+   | `optional-fs` (default) | ✓ live | ✓ read-only | disabled | none |
+   | `fat-block` | ✓ | ✓ | ✓ read-only | virtio-blk required |
+
+3. **FAT block smoke scripts**: `scripts/qemu-aarch64-fat-block-smoke.sh` and
+   `scripts/qemu-x86_64-fat-block-smoke.sh` attach a `virtio-blk-pci` device backed by
+   `FAT_IMAGE` and check all FAT markers (`FAT_MOUNT_READY`, `VFS_MOUNT_REGISTER_FAT_OK`, etc.).
+
+4. **Image creation script**: `scripts/create-fat-image.sh` creates a 1 MiB FAT image
+   containing `hello.txt` and `dir/nested.txt` using `mtools` (rootless) or `mkfs.fat`.
+
+5. **Optional-FS smoke hardening**: both optional-FS smoke scripts now check for
+   `KSPAWN_EXTRA_CAP_DELEGATE_FAIL`, `PM_VFS_SPAWN_FAIL`, `reason=bad_fd_decode`,
+   `fallback=phase2b`, and `panic` — all set `smoke_fail=1` unconditionally.
+
+6. **ext4 hardening tests** (Stage 93):
+   - Unknown opcode returns `VfsError::Unsupported` (not panic)
+   - `VFS_OP_WRITE_INLINE` (opcode 28) on ext4 returns `Unsupported`
+   - `read` on empty ext4 demo file returns 0 bytes
+   - `write` after open still returns `Unsupported`
+
+**FAT gate state (unchanged from Stage 92):**
+- `INIT_SPAWN_FAT_SRV = false` (default optional-fs profile)
+- `VFS_FAT_LIVE_MOUNT_ENABLED = false`
+- `VFS_FAT_SHARED_IO_ENABLED = false`
+
+**Blockers for fat-block profile activation** (see `FAT_SERVER_CONTRACT.md`):
+- Set `INIT_SPAWN_FAT_SRV = true` in fat-block profile (compile-time)
+- Prove blkcache whole-sector read round-trip on QEMU virtio-blk
+- Establish virtio_blk_srv device-presence handshake before FAT reads
+
+**Invariants unchanged:**
+- SYSCALL_COUNT = 31, STARTUP_SLOT_COUNT = 18
+- SpawnV5 ABI, image IDs, initramfs packing: unchanged
+- ext4 writes: `VfsError::Unsupported` (unchanged)
+- FAT writes on IPC backend: `VfsError::Unsupported` (unchanged)
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`
+
+**Test count:** 572 yarm-fs-servers tests pass; 130 yarm-control-plane-servers tests pass.
+Stage 93 adds 13 tests in `mod stage93_tests` (yarm-fs-servers) and 3 tests in
+`control_plane::tests` (yarm-control-plane-servers).

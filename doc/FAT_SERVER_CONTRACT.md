@@ -139,6 +139,68 @@ When enabled, the smoke marker block counts `INIT_FAT_SPAWN_BEGIN`,
 `INIT_FAT_SPAWN_OK`, `FAT_CONFIG_FOUND`, `FAT_BLOCK_BACKEND_STARTUP_CAP`,
 `FAT_MOUNT_READY`, `FAT_MOUNT_FAILED`, and `VFS_MOUNT_REGISTER_FAT_OK`.
 
+## Stage 93: Production readiness checklist
+
+Stage 93 added FAT block-device profile groundwork. The following items are **done**:
+
+- `IpcBlockDevice::read_exact_at` and `write_sector` now use `ipc_recv_v2` (blocking)
+  instead of `ipc_recv_with_deadline(_, 0)` — same deadline=0 race fixed in Stage 92
+  for `vfs_client.rs`. Without this fix, block reads would fail immediately on any
+  scheduler where blkcache_srv has not yet replied within 0 ticks.
+- `scripts/create-fat-image.sh` creates a 1 MiB FAT image with `hello.txt` and
+  `dir/nested.txt` using `mtools` (rootless) or `mkfs.fat + mount` (fallback).
+- `scripts/qemu-aarch64-fat-block-smoke.sh` and `scripts/qemu-x86_64-fat-block-smoke.sh`:
+  attach `virtio-blk-pci` device backed by the FAT image; check all FAT markers.
+- Official FS profile matrix documented in `VFS_SHARED_IO_CONTRACT.md`.
+
+The following items are **blocked** pending:
+
+1. **INIT_SPAWN_FAT_SRV must be changed to `true`** in the fat-block profile.
+   Currently `false` to prevent spurious spawns in the optional-fs profile.
+   Change only via a compile-time feature or config, not in the default binary.
+
+2. **Blkcache whole-sector read round-trip contract** must be proven on QEMU:
+   `IpcBlockDevice::read_exact_at` issues `BLK_OP_READ` in 120-byte chunks; sector
+   assembly logic in blkcache_srv must correctly re-assemble multi-chunk replies.
+
+3. **virtio_blk_srv device-presence handshake**: `virtio_blk_srv` currently has no
+   probe/ready handshake. `fat_srv` must not attempt `BLK_OP_READ` before `virtio_blk_srv`
+   has signaled device readiness.
+
+4. **FAT shared-I/O** (`VFS_FAT_SHARED_IO_ENABLED`): remains `false` until the normal
+   IPC read path is proven on real block hardware with at least one full file round-trip.
+
+5. **FAT writes**: production IPC-backed writes remain unsupported until the
+   whole-sector read/RMW contract is established and tested.
+
+### Exact activation sequence for fat-block profile
+
+```
+INIT_SPAWN_FAT_SRV = true        (fat-block profile compile flag)
+VFS_FAT_LIVE_MOUNT_ENABLED = true (follows INIT_SPAWN_FAT_SRV)
+VFS_FAT_SHARED_IO_ENABLED = false (prove read path first)
+
+QEMU args: -drive file=fat.img,if=none,id=blk0,format=raw
+           -device virtio-blk-pci,drive=blk0
+
+Expected markers (FAT_SMOKE_EXPECTED=1):
+  INIT_FAT_SPAWN_BEGIN
+  INIT_FAT_SPAWN_OK
+  FAT_BIN_ENTRY_START
+  FAT_CONFIG_FOUND
+  FAT_BLOCK_BACKEND_STARTUP_CAP
+  FAT_MOUNT_READY
+  FAT_SRV_READY
+  VFS_MOUNT_REGISTER_FAT_OK prefix=/fat
+
+Forbidden:
+  INIT_FAT_SPAWN_FAIL
+  FAT_MOUNT_FAILED
+  PM_ELF_ZC_FAIL image_id=10
+  KSPAWN_EXTRA_CAP_DELEGATE_FAIL
+  PM_VFS_SPAWN_FAIL
+```
+
 ## Known limitations
 
 - The VFS reply ABI currently returns only the historical scalar `statx` value, so

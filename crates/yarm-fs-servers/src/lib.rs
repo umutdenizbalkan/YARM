@@ -1988,3 +1988,253 @@ mod stage92_tests {
         );
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Stage 93: FAT production virtio-blk profile + official FS profile matrix.
+//
+// Key changes:
+//   - IpcBlockDevice::read_exact_at / write_sector: ipc_recv_v2 (blocking)
+//     instead of ipc_recv_with_deadline(_, 0) — same deadline-0 bug as Stage 92
+//   - Official FS profile matrix documented
+//   - FAT block smoke scripts + create-fat-image.sh added
+//   - Optional-FS smoke scripts: add KSPAWN/PM_VFS_SPAWN_FAIL/bad_fd/panic/phase2b checks
+//   - ext4 hardening: unknown-opcode, write-inline, read, short-EOF tests
+// ════════════════════════════════════════════════════════════════════════════
+#[cfg(test)]
+mod stage93_tests {
+    use crate::fs::common::vfs_service::VfsService;
+    use crate::fs::common::vfs_ipc::{
+        VfsError, openat_inline_message, read_message, ReadWriteRequest,
+    };
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::ext4::service::Ext4Service;
+    use yarm_ipc_abi::vfs_abi::VFS_OP_WRITE_INLINE;
+    use yarm_srv_common::vfs_reply::VfsReply;
+
+    const FAT_FS_SRC: &str = include_str!("fs/fat/fs.rs");
+    const SHARED_IO_SRC: &str =
+        include_str!("fs/common/shared_io_adapter.rs");
+    const INIT_SRC: &str = include_str!(
+        "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    // ── 1. IpcBlockDevice blocking-recv fix (same as Stage 92 for vfs_client) ─
+
+    #[test]
+    fn stage93_ipc_block_device_read_uses_blocking_recv_v2() {
+        // IpcBlockDevice::read_exact_at must use ipc_recv_v2 (blocking) to
+        // receive the blkcache reply.  Using deadline=0 (non-blocking) would
+        // cause immediate Err(FatError::Io) before blkcache_srv has a chance
+        // to process the read request — same race as Stage 92's vfs_client.rs fix.
+        //
+        // Scope to the IpcBlockDevice impl block (not the FatBlockDevice dispatch wrapper).
+        let impl_start = FAT_FS_SRC
+            .find("impl BlockDevice for IpcBlockDevice")
+            .expect("IpcBlockDevice BlockDevice impl must be present in fat/fs.rs");
+        let impl_body = &FAT_FS_SRC[impl_start..];
+        let fn_start = impl_body
+            .find("fn read_exact_at(")
+            .expect("read_exact_at must be inside impl BlockDevice for IpcBlockDevice");
+        let fn_body = &impl_body[fn_start..];
+        let fn_end = fn_body.find("\n    fn ").unwrap_or(fn_body.len());
+        let read_body = &fn_body[..fn_end];
+        assert!(
+            read_body.contains("ipc_recv_v2(self.reply_recv_cap)"),
+            "IpcBlockDevice::read_exact_at must use ipc_recv_v2 (blocking)"
+        );
+        assert!(
+            !read_body.contains("ipc_recv_with_deadline"),
+            "IpcBlockDevice::read_exact_at must not use ipc_recv_with_deadline (deadline-0 race)"
+        );
+    }
+
+    #[test]
+    fn stage93_ipc_block_device_write_uses_blocking_recv_v2() {
+        // write_sector must also use ipc_recv_v2 to receive the BlkWriteReply.
+        let fn_start = FAT_FS_SRC
+            .find("fn write_sector(")
+            .expect("write_sector must be defined in fat/fs.rs");
+        let fn_body = &FAT_FS_SRC[fn_start..];
+        let fn_end = fn_body.find("\nfn ").unwrap_or(fn_body.len());
+        let write_body = &fn_body[..fn_end];
+        assert!(
+            write_body.contains("ipc_recv_v2(reply_recv_cap)"),
+            "IpcBlockDevice::write_sector must use ipc_recv_v2 (blocking)"
+        );
+        assert!(
+            !write_body.contains("ipc_recv_with_deadline"),
+            "IpcBlockDevice::write_sector must not use ipc_recv_with_deadline"
+        );
+    }
+
+    // ── 2. FAT gate constants locked in default profile ──────────────────────
+
+    #[test]
+    fn stage93_fat_live_mount_gate_is_false_in_default_profile() {
+        assert!(
+            SHARED_IO_SRC.contains("VFS_FAT_LIVE_MOUNT_ENABLED: bool = false"),
+            "VFS_FAT_LIVE_MOUNT_ENABLED must be false in default optional-fs profile (needs virtio-blk)"
+        );
+    }
+
+    #[test]
+    fn stage93_fat_shared_io_gate_is_false_in_default_profile() {
+        assert!(
+            SHARED_IO_SRC.contains("VFS_FAT_SHARED_IO_ENABLED: bool = false"),
+            "VFS_FAT_SHARED_IO_ENABLED must be false in default profile (no FAT read-shared proof yet)"
+        );
+    }
+
+    #[test]
+    fn stage93_init_spawn_fat_srv_is_false_in_default_profile() {
+        assert!(
+            INIT_SRC.contains("const INIT_SPAWN_FAT_SRV: bool = false"),
+            "INIT_SPAWN_FAT_SRV must be false in default optional-fs profile"
+        );
+    }
+
+    // ── 3. ext4 hardening: unknown and forbidden opcodes ─────────────────────
+
+    #[test]
+    fn stage93_ext4_rejects_unknown_opcode_as_unsupported() {
+        // Any opcode not in the VFS dispatch table returns Err(VfsError::Unsupported)
+        // rather than panicking or returning garbage.  Opcode 0x4242 is not in the table.
+        let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+        let unknown_msg = yarm_user_rt::ipc::Message::with_header(0, 0x4242, 0, None, &[])
+            .expect("build unknown-opcode message");
+        assert_eq!(
+            svc.handle(unknown_msg),
+            Err(VfsError::Unsupported),
+            "ext4 service must return Unsupported for unknown opcode 0x4242"
+        );
+    }
+
+    #[test]
+    fn stage93_ext4_rejects_write_inline_opcode_28_as_unsupported() {
+        // VFS_OP_WRITE_INLINE (28) is FAT-only. The generic VfsService catch-all
+        // returns Unsupported, so ext4 must not decode it as a real write.
+        let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+        let inline_payload = [1u8; 32];
+        let write_inline_msg =
+            yarm_user_rt::ipc::Message::with_header(0, VFS_OP_WRITE_INLINE, 0, None, &inline_payload)
+                .expect("build write-inline message");
+        assert_eq!(
+            svc.handle(write_inline_msg),
+            Err(VfsError::Unsupported),
+            "ext4 service must reject VFS_OP_WRITE_INLINE (opcode 28) with Unsupported"
+        );
+    }
+
+    // ── 4. ext4 hardening: read and short-EOF ────────────────────────────────
+
+    #[test]
+    fn stage93_ext4_read_returns_zero_for_empty_file() {
+        // ext4 demo files have file_len=0; a read request should return 0 bytes read.
+        let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+        let open = openat_inline_message(0, EXT4_SERVICE_PATH, 0, 0).expect("open");
+        let open_rep = svc.handle(open).expect("open reply");
+        let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
+            .expect("decode fd")
+            .as_u64();
+        let read = read_message(ReadWriteRequest { fd, buf_ptr: 0, len: 1024 }).expect("read msg");
+        let read_rep = svc.handle(read).expect("read reply");
+        let bytes_read = VfsReply::from_opcode_payload_checked(read_rep.opcode, read_rep.as_slice())
+            .expect("decode read result")
+            .as_u64();
+        assert_eq!(
+            bytes_read, 0,
+            "ext4 read on empty demo file must return 0 bytes"
+        );
+    }
+
+    #[test]
+    fn stage93_ext4_write_returns_unsupported_after_read() {
+        // ext4 is read-only: all write attempts must return Unsupported regardless
+        // of whether the file was opened or read first.
+        use crate::fs::common::vfs_ipc::{write_message, ReadWriteRequest};
+        let mut svc = Ext4Service::with_backend(Ext4Backend::new());
+        let open = openat_inline_message(0, EXT4_SERVICE_PATH, 0, 0).expect("open");
+        let open_rep = svc.handle(open).expect("open");
+        let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
+            .expect("decode fd")
+            .as_u64();
+        let write = write_message(ReadWriteRequest { fd, buf_ptr: 0, len: 4096 }).expect("write");
+        assert_eq!(
+            svc.handle(write),
+            Err(VfsError::Unsupported),
+            "ext4 write must remain Unsupported after successful open"
+        );
+    }
+
+    // ── 5. Smoke script hardening ─────────────────────────────────────────────
+
+    #[test]
+    fn stage93_optional_fs_smoke_scripts_check_kspawn_fail() {
+        for (arch, script) in &[
+            ("aarch64", include_str!("../../../scripts/qemu-aarch64-optional-fs-smoke.sh")),
+            ("x86_64",  include_str!("../../../scripts/qemu-x86_64-optional-fs-smoke.sh")),
+        ] {
+            assert!(
+                script.contains("KSPAWN_EXTRA_CAP_DELEGATE_FAIL"),
+                "{arch} optional-FS smoke must check for KSPAWN_EXTRA_CAP_DELEGATE_FAIL"
+            );
+            assert!(
+                script.contains("PM_VFS_SPAWN_FAIL"),
+                "{arch} optional-FS smoke must check for PM_VFS_SPAWN_FAIL"
+            );
+            assert!(
+                script.contains("reason=bad_fd_decode"),
+                "{arch} optional-FS smoke must check for bad_fd_decode"
+            );
+        }
+    }
+
+    // ── 6. FAT block smoke scripts and image-creation script exist ────────────
+
+    #[test]
+    fn stage93_fat_block_smoke_script_aarch64_has_virtio_blk_args() {
+        let script = include_str!("../../../scripts/qemu-aarch64-fat-block-smoke.sh");
+        assert!(
+            script.contains("virtio-blk"),
+            "aarch64 fat-block smoke must use virtio-blk QEMU device"
+        );
+        assert!(
+            script.contains("FAT_IMAGE"),
+            "aarch64 fat-block smoke must reference FAT_IMAGE"
+        );
+        assert!(
+            script.contains("FAT_MOUNT_READY"),
+            "aarch64 fat-block smoke must check FAT_MOUNT_READY marker"
+        );
+    }
+
+    #[test]
+    fn stage93_fat_block_smoke_script_x86_64_has_virtio_blk_args() {
+        let script = include_str!("../../../scripts/qemu-x86_64-fat-block-smoke.sh");
+        assert!(
+            script.contains("virtio-blk"),
+            "x86_64 fat-block smoke must use virtio-blk QEMU device"
+        );
+        assert!(
+            script.contains("FAT_IMAGE"),
+            "x86_64 fat-block smoke must reference FAT_IMAGE"
+        );
+        assert!(
+            script.contains("FAT_MOUNT_READY"),
+            "x86_64 fat-block smoke must check FAT_MOUNT_READY marker"
+        );
+    }
+
+    #[test]
+    fn stage93_create_fat_image_script_exists_with_mtools_path() {
+        let script = include_str!("../../../scripts/create-fat-image.sh");
+        assert!(
+            script.contains("mformat") || script.contains("mkfs.fat"),
+            "create-fat-image.sh must use mformat or mkfs.fat to create the FAT image"
+        );
+        assert!(
+            script.contains("hello.txt"),
+            "create-fat-image.sh must create a hello.txt file in the FAT image"
+        );
+    }
+}

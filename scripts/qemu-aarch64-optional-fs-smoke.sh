@@ -103,15 +103,61 @@ if [[ -f "$LOGFILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Strict: INIT_SPAWN_V5_WRONG_SENDER_REPLY must be absent (count=0).
+# Strict: fatal runtime error patterns must be absent.
 # ---------------------------------------------------------------------------
 if [[ -f "$LOGFILE" ]]; then
+  # Stage 92: wrong-sender SpawnV5 drain must be zero.
   wsr_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "INIT_SPAWN_V5_WRONG_SENDER_REPLY" 2>/dev/null || echo 0)
   if [[ "$wsr_count" -gt 0 ]]; then
-    echo "[error] INIT_SPAWN_V5_WRONG_SENDER_REPLY count=${wsr_count} (wrong-sender drain must be zero after Stage 92 fix)"
+    echo "[error] INIT_SPAWN_V5_WRONG_SENDER_REPLY count=${wsr_count} (wrong-sender drain must be zero)"
     [[ "$QEMU_SMOKE_STRICT" == "1" ]] && smoke_fail=1
   else
     echo "[ok] INIT_SPAWN_V5_WRONG_SENDER_REPLY count=0"
+  fi
+
+  # KSPAWN_EXTRA_CAP_DELEGATE_FAIL: kernel rejected a non-zero service_caps slot.
+  kspawn_fail=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "KSPAWN_EXTRA_CAP_DELEGATE_FAIL" 2>/dev/null || echo 0)
+  if [[ "$kspawn_fail" -gt 0 ]]; then
+    echo "[error] KSPAWN_EXTRA_CAP_DELEGATE_FAIL count=${kspawn_fail} (kernel rejected service_caps entry — check spawn call)"
+    smoke_fail=1
+  else
+    echo "[ok] KSPAWN_EXTRA_CAP_DELEGATE_FAIL count=0"
+  fi
+
+  # PM_VFS_SPAWN_FAIL: PM failed to load/spawn a server from VFS.
+  pm_vfs_fail=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_SPAWN_FAIL" 2>/dev/null || echo 0)
+  if [[ "$pm_vfs_fail" -gt 0 ]]; then
+    echo "[error] PM_VFS_SPAWN_FAIL count=${pm_vfs_fail} (PM failed to load server ELF via VFS)"
+    smoke_fail=1
+  else
+    echo "[ok] PM_VFS_SPAWN_FAIL count=0"
+  fi
+
+  # bad_fd_decode inside a PM_ELF_ZC_FAIL or PM_VFS_SPAWN_FAIL context.
+  bad_fd=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "reason=bad_fd_decode" 2>/dev/null || echo 0)
+  if [[ "$bad_fd" -gt 0 ]]; then
+    echo "[error] bad_fd_decode count=${bad_fd} (PM received malformed fd from VFS — check vfs_client blocking-recv fix)"
+    smoke_fail=1
+  else
+    echo "[ok] bad_fd_decode count=0"
+  fi
+
+  # PM_VFS_GRANT_RO_UNSUPPORTED fallback=phase2b: Phase 3A zero-copy grant unavailable.
+  phase2b=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "fallback=phase2b" 2>/dev/null || echo 0)
+  if [[ "$phase2b" -gt 0 ]]; then
+    echo "[warn] PM_VFS_GRANT_RO_UNSUPPORTED fallback=phase2b count=${phase2b} (Phase 3A unavailable, using bulk-read fallback)"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && smoke_fail=1
+  else
+    echo "[ok] Phase2B fallback count=0"
+  fi
+
+  # Kernel panic or userspace panic.
+  panic_count=$(tr '\r' '\n' <"$LOGFILE" | rg -ai -c "\bpanic\b" 2>/dev/null || echo 0)
+  if [[ "$panic_count" -gt 0 ]]; then
+    echo "[error] panic count=${panic_count} (kernel or userspace panic detected)"
+    smoke_fail=1
+  else
+    echo "[ok] panic count=0"
   fi
 fi
 
