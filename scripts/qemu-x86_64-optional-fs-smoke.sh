@@ -173,7 +173,8 @@ if [[ -f "$LOGFILE" ]]; then
   fi
 
   # Kernel panic or userspace panic.
-  panic_count=$(tr '\r' '\n' <"$LOGFILE" | rg -ai -c "\bpanic\b" 2>/dev/null || echo 0)
+  # Stage 94: exclude lines containing nonfatal=true — those are non-fatal diagnostic events.
+  panic_count=$(tr '\r' '\n' <"$LOGFILE" | rg -ai "\bpanic\b" 2>/dev/null | rg -avc "nonfatal=true" 2>/dev/null || echo 0)
   if [[ "$panic_count" -gt 0 ]]; then
     echo "[error] panic count=${panic_count} (kernel or userspace panic detected)"
     smoke_fail=1
