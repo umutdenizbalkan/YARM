@@ -4961,3 +4961,71 @@ all new patterns. Stage 94 is docs-and-hardening only.
 - SpawnV5 ABI; SYSCALL_COUNT = 31; STARTUP_SLOT_COUNT = 18
 
 **Run:** `cargo test --lib -- --test-threads=1` (all 1282 must pass)
+
+---
+
+## Stage 101 — Kernel unlocking restart / MUST_SMOKE policy + syscall decomposition readiness
+
+Stage 101 reopens kernel-unlocking work. It is a docs / audit / source-label /
+scaffold-status stage. No behavior change is permitted in Stage 101 itself.
+See:
+- `doc/AI_AGENT_RULES.md §13` — MUST_SMOKE policy.
+- `doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md` — full audit, D1 readiness, syscall
+  decomposition map, unsafe split-helper guard audit, scaffold status pointer.
+- `doc/DECOMPOSITION_SCAFFOLD_STATUS.md` — scaffold/plan-type status (live /
+  helper-only / fallback-only / deferred / obsolete).
+
+### Stage 101.1 — MUST_SMOKE policy is a test rule
+
+Smoke results are part of the test contract, not just the agent rule contract.
+A stage/PR that meets any of the §13.1 triggers but does not include smoke
+results (or an explicit "QEMU not available" disclosure) is **incomplete** —
+the CI smoke gate must reject it.
+
+The MUST_SMOKE policy itself is enforced by source-scan tests in
+`syscall.rs` / `boot/tests.rs` that assert the policy text is present in
+`doc/AI_AGENT_RULES.md` and that the existing LIVE_TRAP_SMOKE labels remain at
+the relevant split-path call sites.
+
+### Stage 101.2 — LIVE_TRAP_SMOKE validation-label convention
+
+Existing split / live-wired paths in the kernel are labeled with structured
+validation comments at their call sites. Stage 101 codifies the convention so
+that future split-wiring work can be inspected mechanically:
+
+| Label | Meaning |
+|-------|---------|
+| `VALIDATION: LIVE_TRAP_SMOKE_X86_64` | Live-wired on x86_64 `-smp 1`; smoke marker validated. |
+| `VALIDATION: LIVE_OFF_TRAP` | Live-wired off the trap-entry path (post-decode, pre-dispatch). |
+| `VALIDATION: FALLBACK_GLOBAL_LOCK` | Returns `None` here; the global-lock path is the authoritative service path. |
+| `VALIDATION: SPLIT_FAST_PATH_ONLY` | Split path serves only the fast case; slow case falls through to global lock. |
+| `VALIDATION: GLOBAL_LOCK_SLOW_PATH` | Unconditional global-lock service site (no split path attempted). |
+
+Stage 101 does not introduce new labels. It documents the convention used by
+Stage 29 / Stage 32 / Stage 36+37 / Stage 42+43 and ensures source-scan tests
+guard their continued presence.
+
+### Stage 101.3 — boot/tests.rs and syscall.rs maintainability
+
+- `src/kernel/boot/tests.rs` has grown to ~31,600 lines. A mechanical split by
+  subsystem (capability / IPC / VM / scheduler / spawn / fault) is recommended
+  for a dedicated future stage, **not** combined with any behavior change.
+- `src/kernel/syscall.rs` is ~7,650 lines. The decomposition map in
+  `KERNEL_UNLOCKING_STAGE101_AUDIT.md §3` is the canonical target. A mechanical
+  split (move-only, zero behavior change) is permitted in Stage 102+ but must
+  not be combined with D1 / D3 / D6 live-wire changes.
+
+### Stage 101.4 — Invariants unchanged from Stage 100
+
+- `SYSCALL_COUNT = 31`
+- `STARTUP_SLOT_COUNT = 18`
+- SpawnV5 ABI (16-byte reply)
+- `recv_shared_v3` ABI offsets
+- Image IDs 7–12 frozen
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`
+- `INIT_SPAWN_FAT_SRV = false`, `VFS_FAT_LIVE_MOUNT_ENABLED = false`,
+  `VFS_FAT_SHARED_IO_ENABLED = false`
+- `INIT_SPAWN_RAMFS_SRV = true`, `INIT_SPAWN_EXT4_SRV = true`,
+  `VFS_EXT4_LIVE_MOUNT_ENABLED = true`
+
+**Run:** `cargo test --lib -- --test-threads=1` (must remain green).

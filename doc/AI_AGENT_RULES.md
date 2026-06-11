@@ -516,3 +516,93 @@ Key invariants that kernel unlocking must not break:
 - Optional-FS smoke markers (RAMFS/ext4 expected; FAT skipped)
 - No deadline-0 required replies in vfs_client.rs or IpcBlockDevice
 - VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false
+
+---
+
+## 13. MUST_SMOKE Policy (Stage 101)
+
+### 13.1 Scope — when smoke results are mandatory
+
+Any stage/PR MUST include smoke results when its diff:
+
+1. **live-wires a new split path** in `handle_trap_entry_shared`,
+   `dispatch_trap_entry_with_shared_kernel`, `try_split_dispatch_into_frame`, or
+   any equivalent trap/syscall entry seam (i.e. a new `Some(Ok(()))` /
+   `Some(Err(..))` return on a code path previously returning `None`),
+2. modifies **IPC dequeue, sender-waiter, receiver-waiter, timeout, wakeup, or
+   reply-delivery logic** (`recv_core.rs`, `ipc.rs`, `ipc_state.rs`, any
+   `complete_blocked_recv_for_waiter` /
+   `ipc_try_recv_queued_with_cap_transfer` / `apply_split_sender_wake_plan` /
+   `apply_split_receiver_wake_plan` callers),
+3. changes `entering_tid` / `exiting_tid` / `task_switched` /
+   `current_tid_authoritative` / `current_tid_split_read` behavior,
+4. changes **trap/syscall result writeback** (`TrapFrame::set_ok`,
+   `TrapFrame::set_err`, `encode_transfer_cap_ret`, pack-payload helpers),
+5. changes **scheduler dispatch or block/wake** (`dispatch_next_task`,
+   `block_current_cpu`, `enqueue_on_cpu`, runqueue ops, membership tables),
+6. changes **VM/TLB shootdown** (`vm.rs` two-phase unmap, `DrainedMapping`,
+   `execute_tlb_shootdown_wait_plan`, `unmap_range_two_phase`).
+
+### 13.2 Minimum accepted smoke
+
+The minimum accepted smoke for these classes is **x86_64 `-smp 1`** core smoke:
+
+```bash
+QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh
+```
+
+If the change touches IPC/scheduler/SMP-sensitive paths and x86_64 SMP is still
+known unstable, `-smp 1` is the accepted floor until the x86_64 SMP trampoline /
+assembly split in `src/arch/x86_64/smp.rs` is audited (see §5.2).
+
+### 13.3 Optional-FS strict smoke remains a regression gate
+
+If the diff touches **filesystem-facing boot behavior** (init service spawn
+ordering, optional-FS profile gates, VFS mount registration, RAMFS/ext4/FAT
+spawn paths, or the SpawnV5 path), the strict optional-FS smoke is required
+**in addition** to the core smoke:
+
+```bash
+QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh
+QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh
+```
+
+Required markers (see §7 and §12.3) must remain present; forbidden markers must
+remain absent.
+
+### 13.4 Pure scaffold / docs / source-label / audit stages
+
+Stages whose diff is purely:
+- documentation,
+- source-comment validation labels (no behavior change),
+- scaffold or plan types not yet live-wired,
+- audit/test-only source-scan additions,
+
+do not require smoke runs, but MUST state the no-behavior-change claim and the
+source-scan test coverage explicitly in the stage summary.
+
+### 13.5 Do not grep `fatal` naïvely
+
+The `fatal` substring is produced by both real fatal events and by lines of the
+form `nonfatal=true`. A naïve `rg fatal` over a smoke log produces false
+positives. Use a two-stage filter that excludes `nonfatal=true`:
+
+```bash
+# CORRECT (Stage 94 pattern, extended to fatal lookups in general)
+fatal_count=$(tr '\r' '\n' <"$LOGFILE" | rg -ai "\bfatal\b" 2>/dev/null \
+    | rg -avc "nonfatal=true" 2>/dev/null || echo 0)
+```
+
+```bash
+# FORBIDDEN — matches `nonfatal=true` lines as fatal
+fatal_count=$(... | rg -ai -c "\bfatal\b" 2>/dev/null || echo 0)
+```
+
+The same rule applies to `panic` (already enforced by §12.3).
+
+### 13.6 QEMU not available is an acceptable disclosure
+
+If the build/test environment does not have QEMU available (e.g. minimal CI
+containers, remote agent sandboxes), the stage summary MUST say so explicitly
+("QEMU not available; smoke not run"). It is **not** acceptable to claim a
+smoke result that was not actually executed.
