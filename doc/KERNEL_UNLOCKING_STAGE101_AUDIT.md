@@ -577,3 +577,129 @@ Stage 102 deliberately did NOT touch any of these functions, so the Stage
 4. `stage102_dispatch_runtime_routing_for_moved_handlers` — runtime proof
    that NR 15 and NR 27 still route through `dispatch()` to the moved
    bodies with identical results (ok-0 fast path; MissingRight gate).
+
+---
+
+## 12. Stage 103 — D1 cap-transfer recv split scaffold (helper-only)
+
+Stage 103 builds the Phase A / B / C scaffold for the D1 cap-transfer recv
+split as **helper-only / default-off**. No live behavior change.
+
+### 12.1 New module: `src/kernel/cap_transfer_split.rs`
+
+| Item | Purpose |
+|------|---------|
+| `CapTransferRecvClass` | Pure flag classification of a delivered `Message` into `None` / `Transfer { raw_handle }` / `Reply { raw_handle }`. |
+| `CapTransferRecvSnapshot` | Phase A output: `handle`, `endpoint`, `source_tid`, `source_cap`, `receiver_tid`, `source_rights`. All `Copy`. |
+| `CapTransferMaterializeOutcome` | Phase B output: receiver-local `CapId`. |
+| `CapTransferSplitResult` | Combined entry-point outcome enum: `None` / `Materialized(u64)` / `FallbackRequired` / `Failed(SyscallError)`. |
+| `phase_a_take_transfer_envelope` | Phase A: IPC rank 3 (`take_transfer_envelope`) + capability rank 4 read (`resolve_capability_for_task`). |
+| `phase_b_materialize_transfer_cap` | Phase B: capability rank 4 mutate (`grant_task_to_task_with_rights`). |
+| `materialize_split_transfer_cap_equivalent` | Combined A → B entry; equivalence-tested against the global-lock direct-call sequence. |
+
+All three helper fns are labeled `D1_HELPER_ONLY` / `D1_DEFAULT_OFF` /
+`FALLBACK_GLOBAL_LOCK`. A source-scan test
+(`stage103_helper_only_no_live_call_sites`) asserts they are not called from
+`syscall.rs` or `runtime.rs`.
+
+### 12.2 Supported case (helper-only)
+
+- **`FLAG_CAP_TRANSFER` + non-reply (delegation path)** — full A → B handled.
+- **`FLAG_CAP_TRANSFER_PLAIN`** — same `Transfer` class as `FLAG_CAP_TRANSFER`;
+  same A → B path; same observable outcome. (`materialize_received_message_cap`
+  unifies these two flags into a single `materialize_received_transfer_cap`
+  call, and the helper mirrors that.)
+- **Plain (no flag, no `transferred_cap`)** — returns `None`.
+
+### 12.3 Fallback cases (not implemented)
+
+| Case | Why fallback |
+|------|--------------|
+| `FLAG_REPLY_CAP` | Reply-cap Phase B is rank-4 `mint_capability_in_cnode` followed by a **rank-3** `set_reply_cap_waiter_cap` — rank inversion. Live wiring requires either a dedicated rank-3 B′ phase reacquired after B (extra lock cycles) or a deferred-plan write applied by the caller alongside the scheduler wake plan. Either choice is a live-IPC timing change and requires QEMU smoke. |
+| Sender-waiter with cap-transfer | `RecvOutcome::FallbackRequired(FallbackReason::SenderWaiterWake)` already routes this to the global lock for "complex" cap-flagged refills (`recv_core.rs` §FallbackReason::SenderWaiterWake comment). D1 inherits the same fallback. |
+| Mapped / shared receive (`FLAG_CAP_TRANSFER` with `OPCODE_SHARED_MEM`) | The envelope has a `shared_region`; Phase A's pin-refcount adjust is already in the right domain, but the receiver-side `register_active_transfer_mapping` + VM map require additional domain handling. Out of scope for Stage 103. |
+
+### 12.4 Domain / rank order used by the helper
+
+| Phase | Lock acquired | Lock released | Operations |
+|-------|---------------|---------------|------------|
+| Phase A.1 | IPC rank 3 (+ memory refcount) | end of `take_transfer_envelope` | dequeue envelope |
+| Phase A.2 | capability rank 4 (read) | end of `resolve_capability_for_task` | snapshot source rights |
+| Phase B | capability rank 4 (mutate) + memory refcount + delegation links | end of `grant_task_to_task_with_rights` | mint receiver cap |
+| Phase C | none | — | writeback (caller drives) |
+
+The helper today runs all three phases under a single `&mut KernelState`, so
+the in-process lock count is unchanged from the global-lock path. Stage 104
+will replace the closure boundary with explicit `SharedKernel` lock-release
+points between Phase A.2 → Phase B (rank 4 read → rank 4 mutate is rank-safe
+to chain; rank 3 → rank 4 is the actual decomposition gain).
+
+### 12.5 Rollback / error behavior
+
+- **Phase A failure** (envelope already gone / endpoint mismatch / receiver
+  mismatch / source-cap resolve failure): no state changed; envelope remains
+  consumed only if `take_transfer_envelope` succeeded (it didn't in this
+  case). Same observable outcome as the global-lock path.
+- **Phase B failure** (`grant_task_to_task_with_rights` returns
+  `CapabilityFull` / `MissingRight` / `TaskMissing`): envelope is **already
+  consumed** by Phase A — exactly matching the global-lock contract today
+  (no envelope rollback on materialize failure; the message is delivered
+  with `transferred_cap = None` or the syscall returns the error).
+- **Writeback (Phase C) failure** drives `rollback_materialized_recv_cap`,
+  unchanged from existing live code in `try_split_recv_queued_plain_with_snapshot_locked`.
+
+### 12.6 Equivalence proof
+
+Test `stage103_equivalence_split_matches_direct_take_plus_grant` builds two
+independent kernel states with byte-identical setup. State A runs the helper
+end-to-end; State B calls `take_transfer_envelope` +
+`resolve_capability_for_task` + `grant_task_to_task_with_rights` directly
+(the exact sequence inside `materialize_received_transfer_cap`). The test
+asserts:
+
+- minted `CapId` raw values are equal,
+- receiver cnode slot objects are equal,
+- receiver cnode slot rights are equal.
+
+Plus four additional behavior-equivalence tests:
+
+- `stage103_equivalence_plain_message_returns_none`
+- `stage103_equivalence_reply_cap_message_returns_fallback_required` (also
+  verifies the envelope is **not** consumed on fallback)
+- `stage103_equivalence_no_envelope_returns_invalid_capability` (matches the
+  global-lock `SyscallError::InvalidCapability` exactly)
+- `stage103_phase_b_mints_attenuated_cap_in_receiver_cnode` (matches the
+  attenuation contract of `grant_task_to_task_with_rights`)
+
+### 12.7 Live-wire blockers (Stage 104 prerequisites)
+
+1. **SharedKernel seam.** `runtime.rs` must expose two split-mut entry
+   points, one per phase. The current `SharedKernel::with(...)` closure
+   holds the global lock for the duration of the whole materialize. Phase A
+   and Phase B must each take their own narrow rank-3 / rank-4 closure to
+   actually realize the split.
+2. **Reply-cap rank 3↔4 design.** Choose between (a) explicit rank-3 B′
+   phase, or (b) deferred reply-record write. Both are observable timing
+   changes.
+3. **QEMU x86_64 `-smp 1` smoke.** MUST_SMOKE (`AI_AGENT_RULES.md §13`)
+   triggers because the change modifies IPC reply-delivery / cap-transfer
+   logic. Stage 103 was developed without QEMU; Stage 104 needs an
+   environment with QEMU available.
+4. **Sender-waiter-with-cap-transfer.** `FallbackReason::SenderWaiterWake`
+   currently routes complex cap-flagged refills to the global lock. D1 may
+   absorb the plain subset; the complex subset stays fallback.
+
+### 12.8 Stage 103 invariants reaffirmed
+
+- `SYSCALL_COUNT = 31`, `STARTUP_SLOT_COUNT = 18`, SpawnV5 ABI,
+  `recv_shared_v3` ABI offsets, image IDs 7–12 — **unchanged**.
+- Stage 100 FS gates (`INIT_SPAWN_RAMFS_SRV=true`, `INIT_SPAWN_FAT_SRV=false`,
+  `INIT_SPAWN_EXT4_SRV=true`, `VFS_EXT4_LIVE_MOUNT_ENABLED=true`,
+  `VFS_FAT_LIVE_MOUNT_ENABLED=false`, `VFS_FAT_SHARED_IO_ENABLED=false`) —
+  **unchanged**.
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` — **unchanged**.
+- Stage 101 LIVE_TRAP_SMOKE labels — **unchanged**.
+- Stage 102 syscall module split (`syscall/debug.rs`, `syscall/initramfs.rs`)
+  — **unchanged**.
+- Global-lock fallback `materialize_received_message_cap` — **unchanged and
+  still authoritative**.

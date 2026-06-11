@@ -32,7 +32,11 @@ Each entry is one of:
 | `RecvPlan` | `kernel/recv_core.rs` | **live** | Returned by `plan_recv_core`; consumed by `try_split_recv_queued_plain_with_snapshot_locked`. Branches: `KernelPlainEligible` / `UserPlainEligible` / `UserPlainV2Eligible` / `FallbackRequired`. |
 | `RecvWritebackPlan` | `kernel/recv_core.rs` | **live** | Variants `KernelRegister`, `UserMemory`, `UserMemoryV2` all live. |
 | `RecvSchedulerWakePlan` | `kernel/recv_core.rs` | **live** | `WakeSender` applied after `ipc_state_lock` released. |
-| `RecvCapTransferPlan` | `kernel/recv_core.rs` | **helper-only** (Stage 101) | Populated by `extract_cap_transfer_plan` and read by the syscall-side materialize call. Stage 100 still materializes under the global lock; D1 (Stage 102+) will live-wire the rank-4 split. |
+| `RecvCapTransferPlan` | `kernel/recv_core.rs` | **helper-only** (Stage 101) | Populated by `extract_cap_transfer_plan` and read by the syscall-side materialize call. Stage 100 still materializes under the global lock; D1 (Stage 104+) will live-wire the rank-4 split. |
+| `CapTransferRecvClass` | `kernel/cap_transfer_split.rs` | **helper-only** (Stage 103, `D1_HELPER_ONLY` / `D1_DEFAULT_OFF`) | Pure flag classification of a delivered `Message`. |
+| `CapTransferRecvSnapshot` | `kernel/cap_transfer_split.rs` | **helper-only** (Stage 103) | Phase A output: `Copy` snapshot for Phase B. |
+| `CapTransferMaterializeOutcome` | `kernel/cap_transfer_split.rs` | **helper-only** (Stage 103) | Phase B output: receiver-local `CapId`. |
+| `CapTransferSplitResult` | `kernel/cap_transfer_split.rs` | **helper-only** (Stage 103) | Combined A → B entry-point outcome: `None` / `Materialized` / `FallbackRequired` / `Failed`. |
 | `FallbackReason` | `kernel/recv_core.rs` | **live** | Used by every `try_recv_core_*` adapter. Variant `CapTransfer` is documented as no longer produced; kept for the sender-waiter-with-cap-transfer fallback case. **Deferred (variant)** — `CapTransfer` is the only deferred discriminant. |
 | `RecvOutcome` | `kernel/recv_core.rs` | **live** | `Delivered` / `WouldBlock` / `TimedOut` / `FallbackRequired` / `Error`. `TimedOut` is **deferred** (no live producer yet). |
 
@@ -107,6 +111,32 @@ stable.
 | `RecvOutcome::TimedOut` | Documented as "reserved for future timed-recv integration". | Re-evaluate when timed-recv is split-wired. |
 
 No types are flagged as **obsolete** at Stage 101.
+
+---
+
+## 6.2 Stage 103 — D1 cap-transfer recv split status
+
+The cap-transfer materialization Phase A / B / C scaffold lives in
+`src/kernel/cap_transfer_split.rs` (Stage 103). All entry points are
+`D1_HELPER_ONLY` / `D1_DEFAULT_OFF`; no live syscall path calls them.
+Equivalence with the global-lock `materialize_received_transfer_cap` is
+proven by `stage103_equivalence_split_matches_direct_take_plus_grant` (byte
+comparison of minted `CapId`, receiver cnode slot object, and slot rights).
+
+| Path | D1 status (Stage 103) | Owner |
+|------|------------------------|-------|
+| `FLAG_CAP_TRANSFER` (non-reply, no shared region) | helper-only, equivalence-tested | `materialize_split_transfer_cap_equivalent` |
+| `FLAG_CAP_TRANSFER_PLAIN` (non-reply) | helper-only, equivalence-tested | same |
+| Plain message (no flag) | helper-only, returns `None` | same |
+| `FLAG_REPLY_CAP` | **fallback to global lock** (rank 3↔4 inversion) | `materialize_received_message_cap` reply arm |
+| Sender-waiter with cap-transfer | **fallback to global lock** | `recv_core.rs` `FallbackReason::SenderWaiterWake` |
+| `FLAG_CAP_TRANSFER` with shared region (OPCODE_SHARED_MEM) | **fallback to global lock** | global-lock recv path |
+
+Stage 104 prerequisites for live-wiring (see audit doc §12.7):
+
+1. `SharedKernel` split-mut seam per phase.
+2. Reply-cap rank 3↔4 design choice.
+3. QEMU x86_64 `-smp 1` smoke environment.
 
 ---
 
