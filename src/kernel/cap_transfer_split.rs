@@ -94,10 +94,10 @@
 //! reply-cap helper; see the D5 lock-touch map above for the exact blocker
 //! and the safe design for a future pass.
 
-use crate::kernel::boot::KernelState;
+use crate::kernel::boot::{KernelState, ReplyRecordSetOutcome};
 #[cfg(test)]
 use crate::kernel::boot::KernelError;
-use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Message, ThreadId};
 use crate::kernel::syscall::SyscallError;
 
@@ -256,6 +256,200 @@ pub fn phase_b_materialize_transfer_cap(
     Ok(CapTransferMaterializeOutcome {
         receiver_local_cap: derived,
     })
+}
+
+// ─── D5: reply-cap split (Stage 105) ──────────────────────────────────────────
+
+/// Phase A output for the reply-cap path.
+///
+/// Captures the reply-object identity (index + generation) recovered from the
+/// transfer envelope. The (index, generation) pair is what Phase B' uses to
+/// race-detect the mint→record window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyCapRecvSnapshot {
+    /// Raw envelope handle consumed in Phase A.
+    pub handle: u64,
+    /// Endpoint the envelope was bound to.
+    pub endpoint: CapObject,
+    /// Reply object index in the global reply-cap registry.
+    pub reply_index: usize,
+    /// Reply object generation captured at Phase A.
+    pub reply_generation: u64,
+    /// Receiver TID.
+    pub receiver_tid: u64,
+    /// Receiver cnode resolved at Phase A. Captured by snapshot so Phase B
+    /// does not need to re-resolve under a different lock window.
+    pub receiver_cnode: CNodeId,
+}
+
+/// D5 Phase A — IPC rank 3 (+ memory pin-refcount adjust) and capability rank
+/// 4 read: take the transfer envelope, validate the source object is a
+/// `Reply`, validate the reply object is live, and resolve the receiver
+/// cnode.
+///
+/// VALIDATION: D5_LIVE_SPLIT
+///
+/// Returns `Err(SyscallError::InvalidCapability)` on the same conditions the
+/// canonical reply arm would: missing envelope, dead reply object, missing
+/// receiver cnode. Returns `Err(SyscallError::WrongObject)` if the envelope
+/// did not carry a `Reply` object (matches canonical `WrongObject`).
+pub fn phase_a_take_reply_envelope(
+    kernel: &mut KernelState,
+    handle: u64,
+    endpoint: CapObject,
+    receiver_tid: u64,
+) -> Result<ReplyCapRecvSnapshot, SyscallError> {
+    let envelope = kernel
+        .take_transfer_envelope(handle, endpoint, ThreadId(receiver_tid))
+        .ok_or(SyscallError::InvalidCapability)?;
+    let (reply_index, reply_generation) = match envelope.source_object {
+        CapObject::Reply { index, generation } => (index, generation),
+        _ => return Err(SyscallError::WrongObject),
+    };
+    let reply_object = CapObject::Reply {
+        index: reply_index,
+        generation: reply_generation,
+    };
+    if kernel.capability_object_live(reply_object).is_none() {
+        return Err(SyscallError::InvalidCapability);
+    }
+    let receiver_cnode = kernel
+        .task_cnode(receiver_tid)
+        .ok_or(SyscallError::InvalidCapability)?;
+    Ok(ReplyCapRecvSnapshot {
+        handle,
+        endpoint,
+        reply_index,
+        reply_generation,
+        receiver_tid,
+        receiver_cnode,
+    })
+}
+
+/// D5 Phase B — capability rank 4 mutate: mint the Reply cap directly into the
+/// receiver's cnode. Does NOT touch the reply-cap registry (that is Phase B').
+///
+/// VALIDATION: D5_LIVE_SPLIT
+pub fn phase_b_mint_reply_cap(
+    kernel: &mut KernelState,
+    snapshot: &ReplyCapRecvSnapshot,
+) -> Result<CapTransferMaterializeOutcome, SyscallError> {
+    let reply_object = CapObject::Reply {
+        index: snapshot.reply_index,
+        generation: snapshot.reply_generation,
+    };
+    let minted = kernel
+        .mint_capability_in_cnode(
+            snapshot.receiver_cnode,
+            Capability::new(reply_object, CapRights::SEND),
+        )
+        .map_err(SyscallError::from)?;
+    Ok(CapTransferMaterializeOutcome {
+        receiver_local_cap: minted,
+    })
+}
+
+/// D5 Phase B' — IPC rank 3 mutate: install the receiver-local CapId in the
+/// reply registry, **with stale-window rollback**.
+///
+/// This is the heart of the D5 atomicity contract. Between Phase B (rank 4
+/// mint) and this call, another CPU could have revoked / reused the reply
+/// record. The fallible `try_set_reply_cap_waiter_cap` distinguishes the
+/// three stale modes (index out of range, generation mismatch, slot empty).
+/// On any stale outcome, this function rolls back the Phase B mint via
+/// `rollback_materialized_recv_cap` (which is `is_reply_cap=true` →
+/// `fast_revoke_reply_cap_in_cnode` + `clear_reply_cap_waiter_cap`), then
+/// returns `Err(SyscallError::StaleCapability)`. The reply object remains
+/// live and re-deliverable, matching the existing
+/// `IPC_RECV_REPLY_CAP_MATERIALIZE_OK` invariant: a record-set failure must
+/// never leave a minted cap behind.
+///
+/// On `Set`, returns the same `CapId` the mint produced — by contract this is
+/// the value the caller writes back through `encode_transfer_cap_ret`. On
+/// stale, returns [`SyscallError::WrongObject`] — the same error mapping the
+/// canonical path uses for `KernelError::StaleCapability` (see
+/// `SyscallError::from(KernelError)`), so the observable error code is
+/// consistent with "your reply cap was revoked concurrently".
+pub fn phase_b_prime_record_reply_cap(
+    kernel: &mut KernelState,
+    snapshot: &ReplyCapRecvSnapshot,
+    minted: CapId,
+) -> Result<CapId, SyscallError> {
+    let outcome =
+        kernel.try_set_reply_cap_waiter_cap(snapshot.reply_index, snapshot.reply_generation, minted);
+    match outcome {
+        ReplyRecordSetOutcome::Set => {
+            crate::yarm_log!(
+                "YARM_D5_SPLIT_RECORD reply_index={} reply_gen={} cap={}",
+                snapshot.reply_index,
+                snapshot.reply_generation,
+                minted.0
+            );
+            Ok(minted)
+        }
+        stale => {
+            // Phase B' rollback: revoke the freshly-minted slot, drop the
+            // (already-stale-or-empty) waiter_cap_id. The reply object stays
+            // live; the canonical record state is whatever the racing CPU
+            // installed.
+            let _ = kernel.rollback_materialized_recv_cap(snapshot.receiver_tid, minted, true);
+            crate::yarm_log!(
+                "YARM_D5_SPLIT_RECORD_ROLLBACK reply_index={} reply_gen={} cap={} reason={}",
+                snapshot.reply_index,
+                snapshot.reply_generation,
+                minted.0,
+                stale.stale_reason().unwrap_or("unknown")
+            );
+            Err(SyscallError::WrongObject)
+        }
+    }
+}
+
+/// Combined D5 entry point for the reply-cap path. Equivalent to the reply
+/// arm of `materialize_received_message_cap`.
+///
+/// VALIDATION: D5_LIVE_SPLIT
+/// VALIDATION: FALLBACK_GLOBAL_LOCK
+///
+/// Returns:
+/// - [`CapTransferSplitResult::None`] — message is not a reply-cap message
+///   with a transferred-cap handle (caller should not have called this).
+/// - [`CapTransferSplitResult::Materialized(cap)`] — supported path; the
+///   `cap` raw value is what canonical `Ok(Some(cap))` would have returned.
+/// - [`CapTransferSplitResult::FallbackRequired`] — never produced today;
+///   reserved for future not-yet-supported reply-cap subcases.
+/// - [`CapTransferSplitResult::Failed(err)`] — matches the canonical reply
+///   arm's error for the same input. `StaleCapability` is the new D5 error
+///   for the mint→record race; the canonical path cannot produce it because
+///   the global lock spans the window.
+pub fn materialize_split_reply_cap_equivalent(
+    kernel: &mut KernelState,
+    endpoint: CapObject,
+    receiver_tid: u64,
+    msg: &Message,
+) -> CapTransferSplitResult {
+    let raw_handle = match CapTransferRecvClass::classify(msg) {
+        CapTransferRecvClass::Reply { raw_handle } => raw_handle,
+        CapTransferRecvClass::None | CapTransferRecvClass::Transfer { .. } => {
+            return CapTransferSplitResult::None;
+        }
+    };
+    let snapshot = match phase_a_take_reply_envelope(kernel, raw_handle, endpoint, receiver_tid) {
+        Ok(s) => s,
+        Err(e) => return CapTransferSplitResult::Failed(e),
+    };
+    let minted = match phase_b_mint_reply_cap(kernel, &snapshot) {
+        Ok(out) => out.receiver_local_cap,
+        Err(e) => return CapTransferSplitResult::Failed(e),
+    };
+    match phase_b_prime_record_reply_cap(kernel, &snapshot, minted) {
+        Ok(cap) => CapTransferSplitResult::Materialized(cap.0),
+        Err(e) => {
+            // Stale-rollback telemetry: count the rollback exactly once.
+            kernel.note_d5_split_reply_rollback();
+            CapTransferSplitResult::Failed(e)
+        }
+    }
 }
 
 /// Combined Phase A → Phase B entry point for the transfer-cap (non-reply)

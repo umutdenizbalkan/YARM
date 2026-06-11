@@ -843,3 +843,295 @@ continue to pass and remain the equivalence contract.
    IPC lock; global lock only for the scheduler block/dispatch step.
 4. Optional D4 continuation: `syscall/recv_shared_v3.rs` mechanical move
    (separate PR from any semantic change).
+
+---
+
+## 14. Stage 105 / Pass 2 — D5 reply-cap split live-wired
+
+D5 splits the reply-cap recv materialization out of the global lock using a
+fallible Phase B' record-write with explicit mint rollback.
+
+**NOT SMOKE-ACCEPTED:** developed without QEMU. Per MUST_SMOKE the branch
+requires x86_64 `-smp 1` core smoke and optional-FS strict smoke before
+merge acceptance.
+
+### 14.1 The atomicity solution (Pass 1's exact blocker)
+
+Pass 1 blocked D5 on the rank-4 mint → rank-3 `set_reply_cap_waiter_cap`
+race window. Pass 2 solves it as the audit doc §12.7 predicted:
+
+1. New fallible primitive `KernelState::try_set_reply_cap_waiter_cap`
+   returns `ReplyRecordSetOutcome::{Set, IndexOutOfRange, GenerationMismatch,
+   SlotEmpty}`. The existing `set_reply_cap_waiter_cap` becomes a thin
+   wrapper that discards the outcome (still used by the canonical reply arm
+   under the global lock, where staleness is unreachable).
+2. New Phase B' helper `phase_b_prime_record_reply_cap` calls the fallible
+   primitive and, on any non-`Set` outcome, drives mint rollback via
+   `rollback_materialized_recv_cap` (the existing helper with
+   `is_reply_cap=true`) and surfaces `SyscallError::WrongObject` — the same
+   error the canonical path produces for `KernelError::StaleCapability`.
+3. New telemetry: `IpcPathTelemetry::d5_split_reply_materializations` and
+   `d5_split_reply_rollbacks`. Smoke logs additionally see
+   `YARM_D5_SPLIT_MATERIALIZE` (success), `YARM_D5_SPLIT_RECORD` (Phase B'
+   success), `YARM_D5_SPLIT_RECORD_ROLLBACK reason=...` (Phase B' rollback),
+   and `D5_REPLY_RECORD_SET_STALE reason=...` (from the fallible primitive).
+
+### 14.2 What is live now (D5)
+
+`syscall.rs::materialize_received_message_cap_routed` (label
+`D1_LIVE_SPLIT`) is extended with a D5 reply-cap arm after the D1 transfer
+arm. Both arms route from exactly the same two delivery seams:
+
+1. `complete_blocked_recv_for_waiter` — recv-v2 blocked-receiver delivery
+2. `try_split_recv_queued_plain_with_snapshot_locked` — queued split-recv
+
+Supported scope routed through
+`cap_transfer_split::materialize_split_reply_cap_equivalent`:
+- `FLAG_REPLY_CAP`, `opcode != OPCODE_SHARED_MEM`
+
+### 14.3 What stays on the global-lock fallback
+
+| Case | Why |
+|------|-----|
+| Reply-cap with `OPCODE_SHARED_MEM` | shared-region semantics outside D5 scope |
+| Sender-waiter cap-transfer refills | `recv_core.rs FallbackReason::SenderWaiterWake` unchanged |
+| Legacy full recv path (`handle_ipc_recv_result_with_empty_error`) | intentionally unrouted (canonical helper called directly) |
+| NR 30 RecvSharedV3 handler | intentionally unrouted |
+
+The canonical `materialize_received_message_cap` reply arm is **unchanged**
+and remains authoritative.
+
+### 14.4 Rank order and the atomicity proof
+
+D5 routed sequence (sequential acquire/release, never nested):
+
+| Phase | Lock | Operations |
+|-------|------|------------|
+| A.1 | IPC rank 3 | `take_transfer_envelope` |
+| A.2 | capability rank 4 read | `capability_object_live` |
+| A.3 | task rank 2 read | `task_cnode(receiver)` |
+| B | capability rank 4 mutate | `mint_capability_in_cnode` |
+| B' | IPC rank 3 mutate | `try_set_reply_cap_waiter_cap` (+ rollback) |
+| C | none | writeback (caller) |
+
+**Atomicity proof:** between Phase B (rank 4 mint) and Phase B' (rank 3
+record set), any other CPU that revokes/reuses the reply record changes the
+slot's generation or sets the slot to `None`. Phase B's fallible primitive
+detects both modes and returns a non-`Set` outcome. The Phase B' rollback
+revokes the freshly-minted slot via `fast_revoke_reply_cap_in_cnode` and
+clears the (now-stale) `waiter_cap_id` via `clear_reply_cap_waiter_cap`.
+Net effect: the receiver cnode contains exactly what it would have if the
+revoke had landed BEFORE the mint, and the receiver gets `WrongObject` — the
+same error code the canonical path produces for that exact race outcome
+under the global lock. Mint leak: impossible by construction.
+
+### 14.5 Stage 105 test additions (net +6: 7 new, 1 renamed)
+
+`kernel::syscall::tests`:
+- `stage105_router_reply_cap_routes_through_d5_split_engine` — telemetry
+  proves routing; minted cap object matches the captured reply object.
+- `stage105_router_reply_cap_equivalence_with_canonical_for_supported_case`
+  — two identical states; byte-equal CapId, slot object, slot rights.
+- `stage105_router_reply_cap_stale_record_rolls_back_mint` — manual race
+  injection: `phase_a_take_reply_envelope` → revoke record →
+  `phase_b_mint_reply_cap` → `phase_b_prime_record_reply_cap` returns
+  `WrongObject`; receiver cnode slot is gone.
+- `stage105_router_reply_cap_phase_a_failure_does_not_count_rollback` —
+  bogus handle: telemetry stays at 0 success / 0 rollback.
+- `stage105_phase_b_prime_rollback_increments_rollback_telemetry` —
+  success-path telemetry; source-scan that the engine wrapper calls
+  `note_d5_split_reply_rollback` on Failed.
+- `stage105_router_reply_cap_wrong_object_caught_by_d5_phase_a` (renamed
+  from Stage 104's `_falls_back_to_canonical_path`): non-Reply envelope
+  under FLAG_REPLY_CAP — D5 Phase A returns `WrongObject`; telemetry stays 0.
+- `stage105_canonical_reply_arm_remains_authoritative` — canonical helper
+  retained at ≥ 4 sites; the discarding `set_reply_cap_waiter_cap` wrapper
+  is still used by the canonical arm.
+
+### 14.6 Invariants reaffirmed
+
+- `SYSCALL_COUNT = 31`, `STARTUP_SLOT_COUNT = 18`, SpawnV5 ABI,
+  `recv_shared_v3` ABI offsets, image IDs 7–12 — **unchanged**.
+- Stage 100 FS gates — **unchanged**.
+- D1 transfer arm unchanged. Test counts: workspace lib 1323/0 (+6 net);
+  yarm-fs-servers 572/0; yarm-control-plane-servers 130/0.
+
+### 14.7 D2 and D3 — Pass 2 status
+
+**D2 (IPC recv blocking precursor):** scope is large enough that
+implementing it without QEMU smoke would re-create the Pass 1 D5 risk
+posture. Pass 2 defers D2 with the audit captured in §15 below (helper-only
+scaffold + no-lost-wakeup audit, no live wiring).
+
+**D3 (VmAnonMap/VmBrk two-phase split):** existing plan types
+(`VmAnonMapProgressPlan`, `VmAnonMapRollbackTlbPlan`, `TlbShootdownWaitPlan`,
+`VmBrkShrinkTlbPlan`) are already consumed inside the global-lock
+`handle_vm_anon_map` / `handle_vm_brk` paths (see scaffold status §2). The
+live-wire delta is plumbing the SharedKernel seam to release between PTE
+mutation, TLB shootdown, and frame reclaim. Same QEMU smoke gate as D2 and
+D5: deferred this pass. Audit at §16.
+
+---
+
+## 15. Stage 105 / Pass 2 — D2 IPC recv blocking precursor (helper-only audit)
+
+D2 splits the IPC recv blocking path so the scheduler block (rank 1), the
+TCB transition (rank 2), and the IPC waiter publish (rank 3) each run under
+their own narrow lock window instead of one `&mut KernelState` body. Stage
+105 lands D2 as helper-only / audit-only, mirroring the Stage 103 discipline
+for D1: the typed primitive exists with full unit tests, but it is **not
+called from any live syscall or runtime path**. Pass 3 may live-wire it
+when the SharedKernel split-mut seam for scheduler block exists and QEMU
+smoke is available.
+
+### 15.1 New module: `src/kernel/recv_waiter_split.rs`
+
+| Item | Purpose |
+|------|---------|
+| `PublishWaiterPlan` | Captures the data needed for the rank-3 publish: `endpoint_idx`, `receiver_tid`, `recv_cap`. |
+| `PublishWaiterOutcome` | Typed outcome: `Published`, `ReceiverAlreadyWaiting`, `QueueNonEmpty`, `InvalidEndpoint`. |
+| `try_publish_recv_waiter` | Helper: takes `ipc_state_lock` (rank 3) only; decides the outcome and writes `endpoint_waiters[idx]` inside the same critical section. |
+| `KernelState::try_publish_recv_waiter_audit_only` | Kernel-side primitive the helper delegates to. Same atomic semantics. |
+
+Labels: `D2_HELPER_ONLY`, `D2_DEFAULT_OFF`, `FALLBACK_GLOBAL_LOCK`. Asserted
+by `stage105_d2_validation_labels_present` and
+`stage105_d2_helper_only_not_called_by_live_paths`.
+
+### 15.2 The no-lost-wakeup invariant (D2 contract)
+
+Let *publish* = `endpoint_waiters[idx] = Some(receiver_tid)` (rank 3 mutate).
+Let *enqueue* = a sender's mutation of `endpoints[idx].queue` (rank 3
+mutate).
+
+**Invariant:** any sender whose enqueue happens-after a receiver's publish
+either (a) finds the waiter and hands the message directly (existing send
+path's receiver-waiter check), or (b) writes to the queue. There is no
+third outcome ("message enqueued AND waiter sleeping AND no one wakes them").
+
+**Proof** (by lock-ordering of the canonical flow today):
+
+1. The receiver's scheduler-block (`block_current_cpu`, rank 1) precedes
+   *publish*. So when *publish* becomes visible, the receiver TCB is
+   already `TaskStatus::Blocked(WaitReason::EndpointReceive(_))` from any
+   racing sender's perspective.
+2. *Publish* and *enqueue* both run under `ipc_state_lock` (rank 3) in
+   separate atomic critical sections.
+3. A sender's section ordered *after* *publish* observes the waiter and
+   takes the direct-delivery fast path
+   (`ipc_try_send_queued_plain_endpoint_only` →
+   `ReceiverWaiterFound` → `complete_blocked_recv_for_waiter` for recv-v2,
+   or the standard waiter-hand-off otherwise). Wake plan applied AFTER
+   rank-3 release.
+4. A sender's section ordered *before* *publish* observes no waiter and
+   enqueues into the endpoint queue. The receiver's
+   `try_publish_recv_waiter_audit_only` then returns `QueueNonEmpty` and
+   the caller is steered to dequeue immediately rather than block, so the
+   message is consumed without sleeping.
+5. There is no interleaving in which a sender enqueues to an empty queue
+   *and* fails to observe the published waiter, because both operations
+   acquire the same rank-3 lock in some serializable order.
+
+### 15.3 Tests (6 in `kernel::recv_waiter_split::tests`)
+
+- `stage105_d2_publish_on_empty_waiter_slot_lands` — empty slot →
+  `Published`; the published TID is observable via `endpoint_waiter_tid`.
+- `stage105_d2_publish_when_another_waiter_present_returns_already_waiting`
+  — second publish → `ReceiverAlreadyWaiting`.
+- `stage105_d2_publish_when_queue_nonempty_signals_dequeue_now` — sender
+  pre-enqueued → `QueueNonEmpty`; no waiter written (would-be-lost wake
+  ruled out by the helper's own contract).
+- `stage105_d2_publish_invalid_endpoint_index` — out-of-range → `InvalidEndpoint`.
+- `stage105_d2_helper_only_not_called_by_live_paths` — source-scan that
+  `syscall.rs` and `runtime.rs` do not reference the helper or its types.
+- `stage105_d2_validation_labels_present` — `D2_HELPER_ONLY`,
+  `D2_DEFAULT_OFF`, `FALLBACK_GLOBAL_LOCK`.
+
+### 15.4 Pass 3 live-wire prerequisites
+
+1. **SharedKernel split-mut seam for scheduler block.** Add a `block_current_cpu_split_mut` that takes only the scheduler lock (rank 1) and returns the blocked TID.
+2. **SharedKernel split-mut seam for TCB transition.** A narrow `set_blocked_on_endpoint_recv_split_mut(tid, recv_cap, deadline)` taking task lock (rank 2) only.
+3. **Replace `block_current_on_receive_with_deadline`'s body** with the three sequential split-mut calls + `try_publish_recv_waiter` for step 3.
+4. **Timeout integration.** Today's deadline write lives inside the same
+   `with_tcbs_mut` as the status transition; the split keeps them together
+   under rank 2.
+5. **QEMU x86_64 `-smp 1` core smoke + optional-FS strict smoke.** Mandatory
+   per MUST_SMOKE (this change crosses the trigger for "scheduler block/wake"
+   and "receiver-waiter logic").
+
+---
+
+## 16. Stage 105 / Pass 2 — D3 VmAnonMap/VmBrk two-phase split (audit only, deferred)
+
+D3's invariant is **no physical frame reuse until every relevant CPU has
+ACK'd the corresponding TLB invalidation**. The existing code already
+captures this via `VmAnonMapProgressPlan`, `VmAnonMapRollbackTlbPlan`,
+`TlbShootdownWaitPlan`, `VmBrkShrinkTlbPlan`, and the
+`execute_tlb_shootdown_wait_plan` / `unmap_range_two_phase` family, but they
+all run inside the global `&mut KernelState` of `handle_vm_anon_map` /
+`handle_vm_brk` today. The D3 live unlock would release between PTE
+mutation (rank 5), TLB shootdown wait (rank-1 IPI + ACK polling), and frame
+reclaim (rank 6).
+
+### 16.1 Why D3 is deferred at Stage 105 (no code in this stage)
+
+- **Highest blast radius.** Incorrect TLB-shootdown ordering causes silent
+  memory corruption that is invisible to unit tests but reproduces
+  intermittently in SMP runtime. The MUST_SMOKE policy applies, and a
+  meaningful smoke run requires multi-CPU coverage (x86_64 SMP is itself
+  blocked behind the trampoline split, per `AI_AGENT_RULES.md §5.1–5.2`).
+- **No SharedKernel VM seam.** A live D3 needs split-mut entries for the
+  VM domain (rank 5) and the memory domain (rank 6) plus the IPI/ACK loop
+  to run outside any lock. None of those exist yet.
+- **Active correctness fixes to preserve.** `vm.rs` `Result` /
+  `DrainedMapping` semantics and the two-phase unmap order are listed in
+  `doc/KERNEL_UNLOCKING_NEXT_CONTEXT.md §3` as hard invariants. Stage 105
+  must not perturb them.
+
+### 16.2 Pass 3 D3 prerequisites
+
+1. **SharedKernel split-mut seam per VM domain.** `with_vm_split_mut`
+   (rank 5) and `with_memory_split_mut` (rank 6).
+2. **TLB-shootdown ACK observability outside any lock.** Today
+   `execute_tlb_shootdown_wait_plan` spins inside `&mut KernelState`. A
+   live D3 needs an `await_tlb_shootdown_ack(plan)` that holds no lock.
+3. **Equivalence tests over the existing plan types.** Today's tests prove
+   the canonical `handle_vm_anon_map` path is correct; Pass 3 must add
+   tests that drive the same plan through a split sequence and assert
+   byte-equal mapping outcome (`Mapping` slot contents, refcount deltas,
+   shootdown bitmap, reclaimed frames).
+4. **MUST_SMOKE on x86_64 `-smp 1`** (and SMP > 1 when the trampoline
+   split lands).
+
+### 16.3 Status now
+
+- `VmAnonMapPlan`, `VmAnonMapProgressPlan`, `VmAnonMapRollbackTlbPlan`,
+  `TlbShootdownWaitPlan`, `VmBrkShrinkTlbPlan` — all **live** inside the
+  canonical `handle_vm_anon_map` / `handle_vm_brk` global-lock path
+  (`DECOMPOSITION_SCAFFOLD_STATUS.md §2`). No additional helper-only
+  scaffold is added in Stage 105; the existing plan types already make the
+  phase boundary explicit, and adding parallel "_split" variants without a
+  live wire would create the maintenance-noise pattern §7 of this doc
+  warns against.
+- D3 stays as a Pass 3 deliverable. Recommended sequencing: VmBrk shrink
+  first (smaller surface, simpler invariants), then VmAnonMap full path.
+
+---
+
+## 17. Pass 2 overall status and Pass 3 readiness
+
+| Directive | Pass 2 outcome |
+|-----------|----------------|
+| **D5** reply-cap split | **live-wired** for `FLAG_REPLY_CAP` non-shared-region, with fallible primitive + Phase B' mint rollback; tested. |
+| **D2** IPC recv blocking | **helper-only scaffold** + no-lost-wakeup audit; not live-wired. |
+| **D3** VmAnonMap/VmBrk | **deferred** with audit-only doc; existing plan types already capture the phase boundary. |
+| **D6** per-CPU scheduler | not started (per directive). |
+
+Pass 3 readiness:
+1. Smoke-accept Pass 2 (x86_64 `-smp 1` core + optional-FS strict on both
+   architectures, AArch64 optional-FS strict if available).
+2. Add the SharedKernel split-mut seams for **scheduler block (rank 1)**,
+   **task lock (rank 2) recv blocked-state transition**, and **VM/memory
+   domains (rank 5/6)**.
+3. Live-wire D2 using §15.4; smoke.
+4. Live-wire D3 (VmBrk shrink → VmAnonMap) using §16.2; smoke.
+5. Begin D6 audit (per-CPU scheduler locking) only after D2+D3 are smoke-stable.

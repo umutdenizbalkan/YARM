@@ -6,6 +6,7 @@ pub(crate) mod boot_command_line;
 pub mod capabilities;
 pub mod cap_transfer_split;
 pub mod frame_allocator;
+pub mod recv_waiter_split;
 pub mod global_allocator;
 pub mod ipc;
 pub mod lock;
