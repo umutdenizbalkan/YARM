@@ -4777,3 +4777,63 @@ let delivery = RecvSharedV3Delivery {
 
 **Run:** `cargo test -p yarm-fs-servers --lib stage91` and
 `cargo test -p yarm-control-plane-servers --lib stage91`
+
+---
+
+## Stage 92 — AArch64 wrong-sender reply race elimination
+
+**Problem:** Stage 91 made AArch64 functionally pass (RAMFS_SRV_READY, EXT4_SRV_READY,
+VFS_MOUNT_REGISTER_EXT4_OK) but still logged 3 `INIT_SPAWN_V5_WRONG_SENDER_REPLY` drain
+messages during RAMFS spawn on AArch64. These came from delayed VFS replies to the 3
+smoke-path calls (`vfs_statx` ×2, `vfs_openat` ×1) that used non-blocking `ipc_recv_with_deadline`
+in `crates/yarm-user-rt/src/vfs_client.rs`.
+
+**Root cause:** `vfs_client.rs` IPC helpers used `ipc_recv_with_deadline(reply_recv_cap, 0)`.
+The non-blocking poll returns `None` immediately if VFS hasn't replied yet, returning
+`Err(NoReply)` to the caller — but the reply remains queued. The pre-spawn drain loop
+(also non-blocking) then misses it. The reply arrives during `spawn_v5_cap`'s blocking
+`ipc_recv_v2`, triggering the wrong-sender drain.
+
+**Fix:** `crates/yarm-user-rt/src/vfs_client.rs` — changed `vfs_statx`, `vfs_openat`,
+`vfs_read`, `vfs_close` from `ipc_recv_with_deadline(reply_recv_cap, 0)` to
+`ipc_recv_v2(reply_recv_cap)` (blocking). Updated `decode_reply_u64` call to
+`&received.message`.
+
+**What must NOT change:**
+- The wrong-sender drain loop in `spawn_v5_cap` (retained as defense-in-depth).
+- All endpoint ABI, spawn ABI, image IDs, SYSCALL_COUNT, STARTUP_SLOT_COUNT.
+
+**Test groups (yarm-fs-servers `mod stage92_tests` — 10 tests):**
+
+1. `stage92_vfs_client_statx_uses_blocking_recv_v2` — statx uses `ipc_recv_v2`
+2. `stage92_vfs_client_openat_uses_blocking_recv_v2` — openat uses `ipc_recv_v2`
+3. `stage92_vfs_client_read_uses_blocking_recv_v2` — read uses `ipc_recv_v2`
+4. `stage92_vfs_client_close_uses_blocking_recv_v2` — close uses `ipc_recv_v2`
+5. `stage92_vfs_client_ipc_helpers_do_not_use_zero_deadline_recv` — no `ipc_recv_with_deadline` in IPC section
+6. `stage92_vfs_client_ipc_helpers_decode_via_received_message_field` — uses `&received.message`
+7. `stage92_vfs_client_module_doc_says_blocking_not_deadline` — doc updated
+8. `stage92_spawn_v5_drain_loop_is_defense_in_depth_with_blocking_vfs_client` — loop still present
+9. `stage92_smoke_script_aarch64_checks_zero_wrong_sender_count` — aarch64 smoke script enforces count=0
+10. `stage92_smoke_script_x86_64_checks_zero_wrong_sender_count` — x86_64 smoke script enforces count=0
+
+**Test groups (yarm-control-plane-servers `control_plane::tests` Stage 92 — 4 tests):**
+
+1. `stage92_vfs_client_all_ipc_helpers_use_ipc_recv_v2` — all four helpers checked
+2. `stage92_vfs_client_ipc_helpers_no_zero_deadline_recv` — no deadline-0 in IPC section
+3. `stage92_smoke_aarch64_checks_spawn_fail_and_wrong_sender` — script checks both markers
+4. `stage92_smoke_x86_64_checks_spawn_fail_and_wrong_sender` — same for x86_64
+
+**Smoke scripts (Stage 92 additions):**
+
+Both `scripts/qemu-aarch64-optional-fs-smoke.sh` and `scripts/qemu-x86_64-optional-fs-smoke.sh`
+now include a strict-mode check for `INIT_SPAWN_V5_WRONG_SENDER_REPLY`. When `QEMU_SMOKE_STRICT=1`
+and count > 0, the script sets `smoke_fail=1`.
+
+**Invariants unchanged from Stage 91:**
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`
+- `INIT_SPAWN_FAT_SRV = false`; `VFS_FAT_LIVE_MOUNT_ENABLED = false`
+- `MAX_INITRAMFS_INODES = 14`
+- SpawnV5 ABI; SYSCALL_COUNT = 31; STARTUP_SLOT_COUNT = 18
+
+**Run:** `cargo test -p yarm-fs-servers --lib stage92` and
+`cargo test -p yarm-control-plane-servers --lib stage92`

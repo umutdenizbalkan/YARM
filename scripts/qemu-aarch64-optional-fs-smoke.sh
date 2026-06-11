@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Stage 91: AArch64 optional-FS smoke test.
+# Stage 92: AArch64 optional-FS smoke test.
 # Checks RAMFS, EXT4, and FAT (skipped) marker presence in a QEMU boot log.
 # Sources qemu-smoke-common.sh for shared helpers.
 #
@@ -24,10 +24,11 @@ QEMU_MEMORY=${QEMU_MEMORY:-1024M}
 QEMU_SMP=${QEMU_SMP:-2}
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-}
 
-# Default expectations for Stage 91:
+# Default expectations for Stage 92:
 #   RAMFS is live (INIT_SPAWN_RAMFS_SRV=true, VFS_RAMFS_LIVE_MOUNT_ENABLED=true)
 #   EXT4 is live  (INIT_SPAWN_EXT4_SRV=true,  VFS_EXT4_LIVE_MOUNT_ENABLED=true)
 #   FAT is disabled (INIT_SPAWN_FAT_SRV=false, no virtio_blk in default profile)
+#   QEMU_SMOKE_STRICT=1: INIT_SPAWN_V5_WRONG_SENDER_REPLY must be absent (count=0)
 RAMFS_SMOKE_EXPECTED=${RAMFS_SMOKE_EXPECTED:-1}
 EXT4_SMOKE_EXPECTED=${EXT4_SMOKE_EXPECTED:-1}
 FAT_SMOKE_EXPECTED=${FAT_SMOKE_EXPECTED:-0}
@@ -99,6 +100,19 @@ if [[ -f "$LOGFILE" ]]; then
       echo "[ok] PM_ELF_ZC_FAIL image_id=${img_id} count=0"
     fi
   done
+fi
+
+# ---------------------------------------------------------------------------
+# Strict: INIT_SPAWN_V5_WRONG_SENDER_REPLY must be absent (count=0).
+# ---------------------------------------------------------------------------
+if [[ -f "$LOGFILE" ]]; then
+  wsr_count=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "INIT_SPAWN_V5_WRONG_SENDER_REPLY" 2>/dev/null || echo 0)
+  if [[ "$wsr_count" -gt 0 ]]; then
+    echo "[error] INIT_SPAWN_V5_WRONG_SENDER_REPLY count=${wsr_count} (wrong-sender drain must be zero after Stage 92 fix)"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && smoke_fail=1
+  else
+    echo "[ok] INIT_SPAWN_V5_WRONG_SENDER_REPLY count=0"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
