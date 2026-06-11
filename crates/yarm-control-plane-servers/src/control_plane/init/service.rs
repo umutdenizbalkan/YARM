@@ -485,6 +485,56 @@ fn register_fat_mount_with_vfs(
     }
 }
 
+fn register_ext4_mount_with_vfs(
+    vfs_send_cap: u32,
+    reply_recv_cap: u32,
+    ext4_send_cap: u64,
+) -> bool {
+    let Some((payload, len)) = (MountRegisterArgs {
+        backend_send_cap: ext4_send_cap,
+        flags: 1,
+        prefix: b"/ext4",
+    })
+    .encode() else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=encode");
+        return false;
+    };
+    let Ok(msg) =
+        yarm_user_rt::ipc::Message::with_header(0, VFS_OP_MOUNT_REGISTER, 0, None, &payload[..len])
+    else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=message");
+        return false;
+    };
+    yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_BEGIN prefix=/ext4");
+    let call = unsafe { yarm_user_rt::syscall::ipc_call(vfs_send_cap, reply_recv_cap, &msg) };
+    if call.is_err() {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=ipc-call");
+        return false;
+    }
+    let reply = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(reply_recv_cap, 0) };
+    let Ok(Some(reply_msg)) = reply else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=no-reply");
+        return false;
+    };
+    if reply_msg.as_slice().len() < 4 {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR reason=short-reply");
+        return false;
+    }
+    let status = u32::from_le_bytes([
+        reply_msg.as_slice()[0],
+        reply_msg.as_slice()[1],
+        reply_msg.as_slice()[2],
+        reply_msg.as_slice()[3],
+    ]);
+    if status == VFS_MOUNT_STATUS_OK {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4");
+        true
+    } else {
+        yarm_user_rt::user_log!("VFS_MOUNT_REGISTER_EXT4_ERR status={}", status);
+        false
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
@@ -875,19 +925,25 @@ pub fn run() {
             yarm_user_rt::user_log!("INIT_FAT_SPAWN_SKIPPED reason=server_disabled");
         }
 
-        // --- Spawn ext4_srv (image_id=12) read-only. ---
-        // Stage 86: ext4_srv now has a resident ipc_recv_v2 loop (VFS_EXT4_RECV_LOOP_ENABLED).
-        // VFS mount registration remains deferred (VFS_EXT4_LIVE_MOUNT_ENABLED = false).
+        // --- Spawn ext4_srv (image_id=12) read-only and register /ext4 with VFS. ---
+        // Stage 86: ext4_srv has a resident ipc_recv_v2 loop (VFS_EXT4_RECV_LOOP_ENABLED=true).
+        // Stage 88: VFS_EXT4_LIVE_MOUNT_ENABLED=true; register_ext4_mount_with_vfs wires /ext4.
         if INIT_SPAWN_EXT4_SRV {
             yarm_user_rt::user_log!("INIT_EXT4_SPAWN_BEGIN");
-            if let Some((ext4_child_tid, _init_ext4_send_cap)) =
+            if let Some((ext4_child_tid, init_ext4_send_cap)) =
                 spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)
             {
                 yarm_user_rt::user_log!(
-                    "INIT_EXT4_SPAWN_OK child_tid={} mount_deferred=true reason=live-mount-disabled",
-                    ext4_child_tid
+                    "INIT_EXT4_SPAWN_OK child_tid={} send_cap={}",
+                    ext4_child_tid,
+                    init_ext4_send_cap,
                 );
                 yarm_user_rt::user_log!("EXT4_SRV_READY child_tid={}", ext4_child_tid);
+                let _ = register_ext4_mount_with_vfs(
+                    vfs_recv_cap as u32,
+                    pm_recv,
+                    init_ext4_send_cap,
+                );
             } else {
                 yarm_user_rt::user_log!("INIT_EXT4_SPAWN_FAIL ok=0 child_tid=0");
             }
