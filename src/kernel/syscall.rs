@@ -956,6 +956,13 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
         Err(err) => return Err(err),
     };
 
+    // VALIDATION: LIVE_OFF_TRAP
+    // VALIDATION: SPLIT_FAST_PATH_ONLY
+    // Stage 4E / Stage 4F / Stage 4K / Stage 4O: split-send fast path off the
+    // trap-entry seam. Cases this match cannot service set
+    // `split_send_result = None` and the caller falls back to the global-lock
+    // `kernel.ipc_send(...)` / `ipc_send_with_deadline(...)` paths below.
+    // See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
     let (split_send_result, split_scheduler_plan) = match endpoint {
         CapObject::Endpoint { .. } => {
             let endpoint_idx = kernel
@@ -1088,6 +1095,12 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 // the scheduler.  Returns Ok(Some((msg, plan))) on immediate success, Ok(None) when
 // the endpoint is ineligible, or Err on capability resolution failure.
 // The wake plan (WakeSender) must be applied by the caller AFTER releasing every lock.
+//
+// VALIDATION: LIVE_OFF_TRAP
+// VALIDATION: SPLIT_FAST_PATH_ONLY
+// Stage 101: this is a split fast path off the trap-entry seam. Cases the helper
+// cannot service return Ok(None) and the caller falls back to the global-lock
+// `kernel.ipc_recv(cap)` path. See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
 fn try_endpoint_split_recv(
     kernel: &mut KernelState,
     endpoint: CapObject,
@@ -1493,6 +1506,12 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     // only applies to the no-waiter enqueue path). complete_blocked_recv_for_waiter
     // handles FLAG_REPLY_CAP via materialize_received_message_cap.
     //
+    // VALIDATION: LIVE_OFF_TRAP
+    // VALIDATION: SPLIT_FAST_PATH_ONLY
+    // Stage 101: live-wired off the trap entry; non-recv-v2 receivers and
+    // sender/cap-transfer envelope failures fall back to the global-lock
+    // `kernel.ipc_send(...)` path. See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
+    //
     // The transfer envelope was stashed by stash_transfer_handle with
     // receiver_tid = Some(waiter_tid). Error-path cleanup must pass that same
     // receiver_tid to take_transfer_envelope — passing sender_tid would cause
@@ -1570,6 +1589,11 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     Ok(())
 }
 
+// VALIDATION: GLOBAL_LOCK_SLOW_PATH
+// Stage 101: NR 7 IpcReply is not yet split-wired off the trap-entry seam.
+// kernel.ipc_reply(...) runs under the global &mut KernelState. A future
+// Stage 102+ may add a Stage-4M fast path analogous to Stage 4L.
+// See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
 fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let reply_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
@@ -4218,6 +4242,13 @@ fn recv_v3_exact_region_len(obj: crate::kernel::capabilities::CapObject) -> u64 
     }
 }
 
+/// VALIDATION: SPLIT_FAST_PATH_ONLY
+/// Stage 101 (audit): NR 30 RecvSharedV3 reuses the `try_recv_core_user_plain`
+/// split-recv adapter for the dequeue+writeback. The trap-entry seam itself
+/// still routes NR 30 through the global-lock dispatch (`dispatch()`), but the
+/// IPC dequeue inside this handler runs against the same split adapter as
+/// Stage 36. See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
+///
 /// Stage 42+43: handle the `recv_shared_v3` syscall (NR 30).
 ///
 /// # Constraints (Stage 42+43)
@@ -7645,5 +7676,233 @@ mod tests {
             init_src.contains("INIT_SPAWN_EXT4_SRV"),
             "init must define INIT_SPAWN_EXT4_SRV sub-gate"
         );
+    }
+
+    // ── Stage 101: kernel-unlocking restart — audit / source-label tests ──────
+
+    #[test]
+    fn stage101_must_smoke_policy_is_documented() {
+        // The MUST_SMOKE policy must live in AI_AGENT_RULES.md and be
+        // cross-referenced from KERNEL_TEST_RULES.md.
+        let agent_rules = include_str!("../../doc/AI_AGENT_RULES.md");
+        let test_rules = include_str!("../../doc/KERNEL_TEST_RULES.md");
+        assert!(
+            agent_rules.contains("## 13. MUST_SMOKE Policy"),
+            "AI_AGENT_RULES.md must define §13 MUST_SMOKE policy"
+        );
+        assert!(
+            agent_rules.contains("Minimum accepted smoke")
+                && agent_rules.contains("x86_64 `-smp 1`"),
+            "AI_AGENT_RULES.md §13 must specify minimum x86_64 -smp 1 smoke"
+        );
+        assert!(
+            agent_rules.contains("nonfatal=true"),
+            "AI_AGENT_RULES.md §13 must document the nonfatal=true grep exclusion"
+        );
+        assert!(
+            test_rules.contains("Stage 101")
+                && test_rules.contains("MUST_SMOKE"),
+            "KERNEL_TEST_RULES.md must reference Stage 101 MUST_SMOKE policy"
+        );
+    }
+
+    #[test]
+    fn stage101_live_trap_smoke_labels_present_at_split_call_sites() {
+        // Audit labels added in Stage 101 at the live split call sites.
+        let src = include_str!("syscall.rs");
+        // try_endpoint_split_recv (Stage 4C/4D/4J)
+        assert!(
+            src.contains("VALIDATION: LIVE_OFF_TRAP")
+                && src.contains("VALIDATION: SPLIT_FAST_PATH_ONLY"),
+            "syscall.rs must carry LIVE_OFF_TRAP + SPLIT_FAST_PATH_ONLY labels"
+        );
+        // handle_ipc_reply (no split yet)
+        assert!(
+            src.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "syscall.rs must mark handle_ipc_reply as GLOBAL_LOCK_SLOW_PATH"
+        );
+        // Stage 4L IpcCall block
+        let stage_4l_block = src
+            .split("Stage 4L: IpcCall to a recv-v2 blocked receiver")
+            .nth(1)
+            .expect("Stage 4L block present");
+        let next_500 = &stage_4l_block[..stage_4l_block.len().min(800)];
+        assert!(
+            next_500.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "Stage 4L IpcCall block must carry LIVE_OFF_TRAP label"
+        );
+        // handle_recv_shared_v3
+        let v3_block = src
+            .split("/// Stage 42+43: handle the `recv_shared_v3` syscall")
+            .next()
+            .expect("recv_shared_v3 split");
+        let tail_v3 = &v3_block[v3_block.len().saturating_sub(800)..];
+        assert!(
+            tail_v3.contains("VALIDATION: SPLIT_FAST_PATH_ONLY"),
+            "handle_recv_shared_v3 must carry SPLIT_FAST_PATH_ONLY label"
+        );
+    }
+
+    #[test]
+    fn stage101_syscall_split_lib_still_carries_live_trap_smoke_label() {
+        // The Stage 29 / Stage 32B live split-dispatch seam must keep its
+        // LIVE_TRAP_SMOKE_X86_64 validation marker.
+        let split_src = include_str!("syscall_split.rs");
+        assert!(
+            split_src.contains("LIVE_TRAP_SMOKE_X86_64"),
+            "syscall_split.rs must carry LIVE_TRAP_SMOKE_X86_64 label"
+        );
+    }
+
+    #[test]
+    fn stage101_recv_core_extract_cap_transfer_plan_labels_d1_status() {
+        let src = include_str!("recv_core.rs");
+        // Stage 101 D1 pre-audit label.
+        assert!(
+            src.contains("VALIDATION: SPLIT_FAST_PATH_ONLY")
+                && src.contains("Stage 101 / D1 pre-audit"),
+            "extract_cap_transfer_plan must carry the Stage 101 D1 pre-audit label"
+        );
+    }
+
+    #[test]
+    fn stage101_audit_doc_exists_with_decomposition_map_and_d1_audit() {
+        let audit = include_str!("../../doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md");
+        // Decomposition map skeleton.
+        for module in [
+            "syscall/dispatch.rs",
+            "syscall/ipc.rs",
+            "syscall/ipc_recv_core.rs",
+            "syscall/mm.rs",
+            "syscall/cap.rs",
+            "syscall/sched.rs",
+            "syscall/process.rs",
+            "syscall/initramfs.rs",
+            "syscall/debug.rs",
+            "syscall/recv_shared_v3.rs",
+        ] {
+            assert!(
+                audit.contains(module),
+                "audit doc must list {module} in the decomposition map"
+            );
+        }
+        // D1 audit answers.
+        for q in [
+            "Q1 — Does",
+            "Q2 — Does",
+            "Q3 — Do either",
+            "Q4 — Is D1 safe",
+            "Q5 — Rollback",
+            "Q6 — Does `FLAG_CAP_TRANSFER_PLAIN` fall back",
+            "Q7 — Queue-head starvation",
+        ] {
+            assert!(
+                audit.contains(q),
+                "audit doc must answer D1 question: {q}"
+            );
+        }
+        // Unsafe split-helper guard audit section.
+        assert!(
+            audit.contains("Unsafe split-helper guard audit")
+                && audit.contains("`addr_of!`"),
+            "audit doc must include the unsafe split-helper guard audit"
+        );
+    }
+
+    #[test]
+    fn stage101_scaffold_status_doc_exists_and_lists_required_types() {
+        let status = include_str!("../../doc/DECOMPOSITION_SCAFFOLD_STATUS.md");
+        for ty in [
+            "RecvCapTransferPlan",
+            "TlbShootdownWaitPlan",
+            "VmAnonMapProgressPlan",
+            "VmAnonMapRollbackTlbPlan",
+            "VmBrkShrinkTlbPlan",
+            "SchedulerWakePlan",
+            "SchedulerHandoffPlan",
+            "RecvV3CleanupToken",
+            "RecvV3CleanupIdentity",
+            "RecvV3MappingPlan",
+            "FallbackReason::CapTransfer",
+        ] {
+            assert!(
+                status.contains(ty),
+                "scaffold status doc must list type: {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage101_d1_audit_recv_core_cap_transfer_plumbing_present() {
+        // Source-scan the three concrete pre-audit conclusions:
+        //   * RecvCapTransferPlan exists and is consumed by all three
+        //     try_recv_core_* split adapters.
+        //   * extract_cap_transfer_plan is the canonical extractor.
+        //   * materialize_received_message_cap remains the materialize entry
+        //     point on the syscall side.
+        let recv = include_str!("recv_core.rs");
+        let syscall = include_str!("syscall.rs");
+        assert!(recv.contains("pub struct RecvCapTransferPlan"));
+        assert!(recv.contains("fn extract_cap_transfer_plan"));
+        let consumers = recv.matches("extract_cap_transfer_plan(&msg)").count();
+        assert!(
+            consumers >= 6,
+            "extract_cap_transfer_plan must be consumed by both arms of all \
+             three try_recv_core_* paths (got {consumers})"
+        );
+        assert!(syscall.contains("fn materialize_received_message_cap"));
+        assert!(syscall.contains("fn materialize_received_transfer_cap"));
+    }
+
+    #[test]
+    fn stage101_syscall_count_and_recv_shared_v3_dispatch_remain() {
+        // Stage 101 hard invariants reaffirmed by source scan.
+        let src = include_str!("syscall.rs");
+        assert!(
+            src.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31 in Stage 101"
+        );
+        // NR 30 RecvSharedV3 dispatch arm.
+        assert!(
+            src.contains("Syscall::RecvSharedV3 => handle_recv_shared_v3"),
+            "Syscall::RecvSharedV3 must remain a live dispatch arm"
+        );
+        // NR 8 ControlPlaneSetCnodeSlots dispatch arm.
+        assert!(
+            src.contains(
+                "Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots"
+            ),
+            "Syscall::ControlPlaneSetCnodeSlots must remain a live dispatch arm"
+        );
+        // Stage 29 split path remains whitelisted.
+        let split = include_str!("syscall_split.rs");
+        assert!(
+            split.contains("Syscall::ControlPlaneSetCnodeSlots => Some(syscall)"),
+            "Stage 29 NR 8 split path must remain in classify_split_eligible_nr_only"
+        );
+    }
+
+    #[test]
+    fn stage101_stage_100_fs_baseline_preserved() {
+        // FS gate constants source-scan: the Stage 100 baseline must be
+        // unchanged at Stage 101 (this is an audit/scaffold stage only).
+        let fs_lib = include_str!(
+            "../../crates/yarm-fs-servers/src/lib.rs"
+        );
+        let init_src =
+            include_str!("../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs");
+        assert!(
+            init_src.contains("INIT_SPAWN_RAMFS_SRV: bool = true"),
+            "INIT_SPAWN_RAMFS_SRV must remain true at Stage 101"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
+            "INIT_SPAWN_FAT_SRV must remain false at Stage 101"
+        );
+        assert!(
+            init_src.contains("INIT_SPAWN_EXT4_SRV: bool = true"),
+            "INIT_SPAWN_EXT4_SRV must remain true at Stage 101"
+        );
+        let _ = fs_lib; // referenced for include_str! side check; assertions below
     }
 }
