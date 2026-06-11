@@ -689,7 +689,7 @@ Plus four additional behavior-equivalence tests:
    currently routes complex cap-flagged refills to the global lock. D1 may
    absorb the plain subset; the complex subset stays fallback.
 
-### 12.8 Stage 103 invariants reaffirmed
+### 12.8 Stage 103 invariants reaffirmed (superseded by §13 for D1 status)
 
 - `SYSCALL_COUNT = 31`, `STARTUP_SLOT_COUNT = 18`, SpawnV5 ABI,
   `recv_shared_v3` ABI offsets, image IDs 7–12 — **unchanged**.
@@ -703,3 +703,143 @@ Plus four additional behavior-equivalence tests:
   — **unchanged**.
 - Global-lock fallback `materialize_received_message_cap` — **unchanged and
   still authoritative**.
+
+---
+
+## 13. Stage 104 / Kernel Unlocking Pass 1 — D1 live-wired (transfer arm), D5 deferred
+
+Stage 104 live-wires the Stage 103 D1 engine for the supported transfer-cap
+receive case and defers D5 (reply-cap split) with an exact blocker.
+
+**NOT SMOKE-ACCEPTED:** developed in an environment without QEMU. Per
+MUST_SMOKE (`AI_AGENT_RULES.md §13`) this branch requires x86_64 `-smp 1`
+core smoke and optional-FS strict smoke before merge acceptance — this is a
+live IPC semantics change (routing), even though the materialization sequence
+is equivalence-proven byte-identical.
+
+### 13.1 What is live now (D1)
+
+`syscall.rs::materialize_received_message_cap_routed` (labels:
+`D1_LIVE_SPLIT` + `FALLBACK_GLOBAL_LOCK`) is called from exactly two
+delivery seams:
+
+1. `complete_blocked_recv_for_waiter` — recv-v2 blocked-receiver delivery
+   (Stage 4K/4O seam, used by IpcSend and IpcCall split deliveries).
+2. `try_split_recv_queued_plain_with_snapshot_locked` — queued split-recv
+   (Stage 36/37/42+43 seam).
+
+Supported scope routed through `cap_transfer_split::materialize_split_transfer_cap_equivalent`:
+- `FLAG_CAP_TRANSFER`, non-reply, `opcode != OPCODE_SHARED_MEM`
+- `FLAG_CAP_TRANSFER_PLAIN`, non-reply, `opcode != OPCODE_SHARED_MEM`
+- plain messages short-circuit to `None`
+
+Each successful routed materialization increments the new
+`IpcPathTelemetry::d1_split_materializations` counter and emits
+`YARM_D1_SPLIT_MATERIALIZE` (additive marker). Failure logging is
+byte-identical to the canonical transfer arm
+(`IPC_RECV_CAP_MATERIALIZE_FAILED kind=transfer ...`).
+
+### 13.2 What stays on the global-lock fallback
+
+| Case | Why |
+|------|-----|
+| `FLAG_REPLY_CAP` | D5 deferred — see §13.4 |
+| `OPCODE_SHARED_MEM` transfers | receiver-side mapping obligations outside the materialize step |
+| Sender-waiter cap-transfer refills | `recv_core.rs FallbackReason::SenderWaiterWake` unchanged |
+| Legacy full recv path (`handle_ipc_recv_result_with_empty_error`) | intentionally unrouted this pass — canonical helper called directly |
+| NR 30 RecvSharedV3 handler | intentionally unrouted this pass |
+| Any `FallbackRequired` outcome | router falls through to `materialize_received_message_cap` |
+
+The canonical `materialize_received_message_cap` is **unchanged** and remains
+the authoritative implementation for all fallback cases.
+
+### 13.3 Rank order and the hosted-dev lock-order note
+
+Routed sequence (all sequential acquire/release, never nested):
+Phase A.1 IPC rank 3 (`take_transfer_envelope`) → Phase A.2 capability rank 4
+read (`resolve_capability_for_task`) → Phase B capability rank 4 mutate
+(`grant_task_to_task_with_rights`) → telemetry IPC rank 3
+(`note_d1_split_materialize`).
+
+The final rank-4 → rank-3 sequential transition triggers the debug-only
+hosted-dev `YARM_LOCK_ORDER_WARN` diagnostic in unit tests. This is expected:
+the tracker flags any descending sequential pair, the locks are never held
+simultaneously (no deadlock possibility), and the canonical reply arm
+produces the same pattern (`mint` rank 4 → `set_reply_cap_waiter_cap` rank
+3). The warn is compiled out of production builds (`hosted-dev` +
+`debug_assertions` only) and no smoke script greps it.
+
+### 13.4 D5 reply-cap split — deferred with exact blocker
+
+Lock-touch map of the reply arm: `take_transfer_envelope` (rank 3) →
+`capability_object_live` (rank 4 read) → `task_cnode` (rank 2) →
+`mint_capability_in_cnode` (rank 4 mutate) → `set_reply_cap_waiter_cap`
+(rank 3 mutate).
+
+Sequential acquisition is deadlock-free; the blocker is the **atomicity
+window** between the rank-4 mint and the rank-3 record write: outside the
+global lock another CPU could revoke/consume the reply object in that window,
+leaving a minted-but-unrecorded reply cap (leak) or a generation-guarded
+record-set that silently no-ops. Safe D5 design (Pass 2):
+
+1. mint under rank 4 (existing code),
+2. change `set_reply_cap_waiter_cap` to return `bool` (its generation guard
+   already detects the stale case — the signal is just discarded today),
+3. on `false`, roll back the mint via `rollback_materialized_recv_cap`.
+
+This requires a signature change plus a new rollback branch on live reply
+traffic — gated on QEMU smoke. Deferred.
+
+### 13.5 CapRights widening — explicitly deferred
+
+Stage 104 does not touch the capability layout. `CapRights` widening (C6)
+remains deferred to a later stage; nothing in the D1 transfer arm requires
+it (rights pass through `Capability::derive` unchanged).
+
+### 13.6 D4 — no further module moves this pass
+
+No additional syscall module splits were performed: mixing mechanical churn
+with a semantic IPC change would defeat the per-PR reviewability that D4
+exists to provide. The Stage 102 split (`syscall/debug.rs`,
+`syscall/initramfs.rs`) is unchanged.
+
+### 13.7 Stage 104 test additions (net +6: 8 new, 2 Stage 103 tests replaced)
+
+In `kernel::cap_transfer_split::tests`:
+- `stage104_live_wire_call_sites_present` (replaces
+  `stage103_helper_only_no_live_call_sites` per the Stage 103 test rule):
+  router defined; split engine called; both routed seams present; canonical
+  helper retained at definition + router fallback + legacy path + NR 30.
+- `stage104_validation_labels_present` (replaces
+  `stage103_validation_labels_present`): `D1_LIVE_SPLIT`,
+  `FALLBACK_GLOBAL_LOCK`, and the `NOT SMOKE-ACCEPTED` disclosure.
+
+In `kernel::syscall::tests`:
+- `stage104_router_supported_transfer_routes_through_split_engine`
+  (telemetry proves routing; cap present in receiver cnode)
+- `stage104_router_transfer_plain_also_routes_through_split_engine`
+- `stage104_router_shared_mem_opcode_stays_on_canonical_path` (telemetry 0)
+- `stage104_router_reply_cap_falls_back_to_canonical_path` (telemetry 0;
+  canonical WrongObject; envelope consumed per canonical contract)
+- `stage104_router_equivalence_with_canonical_for_supported_case`
+  (byte-equal CapId, slot object, slot rights, memory-object cap_refcount,
+  delegation-link count across two identical states)
+- `stage104_router_materialize_failure_error_matches_canonical`
+  (source cap revoked after stash: identical error + identical envelope
+  consumption on both paths)
+
+Stage 103's remaining 12 tests (classification, Phase A/B, equivalence)
+continue to pass and remain the equivalence contract.
+
+### 13.8 Recommended Pass 2
+
+1. **Smoke-accept Pass 1**: run x86_64 `-smp 1` core smoke + optional-FS
+   strict smoke on this branch in a QEMU-capable environment. Watch for
+   `YARM_D1_SPLIT_MATERIALIZE` on PM/VFS cap-transfer traffic and verify
+   `INIT_SPAWN_V5_WRONG_SENDER_REPLY count=0` is preserved.
+2. **D5 reply-cap split** per the §13.4 design (bool-returning record set +
+   mint rollback), smoke-gated.
+3. **D2 (IPC recv blocking split)** after D5: register recv waiters under
+   IPC lock; global lock only for the scheduler block/dispatch step.
+4. Optional D4 continuation: `syscall/recv_shared_v3.rs` mechanical move
+   (separate PR from any semantic change).

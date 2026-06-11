@@ -114,29 +114,32 @@ No types are flagged as **obsolete** at Stage 101.
 
 ---
 
-## 6.2 Stage 103 — D1 cap-transfer recv split status
+## 6.2 Stage 104 — D1 cap-transfer recv split status (LIVE for transfer arm)
 
-The cap-transfer materialization Phase A / B / C scaffold lives in
-`src/kernel/cap_transfer_split.rs` (Stage 103). All entry points are
-`D1_HELPER_ONLY` / `D1_DEFAULT_OFF`; no live syscall path calls them.
-Equivalence with the global-lock `materialize_received_transfer_cap` is
-proven by `stage103_equivalence_split_matches_direct_take_plus_grant` (byte
-comparison of minted `CapId`, receiver cnode slot object, and slot rights).
+The cap-transfer materialization Phase A / B / C engine lives in
+`src/kernel/cap_transfer_split.rs` (Stage 103 scaffold, **Stage 104
+live-wired** via `syscall.rs::materialize_received_message_cap_routed` at the
+recv-v2 blocked-receiver seam and the queued split-recv seam). Labels:
+`D1_LIVE_SPLIT` + `FALLBACK_GLOBAL_LOCK`. **NOT SMOKE-ACCEPTED** until
+x86_64 `-smp 1` + optional-FS strict smoke run (no QEMU in dev environment).
+Equivalence with the global-lock path is proven by
+`stage103_equivalence_split_matches_direct_take_plus_grant` and the
+`stage104_router_*` tests (CapId, slot object, slot rights, cap_refcount,
+delegation-link count, failure-error parity).
 
-| Path | D1 status (Stage 103) | Owner |
+| Path | D1 status (Stage 104) | Owner |
 |------|------------------------|-------|
-| `FLAG_CAP_TRANSFER` (non-reply, no shared region) | helper-only, equivalence-tested | `materialize_split_transfer_cap_equivalent` |
-| `FLAG_CAP_TRANSFER_PLAIN` (non-reply) | helper-only, equivalence-tested | same |
-| Plain message (no flag) | helper-only, returns `None` | same |
-| `FLAG_REPLY_CAP` | **fallback to global lock** (rank 3↔4 inversion) | `materialize_received_message_cap` reply arm |
+| `FLAG_CAP_TRANSFER` (non-reply, no shared region) | **live** (`d1_split_materializations` telemetry) | router → `materialize_split_transfer_cap_equivalent` |
+| `FLAG_CAP_TRANSFER_PLAIN` (non-reply) | **live** | same |
+| Plain message (no flag) | **live**, returns `None` | same |
+| `FLAG_REPLY_CAP` | **fallback to global lock** (D5: mint→record atomicity window; see audit §13.4) | `materialize_received_message_cap` reply arm |
 | Sender-waiter with cap-transfer | **fallback to global lock** | `recv_core.rs` `FallbackReason::SenderWaiterWake` |
-| `FLAG_CAP_TRANSFER` with shared region (OPCODE_SHARED_MEM) | **fallback to global lock** | global-lock recv path |
+| `FLAG_CAP_TRANSFER` with shared region (OPCODE_SHARED_MEM) | **fallback to global lock** | router → canonical path |
+| Legacy full recv path / NR 30 handler | **unrouted this pass** — canonical helper called directly | `materialize_received_message_cap` |
 
-Stage 104 prerequisites for live-wiring (see audit doc §12.7):
-
-1. `SharedKernel` split-mut seam per phase.
-2. Reply-cap rank 3↔4 design choice.
-3. QEMU x86_64 `-smp 1` smoke environment.
+Pass 2 items (see audit doc §13.8): smoke-accept Pass 1; D5 reply-cap split
+(bool-returning `set_reply_cap_waiter_cap` + mint rollback); D2 blocking-recv
+split; optional `syscall/recv_shared_v3.rs` mechanical move.
 
 ---
 

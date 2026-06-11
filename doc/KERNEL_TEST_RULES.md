@@ -5145,3 +5145,57 @@ labels present; Stage 100 FS gates unchanged.
 
 **Run:** `cargo test --lib stage103` and the full
 `cargo test --lib -- --test-threads=1`.
+
+---
+
+## Stage 104 / Kernel Unlocking Pass 1 — D1 live router test rules
+
+Stage 104 live-wired the D1 cap-transfer recv split for the supported
+transfer-cap case via `syscall.rs::materialize_received_message_cap_routed`.
+**NOT SMOKE-ACCEPTED** until x86_64 `-smp 1` core smoke and optional-FS
+strict smoke run on the branch (developed without QEMU). See
+`doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §13`.
+
+**Test rules:**
+
+1. **Routing is proven by telemetry, not logs.** Tests assert
+   `IpcPathTelemetry::d1_split_materializations` increments for routed
+   materializations and stays 0 for fallback cases (reply-cap, shared-mem).
+   Do not grep `YARM_D1_SPLIT_MATERIALIZE` in unit tests — the marker is for
+   smoke logs.
+2. **The canonical helper is load-bearing.** `materialize_received_message_cap`
+   must remain called at ≥ 4 sites: definition, router fallback, legacy full
+   recv path, NR 30 handler (`stage104_live_wire_call_sites_present`).
+   Removing any of them breaks the global-lock fallback contract.
+3. **Equivalence tests are the regression gate for both sides.** Any change
+   to `take_transfer_envelope`, `grant_task_to_task_with_rights`, or the
+   split engine must keep `stage104_router_equivalence_with_canonical_for_supported_case`
+   (CapId / slot object / slot rights / cap_refcount / delegation-link parity)
+   and `stage104_router_materialize_failure_error_matches_canonical`
+   (error + envelope-consumption parity) passing.
+4. **Hosted-dev `YARM_LOCK_ORDER_WARN` after routed success is expected.**
+   The router's telemetry note (IPC rank 3) follows Phase B (capability rank
+   4) sequentially — the debug tracker flags descending sequential pairs even
+   though no locks are held simultaneously. Do not "fix" this by removing the
+   telemetry or reordering phases; it is compiled out of production builds.
+5. **The Stage 103 helper-only assertion is gone by design.** It was replaced
+   by `stage104_live_wire_call_sites_present` in the same PR that live-wired
+   the engine, per the Stage 103 rule 1 contract.
+
+**Test groups (Stage 104 — 8 tests, net +6):**
+
+`kernel::cap_transfer_split::tests`: `stage104_live_wire_call_sites_present`,
+`stage104_validation_labels_present`.
+`kernel::syscall::tests`: `stage104_router_supported_transfer_routes_through_split_engine`,
+`stage104_router_transfer_plain_also_routes_through_split_engine`,
+`stage104_router_shared_mem_opcode_stays_on_canonical_path`,
+`stage104_router_reply_cap_falls_back_to_canonical_path`,
+`stage104_router_equivalence_with_canonical_for_supported_case`,
+`stage104_router_materialize_failure_error_matches_canonical`.
+
+**Invariants unchanged:** SYSCALL_COUNT = 31; NR 30 routed; NR 8 split
+whitelist; Stage 101 labels; Stage 102 module split; Stage 100 FS gates;
+no deadline-0 required replies; no wrong-sender SpawnV5 replies.
+
+**Run:** `cargo test --lib stage104` and the full
+`cargo test --lib -- --test-threads=1`.

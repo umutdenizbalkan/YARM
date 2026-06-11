@@ -19,6 +19,13 @@ pub struct IpcPathTelemetry {
     /// Stage 4E: cap-transfer messages buffered into the endpoint queue via the split
     /// send path (no receiver waiter).  Incremented alongside queued_sends.
     pub cap_transfer_stage4e_enqueued: u64,
+    /// Stage 104 / D1: recv-side cap materializations serviced through the
+    /// phase-separated split router (`cap_transfer_split`) instead of the
+    /// canonical `materialize_received_message_cap` transfer arm.  Counts only
+    /// the supported case (FLAG_CAP_TRANSFER / FLAG_CAP_TRANSFER_PLAIN,
+    /// non-reply, non-shared-region).  Reply-cap, shared-region, and fallback
+    /// materializations do NOT increment this.
+    pub d1_split_materializations: u64,
     pub blocked_sends: u64,
     pub rendezvous_handoffs: u64,
     pub transfer_records_created: u64,

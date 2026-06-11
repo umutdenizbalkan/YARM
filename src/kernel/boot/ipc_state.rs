@@ -2061,6 +2061,18 @@ impl KernelState {
         });
     }
 
+    /// Stage 104 / D1: count a recv-side cap materialization serviced through
+    /// the phase-separated split router (`cap_transfer_split`). Incremented
+    /// only for the supported case (transfer-cap, non-reply, non-shared-region);
+    /// fallback materializations keep this counter unchanged, which lets tests
+    /// assert the routing decision itself.
+    pub(crate) fn note_d1_split_materialize(&mut self) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.d1_split_materializations =
+                ipc.telemetry.d1_split_materializations.saturating_add(1);
+        });
+    }
+
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {
         if msg.opcode != PROC_OP_EXECUTE_RESTART {
             return Err(KernelError::WrongObject);

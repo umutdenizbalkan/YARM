@@ -297,8 +297,16 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     } else {
         0
     };
-    let recv_local_transfer =
-        materialize_received_message_cap(kernel, recv_endpoint, waiter_tid, msg.sender_tid.0, msg)?;
+    // Stage 104 / D1: routed — supported transfer-cap messages go through the
+    // phase-separated split engine; reply-cap and shared-region fall back to
+    // the canonical materialize path inside the router.
+    let recv_local_transfer = materialize_received_message_cap_routed(
+        kernel,
+        recv_endpoint,
+        waiter_tid,
+        msg.sender_tid.0,
+        msg,
+    )?;
     if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
         crate::yarm_log!(
             "IPC_RECV_BLOCKED_REPLY_CAP_MINT waiter_tid={} local_reply_cap={} reply_obj={}",
@@ -593,6 +601,82 @@ fn materialize_received_message_cap(
             Err(first_err)
         }
     }
+}
+
+/// Stage 104 / D1: route recv-side cap materialization through the
+/// phase-separated split engine for the supported case; keep everything else
+/// on the canonical global-lock path.
+///
+/// VALIDATION: D1_LIVE_SPLIT — live-wired at two delivery sites:
+///   1. `complete_blocked_recv_for_waiter` (recv-v2 blocked-receiver delivery,
+///      Stage 4K/4O seam),
+///   2. `try_split_recv_queued_plain_with_snapshot_locked` (queued split-recv,
+///      Stage 36/37/42+43 seam).
+/// VALIDATION: FALLBACK_GLOBAL_LOCK — `FLAG_REPLY_CAP` (D5 deferred),
+///   shared-region transfers (`OPCODE_SHARED_MEM`), and every
+///   `FallbackRequired` outcome continue through
+///   `materialize_received_message_cap` unchanged. The legacy full recv path
+///   (`handle_ipc_recv_result_with_empty_error`) and the NR 30 RecvSharedV3
+///   handler intentionally keep calling the canonical helper directly.
+///
+/// Supported case (increments `d1_split_materializations` telemetry):
+/// `FLAG_CAP_TRANSFER` / `FLAG_CAP_TRANSFER_PLAIN`, non-reply, with
+/// `msg.opcode != OPCODE_SHARED_MEM`. Phase A (IPC rank 3 envelope take +
+/// capability rank 4 rights read) and Phase B (capability rank 4
+/// `grant_task_to_task_with_rights`) run through
+/// `cap_transfer_split::materialize_split_transfer_cap_equivalent`, which is
+/// equivalence-tested against the canonical transfer arm (byte-equal CapId,
+/// slot object, slot rights — `stage103_equivalence_split_matches_direct_take_plus_grant`).
+///
+/// Failure logging is byte-identical to the canonical transfer arm
+/// (`IPC_RECV_CAP_MATERIALIZE_FAILED kind=transfer raw=.. err=..`) so smoke
+/// log contracts are unchanged. Success additionally emits the new
+/// `YARM_D1_SPLIT_MATERIALIZE` marker (additive; no script greps it as
+/// forbidden).
+fn materialize_received_message_cap_routed(
+    kernel: &mut KernelState,
+    endpoint: CapObject,
+    receiver_tid: u64,
+    sender_tid: u64,
+    msg: &Message,
+) -> Result<Option<u64>, SyscallError> {
+    use crate::kernel::cap_transfer_split::{
+        CapTransferSplitResult, materialize_split_transfer_cap_equivalent,
+    };
+    // D1 supported scope (Pass 1 / Stage 104): non-shared-region only.
+    // Shared-region transfers carry receiver-side mapping obligations outside
+    // the materialize step; they keep the canonical path per the Stage 103
+    // audit (doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §12.3).
+    if msg.opcode != OPCODE_SHARED_MEM {
+        match materialize_split_transfer_cap_equivalent(kernel, endpoint, receiver_tid, msg) {
+            CapTransferSplitResult::None => return Ok(None),
+            CapTransferSplitResult::Materialized(local_cap) => {
+                kernel.note_d1_split_materialize();
+                crate::yarm_log!(
+                    "YARM_D1_SPLIT_MATERIALIZE kind=transfer receiver_tid={} local_cap={}",
+                    receiver_tid,
+                    local_cap
+                );
+                return Ok(Some(local_cap));
+            }
+            CapTransferSplitResult::Failed(err) => {
+                // Byte-identical failure marker to the canonical transfer arm.
+                crate::yarm_log!(
+                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=transfer raw={} err={:?}",
+                    msg.transferred_cap()
+                        .map(|c| c.0)
+                        .unwrap_or(SYSCALL_NO_TRANSFER_CAP),
+                    err
+                );
+                return Err(err);
+            }
+            // Reply-cap (D5 deferred) → canonical path below. The split
+            // helper guarantees the envelope was NOT consumed in this case.
+            CapTransferSplitResult::FallbackRequired => {}
+        }
+    }
+    // VALIDATION: FALLBACK_GLOBAL_LOCK
+    materialize_received_message_cap(kernel, endpoint, receiver_tid, sender_tid, msg)
 }
 
 fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
@@ -2283,7 +2367,10 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
             let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
             let materialized_cap: Option<u64> = if let Some(_plan) = delivery.cap_transfer {
                 let endpoint = snapshot.endpoint;
-                match materialize_received_message_cap(
+                // Stage 104 / D1: routed — supported transfer-cap messages go
+                // through the phase-separated split engine; reply-cap falls
+                // back to the canonical materialize path inside the router.
+                match materialize_received_message_cap_routed(
                     kernel,
                     endpoint,
                     receiver_tid,
@@ -7760,5 +7847,346 @@ mod tests {
         let mut frame27 = TrapFrame::new(SYSCALL_INITRAMFS_READ_CHUNK_NR, [0, 8, 0, 0x1000, 64, 0]);
         let err = dispatch(&mut kernel, &mut frame27).expect_err("NR 27 must deny non-system-server");
         assert_eq!(err, SyscallError::MissingRight);
+    }
+
+    // ── Stage 104 / Pass 1: D1 live router tests ──────────────────────────────
+
+    /// Build: tid 0 = sender (boot task); `receiver` = registered task with
+    /// its own cnode; one MemoryObject cap in the sender's cnode; one
+    /// endpoint; one transfer envelope stashed (no shared region, unbound).
+    fn stage104_state_with_envelope(
+        receiver: u64,
+    ) -> (KernelState, CapObject, u64, CapId) {
+        use crate::kernel::capabilities::CNodeId;
+        let mut state = crate::kernel::boot::Bootstrap::init().expect("init");
+        let sender = state.current_tid().expect("boot task");
+        state.register_task(receiver).expect("register receiver");
+        state
+            .ensure_cnode_space(CNodeId(receiver))
+            .expect("receiver cnode");
+        state
+            .set_process_cnode_for_pid(receiver, CNodeId(receiver))
+            .expect("bind receiver cnode");
+        let (_id, mem_cap) = state
+            .alloc_anonymous_memory_object()
+            .expect("alloc mem object");
+        let (_eid, send_cap, _recv_cap) = state.create_endpoint(1).expect("endpoint");
+        let endpoint = state
+            .current_task_capability(send_cap)
+            .expect("send cap")
+            .object;
+        let handle = state
+            .stash_transfer_envelope(
+                crate::kernel::ipc::ThreadId(sender),
+                mem_cap,
+                endpoint,
+                None,
+                None,
+            )
+            .expect("stash");
+        (state, endpoint, handle, mem_cap)
+    }
+
+    #[test]
+    fn stage104_router_supported_transfer_routes_through_split_engine() {
+        let receiver = 901u64;
+        let (mut state, endpoint, handle, _mem_cap) = stage104_state_with_envelope(receiver);
+        let sender = state.current_tid().expect("boot");
+        let msg = Message::with_header(
+            sender,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            b"",
+        )
+        .expect("msg");
+
+        assert_eq!(state.ipc_path_telemetry().d1_split_materializations, 0);
+        let cap = materialize_received_message_cap_routed(
+            &mut state, endpoint, receiver, sender, &msg,
+        )
+        .expect("routed materialize")
+        .expect("transfer arm yields a cap");
+
+        // Routed through the split engine — telemetry proves the routing.
+        assert_eq!(
+            state.ipc_path_telemetry().d1_split_materializations,
+            1,
+            "supported transfer-cap must route through the D1 split engine"
+        );
+        // The minted cap is present in the receiver cnode.
+        let cnode = state.task_cnode(receiver).expect("receiver cnode");
+        assert!(
+            state
+                .capability_for_cnode_local(cnode, CapId(cap))
+                .is_some(),
+            "minted cap must be present in the receiver cnode"
+        );
+    }
+
+    #[test]
+    fn stage104_router_transfer_plain_also_routes_through_split_engine() {
+        let receiver = 901u64;
+        let (mut state, endpoint, handle, _mem_cap) = stage104_state_with_envelope(receiver);
+        let sender = state.current_tid().expect("boot");
+        let msg = Message::with_header(
+            sender,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER_PLAIN,
+            Some(handle),
+            b"reply-with-cap",
+        )
+        .expect("msg");
+        let cap = materialize_received_message_cap_routed(
+            &mut state, endpoint, receiver, sender, &msg,
+        )
+        .expect("routed")
+        .expect("cap");
+        assert_eq!(state.ipc_path_telemetry().d1_split_materializations, 1);
+        let cnode = state.task_cnode(receiver).expect("cnode");
+        assert!(state.capability_for_cnode_local(cnode, CapId(cap)).is_some());
+    }
+
+    #[test]
+    fn stage104_router_shared_mem_opcode_stays_on_canonical_path() {
+        // OPCODE_SHARED_MEM transfers carry receiver-side mapping obligations;
+        // they must NOT route through the D1 split engine (telemetry stays 0)
+        // but must still succeed via the canonical path.
+        let receiver = 901u64;
+        let (mut state, endpoint, handle, _mem_cap) = stage104_state_with_envelope(receiver);
+        let sender = state.current_tid().expect("boot");
+        let region = SharedMemoryRegion {
+            offset: 0,
+            len: PAGE_SIZE as u64,
+        };
+        let msg = Message::with_header(
+            sender,
+            OPCODE_SHARED_MEM,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle),
+            &region.encode(),
+        )
+        .expect("msg");
+        let cap = materialize_received_message_cap_routed(
+            &mut state, endpoint, receiver, sender, &msg,
+        )
+        .expect("canonical materialize")
+        .expect("cap");
+        assert_eq!(
+            state.ipc_path_telemetry().d1_split_materializations,
+            0,
+            "shared-mem transfer must stay on the canonical global-lock path"
+        );
+        let cnode = state.task_cnode(receiver).expect("cnode");
+        assert!(state.capability_for_cnode_local(cnode, CapId(cap)).is_some());
+    }
+
+    #[test]
+    fn stage104_router_reply_cap_falls_back_to_canonical_path() {
+        // FLAG_REPLY_CAP must fall back to the canonical reply arm (D5
+        // deferred). With a non-Reply envelope the canonical arm consumes the
+        // envelope and fails WrongObject — byte-identical to pre-Stage-104.
+        let receiver = 901u64;
+        let (mut state, endpoint, handle, _mem_cap) = stage104_state_with_envelope(receiver);
+        let sender = state.current_tid().expect("boot");
+        let msg = Message::with_header(
+            sender,
+            OPCODE_INLINE,
+            Message::FLAG_REPLY_CAP,
+            Some(handle),
+            b"",
+        )
+        .expect("msg");
+        let err = materialize_received_message_cap_routed(
+            &mut state, endpoint, receiver, sender, &msg,
+        )
+        .expect_err("non-reply envelope under FLAG_REPLY_CAP must fail");
+        assert_eq!(err, SyscallError::WrongObject);
+        assert_eq!(
+            state.ipc_path_telemetry().d1_split_materializations,
+            0,
+            "reply-cap must not route through the D1 split engine"
+        );
+        // Canonical arm consumed the envelope (same as pre-Stage-104).
+        assert!(
+            state
+                .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver))
+                .is_none(),
+            "canonical reply arm consumes the envelope on its failure path"
+        );
+    }
+
+    #[test]
+    fn stage104_router_equivalence_with_canonical_for_supported_case() {
+        // Two identical states: route one through the Stage 104 router, the
+        // other through the canonical materialize helper. Outcomes must be
+        // byte-identical: same CapId, same slot object, same slot rights,
+        // same memory-object cap_refcount, same delegation-link count.
+        let receiver = 901u64;
+        let (mut state_split, ep_a, handle_a, _m_a) = stage104_state_with_envelope(receiver);
+        let (mut state_canon, ep_b, handle_b, _m_b) = stage104_state_with_envelope(receiver);
+        let sender = state_split.current_tid().expect("boot");
+
+        let msg_a = Message::with_header(
+            sender,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle_a),
+            b"x",
+        )
+        .expect("msg a");
+        let msg_b = Message::with_header(
+            sender,
+            OPCODE_INLINE,
+            Message::FLAG_CAP_TRANSFER,
+            Some(handle_b),
+            b"x",
+        )
+        .expect("msg b");
+
+        let cap_split = materialize_received_message_cap_routed(
+            &mut state_split, ep_a, receiver, sender, &msg_a,
+        )
+        .expect("split route")
+        .expect("cap");
+        let cap_canon = materialize_received_message_cap(
+            &mut state_canon, ep_b, receiver, sender, &msg_b,
+        )
+        .expect("canonical")
+        .expect("cap");
+
+        assert_eq!(cap_split, cap_canon, "minted CapId must be byte-identical");
+
+        let cnode_split = state_split.task_cnode(receiver).expect("cnode");
+        let cnode_canon = state_canon.task_cnode(receiver).expect("cnode");
+        let slot_split = state_split
+            .capability_for_cnode_local(cnode_split, CapId(cap_split))
+            .expect("slot");
+        let slot_canon = state_canon
+            .capability_for_cnode_local(cnode_canon, CapId(cap_canon))
+            .expect("slot");
+        assert_eq!(slot_split.object, slot_canon.object, "slot object equal");
+        assert_eq!(slot_split.rights(), slot_canon.rights(), "slot rights equal");
+
+        // Memory-object cap_refcount equivalence (delegation increments it).
+        let refcount = |state: &KernelState, object: CapObject| -> Option<u32> {
+            let CapObject::MemoryObject { id } = object else {
+                return None;
+            };
+            state.with_memory_state(|memory| {
+                memory
+                    .memory_objects
+                    .iter()
+                    .flatten()
+                    .find(|o| o.id == id)
+                    .map(|o| o.cap_refcount)
+            })
+        };
+        assert_eq!(
+            refcount(&state_split, slot_split.object),
+            refcount(&state_canon, slot_canon.object),
+            "memory-object cap_refcount must be identical after both paths"
+        );
+
+        // Delegation-link count equivalence.
+        let link_count = |state: &KernelState| -> usize {
+            state.with_capability_state(|capability| {
+                crate::kernel::boot::kernel_ref(&capability.delegated_capability_links)
+                    .iter()
+                    .flatten()
+                    .count()
+            })
+        };
+        assert_eq!(
+            link_count(&state_split),
+            link_count(&state_canon),
+            "delegation-link table contents must be identical after both paths"
+        );
+    }
+
+    #[test]
+    fn stage104_router_materialize_failure_error_matches_canonical() {
+        // When materialization cannot complete (here: the sender's source cap
+        // was revoked after the envelope was stashed, so the post-take
+        // resolve fails), the routed path must surface the same error the
+        // canonical path would, with the envelope equally consumed by both.
+        fn build(receiver: u64) -> (KernelState, CapObject, u64) {
+            use crate::kernel::capabilities::CNodeId;
+            let mut state = crate::kernel::boot::Bootstrap::init().expect("init");
+            let sender = state.current_tid().expect("boot");
+            state.register_task(receiver).expect("register");
+            state
+                .ensure_cnode_space(CNodeId(receiver))
+                .expect("receiver cnode");
+            state
+                .set_process_cnode_for_pid(receiver, CNodeId(receiver))
+                .expect("bind");
+            let (_id, mem_cap) = state
+                .alloc_anonymous_memory_object()
+                .expect("transfer object");
+            let (_eid, send_cap, _recv) = state.create_endpoint(1).expect("endpoint");
+            let endpoint = state
+                .current_task_capability(send_cap)
+                .expect("send cap")
+                .object;
+            let handle = state
+                .stash_transfer_envelope(
+                    crate::kernel::ipc::ThreadId(sender),
+                    mem_cap,
+                    endpoint,
+                    None,
+                    None,
+                )
+                .expect("stash");
+            // Revoke the source cap AFTER stashing: the materialize-time
+            // resolve_capability_for_task(source) must now fail identically
+            // on both paths.
+            let sender_cnode = state.task_cnode(sender).expect("sender cnode");
+            state
+                .revoke_capability_in_cnode(sender_cnode, mem_cap)
+                .expect("revoke source cap");
+            (state, endpoint, handle)
+        }
+
+        let receiver = 933u64;
+        let (mut state_split, ep_a, handle_a) = build(receiver);
+        let (mut state_canon, ep_b, handle_b) = build(receiver);
+        let sender = state_split.current_tid().expect("boot");
+
+        let msg = |h: u64| {
+            Message::with_header(
+                sender,
+                OPCODE_INLINE,
+                Message::FLAG_CAP_TRANSFER,
+                Some(h),
+                b"",
+            )
+            .expect("msg")
+        };
+
+        let err_split = materialize_received_message_cap_routed(
+            &mut state_split, ep_a, receiver, sender, &msg(handle_a),
+        )
+        .expect_err("revoked source cap must fail materialization");
+        let err_canon = materialize_received_message_cap(
+            &mut state_canon, ep_b, receiver, sender, &msg(handle_b),
+        )
+        .expect_err("revoked source cap must fail materialization");
+        assert_eq!(
+            err_split, err_canon,
+            "materialize-failure error must be byte-identical between routed and canonical paths"
+        );
+        // Envelope consumption parity: both paths consumed the envelope in
+        // Phase A before the Phase B failure (existing contract).
+        let consumed = |state: &mut KernelState, h: u64, ep: CapObject| {
+            state
+                .take_transfer_envelope(h, ep, crate::kernel::ipc::ThreadId(receiver))
+                .is_none()
+        };
+        assert_eq!(
+            consumed(&mut state_split, handle_a, ep_a),
+            consumed(&mut state_canon, handle_b, ep_b),
+            "envelope consumption must match between routed and canonical failure paths"
+        );
     }
 }

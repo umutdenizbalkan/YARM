@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! D1 cap-transfer recv split — Phase A / B / C scaffold (Stage 103).
+//! D1 cap-transfer recv split — Phase A / B / C engine (Stage 103 scaffold,
+//! Stage 104 live-wired for the supported transfer-cap case).
 //!
-//! VALIDATION: D1_HELPER_ONLY
-//! VALIDATION: D1_DEFAULT_OFF
-//! VALIDATION: FALLBACK_GLOBAL_LOCK
+//! VALIDATION: D1_LIVE_SPLIT — `materialize_split_transfer_cap_equivalent` is
+//! live-wired via `syscall.rs::materialize_received_message_cap_routed` at the
+//! recv-v2 blocked-receiver delivery seam (`complete_blocked_recv_for_waiter`)
+//! and the queued split-recv seam
+//! (`try_split_recv_queued_plain_with_snapshot_locked`). Supported scope:
+//! `FLAG_CAP_TRANSFER` / `FLAG_CAP_TRANSFER_PLAIN`, non-reply, non-shared-region.
+//! VALIDATION: FALLBACK_GLOBAL_LOCK — `FLAG_REPLY_CAP` (D5 deferred),
+//! shared-region transfers, sender-waiter cap-transfer refills, and every
+//! `FallbackRequired` outcome stay on the canonical
+//! `materialize_received_message_cap` global-lock path, which remains fully
+//! intact and authoritative for those cases.
 //!
-//! This module hosts the scaffold types and pure helpers for splitting the
-//! cap-transfer materialization that today runs inside the global
-//! `&mut KernelState` of `materialize_received_message_cap`. **Nothing in this
-//! module is on a live trap/syscall code path.** The live path in
-//! `kernel/syscall.rs` is unchanged and continues to drive both the reply-cap
-//! and transfer-cap materialization under the global lock.
+//! NOT SMOKE-ACCEPTED: the Stage 104 live wiring was developed in an
+//! environment without QEMU. Per the MUST_SMOKE policy
+//! (`doc/AI_AGENT_RULES.md §13`) the branch requires x86_64 `-smp 1` core
+//! smoke and optional-FS strict smoke before merge acceptance.
 //!
 //! ## Why D1 is helper-only at Stage 103
 //!
@@ -30,20 +37,32 @@
 //!
 //! The transfer-cap path has a clean A → B → C ordering (rank 3 → rank 4 → no
 //! lock). The **reply-cap** path interleaves rank 4 → rank 3 at the very end
-//! (`set_reply_cap_waiter_cap` is rank 3), which is a rank inversion the split
-//! engine cannot perform without either:
+//! (`set_reply_cap_waiter_cap` is rank 3).
 //!
-//!   1. a dedicated rank-3 "B-prime" phase reacquired after B (extra lock
-//!      acquire/release; allowed by the rank graph but increases reply-cap
-//!      latency), or
-//!   2. moving `set_reply_cap_waiter_cap` into a deferred plan applied by the
-//!      caller alongside the scheduler wake plan.
+//! ## D5 reply-cap lock-touch map (Stage 104 audit — NOT proven safe)
 //!
-//! Either choice changes observable timing of the reply-cap record write. That
-//! is a live-IPC behavior change and requires QEMU x86_64 -smp 1 smoke per the
-//! MUST_SMOKE policy (`doc/AI_AGENT_RULES.md §13`). Stage 103 does not have
-//! QEMU available, so the reply-cap path stays on the global-lock path and the
-//! sender-waiter-with-cap-transfer fallback is unchanged.
+//! Because the per-domain `with_*` helpers each acquire and release their own
+//! lock (sequential, never nested), the rank-4-mint → rank-3-record-set
+//! sequence is **deadlock-free** even outside the global lock. The actual D5
+//! blocker is an **atomicity window**: between `mint_capability_in_cnode`
+//! (rank 4) and `set_reply_cap_waiter_cap` (rank 3), another CPU could revoke
+//! or consume the reply object, leaving either (a) a minted reply cap in the
+//! receiver cnode with no record pointing at it (leak), or (b) a record-set
+//! that silently no-ops on its generation guard while the mint stands.
+//! Today the global lock closes that window. A safe D5 design is:
+//!
+//!   1. mint under rank 4 (existing code),
+//!   2. generation-guarded `set_reply_cap_waiter_cap` (already guarded) but
+//!      **returning bool** so the caller learns the record moved on,
+//!   3. on a `false` return, roll back the mint via
+//!      `rollback_materialized_recv_cap` (existing helper).
+//!
+//! That requires a signature change to `set_reply_cap_waiter_cap` plus the
+//! rollback branch, both observable on live reply traffic — gated on QEMU
+//! x86_64 -smp 1 smoke per MUST_SMOKE (`doc/AI_AGENT_RULES.md §13`). QEMU is
+//! not available in the Stage 104 environment, so the reply-cap path stays on
+//! the global-lock fallback with this exact blocker. The
+//! sender-waiter-with-cap-transfer fallback is likewise unchanged.
 //!
 //! ## What this module provides
 //!
@@ -61,19 +80,19 @@
 //!   `grant_task_to_task_with_rights` only. Does NOT touch IPC envelope state.
 //! - [`materialize_split_transfer_cap_equivalent`] — combined A → B entry
 //!   point that produces byte-identical output to the existing
-//!   `materialize_received_message_cap` non-reply transfer-cap arm. **Helper
-//!   only** — runs against a single `&mut KernelState`, same as today, so
-//!   there is no live behavior change. Stage 104 may replace it with a
-//!   SharedKernel-driven A → B sequence with explicit lock-release between
-//!   the two phases.
+//!   `materialize_received_message_cap` non-reply transfer-cap arm. **Live
+//!   since Stage 104** via `materialize_received_message_cap_routed` in
+//!   `syscall.rs`. It still runs against a single `&mut KernelState` (inside
+//!   the SharedKernel closure); the per-phase domain locks are acquired and
+//!   released sequentially inside. A later pass may move the phase boundary
+//!   to the SharedKernel seam with explicit lock-release between A and B.
 //!
-//! ## Reply-cap path: not implemented (deferred)
+//! ## Reply-cap path: not implemented (D5 deferred)
 //!
 //! The reply-cap arm of `materialize_received_message_cap` remains the
 //! canonical implementation. This module deliberately does NOT expose a
-//! reply-cap helper, to keep the scaffold scope narrow and the equivalence
-//! proof tight. Stage 104+ may add a `phase_b_materialize_reply_cap` with the
-//! rank-4 mint + rank-3 reply-record write split.
+//! reply-cap helper; see the D5 lock-touch map above for the exact blocker
+//! and the safe design for a future pass.
 
 use crate::kernel::boot::KernelState;
 #[cfg(test)]
@@ -166,7 +185,8 @@ pub struct CapTransferMaterializeOutcome {
 /// Phase A — IPC rank 3 (+ memory pin-refcount adjust): take the transfer
 /// envelope and resolve the source capability's rights.
 ///
-/// VALIDATION: D1_HELPER_ONLY — not called from any live syscall path.
+/// VALIDATION: D1_LIVE_SPLIT — live since Stage 104 via
+/// `materialize_split_transfer_cap_equivalent` (routed from `syscall.rs`).
 ///
 /// This is byte-identical to the first half of
 /// `materialize_received_transfer_cap` (the `take_transfer_envelope` +
@@ -208,7 +228,8 @@ pub fn phase_a_take_transfer_envelope(
 /// Phase B — capability rank 4 mutate (+ memory refcount + delegation link):
 /// materialize the transfer-cap into the receiver's cnode.
 ///
-/// VALIDATION: D1_HELPER_ONLY — not called from any live syscall path.
+/// VALIDATION: D1_LIVE_SPLIT — live since Stage 104 via
+/// `materialize_split_transfer_cap_equivalent` (routed from `syscall.rs`).
 ///
 /// Identical to the second half of `materialize_received_transfer_cap`
 /// (`grant_task_to_task_with_rights`). On failure, the envelope is already
@@ -240,15 +261,16 @@ pub fn phase_b_materialize_transfer_cap(
 /// Combined Phase A → Phase B entry point for the transfer-cap (non-reply)
 /// path. Equivalent to the non-reply arm of `materialize_received_message_cap`.
 ///
-/// VALIDATION: D1_HELPER_ONLY
-/// VALIDATION: D1_DEFAULT_OFF
+/// VALIDATION: D1_LIVE_SPLIT
 /// VALIDATION: FALLBACK_GLOBAL_LOCK
 ///
-/// **Stage 103 — helper only.** This function is not called from any live
-/// path; it exists so equivalence tests can compare it against the global-lock
-/// `materialize_received_message_cap` byte-for-byte. Stage 104 may replace
-/// the live materialize call with this function once the SharedKernel split
-/// seam is available and x86_64 -smp 1 smoke is run.
+/// **Stage 104 — live.** Called from
+/// `syscall.rs::materialize_received_message_cap_routed` at the recv-v2
+/// blocked-receiver delivery seam and the queued split-recv seam. The
+/// equivalence tests below remain the contract: byte-identical outcome to the
+/// canonical `materialize_received_message_cap` transfer arm. The caller's
+/// `FallbackRequired` arm and the canonical helper itself are unchanged, so
+/// the global-lock fallback is fully preserved.
 ///
 /// Returns:
 ///
@@ -698,35 +720,62 @@ mod tests {
     }
 
     #[test]
-    fn stage103_helper_only_no_live_call_sites() {
-        // Source-scan invariant: the Stage 103 helper entry points must not be
-        // called from any live trap/syscall code path. Only `syscall.rs` and
-        // `runtime.rs` could plausibly contain the live call; both must NOT
-        // reference the helper.
+    fn stage104_live_wire_call_sites_present() {
+        // Stage 104 replaces the Stage 103 helper-only invariant: the split
+        // engine is now live-wired through the router in syscall.rs at exactly
+        // two delivery seams. The router itself must keep the canonical
+        // fallback call.
         let syscall_src = include_str!("syscall.rs");
-        let runtime_src = include_str!("../runtime.rs");
-        for name in [
-            "materialize_split_transfer_cap_equivalent",
-            "phase_a_take_transfer_envelope",
-            "phase_b_materialize_transfer_cap",
-        ] {
-            assert!(
-                !syscall_src.contains(name),
-                "{name} must not be called from syscall.rs (Stage 103 is D1_HELPER_ONLY)"
-            );
-            assert!(
-                !runtime_src.contains(name),
-                "{name} must not be called from runtime.rs (Stage 103 is D1_HELPER_ONLY)"
-            );
-        }
+        assert!(
+            syscall_src.contains("fn materialize_received_message_cap_routed"),
+            "syscall.rs must define the Stage 104 D1 router"
+        );
+        assert!(
+            syscall_src.contains("materialize_split_transfer_cap_equivalent"),
+            "router must call the split engine"
+        );
+        // The two routed delivery seams.
+        let routed_calls = syscall_src
+            .matches("materialize_received_message_cap_routed(")
+            .count();
+        assert!(
+            routed_calls >= 3, // 1 definition + 2 call sites
+            "router must be called from complete_blocked_recv_for_waiter and \
+             try_split_recv_queued_plain_with_snapshot_locked (found {routed_calls} occurrences)"
+        );
+        // The canonical fallback MUST remain inside the router (global-lock
+        // path preserved): 1 definition + router fallback + legacy full path
+        // + NR 30 handler. (`materialize_received_message_cap_routed(` does
+        // not match this pattern — the paren follows `_routed`.)
+        let canonical_calls = syscall_src
+            .matches("materialize_received_message_cap(")
+            .count();
+        assert!(
+            canonical_calls >= 4,
+            "canonical materialize_received_message_cap must remain: definition, \
+             router fallback, legacy full path, NR 30 handler \
+             (found {canonical_calls} occurrences)"
+        );
+        // The legacy full recv path and NR 30 stay on the canonical helper —
+        // the router is scoped to the two split seams only.
+        assert!(
+            syscall_src.contains("fn materialize_received_message_cap"),
+            "canonical helper must not be removed"
+        );
     }
 
     #[test]
-    fn stage103_validation_labels_present() {
+    fn stage104_validation_labels_present() {
         let src = include_str!("cap_transfer_split.rs");
-        assert!(src.contains("VALIDATION: D1_HELPER_ONLY"));
-        assert!(src.contains("VALIDATION: D1_DEFAULT_OFF"));
+        assert!(src.contains("VALIDATION: D1_LIVE_SPLIT"));
         assert!(src.contains("VALIDATION: FALLBACK_GLOBAL_LOCK"));
+        assert!(
+            src.contains("NOT SMOKE-ACCEPTED"),
+            "module must carry the not-smoke-accepted disclosure until smoke runs"
+        );
+        // The router in syscall.rs carries the same labels.
+        let syscall_src = include_str!("syscall.rs");
+        assert!(syscall_src.contains("VALIDATION: D1_LIVE_SPLIT"));
     }
 
     #[test]
