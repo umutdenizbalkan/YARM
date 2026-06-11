@@ -436,20 +436,19 @@ mod tests {
     #[test]
     fn stage91_mount_register_ext4_uses_dedicated_reply_cap_not_pm_recv() {
         let init_src = include_str!("init/service.rs");
-        // register_ext4_mount_with_vfs must use reply_recv_cap (not pm_recv) for its reply poll.
+        // register_ext4_mount_with_vfs must use blocking ipc_recv_v2 on reply_recv_cap.
         assert!(
             init_src.contains("fn register_ext4_mount_with_vfs("),
             "init/service.rs must define register_ext4_mount_with_vfs"
         );
         assert!(
-            init_src.contains("ipc_recv_with_deadline(reply_recv_cap"),
-            "register_ext4_mount_with_vfs must use dedicated reply_recv_cap for reply poll"
+            init_src.contains("ipc_recv_v2(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must use blocking ipc_recv_v2 on dedicated reply_recv_cap"
         );
-        // Sanity: find function body and confirm it does not use pm_recv for the reply.
+        // Must not use non-blocking poll on pm_recv (stale-reply poisoning).
         let fn_start = init_src
             .find("fn register_ext4_mount_with_vfs(")
             .expect("function must exist");
-        // Find the nearest next top-level function definition (fn or pub fn).
         let after_fn = &init_src[fn_start + 1..];
         let fn_off = after_fn.find("\nfn ").unwrap_or(usize::MAX);
         let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
@@ -458,6 +457,111 @@ mod tests {
         assert!(
             !fn_text.contains("ipc_recv_with_deadline(pm_recv"),
             "register_ext4_mount_with_vfs must NOT use ipc_recv_with_deadline(pm_recv)"
+        );
+        assert!(
+            !fn_text.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must NOT use non-blocking ipc_recv_with_deadline"
+        );
+    }
+
+    #[test]
+    fn stage91_ramfs_spawn_uses_zero_service_caps() {
+        // RAMFS spawn must pass [0,0,0,0] — no config words in cap slots.
+        // Passing encoded mount-config words causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL
+        // because the kernel treats every non-zero service_caps entry as a cap ID.
+        let init_src = include_str!("init/service.rs");
+        let spawn_begin = init_src
+            .find("INIT_RAMFS_SPAWN_BEGIN")
+            .expect("INIT_RAMFS_SPAWN_BEGIN must be present");
+        let spawn_ok = init_src[spawn_begin..]
+            .find("INIT_RAMFS_SPAWN_OK")
+            .map(|off| spawn_begin + off)
+            .expect("INIT_RAMFS_SPAWN_OK must follow INIT_RAMFS_SPAWN_BEGIN");
+        let ramfs_spawn_region = &init_src[spawn_begin..spawn_ok];
+        assert!(
+            ramfs_spawn_region.contains("[0, 0, 0, 0]"),
+            "RAMFS spawn (image_id=11) must pass [0,0,0,0] as service_caps — no config words in cap slots"
+        );
+        assert!(
+            !ramfs_spawn_region.contains("ramfs_prefix_word"),
+            "RAMFS spawn must not pass ramfs_prefix_word as a service_cap"
+        );
+        assert!(
+            !ramfs_spawn_region.contains("ramfs_meta_word"),
+            "RAMFS spawn must not pass ramfs_meta_word as a service_cap"
+        );
+    }
+
+    #[test]
+    fn stage91_fat_spawn_uses_only_blkcache_cap() {
+        // FAT spawn must pass blkcache cap only at position 0; positions 1-3 must be zero.
+        // Passing encoded mount-config words in positions 1-2 causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL.
+        let init_src = include_str!("init/service.rs");
+        let spawn_begin = init_src
+            .find("INIT_FAT_SPAWN_BEGIN")
+            .expect("INIT_FAT_SPAWN_BEGIN must be present");
+        let spawn_ok = init_src[spawn_begin..]
+            .find("INIT_FAT_SPAWN_OK")
+            .map(|off| spawn_begin + off)
+            .expect("INIT_FAT_SPAWN_OK must follow INIT_FAT_SPAWN_BEGIN");
+        let fat_spawn_region = &init_src[spawn_begin..spawn_ok];
+        assert!(
+            fat_spawn_region.contains("[init_blkcache_send_cap, 0, 0, 0]"),
+            "FAT spawn (image_id=10) must pass [init_blkcache_send_cap,0,0,0] — only position 0 is a real cap"
+        );
+        assert!(
+            !fat_spawn_region.contains("fat_prefix_word"),
+            "FAT spawn must not pass fat_prefix_word as a service_cap"
+        );
+        assert!(
+            !fat_spawn_region.contains("fat_meta_word"),
+            "FAT spawn must not pass fat_meta_word as a service_cap"
+        );
+    }
+
+    #[test]
+    fn stage91_register_ramfs_uses_blocking_recv() {
+        // register_ramfs_mount_with_vfs must use blocking ipc_recv_v2 on reply_recv_cap,
+        // not a non-blocking poll. A non-blocking poll at deadline=0 leaves delayed VFS
+        // mount-status replies (4 bytes) on pm_recv, poisoning the next spawn's reply read.
+        let init_src = include_str!("init/service.rs");
+        let fn_start = init_src
+            .find("fn register_ramfs_mount_with_vfs(")
+            .expect("register_ramfs_mount_with_vfs must be defined");
+        let after_fn = &init_src[fn_start + 1..];
+        let fn_off = after_fn.find("\nfn ").unwrap_or(usize::MAX);
+        let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
+        let fn_body_end = fn_start + 1 + fn_off.min(pub_fn_off);
+        let fn_text = &init_src[fn_start..fn_body_end];
+        assert!(
+            fn_text.contains("ipc_recv_v2(reply_recv_cap"),
+            "register_ramfs_mount_with_vfs must use blocking ipc_recv_v2 on reply_recv_cap"
+        );
+        assert!(
+            !fn_text.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            "register_ramfs_mount_with_vfs must NOT use non-blocking ipc_recv_with_deadline"
+        );
+    }
+
+    #[test]
+    fn stage91_register_ext4_uses_blocking_recv() {
+        // register_ext4_mount_with_vfs must use blocking ipc_recv_v2 on reply_recv_cap.
+        let init_src = include_str!("init/service.rs");
+        let fn_start = init_src
+            .find("fn register_ext4_mount_with_vfs(")
+            .expect("register_ext4_mount_with_vfs must be defined");
+        let after_fn = &init_src[fn_start + 1..];
+        let fn_off = after_fn.find("\nfn ").unwrap_or(usize::MAX);
+        let pub_fn_off = after_fn.find("\npub fn ").unwrap_or(usize::MAX);
+        let fn_body_end = fn_start + 1 + fn_off.min(pub_fn_off);
+        let fn_text = &init_src[fn_start..fn_body_end];
+        assert!(
+            fn_text.contains("ipc_recv_v2(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must use blocking ipc_recv_v2 on reply_recv_cap"
+        );
+        assert!(
+            !fn_text.contains("ipc_recv_with_deadline(reply_recv_cap"),
+            "register_ext4_mount_with_vfs must NOT use non-blocking ipc_recv_with_deadline"
         );
     }
 
