@@ -98,6 +98,49 @@ pub struct DriverDelegationBundle {
     pub iova_cap: CapId,
 }
 
+/// Stage 105 / D5: outcome of [`super::KernelState::try_set_reply_cap_waiter_cap`].
+///
+/// The D5 reply-cap split treats any non-[`Set`](ReplyRecordSetOutcome::Set)
+/// outcome as a stale window between the rank-4 mint and the rank-3 record
+/// write and rolls back the mint. The wrapper
+/// `KernelState::set_reply_cap_waiter_cap` discards the outcome and is used
+/// only by the canonical global-lock path, where staleness is unreachable
+/// because the global lock spans the mint→set sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyRecordSetOutcome {
+    /// Record was updated; D5 split can finalize Phase C.
+    Set,
+    /// `reply_index >= MAX_REPLY_CAPS`. Indicates a corrupted reply object —
+    /// in practice unreachable because the source envelope guarantees the
+    /// index is valid, but the variant exists so the typed outcome is total.
+    IndexOutOfRange,
+    /// Generation on the slot no longer matches the one captured before the
+    /// rank-4 mint: the record was revoked and reused between mint and set.
+    /// D5 split rolls back the mint.
+    GenerationMismatch,
+    /// Generation matched but the slot itself is `None`: the record was
+    /// revoked between mint and set without yet being reused. D5 split rolls
+    /// back the mint.
+    SlotEmpty,
+}
+
+impl ReplyRecordSetOutcome {
+    /// True only for [`Set`](Self::Set).
+    pub fn is_set(self) -> bool {
+        matches!(self, Self::Set)
+    }
+    /// Smoke-log reason tag matching the `D5_REPLY_RECORD_SET_STALE reason=`
+    /// values emitted by [`super::KernelState::try_set_reply_cap_waiter_cap`].
+    pub fn stale_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Set => None,
+            Self::IndexOutOfRange => Some("index_out_of_range"),
+            Self::GenerationMismatch => Some("generation_mismatch"),
+            Self::SlotEmpty => Some("slot_empty"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DriverBundlePlan {
     pub server_tid: ThreadId,

@@ -26,6 +26,20 @@ pub struct IpcPathTelemetry {
     /// non-reply, non-shared-region).  Reply-cap, shared-region, and fallback
     /// materializations do NOT increment this.
     pub d1_split_materializations: u64,
+    /// Stage 105 / D5: reply-cap recv-side materializations serviced through
+    /// the phase-separated split engine (Phase A → B → B' with
+    /// `try_set_reply_cap_waiter_cap` + mint rollback).  Counts only the
+    /// FLAG_REPLY_CAP supported case.  Stale-rollback failures still
+    /// increment `d5_split_reply_rollbacks` (below).
+    pub d5_split_reply_materializations: u64,
+    /// Stage 105 / D5: reply-cap split materializations that hit the
+    /// mint→record race window and rolled back via
+    /// `rollback_materialized_recv_cap`.  Should normally be 0 on a
+    /// well-behaved workload; a non-zero count is benign (the reply object
+    /// stays live and the receiver gets the same `WrongObject` it would have
+    /// gotten if the revoke had landed before the mint), but it is the
+    /// signal smoke tests use to confirm the rollback path is exercised.
+    pub d5_split_reply_rollbacks: u64,
     pub blocked_sends: u64,
     pub rendezvous_handoffs: u64,
     pub transfer_records_created: u64,

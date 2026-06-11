@@ -843,3 +843,130 @@ continue to pass and remain the equivalence contract.
    IPC lock; global lock only for the scheduler block/dispatch step.
 4. Optional D4 continuation: `syscall/recv_shared_v3.rs` mechanical move
    (separate PR from any semantic change).
+
+---
+
+## 14. Stage 105 / Pass 2 — D5 reply-cap split live-wired
+
+D5 splits the reply-cap recv materialization out of the global lock using a
+fallible Phase B' record-write with explicit mint rollback.
+
+**NOT SMOKE-ACCEPTED:** developed without QEMU. Per MUST_SMOKE the branch
+requires x86_64 `-smp 1` core smoke and optional-FS strict smoke before
+merge acceptance.
+
+### 14.1 The atomicity solution (Pass 1's exact blocker)
+
+Pass 1 blocked D5 on the rank-4 mint → rank-3 `set_reply_cap_waiter_cap`
+race window. Pass 2 solves it as the audit doc §12.7 predicted:
+
+1. New fallible primitive `KernelState::try_set_reply_cap_waiter_cap`
+   returns `ReplyRecordSetOutcome::{Set, IndexOutOfRange, GenerationMismatch,
+   SlotEmpty}`. The existing `set_reply_cap_waiter_cap` becomes a thin
+   wrapper that discards the outcome (still used by the canonical reply arm
+   under the global lock, where staleness is unreachable).
+2. New Phase B' helper `phase_b_prime_record_reply_cap` calls the fallible
+   primitive and, on any non-`Set` outcome, drives mint rollback via
+   `rollback_materialized_recv_cap` (the existing helper with
+   `is_reply_cap=true`) and surfaces `SyscallError::WrongObject` — the same
+   error the canonical path produces for `KernelError::StaleCapability`.
+3. New telemetry: `IpcPathTelemetry::d5_split_reply_materializations` and
+   `d5_split_reply_rollbacks`. Smoke logs additionally see
+   `YARM_D5_SPLIT_MATERIALIZE` (success), `YARM_D5_SPLIT_RECORD` (Phase B'
+   success), `YARM_D5_SPLIT_RECORD_ROLLBACK reason=...` (Phase B' rollback),
+   and `D5_REPLY_RECORD_SET_STALE reason=...` (from the fallible primitive).
+
+### 14.2 What is live now (D5)
+
+`syscall.rs::materialize_received_message_cap_routed` (label
+`D1_LIVE_SPLIT`) is extended with a D5 reply-cap arm after the D1 transfer
+arm. Both arms route from exactly the same two delivery seams:
+
+1. `complete_blocked_recv_for_waiter` — recv-v2 blocked-receiver delivery
+2. `try_split_recv_queued_plain_with_snapshot_locked` — queued split-recv
+
+Supported scope routed through
+`cap_transfer_split::materialize_split_reply_cap_equivalent`:
+- `FLAG_REPLY_CAP`, `opcode != OPCODE_SHARED_MEM`
+
+### 14.3 What stays on the global-lock fallback
+
+| Case | Why |
+|------|-----|
+| Reply-cap with `OPCODE_SHARED_MEM` | shared-region semantics outside D5 scope |
+| Sender-waiter cap-transfer refills | `recv_core.rs FallbackReason::SenderWaiterWake` unchanged |
+| Legacy full recv path (`handle_ipc_recv_result_with_empty_error`) | intentionally unrouted (canonical helper called directly) |
+| NR 30 RecvSharedV3 handler | intentionally unrouted |
+
+The canonical `materialize_received_message_cap` reply arm is **unchanged**
+and remains authoritative.
+
+### 14.4 Rank order and the atomicity proof
+
+D5 routed sequence (sequential acquire/release, never nested):
+
+| Phase | Lock | Operations |
+|-------|------|------------|
+| A.1 | IPC rank 3 | `take_transfer_envelope` |
+| A.2 | capability rank 4 read | `capability_object_live` |
+| A.3 | task rank 2 read | `task_cnode(receiver)` |
+| B | capability rank 4 mutate | `mint_capability_in_cnode` |
+| B' | IPC rank 3 mutate | `try_set_reply_cap_waiter_cap` (+ rollback) |
+| C | none | writeback (caller) |
+
+**Atomicity proof:** between Phase B (rank 4 mint) and Phase B' (rank 3
+record set), any other CPU that revokes/reuses the reply record changes the
+slot's generation or sets the slot to `None`. Phase B's fallible primitive
+detects both modes and returns a non-`Set` outcome. The Phase B' rollback
+revokes the freshly-minted slot via `fast_revoke_reply_cap_in_cnode` and
+clears the (now-stale) `waiter_cap_id` via `clear_reply_cap_waiter_cap`.
+Net effect: the receiver cnode contains exactly what it would have if the
+revoke had landed BEFORE the mint, and the receiver gets `WrongObject` — the
+same error code the canonical path produces for that exact race outcome
+under the global lock. Mint leak: impossible by construction.
+
+### 14.5 Stage 105 test additions (net +6: 7 new, 1 renamed)
+
+`kernel::syscall::tests`:
+- `stage105_router_reply_cap_routes_through_d5_split_engine` — telemetry
+  proves routing; minted cap object matches the captured reply object.
+- `stage105_router_reply_cap_equivalence_with_canonical_for_supported_case`
+  — two identical states; byte-equal CapId, slot object, slot rights.
+- `stage105_router_reply_cap_stale_record_rolls_back_mint` — manual race
+  injection: `phase_a_take_reply_envelope` → revoke record →
+  `phase_b_mint_reply_cap` → `phase_b_prime_record_reply_cap` returns
+  `WrongObject`; receiver cnode slot is gone.
+- `stage105_router_reply_cap_phase_a_failure_does_not_count_rollback` —
+  bogus handle: telemetry stays at 0 success / 0 rollback.
+- `stage105_phase_b_prime_rollback_increments_rollback_telemetry` —
+  success-path telemetry; source-scan that the engine wrapper calls
+  `note_d5_split_reply_rollback` on Failed.
+- `stage105_router_reply_cap_wrong_object_caught_by_d5_phase_a` (renamed
+  from Stage 104's `_falls_back_to_canonical_path`): non-Reply envelope
+  under FLAG_REPLY_CAP — D5 Phase A returns `WrongObject`; telemetry stays 0.
+- `stage105_canonical_reply_arm_remains_authoritative` — canonical helper
+  retained at ≥ 4 sites; the discarding `set_reply_cap_waiter_cap` wrapper
+  is still used by the canonical arm.
+
+### 14.6 Invariants reaffirmed
+
+- `SYSCALL_COUNT = 31`, `STARTUP_SLOT_COUNT = 18`, SpawnV5 ABI,
+  `recv_shared_v3` ABI offsets, image IDs 7–12 — **unchanged**.
+- Stage 100 FS gates — **unchanged**.
+- D1 transfer arm unchanged. Test counts: workspace lib 1323/0 (+6 net);
+  yarm-fs-servers 572/0; yarm-control-plane-servers 130/0.
+
+### 14.7 D2 and D3 — Pass 2 status
+
+**D2 (IPC recv blocking precursor):** scope is large enough that
+implementing it without QEMU smoke would re-create the Pass 1 D5 risk
+posture. Pass 2 defers D2 with the audit captured in §15 below (helper-only
+scaffold + no-lost-wakeup audit, no live wiring).
+
+**D3 (VmAnonMap/VmBrk two-phase split):** existing plan types
+(`VmAnonMapProgressPlan`, `VmAnonMapRollbackTlbPlan`, `TlbShootdownWaitPlan`,
+`VmBrkShrinkTlbPlan`) are already consumed inside the global-lock
+`handle_vm_anon_map` / `handle_vm_brk` paths (see scaffold status §2). The
+live-wire delta is plumbing the SharedKernel seam to release between PTE
+mutation, TLB shootdown, and frame reclaim. Same QEMU smoke gate as D2 and
+D5: deferred this pass. Audit at §16.

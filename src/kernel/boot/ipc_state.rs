@@ -4,7 +4,7 @@
 use super::{
     IpcEndpointRecvResult, IpcEndpointSendResult, IpcEndpointSplitRejectReason, IpcFastpathResult,
     KernelError, KernelState, MAX_ENDPOINT_SENDER_WAITERS, MAX_IRQ_LINES, NotificationObject,
-    ReplyCapRecord, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
+    ReplyCapRecord, ReplyRecordSetOutcome, SenderWaiter, kernel_mut, kernel_ref, map_ipc_error,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Endpoint, EndpointMode, Message, ThreadId};
@@ -71,12 +71,41 @@ impl KernelState {
         reply_generation: u64,
         cap: CapId,
     ) {
-        self.with_ipc_state_mut(|ipc| {
+        // Stage 105 / D5: thin wrapper over try_set_reply_cap_waiter_cap that
+        // discards the stale signal. The canonical reply arm of
+        // materialize_received_message_cap holds the global lock for the
+        // duration of the reply materialization, so a stale outcome here is
+        // unreachable on that path. The D5 split path uses the fallible form
+        // directly to drive its mint rollback.
+        let _ = self.try_set_reply_cap_waiter_cap(reply_index, reply_generation, cap);
+    }
+
+    /// Stage 105 / D5: fallible variant of [`set_reply_cap_waiter_cap`].
+    ///
+    /// Returns [`ReplyRecordSetOutcome::Set`] when the record was updated, or
+    /// a typed stale-outcome variant when the index, generation, or slot no
+    /// longer matches what the caller minted against. Callers driving the D5
+    /// reply-cap split (`cap_transfer_split::phase_b_prime_record_reply_cap`)
+    /// translate any non-`Set` outcome into a mint rollback so a stale record
+    /// can never leave a freshly-minted reply cap orphaned in the receiver
+    /// cnode.
+    ///
+    /// Locks: rank 3 (IPC) only — identical to the wrapper above. The marker
+    /// `IPC_RECV_REPLY_CAP_WAITER_CAP_SET` is emitted on success; the new
+    /// `D5_REPLY_RECORD_SET_STALE` marker is emitted on each stale path with
+    /// a `reason=` tag so smoke logs distinguish the three stale modes.
+    pub(crate) fn try_set_reply_cap_waiter_cap(
+        &mut self,
+        reply_index: usize,
+        reply_generation: u64,
+        cap: CapId,
+    ) -> ReplyRecordSetOutcome {
+        let outcome = self.with_ipc_state_mut(|ipc| {
             if reply_index >= super::MAX_REPLY_CAPS {
-                return;
+                return ReplyRecordSetOutcome::IndexOutOfRange;
             }
             if ipc.reply_cap_generations[reply_index] != reply_generation {
-                return;
+                return ReplyRecordSetOutcome::GenerationMismatch;
             }
             if let Some(record) = &mut ipc.reply_caps[reply_index] {
                 record.waiter_cap_id = Some(cap);
@@ -86,8 +115,27 @@ impl KernelState {
                     reply_generation,
                     cap.0
                 );
+                ReplyRecordSetOutcome::Set
+            } else {
+                ReplyRecordSetOutcome::SlotEmpty
             }
         });
+        if !matches!(outcome, ReplyRecordSetOutcome::Set) {
+            let reason = match outcome {
+                ReplyRecordSetOutcome::IndexOutOfRange => "index_out_of_range",
+                ReplyRecordSetOutcome::GenerationMismatch => "generation_mismatch",
+                ReplyRecordSetOutcome::SlotEmpty => "slot_empty",
+                ReplyRecordSetOutcome::Set => unreachable!(),
+            };
+            crate::yarm_log!(
+                "D5_REPLY_RECORD_SET_STALE reply_index={} reply_gen={} cap={} reason={}",
+                reply_index,
+                reply_generation,
+                cap.0,
+                reason
+            );
+        }
+        outcome
     }
 
     /// Stage 20: clear a previously-set waiter Reply CapId in the global record.
@@ -2070,6 +2118,31 @@ impl KernelState {
         self.with_ipc_state_mut(|ipc| {
             ipc.telemetry.d1_split_materializations =
                 ipc.telemetry.d1_split_materializations.saturating_add(1);
+        });
+    }
+
+    /// Stage 105 / D5: count a reply-cap recv-side materialization serviced
+    /// through the phase-separated split engine. Incremented only for the
+    /// supported FLAG_REPLY_CAP case routed through `cap_transfer_split`;
+    /// fallback materializations (sender-waiter cap-transfer, etc.) keep
+    /// this counter unchanged.
+    pub(crate) fn note_d5_split_reply_materialize(&mut self) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.d5_split_reply_materializations = ipc
+                .telemetry
+                .d5_split_reply_materializations
+                .saturating_add(1);
+        });
+    }
+
+    /// Stage 105 / D5: count a reply-cap split materialization that hit the
+    /// mint→record race window and rolled back the mint. Incremented once
+    /// per Phase B' rollback regardless of the stale subtype
+    /// (`IndexOutOfRange` / `GenerationMismatch` / `SlotEmpty`).
+    pub(crate) fn note_d5_split_reply_rollback(&mut self) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.d5_split_reply_rollbacks =
+                ipc.telemetry.d5_split_reply_rollbacks.saturating_add(1);
         });
     }
 
