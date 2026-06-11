@@ -88,6 +88,18 @@ const INITRAMFS_READ_CHUNK_TRACE: bool = false;
 /// Temporary Phase 2B bridge constant — replace with page-cap grant in Phase 3.
 const PM_BOOTSTRAP_TID: u64 = 3;
 
+// ── Stage 102: mechanical syscall decomposition (zero behavior change) ───────
+// Child modules split from this file per the decomposition map in
+// doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §3. The dispatch arms below are
+// unchanged; the `use` re-imports keep the handler call sites textually
+// identical. NOTE: these `mod` declarations must stay AFTER the
+// `syscall_trace!` macro definition above (textual macro scoping).
+mod debug;
+mod initramfs;
+
+use self::debug::handle_debug_log;
+use self::initramfs::{handle_create_initramfs_file_slice_mo, handle_initramfs_read_chunk};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum Syscall {
@@ -3353,242 +3365,6 @@ fn copy_spawn_startup_args(
     Ok(out)
 }
 
-/// Phase 2 bulk-copy bridge: reads up to 4096 bytes from a named initramfs CPIO
-/// file at the given byte offset into the caller's (or a target task's) user buffer.
-///
-/// TEMPORARY stepping stone for Phase 2. Replace with page-cap zero-copy in Phase 3.
-///
-/// Access control: caller must be `TaskClass::SystemServer`.
-/// Any other task class receives `SyscallError::MissingRight`.
-///
-/// syscall nr=27 args:
-///   arg0 = name_ptr    (user VA of file name bytes, no leading slash required)
-///   arg1 = name_len    (1..=128)
-///   arg2 = offset      (byte offset into file)
-///   arg3 = dst_ptr     (user VA of destination buffer)
-///   arg4 = max_len     (max bytes to copy; clamped to 4096)
-///   arg5 = target_tid  (0 = write to caller's own ASID;
-///                       PM_BOOTSTRAP_TID(3) = write to PM's ASID — Phase 2B bridge)
-///
-/// Returns: ret0=0 (status OK), ret1=bytes_copied
-///          ret0=SyscallError (non-zero) on all error cases, including not_found.
-///
-/// Note: EOF (offset >= file_len) returns ret0=0, ret1=0 — NOT an error.
-///       File-not-found returns ret0=SyscallError::Internal — NOT 0/EOF.
-fn handle_initramfs_read_chunk(
-    kernel: &mut KernelState,
-    frame: &mut TrapFrame,
-) -> Result<(), SyscallError> {
-    // ── 0. Access gate: SystemServer only ────────────────────────────────────
-    let caller_tid = current_tid(kernel)?;
-    let caller_class = kernel.task_class(caller_tid);
-    if caller_class != Some(TaskClass::SystemServer) {
-        crate::yarm_log!("INITRAMFS_READ_CHUNK_DENIED tid={}", caller_tid);
-        return Err(SyscallError::MissingRight);
-    }
-
-    let name_ptr = frame.arg(0);
-    let name_len = frame.arg(1);
-    let offset = frame.arg(2) as u64;
-    let dst_ptr = frame.arg(3);
-    let max_len = core::cmp::min(frame.arg(4), 4096);
-    // Phase 2B extension: arg5 = target_tid (0 = self, PM_BOOTSTRAP_TID = PM's ASID)
-    let target_tid_arg = frame.arg(5) as u64;
-
-    if name_len == 0 || name_len > 128 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    if dst_ptr == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    // Validate target_tid: only 0 (self) or PM_BOOTSTRAP_TID allowed as Phase 2B bridge.
-    if target_tid_arg != 0 && target_tid_arg != PM_BOOTSTRAP_TID {
-        crate::yarm_log!(
-            "INITRAMFS_READ_CHUNK_DENIED tid={} target_tid={} reason=invalid_target",
-            caller_tid,
-            target_tid_arg
-        );
-        return Err(SyscallError::MissingRight);
-    }
-
-    let name_buf = kernel
-        .copy_from_current_user(name_ptr, name_len)
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let raw_name =
-        core::str::from_utf8(&name_buf[..name_len]).map_err(|_| SyscallError::InvalidArgs)?;
-    // Accept both "sbin/driver_manager" and "/sbin/driver_manager" and
-    // "/initramfs/sbin/driver_manager" — strip leading slashes and optional
-    // "/initramfs/" prefix so callers can reuse VFS path strings.
-    let name = raw_name.trim_start_matches('/');
-    let name = name.strip_prefix("initramfs/").unwrap_or(name);
-    let name = name.trim_start_matches('/');
-
-    let initrd =
-        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-    let entry = CpioArchive::new(initrd)
-        .find(name)
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let data = match entry {
-        Some(e) => e.file_data(),
-        None => {
-            // File not found — return a real error (NOT 0/EOF).
-            // EOF is reserved for "file exists but offset >= file_len".
-            crate::yarm_log!(
-                "INITRAMFS_READ_CHUNK_NOT_FOUND name={} offset={} max_len={}",
-                name,
-                offset,
-                max_len
-            );
-            return Err(SyscallError::Internal);
-        }
-    };
-
-    let offset_usize = offset as usize;
-    if offset_usize >= data.len() {
-        // EOF — file exists, offset is past the end.
-        if INITRAMFS_READ_CHUNK_TRACE {
-            crate::yarm_log!(
-                "INITRAMFS_READ_CHUNK_EOF name={} offset={} file_len={}",
-                name,
-                offset,
-                data.len()
-            );
-        }
-        frame.set_ok(0, 0, 0);
-        return Ok(());
-    }
-
-    let available = data.len() - offset_usize;
-    let to_copy = core::cmp::min(available, max_len);
-
-    if INITRAMFS_READ_CHUNK_TRACE {
-        crate::yarm_log!(
-            "INITRAMFS_READ_CHUNK name={} offset={} to_copy={} file_len={} target_tid={}",
-            name,
-            offset,
-            to_copy,
-            data.len(),
-            target_tid_arg
-        );
-    }
-
-    // ── Copy to destination ASID ──────────────────────────────────────────────
-    if target_tid_arg == 0 {
-        // Default: copy to caller's own address space.
-        validate_user_region(dst_ptr as u64, to_copy as u64)?;
-        kernel
-            .copy_to_current_user_from_slice(dst_ptr, &data[offset_usize..offset_usize + to_copy])
-            .map_err(SyscallError::from)?;
-    } else {
-        // Phase 2B bridge: copy to PM's address space (target_tid = PM_BOOTSTRAP_TID).
-        // SAFETY: dst_ptr is PM's VA; to_copy ≤ 4096; data slice is valid CPIO data.
-        kernel
-            .copy_slice_to_task(
-                target_tid_arg,
-                dst_ptr,
-                &data[offset_usize..offset_usize + to_copy],
-            )
-            .map_err(|_| SyscallError::PageFault)?;
-    }
-
-    if INITRAMFS_READ_CHUNK_TRACE {
-        crate::yarm_log!(
-            "INITRAMFS_READ_CHUNK_FAIL name={} stage=copy_done to_copy={}",
-            name,
-            to_copy
-        );
-    }
-
-    frame.set_ok(0, to_copy, 0);
-    Ok(())
-}
-
-/// Phase 3A: Create a read-only MemoryObject backed by a named initramfs CPIO file slice.
-///
-/// Access control: caller must be `TaskClass::SystemServer` (initramfs_srv only).
-///
-/// ABI: arg0=name_ptr, arg1=name_len, arg2=flags (reserved, must be 0)
-///
-/// Returns: ret0=0, ret1=cap_id (u64), ret2=file_len (u64) on success.
-fn handle_create_initramfs_file_slice_mo(
-    kernel: &mut KernelState,
-    frame: &mut TrapFrame,
-) -> Result<(), SyscallError> {
-    // Access gate: SystemServer only.
-    let caller_tid = current_tid(kernel)?;
-    let caller_class = kernel.task_class(caller_tid);
-    if caller_class != Some(TaskClass::SystemServer) {
-        crate::yarm_log!(
-            "CREATE_INITRAMFS_FILE_SLICE_MO_DENIED tid={} reason=not_system_server",
-            caller_tid
-        );
-        return Err(SyscallError::MissingRight);
-    }
-
-    let name_ptr = frame.arg(0);
-    let name_len = frame.arg(1);
-    let flags = frame.arg(2) as u64;
-
-    if name_len == 0 || name_len > 128 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    if flags != 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    let name_buf = kernel
-        .copy_from_current_user(name_ptr, name_len)
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let raw_name =
-        core::str::from_utf8(&name_buf[..name_len]).map_err(|_| SyscallError::InvalidArgs)?;
-    // Strip leading slash and optional "/initramfs/" prefix.
-    let name = raw_name.trim_start_matches('/');
-    let name = name.strip_prefix("initramfs/").unwrap_or(name);
-    let name = name.trim_start_matches('/');
-
-    let initrd =
-        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-    let entry = CpioArchive::new(initrd)
-        .find(name)
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let cpio_entry = match entry {
-        Some(e) => e,
-        None => {
-            crate::yarm_log!("CREATE_INITRAMFS_FILE_SLICE_MO_NOT_FOUND name={}", name);
-            return Err(SyscallError::InvalidArgs);
-        }
-    };
-    let file_data = cpio_entry.file_data();
-    let file_len = file_data.len();
-    if file_len == 0 {
-        crate::yarm_log!("CREATE_INITRAMFS_FILE_SLICE_MO_EMPTY name={}", name);
-        return Err(SyscallError::InvalidArgs);
-    }
-    // Compute byte offset of file_data within the initrd blob.
-    let initrd_ptr = initrd.as_ptr() as usize;
-    let data_ptr = file_data.as_ptr() as usize;
-    let file_data_offset = data_ptr
-        .checked_sub(initrd_ptr)
-        .ok_or(SyscallError::InvalidArgs)?;
-
-    let (mo_id, cap_id) = kernel
-        .create_initramfs_file_slice_mo(initrd, file_data_offset, file_len)
-        .map_err(SyscallError::from)?;
-
-    crate::yarm_log!(
-        "CREATE_INITRAMFS_FILE_SLICE_MO_OK tid={} name={} file_len={} mo_id={} cap={}",
-        caller_tid,
-        name,
-        file_len,
-        mo_id,
-        cap_id.0
-    );
-
-    // ret1 = cap_id (u32 packed into u64), ret2 = file_len
-    frame.set_ok(0, cap_id.0 as usize, file_len);
-    Ok(())
-}
-
 /// Phase 3A: Spawn a process from an InitramfsFileSlice MemoryObject capability.
 ///
 /// Access control: caller must be PM (TID == PM_BOOTSTRAP_TID).
@@ -4011,47 +3787,6 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
         .set_task_brk_bounds(tid, base, requested)
         .map_err(SyscallError::from)?;
     frame.set_ok(requested, 0, 0);
-    Ok(())
-}
-
-fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    // ABI: arg0=ptr, arg1=len (no cap slot; do not use SYSCALL_ARG_PTR/LEN here).
-    let a0 = frame.arg(0);
-    let a1 = frame.arg(1);
-    let a2 = frame.arg(2);
-    let tid = kernel.current_tid().unwrap_or(0);
-    syscall_trace!(
-        "DEBUG_LOG_ARGS tid={} a0=0x{:x} a1=0x{:x} a2=0x{:x}",
-        tid,
-        a0,
-        a1,
-        a2
-    );
-    let user_ptr = a0;
-    let raw_len = a1;
-    let len = raw_len.min(Message::MAX_PAYLOAD);
-    syscall_trace!(
-        "DEBUG_LOG_ENTER tid={} ptr=0x{:x} len={}",
-        tid,
-        user_ptr,
-        raw_len
-    );
-    if user_ptr == 0 || len == 0 {
-        frame.set_ok(0, 0, 0);
-        return Ok(());
-    }
-    let payload = match kernel.copy_from_current_user(user_ptr, len) {
-        Ok(data) => data,
-        Err(e) => {
-            syscall_trace!("DEBUG_LOG_COPY_FAIL tid={} err={:?}", tid, e);
-            frame.set_ok(0, 0, 0);
-            return Ok(());
-        }
-    };
-    syscall_trace!("DEBUG_LOG_COPY_OK tid={} len={}", tid, len);
-    let msg_str = core::str::from_utf8(&payload[..len]).unwrap_or("<utf8_err>");
-    crate::yarm_log!("USER_LOG tid={} msg={}", tid, msg_str);
-    frame.set_ok(0, 0, 0);
     Ok(())
 }
 
@@ -7904,5 +7639,126 @@ mod tests {
             "INIT_SPAWN_EXT4_SRV must remain true at Stage 101"
         );
         let _ = fs_lib; // referenced for include_str! side check; assertions below
+    }
+
+    // ── Stage 102: mechanical syscall decomposition — source-scan tests ───────
+
+    #[test]
+    fn stage102_split_modules_exist_and_host_moved_handlers() {
+        // The Stage 102 mechanical split moved NR 15 (DebugLog) and NR 27/28
+        // (InitramfsReadChunk / CreateInitramfsFileSliceMo) handler bodies into
+        // child modules. The bodies must live there and ONLY there.
+        let debug_src = include_str!("syscall/debug.rs");
+        let initramfs_src = include_str!("syscall/initramfs.rs");
+        let parent_src = include_str!("syscall.rs");
+
+        assert!(
+            debug_src.contains("pub(super) fn handle_debug_log"),
+            "syscall/debug.rs must define handle_debug_log with pub(super) visibility"
+        );
+        assert!(
+            initramfs_src.contains("pub(super) fn handle_initramfs_read_chunk"),
+            "syscall/initramfs.rs must define handle_initramfs_read_chunk"
+        );
+        assert!(
+            initramfs_src.contains("pub(super) fn handle_create_initramfs_file_slice_mo"),
+            "syscall/initramfs.rs must define handle_create_initramfs_file_slice_mo"
+        );
+
+        // The parent must no longer define the moved bodies (only `use` them).
+        assert!(
+            !parent_src.contains("\nfn handle_debug_log"),
+            "handle_debug_log body must not remain in syscall.rs"
+        );
+        assert!(
+            !parent_src.contains("\nfn handle_initramfs_read_chunk"),
+            "handle_initramfs_read_chunk body must not remain in syscall.rs"
+        );
+        assert!(
+            !parent_src.contains("\nfn handle_create_initramfs_file_slice_mo"),
+            "handle_create_initramfs_file_slice_mo body must not remain in syscall.rs"
+        );
+
+        // Parent must declare the child modules and re-import the handlers so
+        // the dispatch arms remain textually unchanged.
+        assert!(parent_src.contains("mod debug;"), "mod debug; missing");
+        assert!(
+            parent_src.contains("mod initramfs;"),
+            "mod initramfs; missing"
+        );
+        assert!(
+            parent_src.contains("use self::debug::handle_debug_log;"),
+            "debug handler re-import missing"
+        );
+        assert!(
+            parent_src.contains(
+                "use self::initramfs::{handle_create_initramfs_file_slice_mo, handle_initramfs_read_chunk};"
+            ),
+            "initramfs handler re-import missing"
+        );
+    }
+
+    #[test]
+    fn stage102_dispatch_arms_unchanged_for_moved_handlers() {
+        // Dispatch routing must remain textually identical after the split.
+        let src = include_str!("syscall.rs");
+        assert!(
+            src.contains("Syscall::DebugLog => handle_debug_log(kernel, frame)"),
+            "NR 15 dispatch arm must be unchanged"
+        );
+        assert!(
+            src.contains("Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame)"),
+            "NR 27 dispatch arm must be unchanged"
+        );
+        assert!(
+            src.contains(
+                "Syscall::CreateInitramfsFileSliceMo => handle_create_initramfs_file_slice_mo(kernel, frame)"
+            ),
+            "NR 28 dispatch arm must be unchanged"
+        );
+    }
+
+    #[test]
+    fn stage102_moved_modules_do_not_define_abi_constants() {
+        // The split is mechanical: no ABI constants, no syscall numbers, and no
+        // Syscall enum may leak into the child modules.
+        for (name, src) in [
+            ("syscall/debug.rs", include_str!("syscall/debug.rs")),
+            ("syscall/initramfs.rs", include_str!("syscall/initramfs.rs")),
+        ] {
+            assert!(
+                !src.contains("SYSCALL_COUNT"),
+                "{name} must not define or reference SYSCALL_COUNT"
+            );
+            assert!(
+                !src.contains("_NR: usize ="),
+                "{name} must not define syscall NR constants"
+            );
+            assert!(
+                !src.contains("pub enum Syscall"),
+                "{name} must not define the Syscall enum"
+            );
+        }
+    }
+
+    #[test]
+    fn stage102_dispatch_runtime_routing_for_moved_handlers() {
+        // Runtime proof (not just source-scan): NR 15 DebugLog with a null
+        // pointer is a no-op success — the moved handler must still be
+        // reachable through dispatch() and produce the same trapframe result.
+        let mut kernel = crate::kernel::boot::Bootstrap::init().expect("bootstrap");
+        kernel.register_task(700).expect("register");
+        kernel.enqueue_current_cpu(700).expect("enqueue");
+        kernel.dispatch_next_task().expect("dispatch");
+        let mut frame = TrapFrame::new(SYSCALL_DEBUG_LOG_NR, [0; 6]);
+        dispatch(&mut kernel, &mut frame).expect("debug_log dispatch");
+        assert_eq!(frame.ret0(), 0, "NR 15 null-ptr fast path returns ok(0)");
+
+        // NR 27 InitramfsReadChunk from a non-SystemServer task must be denied
+        // with MissingRight — same access-gate behavior as before the move.
+        // args: name_ptr=0, name_len=8, offset=0, dst_ptr=0x1000, max_len=64, target=0
+        let mut frame27 = TrapFrame::new(SYSCALL_INITRAMFS_READ_CHUNK_NR, [0, 8, 0, 0x1000, 64, 0]);
+        let err = dispatch(&mut kernel, &mut frame27).expect_err("NR 27 must deny non-system-server");
+        assert_eq!(err, SyscallError::MissingRight);
     }
 }
