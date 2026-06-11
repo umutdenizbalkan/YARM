@@ -1317,3 +1317,54 @@ the default outside this explicit gate.
 - `VFS_SHARED_IO_ENABLED = true` (unchanged)
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
 - 436 yarm-fs-servers tests pass (412 prior + 24 Stage 85)
+
+## Stage 88 — ext4 live read-only VFS route
+
+**Gate constants changed:**
+- `VFS_EXT4_LIVE_MOUNT_ENABLED`: `false` → `true`
+- `VFS_EXT4_RECV_LOOP_ENABLED`: unchanged (`true`, set in Stage 86)
+- All shared-I/O gates: unchanged
+
+**What Stage 88 adds:**
+
+`register_ext4_mount_with_vfs(vfs_send_cap, reply_recv_cap, ext4_send_cap)` — new function in
+`init/service.rs` that sends `VFS_OP_MOUNT_REGISTER` to VFS server with:
+- `backend_send_cap = init_ext4_send_cap` (delegated at spawn time via `parent_pid=1`)
+- `flags = 1` (read-only)
+- `prefix = b"/ext4"`
+
+Called after a successful `INIT_EXT4_SPAWN_OK`. On `VFS_MOUNT_STATUS_OK` reply, VFS registers
+`/ext4` in its mount table and future requests to `/ext4/*` are forwarded to `ext4_srv`.
+
+**Log markers (production boot):**
+- `INIT_EXT4_SPAWN_BEGIN` — before spawn call
+- `INIT_EXT4_SPAWN_OK child_tid=<N> send_cap=<C>` — on spawn success
+- `EXT4_SRV_READY child_tid=<N>` — init acknowledges ext4_srv is live
+- `VFS_MOUNT_REGISTER_EXT4_BEGIN prefix=/ext4` — before VFS registration IPC
+- `VFS_MOUNT_REGISTER_EXT4_OK prefix=/ext4` — on successful registration
+
+**ext4 backend contract (read-only, unchanged from Stage 80/86):**
+- `openat_path(path)` resolves `/ext4/file.bin`, `/ext4/service.bin`, `/ext4/oversize.bin`
+- `statx_path(path)` returns `file_len` (0 for demo inodes)
+- `read(fd, len)` returns `min(len, file_len)` bytes
+- `write(fd, len)` returns `Err(VfsError::Unsupported)` for all lengths
+- `read_shared_bytes(fd, buf)` uses default impl → `Err(VfsError::Unsupported)`
+
+**FAT status (unchanged):** `INIT_SPAWN_FAT_SRV = false`; `VFS_FAT_LIVE_MOUNT_ENABLED = false`.
+FAT cap handoff design is proven (init passes `init_blkcache_send_cap` via `service_extra_cap_0`)
+but the spawn is disabled until a virtio_blk block device is available in the default profile.
+
+**Routing:** `/ext4` and `/ext4/*` are dynamically registered in the VFS mount table via
+`insert_dynamic(b"/ext4", cap, 1)`. The static boot table (initramfs + dev) is unchanged.
+Longest-prefix match routes `/ext4/file.bin` to `ext4_srv`.
+
+**Invariants preserved:**
+- SYSCALL_COUNT = 31 (no change)
+- STARTUP_SLOT_COUNT = 18 (no change)
+- SpawnV5 ABI, image IDs, initramfs packing: unchanged
+- `handle_request` shared opcodes still `VfsError::Unsupported` (no shared-I/O for ext4)
+- `VFS_FAT_LIVE_MOUNT_ENABLED = false` (FAT remains disabled)
+- `VFS_RAMFS_LIVE_MOUNT_ENABLED = true` (RAMFS unchanged)
+- `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
+- ext4 writes: `VfsError::Unsupported` (unchanged)
+- 502 yarm-fs-servers tests pass; 97 yarm-control-plane-servers tests pass

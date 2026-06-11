@@ -476,7 +476,8 @@ mod tests {
         //   /initramfs/ → initramfs_srv (cap=10, static boot mount)
         //   /dev/       → devfs_srv     (cap=20, static boot mount)
         //   /ram/       → ramfs_srv     (cap=30, dynamic — registered after RAMFS spawn)
-        // Not present: /fat (INIT_SPAWN_FAT_SRV=false), ext4 (VFS_EXT4_LIVE_MOUNT_ENABLED=false)
+        // Not present in static table: /fat (INIT_SPAWN_FAT_SRV=false, needs virtio_blk)
+        // /ext4 is registered dynamically via VFS_OP_MOUNT_REGISTER after ext4_srv spawn (Stage 88)
         let mut table = VfsMountTable::new();
         assert!(table.register(b"/initramfs/", "initramfs", 10));
         assert!(table.register(b"/dev/", "devfs", 20));
@@ -547,15 +548,16 @@ mod tests {
 
     #[test]
     fn stage87_routing_ext4_absent_by_default() {
-        // ext4 live-mount is disabled (VFS_EXT4_LIVE_MOUNT_ENABLED=false).
+        // ext4 is registered dynamically (VFS_EXT4_LIVE_MOUNT_ENABLED=true, Stage 88),
+        // not in the static boot table.  Before dynamic registration /ext4 is absent.
         let table = make_boot_table();
         assert!(
             table.route(b"/ext4").is_none(),
-            "/ext4 must return None when ext4 live-mount is disabled"
+            "/ext4 must return None before dynamic registration (not in static boot table)"
         );
         assert!(
             table.route(b"/mnt/ext4").is_none(),
-            "/mnt/ext4 must return None when ext4 live-mount is disabled"
+            "/mnt/ext4 must return None (ext4 is mounted at /ext4, not /mnt/ext4)"
         );
     }
 

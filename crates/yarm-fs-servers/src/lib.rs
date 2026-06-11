@@ -196,7 +196,7 @@ mod stage80_tests {
     fn stage86_ext4_recv_loop_blocker_lifted() {
         // Stage 86 lifts the Stage-80 "no-ipc-loop" blocker.
         // ext4/service.rs now has a resident ipc_recv_v2 loop after the smoke demo.
-        // VFS mount registration remains deferred (VFS_EXT4_LIVE_MOUNT_ENABLED = false).
+        // Stage 88 further wires VFS mount registration (VFS_EXT4_LIVE_MOUNT_ENABLED = true).
         let ext4_service_src = include_str!("fs/ext4/service.rs");
         assert!(
             ext4_service_src.contains("ipc_recv_v2("),

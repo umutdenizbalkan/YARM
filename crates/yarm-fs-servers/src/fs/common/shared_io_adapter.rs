@@ -158,10 +158,11 @@ pub const VFS_FAT_LIVE_MOUNT_ENABLED: bool = false;
 
 /// Stage 86: ext4 resident IPC recv loop.
 ///
-/// `true`: ext4/service.rs::run() now enters a resident `ipc_recv_v2` loop after
-/// the smoke demo.  This lifts the Stage-80 "no-ipc-loop" blocker.
-/// VFS mount registration remains deferred (`VFS_EXT4_LIVE_MOUNT_ENABLED = false`)
-/// until the ext4 backend supports the full VFS write/stat contract.
+/// `true`: ext4/service.rs::run() enters a resident `ipc_recv_v2` loop after
+/// the smoke demo.  This lifted the Stage-80 "no-ipc-loop" blocker.
+/// Stage 88 builds on this: `VFS_EXT4_LIVE_MOUNT_ENABLED = true` wires
+/// VFS mount registration, making `/ext4` available read-only after ext4_srv spawns.
+/// ext4 write operations remain `VfsError::Unsupported`.
 pub const VFS_EXT4_RECV_LOOP_ENABLED: bool = true;
 
 /// Stage 88: ext4 live read-only VFS mount.

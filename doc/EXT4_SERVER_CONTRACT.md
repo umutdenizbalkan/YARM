@@ -8,8 +8,10 @@
 `ext4_srv` follows the existing freestanding filesystem-server pattern: `no_std`/`no_main`, the
 shared freestanding allocator installer, local panic handler, `yarm_user_entry`, `_start`, resident
 loop, and the existing `EXT4_SRV_ENTRY`, `EXT4_BIN_BEFORE_RUN`, `EXT4_MOUNT_READY`, and
-`EXT4_MOUNT_FAILED`-style markers. Runtime spawning remains deferred. This work does not alter the
-init/PM/VFS service spawn order or the kernel syscall ABI.
+`EXT4_MOUNT_FAILED`-style markers. Runtime spawning is live (Stage 88): `init` spawns `ext4_srv`
+via `spawn_v5_cap(..., 12, [0,0,0,0], 1)` and calls `register_ext4_mount_with_vfs()` on success,
+registering `/ext4` read-only (flags=1) in the VFS mount table via `VFS_OP_MOUNT_REGISTER`.
+This does not alter the kernel syscall ABI, SpawnV5 ABI, or STARTUP_SLOT_COUNT.
 
 ## FS-10 read-side freeze
 
