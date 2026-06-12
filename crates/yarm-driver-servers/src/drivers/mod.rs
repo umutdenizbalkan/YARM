@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 pub mod blkcache;
+pub mod firmware;
 pub mod input;
 pub mod irqmux;
 pub mod mailbox;

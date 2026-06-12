@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! Typed property client helpers backed by an injected transport.
+//! Typed Raspberry Pi / VideoCore firmware-property helpers.
 
-use super::transport::PropertyTransport;
-use yarm_ipc_abi::mailbox_abi::{
+use super::transport::RpiPropertyTransport;
+use yarm_ipc_abi::platform::rpi::property_mailbox_abi::{
     AlignedPropertyBuffer, GET_ARM_MEMORY, GET_BOARD_MODEL, GET_BOARD_REVISION, GET_BOARD_SERIAL,
     GET_FIRMWARE_REVISION, MailboxError, PropertyRequestEncoder, PropertyResponse,
 };
@@ -12,16 +12,16 @@ use yarm_ipc_abi::mailbox_abi::{
 const CLIENT_BUFFER_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MemoryRegion {
+pub struct RpiMemoryRegion {
     pub base: u32,
     pub size: u32,
 }
 
-pub struct MailboxClient<T> {
+pub struct RpiFirmwareClient<T> {
     transport: T,
 }
 
-impl<T: PropertyTransport> MailboxClient<T> {
+impl<T: RpiPropertyTransport> RpiFirmwareClient<T> {
     pub const fn new(transport: T) -> Self {
         Self { transport }
     }
@@ -59,7 +59,7 @@ impl<T: PropertyTransport> MailboxClient<T> {
         decode_u64(response.tag(GET_BOARD_SERIAL)?.value)
     }
 
-    pub fn get_arm_memory(&mut self) -> Result<MemoryRegion, MailboxError> {
+    pub fn get_arm_memory(&mut self) -> Result<RpiMemoryRegion, MailboxError> {
         let mut buffer = AlignedPropertyBuffer::<CLIENT_BUFFER_LEN>::zeroed();
         let used = encode_query(buffer.as_mut_slice(), GET_ARM_MEMORY, 8)?;
         self.transport
@@ -69,7 +69,7 @@ impl<T: PropertyTransport> MailboxClient<T> {
         if value.len() != 8 {
             return Err(MailboxError::Malformed);
         }
-        Ok(MemoryRegion {
+        Ok(RpiMemoryRegion {
             base: decode_u32(&value[..4])?,
             size: decode_u32(&value[4..])?,
         })
@@ -110,29 +110,31 @@ fn decode_u64(value: &[u8]) -> Result<u64, MailboxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drivers::mailbox::transport::{MockPropertyTransport, MockPropertyValues};
+    use crate::drivers::firmware::rpi::transport::{
+        MockRpiPropertyTransport, MockRpiPropertyValues,
+    };
 
     #[test]
     fn board_serial_helper_returns_typed_mock_value() {
-        let transport = MockPropertyTransport::new(MockPropertyValues {
+        let transport = MockRpiPropertyTransport::new(MockRpiPropertyValues {
             board_serial: Some(0x0123_4567_89ab_cdef),
-            ..MockPropertyValues::default()
+            ..MockRpiPropertyValues::default()
         });
-        let mut client = MailboxClient::new(transport);
+        let mut client = RpiFirmwareClient::new(transport);
         assert_eq!(client.get_board_serial(), Ok(0x0123_4567_89ab_cdef));
         assert_eq!(client.transport().transactions(), 1);
     }
 
     #[test]
     fn arm_memory_helper_returns_typed_mock_region() {
-        let transport = MockPropertyTransport::new(MockPropertyValues {
+        let transport = MockRpiPropertyTransport::new(MockRpiPropertyValues {
             arm_memory: Some((0, 0x8000_0000)),
-            ..MockPropertyValues::default()
+            ..MockRpiPropertyValues::default()
         });
-        let mut client = MailboxClient::new(transport);
+        let mut client = RpiFirmwareClient::new(transport);
         assert_eq!(
             client.get_arm_memory(),
-            Ok(MemoryRegion {
+            Ok(RpiMemoryRegion {
                 base: 0,
                 size: 0x8000_0000,
             })
@@ -141,13 +143,13 @@ mod tests {
 
     #[test]
     fn scalar_helpers_return_typed_mock_values() {
-        let transport = MockPropertyTransport::new(MockPropertyValues {
+        let transport = MockRpiPropertyTransport::new(MockRpiPropertyValues {
             firmware_revision: Some(0x1234_5678),
             board_model: Some(0x17),
             board_revision: Some(0x00a0_2082),
-            ..MockPropertyValues::default()
+            ..MockRpiPropertyValues::default()
         });
-        let mut client = MailboxClient::new(transport);
+        let mut client = RpiFirmwareClient::new(transport);
         assert_eq!(client.get_firmware_revision(), Ok(0x1234_5678));
         assert_eq!(client.get_board_model(), Ok(0x17));
         assert_eq!(client.get_board_revision(), Ok(0x00a0_2082));

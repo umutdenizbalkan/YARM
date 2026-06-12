@@ -5,7 +5,7 @@
 
 pub mod drivers;
 pub use drivers::{
-    blkcache, input, irqmux, mailbox, rp1_gpio, uart, virtio_blk, virtio_gpu, virtio_net,
+    blkcache, firmware, input, irqmux, mailbox, rp1_gpio, uart, virtio_blk, virtio_gpu, virtio_net,
 };
 
 pub fn run_input() {
@@ -69,6 +69,31 @@ mod tests {
                 "workspace scoped drivers impl must not delegate to legacy driver namespace"
             );
         }
+    }
+
+    #[test]
+    fn platform_specific_driver_layers_are_explicit_and_compatibility_is_retained() {
+        let uart_service = include_str!("drivers/uart/service.rs");
+        let uart_module = include_str!("drivers/uart/mod.rs");
+        let pl011_device = include_str!("drivers/uart/backend/pl011/device.rs");
+        let rpi_module = include_str!("drivers/firmware/rpi/mod.rs");
+        let mailbox_compat = include_str!("drivers/mailbox/mod.rs");
+        let audit = include_str!("../../../doc/driver-layering-audit.md");
+        let manifest = include_str!("../Cargo.toml");
+        let crate_root = include_str!("lib.rs");
+        let concrete_uart = ["Pl011", "UartDevice"].concat();
+
+        assert!(!uart_service.contains(&concrete_uart));
+        assert!(uart_service.contains("UartDeviceOps"));
+        assert!(uart_module.contains("pub mod backend"));
+        assert!(pl011_device.contains("impl<B: UartRegisterIo> UartDeviceOps"));
+        assert!(rpi_module.contains("Raspberry Pi / VideoCore"));
+        assert!(mailbox_compat.contains("Compatibility aliases"));
+        assert!(audit.contains("not live-spawned"));
+        assert!(audit.contains("No `rpi_firmware_srv` bin is added"));
+        assert!(!manifest.contains("name = \"rpi_firmware_srv\""));
+        let firmware_run = ["run_rpi", "_firmware"].concat();
+        assert!(!crate_root.contains(&firmware_run));
     }
 
     #[test]

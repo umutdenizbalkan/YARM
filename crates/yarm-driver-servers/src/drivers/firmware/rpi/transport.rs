@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! Property transport boundary and hosted mock.
+//! Raspberry Pi / VideoCore property-mailbox transport boundary and hosted mock.
 
-use yarm_ipc_abi::mailbox_abi::MailboxError;
+use yarm_ipc_abi::platform::rpi::property_mailbox_abi::MailboxError;
 
-pub trait PropertyTransport {
+pub trait RpiPropertyTransport {
     /// Firmware-style in-place transaction: a successful transport overwrites
     /// the request buffer with a response buffer.
     fn transact(&mut self, buffer: &mut [u8]) -> Result<(), MailboxError>;
@@ -14,7 +14,7 @@ pub trait PropertyTransport {
 /// Values returned by the deterministic hosted property transport.
 #[cfg(any(test, feature = "hosted-dev"))]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct MockPropertyValues {
+pub struct MockRpiPropertyValues {
     pub firmware_revision: Option<u32>,
     pub board_model: Option<u32>,
     pub board_revision: Option<u32>,
@@ -25,14 +25,14 @@ pub struct MockPropertyValues {
 
 /// Hosted-only backend that validates a request and overwrites it in place.
 #[cfg(any(test, feature = "hosted-dev"))]
-pub struct MockPropertyTransport {
-    values: MockPropertyValues,
+pub struct MockRpiPropertyTransport {
+    values: MockRpiPropertyValues,
     transactions: usize,
 }
 
 #[cfg(any(test, feature = "hosted-dev"))]
-impl MockPropertyTransport {
-    pub const fn new(values: MockPropertyValues) -> Self {
+impl MockRpiPropertyTransport {
+    pub const fn new(values: MockRpiPropertyValues) -> Self {
         Self {
             values,
             transactions: 0,
@@ -45,9 +45,9 @@ impl MockPropertyTransport {
 }
 
 #[cfg(any(test, feature = "hosted-dev"))]
-impl PropertyTransport for MockPropertyTransport {
+impl RpiPropertyTransport for MockRpiPropertyTransport {
     fn transact(&mut self, buffer: &mut [u8]) -> Result<(), MailboxError> {
-        use yarm_ipc_abi::mailbox_abi::{
+        use yarm_ipc_abi::platform::rpi::property_mailbox_abi::{
             END_TAG, GET_ARM_MEMORY, GET_BOARD_MODEL, GET_BOARD_REVISION, GET_BOARD_SERIAL,
             GET_FIRMWARE_REVISION, GET_VC_MEMORY, PropertyRequest, RESPONSE_SUCCESS,
             TAG_RESPONSE_BIT,
@@ -145,13 +145,13 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), MailboxE
 /// Marker proving that a future backend received a platform-validated,
 /// capability-granted virtual mapping. It does not discover or grant MMIO.
 #[cfg(not(feature = "hosted-dev"))]
-pub struct GrantedMailboxMapping {
+pub struct GrantedRpiMailboxMapping {
     base: usize,
     length: usize,
 }
 
 #[cfg(not(feature = "hosted-dev"))]
-impl GrantedMailboxMapping {
+impl GrantedRpiMailboxMapping {
     /// # Safety
     /// The caller must prove `base..base + length` is a platform-discovered,
     /// capability-granted mailbox mapping valid for the receiving process.
@@ -169,13 +169,13 @@ impl GrantedMailboxMapping {
 /// Deferred non-hosted transport. It deliberately performs no volatile access
 /// until address translation, cache/coherency, and mailbox register policy exist.
 #[cfg(not(feature = "hosted-dev"))]
-pub struct DeferredMmioTransport {
-    mapping: GrantedMailboxMapping,
+pub struct DeferredRpiMailboxTransport {
+    mapping: GrantedRpiMailboxMapping,
 }
 
 #[cfg(not(feature = "hosted-dev"))]
-impl DeferredMmioTransport {
-    pub const fn new(mapping: GrantedMailboxMapping) -> Self {
+impl DeferredRpiMailboxTransport {
+    pub const fn new(mapping: GrantedRpiMailboxMapping) -> Self {
         Self { mapping }
     }
 
@@ -185,7 +185,7 @@ impl DeferredMmioTransport {
 }
 
 #[cfg(not(feature = "hosted-dev"))]
-impl PropertyTransport for DeferredMmioTransport {
+impl RpiPropertyTransport for DeferredRpiMailboxTransport {
     fn transact(&mut self, _buffer: &mut [u8]) -> Result<(), MailboxError> {
         Err(MailboxError::Unsupported)
     }

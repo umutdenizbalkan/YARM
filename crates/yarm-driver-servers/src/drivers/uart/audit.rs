@@ -5,12 +5,12 @@
 //!
 //! | Category | Audit result | Current status / blocker |
 //! |---|---|---|
-//! | Existing service | A synthetic 64-byte queue/statistics model existed | Retained for deterministic accounting and connected to internal PL011 data helpers. |
+//! | Generic service | UART ABI dispatch and accounting | Depends only on `UartDeviceOps`; no PL011 type is imported. |
 //! | Stubbed behavior | `run()` only exercised fake statistics and logged "online" | It now explicitly returns deferred without MMIO or a hardware claim. |
-//! | UART ABI | No UART data/control request ABI exists | `driver_abi.rs` only defines driver-manager lifecycle/grant operations; UART wire dispatch is deferred. |
-//! | Dispatch | No UART request decoder/reply encoder exists | Internal mock-tested TX/RX service helpers are provided until an ABI is designed. |
+//! | UART ABI | Version 1 exists | Generic fixed-size request/reply codecs remain independent of PL011. |
+//! | Dispatch | Pure generic dispatch exists | Mock-tested through `UartDeviceOps`; no live IPC loop is present. |
 //! | Register model | Missing before this work | PL011 DR, FR, IBRD, FBRD, LCRH, CR, IMSC, ICR and required fields are defined. |
-//! | Backend abstraction | Missing before this work | `UartRegisterIo`, generic `Pl011UartDevice`, hosted mock, and non-hosted-only volatile backend are implemented. |
+//! | Backend layout | PL011 was mixed into `uart/` | PL011 device/register/mock/volatile code lives under `uart/backend/pl011`. |
 //! | Hosted tests | One queue-backpressure test existed | Register flags, exact writes, configuration order, errors, service helpers, and no-real-MMIO are covered. |
 //! | Hardware blockers | No discovery or MMIO grant path exists | Raspberry Pi 5 needs platform DTB discovery, clock/divisor policy, pinmux ownership, and capability-granted MMIO; QEMU also needs an explicit platform grant. |
 //! | Kernel early console | Existing architecture-specific kernel facility | It remains separate and untouched; `uart_srv` must never become a dependency of early boot/fatal logging. |
@@ -25,7 +25,8 @@ mod tests {
     fn audit_keeps_boundaries_and_blockers_explicit() {
         let audit = include_str!("audit.rs");
         for required in [
-            "No UART data/control request ABI exists",
+            "Version 1 exists",
+            "uart/backend/pl011",
             "DTB discovery",
             "capability-granted MMIO",
             "Kernel early console",

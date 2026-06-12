@@ -8,14 +8,9 @@
 //! whenever `hosted-dev` is enabled.
 
 use super::regs::{self, cr, fr, lcrh};
+use crate::drivers::uart::service::{UartDeviceError, UartDeviceOps};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UartError {
-    TxWouldBlock,
-    RxWouldBlock,
-    InvalidConfig,
-    Unsupported,
-}
+pub type UartError = UartDeviceError;
 
 /// Data-only PL011 configuration. Clock/baud policy is expected to calculate
 /// and validate these divisors before granting the device to this server.
@@ -158,6 +153,39 @@ impl<B: UartRegisterIo> Pl011UartDevice<B> {
             current & !bit
         };
         self.registers.write32(regs::CR, updated);
+    }
+}
+
+impl<B: UartRegisterIo> UartDeviceOps for Pl011UartDevice<B> {
+    fn configure_8n1(
+        &self,
+        integer_divisor: u16,
+        fractional_divisor: u8,
+        fifo_enabled: bool,
+    ) -> Result<(), UartDeviceError> {
+        self.configure(Pl011Config {
+            integer_divisor,
+            fractional_divisor,
+            fifo_enabled,
+            tx_enabled: true,
+            rx_enabled: true,
+        })
+    }
+
+    fn write_byte(&self, byte: u8) -> Result<(), UartDeviceError> {
+        Pl011UartDevice::write_byte(self, byte)
+    }
+
+    fn write_bytes(&self, bytes: &[u8]) -> Result<usize, UartDeviceError> {
+        Pl011UartDevice::write_bytes(self, bytes)
+    }
+
+    fn read_byte_nonblocking(&self) -> Result<u8, UartDeviceError> {
+        Pl011UartDevice::read_byte_nonblocking(self)
+    }
+
+    fn clear_interrupts(&self) {
+        Pl011UartDevice::clear_interrupts(self);
     }
 }
 
@@ -347,6 +375,38 @@ mod tests {
         uart.backend().set(regs::FR, fr::TXFF);
         assert_eq!(uart.write_bytes(b"abc"), Err(UartError::TxWouldBlock));
         assert_eq!(uart.backend().write_count(), 0);
+    }
+
+    #[test]
+    fn generic_uart_dispatch_operates_through_pl011_trait_impl() {
+        use crate::drivers::uart::service::{UartService, dispatch_uart_request};
+        use yarm_ipc_abi::uart_abi::{UartConfig8N1, UartReply, UartRequest, UartStatus};
+
+        let uart = device();
+        let mut service = UartService::new();
+        let config = UartRequest::Configure8N1(UartConfig8N1 {
+            integer_divisor: 26,
+            fractional_divisor: 3,
+            fifo_enabled: true,
+        });
+        let reply = UartReply::decode(&dispatch_uart_request(
+            &mut service,
+            &uart,
+            &config.encode(),
+        ))
+        .unwrap();
+        assert_eq!(reply.status, UartStatus::Ok);
+        assert_eq!(uart.backend().get(regs::IBRD), 26);
+
+        uart.backend().set(regs::FR, 0);
+        let reply = UartReply::decode(&dispatch_uart_request(
+            &mut service,
+            &uart,
+            &UartRequest::WriteByte(b'P').encode(),
+        ))
+        .unwrap();
+        assert_eq!(reply.bytes_written, 1);
+        assert_eq!(uart.backend().get(regs::DR), b'P' as u32);
     }
 
     #[test]

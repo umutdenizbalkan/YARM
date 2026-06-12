@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! Pure mailbox request dispatch scaffold.
+//! Pure Raspberry Pi / VideoCore firmware-property dispatch scaffold.
 //!
 //! This module has no IPC loop. It is not registered in an image manifest or
 //! spawned by init, and `run` intentionally consumes no startup slots or MMIO.
 
-use super::{MailboxClient, MemoryRegion, PropertyTransport};
-use yarm_ipc_abi::mailbox_abi::MailboxError;
+use super::{RpiFirmwareClient, RpiMemoryRegion, RpiPropertyTransport};
+use yarm_ipc_abi::platform::rpi::property_mailbox_abi::MailboxError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MailboxCommand {
+pub enum RpiFirmwareCommand {
     GetFirmwareRevision,
     GetBoardModel,
     GetBoardRevision,
@@ -19,28 +19,34 @@ pub enum MailboxCommand {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MailboxReply {
+pub enum RpiFirmwareReply {
     FirmwareRevision(u32),
     BoardModel(u32),
     BoardRevision(u32),
     BoardSerial(u64),
-    ArmMemory(MemoryRegion),
+    ArmMemory(RpiMemoryRegion),
 }
 
-pub fn dispatch<T: PropertyTransport>(
-    client: &mut MailboxClient<T>,
-    command: MailboxCommand,
-) -> Result<MailboxReply, MailboxError> {
+pub fn dispatch_rpi_firmware_request<T: RpiPropertyTransport>(
+    client: &mut RpiFirmwareClient<T>,
+    command: RpiFirmwareCommand,
+) -> Result<RpiFirmwareReply, MailboxError> {
     match command {
-        MailboxCommand::GetFirmwareRevision => client
+        RpiFirmwareCommand::GetFirmwareRevision => client
             .get_firmware_revision()
-            .map(MailboxReply::FirmwareRevision),
-        MailboxCommand::GetBoardModel => client.get_board_model().map(MailboxReply::BoardModel),
-        MailboxCommand::GetBoardRevision => {
-            client.get_board_revision().map(MailboxReply::BoardRevision)
+            .map(RpiFirmwareReply::FirmwareRevision),
+        RpiFirmwareCommand::GetBoardModel => {
+            client.get_board_model().map(RpiFirmwareReply::BoardModel)
         }
-        MailboxCommand::GetBoardSerial => client.get_board_serial().map(MailboxReply::BoardSerial),
-        MailboxCommand::GetArmMemory => client.get_arm_memory().map(MailboxReply::ArmMemory),
+        RpiFirmwareCommand::GetBoardRevision => client
+            .get_board_revision()
+            .map(RpiFirmwareReply::BoardRevision),
+        RpiFirmwareCommand::GetBoardSerial => {
+            client.get_board_serial().map(RpiFirmwareReply::BoardSerial)
+        }
+        RpiFirmwareCommand::GetArmMemory => {
+            client.get_arm_memory().map(RpiFirmwareReply::ArmMemory)
+        }
     }
 }
 
@@ -51,18 +57,20 @@ pub fn run() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drivers::mailbox::transport::{MockPropertyTransport, MockPropertyValues};
+    use crate::drivers::firmware::rpi::transport::{
+        MockRpiPropertyTransport, MockRpiPropertyValues,
+    };
 
     #[test]
     fn dispatch_is_pure_over_the_mock_client() {
-        let transport = MockPropertyTransport::new(MockPropertyValues {
+        let transport = MockRpiPropertyTransport::new(MockRpiPropertyValues {
             board_model: Some(0x17),
-            ..MockPropertyValues::default()
+            ..MockRpiPropertyValues::default()
         });
-        let mut client = MailboxClient::new(transport);
+        let mut client = RpiFirmwareClient::new(transport);
         assert_eq!(
-            dispatch(&mut client, MailboxCommand::GetBoardModel),
-            Ok(MailboxReply::BoardModel(0x17))
+            dispatch_rpi_firmware_request(&mut client, RpiFirmwareCommand::GetBoardModel),
+            Ok(RpiFirmwareReply::BoardModel(0x17))
         );
     }
 
