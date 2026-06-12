@@ -126,6 +126,9 @@ pub enum BootPhase {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct YarmBootOptions<'a> {
     pub manifest_path: Option<&'a [u8]>,
+    pub platform: PlatformOption,
+    pub boot_phase: BootPhase,
+    pub max_cpus: Option<usize>,
     /// Stage 108 / Milestone 2 Pass 1: `yarm.loglevel=` observability knob.
     ///
     /// Accepts a printk level as a digit `0`–`7` or a name
