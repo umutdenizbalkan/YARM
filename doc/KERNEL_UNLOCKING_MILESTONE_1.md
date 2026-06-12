@@ -43,9 +43,12 @@ MUST_SMOKE policy (`doc/AI_AGENT_RULES.md §13`).
 
 | Run | Result | Date | Notes |
 |-----|--------|------|-------|
-| x86_64 core (-smp 1) | **PASS** | 2026-06-12 | QEMU 8.2.2; 6/6 service entries exactly once; RAMFS+ext4 live; FAT skipped (`server_disabled`) |
-| x86_64 optional-FS strict | **PASS** | 2026-06-12 | `QEMU_SMOKE_STRICT=1`; all checks passed; wrong-sender count=0 |
-| AArch64 optional-FS strict | **PASS** | 2026-06-12 | `QEMU_SMOKE_STRICT=1`; all checks passed; wrong-sender count=0 |
+| x86_64 core (-smp 1) | **PASS** | 2026-06-12 | Stage 106 declaration; QEMU 8.2.2; 6/6 service entries exactly once; RAMFS+ext4 live; FAT skipped (`server_disabled`) |
+| x86_64 optional-FS strict | **PASS** | 2026-06-12 | Stage 106; `QEMU_SMOKE_STRICT=1`; wrong-sender count=0 |
+| AArch64 optional-FS strict | **PASS** | 2026-06-12 | Stage 106; `QEMU_SMOKE_STRICT=1`; wrong-sender count=0 |
+| x86_64 core (-smp 1) | **PASS** | 2026-06-12 | Stage 107 (D3.1 + D6.1 live wires); same coverage as above |
+| x86_64 optional-FS strict | **PASS** | 2026-06-12 | Stage 107; `QEMU_SMOKE_STRICT=1`; forbidden markers all 0 (wrong_sender=0, d2_race=0, d5_rollback=0) |
+| AArch64 optional-FS strict | **PASS** | 2026-06-12 | Stage 107; `QEMU_SMOKE_STRICT=1`; forbidden markers all 0 |
 
 ---
 

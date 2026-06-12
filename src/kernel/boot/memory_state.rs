@@ -1076,6 +1076,56 @@ impl KernelState {
         }
     }
 
+    /// Stage 107 / D3 first live step — typed batched two-phase shrink over a
+    /// page-aligned range.
+    ///
+    /// VALIDATION: D3_LIVE_SPLIT — called from `syscall.rs::handle_vm_brk` for
+    /// the shrink case since Stage 107.
+    /// VALIDATION: FALLBACK_GLOBAL_LOCK — the per-page loop still runs inside
+    /// one `&mut KernelState` borrow today; the typed method is the
+    /// observability + future-seam-wrapping anchor. The SharedKernel
+    /// VM/memory split-mut seam (audit doc §16.2/§19) remains the next
+    /// prerequisite for releasing between phases on real SMP.
+    ///
+    /// Returns `(pages_unmapped, pages_with_shootdown)`. The invariant
+    /// "no frame reuse before TLB invalidation ACK" is preserved page-by-page
+    /// by `execute_tlb_shootdown_wait_plan` (shootdown then reclaim) inside
+    /// the loop; the typed helper keeps the canonical ordering byte-for-byte.
+    /// `Ok(None)` from `unmap_page_phase1` (lazy/absent page) is silently
+    /// skipped, matching the existing brk-shrink contract.
+    ///
+    /// Telemetry: `d3_vm_brk_shrink_calls` (+1 per invocation),
+    /// `d3_vm_brk_shrink_pages_unmapped` (+= pages actually unmapped),
+    /// `d3_vm_brk_shrink_shootdowns` (+= per-page shootdowns executed).
+    /// Smoke marker: `D3_VM_BRK_SHRINK pages_unmapped=N shootdowns=M`.
+    pub(crate) fn vm_brk_shrink_two_phase(
+        &mut self,
+        asid: Asid,
+        unmap_start: usize,
+        unmap_end: usize,
+    ) -> Result<(usize, usize), KernelError> {
+        let mut pages_unmapped = 0usize;
+        let mut shootdowns = 0usize;
+        let mut va = unmap_start;
+        while va < unmap_end {
+            if let Some(plan) = self.unmap_page_phase1(asid, VirtAddr(va as u64))? {
+                pages_unmapped += 1;
+                if plan.target_cpu_bitmap != 0 {
+                    shootdowns += 1;
+                }
+                self.execute_tlb_shootdown_wait_plan(plan)?;
+            }
+            va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
+        }
+        self.note_d3_vm_brk_shrink(pages_unmapped, shootdowns);
+        crate::yarm_log!(
+            "D3_VM_BRK_SHRINK pages_unmapped={} shootdowns={}",
+            pages_unmapped,
+            shootdowns
+        );
+        Ok((pages_unmapped, shootdowns))
+    }
+
     pub fn protect_user_page(
         &mut self,
         aspace_map_cap: CapId,

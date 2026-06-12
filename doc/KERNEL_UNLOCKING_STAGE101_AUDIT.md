@@ -1297,3 +1297,96 @@ like `IPC_RECV_BLOCK_REGISTER`) are below the production console loglevel
 in all profiles; split-engine routing is verified by the hosted-dev
 telemetry suites (same verification depth as the locally smoke-accepted
 Pass 1/2 runs).
+
+---
+
+## 22. Stage 107 / Pass 3 continuation — D3 + D6 first live wires
+
+After Milestone 1 was declared (Stage 106), the 3-pass directive asked to
+push D3 from gated to live and D6 from audit-only to at least a first
+live/scaffolded step. Stage 107 delivers both as **observability-batched
+typed live wires** that preserve byte-identical behavior on `-smp 1` smoke
+while providing the seam point for a future SharedKernel split-mut wrapper.
+
+**NOT SMOKE-ACCEPTED:** developed post-Milestone 1; the Stage 107
+declaration runs are recorded in the Stage 107 acceptance row in the
+milestone doc (separate from the Milestone 1 row).
+
+### 22.1 D3 — `vm_brk_shrink_two_phase` (VALIDATION: D3_LIVE_SPLIT)
+
+New `KernelState::vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)` in
+`boot/memory_state.rs`. Replaces the per-page inline loop in
+`handle_vm_brk`:
+
+- Per page in `[unmap_start, unmap_end)`: `unmap_page_phase1` (PTE remove +
+  memory accounting), then `execute_tlb_shootdown_wait_plan` (shootdown
+  then reclaim). Byte-identical to the pre-Stage-107 inline body.
+- Returns `(pages_unmapped, shootdowns)`.
+- Telemetry: `d3_vm_brk_shrink_calls` (+1 per invocation),
+  `d3_vm_brk_shrink_pages_unmapped` (per actually-unmapped page),
+  `d3_vm_brk_shrink_shootdowns` (per non-zero-bitmap shootdown — always 0
+  on `-smp 1`).
+- Marker: `D3_VM_BRK_SHRINK pages_unmapped=N shootdowns=M`.
+
+**Invariant preserved:** shootdown-before-reclaim is the structural
+contract of `execute_tlb_shootdown_wait_plan`; the helper inherits it
+unchanged. The fence test `stage106_d3_two_phase_order_is_structural_and_gated`
+remains passing because Phase 1 still defers reclaim and the executor still
+shootdowns before reclaiming.
+
+**What's still gated** (audit doc §16/§19 unchanged): the
+SharedKernel `with_vm_split_mut` / `with_memory_split_mut` seams and a
+lock-free `await_tlb_shootdown_ack` for the multi-CPU split. VmAnonMap is
+NOT routed through this helper at Stage 107 — its rollback paths
+(`VmAnonMapProgressPlan` + `VmAnonMapRollbackTlbPlan`) deserve a separate
+typed wrapper which Pass 4 may add.
+
+### 22.2 D6 — `local_dispatch_step_split` (VALIDATION: D6_LIVE_SPLIT)
+
+New `KernelState::local_dispatch_step_split` in `boot/scheduler_state.rs`.
+Wired into `exec_state.rs::dispatch_next_task`, replacing the direct
+`dispatch_next_current_cpu` call:
+
+- Takes only `scheduler_state()` (rank 1) on the current CPU's per-CPU
+  `RingQueue` set.
+- Source-scan fenced: must NOT touch `task_asid`, `enqueue_woken_task`,
+  `entering_tid`, `exiting_tid`. Cross-CPU wake, ASID switch, timer
+  preemption, and the Class F TID reads remain on their existing global
+  paths (`AI_AGENT_RULES.md §14.4`, `KERNEL_LOCKING.md` Rule N+4).
+- Telemetry: `d6_local_dispatch_calls`. Marker:
+  `D6_LOCAL_DISPATCH cpu=N tid=Some(T)|None`.
+
+**Class F preservation:** `current_tid_authoritative` is the trap-entry
+read; it stays as-is (`stage107_d6_class_f_invariants_preserved`).
+
+**What's still scaffold:** the actual per-CPU runqueue lock sharding waits
+on the SMP trampoline split (out of scope by directive). Today the
+scheduler data structure is already per-CPU under the hood — the single
+global lock is what guards it. Stage 107 establishes the typed entry point
+so a future SharedKernel-seam variant can swap the lock without changing
+any call site.
+
+### 22.3 D4 — not touched
+
+The Stage 107 changes do not extend the syscall module split.
+`syscall.rs` was edited only to route `handle_vm_brk` through the helper.
+
+### 22.4 Stage 107 tests (7 in `kernel::syscall::tests`)
+
+- `stage107_d3_vm_brk_shrink_routes_through_typed_helper` — handle_vm_brk
+  routes through the helper; the inline Phase-1/Phase-2 calls are gone
+  from the syscall body; the helper preserves the executor invocation.
+- `stage107_d3_shrink_telemetry_counts_pages_and_zero_shootdowns_on_smp1`
+  — call counter increments; shootdowns 0 on `-smp 1`.
+- `stage107_d3_shrink_empty_range_is_safe_no_op` — empty range bumps the
+  call counter but does nothing else.
+- `stage107_d6_local_dispatch_routes_through_typed_helper` — exec routes
+  through the typed helper; the helper takes only `scheduler_state()`; no
+  forbidden cross-domain calls.
+- `stage107_d6_local_dispatch_telemetry_increments_per_call` — runtime
+  dispatch increments the counter.
+- `stage107_d6_class_f_invariants_preserved` — the helper does not
+  observe `current_tid_split_read`; `current_tid_authoritative` remains
+  the trap-entry API.
+- `stage107_milestone_doc_lists_pass3_continuation` — milestone stays
+  DECLARED and the audit doc records Stage 107 D3/D6 live wires.

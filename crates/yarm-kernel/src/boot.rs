@@ -49,6 +49,23 @@ pub struct IpcPathTelemetry {
     /// global lock; non-zero only after the SharedKernel seam split, where
     /// it indicates the race branch fired and was handled correctly.
     pub d2_publish_race_unwinds: u64,
+    /// Stage 107 / D3: VmBrk shrink calls routed through the typed batched
+    /// two-phase helper `vm_brk_shrink_two_phase`. Increments once per
+    /// shrink invocation regardless of whether any pages were actually
+    /// unmapped (a zero-page shrink is observable for telemetry purposes).
+    pub d3_vm_brk_shrink_calls: u64,
+    /// Stage 107 / D3: total pages unmapped through the typed shrink helper.
+    pub d3_vm_brk_shrink_pages_unmapped: u64,
+    /// Stage 107 / D3: total per-page shootdowns executed by the shrink
+    /// helper. Always 0 on `-smp 1` because `target_cpu_bitmap` is empty in
+    /// the single-CPU case; non-zero only on multi-CPU. The counter exists
+    /// so post-SMP-trampoline-split smoke can detect the shootdown path
+    /// being exercised.
+    pub d3_vm_brk_shrink_shootdowns: u64,
+    /// Stage 107 / D6: local-CPU dispatch attempts routed through the typed
+    /// `local_dispatch_step_split` helper. Increments once per call,
+    /// independent of whether the dispatched TID changed.
+    pub d6_local_dispatch_calls: u64,
     pub blocked_sends: u64,
     pub rendezvous_handoffs: u64,
     pub transfer_records_created: u64,
