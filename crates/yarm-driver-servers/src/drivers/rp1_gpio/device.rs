@@ -8,6 +8,15 @@
 //! grants this server an MMIO mapping. Hosted development uses only mock
 //! backends and cannot construct the real volatile-MMIO backend.
 
+use crate::drivers::gpio::{GpioDeviceError, GpioDeviceOps, GpioDirection, GpioPinMode, GpioPull};
+
+// Compatibility aliases for the existing RP1 public API. New generic code
+// should use the canonical types from `drivers::gpio`.
+pub use crate::drivers::gpio::{
+    GpioDeviceError as GpioError, GpioDeviceOps as GpioDriver, GpioDirection as Direction,
+    GpioPinMode as PinMode, GpioPull as Pull,
+};
+
 use super::regs::{
     GPIO_BANK0_OFFSET, GPIO_BANK1_OFFSET, GPIO_BANK2_OFFSET, PADS_BANK0_OFFSET, PADS_BANK1_OFFSET,
     PADS_BANK2_OFFSET, RIO_BANK0_OFFSET, RIO_BANK1_OFFSET, RIO_BANK2_OFFSET, fsel, gpio_ctrl,
@@ -31,34 +40,6 @@ const RIO_CLR_ALIAS: usize = 0x3000;
 const PAD_GPIO0_OFFSET: usize = 4;
 const PAD_PIN_STRIDE: usize = 4;
 
-/// Device-level errors translated into deterministic ABI status replies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GpioError {
-    InvalidPin,
-    InvalidFunction,
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Input,
-    Output,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Pull {
-    Off,
-    Down,
-    Up,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PinMode {
-    Input,
-    Output { initial_level: bool },
-    AltFunction(u32),
-}
-
 /// Minimal register transport used by the RP1 GPIO logic.
 ///
 /// Implementations may perform volatile MMIO or provide deterministic hosted
@@ -67,17 +48,6 @@ pub enum PinMode {
 pub trait RegisterIo {
     fn read32(&self, offset: usize) -> u32;
     fn write32(&self, offset: usize, value: u32);
-}
-
-/// Operations consumed by the IPC dispatcher.
-pub trait GpioDriver {
-    fn set_function(&self, pin: usize, function: u32) -> Result<(), GpioError>;
-    fn set_pin_mode(&self, pin: usize, mode: PinMode) -> Result<(), GpioError>;
-    fn direction(&self, pin: usize) -> Result<Direction, GpioError>;
-    fn write_pin(&self, pin: usize, level: bool) -> Result<(), GpioError>;
-    fn read_pin(&self, pin: usize) -> Result<bool, GpioError>;
-    fn set_pull(&self, pin: usize, pull: Pull) -> Result<(), GpioError>;
-    fn pull(&self, pin: usize) -> Result<Pull, GpioError>;
 }
 
 /// Backend-independent RP1 GPIO device.
@@ -102,7 +72,7 @@ impl<B> Rp1GpioDevice<B> {
         } else if pin < TOTAL_GPIOS {
             Ok((2, pin - BANK0_PINS - BANK1_PINS))
         } else {
-            Err(GpioError::InvalidPin)
+            Err(GpioDeviceError::InvalidPin)
         }
     }
 }
@@ -126,10 +96,10 @@ impl<B: RegisterIo> Rp1GpioDevice<B> {
     }
 }
 
-impl<B: RegisterIo> GpioDriver for Rp1GpioDevice<B> {
-    fn set_function(&self, pin: usize, function: u32) -> Result<(), GpioError> {
+impl<B: RegisterIo> GpioDeviceOps for Rp1GpioDevice<B> {
+    fn set_function(&self, pin: usize, function: u32) -> Result<(), GpioDeviceError> {
         if function > 0x1f {
-            return Err(GpioError::InvalidFunction);
+            return Err(GpioDeviceError::InvalidFunction);
         }
         let (ctrl, _, _) = Self::locations(pin)?;
         self.update(
@@ -140,18 +110,18 @@ impl<B: RegisterIo> GpioDriver for Rp1GpioDevice<B> {
         Ok(())
     }
 
-    fn set_pin_mode(&self, pin: usize, mode: PinMode) -> Result<(), GpioError> {
+    fn set_pin_mode(&self, pin: usize, mode: GpioPinMode) -> Result<(), GpioDeviceError> {
         let (ctrl, rio, pad) = Self::locations(pin)?;
         let (_, index) = Self::pin_location(pin)?;
         let mask = 1u32 << index;
 
         match mode {
-            PinMode::Input => {
+            GpioPinMode::Input => {
                 self.io.write32(rio + RIO_CLR_ALIAS + RIO_OE_OFFSET, mask);
                 self.update(ctrl, gpio_ctrl::FUNCSEL_MASK, fsel::GPIO);
                 self.update(pad, pad_ctrl::OUTPUT_DISABLE, pad_ctrl::INPUT_ENABLE);
             }
-            PinMode::Output { initial_level } => {
+            GpioPinMode::Output { initial_level } => {
                 let alias = if initial_level {
                     RIO_SET_ALIAS
                 } else {
@@ -161,9 +131,9 @@ impl<B: RegisterIo> GpioDriver for Rp1GpioDevice<B> {
                 self.update(ctrl, gpio_ctrl::FUNCSEL_MASK, fsel::GPIO);
                 self.io.write32(rio + RIO_SET_ALIAS + RIO_OE_OFFSET, mask);
             }
-            PinMode::AltFunction(function) => {
+            GpioPinMode::AltFunction(function) => {
                 if !matches!(function, 1..=4 | 6..=8) {
-                    return Err(GpioError::InvalidFunction);
+                    return Err(GpioDeviceError::InvalidFunction);
                 }
                 self.io.write32(rio + RIO_CLR_ALIAS + RIO_OE_OFFSET, mask);
                 self.update(
@@ -176,19 +146,19 @@ impl<B: RegisterIo> GpioDriver for Rp1GpioDevice<B> {
         Ok(())
     }
 
-    fn direction(&self, pin: usize) -> Result<Direction, GpioError> {
+    fn direction(&self, pin: usize) -> Result<GpioDirection, GpioDeviceError> {
         let (_, rio, _) = Self::locations(pin)?;
         let (_, index) = Self::pin_location(pin)?;
         Ok(
             if self.io.read32(rio + RIO_OE_OFFSET) & (1u32 << index) != 0 {
-                Direction::Output
+                GpioDirection::Output
             } else {
-                Direction::Input
+                GpioDirection::Input
             },
         )
     }
 
-    fn write_pin(&self, pin: usize, level: bool) -> Result<(), GpioError> {
+    fn write_pin(&self, pin: usize, level: bool) -> Result<(), GpioDeviceError> {
         let (_, rio, _) = Self::locations(pin)?;
         let (_, index) = Self::pin_location(pin)?;
         let alias = if level { RIO_SET_ALIAS } else { RIO_CLR_ALIAS };
@@ -196,30 +166,30 @@ impl<B: RegisterIo> GpioDriver for Rp1GpioDevice<B> {
         Ok(())
     }
 
-    fn read_pin(&self, pin: usize) -> Result<bool, GpioError> {
+    fn read_pin(&self, pin: usize) -> Result<bool, GpioDeviceError> {
         let (_, rio, _) = Self::locations(pin)?;
         let (_, index) = Self::pin_location(pin)?;
         Ok(self.io.read32(rio + RIO_IN_OFFSET) & (1u32 << index) != 0)
     }
 
-    fn set_pull(&self, pin: usize, pull: Pull) -> Result<(), GpioError> {
+    fn set_pull(&self, pin: usize, pull: GpioPull) -> Result<(), GpioDeviceError> {
         let (_, _, pad) = Self::locations(pin)?;
         let set = match pull {
-            Pull::Off => 0,
-            Pull::Down => pad_ctrl::PULL_DOWN,
-            Pull::Up => pad_ctrl::PULL_UP,
+            GpioPull::Off => 0,
+            GpioPull::Down => pad_ctrl::PULL_DOWN,
+            GpioPull::Up => pad_ctrl::PULL_UP,
         };
         self.update(pad, pad_ctrl::PULL_DOWN | pad_ctrl::PULL_UP, set);
         Ok(())
     }
 
-    fn pull(&self, pin: usize) -> Result<Pull, GpioError> {
+    fn pull(&self, pin: usize) -> Result<GpioPull, GpioDeviceError> {
         let (_, _, pad) = Self::locations(pin)?;
         match self.io.read32(pad) & (pad_ctrl::PULL_DOWN | pad_ctrl::PULL_UP) {
-            0 => Ok(Pull::Off),
-            pad_ctrl::PULL_DOWN => Ok(Pull::Down),
-            pad_ctrl::PULL_UP => Ok(Pull::Up),
-            _ => Err(GpioError::Unsupported),
+            0 => Ok(GpioPull::Off),
+            pad_ctrl::PULL_DOWN => Ok(GpioPull::Down),
+            pad_ctrl::PULL_UP => Ok(GpioPull::Up),
+            _ => Err(GpioDeviceError::Unsupported),
         }
     }
 }
@@ -310,11 +280,11 @@ mod tests {
         }
         assert_eq!(
             Rp1GpioDevice::<MockIo>::pin_location(54),
-            Err(GpioError::InvalidPin)
+            Err(GpioDeviceError::InvalidPin)
         );
         assert_eq!(
             Rp1GpioDevice::<MockIo>::pin_location(usize::MAX),
-            Err(GpioError::InvalidPin)
+            Err(GpioDeviceError::InvalidPin)
         );
     }
 
@@ -323,12 +293,12 @@ mod tests {
         let dev = Rp1GpioDevice::new(MockIo::default());
         dev.set_pin_mode(
             28,
-            PinMode::Output {
+            GpioPinMode::Output {
                 initial_level: true,
             },
         )
         .unwrap();
-        assert_eq!(dev.direction(28), Ok(Direction::Output));
+        assert_eq!(dev.direction(28), Ok(GpioDirection::Output));
         assert!(
             dev.backend()
                 .writes()
@@ -340,8 +310,8 @@ mod tests {
                 .contains(&(RIO_BANK1_OFFSET + RIO_SET_ALIAS + RIO_OE_OFFSET, 1))
         );
 
-        dev.set_pin_mode(28, PinMode::Input).unwrap();
-        assert_eq!(dev.direction(28), Ok(Direction::Input));
+        dev.set_pin_mode(28, GpioPinMode::Input).unwrap();
+        assert_eq!(dev.direction(28), Ok(GpioDirection::Input));
         assert!(
             dev.backend()
                 .writes()
@@ -374,23 +344,26 @@ mod tests {
         let pad = PADS_BANK0_OFFSET + PAD_GPIO0_OFFSET + 7 * PAD_PIN_STRIDE;
         dev.backend()
             .put(pad, pad_ctrl::SCHMITT | pad_ctrl::PULL_DOWN);
-        dev.set_pull(7, Pull::Up).unwrap();
-        assert_eq!(dev.pull(7), Ok(Pull::Up));
+        dev.set_pull(7, GpioPull::Up).unwrap();
+        assert_eq!(dev.pull(7), Ok(GpioPull::Up));
         assert_eq!(
             dev.backend().read32(pad),
             pad_ctrl::SCHMITT | pad_ctrl::PULL_UP
         );
-        dev.set_pull(7, Pull::Off).unwrap();
-        assert_eq!(dev.pull(7), Ok(Pull::Off));
+        dev.set_pull(7, GpioPull::Off).unwrap();
+        assert_eq!(dev.pull(7), Ok(GpioPull::Off));
     }
 
     #[test]
     fn invalid_functions_are_rejected_before_mmio() {
         let dev = Rp1GpioDevice::new(MockIo::default());
-        assert_eq!(dev.set_function(0, 32), Err(GpioError::InvalidFunction));
         assert_eq!(
-            dev.set_pin_mode(0, PinMode::AltFunction(5)),
-            Err(GpioError::InvalidFunction)
+            dev.set_function(0, 32),
+            Err(GpioDeviceError::InvalidFunction)
+        );
+        assert_eq!(
+            dev.set_pin_mode(0, GpioPinMode::AltFunction(5)),
+            Err(GpioDeviceError::InvalidFunction)
         );
         assert!(dev.backend().writes().is_empty());
     }
@@ -401,7 +374,42 @@ mod tests {
         let pad = PADS_BANK0_OFFSET + PAD_GPIO0_OFFSET;
         dev.backend()
             .put(pad, pad_ctrl::PULL_DOWN | pad_ctrl::PULL_UP);
-        assert_eq!(dev.pull(0), Err(GpioError::Unsupported));
+        assert_eq!(dev.pull(0), Err(GpioDeviceError::Unsupported));
+    }
+
+    #[test]
+    fn generic_gpio_trait_covers_pin_mode_level_function_and_pull() {
+        fn exercise<D: GpioDeviceOps>(device: &D) {
+            assert_eq!(
+                device.set_pin_mode(
+                    28,
+                    GpioPinMode::Output {
+                        initial_level: true,
+                    },
+                ),
+                Ok(())
+            );
+            assert_eq!(device.direction(28), Ok(GpioDirection::Output));
+            assert_eq!(device.write_pin(53, true), Ok(()));
+            assert_eq!(device.set_function(7, 3), Ok(()));
+            assert_eq!(device.set_pull(7, GpioPull::Up), Ok(()));
+            assert_eq!(device.pull(7), Ok(GpioPull::Up));
+            assert_eq!(
+                device.set_pin_mode(54, GpioPinMode::Input),
+                Err(GpioDeviceError::InvalidPin)
+            );
+            assert_eq!(
+                device.set_function(0, 32),
+                Err(GpioDeviceError::InvalidFunction)
+            );
+        }
+
+        let device = Rp1GpioDevice::new(MockIo::default());
+        exercise(&device);
+        device
+            .backend()
+            .put(RIO_BANK2_OFFSET + RIO_IN_OFFSET, 1 << 5);
+        assert_eq!(GpioDeviceOps::read_pin(&device, 53), Ok(true));
     }
 
     #[test]

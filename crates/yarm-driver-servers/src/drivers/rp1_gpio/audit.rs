@@ -6,6 +6,8 @@
 //! | Category | State after audit | Verification / blocker |
 //! |---|---|---|
 //! | ABI requests/replies | Implemented for ABI v1 set-function, set-mode, write, and read | Codec and dispatch tests cover every opcode. ABI has no pull, direction-query, or interrupt opcode. |
+//! | Generic GPIO contract | Implemented | `drivers/gpio` defines `GpioDeviceOps` plus shared error, direction, mode, and pull types. |
+//! | RP1 implementation | Implemented | `Rp1GpioDevice<B>` implements `GpioDeviceOps` and remains under `drivers/rp1_gpio`. |
 //! | Service dispatch | Implemented as a pure, mock-testable request-to-reply function | Runtime transport remains separate. Unknown opcodes return `Unsupported`. |
 //! | Register constants/bitfields | Implemented for GPIO_CTRL, SYS_RIO, and PADS | Layout assertions and exact-offset mock tests exist. Offsets are BAR-relative, not production physical addresses. |
 //! | MMIO abstraction/mock | Implemented | `RegisterIo` plus hosted mock; volatile backend is excluded from hosted-dev. |
@@ -39,6 +41,8 @@ mod tests {
             "mock/protocol-ready",
             "not hardware-proven",
             "No real MMIO in hosted-dev",
+            "GpioDeviceOps",
+            "drivers/rp1_gpio",
         ] {
             assert!(audit.contains(required), "audit matrix lost: {required}");
         }

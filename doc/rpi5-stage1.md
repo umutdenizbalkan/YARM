@@ -12,7 +12,9 @@ YARM's userspace/service chain.
 Stage an already-built raw Stage 1 image as `kernel_2712.img`:
 
 ```sh
-scripts/create-rpi5-stage1-boot-dir.sh path/to/kernel-image build/rpi5-stage1-boot
+scripts/create-rpi5-stage1-boot-dir.sh \
+  --kernel-input path/to/kernel-image \
+  --boot-dir build/rpi5-stage1-boot
 ```
 
 The generated directory contains:
@@ -21,14 +23,30 @@ The generated directory contains:
 config.txt
 cmdline.txt
 kernel_2712.img
+README-RPI5-STAGE1.txt
 ```
 
-The generated `cmdline.txt` is:
+The default generated files include:
 
 ```text
+# config.txt
+kernel=kernel_2712.img
+arm_64bit=1
+enable_uart=1
+uart_2ndstage=1
+
+# cmdline.txt
 yarm.platform=auto yarm.boot_phase=uart yarm.max_cpus=1
 ```
 
+Use `--phase entry|uart|dtb|mmu|kernel` to choose the diagnostic stop point and
+`--cmdline-extra STRING` to append additional kernel arguments. `--os-check-off` adds `os_check=0`
+for firmware environments that require bypassing the OS check. `--enable-rp1-uart` adds the Pi
+5-specific `enable_rp1_uart=1`; it is deliberately opt-in rather than a default. The generator
+refuses to replace its four output files unless `--force` is supplied.
+
+The generated README records the selected phase and command line, lists the four expected UART
+markers, and maps partial marker progress to the next boundary to investigate during hardware smoke.
 Copy the generated files alongside the Raspberry Pi 5 firmware files on a FAT boot partition. The
 script intentionally does not download or redistribute firmware.
 

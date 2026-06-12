@@ -4,7 +4,10 @@
 #![no_std]
 
 pub mod drivers;
-pub use drivers::{blkcache, input, irqmux, rp1_gpio, uart, virtio_blk, virtio_gpu, virtio_net};
+pub use drivers::{
+    blkcache, firmware, gpio, input, irqmux, mailbox, rp1_gpio, uart, virtio_blk, virtio_gpu,
+    virtio_net,
+};
 
 pub fn run_input() {
     drivers::input::run();
@@ -67,6 +70,71 @@ mod tests {
                 "workspace scoped drivers impl must not delegate to legacy driver namespace"
             );
         }
+    }
+
+    #[test]
+    fn platform_specific_driver_layers_are_explicit_and_compatibility_is_retained() {
+        let uart_service = include_str!("drivers/uart/service.rs");
+        let uart_module = include_str!("drivers/uart/mod.rs");
+        let pl011_device = include_str!("drivers/uart/backend/pl011/device.rs");
+        let rpi_module = include_str!("drivers/firmware/rpi/mod.rs");
+        let mailbox_compat = include_str!("drivers/mailbox/mod.rs");
+        let audit = include_str!("../../../doc/driver-layering-audit.md");
+        let manifest = include_str!("../Cargo.toml");
+        let crate_root = include_str!("lib.rs");
+        let concrete_uart = ["Pl011", "UartDevice"].concat();
+
+        assert!(!uart_service.contains(&concrete_uart));
+        assert!(uart_service.contains("UartDeviceOps"));
+        assert!(uart_module.contains("pub mod backend"));
+        assert!(pl011_device.contains("impl<B: UartRegisterIo> UartDeviceOps"));
+        assert!(rpi_module.contains("Raspberry Pi / VideoCore"));
+        assert!(mailbox_compat.contains("Compatibility aliases"));
+        assert!(audit.contains("not live-spawned"));
+        assert!(audit.contains("No `rpi_firmware_srv` bin is added"));
+        assert!(!manifest.contains("name = \"rpi_firmware_srv\""));
+        let firmware_run = ["run_rpi", "_firmware"].concat();
+        assert!(!crate_root.contains(&firmware_run));
+    }
+
+    #[test]
+    fn gpio_service_is_trait_backed_while_rp1_path_remains_in_place() {
+        let generic_gpio = include_str!("drivers/gpio/mod.rs");
+        let rp1_device = include_str!("drivers/rp1_gpio/device.rs");
+        let rp1_service = include_str!("drivers/rp1_gpio/service.rs");
+        let drivers_module = include_str!("drivers/mod.rs");
+        let audit = include_str!("../../../doc/driver-layering-audit.md");
+        let future_backend = ["gpio/backend/", "rp1"].concat();
+
+        assert!(generic_gpio.contains("pub trait GpioDeviceOps"));
+        assert!(rp1_device.contains("impl<B: RegisterIo> GpioDeviceOps for Rp1GpioDevice<B>"));
+        assert!(rp1_service.contains("dispatch<D: GpioDeviceOps>"));
+        assert!(!rp1_service.contains("Rp1GpioDevice"));
+        assert!(drivers_module.contains("pub mod rp1_gpio"));
+        assert!(!drivers_module.contains(&future_backend));
+        assert!(audit.contains("drivers/gpio/backend/rp1"));
+        assert!(audit.contains("PCIe discovery"));
+        assert!(audit.contains("not hardware-proven"));
+    }
+
+    #[test]
+    fn block_service_is_trait_backed_and_virtio_paths_remain_compatible() {
+        let service = include_str!("drivers/virtio_blk/service.rs");
+        let module = include_str!("drivers/virtio_blk/mod.rs");
+        let backend = include_str!("drivers/virtio_blk/backend/virtio/device.rs");
+        let audit = include_str!("../../../doc/driver-layering-audit.md");
+        let queue_type = ["Virtq", "Chain"].concat();
+        let concrete_device = ["VirtioBlk", "MemoryDevice"].concat();
+
+        assert!(service.contains("BlockDeviceOps"));
+        assert!(!service.contains(&queue_type));
+        assert!(!service.contains(&concrete_device));
+        assert!(backend.contains("impl<const SECTORS: usize> BlockDeviceOps"));
+        assert!(module.contains("Compatibility module for the former `virtio_blk::device` path"));
+        assert!(module.contains("pub type VirtioBlkWriteService"));
+        assert!(audit.contains("block_backend_abi"));
+        assert!(audit.contains("VIRTIO_BLK_SRV_READY"));
+        assert!(audit.contains("FAT gates"));
     }
 
     #[test]

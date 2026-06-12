@@ -13,4 +13,4 @@ pub mod service;
 pub use device::{
     Direction, GpioDriver, GpioError, PinMode, Pull, RegisterIo, Rp1GpioDevice, TOTAL_GPIOS,
 };
-pub use service::run;
+pub use service::{dispatch, run};
