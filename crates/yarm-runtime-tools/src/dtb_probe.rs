@@ -508,6 +508,10 @@ pub fn render_report(parsed: &ParsedFdt) -> String {
 }
 
 pub fn render_yarm_readiness(parsed: &ParsedFdt) -> String {
+    render_yarm_readiness_with_options(parsed, false)
+}
+
+pub fn render_yarm_readiness_with_options(parsed: &ParsedFdt, verbose_nodes: bool) -> String {
     let mut out = String::new();
     let platform = classify_platform(parsed);
     let memory: Vec<_> = memory_nodes(parsed)
@@ -521,11 +525,7 @@ pub fn render_yarm_readiness(parsed: &ParsedFdt) -> String {
         .filter(|node| classify_node(node).serial && node_is_usable(node))
         .or_else(|| first_usable(parsed, |classes| classes.serial));
     let interrupt = first_usable(parsed, |classes| classes.interrupt_controller);
-    let pcie_rp1: Vec<_> = parsed
-        .nodes
-        .iter()
-        .filter(|node| is_rp1_pcie_node(node) && node_is_usable(node))
-        .collect();
+    let rp1_pcie = rp1_pcie_summary(parsed);
     let initrd = initrd_range(parsed);
 
     writeln!(out, "== YARM Readiness ==").unwrap();
@@ -561,20 +561,7 @@ pub fn render_yarm_readiness(parsed: &ParsedFdt) -> String {
     }
     line_candidate(&mut out, "first-usable-serial", serial);
     line_candidate(&mut out, "interrupt-controller", interrupt);
-    if pcie_rp1.is_empty() {
-        writeln!(out, "rp1-pcie: missing").unwrap();
-    } else {
-        writeln!(
-            out,
-            "rp1-pcie: present ({})",
-            pcie_rp1
-                .iter()
-                .map(|node| node.path.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-        .unwrap();
-    }
+    render_rp1_pcie(&mut out, &rp1_pcie, verbose_nodes);
 
     writeln!(out, "warnings:").unwrap();
     let mut warnings = Vec::new();
@@ -601,7 +588,7 @@ pub fn render_yarm_readiness(parsed: &ParsedFdt) -> String {
     if interrupt.is_none() {
         warnings.push("no enabled interrupt-controller node was found");
     }
-    if platform == Platform::Rpi5Bcm2712 && pcie_rp1.is_empty() {
+    if platform == Platform::Rpi5Bcm2712 && rp1_pcie.rp1_node.is_none() {
         warnings.push(
             "BCM2712 tree has no RP1/PCIe candidate; Pi 5 peripheral discovery is incomplete",
         );
@@ -614,6 +601,158 @@ pub fn render_yarm_readiness(parsed: &ParsedFdt) -> String {
         }
     }
     out
+}
+
+#[derive(Debug, Default)]
+struct Rp1PcieSummary<'a> {
+    pcie_controller: Option<&'a Node>,
+    rp1_node: Option<&'a Node>,
+    gpio: Option<&'a Node>,
+    pwm_count: usize,
+    uart_count: usize,
+    ethernet_present: bool,
+    usb_count: usize,
+    child_count: usize,
+    verbose_nodes: Vec<&'a Node>,
+}
+
+fn rp1_pcie_summary(parsed: &ParsedFdt) -> Rp1PcieSummary<'_> {
+    let rp1_node = parsed
+        .nodes
+        .iter()
+        .filter(|node| is_rp1_node(node) && node_is_usable(node))
+        .min_by(|left, right| left.path.cmp(&right.path));
+    let pcie_controller = rp1_node.and_then(|rp1| {
+        ancestors(&rp1.path)
+            .filter_map(|path| node(parsed, path))
+            .find(|node| is_pcie_controller(node) && node_is_usable(node))
+    });
+
+    let mut summary = Rp1PcieSummary {
+        pcie_controller,
+        rp1_node,
+        ..Rp1PcieSummary::default()
+    };
+    let Some(rp1) = rp1_node else {
+        return summary;
+    };
+
+    let descendant_prefix = format!("{}/", rp1.path);
+    let mut descendants: Vec<_> = parsed
+        .nodes
+        .iter()
+        .filter(|node| node.path.starts_with(&descendant_prefix) && node_is_usable(node))
+        .collect();
+    descendants.sort_by(|left, right| left.path.cmp(&right.path));
+
+    summary.gpio = descendants.iter().copied().find(|node| is_rp1_gpio(node));
+    summary.pwm_count = descendants.iter().filter(|node| is_rp1_pwm(node)).count();
+    summary.uart_count = descendants
+        .iter()
+        .filter(|node| classify_node(node).serial)
+        .count();
+    summary.ethernet_present = descendants.iter().any(|node| is_ethernet(node));
+    summary.usb_count = descendants.iter().filter(|node| is_usb(node)).count();
+    summary.child_count = descendants
+        .iter()
+        .filter(|node| direct_parent_path(&node.path) == Some(rp1.path.as_str()))
+        .count();
+    summary.verbose_nodes = parsed
+        .nodes
+        .iter()
+        .filter(|node| is_rp1_pcie_node(node) && node_is_usable(node))
+        .collect();
+    summary
+        .verbose_nodes
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    summary
+}
+
+fn render_rp1_pcie(out: &mut String, summary: &Rp1PcieSummary<'_>, verbose_nodes: bool) {
+    let Some(rp1_node) = summary.rp1_node else {
+        writeln!(out, "rp1-pcie: missing").unwrap();
+        return;
+    };
+
+    writeln!(out, "rp1-pcie:").unwrap();
+    line_candidate_indented(out, "pcie-controller", summary.pcie_controller);
+    line_candidate_indented(out, "rp1-node", Some(rp1_node));
+    if let Some(gpio) = summary.gpio {
+        writeln!(out, "  rp1-gpio: {}", gpio.path).unwrap();
+    }
+    writeln!(out, "  rp1-pwm-count: {}", summary.pwm_count).unwrap();
+    writeln!(out, "  rp1-uart-count: {}", summary.uart_count).unwrap();
+    writeln!(
+        out,
+        "  rp1-ethernet: {}",
+        if summary.ethernet_present {
+            "present"
+        } else {
+            "absent"
+        }
+    )
+    .unwrap();
+    writeln!(out, "  rp1-usb-count: {}", summary.usb_count).unwrap();
+    writeln!(out, "  rp1-child-count: {}", summary.child_count).unwrap();
+    if verbose_nodes {
+        writeln!(out, "  nodes:").unwrap();
+        for node in &summary.verbose_nodes {
+            writeln!(out, "    - {}", node.path).unwrap();
+        }
+    }
+}
+
+fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(direct_parent_path(path), |path| direct_parent_path(path))
+}
+
+fn direct_parent_path(path: &str) -> Option<&str> {
+    let split = path.rfind('/')?;
+    if split == 0 {
+        Some("/")
+    } else {
+        Some(&path[..split])
+    }
+}
+
+fn is_rp1_node(node: &Node) -> bool {
+    let name = node.name.to_ascii_lowercase();
+    name == "rp1"
+        || name.starts_with("rp1@")
+        || node
+            .compatible()
+            .iter()
+            .any(|compatible| compatible.to_ascii_lowercase().contains("raspberrypi,rp1"))
+}
+
+fn is_pcie_controller(node: &Node) -> bool {
+    let name = node.name.to_ascii_lowercase();
+    let compatible = node.compatible().join(" ").to_ascii_lowercase();
+    name.starts_with("pci@")
+        || name.starts_with("pcie@")
+        || compatible.contains("pcie")
+        || compatible.contains("pci-host")
+}
+
+fn is_rp1_gpio(node: &Node) -> bool {
+    node.has_property("gpio-controller") || node.name.to_ascii_lowercase().starts_with("gpio@")
+}
+
+fn is_rp1_pwm(node: &Node) -> bool {
+    let name = node.name.to_ascii_lowercase();
+    let compatible = node.compatible().join(" ").to_ascii_lowercase();
+    name == "pwm" || name.starts_with("pwm@") || compatible.contains("pwm")
+}
+
+fn is_ethernet(node: &Node) -> bool {
+    let name = node.name.to_ascii_lowercase();
+    let compatible = node.compatible().join(" ").to_ascii_lowercase();
+    name == "ethernet" || name.starts_with("ethernet@") || compatible.contains("ethernet")
+}
+
+fn is_usb(node: &Node) -> bool {
+    let name = node.name.to_ascii_lowercase();
+    name == "usb" || name.starts_with("usb@")
 }
 
 fn memory_nodes(parsed: &ParsedFdt) -> Vec<&Node> {
@@ -672,6 +811,13 @@ fn line_candidate(out: &mut String, label: &str, candidate: Option<&Node>) {
     match candidate {
         Some(node) => writeln!(out, "{label}: {}", node.path).unwrap(),
         None => writeln!(out, "{label}: <none>").unwrap(),
+    }
+}
+
+fn line_candidate_indented(out: &mut String, label: &str, candidate: Option<&Node>) {
+    match candidate {
+        Some(node) => writeln!(out, "  {label}: {}", node.path).unwrap(),
+        None => writeln!(out, "  {label}: <none>").unwrap(),
     }
 }
 
@@ -1120,6 +1266,60 @@ mod tests {
     }
 
     #[test]
+    fn readiness_rp1_pcie_output_is_concise_and_ordered() {
+        let parsed = synthetic_rp1_tree();
+        let report = render_yarm_readiness(&parsed);
+        let expected = "\
+rp1-pcie:
+  pcie-controller: /axi/pcie@120000
+  rp1-node: /axi/pcie@120000/rp1@0
+  rp1-gpio: /axi/pcie@120000/rp1@0/gpio@d0000
+  rp1-pwm-count: 2
+  rp1-uart-count: 2
+  rp1-ethernet: present
+  rp1-usb-count: 2
+  rp1-child-count: 8
+warnings:";
+        assert!(
+            report.contains(expected),
+            "unexpected readiness report:\n{report}"
+        );
+        assert!(!report.contains("uart@30000"));
+        assert!(!report.contains("usb@200000"));
+    }
+
+    #[test]
+    fn verbose_nodes_preserves_sorted_rp1_descendant_listing() {
+        let parsed = synthetic_rp1_tree();
+        let report = render_yarm_readiness_with_options(&parsed, true);
+        let expected = "\
+  nodes:
+    - /axi/pcie@120000
+    - /axi/pcie@120000/rp1@0
+    - /axi/pcie@120000/rp1@0/ethernet@100000
+    - /axi/pcie@120000/rp1@0/gpio@d0000
+    - /axi/pcie@120000/rp1@0/pwm@98000
+    - /axi/pcie@120000/rp1@0/pwm@9c000
+    - /axi/pcie@120000/rp1@0/uart@30000
+    - /axi/pcie@120000/rp1@0/uart@34000
+    - /axi/pcie@120000/rp1@0/usb@200000
+    - /axi/pcie@120000/rp1@0/usb@200000/port@1
+    - /axi/pcie@120000/rp1@0/usb@300000
+warnings:";
+        assert!(
+            report.contains(expected),
+            "unexpected verbose report:\n{report}"
+        );
+    }
+
+    #[test]
+    fn rp1_readiness_keeps_pi5_classification() {
+        let parsed = synthetic_rp1_tree();
+        assert_eq!(classify_platform(&parsed), Platform::Rpi5Bcm2712);
+        assert!(render_yarm_readiness(&parsed).contains("platform: rpi5-bcm2712"));
+    }
+
+    #[test]
     fn malformed_headers_and_properties_return_errors() {
         assert!(parse_fdt(&[]).is_err());
         let mut bad_magic = vec![0; HEADER_LEN];
@@ -1162,6 +1362,73 @@ mod tests {
                 "missing report line: {expected}\n{report}"
             );
         }
+    }
+
+    fn synthetic_rp1_tree() -> ParsedFdt {
+        let mut parsed = parse_fdt(&synthetic_dtb()).expect("synthetic DTB parses");
+        parsed
+            .nodes
+            .iter_mut()
+            .find(|node| node.path == "/")
+            .unwrap()
+            .properties
+            .iter_mut()
+            .find(|property| property.name == "compatible")
+            .unwrap()
+            .value = b"raspberrypi,5-model-b\0brcm,bcm2712\0".to_vec();
+
+        let make_node = |path: &str, compatible: &str, marker: Option<&str>| Node {
+            path: path.into(),
+            name: path.rsplit('/').next().unwrap().into(),
+            properties: [
+                (!compatible.is_empty()).then(|| Property {
+                    name: "compatible".into(),
+                    value: format!("{compatible}\0").into_bytes(),
+                }),
+                marker.map(|name| Property {
+                    name: name.into(),
+                    value: Vec::new(),
+                }),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            parent_address_cells: 2,
+            parent_size_cells: 2,
+            address_cells: 2,
+            size_cells: 2,
+        };
+        // Deliberately use non-path order so rendering must sort the verbose list.
+        parsed.nodes.extend([
+            make_node("/axi/pcie@120000/rp1@0/usb@300000", "generic-xhci", None),
+            make_node("/axi/pcie@120000", "brcm,bcm2712-pcie", None),
+            make_node("/axi/pcie@120000/rp1@0/uart@34000", "arm,pl011", None),
+            make_node(
+                "/axi/pcie@120000/rp1@0/gpio@d0000",
+                "raspberrypi,rp1-gpio",
+                Some("gpio-controller"),
+            ),
+            make_node(
+                "/axi/pcie@120000/rp1@0/ethernet@100000",
+                "raspberrypi,rp1-ethernet",
+                None,
+            ),
+            make_node("/axi/pcie@120000/rp1@0", "raspberrypi,rp1", None),
+            make_node("/axi/pcie@120000/rp1@0/usb@200000/port@1", "usb-port", None),
+            make_node(
+                "/axi/pcie@120000/rp1@0/pwm@9c000",
+                "raspberrypi,rp1-pwm",
+                None,
+            ),
+            make_node("/axi/pcie@120000/rp1@0/uart@30000", "arm,pl011", None),
+            make_node("/axi/pcie@120000/rp1@0/usb@200000", "generic-xhci", None),
+            make_node(
+                "/axi/pcie@120000/rp1@0/pwm@98000",
+                "raspberrypi,rp1-pwm",
+                None,
+            ),
+        ]);
+        parsed
     }
 
     fn synthetic_dtb() -> Vec<u8> {
