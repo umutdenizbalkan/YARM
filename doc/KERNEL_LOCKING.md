@@ -12219,3 +12219,16 @@ smoke pinned `-smp 1`.
 
 Milestone 1 status: DECLARED (2026-06-12; all three smoke runs passed — see
 the milestone doc acceptance record).
+
+---
+
+# Stage 108 / Milestone 2 Pass 1 addendum
+
+Per-domain split-mut seams now exist for scheduler (rank 1), task/TCB
+(rank 2), VM/user-spaces (rank 5), and memory/frames (rank 6) in
+`runtime.rs` (M2_SEAM_HELPER_ONLY — no live callers yet; equivalence-tested).
+Together with the pre-existing fault/telemetry seams this completes the seam
+set the D2/D3/D6 lock-window conversions need. The x86_64 AP trampoline is
+split into `arch/x86_64/smp_trampoline.rs` (mechanical, zero behavior
+change); the AP still parks in assembly — the per-CPU AP environment is the
+remaining SMP blocker (`KERNEL_UNLOCKING_MILESTONE_2.md` §3).

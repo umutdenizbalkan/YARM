@@ -203,3 +203,16 @@ listed here with a status. If a type sits at **deferred** or **helper-only**
 for more than two stages without a live-wire plan, the next maintenance
 stage should either live-wire it or remove it. Long-lived helper-only types
 become noise and obscure the audit surface.
+
+---
+
+## 6.5 Stage 108 / Milestone 2 Pass 1 — split-mut seams + trampoline split
+
+| Item | Status (Stage 108) | Notes |
+|------|--------------------|-------|
+| `with_scheduler_split_mut` (rank 1) | **helper-only** (`M2_SEAM_HELPER_ONLY`) | Equivalence-tested vs global lock. Future caller: `local_dispatch_step_split` (D6). |
+| `with_task_tcbs_split_mut` (rank 2) | **helper-only** | Future caller: D2 blocked-state transition. |
+| `with_vm_user_spaces_split_mut` (rank 5) | **helper-only** | Future caller: `vm_brk_shrink_two_phase` Phase 1 (D3). |
+| `with_memory_split_mut` (rank 6) | **helper-only** | Future caller: D3 reclaim phase. |
+| `src/arch/x86_64/smp_trampoline.rs` | **live** (mechanical move, zero behavior change) | AI_AGENT_RULES §5.2 split complete. AP still parks in assembly — exact SMP blocker in `KERNEL_UNLOCKING_MILESTONE_2.md` §3. |
+| `yarm.loglevel=` knob | **live** (boot-cmdline capture chokepoint) | Default Info unchanged when absent/invalid. |

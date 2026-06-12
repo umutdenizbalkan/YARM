@@ -646,3 +646,18 @@ acceptance table. Declaring without smoke is a hard violation of §13.
 - D6: no per-CPU scheduler lock types until the x86_64 SMP trampoline split
   lands and D2/D3 are smoke-stable. `entering_tid`/`exiting_tid` remain
   Class F (authoritative read only).
+
+### 14.5 Stage 108 seam and knob rules
+
+- The Stage 108 split-mut seams (`with_scheduler_split_mut`,
+  `with_task_tcbs_split_mut`, `with_vm_user_spaces_split_mut`,
+  `with_memory_split_mut`) are M2_SEAM_HELPER_ONLY. Live-wiring any of them
+  requires its own PR + MUST_SMOKE run + deletion of the helper-only fence
+  in the same PR.
+- `yarm.loglevel=` may be used in verbose smoke runs; never change the
+  production default (Info), and never rely on Debug-level markers in
+  acceptance greps.
+- §5.2 is satisfied: the trampoline asm lives in
+  `arch/x86_64/smp_trampoline.rs`. §5.1 still stands: core smoke stays
+  `-smp 1` until the AP per-CPU environment exists and an SMP smoke is
+  genuinely accepted (no fake SMP acceptance).

@@ -27,6 +27,12 @@ pub enum LogLevel {
 }
 
 impl LogLevel {
+    /// Stage 108: public `from_u8` for the `yarm.loglevel=` boot-cmdline knob.
+    /// Same clamping as the private decoder (8+ ⇒ Debug).
+    pub const fn from_u8_public(raw: u8) -> Self {
+        Self::from_u8(raw)
+    }
+
     const fn from_u8(raw: u8) -> Self {
         match raw {
             0 => Self::Emerg,

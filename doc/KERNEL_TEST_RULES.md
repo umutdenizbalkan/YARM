@@ -5252,3 +5252,36 @@ notification-recv blocking path canonical.
 
 **Run:** `cargo test --lib stage106 -- --test-threads=1` and the full
 `cargo test --lib -- --test-threads=1`.
+
+---
+
+## Stage 108 / Milestone 2 Pass 1 — seams, loglevel knob, trampoline split
+
+**Test rules:**
+
+1. **Seams are helper-only.** The four Stage 108 split-mut seams must not be
+   called from `syscall.rs` or `arch/trap_entry.rs`
+   (`stage108_seams_are_helper_only_no_live_callers`, runtime-built needles
+   to avoid self-matching). Routing the Stage 106/107 typed helpers through
+   them is Milestone 2 Pass 2 work, one helper per PR, smoke-gated.
+2. **Seam equivalence is the routing contract.** The four
+   `stage108_*_seam_matches_global_*` tests prove seam reads/mutations are
+   indistinguishable from global-lock access. Keep them green across any
+   KernelState field reshuffle.
+3. **Loglevel default is load-bearing.**
+   `stage108_loglevel_rejects_invalid_values_keeping_default` and
+   `stage108_capture_applies_loglevel_then_restores_default_capture_does_not`
+   pin: absent/invalid `yarm.loglevel=` never touches the production
+   default (Info). A bare Linux-style `loglevel=` is ignored by namespace
+   rule.
+4. **Trampoline split fences.** `stage108_smp_trampoline_split_is_complete`
+   (asm lives only in `smp_trampoline.rs`; smoke pinned `QEMU_SMP=1`) and
+   `stage108_smp_ap_still_parks_in_assembly` (AP never enters Rust;
+   `start_secondary_cpus` returns Ok(0)). Removing either fence without the
+   AP per-CPU environment is a fake-SMP regression.
+
+**Test groups (Stage 108 — 12 tests):** 5 loglevel
+(`kernel::boot_command_line::tests`), 5 seams (`runtime::tests`), 2 SMP
+fences (`kernel::syscall::tests`).
+
+**Run:** `cargo test --lib stage108 -- --test-threads=1`.

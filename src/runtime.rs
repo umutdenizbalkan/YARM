@@ -428,6 +428,92 @@ impl SharedKernel {
         });
     }
 
+    // ── Stage 108 / Milestone 2 Pass 1: per-domain split-mut seams ────────────
+    //
+    // VALIDATION: M2_SEAM_HELPER_ONLY
+    // VALIDATION: FALLBACK_GLOBAL_LOCK
+    //
+    // The four seams the D3/D6 live unlocks need: scheduler (rank 1),
+    // task/TCB (rank 2), VM/user-spaces (rank 5), memory/frames (rank 6).
+    // Each acquires ONLY its own per-domain lock — never the outer
+    // SharedKernel lock — exactly like the fault/telemetry seams above. No
+    // live trap/syscall path calls these yet (test-enforced); the Stage
+    // 106/107 typed helpers (`publish_recv_waiter_live`,
+    // `vm_brk_shrink_two_phase`, `local_dispatch_step_split`) are the call
+    // sites a future pass will route through these seams.
+    //
+    // Lock-held assertion note: the wrapper itself acquires the domain lock
+    // and holds the guard across the closure, so a separate debug
+    // "lock-held" assertion would be tautological — the guard IS the proof.
+    // What a caller must NOT do is hold a lock of equal or lower rank when
+    // entering; that discipline is enforced by the hosted-dev
+    // YARM_LOCK_ORDER_WARN tracker (descending sequential pairs are logged)
+    // and by the per-seam doc comments.
+
+    /// Stage 108: scheduler (rank 1) split-mut seam.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_scheduler_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut SchedulerState) -> R,
+    ) -> R {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned
+        // by this SharedKernel. `scheduler_split_mut_ptr_from_raw` derives a
+        // raw field pointer without creating a whole-KernelState reference;
+        // the scheduler lock contains and serializes its own data.
+        let scheduler_lock =
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+        let scheduler_lock = unsafe { &*scheduler_lock };
+        let mut guard = scheduler_lock.lock();
+        f(&mut guard)
+    }
+
+    /// Stage 108: task/TCB (rank 2) split-mut seam.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_task_tcbs_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut [Option<crate::kernel::task::ThreadControlBlock>]) -> R,
+    ) -> R {
+        // SAFETY: same pattern as with_fault_split_mut — the task lock
+        // serializes access to the TCB array storage.
+        let (task_lock, tcbs) =
+            unsafe { KernelState::task_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let task_lock = unsafe { &*task_lock };
+        let _guard = task_lock.lock();
+        let tcbs = unsafe { &mut *tcbs };
+        f(kernel_mut(tcbs).as_mut_slice())
+    }
+
+    /// Stage 108: VM/user-spaces (rank 5) split-mut seam.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_vm_user_spaces_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::vm::AddressSpaceManager) -> R,
+    ) -> R {
+        // SAFETY: same pattern — the vm lock serializes user_spaces storage.
+        let (vm_lock, user_spaces) =
+            unsafe { KernelState::vm_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let vm_lock = unsafe { &*vm_lock };
+        let _guard = vm_lock.lock();
+        let user_spaces = unsafe { &mut *user_spaces };
+        f(kernel_mut(user_spaces))
+    }
+
+    /// Stage 108: memory/frame-allocator (rank 6) split-mut seam.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_memory_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::boot::MemorySubsystem) -> R,
+    ) -> R {
+        // SAFETY: same pattern — the memory lock serializes MemorySubsystem
+        // storage (memory objects + frame bookkeeping).
+        let (memory_lock, memory) =
+            unsafe { KernelState::memory_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let memory_lock = unsafe { &*memory_lock };
+        let _guard = memory_lock.lock();
+        let memory = unsafe { &mut *memory };
+        f(kernel_mut(memory))
+    }
+
     fn with_fault_split_read<R>(&self, f: impl FnOnce(&FaultSubsystem) -> R) -> R {
         // Stage 4T+5 split-read: acquires fault_state_lock (rank 8) only.
         // Does not acquire the outer SharedKernel lock. Does not mutate any state.
@@ -1849,5 +1935,130 @@ mod tests {
 
         // Adjacent path regression: an unrelated pid is still unregistered.
         assert!(!kernel.cnode_registered_split_read(999));
+    }
+    // ── Stage 108 / Milestone 2 Pass 1: split-mut seam equivalence tests ──────
+
+    #[test]
+    fn stage108_scheduler_seam_matches_global_current_cpu() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        // Equivalence via runnable count on CPU 0: enqueue a task globally,
+        // then observe the same runnable count through the seam.
+        kernel.with(|state| {
+            state.register_task(839).expect("register");
+            state.enqueue_current_cpu(839).expect("enqueue");
+        });
+        let global_count = kernel.with(|state| {
+            state.with_scheduler_state(|sched| {
+                crate::kernel::boot::kernel_ref(&sched.scheduler)
+                    .runnable_count_on(crate::kernel::scheduler::CpuId(0))
+            })
+        });
+        let seam_count = kernel.with_scheduler_split_mut(|sched| {
+            crate::kernel::boot::kernel_ref(&sched.scheduler)
+                .runnable_count_on(crate::kernel::scheduler::CpuId(0))
+        });
+        assert_eq!(seam_count, global_count);
+        assert!(seam_count >= 1, "enqueued task visible through the seam");
+    }
+
+    #[test]
+    fn stage108_task_seam_matches_global_tcb_view() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| state.register_task(840).expect("register"));
+        let global_present = kernel.with(|state| state.task_status(840).is_some());
+        let seam_present = kernel.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter().flatten().any(|tcb| tcb.tid.0 == 840)
+        });
+        assert_eq!(seam_present, global_present);
+        assert!(seam_present, "registered TCB must be visible through the seam");
+        // Mutation through the seam is visible to the global view.
+        kernel.with_task_tcbs_split_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == 840) {
+                tcb.ipc_timeout_fired = true;
+            }
+        });
+        let global_fired = kernel.with(|state| {
+            state
+                .consume_ipc_timeout_fired_for_tid(840)
+                .expect("consume")
+        });
+        assert!(global_fired, "seam mutation must be visible under the global lock");
+    }
+
+    #[test]
+    fn stage108_vm_seam_matches_global_mapping_view() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let (asid, map_cap) = kernel.with(|state| {
+            let (asid, map_cap) = state.create_user_address_space().expect("asid");
+            state
+                .map_user_page(
+                    map_cap,
+                    crate::kernel::vm::VirtAddr(0x5000),
+                    crate::kernel::vm::Mapping {
+                        phys: crate::kernel::vm::PhysAddr(0x9000),
+                        flags: crate::kernel::vm::PageFlags::USER_RW,
+                    },
+                )
+                .expect("map page");
+            (asid, map_cap)
+        });
+        let _ = map_cap;
+        let global_mapped = kernel.with(|state| {
+            state
+                .is_user_page_mapped_in_asid(asid, crate::kernel::vm::VirtAddr(0x5000))
+                .expect("mapped query")
+        });
+        let seam_mapped = kernel.with_vm_user_spaces_split_mut(|spaces| {
+            spaces
+                .get_mut(asid)
+                .map(|aspace| aspace.resolve(crate::kernel::vm::VirtAddr(0x5000)).is_some())
+                .unwrap_or(false)
+        });
+        assert_eq!(seam_mapped, global_mapped);
+        assert!(seam_mapped, "mapping must be visible through the VM seam");
+    }
+
+    #[test]
+    fn stage108_memory_seam_matches_global_object_count() {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state.alloc_anonymous_memory_object().expect("alloc");
+        });
+        let global_count = kernel.with(|state| {
+            state.with_memory_state(|memory| memory.memory_objects.iter().flatten().count())
+        });
+        let seam_count = kernel
+            .with_memory_split_mut(|memory| memory.memory_objects.iter().flatten().count());
+        assert_eq!(seam_count, global_count);
+        assert!(seam_count >= 1);
+    }
+
+    #[test]
+    fn stage108_seams_are_helper_only_no_live_callers() {
+        // M2_SEAM_HELPER_ONLY: the four Stage 108 seams must not be called
+        // from any live trap/syscall path yet.
+        let syscall_src = include_str!("kernel/syscall.rs");
+        let trap_entry_src = include_str!("arch/trap_entry.rs");
+        // Build needles at runtime so doc/test mentions of the names in other
+        // files' test modules cannot self-match.
+        let names = [
+            ["with_scheduler_", "split_mut("].concat(),
+            ["with_task_tcbs_", "split_mut("].concat(),
+            ["with_vm_user_spaces_", "split_mut("].concat(),
+            ["with_memory_", "split_mut("].concat(),
+        ];
+        for name in &names {
+            assert!(
+                !syscall_src.contains(name.as_str()),
+                "{name} must not be called from syscall.rs (Stage 108 seams are helper-only)"
+            );
+            assert!(
+                !trap_entry_src.contains(name.as_str()),
+                "{name} must not be called from trap_entry.rs"
+            );
+        }
+        // Labels present.
+        let runtime_src = include_str!("runtime.rs");
+        assert!(runtime_src.contains("VALIDATION: M2_SEAM_HELPER_ONLY"));
     }
 }
