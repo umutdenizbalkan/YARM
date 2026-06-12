@@ -114,23 +114,20 @@ No types are flagged as **obsolete** at Stage 101.
 
 ---
 
-## 6.3 Stage 105 / Pass 2 — D2 IPC recv blocking precursor (helper-only)
+## 6.3 Stage 106 / Pass 3 — D2 IPC recv blocking split (LIVE)
 
-New module `src/kernel/recv_waiter_split.rs` exposes Phase 1 of the D2 split
-as helper-only scaffold:
+`src/kernel/recv_waiter_split.rs` + `KernelState::publish_recv_waiter_live`:
 
-| Type / fn | Status (Stage 105) | Notes |
+| Type / fn | Status (Stage 106) | Notes |
 |-----------|--------------------|-------|
-| `PublishWaiterPlan` | **helper-only** (`D2_HELPER_ONLY` / `D2_DEFAULT_OFF`) | Phase 1 plan: endpoint_idx, receiver_tid, recv_cap. |
-| `PublishWaiterOutcome` | **helper-only** | `Published` / `ReceiverAlreadyWaiting` / `QueueNonEmpty` / `InvalidEndpoint`. |
-| `try_publish_recv_waiter` | **helper-only** | Single rank-3 critical section; decides outcome and writes `endpoint_waiters[idx]` atomically. |
-| `KernelState::try_publish_recv_waiter_audit_only` | **helper-only** | Kernel-side primitive. Source-scan asserts no live-path caller. |
+| `PublishWaiterPlan` | **live-adjacent** | Phase 1 plan type (used by the helper API). |
+| `PublishWaiterOutcome` | **live** | Consumed by the live call site in `block_current_on_receive_with_deadline`. |
+| `KernelState::publish_recv_waiter_live` | **LIVE** (`D2_LIVE_SPLIT`) | Atomic queue-recheck + waiter publish, one rank-3 critical section; overwrite semantics preserved; `QueueNonEmpty` steers the no-lost-wakeup unwind. Telemetry: `d2_recv_waiter_publishes`, `d2_publish_race_unwinds`. |
+| `try_publish_recv_waiter` / `try_publish_recv_waiter_audit_only` | **helper-only** | Stage 105 strict-single-waiter variant (refuses on existing waiter); retained for the future design study; no live caller (test-enforced). |
 
-The canonical `block_current_on_receive_with_deadline` already orders
-scheduler block (rank 1) → TCB transition (rank 2) → publish (rank 3)
-sequentially with no nested locks; D2's live unlock replaces the single
-`&mut KernelState` body with three SharedKernel split-mut closures. Pass 3
-prerequisites in audit doc §15.4.
+**NOT SMOKE-ACCEPTED** until the Milestone 1 checklist runs
+(`KERNEL_UNLOCKING_MILESTONE_1.md`). The notification-recv blocking path and
+sender-side blocking remain canonical (FALLBACK_GLOBAL_LOCK).
 
 ## 6.4 Stage 105 / Pass 2 — D5 reply-cap split status (LIVE for non-shared-region reply arm)
 

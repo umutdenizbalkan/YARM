@@ -12194,3 +12194,28 @@ No new kernel locks, interior mutability, or concurrent access paths are introdu
 - `handle_request` still rejects shared opcodes
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false` (unchanged)
 - 436 yarm-fs-servers tests pass (412 prior + 24 Stage 85)
+
+---
+
+# Stage 106 / Kernel Unlocking Pass 3 addendum
+
+Live split paths as of Stage 106 (full record:
+`doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md` §13/§14/§18 and
+`doc/KERNEL_UNLOCKING_MILESTONE_1.md`):
+
+- **D1 (Stage 104):** recv-side transfer-cap materialization routed through
+  `cap_transfer_split` Phase A (ipc 3 → cap 4 read) / Phase B (cap 4 mutate).
+- **D5 (Stage 105):** reply-cap materialization Phase A/B/B' with fallible
+  `try_set_reply_cap_waiter_cap` (ipc 3) + mint rollback on stale.
+- **D2 (Stage 106):** endpoint blocking-recv waiter publish via
+  `publish_recv_waiter_live` — atomic queue-recheck + publish in one ipc(3)
+  critical section; phase order block(1) → TCB(2) → publish(3) → dispatch;
+  `QueueNonEmpty` drives the no-lost-wakeup unwind.
+
+Gates still in force: D3 structural shootdown-before-reclaim order is
+UAF-load-bearing (`execute_tlb_shootdown_wait_plan`); D6 per-CPU scheduler
+locking not started — `entering_tid`/`exiting_tid` remain Class F; x86_64
+smoke pinned `-smp 1`.
+
+Milestone 1 status: PREPARED — NOT DECLARED (smoke checklist pending; see
+the milestone doc).

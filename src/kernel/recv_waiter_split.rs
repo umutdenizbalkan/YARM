@@ -1,35 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! D2 IPC recv blocking precursor — helper-only / no live wiring (Stage 105).
+//! D2 IPC recv blocking split — typed waiter-publish engine (Stage 105
+//! scaffold; Stage 106 / Pass 3 live-wired into the canonical blocking-recv
+//! path).
 //!
-//! VALIDATION: D2_HELPER_ONLY
-//! VALIDATION: D2_DEFAULT_OFF
-//! VALIDATION: FALLBACK_GLOBAL_LOCK
+//! VALIDATION: D2_LIVE_SPLIT — `KernelState::publish_recv_waiter_live` is
+//! called from `block_current_on_receive_with_deadline` (the canonical
+//! endpoint blocking-recv path) since Stage 106. The live primitive performs
+//! the atomic queue-recheck + waiter publish in one rank-3 critical section
+//! and steers the no-lost-wakeup unwind via
+//! [`PublishWaiterOutcome::QueueNonEmpty`].
+//! VALIDATION: FALLBACK_GLOBAL_LOCK — the notification-recv blocking path,
+//! sender-waiter handling, mapped/shared receive, and every non-endpoint
+//! blocking case keep their existing canonical code, unchanged.
 //!
-//! D2's goal is to split the IPC recv blocking path so the **scheduler block**
-//! (rank 1) runs in its own narrow lock window, with the IPC waiter
-//! registration (rank 3) and TCB transition (rank 2) preceding it
-//! sequentially. The current canonical implementation
-//! (`KernelState::block_current_on_receive_with_deadline`) already orders the
-//! three steps as **scheduler→task→IPC** sequentially (no nested locks); the
-//! D2 live unlock would replace the single `&mut KernelState` body with three
-//! SharedKernel split-mut closures so other CPUs holding scheduler / task /
-//! IPC locks can progress concurrently.
+//! NOT SMOKE-ACCEPTED: the Stage 106 live wiring was developed without QEMU.
+//! Per MUST_SMOKE (`doc/AI_AGENT_RULES.md §13`) the branch requires x86_64
+//! `-smp 1` core smoke and optional-FS strict smoke before merge acceptance.
 //!
-//! ## Why D2 is helper-only at Stage 105
+//! ## Live vs audit primitives
 //!
-//! - The SharedKernel split-mut seam for `block_current_cpu` (rank 1) does not
-//!   exist yet; D1 / D5 don't need it because they don't touch the scheduler.
-//! - MUST_SMOKE (`doc/AI_AGENT_RULES.md §13`) triggers on any change to
-//!   `entering_tid` / `exiting_tid` / scheduler block-wake behavior. Stage
-//!   105 was developed without QEMU.
-//!
-//! So Stage 105 lands the **no-lost-wakeup audit** as a typed helper that the
-//! canonical path could optionally use (today: no callers), plus
-//! equivalence-style unit tests that prove the published-waiter→sender-enqueue
-//! invariant under the existing sequential ordering. Pass 3 may live-wire
-//! this scaffold when QEMU smoke is available.
+//! - [`KernelState::publish_recv_waiter_live`] (Stage 106, **live**):
+//!   overwrite semantics for a pre-existing waiter — byte-identical to the
+//!   pre-Stage-106 unconditional `endpoint_waiters[idx] = Some(tid)` write —
+//!   plus the `QueueNonEmpty` race steer. Never returns
+//!   `ReceiverAlreadyWaiting`.
+//! - [`KernelState::try_publish_recv_waiter_audit_only`] (Stage 105,
+//!   helper-only): refuses on a pre-existing waiter. Retained for the future
+//!   strict-single-waiter design study; not on any live path.
 //!
 //! ## The no-lost-wakeup invariant (D2 contract)
 //!
@@ -60,7 +59,7 @@
 //!    will dequeue. Until then, the receiver is asleep on the
 //!    `EndpointReceive` wait reason, which the kernel wake path keys on.
 //!
-//! The audit type [`PublishWaiterPlan`] captures the data needed to perform
+//! The plan type [`PublishWaiterPlan`] captures the data needed to perform
 //! step (1) without holding any non-IPC lock; the helper
 //! [`try_publish_recv_waiter`] performs the mutation under `ipc_state_lock`
 //! alone and returns a typed [`PublishWaiterOutcome`] indicating whether the
@@ -68,8 +67,18 @@
 //! receiver should not block — it should dequeue right now and return the
 //! message instead).
 //!
-//! Stage 105 binds none of this to a live path. The helper exists so Pass 3
-//! has a typed, equivalence-tested foundation to build on.
+//! ## The Stage 106 live unwind (QueueNonEmpty after scheduler block)
+//!
+//! In the live path, the publish runs AFTER `block_current_cpu` (rank 1) and
+//! the TCB transition (rank 2). When the live primitive reports
+//! `QueueNonEmpty` (sender enqueued between the caller's Phase-1 empty
+//! dequeue and this publish — unreachable while the global lock spans both,
+//! mandatory once the SharedKernel seam splits the borrow), the caller must
+//! NOT remain blocked. The unwind in
+//! `block_current_on_receive_with_deadline` restores the task via
+//! `wake_tid_to_runnable` (which also clears the staged deadline) and
+//! returns, so the caller's Phase-2 dequeue drains the raced message.
+//! Telemetry: `d2_publish_race_unwinds` (always 0 pre-seam-split).
 
 use crate::kernel::boot::KernelState;
 use crate::kernel::capabilities::{CapId, CapObject};
@@ -242,33 +251,282 @@ mod tests {
         assert_eq!(outcome, PublishWaiterOutcome::InvalidEndpoint);
     }
 
+    // ── Stage 106 / Pass 3: D2 live-wire tests ────────────────────────────────
+
     #[test]
-    fn stage105_d2_helper_only_not_called_by_live_paths() {
-        // Source-scan invariant: the D2 helper must NOT be referenced from
-        // any live syscall/runtime path. Stage 105 lands it as scaffold only.
+    fn stage106_d2_live_wire_call_site_present() {
+        // Replaces the Stage 105 helper-only assertion: the live primitive
+        // must be called from the canonical blocking-recv path, and the
+        // canonical publish must now route through it.
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        assert!(
+            ipc_src.contains("fn publish_recv_waiter_live"),
+            "live primitive must exist in ipc_state.rs"
+        );
+        assert!(
+            ipc_src.contains("self.publish_recv_waiter_live(endpoint_idx, ThreadId(blocked_tid), recv_cap)"),
+            "block_current_on_receive_with_deadline must route the publish through the live primitive"
+        );
+        assert!(
+            ipc_src.contains("D2_PUBLISH_RACE_UNWIND"),
+            "the no-lost-wakeup unwind branch must exist"
+        );
+        // The audit-only primitive stays helper-only (no syscall/runtime use).
         let syscall_src = include_str!("syscall.rs");
         let runtime_src = include_str!("../runtime.rs");
-        for name in [
-            "try_publish_recv_waiter",
-            "PublishWaiterPlan",
-            "PublishWaiterOutcome",
-        ] {
+        for name in ["try_publish_recv_waiter", "try_publish_recv_waiter_audit_only"] {
             assert!(
                 !syscall_src.contains(name),
-                "{name} must not appear in syscall.rs (Stage 105 D2 is helper-only)"
+                "{name} must not appear in syscall.rs"
             );
             assert!(
                 !runtime_src.contains(name),
-                "{name} must not appear in runtime.rs (Stage 105 D2 is helper-only)"
+                "{name} must not appear in runtime.rs"
             );
         }
     }
 
     #[test]
-    fn stage105_d2_validation_labels_present() {
+    fn stage106_d2_validation_labels_present() {
         let src = include_str!("recv_waiter_split.rs");
-        assert!(src.contains("VALIDATION: D2_HELPER_ONLY"));
-        assert!(src.contains("VALIDATION: D2_DEFAULT_OFF"));
+        assert!(src.contains("VALIDATION: D2_LIVE_SPLIT"));
         assert!(src.contains("VALIDATION: FALLBACK_GLOBAL_LOCK"));
+        assert!(
+            src.contains("NOT SMOKE-ACCEPTED"),
+            "module must carry the not-smoke-accepted disclosure until smoke runs"
+        );
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        assert!(
+            ipc_src.contains("VALIDATION: D2_LIVE_SPLIT"),
+            "live call site must carry the D2_LIVE_SPLIT label"
+        );
+    }
+
+    #[test]
+    fn stage106_d2_blocked_recv_publishes_waiter_and_counts_telemetry() {
+        // Blocked endpoint recv must publish the waiter through the live
+        // primitive (telemetry proves routing) and stage the deadline.
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(42).expect("task");
+        state.enqueue_current_cpu(42).expect("enqueue");
+        state.dispatch_next_task().expect("dispatch");
+        state.idle_re_enqueue_for_test().expect("idle");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+
+        assert_eq!(state.ipc_path_telemetry().d2_recv_waiter_publishes, 0);
+        let result = state.ipc_recv(recv_cap).expect("blocking recv");
+        assert!(result.is_none(), "empty endpoint recv blocks (returns None)");
+        let telem = state.ipc_path_telemetry();
+        assert_eq!(
+            telem.d2_recv_waiter_publishes, 1,
+            "blocked recv must publish through the live primitive"
+        );
+        assert_eq!(
+            telem.d2_publish_race_unwinds, 0,
+            "no race unwind under the serialized global lock"
+        );
+    }
+
+    #[test]
+    fn stage106_d2_sender_after_waiter_delivers_and_wakes() {
+        // sender-after-waiter: receiver (tid 0) blocks — waiter published via
+        // the live primitive — then a sender (tid 1) delivers; the waiter is
+        // consumed and the receiver becomes Runnable. Mirrors the canonical
+        // recv_on_empty_endpoint_blocks_then_send_wakes pattern with the new
+        // D2 telemetry assertions.
+        use crate::kernel::task::{TaskStatus, WaitReason};
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(2).expect("endpoint");
+        let endpoint_obj = state
+            .current_task_capability(recv_cap)
+            .expect("recv cap")
+            .object;
+        let send_cap_task1 = state
+            .grant_capability_task_to_task(0, send_cap, 1)
+            .expect("dup send cap to task1");
+
+        assert_eq!(state.ipc_path_telemetry().d2_recv_waiter_publishes, 0);
+        let blocked = state.ipc_recv(recv_cap).expect("blocking recv");
+        assert!(blocked.is_none());
+        assert_eq!(
+            state.task_status(0),
+            Some(TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap)))
+        );
+        assert_eq!(
+            state.ipc_path_telemetry().d2_recv_waiter_publishes,
+            1,
+            "blocked recv must publish through the live primitive"
+        );
+        assert_eq!(state.endpoint_waiter_tid(endpoint_obj), Some(ThreadId(0)));
+
+        // Sender arrives after the publish (current task is now tid 1).
+        let msg = crate::kernel::ipc::Message::new(1, b"after").expect("msg");
+        state.ipc_send(send_cap_task1, msg).expect("send wakes waiter");
+        assert_eq!(
+            state.task_status(0),
+            Some(TaskStatus::Runnable),
+            "sender-after-waiter must wake the published waiter"
+        );
+        assert_eq!(
+            state.endpoint_waiter_tid(endpoint_obj),
+            None,
+            "the published waiter must be consumed by the wake path"
+        );
+    }
+
+    #[test]
+    fn stage106_d2_sender_before_waiter_dequeues_without_publish() {
+        // sender-before-waiter: message already queued; recv dequeues
+        // immediately; the publish never happens (telemetry stays 0).
+        let mut state = Bootstrap::init().expect("init");
+        let (_eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let msg = crate::kernel::ipc::Message::new(0, b"before").expect("msg");
+        state.ipc_send(send_cap, msg).expect("send");
+
+        let got = state.ipc_recv(recv_cap).expect("recv");
+        assert!(got.is_some(), "queued message must be dequeued immediately");
+        assert_eq!(got.unwrap().as_slice(), b"before");
+        assert_eq!(
+            state.ipc_path_telemetry().d2_recv_waiter_publishes,
+            0,
+            "immediate dequeue must not publish a waiter"
+        );
+    }
+
+    #[test]
+    fn stage106_d2_no_lost_wakeup_unwind_sequence_drains_message() {
+        // Executable no-lost-wakeup proof for the future-split race branch:
+        // manually replicate the exact unwind sequence the live path performs
+        // when publish_recv_waiter_live returns QueueNonEmpty after the
+        // scheduler block. The message must be drained, the task must be
+        // runnable, and no waiter may remain published.
+        use crate::kernel::task::TaskStatus;
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register sender task");
+        state.enqueue_current_cpu(1).expect("queue sender");
+        let (_eid, send_cap, recv_cap) = fresh_endpoint(&mut state);
+        let idx = endpoint_index(&state, recv_cap);
+        let endpoint_obj = state
+            .current_task_capability(recv_cap)
+            .expect("recv cap")
+            .object;
+        let send_cap_task1 = state
+            .grant_capability_task_to_task(0, send_cap, 1)
+            .expect("dup send cap to task1");
+
+        // Step 1 (receiver tid 0, rank 1): scheduler block + dispatch so the
+        // sender task becomes current (mirrors the live block→dispatch).
+        let blocked_tid = state.block_current_cpu().expect("block");
+        assert_eq!(blocked_tid, 0);
+        state.dispatch_next_task().expect("dispatch to sender");
+        assert_eq!(state.current_tid(), Some(1));
+
+        // Step 2 (sender tid 1): racing send lands AFTER the block but
+        // BEFORE the publish — exactly the window the unwind handles. No
+        // waiter is published yet, so the message goes to the queue.
+        let msg = crate::kernel::ipc::Message::new(1, b"raced").expect("msg");
+        state.ipc_send(send_cap_task1, msg).expect("racing send");
+        assert_eq!(state.endpoint_waiter_tid(endpoint_obj), None);
+
+        // Step 3 (receiver, rank 3): publish observes the non-empty queue.
+        let outcome = state.publish_recv_waiter_live(idx, ThreadId(0), recv_cap);
+        assert_eq!(
+            outcome,
+            PublishWaiterOutcome::QueueNonEmpty,
+            "publish must detect the raced enqueue"
+        );
+        assert_eq!(
+            state.endpoint_waiter_tid(endpoint_obj),
+            None,
+            "no waiter may be published on the race branch"
+        );
+
+        // Step 4 (receiver): unwind — wake back to runnable, exactly what the
+        // live path's QueueNonEmpty branch does via wake_tid_to_runnable.
+        state
+            .wake_tid_to_runnable_for_test(ThreadId(0))
+            .expect("unwind wake");
+        assert_eq!(
+            state.task_status(0),
+            Some(TaskStatus::Runnable),
+            "unwound receiver must be runnable (it will re-run Phase-2 dequeue)"
+        );
+
+        // Step 5: the raced message is in the queue, the receiver is
+        // runnable: drained on its next dequeue. Prove the drain by granting
+        // the recv cap to the current task and dequeuing — message NOT lost.
+        let recv_cap_task1 = state
+            .grant_capability_task_to_task(0, recv_cap, 1)
+            .expect("dup recv cap");
+        let got = state.ipc_recv(recv_cap_task1).expect("drain");
+        assert!(got.is_some(), "raced message must be drained, not lost");
+        assert_eq!(got.unwrap().as_slice(), b"raced");
+        // Telemetry contract: this manual replication did not go through the
+        // live unwind branch, so the counter stays 0 here; the live branch is
+        // covered by the source-scan + the counter's existence.
+        assert_eq!(state.ipc_path_telemetry().d2_recv_waiter_publishes, 0);
+    }
+
+    #[test]
+    fn stage106_d2_timeout_deadline_staged_through_live_publish_fires() {
+        // Deadline staging must survive the new publish path: a recv with a
+        // deadline blocks (publish via the live primitive), and the canonical
+        // deadline processor fires the staged deadline at the deadline tick,
+        // waking the task with ipc_timeout_fired set and the waiter cleared.
+        // (The canonical expiry comparison fires on tick == deadline; the
+        // pre-deadline behavior is the canonical wrapping comparison and is
+        // intentionally untouched by D2.)
+        use crate::kernel::task::TaskStatus;
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("register task 1");
+        state.enqueue_current_cpu(1).expect("queue task 1");
+        let (_eid, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        let endpoint_obj = state
+            .current_task_capability(recv_cap)
+            .expect("recv cap")
+            .object;
+
+        let deadline_tick = 10u64;
+        let blocked = state
+            .ipc_recv_until_deadline(recv_cap, deadline_tick)
+            .expect("recv with deadline");
+        assert!(blocked.is_none());
+        assert_eq!(
+            state.ipc_path_telemetry().d2_recv_waiter_publishes,
+            1,
+            "deadline recv must publish through the live primitive"
+        );
+        assert_eq!(state.endpoint_waiter_tid(endpoint_obj), Some(ThreadId(0)));
+
+        // Deadline tick: the blocked receiver fires; waiter slot cleared;
+        // task runnable with ipc_timeout_fired staged for the recv return.
+        let fired = state
+            .process_ipc_timeout_deadlines(deadline_tick)
+            .expect("deadline tick");
+        assert_eq!(fired, 1, "deadline must fire at the staged tick");
+        assert_eq!(
+            state.endpoint_waiter_tid(endpoint_obj),
+            None,
+            "expired waiter must be cleared from the endpoint slot"
+        );
+        assert_eq!(state.task_status(0), Some(TaskStatus::Runnable));
+    }
+
+    fn fresh_endpoint(state: &mut KernelState) -> (usize, CapId, CapId) {
+        let (eid, send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        (eid, send_cap, recv_cap)
+    }
+
+    fn endpoint_index(state: &KernelState, recv_cap: CapId) -> usize {
+        match state
+            .current_task_capability(recv_cap)
+            .expect("recv cap")
+            .object
+        {
+            CapObject::Endpoint { index, .. } => index,
+            other => panic!("expected Endpoint, got {other:?}"),
+        }
     }
 }
