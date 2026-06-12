@@ -136,6 +136,77 @@ impl KernelState {
         }
     }
 
+    // ── Stage 108 / Milestone 2 Pass 1: split-mut seam pointer projectors ─────
+    //
+    // VALIDATION: M2_SEAM_HELPER_ONLY — these four projectors complete the
+    // per-domain seam set for the ranks the D3/D6 unlocks need: scheduler
+    // (rank 1), task/TCB (rank 2), VM/user-spaces (rank 5), memory/frames
+    // (rank 6). They follow the exact fault/telemetry pattern above: derive
+    // raw field pointers via addr_of!/addr_of_mut! without forming a
+    // reference to the whole KernelState. The corresponding lock serializes
+    // access; the seam wrapper in runtime.rs acquires it before touching the
+    // data, so the lock guard IS the held-assertion (same argument as the
+    // Stage 101 §6.2 audit — a separate debug "is the lock held?" check would
+    // be redundant with the guard the wrapper itself holds).
+
+    /// Stage 108: scheduler (rank 1) seam projector. Unlike the
+    /// `lock + storage` pairs, `scheduler_state` is a `SpinLockIrq` that
+    /// CONTAINS its data, so a single lock pointer is sufficient.
+    pub(crate) unsafe fn scheduler_split_mut_ptr_from_raw(
+        state: *mut KernelState,
+    ) -> *const crate::kernel::lock::SpinLockIrq<SchedulerState> {
+        // SAFETY: see module pattern note above.
+        unsafe { core::ptr::addr_of!((*state).scheduler_state) }
+    }
+
+    /// Stage 108: task/TCB (rank 2) seam projector.
+    pub(crate) unsafe fn task_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<[Option<ThreadControlBlock>; MAX_TASKS]>,
+    ) {
+        // SAFETY: see module pattern note above.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).task_state_lock),
+                core::ptr::addr_of_mut!((*state).tcbs),
+            )
+        }
+    }
+
+    /// Stage 108: VM/user-spaces (rank 5) seam projector.
+    pub(crate) unsafe fn vm_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<AddressSpaceManager>,
+    ) {
+        // SAFETY: see module pattern note above.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).vm_state_lock),
+                core::ptr::addr_of_mut!((*state).user_spaces),
+            )
+        }
+    }
+
+    /// Stage 108: memory/frame-allocator (rank 6) seam projector.
+    pub(crate) unsafe fn memory_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<MemorySubsystem>,
+    ) {
+        // SAFETY: see module pattern note above.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).memory_state_lock),
+                core::ptr::addr_of_mut!((*state).memory),
+            )
+        }
+    }
+
     /// Stage 4T+7 split-read: look up the ASID bound to `tid` under only the
     /// task lock (rank 2). Returns `0` if the task is not found or has no ASID.
     ///

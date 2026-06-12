@@ -81,9 +81,24 @@ impl BootCommandLine {
 static BOOT_COMMAND_LINE: SpinLock<BootCommandLine> = SpinLock::new(BootCommandLine::absent());
 
 pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
-    let mut command_line = BOOT_COMMAND_LINE.lock();
-    command_line.set_raw_cmdline_from_bytes(source);
-    *command_line
+    let captured = {
+        let mut command_line = BOOT_COMMAND_LINE.lock();
+        command_line.set_raw_cmdline_from_bytes(source);
+        *command_line
+    };
+    // Stage 108 / Milestone 2 Pass 1: apply the `yarm.loglevel=` observability
+    // knob at capture time. This is the single chokepoint every arch boot path
+    // (x86_64, AArch64, RISC-V) routes through, so no arch boot file needs to
+    // change. The knob is applied ONLY when present and valid; otherwise the
+    // console loglevel keeps its production default (Info). The
+    // `BootCommandLine` storage itself stays policy-neutral.
+    if let Some(level) = parse_yarm_boot_options(captured.raw_cmdline()).console_loglevel {
+        crate::kernel::printk::set_console_loglevel(
+            crate::kernel::printk::LogLevel::from_u8_public(level),
+        );
+        crate::yarm_log!("YARM_LOGLEVEL_SET level={}", level);
+    }
+    captured
 }
 
 pub fn boot_command_line() -> BootCommandLine {
@@ -111,9 +126,30 @@ pub enum BootPhase {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct YarmBootOptions<'a> {
     pub manifest_path: Option<&'a [u8]>,
-    pub platform: PlatformOption,
-    pub boot_phase: BootPhase,
-    pub max_cpus: Option<usize>,
+    /// Stage 108 / Milestone 2 Pass 1: `yarm.loglevel=` observability knob.
+    ///
+    /// Accepts a printk level as a digit `0`–`7` or a name
+    /// (`emerg|alert|crit|err|warn|notice|info|debug`). `None` when the key
+    /// is absent or the value is invalid — the console loglevel is then left
+    /// at its production default (Info). The knob can only be applied at
+    /// boot-cmdline capture time; it never changes the default.
+    pub console_loglevel: Option<u8>,
+}
+
+/// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
+fn parse_loglevel_value(value: &[u8]) -> Option<u8> {
+    match value {
+        [d @ b'0'..=b'7'] => Some(d - b'0'),
+        b"emerg" => Some(0),
+        b"alert" => Some(1),
+        b"crit" => Some(2),
+        b"err" => Some(3),
+        b"warn" => Some(4),
+        b"notice" => Some(5),
+        b"info" => Some(6),
+        b"debug" => Some(7),
+        _ => None,
+    }
 }
 
 /// Parses YARM-owned `key=value` tokens without applying any boot policy.
@@ -159,6 +195,13 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
                 }
             }
             _ => {}
+        }
+        if key == b"yarm.loglevel" {
+            // Invalid values leave the option unset (last-wins only among
+            // valid values would deviate from the manifest key's last-wins
+            // semantics, so mirror those exactly: last token wins, and an
+            // invalid last token clears back to None).
+            options.console_loglevel = parse_loglevel_value(value);
         }
     }
     options
@@ -274,6 +317,83 @@ mod tests {
             b"yarm.manifest=/boot/first.txt yarm.unknown=x yarm.manifest=/boot/last.txt",
         );
         assert_eq!(parsed.manifest_path, Some(b"/boot/last.txt".as_slice()));
+    }
+
+    #[test]
+    fn stage108_loglevel_parses_digits_and_names() {
+        for (raw, expected) in [
+            (b"yarm.loglevel=0".as_slice(), Some(0u8)),
+            (b"yarm.loglevel=7".as_slice(), Some(7)),
+            (b"yarm.loglevel=debug".as_slice(), Some(7)),
+            (b"yarm.loglevel=info".as_slice(), Some(6)),
+            (b"yarm.loglevel=warn".as_slice(), Some(4)),
+            (b"yarm.loglevel=emerg".as_slice(), Some(0)),
+        ] {
+            assert_eq!(
+                parse_yarm_boot_options(raw).console_loglevel,
+                expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage108_loglevel_rejects_invalid_values_keeping_default() {
+        for raw in [
+            b"yarm.loglevel=8".as_slice(),
+            b"yarm.loglevel=99".as_slice(),
+            b"yarm.loglevel=".as_slice(),
+            b"yarm.loglevel=verbose".as_slice(),
+            b"yarm.loglevel=-1".as_slice(),
+            b"loglevel=7".as_slice(), // non-yarm namespace ignored
+            b"console=ttyS0 rdinit=/init".as_slice(), // absent
+        ] {
+            assert_eq!(
+                parse_yarm_boot_options(raw).console_loglevel,
+                None,
+                "{raw:?} must leave the production default untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn stage108_loglevel_last_token_wins_including_invalid() {
+        // Mirrors yarm.manifest semantics exactly: last token wins, and an
+        // invalid last token clears back to None (production default).
+        let parsed = parse_yarm_boot_options(b"yarm.loglevel=debug yarm.loglevel=3");
+        assert_eq!(parsed.console_loglevel, Some(3));
+        let parsed = parse_yarm_boot_options(b"yarm.loglevel=3 yarm.loglevel=bogus");
+        assert_eq!(parsed.console_loglevel, None);
+    }
+
+    #[test]
+    fn stage108_loglevel_does_not_disturb_manifest_parsing() {
+        // RPi5 Stage1 / existing cmdline-semantics preservation: the new key
+        // must not interfere with yarm.manifest or any non-yarm token.
+        let parsed = parse_yarm_boot_options(
+            b"console=ttyAMA0 yarm.loglevel=debug yarm.manifest=/boot/services-core.txt",
+        );
+        assert_eq!(
+            parsed.manifest_path,
+            Some(b"/boot/services-core.txt".as_slice())
+        );
+        assert_eq!(parsed.console_loglevel, Some(7));
+    }
+
+    #[test]
+    fn stage108_capture_applies_loglevel_then_restores_default_capture_does_not() {
+        use crate::kernel::printk::{LogLevel, console_loglevel, set_console_loglevel};
+        // Capture WITH the knob: console loglevel changes.
+        let _ = set_raw_cmdline_from_bytes(b"console=ttyS0 yarm.loglevel=debug");
+        assert_eq!(console_loglevel(), LogLevel::Debug);
+        // Restore default, then capture WITHOUT the knob: default untouched.
+        set_console_loglevel(LogLevel::Info);
+        let _ = set_raw_cmdline_from_bytes(b"console=ttyS0 rdinit=/init");
+        assert_eq!(
+            console_loglevel(),
+            LogLevel::Info,
+            "absent knob must leave the production default unchanged"
+        );
     }
 
     #[test]

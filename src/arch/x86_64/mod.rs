@@ -9,6 +9,7 @@ pub mod irq;
 pub mod page_table;
 pub mod platform_layout;
 pub mod smp;
+pub(crate) mod smp_trampoline;
 pub mod syscall_abi;
 pub mod trap;
 pub mod vm_layout;

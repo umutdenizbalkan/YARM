@@ -19,7 +19,12 @@ MUST_SMOKE policy (`doc/AI_AGENT_RULES.md §13`).
    "all checks passed".
 3. ✅ `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` —
    "all checks passed".
-4. ✅ (amended — see note) Kernel-side `Info` markers
+4. ✅ (note superseded — see `KERNEL_UNLOCKING_MILESTONE_2.md` Pass 1 §2:
+   the markers WERE present in the QEMU console logs all along; the Stage
+   106 analysis grepped the bash-xtrace `smoke.log` by mistake. Stage 107
+   console logs: `YARM_D1_SPLIT_MATERIALIZE`=11, `YARM_D5_SPLIT_MATERIALIZE`=54,
+   `D2_RECV_WAITER_PUBLISH`=115 per run, both architectures.)
+   Original note kept for the record: Kernel-side `Info` markers
    (`YARM_D1_SPLIT_MATERIALIZE`, `YARM_D5_SPLIT_MATERIALIZE`,
    `D2_RECV_WAITER_PUBLISH`, and equally ALL pre-existing kernel Info
    markers such as `IPC_RECV_BLOCK_REGISTER`) are below the production

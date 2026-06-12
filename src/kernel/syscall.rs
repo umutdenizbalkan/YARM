@@ -8630,14 +8630,23 @@ mod tests {
             "TLB shootdown must precede frame reclaim inside the wait plan executor"
         );
 
-        // D3 remains GATED at Stage 106: no SharedKernel VM/memory split-mut
-        // seam exists. The exact blocker is documented in
-        // doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §16 / §19.
-        let runtime_src = include_str!("../runtime.rs");
+        // Stage 106 originally asserted no VM/memory seam existed. Stage 108
+        // (Milestone 2 Pass 1) added the seams BY DESIGN as helper-only
+        // scaffold; the gate is now "seams exist but are not on any live
+        // trap/syscall path" — enforced by
+        // runtime::tests::stage108_seams_are_helper_only_no_live_callers.
+        // Here we keep the load-bearing remainder: the live D3 VmBrk-shrink
+        // helper still runs under the global borrow (no seam call inside
+        // memory_state.rs's shrink helper).
+        let shrink_body = mem_src
+            .split("fn vm_brk_shrink_two_phase")
+            .nth(1)
+            .expect("shrink helper present");
+        let shrink_end = shrink_body.find("\n    pub ").unwrap_or(shrink_body.len());
+        let needle = ["with_memory_", "split_mut"].concat();
         assert!(
-            !runtime_src.contains("with_vm_split_mut")
-                && !runtime_src.contains("with_memory_split_mut"),
-            "D3 must remain gated: no VM/memory split-mut seam in runtime.rs at Stage 106"
+            !shrink_body[..shrink_end].contains(&needle),
+            "vm_brk_shrink_two_phase must not call the Stage 108 seams until the live D3 seam pass"
         );
     }
 
@@ -8862,6 +8871,60 @@ mod tests {
         assert!(
             audit.contains("D6_LIVE_SPLIT"),
             "audit doc must record Stage 107 D6 live wiring"
+        );
+    }
+
+    // ── Stage 108 / Milestone 2 Pass 1: x86_64 SMP trampoline split fences ────
+
+    #[test]
+    fn stage108_smp_trampoline_split_is_complete() {
+        // The AI_AGENT_RULES §5.2 prerequisite: trampoline/early assembly
+        // lives in smp_trampoline.rs; smp.rs keeps only Rust bring-up logic.
+        let smp_src = include_str!("../arch/x86_64/smp.rs");
+        let tramp_src = include_str!("../arch/x86_64/smp_trampoline.rs");
+        assert!(
+            !smp_src.contains("global_asm!") && !smp_src.contains(".code16"),
+            "smp.rs must no longer contain the trampoline assembly"
+        );
+        assert!(
+            tramp_src.contains("global_asm!")
+                && tramp_src.contains(".code16")
+                && tramp_src.contains("yarm_ap_trampoline_start"),
+            "smp_trampoline.rs must host the trampoline assembly"
+        );
+        assert!(
+            smp_src.contains("use super::smp_trampoline::"),
+            "smp.rs must consume the trampoline module via imports"
+        );
+        // The core smoke stays pinned to -smp 1 — the split is a prerequisite,
+        // not an SMP enablement.
+        let smoke = include_str!("../../scripts/qemu-x86_64-core-smoke.sh");
+        assert!(smoke.contains("QEMU_SMP=1"));
+    }
+
+    #[test]
+    fn stage108_smp_ap_still_parks_in_assembly() {
+        // Honest-blocker fence: the AP parks in an assembly cli/hlt loop and
+        // never enters Rust. Until an AP per-CPU environment (IDT/TSS/GS/
+        // scheduler/log) exists, x86_64 SMP scheduling is NOT possible and no
+        // SMP smoke may be claimed. See audit doc §23.
+        let tramp_src = include_str!("../arch/x86_64/smp_trampoline.rs");
+        assert!(
+            tramp_src.contains("Park AP fully offline in assembly"),
+            "the assembly park comment must remain until APs get a Rust environment"
+        );
+        // start_secondary_cpus still returns Ok(0) — no scheduler CPU online.
+        let smp_src = include_str!("../arch/x86_64/smp.rs");
+        assert!(
+            smp_src.contains("Do NOT call kernel.bring_up_cpu(cpu) yet."),
+            "start_secondary_cpus must not bring APs into the scheduler yet"
+        );
+        // The exact blocker (AP per-CPU environment) is documented in the
+        // Milestone 2 prep doc.
+        let m2 = include_str!("../../doc/KERNEL_UNLOCKING_MILESTONE_2.md");
+        assert!(
+            m2.contains("Exact remaining x86_64 SMP blocker"),
+            "Milestone 2 doc must record the exact SMP blocker"
         );
     }
 
