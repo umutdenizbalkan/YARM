@@ -5206,8 +5206,8 @@ no deadline-0 required replies; no wrong-sender SpawnV5 replies.
 
 D2 is live-wired (`publish_recv_waiter_live` in the canonical endpoint
 blocking-recv path). D3 remains gated with a structural ordering proof. D6
-is audit-only. Milestone 1 is **PREPARED — NOT DECLARED** pending the smoke
-checklist in `KERNEL_UNLOCKING_MILESTONE_1.md`.
+is audit-only. Milestone 1 is **DECLARED** (2026-06-12) — the smoke checklist
+in `KERNEL_UNLOCKING_MILESTONE_1.md` passed on all three runs.
 
 **Test rules:**
 

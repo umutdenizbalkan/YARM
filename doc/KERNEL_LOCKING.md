@@ -12217,5 +12217,5 @@ UAF-load-bearing (`execute_tlb_shootdown_wait_plan`); D6 per-CPU scheduler
 locking not started — `entering_tid`/`exiting_tid` remain Class F; x86_64
 smoke pinned `-smp 1`.
 
-Milestone 1 status: PREPARED — NOT DECLARED (smoke checklist pending; see
-the milestone doc).
+Milestone 1 status: DECLARED (2026-06-12; all three smoke runs passed — see
+the milestone doc acceptance record).

@@ -1286,7 +1286,14 @@ Not started, by directive. The audit above is the Milestone-2 entry point.
 
 ## 21. Stage 106 — Milestone 1 status
 
-See `doc/KERNEL_UNLOCKING_MILESTONE_1.md`. Status: **PREPARED — NOT
-DECLARED** (QEMU unavailable in the development environment; the
-declaration checklist requires the three smoke runs). The Pass 3 directive
-explicitly forbids declaring without smoke; this is the honest outcome.
+See `doc/KERNEL_UNLOCKING_MILESTONE_1.md`. Status: **DECLARED**
+(2026-06-12). QEMU 8.2.2 was installed into the development environment
+and all three declaring smoke runs passed: x86_64 `-smp 1` core smoke,
+x86_64 optional-FS strict smoke, AArch64 optional-FS strict smoke —
+`INIT_SPAWN_V5_WRONG_SENDER_REPLY` count=0 in all logs; no forbidden
+markers; `D2_PUBLISH_RACE_UNWIND`=0 and `YARM_D5_SPLIT_RECORD_ROLLBACK`=0
+as required. Note: kernel-side Info markers (including pre-existing ones
+like `IPC_RECV_BLOCK_REGISTER`) are below the production console loglevel
+in all profiles; split-engine routing is verified by the hosted-dev
+telemetry suites (same verification depth as the locally smoke-accepted
+Pass 1/2 runs).

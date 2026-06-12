@@ -617,7 +617,7 @@ smoke result that was not actually executed.
 |------|-----------|------|
 | D1 transfer-cap recv materialization (`materialize_received_message_cap_routed`) | Stage 104 | smoke-accepted per local Pass-1/2 runs |
 | D5 reply-cap recv materialization (Phase B' fallible record-set + mint rollback) | Stage 105 | same |
-| D2 endpoint blocking-recv waiter publish (`publish_recv_waiter_live`) | Stage 106 | **pending** Milestone 1 smoke checklist |
+| D2 endpoint blocking-recv waiter publish (`publish_recv_waiter_live`) | Stage 106 | smoke-accepted (Milestone 1 declared 2026-06-12) |
 
 Do not remove the canonical fallbacks: `materialize_received_message_cap`
 must remain at its ≥4 call sites; the notification-recv blocking path stays
