@@ -5,7 +5,8 @@
 
 pub mod drivers;
 pub use drivers::{
-    blkcache, firmware, input, irqmux, mailbox, rp1_gpio, uart, virtio_blk, virtio_gpu, virtio_net,
+    blkcache, firmware, gpio, input, irqmux, mailbox, rp1_gpio, uart, virtio_blk, virtio_gpu,
+    virtio_net,
 };
 
 pub fn run_input() {
@@ -94,6 +95,26 @@ mod tests {
         assert!(!manifest.contains("name = \"rpi_firmware_srv\""));
         let firmware_run = ["run_rpi", "_firmware"].concat();
         assert!(!crate_root.contains(&firmware_run));
+    }
+
+    #[test]
+    fn gpio_service_is_trait_backed_while_rp1_path_remains_in_place() {
+        let generic_gpio = include_str!("drivers/gpio/mod.rs");
+        let rp1_device = include_str!("drivers/rp1_gpio/device.rs");
+        let rp1_service = include_str!("drivers/rp1_gpio/service.rs");
+        let drivers_module = include_str!("drivers/mod.rs");
+        let audit = include_str!("../../../doc/driver-layering-audit.md");
+        let future_backend = ["gpio/backend/", "rp1"].concat();
+
+        assert!(generic_gpio.contains("pub trait GpioDeviceOps"));
+        assert!(rp1_device.contains("impl<B: RegisterIo> GpioDeviceOps for Rp1GpioDevice<B>"));
+        assert!(rp1_service.contains("dispatch<D: GpioDeviceOps>"));
+        assert!(!rp1_service.contains("Rp1GpioDevice"));
+        assert!(drivers_module.contains("pub mod rp1_gpio"));
+        assert!(!drivers_module.contains(&future_backend));
+        assert!(audit.contains("drivers/gpio/backend/rp1"));
+        assert!(audit.contains("PCIe discovery"));
+        assert!(audit.contains("not hardware-proven"));
     }
 
     #[test]

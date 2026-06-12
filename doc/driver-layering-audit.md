@@ -10,7 +10,7 @@ startup grants, or claim hardware support.
 |---|---|---|---|---|---|---|---|
 | UART | `uart_abi` | none | `drivers/uart/service.rs`, through `UartDeviceOps` | `drivers/uart/backend/pl011` | `uart_srv` | present for build parity; deferred and not live-spawned | No |
 | Raspberry Pi firmware properties | none | `platform/rpi/property_mailbox_abi`; legacy `mailbox_abi` re-export retained | none; dispatch is platform firmware-specific | `drivers/firmware/rpi` mock transport plus deferred mapping holder | none, intentionally | not spawned | No |
-| GPIO | `gpio_abi` | none | RP1 service currently lives with the implementation | `drivers/rp1_gpio` | `rp1_gpio_srv` | deferred and not live-spawned | No |
+| GPIO | `gpio_abi` | none | `drivers/gpio` defines `GpioDeviceOps`; existing pure ABI dispatch is generic over it | RP1 remains at `drivers/rp1_gpio` | `rp1_gpio_srv` | deferred and not live-spawned | No |
 | Virtio block | `block_abi` and `blkcache_abi` are generic; `block_backend_abi` is the generic backend contract | none | `drivers/virtio_blk/service.rs`, through `BlockDeviceOps` | `drivers/virtio_blk/backend/virtio`; deterministic in-memory device preserves existing behavior | `virtio_blk_srv` | existing entrypoint/spawn policy unchanged | No production virtio hardware proof |
 | Virtio net/GPU | netdev or existing service contracts | none | implementation-specific service modules | `drivers/virtio_net`, `drivers/virtio_gpu` | existing bins | existing project policy unchanged | Not audited here |
 | IRQ mux/input/block cache | existing generic ABIs where present | none identified | existing service modules | mock/service-local implementations | existing bins | existing project policy unchanged | Not audited here |
@@ -24,12 +24,14 @@ startup grants, or claim hardware support.
   Its canonical ABI path is `platform::rpi::property_mailbox_abi`, and its
   client/transport/dispatch path is `drivers::firmware::rpi`. Compatibility
   re-exports preserve the prior `mailbox_abi` and `drivers::mailbox` paths.
-- Generic `gpio_abi` contains GPIO operations and may remain generic. The RP1
-  implementation is already explicitly named `drivers/rp1_gpio`; moving it to
-  `drivers/gpio/backend/rp1` is deferred because it would add churn without
-  improving the current public boundary. Its service still imports the RP1
-  device trait, so a future low-risk cleanup should introduce a generic GPIO
-  device-ops trait before moving directories.
+- Generic `gpio_abi` remains unchanged. `drivers/gpio` now owns the generic
+  `GpioDeviceOps`, error, direction, pin-mode, and pull contract; RP1 implements
+  that contract and pure ABI dispatch depends on it rather than an RP1 type.
+  The existing `drivers/rp1_gpio` path and public aliases are retained. A future
+  move to `drivers/gpio/backend/rp1` is deferred until compatibility review.
+- RP1 production remains blocked on PCIe discovery, BAR sizing/validation,
+  capability-granted MMIO, interrupt routing, and an explicit startup-grant
+  contract. The current backend remains mock/protocol-ready, not hardware-proven.
 - The block wire ABIs, status values, request/reply sizes, and blkcache handoff
   remain unchanged. Generic GET_INFO and sector read/write service logic now
   sees only `BlockDeviceOps`; virtio frame, queue, request builder, and the

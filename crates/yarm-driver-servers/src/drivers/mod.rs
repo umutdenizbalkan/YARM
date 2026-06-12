@@ -3,6 +3,7 @@
 
 pub mod blkcache;
 pub mod firmware;
+pub mod gpio;
 pub mod input;
 pub mod irqmux;
 pub mod mailbox;

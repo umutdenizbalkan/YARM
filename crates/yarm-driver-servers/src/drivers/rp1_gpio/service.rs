@@ -9,7 +9,7 @@
 //! complete and hosted-mock tested so that transport can be enabled later
 //! without coupling protocol correctness to hardware availability.
 
-use super::device::{GpioDriver, GpioError, PinMode};
+use crate::drivers::gpio::{GpioDeviceError, GpioDeviceOps, GpioPinMode};
 use yarm_ipc_abi::gpio_abi::{
     GPIO_MODE_ALT_FUNC, GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GPIO_OP_READ_PIN, GPIO_OP_SET_FUNCTION,
     GPIO_OP_SET_PIN_MODE, GPIO_OP_WRITE_PIN, GpioReadPinReply, GpioReadPinRequest,
@@ -27,15 +27,15 @@ pub fn run() {
     yarm_user_rt::user_log!("RP1_GPIO_SRV_DEFERRED_NO_MMIO_GRANT");
 }
 
-fn status_for(error: GpioError) -> GpioStatus {
+fn status_for(error: GpioDeviceError) -> GpioStatus {
     match error {
-        GpioError::InvalidPin => GpioStatus::InvalidPin,
-        GpioError::InvalidFunction => GpioStatus::InvalidFunction,
-        GpioError::Unsupported => GpioStatus::Unsupported,
+        GpioDeviceError::InvalidPin => GpioStatus::InvalidPin,
+        GpioDeviceError::InvalidFunction => GpioStatus::InvalidFunction,
+        GpioDeviceError::Unsupported => GpioStatus::Unsupported,
     }
 }
 
-fn status_message(opcode: u16, result: Result<(), GpioError>) -> Option<Message> {
+fn status_message(opcode: u16, result: Result<(), GpioDeviceError>) -> Option<Message> {
     let status = match result {
         Ok(()) => GpioStatusReply::ok(),
         Err(error) => GpioStatusReply::err(status_for(error)),
@@ -47,25 +47,25 @@ fn status_message(opcode: u16, result: Result<(), GpioError>) -> Option<Message>
 ///
 /// Malformed payloads are deterministic errors, unknown operations return
 /// `Unsupported`, and all device failures are translated to ABI statuses.
-pub fn dispatch<D: GpioDriver>(driver: &D, msg: &Message) -> Option<Message> {
+pub fn dispatch<D: GpioDeviceOps>(driver: &D, msg: &Message) -> Option<Message> {
     match msg.opcode {
         GPIO_OP_SET_FUNCTION => {
             let result = GpioSetFunctionRequest::decode(msg.as_slice())
-                .ok_or(GpioError::InvalidPin)
+                .ok_or(GpioDeviceError::InvalidPin)
                 .and_then(|req| driver.set_function(req.pin as usize, req.function as u32));
             status_message(msg.opcode, result)
         }
         GPIO_OP_SET_PIN_MODE => {
             let req = match GpioSetPinModeRequest::decode(msg.as_slice()) {
                 Some(req) => req,
-                None => return status_message(msg.opcode, Err(GpioError::InvalidPin)),
+                None => return status_message(msg.opcode, Err(GpioDeviceError::InvalidPin)),
             };
             let mode = match req.mode {
-                GPIO_MODE_INPUT => PinMode::Input,
-                GPIO_MODE_OUTPUT => PinMode::Output {
+                GPIO_MODE_INPUT => GpioPinMode::Input,
+                GPIO_MODE_OUTPUT => GpioPinMode::Output {
                     initial_level: req.initial_level != 0,
                 },
-                GPIO_MODE_ALT_FUNC => PinMode::AltFunction(req.function as u32),
+                GPIO_MODE_ALT_FUNC => GpioPinMode::AltFunction(req.function as u32),
                 _ => {
                     return Message::with_header(
                         0,
@@ -81,14 +81,14 @@ pub fn dispatch<D: GpioDriver>(driver: &D, msg: &Message) -> Option<Message> {
         }
         GPIO_OP_WRITE_PIN => {
             let result = GpioWritePinRequest::decode(msg.as_slice())
-                .ok_or(GpioError::InvalidPin)
+                .ok_or(GpioDeviceError::InvalidPin)
                 .and_then(|req| driver.write_pin(req.pin as usize, req.level != 0));
             status_message(msg.opcode, result)
         }
         GPIO_OP_READ_PIN => {
             let req = match GpioReadPinRequest::decode(msg.as_slice()) {
                 Some(req) => req,
-                None => return status_message(msg.opcode, Err(GpioError::InvalidPin)),
+                None => return status_message(msg.opcode, Err(GpioDeviceError::InvalidPin)),
             };
             match driver.read_pin(req.pin as usize) {
                 Ok(level) => Message::with_header(
@@ -107,14 +107,14 @@ pub fn dispatch<D: GpioDriver>(driver: &D, msg: &Message) -> Option<Message> {
                 Err(error) => status_message(msg.opcode, Err(error)),
             }
         }
-        _ => status_message(msg.opcode, Err(GpioError::Unsupported)),
+        _ => status_message(msg.opcode, Err(GpioDeviceError::Unsupported)),
     }
 }
 
 /// Future transport loop for a platform-granted device. It is intentionally
 /// not called by `run()` until the RP1 discovery/grant contract exists.
 #[allow(dead_code)]
-fn serve<D: GpioDriver>(driver: &D, recv_cap: u32) -> ! {
+fn serve<D: GpioDeviceOps>(driver: &D, recv_cap: u32) -> ! {
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some(received)) => {
@@ -137,7 +137,7 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use crate::drivers::rp1_gpio::device::{Direction, Pull};
+    use crate::drivers::gpio::{GpioDirection, GpioPull};
     use core::cell::{Cell, RefCell};
     use std::vec::Vec;
 
@@ -147,57 +147,57 @@ mod tests {
         read_level: Cell<bool>,
     }
 
-    impl GpioDriver for MockDriver {
-        fn set_function(&self, pin: usize, function: u32) -> Result<(), GpioError> {
+    impl GpioDeviceOps for MockDriver {
+        fn set_function(&self, pin: usize, function: u32) -> Result<(), GpioDeviceError> {
             if pin >= 54 {
-                return Err(GpioError::InvalidPin);
+                return Err(GpioDeviceError::InvalidPin);
             }
             if function > 31 {
-                return Err(GpioError::InvalidFunction);
+                return Err(GpioDeviceError::InvalidFunction);
             }
             self.calls.borrow_mut().push((1, pin, function));
             Ok(())
         }
 
-        fn set_pin_mode(&self, pin: usize, mode: PinMode) -> Result<(), GpioError> {
+        fn set_pin_mode(&self, pin: usize, mode: GpioPinMode) -> Result<(), GpioDeviceError> {
             if pin >= 54 {
-                return Err(GpioError::InvalidPin);
+                return Err(GpioDeviceError::InvalidPin);
             }
             let value = match mode {
-                PinMode::Input => 0,
-                PinMode::Output { initial_level } => 1 + initial_level as u32,
-                PinMode::AltFunction(function) => 0x100 + function,
+                GpioPinMode::Input => 0,
+                GpioPinMode::Output { initial_level } => 1 + initial_level as u32,
+                GpioPinMode::AltFunction(function) => 0x100 + function,
             };
             self.calls.borrow_mut().push((2, pin, value));
             Ok(())
         }
 
-        fn direction(&self, _pin: usize) -> Result<Direction, GpioError> {
-            Ok(Direction::Input)
+        fn direction(&self, _pin: usize) -> Result<GpioDirection, GpioDeviceError> {
+            Ok(GpioDirection::Input)
         }
 
-        fn write_pin(&self, pin: usize, level: bool) -> Result<(), GpioError> {
+        fn write_pin(&self, pin: usize, level: bool) -> Result<(), GpioDeviceError> {
             if pin >= 54 {
-                return Err(GpioError::InvalidPin);
+                return Err(GpioDeviceError::InvalidPin);
             }
             self.calls.borrow_mut().push((3, pin, level as u32));
             Ok(())
         }
 
-        fn read_pin(&self, pin: usize) -> Result<bool, GpioError> {
+        fn read_pin(&self, pin: usize) -> Result<bool, GpioDeviceError> {
             if pin >= 54 {
-                return Err(GpioError::InvalidPin);
+                return Err(GpioDeviceError::InvalidPin);
             }
             self.calls.borrow_mut().push((4, pin, 0));
             Ok(self.read_level.get())
         }
 
-        fn set_pull(&self, _pin: usize, _pull: Pull) -> Result<(), GpioError> {
-            Err(GpioError::Unsupported)
+        fn set_pull(&self, _pin: usize, _pull: GpioPull) -> Result<(), GpioDeviceError> {
+            Err(GpioDeviceError::Unsupported)
         }
 
-        fn pull(&self, _pin: usize) -> Result<Pull, GpioError> {
-            Err(GpioError::Unsupported)
+        fn pull(&self, _pin: usize) -> Result<GpioPull, GpioDeviceError> {
+            Err(GpioDeviceError::Unsupported)
         }
     }
 
