@@ -97,6 +97,26 @@ mod tests {
     }
 
     #[test]
+    fn block_service_is_trait_backed_and_virtio_paths_remain_compatible() {
+        let service = include_str!("drivers/virtio_blk/service.rs");
+        let module = include_str!("drivers/virtio_blk/mod.rs");
+        let backend = include_str!("drivers/virtio_blk/backend/virtio/device.rs");
+        let audit = include_str!("../../../doc/driver-layering-audit.md");
+        let queue_type = ["Virtq", "Chain"].concat();
+        let concrete_device = ["VirtioBlk", "MemoryDevice"].concat();
+
+        assert!(service.contains("BlockDeviceOps"));
+        assert!(!service.contains(&queue_type));
+        assert!(!service.contains(&concrete_device));
+        assert!(backend.contains("impl<const SECTORS: usize> BlockDeviceOps"));
+        assert!(module.contains("Compatibility module for the former `virtio_blk::device` path"));
+        assert!(module.contains("pub type VirtioBlkWriteService"));
+        assert!(audit.contains("block_backend_abi"));
+        assert!(audit.contains("VIRTIO_BLK_SRV_READY"));
+        assert!(audit.contains("FAT gates"));
+    }
+
+    #[test]
     fn driver_server_bin_parity_guard_covers_expected_entrypoints() {
         let cargo_toml = include_str!("../Cargo.toml");
         let expected_bins = [

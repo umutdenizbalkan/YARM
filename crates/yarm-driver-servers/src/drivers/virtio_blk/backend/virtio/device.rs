@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+use crate::drivers::virtio_blk::service::{BlockDeviceInfo, BlockDeviceOps};
+
 const VIRTQ_DEPTH: usize = 16;
 
 pub const VIRTIO_BLK_OP_READ: u16 = 1;
@@ -226,6 +228,24 @@ impl<const SECTORS: usize> VirtioBlkMemoryDevice<SECTORS> {
     pub fn read_sector(&mut self, sector: u64) -> Result<[u8; 512], ()> {
         self.device.read(VirtioBlkRequest { sector, len: 512 })?;
         self.storage.get(sector as usize).copied().ok_or(())
+    }
+}
+
+impl<const SECTORS: usize> BlockDeviceOps for VirtioBlkMemoryDevice<SECTORS> {
+    fn get_info(&self) -> BlockDeviceInfo {
+        BlockDeviceInfo {
+            logical_block_size: 512,
+            total_blocks: SECTORS as u64,
+            feature_flags: 0,
+        }
+    }
+
+    fn read_sector(&mut self, lba: u64) -> Result<[u8; 512], ()> {
+        VirtioBlkMemoryDevice::read_sector(self, lba)
+    }
+
+    fn write_sector(&mut self, lba: u64, data: &[u8; 512]) -> Result<u32, ()> {
+        VirtioBlkMemoryDevice::write_sector(self, lba, data)
     }
 }
 
