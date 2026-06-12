@@ -106,6 +106,24 @@ pub fn boot_command_line() -> BootCommandLine {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlatformOption {
+    #[default]
+    Auto,
+    QemuVirt,
+    Rpi5,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BootPhase {
+    Entry,
+    Uart,
+    Dtb,
+    Mmu,
+    #[default]
+    Kernel,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct YarmBootOptions<'a> {
     pub manifest_path: Option<&'a [u8]>,
     /// Stage 108 / Milestone 2 Pass 1: `yarm.loglevel=` observability knob.
@@ -157,8 +175,26 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         {
             continue;
         }
-        if key == b"yarm.manifest" {
-            options.manifest_path = valid_manifest_path(value).then_some(value);
+        match key {
+            b"yarm.manifest" => {
+                options.manifest_path = valid_manifest_path(value).then_some(value);
+            }
+            b"yarm.platform" => {
+                if let Some(platform) = parse_platform_option(value) {
+                    options.platform = platform;
+                }
+            }
+            b"yarm.boot_phase" => {
+                if let Some(phase) = parse_boot_phase(value) {
+                    options.boot_phase = phase;
+                }
+            }
+            b"yarm.max_cpus" => {
+                if let Some(max_cpus) = parse_positive_usize(value) {
+                    options.max_cpus = Some(max_cpus);
+                }
+            }
+            _ => {}
         }
         if key == b"yarm.loglevel" {
             // Invalid values leave the option unset (last-wins only among
@@ -169,6 +205,42 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
     }
     options
+}
+
+fn parse_platform_option(value: &[u8]) -> Option<PlatformOption> {
+    match value {
+        b"auto" => Some(PlatformOption::Auto),
+        b"qemu-virt" => Some(PlatformOption::QemuVirt),
+        b"rpi5" => Some(PlatformOption::Rpi5),
+        _ => None,
+    }
+}
+
+fn parse_boot_phase(value: &[u8]) -> Option<BootPhase> {
+    match value {
+        b"entry" => Some(BootPhase::Entry),
+        b"uart" => Some(BootPhase::Uart),
+        b"dtb" => Some(BootPhase::Dtb),
+        b"mmu" => Some(BootPhase::Mmu),
+        b"kernel" => Some(BootPhase::Kernel),
+        _ => None,
+    }
+}
+
+fn parse_positive_usize(value: &[u8]) -> Option<usize> {
+    if value.is_empty() {
+        return None;
+    }
+    let mut parsed = 0usize;
+    for byte in value {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        parsed = parsed
+            .checked_mul(10)?
+            .checked_add((byte - b'0') as usize)?;
+    }
+    (parsed > 0).then_some(parsed)
 }
 
 fn valid_manifest_path(path: &[u8]) -> bool {
@@ -334,5 +406,30 @@ mod tests {
         ] {
             assert_eq!(parse_yarm_boot_options(raw).manifest_path, None, "{raw:?}");
         }
+    }
+
+    #[test]
+    fn platform_phase_and_cpu_options_parse_with_qemu_preserving_defaults() {
+        let defaults = parse_yarm_boot_options(b"");
+        assert_eq!(defaults.platform, PlatformOption::Auto);
+        assert_eq!(defaults.boot_phase, BootPhase::Kernel);
+        assert_eq!(defaults.max_cpus, None);
+
+        let parsed =
+            parse_yarm_boot_options(b"yarm.platform=rpi5 yarm.boot_phase=uart yarm.max_cpus=1");
+        assert_eq!(parsed.platform, PlatformOption::Rpi5);
+        assert_eq!(parsed.boot_phase, BootPhase::Uart);
+        assert_eq!(parsed.max_cpus, Some(1));
+    }
+
+    #[test]
+    fn recognized_boot_options_are_last_wins_and_invalid_values_are_ignored() {
+        let parsed = parse_yarm_boot_options(
+            b"yarm.platform=qemu-virt yarm.platform=rpi5 yarm.boot_phase=dtb \
+              yarm.boot_phase=bogus yarm.max_cpus=4 yarm.max_cpus=0",
+        );
+        assert_eq!(parsed.platform, PlatformOption::Rpi5);
+        assert_eq!(parsed.boot_phase, BootPhase::Dtb);
+        assert_eq!(parsed.max_cpus, Some(4));
     }
 }

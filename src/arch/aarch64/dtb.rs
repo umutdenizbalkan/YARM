@@ -364,7 +364,7 @@ mod tests {
     #[test]
     fn parse_boot_dtb_extracts_cpu_bitmap_from_cpu_nodes() {
         let mut struct_block = Vec::new();
-        let mut strings = Vec::new();
+        let strings: Vec<u8> = Vec::new();
 
         push_begin_node(&mut struct_block, "");
         push_begin_node(&mut struct_block, "cpus");

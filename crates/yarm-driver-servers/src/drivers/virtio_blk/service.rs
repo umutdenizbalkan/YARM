@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::device::{VirtioBlkMemoryDevice, build_write_chain};
 use yarm_ipc_abi::block_abi::{
     BLK_OP_GET_INFO, BLK_OP_WRITE, BlkGetInfoReply, BlkGetInfoRequest, BlkSectorWriteAssembler,
     BlkStatus, BlkWriteReply, BlkWriteRequest,
@@ -9,30 +8,72 @@ use yarm_ipc_abi::block_abi::{
 use yarm_ipc_abi::block_backend_abi::*;
 use yarm_user_rt::ipc::Message;
 
-const SERVICE_SECTORS: usize = 8;
+pub const SERVICE_SECTORS: usize = 8;
 
-#[derive(Debug)]
-pub struct VirtioBlkWriteService<const SECTORS: usize> {
-    assembler: BlkSectorWriteAssembler,
-    device: VirtioBlkMemoryDevice<SECTORS>,
+pub use super::VirtioBlkWriteService;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockDeviceInfo {
+    pub logical_block_size: u32,
+    pub total_blocks: u64,
+    pub feature_flags: u64,
 }
 
-impl<const SECTORS: usize> Default for VirtioBlkWriteService<SECTORS> {
+/// Backend-neutral sector operations required by the existing block service.
+pub trait BlockDeviceOps {
+    fn get_info(&self) -> BlockDeviceInfo;
+    fn read_sector(&mut self, lba: u64) -> Result<[u8; 512], ()>;
+    fn write_sector(&mut self, lba: u64, data: &[u8; 512]) -> Result<u32, ()>;
+}
+
+#[derive(Debug)]
+pub struct BlockWriteService<D> {
+    assembler: BlkSectorWriteAssembler,
+    device: D,
+}
+
+impl<D: BlockDeviceOps + Default> Default for BlockWriteService<D> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<const SECTORS: usize> VirtioBlkWriteService<SECTORS> {
-    pub const fn new() -> Self {
+impl<D: BlockDeviceOps + Default> BlockWriteService<D> {
+    pub fn new() -> Self {
+        Self::with_backend(D::default())
+    }
+}
+
+impl<D: BlockDeviceOps> BlockWriteService<D> {
+    pub const fn with_backend(device: D) -> Self {
         Self {
             assembler: BlkSectorWriteAssembler::new(),
-            device: VirtioBlkMemoryDevice::new(),
+            device,
+        }
+    }
+
+    pub fn backend(&self) -> &D {
+        &self.device
+    }
+
+    pub fn handle_get_info(&self, request: &[u8]) -> BlkGetInfoReply {
+        let status = match BlkGetInfoRequest::decode(request) {
+            Some(_) => BlkStatus::Success,
+            None => BlkStatus::InvalidRequest,
+        };
+        let info = self.device.get_info();
+        BlkGetInfoReply {
+            status,
+            _reserved0: 0,
+            logical_block_size: info.logical_block_size,
+            _reserved1: 0,
+            total_blocks: info.total_blocks,
+            feature_flags: info.feature_flags,
         }
     }
 
     pub fn handle_write(&mut self, request: &BlkWriteRequest) -> BlkWriteReply {
-        if request.lba >= SECTORS as u64 {
+        if request.lba >= self.device.get_info().total_blocks {
             self.assembler.reset();
             return write_reply(request, BlkStatus::InvalidRequest, 0, false);
         }
@@ -44,10 +85,7 @@ impl<const SECTORS: usize> VirtioBlkWriteService<SECTORS> {
             return write_reply(request, BlkStatus::Success, request.data_len, false);
         };
 
-        let chain = build_write_chain(sector.request_id, sector.lba, sector.data.len() as u32);
-        if chain.request.op != super::device::VIRTIO_BLK_OP_WRITE
-            || self.device.write_sector(sector.lba, &sector.data).is_err()
-        {
+        if self.device.write_sector(sector.lba, &sector.data).is_err() {
             return write_reply(request, BlkStatus::IOError, 0, false);
         }
         write_reply(request, BlkStatus::Success, request.data_len, true)
@@ -98,12 +136,12 @@ fn build_resp(req_id: u32, status: i32) -> BlkBackendResponse {
     }
 }
 
-pub fn run() {
+pub fn run_with_backend<D: BlockDeviceOps>(device: D) {
     let ctx = yarm_user_rt::runtime::startup_context();
     let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
         return;
     };
-    let mut write_service = VirtioBlkWriteService::<SERVICE_SECTORS>::new();
+    let mut write_service = BlockWriteService::with_backend(device);
     yarm_user_rt::user_log!("VIRTIO_BLK_SRV_READY");
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
@@ -115,18 +153,7 @@ pub fn run() {
                 match msg.opcode {
                     BLK_OP_GET_INFO => {
                         yarm_user_rt::user_log!("VIRTIO_BLK_GET_INFO_REQUEST");
-                        let status = match BlkGetInfoRequest::decode(msg.as_slice()) {
-                            Some(_) => BlkStatus::Success,
-                            None => BlkStatus::InvalidRequest,
-                        };
-                        let reply = BlkGetInfoReply {
-                            status,
-                            _reserved0: 0,
-                            logical_block_size: 512,
-                            _reserved1: 0,
-                            total_blocks: SERVICE_SECTORS as u64,
-                            feature_flags: 0,
-                        };
+                        let reply = write_service.handle_get_info(msg.as_slice());
                         if let Ok(message) =
                             Message::with_header(0, BLK_OP_GET_INFO, 0, None, &reply.encode())
                         {
@@ -195,8 +222,48 @@ mod tests {
         BLK_SECTOR_SIZE, BLK_WRITE_F_FIRST, BLK_WRITE_F_LAST, BLK_WRITE_MAX_CHUNK_BYTES,
     };
 
-    fn write_sector(
-        service: &mut VirtioBlkWriteService<4>,
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MockBlockDevice<const SECTORS: usize> {
+        storage: [[u8; 512]; SECTORS],
+        reads: usize,
+        writes: usize,
+    }
+
+    impl<const SECTORS: usize> Default for MockBlockDevice<SECTORS> {
+        fn default() -> Self {
+            Self {
+                storage: [[0; 512]; SECTORS],
+                reads: 0,
+                writes: 0,
+            }
+        }
+    }
+
+    impl<const SECTORS: usize> BlockDeviceOps for MockBlockDevice<SECTORS> {
+        fn get_info(&self) -> BlockDeviceInfo {
+            BlockDeviceInfo {
+                logical_block_size: 512,
+                total_blocks: SECTORS as u64,
+                feature_flags: 0,
+            }
+        }
+
+        fn read_sector(&mut self, lba: u64) -> Result<[u8; 512], ()> {
+            let data = self.storage.get(lba as usize).copied().ok_or(())?;
+            self.reads += 1;
+            Ok(data)
+        }
+
+        fn write_sector(&mut self, lba: u64, data: &[u8; 512]) -> Result<u32, ()> {
+            let slot = self.storage.get_mut(lba as usize).ok_or(())?;
+            *slot = *data;
+            self.writes += 1;
+            Ok(512)
+        }
+    }
+
+    fn write_sector<D: BlockDeviceOps>(
+        service: &mut BlockWriteService<D>,
         request_id: u32,
         lba: u64,
         data: &[u8; 512],
@@ -228,37 +295,62 @@ mod tests {
     }
 
     #[test]
-    fn virtio_service_write_then_read_and_overwrite_are_exact() {
-        let mut service = VirtioBlkWriteService::<4>::new();
-        let first = [0x33; 512];
-        let second = core::array::from_fn(|index| (index * 3) as u8);
-        let reply = write_sector(&mut service, 1, 2, &first);
-        assert_eq!(reply.status, BlkStatus::Success);
-        assert_eq!(reply.sector_committed, 1);
+    fn trait_backed_get_info_preserves_geometry_and_malformed_status() {
+        let service = BlockWriteService::with_backend(MockBlockDevice::<4>::default());
+        let valid = service.handle_get_info(&BlkGetInfoRequest { device_id: 1 }.encode());
+        assert_eq!(valid.status, BlkStatus::Success);
+        assert_eq!(valid.logical_block_size, 512);
+        assert_eq!(valid.total_blocks, 4);
+        assert_eq!(valid.feature_flags, 0);
+        assert_eq!(
+            service.handle_get_info(&[]).status,
+            BlkStatus::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn trait_backed_write_then_read_and_overwrite_are_exact() {
+        let mut service = BlockWriteService::with_backend(MockBlockDevice::<4>::default());
+        let first = [0x5a; 512];
+        let second = core::array::from_fn(|index| index as u8);
+        assert_eq!(
+            write_sector(&mut service, 1, 2, &first).status,
+            BlkStatus::Success
+        );
         assert_eq!(service.read_sector(2), Ok(first));
         assert_eq!(
             write_sector(&mut service, 2, 2, &second).status,
             BlkStatus::Success
         );
         assert_eq!(service.read_sector(2), Ok(second));
+        assert_eq!(service.backend().writes, 2);
+        assert_eq!(service.backend().reads, 2);
     }
 
     #[test]
-    fn virtio_service_rejects_out_of_range_sector_without_mutation() {
-        let mut service = VirtioBlkWriteService::<2>::new();
-        let request = BlkWriteRequest {
-            request_id: 1,
-            flags: BLK_WRITE_F_FIRST,
-            device_id: 1,
-            lba: 2,
-            sector_offset: 0,
-            data_len: 1,
-            data: [0xaa; BLK_WRITE_MAX_CHUNK_BYTES],
-        };
-        assert_eq!(
-            service.handle_write(&request).status,
-            BlkStatus::InvalidRequest
-        );
-        assert_eq!(service.read_sector(0), Ok([0; 512]));
+    fn trait_backed_out_of_range_write_is_rejected_without_mutation() {
+        let mut service = BlockWriteService::with_backend(MockBlockDevice::<4>::default());
+        let data = [0x11; 512];
+        let reply = write_sector(&mut service, 9, 4, &data);
+        assert_eq!(reply.status, BlkStatus::InvalidRequest);
+        assert_eq!(service.backend().writes, 0);
+    }
+
+    #[test]
+    fn generic_service_has_no_concrete_virtio_queue_or_device_dependency() {
+        let source = include_str!("service.rs");
+        for forbidden in [
+            ["VirtioBlk", "MemoryDevice"].concat(),
+            ["Virtq", "Chain"].concat(),
+            ["build_", "write_chain"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "generic service contains {forbidden}"
+            );
+        }
+        assert!(source.contains("BlockDeviceOps"));
+        assert!(source.contains("VIRTIO_BLK_SRV_READY"));
+        assert!(source.contains("VIRTIO_BLK_GET_INFO_REQUEST"));
     }
 }

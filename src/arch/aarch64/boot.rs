@@ -44,12 +44,14 @@ _start:
     adrp x0, boot_stack_aarch64_end
     add x0, x0, :lo12:boot_stack_aarch64_end
     mov sp, x0
+    bl yarm_aarch64_enter_el1_if_needed
+    bl yarm_aarch64_enable_fp_simd
+    mov x0, x20
+    bl yarm_aarch64_select_early_console
     bl yarm_aarch64_boot_breadcrumb_b0
     bl yarm_aarch64_boot_marker_start
     bl yarm_aarch64_boot_breadcrumb_b1
-    bl yarm_aarch64_enter_el1_if_needed
     bl yarm_aarch64_boot_breadcrumb_b2
-    bl yarm_aarch64_enable_fp_simd
     bl yarm_aarch64_boot_breadcrumb_b3
     mov x0, x20
     .weak yarm_kernel_main
@@ -412,16 +414,74 @@ yarm_aarch64_vector_dispatch:
 );
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+fn halt_stage1() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
+    use crate::arch::aarch64_boot_policy::DetectedPlatform;
+    use crate::kernel::boot_command_line::{BootPhase, PlatformOption, parse_yarm_boot_options};
+
+    let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
+        // Preserve the direct-kernel QEMU fallback when no firmware DTB can be read.
+        crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
+        return;
+    };
+    let Some(info) = crate::arch::aarch64_boot_policy::parse_platform_dtb(dtb) else {
+        return;
+    };
+    let raw = crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]);
+    let options = parse_yarm_boot_options(raw);
+    let selected = match options.platform {
+        PlatformOption::Auto => info.platform,
+        PlatformOption::QemuVirt => DetectedPlatform::QemuVirt,
+        PlatformOption::Rpi5 => DetectedPlatform::Rpi5Bcm2712,
+    };
+    match selected {
+        DetectedPlatform::QemuVirt => {
+            crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
+        }
+        DetectedPlatform::Rpi5Bcm2712 => {
+            let Some(serial) = info.serial else {
+                halt_stage1();
+            };
+            if !crate::arch::aarch64::console::init_dtb_pl011(serial.base as usize) {
+                halt_stage1();
+            }
+            crate::arch::aarch64::console::write_line("RPI5_BOOT_00_ENTRY");
+            if options.boot_phase == BootPhase::Entry {
+                halt_stage1();
+            }
+            crate::yarm_log!("RPI5_BOOT_01_DTB_PTR value=0x{:x}", start_info_ptr as u64);
+            crate::yarm_log!(
+                "RPI5_BOOT_02_UART_SELECTED path={} base=0x{:x}",
+                serial.path.as_str(),
+                serial.base
+            );
+            crate::arch::aarch64::console::write_line("RPI5_BOOT_03_UART_OK");
+            if options.boot_phase == BootPhase::Uart {
+                halt_stage1();
+            }
+        }
+        DetectedPlatform::Unknown => halt_stage1(),
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_boot_marker_start() {
-    crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BOOT_MARKER stage=_start");
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_boot_breadcrumb_b0() {
-    crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
     crate::arch::aarch64::console::write_line("YARM_AARCH64_BREADCRUMB B0");
 }
 
@@ -1855,6 +1915,60 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                 captured.raw_cmdline().len(),
                 captured.cmdline_was_truncated() as u8
             );
+            let options =
+                crate::kernel::boot_command_line::parse_yarm_boot_options(captured.raw_cmdline());
+            if let Some(info) = crate::arch::aarch64_boot_policy::parse_platform_dtb(dtb) {
+                use crate::arch::aarch64_boot_policy::DetectedPlatform;
+                use crate::kernel::boot_command_line::{BootPhase, PlatformOption};
+                let selected = match options.platform {
+                    PlatformOption::Auto => info.platform,
+                    PlatformOption::QemuVirt => DetectedPlatform::QemuVirt,
+                    PlatformOption::Rpi5 => DetectedPlatform::Rpi5Bcm2712,
+                };
+                crate::yarm_log!(
+                    "YARM_AARCH64_PLATFORM detected={} selected={} phase={:?} max_cpus={}",
+                    info.platform.label(),
+                    selected.label(),
+                    options.boot_phase,
+                    options.max_cpus.unwrap_or(0),
+                );
+                if selected == DetectedPlatform::Rpi5Bcm2712 {
+                    crate::yarm_log!(
+                        "RPI5_BOOT_DTB memory_start=0x{:x} memory_len=0x{:x} reserved_count={} reserved_first=0x{:x} reserved_first_len=0x{:x}",
+                        info.memory_start.unwrap_or(0),
+                        info.memory_len.unwrap_or(0),
+                        info.reserved_count,
+                        info.first_reserved_start.unwrap_or(0),
+                        info.first_reserved_len.unwrap_or(0),
+                    );
+                    crate::yarm_log!(
+                        "RPI5_BOOT_GIC path={} base=0x{:x}",
+                        info.interrupt_controller_path.as_str(),
+                        info.interrupt_controller_base.unwrap_or(0),
+                    );
+                    crate::yarm_log!(
+                        "RPI5_BOOT_INITRD present={} start=0x{:x} end=0x{:x}",
+                        info.has_initrd() as u8,
+                        info.initrd_start.unwrap_or(0),
+                        info.initrd_end.unwrap_or(0),
+                    );
+                    if matches!(options.boot_phase, BootPhase::Dtb | BootPhase::Mmu) {
+                        crate::yarm_log!("RPI5_BOOT_STOP phase={:?} stage1=1", options.boot_phase);
+                        halt_stage1();
+                    }
+                    if options.boot_phase == BootPhase::Kernel && !info.has_initrd() {
+                        crate::arch::aarch64::console::write_line(
+                            "RPI5_BOOT_KERNEL_REFUSED reason=missing_initrd",
+                        );
+                        halt_stage1();
+                    }
+                    // Stage 1 never enters the existing userspace boot chain on Raspberry Pi 5.
+                    crate::arch::aarch64::console::write_line(
+                        "RPI5_BOOT_KERNEL_REFUSED reason=stage1_uart_only",
+                    );
+                    halt_stage1();
+                }
+            }
             if let Some(parsed) = crate::arch::aarch64::dtb::parse_boot_dtb(dtb) {
                 crate::yarm_log!(
                     "YARM_AARCH64_DTB memory_start=0x{:x} memory_len=0x{:x} initrd_start=0x{:x} initrd_end=0x{:x} gic_cpu_if_base=0x{:x}",
@@ -1865,6 +1979,16 @@ pub fn prepare_arch_boot(_start_info_ptr: usize) {
                     parsed.gic_cpu_if_base.unwrap_or(0),
                 );
                 if let Some(bitmap) = parsed.present_cpu_bitmap {
+                    let max_cpus = options
+                        .max_cpus
+                        .unwrap_or(u64::BITS as usize)
+                        .min(u64::BITS as usize);
+                    let cpu_mask = if max_cpus == u64::BITS as usize {
+                        u64::MAX
+                    } else {
+                        (1u64 << max_cpus) - 1
+                    };
+                    let bitmap = bitmap & cpu_mask;
                     let _ = crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(bitmap);
                     crate::yarm_log!(
                         "YARM_AARCH64_DTB_CPU_BITMAP value=0x{:x} count={}",

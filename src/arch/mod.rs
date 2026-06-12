@@ -3,6 +3,8 @@
 
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
+#[cfg(any(test, target_arch = "aarch64"))]
+pub mod aarch64_boot_policy;
 pub mod boot_entry;
 pub mod cpu_mapping;
 #[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]

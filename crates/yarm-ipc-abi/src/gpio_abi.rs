@@ -196,6 +196,9 @@ pub enum GpioStatus {
     InvalidPin = 1,
     InvalidMode = 2,
     InvalidFunction = 3,
+    /// Operation is not defined by this ABI version or backend.
+    Unsupported = 4,
+    /// Legacy status retained for wire compatibility with earlier scaffolds.
     Unimplemented = 255,
 }
 
@@ -311,6 +314,7 @@ mod tests {
         assert_eq!(GpioStatusReply::ok().encode()[0], 0);
         assert_eq!(GpioStatusReply::err(GpioStatus::InvalidPin).encode()[0], 1);
         assert_eq!(GpioStatusReply::err(GpioStatus::InvalidMode).encode()[0], 2);
+        assert_eq!(GpioStatusReply::err(GpioStatus::Unsupported).encode()[0], 4);
     }
 
     #[test]

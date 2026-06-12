@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! IPC service loop for the RP1 GPIO driver.
+//! IPC dispatch for the RP1 GPIO userspace scaffold.
 //!
-//! The driver-manager spawns this server with the RP1 PCIe BAR virtual
-//! address stored in startup-slot 13 (`STARTUP_SLOT_SERVICE_EXTRA_CAP_0`)
-//! as a raw `u64`.  The service reads that slot, constructs the driver, and
-//! enters an IPC receive loop that dispatches GPIO_OP_* messages.
+//! `run()` intentionally does not obtain or dereference an address from a
+//! startup slot. RP1 production access is blocked on PCIe discovery and a
+//! capability-controlled MMIO grant contract. The pure [`dispatch`] helper is
+//! complete and hosted-mock tested so that transport can be enabled later
+//! without coupling protocol correctness to hardware availability.
 
-use super::device::{GpioDriver, PinMode, Rp1GpioDriver, TOTAL_GPIOS};
+use crate::drivers::gpio::{GpioDeviceError, GpioDeviceOps, GpioPinMode};
 use yarm_ipc_abi::gpio_abi::{
     GPIO_MODE_ALT_FUNC, GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GPIO_OP_READ_PIN, GPIO_OP_SET_FUNCTION,
     GPIO_OP_SET_PIN_MODE, GPIO_OP_WRITE_PIN, GpioReadPinReply, GpioReadPinRequest,
@@ -16,46 +17,112 @@ use yarm_ipc_abi::gpio_abi::{
     GpioWritePinRequest,
 };
 use yarm_user_rt::ipc::Message;
-use yarm_user_rt::runtime::{STARTUP_SLOT_SERVICE_EXTRA_CAP_0, startup_arg_slot, startup_context};
 
-/// Run the GPIO service loop.
+/// Entry point retained for binary/build parity.
 ///
-/// Blocks forever; the microkernel terminates this server by revoking its
-/// receive capability.  Returns immediately if the BAR address slot is absent
-/// or zero (misconfigured deployment).
+/// The server is not live-spawned. Enabling it requires a future RP1 PCIe BAR
+/// discovery, validation, mapping, and startup-grant contract; until then this
+/// function performs no MMIO and returns.
 pub fn run() {
-    let ctx = startup_context();
+    yarm_user_rt::user_log!("RP1_GPIO_SRV_DEFERRED_NO_MMIO_GRANT");
+}
 
-    // Receive endpoint handed to us by the driver-manager.
-    let Some(recv_cap) = ctx.process_manager_service_recv_ep else {
-        return;
-    };
-
-    // The driver-manager stores the RP1 PCIe BAR virtual address in slot 13
-    // before spawning this server.  Reading via `startup_arg_slot` bypasses
-    // the `cap_from_slot` truncation so values > u32::MAX are preserved.
-    let bar_vaddr = startup_arg_slot(STARTUP_SLOT_SERVICE_EXTRA_CAP_0).unwrap_or(0) as usize;
-
-    if bar_vaddr == 0 {
-        // BAR not configured — deployment error; fail silently so the
-        // supervisor can restart or report the fault.
-        return;
+fn status_for(error: GpioDeviceError) -> GpioStatus {
+    match error {
+        GpioDeviceError::InvalidPin => GpioStatus::InvalidPin,
+        GpioDeviceError::InvalidFunction => GpioStatus::InvalidFunction,
+        GpioDeviceError::Unsupported => GpioStatus::Unsupported,
     }
+}
 
-    // SAFETY: `bar_vaddr` was validated by the driver-manager as a
-    // Device-nGnRE mapped BAR covering the RP1 peripheral space.
-    let driver = unsafe { Rp1GpioDriver::new(bar_vaddr) };
+fn status_message(opcode: u16, result: Result<(), GpioDeviceError>) -> Option<Message> {
+    let status = match result {
+        Ok(()) => GpioStatusReply::ok(),
+        Err(error) => GpioStatusReply::err(status_for(error)),
+    };
+    Message::with_header(0, opcode, 0, None, &status.encode()).ok()
+}
 
-    yarm_user_rt::user_log!("RP1_GPIO_SRV_READY");
+/// Translate one ABI request into one reply without performing IPC syscalls.
+///
+/// Malformed payloads are deterministic errors, unknown operations return
+/// `Unsupported`, and all device failures are translated to ABI statuses.
+pub fn dispatch<D: GpioDeviceOps>(driver: &D, msg: &Message) -> Option<Message> {
+    match msg.opcode {
+        GPIO_OP_SET_FUNCTION => {
+            let result = GpioSetFunctionRequest::decode(msg.as_slice())
+                .ok_or(GpioDeviceError::InvalidPin)
+                .and_then(|req| driver.set_function(req.pin as usize, req.function as u32));
+            status_message(msg.opcode, result)
+        }
+        GPIO_OP_SET_PIN_MODE => {
+            let req = match GpioSetPinModeRequest::decode(msg.as_slice()) {
+                Some(req) => req,
+                None => return status_message(msg.opcode, Err(GpioDeviceError::InvalidPin)),
+            };
+            let mode = match req.mode {
+                GPIO_MODE_INPUT => GpioPinMode::Input,
+                GPIO_MODE_OUTPUT => GpioPinMode::Output {
+                    initial_level: req.initial_level != 0,
+                },
+                GPIO_MODE_ALT_FUNC => GpioPinMode::AltFunction(req.function as u32),
+                _ => {
+                    return Message::with_header(
+                        0,
+                        msg.opcode,
+                        0,
+                        None,
+                        &GpioStatusReply::err(GpioStatus::InvalidMode).encode(),
+                    )
+                    .ok();
+                }
+            };
+            status_message(msg.opcode, driver.set_pin_mode(req.pin as usize, mode))
+        }
+        GPIO_OP_WRITE_PIN => {
+            let result = GpioWritePinRequest::decode(msg.as_slice())
+                .ok_or(GpioDeviceError::InvalidPin)
+                .and_then(|req| driver.write_pin(req.pin as usize, req.level != 0));
+            status_message(msg.opcode, result)
+        }
+        GPIO_OP_READ_PIN => {
+            let req = match GpioReadPinRequest::decode(msg.as_slice()) {
+                Some(req) => req,
+                None => return status_message(msg.opcode, Err(GpioDeviceError::InvalidPin)),
+            };
+            match driver.read_pin(req.pin as usize) {
+                Ok(level) => Message::with_header(
+                    0,
+                    msg.opcode,
+                    0,
+                    None,
+                    &GpioReadPinReply {
+                        pin: req.pin,
+                        level: level as u8,
+                        _pad: [0; 2],
+                    }
+                    .encode(),
+                )
+                .ok(),
+                Err(error) => status_message(msg.opcode, Err(error)),
+            }
+        }
+        _ => status_message(msg.opcode, Err(GpioDeviceError::Unsupported)),
+    }
+}
 
+/// Future transport loop for a platform-granted device. It is intentionally
+/// not called by `run()` until the RP1 discovery/grant contract exists.
+#[allow(dead_code)]
+fn serve<D: GpioDeviceOps>(driver: &D, recv_cap: u32) -> ! {
     loop {
         match unsafe { yarm_user_rt::syscall::ipc_recv_v2(recv_cap) } {
             Ok(Some(received)) => {
-                let msg = received.message;
-                let Some(reply_cap) = received.reply_cap else {
-                    continue;
-                };
-                handle(&driver, &msg, reply_cap);
+                if let (Some(reply_cap), Some(reply)) =
+                    (received.reply_cap, dispatch(driver, &received.message))
+                {
+                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
+                }
             }
             Ok(None) => {}
             Err(_) => {
@@ -65,164 +132,171 @@ pub fn run() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Message dispatcher
-// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    extern crate std;
 
-fn handle(driver: &Rp1GpioDriver, msg: &Message, reply_cap: u32) {
-    match msg.opcode {
-        GPIO_OP_SET_FUNCTION => {
-            let status = match GpioSetFunctionRequest::decode(msg.as_slice()) {
-                Some(req) if (req.pin as usize) < TOTAL_GPIOS => {
-                    driver.set_function(req.pin as usize, req.function as u32);
-                    GpioStatusReply::ok()
-                }
-                Some(_) => GpioStatusReply::err(GpioStatus::InvalidPin),
-                None => GpioStatusReply::err(GpioStatus::InvalidPin),
-            };
-            reply_status(reply_cap, GPIO_OP_SET_FUNCTION, status);
+    use super::*;
+    use crate::drivers::gpio::{GpioDirection, GpioPull};
+    use core::cell::{Cell, RefCell};
+    use std::vec::Vec;
+
+    #[derive(Default)]
+    struct MockDriver {
+        calls: RefCell<Vec<(u8, usize, u32)>>,
+        read_level: Cell<bool>,
+    }
+
+    impl GpioDeviceOps for MockDriver {
+        fn set_function(&self, pin: usize, function: u32) -> Result<(), GpioDeviceError> {
+            if pin >= 54 {
+                return Err(GpioDeviceError::InvalidPin);
+            }
+            if function > 31 {
+                return Err(GpioDeviceError::InvalidFunction);
+            }
+            self.calls.borrow_mut().push((1, pin, function));
+            Ok(())
         }
 
-        GPIO_OP_SET_PIN_MODE => {
-            let status = match GpioSetPinModeRequest::decode(msg.as_slice()) {
-                Some(req) if (req.pin as usize) < TOTAL_GPIOS => match req.mode {
-                    GPIO_MODE_INPUT => {
-                        driver.set_pin_mode(req.pin as usize, PinMode::Input);
-                        GpioStatusReply::ok()
-                    }
-                    GPIO_MODE_OUTPUT => {
-                        driver.set_pin_mode(
-                            req.pin as usize,
-                            PinMode::Output {
-                                initial_level: req.initial_level != 0,
-                            },
-                        );
-                        GpioStatusReply::ok()
-                    }
-                    GPIO_MODE_ALT_FUNC => {
-                        driver.set_pin_mode(
-                            req.pin as usize,
-                            PinMode::AltFunction(req.function as u32),
-                        );
-                        GpioStatusReply::ok()
-                    }
-                    _ => GpioStatusReply::err(GpioStatus::InvalidMode),
-                },
-                Some(_) => GpioStatusReply::err(GpioStatus::InvalidPin),
-                None => GpioStatusReply::err(GpioStatus::InvalidPin),
+        fn set_pin_mode(&self, pin: usize, mode: GpioPinMode) -> Result<(), GpioDeviceError> {
+            if pin >= 54 {
+                return Err(GpioDeviceError::InvalidPin);
+            }
+            let value = match mode {
+                GpioPinMode::Input => 0,
+                GpioPinMode::Output { initial_level } => 1 + initial_level as u32,
+                GpioPinMode::AltFunction(function) => 0x100 + function,
             };
-            reply_status(reply_cap, GPIO_OP_SET_PIN_MODE, status);
+            self.calls.borrow_mut().push((2, pin, value));
+            Ok(())
         }
 
-        GPIO_OP_WRITE_PIN => {
-            let status = match GpioWritePinRequest::decode(msg.as_slice()) {
-                Some(req) if (req.pin as usize) < TOTAL_GPIOS => {
-                    driver.write_pin(req.pin as usize, req.level != 0);
-                    GpioStatusReply::ok()
-                }
-                Some(_) => GpioStatusReply::err(GpioStatus::InvalidPin),
-                None => GpioStatusReply::err(GpioStatus::InvalidPin),
-            };
-            reply_status(reply_cap, GPIO_OP_WRITE_PIN, status);
+        fn direction(&self, _pin: usize) -> Result<GpioDirection, GpioDeviceError> {
+            Ok(GpioDirection::Input)
         }
 
-        GPIO_OP_READ_PIN => match GpioReadPinRequest::decode(msg.as_slice()) {
-            Some(req) if (req.pin as usize) < TOTAL_GPIOS => {
-                let level = driver.read_pin(req.pin as usize);
-                let reply_payload = GpioReadPinReply {
-                    pin: req.pin,
-                    level: level as u8,
+        fn write_pin(&self, pin: usize, level: bool) -> Result<(), GpioDeviceError> {
+            if pin >= 54 {
+                return Err(GpioDeviceError::InvalidPin);
+            }
+            self.calls.borrow_mut().push((3, pin, level as u32));
+            Ok(())
+        }
+
+        fn read_pin(&self, pin: usize) -> Result<bool, GpioDeviceError> {
+            if pin >= 54 {
+                return Err(GpioDeviceError::InvalidPin);
+            }
+            self.calls.borrow_mut().push((4, pin, 0));
+            Ok(self.read_level.get())
+        }
+
+        fn set_pull(&self, _pin: usize, _pull: GpioPull) -> Result<(), GpioDeviceError> {
+            Err(GpioDeviceError::Unsupported)
+        }
+
+        fn pull(&self, _pin: usize) -> Result<GpioPull, GpioDeviceError> {
+            Err(GpioDeviceError::Unsupported)
+        }
+    }
+
+    fn request(opcode: u16, payload: &[u8]) -> Message {
+        Message::with_header(0, opcode, 0, None, payload).unwrap()
+    }
+
+    fn status(reply: &Message) -> u8 {
+        GpioStatusReply::decode(reply.as_slice()).unwrap().status
+    }
+
+    #[test]
+    fn dispatch_covers_every_v1_request_and_reply() {
+        let driver = MockDriver::default();
+        let cases = [
+            request(
+                GPIO_OP_SET_FUNCTION,
+                &GpioSetFunctionRequest {
+                    pin: 4,
+                    function: 3,
                     _pad: [0; 2],
                 }
-                .encode();
-                if let Ok(reply) =
-                    Message::with_header(0, GPIO_OP_READ_PIN, 0, None, &reply_payload)
-                {
-                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
+                .encode(),
+            ),
+            request(
+                GPIO_OP_SET_PIN_MODE,
+                &GpioSetPinModeRequest {
+                    pin: 5,
+                    mode: GPIO_MODE_OUTPUT,
+                    function: 0,
+                    initial_level: 1,
                 }
-            }
-            Some(_) | None => {
-                reply_status(
-                    reply_cap,
-                    GPIO_OP_READ_PIN,
-                    GpioStatusReply::err(GpioStatus::InvalidPin),
-                );
-            }
-        },
+                .encode(),
+            ),
+            request(
+                GPIO_OP_WRITE_PIN,
+                &GpioWritePinRequest {
+                    pin: 6,
+                    level: 1,
+                    _pad: [0; 2],
+                }
+                .encode(),
+            ),
+        ];
+        for msg in cases {
+            assert_eq!(
+                status(&dispatch(&driver, &msg).unwrap()),
+                GpioStatus::Ok as u8
+            );
+        }
 
-        _ => {
-            // Unknown opcode — send a generic error status.
-            reply_status(
-                reply_cap,
-                msg.opcode,
-                GpioStatusReply::err(GpioStatus::Unimplemented),
+        driver.read_level.set(true);
+        let read = request(
+            GPIO_OP_READ_PIN,
+            &GpioReadPinRequest {
+                pin: 7,
+                _pad: [0; 3],
+            }
+            .encode(),
+        );
+        let reply = dispatch(&driver, &read).unwrap();
+        assert_eq!(GpioReadPinReply::decode(reply.as_slice()).unwrap().level, 1);
+        assert_eq!(driver.calls.borrow().len(), 4);
+    }
+
+    #[test]
+    fn invalid_pin_is_deterministic_for_all_pin_operations() {
+        let driver = MockDriver::default();
+        let messages = [
+            request(GPIO_OP_SET_FUNCTION, &[54, 1, 0, 0]),
+            request(GPIO_OP_SET_PIN_MODE, &[54, GPIO_MODE_INPUT, 0, 0]),
+            request(GPIO_OP_WRITE_PIN, &[54, 1, 0, 0]),
+            request(GPIO_OP_READ_PIN, &[54, 0, 0, 0]),
+        ];
+        for msg in messages {
+            assert_eq!(
+                status(&dispatch(&driver, &msg).unwrap()),
+                GpioStatus::InvalidPin as u8
             );
         }
     }
-}
-
-/// Send a `GpioStatusReply` as a reply to the given capability.
-#[inline]
-fn reply_status(reply_cap: u32, opcode: u16, status: GpioStatusReply) {
-    if let Ok(reply) = Message::with_header(0, opcode, 0, None, &status.encode()) {
-        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &reply) };
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use yarm_ipc_abi::gpio_abi::{GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GpioStatus, GpioStatusReply};
 
     #[test]
-    fn gpio_status_reply_ok_encodes_zero() {
-        assert_eq!(GpioStatusReply::ok().encode()[0], GpioStatus::Ok as u8);
-    }
-
-    #[test]
-    fn set_function_request_decode_rejects_short_payload() {
-        assert!(GpioSetFunctionRequest::decode(&[]).is_none());
-        assert!(GpioSetFunctionRequest::decode(&[0; 3]).is_none());
-    }
-
-    #[test]
-    fn set_pin_mode_decode_round_trips_all_modes() {
-        for mode in [GPIO_MODE_INPUT, GPIO_MODE_OUTPUT, GPIO_MODE_ALT_FUNC] {
-            let req = GpioSetPinModeRequest {
-                pin: 10,
-                mode,
-                function: 2,
-                initial_level: 1,
-            };
-            assert_eq!(GpioSetPinModeRequest::decode(&req.encode()), Some(req));
-        }
-    }
-
-    #[test]
-    fn write_pin_request_round_trips_high_and_low() {
-        for level in [0u8, 1u8] {
-            let req = GpioWritePinRequest {
-                pin: 5,
-                level,
-                _pad: [0; 2],
-            };
-            assert_eq!(GpioWritePinRequest::decode(&req.encode()), Some(req));
-        }
-    }
-
-    #[test]
-    fn read_pin_reply_encodes_pin_and_level() {
-        let reply = GpioReadPinReply {
-            pin: 17,
-            level: 1,
-            _pad: [0; 2],
-        };
-        let enc = reply.encode();
-        assert_eq!(enc[0], 17);
-        assert_eq!(enc[1], 1);
+    fn malformed_and_unsupported_requests_return_errors_without_panic() {
+        let driver = MockDriver::default();
+        let malformed = request(GPIO_OP_WRITE_PIN, &[1, 1, 0]);
+        assert_eq!(
+            status(&dispatch(&driver, &malformed).unwrap()),
+            GpioStatus::InvalidPin as u8
+        );
+        let unknown = request(0xffff, &[]);
+        assert_eq!(
+            status(&dispatch(&driver, &unknown).unwrap()),
+            GpioStatus::Unsupported as u8
+        );
+        let bad_mode = request(GPIO_OP_SET_PIN_MODE, &[1, 99, 0, 0]);
+        assert_eq!(
+            status(&dispatch(&driver, &bad_mode).unwrap()),
+            GpioStatus::InvalidMode as u8
+        );
     }
 }
