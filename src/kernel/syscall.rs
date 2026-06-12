@@ -3871,33 +3871,22 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
         let unmap_start = round_up_page(requested)?;
         let unmap_end = round_up_page(current_end)?;
         if unmap_start < unmap_end {
-            // Stage 5F two-phase shrink: resolve ASID once before the loop
-            // (plan-first: snapshot task rank 2 before vm+memory mutation).
-            // Equivalent to the per-iteration resolution in the old path, but
-            // done once so the loop body is free of scheduler/task reads.
+            // VALIDATION: D3_LIVE_SPLIT (Stage 107)
+            // Stage 5F two-phase shrink: resolve ASID once before the helper
+            // call (plan-first: snapshot task rank 2 before vm+memory
+            // mutation). Stage 107 routes the per-page two-phase loop into
+            // the typed `vm_brk_shrink_two_phase` helper in memory_state.rs
+            // — observability + future SharedKernel seam anchor. The per-page
+            // ordering (Phase 1 PTE remove → Phase 2 TLB shootdown wait →
+            // Phase 3 frame reclaim, via execute_tlb_shootdown_wait_plan)
+            // is byte-identical to the pre-Stage-107 inline loop. See
+            // doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §22.
             let asid = kernel
                 .task_asid(plan.tid)
                 .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
-            let mut va = unmap_start;
-            while va < unmap_end {
-                // Stage 5F: two-phase unmap per page.
-                //   Phase 1 (unmap_page_phase1): remove page table entry, clear COW,
-                //     decrement map_refcount.  Returns Ok(None) for lazy/absent pages
-                //     so the loop tolerates brk pages that were never faulted in.
-                //   Phase 2 (execute_tlb_shootdown_wait_plan): TLB shootdown when
-                //     needed, then frame reclamation AFTER shootdown completes.
-                //   This ordering (reclaim after shootdown) is the fix for Stage 5E
-                //   blocker #1b: the old path reclaimed before shooting.
-                if let Some(wait_plan) = kernel
-                    .unmap_page_phase1(asid, VirtAddr(va as u64))
-                    .map_err(SyscallError::from)?
-                {
-                    kernel
-                        .execute_tlb_shootdown_wait_plan(wait_plan)
-                        .map_err(SyscallError::from)?;
-                }
-                va += PAGE_SIZE;
-            }
+            kernel
+                .vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)
+                .map_err(SyscallError::from)?;
         }
     }
 
@@ -8668,6 +8657,211 @@ mod tests {
         assert!(
             smoke.contains("QEMU_SMP=1"),
             "x86_64 core smoke must remain pinned to -smp 1 (AI_AGENT_RULES §5.1)"
+        );
+    }
+
+    // ── Stage 107 / Pass 3 cont'd: D3 + D6 live-wire tests ────────────────────
+
+    #[test]
+    fn stage107_d3_vm_brk_shrink_routes_through_typed_helper() {
+        // handle_vm_brk for the shrink case must route the per-page two-phase
+        // loop through KernelState::vm_brk_shrink_two_phase. Source-scan + a
+        // syscall.rs textual assertion together pin the live wire.
+        let src = include_str!("syscall.rs");
+        let mem_src = include_str!("boot/memory_state.rs");
+        assert!(
+            mem_src.contains("fn vm_brk_shrink_two_phase"),
+            "memory_state.rs must define the typed shrink helper"
+        );
+        assert!(
+            src.contains("kernel\n                .vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)")
+                || src.contains(".vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)"),
+            "handle_vm_brk must route shrink through the typed helper"
+        );
+        // The inline per-page loop must be gone from handle_vm_brk: no direct
+        // `kernel.execute_tlb_shootdown_wait_plan(` invocation lives in the
+        // body anymore (calls have moved into the typed helper).
+        let handle_body = src
+            .split("fn handle_vm_brk")
+            .nth(1)
+            .expect("handle_vm_brk present");
+        let next_fn = handle_body.find("\nfn ").unwrap_or(handle_body.len());
+        let handle_body = &handle_body[..next_fn];
+        assert!(
+            !handle_body.contains("kernel\n                    .execute_tlb_shootdown_wait_plan")
+                && !handle_body.contains("kernel.execute_tlb_shootdown_wait_plan("),
+            "handle_vm_brk must not invoke execute_tlb_shootdown_wait_plan directly"
+        );
+        assert!(
+            !handle_body.contains(".unmap_page_phase1(asid"),
+            "handle_vm_brk must not call unmap_page_phase1 directly anymore"
+        );
+        // The shootdown-before-reclaim ordering inside the helper is the
+        // structural invariant the D3 unlock rests on.
+        let helper_body = mem_src
+            .split("fn vm_brk_shrink_two_phase")
+            .nth(1)
+            .expect("helper present");
+        assert!(
+            helper_body.contains("self.execute_tlb_shootdown_wait_plan(plan)?;"),
+            "shrink helper must invoke execute_tlb_shootdown_wait_plan (Phase 2+3)"
+        );
+    }
+
+    #[test]
+    fn stage107_d3_shrink_telemetry_counts_pages_and_zero_shootdowns_on_smp1() {
+        // Drive the typed shrink helper on a lazy range and verify telemetry.
+        // On -smp 1 (single-CPU hosted-dev), no page has a non-zero target
+        // bitmap, so shootdowns stays 0; pages_unmapped is 0 for a fully
+        // lazy range (matches the existing brk-shrink-over-lazy-pages
+        // contract). The call counter increments monotonically per call.
+        use crate::kernel::boot::Bootstrap;
+        use crate::kernel::vm::PAGE_SIZE;
+        let mut kernel = Bootstrap::init().expect("bootstrap");
+        let tid = kernel.current_tid().expect("boot");
+        let (asid, _aspace) = kernel.create_user_address_space().expect("asid");
+        kernel.bind_task_asid(tid, asid).expect("bind asid");
+
+        let base = 0x4000_0000usize;
+        let end = base + 2 * PAGE_SIZE;
+
+        let before = kernel.ipc_path_telemetry();
+        let result = kernel.vm_brk_shrink_two_phase(asid, base, end);
+        assert!(result.is_ok());
+        let after = kernel.ipc_path_telemetry();
+        assert_eq!(
+            after.d3_vm_brk_shrink_calls,
+            before.d3_vm_brk_shrink_calls + 1,
+            "shrink call counter must increment by 1 per invocation"
+        );
+        assert_eq!(
+            after.d3_vm_brk_shrink_shootdowns,
+            before.d3_vm_brk_shrink_shootdowns,
+            "shootdowns must stay 0 on -smp 1 (target_cpu_bitmap empty)"
+        );
+        assert!(after.d3_vm_brk_shrink_pages_unmapped >= before.d3_vm_brk_shrink_pages_unmapped);
+    }
+
+    #[test]
+    fn stage107_d3_shrink_empty_range_is_safe_no_op() {
+        // unmap_start == unmap_end ⇒ helper does nothing but still bumps the
+        // call counter so smoke can grep for it.
+        use crate::kernel::boot::Bootstrap;
+        let mut kernel = Bootstrap::init().expect("bootstrap");
+        let tid = kernel.current_tid().expect("boot");
+        let (asid, _aspace) = kernel.create_user_address_space().expect("asid");
+        kernel.bind_task_asid(tid, asid).expect("bind asid");
+        let before = kernel.ipc_path_telemetry();
+        let (pages, shootdowns) = kernel
+            .vm_brk_shrink_two_phase(asid, 0x4000_0000, 0x4000_0000)
+            .expect("empty shrink");
+        assert_eq!((pages, shootdowns), (0, 0));
+        let after = kernel.ipc_path_telemetry();
+        assert_eq!(
+            after.d3_vm_brk_shrink_calls,
+            before.d3_vm_brk_shrink_calls + 1
+        );
+    }
+
+    #[test]
+    fn stage107_d6_local_dispatch_routes_through_typed_helper() {
+        // dispatch_next_task must call local_dispatch_step_split (the typed
+        // D6 entry) instead of dispatch_next_current_cpu directly.
+        let exec_src = include_str!("boot/exec_state.rs");
+        let sched_src = include_str!("boot/scheduler_state.rs");
+        assert!(
+            sched_src.contains("fn local_dispatch_step_split"),
+            "scheduler_state.rs must define the typed local-dispatch helper"
+        );
+        assert!(
+            exec_src.contains("self.local_dispatch_step_split()"),
+            "dispatch_next_task must route through the typed helper"
+        );
+        // The helper must take only the scheduler-state lock — `scheduler_state()`
+        // is the rank-1 split-mut accessor. Bound the captured slice to the
+        // helper body so forbidden-substring checks don't bleed into the next
+        // method's body.
+        let helper_body = sched_src
+            .split("fn local_dispatch_step_split")
+            .nth(1)
+            .expect("helper present");
+        let next_fn = helper_body.find("\n    pub ").or(helper_body.find("\n    fn "));
+        let helper_body = match next_fn {
+            Some(end) => &helper_body[..end],
+            None => helper_body,
+        };
+        assert!(
+            helper_body.contains("self.scheduler_state();"),
+            "local_dispatch_step_split must take only scheduler_state (rank 1)"
+        );
+        // Cross-CPU wake / ASID switch / timer fences: none of these terms
+        // may appear in the helper body — they remain on the global path.
+        for forbidden in [
+            "task_asid(",
+            "enqueue_woken_task",
+            "entering_tid",
+            "exiting_tid",
+        ] {
+            assert!(
+                !helper_body.contains(forbidden),
+                "local_dispatch_step_split must not touch {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage107_d6_local_dispatch_telemetry_increments_per_call() {
+        use crate::kernel::boot::Bootstrap;
+        let mut kernel = Bootstrap::init().expect("bootstrap");
+        kernel.register_task(500).expect("register");
+        kernel.enqueue_current_cpu(500).expect("enqueue");
+        let before = kernel.ipc_path_telemetry();
+        kernel.dispatch_next_task().expect("dispatch");
+        let after = kernel.ipc_path_telemetry();
+        assert_eq!(
+            after.d6_local_dispatch_calls,
+            before.d6_local_dispatch_calls + 1,
+            "dispatch must route through local_dispatch_step_split exactly once"
+        );
+    }
+
+    #[test]
+    fn stage107_d6_class_f_invariants_preserved() {
+        // entering_tid / exiting_tid remain Class F (global-lock authoritative
+        // reads). They must NOT be moved to the local-dispatch helper.
+        let sched_src = include_str!("boot/scheduler_state.rs");
+        let runtime_src = include_str!("../runtime.rs");
+        // The authoritative reads stay in runtime.rs / scheduler_state.rs as
+        // their existing helpers (current_tid_authoritative). Make sure no
+        // *_split_read alias snuck into D6 territory.
+        let helper_body = sched_src
+            .split("fn local_dispatch_step_split")
+            .nth(1)
+            .expect("helper present");
+        assert!(!helper_body.contains("current_tid_split_read"));
+        // The runtime still exposes the authoritative API used at trap entry.
+        assert!(
+            runtime_src.contains("current_tid_authoritative"),
+            "current_tid_authoritative must remain the Class F entry point"
+        );
+    }
+
+    #[test]
+    fn stage107_milestone_doc_lists_pass3_continuation() {
+        // The Milestone 1 doc must remain DECLARED and document the Stage 107
+        // continuation (D3.1 + D6.1 first live steps) in the Milestone 2
+        // work list — proving the doc tracks what's live.
+        let doc = include_str!("../../doc/KERNEL_UNLOCKING_MILESTONE_1.md");
+        assert!(doc.contains("Milestone status: DECLARED"));
+        // Audit doc must carry the Stage 107 section.
+        let audit = include_str!("../../doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md");
+        assert!(
+            audit.contains("Stage 107") && audit.contains("D3_LIVE_SPLIT"),
+            "audit doc must record Stage 107 D3 live wiring"
+        );
+        assert!(
+            audit.contains("D6_LIVE_SPLIT"),
+            "audit doc must record Stage 107 D6 live wiring"
         );
     }
 

@@ -2316,6 +2316,36 @@ impl KernelState {
         });
     }
 
+    /// Stage 107 / D3: count a routed VmBrk shrink invocation through
+    /// `vm_brk_shrink_two_phase`. The counter is keyed off the IPC telemetry
+    /// struct because that is the kernel's shared telemetry surface; no IPC
+    /// state is touched by this helper. `pages_unmapped` and `shootdowns`
+    /// are also accumulated for smoke-grep parity.
+    pub(crate) fn note_d3_vm_brk_shrink(&mut self, pages_unmapped: usize, shootdowns: usize) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.d3_vm_brk_shrink_calls =
+                ipc.telemetry.d3_vm_brk_shrink_calls.saturating_add(1);
+            ipc.telemetry.d3_vm_brk_shrink_pages_unmapped = ipc
+                .telemetry
+                .d3_vm_brk_shrink_pages_unmapped
+                .saturating_add(pages_unmapped as u64);
+            ipc.telemetry.d3_vm_brk_shrink_shootdowns = ipc
+                .telemetry
+                .d3_vm_brk_shrink_shootdowns
+                .saturating_add(shootdowns as u64);
+        });
+    }
+
+    /// Stage 107 / D6: count a local-CPU dispatch through the typed helper
+    /// `local_dispatch_step_split`. Same telemetry-keying rationale as
+    /// `note_d3_vm_brk_shrink`.
+    pub(crate) fn note_d6_local_dispatch(&mut self) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.d6_local_dispatch_calls =
+                ipc.telemetry.d6_local_dispatch_calls.saturating_add(1);
+        });
+    }
+
     /// Stage 106 / D2 test hook: expose the private `wake_tid_to_runnable`
     /// so the executable no-lost-wakeup unwind proof
     /// (`stage106_d2_no_lost_wakeup_unwind_sequence_drains_message`) can

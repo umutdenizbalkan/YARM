@@ -83,6 +83,43 @@ impl KernelState {
         next
     }
 
+    /// Stage 107 / D6 first live step — typed local-CPU dispatch step.
+    ///
+    /// VALIDATION: D6_LIVE_SPLIT — called from
+    /// `exec_state.rs::dispatch_next_task` since Stage 107.
+    /// VALIDATION: FALLBACK_GLOBAL_LOCK — cross-CPU wake, ASID switch, timer
+    /// preemption, and `entering_tid` / `exiting_tid` (Class F per
+    /// `KERNEL_LOCKING.md` Rule N+4) remain under the global lock. The typed
+    /// helper covers ONLY the local-CPU runqueue dispatch step.
+    ///
+    /// Semantics are byte-identical to `dispatch_next_current_cpu`: takes
+    /// only the scheduler-state lock (rank 1) on the current CPU's
+    /// per-CPU `RingQueue` set; returns the dispatched TID. The D6 unlock
+    /// thesis is that under a future SharedKernel split-mut seam this method
+    /// is the seam — the per-CPU runqueue lock could be sharded without
+    /// touching the membership table or the `entering_tid`/`exiting_tid`
+    /// authoritative reads. Stage 107 adds the typed entry point and
+    /// telemetry; the per-CPU sharding waits on the SMP trampoline split.
+    ///
+    /// Telemetry: `d6_local_dispatch_calls` (+1 per call). Smoke marker:
+    /// `D6_LOCAL_DISPATCH cpu=N tid=Some(T)|None`.
+    pub fn local_dispatch_step_split(&mut self) -> Option<u64> {
+        let cpu = self.current_cpu();
+        let next = {
+            let mut sched = self.scheduler_state();
+            kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(cpu)
+                .map(|tid| tid.0)
+        };
+        self.note_d6_local_dispatch();
+        crate::yarm_log!(
+            "D6_LOCAL_DISPATCH cpu={} tid={:?}",
+            cpu.0,
+            next
+        );
+        next
+    }
+
     pub fn on_preempt_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();

@@ -1267,7 +1267,11 @@ impl KernelState {
                 ipc.telemetry.scheduler_dispatch_calls.saturating_add(1);
         });
         let outgoing_tid = self.current_tid();
-        let next = self.dispatch_next_current_cpu();
+        // VALIDATION: D6_LIVE_SPLIT (Stage 107)
+        // Route the local-CPU dispatch step through the typed helper for
+        // telemetry + future SharedKernel-seam wrapping. Behavior is
+        // byte-identical to dispatch_next_current_cpu.
+        let next = self.local_dispatch_step_split();
         if let Some(tid) = next {
             crate::yarm_log!("SCHED_DISPATCH_NEXT chosen_tid={}", tid);
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
