@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
+//! Internal userspace UART service state and mock-testable PL011 data helpers.
+//!
+//! No UART wire ABI exists yet, so this module does not invent request opcodes.
+//! The kernel early console is a separate architecture facility and is not used
+//! by this server.
+
+use super::device::{Pl011UartDevice, UartError, UartRegisterIo};
+
 const UART_TX_QUEUE_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,18 +57,51 @@ impl UartService {
     pub const fn stats(&self) -> UartStats {
         self.stats
     }
+
+    /// Attempt a nonblocking write to a configured PL011 backend.
+    ///
+    /// Accepted and unaccepted bytes are reflected in the same counters used
+    /// by the existing synthetic queue model. No retry loop is performed.
+    pub fn write_device<B: UartRegisterIo>(
+        &mut self,
+        device: &Pl011UartDevice<B>,
+        bytes: &[u8],
+    ) -> Result<usize, UartError> {
+        match device.write_bytes(bytes) {
+            Ok(written) => {
+                self.stats.tx_bytes = self.stats.tx_bytes.saturating_add(written as u64);
+                self.stats.dropped_tx_bytes = self
+                    .stats
+                    .dropped_tx_bytes
+                    .saturating_add(bytes.len().saturating_sub(written) as u64);
+                Ok(written)
+            }
+            Err(error) => {
+                self.stats.dropped_tx_bytes = self
+                    .stats
+                    .dropped_tx_bytes
+                    .saturating_add(bytes.len() as u64);
+                Err(error)
+            }
+        }
+    }
+
+    /// Poll one receive byte without waiting and account for successful input.
+    pub fn read_device_nonblocking<B: UartRegisterIo>(
+        &mut self,
+        device: &Pl011UartDevice<B>,
+    ) -> Result<u8, UartError> {
+        let byte = device.read_byte_nonblocking()?;
+        self.stats.rx_bytes = self.stats.rx_bytes.saturating_add(1);
+        Ok(byte)
+    }
 }
 
 pub fn run() {
-    let mut svc = UartService::new();
-    svc.write(4);
-    let s = svc.stats();
-    yarm_user_rt::user_log!(
-        "uart.srv online: tx_bytes={}, rx_bytes={}, dropped_tx_bytes={}",
-        s.tx_bytes,
-        s.rx_bytes,
-        s.dropped_tx_bytes
-    );
+    // The binary exists for build parity but is not live-spawned. A future
+    // platform service must discover the UART from DTB/platform data and pass
+    // a validated capability-granted MMIO mapping before a device is created.
+    yarm_user_rt::user_log!("UART_SRV_DEFERRED_NO_MMIO_GRANT");
 }
 
 #[cfg(test)]
@@ -82,5 +123,39 @@ mod tests {
                 dropped_tx_bytes: 16,
             }
         );
+    }
+
+    #[test]
+    fn internal_data_helpers_translate_nonblocking_device_results() {
+        use crate::drivers::uart::{MockUartRegisters, Pl011UartDevice, regs};
+
+        let device = Pl011UartDevice::new(MockUartRegisters::default());
+        let mut service = UartService::new();
+
+        device.backend().set(regs::FR, 0);
+        assert_eq!(service.write_device(&device, b"OK"), Ok(2));
+        device.backend().set(regs::DR, b'R' as u32);
+        assert_eq!(service.read_device_nonblocking(&device), Ok(b'R'));
+        assert_eq!(
+            service.stats(),
+            UartStats {
+                tx_bytes: 2,
+                rx_bytes: 1,
+                dropped_tx_bytes: 0,
+            }
+        );
+
+        device
+            .backend()
+            .set(regs::FR, regs::fr::TXFF | regs::fr::RXFE);
+        assert_eq!(
+            service.write_device(&device, b"NO"),
+            Err(UartError::TxWouldBlock)
+        );
+        assert_eq!(
+            service.read_device_nonblocking(&device),
+            Err(UartError::RxWouldBlock)
+        );
+        assert_eq!(service.stats().dropped_tx_bytes, 2);
     }
 }

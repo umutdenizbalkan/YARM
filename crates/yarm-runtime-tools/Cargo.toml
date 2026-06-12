@@ -18,3 +18,8 @@ yarm = { path = "../..", default-features = false, features = ["hosted-dev"] }
 name = "core_profile_smoke"
 path = "src/bin/core_profile_smoke.rs"
 required-features = ["hosted-dev", "legacy-tests"]
+
+[[bin]]
+name = "dtb_probe"
+path = "src/bin/dtb_probe.rs"
+required-features = ["hosted-dev"]
