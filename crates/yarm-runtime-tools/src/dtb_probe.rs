@@ -4,6 +4,7 @@
 //! Bounds-checked Flattened Device Tree inspection for the hosted `dtb_probe`
 //! command. This parser is intentionally separate from kernel DTB handling.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
@@ -92,6 +93,31 @@ pub struct ParsedFdt {
 pub struct RegRange {
     pub address: u64,
     pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StdoutPath<'a> {
+    pub raw: String,
+    pub device: String,
+    pub options: Option<String>,
+    pub node: Option<&'a Node>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    QemuVirt,
+    Rpi5Bcm2712,
+    Unknown,
+}
+
+impl Platform {
+    fn label(self) -> &'static str {
+        match self {
+            Self::QemuVirt => "qemu-virt",
+            Self::Rpi5Bcm2712 => "rpi5-bcm2712",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,6 +344,60 @@ pub fn parse_reg_ranges(
     Ok(ranges)
 }
 
+pub fn aliases(parsed: &ParsedFdt) -> BTreeMap<String, String> {
+    node(parsed, "/aliases")
+        .map(|aliases| {
+            aliases
+                .properties
+                .iter()
+                .filter_map(|property| {
+                    decode_string(&property.value).map(|value| (property.name.clone(), value))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn resolve_stdout_path(parsed: &ParsedFdt) -> Option<StdoutPath<'_>> {
+    let raw = node(parsed, "/chosen")?
+        .property("stdout-path")
+        .and_then(decode_string)?;
+    let (reference, options) = match raw.split_once(':') {
+        Some((path, options)) => (path.to_string(), Some(options.to_string())),
+        None => (raw.clone(), None),
+    };
+    let device = if reference.starts_with('/') {
+        reference
+    } else {
+        aliases(parsed)
+            .get(&reference)
+            .cloned()
+            .unwrap_or(reference)
+    };
+    Some(StdoutPath {
+        node: node(parsed, &device),
+        raw,
+        device,
+        options,
+    })
+}
+
+pub fn classify_platform(parsed: &ParsedFdt) -> Platform {
+    let compatible = node(parsed, "/").map(Node::compatible).unwrap_or_default();
+    if compatible
+        .iter()
+        .any(|value| value.contains("bcm2712") || value.contains("raspberrypi,5-model-b"))
+    {
+        Platform::Rpi5Bcm2712
+    } else if compatible.iter().any(|value| {
+        value == "linux,dummy-virt" || value == "qemu,virt" || value.contains("qemu-virt")
+    }) {
+        Platform::QemuVirt
+    } else {
+        Platform::Unknown
+    }
+}
+
 pub fn classify_node(node: &Node) -> NodeClasses {
     let name = node.name.to_ascii_lowercase();
     let path = node.path.to_ascii_lowercase();
@@ -393,20 +473,11 @@ pub fn render_report(parsed: &ParsedFdt) -> String {
         writeln!(out, "<missing>").unwrap();
     }
 
+    section(&mut out, "Resolved stdout");
+    render_resolved_stdout(&mut out, parsed);
+
     section(&mut out, "Memory ranges");
-    let memory: Vec<_> = parsed
-        .nodes
-        .iter()
-        .filter(|node| {
-            node.name == "memory"
-                || node.name.starts_with("memory@")
-                || node
-                    .property("device_type")
-                    .and_then(decode_string)
-                    .as_deref()
-                    == Some("memory")
-        })
-        .collect();
+    let memory = memory_nodes(parsed);
     render_nodes(&mut out, &memory, false, false);
 
     section(&mut out, "Reserved memory");
@@ -434,6 +505,214 @@ pub fn render_report(parsed: &ParsedFdt) -> String {
         render_nodes(&mut out, &nodes, false, title == "PCIe/RP1-ish nodes");
     }
     out
+}
+
+pub fn render_yarm_readiness(parsed: &ParsedFdt) -> String {
+    let mut out = String::new();
+    let platform = classify_platform(parsed);
+    let memory: Vec<_> = memory_nodes(parsed)
+        .into_iter()
+        .filter(|node| node_is_usable(node))
+        .collect();
+    let stdout = resolve_stdout_path(parsed);
+    let serial = stdout
+        .as_ref()
+        .and_then(|stdout| stdout.node)
+        .filter(|node| classify_node(node).serial && node_is_usable(node))
+        .or_else(|| first_usable(parsed, |classes| classes.serial));
+    let interrupt = first_usable(parsed, |classes| classes.interrupt_controller);
+    let pcie_rp1: Vec<_> = parsed
+        .nodes
+        .iter()
+        .filter(|node| is_rp1_pcie_node(node) && node_is_usable(node))
+        .collect();
+    let initrd = initrd_range(parsed);
+
+    writeln!(out, "== YARM Readiness ==").unwrap();
+    writeln!(out, "platform: {}", platform.label()).unwrap();
+    writeln!(out, "memory-ranges:").unwrap();
+    if memory.is_empty() {
+        writeln!(out, "  <none>").unwrap();
+    } else {
+        for memory_node in &memory {
+            render_readiness_ranges(&mut out, memory_node);
+        }
+    }
+    match initrd {
+        Some((start, end)) if end > start => {
+            writeln!(
+                out,
+                "initrd: present start=0x{start:x} end=0x{end:x} size=0x{:x}",
+                end - start
+            )
+            .unwrap();
+        }
+        _ => writeln!(out, "initrd: missing").unwrap(),
+    }
+    match &stdout {
+        Some(stdout) => {
+            writeln!(out, "stdout-path-raw: {}", stdout.raw).unwrap();
+            writeln!(out, "stdout-path-resolved: {}", stdout.device).unwrap();
+        }
+        None => {
+            writeln!(out, "stdout-path-raw: <missing>").unwrap();
+            writeln!(out, "stdout-path-resolved: <missing>").unwrap();
+        }
+    }
+    line_candidate(&mut out, "first-usable-serial", serial);
+    line_candidate(&mut out, "interrupt-controller", interrupt);
+    if pcie_rp1.is_empty() {
+        writeln!(out, "rp1-pcie: missing").unwrap();
+    } else {
+        writeln!(
+            out,
+            "rp1-pcie: present ({})",
+            pcie_rp1
+                .iter()
+                .map(|node| node.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+        .unwrap();
+    }
+
+    writeln!(out, "warnings:").unwrap();
+    let mut warnings = Vec::new();
+    if platform == Platform::Unknown {
+        warnings.push("unrecognized platform; YARM AArch64 first-boot assumptions are unverified");
+    }
+    if platform == Platform::Rpi5Bcm2712 {
+        warnings.push("Raspberry Pi 5 bare-metal boot and RP1 device support are not implemented");
+    }
+    if memory.is_empty() {
+        warnings.push("no usable memory range was discovered");
+    }
+    if initrd.is_none_or(|(start, end)| end <= start) {
+        warnings.push(
+            "linux,initrd-start/end are missing or invalid; initramfs /init cannot be handed off",
+        );
+    }
+    if stdout.as_ref().and_then(|stdout| stdout.node).is_none() {
+        warnings.push("stdout-path is missing or does not resolve to a DT node");
+    }
+    if serial.is_none() {
+        warnings.push("no enabled serial node is available for early boot markers");
+    }
+    if interrupt.is_none() {
+        warnings.push("no enabled interrupt-controller node was found");
+    }
+    if platform == Platform::Rpi5Bcm2712 && pcie_rp1.is_empty() {
+        warnings.push(
+            "BCM2712 tree has no RP1/PCIe candidate; Pi 5 peripheral discovery is incomplete",
+        );
+    }
+    if warnings.is_empty() {
+        writeln!(out, "  <none>").unwrap();
+    } else {
+        for warning in warnings {
+            writeln!(out, "  - {warning}").unwrap();
+        }
+    }
+    out
+}
+
+fn memory_nodes(parsed: &ParsedFdt) -> Vec<&Node> {
+    parsed
+        .nodes
+        .iter()
+        .filter(|node| {
+            node.name == "memory"
+                || node.name.starts_with("memory@")
+                || node
+                    .property("device_type")
+                    .and_then(decode_string)
+                    .as_deref()
+                    == Some("memory")
+        })
+        .collect()
+}
+
+fn is_rp1_pcie_node(node: &Node) -> bool {
+    let name = node.name.to_ascii_lowercase();
+    let path = node.path.to_ascii_lowercase();
+    let compatible = node.compatible().join(" ").to_ascii_lowercase();
+    name.contains("pci")
+        || name.contains("pcie")
+        || name.contains("rp1")
+        || path.contains("pci")
+        || path.contains("pcie")
+        || path.contains("rp1")
+        || compatible.contains("pci")
+        || compatible.contains("pcie")
+        || compatible.contains("rp1")
+}
+
+fn initrd_range(parsed: &ParsedFdt) -> Option<(u64, u64)> {
+    let chosen = node(parsed, "/chosen")?;
+    Some((
+        decode_scalar(chosen.property("linux,initrd-start")?).ok()?,
+        decode_scalar(chosen.property("linux,initrd-end")?).ok()?,
+    ))
+}
+
+fn first_usable(parsed: &ParsedFdt, include: fn(NodeClasses) -> bool) -> Option<&Node> {
+    parsed
+        .nodes
+        .iter()
+        .find(|node| include(classify_node(node)) && node_is_usable(node))
+}
+
+fn node_is_usable(node: &Node) -> bool {
+    node.property("status")
+        .and_then(decode_string)
+        .is_none_or(|status| status == "okay" || status == "ok")
+}
+
+fn line_candidate(out: &mut String, label: &str, candidate: Option<&Node>) {
+    match candidate {
+        Some(node) => writeln!(out, "{label}: {}", node.path).unwrap(),
+        None => writeln!(out, "{label}: <none>").unwrap(),
+    }
+}
+
+fn render_readiness_ranges(out: &mut String, node: &Node) {
+    match node
+        .property("reg")
+        .map(|value| parse_reg_ranges(value, node.parent_address_cells, node.parent_size_cells))
+    {
+        Some(Ok(ranges)) if !ranges.is_empty() => {
+            for range in ranges {
+                writeln!(
+                    out,
+                    "  {} address=0x{:x} size=0x{:x}",
+                    node.path, range.address, range.size
+                )
+                .unwrap();
+            }
+        }
+        Some(Ok(_)) => writeln!(out, "  {} <empty>", node.path).unwrap(),
+        Some(Err(error)) => writeln!(out, "  {} <unparsed: {error}>", node.path).unwrap(),
+        None => writeln!(out, "  {} <missing reg>", node.path).unwrap(),
+    }
+}
+
+fn render_resolved_stdout(out: &mut String, parsed: &ParsedFdt) {
+    let Some(stdout) = resolve_stdout_path(parsed) else {
+        writeln!(out, "path: <missing>").unwrap();
+        return;
+    };
+    writeln!(out, "path: {}", stdout.device).unwrap();
+    if let Some(options) = stdout.options {
+        writeln!(out, "options: {options}").unwrap();
+    }
+    match stdout.node {
+        Some(node) => {
+            line_strings(out, "  compatible", &node.compatible());
+            line_string_property_indented(out, node, "status");
+            render_reg(out, node);
+        }
+        None => writeln!(out, "node: <not found>").unwrap(),
+    }
 }
 
 fn is_serial(classes: NodeClasses) -> bool {
@@ -780,6 +1059,67 @@ mod tests {
     }
 
     #[test]
+    fn aliases_resolve_stdout_device_and_options() {
+        let parsed = parse_fdt(&synthetic_dtb()).expect("synthetic DTB parses");
+        assert_eq!(
+            aliases(&parsed).get("serial10").map(String::as_str),
+            Some("/pl011@9000000")
+        );
+        let stdout = resolve_stdout_path(&parsed).expect("stdout path");
+        assert_eq!(stdout.raw, "serial10:115200n8");
+        assert_eq!(stdout.device, "/pl011@9000000");
+        assert_eq!(stdout.options.as_deref(), Some("115200n8"));
+        assert_eq!(
+            stdout.node.map(|node| node.path.as_str()),
+            Some("/pl011@9000000")
+        );
+    }
+
+    #[test]
+    fn readiness_report_covers_first_boot_inputs() {
+        let parsed = parse_fdt(&synthetic_dtb()).expect("synthetic DTB parses");
+        let report = render_yarm_readiness(&parsed);
+        for expected in [
+            "platform: qemu-virt",
+            "memory-ranges:",
+            "/memory@40000000 address=0x40000000 size=0x10000000",
+            "initrd: present start=0x48000000 end=0x49000000 size=0x1000000",
+            "stdout-path-raw: serial10:115200n8",
+            "stdout-path-resolved: /pl011@9000000",
+            "first-usable-serial: /pl011@9000000",
+            "interrupt-controller: /intc@8000000",
+            "rp1-pcie: missing",
+            "warnings:\n  <none>",
+        ] {
+            assert!(
+                report.contains(expected),
+                "missing readiness line: {expected}\n{report}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_classification_recognizes_bcm2712() {
+        let mut parsed = parse_fdt(&synthetic_dtb()).expect("synthetic DTB parses");
+        let root = parsed
+            .nodes
+            .iter_mut()
+            .find(|node| node.path == "/")
+            .unwrap();
+        root.properties
+            .iter_mut()
+            .find(|property| property.name == "compatible")
+            .unwrap()
+            .value = b"raspberrypi,5-model-b\0brcm,bcm2712\0".to_vec();
+        assert_eq!(classify_platform(&parsed), Platform::Rpi5Bcm2712);
+        assert!(
+            render_yarm_readiness(&parsed).contains(
+                "Raspberry Pi 5 bare-metal boot and RP1 device support are not implemented"
+            )
+        );
+    }
+
+    #[test]
     fn malformed_headers_and_properties_return_errors() {
         assert!(parse_fdt(&[]).is_err());
         let mut bad_magic = vec![0; HEADER_LEN];
@@ -802,13 +1142,16 @@ mod tests {
     fn parse_and_render_synthetic_tree_is_stable() {
         let dtb = synthetic_dtb();
         let parsed = parse_fdt(&dtb).expect("synthetic DTB parses");
-        assert_eq!(parsed.nodes.len(), 5);
+        assert_eq!(parsed.nodes.len(), 6);
         let report = render_report(&parsed);
         for expected in [
             "magic: ok (0xd00dfeed)",
             "compatible: test,qemu-virt, test,board",
             "bootargs: console=ttyAMA0",
-            "stdout-path: /pl011@9000000",
+            "stdout-path: serial10:115200n8",
+            "== Resolved stdout ==",
+            "path: /pl011@9000000",
+            "options: 115200n8",
             "linux,initrd-start: 0x48000000",
             "reg: address=0x40000000 size=0x10000000",
             "path: /pl011@9000000",
@@ -833,6 +1176,7 @@ mod tests {
             "device_type",
             "reg",
             "interrupt-controller",
+            "serial10",
         ];
         let mut strings = Vec::new();
         let mut offsets = std::collections::BTreeMap::new();
@@ -851,9 +1195,17 @@ mod tests {
             b"test,qemu-virt\0test,board\0",
         );
 
+        begin_node(&mut structure, "aliases");
+        property(&mut structure, offsets["serial10"], b"/pl011@9000000\0");
+        end_node(&mut structure);
+
         begin_node(&mut structure, "chosen");
         property(&mut structure, offsets["bootargs"], b"console=ttyAMA0\0");
-        property(&mut structure, offsets["stdout-path"], b"/pl011@9000000\0");
+        property(
+            &mut structure,
+            offsets["stdout-path"],
+            b"serial10:115200n8\0",
+        );
         property(
             &mut structure,
             offsets["linux,initrd-start"],
