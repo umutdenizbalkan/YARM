@@ -444,6 +444,13 @@ impl KernelState {
         recv_cap: CapId,
         deadline: Option<u64>,
     ) -> Result<ThreadId, KernelError> {
+        // VALIDATION: D2_LIVE_SPLIT (Stage 106 / Pass 3)
+        // Phase order: scheduler block (rank 1) → TCB transition + deadline
+        // staging (rank 2) → waiter publish (rank 3) → dispatch. Sequential
+        // acquire/release, never nested. Because the TCB is Blocked BEFORE
+        // the publish becomes visible, any sender that observes the published
+        // waiter also observes a Blocked TCB — wake cannot be lost on that
+        // edge (audit doc §15.2 / §18).
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
         self.with_tcbs_mut(|tcbs| {
@@ -457,12 +464,38 @@ impl KernelState {
             tcb.ipc_timeout_fired = false;
             Ok::<_, KernelError>(())
         })?;
-        // Publish receiver waiter under ipc_state_lock (rank 3), AFTER TCB is marked
-        // Blocked under task_state_lock (rank 2) above — sequential ordering guarantees
-        // the waker sees a consistent Blocked TCB when it finds this slot.
-        self.with_ipc_state_mut(|ipc| {
-            ipc.endpoint_waiters[endpoint_idx] = Some(ThreadId(blocked_tid));
-        });
+        // D2: atomic queue-recheck + publish under ipc_state_lock (rank 3)
+        // via the typed live primitive (Stage 105 scaffold, Stage 106 live).
+        match self.publish_recv_waiter_live(endpoint_idx, ThreadId(blocked_tid), recv_cap) {
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published => {}
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {
+                // No-lost-wakeup unwind: a sender enqueued between the
+                // caller's Phase-1 empty dequeue and this publish. Unreachable
+                // under the serialized global lock (Phase 1 and this publish
+                // run in the same `&mut KernelState` borrow today); REQUIRED
+                // for correctness once the SharedKernel seam splits the
+                // borrow. Do not stay blocked: restore the task to Runnable
+                // (clears the staged deadline) and return so the caller's
+                // Phase-2 dequeue drains the raced message.
+                crate::yarm_log!(
+                    "D2_PUBLISH_RACE_UNWIND endpoint={} tid={}",
+                    endpoint_idx,
+                    blocked_tid
+                );
+                self.note_d2_publish_race_unwind();
+                self.wake_tid_to_runnable(ThreadId(blocked_tid))?;
+                let _ = self.dispatch_next_task()?;
+                return Ok(ThreadId(blocked_tid));
+            }
+            // The live primitive preserves canonical overwrite semantics for
+            // a pre-existing waiter (it never returns ReceiverAlreadyWaiting)
+            // and endpoint_idx was validated by resolve_endpoint_index, so
+            // InvalidEndpoint is defensively unreachable here.
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::ReceiverAlreadyWaiting
+            | crate::kernel::recv_waiter_split::PublishWaiterOutcome::InvalidEndpoint => {
+                return Err(KernelError::WrongObject);
+            }
+        }
         crate::yarm_log!(
             "IPC_RECV_BLOCK_REGISTER endpoint={} tid={}",
             endpoint_idx,
@@ -2197,6 +2230,102 @@ impl KernelState {
             );
             PublishWaiterOutcome::Published
         })
+    }
+
+    /// Stage 106 / D2 LIVE primitive — atomic queue-recheck + waiter publish
+    /// under `ipc_state_lock` (rank 3) only.
+    ///
+    /// VALIDATION: D2_LIVE_SPLIT — called from
+    /// `block_current_on_receive_with_deadline` (the canonical blocking-recv
+    /// path) since Stage 106.
+    ///
+    /// Differences from the Stage 105 audit primitive
+    /// ([`Self::try_publish_recv_waiter_audit_only`]):
+    ///
+    /// - **Overwrite semantics for a pre-existing waiter** — byte-identical
+    ///   to the pre-Stage-106 unconditional
+    ///   `endpoint_waiters[idx] = Some(tid)` write. A displaced waiter is
+    ///   logged (`D2_RECV_WAITER_DISPLACED`, additive marker) but the
+    ///   behavior matches the canonical path exactly: last receiver wins.
+    ///   This primitive therefore NEVER returns `ReceiverAlreadyWaiting`.
+    /// - Returns `QueueNonEmpty` (without publishing) when a sender's message
+    ///   landed in the queue — the caller drives the no-lost-wakeup unwind.
+    ///   Under the serialized global lock this outcome is unreachable; it is
+    ///   the future-split correctness branch.
+    ///
+    /// Telemetry: increments `d2_recv_waiter_publishes` on `Published`.
+    pub(crate) fn publish_recv_waiter_live(
+        &mut self,
+        endpoint_idx: usize,
+        receiver_tid: ThreadId,
+        recv_cap: CapId,
+    ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
+        use crate::kernel::recv_waiter_split::PublishWaiterOutcome;
+        let outcome = self.with_ipc_state_mut(|ipc| {
+            if endpoint_idx >= ipc.endpoints.len() {
+                return PublishWaiterOutcome::InvalidEndpoint;
+            }
+            let endpoint = match ipc.endpoints[endpoint_idx].as_ref() {
+                Some(e) => e,
+                None => return PublishWaiterOutcome::InvalidEndpoint,
+            };
+            if endpoint.queued() > 0 {
+                return PublishWaiterOutcome::QueueNonEmpty;
+            }
+            if let Some(displaced) = ipc.endpoint_waiters[endpoint_idx] {
+                // Canonical overwrite semantics preserved (additive marker).
+                crate::yarm_log!(
+                    "D2_RECV_WAITER_DISPLACED endpoint={} old_tid={} new_tid={}",
+                    endpoint_idx,
+                    displaced.0,
+                    receiver_tid.0
+                );
+            }
+            ipc.endpoint_waiters[endpoint_idx] = Some(receiver_tid);
+            crate::yarm_log!(
+                "D2_RECV_WAITER_PUBLISH endpoint={} tid={} recv_cap={}",
+                endpoint_idx,
+                receiver_tid.0,
+                recv_cap.0
+            );
+            PublishWaiterOutcome::Published
+        });
+        if matches!(outcome, PublishWaiterOutcome::Published) {
+            self.note_d2_recv_waiter_publish();
+        }
+        outcome
+    }
+
+    /// Stage 106 / D2: count a live waiter publish through
+    /// [`Self::publish_recv_waiter_live`].
+    pub(crate) fn note_d2_recv_waiter_publish(&mut self) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.d2_recv_waiter_publishes =
+                ipc.telemetry.d2_recv_waiter_publishes.saturating_add(1);
+        });
+    }
+
+    /// Stage 106 / D2: count a no-lost-wakeup unwind (publish returned
+    /// `QueueNonEmpty` after the scheduler block — the future-split race
+    /// branch). Always 0 under the serialized global lock; the counter exists
+    /// so post-seam-split smoke can detect the branch being taken.
+    pub(crate) fn note_d2_publish_race_unwind(&mut self) {
+        self.with_ipc_state_mut(|ipc| {
+            ipc.telemetry.d2_publish_race_unwinds =
+                ipc.telemetry.d2_publish_race_unwinds.saturating_add(1);
+        });
+    }
+
+    /// Stage 106 / D2 test hook: expose the private `wake_tid_to_runnable`
+    /// so the executable no-lost-wakeup unwind proof
+    /// (`stage106_d2_no_lost_wakeup_unwind_sequence_drains_message`) can
+    /// replicate the exact unwind sequence the live path performs.
+    #[cfg(test)]
+    pub(crate) fn wake_tid_to_runnable_for_test(
+        &mut self,
+        tid: ThreadId,
+    ) -> Result<(), KernelError> {
+        self.wake_tid_to_runnable(tid)
     }
 
     fn handle_restart_control_kernel_ipc(&mut self, msg: Message) -> Result<(), KernelError> {

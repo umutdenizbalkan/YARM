@@ -8611,4 +8611,83 @@ mod tests {
             "canonical reply arm must keep using the discarding wrapper"
         );
     }
+
+    // ── Stage 106 / Pass 3: D3 gating proof + D6 audit source-scans ──────────
+
+    #[test]
+    fn stage106_d3_two_phase_order_is_structural_and_gated() {
+        // D3 invariant: PTE change → TLB shootdown wait/ACK → frame reclaim.
+        // The ordering is structurally enforced inside
+        // execute_tlb_shootdown_wait_plan; phase 1 must NOT reclaim.
+        let mem_src = include_str!("boot/memory_state.rs");
+        assert!(
+            mem_src.contains("Frame reclamation is intentionally NOT done here"),
+            "unmap_page_phase1 must defer frame reclamation"
+        );
+        // Inside execute_tlb_shootdown_wait_plan, the shootdown request must
+        // textually precede the reclaim call (structural order proof).
+        let body = mem_src
+            .split("fn execute_tlb_shootdown_wait_plan")
+            .nth(1)
+            .expect("execute_tlb_shootdown_wait_plan present");
+        let shootdown_pos = body
+            .find("request_live_asid_shootdown")
+            .expect("phase 2 shootdown call present");
+        let reclaim_pos = body
+            .find("reclaim_memory_object_for_phys")
+            .expect("phase 3 reclaim call present");
+        assert!(
+            shootdown_pos < reclaim_pos,
+            "TLB shootdown must precede frame reclaim inside the wait plan executor"
+        );
+
+        // D3 remains GATED at Stage 106: no SharedKernel VM/memory split-mut
+        // seam exists. The exact blocker is documented in
+        // doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §16 / §19.
+        let runtime_src = include_str!("../runtime.rs");
+        assert!(
+            !runtime_src.contains("with_vm_split_mut")
+                && !runtime_src.contains("with_memory_split_mut"),
+            "D3 must remain gated: no VM/memory split-mut seam in runtime.rs at Stage 106"
+        );
+    }
+
+    #[test]
+    fn stage106_d6_audit_no_per_cpu_scheduler_locking_started() {
+        // D6 is audit-only at Stage 106: no per-CPU scheduler locks may exist
+        // and the x86_64 core smoke must stay pinned to -smp 1.
+        let runtime_src = include_str!("../runtime.rs");
+        let sched_src = include_str!("scheduler.rs");
+        for forbidden in ["per_cpu_scheduler_lock", "PerCpuSchedulerLock"] {
+            assert!(
+                !runtime_src.contains(forbidden) && !sched_src.contains(forbidden),
+                "{forbidden} must not exist at Stage 106 (D6 is audit-only)"
+            );
+        }
+        let smoke = include_str!("../../scripts/qemu-x86_64-core-smoke.sh");
+        assert!(
+            smoke.contains("QEMU_SMP=1"),
+            "x86_64 core smoke must remain pinned to -smp 1 (AI_AGENT_RULES §5.1)"
+        );
+    }
+
+    #[test]
+    fn stage106_milestone_doc_exists_and_is_not_falsely_declared() {
+        // The Kernel Unlocking Milestone 1 doc must exist; if the branch is
+        // not smoke-accepted the doc must say the milestone is NOT declared.
+        let doc = include_str!("../../doc/KERNEL_UNLOCKING_MILESTONE_1.md");
+        assert!(
+            doc.contains("Milestone status"),
+            "milestone doc must carry an explicit status line"
+        );
+        assert!(
+            doc.contains("PREPARED — NOT DECLARED") || doc.contains("DECLARED"),
+            "milestone doc must be explicit about declared vs prepared"
+        );
+        // The declaration checklist must require smoke results.
+        assert!(
+            doc.contains("smoke"),
+            "milestone declaration checklist must reference smoke results"
+        );
+    }
 }

@@ -1135,3 +1135,165 @@ Pass 3 readiness:
 3. Live-wire D2 using §15.4; smoke.
 4. Live-wire D3 (VmBrk shrink → VmAnonMap) using §16.2; smoke.
 5. Begin D6 audit (per-CPU scheduler locking) only after D2+D3 are smoke-stable.
+
+---
+
+## 18. Stage 106 / Pass 3 — D2 live-wired
+
+D2 is live: the canonical endpoint blocking-recv path
+(`block_current_on_receive_with_deadline`) now routes its waiter publish
+through the typed primitive `KernelState::publish_recv_waiter_live`
+(VALIDATION: D2_LIVE_SPLIT), which performs the **atomic queue-recheck +
+publish** in one rank-3 critical section and steers the no-lost-wakeup
+unwind.
+
+**NOT SMOKE-ACCEPTED:** developed without QEMU; see
+`KERNEL_UNLOCKING_MILESTONE_1.md` for the declaration checklist.
+
+### 18.1 Live semantics (behavior-preserving)
+
+| Aspect | Pre-Stage-106 canonical | Stage 106 live |
+|--------|-------------------------|----------------|
+| Phase order | block(1) → TCB+deadline(2) → publish(3) → dispatch | identical |
+| Publish write | unconditional `endpoint_waiters[idx] = Some(tid)` | identical (overwrite preserved; displaced waiter now logged `D2_RECV_WAITER_DISPLACED`, additive) |
+| Queue recheck at publish | none (impossible under serialized borrow) | atomic recheck; `QueueNonEmpty` → unwind (unreachable today, REQUIRED post-seam-split) |
+| Deadline staging | rank-2 write with status | identical |
+| Notification blocking recv | canonical | unchanged (out of D2 scope) |
+
+The `ReceiverAlreadyWaiting` outcome is never produced by the live
+primitive (overwrite semantics); the Stage 105 audit-only primitive that
+refuses on a pre-existing waiter is retained, helper-only, for the future
+strict-single-waiter design study.
+
+### 18.2 No-lost-wakeup proof (live form)
+
+The §15.2 proof carries over; the live delta is the unwind branch:
+
+- If a sender's enqueue serializes BEFORE the receiver's publish, the
+  publish's atomic recheck observes the non-empty queue and returns
+  `QueueNonEmpty` — the receiver does NOT park a waiter and does NOT stay
+  blocked. The unwind (`wake_tid_to_runnable` → caller's Phase-2 dequeue)
+  drains the raced message. Executable proof:
+  `stage106_d2_no_lost_wakeup_unwind_sequence_drains_message`.
+- If the sender's enqueue serializes AFTER the publish, the sender observes
+  the waiter (TCB already Blocked, because rank-1 block precedes the
+  publish) and wakes it. Executable proof:
+  `stage106_d2_sender_after_waiter_delivers_and_wakes`.
+- Under today's serialized global borrow the race window cannot open, so
+  `d2_publish_race_unwinds` must read 0 in all smoke runs until the
+  SharedKernel seam split lands (it is a forbidden-marker check in the
+  milestone checklist).
+
+### 18.3 Telemetry / markers
+
+- `d2_recv_waiter_publishes` — one per blocked endpoint receive.
+- `d2_publish_race_unwinds` — 0 pre-seam-split.
+- Markers: `D2_RECV_WAITER_PUBLISH`, `D2_RECV_WAITER_DISPLACED`,
+  `D2_PUBLISH_RACE_UNWIND` (all additive; `IPC_RECV_BLOCK_REGISTER`
+  retained).
+
+### 18.4 Stage 106 D2 tests (7; 2 Stage 105 tests replaced)
+
+`kernel::recv_waiter_split::tests`: `stage106_d2_live_wire_call_site_present`,
+`stage106_d2_validation_labels_present`,
+`stage106_d2_blocked_recv_publishes_waiter_and_counts_telemetry`,
+`stage106_d2_sender_after_waiter_delivers_and_wakes`,
+`stage106_d2_sender_before_waiter_dequeues_without_publish`,
+`stage106_d2_no_lost_wakeup_unwind_sequence_drains_message`,
+`stage106_d2_timeout_deadline_staged_through_live_publish_fires`.
+(The Stage 105 audit-primitive tests for empty-slot / already-waiting /
+queue-non-empty / invalid-index remain.)
+
+---
+
+## 19. Stage 106 / Pass 3 — D3 decision: GATED with structural proof
+
+D3 stays gated. What Stage 106 adds is the **structural ordering proof**
+(`stage106_d3_two_phase_order_is_structural_and_gated`):
+
+1. `unmap_page_phase1` defers frame reclamation (source text asserts the
+   "intentionally NOT done here" contract comment).
+2. Inside `execute_tlb_shootdown_wait_plan`, the Phase-2 shootdown request
+   textually precedes the Phase-3 `reclaim_memory_object_for_phys`.
+3. No VM/memory split-mut seam exists in `runtime.rs` (asserted) — the
+   invariant "no frame reuse before invalidation ACK" is currently
+   guaranteed by the global borrow + the structural order, and a live D3
+   must not land until the seam exists AND multi-CPU smoke is possible.
+
+Exact blockers (unchanged from §16.2): SharedKernel `with_vm_split_mut`
+(rank 5) / `with_memory_split_mut` (rank 6); lock-free
+`await_tlb_shootdown_ack`; multi-CPU smoke (blocked behind the x86_64 SMP
+trampoline split, which is out of scope by directive).
+
+---
+
+## 20. Stage 106 / Pass 3 — D6 audit (per-CPU scheduler locking)
+
+Audit-only; enforced by `stage106_d6_audit_no_per_cpu_scheduler_locking_started`.
+
+### 20.1 Remaining scheduler global-lock surface after D2
+
+`scheduler_state_lock` (rank 1) is acquired by ~17 sites in
+`boot/scheduler_state.rs` plus 9 in `orchestrator_state.rs`. The dominant
+callers after D2:
+
+| Site | Why it holds rank 1 |
+|------|---------------------|
+| `block_current_cpu` | detaches current from the per-CPU slot |
+| `dispatch_next_task` / `dispatch_next_current_cpu` | runqueue pop + current-slot write |
+| `enqueue_on_cpu` / `enqueue_woken_task` | runqueue push + membership insert |
+| `yield_current` | requeue + dispatch |
+| scheduler-timer tick | preemption bookkeeping |
+| `current_tid_authoritative` / split reads | per-CPU current-slot read |
+
+### 20.2 Per-CPU runqueue candidates
+
+The scheduler data structure is already per-CPU underneath
+(`dispatch_next_on(cpu)`, "smp_scheduler_tracks_per_cpu_queues" suite;
+3-priority `RingQueue` set per CPU). The lock is what is global. The
+natural D6 shape is one lock per CPU runqueue + a separate membership-table
+lock, with cross-CPU wake doing: lock(target_cpu_queue) → push → unlock →
+IPI.
+
+### 20.3 Constraints the D6 design must satisfy
+
+1. **Cross-CPU wake/IPI:** `enqueue_woken_task` chooses a CPU; with per-CPU
+   locks the choice and the push must be atomic per-queue, and the wake IPI
+   must be sent after the push is visible.
+2. **ASID switch:** dispatch writes the per-CPU current ASID; TLB-shootdown
+   targeting reads the live-ASID table — those reads must see a consistent
+   (cpu → asid) snapshot or the shootdown bitmap may miss a CPU. D6 must
+   keep the live-ASID table under a lock ordered before/with the queue
+   locks, or shootdown correctness (D3 invariant) breaks.
+3. **`entering_tid` / `exiting_tid` are Class F** (global-lock required;
+   Stage 4T+6 smoke regression precedent — `KERNEL_LOCKING.md` Rule N+4).
+   The trap-boundary TID snapshots must remain on the authoritative read
+   path; D6 must not convert them to split reads.
+4. **Membership/tombstone invariants** (`KERNEL_TEST_RULES.md` Rules 1–2):
+   membership insert/remove must stay mutually exclusive with the runqueue
+   ops on the same task — per-CPU locks must not allow a task to be in two
+   queues, which is what the membership hash table currently prevents
+   under the single lock.
+5. **x86_64 SMP trampoline split must land first** — without `-smp >1`
+   smoke, no per-CPU locking change is observable in CI
+   (`AI_AGENT_RULES.md §5.1–5.2`).
+
+### 20.4 D6 verdict
+
+Not started, by directive. The audit above is the Milestone-2 entry point.
+
+---
+
+## 21. Stage 106 — Milestone 1 status
+
+See `doc/KERNEL_UNLOCKING_MILESTONE_1.md`. Status: **DECLARED**
+(2026-06-12). QEMU 8.2.2 was installed into the development environment
+and all three declaring smoke runs passed: x86_64 `-smp 1` core smoke,
+x86_64 optional-FS strict smoke, AArch64 optional-FS strict smoke —
+`INIT_SPAWN_V5_WRONG_SENDER_REPLY` count=0 in all logs; no forbidden
+markers; `D2_PUBLISH_RACE_UNWIND`=0 and `YARM_D5_SPLIT_RECORD_ROLLBACK`=0
+as required. Note: kernel-side Info markers (including pre-existing ones
+like `IPC_RECV_BLOCK_REGISTER`) are below the production console loglevel
+in all profiles; split-engine routing is verified by the hosted-dev
+telemetry suites (same verification depth as the locally smoke-accepted
+Pass 1/2 runs).

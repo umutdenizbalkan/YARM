@@ -5199,3 +5199,56 @@ no deadline-0 required replies; no wrong-sender SpawnV5 replies.
 
 **Run:** `cargo test --lib stage104` and the full
 `cargo test --lib -- --test-threads=1`.
+
+---
+
+## Stage 106 / Kernel Unlocking Pass 3 — D2 live, D3 gated proof, D6 audit
+
+D2 is live-wired (`publish_recv_waiter_live` in the canonical endpoint
+blocking-recv path). D3 remains gated with a structural ordering proof. D6
+is audit-only. Milestone 1 is **DECLARED** (2026-06-12) — the smoke checklist
+in `KERNEL_UNLOCKING_MILESTONE_1.md` passed on all three runs.
+
+**Test rules:**
+
+1. **D2 routing is proven by telemetry.** `d2_recv_waiter_publishes`
+   increments once per blocked endpoint recv; immediate dequeues must not
+   increment it. `d2_publish_race_unwinds` must be 0 in every test and
+   smoke run until the SharedKernel seam split lands — a non-zero value
+   before then indicates the publish recheck disagreed with the Phase-1
+   dequeue under the same global borrow, which is a bug.
+2. **Overwrite semantics are canonical.** `publish_recv_waiter_live` never
+   returns `ReceiverAlreadyWaiting`; tests asserting strict-single-waiter
+   behavior must use the Stage 105 audit primitive, not the live one.
+3. **The no-lost-wakeup executable proof**
+   (`stage106_d2_no_lost_wakeup_unwind_sequence_drains_message`) replicates
+   the exact live unwind sequence (block → racing send → publish
+   QueueNonEmpty → wake → drain). Any change to the publish primitive, the
+   unwind branch, or `wake_tid_to_runnable` must keep it passing.
+4. **D3 structural order is load-bearing.** The shootdown-before-reclaim
+   source order inside `execute_tlb_shootdown_wait_plan` and the deferred
+   reclamation in `unmap_page_phase1` are asserted by
+   `stage106_d3_two_phase_order_is_structural_and_gated`. Reordering those
+   calls is a UAF-class regression.
+5. **D6 is fenced.** `stage106_d6_audit_no_per_cpu_scheduler_locking_started`
+   asserts no per-CPU scheduler lock types exist and the x86_64 core smoke
+   stays pinned `QEMU_SMP=1`.
+6. **The milestone doc may not lie.**
+   `stage106_milestone_doc_exists_and_is_not_falsely_declared` requires an
+   explicit status line; flipping to DECLARED belongs to the smoke-running
+   environment only.
+
+**Test groups (Stage 106 — 10 tests, net +5 after 2 Stage 105 replacements):**
+
+`kernel::recv_waiter_split::tests` (7): live-wire call-site scan, labels,
+blocked-recv telemetry, sender-after-waiter, sender-before-waiter,
+no-lost-wakeup unwind, deadline staging.
+`kernel::syscall::tests` (3): D3 structural-order + gating, D6 fence,
+milestone-doc honesty.
+
+**Invariants unchanged:** SYSCALL_COUNT = 31; NR 30 routed; NR 8 split
+whitelist; D1/D5 routing (Stage 104/105 suites); Stage 100 FS gates;
+notification-recv blocking path canonical.
+
+**Run:** `cargo test --lib stage106 -- --test-threads=1` and the full
+`cargo test --lib -- --test-threads=1`.

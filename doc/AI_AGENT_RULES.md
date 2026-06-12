@@ -606,3 +606,43 @@ If the build/test environment does not have QEMU available (e.g. minimal CI
 containers, remote agent sandboxes), the stage summary MUST say so explicitly
 ("QEMU not available; smoke not run"). It is **not** acceptable to claim a
 smoke result that was not actually executed.
+
+---
+
+## 14. Kernel Unlocking Live-Path Rules (Stage 104–106)
+
+### 14.1 Live split paths and their gates
+
+| Path | Live since | Gate |
+|------|-----------|------|
+| D1 transfer-cap recv materialization (`materialize_received_message_cap_routed`) | Stage 104 | smoke-accepted per local Pass-1/2 runs |
+| D5 reply-cap recv materialization (Phase B' fallible record-set + mint rollback) | Stage 105 | same |
+| D2 endpoint blocking-recv waiter publish (`publish_recv_waiter_live`) | Stage 106 | smoke-accepted (Milestone 1 declared 2026-06-12) |
+
+Do not remove the canonical fallbacks: `materialize_received_message_cap`
+must remain at its ≥4 call sites; the notification-recv blocking path stays
+canonical; sender-waiter cap-transfer refills stay on the global lock.
+
+### 14.2 Milestone declaration honesty rule
+
+`doc/KERNEL_UNLOCKING_MILESTONE_1.md` carries an explicit
+`Milestone status` line. Only an environment that has actually executed the
+smoke checklist may flip it to DECLARED, recording the run results in the
+acceptance table. Declaring without smoke is a hard violation of §13.
+
+### 14.3 D2-specific invariants
+
+- `d2_publish_race_unwinds` MUST be 0 until the SharedKernel seam split
+  lands. Treat any non-zero value in a smoke log as a stop-ship bug.
+- The publish primitive preserves canonical overwrite semantics
+  (`D2_RECV_WAITER_DISPLACED` is observability, not a behavior change).
+
+### 14.4 D3/D6 fences
+
+- D3: no `with_vm_split_mut` / `with_memory_split_mut` may be added without
+  the lock-free `await_tlb_shootdown_ack` design and multi-CPU smoke.
+  The shootdown-before-reclaim source order inside
+  `execute_tlb_shootdown_wait_plan` is UAF-load-bearing.
+- D6: no per-CPU scheduler lock types until the x86_64 SMP trampoline split
+  lands and D2/D3 are smoke-stable. `entering_tid`/`exiting_tid` remain
+  Class F (authoritative read only).

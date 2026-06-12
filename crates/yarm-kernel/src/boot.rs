@@ -40,6 +40,15 @@ pub struct IpcPathTelemetry {
     /// gotten if the revoke had landed before the mint), but it is the
     /// signal smoke tests use to confirm the rollback path is exercised.
     pub d5_split_reply_rollbacks: u64,
+    /// Stage 106 / D2: blocking-recv waiter publishes through the typed live
+    /// primitive (`publish_recv_waiter_live`). Increments once per blocked
+    /// receive that parked a waiter.
+    pub d2_recv_waiter_publishes: u64,
+    /// Stage 106 / D2: no-lost-wakeup unwinds (publish observed a non-empty
+    /// queue after the scheduler block). Always 0 under the serialized
+    /// global lock; non-zero only after the SharedKernel seam split, where
+    /// it indicates the race branch fired and was handled correctly.
+    pub d2_publish_race_unwinds: u64,
     pub blocked_sends: u64,
     pub rendezvous_handoffs: u64,
     pub transfer_records_created: u64,
