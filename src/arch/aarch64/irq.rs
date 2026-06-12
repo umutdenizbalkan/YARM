@@ -213,11 +213,19 @@ mod tests {
 
     #[test]
     fn gic_configuration_parses_description() {
+        let mut regs = [0u32; 64];
+        let description = crate::std::format!("gic_cpu_if_base=0x{:x}", regs.as_mut_ptr() as usize);
         GIC_CONFIGURED.store(false, Ordering::Relaxed);
-        assert!(try_configure_gic_from_description(
-            b"gic_cpu_if_base=0x08010000"
-        ));
+        assert!(try_configure_gic_from_description(description.as_bytes()));
         assert!(GIC_CONFIGURED.load(Ordering::Relaxed));
+        assert_eq!(
+            regs[GICC_PMR_OFFSET / core::mem::size_of::<u32>()],
+            GICC_PMR_UNMASK_ALL
+        );
+        assert_eq!(
+            regs[GICC_CTLR_OFFSET / core::mem::size_of::<u32>()],
+            GICC_CTLR_ENABLE_GROUP0
+        );
     }
 
     #[test]

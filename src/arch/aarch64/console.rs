@@ -15,6 +15,12 @@ const PL011_DR: usize = 0x000;
 #[cfg(not(feature = "hosted-dev"))]
 const PL011_FR: usize = 0x018;
 #[cfg(not(feature = "hosted-dev"))]
+const PL011_LCR_H: usize = 0x02c;
+#[cfg(not(feature = "hosted-dev"))]
+const PL011_CR: usize = 0x030;
+#[cfg(not(feature = "hosted-dev"))]
+const PL011_ICR: usize = 0x044;
+#[cfg(not(feature = "hosted-dev"))]
 const PL011_FR_TXFF: u32 = 1 << 5;
 
 #[cfg(not(feature = "hosted-dev"))]
@@ -30,6 +36,22 @@ pub fn init_early_mmio_base(base: usize) {
     if base != 0 {
         UART_BASE.store(base, Ordering::Relaxed);
     }
+}
+
+/// Selects a DTB-described PL011 and establishes a conservative 8N1 TX/RX
+/// configuration. Firmware-provided baud divisors are intentionally retained
+/// because the input clock varies by platform and clock controller state.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn init_dtb_pl011(base: usize) -> bool {
+    if base == 0 {
+        return false;
+    }
+    UART_BASE.store(base, Ordering::Relaxed);
+    mmio_write32(base + PL011_CR, 0);
+    mmio_write32(base + PL011_ICR, 0x7ff);
+    mmio_write32(base + PL011_LCR_H, (0b11 << 5) | (1 << 4));
+    mmio_write32(base + PL011_CR, (1 << 9) | (1 << 8) | 1);
+    true
 }
 
 #[cfg(not(feature = "hosted-dev"))]
