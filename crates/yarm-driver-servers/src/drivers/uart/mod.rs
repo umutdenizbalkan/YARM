@@ -11,4 +11,4 @@ pub mod service;
 #[cfg(any(test, feature = "hosted-dev"))]
 pub use device::MockUartRegisters;
 pub use device::{Pl011Config, Pl011UartDevice, UartError, UartRegisterIo};
-pub use service::run;
+pub use service::{UartService, UartStats, dispatch_uart_request, run};
