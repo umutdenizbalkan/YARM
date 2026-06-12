@@ -4,7 +4,9 @@
 #![no_std]
 
 pub mod drivers;
-pub use drivers::{blkcache, input, irqmux, rp1_gpio, uart, virtio_blk, virtio_gpu, virtio_net};
+pub use drivers::{
+    blkcache, input, irqmux, mailbox, rp1_gpio, uart, virtio_blk, virtio_gpu, virtio_net,
+};
 
 pub fn run_input() {
     drivers::input::run();
