@@ -936,26 +936,36 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
         max_cpus,
         effective_bitmap.count_ones()
     );
-    if !info.pcie_controller_path.is_empty() {
-        if let Some(base) = info.pcie_controller_base {
+    for (index, controller) in info.pcie_controllers[..info.pcie_controller_count]
+        .iter()
+        .enumerate()
+    {
+        if let Some(base) = controller.base {
             diag!(
-                "RPI5_DTB_PCIE_CONTROLLER path={} base=0x{:016x}",
-                info.pcie_controller_path.as_str(),
+                "RPI5_DTB_PCIE_CONTROLLER index={} path={} base=0x{:016x}",
+                index,
+                controller.path.as_str(),
                 base
             );
         } else {
             diag!(
-                "RPI5_DTB_PCIE_CONTROLLER_BASE_MISSING path={}",
-                info.pcie_controller_path.as_str()
+                "RPI5_DTB_PCIE_CONTROLLER_BASE_MISSING index={} path={}",
+                index,
+                controller.path.as_str()
             );
         }
-    } else {
+    }
+    if info.pcie_controller_count == 0 {
         diag!("RPI5_DTB_PCIE_CONTROLLER_MISSING");
     }
-    diag!(
-        "RPI5_DTB_RP1_PCIE present={}",
-        (!info.pcie_controller_path.is_empty() && !info.rp1_node_path.is_empty()) as u8
-    );
+    if info.pcie_controllers_truncated {
+        diag!("RPI5_DTB_PCIE_CONTROLLER_TRUNCATED");
+    }
+    if let Some(index) = info.rp1_controller_index {
+        diag!("RPI5_DTB_RP1_PCIE present=1 controller_index={}", index);
+    } else {
+        diag!("RPI5_DTB_RP1_PCIE present=0");
+    }
     if !info.rp1_node_path.is_empty() {
         diag!("RPI5_DTB_RP1_NODE path={}", info.rp1_node_path.as_str());
     }

@@ -159,9 +159,9 @@ fn rpi5_stage1b_diagnostics_are_bounded_lock_free_and_halt() {
     assert!(policy.contains("is_excluded_pcie_node_name"));
     assert!(policy.contains("is_known_pcie_compatible"));
     assert!(policy.contains("first_string(value) == b\"pci\""));
-    assert!(
-        policy.contains("direct_parent_path(path) == Some(out.pcie_controller_path.as_bytes())")
-    );
+    assert!(policy.contains("const MAX_DIAGNOSTIC_PCIE_CONTROLLERS: usize = 8"));
+    assert!(policy.contains("find_pcie_controller(&out, parent)"));
+    assert!(boot.contains("RPI5_DTB_RP1_PCIE present=1 controller_index={}"));
     for forbidden_init in ["init_gic", "init_rp1", "init_pcie", "pcie_init"] {
         assert!(
             !diagnostics.contains(forbidden_init),

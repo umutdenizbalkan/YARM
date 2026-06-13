@@ -12,6 +12,7 @@ const FDT_END: u32 = 9;
 const MAX_PATH: usize = 192;
 const MAX_DEPTH: usize = 32;
 const MAX_DIAGNOSTIC_RANGES: usize = 8;
+const MAX_DIAGNOSTIC_PCIE_CONTROLLERS: usize = 8;
 const MAX_DIAGNOSTIC_BOOTARGS: usize = 256;
 const RPI5_PREFERRED_UART: &[u8] = b"/soc@107c000000/serial@7d001000";
 
@@ -118,6 +119,12 @@ pub enum DiagnosticPsciConduit {
     Hvc,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiagnosticPcieController {
+    pub path: DtbPath,
+    pub base: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformDtbDiagnostics {
     pub memory_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
@@ -142,8 +149,10 @@ pub struct PlatformDtbDiagnostics {
     pub gic_redist_base: Option<u64>,
     pub psci_conduit: DiagnosticPsciConduit,
     pub cpu_bitmap: u64,
-    pub pcie_controller_path: DtbPath,
-    pub pcie_controller_base: Option<u64>,
+    pub pcie_controllers: [DiagnosticPcieController; MAX_DIAGNOSTIC_PCIE_CONTROLLERS],
+    pub pcie_controller_count: usize,
+    pub pcie_controllers_truncated: bool,
+    pub rp1_controller_index: Option<usize>,
     pub rp1_node_path: DtbPath,
 }
 
@@ -172,8 +181,11 @@ impl Default for PlatformDtbDiagnostics {
             gic_redist_base: None,
             psci_conduit: DiagnosticPsciConduit::None,
             cpu_bitmap: 0,
-            pcie_controller_path: DtbPath::empty(),
-            pcie_controller_base: None,
+            pcie_controllers: [DiagnosticPcieController::default();
+                MAX_DIAGNOSTIC_PCIE_CONTROLLERS],
+            pcie_controller_count: 0,
+            pcie_controllers_truncated: false,
+            rp1_controller_index: None,
             rp1_node_path: DtbPath::empty(),
         }
     }
@@ -198,7 +210,7 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
     let mut irq_path = DtbPath::empty();
     let mut irq_reg = [DiagnosticRange::default(); 2];
     let mut irq_reg_count = 0usize;
-    let mut pcie_candidate = false;
+    let mut pcie_controller_index = None;
     let mut pcie_path = DtbPath::empty();
     let mut pcie_base = None;
     while let Some(event) = walker.next() {
@@ -215,22 +227,24 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                 irq_compatible = DtbPath::empty();
                 irq_path.set(path);
                 irq_reg_count = 0;
-                pcie_candidate = is_pcie_node_name(name);
+                pcie_controller_index = None;
                 pcie_path.set(path);
                 pcie_base = None;
-                if pcie_candidate && out.pcie_controller_path.is_empty() {
-                    out.pcie_controller_path = pcie_path;
+                if is_pcie_node_name(name) {
+                    pcie_controller_index = ensure_pcie_controller(&mut out, pcie_path);
                 }
                 if path.starts_with(b"/cpus/")
                     && let Some(cpu) = parse_cpu_id_from_node_name(name)
                 {
                     out.cpu_bitmap |= 1u64 << cpu;
                 }
-                if name == b"rp1"
-                    && direct_parent_path(path) == Some(out.pcie_controller_path.as_bytes())
-                    && out.rp1_node_path.is_empty()
-                {
-                    out.rp1_node_path.set(path);
+                if name == b"rp1" && out.rp1_node_path.is_empty() {
+                    if let Some(parent) = direct_parent_path(path)
+                        && let Some(index) = find_pcie_controller(&out, parent)
+                    {
+                        out.rp1_controller_index = Some(index);
+                        out.rp1_node_path.set(path);
+                    }
                 }
             }
             Event::Property {
@@ -304,31 +318,25 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                     };
                 }
                 if name == b"device_type" && first_string(value) == b"pci" {
-                    pcie_candidate = !node_name(path).is_some_and(is_excluded_pcie_node_name);
                     pcie_path.set(path);
-                    if pcie_candidate && out.pcie_controller_path.is_empty() {
-                        out.pcie_controller_path = pcie_path;
+                    if !node_name(path).is_some_and(is_excluded_pcie_node_name) {
+                        pcie_controller_index = ensure_pcie_controller(&mut out, pcie_path);
                     }
                 }
                 if name == b"compatible"
                     && value.split(|byte| *byte == 0).any(is_known_pcie_compatible)
                     && !node_name(path).is_some_and(is_excluded_pcie_node_name)
                 {
-                    pcie_candidate = true;
                     pcie_path.set(path);
-                    if out.pcie_controller_path.is_empty() {
-                        out.pcie_controller_path = pcie_path;
-                    }
+                    pcie_controller_index = ensure_pcie_controller(&mut out, pcie_path);
                 }
-                if pcie_candidate && name == b"reg" {
+                if name == b"reg" {
                     let (base, _) = first_reg(value, parent_address_cells, parent_size_cells);
                     pcie_base = base;
                 }
-                if pcie_candidate && let Some(base) = pcie_base {
-                    if out.pcie_controller_path == pcie_path {
-                        out.pcie_controller_base =
-                            translate_to_root(blocks, pcie_path.as_bytes(), base);
-                    }
+                if let (Some(index), Some(base)) = (pcie_controller_index, pcie_base) {
+                    out.pcie_controllers[index].base =
+                        translate_to_root(blocks, pcie_path.as_bytes(), base);
                 }
             }
             Event::EndNode => {
@@ -362,7 +370,7 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                     }
                 }
                 irq_candidate = false;
-                pcie_candidate = false;
+                pcie_controller_index = None;
             }
             Event::End => break,
         }
@@ -899,6 +907,24 @@ fn direct_parent_path(path: &[u8]) -> Option<&[u8]> {
     let split = path.iter().rposition(|byte| *byte == b'/')?;
     (split != 0).then_some(&path[..split])
 }
+fn find_pcie_controller(info: &PlatformDtbDiagnostics, path: &[u8]) -> Option<usize> {
+    info.pcie_controllers[..info.pcie_controller_count]
+        .iter()
+        .position(|controller| controller.path.as_bytes() == path)
+}
+fn ensure_pcie_controller(info: &mut PlatformDtbDiagnostics, path: DtbPath) -> Option<usize> {
+    if let Some(index) = find_pcie_controller(info, path.as_bytes()) {
+        return Some(index);
+    }
+    if info.pcie_controller_count == info.pcie_controllers.len() {
+        info.pcie_controllers_truncated = true;
+        return None;
+    }
+    let index = info.pcie_controller_count;
+    info.pcie_controllers[index].path = path;
+    info.pcie_controller_count += 1;
+    Some(index)
+}
 fn append_reg_ranges<const N: usize>(
     ranges: &mut [DiagnosticRange; N],
     count: &mut usize,
@@ -1325,6 +1351,23 @@ mod tests {
                     &2u32.to_be_bytes(),
                 );
                 prop(&mut st, &mut strings, &mut offsets, "ranges", &[]);
+                begin(&mut st, b"pcie@1000100000");
+                prop(&mut st, &mut strings, &mut offsets, "device_type", b"pci\0");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"brcm,bcm2712-pcie\0",
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "reg",
+                    &reg64(0x10_0010_0000, 0x10_000),
+                );
+                end(&mut st);
                 begin(&mut st, b"pcie@1000120000");
                 prop(&mut st, &mut strings, &mut offsets, "device_type", b"pci\0");
                 prop(
@@ -1485,8 +1528,18 @@ mod tests {
         assert_eq!(info.gic_redist_base, Some(0x10_7fff_a000));
         assert_eq!(info.psci_conduit, DiagnosticPsciConduit::Smc);
         assert_eq!(info.cpu_bitmap, 0b1001);
-        assert_eq!(info.pcie_controller_path.as_str(), "/axi/pcie@1000120000");
-        assert_eq!(info.pcie_controller_base, Some(0x10_0012_0000));
+        assert_eq!(info.pcie_controller_count, 2);
+        assert_eq!(
+            info.pcie_controllers[0].path.as_str(),
+            "/axi/pcie@1000100000"
+        );
+        assert_eq!(info.pcie_controllers[0].base, Some(0x10_0010_0000));
+        assert_eq!(
+            info.pcie_controllers[1].path.as_str(),
+            "/axi/pcie@1000120000"
+        );
+        assert_eq!(info.pcie_controllers[1].base, Some(0x10_0012_0000));
+        assert_eq!(info.rp1_controller_index, Some(1));
         assert_eq!(info.rp1_node_path.as_str(), "/axi/pcie@1000120000/rp1");
         assert_ne!(
             info.rp1_node_path.as_str(),
@@ -1515,8 +1568,8 @@ mod tests {
         assert_eq!(info.gic_dist_base, None);
         assert_eq!(info.gic_redist_base, None);
         assert!(!info.l2_interrupt_controller_path.is_empty());
-        assert!(info.pcie_controller_path.is_empty());
-        assert_eq!(info.pcie_controller_base, None);
+        assert_eq!(info.pcie_controller_count, 0);
+        assert_eq!(info.rp1_controller_index, None);
         assert!(
             info.rp1_node_path.is_empty(),
             "an rp1 node outside the classified PCIe controller must not count"
