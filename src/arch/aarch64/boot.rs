@@ -783,6 +783,10 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
             if options.boot_phase == BootPhase::Dtb {
                 rpi5_stage1_dtb_diagnostics(dtb);
             }
+            #[cfg(feature = "rpi5-stage1")]
+            if matches!(options.boot_phase, BootPhase::Mmu | BootPhase::Kernel) {
+                rpi5_stage1_kernel_core_diagnostics(dtb);
+            }
         }
         DetectedPlatform::Unknown => halt_stage1(),
     }
@@ -970,6 +974,136 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
         diag!("RPI5_DTB_RP1_NODE path={}", info.rp1_node_path.as_str());
     }
     rpi5_emergency_marker(b"RPI5_DTB_DIAG_DONE\r\n\0");
+    halt_stage1();
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
+    use crate::arch::aarch64_boot_policy::{
+        Stage1KernelRange, parse_platform_dtb_diagnostics, plan_rpi5_stage1_kernel_memory,
+    };
+    use core::fmt::Write;
+
+    struct Line {
+        bytes: [u8; 192],
+        len: usize,
+        truncated: bool,
+    }
+    impl Line {
+        const fn new() -> Self {
+            Self {
+                bytes: [0; 192],
+                len: 0,
+                truncated: false,
+            }
+        }
+        fn emit(&self) -> bool {
+            let text =
+                core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("RPI5_KERNEL_FORMAT_ERR");
+            crate::arch::aarch64::console::try_write_line(text)
+        }
+    }
+    impl Write for Line {
+        fn write_str(&mut self, value: &str) -> core::fmt::Result {
+            let remaining = self.bytes.len().saturating_sub(self.len);
+            let copied = remaining.min(value.len());
+            self.bytes[self.len..self.len + copied].copy_from_slice(&value.as_bytes()[..copied]);
+            self.len += copied;
+            self.truncated |= copied != value.len();
+            if copied == value.len() {
+                Ok(())
+            } else {
+                Err(core::fmt::Error)
+            }
+        }
+    }
+    macro_rules! kernel_diag {
+        ($($arg:tt)*) => {{
+            let mut line = Line::new();
+            let _ = write!(&mut line, $($arg)*);
+            if line.truncated || !line.emit() {
+                rpi5_emergency_marker(b"RPI5_KERNEL_OUTPUT_FAILED\r\n\0");
+                halt_stage1();
+            }
+        }};
+    }
+
+    rpi5_emergency_marker(b"RPI5_KERNEL_PLAN_BEGIN\r\n\0");
+    let Some(info) = parse_platform_dtb_diagnostics(dtb) else {
+        kernel_diag!("RPI5_KERNEL_PLAN_FAILED reason=dtb_parse_failed");
+        halt_stage1();
+    };
+    let kernel = Stage1KernelRange::new(
+        core::ptr::addr_of!(__kernel_start) as u64,
+        core::ptr::addr_of!(__kernel_end) as u64,
+    );
+    let Some(dtb_end) = (dtb.as_ptr() as u64).checked_add(dtb.len() as u64) else {
+        kernel_diag!("RPI5_KERNEL_PLAN_FAILED reason=dtb_address_overflow");
+        halt_stage1();
+    };
+    let dtb_range = Stage1KernelRange::new(dtb.as_ptr() as u64, dtb_end);
+    kernel_diag!(
+        "RPI5_KERNEL_IMAGE_RANGE start=0x{:016x} end=0x{:016x}",
+        kernel.start,
+        kernel.end
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_DTB_RANGE start=0x{:016x} end=0x{:016x}",
+        dtb_range.start,
+        dtb_range.end
+    );
+    let plan = match plan_rpi5_stage1_kernel_memory(&info, kernel, dtb_range) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_KERNEL_PLAN_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    for (index, range) in plan.reserved_ranges[..plan.reserved_range_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_KERNEL_RESERVED_RANGE index={} start=0x{:016x} end=0x{:016x}",
+            index,
+            range.start,
+            range.end
+        );
+    }
+    for index in &plan.zero_reserved_skipped[..plan.zero_reserved_skipped_count] {
+        kernel_diag!("RPI5_KERNEL_RESERVED_ZERO_SKIPPED index={}", index);
+    }
+    for (index, range) in plan.usable_ranges[..plan.usable_range_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_KERNEL_USABLE_RANGE index={} start=0x{:016x} end=0x{:016x}",
+            index,
+            range.start,
+            range.end
+        );
+    }
+    kernel_diag!(
+        "RPI5_KERNEL_PT_POOL start=0x{:016x} end=0x{:016x}",
+        plan.page_table_pool.start,
+        plan.page_table_pool.end
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_EARLY_HEAP start=0x{:016x} end=0x{:016x}",
+        plan.early_heap.start,
+        plan.early_heap.end
+    );
+    rpi5_emergency_marker(b"RPI5_KERNEL_PLAN_DONE\r\n\0");
+
+    // Stage1D deliberately stops at the validated plan. Enabling SCTLR_EL1
+    // requires a reviewed identity table builder and cache/TLB transition;
+    // reusing the production VM path here would cross the Stage1 boundary.
+    kernel_diag!("RPI5_MMU_DEFERRED reason=identity_map_builder_not_ready");
     halt_stage1();
 }
 

@@ -179,6 +179,62 @@ fn rpi5_stage1b_diagnostics_are_bounded_lock_free_and_halt() {
 }
 
 #[test]
+fn rpi5_stage1d_kernel_plan_is_bounded_plan_only_and_precedes_userspace() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let policy = include_str!("../src/arch/aarch64_boot_policy.rs");
+    let start = boot
+        .find("fn rpi5_stage1_kernel_core_diagnostics")
+        .expect("Stage1D diagnostics function");
+    let end = boot[start..]
+        .find("fn yarm_aarch64_boot_marker_start")
+        .map(|offset| start + offset)
+        .expect("end of Stage1D diagnostics function");
+    let diagnostics = &boot[start..end];
+
+    for marker in [
+        "RPI5_KERNEL_PLAN_BEGIN",
+        "RPI5_KERNEL_IMAGE_RANGE",
+        "RPI5_KERNEL_DTB_RANGE",
+        "RPI5_KERNEL_RESERVED_RANGE",
+        "RPI5_KERNEL_RESERVED_ZERO_SKIPPED",
+        "RPI5_KERNEL_USABLE_RANGE",
+        "RPI5_KERNEL_PT_POOL",
+        "RPI5_KERNEL_EARLY_HEAP",
+        "RPI5_KERNEL_PLAN_DONE",
+        "RPI5_MMU_DEFERRED reason=identity_map_builder_not_ready",
+    ] {
+        assert!(
+            diagnostics.contains(marker),
+            "missing Stage1D marker {marker}"
+        );
+    }
+    assert!(diagnostics.contains("console::try_write_line"));
+    assert!(diagnostics.contains("bytes: [u8; 192]"));
+    assert!(!diagnostics.contains("yarm_log!"));
+    assert!(!diagnostics.contains("printk"));
+    assert!(!diagnostics.contains("initrd"));
+    for forbidden in [
+        "SpawnV5",
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "pcie_init",
+        "start_secondary_cpus",
+    ] {
+        assert!(
+            !diagnostics.contains(forbidden),
+            "Stage1D added forbidden path {forbidden}"
+        );
+    }
+    assert!(boot.contains("if matches!(options.boot_phase, BootPhase::Mmu | BootPhase::Kernel)"));
+    assert!(boot.contains("rpi5_stage1_kernel_core_diagnostics(dtb)"));
+    assert!(policy.contains("const STAGE1_PT_POOL_SIZE: u64 = 256 * 1024"));
+    assert!(policy.contains("const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024"));
+    assert!(policy.contains("plan_rpi5_stage1_kernel_memory"));
+    assert!(policy.contains("Stage1KernelRange::new(0, RPI5_FIRMWARE_LOW_RESERVED_END)"));
+}
+
+#[test]
 fn existing_architecture_defaults_remain_explicit() {
     let aarch64 = include_str!("../src/arch/aarch64/platform_layout.rs");
     let x86 = include_str!("../src/arch/x86_64/platform_layout.rs");

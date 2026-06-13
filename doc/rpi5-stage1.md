@@ -209,6 +209,26 @@ later controller containing `rp1` is selected even when an earlier eligible PCIe
 RP1 child. If no matching child exists, all controllers are still printed and
 `RPI5_DTB_RP1_PCIE present=0` is emitted.
 
+With `yarm.boot_phase=mmu` or `yarm.boot_phase=kernel`, Stage 1D constructs a bounded kernel-core
+memory plan and halts before the production boot path. The kernel image range comes from
+`__kernel_start` and `__kernel_end`; the DTB range comes from the firmware pointer and validated FDT
+total size. The planner reserves `0..0x80000`, the kernel image, the DTB, and every nonzero
+`/reserved-memory` range. Exact duplicate reservations are collapsed, while zero-sized firmware
+entries emit `RPI5_KERNEL_RESERVED_ZERO_SKIPPED`.
+
+The planner subtracts those ranges from at most eight firmware memory ranges using a fixed
+24-entry working array. It selects a 256 KiB page-table pool followed by a 2 MiB early-heap range,
+both aligned to 64 KiB and checked against every reservation and each other. The remaining fragments
+are printed as `RPI5_KERNEL_USABLE_RANGE`. Capacity, overflow, malformed input, or inability to
+place either range fails closed with `RPI5_KERNEL_PLAN_FAILED reason=...`. An initrd is not required
+for this diagnostic path.
+
+Stage 1D currently implements the accepted plan-only outcome. After `RPI5_KERNEL_PLAN_DONE`, it
+emits `RPI5_MMU_DEFERRED reason=identity_map_builder_not_ready` and halts. It deliberately does not
+reuse production VM code before a reviewed identity-map table builder and cache/TLB transition are
+available. Consequently it does not claim `RPI5_MMU_ENABLE_DONE`,
+`RPI5_UART_AFTER_MMU_OK`, or userspace readiness.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

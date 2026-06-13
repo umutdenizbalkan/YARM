@@ -14,6 +14,12 @@ const MAX_DEPTH: usize = 32;
 const MAX_DIAGNOSTIC_RANGES: usize = 8;
 const MAX_DIAGNOSTIC_PCIE_CONTROLLERS: usize = 8;
 const MAX_DIAGNOSTIC_BOOTARGS: usize = 256;
+pub const MAX_STAGE1_KERNEL_RESERVED_RANGES: usize = MAX_DIAGNOSTIC_RANGES + 3;
+pub const MAX_STAGE1_KERNEL_USABLE_RANGES: usize = 24;
+pub const STAGE1_PT_POOL_SIZE: u64 = 256 * 1024;
+pub const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024;
+const STAGE1_ALLOCATION_ALIGNMENT: u64 = 64 * 1024;
+const RPI5_FIRMWARE_LOW_RESERVED_END: u64 = 0x80000;
 const RPI5_PREFERRED_UART: &[u8] = b"/soc@107c000000/serial@7d001000";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -125,6 +131,81 @@ pub struct DiagnosticPcieController {
     pub base: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage1KernelRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl Stage1KernelRange {
+    pub const fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1KernelPlanFailure {
+    #[default]
+    InvalidKernelRange,
+    InvalidDtbRange,
+    FirmwareRangesTruncated,
+    AddressOverflow,
+    ReservedCapacity,
+    UsableCapacity,
+    NoPageTablePool,
+    NoEarlyHeap,
+}
+
+impl Stage1KernelPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InvalidKernelRange => "invalid_kernel_range",
+            Self::InvalidDtbRange => "invalid_dtb_range",
+            Self::FirmwareRangesTruncated => "firmware_ranges_truncated",
+            Self::AddressOverflow => "address_overflow",
+            Self::ReservedCapacity => "reserved_capacity",
+            Self::UsableCapacity => "usable_capacity",
+            Self::NoPageTablePool => "no_page_table_pool",
+            Self::NoEarlyHeap => "no_early_heap",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1KernelPlan {
+    pub reserved_ranges: [Stage1KernelRange; MAX_STAGE1_KERNEL_RESERVED_RANGES],
+    pub reserved_range_count: usize,
+    pub zero_reserved_skipped: [usize; MAX_DIAGNOSTIC_RANGES],
+    pub zero_reserved_skipped_count: usize,
+    pub usable_ranges: [Stage1KernelRange; MAX_STAGE1_KERNEL_USABLE_RANGES],
+    pub usable_range_count: usize,
+    pub page_table_pool: Stage1KernelRange,
+    pub early_heap: Stage1KernelRange,
+}
+
+impl Default for Stage1KernelPlan {
+    fn default() -> Self {
+        Self {
+            reserved_ranges: [Stage1KernelRange::default(); MAX_STAGE1_KERNEL_RESERVED_RANGES],
+            reserved_range_count: 0,
+            zero_reserved_skipped: [0; MAX_DIAGNOSTIC_RANGES],
+            zero_reserved_skipped_count: 0,
+            usable_ranges: [Stage1KernelRange::default(); MAX_STAGE1_KERNEL_USABLE_RANGES],
+            usable_range_count: 0,
+            page_table_pool: Stage1KernelRange::default(),
+            early_heap: Stage1KernelRange::default(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlatformDtbDiagnostics {
     pub memory_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
@@ -195,6 +276,180 @@ impl PlatformDtbInfo {
     pub const fn has_initrd(&self) -> bool {
         matches!((self.initrd_start, self.initrd_end), (Some(start), Some(end)) if end > start)
     }
+}
+
+pub fn plan_rpi5_stage1_kernel_memory(
+    info: &PlatformDtbDiagnostics,
+    kernel: Stage1KernelRange,
+    dtb: Stage1KernelRange,
+) -> Result<Stage1KernelPlan, Stage1KernelPlanFailure> {
+    if kernel.is_empty() {
+        return Err(Stage1KernelPlanFailure::InvalidKernelRange);
+    }
+    if dtb.is_empty() {
+        return Err(Stage1KernelPlanFailure::InvalidDtbRange);
+    }
+    if info.memory_ranges_truncated || info.reserved_ranges_truncated {
+        return Err(Stage1KernelPlanFailure::FirmwareRangesTruncated);
+    }
+
+    let mut plan = Stage1KernelPlan::default();
+    append_stage1_reserved(
+        &mut plan,
+        Stage1KernelRange::new(0, RPI5_FIRMWARE_LOW_RESERVED_END),
+    )?;
+    append_stage1_reserved(&mut plan, kernel)?;
+    append_stage1_reserved(&mut plan, dtb)?;
+    for (index, range) in info.reserved_ranges[..info.reserved_range_count]
+        .iter()
+        .enumerate()
+    {
+        if range.size == 0 {
+            plan.zero_reserved_skipped[plan.zero_reserved_skipped_count] = index;
+            plan.zero_reserved_skipped_count += 1;
+            continue;
+        }
+        append_stage1_reserved(
+            &mut plan,
+            Stage1KernelRange::new(
+                range.start,
+                range
+                    .start
+                    .checked_add(range.size)
+                    .ok_or(Stage1KernelPlanFailure::AddressOverflow)?,
+            ),
+        )?;
+    }
+
+    let mut free = [Stage1KernelRange::default(); MAX_STAGE1_KERNEL_USABLE_RANGES];
+    let mut free_count = 0usize;
+    for range in &info.memory_ranges[..info.memory_range_count] {
+        if range.size == 0 {
+            continue;
+        }
+        append_stage1_range(
+            &mut free,
+            &mut free_count,
+            Stage1KernelRange::new(
+                range.start,
+                range
+                    .start
+                    .checked_add(range.size)
+                    .ok_or(Stage1KernelPlanFailure::AddressOverflow)?,
+            ),
+        )?;
+    }
+    for reserved in &plan.reserved_ranges[..plan.reserved_range_count] {
+        subtract_stage1_range(&mut free, &mut free_count, *reserved)?;
+    }
+
+    plan.page_table_pool = allocate_stage1_range(
+        &mut free,
+        &mut free_count,
+        STAGE1_PT_POOL_SIZE,
+        STAGE1_ALLOCATION_ALIGNMENT,
+    )
+    .ok_or(Stage1KernelPlanFailure::NoPageTablePool)?;
+    plan.early_heap = allocate_stage1_range(
+        &mut free,
+        &mut free_count,
+        STAGE1_EARLY_HEAP_SIZE,
+        STAGE1_ALLOCATION_ALIGNMENT,
+    )
+    .ok_or(Stage1KernelPlanFailure::NoEarlyHeap)?;
+    plan.usable_ranges[..free_count].copy_from_slice(&free[..free_count]);
+    plan.usable_range_count = free_count;
+    Ok(plan)
+}
+
+fn append_stage1_reserved(
+    plan: &mut Stage1KernelPlan,
+    range: Stage1KernelRange,
+) -> Result<(), Stage1KernelPlanFailure> {
+    if plan.reserved_ranges[..plan.reserved_range_count].contains(&range) {
+        return Ok(());
+    }
+    if plan.reserved_range_count == plan.reserved_ranges.len() {
+        return Err(Stage1KernelPlanFailure::ReservedCapacity);
+    }
+    plan.reserved_ranges[plan.reserved_range_count] = range;
+    plan.reserved_range_count += 1;
+    Ok(())
+}
+
+fn append_stage1_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    range: Stage1KernelRange,
+) -> Result<(), Stage1KernelPlanFailure> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    if *count == N {
+        return Err(Stage1KernelPlanFailure::UsableCapacity);
+    }
+    ranges[*count] = range;
+    *count += 1;
+    Ok(())
+}
+
+fn subtract_stage1_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    reserved: Stage1KernelRange,
+) -> Result<(), Stage1KernelPlanFailure> {
+    let mut index = 0usize;
+    while index < *count {
+        let current = ranges[index];
+        if !current.overlaps(reserved) {
+            index += 1;
+            continue;
+        }
+        let left = Stage1KernelRange::new(current.start, current.end.min(reserved.start));
+        let right = Stage1KernelRange::new(current.start.max(reserved.end), current.end);
+        if left.is_empty() {
+            ranges[index] = right;
+            if right.is_empty() {
+                ranges.copy_within(index + 1..*count, index);
+                *count -= 1;
+            } else {
+                index += 1;
+            }
+        } else {
+            ranges[index] = left;
+            index += 1;
+            if !right.is_empty() {
+                append_stage1_range(ranges, count, right)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn allocate_stage1_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    size: u64,
+    alignment: u64,
+) -> Option<Stage1KernelRange> {
+    for index in 0..*count {
+        let candidate_start = align_up_u64(ranges[index].start, alignment)?;
+        let candidate_end = candidate_start.checked_add(size)?;
+        if candidate_end > ranges[index].end {
+            continue;
+        }
+        let allocation = Stage1KernelRange::new(candidate_start, candidate_end);
+        subtract_stage1_range(ranges, count, allocation).ok()?;
+        return Some(allocation);
+    }
+    None
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    debug_assert!(alignment.is_power_of_two());
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
 }
 
 pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnostics> {
@@ -1573,6 +1828,86 @@ mod tests {
         assert!(
             info.rp1_node_path.is_empty(),
             "an rp1 node outside the classified PCIe controller must not count"
+        );
+    }
+
+    #[test]
+    fn rpi5_stage1_kernel_plan_reserves_firmware_kernel_dtb_and_allocates_safely() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        info.reserved_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x80000,
+            no_map: true,
+        };
+        info.reserved_ranges[1] = DiagnosticRange {
+            start: 0x3fd2_3180,
+            size: 0x3e,
+            no_map: true,
+        };
+        info.reserved_ranges[2] = DiagnosticRange {
+            start: 0x5000_0000,
+            size: 0,
+            no_map: false,
+        };
+        info.reserved_range_count = 3;
+
+        let kernel = Stage1KernelRange::new(0x80000, 0x280000);
+        let dtb = Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600);
+        let plan = plan_rpi5_stage1_kernel_memory(&info, kernel, dtb).unwrap();
+
+        assert_eq!(plan.reserved_ranges[0], Stage1KernelRange::new(0, 0x80000));
+        assert_eq!(plan.reserved_ranges[1], kernel);
+        assert_eq!(plan.reserved_ranges[2], dtb);
+        assert_eq!(
+            plan.reserved_ranges[3],
+            Stage1KernelRange::new(0x3fd2_3180, 0x3fd2_31be)
+        );
+        assert_eq!(&plan.zero_reserved_skipped[..1], &[2]);
+        assert_eq!(
+            plan.page_table_pool.end - plan.page_table_pool.start,
+            STAGE1_PT_POOL_SIZE
+        );
+        assert_eq!(
+            plan.early_heap.end - plan.early_heap.start,
+            STAGE1_EARLY_HEAP_SIZE
+        );
+        for allocation in [plan.page_table_pool, plan.early_heap] {
+            for reserved in &plan.reserved_ranges[..plan.reserved_range_count] {
+                assert!(!allocation.overlaps(*reserved));
+            }
+        }
+        assert!(!plan.page_table_pool.overlaps(plan.early_heap));
+    }
+
+    #[test]
+    fn rpi5_stage1_kernel_plan_does_not_require_an_initrd() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert!(
+            plan_rpi5_stage1_kernel_memory(
+                &info,
+                Stage1KernelRange::new(0x80000, 0x180000),
+                Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600),
+            )
+            .is_ok()
         );
     }
 
