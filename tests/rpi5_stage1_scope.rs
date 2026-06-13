@@ -65,6 +65,13 @@ fn raw_entry_breadcrumb_ladder_has_all_expected_markers() {
         "RPI5_TRY_WRITE_RETURN_OK",
         "RPI5_TRY_WRITE_RETURN_ERR",
         "RPI5_PL011_FR value=0x",
+        "RPI5_AFTER_CONSOLE_WRITE",
+        "RPI5_BEFORE_BOOT01",
+        "RPI5_AFTER_BOOT01",
+        "RPI5_BEFORE_BOOT02",
+        "RPI5_AFTER_BOOT02",
+        "RPI5_BEFORE_BOOT03",
+        "RPI5_AFTER_BOOT03",
     ] {
         assert!(
             boot.contains(marker) || console.contains(marker),
@@ -104,6 +111,12 @@ fn rpi5_console_transition_is_bounded_and_uses_the_proven_uart() {
     assert!(!console.contains("0x107d001000"));
     assert!(boot.contains("RPI5_UART_TRANSLATION_FAILED"));
     assert!(policy.contains("assert_eq!(info.serial.unwrap().base, 0x10_7d00_1000)"));
+    assert!(boot.contains("rpi5_emergency_marker(b\"RPI5_BOOT_01_DTB_PTR\\r\\n\\0\")"));
+    assert!(boot.contains("b\"RPI5_BOOT_01_DTB_PTR value=0x\\0\""));
+    assert!(boot.contains("rpi5_emergency_marker(b\"RPI5_BOOT_02_UART_SELECTED\\r\\n\\0\")"));
+    assert!(boot.contains("b\"RPI5_BOOT_02_UART_SELECTED base=0x\\0\""));
+    assert!(boot.contains("rpi5_emergency_marker(b\"RPI5_BOOT_03_UART_OK\\r\\n\\0\")"));
+    assert!(boot.contains("#[cfg(not(feature = \"rpi5-stage1\"))]\n            crate::yarm_log!"));
 }
 
 #[test]

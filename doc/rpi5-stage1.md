@@ -111,9 +111,18 @@ RPI5_TRY_WRITE_TX_READY
 RPI5_TRY_WRITE_BYTE_DONE
 RPI5_TRY_WRITE_RETURN_OK
 RPI5_CONSOLE_WRITE_DONE
+RPI5_AFTER_CONSOLE_WRITE
+RPI5_BEFORE_BOOT01
+RPI5_BOOT_01_DTB_PTR
 RPI5_BOOT_01_DTB_PTR value=...
-RPI5_BOOT_02_UART_SELECTED path=... base=...
+RPI5_AFTER_BOOT01
+RPI5_BEFORE_BOOT02
+RPI5_BOOT_02_UART_SELECTED
+RPI5_BOOT_02_UART_SELECTED base=...
+RPI5_AFTER_BOOT02
+RPI5_BEFORE_BOOT03
 RPI5_BOOT_03_UART_OK
+RPI5_AFTER_BOOT03
 ```
 
 `RPI5_RAW_ENTRY` is emitted directly from `_start`, before BSS clearing, Rust, DTB parsing, MMU
@@ -140,6 +149,17 @@ byte still uses the bounded PL011 helper. The probe reports its first `FR` read,
 and TX-full bit 5 match the emergency writer; data is written at offset `0x00`. Failure emits
 `RPI5_TRY_WRITE_TIMEOUT`, then `RPI5_TRY_WRITE_RETURN_ERR`, and finally
 `RPI5_CONSOLE_WRITE_TIMEOUT` before halting.
+
+The Stage 1 BOOT_01/02/03 sequence stays entirely on the emergency writer. The generic
+`yarm_log!` path formats into the printk ring and then enters the IRQ-safe `PRINTK_DRAIN_LOCK`; that
+lock is not yet a proven-safe dependency at this boundary. Non-Stage1 builds retain the formatted
+path and UART path-string report, while `rpi5-stage1` reports the DTB pointer and selected UART base
+without printk formatting or drain locks.
+
+An initial `PL011_FR` value of `0x38` has BUSY (bit 3), RXFE (bit 4), and TXFF (bit 5) set. It is
+therefore not considered TX-ready at that instant. The bounded writer correctly continues polling;
+the later `RPI5_TRY_WRITE_TX_READY` marker means a subsequent FR read had TXFF clear. No readiness
+predicate change is required.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans

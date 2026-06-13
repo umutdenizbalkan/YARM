@@ -749,16 +749,33 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
                 halt_stage1();
             }
             rpi5_emergency_marker(b"RPI5_CONSOLE_WRITE_DONE\r\n\0");
+            rpi5_emergency_marker(b"RPI5_AFTER_CONSOLE_WRITE\r\n\0");
             if options.boot_phase == BootPhase::Entry {
                 halt_stage1();
             }
+            rpi5_emergency_marker(b"RPI5_BEFORE_BOOT01\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_01_DTB_PTR\r\n\0");
+            rpi5_emergency_hex(b"RPI5_BOOT_01_DTB_PTR value=0x\0", start_info_ptr as u64);
+            #[cfg(not(feature = "rpi5-stage1"))]
             crate::yarm_log!("RPI5_BOOT_01_DTB_PTR value=0x{:x}", start_info_ptr as u64);
+            rpi5_emergency_marker(b"RPI5_AFTER_BOOT01\r\n\0");
+
+            rpi5_emergency_marker(b"RPI5_BEFORE_BOOT02\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_02_UART_SELECTED\r\n\0");
+            rpi5_emergency_hex(b"RPI5_BOOT_02_UART_SELECTED base=0x\0", serial.base);
+            #[cfg(not(feature = "rpi5-stage1"))]
             crate::yarm_log!(
                 "RPI5_BOOT_02_UART_SELECTED path={} base=0x{:x}",
                 serial.path.as_str(),
                 serial.base
             );
+            rpi5_emergency_marker(b"RPI5_AFTER_BOOT02\r\n\0");
+
+            rpi5_emergency_marker(b"RPI5_BEFORE_BOOT03\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_03_UART_OK\r\n\0");
+            #[cfg(not(feature = "rpi5-stage1"))]
             crate::arch::aarch64::console::write_line("RPI5_BOOT_03_UART_OK");
+            rpi5_emergency_marker(b"RPI5_AFTER_BOOT03\r\n\0");
             if options.boot_phase == BootPhase::Uart {
                 halt_stage1();
             }
