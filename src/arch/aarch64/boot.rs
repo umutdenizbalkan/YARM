@@ -654,7 +654,7 @@ fn halt_stage1() -> ! {
     feature = "rpi5-stage1"
 ))]
 #[inline(always)]
-fn rpi5_emergency_marker(marker: &'static [u8]) {
+pub(super) fn rpi5_emergency_marker(marker: &'static [u8]) {
     unsafe extern "C" {
         fn yarm_aarch64_rpi5_emergency_write(marker: *const u8);
     }
@@ -669,7 +669,7 @@ fn rpi5_emergency_marker(marker: &'static [u8]) {
     feature = "rpi5-stage1"
 ))]
 #[inline(always)]
-fn rpi5_emergency_hex(prefix: &'static [u8], value: u64) {
+pub(super) fn rpi5_emergency_hex(prefix: &'static [u8], value: u64) {
     unsafe extern "C" {
         fn yarm_aarch64_rpi5_emergency_write_hex(prefix: *const u8, value: u64);
     }

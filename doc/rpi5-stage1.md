@@ -104,6 +104,12 @@ RPI5_SELECTED_UART_BASE value=0x000000107d001000
 RPI5_CONSOLE_SELECT_DONE
 RPI5_CONSOLE_WRITE_BEGIN
 RPI5_BOOT_00_ENTRY
+RPI5_TRY_WRITE_ENTER
+RPI5_TRY_WRITE_BYTE_BEGIN
+RPI5_PL011_FR value=0x...
+RPI5_TRY_WRITE_TX_READY
+RPI5_TRY_WRITE_BYTE_DONE
+RPI5_TRY_WRITE_RETURN_OK
 RPI5_CONSOLE_WRITE_DONE
 RPI5_BOOT_01_DTB_PTR value=...
 RPI5_BOOT_02_UART_SELECTED path=... base=...
@@ -127,6 +133,13 @@ unproven MMIO base. `RPI5_BOOT_00_ENTRY` also remains on the emergency writer. T
 then probed with a CRLF write bracketed by `RPI5_CONSOLE_WRITE_BEGIN` and
 `RPI5_CONSOLE_WRITE_DONE`; RPi5 Stage 1 bounds its PL011 TX-ready poll and reports
 `RPI5_CONSOLE_WRITE_TIMEOUT` instead of spinning forever.
+
+The first empty-line normal-console probe bypasses the normal IRQ-safe log lock because RPi5 Stage 1
+is explicitly single-CPU and interrupts are not yet part of this diagnostic boundary. Every emitted
+byte still uses the bounded PL011 helper. The probe reports its first `FR` read, where offset `0x18`
+and TX-full bit 5 match the emergency writer; data is written at offset `0x00`. Failure emits
+`RPI5_TRY_WRITE_TIMEOUT`, then `RPI5_TRY_WRITE_RETURN_ERR`, and finally
+`RPI5_CONSOLE_WRITE_TIMEOUT` before halting.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans

@@ -35,6 +35,7 @@ fn raw_entry_marker_is_confined_to_the_rpi5_stage1_feature() {
 #[test]
 fn raw_entry_breadcrumb_ladder_has_all_expected_markers() {
     let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let console = include_str!("../src/arch/aarch64/console.rs");
     for marker in [
         "RPI5_RAW_ENTRY",
         "RPI5_RAW_AFTER_MARKER",
@@ -56,8 +57,19 @@ fn raw_entry_breadcrumb_ladder_has_all_expected_markers() {
         "RPI5_CONSOLE_SELECT_DONE",
         "RPI5_CONSOLE_WRITE_BEGIN",
         "RPI5_CONSOLE_WRITE_DONE",
+        "RPI5_TRY_WRITE_ENTER",
+        "RPI5_TRY_WRITE_BYTE_BEGIN",
+        "RPI5_TRY_WRITE_TX_READY",
+        "RPI5_TRY_WRITE_BYTE_DONE",
+        "RPI5_TRY_WRITE_TIMEOUT",
+        "RPI5_TRY_WRITE_RETURN_OK",
+        "RPI5_TRY_WRITE_RETURN_ERR",
+        "RPI5_PL011_FR value=0x",
     ] {
-        assert!(boot.contains(marker), "missing breadcrumb {marker}");
+        assert!(
+            boot.contains(marker) || console.contains(marker),
+            "missing breadcrumb {marker}"
+        );
     }
 }
 
@@ -71,9 +83,23 @@ fn rpi5_console_transition_is_bounded_and_uses_the_proven_uart() {
     assert!(boot.contains("serial.base != RPI5_EMERGENCY_UART_BASE"));
     assert!(boot.contains("rpi5_emergency_marker(b\"RPI5_BOOT_00_ENTRY\\r\\n\\0\")"));
     assert!(!boot.contains("console::write_line(\"RPI5_BOOT_00_ENTRY\")"));
-    assert!(console.contains("#[cfg(feature = \"rpi5-stage1\")]"));
+    assert!(console.contains("feature = \"rpi5-stage1\""));
     assert!(console.contains("const TX_READY_POLL_LIMIT: usize = 1_048_576"));
     assert!(console.contains("return false"));
+    assert!(console.contains("pub fn try_write_line(msg: &str) -> bool"));
+    assert!(console.contains("rpi5_write_byte_bounded(b'\\r', diagnostic_probe)"));
+    assert!(console.contains("rpi5_write_byte_bounded(b'\\n', diagnostic_probe)"));
+    assert!(console.contains("super::boot::rpi5_emergency_hex"));
+    assert!(console.contains("const PL011_DR: usize = 0x000"));
+    assert!(console.contains("const PL011_FR: usize = 0x018"));
+    assert!(console.contains("const PL011_FR_TXFF: u32 = 1 << 5"));
+    assert!(boot.contains("ldr w13, [x10, #0x18]"));
+    assert!(boot.contains("tbz w13, #5"));
+    assert!(boot.contains("str w11, [x10]"));
+    assert!(console.contains(
+        "#[cfg(all(not(feature = \"hosted-dev\"), not(feature = \"rpi5-stage1\")))]\n\
+         static UART_LOG_LOCK"
+    ));
     assert!(!console.contains("0x10_7d00_1000"));
     assert!(!console.contains("0x107d001000"));
     assert!(boot.contains("RPI5_UART_TRANSLATION_FAILED"));
