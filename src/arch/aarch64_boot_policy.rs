@@ -217,7 +217,9 @@ pub struct Stage1MmuMapping {
     pub memory_type: Stage1MmuMemoryType,
 }
 
-pub const MAX_STAGE1_MMU_MAPPINGS: usize = MAX_DIAGNOSTIC_RANGES + 1;
+pub const RPI5_STAGE1_GICR_FRAME_STRIDE: u64 = 128 * 1024;
+pub const RPI5_STAGE1_GICR_SCAN_FRAMES: usize = 4;
+pub const MAX_STAGE1_MMU_MAPPINGS: usize = MAX_DIAGNOSTIC_RANGES + 1 + RPI5_STAGE1_GICR_SCAN_FRAMES;
 pub const MAX_STAGE1_ALLOC_RESERVED_RANGES: usize = MAX_STAGE1_KERNEL_RESERVED_RANGES + 2;
 pub const MAX_STAGE1_ALLOC_USABLE_RANGES: usize = MAX_STAGE1_KERNEL_USABLE_RANGES;
 
@@ -732,10 +734,7 @@ pub fn plan_rpi5_stage1_identity_map(
             memory_type: Stage1MmuMemoryType::DeviceNgnre,
         },
     )?;
-    for base in [info.gic_dist_base, info.gic_redist_base]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(base) = info.gic_dist_base {
         let page_start = align_down_u64_policy(base, STAGE1_PAGE_SIZE);
         append_stage1_mmu_mapping(
             &mut plan,
@@ -749,6 +748,30 @@ pub fn plan_rpi5_stage1_identity_map(
                 memory_type: Stage1MmuMemoryType::DeviceNgnre,
             },
         )?;
+    }
+    if let Some(base) = info.gic_redist_base {
+        for index in 0..RPI5_STAGE1_GICR_SCAN_FRAMES {
+            let candidate = base
+                .checked_add(
+                    (index as u64)
+                        .checked_mul(RPI5_STAGE1_GICR_FRAME_STRIDE)
+                        .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+                )
+                .ok_or(Stage1MmuPlanFailure::AddressOverflow)?;
+            let page_start = align_down_u64_policy(candidate, STAGE1_PAGE_SIZE);
+            append_stage1_mmu_mapping(
+                &mut plan,
+                Stage1MmuMapping {
+                    range: Stage1KernelRange::new(
+                        page_start,
+                        page_start
+                            .checked_add(STAGE1_PAGE_SIZE)
+                            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+                    ),
+                    memory_type: Stage1MmuMemoryType::DeviceNgnre,
+                },
+            )?;
+        }
     }
 
     for (index, mapping) in plan.mappings[..plan.mapping_count].iter().enumerate() {
@@ -786,6 +809,10 @@ pub const fn rpi5_stage1_timer_delta(begin: u64, end: u64) -> Option<u64> {
         Some(0) | None => None,
         Some(delta) => Some(delta),
     }
+}
+
+pub const fn rpi5_stage1_gicr_typer_plausible(typer: u64) -> bool {
+    typer != 0 && typer != u64::MAX
 }
 
 fn append_stage1_mmu_mapping(
@@ -2398,7 +2425,7 @@ mod tests {
             plan_rpi5_stage1_identity_map(&info, &kernel_plan, kernel, stack, dtb, 0x10_7d00_1000)
                 .unwrap();
         assert_eq!(plan.pt_pool, kernel_plan.page_table_pool);
-        assert_eq!(plan.mapping_count, 5);
+        assert_eq!(plan.mapping_count, 8);
         assert_eq!(
             plan.mappings[0],
             Stage1MmuMapping {
@@ -2434,6 +2461,16 @@ mod tests {
                 memory_type: Stage1MmuMemoryType::DeviceNgnre,
             }
         );
+        for (index, mapping) in plan.mappings[4..8].iter().enumerate() {
+            let start = 0x10_7fff_a000 + (index as u64) * RPI5_STAGE1_GICR_FRAME_STRIDE;
+            assert_eq!(
+                *mapping,
+                Stage1MmuMapping {
+                    range: Stage1KernelRange::new(start, start + STAGE1_PAGE_SIZE),
+                    memory_type: Stage1MmuMemoryType::DeviceNgnre,
+                }
+            );
+        }
         for normal in &plan.mappings[..2] {
             assert!(!normal.range.overlaps(plan.mappings[2].range));
         }
@@ -2585,6 +2622,14 @@ mod tests {
         assert_eq!(info.initrd_start, None);
         assert_eq!(info.initrd_end, None);
         assert_eq!(rpi5_stage1_timer_delta(7, 9), Some(2));
+    }
+
+    #[test]
+    fn rpi5_stage1_gicr_validation_rejects_zero_and_accepts_plausible_typer() {
+        assert!(!rpi5_stage1_gicr_typer_plausible(0));
+        assert!(!rpi5_stage1_gicr_typer_plausible(u64::MAX));
+        assert!(rpi5_stage1_gicr_typer_plausible(1 << 4));
+        assert!(rpi5_stage1_gicr_typer_plausible(0x1234_0000_0000_0010));
     }
 
     #[test]

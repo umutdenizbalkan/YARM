@@ -984,9 +984,10 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
 ))]
 fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     use crate::arch::aarch64_boot_policy::{
-        Stage1KernelRange, Stage1MmuMemoryType, parse_platform_dtb_diagnostics,
-        plan_rpi5_stage1_allocator_handoff, plan_rpi5_stage1_identity_map,
-        plan_rpi5_stage1_kernel_memory, rpi5_stage1_timer_delta,
+        RPI5_STAGE1_GICR_FRAME_STRIDE, RPI5_STAGE1_GICR_SCAN_FRAMES, Stage1KernelRange,
+        Stage1MmuMemoryType, parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
+        plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory,
+        rpi5_stage1_gicr_typer_plausible, rpi5_stage1_timer_delta,
     };
     use core::fmt::Write;
 
@@ -1337,6 +1338,76 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     kernel_diag!("RPI5_L2_INTC_PROBE_DEFERRED reason=no_reviewed_read_only_offset");
     rpi5_emergency_marker(b"RPI5_IRQTIMER_DIAG_DONE\r\n\0");
     rpi5_emergency_marker(b"RPI5_KERNEL_IRQTIMER_READY\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_IRQ_INIT_BEGIN\r\n\0");
+    kernel_diag!("RPI5_GICR_VALIDATE_BEGIN base=0x{:016x}", gicr_base);
+    let mut validated_gicr = None;
+    for index in 0..RPI5_STAGE1_GICR_SCAN_FRAMES {
+        let Some(frame_base) =
+            gicr_base.checked_add((index as u64) * RPI5_STAGE1_GICR_FRAME_STRIDE)
+        else {
+            kernel_diag!("RPI5_IRQ_INIT_FAILED reason=gicr_scan_address_overflow");
+            halt_stage1();
+        };
+        let typer = unsafe { core::ptr::read_volatile((frame_base + 0x008) as *const u64) };
+        kernel_diag!(
+            "RPI5_GICR_FRAME index={} base=0x{:016x} typer=0x{:016x}",
+            index,
+            frame_base,
+            typer
+        );
+        if validated_gicr.is_none() && rpi5_stage1_gicr_typer_plausible(typer) {
+            validated_gicr = Some(frame_base);
+        }
+    }
+    if validated_gicr.is_some() {
+        rpi5_emergency_marker(b"RPI5_GICR_VALIDATE_DONE\r\n\0");
+        kernel_diag!("RPI5_IRQ_INIT_DEFERRED reason=gic_init_sequence_not_reviewed");
+    } else {
+        kernel_diag!("RPI5_GICR_VALIDATE_FAILED reason=no_valid_frame");
+        kernel_diag!("RPI5_IRQ_INIT_DEFERRED reason=gicr_unvalidated");
+    }
+
+    rpi5_emergency_marker(b"RPI5_TIMER_INIT_BEGIN\r\n\0");
+    let timer_ctl_before: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, CNTP_CTL_EL0",
+            out(reg) timer_ctl_before,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CTL_BEFORE value=0x{:016x}", timer_ctl_before);
+    let timer_tval = (timer_frequency / 100).clamp(1, u32::MAX as u64);
+    unsafe {
+        core::arch::asm!(
+            "msr CNTP_TVAL_EL0, {0}",
+            in(reg) timer_tval,
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "msr CNTP_CTL_EL0, {0}",
+            "isb",
+            in(reg) 3u64,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_TVAL_SET value=0x{:016x}", timer_tval);
+    let timer_ctl_after: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, CNTP_CTL_EL0",
+            out(reg) timer_ctl_after,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CTL_AFTER value=0x{:016x}", timer_ctl_after);
+    if timer_ctl_after & 0x3 != 0x3 {
+        kernel_diag!("RPI5_IRQ_INIT_FAILED reason=timer_masked_enable_readback");
+        halt_stage1();
+    }
+    kernel_diag!("RPI5_TIMER_INIT_DONE masked=1");
+    rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_PREP_DONE\r\n\0");
     halt_stage1();
 }
 

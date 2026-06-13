@@ -275,6 +275,23 @@ enable IRQs. The tree has no reviewed read-only register definition for the
 `RPI5_L2_INTC_PROBE_DEFERRED reason=no_reviewed_read_only_offset` instead of guessing an offset.
 Success ends with `RPI5_IRQTIMER_DIAG_DONE` and `RPI5_KERNEL_IRQTIMER_READY`, then halts.
 
+Stage 1H performs a bounded validation pass over four possible GICv3 redistributor frames, starting
+at the DTB-discovered base with the architectural 128 KiB frame stride. Only each candidate's
+64-bit `GICR_TYPER` is read. Zero and all-ones values are rejected. The corresponding 4 KiB probe
+pages are included in the Stage1 identity map as device-nGnRE.
+
+No reviewed CPU-interface/redistributor write sequence is present yet, so Stage 1H does not write
+GICD or GICR registers even if a plausible frame is observed. A zero-only scan emits
+`RPI5_GICR_VALIDATE_FAILED reason=no_valid_frame` and
+`RPI5_IRQ_INIT_DEFERRED reason=gicr_unvalidated`; a plausible frame emits validation success and
+defers with `gic_init_sequence_not_reviewed`.
+
+After that explicit GIC deferral, Stage 1H programs a diagnostic physical-timer interval equal to
+one hundredth of `CNTFRQ_EL0`, clamped to the positive 32-bit `CNTP_TVAL_EL0` range. It writes
+`CNTP_CTL_EL0=3`, leaving the timer enabled but interrupt-masked, verifies the enable/mask readback,
+emits `RPI5_TIMER_INIT_DONE masked=1` and `RPI5_KERNEL_BOOT_PREP_DONE`, then halts. It does not
+enable any IRQ, enter a scheduler, start another CPU, or initialize an external device.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

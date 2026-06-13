@@ -238,6 +238,18 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_L2_INTC_PROBE_DEFERRED",
         "RPI5_IRQTIMER_DIAG_DONE",
         "RPI5_KERNEL_IRQTIMER_READY",
+        "RPI5_IRQ_INIT_BEGIN",
+        "RPI5_GICR_VALIDATE_BEGIN",
+        "RPI5_GICR_FRAME",
+        "RPI5_GICR_VALIDATE_DONE",
+        "RPI5_GICR_VALIDATE_FAILED",
+        "RPI5_IRQ_INIT_DEFERRED",
+        "RPI5_TIMER_INIT_BEGIN",
+        "RPI5_TIMER_CTL_BEFORE",
+        "RPI5_TIMER_TVAL_SET",
+        "RPI5_TIMER_CTL_AFTER",
+        "RPI5_TIMER_INIT_DONE",
+        "RPI5_KERNEL_BOOT_PREP_DONE",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -304,6 +316,25 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(!stage1g.contains("GICD_CTLR"));
     assert!(!stage1g.contains("ISENABLER"));
     assert!(!stage1g.contains("ICENABLER"));
+    let stage1h_start = diagnostics.find("RPI5_IRQ_INIT_BEGIN").unwrap();
+    let stage1h_end = diagnostics[stage1h_start..]
+        .find("RPI5_KERNEL_BOOT_PREP_DONE")
+        .map(|offset| stage1h_start + offset)
+        .unwrap();
+    let stage1h = &diagnostics[stage1h_start..stage1h_end];
+    let validation = stage1h.find("RPI5_GICR_VALIDATE_BEGIN").unwrap();
+    let deferral = stage1h.find("RPI5_IRQ_INIT_DEFERRED").unwrap();
+    assert!(validation < deferral);
+    assert!(stage1h.contains("core::ptr::read_volatile"));
+    assert!(!stage1h.contains("write_volatile"));
+    assert!(!stage1h.contains("GICD_CTLR"));
+    assert!(!stage1h.contains("ISENABLER"));
+    assert!(!stage1h.contains("ICENABLER"));
+    assert!(stage1h.contains("\"msr CNTP_TVAL_EL0, {0}\""));
+    assert!(stage1h.contains("\"msr CNTP_CTL_EL0, {0}\""));
+    assert_eq!(stage1h.matches("\"msr CNTP_").count(), 2);
+    assert!(!stage1h.contains("start_secondary_cpus"));
+    assert!(!stage1h.contains("scheduler"));
 }
 
 #[test]
