@@ -133,11 +133,17 @@ pub struct PlatformDtbDiagnostics {
     pub interrupt_controller_path: DtbPath,
     pub interrupt_controller_base: Option<u64>,
     pub interrupt_controller_compatible: DtbPath,
+    pub l2_interrupt_controller_path: DtbPath,
+    pub l2_interrupt_controller_base: Option<u64>,
+    pub l2_interrupt_controller_compatible: DtbPath,
+    pub gic_path: DtbPath,
+    pub gic_compatible: DtbPath,
     pub gic_dist_base: Option<u64>,
     pub gic_redist_base: Option<u64>,
     pub psci_conduit: DiagnosticPsciConduit,
     pub cpu_bitmap: u64,
-    pub rp1_pcie_present: bool,
+    pub pcie_controller_path: DtbPath,
+    pub pcie_controller_base: Option<u64>,
     pub rp1_node_path: DtbPath,
 }
 
@@ -157,11 +163,17 @@ impl Default for PlatformDtbDiagnostics {
             interrupt_controller_path: DtbPath::empty(),
             interrupt_controller_base: None,
             interrupt_controller_compatible: DtbPath::empty(),
+            l2_interrupt_controller_path: DtbPath::empty(),
+            l2_interrupt_controller_base: None,
+            l2_interrupt_controller_compatible: DtbPath::empty(),
+            gic_path: DtbPath::empty(),
+            gic_compatible: DtbPath::empty(),
             gic_dist_base: None,
             gic_redist_base: None,
             psci_conduit: DiagnosticPsciConduit::None,
             cpu_bitmap: 0,
-            rp1_pcie_present: false,
+            pcie_controller_path: DtbPath::empty(),
+            pcie_controller_base: None,
             rp1_node_path: DtbPath::empty(),
         }
     }
@@ -180,8 +192,15 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
     let mut reserved_range = None;
     let mut reserved_no_map = false;
     let mut irq_candidate = false;
+    let mut irq_is_l2 = false;
+    let mut irq_is_gic = false;
+    let mut irq_compatible = DtbPath::empty();
+    let mut irq_path = DtbPath::empty();
     let mut irq_reg = [DiagnosticRange::default(); 2];
     let mut irq_reg_count = 0usize;
+    let mut pcie_candidate = false;
+    let mut pcie_path = DtbPath::empty();
+    let mut pcie_base = None;
     while let Some(event) = walker.next() {
         match event {
             Event::Begin { path, name } => {
@@ -191,17 +210,24 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                 }
                 irq_candidate =
                     name.starts_with(b"intc") || name.starts_with(b"interrupt-controller");
+                irq_is_l2 = false;
+                irq_is_gic = false;
+                irq_compatible = DtbPath::empty();
+                irq_path.set(path);
                 irq_reg_count = 0;
+                pcie_candidate = name.starts_with(b"pcie@") || name.starts_with(b"pci@");
+                pcie_path.set(path);
+                pcie_base = None;
                 if path.starts_with(b"/cpus/")
                     && let Some(cpu) = parse_cpu_id_from_node_name(name)
                 {
                     out.cpu_bitmap |= 1u64 << cpu;
                 }
-                if is_rp1_or_pcie(name) {
-                    out.rp1_pcie_present = true;
-                    if out.rp1_node_path.is_empty() {
-                        out.rp1_node_path.set(path);
-                    }
+                if name == b"rp1"
+                    && direct_parent_path(path) == Some(out.pcie_controller_path.as_bytes())
+                    && out.rp1_node_path.is_empty()
+                {
+                    out.rp1_node_path.set(path);
                 }
             }
             Event::Property {
@@ -250,7 +276,9 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                     irq_candidate = true;
                 }
                 if irq_candidate && name == b"compatible" {
-                    out.interrupt_controller_compatible.set(first_string(value));
+                    irq_compatible.set(first_string(value));
+                    irq_is_l2 = value.split(|byte| *byte == 0).any(is_bcm7271_l2_compatible);
+                    irq_is_gic = value.split(|byte| *byte == 0).any(is_arm_gic_compatible);
                 }
                 if irq_candidate && name == b"reg" {
                     let mut truncated = false;
@@ -263,7 +291,7 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                         parent_size_cells,
                         false,
                     )?;
-                    out.interrupt_controller_path.set(path);
+                    irq_path.set(path);
                 }
                 if path.starts_with(b"/psci") && name == b"method" {
                     out.psci_conduit = match first_string(value) {
@@ -272,10 +300,21 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                         _ => DiagnosticPsciConduit::None,
                     };
                 }
-                if name == b"compatible" && value.split(|byte| *byte == 0).any(is_rp1_or_pcie) {
-                    out.rp1_pcie_present = true;
-                    if out.rp1_node_path.is_empty() {
-                        out.rp1_node_path.set(path);
+                if name == b"compatible" && value.split(|byte| *byte == 0).any(is_pcie_compatible) {
+                    pcie_candidate = true;
+                    pcie_path.set(path);
+                    if out.pcie_controller_path.is_empty() {
+                        out.pcie_controller_path = pcie_path;
+                    }
+                }
+                if pcie_candidate && name == b"reg" {
+                    let (base, _) = first_reg(value, parent_address_cells, parent_size_cells);
+                    pcie_base = base;
+                }
+                if pcie_candidate && let Some(base) = pcie_base {
+                    if out.pcie_controller_path == pcie_path {
+                        out.pcie_controller_base =
+                            translate_to_root(blocks, pcie_path.as_bytes(), base);
                     }
                 }
             }
@@ -289,15 +328,28 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                     );
                 }
                 if irq_candidate && irq_reg_count != 0 {
-                    let path = out.interrupt_controller_path.as_bytes();
-                    out.interrupt_controller_base =
-                        translate_to_root(blocks, path, irq_reg[0].start);
-                    out.gic_dist_base = out.interrupt_controller_base;
-                    if irq_reg_count > 1 {
-                        out.gic_redist_base = translate_to_root(blocks, path, irq_reg[1].start);
+                    let path = irq_path.as_bytes();
+                    let first_base = translate_to_root(blocks, path, irq_reg[0].start);
+                    if out.interrupt_controller_path.is_empty() {
+                        out.interrupt_controller_path = irq_path;
+                        out.interrupt_controller_base = first_base;
+                        out.interrupt_controller_compatible = irq_compatible;
+                    }
+                    if irq_is_l2 && out.l2_interrupt_controller_path.is_empty() {
+                        out.l2_interrupt_controller_path = irq_path;
+                        out.l2_interrupt_controller_base = first_base;
+                        out.l2_interrupt_controller_compatible = irq_compatible;
+                    } else if irq_is_gic && out.gic_path.is_empty() {
+                        out.gic_path = irq_path;
+                        out.gic_compatible = irq_compatible;
+                        out.gic_dist_base = first_base;
+                        if irq_reg_count > 1 {
+                            out.gic_redist_base = translate_to_root(blocks, path, irq_reg[1].start);
+                        }
                     }
                 }
                 irq_candidate = false;
+                pcie_candidate = false;
             }
             Event::End => break,
         }
@@ -805,16 +857,23 @@ fn parse_cpu_id_from_node_name(name: &[u8]) -> Option<u8> {
     }
     (consumed != 0 && value < 64).then_some(value as u8)
 }
-fn is_rp1_or_pcie(value: &[u8]) -> bool {
+fn is_bcm7271_l2_compatible(value: &[u8]) -> bool {
+    value == b"brcm,bcm7271-l2-intc"
+}
+fn is_arm_gic_compatible(value: &[u8]) -> bool {
+    matches!(
+        value,
+        b"arm,gic-v3" | b"arm,gic-400" | b"arm,cortex-a15-gic"
+    )
+}
+fn is_pcie_compatible(value: &[u8]) -> bool {
     value
-        .windows(3)
-        .any(|part| part.eq_ignore_ascii_case(b"rp1"))
-        || value
-            .windows(4)
-            .any(|part| part.eq_ignore_ascii_case(b"pcie"))
-        || value
-            .windows(3)
-            .any(|part| part.eq_ignore_ascii_case(b"pci"))
+        .windows(4)
+        .any(|part| part.eq_ignore_ascii_case(b"pcie"))
+}
+fn direct_parent_path(path: &[u8]) -> Option<&[u8]> {
+    let split = path.iter().rposition(|byte| *byte == b'/')?;
+    (split != 0).then_some(&path[..split])
 }
 fn append_reg_ranges<const N: usize>(
     ranges: &mut [DiagnosticRange; N],
@@ -1001,6 +1060,7 @@ mod tests {
         with_initrd: bool,
         rpi_ranges_map_uart: bool,
         bootargs: &[u8],
+        with_gic: bool,
     ) -> Vec<u8> {
         let mut st = Vec::new();
         let mut strings = Vec::new();
@@ -1160,7 +1220,7 @@ mod tests {
                 &reg_2_1(0x7d00_1000, 0x1000),
             );
             end(&mut st);
-            begin(&mut st, b"interrupt-controller@7fff9000");
+            begin(&mut st, b"intc@7d517ac0");
             prop(
                 &mut st,
                 &mut strings,
@@ -1173,13 +1233,64 @@ mod tests {
                 &mut strings,
                 &mut offsets,
                 "compatible",
-                b"arm,gic-v3\0",
+                b"brcm,bcm7271-l2-intc\0",
             );
-            let mut gic_regs = reg_2_1(0x7fff_9000, 0x1000);
-            gic_regs.extend_from_slice(&reg_2_1(0x7fff_a000, 0x20_000));
-            prop(&mut st, &mut strings, &mut offsets, "reg", &gic_regs);
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "reg",
+                &reg_2_1(0x7d51_7ac0, 0x100),
+            );
             end(&mut st);
-            begin(&mut st, b"pcie@120000");
+            if with_gic {
+                begin(&mut st, b"interrupt-controller@7fff9000");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "interrupt-controller",
+                    &[],
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"arm,gic-v3\0",
+                );
+                let mut gic_regs = reg_2_1(0x7fff_9000, 0x1000);
+                gic_regs.extend_from_slice(&reg_2_1(0x7fff_a000, 0x20_000));
+                prop(&mut st, &mut strings, &mut offsets, "reg", &gic_regs);
+                end(&mut st);
+            }
+            begin(&mut st, b"reset-controller@119500");
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "compatible",
+                b"raspberrypi,rp1-reset\0",
+            );
+            end(&mut st);
+            end(&mut st);
+            begin(&mut st, b"axi");
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "#address-cells",
+                &2u32.to_be_bytes(),
+            );
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "#size-cells",
+                &2u32.to_be_bytes(),
+            );
+            prop(&mut st, &mut strings, &mut offsets, "ranges", &[]);
+            begin(&mut st, b"pcie@1000120000");
             prop(
                 &mut st,
                 &mut strings,
@@ -1187,6 +1298,22 @@ mod tests {
                 "compatible",
                 b"brcm,bcm2712-pcie\0",
             );
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "reg",
+                &reg64(0x10_0012_0000, 0x10_000),
+            );
+            begin(&mut st, b"rp1");
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "compatible",
+                b"raspberrypi,rp1\0",
+            );
+            end(&mut st);
             end(&mut st);
             end(&mut st);
         } else {
@@ -1220,6 +1347,7 @@ mod tests {
             true,
             false,
             b"console=ttyAMA0\0",
+            false,
         ))
         .unwrap();
         assert_eq!(info.platform, DetectedPlatform::QemuVirt);
@@ -1235,6 +1363,7 @@ mod tests {
             false,
             true,
             b"console=ttyAMA10 yarm.boot_phase=dtb\0",
+            true,
         ))
         .unwrap();
         assert_eq!(info.platform, DetectedPlatform::Rpi5Bcm2712);
@@ -1244,7 +1373,7 @@ mod tests {
         assert_eq!(info.reserved_count, 1);
         assert_eq!(
             info.interrupt_controller_path.as_str(),
-            "/soc@107c000000/interrupt-controller@7fff9000"
+            "/soc@107c000000/intc@7d517ac0"
         );
     }
 
@@ -1256,6 +1385,7 @@ mod tests {
             false,
             false,
             b"console=ttyAMA10\0",
+            true,
         ))
         .unwrap();
         assert_eq!(info.stdout_path.as_str(), "/soc@107c000000/serial@7d001000");
@@ -1270,6 +1400,7 @@ mod tests {
             true,
             true,
             b"console=ttyAMA10 yarm.boot_phase=dtb\0",
+            true,
         );
         let info = parse_platform_dtb_diagnostics(&dtb).unwrap();
         assert_eq!(
@@ -1296,16 +1427,30 @@ mod tests {
         );
         assert!(!info.bootargs_truncated);
         assert_eq!(
-            info.interrupt_controller_path.as_str(),
+            info.l2_interrupt_controller_path.as_str(),
+            "/soc@107c000000/intc@7d517ac0"
+        );
+        assert_eq!(
+            info.l2_interrupt_controller_compatible.as_str(),
+            "brcm,bcm7271-l2-intc"
+        );
+        assert_eq!(info.l2_interrupt_controller_base, Some(0x10_7d51_7ac0));
+        assert_eq!(
+            info.gic_path.as_str(),
             "/soc@107c000000/interrupt-controller@7fff9000"
         );
-        assert_eq!(info.interrupt_controller_compatible.as_str(), "arm,gic-v3");
+        assert_eq!(info.gic_compatible.as_str(), "arm,gic-v3");
         assert_eq!(info.gic_dist_base, Some(0x10_7fff_9000));
         assert_eq!(info.gic_redist_base, Some(0x10_7fff_a000));
         assert_eq!(info.psci_conduit, DiagnosticPsciConduit::Smc);
         assert_eq!(info.cpu_bitmap, 0b1001);
-        assert!(info.rp1_pcie_present);
-        assert_eq!(info.rp1_node_path.as_str(), "/soc@107c000000/pcie@120000");
+        assert_eq!(info.pcie_controller_path.as_str(), "/axi/pcie@1000120000");
+        assert_eq!(info.pcie_controller_base, Some(0x10_0012_0000));
+        assert_eq!(info.rp1_node_path.as_str(), "/axi/pcie@1000120000/rp1");
+        assert_ne!(
+            info.rp1_node_path.as_str(),
+            "/soc@107c000000/reset-controller@119500"
+        );
     }
 
     #[test]
@@ -1318,12 +1463,16 @@ mod tests {
             false,
             true,
             &bootargs,
+            false,
         ))
         .unwrap();
         assert_eq!(info.initrd_start, None);
         assert_eq!(info.initrd_end, None);
         assert_eq!(info.bootargs_len, MAX_DIAGNOSTIC_BOOTARGS + 1);
         assert!(info.bootargs_truncated);
+        assert_eq!(info.gic_dist_base, None);
+        assert_eq!(info.gic_redist_base, None);
+        assert!(!info.l2_interrupt_controller_path.is_empty());
     }
 
     #[test]

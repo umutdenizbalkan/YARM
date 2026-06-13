@@ -72,12 +72,14 @@ fn raw_entry_breadcrumb_ladder_has_all_expected_markers() {
         "RPI5_DTB_INITRD",
         "RPI5_DTB_BOOTARGS",
         "RPI5_DTB_IRQC",
+        "RPI5_DTB_IRQC_L2",
         "RPI5_DTB_GIC_DIST",
         "RPI5_DTB_GIC_REDIST",
         "RPI5_DTB_GIC_MISSING",
         "RPI5_DTB_PSCI",
         "RPI5_DTB_CPU_BITMAP",
         "RPI5_DTB_RP1_PCIE",
+        "RPI5_DTB_PCIE_CONTROLLER",
         "RPI5_DTB_RP1_NODE",
         "RPI5_DTB_DIAG_DONE",
     ] {
@@ -144,10 +146,24 @@ fn rpi5_stage1b_diagnostics_are_bounded_lock_free_and_halt() {
     assert!(!diagnostics.contains("printk"));
     assert!(diagnostics.contains("bytes: [u8; 384]"));
     assert!(diagnostics.contains("RPI5_DTB_DIAG_DONE"));
+    assert!(diagnostics.contains("RPI5_DTB_IRQC_L2"));
+    assert!(diagnostics.contains("RPI5_DTB_GIC_MISSING"));
+    assert!(diagnostics.contains("RPI5_DTB_PCIE_CONTROLLER"));
     assert!(diagnostics.contains("halt_stage1();"));
     assert!(policy.contains("const MAX_DIAGNOSTIC_RANGES: usize = 8"));
     assert!(policy.contains("const MAX_DIAGNOSTIC_BOOTARGS: usize = 256"));
     assert!(policy.contains("pub fn parse_platform_dtb_diagnostics"));
+    assert!(policy.contains("is_bcm7271_l2_compatible"));
+    assert!(policy.contains("is_arm_gic_compatible"));
+    assert!(
+        policy.contains("direct_parent_path(path) == Some(out.pcie_controller_path.as_bytes())")
+    );
+    for forbidden_init in ["init_gic", "init_rp1", "init_pcie", "pcie_init"] {
+        assert!(
+            !diagnostics.contains(forbidden_init),
+            "Stage1C added production initializer {forbidden_init}"
+        );
+    }
 
     let after_boot03 = boot.find("RPI5_AFTER_BOOT03").unwrap();
     let uart_halt = boot[after_boot03..]

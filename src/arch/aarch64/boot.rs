@@ -897,6 +897,22 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
     } else {
         diag!("RPI5_DTB_IRQC_MISSING");
     }
+    if !info.l2_interrupt_controller_path.is_empty() {
+        if let Some(base) = info.l2_interrupt_controller_base {
+            diag!(
+                "RPI5_DTB_IRQC_L2 path={} base=0x{:016x} compatible={}",
+                info.l2_interrupt_controller_path.as_str(),
+                base,
+                info.l2_interrupt_controller_compatible.as_str()
+            );
+        } else {
+            diag!(
+                "RPI5_DTB_IRQC_L2_BASE_MISSING path={} compatible={}",
+                info.l2_interrupt_controller_path.as_str(),
+                info.l2_interrupt_controller_compatible.as_str()
+            );
+        }
+    }
     if let Some(base) = info.gic_dist_base {
         diag!("RPI5_DTB_GIC_DIST base=0x{:016x}", base);
         if let Some(base) = info.gic_redist_base {
@@ -920,7 +936,26 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
         max_cpus,
         effective_bitmap.count_ones()
     );
-    diag!("RPI5_DTB_RP1_PCIE present={}", info.rp1_pcie_present as u8);
+    if !info.pcie_controller_path.is_empty() {
+        if let Some(base) = info.pcie_controller_base {
+            diag!(
+                "RPI5_DTB_PCIE_CONTROLLER path={} base=0x{:016x}",
+                info.pcie_controller_path.as_str(),
+                base
+            );
+        } else {
+            diag!(
+                "RPI5_DTB_PCIE_CONTROLLER_BASE_MISSING path={}",
+                info.pcie_controller_path.as_str()
+            );
+        }
+    } else {
+        diag!("RPI5_DTB_PCIE_CONTROLLER_MISSING");
+    }
+    diag!(
+        "RPI5_DTB_RP1_PCIE present={}",
+        (!info.pcie_controller_path.is_empty() && !info.rp1_node_path.is_empty()) as u8
+    );
     if !info.rp1_node_path.is_empty() {
         diag!("RPI5_DTB_RP1_NODE path={}", info.rp1_node_path.as_str());
     }
