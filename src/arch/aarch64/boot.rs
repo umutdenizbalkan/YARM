@@ -30,6 +30,7 @@ secondary_boot_stacks_end:
     .type _start,%function
 _start:
     mov x20, x0
+    bl yarm_aarch64_raw_entry_marker
     adrp x1, __bss_start
     add x1, x1, :lo12:__bss_start
     adrp x2, __bss_end
@@ -95,6 +96,63 @@ yarm_aarch64_enter_el1_if_needed:
     eret
 1:
 2:
+    ret
+    "#
+);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+global_asm!(
+    r#"
+    .section .text.boot,"ax",@progbits
+    .type yarm_aarch64_raw_entry_marker,%function
+yarm_aarch64_raw_entry_marker:
+    // The Pi 5 Stage 1 DTB parser translates the preferred
+    // /soc@107c000000/serial@7d001000 PL011 to 0x107d001000.  This raw
+    // pre-BSS path deliberately uses that same physical base; it does not
+    // consult console globals or attempt to configure clocks/divisors.
+    movz x9, #0x1000
+    movk x9, #0x7d00, lsl #16
+    movk x9, #0x0010, lsl #32
+    adr x10, .Lrpi5_raw_entry
+.Lrpi5_raw_entry_next:
+    ldrb w11, [x10], #1
+    cbz w11, .Lrpi5_raw_entry_done
+    movz x12, #0x0010, lsl #16
+.Lrpi5_raw_entry_wait:
+    ldr w13, [x9, #0x18]
+    tbz w13, #5, .Lrpi5_raw_entry_send
+    subs x12, x12, #1
+    b.ne .Lrpi5_raw_entry_wait
+    b .Lrpi5_raw_entry_done
+.Lrpi5_raw_entry_send:
+    dsb sy
+    str w11, [x9]
+    dsb sy
+    b .Lrpi5_raw_entry_next
+.Lrpi5_raw_entry_done:
+    ret
+
+    .section .rodata.rpi5_raw_entry,"a",@progbits
+    .balign 8
+.Lrpi5_raw_entry:
+    .asciz "RPI5_RAW_ENTRY\r\n"
+    "#
+);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    not(feature = "rpi5-stage1")
+))]
+global_asm!(
+    r#"
+    .section .text.boot,"ax",@progbits
+    .type yarm_aarch64_raw_entry_marker,%function
+yarm_aarch64_raw_entry_marker:
     ret
     "#
 );

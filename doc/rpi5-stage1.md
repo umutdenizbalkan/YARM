@@ -84,11 +84,20 @@ the Raspberry Pi address is not the only supported base.
 The expected UART markers are:
 
 ```text
+RPI5_RAW_ENTRY
 RPI5_BOOT_00_ENTRY
 RPI5_BOOT_01_DTB_PTR value=...
 RPI5_BOOT_02_UART_SELECTED path=... base=...
 RPI5_BOOT_03_UART_OK
 ```
+
+`RPI5_RAW_ENTRY` is emitted directly from `_start`, before BSS clearing, stack setup, Rust, DTB
+parsing, MMU work, or console initialization. The RPi5-only assembly path uses the same translated
+physical PL011 base (`0x107d001000`) produced by the existing preferred-node DTB path for
+`/soc@107c000000/serial@7d001000`. It retains firmware UART configuration, fences each MMIO write,
+and abandons the marker after a bounded transmitter-ready poll rather than hanging entry forever.
+The firmware DTB pointer in `x0` is copied to `x20` before the marker and restored before the first
+Rust call. QEMU builds compile the marker routine to a no-op and retain their `0x40080000` entry.
 
 ## Explicit non-goals
 
