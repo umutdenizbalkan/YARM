@@ -982,14 +982,197 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
     target_arch = "aarch64",
     feature = "rpi5-stage1"
 ))]
+struct Rpi5Stage2CInitTask {
+    tid: u64,
+    root_table: u64,
+    entry: u64,
+    stack_pointer: u64,
+    mapped_pages: usize,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage2c_build_init_task(
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+    elf: &[u8],
+    elf_plan: &crate::arch::aarch64_boot_policy::Stage2BElfLoadPlan,
+    task_plan: &crate::arch::aarch64_boot_policy::Stage2CTaskPlan,
+) -> Result<Rpi5Stage2CInitTask, &'static str> {
+    use crate::arch::aarch64_boot_policy::Stage2CUserPermission;
+
+    let root = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+    let mut mapped_pages = 0usize;
+    for (segment, planned) in elf_plan.segments[..elf_plan.segment_count]
+        .iter()
+        .zip(&task_plan.segments[..task_plan.segment_count])
+    {
+        let flags = match planned.permission {
+            Stage2CUserPermission::ReadExecute => RPI5_STAGE2C_USER_RX_FLAGS,
+            Stage2CUserPermission::ReadWrite => RPI5_STAGE2C_USER_RW_FLAGS,
+        };
+        let file_end = segment
+            .vaddr
+            .checked_add(segment.file_size)
+            .ok_or("segment_file_overflow")?;
+        let mut page_va = planned.page_range.start;
+        while page_va < planned.page_range.end {
+            let phys = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+            let page_end = page_va
+                .checked_add(RPI5_STAGE1_PAGE_SIZE)
+                .ok_or("segment_page_overflow")?;
+            let copy_start = page_va.max(segment.vaddr);
+            let copy_end = page_end.min(file_end);
+            if copy_start < copy_end {
+                let source_start = segment
+                    .file_offset
+                    .checked_add(copy_start - segment.vaddr)
+                    .ok_or("segment_source_overflow")?;
+                let source_end = source_start
+                    .checked_add(copy_end - copy_start)
+                    .ok_or("segment_source_overflow")?;
+                let source_start =
+                    usize::try_from(source_start).map_err(|_| "segment_source_address")?;
+                let source_end =
+                    usize::try_from(source_end).map_err(|_| "segment_source_address")?;
+                let source = elf
+                    .get(source_start..source_end)
+                    .ok_or("segment_source_bounds")?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        source.as_ptr(),
+                        (phys + copy_start - page_va) as *mut u8,
+                        source.len(),
+                    );
+                }
+            }
+            unsafe {
+                rpi5_stage2c_map_user_page(root, allocator, page_va, phys, flags)?;
+            }
+            mapped_pages += 1;
+            page_va = page_end;
+        }
+    }
+    let mut stack_va = task_plan.stack_range.start;
+    while stack_va < task_plan.stack_range.end {
+        let phys = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+        unsafe {
+            rpi5_stage2c_map_user_page(
+                root,
+                allocator,
+                stack_va,
+                phys,
+                RPI5_STAGE2C_USER_RW_FLAGS,
+            )?;
+        }
+        mapped_pages += 1;
+        stack_va += RPI5_STAGE1_PAGE_SIZE;
+    }
+    Ok(Rpi5Stage2CInitTask {
+        tid: task_plan.tid,
+        root_table: root,
+        entry: task_plan.entry,
+        stack_pointer: task_plan.stack_pointer,
+        mapped_pages,
+    })
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+fn rpi5_stage2c_alloc_zeroed_frame(
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+) -> Result<u64, &'static str> {
+    let frame = allocator.alloc_frame().map_err(|_| "frame_allocator")?;
+    unsafe {
+        core::ptr::write_bytes(frame as *mut u8, 0, RPI5_STAGE1_PAGE_SIZE as usize);
+    }
+    Ok(frame)
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage2c_map_user_page(
+    root: u64,
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+    virtual_address: u64,
+    physical_address: u64,
+    flags: u64,
+) -> Result<(), &'static str> {
+    if virtual_address % RPI5_STAGE1_PAGE_SIZE != 0
+        || physical_address % RPI5_STAGE1_PAGE_SIZE != 0
+        || virtual_address >= (1 << 39)
+    {
+        return Err("invalid_user_mapping");
+    }
+    let l1 = ((virtual_address >> 30) & 0x1ff) as usize;
+    let l2_table = unsafe { rpi5_stage2c_ensure_table(root, l1, allocator)? };
+    let l2 = ((virtual_address >> 21) & 0x1ff) as usize;
+    let l3_table = unsafe { rpi5_stage2c_ensure_table(l2_table, l2, allocator)? };
+    let l3 = ((virtual_address >> 12) & 0x1ff) as usize;
+    let entry = (l3_table as *mut u64).wrapping_add(l3);
+    if unsafe { core::ptr::read_volatile(entry) } != 0 {
+        return Err("user_mapping_overlap");
+    }
+    unsafe {
+        core::ptr::write_volatile(
+            entry,
+            (physical_address & RPI5_STAGE1_PTE_ADDR_MASK) | flags | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage2c_ensure_table(
+    table: u64,
+    index: usize,
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+) -> Result<u64, &'static str> {
+    let entry = (table as *mut u64).wrapping_add(index);
+    let current = unsafe { core::ptr::read_volatile(entry) };
+    if current != 0 {
+        if current & (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+            != (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+        {
+            return Err("user_table_conflict");
+        }
+        return Ok(current & RPI5_STAGE1_PTE_ADDR_MASK);
+    }
+    let child = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+    unsafe {
+        core::ptr::write_volatile(
+            entry,
+            child | RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+        );
+    }
+    Ok(child)
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
 fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     use crate::arch::aarch64_boot_policy::{
         RPI5_STAGE1_GICR_FRAME_STRIDE, RPI5_STAGE1_GICR_SCAN_FRAMES, Stage1KernelRange,
         Stage1MmuMemoryType, build_rpi5_stage1_kernel_bootstrap_record,
         parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
         plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory, plan_rpi5_stage2a_initrd,
-        plan_rpi5_stage2b_init_elf, rpi5_stage1_gicr_typer_plausible, rpi5_stage1_timer_delta,
-        rpi5_stage2a_cpio_first_name, rpi5_stage2b_find_init,
+        plan_rpi5_stage2b_init_elf, plan_rpi5_stage2c_init_task, rpi5_stage1_gicr_typer_plausible,
+        rpi5_stage1_timer_delta, rpi5_stage2a_cpio_first_name, rpi5_stage2b_find_init,
     };
     use core::fmt::Write;
 
@@ -1584,8 +1767,79 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
         );
     }
     rpi5_emergency_marker(b"RPI5_INIT_ELF_LOAD_PLAN_DONE\r\n\0");
-    kernel_diag!("RPI5_STAGE2B_DEFERRED reason=loader_bridge_not_ready");
-    kernel_diag!("RPI5_STAGE2B_DONE status=deferred");
+    kernel_diag!("RPI5_STAGE2B_DONE status=load_plan_ready");
+
+    rpi5_emergency_marker(b"RPI5_STAGE2C_BEGIN\r\n\0");
+    rpi5_emergency_marker(b"RPI5_INIT_TASK_BUILD_BEGIN\r\n\0");
+    let task_plan = match plan_rpi5_stage2c_init_task(&load_plan) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_TASK_BUILD_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    rpi5_emergency_marker(b"RPI5_INIT_ADDRESS_SPACE_BEGIN\r\n\0");
+    for index in 0..load_plan.segment_count {
+        kernel_diag!("RPI5_INIT_SEGMENT_MAP_BEGIN index={}", index);
+    }
+    let task = match unsafe {
+        rpi5_stage2c_build_init_task(allocator, init_elf, &load_plan, &task_plan)
+    } {
+        Ok(task) => task,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_SEGMENT_MAP_FAILED reason={}", reason);
+            kernel_diag!("RPI5_INIT_ADDRESS_SPACE_FAILED reason={}", reason);
+            halt_stage1();
+        }
+    };
+    for (index, segment) in load_plan.segments[..load_plan.segment_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_INIT_SEGMENT_MAPPED index={} vaddr=0x{:016x} memsz=0x{:016x} filesz=0x{:016x} flags=0x{:08x}",
+            index,
+            segment.vaddr,
+            segment.mem_size,
+            segment.file_size,
+            segment.flags
+        );
+        if let Some(bss) = task_plan.segments[index].bss_range {
+            kernel_diag!(
+                "RPI5_INIT_BSS_ZEROED index={} start=0x{:016x} end=0x{:016x}",
+                index,
+                bss.start,
+                bss.end
+            );
+        }
+    }
+    kernel_diag!(
+        "RPI5_INIT_ADDRESS_SPACE_READY root=0x{:016x} pages={}",
+        task.root_table,
+        task.mapped_pages
+    );
+    kernel_diag!("RPI5_INIT_STACK_READY sp=0x{:016x}", task.stack_pointer);
+    let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
+    trap_frame.set_saved_pc(task.entry as usize);
+    trap_frame.set_saved_sp(task.stack_pointer as usize);
+    kernel_diag!(
+        "RPI5_INIT_TRAP_FRAME_READY entry=0x{:016x} sp=0x{:016x}",
+        trap_frame.saved_pc(),
+        trap_frame.saved_sp()
+    );
+    rpi5_emergency_marker(b"RPI5_INIT_TASK_BUILD_DONE\r\n\0");
+    kernel_diag!("RPI5_INIT_SPAWN_READY tid={}", task.tid);
+    rpi5_emergency_marker(b"RPI5_STAGE2C_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_STAGE2D_BEGIN\r\n\0");
+    kernel_diag!(
+        "RPI5_ENTER_USER_ATTEMPT tid={} entry=0x{:016x} sp=0x{:016x}",
+        task.tid,
+        task.entry,
+        task.stack_pointer
+    );
+    kernel_diag!("RPI5_STAGE2D_DEFERRED reason=enter_user_bridge_not_ready");
+    kernel_diag!("RPI5_STAGE2D_DONE status=deferred");
     halt_stage1();
 }
 
@@ -1665,6 +1919,28 @@ const RPI5_STAGE1_DEVICE_FLAGS: u64 = RPI5_STAGE1_PTE_VALID
     | RPI5_STAGE1_PTE_AF
     | (0b10 << 8)
     | (1 << 2)
+    | RPI5_STAGE1_PTE_PXN
+    | RPI5_STAGE1_PTE_UXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE2C_USER_RX_FLAGS: u64 = RPI5_STAGE1_PTE_VALID
+    | RPI5_STAGE1_PTE_AF
+    | (0b11 << 8)
+    | (1 << 6)
+    | (1 << 7)
+    | RPI5_STAGE1_PTE_PXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE2C_USER_RW_FLAGS: u64 = RPI5_STAGE1_PTE_VALID
+    | RPI5_STAGE1_PTE_AF
+    | (0b11 << 8)
+    | (1 << 6)
     | RPI5_STAGE1_PTE_PXN
     | RPI5_STAGE1_PTE_UXN;
 #[cfg(all(

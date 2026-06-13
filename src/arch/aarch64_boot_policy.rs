@@ -23,6 +23,9 @@ const STAGE1_PAGE_SIZE: u64 = 4096;
 pub const MAX_STAGE2B_ELF_LOAD_SEGMENTS: usize = 8;
 const MAX_STAGE2B_CPIO_ENTRIES: usize = 4096;
 const MAX_STAGE2B_CPIO_NAME: usize = 256;
+pub const RPI5_STAGE2C_INIT_TID: u64 = 1;
+pub const RPI5_STAGE2C_STACK_TOP: u64 = 0x3fe0_0000;
+pub const RPI5_STAGE2C_STACK_PAGES: u64 = 4;
 const STAGE1_MMU_MIN_TABLE_PAGES: u64 = 4;
 const STAGE1_TTBR0_VA_LIMIT: u64 = 1 << 39;
 const RPI5_FIRMWARE_LOW_RESERVED_END: u64 = 0x80000;
@@ -393,6 +396,67 @@ pub struct Stage2BElfLoadPlan {
     pub entry: u64,
     pub segments: [Stage2BElfLoadSegment; MAX_STAGE2B_ELF_LOAD_SEGMENTS],
     pub segment_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2CUserPermission {
+    #[default]
+    ReadExecute,
+    ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2CSegmentPlan {
+    pub page_range: Stage1KernelRange,
+    pub bss_range: Option<Stage1KernelRange>,
+    pub permission: Stage2CUserPermission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage2CTaskPlan {
+    pub tid: u64,
+    pub entry: u64,
+    pub segments: [Stage2CSegmentPlan; MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+    pub segment_count: usize,
+    pub stack_range: Stage1KernelRange,
+    pub stack_pointer: u64,
+}
+
+impl Default for Stage2CTaskPlan {
+    fn default() -> Self {
+        Self {
+            tid: RPI5_STAGE2C_INIT_TID,
+            entry: 0,
+            segments: [Stage2CSegmentPlan::default(); MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+            segment_count: 0,
+            stack_range: Stage1KernelRange::default(),
+            stack_pointer: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2CTaskPlanFailure {
+    #[default]
+    NoSegments,
+    InvalidPermission,
+    AddressOverflow,
+    SegmentOverlap,
+    StackOverlap,
+    EntryNotExecutable,
+}
+
+impl Stage2CTaskPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoSegments => "no_segments",
+            Self::InvalidPermission => "invalid_permission",
+            Self::AddressOverflow => "address_overflow",
+            Self::SegmentOverlap => "segment_overlap",
+            Self::StackOverlap => "stack_overlap",
+            Self::EntryNotExecutable => "entry_not_executable",
+        }
+    }
 }
 
 impl Default for Stage2BElfLoadPlan {
@@ -1322,6 +1386,83 @@ pub fn plan_rpi5_stage2b_init_elf(elf: &[u8]) -> Result<Stage2BElfLoadPlan, Stag
     }
     if !entry_is_executable {
         return Err(Stage2BElfFailure::EntryNotExecutable);
+    }
+    Ok(plan)
+}
+
+pub fn plan_rpi5_stage2c_init_task(
+    elf_plan: &Stage2BElfLoadPlan,
+) -> Result<Stage2CTaskPlan, Stage2CTaskPlanFailure> {
+    const PF_X: u32 = 1;
+    const PF_W: u32 = 2;
+    if elf_plan.segment_count == 0 {
+        return Err(Stage2CTaskPlanFailure::NoSegments);
+    }
+    let stack_size = RPI5_STAGE2C_STACK_PAGES
+        .checked_mul(STAGE1_PAGE_SIZE)
+        .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?;
+    let stack_range = Stage1KernelRange::new(
+        RPI5_STAGE2C_STACK_TOP
+            .checked_sub(stack_size)
+            .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?,
+        RPI5_STAGE2C_STACK_TOP,
+    );
+    let mut plan = Stage2CTaskPlan {
+        entry: elf_plan.entry,
+        stack_range,
+        stack_pointer: RPI5_STAGE2C_STACK_TOP,
+        ..Stage2CTaskPlan::default()
+    };
+    let mut entry_is_executable = false;
+    for (index, segment) in elf_plan.segments[..elf_plan.segment_count]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let permission = match (segment.flags & PF_W != 0, segment.flags & PF_X != 0) {
+            (false, true) => Stage2CUserPermission::ReadExecute,
+            (true, false) => Stage2CUserPermission::ReadWrite,
+            _ => return Err(Stage2CTaskPlanFailure::InvalidPermission),
+        };
+        let segment_end = segment
+            .vaddr
+            .checked_add(segment.mem_size)
+            .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?;
+        let page_range = Stage1KernelRange::new(
+            align_down_u64_policy(segment.vaddr, STAGE1_PAGE_SIZE),
+            align_up_u64_policy(segment_end, STAGE1_PAGE_SIZE)
+                .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?,
+        );
+        if page_range.overlaps(stack_range) {
+            return Err(Stage2CTaskPlanFailure::StackOverlap);
+        }
+        if plan.segments[..plan.segment_count]
+            .iter()
+            .any(|existing| existing.page_range.overlaps(page_range))
+        {
+            return Err(Stage2CTaskPlanFailure::SegmentOverlap);
+        }
+        let bss_start = segment
+            .vaddr
+            .checked_add(segment.file_size)
+            .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?;
+        let bss_range = (segment.mem_size > segment.file_size)
+            .then_some(Stage1KernelRange::new(bss_start, segment_end));
+        if permission == Stage2CUserPermission::ReadExecute
+            && elf_plan.entry >= segment.vaddr
+            && elf_plan.entry < segment_end
+        {
+            entry_is_executable = true;
+        }
+        plan.segments[index] = Stage2CSegmentPlan {
+            page_range,
+            bss_range,
+            permission,
+        };
+        plan.segment_count += 1;
+    }
+    if !entry_is_executable {
+        return Err(Stage2CTaskPlanFailure::EntryNotExecutable);
     }
     Ok(plan)
 }
@@ -3446,6 +3587,76 @@ mod tests {
         assert_eq!(
             plan_rpi5_stage2b_init_elf(&elf),
             Err(Stage2BElfFailure::InvalidLoadSegment)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2c_task_plan_matches_real_init_permissions_bss_and_stack() {
+        let mut elf_plan = Stage2BElfLoadPlan {
+            entry: 0x4023d8,
+            segment_count: 2,
+            ..Stage2BElfLoadPlan::default()
+        };
+        elf_plan.segments[0] = Stage2BElfLoadSegment {
+            vaddr: 0x400000,
+            mem_size: 0x6cf0,
+            file_size: 0x6cf0,
+            file_offset: 0,
+            flags: 0x5,
+        };
+        elf_plan.segments[1] = Stage2BElfLoadSegment {
+            vaddr: 0x407000,
+            mem_size: 0x400a8,
+            file_size: 0,
+            file_offset: 0x7000,
+            flags: 0x6,
+        };
+        let task = plan_rpi5_stage2c_init_task(&elf_plan).unwrap();
+        assert_eq!(task.tid, RPI5_STAGE2C_INIT_TID);
+        assert_eq!(task.entry, 0x4023d8);
+        assert_eq!(
+            task.segments[0].permission,
+            Stage2CUserPermission::ReadExecute
+        );
+        assert_eq!(
+            task.segments[1].permission,
+            Stage2CUserPermission::ReadWrite
+        );
+        assert_eq!(
+            task.segments[1].bss_range,
+            Some(Stage1KernelRange::new(0x407000, 0x4470a8))
+        );
+        assert_eq!(
+            task.stack_range,
+            Stage1KernelRange::new(0x3fdf_c000, 0x3fe0_0000)
+        );
+        assert_eq!(task.stack_pointer, 0x3fe0_0000);
+        assert_eq!(task.stack_range.start % STAGE1_PAGE_SIZE, 0);
+        assert_eq!(task.stack_range.end % STAGE1_PAGE_SIZE, 0);
+        assert!(
+            task.segments[..task.segment_count]
+                .iter()
+                .all(|segment| !segment.page_range.overlaps(task.stack_range))
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2c_task_plan_requires_entry_in_executable_segment() {
+        let mut elf_plan = Stage2BElfLoadPlan {
+            entry: 0x407000,
+            segment_count: 1,
+            ..Stage2BElfLoadPlan::default()
+        };
+        elf_plan.segments[0] = Stage2BElfLoadSegment {
+            vaddr: 0x400000,
+            mem_size: 0x1000,
+            file_size: 0x1000,
+            file_offset: 0,
+            flags: 0x5,
+        };
+        assert_eq!(
+            plan_rpi5_stage2c_init_task(&elf_plan),
+            Err(Stage2CTaskPlanFailure::EntryNotExecutable)
         );
     }
 

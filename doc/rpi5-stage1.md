@@ -333,11 +333,22 @@ table and up to eight `PT_LOAD` segments, rejects file sizes larger than memory 
 segments, invalid alignment, writable-plus-executable segments, and entry points outside executable
 load segments. The resulting fixed-size load plan is diagnostic only.
 
-The existing first-task loader is coupled to the normal kernel bootstrap and service-chain
-invariants that Stage1 deliberately does not initialize. Stage2B therefore emits
-`RPI5_STAGE2B_DEFERRED reason=loader_bridge_not_ready` after a valid load plan and halts. It does not
-construct a task, claim a TID, enter userspace, enable interrupts, or run the scheduler. A future
-stage must bridge the validated plan into the existing loader without weakening those invariants.
+Stage 2C consumes that load plan with the existing Stage1F physical-frame allocator. It allocates a
+standalone three-level 4 KiB-granule user page table, zeroed data pages, and a four-page stack ending
+at `0x3fe00000`. RX pages are EL0-readable/executable and never writable; RW/BSS and stack pages are
+EL0-readable/writable with both privileged and user execute disabled. File bytes are copied directly
+from the reserved initrd, while every destination page is zeroed before copying, which also clears
+the complete BSS and partial-page gaps.
+
+This produces a diagnostic init task record with TID 1, page-table root, entry, stack pointer, and a
+`TrapFrame` carrying the EL0 PC/SP. It intentionally does not register the task with the production
+scheduler, capability, PM, supervisor, or VFS state. The frame allocator is the already initialized
+Stage1F allocator; Stage2C never creates a second allocator.
+
+Stage 2D reports the reviewed entry parameters but defers with
+`RPI5_STAGE2D_DEFERRED reason=enter_user_bridge_not_ready`. Switching TTBR0 and issuing ERET without
+the normal current-task/exception-return invariants has not been reviewed, so no ERET is attempted
+and no first-user success is claimed. Interrupts remain masked and the diagnostic halts.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans

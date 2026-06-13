@@ -278,6 +278,22 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_INIT_ELF_LOAD_PLAN_DONE",
         "RPI5_STAGE2B_DEFERRED",
         "RPI5_STAGE2B_DONE",
+        "RPI5_STAGE2C_BEGIN",
+        "RPI5_INIT_TASK_BUILD_BEGIN",
+        "RPI5_INIT_ADDRESS_SPACE_BEGIN",
+        "RPI5_INIT_SEGMENT_MAP_BEGIN",
+        "RPI5_INIT_SEGMENT_MAPPED",
+        "RPI5_INIT_BSS_ZEROED",
+        "RPI5_INIT_ADDRESS_SPACE_READY",
+        "RPI5_INIT_STACK_READY",
+        "RPI5_INIT_TRAP_FRAME_READY",
+        "RPI5_INIT_TASK_BUILD_DONE",
+        "RPI5_INIT_SPAWN_READY",
+        "RPI5_STAGE2C_DONE",
+        "RPI5_STAGE2D_BEGIN",
+        "RPI5_ENTER_USER_ATTEMPT",
+        "RPI5_STAGE2D_DEFERRED",
+        "RPI5_STAGE2D_DONE",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -404,9 +420,15 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     let stage2b = &diagnostics[stage2b_start..];
     assert!(stage2b.contains("rpi5_stage2b_find_init"));
     assert!(stage2b.contains("plan_rpi5_stage2b_init_elf"));
-    assert!(stage2b.contains("loader_bridge_not_ready"));
-    assert!(!stage2b.contains("RPI5_INIT_TASK_BUILD_DONE"));
-    assert!(!stage2b.contains("RPI5_INIT_SPAWN_READY"));
+    assert!(stage2b.contains("plan_rpi5_stage2c_init_task"));
+    assert!(stage2b.contains("rpi5_stage2c_build_init_task"));
+    assert!(stage2b.contains("allocator, init_elf"));
+    assert!(!stage2b.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(stage2b.contains("RPI5_INIT_TASK_BUILD_DONE"));
+    assert!(stage2b.contains("RPI5_INIT_SPAWN_READY"));
+    assert!(stage2b.contains("enter_user_bridge_not_ready"));
+    assert!(!stage2b.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!stage2b.contains("RPI5_FIRST_USER_TRAP"));
     assert!(!stage2b.contains("bootstrap_first_user_task"));
     assert!(!stage2b.contains("Bootstrap::init"));
     assert!(!stage2b.contains("SpawnV5"));
