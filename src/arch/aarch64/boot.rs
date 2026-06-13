@@ -730,6 +730,7 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
         DetectedPlatform::Rpi5Bcm2712 => {
             rpi5_emergency_marker(b"RPI5_CONSOLE_SELECT_BEGIN\r\n\0");
             let Some(serial) = info.serial else {
+                rpi5_emergency_marker(b"RPI5_UART_TRANSLATION_FAILED\r\n\0");
                 halt_stage1();
             };
             rpi5_emergency_hex(b"RPI5_SELECTED_UART_BASE value=0x\0", serial.base);

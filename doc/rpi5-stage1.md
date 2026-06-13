@@ -128,6 +128,13 @@ then probed with a CRLF write bracketed by `RPI5_CONSOLE_WRITE_BEGIN` and
 `RPI5_CONSOLE_WRITE_DONE`; RPi5 Stage 1 bounds its PL011 TX-ready poll and reports
 `RPI5_CONSOLE_WRITE_TIMEOUT` instead of spinning forever.
 
+The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
+bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
+every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls
+inside child window `0x7c000000..0x80000000`, whose CPU parent window begins at `0x107c000000`;
+the translated physical address is therefore `0x107d001000`. Missing, malformed, or non-matching
+`ranges` fails closed and emits `RPI5_UART_TRANSLATION_FAILED` rather than reusing the child address.
+
 ## Explicit non-goals
 
 Stage 1 does **not** implement or claim:

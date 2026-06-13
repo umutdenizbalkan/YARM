@@ -344,9 +344,10 @@ pub fn parse_platform_dtb(bytes: &[u8]) -> Option<PlatformDtbInfo> {
         resolved.or(first)
     };
     if let Some(mut serial) = info.serial {
-        serial.base =
-            translate_to_root(blocks, serial.path.as_bytes(), serial.base).unwrap_or(serial.base);
-        info.serial = Some(serial);
+        info.serial = translate_to_root(blocks, serial.path.as_bytes(), serial.base).map(|base| {
+            serial.base = base;
+            serial
+        });
     }
 
     let mut gic = Walker::new(blocks);
@@ -483,16 +484,12 @@ fn translate_to_root(blocks: Blocks<'_>, node_path: &[u8], mut address: u64) -> 
             return Some(address);
         }
         path.len = parent_len;
-        if let Some((child, parent, size)) = node_ranges(blocks, path.as_bytes()) {
-            if address >= child && address < child.checked_add(size)? {
-                address = parent.checked_add(address - child)?;
-            }
-        }
+        address = translate_parent_ranges(blocks, path.as_bytes(), address)?;
     }
     None
 }
 
-fn node_ranges(blocks: Blocks<'_>, wanted: &[u8]) -> Option<(u64, u64, u64)> {
+fn translate_parent_ranges(blocks: Blocks<'_>, wanted: &[u8], address: u64) -> Option<u64> {
     let mut walker = Walker::new(blocks);
     while let Some(event) = walker.next() {
         if let Event::Property {
@@ -505,18 +502,39 @@ fn node_ranges(blocks: Blocks<'_>, wanted: &[u8]) -> Option<(u64, u64, u64)> {
         {
             if path == wanted && name == b"ranges" {
                 if value.is_empty() {
-                    return None;
+                    return Some(address);
                 }
                 let child_cells = node_cell_count(blocks, wanted, b"#address-cells")
                     .unwrap_or(parent_address_cells);
-                let child = cells(value, child_cells, 0)?;
-                let parent = cells(value, parent_address_cells, child_cells as usize)?;
-                let size = cells(
-                    value,
-                    parent_size_cells,
-                    (child_cells + parent_address_cells) as usize,
-                )?;
-                return Some((child, parent, size));
+                let size_cells =
+                    node_cell_count(blocks, wanted, b"#size-cells").unwrap_or(parent_size_cells);
+                if !(1..=2).contains(&child_cells)
+                    || !(1..=2).contains(&parent_address_cells)
+                    || !(1..=2).contains(&size_cells)
+                {
+                    return None;
+                }
+                let entry_cells = child_cells
+                    .checked_add(parent_address_cells)?
+                    .checked_add(size_cells)? as usize;
+                let entry_bytes = entry_cells.checked_mul(4)?;
+                if entry_bytes == 0 || value.len() % entry_bytes != 0 {
+                    return None;
+                }
+                for entry in value.chunks_exact(entry_bytes) {
+                    let child = cells(entry, child_cells, 0)?;
+                    let parent = cells(entry, parent_address_cells, child_cells as usize)?;
+                    let size = cells(
+                        entry,
+                        size_cells,
+                        (child_cells + parent_address_cells) as usize,
+                    )?;
+                    let end = child.checked_add(size)?;
+                    if size != 0 && address >= child && address < end {
+                        return parent.checked_add(address - child);
+                    }
+                }
+                return None;
             }
         }
     }
@@ -677,6 +695,13 @@ mod tests {
         out.extend_from_slice(&(size as u32).to_be_bytes());
         out
     }
+    fn reg_2_1(address: u64, size: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(address >> 32).to_be_bytes()[4..]);
+        out.extend_from_slice(&(address as u32).to_be_bytes());
+        out.extend_from_slice(&size.to_be_bytes());
+        out
+    }
     fn finish(structure: Vec<u8>, strings: Vec<u8>) -> Vec<u8> {
         let header = 40usize;
         let struct_off = header;
@@ -701,7 +726,12 @@ mod tests {
         out.extend_from_slice(&strings);
         out
     }
-    fn test_dtb(compatible: &[u8], rpi: bool, with_initrd: bool) -> Vec<u8> {
+    fn test_dtb(
+        compatible: &[u8],
+        rpi: bool,
+        with_initrd: bool,
+        rpi_ranges_map_uart: bool,
+    ) -> Vec<u8> {
         let mut st = Vec::new();
         let mut strings = Vec::new();
         let mut offsets = BTreeMap::new();
@@ -813,14 +843,24 @@ mod tests {
                 &mut strings,
                 &mut offsets,
                 "#size-cells",
-                &2u32.to_be_bytes(),
+                &1u32.to_be_bytes(),
             );
             let mut ranges = Vec::new();
-            ranges.extend_from_slice(&reg64(0x7c00_0000, 0x0400_0000)[..8]);
-            ranges.extend_from_slice(&0x0000_0010u32.to_be_bytes());
-            ranges.extend_from_slice(&0x7c00_0000u32.to_be_bytes());
+            // Real BCM2712-style bus ranges use two child-address cells, two
+            // parent-address cells, and one size cell. Keep a non-matching
+            // entry first to prove translation scans the complete property.
             ranges.extend_from_slice(&0u32.to_be_bytes());
-            ranges.extend_from_slice(&0x0400_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&0x4000_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&0u32.to_be_bytes());
+            ranges.extend_from_slice(&0x4000_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+            if rpi_ranges_map_uart {
+                ranges.extend_from_slice(&0u32.to_be_bytes());
+                ranges.extend_from_slice(&0x7c00_0000u32.to_be_bytes());
+                ranges.extend_from_slice(&0x0000_0010u32.to_be_bytes());
+                ranges.extend_from_slice(&0x7c00_0000u32.to_be_bytes());
+                ranges.extend_from_slice(&0x0400_0000u32.to_be_bytes());
+            }
             prop(&mut st, &mut strings, &mut offsets, "ranges", &ranges);
             begin(&mut st, b"serial@7d001000");
             prop(
@@ -836,7 +876,7 @@ mod tests {
                 &mut strings,
                 &mut offsets,
                 "reg",
-                &reg64(0x7d00_1000, 0x1000),
+                &reg_2_1(0x7d00_1000, 0x1000),
             );
             end(&mut st);
             begin(&mut st, b"interrupt-controller@7fff9000");
@@ -852,7 +892,7 @@ mod tests {
                 &mut strings,
                 &mut offsets,
                 "reg",
-                &reg64(0x7fff_9000, 0x1000),
+                &reg_2_1(0x7fff_9000, 0x1000),
             );
             end(&mut st);
             end(&mut st);
@@ -881,7 +921,8 @@ mod tests {
 
     #[test]
     fn detects_qemu_virt_and_resolves_absolute_uart_alias() {
-        let info = parse_platform_dtb(&test_dtb(b"linux,dummy-virt\0", false, true)).unwrap();
+        let info =
+            parse_platform_dtb(&test_dtb(b"linux,dummy-virt\0", false, true, false)).unwrap();
         assert_eq!(info.platform, DetectedPlatform::QemuVirt);
         assert_eq!(info.serial.unwrap().base, 0x0900_0000);
         assert!(info.has_initrd());
@@ -893,6 +934,7 @@ mod tests {
             b"raspberrypi,5-model-b\0brcm,bcm2712\0",
             true,
             false,
+            true,
         ))
         .unwrap();
         assert_eq!(info.platform, DetectedPlatform::Rpi5Bcm2712);
@@ -904,6 +946,19 @@ mod tests {
             info.interrupt_controller_path.as_str(),
             "/soc@107c000000/interrupt-controller@7fff9000"
         );
+    }
+
+    #[test]
+    fn rpi5_uart_translation_fails_closed_when_ranges_do_not_map_reg() {
+        let info = parse_platform_dtb(&test_dtb(
+            b"raspberrypi,5-model-b\0brcm,bcm2712\0",
+            true,
+            false,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(info.stdout_path.as_str(), "/soc@107c000000/serial@7d001000");
+        assert_eq!(info.serial, None);
     }
 
     #[test]

@@ -74,6 +74,9 @@ fn rpi5_console_transition_is_bounded_and_uses_the_proven_uart() {
     assert!(console.contains("#[cfg(feature = \"rpi5-stage1\")]"));
     assert!(console.contains("const TX_READY_POLL_LIMIT: usize = 1_048_576"));
     assert!(console.contains("return false"));
+    assert!(!console.contains("0x10_7d00_1000"));
+    assert!(!console.contains("0x107d001000"));
+    assert!(boot.contains("RPI5_UART_TRANSLATION_FAILED"));
     assert!(policy.contains("assert_eq!(info.serial.unwrap().base, 0x10_7d00_1000)"));
 }
 
