@@ -215,9 +215,12 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                 irq_compatible = DtbPath::empty();
                 irq_path.set(path);
                 irq_reg_count = 0;
-                pcie_candidate = name.starts_with(b"pcie@") || name.starts_with(b"pci@");
+                pcie_candidate = is_pcie_node_name(name);
                 pcie_path.set(path);
                 pcie_base = None;
+                if pcie_candidate && out.pcie_controller_path.is_empty() {
+                    out.pcie_controller_path = pcie_path;
+                }
                 if path.starts_with(b"/cpus/")
                     && let Some(cpu) = parse_cpu_id_from_node_name(name)
                 {
@@ -300,7 +303,17 @@ pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnos
                         _ => DiagnosticPsciConduit::None,
                     };
                 }
-                if name == b"compatible" && value.split(|byte| *byte == 0).any(is_pcie_compatible) {
+                if name == b"device_type" && first_string(value) == b"pci" {
+                    pcie_candidate = !node_name(path).is_some_and(is_excluded_pcie_node_name);
+                    pcie_path.set(path);
+                    if pcie_candidate && out.pcie_controller_path.is_empty() {
+                        out.pcie_controller_path = pcie_path;
+                    }
+                }
+                if name == b"compatible"
+                    && value.split(|byte| *byte == 0).any(is_known_pcie_compatible)
+                    && !node_name(path).is_some_and(is_excluded_pcie_node_name)
+                {
                     pcie_candidate = true;
                     pcie_path.set(path);
                     if out.pcie_controller_path.is_empty() {
@@ -866,10 +879,21 @@ fn is_arm_gic_compatible(value: &[u8]) -> bool {
         b"arm,gic-v3" | b"arm,gic-400" | b"arm,cortex-a15-gic"
     )
 }
-fn is_pcie_compatible(value: &[u8]) -> bool {
-    value
-        .windows(4)
-        .any(|part| part.eq_ignore_ascii_case(b"pcie"))
+fn is_pcie_node_name(name: &[u8]) -> bool {
+    !is_excluded_pcie_node_name(name) && (name.starts_with(b"pcie@") || name.starts_with(b"pci@"))
+}
+fn is_excluded_pcie_node_name(name: &[u8]) -> bool {
+    name.windows(b"reset-controller".len())
+        .any(|part| part == b"reset-controller")
+}
+fn is_known_pcie_compatible(value: &[u8]) -> bool {
+    matches!(
+        value,
+        b"brcm,bcm2712-pcie" | b"brcm,bcm2711-pcie" | b"pci-host-ecam-generic" | b"snps,dw-pcie"
+    )
+}
+fn node_name(path: &[u8]) -> Option<&[u8]> {
+    path.rsplit(|byte| *byte == b'/').next()
 }
 fn direct_parent_path(path: &[u8]) -> Option<&[u8]> {
     let split = path.iter().rposition(|byte| *byte == b'/')?;
@@ -1061,6 +1085,7 @@ mod tests {
         rpi_ranges_map_uart: bool,
         bootargs: &[u8],
         with_gic: bool,
+        with_pcie: bool,
     ) -> Vec<u8> {
         let mut st = Vec::new();
         let mut strings = Vec::new();
@@ -1270,41 +1295,9 @@ mod tests {
                 &mut strings,
                 &mut offsets,
                 "compatible",
-                b"raspberrypi,rp1-reset\0",
+                b"raspberrypi,rp1-pcie-reset\0",
             );
             end(&mut st);
-            end(&mut st);
-            begin(&mut st, b"axi");
-            prop(
-                &mut st,
-                &mut strings,
-                &mut offsets,
-                "#address-cells",
-                &2u32.to_be_bytes(),
-            );
-            prop(
-                &mut st,
-                &mut strings,
-                &mut offsets,
-                "#size-cells",
-                &2u32.to_be_bytes(),
-            );
-            prop(&mut st, &mut strings, &mut offsets, "ranges", &[]);
-            begin(&mut st, b"pcie@1000120000");
-            prop(
-                &mut st,
-                &mut strings,
-                &mut offsets,
-                "compatible",
-                b"brcm,bcm2712-pcie\0",
-            );
-            prop(
-                &mut st,
-                &mut strings,
-                &mut offsets,
-                "reg",
-                &reg64(0x10_0012_0000, 0x10_000),
-            );
             begin(&mut st, b"rp1");
             prop(
                 &mut st,
@@ -1315,7 +1308,51 @@ mod tests {
             );
             end(&mut st);
             end(&mut st);
-            end(&mut st);
+            if with_pcie {
+                begin(&mut st, b"axi");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "#address-cells",
+                    &2u32.to_be_bytes(),
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "#size-cells",
+                    &2u32.to_be_bytes(),
+                );
+                prop(&mut st, &mut strings, &mut offsets, "ranges", &[]);
+                begin(&mut st, b"pcie@1000120000");
+                prop(&mut st, &mut strings, &mut offsets, "device_type", b"pci\0");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"brcm,bcm2712-pcie\0",
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "reg",
+                    &reg64(0x10_0012_0000, 0x10_000),
+                );
+                begin(&mut st, b"rp1");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"raspberrypi,rp1\0",
+                );
+                end(&mut st);
+                end(&mut st);
+                end(&mut st);
+            }
         } else {
             begin(&mut st, b"pl011@9000000");
             prop(
@@ -1348,6 +1385,7 @@ mod tests {
             false,
             b"console=ttyAMA0\0",
             false,
+            false,
         ))
         .unwrap();
         assert_eq!(info.platform, DetectedPlatform::QemuVirt);
@@ -1363,6 +1401,7 @@ mod tests {
             false,
             true,
             b"console=ttyAMA10 yarm.boot_phase=dtb\0",
+            true,
             true,
         ))
         .unwrap();
@@ -1386,6 +1425,7 @@ mod tests {
             false,
             b"console=ttyAMA10\0",
             true,
+            true,
         ))
         .unwrap();
         assert_eq!(info.stdout_path.as_str(), "/soc@107c000000/serial@7d001000");
@@ -1400,6 +1440,7 @@ mod tests {
             true,
             true,
             b"console=ttyAMA10 yarm.boot_phase=dtb\0",
+            true,
             true,
         );
         let info = parse_platform_dtb_diagnostics(&dtb).unwrap();
@@ -1464,6 +1505,7 @@ mod tests {
             true,
             &bootargs,
             false,
+            false,
         ))
         .unwrap();
         assert_eq!(info.initrd_start, None);
@@ -1473,6 +1515,12 @@ mod tests {
         assert_eq!(info.gic_dist_base, None);
         assert_eq!(info.gic_redist_base, None);
         assert!(!info.l2_interrupt_controller_path.is_empty());
+        assert!(info.pcie_controller_path.is_empty());
+        assert_eq!(info.pcie_controller_base, None);
+        assert!(
+            info.rp1_node_path.is_empty(),
+            "an rp1 node outside the classified PCIe controller must not count"
+        );
     }
 
     #[test]

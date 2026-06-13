@@ -197,6 +197,12 @@ This excludes reset controllers, GPIO hogs, firmware nodes, and RP1-related regu
 records remain presence/classification diagnostics and do not initialize any interrupt controller,
 PCIe controller, or RP1 device.
 
+PCIe controller eligibility is structural: a node must be named `pcie@...`/`pci@...`, declare
+`device_type = "pci"`, or carry a recognized host-controller compatible such as
+`brcm,bcm2712-pcie`. Names containing `reset-controller` are explicitly excluded, so compatibles
+such as `raspberrypi,rp1-pcie-reset` cannot steal the PCIe-controller slot. The complete DTB is
+walked, including `/axi` outside `/soc`; an RP1 node elsewhere in the tree is ignored.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

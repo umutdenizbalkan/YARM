@@ -155,6 +155,10 @@ fn rpi5_stage1b_diagnostics_are_bounded_lock_free_and_halt() {
     assert!(policy.contains("pub fn parse_platform_dtb_diagnostics"));
     assert!(policy.contains("is_bcm7271_l2_compatible"));
     assert!(policy.contains("is_arm_gic_compatible"));
+    assert!(policy.contains("is_pcie_node_name"));
+    assert!(policy.contains("is_excluded_pcie_node_name"));
+    assert!(policy.contains("is_known_pcie_compatible"));
+    assert!(policy.contains("first_string(value) == b\"pci\""));
     assert!(
         policy.contains("direct_parent_path(path) == Some(out.pcie_controller_path.as_bytes())")
     );
