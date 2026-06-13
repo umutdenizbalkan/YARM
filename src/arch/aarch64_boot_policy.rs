@@ -20,6 +20,9 @@ pub const STAGE1_PT_POOL_SIZE: u64 = 256 * 1024;
 pub const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024;
 const STAGE1_ALLOCATION_ALIGNMENT: u64 = 64 * 1024;
 const STAGE1_PAGE_SIZE: u64 = 4096;
+pub const MAX_STAGE2B_ELF_LOAD_SEGMENTS: usize = 8;
+const MAX_STAGE2B_CPIO_ENTRIES: usize = 4096;
+const MAX_STAGE2B_CPIO_NAME: usize = 256;
 const STAGE1_MMU_MIN_TABLE_PAGES: u64 = 4;
 const STAGE1_TTBR0_VA_LIMIT: u64 = 1 << 39;
 const RPI5_FIRMWARE_LOW_RESERVED_END: u64 = 0x80000;
@@ -336,6 +339,110 @@ pub struct Stage1KernelBootstrapRecord {
 pub struct Stage2AInitrdPlan {
     pub byte_range: Stage1KernelRange,
     pub reservation: Stage1KernelRange,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2BCpioFile {
+    pub data_offset: usize,
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2BCpioLookupFailure {
+    #[default]
+    NotFound,
+    EntryLimit,
+    HeaderTruncated,
+    BadMagic,
+    InvalidHex,
+    InvalidNameSize,
+    NameTruncated,
+    NameNotTerminated,
+    EntryTruncated,
+    MissingTrailer,
+}
+
+impl Stage2BCpioLookupFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::EntryLimit => "entry_limit",
+            Self::HeaderTruncated => "header_truncated",
+            Self::BadMagic => "bad_magic",
+            Self::InvalidHex => "invalid_hex",
+            Self::InvalidNameSize => "invalid_name_size",
+            Self::NameTruncated => "name_truncated",
+            Self::NameNotTerminated => "name_not_terminated",
+            Self::EntryTruncated => "entry_truncated",
+            Self::MissingTrailer => "missing_trailer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2BElfLoadSegment {
+    pub vaddr: u64,
+    pub mem_size: u64,
+    pub file_size: u64,
+    pub file_offset: u64,
+    pub flags: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage2BElfLoadPlan {
+    pub entry: u64,
+    pub segments: [Stage2BElfLoadSegment; MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+    pub segment_count: usize,
+}
+
+impl Default for Stage2BElfLoadPlan {
+    fn default() -> Self {
+        Self {
+            entry: 0,
+            segments: [Stage2BElfLoadSegment::default(); MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+            segment_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2BElfFailure {
+    #[default]
+    HeaderTruncated,
+    BadMagic,
+    WrongClass,
+    WrongEndian,
+    WrongVersion,
+    WrongType,
+    WrongMachine,
+    InvalidEntry,
+    InvalidProgramHeaderSize,
+    ProgramHeadersOutOfBounds,
+    TooManyLoadSegments,
+    InvalidLoadSegment,
+    WritableExecutableSegment,
+    EntryNotExecutable,
+}
+
+impl Stage2BElfFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HeaderTruncated => "header_truncated",
+            Self::BadMagic => "bad_magic",
+            Self::WrongClass => "wrong_class",
+            Self::WrongEndian => "wrong_endian",
+            Self::WrongVersion => "wrong_version",
+            Self::WrongType => "wrong_type",
+            Self::WrongMachine => "wrong_machine",
+            Self::InvalidEntry => "invalid_entry",
+            Self::InvalidProgramHeaderSize => "invalid_program_header_size",
+            Self::ProgramHeadersOutOfBounds => "program_headers_out_of_bounds",
+            Self::TooManyLoadSegments => "too_many_load_segments",
+            Self::InvalidLoadSegment => "invalid_load_segment",
+            Self::WritableExecutableSegment => "writable_executable_segment",
+            Self::EntryNotExecutable => "entry_not_executable",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1044,6 +1151,202 @@ pub fn rpi5_stage2a_cpio_first_name(archive: &[u8]) -> Result<&[u8], Stage2ACpio
         return Err(Stage2ACpioFailure::EntryTruncated);
     }
     Ok(&name_with_nul[..name_with_nul.len() - 1])
+}
+
+pub fn rpi5_stage2b_find_init(archive: &[u8]) -> Result<Stage2BCpioFile, Stage2BCpioLookupFailure> {
+    const NEWC_HEADER_LEN: usize = 110;
+    let mut offset = 0usize;
+    for _ in 0..MAX_STAGE2B_CPIO_ENTRIES {
+        let header = archive
+            .get(offset..offset.saturating_add(NEWC_HEADER_LEN))
+            .ok_or(Stage2BCpioLookupFailure::HeaderTruncated)?;
+        if &header[..6] != b"070701" {
+            return Err(Stage2BCpioLookupFailure::BadMagic);
+        }
+        let file_size = parse_newc_hex(
+            header
+                .get(54..62)
+                .ok_or(Stage2BCpioLookupFailure::HeaderTruncated)?,
+        )
+        .map_err(stage2b_cpio_hex_failure)?;
+        let name_size = parse_newc_hex(
+            header
+                .get(94..102)
+                .ok_or(Stage2BCpioLookupFailure::HeaderTruncated)?,
+        )
+        .map_err(stage2b_cpio_hex_failure)?;
+        if name_size == 0 || name_size > MAX_STAGE2B_CPIO_NAME {
+            return Err(Stage2BCpioLookupFailure::InvalidNameSize);
+        }
+        let name_start = offset
+            .checked_add(NEWC_HEADER_LEN)
+            .ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        let name_end = name_start
+            .checked_add(name_size)
+            .ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        let name_with_nul = archive
+            .get(name_start..name_end)
+            .ok_or(Stage2BCpioLookupFailure::NameTruncated)?;
+        if name_with_nul.last() != Some(&0) {
+            return Err(Stage2BCpioLookupFailure::NameNotTerminated);
+        }
+        let name = &name_with_nul[..name_with_nul.len() - 1];
+        let data_offset =
+            align_up_usize_policy(name_end, 4).ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        let data_end = data_offset
+            .checked_add(file_size)
+            .ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        if data_end > archive.len() {
+            return Err(Stage2BCpioLookupFailure::EntryTruncated);
+        }
+        if name == b"init" || name == b"/init" {
+            return Ok(Stage2BCpioFile {
+                data_offset,
+                size: file_size,
+            });
+        }
+        if name == b"TRAILER!!!" {
+            return Err(Stage2BCpioLookupFailure::NotFound);
+        }
+        offset =
+            align_up_usize_policy(data_end, 4).ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        if offset == archive.len() {
+            return Err(Stage2BCpioLookupFailure::MissingTrailer);
+        }
+    }
+    Err(Stage2BCpioLookupFailure::EntryLimit)
+}
+
+fn stage2b_cpio_hex_failure(failure: Stage2ACpioFailure) -> Stage2BCpioLookupFailure {
+    match failure {
+        Stage2ACpioFailure::InvalidHex => Stage2BCpioLookupFailure::InvalidHex,
+        _ => Stage2BCpioLookupFailure::EntryTruncated,
+    }
+}
+
+pub fn plan_rpi5_stage2b_init_elf(elf: &[u8]) -> Result<Stage2BElfLoadPlan, Stage2BElfFailure> {
+    const ELF64_HEADER_SIZE: usize = 64;
+    const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
+    const PT_LOAD: u32 = 1;
+    const PF_X: u32 = 1;
+    const PF_W: u32 = 2;
+
+    let header = elf
+        .get(..ELF64_HEADER_SIZE)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    if &header[..4] != b"\x7fELF" {
+        return Err(Stage2BElfFailure::BadMagic);
+    }
+    if header[4] != 2 {
+        return Err(Stage2BElfFailure::WrongClass);
+    }
+    if header[5] != 1 {
+        return Err(Stage2BElfFailure::WrongEndian);
+    }
+    if header[6] != 1 || read_le_u32(header, 20)? != 1 {
+        return Err(Stage2BElfFailure::WrongVersion);
+    }
+    if read_le_u16(header, 16)? != 2 {
+        return Err(Stage2BElfFailure::WrongType);
+    }
+    if read_le_u16(header, 18)? != 183 {
+        return Err(Stage2BElfFailure::WrongMachine);
+    }
+    let entry = read_le_u64(header, 24)?;
+    if entry == 0 {
+        return Err(Stage2BElfFailure::InvalidEntry);
+    }
+    let program_offset = usize::try_from(read_le_u64(header, 32)?)
+        .map_err(|_| Stage2BElfFailure::ProgramHeadersOutOfBounds)?;
+    let program_entry_size = read_le_u16(header, 54)? as usize;
+    let program_count = read_le_u16(header, 56)? as usize;
+    if program_entry_size != ELF64_PROGRAM_HEADER_SIZE || program_count == 0 {
+        return Err(Stage2BElfFailure::InvalidProgramHeaderSize);
+    }
+    let program_bytes = program_entry_size
+        .checked_mul(program_count)
+        .and_then(|size| program_offset.checked_add(size))
+        .ok_or(Stage2BElfFailure::ProgramHeadersOutOfBounds)?;
+    if program_bytes > elf.len() {
+        return Err(Stage2BElfFailure::ProgramHeadersOutOfBounds);
+    }
+
+    let mut plan = Stage2BElfLoadPlan {
+        entry,
+        ..Stage2BElfLoadPlan::default()
+    };
+    let mut entry_is_executable = false;
+    for index in 0..program_count {
+        let offset = program_offset + index * program_entry_size;
+        let program = &elf[offset..offset + program_entry_size];
+        if read_le_u32(program, 0)? != PT_LOAD {
+            continue;
+        }
+        if plan.segment_count == plan.segments.len() {
+            return Err(Stage2BElfFailure::TooManyLoadSegments);
+        }
+        let flags = read_le_u32(program, 4)?;
+        let file_offset = read_le_u64(program, 8)?;
+        let vaddr = read_le_u64(program, 16)?;
+        let file_size = read_le_u64(program, 32)?;
+        let mem_size = read_le_u64(program, 40)?;
+        let alignment = read_le_u64(program, 48)?;
+        if mem_size == 0
+            || file_size > mem_size
+            || vaddr.checked_add(mem_size).is_none()
+            || file_offset
+                .checked_add(file_size)
+                .is_none_or(|end| end > elf.len() as u64)
+            || (alignment > 1
+                && (!alignment.is_power_of_two() || file_offset % alignment != vaddr % alignment))
+        {
+            return Err(Stage2BElfFailure::InvalidLoadSegment);
+        }
+        if flags & (PF_W | PF_X) == (PF_W | PF_X) {
+            return Err(Stage2BElfFailure::WritableExecutableSegment);
+        }
+        if flags & PF_X != 0 && entry >= vaddr && entry < vaddr + mem_size {
+            entry_is_executable = true;
+        }
+        plan.segments[plan.segment_count] = Stage2BElfLoadSegment {
+            vaddr,
+            mem_size,
+            file_size,
+            file_offset,
+            flags,
+        };
+        plan.segment_count += 1;
+    }
+    if plan.segment_count == 0 {
+        return Err(Stage2BElfFailure::InvalidLoadSegment);
+    }
+    if !entry_is_executable {
+        return Err(Stage2BElfFailure::EntryNotExecutable);
+    }
+    Ok(plan)
+}
+
+fn read_le_u16(bytes: &[u8], offset: usize) -> Result<u16, Stage2BElfFailure> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32, Stage2BElfFailure> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_le_u64(bytes: &[u8], offset: usize) -> Result<u64, Stage2BElfFailure> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
 }
 
 fn parse_newc_hex(bytes: &[u8]) -> Result<usize, Stage2ACpioFailure> {
@@ -2023,6 +2326,7 @@ mod tests {
     use super::*;
     use crate::kernel::boot_command_line::BootPhase;
     use std::collections::BTreeMap;
+    use std::format;
     use std::vec::Vec;
 
     fn be(out: &mut Vec<u8>, value: u32) {
@@ -3035,6 +3339,113 @@ mod tests {
         assert_eq!(
             rpi5_stage2a_cpio_first_name(&archive),
             Err(Stage2ACpioFailure::BadMagic)
+        );
+    }
+
+    fn append_newc_entry(archive: &mut Vec<u8>, name: &[u8], data: &[u8]) {
+        let mut header = [b'0'; 110];
+        header[..6].copy_from_slice(b"070701");
+        header[54..62].copy_from_slice(format!("{:08x}", data.len()).as_bytes());
+        header[94..102].copy_from_slice(format!("{:08x}", name.len() + 1).as_bytes());
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(name);
+        archive.push(0);
+        while archive.len() % 4 != 0 {
+            archive.push(0);
+        }
+        archive.extend_from_slice(data);
+        while archive.len() % 4 != 0 {
+            archive.push(0);
+        }
+    }
+
+    fn minimal_aarch64_elf() -> Vec<u8> {
+        let mut elf = std::vec![0u8; 0x108];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+        elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+        elf[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&8u64.to_le_bytes());
+        elf[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[112..120].copy_from_slice(&1u64.to_le_bytes());
+        elf
+    }
+
+    #[test]
+    fn rpi5_stage2b_cpio_lookup_accepts_init_name_variants() {
+        for name in [&b"init"[..], &b"/init"[..]] {
+            let mut archive = Vec::new();
+            append_newc_entry(&mut archive, b".", &[]);
+            append_newc_entry(&mut archive, name, b"elf");
+            append_newc_entry(&mut archive, b"TRAILER!!!", &[]);
+            let file = rpi5_stage2b_find_init(&archive).unwrap();
+            assert_eq!(
+                &archive[file.data_offset..file.data_offset + file.size],
+                b"elf"
+            );
+        }
+    }
+
+    #[test]
+    fn rpi5_stage2b_cpio_lookup_rejects_missing_and_malformed_entries() {
+        let mut archive = Vec::new();
+        append_newc_entry(&mut archive, b"TRAILER!!!", &[]);
+        assert_eq!(
+            rpi5_stage2b_find_init(&archive),
+            Err(Stage2BCpioLookupFailure::NotFound)
+        );
+        archive[..6].copy_from_slice(b"070702");
+        assert_eq!(
+            rpi5_stage2b_find_init(&archive),
+            Err(Stage2BCpioLookupFailure::BadMagic)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2b_elf_accepts_aarch64_load_plan_and_rejects_wrong_formats() {
+        let elf = minimal_aarch64_elf();
+        let plan = plan_rpi5_stage2b_init_elf(&elf).unwrap();
+        assert_eq!(plan.entry, 0x400000);
+        assert_eq!(plan.segment_count, 1);
+        assert_eq!(plan.segments[0].vaddr, 0x400000);
+        assert_eq!(plan.segments[0].file_size, 8);
+        assert_eq!(plan.segments[0].mem_size, 0x1000);
+
+        for (index, value, expected) in [
+            (4, 1, Stage2BElfFailure::WrongClass),
+            (5, 2, Stage2BElfFailure::WrongEndian),
+        ] {
+            let mut invalid = elf.clone();
+            invalid[index] = value;
+            assert_eq!(plan_rpi5_stage2b_init_elf(&invalid), Err(expected));
+        }
+        let mut wrong_machine = elf.clone();
+        wrong_machine[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert_eq!(
+            plan_rpi5_stage2b_init_elf(&wrong_machine),
+            Err(Stage2BElfFailure::WrongMachine)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2b_elf_rejects_out_of_bounds_load_segment() {
+        let mut elf = minimal_aarch64_elf();
+        elf[96..104].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert_eq!(
+            plan_rpi5_stage2b_init_elf(&elf),
+            Err(Stage2BElfFailure::InvalidLoadSegment)
         );
     }
 

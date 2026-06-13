@@ -268,6 +268,16 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_INITRD_CPIO_FIRST_ENTRY",
         "RPI5_INITRD_READY",
         "RPI5_STAGE2A_DONE",
+        "RPI5_STAGE2B_BEGIN",
+        "RPI5_INIT_LOOKUP_BEGIN",
+        "RPI5_INIT_LOOKUP_OK",
+        "RPI5_INIT_ELF_CHECK_BEGIN",
+        "RPI5_INIT_ELF_HEADER_OK",
+        "RPI5_INIT_ELF_LOAD_PLAN_BEGIN",
+        "RPI5_INIT_ELF_SEGMENT",
+        "RPI5_INIT_ELF_LOAD_PLAN_DONE",
+        "RPI5_STAGE2B_DEFERRED",
+        "RPI5_STAGE2B_DONE",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -390,6 +400,23 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(!stage2a.contains("init_pcie"));
     assert!(!stage2a.contains("yarm_log!"));
     assert!(!stage2a.contains("printk"));
+    let stage2b_start = diagnostics.find("RPI5_STAGE2B_BEGIN").unwrap();
+    let stage2b = &diagnostics[stage2b_start..];
+    assert!(stage2b.contains("rpi5_stage2b_find_init"));
+    assert!(stage2b.contains("plan_rpi5_stage2b_init_elf"));
+    assert!(stage2b.contains("loader_bridge_not_ready"));
+    assert!(!stage2b.contains("RPI5_INIT_TASK_BUILD_DONE"));
+    assert!(!stage2b.contains("RPI5_INIT_SPAWN_READY"));
+    assert!(!stage2b.contains("bootstrap_first_user_task"));
+    assert!(!stage2b.contains("Bootstrap::init"));
+    assert!(!stage2b.contains("SpawnV5"));
+    assert!(!stage2b.contains("scheduler"));
+    assert!(!stage2b.contains("start_secondary_cpus"));
+    assert!(!stage2b.contains("init_gic"));
+    assert!(!stage2b.contains("init_rp1"));
+    assert!(!stage2b.contains("init_pcie"));
+    assert!(!stage2b.contains("yarm_log!"));
+    assert!(!stage2b.contains("printk"));
 }
 
 #[test]

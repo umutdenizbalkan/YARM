@@ -988,7 +988,8 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
         Stage1MmuMemoryType, build_rpi5_stage1_kernel_bootstrap_record,
         parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
         plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory, plan_rpi5_stage2a_initrd,
-        rpi5_stage1_gicr_typer_plausible, rpi5_stage1_timer_delta, rpi5_stage2a_cpio_first_name,
+        plan_rpi5_stage2b_init_elf, rpi5_stage1_gicr_typer_plausible, rpi5_stage1_timer_delta,
+        rpi5_stage2a_cpio_first_name, rpi5_stage2b_find_init,
     };
     use core::fmt::Write;
 
@@ -1541,6 +1542,50 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
         initrd_plan.byte_range.end
     );
     rpi5_emergency_marker(b"RPI5_STAGE2A_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_STAGE2B_BEGIN\r\n\0");
+    rpi5_emergency_marker(b"RPI5_INIT_LOOKUP_BEGIN path=/init\r\n\0");
+    let init_file = match rpi5_stage2b_find_init(initrd) {
+        Ok(file) => file,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_LOOKUP_FAILED reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2B_DEFERRED reason=init_lookup_failed");
+            halt_stage1();
+        }
+    };
+    kernel_diag!(
+        "RPI5_INIT_LOOKUP_OK offset=0x{:016x} size=0x{:016x}",
+        init_file.data_offset,
+        init_file.size
+    );
+    let init_elf = &initrd[init_file.data_offset..init_file.data_offset + init_file.size];
+    rpi5_emergency_marker(b"RPI5_INIT_ELF_CHECK_BEGIN\r\n\0");
+    let load_plan = match plan_rpi5_stage2b_init_elf(init_elf) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_ELF_INVALID reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2B_DEFERRED reason=invalid_init_elf");
+            halt_stage1();
+        }
+    };
+    kernel_diag!("RPI5_INIT_ELF_HEADER_OK entry=0x{:016x}", load_plan.entry);
+    rpi5_emergency_marker(b"RPI5_INIT_ELF_LOAD_PLAN_BEGIN\r\n\0");
+    for (index, segment) in load_plan.segments[..load_plan.segment_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_INIT_ELF_SEGMENT index={} vaddr=0x{:016x} memsz=0x{:016x} filesz=0x{:016x} flags=0x{:08x}",
+            index,
+            segment.vaddr,
+            segment.mem_size,
+            segment.file_size,
+            segment.flags
+        );
+    }
+    rpi5_emergency_marker(b"RPI5_INIT_ELF_LOAD_PLAN_DONE\r\n\0");
+    kernel_diag!("RPI5_STAGE2B_DEFERRED reason=loader_bridge_not_ready");
+    kernel_diag!("RPI5_STAGE2B_DONE status=deferred");
     halt_stage1();
 }
 

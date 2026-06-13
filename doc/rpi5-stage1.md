@@ -324,6 +324,21 @@ the Raspberry Pi firmware directive `initramfs initramfs-stage2a.cpio followkern
 is space-separated, without `=`, and asks firmware to place the archive after the kernel and publish
 the `/chosen` initrd properties. Omitting `--initrd-input` preserves the prior no-initrd config.
 
+Stage 2B continues only after Stage2A has validated and reserved the initrd. It walks the `newc`
+archive in place with a 4096-entry bound, validates every header, name, file range, and four-byte
+alignment, and accepts either `init` or `/init`. It does not unpack the archive.
+
+The selected file must be a little-endian AArch64 ELF64 executable. Stage2B bounds the program-header
+table and up to eight `PT_LOAD` segments, rejects file sizes larger than memory sizes, out-of-file
+segments, invalid alignment, writable-plus-executable segments, and entry points outside executable
+load segments. The resulting fixed-size load plan is diagnostic only.
+
+The existing first-task loader is coupled to the normal kernel bootstrap and service-chain
+invariants that Stage1 deliberately does not initialize. Stage2B therefore emits
+`RPI5_STAGE2B_DEFERRED reason=loader_bridge_not_ready` after a valid load plan and halts. It does not
+construct a task, claim a TID, enter userspace, enable interrupts, or run the scheduler. A future
+stage must bridge the validated plan into the existing loader without weakening those invariants.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls
