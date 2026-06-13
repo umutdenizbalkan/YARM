@@ -123,6 +123,19 @@ RPI5_AFTER_BOOT02
 RPI5_BEFORE_BOOT03
 RPI5_BOOT_03_UART_OK
 RPI5_AFTER_BOOT03
+RPI5_DTB_DIAG_BEGIN
+RPI5_DTB_MEMORY_RANGE index=... start=0x... size=0x...
+RPI5_DTB_RESERVED_RANGE index=... start=0x... size=0x... no_map=...
+RPI5_DTB_INITRD present=... start=0x... end=0x...
+RPI5_DTB_BOOTARGS len=... truncated=...
+RPI5_DTB_IRQC path=... base=0x... compatible=...
+RPI5_DTB_GIC_DIST base=0x...
+RPI5_DTB_GIC_REDIST base=0x...
+RPI5_DTB_PSCI conduit=...
+RPI5_DTB_CPU_BITMAP value=0x... count=... max_cpus=1 effective=1
+RPI5_DTB_RP1_PCIE present=...
+RPI5_DTB_RP1_NODE path=...
+RPI5_DTB_DIAG_DONE
 ```
 
 `RPI5_RAW_ENTRY` is emitted directly from `_start`, before BSS clearing, Rust, DTB parsing, MMU
@@ -160,6 +173,17 @@ An initial `PL011_FR` value of `0x38` has BUSY (bit 3), RXFE (bit 4), and TXFF (
 therefore not considered TX-ready at that instant. The bounded writer correctly continues polling;
 the later `RPI5_TRY_WRITE_TX_READY` marker means a subsequent FR read had TXFF clear. No readiness
 predicate change is required.
+
+With `yarm.boot_phase=dtb`, Stage 1B performs one additional bounded DTB walk after
+`RPI5_AFTER_BOOT03`. It records at most eight memory ranges and eight reserved-memory ranges, caps
+bootargs inspection at 256 bytes, records paths in the existing 192-byte fixed path type, and uses a
+384-byte stack line buffer for output through the already-proven bounded Stage 1 console. It reports
+initrd state, the first interrupt-controller candidate and up to two translated GIC register ranges,
+PSCI conduit, the firmware CPU bitmap constrained to the Stage 1 `max_cpus=1` policy, and RP1/PCIe
+presence only. Missing GIC data emits `RPI5_DTB_GIC_MISSING`; parse or output failure emits an
+explicit failure marker. `RPI5_DTB_DIAG_DONE` is followed directly by the safe Stage 1 halt, without
+MMU, interrupt-controller, PCIe, SMP, or userspace initialization. Required Stage 1B output does not
+use `yarm_log!`, printk, allocation, or an unbounded transmit loop.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans

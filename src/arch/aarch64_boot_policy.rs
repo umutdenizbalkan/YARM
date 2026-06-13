@@ -11,6 +11,8 @@ const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 const MAX_PATH: usize = 192;
 const MAX_DEPTH: usize = 32;
+const MAX_DIAGNOSTIC_RANGES: usize = 8;
+const MAX_DIAGNOSTIC_BOOTARGS: usize = 256;
 const RPI5_PREFERRED_UART: &[u8] = b"/soc@107c000000/serial@7d001000";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,10 +103,206 @@ pub struct PlatformDtbInfo {
     pub serial: Option<SerialSelection>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiagnosticRange {
+    pub start: u64,
+    pub size: u64,
+    pub no_map: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiagnosticPsciConduit {
+    #[default]
+    None,
+    Smc,
+    Hvc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlatformDtbDiagnostics {
+    pub memory_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
+    pub memory_range_count: usize,
+    pub memory_ranges_truncated: bool,
+    pub reserved_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
+    pub reserved_range_count: usize,
+    pub reserved_ranges_truncated: bool,
+    pub initrd_start: Option<u64>,
+    pub initrd_end: Option<u64>,
+    pub bootargs_len: usize,
+    pub bootargs_truncated: bool,
+    pub interrupt_controller_path: DtbPath,
+    pub interrupt_controller_base: Option<u64>,
+    pub interrupt_controller_compatible: DtbPath,
+    pub gic_dist_base: Option<u64>,
+    pub gic_redist_base: Option<u64>,
+    pub psci_conduit: DiagnosticPsciConduit,
+    pub cpu_bitmap: u64,
+    pub rp1_pcie_present: bool,
+    pub rp1_node_path: DtbPath,
+}
+
+impl Default for PlatformDtbDiagnostics {
+    fn default() -> Self {
+        Self {
+            memory_ranges: [DiagnosticRange::default(); MAX_DIAGNOSTIC_RANGES],
+            memory_range_count: 0,
+            memory_ranges_truncated: false,
+            reserved_ranges: [DiagnosticRange::default(); MAX_DIAGNOSTIC_RANGES],
+            reserved_range_count: 0,
+            reserved_ranges_truncated: false,
+            initrd_start: None,
+            initrd_end: None,
+            bootargs_len: 0,
+            bootargs_truncated: false,
+            interrupt_controller_path: DtbPath::empty(),
+            interrupt_controller_base: None,
+            interrupt_controller_compatible: DtbPath::empty(),
+            gic_dist_base: None,
+            gic_redist_base: None,
+            psci_conduit: DiagnosticPsciConduit::None,
+            cpu_bitmap: 0,
+            rp1_pcie_present: false,
+            rp1_node_path: DtbPath::empty(),
+        }
+    }
+}
+
 impl PlatformDtbInfo {
     pub const fn has_initrd(&self) -> bool {
         matches!((self.initrd_start, self.initrd_end), (Some(start), Some(end)) if end > start)
     }
+}
+
+pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnostics> {
+    let blocks = blocks(bytes)?;
+    let mut out = PlatformDtbDiagnostics::default();
+    let mut walker = Walker::new(blocks);
+    let mut reserved_range = None;
+    let mut reserved_no_map = false;
+    let mut irq_candidate = false;
+    let mut irq_reg = [DiagnosticRange::default(); 2];
+    let mut irq_reg_count = 0usize;
+    while let Some(event) = walker.next() {
+        match event {
+            Event::Begin { path, name } => {
+                if path.starts_with(b"/reserved-memory/") {
+                    reserved_range = None;
+                    reserved_no_map = false;
+                }
+                irq_candidate =
+                    name.starts_with(b"intc") || name.starts_with(b"interrupt-controller");
+                irq_reg_count = 0;
+                if path.starts_with(b"/cpus/")
+                    && let Some(cpu) = parse_cpu_id_from_node_name(name)
+                {
+                    out.cpu_bitmap |= 1u64 << cpu;
+                }
+                if is_rp1_or_pcie(name) {
+                    out.rp1_pcie_present = true;
+                    if out.rp1_node_path.is_empty() {
+                        out.rp1_node_path.set(path);
+                    }
+                }
+            }
+            Event::Property {
+                path,
+                name,
+                value,
+                parent_address_cells,
+                parent_size_cells,
+            } => {
+                if is_memory_path(path) && name == b"reg" {
+                    append_reg_ranges(
+                        &mut out.memory_ranges,
+                        &mut out.memory_range_count,
+                        &mut out.memory_ranges_truncated,
+                        value,
+                        parent_address_cells,
+                        parent_size_cells,
+                        false,
+                    )?;
+                }
+                if path.starts_with(b"/reserved-memory/") && name == b"reg" {
+                    let (start, size) = first_reg(value, parent_address_cells, parent_size_cells);
+                    reserved_range = Some(DiagnosticRange {
+                        start: start?,
+                        size: size?,
+                        no_map: reserved_no_map,
+                    });
+                }
+                if path.starts_with(b"/reserved-memory/") && name == b"no-map" {
+                    reserved_no_map = true;
+                    if let Some(range) = reserved_range.as_mut() {
+                        range.no_map = true;
+                    }
+                }
+                if path == b"/chosen" && name == b"linux,initrd-start" {
+                    out.initrd_start = scalar(value);
+                }
+                if path == b"/chosen" && name == b"linux,initrd-end" {
+                    out.initrd_end = scalar(value);
+                }
+                if path == b"/chosen" && name == b"bootargs" {
+                    out.bootargs_len = first_string(value).len();
+                    out.bootargs_truncated = out.bootargs_len > MAX_DIAGNOSTIC_BOOTARGS;
+                }
+                if name == b"interrupt-controller" {
+                    irq_candidate = true;
+                }
+                if irq_candidate && name == b"compatible" {
+                    out.interrupt_controller_compatible.set(first_string(value));
+                }
+                if irq_candidate && name == b"reg" {
+                    let mut truncated = false;
+                    append_reg_ranges(
+                        &mut irq_reg,
+                        &mut irq_reg_count,
+                        &mut truncated,
+                        value,
+                        parent_address_cells,
+                        parent_size_cells,
+                        false,
+                    )?;
+                    out.interrupt_controller_path.set(path);
+                }
+                if path.starts_with(b"/psci") && name == b"method" {
+                    out.psci_conduit = match first_string(value) {
+                        b"hvc" => DiagnosticPsciConduit::Hvc,
+                        b"smc" => DiagnosticPsciConduit::Smc,
+                        _ => DiagnosticPsciConduit::None,
+                    };
+                }
+                if name == b"compatible" && value.split(|byte| *byte == 0).any(is_rp1_or_pcie) {
+                    out.rp1_pcie_present = true;
+                    if out.rp1_node_path.is_empty() {
+                        out.rp1_node_path.set(path);
+                    }
+                }
+            }
+            Event::EndNode => {
+                if let Some(range) = reserved_range.take() {
+                    append_diagnostic_range(
+                        &mut out.reserved_ranges,
+                        &mut out.reserved_range_count,
+                        &mut out.reserved_ranges_truncated,
+                        range,
+                    );
+                }
+                if irq_candidate && irq_reg_count != 0 {
+                    let path = out.interrupt_controller_path.as_bytes();
+                    out.interrupt_controller_base =
+                        translate_to_root(blocks, path, irq_reg[0].start);
+                    out.gic_dist_base = out.interrupt_controller_base;
+                    if irq_reg_count > 1 {
+                        out.gic_redist_base = translate_to_root(blocks, path, irq_reg[1].start);
+                    }
+                }
+                irq_candidate = false;
+            }
+            Event::End => break,
+        }
+    }
+    Some(out)
 }
 
 #[derive(Clone, Copy)]
@@ -591,6 +789,77 @@ fn is_memory_path(path: &[u8]) -> bool {
     path.strip_prefix(b"/")
         .is_some_and(|rest| rest.starts_with(b"memory@") || rest == b"memory")
 }
+fn parse_cpu_id_from_node_name(name: &[u8]) -> Option<u8> {
+    let suffix = name.strip_prefix(b"cpu@")?;
+    let mut value = 0u64;
+    let mut consumed = 0usize;
+    for byte in suffix.iter().copied() {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as u64,
+            b'a'..=b'f' => (byte - b'a' + 10) as u64,
+            b'A'..=b'F' => (byte - b'A' + 10) as u64,
+            _ => break,
+        };
+        value = value.checked_mul(16)?.checked_add(digit)?;
+        consumed += 1;
+    }
+    (consumed != 0 && value < 64).then_some(value as u8)
+}
+fn is_rp1_or_pcie(value: &[u8]) -> bool {
+    value
+        .windows(3)
+        .any(|part| part.eq_ignore_ascii_case(b"rp1"))
+        || value
+            .windows(4)
+            .any(|part| part.eq_ignore_ascii_case(b"pcie"))
+        || value
+            .windows(3)
+            .any(|part| part.eq_ignore_ascii_case(b"pci"))
+}
+fn append_reg_ranges<const N: usize>(
+    ranges: &mut [DiagnosticRange; N],
+    count: &mut usize,
+    truncated: &mut bool,
+    value: &[u8],
+    address_cells: u32,
+    size_cells: u32,
+    no_map: bool,
+) -> Option<()> {
+    if !(1..=2).contains(&address_cells) || !(1..=2).contains(&size_cells) {
+        return None;
+    }
+    let cells_per_entry = address_cells.checked_add(size_cells)? as usize;
+    let bytes_per_entry = cells_per_entry.checked_mul(4)?;
+    if bytes_per_entry == 0 || value.len() % bytes_per_entry != 0 {
+        return None;
+    }
+    for entry in value.chunks_exact(bytes_per_entry) {
+        append_diagnostic_range(
+            ranges,
+            count,
+            truncated,
+            DiagnosticRange {
+                start: cells(entry, address_cells, 0)?,
+                size: cells(entry, size_cells, address_cells as usize)?,
+                no_map,
+            },
+        );
+    }
+    Some(())
+}
+fn append_diagnostic_range<const N: usize>(
+    ranges: &mut [DiagnosticRange; N],
+    count: &mut usize,
+    truncated: &mut bool,
+    range: DiagnosticRange,
+) {
+    if *count < N {
+        ranges[*count] = range;
+        *count += 1;
+    } else {
+        *truncated = true;
+    }
+}
 fn first_string(value: &[u8]) -> &[u8] {
     &value[..value.iter().position(|b| *b == 0).unwrap_or(value.len())]
 }
@@ -731,6 +1000,7 @@ mod tests {
         rpi: bool,
         with_initrd: bool,
         rpi_ranges_map_uart: bool,
+        bootargs: &[u8],
     ) -> Vec<u8> {
         let mut st = Vec::new();
         let mut strings = Vec::new();
@@ -778,6 +1048,7 @@ mod tests {
             "stdout-path",
             b"serial10:115200n8\0",
         );
+        prop(&mut st, &mut strings, &mut offsets, "bootargs", bootargs);
         if with_initrd {
             prop(
                 &mut st,
@@ -828,7 +1099,17 @@ mod tests {
                 "reg",
                 &reg64(0x1000, 0x2000),
             );
+            prop(&mut st, &mut strings, &mut offsets, "no-map", &[]);
             end(&mut st);
+            end(&mut st);
+            begin(&mut st, b"cpus");
+            begin(&mut st, b"cpu@0");
+            end(&mut st);
+            begin(&mut st, b"cpu@3");
+            end(&mut st);
+            end(&mut st);
+            begin(&mut st, b"psci");
+            prop(&mut st, &mut strings, &mut offsets, "method", b"smc\0");
             end(&mut st);
             begin(&mut st, b"soc@107c000000");
             prop(
@@ -891,8 +1172,20 @@ mod tests {
                 &mut st,
                 &mut strings,
                 &mut offsets,
-                "reg",
-                &reg_2_1(0x7fff_9000, 0x1000),
+                "compatible",
+                b"arm,gic-v3\0",
+            );
+            let mut gic_regs = reg_2_1(0x7fff_9000, 0x1000);
+            gic_regs.extend_from_slice(&reg_2_1(0x7fff_a000, 0x20_000));
+            prop(&mut st, &mut strings, &mut offsets, "reg", &gic_regs);
+            end(&mut st);
+            begin(&mut st, b"pcie@120000");
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "compatible",
+                b"brcm,bcm2712-pcie\0",
             );
             end(&mut st);
             end(&mut st);
@@ -921,8 +1214,14 @@ mod tests {
 
     #[test]
     fn detects_qemu_virt_and_resolves_absolute_uart_alias() {
-        let info =
-            parse_platform_dtb(&test_dtb(b"linux,dummy-virt\0", false, true, false)).unwrap();
+        let info = parse_platform_dtb(&test_dtb(
+            b"linux,dummy-virt\0",
+            false,
+            true,
+            false,
+            b"console=ttyAMA0\0",
+        ))
+        .unwrap();
         assert_eq!(info.platform, DetectedPlatform::QemuVirt);
         assert_eq!(info.serial.unwrap().base, 0x0900_0000);
         assert!(info.has_initrd());
@@ -935,6 +1234,7 @@ mod tests {
             true,
             false,
             true,
+            b"console=ttyAMA10 yarm.boot_phase=dtb\0",
         ))
         .unwrap();
         assert_eq!(info.platform, DetectedPlatform::Rpi5Bcm2712);
@@ -955,10 +1255,75 @@ mod tests {
             true,
             false,
             false,
+            b"console=ttyAMA10\0",
         ))
         .unwrap();
         assert_eq!(info.stdout_path.as_str(), "/soc@107c000000/serial@7d001000");
         assert_eq!(info.serial, None);
+    }
+
+    #[test]
+    fn rpi5_stage1_diagnostics_report_bounded_firmware_state() {
+        let dtb = test_dtb(
+            b"raspberrypi,5-model-b\0brcm,bcm2712\0",
+            true,
+            true,
+            true,
+            b"console=ttyAMA10 yarm.boot_phase=dtb\0",
+        );
+        let info = parse_platform_dtb_diagnostics(&dtb).unwrap();
+        assert_eq!(
+            &info.memory_ranges[..info.memory_range_count],
+            &[DiagnosticRange {
+                start: 0,
+                size: 0x4000_0000,
+                no_map: false,
+            }]
+        );
+        assert_eq!(
+            &info.reserved_ranges[..info.reserved_range_count],
+            &[DiagnosticRange {
+                start: 0x1000,
+                size: 0x2000,
+                no_map: true,
+            }]
+        );
+        assert_eq!(info.initrd_start, Some(0x0800_0000));
+        assert_eq!(info.initrd_end, Some(0x0810_0000));
+        assert_eq!(
+            info.bootargs_len,
+            b"console=ttyAMA10 yarm.boot_phase=dtb".len()
+        );
+        assert!(!info.bootargs_truncated);
+        assert_eq!(
+            info.interrupt_controller_path.as_str(),
+            "/soc@107c000000/interrupt-controller@7fff9000"
+        );
+        assert_eq!(info.interrupt_controller_compatible.as_str(), "arm,gic-v3");
+        assert_eq!(info.gic_dist_base, Some(0x10_7fff_9000));
+        assert_eq!(info.gic_redist_base, Some(0x10_7fff_a000));
+        assert_eq!(info.psci_conduit, DiagnosticPsciConduit::Smc);
+        assert_eq!(info.cpu_bitmap, 0b1001);
+        assert!(info.rp1_pcie_present);
+        assert_eq!(info.rp1_node_path.as_str(), "/soc@107c000000/pcie@120000");
+    }
+
+    #[test]
+    fn rpi5_stage1_diagnostics_report_missing_initrd_and_bootargs_truncation() {
+        let mut bootargs = [b'x'; MAX_DIAGNOSTIC_BOOTARGS + 2];
+        bootargs[MAX_DIAGNOSTIC_BOOTARGS + 1] = 0;
+        let info = parse_platform_dtb_diagnostics(&test_dtb(
+            b"raspberrypi,5-model-b\0brcm,bcm2712\0",
+            true,
+            false,
+            true,
+            &bootargs,
+        ))
+        .unwrap();
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert_eq!(info.bootargs_len, MAX_DIAGNOSTIC_BOOTARGS + 1);
+        assert!(info.bootargs_truncated);
     }
 
     #[test]

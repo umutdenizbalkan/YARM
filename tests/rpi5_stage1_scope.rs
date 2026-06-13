@@ -5,13 +5,7 @@
 fn rpi5_stage1_does_not_start_rp1_pcie_or_userspace_policy() {
     let policy = include_str!("../src/arch/aarch64_boot_policy.rs");
     let boot = include_str!("../src/arch/aarch64/boot.rs");
-    for forbidden in [
-        "rp1_gpio",
-        "SpawnV5",
-        "driver_manager",
-        "pcie_init",
-        "rp1_pcie",
-    ] {
+    for forbidden in ["rp1_gpio", "SpawnV5", "driver_manager", "pcie_init"] {
         assert!(!policy.contains(forbidden), "policy contains {forbidden}");
     }
     assert!(boot.contains("RPI5_BOOT_KERNEL_REFUSED reason=stage1_uart_only"));
@@ -72,6 +66,20 @@ fn raw_entry_breadcrumb_ladder_has_all_expected_markers() {
         "RPI5_AFTER_BOOT02",
         "RPI5_BEFORE_BOOT03",
         "RPI5_AFTER_BOOT03",
+        "RPI5_DTB_DIAG_BEGIN",
+        "RPI5_DTB_MEMORY_RANGE",
+        "RPI5_DTB_RESERVED_RANGE",
+        "RPI5_DTB_INITRD",
+        "RPI5_DTB_BOOTARGS",
+        "RPI5_DTB_IRQC",
+        "RPI5_DTB_GIC_DIST",
+        "RPI5_DTB_GIC_REDIST",
+        "RPI5_DTB_GIC_MISSING",
+        "RPI5_DTB_PSCI",
+        "RPI5_DTB_CPU_BITMAP",
+        "RPI5_DTB_RP1_PCIE",
+        "RPI5_DTB_RP1_NODE",
+        "RPI5_DTB_DIAG_DONE",
     ] {
         assert!(
             boot.contains(marker) || console.contains(marker),
@@ -120,6 +128,37 @@ fn rpi5_console_transition_is_bounded_and_uses_the_proven_uart() {
 }
 
 #[test]
+fn rpi5_stage1b_diagnostics_are_bounded_lock_free_and_halt() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let policy = include_str!("../src/arch/aarch64_boot_policy.rs");
+    let start = boot
+        .find("fn rpi5_stage1_dtb_diagnostics")
+        .expect("Stage1B diagnostics function");
+    let end = boot[start..]
+        .find("fn yarm_aarch64_boot_marker_start")
+        .map(|offset| start + offset)
+        .expect("end of Stage1B diagnostics function");
+    let diagnostics = &boot[start..end];
+    assert!(diagnostics.contains("console::try_write_line"));
+    assert!(!diagnostics.contains("yarm_log!"));
+    assert!(!diagnostics.contains("printk"));
+    assert!(diagnostics.contains("bytes: [u8; 384]"));
+    assert!(diagnostics.contains("RPI5_DTB_DIAG_DONE"));
+    assert!(diagnostics.contains("halt_stage1();"));
+    assert!(policy.contains("const MAX_DIAGNOSTIC_RANGES: usize = 8"));
+    assert!(policy.contains("const MAX_DIAGNOSTIC_BOOTARGS: usize = 256"));
+    assert!(policy.contains("pub fn parse_platform_dtb_diagnostics"));
+
+    let after_boot03 = boot.find("RPI5_AFTER_BOOT03").unwrap();
+    let uart_halt = boot[after_boot03..]
+        .find("options.boot_phase == BootPhase::Uart")
+        .map(|offset| after_boot03 + offset)
+        .unwrap();
+    let dtb_diagnostics = boot.find("rpi5_stage1_dtb_diagnostics(dtb").unwrap();
+    assert!(uart_halt < dtb_diagnostics);
+}
+
+#[test]
 fn existing_architecture_defaults_remain_explicit() {
     let aarch64 = include_str!("../src/arch/aarch64/platform_layout.rs");
     let x86 = include_str!("../src/arch/x86_64/platform_layout.rs");
@@ -129,4 +168,11 @@ fn existing_architecture_defaults_remain_explicit() {
     assert!(x86.contains("KERNEL_BOOTSTRAP_PHYS_BASE"));
     assert!(options.contains("#[default]\n    Kernel"));
     assert!(options.contains("#[default]\n    Auto"));
+    assert!(
+        include_str!("../targets/aarch64-rpi5-stage1-none.ld")
+            .contains("KERNEL_LOAD_BASE = 0x80000")
+    );
+    assert!(
+        include_str!("../targets/aarch64-yarm-none.ld").contains("KERNEL_LOAD_BASE = 0x40080000")
+    );
 }

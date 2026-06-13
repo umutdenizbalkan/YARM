@@ -779,9 +779,153 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
             if options.boot_phase == BootPhase::Uart {
                 halt_stage1();
             }
+            #[cfg(feature = "rpi5-stage1")]
+            if options.boot_phase == BootPhase::Dtb {
+                rpi5_stage1_dtb_diagnostics(dtb);
+            }
         }
         DetectedPlatform::Unknown => halt_stage1(),
     }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
+    use crate::arch::aarch64_boot_policy::{DiagnosticPsciConduit, parse_platform_dtb_diagnostics};
+    use core::fmt::Write;
+
+    struct Line {
+        bytes: [u8; 384],
+        len: usize,
+        truncated: bool,
+    }
+    impl Line {
+        const fn new() -> Self {
+            Self {
+                bytes: [0; 384],
+                len: 0,
+                truncated: false,
+            }
+        }
+        fn emit(&self) -> bool {
+            let text =
+                core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("RPI5_DTB_FORMAT_ERR");
+            crate::arch::aarch64::console::try_write_line(text)
+        }
+    }
+    impl Write for Line {
+        fn write_str(&mut self, value: &str) -> core::fmt::Result {
+            let remaining = self.bytes.len().saturating_sub(self.len);
+            let copied = remaining.min(value.len());
+            self.bytes[self.len..self.len + copied].copy_from_slice(&value.as_bytes()[..copied]);
+            self.len += copied;
+            self.truncated |= copied != value.len();
+            if copied == value.len() {
+                Ok(())
+            } else {
+                Err(core::fmt::Error)
+            }
+        }
+    }
+    macro_rules! diag {
+        ($($arg:tt)*) => {{
+            let mut line = Line::new();
+            let _ = write!(&mut line, $($arg)*);
+            if line.truncated || !line.emit() {
+                rpi5_emergency_marker(b"RPI5_DTB_DIAG_OUTPUT_FAILED\r\n\0");
+                halt_stage1();
+            }
+        }};
+    }
+
+    rpi5_emergency_marker(b"RPI5_DTB_DIAG_BEGIN\r\n\0");
+    let Some(info) = parse_platform_dtb_diagnostics(dtb) else {
+        rpi5_emergency_marker(b"RPI5_DTB_DIAG_PARSE_FAILED\r\n\0");
+        halt_stage1();
+    };
+    for (index, range) in info.memory_ranges[..info.memory_range_count]
+        .iter()
+        .enumerate()
+    {
+        diag!(
+            "RPI5_DTB_MEMORY_RANGE index={} start=0x{:016x} size=0x{:016x}",
+            index,
+            range.start,
+            range.size
+        );
+    }
+    if info.memory_ranges_truncated {
+        diag!("RPI5_DTB_MEMORY_RANGE_TRUNCATED");
+    }
+    for (index, range) in info.reserved_ranges[..info.reserved_range_count]
+        .iter()
+        .enumerate()
+    {
+        diag!(
+            "RPI5_DTB_RESERVED_RANGE index={} start=0x{:016x} size=0x{:016x} no_map={}",
+            index,
+            range.start,
+            range.size,
+            range.no_map as u8
+        );
+    }
+    if info.reserved_ranges_truncated {
+        diag!("RPI5_DTB_RESERVED_RANGE_TRUNCATED");
+    }
+    diag!(
+        "RPI5_DTB_INITRD present={} start=0x{:016x} end=0x{:016x}",
+        matches!((info.initrd_start, info.initrd_end), (Some(start), Some(end)) if end > start)
+            as u8,
+        info.initrd_start.unwrap_or(0),
+        info.initrd_end.unwrap_or(0)
+    );
+    diag!(
+        "RPI5_DTB_BOOTARGS len={} truncated={}",
+        info.bootargs_len,
+        info.bootargs_truncated as u8
+    );
+    if !info.interrupt_controller_path.is_empty() {
+        diag!(
+            "RPI5_DTB_IRQC path={} base=0x{:016x} compatible={}",
+            info.interrupt_controller_path.as_str(),
+            info.interrupt_controller_base.unwrap_or(0),
+            info.interrupt_controller_compatible.as_str()
+        );
+    } else {
+        diag!("RPI5_DTB_IRQC_MISSING");
+    }
+    if let Some(base) = info.gic_dist_base {
+        diag!("RPI5_DTB_GIC_DIST base=0x{:016x}", base);
+        if let Some(base) = info.gic_redist_base {
+            diag!("RPI5_DTB_GIC_REDIST base=0x{:016x}", base);
+        }
+    } else {
+        diag!("RPI5_DTB_GIC_MISSING");
+    }
+    let conduit = match info.psci_conduit {
+        DiagnosticPsciConduit::Hvc => "hvc",
+        DiagnosticPsciConduit::Smc => "smc",
+        DiagnosticPsciConduit::None => "none",
+    };
+    diag!("RPI5_DTB_PSCI conduit={}", conduit);
+    let max_cpus = 1usize;
+    let effective_bitmap = info.cpu_bitmap & 1;
+    diag!(
+        "RPI5_DTB_CPU_BITMAP value=0x{:016x} count={} max_cpus={} effective={}",
+        info.cpu_bitmap,
+        info.cpu_bitmap.count_ones(),
+        max_cpus,
+        effective_bitmap.count_ones()
+    );
+    diag!("RPI5_DTB_RP1_PCIE present={}", info.rp1_pcie_present as u8);
+    if !info.rp1_node_path.is_empty() {
+        diag!("RPI5_DTB_RP1_NODE path={}", info.rp1_node_path.as_str());
+    }
+    rpi5_emergency_marker(b"RPI5_DTB_DIAG_DONE\r\n\0");
+    halt_stage1();
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
