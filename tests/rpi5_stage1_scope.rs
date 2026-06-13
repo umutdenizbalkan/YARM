@@ -250,6 +250,15 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_TIMER_CTL_AFTER",
         "RPI5_TIMER_INIT_DONE",
         "RPI5_KERNEL_BOOT_PREP_DONE",
+        "RPI5_KERNEL_BOOT_BEGIN",
+        "RPI5_KERNEL_PLATFORM_READY",
+        "RPI5_KERNEL_MEMORY_READY",
+        "RPI5_KERNEL_CPU0_READY",
+        "RPI5_KERNEL_TRAP_READY",
+        "RPI5_KERNEL_STATE_BEGIN",
+        "RPI5_KERNEL_STATE_READY",
+        "RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE",
+        "RPI5_KERNEL_BOOT_OK",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -260,7 +269,8 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(diagnostics.contains("bytes: [u8; 192]"));
     assert!(!diagnostics.contains("yarm_log!"));
     assert!(!diagnostics.contains("printk"));
-    assert!(!diagnostics.contains("initrd"));
+    assert!(!diagnostics.contains("boot_initrd_bytes"));
+    assert!(!diagnostics.contains("install_boot_initrd_bytes"));
     for forbidden in [
         "SpawnV5",
         "init_gic",
@@ -335,6 +345,27 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert_eq!(stage1h.matches("\"msr CNTP_").count(), 2);
     assert!(!stage1h.contains("start_secondary_cpus"));
     assert!(!stage1h.contains("scheduler"));
+    let stage1i_start = diagnostics.find("RPI5_KERNEL_BOOT_BEGIN").unwrap();
+    let stage1i_end = diagnostics[stage1i_start..]
+        .find("RPI5_KERNEL_BOOT_OK")
+        .map(|offset| stage1i_start + offset)
+        .unwrap();
+    let stage1i = &diagnostics[stage1i_start..stage1i_end];
+    assert!(stage1i.contains("build_rpi5_stage1_kernel_bootstrap_record"));
+    assert!(stage1i.contains("allocator.total_frames()"));
+    assert!(stage1i.contains("allocator.free_frames()"));
+    assert!(!stage1i.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(!stage1i.contains("init_from_memory_map"));
+    assert!(!stage1i.contains("bootstrap_first_user_task"));
+    assert!(!stage1i.contains("Bootstrap::init"));
+    assert!(!stage1i.contains("scheduler"));
+    assert!(!stage1i.contains("start_secondary_cpus"));
+    assert!(!stage1i.contains("init_gic"));
+    assert!(!stage1i.contains("init_rp1"));
+    assert!(!stage1i.contains("init_pcie"));
+    assert!(!stage1i.contains("yarm_log!"));
+    assert!(!stage1i.contains("printk"));
+    assert!(stage1i.contains("\"msr daifset, #0xf\""));
 }
 
 #[test]

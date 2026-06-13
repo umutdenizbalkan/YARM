@@ -985,7 +985,8 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
 fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     use crate::arch::aarch64_boot_policy::{
         RPI5_STAGE1_GICR_FRAME_STRIDE, RPI5_STAGE1_GICR_SCAN_FRAMES, Stage1KernelRange,
-        Stage1MmuMemoryType, parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
+        Stage1MmuMemoryType, build_rpi5_stage1_kernel_bootstrap_record,
+        parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
         plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory,
         rpi5_stage1_gicr_typer_plausible, rpi5_stage1_timer_delta,
     };
@@ -1408,6 +1409,82 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     }
     kernel_diag!("RPI5_TIMER_INIT_DONE masked=1");
     rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_PREP_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_BEGIN\r\n\0");
+    unsafe extern "C" {
+        static yarm_aarch64_vector_table_el1: u8;
+    }
+    let trap_vector_base = core::ptr::addr_of!(yarm_aarch64_vector_table_el1) as u64;
+    let record = match build_rpi5_stage1_kernel_bootstrap_record(
+        &info,
+        &allocator_plan,
+        RPI5_STAGE1_UART_BASE,
+        allocator.total_frames() as u64,
+        allocator.free_frames() as u64,
+        trap_vector_base,
+    ) {
+        Some(record) => record,
+        None => {
+            kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=platform_record_invalid");
+            halt_stage1();
+        }
+    };
+    kernel_diag!(
+        "RPI5_KERNEL_PLATFORM_READY uart=0x{:016x} psci={} gicd=0x{:016x} gicr=0x{:016x}",
+        record.uart_base,
+        record.psci_conduit.label(),
+        record.gic_dist_base.unwrap_or(0),
+        record.gic_redist_base.unwrap_or(0)
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_MEMORY_READY ranges={} reserved={} total_pages={} free_pages={}",
+        record.memory_range_count,
+        record.reserved_range_count,
+        record.frame_total_pages,
+        record.frame_free_pages
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_CPU0_READY bitmap=0x{:016x} effective={}",
+        record.cpu_bitmap,
+        record.effective_cpu_count
+    );
+    unsafe {
+        core::arch::asm!(
+            "msr daifset, #0xf",
+            "msr VBAR_EL1, {0}",
+            "isb",
+            in(reg) record.trap_vector_base,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let installed_vbar: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, VBAR_EL1",
+            out(reg) installed_vbar,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if installed_vbar != record.trap_vector_base {
+        kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=trap_vector_readback");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_KERNEL_TRAP_READY\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_STATE_BEGIN\r\n\0");
+    if record.initrd_present {
+        kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=unexpected_initrd");
+        halt_stage1();
+    }
+    if allocator.total_frames() as u64 != record.frame_total_pages
+        || allocator.free_frames() as u64 != record.frame_free_pages
+    {
+        kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=allocator_handoff_changed");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_KERNEL_STATE_READY\r\n\0");
+    kernel_diag!("RPI5_KERNEL_IRQ_DEFERRED reason=gic_init_sequence_not_reviewed");
+    kernel_diag!("RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE reason=no_initrd");
+    rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_OK\r\n\0");
     halt_stage1();
 }
 

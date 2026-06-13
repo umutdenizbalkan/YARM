@@ -292,6 +292,20 @@ one hundredth of `CNTFRQ_EL0`, clamped to the positive 32-bit `CNTP_TVAL_EL0` ra
 emits `RPI5_TIMER_INIT_DONE masked=1` and `RPI5_KERNEL_BOOT_PREP_DONE`, then halts. It does not
 enable any IRQ, enter a scheduler, start another CPU, or initialize an external device.
 
+Stage 1I converts the parsed Pi 5 platform diagnostics and the existing Stage1F allocator handoff
+into a fixed-size kernel bootstrap record. The record carries the translated UART base, firmware
+memory ranges, complete allocator reservation ranges, total/free frame counts, CPU bitmap with an
+effective CPU count of one, PSCI conduit, diagnostic GIC bases, vector-table base, and explicit
+initrd presence. It does not create another frame allocator.
+
+The Stage1 path installs the normal AArch64 EL1 vector table while setting all DAIF masks, verifies
+`VBAR_EL1`, and leaves the physical timer interrupt masked. Because normal `KernelState` construction
+is coupled to production bootstrap and userspace invariants, Stage1I uses this diagnostic skeleton
+record instead of weakening those invariants. It revalidates the live Stage1F allocator counts,
+reports GIC readiness as deferred, emits
+`RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE reason=no_initrd` and `RPI5_KERNEL_BOOT_OK`, then halts without
+calling the scheduler, userspace bootstrap, SMP, VFS, or production device initialization.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

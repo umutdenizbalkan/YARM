@@ -311,6 +311,24 @@ pub struct Stage1AllocatorPlan {
     pub total_pages: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1KernelBootstrapRecord {
+    pub uart_base: u64,
+    pub memory_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
+    pub memory_range_count: usize,
+    pub reserved_ranges: [Stage1KernelRange; MAX_STAGE1_ALLOC_RESERVED_RANGES],
+    pub reserved_range_count: usize,
+    pub frame_total_pages: u64,
+    pub frame_free_pages: u64,
+    pub cpu_bitmap: u64,
+    pub effective_cpu_count: usize,
+    pub psci_conduit: DiagnosticPsciConduit,
+    pub gic_dist_base: Option<u64>,
+    pub gic_redist_base: Option<u64>,
+    pub trap_vector_base: u64,
+    pub initrd_present: bool,
+}
+
 impl Default for Stage1AllocatorPlan {
     fn default() -> Self {
         Self {
@@ -813,6 +831,50 @@ pub const fn rpi5_stage1_timer_delta(begin: u64, end: u64) -> Option<u64> {
 
 pub const fn rpi5_stage1_gicr_typer_plausible(typer: u64) -> bool {
     typer != 0 && typer != u64::MAX
+}
+
+pub fn build_rpi5_stage1_kernel_bootstrap_record(
+    info: &PlatformDtbDiagnostics,
+    allocator_plan: &Stage1AllocatorPlan,
+    uart_base: u64,
+    frame_total_pages: u64,
+    frame_free_pages: u64,
+    trap_vector_base: u64,
+) -> Option<Stage1KernelBootstrapRecord> {
+    if uart_base == 0
+        || trap_vector_base == 0
+        || info.memory_range_count == 0
+        || info.memory_ranges_truncated
+        || allocator_plan.reserved_count == 0
+        || frame_total_pages == 0
+        || frame_free_pages > frame_total_pages
+        || info.cpu_bitmap & 1 == 0
+    {
+        return None;
+    }
+    let mut reserved_ranges = [Stage1KernelRange::default(); MAX_STAGE1_ALLOC_RESERVED_RANGES];
+    for (slot, reservation) in reserved_ranges
+        .iter_mut()
+        .zip(&allocator_plan.reserved[..allocator_plan.reserved_count])
+    {
+        *slot = reservation.range;
+    }
+    Some(Stage1KernelBootstrapRecord {
+        uart_base,
+        memory_ranges: info.memory_ranges,
+        memory_range_count: info.memory_range_count,
+        reserved_ranges,
+        reserved_range_count: allocator_plan.reserved_count,
+        frame_total_pages,
+        frame_free_pages,
+        cpu_bitmap: info.cpu_bitmap,
+        effective_cpu_count: 1,
+        psci_conduit: info.psci_conduit,
+        gic_dist_base: info.gic_dist_base,
+        gic_redist_base: info.gic_redist_base,
+        trap_vector_base,
+        initrd_present: info.initrd_start.is_some() && info.initrd_end.is_some(),
+    })
 }
 
 fn append_stage1_mmu_mapping(
@@ -2630,6 +2692,52 @@ mod tests {
         assert!(!rpi5_stage1_gicr_typer_plausible(u64::MAX));
         assert!(rpi5_stage1_gicr_typer_plausible(1 << 4));
         assert!(rpi5_stage1_gicr_typer_plausible(0x1234_0000_0000_0010));
+    }
+
+    #[test]
+    fn rpi5_stage1_kernel_bootstrap_record_carries_proven_platform_without_initrd() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        info.cpu_bitmap = 0xf;
+        info.psci_conduit = DiagnosticPsciConduit::Smc;
+        info.gic_dist_base = Some(0x10_7fff_9000);
+        info.gic_redist_base = Some(0x10_7fff_a000);
+        let mut allocator_plan = Stage1AllocatorPlan::default();
+        allocator_plan.reserved[0] = Stage1AllocatorReservation {
+            range: Stage1KernelRange::new(0, 0x80000),
+            reason: Stage1AllocatorReservationReason::LowFirmware,
+        };
+        allocator_plan.reserved_count = 1;
+        let record = build_rpi5_stage1_kernel_bootstrap_record(
+            &info,
+            &allocator_plan,
+            0x10_7d00_1000,
+            499_292,
+            499_292,
+            0x80000,
+        )
+        .unwrap();
+        assert_eq!(record.uart_base, 0x10_7d00_1000);
+        assert_eq!(record.memory_range_count, 2);
+        assert_eq!(record.reserved_range_count, 1);
+        assert_eq!(record.frame_total_pages, 499_292);
+        assert_eq!(record.frame_free_pages, 499_292);
+        assert_eq!(record.cpu_bitmap, 0xf);
+        assert_eq!(record.effective_cpu_count, 1);
+        assert_eq!(record.psci_conduit, DiagnosticPsciConduit::Smc);
+        assert_eq!(record.gic_dist_base, Some(0x10_7fff_9000));
+        assert_eq!(record.gic_redist_base, Some(0x10_7fff_a000));
+        assert!(!record.initrd_present);
     }
 
     #[test]
