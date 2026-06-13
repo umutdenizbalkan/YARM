@@ -1168,11 +1168,12 @@ unsafe fn rpi5_stage2c_ensure_table(
 fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     use crate::arch::aarch64_boot_policy::{
         RPI5_STAGE1_GICR_FRAME_STRIDE, RPI5_STAGE1_GICR_SCAN_FRAMES, Stage1KernelRange,
-        Stage1MmuMemoryType, build_rpi5_stage1_kernel_bootstrap_record,
+        Stage1MmuMemoryType, Stage2DEnterBridgeState, build_rpi5_stage1_kernel_bootstrap_record,
         parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
         plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory, plan_rpi5_stage2a_initrd,
         plan_rpi5_stage2b_init_elf, plan_rpi5_stage2c_init_task, rpi5_stage1_gicr_typer_plausible,
         rpi5_stage1_timer_delta, rpi5_stage2a_cpio_first_name, rpi5_stage2b_find_init,
+        validate_rpi5_stage2d_enter_bridge,
     };
     use core::fmt::Write;
 
@@ -1831,15 +1832,39 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     kernel_diag!("RPI5_INIT_SPAWN_READY tid={}", task.tid);
     rpi5_emergency_marker(b"RPI5_STAGE2C_DONE\r\n\0");
 
-    rpi5_emergency_marker(b"RPI5_STAGE2D_BEGIN\r\n\0");
-    kernel_diag!(
-        "RPI5_ENTER_USER_ATTEMPT tid={} entry=0x{:016x} sp=0x{:016x}",
-        task.tid,
-        task.entry,
-        task.stack_pointer
-    );
-    kernel_diag!("RPI5_STAGE2D_DEFERRED reason=enter_user_bridge_not_ready");
-    kernel_diag!("RPI5_STAGE2D_DONE status=deferred");
+    rpi5_emergency_marker(b"RPI5_STAGE2D_REAL_BEGIN\r\n\0");
+    let (current_ttbr0, current_tcr, kernel_pc): (u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "mrs {ttbr0}, TTBR0_EL1",
+            "mrs {tcr}, TCR_EL1",
+            "adr {pc}, .",
+            ttbr0 = out(reg) current_ttbr0,
+            tcr = out(reg) current_tcr,
+            pc = out(reg) kernel_pc,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let bridge = Stage2DEnterBridgeState {
+        expected_tid: task.tid,
+        current_tid: None,
+        stage2c_root: task.root_table,
+        current_ttbr0,
+        trap_entry: trap_frame.saved_pc() as u64,
+        task_entry: task.entry,
+        trap_stack_pointer: trap_frame.saved_sp() as u64,
+        task_stack_pointer: task.stack_pointer,
+        tcr_el1: current_tcr,
+        kernel_pc,
+    };
+    if let Err(reason) = validate_rpi5_stage2d_enter_bridge(bridge) {
+        kernel_diag!("RPI5_ENTER_USER_FAILED reason={}", reason.label());
+        kernel_diag!("RPI5_STAGE2D_REAL_DEFERRED reason={}", reason.label());
+        kernel_diag!("RPI5_STAGE2E_DEFERRED reason=el0_not_entered");
+        halt_stage1();
+    }
+    kernel_diag!("RPI5_STAGE2D_REAL_DEFERRED reason=eret_sequence_not_reviewed");
+    kernel_diag!("RPI5_STAGE2E_DEFERRED reason=el0_not_entered");
     halt_stage1();
 }
 

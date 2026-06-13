@@ -422,6 +422,46 @@ pub struct Stage2CTaskPlan {
     pub stack_pointer: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2DEnterBridgeState {
+    pub expected_tid: u64,
+    pub current_tid: Option<u64>,
+    pub stage2c_root: u64,
+    pub current_ttbr0: u64,
+    pub trap_entry: u64,
+    pub task_entry: u64,
+    pub trap_stack_pointer: u64,
+    pub task_stack_pointer: u64,
+    pub tcr_el1: u64,
+    pub kernel_pc: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2DEnterBridgeFailure {
+    #[default]
+    CurrentTaskMissing,
+    CurrentTaskMismatch,
+    InvalidUserRoot,
+    RootAlreadyActive,
+    TrapEntryMismatch,
+    TrapStackMismatch,
+    TtbrSplitNotReady,
+}
+
+impl Stage2DEnterBridgeFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CurrentTaskMissing => "current_task_missing",
+            Self::CurrentTaskMismatch => "current_task_mismatch",
+            Self::InvalidUserRoot => "invalid_user_root",
+            Self::RootAlreadyActive => "root_already_active",
+            Self::TrapEntryMismatch => "trap_entry_mismatch",
+            Self::TrapStackMismatch => "trap_stack_mismatch",
+            Self::TtbrSplitNotReady => "ttbr_split_not_ready",
+        }
+    }
+}
+
 impl Default for Stage2CTaskPlan {
     fn default() -> Self {
         Self {
@@ -1465,6 +1505,38 @@ pub fn plan_rpi5_stage2c_init_task(
         return Err(Stage2CTaskPlanFailure::EntryNotExecutable);
     }
     Ok(plan)
+}
+
+pub fn validate_rpi5_stage2d_enter_bridge(
+    state: Stage2DEnterBridgeState,
+) -> Result<(), Stage2DEnterBridgeFailure> {
+    if state.stage2c_root == 0 || state.stage2c_root & (STAGE1_PAGE_SIZE - 1) != 0 {
+        return Err(Stage2DEnterBridgeFailure::InvalidUserRoot);
+    }
+    if state.current_ttbr0 & 0x0000_ffff_ffff_f000 == state.stage2c_root {
+        return Err(Stage2DEnterBridgeFailure::RootAlreadyActive);
+    }
+    if state.trap_entry != state.task_entry || state.trap_entry == 0 {
+        return Err(Stage2DEnterBridgeFailure::TrapEntryMismatch);
+    }
+    if state.trap_stack_pointer != state.task_stack_pointer
+        || state.trap_stack_pointer == 0
+        || state.trap_stack_pointer & 0xf != 0
+    {
+        return Err(Stage2DEnterBridgeFailure::TrapStackMismatch);
+    }
+    const TCR_EPD1: u64 = 1 << 23;
+    const TTBR0_VA_LIMIT: u64 = 1 << 39;
+    if state.tcr_el1 & TCR_EPD1 != 0 || state.kernel_pc < TTBR0_VA_LIMIT {
+        return Err(Stage2DEnterBridgeFailure::TtbrSplitNotReady);
+    }
+    let current_tid = state
+        .current_tid
+        .ok_or(Stage2DEnterBridgeFailure::CurrentTaskMissing)?;
+    if current_tid != state.expected_tid {
+        return Err(Stage2DEnterBridgeFailure::CurrentTaskMismatch);
+    }
+    Ok(())
 }
 
 fn read_le_u16(bytes: &[u8], offset: usize) -> Result<u16, Stage2BElfFailure> {
@@ -3657,6 +3729,54 @@ mod tests {
         assert_eq!(
             plan_rpi5_stage2c_init_task(&elf_plan),
             Err(Stage2CTaskPlanFailure::EntryNotExecutable)
+        );
+    }
+
+    fn stage2d_bridge_state() -> Stage2DEnterBridgeState {
+        Stage2DEnterBridgeState {
+            expected_tid: 1,
+            current_tid: Some(1),
+            stage2c_root: 0x05d9_0000,
+            current_ttbr0: 0x05b5_0000,
+            trap_entry: 0x4023d8,
+            task_entry: 0x4023d8,
+            trap_stack_pointer: 0x3fe0_0000,
+            task_stack_pointer: 0x3fe0_0000,
+            tcr_el1: 25,
+            kernel_pc: 0xffff_0000_0008_0000,
+        }
+    }
+
+    #[test]
+    fn rpi5_stage2d_bridge_rejects_missing_current_task_and_wrong_root() {
+        let mut state = stage2d_bridge_state();
+        state.current_tid = None;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::CurrentTaskMissing)
+        );
+        let mut state = stage2d_bridge_state();
+        state.current_ttbr0 = state.stage2c_root;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::RootAlreadyActive)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2d_bridge_requires_matching_trap_frame_and_ttbr_split() {
+        let mut state = stage2d_bridge_state();
+        state.trap_entry += 4;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::TrapEntryMismatch)
+        );
+        let mut state = stage2d_bridge_state();
+        state.kernel_pc = 0x0010_0000;
+        state.tcr_el1 |= 1 << 23;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::TtbrSplitNotReady)
         );
     }
 

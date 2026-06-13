@@ -345,10 +345,18 @@ This produces a diagnostic init task record with TID 1, page-table root, entry, 
 scheduler, capability, PM, supervisor, or VFS state. The frame allocator is the already initialized
 Stage1F allocator; Stage2C never creates a second allocator.
 
-Stage 2D reports the reviewed entry parameters but defers with
-`RPI5_STAGE2D_DEFERRED reason=enter_user_bridge_not_ready`. Switching TTBR0 and issuing ERET without
-the normal current-task/exception-return invariants has not been reviewed, so no ERET is attempted
-and no first-user success is claimed. Interrupts remain masked and the diagnostic halts.
+Stage 2D performs a real-entry preflight against the live architectural state. The Stage1E identity
+map is installed in `TTBR0_EL1`, `TTBR1_EL1` is zero, `TCR_EL1.EPD1` disables TTBR1 walks, and the
+kernel is executing from a low identity-mapped address. Replacing TTBR0 with the Stage2C user root
+would therefore remove the translations for the executing kernel, vector table, stack, and UART
+before ERET could complete.
+
+The bridge also requires a production current-task registration, matching task/address-space root,
+and exact trap-frame entry/SP. Stage2C deliberately has only a diagnostic task record, so those
+normal scheduler invariants are not fabricated. Stage2D emits
+`RPI5_STAGE2D_REAL_DEFERRED reason=ttbr_split_not_ready` and
+`RPI5_STAGE2E_DEFERRED reason=el0_not_entered`, then halts. It does not write TTBR0, execute ERET,
+dispatch a syscall, enable interrupts, or claim userspace/service-chain progress.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans

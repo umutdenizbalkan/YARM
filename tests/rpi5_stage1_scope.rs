@@ -290,10 +290,10 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_INIT_TASK_BUILD_DONE",
         "RPI5_INIT_SPAWN_READY",
         "RPI5_STAGE2C_DONE",
-        "RPI5_STAGE2D_BEGIN",
-        "RPI5_ENTER_USER_ATTEMPT",
-        "RPI5_STAGE2D_DEFERRED",
-        "RPI5_STAGE2D_DONE",
+        "RPI5_STAGE2D_REAL_BEGIN",
+        "RPI5_ENTER_USER_FAILED",
+        "RPI5_STAGE2D_REAL_DEFERRED",
+        "RPI5_STAGE2E_DEFERRED",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -417,7 +417,11 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(!stage2a.contains("yarm_log!"));
     assert!(!stage2a.contains("printk"));
     let stage2b_start = diagnostics.find("RPI5_STAGE2B_BEGIN").unwrap();
-    let stage2b = &diagnostics[stage2b_start..];
+    let stage2b_end = diagnostics[stage2b_start..]
+        .find("RPI5_STAGE2E_DEFERRED reason=el0_not_entered")
+        .map(|offset| stage2b_start + offset + "RPI5_STAGE2E_DEFERRED reason=el0_not_entered".len())
+        .unwrap();
+    let stage2b = &diagnostics[stage2b_start..stage2b_end];
     assert!(stage2b.contains("rpi5_stage2b_find_init"));
     assert!(stage2b.contains("plan_rpi5_stage2b_init_elf"));
     assert!(stage2b.contains("plan_rpi5_stage2c_init_task"));
@@ -426,9 +430,14 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(!stage2b.contains("PhysicalFrameAllocator::new_uninit()"));
     assert!(stage2b.contains("RPI5_INIT_TASK_BUILD_DONE"));
     assert!(stage2b.contains("RPI5_INIT_SPAWN_READY"));
-    assert!(stage2b.contains("enter_user_bridge_not_ready"));
+    assert!(stage2b.contains("validate_rpi5_stage2d_enter_bridge"));
+    assert!(policy.contains("TtbrSplitNotReady => \"ttbr_split_not_ready\""));
     assert!(!stage2b.contains("RPI5_ENTER_USER_ERET"));
     assert!(!stage2b.contains("RPI5_FIRST_USER_TRAP"));
+    assert!(!stage2b.contains("RPI5_SERVICE_CHAIN_OK"));
+    assert!(!stage2b.contains("RPI5_TTBR0_INSTALL root="));
+    assert!(!stage2b.contains("\"msr TTBR0_EL1"));
+    assert!(!stage2b.contains("\"msr daifclr"));
     assert!(!stage2b.contains("bootstrap_first_user_task"));
     assert!(!stage2b.contains("Bootstrap::init"));
     assert!(!stage2b.contains("SpawnV5"));
