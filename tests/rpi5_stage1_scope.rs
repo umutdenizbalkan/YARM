@@ -259,6 +259,15 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_KERNEL_STATE_READY",
         "RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE",
         "RPI5_KERNEL_BOOT_OK",
+        "RPI5_INITRD_DETECT_BEGIN",
+        "RPI5_INITRD_DTB_PROPS",
+        "RPI5_INITRD_RANGE",
+        "RPI5_INITRD_RESERVED",
+        "RPI5_INITRD_CPIO_CHECK_BEGIN",
+        "RPI5_INITRD_CPIO_MAGIC_OK",
+        "RPI5_INITRD_CPIO_FIRST_ENTRY",
+        "RPI5_INITRD_READY",
+        "RPI5_STAGE2A_DONE",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -366,6 +375,21 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(!stage1i.contains("yarm_log!"));
     assert!(!stage1i.contains("printk"));
     assert!(stage1i.contains("\"msr daifset, #0xf\""));
+    let stage2a_start = diagnostics.find("RPI5_INITRD_DETECT_BEGIN").unwrap();
+    let stage2a = &diagnostics[stage2a_start..];
+    assert!(stage2a.contains("plan_rpi5_stage2a_initrd"));
+    assert!(stage2a.contains("rpi5_stage2a_cpio_first_name"));
+    assert!(stage2a.contains("RPI5_INITRD_MISSING"));
+    assert!(stage2a.contains("RPI5_STAGE2A_DEFERRED reason=no_initrd"));
+    assert!(!stage2a.contains("bootstrap_first_user_task"));
+    assert!(!stage2a.contains("Bootstrap::init"));
+    assert!(!stage2a.contains("scheduler"));
+    assert!(!stage2a.contains("start_secondary_cpus"));
+    assert!(!stage2a.contains("init_gic"));
+    assert!(!stage2a.contains("init_rp1"));
+    assert!(!stage2a.contains("init_pcie"));
+    assert!(!stage2a.contains("yarm_log!"));
+    assert!(!stage2a.contains("printk"));
 }
 
 #[test]

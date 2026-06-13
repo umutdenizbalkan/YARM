@@ -306,6 +306,24 @@ reports GIC readiness as deferred, emits
 `RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE reason=no_initrd` and `RPI5_KERNEL_BOOT_OK`, then halts without
 calling the scheduler, userspace bootstrap, SMP, VFS, or production device initialization.
 
+Stage 2A accepts firmware-provided `linux,initrd-start` and `linux,initrd-end` values from
+`/chosen`, preserving the original byte range while rounding a separate reservation down/up to
+4 KiB pages. The range must be nonempty, fully contained in one firmware RAM range, and disjoint
+from every Stage1 allocator reservation, including the kernel, DTB, page-table pool, early heap,
+and firmware reserved-memory. Stage2A performs no frame allocations after this check.
+
+For an accepted range, Stage2A reads only the first bounded CPIO newc header. It requires magic
+`070701`, parses the fixed-width hexadecimal file-size and name-size fields, limits the first name
+to 96 bytes, verifies its terminating NUL and entry bounds, and prints the first entry name. It
+does not unpack the archive or start userspace. Missing or malformed initrd state emits an explicit
+`RPI5_STAGE2A_DEFERRED` reason and halts; success emits `RPI5_INITRD_READY` and
+`RPI5_STAGE2A_DONE`.
+
+The Pi boot-directory generator stages an optional archive as `initramfs-stage2a.cpio` and uses
+the Raspberry Pi firmware directive `initramfs initramfs-stage2a.cpio followkernel`. This directive
+is space-separated, without `=`, and asks firmware to place the archive after the kernel and publish
+the `/chosen` initrd properties. Omitting `--initrd-input` preserves the prior no-initrd config.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

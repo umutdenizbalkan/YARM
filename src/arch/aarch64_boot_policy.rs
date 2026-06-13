@@ -14,7 +14,7 @@ const MAX_DEPTH: usize = 32;
 const MAX_DIAGNOSTIC_RANGES: usize = 8;
 const MAX_DIAGNOSTIC_PCIE_CONTROLLERS: usize = 8;
 const MAX_DIAGNOSTIC_BOOTARGS: usize = 256;
-pub const MAX_STAGE1_KERNEL_RESERVED_RANGES: usize = MAX_DIAGNOSTIC_RANGES + 3;
+pub const MAX_STAGE1_KERNEL_RESERVED_RANGES: usize = MAX_DIAGNOSTIC_RANGES + 4;
 pub const MAX_STAGE1_KERNEL_USABLE_RANGES: usize = 24;
 pub const STAGE1_PT_POOL_SIZE: u64 = 256 * 1024;
 pub const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024;
@@ -202,6 +202,7 @@ pub struct Stage1KernelPlan {
     pub usable_range_count: usize,
     pub page_table_pool: Stage1KernelRange,
     pub early_heap: Stage1KernelRange,
+    pub initrd_reservation: Option<Stage1KernelRange>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -281,6 +282,7 @@ pub enum Stage1AllocatorReservationReason {
     FirmwareReserved,
     PageTablePool,
     EarlyHeap,
+    Initrd,
 }
 
 impl Stage1AllocatorReservationReason {
@@ -292,6 +294,7 @@ impl Stage1AllocatorReservationReason {
             Self::FirmwareReserved => "firmware_reserved",
             Self::PageTablePool => "page_table_pool",
             Self::EarlyHeap => "early_heap",
+            Self::Initrd => "initrd",
         }
     }
 }
@@ -327,6 +330,62 @@ pub struct Stage1KernelBootstrapRecord {
     pub gic_redist_base: Option<u64>,
     pub trap_vector_base: u64,
     pub initrd_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2AInitrdPlan {
+    pub byte_range: Stage1KernelRange,
+    pub reservation: Stage1KernelRange,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2AInitrdFailure {
+    #[default]
+    Missing,
+    IncompleteProperties,
+    InvalidRange,
+    AddressOverflow,
+    OutsideFirmwareRam,
+    OverlapsReserved,
+}
+
+impl Stage2AInitrdFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::IncompleteProperties => "incomplete_properties",
+            Self::InvalidRange => "invalid_range",
+            Self::AddressOverflow => "address_overflow",
+            Self::OutsideFirmwareRam => "outside_firmware_ram",
+            Self::OverlapsReserved => "overlaps_reserved",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2ACpioFailure {
+    #[default]
+    HeaderTruncated,
+    BadMagic,
+    InvalidHex,
+    InvalidNameSize,
+    NameTruncated,
+    NameNotTerminated,
+    EntryTruncated,
+}
+
+impl Stage2ACpioFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HeaderTruncated => "header_truncated",
+            Self::BadMagic => "bad_magic",
+            Self::InvalidHex => "invalid_hex",
+            Self::InvalidNameSize => "invalid_name_size",
+            Self::NameTruncated => "name_truncated",
+            Self::NameNotTerminated => "name_not_terminated",
+            Self::EntryTruncated => "entry_truncated",
+        }
+    }
 }
 
 impl Default for Stage1AllocatorPlan {
@@ -374,6 +433,7 @@ impl Default for Stage1KernelPlan {
             usable_range_count: 0,
             page_table_pool: Stage1KernelRange::default(),
             early_heap: Stage1KernelRange::default(),
+            initrd_reservation: None,
         }
     }
 }
@@ -492,6 +552,34 @@ pub fn plan_rpi5_stage1_kernel_memory(
             ),
         )?;
     }
+    if let (Some(start), Some(end)) = (info.initrd_start, info.initrd_end) {
+        if start == 0 || end <= start {
+            return Err(Stage1KernelPlanFailure::InvalidDtbRange);
+        }
+        let reservation = Stage1KernelRange::new(
+            align_down_u64_policy(start, STAGE1_PAGE_SIZE),
+            align_up_u64_policy(end, STAGE1_PAGE_SIZE)
+                .ok_or(Stage1KernelPlanFailure::AddressOverflow)?,
+        );
+        let inside_ram = info.memory_ranges[..info.memory_range_count]
+            .iter()
+            .filter(|range| range.size != 0)
+            .any(|range| {
+                range
+                    .start
+                    .checked_add(range.size)
+                    .is_some_and(|ram_end| range.start <= start && ram_end >= end)
+            });
+        if !inside_ram
+            || plan.reserved_ranges[..plan.reserved_range_count]
+                .iter()
+                .any(|reserved| reservation.overlaps(*reserved))
+        {
+            return Err(Stage1KernelPlanFailure::InvalidDtbRange);
+        }
+        append_stage1_reserved(&mut plan, reservation)?;
+        plan.initrd_reservation = Some(reservation);
+    }
 
     let mut free = [Stage1KernelRange::default(); MAX_STAGE1_KERNEL_USABLE_RANGES];
     let mut free_count = 0usize;
@@ -548,6 +636,9 @@ pub fn plan_rpi5_stage1_allocator_handoff(
             0 => Stage1AllocatorReservationReason::LowFirmware,
             1 => Stage1AllocatorReservationReason::Kernel,
             2 => Stage1AllocatorReservationReason::Dtb,
+            _ if Some(range) == kernel_plan.initrd_reservation => {
+                Stage1AllocatorReservationReason::Initrd
+            }
             _ => Stage1AllocatorReservationReason::FirmwareReserved,
         };
         append_stage1_allocator_reserved(&mut plan, range, reason)?;
@@ -875,6 +966,108 @@ pub fn build_rpi5_stage1_kernel_bootstrap_record(
         trap_vector_base,
         initrd_present: info.initrd_start.is_some() && info.initrd_end.is_some(),
     })
+}
+
+pub fn plan_rpi5_stage2a_initrd(
+    info: &PlatformDtbDiagnostics,
+    allocator_plan: &Stage1AllocatorPlan,
+) -> Result<Stage2AInitrdPlan, Stage2AInitrdFailure> {
+    let (start, end) = match (info.initrd_start, info.initrd_end) {
+        (None, None) => return Err(Stage2AInitrdFailure::Missing),
+        (Some(start), Some(end)) => (start, end),
+        _ => return Err(Stage2AInitrdFailure::IncompleteProperties),
+    };
+    if start == 0 || end <= start {
+        return Err(Stage2AInitrdFailure::InvalidRange);
+    }
+    let byte_range = Stage1KernelRange::new(start, end);
+    let inside_ram = info.memory_ranges[..info.memory_range_count]
+        .iter()
+        .filter(|range| range.size != 0)
+        .any(|range| {
+            range
+                .start
+                .checked_add(range.size)
+                .is_some_and(|ram_end| range.start <= start && ram_end >= end)
+        });
+    if !inside_ram {
+        return Err(Stage2AInitrdFailure::OutsideFirmwareRam);
+    }
+    let reservation = Stage1KernelRange::new(
+        align_down_u64_policy(start, STAGE1_PAGE_SIZE),
+        align_up_u64_policy(end, STAGE1_PAGE_SIZE).ok_or(Stage2AInitrdFailure::AddressOverflow)?,
+    );
+    if allocator_plan.reserved[..allocator_plan.reserved_count]
+        .iter()
+        .any(|reserved| {
+            reserved.reason != Stage1AllocatorReservationReason::Initrd
+                && reservation.overlaps(reserved.range)
+        })
+    {
+        return Err(Stage2AInitrdFailure::OverlapsReserved);
+    }
+    Ok(Stage2AInitrdPlan {
+        byte_range,
+        reservation,
+    })
+}
+
+pub fn rpi5_stage2a_cpio_first_name(archive: &[u8]) -> Result<&[u8], Stage2ACpioFailure> {
+    const NEWC_HEADER_LEN: usize = 110;
+    const MAX_FIRST_NAME: usize = 96;
+    let header = archive
+        .get(..NEWC_HEADER_LEN)
+        .ok_or(Stage2ACpioFailure::HeaderTruncated)?;
+    if &header[..6] != b"070701" {
+        return Err(Stage2ACpioFailure::BadMagic);
+    }
+    let file_size = parse_newc_hex(&header[54..62])?;
+    let name_size = parse_newc_hex(&header[94..102])?;
+    if name_size == 0 || name_size > MAX_FIRST_NAME {
+        return Err(Stage2ACpioFailure::InvalidNameSize);
+    }
+    let name_end = NEWC_HEADER_LEN
+        .checked_add(name_size)
+        .ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    let name_with_nul = archive
+        .get(NEWC_HEADER_LEN..name_end)
+        .ok_or(Stage2ACpioFailure::NameTruncated)?;
+    if name_with_nul.last() != Some(&0) {
+        return Err(Stage2ACpioFailure::NameNotTerminated);
+    }
+    let data_start =
+        align_up_usize_policy(name_end, 4).ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    let data_end = data_start
+        .checked_add(file_size)
+        .ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    if data_end > archive.len() {
+        return Err(Stage2ACpioFailure::EntryTruncated);
+    }
+    Ok(&name_with_nul[..name_with_nul.len() - 1])
+}
+
+fn parse_newc_hex(bytes: &[u8]) -> Result<usize, Stage2ACpioFailure> {
+    let mut value = 0usize;
+    for byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as usize,
+            b'a'..=b'f' => (byte - b'a' + 10) as usize,
+            b'A'..=b'F' => (byte - b'A' + 10) as usize,
+            _ => return Err(Stage2ACpioFailure::InvalidHex),
+        };
+        value = value
+            .checked_mul(16)
+            .and_then(|current| current.checked_add(digit))
+            .ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    }
+    Ok(value)
+}
+
+const fn align_up_usize_policy(value: usize, alignment: usize) -> Option<usize> {
+    match value.checked_add(alignment - 1) {
+        Some(added) => Some(added & !(alignment - 1)),
+        None => None,
+    }
 }
 
 fn append_stage1_mmu_mapping(
@@ -2738,6 +2931,111 @@ mod tests {
         assert_eq!(record.gic_dist_base, Some(0x10_7fff_9000));
         assert_eq!(record.gic_redist_base, Some(0x10_7fff_a000));
         assert!(!record.initrd_present);
+    }
+
+    #[test]
+    fn rpi5_stage2a_initrd_plan_validates_and_page_rounds_reservation() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x8000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        info.initrd_start = Some(0x3000_0123);
+        info.initrd_end = Some(0x3001_2345);
+        let mut allocator_plan = Stage1AllocatorPlan::default();
+        allocator_plan.reserved[0] = Stage1AllocatorReservation {
+            range: Stage1KernelRange::new(0, 0x05d9_0000),
+            reason: Stage1AllocatorReservationReason::Kernel,
+        };
+        allocator_plan.reserved_count = 1;
+        let plan = plan_rpi5_stage2a_initrd(&info, &allocator_plan).unwrap();
+        assert_eq!(
+            plan.byte_range,
+            Stage1KernelRange::new(0x3000_0123, 0x3001_2345)
+        );
+        assert_eq!(
+            plan.reservation,
+            Stage1KernelRange::new(0x3000_0000, 0x3001_3000)
+        );
+        let kernel_plan = plan_rpi5_stage1_kernel_memory(
+            &info,
+            Stage1KernelRange::new(0x80000, 0x05b5_0000),
+            Stage1KernelRange::new(0x2efe_c600, 0x2eff_ff4e),
+        )
+        .unwrap();
+        assert_eq!(kernel_plan.initrd_reservation, Some(plan.reservation));
+        assert!(!kernel_plan.page_table_pool.overlaps(plan.reservation));
+        assert!(!kernel_plan.early_heap.overlaps(plan.reservation));
+        let frame_plan = plan_rpi5_stage1_allocator_handoff(&info, &kernel_plan).unwrap();
+        assert!(
+            frame_plan.reserved[..frame_plan.reserved_count]
+                .iter()
+                .any(|reserved| {
+                    reserved.reason == Stage1AllocatorReservationReason::Initrd
+                        && reserved.range == plan.reservation
+                })
+        );
+        assert!(
+            frame_plan.usable[..frame_plan.usable_count]
+                .iter()
+                .all(|usable| !usable.overlaps(plan.reservation))
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2a_initrd_plan_rejects_missing_invalid_and_overlapping_ranges() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x8000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        let mut allocator_plan = Stage1AllocatorPlan::default();
+        allocator_plan.reserved[0] = Stage1AllocatorReservation {
+            range: Stage1KernelRange::new(0x1000_0000, 0x1100_0000),
+            reason: Stage1AllocatorReservationReason::Dtb,
+        };
+        allocator_plan.reserved_count = 1;
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::Missing)
+        );
+        info.initrd_start = Some(0x2000_0000);
+        info.initrd_end = Some(0x2000_0000);
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::InvalidRange)
+        );
+        info.initrd_start = Some(0x1008_0000);
+        info.initrd_end = Some(0x1010_0000);
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::OverlapsReserved)
+        );
+        info.initrd_start = Some(0x9000_0000);
+        info.initrd_end = Some(0x9001_0000);
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::OutsideFirmwareRam)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2a_cpio_accepts_newc_and_rejects_bad_magic() {
+        let mut archive = std::vec![b'0'; 116];
+        archive[..6].copy_from_slice(b"070701");
+        archive[54..62].copy_from_slice(b"00000000");
+        archive[94..102].copy_from_slice(b"00000005");
+        archive[110..115].copy_from_slice(b"init\0");
+        assert_eq!(rpi5_stage2a_cpio_first_name(&archive), Ok(&b"init"[..]));
+        archive[..6].copy_from_slice(b"070702");
+        assert_eq!(
+            rpi5_stage2a_cpio_first_name(&archive),
+            Err(Stage2ACpioFailure::BadMagic)
+        );
     }
 
     #[test]

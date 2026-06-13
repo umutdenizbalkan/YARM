@@ -47,6 +47,8 @@ for setting in 'kernel=kernel_2712.img' 'arm_64bit=1' 'enable_uart=1' 'uart_2nds
 done
 assert_not_contains "$default_boot/config.txt" 'os_check=0'
 assert_not_contains "$default_boot/config.txt" 'enable_rp1_uart=1'
+assert_not_contains "$default_boot/config.txt" 'initramfs '
+[[ ! -e "$default_boot/initramfs-stage2a.cpio" ]] || fail "default boot unexpectedly staged initrd"
 for marker in RPI5_BOOT_00_ENTRY RPI5_BOOT_01_DTB_PTR RPI5_BOOT_02_UART_SELECTED RPI5_BOOT_03_UART_OK; do
   assert_contains "$default_boot/README-RPI5-STAGE1.txt" "$marker"
 done
@@ -65,6 +67,21 @@ options_boot="$tmp_dir/options-boot"
 [[ $(<"$options_boot/cmdline.txt") == "yarm.platform=auto yarm.boot_phase=dtb yarm.max_cpus=1 console=ttyAMA10,115200 diagnostic=yes" ]] || fail "phase or cmdline extra was not generated correctly"
 assert_contains "$options_boot/config.txt" 'os_check=0'
 assert_contains "$options_boot/config.txt" 'enable_rp1_uart=1'
+
+initrd="$tmp_dir/fake-initramfs.cpio"
+printf '070701fake-stage2a-cpio\n' > "$initrd"
+initrd_boot="$tmp_dir/initrd-boot"
+"$generator" \
+  --kernel-input "$kernel" \
+  --initrd-input "$initrd" \
+  --boot-dir "$initrd_boot" \
+  --phase kernel >/dev/null
+assert_file "$initrd_boot/initramfs-stage2a.cpio"
+cmp "$initrd" "$initrd_boot/initramfs-stage2a.cpio" >/dev/null || fail "staged initrd differs from input"
+assert_contains "$initrd_boot/config.txt" 'initramfs initramfs-stage2a.cpio followkernel'
+assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" '--initrd-input build-aarch64/initramfs-core.cpio'
+assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" 'RPI5_STAGE2A_DONE'
+assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" 'It does not unpack the archive or spawn userspace.'
 
 if "$generator" --kernel-input "$kernel" --boot-dir "$default_boot" >"$tmp_dir/no-force.out" 2>&1; then
   fail "existing generated files were overwritten without --force"

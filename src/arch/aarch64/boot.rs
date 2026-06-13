@@ -987,8 +987,8 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
         RPI5_STAGE1_GICR_FRAME_STRIDE, RPI5_STAGE1_GICR_SCAN_FRAMES, Stage1KernelRange,
         Stage1MmuMemoryType, build_rpi5_stage1_kernel_bootstrap_record,
         parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
-        plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory,
-        rpi5_stage1_gicr_typer_plausible, rpi5_stage1_timer_delta,
+        plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory, plan_rpi5_stage2a_initrd,
+        rpi5_stage1_gicr_typer_plausible, rpi5_stage1_timer_delta, rpi5_stage2a_cpio_first_name,
     };
     use core::fmt::Write;
 
@@ -1471,10 +1471,6 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     }
     rpi5_emergency_marker(b"RPI5_KERNEL_TRAP_READY\r\n\0");
     rpi5_emergency_marker(b"RPI5_KERNEL_STATE_BEGIN\r\n\0");
-    if record.initrd_present {
-        kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=unexpected_initrd");
-        halt_stage1();
-    }
     if allocator.total_frames() as u64 != record.frame_total_pages
         || allocator.free_frames() as u64 != record.frame_free_pages
     {
@@ -1483,8 +1479,68 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     }
     rpi5_emergency_marker(b"RPI5_KERNEL_STATE_READY\r\n\0");
     kernel_diag!("RPI5_KERNEL_IRQ_DEFERRED reason=gic_init_sequence_not_reviewed");
-    kernel_diag!("RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE reason=no_initrd");
+    if !record.initrd_present {
+        kernel_diag!("RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE reason=no_initrd");
+    }
     rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_OK\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_INITRD_DETECT_BEGIN\r\n\0");
+    let (Some(initrd_start), Some(initrd_end)) = (info.initrd_start, info.initrd_end) else {
+        rpi5_emergency_marker(b"RPI5_INITRD_MISSING\r\n\0");
+        kernel_diag!("RPI5_STAGE2A_DEFERRED reason=no_initrd");
+        halt_stage1();
+    };
+    kernel_diag!(
+        "RPI5_INITRD_DTB_PROPS start=0x{:016x} end=0x{:016x}",
+        initrd_start,
+        initrd_end
+    );
+    let initrd_plan = match plan_rpi5_stage2a_initrd(&info, &allocator_plan) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_INITRD_INVALID reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2A_DEFERRED reason=invalid_initrd");
+            halt_stage1();
+        }
+    };
+    kernel_diag!(
+        "RPI5_INITRD_RANGE start=0x{:016x} end=0x{:016x} size=0x{:016x}",
+        initrd_plan.byte_range.start,
+        initrd_plan.byte_range.end,
+        initrd_plan.byte_range.end - initrd_plan.byte_range.start
+    );
+    kernel_diag!(
+        "RPI5_INITRD_RESERVED start=0x{:016x} end=0x{:016x}",
+        initrd_plan.reservation.start,
+        initrd_plan.reservation.end
+    );
+    rpi5_emergency_marker(b"RPI5_INITRD_CPIO_CHECK_BEGIN\r\n\0");
+    let initrd_size = initrd_plan.byte_range.end - initrd_plan.byte_range.start;
+    let Ok(initrd_size) = usize::try_from(initrd_size) else {
+        kernel_diag!("RPI5_INITRD_CPIO_INVALID reason=size_not_addressable");
+        kernel_diag!("RPI5_STAGE2A_DEFERRED reason=invalid_cpio");
+        halt_stage1();
+    };
+    let initrd = unsafe {
+        core::slice::from_raw_parts(initrd_plan.byte_range.start as *const u8, initrd_size)
+    };
+    let first_name = match rpi5_stage2a_cpio_first_name(initrd) {
+        Ok(name) => name,
+        Err(reason) => {
+            kernel_diag!("RPI5_INITRD_CPIO_INVALID reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2A_DEFERRED reason=invalid_cpio");
+            halt_stage1();
+        }
+    };
+    rpi5_emergency_marker(b"RPI5_INITRD_CPIO_MAGIC_OK\r\n\0");
+    let first_name = core::str::from_utf8(first_name).unwrap_or("<non-utf8>");
+    kernel_diag!("RPI5_INITRD_CPIO_FIRST_ENTRY name={}", first_name);
+    kernel_diag!(
+        "RPI5_INITRD_READY start=0x{:016x} end=0x{:016x}",
+        initrd_plan.byte_range.start,
+        initrd_plan.byte_range.end
+    );
+    rpi5_emergency_marker(b"RPI5_STAGE2A_DONE\r\n\0");
     halt_stage1();
 }
 
