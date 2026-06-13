@@ -30,7 +30,16 @@ secondary_boot_stacks_end:
     .type _start,%function
 _start:
     mov x20, x0
-    bl yarm_aarch64_raw_entry_marker
+    mov x21, x1
+    mov x22, x2
+    mov x23, x3
+    adrp x9, boot_stack_aarch64_end
+    add x9, x9, :lo12:boot_stack_aarch64_end
+    mov sp, x9
+    bl yarm_aarch64_marker_raw_entry
+    bl yarm_aarch64_marker_raw_after_marker
+    bl yarm_aarch64_marker_dtb_x0
+    bl yarm_aarch64_marker_bss_clear_begin
     adrp x1, __bss_start
     add x1, x1, :lo12:__bss_start
     adrp x2, __bss_end
@@ -42,12 +51,20 @@ _start:
     subs x2, x2, #8
     b.gt 1b
 2:
-    adrp x0, boot_stack_aarch64_end
-    add x0, x0, :lo12:boot_stack_aarch64_end
-    mov sp, x0
+    bl yarm_aarch64_marker_bss_clear_done
+    adrp x9, boot_stack_aarch64_end
+    add x9, x9, :lo12:boot_stack_aarch64_end
+    mov sp, x9
+    bl yarm_aarch64_marker_stack_ready
+    bl yarm_aarch64_marker_before_el1
     bl yarm_aarch64_enter_el1_if_needed
+    bl yarm_aarch64_marker_after_el1
     bl yarm_aarch64_enable_fp_simd
+    bl yarm_aarch64_marker_before_rust
     mov x0, x20
+    mov x1, x21
+    mov x2, x22
+    mov x3, x23
     bl yarm_aarch64_select_early_console
     bl yarm_aarch64_boot_breadcrumb_b0
     bl yarm_aarch64_boot_marker_start
@@ -108,38 +125,144 @@ yarm_aarch64_enter_el1_if_needed:
 global_asm!(
     r#"
     .section .text.boot,"ax",@progbits
-    .type yarm_aarch64_raw_entry_marker,%function
-yarm_aarch64_raw_entry_marker:
+    .macro rpi5_fixed_marker name, label
+    .global \name
+    .type \name,%function
+\name:
+    stp x9, x30, [sp, #-16]!
+    adr x9, \label
+    bl .Lrpi5_emergency_write_x9
+    ldp x9, x30, [sp], #16
+    ret
+    .endm
+
+    rpi5_fixed_marker yarm_aarch64_marker_raw_entry, .Lrpi5_raw_entry
+    rpi5_fixed_marker yarm_aarch64_marker_raw_after_marker, .Lrpi5_raw_after_marker
+    rpi5_fixed_marker yarm_aarch64_marker_bss_clear_begin, .Lrpi5_bss_clear_begin
+    rpi5_fixed_marker yarm_aarch64_marker_bss_clear_done, .Lrpi5_bss_clear_done
+    rpi5_fixed_marker yarm_aarch64_marker_stack_ready, .Lrpi5_stack_ready
+    rpi5_fixed_marker yarm_aarch64_marker_before_el1, .Lrpi5_before_el1
+    rpi5_fixed_marker yarm_aarch64_marker_after_el1, .Lrpi5_after_el1
+    rpi5_fixed_marker yarm_aarch64_marker_before_rust, .Lrpi5_before_rust
+
+    .type yarm_aarch64_marker_dtb_x0,%function
+yarm_aarch64_marker_dtb_x0:
+    stp x9, x10, [sp, #-16]!
+    stp x11, x12, [sp, #-16]!
+    stp x13, x14, [sp, #-16]!
+    stp x15, x30, [sp, #-16]!
+    adr x9, .Lrpi5_dtb_x0_prefix
+    bl .Lrpi5_emergency_write_x9
+    mov x10, x20
+    mov x11, #60
+.Lrpi5_dtb_x0_hex:
+    lsr x12, x10, x11
+    and x12, x12, #0xf
+    cmp x12, #10
+    add x13, x12, #'0'
+    add x14, x12, #('a' - 10)
+    csel x15, x13, x14, lo
+    bl .Lrpi5_emergency_write_byte_x15
+    subs x11, x11, #4
+    b.ge .Lrpi5_dtb_x0_hex
+    mov x15, #'\r'
+    bl .Lrpi5_emergency_write_byte_x15
+    mov x15, #'\n'
+    bl .Lrpi5_emergency_write_byte_x15
+    ldp x15, x30, [sp], #16
+    ldp x13, x14, [sp], #16
+    ldp x11, x12, [sp], #16
+    ldp x9, x10, [sp], #16
+    ret
+
+    .global yarm_aarch64_rpi5_emergency_write
+    .type yarm_aarch64_rpi5_emergency_write,%function
+yarm_aarch64_rpi5_emergency_write:
+    stp x9, x10, [sp, #-16]!
+    stp x11, x12, [sp, #-16]!
+    stp x13, x15, [sp, #-16]!
+    stp x0, x30, [sp, #-16]!
+    mov x9, x0
+    bl .Lrpi5_emergency_write_x9
+    ldp x0, x30, [sp], #16
+    ldp x13, x15, [sp], #16
+    ldp x11, x12, [sp], #16
+    ldp x9, x10, [sp], #16
+    ret
+
+.Lrpi5_emergency_write_x9:
+    stp x10, x11, [sp, #-16]!
+    stp x12, x13, [sp, #-16]!
     // The Pi 5 Stage 1 DTB parser translates the preferred
     // /soc@107c000000/serial@7d001000 PL011 to 0x107d001000.  This raw
     // pre-BSS path deliberately uses that same physical base; it does not
     // consult console globals or attempt to configure clocks/divisors.
-    movz x9, #0x1000
-    movk x9, #0x7d00, lsl #16
-    movk x9, #0x0010, lsl #32
-    adr x10, .Lrpi5_raw_entry
-.Lrpi5_raw_entry_next:
-    ldrb w11, [x10], #1
+    movz x10, #0x1000
+    movk x10, #0x7d00, lsl #16
+    movk x10, #0x0010, lsl #32
+.Lrpi5_emergency_write_next:
+    ldrb w11, [x9], #1
     cbz w11, .Lrpi5_raw_entry_done
     movz x12, #0x0010, lsl #16
 .Lrpi5_raw_entry_wait:
-    ldr w13, [x9, #0x18]
+    ldr w13, [x10, #0x18]
     tbz w13, #5, .Lrpi5_raw_entry_send
     subs x12, x12, #1
     b.ne .Lrpi5_raw_entry_wait
     b .Lrpi5_raw_entry_done
 .Lrpi5_raw_entry_send:
     dsb sy
-    str w11, [x9]
+    str w11, [x10]
     dsb sy
-    b .Lrpi5_raw_entry_next
+    b .Lrpi5_emergency_write_next
 .Lrpi5_raw_entry_done:
+    ldp x12, x13, [sp], #16
+    ldp x10, x11, [sp], #16
+    ret
+
+// Writes x15 while preserving the pointer/value registers used by callers.
+.Lrpi5_emergency_write_byte_x15:
+    stp x10, x12, [sp, #-16]!
+    stp x13, x30, [sp, #-16]!
+    movz x10, #0x1000
+    movk x10, #0x7d00, lsl #16
+    movk x10, #0x0010, lsl #32
+    movz x12, #0x0010, lsl #16
+1:
+    ldr w13, [x10, #0x18]
+    tbz w13, #5, 2f
+    subs x12, x12, #1
+    b.ne 1b
+    b 3f
+2:
+    dsb sy
+    str w15, [x10]
+    dsb sy
+3:
+    ldp x13, x30, [sp], #16
+    ldp x10, x12, [sp], #16
     ret
 
     .section .rodata.rpi5_raw_entry,"a",@progbits
     .balign 8
 .Lrpi5_raw_entry:
     .asciz "RPI5_RAW_ENTRY\r\n"
+.Lrpi5_raw_after_marker:
+    .asciz "RPI5_RAW_AFTER_MARKER\r\n"
+.Lrpi5_dtb_x0_prefix:
+    .asciz "RPI5_DTB_X0 value=0x"
+.Lrpi5_bss_clear_begin:
+    .asciz "RPI5_BSS_CLEAR_BEGIN\r\n"
+.Lrpi5_bss_clear_done:
+    .asciz "RPI5_BSS_CLEAR_DONE\r\n"
+.Lrpi5_stack_ready:
+    .asciz "RPI5_STACK_READY\r\n"
+.Lrpi5_before_el1:
+    .asciz "RPI5_BEFORE_EL1\r\n"
+.Lrpi5_after_el1:
+    .asciz "RPI5_AFTER_EL1\r\n"
+.Lrpi5_before_rust:
+    .asciz "RPI5_BEFORE_RUST\r\n"
     "#
 );
 
@@ -151,9 +274,21 @@ yarm_aarch64_raw_entry_marker:
 global_asm!(
     r#"
     .section .text.boot,"ax",@progbits
-    .type yarm_aarch64_raw_entry_marker,%function
-yarm_aarch64_raw_entry_marker:
+    .macro rpi5_noop_marker name
+    .global \name
+    .type \name,%function
+\name:
     ret
+    .endm
+    rpi5_noop_marker yarm_aarch64_marker_raw_entry
+    rpi5_noop_marker yarm_aarch64_marker_raw_after_marker
+    rpi5_noop_marker yarm_aarch64_marker_dtb_x0
+    rpi5_noop_marker yarm_aarch64_marker_bss_clear_begin
+    rpi5_noop_marker yarm_aarch64_marker_bss_clear_done
+    rpi5_noop_marker yarm_aarch64_marker_stack_ready
+    rpi5_noop_marker yarm_aarch64_marker_before_el1
+    rpi5_noop_marker yarm_aarch64_marker_after_el1
+    rpi5_noop_marker yarm_aarch64_marker_before_rust
     "#
 );
 
@@ -480,12 +615,37 @@ fn halt_stage1() -> ! {
     }
 }
 
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+#[inline(always)]
+fn rpi5_emergency_marker(marker: &'static [u8]) {
+    unsafe extern "C" {
+        fn yarm_aarch64_rpi5_emergency_write(marker: *const u8);
+    }
+    unsafe {
+        yarm_aarch64_rpi5_emergency_write(marker.as_ptr());
+    }
+}
+
+#[cfg(any(
+    feature = "hosted-dev",
+    not(target_arch = "aarch64"),
+    not(feature = "rpi5-stage1")
+))]
+#[inline(always)]
+fn rpi5_emergency_marker(_marker: &'static [u8]) {}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
     use crate::arch::aarch64_boot_policy::DetectedPlatform;
     use crate::kernel::boot_command_line::{BootPhase, PlatformOption, parse_yarm_boot_options};
 
+    rpi5_emergency_marker(b"RPI5_RUST_ENTRY\0");
+    rpi5_emergency_marker(b"RPI5_DTB_PARSE_BEGIN\0");
     let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
         // Preserve the direct-kernel QEMU fallback when no firmware DTB can be read.
         crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
@@ -494,8 +654,11 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
     let Some(info) = crate::arch::aarch64_boot_policy::parse_platform_dtb(dtb) else {
         return;
     };
+    rpi5_emergency_marker(b"RPI5_DTB_PARSE_DONE\0");
+    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_BEGIN\0");
     let raw = crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]);
     let options = parse_yarm_boot_options(raw);
+    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_DONE\0");
     let selected = match options.platform {
         PlatformOption::Auto => info.platform,
         PlatformOption::QemuVirt => DetectedPlatform::QemuVirt,

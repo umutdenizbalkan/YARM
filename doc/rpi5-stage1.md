@@ -85,19 +85,35 @@ The expected UART markers are:
 
 ```text
 RPI5_RAW_ENTRY
+RPI5_RAW_AFTER_MARKER
+RPI5_DTB_X0 value=0x...
+RPI5_BSS_CLEAR_BEGIN
+RPI5_BSS_CLEAR_DONE
+RPI5_STACK_READY
+RPI5_BEFORE_EL1
+RPI5_AFTER_EL1
+RPI5_BEFORE_RUST
+RPI5_RUST_ENTRY
+RPI5_DTB_PARSE_BEGIN
+RPI5_DTB_PARSE_DONE
+RPI5_BOOT_OPTIONS_BEGIN
+RPI5_BOOT_OPTIONS_DONE
 RPI5_BOOT_00_ENTRY
 RPI5_BOOT_01_DTB_PTR value=...
 RPI5_BOOT_02_UART_SELECTED path=... base=...
 RPI5_BOOT_03_UART_OK
 ```
 
-`RPI5_RAW_ENTRY` is emitted directly from `_start`, before BSS clearing, stack setup, Rust, DTB
-parsing, MMU work, or console initialization. The RPi5-only assembly path uses the same translated
-physical PL011 base (`0x107d001000`) produced by the existing preferred-node DTB path for
+`RPI5_RAW_ENTRY` is emitted directly from `_start`, before BSS clearing, Rust, DTB parsing, MMU
+work, or console initialization. A temporary boot stack is established first so every register used
+by the emergency writer can be saved and restored explicitly. The RPi5-only assembly path uses the
+same translated physical PL011 base (`0x107d001000`) produced by the existing preferred-node DTB path for
 `/soc@107c000000/serial@7d001000`. It retains firmware UART configuration, fences each MMIO write,
 and abandons the marker after a bounded transmitter-ready poll rather than hanging entry forever.
-The firmware DTB pointer in `x0` is copied to `x20` before the marker and restored before the first
-Rust call. QEMU builds compile the marker routine to a no-op and retain their `0x40080000` entry.
+The firmware handoff registers `x0` through `x3` are copied to `x20` through `x23` before the first
+marker and restored before the first Rust call. `RPI5_DTB_X0` prints the saved DTB pointer as sixteen
+hex digits using the same emergency writer. QEMU builds compile the assembly marker routines to
+no-ops, compile the Rust marker helper to an empty function, and retain their `0x40080000` entry.
 
 ## Explicit non-goals
 

@@ -24,9 +24,35 @@ fn raw_entry_marker_is_confined_to_the_rpi5_stage1_feature() {
     let feature_gate = boot[..marker]
         .rfind("feature = \"rpi5-stage1\"")
         .expect("RPi5 feature gate before raw marker");
-    assert!(marker - feature_gate < 2_000);
-    assert!(boot.contains("_start:\n    mov x20, x0\n    bl yarm_aarch64_raw_entry_marker"));
-    assert!(boot.contains("mov x0, x20\n    bl yarm_aarch64_select_early_console"));
+    assert!(marker - feature_gate < 8_000);
+    assert!(boot.contains("_start:\n    mov x20, x0\n    mov x21, x1"));
+    assert!(boot.contains("mov x0, x20\n    mov x1, x21\n    mov x2, x22\n    mov x3, x23"));
+    assert!(boot.contains("bl yarm_aarch64_select_early_console"));
+    assert!(boot.contains("stp x9, x10, [sp, #-16]!"));
+    assert!(boot.contains("ldp x9, x10, [sp], #16"));
+}
+
+#[test]
+fn raw_entry_breadcrumb_ladder_has_all_expected_markers() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    for marker in [
+        "RPI5_RAW_ENTRY",
+        "RPI5_RAW_AFTER_MARKER",
+        "RPI5_DTB_X0 value=0x",
+        "RPI5_BSS_CLEAR_BEGIN",
+        "RPI5_BSS_CLEAR_DONE",
+        "RPI5_STACK_READY",
+        "RPI5_BEFORE_EL1",
+        "RPI5_AFTER_EL1",
+        "RPI5_BEFORE_RUST",
+        "RPI5_RUST_ENTRY",
+        "RPI5_BOOT_OPTIONS_BEGIN",
+        "RPI5_BOOT_OPTIONS_DONE",
+        "RPI5_DTB_PARSE_BEGIN",
+        "RPI5_DTB_PARSE_DONE",
+    ] {
+        assert!(boot.contains(marker), "missing breadcrumb {marker}");
+    }
 }
 
 #[test]
