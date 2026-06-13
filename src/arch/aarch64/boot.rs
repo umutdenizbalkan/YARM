@@ -985,7 +985,8 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
 fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     use crate::arch::aarch64_boot_policy::{
         Stage1KernelRange, Stage1MmuMemoryType, parse_platform_dtb_diagnostics,
-        plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory,
+        plan_rpi5_stage1_allocator_handoff, plan_rpi5_stage1_identity_map,
+        plan_rpi5_stage1_kernel_memory,
     };
     use core::fmt::Write;
 
@@ -1161,6 +1162,112 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
         halt_stage1();
     }
     rpi5_emergency_marker(b"RPI5_KERNEL_CORE_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_ALLOC_PLAN_BEGIN\r\n\0");
+    let allocator_plan = match plan_rpi5_stage1_allocator_handoff(&info, &plan) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    for reserved in &allocator_plan.reserved[..allocator_plan.reserved_count] {
+        kernel_diag!(
+            "RPI5_ALLOC_RESERVED start=0x{:016x} end=0x{:016x} reason={}",
+            reserved.range.start,
+            reserved.range.end,
+            reserved.reason.label()
+        );
+    }
+    for usable in &allocator_plan.usable[..allocator_plan.usable_count] {
+        kernel_diag!(
+            "RPI5_ALLOC_USABLE start=0x{:016x} end=0x{:016x}",
+            usable.start,
+            usable.end
+        );
+    }
+    kernel_diag!(
+        "RPI5_EARLY_HEAP_READY start=0x{:016x} end=0x{:016x}",
+        plan.early_heap.start,
+        plan.early_heap.end
+    );
+
+    use crate::kernel::frame_allocator::{MemoryRegion, PhysicalFrameAllocator};
+    if core::mem::size_of::<PhysicalFrameAllocator>()
+        > (plan.early_heap.end - plan.early_heap.start) as usize
+        || plan.early_heap.start % core::mem::align_of::<PhysicalFrameAllocator>() as u64 != 0
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=early_heap_metadata_fit");
+        halt_stage1();
+    }
+    let mut regions = [MemoryRegion {
+        start: 0,
+        len: 0,
+        usable: false,
+    }; crate::arch::aarch64_boot_policy::MAX_STAGE1_ALLOC_USABLE_RANGES];
+    for (slot, usable) in regions
+        .iter_mut()
+        .zip(&allocator_plan.usable[..allocator_plan.usable_count])
+    {
+        *slot = MemoryRegion {
+            start: usable.start,
+            len: usable.end - usable.start,
+            usable: true,
+        };
+    }
+    let allocator_ptr = plan.early_heap.start as *mut PhysicalFrameAllocator;
+    unsafe {
+        core::ptr::write(allocator_ptr, PhysicalFrameAllocator::new_uninit());
+    }
+    let allocator = unsafe { &mut *allocator_ptr };
+    if allocator
+        .init_from_memory_map(&regions[..allocator_plan.usable_count])
+        .is_err()
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_allocator_init");
+        halt_stage1();
+    }
+    kernel_diag!(
+        "RPI5_FRAME_ALLOC_READY total_pages={} free_pages={}",
+        allocator.total_frames(),
+        allocator.free_frames()
+    );
+    if allocator.total_frames() as u64 != allocator_plan.total_pages
+        || allocator.free_frames() != allocator.total_frames()
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_count_mismatch");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_FRAME_ALLOC_TEST_BEGIN\r\n\0");
+    let initial_free = allocator.free_frames();
+    let test_frame = match allocator.alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_alloc_test");
+            halt_stage1();
+        }
+    };
+    kernel_diag!("RPI5_FRAME_ALLOC_TEST_PAGE phys=0x{:016x}", test_frame);
+    let test_range = Stage1KernelRange::new(test_frame, test_frame + RPI5_STAGE1_PAGE_SIZE);
+    if test_frame % RPI5_STAGE1_PAGE_SIZE != 0
+        || !allocator_plan.usable[..allocator_plan.usable_count]
+            .iter()
+            .any(|usable| usable.start <= test_range.start && usable.end >= test_range.end)
+        || allocator_plan.reserved[..allocator_plan.reserved_count]
+            .iter()
+            .any(|reserved| test_range.overlaps(reserved.range))
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_alloc_test_range");
+        halt_stage1();
+    }
+    if allocator.free_frame(test_frame).is_err() || allocator.free_frames() != initial_free {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_free_test");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_FRAME_ALLOC_TEST_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_ALLOC_PLAN_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_ALLOCATOR_READY\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_CORE_ALLOC_DONE\r\n\0");
     halt_stage1();
 }
 

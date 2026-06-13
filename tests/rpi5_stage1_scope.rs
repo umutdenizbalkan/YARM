@@ -210,6 +210,17 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_MMU_ENABLE_DONE",
         "RPI5_UART_AFTER_MMU_OK",
         "RPI5_KERNEL_CORE_DONE",
+        "RPI5_ALLOC_PLAN_BEGIN",
+        "RPI5_ALLOC_RESERVED",
+        "RPI5_ALLOC_USABLE",
+        "RPI5_EARLY_HEAP_READY",
+        "RPI5_FRAME_ALLOC_READY",
+        "RPI5_FRAME_ALLOC_TEST_BEGIN",
+        "RPI5_FRAME_ALLOC_TEST_PAGE",
+        "RPI5_FRAME_ALLOC_TEST_DONE",
+        "RPI5_ALLOC_PLAN_DONE",
+        "RPI5_KERNEL_ALLOCATOR_READY",
+        "RPI5_KERNEL_CORE_ALLOC_DONE",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -240,6 +251,7 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(policy.contains("const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024"));
     assert!(policy.contains("plan_rpi5_stage1_kernel_memory"));
     assert!(policy.contains("plan_rpi5_stage1_identity_map"));
+    assert!(policy.contains("plan_rpi5_stage1_allocator_handoff"));
     assert!(policy.contains("Stage1KernelRange::new(0, RPI5_FIRMWARE_LOW_RESERVED_END)"));
     assert!(diagnostics.contains("rpi5_stage1_build_identity_tables"));
     assert!(diagnostics.contains("rpi5_stage1_enable_identity_mmu"));
@@ -252,6 +264,10 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(diagnostics.contains("\"tlbi vmalle1\""));
     assert!(diagnostics.contains("\"msr SCTLR_EL1, {0}\""));
     assert!(!diagnostics.contains("RPI5_MMU_DEFERRED"));
+    assert!(diagnostics.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(diagnostics.contains("allocator.alloc_frame()"));
+    assert!(diagnostics.contains("allocator.free_frame(test_frame)"));
+    assert!(diagnostics.contains("plan.early_heap.start as *mut PhysicalFrameAllocator"));
 }
 
 #[test]

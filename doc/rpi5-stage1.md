@@ -245,6 +245,24 @@ while setting M, C, and I. A pre-enabled MMU or failed SCTLR.M readback emits
 `RPI5_UART_AFTER_MMU_OK`, emits `RPI5_KERNEL_CORE_DONE`, and halts before production kernel or
 userspace initialization.
 
+Stage 1F converts the same firmware memory and reservation plan into sorted, page-aligned input for
+the kernel `PhysicalFrameAllocator`. Reservations include low firmware memory, the kernel image,
+DTB, Stage1E page-table pool, the complete early heap, and every nonzero firmware reserved-memory
+range. Usable starts round up and ends round down to 4 KiB boundaries; an overlap with any
+reservation fails closed.
+
+The allocator object itself is placed at the beginning of the reserved
+`0x5b90000..0x5d90000` early heap, so its fixed metadata cannot consume a frame later advertised as
+free. On the hardware-proven plan the installed usable extents are
+`0x5d90000..0x2efec000`, `0x2f000000..0x3fc00000`, and
+`0x40000000..0x80000000`. Stage 1F allocates the first 4 KiB frame, verifies alignment, usable-range
+containment, and non-overlap with every reservation, then releases it and verifies the free-page
+count is restored. No frame is intentionally leaked.
+
+All Stage1F status and failure markers use the bounded Stage1 line/emergency writers. Success emits
+`RPI5_KERNEL_ALLOCATOR_READY` and `RPI5_KERNEL_CORE_ALLOC_DONE`, then halts without installing a
+scheduler, initializing interrupts or devices, or entering userspace.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

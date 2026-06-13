@@ -208,6 +208,8 @@ pub struct Stage1MmuMapping {
 }
 
 pub const MAX_STAGE1_MMU_MAPPINGS: usize = MAX_DIAGNOSTIC_RANGES + 1;
+pub const MAX_STAGE1_ALLOC_RESERVED_RANGES: usize = MAX_STAGE1_KERNEL_RESERVED_RANGES + 2;
+pub const MAX_STAGE1_ALLOC_USABLE_RANGES: usize = MAX_STAGE1_KERNEL_USABLE_RANGES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stage1MmuPlan {
@@ -254,6 +256,79 @@ impl Stage1MmuPlanFailure {
             Self::DtbNotMapped => "dtb_not_mapped",
             Self::PageTablePoolNotMapped => "pt_pool_not_mapped",
             Self::EarlyHeapNotMapped => "early_heap_not_mapped",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1AllocatorReservationReason {
+    #[default]
+    LowFirmware,
+    Kernel,
+    Dtb,
+    FirmwareReserved,
+    PageTablePool,
+    EarlyHeap,
+}
+
+impl Stage1AllocatorReservationReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LowFirmware => "low_firmware",
+            Self::Kernel => "kernel",
+            Self::Dtb => "dtb",
+            Self::FirmwareReserved => "firmware_reserved",
+            Self::PageTablePool => "page_table_pool",
+            Self::EarlyHeap => "early_heap",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage1AllocatorReservation {
+    pub range: Stage1KernelRange,
+    pub reason: Stage1AllocatorReservationReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1AllocatorPlan {
+    pub reserved: [Stage1AllocatorReservation; MAX_STAGE1_ALLOC_RESERVED_RANGES],
+    pub reserved_count: usize,
+    pub usable: [Stage1KernelRange; MAX_STAGE1_ALLOC_USABLE_RANGES],
+    pub usable_count: usize,
+    pub total_pages: u64,
+}
+
+impl Default for Stage1AllocatorPlan {
+    fn default() -> Self {
+        Self {
+            reserved: [Stage1AllocatorReservation::default(); MAX_STAGE1_ALLOC_RESERVED_RANGES],
+            reserved_count: 0,
+            usable: [Stage1KernelRange::default(); MAX_STAGE1_ALLOC_USABLE_RANGES],
+            usable_count: 0,
+            total_pages: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1AllocatorPlanFailure {
+    #[default]
+    ReservedCapacity,
+    UsableCapacity,
+    AddressOverflow,
+    NoUsableFrames,
+    UsableOverlapsReserved,
+}
+
+impl Stage1AllocatorPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReservedCapacity => "reserved_capacity",
+            Self::UsableCapacity => "usable_capacity",
+            Self::AddressOverflow => "address_overflow",
+            Self::NoUsableFrames => "no_usable_frames",
+            Self::UsableOverlapsReserved => "usable_overlaps_reserved",
         }
     }
 }
@@ -427,6 +502,169 @@ pub fn plan_rpi5_stage1_kernel_memory(
     plan.usable_ranges[..free_count].copy_from_slice(&free[..free_count]);
     plan.usable_range_count = free_count;
     Ok(plan)
+}
+
+pub fn plan_rpi5_stage1_allocator_handoff(
+    info: &PlatformDtbDiagnostics,
+    kernel_plan: &Stage1KernelPlan,
+) -> Result<Stage1AllocatorPlan, Stage1AllocatorPlanFailure> {
+    let mut plan = Stage1AllocatorPlan::default();
+    for (index, range) in kernel_plan.reserved_ranges[..kernel_plan.reserved_range_count]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let reason = match index {
+            0 => Stage1AllocatorReservationReason::LowFirmware,
+            1 => Stage1AllocatorReservationReason::Kernel,
+            2 => Stage1AllocatorReservationReason::Dtb,
+            _ => Stage1AllocatorReservationReason::FirmwareReserved,
+        };
+        append_stage1_allocator_reserved(&mut plan, range, reason)?;
+    }
+    append_stage1_allocator_reserved(
+        &mut plan,
+        kernel_plan.page_table_pool,
+        Stage1AllocatorReservationReason::PageTablePool,
+    )?;
+    append_stage1_allocator_reserved(
+        &mut plan,
+        kernel_plan.early_heap,
+        Stage1AllocatorReservationReason::EarlyHeap,
+    )?;
+
+    let mut free = [Stage1KernelRange::default(); MAX_STAGE1_ALLOC_USABLE_RANGES];
+    let mut free_count = 0usize;
+    for range in &info.memory_ranges[..info.memory_range_count] {
+        if range.size == 0 {
+            continue;
+        }
+        append_stage1_allocator_usable(
+            &mut free,
+            &mut free_count,
+            Stage1KernelRange::new(
+                range.start,
+                range
+                    .start
+                    .checked_add(range.size)
+                    .ok_or(Stage1AllocatorPlanFailure::AddressOverflow)?,
+            ),
+        )?;
+    }
+    for reserved in &plan.reserved[..plan.reserved_count] {
+        subtract_stage1_allocator_range(&mut free, &mut free_count, reserved.range)?;
+    }
+
+    let mut aligned_count = 0usize;
+    for range in free[..free_count].iter().copied() {
+        let start = align_up_u64_policy(range.start, STAGE1_PAGE_SIZE)
+            .ok_or(Stage1AllocatorPlanFailure::AddressOverflow)?;
+        let end = align_down_u64_policy(range.end, STAGE1_PAGE_SIZE);
+        if end <= start {
+            continue;
+        }
+        plan.usable[aligned_count] = Stage1KernelRange::new(start, end);
+        aligned_count += 1;
+    }
+    plan.usable_count = aligned_count;
+    sort_stage1_ranges(&mut plan.usable, plan.usable_count);
+    for usable in &plan.usable[..plan.usable_count] {
+        if plan.reserved[..plan.reserved_count]
+            .iter()
+            .any(|reserved| usable.overlaps(reserved.range))
+        {
+            return Err(Stage1AllocatorPlanFailure::UsableOverlapsReserved);
+        }
+        plan.total_pages = plan
+            .total_pages
+            .checked_add((usable.end - usable.start) / STAGE1_PAGE_SIZE)
+            .ok_or(Stage1AllocatorPlanFailure::AddressOverflow)?;
+    }
+    if plan.total_pages == 0 {
+        return Err(Stage1AllocatorPlanFailure::NoUsableFrames);
+    }
+    Ok(plan)
+}
+
+fn append_stage1_allocator_reserved(
+    plan: &mut Stage1AllocatorPlan,
+    range: Stage1KernelRange,
+    reason: Stage1AllocatorReservationReason,
+) -> Result<(), Stage1AllocatorPlanFailure> {
+    if range.is_empty()
+        || plan.reserved[..plan.reserved_count]
+            .iter()
+            .any(|existing| existing.range == range)
+    {
+        return Ok(());
+    }
+    if plan.reserved_count == plan.reserved.len() {
+        return Err(Stage1AllocatorPlanFailure::ReservedCapacity);
+    }
+    plan.reserved[plan.reserved_count] = Stage1AllocatorReservation { range, reason };
+    plan.reserved_count += 1;
+    Ok(())
+}
+
+fn append_stage1_allocator_usable<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    range: Stage1KernelRange,
+) -> Result<(), Stage1AllocatorPlanFailure> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    if *count == N {
+        return Err(Stage1AllocatorPlanFailure::UsableCapacity);
+    }
+    ranges[*count] = range;
+    *count += 1;
+    Ok(())
+}
+
+fn subtract_stage1_allocator_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    reserved: Stage1KernelRange,
+) -> Result<(), Stage1AllocatorPlanFailure> {
+    let mut index = 0usize;
+    while index < *count {
+        let current = ranges[index];
+        if !current.overlaps(reserved) {
+            index += 1;
+            continue;
+        }
+        let left = Stage1KernelRange::new(current.start, current.end.min(reserved.start));
+        let right = Stage1KernelRange::new(current.start.max(reserved.end), current.end);
+        if left.is_empty() {
+            ranges[index] = right;
+            if right.is_empty() {
+                ranges.copy_within(index + 1..*count, index);
+                *count -= 1;
+            } else {
+                index += 1;
+            }
+        } else {
+            ranges[index] = left;
+            index += 1;
+            if !right.is_empty() {
+                append_stage1_allocator_usable(ranges, count, right)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sort_stage1_ranges<const N: usize>(ranges: &mut [Stage1KernelRange; N], count: usize) {
+    for index in 1..count {
+        let current = ranges[index];
+        let mut position = index;
+        while position > 0 && ranges[position - 1].start > current.start {
+            ranges[position] = ranges[position - 1];
+            position -= 1;
+        }
+        ranges[position] = current;
+    }
 }
 
 pub fn plan_rpi5_stage1_identity_map(
@@ -2184,6 +2422,103 @@ mod tests {
             ),
             Err(Stage1MmuPlanFailure::PageTablePoolNotMapped)
         );
+    }
+
+    #[test]
+    fn rpi5_stage1_allocator_handoff_is_sorted_aligned_and_excludes_reservations() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        let mut kernel_plan = Stage1KernelPlan::default();
+        kernel_plan.reserved_ranges[0] = Stage1KernelRange::new(0, 0x80000);
+        kernel_plan.reserved_ranges[1] = Stage1KernelRange::new(0x80000, 0x5b50_000);
+        kernel_plan.reserved_ranges[2] = Stage1KernelRange::new(0x2efe_c600, 0x2eff_ff4e);
+        kernel_plan.reserved_ranges[3] = Stage1KernelRange::new(0x3fd2_3180, 0x3fd2_31be);
+        kernel_plan.reserved_range_count = 4;
+        kernel_plan.page_table_pool = Stage1KernelRange::new(0x5b50_000, 0x5b90_000);
+        kernel_plan.early_heap = Stage1KernelRange::new(0x5b90_000, 0x5d90_000);
+
+        let plan = plan_rpi5_stage1_allocator_handoff(&info, &kernel_plan).unwrap();
+        assert_eq!(plan.reserved_count, 6);
+        assert_eq!(
+            plan.reserved[4],
+            Stage1AllocatorReservation {
+                range: kernel_plan.page_table_pool,
+                reason: Stage1AllocatorReservationReason::PageTablePool,
+            }
+        );
+        assert_eq!(
+            plan.reserved[5],
+            Stage1AllocatorReservation {
+                range: kernel_plan.early_heap,
+                reason: Stage1AllocatorReservationReason::EarlyHeap,
+            }
+        );
+        assert_eq!(
+            &plan.usable[..plan.usable_count],
+            &[
+                Stage1KernelRange::new(0x5d90_000, 0x2efe_c000),
+                Stage1KernelRange::new(0x2f00_0000, 0x3fc0_0000),
+                Stage1KernelRange::new(0x4000_0000, 0x8000_0000),
+            ]
+        );
+        for (index, usable) in plan.usable[..plan.usable_count].iter().enumerate() {
+            assert_eq!(usable.start % STAGE1_PAGE_SIZE, 0);
+            assert_eq!(usable.end % STAGE1_PAGE_SIZE, 0);
+            if index != 0 {
+                assert!(plan.usable[index - 1].start < usable.start);
+            }
+            for reserved in &plan.reserved[..plan.reserved_count] {
+                assert!(!usable.overlaps(reserved.range));
+            }
+        }
+        let test_frame = plan.usable[0].start;
+        assert_eq!(test_frame, 0x5d90_000);
+        assert_eq!(test_frame % STAGE1_PAGE_SIZE, 0);
+        let test_range = Stage1KernelRange::new(test_frame, test_frame + STAGE1_PAGE_SIZE);
+        assert!(
+            plan.reserved[..plan.reserved_count]
+                .iter()
+                .all(|reserved| !test_range.overlaps(reserved.range))
+        );
+        assert_eq!(
+            plan.total_pages,
+            plan.usable[..plan.usable_count]
+                .iter()
+                .map(|range| (range.end - range.start) / STAGE1_PAGE_SIZE)
+                .sum()
+        );
+        assert_eq!(plan.total_pages, 499_292);
+    }
+
+    #[test]
+    fn rpi5_stage1_allocator_handoff_does_not_require_initrd() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        let mut kernel_plan = Stage1KernelPlan::default();
+        kernel_plan.reserved_ranges[0] = Stage1KernelRange::new(0, 0x80000);
+        kernel_plan.reserved_ranges[1] = Stage1KernelRange::new(0x80000, 0x180000);
+        kernel_plan.reserved_ranges[2] = Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600);
+        kernel_plan.reserved_range_count = 3;
+        kernel_plan.page_table_pool = Stage1KernelRange::new(0x180000, 0x1c0000);
+        kernel_plan.early_heap = Stage1KernelRange::new(0x1c0000, 0x3c0000);
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert!(plan_rpi5_stage1_allocator_handoff(&info, &kernel_plan).is_ok());
     }
 
     #[test]
