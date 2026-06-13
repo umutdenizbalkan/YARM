@@ -263,6 +263,18 @@ All Stage1F status and failure markers use the bounded Stage1 line/emergency wri
 `RPI5_KERNEL_ALLOCATOR_READY` and `RPI5_KERNEL_CORE_ALLOC_DONE`, then halts without installing a
 scheduler, initializing interrupts or devices, or entering userspace.
 
+Stage 1G follows the allocator smoke with read-only timer and interrupt-controller diagnostics.
+It reads `CNTFRQ_EL0` and samples `CNTPCT_EL0` around a bounded 4096-iteration delay, rejecting a
+zero or backwards delta. It does not program `CNTP_CTL_EL0` or `CNTP_TVAL_EL0`.
+
+The identity map includes one device-nGnRE page for each DTB-discovered GIC distributor and
+redistributor base. Stage 1G reads only `GICD_TYPER` at offset `0x004`, `GICD_IIDR` at offset
+`0x008`, and the 64-bit `GICR_TYPER` at offset `0x008`. It performs no GIC writes and does not
+enable IRQs. The tree has no reviewed read-only register definition for the
+`brcm,bcm7271-l2-intc`, so the L2 probe deliberately emits
+`RPI5_L2_INTC_PROBE_DEFERRED reason=no_reviewed_read_only_offset` instead of guessing an offset.
+Success ends with `RPI5_IRQTIMER_DIAG_DONE` and `RPI5_KERNEL_IRQTIMER_READY`, then halts.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

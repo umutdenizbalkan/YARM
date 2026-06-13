@@ -128,6 +128,16 @@ pub enum DiagnosticPsciConduit {
     Hvc,
 }
 
+impl DiagnosticPsciConduit {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Smc => "smc",
+            Self::Hvc => "hvc",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DiagnosticPcieController {
     pub path: DtbPath,
@@ -722,6 +732,24 @@ pub fn plan_rpi5_stage1_identity_map(
             memory_type: Stage1MmuMemoryType::DeviceNgnre,
         },
     )?;
+    for base in [info.gic_dist_base, info.gic_redist_base]
+        .into_iter()
+        .flatten()
+    {
+        let page_start = align_down_u64_policy(base, STAGE1_PAGE_SIZE);
+        append_stage1_mmu_mapping(
+            &mut plan,
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(
+                    page_start,
+                    page_start
+                        .checked_add(STAGE1_PAGE_SIZE)
+                        .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+                ),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            },
+        )?;
+    }
 
     for (index, mapping) in plan.mappings[..plan.mapping_count].iter().enumerate() {
         if mapping.range.end > STAGE1_TTBR0_VA_LIMIT {
@@ -751,6 +779,13 @@ pub fn plan_rpi5_stage1_identity_map(
         }
     }
     Ok(plan)
+}
+
+pub const fn rpi5_stage1_timer_delta(begin: u64, end: u64) -> Option<u64> {
+    match end.checked_sub(begin) {
+        Some(0) | None => None,
+        Some(delta) => Some(delta),
+    }
 }
 
 fn append_stage1_mmu_mapping(
@@ -2348,6 +2383,8 @@ mod tests {
             no_map: false,
         };
         info.memory_range_count = 2;
+        info.gic_dist_base = Some(0x10_7fff_9000);
+        info.gic_redist_base = Some(0x10_7fff_a000);
         let kernel = Stage1KernelRange::new(0x80000, 0x5b50_000);
         let dtb = Stage1KernelRange::new(0x2efe_c600, 0x2eff_ff4e);
         let kernel_plan = Stage1KernelPlan {
@@ -2361,7 +2398,7 @@ mod tests {
             plan_rpi5_stage1_identity_map(&info, &kernel_plan, kernel, stack, dtb, 0x10_7d00_1000)
                 .unwrap();
         assert_eq!(plan.pt_pool, kernel_plan.page_table_pool);
-        assert_eq!(plan.mapping_count, 3);
+        assert_eq!(plan.mapping_count, 5);
         assert_eq!(
             plan.mappings[0],
             Stage1MmuMapping {
@@ -2380,6 +2417,20 @@ mod tests {
             plan.mappings[2],
             Stage1MmuMapping {
                 range: Stage1KernelRange::new(0x10_7d00_1000, 0x10_7d00_2000),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            }
+        );
+        assert_eq!(
+            plan.mappings[3],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x10_7fff_9000, 0x10_7fff_a000),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            }
+        );
+        assert_eq!(
+            plan.mappings[4],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x10_7fff_a000, 0x10_7fff_b000),
                 memory_type: Stage1MmuMemoryType::DeviceNgnre,
             }
         );
@@ -2519,6 +2570,21 @@ mod tests {
         assert_eq!(info.initrd_start, None);
         assert_eq!(info.initrd_end, None);
         assert!(plan_rpi5_stage1_allocator_handoff(&info, &kernel_plan).is_ok());
+    }
+
+    #[test]
+    fn rpi5_stage1_timer_diagnostic_rejects_non_incrementing_counter() {
+        assert_eq!(rpi5_stage1_timer_delta(100, 101), Some(1));
+        assert_eq!(rpi5_stage1_timer_delta(100, 100), None);
+        assert_eq!(rpi5_stage1_timer_delta(101, 100), None);
+    }
+
+    #[test]
+    fn rpi5_stage1_irqtimer_diagnostic_does_not_require_initrd() {
+        let info = PlatformDtbDiagnostics::default();
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert_eq!(rpi5_stage1_timer_delta(7, 9), Some(2));
     }
 
     #[test]

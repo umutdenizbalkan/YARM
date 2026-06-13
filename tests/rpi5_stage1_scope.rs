@@ -221,6 +221,23 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
         "RPI5_ALLOC_PLAN_DONE",
         "RPI5_KERNEL_ALLOCATOR_READY",
         "RPI5_KERNEL_CORE_ALLOC_DONE",
+        "RPI5_IRQTIMER_DIAG_BEGIN",
+        "RPI5_TIMER_CNTFRQ",
+        "RPI5_TIMER_CNTPCT_BEGIN",
+        "RPI5_TIMER_CNTPCT_END",
+        "RPI5_TIMER_CNTPCT_DELTA",
+        "RPI5_TIMER_COUNTER_OK",
+        "RPI5_PSCI_CONDUIT",
+        "RPI5_GICD_PROBE_BEGIN",
+        "RPI5_GICD_TYPER",
+        "RPI5_GICD_IIDR",
+        "RPI5_GICD_PROBE_DONE",
+        "RPI5_GICR_PROBE_BEGIN",
+        "RPI5_GICR_TYPER",
+        "RPI5_GICR_PROBE_DONE",
+        "RPI5_L2_INTC_PROBE_DEFERRED",
+        "RPI5_IRQTIMER_DIAG_DONE",
+        "RPI5_KERNEL_IRQTIMER_READY",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -268,6 +285,25 @@ fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     assert!(diagnostics.contains("allocator.alloc_frame()"));
     assert!(diagnostics.contains("allocator.free_frame(test_frame)"));
     assert!(diagnostics.contains("plan.early_heap.start as *mut PhysicalFrameAllocator"));
+    assert!(diagnostics.contains("\"mrs {0}, CNTFRQ_EL0\""));
+    assert!(diagnostics.contains("\"mrs {0}, CNTPCT_EL0\""));
+    assert!(diagnostics.contains("(gicd_base + 0x004) as *const u32"));
+    assert!(diagnostics.contains("(gicd_base + 0x008) as *const u32"));
+    assert!(diagnostics.contains("(gicr_base + 0x008) as *const u64"));
+    assert!(diagnostics.contains("core::ptr::read_volatile"));
+    assert!(diagnostics.contains("no_reviewed_read_only_offset"));
+    let stage1g_start = diagnostics.find("RPI5_IRQTIMER_DIAG_BEGIN").unwrap();
+    let stage1g_end = diagnostics[stage1g_start..]
+        .find("RPI5_KERNEL_IRQTIMER_READY")
+        .map(|offset| stage1g_start + offset)
+        .unwrap();
+    let stage1g = &diagnostics[stage1g_start..stage1g_end];
+    assert!(!stage1g.contains("write_volatile"));
+    assert!(!stage1g.contains("CNTP_CTL_EL0"));
+    assert!(!stage1g.contains("CNTP_TVAL_EL0"));
+    assert!(!stage1g.contains("GICD_CTLR"));
+    assert!(!stage1g.contains("ISENABLER"));
+    assert!(!stage1g.contains("ICENABLER"));
 }
 
 #[test]

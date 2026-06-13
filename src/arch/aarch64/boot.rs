@@ -986,7 +986,7 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     use crate::arch::aarch64_boot_policy::{
         Stage1KernelRange, Stage1MmuMemoryType, parse_platform_dtb_diagnostics,
         plan_rpi5_stage1_allocator_handoff, plan_rpi5_stage1_identity_map,
-        plan_rpi5_stage1_kernel_memory,
+        plan_rpi5_stage1_kernel_memory, rpi5_stage1_timer_delta,
     };
     use core::fmt::Write;
 
@@ -1268,6 +1268,75 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     rpi5_emergency_marker(b"RPI5_ALLOC_PLAN_DONE\r\n\0");
     rpi5_emergency_marker(b"RPI5_KERNEL_ALLOCATOR_READY\r\n\0");
     rpi5_emergency_marker(b"RPI5_KERNEL_CORE_ALLOC_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_IRQTIMER_DIAG_BEGIN\r\n\0");
+    let timer_frequency: u64;
+    let counter_begin: u64;
+    let counter_end: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, CNTFRQ_EL0",
+            out(reg) timer_frequency,
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "isb",
+            "mrs {0}, CNTPCT_EL0",
+            out(reg) counter_begin,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CNTFRQ value=0x{:016x}", timer_frequency);
+    if timer_frequency == 0 {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=counter_frequency_zero");
+        halt_stage1();
+    }
+    kernel_diag!("RPI5_TIMER_CNTPCT_BEGIN value=0x{:016x}", counter_begin);
+    for _ in 0..4096 {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        core::arch::asm!(
+            "isb",
+            "mrs {0}, CNTPCT_EL0",
+            out(reg) counter_end,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CNTPCT_END value=0x{:016x}", counter_end);
+    let Some(counter_delta) = rpi5_stage1_timer_delta(counter_begin, counter_end) else {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=counter_not_incrementing");
+        halt_stage1();
+    };
+    kernel_diag!("RPI5_TIMER_CNTPCT_DELTA value=0x{:016x}", counter_delta);
+    rpi5_emergency_marker(b"RPI5_TIMER_COUNTER_OK\r\n\0");
+    kernel_diag!("RPI5_PSCI_CONDUIT value={}", info.psci_conduit.label());
+
+    let Some(gicd_base) = info.gic_dist_base else {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=gicd_missing");
+        halt_stage1();
+    };
+    kernel_diag!("RPI5_GICD_PROBE_BEGIN base=0x{:016x}", gicd_base);
+    let gicd_typer = unsafe { core::ptr::read_volatile((gicd_base + 0x004) as *const u32) };
+    let gicd_iidr = unsafe { core::ptr::read_volatile((gicd_base + 0x008) as *const u32) };
+    kernel_diag!("RPI5_GICD_TYPER value=0x{:08x}", gicd_typer);
+    kernel_diag!("RPI5_GICD_IIDR value=0x{:08x}", gicd_iidr);
+    rpi5_emergency_marker(b"RPI5_GICD_PROBE_DONE\r\n\0");
+
+    let Some(gicr_base) = info.gic_redist_base else {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=gicr_missing");
+        halt_stage1();
+    };
+    kernel_diag!("RPI5_GICR_PROBE_BEGIN base=0x{:016x}", gicr_base);
+    let gicr_typer = unsafe { core::ptr::read_volatile((gicr_base + 0x008) as *const u64) };
+    kernel_diag!("RPI5_GICR_TYPER value=0x{:016x}", gicr_typer);
+    rpi5_emergency_marker(b"RPI5_GICR_PROBE_DONE\r\n\0");
+
+    // No reviewed read-only register definition for bcm7271-l2-intc is available
+    // in this tree. Do not infer one from production drivers or probe an offset.
+    kernel_diag!("RPI5_L2_INTC_PROBE_DEFERRED reason=no_reviewed_read_only_offset");
+    rpi5_emergency_marker(b"RPI5_IRQTIMER_DIAG_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_IRQTIMER_READY\r\n\0");
     halt_stage1();
 }
 
