@@ -179,7 +179,7 @@ fn rpi5_stage1b_diagnostics_are_bounded_lock_free_and_halt() {
 }
 
 #[test]
-fn rpi5_stage1d_kernel_plan_is_bounded_plan_only_and_precedes_userspace() {
+fn rpi5_stage1e_identity_mmu_is_bounded_and_precedes_userspace() {
     let boot = include_str!("../src/arch/aarch64/boot.rs");
     let policy = include_str!("../src/arch/aarch64_boot_policy.rs");
     let start = boot
@@ -201,7 +201,15 @@ fn rpi5_stage1d_kernel_plan_is_bounded_plan_only_and_precedes_userspace() {
         "RPI5_KERNEL_PT_POOL",
         "RPI5_KERNEL_EARLY_HEAP",
         "RPI5_KERNEL_PLAN_DONE",
-        "RPI5_MMU_DEFERRED reason=identity_map_builder_not_ready",
+        "RPI5_MMU_PLAN_BEGIN",
+        "RPI5_MMU_MAP_NORMAL",
+        "RPI5_MMU_MAP_DEVICE",
+        "RPI5_MMU_PT_ROOT",
+        "RPI5_MMU_PLAN_DONE",
+        "RPI5_MMU_ENABLE_BEGIN",
+        "RPI5_MMU_ENABLE_DONE",
+        "RPI5_UART_AFTER_MMU_OK",
+        "RPI5_KERNEL_CORE_DONE",
     ] {
         assert!(
             diagnostics.contains(marker),
@@ -231,7 +239,19 @@ fn rpi5_stage1d_kernel_plan_is_bounded_plan_only_and_precedes_userspace() {
     assert!(policy.contains("const STAGE1_PT_POOL_SIZE: u64 = 256 * 1024"));
     assert!(policy.contains("const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024"));
     assert!(policy.contains("plan_rpi5_stage1_kernel_memory"));
+    assert!(policy.contains("plan_rpi5_stage1_identity_map"));
     assert!(policy.contains("Stage1KernelRange::new(0, RPI5_FIRMWARE_LOW_RESERVED_END)"));
+    assert!(diagnostics.contains("rpi5_stage1_build_identity_tables"));
+    assert!(diagnostics.contains("rpi5_stage1_enable_identity_mmu"));
+    assert!(diagnostics.contains("next: plan.pt_pool.start"));
+    assert!(diagnostics.contains("end: plan.pt_pool.end"));
+    assert!(diagnostics.contains("return Err(\"pt_pool_exhausted\")"));
+    assert!(diagnostics.contains("RPI5_STAGE1_DEVICE_FLAGS"));
+    assert!(diagnostics.contains("RPI5_STAGE1_MAIR_EL1: u64 = 0x04ff"));
+    assert!(diagnostics.contains("RPI5_STAGE1_TCR_EL1"));
+    assert!(diagnostics.contains("\"tlbi vmalle1\""));
+    assert!(diagnostics.contains("\"msr SCTLR_EL1, {0}\""));
+    assert!(!diagnostics.contains("RPI5_MMU_DEFERRED"));
 }
 
 #[test]

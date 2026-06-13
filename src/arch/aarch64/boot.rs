@@ -984,7 +984,8 @@ fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
 ))]
 fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     use crate::arch::aarch64_boot_policy::{
-        Stage1KernelRange, parse_platform_dtb_diagnostics, plan_rpi5_stage1_kernel_memory,
+        Stage1KernelRange, Stage1MmuMemoryType, parse_platform_dtb_diagnostics,
+        plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory,
     };
     use core::fmt::Write;
 
@@ -1100,11 +1101,383 @@ fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
     );
     rpi5_emergency_marker(b"RPI5_KERNEL_PLAN_DONE\r\n\0");
 
-    // Stage1D deliberately stops at the validated plan. Enabling SCTLR_EL1
-    // requires a reviewed identity table builder and cache/TLB transition;
-    // reusing the production VM path here would cross the Stage1 boundary.
-    kernel_diag!("RPI5_MMU_DEFERRED reason=identity_map_builder_not_ready");
+    rpi5_emergency_marker(b"RPI5_MMU_PLAN_BEGIN\r\n\0");
+    let stack_pointer: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, sp",
+            out(reg) stack_pointer,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let stack_page_start = stack_pointer & !(RPI5_STAGE1_PAGE_SIZE - 1);
+    let stack_page =
+        Stage1KernelRange::new(stack_page_start, stack_page_start + RPI5_STAGE1_PAGE_SIZE);
+    let mmu_plan = match plan_rpi5_stage1_identity_map(
+        &info,
+        &plan,
+        kernel,
+        stack_page,
+        dtb_range,
+        RPI5_STAGE1_UART_BASE,
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_MMU_PLAN_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    for mapping in &mmu_plan.mappings[..mmu_plan.mapping_count] {
+        match mapping.memory_type {
+            Stage1MmuMemoryType::Normal => kernel_diag!(
+                "RPI5_MMU_MAP_NORMAL start=0x{:016x} end=0x{:016x}",
+                mapping.range.start,
+                mapping.range.end
+            ),
+            Stage1MmuMemoryType::DeviceNgnre => kernel_diag!(
+                "RPI5_MMU_MAP_DEVICE start=0x{:016x} end=0x{:016x}",
+                mapping.range.start,
+                mapping.range.end
+            ),
+        }
+    }
+    let root = match unsafe { rpi5_stage1_build_identity_tables(&mmu_plan) } {
+        Ok(root) => root,
+        Err(reason) => {
+            kernel_diag!("RPI5_MMU_PLAN_FAILED reason={}", reason);
+            halt_stage1();
+        }
+    };
+    kernel_diag!("RPI5_MMU_PT_ROOT base=0x{:016x}", root);
+    rpi5_emergency_marker(b"RPI5_MMU_PLAN_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_MMU_ENABLE_BEGIN\r\n\0");
+    if let Err(reason) = unsafe { rpi5_stage1_enable_identity_mmu(root, mmu_plan.pt_pool) } {
+        kernel_diag!("RPI5_MMU_ENABLE_FAILED reason={}", reason);
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_MMU_ENABLE_DONE\r\n\0");
+    if !crate::arch::aarch64::console::try_write_line("RPI5_UART_AFTER_MMU_OK") {
+        rpi5_emergency_marker(b"RPI5_MMU_ENABLE_FAILED reason=uart_after_mmu_timeout\r\n\0");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_KERNEL_CORE_DONE\r\n\0");
     halt_stage1();
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_UART_BASE: u64 = 0x10_7d00_1000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PAGE_SIZE: u64 = 4096;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_L2_BLOCK_SIZE: u64 = 2 * 1024 * 1024;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_L1_BLOCK_SIZE: u64 = 1024 * 1024 * 1024;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_VALID: u64 = 1 << 0;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_TABLE_OR_PAGE: u64 = 1 << 1;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_AF: u64 = 1 << 10;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_PXN: u64 = 1 << 53;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_UXN: u64 = 1 << 54;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_NORMAL_FLAGS: u64 =
+    RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_AF | (0b11 << 8) | RPI5_STAGE1_PTE_UXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_DEVICE_FLAGS: u64 = RPI5_STAGE1_PTE_VALID
+    | RPI5_STAGE1_PTE_AF
+    | (0b10 << 8)
+    | (1 << 2)
+    | RPI5_STAGE1_PTE_PXN
+    | RPI5_STAGE1_PTE_UXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_MAIR_EL1: u64 = 0x04ff;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_TCR_EL1: u64 =
+    25 | (1 << 8) | (1 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+struct Rpi5Stage1TableAllocator {
+    next: u64,
+    end: u64,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+impl Rpi5Stage1TableAllocator {
+    unsafe fn allocate(&mut self) -> Result<u64, &'static str> {
+        let Some(next) = self.next.checked_add(RPI5_STAGE1_PAGE_SIZE) else {
+            return Err("pt_pool_overflow");
+        };
+        if next > self.end {
+            return Err("pt_pool_exhausted");
+        }
+        let page = self.next;
+        self.next = next;
+        unsafe {
+            core::ptr::write_bytes(page as *mut u8, 0, RPI5_STAGE1_PAGE_SIZE as usize);
+        }
+        Ok(page)
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_build_identity_tables(
+    plan: &crate::arch::aarch64_boot_policy::Stage1MmuPlan,
+) -> Result<u64, &'static str> {
+    let mut allocator = Rpi5Stage1TableAllocator {
+        next: plan.pt_pool.start,
+        end: plan.pt_pool.end,
+    };
+    let root = unsafe { allocator.allocate()? };
+    for mapping in &plan.mappings[..plan.mapping_count] {
+        let flags = match mapping.memory_type {
+            crate::arch::aarch64_boot_policy::Stage1MmuMemoryType::Normal => {
+                RPI5_STAGE1_NORMAL_FLAGS
+            }
+            crate::arch::aarch64_boot_policy::Stage1MmuMemoryType::DeviceNgnre => {
+                RPI5_STAGE1_DEVICE_FLAGS
+            }
+        };
+        unsafe {
+            rpi5_stage1_map_identity_range(
+                root,
+                &mut allocator,
+                mapping.range.start,
+                mapping.range.end,
+                flags,
+            )?;
+        }
+    }
+    Ok(root)
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_map_identity_range(
+    root: u64,
+    allocator: &mut Rpi5Stage1TableAllocator,
+    mut start: u64,
+    end: u64,
+    flags: u64,
+) -> Result<(), &'static str> {
+    if start % RPI5_STAGE1_PAGE_SIZE != 0 || end % RPI5_STAGE1_PAGE_SIZE != 0 || start >= end {
+        return Err("unaligned_mapping");
+    }
+    while start < end {
+        if start % RPI5_STAGE1_L1_BLOCK_SIZE == 0 && end - start >= RPI5_STAGE1_L1_BLOCK_SIZE {
+            let l1_index = ((start >> 30) & 0x1ff) as usize;
+            unsafe {
+                rpi5_stage1_write_empty_entry(root, l1_index, start | flags)?;
+            }
+            start += RPI5_STAGE1_L1_BLOCK_SIZE;
+            continue;
+        }
+        let l1_index = ((start >> 30) & 0x1ff) as usize;
+        let l2 = unsafe { rpi5_stage1_ensure_table(root, l1_index, allocator)? };
+        if start % RPI5_STAGE1_L2_BLOCK_SIZE == 0 && end - start >= RPI5_STAGE1_L2_BLOCK_SIZE {
+            let l2_index = ((start >> 21) & 0x1ff) as usize;
+            unsafe {
+                rpi5_stage1_write_empty_entry(l2, l2_index, start | flags)?;
+            }
+            start += RPI5_STAGE1_L2_BLOCK_SIZE;
+            continue;
+        }
+        let l2_index = ((start >> 21) & 0x1ff) as usize;
+        let l3 = unsafe { rpi5_stage1_ensure_table(l2, l2_index, allocator)? };
+        let l3_index = ((start >> 12) & 0x1ff) as usize;
+        unsafe {
+            rpi5_stage1_write_empty_entry(
+                l3,
+                l3_index,
+                start | flags | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+            )?;
+        }
+        start += RPI5_STAGE1_PAGE_SIZE;
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_ensure_table(
+    table: u64,
+    index: usize,
+    allocator: &mut Rpi5Stage1TableAllocator,
+) -> Result<u64, &'static str> {
+    let entry = unsafe { core::ptr::read_volatile((table as *const u64).add(index)) };
+    if entry == 0 {
+        let child = unsafe { allocator.allocate()? };
+        unsafe {
+            core::ptr::write_volatile(
+                (table as *mut u64).add(index),
+                child | RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+            );
+        }
+        return Ok(child);
+    }
+    if entry & (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+        == (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+    {
+        Ok(entry & RPI5_STAGE1_PTE_ADDR_MASK)
+    } else {
+        Err("mapping_conflict")
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_write_empty_entry(
+    table: u64,
+    index: usize,
+    value: u64,
+) -> Result<(), &'static str> {
+    let slot = unsafe { (table as *mut u64).add(index) };
+    if unsafe { core::ptr::read_volatile(slot) } != 0 {
+        return Err("mapping_conflict");
+    }
+    unsafe {
+        core::ptr::write_volatile(slot, value);
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_enable_identity_mmu(
+    root: u64,
+    pt_pool: crate::arch::aarch64_boot_policy::Stage1KernelRange,
+) -> Result<(), &'static str> {
+    let mut sctlr: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
+    }
+    if sctlr & 1 != 0 {
+        return Err("already_enabled");
+    }
+    let mut line = pt_pool.start;
+    while line < pt_pool.end {
+        unsafe {
+            core::arch::asm!("dc cvac, {0}", in(reg) line, options(nostack, preserves_flags));
+        }
+        line += 64;
+    }
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "msr MAIR_EL1, {mair}",
+            "msr TCR_EL1, {tcr}",
+            "msr TTBR0_EL1, {root}",
+            "msr TTBR1_EL1, xzr",
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            "ic iallu",
+            "dsb nsh",
+            "isb",
+            mair = in(reg) RPI5_STAGE1_MAIR_EL1,
+            tcr = in(reg) RPI5_STAGE1_TCR_EL1,
+            root = in(reg) root,
+            options(nostack, preserves_flags)
+        );
+        sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+        core::arch::asm!(
+            "msr SCTLR_EL1, {0}",
+            "isb",
+            in(reg) sctlr,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
+    }
+    if sctlr & 1 == 0 {
+        Err("sctlr_m_not_set")
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]

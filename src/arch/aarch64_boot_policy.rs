@@ -19,6 +19,9 @@ pub const MAX_STAGE1_KERNEL_USABLE_RANGES: usize = 24;
 pub const STAGE1_PT_POOL_SIZE: u64 = 256 * 1024;
 pub const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024;
 const STAGE1_ALLOCATION_ALIGNMENT: u64 = 64 * 1024;
+const STAGE1_PAGE_SIZE: u64 = 4096;
+const STAGE1_MMU_MIN_TABLE_PAGES: u64 = 4;
+const STAGE1_TTBR0_VA_LIMIT: u64 = 1 << 39;
 const RPI5_FIRMWARE_LOW_RESERVED_END: u64 = 0x80000;
 const RPI5_PREFERRED_UART: &[u8] = b"/soc@107c000000/serial@7d001000";
 
@@ -191,6 +194,70 @@ pub struct Stage1KernelPlan {
     pub early_heap: Stage1KernelRange,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1MmuMemoryType {
+    #[default]
+    Normal,
+    DeviceNgnre,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage1MmuMapping {
+    pub range: Stage1KernelRange,
+    pub memory_type: Stage1MmuMemoryType,
+}
+
+pub const MAX_STAGE1_MMU_MAPPINGS: usize = MAX_DIAGNOSTIC_RANGES + 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1MmuPlan {
+    pub mappings: [Stage1MmuMapping; MAX_STAGE1_MMU_MAPPINGS],
+    pub mapping_count: usize,
+    pub pt_pool: Stage1KernelRange,
+}
+
+impl Default for Stage1MmuPlan {
+    fn default() -> Self {
+        Self {
+            mappings: [Stage1MmuMapping::default(); MAX_STAGE1_MMU_MAPPINGS],
+            mapping_count: 0,
+            pt_pool: Stage1KernelRange::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1MmuPlanFailure {
+    #[default]
+    InvalidPageTablePool,
+    MappingCapacity,
+    AddressOverflow,
+    AddressOutsideTtbr0,
+    AttributeOverlap,
+    KernelNotMapped,
+    CurrentStackNotMapped,
+    DtbNotMapped,
+    PageTablePoolNotMapped,
+    EarlyHeapNotMapped,
+}
+
+impl Stage1MmuPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InvalidPageTablePool => "invalid_pt_pool",
+            Self::MappingCapacity => "mapping_capacity",
+            Self::AddressOverflow => "address_overflow",
+            Self::AddressOutsideTtbr0 => "address_outside_ttbr0",
+            Self::AttributeOverlap => "attribute_overlap",
+            Self::KernelNotMapped => "kernel_not_mapped",
+            Self::CurrentStackNotMapped => "current_stack_not_mapped",
+            Self::DtbNotMapped => "dtb_not_mapped",
+            Self::PageTablePoolNotMapped => "pt_pool_not_mapped",
+            Self::EarlyHeapNotMapped => "early_heap_not_mapped",
+        }
+    }
+}
+
 impl Default for Stage1KernelPlan {
     fn default() -> Self {
         Self {
@@ -360,6 +427,124 @@ pub fn plan_rpi5_stage1_kernel_memory(
     plan.usable_ranges[..free_count].copy_from_slice(&free[..free_count]);
     plan.usable_range_count = free_count;
     Ok(plan)
+}
+
+pub fn plan_rpi5_stage1_identity_map(
+    info: &PlatformDtbDiagnostics,
+    kernel_plan: &Stage1KernelPlan,
+    kernel: Stage1KernelRange,
+    current_stack: Stage1KernelRange,
+    dtb: Stage1KernelRange,
+    uart_base: u64,
+) -> Result<Stage1MmuPlan, Stage1MmuPlanFailure> {
+    if kernel_plan.page_table_pool.start % STAGE1_PAGE_SIZE != 0
+        || kernel_plan.page_table_pool.end % STAGE1_PAGE_SIZE != 0
+        || kernel_plan
+            .page_table_pool
+            .end
+            .saturating_sub(kernel_plan.page_table_pool.start)
+            < STAGE1_MMU_MIN_TABLE_PAGES * STAGE1_PAGE_SIZE
+    {
+        return Err(Stage1MmuPlanFailure::InvalidPageTablePool);
+    }
+
+    let mut plan = Stage1MmuPlan {
+        pt_pool: kernel_plan.page_table_pool,
+        ..Stage1MmuPlan::default()
+    };
+    for range in &info.memory_ranges[..info.memory_range_count] {
+        if range.size == 0 {
+            continue;
+        }
+        let start = align_down_u64_policy(range.start, STAGE1_PAGE_SIZE);
+        let raw_end = range
+            .start
+            .checked_add(range.size)
+            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?;
+        let end = align_up_u64_policy(raw_end, STAGE1_PAGE_SIZE)
+            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?;
+        append_stage1_mmu_mapping(
+            &mut plan,
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(start, end),
+                memory_type: Stage1MmuMemoryType::Normal,
+            },
+        )?;
+    }
+    let uart_page = Stage1KernelRange::new(
+        align_down_u64_policy(uart_base, STAGE1_PAGE_SIZE),
+        align_down_u64_policy(uart_base, STAGE1_PAGE_SIZE)
+            .checked_add(STAGE1_PAGE_SIZE)
+            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+    );
+    append_stage1_mmu_mapping(
+        &mut plan,
+        Stage1MmuMapping {
+            range: uart_page,
+            memory_type: Stage1MmuMemoryType::DeviceNgnre,
+        },
+    )?;
+
+    for (index, mapping) in plan.mappings[..plan.mapping_count].iter().enumerate() {
+        if mapping.range.end > STAGE1_TTBR0_VA_LIMIT {
+            return Err(Stage1MmuPlanFailure::AddressOutsideTtbr0);
+        }
+        for other in &plan.mappings[index + 1..plan.mapping_count] {
+            if mapping.memory_type != other.memory_type && mapping.range.overlaps(other.range) {
+                return Err(Stage1MmuPlanFailure::AttributeOverlap);
+            }
+        }
+    }
+    for (range, failure) in [
+        (kernel, Stage1MmuPlanFailure::KernelNotMapped),
+        (current_stack, Stage1MmuPlanFailure::CurrentStackNotMapped),
+        (dtb, Stage1MmuPlanFailure::DtbNotMapped),
+        (
+            kernel_plan.page_table_pool,
+            Stage1MmuPlanFailure::PageTablePoolNotMapped,
+        ),
+        (
+            kernel_plan.early_heap,
+            Stage1MmuPlanFailure::EarlyHeapNotMapped,
+        ),
+    ] {
+        if !stage1_mmu_normal_mapping_contains(&plan, range) {
+            return Err(failure);
+        }
+    }
+    Ok(plan)
+}
+
+fn append_stage1_mmu_mapping(
+    plan: &mut Stage1MmuPlan,
+    mapping: Stage1MmuMapping,
+) -> Result<(), Stage1MmuPlanFailure> {
+    if plan.mapping_count == plan.mappings.len() {
+        return Err(Stage1MmuPlanFailure::MappingCapacity);
+    }
+    plan.mappings[plan.mapping_count] = mapping;
+    plan.mapping_count += 1;
+    Ok(())
+}
+
+fn stage1_mmu_normal_mapping_contains(plan: &Stage1MmuPlan, range: Stage1KernelRange) -> bool {
+    !range.is_empty()
+        && plan.mappings[..plan.mapping_count].iter().any(|mapping| {
+            mapping.memory_type == Stage1MmuMemoryType::Normal
+                && mapping.range.start <= range.start
+                && mapping.range.end >= range.end
+        })
+}
+
+const fn align_down_u64_policy(value: u64, alignment: u64) -> u64 {
+    value & !(alignment - 1)
+}
+
+const fn align_up_u64_policy(value: u64, alignment: u64) -> Option<u64> {
+    match value.checked_add(alignment - 1) {
+        Some(added) => Some(added & !(alignment - 1)),
+        None => None,
+    }
 }
 
 fn append_stage1_reserved(
@@ -1908,6 +2093,96 @@ mod tests {
                 Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn rpi5_stage1_identity_map_covers_core_ranges_and_uart_attributes() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        let kernel = Stage1KernelRange::new(0x80000, 0x5b50_000);
+        let dtb = Stage1KernelRange::new(0x2efe_c600, 0x2eff_ff4e);
+        let kernel_plan = Stage1KernelPlan {
+            page_table_pool: Stage1KernelRange::new(0x5b50_000, 0x5b90_000),
+            early_heap: Stage1KernelRange::new(0x5b90_000, 0x5d90_000),
+            ..Stage1KernelPlan::default()
+        };
+
+        let stack = Stage1KernelRange::new(0x5b4f_000, 0x5b50_000);
+        let plan =
+            plan_rpi5_stage1_identity_map(&info, &kernel_plan, kernel, stack, dtb, 0x10_7d00_1000)
+                .unwrap();
+        assert_eq!(plan.pt_pool, kernel_plan.page_table_pool);
+        assert_eq!(plan.mapping_count, 3);
+        assert_eq!(
+            plan.mappings[0],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0, 0x3fc0_0000),
+                memory_type: Stage1MmuMemoryType::Normal,
+            }
+        );
+        assert_eq!(
+            plan.mappings[1],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x4000_0000, 0x8000_0000),
+                memory_type: Stage1MmuMemoryType::Normal,
+            }
+        );
+        assert_eq!(
+            plan.mappings[2],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x10_7d00_1000, 0x10_7d00_2000),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            }
+        );
+        for normal in &plan.mappings[..2] {
+            assert!(!normal.range.overlaps(plan.mappings[2].range));
+        }
+        for required in [
+            kernel,
+            stack,
+            dtb,
+            kernel_plan.page_table_pool,
+            kernel_plan.early_heap,
+        ] {
+            assert!(stage1_mmu_normal_mapping_contains(&plan, required));
+        }
+    }
+
+    #[test]
+    fn rpi5_stage1_identity_map_rejects_pt_pool_outside_normal_ram() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        let kernel_plan = Stage1KernelPlan {
+            page_table_pool: Stage1KernelRange::new(0x5000_0000, 0x5004_0000),
+            early_heap: Stage1KernelRange::new(0x1000_0000, 0x1020_0000),
+            ..Stage1KernelPlan::default()
+        };
+        assert_eq!(
+            plan_rpi5_stage1_identity_map(
+                &info,
+                &kernel_plan,
+                Stage1KernelRange::new(0x80000, 0x180000),
+                Stage1KernelRange::new(0x170000, 0x171000),
+                Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600),
+                0x10_7d00_1000,
+            ),
+            Err(Stage1MmuPlanFailure::PageTablePoolNotMapped)
         );
     }
 

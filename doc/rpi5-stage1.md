@@ -223,11 +223,27 @@ are printed as `RPI5_KERNEL_USABLE_RANGE`. Capacity, overflow, malformed input, 
 place either range fails closed with `RPI5_KERNEL_PLAN_FAILED reason=...`. An initrd is not required
 for this diagnostic path.
 
-Stage 1D currently implements the accepted plan-only outcome. After `RPI5_KERNEL_PLAN_DONE`, it
-emits `RPI5_MMU_DEFERRED reason=identity_map_builder_not_ready` and halts. It deliberately does not
-reuse production VM code before a reviewed identity-map table builder and cache/TLB transition are
-available. Consequently it does not claim `RPI5_MMU_ENABLE_DONE`,
-`RPI5_UART_AFTER_MMU_OK`, or userspace readiness.
+Stage 1E consumes the Stage1D page-table pool with a separate identity-map builder rather than the
+production VM allocator. With a 4 KiB granule and a 39-bit TTBR0 address space, it maps every
+firmware RAM range as normal WB/WA memory and maps only the translated PL011 page at
+`0x107d001000` as device-nGnRE. The hardware-proven kernel, current boot stack, DTB, page-table pool,
+and early heap all lie in those normal-memory ranges. The plan fails closed if any required range is
+not covered or if a normal mapping overlaps the UART device page.
+
+Tables are allocated sequentially and cleared only within the planned 256 KiB pool. For the
+hardware-proven two-range map, the expected minimum layout is one L1 root, one L2 table for
+`0..0x3fc00000`, and one L2 plus one L3 table for the high UART page; the aligned
+`0x40000000..0x80000000` range uses an L1 block. Normal mappings use AttrIdx 0 and privileged
+execution with EL0 execute-never; the UART page uses AttrIdx 1, PXN, and UXN.
+
+Stage 1E programs `MAIR_EL1=0x04ff` (Attr0 normal WB/WA, Attr1 device-nGnRE) and
+`TCR_EL1=0x0000000200803519` (T0SZ=25, 4 KiB TG0, inner-shareable WB/WA walks, 40-bit PA,
+TTBR1 disabled). It writes the identity root to TTBR0, clears TTBR1, cleans the table pool, performs
+explicit DSB/TLBI/ISB and instruction-cache maintenance, then preserves the incoming SCTLR state
+while setting M, C, and I. A pre-enabled MMU or failed SCTLR.M readback emits
+`RPI5_MMU_ENABLE_FAILED`. Success prints `RPI5_MMU_ENABLE_DONE`, proves the bounded UART path with
+`RPI5_UART_AFTER_MMU_OK`, emits `RPI5_KERNEL_CORE_DONE`, and halts before production kernel or
+userspace initialization.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
