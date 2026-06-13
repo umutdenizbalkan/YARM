@@ -98,7 +98,13 @@ RPI5_DTB_PARSE_BEGIN
 RPI5_DTB_PARSE_DONE
 RPI5_BOOT_OPTIONS_BEGIN
 RPI5_BOOT_OPTIONS_DONE
+RPI5_AFTER_BOOT_OPTIONS
+RPI5_CONSOLE_SELECT_BEGIN
+RPI5_SELECTED_UART_BASE value=0x000000107d001000
+RPI5_CONSOLE_SELECT_DONE
+RPI5_CONSOLE_WRITE_BEGIN
 RPI5_BOOT_00_ENTRY
+RPI5_CONSOLE_WRITE_DONE
 RPI5_BOOT_01_DTB_PTR value=...
 RPI5_BOOT_02_UART_SELECTED path=... base=...
 RPI5_BOOT_03_UART_OK
@@ -114,6 +120,13 @@ The firmware handoff registers `x0` through `x3` are copied to `x20` through `x2
 marker and restored before the first Rust call. `RPI5_DTB_X0` prints the saved DTB pointer as sixteen
 hex digits using the same emergency writer. QEMU builds compile the assembly marker routines to
 no-ops, compile the Rust marker helper to an empty function, and retain their `0x40080000` entry.
+
+During the Stage 1 console transition, the selected DTB UART base is printed through the emergency
+writer and must equal `0x107d001000`. A mismatch is reported and halted before any access through an
+unproven MMIO base. `RPI5_BOOT_00_ENTRY` also remains on the emergency writer. The normal console is
+then probed with a CRLF write bracketed by `RPI5_CONSOLE_WRITE_BEGIN` and
+`RPI5_CONSOLE_WRITE_DONE`; RPi5 Stage 1 bounds its PL011 TX-ready poll and reports
+`RPI5_CONSOLE_WRITE_TIMEOUT` instead of spinning forever.
 
 ## Explicit non-goals
 

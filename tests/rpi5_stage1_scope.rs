@@ -50,9 +50,31 @@ fn raw_entry_breadcrumb_ladder_has_all_expected_markers() {
         "RPI5_BOOT_OPTIONS_DONE",
         "RPI5_DTB_PARSE_BEGIN",
         "RPI5_DTB_PARSE_DONE",
+        "RPI5_AFTER_BOOT_OPTIONS",
+        "RPI5_CONSOLE_SELECT_BEGIN",
+        "RPI5_SELECTED_UART_BASE value=0x",
+        "RPI5_CONSOLE_SELECT_DONE",
+        "RPI5_CONSOLE_WRITE_BEGIN",
+        "RPI5_CONSOLE_WRITE_DONE",
     ] {
         assert!(boot.contains(marker), "missing breadcrumb {marker}");
     }
+}
+
+#[test]
+fn rpi5_console_transition_is_bounded_and_uses_the_proven_uart() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let console = include_str!("../src/arch/aarch64/console.rs");
+    let policy = include_str!("../src/arch/aarch64_boot_policy.rs");
+
+    assert!(boot.contains("const RPI5_EMERGENCY_UART_BASE: u64 = 0x10_7d00_1000"));
+    assert!(boot.contains("serial.base != RPI5_EMERGENCY_UART_BASE"));
+    assert!(boot.contains("rpi5_emergency_marker(b\"RPI5_BOOT_00_ENTRY\\r\\n\\0\")"));
+    assert!(!boot.contains("console::write_line(\"RPI5_BOOT_00_ENTRY\")"));
+    assert!(console.contains("#[cfg(feature = \"rpi5-stage1\")]"));
+    assert!(console.contains("const TX_READY_POLL_LIMIT: usize = 1_048_576"));
+    assert!(console.contains("return false"));
+    assert!(policy.contains("assert_eq!(info.serial.unwrap().base, 0x10_7d00_1000)"));
 }
 
 #[test]

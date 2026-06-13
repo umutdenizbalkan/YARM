@@ -31,6 +31,11 @@ static UART_LOG_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
 
+#[cfg(feature = "hosted-dev")]
+pub fn try_write_line(_msg: &str) -> bool {
+    true
+}
+
 #[cfg(not(feature = "hosted-dev"))]
 pub fn init_early_mmio_base(base: usize) {
     if base != 0 {
@@ -56,24 +61,48 @@ pub fn init_dtb_pl011(base: usize) -> bool {
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn write_line(msg: &str) {
+    let _ = try_write_line(msg);
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+pub fn try_write_line(msg: &str) -> bool {
     // Serialize full-line emission under an IRQ-safe lock so SMP CPUs and local
     // IRQ/exception re-entry cannot interleave UART bytes mid-line.
     let _guard = UART_LOG_LOCK.lock();
     for &byte in msg.as_bytes() {
-        if byte == b'\n' {
-            write_byte(b'\r');
+        if byte == b'\n' && !write_byte(b'\r') {
+            return false;
         }
-        write_byte(byte);
+        if !write_byte(byte) {
+            return false;
+        }
     }
-    write_byte(b'\r');
-    write_byte(b'\n');
+    write_byte(b'\r') && write_byte(b'\n')
 }
 
 #[cfg(not(feature = "hosted-dev"))]
-fn write_byte(byte: u8) {
+fn write_byte(byte: u8) -> bool {
     let base = UART_BASE.load(Ordering::Relaxed);
+
+    #[cfg(feature = "rpi5-stage1")]
+    {
+        const TX_READY_POLL_LIMIT: usize = 1_048_576;
+        for _ in 0..TX_READY_POLL_LIMIT {
+            if (mmio_read32(base + PL011_FR) & PL011_FR_TXFF) == 0 {
+                mmio_write32(base + PL011_DR, byte as u32);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    #[cfg(not(feature = "rpi5-stage1"))]
     while (mmio_read32(base + PL011_FR) & PL011_FR_TXFF) != 0 {}
-    mmio_write32(base + PL011_DR, byte as u32);
+    #[cfg(not(feature = "rpi5-stage1"))]
+    {
+        mmio_write32(base + PL011_DR, byte as u32);
+        true
+    }
 }
 
 #[cfg(not(feature = "hosted-dev"))]

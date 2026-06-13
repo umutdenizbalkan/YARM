@@ -190,6 +190,39 @@ yarm_aarch64_rpi5_emergency_write:
     ldp x9, x10, [sp], #16
     ret
 
+    .global yarm_aarch64_rpi5_emergency_write_hex
+    .type yarm_aarch64_rpi5_emergency_write_hex,%function
+yarm_aarch64_rpi5_emergency_write_hex:
+    stp x0, x1, [sp, #-16]!
+    stp x9, x10, [sp, #-16]!
+    stp x11, x12, [sp, #-16]!
+    stp x13, x14, [sp, #-16]!
+    stp x15, x30, [sp, #-16]!
+    mov x9, x0
+    bl .Lrpi5_emergency_write_x9
+    mov x10, x1
+    mov x11, #60
+.Lrpi5_emergency_hex:
+    lsr x12, x10, x11
+    and x12, x12, #0xf
+    cmp x12, #10
+    add x13, x12, #'0'
+    add x14, x12, #('a' - 10)
+    csel x15, x13, x14, lo
+    bl .Lrpi5_emergency_write_byte_x15
+    subs x11, x11, #4
+    b.ge .Lrpi5_emergency_hex
+    mov x15, #'\r'
+    bl .Lrpi5_emergency_write_byte_x15
+    mov x15, #'\n'
+    bl .Lrpi5_emergency_write_byte_x15
+    ldp x15, x30, [sp], #16
+    ldp x13, x14, [sp], #16
+    ldp x11, x12, [sp], #16
+    ldp x9, x10, [sp], #16
+    ldp x0, x1, [sp], #16
+    ret
+
 .Lrpi5_emergency_write_x9:
     stp x10, x11, [sp, #-16]!
     stp x12, x13, [sp, #-16]!
@@ -630,6 +663,21 @@ fn rpi5_emergency_marker(marker: &'static [u8]) {
     }
 }
 
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+#[inline(always)]
+fn rpi5_emergency_hex(prefix: &'static [u8], value: u64) {
+    unsafe extern "C" {
+        fn yarm_aarch64_rpi5_emergency_write_hex(prefix: *const u8, value: u64);
+    }
+    unsafe {
+        yarm_aarch64_rpi5_emergency_write_hex(prefix.as_ptr(), value);
+    }
+}
+
 #[cfg(any(
     feature = "hosted-dev",
     not(target_arch = "aarch64"),
@@ -638,14 +686,24 @@ fn rpi5_emergency_marker(marker: &'static [u8]) {
 #[inline(always)]
 fn rpi5_emergency_marker(_marker: &'static [u8]) {}
 
+#[cfg(any(
+    feature = "hosted-dev",
+    not(target_arch = "aarch64"),
+    not(feature = "rpi5-stage1")
+))]
+#[inline(always)]
+fn rpi5_emergency_hex(_prefix: &'static [u8], _value: u64) {}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
     use crate::arch::aarch64_boot_policy::DetectedPlatform;
     use crate::kernel::boot_command_line::{BootPhase, PlatformOption, parse_yarm_boot_options};
 
-    rpi5_emergency_marker(b"RPI5_RUST_ENTRY\0");
-    rpi5_emergency_marker(b"RPI5_DTB_PARSE_BEGIN\0");
+    const RPI5_EMERGENCY_UART_BASE: u64 = 0x10_7d00_1000;
+
+    rpi5_emergency_marker(b"RPI5_RUST_ENTRY\r\n\0");
+    rpi5_emergency_marker(b"RPI5_DTB_PARSE_BEGIN\r\n\0");
     let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
         // Preserve the direct-kernel QEMU fallback when no firmware DTB can be read.
         crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
@@ -654,11 +712,12 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
     let Some(info) = crate::arch::aarch64_boot_policy::parse_platform_dtb(dtb) else {
         return;
     };
-    rpi5_emergency_marker(b"RPI5_DTB_PARSE_DONE\0");
-    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_BEGIN\0");
+    rpi5_emergency_marker(b"RPI5_DTB_PARSE_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_BEGIN\r\n\0");
     let raw = crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]);
     let options = parse_yarm_boot_options(raw);
-    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_DONE\0");
+    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_AFTER_BOOT_OPTIONS\r\n\0");
     let selected = match options.platform {
         PlatformOption::Auto => info.platform,
         PlatformOption::QemuVirt => DetectedPlatform::QemuVirt,
@@ -669,13 +728,26 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
             crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
         }
         DetectedPlatform::Rpi5Bcm2712 => {
+            rpi5_emergency_marker(b"RPI5_CONSOLE_SELECT_BEGIN\r\n\0");
             let Some(serial) = info.serial else {
                 halt_stage1();
             };
+            rpi5_emergency_hex(b"RPI5_SELECTED_UART_BASE value=0x\0", serial.base);
+            if serial.base != RPI5_EMERGENCY_UART_BASE {
+                rpi5_emergency_marker(b"RPI5_SELECTED_UART_BASE_MISMATCH\r\n\0");
+                halt_stage1();
+            }
             if !crate::arch::aarch64::console::init_dtb_pl011(serial.base as usize) {
                 halt_stage1();
             }
-            crate::arch::aarch64::console::write_line("RPI5_BOOT_00_ENTRY");
+            rpi5_emergency_marker(b"RPI5_CONSOLE_SELECT_DONE\r\n\0");
+            rpi5_emergency_marker(b"RPI5_CONSOLE_WRITE_BEGIN\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_00_ENTRY\r\n\0");
+            if !crate::arch::aarch64::console::try_write_line("") {
+                rpi5_emergency_marker(b"RPI5_CONSOLE_WRITE_TIMEOUT\r\n\0");
+                halt_stage1();
+            }
+            rpi5_emergency_marker(b"RPI5_CONSOLE_WRITE_DONE\r\n\0");
             if options.boot_phase == BootPhase::Entry {
                 halt_stage1();
             }
