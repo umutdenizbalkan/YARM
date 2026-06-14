@@ -394,12 +394,31 @@ HH-2 programs `MAIR_EL1=0x04ff` and `TCR_EL1=0x00000002b5193519`. T0SZ and T1SZ 
 (39-bit regions), TG0/TG1 select 4 KiB granules, both walks are inner-shareable WB/WA, EPD1 is clear,
 and IPS selects 40-bit physical addresses. After installing the distinct roots and enabling the MMU,
 the trampoline branches to its high alias, moves SP to its high alias, installs the high alias of a
-diagnostic vector table in VBAR_EL1, switches the bounded writer to the high UART alias, emits
-`RPI5_HH_DONE`, and halts.
+diagnostic vector table in VBAR_EL1, switches the bounded writer to the high UART alias, and reaches
+the high continuation boundary.
 
-This path does not call Rust, install the Stage2C user root, enter EL0, dispatch syscalls, or start
-the scheduler/service chain. The only `eret` in the trampoline is the existing architectural
-EL2-to-EL1 descent when firmware did not already enter at EL1.
+The trampoline does not install the Stage2C user root, enter EL0, dispatch syscalls, or start the
+scheduler/service chain. The only `eret` in the trampoline is the existing architectural EL2-to-EL1
+descent when firmware did not already enter at EL1.
+
+### HH-3 high-linked Rust continuation
+
+HH-3 keeps the HH-2 mappings and replaces the final assembly halt with a direct branch to the
+high-linked `yarm_rpi5_hh_rust_continue` function. The continuation uses only the bounded high UART
+alias and stack-local fixed buffers. It prints and validates the current PC, SP, VBAR_EL1,
+TTBR0_EL1, TTBR1_EL1, and TCR_EL1. PC, SP, and VBAR must be high; VBAR must retain 2 KiB alignment;
+the roots must be nonzero, page-aligned, distinct, and equal the linker-reserved roots; EPD1 must be
+clear; T1SZ must remain 25; and TCR must equal `0x00000002b5193519`. Success ends with
+`RPI5_HH_REGISTERS_OK`, `RPI5_HH_RUST_UART_OK`, and `RPI5_HH3_DONE`, followed by a safe halt.
+
+`scripts/build-rpi5-highhalf-artifact.sh` is the explicit build entry point. It selects the HH target
+and feature and writes `build-rpi5/kernel_2712_hh.img`; it refuses to replace the default
+`build-rpi5/kernel_2712.img`. The boot-directory generator stages that image as firmware-visible
+`kernel_2712.img` only when invoked with `--highhalf`. The generated README labels the image as a
+high-half diagnostic. An initrd remains optional and is not consumed by HH-3.
+
+HH-3 still does not install a user root in TTBR0, enter EL0, enable interrupts, remove the low
+identity map, or start any scheduler or service-chain component.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans

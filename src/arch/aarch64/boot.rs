@@ -394,11 +394,8 @@ _start:
     bl .Lhh_write_cstr
     adr x0, .Lhh_vbar_ok
     bl .Lhh_write_cstr
-    adr x0, .Lhh_uart_ok
-    bl .Lhh_write_cstr
-    adr x0, .Lhh_done
-    bl .Lhh_write_cstr
-    b .Lhh_halt
+    ldr x0, =yarm_rpi5_hh_rust_continue
+    br x0
 
 .Lhh_fail_roots:
     adr x0, .Lhh_failed_roots
@@ -533,8 +530,6 @@ _start:
 .Lhh_jump_high:       .asciz "RPI5_HH_JUMP_HIGH\r\n"
 .Lhh_high_ok:         .asciz "RPI5_HH_HIGH_ENTRY_OK\r\n"
 .Lhh_vbar_ok:         .asciz "RPI5_HH_VBAR_HIGH_OK\r\n"
-.Lhh_uart_ok:         .asciz "RPI5_HH_UART_HIGH_OK\r\n"
-.Lhh_done:            .asciz "RPI5_HH_DONE\r\n"
 .Lhh_failed_roots:    .asciz "RPI5_HH_PLAN_FAILED reason=invalid_or_shared_roots\r\n"
 .Lhh_failed_range:    .asciz "RPI5_HH_PLAN_FAILED reason=range_outside_high_map\r\n"
 .Lhh_failed_dtb:      .asciz "RPI5_HH_PLAN_FAILED reason=invalid_dtb_range\r\n"
@@ -545,6 +540,190 @@ _start:
 .Lhh_crlf:            .asciz "\r\n"
     "#
 );
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH_UART_VIRT: usize = 0xffff_ff90_7d00_1000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH_VA_OFFSET: u64 = 0xffff_ff80_0000_0000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH_TCR_EL1: u64 = 0x0000_0002_b519_3519;
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_bytes(bytes: &[u8]) -> bool {
+    const TX_READY_POLL_LIMIT: usize = 0x1_0000;
+    let data = RPI5_HH_UART_VIRT as *mut u32;
+    let flags = (RPI5_HH_UART_VIRT + 0x18) as *const u32;
+    for &byte in bytes {
+        let mut ready = false;
+        for _ in 0..TX_READY_POLL_LIMIT {
+            if unsafe { core::ptr::read_volatile(flags) } & (1 << 5) == 0 {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            return false;
+        }
+        unsafe {
+            core::ptr::write_volatile(data, u32::from(byte));
+        }
+    }
+    true
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_line(line: &[u8]) -> bool {
+    rpi5_hh_write_bytes(line) && rpi5_hh_write_bytes(b"\r\n")
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_hex_line(prefix: &[u8], value: u64) -> bool {
+    let mut digits = [0u8; 16];
+    for (index, digit) in digits.iter_mut().enumerate() {
+        let nibble = ((value >> (60 - index * 4)) & 0xf) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+    }
+    rpi5_hh_write_bytes(prefix) && rpi5_hh_write_bytes(&digits) && rpi5_hh_write_bytes(b"\r\n")
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(b"RPI5_HH_REGISTER_MISMATCH reason=");
+    let _ = rpi5_hh_write_line(reason);
+    let _ = rpi5_hh_write_bytes(b"RPI5_HH3_FAILED reason=");
+    let _ = rpi5_hh_write_line(reason);
+    loop {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
+    unsafe extern "C" {
+        static __hh_ttbr0_root: u8;
+        static __hh_ttbr1_root: u8;
+    }
+
+    let pc: u64;
+    let sp: u64;
+    let vbar: u64;
+    let ttbr0: u64;
+    let ttbr1: u64;
+    let tcr: u64;
+    unsafe {
+        core::arch::asm!(
+            "adr {pc}, .",
+            "mov {sp}, sp",
+            "mrs {vbar}, VBAR_EL1",
+            "mrs {ttbr0}, TTBR0_EL1",
+            "mrs {ttbr1}, TTBR1_EL1",
+            "mrs {tcr}, TCR_EL1",
+            pc = out(reg) pc,
+            sp = out(reg) sp,
+            vbar = out(reg) vbar,
+            ttbr0 = out(reg) ttbr0,
+            ttbr1 = out(reg) ttbr1,
+            tcr = out(reg) tcr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    if !rpi5_hh_write_line(b"RPI5_HH_RUST_ENTRY") {
+        loop {
+            unsafe {
+                core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
+    if !rpi5_hh_write_hex_line(b"RPI5_HH_PC value=0x", pc)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_SP value=0x", sp)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_VBAR value=0x", vbar)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_TTBR0 value=0x", ttbr0)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_TTBR1 value=0x", ttbr1)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_TCR value=0x", tcr)
+    {
+        rpi5_hh_fail(b"uart_timeout");
+    }
+
+    let expected_ttbr0 = core::ptr::addr_of!(__hh_ttbr0_root) as u64;
+    let expected_ttbr1 = core::ptr::addr_of!(__hh_ttbr1_root) as u64;
+    let root_mask = !0xfffu64;
+    if pc < RPI5_HH_VA_OFFSET {
+        rpi5_hh_fail(b"pc_not_high");
+    }
+    if sp < RPI5_HH_VA_OFFSET {
+        rpi5_hh_fail(b"sp_not_high");
+    }
+    if vbar < RPI5_HH_VA_OFFSET || vbar & 0x7ff != 0 {
+        rpi5_hh_fail(b"vbar_not_high_aligned");
+    }
+    if ttbr0 & root_mask != expected_ttbr0 || ttbr0 == 0 {
+        rpi5_hh_fail(b"ttbr0_root_mismatch");
+    }
+    if ttbr1 & root_mask != expected_ttbr1 || ttbr1 == 0 {
+        rpi5_hh_fail(b"ttbr1_root_mismatch");
+    }
+    if ttbr0 & root_mask == ttbr1 & root_mask {
+        rpi5_hh_fail(b"ttbr_roots_not_distinct");
+    }
+    if tcr & (1 << 23) != 0 || ((tcr >> 16) & 0x3f) != 25 {
+        rpi5_hh_fail(b"ttbr1_walk_configuration");
+    }
+    if tcr != RPI5_HH_TCR_EL1 {
+        rpi5_hh_fail(b"tcr_value_mismatch");
+    }
+
+    if !rpi5_hh_write_line(b"RPI5_HH_REGISTERS_OK")
+        || !rpi5_hh_write_line(b"RPI5_HH_RUST_UART_OK")
+        || !rpi5_hh_write_line(b"RPI5_HH3_DONE")
+    {
+        rpi5_hh_fail(b"uart_timeout");
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
 
 #[cfg(all(
     not(feature = "hosted-dev"),

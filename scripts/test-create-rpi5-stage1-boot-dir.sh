@@ -48,6 +48,7 @@ done
 assert_not_contains "$default_boot/config.txt" 'os_check=0'
 assert_not_contains "$default_boot/config.txt" 'enable_rp1_uart=1'
 assert_not_contains "$default_boot/config.txt" 'initramfs '
+assert_not_contains "$default_boot/README-RPI5-STAGE1.txt" 'Explicit high-half diagnostic mode'
 [[ ! -e "$default_boot/initramfs-stage2a.cpio" ]] || fail "default boot unexpectedly staged initrd"
 for marker in RPI5_BOOT_00_ENTRY RPI5_BOOT_01_DTB_PTR RPI5_BOOT_02_UART_SELECTED RPI5_BOOT_03_UART_OK; do
   assert_contains "$default_boot/README-RPI5-STAGE1.txt" "$marker"
@@ -82,6 +83,38 @@ assert_contains "$initrd_boot/config.txt" 'initramfs initramfs-stage2a.cpio foll
 assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" '--initrd-input build-aarch64/initramfs-core.cpio'
 assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" 'RPI5_STAGE2A_DONE'
 assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" 'It does not unpack the archive or spawn userspace.'
+
+hh_kernel="$tmp_dir/fake-kernel_2712_hh.img"
+printf 'fake-rpi5-highhalf-kernel\n' > "$hh_kernel"
+hh_boot="$tmp_dir/highhalf-boot"
+"$generator" \
+  --kernel-input "$hh_kernel" \
+  --boot-dir "$hh_boot" \
+  --phase kernel \
+  --highhalf >/dev/null
+cmp "$hh_kernel" "$hh_boot/kernel_2712.img" >/dev/null || fail "HH kernel differs from explicit input"
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'Explicit high-half diagnostic mode'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'separately built kernel_2712_hh.img artifact'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH_RUST_ENTRY'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH3_DONE'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'HH-3 does not require or'
+[[ ! -e "$hh_boot/initramfs-stage2a.cpio" ]] || fail "HH mode unexpectedly required an initrd"
+
+hh_initrd_boot="$tmp_dir/highhalf-initrd-boot"
+"$generator" \
+  --kernel-input "$hh_kernel" \
+  --initrd-input "$initrd" \
+  --boot-dir "$hh_initrd_boot" \
+  --phase kernel \
+  --highhalf >/dev/null
+cmp "$initrd" "$hh_initrd_boot/initramfs-stage2a.cpio" >/dev/null ||
+  fail "HH mode did not preserve optional initrd staging"
+assert_contains "$hh_initrd_boot/config.txt" 'initramfs initramfs-stage2a.cpio followkernel'
+
+if "$generator" --highhalf --boot-dir "$tmp_dir/hh-missing-kernel" >"$tmp_dir/hh-missing.out" 2>&1; then
+  fail "HH mode without explicit kernel input unexpectedly succeeded"
+fi
+assert_contains "$tmp_dir/hh-missing.out" '--kernel-input is required'
 
 if "$generator" --kernel-input "$kernel" --boot-dir "$default_boot" >"$tmp_dir/no-force.out" 2>&1; then
   fail "existing generated files were overwritten without --force"

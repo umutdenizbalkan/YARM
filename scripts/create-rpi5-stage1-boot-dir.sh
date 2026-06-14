@@ -15,6 +15,7 @@ Required:
 
 Options:
   --initrd-input PATH    Optional newc CPIO image to stage as initramfs-stage2a.cpio.
+  --highhalf             Explicitly stage an HH diagnostic kernel input.
   --boot-dir PATH        Output directory (default: build/rpi5-stage1-boot).
   --phase PHASE          Stop phase: entry, uart, dtb, mmu, or kernel
                          (default: uart).
@@ -43,6 +44,7 @@ cmdline_extra=
 os_check_off=false
 enable_rp1_uart=false
 force=false
+highhalf=false
 
 while (($# > 0)); do
   case "$1" in
@@ -55,6 +57,10 @@ while (($# > 0)); do
       (($# >= 2)) || fail "--initrd-input requires a path"
       initrd_input=$2
       shift 2
+      ;;
+    --highhalf)
+      highhalf=true
+      shift
       ;;
     --boot-dir)
       (($# >= 2)) || fail "--boot-dir requires a path"
@@ -225,6 +231,33 @@ Optional firmware settings are intentionally absent unless requested:
   enable_rp1_uart=1      Generated only with --enable-rp1-uart.
 EOF_README
 
+if [[ "$highhalf" == true ]]; then
+  cat >> "$boot_dir/README-RPI5-STAGE1.txt" <<'EOF_HIGHHALF'
+
+Explicit high-half diagnostic mode
+----------------------------------
+This directory was generated with --highhalf. The staged kernel_2712.img is
+expected to be the separately built kernel_2712_hh.img artifact. This mode is
+diagnostic only: it proves the low-to-high transition, high stack/vector state,
+dual TTBR roots, TCR configuration, and the high UART alias. It does not install
+a userspace TTBR0 root, enter EL0, or start the scheduler/service chain.
+
+Expected HH-3 completion markers:
+  RPI5_HH_LOW_ENTRY
+  RPI5_HH_PLAN_DONE
+  RPI5_HH_ENABLE_DONE
+  RPI5_HH_JUMP_HIGH
+  RPI5_HH_HIGH_ENTRY_OK
+  RPI5_HH_RUST_ENTRY
+  RPI5_HH_REGISTERS_OK
+  RPI5_HH_RUST_UART_OK
+  RPI5_HH3_DONE
+
+An initrd may still be staged with --initrd-input, but HH-3 does not require or
+consume it.
+EOF_HIGHHALF
+fi
+
 cat <<REPORT
 [ok] staged Raspberry Pi 5 Stage 1 boot directory: $boot_dir
 [ok] kernel: $boot_dir/kernel_2712.img
@@ -233,6 +266,9 @@ cat <<REPORT
 [warn] this scaffold does not build firmware files or prove the linked image load address
 [warn] this is Stage 1 diagnostics; it does not claim full Raspberry Pi 5 support
 REPORT
+if [[ "$highhalf" == true ]]; then
+  echo "[ok] mode: explicit RPi5 high-half diagnostic"
+fi
 if [[ -n "$initrd_input" ]]; then
   echo "[ok] initrd: $boot_dir/initramfs-stage2a.cpio"
 fi

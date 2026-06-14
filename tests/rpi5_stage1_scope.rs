@@ -510,8 +510,8 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
     let high_target = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.json");
     let high_linker = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.ld");
     let hh_start = boot.find("RPI5_HH_LOW_ENTRY").unwrap();
-    let hh_end = boot[hh_start..].find("RPI5_HH_DONE").unwrap() + hh_start;
-    let hh = &boot[hh_start..hh_end + "RPI5_HH_DONE".len()];
+    let hh_end = boot[hh_start..].find("RPI5_HH3_DONE").unwrap() + hh_start;
+    let hh = &boot[hh_start..hh_end + "RPI5_HH3_DONE".len()];
 
     assert!(cargo.contains("rpi5-highhalf = [\"rpi5-stage1\"]"));
     assert!(high_target.contains("aarch64-rpi5-stage2-highhalf-none.ld"));
@@ -548,14 +548,28 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH_JUMP_HIGH",
         "RPI5_HH_HIGH_ENTRY_OK",
         "RPI5_HH_VBAR_HIGH_OK",
-        "RPI5_HH_UART_HIGH_OK",
-        "RPI5_HH_DONE",
+        "RPI5_HH_RUST_ENTRY",
+        "RPI5_HH_PC value=0x",
+        "RPI5_HH_SP value=0x",
+        "RPI5_HH_VBAR value=0x",
+        "RPI5_HH_TTBR0 value=0x",
+        "RPI5_HH_TTBR1 value=0x",
+        "RPI5_HH_TCR value=0x",
+        "RPI5_HH_REGISTERS_OK",
+        "RPI5_HH_RUST_UART_OK",
+        "RPI5_HH3_DONE",
+        "RPI5_HH3_FAILED reason=",
+        "RPI5_HH_REGISTER_MISMATCH reason=",
     ] {
         assert!(boot.contains(marker), "missing {marker}");
     }
     assert!(boot.contains("msr TTBR0_EL1, x21"));
     assert!(boot.contains("msr TTBR1_EL1, x22"));
     assert!(boot.contains("ldr x19, =HH_UART_VIRT"));
+    assert!(boot.contains("br x0"));
+    assert!(boot.contains("extern \"C\" fn yarm_rpi5_hh_rust_continue() -> !"));
+    assert!(boot.contains("RPI5_HH_VA_OFFSET: u64 = 0xffff_ff80_0000_0000"));
+    assert!(boot.contains("tcr & (1 << 23) != 0"));
     assert!(policy.contains("plan_rpi5_high_half_transition"));
     assert!(policy.contains("AttributeOverlap"));
     assert!(!hh.contains("Stage2C"));
@@ -567,4 +581,21 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
     assert!(!hh.contains("init_gic"));
     assert!(!hh.contains("init_rp1"));
     assert!(!hh.contains("init_pcie"));
+}
+
+#[test]
+fn rpi5_hh3_build_and_generator_paths_are_explicit() {
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+    let generator = include_str!("../scripts/create-rpi5-stage1-boot-dir.sh");
+    let generator_test = include_str!("../scripts/test-create-rpi5-stage1-boot-dir.sh");
+
+    assert!(build.contains("build-rpi5/kernel_2712_hh.img"));
+    assert!(build.contains("--features rpi5-highhalf"));
+    assert!(build.contains("aarch64-rpi5-stage2-highhalf-none.json"));
+    assert!(build.contains("refusing to overwrite the default RPi5 artifact"));
+    assert!(generator.contains("--highhalf"));
+    assert!(generator.contains("Explicit high-half diagnostic mode"));
+    assert!(generator.contains("RPI5_HH3_DONE"));
+    assert!(generator_test.contains("fake-kernel_2712_hh.img"));
+    assert!(generator_test.contains("HH mode without explicit kernel input"));
 }
