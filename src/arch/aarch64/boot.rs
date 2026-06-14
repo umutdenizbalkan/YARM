@@ -8,7 +8,11 @@ use core::fmt::Write;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    not(feature = "rpi5-highhalf")
+))]
 global_asm!(
     r#"
     .section .bss.bootstack,"aw",@nobits
@@ -114,6 +118,431 @@ yarm_aarch64_enter_el1_if_needed:
 1:
 2:
     ret
+    "#
+);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+global_asm!(
+    r#"
+    /*
+     * HH-2 is a transition diagnostic, not the final user-entry path.  It
+     * builds distinct low-identity and high-kernel roots from linker-reserved
+     * pages, keeps TTBR0 on the low root, enables TTBR1, branches to the high
+     * alias of this code, proves VBAR/UART high aliases, and halts.  It never
+     * installs the Stage2C root and never executes an EL0 ERET.
+     */
+    .equ HH_UART_PHYS,       0x107d001000
+    .equ HH_UART_VIRT,       0xffffff907d001000
+    .equ HH_VA_OFFSET,       0xffffff8000000000
+    .equ HH_RAM_LIMIT,       0x80000000
+    .equ HH_MAIR,            0x04ff
+    .equ HH_TCR,             0x00000002b5193519
+    .equ HH_NORMAL_BLOCK,    0x701
+    .equ HH_DEVICE_PAGE,     0x60000000000707
+    .equ HH_TABLE,           0x3
+
+    .section .bss.bootstack,"aw",@nobits
+    .align 16
+boot_stack_aarch64:
+    .skip 0x01000000
+boot_stack_aarch64_end:
+    .align 16
+exc_stack_aarch64:
+    .skip 65536
+exc_stack_aarch64_end:
+    .align 16
+secondary_boot_stacks:
+    .skip 0x00100000
+secondary_boot_stacks_end:
+
+    .section .text.boot,"ax",@progbits
+    .global _start
+    .type _start,%function
+_start:
+    mov x20, x0
+    ldr x9, =boot_stack_aarch64_end
+    mov sp, x9
+    bl .Lhh_enter_el1
+    ldr x19, =HH_UART_PHYS
+    adr x0, .Lhh_low_entry
+    bl .Lhh_write_cstr
+
+    adr x0, .Lhh_plan_begin
+    bl .Lhh_write_cstr
+    mrs x0, SCTLR_EL1
+    tbnz x0, #0, .Lhh_fail_already_enabled
+    ldr x21, =__hh_ttbr0_root
+    ldr x22, =__hh_ttbr1_root
+    cmp x21, x22
+    b.eq .Lhh_fail_roots
+    tst x21, #0xfff
+    b.ne .Lhh_fail_roots
+    tst x22, #0xfff
+    b.ne .Lhh_fail_roots
+
+    ldr x0, =__hh_pt_pool_start
+    ldr x1, =__hh_pt_pool_end
+.Lhh_zero_pt:
+    cmp x0, x1
+    b.hs .Lhh_zero_pt_done
+    stp xzr, xzr, [x0], #16
+    b .Lhh_zero_pt
+.Lhh_zero_pt_done:
+
+    // TTBR0 retains a bounded 0..2 GiB identity map during the transition.
+    ldr x0, =HH_NORMAL_BLOCK
+    str x0, [x21]
+    ldr x1, =0x40000000
+    orr x1, x1, x0
+    str x1, [x21, #8]
+
+    // TTBR1 maps the same RAM at VA = PA + HH_VA_OFFSET.
+    str x0, [x22]
+    str x1, [x22, #8]
+
+    // UART is outside RAM. Keep its physical alias in TTBR0 until the branch.
+    ldr x23, =__hh_uart0_l2
+    orr x0, x23, #HH_TABLE
+    str x0, [x21, #(65 * 8)]
+    ldr x24, =__hh_uart0_l3
+    orr x0, x24, #HH_TABLE
+    mov x1, #0xf40
+    str x0, [x23, x1]
+    ldr x0, =HH_UART_PHYS
+    ldr x1, =HH_DEVICE_PAGE
+    orr x0, x0, x1
+    mov x1, #8
+    str x0, [x24, x1]
+
+    // TTBR1 receives the equivalent dedicated device-nGnRE high alias.
+    ldr x23, =__hh_uart1_l2
+    orr x0, x23, #HH_TABLE
+    str x0, [x22, #(65 * 8)]
+    ldr x24, =__hh_uart1_l3
+    orr x0, x24, #HH_TABLE
+    mov x1, #0xf40
+    str x0, [x23, x1]
+    ldr x0, =HH_UART_PHYS
+    ldr x1, =HH_DEVICE_PAGE
+    orr x0, x0, x1
+    mov x1, #8
+    str x0, [x24, x1]
+
+    // All required high aliases are contained by the reviewed 0..2 GiB map.
+    ldr x25, =__kernel_phys_start
+    ldr x26, =__kernel_phys_end
+    cmp x26, x25
+    b.ls .Lhh_fail_range
+    ldr x0, =HH_RAM_LIMIT
+    cmp x26, x0
+    b.hi .Lhh_fail_range
+    cbz x20, .Lhh_fail_dtb
+    cmp x20, x0
+    b.hs .Lhh_fail_dtb
+    ldr w1, [x20, #4]
+    rev w1, w1
+    add x27, x20, x1
+    cmp x27, x20
+    b.ls .Lhh_fail_dtb
+    cmp x27, x0
+    b.hi .Lhh_fail_dtb
+
+    adr x0, .Lhh_map_kernel
+    bl .Lhh_write_cstr
+    mov x0, x25
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x25, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x26, x25
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_stack
+    bl .Lhh_write_cstr
+    ldr x25, =boot_stack_aarch64
+    ldr x26, =boot_stack_aarch64_end
+    mov x0, x25
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x25, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x26, x25
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_dtb
+    bl .Lhh_write_cstr
+    mov x0, x20
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x20, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x27, x20
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_heap
+    bl .Lhh_write_cstr
+    ldr x25, =__hh_heap_start
+    ldr x26, =__hh_heap_end
+    mov x0, x25
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x25, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x26, x25
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_uart
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_ttbr0
+    bl .Lhh_write_cstr
+    mov x0, x21
+    bl .Lhh_write_hex_line
+    adr x0, .Lhh_ttbr1
+    bl .Lhh_write_cstr
+    mov x0, x22
+    bl .Lhh_write_hex_line
+    adr x0, .Lhh_tcr
+    bl .Lhh_write_cstr
+    ldr x0, =HH_TCR
+    bl .Lhh_write_hex_line
+    adr x0, .Lhh_plan_done
+    bl .Lhh_write_cstr
+
+    adr x0, .Lhh_enable_begin
+    bl .Lhh_write_cstr
+    ldr x0, =__hh_pt_pool_start
+    ldr x1, =__hh_pt_pool_end
+.Lhh_clean_pt:
+    cmp x0, x1
+    b.hs .Lhh_clean_pt_done
+    dc cvac, x0
+    add x0, x0, #64
+    b .Lhh_clean_pt
+.Lhh_clean_pt_done:
+    dsb sy
+    ldr x0, =HH_MAIR
+    msr MAIR_EL1, x0
+    ldr x0, =HH_TCR
+    msr TCR_EL1, x0
+    msr TTBR0_EL1, x21
+    msr TTBR1_EL1, x22
+    dsb ishst
+    tlbi vmalle1
+    dsb ish
+    isb
+    ic iallu
+    dsb nsh
+    isb
+    mrs x0, SCTLR_EL1
+    orr x0, x0, #(1 << 0)
+    orr x0, x0, #(1 << 2)
+    orr x0, x0, #(1 << 12)
+    msr SCTLR_EL1, x0
+    isb
+    mrs x0, SCTLR_EL1
+    tbz x0, #0, .Lhh_fail_enable
+    adr x0, .Lhh_enable_done
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_jump_high
+    bl .Lhh_write_cstr
+
+    adr x0, .Lhh_high_entry
+    ldr x1, =HH_VA_OFFSET
+    add x0, x0, x1
+    br x0
+
+.Lhh_high_entry:
+    adr x0, .Lhh_high_entry
+    ldr x1, =HH_VA_OFFSET
+    cmp x0, x1
+    b.hs 1f
+    adr x0, .Lhh_high_failed_pc
+    b .Lhh_high_fail
+1:
+    mov x0, sp
+    ldr x1, =HH_VA_OFFSET
+    add x0, x0, x1
+    mov sp, x0
+    adr x0, .Lhh_vectors
+    msr VBAR_EL1, x0
+    isb
+    mrs x1, VBAR_EL1
+    cmp x0, x1
+    b.ne .Lhh_high_failed_vbar
+    ldr x19, =HH_UART_VIRT
+    adr x0, .Lhh_high_ok
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_vbar_ok
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_uart_ok
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_done
+    bl .Lhh_write_cstr
+    b .Lhh_halt
+
+.Lhh_fail_roots:
+    adr x0, .Lhh_failed_roots
+    b .Lhh_low_fail
+.Lhh_fail_already_enabled:
+    adr x0, .Lhh_enable_already
+    b .Lhh_low_fail
+.Lhh_fail_range:
+    adr x0, .Lhh_failed_range
+    b .Lhh_low_fail
+.Lhh_fail_dtb:
+    adr x0, .Lhh_failed_dtb
+    b .Lhh_low_fail
+.Lhh_fail_enable:
+    adr x0, .Lhh_enable_failed
+.Lhh_low_fail:
+    bl .Lhh_write_cstr
+    b .Lhh_halt
+.Lhh_high_failed_vbar:
+    adr x0, .Lhh_high_failed_vbar_msg
+.Lhh_high_fail:
+    bl .Lhh_write_cstr
+.Lhh_halt:
+    wfe
+    b .Lhh_halt
+
+.Lhh_enter_el1:
+    mrs x0, CurrentEL
+    lsr x0, x0, #2
+    cmp x0, #2
+    b.ne 1f
+    mov x0, #(1 << 31)
+    msr HCR_EL2, x0
+    msr CPTR_EL2, xzr
+    msr HSTR_EL2, xzr
+    msr MDCR_EL2, xzr
+    mov x0, sp
+    msr SP_EL1, x0
+    adr x0, 1f
+    msr ELR_EL2, x0
+    mov x0, #0x3c5
+    msr SPSR_EL2, x0
+    isb
+    eret
+1:
+    ret
+
+// x0 = NUL-terminated bytes, x19 = selected low/high UART alias.
+.Lhh_write_cstr:
+    stp x1, x2, [sp, #-16]!
+    stp x3, x30, [sp, #-16]!
+1:
+    ldrb w1, [x0], #1
+    cbz w1, 3f
+    mov x2, #0x10000
+2:
+    ldr w3, [x19, #0x18]
+    tbz w3, #5, 4f
+    subs x2, x2, #1
+    b.ne 2b
+    b 3f
+4:
+    str w1, [x19]
+    b 1b
+3:
+    ldp x3, x30, [sp], #16
+    ldp x1, x2, [sp], #16
+    ret
+
+// x0 = value. Writes exactly 16 lower-case hexadecimal digits.
+.Lhh_write_hex:
+    stp x1, x2, [sp, #-16]!
+    stp x3, x4, [sp, #-16]!
+    stp x5, x30, [sp, #-16]!
+    mov x5, x0
+    mov x4, #60
+1:
+    lsr x1, x5, x4
+    and x1, x1, #0xf
+    cmp x1, #10
+    add x2, x1, #'0'
+    add x3, x1, #('a' - 10)
+    csel x1, x2, x3, lo
+    mov x2, #0x10000
+2:
+    ldr w3, [x19, #0x18]
+    tbz w3, #5, 3f
+    subs x2, x2, #1
+    b.ne 2b
+    b 4f
+3:
+    str w1, [x19]
+4:
+    subs x4, x4, #4
+    b.ge 1b
+    ldp x5, x30, [sp], #16
+    ldp x3, x4, [sp], #16
+    ldp x1, x2, [sp], #16
+    ret
+
+.Lhh_write_hex_line:
+    stp x0, x30, [sp, #-16]!
+    bl .Lhh_write_hex
+    adr x0, .Lhh_crlf
+    bl .Lhh_write_cstr
+    ldp x0, x30, [sp], #16
+    ret
+
+    .balign 2048
+.Lhh_vectors:
+    .rept 16
+    b .Lhh_halt
+    .space 124
+    .endr
+
+    .section .rodata.rpi5_raw_entry,"a",@progbits
+.Lhh_low_entry:       .asciz "RPI5_HH_LOW_ENTRY\r\n"
+.Lhh_plan_begin:      .asciz "RPI5_HH_PLAN_BEGIN\r\n"
+.Lhh_map_kernel:      .asciz "RPI5_HH_MAP_KERNEL phys=0x"
+.Lhh_map_stack:       .asciz "RPI5_HH_MAP_STACK phys=0x"
+.Lhh_map_dtb:         .asciz "RPI5_HH_MAP_DTB phys=0x"
+.Lhh_map_heap:        .asciz "RPI5_HH_MAP_HEAP phys=0x"
+.Lhh_virt_sep:        .asciz " virt=0x"
+.Lhh_size_sep:        .asciz " size=0x"
+.Lhh_map_uart:        .asciz "RPI5_HH_MAP_UART phys=0x000000107d001000 virt=0xffffff907d001000\r\n"
+.Lhh_ttbr0:           .asciz "RPI5_HH_TTBR0_ROOT base=0x"
+.Lhh_ttbr1:           .asciz "RPI5_HH_TTBR1_ROOT base=0x"
+.Lhh_tcr:             .asciz "RPI5_HH_TCR value=0x"
+.Lhh_plan_done:       .asciz "RPI5_HH_PLAN_DONE\r\n"
+.Lhh_enable_begin:    .asciz "RPI5_HH_ENABLE_BEGIN\r\n"
+.Lhh_enable_done:     .asciz "RPI5_HH_ENABLE_DONE\r\n"
+.Lhh_jump_high:       .asciz "RPI5_HH_JUMP_HIGH\r\n"
+.Lhh_high_ok:         .asciz "RPI5_HH_HIGH_ENTRY_OK\r\n"
+.Lhh_vbar_ok:         .asciz "RPI5_HH_VBAR_HIGH_OK\r\n"
+.Lhh_uart_ok:         .asciz "RPI5_HH_UART_HIGH_OK\r\n"
+.Lhh_done:            .asciz "RPI5_HH_DONE\r\n"
+.Lhh_failed_roots:    .asciz "RPI5_HH_PLAN_FAILED reason=invalid_or_shared_roots\r\n"
+.Lhh_failed_range:    .asciz "RPI5_HH_PLAN_FAILED reason=range_outside_high_map\r\n"
+.Lhh_failed_dtb:      .asciz "RPI5_HH_PLAN_FAILED reason=invalid_dtb_range\r\n"
+.Lhh_enable_already:  .asciz "RPI5_HH_ENABLE_FAILED reason=mmu_already_enabled\r\n"
+.Lhh_enable_failed:   .asciz "RPI5_HH_ENABLE_FAILED reason=sctlr_m_not_set\r\n"
+.Lhh_high_failed_pc:  .asciz "RPI5_HH_HIGH_ENTRY_FAILED reason=pc_not_high\r\n"
+.Lhh_high_failed_vbar_msg: .asciz "RPI5_HH_HIGH_ENTRY_FAILED reason=vbar_readback\r\n"
+.Lhh_crlf:            .asciz "\r\n"
     "#
 );
 

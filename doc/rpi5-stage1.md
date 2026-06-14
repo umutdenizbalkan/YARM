@@ -375,6 +375,32 @@ This scaffold does not install TTBR1, alter TCR, branch to a high virtual addres
 or attempt ERET. A later transition must first map the executing kernel, vectors, stack, page tables,
 and required MMIO in TTBR1, branch into the high half, and only then install a user root in TTBR0.
 
+### HH-2 explicit transition diagnostic
+
+The non-default `rpi5-highhalf` feature and
+`targets/aarch64-rpi5-stage2-highhalf-none.json` implement that first transition as a self-contained
+low assembly diagnostic. The current Stage1 target does not enable the feature or select the linker
+script. HH-2 reserves a 16-page low physical page-table pool, a low boot stack, and a 2 MiB diagnostic
+heap in the high-half linker layout.
+
+The trampoline builds distinct roots. TTBR0 maps physical `0..2 GiB` identically and remains
+installed only to keep the low trampoline executable. TTBR1 maps the same RAM at
+`PA + 0xffffff8000000000`; this contains the linked kernel, low boot stack and vectors, page-table
+pool, diagnostic heap, and the firmware DTB after a bounded range check. A separate three-level
+TTBR1 path maps physical UART page `0x107d001000` at `0xffffff907d001000` with MAIR AttrIdx 1,
+device-nGnRE. Conflicting table entries and exhausted/reserved table storage fail closed.
+
+HH-2 programs `MAIR_EL1=0x04ff` and `TCR_EL1=0x00000002b5193519`. T0SZ and T1SZ are both 25
+(39-bit regions), TG0/TG1 select 4 KiB granules, both walks are inner-shareable WB/WA, EPD1 is clear,
+and IPS selects 40-bit physical addresses. After installing the distinct roots and enabling the MMU,
+the trampoline branches to its high alias, moves SP to its high alias, installs the high alias of a
+diagnostic vector table in VBAR_EL1, switches the bounded writer to the high UART alias, emits
+`RPI5_HH_DONE`, and halts.
+
+This path does not call Rust, install the Stage2C user root, enter EL0, dispatch syscalls, or start
+the scheduler/service chain. The only `eret` in the trampoline is the existing architectural
+EL2-to-EL1 descent when firmware did not already enter at EL1.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls

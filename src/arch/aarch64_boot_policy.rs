@@ -262,6 +262,7 @@ pub const RPI5_STAGE1_GICR_SCAN_FRAMES: usize = 4;
 pub const MAX_STAGE1_MMU_MAPPINGS: usize = MAX_DIAGNOSTIC_RANGES + 1 + RPI5_STAGE1_GICR_SCAN_FRAMES;
 pub const MAX_STAGE1_ALLOC_RESERVED_RANGES: usize = MAX_STAGE1_KERNEL_RESERVED_RANGES + 2;
 pub const MAX_STAGE1_ALLOC_USABLE_RANGES: usize = MAX_STAGE1_KERNEL_USABLE_RANGES;
+pub const MAX_RPI5_HIGH_HALF_MAPPINGS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stage1MmuPlan {
@@ -308,6 +309,62 @@ impl Stage1MmuPlanFailure {
             Self::DtbNotMapped => "dtb_not_mapped",
             Self::PageTablePoolNotMapped => "pt_pool_not_mapped",
             Self::EarlyHeapNotMapped => "early_heap_not_mapped",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rpi5HighHalfMapping {
+    pub physical: Stage1KernelRange,
+    pub virtual_range: Stage1KernelRange,
+    pub memory_type: Stage1MmuMemoryType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rpi5HighHalfPlan {
+    pub mappings: [Rpi5HighHalfMapping; MAX_RPI5_HIGH_HALF_MAPPINGS],
+    pub mapping_count: usize,
+    pub ttbr0_root: u64,
+    pub ttbr1_root: u64,
+    pub tcr_el1: u64,
+    pub mair_el1: u64,
+}
+
+impl Default for Rpi5HighHalfPlan {
+    fn default() -> Self {
+        Self {
+            mappings: [Rpi5HighHalfMapping::default(); MAX_RPI5_HIGH_HALF_MAPPINGS],
+            mapping_count: 0,
+            ttbr0_root: 0,
+            ttbr1_root: 0,
+            tcr_el1: 0,
+            mair_el1: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rpi5HighHalfPlanFailure {
+    #[default]
+    InvalidRange,
+    AddressOverflow,
+    MappingCapacity,
+    AttributeOverlap,
+    InvalidTtbr0Root,
+    MissingTtbr1Root,
+    SharedRoots,
+}
+
+impl Rpi5HighHalfPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InvalidRange => "invalid_range",
+            Self::AddressOverflow => "address_overflow",
+            Self::MappingCapacity => "mapping_capacity",
+            Self::AttributeOverlap => "attribute_overlap",
+            Self::InvalidTtbr0Root => "invalid_ttbr0_root",
+            Self::MissingTtbr1Root => "missing_ttbr1_root",
+            Self::SharedRoots => "shared_roots",
         }
     }
 }
@@ -1155,6 +1212,98 @@ pub fn plan_rpi5_stage1_identity_map(
         }
     }
     Ok(plan)
+}
+
+pub fn plan_rpi5_high_half_transition(
+    ttbr0_root: u64,
+    ttbr1_root: u64,
+    kernel: Stage1KernelRange,
+    stack: Stage1KernelRange,
+    vector: Stage1KernelRange,
+    page_tables: Stage1KernelRange,
+    dtb: Stage1KernelRange,
+    heap: Stage1KernelRange,
+    uart_base: u64,
+) -> Result<Rpi5HighHalfPlan, Rpi5HighHalfPlanFailure> {
+    if ttbr0_root == 0 || ttbr0_root % STAGE1_PAGE_SIZE != 0 {
+        return Err(Rpi5HighHalfPlanFailure::InvalidTtbr0Root);
+    }
+    if ttbr1_root == 0 || ttbr1_root % STAGE1_PAGE_SIZE != 0 {
+        return Err(Rpi5HighHalfPlanFailure::MissingTtbr1Root);
+    }
+    if ttbr0_root == ttbr1_root {
+        return Err(Rpi5HighHalfPlanFailure::SharedRoots);
+    }
+
+    // T0SZ/T1SZ=25 selects two 39-bit translation regions. Both walks use
+    // 4 KiB granules, inner-shareable WB/WA table walks, and a 40-bit PA.
+    const HH_TCR_EL1: u64 = 0x0000_0002_b519_3519;
+    const HH_MAIR_EL1: u64 = 0x04ff;
+    let mut plan = Rpi5HighHalfPlan {
+        ttbr0_root,
+        ttbr1_root,
+        tcr_el1: HH_TCR_EL1,
+        mair_el1: HH_MAIR_EL1,
+        ..Rpi5HighHalfPlan::default()
+    };
+    for physical in [kernel, stack, vector, page_tables, dtb, heap] {
+        append_rpi5_high_half_mapping(
+            &mut plan,
+            high_half_mapping(physical, Stage1MmuMemoryType::Normal)?,
+        )?;
+    }
+    let uart_start = align_down_u64_policy(uart_base, STAGE1_PAGE_SIZE);
+    let uart = Stage1KernelRange::new(
+        uart_start,
+        uart_start
+            .checked_add(STAGE1_PAGE_SIZE)
+            .ok_or(Rpi5HighHalfPlanFailure::AddressOverflow)?,
+    );
+    append_rpi5_high_half_mapping(
+        &mut plan,
+        high_half_mapping(uart, Stage1MmuMemoryType::DeviceNgnre)?,
+    )?;
+    Ok(plan)
+}
+
+fn high_half_mapping(
+    physical: Stage1KernelRange,
+    memory_type: Stage1MmuMemoryType,
+) -> Result<Rpi5HighHalfMapping, Rpi5HighHalfPlanFailure> {
+    if physical.start >= physical.end
+        || physical.start % STAGE1_PAGE_SIZE != 0
+        || physical.end % STAGE1_PAGE_SIZE != 0
+    {
+        return Err(Rpi5HighHalfPlanFailure::InvalidRange);
+    }
+    let virtual_start = checked_phys_to_rpi5_kernel_virt(physical.start)
+        .ok_or(Rpi5HighHalfPlanFailure::AddressOverflow)?;
+    let virtual_end = checked_phys_to_rpi5_kernel_virt(physical.end)
+        .ok_or(Rpi5HighHalfPlanFailure::AddressOverflow)?;
+    Ok(Rpi5HighHalfMapping {
+        physical,
+        virtual_range: Stage1KernelRange::new(virtual_start, virtual_end),
+        memory_type,
+    })
+}
+
+fn append_rpi5_high_half_mapping(
+    plan: &mut Rpi5HighHalfPlan,
+    mapping: Rpi5HighHalfMapping,
+) -> Result<(), Rpi5HighHalfPlanFailure> {
+    if plan.mapping_count == plan.mappings.len() {
+        return Err(Rpi5HighHalfPlanFailure::MappingCapacity);
+    }
+    for existing in &plan.mappings[..plan.mapping_count] {
+        if existing.virtual_range.overlaps(mapping.virtual_range)
+            && existing.memory_type != mapping.memory_type
+        {
+            return Err(Rpi5HighHalfPlanFailure::AttributeOverlap);
+        }
+    }
+    plan.mappings[plan.mapping_count] = mapping;
+    plan.mapping_count += 1;
+    Ok(())
 }
 
 pub const fn rpi5_stage1_timer_delta(begin: u64, end: u64) -> Option<u64> {
@@ -3799,6 +3948,81 @@ mod tests {
         assert!(!is_rpi5_kernel_high_va(0x80000));
         assert_eq!(checked_phys_to_rpi5_kernel_virt(u64::MAX), None);
         assert!(!is_rpi5_low_phys(u64::MAX));
+    }
+
+    fn rpi5_high_half_plan() -> Rpi5HighHalfPlan {
+        plan_rpi5_high_half_transition(
+            0x05b5_0000,
+            0x05b6_0000,
+            Stage1KernelRange::new(0x0008_0000, 0x05b5_0000),
+            Stage1KernelRange::new(0x0100_0000, 0x0200_0000),
+            Stage1KernelRange::new(0x0010_0000, 0x0010_1000),
+            Stage1KernelRange::new(0x05b5_0000, 0x05b9_0000),
+            Stage1KernelRange::new(0x2efe_c000, 0x2f00_0000),
+            Stage1KernelRange::new(0x05b9_0000, 0x05d9_0000),
+            0x10_7d00_1000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rpi5_high_half_plan_covers_transition_resources_and_distinct_roots() {
+        let plan = rpi5_high_half_plan();
+        assert_ne!(plan.ttbr0_root, plan.ttbr1_root);
+        assert_eq!(plan.tcr_el1, 0x0000_0002_b519_3519);
+        assert_eq!(plan.mair_el1, 0x04ff);
+        for expected in [
+            Stage1KernelRange::new(0x0008_0000, 0x05b5_0000),
+            Stage1KernelRange::new(0x0100_0000, 0x0200_0000),
+            Stage1KernelRange::new(0x0010_0000, 0x0010_1000),
+            Stage1KernelRange::new(0x05b5_0000, 0x05b9_0000),
+            Stage1KernelRange::new(0x2efe_c000, 0x2f00_0000),
+            Stage1KernelRange::new(0x05b9_0000, 0x05d9_0000),
+        ] {
+            assert!(plan.mappings[..plan.mapping_count].iter().any(|mapping| {
+                mapping.physical == expected
+                    && mapping.virtual_range.start == phys_to_rpi5_kernel_virt(expected.start)
+                    && mapping.virtual_range.end == phys_to_rpi5_kernel_virt(expected.end)
+                    && mapping.memory_type == Stage1MmuMemoryType::Normal
+            }));
+        }
+        assert!(plan.mappings[..plan.mapping_count].iter().any(|mapping| {
+            mapping.physical == Stage1KernelRange::new(0x10_7d00_1000, 0x10_7d00_2000)
+                && mapping.virtual_range
+                    == Stage1KernelRange::new(0xffff_ff90_7d00_1000, 0xffff_ff90_7d00_2000)
+                && mapping.memory_type == Stage1MmuMemoryType::DeviceNgnre
+        }));
+    }
+
+    #[test]
+    fn rpi5_high_half_plan_rejects_missing_root_and_conflicting_attributes() {
+        assert_eq!(
+            plan_rpi5_high_half_transition(
+                0x05b5_0000,
+                0,
+                Stage1KernelRange::new(0x0008_0000, 0x05b5_0000),
+                Stage1KernelRange::new(0x0100_0000, 0x0200_0000),
+                Stage1KernelRange::new(0x0010_0000, 0x0010_1000),
+                Stage1KernelRange::new(0x05b5_0000, 0x05b9_0000),
+                Stage1KernelRange::new(0x2efe_c000, 0x2f00_0000),
+                Stage1KernelRange::new(0x05b9_0000, 0x05d9_0000),
+                0x10_7d00_1000,
+            ),
+            Err(Rpi5HighHalfPlanFailure::MissingTtbr1Root)
+        );
+        let mut plan = rpi5_high_half_plan();
+        let conflicting = Rpi5HighHalfMapping {
+            physical: Stage1KernelRange::new(0x0008_0000, 0x0009_0000),
+            virtual_range: Stage1KernelRange::new(
+                phys_to_rpi5_kernel_virt(0x0008_0000),
+                phys_to_rpi5_kernel_virt(0x0009_0000),
+            ),
+            memory_type: Stage1MmuMemoryType::DeviceNgnre,
+        };
+        assert_eq!(
+            append_rpi5_high_half_mapping(&mut plan, conflicting),
+            Err(Rpi5HighHalfPlanFailure::AttributeOverlap)
+        );
     }
 
     #[test]

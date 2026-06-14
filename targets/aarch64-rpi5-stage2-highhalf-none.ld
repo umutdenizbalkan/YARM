@@ -6,8 +6,8 @@
  *
  * This script establishes load-address and symbol contracts only. The current
  * hardware-proven Stage1 image continues to use aarch64-rpi5-stage1-none.ld.
- * A future low trampoline will establish TTBR1 before branching to these
- * high-half sections.
+ * The rpi5-highhalf diagnostic feature supplies a self-contained low
+ * trampoline that establishes TTBR1 before branching to these sections.
  */
 
 ENTRY(_start)
@@ -37,6 +37,37 @@ SECTIONS {
     } :boot
 
     . = ALIGN(4096);
+    .bss.bootstack (NOLOAD) : {
+        *(.bss.bootstack)
+    } :boot
+
+    . = ALIGN(4096);
+    __hh_pt_pool_start = .;
+    .bss.hh_pt (NOLOAD) : {
+        __hh_ttbr0_root = .;
+        . += 4096;
+        __hh_ttbr1_root = .;
+        . += 4096;
+        __hh_uart0_l2 = .;
+        . += 4096;
+        __hh_uart0_l3 = .;
+        . += 4096;
+        __hh_uart1_l2 = .;
+        . += 4096;
+        __hh_uart1_l3 = .;
+        . += 4096;
+        . += 10 * 4096;
+    } :boot
+    __hh_pt_pool_end = .;
+
+    . = ALIGN(4096);
+    __hh_heap_start = .;
+    .bss.hh_heap (NOLOAD) : {
+        . += 2 * 1024 * 1024;
+    } :boot
+    __hh_heap_end = .;
+
+    . = ALIGN(4096);
     __boot_low_end = .;
 
     __kernel_phys_start = __boot_low_end;
@@ -56,10 +87,6 @@ SECTIONS {
     } :data
 
     __bss_start = .;
-
-    .bss.bootstack (NOLOAD) : ALIGN(16) {
-        *(.bss.bootstack)
-    } :data
 
     .bss (NOLOAD) : ALIGN(16) {
         *(.bss*)

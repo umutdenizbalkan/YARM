@@ -34,6 +34,7 @@ trace_boot_vm = []
 trace_frame_alloc = []
 legacy-tests = []
 rpi5-stage1 = []
+rpi5-highhalf = ["rpi5-stage1"]
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }

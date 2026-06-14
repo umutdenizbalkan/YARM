@@ -500,3 +500,71 @@ fn rpi5_high_half_scaffold_is_explicit_and_non_default() {
     assert!(documentation.contains("This scaffold does not install TTBR1"));
     assert!(documentation.contains("only then install a user root in TTBR0"));
 }
+
+#[test]
+fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
+    let cargo = include_str!("../Cargo.toml");
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let policy = include_str!("../src/arch/aarch64_boot_policy.rs");
+    let stage1_target = include_str!("../targets/aarch64-rpi5-stage1-none.json");
+    let high_target = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.json");
+    let high_linker = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.ld");
+    let hh_start = boot.find("RPI5_HH_LOW_ENTRY").unwrap();
+    let hh_end = boot[hh_start..].find("RPI5_HH_DONE").unwrap() + hh_start;
+    let hh = &boot[hh_start..hh_end + "RPI5_HH_DONE".len()];
+
+    assert!(cargo.contains("rpi5-highhalf = [\"rpi5-stage1\"]"));
+    assert!(high_target.contains("aarch64-rpi5-stage2-highhalf-none.ld"));
+    assert!(high_target.contains("\"code-model\": \"large\""));
+    assert!(!stage1_target.contains("aarch64-rpi5-stage2-highhalf-none.ld"));
+    for symbol in [
+        "__hh_pt_pool_start",
+        "__hh_pt_pool_end",
+        "__hh_ttbr0_root",
+        "__hh_ttbr1_root",
+        "__hh_uart0_l2",
+        "__hh_uart0_l3",
+        "__hh_uart1_l2",
+        "__hh_uart1_l3",
+        "__hh_heap_start",
+        "__hh_heap_end",
+    ] {
+        assert!(high_linker.contains(symbol));
+    }
+    for marker in [
+        "RPI5_HH_LOW_ENTRY",
+        "RPI5_HH_PLAN_BEGIN",
+        "RPI5_HH_MAP_KERNEL",
+        "RPI5_HH_MAP_STACK",
+        "RPI5_HH_MAP_DTB",
+        "RPI5_HH_MAP_HEAP",
+        "RPI5_HH_MAP_UART",
+        "RPI5_HH_TTBR0_ROOT",
+        "RPI5_HH_TTBR1_ROOT",
+        "RPI5_HH_TCR",
+        "RPI5_HH_PLAN_DONE",
+        "RPI5_HH_ENABLE_BEGIN",
+        "RPI5_HH_ENABLE_DONE",
+        "RPI5_HH_JUMP_HIGH",
+        "RPI5_HH_HIGH_ENTRY_OK",
+        "RPI5_HH_VBAR_HIGH_OK",
+        "RPI5_HH_UART_HIGH_OK",
+        "RPI5_HH_DONE",
+    ] {
+        assert!(boot.contains(marker), "missing {marker}");
+    }
+    assert!(boot.contains("msr TTBR0_EL1, x21"));
+    assert!(boot.contains("msr TTBR1_EL1, x22"));
+    assert!(boot.contains("ldr x19, =HH_UART_VIRT"));
+    assert!(policy.contains("plan_rpi5_high_half_transition"));
+    assert!(policy.contains("AttributeOverlap"));
+    assert!(!hh.contains("Stage2C"));
+    assert!(!hh.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!hh.contains("yarm_log!"));
+    assert!(!hh.contains("printk"));
+    assert!(!hh.contains("SpawnV5"));
+    assert!(!hh.contains("scheduler"));
+    assert!(!hh.contains("init_gic"));
+    assert!(!hh.contains("init_rp1"));
+    assert!(!hh.contains("init_pcie"));
+}
