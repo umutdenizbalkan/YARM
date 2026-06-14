@@ -92,11 +92,22 @@ pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
     // change. The knob is applied ONLY when present and valid; otherwise the
     // console loglevel keeps its production default (Info). The
     // `BootCommandLine` storage itself stays policy-neutral.
-    if let Some(level) = parse_yarm_boot_options(captured.raw_cmdline()).console_loglevel {
+    let parsed = parse_yarm_boot_options(captured.raw_cmdline());
+    if let Some(level) = parsed.console_loglevel {
         crate::kernel::printk::set_console_loglevel(
             crate::kernel::printk::LogLevel::from_u8_public(level),
         );
         crate::yarm_log!("YARM_LOGLEVEL_SET level={}", level);
+    }
+    // Stage 109 / Milestone 2 Pass 2: apply the `yarm.x86_ap_rust=` gate.
+    // Today the trampoline asm is unchanged from Stage 108 so this flag
+    // currently has no observable effect on AP behavior; the plumbing
+    // proves the cmdline-to-arch-SMP route works end-to-end and is
+    // available for Pass 3 when the trampoline Rust-jump is wired live.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(enabled) = parsed.x86_ap_rust {
+        crate::arch::x86_64::smp::set_ap_rust_entry_enabled(enabled);
+        crate::yarm_log!("YARM_X86_AP_RUST_SET enabled={}", enabled);
     }
     captured
 }
@@ -137,6 +148,12 @@ pub struct YarmBootOptions<'a> {
     /// at its production default (Info). The knob can only be applied at
     /// boot-cmdline capture time; it never changes the default.
     pub console_loglevel: Option<u8>,
+    /// Stage 109 / Milestone 2 Pass 2: `yarm.x86_ap_rust=1` knob. Sets the
+    /// `set_ap_rust_entry_enabled` gate in `arch::x86_64::smp` at capture
+    /// time. Today the trampoline asm is unchanged and ignores the gate;
+    /// the knob exists as Pass 2 scaffolding so the cmdline plumbing for
+    /// Pass 3's live Rust-entry wiring is already in place and testable.
+    pub x86_ap_rust: Option<bool>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -205,6 +222,13 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
             // semantics, so mirror those exactly: last token wins, and an
             // invalid last token clears back to None).
             options.console_loglevel = parse_loglevel_value(value);
+        }
+        if key == b"yarm.x86_ap_rust" {
+            options.x86_ap_rust = match value {
+                b"1" | b"true" | b"yes" | b"on" => Some(true),
+                b"0" | b"false" | b"no" | b"off" => Some(false),
+                _ => None,
+            };
         }
     }
     options

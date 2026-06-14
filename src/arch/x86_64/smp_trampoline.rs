@@ -269,8 +269,24 @@ unsafe extern "C" {
     static yarm_ap_trampoline_handoff: u8;
 }
 
-// Kept as a future AP Rust entry point, but SMP-1 does not call it yet.
-// The AP is parked in assembly after writing ready_word.
+/// Stage 109 / Milestone 2 Pass 2: AP Rust online flag, distinct from
+/// `AP_READY_FLAGS` (which tracks trampoline assembly reach). Set by a
+/// future Rust AP entry function once the AP per-CPU environment exists
+/// (audit doc §22 / §23). Today every slot stays `false`; the static is
+/// retained so the BSP `start_secondary_cpus` polling code in smp.rs has a
+/// stable symbol to reference.
+pub(super) static AP_RUST_ONLINE: [core::sync::atomic::AtomicBool;
+    crate::arch::platform_constants::MAX_CPUS] = [const {
+    core::sync::atomic::AtomicBool::new(false)
+}; crate::arch::platform_constants::MAX_CPUS];
+
+// Kept as a future AP Rust entry point, but Pass 2 does not call it yet.
+// The trampoline still falls through to the assembly cli/hlt park loop;
+// jumping here from the trampoline was prototyped and reverted in Pass 2
+// after observing an unexplained BSP service-chain regression under
+// `-smp 2`. The exact blocker — likely AP per-CPU FX state / .rodata-or-.bss
+// AP-side mapping — is documented in
+// doc/KERNEL_UNLOCKING_MILESTONE_2.md §3 (Pass 3 work item).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 #[unsafe(no_mangle)]
 pub(super) extern "C" fn yarm_x86_64_ap_entry(_handoff_ptr: *const ApHandoff) -> ! {
