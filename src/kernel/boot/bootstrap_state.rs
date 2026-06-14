@@ -447,8 +447,10 @@ impl Bootstrap {
         boot_regions: &[MemoryRegion],
         reserved_ranges: &[(u64, u64)],
     ) -> Result<&'static mut KernelState, KernelError> {
+        crate::arch::boot_entry::bootstrap_step("enter");
         // Register all reserved ranges in the global frame allocator guard and emit
         // PMEM_RESERVE_* diagnostics so boot logs show the full reserved map.
+        crate::arch::boot_entry::bootstrap_step("reserved_ranges");
         for &(start, end) in reserved_ranges {
             if end <= start {
                 continue;
@@ -509,13 +511,18 @@ impl Bootstrap {
         // emitted and the kernel panics if the invariant is broken.
         Self::assert_pools_disjoint(pt_slice, main_slice);
 
+        crate::arch::boot_entry::bootstrap_step("pt_frame_allocator");
         init_pt_frame_allocator(pt_slice).map_err(|_| KernelError::MemoryObjectFull)?;
+        crate::arch::boot_entry::bootstrap_step("frame_allocator");
         frame_allocator
             .init_from_memory_map(main_slice)
             .map_err(|_| KernelError::MemoryObjectFull)?;
+        crate::arch::boot_entry::bootstrap_step("page_table_reset_state");
         crate::arch::selected_isa::page_table::reset_state();
 
+        crate::arch::boot_entry::bootstrap_step("kernel_aspace_new");
         let mut kernel_aspace = AddressSpace::new_kernel();
+        crate::arch::boot_entry::bootstrap_step("kernel_aspace_map_page");
         kernel_aspace
             .map_page(
                 VirtAddr(platform_constants::KERNEL_BOOTSTRAP_VIRT_BASE),
@@ -529,6 +536,7 @@ impl Bootstrap {
                 other => KernelError::Vm(other),
             })?;
 
+        crate::arch::boot_entry::bootstrap_step("scheduler_new");
         let mut scheduler = SmpScheduler::default();
         let present_cpu_bitmap =
             crate::arch::boot_entry::take_staged_present_cpu_bitmap_for_bootstrap()
@@ -541,6 +549,7 @@ impl Bootstrap {
             )
             .map_err(map_scheduler_error)?;
 
+        crate::arch::boot_entry::bootstrap_step("kernel_state_write");
         unsafe {
             let state_ptr = core::ptr::addr_of_mut!(BOOTSTRAP_KERNEL_STATE).cast::<KernelState>();
             core::ptr::addr_of_mut!((*state_ptr).kernel_aspace).write(kernel_aspace);
@@ -665,8 +674,11 @@ impl Bootstrap {
                     .next_dynamic_tid(state.tid_allocation_policy)
             );
 
+            crate::arch::boot_entry::bootstrap_step("register_task_0");
             state.register_task(0)?;
+            crate::arch::boot_entry::bootstrap_step("dispatch_next_task");
             state.dispatch_next_task()?;
+            crate::arch::boot_entry::bootstrap_step("done");
             Ok(state)
         }
     }

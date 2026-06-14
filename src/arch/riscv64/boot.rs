@@ -10,7 +10,19 @@ global_asm!(
     .section .bss.bootstack,"aw",@nobits
     .align 16
 boot_stack_riscv64:
-    .skip 16384
+    // 16 MiB boot stack, matching x86_64 and AArch64. The previous 16 KiB was
+    // grossly undersized: `Bootstrap::init()` returns `KernelState` (~5 KiB)
+    // by value, and the init chain holds several `KernelState`-sized copies on
+    // the stack simultaneously (the `init()` return slot, the
+    // `init_with_capacity_profile` `*state` temporary, the `init_boxed`
+    // `MaybeUninit<KernelState>` temporary, and the caller's `kernel` binding),
+    // plus the deep run_kernel_boot call chain and core::fmt machinery. With
+    // only 16 KiB this overflowed the boot stack downward, corrupting a saved
+    // return address so a later `ret` jumped to ~-2 and faulted with an
+    // instruction access fault at sepc=0xfffffffffffffffe. x86_64/AArch64 never
+    // hit this because their boot stacks are 16 MiB. Lives in .bss (NOLOAD),
+    // so it costs RAM only, not image size.
+    .skip 0x01000000
 boot_stack_riscv64_end:
 
     .section .text.boot,"ax",@progbits
@@ -154,6 +166,13 @@ unsafe extern "C" {
     fn yarm_kernel_main(start_info_ptr: usize) -> !;
 }
 
+// Kernel image bounds from the linker script (riscv64-yarm-none.ld), used to
+// reserve the firmware window below the kernel during RAM staging.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+unsafe extern "C" {
+    static __kernel_start: u8;
+}
+
 /// Rust primary (boot-hart) entry, tail-called from `_start` with the
 /// preserved OpenSBI handoff registers. Emits the early boot markers, then
 /// hands `dtb_ptr` to the common kernel entry exactly as the previous
@@ -183,9 +202,47 @@ extern "C" fn yarm_riscv64_secondary_cold_park(hart_id: usize) -> ! {
     }
 }
 
+/// Current kernel-bootstrap step breadcrumb, published by
+/// [`riscv64_set_bootstrap_step`] and read by the early trap reporter so a
+/// fault during `Bootstrap::init` can be attributed to a named step even
+/// though the boot hart has no kernel logging context yet. We store a
+/// `&'static str` as (ptr,len) in two atomics; the strings are static, so the
+/// pointer stays valid for the whole boot.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static BOOTSTRAP_STEP_PTR: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static BOOTSTRAP_STEP_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Records the current bootstrap step and emits a `RISCV_BOOTSTRAP_BEFORE_*`
+/// breadcrumb. Called from the (arch-agnostic) kernel bootstrap via the
+/// `arch::boot_entry::bootstrap_step` facade; a no-op on other arches.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn riscv64_set_bootstrap_step(name: &'static str) {
+    use core::sync::atomic::Ordering;
+    BOOTSTRAP_STEP_PTR.store(name.as_ptr() as usize, Ordering::Relaxed);
+    BOOTSTRAP_STEP_LEN.store(name.len(), Ordering::Relaxed);
+    early_marker!("RISCV_BOOTSTRAP_BEFORE_{}", name);
+}
+
+/// Returns the current bootstrap step name, if any (used by the trap reporter).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn current_bootstrap_step() -> Option<&'static str> {
+    use core::sync::atomic::Ordering;
+    let ptr = BOOTSTRAP_STEP_PTR.load(Ordering::Relaxed);
+    let len = BOOTSTRAP_STEP_LEN.load(Ordering::Relaxed);
+    if ptr == 0 || len == 0 || len > 64 {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    core::str::from_utf8(bytes).ok()
+}
+
 /// Early trap reporter, tail-called from the early S-mode trap vector. Reports
-/// the trap CSRs once and parks, converting any pre-kernel fault into a single
-/// deterministic diagnostic instead of an invisible payload-reset loop.
+/// the trap CSRs once (plus the named bootstrap step, if known) and parks,
+/// converting any pre-kernel fault into a single deterministic diagnostic
+/// instead of an invisible payload-reset loop.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_riscv64_early_trap_report(scause: usize, sepc: usize, stval: usize) -> ! {
@@ -195,6 +252,9 @@ extern "C" fn yarm_riscv64_early_trap_report(scause: usize, sepc: usize, stval: 
         sepc,
         stval
     );
+    if let Some(step) = current_bootstrap_step() {
+        early_marker!("RISCV_BOOTSTRAP_TRAP_STEP name={}", step);
+    }
     loop {
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
@@ -846,19 +906,46 @@ pub fn release_secondary_cpus_after_bootstrap() {}
 
 pub fn enter_dispatched_user_task_if_available(
     _kernel: &crate::kernel::boot::KernelState,
-    _dispatched_tid: Option<u64>,
+    dispatched_tid: Option<u64>,
 ) {
+    // Fail-closed: the RISC-V S-mode -> U-mode transition is not yet
+    // implemented. Reaching this point means the kernel booted, the
+    // initramfs ELFs were spawned, and the scheduler selected a user task,
+    // but the arch prerequisites for entering U-mode are missing:
+    //   - Sv39 paging is not enabled (the kernel still runs with satp=0,
+    //     identity-mapped); the user ELF is mapped at its virtual address
+    //     inside a per-task page table that is never activated.
+    //   - There is no installed S-mode trap vector for user traps (only the
+    //     early pre-kernel diagnostic vector), and no user trap save/restore
+    //     or enter-user (`sret`) asm path.
+    // Until those land, do NOT fabricate a transition; report the exact
+    // blocker and let the boot hart idle deterministically.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    if let Some(tid) = dispatched_tid {
+        early_marker!(
+            "RISCV_USERSPACE_DEFERRED reason=no_smode_to_umode_path_no_sv39_paging tid={}",
+            tid
+        );
+    }
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+    let _ = dispatched_tid;
 }
 
 pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
-    let mut kernel = crate::kernel::boot::Bootstrap::init().expect("kernel init");
+    // Use the in-place static initializer (writes BOOTSTRAP_KERNEL_STATE in
+    // .bss and returns a &'static mut), exactly like x86_64/AArch64. The
+    // boxed `Bootstrap::init()` path would `Box::new` the ~4.27 MiB bare-metal
+    // KernelState out of the 1 MiB page-table frame pool and OOM (silent
+    // panic-loop); init_static avoids the heap entirely.
+    let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
         kernel.present_cpu_bitmap(),
         kernel.online_cpu_count()
     );
-    run(&mut kernel);
+    crate::yarm_log!("RISCV_KERNEL_BOOT_OK");
+    run(kernel);
 }
 
 /// Tracks whether the RISC-V boot command line has already been captured.
@@ -916,7 +1003,107 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
         "RISCV_CMDLINE_CAPTURE_ONCE len={}",
         captured.raw_cmdline().len()
     );
+
+    // Stage the real RAM window and reserve firmware/DTB/initrd so the frame
+    // allocator never hands out MMIO or firmware memory. Without this the
+    // common fallback memory map (NEXT_ANON_PHYS_BASE = 0x1000_0000, the QEMU
+    // virt UART region, which is BELOW RAM at 0x8000_0000) seeded the
+    // allocators with MMIO addresses, producing a store access fault when the
+    // first frame was written.
+    stage_riscv64_boot_memory(dtb, start_info_ptr);
 }
+
+/// Stages the real RAM window from the DTB and reserves the firmware, DTB, and
+/// initramfs regions for the frame allocator. RISC-V-specific; mirrors what the
+/// PVH (x86_64) and DTB (AArch64) paths already do for their allocators.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn stage_riscv64_boot_memory(dtb: &'static [u8], dtb_ptr: usize) {
+    let page = crate::kernel::vm::PAGE_SIZE as u64;
+
+    let Some((ram_base, ram_size)) = crate::arch::fdt::memory_reg(dtb) else {
+        // Fail closed: without a trustworthy RAM window we must not guess, or
+        // the allocator could stomp MMIO/firmware. The kernel image range is
+        // still reserved by default_reserved_ranges; bootstrap will then fail
+        // deterministically rather than corrupt memory.
+        early_marker!("RISCV_MEM_PARSE_FAILED reason=no_memory_reg");
+        return;
+    };
+    let ram_end = ram_base.saturating_add(ram_size);
+    early_marker!(
+        "RISCV_MEM_RAM base=0x{:x} size=0x{:x} end=0x{:x}",
+        ram_base,
+        ram_size,
+        ram_end
+    );
+    let _ = crate::arch::boot_entry::stage_detected_ram_for_bootstrap(&[
+        crate::kernel::frame_allocator::MemoryRegion {
+            start: ram_base,
+            len: ram_size,
+            usable: true,
+        },
+    ]);
+
+    let mut reserved: [(u64, u64); MAX_BOOT_EXTRA_RESERVED_RISCV] =
+        [(0, 0); MAX_BOOT_EXTRA_RESERVED_RISCV];
+    let mut reserved_len = 0usize;
+
+    // Firmware (OpenSBI) occupies RAM from ram_base up to the kernel image.
+    let kernel_start = (core::ptr::addr_of!(__kernel_start) as u64) & !(page - 1);
+    if kernel_start > ram_base {
+        reserved[reserved_len] = (ram_base, kernel_start);
+        reserved_len += 1;
+        early_marker!(
+            "RISCV_MEM_RESERVE_FIRMWARE start=0x{:x} end=0x{:x}",
+            ram_base,
+            kernel_start
+        );
+    }
+
+    // The DTB blob itself (we are still reading it; reserve so it survives).
+    let dtb_start = (dtb_ptr as u64) & !(page - 1);
+    let dtb_end = ((dtb_ptr as u64).saturating_add(dtb.len() as u64) + (page - 1)) & !(page - 1);
+    if dtb_end > dtb_start && reserved_len < reserved.len() {
+        reserved[reserved_len] = (dtb_start, dtb_end);
+        reserved_len += 1;
+        early_marker!(
+            "RISCV_MEM_RESERVE_DTB start=0x{:x} end=0x{:x}",
+            dtb_start,
+            dtb_end
+        );
+    }
+
+    // The initramfs, located via /chosen. Register it for later ELF loading and
+    // reserve its frames.
+    if let Some((initrd_start, initrd_end)) = crate::arch::fdt::chosen_initrd(dtb) {
+        let initrd_len = initrd_end.saturating_sub(initrd_start) as usize;
+        if initrd_len > 0 {
+            // SAFETY: the DTB-provided initrd window is immutable boot memory
+            // inside the RAM region staged above.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(initrd_start as *const u8, initrd_len) };
+            crate::kernel::boot::Bootstrap::install_boot_initrd_bytes(bytes);
+        }
+        let initrd_pa_start = initrd_start & !(page - 1);
+        let initrd_pa_end = (initrd_end + (page - 1)) & !(page - 1);
+        if initrd_pa_end > initrd_pa_start && reserved_len < reserved.len() {
+            reserved[reserved_len] = (initrd_pa_start, initrd_pa_end);
+            reserved_len += 1;
+        }
+        early_marker!(
+            "RISCV_MEM_RESERVE_INITRD start=0x{:x} end=0x{:x} len=0x{:x}",
+            initrd_start,
+            initrd_end,
+            initrd_len
+        );
+    } else {
+        early_marker!("RISCV_INITRD_ABSENT reason=no_chosen_initrd");
+    }
+
+    crate::kernel::boot::Bootstrap::install_boot_extra_reserved_ranges(&reserved[..reserved_len]);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+const MAX_BOOT_EXTRA_RESERVED_RISCV: usize = 4;
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn dtb_slice_from_start_info(start_info_ptr: usize) -> Option<&'static [u8]> {
