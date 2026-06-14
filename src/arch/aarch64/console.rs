@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), not(feature = "rpi5-stage1")))]
 use crate::kernel::lock::SpinLockIrq;
 #[cfg(not(feature = "hosted-dev"))]
 use core::ptr::{read_volatile, write_volatile};
@@ -25,11 +25,16 @@ const PL011_FR_TXFF: u32 = 1 << 5;
 
 #[cfg(not(feature = "hosted-dev"))]
 static UART_BASE: AtomicUsize = AtomicUsize::new(QEMU_VIRT_PL011_BASE);
-#[cfg(not(feature = "hosted-dev"))]
+#[cfg(all(not(feature = "hosted-dev"), not(feature = "rpi5-stage1")))]
 static UART_LOG_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
 #[cfg(feature = "hosted-dev")]
 pub fn write_line(_msg: &str) {}
+
+#[cfg(feature = "hosted-dev")]
+pub fn try_write_line(_msg: &str) -> bool {
+    true
+}
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn init_early_mmio_base(base: usize) {
@@ -56,24 +61,91 @@ pub fn init_dtb_pl011(base: usize) -> bool {
 
 #[cfg(not(feature = "hosted-dev"))]
 pub fn write_line(msg: &str) {
+    let _ = try_write_line(msg);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(feature = "rpi5-stage1")))]
+pub fn try_write_line(msg: &str) -> bool {
     // Serialize full-line emission under an IRQ-safe lock so SMP CPUs and local
     // IRQ/exception re-entry cannot interleave UART bytes mid-line.
     let _guard = UART_LOG_LOCK.lock();
     for &byte in msg.as_bytes() {
-        if byte == b'\n' {
-            write_byte(b'\r');
+        if byte == b'\n' && !write_byte(b'\r') {
+            return false;
         }
-        write_byte(byte);
+        if !write_byte(byte) {
+            return false;
+        }
     }
-    write_byte(b'\r');
-    write_byte(b'\n');
+    write_byte(b'\r') && write_byte(b'\n')
 }
 
-#[cfg(not(feature = "hosted-dev"))]
-fn write_byte(byte: u8) {
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-stage1"))]
+pub fn try_write_line(msg: &str) -> bool {
+    let diagnostic_probe = msg.is_empty();
+    if diagnostic_probe {
+        super::boot::rpi5_emergency_marker(b"RPI5_TRY_WRITE_ENTER\r\n\0");
+    }
+    for &byte in msg.as_bytes() {
+        if byte == b'\n' && !rpi5_write_byte_bounded(b'\r', diagnostic_probe) {
+            return rpi5_try_write_result(false, diagnostic_probe);
+        }
+        if !rpi5_write_byte_bounded(byte, diagnostic_probe) {
+            return rpi5_try_write_result(false, diagnostic_probe);
+        }
+    }
+    let ok = rpi5_write_byte_bounded(b'\r', diagnostic_probe)
+        && rpi5_write_byte_bounded(b'\n', diagnostic_probe);
+    rpi5_try_write_result(ok, diagnostic_probe)
+}
+
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-stage1"))]
+fn rpi5_try_write_result(ok: bool, diagnostic_probe: bool) -> bool {
+    if diagnostic_probe {
+        super::boot::rpi5_emergency_marker(if ok {
+            b"RPI5_TRY_WRITE_RETURN_OK\r\n\0"
+        } else {
+            b"RPI5_TRY_WRITE_RETURN_ERR\r\n\0"
+        });
+    }
+    ok
+}
+
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-stage1"))]
+fn rpi5_write_byte_bounded(byte: u8, diagnostic_probe: bool) -> bool {
+    const TX_READY_POLL_LIMIT: usize = 1_048_576;
+    let base = UART_BASE.load(Ordering::Relaxed);
+    if diagnostic_probe {
+        super::boot::rpi5_emergency_marker(b"RPI5_TRY_WRITE_BYTE_BEGIN\r\n\0");
+    }
+    for poll in 0..TX_READY_POLL_LIMIT {
+        let flags = mmio_read32(base + PL011_FR);
+        if diagnostic_probe && poll == 0 {
+            super::boot::rpi5_emergency_hex(b"RPI5_PL011_FR value=0x\0", flags as u64);
+        }
+        if flags & PL011_FR_TXFF == 0 {
+            if diagnostic_probe {
+                super::boot::rpi5_emergency_marker(b"RPI5_TRY_WRITE_TX_READY\r\n\0");
+            }
+            mmio_write32(base + PL011_DR, byte as u32);
+            if diagnostic_probe {
+                super::boot::rpi5_emergency_marker(b"RPI5_TRY_WRITE_BYTE_DONE\r\n\0");
+            }
+            return true;
+        }
+    }
+    if diagnostic_probe {
+        super::boot::rpi5_emergency_marker(b"RPI5_TRY_WRITE_TIMEOUT\r\n\0");
+    }
+    false
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(feature = "rpi5-stage1")))]
+fn write_byte(byte: u8) -> bool {
     let base = UART_BASE.load(Ordering::Relaxed);
     while (mmio_read32(base + PL011_FR) & PL011_FR_TXFF) != 0 {}
     mmio_write32(base + PL011_DR, byte as u32);
+    true
 }
 
 #[cfg(not(feature = "hosted-dev"))]
