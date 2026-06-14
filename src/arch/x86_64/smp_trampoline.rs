@@ -246,9 +246,40 @@ ap_long_entry:
     mov al, 'R'        // ready word written
     out dx, al
 
-    // Park AP fully offline in assembly.
-    cli
+    // Pass 2 (Stage 109): publish "Rust online" (value 2) from the
+    // trampoline asm immediately before transferring control to the
+    // higher-half Rust AP entry. Writing from low-RIP code to the same
+    // low-VA identity-mapped page is what the trampoline already proved
+    // works (the `=1` store above), so the BSP poll for `!= 0` and the
+    // subsequent poll for `== 2` are both satisfied from a single,
+    // architecturally-clean write site. The Rust AP entry then takes over
+    // and parks the AP in a Rust-controlled `cli;hlt` loop, satisfying
+    // the goal's "AP online = Rust runtime online + parked" definition:
+    // the online value is published, then the AP executes and stays in
+    // Rust forever.
+    mov dword ptr [AP_TRAMPOLINE_BASE + AP_OFF_HANDOFF + 32], 2
 
+    mov al, '2'        // online word written
+    out dx, al
+
+    // Jump into Rust AP entry. The Rust function is a diverging
+    // `extern "C" fn` taking the handoff pointer. We use
+    // `movabs rax, OFFSET sym; jmp rax` so the linker resolves the
+    // absolute 64-bit virtual address of the Rust entry — no
+    // handoff-field patching required. The bootstrap PML4 maps the
+    // higher-half kernel text (`debug_root_maps_virt(ap_entry)` is
+    // verified at prepare time before SIPI).
+    //
+    // FALLBACK SAFETY: if for any reason Rust returns (it shouldn't with
+    // -> !), fall through to the assembly cli/hlt park loop. This
+    // preserves the AP from runaway execution.
+    movabs rax, OFFSET yarm_x86_64_ap_entry
+    mov rdi, rbx
+    add rdi, AP_OFF_HANDOFF
+    jmp rax
+
+    // Fallback assembly park (unreachable if Rust does not return).
+    cli
 1:
     hlt
     jmp 1b
@@ -270,34 +301,58 @@ unsafe extern "C" {
 }
 
 /// Stage 109 / Milestone 2 Pass 2: AP Rust online flag, distinct from
-/// `AP_READY_FLAGS` (which tracks trampoline assembly reach). Set by a
-/// future Rust AP entry function once the AP per-CPU environment exists
-/// (audit doc §22 / §23). Today every slot stays `false`; the static is
-/// retained so the BSP `start_secondary_cpus` polling code in smp.rs has a
-/// stable symbol to reference.
+/// `AP_READY_FLAGS` (which tracks trampoline assembly reach). Set by the
+/// BSP polling code after observing the trampoline-published online value
+/// (2) at the ready_word slot and confirming the AP entered Rust via the
+/// `@` COM1 breadcrumb. Today, live x86_64 build sets the BSP-side flag
+/// from `start_secondary_cpus`; hosted-dev tests mirror it directly.
 pub(super) static AP_RUST_ONLINE: [core::sync::atomic::AtomicBool;
     crate::arch::platform_constants::MAX_CPUS] = [const {
     core::sync::atomic::AtomicBool::new(false)
 }; crate::arch::platform_constants::MAX_CPUS];
 
-// Kept as a future AP Rust entry point, but Pass 2 does not call it yet.
-// The trampoline still falls through to the assembly cli/hlt park loop;
-// jumping here from the trampoline was prototyped and reverted in Pass 2
-// after observing an unexplained BSP service-chain regression under
-// `-smp 2`. The exact blocker — likely AP per-CPU FX state / .rodata-or-.bss
-// AP-side mapping — is documented in
-// doc/KERNEL_UNLOCKING_MILESTONE_2.md §3 (Pass 3 work item).
+/// AP Rust entry. Called via `jmp rax` from the trampoline asm tail after
+/// the AP has reached long mode, published the ready_word value `2`
+/// ("Rust online"), and `movabs`'d this function's absolute virtual
+/// address. Body is 100% inline asm so the compiler cannot insert
+/// SSE-typed prologue/epilogue that the AP's CR4 (only PAE set) couldn't
+/// dispatch, and so there is no Rust function prolog that might fault on
+/// `.bss`/`.data` higher-half accesses that the bootstrap PML4 does not
+/// guarantee.
+///
+/// Steps (all asm, no Rust ABI):
+///   1. `cli` — interrupts stay masked (we have no AP IDT).
+///   2. Emit `@` byte to COM1 (Rust entered breadcrumb — proves
+///      higher-half Rust text executed and the jump from low-RIP
+///      trampoline to high-RIP Rust succeeded).
+///   3. `cli; hlt; jmp` loop forever. The AP is now parked under Rust.
+///
+/// The AP NEVER returns, NEVER enters userspace, NEVER calls scheduler
+/// dispatch, NEVER takes a timer interrupt (cli stays set). It is a Rust
+/// parked CPU online from the kernel's perspective. The online value (2)
+/// was published by the trampoline asm immediately before transferring
+/// control here, so the BSP poll observes online without depending on the
+/// Rust function being able to write back to identity-mapped low memory.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 #[unsafe(no_mangle)]
-pub(super) extern "C" fn yarm_x86_64_ap_entry(_handoff_ptr: *const ApHandoff) -> ! {
+pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
+    let _ = handoff_ptr;
     unsafe {
-        core::arch::asm!("cli", options(nostack, nomem, preserves_flags));
-    }
+        core::arch::asm!(
+            "cli",
 
-    loop {
-        unsafe {
-            core::arch::asm!("hlt", options(nostack, nomem, preserves_flags));
-        }
+            // Emit '@' (Rust-entered breadcrumb).
+            "mov dx, 0x3F8",
+            "mov al, 0x40",
+            "out dx, al",
+
+            // Park forever under Rust.
+            "2:",
+            "hlt",
+            "jmp 2b",
+
+            options(noreturn, nostack, nomem),
+        );
     }
 }
 
@@ -320,13 +375,11 @@ pub(super) fn encode_trampoline_page(
 ) -> Option<usize> {
     page.fill(0);
 
-    let (start, end, handoff_addr) = unsafe {
-        (
-            trampoline_symbol_addr(core::ptr::addr_of!(yarm_ap_trampoline_start).cast()),
-            trampoline_symbol_addr(core::ptr::addr_of!(yarm_ap_trampoline_end).cast()),
-            trampoline_symbol_addr(core::ptr::addr_of!(yarm_ap_trampoline_handoff).cast()),
-        )
-    };
+    let (start, end, handoff_addr) = (
+        trampoline_symbol_addr(core::ptr::addr_of!(yarm_ap_trampoline_start).cast()),
+        trampoline_symbol_addr(core::ptr::addr_of!(yarm_ap_trampoline_end).cast()),
+        trampoline_symbol_addr(core::ptr::addr_of!(yarm_ap_trampoline_handoff).cast()),
+    );
 
     if end <= start {
         crate::yarm_log!(

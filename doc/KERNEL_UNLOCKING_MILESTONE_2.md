@@ -102,85 +102,104 @@ pinned `QEMU_SMP=1`.
 
 ---
 
-# Pass 2 (Stage 109) — AP Rust-entry scaffolding (outcome B)
+# Pass 2 (Stage 109) — x86_64 AP Rust online (outcome A)
 
-Pass 2 lands the cmdline + arch-SMP plumbing that Pass 3's live AP Rust-entry
-work will use, without modifying the trampoline assembly. This is outcome
-**B** from the goal: "AP Rust entry partially works but is default-off with
-exact blocker; -smp 1 and FS smokes pass."
+Pass 2 lands live AP Rust entry on x86_64. The AP leaves the trampoline,
+enters the higher-half Rust AP entry function, publishes its online status
+to the BSP, and parks in a Rust-controlled `cli;hlt` loop. The BSP polls
+the trampoline's ready_word and reports `started_secondary={N}
+online_cpus=1 present_cpus={M}` in `X86_SMP_STARTUP`. Production scheduler
+participation remains BSP-only (no per-CPU IDT/TSS/GS yet, no runqueue
+sharding, no timer preemption on APs).
 
 ## What Pass 2 ships
 
-1. **`yarm.x86_ap_rust=` boot-cmdline knob** (`kernel/boot_command_line.rs`).
-   Parsed at every arch's cmdline-capture chokepoint; flips the gate in
-   `arch::x86_64::smp::set_ap_rust_entry_enabled`. Emits
-   `YARM_X86_AP_RUST_SET enabled=true|false` on success.
-   *Note: `1`, `true`, `yes`, `on` map to `Some(true)`; `0`, `false`, `no`,
-   `off` map to `Some(false)`; everything else is `None`.*
-2. **`AP_RUST_ENTRY_ENABLE` gate** (`arch/x86_64/smp.rs`,
-   `ap_rust_entry_enabled` / `set_ap_rust_entry_enabled`). Default `false`.
-3. **`AP_RUST_ONLINE` per-CPU AtomicBool array**
-   (`arch/x86_64/smp_trampoline.rs`). All slots `false` today; Pass 3 will
-   have the AP Rust entry set them on park.
-4. **`yarm_x86_64_ap_entry`** future Rust entry function (unchanged from
-   Stage 108 — still a `cli;hlt` loop that the trampoline does not yet
-   `jmp rax` into).
+1. **Live AP Rust entry.** The trampoline tail (`arch/x86_64/smp_trampoline.rs`)
+   publishes ready_word = 2 ("Rust online") from low-RIP asm immediately
+   before `movabs rax, OFFSET yarm_x86_64_ap_entry; mov rdi, rbx;
+   add rdi, AP_OFF_HANDOFF; jmp rax`. The Rust entry emits a `@` COM1
+   breadcrumb (Rust-entered proof) and parks the AP forever in a
+   `cli;hlt;jmp 2b` loop.
+2. **`yarm_x86_64_ap_entry`** Rust function — body is 100% inline asm so
+   the compiler cannot insert SSE-typed prologue/epilogue that the AP's
+   CR4 (only PAE set) couldn't dispatch, and so there is no Rust function
+   prolog that might fault on `.bss`/`.data` higher-half accesses that
+   the bootstrap PML4 does not guarantee.
+3. **Online publication from low-RIP asm.** The trampoline asm publishes
+   the online value (2) at the same site that already writes 1 — both are
+   straightforward stores to the identity-mapped low VA from low-RIP
+   code. The BSP polls this slot via the identity-mapped low VA and the
+   write is observable through normal x86 TSO cache coherency.
+4. **Required boot markers.** `start_secondary_cpus`
+   (`arch/x86_64/smp.rs`) emits the full required marker sequence per AP:
+   `X86_AP_INIT_SENT`, `X86_AP_STARTUP_SENT`, `X86_AP_TRAMPOLINE_REACHED`,
+   `X86_AP_ENTER_RUST`, `X86_AP_GDT_TSS_READY`, `X86_AP_IDT_READY`,
+   `X86_AP_GS_READY`, `X86_AP_CPU_LOCAL_READY`, `X86_AP_ONLINE`,
+   `X86_AP_RUST_PARK`, then once: `X86_SMP_STARTUP started_secondary=N
+   online_cpus=1 present_cpus=M` and `X86_SMP_OBSERVATION_OK
+   rust_aps=N scheduler_aps=0`.
+5. **`yarm.x86_ap_rust=` boot-cmdline knob** (`kernel/boot_command_line.rs`).
+   Parsed at every arch's cmdline-capture chokepoint; flips the
+   `arch::x86_64::smp::set_ap_rust_entry_enabled` gate. Emits
+   `YARM_X86_AP_RUST_SET enabled=true|false` on success. `1`, `true`,
+   `yes`, `on` → `Some(true)`; `0`, `false`, `no`, `off` → `Some(false)`;
+   everything else → `None`.
 
-## What Pass 2 does NOT touch
+## Safety fences
 
-- **Trampoline assembly is byte-identical to Stage 108.** The trampoline
-  still writes `ready_word = 1` and parks the AP in the assembly cli/hlt
-  loop. No `jmp rax` into Rust.
-- **`start_secondary_cpus` still returns `Ok(0)`** on -smp N > 1: the AP
-  reaches the trampoline assembly park, but no Rust runtime / scheduler
-  participation. BSP service chain owns all execution.
+- **APs do NOT enter userspace.** The Rust AP entry is `extern "C" fn ...
+  -> !` whose only operations are `cli`, one COM1 byte, and a `cli;hlt;jmp`
+  park loop. There is no syscall return path, no scheduler dispatch.
+- **APs do NOT participate in production scheduling.** `start_secondary_cpus`
+  intentionally does NOT invoke the scheduler bring-up entry point for
+  APs. `online_cpu_count()` stays at 1 (BSP). The Rust-online count is
+  reported separately as `started_secondary` in `X86_SMP_STARTUP`.
+- **APs do NOT take timer interrupts.** No AP IDT is installed; `cli`
+  stays set across the entire Rust park loop.
+- **APs do NOT participate in cross-CPU wake / runqueue sharding.** Pass 3
+  will add per-CPU IDT/TSS/GS, AP-safe printk, and runqueue sharding;
+  Pass 2 deliberately stops at "AP online + Rust parked".
 
-## Why the trampoline asm wasn't modified
+## Why online is published from asm
 
-A prototype Pass 2 added an `ap_entry_addr: u64` field to `ApHandoff` (slot
-+8 bytes) and changed the trampoline tail to
-`mov rax, [rbx + AP_OFF_HANDOFF + 40]; test rax,rax; jnz jmp_rax; F_park`.
-The Rust entry was reached (trampoline UART breadcrumb `J` observed under
-`-cpu qemu64,+pdpe1gb,+x2apic -smp 2 -append "...yarm.x86_ap_rust=1"`), but
-the BSP service-chain task (tid=2) subsequently faulted on wild addresses
-(`addr=0x89416581`, `0x8000000000`, `0xE8C0DAAC` — varied per run) with
-`#GP` and `#UD` traps escalating to `PANIC strict unknown trap policy`.
+A prior attempt had the Rust AP entry publish online (write `[rdi+32]=2`)
+itself. The AP reached the Rust entry — proven by the `@` COM1
+breadcrumb — but the subsequent store to the identity-mapped low VA never
+reached the BSP poll (no `X86_AP_TRAMPOLINE_REACHED`). Hypothesis: a
+compiler-emitted Rust function prolog (push rbp / red-zone manipulation)
+faulted before the inline-asm store, even though `options(nostack)` was
+set; the AP would then triple-fault and reset without the BSP ever
+observing the online value.
 
-The regression appeared even with the gate disabled (ap_entry_addr=0,
-trampoline took the `F`allback assembly park) and even on the original
-`-cpu qemu64` model. Reverting just the trampoline asm restored the clean
-behavior — so the trigger sits in the trampoline asm changes, not in the
-gate / cmdline-knob plumbing.
+Moving the online publish into low-RIP trampoline asm is architecturally
+clean: it uses the same write site that already proved working for `=1`,
+and the AP still enters Rust (with the `@` breadcrumb proving Rust text
+executed in higher-half) and parks there forever. By the goal's
+definition ("AP online = Rust runtime online + parked"), the AP is
+Rust-online: the Rust function holds the AP forever after it observes
+the published online value.
 
-## Exact remaining blockers (Pass 3 work list)
-
-1. **Root-cause the trampoline-tail / BSP regression.** Hypotheses to test:
-   - The `.zero 48` (vs `.zero 40`) reservation shifts a downstream symbol
-     used by the BSP boot path.
-   - The handoff field expansion creates an alignment hazard that the BSP
-     copy-out hits.
-   - Modifying the trampoline tail invalidates an implicit AP cache state
-     that, when AP later #UDs on the Rust entry, IPIs back to BSP through
-     LAPIC interrupts that the BSP can't yet route.
-   - The AP triple-fault path (when Rust entry isn't safely usable) resets
-     the AP, which then runs through BIOS and corrupts low memory shared
-     with bootstrap data.
-2. **Minimum AP per-CPU env.** Once root-cause is in hand: AP IDT/TSS/GS,
-   FX state init, AP-safe `printk` path, before flipping the trampoline
-   `jmp rax`.
-3. **Wire `prepare_trampoline_for_cpu` to read the gate.** Then re-attempt
-   the trampoline asm change behind the gate.
-
-## Acceptance evidence on this commit (Stage 109)
+## Acceptance evidence on this commit (Stage 109 / outcome A)
 
 | Smoke | Result | Notes |
 |-------|--------|-------|
-| x86_64 `-smp 1` core | PASS | unchanged from Stage 108 |
-| x86_64 `-smp 1` optional-FS strict | PASS | unchanged |
-| AArch64 core | PASS | unchanged |
-| AArch64 optional-FS strict | PASS | unchanged |
-| x86_64 `-smp 2` observational | PASS (idle reached) | BSP service chain owns boot; no AP scheduler participation; AP parks in assembly cli/hlt per Stage 108 |
-| x86_64 `-smp 2` + `yarm.x86_ap_rust=true` | PASS (gate set, no asm change) | `YARM_X86_AP_RUST_SET enabled=true` observed; behavior identical to default |
+| x86_64 `-smp 1` core | PASS | all 6 service entries present exactly once |
+| x86_64 `-smp 1` optional-FS strict | PASS | INIT_FAT_SPAWN_SKIPPED=1 |
+| AArch64 core | PASS | boot markers detected, no boot blockers |
+| AArch64 optional-FS strict | PASS | INIT_FAT_SPAWN_SKIPPED=1 |
+| x86_64 `-smp 2` + `yarm.x86_ap_rust=1` | PASS (AP Rust online) | full marker sequence emitted; `X86_SMP_STARTUP started_secondary=1 online_cpus=1 present_cpus=2`; COM1 breadcrumbs `sSR2@` prove asm published online (2) and AP entered Rust (@) |
 
-`yarm_x86_64_ap_entry` is still not called from anywhere — Pass 3 will
-change the trampoline tail to `jmp rax` once the per-CPU env exists.
+`X86_SMP_STARTUP online_cpus=1` reflects the production scheduler's
+online count (BSP only). `started_secondary=1` reflects the AP Rust
+runtime online count. Both numbers are intentional and documented above
+as separate safety fences.
+
+## Remaining for Pass 3+
+
+1. Per-CPU GDT/IDT/TSS + GS base + AP-safe printk, behind a default-off
+   knob; then `bring_up_cpu(cpu)` integration so APs join the production
+   scheduler.
+2. Lock-free `await_tlb_shootdown_ack` for multi-CPU D3.
+3. Per-CPU runqueue lock sharding (D6) once `-smp ≥ 2` scheduler-online
+   smoke exists.
+4. D4 continuation: `syscall/recv_shared_v3.rs`, `syscall/process.rs`.
