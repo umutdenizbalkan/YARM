@@ -596,9 +596,42 @@ rpi5_hh_retained_marker!(RPI5_HH_READ_PC_BEGIN_MARKER, b"RPI5_HH_READ_PC_BEGIN")
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_PC_CAPTURED_MARKER, b"RPI5_HH_READ_PC_CAPTURED");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_PC_PRINT_BEGIN_MARKER,
+    b"RPI5_HH_READ_PC_PRINT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
 rpi5_hh_retained_marker!(
     RPI5_HH_READ_PC_DONE_MARKER,
     b"RPI5_HH_READ_PC_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_PC_FAILED_MARKER,
+    b"RPI5_HH_READ_PC_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH3_PC_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH3_FAULT_BOUNDARY reason=pc_read_or_print"
 );
 #[cfg(all(
     not(feature = "hosted-dev"),
@@ -982,6 +1015,18 @@ fn rpi5_hh_fail(reason: &[u8]) -> ! {
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+fn rpi5_hh_pc_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(&RPI5_HH_READ_PC_FAILED_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    let _ = rpi5_hh_write_line(&RPI5_HH3_PC_FAULT_BOUNDARY_MARKER);
+    rpi5_hh_halt()
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
 fn rpi5_hh_halt() -> ! {
     loop {
         unsafe {
@@ -1239,10 +1284,26 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
     }
     let pc: u64;
     unsafe {
-        core::arch::asm!("adr {pc}, .", pc = out(reg) pc, options(nomem, nostack, preserves_flags));
+        /*
+         * ADR resolves this local label relative to the executing instruction.
+         * It neither dereferences memory nor depends on a low-half symbol, so
+         * the captured address remains valid after the branch into high code.
+         */
+        core::arch::asm!(
+            "adr {pc}, 2f",
+            "2:",
+            pc = out(reg) pc,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_READ_PC_CAPTURED_MARKER) {
+        rpi5_hh_pc_fail(b"captured_marker_uart_timeout");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_READ_PC_PRINT_BEGIN_MARKER) {
+        rpi5_hh_pc_fail(b"print_begin_uart_timeout");
     }
     if !rpi5_hh_write_hex_line(&RPI5_HH_READ_PC_DONE_MARKER, pc) {
-        rpi5_hh_fail(b"read_pc_done_uart_timeout");
+        rpi5_hh_pc_fail(b"value_uart_timeout");
     }
 
     if !rpi5_hh_write_line(&RPI5_HH_READ_SP_BEGIN_MARKER) {
