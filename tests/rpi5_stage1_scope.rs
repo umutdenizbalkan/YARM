@@ -550,6 +550,18 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH_HIGH_ENTRY_OK",
         "RPI5_HH_VBAR_HIGH_OK",
         "RPI5_HH_RUST_ENTRY",
+        "RPI5_HH_RUST_AFTER_ENTRY",
+        "RPI5_HH_READ_PC_BEGIN",
+        "RPI5_HH_READ_PC_DONE value=0x",
+        "RPI5_HH_READ_SP_BEGIN",
+        "RPI5_HH_READ_SP_DONE value=0x",
+        "RPI5_HH_READ_VBAR_BEGIN",
+        "RPI5_HH_READ_VBAR_DONE value=0x",
+        "RPI5_HH_READ_TTBR_BEGIN",
+        "RPI5_HH_READ_TTBR_DONE",
+        "RPI5_HH_PRINT_REGS_BEGIN",
+        "RPI5_HH_PRINT_REGS_DONE",
+        "RPI5_HH3_PRECHECK_DONE",
         "RPI5_HH_PC value=0x",
         "RPI5_HH_SP value=0x",
         "RPI5_HH_VBAR value=0x",
@@ -564,6 +576,7 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH5_BEGIN",
         "RPI5_HH5_ENTER_USER_ATTEMPT",
         "RPI5_HH3_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=",
         "RPI5_HH_REGISTER_MISMATCH reason=",
     ] {
         assert!(boot.contains(marker), "missing {marker}");
@@ -611,6 +624,14 @@ fn rpi5_hh3_build_and_generator_paths_are_explicit() {
         "RPI5_HH_JUMP_HIGH",
         "RPI5_HH_HIGH_ENTRY_OK",
         "RPI5_HH_RUST_ENTRY",
+        "RPI5_HH_RUST_AFTER_ENTRY",
+        "RPI5_HH_READ_PC_BEGIN",
+        "RPI5_HH_READ_PC_DONE",
+        "RPI5_HH_READ_SP_BEGIN",
+        "RPI5_HH_READ_SP_DONE",
+        "RPI5_HH_READ_VBAR_BEGIN",
+        "RPI5_HH_READ_VBAR_DONE",
+        "RPI5_HH3_PRECHECK_DONE",
         "RPI5_HH_REGISTERS_OK",
         "RPI5_HH_RUST_UART_OK",
         "RPI5_HH3_DONE",
@@ -638,6 +659,8 @@ fn rpi5_hh3_success_markers_are_retained_in_the_high_image() {
     assert!(boot.contains("#[used]"));
     assert!(linker.contains("KEEP(*(.rodata.rpi5_hh_markers))"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER)"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_AFTER_ENTRY_MARKER)"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_PRECHECK_DONE_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)"));
