@@ -17,29 +17,80 @@ boot_stack_riscv64_end:
     .weak _start
     .type _start,@function
 _start:
+    // OpenSBI enters the boot hart in S-mode with a0=hartid and a1=FDT
+    // pointer. Preserve BOTH across early setup: a0/a1 are the only handoff
+    // the firmware gives us. We stash them in callee-saved s0/s1 (this is the
+    // root of the call tree, so nothing else owns these yet).
     la sp, boot_stack_riscv64_end
-    // OpenSBI enters the boot hart with a0=hartid and a1=FDT pointer. The
-    // common kernel entry accepts one architecture boot-information pointer;
-    // YARM does not consume the primary hart ID here, so forward a1 narrowly.
-    mv a0, a1
-    .weak yarm_kernel_main
-    call yarm_kernel_main
+    mv s0, a0                       // s0 = hartid (OpenSBI a0)
+    mv s1, a1                       // s1 = DTB physical pointer (OpenSBI a1)
+
+    // Install an early S-mode trap vector (direct mode) BEFORE running any
+    // kernel code. Until the kernel installs its real trap handler, any
+    // early fault (e.g. during bootstrap) must land in a deterministic
+    // diagnostic park instead of silently re-entering the payload entry and
+    // spinning forever. stvec must be 4-byte aligned; the label below is.
+    la t0, yarm_riscv64_early_trap_vector
+    csrw stvec, t0
+
+    // Single-BSP selection: only the bootstrap hart (id 0) continues into
+    // kernel bootstrap. Any other hart that reaches the cold-boot entry must
+    // park in a safe loop BEFORE BSS use, allocator init, cmdline capture, or
+    // kernel bootstrap. (On QEMU virt + OpenSBI, secondaries normally wait in
+    // firmware for an HSM start, but this guard is defensive and correct even
+    // if a secondary arrives here.)
+    li t1, 0                        // BOOTSTRAP_CPU_ID
+    bne s0, t1, .Lriscv64_secondary_cold_park
+
+    // Boot hart: hand the firmware registers to the Rust primary entry, which
+    // emits the early boot markers and then calls the common kernel entry.
+    mv a0, s0                       // a0 = hartid
+    mv a1, s1                       // a1 = DTB pointer
+    call yarm_riscv64_primary_entry // -> ! (does not return)
 1:
     wfi
     j 1b
 
+.Lriscv64_secondary_cold_park:
+    mv a0, s0                       // a0 = hartid
+    call yarm_riscv64_secondary_cold_park // -> ! (does not return)
+2:
+    wfi
+    j 2b
+
+    // Early S-mode trap vector (direct mode). Runs before the kernel installs
+    // its own handler. Re-establishes a known-good stack (the faulting sp may
+    // be corrupt), reads the trap CSRs, reports them once, and parks. This
+    // converts any pre-kernel fault into a single deterministic diagnostic
+    // instead of an invisible reset loop.
+    .align 4
+    .global yarm_riscv64_early_trap_vector
+    .type yarm_riscv64_early_trap_vector,@function
+yarm_riscv64_early_trap_vector:
+    la sp, boot_stack_riscv64_end
+    csrr a0, scause
+    csrr a1, sepc
+    csrr a2, stval
+    call yarm_riscv64_early_trap_report // -> ! (does not return)
+3:
+    wfi
+    j 3b
+
     .global yarm_riscv64_secondary_entry
     .type yarm_riscv64_secondary_entry,@function
 yarm_riscv64_secondary_entry:
-    // OpenSBI HSM hart_start passes the opaque value in a0. YARM passes a
-    // pointer to SecondaryHartHandoff; do not enter _start/yarm_kernel_main.
-    beqz a0, 2f
-    ld sp, 8(a0)
+    // Per the SBI HSM spec, a hart started via sbi_hart_start() begins here
+    // with a0 = hartid and a1 = the opaque value. YARM passes a pointer to
+    // SecondaryHartHandoff as the opaque value, so the handoff is in a1 (NOT
+    // a0). Do not enter _start/yarm_kernel_main.
+    beqz a1, 2f
+    ld sp, 8(a1)            // stack_top lives at offset 8 of the handoff
     andi sp, sp, -16
     la t0, 3f
     csrw stvec, t0
     li t1, 2
     csrc sstatus, t1
+    mv a0, a1              // yarm_riscv64_secondary_boot(handoff_ptr)
     call yarm_riscv64_secondary_boot
 2:
     wfi
@@ -49,6 +100,107 @@ yarm_riscv64_secondary_entry:
     j 3b
     "#
 );
+
+/// Early, allocation-free, lock-free marker writer for the RISC-V boot path.
+///
+/// Writes a formatted line straight to the SBI legacy console (a single
+/// `console_putchar` ecall per byte). Unlike `yarm_log!`, this touches no
+/// kernel statics, ring buffers, or locks, so it is safe on any hart at the
+/// very earliest boot stage — before BSS use, allocator init, or kernel
+/// bootstrap, and from the early trap vector where the kernel state may be
+/// unusable. Lines longer than the fixed scratch buffer are truncated.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+struct EarlySbiLine {
+    buf: [u8; 160],
+    len: usize,
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+impl core::fmt::Write for EarlySbiLine {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &byte in s.as_bytes() {
+            if self.len >= self.buf.len() {
+                break;
+            }
+            self.buf[self.len] = byte;
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn early_sbi_marker(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    let mut line = EarlySbiLine {
+        buf: [0; 160],
+        len: 0,
+    };
+    let _ = line.write_fmt(args);
+    let text = core::str::from_utf8(&line.buf[..line.len]).unwrap_or("RISCV_EARLY_MARKER_UTF8_ERR");
+    crate::arch::riscv64::console::write_line(text);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+macro_rules! early_marker {
+    ($($arg:tt)*) => {
+        $crate::arch::riscv64::boot::early_sbi_marker(core::format_args!($($arg)*))
+    };
+}
+
+// The common kernel entry, defined in the `kernel_boot` binary and linked in.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+unsafe extern "C" {
+    fn yarm_kernel_main(start_info_ptr: usize) -> !;
+}
+
+/// Rust primary (boot-hart) entry, tail-called from `_start` with the
+/// preserved OpenSBI handoff registers. Emits the early boot markers, then
+/// hands `dtb_ptr` to the common kernel entry exactly as the previous
+/// `mv a0, a1; call yarm_kernel_main` did.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_riscv64_primary_entry(hart_id: usize, dtb_ptr: usize) -> ! {
+    early_marker!("RISCV_BOOT_ENTRY hart={} dtb=0x{:x}", hart_id, dtb_ptr);
+    early_marker!("RISCV_BOOT_HART_SELECTED hart={}", hart_id);
+    // Park every non-bootstrap hart in a safe Rust loop BEFORE the boot hart
+    // touches BSS, the allocator, cmdline capture, or kernel bootstrap.
+    park_secondary_harts_early();
+    early_marker!("RISCV_DTB_PTR value=0x{:x}", dtb_ptr);
+    unsafe { yarm_kernel_main(dtb_ptr) }
+}
+
+/// Cold-boot park for any non-bootstrap hart that reaches `_start`. Emits the
+/// park marker and spins in `wfi`, never touching shared boot state.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_riscv64_secondary_cold_park(hart_id: usize) -> ! {
+    early_marker!("RISCV_SECONDARY_HART_PARK hart={}", hart_id);
+    loop {
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Early trap reporter, tail-called from the early S-mode trap vector. Reports
+/// the trap CSRs once and parks, converting any pre-kernel fault into a single
+/// deterministic diagnostic instead of an invisible payload-reset loop.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_riscv64_early_trap_report(scause: usize, sepc: usize, stval: usize) -> ! {
+    early_marker!(
+        "RISCV_EARLY_TRAP scause=0x{:x} sepc=0x{:x} stval=0x{:x}",
+        scause,
+        sepc,
+        stval
+    );
+    loop {
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
@@ -545,15 +697,21 @@ unsafe extern "C" {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_riscv64_secondary_boot(handoff_ptr: usize) -> ! {
+    let mut hart_id = usize::MAX;
     if handoff_ptr != 0 {
         let handoff = handoff_ptr as *mut SecondaryHartHandoff;
         unsafe {
+            hart_id = core::ptr::read_volatile(core::ptr::addr_of!((*handoff).hart_id));
             core::ptr::write_volatile(
                 core::ptr::addr_of_mut!((*handoff).ack),
                 RISCV64_SECONDARY_ACK_PARKED,
             );
         }
     }
+    // Required early-boot marker: a non-bootstrap hart has reached a safe,
+    // Rust-controlled park. This runs on the secondary's own per-hart stack,
+    // with interrupts masked, before it could ever touch kernel bootstrap.
+    early_marker!("RISCV_SECONDARY_HART_PARK hart={}", hart_id);
     crate::arch::riscv64::console::write_line("YARM_RISCV64_SMP_SECONDARY_PARKED");
     loop {
         unsafe {
@@ -609,18 +767,35 @@ fn wait_for_secondary_ack(slot: usize) -> bool {
     false
 }
 
+/// Ensures the QEMU-virt secondary harts are brought to a Rust-controlled
+/// park exactly once. On QEMU virt + OpenSBI, non-boot harts wait in firmware
+/// for an HSM `hart_start`; this drives that start so each secondary lands in
+/// `yarm_riscv64_secondary_boot`, emits `RISCV_SECONDARY_HART_PARK hart=N`,
+/// and spins in `wfi`. The `swap` guard makes this idempotent so the early
+/// (pre-bootstrap) call and the legacy post-bootstrap call cannot double-start
+/// a hart (`SBI_ERR_ALREADY_*`).
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-fn release_qemu_virt_secondaries_with_hsm() {
-    match crate::arch::riscv64::sbi::probe_extension(crate::arch::riscv64::sbi::SBI_EXT_HSM) {
-        Ok(0) => {
-            crate::yarm_log!("YARM_RISCV64_SMP_HSM unavailable probe=0");
-            return;
-        }
-        Ok(value) => crate::yarm_log!("YARM_RISCV64_SMP_HSM available probe={}", value),
-        Err(err) => {
-            crate::yarm_log!("YARM_RISCV64_SMP_HSM probe_err={:?}", err);
-            return;
-        }
+static RISCV64_SECONDARIES_PARKED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn park_qemu_virt_secondaries_once(context: &str) {
+    if RISCV64_SECONDARIES_PARKED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+
+    let hsm_available =
+        match crate::arch::riscv64::sbi::probe_extension(crate::arch::riscv64::sbi::SBI_EXT_HSM) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(_) => false,
+        };
+    if !hsm_available {
+        early_marker!(
+            "RISCV_SECONDARY_PARK_SKIPPED reason=no_hsm context={}",
+            context
+        );
+        return;
     }
 
     let entry_addr = (yarm_riscv64_secondary_entry as *const () as usize)
@@ -636,27 +811,34 @@ fn release_qemu_virt_secondaries_with_hsm() {
             Ok(()) => {
                 let acked = wait_for_secondary_ack(slot);
                 crate::yarm_log!(
-                    "YARM_RISCV64_SMP_HART_START hart={} ret=0 ack={} state=parked_not_online entry=0x{:x} handoff=0x{:x}",
+                    "YARM_RISCV64_SMP_HART_START hart={} ret=0 ack={} state=parked_not_online entry=0x{:x} handoff=0x{:x} context={}",
                     hart_id,
                     acked as u8,
                     entry_addr,
-                    handoff_ptr
+                    handoff_ptr,
+                    context
                 );
             }
-            Err(err) => {
-                crate::yarm_log!(
-                    "YARM_RISCV64_SMP_HART_START hart={} err={:?} ack=0 state=not_started",
-                    hart_id,
-                    err
-                );
-            }
+            // Absent harts (e.g. all slots beyond `-smp N`) return an HSM
+            // error; that is expected, so stay silent to avoid log spam.
+            Err(_) => {}
         }
     }
 }
 
+/// Parks the secondary harts early, before kernel bootstrap. Called from the
+/// boot-hart primary entry so non-boot harts are in a safe Rust-controlled
+/// `wfi` loop before any BSS use, allocator init, cmdline capture, or kernel
+/// bootstrap on the boot hart.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn park_secondary_harts_early() {
+    park_qemu_virt_secondaries_once("early_primary");
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn release_secondary_cpus_after_bootstrap() {
-    release_qemu_virt_secondaries_with_hsm();
+    // Idempotent: a no-op if the secondaries were already parked early.
+    park_qemu_virt_secondaries_once("post_bootstrap");
 }
 
 #[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
@@ -679,24 +861,60 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     run(&mut kernel);
 }
 
+/// Tracks whether the RISC-V boot command line has already been captured.
+///
+/// The boot command line is owned by the firmware-provided DTB and must be
+/// captured exactly once, from the boot hart, using the OpenSBI `a1` pointer.
+/// If this function is ever re-entered (e.g. a pre-kernel fault restarts the
+/// payload entry before the early trap vector is in force), a later
+/// missing-DTB capture must NOT clobber the already-valid command line.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV64_CMDLINE_CAPTURED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn prepare_arch_boot(start_info_ptr: usize) {
+    // Monotonic, capture-once guard: the first call wins and records the
+    // command line; any subsequent call is a no-op that preserves it. This is
+    // the single source of truth for "the cmdline is captured", so a re-entry
+    // with a missing/garbage DTB pointer can never replace a valid cmdline
+    // with an empty one (requirement: no missing-DTB overwrite loop).
+    if RISCV64_CMDLINE_CAPTURED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        early_marker!("RISCV_CMDLINE_PRESERVED reason=missing_dtb_after_valid");
+        return;
+    }
+
     let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
-        let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes(&[]);
+        // DTB parse failed on the one-and-only capture. Record an empty
+        // command line once and report the precise reason; the boot hart can
+        // still proceed (the QEMU `-append` may be absent).
+        early_marker!(
+            "RISCV_DTB_PARSE_FAILED reason=bad_magic_or_size ptr=0x{:x}",
+            start_info_ptr
+        );
+        let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes_monotonic(&[]);
         crate::yarm_log!(
             "YARM_BOOT_CMDLINE_CAPTURE arch=riscv64 len={} truncated={} source=missing_dtb",
             captured.raw_cmdline().len(),
             captured.cmdline_was_truncated() as u8
         );
+        early_marker!(
+            "RISCV_CMDLINE_CAPTURE_ONCE len={}",
+            captured.raw_cmdline().len()
+        );
         return;
     };
-    let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes(
+    let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes_monotonic(
         crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]),
     );
     crate::yarm_log!(
         "YARM_BOOT_CMDLINE_CAPTURE arch=riscv64 len={} truncated={}",
         captured.raw_cmdline().len(),
         captured.cmdline_was_truncated() as u8
+    );
+    early_marker!(
+        "RISCV_CMDLINE_CAPTURE_ONCE len={}",
+        captured.raw_cmdline().len()
     );
 }
 

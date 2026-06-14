@@ -9004,6 +9004,100 @@ mod tests {
         );
     }
 
+    fn riscv_boot_src() -> &'static str {
+        include_str!("../arch/riscv64/boot.rs")
+    }
+
+    fn riscv_index_of(needle: &str) -> usize {
+        riscv_boot_src()
+            .find(needle)
+            .unwrap_or_else(|| panic!("expected to find {needle:?} in riscv64/boot.rs"))
+    }
+
+    #[test]
+    fn riscv_start_parks_non_boot_harts_before_primary_entry() {
+        // Source-ordering guarantee: the cold-boot `_start` must branch
+        // non-bootstrap harts to the park routine BEFORE it calls the
+        // boot-hart primary entry (which runs global bootstrap). This proves a
+        // secondary hart that reaches `_start` parks before any
+        // BSS/allocator/cmdline/bootstrap work.
+        let select = riscv_index_of("bne s0, t1, .Lriscv64_secondary_cold_park");
+        let primary_call = riscv_index_of("call yarm_riscv64_primary_entry");
+        assert!(
+            select < primary_call,
+            "non-boot-hart park branch must precede the primary-entry call"
+        );
+    }
+
+    #[test]
+    fn riscv_primary_entry_parks_secondaries_before_kernel_main() {
+        // On the boot hart, secondaries are parked early (via SBI HSM) BEFORE
+        // the common kernel entry runs cmdline capture / kernel bootstrap.
+        let src = riscv_boot_src();
+        let park = src
+            .find("park_secondary_harts_early();")
+            .expect("primary entry must call park_secondary_harts_early()");
+        let kmain = src
+            .find("yarm_kernel_main(dtb_ptr)")
+            .expect("primary entry must call yarm_kernel_main(dtb_ptr)");
+        assert!(
+            park < kmain,
+            "park_secondary_harts_early() must run before yarm_kernel_main()"
+        );
+    }
+
+    #[test]
+    fn riscv_early_trap_vector_installed_before_hart_selection() {
+        // The early S-mode trap vector must be installed in `_start` before
+        // the hart-selection branch, so a fault in the boot path becomes a
+        // deterministic diagnostic park instead of an invisible reset loop.
+        let stvec = riscv_index_of("csrw stvec, t0");
+        let select = riscv_index_of("bne s0, t1, .Lriscv64_secondary_cold_park");
+        assert!(
+            stvec < select,
+            "early stvec install must precede hart selection / kernel code"
+        );
+    }
+
+    #[test]
+    fn riscv_preserves_opensbi_handoff_registers() {
+        // a0 (hartid) and a1 (DTB) must both be preserved across early setup
+        // and the DTB must be parsed from a1 (not guessed memory).
+        let src = riscv_boot_src();
+        assert!(
+            src.contains("mv s0, a0") && src.contains("mv s1, a1"),
+            "_start must stash a0=hartid and a1=DTB before clobbering them"
+        );
+        assert!(
+            src.contains("mv a1, s1"),
+            "boot hart must forward the preserved DTB pointer (a1) to the entry"
+        );
+    }
+
+    #[test]
+    fn riscv_cmdline_capture_is_monotonic_and_guarded_once() {
+        // prepare_arch_boot must use the monotonic capture and a capture-once
+        // guard so a re-entry with a missing DTB can neither overwrite a valid
+        // cmdline nor spam captures.
+        let src = riscv_boot_src();
+        assert!(
+            src.contains("set_raw_cmdline_from_bytes_monotonic"),
+            "prepare_arch_boot must use the monotonic cmdline capture"
+        );
+        assert!(
+            src.contains("RISCV64_CMDLINE_CAPTURED.swap("),
+            "prepare_arch_boot must guard capture with a once-flag"
+        );
+        assert!(
+            src.contains("RISCV_CMDLINE_PRESERVED reason=missing_dtb_after_valid"),
+            "re-entry must emit the cmdline-preserved marker"
+        );
+        assert!(
+            src.contains("RISCV_DTB_PARSE_FAILED"),
+            "a failed DTB parse must emit a precise reason marker"
+        );
+    }
+
     #[test]
     fn stage106_milestone_doc_exists_and_is_not_falsely_declared() {
         // The Kernel Unlocking Milestone 1 doc must exist; if the branch is
