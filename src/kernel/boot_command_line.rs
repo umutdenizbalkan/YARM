@@ -76,22 +76,41 @@ impl BootCommandLine {
     pub const fn cmdline_was_truncated(&self) -> bool {
         matches!(self.status, BootCommandLineStatus::Truncated)
     }
+
+    /// Monotonic capture: copies `source` UNLESS doing so would replace an
+    /// already-stored non-empty command line with an empty one, in which case
+    /// the existing command line is preserved untouched.
+    ///
+    /// This protects the firmware-provided command line on architectures
+    /// whose early-boot entry can be re-reached (e.g. RISC-V, where a
+    /// pre-kernel fault could restart the payload entry): a later capture that
+    /// no longer has a valid DTB pointer must never clear a command line that
+    /// was already captured from a valid DTB. Returns `true` if the stored
+    /// command line was (re)written, `false` if the existing value was kept.
+    pub fn set_raw_cmdline_from_bytes_monotonic(&mut self, source: &[u8]) -> bool {
+        let incoming_len = source
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(source.len());
+        if incoming_len == 0 && self.len > 0 {
+            return false;
+        }
+        self.set_raw_cmdline_from_bytes(source);
+        true
+    }
 }
 
 static BOOT_COMMAND_LINE: SpinLock<BootCommandLine> = SpinLock::new(BootCommandLine::absent());
 
-pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
-    let captured = {
-        let mut command_line = BOOT_COMMAND_LINE.lock();
-        command_line.set_raw_cmdline_from_bytes(source);
-        *command_line
-    };
-    // Stage 108 / Milestone 2 Pass 1: apply the `yarm.loglevel=` observability
-    // knob at capture time. This is the single chokepoint every arch boot path
-    // (x86_64, AArch64, RISC-V) routes through, so no arch boot file needs to
-    // change. The knob is applied ONLY when present and valid; otherwise the
-    // console loglevel keeps its production default (Info). The
-    // `BootCommandLine` storage itself stays policy-neutral.
+/// Applies the YARM boot-option knobs carried by a captured command line.
+///
+/// Stage 108/109: `yarm.loglevel=` sets the console loglevel and
+/// `yarm.x86_ap_rust=` flips the x86_64 AP Rust-entry gate. Knobs are applied
+/// ONLY when present and valid; otherwise production defaults are kept. The
+/// `BootCommandLine` storage itself stays policy-neutral. This is the single
+/// chokepoint every arch boot path routes through, so no arch boot file needs
+/// to change.
+fn apply_boot_option_knobs(captured: &BootCommandLine) {
     let parsed = parse_yarm_boot_options(captured.raw_cmdline());
     if let Some(level) = parsed.console_loglevel {
         crate::kernel::printk::set_console_loglevel(
@@ -99,15 +118,38 @@ pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
         );
         crate::yarm_log!("YARM_LOGLEVEL_SET level={}", level);
     }
-    // Stage 109 / Milestone 2 Pass 2: apply the `yarm.x86_ap_rust=` gate.
-    // Today the trampoline asm is unchanged from Stage 108 so this flag
-    // currently has no observable effect on AP behavior; the plumbing
-    // proves the cmdline-to-arch-SMP route works end-to-end and is
-    // available for Pass 3 when the trampoline Rust-jump is wired live.
     #[cfg(target_arch = "x86_64")]
     if let Some(enabled) = parsed.x86_ap_rust {
         crate::arch::x86_64::smp::set_ap_rust_entry_enabled(enabled);
         crate::yarm_log!("YARM_X86_AP_RUST_SET enabled={}", enabled);
+    }
+}
+
+pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
+    let captured = {
+        let mut command_line = BOOT_COMMAND_LINE.lock();
+        command_line.set_raw_cmdline_from_bytes(source);
+        *command_line
+    };
+    apply_boot_option_knobs(&captured);
+    captured
+}
+
+/// Monotonic variant of [`set_raw_cmdline_from_bytes`]: captures `source` and
+/// applies the boot-option knobs, but never replaces an already-captured
+/// non-empty command line with an empty one. Used by early-boot entries that
+/// can be re-reached so a missing-DTB re-capture cannot clobber a valid
+/// command line. Returns the resulting (possibly preserved) command line.
+pub fn set_raw_cmdline_from_bytes_monotonic(source: &[u8]) -> BootCommandLine {
+    let (captured, wrote) = {
+        let mut command_line = BOOT_COMMAND_LINE.lock();
+        let wrote = command_line.set_raw_cmdline_from_bytes_monotonic(source);
+        (*command_line, wrote)
+    };
+    // Apply knobs only when this call actually (re)captured; a preserved
+    // command line keeps the knob state established by its original capture.
+    if wrote {
+        apply_boot_option_knobs(&captured);
     }
     captured
 }
@@ -288,6 +330,80 @@ mod tests {
         let command_line = BootCommandLine::absent();
         assert_eq!(command_line.raw_cmdline(), b"");
         assert_eq!(command_line.status(), BootCommandLineStatus::Absent);
+    }
+
+    #[test]
+    fn riscv_monotonic_valid_cmdline_then_missing_dtb_is_preserved() {
+        // RISC-V early boot: a valid command line is captured from a valid
+        // DTB, then a later re-capture with a missing DTB (empty source) must
+        // NOT clear it.
+        let mut command_line = BootCommandLine::absent();
+        let wrote =
+            command_line.set_raw_cmdline_from_bytes_monotonic(b"console=ttyS0 rdinit=/init");
+        assert!(wrote, "first valid capture must be written");
+        assert_eq!(command_line.raw_cmdline(), b"console=ttyS0 rdinit=/init");
+        assert_eq!(command_line.status(), BootCommandLineStatus::Captured);
+
+        // Missing-DTB re-capture: empty source must be ignored, value kept.
+        let wrote_again = command_line.set_raw_cmdline_from_bytes_monotonic(b"");
+        assert!(
+            !wrote_again,
+            "empty re-capture must not overwrite valid cmdline"
+        );
+        assert_eq!(
+            command_line.raw_cmdline(),
+            b"console=ttyS0 rdinit=/init",
+            "valid cmdline must survive a missing-DTB re-capture"
+        );
+        assert_eq!(command_line.status(), BootCommandLineStatus::Captured);
+
+        // Even repeated empty re-captures keep the original (no overwrite loop).
+        for _ in 0..8 {
+            assert!(!command_line.set_raw_cmdline_from_bytes_monotonic(b""));
+        }
+        assert_eq!(command_line.raw_cmdline(), b"console=ttyS0 rdinit=/init");
+    }
+
+    #[test]
+    fn riscv_monotonic_missing_dtb_first_records_empty_once_and_is_idempotent() {
+        // If the very first capture has a missing DTB (empty source), it is
+        // recorded as absent exactly once; subsequent empty captures remain a
+        // stable no-op (no spam, no flapping), and a later valid capture can
+        // still populate it.
+        let mut command_line = BootCommandLine::absent();
+        let wrote = command_line.set_raw_cmdline_from_bytes_monotonic(b"");
+        assert!(
+            wrote,
+            "first empty capture records the empty/absent state once"
+        );
+        assert_eq!(command_line.raw_cmdline(), b"");
+        assert_eq!(command_line.status(), BootCommandLineStatus::Absent);
+
+        // Repeated empty captures stay a stable no-op.
+        let wrote_again = command_line.set_raw_cmdline_from_bytes_monotonic(b"");
+        assert!(
+            wrote_again,
+            "empty-over-empty still records empty (nothing to preserve)"
+        );
+        assert_eq!(command_line.raw_cmdline(), b"");
+        assert_eq!(command_line.status(), BootCommandLineStatus::Absent);
+
+        // A subsequent valid capture is still allowed to populate it.
+        assert!(command_line.set_raw_cmdline_from_bytes_monotonic(b"console=ttyS0"));
+        assert_eq!(command_line.raw_cmdline(), b"console=ttyS0");
+        assert_eq!(command_line.status(), BootCommandLineStatus::Captured);
+    }
+
+    #[test]
+    fn riscv_monotonic_stops_at_nul_when_deciding_emptiness() {
+        // A source that is NUL-first is treated as empty for preservation
+        // purposes (mirrors set_raw_cmdline_from_bytes NUL handling).
+        let mut command_line = BootCommandLine::absent();
+        assert!(command_line.set_raw_cmdline_from_bytes_monotonic(b"yarm.manifest=/boot/a"));
+        assert_eq!(command_line.raw_cmdline(), b"yarm.manifest=/boot/a");
+        // Leading NUL => incoming length 0 => preserve existing.
+        assert!(!command_line.set_raw_cmdline_from_bytes_monotonic(b"\0ignored"));
+        assert_eq!(command_line.raw_cmdline(), b"yarm.manifest=/boot/a");
     }
 
     #[test]
