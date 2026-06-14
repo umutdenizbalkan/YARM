@@ -8,6 +8,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 
 output=build-rpi5/kernel_2712_hh.img
+validate_image=
 target_dir=${CARGO_TARGET_DIR:-target}
 target_name=aarch64-rpi5-stage2-highhalf-none
 profile=aarch64-none
@@ -15,11 +16,13 @@ profile=aarch64-none
 usage() {
   cat <<USAGE
 Usage: $0 [--output PATH]
+       $0 --validate-image PATH
 
 Build the explicit RPi5 HH-3 diagnostic image. The output defaults to:
   build-rpi5/kernel_2712_hh.img
 
 This script never replaces build-rpi5/kernel_2712.img.
+The validation-only mode checks an existing raw image without rebuilding it.
 USAGE
 }
 
@@ -28,11 +31,38 @@ fail() {
   exit 1
 }
 
+required_markers=(
+  RPI5_HH_LOW_ENTRY
+  RPI5_HH_PLAN_DONE
+  RPI5_HH_ENABLE_DONE
+  RPI5_HH_JUMP_HIGH
+  RPI5_HH_HIGH_ENTRY_OK
+  RPI5_HH_RUST_ENTRY
+  RPI5_HH_REGISTERS_OK
+  RPI5_HH_RUST_UART_OK
+  RPI5_HH3_DONE
+)
+
+validate_raw_image_markers() {
+  local image=$1
+  local marker
+  [[ -f "$image" ]] || fail "HH raw image is not a file: $image"
+  for marker in "${required_markers[@]}"; do
+    grep -aFq -- "$marker" "$image" ||
+      fail "HH raw image is missing required marker: $marker"
+  done
+}
+
 while (($# > 0)); do
   case "$1" in
     --output)
       (($# >= 2)) || fail "--output requires a path"
       output=$2
+      shift 2
+      ;;
+    --validate-image)
+      (($# >= 2)) || fail "--validate-image requires a path"
+      validate_image=$2
       shift 2
       ;;
     -h|--help)
@@ -44,6 +74,12 @@ while (($# > 0)); do
       ;;
   esac
 done
+
+if [[ -n "$validate_image" ]]; then
+  validate_raw_image_markers "$validate_image"
+  echo "[ok] RPi5 HH raw image contains all required HH-3 markers: $validate_image"
+  exit 0
+fi
 
 [[ -n "$output" ]] || fail "--output must not be empty"
 if [[ "$output" == "build-rpi5/kernel_2712.img" ]]; then
@@ -73,6 +109,8 @@ fi
 mkdir -p -- "$(dirname -- "$output")"
 "$objcopy_bin" -O binary "$elf" "$output"
 
+validate_raw_image_markers "$output"
+
 readelf_bin=${READELF:-}
 if [[ -z "$readelf_bin" ]]; then
   readelf_bin=$(command -v readelf || true)
@@ -97,6 +135,7 @@ ttbr1=$("$readelf_bin" -W -s "$elf" | awk '$NF == "__hh_ttbr1_root" { print $2; 
 
 echo "[ok] RPi5 HH ELF: $elf"
 echo "[ok] RPi5 HH raw image: $output"
+echo "[ok] RPi5 HH raw image contains all required HH-3 markers"
 echo "[ok] RPi5 HH readelf proof: $readelf_report"
 echo "[ok] TTBR0 root: 0x$ttbr0"
 echo "[ok] TTBR1 root: 0x$ttbr1"

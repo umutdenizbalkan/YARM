@@ -79,6 +79,12 @@ SECTIONS {
     } :text
 
     .rodata : ALIGN(4096) {
+        /*
+         * Rust may otherwise materialize short diagnostic strings as immediate
+         * stores. Retain the HH-3 success markers as contiguous bytes so the
+         * raw firmware image is independently inspectable.
+         */
+        KEEP(*(.rodata.rpi5_hh_markers))
         *(.rodata*)
     } :text
 

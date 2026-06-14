@@ -6,6 +6,7 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 generator="$repo_root/scripts/create-rpi5-stage1-boot-dir.sh"
+hh_builder="$repo_root/scripts/build-rpi5-highhalf-artifact.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -31,6 +32,28 @@ assert_not_contains() {
     fail "$file unexpectedly contains: $text"
   fi
 }
+
+hh_marker_fixture="$tmp_dir/hh-marker-fixture.img"
+for marker in \
+  RPI5_HH_LOW_ENTRY \
+  RPI5_HH_PLAN_DONE \
+  RPI5_HH_ENABLE_DONE \
+  RPI5_HH_JUMP_HIGH \
+  RPI5_HH_HIGH_ENTRY_OK \
+  RPI5_HH_RUST_ENTRY \
+  RPI5_HH_REGISTERS_OK \
+  RPI5_HH_RUST_UART_OK \
+  RPI5_HH3_DONE; do
+  printf '%s\n' "$marker" >> "$hh_marker_fixture"
+done
+"$hh_builder" --validate-image "$hh_marker_fixture" >/dev/null
+sed '/RPI5_HH3_DONE/d' "$hh_marker_fixture" > "$tmp_dir/hh-marker-missing.img"
+if "$hh_builder" --validate-image "$tmp_dir/hh-marker-missing.img" \
+  >"$tmp_dir/hh-marker-missing.out" 2>&1; then
+  fail "HH marker validator accepted an incomplete raw image"
+fi
+assert_contains "$tmp_dir/hh-marker-missing.out" \
+  'HH raw image is missing required marker: RPI5_HH3_DONE'
 
 kernel="$tmp_dir/fake-stage1.img"
 printf 'fake-rpi5-stage1-kernel\n' > "$kernel"

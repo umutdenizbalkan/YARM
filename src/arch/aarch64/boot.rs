@@ -565,6 +565,44 @@ const RPI5_HH_TCR_EL1: u64 = 0x0000_0002_b519_3519;
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+macro_rules! rpi5_hh_retained_marker {
+    ($name:ident, $value:literal) => {
+        #[used]
+        #[unsafe(link_section = ".rodata.rpi5_hh_markers")]
+        static $name: [u8; $value.len()] = *$value;
+    };
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_RUST_ENTRY_MARKER, b"RPI5_HH_RUST_ENTRY");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_REGISTERS_OK_MARKER, b"RPI5_HH_REGISTERS_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_RUST_UART_OK_MARKER, b"RPI5_HH_RUST_UART_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH3_DONE_MARKER, b"RPI5_HH3_DONE");
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
 fn rpi5_hh_write_bytes(bytes: &[u8]) -> bool {
     const TX_READY_POLL_LIMIT: usize = 0x1_0000;
     let data = RPI5_HH_UART_VIRT as *mut u32;
@@ -667,7 +705,7 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
         );
     }
 
-    if !rpi5_hh_write_line(b"RPI5_HH_RUST_ENTRY") {
+    if !rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER) {
         loop {
             unsafe {
                 core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
@@ -712,9 +750,9 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
         rpi5_hh_fail(b"tcr_value_mismatch");
     }
 
-    if !rpi5_hh_write_line(b"RPI5_HH_REGISTERS_OK")
-        || !rpi5_hh_write_line(b"RPI5_HH_RUST_UART_OK")
-        || !rpi5_hh_write_line(b"RPI5_HH3_DONE")
+    if !rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)
     {
         rpi5_hh_fail(b"uart_timeout");
     }

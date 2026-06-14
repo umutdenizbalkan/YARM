@@ -593,9 +593,41 @@ fn rpi5_hh3_build_and_generator_paths_are_explicit() {
     assert!(build.contains("--features rpi5-highhalf"));
     assert!(build.contains("aarch64-rpi5-stage2-highhalf-none.json"));
     assert!(build.contains("refusing to overwrite the default RPi5 artifact"));
+    assert!(build.contains("required_markers=("));
+    assert!(build.contains("validate_raw_image_markers"));
+    assert!(build.contains("grep -aFq -- \"$marker\" \"$image\""));
+    assert!(build.contains("--validate-image"));
+    for marker in [
+        "RPI5_HH_LOW_ENTRY",
+        "RPI5_HH_PLAN_DONE",
+        "RPI5_HH_ENABLE_DONE",
+        "RPI5_HH_JUMP_HIGH",
+        "RPI5_HH_HIGH_ENTRY_OK",
+        "RPI5_HH_RUST_ENTRY",
+        "RPI5_HH_REGISTERS_OK",
+        "RPI5_HH_RUST_UART_OK",
+        "RPI5_HH3_DONE",
+    ] {
+        assert!(build.contains(marker), "build validation omits {marker}");
+    }
     assert!(generator.contains("--highhalf"));
     assert!(generator.contains("Explicit high-half diagnostic mode"));
     assert!(generator.contains("RPI5_HH3_DONE"));
     assert!(generator_test.contains("fake-kernel_2712_hh.img"));
     assert!(generator_test.contains("HH mode without explicit kernel input"));
+    assert!(generator_test.contains("HH marker validator accepted an incomplete raw image"));
+}
+
+#[test]
+fn rpi5_hh3_success_markers_are_retained_in_the_high_image() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let linker = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.ld");
+
+    assert!(boot.contains("link_section = \".rodata.rpi5_hh_markers\""));
+    assert!(boot.contains("#[used]"));
+    assert!(linker.contains("KEEP(*(.rodata.rpi5_hh_markers))"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER)"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)"));
 }

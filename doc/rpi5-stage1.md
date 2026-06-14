@@ -410,10 +410,14 @@ TTBR0_EL1, TTBR1_EL1, and TCR_EL1. PC, SP, and VBAR must be high; VBAR must reta
 the roots must be nonzero, page-aligned, distinct, and equal the linker-reserved roots; EPD1 must be
 clear; T1SZ must remain 25; and TCR must equal `0x00000002b5193519`. Success ends with
 `RPI5_HH_REGISTERS_OK`, `RPI5_HH_RUST_UART_OK`, and `RPI5_HH3_DONE`, followed by a safe halt.
+The four Rust success markers live in a dedicated retained
+`.rodata.rpi5_hh_markers` section. The high-half linker uses `KEEP` for that section so optimized
+code generation cannot turn the only copies into non-contiguous immediate stores or discard them.
 
 `scripts/build-rpi5-highhalf-artifact.sh` is the explicit build entry point. It selects the HH target
 and feature and writes `build-rpi5/kernel_2712_hh.img`; it refuses to replace the default
-`build-rpi5/kernel_2712.img`. The boot-directory generator stages that image as firmware-visible
+`build-rpi5/kernel_2712.img`. After objcopy, the script scans the raw image and fails unless every
+required low-transition and HH-3 success marker is present. The boot-directory generator stages that image as firmware-visible
 `kernel_2712.img` only when invoked with `--highhalf`. The generated README labels the image as a
 high-half diagnostic. An initrd remains optional and is not consumed by HH-3.
 
