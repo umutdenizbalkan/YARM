@@ -14,6 +14,8 @@ Required:
   --kernel-input PATH    Raw Stage 1 kernel image to copy as kernel_2712.img.
 
 Options:
+  --initrd-input PATH    Optional newc CPIO image to stage as initramfs-stage2a.cpio.
+  --highhalf             Explicitly stage an HH diagnostic kernel input.
   --boot-dir PATH        Output directory (default: build/rpi5-stage1-boot).
   --phase PHASE          Stop phase: entry, uart, dtb, mmu, or kernel
                          (default: uart).
@@ -23,8 +25,9 @@ Options:
   --force                Replace generator-owned files if they already exist.
   -h, --help             Show this help.
 
-This creates only config.txt, cmdline.txt, kernel_2712.img, and
-README-RPI5-STAGE1.txt. It does not download firmware or claim full Pi 5 support.
+This creates config.txt, cmdline.txt, kernel_2712.img, and
+README-RPI5-STAGE1.txt. When --initrd-input is supplied it also creates
+initramfs-stage2a.cpio. It does not download firmware or claim full Pi 5 support.
 USAGE
 }
 
@@ -34,12 +37,14 @@ fail() {
 }
 
 kernel_input=
+initrd_input=
 boot_dir=build/rpi5-stage1-boot
 phase=uart
 cmdline_extra=
 os_check_off=false
 enable_rp1_uart=false
 force=false
+highhalf=false
 
 while (($# > 0)); do
   case "$1" in
@@ -47,6 +52,15 @@ while (($# > 0)); do
       (($# >= 2)) || fail "--kernel-input requires a path"
       kernel_input=$2
       shift 2
+      ;;
+    --initrd-input)
+      (($# >= 2)) || fail "--initrd-input requires a path"
+      initrd_input=$2
+      shift 2
+      ;;
+    --highhalf)
+      highhalf=true
+      shift
       ;;
     --boot-dir)
       (($# >= 2)) || fail "--boot-dir requires a path"
@@ -94,6 +108,9 @@ done
 
 [[ -n "$kernel_input" ]] || fail "--kernel-input is required (use --help for usage)"
 [[ -f "$kernel_input" ]] || fail "kernel input is not a file: $kernel_input"
+if [[ -n "$initrd_input" ]]; then
+  [[ -f "$initrd_input" ]] || fail "initrd input is not a file: $initrd_input"
+fi
 [[ -n "$boot_dir" ]] || fail "--boot-dir must not be empty"
 case "$phase" in
   entry|uart|dtb|mmu|kernel) ;;
@@ -109,6 +126,9 @@ output_files=(
   "$boot_dir/kernel_2712.img"
   "$boot_dir/README-RPI5-STAGE1.txt"
 )
+if [[ -n "$initrd_input" ]]; then
+  output_files+=("$boot_dir/initramfs-stage2a.cpio")
+fi
 if [[ "$force" != true ]]; then
   for output_file in "${output_files[@]}"; do
     [[ ! -e "$output_file" ]] || fail "output already exists: $output_file (use --force to replace generator-owned files)"
@@ -125,6 +145,9 @@ if [[ -n "$cmdline_extra" ]]; then
 fi
 
 cp -- "$kernel_input" "$boot_dir/kernel_2712.img"
+if [[ -n "$initrd_input" ]]; then
+  cp -- "$initrd_input" "$boot_dir/initramfs-stage2a.cpio"
+fi
 
 {
   echo "# Raspberry Pi 5 YARM Stage 1 UART bring-up scaffold; not full Pi 5 support."
@@ -132,6 +155,12 @@ cp -- "$kernel_input" "$boot_dir/kernel_2712.img"
   echo "arm_64bit=1"
   echo "enable_uart=1"
   echo "uart_2ndstage=1"
+  if [[ -n "$initrd_input" ]]; then
+    # Raspberry Pi firmware's initramfs directive is space-separated (no '=').
+    # followkernel asks firmware to place the blob after the loaded kernel and
+    # publish linux,initrd-start/end in /chosen.
+    echo "initramfs initramfs-stage2a.cpio followkernel"
+  fi
   if [[ "$os_check_off" == true ]]; then
     echo "os_check=0"
   fi
@@ -160,6 +189,25 @@ Expected serial markers, in order:
   RPI5_BOOT_02_UART_SELECTED
   RPI5_BOOT_03_UART_OK
 
+Stage2A initrd diagnostics (boot_phase=kernel):
+  RPI5_INITRD_DETECT_BEGIN
+  RPI5_INITRD_DTB_PROPS
+  RPI5_INITRD_RANGE
+  RPI5_INITRD_RESERVED
+  RPI5_INITRD_CPIO_MAGIC_OK
+  RPI5_INITRD_CPIO_FIRST_ENTRY
+  RPI5_INITRD_READY
+  RPI5_STAGE2A_DONE
+
+To stage an initrd, rerun this generator with:
+  --initrd-input build-aarch64/initramfs-core.cpio
+
+The generator copies it as initramfs-stage2a.cpio and adds:
+  initramfs initramfs-stage2a.cpio followkernel
+
+Stage2A validates and reserves the archive and reads only its first newc entry.
+It does not unpack the archive or spawn userspace.
+
 Troubleshooting
 ---------------
 | Serial result                         | Likely boundary to investigate |
@@ -175,12 +223,47 @@ Generated files
   config.txt             Pi firmware configuration for this smoke test.
   cmdline.txt            YARM platform, stop phase, CPU limit, and extras.
   kernel_2712.img        Exact copy of the --kernel-input file.
+  initramfs-stage2a.cpio Present only when --initrd-input is supplied.
   README-RPI5-STAGE1.txt This guide.
 
 Optional firmware settings are intentionally absent unless requested:
   os_check=0             Generated only with --os-check-off.
   enable_rp1_uart=1      Generated only with --enable-rp1-uart.
 EOF_README
+
+if [[ "$highhalf" == true ]]; then
+  cat >> "$boot_dir/README-RPI5-STAGE1.txt" <<'EOF_HIGHHALF'
+
+Explicit high-half diagnostic mode
+----------------------------------
+This directory was generated with --highhalf. The staged kernel_2712.img is
+expected to be the separately built kernel_2712_hh.img artifact. This mode is
+diagnostic only: it proves the low-to-high transition, high stack/vector state,
+dual TTBR roots, TCR configuration, and the high UART alias. It does not install
+a userspace TTBR0 root, enter EL0, or start the scheduler/service chain.
+
+Expected high-half diagnostic markers:
+  RPI5_HH_LOW_ENTRY
+  RPI5_HH_PLAN_DONE
+  RPI5_HH_ENABLE_DONE
+  RPI5_HH_JUMP_HIGH
+  RPI5_HH_HIGH_ENTRY_OK
+  RPI5_HH_RUST_ENTRY
+  RPI5_HH_REGISTERS_OK
+  RPI5_HH_RUST_UART_OK
+  RPI5_HH3_DONE
+  RPI5_HH4_BEGIN
+  RPI5_HH4_TTBR0_REPLACE_DONE
+  RPI5_HH4_UART_AFTER_TTBR0_OK
+  RPI5_HH4_DONE
+  RPI5_HH5_BEGIN
+  RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready
+  RPI5_HH5_DONE status=deferred
+
+An initrd may still be staged with --initrd-input, but HH-3 does not require or
+consume it.
+EOF_HIGHHALF
+fi
 
 cat <<REPORT
 [ok] staged Raspberry Pi 5 Stage 1 boot directory: $boot_dir
@@ -190,3 +273,9 @@ cat <<REPORT
 [warn] this scaffold does not build firmware files or prove the linked image load address
 [warn] this is Stage 1 diagnostics; it does not claim full Raspberry Pi 5 support
 REPORT
+if [[ "$highhalf" == true ]]; then
+  echo "[ok] mode: explicit RPi5 high-half diagnostic"
+fi
+if [[ -n "$initrd_input" ]]; then
+  echo "[ok] initrd: $boot_dir/initramfs-stage2a.cpio"
+fi
