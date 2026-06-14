@@ -292,6 +292,25 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
     }
 }
 
+/// Stage 109 / Milestone 2 Pass 2: scaffolding gate for the AP Rust-entry
+/// path. The cmdline knob `yarm.x86_ap_rust=1` flips this flag at boot
+/// (handled in `kernel/boot_command_line.rs`), and a future pass will read
+/// it inside `prepare_trampoline_for_cpu` to populate
+/// `ApHandoff::ap_entry_addr`. Today the trampoline asm is unchanged from
+/// Stage 108 and ignores this flag; the gate exists so observability tests
+/// can prove the cmdline path is wired through to the SMP layer without
+/// activating the regression-prone Rust-entry path.
+static AP_RUST_ENTRY_ENABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn ap_rust_entry_enabled() -> bool {
+    AP_RUST_ENTRY_ENABLE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub fn set_ap_rust_entry_enabled(enabled: bool) {
+    AP_RUST_ENTRY_ENABLE.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
 pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelError> {
     let present = kernel.present_cpu_bitmap();
 

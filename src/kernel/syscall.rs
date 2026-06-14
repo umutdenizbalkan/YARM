@@ -8902,6 +8902,76 @@ mod tests {
         assert!(smoke.contains("QEMU_SMP=1"));
     }
 
+    // ── Stage 109 / Milestone 2 Pass 2 — AP Rust-entry scaffolding fences ────
+
+    #[test]
+    fn stage109_smp_ap_rust_entry_function_exists() {
+        // The AP Rust entry function is the future call target for the
+        // trampoline (Pass 3 wiring). It must remain a `pub(super)` extern
+        // "C" fn with the canonical name so the trampoline asm can take its
+        // address without re-mangling.
+        let src = include_str!("../arch/x86_64/smp_trampoline.rs");
+        assert!(
+            src.contains("pub(super) extern \"C\" fn yarm_x86_64_ap_entry"),
+            "yarm_x86_64_ap_entry must remain defined as a future Rust AP entry"
+        );
+    }
+
+    #[test]
+    fn stage109_smp_ap_rust_gate_is_default_off() {
+        // The Pass 2 gate exists in arch::x86_64::smp and defaults to false.
+        let src = include_str!("../arch/x86_64/smp.rs");
+        assert!(
+            src.contains("pub fn ap_rust_entry_enabled()")
+                && src.contains("pub fn set_ap_rust_entry_enabled(enabled: bool)"),
+            "Pass 2 AP Rust-entry gate getter/setter must exist"
+        );
+        assert!(
+            src.contains("AtomicBool::new(false)"),
+            "Pass 2 AP Rust-entry gate must default to false"
+        );
+    }
+
+    #[test]
+    fn stage109_smp_cmdline_knob_parses() {
+        use crate::kernel::boot_command_line::parse_yarm_boot_options;
+        // `yarm.x86_ap_rust=1` parses to Some(true).
+        let parsed = parse_yarm_boot_options(b"yarm.x86_ap_rust=1");
+        assert_eq!(parsed.x86_ap_rust, Some(true));
+        // `yarm.x86_ap_rust=0` parses to Some(false).
+        let parsed = parse_yarm_boot_options(b"yarm.x86_ap_rust=0");
+        assert_eq!(parsed.x86_ap_rust, Some(false));
+        // Invalid value clears to None.
+        let parsed = parse_yarm_boot_options(b"yarm.x86_ap_rust=bogus");
+        assert_eq!(parsed.x86_ap_rust, None);
+        // Absent key keeps default None.
+        let parsed = parse_yarm_boot_options(b"console=ttyS0");
+        assert_eq!(parsed.x86_ap_rust, None);
+        // Knob does not collide with other yarm.* knobs.
+        let parsed = parse_yarm_boot_options(
+            b"yarm.loglevel=info yarm.x86_ap_rust=true yarm.manifest=/boot/x.txt",
+        );
+        assert_eq!(parsed.x86_ap_rust, Some(true));
+        assert_eq!(parsed.console_loglevel, Some(6));
+    }
+
+    #[test]
+    fn stage109_smp_ap_trampoline_asm_park_default_preserved() {
+        // The trampoline asm MUST still default to the assembly cli/hlt
+        // park loop. Pass 2 keeps the trampoline byte-identical to Stage
+        // 108 (the proposed Rust-jump tail was reverted after a -smp 2
+        // BSP service-chain regression).
+        let src = include_str!("../arch/x86_64/smp_trampoline.rs");
+        assert!(
+            src.contains("// Park AP fully offline in assembly."),
+            "the assembly park comment must remain"
+        );
+        assert!(
+            !src.contains("test rax, rax\n    jnz"),
+            "the Rust-jump trampoline tail must remain reverted in Pass 2"
+        );
+    }
+
     #[test]
     fn stage108_smp_ap_still_parks_in_assembly() {
         // Honest-blocker fence: the AP parks in an assembly cli/hlt loop and
