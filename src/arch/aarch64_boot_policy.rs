@@ -26,10 +26,43 @@ const MAX_STAGE2B_CPIO_NAME: usize = 256;
 pub const RPI5_STAGE2C_INIT_TID: u64 = 1;
 pub const RPI5_STAGE2C_STACK_TOP: u64 = 0x3fe0_0000;
 pub const RPI5_STAGE2C_STACK_PAGES: u64 = 4;
+pub const RPI5_KERNEL_VA_OFFSET: u64 = 0xffff_ff80_0000_0000;
+pub const RPI5_KERNEL_PHYS_LOAD_BASE: u64 = 0x0000_0000_0008_0000;
+pub const RPI5_KERNEL_VIRT_LOAD_BASE: u64 = 0xffff_ff80_0008_0000;
 const STAGE1_MMU_MIN_TABLE_PAGES: u64 = 4;
 const STAGE1_TTBR0_VA_LIMIT: u64 = 1 << 39;
 const RPI5_FIRMWARE_LOW_RESERVED_END: u64 = 0x80000;
 const RPI5_PREFERRED_UART: &[u8] = b"/soc@107c000000/serial@7d001000";
+
+pub const fn checked_phys_to_rpi5_kernel_virt(pa: u64) -> Option<u64> {
+    RPI5_KERNEL_VA_OFFSET.checked_add(pa)
+}
+
+pub const fn phys_to_rpi5_kernel_virt(pa: u64) -> u64 {
+    match checked_phys_to_rpi5_kernel_virt(pa) {
+        Some(va) => va,
+        None => panic!("RPi5 physical address is outside the high-half direct-map contract"),
+    }
+}
+
+pub const fn checked_rpi5_kernel_virt_to_phys(va: u64) -> Option<u64> {
+    va.checked_sub(RPI5_KERNEL_VA_OFFSET)
+}
+
+pub const fn rpi5_kernel_virt_to_phys(va: u64) -> u64 {
+    match checked_rpi5_kernel_virt_to_phys(va) {
+        Some(pa) => pa,
+        None => panic!("address is not in the RPi5 kernel high half"),
+    }
+}
+
+pub const fn is_rpi5_kernel_high_va(va: u64) -> bool {
+    checked_rpi5_kernel_virt_to_phys(va).is_some()
+}
+
+pub const fn is_rpi5_low_phys(pa: u64) -> bool {
+    checked_phys_to_rpi5_kernel_virt(pa).is_some()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DetectedPlatform {
@@ -3745,6 +3778,27 @@ mod tests {
             tcr_el1: 25,
             kernel_pc: 0xffff_0000_0008_0000,
         }
+    }
+
+    #[test]
+    fn rpi5_high_half_address_contract_maps_and_round_trips() {
+        assert_eq!(
+            checked_phys_to_rpi5_kernel_virt(RPI5_KERNEL_PHYS_LOAD_BASE),
+            Some(RPI5_KERNEL_VIRT_LOAD_BASE)
+        );
+        assert_eq!(
+            phys_to_rpi5_kernel_virt(0x10_7d00_1000),
+            0xffff_ff90_7d00_1000
+        );
+        let pa = 0x2efe_c600;
+        let va = phys_to_rpi5_kernel_virt(pa);
+        assert!(is_rpi5_kernel_high_va(va));
+        assert!(is_rpi5_low_phys(pa));
+        assert_eq!(rpi5_kernel_virt_to_phys(va), pa);
+        assert_eq!(checked_rpi5_kernel_virt_to_phys(0x80000), None);
+        assert!(!is_rpi5_kernel_high_va(0x80000));
+        assert_eq!(checked_phys_to_rpi5_kernel_virt(u64::MAX), None);
+        assert!(!is_rpi5_low_phys(u64::MAX));
     }
 
     #[test]

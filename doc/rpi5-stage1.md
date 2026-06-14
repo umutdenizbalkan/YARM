@@ -358,6 +358,23 @@ normal scheduler invariants are not fabricated. Stage2D emits
 `RPI5_STAGE2E_DEFERRED reason=el0_not_entered`, then halts. It does not write TTBR0, execute ERET,
 dispatch a syscall, enable interrupts, or claim userspace/service-chain progress.
 
+### RPi5 high-half address contract
+
+The selected long-term TTBR split keeps EL0 mappings in `TTBR0_EL1` and moves the kernel to
+`TTBR1_EL1`. The RPi5 contract preserves the physical firmware load base at `0x80000`, uses
+`0xffffff8000000000` as the kernel virtual offset, and therefore maps the first kernel load address
+to `0xffffff8000080000`. Kernel virtual and physical addresses convert by adding or subtracting that
+fixed offset; checked helpers reject arithmetic overflow and addresses below the kernel high half.
+
+`targets/aarch64-rpi5-stage2-highhalf-none.ld` is a non-default scaffold for that transition. It
+defines the low boot range, physical and virtual kernel ranges, and the VA offset while assigning
+high-half VMAs and low physical LMAs. It is deliberately not referenced by the current target JSON.
+The hardware-proven `aarch64-rpi5-stage1-none` profile still links and executes at `0x80000`.
+
+This scaffold does not install TTBR1, alter TCR, branch to a high virtual address, replace TTBR0,
+or attempt ERET. A later transition must first map the executing kernel, vectors, stack, page tables,
+and required MMIO in TTBR1, branch into the high half, and only then install a user root in TTBR0.
+
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans
 every `ranges` entry for a containing window. For the BCM2712 UART, child address `0x7d001000` falls
