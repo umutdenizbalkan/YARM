@@ -8,7 +8,11 @@ use core::fmt::Write;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    not(feature = "rpi5-highhalf")
+))]
 global_asm!(
     r#"
     .section .bss.bootstack,"aw",@nobits
@@ -30,6 +34,16 @@ secondary_boot_stacks_end:
     .type _start,%function
 _start:
     mov x20, x0
+    mov x21, x1
+    mov x22, x2
+    mov x23, x3
+    adrp x9, boot_stack_aarch64_end
+    add x9, x9, :lo12:boot_stack_aarch64_end
+    mov sp, x9
+    bl yarm_aarch64_marker_raw_entry
+    bl yarm_aarch64_marker_raw_after_marker
+    bl yarm_aarch64_marker_dtb_x0
+    bl yarm_aarch64_marker_bss_clear_begin
     adrp x1, __bss_start
     add x1, x1, :lo12:__bss_start
     adrp x2, __bss_end
@@ -41,12 +55,20 @@ _start:
     subs x2, x2, #8
     b.gt 1b
 2:
-    adrp x0, boot_stack_aarch64_end
-    add x0, x0, :lo12:boot_stack_aarch64_end
-    mov sp, x0
+    bl yarm_aarch64_marker_bss_clear_done
+    adrp x9, boot_stack_aarch64_end
+    add x9, x9, :lo12:boot_stack_aarch64_end
+    mov sp, x9
+    bl yarm_aarch64_marker_stack_ready
+    bl yarm_aarch64_marker_before_el1
     bl yarm_aarch64_enter_el1_if_needed
+    bl yarm_aarch64_marker_after_el1
     bl yarm_aarch64_enable_fp_simd
+    bl yarm_aarch64_marker_before_rust
     mov x0, x20
+    mov x1, x21
+    mov x2, x22
+    mov x3, x23
     bl yarm_aarch64_select_early_console
     bl yarm_aarch64_boot_breadcrumb_b0
     bl yarm_aarch64_boot_marker_start
@@ -96,6 +118,1487 @@ yarm_aarch64_enter_el1_if_needed:
 1:
 2:
     ret
+    "#
+);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+global_asm!(
+    r#"
+    /*
+     * HH-2 is a transition diagnostic, not the final user-entry path.  It
+     * builds distinct low-identity and high-kernel roots from linker-reserved
+     * pages, keeps TTBR0 on the low root, enables TTBR1, branches to the high
+     * alias of this code, proves VBAR/UART high aliases, and halts.  It never
+     * installs the Stage2C root and never executes an EL0 ERET.
+     */
+    .equ HH_UART_PHYS,       0x107d001000
+    .equ HH_UART_VIRT,       0xffffff907d001000
+    .equ HH_VA_OFFSET,       0xffffff8000000000
+    .equ HH_RAM_LIMIT,       0x80000000
+    .equ HH_MAIR,            0x04ff
+    .equ HH_TCR,             0x00000002b5193519
+    .equ HH_NORMAL_BLOCK,    0x701
+    .equ HH_DEVICE_PAGE,     0x60000000000707
+    .equ HH_TABLE,           0x3
+
+    .section .bss.bootstack,"aw",@nobits
+    .align 16
+boot_stack_aarch64:
+    .skip 0x01000000
+boot_stack_aarch64_end:
+    .align 16
+exc_stack_aarch64:
+    .skip 65536
+exc_stack_aarch64_end:
+    .align 16
+secondary_boot_stacks:
+    .skip 0x00100000
+secondary_boot_stacks_end:
+
+    .section .text.boot,"ax",@progbits
+    .global _start
+    .type _start,%function
+_start:
+    mov x20, x0
+    ldr x9, =boot_stack_aarch64_end
+    mov sp, x9
+    bl .Lhh_enter_el1
+    ldr x19, =HH_UART_PHYS
+    adr x0, .Lhh_low_entry
+    bl .Lhh_write_cstr
+
+    adr x0, .Lhh_plan_begin
+    bl .Lhh_write_cstr
+    mrs x0, SCTLR_EL1
+    tbnz x0, #0, .Lhh_fail_already_enabled
+    ldr x21, =__hh_ttbr0_root
+    ldr x22, =__hh_ttbr1_root
+    cmp x21, x22
+    b.eq .Lhh_fail_roots
+    tst x21, #0xfff
+    b.ne .Lhh_fail_roots
+    tst x22, #0xfff
+    b.ne .Lhh_fail_roots
+
+    ldr x0, =__hh_pt_pool_start
+    ldr x1, =__hh_pt_pool_end
+.Lhh_zero_pt:
+    cmp x0, x1
+    b.hs .Lhh_zero_pt_done
+    stp xzr, xzr, [x0], #16
+    b .Lhh_zero_pt
+.Lhh_zero_pt_done:
+
+    // TTBR0 retains a bounded 0..2 GiB identity map during the transition.
+    ldr x0, =HH_NORMAL_BLOCK
+    str x0, [x21]
+    ldr x1, =0x40000000
+    orr x1, x1, x0
+    str x1, [x21, #8]
+
+    // TTBR1 maps the same RAM at VA = PA + HH_VA_OFFSET.
+    str x0, [x22]
+    str x1, [x22, #8]
+
+    // UART is outside RAM. Keep its physical alias in TTBR0 until the branch.
+    ldr x23, =__hh_uart0_l2
+    orr x0, x23, #HH_TABLE
+    str x0, [x21, #(65 * 8)]
+    ldr x24, =__hh_uart0_l3
+    orr x0, x24, #HH_TABLE
+    mov x1, #0xf40
+    str x0, [x23, x1]
+    ldr x0, =HH_UART_PHYS
+    ldr x1, =HH_DEVICE_PAGE
+    orr x0, x0, x1
+    mov x1, #8
+    str x0, [x24, x1]
+
+    // TTBR1 receives the equivalent dedicated device-nGnRE high alias.
+    ldr x23, =__hh_uart1_l2
+    orr x0, x23, #HH_TABLE
+    str x0, [x22, #(65 * 8)]
+    ldr x24, =__hh_uart1_l3
+    orr x0, x24, #HH_TABLE
+    mov x1, #0xf40
+    str x0, [x23, x1]
+    ldr x0, =HH_UART_PHYS
+    ldr x1, =HH_DEVICE_PAGE
+    orr x0, x0, x1
+    mov x1, #8
+    str x0, [x24, x1]
+
+    // All required high aliases are contained by the reviewed 0..2 GiB map.
+    ldr x25, =__kernel_phys_start
+    ldr x26, =__kernel_phys_end
+    cmp x26, x25
+    b.ls .Lhh_fail_range
+    ldr x0, =HH_RAM_LIMIT
+    cmp x26, x0
+    b.hi .Lhh_fail_range
+    cbz x20, .Lhh_fail_dtb
+    cmp x20, x0
+    b.hs .Lhh_fail_dtb
+    ldr w1, [x20, #4]
+    rev w1, w1
+    add x27, x20, x1
+    cmp x27, x20
+    b.ls .Lhh_fail_dtb
+    cmp x27, x0
+    b.hi .Lhh_fail_dtb
+
+    adr x0, .Lhh_map_kernel
+    bl .Lhh_write_cstr
+    mov x0, x25
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x25, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x26, x25
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_stack
+    bl .Lhh_write_cstr
+    ldr x25, =boot_stack_aarch64
+    ldr x26, =boot_stack_aarch64_end
+    mov x0, x25
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x25, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x26, x25
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_dtb
+    bl .Lhh_write_cstr
+    mov x0, x20
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x20, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x27, x20
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_heap
+    bl .Lhh_write_cstr
+    ldr x25, =__hh_heap_start
+    ldr x26, =__hh_heap_end
+    mov x0, x25
+    bl .Lhh_write_hex
+    adr x0, .Lhh_virt_sep
+    bl .Lhh_write_cstr
+    ldr x1, =HH_VA_OFFSET
+    add x0, x25, x1
+    bl .Lhh_write_hex
+    adr x0, .Lhh_size_sep
+    bl .Lhh_write_cstr
+    sub x0, x26, x25
+    bl .Lhh_write_hex_line
+
+    adr x0, .Lhh_map_uart
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_ttbr0
+    bl .Lhh_write_cstr
+    mov x0, x21
+    bl .Lhh_write_hex_line
+    adr x0, .Lhh_ttbr1
+    bl .Lhh_write_cstr
+    mov x0, x22
+    bl .Lhh_write_hex_line
+    adr x0, .Lhh_tcr
+    bl .Lhh_write_cstr
+    ldr x0, =HH_TCR
+    bl .Lhh_write_hex_line
+    adr x0, .Lhh_plan_done
+    bl .Lhh_write_cstr
+
+    adr x0, .Lhh_enable_begin
+    bl .Lhh_write_cstr
+    ldr x0, =__hh_pt_pool_start
+    ldr x1, =__hh_pt_pool_end
+.Lhh_clean_pt:
+    cmp x0, x1
+    b.hs .Lhh_clean_pt_done
+    dc cvac, x0
+    add x0, x0, #64
+    b .Lhh_clean_pt
+.Lhh_clean_pt_done:
+    dsb sy
+    ldr x0, =HH_MAIR
+    msr MAIR_EL1, x0
+    ldr x0, =HH_TCR
+    msr TCR_EL1, x0
+    msr TTBR0_EL1, x21
+    msr TTBR1_EL1, x22
+    dsb ishst
+    tlbi vmalle1
+    dsb ish
+    isb
+    ic iallu
+    dsb nsh
+    isb
+    mrs x0, SCTLR_EL1
+    orr x0, x0, #(1 << 0)
+    orr x0, x0, #(1 << 2)
+    orr x0, x0, #(1 << 12)
+    msr SCTLR_EL1, x0
+    isb
+    mrs x0, SCTLR_EL1
+    tbz x0, #0, .Lhh_fail_enable
+    adr x0, .Lhh_enable_done
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_jump_high
+    bl .Lhh_write_cstr
+
+    adr x0, .Lhh_high_entry
+    ldr x1, =HH_VA_OFFSET
+    add x0, x0, x1
+    br x0
+
+.Lhh_high_entry:
+    adr x0, .Lhh_high_entry
+    ldr x1, =HH_VA_OFFSET
+    cmp x0, x1
+    b.hs 1f
+    adr x0, .Lhh_high_failed_pc
+    b .Lhh_high_fail
+1:
+    mov x0, sp
+    ldr x1, =HH_VA_OFFSET
+    add x0, x0, x1
+    mov sp, x0
+    adr x0, .Lhh_vectors
+    msr VBAR_EL1, x0
+    isb
+    mrs x1, VBAR_EL1
+    cmp x0, x1
+    b.ne .Lhh_high_failed_vbar
+    ldr x19, =HH_UART_VIRT
+    adr x0, .Lhh_high_ok
+    bl .Lhh_write_cstr
+    adr x0, .Lhh_vbar_ok
+    bl .Lhh_write_cstr
+    ldr x0, =yarm_rpi5_hh_rust_continue
+    br x0
+
+.Lhh_fail_roots:
+    adr x0, .Lhh_failed_roots
+    b .Lhh_low_fail
+.Lhh_fail_already_enabled:
+    adr x0, .Lhh_enable_already
+    b .Lhh_low_fail
+.Lhh_fail_range:
+    adr x0, .Lhh_failed_range
+    b .Lhh_low_fail
+.Lhh_fail_dtb:
+    adr x0, .Lhh_failed_dtb
+    b .Lhh_low_fail
+.Lhh_fail_enable:
+    adr x0, .Lhh_enable_failed
+.Lhh_low_fail:
+    bl .Lhh_write_cstr
+    b .Lhh_halt
+.Lhh_high_failed_vbar:
+    adr x0, .Lhh_high_failed_vbar_msg
+.Lhh_high_fail:
+    bl .Lhh_write_cstr
+.Lhh_halt:
+    wfe
+    b .Lhh_halt
+
+.Lhh_enter_el1:
+    mrs x0, CurrentEL
+    lsr x0, x0, #2
+    cmp x0, #2
+    b.ne 1f
+    mov x0, #(1 << 31)
+    msr HCR_EL2, x0
+    msr CPTR_EL2, xzr
+    msr HSTR_EL2, xzr
+    msr MDCR_EL2, xzr
+    mov x0, sp
+    msr SP_EL1, x0
+    adr x0, 1f
+    msr ELR_EL2, x0
+    mov x0, #0x3c5
+    msr SPSR_EL2, x0
+    isb
+    eret
+1:
+    ret
+
+// x0 = NUL-terminated bytes, x19 = selected low/high UART alias.
+.Lhh_write_cstr:
+    stp x1, x2, [sp, #-16]!
+    stp x3, x30, [sp, #-16]!
+1:
+    ldrb w1, [x0], #1
+    cbz w1, 3f
+    mov x2, #0x10000
+2:
+    ldr w3, [x19, #0x18]
+    tbz w3, #5, 4f
+    subs x2, x2, #1
+    b.ne 2b
+    b 3f
+4:
+    str w1, [x19]
+    b 1b
+3:
+    ldp x3, x30, [sp], #16
+    ldp x1, x2, [sp], #16
+    ret
+
+// x0 = value. Writes exactly 16 lower-case hexadecimal digits.
+.Lhh_write_hex:
+    stp x1, x2, [sp, #-16]!
+    stp x3, x4, [sp, #-16]!
+    stp x5, x30, [sp, #-16]!
+    mov x5, x0
+    mov x4, #60
+1:
+    lsr x1, x5, x4
+    and x1, x1, #0xf
+    cmp x1, #10
+    add x2, x1, #'0'
+    add x3, x1, #('a' - 10)
+    csel x1, x2, x3, lo
+    mov x2, #0x10000
+2:
+    ldr w3, [x19, #0x18]
+    tbz w3, #5, 3f
+    subs x2, x2, #1
+    b.ne 2b
+    b 4f
+3:
+    str w1, [x19]
+4:
+    subs x4, x4, #4
+    b.ge 1b
+    ldp x5, x30, [sp], #16
+    ldp x3, x4, [sp], #16
+    ldp x1, x2, [sp], #16
+    ret
+
+.Lhh_write_hex_line:
+    stp x0, x30, [sp, #-16]!
+    bl .Lhh_write_hex
+    adr x0, .Lhh_crlf
+    bl .Lhh_write_cstr
+    ldp x0, x30, [sp], #16
+    ret
+
+    .balign 2048
+.Lhh_vectors:
+    .rept 16
+    b .Lhh_halt
+    .space 124
+    .endr
+
+    .section .rodata.rpi5_raw_entry,"a",@progbits
+.Lhh_low_entry:       .asciz "RPI5_HH_LOW_ENTRY\r\n"
+.Lhh_plan_begin:      .asciz "RPI5_HH_PLAN_BEGIN\r\n"
+.Lhh_map_kernel:      .asciz "RPI5_HH_MAP_KERNEL phys=0x"
+.Lhh_map_stack:       .asciz "RPI5_HH_MAP_STACK phys=0x"
+.Lhh_map_dtb:         .asciz "RPI5_HH_MAP_DTB phys=0x"
+.Lhh_map_heap:        .asciz "RPI5_HH_MAP_HEAP phys=0x"
+.Lhh_virt_sep:        .asciz " virt=0x"
+.Lhh_size_sep:        .asciz " size=0x"
+.Lhh_map_uart:        .asciz "RPI5_HH_MAP_UART phys=0x000000107d001000 virt=0xffffff907d001000\r\n"
+.Lhh_ttbr0:           .asciz "RPI5_HH_TTBR0_ROOT base=0x"
+.Lhh_ttbr1:           .asciz "RPI5_HH_TTBR1_ROOT base=0x"
+.Lhh_tcr:             .asciz "RPI5_HH_TCR value=0x"
+.Lhh_plan_done:       .asciz "RPI5_HH_PLAN_DONE\r\n"
+.Lhh_enable_begin:    .asciz "RPI5_HH_ENABLE_BEGIN\r\n"
+.Lhh_enable_done:     .asciz "RPI5_HH_ENABLE_DONE\r\n"
+.Lhh_jump_high:       .asciz "RPI5_HH_JUMP_HIGH\r\n"
+.Lhh_high_ok:         .asciz "RPI5_HH_HIGH_ENTRY_OK\r\n"
+.Lhh_vbar_ok:         .asciz "RPI5_HH_VBAR_HIGH_OK\r\n"
+.Lhh_failed_roots:    .asciz "RPI5_HH_PLAN_FAILED reason=invalid_or_shared_roots\r\n"
+.Lhh_failed_range:    .asciz "RPI5_HH_PLAN_FAILED reason=range_outside_high_map\r\n"
+.Lhh_failed_dtb:      .asciz "RPI5_HH_PLAN_FAILED reason=invalid_dtb_range\r\n"
+.Lhh_enable_already:  .asciz "RPI5_HH_ENABLE_FAILED reason=mmu_already_enabled\r\n"
+.Lhh_enable_failed:   .asciz "RPI5_HH_ENABLE_FAILED reason=sctlr_m_not_set\r\n"
+.Lhh_high_failed_pc:  .asciz "RPI5_HH_HIGH_ENTRY_FAILED reason=pc_not_high\r\n"
+.Lhh_high_failed_vbar_msg: .asciz "RPI5_HH_HIGH_ENTRY_FAILED reason=vbar_readback\r\n"
+.Lhh_crlf:            .asciz "\r\n"
+    "#
+);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH_UART_VIRT: usize = 0xffff_ff90_7d00_1000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH_VA_OFFSET: u64 = 0xffff_ff80_0000_0000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH_TCR_EL1: u64 = 0x0000_0002_b519_3519;
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+macro_rules! rpi5_hh_retained_marker {
+    ($name:ident, $value:literal) => {
+        #[used]
+        #[unsafe(link_section = ".rodata.rpi5_hh_markers")]
+        static $name: [u8; $value.len()] = *$value;
+    };
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_RUST_ENTRY_MARKER, b"RPI5_HH_RUST_ENTRY");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_RUST_AFTER_ENTRY_MARKER, b"RPI5_HH_RUST_AFTER_ENTRY");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_PC_BEGIN_MARKER, b"RPI5_HH_READ_PC_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_PC_DONE_MARKER,
+    b"RPI5_HH_READ_PC_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_SP_BEGIN_MARKER, b"RPI5_HH_READ_SP_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_SP_DONE_MARKER,
+    b"RPI5_HH_READ_SP_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_VBAR_BEGIN_MARKER, b"RPI5_HH_READ_VBAR_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_VBAR_DONE_MARKER,
+    b"RPI5_HH_READ_VBAR_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_TTBR_BEGIN_MARKER, b"RPI5_HH_READ_TTBR_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_TTBR_DONE_MARKER, b"RPI5_HH_READ_TTBR_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_TCR_BEGIN_MARKER, b"RPI5_HH_READ_TCR_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_TCR_DONE_MARKER,
+    b"RPI5_HH_READ_TCR_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_PRINT_REGS_BEGIN_MARKER, b"RPI5_HH_PRINT_REGS_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_PRINT_REGS_DONE_MARKER, b"RPI5_HH_PRINT_REGS_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH3_PRECHECK_DONE_MARKER, b"RPI5_HH3_PRECHECK_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH3_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH3_FAULT_BOUNDARY reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_REGISTERS_OK_MARKER, b"RPI5_HH_REGISTERS_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_RUST_UART_OK_MARKER, b"RPI5_HH_RUST_UART_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH3_DONE_MARKER, b"RPI5_HH3_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_BEGIN_MARKER, b"RPI5_HH4_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_PRECHECK_OK_MARKER, b"RPI5_HH4_PRECHECK_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER,
+    b"RPI5_HH4_EMPTY_TTBR0_ROOT base=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_TTBR0_REPLACE_BEGIN_MARKER,
+    b"RPI5_HH4_TTBR0_REPLACE_BEGIN old=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_NEW_TTBR0_SEPARATOR, b" new=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_TTBR0_REPLACE_DONE_MARKER,
+    b"RPI5_HH4_TTBR0_REPLACE_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_PC_HIGH_OK_MARKER, b"RPI5_HH4_PC_HIGH_OK value=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_SP_HIGH_OK_MARKER, b"RPI5_HH4_SP_HIGH_OK value=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_VBAR_HIGH_OK_MARKER,
+    b"RPI5_HH4_VBAR_HIGH_OK value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER,
+    b"RPI5_HH4_UART_AFTER_TTBR0_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_DONE_MARKER, b"RPI5_HH4_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_FAILED_MARKER, b"RPI5_HH4_FAILED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_BEGIN_MARKER, b"RPI5_HH5_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INITRD_READY_MARKER,
+    b"RPI5_HH5_INITRD_READY start=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INIT_LOOKUP_OK_MARKER,
+    b"RPI5_HH5_INIT_LOOKUP_OK offset=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INIT_ELF_OK_MARKER,
+    b"RPI5_HH5_INIT_ELF_OK entry=0x00000000004023d8"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_USER_ROOT_READY_MARKER,
+    b"RPI5_HH5_USER_ROOT_READY base=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INIT_STACK_READY_MARKER,
+    b"RPI5_HH5_INIT_STACK_READY sp=0x000000003fe00000"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_TRAP_FRAME_READY_MARKER,
+    b"RPI5_HH5_TRAP_FRAME_READY entry=0x00000000004023d8 sp=0x000000003fe00000"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ENTER_USER_PRECHECK_OK_MARKER,
+    b"RPI5_HH5_ENTER_USER_PRECHECK_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_TTBR0_USER_INSTALL_MARKER,
+    b"RPI5_HH5_TTBR0_USER_INSTALL root=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ENTER_USER_ATTEMPT_MARKER,
+    b"RPI5_HH5_ENTER_USER_ATTEMPT tid=1 entry=0x00000000004023d8 sp=0x000000003fe00000"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_DEFERRED_MARKER, b"RPI5_HH5_DEFERRED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_DONE_DEFERRED_MARKER,
+    b"RPI5_HH5_DONE status=deferred"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_FAILED_MARKER, b"RPI5_HH5_FAILED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ENTER_USER_FAILED_MARKER,
+    b"RPI5_HH5_ENTER_USER_FAILED reason="
+);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_bytes(bytes: &[u8]) -> bool {
+    const TX_READY_POLL_LIMIT: usize = 0x1_0000;
+    let data = RPI5_HH_UART_VIRT as *mut u32;
+    let flags = (RPI5_HH_UART_VIRT + 0x18) as *const u32;
+    for &byte in bytes {
+        let mut ready = false;
+        for _ in 0..TX_READY_POLL_LIMIT {
+            if unsafe { core::ptr::read_volatile(flags) } & (1 << 5) == 0 {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            return false;
+        }
+        unsafe {
+            core::ptr::write_volatile(data, u32::from(byte));
+        }
+    }
+    true
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_line(line: &[u8]) -> bool {
+    rpi5_hh_write_bytes(line) && rpi5_hh_write_bytes(b"\r\n")
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_hex_line(prefix: &[u8], value: u64) -> bool {
+    let mut digits = [0u8; 16];
+    /*
+     * Keep this conversion local to the hardware-proven early HH-3 writer.
+     * An out-of-line conversion helper was the first new call after
+     * RPI5_HH_RUST_ENTRY in the regressed image.
+     */
+    for (index, digit) in digits.iter_mut().enumerate() {
+        let nibble = ((value >> (60 - index * 4)) & 0xf) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+    }
+    rpi5_hh_write_bytes(prefix) && rpi5_hh_write_bytes(&digits) && rpi5_hh_write_bytes(b"\r\n")
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_two_hex_line(prefix: &[u8], first: u64, separator: &[u8], second: u64) -> bool {
+    let mut first_digits = [0u8; 16];
+    let mut second_digits = [0u8; 16];
+    rpi5_hh_hex_digits(first, &mut first_digits);
+    rpi5_hh_hex_digits(second, &mut second_digits);
+    rpi5_hh_write_bytes(prefix)
+        && rpi5_hh_write_bytes(&first_digits)
+        && rpi5_hh_write_bytes(separator)
+        && rpi5_hh_write_bytes(&second_digits)
+        && rpi5_hh_write_bytes(b"\r\n")
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(b"RPI5_HH_REGISTER_MISMATCH reason=");
+    let _ = rpi5_hh_write_line(reason);
+    let _ = rpi5_hh_write_bytes(b"RPI5_HH3_FAILED reason=");
+    let _ = rpi5_hh_write_line(reason);
+    let _ = rpi5_hh_write_bytes(&RPI5_HH3_FAULT_BOUNDARY_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    loop {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_halt() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh4_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(&RPI5_HH4_FAILED_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    rpi5_hh_halt()
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+struct Rpi5Hh4Ready {
+    empty_ttbr0_root: u64,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+struct Rpi5Hh3Ready;
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh4_retire_low_ttbr0(_hh3: Rpi5Hh3Ready) -> Rpi5Hh4Ready {
+    unsafe extern "C" {
+        static __hh_ttbr0_root: u8;
+        static __hh_ttbr1_root: u8;
+        static __hh_empty_ttbr0_root: u8;
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH4_BEGIN_MARKER) {
+        rpi5_hh4_fail(b"uart_timeout");
+    }
+
+    let pc: u64;
+    let sp: u64;
+    let vbar: u64;
+    let old_ttbr0: u64;
+    let ttbr1: u64;
+    unsafe {
+        core::arch::asm!(
+            "adr {pc}, .",
+            "mov {sp}, sp",
+            "mrs {vbar}, VBAR_EL1",
+            "mrs {ttbr0}, TTBR0_EL1",
+            "mrs {ttbr1}, TTBR1_EL1",
+            pc = out(reg) pc,
+            sp = out(reg) sp,
+            vbar = out(reg) vbar,
+            ttbr0 = out(reg) old_ttbr0,
+            ttbr1 = out(reg) ttbr1,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    let root_mask = !0xfffu64;
+    let expected_old_ttbr0 = core::ptr::addr_of!(__hh_ttbr0_root) as u64;
+    let expected_ttbr1 = core::ptr::addr_of!(__hh_ttbr1_root) as u64;
+    let empty_ttbr0_root = core::ptr::addr_of!(__hh_empty_ttbr0_root) as u64;
+    if pc < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"pc_not_high");
+    }
+    if sp < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"sp_not_high");
+    }
+    if vbar < RPI5_HH_VA_OFFSET || vbar & 0x7ff != 0 {
+        rpi5_hh4_fail(b"vbar_not_high_aligned");
+    }
+    if old_ttbr0 & root_mask != expected_old_ttbr0 {
+        rpi5_hh4_fail(b"old_ttbr0_mismatch");
+    }
+    if ttbr1 & root_mask != expected_ttbr1 {
+        rpi5_hh4_fail(b"ttbr1_root_mismatch");
+    }
+    if empty_ttbr0_root == 0
+        || empty_ttbr0_root & 0xfff != 0
+        || empty_ttbr0_root == expected_old_ttbr0
+        || empty_ttbr0_root == expected_ttbr1
+    {
+        rpi5_hh4_fail(b"empty_ttbr0_invalid");
+    }
+    for address in [
+        core::ptr::addr_of!(RPI5_HH4_TTBR0_REPLACE_DONE_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_PC_HIGH_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_SP_HIGH_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_VBAR_HIGH_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_DONE_MARKER) as u64,
+        rpi5_hh4_retire_low_ttbr0 as usize as u64,
+        rpi5_hh5_defer as usize as u64,
+    ] {
+        if address < RPI5_HH_VA_OFFSET {
+            rpi5_hh4_fail(b"post_replace_pointer_not_high");
+        }
+    }
+    if !rpi5_hh_write_line(&RPI5_HH4_PRECHECK_OK_MARKER)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER, empty_ttbr0_root)
+        || !rpi5_hh_write_two_hex_line(
+            &RPI5_HH4_TTBR0_REPLACE_BEGIN_MARKER,
+            old_ttbr0,
+            &RPI5_HH4_NEW_TTBR0_SEPARATOR,
+            empty_ttbr0_root,
+        )
+    {
+        rpi5_hh4_fail(b"uart_timeout");
+    }
+
+    let empty_root = empty_ttbr0_root as *mut u64;
+    for index in 0..512 {
+        unsafe {
+            core::ptr::write_volatile(empty_root.add(index), 0);
+        }
+    }
+    for offset in (0..4096).step_by(64) {
+        let address = empty_ttbr0_root + offset;
+        unsafe {
+            core::arch::asm!("dc cvac, {address}", address = in(reg) address, options(nostack));
+        }
+    }
+
+    /*
+     * This is the HH-4 architectural boundary. Every instruction, stack
+     * access, literal, vector, and UART access after the TTBR write uses a
+     * TTBR1 high address. The empty root deliberately maps no low addresses.
+     */
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "msr TTBR0_EL1, {root}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            root = in(reg) empty_ttbr0_root,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    let replaced_ttbr0: u64;
+    let post_pc: u64;
+    let post_sp: u64;
+    let post_vbar: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {ttbr0}, TTBR0_EL1",
+            "adr {pc}, .",
+            "mov {sp}, sp",
+            "mrs {vbar}, VBAR_EL1",
+            ttbr0 = out(reg) replaced_ttbr0,
+            pc = out(reg) post_pc,
+            sp = out(reg) post_sp,
+            vbar = out(reg) post_vbar,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if replaced_ttbr0 & root_mask != empty_ttbr0_root {
+        rpi5_hh4_fail(b"ttbr0_replace_readback");
+    }
+    if post_pc < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"post_replace_pc_not_high");
+    }
+    if post_sp < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"post_replace_sp_not_high");
+    }
+    if post_vbar < RPI5_HH_VA_OFFSET || post_vbar & 0x7ff != 0 {
+        rpi5_hh4_fail(b"post_replace_vbar_not_high");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH4_TTBR0_REPLACE_DONE_MARKER)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_PC_HIGH_OK_MARKER, post_pc)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_SP_HIGH_OK_MARKER, post_sp)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_VBAR_HIGH_OK_MARKER, post_vbar)
+        || !rpi5_hh_write_line(&RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_HH4_DONE_MARKER)
+    {
+        rpi5_hh4_fail(b"uart_timeout");
+    }
+
+    Rpi5Hh4Ready { empty_ttbr0_root }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_hex_digits(value: u64, digits: &mut [u8; 16]) {
+    for (index, digit) in digits.iter_mut().enumerate() {
+        let nibble = ((value >> (60 - index * 4)) & 0xf) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh5_defer(hh4: Rpi5Hh4Ready) -> ! {
+    if hh4.empty_ttbr0_root == 0 {
+        let _ = rpi5_hh_write_bytes(&RPI5_HH5_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"hh4_not_ready");
+        rpi5_hh_halt();
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    /*
+     * Outcome C: HH-4 has retired the low identity root, but the existing
+     * Stage2C builder owns a low-physical allocator and consumes the firmware
+     * DTB/initrd through low pointers. Reusing it here would violate HH-4's
+     * no-low-VA contract. Keep the future attempt/ERET/trap markers retained
+     * for artifact auditing, but do not emit them and do not execute ERET.
+     */
+    let _ = rpi5_hh_write_bytes(&RPI5_HH5_DEFERRED_MARKER);
+    let _ = rpi5_hh_write_line(b"high_half_initrd_allocator_bridge_not_ready");
+    let _ = rpi5_hh_write_line(&RPI5_HH5_DONE_DEFERRED_MARKER);
+    rpi5_hh_halt()
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
+    unsafe extern "C" {
+        static __hh_ttbr0_root: u8;
+        static __hh_ttbr1_root: u8;
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER) {
+        rpi5_hh_halt();
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_RUST_AFTER_ENTRY_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_PC_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let pc: u64;
+    unsafe {
+        core::arch::asm!("adr {pc}, .", pc = out(reg) pc, options(nomem, nostack, preserves_flags));
+    }
+    if !rpi5_hh_write_hex_line(&RPI5_HH_READ_PC_DONE_MARKER, pc) {
+        rpi5_hh_fail(b"read_pc_print_timeout");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_SP_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mov {sp}, sp", sp = out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    if !rpi5_hh_write_hex_line(&RPI5_HH_READ_SP_DONE_MARKER, sp) {
+        rpi5_hh_fail(b"read_sp_print_timeout");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_VBAR_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let vbar: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {vbar}, VBAR_EL1",
+            vbar = out(reg) vbar,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if !rpi5_hh_write_hex_line(&RPI5_HH_READ_VBAR_DONE_MARKER, vbar) {
+        rpi5_hh_fail(b"read_vbar_print_timeout");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_TTBR_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let ttbr0: u64;
+    let ttbr1: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {ttbr0}, TTBR0_EL1",
+            "mrs {ttbr1}, TTBR1_EL1",
+            ttbr0 = out(reg) ttbr0,
+            ttbr1 = out(reg) ttbr1,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_READ_TTBR_DONE_MARKER) {
+        rpi5_hh_fail(b"read_ttbr_done_timeout");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_TCR_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let tcr: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {tcr}, TCR_EL1",
+            tcr = out(reg) tcr,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if !rpi5_hh_write_hex_line(&RPI5_HH_READ_TCR_DONE_MARKER, tcr) {
+        rpi5_hh_fail(b"read_tcr_print_timeout");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    if !rpi5_hh_write_hex_line(b"RPI5_HH_PC value=0x", pc)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_SP value=0x", sp)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_VBAR value=0x", vbar)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_TTBR0 value=0x", ttbr0)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_TTBR1 value=0x", ttbr1)
+        || !rpi5_hh_write_hex_line(b"RPI5_HH_TCR value=0x", tcr)
+    {
+        rpi5_hh_fail(b"uart_timeout");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_DONE_MARKER) {
+        rpi5_hh_fail(b"print_regs_done_timeout");
+    }
+
+    let expected_ttbr0 = core::ptr::addr_of!(__hh_ttbr0_root) as u64;
+    let expected_ttbr1 = core::ptr::addr_of!(__hh_ttbr1_root) as u64;
+    let root_mask = !0xfffu64;
+    if pc < RPI5_HH_VA_OFFSET {
+        rpi5_hh_fail(b"pc_not_high");
+    }
+    if sp < RPI5_HH_VA_OFFSET {
+        rpi5_hh_fail(b"sp_not_high");
+    }
+    if vbar < RPI5_HH_VA_OFFSET || vbar & 0x7ff != 0 {
+        rpi5_hh_fail(b"vbar_not_high_aligned");
+    }
+    if ttbr0 & root_mask != expected_ttbr0 || ttbr0 == 0 {
+        rpi5_hh_fail(b"ttbr0_root_mismatch");
+    }
+    if ttbr1 & root_mask != expected_ttbr1 || ttbr1 == 0 {
+        rpi5_hh_fail(b"ttbr1_root_mismatch");
+    }
+    if ttbr0 & root_mask == ttbr1 & root_mask {
+        rpi5_hh_fail(b"ttbr_roots_not_distinct");
+    }
+    if tcr & (1 << 23) != 0 || ((tcr >> 16) & 0x3f) != 25 {
+        rpi5_hh_fail(b"ttbr1_walk_configuration");
+    }
+    if tcr != RPI5_HH_TCR_EL1 {
+        rpi5_hh_fail(b"tcr_value_mismatch");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH3_PRECHECK_DONE_MARKER) {
+        rpi5_hh_fail(b"precheck_done_timeout");
+    }
+    let hh3 = Rpi5Hh3Ready;
+
+    if !rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)
+    {
+        rpi5_hh_fail(b"uart_timeout");
+    }
+    let hh4 = rpi5_hh4_retire_low_ttbr0(hh3);
+    rpi5_hh5_defer(hh4)
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+global_asm!(
+    r#"
+    .section .text.boot,"ax",@progbits
+    .macro rpi5_fixed_marker name, label
+    .global \name
+    .type \name,%function
+\name:
+    stp x9, x30, [sp, #-16]!
+    adr x9, \label
+    bl .Lrpi5_emergency_write_x9
+    ldp x9, x30, [sp], #16
+    ret
+    .endm
+
+    rpi5_fixed_marker yarm_aarch64_marker_raw_entry, .Lrpi5_raw_entry
+    rpi5_fixed_marker yarm_aarch64_marker_raw_after_marker, .Lrpi5_raw_after_marker
+    rpi5_fixed_marker yarm_aarch64_marker_bss_clear_begin, .Lrpi5_bss_clear_begin
+    rpi5_fixed_marker yarm_aarch64_marker_bss_clear_done, .Lrpi5_bss_clear_done
+    rpi5_fixed_marker yarm_aarch64_marker_stack_ready, .Lrpi5_stack_ready
+    rpi5_fixed_marker yarm_aarch64_marker_before_el1, .Lrpi5_before_el1
+    rpi5_fixed_marker yarm_aarch64_marker_after_el1, .Lrpi5_after_el1
+    rpi5_fixed_marker yarm_aarch64_marker_before_rust, .Lrpi5_before_rust
+
+    .type yarm_aarch64_marker_dtb_x0,%function
+yarm_aarch64_marker_dtb_x0:
+    stp x9, x10, [sp, #-16]!
+    stp x11, x12, [sp, #-16]!
+    stp x13, x14, [sp, #-16]!
+    stp x15, x30, [sp, #-16]!
+    adr x9, .Lrpi5_dtb_x0_prefix
+    bl .Lrpi5_emergency_write_x9
+    mov x10, x20
+    mov x11, #60
+.Lrpi5_dtb_x0_hex:
+    lsr x12, x10, x11
+    and x12, x12, #0xf
+    cmp x12, #10
+    add x13, x12, #'0'
+    add x14, x12, #('a' - 10)
+    csel x15, x13, x14, lo
+    bl .Lrpi5_emergency_write_byte_x15
+    subs x11, x11, #4
+    b.ge .Lrpi5_dtb_x0_hex
+    mov x15, #'\r'
+    bl .Lrpi5_emergency_write_byte_x15
+    mov x15, #'\n'
+    bl .Lrpi5_emergency_write_byte_x15
+    ldp x15, x30, [sp], #16
+    ldp x13, x14, [sp], #16
+    ldp x11, x12, [sp], #16
+    ldp x9, x10, [sp], #16
+    ret
+
+    .global yarm_aarch64_rpi5_emergency_write
+    .type yarm_aarch64_rpi5_emergency_write,%function
+yarm_aarch64_rpi5_emergency_write:
+    stp x9, x10, [sp, #-16]!
+    stp x11, x12, [sp, #-16]!
+    stp x13, x15, [sp, #-16]!
+    stp x0, x30, [sp, #-16]!
+    mov x9, x0
+    bl .Lrpi5_emergency_write_x9
+    ldp x0, x30, [sp], #16
+    ldp x13, x15, [sp], #16
+    ldp x11, x12, [sp], #16
+    ldp x9, x10, [sp], #16
+    ret
+
+    .global yarm_aarch64_rpi5_emergency_write_hex
+    .type yarm_aarch64_rpi5_emergency_write_hex,%function
+yarm_aarch64_rpi5_emergency_write_hex:
+    stp x0, x1, [sp, #-16]!
+    stp x9, x10, [sp, #-16]!
+    stp x11, x12, [sp, #-16]!
+    stp x13, x14, [sp, #-16]!
+    stp x15, x30, [sp, #-16]!
+    mov x9, x0
+    bl .Lrpi5_emergency_write_x9
+    mov x10, x1
+    mov x11, #60
+.Lrpi5_emergency_hex:
+    lsr x12, x10, x11
+    and x12, x12, #0xf
+    cmp x12, #10
+    add x13, x12, #'0'
+    add x14, x12, #('a' - 10)
+    csel x15, x13, x14, lo
+    bl .Lrpi5_emergency_write_byte_x15
+    subs x11, x11, #4
+    b.ge .Lrpi5_emergency_hex
+    mov x15, #'\r'
+    bl .Lrpi5_emergency_write_byte_x15
+    mov x15, #'\n'
+    bl .Lrpi5_emergency_write_byte_x15
+    ldp x15, x30, [sp], #16
+    ldp x13, x14, [sp], #16
+    ldp x11, x12, [sp], #16
+    ldp x9, x10, [sp], #16
+    ldp x0, x1, [sp], #16
+    ret
+
+.Lrpi5_emergency_write_x9:
+    stp x10, x11, [sp, #-16]!
+    stp x12, x13, [sp, #-16]!
+    // The Pi 5 Stage 1 DTB parser translates the preferred
+    // /soc@107c000000/serial@7d001000 PL011 to 0x107d001000.  This raw
+    // pre-BSS path deliberately uses that same physical base; it does not
+    // consult console globals or attempt to configure clocks/divisors.
+    movz x10, #0x1000
+    movk x10, #0x7d00, lsl #16
+    movk x10, #0x0010, lsl #32
+.Lrpi5_emergency_write_next:
+    ldrb w11, [x9], #1
+    cbz w11, .Lrpi5_raw_entry_done
+    movz x12, #0x0010, lsl #16
+.Lrpi5_raw_entry_wait:
+    ldr w13, [x10, #0x18]
+    tbz w13, #5, .Lrpi5_raw_entry_send
+    subs x12, x12, #1
+    b.ne .Lrpi5_raw_entry_wait
+    b .Lrpi5_raw_entry_done
+.Lrpi5_raw_entry_send:
+    dsb sy
+    str w11, [x10]
+    dsb sy
+    b .Lrpi5_emergency_write_next
+.Lrpi5_raw_entry_done:
+    ldp x12, x13, [sp], #16
+    ldp x10, x11, [sp], #16
+    ret
+
+// Writes x15 while preserving the pointer/value registers used by callers.
+.Lrpi5_emergency_write_byte_x15:
+    stp x10, x12, [sp, #-16]!
+    stp x13, x30, [sp, #-16]!
+    movz x10, #0x1000
+    movk x10, #0x7d00, lsl #16
+    movk x10, #0x0010, lsl #32
+    movz x12, #0x0010, lsl #16
+1:
+    ldr w13, [x10, #0x18]
+    tbz w13, #5, 2f
+    subs x12, x12, #1
+    b.ne 1b
+    b 3f
+2:
+    dsb sy
+    str w15, [x10]
+    dsb sy
+3:
+    ldp x13, x30, [sp], #16
+    ldp x10, x12, [sp], #16
+    ret
+
+    .section .rodata.rpi5_raw_entry,"a",@progbits
+    .balign 8
+.Lrpi5_raw_entry:
+    .asciz "RPI5_RAW_ENTRY\r\n"
+.Lrpi5_raw_after_marker:
+    .asciz "RPI5_RAW_AFTER_MARKER\r\n"
+.Lrpi5_dtb_x0_prefix:
+    .asciz "RPI5_DTB_X0 value=0x"
+.Lrpi5_bss_clear_begin:
+    .asciz "RPI5_BSS_CLEAR_BEGIN\r\n"
+.Lrpi5_bss_clear_done:
+    .asciz "RPI5_BSS_CLEAR_DONE\r\n"
+.Lrpi5_stack_ready:
+    .asciz "RPI5_STACK_READY\r\n"
+.Lrpi5_before_el1:
+    .asciz "RPI5_BEFORE_EL1\r\n"
+.Lrpi5_after_el1:
+    .asciz "RPI5_AFTER_EL1\r\n"
+.Lrpi5_before_rust:
+    .asciz "RPI5_BEFORE_RUST\r\n"
+    "#
+);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    not(feature = "rpi5-stage1")
+))]
+global_asm!(
+    r#"
+    .section .text.boot,"ax",@progbits
+    .macro rpi5_noop_marker name
+    .global \name
+    .type \name,%function
+\name:
+    ret
+    .endm
+    rpi5_noop_marker yarm_aarch64_marker_raw_entry
+    rpi5_noop_marker yarm_aarch64_marker_raw_after_marker
+    rpi5_noop_marker yarm_aarch64_marker_dtb_x0
+    rpi5_noop_marker yarm_aarch64_marker_bss_clear_begin
+    rpi5_noop_marker yarm_aarch64_marker_bss_clear_done
+    rpi5_noop_marker yarm_aarch64_marker_stack_ready
+    rpi5_noop_marker yarm_aarch64_marker_before_el1
+    rpi5_noop_marker yarm_aarch64_marker_after_el1
+    rpi5_noop_marker yarm_aarch64_marker_before_rust
     "#
 );
 
@@ -422,12 +1925,62 @@ fn halt_stage1() -> ! {
     }
 }
 
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+#[inline(always)]
+pub(super) fn rpi5_emergency_marker(marker: &'static [u8]) {
+    unsafe extern "C" {
+        fn yarm_aarch64_rpi5_emergency_write(marker: *const u8);
+    }
+    unsafe {
+        yarm_aarch64_rpi5_emergency_write(marker.as_ptr());
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+#[inline(always)]
+pub(super) fn rpi5_emergency_hex(prefix: &'static [u8], value: u64) {
+    unsafe extern "C" {
+        fn yarm_aarch64_rpi5_emergency_write_hex(prefix: *const u8, value: u64);
+    }
+    unsafe {
+        yarm_aarch64_rpi5_emergency_write_hex(prefix.as_ptr(), value);
+    }
+}
+
+#[cfg(any(
+    feature = "hosted-dev",
+    not(target_arch = "aarch64"),
+    not(feature = "rpi5-stage1")
+))]
+#[inline(always)]
+fn rpi5_emergency_marker(_marker: &'static [u8]) {}
+
+#[cfg(any(
+    feature = "hosted-dev",
+    not(target_arch = "aarch64"),
+    not(feature = "rpi5-stage1")
+))]
+#[inline(always)]
+fn rpi5_emergency_hex(_prefix: &'static [u8], _value: u64) {}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
     use crate::arch::aarch64_boot_policy::DetectedPlatform;
     use crate::kernel::boot_command_line::{BootPhase, PlatformOption, parse_yarm_boot_options};
 
+    const RPI5_EMERGENCY_UART_BASE: u64 = 0x10_7d00_1000;
+
+    rpi5_emergency_marker(b"RPI5_RUST_ENTRY\r\n\0");
+    rpi5_emergency_marker(b"RPI5_DTB_PARSE_BEGIN\r\n\0");
     let Some(dtb) = dtb_slice_from_start_info(start_info_ptr) else {
         // Preserve the direct-kernel QEMU fallback when no firmware DTB can be read.
         crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
@@ -436,8 +1989,12 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
     let Some(info) = crate::arch::aarch64_boot_policy::parse_platform_dtb(dtb) else {
         return;
     };
+    rpi5_emergency_marker(b"RPI5_DTB_PARSE_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_BEGIN\r\n\0");
     let raw = crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]);
     let options = parse_yarm_boot_options(raw);
+    rpi5_emergency_marker(b"RPI5_BOOT_OPTIONS_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_AFTER_BOOT_OPTIONS\r\n\0");
     let selected = match options.platform {
         PlatformOption::Auto => info.platform,
         PlatformOption::QemuVirt => DetectedPlatform::QemuVirt,
@@ -448,28 +2005,1481 @@ extern "C" fn yarm_aarch64_select_early_console(start_info_ptr: usize) {
             crate::arch::aarch64::console::init_early_mmio_base(0x0900_0000);
         }
         DetectedPlatform::Rpi5Bcm2712 => {
+            rpi5_emergency_marker(b"RPI5_CONSOLE_SELECT_BEGIN\r\n\0");
             let Some(serial) = info.serial else {
+                rpi5_emergency_marker(b"RPI5_UART_TRANSLATION_FAILED\r\n\0");
                 halt_stage1();
             };
+            rpi5_emergency_hex(b"RPI5_SELECTED_UART_BASE value=0x\0", serial.base);
+            if serial.base != RPI5_EMERGENCY_UART_BASE {
+                rpi5_emergency_marker(b"RPI5_SELECTED_UART_BASE_MISMATCH\r\n\0");
+                halt_stage1();
+            }
             if !crate::arch::aarch64::console::init_dtb_pl011(serial.base as usize) {
                 halt_stage1();
             }
-            crate::arch::aarch64::console::write_line("RPI5_BOOT_00_ENTRY");
+            rpi5_emergency_marker(b"RPI5_CONSOLE_SELECT_DONE\r\n\0");
+            rpi5_emergency_marker(b"RPI5_CONSOLE_WRITE_BEGIN\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_00_ENTRY\r\n\0");
+            if !crate::arch::aarch64::console::try_write_line("") {
+                rpi5_emergency_marker(b"RPI5_CONSOLE_WRITE_TIMEOUT\r\n\0");
+                halt_stage1();
+            }
+            rpi5_emergency_marker(b"RPI5_CONSOLE_WRITE_DONE\r\n\0");
+            rpi5_emergency_marker(b"RPI5_AFTER_CONSOLE_WRITE\r\n\0");
             if options.boot_phase == BootPhase::Entry {
                 halt_stage1();
             }
+            rpi5_emergency_marker(b"RPI5_BEFORE_BOOT01\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_01_DTB_PTR\r\n\0");
+            rpi5_emergency_hex(b"RPI5_BOOT_01_DTB_PTR value=0x\0", start_info_ptr as u64);
+            #[cfg(not(feature = "rpi5-stage1"))]
             crate::yarm_log!("RPI5_BOOT_01_DTB_PTR value=0x{:x}", start_info_ptr as u64);
+            rpi5_emergency_marker(b"RPI5_AFTER_BOOT01\r\n\0");
+
+            rpi5_emergency_marker(b"RPI5_BEFORE_BOOT02\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_02_UART_SELECTED\r\n\0");
+            rpi5_emergency_hex(b"RPI5_BOOT_02_UART_SELECTED base=0x\0", serial.base);
+            #[cfg(not(feature = "rpi5-stage1"))]
             crate::yarm_log!(
                 "RPI5_BOOT_02_UART_SELECTED path={} base=0x{:x}",
                 serial.path.as_str(),
                 serial.base
             );
+            rpi5_emergency_marker(b"RPI5_AFTER_BOOT02\r\n\0");
+
+            rpi5_emergency_marker(b"RPI5_BEFORE_BOOT03\r\n\0");
+            rpi5_emergency_marker(b"RPI5_BOOT_03_UART_OK\r\n\0");
+            #[cfg(not(feature = "rpi5-stage1"))]
             crate::arch::aarch64::console::write_line("RPI5_BOOT_03_UART_OK");
+            rpi5_emergency_marker(b"RPI5_AFTER_BOOT03\r\n\0");
             if options.boot_phase == BootPhase::Uart {
                 halt_stage1();
             }
+            #[cfg(feature = "rpi5-stage1")]
+            if options.boot_phase == BootPhase::Dtb {
+                rpi5_stage1_dtb_diagnostics(dtb);
+            }
+            #[cfg(feature = "rpi5-stage1")]
+            if matches!(options.boot_phase, BootPhase::Mmu | BootPhase::Kernel) {
+                rpi5_stage1_kernel_core_diagnostics(dtb);
+            }
         }
         DetectedPlatform::Unknown => halt_stage1(),
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+fn rpi5_stage1_dtb_diagnostics(dtb: &[u8]) -> ! {
+    use crate::arch::aarch64_boot_policy::{DiagnosticPsciConduit, parse_platform_dtb_diagnostics};
+    use core::fmt::Write;
+
+    struct Line {
+        bytes: [u8; 384],
+        len: usize,
+        truncated: bool,
+    }
+    impl Line {
+        const fn new() -> Self {
+            Self {
+                bytes: [0; 384],
+                len: 0,
+                truncated: false,
+            }
+        }
+        fn emit(&self) -> bool {
+            let text =
+                core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("RPI5_DTB_FORMAT_ERR");
+            crate::arch::aarch64::console::try_write_line(text)
+        }
+    }
+    impl Write for Line {
+        fn write_str(&mut self, value: &str) -> core::fmt::Result {
+            let remaining = self.bytes.len().saturating_sub(self.len);
+            let copied = remaining.min(value.len());
+            self.bytes[self.len..self.len + copied].copy_from_slice(&value.as_bytes()[..copied]);
+            self.len += copied;
+            self.truncated |= copied != value.len();
+            if copied == value.len() {
+                Ok(())
+            } else {
+                Err(core::fmt::Error)
+            }
+        }
+    }
+    macro_rules! diag {
+        ($($arg:tt)*) => {{
+            let mut line = Line::new();
+            let _ = write!(&mut line, $($arg)*);
+            if line.truncated || !line.emit() {
+                rpi5_emergency_marker(b"RPI5_DTB_DIAG_OUTPUT_FAILED\r\n\0");
+                halt_stage1();
+            }
+        }};
+    }
+
+    rpi5_emergency_marker(b"RPI5_DTB_DIAG_BEGIN\r\n\0");
+    let Some(info) = parse_platform_dtb_diagnostics(dtb) else {
+        rpi5_emergency_marker(b"RPI5_DTB_DIAG_PARSE_FAILED\r\n\0");
+        halt_stage1();
+    };
+    for (index, range) in info.memory_ranges[..info.memory_range_count]
+        .iter()
+        .enumerate()
+    {
+        diag!(
+            "RPI5_DTB_MEMORY_RANGE index={} start=0x{:016x} size=0x{:016x}",
+            index,
+            range.start,
+            range.size
+        );
+    }
+    if info.memory_ranges_truncated {
+        diag!("RPI5_DTB_MEMORY_RANGE_TRUNCATED");
+    }
+    for (index, range) in info.reserved_ranges[..info.reserved_range_count]
+        .iter()
+        .enumerate()
+    {
+        diag!(
+            "RPI5_DTB_RESERVED_RANGE index={} start=0x{:016x} size=0x{:016x} no_map={}",
+            index,
+            range.start,
+            range.size,
+            range.no_map as u8
+        );
+    }
+    if info.reserved_ranges_truncated {
+        diag!("RPI5_DTB_RESERVED_RANGE_TRUNCATED");
+    }
+    diag!(
+        "RPI5_DTB_INITRD present={} start=0x{:016x} end=0x{:016x}",
+        matches!((info.initrd_start, info.initrd_end), (Some(start), Some(end)) if end > start)
+            as u8,
+        info.initrd_start.unwrap_or(0),
+        info.initrd_end.unwrap_or(0)
+    );
+    diag!(
+        "RPI5_DTB_BOOTARGS len={} truncated={}",
+        info.bootargs_len,
+        info.bootargs_truncated as u8
+    );
+    if !info.interrupt_controller_path.is_empty() {
+        diag!(
+            "RPI5_DTB_IRQC path={} base=0x{:016x} compatible={}",
+            info.interrupt_controller_path.as_str(),
+            info.interrupt_controller_base.unwrap_or(0),
+            info.interrupt_controller_compatible.as_str()
+        );
+    } else {
+        diag!("RPI5_DTB_IRQC_MISSING");
+    }
+    if !info.l2_interrupt_controller_path.is_empty() {
+        if let Some(base) = info.l2_interrupt_controller_base {
+            diag!(
+                "RPI5_DTB_IRQC_L2 path={} base=0x{:016x} compatible={}",
+                info.l2_interrupt_controller_path.as_str(),
+                base,
+                info.l2_interrupt_controller_compatible.as_str()
+            );
+        } else {
+            diag!(
+                "RPI5_DTB_IRQC_L2_BASE_MISSING path={} compatible={}",
+                info.l2_interrupt_controller_path.as_str(),
+                info.l2_interrupt_controller_compatible.as_str()
+            );
+        }
+    }
+    if let Some(base) = info.gic_dist_base {
+        diag!("RPI5_DTB_GIC_DIST base=0x{:016x}", base);
+        if let Some(base) = info.gic_redist_base {
+            diag!("RPI5_DTB_GIC_REDIST base=0x{:016x}", base);
+        }
+    } else {
+        diag!("RPI5_DTB_GIC_MISSING");
+    }
+    let conduit = match info.psci_conduit {
+        DiagnosticPsciConduit::Hvc => "hvc",
+        DiagnosticPsciConduit::Smc => "smc",
+        DiagnosticPsciConduit::None => "none",
+    };
+    diag!("RPI5_DTB_PSCI conduit={}", conduit);
+    let max_cpus = 1usize;
+    let effective_bitmap = info.cpu_bitmap & 1;
+    diag!(
+        "RPI5_DTB_CPU_BITMAP value=0x{:016x} count={} max_cpus={} effective={}",
+        info.cpu_bitmap,
+        info.cpu_bitmap.count_ones(),
+        max_cpus,
+        effective_bitmap.count_ones()
+    );
+    for (index, controller) in info.pcie_controllers[..info.pcie_controller_count]
+        .iter()
+        .enumerate()
+    {
+        if let Some(base) = controller.base {
+            diag!(
+                "RPI5_DTB_PCIE_CONTROLLER index={} path={} base=0x{:016x}",
+                index,
+                controller.path.as_str(),
+                base
+            );
+        } else {
+            diag!(
+                "RPI5_DTB_PCIE_CONTROLLER_BASE_MISSING index={} path={}",
+                index,
+                controller.path.as_str()
+            );
+        }
+    }
+    if info.pcie_controller_count == 0 {
+        diag!("RPI5_DTB_PCIE_CONTROLLER_MISSING");
+    }
+    if info.pcie_controllers_truncated {
+        diag!("RPI5_DTB_PCIE_CONTROLLER_TRUNCATED");
+    }
+    if let Some(index) = info.rp1_controller_index {
+        diag!("RPI5_DTB_RP1_PCIE present=1 controller_index={}", index);
+    } else {
+        diag!("RPI5_DTB_RP1_PCIE present=0");
+    }
+    if !info.rp1_node_path.is_empty() {
+        diag!("RPI5_DTB_RP1_NODE path={}", info.rp1_node_path.as_str());
+    }
+    rpi5_emergency_marker(b"RPI5_DTB_DIAG_DONE\r\n\0");
+    halt_stage1();
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+struct Rpi5Stage2CInitTask {
+    tid: u64,
+    root_table: u64,
+    entry: u64,
+    stack_pointer: u64,
+    mapped_pages: usize,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage2c_build_init_task(
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+    elf: &[u8],
+    elf_plan: &crate::arch::aarch64_boot_policy::Stage2BElfLoadPlan,
+    task_plan: &crate::arch::aarch64_boot_policy::Stage2CTaskPlan,
+) -> Result<Rpi5Stage2CInitTask, &'static str> {
+    use crate::arch::aarch64_boot_policy::Stage2CUserPermission;
+
+    let root = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+    let mut mapped_pages = 0usize;
+    for (segment, planned) in elf_plan.segments[..elf_plan.segment_count]
+        .iter()
+        .zip(&task_plan.segments[..task_plan.segment_count])
+    {
+        let flags = match planned.permission {
+            Stage2CUserPermission::ReadExecute => RPI5_STAGE2C_USER_RX_FLAGS,
+            Stage2CUserPermission::ReadWrite => RPI5_STAGE2C_USER_RW_FLAGS,
+        };
+        let file_end = segment
+            .vaddr
+            .checked_add(segment.file_size)
+            .ok_or("segment_file_overflow")?;
+        let mut page_va = planned.page_range.start;
+        while page_va < planned.page_range.end {
+            let phys = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+            let page_end = page_va
+                .checked_add(RPI5_STAGE1_PAGE_SIZE)
+                .ok_or("segment_page_overflow")?;
+            let copy_start = page_va.max(segment.vaddr);
+            let copy_end = page_end.min(file_end);
+            if copy_start < copy_end {
+                let source_start = segment
+                    .file_offset
+                    .checked_add(copy_start - segment.vaddr)
+                    .ok_or("segment_source_overflow")?;
+                let source_end = source_start
+                    .checked_add(copy_end - copy_start)
+                    .ok_or("segment_source_overflow")?;
+                let source_start =
+                    usize::try_from(source_start).map_err(|_| "segment_source_address")?;
+                let source_end =
+                    usize::try_from(source_end).map_err(|_| "segment_source_address")?;
+                let source = elf
+                    .get(source_start..source_end)
+                    .ok_or("segment_source_bounds")?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        source.as_ptr(),
+                        (phys + copy_start - page_va) as *mut u8,
+                        source.len(),
+                    );
+                }
+            }
+            unsafe {
+                rpi5_stage2c_map_user_page(root, allocator, page_va, phys, flags)?;
+            }
+            mapped_pages += 1;
+            page_va = page_end;
+        }
+    }
+    let mut stack_va = task_plan.stack_range.start;
+    while stack_va < task_plan.stack_range.end {
+        let phys = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+        unsafe {
+            rpi5_stage2c_map_user_page(
+                root,
+                allocator,
+                stack_va,
+                phys,
+                RPI5_STAGE2C_USER_RW_FLAGS,
+            )?;
+        }
+        mapped_pages += 1;
+        stack_va += RPI5_STAGE1_PAGE_SIZE;
+    }
+    Ok(Rpi5Stage2CInitTask {
+        tid: task_plan.tid,
+        root_table: root,
+        entry: task_plan.entry,
+        stack_pointer: task_plan.stack_pointer,
+        mapped_pages,
+    })
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+fn rpi5_stage2c_alloc_zeroed_frame(
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+) -> Result<u64, &'static str> {
+    let frame = allocator.alloc_frame().map_err(|_| "frame_allocator")?;
+    unsafe {
+        core::ptr::write_bytes(frame as *mut u8, 0, RPI5_STAGE1_PAGE_SIZE as usize);
+    }
+    Ok(frame)
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage2c_map_user_page(
+    root: u64,
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+    virtual_address: u64,
+    physical_address: u64,
+    flags: u64,
+) -> Result<(), &'static str> {
+    if virtual_address % RPI5_STAGE1_PAGE_SIZE != 0
+        || physical_address % RPI5_STAGE1_PAGE_SIZE != 0
+        || virtual_address >= (1 << 39)
+    {
+        return Err("invalid_user_mapping");
+    }
+    let l1 = ((virtual_address >> 30) & 0x1ff) as usize;
+    let l2_table = unsafe { rpi5_stage2c_ensure_table(root, l1, allocator)? };
+    let l2 = ((virtual_address >> 21) & 0x1ff) as usize;
+    let l3_table = unsafe { rpi5_stage2c_ensure_table(l2_table, l2, allocator)? };
+    let l3 = ((virtual_address >> 12) & 0x1ff) as usize;
+    let entry = (l3_table as *mut u64).wrapping_add(l3);
+    if unsafe { core::ptr::read_volatile(entry) } != 0 {
+        return Err("user_mapping_overlap");
+    }
+    unsafe {
+        core::ptr::write_volatile(
+            entry,
+            (physical_address & RPI5_STAGE1_PTE_ADDR_MASK) | flags | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage2c_ensure_table(
+    table: u64,
+    index: usize,
+    allocator: &mut crate::kernel::frame_allocator::PhysicalFrameAllocator,
+) -> Result<u64, &'static str> {
+    let entry = (table as *mut u64).wrapping_add(index);
+    let current = unsafe { core::ptr::read_volatile(entry) };
+    if current != 0 {
+        if current & (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+            != (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+        {
+            return Err("user_table_conflict");
+        }
+        return Ok(current & RPI5_STAGE1_PTE_ADDR_MASK);
+    }
+    let child = rpi5_stage2c_alloc_zeroed_frame(allocator)?;
+    unsafe {
+        core::ptr::write_volatile(
+            entry,
+            child | RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+        );
+    }
+    Ok(child)
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+fn rpi5_stage1_kernel_core_diagnostics(dtb: &[u8]) -> ! {
+    use crate::arch::aarch64_boot_policy::{
+        RPI5_STAGE1_GICR_FRAME_STRIDE, RPI5_STAGE1_GICR_SCAN_FRAMES, Stage1KernelRange,
+        Stage1MmuMemoryType, Stage2DEnterBridgeState, build_rpi5_stage1_kernel_bootstrap_record,
+        parse_platform_dtb_diagnostics, plan_rpi5_stage1_allocator_handoff,
+        plan_rpi5_stage1_identity_map, plan_rpi5_stage1_kernel_memory, plan_rpi5_stage2a_initrd,
+        plan_rpi5_stage2b_init_elf, plan_rpi5_stage2c_init_task, rpi5_stage1_gicr_typer_plausible,
+        rpi5_stage1_timer_delta, rpi5_stage2a_cpio_first_name, rpi5_stage2b_find_init,
+        validate_rpi5_stage2d_enter_bridge,
+    };
+    use core::fmt::Write;
+
+    struct Line {
+        bytes: [u8; 192],
+        len: usize,
+        truncated: bool,
+    }
+    impl Line {
+        const fn new() -> Self {
+            Self {
+                bytes: [0; 192],
+                len: 0,
+                truncated: false,
+            }
+        }
+        fn emit(&self) -> bool {
+            let text =
+                core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("RPI5_KERNEL_FORMAT_ERR");
+            crate::arch::aarch64::console::try_write_line(text)
+        }
+    }
+    impl Write for Line {
+        fn write_str(&mut self, value: &str) -> core::fmt::Result {
+            let remaining = self.bytes.len().saturating_sub(self.len);
+            let copied = remaining.min(value.len());
+            self.bytes[self.len..self.len + copied].copy_from_slice(&value.as_bytes()[..copied]);
+            self.len += copied;
+            self.truncated |= copied != value.len();
+            if copied == value.len() {
+                Ok(())
+            } else {
+                Err(core::fmt::Error)
+            }
+        }
+    }
+    macro_rules! kernel_diag {
+        ($($arg:tt)*) => {{
+            let mut line = Line::new();
+            let _ = write!(&mut line, $($arg)*);
+            if line.truncated || !line.emit() {
+                rpi5_emergency_marker(b"RPI5_KERNEL_OUTPUT_FAILED\r\n\0");
+                halt_stage1();
+            }
+        }};
+    }
+
+    rpi5_emergency_marker(b"RPI5_KERNEL_PLAN_BEGIN\r\n\0");
+    let Some(info) = parse_platform_dtb_diagnostics(dtb) else {
+        kernel_diag!("RPI5_KERNEL_PLAN_FAILED reason=dtb_parse_failed");
+        halt_stage1();
+    };
+    let kernel = Stage1KernelRange::new(
+        core::ptr::addr_of!(__kernel_start) as u64,
+        core::ptr::addr_of!(__kernel_end) as u64,
+    );
+    let Some(dtb_end) = (dtb.as_ptr() as u64).checked_add(dtb.len() as u64) else {
+        kernel_diag!("RPI5_KERNEL_PLAN_FAILED reason=dtb_address_overflow");
+        halt_stage1();
+    };
+    let dtb_range = Stage1KernelRange::new(dtb.as_ptr() as u64, dtb_end);
+    kernel_diag!(
+        "RPI5_KERNEL_IMAGE_RANGE start=0x{:016x} end=0x{:016x}",
+        kernel.start,
+        kernel.end
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_DTB_RANGE start=0x{:016x} end=0x{:016x}",
+        dtb_range.start,
+        dtb_range.end
+    );
+    let plan = match plan_rpi5_stage1_kernel_memory(&info, kernel, dtb_range) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_KERNEL_PLAN_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    for (index, range) in plan.reserved_ranges[..plan.reserved_range_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_KERNEL_RESERVED_RANGE index={} start=0x{:016x} end=0x{:016x}",
+            index,
+            range.start,
+            range.end
+        );
+    }
+    for index in &plan.zero_reserved_skipped[..plan.zero_reserved_skipped_count] {
+        kernel_diag!("RPI5_KERNEL_RESERVED_ZERO_SKIPPED index={}", index);
+    }
+    for (index, range) in plan.usable_ranges[..plan.usable_range_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_KERNEL_USABLE_RANGE index={} start=0x{:016x} end=0x{:016x}",
+            index,
+            range.start,
+            range.end
+        );
+    }
+    kernel_diag!(
+        "RPI5_KERNEL_PT_POOL start=0x{:016x} end=0x{:016x}",
+        plan.page_table_pool.start,
+        plan.page_table_pool.end
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_EARLY_HEAP start=0x{:016x} end=0x{:016x}",
+        plan.early_heap.start,
+        plan.early_heap.end
+    );
+    rpi5_emergency_marker(b"RPI5_KERNEL_PLAN_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_MMU_PLAN_BEGIN\r\n\0");
+    let stack_pointer: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {0}, sp",
+            out(reg) stack_pointer,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let stack_page_start = stack_pointer & !(RPI5_STAGE1_PAGE_SIZE - 1);
+    let stack_page =
+        Stage1KernelRange::new(stack_page_start, stack_page_start + RPI5_STAGE1_PAGE_SIZE);
+    let mmu_plan = match plan_rpi5_stage1_identity_map(
+        &info,
+        &plan,
+        kernel,
+        stack_page,
+        dtb_range,
+        RPI5_STAGE1_UART_BASE,
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_MMU_PLAN_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    for mapping in &mmu_plan.mappings[..mmu_plan.mapping_count] {
+        match mapping.memory_type {
+            Stage1MmuMemoryType::Normal => kernel_diag!(
+                "RPI5_MMU_MAP_NORMAL start=0x{:016x} end=0x{:016x}",
+                mapping.range.start,
+                mapping.range.end
+            ),
+            Stage1MmuMemoryType::DeviceNgnre => kernel_diag!(
+                "RPI5_MMU_MAP_DEVICE start=0x{:016x} end=0x{:016x}",
+                mapping.range.start,
+                mapping.range.end
+            ),
+        }
+    }
+    let root = match unsafe { rpi5_stage1_build_identity_tables(&mmu_plan) } {
+        Ok(root) => root,
+        Err(reason) => {
+            kernel_diag!("RPI5_MMU_PLAN_FAILED reason={}", reason);
+            halt_stage1();
+        }
+    };
+    kernel_diag!("RPI5_MMU_PT_ROOT base=0x{:016x}", root);
+    rpi5_emergency_marker(b"RPI5_MMU_PLAN_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_MMU_ENABLE_BEGIN\r\n\0");
+    if let Err(reason) = unsafe { rpi5_stage1_enable_identity_mmu(root, mmu_plan.pt_pool) } {
+        kernel_diag!("RPI5_MMU_ENABLE_FAILED reason={}", reason);
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_MMU_ENABLE_DONE\r\n\0");
+    if !crate::arch::aarch64::console::try_write_line("RPI5_UART_AFTER_MMU_OK") {
+        rpi5_emergency_marker(b"RPI5_MMU_ENABLE_FAILED reason=uart_after_mmu_timeout\r\n\0");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_KERNEL_CORE_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_ALLOC_PLAN_BEGIN\r\n\0");
+    let allocator_plan = match plan_rpi5_stage1_allocator_handoff(&info, &plan) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    for reserved in &allocator_plan.reserved[..allocator_plan.reserved_count] {
+        kernel_diag!(
+            "RPI5_ALLOC_RESERVED start=0x{:016x} end=0x{:016x} reason={}",
+            reserved.range.start,
+            reserved.range.end,
+            reserved.reason.label()
+        );
+    }
+    for usable in &allocator_plan.usable[..allocator_plan.usable_count] {
+        kernel_diag!(
+            "RPI5_ALLOC_USABLE start=0x{:016x} end=0x{:016x}",
+            usable.start,
+            usable.end
+        );
+    }
+    kernel_diag!(
+        "RPI5_EARLY_HEAP_READY start=0x{:016x} end=0x{:016x}",
+        plan.early_heap.start,
+        plan.early_heap.end
+    );
+
+    use crate::kernel::frame_allocator::{MemoryRegion, PhysicalFrameAllocator};
+    if core::mem::size_of::<PhysicalFrameAllocator>()
+        > (plan.early_heap.end - plan.early_heap.start) as usize
+        || plan.early_heap.start % core::mem::align_of::<PhysicalFrameAllocator>() as u64 != 0
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=early_heap_metadata_fit");
+        halt_stage1();
+    }
+    let mut regions = [MemoryRegion {
+        start: 0,
+        len: 0,
+        usable: false,
+    }; crate::arch::aarch64_boot_policy::MAX_STAGE1_ALLOC_USABLE_RANGES];
+    for (slot, usable) in regions
+        .iter_mut()
+        .zip(&allocator_plan.usable[..allocator_plan.usable_count])
+    {
+        *slot = MemoryRegion {
+            start: usable.start,
+            len: usable.end - usable.start,
+            usable: true,
+        };
+    }
+    let allocator_ptr = plan.early_heap.start as *mut PhysicalFrameAllocator;
+    unsafe {
+        core::ptr::write(allocator_ptr, PhysicalFrameAllocator::new_uninit());
+    }
+    let allocator = unsafe { &mut *allocator_ptr };
+    if allocator
+        .init_from_memory_map(&regions[..allocator_plan.usable_count])
+        .is_err()
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_allocator_init");
+        halt_stage1();
+    }
+    kernel_diag!(
+        "RPI5_FRAME_ALLOC_READY total_pages={} free_pages={}",
+        allocator.total_frames(),
+        allocator.free_frames()
+    );
+    if allocator.total_frames() as u64 != allocator_plan.total_pages
+        || allocator.free_frames() != allocator.total_frames()
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_count_mismatch");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_FRAME_ALLOC_TEST_BEGIN\r\n\0");
+    let initial_free = allocator.free_frames();
+    let test_frame = match allocator.alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_alloc_test");
+            halt_stage1();
+        }
+    };
+    kernel_diag!("RPI5_FRAME_ALLOC_TEST_PAGE phys=0x{:016x}", test_frame);
+    let test_range = Stage1KernelRange::new(test_frame, test_frame + RPI5_STAGE1_PAGE_SIZE);
+    if test_frame % RPI5_STAGE1_PAGE_SIZE != 0
+        || !allocator_plan.usable[..allocator_plan.usable_count]
+            .iter()
+            .any(|usable| usable.start <= test_range.start && usable.end >= test_range.end)
+        || allocator_plan.reserved[..allocator_plan.reserved_count]
+            .iter()
+            .any(|reserved| test_range.overlaps(reserved.range))
+    {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_alloc_test_range");
+        halt_stage1();
+    }
+    if allocator.free_frame(test_frame).is_err() || allocator.free_frames() != initial_free {
+        kernel_diag!("RPI5_ALLOC_PLAN_FAILED reason=frame_free_test");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_FRAME_ALLOC_TEST_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_ALLOC_PLAN_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_ALLOCATOR_READY\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_CORE_ALLOC_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_IRQTIMER_DIAG_BEGIN\r\n\0");
+    let timer_frequency: u64;
+    let counter_begin: u64;
+    let counter_end: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, CNTFRQ_EL0",
+            out(reg) timer_frequency,
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "isb",
+            "mrs {0}, CNTPCT_EL0",
+            out(reg) counter_begin,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CNTFRQ value=0x{:016x}", timer_frequency);
+    if timer_frequency == 0 {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=counter_frequency_zero");
+        halt_stage1();
+    }
+    kernel_diag!("RPI5_TIMER_CNTPCT_BEGIN value=0x{:016x}", counter_begin);
+    for _ in 0..4096 {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        core::arch::asm!(
+            "isb",
+            "mrs {0}, CNTPCT_EL0",
+            out(reg) counter_end,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CNTPCT_END value=0x{:016x}", counter_end);
+    let Some(counter_delta) = rpi5_stage1_timer_delta(counter_begin, counter_end) else {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=counter_not_incrementing");
+        halt_stage1();
+    };
+    kernel_diag!("RPI5_TIMER_CNTPCT_DELTA value=0x{:016x}", counter_delta);
+    rpi5_emergency_marker(b"RPI5_TIMER_COUNTER_OK\r\n\0");
+    kernel_diag!("RPI5_PSCI_CONDUIT value={}", info.psci_conduit.label());
+
+    let Some(gicd_base) = info.gic_dist_base else {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=gicd_missing");
+        halt_stage1();
+    };
+    kernel_diag!("RPI5_GICD_PROBE_BEGIN base=0x{:016x}", gicd_base);
+    let gicd_typer = unsafe { core::ptr::read_volatile((gicd_base + 0x004) as *const u32) };
+    let gicd_iidr = unsafe { core::ptr::read_volatile((gicd_base + 0x008) as *const u32) };
+    kernel_diag!("RPI5_GICD_TYPER value=0x{:08x}", gicd_typer);
+    kernel_diag!("RPI5_GICD_IIDR value=0x{:08x}", gicd_iidr);
+    rpi5_emergency_marker(b"RPI5_GICD_PROBE_DONE\r\n\0");
+
+    let Some(gicr_base) = info.gic_redist_base else {
+        kernel_diag!("RPI5_IRQTIMER_DIAG_FAILED reason=gicr_missing");
+        halt_stage1();
+    };
+    kernel_diag!("RPI5_GICR_PROBE_BEGIN base=0x{:016x}", gicr_base);
+    let gicr_typer = unsafe { core::ptr::read_volatile((gicr_base + 0x008) as *const u64) };
+    kernel_diag!("RPI5_GICR_TYPER value=0x{:016x}", gicr_typer);
+    rpi5_emergency_marker(b"RPI5_GICR_PROBE_DONE\r\n\0");
+
+    // No reviewed read-only register definition for bcm7271-l2-intc is available
+    // in this tree. Do not infer one from production drivers or probe an offset.
+    kernel_diag!("RPI5_L2_INTC_PROBE_DEFERRED reason=no_reviewed_read_only_offset");
+    rpi5_emergency_marker(b"RPI5_IRQTIMER_DIAG_DONE\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_IRQTIMER_READY\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_IRQ_INIT_BEGIN\r\n\0");
+    kernel_diag!("RPI5_GICR_VALIDATE_BEGIN base=0x{:016x}", gicr_base);
+    let mut validated_gicr = None;
+    for index in 0..RPI5_STAGE1_GICR_SCAN_FRAMES {
+        let Some(frame_base) =
+            gicr_base.checked_add((index as u64) * RPI5_STAGE1_GICR_FRAME_STRIDE)
+        else {
+            kernel_diag!("RPI5_IRQ_INIT_FAILED reason=gicr_scan_address_overflow");
+            halt_stage1();
+        };
+        let typer = unsafe { core::ptr::read_volatile((frame_base + 0x008) as *const u64) };
+        kernel_diag!(
+            "RPI5_GICR_FRAME index={} base=0x{:016x} typer=0x{:016x}",
+            index,
+            frame_base,
+            typer
+        );
+        if validated_gicr.is_none() && rpi5_stage1_gicr_typer_plausible(typer) {
+            validated_gicr = Some(frame_base);
+        }
+    }
+    if validated_gicr.is_some() {
+        rpi5_emergency_marker(b"RPI5_GICR_VALIDATE_DONE\r\n\0");
+        kernel_diag!("RPI5_IRQ_INIT_DEFERRED reason=gic_init_sequence_not_reviewed");
+    } else {
+        kernel_diag!("RPI5_GICR_VALIDATE_FAILED reason=no_valid_frame");
+        kernel_diag!("RPI5_IRQ_INIT_DEFERRED reason=gicr_unvalidated");
+    }
+
+    rpi5_emergency_marker(b"RPI5_TIMER_INIT_BEGIN\r\n\0");
+    let timer_ctl_before: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, CNTP_CTL_EL0",
+            out(reg) timer_ctl_before,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CTL_BEFORE value=0x{:016x}", timer_ctl_before);
+    let timer_tval = (timer_frequency / 100).clamp(1, u32::MAX as u64);
+    unsafe {
+        core::arch::asm!(
+            "msr CNTP_TVAL_EL0, {0}",
+            in(reg) timer_tval,
+            options(nomem, nostack, preserves_flags)
+        );
+        core::arch::asm!(
+            "msr CNTP_CTL_EL0, {0}",
+            "isb",
+            in(reg) 3u64,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_TVAL_SET value=0x{:016x}", timer_tval);
+    let timer_ctl_after: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, CNTP_CTL_EL0",
+            out(reg) timer_ctl_after,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    kernel_diag!("RPI5_TIMER_CTL_AFTER value=0x{:016x}", timer_ctl_after);
+    if timer_ctl_after & 0x3 != 0x3 {
+        kernel_diag!("RPI5_IRQ_INIT_FAILED reason=timer_masked_enable_readback");
+        halt_stage1();
+    }
+    kernel_diag!("RPI5_TIMER_INIT_DONE masked=1");
+    rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_PREP_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_BEGIN\r\n\0");
+    unsafe extern "C" {
+        static yarm_aarch64_vector_table_el1: u8;
+    }
+    let trap_vector_base = core::ptr::addr_of!(yarm_aarch64_vector_table_el1) as u64;
+    let record = match build_rpi5_stage1_kernel_bootstrap_record(
+        &info,
+        &allocator_plan,
+        RPI5_STAGE1_UART_BASE,
+        allocator.total_frames() as u64,
+        allocator.free_frames() as u64,
+        trap_vector_base,
+    ) {
+        Some(record) => record,
+        None => {
+            kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=platform_record_invalid");
+            halt_stage1();
+        }
+    };
+    kernel_diag!(
+        "RPI5_KERNEL_PLATFORM_READY uart=0x{:016x} psci={} gicd=0x{:016x} gicr=0x{:016x}",
+        record.uart_base,
+        record.psci_conduit.label(),
+        record.gic_dist_base.unwrap_or(0),
+        record.gic_redist_base.unwrap_or(0)
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_MEMORY_READY ranges={} reserved={} total_pages={} free_pages={}",
+        record.memory_range_count,
+        record.reserved_range_count,
+        record.frame_total_pages,
+        record.frame_free_pages
+    );
+    kernel_diag!(
+        "RPI5_KERNEL_CPU0_READY bitmap=0x{:016x} effective={}",
+        record.cpu_bitmap,
+        record.effective_cpu_count
+    );
+    unsafe {
+        core::arch::asm!(
+            "msr daifset, #0xf",
+            "msr VBAR_EL1, {0}",
+            "isb",
+            in(reg) record.trap_vector_base,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let installed_vbar: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {0}, VBAR_EL1",
+            out(reg) installed_vbar,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if installed_vbar != record.trap_vector_base {
+        kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=trap_vector_readback");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_KERNEL_TRAP_READY\r\n\0");
+    rpi5_emergency_marker(b"RPI5_KERNEL_STATE_BEGIN\r\n\0");
+    if allocator.total_frames() as u64 != record.frame_total_pages
+        || allocator.free_frames() as u64 != record.frame_free_pages
+    {
+        kernel_diag!("RPI5_KERNEL_BOOT_FAILED reason=allocator_handoff_changed");
+        halt_stage1();
+    }
+    rpi5_emergency_marker(b"RPI5_KERNEL_STATE_READY\r\n\0");
+    kernel_diag!("RPI5_KERNEL_IRQ_DEFERRED reason=gic_init_sequence_not_reviewed");
+    if !record.initrd_present {
+        kernel_diag!("RPI5_KERNEL_BOOTSTRAP_NO_USERSPACE reason=no_initrd");
+    }
+    rpi5_emergency_marker(b"RPI5_KERNEL_BOOT_OK\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_INITRD_DETECT_BEGIN\r\n\0");
+    let (Some(initrd_start), Some(initrd_end)) = (info.initrd_start, info.initrd_end) else {
+        rpi5_emergency_marker(b"RPI5_INITRD_MISSING\r\n\0");
+        kernel_diag!("RPI5_STAGE2A_DEFERRED reason=no_initrd");
+        halt_stage1();
+    };
+    kernel_diag!(
+        "RPI5_INITRD_DTB_PROPS start=0x{:016x} end=0x{:016x}",
+        initrd_start,
+        initrd_end
+    );
+    let initrd_plan = match plan_rpi5_stage2a_initrd(&info, &allocator_plan) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_INITRD_INVALID reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2A_DEFERRED reason=invalid_initrd");
+            halt_stage1();
+        }
+    };
+    kernel_diag!(
+        "RPI5_INITRD_RANGE start=0x{:016x} end=0x{:016x} size=0x{:016x}",
+        initrd_plan.byte_range.start,
+        initrd_plan.byte_range.end,
+        initrd_plan.byte_range.end - initrd_plan.byte_range.start
+    );
+    kernel_diag!(
+        "RPI5_INITRD_RESERVED start=0x{:016x} end=0x{:016x}",
+        initrd_plan.reservation.start,
+        initrd_plan.reservation.end
+    );
+    rpi5_emergency_marker(b"RPI5_INITRD_CPIO_CHECK_BEGIN\r\n\0");
+    let initrd_size = initrd_plan.byte_range.end - initrd_plan.byte_range.start;
+    let Ok(initrd_size) = usize::try_from(initrd_size) else {
+        kernel_diag!("RPI5_INITRD_CPIO_INVALID reason=size_not_addressable");
+        kernel_diag!("RPI5_STAGE2A_DEFERRED reason=invalid_cpio");
+        halt_stage1();
+    };
+    let initrd = unsafe {
+        core::slice::from_raw_parts(initrd_plan.byte_range.start as *const u8, initrd_size)
+    };
+    let first_name = match rpi5_stage2a_cpio_first_name(initrd) {
+        Ok(name) => name,
+        Err(reason) => {
+            kernel_diag!("RPI5_INITRD_CPIO_INVALID reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2A_DEFERRED reason=invalid_cpio");
+            halt_stage1();
+        }
+    };
+    rpi5_emergency_marker(b"RPI5_INITRD_CPIO_MAGIC_OK\r\n\0");
+    let first_name = core::str::from_utf8(first_name).unwrap_or("<non-utf8>");
+    kernel_diag!("RPI5_INITRD_CPIO_FIRST_ENTRY name={}", first_name);
+    kernel_diag!(
+        "RPI5_INITRD_READY start=0x{:016x} end=0x{:016x}",
+        initrd_plan.byte_range.start,
+        initrd_plan.byte_range.end
+    );
+    rpi5_emergency_marker(b"RPI5_STAGE2A_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_STAGE2B_BEGIN\r\n\0");
+    rpi5_emergency_marker(b"RPI5_INIT_LOOKUP_BEGIN path=/init\r\n\0");
+    let init_file = match rpi5_stage2b_find_init(initrd) {
+        Ok(file) => file,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_LOOKUP_FAILED reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2B_DEFERRED reason=init_lookup_failed");
+            halt_stage1();
+        }
+    };
+    kernel_diag!(
+        "RPI5_INIT_LOOKUP_OK offset=0x{:016x} size=0x{:016x}",
+        init_file.data_offset,
+        init_file.size
+    );
+    let init_elf = &initrd[init_file.data_offset..init_file.data_offset + init_file.size];
+    rpi5_emergency_marker(b"RPI5_INIT_ELF_CHECK_BEGIN\r\n\0");
+    let load_plan = match plan_rpi5_stage2b_init_elf(init_elf) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_ELF_INVALID reason={}", reason.label());
+            kernel_diag!("RPI5_STAGE2B_DEFERRED reason=invalid_init_elf");
+            halt_stage1();
+        }
+    };
+    kernel_diag!("RPI5_INIT_ELF_HEADER_OK entry=0x{:016x}", load_plan.entry);
+    rpi5_emergency_marker(b"RPI5_INIT_ELF_LOAD_PLAN_BEGIN\r\n\0");
+    for (index, segment) in load_plan.segments[..load_plan.segment_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_INIT_ELF_SEGMENT index={} vaddr=0x{:016x} memsz=0x{:016x} filesz=0x{:016x} flags=0x{:08x}",
+            index,
+            segment.vaddr,
+            segment.mem_size,
+            segment.file_size,
+            segment.flags
+        );
+    }
+    rpi5_emergency_marker(b"RPI5_INIT_ELF_LOAD_PLAN_DONE\r\n\0");
+    kernel_diag!("RPI5_STAGE2B_DONE status=load_plan_ready");
+
+    rpi5_emergency_marker(b"RPI5_STAGE2C_BEGIN\r\n\0");
+    rpi5_emergency_marker(b"RPI5_INIT_TASK_BUILD_BEGIN\r\n\0");
+    let task_plan = match plan_rpi5_stage2c_init_task(&load_plan) {
+        Ok(plan) => plan,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_TASK_BUILD_FAILED reason={}", reason.label());
+            halt_stage1();
+        }
+    };
+    rpi5_emergency_marker(b"RPI5_INIT_ADDRESS_SPACE_BEGIN\r\n\0");
+    for index in 0..load_plan.segment_count {
+        kernel_diag!("RPI5_INIT_SEGMENT_MAP_BEGIN index={}", index);
+    }
+    let task = match unsafe {
+        rpi5_stage2c_build_init_task(allocator, init_elf, &load_plan, &task_plan)
+    } {
+        Ok(task) => task,
+        Err(reason) => {
+            kernel_diag!("RPI5_INIT_SEGMENT_MAP_FAILED reason={}", reason);
+            kernel_diag!("RPI5_INIT_ADDRESS_SPACE_FAILED reason={}", reason);
+            halt_stage1();
+        }
+    };
+    for (index, segment) in load_plan.segments[..load_plan.segment_count]
+        .iter()
+        .enumerate()
+    {
+        kernel_diag!(
+            "RPI5_INIT_SEGMENT_MAPPED index={} vaddr=0x{:016x} memsz=0x{:016x} filesz=0x{:016x} flags=0x{:08x}",
+            index,
+            segment.vaddr,
+            segment.mem_size,
+            segment.file_size,
+            segment.flags
+        );
+        if let Some(bss) = task_plan.segments[index].bss_range {
+            kernel_diag!(
+                "RPI5_INIT_BSS_ZEROED index={} start=0x{:016x} end=0x{:016x}",
+                index,
+                bss.start,
+                bss.end
+            );
+        }
+    }
+    kernel_diag!(
+        "RPI5_INIT_ADDRESS_SPACE_READY root=0x{:016x} pages={}",
+        task.root_table,
+        task.mapped_pages
+    );
+    kernel_diag!("RPI5_INIT_STACK_READY sp=0x{:016x}", task.stack_pointer);
+    let mut trap_frame = crate::kernel::trapframe::TrapFrame::zeroed();
+    trap_frame.set_saved_pc(task.entry as usize);
+    trap_frame.set_saved_sp(task.stack_pointer as usize);
+    kernel_diag!(
+        "RPI5_INIT_TRAP_FRAME_READY entry=0x{:016x} sp=0x{:016x}",
+        trap_frame.saved_pc(),
+        trap_frame.saved_sp()
+    );
+    rpi5_emergency_marker(b"RPI5_INIT_TASK_BUILD_DONE\r\n\0");
+    kernel_diag!("RPI5_INIT_SPAWN_READY tid={}", task.tid);
+    rpi5_emergency_marker(b"RPI5_STAGE2C_DONE\r\n\0");
+
+    rpi5_emergency_marker(b"RPI5_STAGE2D_REAL_BEGIN\r\n\0");
+    let (current_ttbr0, current_tcr, kernel_pc): (u64, u64, u64);
+    unsafe {
+        core::arch::asm!(
+            "mrs {ttbr0}, TTBR0_EL1",
+            "mrs {tcr}, TCR_EL1",
+            "adr {pc}, .",
+            ttbr0 = out(reg) current_ttbr0,
+            tcr = out(reg) current_tcr,
+            pc = out(reg) kernel_pc,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let bridge = Stage2DEnterBridgeState {
+        expected_tid: task.tid,
+        current_tid: None,
+        stage2c_root: task.root_table,
+        current_ttbr0,
+        trap_entry: trap_frame.saved_pc() as u64,
+        task_entry: task.entry,
+        trap_stack_pointer: trap_frame.saved_sp() as u64,
+        task_stack_pointer: task.stack_pointer,
+        tcr_el1: current_tcr,
+        kernel_pc,
+    };
+    if let Err(reason) = validate_rpi5_stage2d_enter_bridge(bridge) {
+        kernel_diag!("RPI5_ENTER_USER_FAILED reason={}", reason.label());
+        kernel_diag!("RPI5_STAGE2D_REAL_DEFERRED reason={}", reason.label());
+        kernel_diag!("RPI5_STAGE2E_DEFERRED reason=el0_not_entered");
+        halt_stage1();
+    }
+    kernel_diag!("RPI5_STAGE2D_REAL_DEFERRED reason=eret_sequence_not_reviewed");
+    kernel_diag!("RPI5_STAGE2E_DEFERRED reason=el0_not_entered");
+    halt_stage1();
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_UART_BASE: u64 = 0x10_7d00_1000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PAGE_SIZE: u64 = 4096;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_L2_BLOCK_SIZE: u64 = 2 * 1024 * 1024;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_L1_BLOCK_SIZE: u64 = 1024 * 1024 * 1024;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_VALID: u64 = 1 << 0;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_TABLE_OR_PAGE: u64 = 1 << 1;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_AF: u64 = 1 << 10;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_PXN: u64 = 1 << 53;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_UXN: u64 = 1 << 54;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_PTE_ADDR_MASK: u64 = 0x0000_ffff_ffff_f000;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_NORMAL_FLAGS: u64 =
+    RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_AF | (0b11 << 8) | RPI5_STAGE1_PTE_UXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_DEVICE_FLAGS: u64 = RPI5_STAGE1_PTE_VALID
+    | RPI5_STAGE1_PTE_AF
+    | (0b10 << 8)
+    | (1 << 2)
+    | RPI5_STAGE1_PTE_PXN
+    | RPI5_STAGE1_PTE_UXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE2C_USER_RX_FLAGS: u64 = RPI5_STAGE1_PTE_VALID
+    | RPI5_STAGE1_PTE_AF
+    | (0b11 << 8)
+    | (1 << 6)
+    | (1 << 7)
+    | RPI5_STAGE1_PTE_PXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE2C_USER_RW_FLAGS: u64 = RPI5_STAGE1_PTE_VALID
+    | RPI5_STAGE1_PTE_AF
+    | (0b11 << 8)
+    | (1 << 6)
+    | RPI5_STAGE1_PTE_PXN
+    | RPI5_STAGE1_PTE_UXN;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_MAIR_EL1: u64 = 0x04ff;
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+const RPI5_STAGE1_TCR_EL1: u64 =
+    25 | (1 << 8) | (1 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+struct Rpi5Stage1TableAllocator {
+    next: u64,
+    end: u64,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+impl Rpi5Stage1TableAllocator {
+    unsafe fn allocate(&mut self) -> Result<u64, &'static str> {
+        let Some(next) = self.next.checked_add(RPI5_STAGE1_PAGE_SIZE) else {
+            return Err("pt_pool_overflow");
+        };
+        if next > self.end {
+            return Err("pt_pool_exhausted");
+        }
+        let page = self.next;
+        self.next = next;
+        unsafe {
+            core::ptr::write_bytes(page as *mut u8, 0, RPI5_STAGE1_PAGE_SIZE as usize);
+        }
+        Ok(page)
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_build_identity_tables(
+    plan: &crate::arch::aarch64_boot_policy::Stage1MmuPlan,
+) -> Result<u64, &'static str> {
+    let mut allocator = Rpi5Stage1TableAllocator {
+        next: plan.pt_pool.start,
+        end: plan.pt_pool.end,
+    };
+    let root = unsafe { allocator.allocate()? };
+    for mapping in &plan.mappings[..plan.mapping_count] {
+        let flags = match mapping.memory_type {
+            crate::arch::aarch64_boot_policy::Stage1MmuMemoryType::Normal => {
+                RPI5_STAGE1_NORMAL_FLAGS
+            }
+            crate::arch::aarch64_boot_policy::Stage1MmuMemoryType::DeviceNgnre => {
+                RPI5_STAGE1_DEVICE_FLAGS
+            }
+        };
+        unsafe {
+            rpi5_stage1_map_identity_range(
+                root,
+                &mut allocator,
+                mapping.range.start,
+                mapping.range.end,
+                flags,
+            )?;
+        }
+    }
+    Ok(root)
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_map_identity_range(
+    root: u64,
+    allocator: &mut Rpi5Stage1TableAllocator,
+    mut start: u64,
+    end: u64,
+    flags: u64,
+) -> Result<(), &'static str> {
+    if start % RPI5_STAGE1_PAGE_SIZE != 0 || end % RPI5_STAGE1_PAGE_SIZE != 0 || start >= end {
+        return Err("unaligned_mapping");
+    }
+    while start < end {
+        if start % RPI5_STAGE1_L1_BLOCK_SIZE == 0 && end - start >= RPI5_STAGE1_L1_BLOCK_SIZE {
+            let l1_index = ((start >> 30) & 0x1ff) as usize;
+            unsafe {
+                rpi5_stage1_write_empty_entry(root, l1_index, start | flags)?;
+            }
+            start += RPI5_STAGE1_L1_BLOCK_SIZE;
+            continue;
+        }
+        let l1_index = ((start >> 30) & 0x1ff) as usize;
+        let l2 = unsafe { rpi5_stage1_ensure_table(root, l1_index, allocator)? };
+        if start % RPI5_STAGE1_L2_BLOCK_SIZE == 0 && end - start >= RPI5_STAGE1_L2_BLOCK_SIZE {
+            let l2_index = ((start >> 21) & 0x1ff) as usize;
+            unsafe {
+                rpi5_stage1_write_empty_entry(l2, l2_index, start | flags)?;
+            }
+            start += RPI5_STAGE1_L2_BLOCK_SIZE;
+            continue;
+        }
+        let l2_index = ((start >> 21) & 0x1ff) as usize;
+        let l3 = unsafe { rpi5_stage1_ensure_table(l2, l2_index, allocator)? };
+        let l3_index = ((start >> 12) & 0x1ff) as usize;
+        unsafe {
+            rpi5_stage1_write_empty_entry(
+                l3,
+                l3_index,
+                start | flags | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+            )?;
+        }
+        start += RPI5_STAGE1_PAGE_SIZE;
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_ensure_table(
+    table: u64,
+    index: usize,
+    allocator: &mut Rpi5Stage1TableAllocator,
+) -> Result<u64, &'static str> {
+    let entry = unsafe { core::ptr::read_volatile((table as *const u64).add(index)) };
+    if entry == 0 {
+        let child = unsafe { allocator.allocate()? };
+        unsafe {
+            core::ptr::write_volatile(
+                (table as *mut u64).add(index),
+                child | RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE,
+            );
+        }
+        return Ok(child);
+    }
+    if entry & (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+        == (RPI5_STAGE1_PTE_VALID | RPI5_STAGE1_PTE_TABLE_OR_PAGE)
+    {
+        Ok(entry & RPI5_STAGE1_PTE_ADDR_MASK)
+    } else {
+        Err("mapping_conflict")
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_write_empty_entry(
+    table: u64,
+    index: usize,
+    value: u64,
+) -> Result<(), &'static str> {
+    let slot = unsafe { (table as *mut u64).add(index) };
+    if unsafe { core::ptr::read_volatile(slot) } != 0 {
+        return Err("mapping_conflict");
+    }
+    unsafe {
+        core::ptr::write_volatile(slot, value);
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-stage1"
+))]
+unsafe fn rpi5_stage1_enable_identity_mmu(
+    root: u64,
+    pt_pool: crate::arch::aarch64_boot_policy::Stage1KernelRange,
+) -> Result<(), &'static str> {
+    let mut sctlr: u64;
+    unsafe {
+        core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
+    }
+    if sctlr & 1 != 0 {
+        return Err("already_enabled");
+    }
+    let mut line = pt_pool.start;
+    while line < pt_pool.end {
+        unsafe {
+            core::arch::asm!("dc cvac, {0}", in(reg) line, options(nostack, preserves_flags));
+        }
+        line += 64;
+    }
+    unsafe {
+        core::arch::asm!(
+            "dsb ish",
+            "msr MAIR_EL1, {mair}",
+            "msr TCR_EL1, {tcr}",
+            "msr TTBR0_EL1, {root}",
+            "msr TTBR1_EL1, xzr",
+            "dsb ishst",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            "ic iallu",
+            "dsb nsh",
+            "isb",
+            mair = in(reg) RPI5_STAGE1_MAIR_EL1,
+            tcr = in(reg) RPI5_STAGE1_TCR_EL1,
+            root = in(reg) root,
+            options(nostack, preserves_flags)
+        );
+        sctlr |= (1 << 0) | (1 << 2) | (1 << 12);
+        core::arch::asm!(
+            "msr SCTLR_EL1, {0}",
+            "isb",
+            in(reg) sctlr,
+            options(nostack, preserves_flags)
+        );
+        core::arch::asm!("mrs {0}, SCTLR_EL1", out(reg) sctlr, options(nostack, preserves_flags));
+    }
+    if sctlr & 1 == 0 {
+        Err("sctlr_m_not_set")
+    } else {
+        Ok(())
     }
 }
 

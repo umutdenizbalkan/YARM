@@ -11,7 +11,58 @@ const FDT_NOP: u32 = 4;
 const FDT_END: u32 = 9;
 const MAX_PATH: usize = 192;
 const MAX_DEPTH: usize = 32;
+const MAX_DIAGNOSTIC_RANGES: usize = 8;
+const MAX_DIAGNOSTIC_PCIE_CONTROLLERS: usize = 8;
+const MAX_DIAGNOSTIC_BOOTARGS: usize = 256;
+pub const MAX_STAGE1_KERNEL_RESERVED_RANGES: usize = MAX_DIAGNOSTIC_RANGES + 4;
+pub const MAX_STAGE1_KERNEL_USABLE_RANGES: usize = 24;
+pub const STAGE1_PT_POOL_SIZE: u64 = 256 * 1024;
+pub const STAGE1_EARLY_HEAP_SIZE: u64 = 2 * 1024 * 1024;
+const STAGE1_ALLOCATION_ALIGNMENT: u64 = 64 * 1024;
+const STAGE1_PAGE_SIZE: u64 = 4096;
+pub const MAX_STAGE2B_ELF_LOAD_SEGMENTS: usize = 8;
+const MAX_STAGE2B_CPIO_ENTRIES: usize = 4096;
+const MAX_STAGE2B_CPIO_NAME: usize = 256;
+pub const RPI5_STAGE2C_INIT_TID: u64 = 1;
+pub const RPI5_STAGE2C_STACK_TOP: u64 = 0x3fe0_0000;
+pub const RPI5_STAGE2C_STACK_PAGES: u64 = 4;
+pub const RPI5_KERNEL_VA_OFFSET: u64 = 0xffff_ff80_0000_0000;
+pub const RPI5_KERNEL_PHYS_LOAD_BASE: u64 = 0x0000_0000_0008_0000;
+pub const RPI5_KERNEL_VIRT_LOAD_BASE: u64 = 0xffff_ff80_0008_0000;
+const STAGE1_MMU_MIN_TABLE_PAGES: u64 = 4;
+const STAGE1_TTBR0_VA_LIMIT: u64 = 1 << 39;
+const RPI5_FIRMWARE_LOW_RESERVED_END: u64 = 0x80000;
 const RPI5_PREFERRED_UART: &[u8] = b"/soc@107c000000/serial@7d001000";
+
+pub const fn checked_phys_to_rpi5_kernel_virt(pa: u64) -> Option<u64> {
+    RPI5_KERNEL_VA_OFFSET.checked_add(pa)
+}
+
+pub const fn phys_to_rpi5_kernel_virt(pa: u64) -> u64 {
+    match checked_phys_to_rpi5_kernel_virt(pa) {
+        Some(va) => va,
+        None => panic!("RPi5 physical address is outside the high-half direct-map contract"),
+    }
+}
+
+pub const fn checked_rpi5_kernel_virt_to_phys(va: u64) -> Option<u64> {
+    va.checked_sub(RPI5_KERNEL_VA_OFFSET)
+}
+
+pub const fn rpi5_kernel_virt_to_phys(va: u64) -> u64 {
+    match checked_rpi5_kernel_virt_to_phys(va) {
+        Some(pa) => pa,
+        None => panic!("address is not in the RPi5 kernel high half"),
+    }
+}
+
+pub const fn is_rpi5_kernel_high_va(va: u64) -> bool {
+    checked_rpi5_kernel_virt_to_phys(va).is_some()
+}
+
+pub const fn is_rpi5_low_phys(pa: u64) -> bool {
+    checked_phys_to_rpi5_kernel_virt(pa).is_some()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DetectedPlatform {
@@ -101,10 +152,1923 @@ pub struct PlatformDtbInfo {
     pub serial: Option<SerialSelection>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiagnosticRange {
+    pub start: u64,
+    pub size: u64,
+    pub no_map: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiagnosticPsciConduit {
+    #[default]
+    None,
+    Smc,
+    Hvc,
+}
+
+impl DiagnosticPsciConduit {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Smc => "smc",
+            Self::Hvc => "hvc",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DiagnosticPcieController {
+    pub path: DtbPath,
+    pub base: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage1KernelRange {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl Stage1KernelRange {
+    pub const fn new(start: u64, end: u64) -> Self {
+        Self { start, end }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
+    pub const fn overlaps(self, other: Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1KernelPlanFailure {
+    #[default]
+    InvalidKernelRange,
+    InvalidDtbRange,
+    FirmwareRangesTruncated,
+    AddressOverflow,
+    ReservedCapacity,
+    UsableCapacity,
+    NoPageTablePool,
+    NoEarlyHeap,
+}
+
+impl Stage1KernelPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InvalidKernelRange => "invalid_kernel_range",
+            Self::InvalidDtbRange => "invalid_dtb_range",
+            Self::FirmwareRangesTruncated => "firmware_ranges_truncated",
+            Self::AddressOverflow => "address_overflow",
+            Self::ReservedCapacity => "reserved_capacity",
+            Self::UsableCapacity => "usable_capacity",
+            Self::NoPageTablePool => "no_page_table_pool",
+            Self::NoEarlyHeap => "no_early_heap",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1KernelPlan {
+    pub reserved_ranges: [Stage1KernelRange; MAX_STAGE1_KERNEL_RESERVED_RANGES],
+    pub reserved_range_count: usize,
+    pub zero_reserved_skipped: [usize; MAX_DIAGNOSTIC_RANGES],
+    pub zero_reserved_skipped_count: usize,
+    pub usable_ranges: [Stage1KernelRange; MAX_STAGE1_KERNEL_USABLE_RANGES],
+    pub usable_range_count: usize,
+    pub page_table_pool: Stage1KernelRange,
+    pub early_heap: Stage1KernelRange,
+    pub initrd_reservation: Option<Stage1KernelRange>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1MmuMemoryType {
+    #[default]
+    Normal,
+    DeviceNgnre,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage1MmuMapping {
+    pub range: Stage1KernelRange,
+    pub memory_type: Stage1MmuMemoryType,
+}
+
+pub const RPI5_STAGE1_GICR_FRAME_STRIDE: u64 = 128 * 1024;
+pub const RPI5_STAGE1_GICR_SCAN_FRAMES: usize = 4;
+pub const MAX_STAGE1_MMU_MAPPINGS: usize = MAX_DIAGNOSTIC_RANGES + 1 + RPI5_STAGE1_GICR_SCAN_FRAMES;
+pub const MAX_STAGE1_ALLOC_RESERVED_RANGES: usize = MAX_STAGE1_KERNEL_RESERVED_RANGES + 2;
+pub const MAX_STAGE1_ALLOC_USABLE_RANGES: usize = MAX_STAGE1_KERNEL_USABLE_RANGES;
+pub const MAX_RPI5_HIGH_HALF_MAPPINGS: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1MmuPlan {
+    pub mappings: [Stage1MmuMapping; MAX_STAGE1_MMU_MAPPINGS],
+    pub mapping_count: usize,
+    pub pt_pool: Stage1KernelRange,
+}
+
+impl Default for Stage1MmuPlan {
+    fn default() -> Self {
+        Self {
+            mappings: [Stage1MmuMapping::default(); MAX_STAGE1_MMU_MAPPINGS],
+            mapping_count: 0,
+            pt_pool: Stage1KernelRange::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1MmuPlanFailure {
+    #[default]
+    InvalidPageTablePool,
+    MappingCapacity,
+    AddressOverflow,
+    AddressOutsideTtbr0,
+    AttributeOverlap,
+    KernelNotMapped,
+    CurrentStackNotMapped,
+    DtbNotMapped,
+    PageTablePoolNotMapped,
+    EarlyHeapNotMapped,
+}
+
+impl Stage1MmuPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InvalidPageTablePool => "invalid_pt_pool",
+            Self::MappingCapacity => "mapping_capacity",
+            Self::AddressOverflow => "address_overflow",
+            Self::AddressOutsideTtbr0 => "address_outside_ttbr0",
+            Self::AttributeOverlap => "attribute_overlap",
+            Self::KernelNotMapped => "kernel_not_mapped",
+            Self::CurrentStackNotMapped => "current_stack_not_mapped",
+            Self::DtbNotMapped => "dtb_not_mapped",
+            Self::PageTablePoolNotMapped => "pt_pool_not_mapped",
+            Self::EarlyHeapNotMapped => "early_heap_not_mapped",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rpi5HighHalfMapping {
+    pub physical: Stage1KernelRange,
+    pub virtual_range: Stage1KernelRange,
+    pub memory_type: Stage1MmuMemoryType,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rpi5HighHalfPlan {
+    pub mappings: [Rpi5HighHalfMapping; MAX_RPI5_HIGH_HALF_MAPPINGS],
+    pub mapping_count: usize,
+    pub ttbr0_root: u64,
+    pub ttbr1_root: u64,
+    pub tcr_el1: u64,
+    pub mair_el1: u64,
+}
+
+impl Default for Rpi5HighHalfPlan {
+    fn default() -> Self {
+        Self {
+            mappings: [Rpi5HighHalfMapping::default(); MAX_RPI5_HIGH_HALF_MAPPINGS],
+            mapping_count: 0,
+            ttbr0_root: 0,
+            ttbr1_root: 0,
+            tcr_el1: 0,
+            mair_el1: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Rpi5HighHalfPlanFailure {
+    #[default]
+    InvalidRange,
+    AddressOverflow,
+    MappingCapacity,
+    AttributeOverlap,
+    InvalidTtbr0Root,
+    MissingTtbr1Root,
+    SharedRoots,
+}
+
+impl Rpi5HighHalfPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::InvalidRange => "invalid_range",
+            Self::AddressOverflow => "address_overflow",
+            Self::MappingCapacity => "mapping_capacity",
+            Self::AttributeOverlap => "attribute_overlap",
+            Self::InvalidTtbr0Root => "invalid_ttbr0_root",
+            Self::MissingTtbr1Root => "missing_ttbr1_root",
+            Self::SharedRoots => "shared_roots",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1AllocatorReservationReason {
+    #[default]
+    LowFirmware,
+    Kernel,
+    Dtb,
+    FirmwareReserved,
+    PageTablePool,
+    EarlyHeap,
+    Initrd,
+}
+
+impl Stage1AllocatorReservationReason {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LowFirmware => "low_firmware",
+            Self::Kernel => "kernel",
+            Self::Dtb => "dtb",
+            Self::FirmwareReserved => "firmware_reserved",
+            Self::PageTablePool => "page_table_pool",
+            Self::EarlyHeap => "early_heap",
+            Self::Initrd => "initrd",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage1AllocatorReservation {
+    pub range: Stage1KernelRange,
+    pub reason: Stage1AllocatorReservationReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1AllocatorPlan {
+    pub reserved: [Stage1AllocatorReservation; MAX_STAGE1_ALLOC_RESERVED_RANGES],
+    pub reserved_count: usize,
+    pub usable: [Stage1KernelRange; MAX_STAGE1_ALLOC_USABLE_RANGES],
+    pub usable_count: usize,
+    pub total_pages: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage1KernelBootstrapRecord {
+    pub uart_base: u64,
+    pub memory_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
+    pub memory_range_count: usize,
+    pub reserved_ranges: [Stage1KernelRange; MAX_STAGE1_ALLOC_RESERVED_RANGES],
+    pub reserved_range_count: usize,
+    pub frame_total_pages: u64,
+    pub frame_free_pages: u64,
+    pub cpu_bitmap: u64,
+    pub effective_cpu_count: usize,
+    pub psci_conduit: DiagnosticPsciConduit,
+    pub gic_dist_base: Option<u64>,
+    pub gic_redist_base: Option<u64>,
+    pub trap_vector_base: u64,
+    pub initrd_present: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2AInitrdPlan {
+    pub byte_range: Stage1KernelRange,
+    pub reservation: Stage1KernelRange,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2BCpioFile {
+    pub data_offset: usize,
+    pub size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2BCpioLookupFailure {
+    #[default]
+    NotFound,
+    EntryLimit,
+    HeaderTruncated,
+    BadMagic,
+    InvalidHex,
+    InvalidNameSize,
+    NameTruncated,
+    NameNotTerminated,
+    EntryTruncated,
+    MissingTrailer,
+}
+
+impl Stage2BCpioLookupFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::EntryLimit => "entry_limit",
+            Self::HeaderTruncated => "header_truncated",
+            Self::BadMagic => "bad_magic",
+            Self::InvalidHex => "invalid_hex",
+            Self::InvalidNameSize => "invalid_name_size",
+            Self::NameTruncated => "name_truncated",
+            Self::NameNotTerminated => "name_not_terminated",
+            Self::EntryTruncated => "entry_truncated",
+            Self::MissingTrailer => "missing_trailer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2BElfLoadSegment {
+    pub vaddr: u64,
+    pub mem_size: u64,
+    pub file_size: u64,
+    pub file_offset: u64,
+    pub flags: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage2BElfLoadPlan {
+    pub entry: u64,
+    pub segments: [Stage2BElfLoadSegment; MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+    pub segment_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2CUserPermission {
+    #[default]
+    ReadExecute,
+    ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2CSegmentPlan {
+    pub page_range: Stage1KernelRange,
+    pub bss_range: Option<Stage1KernelRange>,
+    pub permission: Stage2CUserPermission,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage2CTaskPlan {
+    pub tid: u64,
+    pub entry: u64,
+    pub segments: [Stage2CSegmentPlan; MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+    pub segment_count: usize,
+    pub stack_range: Stage1KernelRange,
+    pub stack_pointer: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stage2DEnterBridgeState {
+    pub expected_tid: u64,
+    pub current_tid: Option<u64>,
+    pub stage2c_root: u64,
+    pub current_ttbr0: u64,
+    pub trap_entry: u64,
+    pub task_entry: u64,
+    pub trap_stack_pointer: u64,
+    pub task_stack_pointer: u64,
+    pub tcr_el1: u64,
+    pub kernel_pc: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2DEnterBridgeFailure {
+    #[default]
+    CurrentTaskMissing,
+    CurrentTaskMismatch,
+    InvalidUserRoot,
+    RootAlreadyActive,
+    TrapEntryMismatch,
+    TrapStackMismatch,
+    TtbrSplitNotReady,
+}
+
+impl Stage2DEnterBridgeFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CurrentTaskMissing => "current_task_missing",
+            Self::CurrentTaskMismatch => "current_task_mismatch",
+            Self::InvalidUserRoot => "invalid_user_root",
+            Self::RootAlreadyActive => "root_already_active",
+            Self::TrapEntryMismatch => "trap_entry_mismatch",
+            Self::TrapStackMismatch => "trap_stack_mismatch",
+            Self::TtbrSplitNotReady => "ttbr_split_not_ready",
+        }
+    }
+}
+
+impl Default for Stage2CTaskPlan {
+    fn default() -> Self {
+        Self {
+            tid: RPI5_STAGE2C_INIT_TID,
+            entry: 0,
+            segments: [Stage2CSegmentPlan::default(); MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+            segment_count: 0,
+            stack_range: Stage1KernelRange::default(),
+            stack_pointer: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2CTaskPlanFailure {
+    #[default]
+    NoSegments,
+    InvalidPermission,
+    AddressOverflow,
+    SegmentOverlap,
+    StackOverlap,
+    EntryNotExecutable,
+}
+
+impl Stage2CTaskPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoSegments => "no_segments",
+            Self::InvalidPermission => "invalid_permission",
+            Self::AddressOverflow => "address_overflow",
+            Self::SegmentOverlap => "segment_overlap",
+            Self::StackOverlap => "stack_overlap",
+            Self::EntryNotExecutable => "entry_not_executable",
+        }
+    }
+}
+
+impl Default for Stage2BElfLoadPlan {
+    fn default() -> Self {
+        Self {
+            entry: 0,
+            segments: [Stage2BElfLoadSegment::default(); MAX_STAGE2B_ELF_LOAD_SEGMENTS],
+            segment_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2BElfFailure {
+    #[default]
+    HeaderTruncated,
+    BadMagic,
+    WrongClass,
+    WrongEndian,
+    WrongVersion,
+    WrongType,
+    WrongMachine,
+    InvalidEntry,
+    InvalidProgramHeaderSize,
+    ProgramHeadersOutOfBounds,
+    TooManyLoadSegments,
+    InvalidLoadSegment,
+    WritableExecutableSegment,
+    EntryNotExecutable,
+}
+
+impl Stage2BElfFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HeaderTruncated => "header_truncated",
+            Self::BadMagic => "bad_magic",
+            Self::WrongClass => "wrong_class",
+            Self::WrongEndian => "wrong_endian",
+            Self::WrongVersion => "wrong_version",
+            Self::WrongType => "wrong_type",
+            Self::WrongMachine => "wrong_machine",
+            Self::InvalidEntry => "invalid_entry",
+            Self::InvalidProgramHeaderSize => "invalid_program_header_size",
+            Self::ProgramHeadersOutOfBounds => "program_headers_out_of_bounds",
+            Self::TooManyLoadSegments => "too_many_load_segments",
+            Self::InvalidLoadSegment => "invalid_load_segment",
+            Self::WritableExecutableSegment => "writable_executable_segment",
+            Self::EntryNotExecutable => "entry_not_executable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2AInitrdFailure {
+    #[default]
+    Missing,
+    IncompleteProperties,
+    InvalidRange,
+    AddressOverflow,
+    OutsideFirmwareRam,
+    OverlapsReserved,
+}
+
+impl Stage2AInitrdFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::IncompleteProperties => "incomplete_properties",
+            Self::InvalidRange => "invalid_range",
+            Self::AddressOverflow => "address_overflow",
+            Self::OutsideFirmwareRam => "outside_firmware_ram",
+            Self::OverlapsReserved => "overlaps_reserved",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage2ACpioFailure {
+    #[default]
+    HeaderTruncated,
+    BadMagic,
+    InvalidHex,
+    InvalidNameSize,
+    NameTruncated,
+    NameNotTerminated,
+    EntryTruncated,
+}
+
+impl Stage2ACpioFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::HeaderTruncated => "header_truncated",
+            Self::BadMagic => "bad_magic",
+            Self::InvalidHex => "invalid_hex",
+            Self::InvalidNameSize => "invalid_name_size",
+            Self::NameTruncated => "name_truncated",
+            Self::NameNotTerminated => "name_not_terminated",
+            Self::EntryTruncated => "entry_truncated",
+        }
+    }
+}
+
+impl Default for Stage1AllocatorPlan {
+    fn default() -> Self {
+        Self {
+            reserved: [Stage1AllocatorReservation::default(); MAX_STAGE1_ALLOC_RESERVED_RANGES],
+            reserved_count: 0,
+            usable: [Stage1KernelRange::default(); MAX_STAGE1_ALLOC_USABLE_RANGES],
+            usable_count: 0,
+            total_pages: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage1AllocatorPlanFailure {
+    #[default]
+    ReservedCapacity,
+    UsableCapacity,
+    AddressOverflow,
+    NoUsableFrames,
+    UsableOverlapsReserved,
+}
+
+impl Stage1AllocatorPlanFailure {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReservedCapacity => "reserved_capacity",
+            Self::UsableCapacity => "usable_capacity",
+            Self::AddressOverflow => "address_overflow",
+            Self::NoUsableFrames => "no_usable_frames",
+            Self::UsableOverlapsReserved => "usable_overlaps_reserved",
+        }
+    }
+}
+
+impl Default for Stage1KernelPlan {
+    fn default() -> Self {
+        Self {
+            reserved_ranges: [Stage1KernelRange::default(); MAX_STAGE1_KERNEL_RESERVED_RANGES],
+            reserved_range_count: 0,
+            zero_reserved_skipped: [0; MAX_DIAGNOSTIC_RANGES],
+            zero_reserved_skipped_count: 0,
+            usable_ranges: [Stage1KernelRange::default(); MAX_STAGE1_KERNEL_USABLE_RANGES],
+            usable_range_count: 0,
+            page_table_pool: Stage1KernelRange::default(),
+            early_heap: Stage1KernelRange::default(),
+            initrd_reservation: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlatformDtbDiagnostics {
+    pub memory_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
+    pub memory_range_count: usize,
+    pub memory_ranges_truncated: bool,
+    pub reserved_ranges: [DiagnosticRange; MAX_DIAGNOSTIC_RANGES],
+    pub reserved_range_count: usize,
+    pub reserved_ranges_truncated: bool,
+    pub initrd_start: Option<u64>,
+    pub initrd_end: Option<u64>,
+    pub bootargs_len: usize,
+    pub bootargs_truncated: bool,
+    pub interrupt_controller_path: DtbPath,
+    pub interrupt_controller_base: Option<u64>,
+    pub interrupt_controller_compatible: DtbPath,
+    pub l2_interrupt_controller_path: DtbPath,
+    pub l2_interrupt_controller_base: Option<u64>,
+    pub l2_interrupt_controller_compatible: DtbPath,
+    pub gic_path: DtbPath,
+    pub gic_compatible: DtbPath,
+    pub gic_dist_base: Option<u64>,
+    pub gic_redist_base: Option<u64>,
+    pub psci_conduit: DiagnosticPsciConduit,
+    pub cpu_bitmap: u64,
+    pub pcie_controllers: [DiagnosticPcieController; MAX_DIAGNOSTIC_PCIE_CONTROLLERS],
+    pub pcie_controller_count: usize,
+    pub pcie_controllers_truncated: bool,
+    pub rp1_controller_index: Option<usize>,
+    pub rp1_node_path: DtbPath,
+}
+
+impl Default for PlatformDtbDiagnostics {
+    fn default() -> Self {
+        Self {
+            memory_ranges: [DiagnosticRange::default(); MAX_DIAGNOSTIC_RANGES],
+            memory_range_count: 0,
+            memory_ranges_truncated: false,
+            reserved_ranges: [DiagnosticRange::default(); MAX_DIAGNOSTIC_RANGES],
+            reserved_range_count: 0,
+            reserved_ranges_truncated: false,
+            initrd_start: None,
+            initrd_end: None,
+            bootargs_len: 0,
+            bootargs_truncated: false,
+            interrupt_controller_path: DtbPath::empty(),
+            interrupt_controller_base: None,
+            interrupt_controller_compatible: DtbPath::empty(),
+            l2_interrupt_controller_path: DtbPath::empty(),
+            l2_interrupt_controller_base: None,
+            l2_interrupt_controller_compatible: DtbPath::empty(),
+            gic_path: DtbPath::empty(),
+            gic_compatible: DtbPath::empty(),
+            gic_dist_base: None,
+            gic_redist_base: None,
+            psci_conduit: DiagnosticPsciConduit::None,
+            cpu_bitmap: 0,
+            pcie_controllers: [DiagnosticPcieController::default();
+                MAX_DIAGNOSTIC_PCIE_CONTROLLERS],
+            pcie_controller_count: 0,
+            pcie_controllers_truncated: false,
+            rp1_controller_index: None,
+            rp1_node_path: DtbPath::empty(),
+        }
+    }
+}
+
 impl PlatformDtbInfo {
     pub const fn has_initrd(&self) -> bool {
         matches!((self.initrd_start, self.initrd_end), (Some(start), Some(end)) if end > start)
     }
+}
+
+pub fn plan_rpi5_stage1_kernel_memory(
+    info: &PlatformDtbDiagnostics,
+    kernel: Stage1KernelRange,
+    dtb: Stage1KernelRange,
+) -> Result<Stage1KernelPlan, Stage1KernelPlanFailure> {
+    if kernel.is_empty() {
+        return Err(Stage1KernelPlanFailure::InvalidKernelRange);
+    }
+    if dtb.is_empty() {
+        return Err(Stage1KernelPlanFailure::InvalidDtbRange);
+    }
+    if info.memory_ranges_truncated || info.reserved_ranges_truncated {
+        return Err(Stage1KernelPlanFailure::FirmwareRangesTruncated);
+    }
+
+    let mut plan = Stage1KernelPlan::default();
+    append_stage1_reserved(
+        &mut plan,
+        Stage1KernelRange::new(0, RPI5_FIRMWARE_LOW_RESERVED_END),
+    )?;
+    append_stage1_reserved(&mut plan, kernel)?;
+    append_stage1_reserved(&mut plan, dtb)?;
+    for (index, range) in info.reserved_ranges[..info.reserved_range_count]
+        .iter()
+        .enumerate()
+    {
+        if range.size == 0 {
+            plan.zero_reserved_skipped[plan.zero_reserved_skipped_count] = index;
+            plan.zero_reserved_skipped_count += 1;
+            continue;
+        }
+        append_stage1_reserved(
+            &mut plan,
+            Stage1KernelRange::new(
+                range.start,
+                range
+                    .start
+                    .checked_add(range.size)
+                    .ok_or(Stage1KernelPlanFailure::AddressOverflow)?,
+            ),
+        )?;
+    }
+    if let (Some(start), Some(end)) = (info.initrd_start, info.initrd_end) {
+        if start == 0 || end <= start {
+            return Err(Stage1KernelPlanFailure::InvalidDtbRange);
+        }
+        let reservation = Stage1KernelRange::new(
+            align_down_u64_policy(start, STAGE1_PAGE_SIZE),
+            align_up_u64_policy(end, STAGE1_PAGE_SIZE)
+                .ok_or(Stage1KernelPlanFailure::AddressOverflow)?,
+        );
+        let inside_ram = info.memory_ranges[..info.memory_range_count]
+            .iter()
+            .filter(|range| range.size != 0)
+            .any(|range| {
+                range
+                    .start
+                    .checked_add(range.size)
+                    .is_some_and(|ram_end| range.start <= start && ram_end >= end)
+            });
+        if !inside_ram
+            || plan.reserved_ranges[..plan.reserved_range_count]
+                .iter()
+                .any(|reserved| reservation.overlaps(*reserved))
+        {
+            return Err(Stage1KernelPlanFailure::InvalidDtbRange);
+        }
+        append_stage1_reserved(&mut plan, reservation)?;
+        plan.initrd_reservation = Some(reservation);
+    }
+
+    let mut free = [Stage1KernelRange::default(); MAX_STAGE1_KERNEL_USABLE_RANGES];
+    let mut free_count = 0usize;
+    for range in &info.memory_ranges[..info.memory_range_count] {
+        if range.size == 0 {
+            continue;
+        }
+        append_stage1_range(
+            &mut free,
+            &mut free_count,
+            Stage1KernelRange::new(
+                range.start,
+                range
+                    .start
+                    .checked_add(range.size)
+                    .ok_or(Stage1KernelPlanFailure::AddressOverflow)?,
+            ),
+        )?;
+    }
+    for reserved in &plan.reserved_ranges[..plan.reserved_range_count] {
+        subtract_stage1_range(&mut free, &mut free_count, *reserved)?;
+    }
+
+    plan.page_table_pool = allocate_stage1_range(
+        &mut free,
+        &mut free_count,
+        STAGE1_PT_POOL_SIZE,
+        STAGE1_ALLOCATION_ALIGNMENT,
+    )
+    .ok_or(Stage1KernelPlanFailure::NoPageTablePool)?;
+    plan.early_heap = allocate_stage1_range(
+        &mut free,
+        &mut free_count,
+        STAGE1_EARLY_HEAP_SIZE,
+        STAGE1_ALLOCATION_ALIGNMENT,
+    )
+    .ok_or(Stage1KernelPlanFailure::NoEarlyHeap)?;
+    plan.usable_ranges[..free_count].copy_from_slice(&free[..free_count]);
+    plan.usable_range_count = free_count;
+    Ok(plan)
+}
+
+pub fn plan_rpi5_stage1_allocator_handoff(
+    info: &PlatformDtbDiagnostics,
+    kernel_plan: &Stage1KernelPlan,
+) -> Result<Stage1AllocatorPlan, Stage1AllocatorPlanFailure> {
+    let mut plan = Stage1AllocatorPlan::default();
+    for (index, range) in kernel_plan.reserved_ranges[..kernel_plan.reserved_range_count]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let reason = match index {
+            0 => Stage1AllocatorReservationReason::LowFirmware,
+            1 => Stage1AllocatorReservationReason::Kernel,
+            2 => Stage1AllocatorReservationReason::Dtb,
+            _ if Some(range) == kernel_plan.initrd_reservation => {
+                Stage1AllocatorReservationReason::Initrd
+            }
+            _ => Stage1AllocatorReservationReason::FirmwareReserved,
+        };
+        append_stage1_allocator_reserved(&mut plan, range, reason)?;
+    }
+    append_stage1_allocator_reserved(
+        &mut plan,
+        kernel_plan.page_table_pool,
+        Stage1AllocatorReservationReason::PageTablePool,
+    )?;
+    append_stage1_allocator_reserved(
+        &mut plan,
+        kernel_plan.early_heap,
+        Stage1AllocatorReservationReason::EarlyHeap,
+    )?;
+
+    let mut free = [Stage1KernelRange::default(); MAX_STAGE1_ALLOC_USABLE_RANGES];
+    let mut free_count = 0usize;
+    for range in &info.memory_ranges[..info.memory_range_count] {
+        if range.size == 0 {
+            continue;
+        }
+        append_stage1_allocator_usable(
+            &mut free,
+            &mut free_count,
+            Stage1KernelRange::new(
+                range.start,
+                range
+                    .start
+                    .checked_add(range.size)
+                    .ok_or(Stage1AllocatorPlanFailure::AddressOverflow)?,
+            ),
+        )?;
+    }
+    for reserved in &plan.reserved[..plan.reserved_count] {
+        subtract_stage1_allocator_range(&mut free, &mut free_count, reserved.range)?;
+    }
+
+    let mut aligned_count = 0usize;
+    for range in free[..free_count].iter().copied() {
+        let start = align_up_u64_policy(range.start, STAGE1_PAGE_SIZE)
+            .ok_or(Stage1AllocatorPlanFailure::AddressOverflow)?;
+        let end = align_down_u64_policy(range.end, STAGE1_PAGE_SIZE);
+        if end <= start {
+            continue;
+        }
+        plan.usable[aligned_count] = Stage1KernelRange::new(start, end);
+        aligned_count += 1;
+    }
+    plan.usable_count = aligned_count;
+    sort_stage1_ranges(&mut plan.usable, plan.usable_count);
+    for usable in &plan.usable[..plan.usable_count] {
+        if plan.reserved[..plan.reserved_count]
+            .iter()
+            .any(|reserved| usable.overlaps(reserved.range))
+        {
+            return Err(Stage1AllocatorPlanFailure::UsableOverlapsReserved);
+        }
+        plan.total_pages = plan
+            .total_pages
+            .checked_add((usable.end - usable.start) / STAGE1_PAGE_SIZE)
+            .ok_or(Stage1AllocatorPlanFailure::AddressOverflow)?;
+    }
+    if plan.total_pages == 0 {
+        return Err(Stage1AllocatorPlanFailure::NoUsableFrames);
+    }
+    Ok(plan)
+}
+
+fn append_stage1_allocator_reserved(
+    plan: &mut Stage1AllocatorPlan,
+    range: Stage1KernelRange,
+    reason: Stage1AllocatorReservationReason,
+) -> Result<(), Stage1AllocatorPlanFailure> {
+    if range.is_empty()
+        || plan.reserved[..plan.reserved_count]
+            .iter()
+            .any(|existing| existing.range == range)
+    {
+        return Ok(());
+    }
+    if plan.reserved_count == plan.reserved.len() {
+        return Err(Stage1AllocatorPlanFailure::ReservedCapacity);
+    }
+    plan.reserved[plan.reserved_count] = Stage1AllocatorReservation { range, reason };
+    plan.reserved_count += 1;
+    Ok(())
+}
+
+fn append_stage1_allocator_usable<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    range: Stage1KernelRange,
+) -> Result<(), Stage1AllocatorPlanFailure> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    if *count == N {
+        return Err(Stage1AllocatorPlanFailure::UsableCapacity);
+    }
+    ranges[*count] = range;
+    *count += 1;
+    Ok(())
+}
+
+fn subtract_stage1_allocator_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    reserved: Stage1KernelRange,
+) -> Result<(), Stage1AllocatorPlanFailure> {
+    let mut index = 0usize;
+    while index < *count {
+        let current = ranges[index];
+        if !current.overlaps(reserved) {
+            index += 1;
+            continue;
+        }
+        let left = Stage1KernelRange::new(current.start, current.end.min(reserved.start));
+        let right = Stage1KernelRange::new(current.start.max(reserved.end), current.end);
+        if left.is_empty() {
+            ranges[index] = right;
+            if right.is_empty() {
+                ranges.copy_within(index + 1..*count, index);
+                *count -= 1;
+            } else {
+                index += 1;
+            }
+        } else {
+            ranges[index] = left;
+            index += 1;
+            if !right.is_empty() {
+                append_stage1_allocator_usable(ranges, count, right)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sort_stage1_ranges<const N: usize>(ranges: &mut [Stage1KernelRange; N], count: usize) {
+    for index in 1..count {
+        let current = ranges[index];
+        let mut position = index;
+        while position > 0 && ranges[position - 1].start > current.start {
+            ranges[position] = ranges[position - 1];
+            position -= 1;
+        }
+        ranges[position] = current;
+    }
+}
+
+pub fn plan_rpi5_stage1_identity_map(
+    info: &PlatformDtbDiagnostics,
+    kernel_plan: &Stage1KernelPlan,
+    kernel: Stage1KernelRange,
+    current_stack: Stage1KernelRange,
+    dtb: Stage1KernelRange,
+    uart_base: u64,
+) -> Result<Stage1MmuPlan, Stage1MmuPlanFailure> {
+    if kernel_plan.page_table_pool.start % STAGE1_PAGE_SIZE != 0
+        || kernel_plan.page_table_pool.end % STAGE1_PAGE_SIZE != 0
+        || kernel_plan
+            .page_table_pool
+            .end
+            .saturating_sub(kernel_plan.page_table_pool.start)
+            < STAGE1_MMU_MIN_TABLE_PAGES * STAGE1_PAGE_SIZE
+    {
+        return Err(Stage1MmuPlanFailure::InvalidPageTablePool);
+    }
+
+    let mut plan = Stage1MmuPlan {
+        pt_pool: kernel_plan.page_table_pool,
+        ..Stage1MmuPlan::default()
+    };
+    for range in &info.memory_ranges[..info.memory_range_count] {
+        if range.size == 0 {
+            continue;
+        }
+        let start = align_down_u64_policy(range.start, STAGE1_PAGE_SIZE);
+        let raw_end = range
+            .start
+            .checked_add(range.size)
+            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?;
+        let end = align_up_u64_policy(raw_end, STAGE1_PAGE_SIZE)
+            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?;
+        append_stage1_mmu_mapping(
+            &mut plan,
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(start, end),
+                memory_type: Stage1MmuMemoryType::Normal,
+            },
+        )?;
+    }
+    let uart_page = Stage1KernelRange::new(
+        align_down_u64_policy(uart_base, STAGE1_PAGE_SIZE),
+        align_down_u64_policy(uart_base, STAGE1_PAGE_SIZE)
+            .checked_add(STAGE1_PAGE_SIZE)
+            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+    );
+    append_stage1_mmu_mapping(
+        &mut plan,
+        Stage1MmuMapping {
+            range: uart_page,
+            memory_type: Stage1MmuMemoryType::DeviceNgnre,
+        },
+    )?;
+    if let Some(base) = info.gic_dist_base {
+        let page_start = align_down_u64_policy(base, STAGE1_PAGE_SIZE);
+        append_stage1_mmu_mapping(
+            &mut plan,
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(
+                    page_start,
+                    page_start
+                        .checked_add(STAGE1_PAGE_SIZE)
+                        .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+                ),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            },
+        )?;
+    }
+    if let Some(base) = info.gic_redist_base {
+        for index in 0..RPI5_STAGE1_GICR_SCAN_FRAMES {
+            let candidate = base
+                .checked_add(
+                    (index as u64)
+                        .checked_mul(RPI5_STAGE1_GICR_FRAME_STRIDE)
+                        .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+                )
+                .ok_or(Stage1MmuPlanFailure::AddressOverflow)?;
+            let page_start = align_down_u64_policy(candidate, STAGE1_PAGE_SIZE);
+            append_stage1_mmu_mapping(
+                &mut plan,
+                Stage1MmuMapping {
+                    range: Stage1KernelRange::new(
+                        page_start,
+                        page_start
+                            .checked_add(STAGE1_PAGE_SIZE)
+                            .ok_or(Stage1MmuPlanFailure::AddressOverflow)?,
+                    ),
+                    memory_type: Stage1MmuMemoryType::DeviceNgnre,
+                },
+            )?;
+        }
+    }
+
+    for (index, mapping) in plan.mappings[..plan.mapping_count].iter().enumerate() {
+        if mapping.range.end > STAGE1_TTBR0_VA_LIMIT {
+            return Err(Stage1MmuPlanFailure::AddressOutsideTtbr0);
+        }
+        for other in &plan.mappings[index + 1..plan.mapping_count] {
+            if mapping.memory_type != other.memory_type && mapping.range.overlaps(other.range) {
+                return Err(Stage1MmuPlanFailure::AttributeOverlap);
+            }
+        }
+    }
+    for (range, failure) in [
+        (kernel, Stage1MmuPlanFailure::KernelNotMapped),
+        (current_stack, Stage1MmuPlanFailure::CurrentStackNotMapped),
+        (dtb, Stage1MmuPlanFailure::DtbNotMapped),
+        (
+            kernel_plan.page_table_pool,
+            Stage1MmuPlanFailure::PageTablePoolNotMapped,
+        ),
+        (
+            kernel_plan.early_heap,
+            Stage1MmuPlanFailure::EarlyHeapNotMapped,
+        ),
+    ] {
+        if !stage1_mmu_normal_mapping_contains(&plan, range) {
+            return Err(failure);
+        }
+    }
+    Ok(plan)
+}
+
+pub fn plan_rpi5_high_half_transition(
+    ttbr0_root: u64,
+    ttbr1_root: u64,
+    kernel: Stage1KernelRange,
+    stack: Stage1KernelRange,
+    vector: Stage1KernelRange,
+    page_tables: Stage1KernelRange,
+    dtb: Stage1KernelRange,
+    heap: Stage1KernelRange,
+    uart_base: u64,
+) -> Result<Rpi5HighHalfPlan, Rpi5HighHalfPlanFailure> {
+    if ttbr0_root == 0 || ttbr0_root % STAGE1_PAGE_SIZE != 0 {
+        return Err(Rpi5HighHalfPlanFailure::InvalidTtbr0Root);
+    }
+    if ttbr1_root == 0 || ttbr1_root % STAGE1_PAGE_SIZE != 0 {
+        return Err(Rpi5HighHalfPlanFailure::MissingTtbr1Root);
+    }
+    if ttbr0_root == ttbr1_root {
+        return Err(Rpi5HighHalfPlanFailure::SharedRoots);
+    }
+
+    // T0SZ/T1SZ=25 selects two 39-bit translation regions. Both walks use
+    // 4 KiB granules, inner-shareable WB/WA table walks, and a 40-bit PA.
+    const HH_TCR_EL1: u64 = 0x0000_0002_b519_3519;
+    const HH_MAIR_EL1: u64 = 0x04ff;
+    let mut plan = Rpi5HighHalfPlan {
+        ttbr0_root,
+        ttbr1_root,
+        tcr_el1: HH_TCR_EL1,
+        mair_el1: HH_MAIR_EL1,
+        ..Rpi5HighHalfPlan::default()
+    };
+    for physical in [kernel, stack, vector, page_tables, dtb, heap] {
+        append_rpi5_high_half_mapping(
+            &mut plan,
+            high_half_mapping(physical, Stage1MmuMemoryType::Normal)?,
+        )?;
+    }
+    let uart_start = align_down_u64_policy(uart_base, STAGE1_PAGE_SIZE);
+    let uart = Stage1KernelRange::new(
+        uart_start,
+        uart_start
+            .checked_add(STAGE1_PAGE_SIZE)
+            .ok_or(Rpi5HighHalfPlanFailure::AddressOverflow)?,
+    );
+    append_rpi5_high_half_mapping(
+        &mut plan,
+        high_half_mapping(uart, Stage1MmuMemoryType::DeviceNgnre)?,
+    )?;
+    Ok(plan)
+}
+
+fn high_half_mapping(
+    physical: Stage1KernelRange,
+    memory_type: Stage1MmuMemoryType,
+) -> Result<Rpi5HighHalfMapping, Rpi5HighHalfPlanFailure> {
+    if physical.start >= physical.end
+        || physical.start % STAGE1_PAGE_SIZE != 0
+        || physical.end % STAGE1_PAGE_SIZE != 0
+    {
+        return Err(Rpi5HighHalfPlanFailure::InvalidRange);
+    }
+    let virtual_start = checked_phys_to_rpi5_kernel_virt(physical.start)
+        .ok_or(Rpi5HighHalfPlanFailure::AddressOverflow)?;
+    let virtual_end = checked_phys_to_rpi5_kernel_virt(physical.end)
+        .ok_or(Rpi5HighHalfPlanFailure::AddressOverflow)?;
+    Ok(Rpi5HighHalfMapping {
+        physical,
+        virtual_range: Stage1KernelRange::new(virtual_start, virtual_end),
+        memory_type,
+    })
+}
+
+fn append_rpi5_high_half_mapping(
+    plan: &mut Rpi5HighHalfPlan,
+    mapping: Rpi5HighHalfMapping,
+) -> Result<(), Rpi5HighHalfPlanFailure> {
+    if plan.mapping_count == plan.mappings.len() {
+        return Err(Rpi5HighHalfPlanFailure::MappingCapacity);
+    }
+    for existing in &plan.mappings[..plan.mapping_count] {
+        if existing.virtual_range.overlaps(mapping.virtual_range)
+            && existing.memory_type != mapping.memory_type
+        {
+            return Err(Rpi5HighHalfPlanFailure::AttributeOverlap);
+        }
+    }
+    plan.mappings[plan.mapping_count] = mapping;
+    plan.mapping_count += 1;
+    Ok(())
+}
+
+pub const fn rpi5_stage1_timer_delta(begin: u64, end: u64) -> Option<u64> {
+    match end.checked_sub(begin) {
+        Some(0) | None => None,
+        Some(delta) => Some(delta),
+    }
+}
+
+pub const fn rpi5_stage1_gicr_typer_plausible(typer: u64) -> bool {
+    typer != 0 && typer != u64::MAX
+}
+
+pub fn build_rpi5_stage1_kernel_bootstrap_record(
+    info: &PlatformDtbDiagnostics,
+    allocator_plan: &Stage1AllocatorPlan,
+    uart_base: u64,
+    frame_total_pages: u64,
+    frame_free_pages: u64,
+    trap_vector_base: u64,
+) -> Option<Stage1KernelBootstrapRecord> {
+    if uart_base == 0
+        || trap_vector_base == 0
+        || info.memory_range_count == 0
+        || info.memory_ranges_truncated
+        || allocator_plan.reserved_count == 0
+        || frame_total_pages == 0
+        || frame_free_pages > frame_total_pages
+        || info.cpu_bitmap & 1 == 0
+    {
+        return None;
+    }
+    let mut reserved_ranges = [Stage1KernelRange::default(); MAX_STAGE1_ALLOC_RESERVED_RANGES];
+    for (slot, reservation) in reserved_ranges
+        .iter_mut()
+        .zip(&allocator_plan.reserved[..allocator_plan.reserved_count])
+    {
+        *slot = reservation.range;
+    }
+    Some(Stage1KernelBootstrapRecord {
+        uart_base,
+        memory_ranges: info.memory_ranges,
+        memory_range_count: info.memory_range_count,
+        reserved_ranges,
+        reserved_range_count: allocator_plan.reserved_count,
+        frame_total_pages,
+        frame_free_pages,
+        cpu_bitmap: info.cpu_bitmap,
+        effective_cpu_count: 1,
+        psci_conduit: info.psci_conduit,
+        gic_dist_base: info.gic_dist_base,
+        gic_redist_base: info.gic_redist_base,
+        trap_vector_base,
+        initrd_present: info.initrd_start.is_some() && info.initrd_end.is_some(),
+    })
+}
+
+pub fn plan_rpi5_stage2a_initrd(
+    info: &PlatformDtbDiagnostics,
+    allocator_plan: &Stage1AllocatorPlan,
+) -> Result<Stage2AInitrdPlan, Stage2AInitrdFailure> {
+    let (start, end) = match (info.initrd_start, info.initrd_end) {
+        (None, None) => return Err(Stage2AInitrdFailure::Missing),
+        (Some(start), Some(end)) => (start, end),
+        _ => return Err(Stage2AInitrdFailure::IncompleteProperties),
+    };
+    if start == 0 || end <= start {
+        return Err(Stage2AInitrdFailure::InvalidRange);
+    }
+    let byte_range = Stage1KernelRange::new(start, end);
+    let inside_ram = info.memory_ranges[..info.memory_range_count]
+        .iter()
+        .filter(|range| range.size != 0)
+        .any(|range| {
+            range
+                .start
+                .checked_add(range.size)
+                .is_some_and(|ram_end| range.start <= start && ram_end >= end)
+        });
+    if !inside_ram {
+        return Err(Stage2AInitrdFailure::OutsideFirmwareRam);
+    }
+    let reservation = Stage1KernelRange::new(
+        align_down_u64_policy(start, STAGE1_PAGE_SIZE),
+        align_up_u64_policy(end, STAGE1_PAGE_SIZE).ok_or(Stage2AInitrdFailure::AddressOverflow)?,
+    );
+    if allocator_plan.reserved[..allocator_plan.reserved_count]
+        .iter()
+        .any(|reserved| {
+            reserved.reason != Stage1AllocatorReservationReason::Initrd
+                && reservation.overlaps(reserved.range)
+        })
+    {
+        return Err(Stage2AInitrdFailure::OverlapsReserved);
+    }
+    Ok(Stage2AInitrdPlan {
+        byte_range,
+        reservation,
+    })
+}
+
+pub fn rpi5_stage2a_cpio_first_name(archive: &[u8]) -> Result<&[u8], Stage2ACpioFailure> {
+    const NEWC_HEADER_LEN: usize = 110;
+    const MAX_FIRST_NAME: usize = 96;
+    let header = archive
+        .get(..NEWC_HEADER_LEN)
+        .ok_or(Stage2ACpioFailure::HeaderTruncated)?;
+    if &header[..6] != b"070701" {
+        return Err(Stage2ACpioFailure::BadMagic);
+    }
+    let file_size = parse_newc_hex(&header[54..62])?;
+    let name_size = parse_newc_hex(&header[94..102])?;
+    if name_size == 0 || name_size > MAX_FIRST_NAME {
+        return Err(Stage2ACpioFailure::InvalidNameSize);
+    }
+    let name_end = NEWC_HEADER_LEN
+        .checked_add(name_size)
+        .ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    let name_with_nul = archive
+        .get(NEWC_HEADER_LEN..name_end)
+        .ok_or(Stage2ACpioFailure::NameTruncated)?;
+    if name_with_nul.last() != Some(&0) {
+        return Err(Stage2ACpioFailure::NameNotTerminated);
+    }
+    let data_start =
+        align_up_usize_policy(name_end, 4).ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    let data_end = data_start
+        .checked_add(file_size)
+        .ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    if data_end > archive.len() {
+        return Err(Stage2ACpioFailure::EntryTruncated);
+    }
+    Ok(&name_with_nul[..name_with_nul.len() - 1])
+}
+
+pub fn rpi5_stage2b_find_init(archive: &[u8]) -> Result<Stage2BCpioFile, Stage2BCpioLookupFailure> {
+    const NEWC_HEADER_LEN: usize = 110;
+    let mut offset = 0usize;
+    for _ in 0..MAX_STAGE2B_CPIO_ENTRIES {
+        let header = archive
+            .get(offset..offset.saturating_add(NEWC_HEADER_LEN))
+            .ok_or(Stage2BCpioLookupFailure::HeaderTruncated)?;
+        if &header[..6] != b"070701" {
+            return Err(Stage2BCpioLookupFailure::BadMagic);
+        }
+        let file_size = parse_newc_hex(
+            header
+                .get(54..62)
+                .ok_or(Stage2BCpioLookupFailure::HeaderTruncated)?,
+        )
+        .map_err(stage2b_cpio_hex_failure)?;
+        let name_size = parse_newc_hex(
+            header
+                .get(94..102)
+                .ok_or(Stage2BCpioLookupFailure::HeaderTruncated)?,
+        )
+        .map_err(stage2b_cpio_hex_failure)?;
+        if name_size == 0 || name_size > MAX_STAGE2B_CPIO_NAME {
+            return Err(Stage2BCpioLookupFailure::InvalidNameSize);
+        }
+        let name_start = offset
+            .checked_add(NEWC_HEADER_LEN)
+            .ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        let name_end = name_start
+            .checked_add(name_size)
+            .ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        let name_with_nul = archive
+            .get(name_start..name_end)
+            .ok_or(Stage2BCpioLookupFailure::NameTruncated)?;
+        if name_with_nul.last() != Some(&0) {
+            return Err(Stage2BCpioLookupFailure::NameNotTerminated);
+        }
+        let name = &name_with_nul[..name_with_nul.len() - 1];
+        let data_offset =
+            align_up_usize_policy(name_end, 4).ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        let data_end = data_offset
+            .checked_add(file_size)
+            .ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        if data_end > archive.len() {
+            return Err(Stage2BCpioLookupFailure::EntryTruncated);
+        }
+        if name == b"init" || name == b"/init" {
+            return Ok(Stage2BCpioFile {
+                data_offset,
+                size: file_size,
+            });
+        }
+        if name == b"TRAILER!!!" {
+            return Err(Stage2BCpioLookupFailure::NotFound);
+        }
+        offset =
+            align_up_usize_policy(data_end, 4).ok_or(Stage2BCpioLookupFailure::EntryTruncated)?;
+        if offset == archive.len() {
+            return Err(Stage2BCpioLookupFailure::MissingTrailer);
+        }
+    }
+    Err(Stage2BCpioLookupFailure::EntryLimit)
+}
+
+fn stage2b_cpio_hex_failure(failure: Stage2ACpioFailure) -> Stage2BCpioLookupFailure {
+    match failure {
+        Stage2ACpioFailure::InvalidHex => Stage2BCpioLookupFailure::InvalidHex,
+        _ => Stage2BCpioLookupFailure::EntryTruncated,
+    }
+}
+
+pub fn plan_rpi5_stage2b_init_elf(elf: &[u8]) -> Result<Stage2BElfLoadPlan, Stage2BElfFailure> {
+    const ELF64_HEADER_SIZE: usize = 64;
+    const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
+    const PT_LOAD: u32 = 1;
+    const PF_X: u32 = 1;
+    const PF_W: u32 = 2;
+
+    let header = elf
+        .get(..ELF64_HEADER_SIZE)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    if &header[..4] != b"\x7fELF" {
+        return Err(Stage2BElfFailure::BadMagic);
+    }
+    if header[4] != 2 {
+        return Err(Stage2BElfFailure::WrongClass);
+    }
+    if header[5] != 1 {
+        return Err(Stage2BElfFailure::WrongEndian);
+    }
+    if header[6] != 1 || read_le_u32(header, 20)? != 1 {
+        return Err(Stage2BElfFailure::WrongVersion);
+    }
+    if read_le_u16(header, 16)? != 2 {
+        return Err(Stage2BElfFailure::WrongType);
+    }
+    if read_le_u16(header, 18)? != 183 {
+        return Err(Stage2BElfFailure::WrongMachine);
+    }
+    let entry = read_le_u64(header, 24)?;
+    if entry == 0 {
+        return Err(Stage2BElfFailure::InvalidEntry);
+    }
+    let program_offset = usize::try_from(read_le_u64(header, 32)?)
+        .map_err(|_| Stage2BElfFailure::ProgramHeadersOutOfBounds)?;
+    let program_entry_size = read_le_u16(header, 54)? as usize;
+    let program_count = read_le_u16(header, 56)? as usize;
+    if program_entry_size != ELF64_PROGRAM_HEADER_SIZE || program_count == 0 {
+        return Err(Stage2BElfFailure::InvalidProgramHeaderSize);
+    }
+    let program_bytes = program_entry_size
+        .checked_mul(program_count)
+        .and_then(|size| program_offset.checked_add(size))
+        .ok_or(Stage2BElfFailure::ProgramHeadersOutOfBounds)?;
+    if program_bytes > elf.len() {
+        return Err(Stage2BElfFailure::ProgramHeadersOutOfBounds);
+    }
+
+    let mut plan = Stage2BElfLoadPlan {
+        entry,
+        ..Stage2BElfLoadPlan::default()
+    };
+    let mut entry_is_executable = false;
+    for index in 0..program_count {
+        let offset = program_offset + index * program_entry_size;
+        let program = &elf[offset..offset + program_entry_size];
+        if read_le_u32(program, 0)? != PT_LOAD {
+            continue;
+        }
+        if plan.segment_count == plan.segments.len() {
+            return Err(Stage2BElfFailure::TooManyLoadSegments);
+        }
+        let flags = read_le_u32(program, 4)?;
+        let file_offset = read_le_u64(program, 8)?;
+        let vaddr = read_le_u64(program, 16)?;
+        let file_size = read_le_u64(program, 32)?;
+        let mem_size = read_le_u64(program, 40)?;
+        let alignment = read_le_u64(program, 48)?;
+        if mem_size == 0
+            || file_size > mem_size
+            || vaddr.checked_add(mem_size).is_none()
+            || file_offset
+                .checked_add(file_size)
+                .is_none_or(|end| end > elf.len() as u64)
+            || (alignment > 1
+                && (!alignment.is_power_of_two() || file_offset % alignment != vaddr % alignment))
+        {
+            return Err(Stage2BElfFailure::InvalidLoadSegment);
+        }
+        if flags & (PF_W | PF_X) == (PF_W | PF_X) {
+            return Err(Stage2BElfFailure::WritableExecutableSegment);
+        }
+        if flags & PF_X != 0 && entry >= vaddr && entry < vaddr + mem_size {
+            entry_is_executable = true;
+        }
+        plan.segments[plan.segment_count] = Stage2BElfLoadSegment {
+            vaddr,
+            mem_size,
+            file_size,
+            file_offset,
+            flags,
+        };
+        plan.segment_count += 1;
+    }
+    if plan.segment_count == 0 {
+        return Err(Stage2BElfFailure::InvalidLoadSegment);
+    }
+    if !entry_is_executable {
+        return Err(Stage2BElfFailure::EntryNotExecutable);
+    }
+    Ok(plan)
+}
+
+pub fn plan_rpi5_stage2c_init_task(
+    elf_plan: &Stage2BElfLoadPlan,
+) -> Result<Stage2CTaskPlan, Stage2CTaskPlanFailure> {
+    const PF_X: u32 = 1;
+    const PF_W: u32 = 2;
+    if elf_plan.segment_count == 0 {
+        return Err(Stage2CTaskPlanFailure::NoSegments);
+    }
+    let stack_size = RPI5_STAGE2C_STACK_PAGES
+        .checked_mul(STAGE1_PAGE_SIZE)
+        .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?;
+    let stack_range = Stage1KernelRange::new(
+        RPI5_STAGE2C_STACK_TOP
+            .checked_sub(stack_size)
+            .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?,
+        RPI5_STAGE2C_STACK_TOP,
+    );
+    let mut plan = Stage2CTaskPlan {
+        entry: elf_plan.entry,
+        stack_range,
+        stack_pointer: RPI5_STAGE2C_STACK_TOP,
+        ..Stage2CTaskPlan::default()
+    };
+    let mut entry_is_executable = false;
+    for (index, segment) in elf_plan.segments[..elf_plan.segment_count]
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let permission = match (segment.flags & PF_W != 0, segment.flags & PF_X != 0) {
+            (false, true) => Stage2CUserPermission::ReadExecute,
+            (true, false) => Stage2CUserPermission::ReadWrite,
+            _ => return Err(Stage2CTaskPlanFailure::InvalidPermission),
+        };
+        let segment_end = segment
+            .vaddr
+            .checked_add(segment.mem_size)
+            .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?;
+        let page_range = Stage1KernelRange::new(
+            align_down_u64_policy(segment.vaddr, STAGE1_PAGE_SIZE),
+            align_up_u64_policy(segment_end, STAGE1_PAGE_SIZE)
+                .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?,
+        );
+        if page_range.overlaps(stack_range) {
+            return Err(Stage2CTaskPlanFailure::StackOverlap);
+        }
+        if plan.segments[..plan.segment_count]
+            .iter()
+            .any(|existing| existing.page_range.overlaps(page_range))
+        {
+            return Err(Stage2CTaskPlanFailure::SegmentOverlap);
+        }
+        let bss_start = segment
+            .vaddr
+            .checked_add(segment.file_size)
+            .ok_or(Stage2CTaskPlanFailure::AddressOverflow)?;
+        let bss_range = (segment.mem_size > segment.file_size)
+            .then_some(Stage1KernelRange::new(bss_start, segment_end));
+        if permission == Stage2CUserPermission::ReadExecute
+            && elf_plan.entry >= segment.vaddr
+            && elf_plan.entry < segment_end
+        {
+            entry_is_executable = true;
+        }
+        plan.segments[index] = Stage2CSegmentPlan {
+            page_range,
+            bss_range,
+            permission,
+        };
+        plan.segment_count += 1;
+    }
+    if !entry_is_executable {
+        return Err(Stage2CTaskPlanFailure::EntryNotExecutable);
+    }
+    Ok(plan)
+}
+
+pub fn validate_rpi5_stage2d_enter_bridge(
+    state: Stage2DEnterBridgeState,
+) -> Result<(), Stage2DEnterBridgeFailure> {
+    if state.stage2c_root == 0 || state.stage2c_root & (STAGE1_PAGE_SIZE - 1) != 0 {
+        return Err(Stage2DEnterBridgeFailure::InvalidUserRoot);
+    }
+    if state.current_ttbr0 & 0x0000_ffff_ffff_f000 == state.stage2c_root {
+        return Err(Stage2DEnterBridgeFailure::RootAlreadyActive);
+    }
+    if state.trap_entry != state.task_entry || state.trap_entry == 0 {
+        return Err(Stage2DEnterBridgeFailure::TrapEntryMismatch);
+    }
+    if state.trap_stack_pointer != state.task_stack_pointer
+        || state.trap_stack_pointer == 0
+        || state.trap_stack_pointer & 0xf != 0
+    {
+        return Err(Stage2DEnterBridgeFailure::TrapStackMismatch);
+    }
+    const TCR_EPD1: u64 = 1 << 23;
+    const TTBR0_VA_LIMIT: u64 = 1 << 39;
+    if state.tcr_el1 & TCR_EPD1 != 0 || state.kernel_pc < TTBR0_VA_LIMIT {
+        return Err(Stage2DEnterBridgeFailure::TtbrSplitNotReady);
+    }
+    let current_tid = state
+        .current_tid
+        .ok_or(Stage2DEnterBridgeFailure::CurrentTaskMissing)?;
+    if current_tid != state.expected_tid {
+        return Err(Stage2DEnterBridgeFailure::CurrentTaskMismatch);
+    }
+    Ok(())
+}
+
+fn read_le_u16(bytes: &[u8], offset: usize) -> Result<u16, Stage2BElfFailure> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_le_u32(bytes: &[u8], offset: usize) -> Result<u32, Stage2BElfFailure> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_le_u64(bytes: &[u8], offset: usize) -> Result<u64, Stage2BElfFailure> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(Stage2BElfFailure::HeaderTruncated)?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
+}
+
+fn parse_newc_hex(bytes: &[u8]) -> Result<usize, Stage2ACpioFailure> {
+    let mut value = 0usize;
+    for byte in bytes {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as usize,
+            b'a'..=b'f' => (byte - b'a' + 10) as usize,
+            b'A'..=b'F' => (byte - b'A' + 10) as usize,
+            _ => return Err(Stage2ACpioFailure::InvalidHex),
+        };
+        value = value
+            .checked_mul(16)
+            .and_then(|current| current.checked_add(digit))
+            .ok_or(Stage2ACpioFailure::EntryTruncated)?;
+    }
+    Ok(value)
+}
+
+const fn align_up_usize_policy(value: usize, alignment: usize) -> Option<usize> {
+    match value.checked_add(alignment - 1) {
+        Some(added) => Some(added & !(alignment - 1)),
+        None => None,
+    }
+}
+
+fn append_stage1_mmu_mapping(
+    plan: &mut Stage1MmuPlan,
+    mapping: Stage1MmuMapping,
+) -> Result<(), Stage1MmuPlanFailure> {
+    if plan.mapping_count == plan.mappings.len() {
+        return Err(Stage1MmuPlanFailure::MappingCapacity);
+    }
+    plan.mappings[plan.mapping_count] = mapping;
+    plan.mapping_count += 1;
+    Ok(())
+}
+
+fn stage1_mmu_normal_mapping_contains(plan: &Stage1MmuPlan, range: Stage1KernelRange) -> bool {
+    !range.is_empty()
+        && plan.mappings[..plan.mapping_count].iter().any(|mapping| {
+            mapping.memory_type == Stage1MmuMemoryType::Normal
+                && mapping.range.start <= range.start
+                && mapping.range.end >= range.end
+        })
+}
+
+const fn align_down_u64_policy(value: u64, alignment: u64) -> u64 {
+    value & !(alignment - 1)
+}
+
+const fn align_up_u64_policy(value: u64, alignment: u64) -> Option<u64> {
+    match value.checked_add(alignment - 1) {
+        Some(added) => Some(added & !(alignment - 1)),
+        None => None,
+    }
+}
+
+fn append_stage1_reserved(
+    plan: &mut Stage1KernelPlan,
+    range: Stage1KernelRange,
+) -> Result<(), Stage1KernelPlanFailure> {
+    if plan.reserved_ranges[..plan.reserved_range_count].contains(&range) {
+        return Ok(());
+    }
+    if plan.reserved_range_count == plan.reserved_ranges.len() {
+        return Err(Stage1KernelPlanFailure::ReservedCapacity);
+    }
+    plan.reserved_ranges[plan.reserved_range_count] = range;
+    plan.reserved_range_count += 1;
+    Ok(())
+}
+
+fn append_stage1_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    range: Stage1KernelRange,
+) -> Result<(), Stage1KernelPlanFailure> {
+    if range.is_empty() {
+        return Ok(());
+    }
+    if *count == N {
+        return Err(Stage1KernelPlanFailure::UsableCapacity);
+    }
+    ranges[*count] = range;
+    *count += 1;
+    Ok(())
+}
+
+fn subtract_stage1_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    reserved: Stage1KernelRange,
+) -> Result<(), Stage1KernelPlanFailure> {
+    let mut index = 0usize;
+    while index < *count {
+        let current = ranges[index];
+        if !current.overlaps(reserved) {
+            index += 1;
+            continue;
+        }
+        let left = Stage1KernelRange::new(current.start, current.end.min(reserved.start));
+        let right = Stage1KernelRange::new(current.start.max(reserved.end), current.end);
+        if left.is_empty() {
+            ranges[index] = right;
+            if right.is_empty() {
+                ranges.copy_within(index + 1..*count, index);
+                *count -= 1;
+            } else {
+                index += 1;
+            }
+        } else {
+            ranges[index] = left;
+            index += 1;
+            if !right.is_empty() {
+                append_stage1_range(ranges, count, right)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn allocate_stage1_range<const N: usize>(
+    ranges: &mut [Stage1KernelRange; N],
+    count: &mut usize,
+    size: u64,
+    alignment: u64,
+) -> Option<Stage1KernelRange> {
+    for index in 0..*count {
+        let candidate_start = align_up_u64(ranges[index].start, alignment)?;
+        let candidate_end = candidate_start.checked_add(size)?;
+        if candidate_end > ranges[index].end {
+            continue;
+        }
+        let allocation = Stage1KernelRange::new(candidate_start, candidate_end);
+        subtract_stage1_range(ranges, count, allocation).ok()?;
+        return Some(allocation);
+    }
+    None
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    debug_assert!(alignment.is_power_of_two());
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+}
+
+pub fn parse_platform_dtb_diagnostics(bytes: &[u8]) -> Option<PlatformDtbDiagnostics> {
+    let blocks = blocks(bytes)?;
+    let mut out = PlatformDtbDiagnostics::default();
+    let mut walker = Walker::new(blocks);
+    let mut reserved_range = None;
+    let mut reserved_no_map = false;
+    let mut irq_candidate = false;
+    let mut irq_is_l2 = false;
+    let mut irq_is_gic = false;
+    let mut irq_compatible = DtbPath::empty();
+    let mut irq_path = DtbPath::empty();
+    let mut irq_reg = [DiagnosticRange::default(); 2];
+    let mut irq_reg_count = 0usize;
+    let mut pcie_controller_index = None;
+    let mut pcie_path = DtbPath::empty();
+    let mut pcie_base = None;
+    while let Some(event) = walker.next() {
+        match event {
+            Event::Begin { path, name } => {
+                if path.starts_with(b"/reserved-memory/") {
+                    reserved_range = None;
+                    reserved_no_map = false;
+                }
+                irq_candidate =
+                    name.starts_with(b"intc") || name.starts_with(b"interrupt-controller");
+                irq_is_l2 = false;
+                irq_is_gic = false;
+                irq_compatible = DtbPath::empty();
+                irq_path.set(path);
+                irq_reg_count = 0;
+                pcie_controller_index = None;
+                pcie_path.set(path);
+                pcie_base = None;
+                if is_pcie_node_name(name) {
+                    pcie_controller_index = ensure_pcie_controller(&mut out, pcie_path);
+                }
+                if path.starts_with(b"/cpus/")
+                    && let Some(cpu) = parse_cpu_id_from_node_name(name)
+                {
+                    out.cpu_bitmap |= 1u64 << cpu;
+                }
+                if name == b"rp1" && out.rp1_node_path.is_empty() {
+                    if let Some(parent) = direct_parent_path(path)
+                        && let Some(index) = find_pcie_controller(&out, parent)
+                    {
+                        out.rp1_controller_index = Some(index);
+                        out.rp1_node_path.set(path);
+                    }
+                }
+            }
+            Event::Property {
+                path,
+                name,
+                value,
+                parent_address_cells,
+                parent_size_cells,
+            } => {
+                if is_memory_path(path) && name == b"reg" {
+                    append_reg_ranges(
+                        &mut out.memory_ranges,
+                        &mut out.memory_range_count,
+                        &mut out.memory_ranges_truncated,
+                        value,
+                        parent_address_cells,
+                        parent_size_cells,
+                        false,
+                    )?;
+                }
+                if path.starts_with(b"/reserved-memory/") && name == b"reg" {
+                    let (start, size) = first_reg(value, parent_address_cells, parent_size_cells);
+                    reserved_range = Some(DiagnosticRange {
+                        start: start?,
+                        size: size?,
+                        no_map: reserved_no_map,
+                    });
+                }
+                if path.starts_with(b"/reserved-memory/") && name == b"no-map" {
+                    reserved_no_map = true;
+                    if let Some(range) = reserved_range.as_mut() {
+                        range.no_map = true;
+                    }
+                }
+                if path == b"/chosen" && name == b"linux,initrd-start" {
+                    out.initrd_start = scalar(value);
+                }
+                if path == b"/chosen" && name == b"linux,initrd-end" {
+                    out.initrd_end = scalar(value);
+                }
+                if path == b"/chosen" && name == b"bootargs" {
+                    out.bootargs_len = first_string(value).len();
+                    out.bootargs_truncated = out.bootargs_len > MAX_DIAGNOSTIC_BOOTARGS;
+                }
+                if name == b"interrupt-controller" {
+                    irq_candidate = true;
+                }
+                if irq_candidate && name == b"compatible" {
+                    irq_compatible.set(first_string(value));
+                    irq_is_l2 = value.split(|byte| *byte == 0).any(is_bcm7271_l2_compatible);
+                    irq_is_gic = value.split(|byte| *byte == 0).any(is_arm_gic_compatible);
+                }
+                if irq_candidate && name == b"reg" {
+                    let mut truncated = false;
+                    append_reg_ranges(
+                        &mut irq_reg,
+                        &mut irq_reg_count,
+                        &mut truncated,
+                        value,
+                        parent_address_cells,
+                        parent_size_cells,
+                        false,
+                    )?;
+                    irq_path.set(path);
+                }
+                if path.starts_with(b"/psci") && name == b"method" {
+                    out.psci_conduit = match first_string(value) {
+                        b"hvc" => DiagnosticPsciConduit::Hvc,
+                        b"smc" => DiagnosticPsciConduit::Smc,
+                        _ => DiagnosticPsciConduit::None,
+                    };
+                }
+                if name == b"device_type" && first_string(value) == b"pci" {
+                    pcie_path.set(path);
+                    if !node_name(path).is_some_and(is_excluded_pcie_node_name) {
+                        pcie_controller_index = ensure_pcie_controller(&mut out, pcie_path);
+                    }
+                }
+                if name == b"compatible"
+                    && value.split(|byte| *byte == 0).any(is_known_pcie_compatible)
+                    && !node_name(path).is_some_and(is_excluded_pcie_node_name)
+                {
+                    pcie_path.set(path);
+                    pcie_controller_index = ensure_pcie_controller(&mut out, pcie_path);
+                }
+                if name == b"reg" {
+                    let (base, _) = first_reg(value, parent_address_cells, parent_size_cells);
+                    pcie_base = base;
+                }
+                if let (Some(index), Some(base)) = (pcie_controller_index, pcie_base) {
+                    out.pcie_controllers[index].base =
+                        translate_to_root(blocks, pcie_path.as_bytes(), base);
+                }
+            }
+            Event::EndNode => {
+                if let Some(range) = reserved_range.take() {
+                    append_diagnostic_range(
+                        &mut out.reserved_ranges,
+                        &mut out.reserved_range_count,
+                        &mut out.reserved_ranges_truncated,
+                        range,
+                    );
+                }
+                if irq_candidate && irq_reg_count != 0 {
+                    let path = irq_path.as_bytes();
+                    let first_base = translate_to_root(blocks, path, irq_reg[0].start);
+                    if out.interrupt_controller_path.is_empty() {
+                        out.interrupt_controller_path = irq_path;
+                        out.interrupt_controller_base = first_base;
+                        out.interrupt_controller_compatible = irq_compatible;
+                    }
+                    if irq_is_l2 && out.l2_interrupt_controller_path.is_empty() {
+                        out.l2_interrupt_controller_path = irq_path;
+                        out.l2_interrupt_controller_base = first_base;
+                        out.l2_interrupt_controller_compatible = irq_compatible;
+                    } else if irq_is_gic && out.gic_path.is_empty() {
+                        out.gic_path = irq_path;
+                        out.gic_compatible = irq_compatible;
+                        out.gic_dist_base = first_base;
+                        if irq_reg_count > 1 {
+                            out.gic_redist_base = translate_to_root(blocks, path, irq_reg[1].start);
+                        }
+                    }
+                }
+                irq_candidate = false;
+                pcie_controller_index = None;
+            }
+            Event::End => break,
+        }
+    }
+    Some(out)
 }
 
 #[derive(Clone, Copy)]
@@ -344,9 +2308,10 @@ pub fn parse_platform_dtb(bytes: &[u8]) -> Option<PlatformDtbInfo> {
         resolved.or(first)
     };
     if let Some(mut serial) = info.serial {
-        serial.base =
-            translate_to_root(blocks, serial.path.as_bytes(), serial.base).unwrap_or(serial.base);
-        info.serial = Some(serial);
+        info.serial = translate_to_root(blocks, serial.path.as_bytes(), serial.base).map(|base| {
+            serial.base = base;
+            serial
+        });
     }
 
     let mut gic = Walker::new(blocks);
@@ -483,16 +2448,12 @@ fn translate_to_root(blocks: Blocks<'_>, node_path: &[u8], mut address: u64) -> 
             return Some(address);
         }
         path.len = parent_len;
-        if let Some((child, parent, size)) = node_ranges(blocks, path.as_bytes()) {
-            if address >= child && address < child.checked_add(size)? {
-                address = parent.checked_add(address - child)?;
-            }
-        }
+        address = translate_parent_ranges(blocks, path.as_bytes(), address)?;
     }
     None
 }
 
-fn node_ranges(blocks: Blocks<'_>, wanted: &[u8]) -> Option<(u64, u64, u64)> {
+fn translate_parent_ranges(blocks: Blocks<'_>, wanted: &[u8], address: u64) -> Option<u64> {
     let mut walker = Walker::new(blocks);
     while let Some(event) = walker.next() {
         if let Event::Property {
@@ -505,18 +2466,39 @@ fn node_ranges(blocks: Blocks<'_>, wanted: &[u8]) -> Option<(u64, u64, u64)> {
         {
             if path == wanted && name == b"ranges" {
                 if value.is_empty() {
-                    return None;
+                    return Some(address);
                 }
                 let child_cells = node_cell_count(blocks, wanted, b"#address-cells")
                     .unwrap_or(parent_address_cells);
-                let child = cells(value, child_cells, 0)?;
-                let parent = cells(value, parent_address_cells, child_cells as usize)?;
-                let size = cells(
-                    value,
-                    parent_size_cells,
-                    (child_cells + parent_address_cells) as usize,
-                )?;
-                return Some((child, parent, size));
+                let size_cells =
+                    node_cell_count(blocks, wanted, b"#size-cells").unwrap_or(parent_size_cells);
+                if !(1..=2).contains(&child_cells)
+                    || !(1..=2).contains(&parent_address_cells)
+                    || !(1..=2).contains(&size_cells)
+                {
+                    return None;
+                }
+                let entry_cells = child_cells
+                    .checked_add(parent_address_cells)?
+                    .checked_add(size_cells)? as usize;
+                let entry_bytes = entry_cells.checked_mul(4)?;
+                if entry_bytes == 0 || value.len() % entry_bytes != 0 {
+                    return None;
+                }
+                for entry in value.chunks_exact(entry_bytes) {
+                    let child = cells(entry, child_cells, 0)?;
+                    let parent = cells(entry, parent_address_cells, child_cells as usize)?;
+                    let size = cells(
+                        entry,
+                        size_cells,
+                        (child_cells + parent_address_cells) as usize,
+                    )?;
+                    let end = child.checked_add(size)?;
+                    if size != 0 && address >= child && address < end {
+                        return parent.checked_add(address - child);
+                    }
+                }
+                return None;
             }
         }
     }
@@ -572,6 +2554,113 @@ fn blocks(bytes: &[u8]) -> Option<Blocks<'_>> {
 fn is_memory_path(path: &[u8]) -> bool {
     path.strip_prefix(b"/")
         .is_some_and(|rest| rest.starts_with(b"memory@") || rest == b"memory")
+}
+fn parse_cpu_id_from_node_name(name: &[u8]) -> Option<u8> {
+    let suffix = name.strip_prefix(b"cpu@")?;
+    let mut value = 0u64;
+    let mut consumed = 0usize;
+    for byte in suffix.iter().copied() {
+        let digit = match byte {
+            b'0'..=b'9' => (byte - b'0') as u64,
+            b'a'..=b'f' => (byte - b'a' + 10) as u64,
+            b'A'..=b'F' => (byte - b'A' + 10) as u64,
+            _ => break,
+        };
+        value = value.checked_mul(16)?.checked_add(digit)?;
+        consumed += 1;
+    }
+    (consumed != 0 && value < 64).then_some(value as u8)
+}
+fn is_bcm7271_l2_compatible(value: &[u8]) -> bool {
+    value == b"brcm,bcm7271-l2-intc"
+}
+fn is_arm_gic_compatible(value: &[u8]) -> bool {
+    matches!(
+        value,
+        b"arm,gic-v3" | b"arm,gic-400" | b"arm,cortex-a15-gic"
+    )
+}
+fn is_pcie_node_name(name: &[u8]) -> bool {
+    !is_excluded_pcie_node_name(name) && (name.starts_with(b"pcie@") || name.starts_with(b"pci@"))
+}
+fn is_excluded_pcie_node_name(name: &[u8]) -> bool {
+    name.windows(b"reset-controller".len())
+        .any(|part| part == b"reset-controller")
+}
+fn is_known_pcie_compatible(value: &[u8]) -> bool {
+    matches!(
+        value,
+        b"brcm,bcm2712-pcie" | b"brcm,bcm2711-pcie" | b"pci-host-ecam-generic" | b"snps,dw-pcie"
+    )
+}
+fn node_name(path: &[u8]) -> Option<&[u8]> {
+    path.rsplit(|byte| *byte == b'/').next()
+}
+fn direct_parent_path(path: &[u8]) -> Option<&[u8]> {
+    let split = path.iter().rposition(|byte| *byte == b'/')?;
+    (split != 0).then_some(&path[..split])
+}
+fn find_pcie_controller(info: &PlatformDtbDiagnostics, path: &[u8]) -> Option<usize> {
+    info.pcie_controllers[..info.pcie_controller_count]
+        .iter()
+        .position(|controller| controller.path.as_bytes() == path)
+}
+fn ensure_pcie_controller(info: &mut PlatformDtbDiagnostics, path: DtbPath) -> Option<usize> {
+    if let Some(index) = find_pcie_controller(info, path.as_bytes()) {
+        return Some(index);
+    }
+    if info.pcie_controller_count == info.pcie_controllers.len() {
+        info.pcie_controllers_truncated = true;
+        return None;
+    }
+    let index = info.pcie_controller_count;
+    info.pcie_controllers[index].path = path;
+    info.pcie_controller_count += 1;
+    Some(index)
+}
+fn append_reg_ranges<const N: usize>(
+    ranges: &mut [DiagnosticRange; N],
+    count: &mut usize,
+    truncated: &mut bool,
+    value: &[u8],
+    address_cells: u32,
+    size_cells: u32,
+    no_map: bool,
+) -> Option<()> {
+    if !(1..=2).contains(&address_cells) || !(1..=2).contains(&size_cells) {
+        return None;
+    }
+    let cells_per_entry = address_cells.checked_add(size_cells)? as usize;
+    let bytes_per_entry = cells_per_entry.checked_mul(4)?;
+    if bytes_per_entry == 0 || value.len() % bytes_per_entry != 0 {
+        return None;
+    }
+    for entry in value.chunks_exact(bytes_per_entry) {
+        append_diagnostic_range(
+            ranges,
+            count,
+            truncated,
+            DiagnosticRange {
+                start: cells(entry, address_cells, 0)?,
+                size: cells(entry, size_cells, address_cells as usize)?,
+                no_map,
+            },
+        );
+    }
+    Some(())
+}
+fn append_diagnostic_range<const N: usize>(
+    ranges: &mut [DiagnosticRange; N],
+    count: &mut usize,
+    truncated: &mut bool,
+    range: DiagnosticRange,
+) {
+    if *count < N {
+        ranges[*count] = range;
+        *count += 1;
+    } else {
+        *truncated = true;
+    }
 }
 fn first_string(value: &[u8]) -> &[u8] {
     &value[..value.iter().position(|b| *b == 0).unwrap_or(value.len())]
@@ -632,6 +2721,7 @@ mod tests {
     use super::*;
     use crate::kernel::boot_command_line::BootPhase;
     use std::collections::BTreeMap;
+    use std::format;
     use std::vec::Vec;
 
     fn be(out: &mut Vec<u8>, value: u32) {
@@ -677,6 +2767,13 @@ mod tests {
         out.extend_from_slice(&(size as u32).to_be_bytes());
         out
     }
+    fn reg_2_1(address: u64, size: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(address >> 32).to_be_bytes()[4..]);
+        out.extend_from_slice(&(address as u32).to_be_bytes());
+        out.extend_from_slice(&size.to_be_bytes());
+        out
+    }
     fn finish(structure: Vec<u8>, strings: Vec<u8>) -> Vec<u8> {
         let header = 40usize;
         let struct_off = header;
@@ -701,7 +2798,15 @@ mod tests {
         out.extend_from_slice(&strings);
         out
     }
-    fn test_dtb(compatible: &[u8], rpi: bool, with_initrd: bool) -> Vec<u8> {
+    fn test_dtb(
+        compatible: &[u8],
+        rpi: bool,
+        with_initrd: bool,
+        rpi_ranges_map_uart: bool,
+        bootargs: &[u8],
+        with_gic: bool,
+        with_pcie: bool,
+    ) -> Vec<u8> {
         let mut st = Vec::new();
         let mut strings = Vec::new();
         let mut offsets = BTreeMap::new();
@@ -748,6 +2853,7 @@ mod tests {
             "stdout-path",
             b"serial10:115200n8\0",
         );
+        prop(&mut st, &mut strings, &mut offsets, "bootargs", bootargs);
         if with_initrd {
             prop(
                 &mut st,
@@ -798,7 +2904,17 @@ mod tests {
                 "reg",
                 &reg64(0x1000, 0x2000),
             );
+            prop(&mut st, &mut strings, &mut offsets, "no-map", &[]);
             end(&mut st);
+            end(&mut st);
+            begin(&mut st, b"cpus");
+            begin(&mut st, b"cpu@0");
+            end(&mut st);
+            begin(&mut st, b"cpu@3");
+            end(&mut st);
+            end(&mut st);
+            begin(&mut st, b"psci");
+            prop(&mut st, &mut strings, &mut offsets, "method", b"smc\0");
             end(&mut st);
             begin(&mut st, b"soc@107c000000");
             prop(
@@ -813,14 +2929,24 @@ mod tests {
                 &mut strings,
                 &mut offsets,
                 "#size-cells",
-                &2u32.to_be_bytes(),
+                &1u32.to_be_bytes(),
             );
             let mut ranges = Vec::new();
-            ranges.extend_from_slice(&reg64(0x7c00_0000, 0x0400_0000)[..8]);
-            ranges.extend_from_slice(&0x0000_0010u32.to_be_bytes());
-            ranges.extend_from_slice(&0x7c00_0000u32.to_be_bytes());
+            // Real BCM2712-style bus ranges use two child-address cells, two
+            // parent-address cells, and one size cell. Keep a non-matching
+            // entry first to prove translation scans the complete property.
             ranges.extend_from_slice(&0u32.to_be_bytes());
-            ranges.extend_from_slice(&0x0400_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&0x4000_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&0u32.to_be_bytes());
+            ranges.extend_from_slice(&0x4000_0000u32.to_be_bytes());
+            ranges.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+            if rpi_ranges_map_uart {
+                ranges.extend_from_slice(&0u32.to_be_bytes());
+                ranges.extend_from_slice(&0x7c00_0000u32.to_be_bytes());
+                ranges.extend_from_slice(&0x0000_0010u32.to_be_bytes());
+                ranges.extend_from_slice(&0x7c00_0000u32.to_be_bytes());
+                ranges.extend_from_slice(&0x0400_0000u32.to_be_bytes());
+            }
             prop(&mut st, &mut strings, &mut offsets, "ranges", &ranges);
             begin(&mut st, b"serial@7d001000");
             prop(
@@ -836,10 +2962,10 @@ mod tests {
                 &mut strings,
                 &mut offsets,
                 "reg",
-                &reg64(0x7d00_1000, 0x1000),
+                &reg_2_1(0x7d00_1000, 0x1000),
             );
             end(&mut st);
-            begin(&mut st, b"interrupt-controller@7fff9000");
+            begin(&mut st, b"intc@7d517ac0");
             prop(
                 &mut st,
                 &mut strings,
@@ -851,11 +2977,119 @@ mod tests {
                 &mut st,
                 &mut strings,
                 &mut offsets,
+                "compatible",
+                b"brcm,bcm7271-l2-intc\0",
+            );
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
                 "reg",
-                &reg64(0x7fff_9000, 0x1000),
+                &reg_2_1(0x7d51_7ac0, 0x100),
+            );
+            end(&mut st);
+            if with_gic {
+                begin(&mut st, b"interrupt-controller@7fff9000");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "interrupt-controller",
+                    &[],
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"arm,gic-v3\0",
+                );
+                let mut gic_regs = reg_2_1(0x7fff_9000, 0x1000);
+                gic_regs.extend_from_slice(&reg_2_1(0x7fff_a000, 0x20_000));
+                prop(&mut st, &mut strings, &mut offsets, "reg", &gic_regs);
+                end(&mut st);
+            }
+            begin(&mut st, b"reset-controller@119500");
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "compatible",
+                b"raspberrypi,rp1-pcie-reset\0",
+            );
+            end(&mut st);
+            begin(&mut st, b"rp1");
+            prop(
+                &mut st,
+                &mut strings,
+                &mut offsets,
+                "compatible",
+                b"raspberrypi,rp1\0",
             );
             end(&mut st);
             end(&mut st);
+            if with_pcie {
+                begin(&mut st, b"axi");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "#address-cells",
+                    &2u32.to_be_bytes(),
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "#size-cells",
+                    &2u32.to_be_bytes(),
+                );
+                prop(&mut st, &mut strings, &mut offsets, "ranges", &[]);
+                begin(&mut st, b"pcie@1000100000");
+                prop(&mut st, &mut strings, &mut offsets, "device_type", b"pci\0");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"brcm,bcm2712-pcie\0",
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "reg",
+                    &reg64(0x10_0010_0000, 0x10_000),
+                );
+                end(&mut st);
+                begin(&mut st, b"pcie@1000120000");
+                prop(&mut st, &mut strings, &mut offsets, "device_type", b"pci\0");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"brcm,bcm2712-pcie\0",
+                );
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "reg",
+                    &reg64(0x10_0012_0000, 0x10_000),
+                );
+                begin(&mut st, b"rp1");
+                prop(
+                    &mut st,
+                    &mut strings,
+                    &mut offsets,
+                    "compatible",
+                    b"raspberrypi,rp1\0",
+                );
+                end(&mut st);
+                end(&mut st);
+                end(&mut st);
+            }
         } else {
             begin(&mut st, b"pl011@9000000");
             prop(
@@ -881,7 +3115,16 @@ mod tests {
 
     #[test]
     fn detects_qemu_virt_and_resolves_absolute_uart_alias() {
-        let info = parse_platform_dtb(&test_dtb(b"linux,dummy-virt\0", false, true)).unwrap();
+        let info = parse_platform_dtb(&test_dtb(
+            b"linux,dummy-virt\0",
+            false,
+            true,
+            false,
+            b"console=ttyAMA0\0",
+            false,
+            false,
+        ))
+        .unwrap();
         assert_eq!(info.platform, DetectedPlatform::QemuVirt);
         assert_eq!(info.serial.unwrap().base, 0x0900_0000);
         assert!(info.has_initrd());
@@ -893,6 +3136,10 @@ mod tests {
             b"raspberrypi,5-model-b\0brcm,bcm2712\0",
             true,
             false,
+            true,
+            b"console=ttyAMA10 yarm.boot_phase=dtb\0",
+            true,
+            true,
         ))
         .unwrap();
         assert_eq!(info.platform, DetectedPlatform::Rpi5Bcm2712);
@@ -902,7 +3149,912 @@ mod tests {
         assert_eq!(info.reserved_count, 1);
         assert_eq!(
             info.interrupt_controller_path.as_str(),
+            "/soc@107c000000/intc@7d517ac0"
+        );
+    }
+
+    #[test]
+    fn rpi5_uart_translation_fails_closed_when_ranges_do_not_map_reg() {
+        let info = parse_platform_dtb(&test_dtb(
+            b"raspberrypi,5-model-b\0brcm,bcm2712\0",
+            true,
+            false,
+            false,
+            b"console=ttyAMA10\0",
+            true,
+            true,
+        ))
+        .unwrap();
+        assert_eq!(info.stdout_path.as_str(), "/soc@107c000000/serial@7d001000");
+        assert_eq!(info.serial, None);
+    }
+
+    #[test]
+    fn rpi5_stage1_diagnostics_report_bounded_firmware_state() {
+        let dtb = test_dtb(
+            b"raspberrypi,5-model-b\0brcm,bcm2712\0",
+            true,
+            true,
+            true,
+            b"console=ttyAMA10 yarm.boot_phase=dtb\0",
+            true,
+            true,
+        );
+        let info = parse_platform_dtb_diagnostics(&dtb).unwrap();
+        assert_eq!(
+            &info.memory_ranges[..info.memory_range_count],
+            &[DiagnosticRange {
+                start: 0,
+                size: 0x4000_0000,
+                no_map: false,
+            }]
+        );
+        assert_eq!(
+            &info.reserved_ranges[..info.reserved_range_count],
+            &[DiagnosticRange {
+                start: 0x1000,
+                size: 0x2000,
+                no_map: true,
+            }]
+        );
+        assert_eq!(info.initrd_start, Some(0x0800_0000));
+        assert_eq!(info.initrd_end, Some(0x0810_0000));
+        assert_eq!(
+            info.bootargs_len,
+            b"console=ttyAMA10 yarm.boot_phase=dtb".len()
+        );
+        assert!(!info.bootargs_truncated);
+        assert_eq!(
+            info.l2_interrupt_controller_path.as_str(),
+            "/soc@107c000000/intc@7d517ac0"
+        );
+        assert_eq!(
+            info.l2_interrupt_controller_compatible.as_str(),
+            "brcm,bcm7271-l2-intc"
+        );
+        assert_eq!(info.l2_interrupt_controller_base, Some(0x10_7d51_7ac0));
+        assert_eq!(
+            info.gic_path.as_str(),
             "/soc@107c000000/interrupt-controller@7fff9000"
+        );
+        assert_eq!(info.gic_compatible.as_str(), "arm,gic-v3");
+        assert_eq!(info.gic_dist_base, Some(0x10_7fff_9000));
+        assert_eq!(info.gic_redist_base, Some(0x10_7fff_a000));
+        assert_eq!(info.psci_conduit, DiagnosticPsciConduit::Smc);
+        assert_eq!(info.cpu_bitmap, 0b1001);
+        assert_eq!(info.pcie_controller_count, 2);
+        assert_eq!(
+            info.pcie_controllers[0].path.as_str(),
+            "/axi/pcie@1000100000"
+        );
+        assert_eq!(info.pcie_controllers[0].base, Some(0x10_0010_0000));
+        assert_eq!(
+            info.pcie_controllers[1].path.as_str(),
+            "/axi/pcie@1000120000"
+        );
+        assert_eq!(info.pcie_controllers[1].base, Some(0x10_0012_0000));
+        assert_eq!(info.rp1_controller_index, Some(1));
+        assert_eq!(info.rp1_node_path.as_str(), "/axi/pcie@1000120000/rp1");
+        assert_ne!(
+            info.rp1_node_path.as_str(),
+            "/soc@107c000000/reset-controller@119500"
+        );
+    }
+
+    #[test]
+    fn rpi5_stage1_diagnostics_report_missing_initrd_and_bootargs_truncation() {
+        let mut bootargs = [b'x'; MAX_DIAGNOSTIC_BOOTARGS + 2];
+        bootargs[MAX_DIAGNOSTIC_BOOTARGS + 1] = 0;
+        let info = parse_platform_dtb_diagnostics(&test_dtb(
+            b"raspberrypi,5-model-b\0brcm,bcm2712\0",
+            true,
+            false,
+            true,
+            &bootargs,
+            false,
+            false,
+        ))
+        .unwrap();
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert_eq!(info.bootargs_len, MAX_DIAGNOSTIC_BOOTARGS + 1);
+        assert!(info.bootargs_truncated);
+        assert_eq!(info.gic_dist_base, None);
+        assert_eq!(info.gic_redist_base, None);
+        assert!(!info.l2_interrupt_controller_path.is_empty());
+        assert_eq!(info.pcie_controller_count, 0);
+        assert_eq!(info.rp1_controller_index, None);
+        assert!(
+            info.rp1_node_path.is_empty(),
+            "an rp1 node outside the classified PCIe controller must not count"
+        );
+    }
+
+    #[test]
+    fn rpi5_stage1_kernel_plan_reserves_firmware_kernel_dtb_and_allocates_safely() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        info.reserved_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x80000,
+            no_map: true,
+        };
+        info.reserved_ranges[1] = DiagnosticRange {
+            start: 0x3fd2_3180,
+            size: 0x3e,
+            no_map: true,
+        };
+        info.reserved_ranges[2] = DiagnosticRange {
+            start: 0x5000_0000,
+            size: 0,
+            no_map: false,
+        };
+        info.reserved_range_count = 3;
+
+        let kernel = Stage1KernelRange::new(0x80000, 0x280000);
+        let dtb = Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600);
+        let plan = plan_rpi5_stage1_kernel_memory(&info, kernel, dtb).unwrap();
+
+        assert_eq!(plan.reserved_ranges[0], Stage1KernelRange::new(0, 0x80000));
+        assert_eq!(plan.reserved_ranges[1], kernel);
+        assert_eq!(plan.reserved_ranges[2], dtb);
+        assert_eq!(
+            plan.reserved_ranges[3],
+            Stage1KernelRange::new(0x3fd2_3180, 0x3fd2_31be)
+        );
+        assert_eq!(&plan.zero_reserved_skipped[..1], &[2]);
+        assert_eq!(
+            plan.page_table_pool.end - plan.page_table_pool.start,
+            STAGE1_PT_POOL_SIZE
+        );
+        assert_eq!(
+            plan.early_heap.end - plan.early_heap.start,
+            STAGE1_EARLY_HEAP_SIZE
+        );
+        for allocation in [plan.page_table_pool, plan.early_heap] {
+            for reserved in &plan.reserved_ranges[..plan.reserved_range_count] {
+                assert!(!allocation.overlaps(*reserved));
+            }
+        }
+        assert!(!plan.page_table_pool.overlaps(plan.early_heap));
+    }
+
+    #[test]
+    fn rpi5_stage1_kernel_plan_does_not_require_an_initrd() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert!(
+            plan_rpi5_stage1_kernel_memory(
+                &info,
+                Stage1KernelRange::new(0x80000, 0x180000),
+                Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rpi5_stage1_identity_map_covers_core_ranges_and_uart_attributes() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        info.gic_dist_base = Some(0x10_7fff_9000);
+        info.gic_redist_base = Some(0x10_7fff_a000);
+        let kernel = Stage1KernelRange::new(0x80000, 0x5b50_000);
+        let dtb = Stage1KernelRange::new(0x2efe_c600, 0x2eff_ff4e);
+        let kernel_plan = Stage1KernelPlan {
+            page_table_pool: Stage1KernelRange::new(0x5b50_000, 0x5b90_000),
+            early_heap: Stage1KernelRange::new(0x5b90_000, 0x5d90_000),
+            ..Stage1KernelPlan::default()
+        };
+
+        let stack = Stage1KernelRange::new(0x5b4f_000, 0x5b50_000);
+        let plan =
+            plan_rpi5_stage1_identity_map(&info, &kernel_plan, kernel, stack, dtb, 0x10_7d00_1000)
+                .unwrap();
+        assert_eq!(plan.pt_pool, kernel_plan.page_table_pool);
+        assert_eq!(plan.mapping_count, 8);
+        assert_eq!(
+            plan.mappings[0],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0, 0x3fc0_0000),
+                memory_type: Stage1MmuMemoryType::Normal,
+            }
+        );
+        assert_eq!(
+            plan.mappings[1],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x4000_0000, 0x8000_0000),
+                memory_type: Stage1MmuMemoryType::Normal,
+            }
+        );
+        assert_eq!(
+            plan.mappings[2],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x10_7d00_1000, 0x10_7d00_2000),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            }
+        );
+        assert_eq!(
+            plan.mappings[3],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x10_7fff_9000, 0x10_7fff_a000),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            }
+        );
+        assert_eq!(
+            plan.mappings[4],
+            Stage1MmuMapping {
+                range: Stage1KernelRange::new(0x10_7fff_a000, 0x10_7fff_b000),
+                memory_type: Stage1MmuMemoryType::DeviceNgnre,
+            }
+        );
+        for (index, mapping) in plan.mappings[4..8].iter().enumerate() {
+            let start = 0x10_7fff_a000 + (index as u64) * RPI5_STAGE1_GICR_FRAME_STRIDE;
+            assert_eq!(
+                *mapping,
+                Stage1MmuMapping {
+                    range: Stage1KernelRange::new(start, start + STAGE1_PAGE_SIZE),
+                    memory_type: Stage1MmuMemoryType::DeviceNgnre,
+                }
+            );
+        }
+        for normal in &plan.mappings[..2] {
+            assert!(!normal.range.overlaps(plan.mappings[2].range));
+        }
+        for required in [
+            kernel,
+            stack,
+            dtb,
+            kernel_plan.page_table_pool,
+            kernel_plan.early_heap,
+        ] {
+            assert!(stage1_mmu_normal_mapping_contains(&plan, required));
+        }
+    }
+
+    #[test]
+    fn rpi5_stage1_identity_map_rejects_pt_pool_outside_normal_ram() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        let kernel_plan = Stage1KernelPlan {
+            page_table_pool: Stage1KernelRange::new(0x5000_0000, 0x5004_0000),
+            early_heap: Stage1KernelRange::new(0x1000_0000, 0x1020_0000),
+            ..Stage1KernelPlan::default()
+        };
+        assert_eq!(
+            plan_rpi5_stage1_identity_map(
+                &info,
+                &kernel_plan,
+                Stage1KernelRange::new(0x80000, 0x180000),
+                Stage1KernelRange::new(0x170000, 0x171000),
+                Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600),
+                0x10_7d00_1000,
+            ),
+            Err(Stage1MmuPlanFailure::PageTablePoolNotMapped)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage1_allocator_handoff_is_sorted_aligned_and_excludes_reservations() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        let mut kernel_plan = Stage1KernelPlan::default();
+        kernel_plan.reserved_ranges[0] = Stage1KernelRange::new(0, 0x80000);
+        kernel_plan.reserved_ranges[1] = Stage1KernelRange::new(0x80000, 0x5b50_000);
+        kernel_plan.reserved_ranges[2] = Stage1KernelRange::new(0x2efe_c600, 0x2eff_ff4e);
+        kernel_plan.reserved_ranges[3] = Stage1KernelRange::new(0x3fd2_3180, 0x3fd2_31be);
+        kernel_plan.reserved_range_count = 4;
+        kernel_plan.page_table_pool = Stage1KernelRange::new(0x5b50_000, 0x5b90_000);
+        kernel_plan.early_heap = Stage1KernelRange::new(0x5b90_000, 0x5d90_000);
+
+        let plan = plan_rpi5_stage1_allocator_handoff(&info, &kernel_plan).unwrap();
+        assert_eq!(plan.reserved_count, 6);
+        assert_eq!(
+            plan.reserved[4],
+            Stage1AllocatorReservation {
+                range: kernel_plan.page_table_pool,
+                reason: Stage1AllocatorReservationReason::PageTablePool,
+            }
+        );
+        assert_eq!(
+            plan.reserved[5],
+            Stage1AllocatorReservation {
+                range: kernel_plan.early_heap,
+                reason: Stage1AllocatorReservationReason::EarlyHeap,
+            }
+        );
+        assert_eq!(
+            &plan.usable[..plan.usable_count],
+            &[
+                Stage1KernelRange::new(0x5d90_000, 0x2efe_c000),
+                Stage1KernelRange::new(0x2f00_0000, 0x3fc0_0000),
+                Stage1KernelRange::new(0x4000_0000, 0x8000_0000),
+            ]
+        );
+        for (index, usable) in plan.usable[..plan.usable_count].iter().enumerate() {
+            assert_eq!(usable.start % STAGE1_PAGE_SIZE, 0);
+            assert_eq!(usable.end % STAGE1_PAGE_SIZE, 0);
+            if index != 0 {
+                assert!(plan.usable[index - 1].start < usable.start);
+            }
+            for reserved in &plan.reserved[..plan.reserved_count] {
+                assert!(!usable.overlaps(reserved.range));
+            }
+        }
+        let test_frame = plan.usable[0].start;
+        assert_eq!(test_frame, 0x5d90_000);
+        assert_eq!(test_frame % STAGE1_PAGE_SIZE, 0);
+        let test_range = Stage1KernelRange::new(test_frame, test_frame + STAGE1_PAGE_SIZE);
+        assert!(
+            plan.reserved[..plan.reserved_count]
+                .iter()
+                .all(|reserved| !test_range.overlaps(reserved.range))
+        );
+        assert_eq!(
+            plan.total_pages,
+            plan.usable[..plan.usable_count]
+                .iter()
+                .map(|range| (range.end - range.start) / STAGE1_PAGE_SIZE)
+                .sum()
+        );
+        assert_eq!(plan.total_pages, 499_292);
+    }
+
+    #[test]
+    fn rpi5_stage1_allocator_handoff_does_not_require_initrd() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        let mut kernel_plan = Stage1KernelPlan::default();
+        kernel_plan.reserved_ranges[0] = Stage1KernelRange::new(0, 0x80000);
+        kernel_plan.reserved_ranges[1] = Stage1KernelRange::new(0x80000, 0x180000);
+        kernel_plan.reserved_ranges[2] = Stage1KernelRange::new(0x2efe_c600, 0x2eff_c600);
+        kernel_plan.reserved_range_count = 3;
+        kernel_plan.page_table_pool = Stage1KernelRange::new(0x180000, 0x1c0000);
+        kernel_plan.early_heap = Stage1KernelRange::new(0x1c0000, 0x3c0000);
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert!(plan_rpi5_stage1_allocator_handoff(&info, &kernel_plan).is_ok());
+    }
+
+    #[test]
+    fn rpi5_stage1_timer_diagnostic_rejects_non_incrementing_counter() {
+        assert_eq!(rpi5_stage1_timer_delta(100, 101), Some(1));
+        assert_eq!(rpi5_stage1_timer_delta(100, 100), None);
+        assert_eq!(rpi5_stage1_timer_delta(101, 100), None);
+    }
+
+    #[test]
+    fn rpi5_stage1_irqtimer_diagnostic_does_not_require_initrd() {
+        let info = PlatformDtbDiagnostics::default();
+        assert_eq!(info.initrd_start, None);
+        assert_eq!(info.initrd_end, None);
+        assert_eq!(rpi5_stage1_timer_delta(7, 9), Some(2));
+    }
+
+    #[test]
+    fn rpi5_stage1_gicr_validation_rejects_zero_and_accepts_plausible_typer() {
+        assert!(!rpi5_stage1_gicr_typer_plausible(0));
+        assert!(!rpi5_stage1_gicr_typer_plausible(u64::MAX));
+        assert!(rpi5_stage1_gicr_typer_plausible(1 << 4));
+        assert!(rpi5_stage1_gicr_typer_plausible(0x1234_0000_0000_0010));
+    }
+
+    #[test]
+    fn rpi5_stage1_kernel_bootstrap_record_carries_proven_platform_without_initrd() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x3fc0_0000,
+            no_map: false,
+        };
+        info.memory_ranges[1] = DiagnosticRange {
+            start: 0x4000_0000,
+            size: 0x4000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 2;
+        info.cpu_bitmap = 0xf;
+        info.psci_conduit = DiagnosticPsciConduit::Smc;
+        info.gic_dist_base = Some(0x10_7fff_9000);
+        info.gic_redist_base = Some(0x10_7fff_a000);
+        let mut allocator_plan = Stage1AllocatorPlan::default();
+        allocator_plan.reserved[0] = Stage1AllocatorReservation {
+            range: Stage1KernelRange::new(0, 0x80000),
+            reason: Stage1AllocatorReservationReason::LowFirmware,
+        };
+        allocator_plan.reserved_count = 1;
+        let record = build_rpi5_stage1_kernel_bootstrap_record(
+            &info,
+            &allocator_plan,
+            0x10_7d00_1000,
+            499_292,
+            499_292,
+            0x80000,
+        )
+        .unwrap();
+        assert_eq!(record.uart_base, 0x10_7d00_1000);
+        assert_eq!(record.memory_range_count, 2);
+        assert_eq!(record.reserved_range_count, 1);
+        assert_eq!(record.frame_total_pages, 499_292);
+        assert_eq!(record.frame_free_pages, 499_292);
+        assert_eq!(record.cpu_bitmap, 0xf);
+        assert_eq!(record.effective_cpu_count, 1);
+        assert_eq!(record.psci_conduit, DiagnosticPsciConduit::Smc);
+        assert_eq!(record.gic_dist_base, Some(0x10_7fff_9000));
+        assert_eq!(record.gic_redist_base, Some(0x10_7fff_a000));
+        assert!(!record.initrd_present);
+    }
+
+    #[test]
+    fn rpi5_stage2a_initrd_plan_validates_and_page_rounds_reservation() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x8000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        info.initrd_start = Some(0x3000_0123);
+        info.initrd_end = Some(0x3001_2345);
+        let mut allocator_plan = Stage1AllocatorPlan::default();
+        allocator_plan.reserved[0] = Stage1AllocatorReservation {
+            range: Stage1KernelRange::new(0, 0x05d9_0000),
+            reason: Stage1AllocatorReservationReason::Kernel,
+        };
+        allocator_plan.reserved_count = 1;
+        let plan = plan_rpi5_stage2a_initrd(&info, &allocator_plan).unwrap();
+        assert_eq!(
+            plan.byte_range,
+            Stage1KernelRange::new(0x3000_0123, 0x3001_2345)
+        );
+        assert_eq!(
+            plan.reservation,
+            Stage1KernelRange::new(0x3000_0000, 0x3001_3000)
+        );
+        let kernel_plan = plan_rpi5_stage1_kernel_memory(
+            &info,
+            Stage1KernelRange::new(0x80000, 0x05b5_0000),
+            Stage1KernelRange::new(0x2efe_c600, 0x2eff_ff4e),
+        )
+        .unwrap();
+        assert_eq!(kernel_plan.initrd_reservation, Some(plan.reservation));
+        assert!(!kernel_plan.page_table_pool.overlaps(plan.reservation));
+        assert!(!kernel_plan.early_heap.overlaps(plan.reservation));
+        let frame_plan = plan_rpi5_stage1_allocator_handoff(&info, &kernel_plan).unwrap();
+        assert!(
+            frame_plan.reserved[..frame_plan.reserved_count]
+                .iter()
+                .any(|reserved| {
+                    reserved.reason == Stage1AllocatorReservationReason::Initrd
+                        && reserved.range == plan.reservation
+                })
+        );
+        assert!(
+            frame_plan.usable[..frame_plan.usable_count]
+                .iter()
+                .all(|usable| !usable.overlaps(plan.reservation))
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2a_initrd_plan_rejects_missing_invalid_and_overlapping_ranges() {
+        let mut info = PlatformDtbDiagnostics::default();
+        info.memory_ranges[0] = DiagnosticRange {
+            start: 0,
+            size: 0x8000_0000,
+            no_map: false,
+        };
+        info.memory_range_count = 1;
+        let mut allocator_plan = Stage1AllocatorPlan::default();
+        allocator_plan.reserved[0] = Stage1AllocatorReservation {
+            range: Stage1KernelRange::new(0x1000_0000, 0x1100_0000),
+            reason: Stage1AllocatorReservationReason::Dtb,
+        };
+        allocator_plan.reserved_count = 1;
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::Missing)
+        );
+        info.initrd_start = Some(0x2000_0000);
+        info.initrd_end = Some(0x2000_0000);
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::InvalidRange)
+        );
+        info.initrd_start = Some(0x1008_0000);
+        info.initrd_end = Some(0x1010_0000);
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::OverlapsReserved)
+        );
+        info.initrd_start = Some(0x9000_0000);
+        info.initrd_end = Some(0x9001_0000);
+        assert_eq!(
+            plan_rpi5_stage2a_initrd(&info, &allocator_plan),
+            Err(Stage2AInitrdFailure::OutsideFirmwareRam)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2a_cpio_accepts_newc_and_rejects_bad_magic() {
+        let mut archive = std::vec![b'0'; 116];
+        archive[..6].copy_from_slice(b"070701");
+        archive[54..62].copy_from_slice(b"00000000");
+        archive[94..102].copy_from_slice(b"00000005");
+        archive[110..115].copy_from_slice(b"init\0");
+        assert_eq!(rpi5_stage2a_cpio_first_name(&archive), Ok(&b"init"[..]));
+        archive[..6].copy_from_slice(b"070702");
+        assert_eq!(
+            rpi5_stage2a_cpio_first_name(&archive),
+            Err(Stage2ACpioFailure::BadMagic)
+        );
+    }
+
+    fn append_newc_entry(archive: &mut Vec<u8>, name: &[u8], data: &[u8]) {
+        let mut header = [b'0'; 110];
+        header[..6].copy_from_slice(b"070701");
+        header[54..62].copy_from_slice(format!("{:08x}", data.len()).as_bytes());
+        header[94..102].copy_from_slice(format!("{:08x}", name.len() + 1).as_bytes());
+        archive.extend_from_slice(&header);
+        archive.extend_from_slice(name);
+        archive.push(0);
+        while archive.len() % 4 != 0 {
+            archive.push(0);
+        }
+        archive.extend_from_slice(data);
+        while archive.len() % 4 != 0 {
+            archive.push(0);
+        }
+    }
+
+    fn minimal_aarch64_elf() -> Vec<u8> {
+        let mut elf = std::vec![0u8; 0x108];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        elf[6] = 1;
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes());
+        elf[18..20].copy_from_slice(&183u16.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+        elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+        elf[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&8u64.to_le_bytes());
+        elf[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[112..120].copy_from_slice(&1u64.to_le_bytes());
+        elf
+    }
+
+    #[test]
+    fn rpi5_stage2b_cpio_lookup_accepts_init_name_variants() {
+        for name in [&b"init"[..], &b"/init"[..]] {
+            let mut archive = Vec::new();
+            append_newc_entry(&mut archive, b".", &[]);
+            append_newc_entry(&mut archive, name, b"elf");
+            append_newc_entry(&mut archive, b"TRAILER!!!", &[]);
+            let file = rpi5_stage2b_find_init(&archive).unwrap();
+            assert_eq!(
+                &archive[file.data_offset..file.data_offset + file.size],
+                b"elf"
+            );
+        }
+    }
+
+    #[test]
+    fn rpi5_stage2b_cpio_lookup_rejects_missing_and_malformed_entries() {
+        let mut archive = Vec::new();
+        append_newc_entry(&mut archive, b"TRAILER!!!", &[]);
+        assert_eq!(
+            rpi5_stage2b_find_init(&archive),
+            Err(Stage2BCpioLookupFailure::NotFound)
+        );
+        archive[..6].copy_from_slice(b"070702");
+        assert_eq!(
+            rpi5_stage2b_find_init(&archive),
+            Err(Stage2BCpioLookupFailure::BadMagic)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2b_elf_accepts_aarch64_load_plan_and_rejects_wrong_formats() {
+        let elf = minimal_aarch64_elf();
+        let plan = plan_rpi5_stage2b_init_elf(&elf).unwrap();
+        assert_eq!(plan.entry, 0x400000);
+        assert_eq!(plan.segment_count, 1);
+        assert_eq!(plan.segments[0].vaddr, 0x400000);
+        assert_eq!(plan.segments[0].file_size, 8);
+        assert_eq!(plan.segments[0].mem_size, 0x1000);
+
+        for (index, value, expected) in [
+            (4, 1, Stage2BElfFailure::WrongClass),
+            (5, 2, Stage2BElfFailure::WrongEndian),
+        ] {
+            let mut invalid = elf.clone();
+            invalid[index] = value;
+            assert_eq!(plan_rpi5_stage2b_init_elf(&invalid), Err(expected));
+        }
+        let mut wrong_machine = elf.clone();
+        wrong_machine[18..20].copy_from_slice(&62u16.to_le_bytes());
+        assert_eq!(
+            plan_rpi5_stage2b_init_elf(&wrong_machine),
+            Err(Stage2BElfFailure::WrongMachine)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2b_elf_rejects_out_of_bounds_load_segment() {
+        let mut elf = minimal_aarch64_elf();
+        elf[96..104].copy_from_slice(&0x1000u64.to_le_bytes());
+        assert_eq!(
+            plan_rpi5_stage2b_init_elf(&elf),
+            Err(Stage2BElfFailure::InvalidLoadSegment)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2c_task_plan_matches_real_init_permissions_bss_and_stack() {
+        let mut elf_plan = Stage2BElfLoadPlan {
+            entry: 0x4023d8,
+            segment_count: 2,
+            ..Stage2BElfLoadPlan::default()
+        };
+        elf_plan.segments[0] = Stage2BElfLoadSegment {
+            vaddr: 0x400000,
+            mem_size: 0x6cf0,
+            file_size: 0x6cf0,
+            file_offset: 0,
+            flags: 0x5,
+        };
+        elf_plan.segments[1] = Stage2BElfLoadSegment {
+            vaddr: 0x407000,
+            mem_size: 0x400a8,
+            file_size: 0,
+            file_offset: 0x7000,
+            flags: 0x6,
+        };
+        let task = plan_rpi5_stage2c_init_task(&elf_plan).unwrap();
+        assert_eq!(task.tid, RPI5_STAGE2C_INIT_TID);
+        assert_eq!(task.entry, 0x4023d8);
+        assert_eq!(
+            task.segments[0].permission,
+            Stage2CUserPermission::ReadExecute
+        );
+        assert_eq!(
+            task.segments[1].permission,
+            Stage2CUserPermission::ReadWrite
+        );
+        assert_eq!(
+            task.segments[1].bss_range,
+            Some(Stage1KernelRange::new(0x407000, 0x4470a8))
+        );
+        assert_eq!(
+            task.stack_range,
+            Stage1KernelRange::new(0x3fdf_c000, 0x3fe0_0000)
+        );
+        assert_eq!(task.stack_pointer, 0x3fe0_0000);
+        assert_eq!(task.stack_range.start % STAGE1_PAGE_SIZE, 0);
+        assert_eq!(task.stack_range.end % STAGE1_PAGE_SIZE, 0);
+        assert!(
+            task.segments[..task.segment_count]
+                .iter()
+                .all(|segment| !segment.page_range.overlaps(task.stack_range))
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2c_task_plan_requires_entry_in_executable_segment() {
+        let mut elf_plan = Stage2BElfLoadPlan {
+            entry: 0x407000,
+            segment_count: 1,
+            ..Stage2BElfLoadPlan::default()
+        };
+        elf_plan.segments[0] = Stage2BElfLoadSegment {
+            vaddr: 0x400000,
+            mem_size: 0x1000,
+            file_size: 0x1000,
+            file_offset: 0,
+            flags: 0x5,
+        };
+        assert_eq!(
+            plan_rpi5_stage2c_init_task(&elf_plan),
+            Err(Stage2CTaskPlanFailure::EntryNotExecutable)
+        );
+    }
+
+    fn stage2d_bridge_state() -> Stage2DEnterBridgeState {
+        Stage2DEnterBridgeState {
+            expected_tid: 1,
+            current_tid: Some(1),
+            stage2c_root: 0x05d9_0000,
+            current_ttbr0: 0x05b5_0000,
+            trap_entry: 0x4023d8,
+            task_entry: 0x4023d8,
+            trap_stack_pointer: 0x3fe0_0000,
+            task_stack_pointer: 0x3fe0_0000,
+            tcr_el1: 25,
+            kernel_pc: 0xffff_0000_0008_0000,
+        }
+    }
+
+    #[test]
+    fn rpi5_high_half_address_contract_maps_and_round_trips() {
+        assert_eq!(
+            checked_phys_to_rpi5_kernel_virt(RPI5_KERNEL_PHYS_LOAD_BASE),
+            Some(RPI5_KERNEL_VIRT_LOAD_BASE)
+        );
+        assert_eq!(
+            phys_to_rpi5_kernel_virt(0x10_7d00_1000),
+            0xffff_ff90_7d00_1000
+        );
+        let pa = 0x2efe_c600;
+        let va = phys_to_rpi5_kernel_virt(pa);
+        assert!(is_rpi5_kernel_high_va(va));
+        assert!(is_rpi5_low_phys(pa));
+        assert_eq!(rpi5_kernel_virt_to_phys(va), pa);
+        assert_eq!(checked_rpi5_kernel_virt_to_phys(0x80000), None);
+        assert!(!is_rpi5_kernel_high_va(0x80000));
+        assert_eq!(checked_phys_to_rpi5_kernel_virt(u64::MAX), None);
+        assert!(!is_rpi5_low_phys(u64::MAX));
+    }
+
+    fn rpi5_high_half_plan() -> Rpi5HighHalfPlan {
+        plan_rpi5_high_half_transition(
+            0x05b5_0000,
+            0x05b6_0000,
+            Stage1KernelRange::new(0x0008_0000, 0x05b5_0000),
+            Stage1KernelRange::new(0x0100_0000, 0x0200_0000),
+            Stage1KernelRange::new(0x0010_0000, 0x0010_1000),
+            Stage1KernelRange::new(0x05b5_0000, 0x05b9_0000),
+            Stage1KernelRange::new(0x2efe_c000, 0x2f00_0000),
+            Stage1KernelRange::new(0x05b9_0000, 0x05d9_0000),
+            0x10_7d00_1000,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rpi5_high_half_plan_covers_transition_resources_and_distinct_roots() {
+        let plan = rpi5_high_half_plan();
+        assert_ne!(plan.ttbr0_root, plan.ttbr1_root);
+        assert_eq!(plan.tcr_el1, 0x0000_0002_b519_3519);
+        assert_eq!(plan.mair_el1, 0x04ff);
+        for expected in [
+            Stage1KernelRange::new(0x0008_0000, 0x05b5_0000),
+            Stage1KernelRange::new(0x0100_0000, 0x0200_0000),
+            Stage1KernelRange::new(0x0010_0000, 0x0010_1000),
+            Stage1KernelRange::new(0x05b5_0000, 0x05b9_0000),
+            Stage1KernelRange::new(0x2efe_c000, 0x2f00_0000),
+            Stage1KernelRange::new(0x05b9_0000, 0x05d9_0000),
+        ] {
+            assert!(plan.mappings[..plan.mapping_count].iter().any(|mapping| {
+                mapping.physical == expected
+                    && mapping.virtual_range.start == phys_to_rpi5_kernel_virt(expected.start)
+                    && mapping.virtual_range.end == phys_to_rpi5_kernel_virt(expected.end)
+                    && mapping.memory_type == Stage1MmuMemoryType::Normal
+            }));
+        }
+        assert!(plan.mappings[..plan.mapping_count].iter().any(|mapping| {
+            mapping.physical == Stage1KernelRange::new(0x10_7d00_1000, 0x10_7d00_2000)
+                && mapping.virtual_range
+                    == Stage1KernelRange::new(0xffff_ff90_7d00_1000, 0xffff_ff90_7d00_2000)
+                && mapping.memory_type == Stage1MmuMemoryType::DeviceNgnre
+        }));
+    }
+
+    #[test]
+    fn rpi5_high_half_plan_rejects_missing_root_and_conflicting_attributes() {
+        assert_eq!(
+            plan_rpi5_high_half_transition(
+                0x05b5_0000,
+                0,
+                Stage1KernelRange::new(0x0008_0000, 0x05b5_0000),
+                Stage1KernelRange::new(0x0100_0000, 0x0200_0000),
+                Stage1KernelRange::new(0x0010_0000, 0x0010_1000),
+                Stage1KernelRange::new(0x05b5_0000, 0x05b9_0000),
+                Stage1KernelRange::new(0x2efe_c000, 0x2f00_0000),
+                Stage1KernelRange::new(0x05b9_0000, 0x05d9_0000),
+                0x10_7d00_1000,
+            ),
+            Err(Rpi5HighHalfPlanFailure::MissingTtbr1Root)
+        );
+        let mut plan = rpi5_high_half_plan();
+        let conflicting = Rpi5HighHalfMapping {
+            physical: Stage1KernelRange::new(0x0008_0000, 0x0009_0000),
+            virtual_range: Stage1KernelRange::new(
+                phys_to_rpi5_kernel_virt(0x0008_0000),
+                phys_to_rpi5_kernel_virt(0x0009_0000),
+            ),
+            memory_type: Stage1MmuMemoryType::DeviceNgnre,
+        };
+        assert_eq!(
+            append_rpi5_high_half_mapping(&mut plan, conflicting),
+            Err(Rpi5HighHalfPlanFailure::AttributeOverlap)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2d_bridge_rejects_missing_current_task_and_wrong_root() {
+        let mut state = stage2d_bridge_state();
+        state.current_tid = None;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::CurrentTaskMissing)
+        );
+        let mut state = stage2d_bridge_state();
+        state.current_ttbr0 = state.stage2c_root;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::RootAlreadyActive)
+        );
+    }
+
+    #[test]
+    fn rpi5_stage2d_bridge_requires_matching_trap_frame_and_ttbr_split() {
+        let mut state = stage2d_bridge_state();
+        state.trap_entry += 4;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::TrapEntryMismatch)
+        );
+        let mut state = stage2d_bridge_state();
+        state.kernel_pc = 0x0010_0000;
+        state.tcr_el1 |= 1 << 23;
+        assert_eq!(
+            validate_rpi5_stage2d_enter_bridge(state),
+            Err(Stage2DEnterBridgeFailure::TtbrSplitNotReady)
         );
     }
 

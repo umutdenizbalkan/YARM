@@ -6,6 +6,7 @@ set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 generator="$repo_root/scripts/create-rpi5-stage1-boot-dir.sh"
+hh_builder="$repo_root/scripts/build-rpi5-highhalf-artifact.sh"
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -32,6 +33,46 @@ assert_not_contains() {
   fi
 }
 
+hh_marker_fixture="$tmp_dir/hh-marker-fixture.img"
+for marker in \
+  RPI5_HH_LOW_ENTRY \
+  RPI5_HH_PLAN_DONE \
+  RPI5_HH_ENABLE_DONE \
+  RPI5_HH_JUMP_HIGH \
+  RPI5_HH_HIGH_ENTRY_OK \
+  RPI5_HH_RUST_ENTRY \
+  RPI5_HH_RUST_AFTER_ENTRY \
+  RPI5_HH_READ_PC_BEGIN \
+  RPI5_HH_READ_PC_DONE \
+  RPI5_HH_READ_SP_BEGIN \
+  RPI5_HH_READ_SP_DONE \
+  RPI5_HH_READ_VBAR_BEGIN \
+  RPI5_HH_READ_VBAR_DONE \
+  RPI5_HH_READ_TTBR_BEGIN \
+  RPI5_HH_READ_TTBR_DONE \
+  RPI5_HH_READ_TCR_BEGIN \
+  RPI5_HH_READ_TCR_DONE \
+  RPI5_HH_PRINT_REGS_BEGIN \
+  RPI5_HH_PRINT_REGS_DONE \
+  RPI5_HH3_PRECHECK_DONE \
+  RPI5_HH_REGISTERS_OK \
+  RPI5_HH_RUST_UART_OK \
+  RPI5_HH3_DONE \
+  RPI5_HH4_BEGIN \
+  RPI5_HH4_DONE \
+  RPI5_HH5_BEGIN \
+  RPI5_HH5_ENTER_USER_ATTEMPT; do
+  printf '%s\n' "$marker" >> "$hh_marker_fixture"
+done
+"$hh_builder" --validate-image "$hh_marker_fixture" >/dev/null
+sed '/RPI5_HH3_DONE/d' "$hh_marker_fixture" > "$tmp_dir/hh-marker-missing.img"
+if "$hh_builder" --validate-image "$tmp_dir/hh-marker-missing.img" \
+  >"$tmp_dir/hh-marker-missing.out" 2>&1; then
+  fail "HH marker validator accepted an incomplete raw image"
+fi
+assert_contains "$tmp_dir/hh-marker-missing.out" \
+  'HH raw image is missing required marker: RPI5_HH3_DONE'
+
 kernel="$tmp_dir/fake-stage1.img"
 printf 'fake-rpi5-stage1-kernel\n' > "$kernel"
 
@@ -47,6 +88,9 @@ for setting in 'kernel=kernel_2712.img' 'arm_64bit=1' 'enable_uart=1' 'uart_2nds
 done
 assert_not_contains "$default_boot/config.txt" 'os_check=0'
 assert_not_contains "$default_boot/config.txt" 'enable_rp1_uart=1'
+assert_not_contains "$default_boot/config.txt" 'initramfs '
+assert_not_contains "$default_boot/README-RPI5-STAGE1.txt" 'Explicit high-half diagnostic mode'
+[[ ! -e "$default_boot/initramfs-stage2a.cpio" ]] || fail "default boot unexpectedly staged initrd"
 for marker in RPI5_BOOT_00_ENTRY RPI5_BOOT_01_DTB_PTR RPI5_BOOT_02_UART_SELECTED RPI5_BOOT_03_UART_OK; do
   assert_contains "$default_boot/README-RPI5-STAGE1.txt" "$marker"
 done
@@ -65,6 +109,56 @@ options_boot="$tmp_dir/options-boot"
 [[ $(<"$options_boot/cmdline.txt") == "yarm.platform=auto yarm.boot_phase=dtb yarm.max_cpus=1 console=ttyAMA10,115200 diagnostic=yes" ]] || fail "phase or cmdline extra was not generated correctly"
 assert_contains "$options_boot/config.txt" 'os_check=0'
 assert_contains "$options_boot/config.txt" 'enable_rp1_uart=1'
+
+initrd="$tmp_dir/fake-initramfs.cpio"
+printf '070701fake-stage2a-cpio\n' > "$initrd"
+initrd_boot="$tmp_dir/initrd-boot"
+"$generator" \
+  --kernel-input "$kernel" \
+  --initrd-input "$initrd" \
+  --boot-dir "$initrd_boot" \
+  --phase kernel >/dev/null
+assert_file "$initrd_boot/initramfs-stage2a.cpio"
+cmp "$initrd" "$initrd_boot/initramfs-stage2a.cpio" >/dev/null || fail "staged initrd differs from input"
+assert_contains "$initrd_boot/config.txt" 'initramfs initramfs-stage2a.cpio followkernel'
+assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" '--initrd-input build-aarch64/initramfs-core.cpio'
+assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" 'RPI5_STAGE2A_DONE'
+assert_contains "$initrd_boot/README-RPI5-STAGE1.txt" 'It does not unpack the archive or spawn userspace.'
+
+hh_kernel="$tmp_dir/fake-kernel_2712_hh.img"
+printf 'fake-rpi5-highhalf-kernel\n' > "$hh_kernel"
+hh_boot="$tmp_dir/highhalf-boot"
+"$generator" \
+  --kernel-input "$hh_kernel" \
+  --boot-dir "$hh_boot" \
+  --phase kernel \
+  --highhalf >/dev/null
+cmp "$hh_kernel" "$hh_boot/kernel_2712.img" >/dev/null || fail "HH kernel differs from explicit input"
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'Explicit high-half diagnostic mode'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'separately built kernel_2712_hh.img artifact'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH_RUST_ENTRY'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH3_DONE'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH4_DONE'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" \
+  'RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'HH-3 does not require or'
+[[ ! -e "$hh_boot/initramfs-stage2a.cpio" ]] || fail "HH mode unexpectedly required an initrd"
+
+hh_initrd_boot="$tmp_dir/highhalf-initrd-boot"
+"$generator" \
+  --kernel-input "$hh_kernel" \
+  --initrd-input "$initrd" \
+  --boot-dir "$hh_initrd_boot" \
+  --phase kernel \
+  --highhalf >/dev/null
+cmp "$initrd" "$hh_initrd_boot/initramfs-stage2a.cpio" >/dev/null ||
+  fail "HH mode did not preserve optional initrd staging"
+assert_contains "$hh_initrd_boot/config.txt" 'initramfs initramfs-stage2a.cpio followkernel'
+
+if "$generator" --highhalf --boot-dir "$tmp_dir/hh-missing-kernel" >"$tmp_dir/hh-missing.out" 2>&1; then
+  fail "HH mode without explicit kernel input unexpectedly succeeded"
+fi
+assert_contains "$tmp_dir/hh-missing.out" '--kernel-input is required'
 
 if "$generator" --kernel-input "$kernel" --boot-dir "$default_boot" >"$tmp_dir/no-force.out" 2>&1; then
   fail "existing generated files were overwritten without --force"
