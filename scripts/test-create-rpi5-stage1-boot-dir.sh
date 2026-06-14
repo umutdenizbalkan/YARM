@@ -43,7 +43,11 @@ for marker in \
   RPI5_HH_RUST_ENTRY \
   RPI5_HH_REGISTERS_OK \
   RPI5_HH_RUST_UART_OK \
-  RPI5_HH3_DONE; do
+  RPI5_HH3_DONE \
+  RPI5_HH4_BEGIN \
+  RPI5_HH4_DONE \
+  RPI5_HH5_BEGIN \
+  RPI5_HH5_ENTER_USER_ATTEMPT; do
   printf '%s\n' "$marker" >> "$hh_marker_fixture"
 done
 "$hh_builder" --validate-image "$hh_marker_fixture" >/dev/null
@@ -120,6 +124,9 @@ assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'Explicit high-half diagnostic
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'separately built kernel_2712_hh.img artifact'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH_RUST_ENTRY'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH3_DONE'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH4_DONE'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" \
+  'RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'HH-3 does not require or'
 [[ ! -e "$hh_boot/initramfs-stage2a.cpio" ]] || fail "HH mode unexpectedly required an initrd"
 

@@ -242,7 +242,7 @@ diagnostic only: it proves the low-to-high transition, high stack/vector state,
 dual TTBR roots, TCR configuration, and the high UART alias. It does not install
 a userspace TTBR0 root, enter EL0, or start the scheduler/service chain.
 
-Expected HH-3 completion markers:
+Expected high-half diagnostic markers:
   RPI5_HH_LOW_ENTRY
   RPI5_HH_PLAN_DONE
   RPI5_HH_ENABLE_DONE
@@ -252,6 +252,13 @@ Expected HH-3 completion markers:
   RPI5_HH_REGISTERS_OK
   RPI5_HH_RUST_UART_OK
   RPI5_HH3_DONE
+  RPI5_HH4_BEGIN
+  RPI5_HH4_TTBR0_REPLACE_DONE
+  RPI5_HH4_UART_AFTER_TTBR0_OK
+  RPI5_HH4_DONE
+  RPI5_HH5_BEGIN
+  RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready
+  RPI5_HH5_DONE status=deferred
 
 An initrd may still be staged with --initrd-input, but HH-3 does not require or
 consume it.

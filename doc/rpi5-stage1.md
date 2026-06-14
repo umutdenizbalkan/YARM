@@ -409,7 +409,7 @@ alias and stack-local fixed buffers. It prints and validates the current PC, SP,
 TTBR0_EL1, TTBR1_EL1, and TCR_EL1. PC, SP, and VBAR must be high; VBAR must retain 2 KiB alignment;
 the roots must be nonzero, page-aligned, distinct, and equal the linker-reserved roots; EPD1 must be
 clear; T1SZ must remain 25; and TCR must equal `0x00000002b5193519`. Success ends with
-`RPI5_HH_REGISTERS_OK`, `RPI5_HH_RUST_UART_OK`, and `RPI5_HH3_DONE`, followed by a safe halt.
+`RPI5_HH_REGISTERS_OK`, `RPI5_HH_RUST_UART_OK`, and `RPI5_HH3_DONE`, then enters HH-4.
 The four Rust success markers live in a dedicated retained
 `.rodata.rpi5_hh_markers` section. The high-half linker uses `KEEP` for that section so optimized
 code generation cannot turn the only copies into non-contiguous immediate stores or discard them.
@@ -417,12 +417,30 @@ code generation cannot turn the only copies into non-contiguous immediate stores
 `scripts/build-rpi5-highhalf-artifact.sh` is the explicit build entry point. It selects the HH target
 and feature and writes `build-rpi5/kernel_2712_hh.img`; it refuses to replace the default
 `build-rpi5/kernel_2712.img`. After objcopy, the script scans the raw image and fails unless every
-required low-transition and HH-3 success marker is present. The boot-directory generator stages that image as firmware-visible
+required low-transition, HH-3, HH-4, and HH-5 audit marker is present. The boot-directory generator stages that image as firmware-visible
 `kernel_2712.img` only when invoked with `--highhalf`. The generated README labels the image as a
 high-half diagnostic. An initrd remains optional and is not consumed by HH-3.
 
 HH-3 still does not install a user root in TTBR0, enter EL0, enable interrupts, remove the low
 identity map, or start any scheduler or service-chain component.
+
+### HH-4 low-identity retirement and HH-5 deferral
+
+After HH-3 validates the high PC, stack, VBAR, TTBR roots, TCR, and UART, HH-4 uses a distinct
+linker-reserved, page-aligned empty TTBR0 root. Before replacement it verifies that every continuation
+entry point and required output marker is a high VA, zeros and cleans the empty root, then performs
+`DSB ISHST`, writes TTBR0_EL1, executes `ISB`, invalidates EL1 translations with `TLBI VMALLE1`, and
+finishes with `DSB ISH` plus `ISB`. The post-replacement path reads back TTBR0 and proves PC, SP,
+VBAR, and the bounded UART remain usable solely through TTBR1 high aliases.
+
+HH-5 starts only with the private readiness token returned by successful HH-4. The current HH target
+does not yet reuse the Stage2C loader because that loader consumes a low-physical allocator and
+firmware DTB/initrd pointers. Accessing those after the empty TTBR0 replacement would violate HH-4's
+no-low-VA contract. HH-5 therefore reports
+`RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready` and halts with
+`RPI5_HH5_DONE status=deferred`. It retains future load/attempt marker bytes for artifact auditing,
+but does not emit the attempt marker, install a user root, compile an EL0 ERET path, or claim EL0
+success.
 
 The selected UART `reg` address is a child-bus address. Translation walks each parent bus, uses that
 bus node's `#address-cells` and `#size-cells` together with its parent's address-cell count, and scans

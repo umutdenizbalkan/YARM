@@ -597,6 +597,210 @@ rpi5_hh_retained_marker!(RPI5_HH_RUST_UART_OK_MARKER, b"RPI5_HH_RUST_UART_OK");
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(RPI5_HH3_DONE_MARKER, b"RPI5_HH3_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_BEGIN_MARKER, b"RPI5_HH4_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_PRECHECK_OK_MARKER, b"RPI5_HH4_PRECHECK_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER,
+    b"RPI5_HH4_EMPTY_TTBR0_ROOT base=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_TTBR0_REPLACE_BEGIN_MARKER,
+    b"RPI5_HH4_TTBR0_REPLACE_BEGIN old=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_NEW_TTBR0_SEPARATOR, b" new=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_TTBR0_REPLACE_DONE_MARKER,
+    b"RPI5_HH4_TTBR0_REPLACE_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_PC_HIGH_OK_MARKER, b"RPI5_HH4_PC_HIGH_OK value=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_SP_HIGH_OK_MARKER, b"RPI5_HH4_SP_HIGH_OK value=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_VBAR_HIGH_OK_MARKER,
+    b"RPI5_HH4_VBAR_HIGH_OK value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER,
+    b"RPI5_HH4_UART_AFTER_TTBR0_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_DONE_MARKER, b"RPI5_HH4_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_FAILED_MARKER, b"RPI5_HH4_FAILED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_BEGIN_MARKER, b"RPI5_HH5_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INITRD_READY_MARKER,
+    b"RPI5_HH5_INITRD_READY start=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INIT_LOOKUP_OK_MARKER,
+    b"RPI5_HH5_INIT_LOOKUP_OK offset=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INIT_ELF_OK_MARKER,
+    b"RPI5_HH5_INIT_ELF_OK entry=0x00000000004023d8"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_USER_ROOT_READY_MARKER,
+    b"RPI5_HH5_USER_ROOT_READY base=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INIT_STACK_READY_MARKER,
+    b"RPI5_HH5_INIT_STACK_READY sp=0x000000003fe00000"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_TRAP_FRAME_READY_MARKER,
+    b"RPI5_HH5_TRAP_FRAME_READY entry=0x00000000004023d8 sp=0x000000003fe00000"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ENTER_USER_PRECHECK_OK_MARKER,
+    b"RPI5_HH5_ENTER_USER_PRECHECK_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_TTBR0_USER_INSTALL_MARKER,
+    b"RPI5_HH5_TTBR0_USER_INSTALL root=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ENTER_USER_ATTEMPT_MARKER,
+    b"RPI5_HH5_ENTER_USER_ATTEMPT tid=1 entry=0x00000000004023d8 sp=0x000000003fe00000"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_DEFERRED_MARKER, b"RPI5_HH5_DEFERRED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_DONE_DEFERRED_MARKER,
+    b"RPI5_HH5_DONE status=deferred"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_FAILED_MARKER, b"RPI5_HH5_FAILED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ENTER_USER_FAILED_MARKER,
+    b"RPI5_HH5_ENTER_USER_FAILED reason="
+);
 
 #[cfg(all(
     not(feature = "hosted-dev"),
@@ -641,15 +845,25 @@ fn rpi5_hh_write_line(line: &[u8]) -> bool {
 ))]
 fn rpi5_hh_write_hex_line(prefix: &[u8], value: u64) -> bool {
     let mut digits = [0u8; 16];
-    for (index, digit) in digits.iter_mut().enumerate() {
-        let nibble = ((value >> (60 - index * 4)) & 0xf) as u8;
-        *digit = if nibble < 10 {
-            b'0' + nibble
-        } else {
-            b'a' + nibble - 10
-        };
-    }
+    rpi5_hh_hex_digits(value, &mut digits);
     rpi5_hh_write_bytes(prefix) && rpi5_hh_write_bytes(&digits) && rpi5_hh_write_bytes(b"\r\n")
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_write_two_hex_line(prefix: &[u8], first: u64, separator: &[u8], second: u64) -> bool {
+    let mut first_digits = [0u8; 16];
+    let mut second_digits = [0u8; 16];
+    rpi5_hh_hex_digits(first, &mut first_digits);
+    rpi5_hh_hex_digits(second, &mut second_digits);
+    rpi5_hh_write_bytes(prefix)
+        && rpi5_hh_write_bytes(&first_digits)
+        && rpi5_hh_write_bytes(separator)
+        && rpi5_hh_write_bytes(&second_digits)
+        && rpi5_hh_write_bytes(b"\r\n")
 }
 
 #[cfg(all(
@@ -667,6 +881,244 @@ fn rpi5_hh_fail(reason: &[u8]) -> ! {
             core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
         }
     }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_halt() -> ! {
+    loop {
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh4_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(&RPI5_HH4_FAILED_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    rpi5_hh_halt()
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+struct Rpi5Hh4Ready {
+    empty_ttbr0_root: u64,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh4_retire_low_ttbr0() -> Rpi5Hh4Ready {
+    unsafe extern "C" {
+        static __hh_ttbr0_root: u8;
+        static __hh_ttbr1_root: u8;
+        static __hh_empty_ttbr0_root: u8;
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH4_BEGIN_MARKER) {
+        rpi5_hh4_fail(b"uart_timeout");
+    }
+
+    let pc: u64;
+    let sp: u64;
+    let vbar: u64;
+    let old_ttbr0: u64;
+    let ttbr1: u64;
+    unsafe {
+        core::arch::asm!(
+            "adr {pc}, .",
+            "mov {sp}, sp",
+            "mrs {vbar}, VBAR_EL1",
+            "mrs {ttbr0}, TTBR0_EL1",
+            "mrs {ttbr1}, TTBR1_EL1",
+            pc = out(reg) pc,
+            sp = out(reg) sp,
+            vbar = out(reg) vbar,
+            ttbr0 = out(reg) old_ttbr0,
+            ttbr1 = out(reg) ttbr1,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+
+    let root_mask = !0xfffu64;
+    let expected_old_ttbr0 = core::ptr::addr_of!(__hh_ttbr0_root) as u64;
+    let expected_ttbr1 = core::ptr::addr_of!(__hh_ttbr1_root) as u64;
+    let empty_ttbr0_root = core::ptr::addr_of!(__hh_empty_ttbr0_root) as u64;
+    if pc < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"pc_not_high");
+    }
+    if sp < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"sp_not_high");
+    }
+    if vbar < RPI5_HH_VA_OFFSET || vbar & 0x7ff != 0 {
+        rpi5_hh4_fail(b"vbar_not_high_aligned");
+    }
+    if old_ttbr0 & root_mask != expected_old_ttbr0 {
+        rpi5_hh4_fail(b"old_ttbr0_mismatch");
+    }
+    if ttbr1 & root_mask != expected_ttbr1 {
+        rpi5_hh4_fail(b"ttbr1_root_mismatch");
+    }
+    if empty_ttbr0_root == 0
+        || empty_ttbr0_root & 0xfff != 0
+        || empty_ttbr0_root == expected_old_ttbr0
+        || empty_ttbr0_root == expected_ttbr1
+    {
+        rpi5_hh4_fail(b"empty_ttbr0_invalid");
+    }
+    for address in [
+        core::ptr::addr_of!(RPI5_HH4_TTBR0_REPLACE_DONE_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_PC_HIGH_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_SP_HIGH_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_VBAR_HIGH_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER) as u64,
+        core::ptr::addr_of!(RPI5_HH4_DONE_MARKER) as u64,
+        rpi5_hh4_retire_low_ttbr0 as usize as u64,
+        rpi5_hh5_defer as usize as u64,
+    ] {
+        if address < RPI5_HH_VA_OFFSET {
+            rpi5_hh4_fail(b"post_replace_pointer_not_high");
+        }
+    }
+    if !rpi5_hh_write_line(&RPI5_HH4_PRECHECK_OK_MARKER)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER, empty_ttbr0_root)
+        || !rpi5_hh_write_two_hex_line(
+            &RPI5_HH4_TTBR0_REPLACE_BEGIN_MARKER,
+            old_ttbr0,
+            &RPI5_HH4_NEW_TTBR0_SEPARATOR,
+            empty_ttbr0_root,
+        )
+    {
+        rpi5_hh4_fail(b"uart_timeout");
+    }
+
+    let empty_root = empty_ttbr0_root as *mut u64;
+    for index in 0..512 {
+        unsafe {
+            core::ptr::write_volatile(empty_root.add(index), 0);
+        }
+    }
+    for offset in (0..4096).step_by(64) {
+        let address = empty_ttbr0_root + offset;
+        unsafe {
+            core::arch::asm!("dc cvac, {address}", address = in(reg) address, options(nostack));
+        }
+    }
+
+    /*
+     * This is the HH-4 architectural boundary. Every instruction, stack
+     * access, literal, vector, and UART access after the TTBR write uses a
+     * TTBR1 high address. The empty root deliberately maps no low addresses.
+     */
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "msr TTBR0_EL1, {root}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            root = in(reg) empty_ttbr0_root,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    let replaced_ttbr0: u64;
+    let post_pc: u64;
+    let post_sp: u64;
+    let post_vbar: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {ttbr0}, TTBR0_EL1",
+            "adr {pc}, .",
+            "mov {sp}, sp",
+            "mrs {vbar}, VBAR_EL1",
+            ttbr0 = out(reg) replaced_ttbr0,
+            pc = out(reg) post_pc,
+            sp = out(reg) post_sp,
+            vbar = out(reg) post_vbar,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if replaced_ttbr0 & root_mask != empty_ttbr0_root {
+        rpi5_hh4_fail(b"ttbr0_replace_readback");
+    }
+    if post_pc < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"post_replace_pc_not_high");
+    }
+    if post_sp < RPI5_HH_VA_OFFSET {
+        rpi5_hh4_fail(b"post_replace_sp_not_high");
+    }
+    if post_vbar < RPI5_HH_VA_OFFSET || post_vbar & 0x7ff != 0 {
+        rpi5_hh4_fail(b"post_replace_vbar_not_high");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH4_TTBR0_REPLACE_DONE_MARKER)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_PC_HIGH_OK_MARKER, post_pc)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_SP_HIGH_OK_MARKER, post_sp)
+        || !rpi5_hh_write_hex_line(&RPI5_HH4_VBAR_HIGH_OK_MARKER, post_vbar)
+        || !rpi5_hh_write_line(&RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_HH4_DONE_MARKER)
+    {
+        rpi5_hh4_fail(b"uart_timeout");
+    }
+
+    Rpi5Hh4Ready { empty_ttbr0_root }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_hex_digits(value: u64, digits: &mut [u8; 16]) {
+    for (index, digit) in digits.iter_mut().enumerate() {
+        let nibble = ((value >> (60 - index * 4)) & 0xf) as u8;
+        *digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+    }
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh5_defer(hh4: Rpi5Hh4Ready) -> ! {
+    if hh4.empty_ttbr0_root == 0 {
+        let _ = rpi5_hh_write_bytes(&RPI5_HH5_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"hh4_not_ready");
+        rpi5_hh_halt();
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    /*
+     * Outcome C: HH-4 has retired the low identity root, but the existing
+     * Stage2C builder owns a low-physical allocator and consumes the firmware
+     * DTB/initrd through low pointers. Reusing it here would violate HH-4's
+     * no-low-VA contract. Keep the future attempt/ERET/trap markers retained
+     * for artifact auditing, but do not emit them and do not execute ERET.
+     */
+    let _ = rpi5_hh_write_bytes(&RPI5_HH5_DEFERRED_MARKER);
+    let _ = rpi5_hh_write_line(b"high_half_initrd_allocator_bridge_not_ready");
+    let _ = rpi5_hh_write_line(&RPI5_HH5_DONE_DEFERRED_MARKER);
+    rpi5_hh_halt()
 }
 
 #[cfg(all(
@@ -756,11 +1208,8 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
     {
         rpi5_hh_fail(b"uart_timeout");
     }
-    loop {
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
+    let hh4 = rpi5_hh4_retire_low_ttbr0();
+    rpi5_hh5_defer(hh4)
 }
 
 #[cfg(all(

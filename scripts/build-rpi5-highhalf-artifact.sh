@@ -41,6 +41,10 @@ required_markers=(
   RPI5_HH_REGISTERS_OK
   RPI5_HH_RUST_UART_OK
   RPI5_HH3_DONE
+  RPI5_HH4_BEGIN
+  RPI5_HH4_DONE
+  RPI5_HH5_BEGIN
+  RPI5_HH5_ENTER_USER_ATTEMPT
 )
 
 validate_raw_image_markers() {
@@ -77,7 +81,7 @@ done
 
 if [[ -n "$validate_image" ]]; then
   validate_raw_image_markers "$validate_image"
-  echo "[ok] RPi5 HH raw image contains all required HH-3 markers: $validate_image"
+  echo "[ok] RPi5 HH raw image contains all required transition markers: $validate_image"
   exit 0
 fi
 
@@ -130,12 +134,18 @@ grep -Eq 'ffffff8000000000[[:space:]].*__kernel_va_offset$' "$readelf_report" ||
 
 ttbr0=$("$readelf_bin" -W -s "$elf" | awk '$NF == "__hh_ttbr0_root" { print $2; exit }')
 ttbr1=$("$readelf_bin" -W -s "$elf" | awk '$NF == "__hh_ttbr1_root" { print $2; exit }')
-[[ -n "$ttbr0" && -n "$ttbr1" ]] || fail "HH ELF TTBR root symbols are missing"
+empty_ttbr0=$("$readelf_bin" -W -s "$elf" | awk '$NF == "__hh_empty_ttbr0_root" { print $2; exit }')
+[[ -n "$ttbr0" && -n "$ttbr1" && -n "$empty_ttbr0" ]] ||
+  fail "HH ELF TTBR root symbols are missing"
 [[ "$ttbr0" != "$ttbr1" ]] || fail "HH ELF TTBR root symbols are not distinct"
+[[ "$empty_ttbr0" != "$ttbr0" && "$empty_ttbr0" != "$ttbr1" ]] ||
+  fail "HH ELF empty TTBR0 root is not distinct"
+[[ "$empty_ttbr0" =~ 000$ ]] || fail "HH ELF empty TTBR0 root is not page aligned"
 
 echo "[ok] RPi5 HH ELF: $elf"
 echo "[ok] RPi5 HH raw image: $output"
-echo "[ok] RPi5 HH raw image contains all required HH-3 markers"
+echo "[ok] RPi5 HH raw image contains all required transition markers"
 echo "[ok] RPi5 HH readelf proof: $readelf_report"
 echo "[ok] TTBR0 root: 0x$ttbr0"
 echo "[ok] TTBR1 root: 0x$ttbr1"
+echo "[ok] empty TTBR0 root: 0x$empty_ttbr0"

@@ -56,7 +56,9 @@ SECTIONS {
         . += 4096;
         __hh_uart1_l3 = .;
         . += 4096;
-        . += 10 * 4096;
+        __hh_empty_ttbr0_root = .;
+        . += 4096;
+        . += 9 * 4096;
     } :boot
     __hh_pt_pool_end = .;
 

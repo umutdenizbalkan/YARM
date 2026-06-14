@@ -522,6 +522,7 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "__hh_pt_pool_end",
         "__hh_ttbr0_root",
         "__hh_ttbr1_root",
+        "__hh_empty_ttbr0_root",
         "__hh_uart0_l2",
         "__hh_uart0_l3",
         "__hh_uart1_l2",
@@ -558,6 +559,10 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH_REGISTERS_OK",
         "RPI5_HH_RUST_UART_OK",
         "RPI5_HH3_DONE",
+        "RPI5_HH4_BEGIN",
+        "RPI5_HH4_DONE",
+        "RPI5_HH5_BEGIN",
+        "RPI5_HH5_ENTER_USER_ATTEMPT",
         "RPI5_HH3_FAILED reason=",
         "RPI5_HH_REGISTER_MISMATCH reason=",
     ] {
@@ -597,6 +602,8 @@ fn rpi5_hh3_build_and_generator_paths_are_explicit() {
     assert!(build.contains("validate_raw_image_markers"));
     assert!(build.contains("grep -aFq -- \"$marker\" \"$image\""));
     assert!(build.contains("--validate-image"));
+    assert!(build.contains("__hh_empty_ttbr0_root"));
+    assert!(build.contains("empty TTBR0 root is not distinct"));
     for marker in [
         "RPI5_HH_LOW_ENTRY",
         "RPI5_HH_PLAN_DONE",
@@ -607,6 +614,10 @@ fn rpi5_hh3_build_and_generator_paths_are_explicit() {
         "RPI5_HH_REGISTERS_OK",
         "RPI5_HH_RUST_UART_OK",
         "RPI5_HH3_DONE",
+        "RPI5_HH4_BEGIN",
+        "RPI5_HH4_DONE",
+        "RPI5_HH5_BEGIN",
+        "RPI5_HH5_ENTER_USER_ATTEMPT",
     ] {
         assert!(build.contains(marker), "build validation omits {marker}");
     }
@@ -630,4 +641,40 @@ fn rpi5_hh3_success_markers_are_retained_in_the_high_image() {
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)"));
+}
+
+#[test]
+fn rpi5_hh4_retires_low_ttbr0_and_hh5_defers_without_eret() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let linker = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.ld");
+    let hh4_start = boot.find("fn rpi5_hh4_retire_low_ttbr0").unwrap();
+    let hh5_end = boot[hh4_start..]
+        .find("fn yarm_rpi5_hh_rust_continue")
+        .unwrap()
+        + hh4_start;
+    let hh45 = &boot[hh4_start..hh5_end];
+
+    assert!(linker.contains("__hh_empty_ttbr0_root"));
+    assert!(hh45.contains("if pc < RPI5_HH_VA_OFFSET"));
+    assert!(hh45.contains("if sp < RPI5_HH_VA_OFFSET"));
+    assert!(hh45.contains("vbar < RPI5_HH_VA_OFFSET"));
+    assert!(hh45.contains("empty_ttbr0_root & 0xfff != 0"));
+    assert!(hh45.contains("empty_ttbr0_root == expected_ttbr1"));
+    assert!(hh45.contains("\"dsb ishst\""));
+    assert!(hh45.contains("\"msr TTBR0_EL1, {root}\""));
+    assert!(hh45.contains("\"tlbi vmalle1\""));
+    assert!(hh45.contains("\"dsb ish\""));
+    assert!(hh45.contains("RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER"));
+    assert!(hh45.contains("Rpi5Hh4Ready"));
+    assert!(hh45.contains("fn rpi5_hh5_defer(hh4: Rpi5Hh4Ready) -> !"));
+    assert!(hh45.contains("high_half_initrd_allocator_bridge_not_ready"));
+    assert!(!hh45.contains("core::arch::asm!(\"eret\""));
+    assert!(!boot.contains("RPI5_HH5_ENTER_USER_ERET"));
+    assert!(!boot.contains("RPI5_HH5_FIRST_USER_TRAP"));
+    assert!(!hh45.contains("yarm_log!"));
+    assert!(!hh45.contains("printk"));
+    assert!(!hh45.contains("scheduler"));
+    assert!(!hh45.contains("init_gic"));
+    assert!(!hh45.contains("init_rp1"));
+    assert!(!hh45.contains("init_pcie"));
 }
