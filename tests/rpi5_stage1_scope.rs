@@ -552,7 +552,17 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH_RUST_ENTRY",
         "RPI5_HH_RUST_AFTER_ENTRY",
         "RPI5_HH_READ_PC_BEGIN",
+        "RPI5_HH_READ_PC_CAPTURED",
+        "RPI5_HH_READ_PC_PRINT_BEGIN",
+        "RPI5_HH_HEX_BEGIN",
+        "RPI5_HH_HEX_DIGIT_BEGIN",
+        "RPI5_HH_HEX_DIGIT_DONE",
+        "RPI5_HH_HEX_DONE",
+        "RPI5_HH_HEX_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=hex_output",
         "RPI5_HH_READ_PC_DONE value=0x",
+        "RPI5_HH_READ_PC_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=pc_read_or_print",
         "RPI5_HH_READ_SP_BEGIN",
         "RPI5_HH_READ_SP_DONE value=0x",
         "RPI5_HH_READ_VBAR_BEGIN",
@@ -586,6 +596,11 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
     assert!(boot.contains("ldr x19, =HH_UART_VIRT"));
     assert!(boot.contains("br x0"));
     assert!(boot.contains("extern \"C\" fn yarm_rpi5_hh_rust_continue() -> !"));
+    assert!(boot.contains("\"adr {pc}, 2f\""));
+    assert!(boot.contains("\"2:\""));
+    assert!(boot.contains("while nibble_index < 16"));
+    assert!(boot.contains("core::ptr::write_volatile(hh_pc_hex_data, $byte as u32)"));
+    assert!(!boot.contains("rpi5_hh_write_hex_line(&RPI5_HH_READ_PC_DONE_MARKER, pc)"));
     assert!(boot.contains("RPI5_HH_VA_OFFSET: u64 = 0xffff_ff80_0000_0000"));
     assert!(boot.contains("tcr & (1 << 23) != 0"));
     assert!(policy.contains("plan_rpi5_high_half_transition"));
@@ -626,7 +641,17 @@ fn rpi5_hh3_build_and_generator_paths_are_explicit() {
         "RPI5_HH_RUST_ENTRY",
         "RPI5_HH_RUST_AFTER_ENTRY",
         "RPI5_HH_READ_PC_BEGIN",
+        "RPI5_HH_READ_PC_CAPTURED",
+        "RPI5_HH_READ_PC_PRINT_BEGIN",
+        "RPI5_HH_HEX_BEGIN",
+        "RPI5_HH_HEX_DIGIT_BEGIN",
+        "RPI5_HH_HEX_DIGIT_DONE",
+        "RPI5_HH_HEX_DONE",
+        "RPI5_HH_HEX_FAILED",
+        "RPI5_HH3_FAULT_BOUNDARY reason=hex_output",
         "RPI5_HH_READ_PC_DONE",
+        "RPI5_HH_READ_PC_FAILED",
+        "RPI5_HH3_FAULT_BOUNDARY reason=pc_read_or_print",
         "RPI5_HH_READ_SP_BEGIN",
         "RPI5_HH_READ_SP_DONE",
         "RPI5_HH_READ_VBAR_BEGIN",
@@ -660,6 +685,12 @@ fn rpi5_hh3_success_markers_are_retained_in_the_high_image() {
     assert!(linker.contains("KEEP(*(.rodata.rpi5_hh_markers))"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_AFTER_ENTRY_MARKER)"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_READ_PC_CAPTURED_MARKER)"));
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_READ_PC_PRINT_BEGIN_MARKER)"));
+    assert!(boot.contains("RPI5_HH_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_HEX_DONE_MARKER"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_PRECHECK_DONE_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)"));
