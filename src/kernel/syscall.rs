@@ -8956,45 +8956,51 @@ mod tests {
     }
 
     #[test]
-    fn stage109_smp_ap_trampoline_asm_park_default_preserved() {
-        // The trampoline asm MUST still default to the assembly cli/hlt
-        // park loop. Pass 2 keeps the trampoline byte-identical to Stage
-        // 108 (the proposed Rust-jump tail was reverted after a -smp 2
-        // BSP service-chain regression).
-        let src = include_str!("../arch/x86_64/smp_trampoline.rs");
-        assert!(
-            src.contains("// Park AP fully offline in assembly."),
-            "the assembly park comment must remain"
-        );
-        assert!(
-            !src.contains("test rax, rax\n    jnz"),
-            "the Rust-jump trampoline tail must remain reverted in Pass 2"
-        );
-    }
-
-    #[test]
-    fn stage108_smp_ap_still_parks_in_assembly() {
-        // Honest-blocker fence: the AP parks in an assembly cli/hlt loop and
-        // never enters Rust. Until an AP per-CPU environment (IDT/TSS/GS/
-        // scheduler/log) exists, x86_64 SMP scheduling is NOT possible and no
-        // SMP smoke may be claimed. See audit doc §23.
+    fn stage109_smp_ap_enters_rust_and_publishes_online() {
+        // Pass 2: the AP trampoline publishes the "Rust online" value (2)
+        // into the identity-mapped ready_word slot immediately before
+        // `jmp rax`ing into the higher-half Rust AP entry, which parks the
+        // AP in a Rust-controlled cli/hlt loop. This pins:
+        //   (a) the trampoline writes 2 to the ready_word slot from
+        //       low-RIP code (architecturally clean — same write site that
+        //       already worked for the `=1` store) BEFORE jumping to Rust
+        //   (b) the trampoline tail has movabs+jmp rax sequence to Rust
+        //   (c) the assembly cli/hlt loop is the FALLBACK after Rust (Rust
+        //       won't return because it's -> !)
+        //   (d) the Rust entry emits the `@` COM1 breadcrumb (Rust-entered
+        //       proof) and parks forever
+        //   (e) the AP is fenced from scheduler bring-up — production
+        //       scheduler stays BSP-only
         let tramp_src = include_str!("../arch/x86_64/smp_trampoline.rs");
         assert!(
-            tramp_src.contains("Park AP fully offline in assembly"),
-            "the assembly park comment must remain until APs get a Rust environment"
+            tramp_src
+                .contains("mov dword ptr [AP_TRAMPOLINE_BASE + AP_OFF_HANDOFF + 32], 2"),
+            "trampoline must publish Rust-online value (2) into ready_word \
+             before jumping to Rust"
         );
-        // start_secondary_cpus still returns Ok(0) — no scheduler CPU online.
+        assert!(
+            tramp_src.contains("movabs rax, OFFSET yarm_x86_64_ap_entry")
+                && tramp_src.contains("jmp rax"),
+            "trampoline tail must movabs the Rust entry addr and jmp into it"
+        );
+        assert!(
+            tramp_src.contains("Fallback assembly park"),
+            "fallback assembly park must remain as defense-in-depth"
+        );
+        assert!(
+            tramp_src.contains("Emit '@' (Rust-entered breadcrumb)"),
+            "Rust AP entry must emit the @ breadcrumb on entry"
+        );
         let smp_src = include_str!("../arch/x86_64/smp.rs");
         assert!(
-            smp_src.contains("Do NOT call kernel.bring_up_cpu(cpu) yet."),
-            "start_secondary_cpus must not bring APs into the scheduler yet"
+            !smp_src.contains("kernel.bring_up_cpu(cpu)"),
+            "production scheduler bring-up must remain BSP-only in Pass 2"
         );
-        // The exact blocker (AP per-CPU environment) is documented in the
-        // Milestone 2 prep doc.
         let m2 = include_str!("../../doc/KERNEL_UNLOCKING_MILESTONE_2.md");
         assert!(
-            m2.contains("Exact remaining x86_64 SMP blocker"),
-            "Milestone 2 doc must record the exact SMP blocker"
+            m2.contains("Exact remaining x86_64 SMP blocker")
+                || m2.contains("x86_64 AP Rust online"),
+            "Milestone 2 doc must record the SMP AP Rust-online status"
         );
     }
 

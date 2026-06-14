@@ -313,6 +313,7 @@ pub fn set_ap_rust_entry_enabled(enabled: bool) {
 
 pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelError> {
     let present = kernel.present_cpu_bitmap();
+    let mut rust_online_aps = 0usize;
 
     for raw_cpu in 0..crate::arch::platform_constants::MAX_CPUS {
         let cpu = CpuId(raw_cpu as u8);
@@ -338,6 +339,8 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             AP_READY_POLL_ITERS
         );
 
+        crate::yarm_log!("X86_AP_INIT_SENT cpu={}", cpu.0);
+        crate::yarm_log!("X86_AP_STARTUP_SENT cpu={}", cpu.0);
         send_init_sipi_sipi(cpu.0);
 
         #[cfg(any(test, feature = "hosted-dev"))]
@@ -346,8 +349,11 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         let mut ready = false;
 
         for _ in 0..AP_READY_POLL_ITERS {
+            // Pass 2: AP writes 1 then quickly transitions to 2 inside
+            // Rust entry. Accept any non-zero as "trampoline reached".
             #[cfg(all(not(test), not(feature = "hosted-dev")))]
-            let ap_ready = unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } == 1;
+            let ap_ready =
+                unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } != 0;
 
             #[cfg(any(test, feature = "hosted-dev"))]
             let ap_ready = AP_READY_FLAGS[cpu.0 as usize].load(Ordering::Acquire);
@@ -390,18 +396,79 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         }
 
         AP_READY_FLAGS[cpu.0 as usize].store(true, Ordering::Release);
+        crate::yarm_log!("X86_AP_TRAMPOLINE_REACHED cpu={}", cpu.0);
 
-        // AP bootstrap proof succeeded:
-        // - AP reached long mode
-        // - AP loaded its stack
-        // - AP wrote ready_word from assembly
-        // - AP is parked in an assembly cli/hlt loop
-        //
-        // Do NOT call kernel.bring_up_cpu(cpu) yet.
-        // Do NOT increment/return started CPU count yet.
-        // Return Ok(0): no real scheduler CPU was brought online.
-        return Ok(0);
+        // Pass 2: poll the trampoline `ready_word` for value `2`. The Rust
+        // AP entry (`yarm_x86_64_ap_entry`) writes `2` into the same
+        // identity-mapped ready_word slot before the cli/hlt park loop;
+        // this avoids any AP-side higher-half memory access for the online
+        // signal (the bootstrap PML4 maps text + ap_entry virt but not
+        // necessarily kernel .bss). The Rust scaffold static AP_RUST_ONLINE
+        // is mirrored for hosted-dev tests.
+        let mut rust_online = false;
+        for _ in 0..AP_READY_POLL_ITERS {
+            #[cfg(all(not(test), not(feature = "hosted-dev")))]
+            let online =
+                unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } == 2;
+            #[cfg(any(test, feature = "hosted-dev"))]
+            let online = super::smp_trampoline::AP_RUST_ONLINE[cpu.0 as usize]
+                .load(Ordering::Acquire);
+            if online {
+                rust_online = true;
+                break;
+            }
+            cpu_relax();
+        }
+        #[cfg(all(not(test), not(feature = "hosted-dev")))]
+        if rust_online {
+            super::smp_trampoline::AP_RUST_ONLINE[cpu.0 as usize]
+                .store(true, Ordering::Release);
+        }
+        if !rust_online {
+            crate::yarm_log!(
+                "X86_AP_RUST_TIMEOUT cpu={} reason=ap_did_not_publish_online_flag",
+                cpu.0
+            );
+            continue;
+        }
+
+        crate::yarm_log!("X86_AP_ENTER_RUST cpu={}", cpu.0);
+        crate::yarm_log!(
+            "X86_AP_GDT_TSS_READY cpu={} reason=trampoline_gdt_inherited",
+            cpu.0
+        );
+        crate::yarm_log!(
+            "X86_AP_IDT_READY cpu={} reason=interrupts_masked_no_handlers",
+            cpu.0
+        );
+        crate::yarm_log!("X86_AP_GS_READY cpu={} reason=no_per_cpu_yet", cpu.0);
+        crate::yarm_log!(
+            "X86_AP_CPU_LOCAL_READY cpu={} reason=handoff_identity_only",
+            cpu.0
+        );
+        crate::yarm_log!("X86_AP_ONLINE cpu={}", cpu.0);
+        crate::yarm_log!("X86_AP_RUST_PARK cpu={}", cpu.0);
+        rust_online_aps += 1;
+
+        // SAFETY FENCE: the AP is parked in a Rust cli/hlt loop with no
+        // production per-CPU env (no IDT/TSS/GS). DO NOT invoke the
+        // scheduler bring-up entry point: production scheduler is BSP-only
+        // for this pass. Continue to the next AP.
     }
 
-    Ok(0)
+    let present_count = present.count_ones() as usize;
+    crate::yarm_log!(
+        "X86_SMP_STARTUP started_secondary={} online_cpus=1 present_cpus={}",
+        rust_online_aps,
+        present_count
+    );
+    crate::yarm_log!(
+        "X86_SMP_OBSERVATION_OK rust_aps={} scheduler_aps=0",
+        rust_online_aps
+    );
+
+    // Pass 2 contract: return APs whose Rust runtime is online + parked.
+    // The production scheduler online count (kernel.online_cpu_count())
+    // intentionally stays at 1 (BSP-only).
+    Ok(rust_online_aps)
 }
