@@ -103,6 +103,9 @@ impl PageTableState {
         for (idx, slot) in self.pages.iter_mut().enumerate() {
             if slot.is_none() {
                 let phys = alloc_pt_frame().map_err(|_| PageTableError::OutOfMemory)?;
+                // The hardware walks the *physical* frame, so it must start
+                // zeroed (no stale/garbage PTEs from a recycled frame).
+                zero_pt_frame(phys);
                 *slot = Some(PageTablePage::new(phys));
                 return Ok(idx);
             }
@@ -143,6 +146,35 @@ impl PageTableState {
 
 static PAGE_TABLE_STATE: SpinLockIrq<PageTableState> = SpinLockIrq::new(PageTableState::new());
 
+/// Writes a single PTE word into the actual physical page-table frame the MMU
+/// walks. RISC-V identity-maps page-table frames (satp=0 bare mode during
+/// setup, and the kernel-shared gigapage once a user satp is active), so the
+/// frame's physical address is directly addressable. The in-memory
+/// `PageTablePage::entries` shadow is kept in sync for software walks; this is
+/// the half that the hardware actually reads.
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn store_pte_to_frame(frame_phys: u64, index: usize, pte: PageTableEntry) {
+    unsafe {
+        core::ptr::write_volatile((frame_phys as *mut u64).add(index), pte.0);
+    }
+}
+
+#[cfg(any(test, feature = "hosted-dev", not(target_arch = "riscv64")))]
+fn store_pte_to_frame(_frame_phys: u64, _index: usize, _pte: PageTableEntry) {}
+
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn zero_pt_frame(frame_phys: u64) {
+    unsafe {
+        let ptr = frame_phys as *mut u64;
+        for i in 0..ENTRIES_PER_TABLE {
+            core::ptr::write_volatile(ptr.add(i), 0);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "hosted-dev", not(target_arch = "riscv64")))]
+fn zero_pt_frame(_frame_phys: u64) {}
+
 pub fn reset_state() {
     let mut state = PAGE_TABLE_STATE.lock();
     for page in &mut state.pages {
@@ -159,12 +191,14 @@ fn level_index(va: u64, shift: u64) -> usize {
 }
 
 fn table_flags_from_page_flags(flags: PageFlags) -> u64 {
-    let mut bits = PageTableEntry::VALID;
-    if flags.user {
-        bits |= PageTableEntry::USER;
-    }
-    bits |= cache_policy_bits(flags.cache_policy);
-    bits
+    // Per the RISC-V Sv39 spec, a non-leaf (table-pointer) PTE has R=W=X=0
+    // and "U, A, D, and G bits are reserved for future use and must be cleared
+    // by software for forward compatibility." QEMU enforces this — setting U
+    // on an intermediate PTE causes the walk to be classified as a leaf with
+    // bad permissions, which surfaces as an instruction page fault even though
+    // the actual leaf has correct flags. Only the VALID bit is allowed here.
+    let _ = flags;
+    PageTableEntry::VALID
 }
 
 fn leaf_flags_from_page_flags(flags: PageFlags) -> u64 {
@@ -210,8 +244,9 @@ fn walk_or_create(
     }
     let child_idx = state.alloc_page()?;
     let child_phys = state.pages[child_idx].expect("child").phys;
-    state.pages[table_idx].as_mut().expect("table").entries[index] =
-        PageTableEntry::with_addr_and_flags(child_phys, table_flags_from_page_flags(flags));
+    let pte = PageTableEntry::with_addr_and_flags(child_phys, table_flags_from_page_flags(flags));
+    state.pages[table_idx].as_mut().expect("table").entries[index] = pte;
+    store_pte_to_frame(table_phys, index, pte);
     Ok(child_phys)
 }
 
@@ -273,6 +308,52 @@ pub fn cr3_for_asid(asid: Asid) -> Option<u64> {
     Some(SATP_MODE_SV39 | asid_bits | root_ppn)
 }
 
+/// Kernel-shared identity gigapage covering [0x8000_0000, 0xC000_0000): the
+/// kernel image (text/rodata/data/bss), all frame-allocated kernel stacks, and
+/// the S-mode trap vector. RISC-V userspace bring-up: installed into every user
+/// address-space root so the kernel keeps executing across a `satp` switch into
+/// a user page table while U-mode (no USER bit) cannot reach kernel memory.
+pub const RISCV_KERNEL_SHARED_BASE: u64 = 0x8000_0000;
+pub const RISCV_KERNEL_SHARED_END: u64 = 0xC000_0000;
+
+/// Installs the kernel-shared gigapage leaf at root index 2 of `asid`'s page
+/// table. Idempotent. Returns the (base, end) of the mapped window.
+pub fn map_kernel_shared_into_asid(asid: Asid) -> Result<(u64, u64), PageTableError> {
+    let mut state = PAGE_TABLE_STATE.lock();
+    let root = state.ensure_asid(asid)?;
+    let root_idx = state
+        .page_index_from_phys(root)
+        .ok_or(PageTableError::InvalidAddress)?;
+    let l2 = level_index(RISCV_KERNEL_SHARED_BASE, 30);
+    // GLOBAL + RWX leaf, ACCESSED|DIRTY pre-set, no USER: S-mode only.
+    let flags = PageTableEntry::VALID
+        | PageTableEntry::READ
+        | PageTableEntry::WRITE
+        | PageTableEntry::EXECUTE
+        | PageTableEntry::GLOBAL
+        | PageTableEntry::ACCESSED
+        | PageTableEntry::DIRTY;
+    let pte = PageTableEntry::with_addr_and_flags(RISCV_KERNEL_SHARED_BASE, flags);
+    state.pages[root_idx].as_mut().expect("root").entries[l2] = pte;
+    store_pte_to_frame(root, l2, pte);
+    Ok((RISCV_KERNEL_SHARED_BASE, RISCV_KERNEL_SHARED_END))
+}
+
+/// Writes `satp` and flushes the TLB. Unlike [`activate_asid`] this takes a
+/// pre-computed satp value (used by the userspace entry/probe paths so the
+/// exact installed value can be logged).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn write_satp(satp: u64) {
+    unsafe {
+        core::arch::asm!(
+            "csrw satp, {value}",
+            "sfence.vma x0, x0",
+            value = in(reg) satp,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     let satp = cr3_for_asid(asid).ok_or(PageTableError::OutOfMemory)?;
     #[cfg(not(feature = "hosted-dev"))]
@@ -313,8 +394,9 @@ pub fn map_page(
         .ok_or(PageTableError::InvalidAddress)?;
     let table = state.pages[leaf_idx].as_mut().expect("leaf");
     let prev = table.entries[l0];
-    table.entries[l0] =
-        PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags));
+    let pte = PageTableEntry::with_addr_and_flags(phys.0, leaf_flags_from_page_flags(flags));
+    table.entries[l0] = pte;
+    store_pte_to_frame(next2, l0, pte);
     drop(state);
     invalidate_page(virt);
     Ok(prev.is_present().then_some(prev))
@@ -345,6 +427,7 @@ pub fn unmap_page(asid: Asid, virt: VirtAddr) -> Option<PageTableEntry> {
         return None;
     }
     table.entries[levels[2]] = PageTableEntry::empty();
+    store_pte_to_frame(table_phys, levels[2], PageTableEntry::empty());
     drop(state);
     invalidate_page(virt);
     Some(old)

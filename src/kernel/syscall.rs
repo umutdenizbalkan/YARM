@@ -9099,6 +9099,159 @@ mod tests {
     }
 
     #[test]
+    fn riscv_sv39_kernel_shared_gigapage_constants_match_kernel_link_range() {
+        // The Sv39 kernel-shared gigapage covers [0x8000_0000, 0xC000_0000)
+        // — the entire RISC-V kernel link range. It must be installed at root
+        // index 2 of every user address-space page table so the kernel/trap
+        // path keeps executing across a satp switch into a user PT.
+        let src = include_str!("../arch/riscv64/page_table.rs");
+        assert!(
+            src.contains("pub const RISCV_KERNEL_SHARED_BASE: u64 = 0x8000_0000;"),
+            "kernel-shared gigapage base must be 0x8000_0000"
+        );
+        assert!(
+            src.contains("pub const RISCV_KERNEL_SHARED_END: u64 = 0xC000_0000;"),
+            "kernel-shared gigapage end must be 0xC000_0000"
+        );
+        assert!(
+            src.contains("fn map_kernel_shared_into_asid"),
+            "kernel-shared gigapage installer must exist"
+        );
+    }
+
+    #[test]
+    fn riscv_intermediate_ptes_must_have_only_valid_bit() {
+        // Per RISC-V Sv39 spec, non-leaf PTEs have R=W=X=0 and U/A/D/G are
+        // reserved and "must be cleared by software for forward
+        // compatibility." QEMU enforces this — setting U on an intermediate
+        // PTE causes the hardware walk to be treated as a bad leaf and
+        // surfaces as an instruction page fault on the very first user fetch.
+        let src = include_str!("../arch/riscv64/page_table.rs");
+        let needle = "fn table_flags_from_page_flags(flags: PageFlags) -> u64 {";
+        let start = src
+            .find(needle)
+            .expect("table_flags_from_page_flags must exist");
+        let rest = &src[start..];
+        let body_end = rest.find("\n}\n").expect("function close");
+        let body = &rest[..body_end];
+        assert!(
+            body.contains("let _ = flags;") && body.contains("PageTableEntry::VALID"),
+            "table_flags_from_page_flags must discard flags and return VALID only"
+        );
+        assert!(
+            !body.contains("PageTableEntry::USER"),
+            "non-leaf PTEs must NOT carry the USER bit on RISC-V Sv39"
+        );
+    }
+
+    #[test]
+    fn riscv_page_table_writes_through_to_physical_frames() {
+        // The page table maintains both a software shadow and the actual
+        // physical frame the MMU walks. The MMU only sees the frame; if PTE
+        // writes only touched the shadow, the hardware walk would miss the
+        // mapping (silent fault). Pin: every PTE write site also calls
+        // store_pte_to_frame, and freshly allocated frames are zeroed.
+        let src = include_str!("../arch/riscv64/page_table.rs");
+        assert!(
+            src.contains("fn store_pte_to_frame"),
+            "PTE write-through helper must exist"
+        );
+        assert!(
+            src.contains("fn zero_pt_frame"),
+            "freshly allocated PT frames must be zeroed"
+        );
+        let occurrences = src.matches("store_pte_to_frame(").count();
+        assert!(
+            occurrences >= 4,
+            "store_pte_to_frame must be called at every PTE write site (>=4 occurrences); found {occurrences}"
+        );
+    }
+
+    #[test]
+    fn riscv_user_entry_asm_clears_spp_and_spie_via_csrc() {
+        // The S-mode -> U-mode transition asm must atomically clear sstatus.SPP
+        // (bit 8) so sret returns to U-mode, and SPIE (bit 5) so interrupts
+        // remain disabled across the transition.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        assert!(
+            src.contains("li t5, 0x120") && src.contains("csrc sstatus, t5"),
+            "enter-user asm must csrc sstatus with mask 0x120 (SPP|SPIE)"
+        );
+        assert!(
+            src.contains("csrw sepc"),
+            "enter-user asm must set sepc to the user entry"
+        );
+        assert!(
+            src.contains("csrw satp") && src.contains("sfence.vma x0, x0") && src.contains("sret"),
+            "enter-user asm must csrw satp, sfence, then sret"
+        );
+        assert!(
+            src.contains("csrw stvec") && src.contains("la t2, yarm_riscv64_trap_vector"),
+            "enter-user asm must install the S-mode trap vector before sret"
+        );
+    }
+
+    #[test]
+    fn riscv_trap_vector_swaps_sscratch_and_captures_csrs() {
+        // The S-mode trap vector must swap the user sp out via sscratch (so
+        // the user GPRs are not clobbered by kernel pushes), then capture
+        // scause/sepc/stval/sstatus/sscratch and call the Rust reporter.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        assert!(
+            src.contains("csrrw sp, sscratch, sp"),
+            "trap vector must swap sp <-> sscratch on entry"
+        );
+        assert!(
+            src.contains("csrr a0, scause")
+                && src.contains("csrr a1, sepc")
+                && src.contains("csrr a2, stval")
+                && src.contains("csrr a4, sstatus")
+                && src.contains("csrr a5, sscratch"),
+            "trap vector must capture scause/sepc/stval/sstatus/sscratch"
+        );
+        assert!(
+            src.contains("call yarm_riscv64_user_trap_report"),
+            "trap vector must hand off to the Rust reporter"
+        );
+    }
+
+    #[test]
+    fn riscv_enter_user_emits_required_phase_markers() {
+        // Pin the full required marker sequence for the U-mode entry path so a
+        // refactor can't silently regress.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        for marker in [
+            "RISCV_SV39_PLAN_BEGIN",
+            "RISCV_SV39_MAP_KERNEL start=",
+            "RISCV_SV39_MAP_TRAP_VECTOR va=",
+            "RISCV_SV39_MAP_KERNEL_STACK va=",
+            "RISCV_SV39_MAP_UART va=",
+            "RISCV_SV39_USER_ROOT_READY tid=",
+            "RISCV_SV39_PLAN_DONE",
+            "RISCV_SATP_INSTALL_BEGIN root=",
+            "RISCV_SATP_KERNEL_ALIVE_OK",
+            "RISCV_SATP_INSTALL_DONE value=",
+            "RISCV_TRAP_VECTOR_INSTALL_BEGIN",
+            "RISCV_TRAP_VECTOR_INSTALL_DONE base=",
+            "RISCV_FIRST_USER_PREP_BEGIN tid=",
+            "RISCV_FIRST_USER_ELF_OK tid=",
+            "RISCV_FIRST_USER_STACK_OK tid=",
+            "RISCV_FIRST_USER_CONTEXT_OK tid=",
+            "RISCV_ENTER_USER_ATTEMPT tid=",
+            "RISCV_ENTER_USER_SRET tid=",
+            "RISCV_TRAP_ENTER scause=",
+            "RISCV_FIRST_USER_TRAP scause=",
+            "RISCV_FIRST_USER_SYSCALL nr=",
+            "RISCV_TRAP_HALTED reason=",
+        ] {
+            assert!(
+                src.contains(marker),
+                "required RISC-V U-mode-entry marker missing: {marker:?}"
+            );
+        }
+    }
+
+    #[test]
     fn stage106_milestone_doc_exists_and_is_not_falsely_declared() {
         // The Kernel Unlocking Milestone 1 doc must exist; if the branch is
         // not smoke-accepted the doc must say the milestone is NOT declared.
