@@ -15,13 +15,12 @@
 //! are expected before the live syscall is added.
 
 pub use yarm_ipc_abi::recv_shared_v3_abi::{
-    RecvSharedV3ObjectKind, RecvSharedV3Output, RecvSharedV3Request,
-    RecvSharedV3ValidationError,
     RECV_V3_ABI_VERSION, RECV_V3_FIELD_UNAVAILABLE, RECV_V3_MAP_READ, RECV_V3_MAP_WRITE,
     RECV_V3_MIN_OUTPUT_LEN, RECV_V3_MIN_REQUEST_LEN, RECV_V3_NO_TRANSFER_CAP,
     RECV_V3_STATUS_BAD_REQUEST, RECV_V3_STATUS_INVALID_CAP, RECV_V3_STATUS_OK,
-    RECV_V3_STATUS_TIMED_OUT, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION,
-    validate_output, validate_request,
+    RECV_V3_STATUS_TIMED_OUT, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION, RecvSharedV3ObjectKind,
+    RecvSharedV3Output, RecvSharedV3Request, RecvSharedV3ValidationError, validate_output,
+    validate_request,
 };
 
 // ── Builder ───────────────────────────────────────────────────────────────────

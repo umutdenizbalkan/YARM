@@ -768,9 +768,8 @@ mod tests {
         );
         let fault_src = include_str!("../../kernel/boot/fault_state.rs");
         assert!(
-            !fault_src.contains(
-                "dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?"
-            ),
+            !fault_src
+                .contains("dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?"),
             "parity fix must be present: dispatch errors must not propagate to AArch64 halt path"
         );
     }

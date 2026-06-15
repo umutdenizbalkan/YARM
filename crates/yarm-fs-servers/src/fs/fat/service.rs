@@ -355,8 +355,7 @@ fn run_resident_service_loop(svc: &mut FatService) {
                     let response = svc.handle(msg).unwrap_or_else(|_| {
                         yarm_user_rt::ipc::Message::new(1, &[]).expect("err-reply")
                     });
-                    let _ =
-                        unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
+                    let _ = unsafe { yarm_user_rt::syscall::ipc_reply(reply_cap, &response) };
                 }
                 _ => {
                     let _ = yarm_user_rt::syscall::yield_now();

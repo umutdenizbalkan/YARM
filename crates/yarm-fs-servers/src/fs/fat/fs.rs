@@ -207,10 +207,9 @@ impl BlockDevice for IpcBlockDevice {
                 .map_err(|_| FatError::Io)?;
             unsafe { yarm_user_rt::syscall::ipc_call(self.send_cap, self.reply_recv_cap, &msg) }
                 .map_err(|_| FatError::Io)?;
-            let received =
-                unsafe { yarm_user_rt::syscall::ipc_recv_v2(self.reply_recv_cap) }
-                    .map_err(|_| FatError::Io)?
-                    .ok_or(FatError::Io)?;
+            let received = unsafe { yarm_user_rt::syscall::ipc_recv_v2(self.reply_recv_cap) }
+                .map_err(|_| FatError::Io)?
+                .ok_or(FatError::Io)?;
             let bytes = received.message.as_slice();
             if bytes.len() < 8 {
                 return Err(FatError::Io);
@@ -269,10 +268,9 @@ impl IpcBlockDevice {
                 .map_err(|_| FatError::Io)?;
             unsafe { yarm_user_rt::syscall::ipc_call(send_cap, reply_recv_cap, &msg) }
                 .map_err(|_| FatError::Io)?;
-            let received =
-                unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) }
-                    .map_err(|_| FatError::Io)?
-                    .ok_or(FatError::Io)?;
+            let received = unsafe { yarm_user_rt::syscall::ipc_recv_v2(reply_recv_cap) }
+                .map_err(|_| FatError::Io)?
+                .ok_or(FatError::Io)?;
             BlkWriteReply::decode(received.message.as_slice()).ok_or(FatError::Io)
         })
     }

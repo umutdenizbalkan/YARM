@@ -30041,7 +30041,8 @@ mod stage61_62 {
         req[16..24].copy_from_slice(&0x2_0000u64.to_le_bytes()); // payload_ptr (mapping VA)
         req[24..32].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // payload_len
         req[32..40].copy_from_slice(&0x1_0200u64.to_le_bytes()); // metadata_ptr
-        req[40..48].copy_from_slice(&(core::mem::size_of::<RecvSharedV3Output>() as u64).to_le_bytes()); // metadata_len = 128
+        req[40..48]
+            .copy_from_slice(&(core::mem::size_of::<RecvSharedV3Output>() as u64).to_le_bytes()); // metadata_len = 128
         req[48..52].copy_from_slice(&1u32.to_le_bytes()); // map_intent = MAP_READ
 
         state
@@ -30082,8 +30083,7 @@ mod stage61_62 {
         let (_asid, raw, _) = run_mapped_recv(&mut state);
         let mapped_len = u64::from_le_bytes(raw[96..104].try_into().unwrap());
         assert_eq!(
-            mapped_len,
-            PAGE_SIZE as u64,
+            mapped_len, PAGE_SIZE as u64,
             "page_rounded_mapped_len must equal PAGE_SIZE"
         );
     }
@@ -30093,7 +30093,10 @@ mod stage61_62 {
         let mut state = Bootstrap::init().expect("init");
         let (_asid, raw, _) = run_mapped_recv(&mut state);
         let perm = u32::from_le_bytes(raw[104..108].try_into().unwrap());
-        assert_eq!(perm, 1u32, "actual_mapping_perm must be 1 (MAP_PERM_READ_ONLY)");
+        assert_eq!(
+            perm, 1u32,
+            "actual_mapping_perm must be 1 (MAP_PERM_READ_ONLY)"
+        );
     }
 
     #[test]
@@ -30154,8 +30157,7 @@ mod stage61_62 {
         assert_ne!(output.mapped_base, 0, "mapped_base must be nonzero");
         assert_eq!(output.mapped_base, 0x2_0000, "mapped_base == payload_ptr");
         assert_eq!(
-            output.page_rounded_mapped_len,
-            PAGE_SIZE as u64,
+            output.page_rounded_mapped_len, PAGE_SIZE as u64,
             "mapped_len"
         );
         assert_eq!(output.actual_mapping_perm, 1, "read-only perm");
@@ -30289,8 +30291,8 @@ mod stage63 {
     use crate::kernel::boot::Bootstrap;
     use crate::kernel::capabilities::CapId;
     use crate::kernel::syscall::{
-        SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, SYSCALL_TRANSFER_RELEASE_NR,
-        Syscall, SyscallError, dispatch,
+        SYSCALL_COUNT, SYSCALL_RECV_SHARED_V3_NR, SYSCALL_TRANSFER_RELEASE_NR, Syscall,
+        SyscallError, dispatch,
     };
     use crate::kernel::trapframe::TrapFrame;
     use crate::kernel::vm::{CachePolicy, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
@@ -30446,7 +30448,10 @@ mod stage63 {
         assert_eq!(output.mapped_base, 0, "mapped_base zero");
         assert_eq!(output.page_rounded_mapped_len, 0, "mapped_len zero");
         assert_eq!(output.actual_mapping_perm, 0, "mapping_perm zero");
-        assert_eq!(output.cleanup_token, RECV_V3_CLEANUP_TOKEN_NONE, "token zero");
+        assert_eq!(
+            output.cleanup_token, RECV_V3_CLEANUP_TOKEN_NONE,
+            "token zero"
+        );
     }
 
     // ── C. Invariants ─────────────────────────────────────────────────────────
@@ -30701,7 +30706,11 @@ mod stage71 {
         assert_eq!(state.current_tid(), Some(0));
 
         state.purge_active_transfer_mappings_for_pid(1);
-        assert_eq!(state.active_transfer_count_for_pid(1), 0, "after first purge");
+        assert_eq!(
+            state.active_transfer_count_for_pid(1),
+            0,
+            "after first purge"
+        );
 
         state.purge_active_transfer_mappings_for_pid(1);
         assert_eq!(
@@ -30727,8 +30736,7 @@ mod stage71 {
                     Syscall::TransferRelease as usize,
                     [cleanup_token as usize, 0, 0, 0, 0, 0],
                 );
-                dispatch(&mut state, &mut frame)
-                    .expect("explicit TransferRelease must succeed");
+                dispatch(&mut state, &mut frame).expect("explicit TransferRelease must succeed");
 
                 assert_eq!(
                     state.active_transfer_count_for_pid(0),
@@ -30878,7 +30886,10 @@ mod stage71 {
             .read_user_memory_for_asid(asid, 0x1_0200, 120)
             .expect("read output");
         let actual_perm = u32::from_le_bytes(out[104..108].try_into().unwrap());
-        assert_eq!(actual_perm, 3, "actual_mapping_perm must be MAP_PERM_READ_WRITE=3");
+        assert_eq!(
+            actual_perm, 3,
+            "actual_mapping_perm must be MAP_PERM_READ_WRITE=3"
+        );
     }
 
     // ── H. Invariants ─────────────────────────────────────────────────────────
@@ -31060,7 +31071,10 @@ mod stage72 {
             actual_perm, MAP_PERM_READ_WRITE,
             "actual_mapping_perm must be 3 (MAP_PERM_READ_WRITE)"
         );
-        assert_ne!(cleanup_token, 0, "cleanup_token must be non-zero for active RW mapping");
+        assert_ne!(
+            cleanup_token, 0,
+            "cleanup_token must be non-zero for active RW mapping"
+        );
         assert_eq!(
             state.active_transfer_count_for_pid(0),
             1,
@@ -31438,8 +31452,7 @@ mod stage77 {
             msg.opcode, KERNEL_OP_PM_TASK_EXITED,
             "opcode must be KERNEL_OP_PM_TASK_EXITED"
         );
-        let ev =
-            KernelPmTaskExitedPayload::decode(msg.as_slice()).expect("payload must decode");
+        let ev = KernelPmTaskExitedPayload::decode(msg.as_slice()).expect("payload must decode");
         assert_eq!(ev.tid, 42, "tid mismatch");
         assert_eq!(ev.exit_code, 7, "exit_code mismatch");
     }
@@ -31546,7 +31559,10 @@ mod stage77 {
         let ev = KernelPmTaskExitedPayload::new(0x0102_0304_0506_0708, 0x0A0B_0C0D_0E0F_1011);
         let enc = ev.encode();
         assert_eq!(&enc[..8], &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
-        assert_eq!(&enc[8..16], &[0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A]);
+        assert_eq!(
+            &enc[8..16],
+            &[0x11, 0x10, 0x0F, 0x0E, 0x0D, 0x0C, 0x0B, 0x0A]
+        );
     }
 
     #[test]
@@ -31575,8 +31591,7 @@ mod stage77 {
     #[test]
     fn stage77_kernel_op_pm_task_exited_distinct_from_supervisor_op() {
         assert_ne!(
-            KERNEL_OP_PM_TASK_EXITED,
-            SUPERVISOR_OP_TASK_EXITED,
+            KERNEL_OP_PM_TASK_EXITED, SUPERVISOR_OP_TASK_EXITED,
             "KERNEL_OP_PM_TASK_EXITED must not collide with SUPERVISOR_OP_TASK_EXITED"
         );
     }
@@ -31597,6 +31612,9 @@ mod stage77 {
     #[test]
     fn stage77_proc_op_task_exited_opcode_unchanged() {
         use yarm_ipc_abi::process_abi::PROC_OP_TASK_EXITED;
-        assert_eq!(PROC_OP_TASK_EXITED, 13, "PROC_OP_TASK_EXITED must remain 13");
+        assert_eq!(
+            PROC_OP_TASK_EXITED, 13,
+            "PROC_OP_TASK_EXITED must remain 13"
+        );
     }
 }

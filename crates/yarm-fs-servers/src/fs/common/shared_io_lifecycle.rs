@@ -653,10 +653,18 @@ mod tests {
         request.map(&handles).expect("map");
         request.begin().expect("begin");
         assert_eq!(request.state(), VfsSharedIoState::InFlight);
-        let result = request.deliver_requester_exit(&mut handles).expect("deliver");
-        assert_eq!(result, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit));
+        let result = request
+            .deliver_requester_exit(&mut handles)
+            .expect("deliver");
+        assert_eq!(
+            result,
+            VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit)
+        );
         assert_eq!(request.state(), VfsSharedIoState::Cleaned);
-        assert_eq!(request.terminal_reason(), Some(VfsSharedIoTerminalReason::RequesterExit));
+        assert_eq!(
+            request.terminal_reason(),
+            Some(VfsSharedIoTerminalReason::RequesterExit)
+        );
     }
 
     #[test]
@@ -667,9 +675,17 @@ mod tests {
         request.map(&handles).expect("map");
         request.begin().expect("begin");
         let first = request.deliver_requester_exit(&mut handles).expect("first");
-        let second = request.deliver_requester_exit(&mut handles).expect("second idempotent");
-        assert_eq!(first, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit));
-        assert_eq!(second, VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::RequesterExit));
+        let second = request
+            .deliver_requester_exit(&mut handles)
+            .expect("second idempotent");
+        assert_eq!(
+            first,
+            VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit)
+        );
+        assert_eq!(
+            second,
+            VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::RequesterExit)
+        );
     }
 
     #[test]
@@ -684,9 +700,17 @@ mod tests {
         let first = request
             .cleanup(&mut handles, VfsSharedIoTerminalReason::Success)
             .expect("success cleanup");
-        let exit = request.deliver_requester_exit(&mut handles).expect("exit after success");
-        assert_eq!(first, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::Success));
-        assert_eq!(exit, VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::Success));
+        let exit = request
+            .deliver_requester_exit(&mut handles)
+            .expect("exit after success");
+        assert_eq!(
+            first,
+            VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::Success)
+        );
+        assert_eq!(
+            exit,
+            VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::Success)
+        );
     }
 
     #[test]
@@ -700,9 +724,17 @@ mod tests {
         let first = request
             .cleanup(&mut handles, VfsSharedIoTerminalReason::BackendError)
             .expect("backend error cleanup");
-        let exit = request.deliver_requester_exit(&mut handles).expect("exit after error");
-        assert_eq!(first, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::BackendError));
-        assert_eq!(exit, VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::BackendError));
+        let exit = request
+            .deliver_requester_exit(&mut handles)
+            .expect("exit after error");
+        assert_eq!(
+            first,
+            VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::BackendError)
+        );
+        assert_eq!(
+            exit,
+            VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::BackendError)
+        );
     }
 
     #[test]
@@ -734,8 +766,13 @@ mod tests {
         let mut handles = VfsSharedIoHandleTable::<1>::new();
         let (_, mut request) = lifecycle(&mut handles, VfsSharedIoDirection::ReadReply, 0, 8);
         assert_eq!(request.state(), VfsSharedIoState::Reserved);
-        let result = request.deliver_requester_exit(&mut handles).expect("exit from reserved");
-        assert_eq!(result, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit));
+        let result = request
+            .deliver_requester_exit(&mut handles)
+            .expect("exit from reserved");
+        assert_eq!(
+            result,
+            VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::RequesterExit)
+        );
         assert_eq!(request.state(), VfsSharedIoState::Cleaned);
     }
 
@@ -757,7 +794,10 @@ mod tests {
         );
         // New allocation reuses slot with bumped generation.
         let new_handle = handles.allocate().expect("reuse slot");
-        assert_eq!(new_handle.object_handle, old_handle.object_handle, "same slot reused");
+        assert_eq!(
+            new_handle.object_handle, old_handle.object_handle,
+            "same slot reused"
+        );
         assert_ne!(
             new_handle.object_generation, old_handle.object_generation,
             "generation must advance"
@@ -917,13 +957,8 @@ mod tests {
     fn stage75_read_reply_lifecycle_observes_tid_matched_exit() {
         // ReadReply direction lifecycle is cleaned up by TID-matched exit.
         let mut handles = VfsSharedIoHandleTable::<1>::new();
-        let (_, mut request) = lifecycle_with_tid(
-            &mut handles,
-            77,
-            VfsSharedIoDirection::ReadReply,
-            0,
-            32,
-        );
+        let (_, mut request) =
+            lifecycle_with_tid(&mut handles, 77, VfsSharedIoDirection::ReadReply, 0, 32);
         request.map(&handles).expect("map");
         request.begin().expect("begin");
         assert_eq!(request.direction(), VfsSharedIoDirection::ReadReply);
@@ -942,13 +977,8 @@ mod tests {
     fn stage75_write_request_lifecycle_unaffected_by_unmatched_tid() {
         // WriteRequest lifecycle for TID=20 is not affected by exit notification for TID=21.
         let mut handles = VfsSharedIoHandleTable::<1>::new();
-        let (_, mut request) = lifecycle_with_tid(
-            &mut handles,
-            20,
-            VfsSharedIoDirection::WriteRequest,
-            0,
-            8,
-        );
+        let (_, mut request) =
+            lifecycle_with_tid(&mut handles, 20, VfsSharedIoDirection::WriteRequest, 0, 8);
         request.map(&handles).expect("map");
         request.begin().expect("begin");
         let action = request
@@ -963,20 +993,10 @@ mod tests {
     fn stage75_multiple_lifecycles_only_matched_tid_cleaned() {
         // Two lifecycles with different TIDs: exit for TID A must not affect TID B's lifecycle.
         let mut handles = VfsSharedIoHandleTable::<2>::new();
-        let (_, mut req_a) = lifecycle_with_tid(
-            &mut handles,
-            100,
-            VfsSharedIoDirection::ReadReply,
-            0,
-            8,
-        );
-        let (_, mut req_b) = lifecycle_with_tid(
-            &mut handles,
-            200,
-            VfsSharedIoDirection::ReadReply,
-            0,
-            8,
-        );
+        let (_, mut req_a) =
+            lifecycle_with_tid(&mut handles, 100, VfsSharedIoDirection::ReadReply, 0, 8);
+        let (_, mut req_b) =
+            lifecycle_with_tid(&mut handles, 200, VfsSharedIoDirection::ReadReply, 0, 8);
         req_a.map(&handles).expect("map a");
         req_a.begin().expect("begin a");
         req_b.map(&handles).expect("map b");

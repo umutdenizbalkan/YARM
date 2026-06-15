@@ -13,7 +13,10 @@ use crate::kernel::boot::KernelState;
 use crate::kernel::ipc::Message;
 use crate::kernel::trapframe::TrapFrame;
 
-pub(super) fn handle_debug_log(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+pub(super) fn handle_debug_log(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
     // ABI: arg0=ptr, arg1=len (no cap slot; do not use SYSCALL_ARG_PTR/LEN here).
     let a0 = frame.arg(0);
     let a1 = frame.arg(1);

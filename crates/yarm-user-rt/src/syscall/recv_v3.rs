@@ -478,9 +478,9 @@ mod tests {
     use super::*;
     use core::mem::size_of;
     use yarm_ipc_abi::recv_shared_v3_abi::{
-        RecvSharedV3Output, RECV_V3_MIN_OUTPUT_LEN, RECV_V3_MIN_REQUEST_LEN,
-        RECV_V3_NO_TRANSFER_CAP, RECV_V3_STATUS_BAD_REQUEST, RECV_V3_STATUS_INVALID_CAP,
-        RECV_V3_STATUS_OK, RECV_V3_STATUS_TIMED_OUT, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION,
+        RECV_V3_MIN_OUTPUT_LEN, RECV_V3_MIN_REQUEST_LEN, RECV_V3_NO_TRANSFER_CAP,
+        RECV_V3_STATUS_BAD_REQUEST, RECV_V3_STATUS_INVALID_CAP, RECV_V3_STATUS_OK,
+        RECV_V3_STATUS_TIMED_OUT, RECV_V3_STATUS_WOULD_BLOCK, RECV_V3_VERSION, RecvSharedV3Output,
     };
 
     #[test]
@@ -1206,10 +1206,7 @@ mod tests {
     #[test]
     fn stage61_encode_mapped_readonly_payload_ptr_encoded() {
         let buf = encode_mapped_readonly_request(0, 0x4000, 0, 0);
-        assert_eq!(
-            u64::from_le_bytes(buf[16..24].try_into().unwrap()),
-            0x4000
-        );
+        assert_eq!(u64::from_le_bytes(buf[16..24].try_into().unwrap()), 0x4000);
     }
 
     #[test]
@@ -1237,7 +1234,10 @@ mod tests {
         output.actual_mapping_perm = 1; // read-only
         output.cleanup_token = 0x0001_0003; // generation=1, slot=3
         let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
-        assert!(d.has_mapping(), "has_mapping must be true when mapped_base != 0");
+        assert!(
+            d.has_mapping(),
+            "has_mapping must be true when mapped_base != 0"
+        );
         assert_eq!(d.mapped_base(), 0x2_0000);
         assert_eq!(d.page_rounded_mapped_len(), 4096);
         assert_eq!(d.actual_mapping_perm(), 1);
@@ -1250,7 +1250,10 @@ mod tests {
         output.transferred_cap = 5;
         output.cleanup_token = 0x0001_0002; // nonzero token
         let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
-        assert!(d.has_cleanup_token(), "nonzero token must report has_cleanup_token");
+        assert!(
+            d.has_cleanup_token(),
+            "nonzero token must report has_cleanup_token"
+        );
         assert_eq!(d.cleanup_token(), 0x0001_0002);
     }
 
@@ -1299,7 +1302,10 @@ mod tests {
         output.transferred_cap = RECV_V3_CLEANUP_TOKEN_NONE; // no cap
         let d = RecvSharedV3Delivery::from_output(&output).expect("must decode");
         assert!(!d.has_mapping(), "plain receive must not report mapping");
-        assert!(!d.has_cleanup_token(), "plain receive must not have cleanup token");
+        assert!(
+            !d.has_cleanup_token(),
+            "plain receive must not have cleanup token"
+        );
         assert_eq!(d.mapped_base(), 0);
         assert_eq!(d.page_rounded_mapped_len(), 0);
         assert_eq!(d.cleanup_token(), 0);

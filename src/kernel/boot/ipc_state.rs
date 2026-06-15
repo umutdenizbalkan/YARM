@@ -894,7 +894,10 @@ impl KernelState {
                     ep.send(waiter_msg)
                         .expect("one slot must be free after recv dequeue");
                 }
-                crate::yarm_log!("IPC_RECV_SPLIT_CAP_REFILL_QUEUED waiter_tid={}", waiter_tid.0);
+                crate::yarm_log!(
+                    "IPC_RECV_SPLIT_CAP_REFILL_QUEUED waiter_tid={}",
+                    waiter_tid.0
+                );
                 return IpcEndpointRecvResult::ReceivedWithSenderWake(received, waiter_tid);
             }
 

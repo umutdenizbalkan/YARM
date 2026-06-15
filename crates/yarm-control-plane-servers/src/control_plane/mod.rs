@@ -703,7 +703,10 @@ mod tests {
             vfs_payload_len, spawn_v5_len,
             "VFS 8-byte reply must not match SpawnV5CapResult::ENCODED_LEN"
         );
-        assert_eq!(spawn_v5_len, 16, "SpawnV5 result is always 16 bytes (pid:u64 + cap:u64)");
+        assert_eq!(
+            spawn_v5_len, 16,
+            "SpawnV5 result is always 16 bytes (pid:u64 + cap:u64)"
+        );
     }
 
     // ── Stage 92: vfs_client.rs blocking-recv fix ─────────────────────────────
@@ -767,8 +770,7 @@ mod tests {
 
     #[test]
     fn stage92_smoke_aarch64_checks_spawn_fail_and_wrong_sender() {
-        let script =
-            include_str!("../../../../scripts/qemu-aarch64-optional-fs-smoke.sh");
+        let script = include_str!("../../../../scripts/qemu-aarch64-optional-fs-smoke.sh");
         assert!(
             script.contains("INIT_RAMFS_SPAWN_FAIL"),
             "aarch64 smoke script must check for INIT_RAMFS_SPAWN_FAIL"
@@ -785,8 +787,7 @@ mod tests {
 
     #[test]
     fn stage92_smoke_x86_64_checks_spawn_fail_and_wrong_sender() {
-        let script =
-            include_str!("../../../../scripts/qemu-x86_64-optional-fs-smoke.sh");
+        let script = include_str!("../../../../scripts/qemu-x86_64-optional-fs-smoke.sh");
         assert!(
             script.contains("INIT_RAMFS_SPAWN_FAIL"),
             "x86_64 smoke script must check for INIT_RAMFS_SPAWN_FAIL"
@@ -832,7 +833,8 @@ mod tests {
     fn stage93_fat_default_profile_all_gates_disabled() {
         // All three FAT production gates must be false in the default optional-fs profile.
         let pm_src = include_str!("process_manager/service.rs");
-        let shared_src = include_str!("../../../yarm-fs-servers/src/fs/common/shared_io_adapter.rs");
+        let shared_src =
+            include_str!("../../../yarm-fs-servers/src/fs/common/shared_io_adapter.rs");
         let init_src = include_str!("init/service.rs");
         assert!(
             init_src.contains("const INIT_SPAWN_FAT_SRV: bool = false"),
@@ -857,8 +859,13 @@ mod tests {
         let aarch64 = include_str!("../../../../scripts/qemu-aarch64-optional-fs-smoke.sh");
         let x86_64 = include_str!("../../../../scripts/qemu-x86_64-optional-fs-smoke.sh");
         for (arch, script) in &[("aarch64", aarch64), ("x86_64", x86_64)] {
-            for pattern in &["KSPAWN_EXTRA_CAP_DELEGATE_FAIL", "PM_VFS_SPAWN_FAIL",
-                             "reason=bad_fd_decode", "fallback=phase2b", "panic"] {
+            for pattern in &[
+                "KSPAWN_EXTRA_CAP_DELEGATE_FAIL",
+                "PM_VFS_SPAWN_FAIL",
+                "reason=bad_fd_decode",
+                "fallback=phase2b",
+                "panic",
+            ] {
                 assert!(
                     script.contains(pattern),
                     "{arch} optional-FS smoke must check for {pattern}"

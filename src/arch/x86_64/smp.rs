@@ -32,7 +32,6 @@ const ICR_LEVEL_DEASSERT: u32 = 0;
 const ICR_LEVEL_ASSERT: u32 = 1 << 14;
 const ICR_TRIGGER_MODE_LEVEL: u32 = 1 << 15;
 
-
 // AP stack backing is low physical memory, but AP receives a higher-half
 // direct-map stack VA after paging is enabled.
 const AP_STACK_BYTES: usize = 16 * 1024;
@@ -41,7 +40,6 @@ const BOOTSTRAP_LOW_IDENTITY_BYTES: u64 = 64 * 1024 * 1024;
 const AP_STACK_TOP_BASE: u64 =
     crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE + AP_STACK_PHYS_BASE;
 
-
 const AP_READY_POLL_ITERS: usize = 20_000_000;
 const ICR_IDLE_POLL_ITERS: usize = 1_000_000;
 
@@ -49,17 +47,8 @@ const ICR_IDLE_POLL_ITERS: usize = 1_000_000;
 // SMP bring-up. Later replace with calibrated TSC/LAPIC/PIT delays.
 const INIT_TO_SIPI_DELAY_ITERS: usize = 5_000_000;
 
-
 static AP_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
     [const { AtomicBool::new(false) }; crate::arch::platform_constants::MAX_CPUS];
-
-
-
-
-
-
-
-
 
 fn lapic_mmio_base() -> usize {
     super::platform_layout::LAPIC_MMIO_BASE
@@ -352,8 +341,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             // Pass 2: AP writes 1 then quickly transitions to 2 inside
             // Rust entry. Accept any non-zero as "trampoline reached".
             #[cfg(all(not(test), not(feature = "hosted-dev")))]
-            let ap_ready =
-                unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } != 0;
+            let ap_ready = unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } != 0;
 
             #[cfg(any(test, feature = "hosted-dev"))]
             let ap_ready = AP_READY_FLAGS[cpu.0 as usize].load(Ordering::Acquire);
@@ -408,11 +396,10 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         let mut rust_online = false;
         for _ in 0..AP_READY_POLL_ITERS {
             #[cfg(all(not(test), not(feature = "hosted-dev")))]
-            let online =
-                unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } == 2;
+            let online = unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } == 2;
             #[cfg(any(test, feature = "hosted-dev"))]
-            let online = super::smp_trampoline::AP_RUST_ONLINE[cpu.0 as usize]
-                .load(Ordering::Acquire);
+            let online =
+                super::smp_trampoline::AP_RUST_ONLINE[cpu.0 as usize].load(Ordering::Acquire);
             if online {
                 rust_online = true;
                 break;
@@ -421,8 +408,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         }
         #[cfg(all(not(test), not(feature = "hosted-dev")))]
         if rust_online {
-            super::smp_trampoline::AP_RUST_ONLINE[cpu.0 as usize]
-                .store(true, Ordering::Release);
+            super::smp_trampoline::AP_RUST_ONLINE[cpu.0 as usize].store(true, Ordering::Release);
         }
         if !rust_online {
             crate::yarm_log!(

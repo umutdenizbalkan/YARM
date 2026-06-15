@@ -365,7 +365,14 @@ pub unsafe fn release_v3_cleanup_token(cleanup_token: u64) -> Result<(), Syscall
         return Err(SyscallError::InvalidArgs);
     }
     // arg0 = full CapId.0 (cleanup_token), arg1/arg2 = 0 → active-record path.
-    let args = [cleanup_token as usize, 0usize, 0usize, 0usize, 0usize, 0usize];
+    let args = [
+        cleanup_token as usize,
+        0usize,
+        0usize,
+        0usize,
+        0usize,
+        0usize,
+    ];
     let ret = unsafe { crate::arch::raw_syscall(SYSCALL_TRANSFER_RELEASE_NR, args) };
     decode_release(ret).map(|_| ())
 }

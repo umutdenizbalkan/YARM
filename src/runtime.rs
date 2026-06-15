@@ -1966,11 +1966,13 @@ mod tests {
         let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
         kernel.with(|state| state.register_task(840).expect("register"));
         let global_present = kernel.with(|state| state.task_status(840).is_some());
-        let seam_present = kernel.with_task_tcbs_split_mut(|tcbs| {
-            tcbs.iter().flatten().any(|tcb| tcb.tid.0 == 840)
-        });
+        let seam_present = kernel
+            .with_task_tcbs_split_mut(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == 840));
         assert_eq!(seam_present, global_present);
-        assert!(seam_present, "registered TCB must be visible through the seam");
+        assert!(
+            seam_present,
+            "registered TCB must be visible through the seam"
+        );
         // Mutation through the seam is visible to the global view.
         kernel.with_task_tcbs_split_mut(|tcbs| {
             if let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == 840) {
@@ -1982,7 +1984,10 @@ mod tests {
                 .consume_ipc_timeout_fired_for_tid(840)
                 .expect("consume")
         });
-        assert!(global_fired, "seam mutation must be visible under the global lock");
+        assert!(
+            global_fired,
+            "seam mutation must be visible under the global lock"
+        );
     }
 
     #[test]
@@ -2011,7 +2016,11 @@ mod tests {
         let seam_mapped = kernel.with_vm_user_spaces_split_mut(|spaces| {
             spaces
                 .get_mut(asid)
-                .map(|aspace| aspace.resolve(crate::kernel::vm::VirtAddr(0x5000)).is_some())
+                .map(|aspace| {
+                    aspace
+                        .resolve(crate::kernel::vm::VirtAddr(0x5000))
+                        .is_some()
+                })
                 .unwrap_or(false)
         });
         assert_eq!(seam_mapped, global_mapped);
@@ -2027,8 +2036,8 @@ mod tests {
         let global_count = kernel.with(|state| {
             state.with_memory_state(|memory| memory.memory_objects.iter().flatten().count())
         });
-        let seam_count = kernel
-            .with_memory_split_mut(|memory| memory.memory_objects.iter().flatten().count());
+        let seam_count =
+            kernel.with_memory_split_mut(|memory| memory.memory_objects.iter().flatten().count());
         assert_eq!(seam_count, global_count);
         assert!(seam_count >= 1);
     }

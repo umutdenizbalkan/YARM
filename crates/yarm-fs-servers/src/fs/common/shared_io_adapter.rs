@@ -13,7 +13,7 @@ use super::shared_io_lifecycle::{
     VfsSharedIoRequesterExitAction,
 };
 use yarm_ipc_abi::process_abi::{
-    KERNEL_OP_PM_TASK_EXITED, PROC_OP_TASK_EXITED, KernelPmTaskExitedPayload, PmTaskExitedEvent,
+    KERNEL_OP_PM_TASK_EXITED, KernelPmTaskExitedPayload, PROC_OP_TASK_EXITED, PmTaskExitedEvent,
 };
 use yarm_ipc_abi::vfs_abi::{
     VFS_SHARED_BUFFER_FS_READ, VFS_SHARED_BUFFER_FS_WRITE, VfsReadSharedRequest,
@@ -61,8 +61,7 @@ pub const VFS_READ_SHARED_REPLY_ENABLED: bool = true;
 /// NOT that `handle_request` routes shared opcodes in production. Both
 /// `VFS_OP_WRITE_SHARED_REQUEST` and `VFS_OP_READ_SHARED_REPLY` remain `VfsError::Unsupported`
 /// in live dispatch until a real `VfsSharedIoMapper` is available. See FS-17/FS-19.
-pub const VFS_SHARED_IO_ENABLED: bool =
-    VFS_WRITE_SHARED_REQUEST_ENABLED
+pub const VFS_SHARED_IO_ENABLED: bool = VFS_WRITE_SHARED_REQUEST_ENABLED
     && VFS_READ_SHARED_REPLY_ENABLED
     && VFS_PM_TASK_EXIT_NOTIFICATION_ENABLED;
 
@@ -445,15 +444,14 @@ impl RecvV3SharedIoMapper {
         if self.page_rounded_mapped_len < range_end {
             return Err(VfsSharedIoAdapterError::BadRange);
         }
-        let offset = usize::try_from(buffer_offset)
-            .map_err(|_| VfsSharedIoAdapterError::BadRange)?;
-        let base = usize::try_from(self.mapped_base)
-            .map_err(|_| VfsSharedIoAdapterError::BadRange)?;
+        let offset =
+            usize::try_from(buffer_offset).map_err(|_| VfsSharedIoAdapterError::BadRange)?;
+        let base =
+            usize::try_from(self.mapped_base).map_err(|_| VfsSharedIoAdapterError::BadRange)?;
         let ptr = base
             .checked_add(offset)
             .ok_or(VfsSharedIoAdapterError::BadRange)?;
-        let len = usize::try_from(requested_len)
-            .map_err(|_| VfsSharedIoAdapterError::BadRange)?;
+        let len = usize::try_from(requested_len).map_err(|_| VfsSharedIoAdapterError::BadRange)?;
         Ok((ptr as *const u8, len))
     }
 }
@@ -1201,8 +1199,8 @@ mod tests {
             request_id: 42,
             flags: 0,
             buffer: VfsSharedBufferDescriptor::new(
-                cleanup_token,         // object_handle = cleanup_token (binding contract)
-                cleanup_token >> 16,   // object_generation = generation part
+                cleanup_token,       // object_handle = cleanup_token (binding contract)
+                cleanup_token >> 16, // object_generation = generation part
                 0,
                 requested_len,
                 VFS_SHARED_BUFFER_FS_READ,
@@ -1254,59 +1252,109 @@ mod tests {
         let req = make_valid_request(0, 8);
         // cleanup_token = 0 → MissingCleanupToken even though descriptor handle = 0
         let result = VfsWriteSharedBinding::validate(
-            0, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            0,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::MissingCleanupToken));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::MissingCleanupToken)
+        );
     }
 
     #[test]
     fn stage65_binding_rejects_no_transfer_cap() {
         let req = make_valid_request(TEST_TOKEN, 8);
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, u64::MAX, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            u64::MAX,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::NoTransferCap));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::NoTransferCap)
+        );
     }
 
     #[test]
     fn stage65_binding_rejects_map_write_permission() {
         let req = make_valid_request(TEST_TOKEN, 8);
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, 3, // MAP_READ|MAP_WRITE
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            3, // MAP_READ|MAP_WRITE
             &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::MappingNotReadOnly));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::MappingNotReadOnly)
+        );
     }
 
     #[test]
     fn stage65_binding_rejects_unmapped_zero_base() {
         let req = make_valid_request(TEST_TOKEN, 8);
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            0, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            0,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::MappingNotEstablished));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::MappingNotEstablished)
+        );
     }
 
     #[test]
     fn stage65_binding_rejects_unsupported_object_kind() {
         let req = make_valid_request(TEST_TOKEN, 8);
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, 2, // Endpoint (unsupported)
-            TEST_REGION_LEN, TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            2, // Endpoint (unsupported)
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::UnsupportedObjectKind));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::UnsupportedObjectKind)
+        );
     }
 
     #[test]
     fn stage65_binding_accepts_memory_object_kind() {
         let req = make_valid_request(TEST_TOKEN, 8);
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, 1, // MemoryObject
-            TEST_REGION_LEN, TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            1, // MemoryObject
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
         assert!(result.is_ok(), "MemoryObject kind must be accepted");
     }
@@ -1316,10 +1364,19 @@ mod tests {
         let mut req = make_valid_request(TEST_TOKEN, 8);
         req.buffer.access = VFS_SHARED_BUFFER_FS_WRITE; // FS-WRITE not allowed for write request
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::WrongDescriptorAccess));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::WrongDescriptorAccess)
+        );
     }
 
     #[test]
@@ -1327,10 +1384,19 @@ mod tests {
         let mut req = make_valid_request(TEST_TOKEN, 8);
         req.buffer.object_handle = TEST_TOKEN + 1; // wrong handle
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::DescriptorHandleMismatch));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::DescriptorHandleMismatch)
+        );
     }
 
     #[test]
@@ -1338,10 +1404,19 @@ mod tests {
         let mut req = make_valid_request(TEST_TOKEN, 8);
         req.buffer.object_generation = (TEST_TOKEN >> 16) + 1; // stale generation
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::DescriptorGenerationMismatch));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::DescriptorGenerationMismatch)
+        );
     }
 
     #[test]
@@ -1351,10 +1426,19 @@ mod tests {
         req.buffer.buffer_offset = 1;
         req.buffer.buffer_len = 4096;
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::MappingRangeTooShort));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::MappingRangeTooShort)
+        );
     }
 
     #[test]
@@ -1362,11 +1446,19 @@ mod tests {
         // exact_region_len=4 < buffer_offset(0) + buffer_len(8) = 8
         let req = make_valid_request(TEST_TOKEN, 8);
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
             4, // exact_region_len authoritative and too small
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::ExactRegionLenInsufficient));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::ExactRegionLenInsufficient)
+        );
     }
 
     #[test]
@@ -1374,11 +1466,19 @@ mod tests {
         // exact_region_len = 0 means "not authoritative" — must be accepted even if < requested_len
         let req = make_valid_request(TEST_TOKEN, 8);
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
             0, // not authoritative
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert!(result.is_ok(), "zero exact_region_len must be accepted (not authoritative)");
+        assert!(
+            result.is_ok(),
+            "zero exact_region_len must be accepted (not authoritative)"
+        );
     }
 
     #[test]
@@ -1386,10 +1486,19 @@ mod tests {
         let mut req = make_valid_request(TEST_TOKEN, 8);
         req.request_id = 0;
         let result = VfsWriteSharedBinding::validate(
-            TEST_TOKEN, TEST_TRANSFERRED_CAP, TEST_OBJECT_KIND, TEST_REGION_LEN,
-            TEST_MAPPED_BASE, TEST_MAPPED_LEN, TEST_MAP_PERM, &req,
+            TEST_TOKEN,
+            TEST_TRANSFERRED_CAP,
+            TEST_OBJECT_KIND,
+            TEST_REGION_LEN,
+            TEST_MAPPED_BASE,
+            TEST_MAPPED_LEN,
+            TEST_MAP_PERM,
+            &req,
         );
-        assert_eq!(result.err(), Some(VfsWriteSharedBindingError::ZeroRequestId));
+        assert_eq!(
+            result.err(),
+            Some(VfsWriteSharedBindingError::ZeroRequestId)
+        );
     }
 
     #[test]
@@ -1400,11 +1509,8 @@ mod tests {
         // BorrowedSharedIoTestMapper is seeded with cleanup_token as object_handle and
         // (cleanup_token >> 16) as object_generation — exactly the binding contract.
         let mut storage = *b"hello65!"; // 8 bytes of "shared write data"
-        let mut mapper = BorrowedSharedIoTestMapper::new(
-            b.cleanup_token,
-            b.cleanup_token >> 16,
-            &mut storage,
-        );
+        let mut mapper =
+            BorrowedSharedIoTestMapper::new(b.cleanup_token, b.cleanup_token >> 16, &mut storage);
 
         let mut ramfs = RamFsBackend::new();
         ramfs.create_file(b"/stage65").expect("create");
@@ -1433,11 +1539,8 @@ mod tests {
         // but the descriptor only carries FS_READ.  This proves direction safety.
         let b = valid_binding(8);
         let mut storage = [0u8; 8];
-        let mut mapper = BorrowedSharedIoTestMapper::new(
-            b.cleanup_token,
-            b.cleanup_token >> 16,
-            &mut storage,
-        );
+        let mut mapper =
+            BorrowedSharedIoTestMapper::new(b.cleanup_token, b.cleanup_token >> 16, &mut storage);
         // with_read_reply_buffer requires FS_WRITE; our descriptor has FS_READ → rejected.
         let result = mapper.with_read_reply_buffer(b.descriptor(), b.requested_len, |_| ());
         assert!(
@@ -1455,10 +1558,20 @@ mod tests {
         lc.map(&handles).expect("map");
         lc.begin().expect("begin");
         lc.complete(8).expect("complete");
-        let first = lc.cleanup(&mut handles, VfsSharedIoTerminalReason::Success).expect("cleanup");
-        let dup = lc.cleanup(&mut handles, VfsSharedIoTerminalReason::BackendError).expect("dup");
-        assert_eq!(first, VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::Success));
-        assert_eq!(dup, VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::Success));
+        let first = lc
+            .cleanup(&mut handles, VfsSharedIoTerminalReason::Success)
+            .expect("cleanup");
+        let dup = lc
+            .cleanup(&mut handles, VfsSharedIoTerminalReason::BackendError)
+            .expect("dup");
+        assert_eq!(
+            first,
+            VfsSharedIoCleanupResult::Won(VfsSharedIoTerminalReason::Success)
+        );
+        assert_eq!(
+            dup,
+            VfsSharedIoCleanupResult::AlreadyCleaned(VfsSharedIoTerminalReason::Success)
+        );
     }
 
     #[test]
@@ -1480,8 +1593,13 @@ mod tests {
             Err(VfsSharedIoLifecycleError::FallbackBeforeCleanup),
             "fallback before cleanup must be rejected"
         );
-        lc.cleanup(&mut handles, VfsSharedIoTerminalReason::Timeout).expect("cleanup");
-        assert_eq!(lc.begin_inline_fallback(), Ok(()), "fallback after timeout cleanup must succeed");
+        lc.cleanup(&mut handles, VfsSharedIoTerminalReason::Timeout)
+            .expect("cleanup");
+        assert_eq!(
+            lc.begin_inline_fallback(),
+            Ok(()),
+            "fallback after timeout cleanup must succeed"
+        );
     }
 
     #[test]
@@ -1501,7 +1619,11 @@ mod tests {
     fn stage65_read_shared_reply_still_unsupported_by_production_mapper() {
         // READ_SHARED_REPLY remains blocked; both directions are unsupported in production.
         let descriptor = VfsSharedBufferDescriptor::new(
-            TEST_TOKEN, TEST_TOKEN >> 16, 0, 8, VFS_SHARED_BUFFER_FS_WRITE,
+            TEST_TOKEN,
+            TEST_TOKEN >> 16,
+            0,
+            8,
+            VFS_SHARED_BUFFER_FS_WRITE,
         );
         let result = UnsupportedSharedIoMapper.with_read_reply_buffer(descriptor, 8, |_| ());
         assert_eq!(result, Err(VfsSharedIoAdapterError::UnsupportedMapping));
@@ -1513,7 +1635,13 @@ mod tests {
         // remain unsupported.  Confirmed by production_mapper_rejects_write_shared_request
         // and read_shared_reply_still_unsupported_by_production_mapper above.
         assert_eq!(
-            UnsupportedSharedIoMapper.release(VfsSharedBufferDescriptor::new(1, 1, 0, 1, VFS_SHARED_BUFFER_FS_READ)),
+            UnsupportedSharedIoMapper.release(VfsSharedBufferDescriptor::new(
+                1,
+                1,
+                0,
+                1,
+                VFS_SHARED_BUFFER_FS_READ
+            )),
             Err(VfsSharedIoAdapterError::UnsupportedMapping),
             "UnsupportedSharedIoMapper must reject release — live mapping is disabled"
         );
@@ -1527,7 +1655,7 @@ mod tests {
     // that fails; release() returns ReleaseFailure but sets the released flag.
 
     const TOKEN_79A: u64 = 0x0009_0007; // gen=9, slot=7
-    const BASE_79A: u64 = 0xB000;       // fake VA — not valid in hosted-dev
+    const BASE_79A: u64 = 0xB000; // fake VA — not valid in hosted-dev
     const LEN_79A: u64 = 4096;
     const PERM_RO_79A: u32 = 1;
     const PERM_RW_79A: u32 = 3;
@@ -1565,7 +1693,11 @@ mod tests {
         let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
         // FS_WRITE access on a write-request mapper (expects FS_READ) → WrongDirection
         let desc = VfsSharedBufferDescriptor::new(
-            TOKEN_79A, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_WRITE,
+            TOKEN_79A,
+            TOKEN_79A >> 16,
+            0,
+            8,
+            VFS_SHARED_BUFFER_FS_WRITE,
         );
         assert_eq!(
             m.with_write_request_buffer(desc, 8, |_| ()),
@@ -1577,7 +1709,11 @@ mod tests {
     fn stage79_write_request_stale_handle_rejected() {
         let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
         let desc = VfsSharedBufferDescriptor::new(
-            TOKEN_79A + 1, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+            TOKEN_79A + 1,
+            TOKEN_79A >> 16,
+            0,
+            8,
+            VFS_SHARED_BUFFER_FS_READ,
         );
         assert_eq!(
             m.with_write_request_buffer(desc, 8, |_| ()),
@@ -1589,7 +1725,11 @@ mod tests {
     fn stage79_write_request_stale_generation_rejected() {
         let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
         let desc = VfsSharedBufferDescriptor::new(
-            TOKEN_79A, (TOKEN_79A >> 16) + 1, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+            TOKEN_79A,
+            (TOKEN_79A >> 16) + 1,
+            0,
+            8,
+            VFS_SHARED_BUFFER_FS_READ,
         );
         assert_eq!(
             m.with_write_request_buffer(desc, 8, |_| ()),
@@ -1612,7 +1752,11 @@ mod tests {
         // page_rounded_mapped_len=8; offset=1 + len=8 → end=9 > 8 → BadRange.
         let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, 8, PERM_RO_79A);
         let desc = VfsSharedBufferDescriptor::new(
-            TOKEN_79A, TOKEN_79A >> 16, 1, 8, VFS_SHARED_BUFFER_FS_READ,
+            TOKEN_79A,
+            TOKEN_79A >> 16,
+            1,
+            8,
+            VFS_SHARED_BUFFER_FS_READ,
         );
         assert_eq!(
             m.with_write_request_buffer(desc, 8, |_| ()),
@@ -1625,7 +1769,11 @@ mod tests {
         let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RW_79A);
         // FS_READ access on a read-reply mapper (expects FS_WRITE) → WrongDirection.
         let desc = VfsSharedBufferDescriptor::new(
-            TOKEN_79A, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+            TOKEN_79A,
+            TOKEN_79A >> 16,
+            0,
+            8,
+            VFS_SHARED_BUFFER_FS_READ,
         );
         assert_eq!(
             m.with_read_reply_buffer(desc, 8, |_| ()),
@@ -1647,10 +1795,17 @@ mod tests {
     fn stage79_release_stale_handle_rejected() {
         let mut m = RecvV3SharedIoMapper::from_fields(TOKEN_79A, BASE_79A, LEN_79A, PERM_RO_79A);
         let wrong = VfsSharedBufferDescriptor::new(
-            TOKEN_79A + 1, TOKEN_79A >> 16, 0, 8, VFS_SHARED_BUFFER_FS_READ,
+            TOKEN_79A + 1,
+            TOKEN_79A >> 16,
+            0,
+            8,
+            VFS_SHARED_BUFFER_FS_READ,
         );
         assert_eq!(m.release(wrong), Err(VfsSharedIoAdapterError::StaleHandle));
-        assert!(!m.is_released(), "stale-handle release must not mark as released");
+        assert!(
+            !m.is_released(),
+            "stale-handle release must not mark as released"
+        );
     }
 
     #[test]
@@ -1665,7 +1820,10 @@ mod tests {
             r == Ok(()) || r == Err(VfsSharedIoAdapterError::ReleaseFailure),
             "release must return Ok or ReleaseFailure; got {r:?}"
         );
-        assert!(m.is_released(), "released flag must be set after first release attempt");
+        assert!(
+            m.is_released(),
+            "released flag must be set after first release attempt"
+        );
         assert_eq!(
             m.with_write_request_buffer(desc, 8, |_| ()),
             Err(VfsSharedIoAdapterError::AccessAfterCleanup),
@@ -1679,7 +1837,11 @@ mod tests {
         let desc = wr_desc_79(TOKEN_79A, 0, 8);
         let _ = m.release(desc); // first call (may fail in hosted-dev; sets released=true)
         assert!(m.is_released());
-        assert_eq!(m.release(desc), Ok(()), "second release must return Ok without syscall");
+        assert_eq!(
+            m.release(desc),
+            Ok(()),
+            "second release must return Ok without syscall"
+        );
     }
 }
 
@@ -1697,15 +1859,11 @@ mod stage83_adapter_tests {
     const TOKEN83A: u64 = 0x0083_0010; // gen=0x83, slot=0x10
 
     fn wr_d(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
-        VfsSharedBufferDescriptor::new(
-            token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_READ,
-        )
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_READ)
     }
 
     fn rr_d(token: u64, offset: u64, len: u64) -> VfsSharedBufferDescriptor {
-        VfsSharedBufferDescriptor::new(
-            token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_WRITE,
-        )
+        VfsSharedBufferDescriptor::new(token, token >> 16, offset, len, VFS_SHARED_BUFFER_FS_WRITE)
     }
 
     #[test]
