@@ -475,7 +475,7 @@ fn rpi5_high_half_scaffold_is_explicit_and_non_default() {
     let stage1_target = include_str!("../targets/aarch64-rpi5-stage1-none.json");
     let stage1_linker = include_str!("../targets/aarch64-rpi5-stage1-none.ld");
     let high_half_linker = include_str!("../targets/aarch64-rpi5-stage2-highhalf-none.ld");
-    let documentation = include_str!("../doc/rpi5-stage1.md");
+    let documentation = include_str!("../doc/RPI5_BRINGUP.md");
 
     assert!(policy.contains("RPI5_KERNEL_VA_OFFSET: u64 = 0xffff_ff80_0000_0000"));
     assert!(policy.contains("RPI5_KERNEL_PHYS_LOAD_BASE: u64 = 0x0000_0000_0008_0000"));

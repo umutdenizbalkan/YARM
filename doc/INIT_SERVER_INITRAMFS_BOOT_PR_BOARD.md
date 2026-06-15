@@ -165,7 +165,7 @@ into a dedicated user address space.
 - `tests/kernel_scenarios.rs`
 - `src/kernel/boot/tests.rs`
 - `scripts/qemu-x86_64-core-smoke.sh`
-- `BOOT_QEMU_RUNBOOK.md`
+- `doc/BOOT.md` §4 (consolidated; replaces the former `BOOT_QEMU_RUNBOOK.md`)
 
 ### Acceptance tests
 - E2E asserts:

@@ -7,7 +7,7 @@ This document defines the implementation slices for seL4-style reply-cap IPC.
 > **Historical/staged design note.**
 > The authoritative current ABI/behavior is documented in:
 > - `doc/SYSCALL_ABI.md`
-> - `doc/AARCH64_IPC_VFS_PM_STATUS_2026_05.md`
+> - `doc/ARCH_AARCH64.md` (consolidated; replaces the former `AARCH64_IPC_VFS_PM_STATUS_2026_05.md`)
 >
 > This plan remains useful for implementation history; where statements differ, follow the two documents above.
 
