@@ -1470,7 +1470,7 @@ work before pausing for kernel unlocking.
    Includes gate matrix, mount matrix, shared-I/O matrix, spawn image IDs, smoke
    commands, expected/forbidden markers, and exact deferred-work list.
 
-3. **New doc: `doc/KERNEL_UNLOCKING_NEXT_CONTEXT.md`**: handoff seed for kernel
+3. **New doc: `doc/KERNEL_UNLOCKING.md`**: handoff seed for kernel
    unlocking work. Includes FS baseline, invariants that must not break, recent
    correctness fixes, and recommended Stage 101 target.
 

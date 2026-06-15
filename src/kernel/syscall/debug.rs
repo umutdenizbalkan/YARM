@@ -6,7 +6,7 @@
 //! Stage 102: mechanically split from the parent `syscall.rs` module with zero
 //! behavior change. The dispatch arm in `syscall.rs` (`Syscall::DebugLog =>
 //! handle_debug_log`) is unchanged; this module only hosts the moved body.
-//! See `doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §3` for the decomposition map.
+//! See `doc/KERNEL_UNLOCKING.md` for the decomposition map.
 
 use super::{AARCH64_SYSCALL_TRACE, SyscallError};
 use crate::kernel::boot::KernelState;

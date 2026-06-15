@@ -8,7 +8,7 @@
 //! behavior change. The dispatch arms in `syscall.rs` are unchanged; this
 //! module only hosts the moved bodies. Syscall 27 is deprecated after Phase 3B
 //! but must not be removed (Phase 2B fallback — see `doc/AI_AGENT_RULES.md
-//! §3.4`). See `doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §3` for the
+//! §3.4`). See `doc/KERNEL_UNLOCKING.md` for the
 //! decomposition map.
 
 use super::{

@@ -23,7 +23,7 @@
 //!
 //! ## Why D1 is helper-only at Stage 103
 //!
-//! Per `doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §4`, cap-transfer materialization
+//! Per `doc/KERNEL_UNLOCKING.md`, cap-transfer materialization
 //! is **multi-domain**:
 //!
 //! | Phase | Operation | Domain / rank |

@@ -4918,7 +4918,7 @@ unlocking resumes at Stage 101.
    with gate matrix, mount matrix, shared-I/O matrix, spawn IDs, smoke commands,
    expected markers, forbidden markers, and deferred-work list.
 
-3. **`doc/KERNEL_UNLOCKING_NEXT_CONTEXT.md`** created: handoff seed for Stage 101.
+3. **`doc/KERNEL_UNLOCKING.md`** created: handoff seed for Stage 101.
    Captures FS baseline, kernel invariants, recent correctness fixes, and Stage 101
    target.
 
@@ -4966,13 +4966,18 @@ all new patterns. Stage 94 is docs-and-hardening only.
 
 ## Stage 101 — Kernel unlocking restart / MUST_SMOKE policy + syscall decomposition readiness
 
+> **Canonical kernel-unlocking reference: `doc/KERNEL_UNLOCKING.md`.** The
+> Stage 101+ unlocking sections below pin per-stage test invariants and are
+> the only documentation owner for kernel-unlocking *test rules*. Status,
+> milestone, scaffold, and audit narrative lives in the canonical doc.
+
 Stage 101 reopens kernel-unlocking work. It is a docs / audit / source-label /
 scaffold-status stage. No behavior change is permitted in Stage 101 itself.
 See:
 - `doc/AI_AGENT_RULES.md §13` — MUST_SMOKE policy.
-- `doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md` — full audit, D1 readiness, syscall
+- `doc/KERNEL_UNLOCKING.md` — full audit, D1 readiness, syscall
   decomposition map, unsafe split-helper guard audit, scaffold status pointer.
-- `doc/DECOMPOSITION_SCAFFOLD_STATUS.md` — scaffold/plan-type status (live /
+- `doc/KERNEL_UNLOCKING.md` — scaffold/plan-type status (live /
   helper-only / fallback-only / deferred / obsolete).
 
 ### Stage 101.1 — MUST_SMOKE policy is a test rule
@@ -5011,7 +5016,7 @@ guard their continued presence.
   subsystem (capability / IPC / VM / scheduler / spawn / fault) is recommended
   for a dedicated future stage, **not** combined with any behavior change.
 - `src/kernel/syscall.rs` is ~7,650 lines. The decomposition map in
-  `KERNEL_UNLOCKING_STAGE101_AUDIT.md §3` is the canonical target. A mechanical
+  `doc/KERNEL_UNLOCKING.md` is the canonical target. A mechanical
   split (move-only, zero behavior change) is permitted in Stage 102+ but must
   not be combined with D1 / D3 / D6 live-wire changes.
 
@@ -5050,7 +5055,7 @@ unchanged; moved fns are `pub(super)`.
    `include_str!("syscall.rs")` sees ONLY the parent file, not child modules.
    If a source-scan pattern targets code that has moved to a child module,
    the test must `include_str!("syscall/<child>.rs")` instead. Check
-   `doc/DECOMPOSITION_SCAFFOLD_STATUS.md §6.1` for what lives where.
+   `doc/KERNEL_UNLOCKING.md` for what lives where.
 2. **Scripts reference `src/kernel/syscall.rs` by path**
    (`check-kernel-arch-boundary.sh`, `phase7-shared-ipc-gates.sh`). Patterns
    those scripts check must stay in the parent file, or the scripts must be
@@ -5062,7 +5067,7 @@ unchanged; moved fns are `pub(super)`.
 4. **Do not churn the IPC group before D1.** `handle_ipc_*`,
    `materialize_received_*`, `complete_blocked_recv_for_waiter`, and the
    recv-result writeback chain stay in `syscall.rs` until the D1 cap-transfer
-   split lands (Stage 103) — see `KERNEL_UNLOCKING_STAGE101_AUDIT.md §11.6`.
+   split lands (Stage 103) — see `doc/KERNEL_UNLOCKING.md`.
 
 **Test groups (kernel::syscall::tests Stage 102 — 4 tests):**
 
@@ -5089,7 +5094,7 @@ labels present; Stage 100 FS gates unchanged.
 
 Stage 103 added the Phase A / B / C scaffold for the D1 cap-transfer recv
 split as **helper-only / default-off**. No live behavior change. See
-`doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §12` for the full record.
+`doc/KERNEL_UNLOCKING.md` for the full record.
 
 New module: `src/kernel/cap_transfer_split.rs` — declared in
 `src/kernel/mod.rs` as `pub mod cap_transfer_split;`. Exposes:
@@ -5154,7 +5159,7 @@ Stage 104 live-wired the D1 cap-transfer recv split for the supported
 transfer-cap case via `syscall.rs::materialize_received_message_cap_routed`.
 **NOT SMOKE-ACCEPTED** until x86_64 `-smp 1` core smoke and optional-FS
 strict smoke run on the branch (developed without QEMU). See
-`doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §13`.
+`doc/KERNEL_UNLOCKING.md`.
 
 **Test rules:**
 
@@ -5207,7 +5212,7 @@ no deadline-0 required replies; no wrong-sender SpawnV5 replies.
 D2 is live-wired (`publish_recv_waiter_live` in the canonical endpoint
 blocking-recv path). D3 remains gated with a structural ordering proof. D6
 is audit-only. Milestone 1 is **DECLARED** (2026-06-12) — the smoke checklist
-in `KERNEL_UNLOCKING_MILESTONE_1.md` passed on all three runs.
+in `doc/KERNEL_UNLOCKING.md` passed on all three runs.
 
 **Test rules:**
 
