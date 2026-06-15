@@ -151,7 +151,7 @@ a smoke log, it is a regression.
 
 Syscall nr=27 `InitramfsReadChunk` (both the self-ASID and cross-ASID paths) is
 still present in the kernel for Phase 2B fallback compatibility. It must not be
-removed until the long-run gate passes (see `doc/PHASE3B_MILESTONE.md §Deprecated`).
+removed until the long-run gate passes (see `doc/PROJECT_HISTORY.md`).
 
 ---
 
@@ -474,7 +474,7 @@ The milestone is reached when:
 - Docs/rules are current.
 - Kernel unlocking handoff seed is written.
 
-See `doc/OPTIONAL_FS_MILESTONE_1.md` for the full milestone record.
+See `doc/PROJECT_HISTORY.md` for the full milestone record.
 
 ### 12.2 Filesystem work is paused after Milestone 1
 

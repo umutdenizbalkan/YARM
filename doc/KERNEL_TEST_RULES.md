@@ -4914,7 +4914,7 @@ unlocking resumes at Stage 101.
    changed to a two-stage filter that excludes lines containing `nonfatal=true`.
    Pattern: `rg -ai "\bpanic\b" | rg -avc "nonfatal=true"`.
 
-2. **`doc/OPTIONAL_FS_MILESTONE_1.md`** created: authoritative milestone record
+2. **`doc/PROJECT_HISTORY.md`** created: authoritative milestone record
    with gate matrix, mount matrix, shared-I/O matrix, spawn IDs, smoke commands,
    expected markers, forbidden markers, and deferred-work list.
 

@@ -223,7 +223,7 @@ Forbidden:
 
 FAT reached **Optional FS Milestone 1** as "profile-ready, disabled" status.
 All scripts, tests, and checklist items are complete. `INIT_SPAWN_FAT_SRV` remains
-`false`. See `doc/OPTIONAL_FS_MILESTONE_1.md §10` for the exact activation blockers.
+`false`. See `doc/PROJECT_HISTORY.md` for the exact activation blockers.
 
 Filesystem work is paused after Milestone 1. The FAT production activation sequence
 (§ Stage 93 checklist) remains valid and will be executed in a future FS milestone
