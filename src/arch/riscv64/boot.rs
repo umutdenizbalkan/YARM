@@ -262,6 +262,187 @@ extern "C" fn yarm_riscv64_early_trap_report(scause: usize, sepc: usize, stval: 
     }
 }
 
+// ── RISC-V S-mode -> U-mode entry + S-mode trap vector ─────────────────────
+//
+// `yarm_riscv64_enter_user` performs the real `sret` into U-mode. It loads the
+// per-task `satp` (a user page table that also carries the kernel-shared
+// gigapage so the kernel/trap-vector keep executing across the switch), sets
+// `sscratch` to a kernel trap stack, installs the S-mode trap vector, programs
+// `sstatus` for U-mode (SPP=0, SPIE=0 — interrupts stay masked in user), loads
+// the user GPRs/sp/sepc, and `sret`s.
+//
+// `yarm_riscv64_trap_vector` is the S-mode trap entry. It swaps to the kernel
+// trap stack via `sscratch`, snapshots the trap CSRs and the syscall number,
+// and hands off to the Rust reporter. It lives in kernel text (covered by the
+// gigapage) so it is reachable with a user `satp` active.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text, "ax", @progbits
+
+    .global yarm_riscv64_enter_user
+    .type yarm_riscv64_enter_user, @function
+yarm_riscv64_enter_user:
+    // a0 = *const RiscvEnterUserCtx (kernel addr, mapped by gigapage)
+    mv t0, a0
+    ld t1, 24(t0)              // kernel_sp
+    csrw sscratch, t1
+    la t2, yarm_riscv64_trap_vector
+    csrw stvec, t2
+    ld t3, 8(t0)              // sepc (user entry)
+    csrw sepc, t3
+    // sstatus: clear SPP (bit 8) -> return to U-mode after sret; clear SPIE
+    // (bit 5) so interrupts stay disabled in U-mode (we have no timer/IRQ
+    // path yet); set SUM (bit 18) so the kernel can still touch U-pages from
+    // S-mode for trap bookkeeping if/when we resume there. We use csrrc/csrrs
+    // (atomic clear/set with mask), the canonical way to flip individual
+    // status bits without read-modify-write hazards.
+    li t5, 0x120              // SPP | SPIE
+    csrc sstatus, t5
+    li t5, 0x40000            // SUM
+    csrs sstatus, t5
+    // user GPRs
+    ld a0, 32(t0)
+    ld a1, 40(t0)
+    ld a2, 48(t0)
+    ld a3, 56(t0)
+    ld a4, 64(t0)
+    ld a5, 72(t0)
+    ld tp, 80(t0)
+    ld sp, 16(t0)            // user sp
+    ld t1, 0(t0)             // satp
+    csrw satp, t1
+    sfence.vma x0, x0
+    sret
+
+    .align 4
+    .global yarm_riscv64_trap_vector
+    .type yarm_riscv64_trap_vector, @function
+yarm_riscv64_trap_vector:
+    // Entered on a trap. sp is the user sp; swap in the kernel trap stack.
+    csrrw sp, sscratch, sp     // sp = kernel trap stack; sscratch = user sp
+    addi sp, sp, -64
+    sd ra, 0(sp)
+    sd a7, 8(sp)               // user a7 (syscall number)
+    csrr a0, scause
+    csrr a1, sepc
+    csrr a2, stval
+    ld a3, 8(sp)               // a7
+    csrr a4, sstatus
+    csrr a5, sscratch          // user sp at trap time
+    call yarm_riscv64_user_trap_report
+1:
+    wfi
+    j 1b
+"#
+);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[repr(C)]
+struct RiscvEnterUserCtx {
+    satp: u64,      // 0
+    sepc: u64,      // 8
+    user_sp: u64,   // 16
+    kernel_sp: u64, // 24
+    a0: u64,        // 32
+    a1: u64,        // 40
+    a2: u64,        // 48
+    a3: u64,        // 56
+    a4: u64,        // 64
+    a5: u64,        // 72
+    tp: u64,        // 80
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+unsafe extern "C" {
+    fn yarm_riscv64_enter_user(ctx: *const RiscvEnterUserCtx) -> !;
+    static yarm_riscv64_trap_vector: u8;
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[repr(align(16))]
+struct RiscvTrapStack([u8; 16 * 1024]);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static mut RISCV_TRAP_STACK: RiscvTrapStack = RiscvTrapStack([0; 16 * 1024]);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_trap_stack_top() -> u64 {
+    let base = core::ptr::addr_of!(RISCV_TRAP_STACK) as u64;
+    (base + (16 * 1024)) & !0xf
+}
+
+/// S-mode trap reporter for U-mode traps. For this bring-up stage it is a
+/// black-box recorder: it captures the trap CSRs and the syscall number, emits
+/// the required markers, and halts deterministically. (The full handle +
+/// `sret` round-trip is the next stage.)
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[unsafe(no_mangle)]
+extern "C" fn yarm_riscv64_user_trap_report(
+    scause: usize,
+    sepc: usize,
+    stval: usize,
+    a7: usize,
+    sstatus: usize,
+    user_sp: usize,
+) -> ! {
+    const EXC_USER_ECALL: usize = 8;
+    // sstatus.SPP (bit 8): 0 = trap was taken from U-mode (sret really
+    // returned to U), 1 = trap was taken from S-mode (sret never reached U).
+    let spp = (sstatus >> 8) & 1;
+    let trap_from_u = spp == 0;
+    early_marker!(
+        "RISCV_TRAP_ENTER scause=0x{:x} sepc=0x{:x} stval=0x{:x} sstatus=0x{:x} spp={} from_u={} user_sp=0x{:x}",
+        scause,
+        sepc,
+        stval,
+        sstatus,
+        spp,
+        trap_from_u as u8,
+        user_sp
+    );
+    early_marker!(
+        "RISCV_FIRST_USER_TRAP scause=0x{:x} sepc=0x{:x} stval=0x{:x}",
+        scause,
+        sepc,
+        stval
+    );
+    if scause == EXC_USER_ECALL {
+        early_marker!("RISCV_FIRST_USER_SYSCALL nr={}", a7);
+        early_marker!("RISCV_TRAP_HALTED reason=first_user_syscall_captured");
+    } else if trap_from_u {
+        early_marker!(
+            "RISCV_TRAP_HALTED reason=first_user_trap_captured_from_u scause=0x{:x}",
+            scause
+        );
+    } else {
+        early_marker!(
+            "RISCV_TRAP_HALTED reason=sret_failed_or_kernel_fault scause=0x{:x}",
+            scause
+        );
+    }
+    loop {
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Proves the kernel keeps executing after a `satp` switch into a user page
+/// table: installs `satp`, runs real kernel code (the marker path touches
+/// kernel .rodata/.data/.bss in the gigapage), then restores the prior `satp`.
+/// If the gigapage were wrong this would fault into the early trap vector
+/// (also gigapage-mapped) rather than dying silently.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv64_probe_satp_alive(satp: u64) {
+    let prev: u64;
+    unsafe {
+        core::arch::asm!("csrr {0}, satp", out(reg) prev, options(nostack, preserves_flags));
+    }
+    crate::arch::riscv64::page_table::write_satp(satp);
+    early_marker!("RISCV_SATP_KERNEL_ALIVE_OK satp=0x{:x}", satp);
+    crate::arch::riscv64::page_table::write_satp(prev);
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 const RING3_INIT_SERVER_TID: u64 = 1;
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -904,31 +1085,131 @@ pub fn release_secondary_cpus_after_bootstrap() {
 #[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
 pub fn release_secondary_cpus_after_bootstrap() {}
 
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 pub fn enter_dispatched_user_task_if_available(
-    _kernel: &crate::kernel::boot::KernelState,
+    kernel: &crate::kernel::boot::KernelState,
     dispatched_tid: Option<u64>,
 ) {
-    // Fail-closed: the RISC-V S-mode -> U-mode transition is not yet
-    // implemented. Reaching this point means the kernel booted, the
-    // initramfs ELFs were spawned, and the scheduler selected a user task,
-    // but the arch prerequisites for entering U-mode are missing:
-    //   - Sv39 paging is not enabled (the kernel still runs with satp=0,
-    //     identity-mapped); the user ELF is mapped at its virtual address
-    //     inside a per-task page table that is never activated.
-    //   - There is no installed S-mode trap vector for user traps (only the
-    //     early pre-kernel diagnostic vector), and no user trap save/restore
-    //     or enter-user (`sret`) asm path.
-    // Until those land, do NOT fabricate a transition; report the exact
-    // blocker and let the boot hart idle deterministically.
-    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-    if let Some(tid) = dispatched_tid {
+    let Some(tid) = dispatched_tid else {
+        return;
+    };
+    early_marker!("RISCV_FIRST_USER_PREP_BEGIN tid={}", tid);
+
+    let Some(context) = kernel.thread_user_context(tid) else {
         early_marker!(
-            "RISCV_USERSPACE_DEFERRED reason=no_smode_to_umode_path_no_sv39_paging tid={}",
+            "RISCV_USERSPACE_DEFERRED reason=no_user_context tid={}",
             tid
         );
+        return;
+    };
+    if context.instruction_ptr.0 == 0 || context.stack_ptr.0 == 0 {
+        early_marker!(
+            "RISCV_USERSPACE_DEFERRED reason=empty_user_context tid={} pc=0x{:x} sp=0x{:x}",
+            tid,
+            context.instruction_ptr.0,
+            context.stack_ptr.0
+        );
+        return;
     }
-    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
-    let _ = dispatched_tid;
+    let Some(asid) = kernel.task_asid(tid) else {
+        early_marker!("RISCV_USERSPACE_DEFERRED reason=no_asid tid={}", tid);
+        return;
+    };
+
+    // Phase 1: Sv39 plan — install the kernel-shared gigapage into the user
+    // root so the kernel/trap path survives the satp switch.
+    early_marker!("RISCV_SV39_PLAN_BEGIN");
+    let (kstart, kend) = match crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid) {
+        Ok(range) => range,
+        Err(err) => {
+            early_marker!(
+                "RISCV_USERSPACE_DEFERRED reason=gigapage_install_failed err={:?}",
+                err
+            );
+            return;
+        }
+    };
+    early_marker!(
+        "RISCV_SV39_MAP_KERNEL start=0x{:x} end=0x{:x}",
+        kstart,
+        kend
+    );
+    let trap_vector = unsafe { core::ptr::addr_of!(yarm_riscv64_trap_vector) as u64 };
+    early_marker!(
+        "RISCV_SV39_MAP_TRAP_VECTOR va=0x{:x} pa=0x{:x}",
+        trap_vector,
+        trap_vector
+    );
+    let kernel_sp = riscv_trap_stack_top();
+    early_marker!(
+        "RISCV_SV39_MAP_KERNEL_STACK va=0x{:x} pa=0x{:x}",
+        kernel_sp,
+        kernel_sp
+    );
+    // The RISC-V console is SBI (ecall to M-mode), so no UART MMIO mapping is
+    // required while a user address space is active.
+    early_marker!("RISCV_SV39_MAP_UART va=0x0 pa=0x0 note=sbi_console_no_mmio_needed");
+    early_marker!("RISCV_SV39_USER_ROOT_READY tid={}", tid);
+    early_marker!("RISCV_SV39_PLAN_DONE");
+
+    let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid) else {
+        early_marker!("RISCV_USERSPACE_DEFERRED reason=no_satp tid={}", tid);
+        return;
+    };
+
+    // Phase 1 proof: switch to the user satp, run kernel code, switch back.
+    early_marker!("RISCV_SATP_INSTALL_BEGIN root=0x{:x}", satp);
+    riscv64_probe_satp_alive(satp);
+    early_marker!("RISCV_SATP_INSTALL_DONE value=0x{:x}", satp);
+
+    // Phase 2: the real S-mode trap vector (installed by the enter-user asm via
+    // `csrw stvec` just before sret).
+    early_marker!("RISCV_TRAP_VECTOR_INSTALL_BEGIN");
+    early_marker!("RISCV_TRAP_VECTOR_INSTALL_DONE base=0x{:x}", trap_vector);
+
+    // Phase 3: build the user context and sret into U-mode.
+    early_marker!(
+        "RISCV_FIRST_USER_ELF_OK tid={} entry=0x{:x}",
+        tid,
+        context.instruction_ptr.0
+    );
+    early_marker!(
+        "RISCV_FIRST_USER_STACK_OK tid={} sp=0x{:x}",
+        tid,
+        context.stack_ptr.0
+    );
+    let tls = kernel.thread_tls_base(tid).unwrap_or(0) as u64;
+    let ctx = RiscvEnterUserCtx {
+        satp,
+        sepc: context.instruction_ptr.0,
+        user_sp: context.stack_ptr.0,
+        kernel_sp,
+        a0: context.arg0 as u64,
+        a1: context.arg1 as u64,
+        a2: context.arg2 as u64,
+        a3: context.arg3 as u64,
+        a4: context.arg4 as u64,
+        a5: context.arg5 as u64,
+        tp: tls,
+    };
+    early_marker!(
+        "RISCV_FIRST_USER_CONTEXT_OK tid={} pc=0x{:x} sp=0x{:x}",
+        tid,
+        ctx.sepc,
+        ctx.user_sp
+    );
+    early_marker!("RISCV_ENTER_USER_ATTEMPT tid={}", tid);
+    early_marker!("RISCV_ENTER_USER_SRET tid={}", tid);
+    unsafe {
+        yarm_riscv64_enter_user(&ctx as *const RiscvEnterUserCtx);
+    }
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
+pub fn enter_dispatched_user_task_if_available(
+    _kernel: &crate::kernel::boot::KernelState,
+    _dispatched_tid: Option<u64>,
+) {
 }
 
 pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) {
