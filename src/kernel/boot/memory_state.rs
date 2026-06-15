@@ -7,7 +7,7 @@ use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::topology::CpuBitmap;
 use crate::kernel::vm::{
-    Asid, Mapping, MappingEntry, PageFlags, PhysAddr, VirtAddr, VmError, PAGE_SIZE,
+    Asid, Mapping, MappingEntry, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr, VmError,
 };
 
 impl KernelState {

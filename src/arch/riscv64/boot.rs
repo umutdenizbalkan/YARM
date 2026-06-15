@@ -685,6 +685,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             crate::yarm_log!(
                 "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
             );
+            // Safe point per the timer/PLIC bring-up contract: real S-mode
+            // trap vector + kernel-state pointer are installed; service
+            // chain has reached stable idle. Both init paths default to
+            // deferred and never enable STIE / external-IRQ delivery
+            // until explicitly audited.
+            let _ = crate::arch::riscv64::timer::init_timer_after_idle_safe_point();
+            let _ = crate::arch::riscv64::plic::init_plic_after_idle_safe_point();
             riscv_trap_halt("kernel_idle_awaiting_io");
         }
         early_marker!(

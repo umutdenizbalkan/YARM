@@ -481,7 +481,9 @@ mod tests {
         let mut table = VfsMountTable::new();
         assert!(table.register(b"/initramfs/", "initramfs", 10));
         assert!(table.register(b"/dev/", "devfs", 20));
-        table.insert_dynamic(b"/ram", 30, 0).expect("ramfs dynamic mount");
+        table
+            .insert_dynamic(b"/ram", 30, 0)
+            .expect("ramfs dynamic mount");
         table
     }
 
@@ -496,7 +498,9 @@ mod tests {
     #[test]
     fn stage87_routing_dev_null_routes_to_devfs() {
         let table = make_boot_table();
-        let (cap, label) = table.route(b"/dev/null").expect("/dev/null must route to devfs");
+        let (cap, label) = table
+            .route(b"/dev/null")
+            .expect("/dev/null must route to devfs");
         assert_eq!(cap, 20);
         assert_eq!(label.as_str(), "devfs");
     }
@@ -504,7 +508,9 @@ mod tests {
     #[test]
     fn stage87_routing_dev_console_routes_to_devfs() {
         let table = make_boot_table();
-        let (cap, label) = table.route(b"/dev/console").expect("/dev/console must route to devfs");
+        let (cap, label) = table
+            .route(b"/dev/console")
+            .expect("/dev/console must route to devfs");
         assert_eq!(cap, 20);
         assert_eq!(label.as_str(), "devfs");
     }
@@ -514,7 +520,9 @@ mod tests {
         let table = make_boot_table();
         let (cap, _) = table.route(b"/ram").expect("/ram must route to RAMFS");
         assert_eq!(cap, 30);
-        let (cap, _) = table.route(b"/ram/file.txt").expect("/ram/file.txt must route to RAMFS");
+        let (cap, _) = table
+            .route(b"/ram/file.txt")
+            .expect("/ram/file.txt must route to RAMFS");
         assert_eq!(cap, 30);
     }
 
@@ -565,7 +573,9 @@ mod tests {
     fn stage87_routing_devpts_longer_prefix_wins() {
         // /dev/pts/ prefix should beat /dev/ when registered.
         let mut table = make_boot_table();
-        table.insert_dynamic(b"/dev/pts", 25, 0).expect("devpts mount");
+        table
+            .insert_dynamic(b"/dev/pts", 25, 0)
+            .expect("devpts mount");
 
         let (cap, _) = table.route(b"/dev/pts/0").expect("/dev/pts/0 must route");
         assert_eq!(cap, 25, "/dev/pts/0 must match the longer /dev/pts/ prefix");
@@ -579,11 +589,17 @@ mod tests {
         // Prove that /fat is routable once fat_srv registers it via VFS_OP_MOUNT_REGISTER.
         // This would happen if INIT_SPAWN_FAT_SRV were true and fat_srv reached READY.
         let mut table = make_boot_table();
-        table.insert_dynamic(b"/fat", 40, 0).expect("fat dynamic mount");
+        table
+            .insert_dynamic(b"/fat", 40, 0)
+            .expect("fat dynamic mount");
 
-        let (cap, _) = table.route(b"/fat").expect("/fat must route once registered");
+        let (cap, _) = table
+            .route(b"/fat")
+            .expect("/fat must route once registered");
         assert_eq!(cap, 40);
-        let (cap, _) = table.route(b"/fat/hello.txt").expect("/fat/hello.txt must route");
+        let (cap, _) = table
+            .route(b"/fat/hello.txt")
+            .expect("/fat/hello.txt must route");
         assert_eq!(cap, 40);
         // Other routes remain unaffected.
         let (cap, _) = table.route(b"/dev/null").expect("/dev/null still routes");
@@ -609,7 +625,9 @@ mod tests {
     #[test]
     fn stage88_routing_ext4_dynamically_registered_routes_root() {
         let table = make_stage88_table();
-        let (cap, _) = table.route(b"/ext4").expect("/ext4 must route after registration");
+        let (cap, _) = table
+            .route(b"/ext4")
+            .expect("/ext4 must route after registration");
         assert_eq!(cap, 50);
     }
 
@@ -634,10 +652,14 @@ mod tests {
     fn stage88_routing_ext4_does_not_shadow_other_mounts() {
         let table = make_stage88_table();
         // /dev still routes to devfs (cap=20).
-        let (cap, _) = table.route(b"/dev/null").expect("/dev/null must still route");
+        let (cap, _) = table
+            .route(b"/dev/null")
+            .expect("/dev/null must still route");
         assert_eq!(cap, 20);
         // /ram still routes to ramfs (cap=30).
-        let (cap, _) = table.route(b"/ram/file.txt").expect("/ram/file.txt must still route");
+        let (cap, _) = table
+            .route(b"/ram/file.txt")
+            .expect("/ram/file.txt must still route");
         assert_eq!(cap, 30);
         // /initramfs still routes to initramfs_srv (cap=10).
         let (cap, _) = table
@@ -683,7 +705,10 @@ mod tests {
         let (cap, _) = table
             .route(b"/initramfs/sbin/ext4_srv")
             .expect("/initramfs/sbin/ext4_srv must route (it's an initramfs path)");
-        assert_eq!(cap, 10, "/initramfs/sbin/ext4_srv must route to initramfs_srv (cap=10)");
+        assert_eq!(
+            cap, 10,
+            "/initramfs/sbin/ext4_srv must route to initramfs_srv (cap=10)"
+        );
     }
 
     #[test]
@@ -693,7 +718,10 @@ mod tests {
         let (cap, _) = table
             .route(b"/initramfs/sbin/ramfs_srv")
             .expect("/initramfs/sbin/ramfs_srv must route (it's an initramfs path)");
-        assert_eq!(cap, 10, "/initramfs/sbin/ramfs_srv must route to initramfs_srv (cap=10)");
+        assert_eq!(
+            cap, 10,
+            "/initramfs/sbin/ramfs_srv must route to initramfs_srv (cap=10)"
+        );
     }
 
     #[test]
@@ -703,7 +731,10 @@ mod tests {
         let (cap, _) = table
             .route(b"/initramfs/sbin/driver_manager")
             .expect("/initramfs/sbin/driver_manager must route");
-        assert_eq!(cap, 10, "/initramfs/sbin/driver_manager must route to initramfs_srv (cap=10)");
+        assert_eq!(
+            cap, 10,
+            "/initramfs/sbin/driver_manager must route to initramfs_srv (cap=10)"
+        );
     }
 
     #[test]
@@ -712,16 +743,24 @@ mod tests {
         // the core mounts (/initramfs, /dev, /ram) must remain unaffected.
         let mut table = make_stage88_table();
         // Hypothetically also register fat (as would happen if FAT were enabled).
-        table.insert_dynamic(b"/fat", 40, 0).expect("fat registration");
+        table
+            .insert_dynamic(b"/fat", 40, 0)
+            .expect("fat registration");
 
         // Core mounts remain intact.
-        let (cap, _) = table.route(b"/initramfs/sbin/ext4_srv").expect("initramfs still routes");
+        let (cap, _) = table
+            .route(b"/initramfs/sbin/ext4_srv")
+            .expect("initramfs still routes");
         assert_eq!(cap, 10, "/initramfs must still route to initramfs_srv");
 
-        let (cap, _) = table.route(b"/dev/null").expect("/dev/null must still route");
+        let (cap, _) = table
+            .route(b"/dev/null")
+            .expect("/dev/null must still route");
         assert_eq!(cap, 20, "/dev must still route to devfs");
 
-        let (cap, _) = table.route(b"/ram/file.txt").expect("/ram/file.txt must still route");
+        let (cap, _) = table
+            .route(b"/ram/file.txt")
+            .expect("/ram/file.txt must still route");
         assert_eq!(cap, 30, "/ram must still route to ramfs_srv");
     }
 
@@ -729,7 +768,9 @@ mod tests {
     fn stage91_routing_ext4_present_after_dynamic_registration_stage88_table() {
         // /ext4 is routable in the stage88 table (after ext4_srv registered).
         let table = make_stage88_table();
-        let (cap, _) = table.route(b"/ext4/service.bin").expect("/ext4/service.bin must route");
+        let (cap, _) = table
+            .route(b"/ext4/service.bin")
+            .expect("/ext4/service.bin must route");
         assert_eq!(cap, 50, "/ext4 paths must route to ext4_srv (cap=50)");
     }
 
@@ -748,8 +789,12 @@ mod tests {
 
         // After hypothetical registration (as would happen if FAT were enabled):
         let mut table_with_fat = make_boot_table();
-        table_with_fat.insert_dynamic(b"/fat", 40, 0).expect("fat registration");
-        let (cap, _) = table_with_fat.route(b"/fat/hello.txt").expect("/fat/hello.txt must route after registration");
+        table_with_fat
+            .insert_dynamic(b"/fat", 40, 0)
+            .expect("fat registration");
+        let (cap, _) = table_with_fat
+            .route(b"/fat/hello.txt")
+            .expect("/fat/hello.txt must route after registration");
         assert_eq!(cap, 40);
     }
 
@@ -759,8 +804,12 @@ mod tests {
         let table_before = make_boot_table();
         let table_after = make_stage88_table();
 
-        let (cap_before, _) = table_before.route(b"/ram/test.txt").expect("/ram must route");
-        let (cap_after, _) = table_after.route(b"/ram/test.txt").expect("/ram must still route after ext4 added");
+        let (cap_before, _) = table_before
+            .route(b"/ram/test.txt")
+            .expect("/ram must route");
+        let (cap_after, _) = table_after
+            .route(b"/ram/test.txt")
+            .expect("/ram must still route after ext4 added");
         assert_eq!(
             cap_before, cap_after,
             "/ram routing cap must be identical before and after ext4 registration"

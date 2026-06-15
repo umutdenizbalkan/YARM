@@ -1025,6 +1025,9 @@ mod tests {
 
     #[test]
     fn stage32b_syscall_count_30() {
-        assert_eq!(SYSCALL_COUNT, 31, "Stage 42+43 adds RecvSharedV3 (NR 30); stage32b invariant updated");
+        assert_eq!(
+            SYSCALL_COUNT, 31,
+            "Stage 42+43 adds RecvSharedV3 (NR 30); stage32b invariant updated"
+        );
     }
 }

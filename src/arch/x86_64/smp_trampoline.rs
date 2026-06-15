@@ -307,9 +307,8 @@ unsafe extern "C" {
 /// `@` COM1 breadcrumb. Today, live x86_64 build sets the BSP-side flag
 /// from `start_secondary_cpus`; hosted-dev tests mirror it directly.
 pub(super) static AP_RUST_ONLINE: [core::sync::atomic::AtomicBool;
-    crate::arch::platform_constants::MAX_CPUS] = [const {
-    core::sync::atomic::AtomicBool::new(false)
-}; crate::arch::platform_constants::MAX_CPUS];
+    crate::arch::platform_constants::MAX_CPUS] = [const { core::sync::atomic::AtomicBool::new(false) };
+    crate::arch::platform_constants::MAX_CPUS];
 
 /// AP Rust entry. Called via `jmp rax` from the trampoline asm tail after
 /// the AP has reached long mode, published the ready_word value `2`
@@ -340,17 +339,14 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
     unsafe {
         core::arch::asm!(
             "cli",
-
             // Emit '@' (Rust-entered breadcrumb).
             "mov dx, 0x3F8",
             "mov al, 0x40",
             "out dx, al",
-
             // Park forever under Rust.
             "2:",
             "hlt",
             "jmp 2b",
-
             options(noreturn, nostack, nomem),
         );
     }

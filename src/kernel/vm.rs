@@ -449,7 +449,10 @@ impl AddressSpace {
                     }
                     self.entries[i + 1] = Some(Entry {
                         virt: tail_virt,
-                        mapping: Mapping { phys: tail_phys, flags: old.flags },
+                        mapping: Mapping {
+                            phys: tail_phys,
+                            flags: old.flags,
+                        },
                         pages: tail_pages,
                     });
                     self.entries[i].as_mut().expect("entry").pages = 1;
@@ -1564,9 +1567,15 @@ mod tests {
         let drained = aspace.drain_mappings();
         assert_eq!(aspace.mappings(), 0);
         assert_eq!(drained[0].expect("block A").pages, 3);
-        assert_eq!(drained[0].expect("block A").mapping.phys, PhysAddr(0x10_000));
+        assert_eq!(
+            drained[0].expect("block A").mapping.phys,
+            PhysAddr(0x10_000)
+        );
         assert_eq!(drained[1].expect("block B").pages, 1);
-        assert_eq!(drained[1].expect("block B").mapping.phys, PhysAddr(0x80_000));
+        assert_eq!(
+            drained[1].expect("block B").mapping.phys,
+            PhysAddr(0x80_000)
+        );
         assert!(drained[2..].iter().all(|s| s.is_none()));
     }
 

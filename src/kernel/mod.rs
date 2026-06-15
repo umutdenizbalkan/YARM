@@ -3,16 +3,16 @@
 
 pub mod boot;
 pub(crate) mod boot_command_line;
-pub mod capabilities;
 pub mod cap_transfer_split;
+pub mod capabilities;
 pub mod frame_allocator;
-pub mod recv_waiter_split;
 pub mod global_allocator;
 pub mod ipc;
 pub mod lock;
 pub mod printk;
 pub mod process;
 pub mod recv_core;
+pub mod recv_waiter_split;
 pub mod scheduler;
 pub mod scheduler_timer;
 pub mod smp;

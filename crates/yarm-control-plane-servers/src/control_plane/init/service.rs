@@ -367,9 +367,7 @@ fn spawn_v5_cap(
                 }
             }
             Ok(None) => {
-                yarm_user_rt::user_log!(
-                    "INIT_SPAWN_V5_REPLY_RECV_ERR err=WouldBlockOrNoMessage"
-                );
+                yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_RECV_ERR err=WouldBlockOrNoMessage");
                 yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_FALLBACK_ZERO reason=recv_none");
                 yarm_user_rt::user_log!("INIT_SPAWN_V5_REPLY_DECODE ok=0 child_tid=0");
                 return None;
@@ -889,13 +887,9 @@ pub fn run() {
             // service_caps entry as a capability ID to delegate into the child cspace.
             // RAMFS falls back to default_compat (prefix=/ram) when config slots are zeroed.
             yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_BEGIN");
-            if let Some((ramfs_child_tid, init_ramfs_send_cap)) = spawn_v5_cap(
-                pm_send,
-                pm_recv,
-                11,
-                [0, 0, 0, 0],
-                1,
-            ) {
+            if let Some((ramfs_child_tid, init_ramfs_send_cap)) =
+                spawn_v5_cap(pm_send, pm_recv, 11, [0, 0, 0, 0], 1)
+            {
                 yarm_user_rt::user_log!(
                     "INIT_RAMFS_SPAWN_OK child_tid={} send_cap={} prefix={}",
                     ramfs_child_tid,
@@ -919,21 +913,17 @@ pub fn run() {
         // INIT_SPAWN_FAT_SRV = false: needs virtio_blk block device.
         // Non-fatal: log and continue to ext4 and alert loop.
         if INIT_SPAWN_FAT_SRV {
-            let fat_mount_config =
-                FatMountConfig::new(b"/fat", 1, true).unwrap_or_else(FatMountConfig::default_compat);
+            let fat_mount_config = FatMountConfig::new(b"/fat", 1, true)
+                .unwrap_or_else(FatMountConfig::default_compat);
             // Stage 91: only position 0 (blkcache cap) is a real capability.
             // Passing fat_prefix_word/fat_meta_word in positions 1-2 causes
             // KSPAWN_EXTRA_CAP_DELEGATE_FAIL — the kernel treats all non-zero
             // service_caps entries as cap IDs to delegate. FAT srv reads its
             // mount config from protocol messages, not startup slots.
             yarm_user_rt::user_log!("INIT_FAT_SPAWN_BEGIN");
-            if let Some((fat_child_tid, init_fat_send_cap)) = spawn_v5_cap(
-                pm_send,
-                pm_recv,
-                10,
-                [init_blkcache_send_cap, 0, 0, 0],
-                1,
-            ) {
+            if let Some((fat_child_tid, init_fat_send_cap)) =
+                spawn_v5_cap(pm_send, pm_recv, 10, [init_blkcache_send_cap, 0, 0, 0], 1)
+            {
                 yarm_user_rt::user_log!(
                     "INIT_FAT_SPAWN_OK child_tid={} send_cap={} prefix={} device_id={}",
                     fat_child_tid,
@@ -968,11 +958,8 @@ pub fn run() {
                     init_ext4_send_cap,
                 );
                 yarm_user_rt::user_log!("EXT4_SRV_READY child_tid={}", ext4_child_tid);
-                let _ = register_ext4_mount_with_vfs(
-                    vfs_recv_cap as u32,
-                    pm_recv,
-                    init_ext4_send_cap,
-                );
+                let _ =
+                    register_ext4_mount_with_vfs(vfs_recv_cap as u32, pm_recv, init_ext4_send_cap);
             } else {
                 yarm_user_rt::user_log!("INIT_EXT4_SPAWN_FAIL ok=0 child_tid=0");
             }
@@ -1216,7 +1203,10 @@ mod tests {
         let payload = encode_spawn_v5_reply(9_999, 65_540);
         let decoded = decode_spawn_v5_reply(&payload).expect("decode");
         assert_ne!(decoded.pid, 0, "PM success reply must not decode as pid=0");
-        assert!(spawn_v5_reply_is_success(decoded.pid, decoded.service_send_cap));
+        assert!(spawn_v5_reply_is_success(
+            decoded.pid,
+            decoded.service_send_cap
+        ));
     }
 
     #[test]

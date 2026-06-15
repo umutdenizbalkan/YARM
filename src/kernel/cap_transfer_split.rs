@@ -94,9 +94,9 @@
 //! reply-cap helper; see the D5 lock-touch map above for the exact blocker
 //! and the safe design for a future pass.
 
-use crate::kernel::boot::{KernelState, ReplyRecordSetOutcome};
 #[cfg(test)]
 use crate::kernel::boot::KernelError;
+use crate::kernel::boot::{KernelState, ReplyRecordSetOutcome};
 use crate::kernel::capabilities::{CNodeId, CapId, CapObject, CapRights, Capability};
 use crate::kernel::ipc::{Message, ThreadId};
 use crate::kernel::syscall::SyscallError;
@@ -128,8 +128,7 @@ impl CapTransferRecvClass {
                 Some(h) => Self::Reply { raw_handle: h },
                 None => Self::None,
             }
-        } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN))
-            != 0
+        } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0
         {
             match raw {
                 Some(h) => Self::Transfer { raw_handle: h },
@@ -375,8 +374,11 @@ pub fn phase_b_prime_record_reply_cap(
     snapshot: &ReplyCapRecvSnapshot,
     minted: CapId,
 ) -> Result<CapId, SyscallError> {
-    let outcome =
-        kernel.try_set_reply_cap_waiter_cap(snapshot.reply_index, snapshot.reply_generation, minted);
+    let outcome = kernel.try_set_reply_cap_waiter_cap(
+        snapshot.reply_index,
+        snapshot.reply_generation,
+        minted,
+    );
     match outcome {
         ReplyRecordSetOutcome::Set => {
             crate::yarm_log!(
@@ -495,19 +497,13 @@ pub fn materialize_split_transfer_cap_equivalent(
             CapTransferSplitResult::FallbackRequired
         }
         CapTransferRecvClass::Transfer { raw_handle } => {
-            let snapshot = match phase_a_take_transfer_envelope(
-                kernel,
-                raw_handle,
-                endpoint,
-                receiver_tid,
-            ) {
-                Ok(s) => s,
-                Err(err) => return CapTransferSplitResult::Failed(err),
-            };
+            let snapshot =
+                match phase_a_take_transfer_envelope(kernel, raw_handle, endpoint, receiver_tid) {
+                    Ok(s) => s,
+                    Err(err) => return CapTransferSplitResult::Failed(err),
+                };
             match phase_b_materialize_transfer_cap(kernel, &snapshot) {
-                Ok(outcome) => {
-                    CapTransferSplitResult::Materialized(outcome.receiver_local_cap.0)
-                }
+                Ok(outcome) => CapTransferSplitResult::Materialized(outcome.receiver_local_cap.0),
                 Err(err) => CapTransferSplitResult::Failed(err),
             }
         }
@@ -682,15 +678,12 @@ mod tests {
 
     #[test]
     fn stage103_classify_plain_message_returns_none() {
-        let msg = Message::with_header(
-            0,
-            crate::kernel::syscall::OPCODE_INLINE,
-            0,
-            None,
-            b"hi",
-        )
-        .expect("plain");
-        assert_eq!(CapTransferRecvClass::classify(&msg), CapTransferRecvClass::None);
+        let msg = Message::with_header(0, crate::kernel::syscall::OPCODE_INLINE, 0, None, b"hi")
+            .expect("plain");
+        assert_eq!(
+            CapTransferRecvClass::classify(&msg),
+            CapTransferRecvClass::None
+        );
     }
 
     #[test]
@@ -731,9 +724,8 @@ mod tests {
             fresh_state_with_envelope(receiver);
         let sender = state.current_tid().expect("boot");
 
-        let snapshot =
-            phase_a_take_transfer_envelope(&mut state, handle, endpoint, receiver)
-                .expect("phase A");
+        let snapshot = phase_a_take_transfer_envelope(&mut state, handle, endpoint, receiver)
+            .expect("phase A");
 
         assert_eq!(snapshot.handle, handle);
         assert_eq!(snapshot.endpoint, endpoint);
@@ -751,8 +743,7 @@ mod tests {
     #[test]
     fn stage103_phase_a_rejects_endpoint_mismatch() {
         let receiver = 901u64;
-        let (mut state, _endpoint, handle, _mem_cap, _r) =
-            fresh_state_with_envelope(receiver);
+        let (mut state, _endpoint, handle, _mem_cap, _r) = fresh_state_with_envelope(receiver);
         let wrong_endpoint = CapObject::Endpoint {
             index: usize::MAX,
             generation: 1,
@@ -764,11 +755,9 @@ mod tests {
     #[test]
     fn stage103_phase_b_mints_attenuated_cap_in_receiver_cnode() {
         let receiver = 901u64;
-        let (mut state, endpoint, handle, _mem_cap, _r) =
-            fresh_state_with_envelope(receiver);
+        let (mut state, endpoint, handle, _mem_cap, _r) = fresh_state_with_envelope(receiver);
         let snapshot =
-            phase_a_take_transfer_envelope(&mut state, handle, endpoint, receiver)
-                .expect("A");
+            phase_a_take_transfer_envelope(&mut state, handle, endpoint, receiver).expect("A");
         let outcome = phase_b_materialize_transfer_cap(&mut state, &snapshot).expect("B");
         // Receiver's cnode must now contain a capability with the same
         // attenuated rights and pointing at the same object.
@@ -861,8 +850,7 @@ mod tests {
     #[test]
     fn stage103_equivalence_plain_message_returns_none() {
         let receiver = 901u64;
-        let (mut state, endpoint, _handle, _mem_cap, _r) =
-            fresh_state_with_envelope(receiver);
+        let (mut state, endpoint, _handle, _mem_cap, _r) = fresh_state_with_envelope(receiver);
         let plain = Message::with_header(
             state.current_tid().expect("boot"),
             crate::kernel::syscall::OPCODE_INLINE,
@@ -879,8 +867,7 @@ mod tests {
     #[test]
     fn stage103_equivalence_reply_cap_message_returns_fallback_required() {
         let receiver = 901u64;
-        let (mut state, endpoint, handle, _mem_cap, _r) =
-            fresh_state_with_envelope(receiver);
+        let (mut state, endpoint, handle, _mem_cap, _r) = fresh_state_with_envelope(receiver);
         let msg = make_reply_cap_msg(state.current_tid().expect("boot"), handle);
         let result =
             materialize_split_transfer_cap_equivalent(&mut state, endpoint, receiver, &msg);
@@ -896,16 +883,11 @@ mod tests {
     #[test]
     fn stage103_equivalence_no_envelope_returns_invalid_capability() {
         let receiver = 901u64;
-        let (mut state, endpoint, _handle, _mem_cap, _r) =
-            fresh_state_with_envelope(receiver);
+        let (mut state, endpoint, _handle, _mem_cap, _r) = fresh_state_with_envelope(receiver);
         // Use a bogus handle.
         let msg = make_transfer_msg(state.current_tid().expect("boot"), 0xdead_beef);
-        let result = materialize_split_transfer_cap_equivalent(
-            &mut state,
-            endpoint,
-            receiver,
-            &msg,
-        );
+        let result =
+            materialize_split_transfer_cap_equivalent(&mut state, endpoint, receiver, &msg);
         assert_eq!(
             result,
             CapTransferSplitResult::Failed(SyscallError::InvalidCapability),

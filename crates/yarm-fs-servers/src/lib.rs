@@ -125,7 +125,9 @@ mod stage80_tests {
     };
     use crate::fs::common::vfs_ipc::VfsError;
     use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
-    use crate::fs::fat::service::{FatServiceStartup, FatStartupConfig, service_from_startup_config};
+    use crate::fs::fat::service::{
+        FatServiceStartup, FatStartupConfig, service_from_startup_config,
+    };
     use crate::fs::ramfs::service::{RamFsServiceStartup, RamFsStartupConfig, run_with_config};
     use yarm_srv_common::vfs_core::VfsBackend;
 
@@ -211,36 +213,50 @@ mod stage86_tests {
         VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_EXT4_RECV_LOOP_ENABLED, VFS_FAT_SHARED_IO_ENABLED,
         VFS_RAMFS_LIVE_MOUNT_ENABLED, VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED,
     };
+    use crate::fs::common::vfs_ipc::{
+        ReadWriteRequest, VfsError, openat_inline_message, write_message,
+    };
     use crate::fs::ext4::service::Ext4Service;
     use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
     use crate::fs::fat::fs::FatBackend;
     use crate::fs::ramfs::service::{
         RamFsServiceStartup, RamFsStartupConfig, run_with_config, service_from_startup_config,
     };
-    use crate::fs::common::vfs_ipc::{VfsError, openat_inline_message, write_message, ReadWriteRequest};
     use yarm_srv_common::vfs_core::VfsBackend;
     use yarm_srv_common::vfs_reply::VfsReply;
 
     #[test]
     fn stage86_gate_vfs_ramfs_live_mount_enabled() {
-        assert!(VFS_RAMFS_LIVE_MOUNT_ENABLED, "RAMFS live-mount gate must be true");
+        assert!(
+            VFS_RAMFS_LIVE_MOUNT_ENABLED,
+            "RAMFS live-mount gate must be true"
+        );
     }
 
     #[test]
     fn stage86_gate_vfs_fat_shared_io_disabled() {
-        assert!(!VFS_FAT_SHARED_IO_ENABLED, "FAT shared-I/O gate must be false");
+        assert!(
+            !VFS_FAT_SHARED_IO_ENABLED,
+            "FAT shared-I/O gate must be false"
+        );
     }
 
     #[test]
     fn stage86_gate_vfs_ext4_recv_loop_enabled() {
-        assert!(VFS_EXT4_RECV_LOOP_ENABLED, "ext4 recv-loop gate must be true");
+        assert!(
+            VFS_EXT4_RECV_LOOP_ENABLED,
+            "ext4 recv-loop gate must be true"
+        );
     }
 
     #[test]
     fn stage86_gate_vfs_ext4_live_mount_disabled() {
         // Stage 88 supersedes this Stage-86 invariant: ext4 live-mount is now enabled.
         // VFS_EXT4_LIVE_MOUNT_ENABLED was false in Stage 86; Stage 88 lifts it to true.
-        assert!(VFS_EXT4_LIVE_MOUNT_ENABLED, "Stage 88: ext4 live-mount gate must be true");
+        assert!(
+            VFS_EXT4_LIVE_MOUNT_ENABLED,
+            "Stage 88: ext4 live-mount gate must be true"
+        );
     }
 
     #[test]
@@ -251,13 +267,22 @@ mod stage86_tests {
     #[test]
     fn stage86_ramfs_service_has_run_resident() {
         let src = include_str!("fs/ramfs/service.rs");
-        assert!(src.contains("fn run_resident("), "ramfs/service.rs must export run_resident");
+        assert!(
+            src.contains("fn run_resident("),
+            "ramfs/service.rs must export run_resident"
+        );
         assert!(
             src.contains("fn run_resident_service_loop("),
             "ramfs/service.rs must have run_resident_service_loop"
         );
-        assert!(src.contains("RAMFS_SRV_READY"), "ramfs/service.rs must emit RAMFS_SRV_READY");
-        assert!(src.contains("ipc_recv_v2("), "ramfs/service.rs must use ipc_recv_v2");
+        assert!(
+            src.contains("RAMFS_SRV_READY"),
+            "ramfs/service.rs must emit RAMFS_SRV_READY"
+        );
+        assert!(
+            src.contains("ipc_recv_v2("),
+            "ramfs/service.rs must use ipc_recv_v2"
+        );
     }
 
     #[test]
@@ -302,17 +327,20 @@ mod stage86_tests {
     #[test]
     fn stage86_fat_backend_read_shared_bytes_wired() {
         let mut backend = FatBackend::new();
-        let fd = backend.openat_path(crate::fs::fat::fs::FAT_HELLO_PATH).expect("open");
+        let fd = backend
+            .openat_path(crate::fs::fat::fs::FAT_HELLO_PATH)
+            .expect("open");
         let mut buf = [0u8; 32];
-        let n = backend.read_shared_bytes(fd, &mut buf).expect("read_shared_bytes");
+        let n = backend
+            .read_shared_bytes(fd, &mut buf)
+            .expect("read_shared_bytes");
         assert!(n <= 32);
     }
 
     #[test]
     fn stage86_init_spawn_sub_gates_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(src.contains("INIT_SPAWN_RAMFS_SRV"));
         assert!(src.contains("INIT_SPAWN_FAT_SRV"));
         assert!(src.contains("INIT_SPAWN_EXT4_SRV"));
@@ -320,9 +348,8 @@ mod stage86_tests {
 
     #[test]
     fn stage86_init_spawn_fail_markers_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(src.contains("INIT_RAMFS_SPAWN_FAIL"));
         assert!(src.contains("INIT_FAT_SPAWN_FAIL"));
         assert!(src.contains("INIT_EXT4_SPAWN_FAIL"));
@@ -336,20 +363,27 @@ mod stage86_tests {
         let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
             .expect("decode")
             .as_u64();
-        let write = write_message(ReadWriteRequest { fd, buf_ptr: 0, len: 512 }).expect("write");
+        let write = write_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0,
+            len: 512,
+        })
+        .expect("write");
         assert_eq!(svc.handle(write), Err(VfsError::Unsupported));
     }
 }
 
 #[cfg(test)]
 mod stage87_tests {
-    use crate::fs::common::shared_io_adapter::{VFS_FAT_LIVE_MOUNT_ENABLED, VFS_RAMFS_LIVE_MOUNT_ENABLED};
+    use crate::fs::common::service::FsService;
+    use crate::fs::common::shared_io_adapter::{
+        VFS_FAT_LIVE_MOUNT_ENABLED, VFS_RAMFS_LIVE_MOUNT_ENABLED,
+    };
     use crate::fs::ramfs::service::{
-        RamFsMountConfig, RamFsServiceStartup, RamFsStartupConfig, run_with_config,
-        run_request_loop,
+        RamFsMountConfig, RamFsServiceStartup, RamFsStartupConfig, run_request_loop,
+        run_with_config,
     };
     use crate::fs::ramfs::tree::RamFsBackend;
-    use crate::fs::common::service::FsService;
 
     #[test]
     fn stage87_ramfs_mount_enabled_gate() {
@@ -464,9 +498,8 @@ mod stage87_tests {
 
     #[test]
     fn stage87_init_ramfs_spawn_ok_marker_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_RAMFS_SPAWN_OK"),
             "init must log INIT_RAMFS_SPAWN_OK on success"
@@ -483,9 +516,8 @@ mod stage87_tests {
 
     #[test]
     fn stage87_init_ext4_spawn_ok_marker_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_EXT4_SPAWN_OK"),
             "init must log INIT_EXT4_SPAWN_OK on success"
@@ -502,9 +534,8 @@ mod stage87_tests {
 
     #[test]
     fn stage87_init_fat_spawn_skipped_with_documented_blocker() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
             "INIT_SPAWN_FAT_SRV must be false (needs block device)"
@@ -522,9 +553,18 @@ mod stage87_tests {
     #[test]
     fn stage87_ramfs_srv_entry_and_ready_markers_present() {
         let src = include_str!("fs/ramfs/service.rs");
-        assert!(src.contains("RAMFS_SRV_ENTRY"), "ramfs must log RAMFS_SRV_ENTRY");
-        assert!(src.contains("RAMFS_SRV_READY"), "ramfs must log RAMFS_SRV_READY");
-        assert!(src.contains("RAMFS_MOUNT_READY"), "ramfs must log RAMFS_MOUNT_READY");
+        assert!(
+            src.contains("RAMFS_SRV_ENTRY"),
+            "ramfs must log RAMFS_SRV_ENTRY"
+        );
+        assert!(
+            src.contains("RAMFS_SRV_READY"),
+            "ramfs must log RAMFS_SRV_READY"
+        );
+        assert!(
+            src.contains("RAMFS_MOUNT_READY"),
+            "ramfs must log RAMFS_MOUNT_READY"
+        );
     }
 
     #[test]
@@ -533,8 +573,14 @@ mod stage87_tests {
         // EXT4_SRV_READY is logged by the service loop (fs/ext4/service.rs).
         let bin_src = include_str!("bin/ext4_srv.rs");
         let svc_src = include_str!("fs/ext4/service.rs");
-        assert!(bin_src.contains("EXT4_SRV_ENTRY"), "ext4 binary must log EXT4_SRV_ENTRY");
-        assert!(svc_src.contains("EXT4_SRV_READY"), "ext4 service must log EXT4_SRV_READY");
+        assert!(
+            bin_src.contains("EXT4_SRV_ENTRY"),
+            "ext4 binary must log EXT4_SRV_ENTRY"
+        );
+        assert!(
+            svc_src.contains("EXT4_SRV_READY"),
+            "ext4 service must log EXT4_SRV_READY"
+        );
     }
 
     // ── Part C: VFS routing safety ────────────────────────────────────────────
@@ -547,9 +593,8 @@ mod stage87_tests {
             !VFS_FAT_LIVE_MOUNT_ENABLED,
             "/fat must not appear in the VFS mount table when FAT live-mount gate is disabled"
         );
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
             "INIT_SPAWN_FAT_SRV must be false to prevent /fat from entering the VFS mount table"
@@ -563,9 +608,8 @@ mod stage87_tests {
             VFS_RAMFS_LIVE_MOUNT_ENABLED,
             "/ram must be registered in the VFS mount table via RAMFS live-mount path"
         );
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_SPAWN_RAMFS_SRV: bool = true"),
             "INIT_SPAWN_RAMFS_SRV must be true so /ram is registered with the VFS"
@@ -580,9 +624,8 @@ mod stage87_tests {
     fn stage87_vfs_routing_init_passes_devfs_and_initramfs_caps_to_vfs() {
         // devfs and initramfs send caps are passed to VFS at spawn time,
         // allowing VFS to register /dev and /initramfs mounts internally.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_DEVFS_SPAWN_V5_CALL_BEGIN"),
             "init must spawn devfs_srv and obtain its send cap for VFS"
@@ -597,9 +640,8 @@ mod stage87_tests {
     fn stage87_vfs_routing_fat_not_registered_when_init_spawn_disabled() {
         // If INIT_SPAWN_FAT_SRV=false, the INIT_FAT_SPAWN_SKIPPED path is taken
         // and register_fat_mount_with_vfs is never called.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         // Gate must be false.
         assert!(
             src.contains("INIT_SPAWN_FAT_SRV: bool = false"),
@@ -629,11 +671,15 @@ mod stage88_tests {
     use crate::fs::common::shared_io_adapter::{
         VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_FAT_LIVE_MOUNT_ENABLED, VFS_FAT_SHARED_IO_ENABLED,
     };
-    use crate::fs::fat::fs::FatBackend;
-    use crate::fs::fat::service::{FatServiceStartup, FatStartupConfig, service_from_startup_config};
-    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::common::vfs_ipc::{
+        ReadWriteRequest, VfsError, openat_inline_message, write_message,
+    };
     use crate::fs::ext4::service::Ext4Service;
-    use crate::fs::common::vfs_ipc::{VfsError, openat_inline_message, write_message, ReadWriteRequest};
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::fat::fs::FatBackend;
+    use crate::fs::fat::service::{
+        FatServiceStartup, FatStartupConfig, service_from_startup_config,
+    };
     use yarm_srv_common::vfs_core::VfsBackend;
     use yarm_srv_common::vfs_reply::VfsReply;
 
@@ -645,16 +691,22 @@ mod stage88_tests {
     #[test]
     fn stage88_fat_read_shared_bytes_returns_valid_count() {
         let mut backend = FatBackend::new();
-        let fd = backend.openat_path(crate::fs::fat::fs::FAT_HELLO_PATH).expect("open");
+        let fd = backend
+            .openat_path(crate::fs::fat::fs::FAT_HELLO_PATH)
+            .expect("open");
         let mut buf = [0u8; 64];
-        let n = backend.read_shared_bytes(fd, &mut buf).expect("read_shared_bytes");
+        let n = backend
+            .read_shared_bytes(fd, &mut buf)
+            .expect("read_shared_bytes");
         assert!(n <= 64);
     }
 
     #[test]
     fn stage88_fat_read_shared_bytes_empty_buf_returns_zero() {
         let mut backend = FatBackend::new();
-        let fd = backend.openat_path(crate::fs::fat::fs::FAT_HELLO_PATH).expect("open");
+        let fd = backend
+            .openat_path(crate::fs::fat::fs::FAT_HELLO_PATH)
+            .expect("open");
         assert_eq!(backend.read_shared_bytes(fd, &mut []).expect("empty"), 0);
     }
 
@@ -693,9 +745,8 @@ mod stage88_tests {
 
     #[test]
     fn stage88_init_register_ext4_mount_with_vfs_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("register_ext4_mount_with_vfs("),
             "init must call register_ext4_mount_with_vfs after successful ext4 spawn"
@@ -712,9 +763,8 @@ mod stage88_tests {
 
     #[test]
     fn stage88_init_ext4_spawn_ok_captures_send_cap() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_EXT4_SPAWN_OK child_tid={} send_cap={}"),
             "INIT_EXT4_SPAWN_OK must include send_cap field (Stage 88: cap used for VFS registration)"
@@ -726,9 +776,8 @@ mod stage88_tests {
         // FAT cap handoff audit: init passes init_blkcache_send_cap to fat_srv via
         // service_extra_cap_0 (position 0) at spawn time. Positions 1-3 must be zero —
         // passing encoded mount-config words causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("[init_blkcache_send_cap, 0, 0, 0]"),
             "FAT spawn must pass init_blkcache_send_cap at position 0 only; positions 1-3 must be zero"
@@ -745,9 +794,8 @@ mod stage88_tests {
 
     #[test]
     fn stage88_register_ext4_mount_with_vfs_call_is_after_spawn_ok() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let spawn_ok_pos = src
             .find("INIT_EXT4_SPAWN_OK")
             .expect("INIT_EXT4_SPAWN_OK must be present");
@@ -788,17 +836,22 @@ mod stage88_tests {
         let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
             .expect("decode")
             .as_u64();
-        let write = write_message(ReadWriteRequest { fd, buf_ptr: 0, len: 512 }).expect("write");
+        let write = write_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0,
+            len: 512,
+        })
+        .expect("write");
         assert_eq!(svc.handle(write), Err(VfsError::Unsupported));
     }
 }
 
 #[cfg(test)]
 mod stage89_tests {
-    use crate::fs::initramfs::archive::{
-        InitramfsBackend, INITRAMFS_EXT4_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH,
-    };
     use crate::fs::common::vfs_ipc::VfsBackend;
+    use crate::fs::initramfs::archive::{
+        INITRAMFS_EXT4_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH, InitramfsBackend,
+    };
 
     // ── Root-cause fix: ext4_srv path is now registered in the inode table ──
 
@@ -849,9 +902,8 @@ mod stage89_tests {
     #[test]
     fn stage89_ext4_spawn_service_caps_all_zero() {
         // ext4_srv spawn uses [0, 0, 0, 0] — no prefix word or metadata.
-        let init_src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let init_src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             init_src.contains("spawn_v5_cap(pm_send, pm_recv, 12, [0, 0, 0, 0], 1)"),
             "ext4_srv spawn must use all-zero service_caps [0,0,0,0]"
@@ -864,9 +916,8 @@ mod stage89_tests {
         // Passing encoded config words (prefix_word, meta_word) in positions 1-2
         // causes KSPAWN_EXTRA_CAP_DELEGATE_FAIL — the kernel treats every non-zero
         // service_caps entry as a cap ID. RAMFS falls back to default_compat (prefix=/ram).
-        let init_src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let init_src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         // Verify RAMFS spawn does NOT pass config words as cap slots.
         assert!(
             !init_src.contains("[0, ramfs_prefix_word, ramfs_meta_word, 0]"),
@@ -890,9 +941,8 @@ mod stage89_tests {
 
     #[test]
     fn stage89_optional_spawns_are_sequential_ramfs_before_ext4() {
-        let init_src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let init_src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let ramfs_pos = init_src
             .find("INIT_RAMFS_SPAWN_BEGIN")
             .expect("INIT_RAMFS_SPAWN_BEGIN must be present");
@@ -909,9 +959,8 @@ mod stage89_tests {
     fn stage89_ramfs_reply_decoded_before_ext4_spawn() {
         // RAMFS spawn is guarded by `if let Some(...)` — reply is decoded
         // before the ext4 spawn block begins. Verify source order.
-        let init_src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let init_src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let ramfs_ok_pos = init_src
             .find("INIT_RAMFS_SPAWN_OK")
             .expect("INIT_RAMFS_SPAWN_OK must be present");
@@ -970,10 +1019,12 @@ mod stage89_tests {
 
 #[cfg(test)]
 mod stage90_tests {
-    use crate::fs::fat::fs::{FAT_HELLO_PATH, FatBackend, FatBackendKind};
-    use crate::fs::fat::service::{FatServiceStartup, FatStartupConfig, service_from_startup_config};
     use crate::fs::common::shared_io_adapter::VFS_FAT_LIVE_MOUNT_ENABLED;
     use crate::fs::common::vfs_ipc::VfsBackend;
+    use crate::fs::fat::fs::{FAT_HELLO_PATH, FatBackend, FatBackendKind};
+    use crate::fs::fat::service::{
+        FatServiceStartup, FatStartupConfig, service_from_startup_config,
+    };
 
     // ── FAT Outcome-B audit: no real virtio_blk block device ─────────────────
     //
@@ -1019,7 +1070,9 @@ mod stage90_tests {
         let svc = service_from_startup_config(FatStartupConfig::hosted_sample())
             .expect("hosted_sample must succeed");
         let mut backend = FatBackend::new();
-        let fd = backend.openat_path(FAT_HELLO_PATH).expect("open must succeed");
+        let fd = backend
+            .openat_path(FAT_HELLO_PATH)
+            .expect("open must succeed");
         assert!(fd >= 10, "fd must be a valid handle");
     }
 
@@ -1034,9 +1087,8 @@ mod stage90_tests {
 
     #[test]
     fn stage90_fat_spawn_disabled_marker_in_init() {
-        let init_src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let init_src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         // Document the exact missing requirement in init/service.rs.
         assert!(
             init_src.contains("const INIT_SPAWN_FAT_SRV: bool = false;"),
@@ -1050,9 +1102,8 @@ mod stage90_tests {
 
     #[test]
     fn stage90_fat_skipped_marker_present_when_gate_false() {
-        let init_src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let init_src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             init_src.contains("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled"),
             "init must emit INIT_FAT_SPAWN_SKIPPED when FAT gate is false"
@@ -1063,9 +1114,8 @@ mod stage90_tests {
 
     #[test]
     fn stage90_init_drains_pm_recv_before_optional_spawns() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_PM_RECV_DRAIN_BEGIN"),
             "init must log INIT_PM_RECV_DRAIN_BEGIN before optional FS spawns"
@@ -1078,9 +1128,8 @@ mod stage90_tests {
 
     #[test]
     fn stage90_drain_appears_before_ramfs_spawn_begin() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let drain_pos = src
             .find("INIT_PM_RECV_DRAIN_BEGIN")
             .expect("drain marker must be present");
@@ -1095,9 +1144,8 @@ mod stage90_tests {
 
     #[test]
     fn stage90_drain_appears_before_ext4_spawn_begin() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let drain_pos = src
             .find("INIT_PM_RECV_DRAIN_BEGIN")
             .expect("drain marker must be present");
@@ -1112,9 +1160,8 @@ mod stage90_tests {
 
     #[test]
     fn stage90_blkcache_smoke_uses_blocking_recv_not_deadline_zero() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let smoke_pos = src
             .find("INIT_BLKCACHE_SMOKE_BEGIN")
             .expect("blkcache smoke marker must be present");
@@ -1139,20 +1186,22 @@ mod stage90_tests {
 // ════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod stage91_tests {
-    use crate::fs::initramfs::archive::{
-        InitramfsBackend, INITRAMFS_DRIVER_MANAGER_PATH, INITRAMFS_BLKCACHE_PATH,
-        INITRAMFS_VIRTIO_BLK_PATH, INITRAMFS_FAT_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH,
-        INITRAMFS_EXT4_SRV_PATH,
-    };
-    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
-    use crate::fs::ext4::service::Ext4Service;
     use crate::fs::common::shared_io_adapter::{
-        VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_EXT4_RECV_LOOP_ENABLED,
-        VFS_RAMFS_LIVE_MOUNT_ENABLED, VFS_FAT_LIVE_MOUNT_ENABLED,
-        VFS_FAT_SHARED_IO_ENABLED, VFS_STAGE84_RAMFS_BRIDGE_ENABLED,
+        VFS_EXT4_LIVE_MOUNT_ENABLED, VFS_EXT4_RECV_LOOP_ENABLED, VFS_FAT_LIVE_MOUNT_ENABLED,
+        VFS_FAT_SHARED_IO_ENABLED, VFS_RAMFS_LIVE_MOUNT_ENABLED, VFS_STAGE84_RAMFS_BRIDGE_ENABLED,
         VFS_STAGE85_RAMFS_LIVE_ROUTE_ENABLED,
     };
-    use crate::fs::common::vfs_ipc::{VfsBackend, VfsError, openat_inline_message, write_message, ReadWriteRequest, statx_inline_message};
+    use crate::fs::common::vfs_ipc::{
+        ReadWriteRequest, VfsBackend, VfsError, openat_inline_message, statx_inline_message,
+        write_message,
+    };
+    use crate::fs::ext4::service::Ext4Service;
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::initramfs::archive::{
+        INITRAMFS_BLKCACHE_PATH, INITRAMFS_DRIVER_MANAGER_PATH, INITRAMFS_EXT4_SRV_PATH,
+        INITRAMFS_FAT_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH, INITRAMFS_VIRTIO_BLK_PATH,
+        InitramfsBackend,
+    };
     use yarm_srv_common::vfs_reply::VfsReply;
 
     // ── Part A: Smoke marker source-scan tests ────────────────────────────────
@@ -1188,9 +1237,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_init_ramfs_spawn_begin_marker_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_RAMFS_SPAWN_BEGIN"),
             "init/service.rs must log INIT_RAMFS_SPAWN_BEGIN before spawning ramfs_srv"
@@ -1199,9 +1247,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_init_ext4_spawn_begin_marker_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_EXT4_SPAWN_BEGIN"),
             "init/service.rs must log INIT_EXT4_SPAWN_BEGIN before spawning ext4_srv"
@@ -1210,9 +1257,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_vfs_mount_register_ext4_ok_marker_present() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("VFS_MOUNT_REGISTER_EXT4_OK"),
             "init/service.rs must log VFS_MOUNT_REGISTER_EXT4_OK on successful ext4 mount registration"
@@ -1221,9 +1267,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_fat_spawn_skipped_marker_profile_disabled() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled"),
             "init/service.rs must log INIT_FAT_SPAWN_SKIPPED reason=profile_disabled for the default no-virtio_blk profile"
@@ -1234,9 +1279,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_reply_endpoint_hygiene_vfs_mount_register_ext4_uses_reply_recv_cap() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         // The function must exist and use blocking ipc_recv_v2 on the dedicated reply_recv_cap.
         // Non-blocking ipc_recv_with_deadline(reply_recv_cap, 0) left stale VFS mount-status
         // replies (4 bytes) on pm_recv, poisoning the next spawn's 16-byte SpawnV5 reply read.
@@ -1256,9 +1300,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_reply_endpoint_hygiene_register_ext4_uses_dedicated_reply_cap() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         // Prove the function signature includes reply_recv_cap as a parameter.
         // The function is: fn register_ext4_mount_with_vfs(..., reply_recv_cap: u32, ...)
         let fn_start = src
@@ -1293,9 +1336,8 @@ mod stage91_tests {
         // to poll for leftover replies on the shared endpoint. This is correct because
         // the drain is exhaustive (loops until None). Contrast with the per-operation
         // helpers (register_ext4_mount_with_vfs) which use dedicated reply_recv_cap.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("INIT_PM_RECV_DRAIN_BEGIN"),
             "drain loop marker INIT_PM_RECV_DRAIN_BEGIN must be present"
@@ -1335,8 +1377,7 @@ mod stage91_tests {
         );
         // A 16-byte zero payload decodes as pid=0 (failure shape).
         let zero_16 = [0u8; 16];
-        let decoded_16 = decode_spawn_v5_reply(&zero_16)
-            .expect("16-byte zero payload must decode");
+        let decoded_16 = decode_spawn_v5_reply(&zero_16).expect("16-byte zero payload must decode");
         assert_eq!(
             decoded_16.pid, 0,
             "16-byte zero payload decodes as pid=0 (failure shape)"
@@ -1473,9 +1514,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_fat_production_checklist_virtio_blk_requirement_documented() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("FAT requires a virtio_blk block device not present"),
             "init/service.rs must document the virtio_blk requirement for FAT production"
@@ -1635,9 +1675,8 @@ mod stage91_tests {
     #[test]
     fn stage91_drain_before_fat_spawn_gate() {
         // The pm_recv drain must complete before the FAT spawn gate is evaluated.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let drain_pos = src
             .find("INIT_PM_RECV_DRAIN_BEGIN")
             .expect("drain marker must be present");
@@ -1656,9 +1695,8 @@ mod stage91_tests {
         // FAT is skipped with reason=server_disabled (INIT_SPAWN_FAT_SRV=false)
         // before the ext4 spawn block. The reason=profile_disabled path is in a
         // separate else-branch and appears after ext4 in source order.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let fat_skip_server_pos = src
             .find("INIT_FAT_SPAWN_SKIPPED reason=server_disabled")
             .expect("INIT_FAT_SPAWN_SKIPPED reason=server_disabled must be present");
@@ -1678,9 +1716,8 @@ mod stage91_tests {
 
     #[test]
     fn stage91_const_init_spawn_fat_srv_is_false() {
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             src.contains("const INIT_SPAWN_FAT_SRV: bool = false;"),
             "INIT_SPAWN_FAT_SRV must be false (no virtio_blk block device in default profile)"
@@ -1705,8 +1742,14 @@ mod stage91_tests {
             VFS_MOUNT_STATUS_REPLY_BYTES, SPAWN_V5_RESULT_BYTES,
             "VFS mount-status reply and SpawnV5 result must have different sizes"
         );
-        assert_eq!(VFS_MOUNT_STATUS_REPLY_BYTES, 4, "VFS mount-status is a u32 (4 bytes)");
-        assert_eq!(SPAWN_V5_RESULT_BYTES, 16, "SpawnV5 result is pid:u64 + cap:u64 (16 bytes)");
+        assert_eq!(
+            VFS_MOUNT_STATUS_REPLY_BYTES, 4,
+            "VFS mount-status is a u32 (4 bytes)"
+        );
+        assert_eq!(
+            SPAWN_V5_RESULT_BYTES, 16,
+            "SpawnV5 result is pid:u64 + cap:u64 (16 bytes)"
+        );
     }
 
     #[test]
@@ -1714,9 +1757,8 @@ mod stage91_tests {
         // Source-scan: none of the three register_*_mount_with_vfs functions may use
         // ipc_recv_with_deadline (non-blocking) to receive the VFS mount-register reply.
         // All must use ipc_recv_v2 (blocking) on reply_recv_cap.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         for fn_name in &[
             "fn register_ramfs_mount_with_vfs(",
             "fn register_fat_mount_with_vfs(",
@@ -1779,9 +1821,8 @@ mod stage91_tests {
         // drain loop that guards against VFS 8-byte replies being misread as SpawnV5
         // failures.  Both RAMFS (image_id=11) and ext4 (image_id=12) spawns call
         // spawn_v5_cap, so both are protected by this loop.
-        let src = include_str!(
-            "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-        );
+        let src =
+            include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
         let fn_start = src
             .find("fn spawn_v5_cap(")
             .expect("spawn_v5_cap must exist in init/service.rs");
@@ -1818,12 +1859,10 @@ mod stage91_tests {
 // ════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod stage92_tests {
-    const VFS_CLIENT_SRC: &str =
-        include_str!("../../yarm-user-rt/src/vfs_client.rs");
+    const VFS_CLIENT_SRC: &str = include_str!("../../yarm-user-rt/src/vfs_client.rs");
 
-    const INIT_SRC: &str = include_str!(
-        "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-    );
+    const INIT_SRC: &str =
+        include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
 
     // ── 1. All four IPC helpers use blocking ipc_recv_v2 ────────────────────
 
@@ -1887,7 +1926,9 @@ mod stage92_tests {
             .expect("IPC helpers section comment must be present in vfs_client.rs");
         let ipc_section = &VFS_CLIENT_SRC[ipc_section_start..];
         // The test section begins after the IPC section; cut at #[cfg(test)].
-        let test_section_start = ipc_section.find("#[cfg(test)]").unwrap_or(ipc_section.len());
+        let test_section_start = ipc_section
+            .find("#[cfg(test)]")
+            .unwrap_or(ipc_section.len());
         let ipc_only = &ipc_section[..test_section_start];
         assert!(
             !ipc_only.contains("ipc_recv_with_deadline"),
@@ -1920,9 +1961,7 @@ mod stage92_tests {
     fn stage92_vfs_client_module_doc_says_blocking_not_deadline() {
         // The module-level doc comment must not claim the helpers use
         // ipc_recv_with_deadline (pre-Stage-92 wording).
-        let module_doc_end = VFS_CLIENT_SRC
-            .find("use crate::ipc::Message;")
-            .unwrap_or(0);
+        let module_doc_end = VFS_CLIENT_SRC.find("use crate::ipc::Message;").unwrap_or(0);
         let module_doc = &VFS_CLIENT_SRC[..module_doc_end];
         assert!(
             !module_doc.contains("ipc_recv_with_deadline"),
@@ -1960,9 +1999,7 @@ mod stage92_tests {
 
     #[test]
     fn stage92_smoke_script_aarch64_checks_zero_wrong_sender_count() {
-        let script = include_str!(
-            "../../../scripts/qemu-aarch64-optional-fs-smoke.sh"
-        );
+        let script = include_str!("../../../scripts/qemu-aarch64-optional-fs-smoke.sh");
         assert!(
             script.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
             "aarch64 smoke script must check for INIT_SPAWN_V5_WRONG_SENDER_REPLY count"
@@ -1975,9 +2012,7 @@ mod stage92_tests {
 
     #[test]
     fn stage92_smoke_script_x86_64_checks_zero_wrong_sender_count() {
-        let script = include_str!(
-            "../../../scripts/qemu-x86_64-optional-fs-smoke.sh"
-        );
+        let script = include_str!("../../../scripts/qemu-x86_64-optional-fs-smoke.sh");
         assert!(
             script.contains("INIT_SPAWN_V5_WRONG_SENDER_REPLY"),
             "x86_64 smoke script must check for INIT_SPAWN_V5_WRONG_SENDER_REPLY count"
@@ -2002,21 +2037,19 @@ mod stage92_tests {
 // ════════════════════════════════════════════════════════════════════════════
 #[cfg(test)]
 mod stage93_tests {
-    use crate::fs::common::vfs_service::VfsService;
     use crate::fs::common::vfs_ipc::{
-        VfsError, openat_inline_message, read_message, ReadWriteRequest,
+        ReadWriteRequest, VfsError, openat_inline_message, read_message,
     };
-    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
+    use crate::fs::common::vfs_service::VfsService;
     use crate::fs::ext4::service::Ext4Service;
+    use crate::fs::ext4::{EXT4_SERVICE_PATH, Ext4Backend};
     use yarm_ipc_abi::vfs_abi::VFS_OP_WRITE_INLINE;
     use yarm_srv_common::vfs_reply::VfsReply;
 
     const FAT_FS_SRC: &str = include_str!("fs/fat/fs.rs");
-    const SHARED_IO_SRC: &str =
-        include_str!("fs/common/shared_io_adapter.rs");
-    const INIT_SRC: &str = include_str!(
-        "../../yarm-control-plane-servers/src/control_plane/init/service.rs"
-    );
+    const SHARED_IO_SRC: &str = include_str!("fs/common/shared_io_adapter.rs");
+    const INIT_SRC: &str =
+        include_str!("../../yarm-control-plane-servers/src/control_plane/init/service.rs");
 
     // ── 1. IpcBlockDevice blocking-recv fix (same as Stage 92 for vfs_client) ─
 
@@ -2115,9 +2148,14 @@ mod stage93_tests {
         // returns Unsupported, so ext4 must not decode it as a real write.
         let mut svc = Ext4Service::with_backend(Ext4Backend::new());
         let inline_payload = [1u8; 32];
-        let write_inline_msg =
-            yarm_user_rt::ipc::Message::with_header(0, VFS_OP_WRITE_INLINE, 0, None, &inline_payload)
-                .expect("build write-inline message");
+        let write_inline_msg = yarm_user_rt::ipc::Message::with_header(
+            0,
+            VFS_OP_WRITE_INLINE,
+            0,
+            None,
+            &inline_payload,
+        )
+        .expect("build write-inline message");
         assert_eq!(
             svc.handle(write_inline_msg),
             Err(VfsError::Unsupported),
@@ -2136,11 +2174,17 @@ mod stage93_tests {
         let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
             .expect("decode fd")
             .as_u64();
-        let read = read_message(ReadWriteRequest { fd, buf_ptr: 0, len: 1024 }).expect("read msg");
+        let read = read_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0,
+            len: 1024,
+        })
+        .expect("read msg");
         let read_rep = svc.handle(read).expect("read reply");
-        let bytes_read = VfsReply::from_opcode_payload_checked(read_rep.opcode, read_rep.as_slice())
-            .expect("decode read result")
-            .as_u64();
+        let bytes_read =
+            VfsReply::from_opcode_payload_checked(read_rep.opcode, read_rep.as_slice())
+                .expect("decode read result")
+                .as_u64();
         assert_eq!(
             bytes_read, 0,
             "ext4 read on empty demo file must return 0 bytes"
@@ -2151,14 +2195,19 @@ mod stage93_tests {
     fn stage93_ext4_write_returns_unsupported_after_read() {
         // ext4 is read-only: all write attempts must return Unsupported regardless
         // of whether the file was opened or read first.
-        use crate::fs::common::vfs_ipc::{write_message, ReadWriteRequest};
+        use crate::fs::common::vfs_ipc::{ReadWriteRequest, write_message};
         let mut svc = Ext4Service::with_backend(Ext4Backend::new());
         let open = openat_inline_message(0, EXT4_SERVICE_PATH, 0, 0).expect("open");
         let open_rep = svc.handle(open).expect("open");
         let fd = VfsReply::from_opcode_payload_checked(open_rep.opcode, open_rep.as_slice())
             .expect("decode fd")
             .as_u64();
-        let write = write_message(ReadWriteRequest { fd, buf_ptr: 0, len: 4096 }).expect("write");
+        let write = write_message(ReadWriteRequest {
+            fd,
+            buf_ptr: 0,
+            len: 4096,
+        })
+        .expect("write");
         assert_eq!(
             svc.handle(write),
             Err(VfsError::Unsupported),
@@ -2171,8 +2220,14 @@ mod stage93_tests {
     #[test]
     fn stage93_optional_fs_smoke_scripts_check_kspawn_fail() {
         for (arch, script) in &[
-            ("aarch64", include_str!("../../../scripts/qemu-aarch64-optional-fs-smoke.sh")),
-            ("x86_64",  include_str!("../../../scripts/qemu-x86_64-optional-fs-smoke.sh")),
+            (
+                "aarch64",
+                include_str!("../../../scripts/qemu-aarch64-optional-fs-smoke.sh"),
+            ),
+            (
+                "x86_64",
+                include_str!("../../../scripts/qemu-x86_64-optional-fs-smoke.sh"),
+            ),
         ] {
             assert!(
                 script.contains("KSPAWN_EXTRA_CAP_DELEGATE_FAIL"),

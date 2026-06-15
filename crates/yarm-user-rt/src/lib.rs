@@ -32,8 +32,8 @@ pub mod capability {
 pub mod syscall {
     use crate::ipc::Message;
 
-    pub mod shared_transfer;
     pub mod recv_v3;
+    pub mod shared_transfer;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[repr(usize)]

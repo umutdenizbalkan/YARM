@@ -264,7 +264,9 @@ mod tests {
             "live primitive must exist in ipc_state.rs"
         );
         assert!(
-            ipc_src.contains("self.publish_recv_waiter_live(endpoint_idx, ThreadId(blocked_tid), recv_cap)"),
+            ipc_src.contains(
+                "self.publish_recv_waiter_live(endpoint_idx, ThreadId(blocked_tid), recv_cap)"
+            ),
             "block_current_on_receive_with_deadline must route the publish through the live primitive"
         );
         assert!(
@@ -274,7 +276,10 @@ mod tests {
         // The audit-only primitive stays helper-only (no syscall/runtime use).
         let syscall_src = include_str!("syscall.rs");
         let runtime_src = include_str!("../runtime.rs");
-        for name in ["try_publish_recv_waiter", "try_publish_recv_waiter_audit_only"] {
+        for name in [
+            "try_publish_recv_waiter",
+            "try_publish_recv_waiter_audit_only",
+        ] {
             assert!(
                 !syscall_src.contains(name),
                 "{name} must not appear in syscall.rs"
@@ -315,7 +320,10 @@ mod tests {
 
         assert_eq!(state.ipc_path_telemetry().d2_recv_waiter_publishes, 0);
         let result = state.ipc_recv(recv_cap).expect("blocking recv");
-        assert!(result.is_none(), "empty endpoint recv blocks (returns None)");
+        assert!(
+            result.is_none(),
+            "empty endpoint recv blocks (returns None)"
+        );
         let telem = state.ipc_path_telemetry();
         assert_eq!(
             telem.d2_recv_waiter_publishes, 1,
@@ -363,7 +371,9 @@ mod tests {
 
         // Sender arrives after the publish (current task is now tid 1).
         let msg = crate::kernel::ipc::Message::new(1, b"after").expect("msg");
-        state.ipc_send(send_cap_task1, msg).expect("send wakes waiter");
+        state
+            .ipc_send(send_cap_task1, msg)
+            .expect("send wakes waiter");
         assert_eq!(
             state.task_status(0),
             Some(TaskStatus::Runnable),

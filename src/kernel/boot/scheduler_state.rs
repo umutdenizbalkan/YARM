@@ -112,11 +112,7 @@ impl KernelState {
                 .map(|tid| tid.0)
         };
         self.note_d6_local_dispatch();
-        crate::yarm_log!(
-            "D6_LOCAL_DISPATCH cpu={} tid={:?}",
-            cpu.0,
-            next
-        );
+        crate::yarm_log!("D6_LOCAL_DISPATCH cpu={} tid={:?}", cpu.0, next);
         next
     }
 

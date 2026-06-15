@@ -7404,9 +7404,8 @@ mod tests {
         let src = include_str!("syscall.rs");
         let fault_src = include_str!("boot/fault_state.rs");
         assert!(
-            !fault_src.contains(
-                "dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?"
-            ),
+            !fault_src
+                .contains("dispatch_syscall(self, trapframe).map_err(TrapHandleError::Syscall)?"),
             "dispatch_syscall must not propagate Err as TrapHandleError via ? — fixes arch halt"
         );
         assert!(
@@ -7505,8 +7504,9 @@ mod tests {
     fn stage86_optional_fs_spawn_gates_present() {
         // Stage 86 lifts Stage-81 "all-off" guard: RAMFS and ext4 sub-gates are now true.
         // The outer gate is derived from sub-gates (RAMFS || FAT || EXT4).
-        let init_src =
-            include_str!("../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs");
+        let init_src = include_str!(
+            "../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+        );
         assert!(
             init_src.contains("INIT_SPAWN_OPTIONAL_FS_SERVERS"),
             "init must define INIT_SPAWN_OPTIONAL_FS_SERVERS"
@@ -7547,8 +7547,7 @@ mod tests {
             "AI_AGENT_RULES.md §13 must document the nonfatal=true grep exclusion"
         );
         assert!(
-            test_rules.contains("Stage 101")
-                && test_rules.contains("MUST_SMOKE"),
+            test_rules.contains("Stage 101") && test_rules.contains("MUST_SMOKE"),
             "KERNEL_TEST_RULES.md must reference Stage 101 MUST_SMOKE policy"
         );
     }
@@ -7644,15 +7643,11 @@ mod tests {
             "Q6 — Does `FLAG_CAP_TRANSFER_PLAIN` fall back",
             "Q7 — Queue-head starvation",
         ] {
-            assert!(
-                audit.contains(q),
-                "audit doc must answer D1 question: {q}"
-            );
+            assert!(audit.contains(q), "audit doc must answer D1 question: {q}");
         }
         // Unsafe split-helper guard audit section.
         assert!(
-            audit.contains("Unsafe split-helper guard audit")
-                && audit.contains("`addr_of!`"),
+            audit.contains("Unsafe split-helper guard audit") && audit.contains("`addr_of!`"),
             "audit doc must include the unsafe split-helper guard audit"
         );
     }
@@ -7735,11 +7730,10 @@ mod tests {
     fn stage101_stage_100_fs_baseline_preserved() {
         // FS gate constants source-scan: the Stage 100 baseline must be
         // unchanged at Stage 101 (this is an audit/scaffold stage only).
-        let fs_lib = include_str!(
-            "../../crates/yarm-fs-servers/src/lib.rs"
+        let fs_lib = include_str!("../../crates/yarm-fs-servers/src/lib.rs");
+        let init_src = include_str!(
+            "../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
         );
-        let init_src =
-            include_str!("../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs");
         assert!(
             init_src.contains("INIT_SPAWN_RAMFS_SRV: bool = true"),
             "INIT_SPAWN_RAMFS_SRV must remain true at Stage 101"
@@ -7821,7 +7815,9 @@ mod tests {
             "NR 15 dispatch arm must be unchanged"
         );
         assert!(
-            src.contains("Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame)"),
+            src.contains(
+                "Syscall::InitramfsReadChunk => handle_initramfs_read_chunk(kernel, frame)"
+            ),
             "NR 27 dispatch arm must be unchanged"
         );
         assert!(
@@ -7872,7 +7868,8 @@ mod tests {
         // with MissingRight — same access-gate behavior as before the move.
         // args: name_ptr=0, name_len=8, offset=0, dst_ptr=0x1000, max_len=64, target=0
         let mut frame27 = TrapFrame::new(SYSCALL_INITRAMFS_READ_CHUNK_NR, [0, 8, 0, 0x1000, 64, 0]);
-        let err = dispatch(&mut kernel, &mut frame27).expect_err("NR 27 must deny non-system-server");
+        let err =
+            dispatch(&mut kernel, &mut frame27).expect_err("NR 27 must deny non-system-server");
         assert_eq!(err, SyscallError::MissingRight);
     }
 
@@ -7881,9 +7878,7 @@ mod tests {
     /// Build: tid 0 = sender (boot task); `receiver` = registered task with
     /// its own cnode; one MemoryObject cap in the sender's cnode; one
     /// endpoint; one transfer envelope stashed (no shared region, unbound).
-    fn stage104_state_with_envelope(
-        receiver: u64,
-    ) -> (KernelState, CapObject, u64, CapId) {
+    fn stage104_state_with_envelope(receiver: u64) -> (KernelState, CapObject, u64, CapId) {
         use crate::kernel::capabilities::CNodeId;
         let mut state = crate::kernel::boot::Bootstrap::init().expect("init");
         let sender = state.current_tid().expect("boot task");
@@ -7929,11 +7924,10 @@ mod tests {
         .expect("msg");
 
         assert_eq!(state.ipc_path_telemetry().d1_split_materializations, 0);
-        let cap = materialize_received_message_cap_routed(
-            &mut state, endpoint, receiver, sender, &msg,
-        )
-        .expect("routed materialize")
-        .expect("transfer arm yields a cap");
+        let cap =
+            materialize_received_message_cap_routed(&mut state, endpoint, receiver, sender, &msg)
+                .expect("routed materialize")
+                .expect("transfer arm yields a cap");
 
         // Routed through the split engine — telemetry proves the routing.
         assert_eq!(
@@ -7964,14 +7958,17 @@ mod tests {
             b"reply-with-cap",
         )
         .expect("msg");
-        let cap = materialize_received_message_cap_routed(
-            &mut state, endpoint, receiver, sender, &msg,
-        )
-        .expect("routed")
-        .expect("cap");
+        let cap =
+            materialize_received_message_cap_routed(&mut state, endpoint, receiver, sender, &msg)
+                .expect("routed")
+                .expect("cap");
         assert_eq!(state.ipc_path_telemetry().d1_split_materializations, 1);
         let cnode = state.task_cnode(receiver).expect("cnode");
-        assert!(state.capability_for_cnode_local(cnode, CapId(cap)).is_some());
+        assert!(
+            state
+                .capability_for_cnode_local(cnode, CapId(cap))
+                .is_some()
+        );
     }
 
     #[test]
@@ -7994,18 +7991,21 @@ mod tests {
             &region.encode(),
         )
         .expect("msg");
-        let cap = materialize_received_message_cap_routed(
-            &mut state, endpoint, receiver, sender, &msg,
-        )
-        .expect("canonical materialize")
-        .expect("cap");
+        let cap =
+            materialize_received_message_cap_routed(&mut state, endpoint, receiver, sender, &msg)
+                .expect("canonical materialize")
+                .expect("cap");
         assert_eq!(
             state.ipc_path_telemetry().d1_split_materializations,
             0,
             "shared-mem transfer must stay on the canonical global-lock path"
         );
         let cnode = state.task_cnode(receiver).expect("cnode");
-        assert!(state.capability_for_cnode_local(cnode, CapId(cap)).is_some());
+        assert!(
+            state
+                .capability_for_cnode_local(cnode, CapId(cap))
+                .is_some()
+        );
     }
 
     #[test]
@@ -8026,10 +8026,9 @@ mod tests {
             b"",
         )
         .expect("msg");
-        let err = materialize_received_message_cap_routed(
-            &mut state, endpoint, receiver, sender, &msg,
-        )
-        .expect_err("non-reply envelope under FLAG_REPLY_CAP must fail");
+        let err =
+            materialize_received_message_cap_routed(&mut state, endpoint, receiver, sender, &msg)
+                .expect_err("non-reply envelope under FLAG_REPLY_CAP must fail");
         assert_eq!(err, SyscallError::WrongObject);
         let telem = state.ipc_path_telemetry();
         assert_eq!(telem.d1_split_materializations, 0);
@@ -8079,15 +8078,18 @@ mod tests {
         .expect("msg b");
 
         let cap_split = materialize_received_message_cap_routed(
-            &mut state_split, ep_a, receiver, sender, &msg_a,
+            &mut state_split,
+            ep_a,
+            receiver,
+            sender,
+            &msg_a,
         )
         .expect("split route")
         .expect("cap");
-        let cap_canon = materialize_received_message_cap(
-            &mut state_canon, ep_b, receiver, sender, &msg_b,
-        )
-        .expect("canonical")
-        .expect("cap");
+        let cap_canon =
+            materialize_received_message_cap(&mut state_canon, ep_b, receiver, sender, &msg_b)
+                .expect("canonical")
+                .expect("cap");
 
         assert_eq!(cap_split, cap_canon, "minted CapId must be byte-identical");
 
@@ -8100,7 +8102,11 @@ mod tests {
             .capability_for_cnode_local(cnode_canon, CapId(cap_canon))
             .expect("slot");
         assert_eq!(slot_split.object, slot_canon.object, "slot object equal");
-        assert_eq!(slot_split.rights(), slot_canon.rights(), "slot rights equal");
+        assert_eq!(
+            slot_split.rights(),
+            slot_canon.rights(),
+            "slot rights equal"
+        );
 
         // Memory-object cap_refcount equivalence (delegation increments it).
         let refcount = |state: &KernelState, object: CapObject| -> Option<u32> {
@@ -8199,11 +8205,19 @@ mod tests {
         };
 
         let err_split = materialize_received_message_cap_routed(
-            &mut state_split, ep_a, receiver, sender, &msg(handle_a),
+            &mut state_split,
+            ep_a,
+            receiver,
+            sender,
+            &msg(handle_a),
         )
         .expect_err("revoked source cap must fail materialization");
         let err_canon = materialize_received_message_cap(
-            &mut state_canon, ep_b, receiver, sender, &msg(handle_b),
+            &mut state_canon,
+            ep_b,
+            receiver,
+            sender,
+            &msg(handle_b),
         )
         .expect_err("revoked source cap must fail materialization");
         assert_eq!(
@@ -8242,7 +8256,9 @@ mod tests {
         let mut state = crate::kernel::boot::Bootstrap::init().expect("init");
         // Caller task with its own cnode.
         state.register_task(caller).expect("register caller");
-        state.ensure_cnode_space(CNodeId(caller)).expect("caller cnode");
+        state
+            .ensure_cnode_space(CNodeId(caller))
+            .expect("caller cnode");
         state
             .set_process_cnode_for_pid(caller, CNodeId(caller))
             .expect("bind caller");
@@ -8293,7 +8309,14 @@ mod tests {
             )
             .expect("stash reply envelope");
 
-        (state, delivery_endpoint, handle, caller, receiver, reply_object)
+        (
+            state,
+            delivery_endpoint,
+            handle,
+            caller,
+            receiver,
+            reply_object,
+        )
     }
 
     fn stage105_reply_msg(caller_tid: u64, handle: u64) -> Message {
@@ -8315,16 +8338,14 @@ mod tests {
             stage105_state_with_reply_envelope(caller, receiver);
         let msg = stage105_reply_msg(caller_tid, handle);
 
-        assert_eq!(state.ipc_path_telemetry().d5_split_reply_materializations, 0);
-        let cap = materialize_received_message_cap_routed(
-            &mut state,
-            ep,
-            receiver_tid,
-            caller_tid,
-            &msg,
-        )
-        .expect("routed reply materialize")
-        .expect("reply arm yields a cap");
+        assert_eq!(
+            state.ipc_path_telemetry().d5_split_reply_materializations,
+            0
+        );
+        let cap =
+            materialize_received_message_cap_routed(&mut state, ep, receiver_tid, caller_tid, &msg)
+                .expect("routed reply materialize")
+                .expect("reply arm yields a cap");
 
         let telem = state.ipc_path_telemetry();
         assert_eq!(
@@ -8547,15 +8568,10 @@ mod tests {
         // telemetry hook (which lives in the router, mirroring the D1 design)
         // fires; the rollback counter must stay 0 on success.
         let msg = stage105_reply_msg(caller_tid, handle);
-        let cap = materialize_received_message_cap_routed(
-            &mut state,
-            ep,
-            receiver_tid,
-            caller_tid,
-            &msg,
-        )
-        .expect("routed reply materialize")
-        .expect("cap");
+        let cap =
+            materialize_received_message_cap_routed(&mut state, ep, receiver_tid, caller_tid, &msg)
+                .expect("routed reply materialize")
+                .expect("cap");
         let _ = cap;
         let telem = state.ipc_path_telemetry();
         assert_eq!(telem.d5_split_reply_materializations, 1);
@@ -8685,8 +8701,9 @@ mod tests {
             "memory_state.rs must define the typed shrink helper"
         );
         assert!(
-            src.contains("kernel\n                .vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)")
-                || src.contains(".vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)"),
+            src.contains(
+                "kernel\n                .vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)"
+            ) || src.contains(".vm_brk_shrink_two_phase(asid, unmap_start, unmap_end)"),
             "handle_vm_brk must route shrink through the typed helper"
         );
         // The inline per-page loop must be gone from handle_vm_brk: no direct
@@ -8746,8 +8763,7 @@ mod tests {
             "shrink call counter must increment by 1 per invocation"
         );
         assert_eq!(
-            after.d3_vm_brk_shrink_shootdowns,
-            before.d3_vm_brk_shrink_shootdowns,
+            after.d3_vm_brk_shrink_shootdowns, before.d3_vm_brk_shrink_shootdowns,
             "shootdowns must stay 0 on -smp 1 (target_cpu_bitmap empty)"
         );
         assert!(after.d3_vm_brk_shrink_pages_unmapped >= before.d3_vm_brk_shrink_pages_unmapped);
@@ -8796,7 +8812,9 @@ mod tests {
             .split("fn local_dispatch_step_split")
             .nth(1)
             .expect("helper present");
-        let next_fn = helper_body.find("\n    pub ").or(helper_body.find("\n    fn "));
+        let next_fn = helper_body
+            .find("\n    pub ")
+            .or(helper_body.find("\n    fn "));
         let helper_body = match next_fn {
             Some(end) => &helper_body[..end],
             None => helper_body,
@@ -8973,8 +8991,7 @@ mod tests {
         //       scheduler stays BSP-only
         let tramp_src = include_str!("../arch/x86_64/smp_trampoline.rs");
         assert!(
-            tramp_src
-                .contains("mov dword ptr [AP_TRAMPOLINE_BASE + AP_OFF_HANDOFF + 32], 2"),
+            tramp_src.contains("mov dword ptr [AP_TRAMPOLINE_BASE + AP_OFF_HANDOFF + 32], 2"),
             "trampoline must publish Rust-online value (2) into ready_word \
              before jumping to Rust"
         );
@@ -9221,10 +9238,7 @@ mod tests {
             "csrr t0, scause",
             "csrr t0, stval",
         ] {
-            assert!(
-                src.contains(inst),
-                "trap vector must capture CSR: {inst:?}"
-            );
+            assert!(src.contains(inst), "trap vector must capture CSR: {inst:?}");
         }
         assert!(
             src.contains("call yarm_riscv64_trap_bridge"),
@@ -9255,10 +9269,7 @@ mod tests {
             src.contains("ld a0, 72(a0)"),
             "trap-return must restore a0 from frame[A0] LAST so the frame ptr stays live"
         );
-        assert!(
-            src.contains("sret"),
-            "trap-return tail must end with sret"
-        );
+        assert!(src.contains("sret"), "trap-return tail must end with sret");
     }
 
     #[test]
@@ -9268,7 +9279,9 @@ mod tests {
         // and page-fault handlers are shared with the rest of the kernel.
         let src = include_str!("../arch/riscv64/boot.rs");
         assert!(
-            src.contains("crate::arch::riscv64::trap::handle_trap_entry(kernel, cpu, ctx, Some(&mut tframe))"),
+            src.contains(
+                "crate::arch::riscv64::trap::handle_trap_entry(kernel, cpu, ctx, Some(&mut tframe))"
+            ),
             "trap bridge must call the existing handle_trap_entry"
         );
         // syscall ABI mapping: a7 -> syscall_num, a0..a5 -> args.

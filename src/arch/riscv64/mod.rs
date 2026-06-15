@@ -7,8 +7,10 @@ pub mod context_switch;
 pub mod irq;
 pub mod page_table;
 pub mod platform_layout;
+pub mod plic;
 pub mod sbi;
 pub mod syscall_abi;
+pub mod timer;
 pub mod trap;
 pub mod vm_layout;
 
