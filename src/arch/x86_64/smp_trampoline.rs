@@ -17,7 +17,7 @@
 //! (`yarm_x86_64_ap_entry` is retained as the future entry point only); it
 //! has no per-CPU IDT/TSS/GS/scheduler/log environment. That gap — not the
 //! file layout — is the remaining blocker for real x86_64 SMP scheduling
-//! (see doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §23).
+//! (see doc/KERNEL_UNLOCKING.md).
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 use core::arch::global_asm;

@@ -90,7 +90,7 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 
 // ── Stage 102: mechanical syscall decomposition (zero behavior change) ───────
 // Child modules split from this file per the decomposition map in
-// doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §3. The dispatch arms below are
+// doc/KERNEL_UNLOCKING.md The dispatch arms below are
 // unchanged; the `use` re-imports keep the handler call sites textually
 // identical. NOTE: these `mod` declarations must stay AFTER the
 // `syscall_trace!` macro definition above (textual macro scoping).
@@ -647,11 +647,11 @@ fn materialize_received_message_cap_routed(
     // D1 supported scope (Pass 1 / Stage 104): non-shared-region only.
     // Shared-region transfers carry receiver-side mapping obligations outside
     // the materialize step; they keep the canonical path per the Stage 103
-    // audit (doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §12.3).
+    // audit (doc/KERNEL_UNLOCKING.md).
     //
     // D5 supported scope (Pass 2 / Stage 105): FLAG_REPLY_CAP, non-shared-region
     // only. Phase B' uses try_set_reply_cap_waiter_cap with mint rollback on
-    // the stale race window. See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §14.
+    // the stale race window. See doc/KERNEL_UNLOCKING.md
     if msg.opcode != OPCODE_SHARED_MEM {
         // ── D1 transfer-cap arm ──────────────────────────────────────────────
         match materialize_split_transfer_cap_equivalent(kernel, endpoint, receiver_tid, msg) {
@@ -1094,7 +1094,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     // trap-entry seam. Cases this match cannot service set
     // `split_send_result = None` and the caller falls back to the global-lock
     // `kernel.ipc_send(...)` / `ipc_send_with_deadline(...)` paths below.
-    // See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
+    // See doc/KERNEL_UNLOCKING.md
     let (split_send_result, split_scheduler_plan) = match endpoint {
         CapObject::Endpoint { .. } => {
             let endpoint_idx = kernel
@@ -1232,7 +1232,7 @@ fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 // VALIDATION: SPLIT_FAST_PATH_ONLY
 // Stage 101: this is a split fast path off the trap-entry seam. Cases the helper
 // cannot service return Ok(None) and the caller falls back to the global-lock
-// `kernel.ipc_recv(cap)` path. See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
+// `kernel.ipc_recv(cap)` path. See doc/KERNEL_UNLOCKING.md
 fn try_endpoint_split_recv(
     kernel: &mut KernelState,
     endpoint: CapObject,
@@ -1642,7 +1642,7 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
     // VALIDATION: SPLIT_FAST_PATH_ONLY
     // Stage 101: live-wired off the trap entry; non-recv-v2 receivers and
     // sender/cap-transfer envelope failures fall back to the global-lock
-    // `kernel.ipc_send(...)` path. See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
+    // `kernel.ipc_send(...)` path. See doc/KERNEL_UNLOCKING.md
     //
     // The transfer envelope was stashed by stash_transfer_handle with
     // receiver_tid = Some(waiter_tid). Error-path cleanup must pass that same
@@ -1725,7 +1725,7 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 // Stage 101: NR 7 IpcReply is not yet split-wired off the trap-entry seam.
 // kernel.ipc_reply(...) runs under the global &mut KernelState. A future
 // Stage 102+ may add a Stage-4M fast path analogous to Stage 4L.
-// See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
+// See doc/KERNEL_UNLOCKING.md
 fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     let reply_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
@@ -3880,7 +3880,7 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
             // ordering (Phase 1 PTE remove → Phase 2 TLB shootdown wait →
             // Phase 3 frame reclaim, via execute_tlb_shootdown_wait_plan)
             // is byte-identical to the pre-Stage-107 inline loop. See
-            // doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §22.
+            // doc/KERNEL_UNLOCKING.md
             let asid = kernel
                 .task_asid(plan.tid)
                 .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
@@ -4094,7 +4094,7 @@ fn recv_v3_exact_region_len(obj: crate::kernel::capabilities::CapObject) -> u64 
 /// split-recv adapter for the dequeue+writeback. The trap-entry seam itself
 /// still routes NR 30 through the global-lock dispatch (`dispatch()`), but the
 /// IPC dequeue inside this handler runs against the same split adapter as
-/// Stage 36. See doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md §2.
+/// Stage 36. See doc/KERNEL_UNLOCKING.md
 ///
 /// Stage 42+43: handle the `recv_shared_v3` syscall (NR 30).
 ///
@@ -7614,7 +7614,8 @@ mod tests {
 
     #[test]
     fn stage101_audit_doc_exists_with_decomposition_map_and_d1_audit() {
-        let audit = include_str!("../../doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md");
+        // Consolidated into the canonical doc/KERNEL_UNLOCKING.md.
+        let audit = include_str!("../../doc/KERNEL_UNLOCKING.md");
         // Decomposition map skeleton.
         for module in [
             "syscall/dispatch.rs",
@@ -7658,7 +7659,8 @@ mod tests {
 
     #[test]
     fn stage101_scaffold_status_doc_exists_and_lists_required_types() {
-        let status = include_str!("../../doc/DECOMPOSITION_SCAFFOLD_STATUS.md");
+        // Consolidated into the canonical doc/KERNEL_UNLOCKING.md (§6).
+        let status = include_str!("../../doc/KERNEL_UNLOCKING.md");
         for ty in [
             "RecvCapTransferPlan",
             "TlbShootdownWaitPlan",
@@ -8857,20 +8859,18 @@ mod tests {
 
     #[test]
     fn stage107_milestone_doc_lists_pass3_continuation() {
-        // The Milestone 1 doc must remain DECLARED and document the Stage 107
-        // continuation (D3.1 + D6.1 first live steps) in the Milestone 2
-        // work list — proving the doc tracks what's live.
-        let doc = include_str!("../../doc/KERNEL_UNLOCKING_MILESTONE_1.md");
+        // The canonical doc must remain DECLARED and document the Stage 107
+        // continuation (D3.1 + D6.1 first live steps) — proving the doc
+        // tracks what's live. (Consolidated into doc/KERNEL_UNLOCKING.md.)
+        let doc = include_str!("../../doc/KERNEL_UNLOCKING.md");
         assert!(doc.contains("Milestone status: DECLARED"));
-        // Audit doc must carry the Stage 107 section.
-        let audit = include_str!("../../doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md");
         assert!(
-            audit.contains("Stage 107") && audit.contains("D3_LIVE_SPLIT"),
-            "audit doc must record Stage 107 D3 live wiring"
+            doc.contains("Stage 107") && doc.contains("D3_LIVE_SPLIT"),
+            "canonical doc must record Stage 107 D3 live wiring"
         );
         assert!(
-            audit.contains("D6_LIVE_SPLIT"),
-            "audit doc must record Stage 107 D6 live wiring"
+            doc.contains("D6_LIVE_SPLIT"),
+            "canonical doc must record Stage 107 D6 live wiring"
         );
     }
 
@@ -8996,11 +8996,12 @@ mod tests {
             !smp_src.contains("kernel.bring_up_cpu(cpu)"),
             "production scheduler bring-up must remain BSP-only in Pass 2"
         );
-        let m2 = include_str!("../../doc/KERNEL_UNLOCKING_MILESTONE_2.md");
+        // Consolidated into doc/KERNEL_UNLOCKING.md (Milestone 2 sections).
+        let m2 = include_str!("../../doc/KERNEL_UNLOCKING.md");
         assert!(
             m2.contains("Exact remaining x86_64 SMP blocker")
                 || m2.contains("x86_64 AP Rust online"),
-            "Milestone 2 doc must record the SMP AP Rust-online status"
+            "canonical doc must record the SMP AP Rust-online status"
         );
     }
 
@@ -9425,9 +9426,10 @@ mod tests {
 
     #[test]
     fn stage106_milestone_doc_exists_and_is_not_falsely_declared() {
-        // The Kernel Unlocking Milestone 1 doc must exist; if the branch is
+        // The canonical Kernel Unlocking doc must exist; if the branch is
         // not smoke-accepted the doc must say the milestone is NOT declared.
-        let doc = include_str!("../../doc/KERNEL_UNLOCKING_MILESTONE_1.md");
+        // (Consolidated into doc/KERNEL_UNLOCKING.md.)
+        let doc = include_str!("../../doc/KERNEL_UNLOCKING.md");
         assert!(
             doc.contains("Milestone status"),
             "milestone doc must carry an explicit status line"

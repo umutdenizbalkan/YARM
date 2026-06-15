@@ -12200,8 +12200,8 @@ No new kernel locks, interior mutability, or concurrent access paths are introdu
 # Stage 106 / Kernel Unlocking Pass 3 addendum
 
 Live split paths as of Stage 106 (full record:
-`doc/KERNEL_UNLOCKING_STAGE101_AUDIT.md` §13/§14/§18 and
-`doc/KERNEL_UNLOCKING_MILESTONE_1.md`):
+`doc/KERNEL_UNLOCKING.md` §13/§14/§18 and
+`doc/KERNEL_UNLOCKING.md`):
 
 - **D1 (Stage 104):** recv-side transfer-cap materialization routed through
   `cap_transfer_split` Phase A (ipc 3 → cap 4 read) / Phase B (cap 4 mutate).
@@ -12231,4 +12231,4 @@ Together with the pre-existing fault/telemetry seams this completes the seam
 set the D2/D3/D6 lock-window conversions need. The x86_64 AP trampoline is
 split into `arch/x86_64/smp_trampoline.rs` (mechanical, zero behavior
 change); the AP still parks in assembly — the per-CPU AP environment is the
-remaining SMP blocker (`KERNEL_UNLOCKING_MILESTONE_2.md` §3).
+remaining SMP blocker (`doc/KERNEL_UNLOCKING.md` §3).

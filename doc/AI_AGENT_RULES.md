@@ -505,10 +505,17 @@ panic_count=$(... | rg -ai -c "\bpanic\b" 2>/dev/null || echo 0)
 
 ### 12.4 Kernel unlocking handoff
 
-See `doc/KERNEL_UNLOCKING_NEXT_CONTEXT.md` for the full handoff context.
-Recommended next stage: **Stage 101 — Kernel unlocking restart / trap-syscall borrow audit**.
+**Canonical source of truth: `doc/KERNEL_UNLOCKING.md`.** New milestone /
+context / audit / status fragment files for kernel unlocking are forbidden;
+update the canonical doc instead. See `doc/DOCUMENTATION_MAP.md` for the
+repo-wide ownership map.
 
-Key invariants that kernel unlocking must not break:
+The full invariant list, live-path / fallback tables, recent correctness
+fixes, scaffold status, and remaining-work plan all live in
+`doc/KERNEL_UNLOCKING.md`. A short summary of the invariants follows for
+quick-reference; if these conflict with the canonical doc, the canonical
+doc wins.
+
 - SpawnV5 ABI (16-byte reply, argument layout)
 - Image IDs 7–12 frozen
 - SYSCALL_COUNT = 31, STARTUP_SLOT_COUNT = 18
@@ -611,6 +618,11 @@ smoke result that was not actually executed.
 
 ## 14. Kernel Unlocking Live-Path Rules (Stage 104–106)
 
+> **Canonical reference:** `doc/KERNEL_UNLOCKING.md` (live-paths and
+> fallbacks, §2; live-path policy fences, §8). The subsections below are
+> retained for the agent-facing quick-reference contract. If they conflict
+> with the canonical doc, the canonical doc wins.
+
 ### 14.1 Live split paths and their gates
 
 | Path | Live since | Gate |
@@ -625,7 +637,7 @@ canonical; sender-waiter cap-transfer refills stay on the global lock.
 
 ### 14.2 Milestone declaration honesty rule
 
-`doc/KERNEL_UNLOCKING_MILESTONE_1.md` carries an explicit
+`doc/KERNEL_UNLOCKING.md` carries an explicit
 `Milestone status` line. Only an environment that has actually executed the
 smoke checklist may flip it to DECLARED, recording the run results in the
 acceptance table. Declaring without smoke is a hard violation of §13.
