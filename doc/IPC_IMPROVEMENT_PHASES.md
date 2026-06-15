@@ -7,7 +7,7 @@ This plan breaks the IPC hardening work into incremental, reviewable phases.
 > **Historical/staged planning note.**
 > For the authoritative current recv-v2/reply-cap ABI contract and semantics, see:
 > - `doc/SYSCALL_ABI.md`
-> - `doc/AARCH64_IPC_VFS_PM_STATUS_2026_05.md`
+> - `doc/ARCH_AARCH64.md` (consolidated; replaces the former `AARCH64_IPC_VFS_PM_STATUS_2026_05.md`)
 >
 > Where this phase plan conflicts with those documents, treat this file as historical context and the above two documents as source of truth.
 

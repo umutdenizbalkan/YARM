@@ -15,11 +15,11 @@ fragment files unless the canonical owner explicitly does not exist.
 |-------|------------------|
 | Kernel unlocking (decomposition, milestones, status, audits) | **`doc/KERNEL_UNLOCKING.md`** |
 | Kernel locking architecture (lock-rank design, domains, invariants) | `doc/KERNEL_LOCKING.md` |
-| Boot (boot flow, command line, memory layout, QEMU runbook) | `doc/BOOT.md` (to be consolidated; see TODO §2) |
-| Architecture — AArch64 | `doc/ARCH_AARCH64.md` (to be consolidated; see TODO §2) |
-| Architecture — x86_64 | `doc/ARCH_X86_64.md` (to be consolidated; see TODO §2) |
-| Architecture — RISC-V64 | `doc/ARCH_RISCV64.md` (to be consolidated; see TODO §2) |
-| RPi5 bring-up | `doc/RPI5_BRINGUP.md` (to be consolidated; see TODO §2) |
+| Boot (boot flow, command line, memory layout, QEMU runbook) | **`doc/BOOT.md`** |
+| Architecture — AArch64 | **`doc/ARCH_AARCH64.md`** |
+| Architecture — x86_64 | **`doc/ARCH_X86_64.md`** |
+| Architecture — RISC-V64 | **`doc/ARCH_RISCV64.md`** |
+| RPi5 bring-up | **`doc/RPI5_BRINGUP.md`** |
 | IPC (send/recv, shared-memory fastpath, fragmentation, throughput) | `doc/IPC.md` (to be consolidated; see TODO §3) |
 | VFS (request loop, shared-I/O contract, mapper requirements) | `doc/VFS.md` (to be consolidated; see TODO §3) |
 | Filesystem and storage (RAMFS/initramfs/devfs/FAT/ext4 + block) | `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md` (to be consolidated; see TODO §3) |
@@ -60,6 +60,10 @@ The canonical-owner expectations above are pinned by source-grep tests:
   in `src/kernel/syscall.rs` reference `doc/KERNEL_UNLOCKING.md`. Changing
   the canonical owner file name requires updating those `include_str!`
   paths.
+- `tests/rpi5_stage1_scope.rs::rpi5_high_half_scaffold_is_explicit_and_non_default`
+  references `doc/RPI5_BRINGUP.md` and pins the two phrases
+  `"This scaffold does not install TTBR1"` and
+  `"only then install a user root in TTBR0"` verbatim — do not reflow.
 
 ## Outstanding consolidation TODOs
 
@@ -97,25 +101,21 @@ cluster at a time:
   - `doc/PHASE_READINESS_MATRIX.md`
   - `doc/KERNEL_STATUS.md`
 
-### TODO §2 — Boot / architecture
+### TODO §2 — Boot / architecture — DONE (Pass 2)
 
-- Create `doc/BOOT.md` consolidating boot cmdline, memory layout, QEMU
-  runbook. Delete after migration:
-  - `doc/BOOT_COMMAND_LINE.md`
-  - `doc/BOOT_MEMORY_LAYOUT.md`
-  - `doc/BOOT_QEMU_RUNBOOK.md`
-- Create `doc/ARCH_AARCH64.md` consolidating aarch64 bring-up + IPC/VFS/PM
-  status. Delete after migration:
-  - `doc/AARCH64_BOOT_BRINGUP_PR_PLAN.md`
-  - `doc/AARCH64_IPC_VFS_PM_STATUS_2026_05.md`
-  - `doc/aarch64-initrd-init-elf-bringup.md`
-  - `doc/aarch64-ipc-bootstrap-notes.md`
-- Create `doc/ARCH_X86_64.md` from `doc/x86_64_boot_path.md` and delete the
-  original.
-- Create `doc/ARCH_RISCV64.md` from `doc/RISCV64_SMP_SECONDARY_RELEASE_AUDIT.md`
-  and the recent RISC-V Sv39 / round-trip work referenced in commit history;
-  delete the original audit fragment.
-- Create `doc/RPI5_BRINGUP.md` from `doc/rpi5-stage1.md`; delete the original.
+Pass 2 consolidated all boot/arch fragments into:
+
+- `doc/BOOT.md` (cmdline + memory layout + QEMU runbook)
+- `doc/ARCH_AARCH64.md` (boot, IPC, VFS, PM, userspace)
+- `doc/ARCH_X86_64.md` (PVH, AP Rust online, SMP fences)
+- `doc/ARCH_RISCV64.md` (OpenSBI handoff, Sv39, U-mode, round-trip, services)
+- `doc/RPI5_BRINGUP.md` (Stage 1 / HH-2 / HH-3 / HH-4 / HH-5)
+
+Deleted in the same pass: `BOOT_COMMAND_LINE.md`, `BOOT_MEMORY_LAYOUT.md`,
+`BOOT_QEMU_RUNBOOK.md`, `AARCH64_BOOT_BRINGUP_PR_PLAN.md`,
+`AARCH64_IPC_VFS_PM_STATUS_2026_05.md`, `aarch64-initrd-init-elf-bringup.md`,
+`aarch64-ipc-bootstrap-notes.md`, `x86_64_boot_path.md`,
+`RISCV64_SMP_SECONDARY_RELEASE_AUDIT.md`, `rpi5-stage1.md`.
 
 ### TODO §3 — IPC / VFS / FS / networking / capability / process
 
