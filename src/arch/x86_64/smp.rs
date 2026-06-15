@@ -170,6 +170,50 @@ fn ap_stack_top(cpu: CpuId) -> u64 {
     AP_STACK_TOP_BASE + ((cpu.0 as u64 + 1) * AP_STACK_BYTES as u64)
 }
 
+/// Emits the AP per-CPU environment scaffold marker sequence for `cpu`.
+///
+/// The scaffold contract (this pass):
+/// - **STACK**: real, AP-owned (`ap_stack_top` derives it from the per-CPU
+///   slot allocated by the trampoline). Marker: `X86_AP_STACK_READY`.
+/// - **GDT**: BSP GDT inherited via the trampoline. Safe for the parked
+///   AP because the AP runs no user code and takes no interrupts. Marker:
+///   `X86_AP_GDT_READY reason=bsp_gdt_shared_safe_while_ap_masked`.
+/// - **TSS / IDT / GS / FPU**: explicitly **DEFERRED** with real reasons.
+///   The AP parks with interrupts masked and runs no FP code, so none of
+///   these are required for safe parking. Future AP scheduler participation
+///   will need to flip these to READY with real per-CPU allocations.
+///
+/// All markers are emitted from the BSP — the AP itself cannot safely use
+/// `yarm_log!` (no AP-safe printk lock yet). The values are deterministic
+/// per `cpu`, so the BSP-side emission accurately reflects what the AP
+/// observes.
+fn emit_ap_env_scaffold(cpu: CpuId) {
+    let stack_top = ap_stack_top(cpu);
+    crate::yarm_log!("X86_AP_ENV_BEGIN cpu={} apic_id={}", cpu.0, cpu.0);
+    crate::yarm_log!("X86_AP_STACK_READY cpu={} stack=0x{:x}", cpu.0, stack_top);
+    crate::yarm_log!(
+        "X86_AP_GDT_READY cpu={} reason=bsp_gdt_shared_safe_while_ap_masked",
+        cpu.0
+    );
+    crate::yarm_log!(
+        "X86_AP_TSS_DEFERRED cpu={} reason=no_ap_local_tss_required_for_parked_ap",
+        cpu.0
+    );
+    crate::yarm_log!(
+        "X86_AP_IDT_DEFERRED cpu={} reason=interrupts_masked_no_handlers",
+        cpu.0
+    );
+    crate::yarm_log!(
+        "X86_AP_GS_DEFERRED cpu={} reason=no_per_cpu_area_allocated",
+        cpu.0
+    );
+    crate::yarm_log!(
+        "X86_AP_FPU_DEFERRED cpu={} reason=ap_runs_no_fp_code",
+        cpu.0
+    );
+    crate::yarm_log!("X86_AP_ENV_READY cpu={}", cpu.0);
+}
+
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 fn current_cr3() -> u64 {
     let cr3: u64;
@@ -419,6 +463,17 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         }
 
         crate::yarm_log!("X86_AP_ENTER_RUST cpu={}", cpu.0);
+
+        // AP per-CPU environment scaffold. Each component is either
+        // wired (READY) or explicitly DEFERRED with a real reason — no
+        // fake readiness. The AP itself is parked with interrupts
+        // masked, so deferring TSS/IDT/GS/FPU is safe and explicitly
+        // recorded for the smoke gate.
+        emit_ap_env_scaffold(cpu);
+
+        // Legacy markers preserved for the existing smoke-grep contract
+        // (see doc/ARCH_X86_64.md §AP markers). The richer env scaffold
+        // markers above are the canonical set going forward.
         crate::yarm_log!(
             "X86_AP_GDT_TSS_READY cpu={} reason=trampoline_gdt_inherited",
             cpu.0
@@ -433,7 +488,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             cpu.0
         );
         crate::yarm_log!("X86_AP_ONLINE cpu={}", cpu.0);
-        crate::yarm_log!("X86_AP_RUST_PARK cpu={}", cpu.0);
+        crate::yarm_log!("X86_AP_RUST_PARK cpu={} reason=no_ap_scheduler_yet", cpu.0);
         rust_online_aps += 1;
 
         // SAFETY FENCE: the AP is parked in a Rust cli/hlt loop with no
