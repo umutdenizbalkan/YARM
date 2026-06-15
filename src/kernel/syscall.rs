@@ -9192,33 +9192,195 @@ mod tests {
     }
 
     #[test]
-    fn riscv_trap_vector_swaps_sscratch_and_captures_csrs() {
-        // The S-mode trap vector must swap the user sp out via sscratch (so
-        // the user GPRs are not clobbered by kernel pushes), then capture
-        // scause/sepc/stval/sstatus/sscratch and call the Rust reporter.
+    fn riscv_trap_vector_saves_full_gpr_frame_and_calls_bridge() {
+        // The S-mode trap vector must swap the user sp out via sscratch, save
+        // a full RiscvTrapFrame (all 31 GPRs except x0, plus the four CSRs
+        // sepc/sstatus/scause/stval) on the kernel trap stack, and tail-call
+        // the Rust bridge with a pointer to the frame.
         let src = include_str!("../arch/riscv64/boot.rs");
         assert!(
             src.contains("csrrw sp, sscratch, sp"),
             "trap vector must swap sp <-> sscratch on entry"
         );
+        // x1, x3..=x31 saved (x0 omitted; x2 is the user sp restored from sscratch).
+        for inst in [
+            "sd x1,   0(sp)",
+            "sd x3,  16(sp)",
+            "sd x17, 128(sp)", // a7 / syscall number
+            "sd x31, 240(sp)",
+        ] {
+            assert!(
+                src.contains(inst),
+                "trap vector must contain GPR save: {inst:?}"
+            );
+        }
+        for inst in [
+            "csrr t0, sepc",
+            "csrr t0, sstatus",
+            "csrr t0, scause",
+            "csrr t0, stval",
+        ] {
+            assert!(
+                src.contains(inst),
+                "trap vector must capture CSR: {inst:?}"
+            );
+        }
         assert!(
-            src.contains("csrr a0, scause")
-                && src.contains("csrr a1, sepc")
-                && src.contains("csrr a2, stval")
-                && src.contains("csrr a4, sstatus")
-                && src.contains("csrr a5, sscratch"),
-            "trap vector must capture scause/sepc/stval/sstatus/sscratch"
+            src.contains("call yarm_riscv64_trap_bridge"),
+            "trap vector must call the Rust trap bridge"
         );
         assert!(
-            src.contains("call yarm_riscv64_user_trap_report"),
-            "trap vector must hand off to the Rust reporter"
+            src.contains(".global yarm_riscv64_trap_return"),
+            "trap-return tail must exist as a global symbol"
+        );
+    }
+
+    #[test]
+    fn riscv_trap_return_restores_gprs_csrs_and_srets() {
+        // The trap-return tail must restore all saved GPRs (including a0 last
+        // so the frame pointer stays valid through the load fan-out), reload
+        // the sepc/sstatus CSRs, swap user sp back via sscratch, and sret.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        assert!(
+            src.contains("csrw sepc, t0") && src.contains("csrw sstatus, t0"),
+            "trap-return must restore sepc and sstatus from the frame"
+        );
+        assert!(
+            src.contains("csrw sscratch, t0"),
+            "trap-return must reseat user sp into sscratch"
+        );
+        // a0 (x10) restored last from offset 72.
+        assert!(
+            src.contains("ld a0, 72(a0)"),
+            "trap-return must restore a0 from frame[A0] LAST so the frame ptr stays live"
+        );
+        assert!(
+            src.contains("sret"),
+            "trap-return tail must end with sret"
+        );
+    }
+
+    #[test]
+    fn riscv_trap_bridge_calls_existing_handle_trap_entry() {
+        // The bridge must dispatch through the existing
+        // `arch::riscv64::trap::handle_trap_entry` Rust path so the syscall
+        // and page-fault handlers are shared with the rest of the kernel.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        assert!(
+            src.contains("crate::arch::riscv64::trap::handle_trap_entry(kernel, cpu, ctx, Some(&mut tframe))"),
+            "trap bridge must call the existing handle_trap_entry"
+        );
+        // syscall ABI mapping: a7 -> syscall_num, a0..a5 -> args.
+        assert!(
+            src.contains("tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7]"),
+            "ecall must take syscall_num from a7"
+        );
+        for (idx, slot) in [
+            (0, "RiscvTrapFrame::A0"),
+            (1, "RiscvTrapFrame::A1"),
+            (2, "RiscvTrapFrame::A2"),
+            (3, "RiscvTrapFrame::A3"),
+            (4, "RiscvTrapFrame::A4"),
+            (5, "RiscvTrapFrame::A5"),
+        ] {
+            let needle = format!("tframe.set_arg({idx}, frame.regs[{slot}]");
+            assert!(
+                src.contains(&needle),
+                "ecall must take arg{idx} from {slot}"
+            );
+        }
+    }
+
+    #[test]
+    fn riscv_pc_is_advanced_by_4_for_ecall_resume() {
+        // RISC-V `ecall` does not auto-advance sepc. The bridge must pre-set
+        // saved_pc to sepc+4 before dispatch so the TCB snapshot taken inside
+        // `dispatch_syscall -> sync_current_thread_from_frame` captures the
+        // post-ecall PC. Otherwise the user thread would resume on top of the
+        // same ecall and loop forever.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        assert!(
+            src.contains("let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };"),
+            "bridge must compute a +4 advance for ecall traps"
+        );
+        assert!(
+            src.contains("tframe.set_saved_pc(sepc + advance);"),
+            "bridge must apply the advance to saved_pc before dispatch"
+        );
+    }
+
+    #[test]
+    fn riscv_round_trip_writes_yarm_abi_returns_to_a0_a1_a2_a3() {
+        // YARM syscall return ABI: a0=ret0, a1=ret1, a2=ret2, a3=error
+        // (matches AArch64). The bridge must write into the saved register
+        // frame, not the generic TrapFrame.user_gprs.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        assert!(
+            src.contains("frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;"),
+            "bridge must write ret0 -> a0"
+        );
+        assert!(
+            src.contains("frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;"),
+            "bridge must write ret1 -> a1"
+        );
+        assert!(
+            src.contains("frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;"),
+            "bridge must write ret2 -> a2"
+        );
+        assert!(
+            src.contains("frame.regs[RiscvTrapFrame::A3] = err as u64;"),
+            "bridge must write error -> a3 on Err"
+        );
+    }
+
+    #[test]
+    fn riscv_round_trip_seeds_a0_a5_from_args_on_task_switch() {
+        // When a task switch occurs (a different task is being resumed) the
+        // freshly-spawned task's `user_gprs` are all zero — its YARM startup
+        // ABI lives in the `args[0..5]` lanes of UserRegisterContext. The
+        // bridge must seed a0..a5 from `tframe.arg(i)` not user_gpr(i+10).
+        let src = include_str!("../arch/riscv64/boot.rs");
+        for slot in 0..6 {
+            let reg = match slot {
+                0 => "RiscvTrapFrame::A0",
+                1 => "RiscvTrapFrame::A1",
+                2 => "RiscvTrapFrame::A2",
+                3 => "RiscvTrapFrame::A3",
+                4 => "RiscvTrapFrame::A4",
+                _ => "RiscvTrapFrame::A5",
+            };
+            let needle = format!("frame.regs[{reg}] = tframe.arg({slot}) as u64;");
+            assert!(
+                src.contains(&needle),
+                "task-switch path must seed {reg} from tframe.arg({slot})"
+            );
+        }
+        assert!(
+            src.contains("let task_switched = resume_tid != entering_tid;"),
+            "bridge must detect task switch"
+        );
+    }
+
+    #[test]
+    fn riscv_non_ecall_trap_from_s_halts_with_diagnostic() {
+        // A trap taken from S-mode (sstatus.SPP=1 at trap time) is a kernel
+        // fault. The bridge must NOT silently sret back; it must emit
+        // RISCV_TRAP_UNHANDLED with the full CSR snapshot and halt.
+        let src = include_str!("../arch/riscv64/boot.rs");
+        assert!(
+            src.contains("RISCV_TRAP_UNHANDLED scause=") && src.contains("reason=trap_from_s_mode"),
+            "S-mode trap must produce RISCV_TRAP_UNHANDLED with named reason"
+        );
+        assert!(
+            src.contains("riscv_trap_halt(\"trap_from_s_mode\")"),
+            "S-mode trap must halt deterministically"
         );
     }
 
     #[test]
     fn riscv_enter_user_emits_required_phase_markers() {
-        // Pin the full required marker sequence for the U-mode entry path so a
-        // refactor can't silently regress.
+        // Pin the full required marker sequence for the U-mode entry +
+        // round-trip path so a refactor can't silently regress.
         let src = include_str!("../arch/riscv64/boot.rs");
         for marker in [
             "RISCV_SV39_PLAN_BEGIN",
@@ -9241,12 +9403,22 @@ mod tests {
             "RISCV_ENTER_USER_SRET tid=",
             "RISCV_TRAP_ENTER scause=",
             "RISCV_FIRST_USER_TRAP scause=",
+            "RISCV_TRAP_SAVE_BEGIN tid=",
+            "RISCV_TRAP_SAVE_DONE tid=",
+            "RISCV_SYSCALL_DECODE nr=",
+            "RISCV_TRAP_HANDLE_BEGIN tid=",
+            "RISCV_TRAP_HANDLE_DONE status=",
+            "RISCV_TRAP_RESTORE_BEGIN tid=",
+            "RISCV_TRAP_RETURN_SRET tid=",
+            "RISCV_LIVEEEEEEE",
+            "RISCV_SYSCALL_ROUNDTRIP_OK nr=",
+            "RISCV_USER_RESUMED tid=",
             "RISCV_FIRST_USER_SYSCALL nr=",
             "RISCV_TRAP_HALTED reason=",
         ] {
             assert!(
                 src.contains(marker),
-                "required RISC-V U-mode-entry marker missing: {marker:?}"
+                "required RISC-V round-trip marker missing: {marker:?}"
             );
         }
     }
