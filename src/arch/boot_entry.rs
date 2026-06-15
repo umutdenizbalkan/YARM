@@ -44,6 +44,21 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
     crate::arch::selected_isa::boot::prepare_arch_boot(start_info_ptr)
 }
 
+/// Records a named kernel-bootstrap step for early diagnostics.
+///
+/// RISC-V publishes the step into a breadcrumb that the early S-mode trap
+/// vector reports (`RISCV_BOOTSTRAP_BEFORE_*` / `RISCV_BOOTSTRAP_TRAP_STEP`),
+/// so a fault in `Bootstrap::init` before kernel logging exists can still be
+/// attributed to an exact step. This is a no-op on x86_64, AArch64, and
+/// hosted-dev, so it cannot affect their behavior or logs.
+#[inline]
+pub fn bootstrap_step(name: &'static str) {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    crate::arch::riscv64::boot::riscv64_set_bootstrap_step(name);
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+    let _ = name;
+}
+
 pub fn emit_panic(info: &core::panic::PanicInfo<'_>) {
     crate::arch::selected_isa::boot::emit_panic(info)
 }
