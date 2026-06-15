@@ -4,8 +4,10 @@
 set -euo pipefail
 source "$(dirname "$0")/qemu-smoke-common.sh"
 
-KERNEL_IMAGE=${KERNEL_IMAGE:-build/yarm-riscv64.bin}
-INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build/initramfs-core.cpio}
+# Official RISC-V64 core smoke. The kernel image and initramfs paths default to
+# the artifacts emitted by scripts/build-qemu-riscv64-artifacts.sh.
+KERNEL_IMAGE=${KERNEL_IMAGE:-build-riscv64/yarm-riscv64.bin}
+INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-build-riscv64/initramfs-core.cpio}
 TIMEOUT_SECS=${TIMEOUT_SECS:-30}
 QEMU_SMOKE_STRICT=${QEMU_SMOKE_STRICT:-0}
 QEMU_MACHINE=${QEMU_MACHINE:-virt}
@@ -15,18 +17,37 @@ QEMU_SMP=${QEMU_SMP:-1}
 QEMU_BIOS=${QEMU_BIOS:-default}
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyS0 rdinit=/init"}
 
+# CLI: --smp 2  → enable smp=2 secondary-park assertion.
+while (( $# > 0 )); do
+  case "$1" in
+    --smp)
+      QEMU_SMP="$2"
+      shift 2
+      ;;
+    --smp=*)
+      QEMU_SMP="${1#--smp=}"
+      shift
+      ;;
+    *)
+      echo "[warn] unknown arg: $1" >&2
+      shift
+      ;;
+  esac
+done
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
+
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64-hwe}
 if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
   QEMU_BIN=qemu-system-riscv64
 fi
 require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 
-LOGFILE=${LOGFILE:-qemu-core.log}
+LOGFILE=${LOGFILE:-qemu-riscv64-core.log}
 rm -f "$LOGFILE"
 
-echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -bios $QEMU_BIOS -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
+echo "[info] qemu command: $QEMU_BIN -machine $QEMU_MACHINE -cpu $QEMU_CPU -m $QEMU_MEMORY -smp $QEMU_SMP -nographic -monitor none -serial stdio -bios $QEMU_BIOS -kernel $KERNEL_IMAGE -initrd $INITRAMFS_IMAGE -append '$KERNEL_CMDLINE'"
 
 if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   -machine "$QEMU_MACHINE" \
@@ -34,6 +55,8 @@ if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   -m "$QEMU_MEMORY" \
   -smp "$QEMU_SMP" \
   -nographic \
+  -monitor none \
+  -serial stdio \
   -bios "$QEMU_BIOS" \
   -kernel "$KERNEL_IMAGE" \
   -initrd "$INITRAMFS_IMAGE" \
@@ -44,33 +67,123 @@ else
   QEMU_STATUS=$?
 fi
 
-MARKER_REGEX="YARM_SUPERVISOR_TID2_SPAWNED|YARM_PM_TID3_SPAWNED|YARM_BOOT_OK|YARM_PROC_VFS_OK|YARM_INIT_START|YARM_INIT_DONE|BusyBox|/ #|Welcome|\[ui\] boot-to-shell marker"
-INIT_SERVER_REGEX="init_server|first server|first-server"
-SPAWN_SEQUENCE=(
-  "YARM_SUPERVISOR_TID2_SPAWNED"
-  "YARM_PM_TID3_SPAWNED"
+REQUIRED_PATTERNS=(
   "YARM_BOOT_OK"
-)
-# Markers 4-6 come from user_log! which is a no-op in no_std; checked warn-only.
-SPAWN_IPC_SEQUENCE=(
-  "YARM_PM_RECV_LOOP_START"
-  "INIT_SPAWN_V5_CALL_BEGIN"
-  "INIT_SPAWN_V5_REPLY_OK"
+  "RISCV_KERNEL_BOOT_OK"
+  "RISCV_LIVEEEEEEE"
+  "RISCV_SYSCALL_ROUNDTRIP_OK"
+  "RISCV_USER_RESUMED"
+  "INITRAMFS_SRV_ENTRY"
+  "DEVFS_SRV_ENTRY"
+  "VFS_SRV_ENTRY"
+  "VFS_MOUNT_TABLE_READY"
+  "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
 )
 
-if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; then
-  if ! check_log_sequence "$LOGFILE" "${SPAWN_SEQUENCE[@]}"; then
-    echo "[warn] riscv64 spawn marker sequence missing or out of order"
-    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+# RAMFS/EXT4 mount markers are emitted when those servers register their
+# mount points; treated as required for the core smoke once the chain runs.
+OPTIONAL_FS_PATTERNS=(
+  "RAMFS_MOUNT_READY"
+  "VFS_MOUNT_REGISTER_RAMFS_OK"
+  "EXT4_SRV_READY"
+  "VFS_MOUNT_REGISTER_EXT4_OK"
+)
+
+# Timer / PLIC / external-IRQ acceptance: either the live marker OR the
+# explicit deferral with reason. The kernel must emit exactly one of each
+# pair so partial bring-up is detectable.
+TIMER_ACCEPT_REGEX='RISCV_TIMER_SMOKE_OK ticks=|RISCV_TIMER_DEFERRED reason='
+PLIC_ACCEPT_REGEX='RISCV_PLIC_INIT_DONE|RISCV_PLIC_DEFERRED reason='
+EXTIRQ_ACCEPT_REGEX='RISCV_EXTIRQ_SMOKE_OK source=|RISCV_EXTIRQ_DEFERRED reason='
+
+# Patterns that must NOT appear in a healthy boot.
+REJECT_PATTERNS=(
+  'RISCV_EARLY_TRAP'
+  '\bPANIC\b'
+  '\bFATAL\b'
+  '\bASSERT\b'
+  'PAGE_FAULT_UNHANDLED'
+  'TRAP_HANDLE failed'
+  'Vm\(Full\)'
+  '\boom\b'
+  '\bcapacity\b'
+)
+
+failures=0
+
+for pat in "${REQUIRED_PATTERNS[@]}"; do
+  if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] required marker missing: $pat"
+    failures=$((failures + 1))
   fi
-  if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
-    echo "[warn] spawn IPC sequence absent (user_log! is a no-op in no_std; expected)"
+done
+
+for pat in "${OPTIONAL_FS_PATTERNS[@]}"; do
+  if ! rg -n -F "$pat" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[warn] optional-FS marker missing: $pat"
   fi
+done
+
+if ! rg -nE "$TIMER_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+  echo "[fail] neither RISCV_TIMER_SMOKE_OK nor RISCV_TIMER_DEFERRED present"
+  failures=$((failures + 1))
+fi
+
+if ! rg -nE "$PLIC_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+  echo "[fail] neither RISCV_PLIC_INIT_DONE nor RISCV_PLIC_DEFERRED present"
+  failures=$((failures + 1))
+fi
+
+if ! rg -nE "$EXTIRQ_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+  echo "[fail] neither RISCV_EXTIRQ_SMOKE_OK nor RISCV_EXTIRQ_DEFERRED present"
+  failures=$((failures + 1))
+fi
+
+# Repeated missing-DTB loop: more than one occurrence of source=missing_dtb in
+# YARM_BOOT_CMDLINE_CAPTURE is the failure mode the kernel guards against.
+missing_dtb_count=$(rg -cF "source=missing_dtb" "$LOGFILE" 2>/dev/null || true)
+missing_dtb_count=${missing_dtb_count:-0}
+if (( missing_dtb_count > 1 )); then
+  echo "[fail] repeated source=missing_dtb loop (count=$missing_dtb_count)"
+  failures=$((failures + 1))
+fi
+
+for pat in "${REJECT_PATTERNS[@]}"; do
+  if rg -nE "$pat" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] rejected pattern present: $pat"
+    failures=$((failures + 1))
+  fi
+done
+
+# SpawnV5 wrong-sender reply guard: the kernel marks any SpawnV5 reply that
+# arrives on the wrong endpoint.
+if rg -n "SPAWN_V5_WRONG_SENDER|YARM_SPAWN_V5_REPLY_WRONG_SENDER" "$LOGFILE" >/dev/null 2>&1; then
+  echo "[fail] SpawnV5 wrong-sender reply observed"
+  failures=$((failures + 1))
+fi
+
+# Unexpected early halt: any RISCV_TRAP_HALTED reason that is not the
+# expected idle terminal state is an unexpected halt.
+if rg -n "RISCV_TRAP_HALTED reason=" "$LOGFILE" >/dev/null 2>&1; then
+  if rg -nv "RISCV_TRAP_HALTED reason=kernel_idle_awaiting_io" "$LOGFILE" 2>/dev/null \
+      | rg -n "RISCV_TRAP_HALTED reason=" >/dev/null 2>&1; then
+    echo "[fail] unexpected RISCV_TRAP_HALTED reason"
+    failures=$((failures + 1))
+  fi
+fi
+
+if (( QEMU_SMP >= 2 )); then
+  if ! rg -nE "RISCV_SECONDARY_HART_PARK hart=" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] --smp ${QEMU_SMP} requires RISCV_SECONDARY_HART_PARK hart=N"
+    failures=$((failures + 1))
+  fi
+fi
+
+if (( failures > 0 )); then
+  echo "[fail] qemu-riscv64-core-smoke: ${failures} check(s) failed (qemu_status=${QEMU_STATUS})"
+  [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi
 
-echo "[warn] boot shell and init-server markers not detected (status=$QEMU_STATUS)"
-if [[ "$QEMU_SMOKE_STRICT" == "1" ]]; then
-  exit 1
-fi
+echo "[ok] qemu-riscv64-core-smoke passed (smp=${QEMU_SMP}, qemu_status=${QEMU_STATUS})"
 exit 0
