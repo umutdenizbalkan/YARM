@@ -45,14 +45,21 @@ _start:
     la t0, yarm_riscv64_early_trap_vector
     csrw stvec, t0
 
-    // Single-BSP selection: only the bootstrap hart (id 0) continues into
-    // kernel bootstrap. Any other hart that reaches the cold-boot entry must
-    // park in a safe loop BEFORE BSS use, allocator init, cmdline capture, or
-    // kernel bootstrap. (On QEMU virt + OpenSBI, secondaries normally wait in
-    // firmware for an HSM start, but this guard is defensive and correct even
-    // if a secondary arrives here.)
-    li t1, 0                        // BOOTSTRAP_CPU_ID
-    bne s0, t1, .Lriscv64_secondary_cold_park
+    // Boot-hart selection: per the SBI spec, OpenSBI starts only ONE hart at
+    // the kernel entry point. The hart that enters here IS the boot hart,
+    // regardless of its hart-id (OpenSBI may pick a nonzero hart on -smp N).
+    // Use a CAS-style guard so that if a stray hart ever arrives here a second
+    // time (defensive), the late arrival parks instead of corrupting boot
+    // state.
+    la t2, RISCV64_BOOT_HART_ARRIVAL
+    li t3, 1
+    amoswap.w.aq t1, t3, (t2)
+    bnez t1, .Lriscv64_secondary_cold_park
+
+    // First arrival wins boot-hart slot. Record the OpenSBI hart-id so the
+    // Rust side can read it later (park-secondaries, topology marker).
+    la t2, RISCV64_BOOT_HART_ID
+    sd s0, (t2)
 
     // Boot hart: hand the firmware registers to the Rust primary entry, which
     // emits the early boot markers and then calls the common kernel entry.
@@ -113,6 +120,63 @@ yarm_riscv64_secondary_entry:
     "#
 );
 
+/// Boot-hart arrival CAS slot, set to 1 by the first hart that enters
+/// `_start`. Lives in `.bss` so it is zero before any hart arrives.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[unsafe(no_mangle)]
+static mut RISCV64_BOOT_HART_ARRIVAL: u32 = 0;
+
+/// Boot-hart id captured from OpenSBI's `a0` on the boot hart's first
+/// entry into `_start`. Lives in `.bss`; the asm path writes this once
+/// before calling `yarm_riscv64_primary_entry`.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[unsafe(no_mangle)]
+static mut RISCV64_BOOT_HART_ID: u64 = 0;
+
+/// Returns the captured OpenSBI boot-hart id. Valid after the asm prologue
+/// of `_start` has run; before that returns 0.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn boot_hart_id() -> usize {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(RISCV64_BOOT_HART_ID)) as usize }
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
+pub fn boot_hart_id() -> usize {
+    0
+}
+
+/// UART line-lock to serialize multi-hart `console_putchar` SBI output.
+///
+/// `early_sbi_marker` writes one byte at a time via legacy SBI; concurrent
+/// emitters from boot hart + HSM-started secondaries interleave bytes and
+/// produce garbled markers. The lock is taken per-line and released after
+/// the trailing CRLF, so a hart that wins the lock writes a complete line
+/// atomically (from the reader's perspective). Lives in `.bss`, so it is
+/// safe to use before any allocator/bootstrap step.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static EARLY_MARKER_LOCK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn early_marker_lock_acquire() {
+    while EARLY_MARKER_LOCK
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn early_marker_lock_release() {
+    EARLY_MARKER_LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+
 /// Early, allocation-free, lock-free marker writer for the RISC-V boot path.
 ///
 /// Writes a formatted line straight to the SBI legacy console (a single
@@ -150,7 +214,11 @@ pub(crate) fn early_sbi_marker(args: core::fmt::Arguments<'_>) {
     };
     let _ = line.write_fmt(args);
     let text = core::str::from_utf8(&line.buf[..line.len]).unwrap_or("RISCV_EARLY_MARKER_UTF8_ERR");
+    // Take the per-line UART lock so concurrent emitters from the boot hart
+    // and HSM-started secondaries cannot interleave bytes mid-line.
+    early_marker_lock_acquire();
     crate::arch::riscv64::console::write_line(text);
+    early_marker_lock_release();
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -1464,7 +1532,10 @@ fn park_qemu_virt_secondaries_once(context: &str) {
 
     let entry_addr = (yarm_riscv64_secondary_entry as *const () as usize)
         .saturating_sub(crate::arch::platform_constants::KERNEL_LINK_VIRT_BASE as usize);
-    let boot_hart = crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize;
+    // Use the OpenSBI-reported boot-hart id captured in _start; the legacy
+    // BOOTSTRAP_CPU_ID constant was wrong for any nonzero boot hart.
+    let boot_hart = boot_hart_id();
+    let mut parked_count: usize = 0;
     for hart_id in 0..QEMU_VIRT_HSM_SECONDARY_HART_LIMIT {
         if hart_id == boot_hart {
             continue;
@@ -1474,6 +1545,9 @@ fn park_qemu_virt_secondaries_once(context: &str) {
         match crate::arch::riscv64::sbi::hsm_hart_start(hart_id, entry_addr, handoff_ptr) {
             Ok(()) => {
                 let acked = wait_for_secondary_ack(slot);
+                if acked {
+                    parked_count = parked_count.saturating_add(1);
+                }
                 crate::yarm_log!(
                     "YARM_RISCV64_SMP_HART_START hart={} ret=0 ack={} state=parked_not_online entry=0x{:x} handoff=0x{:x} context={}",
                     hart_id,
@@ -1488,6 +1562,7 @@ fn park_qemu_virt_secondaries_once(context: &str) {
             Err(_) => {}
         }
     }
+    early_marker!("RISCV_SECONDARY_HARTS_PARKED count={}", parked_count);
 }
 
 /// Parks the secondary harts early, before kernel bootstrap. Called from the
@@ -1700,6 +1775,9 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
         );
         return;
     };
+    // Discover and stage the present-hart bitmap so YARM_BOOT_OK reports the
+    // real OpenSBI topology, not the conservative single-hart fallback.
+    stage_riscv64_present_cpu_bitmap(dtb);
     let captured = crate::kernel::boot_command_line::set_raw_cmdline_from_bytes_monotonic(
         crate::arch::fdt::chosen_bootargs(dtb).unwrap_or(&[]),
     );
@@ -1720,6 +1798,35 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
     // allocators with MMIO addresses, producing a store access fault when the
     // first frame was written.
     stage_riscv64_boot_memory(dtb, start_info_ptr);
+}
+
+/// Discovers present harts from the FDT `/cpus` node, stages the bitmap
+/// for the scheduler, and emits the topology breadcrumbs the smoke gate
+/// pins. Online CPUs remain 1 (BSP-only) until RISC-V SMP scheduling
+/// lands; the breadcrumb explicitly records that.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn stage_riscv64_present_cpu_bitmap(dtb: &'static [u8]) {
+    let bitmap = crate::arch::riscv64::topology::discover_present_cpu_bitmap(dtb);
+    let _ = crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(bitmap);
+    let boot_hart = boot_hart_id();
+    let mut hart_id = 0u32;
+    let mut remaining = bitmap;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            early_marker!("RISCV_HART_PRESENT hart={}", hart_id);
+        }
+        remaining >>= 1;
+        hart_id += 1;
+    }
+    early_marker!(
+        "RISCV_HART_TOPOLOGY present_cpus={} present_bitmap=0x{:x} boot_hart={}",
+        bitmap.count_ones(),
+        bitmap,
+        boot_hart
+    );
+    crate::yarm_log!(
+        "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled"
+    );
 }
 
 /// Stages the real RAM window from the DTB and reserves the firmware, DTB, and

@@ -70,6 +70,8 @@ fi
 REQUIRED_PATTERNS=(
   "YARM_BOOT_OK"
   "RISCV_KERNEL_BOOT_OK"
+  "RISCV_BOOT_HART_SELECTED hart="
+  "RISCV_HART_TOPOLOGY present_cpus="
   "RISCV_LIVEEEEEEE"
   "RISCV_SYSCALL_ROUNDTRIP_OK"
   "RISCV_USER_RESUMED"
@@ -177,6 +179,40 @@ if (( QEMU_SMP >= 2 )); then
     echo "[fail] --smp ${QEMU_SMP} requires RISCV_SECONDARY_HART_PARK hart=N"
     failures=$((failures + 1))
   fi
+fi
+
+# Topology assertions: YARM must report present_cpus matching --smp N, and the
+# present_bitmap must be the contiguous 0..N-1 mask for QEMU virt. online_cpus
+# remains 1 until RISC-V SMP scheduling is implemented.
+expected_bitmap_hex=""
+case "$QEMU_SMP" in
+  1) expected_bitmap_hex="0x1" ;;
+  2) expected_bitmap_hex="0x3" ;;
+  3) expected_bitmap_hex="0x7" ;;
+  4) expected_bitmap_hex="0xf" ;;
+esac
+if [[ -n "$expected_bitmap_hex" ]]; then
+  if ! rg -n "YARM_BOOT_OK present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] YARM_BOOT_OK must report present_cpus=${QEMU_SMP} present_bitmap=${expected_bitmap_hex} online_cpus=1"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Boot hart must not be parked: the RISCV_BOOT_HART_SELECTED hart=N and the
+# RISCV_SECONDARY_HART_PARK hart=N lines must NOT share the same hart-id.
+boot_hart=$(rg -n "RISCV_BOOT_HART_SELECTED hart=" "$LOGFILE" 2>/dev/null \
+  | head -n1 | sed -E 's/.*hart=([0-9]+).*/\1/')
+if [[ -n "$boot_hart" ]]; then
+  if rg -n "RISCV_SECONDARY_HART_PARK hart=${boot_hart}\b" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] boot hart ${boot_hart} appears in RISCV_SECONDARY_HART_PARK list"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Scheduler-online breadcrumb: always required (RISC-V SMP scheduling is off).
+if ! rg -n "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled" "$LOGFILE" >/dev/null 2>&1; then
+  echo "[fail] RISCV_SCHEDULER_BSP_ONLY breadcrumb missing"
+  failures=$((failures + 1))
 fi
 
 if (( failures > 0 )); then
