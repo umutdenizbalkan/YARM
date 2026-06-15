@@ -271,10 +271,28 @@ extern "C" fn yarm_riscv64_early_trap_report(scause: usize, sepc: usize, stval: 
 // `sstatus` for U-mode (SPP=0, SPIE=0 — interrupts stay masked in user), loads
 // the user GPRs/sp/sepc, and `sret`s.
 //
-// `yarm_riscv64_trap_vector` is the S-mode trap entry. It swaps to the kernel
-// trap stack via `sscratch`, snapshots the trap CSRs and the syscall number,
-// and hands off to the Rust reporter. It lives in kernel text (covered by the
-// gigapage) so it is reachable with a user `satp` active.
+// `yarm_riscv64_trap_vector` is the S-mode trap entry. On entry sp is the user
+// sp; we swap it with the kernel trap stack stored in sscratch, then push a
+// full `RiscvTrapFrame` (all 31 GPRs except x0, plus user_sp/sepc/sstatus/
+// scause/stval). The frame pointer is passed to the Rust bridge which builds
+// the generic TrapFrame, dispatches via the existing handle_trap_entry path,
+// then writes return values into the frame. The asm tail
+// `yarm_riscv64_trap_return` restores all GPRs from the frame, rewrites
+// sscratch with the (possibly updated) user sp, and `sret`s.
+//
+// Frame offsets (in bytes) - 38 u64 slots = 304 bytes, 16-byte aligned:
+//   0..=7   user x1 (ra)
+//   8..=15  user x2 (sp at trap entry, BEFORE sscratch swap)
+//   16..=23 user x3 (gp)
+//   ...
+//   240..   user x31
+//   248..   sepc
+//   256..   sstatus
+//   264..   scause
+//   272..   stval
+//   280..   reserved
+//   288..   reserved
+//   296..   reserved
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 core::arch::global_asm!(
     r#"
@@ -294,9 +312,7 @@ yarm_riscv64_enter_user:
     // sstatus: clear SPP (bit 8) -> return to U-mode after sret; clear SPIE
     // (bit 5) so interrupts stay disabled in U-mode (we have no timer/IRQ
     // path yet); set SUM (bit 18) so the kernel can still touch U-pages from
-    // S-mode for trap bookkeeping if/when we resume there. We use csrrc/csrrs
-    // (atomic clear/set with mask), the canonical way to flip individual
-    // status bits without read-modify-write hazards.
+    // S-mode for trap bookkeeping if/when we resume there.
     li t5, 0x120              // SPP | SPIE
     csrc sstatus, t5
     li t5, 0x40000            // SUM
@@ -321,21 +337,140 @@ yarm_riscv64_enter_user:
 yarm_riscv64_trap_vector:
     // Entered on a trap. sp is the user sp; swap in the kernel trap stack.
     csrrw sp, sscratch, sp     // sp = kernel trap stack; sscratch = user sp
-    addi sp, sp, -64
-    sd ra, 0(sp)
-    sd a7, 8(sp)               // user a7 (syscall number)
-    csrr a0, scause
-    csrr a1, sepc
-    csrr a2, stval
-    ld a3, 8(sp)               // a7
-    csrr a4, sstatus
-    csrr a5, sscratch          // user sp at trap time
-    call yarm_riscv64_user_trap_report
-1:
-    wfi
-    j 1b
+    // Reserve 304 bytes (38 * 8) for the RiscvTrapFrame, 16-byte aligned.
+    addi sp, sp, -304
+    // Save GPRs x1, x3..x31 at their natural offsets (x0 omitted).
+    sd x1,   0(sp)             // ra
+    // x2 (user sp) is in sscratch right now; we'll write it later.
+    sd x3,  16(sp)             // gp
+    sd x4,  24(sp)             // tp
+    sd x5,  32(sp)             // t0
+    sd x6,  40(sp)             // t1
+    sd x7,  48(sp)             // t2
+    sd x8,  56(sp)             // s0/fp
+    sd x9,  64(sp)             // s1
+    sd x10, 72(sp)             // a0
+    sd x11, 80(sp)             // a1
+    sd x12, 88(sp)             // a2
+    sd x13, 96(sp)             // a3
+    sd x14, 104(sp)            // a4
+    sd x15, 112(sp)            // a5
+    sd x16, 120(sp)            // a6
+    sd x17, 128(sp)            // a7  (syscall number)
+    sd x18, 136(sp)            // s2
+    sd x19, 144(sp)            // s3
+    sd x20, 152(sp)            // s4
+    sd x21, 160(sp)            // s5
+    sd x22, 168(sp)            // s6
+    sd x23, 176(sp)            // s7
+    sd x24, 184(sp)            // s8
+    sd x25, 192(sp)            // s9
+    sd x26, 200(sp)            // s10
+    sd x27, 208(sp)            // s11
+    sd x28, 216(sp)            // t3
+    sd x29, 224(sp)            // t4
+    sd x30, 232(sp)            // t5
+    sd x31, 240(sp)            // t6
+    // Save user x2 (sp) — currently in sscratch.
+    csrr t0, sscratch
+    sd t0, 8(sp)
+    // Capture CSRs into the frame.
+    csrr t0, sepc
+    sd t0, 248(sp)
+    csrr t0, sstatus
+    sd t0, 256(sp)
+    csrr t0, scause
+    sd t0, 264(sp)
+    csrr t0, stval
+    sd t0, 272(sp)
+    // Re-point sscratch at the kernel trap stack top so a nested trap (if any)
+    // does not corrupt this frame. The top is the *original* trap stack top,
+    // which equals (sp + 304) at this point.
+    addi t0, sp, 304
+    csrw sscratch, t0
+    // Call the Rust bridge with a0 = pointer to the saved frame.
+    mv a0, sp
+    call yarm_riscv64_trap_bridge
+    // Fall through to the restore/sret tail.
+
+    .global yarm_riscv64_trap_return
+    .type yarm_riscv64_trap_return, @function
+yarm_riscv64_trap_return:
+    // a0 = *const RiscvTrapFrame (== sp on the fall-through path).
+    // Restore CSRs first.
+    ld t0, 248(a0)
+    csrw sepc, t0
+    ld t0, 256(a0)
+    csrw sstatus, t0
+    // Save user sp into sscratch so the next trap can swap it in.
+    ld t0, 8(a0)
+    csrw sscratch, t0
+    // Restore GPRs from the frame.
+    ld x1,   0(a0)
+    ld x3,  16(a0)
+    ld x4,  24(a0)
+    ld x5,  32(a0)
+    ld x6,  40(a0)
+    ld x7,  48(a0)
+    ld x8,  56(a0)
+    ld x9,  64(a0)
+    // x10 (a0) restored last so we can keep using the pointer.
+    ld x11, 80(a0)
+    ld x12, 88(a0)
+    ld x13, 96(a0)
+    ld x14, 104(a0)
+    ld x15, 112(a0)
+    ld x16, 120(a0)
+    ld x17, 128(a0)
+    ld x18, 136(a0)
+    ld x19, 144(a0)
+    ld x20, 152(a0)
+    ld x21, 160(a0)
+    ld x22, 168(a0)
+    ld x23, 176(a0)
+    ld x24, 184(a0)
+    ld x25, 192(a0)
+    ld x26, 200(a0)
+    ld x27, 208(a0)
+    ld x28, 216(a0)
+    ld x29, 224(a0)
+    ld x30, 232(a0)
+    ld x31, 240(a0)
+    // Swap sp <-> sscratch: sp gets the user sp, sscratch gets the kernel trap
+    // stack top (saved during the entry tail).
+    csrrw sp, sscratch, sp
+    // Finally restore a0.
+    ld a0, 72(a0)
+    sret
 "#
 );
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+#[repr(C, align(16))]
+pub(crate) struct RiscvTrapFrame {
+    pub(crate) regs: [u64; 31],     // x1..x31 (x0 omitted) at offsets 0..=240
+    pub(crate) sepc: u64,           // 248
+    pub(crate) sstatus: u64,        // 256
+    pub(crate) scause: u64,         // 264
+    pub(crate) stval: u64,          // 272
+    pub(crate) _reserved: [u64; 3], // 280, 288, 296
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+impl RiscvTrapFrame {
+    // Register-index helpers (xN -> regs[N-1]).
+    pub(crate) const RA: usize = 0; // x1
+    pub(crate) const SP: usize = 1; // x2
+    pub(crate) const GP: usize = 2; // x3
+    pub(crate) const TP: usize = 3; // x4
+    pub(crate) const A0: usize = 9; // x10
+    pub(crate) const A1: usize = 10; // x11
+    pub(crate) const A2: usize = 11; // x12
+    pub(crate) const A3: usize = 12; // x13
+    pub(crate) const A4: usize = 13; // x14
+    pub(crate) const A5: usize = 14; // x15
+    pub(crate) const A7: usize = 16; // x17
+}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 #[repr(C)]
@@ -356,8 +491,43 @@ struct RiscvEnterUserCtx {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 unsafe extern "C" {
     fn yarm_riscv64_enter_user(ctx: *const RiscvEnterUserCtx) -> !;
+    fn yarm_riscv64_trap_return(frame: *const RiscvTrapFrame) -> !;
     static yarm_riscv64_trap_vector: u8;
 }
+
+/// Trap-time kernel-state pointer, installed by `run_with_prepared_kernel`
+/// after `Bootstrap::init_static` has returned the &'static mut KernelState.
+/// The Rust trap bridge loads this to dispatch through the existing
+/// `handle_trap_entry` path. Null until installed; once set the pointer
+/// outlives all traps because BOOTSTRAP_KERNEL_STATE lives in .bss for the
+/// life of the kernel.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV_TRAP_KERNEL_STATE_PTR: core::sync::atomic::AtomicPtr<
+    crate::kernel::boot::KernelState,
+> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub(crate) fn install_riscv_trap_kernel_state(kernel: &mut crate::kernel::boot::KernelState) {
+    RISCV_TRAP_KERNEL_STATE_PTR.store(kernel as *mut _, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn trap_kernel_state_mut() -> Option<&'static mut crate::kernel::boot::KernelState> {
+    let ptr = RISCV_TRAP_KERNEL_STATE_PTR.load(core::sync::atomic::Ordering::SeqCst);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *ptr })
+    }
+}
+
+/// Set once we have observed at least one successful round-trip
+/// (handle -> restore -> sret -> RISCV_USER_RESUMED). After that the
+/// RISCV_LIVEEEEEEE marker is emitted and further round-trips drop to a
+/// concise "RISCV_SYSCALL_ROUNDTRIP_OK" so the log stays readable.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static RISCV_FIRST_ROUNDTRIP_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 #[repr(align(16))]
@@ -371,55 +541,301 @@ fn riscv_trap_stack_top() -> u64 {
     (base + (16 * 1024)) & !0xf
 }
 
-/// S-mode trap reporter for U-mode traps. For this bring-up stage it is a
-/// black-box recorder: it captures the trap CSRs and the syscall number, emits
-/// the required markers, and halts deterministically. (The full handle +
-/// `sret` round-trip is the next stage.)
+/// S-mode trap bridge. Builds a generic `TrapFrame` from the saved RISC-V
+/// register frame, dispatches through the existing
+/// `crate::arch::riscv64::trap::handle_trap_entry` Rust path (which decodes
+/// the trap event, advances sepc by +4 on user ecalls, runs the syscall
+/// dispatcher, and reapplies the resumed thread's `UserRegisterContext`),
+/// writes the syscall return values back into the saved frame, then tail-calls
+/// the asm restore/sret tail. The bridge is `-> !` because the asm tail does
+/// not return.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 #[unsafe(no_mangle)]
-extern "C" fn yarm_riscv64_user_trap_report(
-    scause: usize,
-    sepc: usize,
-    stval: usize,
-    a7: usize,
-    sstatus: usize,
-    user_sp: usize,
-) -> ! {
+extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     const EXC_USER_ECALL: usize = 8;
-    // sstatus.SPP (bit 8): 0 = trap was taken from U-mode (sret really
-    // returned to U), 1 = trap was taken from S-mode (sret never reached U).
-    let spp = (sstatus >> 8) & 1;
-    let trap_from_u = spp == 0;
-    early_marker!(
-        "RISCV_TRAP_ENTER scause=0x{:x} sepc=0x{:x} stval=0x{:x} sstatus=0x{:x} spp={} from_u={} user_sp=0x{:x}",
-        scause,
-        sepc,
-        stval,
-        sstatus,
-        spp,
-        trap_from_u as u8,
-        user_sp
-    );
-    early_marker!(
-        "RISCV_FIRST_USER_TRAP scause=0x{:x} sepc=0x{:x} stval=0x{:x}",
-        scause,
-        sepc,
-        stval
-    );
-    if scause == EXC_USER_ECALL {
-        early_marker!("RISCV_FIRST_USER_SYSCALL nr={}", a7);
-        early_marker!("RISCV_TRAP_HALTED reason=first_user_syscall_captured");
-    } else if trap_from_u {
+    let frame = unsafe { &mut *frame_ptr };
+    let scause = frame.scause as usize;
+    let sepc = frame.sepc as usize;
+    let stval = frame.stval as usize;
+    let sstatus = frame.sstatus as usize;
+    let user_sp = frame.regs[RiscvTrapFrame::SP] as usize;
+    let from_u = (sstatus >> 8) & 1 == 0;
+
+    let first_trap = !RISCV_FIRST_ROUNDTRIP_LOGGED.load(core::sync::atomic::Ordering::Acquire);
+    if first_trap {
         early_marker!(
-            "RISCV_TRAP_HALTED reason=first_user_trap_captured_from_u scause=0x{:x}",
-            scause
+            "RISCV_TRAP_ENTER scause=0x{:x} sepc=0x{:x} stval=0x{:x} sstatus=0x{:x} spp={} from_u={} user_sp=0x{:x}",
+            scause,
+            sepc,
+            stval,
+            sstatus,
+            (sstatus >> 8) & 1,
+            from_u as u8,
+            user_sp
         );
-    } else {
         early_marker!(
-            "RISCV_TRAP_HALTED reason=sret_failed_or_kernel_fault scause=0x{:x}",
-            scause
+            "RISCV_FIRST_USER_TRAP scause=0x{:x} sepc=0x{:x} stval=0x{:x}",
+            scause,
+            sepc,
+            stval
         );
     }
+
+    let Some(kernel) = trap_kernel_state_mut() else {
+        early_marker!("RISCV_TRAP_HANDLE_FAILED reason=no_trap_kernel_state");
+        riscv_trap_halt("no_trap_kernel_state");
+    };
+    let cpu = kernel.current_cpu();
+    let entering_tid = kernel.current_tid().unwrap_or(0);
+
+    // ── Phase: SAVE_DONE ────────────────────────────────────────────────
+    if first_trap {
+        early_marker!(
+            "RISCV_TRAP_SAVE_BEGIN tid={} scause=0x{:x} sepc=0x{:x} stval=0x{:x}",
+            entering_tid,
+            scause,
+            sepc,
+            stval
+        );
+        early_marker!(
+            "RISCV_TRAP_SAVE_DONE tid={} scause=0x{:x} sepc=0x{:x} stval=0x{:x}",
+            entering_tid,
+            scause,
+            sepc,
+            stval
+        );
+    }
+
+    if !from_u {
+        // The trap was taken from S-mode — kernel fault. We have no fallback
+        // path; report and halt with the named step so the user sees the
+        // exact failure point rather than a silent loop.
+        early_marker!(
+            "RISCV_TRAP_UNHANDLED scause=0x{:x} sepc=0x{:x} stval=0x{:x} sstatus=0x{:x} reason=trap_from_s_mode",
+            scause,
+            sepc,
+            stval,
+            sstatus
+        );
+        riscv_trap_halt("trap_from_s_mode");
+    }
+
+    // Build the generic TrapFrame from the saved register file.
+    let mut tframe = crate::kernel::trapframe::TrapFrame::zeroed();
+    // For ecall we pre-advance saved_pc by 4 so the TCB snapshot taken inside
+    // `dispatch_syscall -> sync_current_thread_from_frame` captures the
+    // post-ecall PC. handle_trap_entry's own +4 (applied after sync) is then
+    // a no-op when followed by restore_arch_thread_state's apply_user_context
+    // (which re-loads PC from the just-saved TCB context). Without this the
+    // resumed user PC would land back on the same ecall and loop forever.
+    let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };
+    tframe.set_saved_pc(sepc + advance);
+    tframe.set_saved_sp(user_sp);
+    // user_gprs[i] mirrors xN where i = N (slot 0 = x0 = 0).
+    tframe.set_user_gpr(0, 0); // x0
+    for n in 1..32usize {
+        tframe.set_user_gpr(n, frame.regs[n - 1] as usize);
+    }
+    // RISC-V Linux-style syscall ABI: a7 = syscall number, a0..a5 = args.
+    if scause == EXC_USER_ECALL {
+        tframe.set_syscall_num(frame.regs[RiscvTrapFrame::A7] as usize);
+        tframe.set_arg(0, frame.regs[RiscvTrapFrame::A0] as usize);
+        tframe.set_arg(1, frame.regs[RiscvTrapFrame::A1] as usize);
+        tframe.set_arg(2, frame.regs[RiscvTrapFrame::A2] as usize);
+        tframe.set_arg(3, frame.regs[RiscvTrapFrame::A3] as usize);
+        tframe.set_arg(4, frame.regs[RiscvTrapFrame::A4] as usize);
+        tframe.set_arg(5, frame.regs[RiscvTrapFrame::A5] as usize);
+        if first_trap {
+            early_marker!("RISCV_FIRST_USER_SYSCALL nr={}", tframe.syscall_num());
+            early_marker!(
+                "RISCV_SYSCALL_DECODE nr={} a0=0x{:x} a1=0x{:x} a2=0x{:x} a3=0x{:x} a4=0x{:x} a5=0x{:x}",
+                tframe.syscall_num(),
+                tframe.arg(0),
+                tframe.arg(1),
+                tframe.arg(2),
+                tframe.arg(3),
+                tframe.arg(4),
+                tframe.arg(5)
+            );
+            early_marker!(
+                "RISCV_TRAP_HANDLE_BEGIN tid={} nr={}",
+                entering_tid,
+                tframe.syscall_num()
+            );
+        }
+    }
+
+    // For ecall the pre-advanced PC (sepc+4) is what gets snapshotted into the
+    // TCB by `dispatch_syscall -> sync_current_thread_from_frame`. The generic
+    // handler then applies its own +4 to tframe.saved_pc, but
+    // `restore_arch_thread_state -> apply_user_context` immediately reloads
+    // saved_pc from the TCB, so the net resumed PC is sepc+4 exactly once.
+    let ctx = crate::arch::riscv64::trap::Riscv64TrapContext { scause, stval };
+    let handle_result =
+        crate::arch::riscv64::trap::handle_trap_entry(kernel, cpu, ctx, Some(&mut tframe));
+
+    if let Err(err) = handle_result {
+        // The generic restore_arch_thread_state returns Err(Internal) when
+        // there is no runnable user task to resume (all services blocked on
+        // IPC recv, init parked). For an event-driven microkernel awaiting
+        // I/O this is the correct terminal state — wfi here instead of
+        // treating it as a fatal trap.
+        let next_tid = kernel.current_tid().unwrap_or(0);
+        if next_tid == 0 {
+            crate::yarm_log!(
+                "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
+            );
+            riscv_trap_halt("kernel_idle_awaiting_io");
+        }
+        early_marker!(
+            "RISCV_TRAP_HANDLE_FAILED reason=handle_trap_entry_err err={:?}",
+            err
+        );
+        riscv_trap_halt("handle_trap_entry_err");
+    }
+
+    if first_trap && scause == EXC_USER_ECALL {
+        early_marker!(
+            "RISCV_TRAP_HANDLE_DONE status=ok ret0=0x{:x} ret1=0x{:x} ret2=0x{:x} err=0x{:x}",
+            tframe.ret0(),
+            tframe.ret1(),
+            tframe.ret2(),
+            tframe.error_code().unwrap_or(0)
+        );
+    }
+
+    // Write back: handle_trap_entry has already applied the resumed thread's
+    // UserRegisterContext to the frame (PC/SP/args/user_gprs). Resolve task
+    // switch first so we know whether to source registers from the syscall
+    // return path (same task) or from the resumed task's saved
+    // `UserRegisterContext.args` (different task; first-run on fresh spawn or
+    // resume after IPC block).
+    let resume_tid = kernel.current_tid().unwrap_or(entering_tid);
+    let task_switched = resume_tid != entering_tid;
+
+    // PC/SP always come from the (possibly task-switched) generic frame.
+    frame.sepc = tframe.saved_pc() as u64;
+    frame.regs[RiscvTrapFrame::SP] = tframe.saved_sp() as u64;
+
+    // Mirror non-SP, non-ABI integer GPRs from the generic frame so non-ABI
+    // registers are restored from the resumed task's saved context. SP comes
+    // from `saved_sp` (above) and the A0..A5/A7 lanes are written below
+    // depending on switch/syscall semantics — including them in this mirror
+    // would clobber the canonical SP with the fresh-spawn user_gprs[2]==0 and
+    // overwrite the ABI args/returns with stale user_gpr values.
+    for n in 1..32usize {
+        let i = n - 1;
+        if i == RiscvTrapFrame::SP
+            || i == RiscvTrapFrame::A0
+            || i == RiscvTrapFrame::A1
+            || i == RiscvTrapFrame::A2
+            || i == RiscvTrapFrame::A3
+            || i == RiscvTrapFrame::A4
+            || i == RiscvTrapFrame::A5
+            || i == RiscvTrapFrame::A7
+        {
+            continue;
+        }
+        frame.regs[i] = tframe.user_gpr(n) as usize as u64;
+    }
+
+    if task_switched {
+        // First instruction the resumed task will execute consumes the YARM
+        // startup ABI in a0..a5. UserRegisterContext stores those in
+        // `args[0..5]` (apply_user_context copied them into `tframe.args`).
+        // The freshly-spawned task's `user_gprs` are still all-zero, so
+        // mirroring those would clobber the startup args — write args[]
+        // directly into a0..a5.
+        frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;
+        frame.regs[RiscvTrapFrame::A1] = tframe.arg(1) as u64;
+        frame.regs[RiscvTrapFrame::A2] = tframe.arg(2) as u64;
+        frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
+        frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;
+        frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
+        // a7 holds the syscall-number lane on RISC-V; on first run it can
+        // remain whatever the user code expects (0 for a freshly-zeroed
+        // context is fine — task hasn't issued any ecall yet).
+        frame.regs[RiscvTrapFrame::A7] = 0;
+    } else if scause == EXC_USER_ECALL {
+        // Same task continuing past its own ecall: YARM ABI returns
+        // a0=ret0, a1=ret1, a2=ret2, a3=error (mirrors AArch64).
+        if let Some(err) = tframe.error_code() {
+            frame.regs[RiscvTrapFrame::A0] = err as u64;
+            frame.regs[RiscvTrapFrame::A1] = 0;
+            frame.regs[RiscvTrapFrame::A2] = 0;
+            frame.regs[RiscvTrapFrame::A3] = err as u64;
+        } else {
+            frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
+            frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
+            frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
+            frame.regs[RiscvTrapFrame::A3] = 0;
+        }
+        // a4, a5, a7 keep their user-side values from the saved frame at
+        // trap time (they're caller-saved temps in the RISC-V ABI but YARM
+        // userspace may rely on a7 staying as the syscall nr until next call).
+        // The asm save preserved them and the mirror loop skipped them.
+        frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+        frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+        frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+    } else {
+        // Non-syscall trap, same task continuing — preserve all user a-regs
+        // exactly as the trap captured them.
+        frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;
+        frame.regs[RiscvTrapFrame::A1] = tframe.user_gpr(11) as u64;
+        frame.regs[RiscvTrapFrame::A2] = tframe.user_gpr(12) as u64;
+        frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
+        frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+        frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+        frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+    }
+
+    // The active satp may have changed if dispatch_next_task picked a
+    // different task — switch_address_space currently defers on RISC-V
+    // (see hal_adapters.rs) so the satp installed at enter-user is still
+    // live. Activate the new task's satp here explicitly so the sret lands
+    // in the right user page table.
+    if let Some(asid) = kernel.task_asid(resume_tid) {
+        // Make sure the kernel-shared gigapage is present in the resumed
+        // task's page table. Idempotent for asids that already have it.
+        let _ = crate::arch::riscv64::page_table::map_kernel_shared_into_asid(asid);
+        if let Some(satp) = crate::arch::riscv64::page_table::cr3_for_asid(asid) {
+            crate::arch::riscv64::page_table::write_satp(satp);
+        }
+    }
+
+    let pc_final = frame.sepc;
+    let sp_final = frame.regs[RiscvTrapFrame::SP];
+    if first_trap {
+        early_marker!("RISCV_TRAP_RESTORE_BEGIN tid={}", resume_tid);
+        early_marker!(
+            "RISCV_TRAP_RETURN_SRET tid={} pc=0x{:x} sp=0x{:x}",
+            resume_tid,
+            pc_final,
+            sp_final
+        );
+        if RISCV_FIRST_ROUNDTRIP_LOGGED
+            .compare_exchange(
+                false,
+                true,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            // Per the task brief: emit this banner when the round-trip is
+            // about to perform a real sret back to U-mode.
+            crate::arch::riscv64::console::write_line("RISCV_LIVEEEEEEE");
+            early_marker!("RISCV_SYSCALL_ROUNDTRIP_OK nr={}", tframe.syscall_num());
+            early_marker!("RISCV_USER_RESUMED tid={} pc=0x{:x}", resume_tid, pc_final);
+        }
+    }
+
+    unsafe { yarm_riscv64_trap_return(frame_ptr) }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn riscv_trap_halt(reason: &'static str) -> ! {
+    early_marker!("RISCV_TRAP_HALTED reason={}", reason);
     loop {
         unsafe {
             core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
@@ -1219,6 +1635,11 @@ pub fn run_with_prepared_kernel(run: fn(&mut crate::kernel::boot::KernelState)) 
     // KernelState out of the 1 MiB page-table frame pool and OOM (silent
     // panic-loop); init_static avoids the heap entirely.
     let kernel = crate::kernel::boot::Bootstrap::init_static().expect("kernel init");
+    // Install the kernel-state pointer for the S-mode trap bridge before any
+    // user task runs. The trap bridge needs &mut KernelState to dispatch
+    // through handle_trap_entry; init_static returned a &'static mut, so the
+    // pointer remains valid for the life of the kernel.
+    install_riscv_trap_kernel_state(kernel);
     crate::yarm_log!(
         "YARM_BOOT_OK present_cpus={} present_bitmap=0x{:x} online_cpus={}",
         kernel.present_cpu_count(),
