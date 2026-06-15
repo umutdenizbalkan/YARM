@@ -7433,7 +7433,7 @@ second call.
 | `src/kernel/boot/tests.rs` | 10 new Stage 20 tests |
 | `doc/KERNEL_LOCKING.md` | §37.8 Stage 19 acceptance (consolidated); §38 (this section) |
 | `doc/KERNEL_TEST_RULES.md` | Rule N+27 (Stage 20 test rules) |
-| `doc/CAPABILITY_DOMAIN_RULES.md` | IPC cap-transfer lifetime rules |
+| `doc/CAPABILITY_MODEL.md` | IPC cap-transfer lifetime rules |
 
 ### 38.9 Stage 20 acceptance
 
@@ -11510,7 +11510,7 @@ recv_shared_v3 primitives now available.
 No new kernel code was added. All changes are:
 - `src/kernel/boot/tests.rs` — `mod stage63` (8 proof tests)
 - `crates/yarm-user-rt/src/syscall/recv_v3.rs` — 4 stage63 adoption tests
-- `doc/VFS_SHARED_IO_CONTRACT.md` — Stage 64 readiness audit
+- `doc/VFS.md` — Stage 64 readiness audit (see VFS shared-I/O section)
 
 ### 70.2 Plain-receive output field invariants
 
@@ -11534,7 +11534,7 @@ These are complementary to stage61_62 invariants (map_intent=1 path).
 | READ_SHARED_REPLY | Blocked — requires MAP_WRITE which is gated |
 | Process-exit/timeout/cancel signals | Blocked |
 
-VFS_SHARED_IO_ENABLED remains disabled. Full rationale in doc/VFS_SHARED_IO_CONTRACT.md §Stage 64.
+VFS_SHARED_IO_ENABLED remains disabled. Full rationale in doc/VFS.md (Stage 64 shared-I/O readiness).
 
 ### 70.4 Invariants preserved
 

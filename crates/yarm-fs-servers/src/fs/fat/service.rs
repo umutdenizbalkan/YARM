@@ -624,7 +624,9 @@ mod tests {
 
     #[test]
     fn fat_server_contract_docs_match_startup_backend_behavior() {
-        let doc = include_str!("../../../../../doc/FAT_SERVER_CONTRACT.md");
+        // Pass 4 (2026-06-15): FAT server contract migrated into the
+        // consolidated doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md §5 + §11.
+        let doc = include_str!("../../../../../doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md");
         assert!(doc.contains("service_extra_cap_0"));
         assert!(doc.contains("/mnt/fat"));
         assert!(doc.contains("device id"));

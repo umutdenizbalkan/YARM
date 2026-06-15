@@ -5,7 +5,10 @@
 set -euo pipefail
 
 BOUNDARY_DOC=${BOUNDARY_DOC:-doc/MICROKERNEL_BOUNDARY.md}
-KERNEL_STATUS_DOC=${KERNEL_STATUS_DOC:-doc/KERNEL_STATUS.md}
+# Pass 4 (2026-06-15): KERNEL_STATUS.md was consolidated into
+# doc/PHASE_GATES.md §1; the literal "PR-BND-6 pass C landed" string is
+# preserved verbatim there.
+KERNEL_STATUS_DOC=${KERNEL_STATUS_DOC:-doc/PHASE_GATES.md}
 
 if [[ ! -f "$BOUNDARY_DOC" ]]; then
   echo "[fail] boundary milestone document missing: $BOUNDARY_DOC"

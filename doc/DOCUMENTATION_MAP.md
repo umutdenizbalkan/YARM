@@ -20,12 +20,13 @@ fragment files unless the canonical owner explicitly does not exist.
 | Architecture — x86_64 | **`doc/ARCH_X86_64.md`** |
 | Architecture — RISC-V64 | **`doc/ARCH_RISCV64.md`** |
 | RPi5 bring-up | **`doc/RPI5_BRINGUP.md`** |
-| IPC (send/recv, shared-memory fastpath, fragmentation, throughput) | `doc/IPC.md` (to be consolidated; see TODO §3) |
-| VFS (request loop, shared-I/O contract, mapper requirements) | `doc/VFS.md` (to be consolidated; see TODO §3) |
-| Filesystem and storage (RAMFS/initramfs/devfs/FAT/ext4 + block) | `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md` (to be consolidated; see TODO §3) |
-| Networking (netmgr/DHCP/DNS/TCPIP/socket/virtio-net) | `doc/NETWORKING.md` (to be consolidated; see TODO §3) |
-| Capabilities (rights, domains, cspace access) | `doc/CAPABILITY_MODEL.md` (to be consolidated; see TODO §3) |
-| Process / spawn (PM contract, TID allocation, control plane) | `doc/PROCESS_AND_SPAWN.md` (to be consolidated; see TODO §3) |
+| IPC (send/recv, shared-memory fastpath, fragmentation, throughput) | **`doc/IPC.md`** |
+| VFS (request loop, shared-I/O contract, mapper requirements, Proc/VFS codec freeze) | **`doc/VFS.md`** |
+| Filesystem and storage (RAMFS/initramfs/devfs/FAT/ext4 + block + smoke tokens) | **`doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md`** |
+| Networking (netmgr/DHCP/DNS/TCPIP/socket/virtio-net) | **`doc/NETWORKING.md`** |
+| Capabilities (rights, domains, cspace access, lock-rank/two-phase/transfer rules) | **`doc/CAPABILITY_MODEL.md`** |
+| Process / spawn (PM contract, TID allocation, init server boot, startup slots, control plane) | **`doc/PROCESS_AND_SPAWN.md`** |
+| Phase gates (Phase 2/3/4 contracts, server roadmap, kernel-status milestones, phase readiness matrix) | **`doc/PHASE_GATES.md`** |
 | Service manifest format | `doc/SERVICE_MANIFEST.md` |
 | Project history (closed phases / milestones / checklists) | **`doc/PROJECT_HISTORY.md`** |
 | Roadmap (current direction) | `doc/ROADMAP.md` |
@@ -65,11 +66,11 @@ The canonical-owner expectations above are pinned by source-grep tests:
   `"This scaffold does not install TTBR1"` and
   `"only then install a user root in TTBR0"` verbatim — do not reflow.
 
-## Outstanding consolidation TODOs
+## Consolidation passes
 
-The primary kernel-unlocking consolidation landed in this pass. The
-secondary clusters listed below remain open and should be tackled one
-cluster at a time:
+The primary kernel-unlocking consolidation landed in Pass 1. The
+secondary clusters all landed in Passes 2–4; this section is a
+historical log.
 
 ### TODO §1 — Project history / status — DONE (Pass 3)
 
@@ -87,26 +88,21 @@ Deleted in the same pass: `P2_8_P2_9_CHECKLIST.md`, `P2_10_CHECKLIST.md`,
 `SERVER_RUNTIME_REFACTOR_STATUS.md`, `USERSPACE_SERVER_MATURITY.md`,
 `USERSPACE_SERVER_BINARIES.md`.
 
-**Deferred to Pass 4** (live CI gate scripts pin specific file names
-and content; deletion would break gate checks):
+**Pass 4 (2026-06-15) folded the six deferred CI-gated files into
+`doc/PHASE_GATES.md`** and updated the gate scripts in the same pass:
 
-- `doc/KERNEL_STATUS.md` — `scripts/check-boundary-milestone-freeze.sh`
-  requires the literal `PR-BND-6 pass C landed` string in this file.
-- `doc/SERVER_ROADMAP.md` — `scripts/check-roadmap-readiness.sh`
-  enforces frozen-section + dated-addenda + gate-wiring text in this
-  file.
-- `doc/PHASE_READINESS_MATRIX.md` — `scripts/check-roadmap-readiness.sh`
-  enforces specific CI-token strings (`phase2-driver-gates`,
+- `doc/KERNEL_STATUS.md` → §1 of `doc/PHASE_GATES.md` (literal
+  `PR-BND-6 pass C landed` preserved verbatim);
+  `scripts/check-boundary-milestone-freeze.sh` now reads `doc/PHASE_GATES.md`.
+- `doc/SERVER_ROADMAP.md` → §2 of `doc/PHASE_GATES.md` (frozen-section
+  heading + dated addenda preserved verbatim);
+  `scripts/check-roadmap-readiness.sh` now reads `doc/PHASE_GATES.md`.
+- `doc/PHASE_READINESS_MATRIX.md` → §3 of `doc/PHASE_GATES.md`
+  (all five CI tokens preserved verbatim: `phase2-driver-gates`,
   `phase3-network-gates`, `phase4-ui-gates`, `phase4-ui-smoke-marker`,
   `phase5-boundary-gates`).
 - `doc/PHASE2_DRIVER_CONTRACT.md`, `doc/PHASE3_NETWORK_CONTRACT.md`,
-  `doc/PHASE4_UI_CONTRACT.md` — `scripts/check-roadmap-readiness.sh`
-  requires the files to exist as the phase contracts.
-
-These six files will be consolidated alongside the IPC / VFS / FS /
-networking / capability / process clusters in Pass 4, where the same PR
-can update the gate scripts to point at the new canonical owners
-(`doc/STATUS.md` + per-domain contract docs).
+  `doc/PHASE4_UI_CONTRACT.md` → §4/§5/§6 of `doc/PHASE_GATES.md`.
 
 ### TODO §2 — Boot / architecture — DONE (Pass 2)
 
@@ -124,45 +120,48 @@ Deleted in the same pass: `BOOT_COMMAND_LINE.md`, `BOOT_MEMORY_LAYOUT.md`,
 `aarch64-ipc-bootstrap-notes.md`, `x86_64_boot_path.md`,
 `RISCV64_SMP_SECONDARY_RELEASE_AUDIT.md`, `rpi5-stage1.md`.
 
-### TODO §3 — IPC / VFS / FS / networking / capability / process
+### TODO §3 — IPC / VFS / FS / networking / capability / process — DONE (Pass 4)
 
-Each cluster is a multi-file merge that needs careful preservation of live
-ABI offsets. Suggested PR sequence:
+Pass 4 (2026-06-15) consolidated all six clusters into the seven
+canonical owners marked **bold** in the table above. Source-grep
+`include_str!` tests in
+`crates/yarm-fs-servers/src/fs/ramfs/service.rs` and
+`crates/yarm-fs-servers/src/fs/fat/service.rs` were repointed at
+`doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md`. CI gate scripts
+(`check-roadmap-readiness.sh`, `check-boundary-milestone-freeze.sh`,
+`check-contract-doc-enforcement.sh`, `check-proc-vfs-codec-freeze.sh`,
+`phase7-shared-ipc-gates.sh`) were updated atomically.
 
-1. **IPC.** Merge `doc/SHARED_IPC_MIGRATION_GUIDE.md`,
-   `doc/SHARED_IPC_THROUGHPUT_GUIDE.md`,
-   `doc/IPC_SHARED_MEMORY_FASTPATH_PLAN.md`,
-   `doc/IPC_FRAGMENTATION_POLICY.md`,
-   `doc/IPC_IMPROVEMENT_PHASES.md` → `doc/IPC.md`.
-2. **VFS.** Merge `doc/VFS_REQUEST_LOOP_ABI.md`,
-   `doc/VFS_SHARED_IO_CONTRACT.md`,
-   `doc/VFS_SHARED_IO_MAPPER_REQUIREMENTS.md`,
-   `doc/PROC_VFS_CODEC_FREEZE.md` → `doc/VFS.md`.
-3. **Filesystem / storage.** Merge
-   `doc/RAMFS_CONTRACT.md`, `doc/RAMFS_SERVER_CONTRACT.md`,
-   `doc/INITRAMFS_CONTRACT.md`, `doc/INITRAMFS_EXEC_MANIFEST_CONTRACT.md`,
-   `doc/DEVFS_CONTRACT.md`, `doc/EXT4_SERVER_CONTRACT.md`,
-   `doc/FAT_SERVER_CONTRACT.md`, `doc/STORAGE_SERVICE_CONTRACT.md`,
-   `doc/BLKCACHE_ABI.md`, `doc/BLOCK_BACKEND_ABI.md`,
-   `doc/BLOCK_WRITE_CONTRACT.md` → `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md`.
-4. **Networking.** Merge `doc/NETWORK_STACK_INTEGRATION.md`,
-   `doc/NETMGR_CONTRACT.md`, `doc/DHCP_SERVER_CONTRACT.md`,
-   `doc/DNS_SERVER_CONTRACT.md`, `doc/TCPIP_SERVER_CONTRACT.md`,
-   `doc/SOCKET_SERVER_CONTRACT.md`, `doc/VIRTIO_NET_CONTRACT.md` →
-   `doc/NETWORKING.md`.
-5. **Capabilities.** Merge `doc/CAPABILITY_DOMAIN_RULES.md`,
-   `doc/CAPABILITY_RIGHTS_AUDIT.md`,
-   `doc/KERNEL_CSPACE_ACCESS_POLICY.md` → `doc/CAPABILITY_MODEL.md`.
-6. **Process / spawn.** Merge `doc/CONTROL_PLANE_BOUNDARIES.md`,
-   `doc/PM_SPAWN_CONTRACT.md`, `doc/TID_ALLOCATION_CONTRACT.md`,
-   `doc/INIT_SERVER_BOOT_CONTRACT.md` → `doc/PROCESS_AND_SPAWN.md` (keep
-   `INIT_SERVER_BOOT_CONTRACT.md`'s slot 0..17 definitions verbatim under a
-   subsection; they are load-bearing ABI).
+Deleted in Pass 4:
 
-Each cluster PR must:
+- **IPC cluster:** `SHARED_IPC_MIGRATION_GUIDE.md`,
+  `SHARED_IPC_THROUGHPUT_GUIDE.md`,
+  `IPC_SHARED_MEMORY_FASTPATH_PLAN.md`,
+  `IPC_FRAGMENTATION_POLICY.md`, `IPC_IMPROVEMENT_PHASES.md`.
+- **VFS cluster:** `VFS_REQUEST_LOOP_ABI.md`,
+  `VFS_SHARED_IO_CONTRACT.md`,
+  `VFS_SHARED_IO_MAPPER_REQUIREMENTS.md`,
+  `PROC_VFS_CODEC_FREEZE.md`.
+- **Filesystem / storage cluster:** `RAMFS_CONTRACT.md`,
+  `RAMFS_SERVER_CONTRACT.md`, `INITRAMFS_CONTRACT.md`,
+  `INITRAMFS_EXEC_MANIFEST_CONTRACT.md`, `DEVFS_CONTRACT.md`,
+  `EXT4_SERVER_CONTRACT.md`, `FAT_SERVER_CONTRACT.md`,
+  `STORAGE_SERVICE_CONTRACT.md`, `BLKCACHE_ABI.md`,
+  `BLOCK_BACKEND_ABI.md`, `BLOCK_WRITE_CONTRACT.md`.
+- **Networking cluster:** `NETWORK_STACK_INTEGRATION.md`,
+  `NETMGR_CONTRACT.md`, `DHCP_SERVER_CONTRACT.md`,
+  `DNS_SERVER_CONTRACT.md`, `TCPIP_SERVER_CONTRACT.md`,
+  `SOCKET_SERVER_CONTRACT.md`, `VIRTIO_NET_CONTRACT.md`,
+  `PHASE3_NETWORK_CONTRACT.md`.
+- **Capability cluster:** `CAPABILITY_DOMAIN_RULES.md`,
+  `CAPABILITY_RIGHTS_AUDIT.md`, `KERNEL_CSPACE_ACCESS_POLICY.md`.
+- **Process / spawn cluster:** `CONTROL_PLANE_BOUNDARIES.md`,
+  `PM_SPAWN_CONTRACT.md`, `TID_ALLOCATION_CONTRACT.md`,
+  `INIT_SERVER_BOOT_CONTRACT.md`.
+- **Phase-gates cluster (CI-gated):** `KERNEL_STATUS.md`,
+  `SERVER_ROADMAP.md`, `PHASE_READINESS_MATRIX.md`,
+  `PHASE2_DRIVER_CONTRACT.md`, `PHASE4_UI_CONTRACT.md`.
 
-- Verify by grep that no `include_str!`, README, script, or `.github/`
-  workflow references the file being deleted.
-- Update any references to point at the new canonical owner.
-- Run `git diff --check` and the source-grep tests pinned in
-  `src/kernel/syscall.rs`.
+ABI values, opcodes, syscall numbers, struct offsets, image IDs, smoke
+markers, and startup slot counts are preserved verbatim in the
+canonical owners. No runtime code behavior was changed.

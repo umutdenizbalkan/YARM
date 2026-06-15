@@ -82,7 +82,7 @@ milestone (e.g., Phase 3A falls back to Phase 2B on `Unsupported` from
 ### 2.1 Do not casually change startup cap slots
 
 The startup cap layout for each service is fixed and documented in
-`doc/INIT_SERVER_BOOT_CONTRACT.md`. Changing a slot number requires updating every
+`doc/PROCESS_AND_SPAWN.md`. Changing a slot number requires updating every
 consumer of that slot and verifying the change in both AArch64 and x86_64 smoke.
 
 ### 2.2 image_id 7/8/9 late services use zeroed extra caps

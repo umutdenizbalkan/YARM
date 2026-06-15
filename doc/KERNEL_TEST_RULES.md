@@ -3702,7 +3702,7 @@ All tests must pass.
 - `stage63_adoption_mapped_recv_delivery_differs_from_plain`
 - `stage63_adoption_encode_mapped_vs_plain_map_intent_differ`
 
-**VFS readiness:** Documented in `doc/VFS_SHARED_IO_CONTRACT.md` §Stage 64.
+**VFS readiness:** Documented in `doc/VFS.md` (Stage 64 shared-I/O readiness).
 No new Rust code in `yarm-fs-servers` (existing 207 tests unchanged).
 
 **Run commands:**
@@ -4888,7 +4888,7 @@ Both `scripts/qemu-*-optional-fs-smoke.sh` now check:
 3. `stage93_smoke_scripts_check_all_fatal_patterns` — scripts check all fatal patterns
 
 **FAT status: profile-ready (blocked on virtio-blk round-trip proof).**
-See `FAT_SERVER_CONTRACT.md` Stage 93 section for exact activation checklist.
+See `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md` (FAT server section) for the exact activation checklist.
 
 **Invariants unchanged from Stage 92:**
 - `VFS_SUPERVISOR_TASK_EXIT_NOTIFICATION_ENABLED = false`
@@ -4922,8 +4922,9 @@ unlocking resumes at Stage 101.
    Captures FS baseline, kernel invariants, recent correctness fixes, and Stage 101
    target.
 
-4. **VFS_SHARED_IO_CONTRACT.md, FAT_SERVER_CONTRACT.md, AI_AGENT_RULES.md**
-   updated with Milestone 1 references and Stage 94/100 sections.
+4. **`doc/VFS.md`, `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md`, `doc/AI_AGENT_RULES.md`**
+   updated with Milestone 1 references and Stage 94/100 sections (formerly
+   `VFS_SHARED_IO_CONTRACT.md` and `FAT_SERVER_CONTRACT.md` before Pass 4 consolidation).
 
 **No new tests added in Stage 94.** The 16 Stage 93 tests (13 + 3) already cover
 all new patterns. Stage 94 is docs-and-hardening only.

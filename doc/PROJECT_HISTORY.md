@@ -33,7 +33,7 @@ and only summarize a closed milestone here when it is genuinely done.
 | TID Allocation Policy cleanup | ✅ closed (4 phases) | `TidAllocationPolicy` + cursor abstraction; gap-accounting telemetry (`dynamic_tid_allocations`, `dynamic_tid_wraps`, `gap_floor_repairs`); CI dynamic-floor enforcement |
 | Freestanding Service Isolation PR plan | retired (folded into live flow) | Non-hosted PVH module discovery + initramfs executable manifest + ELF validation + initramfs-launched `init_server` in a dedicated user AS |
 | Init-server initramfs-boot PR board | retired (folded into live flow) | PRs that moved x86_64 first-user from synthetic syscall/yield to real initramfs ELF launch in a dedicated user AS |
-| Server Runtime Boundary / POSIX / VFS refactor | ✅ closed | `yarm-server-runtime` no longer a root-crate re-export bridge; userspace runtime in `yarm-user-rt`; startup-slot ABI in `doc/INIT_SERVER_BOOT_CONTRACT.md` |
+| Server Runtime Boundary / POSIX / VFS refactor | ✅ closed | `yarm-server-runtime` no longer a root-crate re-export bridge; userspace runtime in `yarm-user-rt`; startup-slot ABI in `doc/PROCESS_AND_SPAWN.md` (was `doc/INIT_SERVER_BOOT_CONTRACT.md` pre-Pass 4) |
 | Optional FS Milestone 1 | ✅ declared (Stage 100) | All userspace FS servers built/staged/tested; RAMFS fully writable proof; ext4 read-only live; FAT profile-ready and disabled; strict optional-FS smoke scripts for x86_64 + AArch64 |
 | Kernel Unlocking Milestone 1 (Stage 106) | ✅ declared (2026-06-12) | D1 / D2 / D5 live splits; D3.1 + D6.1 first live wires (Stage 107); see `doc/KERNEL_UNLOCKING.md` |
 | Kernel Unlocking Milestone 2 Pass 1 (Stage 108) | ✅ infrastructure landed | SharedKernel split-mut seams (ranks 1/2/5/6), `yarm.loglevel=` knob, x86_64 SMP trampoline split |
@@ -63,8 +63,8 @@ unmap+revoke lifecycle. They remain in the live test suite.
 
 - Frozen `Message::MAX_PAYLOAD = 128` bytes.
 - Medium payloads (>128 B and <shared-memory threshold) use the fragmentation
-  protocol (current canonical doc: `doc/IPC_FRAGMENTATION_POLICY.md`; pending
-  consolidation into `doc/IPC.md`).
+  protocol (canonical doc: `doc/IPC.md` §2; was `doc/IPC_FRAGMENTATION_POLICY.md`
+  pre-Pass 4).
 - Large payloads use the shared-memory descriptor path
   (`OPCODE_SHARED_MEM`).
 - Original benchmark snapshot:
@@ -212,9 +212,8 @@ Four phases, all closed:
 4. ✅ CI enforcement — fail if dynamic allocation returns a TID below
    floor; targeted kernel test suite for TID policy invariants.
 
-Current canonical contract: `doc/TID_ALLOCATION_CONTRACT.md` (pending
-consolidation into `doc/PROCESS_AND_SPAWN.md` per `doc/DOCUMENTATION_MAP.md`
-TODO §3).
+Current canonical contract: `doc/PROCESS_AND_SPAWN.md` (was
+`doc/TID_ALLOCATION_CONTRACT.md` pre-Pass 4).
 
 ### Freestanding Service Isolation PR plan (retired)
 
@@ -253,7 +252,7 @@ Closed; the following live invariants survive:
 - `yarm-user-rt` provides userspace IPC entry points (`ipc_send` /
   `ipc_recv`) plus arch-specific asm under `crates/yarm-user-rt/src/arch`;
   `IpcTransport` / `SyscallIpcTransport` are available.
-- Startup-slot ABI lives in `doc/INIT_SERVER_BOOT_CONTRACT.md` (slots
+- Startup-slot ABI lives in `doc/PROCESS_AND_SPAWN.md` (slots
   0..17 documented there; `STARTUP_SLOT_COUNT = 18`).
 
 ### Optional FS Milestone 1 (Stage 100)

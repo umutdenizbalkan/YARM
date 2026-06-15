@@ -574,7 +574,9 @@ mod tests {
 
     #[test]
     fn ramfs_server_contract_docs_match_behavior() {
-        let doc = include_str!("../../../../../doc/RAMFS_SERVER_CONTRACT.md");
+        // Pass 4 (2026-06-15): RAMFS server contract migrated into the
+        // consolidated doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md §3 + §11.
+        let doc = include_str!("../../../../../doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md");
         assert!(doc.contains("/ram"));
         for marker in [
             "INIT_RAMFS_SPAWN_BEGIN",
