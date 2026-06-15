@@ -7,6 +7,15 @@ pub fn default_present_cpu_bitmap() -> u64 {
 }
 
 pub fn discover_present_cpu_bitmap(dtb: &[u8]) -> u64 {
+    // Prefer the binary FDT walker (the real DTB encoding); fall back to the
+    // legacy textual "/cpus { cpu@N { } }" scan only if the FDT walker yields
+    // an empty bitmap. Returning the conservative single-CPU default keeps
+    // the boot path working when no usable topology is present.
+    if let Some(bitmap) = crate::arch::fdt::cpus_hart_id_bitmap(dtb) {
+        if bitmap != 0 {
+            return bitmap;
+        }
+    }
     let text = core::str::from_utf8(dtb).unwrap_or("");
     let mut inside = false;
     let mut bitmap = 0u64;
@@ -89,6 +98,19 @@ mod tests {
     fn parses_dtb_cpu_nodes() {
         let dtb = b"/cpus {\n cpu@0 { };\n cpu@1 { };\n cpu@3 { };\n};";
         assert_eq!(discover_present_cpu_bitmap(dtb), 0b1011);
+    }
+
+    #[test]
+    fn default_present_cpu_bitmap_is_single_hart() {
+        assert_eq!(default_present_cpu_bitmap(), 0b1);
+    }
+
+    #[test]
+    fn discover_falls_back_to_default_for_empty_blob() {
+        assert_eq!(
+            discover_present_cpu_bitmap(b""),
+            default_present_cpu_bitmap()
+        );
     }
 
     #[test]

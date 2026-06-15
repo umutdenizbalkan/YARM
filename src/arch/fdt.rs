@@ -151,6 +151,136 @@ pub fn memory_reg(bytes: &[u8]) -> Option<(u64, u64)> {
     None
 }
 
+/// Builds a u64 bitmap of present CPU/hart IDs from the FDT `/cpus` node.
+///
+/// Walks `/cpus/cpu@*` children, prefers the `reg` property as the
+/// authoritative hart-id (the spec encoding), and falls back to parsing
+/// the unit-address suffix when `reg` is absent or malformed. Hart IDs
+/// >= 64 are ignored (the bitmap is 64-wide; YARM `MAX_CPUS` is 64).
+/// Returns `None` if the FDT is structurally invalid; returns `Some(0)`
+/// when `/cpus` is absent or empty.
+pub fn cpus_hart_id_bitmap(bytes: &[u8]) -> Option<u64> {
+    if read_be_u32(bytes, 0)? != FDT_MAGIC {
+        return None;
+    }
+    let total_size = read_be_u32(bytes, 4)? as usize;
+    let off_dt_struct = read_be_u32(bytes, 8)? as usize;
+    let off_dt_strings = read_be_u32(bytes, 12)? as usize;
+    let size_dt_strings = read_be_u32(bytes, 32)? as usize;
+    let size_dt_struct = read_be_u32(bytes, 36)? as usize;
+    if total_size > bytes.len()
+        || off_dt_struct.checked_add(size_dt_struct)? > total_size
+        || off_dt_strings.checked_add(size_dt_strings)? > total_size
+    {
+        return None;
+    }
+    let struct_block = &bytes[off_dt_struct..off_dt_struct + size_dt_struct];
+    let strings = &bytes[off_dt_strings..off_dt_strings + size_dt_strings];
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut in_cpus_depth: Option<usize> = None;
+    let mut current_cpu_depth: Option<usize> = None;
+    let mut current_unit_addr: Option<u32> = None;
+    let mut current_reg: Option<u32> = None;
+    let mut bitmap: u64 = 0;
+
+    fn record(bitmap: &mut u64, hart_id: u32) {
+        if hart_id < 64 {
+            *bitmap |= 1u64 << hart_id;
+        }
+    }
+
+    while cursor + 4 <= struct_block.len() {
+        let token = read_be_u32(struct_block, cursor)?;
+        cursor += 4;
+        match token {
+            FDT_BEGIN_NODE => {
+                let (name, next) = read_cstr(struct_block, cursor)?;
+                cursor = align_up_4(next)?;
+                depth = depth.checked_add(1)?;
+                if depth == 2 && name == b"cpus" {
+                    in_cpus_depth = Some(depth);
+                }
+                if in_cpus_depth == Some(depth.saturating_sub(1))
+                    && depth == in_cpus_depth.unwrap_or(0) + 1
+                    && (name == b"cpu" || name.starts_with(b"cpu@"))
+                {
+                    current_cpu_depth = Some(depth);
+                    current_unit_addr = parse_cpu_unit_addr(name);
+                    current_reg = None;
+                }
+            }
+            FDT_END_NODE => {
+                if current_cpu_depth == Some(depth) {
+                    let hart_id = current_reg.or(current_unit_addr);
+                    if let Some(id) = hart_id {
+                        record(&mut bitmap, id);
+                    }
+                    current_cpu_depth = None;
+                    current_unit_addr = None;
+                    current_reg = None;
+                }
+                if in_cpus_depth == Some(depth) {
+                    in_cpus_depth = None;
+                }
+                depth = depth.checked_sub(1)?;
+            }
+            FDT_PROP => {
+                let prop_len = read_be_u32(struct_block, cursor)? as usize;
+                let name_off = read_be_u32(struct_block, cursor + 4)? as usize;
+                cursor = cursor.checked_add(8)?;
+                let prop_end = cursor.checked_add(prop_len)?;
+                if prop_end > struct_block.len() {
+                    return None;
+                }
+                let prop_data = &struct_block[cursor..prop_end];
+                cursor = align_up_4(prop_end)?;
+                let prop_name = read_cstr(strings, name_off)?.0;
+                if current_cpu_depth == Some(depth) && prop_name == b"reg" {
+                    // QEMU virt encodes RISC-V hart-id as 1-cell u32. Some
+                    // encodings use 2 cells (top is 0 for hart IDs < 2^32).
+                    if prop_data.len() == 4 {
+                        if let Some(value) = read_be_u32(prop_data, 0) {
+                            current_reg = Some(value);
+                        }
+                    } else if prop_data.len() == 8 {
+                        if let (Some(_hi), Some(lo)) =
+                            (read_be_u32(prop_data, 0), read_be_u32(prop_data, 4))
+                        {
+                            current_reg = Some(lo);
+                        }
+                    }
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+    Some(bitmap)
+}
+
+fn parse_cpu_unit_addr(name: &[u8]) -> Option<u32> {
+    let at = name.iter().position(|&b| b == b'@')?;
+    let tail = &name[at + 1..];
+    let mut value: u32 = 0;
+    let mut digits = 0usize;
+    for &byte in tail {
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(nibble as u32)?;
+        digits += 1;
+    }
+    if digits == 0 {
+        return None;
+    }
+    Some(value)
+}
+
 /// Returns the `/chosen` `linux,initrd-start` / `linux,initrd-end` pair as
 /// `(start, end)` physical addresses, if present. Each value may be encoded as
 /// a 4-byte or 8-byte big-endian integer (QEMU uses either depending on
@@ -478,5 +608,136 @@ mod tests {
     fn reports_absent_initrd() {
         let dtb = make_dtb_with_memory(2, 2, 0x8000_0000, 0x2000_0000, None);
         assert_eq!(chosen_initrd(&dtb), None);
+    }
+
+    /// Builds a minimal DTB with a `/cpus` node containing N `cpu@<id>`
+    /// children. If `with_reg` is true, each child also gets a `reg` property
+    /// matching its unit-address. The QEMU virt DTB uses 1-cell hart IDs.
+    fn make_dtb_with_cpus(hart_ids: &[u32], with_reg: bool) -> Vec<u8> {
+        let mut structure = Vec::new();
+        let mut strings = Vec::new();
+        let mut str_off = |strings: &mut Vec<u8>, s: &[u8]| -> u32 {
+            let off = strings.len() as u32;
+            strings.extend_from_slice(s);
+            strings.push(0);
+            off
+        };
+        let reg_off = str_off(&mut strings, b"reg");
+
+        // root
+        push_u32(&mut structure, FDT_BEGIN_NODE);
+        structure.push(0);
+        align(&mut structure);
+
+        // /cpus
+        push_u32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"cpus\0");
+        align(&mut structure);
+
+        for &id in hart_ids {
+            push_u32(&mut structure, FDT_BEGIN_NODE);
+            // unit name "cpu@<hex>"
+            let mut name = alloc::vec::Vec::from(&b"cpu@"[..]);
+            // hex digits
+            let mut hex_buf = [0u8; 8];
+            let mut digits = 0usize;
+            let mut value = id;
+            if value == 0 {
+                hex_buf[0] = b'0';
+                digits = 1;
+            } else {
+                while value > 0 {
+                    let nib = (value & 0xF) as u8;
+                    hex_buf[digits] = if nib < 10 {
+                        b'0' + nib
+                    } else {
+                        b'a' + (nib - 10)
+                    };
+                    digits += 1;
+                    value >>= 4;
+                }
+                hex_buf[..digits].reverse();
+            }
+            name.extend_from_slice(&hex_buf[..digits]);
+            name.push(0);
+            structure.extend_from_slice(&name);
+            align(&mut structure);
+
+            if with_reg {
+                push_u32(&mut structure, FDT_PROP);
+                push_u32(&mut structure, 4);
+                push_u32(&mut structure, reg_off);
+                push_u32(&mut structure, id);
+            }
+            push_u32(&mut structure, FDT_END_NODE);
+        }
+
+        push_u32(&mut structure, FDT_END_NODE); // close /cpus
+        push_u32(&mut structure, FDT_END_NODE); // close root
+        push_u32(&mut structure, FDT_END);
+
+        let header = 40usize;
+        let strings_offset = header + structure.len();
+        let total = strings_offset + strings.len();
+        let mut dtb = Vec::new();
+        for value in [
+            FDT_MAGIC,
+            total as u32,
+            header as u32,
+            strings_offset as u32,
+            header as u32,
+            17,
+            16,
+            0,
+            strings.len() as u32,
+            structure.len() as u32,
+        ] {
+            push_u32(&mut dtb, value);
+        }
+        dtb.extend_from_slice(&structure);
+        dtb.extend_from_slice(&strings);
+        dtb
+    }
+
+    #[test]
+    fn cpus_hart_id_bitmap_contiguous_smp1() {
+        let dtb = make_dtb_with_cpus(&[0], true);
+        assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0b1));
+    }
+
+    #[test]
+    fn cpus_hart_id_bitmap_contiguous_smp2() {
+        let dtb = make_dtb_with_cpus(&[0, 1], true);
+        assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0b11));
+    }
+
+    #[test]
+    fn cpus_hart_id_bitmap_contiguous_smp3() {
+        let dtb = make_dtb_with_cpus(&[0, 1, 2], true);
+        assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0b111));
+    }
+
+    #[test]
+    fn cpus_hart_id_bitmap_contiguous_smp4() {
+        let dtb = make_dtb_with_cpus(&[0, 1, 2, 3], true);
+        assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0b1111));
+    }
+
+    #[test]
+    fn cpus_hart_id_bitmap_sparse_ids() {
+        let dtb = make_dtb_with_cpus(&[0, 3, 7], true);
+        assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0b1000_1001));
+    }
+
+    #[test]
+    fn cpus_hart_id_bitmap_falls_back_to_unit_addr_when_reg_absent() {
+        let dtb = make_dtb_with_cpus(&[1, 2], false);
+        assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0b110));
+    }
+
+    #[test]
+    fn cpus_hart_id_bitmap_returns_zero_when_no_cpus_node() {
+        let dtb = make_dtb_with_memory(2, 2, 0x8000_0000, 0x2000_0000, None);
+        assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0));
     }
 }
