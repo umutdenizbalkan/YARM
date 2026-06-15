@@ -230,7 +230,7 @@ Changing any image ID requires updating `spawn_image_path_for_image_id`,
 ### Counts and ABI offsets
 
 - **`STARTUP_SLOT_COUNT = 18`** — do not increase or decrease. Slots 0–17 are
-  documented in `doc/INIT_SERVER_BOOT_CONTRACT.md`. Slot 12 is PM-private for
+  documented in `doc/PROCESS_AND_SPAWN.md`. Slot 12 is PM-private for
   PM↔VFS subcalls.
 - **`SYSCALL_COUNT = 31`** — do not add or remove syscalls without a new ABI
   stage.
@@ -545,5 +545,5 @@ maintenance stage either live-wires it or removes it.
   Live-Path Rules).
 - `doc/KERNEL_TEST_RULES.md` — per-rule unit-test guard rails. Stage-101+
   unlocking rules live there.
-- `doc/INIT_SERVER_BOOT_CONTRACT.md` — startup slot 0..17 definitions.
+- `doc/PROCESS_AND_SPAWN.md` — startup slot 0..17 definitions.
 - `doc/DOCUMENTATION_MAP.md` — repo-wide documentation ownership map.

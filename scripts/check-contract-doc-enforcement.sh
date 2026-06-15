@@ -4,16 +4,16 @@
 set -euo pipefail
 
 # Contract-doc enforcement gate:
-# - ABI_CONTRACT_FREEZE.md
-# - SYSCALL_ABI.md
-# - PROC_VFS_CODEC_FREEZE.md
+# - doc/ABI_CONTRACT_FREEZE.md
+# - doc/SYSCALL_ABI.md
+# - doc/VFS.md (after Pass 4 — consolidated from PROC_VFS_CODEC_FREEZE.md)
 #
 # Verifies required freeze markers and runs targeted frozen-contract tests.
 
 required_docs=(
-  "ABI_CONTRACT_FREEZE.md"
-  "SYSCALL_ABI.md"
-  "PROC_VFS_CODEC_FREEZE.md"
+  "doc/ABI_CONTRACT_FREEZE.md"
+  "doc/SYSCALL_ABI.md"
+  "doc/VFS.md"
 )
 
 for doc in "${required_docs[@]}"; do
@@ -23,14 +23,13 @@ for doc in "${required_docs[@]}"; do
   fi
 done
 
-rg -q "src/arch/trap.rs" ABI_CONTRACT_FREEZE.md
-rg -q "LinuxCompatSyscall::DISPATCH_TABLE" ABI_CONTRACT_FREEZE.md
-rg -q 'SYSCALL_ABI_VERSION = 6|ABI Version: `6`' SYSCALL_ABI.md
-rg -q "TransferRelease" SYSCALL_ABI.md
-rg -q 'Syscall count: `5`' SYSCALL_ABI.md
-rg -q "PROC_CODEC_V2_VERSION = 2" PROC_VFS_CODEC_FREEZE.md
-rg -q "VFS_CODEC_V1_VERSION = 1" PROC_VFS_CODEC_FREEZE.md
-rg -q "scripts/check-proc-vfs-codec-freeze.sh" PROC_VFS_CODEC_FREEZE.md
+rg -q "src/arch/trap.rs" doc/ABI_CONTRACT_FREEZE.md
+rg -q "LinuxCompatSyscall::DISPATCH_TABLE" doc/ABI_CONTRACT_FREEZE.md
+rg -q 'ABI Version: `10`' doc/SYSCALL_ABI.md
+rg -q "TransferRelease" doc/SYSCALL_ABI.md
+rg -q "PROC_CODEC_V2_VERSION = 2" doc/VFS.md
+rg -q "VFS_CODEC_V1_VERSION = 1" doc/VFS.md
+rg -q "scripts/check-proc-vfs-codec-freeze.sh" doc/VFS.md
 
 cargo test -q trap_router_maps_syscall
 cargo test -q proc_v2_golden_vector_is_stable

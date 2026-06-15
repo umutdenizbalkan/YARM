@@ -5,7 +5,9 @@ set -euo pipefail
 
 # Process/VFS typed codec freeze gate
 
-[[ -f PROC_VFS_CODEC_FREEZE.md ]] || { echo "[fail] missing PROC_VFS_CODEC_FREEZE.md"; exit 1; }
+# Pass 4 (2026-06-15): the Proc/VFS codec freeze contract was consolidated
+# into doc/VFS.md §6.
+[[ -f doc/VFS.md ]] || { echo "[fail] missing doc/VFS.md"; exit 1; }
 
 # Ensure frozen constants are present where expected.
 rg -n "pub const PROC_CODEC_V2_VERSION: u16 = 2;" crates/yarm-ipc-abi/src/process_abi.rs >/dev/null || {

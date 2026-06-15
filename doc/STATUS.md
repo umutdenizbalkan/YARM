@@ -93,7 +93,7 @@ hardware artifact-build commands.
 | 2 | `supervisor` | ✅ live; handoff banner emitted; control / fault / control-send caps present |
 | 3 | `process_manager` | ✅ live; SpawnV5 path proven; PM-private reply RECEIVE cap in startup slot 2 |
 
-Slots 0..17 are documented in `doc/INIT_SERVER_BOOT_CONTRACT.md` (slot 12
+Slots 0..17 are documented in `doc/PROCESS_AND_SPAWN.md` (slot 12
 is PM-private for PM↔VFS subcalls).
 
 ### 2.2 Bootstrap FS chain (image IDs 4–6)
@@ -111,7 +111,7 @@ is PM-private for PM↔VFS subcalls).
 | 7 | `driver_manager` | ✅ live; spawned via VFS-backed `STATX → OPENAT → READ* → CLOSE` after init passes a `vfs_server` request SEND cap (SpawnV5 service caps slot 0) |
 | 8 | `blkcache_srv` | ✅ live |
 | 9 | `virtio_blk_srv` | ✅ live |
-| 10 | `fat_srv` | Profile-ready; **disabled by default** (`INIT_FAT_SPAWN_SKIPPED reason=server_disabled`); see `doc/FAT_SERVER_CONTRACT.md` for activation blockers |
+| 10 | `fat_srv` | Profile-ready; **disabled by default** (`INIT_FAT_SPAWN_SKIPPED reason=server_disabled`); see `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md` (FAT server section) for activation blockers |
 | 11 | `ramfs_srv` | ✅ live; fully writable; mounted at `/ram` |
 | 12 | `ext4_srv` | ✅ live; read-only; mounted at `/ext4` (writes report `Unsupported`) |
 
@@ -122,18 +122,14 @@ rename or remove them without updating both smoke scripts.
 ### 2.4 Networking
 
 Service domain crate exists (`crates/yarm-network-servers`) with
-contracts in `doc/NETMGR_CONTRACT.md`, `doc/DHCP_SERVER_CONTRACT.md`,
-`doc/DNS_SERVER_CONTRACT.md`, `doc/TCPIP_SERVER_CONTRACT.md`,
-`doc/SOCKET_SERVER_CONTRACT.md`, `doc/VIRTIO_NET_CONTRACT.md`. Not part
-of the core boot smoke. Pending consolidation into `doc/NETWORKING.md`
-per `doc/DOCUMENTATION_MAP.md` TODO §3.
+contracts consolidated into `doc/NETWORKING.md` (Pass 4). Not part
+of the core boot smoke.
 
 ### 2.5 UI
 
 Service domain crate exists (`crates/yarm-ui-servers`). Not part of the
-core boot smoke. Current contracts live in `doc/PHASE4_UI_CONTRACT.md`
-(deferred to Pass 4 because the live CI gate
-`scripts/check-roadmap-readiness.sh` depends on it).
+core boot smoke. Current contracts live in `doc/PHASE_GATES.md`
+(Phase 4 UI contract section; gated by `scripts/check-roadmap-readiness.sh`).
 
 ---
 
@@ -189,12 +185,13 @@ scripts/phase5-boundary-gates.sh --ui-runtime-entrypoint
 | RPi5 | `doc/RPI5_BRINGUP.md` | ✅ Pass 2 (canonical) |
 | Project history | `doc/PROJECT_HISTORY.md` | ✅ Pass 3 (this pass) |
 | Current status | `doc/STATUS.md` | ✅ Pass 3 (this file) |
-| IPC | `doc/IPC.md` | ❌ pending Pass 4 (cluster §3.1) |
-| VFS | `doc/VFS.md` | ❌ pending Pass 4 (cluster §3.2) |
-| Filesystem / storage | `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md` | ❌ pending Pass 4 (cluster §3.3) |
-| Networking | `doc/NETWORKING.md` | ❌ pending Pass 4 (cluster §3.4) |
-| Capabilities | `doc/CAPABILITY_MODEL.md` | ❌ pending Pass 4 (cluster §3.5) |
-| Process / spawn | `doc/PROCESS_AND_SPAWN.md` | ❌ pending Pass 4 (cluster §3.6) |
+| IPC | `doc/IPC.md` | ✅ Pass 4 (canonical) |
+| VFS | `doc/VFS.md` | ✅ Pass 4 (canonical) |
+| Filesystem / storage | `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md` | ✅ Pass 4 (canonical) |
+| Networking | `doc/NETWORKING.md` | ✅ Pass 4 (canonical) |
+| Capabilities | `doc/CAPABILITY_MODEL.md` | ✅ Pass 4 (canonical) |
+| Process / spawn | `doc/PROCESS_AND_SPAWN.md` | ✅ Pass 4 (canonical) |
+| Phase gates (Phase 2/3/4 contracts, roadmap, kernel-status milestones) | `doc/PHASE_GATES.md` | ✅ Pass 4 (canonical) |
 | Service manifest | `doc/SERVICE_MANIFEST.md` | ✅ (existing canonical) |
 | Roadmap (current direction) | `doc/ROADMAP.md` | ✅ (existing canonical) |
 | Agent rules | `doc/AI_AGENT_RULES.md` | ✅ (existing canonical) |
@@ -229,12 +226,14 @@ The four highest-impact items, in order of unlock value:
    HH-4's no-low-VA contract; then enter EL0 via the real ERET path. See
    `doc/RPI5_BRINGUP.md` §12–13.
 
-4. **Documentation consolidation Pass 4.** Six ABI-sensitive clusters
-   listed in `doc/DOCUMENTATION_MAP.md` TODO §3 (IPC, VFS, FS/storage,
-   networking, capabilities, process/spawn). Each cluster is its own PR
-   with careful preservation of live ABI offsets. The six items deferred
-   from Pass 3 (because live CI gate scripts pin specific files) belong
-   in Pass 4 as well — see `doc/DOCUMENTATION_MAP.md`.
+4. **Documentation consolidation Pass 4 — completed 2026-06-15.** Six
+   ABI-sensitive clusters (IPC, VFS, FS/storage, networking, capabilities,
+   process/spawn) and the six CI-gated phase docs were consolidated into
+   seven canonical owners (`doc/IPC.md`, `doc/VFS.md`,
+   `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md`, `doc/NETWORKING.md`,
+   `doc/CAPABILITY_MODEL.md`, `doc/PROCESS_AND_SPAWN.md`,
+   `doc/PHASE_GATES.md`). CI gate scripts were updated atomically. See
+   `doc/DOCUMENTATION_MAP.md`.
 
 ---
 

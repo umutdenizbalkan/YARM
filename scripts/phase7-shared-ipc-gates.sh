@@ -5,19 +5,23 @@ set -euo pipefail
 
 export RUST_MIN_STACK=${RUST_MIN_STACK:-33554432}
 
-# Phase 7 shared-memory IPC hardening gates
+# Phase 7 shared-memory IPC hardening gates.
+#
+# Pass 4 (2026-06-15): the three former IPC_SHARED_*.md docs were consolidated
+# into doc/IPC.md (shared-memory fastpath §3, throughput patterns §4, migration
+# ownership §5, Phase 5 hardening artifacts §7). The "Phase 7" section header
+# is preserved verbatim in §5 of doc/IPC.md ("Gate expectations" subsection
+# names `phase7-shared-ipc-gates.sh`).
 
 required_docs=(
-  "IPC_SHARED_MEMORY_FASTPATH_PLAN.md"
-  "SHARED_IPC_MIGRATION_GUIDE.md"
-  "SHARED_IPC_THROUGHPUT_GUIDE.md"
+  "doc/IPC.md"
 )
 for doc in "${required_docs[@]}"; do
   [[ -f "$doc" ]] || { echo "[fail] missing required doc: $doc"; exit 1; }
 done
 
-if ! rg -n "Phase 7" IPC_SHARED_MEMORY_FASTPATH_PLAN.md >/dev/null; then
-  echo "[fail] Phase 7 section missing in IPC_SHARED_MEMORY_FASTPATH_PLAN.md"
+if ! rg -n "phase7-shared-ipc-gates" doc/IPC.md >/dev/null; then
+  echo "[fail] Phase 7 gate reference missing in doc/IPC.md"
   exit 1
 fi
 
