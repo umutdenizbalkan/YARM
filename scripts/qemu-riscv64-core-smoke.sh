@@ -71,6 +71,7 @@ REQUIRED_PATTERNS=(
   "YARM_BOOT_OK"
   "RISCV_KERNEL_BOOT_OK"
   "RISCV_BOOT_HART_SELECTED hart="
+  "RISCV_BOOT_HART_ID_STORED hart="
   "RISCV_HART_TOPOLOGY present_cpus="
   "RISCV_LIVEEEEEEE"
   "RISCV_SYSCALL_ROUNDTRIP_OK"
@@ -80,6 +81,9 @@ REQUIRED_PATTERNS=(
   "VFS_SRV_ENTRY"
   "VFS_MOUNT_TABLE_READY"
   "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
+  "RISCV_TIMER_MECHANISM value="
+  "RISCV_PLIC_BASE value="
+  "RISCV_PLIC_CONTEXT value="
 )
 
 # RAMFS/EXT4 mount markers are emitted when those servers register their
@@ -213,6 +217,17 @@ fi
 if ! rg -n "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled" "$LOGFILE" >/dev/null 2>&1; then
   echo "[fail] RISCV_SCHEDULER_BSP_ONLY breadcrumb missing"
   failures=$((failures + 1))
+fi
+
+# Multi-hart topology must record the live-IRQ deferral while the
+# multi-hart timer/PLIC path is not yet validated end-to-end. Single-hart
+# boots must NOT emit this marker so the marker can be a positive signal
+# that the gating is correctly engaged.
+if (( QEMU_SMP >= 2 )); then
+  if ! rg -n "RISCV_IRQ_SMP_TOPOLOGY_DEFERRED reason=present_topology_not_live_validated" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] multi-hart boot must emit RISCV_IRQ_SMP_TOPOLOGY_DEFERRED"
+    failures=$((failures + 1))
+  fi
 fi
 
 if (( failures > 0 )); then

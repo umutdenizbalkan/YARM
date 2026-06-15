@@ -23,18 +23,24 @@ use super::platform_layout;
 pub const DEFER_REASON_NO_SAFE_SOURCE: &str = "no_safe_source";
 pub const DEFER_REASON_AUDIT_PENDING: &str = "extirq_audit_pending";
 
+/// Source IDs for the QEMU virt RISC-V platform. These are well-known
+/// (documented in the QEMU virt-machine source); enumeration here is
+/// breadcrumb-only — no source is enabled in this pass.
+pub const QEMU_VIRT_UART0_SOURCE_ID: u16 = 10;
+pub const QEMU_VIRT_VIRTIO_MMIO_BASE_SOURCE_ID: u16 = 1;
+pub const QEMU_VIRT_VIRTIO_MMIO_LAST_SOURCE_ID: u16 = 8;
+
 static PLIC_INIT_FIRED: AtomicBool = AtomicBool::new(false);
 static PLIC_DISCOVERED_SOURCES: AtomicUsize = AtomicUsize::new(0);
 static EXTIRQ_ENABLED_SOURCES: AtomicUsize = AtomicUsize::new(0);
 
-/// Marker-only discovery + init entry point. Emits PLIC discovery
-/// markers from the platform layout (or DTB description, if available),
-/// then emits the explicit `RISCV_EXTIRQ_DEFERRED reason=...` marker to
-/// keep external-IRQ delivery off until a single safe source is
-/// identified.
+/// Marker-only discovery + init entry point. Prefers a DTB-driven PLIC
+/// base lookup, falls back to the QEMU-virt platform-layout constant
+/// with an explicit `source=qemu_virt_fallback` marker, then emits the
+/// per-source enumeration breadcrumbs and the threshold write.
 ///
-/// Returns the deferral reason; `None` would indicate live external-IRQ
-/// path is engaged (not implemented yet).
+/// External-IRQ enable is deferred: the smoke gate accepts the explicit
+/// `RISCV_EXTIRQ_DEFERRED reason=...` marker.
 pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     if PLIC_INIT_FIRED.swap(true, Ordering::AcqRel) {
         return Some(DEFER_REASON_AUDIT_PENDING);
@@ -42,37 +48,98 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
 
     emit_marker(format_args!("RISCV_PLIC_DISCOVER_BEGIN"));
 
-    let base = platform_layout::PLIC_MMIO_BASE;
+    let (base, base_source) = resolve_plic_base();
     let context = platform_layout::PLIC_SMODE_CONTEXT_INDEX;
+    let boot_hart = super::boot::boot_hart_id();
 
-    emit_marker(format_args!("RISCV_PLIC_BASE value=0x{:x}", base));
-    emit_marker(format_args!("RISCV_PLIC_CONTEXT value={}", context));
-    // Source discovery is a stub: a future pass will enumerate sources
-    // from the DTB. For now the discovery marker emits zero so the gate
-    // can see the discovery happened without us asserting any specific
-    // source set.
-    PLIC_DISCOVERED_SOURCES.store(0, Ordering::Release);
-    emit_marker(format_args!("RISCV_PLIC_DISCOVER_DONE sources={}", 0usize));
+    emit_marker(format_args!(
+        "RISCV_PLIC_BASE value=0x{:x} source={}",
+        base, base_source
+    ));
+    emit_marker(format_args!(
+        "RISCV_PLIC_CONTEXT value={} hart={} mode=s",
+        context, boot_hart
+    ));
+
+    // Per-source enumeration breadcrumb. The QEMU virt layout is fixed:
+    // virtio-mmio takes source IDs 1..=8 and UART0 takes source ID 10.
+    // These are emitted for diagnostic transparency only — no source is
+    // enabled in this pass.
+    let mut enumerated = 0usize;
+    for sid in QEMU_VIRT_VIRTIO_MMIO_BASE_SOURCE_ID..=QEMU_VIRT_VIRTIO_MMIO_LAST_SOURCE_ID {
+        emit_marker(format_args!(
+            "RISCV_PLIC_SOURCE id={} name=virtio_mmio compatible=virtio,mmio",
+            sid
+        ));
+        enumerated += 1;
+    }
+    emit_marker(format_args!(
+        "RISCV_PLIC_SOURCE id={} name=uart0 compatible=ns16550a",
+        QEMU_VIRT_UART0_SOURCE_ID
+    ));
+    enumerated += 1;
+    PLIC_DISCOVERED_SOURCES.store(enumerated, Ordering::Release);
+    emit_marker(format_args!(
+        "RISCV_PLIC_DISCOVER_DONE sources={}",
+        enumerated
+    ));
 
     emit_marker(format_args!("RISCV_PLIC_INIT_BEGIN"));
     // Configure the static PLIC base/context for the existing
     // claim/complete plumbing in `super::irq`. This is a write to the
     // module-local atomics only; no MMIO is performed.
     irq::configure_plic_from_platform_layout();
+    write_plic_threshold(base, context, 0u32);
     emit_marker(format_args!(
         "RISCV_PLIC_THRESHOLD_SET context={} value={}",
         context, 0u32
     ));
     emit_marker(format_args!("RISCV_PLIC_INIT_DONE"));
 
-    // External-IRQ enable is deferred until exactly one safe source is
-    // identified and the trap-bridge claim/complete path is audited.
+    // External-IRQ enable is deferred: we emit the explicit select +
+    // defer pair so the smoke gate can read both the candidate source
+    // we considered and the exact reason it was not enabled. The
+    // claim/complete path in `super::irq` is wired but no source is
+    // enabled, so no IRQ can be claimed without an explicit follow-up.
+    emit_marker(format_args!(
+        "RISCV_EXTIRQ_SELECT source={} reason=uart0_is_safe_candidate_but_handler_not_ready",
+        QEMU_VIRT_UART0_SOURCE_ID
+    ));
     emit_marker(format_args!(
         "RISCV_EXTIRQ_DEFERRED reason={}",
         DEFER_REASON_NO_SAFE_SOURCE
     ));
     Some(DEFER_REASON_NO_SAFE_SOURCE)
 }
+
+/// Returns `(plic_base, source_tag)`. Prefers the DTB-discovered base
+/// via `crate::arch::fdt::find_node_reg_by_name_prefix`; falls back to
+/// the platform-layout constant with `qemu_virt_fallback`.
+fn resolve_plic_base() -> (usize, &'static str) {
+    if let Some(dtb) = super::boot::captured_dtb() {
+        if let Some((base, _size)) = crate::arch::fdt::find_node_reg_by_name_prefix(dtb, b"plic@") {
+            return (base as usize, "dtb");
+        }
+    }
+    (platform_layout::PLIC_MMIO_BASE, "qemu_virt_fallback")
+}
+
+/// Writes the PLIC S-mode threshold register for `context`. Threshold
+/// `value=0` accepts every priority level >= 1 (the QEMU virt default
+/// is `value=0`; we set it explicitly so the boot ordering is
+/// deterministic).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn write_plic_threshold(base: usize, context: usize, value: u32) {
+    const PLIC_CONTEXT_BASE_OFFSET: usize = 0x0020_0000;
+    const PLIC_CONTEXT_STRIDE: usize = 0x1000;
+    let threshold_addr = base + PLIC_CONTEXT_BASE_OFFSET + (context * PLIC_CONTEXT_STRIDE);
+    unsafe {
+        core::ptr::write_volatile(threshold_addr as *mut u32, value);
+    }
+}
+
+#[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+fn write_plic_threshold(_base: usize, _context: usize, _value: u32) {}
 
 pub fn init_fired() -> bool {
     PLIC_INIT_FIRED.load(Ordering::Relaxed)
@@ -140,5 +207,20 @@ mod tests {
     fn deferred_reason_strings_match_smoke_gate() {
         assert_eq!(DEFER_REASON_NO_SAFE_SOURCE, "no_safe_source");
         assert_eq!(DEFER_REASON_AUDIT_PENDING, "extirq_audit_pending");
+    }
+
+    #[test]
+    fn qemu_virt_source_ids_are_pinned() {
+        assert_eq!(QEMU_VIRT_UART0_SOURCE_ID, 10);
+        assert_eq!(QEMU_VIRT_VIRTIO_MMIO_BASE_SOURCE_ID, 1);
+        assert_eq!(QEMU_VIRT_VIRTIO_MMIO_LAST_SOURCE_ID, 8);
+    }
+
+    #[test]
+    fn enumerated_source_count_matches_known_qemu_virt_layout() {
+        reset_for_test();
+        let _ = init_plic_after_idle_safe_point();
+        // 8 virtio-mmio sources + 1 UART0 source = 9 enumerated.
+        assert_eq!(discovered_sources(), 9);
     }
 }

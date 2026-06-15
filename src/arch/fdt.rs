@@ -281,6 +281,82 @@ fn parse_cpu_unit_addr(name: &[u8]) -> Option<u32> {
     Some(value)
 }
 
+/// Locates the first node whose name begins with `prefix` (e.g. `b"plic@"`)
+/// and returns its first `(address, size)` reg pair under the governing
+/// root cell sizes (defaulting to 2/2 — the QEMU virt layout). Walks
+/// nested children correctly so a node beneath `/soc/` is reachable.
+/// Returns `None` if the FDT is structurally invalid or the node is
+/// absent.
+pub fn find_node_reg_by_name_prefix(bytes: &[u8], prefix: &[u8]) -> Option<(u64, u64)> {
+    if read_be_u32(bytes, 0)? != FDT_MAGIC {
+        return None;
+    }
+    let total_size = read_be_u32(bytes, 4)? as usize;
+    let off_dt_struct = read_be_u32(bytes, 8)? as usize;
+    let off_dt_strings = read_be_u32(bytes, 12)? as usize;
+    let size_dt_strings = read_be_u32(bytes, 32)? as usize;
+    let size_dt_struct = read_be_u32(bytes, 36)? as usize;
+    if total_size > bytes.len()
+        || off_dt_struct.checked_add(size_dt_struct)? > total_size
+        || off_dt_strings.checked_add(size_dt_strings)? > total_size
+    {
+        return None;
+    }
+    let struct_block = &bytes[off_dt_struct..off_dt_struct + size_dt_struct];
+    let strings = &bytes[off_dt_strings..off_dt_strings + size_dt_strings];
+    let mut cursor = 0usize;
+    let mut depth = 0usize;
+    let mut address_cells: u32 = 2;
+    let mut size_cells: u32 = 2;
+    let mut in_target_depth: Option<usize> = None;
+
+    while cursor + 4 <= struct_block.len() {
+        let token = read_be_u32(struct_block, cursor)?;
+        cursor += 4;
+        match token {
+            FDT_BEGIN_NODE => {
+                let (name, next) = read_cstr(struct_block, cursor)?;
+                cursor = align_up_4(next)?;
+                depth = depth.checked_add(1)?;
+                if in_target_depth.is_none() && name.starts_with(prefix) {
+                    in_target_depth = Some(depth);
+                }
+            }
+            FDT_END_NODE => {
+                if in_target_depth == Some(depth) {
+                    in_target_depth = None;
+                }
+                depth = depth.checked_sub(1)?;
+            }
+            FDT_PROP => {
+                let prop_len = read_be_u32(struct_block, cursor)? as usize;
+                let name_off = read_be_u32(struct_block, cursor + 4)? as usize;
+                cursor = cursor.checked_add(8)?;
+                let prop_end = cursor.checked_add(prop_len)?;
+                if prop_end > struct_block.len() {
+                    return None;
+                }
+                let prop_data = &struct_block[cursor..prop_end];
+                cursor = align_up_4(prop_end)?;
+                let prop_name = read_cstr(strings, name_off)?.0;
+                if depth == 1 && prop_name == b"#address-cells" {
+                    address_cells = read_be_u32(prop_data, 0)?;
+                }
+                if depth == 1 && prop_name == b"#size-cells" {
+                    size_cells = read_be_u32(prop_data, 0)?;
+                }
+                if in_target_depth == Some(depth) && prop_name == b"reg" {
+                    return decode_reg_pair(prop_data, address_cells, size_cells);
+                }
+            }
+            FDT_NOP => {}
+            FDT_END => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Returns the `/chosen` `linux,initrd-start` / `linux,initrd-end` pair as
 /// `(start, end)` physical addresses, if present. Each value may be encoded as
 /// a 4-byte or 8-byte big-endian integer (QEMU uses either depending on
@@ -739,5 +815,85 @@ mod tests {
     fn cpus_hart_id_bitmap_returns_zero_when_no_cpus_node() {
         let dtb = make_dtb_with_memory(2, 2, 0x8000_0000, 0x2000_0000, None);
         assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0));
+    }
+
+    /// Build a minimal DTB with a single `plic@<base>` node carrying a
+    /// `reg` property under root cell sizes 2/2.
+    fn make_dtb_with_plic(plic_base: u64, plic_size: u64) -> Vec<u8> {
+        let mut structure = Vec::new();
+        let mut strings = Vec::new();
+        let mut str_off = |strings: &mut Vec<u8>, s: &[u8]| -> u32 {
+            let off = strings.len() as u32;
+            strings.extend_from_slice(s);
+            strings.push(0);
+            off
+        };
+        let ac_off = str_off(&mut strings, b"#address-cells");
+        let sc_off = str_off(&mut strings, b"#size-cells");
+        let reg_off = str_off(&mut strings, b"reg");
+
+        push_u32(&mut structure, FDT_BEGIN_NODE);
+        structure.push(0);
+        align(&mut structure);
+        push_u32(&mut structure, FDT_PROP);
+        push_u32(&mut structure, 4);
+        push_u32(&mut structure, ac_off);
+        push_u32(&mut structure, 2);
+        push_u32(&mut structure, FDT_PROP);
+        push_u32(&mut structure, 4);
+        push_u32(&mut structure, sc_off);
+        push_u32(&mut structure, 2);
+
+        push_u32(&mut structure, FDT_BEGIN_NODE);
+        structure.extend_from_slice(b"plic@c000000\0");
+        align(&mut structure);
+        push_u32(&mut structure, FDT_PROP);
+        push_u32(&mut structure, 16);
+        push_u32(&mut structure, reg_off);
+        push_u32(&mut structure, (plic_base >> 32) as u32);
+        push_u32(&mut structure, plic_base as u32);
+        push_u32(&mut structure, (plic_size >> 32) as u32);
+        push_u32(&mut structure, plic_size as u32);
+        push_u32(&mut structure, FDT_END_NODE);
+
+        push_u32(&mut structure, FDT_END_NODE);
+        push_u32(&mut structure, FDT_END);
+
+        let header = 40usize;
+        let strings_offset = header + structure.len();
+        let total = strings_offset + strings.len();
+        let mut dtb = Vec::new();
+        for value in [
+            FDT_MAGIC,
+            total as u32,
+            header as u32,
+            strings_offset as u32,
+            header as u32,
+            17,
+            16,
+            0,
+            strings.len() as u32,
+            structure.len() as u32,
+        ] {
+            push_u32(&mut dtb, value);
+        }
+        dtb.extend_from_slice(&structure);
+        dtb.extend_from_slice(&strings);
+        dtb
+    }
+
+    #[test]
+    fn find_node_reg_by_name_prefix_locates_plic_at_qemu_virt_base() {
+        let dtb = make_dtb_with_plic(0x0C00_0000, 0x0040_0000);
+        assert_eq!(
+            find_node_reg_by_name_prefix(&dtb, b"plic@"),
+            Some((0x0C00_0000, 0x0040_0000))
+        );
+    }
+
+    #[test]
+    fn find_node_reg_by_name_prefix_returns_none_for_absent_node() {
+        let dtb = make_dtb_with_plic(0x0C00_0000, 0x0040_0000);
+        assert_eq!(find_node_reg_by_name_prefix(&dtb, b"clint@"), None);
     }
 }

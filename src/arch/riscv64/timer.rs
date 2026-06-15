@@ -53,6 +53,11 @@ pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {
     }
 
     emit_marker(format_args!("RISCV_TIMER_INIT_BEGIN"));
+    // Mechanism breadcrumb: this pass uses the SBI Timer extension. A
+    // future build that switches to `stimecmp` (Sstc) must emit
+    // `RISCV_TIMER_MECHANISM value=stimecmp` here and document the
+    // QEMU-virt compatibility implication.
+    emit_marker(format_args!("RISCV_TIMER_MECHANISM value=sbi_time"));
 
     let sbi_timer_present = match probe_extension(SBI_EXT_TIME) {
         Ok(value) => value != 0,
