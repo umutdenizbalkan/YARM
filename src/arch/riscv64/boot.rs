@@ -145,6 +145,40 @@ pub fn boot_hart_id() -> usize {
     0
 }
 
+/// Captured DTB slice for late consumers (PLIC discovery, future
+/// interrupt-source enumeration). Set once from `prepare_arch_boot` after
+/// the FDT magic + size checks pass. Lives in `.bss` so a missing
+/// `save_dtb_for_late_consumers` call simply yields `None`.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static CAPTURED_DTB_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+static CAPTURED_DTB_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn save_dtb_for_late_consumers(dtb: &'static [u8]) {
+    CAPTURED_DTB_PTR.store(dtb.as_ptr() as usize, core::sync::atomic::Ordering::Release);
+    CAPTURED_DTB_LEN.store(dtb.len(), core::sync::atomic::Ordering::Release);
+}
+
+/// Returns the captured DTB slice, if one was saved during
+/// `prepare_arch_boot`. Late consumers (e.g. PLIC discovery from the
+/// idle-safe point) read this to walk the FDT a second time without
+/// re-resolving the OpenSBI handoff pointer.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+pub fn captured_dtb() -> Option<&'static [u8]> {
+    let ptr = CAPTURED_DTB_PTR.load(core::sync::atomic::Ordering::Acquire);
+    let len = CAPTURED_DTB_LEN.load(core::sync::atomic::Ordering::Acquire);
+    if ptr == 0 || len == 0 {
+        return None;
+    }
+    Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
+}
+
+#[cfg(any(feature = "hosted-dev", not(target_arch = "riscv64")))]
+pub fn captured_dtb() -> Option<&'static [u8]> {
+    None
+}
+
 /// UART line-lock to serialize multi-hart `console_putchar` SBI output.
 ///
 /// `early_sbi_marker` writes one byte at a time via legacy SBI; concurrent
@@ -250,6 +284,11 @@ unsafe extern "C" {
 extern "C" fn yarm_riscv64_primary_entry(hart_id: usize, dtb_ptr: usize) -> ! {
     early_marker!("RISCV_BOOT_ENTRY hart={} dtb=0x{:x}", hart_id, dtb_ptr);
     early_marker!("RISCV_BOOT_HART_SELECTED hart={}", hart_id);
+    // Confirm the asm-captured OpenSBI hart-id matches what's now in `a0`.
+    // The slot was written from `_start` via the atomic CAS path; this
+    // breadcrumb proves the captured value matches the live one so any
+    // future asm refactor cannot silently drift the boot-hart id.
+    early_marker!("RISCV_BOOT_HART_ID_STORED hart={}", boot_hart_id());
     // Park every non-bootstrap hart in a safe Rust loop BEFORE the boot hart
     // touches BSS, the allocator, cmdline capture, or kernel bootstrap.
     park_secondary_harts_early();
@@ -1791,6 +1830,12 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
         captured.raw_cmdline().len()
     );
 
+    // Save the DTB slice for late consumers (PLIC discovery, future
+    // interrupt-source enumeration). The slice is `'static` because it
+    // points at firmware-owned memory that the bootloader does not
+    // recycle for the lifetime of the kernel.
+    save_dtb_for_late_consumers(dtb);
+
     // Stage the real RAM window and reserve firmware/DTB/initrd so the frame
     // allocator never hands out MMIO or firmware memory. Without this the
     // common fallback memory map (NEXT_ANON_PHYS_BASE = 0x1000_0000, the QEMU
@@ -1827,6 +1872,15 @@ fn stage_riscv64_present_cpu_bitmap(dtb: &'static [u8]) {
     crate::yarm_log!(
         "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled"
     );
+    // Live multi-hart IRQ delivery is not validated in this build. The
+    // smoke gate accepts live timer + PLIC under -smp 1; for present_cpus
+    // > 1 we explicitly record the deferral so a regression cannot
+    // silently widen the IRQ scope.
+    if bitmap.count_ones() > 1 {
+        crate::yarm_log!(
+            "RISCV_IRQ_SMP_TOPOLOGY_DEFERRED reason=present_topology_not_live_validated"
+        );
+    }
 }
 
 /// Stages the real RAM window from the DTB and reserves the firmware, DTB, and
