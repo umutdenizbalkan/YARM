@@ -83,7 +83,7 @@ Absent such redesign decisions, this document is the authoritative stopping-poin
 
 ## Related status document
 
-- See `doc/SERVER_RUNTIME_REFACTOR_STATUS.md` for current server-runtime / POSIX / VFS refactor completion state and known blockers.
+- See `doc/PROJECT_HISTORY.md` for current server-runtime / POSIX / VFS refactor completion state and known blockers.
 
 ## Capability-based restart boundary (current)
 

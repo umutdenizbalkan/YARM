@@ -27,9 +27,9 @@ fragment files unless the canonical owner explicitly does not exist.
 | Capabilities (rights, domains, cspace access) | `doc/CAPABILITY_MODEL.md` (to be consolidated; see TODO §3) |
 | Process / spawn (PM contract, TID allocation, control plane) | `doc/PROCESS_AND_SPAWN.md` (to be consolidated; see TODO §3) |
 | Service manifest format | `doc/SERVICE_MANIFEST.md` |
-| Project history (closed phases / milestones / checklists) | `doc/PROJECT_HISTORY.md` (to be created; see TODO §1) |
+| Project history (closed phases / milestones / checklists) | **`doc/PROJECT_HISTORY.md`** |
 | Roadmap (current direction) | `doc/ROADMAP.md` |
-| Project status / maturity | `doc/STATUS.md` (to be consolidated; see TODO §1) |
+| Project status / maturity | **`doc/STATUS.md`** |
 | Agent rules (capability/spawn/zero-copy/smoke policy) | `doc/AI_AGENT_RULES.md` |
 | Kernel test rules (per-rule unit-test guard rails) | `doc/KERNEL_TEST_RULES.md` |
 | Cross-cutting agent-facing reference | `doc/AGENTS.md` |
@@ -71,35 +71,42 @@ The primary kernel-unlocking consolidation landed in this pass. The
 secondary clusters listed below remain open and should be tackled one
 cluster at a time:
 
-### TODO §1 — Project history / status
+### TODO §1 — Project history / status — DONE (Pass 3)
 
-- Migrate closed phase / milestone / checklist files into a new
-  `doc/PROJECT_HISTORY.md`, then delete the originals:
-  - `doc/P2_8_P2_9_CHECKLIST.md`
-  - `doc/P2_10_CHECKLIST.md`
-  - `doc/PHASE0_IPC_BASELINE_GATES.md`
-  - `doc/PHASE1_PAYLOAD_POLICY.md`
-  - `doc/PHASE2B_MILESTONE.md`
-  - `doc/PHASE2_DRIVER_CONTRACT.md`
-  - `doc/PHASE3A_MILESTONE.md`
-  - `doc/PHASE3B_MILESTONE.md`
-  - `doc/PHASE3_NETWORK_CONTRACT.md`
-  - `doc/PHASE4_CALL_REPLY_CAP_PLAN.md`
-  - `doc/PHASE4_UI_CONTRACT.md`
-  - `doc/PHASE6_EXIT_GATE_REPORT.md`
-  - `doc/PHASE6_SERVICE_MIGRATION_MATRIX.md`
-  - `doc/OPTIONAL_FS_MILESTONE_1.md`
-  - `doc/FREESTANDING_SERVICE_ISOLATION_PR_PLAN.md`
-  - `doc/INIT_SERVER_INITRAMFS_BOOT_PR_BOARD.md`
-  - `doc/TID_ALLOCATION_POLICY_PR_PLAN.md`
-- Consolidate status / maturity / readiness into `doc/STATUS.md`, then
-  delete:
-  - `doc/SERVER_ROADMAP.md`
-  - `doc/SERVER_RUNTIME_REFACTOR_STATUS.md`
-  - `doc/USERSPACE_SERVER_MATURITY.md`
-  - `doc/USERSPACE_SERVER_BINARIES.md`
-  - `doc/PHASE_READINESS_MATRIX.md`
-  - `doc/KERNEL_STATUS.md`
+Pass 3 created `doc/PROJECT_HISTORY.md` (chronological closed-milestone
+log + per-phase outcome detail) and `doc/STATUS.md` (live per-arch /
+per-service / documentation-ownership / next-steps snapshot).
+
+Deleted in the same pass: `P2_8_P2_9_CHECKLIST.md`, `P2_10_CHECKLIST.md`,
+`PHASE0_IPC_BASELINE_GATES.md`, `PHASE1_PAYLOAD_POLICY.md`,
+`PHASE2B_MILESTONE.md`, `PHASE3A_MILESTONE.md`, `PHASE3B_MILESTONE.md`,
+`PHASE4_CALL_REPLY_CAP_PLAN.md`, `PHASE6_EXIT_GATE_REPORT.md`,
+`PHASE6_SERVICE_MIGRATION_MATRIX.md`, `OPTIONAL_FS_MILESTONE_1.md`,
+`FREESTANDING_SERVICE_ISOLATION_PR_PLAN.md`,
+`INIT_SERVER_INITRAMFS_BOOT_PR_BOARD.md`, `TID_ALLOCATION_POLICY_PR_PLAN.md`,
+`SERVER_RUNTIME_REFACTOR_STATUS.md`, `USERSPACE_SERVER_MATURITY.md`,
+`USERSPACE_SERVER_BINARIES.md`.
+
+**Deferred to Pass 4** (live CI gate scripts pin specific file names
+and content; deletion would break gate checks):
+
+- `doc/KERNEL_STATUS.md` — `scripts/check-boundary-milestone-freeze.sh`
+  requires the literal `PR-BND-6 pass C landed` string in this file.
+- `doc/SERVER_ROADMAP.md` — `scripts/check-roadmap-readiness.sh`
+  enforces frozen-section + dated-addenda + gate-wiring text in this
+  file.
+- `doc/PHASE_READINESS_MATRIX.md` — `scripts/check-roadmap-readiness.sh`
+  enforces specific CI-token strings (`phase2-driver-gates`,
+  `phase3-network-gates`, `phase4-ui-gates`, `phase4-ui-smoke-marker`,
+  `phase5-boundary-gates`).
+- `doc/PHASE2_DRIVER_CONTRACT.md`, `doc/PHASE3_NETWORK_CONTRACT.md`,
+  `doc/PHASE4_UI_CONTRACT.md` — `scripts/check-roadmap-readiness.sh`
+  requires the files to exist as the phase contracts.
+
+These six files will be consolidated alongside the IPC / VFS / FS /
+networking / capability / process clusters in Pass 4, where the same PR
+can update the gate scripts to point at the new canonical owners
+(`doc/STATUS.md` + per-domain contract docs).
 
 ### TODO §2 — Boot / architecture — DONE (Pass 2)
 

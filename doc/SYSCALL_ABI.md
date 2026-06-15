@@ -346,7 +346,7 @@ holes from implemented privileged paths.
 - **Timed wait migration target**: control-plane services should migrate blocking receive loops to `IpcRecvTimeout` with explicit tick budgets; indefinite waits are allowed only where watchdog/supervisor policy explicitly permits.
 - **Request/reply migration target**: for standard RPC flows, use `IpcCall`/`IpcReply` single-use reply-cap semantics instead of maintaining ad-hoc reply endpoints.
 - **Legacy choreography deprecation**: two-endpoint request/reply choreography is deprecated for new or updated core services during Phase 6. Existing deployments remain supported during the migration window.
-  - **waiver ledger source**: `PHASE6_EXIT_GATE_REPORT.md`.
+  - **waiver ledger source**: `doc/PROJECT_HISTORY.md`.
 - **Shared-memory lifecycle requirement**: services receiving shared-memory auto-maps must complete `TransferRelease` as the release primitive; manual side-band cleanup protocols are deprecated.
 - **Removal gate**: legacy request/reply choreography removal is deferred until all core control-plane services are migrated and Phase 6 exit criteria are met.
 - **Current migration snapshot**: Phase 6 pass 2 migrates the VFS control-plane kernel-IPC roundtrip receive path to bounded timed receives (`IpcRecvTimeout`-equivalent kernel deadline receive), establishing the first service-level cut.
@@ -357,7 +357,7 @@ holes from implemented privileged paths.
 - **Current migration snapshot (pass 7)**: control-plane module-level guardrails now assert migrated VFS/supervisor sources remain free of legacy blocking `IpcRecv` call-sites.
 - **Current migration snapshot (pass 13)**: Process Manager kernel-IPC roundtrip now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) instead of ad-hoc two-endpoint server reply sends.
 - **Current migration snapshot (pass 14)**: VFS kernel-IPC roundtrip now uses reply-cap call/reply choreography (`create_reply_cap_for_caller` + `ipc_reply`) instead of ad-hoc two-endpoint server reply sends.
-- **Current migration snapshot (pass 19)**: Phase 6 service migration/deprecation slices are complete at the service level; core control-plane services are recorded as migrated or dated-waived in `PHASE6_SERVICE_MIGRATION_MATRIX.md`, with final global sign-off held until remaining Phase 4 lifecycle closure.
+- **Current migration snapshot (pass 19)**: Phase 6 service migration/deprecation slices are complete at the service level; core control-plane services are recorded as migrated or dated-waived in `doc/PROJECT_HISTORY.md`, with final global sign-off held until remaining Phase 4 lifecycle closure.
 
 ## Return layout
 

@@ -1466,7 +1466,7 @@ work before pausing for kernel unlocking.
    from `rg -ai -c "\bpanic\b"` to a two-stage filter: match panic lines, then
    exclude those with `nonfatal=true`.
 
-2. **New doc: `doc/OPTIONAL_FS_MILESTONE_1.md`**: authoritative milestone record.
+2. **New doc: `doc/PROJECT_HISTORY.md`**: authoritative milestone record.
    Includes gate matrix, mount matrix, shared-I/O matrix, spawn image IDs, smoke
    commands, expected/forbidden markers, and exact deferred-work list.
 

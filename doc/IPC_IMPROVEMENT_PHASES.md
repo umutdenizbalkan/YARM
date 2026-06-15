@@ -227,7 +227,7 @@ Superseded/clarified by finalized ABI:
 ## Phase 6 artifacts (pass 8)
 
 - Core-service inventory + migration matrix freeze (PR-6.1):
-  - added `PHASE6_SERVICE_MIGRATION_MATRIX.md` with per-service current state, target primitive, owner, risk, status, and planned PR sequence.
+  - added `doc/PROJECT_HISTORY.md` with per-service current state, target primitive, owner, risk, status, and planned PR sequence.
   - matrix now serves as the canonical tracker for remaining Phase 6 implementation slices.
 
 ## Phase 6 artifacts (pass 9)
@@ -270,7 +270,7 @@ Superseded/clarified by finalized ABI:
 ## Phase 6 artifacts (pass 16)
 
 - PR-6.5 exit-gate report bootstrap:
-  - added `PHASE6_EXIT_GATE_REPORT.md` with:
+  - added `doc/PROJECT_HISTORY.md` with:
     - current gate checklist,
     - dated deprecation checkpoints,
     - draft dated waivers for remaining supervisor/init closure items,
@@ -290,8 +290,8 @@ Superseded/clarified by finalized ABI:
 ## Phase 6 artifacts (pass 19)
 
 - PR-6.5 sign-off closure:
-  - `PHASE6_SERVICE_MIGRATION_MATRIX.md` rows are finalized as `✅ migrated` or `✅ waived (dated)` across core control-plane services.
-  - `PHASE6_EXIT_GATE_REPORT.md` is promoted from draft to sign-off report with closure summary and dated waiver ledger.
+  - `doc/PROJECT_HISTORY.md` rows are finalized as `✅ migrated` or `✅ waived (dated)` across core control-plane services.
+  - `doc/PROJECT_HISTORY.md` is promoted from draft to sign-off report with closure summary and dated waiver ledger.
   - Phase 6 status is flipped to complete, with dated sunset tracking retained through September 30, 2026 checkpoint.
 
 ## Cross-phase quality gates
@@ -303,14 +303,14 @@ Superseded/clarified by finalized ABI:
 
 ## Phase 0 artifacts
 
-- Baseline gate doc: `PHASE0_IPC_BASELINE_GATES.md`
+- Baseline gate doc: `doc/PROJECT_HISTORY.md`
   - Locks round-trip endpoint IPC behavior.
   - Locks IRQ notification routing behavior.
   - Locks shared-memory transfer descriptor + auto-map/release behavior.
 
 ## Phase 1 artifacts
 
-- Payload policy + benchmark matrix: `PHASE1_PAYLOAD_POLICY.md`
+- Payload policy + benchmark matrix: `doc/PROJECT_HISTORY.md`
 - Medium payload fragmentation design: `IPC_FRAGMENTATION_POLICY.md`
 - Repro benchmark command:
   - `cargo test -q --test phase1_payload_bench -- --nocapture`
@@ -335,7 +335,7 @@ Superseded/clarified by finalized ABI:
 ## Phase 4 artifacts (partial)
 
 - Call/reply capability execution plan:
-  - `PHASE4_CALL_REPLY_CAP_PLAN.md`
+  - `doc/PROJECT_HISTORY.md`
 - Slice 1 implementation:
   - `CapObject::Reply` kernel object variant and generation-protected reply-cap record table.
   - `create_reply_cap_for_caller(...)` and single-use `ipc_reply(...)` path.
