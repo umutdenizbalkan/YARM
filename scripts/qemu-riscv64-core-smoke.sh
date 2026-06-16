@@ -17,7 +17,8 @@ QEMU_SMP=${QEMU_SMP:-1}
 QEMU_BIOS=${QEMU_BIOS:-default}
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"console=ttyS0 rdinit=/init"}
 
-# CLI: --smp 2  → enable smp=2 secondary-park assertion.
+# CLI: --smp N           → enable smp=N secondary-park assertion.
+#      --timeout SECS    → override TIMEOUT_SECS for this run.
 while (( $# > 0 )); do
   case "$1" in
     --smp)
@@ -26,6 +27,14 @@ while (( $# > 0 )); do
       ;;
     --smp=*)
       QEMU_SMP="${1#--smp=}"
+      shift
+      ;;
+    --timeout)
+      TIMEOUT_SECS="$2"
+      shift 2
+      ;;
+    --timeout=*)
+      TIMEOUT_SECS="${1#--timeout=}"
       shift
       ;;
     *)
@@ -70,9 +79,12 @@ fi
 REQUIRED_PATTERNS=(
   "YARM_BOOT_OK"
   "RISCV_KERNEL_BOOT_OK"
+  "RISCV_BOOT_ENTRY hart="
   "RISCV_BOOT_HART_SELECTED hart="
   "RISCV_BOOT_HART_ID_STORED hart="
+  "RISCV_DTB_CPU_SCAN_DONE bitmap="
   "RISCV_HART_TOPOLOGY present_cpus="
+  "RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled"
   "RISCV_LIVEEEEEEE"
   "RISCV_SYSCALL_ROUNDTRIP_OK"
   "RISCV_USER_RESUMED"
@@ -80,20 +92,20 @@ REQUIRED_PATTERNS=(
   "DEVFS_SRV_ENTRY"
   "VFS_SRV_ENTRY"
   "VFS_MOUNT_TABLE_READY"
+  "RAMFS_MOUNT_READY"
+  "VFS_MOUNT_REGISTER_RAMFS_OK"
+  "EXT4_SRV_READY"
+  "VFS_MOUNT_REGISTER_EXT4_OK"
   "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
   "RISCV_TIMER_MECHANISM value="
   "RISCV_PLIC_BASE value="
   "RISCV_PLIC_CONTEXT value="
 )
 
-# RAMFS/EXT4 mount markers are emitted when those servers register their
-# mount points; treated as required for the core smoke once the chain runs.
-OPTIONAL_FS_PATTERNS=(
-  "RAMFS_MOUNT_READY"
-  "VFS_MOUNT_REGISTER_RAMFS_OK"
-  "EXT4_SRV_READY"
-  "VFS_MOUNT_REGISTER_EXT4_OK"
-)
+# Nothing optional today: all required RAMFS/EXT4 markers above are
+# emitted deterministically on QEMU virt. This array is kept for future
+# additions that may need to land soft before being promoted to required.
+OPTIONAL_FS_PATTERNS=()
 
 # Timer / PLIC / external-IRQ acceptance: either the live marker OR the
 # explicit deferral with reason. The kernel must emit exactly one of each

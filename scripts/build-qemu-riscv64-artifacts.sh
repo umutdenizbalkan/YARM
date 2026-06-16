@@ -121,5 +121,28 @@ if [[ -f "$KERNEL_ELF" ]]; then
   fi
 fi
 
-echo "[ok] initramfs image: $INITRAMFS_IMAGE_ABS"
-[[ -f "$KERNEL_IMAGE" ]] && echo "[ok] kernel image: $KERNEL_IMAGE" || echo "[warn] kernel image missing: $KERNEL_IMAGE"
+artifact_report() {
+  local label="$1"
+  local path="$2"
+  if [[ -f "$path" ]]; then
+    local sz
+    sz=$(stat -c '%s' "$path" 2>/dev/null || wc -c <"$path")
+    echo "[ok] ${label}: ${path} (size=${sz} bytes)"
+    return 0
+  fi
+  echo "[fail] ${label} missing: ${path}"
+  return 1
+}
+
+missing=0
+artifact_report "initramfs image" "$INITRAMFS_IMAGE_ABS" || missing=$((missing + 1))
+artifact_report "kernel image" "$KERNEL_IMAGE" || missing=$((missing + 1))
+
+if (( missing > 0 )); then
+  echo "[fail] build-qemu-riscv64-artifacts: ${missing} required artifact(s) missing"
+  [[ "$ARTIFACTS_STRICT" == "1" ]] && exit 1
+  exit 0
+fi
+
+echo "[ok] riscv64 qemu artifacts completed"
+echo "[next] run smoke boot: scripts/qemu-riscv64-core-smoke.sh"
