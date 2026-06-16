@@ -22,6 +22,13 @@ use super::platform_layout;
 /// source-grep test below. Do not reword without updating both.
 pub const DEFER_REASON_NO_SAFE_SOURCE: &str = "no_safe_source";
 pub const DEFER_REASON_AUDIT_PENDING: &str = "extirq_audit_pending";
+/// By the time `init_plic_after_idle_safe_point` runs, the active `satp`
+/// (installed for the first dispatched user task) only maps the
+/// kernel-shared gigapage (`RISCV_KERNEL_SHARED_BASE..END`, RAM only); the
+/// PLIC's physical MMIO window sits below RAM and is never covered by that
+/// mapping. Writing there would fault (`StoreAMOPageFault`), so the
+/// threshold write is skipped and reported with this reason instead.
+pub const DEFER_REASON_MMIO_UNMAPPED: &str = "plic_mmio_unmapped_under_active_satp";
 
 /// Source IDs for the QEMU virt RISC-V platform. These are well-known
 /// (documented in the QEMU virt-machine source); enumeration here is
@@ -29,6 +36,11 @@ pub const DEFER_REASON_AUDIT_PENDING: &str = "extirq_audit_pending";
 pub const QEMU_VIRT_UART0_SOURCE_ID: u16 = 10;
 pub const QEMU_VIRT_VIRTIO_MMIO_BASE_SOURCE_ID: u16 = 1;
 pub const QEMU_VIRT_VIRTIO_MMIO_LAST_SOURCE_ID: u16 = 8;
+
+/// PLIC S-mode context-claim region layout, shared between the coverage
+/// check in `init_plic_after_idle_safe_point` and `write_plic_threshold`.
+const PLIC_CONTEXT_BASE_OFFSET: usize = 0x0020_0000;
+const PLIC_CONTEXT_STRIDE: usize = 0x1000;
 
 static PLIC_INIT_FIRED: AtomicBool = AtomicBool::new(false);
 static PLIC_DISCOVERED_SOURCES: AtomicUsize = AtomicUsize::new(0);
@@ -89,12 +101,27 @@ pub fn init_plic_after_idle_safe_point() -> Option<&'static str> {
     // claim/complete plumbing in `super::irq`. This is a write to the
     // module-local atomics only; no MMIO is performed.
     irq::configure_plic_from_platform_layout();
-    write_plic_threshold(base, context, 0u32);
-    emit_marker(format_args!(
-        "RISCV_PLIC_THRESHOLD_SET context={} value={}",
-        context, 0u32
-    ));
-    emit_marker(format_args!("RISCV_PLIC_INIT_DONE"));
+
+    let threshold_addr = base + PLIC_CONTEXT_BASE_OFFSET + (context * PLIC_CONTEXT_STRIDE);
+    if addr_range_covered_by_kernel_shared_mapping(threshold_addr, core::mem::size_of::<u32>()) {
+        write_plic_threshold(base, context, 0u32);
+        emit_marker(format_args!(
+            "RISCV_PLIC_THRESHOLD_SET context={} value={}",
+            context, 0u32
+        ));
+        emit_marker(format_args!("RISCV_PLIC_INIT_DONE"));
+    } else {
+        // `init_plic_after_idle_safe_point` only ever runs from the
+        // idle-trap path, by which point the active `satp` maps nothing
+        // but the kernel-shared gigapage (RAM only). The PLIC's physical
+        // MMIO window is never covered by that mapping, so the threshold
+        // write would fault; skip it and report the exact reason instead
+        // of crashing.
+        emit_marker(format_args!(
+            "RISCV_PLIC_DEFERRED reason={}",
+            DEFER_REASON_MMIO_UNMAPPED
+        ));
+    }
 
     // External-IRQ enable is deferred: we emit the explicit select +
     // defer pair so the smoke gate can read both the candidate source
@@ -124,14 +151,26 @@ fn resolve_plic_base() -> (usize, &'static str) {
     (platform_layout::PLIC_MMIO_BASE, "qemu_virt_fallback")
 }
 
+/// Returns true if the inclusive byte range `[addr, addr+len)` falls
+/// entirely within the single kernel-shared gigapage that
+/// `map_kernel_shared_into_asid` installs into every user ASID's page
+/// table. A PLIC MMIO write is only safe to perform under the active
+/// `satp` if its physical address is covered by that mapping.
+fn addr_range_covered_by_kernel_shared_mapping(addr: usize, len: usize) -> bool {
+    let start = addr as u64;
+    let end = start.saturating_add(len as u64);
+    start >= super::page_table::RISCV_KERNEL_SHARED_BASE
+        && end <= super::page_table::RISCV_KERNEL_SHARED_END
+}
+
 /// Writes the PLIC S-mode threshold register for `context`. Threshold
 /// `value=0` accepts every priority level >= 1 (the QEMU virt default
 /// is `value=0`; we set it explicitly so the boot ordering is
-/// deterministic).
+/// deterministic). Callers must first confirm the target address is
+/// covered by the active mapping via
+/// `addr_range_covered_by_kernel_shared_mapping`.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn write_plic_threshold(base: usize, context: usize, value: u32) {
-    const PLIC_CONTEXT_BASE_OFFSET: usize = 0x0020_0000;
-    const PLIC_CONTEXT_STRIDE: usize = 0x1000;
     let threshold_addr = base + PLIC_CONTEXT_BASE_OFFSET + (context * PLIC_CONTEXT_STRIDE);
     unsafe {
         core::ptr::write_volatile(threshold_addr as *mut u32, value);
@@ -222,5 +261,24 @@ mod tests {
         let _ = init_plic_after_idle_safe_point();
         // 8 virtio-mmio sources + 1 UART0 source = 9 enumerated.
         assert_eq!(discovered_sources(), 9);
+    }
+
+    #[test]
+    fn qemu_virt_plic_base_is_not_covered_by_kernel_shared_mapping() {
+        // QEMU virt's PLIC sits at 0x0C00_0000, well below the
+        // kernel-shared gigapage's 0x8000_0000 base, so the threshold
+        // write must be skipped rather than faulting.
+        assert!(!addr_range_covered_by_kernel_shared_mapping(
+            platform_layout::PLIC_MMIO_BASE,
+            4
+        ));
+    }
+
+    #[test]
+    fn kernel_shared_range_itself_is_covered() {
+        assert!(addr_range_covered_by_kernel_shared_mapping(
+            super::super::page_table::RISCV_KERNEL_SHARED_BASE as usize,
+            4
+        ));
     }
 }

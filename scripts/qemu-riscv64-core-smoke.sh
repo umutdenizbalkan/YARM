@@ -113,6 +113,10 @@ REJECT_PATTERNS=(
   'Vm\(Full\)'
   '\boom\b'
   '\bcapacity\b'
+  # A real QEMU virt DTB always has a well-formed /cpus node; a scan
+  # failure here means the bitmap silently fell back to the single-hart
+  # default instead of reflecting the real topology.
+  'RISCV_DTB_CPU_SCAN_FAILED'
 )
 
 failures=0
@@ -130,17 +134,17 @@ for pat in "${OPTIONAL_FS_PATTERNS[@]}"; do
   fi
 done
 
-if ! rg -nE "$TIMER_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+if ! rg -n "$TIMER_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
   echo "[fail] neither RISCV_TIMER_SMOKE_OK nor RISCV_TIMER_DEFERRED present"
   failures=$((failures + 1))
 fi
 
-if ! rg -nE "$PLIC_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+if ! rg -n "$PLIC_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
   echo "[fail] neither RISCV_PLIC_INIT_DONE nor RISCV_PLIC_DEFERRED present"
   failures=$((failures + 1))
 fi
 
-if ! rg -nE "$EXTIRQ_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
+if ! rg -n "$EXTIRQ_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
   echo "[fail] neither RISCV_EXTIRQ_SMOKE_OK nor RISCV_EXTIRQ_DEFERRED present"
   failures=$((failures + 1))
 fi
@@ -155,7 +159,7 @@ if (( missing_dtb_count > 1 )); then
 fi
 
 for pat in "${REJECT_PATTERNS[@]}"; do
-  if rg -nE "$pat" "$LOGFILE" >/dev/null 2>&1; then
+  if rg -n "$pat" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] rejected pattern present: $pat"
     failures=$((failures + 1))
   fi
@@ -179,8 +183,20 @@ if rg -n "RISCV_TRAP_HALTED reason=" "$LOGFILE" >/dev/null 2>&1; then
 fi
 
 if (( QEMU_SMP >= 2 )); then
-  if ! rg -nE "RISCV_SECONDARY_HART_PARK hart=" "$LOGFILE" >/dev/null 2>&1; then
+  if ! rg -n "RISCV_SECONDARY_HART_PARK hart=" "$LOGFILE" >/dev/null 2>&1; then
     echo "[fail] --smp ${QEMU_SMP} requires RISCV_SECONDARY_HART_PARK hart=N"
+    failures=$((failures + 1))
+  fi
+fi
+
+# Multi-hart topology must come from a completed binary-FDT /cpus scan, not
+# a silent single-hart fallback. RISCV_DTB_CPU_SCAN_FAILED is rejected
+# above; this requires the positive completion marker as well so a scan
+# that neither completes nor fails (e.g. an early return bypassing both)
+# cannot pass unnoticed.
+if (( QEMU_SMP >= 2 )); then
+  if ! rg -n "RISCV_DTB_CPU_SCAN_DONE bitmap=0x[0-9a-f]+ count=${QEMU_SMP}\b" "$LOGFILE" >/dev/null 2>&1; then
+    echo "[fail] --smp ${QEMU_SMP} requires RISCV_DTB_CPU_SCAN_DONE bitmap=... count=${QEMU_SMP}"
     failures=$((failures + 1))
   fi
 fi

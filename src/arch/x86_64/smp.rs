@@ -535,6 +535,12 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         // Legacy markers preserved for the existing smoke-grep contract
         // (see doc/ARCH_X86_64.md §AP markers). The richer env scaffold
         // markers above are the canonical set going forward.
+        //
+        // No GS "ready" marker is emitted here: GS-base is not actually
+        // written (see `emit_ap_percpu_scaffold`'s GS_DEFERRED marker,
+        // reason=ap_entry_is_asm_only_no_msr_write_yet). A ready marker
+        // for GS must never be emitted until a real WRMSR IA32_GS_BASE +
+        // readback exists.
         crate::yarm_log!(
             "X86_AP_GDT_TSS_READY cpu={} reason=trampoline_gdt_inherited",
             cpu.0
@@ -543,7 +549,6 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             "X86_AP_IDT_READY cpu={} reason=interrupts_masked_no_handlers",
             cpu.0
         );
-        crate::yarm_log!("X86_AP_GS_READY cpu={} reason=no_per_cpu_yet", cpu.0);
         crate::yarm_log!(
             "X86_AP_CPU_LOCAL_READY cpu={} reason=handoff_identity_only",
             cpu.0

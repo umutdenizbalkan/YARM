@@ -198,6 +198,24 @@ fn no_code_enables_all_plic_sources_blindly() {
 }
 
 #[test]
+fn plic_threshold_write_is_gated_by_mapping_coverage_check() {
+    let plic = include_str!("../src/arch/riscv64/plic.rs");
+    // The threshold register's physical address is below RAM and is
+    // never covered by the single kernel-shared gigapage mapped into the
+    // active satp once a user task has been dispatched; the raw MMIO
+    // write used to run unconditionally and fault (StoreAMOPageFault).
+    // Pin the guard so this cannot silently regress.
+    assert!(
+        plic.contains("addr_range_covered_by_kernel_shared_mapping"),
+        "plic module must check MMIO coverage before writing the threshold register"
+    );
+    assert!(
+        plic.contains("DEFER_REASON_MMIO_UNMAPPED"),
+        "plic module must expose the MMIO-unmapped defer reason"
+    );
+}
+
+#[test]
 fn secondary_harts_still_park() {
     let boot = include_str!("../src/arch/riscv64/boot.rs");
     assert!(

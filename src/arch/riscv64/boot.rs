@@ -45,37 +45,30 @@ _start:
     la t0, yarm_riscv64_early_trap_vector
     csrw stvec, t0
 
-    // Boot-hart selection: per the SBI spec, OpenSBI starts only ONE hart at
-    // the kernel entry point. The hart that enters here IS the boot hart,
-    // regardless of its hart-id (OpenSBI may pick a nonzero hart on -smp N).
-    // Use a CAS-style guard so that if a stray hart ever arrives here a second
-    // time (defensive), the late arrival parks instead of corrupting boot
-    // state.
-    la t2, RISCV64_BOOT_HART_ARRIVAL
-    li t3, 1
-    amoswap.w.aq t1, t3, (t2)
-    bnez t1, .Lriscv64_secondary_cold_park
-
-    // First arrival wins boot-hart slot. Record the OpenSBI hart-id so the
+    // Boot-hart selection: per the SBI spec, OpenSBI's generic firmware
+    // (used by QEMU virt) releases exactly ONE hart to the kernel entry
+    // point (Domain0 Next Address). Every other hart never reaches this
+    // code at all -- it stays parked *inside OpenSBI itself*
+    // (sbi_hsm_hart_wait), awaiting an explicit HSM hart_start call. So
+    // whichever hart executes `_start` IS the boot hart, unconditionally
+    // and regardless of its hart-id; there is no cold-boot race to
+    // resolve here. (A prior "first arrival wins" atomic-swap-based CAS
+    // guard solved a race that cannot occur under this guarantee, and
+    // additionally required the `Zaamo` extension, which is not enabled
+    // for this target -- it silently failed to assemble for every real
+    // riscv64gc build.) Record the OpenSBI hart-id unconditionally so the
     // Rust side can read it later (park-secondaries, topology marker).
     la t2, RISCV64_BOOT_HART_ID
     sd s0, (t2)
 
-    // Boot hart: hand the firmware registers to the Rust primary entry, which
-    // emits the early boot markers and then calls the common kernel entry.
+    // Hand the firmware registers to the Rust primary entry, which emits
+    // the early boot markers and then calls the common kernel entry.
     mv a0, s0                       // a0 = hartid
     mv a1, s1                       // a1 = DTB pointer
     call yarm_riscv64_primary_entry // -> ! (does not return)
 1:
     wfi
     j 1b
-
-.Lriscv64_secondary_cold_park:
-    mv a0, s0                       // a0 = hartid
-    call yarm_riscv64_secondary_cold_park // -> ! (does not return)
-2:
-    wfi
-    j 2b
 
     // Early S-mode trap vector (direct mode). Runs before the kernel installs
     // its own handler. Re-establishes a known-good stack (the faulting sp may
@@ -119,12 +112,6 @@ yarm_riscv64_secondary_entry:
     j 3b
     "#
 );
-
-/// Boot-hart arrival CAS slot, set to 1 by the first hart that enters
-/// `_start`. Lives in `.bss` so it is zero before any hart arrives.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-#[unsafe(no_mangle)]
-static mut RISCV64_BOOT_HART_ARRIVAL: u32 = 0;
 
 /// Boot-hart id captured from OpenSBI's `a0` on the boot hart's first
 /// entry into `_start`. Lives in `.bss`; the asm path writes this once
@@ -285,28 +272,15 @@ extern "C" fn yarm_riscv64_primary_entry(hart_id: usize, dtb_ptr: usize) -> ! {
     early_marker!("RISCV_BOOT_ENTRY hart={} dtb=0x{:x}", hart_id, dtb_ptr);
     early_marker!("RISCV_BOOT_HART_SELECTED hart={}", hart_id);
     // Confirm the asm-captured OpenSBI hart-id matches what's now in `a0`.
-    // The slot was written from `_start` via the atomic CAS path; this
-    // breadcrumb proves the captured value matches the live one so any
-    // future asm refactor cannot silently drift the boot-hart id.
+    // The slot was written unconditionally from `_start`; this breadcrumb
+    // proves the captured value matches the live one so any future asm
+    // refactor cannot silently drift the boot-hart id.
     early_marker!("RISCV_BOOT_HART_ID_STORED hart={}", boot_hart_id());
     // Park every non-bootstrap hart in a safe Rust loop BEFORE the boot hart
     // touches BSS, the allocator, cmdline capture, or kernel bootstrap.
     park_secondary_harts_early();
     early_marker!("RISCV_DTB_PTR value=0x{:x}", dtb_ptr);
     unsafe { yarm_kernel_main(dtb_ptr) }
-}
-
-/// Cold-boot park for any non-bootstrap hart that reaches `_start`. Emits the
-/// park marker and spins in `wfi`, never touching shared boot state.
-#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
-#[unsafe(no_mangle)]
-extern "C" fn yarm_riscv64_secondary_cold_park(hart_id: usize) -> ! {
-    early_marker!("RISCV_SECONDARY_HART_PARK hart={}", hart_id);
-    loop {
-        unsafe {
-            core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
-        }
-    }
 }
 
 /// Current kernel-bootstrap step breadcrumb, published by
@@ -1849,20 +1823,38 @@ pub fn prepare_arch_boot(start_info_ptr: usize) {
 /// for the scheduler, and emits the topology breadcrumbs the smoke gate
 /// pins. Online CPUs remain 1 (BSP-only) until RISC-V SMP scheduling
 /// lands; the breadcrumb explicitly records that.
+///
+/// The binary FDT walker (`arch::fdt::cpus_hart_id_bitmap`) is consulted
+/// directly here -- not through the generic `topology::discover_present_cpu_bitmap`
+/// fallback chain -- so a malformed or empty `/cpus` node is reported with
+/// an explicit `RISCV_DTB_CPU_SCAN_FAILED` breadcrumb instead of silently
+/// returning the single-hart default. The smoke gate rejects that silent
+/// fallback under `-smp >1`.
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
 fn stage_riscv64_present_cpu_bitmap(dtb: &'static [u8]) {
-    let bitmap = crate::arch::riscv64::topology::discover_present_cpu_bitmap(dtb);
+    early_marker!("RISCV_DTB_CPU_SCAN_BEGIN dtb=0x{:x}", dtb.as_ptr() as usize);
+    let bitmap = match crate::arch::fdt::cpus_hart_id_bitmap(dtb) {
+        Some(bitmap) if bitmap != 0 => {
+            emit_dtb_cpu_node_markers(bitmap);
+            early_marker!(
+                "RISCV_DTB_CPU_SCAN_DONE bitmap=0x{:x} count={}",
+                bitmap,
+                bitmap.count_ones()
+            );
+            bitmap
+        }
+        Some(_) => {
+            early_marker!("RISCV_DTB_CPU_SCAN_FAILED reason=no_cpus_node_found");
+            crate::arch::riscv64::topology::default_present_cpu_bitmap()
+        }
+        None => {
+            early_marker!("RISCV_DTB_CPU_SCAN_FAILED reason=malformed_fdt");
+            crate::arch::riscv64::topology::default_present_cpu_bitmap()
+        }
+    };
     let _ = crate::arch::boot_entry::stage_present_cpu_bitmap_for_bootstrap(bitmap);
     let boot_hart = boot_hart_id();
-    let mut hart_id = 0u32;
-    let mut remaining = bitmap;
-    while remaining != 0 {
-        if remaining & 1 != 0 {
-            early_marker!("RISCV_HART_PRESENT hart={}", hart_id);
-        }
-        remaining >>= 1;
-        hart_id += 1;
-    }
+    emit_present_hart_markers(bitmap);
     early_marker!(
         "RISCV_HART_TOPOLOGY present_cpus={} present_bitmap=0x{:x} boot_hart={}",
         bitmap.count_ones(),
@@ -1880,6 +1872,36 @@ fn stage_riscv64_present_cpu_bitmap(dtb: &'static [u8]) {
         crate::yarm_log!(
             "RISCV_IRQ_SMP_TOPOLOGY_DEFERRED reason=present_topology_not_live_validated"
         );
+    }
+}
+
+/// Emits one `RISCV_DTB_CPU_NODE hart=N` marker per hart bit set, in the
+/// scan-result bitmap returned by the binary FDT walker.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn emit_dtb_cpu_node_markers(bitmap: u64) {
+    let mut hart_id = 0u32;
+    let mut remaining = bitmap;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            early_marker!("RISCV_DTB_CPU_NODE hart={}", hart_id);
+        }
+        remaining >>= 1;
+        hart_id += 1;
+    }
+}
+
+/// Emits one `RISCV_HART_PRESENT hart=N` marker per hart bit set in the
+/// staged present-CPU bitmap.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+fn emit_present_hart_markers(bitmap: u64) {
+    let mut hart_id = 0u32;
+    let mut remaining = bitmap;
+    while remaining != 0 {
+        if remaining & 1 != 0 {
+            early_marker!("RISCV_HART_PRESENT hart={}", hart_id);
+        }
+        remaining >>= 1;
+        hart_id += 1;
     }
 }
 

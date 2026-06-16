@@ -107,14 +107,14 @@ fn ap_percpu_scaffold_emits_required_marker_set() {
 #[test]
 fn gs_base_write_is_not_faked() {
     let smp = include_str!("../src/arch/x86_64/smp.rs");
-    // The new READY marker form (carrying base=0x...) signals that a
-    // real WRMSR IA32_GS_BASE + RDMSR readback succeeded. It must
-    // remain absent until that path lands. The legacy
-    // `X86_AP_GS_READY ... reason=no_per_cpu_yet` form is preserved
-    // for backward-compat and does NOT imply a real write.
+    // X86_AP_GS_READY must remain entirely absent — in any form — until
+    // a real WRMSR IA32_GS_BASE + RDMSR readback exists. The prior
+    // `X86_AP_GS_READY cpu={} reason=no_per_cpu_yet` legacy form was a
+    // fake-ready marker that contradicted the accurate GS_DEFERRED
+    // marker emitted for the same AP; it has been removed, not renamed.
     assert!(
-        !smp.contains("X86_AP_GS_READY cpu={} base=0x{:x}"),
-        "X86_AP_GS_READY base=0x... must not be emitted until WRMSR + readback land"
+        !smp.contains("X86_AP_GS_READY"),
+        "X86_AP_GS_READY must not be emitted in any form until WRMSR + readback land"
     );
     // The deferral reason must specifically name the asm-only gap so a
     // regression cannot silently regress to the weaker prior reason.

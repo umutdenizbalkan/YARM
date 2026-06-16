@@ -817,6 +817,40 @@ mod tests {
         assert_eq!(cpus_hart_id_bitmap(&dtb), Some(0));
     }
 
+    // Real `qemu-system-riscv64 -M virt -smp N -machine dumpdtb=...` captures
+    // (QEMU 8.2.2), not synthetic fixtures. These exercise the binary FDT
+    // walker against the exact `/cpus/cpu@N { reg = <N> }` encoding QEMU
+    // virt actually emits, so a structural assumption that only holds for
+    // the hand-built `make_dtb_with_cpus` fixtures above cannot silently
+    // diverge from real hardware behavior.
+    #[test]
+    fn cpus_hart_id_bitmap_matches_real_qemu_virt_dtb() {
+        for (dtb, expected) in [
+            (
+                include_bytes!("../../tests/fixtures/riscv64_qemu_virt_smp1.dtb").as_slice(),
+                0x1u64,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/riscv64_qemu_virt_smp2.dtb").as_slice(),
+                0x3u64,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/riscv64_qemu_virt_smp3.dtb").as_slice(),
+                0x7u64,
+            ),
+            (
+                include_bytes!("../../tests/fixtures/riscv64_qemu_virt_smp4.dtb").as_slice(),
+                0xfu64,
+            ),
+        ] {
+            assert_eq!(
+                cpus_hart_id_bitmap(dtb),
+                Some(expected),
+                "real QEMU virt DTB must yield bitmap 0x{expected:x}"
+            );
+        }
+    }
+
     /// Build a minimal DTB with a single `plic@<base>` node carrying a
     /// `reg` property under root cell sizes 2/2.
     fn make_dtb_with_plic(plic_base: u64, plic_size: u64) -> Vec<u8> {
