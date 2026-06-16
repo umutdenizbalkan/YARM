@@ -2,6 +2,16 @@
 
 # Kernel Multithreading Design
 
+**Canonical: yes.** Owns the kernel-side thread mechanism (TCB
+fields, futex wait/wake, `spawn_user_thread`, TLS plumbing) used by
+userspace libc / musl runtimes. Higher-level POSIX policy
+(pthread mutex/condvar/cancellation, signal delivery) is intentionally
+out of scope — see `doc/SIGNAL_POLICY.md` and
+`doc/LIBC_AND_LINUX_COMPAT.md`. SMP scheduling readiness per arch is
+tracked in `doc/KERNEL_UNLOCKING.md` §1 and the per-arch ARCH_*.md
+files; RISC-V remains BSP-only (`online_cpus=1`) per
+`doc/ARCH_RISCV64.md` §13.
+
 ## Goal
 
 Define the minimum kernel-resident threading mechanism required to support real userspace TLS, futex-backed synchronization, and libc runtimes such as musl without collapsing the microkernel boundary.

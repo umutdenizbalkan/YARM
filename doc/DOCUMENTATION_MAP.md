@@ -31,9 +31,18 @@ fragment files unless the canonical owner explicitly does not exist.
 | Project history (closed phases / milestones / checklists) | **`doc/PROJECT_HISTORY.md`** |
 | Roadmap (current direction) | `doc/ROADMAP.md` |
 | Project status / maturity | **`doc/STATUS.md`** |
-| Agent rules (capability/spawn/zero-copy/smoke policy) | `doc/AI_AGENT_RULES.md` |
+| Agent rules (capability/spawn/zero-copy/smoke policy + source-licensing header + server-runtime boundary) | **`doc/AI_AGENT_RULES.md`** |
+| Agent-facing entry point (short pointer for tools that look for `AGENTS.md` by convention) | `doc/AGENTS.md` (points at `doc/AI_AGENT_RULES.md`) |
 | Kernel test rules (per-rule unit-test guard rails) | `doc/KERNEL_TEST_RULES.md` |
-| Cross-cutting agent-facing reference | `doc/AGENTS.md` |
+| Driver-server delegation ABI (`DRIVER_OP_*`) | `doc/DRIVER_PROTOCOL.md` |
+| HAL conformance + per-ISA platform-layout audit | `doc/HAL_CONFORMANCE.md` |
+| Kernel global allocator (slab + large-page) | `doc/KERNEL_GLOBAL_ALLOCATOR.md` |
+| Kernel multithreading design (TCB, futex, `spawn_user_thread`, TLS) | `doc/KERNEL_MULTITHREADING_DESIGN.md` |
+| Kernel scaling profile (fixed-array capacities, `hosted-dev` vs non-hosted) | `doc/KERNEL_SCALING_PROFILE.md` |
+| Signal policy (non-goal stance + revisit prerequisites) | `doc/SIGNAL_POLICY.md` |
+| TLB invalidation policy (per-arch + hosted vs production) | `doc/TLB_INVALIDATION_POLICY.md` |
+| libc / Linux / musl POSIX compatibility (ABI freeze, dispatcher table, mapping matrix) | **`doc/LIBC_AND_LINUX_COMPAT.md`** |
+| Global unlocking readiness audit | `doc/KERNEL_UNLOCKING.md` §7.1 (single source of truth — do not restate elsewhere) |
 
 ## Authoring rule
 
@@ -165,3 +174,50 @@ Deleted in Pass 4:
 ABI values, opcodes, syscall numbers, struct offsets, image IDs, smoke
 markers, and startup slot counts are preserved verbatim in the
 canonical owners. No runtime code behavior was changed.
+
+### TODO §4 — libc / Linux / POSIX compatibility cluster — DONE (Pass 5, 2026-06-16)
+
+Pass 5 consolidated the three pre-existing libc/Linux/POSIX docs into
+the single canonical `doc/LIBC_AND_LINUX_COMPAT.md` and updated the
+remaining references atomically.
+
+Deleted in the same pass:
+
+- `doc/LIBC_ABI_X86_64_NONE.md`
+- `doc/LINUX_COMPAT.md`
+- `doc/MUSL_POSIX_IPC_MAPPING.md`
+
+References updated in: `doc/NETWORKING.md`, `doc/PHASE_GATES.md`,
+`doc/X86_64_NONE_MUSL_PORT_TODO.md`.
+
+### TODO §5 — Agent rules + boundary rules — DONE (Pass 5, 2026-06-16)
+
+Pass 5 merged the licensing-header rule (§15) and the
+`yarm-server-runtime` boundary rules (§16) from the former `AGENTS.md`
+into `doc/AI_AGENT_RULES.md`, and reduced `doc/AGENTS.md` to a short
+pointer that preserves the `AGENTS.md` filename convention for
+external tools. No source-grep tests changed (`AI_AGENT_RULES.md` is
+the only one referenced by `src/kernel/syscall.rs::tests::*`).
+
+### TODO §6 — Audited but kept as canonical (Pass 5, 2026-06-16)
+
+The following docs were audited for freshness, found current, and
+retained as canonical owners with explicit "Canonical: yes" notes at
+the top:
+
+- `doc/DRIVER_PROTOCOL.md` — driver-server delegation ABI.
+- `doc/HAL_CONFORMANCE.md` — HAL contract surface + per-ISA platform
+  layout audit (RISC-V row mirrors `doc/ARCH_RISCV64.md` §13).
+- `doc/KERNEL_GLOBAL_ALLOCATOR.md` — slab + large-page allocator
+  (orthogonal to `KERNEL_SCALING_PROFILE.md`).
+- `doc/KERNEL_MULTITHREADING_DESIGN.md` — kernel-side thread
+  mechanism (current after RISC-V BSP-only + x86_64 AP per-CPU
+  scaffold landed; signal/pthread policy explicitly deferred).
+- `doc/KERNEL_SCALING_PROFILE.md` — `hosted-dev` vs non-hosted
+  capacities; dynamic-CNode status.
+- `doc/SIGNAL_POLICY.md` — explicit non-goal + revisit prerequisites.
+- `doc/TLB_INVALIDATION_POLICY.md` — per-arch invalidation contract;
+  hosted no-op rationale.
+
+No content of these files was modified other than the top-of-file
+canonical-status block.

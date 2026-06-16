@@ -40,7 +40,7 @@ Implemented bootstrap sysdeps pieces:
 - [x] Implement futex-like wait/wake bridge using kernel IPC/synchronization primitives.
 - [x] Implement time/clock hooks (`clock_gettime`, `nanosleep`) via kernel timer-backed service hooks for deterministic bring-up.
 - [x] Implement minimal file/socket facade over VFS/network services (bootstrap deterministic fd hooks in `linux_compat::sysdeps`; full service-backed semantics remain milestone-4+ integration work).
-  - Mapping matrix artifact added: `MUSL_POSIX_IPC_MAPPING.md` (POSIX entry -> linux nr -> IPC opcode/service).
+  - Mapping matrix artifact added: `LIBC_AND_LINUX_COMPAT.md` (POSIX entry -> linux nr -> IPC opcode/service).
 
 Not yet complete:
 - [ ] Implement real musl entry/exit glue (`crt` startup + `__libc_start_main` integration path). Current code validates/parses startup vectors and runs a test main callback, but does not yet provide the full musl crt integration symbols.

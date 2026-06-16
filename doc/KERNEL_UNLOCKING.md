@@ -509,6 +509,134 @@ maintenance stage either live-wires it or removes it.
 
 ---
 
+## 7.1 Current global unlocking readiness audit (2026-06-16)
+
+Snapshot of the kernel-unlocking workstream at the end of the
+documentation consolidation pass that also folded RISC-V64 into the
+global smoke matrix. This section is the authoritative readiness
+audit; nothing else in the repo should restate it.
+
+### 7.1.1 Split-path classification
+
+| Split | Class | Notes |
+|-------|-------|-------|
+| D1 (transfer-cap recv, non-reply, non-shared-region) | **live** | router → `materialize_split_transfer_cap_equivalent`; telemetry `d1_split_materializations`. Stage 104. |
+| D2 (endpoint blocking-recv waiter publish) | **live** | `publish_recv_waiter_live`; telemetry `d2_recv_waiter_publishes` / `d2_publish_race_unwinds` (must be 0). Stage 106. |
+| D3.1 (`vm_brk_shrink_two_phase`) | **live** | `D3_LIVE_SPLIT`. Stage 107. |
+| D3 rest (full `VmAnonMap` two-phase live) | **deferred** | plan types are consumed inside the still-global-locked `handle_vm_anon_map`; gated on lock-free `await_tlb_shootdown_ack`. |
+| D4 (`syscall.rs` decomposition) | **partial** | `syscall/{debug,initramfs}.rs` landed; `syscall/recv_shared_v3.rs` is the next split target; the rest of §5.1 is pending mechanical moves. |
+| D5 (reply-cap recv, non-shared-region) | **live** | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations` / `d5_split_reply_rollbacks`. Stage 105. |
+| D6.1 (`local_dispatch_step_split`) | **live** | `D6_LIVE_SPLIT`; per-CPU lock sharding deferred until x86_64 AP scheduler-online. Stage 107. |
+| D7 (MUST_SMOKE policy) | **enforced** | see `AI_AGENT_RULES.md` §13. Stage 101. |
+| Stage 108 split-mut seams (rank 1/2/5/6) | **helper-only** | `M2_SEAM_HELPER_ONLY` + `FALLBACK_GLOBAL_LOCK`. Live-wiring any requires its own PR + MUST_SMOKE + helper-fence deletion in the same PR. |
+| Shared-region cap-transfer split (D1/D5 extension) | **deferred** | gated on folding receiver-side mapping obligations into the phase model. |
+
+### 7.1.2 Lock / rank bottlenecks still global
+
+- Stage 108 seams remain helper-only; the global kernel lock still
+  covers scheduler / task TCBs / VM user-spaces / memory paths under
+  `FALLBACK_GLOBAL_LOCK` for the rank-1/2/5/6 domains.
+- `with_vm_split_mut` / `with_memory_split_mut` cannot be added
+  without the lock-free `await_tlb_shootdown_ack` design and a
+  multi-CPU smoke proof (D3 fence, §8).
+- Per-CPU scheduler lock types are forbidden until the x86_64 SMP
+  trampoline split has landed (it has, §14.5 of `AI_AGENT_RULES.md`)
+  **and** D2/D3 are smoke-stable on `-smp ≥ 2` (they are not — see
+  §7.1.4 below). `entering_tid` / `exiting_tid` remain Class F
+  (authoritative read only).
+
+### 7.1.3 Architecture smoke matrix (required before any future unlocking commit)
+
+| Arch | Smoke | Status | Notes |
+|------|-------|--------|-------|
+| x86_64 | `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | **PASS** | all 6 service entries exactly once; boot markers detected. Core smoke stays `-smp 1` until the AP per-CPU environment exists and an SMP smoke is genuinely accepted (no fake SMP acceptance). |
+| x86_64 | AP Rust online / park status | scaffolded | per-CPU env scaffold + GS deferred (`X86_AP_GS_DEFERRED reason=ap_entry_is_asm_only_no_msr_write_yet`); APs reach env-ready but do not join the scheduler. |
+| x86_64 | AP scheduler participation | **off** | gated on AP per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`. |
+| x86_64 | `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | **PASS** | wrong-sender count=0. |
+| AArch64 | `./scripts/qemu-aarch64-core-smoke.sh` | **PASS** | core service chain reaches steady-state idle. |
+| AArch64 | `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | **PASS** | wrong-sender count=0. |
+| RISC-V64 | `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | **PASS** | regular smoke target since stabilization pass 1 (commit a7733fa); pass 2 added the timer audit scaffold (commit cc74719). Boot hart selected and never parked; `present_cpus`/`present_bitmap` match the real DTB. |
+| RISC-V64 | timer / PLIC / extirq | **deferred** with canonical reasons | `RISCV_TIMER_DEFERRED reason=timer_irq_feature_disabled`, `RISCV_PLIC_DEFERRED reason=plic_mmio_unmapped_under_active_satp`, `RISCV_EXTIRQ_DEFERRED reason=no_safe_source`. Each accepted by the gate. See `doc/ARCH_RISCV64.md` §13. |
+| RPi5 | diagnostic / high-half track only | **out of scope** | not part of the global unlocking smoke gate. See `doc/RPI5_BRINGUP.md`. |
+
+### 7.1.4 Is RISC-V64 included in the global unlocking smoke matrix?
+
+**Yes.** `scripts/qemu-riscv64-smoke-matrix.sh` is the per-arch
+acceptance gate for RISC-V64, treated the same way as the x86_64 /
+AArch64 core smokes (§1 Milestone 1 smoke table). RISC-V64's regular
+core smoke is **Ready: yes** per `doc/ARCH_RISCV64.md` §13.5; the
+remaining RISC-V follow-ups (live timer tick, PLIC mapping,
+one-source external IRQ, SMP scheduling) are explicit post-unlocking
+items, each carrying a canonical deferred-reason marker today so its
+absence is visible at every boot.
+
+### 7.1.5 Next 3 unlocking implementation targets (in order)
+
+1. **x86_64 AP per-CPU environment → scheduler-online.** Per-CPU
+   GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
+   behind a default-off knob; then `-smp ≥ 2` smoke acceptance.
+   Unblocks per-CPU runqueue lock sharding (D6) and the lock-free
+   `await_tlb_shootdown_ack` design (D3).
+2. **Route Stage 106/107 typed helpers through Stage 108 seams**, one
+   PR per helper, each smoke-gated: D2 publish → task/scheduler seams;
+   D3 shrink → vm/memory seams; D6 dispatch → scheduler seam. Each PR
+   deletes its `M2_SEAM_HELPER_ONLY` / `FALLBACK_GLOBAL_LOCK` fence
+   atomically.
+3. **D4 continuation:** `syscall/recv_shared_v3.rs`, then
+   `syscall/process.rs`, then the remaining modules listed in §5.1.
+
+### 7.1.6 What must not be touched yet
+
+- D1/D5/D2 canonical fallbacks. `materialize_received_message_cap`
+  must remain at its ≥4 call sites; notification-recv blocking path
+  stays canonical; sender-waiter cap-transfer refills stay on the
+  global lock. (§8)
+- Lock-free `await_tlb_shootdown_ack` design — not before the AP per-CPU
+  environment exists and `-smp ≥ 2` scheduler-online smoke is
+  accepted. The shootdown-before-reclaim source order inside
+  `execute_tlb_shootdown_wait_plan` is UAF-load-bearing.
+- Per-CPU scheduler lock types — same gate as the previous item.
+  `entering_tid` / `exiting_tid` are Class F.
+- RISC-V64 live timer enable. STIE arming before the trap vector's
+  kernel-S-mode timer fast path lands would crash on the next `wfi`
+  via `RISCV_TRAP_UNHANDLED reason=trap_from_s_mode`. Keep deferred
+  with `reason=timer_irq_feature_disabled` (default builds) or
+  `reason=trap_bridge_reentrancy_not_ready` (feature-on, audit
+  incomplete) until the fast path lands.
+- RISC-V64 broad PLIC source enable. PLIC MMIO is unmapped under the
+  active `satp` (`reason=plic_mmio_unmapped_under_active_satp`);
+  one-source external IRQ proof must come first.
+- Production default of `yarm.loglevel=` (Info). Never rely on
+  Debug-level markers in acceptance greps.
+
+### 7.1.7 Readiness verdict
+
+**Ready to resume global kernel unlocking: yes.**
+
+All required per-arch acceptance smokes pass:
+`qemu-x86_64-core-smoke.sh`, `qemu-aarch64-core-smoke.sh`,
+`qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`), plus the strict
+optional-FS smokes on x86_64 and AArch64. The Stage 108 seams and the
+D3/D6 follow-ups are gated on the x86_64 AP per-CPU environment
+landing, which is item 1 of §7.1.5; that is the natural next
+unlocking pass.
+
+**Exact next Claude prompt recommendation:**
+
+> Kernel unlocking Pass: x86_64 AP per-CPU environment → AP
+> scheduler-online. Goal: stand up per-CPU GDT/IDT/TSS + GS base +
+> AP-safe printk + `bring_up_cpu(cpu)` behind a default-off knob,
+> then accept `-smp ≥ 2` scheduler-online smoke. Hard rules: do not
+> touch D1/D5/D2 canonical fallbacks; do not enable live
+> `await_tlb_shootdown_ack` redesign; do not enable per-CPU
+> scheduler lock types; preserve all three per-arch core smokes
+> (x86_64, AArch64, RISC-V64 matrix) and the strict optional-FS
+> smokes; do not rely on Debug-level markers. Deliverables:
+> implementation, MUST_SMOKE run, deletion of the AP-related
+> helper-only fences, audit note in `doc/KERNEL_UNLOCKING.md` §7.1.
+
+---
+
 ## 8. Live-path policy fences
 
 - **D1/D5/D2 canonical fallbacks must not be removed.**

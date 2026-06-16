@@ -138,7 +138,7 @@ scripts/phase5-boundary-gates.sh --fs-runtime-entrypoint
 
 ### Phase 2 — Driver server readiness
 
-- Contracts: this doc §4, `doc/LIBC_ABI_X86_64_NONE.md`.
+- Contracts: this doc §4, `doc/LIBC_AND_LINUX_COMPAT.md`.
 - Gate command:
 
 ```bash
@@ -234,7 +234,7 @@ Transfer-cap ABI prerequisite:
   otherwise).
 - Transfer metadata is an envelope handle (not a raw source capability
   id).
-- Reference: `doc/LIBC_ABI_X86_64_NONE.md`.
+- Reference: `doc/LIBC_AND_LINUX_COMPAT.md`.
 
 Tests required to pass in `.github/workflows/compat-gates.yml` under
 `phase2-driver-gates` (executed via `scripts/phase2-driver-gates.sh`):
@@ -288,7 +288,7 @@ Minimum invariants for networking services (`netmgr`, `tcpip`, `dns`,
   otherwise).
 - Transfer metadata is an envelope handle, not a raw source capability
   id.
-- Reference: `doc/LIBC_ABI_X86_64_NONE.md`.
+- Reference: `doc/LIBC_AND_LINUX_COMPAT.md`.
 
 ### CI gate mapping (Phase 3 — `phase3-network-gates`)
 
@@ -334,7 +334,7 @@ Minimum invariants for UI-facing services (`display`, `compositor`,
 
 ### IPC transfer-cap ABI prerequisite
 
-(Same as Phase 3 — reference `doc/LIBC_ABI_X86_64_NONE.md`.)
+(Same as Phase 3 — reference `doc/LIBC_AND_LINUX_COMPAT.md`.)
 
 ### CI gate mapping (Phase 4 — `phase4-ui-gates`, `phase4-ui-smoke-marker`)
 
