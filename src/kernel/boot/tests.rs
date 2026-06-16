@@ -11199,6 +11199,218 @@ fn vm_brk_shrink_tlb_plan_aggregate_is_zero_in_single_cpu() {
         .expect("join");
 }
 
+// ── D-NEXT-1 PR-B / Stage 112: brk-shrink phase-split source checks ───────
+
+#[test]
+fn stage112_d3_phase_functions_present_in_rank_order() {
+    // The brk-shrink path must be expressed as three named, rank-ordered
+    // phase calls (vm -> no lock (TLB wait) -> memory), not interleaved.
+    let mem_src = include_str!("memory_state.rs");
+    for name in [
+        "fn brk_shrink_phase_a_vm",
+        "fn brk_shrink_phase_b_tlb_wait",
+        "fn brk_shrink_phase_c_reclaim",
+    ] {
+        assert!(
+            mem_src.contains(name),
+            "{name} must exist in memory_state.rs"
+        );
+    }
+    let orchestrator = mem_src
+        .split("pub(crate) fn vm_brk_shrink_two_phase")
+        .nth(1)
+        .expect("vm_brk_shrink_two_phase must exist");
+    let a = orchestrator
+        .find("self.brk_shrink_phase_a_vm(")
+        .expect("orchestrator must call Phase A first");
+    let b = orchestrator
+        .find("self.brk_shrink_phase_b_tlb_wait(")
+        .expect("orchestrator must call Phase B second");
+    let c = orchestrator
+        .find("self.brk_shrink_phase_c_reclaim(")
+        .expect("orchestrator must call Phase C third");
+    assert!(
+        a < b && b < c,
+        "phase calls must appear in vm(5) -> no-lock-wait -> memory(6) order"
+    );
+}
+
+#[test]
+fn stage112_d3_tlb_wait_is_between_vm_phase_and_reclaim_phase() {
+    // Phase A must fully complete (collect every plan) before Phase B's TLB
+    // wait begins, and Phase B must fully complete before Phase C reclaims
+    // any frame -- the orchestrator must not interleave the three phases.
+    let mem_src = include_str!("memory_state.rs");
+    let orchestrator = mem_src
+        .split("pub(crate) fn vm_brk_shrink_two_phase")
+        .nth(1)
+        .expect("vm_brk_shrink_two_phase must exist");
+    let plans_bound = orchestrator
+        .find("let plans = self.brk_shrink_phase_a_vm")
+        .expect("Phase A result must be bound to a single `plans` value");
+    let shootdowns_bound = orchestrator
+        .find("let shootdowns = self.brk_shrink_phase_b_tlb_wait(&plans)")
+        .expect("Phase B must be called once with the complete Phase A plan batch");
+    let reclaim_call = orchestrator
+        .find("self.brk_shrink_phase_c_reclaim(&plans)")
+        .expect("Phase C must be called once with the complete Phase A plan batch");
+    assert!(
+        plans_bound < shootdowns_bound && shootdowns_bound < reclaim_call,
+        "TLB wait (Phase B) must be structurally between the VM phase (A) and the reclaim phase (C)"
+    );
+}
+
+#[test]
+fn stage112_d3_vm_phase_does_not_reclaim_frames() {
+    let mem_src = include_str!("memory_state.rs");
+    let start = mem_src
+        .find("fn brk_shrink_phase_a_vm")
+        .expect("brk_shrink_phase_a_vm must exist");
+    let end = mem_src
+        .find("fn brk_shrink_phase_b_tlb_wait")
+        .expect("brk_shrink_phase_b_tlb_wait must exist");
+    let body = &mem_src[start..end];
+    assert!(
+        !body.contains("reclaim_memory_object_for_phys"),
+        "Phase A (vm) must not reclaim any frame"
+    );
+}
+
+#[test]
+fn stage112_d3_memory_phase_does_not_mutate_page_tables() {
+    let mem_src = include_str!("memory_state.rs");
+    let start = mem_src
+        .find("fn brk_shrink_phase_c_reclaim")
+        .expect("brk_shrink_phase_c_reclaim must exist");
+    let end = mem_src
+        .find("/// VALIDATION: D3_LIVE_SPLIT")
+        .expect("vm_brk_shrink_two_phase's doc block must exist after the phase functions");
+    let body = &mem_src[start..end];
+    for forbidden in [
+        "unmap_page_phase1",
+        "unmap_user_page_in_asid",
+        "map_user_page_in_asid",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "Phase C (memory) must not call {forbidden} (no VM/page-table mutation)"
+        );
+    }
+}
+
+#[test]
+fn stage112_d3_no_ipc_lock_introduced_into_tlb_wait_path() {
+    // Phase B may call request_live_asid_shootdown (which itself takes the
+    // ipc/rank-3 lock only when target_cpu_bitmap != 0), but the phase
+    // function itself must not acquire any IPC-domain lock directly, and
+    // must not call into endpoint/recv-queue machinery.
+    let mem_src = include_str!("memory_state.rs");
+    let start = mem_src
+        .find("fn brk_shrink_phase_b_tlb_wait")
+        .expect("brk_shrink_phase_b_tlb_wait must exist");
+    let end = mem_src
+        .find("fn brk_shrink_phase_c_reclaim")
+        .expect("brk_shrink_phase_c_reclaim must exist");
+    let body = &mem_src[start..end];
+    for forbidden in [
+        "with_endpoints_mut",
+        "publish_recv_waiter_live",
+        "recv_block_phase_c_ipc_publish",
+        "with_ipc_",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "Phase B (TLB wait) must not contain {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn stage112_d3_vm_and_memory_seams_remain_helper_only_with_documented_blocker() {
+    // D-NEXT-1 PR-B reached the same architectural blocker as PR-A: the
+    // brk-shrink call site still runs nested inside SharedKernel::with_cpu's
+    // global-lock borrow (handle_vm_brk is reached only via trap dispatch),
+    // so calling the SharedKernel-level seams here would alias the same
+    // backing KernelState through two pointers and would not actually
+    // shrink the global lock's hold time. Outcome B: the seams stay
+    // helper-only; this test pins that the brk-shrink phase functions do
+    // not call them, and that the fence documenting why is still present.
+    let mem_src = include_str!("memory_state.rs");
+    for name in ["with_vm_user_spaces_split_mut(", "with_memory_split_mut("] {
+        assert!(
+            !mem_src.contains(name),
+            "{name} must not be called from memory_state.rs yet (deferred, see doc note on vm_brk_shrink_two_phase)"
+        );
+    }
+    assert!(
+        mem_src.contains("relocating the `VmBrk` shrink"),
+        "vm_brk_shrink_two_phase must document the exact architectural blocker for the deferred seam live-wire"
+    );
+    let runtime_src = include_str!("../../runtime.rs");
+    assert!(
+        runtime_src.contains("VALIDATION: M2_SEAM_HELPER_ONLY"),
+        "the Stage 108 seam helper-only fence must remain in runtime.rs"
+    );
+}
+
+#[test]
+fn stage112_d3_pr_a_and_pr_c_fences_untouched() {
+    // PR-B must not delete or weaken the D2 (PR-A) or D6 (PR-C) fences.
+    let ipc_src = include_str!("ipc_state.rs");
+    assert!(
+        ipc_src.contains("fn recv_block_phase_a_scheduler")
+            && ipc_src.contains("fn recv_block_phase_b_task")
+            && ipc_src.contains("fn recv_block_phase_c_ipc_publish"),
+        "D2 PR-A phase functions must remain untouched"
+    );
+    let sched_src = include_str!("scheduler_state.rs");
+    assert!(
+        sched_src.contains("fn local_dispatch_step_split"),
+        "D6 PR-C dispatch seam helper must remain untouched"
+    );
+}
+
+#[test]
+fn stage112_d3_full_and_anon_map_two_phase_remain_deferred() {
+    // PR-B must not implement D3-FULL / full VmAnonMap two-phase, and must
+    // not wire up the Stage 5E VmBrkShrinkTlbPlan aggregate-batch scaffold
+    // (that would be a TLB-ack-protocol redesign, out of scope here).
+    let mem_src = include_str!("memory_state.rs");
+    let orchestrator = mem_src
+        .split("pub(crate) fn vm_brk_shrink_two_phase")
+        .nth(1)
+        .expect("vm_brk_shrink_two_phase must exist");
+    assert!(
+        !orchestrator.contains("VmBrkShrinkTlbPlan"),
+        "vm_brk_shrink_two_phase must not wire up the aggregate-batch TLB plan scaffold in this PR"
+    );
+}
+
+#[test]
+fn stage112_d3_await_tlb_shootdown_ack_not_redesigned() {
+    // PR-B must reuse the existing await_tlb_shootdown_ack /
+    // request_live_asid_shootdown / execute_tlb_shootdown_wait_plan
+    // primitives unchanged; brk_shrink_phase_b_tlb_wait must call
+    // request_live_asid_shootdown (the existing single-page primitive), not
+    // a new redesigned ack protocol.
+    let mem_src = include_str!("memory_state.rs");
+    let start = mem_src
+        .find("fn brk_shrink_phase_b_tlb_wait")
+        .expect("brk_shrink_phase_b_tlb_wait must exist");
+    let end = mem_src
+        .find("fn brk_shrink_phase_c_reclaim")
+        .expect("brk_shrink_phase_c_reclaim must exist");
+    let body = &mem_src[start..end];
+    assert!(
+        body.contains("self.request_live_asid_shootdown("),
+        "Phase B must reuse the existing request_live_asid_shootdown primitive"
+    );
+    assert!(
+        mem_src.contains("fn execute_tlb_shootdown_wait_plan"),
+        "the shared execute_tlb_shootdown_wait_plan (used by D1/D5 cap-transfer revocation too) must remain unmodified/present"
+    );
+}
+
 #[test]
 fn vm_anon_map_rollback_tlb_plan_covers_progress_range() {
     // Stage 5E: VmAnonMapRollbackTlbPlan must capture the progress range from

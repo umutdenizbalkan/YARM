@@ -1076,47 +1076,147 @@ impl KernelState {
         }
     }
 
-    /// Stage 107 / D3 first live step — typed batched two-phase shrink over a
-    /// page-aligned range.
+    /// D-NEXT-1 PR-B Phase A — vm domain, rank 5 (plus the memory rank-6
+    /// COW/refcount bookkeeping that `unmap_page_phase1` performs as part of
+    /// the same PTE-removal step, unchanged since Stage 5E): walk the whole
+    /// page-aligned range, remove each mapped page's PTE, and collect one
+    /// `TlbShootdownWaitPlan` per page that was actually mapped. Absent/lazy
+    /// pages (`Ok(None)`) are silently skipped, matching the pre-Stage-112
+    /// contract. No TLB wait and no frame reclaim happens in this phase —
+    /// the whole range's PTE-removal work completes before Phase B begins.
     ///
-    /// VALIDATION: D3_LIVE_SPLIT — called from `syscall.rs::handle_vm_brk` for
-    /// the shrink case since Stage 107.
-    /// VALIDATION: FALLBACK_GLOBAL_LOCK — the per-page loop still runs inside
-    /// one `&mut KernelState` borrow today; the typed method is the
-    /// observability + future-seam-wrapping anchor. The SharedKernel
-    /// VM/memory split-mut seam (audit doc §16.2/§19) remains the next
-    /// prerequisite for releasing between phases on real SMP.
+    /// Reachability note: every brk page is demand-paged in as its own
+    /// single-page mapping entry, so `unmap_page` never needs to split a
+    /// multi-page block here and cannot return `Err(Full)` for this call
+    /// site — an error from this phase can therefore only mean an invalid
+    /// ASID, which would fail identically on the first page in both this
+    /// batched form and the pre-Stage-112 per-page-interleaved form (no
+    /// page-by-page divergence).
+    fn brk_shrink_phase_a_vm(
+        &mut self,
+        asid: Asid,
+        unmap_start: usize,
+        unmap_end: usize,
+    ) -> Result<alloc::vec::Vec<super::TlbShootdownWaitPlan>, KernelError> {
+        let mut plans = alloc::vec::Vec::new();
+        let mut va = unmap_start;
+        while va < unmap_end {
+            if let Some(plan) = self.unmap_page_phase1(asid, VirtAddr(va as u64))? {
+                plans.push(plan);
+            }
+            va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
+        }
+        Ok(plans)
+    }
+
+    /// D-NEXT-1 PR-B Phase B — no vm or memory lock held by this function
+    /// itself: wait for the TLB shootdown named by every plan Phase A
+    /// collected. Entered strictly after Phase A's PTE removal is complete
+    /// for the entire range. `request_live_asid_shootdown` acquires ipc
+    /// (rank 3) only, and only when `plan.target_cpu_bitmap != 0`; on
+    /// `-smp 1` / single-online-CPU configurations (every currently
+    /// accepted smoke target) that bitmap is always 0, so this phase never
+    /// actually touches the ipc lock there.
+    fn brk_shrink_phase_b_tlb_wait(
+        &mut self,
+        plans: &[super::TlbShootdownWaitPlan],
+    ) -> Result<usize, KernelError> {
+        let mut shootdowns = 0usize;
+        for plan in plans {
+            if plan.target_cpu_bitmap != 0 {
+                self.request_live_asid_shootdown(plan.asid, plan.virt)?;
+                shootdowns += 1;
+            }
+        }
+        Ok(shootdowns)
+    }
+
+    /// D-NEXT-1 PR-B Phase C — memory domain, rank 6 only: reclaim every
+    /// physical frame named by Phase A's plans. Entered strictly after
+    /// Phase B's wait has completed for the whole batch — this is the exact
+    /// ordering that prevents the Stage 5E blocker #1b UAF (frame reuse
+    /// before every targeted CPU has ACKed its TLB invalidation). No VM
+    /// mutation happens in this phase.
+    fn brk_shrink_phase_c_reclaim(&mut self, plans: &[super::TlbShootdownWaitPlan]) {
+        for plan in plans {
+            self.reclaim_memory_object_for_phys(plan.phys);
+        }
+    }
+
+    /// VALIDATION: D3_LIVE_SPLIT (Stage 107; phase-named Stage 112)
     ///
-    /// Returns `(pages_unmapped, pages_with_shootdown)`. The invariant
-    /// "no frame reuse before TLB invalidation ACK" is preserved page-by-page
-    /// by `execute_tlb_shootdown_wait_plan` (shootdown then reclaim) inside
-    /// the loop; the typed helper keeps the canonical ordering byte-for-byte.
-    /// `Ok(None)` from `unmap_page_phase1` (lazy/absent page) is silently
-    /// skipped, matching the existing brk-shrink contract.
+    /// D-NEXT-1 PR-B note (Stage 112): this orchestrator now calls three
+    /// named, rank-ordered phase functions (`brk_shrink_phase_a_vm` rank 5
+    /// → `brk_shrink_phase_b_tlb_wait`, no vm/memory lock →
+    /// `brk_shrink_phase_c_reclaim` rank 6) as three full passes over the
+    /// shrink range instead of interleaving PTE-removal/wait/reclaim
+    /// per-page. Each phase still acquires its domain lock through the
+    /// existing `KernelState` alias methods (`with_user_spaces_mut` /
+    /// `with_memory_state_mut`, both reached transitively via
+    /// `unmap_page_phase1` / `reclaim_memory_object_for_phys`) rather than
+    /// through `SharedKernel::with_vm_user_spaces_split_mut` /
+    /// `with_memory_split_mut` (§6.6) directly: those seams derive their
+    /// pointer via `self.state.data_ptr()` on `SharedKernel`, and this
+    /// method runs nested inside an already-held `&mut KernelState` borrow
+    /// (`SharedKernel::with`/`with_cpu`) reached from the trap dispatcher —
+    /// calling back into a sibling raw-pointer projection of the *same*
+    /// backing storage while that exclusive borrow is alive would alias it,
+    /// and would not actually shrink the global-lock hold time since the
+    /// outer borrow remains live for the whole call. Genuinely exiting the
+    /// global lock for this path requires relocating the `VmBrk` shrink
+    /// entry point to before `SharedKernel::with_cpu` in trap dispatch — the
+    /// same constraint already documented on D2 PR-A's
+    /// `block_current_on_receive_with_deadline` — which is deferred to a
+    /// follow-on PR (see `doc/KERNEL_UNLOCKING.md` §D-NEXT-1 PR-B). The
+    /// `M2_SEAM_HELPER_ONLY` fence for the vm/memory seams is therefore kept
+    /// as-is; behavior, lock order, and the shootdown-before-reclaim
+    /// ordering are unchanged from Stage 107 for every page actually
+    /// reached (see the Phase A reachability note above for the one
+    /// formal-only difference on an unreachable error path).
+    ///
+    /// Returns `(pages_unmapped, pages_with_shootdown)`.
     ///
     /// Telemetry: `d3_vm_brk_shrink_calls` (+1 per invocation),
     /// `d3_vm_brk_shrink_pages_unmapped` (+= pages actually unmapped),
     /// `d3_vm_brk_shrink_shootdowns` (+= per-page shootdowns executed).
-    /// Smoke marker: `D3_VM_BRK_SHRINK pages_unmapped=N shootdowns=M`.
+    /// Smoke marker: `D3_VM_BRK_SHRINK pages_unmapped=N shootdowns=M`
+    /// (unchanged). Optional Info markers for the new phase boundaries:
+    /// `D3_BRK_SHRINK_SPLIT_BEGIN`, `D3_BRK_SHRINK_VM_PHASE_DONE`,
+    /// `D3_BRK_SHRINK_TLB_WAIT_BEGIN`, `D3_BRK_SHRINK_TLB_WAIT_DONE`,
+    /// `D3_BRK_SHRINK_RECLAIM_DONE` — none of these are required for
+    /// acceptance.
     pub(crate) fn vm_brk_shrink_two_phase(
         &mut self,
         asid: Asid,
         unmap_start: usize,
         unmap_end: usize,
     ) -> Result<(usize, usize), KernelError> {
-        let mut pages_unmapped = 0usize;
-        let mut shootdowns = 0usize;
-        let mut va = unmap_start;
-        while va < unmap_end {
-            if let Some(plan) = self.unmap_page_phase1(asid, VirtAddr(va as u64))? {
-                pages_unmapped += 1;
-                if plan.target_cpu_bitmap != 0 {
-                    shootdowns += 1;
-                }
-                self.execute_tlb_shootdown_wait_plan(plan)?;
-            }
-            va = va.saturating_add(crate::kernel::vm::PAGE_SIZE);
-        }
+        // Phase order: vm (rank 5) → no lock (TLB wait) → memory (rank 6).
+        // Sequential, never nested — each phase function below acquires and
+        // releases its own domain lock before the next phase begins.
+        crate::yarm_log!(
+            "D3_BRK_SHRINK_SPLIT_BEGIN asid={} start={:#x} end={:#x}",
+            asid.0,
+            unmap_start,
+            unmap_end
+        );
+        let plans = self.brk_shrink_phase_a_vm(asid, unmap_start, unmap_end)?;
+        let pages_unmapped = plans.len();
+        crate::yarm_log!(
+            "D3_BRK_SHRINK_VM_PHASE_DONE pages_unmapped={}",
+            pages_unmapped
+        );
+
+        crate::yarm_log!("D3_BRK_SHRINK_TLB_WAIT_BEGIN pending={}", pages_unmapped);
+        let shootdowns = self.brk_shrink_phase_b_tlb_wait(&plans)?;
+        crate::yarm_log!("D3_BRK_SHRINK_TLB_WAIT_DONE shootdowns={}", shootdowns);
+
+        self.brk_shrink_phase_c_reclaim(&plans);
+        crate::yarm_log!(
+            "D3_BRK_SHRINK_RECLAIM_DONE pages_reclaimed={}",
+            pages_unmapped
+        );
+
         self.note_d3_vm_brk_shrink(pages_unmapped, shootdowns);
         crate::yarm_log!(
             "D3_VM_BRK_SHRINK pages_unmapped={} shootdowns={}",
