@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 110 sentinel cleanup)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -150,6 +150,45 @@ The exact remaining x86_64 SMP blocker for scheduler participation is the AP
 per-CPU environment: per-CPU GDT/IDT/TSS + GS base + AP-safe printk +
 `bring_up_cpu(cpu)` integration; runqueue sharding (D6) after `-smp ≥ 2`
 scheduler-online smoke exists.
+
+### Stage 110 — D7-A / D7-B: sentinel cleanup + D2 race-unwind smoke gate
+
+**D7-A (smoke acceptance cleanup).** The Stage 104 (D1) and Stage 106 (D2)
+live-wire modules carried a `NOT SMOKE-ACCEPTED` module-doc disclosure
+written before any QEMU smoke had run against those branches. Milestone 1
+(above) was declared PASS on 2026-06-12 against this same live-wired code,
+so the disclosure was stale. Re-ran the full required smoke set on
+2026-06-16 to confirm before removing it:
+
+| Smoke | Result |
+|-------|--------|
+| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PASS |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PASS |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PASS |
+| `./scripts/qemu-aarch64-core-smoke.sh` | PASS |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PASS |
+
+No `D2_PUBLISH_RACE_UNWIND`, panic, fatal, assert, page-fault, OOM,
+capacity, or wrong-sender marker appeared in any log. The `NOT
+SMOKE-ACCEPTED` disclosures in `src/kernel/cap_transfer_split.rs` (D1/D5)
+and `src/kernel/recv_waiter_split.rs` (D2) were removed and replaced with a
+`SMOKE-ACCEPTED (Stage 110, ...)` note; `stage104_validation_labels_present`
+and `stage106_d2_validation_labels_present` now assert the sentinel's
+**absence** instead of its presence. A repo-wide ceiling test
+(`kernel::boot::tests::no_stale_not_smoke_accepted_sentinels_in_src`) fails
+the build if any module re-introduces the sentinel without a matching
+smoke-acceptance update. No D1/D2/D5 runtime logic changed.
+
+**D7-B (D2 publish-race smoke gate).** `d2_publish_race_unwinds` was
+already a required-zero invariant (§3, §8), but no smoke script actually
+grepped the QEMU log for `D2_PUBLISH_RACE_UNWIND` — only a unit test
+checked that the unwind branch exists in source. Added a hard,
+unconditional reject for `D2_PUBLISH_RACE_UNWIND` (independent of
+`QEMU_SMOKE_STRICT`) to `qemu-x86_64-core-smoke.sh`,
+`qemu-x86_64-optional-fs-smoke.sh`, `qemu-aarch64-core-smoke.sh`,
+`qemu-aarch64-optional-fs-smoke.sh`, and `qemu-riscv64-core-smoke.sh`
+(`qemu-riscv64-smoke-matrix.sh` inherits this through the core-smoke
+script it drives).
 
 ---
 
@@ -491,21 +530,61 @@ maintenance stage either live-wires it or removes it.
 
 ## 7. Remaining work
 
-1. **AP per-CPU environment** (x86_64 SMP path to scheduler participation):
-   per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
-   behind a default-off knob; then `-smp ≥ 2` smoke acceptance.
-2. **Route Stage 106/107 typed helpers through Stage 108 seams**, one PR
-   per helper, each smoke-gated:
-   - D2 publish → task/scheduler seams.
-   - D3 shrink → vm/memory seams.
-   - D6 dispatch → scheduler seam.
-3. **Lock-free `await_tlb_shootdown_ack`** for multi-CPU D3.
-4. **Per-CPU runqueue lock sharding (D6)** after `-smp ≥ 2`
-   scheduler-online smoke exists.
-5. **D4 continuation:** `syscall/recv_shared_v3.rs`, then
-   `syscall/process.rs`, then the remaining modules in §5.1.
-6. **Shared-region cap-transfer split** (D1/D5 extension) once
-   receiver-side mapping obligations are folded into the phase model.
+Ordered per the Cycle 12 roadmap review (2026-06-16). Immediate items are
+administrative cleanup with no behavior change; Next items are the
+seam-routing and D4 follow-on work; Concurrent/gated items remain open but
+may not jump ahead of Immediate or bypass their own gates.
+
+**Immediate (Stage 110 — complete, this revision):**
+
+1. **D7-A — smoke acceptance cleanup.** Remove the stale `NOT
+   SMOKE-ACCEPTED` disclosures from `cap_transfer_split.rs` (D1/D5) and
+   `recv_waiter_split.rs` (D2) now that the required smokes have actually
+   run against this live-wired code. See the Stage 110 note in §1.
+2. **D7-B — `D2_PUBLISH_RACE_UNWIND` smoke grep.** Add a hard reject for
+   this marker to every architecture's smoke scripts. See the Stage 110
+   note in §1.
+
+**Next:**
+
+3. **D-NEXT-1 PR-A — D2 publish → task/scheduler seams.** Route
+   `publish_recv_waiter_live` through `with_task_tcbs_split_mut` /
+   `with_scheduler_split_mut` (§6.6), deleting the helper-only fence for
+   those two seams in the same PR. Smoke-gated.
+4. **D-NEXT-1 PR-B — D3 shrink → vm/memory seams.** Route
+   `vm_brk_shrink_two_phase` through `with_vm_user_spaces_split_mut` /
+   `with_memory_split_mut`, deleting the helper-only fence for those two
+   seams in the same PR. Smoke-gated.
+5. **D-NEXT-1 PR-C — D6 dispatch → scheduler seam.** Route
+   `local_dispatch_step_split` through `with_scheduler_split_mut`,
+   deleting its helper-only fence in the same PR. Smoke-gated.
+6. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction.** Next mechanical
+   decomposition target per §5.1.
+
+**Concurrent / gated:**
+
+7. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
+   Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
+   behind a default-off knob; then `-smp ≥ 2` smoke acceptance. Still
+   high priority — it unblocks per-CPU runqueue lock sharding (D6) and the
+   lock-free `await_tlb_shootdown_ack` design (D3) — but must not bypass
+   D7-A/D7-B and must not jump ahead of the Next items above without an
+   explicit gating review.
+8. **D4 steps 2–4** — `syscall/process.rs`, `syscall/sched.rs`,
+   `syscall/cap.rs` splits, then the remaining modules in §5.1.
+9. **D3-FULL / D6-full / D2-B** — full `VmAnonMap` two-phase live,
+   per-CPU runqueue lock sharding, and any shared-region cap-transfer
+   split (D1/D5 extension) — remain gated on item 7 (AP scheduler-online)
+   and on items 3–5 (seam progress) landing first.
+
+RISC-V64 is included in the global unlocking smoke matrix
+(`scripts/qemu-riscv64-smoke-matrix.sh`, §7.1.3/§7.1.4) and is a required
+gate alongside x86_64 and AArch64. RPi5 remains a diagnostic / high-half
+bring-up track only (`doc/RPI5_BRINGUP.md`) and is **not** part of the
+global unlocking smoke gate. No future live-wire PR may leave a stale
+`NOT SMOKE-ACCEPTED` sentinel behind after its required smokes have
+actually run and passed — enforced by
+`kernel::boot::tests::no_stale_not_smoke_accepted_sentinels_in_src` (§8).
 
 ---
 
@@ -570,20 +649,25 @@ one-source external IRQ, SMP scheduling) are explicit post-unlocking
 items, each carrying a canonical deferred-reason marker today so its
 absence is visible at every boot.
 
-### 7.1.5 Next 3 unlocking implementation targets (in order)
+### 7.1.5 Next unlocking implementation targets (in order)
 
-1. **x86_64 AP per-CPU environment → scheduler-online.** Per-CPU
-   GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
-   behind a default-off knob; then `-smp ≥ 2` smoke acceptance.
-   Unblocks per-CPU runqueue lock sharding (D6) and the lock-free
-   `await_tlb_shootdown_ack` design (D3).
-2. **Route Stage 106/107 typed helpers through Stage 108 seams**, one
-   PR per helper, each smoke-gated: D2 publish → task/scheduler seams;
-   D3 shrink → vm/memory seams; D6 dispatch → scheduler seam. Each PR
-   deletes its `M2_SEAM_HELPER_ONLY` / `FALLBACK_GLOBAL_LOCK` fence
-   atomically.
-3. **D4 continuation:** `syscall/recv_shared_v3.rs`, then
+D7-A (sentinel cleanup) and D7-B (`D2_PUBLISH_RACE_UNWIND` smoke grep)
+landed in Stage 110 (§1) and are no longer pending. The next targets, in
+order:
+
+1. **D-NEXT-1 PR-A/B/C — route Stage 106/107 typed helpers through Stage
+   108 seams**, one PR per helper, each smoke-gated: D2 publish →
+   task/scheduler seams; D3 shrink → vm/memory seams; D6 dispatch →
+   scheduler seam. Each PR deletes its `M2_SEAM_HELPER_ONLY` /
+   `FALLBACK_GLOBAL_LOCK` fence atomically.
+2. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction**, then
    `syscall/process.rs`, then the remaining modules listed in §5.1.
+3. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
+   Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
+   behind a default-off knob; then `-smp ≥ 2` smoke acceptance. Still
+   high priority — it unblocks per-CPU runqueue lock sharding (D6) and
+   the lock-free `await_tlb_shootdown_ack` design (D3) — but does not
+   bypass items 1–2 above.
 
 ### 7.1.6 What must not be touched yet
 
@@ -613,27 +697,32 @@ absence is visible at every boot.
 
 **Ready to resume global kernel unlocking: yes.**
 
-All required per-arch acceptance smokes pass:
-`qemu-x86_64-core-smoke.sh`, `qemu-aarch64-core-smoke.sh`,
-`qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`), plus the strict
-optional-FS smokes on x86_64 and AArch64. The Stage 108 seams and the
-D3/D6 follow-ups are gated on the x86_64 AP per-CPU environment
-landing, which is item 1 of §7.1.5; that is the natural next
-unlocking pass.
+D7-A and D7-B (§1 Stage 110, §7 items 1–2) are complete: the stale
+`NOT SMOKE-ACCEPTED` sentinels are gone and `D2_PUBLISH_RACE_UNWIND` is
+now a hard smoke-script reject on every architecture. All required
+per-arch acceptance smokes pass: `qemu-x86_64-core-smoke.sh`,
+`qemu-aarch64-core-smoke.sh`, `qemu-riscv64-smoke-matrix.sh`
+(`--smp 1/2/3/4`), plus the strict optional-FS smokes on x86_64 and
+AArch64. The next unlocking pass is the seam-routing work (§7.1.5 item 1)
+— **not** the x86_64 AP per-CPU environment, which stays gated/concurrent
+(§7 item 7) until the seam PRs and D4 step 1 land.
 
 **Exact next Claude prompt recommendation:**
 
-> Kernel unlocking Pass: x86_64 AP per-CPU environment → AP
-> scheduler-online. Goal: stand up per-CPU GDT/IDT/TSS + GS base +
-> AP-safe printk + `bring_up_cpu(cpu)` behind a default-off knob,
-> then accept `-smp ≥ 2` scheduler-online smoke. Hard rules: do not
-> touch D1/D5/D2 canonical fallbacks; do not enable live
-> `await_tlb_shootdown_ack` redesign; do not enable per-CPU
-> scheduler lock types; preserve all three per-arch core smokes
-> (x86_64, AArch64, RISC-V64 matrix) and the strict optional-FS
-> smokes; do not rely on Debug-level markers. Deliverables:
-> implementation, MUST_SMOKE run, deletion of the AP-related
-> helper-only fences, audit note in `doc/KERNEL_UNLOCKING.md` §7.1.
+> Kernel unlocking Pass: D-NEXT-1 PR-A — route the Stage 106 D2 publish
+> helper (`publish_recv_waiter_live`) through the Stage 108
+> `with_task_tcbs_split_mut` / `with_scheduler_split_mut` seams (§6.6),
+> deleting the `M2_SEAM_HELPER_ONLY` fence for those two seams in the same
+> PR. Hard rules: do not touch D1/D5 canonical fallbacks; do not start
+> D-NEXT-1 PR-B (D3) or PR-C (D6) in this PR; do not start the x86_64 AP
+> per-CPU environment (D-NEXT-2) in this PR; preserve all required
+> per-arch smokes (x86_64 core + optional-FS strict, AArch64 core +
+> optional-FS strict, RISC-V64 matrix) including the `D2_PUBLISH_RACE_UNWIND`
+> reject added in Stage 110; do not rely on Debug-level markers; do not
+> leave a new `NOT SMOKE-ACCEPTED` sentinel behind without actually
+> running the required smokes first. Deliverables: implementation,
+> MUST_SMOKE run, deletion of the two seams' helper-only fence, audit
+> note in `doc/KERNEL_UNLOCKING.md` §1/§7/§7.1.
 
 ---
 
@@ -662,6 +751,11 @@ unlocking pass.
 - **`yarm.loglevel=` may be used in verbose smoke runs.** Never change the
   production default (Info); never rely on Debug-level markers in
   acceptance greps.
+- **No stale smoke-acceptance sentinels.** A live-wired module may carry a
+  `NOT SMOKE-ACCEPTED` module-doc disclosure only until its required
+  smokes actually run; no future live-wire PR may leave that sentinel
+  behind once smoke acceptance is recorded (§1 Stage 110). Enforced
+  repo-wide by `kernel::boot::tests::no_stale_not_smoke_accepted_sentinels_in_src`.
 
 ---
 

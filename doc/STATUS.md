@@ -224,12 +224,18 @@ The four highest-impact items, in order of unlock value:
    kernel-unlocking smoke policy and unblock RISC-V SMP scheduling so
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
-2. **x86_64 AP per-CPU environment.** Per-CPU GDT/IDT/TSS + GS base +
-   AP-safe printk + `bring_up_cpu(cpu)` integration, behind a default-off
-   knob; then `-smp ≥ 2` smoke acceptance. Lock-free
-   `await_tlb_shootdown_ack` and per-CPU runqueue lock sharding (D6)
-   follow once scheduler-online APs exist. See `doc/ARCH_X86_64.md` §4
-   and `doc/KERNEL_UNLOCKING.md` §7.
+2. **Kernel-unlocking seam-routing PRs (D-NEXT-1 PR-A/B/C), then x86_64
+   AP per-CPU environment (D-NEXT-2).** Per Cycle 12 / Stage 110, D7-A
+   (smoke-acceptance sentinel cleanup) and D7-B (D2 race-unwind smoke
+   reject) are complete; the next PRs route the already-live D2/D3/D6
+   call sites through their typed split-lock helpers (no behavior
+   change) before the x86_64 AP per-CPU environment (per-CPU
+   GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`, behind
+   a default-off knob, then `-smp ≥ 2` smoke acceptance) starts. AP
+   per-CPU work remains high priority but may not bypass the seam-
+   routing PRs. Lock-free `await_tlb_shootdown_ack` and per-CPU runqueue
+   lock sharding (D6) follow once scheduler-online APs exist. See
+   `doc/ARCH_X86_64.md` §4 and `doc/KERNEL_UNLOCKING.md` §7.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

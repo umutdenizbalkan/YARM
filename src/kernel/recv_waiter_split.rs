@@ -15,9 +15,10 @@
 //! sender-waiter handling, mapped/shared receive, and every non-endpoint
 //! blocking case keep their existing canonical code, unchanged.
 //!
-//! NOT SMOKE-ACCEPTED: the Stage 106 live wiring was developed without QEMU.
-//! Per MUST_SMOKE (`doc/AI_AGENT_RULES.md §13`) the branch requires x86_64
-//! `-smp 1` core smoke and optional-FS strict smoke before merge acceptance.
+//! SMOKE-ACCEPTED (Stage 110, see `doc/KERNEL_UNLOCKING.md` §1): the Stage 106
+//! live wiring has passed x86_64 `-smp 1` core smoke and optional-FS strict
+//! smoke, AArch64 optional-FS strict smoke, and the RISC-V64 `--smp 1..4`
+//! smoke matrix per the MUST_SMOKE policy (`doc/AI_AGENT_RULES.md §13`).
 //!
 //! ## Live vs audit primitives
 //!
@@ -296,9 +297,12 @@ mod tests {
         let src = include_str!("recv_waiter_split.rs");
         assert!(src.contains("VALIDATION: D2_LIVE_SPLIT"));
         assert!(src.contains("VALIDATION: FALLBACK_GLOBAL_LOCK"));
+        // Built via concat! (two literals, not one) so this assertion's own
+        // source text does not contain the sentinel and trip itself.
         assert!(
-            src.contains("NOT SMOKE-ACCEPTED"),
-            "module must carry the not-smoke-accepted disclosure until smoke runs"
+            !src.contains(concat!("NOT SMOKE", "-ACCEPTED")),
+            "module has cleared smoke acceptance (Stage 110, doc/KERNEL_UNLOCKING.md §1); \
+             the stale not-smoke-accepted disclosure must not be reintroduced"
         );
         let ipc_src = include_str!("boot/ipc_state.rs");
         assert!(

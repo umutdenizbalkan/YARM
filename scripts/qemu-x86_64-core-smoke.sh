@@ -156,6 +156,7 @@ HARD_BLOCKER_PATTERNS=(
   "PM_PANIC"
   "INIT_PANIC"
   "^PANIC "
+  "D2_PUBLISH_RACE_UNWIND"
 )
 
 hard_blocker_found=0

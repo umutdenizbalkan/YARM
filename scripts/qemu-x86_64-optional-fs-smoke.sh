@@ -145,6 +145,16 @@ if [[ -f "$LOGFILE" ]]; then
     echo "[ok] KSPAWN_EXTRA_CAP_DELEGATE_FAIL count=0"
   fi
 
+  # D2_PUBLISH_RACE_UNWIND: D2 endpoint-recv waiter-publish no-lost-wakeup
+  # unwind. Per doc/AI_AGENT_RULES.md §14.3 / doc/KERNEL_UNLOCKING.md §3 this
+  # must be 0 — any occurrence is a stop-ship bug, not just a strict-mode warning.
+  if rg -a -q "D2_PUBLISH_RACE_UNWIND" "$LOGFILE" 2>/dev/null; then
+    echo "[fail] STOP-SHIP: D2_PUBLISH_RACE_UNWIND observed"
+    smoke_fail=1
+  else
+    echo "[ok] D2_PUBLISH_RACE_UNWIND count=0"
+  fi
+
   # PM_VFS_SPAWN_FAIL: PM failed to load/spawn a server from VFS.
   pm_vfs_fail=$(tr '\r' '\n' <"$LOGFILE" | rg -a -c "PM_VFS_SPAWN_FAIL" 2>/dev/null || echo 0)
   if [[ "$pm_vfs_fail" -gt 0 ]]; then

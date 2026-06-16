@@ -145,6 +145,10 @@ REJECT_PATTERNS=(
   # failure here means the bitmap silently fell back to the single-hart
   # default instead of reflecting the real topology.
   'RISCV_DTB_CPU_SCAN_FAILED'
+  # D2 endpoint-recv waiter-publish no-lost-wakeup unwind. Per
+  # doc/AI_AGENT_RULES.md §14.3 / doc/KERNEL_UNLOCKING.md §3 this must be 0 —
+  # any occurrence is a stop-ship bug.
+  'D2_PUBLISH_RACE_UNWIND'
 )
 
 failures=0
