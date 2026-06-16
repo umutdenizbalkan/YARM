@@ -170,6 +170,59 @@ fn ap_stack_top(cpu: CpuId) -> u64 {
     AP_STACK_TOP_BASE + ((cpu.0 as u64 + 1) * AP_STACK_BYTES as u64)
 }
 
+/// Emits the AP per-CPU record + GS-base scaffold for `cpu`.
+///
+/// The per-CPU record at `super::percpu::record_base(cpu)` is initialized
+/// by the BSP before the AP is observed parked. The record carries the
+/// AP's logical CPU id, APIC id, stack top, and a `RECORD_INITIALIZED`
+/// flag. Reserved fields for TSS / IDT / scheduler pointers are zeroed
+/// for future bring-ups.
+///
+/// **GS-base write**: deferred. `yarm_x86_64_ap_entry` is currently
+/// asm-only (cli/hlt loop) with no MSR-write step; until that path
+/// grows a real Rust body that can `wrmsr IA32_GS_BASE` with the
+/// per-CPU record pointer and read it back, we keep GS deferred with
+/// the explicit reason `ap_entry_is_asm_only_no_msr_write_yet`.
+fn emit_ap_percpu_scaffold(cpu: CpuId) {
+    let record_base = super::percpu::record_base(cpu);
+    let stack_top = ap_stack_top(cpu);
+
+    crate::yarm_log!("X86_AP_PERCPU_BEGIN cpu={}", cpu.0);
+    crate::yarm_log!(
+        "X86_AP_PERCPU_SLOT_READY cpu={} base=0x{:x} size=0x{:x}",
+        cpu.0,
+        record_base,
+        super::percpu::PerCpuRecord::SIZE
+    );
+
+    // BSP-initializes the AP's per-CPU record. The APIC id matches the
+    // logical CPU id for the QEMU virt + LAPIC layout currently in use.
+    super::percpu::init_record_for_ap(cpu, cpu.0, stack_top);
+    let record = super::percpu::read_record(cpu);
+    crate::yarm_log!(
+        "X86_AP_PERCPU_RECORD_READY cpu={} apic_id={} stack=0x{:x}",
+        record.cpu_id,
+        record.apic_id,
+        record.stack_top
+    );
+
+    crate::yarm_log!(
+        "X86_AP_GS_WRITE_BEGIN cpu={} base=0x{:x}",
+        cpu.0,
+        record_base
+    );
+    // No MSR write: yarm_x86_64_ap_entry is asm-only in this pass. The
+    // smoke gate accepts X86_AP_GS_DEFERRED with this exact reason.
+    // This marker supersedes the legacy X86_AP_GS_DEFERRED reason
+    // (`no_per_cpu_area_allocated`) since the per-CPU area now exists.
+    crate::yarm_log!(
+        "X86_AP_GS_DEFERRED cpu={} reason=ap_entry_is_asm_only_no_msr_write_yet",
+        cpu.0
+    );
+
+    crate::yarm_log!("X86_AP_PERCPU_READY cpu={}", cpu.0);
+}
+
 /// Emits the AP per-CPU environment scaffold marker sequence for `cpu`.
 ///
 /// The scaffold contract (this pass):
@@ -463,6 +516,14 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         }
 
         crate::yarm_log!("X86_AP_ENTER_RUST cpu={}", cpu.0);
+
+        // AP per-CPU record + GS-base scaffold. Each AP gets a fixed
+        // record at a stable address in the global PER_CPU_SLOTS
+        // table. GS-base write remains deferred until the AP entry
+        // point grows a real Rust body that can WRMSR IA32_GS_BASE
+        // from the handoff; the smoke gate accepts the explicit
+        // deferral marker.
+        emit_ap_percpu_scaffold(cpu);
 
         // AP per-CPU environment scaffold. Each component is either
         // wired (READY) or explicitly DEFERRED with a real reason — no

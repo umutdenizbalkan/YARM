@@ -35,6 +35,13 @@ trace_frame_alloc = []
 legacy-tests = []
 rpi5-stage1 = []
 rpi5-highhalf = ["rpi5-stage1"]
+# Opt-in for the RISC-V S-mode timer-interrupt enable path. Default OFF.
+# When enabled, the kernel-idle terminal point will program a one-shot
+# SBI Timer deadline, set sie.STIE, and set sstatus.SIE — but only after
+# the trap-bridge re-entrancy audit has been completed on a CI runner
+# with live QEMU. The feature gate exists so the scaffold can be merged
+# without flipping live IRQ delivery in default builds.
+riscv64-timer-irq = []
 
 [dependencies]
 yarm-ipc-abi = { path = "crates/yarm-ipc-abi" }
