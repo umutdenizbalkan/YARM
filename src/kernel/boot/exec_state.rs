@@ -1267,13 +1267,19 @@ impl KernelState {
                 ipc.telemetry.scheduler_dispatch_calls.saturating_add(1);
         });
         let outgoing_tid = self.current_tid();
-        // VALIDATION: D6_LIVE_SPLIT (Stage 107)
-        // Route the local-CPU dispatch step through the typed helper for
-        // telemetry + future SharedKernel-seam wrapping. Behavior is
-        // byte-identical to dispatch_next_current_cpu.
+        // VALIDATION: D6_LIVE_SPLIT (Stage 107); Phase A/B named Stage 113.
+        // Phase A (scheduler rank 1 only): local_dispatch_step_split picks
+        // the next runnable task and drops the scheduler lock before
+        // returning. Everything below this line is Phase B (non-scheduler
+        // side effects: ASID switch, kernel-context switch, TCB status
+        // mutation) and already runs with the scheduler lock released — see
+        // local_dispatch_step_split's doc comment in scheduler_state.rs for
+        // the deferred SharedKernel-seam live-wire blocker (§D-NEXT-1 PR-C
+        // in doc/KERNEL_UNLOCKING.md).
         let next = self.local_dispatch_step_split();
         if let Some(tid) = next {
             crate::yarm_log!("SCHED_DISPATCH_NEXT chosen_tid={}", tid);
+            crate::yarm_log!("D6_DISPATCH_SELECTED tid={}", tid);
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: selected_tid={}", tid);
             }
@@ -1461,6 +1467,7 @@ impl KernelState {
         } else {
             crate::yarm_log!("SCHED_NO_RUNNABLE_USER_TASK");
             crate::yarm_log!("SCHED_ENTER_IDLE");
+            crate::yarm_log!("D6_DISPATCH_IDLE");
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: no_runnable_task");
             }
