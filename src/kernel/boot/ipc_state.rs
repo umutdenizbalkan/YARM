@@ -14,6 +14,18 @@ use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, PROC_OP_EXECUTE_RESTART,
 };
 
+/// D-NEXT-1 PR-A (Stage 111): rank-ordered phase plan threaded through the
+/// `block_current_on_receive_with_deadline` sequence. Carrying a typed plan
+/// instead of a bare `ThreadId` makes each phase's pre/post condition
+/// explicit at the type level and gives tests a stable seam to assert phase
+/// completion independently of the final outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecvBlockPhasePlan {
+    blocked_tid: ThreadId,
+    endpoint_idx: usize,
+    recv_cap: CapId,
+}
+
 impl KernelState {
     fn wake_tid_to_runnable(&mut self, tid: ThreadId) -> Result<(), KernelError> {
         let old_status = self.task_status(tid.0).ok_or(KernelError::TaskMissing)?;
@@ -438,54 +450,149 @@ impl KernelState {
         self.mint_capability_in_cnode(cnode, capability)
     }
 
+    /// D-NEXT-1 PR-A Phase A — scheduler domain, rank 1: make the
+    /// block-current-task scheduling decision. Acquires and releases only
+    /// the scheduler's embedded lock (`block_current_cpu` →
+    /// `scheduler_state()`), the same field `SharedKernel::
+    /// with_scheduler_split_mut` (§6.6) guards — never the task or ipc lock.
+    fn recv_block_phase_a_scheduler(
+        &mut self,
+        endpoint_idx: usize,
+        recv_cap: CapId,
+    ) -> Result<RecvBlockPhasePlan, KernelError> {
+        crate::yarm_log!(
+            "D2_RECV_WAITER_SPLIT_BEGIN endpoint={} recv_cap={}",
+            endpoint_idx,
+            recv_cap.0
+        );
+        let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
+        Ok(RecvBlockPhasePlan {
+            blocked_tid: ThreadId(blocked_tid),
+            endpoint_idx,
+            recv_cap,
+        })
+    }
+
+    /// D-NEXT-1 PR-A Phase B — task/TCB domain, rank 2: transition the
+    /// blocked thread's TCB to `Blocked(EndpointReceive)` and stage the
+    /// deadline. Acquires and releases only the task lock (`with_tcbs_mut`),
+    /// the same field `SharedKernel::with_task_tcbs_split_mut` (§6.6)
+    /// guards — never the scheduler or ipc lock. Entered strictly after
+    /// Phase A has released the scheduler lock (rank 1 → rank 2, never
+    /// reversed).
+    fn recv_block_phase_b_task(
+        &mut self,
+        plan: RecvBlockPhasePlan,
+        deadline: Option<u64>,
+    ) -> Result<RecvBlockPhasePlan, KernelError> {
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == plan.blocked_tid.0)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(plan.recv_cap));
+            tcb.ipc_timeout_deadline = deadline;
+            tcb.ipc_timeout_fired = false;
+            Ok::<_, KernelError>(())
+        })?;
+        crate::yarm_log!("D2_RECV_WAITER_TASK_BLOCKED tid={}", plan.blocked_tid.0);
+        Ok(plan)
+    }
+
+    /// D-NEXT-1 PR-A Phase C — ipc domain, rank 3: atomically recheck the
+    /// endpoint queue and publish the waiter under `ipc_state_lock`, via the
+    /// unchanged Stage 106 live primitive. Entered strictly after Phase B
+    /// has released the task lock (rank 2 → rank 3, never reversed). On
+    /// `QueueNonEmpty` the caller drives the no-lost-wakeup unwind back
+    /// through ranks 2 and 1 (`recv_block_unwind_race`).
+    fn recv_block_phase_c_ipc_publish(
+        &mut self,
+        plan: RecvBlockPhasePlan,
+    ) -> crate::kernel::recv_waiter_split::PublishWaiterOutcome {
+        let outcome =
+            self.publish_recv_waiter_live(plan.endpoint_idx, plan.blocked_tid, plan.recv_cap);
+        if matches!(
+            outcome,
+            crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published
+        ) {
+            crate::yarm_log!("D2_RECV_WAITER_PUBLISHED tid={}", plan.blocked_tid.0);
+        }
+        outcome
+    }
+
+    /// D-NEXT-1 PR-A: no-lost-wakeup unwind for the Phase C `QueueNonEmpty`
+    /// race — a sender enqueued between the caller's Phase-1 empty dequeue
+    /// and the Phase C publish. Unreachable under the serialized global
+    /// lock (Phase A/B/C run in the same `&mut KernelState` borrow today);
+    /// REQUIRED for correctness once a future pass genuinely exits the
+    /// global lock for this path (see the module-level deferral note above
+    /// `block_current_on_receive_with_deadline`). Reverses Phase B (task →
+    /// Runnable, rank 2) then re-enters the scheduler (rank 1) to
+    /// redispatch — byte-identical to the Stage 106 unwind, only extracted
+    /// into a named call boundary.
+    fn recv_block_unwind_race(
+        &mut self,
+        plan: RecvBlockPhasePlan,
+    ) -> Result<ThreadId, KernelError> {
+        crate::yarm_log!(
+            "D2_PUBLISH_RACE_UNWIND endpoint={} tid={}",
+            plan.endpoint_idx,
+            plan.blocked_tid.0
+        );
+        crate::yarm_log!("D2_RECV_WAITER_RACE_UNWIND tid={}", plan.blocked_tid.0);
+        self.note_d2_publish_race_unwind();
+        self.wake_tid_to_runnable(plan.blocked_tid)?;
+        let _ = self.dispatch_next_task()?;
+        Ok(plan.blocked_tid)
+    }
+
+    /// VALIDATION: D2_LIVE_SPLIT (Stage 106 / Pass 3; phase-named Stage 111)
+    ///
+    /// D-NEXT-1 PR-A note (Stage 111): this orchestrator now calls three
+    /// named, rank-ordered phase functions (`recv_block_phase_a_scheduler`
+    /// rank 1 → `recv_block_phase_b_task` rank 2 →
+    /// `recv_block_phase_c_ipc_publish` rank 3) instead of inlining the
+    /// scheduler/task/ipc steps. Each phase still acquires its domain lock
+    /// through the existing `KernelState` alias method (`block_current_cpu`
+    /// / `with_tcbs_mut` / `publish_recv_waiter_live`) rather than through
+    /// `SharedKernel::with_scheduler_split_mut` /
+    /// `with_task_tcbs_split_mut` (§6.6) directly: those seams derive their
+    /// pointer via `self.state.data_ptr()` on `SharedKernel`, and this
+    /// method runs nested inside an already-held `&mut KernelState` borrow
+    /// (`SharedKernel::with`/`with_cpu`) reached from the trap dispatcher —
+    /// calling back into a sibling raw-pointer projection of the *same*
+    /// backing storage while that exclusive borrow is alive would alias it,
+    /// and would not actually shrink the global-lock hold time since the
+    /// outer borrow remains live for the whole call. Genuinely exiting the
+    /// global lock for this path requires relocating the IpcRecv-block
+    /// entry point to before `SharedKernel::with_cpu` in trap dispatch —
+    /// mirroring `SharedKernel::try_split_ipc_recv_queued_plain_into_frame`,
+    /// the existing non-blocking split precedent — which is deferred to a
+    /// follow-on PR (see `doc/KERNEL_UNLOCKING.md` §D-NEXT-1 PR-A). The
+    /// `M2_SEAM_HELPER_ONLY` fence for the scheduler/task seams is therefore
+    /// kept as-is; behavior, lock order, and the no-lost-wakeup contract are
+    /// byte-identical to Stage 106.
     fn block_current_on_receive_with_deadline(
         &mut self,
         endpoint_idx: usize,
         recv_cap: CapId,
         deadline: Option<u64>,
     ) -> Result<ThreadId, KernelError> {
-        // VALIDATION: D2_LIVE_SPLIT (Stage 106 / Pass 3)
-        // Phase order: scheduler block (rank 1) → TCB transition + deadline
-        // staging (rank 2) → waiter publish (rank 3) → dispatch. Sequential
-        // acquire/release, never nested. Because the TCB is Blocked BEFORE
-        // the publish becomes visible, any sender that observes the published
-        // waiter also observes a Blocked TCB — wake cannot be lost on that
-        // edge (audit doc §15.2 / §18).
-        let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
-        crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
-        self.with_tcbs_mut(|tcbs| {
-            let tcb = tcbs
-                .iter_mut()
-                .flatten()
-                .find(|tcb| tcb.tid.0 == blocked_tid)
-                .ok_or(KernelError::TaskMissing)?;
-            tcb.status = TaskStatus::Blocked(WaitReason::EndpointReceive(recv_cap));
-            tcb.ipc_timeout_deadline = deadline;
-            tcb.ipc_timeout_fired = false;
-            Ok::<_, KernelError>(())
-        })?;
-        // D2: atomic queue-recheck + publish under ipc_state_lock (rank 3)
-        // via the typed live primitive (Stage 105 scaffold, Stage 106 live).
-        match self.publish_recv_waiter_live(endpoint_idx, ThreadId(blocked_tid), recv_cap) {
+        // Phase order: scheduler (rank 1) → task/TCB (rank 2) → ipc (rank
+        // 3) → dispatch. Sequential acquire/release, never nested — each
+        // phase function below acquires and releases its own domain lock
+        // before the next phase begins. Because the TCB is Blocked (Phase
+        // B) BEFORE the publish becomes visible (Phase C), any sender that
+        // observes the published waiter also observes a Blocked TCB — wake
+        // cannot be lost on that edge (audit doc §15.2 / §18).
+        let plan = self.recv_block_phase_a_scheduler(endpoint_idx, recv_cap)?;
+        let plan = self.recv_block_phase_b_task(plan, deadline)?;
+        match self.recv_block_phase_c_ipc_publish(plan) {
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published => {}
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {
-                // No-lost-wakeup unwind: a sender enqueued between the
-                // caller's Phase-1 empty dequeue and this publish. Unreachable
-                // under the serialized global lock (Phase 1 and this publish
-                // run in the same `&mut KernelState` borrow today); REQUIRED
-                // for correctness once the SharedKernel seam splits the
-                // borrow. Do not stay blocked: restore the task to Runnable
-                // (clears the staged deadline) and return so the caller's
-                // Phase-2 dequeue drains the raced message.
-                crate::yarm_log!(
-                    "D2_PUBLISH_RACE_UNWIND endpoint={} tid={}",
-                    endpoint_idx,
-                    blocked_tid
-                );
-                self.note_d2_publish_race_unwind();
-                self.wake_tid_to_runnable(ThreadId(blocked_tid))?;
-                let _ = self.dispatch_next_task()?;
-                return Ok(ThreadId(blocked_tid));
+                return self.recv_block_unwind_race(plan);
             }
             // The live primitive preserves canonical overwrite semantics for
             // a pre-existing waiter (it never returns ReceiverAlreadyWaiting)
@@ -498,11 +605,11 @@ impl KernelState {
         }
         crate::yarm_log!(
             "IPC_RECV_BLOCK_REGISTER endpoint={} tid={}",
-            endpoint_idx,
-            blocked_tid
+            plan.endpoint_idx,
+            plan.blocked_tid.0
         );
         let _ = self.dispatch_next_task()?;
-        Ok(ThreadId(blocked_tid))
+        Ok(plan.blocked_tid)
     }
 
     fn block_current_on_send_with_deadline(

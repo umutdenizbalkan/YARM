@@ -20,6 +20,15 @@
 //! smoke, AArch64 optional-FS strict smoke, and the RISC-V64 `--smp 1..4`
 //! smoke matrix per the MUST_SMOKE policy (`doc/AI_AGENT_RULES.md §13`).
 //!
+//! Stage 111 / D-NEXT-1 PR-A: `block_current_on_receive_with_deadline`
+//! (`boot/ipc_state.rs`) now expresses its call into this module through a
+//! named rank-3 phase function (`recv_block_phase_c_ipc_publish`) instead of
+//! calling `publish_recv_waiter_live` inline. Behavior, telemetry, and the
+//! no-lost-wakeup contract documented below are unchanged; see the deferral
+//! note on `block_current_on_receive_with_deadline` for why the
+//! `SharedKernel`-level scheduler/task seams (§6.6) are not yet called
+//! directly from this path.
+//!
 //! ## Live vs audit primitives
 //!
 //! - [`KernelState::publish_recv_waiter_live`] (Stage 106, **live**):
@@ -257,8 +266,9 @@ mod tests {
     #[test]
     fn stage106_d2_live_wire_call_site_present() {
         // Replaces the Stage 105 helper-only assertion: the live primitive
-        // must be called from the canonical blocking-recv path, and the
-        // canonical publish must now route through it.
+        // must be called from the canonical blocking-recv path (now via the
+        // Stage 111 Phase C helper), and the canonical publish must route
+        // through it.
         let ipc_src = include_str!("boot/ipc_state.rs");
         assert!(
             ipc_src.contains("fn publish_recv_waiter_live"),
@@ -266,9 +276,9 @@ mod tests {
         );
         assert!(
             ipc_src.contains(
-                "self.publish_recv_waiter_live(endpoint_idx, ThreadId(blocked_tid), recv_cap)"
+                "self.publish_recv_waiter_live(plan.endpoint_idx, plan.blocked_tid, plan.recv_cap)"
             ),
-            "block_current_on_receive_with_deadline must route the publish through the live primitive"
+            "recv_block_phase_c_ipc_publish must route the publish through the live primitive"
         );
         assert!(
             ipc_src.contains("D2_PUBLISH_RACE_UNWIND"),
@@ -290,6 +300,142 @@ mod tests {
                 "{name} must not appear in runtime.rs"
             );
         }
+    }
+
+    // ── D-NEXT-1 PR-A / Stage 111: phase-split source checks ─────────────────
+
+    #[test]
+    fn stage111_d2_phase_functions_present_in_rank_order() {
+        // The blocking-recv path must be expressed as three named,
+        // rank-ordered phase calls (scheduler -> task -> ipc), not inlined.
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        for name in [
+            "fn recv_block_phase_a_scheduler",
+            "fn recv_block_phase_b_task",
+            "fn recv_block_phase_c_ipc_publish",
+            "fn recv_block_unwind_race",
+        ] {
+            assert!(ipc_src.contains(name), "{name} must exist in ipc_state.rs");
+        }
+        let a = ipc_src
+            .find("let plan = self.recv_block_phase_a_scheduler")
+            .expect("block_current_on_receive_with_deadline must call Phase A first");
+        let b = ipc_src
+            .find("let plan = self.recv_block_phase_b_task")
+            .expect("block_current_on_receive_with_deadline must call Phase B second");
+        let c = ipc_src
+            .find("match self.recv_block_phase_c_ipc_publish")
+            .expect("block_current_on_receive_with_deadline must call Phase C third");
+        assert!(
+            a < b && b < c,
+            "phase calls must appear in scheduler(1) -> task(2) -> ipc(3) order"
+        );
+    }
+
+    #[test]
+    fn stage111_d2_lock_order_documented_scheduler_task_ipc() {
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        assert!(
+            ipc_src.contains("scheduler (rank 1) → task/TCB (rank 2) → ipc (rank"),
+            "lock order scheduler(1) -> task(2) -> ipc(3) must be documented at the call site"
+        );
+    }
+
+    #[test]
+    fn stage111_d2_seam_helper_only_fence_not_live_wired_from_d2_path() {
+        // D-NEXT-1 PR-A landed the phase-split refactor but deferred the
+        // genuine bypass-the-global-lock wiring (see the deferral note on
+        // `block_current_on_receive_with_deadline`); the D2 path must
+        // therefore NOT call the SharedKernel-level seam methods directly,
+        // and the M2_SEAM_HELPER_ONLY fence for those seams must stay intact.
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        for name in ["with_scheduler_split_mut(", "with_task_tcbs_split_mut("] {
+            assert!(
+                !ipc_src.contains(name),
+                "{name} must not be called from the D2 path yet (deferred, see doc note)"
+            );
+        }
+        let runtime_src = include_str!("../runtime.rs");
+        assert!(
+            runtime_src.contains("VALIDATION: M2_SEAM_HELPER_ONLY"),
+            "the Stage 108 seam helper-only fence must remain in runtime.rs"
+        );
+    }
+
+    #[test]
+    fn stage111_d2_no_cap_vm_or_user_copy_work_in_phase_functions() {
+        // The phase functions must stay confined to scheduler/task/ipc
+        // mutation only -- no capability, VM, or user-memory-copy work.
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        let phase_fns = [
+            "fn recv_block_phase_a_scheduler",
+            "fn recv_block_phase_b_task",
+            "fn recv_block_phase_c_ipc_publish",
+            "fn recv_block_unwind_race",
+        ];
+        for (i, name) in phase_fns.iter().enumerate() {
+            let start = ipc_src
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} must exist"));
+            let end = phase_fns
+                .get(i + 1)
+                .and_then(|next| ipc_src.find(next))
+                .unwrap_or_else(|| {
+                    ipc_src
+                        .find("fn block_current_on_receive_with_deadline")
+                        .expect("orchestrator must exist after the phase functions")
+                });
+            let body = &ipc_src[start..end];
+            for forbidden in [
+                "copy_to_current_user",
+                "copy_from_current_user",
+                "with_vm_user_spaces_split_mut",
+                "with_memory_split_mut",
+                "mint_capability",
+                "capability_for_cnode",
+            ] {
+                assert!(
+                    !body.contains(forbidden),
+                    "{name} must not contain {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stage111_d2_telemetry_markers_present() {
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        for marker in [
+            "D2_RECV_WAITER_SPLIT_BEGIN",
+            "D2_RECV_WAITER_TASK_BLOCKED",
+            "D2_RECV_WAITER_PUBLISHED",
+            "D2_RECV_WAITER_RACE_UNWIND",
+        ] {
+            assert!(
+                ipc_src.contains(marker),
+                "Info-level marker {marker} must be present (not acceptance-relied-upon)"
+            );
+        }
+        // The smoke-rejected race marker and the stable telemetry counter
+        // names must be unchanged.
+        assert!(ipc_src.contains("D2_PUBLISH_RACE_UNWIND"));
+        assert!(ipc_src.contains("d2_recv_waiter_publishes"));
+        assert!(ipc_src.contains("d2_publish_race_unwinds"));
+    }
+
+    #[test]
+    fn stage111_d2_phase_plan_struct_is_copy() {
+        let ipc_src = include_str!("boot/ipc_state.rs");
+        assert!(
+            ipc_src.contains("struct RecvBlockPhasePlan"),
+            "the typed phase-plan struct must exist for auditability"
+        );
+        assert!(
+            ipc_src.contains(
+                "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct RecvBlockPhasePlan"
+            ),
+            "RecvBlockPhasePlan must derive Copy so each phase can pass it by value"
+        );
     }
 
     #[test]
