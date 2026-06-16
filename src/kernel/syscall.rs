@@ -9033,17 +9033,25 @@ mod tests {
     }
 
     #[test]
-    fn riscv_start_parks_non_boot_harts_before_primary_entry() {
-        // Source-ordering guarantee: the cold-boot `_start` must branch
-        // non-bootstrap harts to the park routine BEFORE it calls the
-        // boot-hart primary entry (which runs global bootstrap). This proves a
-        // secondary hart that reaches `_start` parks before any
-        // BSS/allocator/cmdline/bootstrap work.
-        let select = riscv_index_of("bne s0, t1, .Lriscv64_secondary_cold_park");
+    fn riscv_start_has_no_cold_boot_park_branch() {
+        // OpenSBI's generic firmware (used by QEMU virt) releases exactly
+        // ONE hart to the kernel entry point; every other hart stays
+        // parked *inside OpenSBI itself* awaiting an explicit HSM
+        // hart_start. So `_start` must NOT branch any cold-boot arrival to
+        // a park routine based on hart-id or an arrival race -- whichever
+        // hart reaches `_start` unconditionally becomes the boot hart. The
+        // only legitimate `RISCV_SECONDARY_HART_PARK` source is the
+        // SBI-HSM-driven `yarm_riscv64_secondary_boot` path.
+        let src = riscv_boot_src();
+        assert!(
+            !src.contains(".Lriscv64_secondary_cold_park"),
+            "_start must not branch to a cold-boot secondary park label"
+        );
+        let store = riscv_index_of("sd s0, (t2)");
         let primary_call = riscv_index_of("call yarm_riscv64_primary_entry");
         assert!(
-            select < primary_call,
-            "non-boot-hart park branch must precede the primary-entry call"
+            store < primary_call,
+            "boot-hart id must be stored before the primary-entry call"
         );
     }
 
@@ -9065,15 +9073,16 @@ mod tests {
     }
 
     #[test]
-    fn riscv_early_trap_vector_installed_before_hart_selection() {
+    fn riscv_early_trap_vector_installed_before_boot_hart_id_store() {
         // The early S-mode trap vector must be installed in `_start` before
-        // the hart-selection branch, so a fault in the boot path becomes a
-        // deterministic diagnostic park instead of an invisible reset loop.
+        // the boot-hart id is recorded / the primary entry is called, so a
+        // fault in the boot path becomes a deterministic diagnostic park
+        // instead of an invisible reset loop.
         let stvec = riscv_index_of("csrw stvec, t0");
-        let select = riscv_index_of("bne s0, t1, .Lriscv64_secondary_cold_park");
+        let store = riscv_index_of("sd s0, (t2)");
         assert!(
-            stvec < select,
-            "early stvec install must precede hart selection / kernel code"
+            stvec < store,
+            "early stvec install must precede the boot-hart id store"
         );
     }
 

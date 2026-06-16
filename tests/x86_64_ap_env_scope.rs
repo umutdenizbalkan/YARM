@@ -220,7 +220,6 @@ fn ap_legacy_markers_preserved_for_existing_smoke_grep() {
     for legacy in [
         "X86_AP_GDT_TSS_READY",
         "X86_AP_IDT_READY",
-        "X86_AP_GS_READY",
         "X86_AP_CPU_LOCAL_READY",
         "X86_AP_ONLINE",
     ] {
@@ -229,4 +228,19 @@ fn ap_legacy_markers_preserved_for_existing_smoke_grep() {
             "legacy AP marker must remain: {legacy}"
         );
     }
+}
+
+#[test]
+fn ap_gs_ready_is_never_faked() {
+    let smp = include_str!("../src/arch/x86_64/smp.rs");
+    // Unlike the other legacy READY markers, X86_AP_GS_READY must NOT be
+    // emitted at all until a real WRMSR IA32_GS_BASE + readback exists.
+    // The prior `X86_AP_GS_READY cpu={} reason=no_per_cpu_yet` line was a
+    // fake-ready marker that contradicted the accurate
+    // `X86_AP_GS_DEFERRED reason=ap_entry_is_asm_only_no_msr_write_yet`
+    // emitted moments earlier for the same AP.
+    assert!(
+        !smp.contains("X86_AP_GS_READY"),
+        "X86_AP_GS_READY must not be emitted until a real GS-base write + readback lands"
+    );
 }

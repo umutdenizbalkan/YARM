@@ -111,12 +111,19 @@ What ships (outcome A):
   write site already proven for the `=1` store.
 - The BSP polling site emits the full marker sequence per AP:
   `X86_AP_INIT_SENT`, `X86_AP_STARTUP_SENT`,
-  `X86_AP_TRAMPOLINE_REACHED`, `X86_AP_ENTER_RUST`,
-  `X86_AP_GDT_TSS_READY`, `X86_AP_IDT_READY`, `X86_AP_GS_READY`,
+  `X86_AP_TRAMPOLINE_REACHED`, `X86_AP_ENTER_RUST`, the per-CPU record +
+  GS scaffold (`X86_AP_PERCPU_BEGIN` .. `X86_AP_GS_DEFERRED
+  reason=ap_entry_is_asm_only_no_msr_write_yet` .. `X86_AP_PERCPU_READY`),
+  the env scaffold (`X86_AP_ENV_BEGIN` .. `X86_AP_ENV_READY`),
+  `X86_AP_GDT_TSS_READY`, `X86_AP_IDT_READY`,
   `X86_AP_CPU_LOCAL_READY`, `X86_AP_ONLINE`, `X86_AP_RUST_PARK`, then
   once `X86_SMP_STARTUP started_secondary=N online_cpus=1
   present_cpus=M` and `X86_SMP_OBSERVATION_OK rust_aps=N
   scheduler_aps=0`.
+  Note: `X86_AP_GS_READY` is intentionally never emitted — GS-base is
+  not yet written, and a "READY" marker for it would be fake. Only
+  `X86_AP_GS_DEFERRED` is emitted until a real WRMSR IA32_GS_BASE +
+  readback path lands.
 - The `yarm.x86_ap_rust=` knob (`kernel/boot_command_line.rs`) flips
   `arch::x86_64::smp::set_ap_rust_entry_enabled`; the knob emits
   `YARM_X86_AP_RUST_SET enabled=true|false`. `1`, `true`, `yes`, `on` →
