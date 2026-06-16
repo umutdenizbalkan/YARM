@@ -417,3 +417,158 @@ gate to live-only is the next pass, not this one.
 
 Future RISC-V64 docs update **this file**. Cross-arch / generic boot
 docs update `doc/BOOT.md`.
+
+---
+
+## 13. RISC-V64 port status and TODO (end of stabilization pass 2)
+
+### 13.1 Current accepted status
+
+| Area | Status |
+|------|--------|
+| OpenSBI handoff | ✅ fixed; `a0`=hartid + `a1`=DTB preserved; `mv a0, s1` correct |
+| Boot hart selection | ✅ whichever hart OpenSBI releases to `_start` is the boot hart; no hart-0 assumption, no CAS, no Zaamo dependency |
+| Present-hart topology | ✅ binary-FDT `/cpus` walk (`arch::fdt::cpus_hart_id_bitmap`); `RISCV_DTB_CPU_SCAN_DONE bitmap=... count=N` is required, silent fallback rejected |
+| `--smp 1/2/3/4` smoke | ✅ live-verified — boot hart never parked; per-N bitmap matches the platform; topology summary `YARM_BOOT_OK present_cpus=N present_bitmap=0x{1,3,7,f} online_cpus=1` |
+| `online_cpus=1` (scheduler) | ✅ `RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled` |
+| Secondary harts | ✅ parked via SBI HSM; `RISCV_SECONDARY_HART_PARK hart=N` |
+| Real U-mode `sret` | ✅ `RISCV_ENTER_USER_SRET tid=2`; first trap `from_u=1 spp=0` |
+| Syscall round-trip | ✅ full `RiscvTrapFrame` save/restore; `+4` ecall PC advance; fail-closed S-mode-fault halt |
+| Core service chain | ✅ reaches `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked`; required markers include `RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK`, `EXT4_SRV_READY`, `VFS_MOUNT_REGISTER_EXT4_OK` |
+| Timer | ⏸ deferred — audit-stage scaffold landed (`RISCV_TIMER_AUDIT_BEGIN`/`AUDIT_DONE`), defers with canonical `reason=timer_irq_feature_disabled` in default builds; feature-on path defers with `reason=trap_bridge_reentrancy_not_ready` because the trap vector has no kernel-S-mode timer fast path yet |
+| PLIC | ⏸ discovery + threshold-address compute live; threshold write skipped under active satp (`RISCV_PLIC_DEFERRED reason=plic_mmio_unmapped_under_active_satp`); base / context / per-source breadcrumbs emit |
+| External IRQ | ⏸ `RISCV_EXTIRQ_DEFERRED reason=no_safe_source`; UART0 (sid=10) marked as the candidate via `RISCV_EXTIRQ_SELECT`; no source enabled |
+| RISC-V SMP scheduling | ⏸ not implemented; `online_cpus` stays at 1 by design |
+
+### 13.2 Current smoke contract
+
+```sh
+scripts/build-qemu-riscv64-artifacts.sh                   # fails clearly if any artifact missing; reports sizes
+scripts/qemu-riscv64-core-smoke.sh --smp 1 [--timeout N]  # canonical per-N gate
+scripts/qemu-riscv64-core-smoke.sh --smp 2
+scripts/qemu-riscv64-core-smoke.sh --smp 3
+scripts/qemu-riscv64-core-smoke.sh --smp 4
+scripts/qemu-riscv64-smoke-matrix.sh                       # builds once, runs N=1..4, prints summary table
+```
+
+Required success markers (see §11 for the full table):
+
+- `YARM_BOOT_OK present_cpus=N present_bitmap=0x{1,3,7,f} online_cpus=1`
+- `RISCV_BOOT_ENTRY hart=…`, `RISCV_BOOT_HART_SELECTED hart=…`, `RISCV_BOOT_HART_ID_STORED hart=…`
+- `RISCV_DTB_CPU_SCAN_DONE bitmap=… count=N`
+- `RISCV_HART_TOPOLOGY present_cpus=…`
+- `RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled`
+- `RISCV_LIVEEEEEEE`, `RISCV_SYSCALL_ROUNDTRIP_OK`, `RISCV_USER_RESUMED`
+- `INITRAMFS_SRV_ENTRY`, `DEVFS_SRV_ENTRY`, `VFS_SRV_ENTRY`, `VFS_MOUNT_TABLE_READY`
+- `RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK`, `EXT4_SRV_READY`, `VFS_MOUNT_REGISTER_EXT4_OK`
+- `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked`
+- `RISCV_TIMER_AUDIT_BEGIN`, `RISCV_TIMER_AUDIT_DONE sbi_time=… boot_hart=… trap_bridge_reentrant=… feature=…`
+- `RISCV_TIMER_INIT_BEGIN`, `RISCV_TIMER_MECHANISM value=…`
+- `RISCV_PLIC_BASE value=…`, `RISCV_PLIC_CONTEXT value=…`
+
+Rejected failure markers: `RISCV_EARLY_TRAP`, `PANIC`, `FATAL`,
+`ASSERT`, `PAGE_FAULT_UNHANDLED`, `TRAP_HANDLE failed`, `Vm(Full)`,
+`oom`, `capacity`, `RISCV_DTB_CPU_SCAN_FAILED`, `SPAWN_V5_WRONG_SENDER`,
+`present_cpus=1` under `--smp >1`, boot hart appearing in any
+`RISCV_SECONDARY_HART_PARK` line, repeated `source=missing_dtb`, any
+`RISCV_TRAP_HALTED reason=` other than `kernel_idle_awaiting_io`, any
+`RISCV_TIMER_DEFERRED reason=…` that is not one of the canonical list
+below.
+
+Accepted timer-deferred reasons (canonical, kernel + gate must agree):
+
+- `timer_irq_feature_disabled` — default build, cargo feature off (current).
+- `trap_bridge_reentrancy_not_ready` — feature on, but trap vector's
+  kernel-S-mode timer fast path not yet landed; arming STIE would
+  trigger `RISCV_TRAP_UNHANDLED reason=trap_from_s_mode` on the very
+  next `wfi`.
+- `sbi_time_ext_unavailable` — SBI Timer EID probe returned not-supported.
+- `stie_audit_pending` — re-entry case; `init_timer_after_idle_safe_point` already fired.
+- `not_boot_hart` — guard against a future caller from a secondary hart.
+- `unsafe_under_current_satp` — reserved for a future caller path that
+  runs before the kernel-shared gigapage is installed.
+
+Accepted PLIC-deferred reason: `plic_mmio_unmapped_under_active_satp`.
+
+Accepted external-IRQ-deferred reason: `no_safe_source`.
+
+### 13.3 Current limitations
+
+- No RISC-V SMP scheduling. `online_cpus` is permanently 1 in default
+  builds; secondaries `wfi` inside `yarm_riscv64_secondary_boot` after
+  SBI HSM `hart_start`, and never reach userspace.
+- No secondary-hart userspace. The per-hart park path installs a local
+  trap vector with interrupts masked; there is no per-CPU state and no
+  per-CPU runqueue.
+- No broad PLIC source enable. The discovery breadcrumbs enumerate the
+  QEMU virt source IDs (virtio-mmio 1..=8, UART0 10) but no source's
+  enable register is written.
+- No full virtio IRQ routing. Without external-IRQ enable, devices are
+  driven exclusively through MMIO polling done by their user-mode
+  drivers; that is the steady state today.
+- PLIC MMIO is not mapped under the active satp. By the time the
+  idle-path init runs, the active page table maps only the
+  kernel-shared RAM gigapage; the PLIC's physical MMIO window sits
+  below RAM and is never covered, so the threshold write is skipped and
+  reported as `plic_mmio_unmapped_under_active_satp` instead of
+  faulting. A future change can add a kernel-only / device / NX / not-user
+  PLE mapping in every active root once the rest of the IRQ path is in
+  place, but doing it without the rest of the path provides no value.
+- Timer trap-bridge re-entrancy is unaudited. The current trap bridge
+  treats any kernel-S-mode trap as `RISCV_TRAP_UNHANDLED
+  reason=trap_from_s_mode` and halts. Enabling STIE before adding a
+  kernel-S-mode timer fast path (record tick, disable STIE, sret back
+  to `wfi`) would crash the boot, so STIE remains off and the deferral
+  reason is the canonical `trap_bridge_reentrancy_not_ready`.
+
+### 13.4 TODO list
+
+**Before global kernel unlocking resumes (RISC-V must satisfy):**
+
+- ✅ RISC-V is accepted as a regular smoke target.
+- ✅ `--smp 1/2/3/4` topology smoke passes.
+- ✅ Service chain reaches `RISCV_KERNEL_IDLE_WAITING_FOR_IO`.
+- ✅ Timer is either live with `RISCV_TIMER_SMOKE_OK ticks=…` **or**
+  explicitly deferred with a canonical reason. Default builds defer
+  with `timer_irq_feature_disabled`; the gate accepts this.
+
+**After global kernel unlocking resumes (RISC-V follow-up work):**
+
+- ⏳ Trap-vector kernel-S-mode timer fast path: detect `scause` =
+  interrupt|`IRQ_SUPERVISOR_TIMER` with `spp=1`, call
+  `record_timer_tick`, clear `sie.STIE`, emit
+  `RISCV_TIMER_DISABLED_AFTER_ONE_SHOT` + `RISCV_TIMER_SMOKE_OK
+  ticks=1`, sret back to the interrupted `wfi`. Once this lands, flip
+  `STIE_AUDIT_COMPLETE = true` and enable the `riscv64-timer-irq`
+  cargo feature in the smoke gate.
+- ⏳ PLIC kernel-only MMIO mapping (device / NX / not-user) installed
+  into every active root, so the threshold write can run without
+  faulting.
+- ⏳ One-source external IRQ proof: UART0 (sid=10) is the marked
+  candidate; PLIC claim/complete + a real handler + device interrupt
+  ack must all land together. No broad source enable.
+- ⏳ virtio IRQ routing once the one-source proof works.
+- ⏳ RISC-V SMP scheduler participation, then secondary-hart
+  per-CPU state (runqueue lock sharding, percpu records, GS-equivalent
+  per-hart pointer via `tp`).
+- ⏳ Optional FS strict smoke parity with x86_64 / AArch64 once the
+  regular core smoke is in the global gate.
+
+### 13.5 RISC-V64 readiness for global kernel unlocking
+
+**Ready: yes.**
+
+The RISC-V64 port satisfies every "before global unlocking" gate above:
+`scripts/qemu-riscv64-smoke-matrix.sh` passes live across `--smp 1/2/3/4`
+on QEMU `virt` + OpenSBI; the service chain reaches the idle terminal;
+the timer is explicitly deferred with the canonical reason
+`timer_irq_feature_disabled`, accepted by the gate. The remaining
+items (live timer tick, PLIC mapping, one-source external IRQ, SMP
+scheduling) are post-unlocking follow-ups, not unlocking blockers, and
+each has a canonical deferred-reason marker today so its absence is
+visible at every boot.
+
+The next pass therefore should resume the global kernel unlocking work
+with RISC-V included in the smoke matrix, treating its regular core
+smoke as the per-arch acceptance gate the same way the x86_64 and
+AArch64 core smokes are treated.

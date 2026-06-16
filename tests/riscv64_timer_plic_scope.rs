@@ -83,6 +83,42 @@ fn smoke_script_accepts_timer_live_or_deferred() {
 }
 
 #[test]
+fn smoke_script_pins_canonical_timer_deferred_reasons() {
+    let smoke = include_str!("../scripts/qemu-riscv64-core-smoke.sh");
+    // The list of accepted deferred reasons must include every reason
+    // the kernel emits; an unknown reason fails the gate.
+    for reason in [
+        "timer_irq_feature_disabled",
+        "trap_bridge_reentrancy_not_ready",
+        "sbi_time_ext_unavailable",
+        "stie_audit_pending",
+        "not_boot_hart",
+    ] {
+        assert!(
+            smoke.contains(&format!("\"{reason}\"")),
+            "smoke must list canonical timer-deferred reason: {reason}"
+        );
+    }
+    assert!(
+        smoke.contains("RISCV_TIMER_DEFERRED reason=${timer_reason} is not canonical"),
+        "smoke must reject unknown timer-deferred reasons"
+    );
+}
+
+#[test]
+fn smoke_script_requires_audit_markers() {
+    let smoke = include_str!("../scripts/qemu-riscv64-core-smoke.sh");
+    assert!(
+        smoke.contains("\"RISCV_TIMER_AUDIT_BEGIN\""),
+        "smoke must require RISCV_TIMER_AUDIT_BEGIN"
+    );
+    assert!(
+        smoke.contains("\"RISCV_TIMER_AUDIT_DONE sbi_time=\""),
+        "smoke must require RISCV_TIMER_AUDIT_DONE with audit fields"
+    );
+}
+
+#[test]
 fn smoke_script_accepts_plic_init_or_deferred() {
     let smoke = include_str!("../scripts/qemu-riscv64-core-smoke.sh");
     assert!(smoke.contains("RISCV_PLIC_INIT_DONE"));
@@ -113,6 +149,8 @@ fn smoke_script_supports_smp2_secondary_park_assertion() {
 fn timer_module_emits_required_markers() {
     let timer = include_str!("../src/arch/riscv64/timer.rs");
     for marker in [
+        "RISCV_TIMER_AUDIT_BEGIN",
+        "RISCV_TIMER_AUDIT_DONE sbi_time=",
         "RISCV_TIMER_INIT_BEGIN",
         "RISCV_TIMER_FREQ value=",
         "RISCV_TIMER_DEFERRED reason=",
@@ -130,6 +168,63 @@ fn timer_module_emits_required_markers() {
     assert!(
         timer.contains("DEFER_REASON_NO_SBI_TIMER"),
         "timer module must expose no-SBI-Timer defer reason"
+    );
+    assert!(
+        timer.contains("DEFER_REASON_TRAP_BRIDGE_REENTRANCY"),
+        "timer module must expose trap-bridge-reentrancy defer reason for pass 2"
+    );
+    assert!(
+        timer.contains("DEFER_REASON_NOT_BOOT_HART"),
+        "timer module must expose not-boot-hart defer reason for pass 2"
+    );
+}
+
+#[test]
+fn timer_audit_completes_before_any_csr_write() {
+    let timer = include_str!("../src/arch/riscv64/timer.rs");
+    // AUDIT_BEGIN must precede AUDIT_DONE, and both must precede the
+    // first CSR-write call (`set_sie_stie` / `set_sstatus_sie`).
+    let audit_begin = timer
+        .find("RISCV_TIMER_AUDIT_BEGIN")
+        .expect("AUDIT_BEGIN missing");
+    let audit_done = timer
+        .find("RISCV_TIMER_AUDIT_DONE")
+        .expect("AUDIT_DONE missing");
+    let arm_call = timer
+        .find("arm_one_shot_timer_and_enable()")
+        .expect("arm fn must exist");
+    assert!(
+        audit_begin < audit_done,
+        "AUDIT_BEGIN must precede AUDIT_DONE"
+    );
+    assert!(
+        audit_done < arm_call,
+        "AUDIT_DONE must precede any live-arm call"
+    );
+}
+
+#[test]
+fn timer_boot_hart_only_guard_is_present() {
+    let timer = include_str!("../src/arch/riscv64/timer.rs");
+    assert!(
+        timer.contains("current_hart_is_boot_hart()"),
+        "timer module must guard the live path with a boot-hart check"
+    );
+    assert!(
+        timer.contains("DEFER_REASON_NOT_BOOT_HART"),
+        "timer module must defer with the not-boot-hart reason on secondaries"
+    );
+}
+
+#[test]
+fn timer_stie_audit_flag_remains_false_in_default_build() {
+    let timer = include_str!("../src/arch/riscv64/timer.rs");
+    // Flipping `STIE_AUDIT_COMPLETE` without landing the trap vector's
+    // kernel-S-mode timer fast path would let every `wfi` re-enter the
+    // bridge as `trap_from_s_mode`, which the smoke gate rejects.
+    assert!(
+        timer.contains("pub const STIE_AUDIT_COMPLETE: bool = false;"),
+        "STIE_AUDIT_COMPLETE must remain false until the trap-vector fast path lands"
     );
 }
 
