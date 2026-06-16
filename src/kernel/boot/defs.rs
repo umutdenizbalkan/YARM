@@ -321,6 +321,17 @@ pub(crate) struct TelemetrySubsystem {
     pub(crate) tlb_shootdown_count: u64,
     pub(crate) tlb_shootdown_timeout_count: u64,
     pub(crate) tid_allocation: TidAllocationTelemetry,
+    /// Stage 114 / D-NEXT-2: counts invocations of the genuinely pre-`with_cpu`
+    /// VmBrk-shrink split path (`SharedKernel::try_split_vm_brk_shrink_into_frame`).
+    /// Lives here (rank 10, telemetry) rather than in `ipc.telemetry` (rank 3)
+    /// specifically so the split path never needs an ipc-domain seam to record
+    /// it — `with_telemetry_split_mut` already exists and acquires only the
+    /// telemetry lock. Distinct from `ipc.telemetry.d3_vm_brk_shrink_calls`,
+    /// which the unchanged global-lock `vm_brk_shrink_two_phase` path still
+    /// increments for every shrink it services (including the ones the split
+    /// path defers, e.g. multi-CPU-online).
+    pub(crate) d3_vm_brk_shrink_split_live_calls: u64,
+    pub(crate) d3_vm_brk_shrink_split_live_pages_unmapped: u64,
 }
 
 #[derive(Debug)]

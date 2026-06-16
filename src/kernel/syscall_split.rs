@@ -4,6 +4,9 @@
 //! Stage 28: trap/syscall split-dispatch bridge (whitelist-only scaffold).
 //! Stage 29: live-wired for `ControlPlaneSetCnodeSlots` (NR 8) via
 //! [`try_split_dispatch_into_frame`].
+//! Stage 32B: live-wired for `IpcRecv` (NR 2), kernel-task queued-plain case only.
+//! Stage 114: live-wired for `VmBrk` (NR 14), page-crossing-shrink case only, via
+//! [`try_split_vm_brk_shrink_into_frame`].
 //!
 //! This module hosts the minimal, **whitelist-only** mechanism that classifies
 //! a decoded `Syscall` as eligible for *split-dispatch* — i.e. servicing it via
@@ -91,6 +94,16 @@ pub(crate) enum SplitEligibleSyscall {
     /// global-lock fallback. The variant carries no decoded args for that reason.
     IpcRecvKernelTask,
     // Add others ONLY when the per-domain helper is proven safe.
+    //
+    // Stage 114: `Syscall::VmBrk` (NR 14) is intentionally NOT added here.
+    // Like `IpcRecv`, its split eligibility cannot be decided from the
+    // syscall number + raw args alone (group-leader status, brk bounds,
+    // page-crossing, and online-CPU count all require domain reads), but
+    // unlike `IpcRecv` there is no need for an enum variant: it is
+    // special-cased directly in `try_split_dispatch_into_frame` (mirroring
+    // the `Syscall::IpcRecv` special case below) and routed straight to
+    // `try_split_vm_brk_shrink_into_frame`, never through
+    // `classify_split_eligible` / `try_split_dispatch`.
 }
 
 /// Classify a decoded syscall + raw args into a split-eligible descriptor.
@@ -214,6 +227,15 @@ pub(crate) fn try_split_dispatch_into_frame(
         return try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame);
     }
 
+    // Stage 114: `VmBrk` (NR 14) is routed to the dedicated brk-shrink helper
+    // for the same reason `IpcRecv` is above — eligibility (group leader,
+    // page-crossing shrink, single CPU online) can only be decided inside the
+    // helper. Every case it cannot service returns `None`, which propagates
+    // UNCHANGED back to the global-lock fallback below.
+    if matches!(syscall, Syscall::VmBrk) {
+        return try_split_vm_brk_shrink_into_frame(shared, cpu, frame);
+    }
+
     // The requester TID is what the global-lock handler reads via
     // `current_tid(kernel)` (i.e. `kernel.current_tid()`).
     //
@@ -294,6 +316,30 @@ pub(crate) fn try_split_ipc_recv_queued_plain_into_frame(
     shared.try_split_ipc_recv_queued_plain_into_frame(cpu, frame)
 }
 
+/// # Validation status
+/// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — wired into the live trap seam:
+///   `try_split_dispatch_into_frame` routes `VmBrk` (NR 14) here BEFORE the
+///   global lock. Only the page-crossing shrink case (at most one CPU online,
+///   group-leader caller) is serviced; every other case returns `None` and
+///   propagates to the unchanged global-lock fallback (`handle_vm_brk`).
+///
+/// Thin number-only gate mirroring [`try_split_ipc_recv_queued_plain_into_frame`]:
+/// re-decode the syscall number defensively, reject anything but `VmBrk`, then
+/// delegate to `SharedKernel::try_split_vm_brk_shrink_into_frame`, which holds
+/// the full eligibility logic and the single-CPU-online safety proof.
+pub(crate) fn try_split_vm_brk_shrink_into_frame(
+    shared: &SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Option<Result<(), TrapHandleError>> {
+    // Number-only default-deny gate: only VmBrk is considered here.
+    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+    if !matches!(syscall, Syscall::VmBrk) {
+        return None;
+    }
+    shared.try_split_vm_brk_shrink_into_frame(cpu, frame)
+}
+
 /// Number-only split eligibility classifier (no arg validation, no lock).
 ///
 /// Used by [`try_split_dispatch_into_frame`] as the fast default-deny gate before
@@ -309,6 +355,11 @@ fn classify_split_eligible_nr_only(syscall: Syscall) -> Option<Syscall> {
         // Final eligibility (kernel-task receiver, queued plain, no sender-wake/recv-v2)
         // is decided inside that helper; ineligible cases return `None` → fallback.
         Syscall::IpcRecv => Some(syscall),
+        // Stage 114: VmBrk (NR 14) passes the NR gate so the live seam attempts the
+        // page-crossing-shrink split via `try_split_vm_brk_shrink_into_frame`. Final
+        // eligibility (group leader, page-crossing shrink, single CPU online) is
+        // decided inside that helper; ineligible cases return `None` → fallback.
+        Syscall::VmBrk => Some(syscall),
         _ => None,
     }
 }
@@ -851,14 +902,18 @@ mod tests {
 
     #[test]
     fn stage29_whitelist_exhaustive() {
-        // Iterate the full NR space; only NR 8 (cnode-slots) and NR 2 (IpcRecv,
-        // Stage 32B) may pass the NR-only split-eligibility gate.
+        // Iterate the full NR space; only NR 8 (cnode-slots), NR 2 (IpcRecv,
+        // Stage 32B), and NR 14 (VmBrk, Stage 114) may pass the NR-only
+        // split-eligibility gate.
         for nr in 0..SYSCALL_COUNT {
             let Ok(syscall) = Syscall::decode(nr) else {
                 continue;
             };
             let eligible = classify_split_eligible_nr_only(syscall).is_some();
-            if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR || nr == SYSCALL_IPC_RECV_NR {
+            if nr == SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR
+                || nr == SYSCALL_IPC_RECV_NR
+                || nr == crate::kernel::syscall::SYSCALL_VM_BRK_NR
+            {
                 assert!(eligible, "NR {nr} must be split-eligible");
             } else {
                 assert!(!eligible, "NR {nr} must NOT be split-eligible");

@@ -644,6 +644,8 @@ impl Bootstrap {
                     tlb_shootdown_count: 0,
                     tlb_shootdown_timeout_count: 0,
                     tid_allocation: TidAllocationTelemetry::default(),
+                    d3_vm_brk_shrink_split_live_calls: 0,
+                    d3_vm_brk_shrink_split_live_pages_unmapped: 0,
                 },
             ));
             core::ptr::addr_of_mut!((*state_ptr).boot_config)

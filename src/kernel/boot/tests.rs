@@ -32129,3 +32129,791 @@ mod stage77 {
         );
     }
 }
+
+// ── Stage 114 / D-NEXT-2: combined trap-dispatch call-boundary relocation ────
+//
+// `SharedKernel::try_split_vm_brk_shrink_into_frame` (runtime.rs) is the
+// genuinely-live D3 call boundary this stage adds: it services the
+// page-crossing `VmBrk`-shrink case entirely through Stage 108 split-mut
+// seams, routed from `try_split_dispatch_into_frame` for NR 14
+// (`Syscall::VmBrk`), running strictly BEFORE `SharedKernel::with_cpu` is
+// ever entered (see `arch/trap_entry.rs::handle_trap_entry_shared`). Every
+// VmBrk shape it cannot prove safe — query, growth, a non-page-crossing
+// shrink, a non-leader caller, an out-of-range `requested`, or more than one
+// CPU online — returns `None` before any mutation and falls back to the
+// unchanged global-lock `handle_vm_brk` / `vm_brk_shrink_two_phase`.
+//
+// D2 (IpcRecv-block) and D6 (dispatch) remain Outcome B in this stage: no
+// call boundary for either was relocated ahead of `with_cpu`. See
+// `stage114_d2_recv_block_remains_outcome_b_with_documented_reason` and
+// `stage114_d6_dispatch_remains_outcome_b_with_documented_reason` below for
+// the exact, unchanged blocker text each retains, and why (hard rule 3 rules
+// out the D2-B blocking-split implementation a live D2 wire would require;
+// D6's dispatch entry point has ~50+ call sites, not one frame-decodable
+// trap boundary, so there is no single seam to relocate).
+mod stage114_d3_vm_brk_shrink_live {
+    use crate::kernel::boot::{Bootstrap, KernelError, Trap, TrapHandleError};
+    use crate::kernel::scheduler::CpuId;
+    use crate::kernel::syscall::{SYSCALL_ARG_CAP, Syscall, SyscallError};
+    use crate::kernel::task::{TaskClass, ThreadGroupId};
+    use crate::kernel::trapframe::TrapFrame;
+    use crate::kernel::vm::{Asid, PAGE_SIZE, PageFlags, VirtAddr};
+    use crate::runtime::SharedKernel;
+    use std::{string::String, vec::Vec};
+
+    const CPU0: CpuId = CpuId(0);
+
+    fn brk_frame(requested: usize) -> TrapFrame {
+        TrapFrame::new(Syscall::VmBrk as usize, [requested, 0, 0, 0, 0, 0])
+    }
+
+    /// `SharedKernel` with task 0 bound to a known ASID. Mirrors
+    /// `setup_task0_with_known_asid` (raw `KernelState`), but for
+    /// `SharedKernel`: `Bootstrap::init()` already registers AND dispatches
+    /// tid 0 as current internally, so no extra enqueue/dispatch dance is
+    /// needed to make tid 0 the live requester on CPU0.
+    fn shared_task0_with_known_asid() -> (SharedKernel, Asid) {
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let asid = kernel.with(|state| {
+            let (asid, _map) = state.create_user_address_space().expect("aspace");
+            state.bind_task_asid(0, asid).expect("bind asid");
+            asid
+        });
+        (kernel, asid)
+    }
+
+    fn map_pages(kernel: &SharedKernel, asid: Asid, virts: &[usize]) {
+        kernel.with(|state| {
+            for &virt in virts {
+                let (_, cap) = state.alloc_anonymous_memory_object().expect("alloc mo");
+                state
+                    .map_user_page_in_asid_with_caps(
+                        asid,
+                        cap,
+                        VirtAddr(virt as u64),
+                        PageFlags::USER_RW,
+                    )
+                    .expect("map page");
+            }
+        });
+    }
+
+    // ── A. Live success path (genuine pre-with_cpu service) ─────────────────
+
+    #[test]
+    fn stage114_d3_live_seam_unmaps_pages_and_updates_bounds() {
+        let (kernel, asid) = shared_task0_with_known_asid();
+        let base = 0x70_0000usize;
+        let pages = [base, base + PAGE_SIZE, base + 2 * PAGE_SIZE];
+        let brk_end = base + 3 * PAGE_SIZE;
+        map_pages(&kernel, asid, &pages);
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, brk_end))
+            .expect("set brk bounds");
+
+        let before_calls = kernel.d3_vm_brk_shrink_split_live_calls_split_read();
+        let before_pages = kernel.d3_vm_brk_shrink_split_live_pages_unmapped_split_read();
+
+        let mut frame = brk_frame(base);
+        let result = kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "live D3 seam must service the page-crossing shrink"
+        );
+        assert_eq!(frame.ret0(), base, "ret0 == requested (new brk end)");
+        assert_eq!(frame.error_code(), None);
+
+        for &virt in &pages {
+            assert!(
+                !kernel
+                    .with(|state| state.is_user_page_mapped_in_asid(asid, VirtAddr(virt as u64)))
+                    .expect("post-shrink check"),
+                "page at {virt:#x} must be unmapped by the live seam"
+            );
+        }
+        assert_eq!(
+            kernel.with(|state| state.task_brk_bounds(0)),
+            Some((base, base)),
+            "brk bounds must reflect the shrink"
+        );
+        assert_eq!(
+            kernel.d3_vm_brk_shrink_split_live_calls_split_read(),
+            before_calls + 1,
+            "live-call telemetry counter must increment exactly once"
+        );
+        assert_eq!(
+            kernel.d3_vm_brk_shrink_split_live_pages_unmapped_split_read(),
+            before_pages + 3,
+            "live pages-unmapped telemetry counter must count all 3 pages"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_live_seam_routes_through_try_split_dispatch_into_frame() {
+        // Proves NR 14 routing end-to-end through the exact entry point
+        // `handle_trap_entry_shared` calls ahead of `with_cpu`
+        // (`try_split_dispatch_into_frame`), not just the inner helper.
+        let (kernel, asid) = shared_task0_with_known_asid();
+        let base = 0x71_0000usize;
+        map_pages(&kernel, asid, &[base]);
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + PAGE_SIZE))
+            .expect("set brk bounds");
+
+        let mut frame = brk_frame(base);
+        let result =
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())), "NR 14 must route to the live D3 seam");
+        assert!(
+            !kernel
+                .with(|state| state.is_user_page_mapped_in_asid(asid, VirtAddr(base as u64)))
+                .expect("post-shrink check")
+        );
+    }
+
+    #[test]
+    fn stage114_d3_live_seam_tolerates_lazy_unmapped_pages() {
+        // Mirrors vm_brk_shrink_tolerates_lazy_unmapped_pages (Stage 5D) for
+        // the live split path: pages never faulted in must not error.
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let base = 0x72_0000usize;
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + 4 * PAGE_SIZE))
+            .expect("set brk bounds");
+        let mut frame = brk_frame(base);
+        let result = kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame);
+        assert_eq!(
+            result,
+            Some(Ok(())),
+            "lazy region shrink must succeed on the live seam"
+        );
+        assert_eq!(
+            kernel.with(|state| state.task_brk_bounds(0)),
+            Some((base, base))
+        );
+    }
+
+    #[test]
+    fn stage114_d3_live_seam_handles_mixed_mapped_and_lazy_pages() {
+        // Mirrors vm_brk_shrink_with_partially_mapped_lazy_region (Stage 5D).
+        let (kernel, asid) = shared_task0_with_known_asid();
+        let base = 0x79_0000usize;
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + 4 * PAGE_SIZE))
+            .expect("set brk bounds");
+        map_pages(&kernel, asid, &[base, base + 2 * PAGE_SIZE]);
+
+        let mut frame = brk_frame(base);
+        let result = kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame);
+        assert_eq!(result, Some(Ok(())));
+        for off in [0, PAGE_SIZE, 2 * PAGE_SIZE, 3 * PAGE_SIZE] {
+            assert!(
+                !kernel
+                    .with(|state| state
+                        .is_user_page_mapped_in_asid(asid, VirtAddr((base + off) as u64)))
+                    .expect("post-shrink check")
+            );
+        }
+    }
+
+    // ── B. Cross-check: live path matches the old global-lock path exactly ──
+
+    #[test]
+    fn stage114_d3_live_seam_result_matches_global_lock_path() {
+        let base = 0x73_0000usize;
+        let pages = [base, base + PAGE_SIZE, base + 2 * PAGE_SIZE];
+        let brk_end = base + 3 * PAGE_SIZE;
+
+        // Live split path.
+        let (kernel, asid) = shared_task0_with_known_asid();
+        map_pages(&kernel, asid, &pages);
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, brk_end))
+            .expect("set brk bounds");
+        let mut live_frame = brk_frame(base);
+        let live_result = kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut live_frame);
+        assert_eq!(live_result, Some(Ok(())));
+
+        // Reference: the unmodified global-lock path on an identically-shaped
+        // raw KernelState (same helper the pre-existing Stage 5F tests use).
+        let (mut ref_state, ref_asid) = super::setup_task0_with_known_asid();
+        for &virt in &pages {
+            let (_, cap) = ref_state.alloc_anonymous_memory_object().expect("alloc mo");
+            ref_state
+                .map_user_page_in_asid_with_caps(
+                    ref_asid,
+                    cap,
+                    VirtAddr(virt as u64),
+                    PageFlags::USER_RW,
+                )
+                .expect("map page");
+        }
+        ref_state
+            .set_task_brk_bounds(0, base, brk_end)
+            .expect("set brk bounds");
+        let mut ref_frame = brk_frame(base);
+        let ref_result = ref_state.handle_trap(Trap::Syscall, Some(&mut ref_frame));
+        assert!(
+            ref_result.is_ok(),
+            "reference global-lock path must succeed"
+        );
+
+        assert_eq!(
+            live_frame.ret0(),
+            ref_frame.ret0(),
+            "ret0 must match old path"
+        );
+        assert_eq!(
+            live_frame.ret1(),
+            ref_frame.ret1(),
+            "ret1 must match old path"
+        );
+        assert_eq!(
+            live_frame.ret2(),
+            ref_frame.ret2(),
+            "ret2 must match old path"
+        );
+        assert_eq!(
+            live_frame.error_code(),
+            ref_frame.error_code(),
+            "error encoding must match old path"
+        );
+        assert_eq!(
+            kernel.with(|state| state.task_brk_bounds(0)),
+            ref_state.task_brk_bounds(0),
+            "post-shrink brk bounds must match old path"
+        );
+    }
+
+    // ── C. Deferral (None) paths: every one must fall back, never mutate ────
+
+    #[test]
+    fn stage114_d3_query_path_defers() {
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let mut frame = brk_frame(0);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "requested == 0 (query) must defer"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_growth_defers() {
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, 0x74_0000, 0x74_1000))
+            .expect("set brk bounds");
+        let mut frame = brk_frame(0x74_2000);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "growth must defer"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_non_page_crossing_shrink_defers() {
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let base = 0x75_0000usize;
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + 50))
+            .expect("set brk bounds");
+        let mut frame = brk_frame(base + 10);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "a shrink that does not cross a page boundary must defer"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_requested_below_base_defers() {
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let base = 0x76_0000usize;
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + 3 * PAGE_SIZE))
+            .expect("set brk bounds");
+        let mut frame = brk_frame(base - PAGE_SIZE);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "requested < base must defer"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_validate_user_region_failure_defers() {
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let mut frame = brk_frame(crate::kernel::vm::KERNEL_SPACE_BASE as usize);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "a kernel-space requested value must defer (validate_user_region fails)"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_no_brk_region_defers() {
+        // A group leader with no brk region recorded at all: the memory
+        // split-mut bounds read returns None, so the seam defers rather than
+        // inventing a result.
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let mut frame = brk_frame(0x1000);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "no recorded brk region must defer"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_non_group_leader_defers() {
+        // tid 0 (registered + dispatched by Bootstrap::init) is its own group
+        // leader by construction, so to exercise the non-leader branch a
+        // second task is registered, its thread_group_id is overwritten to a
+        // distinct value, and it is dispatched as the current task on CPU0.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        kernel.with(|state| {
+            state
+                .register_task_with_class(901, TaskClass::App)
+                .expect("register 901");
+            state.with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == 901)
+                    .expect("tcb 901 present");
+                tcb.thread_group_id = ThreadGroupId(900);
+            });
+            state.enqueue_current_cpu(901).expect("enqueue 901");
+            state.dispatch_next_task().expect("dispatch");
+            if state.current_tid() != Some(901) {
+                state.yield_current().expect("switch to 901");
+            }
+            assert_eq!(state.current_tid(), Some(901), "901 must be current");
+            state
+                .set_task_brk_bounds(901, 0x80_0000, 0x80_0000 + 2 * PAGE_SIZE)
+                .expect("set brk bounds for 901");
+        });
+        let mut frame = brk_frame(0x80_0000);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "a non-group-leader requester must defer"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_multi_cpu_online_defers() {
+        let (kernel, asid) = shared_task0_with_known_asid();
+        let base = 0x77_0000usize;
+        map_pages(&kernel, asid, &[base]);
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + PAGE_SIZE))
+            .expect("set brk bounds");
+        kernel
+            .with(|state| state.bring_up_cpu(CpuId(1)))
+            .expect("bring up cpu1");
+        assert_eq!(kernel.online_cpu_count_split_read(), 2);
+
+        let mut frame = brk_frame(base);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            None,
+            "more than one CPU online must defer to the shootdown-capable global-lock path"
+        );
+        assert!(
+            kernel
+                .with(|state| state.is_user_page_mapped_in_asid(asid, VirtAddr(base as u64)))
+                .expect("page must remain mapped after a deferred call (no partial mutation)")
+        );
+    }
+
+    #[test]
+    fn stage114_d3_single_cpu_online_after_bringup_then_back_to_one_is_live_again() {
+        // Sanity: the gate reads online-CPU count fresh on every call; it is
+        // not a one-shot latch. (No API exists to take a CPU back offline, so
+        // this instead proves the converse: starting with exactly one CPU
+        // online — the default — is live, confirming the gate's "<= 1" arm.)
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        assert_eq!(kernel.online_cpu_count_split_read(), 1);
+        let base = 0x7a_0000usize;
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + PAGE_SIZE))
+            .expect("set brk bounds");
+        let mut frame = brk_frame(base);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            Some(Ok(())),
+            "exactly one CPU online must be serviced live"
+        );
+    }
+
+    // ── D. Error paths the live seam surfaces directly (not a defer) ────────
+
+    #[test]
+    fn stage114_d3_asid_missing_returns_page_fault_error() {
+        // Group leader, crossing shrink, but no ASID bound: the live seam
+        // surfaces Some(Err(PageFault)) rather than deferring, matching
+        // KernelError::UserMemoryFault's SyscallError mapping.
+        let kernel = SharedKernel::new(Bootstrap::init().expect("init"));
+        let base = 0x78_0000usize;
+        kernel
+            .with(|state| state.set_task_brk_bounds(0, base, base + 2 * PAGE_SIZE))
+            .expect("set brk bounds");
+        let mut frame = brk_frame(base);
+        assert_eq!(
+            kernel.try_split_vm_brk_shrink_into_frame(CPU0, &mut frame),
+            Some(Err(TrapHandleError::Syscall(SyscallError::from(
+                KernelError::UserMemoryFault
+            )))),
+            "a missing ASID must surface PageFault directly, not defer"
+        );
+    }
+
+    // ── E. No-double-lock / call-boundary-placement structural proofs ───────
+
+    #[test]
+    fn stage114_d3_helper_is_defined_on_shared_kernel() {
+        // The new seam must be a SharedKernel method (callable on `&self`
+        // without ever holding `&mut KernelState`), not a KernelState method
+        // reached from inside an already-held global-lock borrow.
+        let runtime_src = include_str!("../../runtime.rs");
+        let impl_pos = runtime_src
+            .find("impl SharedKernel")
+            .expect("impl SharedKernel block must exist");
+        let fn_pos = runtime_src
+            .find("pub fn try_split_vm_brk_shrink_into_frame")
+            .expect("try_split_vm_brk_shrink_into_frame must exist");
+        assert!(
+            impl_pos < fn_pos,
+            "try_split_vm_brk_shrink_into_frame must be defined inside impl SharedKernel"
+        );
+        let mem_src = include_str!("memory_state.rs");
+        assert!(
+            !mem_src.contains("fn try_split_vm_brk_shrink_into_frame"),
+            "the live seam must not also be defined as a KernelState method in memory_state.rs"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_helper_never_takes_global_lock_directly() {
+        // Structural proof: the function body never calls `self.with(` or
+        // `self.with_cpu(` itself (the global-lock entry points). The one
+        // permitted brief global-lock use is by NAME, via
+        // `current_tid_authoritative`, mirroring
+        // `try_split_ipc_recv_queued_plain_into_frame`'s documented exception
+        // for the requester-TID read — that helper's own body (not this
+        // one's) is what actually calls with_cpu.
+        let runtime_src = include_str!("../../runtime.rs");
+        let start = runtime_src
+            .find("pub fn try_split_vm_brk_shrink_into_frame")
+            .expect("fn present");
+        let end = runtime_src[start..]
+            .find("pub fn handle_trap_with_cpu")
+            .map(|rel| start + rel)
+            .expect("handle_trap_with_cpu must follow");
+        let body = &runtime_src[start..end];
+        assert!(
+            !body.contains("self.with("),
+            "must never directly take the global lock via self.with("
+        );
+        assert!(
+            !body.contains("self.with_cpu("),
+            "must never directly take the global lock via self.with_cpu("
+        );
+        assert!(
+            body.contains("self.current_tid_authoritative("),
+            "must use current_tid_authoritative by name for the one permitted brief global-lock read"
+        );
+        assert!(
+            !body.contains("request_live_asid_shootdown("),
+            "must never call the ipc(3)-needing shootdown primitive (single-CPU-online safety proof); \
+             bare mentions in explanatory comments are fine, but an actual call is not"
+        );
+        for forbidden in ["with_ipc_", "with_endpoints_mut", "with_cnode", "with_cap"] {
+            assert!(
+                !body.contains(forbidden),
+                "must never touch the ipc(3) or capability(4) domain: found {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage114_trap_entry_routes_split_dispatch_before_with_cpu_with_early_return() {
+        // Confirms the actual integration point: try_split_dispatch_into_frame
+        // is called, and returned from early, strictly before with_cpu is
+        // ever entered in handle_trap_entry_shared.
+        let trap_entry_src = include_str!("../../arch/trap_entry.rs");
+        let fn_start = trap_entry_src
+            .find("pub fn handle_trap_entry_shared")
+            .expect("handle_trap_entry_shared must exist");
+        let body = &trap_entry_src[fn_start..];
+        let split_call = body
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("split dispatch call must be present");
+        let early_return = body[split_call..]
+            .find("return result;")
+            .map(|rel| split_call + rel)
+            .expect("an early return on Some(result) must be present");
+        let with_cpu_call = body
+            .find(".with_cpu(")
+            .expect("with_cpu call must still exist as the fallback");
+        assert!(
+            split_call < early_return && early_return < with_cpu_call,
+            "split dispatch + its early return must both precede with_cpu"
+        );
+    }
+
+    // ── F. Fence: NEW seam genuinely calls the Stage 108 seams ──────────────
+
+    #[test]
+    fn stage114_d3_new_live_seam_genuinely_calls_split_mut_seams() {
+        let runtime_src = include_str!("../../runtime.rs");
+        let start = runtime_src
+            .find("pub fn try_split_vm_brk_shrink_into_frame")
+            .expect("fn present");
+        let end = runtime_src[start..]
+            .find("pub fn handle_trap_with_cpu")
+            .map(|rel| start + rel)
+            .expect("next fn present");
+        let body = &runtime_src[start..end];
+        for seam in [
+            "with_task_tcbs_split_mut(",
+            "with_vm_user_spaces_split_mut(",
+            "with_memory_split_mut(",
+        ] {
+            assert!(
+                body.contains(seam),
+                "{seam} must be genuinely called from the new D3 live seam"
+            );
+        }
+        let syscall_split_src = include_str!("../syscall_split.rs");
+        assert!(
+            syscall_split_src.contains("try_split_vm_brk_shrink_into_frame(shared, cpu, frame)"),
+            "syscall_split.rs must route VmBrk to the live seam"
+        );
+        assert!(
+            syscall_split_src.contains("matches!(syscall, Syscall::VmBrk)"),
+            "the VmBrk special case must be present in try_split_dispatch_into_frame"
+        );
+    }
+
+    // ── G. Fence: OLD global-lock D3 path is unmodified by Stage 114 ────────
+
+    #[test]
+    fn stage114_d3_old_global_lock_path_fence_remains_intact() {
+        // Stage 114 did not modify the existing handle_vm_brk /
+        // vm_brk_shrink_two_phase call chain at all: it added an entirely
+        // separate, NEW pre-with_cpu interception point (mirroring the
+        // IpcRecv / Stage 32B precedent), so the Stage 112 fence proving that
+        // chain still does not call the Stage 108 seams directly from
+        // memory_state.rs remains true and unweakened.
+        let mem_src = include_str!("memory_state.rs");
+        for name in ["with_vm_user_spaces_split_mut(", "with_memory_split_mut("] {
+            assert!(
+                !mem_src.contains(name),
+                "{name} must still not be called from memory_state.rs"
+            );
+        }
+        assert!(
+            mem_src.contains("relocating the `VmBrk` shrink"),
+            "the original D3 Outcome-B blocker text must remain present, unchanged"
+        );
+        assert!(
+            mem_src.contains("fn brk_shrink_phase_a_vm")
+                && mem_src.contains("fn brk_shrink_phase_b_tlb_wait")
+                && mem_src.contains("fn brk_shrink_phase_c_reclaim"),
+            "the Stage 112 phase functions must remain untouched"
+        );
+    }
+
+    // ── H. D2 and D6 remain Outcome B, with their exact reasons retained ────
+
+    #[test]
+    fn stage114_d2_recv_block_remains_outcome_b_with_documented_reason() {
+        let ipc_src = include_str!("ipc_state.rs");
+        assert!(ipc_src.contains("fn recv_block_phase_a_scheduler"));
+        assert!(ipc_src.contains("fn recv_block_phase_b_task"));
+        assert!(ipc_src.contains("fn recv_block_phase_c_ipc_publish"));
+        let orch_start = ipc_src
+            .find("fn block_current_on_receive_with_deadline")
+            .expect("orchestrator present");
+        let orch = &ipc_src[orch_start..];
+        let a = orch
+            .find("self.recv_block_phase_a_scheduler(")
+            .expect("phase a call");
+        let b = orch
+            .find("self.recv_block_phase_b_task(")
+            .expect("phase b call");
+        let c = orch
+            .find("self.recv_block_phase_c_ipc_publish(")
+            .expect("phase c call");
+        assert!(
+            a < b && b < c,
+            "D2 phase calls must remain in rank 1 -> 2 -> 3 order"
+        );
+        assert!(
+            ipc_src.contains("relocating the IpcRecv-block"),
+            "the D2 Outcome-B blocker reason must remain present, unchanged"
+        );
+        assert!(
+            !ipc_src.contains("with_scheduler_split_mut(")
+                && !ipc_src.contains("with_task_tcbs_split_mut("),
+            "D2 must still not call the Stage 108 scheduler/task seams directly (Outcome B retained): \
+             relocating the blocking-recv entry point ahead of with_cpu would require a new ipc(3) \
+             split-mut seam to publish the receiver waiter pre-lock, which does not exist, and \
+             implementing one here would be the D2-B blocking split hard rule 3 forbids"
+        );
+    }
+
+    #[test]
+    fn stage114_d2b_ipc_send_still_not_split_eligible() {
+        // Hard rule 3: D2-B (IpcSend blocking split) must not be implemented.
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let mut frame = TrapFrame::new(Syscall::IpcSend as usize, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "IpcSend must remain non-split-eligible"
+        );
+    }
+
+    #[test]
+    fn stage114_d6_dispatch_remains_outcome_b_with_documented_reason() {
+        let sched_src = include_str!("scheduler_state.rs");
+        let exec_src = include_str!("exec_state.rs");
+        assert!(sched_src.contains("pub fn local_dispatch_step_split"));
+        assert_eq!(
+            exec_src.matches("self.local_dispatch_step_split()").count(),
+            1,
+            "dispatch_next_task must still call local_dispatch_step_split exactly once"
+        );
+        assert!(
+            !sched_src.contains("with_scheduler_split_mut(")
+                && !exec_src.contains("with_scheduler_split_mut("),
+            "D6 must still not call with_scheduler_split_mut directly (Outcome B retained): the \
+             dispatch entry point has ~50+ call sites fanning into it (yield, block, exit, fault, \
+             many syscalls), not one frame-decodable trap boundary like VmBrk/IpcRecv, so there is \
+             no single call site to relocate ahead of with_cpu"
+        );
+        assert!(
+            sched_src.contains("relocating the dispatch entry point"),
+            "the D6 Outcome-B blocker reason must remain present, unchanged"
+        );
+    }
+
+    #[test]
+    fn stage114_d3_full_vm_anon_map_two_phase_remains_deferred() {
+        let (kernel, _asid) = shared_task0_with_known_asid();
+        let mut frame = TrapFrame::new(Syscall::VmMap as usize, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            crate::kernel::syscall_split::try_split_dispatch_into_frame(&kernel, CPU0, &mut frame),
+            None,
+            "VmMap must remain non-split-eligible (D3-FULL out of scope)"
+        );
+        let runtime_src = include_str!("../../runtime.rs");
+        assert!(
+            !runtime_src.contains("VmAnonMapRollbackTlbPlan"),
+            "the aggregate-batch rollback scaffold must remain unwired into any live seam"
+        );
+    }
+
+    #[test]
+    fn stage114_d1_d5_cap_transfer_untouched() {
+        // Hard rule 2: Stage 114 must not touch D1/D5 cap-transfer behavior.
+        let src = include_str!("../cap_transfer_split.rs");
+        assert!(src.contains("VALIDATION: D1_LIVE_SPLIT"));
+        assert!(src.contains("VALIDATION: D5_LIVE_SPLIT"));
+    }
+
+    #[test]
+    fn stage114_d6_full_per_cpu_runqueue_sharding_remains_deferred() {
+        let sched_src = include_str!("scheduler_state.rs");
+        for forbidden in [
+            "PerCpuSchedulerLock",
+            "per_cpu_runqueue_lock",
+            "RunqueueShard",
+        ] {
+            assert!(
+                !sched_src.contains(forbidden),
+                "{forbidden} must not be introduced (per-CPU runqueue sharding is deferred)"
+            );
+        }
+    }
+
+    #[test]
+    fn stage114_x86_64_ap_scheduler_participation_remains_off() {
+        let smp_src = include_str!("../../arch/x86_64/smp.rs");
+        assert!(smp_src.contains("scheduler_aps=0"));
+        assert!(smp_src.contains("production scheduler is BSP-only"));
+    }
+
+    #[test]
+    fn stage114_riscv_still_bsp_only_and_in_smoke_matrix() {
+        let boot_src = include_str!("../../arch/riscv64/boot.rs");
+        assert!(
+            boot_src.contains("RISCV_SCHEDULER_BSP_ONLY online_cpus=1"),
+            "RISC-V scheduler must remain BSP-only with online_cpus=1"
+        );
+        let matrix_script = include_str!("../../../scripts/qemu-riscv64-smoke-matrix.sh");
+        assert!(
+            matrix_script.contains("riscv64"),
+            "the RISC-V smoke matrix script must still exist and target riscv64"
+        );
+    }
+
+    #[test]
+    fn stage114_smoke_scripts_still_reject_d2_race_unwind_marker() {
+        // Hard rule 11: Stage 114 must not weaken smoke scripts.
+        for script in [
+            include_str!("../../../scripts/qemu-x86_64-core-smoke.sh"),
+            include_str!("../../../scripts/qemu-x86_64-optional-fs-smoke.sh"),
+            include_str!("../../../scripts/qemu-aarch64-optional-fs-smoke.sh"),
+            include_str!("../../../scripts/qemu-riscv64-core-smoke.sh"),
+        ] {
+            assert!(
+                script.contains("D2_PUBLISH_RACE_UNWIND"),
+                "every smoke script must still reject D2_PUBLISH_RACE_UNWIND"
+            );
+        }
+    }
+
+    #[test]
+    fn stage114_syscall_count_unchanged() {
+        assert_eq!(
+            crate::kernel::syscall::SYSCALL_COUNT,
+            31,
+            "Stage 114 must not change SYSCALL_COUNT"
+        );
+    }
+
+    #[test]
+    fn stage114_no_new_split_eligible_syscall_enum_variant_for_vm_brk() {
+        // Design check: Syscall::VmBrk is intentionally NOT added to
+        // classify_split_eligible's SplitEligibleSyscall whitelist (mirrors
+        // IpcRecv's exact pattern) -- it is special-cased directly in
+        // try_split_dispatch_into_frame instead. Comment lines are stripped
+        // before the check: the enum body carries an explanatory `//` note
+        // about exactly this decision, and a bare substring match on
+        // "VmBrk" would flag that prose, not an actual variant declaration.
+        let src = include_str!("../syscall_split.rs");
+        let enum_start = src.find("enum SplitEligibleSyscall").expect("enum present");
+        let enum_end = src[enum_start..]
+            .find("\n}\n")
+            .map(|rel| enum_start + rel)
+            .expect("enum body closes");
+        let enum_body = &src[enum_start..enum_end];
+        let code_only: String = enum_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("VmBrk"),
+            "VmBrk must not be added as a SplitEligibleSyscall enum variant"
+        );
+    }
+}
