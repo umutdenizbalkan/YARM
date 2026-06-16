@@ -2,6 +2,11 @@
 
 # Signal Policy
 
+**Canonical: yes.** Owns YARM's stance on POSIX/Linux signal support
+(currently: not implemented in the kernel; explicit non-goal).
+Threading prerequisites live in `doc/KERNEL_MULTITHREADING_DESIGN.md`;
+Linux/musl personality scope lives in `doc/LIBC_AND_LINUX_COMPAT.md`.
+
 ## Current policy
 
 YARM does **not** implement classic POSIX/Linux asynchronous signal delivery in the kernel at this stage.

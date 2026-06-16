@@ -2,6 +2,14 @@
 
 # TLB Invalidation Policy (Hosted vs Production)
 
+**Canonical: yes.** Owns the per-arch TLB invalidation instruction
+contract and the `hosted-dev` no-op rationale. VM two-phase ordering
+(`VmAnonMap` / `VmBrk` / `TransferRelease` /
+`map_shared_region_into_receiver`) lives in
+`doc/KERNEL_UNLOCKING.md` §4 (recent correctness fixes) and the
+`vm.rs` source. D3 two-phase live-wiring status is tracked in
+`doc/KERNEL_UNLOCKING.md` §6.3 and §7.
+
 This note defines the expected behavior of the architecture page-table invalidation
 hooks and clarifies why hosted runs differ from non-hosted targets.
 

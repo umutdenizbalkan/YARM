@@ -1,5 +1,13 @@
 # Kernel Global Allocator
 
+**Canonical: yes.** Owns the kernel slab + large-page allocator
+design and locking discipline. Does not overlap with
+`doc/KERNEL_SCALING_PROFILE.md` (fixed-array capacities and
+`hosted-dev` / non-hosted profile gating), which sits on top of the
+allocator described here. RISC-V allocator handoff is covered by
+`doc/ARCH_RISCV64.md` §5 (Bootstrap / static `KernelState` fixes); RPi5
+high-half allocator handoff is covered by `doc/RPI5_BRINGUP.md`.
+
 This repository uses a kernel global allocator for non-hosted builds (`not(feature = "hosted-dev")`) to support `no_std + alloc` runtime allocation needs.
 
 ## Scope and usage

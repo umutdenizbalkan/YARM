@@ -175,7 +175,7 @@ scripts/phase5-boundary-gates.sh --ui-runtime-entrypoint
 ```
 
 `yarm-server-runtime` is a narrow server-runtime boundary; see
-`doc/AGENTS.md` for the export-surface contract.
+`doc/AI_AGENT_RULES.md` §16 for the export-surface contract.
 
 ---
 
@@ -201,9 +201,11 @@ scripts/phase5-boundary-gates.sh --ui-runtime-entrypoint
 | Phase gates (Phase 2/3/4 contracts, roadmap, kernel-status milestones) | `doc/PHASE_GATES.md` | ✅ Pass 4 (canonical) |
 | Service manifest | `doc/SERVICE_MANIFEST.md` | ✅ (existing canonical) |
 | Roadmap (current direction) | `doc/ROADMAP.md` | ✅ (existing canonical) |
-| Agent rules | `doc/AI_AGENT_RULES.md` | ✅ (existing canonical) |
+| Agent rules (capability/spawn/zero-copy/smoke + source-licensing header §15 + server-runtime boundary §16) | `doc/AI_AGENT_RULES.md` | ✅ Pass 5 (canonical; absorbed `AGENTS.md` body 2026-06-16) |
+| libc / Linux / musl POSIX compatibility | `doc/LIBC_AND_LINUX_COMPAT.md` | ✅ Pass 5 (canonical; merged `LIBC_ABI_X86_64_NONE.md` + `LINUX_COMPAT.md` + `MUSL_POSIX_IPC_MAPPING.md` 2026-06-16) |
+| Global unlocking readiness audit | `doc/KERNEL_UNLOCKING.md` §7.1 | ✅ Pass 5 (single source of truth) |
 | Kernel test rules | `doc/KERNEL_TEST_RULES.md` | ✅ (existing canonical) |
-| Cross-cutting agent reference | `doc/AGENTS.md` | ✅ (existing canonical) |
+| Agent-facing entry point (external-tool convention `AGENTS.md`) | `doc/AGENTS.md` | ✅ Pass 5 (short pointer to `doc/AI_AGENT_RULES.md`) |
 
 ---
 

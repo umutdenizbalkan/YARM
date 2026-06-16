@@ -44,7 +44,7 @@ These invariants gate `phase3-network-gates`:
   otherwise).
 - Transfer metadata is an envelope handle, **not** a raw source capability
   id.
-- Reference: `doc/LIBC_ABI_X86_64_NONE.md`.
+- Reference: `doc/LIBC_AND_LINUX_COMPAT.md`.
 
 ### CI gate-mapped tests
 

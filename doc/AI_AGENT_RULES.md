@@ -673,3 +673,37 @@ acceptance table. Declaring without smoke is a hard violation of §13.
   `arch/x86_64/smp_trampoline.rs`. §5.1 still stands: core smoke stays
   `-smp 1` until the AP per-CPU environment exists and an SMP smoke is
   genuinely accepted (no fake SMP acceptance).
+
+---
+
+## 15. Source-file licensing header (canonical)
+
+All new source files must begin with the following header, before any
+other content including `#![no_std]`:
+
+```
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Umut Deniz Balkan
+```
+
+Do not omit this header. Do not add any other license text.
+
+---
+
+## 16. Server-runtime boundary rules
+
+The `yarm-server-runtime` crate must remain a narrow userspace
+server-runtime boundary.
+
+- It may export only intentional server-facing surfaces such as:
+  - `ipc_abi`
+  - `user_rt`
+  - freestanding allocator installer
+  - startup slot installer / helpers
+- It must never depend on or re-export the root `yarm` crate.
+- It must never expose `KernelState`, `Bootstrap`, `TrapFrame`,
+  `ProcessManager`, `kernel::boot`, or other kernel-internal surfaces.
+- Do not use `yarm-server-runtime` as a compatibility bridge for server
+  crates.
+- If a server needs a new runtime surface, add the smallest explicit
+  userspace-facing API instead of glob re-exporting kernel internals.

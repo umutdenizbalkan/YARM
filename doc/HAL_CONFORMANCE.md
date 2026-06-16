@@ -2,6 +2,13 @@
 
 # HAL Conformance Notes (RISC-V + x86 + AArch64 baseline)
 
+**Canonical: yes.** Owns the HAL-portability contract and per-ISA
+platform-layout audit. Per-arch boot/IPC/userspace status lives in
+`doc/ARCH_AARCH64.md`, `doc/ARCH_X86_64.md`, and
+`doc/ARCH_RISCV64.md`; the RISC-V status table here mirrors
+`doc/ARCH_RISCV64.md` §13 — update both together when topology / IRQ
+status changes.
+
 This note freezes the minimum HAL portability checks expected by kernel-core code.
 
 ## Contract surface

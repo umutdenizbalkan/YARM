@@ -1,22 +1,28 @@
-## Licensing
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright 2026 Umut Deniz Balkan -->
 
-All new source files must begin with the following header, before any other content including `#![no_std]`:
-```
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2026 Umut Deniz Balkan
-```
+# YARM agent-facing entry point
 
-Do not omit this header. Do not add any other license text.
+**Canonical owner:** [`doc/AI_AGENT_RULES.md`](./AI_AGENT_RULES.md).
 
-## Architecture / Boundary Rules
+This file exists for AI agents and tooling that look for `AGENTS.md`
+by convention. The canonical, authoritative rules for AI agents
+working on YARM live in `doc/AI_AGENT_RULES.md` — capabilities, spawn,
+zero-copy, fallback / live-path policy, smoke discipline, and (since
+the global-unlocking readiness audit) source-file licensing header
+(§15) and server-runtime boundary rules (§16).
 
-- `yarm-server-runtime` must remain a narrow userspace server runtime boundary.
-- It may export only intentional server-facing surfaces such as:
-  - `ipc_abi`
-  - `user_rt`
-  - freestanding allocator installer
-  - startup slot installer/helpers
-- It must never depend on or re-export the root `yarm` crate.
-- It must never expose `KernelState`, `Bootstrap`, `TrapFrame`, `ProcessManager`, `kernel::boot`, or other kernel-internal surfaces.
-- Do not use `yarm-server-runtime` as a compatibility bridge for server crates.
-- If a server needs a new runtime surface, add the smallest explicit userspace-facing API instead of glob re-exporting kernel internals.
+Always read `doc/AI_AGENT_RULES.md` end-to-end before making any
+kernel, IPC, server, or build-script changes; the per-section rules
+encode invariants proven through Phase 2A–3B and the kernel-unlocking
+milestones (Stage 101+).
+
+Related canonical references:
+
+- `doc/KERNEL_UNLOCKING.md` — kernel unlocking workstream + readiness
+  audit (RISC-V64 included as a regular smoke target as of
+  stabilization pass 2).
+- `doc/KERNEL_LOCKING.md` — lock-rank design.
+- `doc/KERNEL_TEST_RULES.md` — per-rule unit-test guard rails.
+- `doc/DOCUMENTATION_MAP.md` — repo-wide documentation ownership map.
+- `doc/STATUS.md` — live per-arch and per-service status snapshot.

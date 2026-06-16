@@ -2,6 +2,14 @@
 
 # Kernel Scaling Profile
 
+**Canonical: yes.** Owns the `hosted-dev` vs non-hosted capacity
+profile and the dynamic-CNode sizing status. Lower-level allocator
+behavior lives in `doc/KERNEL_GLOBAL_ALLOCATOR.md`; the kernel
+unlocking status that drives per-CPU sharding decisions lives in
+`doc/KERNEL_UNLOCKING.md`. x86_64 AP Rust-online status is in
+`doc/ARCH_X86_64.md`; RISC-V scheduler-online status (BSP-only,
+`online_cpus=1`) is in `doc/ARCH_RISCV64.md` §13.
+
 This document records the current scaling strategy for kernel fixed-size tables,
 why hosted and non-hosted profiles differ, and where we still need follow-up work.
 

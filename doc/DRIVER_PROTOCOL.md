@@ -2,6 +2,13 @@
 
 # Device Server Delegation Protocol (v1)
 
+**Canonical: yes.** This file is the canonical owner of the
+kernel ↔ user-space driver-server delegation IPC contract. It does
+not overlap with `doc/PROCESS_AND_SPAWN.md` (PM/supervisor lifecycle)
+or `doc/FILESYSTEM_AND_STORAGE_CONTRACTS.md` (FS / storage / block
+server contracts) — those describe higher-level service contracts,
+this describes the registration/grant ABI underneath them.
+
 This file defines the initial IPC contract between user-space **device servers** and kernel-facing registration/grant paths.
 
 ## Naming model
