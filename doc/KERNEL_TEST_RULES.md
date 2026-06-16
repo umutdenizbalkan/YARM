@@ -5158,9 +5158,9 @@ labels present; Stage 100 FS gates unchanged.
 
 Stage 104 live-wired the D1 cap-transfer recv split for the supported
 transfer-cap case via `syscall.rs::materialize_received_message_cap_routed`.
-**NOT SMOKE-ACCEPTED** until x86_64 `-smp 1` core smoke and optional-FS
-strict smoke run on the branch (developed without QEMU). See
-`doc/KERNEL_UNLOCKING.md`.
+**SMOKE-ACCEPTED** as of Stage 110 (x86_64 `-smp 1` core smoke, x86_64 and
+AArch64 optional-FS strict smoke, and the RISC-V64 `--smp 1..4` smoke
+matrix all passed; see `doc/KERNEL_UNLOCKING.md` §1).
 
 **Test rules:**
 

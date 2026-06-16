@@ -8955,6 +8955,58 @@ fn direct_legacy_global_cspace_access_patterns_are_forbidden() {
 }
 
 #[test]
+fn no_stale_not_smoke_accepted_sentinels_in_src() {
+    // D7-A (doc/KERNEL_UNLOCKING.md §1): once a live-wired split has passed
+    // its required smoke gates, the module's "NOT SMOKE-ACCEPTED" disclosure
+    // must be removed. This is a ceiling check, not a per-module assertion,
+    // so a future live-wire PR that lands ahead of its own smoke run is
+    // caught here even if it forgets to add a dedicated test.
+    fn visit_rs_files(root: &std::path::Path, f: &mut dyn FnMut(&std::path::Path, &str)) {
+        let entries = std::fs::read_dir(root).expect("read_dir");
+        for entry in entries {
+            let entry = entry.expect("entry");
+            let path = entry.path();
+            if path.is_dir() {
+                visit_rs_files(&path, f);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read file");
+            f(&path, &source);
+        }
+    }
+
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut offenders: Vec<String> = Vec::new();
+    let mut check = |path: &std::path::Path, source: &str| {
+        let rel = path
+            .strip_prefix(&repo_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        if rel == "src/kernel/boot/tests.rs" {
+            // Contains this guard test's own pattern literal.
+            return;
+        }
+        if source.contains("NOT SMOKE-ACCEPTED") || source.contains("NOT_SMOKE_ACCEPTED") {
+            offenders.push(rel);
+        }
+    };
+
+    visit_rs_files(&repo_root.join("src"), &mut check);
+
+    assert!(
+        offenders.is_empty(),
+        "stale NOT SMOKE-ACCEPTED sentinel(s) found in src/ — either the listed \
+         module needs its required smokes run and the sentinel removed, or the \
+         removal needs a matching test update:\n{}",
+        offenders.join("\n")
+    );
+}
+
+#[test]
 fn ipc_reply_cap_direct_mint_path_survives_1536_cycles() {
     std::thread::Builder::new()
         .name("ipc_reply_cap_direct_mint_path_survives_1536_cycles".into())
