@@ -47,7 +47,8 @@ scheduling can be enabled.
 | Item | Status |
 |------|--------|
 | OpenSBI handoff | ✅ a0 (hartid) + a1 (DTB) preserved; `mv a0, s1` fix applied |
-| Secondary hart park (`-smp 2`) | ✅ `RISCV_SECONDARY_HART_PARK hart=1` before global init |
+| Secondary hart park (`--smp 2/3/4`) | ✅ live-verified; boot hart never parked; parked list is the topology bitmap minus the boot hart |
+| SMP topology + nonzero boot hart | ✅ binary-FDT `/cpus` walk yields `present_cpus=N`, `present_bitmap=0x{1,3,7,f}`; nonzero OpenSBI boot hart correctly selected (commit 271ac73) |
 | Monotonic cmdline capture | ✅ once-guarded; `RISCV_CMDLINE_CAPTURE_ONCE`; `RISCV_CMDLINE_PRESERVED reason=missing_dtb_after_valid` |
 | DTB RAM / initrd staging | ✅ `crate::arch::fdt::memory_reg` + `chosen_initrd`; firmware / DTB / initrd reserved |
 | Bootstrap | ✅ 16 MiB boot stack; `Bootstrap::init_static`; real RAM staged before allocator init |
@@ -58,7 +59,11 @@ scheduling can be enabled.
 | Syscall round-trip | ✅ full `RiscvTrapFrame` save/restore; `+4` ecall PC advance via TCB snapshot; task-switch arg seeding; S-mode-fault fail-closed halt |
 | Core service chain | ✅ initramfs / devfs / vfs / ramfs / ext4 reached; `RAMFS_MOUNT_READY`; `EXT4_SRV_READY`; `VFS_MOUNT_REGISTER_*_OK` |
 | Terminal state | ✅ `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked` (event-driven idle, no timer/IRQ scope) |
-| Timer interrupt / official core smoke | ❌ deferred — S-mode timer (`stimecmp` via SBI Timer ext, `sstatus.SIE=1`, delegate STI in `mideleg`) needed before official smoke gate |
+| Regular smoke target (`--smp 1/2/3/4`) | ✅ `scripts/qemu-riscv64-core-smoke.sh` + `scripts/qemu-riscv64-smoke-matrix.sh` enforce the full per-N marker contract on QEMU virt + OpenSBI |
+| Timer interrupt (live) | ⏸ deferred — accepted as `RISCV_TIMER_DEFERRED reason=timer_irq_feature_disabled`; next pass enables S-mode timer (`stimecmp` + `sstatus.SIE=1` + `mideleg` STI) and flips the gate to live-required |
+| PLIC threshold write under active satp | ✅ skipped + reported as `RISCV_PLIC_DEFERRED reason=plic_mmio_unmapped_under_active_satp` (PLIC MMIO is outside the kernel-shared gigapage; raw write would fault) |
+| External IRQ enable | ⏸ deferred — `RISCV_EXTIRQ_DEFERRED reason=no_safe_source`; UART0 (sid=10) is the marked candidate, no source enabled in this pass |
+| SMP scheduler | ⏸ off — `RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled`; `online_cpus` stays at 1 until RISC-V SMP scheduling lands |
 
 See `doc/ARCH_RISCV64.md` for the full marker sequence, ABI mapping, and
 SMP blocker list.
@@ -204,15 +209,16 @@ scripts/phase5-boundary-gates.sh --ui-runtime-entrypoint
 
 The four highest-impact items, in order of unlock value:
 
-1. **RISC-V S-mode timer interrupt + official core smoke.** Enable
-   `stimecmp` via the SBI Timer extension, set `sstatus.SIE=1`, delegate
-   `STI` in `mideleg`. The trap vector already saves all GPRs and the
-   bridge already routes `TrapEvent::TimerInterrupt` through
-   `handle_trap_entry`, so the scheduler will start ticking and the
-   parked services will be woken on external IRQs (PLIC). Then point the
-   official `scripts/qemu-riscv64-core-smoke.sh` at the production
-   binary path and confirm the x86_64 / AArch64 marker set. See
-   `doc/ARCH_RISCV64.md` §10.
+1. **RISC-V S-mode timer interrupt (live path) + smoke-gate tightening.**
+   The regular RISC-V core smoke now passes live across `--smp 1/2/3/4`
+   on the deferred branch (timer / PLIC / external IRQ all reported with
+   explicit `reason=` markers). Next, enable `stimecmp` via the SBI Timer
+   extension, set `sstatus.SIE=1`, delegate `STI` in `mideleg`, then
+   flip the smoke gate's `RISCV_TIMER_SMOKE_OK|RISCV_TIMER_DEFERRED`
+   accept-regex from "either" to "live required". PLIC + external-IRQ
+   follow the same flip; once both land, queue RISC-V into the global
+   kernel-unlocking smoke policy and unblock RISC-V SMP scheduling so
+   `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **x86_64 AP per-CPU environment.** Per-CPU GDT/IDT/TSS + GS base +
    AP-safe printk + `bring_up_cpu(cpu)` integration, behind a default-off

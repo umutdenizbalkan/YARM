@@ -349,42 +349,67 @@ Terminal state is **event-driven idle waiting for I/O / timer / IRQ**
 
 ## 10. Current next target
 
-Enable the S-mode timer interrupt (`stimecmp` via SBI Timer ext,
-`sstatus.SIE=1`, delegate `STI` in `mideleg`). The trap vector already
-saves all GPRs and the bridge already routes
-`TrapEvent::TimerInterrupt` through `handle_trap_entry`, so the
-scheduler will start ticking and the parked services will be woken on
-external IRQs (PLIC). After that, point the official
-`scripts/qemu-riscv64-core-smoke.sh` at the production binary path and
-confirm it matches the x86_64 / AArch64 marker set.
+RISC-V64 is now a regular smoke target (see §11). `--smp 1/2/3/4` are
+all live-verified on QEMU `virt` + OpenSBI: nonzero boot harts are
+selected and not parked, the binary-FDT `/cpus` walk yields
+`present_cpus`/`present_bitmap` matching the platform, the service
+chain reaches the idle terminal, and timer / PLIC / external IRQ are
+each on an explicit deferred branch with a `reason=` tag.
+
+The next pass is to enable the S-mode timer interrupt (`stimecmp` via
+SBI Timer ext, `sstatus.SIE=1`, delegate `STI` in `mideleg`); the trap
+vector already saves all GPRs and the bridge already routes
+`TrapEvent::TimerInterrupt` through `handle_trap_entry`. After that,
+flip the smoke gate from "live OR deferred" to "live required" for the
+timer pair, then for PLIC + external IRQ, then unblock RISC-V SMP
+scheduling so `online_cpus` can climb past 1.
 
 ---
 
 ## 11. Smoke commands
 
+RISC-V64 is a **regular** smoke target. The canonical entry points are
+the build script and the per-`--smp N` core smoke script; both default
+to `build-riscv64/yarm-riscv64.bin` and `build-riscv64/initramfs-core.cpio`.
+
 ```sh
+# 1. Build artifacts (fails clearly if any required image is missing).
 scripts/build-qemu-riscv64-artifacts.sh
 
-# -smp 1
-qemu-system-riscv64 -machine virt -m 512M -smp 1 \
-  -nographic -monitor none -serial stdio -bios default \
-  -kernel build-riscv64/yarm-riscv64.bin \
-  -initrd build-riscv64/initramfs-core.cpio \
-  -append "console=ttyS0 rdinit=/init"
+# 2. Per-N core smoke. Each call enforces the full marker contract for N.
+scripts/qemu-riscv64-core-smoke.sh --smp 1
+scripts/qemu-riscv64-core-smoke.sh --smp 2
+scripts/qemu-riscv64-core-smoke.sh --smp 3
+scripts/qemu-riscv64-core-smoke.sh --smp 4
 
-# -smp 2 (secondary must park)
-qemu-system-riscv64 -machine virt -m 512M -smp 2 \
-  -nographic -monitor none -serial stdio -bios default \
-  -kernel build-riscv64/yarm-riscv64.bin \
-  -initrd build-riscv64/initramfs-core.cpio \
-  -append "console=ttyS0 rdinit=/init"
+# 3. Or run the matrix wrapper, which builds once and summarizes 1..4.
+scripts/qemu-riscv64-smoke-matrix.sh
 ```
 
-The official `scripts/qemu-riscv64-core-smoke.sh` exists for
-scaffolding; it currently uses a different image base
-(`build/yarm-riscv64.bin`). Use the direct commands above (or
-`KERNEL_IMAGE=build-riscv64/yarm-riscv64.bin INITRAMFS_IMAGE=...`
-overrides) until the script is repointed at the production artifacts.
+The per-N gate enforces, for each `--smp N`:
+
+| Axis | Requirement |
+|------|-------------|
+| Boot entry | `RISCV_BOOT_ENTRY hart=N dtb=0x...` from whichever hart OpenSBI released |
+| Boot hart selection | `RISCV_BOOT_HART_SELECTED hart=N` + `RISCV_BOOT_HART_ID_STORED hart=N` |
+| DTB `/cpus` scan | `RISCV_DTB_CPU_SCAN_DONE bitmap=0x... count=N` (silent fallback rejected) |
+| Topology | `RISCV_HART_TOPOLOGY present_cpus=N` and `YARM_BOOT_OK present_cpus=N present_bitmap=0x{1,3,7,f} online_cpus=1` |
+| Scheduler | `RISCV_SCHEDULER_BSP_ONLY online_cpus=1 reason=riscv_smp_scheduler_not_enabled` |
+| Boot hart not parked | If `N>1`, `RISCV_SECONDARY_HART_PARK hart=B` must NOT carry the boot-hart id |
+| Service chain | `RISCV_LIVEEEEEEE`, `RISCV_SYSCALL_ROUNDTRIP_OK`, `RISCV_USER_RESUMED`, `INITRAMFS_SRV_ENTRY`, `DEVFS_SRV_ENTRY`, `VFS_SRV_ENTRY`, `VFS_MOUNT_TABLE_READY`, `RAMFS_MOUNT_READY`, `VFS_MOUNT_REGISTER_RAMFS_OK`, `EXT4_SRV_READY`, `VFS_MOUNT_REGISTER_EXT4_OK` |
+| Idle | `RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked` |
+| Timer / PLIC / extirq | Either the live marker (`RISCV_TIMER_SMOKE_OK`, `RISCV_PLIC_INIT_DONE`, `RISCV_EXTIRQ_SMOKE_OK`) **or** the explicit deferred marker (`RISCV_TIMER_DEFERRED`, `RISCV_PLIC_DEFERRED`, `RISCV_EXTIRQ_DEFERRED`) with a `reason=` tag. This pass remains on the deferred branch by design. |
+
+Reject patterns include `RISCV_EARLY_TRAP`, `PANIC`, `FATAL`, `ASSERT`,
+`PAGE_FAULT_UNHANDLED`, `TRAP_HANDLE failed`, `Vm(Full)`, `oom`,
+`capacity`, `RISCV_DTB_CPU_SCAN_FAILED`, `SPAWN_V5_WRONG_SENDER`, and
+any `RISCV_TRAP_HALTED reason=` other than the expected
+`kernel_idle_awaiting_io` terminal.
+
+Once RISC-V is in the global kernel-unlocking smoke policy this is the
+gate it must continue to satisfy. Live timer IRQ and PLIC external IRQ
+remain explicitly deferred until their bring-up lands; tightening the
+gate to live-only is the next pass, not this one.
 
 ---
 
