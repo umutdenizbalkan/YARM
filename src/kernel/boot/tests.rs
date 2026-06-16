@@ -11411,6 +11411,253 @@ fn stage112_d3_await_tlb_shootdown_ack_not_redesigned() {
     );
 }
 
+// ── D-NEXT-1 PR-C / Stage 113: D6 local-dispatch phase-boundary checks ────
+
+#[test]
+fn stage113_d6_dispatch_seam_anchor_present_and_called_once() {
+    // local_dispatch_step_split must remain the D6 dispatch seam anchor,
+    // and dispatch_next_task must call it exactly once.
+    let sched_src = include_str!("scheduler_state.rs");
+    assert!(
+        sched_src.contains("pub fn local_dispatch_step_split"),
+        "local_dispatch_step_split must remain present in scheduler_state.rs"
+    );
+    let exec_src = include_str!("exec_state.rs");
+    let calls = exec_src.matches("self.local_dispatch_step_split()").count();
+    assert_eq!(
+        calls, 1,
+        "dispatch_next_task must call local_dispatch_step_split exactly once"
+    );
+}
+
+#[test]
+fn stage113_d6_phase_a_lock_dropped_before_phase_b_side_effects() {
+    // Phase A (scheduler rank 1) must be fully released before any Phase B
+    // side effect (ASID switch, kernel-context switch, TCB mutation) runs.
+    let exec_src = include_str!("exec_state.rs");
+    let body_start = exec_src
+        .find("pub(crate) fn dispatch_next_task")
+        .expect("dispatch_next_task must exist");
+    let body_end = exec_src
+        .find("pub fn dispatch_ready_task")
+        .expect("dispatch_ready_task must exist after dispatch_next_task");
+    let body = &exec_src[body_start..body_end];
+    let phase_a = body
+        .find("self.local_dispatch_step_split()")
+        .expect("Phase A call must be present");
+    for phase_b_marker in [
+        "self.hal.switch_address_space(",
+        "self.maybe_switch_kernel_context(",
+        "tcb.status = TaskStatus::Running;",
+    ] {
+        let pos = body
+            .find(phase_b_marker)
+            .unwrap_or_else(|| panic!("{phase_b_marker} must be present in dispatch_next_task"));
+        assert!(
+            phase_a < pos,
+            "{phase_b_marker} (Phase B) must appear after the Phase A dispatch call"
+        );
+    }
+}
+
+#[test]
+fn stage113_d6_local_dispatch_step_split_holds_only_scheduler_lock() {
+    // The function body must take only the scheduler-state lock (rank 1);
+    // the inner lock-guard block must end before telemetry/log side effects.
+    let sched_src = include_str!("scheduler_state.rs");
+    let start = sched_src
+        .find("pub fn local_dispatch_step_split")
+        .expect("local_dispatch_step_split must exist");
+    let end = sched_src[start..]
+        .find("pub fn on_preempt_current_cpu")
+        .map(|rel| start + rel)
+        .expect("on_preempt_current_cpu must follow local_dispatch_step_split");
+    let body = &sched_src[start..end];
+    let lock_pos = body
+        .find("self.scheduler_state()")
+        .expect("must take the scheduler_state lock");
+    let note_pos = body
+        .find("self.note_d6_local_dispatch()")
+        .expect("must call note_d6_local_dispatch after the lock block");
+    assert!(
+        lock_pos < note_pos,
+        "scheduler lock acquisition must precede the post-lock telemetry call"
+    );
+}
+
+#[test]
+fn stage113_d6_no_ipc_cap_vm_memory_usercopy_in_local_dispatch_step_split() {
+    let sched_src = include_str!("scheduler_state.rs");
+    let start = sched_src
+        .find("pub fn local_dispatch_step_split")
+        .expect("local_dispatch_step_split must exist");
+    let end = sched_src[start..]
+        .find("pub fn on_preempt_current_cpu")
+        .map(|rel| start + rel)
+        .expect("on_preempt_current_cpu must follow local_dispatch_step_split");
+    let body = &sched_src[start..end];
+    for forbidden in [
+        "with_ipc_",
+        "with_endpoints_mut",
+        "publish_recv_waiter_live",
+        "with_cnode",
+        "map_user_page",
+        "unmap_page_phase1",
+        "with_memory_state",
+        "copy_to_user",
+        "copy_from_user",
+    ] {
+        assert!(
+            !body.contains(forbidden),
+            "local_dispatch_step_split must not contain {forbidden} (scheduler-rank-only)"
+        );
+    }
+}
+
+#[test]
+fn stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker() {
+    // D-NEXT-1 PR-C reached the same architectural blocker as PR-A/PR-B: the
+    // dispatch call site still runs nested inside SharedKernel::with_cpu's
+    // global-lock borrow (reached via trap dispatch for ~50+ call sites), so
+    // calling the SharedKernel-level seam here would alias the same backing
+    // scheduler_state lock through two pointers and would not actually
+    // shrink the global lock's hold time. Outcome B: the seam stays
+    // helper-only; this test pins that the D6 dispatch path does not call
+    // it, and that the fence documenting why is still present.
+    let sched_src = include_str!("scheduler_state.rs");
+    let exec_src = include_str!("exec_state.rs");
+    assert!(
+        !sched_src.contains("with_scheduler_split_mut("),
+        "with_scheduler_split_mut must not be called from scheduler_state.rs yet"
+    );
+    assert!(
+        !exec_src.contains("with_scheduler_split_mut("),
+        "with_scheduler_split_mut must not be called from exec_state.rs yet"
+    );
+    assert!(
+        sched_src.contains("relocating the dispatch entry point"),
+        "local_dispatch_step_split must document the exact architectural blocker for the deferred seam live-wire"
+    );
+    let runtime_src = include_str!("../../runtime.rs");
+    assert!(
+        runtime_src.contains("VALIDATION: M2_SEAM_HELPER_ONLY"),
+        "the Stage 108 seam helper-only fence must remain in runtime.rs"
+    );
+}
+
+#[test]
+fn stage113_d2_and_d3_fences_untouched() {
+    // PR-C must not delete or weaken the D2 (PR-A) or D3 (PR-B) fences.
+    let ipc_src = include_str!("ipc_state.rs");
+    assert!(
+        ipc_src.contains("fn recv_block_phase_a_scheduler")
+            && ipc_src.contains("fn recv_block_phase_b_task")
+            && ipc_src.contains("fn recv_block_phase_c_ipc_publish"),
+        "D2 PR-A phase functions must remain untouched"
+    );
+    let mem_src = include_str!("memory_state.rs");
+    assert!(
+        mem_src.contains("fn brk_shrink_phase_a_vm")
+            && mem_src.contains("fn brk_shrink_phase_b_tlb_wait")
+            && mem_src.contains("fn brk_shrink_phase_c_reclaim"),
+        "D3 PR-B phase functions must remain untouched"
+    );
+}
+
+#[test]
+fn stage113_per_cpu_runqueue_sharding_remains_deferred() {
+    // D6-full (per-CPU runqueue lock sharding) is out of scope; the
+    // dispatch step must still go through the single shared scheduler lock.
+    let sched_src = include_str!("scheduler_state.rs");
+    let start = sched_src
+        .find("pub fn local_dispatch_step_split")
+        .expect("local_dispatch_step_split must exist");
+    let end = sched_src[start..]
+        .find("pub fn on_preempt_current_cpu")
+        .map(|rel| start + rel)
+        .expect("on_preempt_current_cpu must follow local_dispatch_step_split");
+    let body = &sched_src[start..end];
+    assert!(
+        body.contains("self.scheduler_state()"),
+        "dispatch must still take the single shared scheduler-state lock (no per-CPU sharding yet)"
+    );
+    for forbidden in [
+        "PerCpuSchedulerLock",
+        "per_cpu_runqueue_lock",
+        "RunqueueShard",
+    ] {
+        assert!(
+            !sched_src.contains(forbidden),
+            "{forbidden} must not be introduced (per-CPU runqueue sharding is deferred)"
+        );
+    }
+}
+
+#[test]
+fn stage113_x86_64_ap_scheduler_participation_remains_off() {
+    let smp_src = include_str!("../../arch/x86_64/smp.rs");
+    assert!(
+        smp_src.contains("scheduler_aps=0"),
+        "x86_64 AP scheduler participation must remain off (scheduler_aps=0)"
+    );
+    assert!(
+        smp_src.contains("production scheduler is BSP-only"),
+        "the AP scheduler-off fence comment must remain in smp.rs"
+    );
+}
+
+#[test]
+fn stage113_riscv_scheduler_remains_bsp_only_online_cpus_one() {
+    let boot_src = include_str!("../../arch/riscv64/boot.rs");
+    assert!(
+        boot_src.contains("RISCV_SCHEDULER_BSP_ONLY online_cpus=1"),
+        "RISC-V scheduler must remain BSP-only with online_cpus=1"
+    );
+}
+
+#[test]
+fn stage113_existing_smoke_markers_unchanged() {
+    // PR-C must not remove or rename any pre-existing smoke marker on the
+    // D6 dispatch path; new markers are additive only.
+    let sched_src = include_str!("scheduler_state.rs");
+    assert!(sched_src.contains("D6_LOCAL_DISPATCH cpu={} tid={:?}"));
+    let exec_src = include_str!("exec_state.rs");
+    for marker in [
+        "SCHED_DISPATCH_NEXT chosen_tid={}",
+        "SCHED_NO_RUNNABLE_USER_TASK",
+        "SCHED_ENTER_IDLE",
+    ] {
+        assert!(
+            exec_src.contains(marker),
+            "{marker} must remain present (smoke markers must not be weakened/removed)"
+        );
+    }
+    // New Stage 113 phase-boundary markers are additive only.
+    assert!(sched_src.contains("D6_DISPATCH_SPLIT_BEGIN"));
+    assert!(sched_src.contains("D6_DISPATCH_SCHED_PHASE_DONE"));
+    assert!(exec_src.contains("D6_DISPATCH_SELECTED"));
+    assert!(exec_src.contains("D6_DISPATCH_IDLE"));
+}
+
+#[test]
+fn stage113_no_syscall_abi_or_protocol_changes() {
+    // PR-C only adds phase-boundary documentation/telemetry inside the
+    // scheduler/dispatch path; it must not touch syscall numbers, IPC ABI,
+    // or service protocols.
+    let syscall_src = include_str!("../syscall.rs");
+    for marker in [
+        "D6_DISPATCH_SPLIT_BEGIN",
+        "D6_DISPATCH_SCHED_PHASE_DONE",
+        "D6_DISPATCH_SELECTED",
+        "D6_DISPATCH_IDLE",
+    ] {
+        assert!(
+            !syscall_src.contains(marker),
+            "{marker} must not appear in syscall.rs; PR-C does not touch syscall ABI"
+        );
+    }
+}
+
 #[test]
 fn vm_anon_map_rollback_tlb_plan_covers_progress_range() {
     // Stage 5E: VmAnonMapRollbackTlbPlan must capture the progress range from

@@ -224,29 +224,33 @@ The four highest-impact items, in order of unlock value:
    kernel-unlocking smoke policy and unblock RISC-V SMP scheduling so
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
-2. **Kernel-unlocking seam-routing PR-C, then x86_64 AP per-CPU
-   environment (D-NEXT-2).** Per Cycle 12 / Stage 110, D7-A
+2. **Kernel-unlocking combined trap-dispatch relocation, then x86_64
+   AP per-CPU environment (D-NEXT-2).** Per Cycle 12 / Stage 110, D7-A
    (smoke-acceptance sentinel cleanup) and D7-B (D2 race-unwind smoke
    reject) are complete. Stage 111 landed D-NEXT-1 PR-A's preparatory
    phase split (D2 blocking-recv now three named rank-ordered phase
    functions, no behavior change); Stage 112 landed D-NEXT-1 PR-B's
    preparatory phase split (D3 brk-shrink now three named, batched
-   vm→no-lock-wait→memory phase functions, no behavior change). Both
-   hit the same architectural blocker — the call site is nested inside
-   `SharedKernel::with_cpu` — so their genuine seam live-wire
-   (`with_scheduler_split_mut`/`with_task_tcbs_split_mut` for D2,
-   `with_vm_user_spaces_split_mut`/`with_memory_split_mut` for D3) is
-   deferred to a single follow-on PR that relocates both call sites ahead
-   of `SharedKernel::with_cpu` (see `doc/KERNEL_UNLOCKING.md` §1 Stage 111
-   and Stage 112). The next PR routes the already-live D6 dispatch call
-   site through its typed split-lock helper (no behavior change expected
-   unless a real lock-scope reduction proves achievable) before the
-   x86_64 AP per-CPU environment (per-CPU GDT/IDT/TSS + GS base + AP-safe
-   printk + `bring_up_cpu(cpu)`, behind a default-off knob, then
-   `-smp ≥ 2` smoke acceptance) starts. AP per-CPU work remains high
-   priority but may not bypass PR-C. Lock-free `await_tlb_shootdown_ack`
-   and per-CPU runqueue lock sharding (D6) follow once scheduler-online
-   APs exist. See `doc/ARCH_X86_64.md` §4 and `doc/KERNEL_UNLOCKING.md` §7.
+   vm→no-lock-wait→memory phase functions, no behavior change); Stage 113
+   landed D-NEXT-1 PR-C's preparatory phase split (D6 local dispatch
+   documented/instrumented as its existing scheduler-rank-1 phase A
+   followed by lock-free phase B in `dispatch_next_task`, no behavior
+   change). All three hit the same architectural blocker — the call
+   site is nested inside `SharedKernel::with_cpu` — so their genuine
+   seam live-wire (`with_scheduler_split_mut`/`with_task_tcbs_split_mut`
+   for D2, `with_vm_user_spaces_split_mut`/`with_memory_split_mut` for
+   D3, `with_scheduler_split_mut` for D6) is deferred to a single
+   follow-on PR that relocates all three call sites ahead of
+   `SharedKernel::with_cpu` (see `doc/KERNEL_UNLOCKING.md` §1 Stage 111,
+   Stage 112, and Stage 113). That combined relocation is the next
+   recommended PR, before the x86_64 AP per-CPU environment (per-CPU
+   GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`, behind
+   a default-off knob, then `-smp ≥ 2` smoke acceptance) starts; D4
+   step 1 is an available fallback if the relocation PR proves blocked.
+   AP per-CPU work remains high priority but may not bypass the
+   relocation PR. Lock-free `await_tlb_shootdown_ack` and per-CPU
+   runqueue lock sharding (D6) follow once scheduler-online APs exist.
+   See `doc/ARCH_X86_64.md` §4 and `doc/KERNEL_UNLOCKING.md` §7.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

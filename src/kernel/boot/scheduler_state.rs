@@ -101,16 +101,48 @@ impl KernelState {
     /// authoritative reads. Stage 107 adds the typed entry point and
     /// telemetry; the per-CPU sharding waits on the SMP trampoline split.
     ///
+    /// D-NEXT-1 PR-C note (Stage 113): this method is already the complete
+    /// Phase A (scheduler rank 1 only) for the D6 local dispatch decision —
+    /// the lock guard above is scoped to an inner block and dropped before
+    /// this function returns, before the telemetry/log side effects below,
+    /// and before every Phase B side effect in the caller
+    /// (`dispatch_next_task`: ASID switch, kernel-context switch, TCB status
+    /// mutation) runs. There is no phase interleaving to fix here, unlike
+    /// D2/D3. What remains deferred is only the
+    /// `SharedKernel::with_scheduler_split_mut` live-wire call: every caller
+    /// of `dispatch_next_task` (~50+ sites, via `yield_current`,
+    /// `block_current_on_receive_with_deadline`, exit/exec/fault paths, …)
+    /// is reached transitively through `SharedKernel::with_cpu`'s
+    /// already-held `&mut KernelState` borrow (see
+    /// `arch/trap_entry.rs::handle_trap_entry_shared`). Calling
+    /// `with_scheduler_split_mut` from inside that borrow would derive a
+    /// second raw-pointer alias of the *same* `scheduler_state` field this
+    /// method already locks via `self.scheduler_state()`, and would not
+    /// shrink the global lock's hold time since the outer borrow stays live
+    /// regardless — the identical constraint already documented on D2
+    /// PR-A's `block_current_on_receive_with_deadline` and D3 PR-B's
+    /// `vm_brk_shrink_two_phase`. Genuinely exiting the global lock for this
+    /// path requires relocating the dispatch entry point to before
+    /// `SharedKernel::with_cpu` in trap dispatch, deferred to a follow-on PR
+    /// (see `doc/KERNEL_UNLOCKING.md` §D-NEXT-1 PR-C). The
+    /// `M2_SEAM_HELPER_ONLY` fence for the scheduler seam is therefore kept
+    /// as-is; behavior and lock order are unchanged from Stage 107.
+    ///
     /// Telemetry: `d6_local_dispatch_calls` (+1 per call). Smoke marker:
-    /// `D6_LOCAL_DISPATCH cpu=N tid=Some(T)|None`.
+    /// `D6_LOCAL_DISPATCH cpu=N tid=Some(T)|None` (unchanged). Optional Info
+    /// markers for the phase boundary: `D6_DISPATCH_SPLIT_BEGIN`,
+    /// `D6_DISPATCH_SCHED_PHASE_DONE` — none of these are required for
+    /// acceptance.
     pub fn local_dispatch_step_split(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
+        crate::yarm_log!("D6_DISPATCH_SPLIT_BEGIN cpu={}", cpu.0);
         let next = {
             let mut sched = self.scheduler_state();
             kernel_mut(&mut sched.scheduler)
                 .dispatch_next_on(cpu)
                 .map(|tid| tid.0)
         };
+        crate::yarm_log!("D6_DISPATCH_SCHED_PHASE_DONE cpu={} tid={:?}", cpu.0, next);
         self.note_d6_local_dispatch();
         crate::yarm_log!("D6_LOCAL_DISPATCH cpu={} tid={:?}", cpu.0, next);
         next
