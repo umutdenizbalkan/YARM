@@ -1,4 +1,3 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
 
 # musl sysdeps shim TODO (all ISAs, x86_64 boot target-first)
 

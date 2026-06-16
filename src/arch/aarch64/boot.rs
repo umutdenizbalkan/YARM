@@ -584,6 +584,174 @@ rpi5_hh_retained_marker!(RPI5_HH_RUST_ENTRY_MARKER, b"RPI5_HH_RUST_ENTRY");
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+rpi5_hh_retained_marker!(RPI5_HH_RUST_AFTER_ENTRY_MARKER, b"RPI5_HH_RUST_AFTER_ENTRY");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_PC_BEGIN_MARKER, b"RPI5_HH_READ_PC_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_PC_CAPTURED_MARKER, b"RPI5_HH_READ_PC_CAPTURED");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_PC_PRINT_BEGIN_MARKER,
+    b"RPI5_HH_READ_PC_PRINT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_HEX_BEGIN_MARKER, b"RPI5_HH_HEX_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_HEX_DIGIT_BEGIN_MARKER, b"RPI5_HH_HEX_DIGIT_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_HEX_DIGIT_DONE_MARKER, b"RPI5_HH_HEX_DIGIT_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_HEX_DONE_MARKER, b"RPI5_HH_HEX_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_HEX_FAILED_MARKER, b"RPI5_HH_HEX_FAILED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH3_HEX_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH3_FAULT_BOUNDARY reason=hex_output"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_PC_DONE_MARKER,
+    b"RPI5_HH_READ_PC_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_PC_FAILED_MARKER,
+    b"RPI5_HH_READ_PC_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH3_PC_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH3_FAULT_BOUNDARY reason=pc_read_or_print"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_SP_BEGIN_MARKER, b"RPI5_HH_READ_SP_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_SP_DONE_MARKER,
+    b"RPI5_HH_READ_SP_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_VBAR_BEGIN_MARKER, b"RPI5_HH_READ_VBAR_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_READ_VBAR_DONE_MARKER,
+    b"RPI5_HH_READ_VBAR_DONE value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_TTBR_BEGIN_MARKER, b"RPI5_HH_READ_TTBR_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_READ_TTBR_DONE_MARKER, b"RPI5_HH_READ_TTBR_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_PRINT_REGS_BEGIN_MARKER, b"RPI5_HH_PRINT_REGS_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_PRINT_REGS_DONE_MARKER, b"RPI5_HH_PRINT_REGS_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH3_PRECHECK_DONE_MARKER, b"RPI5_HH3_PRECHECK_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH3_FAILED_MARKER, b"RPI5_HH3_FAILED reason=");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH3_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH3_FAULT_BOUNDARY reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
 rpi5_hh_retained_marker!(RPI5_HH_REGISTERS_OK_MARKER, b"RPI5_HH_REGISTERS_OK");
 #[cfg(all(
     not(feature = "hosted-dev"),
@@ -874,13 +1042,35 @@ fn rpi5_hh_write_two_hex_line(prefix: &[u8], first: u64, separator: &[u8], secon
 fn rpi5_hh_fail(reason: &[u8]) -> ! {
     let _ = rpi5_hh_write_bytes(b"RPI5_HH_REGISTER_MISMATCH reason=");
     let _ = rpi5_hh_write_line(reason);
-    let _ = rpi5_hh_write_bytes(b"RPI5_HH3_FAILED reason=");
+    let _ = rpi5_hh_write_bytes(&RPI5_HH3_FAULT_BOUNDARY_MARKER);
     let _ = rpi5_hh_write_line(reason);
-    loop {
-        unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-        }
-    }
+    let _ = rpi5_hh_write_bytes(&RPI5_HH3_FAILED_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    rpi5_hh_halt()
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_pc_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(&RPI5_HH_READ_PC_FAILED_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    let _ = rpi5_hh_write_line(&RPI5_HH3_PC_FAULT_BOUNDARY_MARKER);
+    rpi5_hh_halt()
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_hex_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(&RPI5_HH_HEX_FAILED_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    let _ = rpi5_hh_write_line(&RPI5_HH3_HEX_FAULT_BOUNDARY_MARKER);
+    rpi5_hh_halt()
 }
 
 #[cfg(all(
@@ -1133,36 +1323,166 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
         static __hh_ttbr1_root: u8;
     }
 
+    if !rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER) {
+        rpi5_hh_halt();
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_RUST_AFTER_ENTRY_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_PC_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     let pc: u64;
+    unsafe {
+        /*
+         * ADR resolves this local label relative to the executing instruction.
+         * It neither dereferences memory nor depends on a low-half symbol, so
+         * the captured address remains valid after the branch into high code.
+         */
+        core::arch::asm!(
+            "adr {pc}, 2f",
+            "2:",
+            pc = out(reg) pc,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_READ_PC_CAPTURED_MARKER) {
+        rpi5_hh_pc_fail(b"captured_marker_uart_timeout");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_READ_PC_PRINT_BEGIN_MARKER) {
+        rpi5_hh_pc_fail(b"print_begin_uart_timeout");
+    }
+
+    /*
+     * Keep the first high-half value print completely local. Each byte polls
+     * only the high PL011 alias, has a fixed bound, and is written directly to
+     * the data register. No slice walk, iterator, formatter, conversion helper,
+     * or out-of-line success-path call is involved.
+     */
+    const HH_PC_HEX_TX_POLL_LIMIT: usize = 0x1_0000;
+    let hh_pc_hex_data = RPI5_HH_UART_VIRT as *mut u32;
+    let hh_pc_hex_flags = (RPI5_HH_UART_VIRT + 0x18) as *const u32;
+    macro_rules! rpi5_hh_pc_hex_write_byte {
+        ($byte:expr, $reason:literal) => {{
+            let mut poll = 0usize;
+            while poll < HH_PC_HEX_TX_POLL_LIMIT {
+                if unsafe { core::ptr::read_volatile(hh_pc_hex_flags) } & (1 << 5) == 0 {
+                    break;
+                }
+                poll += 1;
+            }
+            if poll == HH_PC_HEX_TX_POLL_LIMIT {
+                rpi5_hh_hex_fail($reason);
+            }
+            unsafe {
+                core::ptr::write_volatile(hh_pc_hex_data, $byte as u32);
+            }
+        }};
+    }
+
+    let mut marker_index = 0usize;
+    let hex_begin = core::ptr::addr_of!(RPI5_HH_HEX_BEGIN_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_HEX_BEGIN_MARKER.len() {
+        let byte = unsafe { core::ptr::read(hex_begin.add(marker_index)) };
+        rpi5_hh_pc_hex_write_byte!(byte, b"hex_begin_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_pc_hex_write_byte!(b'\r', b"hex_begin_cr_uart_timeout");
+    rpi5_hh_pc_hex_write_byte!(b'\n', b"hex_begin_lf_uart_timeout");
+
+    marker_index = 0;
+    let digit_begin = core::ptr::addr_of!(RPI5_HH_HEX_DIGIT_BEGIN_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_HEX_DIGIT_BEGIN_MARKER.len() {
+        let byte = unsafe { core::ptr::read(digit_begin.add(marker_index)) };
+        rpi5_hh_pc_hex_write_byte!(byte, b"digit_begin_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_pc_hex_write_byte!(b'\r', b"digit_begin_cr_uart_timeout");
+    rpi5_hh_pc_hex_write_byte!(b'\n', b"digit_begin_lf_uart_timeout");
+
+    let mut prefix_index = 0usize;
+    let pc_prefix = core::ptr::addr_of!(RPI5_HH_READ_PC_DONE_MARKER).cast::<u8>();
+    while prefix_index < RPI5_HH_READ_PC_DONE_MARKER.len() {
+        let byte = unsafe { core::ptr::read(pc_prefix.add(prefix_index)) };
+        rpi5_hh_pc_hex_write_byte!(byte, b"pc_prefix_uart_timeout");
+        prefix_index += 1;
+    }
+
+    let mut nibble_index = 0usize;
+    while nibble_index < 16 {
+        let shift = 60 - nibble_index * 4;
+        let nibble = ((pc >> shift) & 0xf) as u8;
+        let digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+        rpi5_hh_pc_hex_write_byte!(digit, b"hex_digit_uart_timeout");
+        nibble_index += 1;
+    }
+    rpi5_hh_pc_hex_write_byte!(b'\r', b"pc_value_cr_uart_timeout");
+    rpi5_hh_pc_hex_write_byte!(b'\n', b"pc_value_lf_uart_timeout");
+
+    marker_index = 0;
+    let digit_done = core::ptr::addr_of!(RPI5_HH_HEX_DIGIT_DONE_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_HEX_DIGIT_DONE_MARKER.len() {
+        let byte = unsafe { core::ptr::read(digit_done.add(marker_index)) };
+        rpi5_hh_pc_hex_write_byte!(byte, b"digit_done_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_pc_hex_write_byte!(b'\r', b"digit_done_cr_uart_timeout");
+    rpi5_hh_pc_hex_write_byte!(b'\n', b"digit_done_lf_uart_timeout");
+
+    marker_index = 0;
+    let hex_done = core::ptr::addr_of!(RPI5_HH_HEX_DONE_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_HEX_DONE_MARKER.len() {
+        let byte = unsafe { core::ptr::read(hex_done.add(marker_index)) };
+        rpi5_hh_pc_hex_write_byte!(byte, b"hex_done_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_pc_hex_write_byte!(b'\r', b"hex_done_cr_uart_timeout");
+    rpi5_hh_pc_hex_write_byte!(b'\n', b"hex_done_lf_uart_timeout");
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_SP_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     let sp: u64;
+    unsafe {
+        core::arch::asm!("mov {sp}, sp", sp = out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    if !rpi5_hh_write_hex_line(&RPI5_HH_READ_SP_DONE_MARKER, sp) {
+        rpi5_hh_fail(b"read_sp_done_uart_timeout");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_VBAR_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     let vbar: u64;
+    unsafe {
+        core::arch::asm!("mrs {vbar}, VBAR_EL1", vbar = out(reg) vbar, options(nomem, nostack, preserves_flags));
+    }
+    if !rpi5_hh_write_hex_line(&RPI5_HH_READ_VBAR_DONE_MARKER, vbar) {
+        rpi5_hh_fail(b"read_vbar_done_uart_timeout");
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH_READ_TTBR_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     let ttbr0: u64;
     let ttbr1: u64;
     let tcr: u64;
     unsafe {
-        core::arch::asm!(
-            "adr {pc}, .",
-            "mov {sp}, sp",
-            "mrs {vbar}, VBAR_EL1",
-            "mrs {ttbr0}, TTBR0_EL1",
-            "mrs {ttbr1}, TTBR1_EL1",
-            "mrs {tcr}, TCR_EL1",
-            pc = out(reg) pc,
-            sp = out(reg) sp,
-            vbar = out(reg) vbar,
-            ttbr0 = out(reg) ttbr0,
-            ttbr1 = out(reg) ttbr1,
-            tcr = out(reg) tcr,
-            options(nomem, nostack, preserves_flags)
-        );
+        core::arch::asm!("mrs {ttbr0}, TTBR0_EL1", ttbr0 = out(reg) ttbr0, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {ttbr1}, TTBR1_EL1", ttbr1 = out(reg) ttbr1, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("mrs {tcr}, TCR_EL1", tcr = out(reg) tcr, options(nomem, nostack, preserves_flags));
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_READ_TTBR_DONE_MARKER) {
+        rpi5_hh_fail(b"read_ttbr_done_uart_timeout");
     }
 
-    if !rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER) {
-        loop {
-            unsafe {
-                core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
-            }
-        }
+    if !rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_BEGIN_MARKER) {
+        rpi5_hh_halt();
     }
     if !rpi5_hh_write_hex_line(b"RPI5_HH_PC value=0x", pc)
         || !rpi5_hh_write_hex_line(b"RPI5_HH_SP value=0x", sp)
@@ -1172,6 +1492,9 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
         || !rpi5_hh_write_hex_line(b"RPI5_HH_TCR value=0x", tcr)
     {
         rpi5_hh_fail(b"uart_timeout");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_DONE_MARKER) {
+        rpi5_hh_fail(b"print_regs_done_uart_timeout");
     }
 
     let expected_ttbr0 = core::ptr::addr_of!(__hh_ttbr0_root) as u64;
@@ -1202,7 +1525,8 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
         rpi5_hh_fail(b"tcr_value_mismatch");
     }
 
-    if !rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)
+    if !rpi5_hh_write_line(&RPI5_HH3_PRECHECK_DONE_MARKER)
+        || !rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)
         || !rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)
         || !rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)
     {
