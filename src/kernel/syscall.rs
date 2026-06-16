@@ -8725,14 +8725,28 @@ mod tests {
             "handle_vm_brk must not call unmap_page_phase1 directly anymore"
         );
         // The shootdown-before-reclaim ordering inside the helper is the
-        // structural invariant the D3 unlock rests on.
+        // structural invariant the D3 unlock rests on. Stage 112 (D-NEXT-1
+        // PR-B) split the old single execute_tlb_shootdown_wait_plan(plan)
+        // per-page call into three named, rank-ordered phase functions; pin
+        // the new call sequence instead of the old inline call text.
         let helper_body = mem_src
             .split("fn vm_brk_shrink_two_phase")
             .nth(1)
             .expect("helper present");
+        let phase_a_pos = helper_body
+            .find("self.brk_shrink_phase_a_vm(")
+            .expect("orchestrator must call brk_shrink_phase_a_vm (Phase A, vm rank 5)");
+        let phase_b_pos = helper_body
+            .find("self.brk_shrink_phase_b_tlb_wait(")
+            .expect(
+                "orchestrator must call brk_shrink_phase_b_tlb_wait (Phase B, no vm/memory lock)",
+            );
+        let phase_c_pos = helper_body
+            .find("self.brk_shrink_phase_c_reclaim(")
+            .expect("orchestrator must call brk_shrink_phase_c_reclaim (Phase C, memory rank 6)");
         assert!(
-            helper_body.contains("self.execute_tlb_shootdown_wait_plan(plan)?;"),
-            "shrink helper must invoke execute_tlb_shootdown_wait_plan (Phase 2+3)"
+            phase_a_pos < phase_b_pos && phase_b_pos < phase_c_pos,
+            "shrink helper must call phase A, then phase B (TLB wait), then phase C (reclaim) in that order"
         );
     }
 
