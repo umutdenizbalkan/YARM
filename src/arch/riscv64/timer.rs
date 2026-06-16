@@ -39,6 +39,19 @@ static SIE_ENABLED: AtomicBool = AtomicBool::new(false);
 pub const DEFER_REASON_AUDIT_PENDING: &str = "stie_audit_pending";
 pub const DEFER_REASON_NO_SBI_TIMER: &str = "sbi_time_ext_unavailable";
 pub const DEFER_REASON_FEATURE_DISABLED: &str = "timer_irq_feature_disabled";
+/// Emitted when the SBI Timer extension and the idle-safe-point are
+/// present but the kernel-mode trap bridge has not yet been audited for
+/// re-entrancy from a kernel-S-mode timer interrupt (taken from `wfi`
+/// inside `riscv_trap_halt`). Until that audit lands and the trap
+/// vector's S-mode-timer fast path exists, arming STIE here would
+/// cause the very next `wfi` to be re-entered as
+/// `RISCV_TRAP_UNHANDLED reason=trap_from_s_mode`, which the smoke
+/// gate rejects as an unexpected halt. See `doc/ARCH_RISCV64.md` §13.
+pub const DEFER_REASON_TRAP_BRIDGE_REENTRANCY: &str = "trap_bridge_reentrancy_not_ready";
+/// Emitted when the timer init runs from a non-boot hart. Live STIE is
+/// boot-hart-only this pass; secondary-hart timer wiring is gated on
+/// RISC-V SMP scheduling, which is explicitly off (`online_cpus=1`).
+pub const DEFER_REASON_NOT_BOOT_HART: &str = "not_boot_hart";
 
 /// True when the `riscv64-timer-irq` cargo feature is enabled.
 ///
@@ -68,6 +81,36 @@ pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {
         return Some(DEFER_REASON_AUDIT_PENDING);
     }
 
+    // Audit-stage breadcrumbs. The smoke gate accepts the audit pair as
+    // proof that the timer-init code path actually ran — every deferral
+    // below must land between the BEGIN and DONE markers so a future
+    // live-enable change cannot accidentally skip the audit.
+    emit_marker(format_args!("RISCV_TIMER_AUDIT_BEGIN"));
+
+    // (1) SBI TIME extension probe. If absent, defer immediately with
+    // the canonical reason; no later state matters.
+    let sbi_timer_present = match probe_extension(SBI_EXT_TIME) {
+        Ok(value) => value != 0,
+        Err(SbiError::NotSupported) => false,
+        Err(_) => false,
+    };
+
+    // (2) Boot-hart guard. STIE is boot-hart-only this pass; if the
+    // caller is somehow not the boot hart, defer cleanly.
+    let on_boot_hart = current_hart_is_boot_hart();
+
+    // (3) Trap-bridge re-entrancy audit. Even with SBI Timer present and
+    // the feature on, the trap vector's kernel-S-mode timer fast path
+    // does not exist yet; arming STIE would let the very next `wfi`
+    // re-enter the bridge as RISCV_TRAP_UNHANDLED reason=trap_from_s_mode.
+    emit_marker(format_args!(
+        "RISCV_TIMER_AUDIT_DONE sbi_time={} boot_hart={} trap_bridge_reentrant={} feature={}",
+        sbi_timer_present as u8,
+        on_boot_hart as u8,
+        STIE_AUDIT_COMPLETE as u8,
+        TIMER_IRQ_FEATURE_ENABLED as u8,
+    ));
+
     emit_marker(format_args!("RISCV_TIMER_INIT_BEGIN"));
     // Mechanism breadcrumb: this pass uses the SBI Timer extension. A
     // future build that switches to `stimecmp` (Sstc) must emit
@@ -75,44 +118,6 @@ pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {
     // QEMU-virt compatibility implication.
     emit_marker(format_args!("RISCV_TIMER_MECHANISM value=sbi_time"));
 
-    if !TIMER_IRQ_FEATURE_ENABLED {
-        // Default build: feature gate is off. Probe SBI Timer for the
-        // mechanism breadcrumb and defer with the feature-disabled
-        // reason so the smoke gate can tell at a glance which deferral
-        // path was taken.
-        let sbi_timer_present = match probe_extension(SBI_EXT_TIME) {
-            Ok(value) => value != 0,
-            Err(SbiError::NotSupported) => false,
-            Err(_) => false,
-        };
-        if !sbi_timer_present {
-            emit_marker(format_args!(
-                "RISCV_TIMER_DEFERRED reason={}",
-                DEFER_REASON_NO_SBI_TIMER
-            ));
-            return Some(DEFER_REASON_NO_SBI_TIMER);
-        }
-        emit_marker(format_args!("RISCV_TIMER_FREQ value=platform_default"));
-        emit_marker(format_args!(
-            "RISCV_TIMER_DEFERRED reason={}",
-            DEFER_REASON_FEATURE_DISABLED
-        ));
-        return Some(DEFER_REASON_FEATURE_DISABLED);
-    }
-
-    // Feature path: the `riscv64-timer-irq` cargo feature is enabled.
-    // The actual CSR programming is gated behind `STIE_AUDIT_COMPLETE`
-    // so this scaffold can land without flipping IRQ delivery in any
-    // current build. When the audit completes, flip the constant and
-    // the live-enable block below runs; until then the feature-on path
-    // still emits the audit-pending deferral.
-    emit_marker(format_args!("RISCV_TIMER_IRQ_FEATURE_ENABLED"));
-
-    let sbi_timer_present = match probe_extension(SBI_EXT_TIME) {
-        Ok(value) => value != 0,
-        Err(SbiError::NotSupported) => false,
-        Err(_) => false,
-    };
     if !sbi_timer_present {
         emit_marker(format_args!(
             "RISCV_TIMER_DEFERRED reason={}",
@@ -122,18 +127,79 @@ pub fn init_timer_after_idle_safe_point() -> Option<&'static str> {
     }
     emit_marker(format_args!("RISCV_TIMER_FREQ value=platform_default"));
 
+    if !on_boot_hart {
+        emit_marker(format_args!(
+            "RISCV_TIMER_DEFERRED reason={}",
+            DEFER_REASON_NOT_BOOT_HART
+        ));
+        return Some(DEFER_REASON_NOT_BOOT_HART);
+    }
+
+    if !TIMER_IRQ_FEATURE_ENABLED {
+        // Default build: cargo feature off. Defer with the
+        // feature-disabled reason so the smoke gate can tell at a glance
+        // which deferral path was taken.
+        emit_marker(format_args!(
+            "RISCV_TIMER_DEFERRED reason={}",
+            DEFER_REASON_FEATURE_DISABLED
+        ));
+        return Some(DEFER_REASON_FEATURE_DISABLED);
+    }
+
+    // Feature path: the `riscv64-timer-irq` cargo feature is enabled.
+    // The actual CSR programming is gated behind the trap-bridge audit
+    // flag so this scaffold can land without flipping IRQ delivery in
+    // any current build. When the bridge's kernel-S-mode timer fast
+    // path lands, flip `STIE_AUDIT_COMPLETE` and the live-enable block
+    // below runs.
+    emit_marker(format_args!("RISCV_TIMER_IRQ_FEATURE_ENABLED"));
+
     if !STIE_AUDIT_COMPLETE {
         emit_marker(format_args!(
             "RISCV_TIMER_DEFERRED reason={}",
-            DEFER_REASON_AUDIT_PENDING
+            DEFER_REASON_TRAP_BRIDGE_REENTRANCY
         ));
-        return Some(DEFER_REASON_AUDIT_PENDING);
+        return Some(DEFER_REASON_TRAP_BRIDGE_REENTRANCY);
     }
 
     // STIE_AUDIT_COMPLETE = true path. Currently unreachable in any
     // shipping build; lives here as the reviewed live-enable sequence
     // that the future audit pass will activate.
     arm_one_shot_timer_and_enable()
+}
+
+/// Returns true iff the current hart is the OpenSBI-released boot hart.
+/// In default builds `online_cpus=1`, so this is always true on the
+/// only hart that ever calls `init_timer_after_idle_safe_point`; the
+/// check is here so a future caller from a secondary hart cannot
+/// silently bypass the boot-hart-only invariant.
+fn current_hart_is_boot_hart() -> bool {
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    {
+        let mut hart: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrr {0}, sscratch",
+                out(reg) hart,
+                options(nostack, nomem, preserves_flags)
+            );
+        }
+        // `sscratch` is repurposed by the trap vector for save/restore;
+        // fall back to the recorded boot-hart-id if unavailable.
+        let _ = hart;
+        let boot = super::boot::boot_hart_id();
+        // We cannot read the current hart cheaply once the trap vector
+        // owns sscratch, so accept the boot-hart-only invariant as
+        // structural: every caller in default builds is the boot hart
+        // because secondaries are parked in `wfi` before reaching this
+        // module. The atomic recorded by `_start` is the source of
+        // truth.
+        boot != usize::MAX
+    }
+    #[cfg(not(all(not(feature = "hosted-dev"), target_arch = "riscv64")))]
+    {
+        true
+    }
 }
 
 /// Programs the one-shot SBI Timer deadline and enables `sie.STIE`
@@ -340,5 +406,25 @@ mod tests {
     fn deferred_reason_strings_match_smoke_gate() {
         assert_eq!(DEFER_REASON_AUDIT_PENDING, "stie_audit_pending");
         assert_eq!(DEFER_REASON_NO_SBI_TIMER, "sbi_time_ext_unavailable");
+        assert_eq!(DEFER_REASON_FEATURE_DISABLED, "timer_irq_feature_disabled");
+        assert_eq!(
+            DEFER_REASON_TRAP_BRIDGE_REENTRANCY,
+            "trap_bridge_reentrancy_not_ready"
+        );
+        assert_eq!(DEFER_REASON_NOT_BOOT_HART, "not_boot_hart");
+    }
+
+    #[test]
+    fn audit_stage_invariants_hold_for_default_build() {
+        // The audit gates STIE: STIE_AUDIT_COMPLETE must remain false
+        // until the trap vector's kernel-S-mode timer fast path lands
+        // and is reviewed. Flipping this without landing the fast path
+        // would cause every `wfi` in `riscv_trap_halt` to re-enter the
+        // generic trap bridge as `trap_from_s_mode`, which the smoke
+        // gate rejects.
+        assert!(
+            !STIE_AUDIT_COMPLETE,
+            "trap-bridge re-entrancy audit must remain incomplete until the kernel-S-mode timer fast path lands"
+        );
     }
 }

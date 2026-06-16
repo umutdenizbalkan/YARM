@@ -57,6 +57,7 @@ MUST_SMOKE policy):
 | `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PASS | all 6 service entries exactly once; boot markers detected |
 | `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PASS | wrong-sender count=0 |
 | `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PASS | wrong-sender count=0 |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` | PASS | RISC-V64 stabilization pass 2 (`doc/ARCH_RISCV64.md` §13.5 declares **Ready: yes**); core smoke is the per-arch gate for `--smp 1/2/3/4`, treated the same way as the x86_64 / AArch64 core smokes |
 | Forbidden markers across all logs | 0 | `INIT_SPAWN_V5_WRONG_SENDER_REPLY`, `KSPAWN_EXTRA_CAP_DELEGATE_FAIL`, `D2_PUBLISH_RACE_UNWIND`, `YARM_D5_SPLIT_RECORD_ROLLBACK` all zero |
 | Workspace tests | 1337/0 lib, 572/0 fs, 130/0 control-plane | `--test-threads=1` |
 

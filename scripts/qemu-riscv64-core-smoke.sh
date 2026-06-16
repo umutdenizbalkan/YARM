@@ -97,6 +97,9 @@ REQUIRED_PATTERNS=(
   "EXT4_SRV_READY"
   "VFS_MOUNT_REGISTER_EXT4_OK"
   "RISCV_KERNEL_IDLE_WAITING_FOR_IO reason=no_runnable_task all_services_blocked"
+  "RISCV_TIMER_AUDIT_BEGIN"
+  "RISCV_TIMER_AUDIT_DONE sbi_time="
+  "RISCV_TIMER_INIT_BEGIN"
   "RISCV_TIMER_MECHANISM value="
   "RISCV_PLIC_BASE value="
   "RISCV_PLIC_CONTEXT value="
@@ -113,6 +116,19 @@ OPTIONAL_FS_PATTERNS=()
 TIMER_ACCEPT_REGEX='RISCV_TIMER_SMOKE_OK ticks=|RISCV_TIMER_DEFERRED reason='
 PLIC_ACCEPT_REGEX='RISCV_PLIC_INIT_DONE|RISCV_PLIC_DEFERRED reason='
 EXTIRQ_ACCEPT_REGEX='RISCV_EXTIRQ_SMOKE_OK source=|RISCV_EXTIRQ_DEFERRED reason='
+
+# Canonical timer-deferred reasons. The smoke gate accepts only these
+# values when timer is on the deferred branch; an unknown reason means
+# the kernel emitted a marker the gate doesn't yet understand and the
+# operator must update both sides explicitly.
+TIMER_DEFERRED_REASONS=(
+  "timer_irq_feature_disabled"
+  "trap_bridge_reentrancy_not_ready"
+  "sbi_time_ext_unavailable"
+  "stie_audit_pending"
+  "not_boot_hart"
+  "unsafe_under_current_satp"
+)
 
 # Patterns that must NOT appear in a healthy boot.
 REJECT_PATTERNS=(
@@ -149,6 +165,24 @@ done
 if ! rg -n "$TIMER_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
   echo "[fail] neither RISCV_TIMER_SMOKE_OK nor RISCV_TIMER_DEFERRED present"
   failures=$((failures + 1))
+fi
+
+# If timer is on the deferred branch, the reason must be one the gate
+# recognizes; an unknown deferred reason means kernel + gate are
+# out-of-sync. (Live ticks don't go through this branch.)
+if rg -n "RISCV_TIMER_DEFERRED reason=" "$LOGFILE" >/dev/null 2>&1; then
+  timer_reason=$(rg -aN "RISCV_TIMER_DEFERRED reason=[A-Za-z0-9_]+" "$LOGFILE" 2>/dev/null \
+    | head -n1 | sed -E 's/.*reason=([A-Za-z0-9_]+).*/\1/')
+  if [[ -n "$timer_reason" ]]; then
+    canonical=0
+    for reason in "${TIMER_DEFERRED_REASONS[@]}"; do
+      [[ "$timer_reason" == "$reason" ]] && canonical=1 && break
+    done
+    if (( canonical == 0 )); then
+      echo "[fail] RISCV_TIMER_DEFERRED reason=${timer_reason} is not canonical"
+      failures=$((failures + 1))
+    fi
+  fi
 fi
 
 if ! rg -n "$PLIC_ACCEPT_REGEX" "$LOGFILE" >/dev/null 2>&1; then
