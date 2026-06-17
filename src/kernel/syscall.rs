@@ -715,7 +715,11 @@ fn materialize_received_message_cap_routed(
     materialize_received_message_cap(kernel, endpoint, receiver_tid, sender_tid, msg)
 }
 
-fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
+/// D-NEXT-2 / Stage 114: made `pub(crate)` so the pre-`with_cpu` VmBrk-shrink
+/// split path (`SharedKernel::try_split_vm_brk_shrink_into_frame`) can reuse
+/// the identical bounds check the global-lock handler uses — no duplicated
+/// validation logic, no behavior drift between the two paths.
+pub(crate) fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallError> {
     let user_end_exclusive = crate::arch::vm_layout::KERNEL_SPACE_BASE;
     if offset >= user_end_exclusive {
         return Err(SyscallError::InvalidArgs);
@@ -838,7 +842,9 @@ fn vm_map_page_flags(prot: usize) -> Result<PageFlags, SyscallError> {
     })
 }
 
-fn round_up_page(value: usize) -> Result<usize, SyscallError> {
+/// D-NEXT-2 / Stage 114: made `pub(crate)` for the same reason as
+/// `validate_user_region` above — reused verbatim by the split VmBrk-shrink path.
+pub(crate) fn round_up_page(value: usize) -> Result<usize, SyscallError> {
     if value.is_multiple_of(PAGE_SIZE) {
         Ok(value)
     } else {

@@ -81,6 +81,21 @@ impl KernelState {
         });
     }
 
+    /// Stage 114 / D-NEXT-2: byte-identical sibling of [`Self::note_mapping_removed`]
+    /// taking `&mut MemorySubsystem` directly for use inside
+    /// `SharedKernel::with_memory_split_mut`'s closure. `note_mapping_removed`
+    /// is left unmodified.
+    pub(crate) fn note_mapping_removed_locked(memory: &mut MemorySubsystem, phys: PhysAddr) {
+        if let Some(slot) = memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
+            && let Some(memory_object) = memory.memory_objects[slot].as_mut()
+        {
+            memory_object.map_refcount = memory_object.map_refcount.saturating_sub(1);
+        }
+    }
+
     pub(crate) fn reclaim_memory_object_if_unreferenced(&mut self, object: CapObject) {
         let id = match object {
             CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
@@ -117,6 +132,40 @@ impl KernelState {
         if let Some(id) = maybe_id {
             self.reclaim_memory_object_if_unreferenced(CapObject::MemoryObject { id });
         }
+    }
+
+    /// Stage 114 / D-NEXT-2: sibling of [`Self::reclaim_memory_object_for_phys`]
+    /// taking `&mut MemorySubsystem` directly for use inside
+    /// `SharedKernel::with_memory_split_mut`'s closure. The global-lock version
+    /// composes find-by-phys → id → `reclaim_memory_object_if_unreferenced`
+    /// (find-by-id → slot) as three separate `with_memory_state(_mut)` cycles;
+    /// since this helper already holds the one memory-domain lock acquisition
+    /// the seam took, it fuses straight to a single find-by-phys → mutate pass.
+    /// Same refcount/free-frame semantics, strictly fewer redundant scans — not
+    /// a behavior change. `reclaim_memory_object_for_phys` itself is left
+    /// unmodified.
+    pub(crate) fn reclaim_memory_object_for_phys_locked(
+        memory: &mut MemorySubsystem,
+        phys: PhysAddr,
+    ) {
+        let Some(slot_index) = memory
+            .memory_objects
+            .iter()
+            .position(|entry| entry.is_some_and(|mem| mem.phys == phys))
+        else {
+            return;
+        };
+        let Some(memory_object) = memory.memory_objects[slot_index] else {
+            return;
+        };
+        if memory_object.cap_refcount != 0
+            || memory_object.map_refcount != 0
+            || memory_object.pin_refcount != 0
+        {
+            return;
+        }
+        let _ = kernel_mut(&mut memory.frame_allocator).free_frame(memory_object.phys.0);
+        memory.memory_objects[slot_index] = None;
     }
 
     /// Return `(cap_refcount, map_refcount, pin_refcount)` for the MemoryObject

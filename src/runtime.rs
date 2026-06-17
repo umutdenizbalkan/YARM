@@ -2,19 +2,20 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use crate::kernel::boot::{
-    BootConfigSubsystem, ControlPlaneCnodePlan, FaultSubsystem, KernelCapacityProfile, KernelError,
-    KernelState, KernelStorage, RuntimeCapacityConfig, SchedulerState, TelemetrySubsystem,
-    TrapHandleError, kernel_mut, kernel_ref,
+    ControlPlaneCnodePlan, FaultSubsystem, KernelCapacityProfile, KernelError, KernelState,
+    KernelStorage, RuntimeCapacityConfig, SchedulerState, TelemetrySubsystem, TrapHandleError,
+    kernel_mut, kernel_ref,
 };
 use crate::kernel::capabilities::{CapId, CapObject, CapRights};
 use crate::kernel::ipc::Message;
+use crate::kernel::lock::SpinLock;
 #[cfg(test)]
 use crate::kernel::lock::SpinLockGuard;
-use crate::kernel::lock::{SpinLock, SpinLockIrq};
 use crate::kernel::scheduler::CpuId;
 use crate::kernel::task::{FaultPolicy, TaskClass};
 use crate::kernel::trap::{FaultInfo, Trap};
 use crate::kernel::trapframe::TrapFrame;
+use crate::kernel::vm::{PAGE_SIZE, VirtAddr, VmError};
 #[cfg(any(debug_assertions, test))]
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -229,20 +230,21 @@ impl IpcRecvQueuedPlainWritebackPlan {
 #[derive(Debug)]
 pub struct SharedKernel {
     state: SpinLock<KernelState>,
-    scheduler_state: *const SpinLockIrq<SchedulerState>,
-    boot_config_state_lock: *const SpinLockIrq<()>,
-    boot_config: *const KernelStorage<BootConfigSubsystem>,
 }
 
 impl SharedKernel {
+    /// Stage 114 fix: this used to also cache `scheduler_state` /
+    /// `boot_config_state_lock` / `boot_config` raw pointers computed from
+    /// the `state` parameter's address *before* `SpinLock::new(state)` moved
+    /// it into `Self`. Rust gives no guarantee that move is elided, so those
+    /// pointers could go stale (reproduced as a SIGSEGV reading through a
+    /// dangling `scheduler_state` in the Stage 114 D3 live-seam tests). The
+    /// split-read helpers below now derive the same pointers fresh from
+    /// `self.state.data_ptr()` at each call, the same pattern the Stage 108
+    /// `with_*_split_mut` seams already use — no caching, no staleness.
     pub fn new(state: KernelState) -> Self {
-        let scheduler_state = state.scheduler_state_lock_ptr();
-        let (boot_config_state_lock, boot_config) = state.boot_config_split_read_ptrs();
         Self {
             state: SpinLock::new(state),
-            scheduler_state,
-            boot_config_state_lock,
-            boot_config,
         }
     }
 
@@ -272,10 +274,12 @@ impl SharedKernel {
     pub fn scheduler_tick_now_split_read(&self) -> u64 {
         // Stage 2B split: read scheduler tick directly under scheduler lock.
         crate::yarm_log!("YARM_LOCK_SPLIT_STAGE2B path=scheduler_tick_now_split_read");
-        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
-        // same `KernelState` owned by `self.state`; the storage is stable for
-        // the `SharedKernel` lifetime.
-        let scheduler_state = unsafe { &*self.scheduler_state };
+        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
+        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
+        let scheduler_state =
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+        let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         sched.timer.current_ticks().0
     }
@@ -306,10 +310,12 @@ impl SharedKernel {
         // Phase L5A split: read the scheduler's per-CPU current TID directly
         // under the scheduler lock.  This intentionally avoids the global
         // SharedKernel lock and does not mutate current_cpu or task state.
-        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
-        // same `KernelState` owned by `self.state`; the storage is stable for
-        // the `SharedKernel` lifetime.
-        let scheduler_state = unsafe { &*self.scheduler_state };
+        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
+        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
+        let scheduler_state =
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+        let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         kernel_ref(&sched.scheduler)
             .current_tid_on(cpu)
@@ -321,10 +327,12 @@ impl SharedKernel {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
         // SharedKernel lock, mutate runqueues, or update current_cpu.
-        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
-        // same `KernelState` owned by `self.state`; the storage is stable for
-        // the `SharedKernel` lifetime.
-        let scheduler_state = unsafe { &*self.scheduler_state };
+        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
+        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
+        let scheduler_state =
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+        let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         kernel_ref(&sched.scheduler).online_cpu_count()
     }
@@ -334,10 +342,12 @@ impl SharedKernel {
         // Phase L7A split: read scheduler topology through scheduler_state only.
         // This is a read-only staged helper; it does not acquire the global
         // SharedKernel lock, mutate runqueues, or update current_cpu.
-        // SAFETY: `scheduler_state` points at the scheduler lock embedded in the
-        // same `KernelState` owned by `self.state`; the storage is stable for
-        // the `SharedKernel` lifetime.
-        let scheduler_state = unsafe { &*self.scheduler_state };
+        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
+        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
+        let scheduler_state =
+            unsafe { KernelState::scheduler_split_mut_ptr_from_raw(self.state.data_ptr()) };
+        let scheduler_state = unsafe { &*scheduler_state };
         let sched = scheduler_state.lock();
         kernel_ref(&sched.scheduler).present_cpu_count()
     }
@@ -347,12 +357,14 @@ impl SharedKernel {
         // Phase L8B split: read immutable boot configuration under only the
         // boot_config lock domain. This intentionally avoids the global
         // SharedKernel lock and does not mutate boot config or runtime state.
-        // SAFETY: these pointers refer to the boot_config lock and storage
-        // embedded in the same `KernelState` owned by `self.state`; that storage
-        // is stable for the `SharedKernel` lifetime.
-        let boot_config_state_lock = unsafe { &*self.boot_config_state_lock };
+        // SAFETY: `self.state.data_ptr()` is the live address of the
+        // `KernelState` owned by this `SharedKernel`; recomputed fresh on
+        // every call (Stage 114 fix — see `SharedKernel::new`'s doc comment).
+        let (boot_config_state_lock, boot_config) =
+            unsafe { KernelState::boot_config_split_read_ptrs_from_raw(self.state.data_ptr()) };
+        let boot_config_state_lock = unsafe { &*boot_config_state_lock };
         let _guard = boot_config_state_lock.lock();
-        let boot_config = unsafe { &*self.boot_config };
+        let boot_config = unsafe { &*boot_config };
         kernel_ref(boot_config).capacity_profile
     }
 
@@ -430,17 +442,25 @@ impl SharedKernel {
 
     // ── Stage 108 / Milestone 2 Pass 1: per-domain split-mut seams ────────────
     //
-    // VALIDATION: M2_SEAM_HELPER_ONLY
+    // VALIDATION: M2_SEAM_HELPER_ONLY (with_scheduler_split_mut ONLY — see below)
+    // VALIDATION: M2_SEAM_LIVE_D3_BRK_SHRINK (with_task_tcbs_split_mut /
+    //   with_vm_user_spaces_split_mut / with_memory_split_mut)
     // VALIDATION: FALLBACK_GLOBAL_LOCK
     //
     // The four seams the D3/D6 live unlocks need: scheduler (rank 1),
     // task/TCB (rank 2), VM/user-spaces (rank 5), memory/frames (rank 6).
     // Each acquires ONLY its own per-domain lock — never the outer
-    // SharedKernel lock — exactly like the fault/telemetry seams above. No
-    // live trap/syscall path calls these yet (test-enforced); the Stage
-    // 106/107 typed helpers (`publish_recv_waiter_live`,
-    // `vm_brk_shrink_two_phase`, `local_dispatch_step_split`) are the call
-    // sites a future pass will route through these seams.
+    // SharedKernel lock.
+    //
+    // Stage 114 / D-NEXT-2 update: `with_task_tcbs_split_mut`,
+    // `with_vm_user_spaces_split_mut`, and `with_memory_split_mut` are no
+    // longer helper-only — `try_split_vm_brk_shrink_into_frame` below calls
+    // all three from the live pre-`with_cpu` trap path (via
+    // `syscall_split::try_split_dispatch_into_frame`'s NR 14 case) for the
+    // single-CPU-online-gated VmBrk shrink. `with_scheduler_split_mut` has NO
+    // live caller — D6 (`local_dispatch_step_split`) remains deferred (see
+    // its doc comment in `scheduler_state.rs`) — so its `M2_SEAM_HELPER_ONLY`
+    // / dead-code fence is unchanged.
     //
     // Lock-held assertion note: the wrapper itself acquires the domain lock
     // and holds the guard across the closure, so a separate debug
@@ -451,6 +471,11 @@ impl SharedKernel {
     // and by the per-seam doc comments.
 
     /// Stage 108: scheduler (rank 1) split-mut seam.
+    ///
+    /// # Validation status
+    /// - M2_SEAM_HELPER_ONLY — still no live caller as of Stage 114. D6
+    ///   (`local_dispatch_step_split`) remains deferred; see
+    ///   `stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_scheduler_split_mut<R>(
         &self,
@@ -468,7 +493,12 @@ impl SharedKernel {
     }
 
     /// Stage 108: task/TCB (rank 2) split-mut seam.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// # Validation status
+    /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — called by
+    ///   `try_split_vm_brk_shrink_into_frame` three times: the group-leader
+    ///   check, the ASID lookup ahead of the per-page unmap loop, and the
+    ///   task-existence re-check ahead of the final brk-bounds write.
     pub(crate) fn with_task_tcbs_split_mut<R>(
         &self,
         f: impl FnOnce(&mut [Option<crate::kernel::task::ThreadControlBlock>]) -> R,
@@ -484,7 +514,10 @@ impl SharedKernel {
     }
 
     /// Stage 108: VM/user-spaces (rank 5) split-mut seam.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// # Validation status
+    /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — called by
+    ///   `try_split_vm_brk_shrink_into_frame` once per unmapped page.
     pub(crate) fn with_vm_user_spaces_split_mut<R>(
         &self,
         f: impl FnOnce(&mut crate::kernel::vm::AddressSpaceManager) -> R,
@@ -499,7 +532,12 @@ impl SharedKernel {
     }
 
     /// Stage 108: memory/frame-allocator (rank 6) split-mut seam.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///
+    /// # Validation status
+    /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — called by
+    ///   `try_split_vm_brk_shrink_into_frame` once for the initial brk-bounds
+    ///   read, once per unmapped page (COW clear + mapping-removed bookkeeping
+    ///   + frame reclaim), and once more for the final brk-bounds write.
     pub(crate) fn with_memory_split_mut<R>(
         &self,
         f: impl FnOnce(&mut crate::kernel::boot::MemorySubsystem) -> R,
@@ -575,6 +613,23 @@ impl SharedKernel {
         // Stage 4T+5 split-read: reads tlb_shootdown_timeout_count under telemetry_state_lock (rank 10).
         // Does not acquire the outer SharedKernel lock.
         self.with_telemetry_split_read(|telemetry| telemetry.tlb_shootdown_timeout_count)
+    }
+
+    /// Stage 114: reads the D3 live-split-path call counter incremented by
+    /// `try_split_vm_brk_shrink_into_frame`, under telemetry_state_lock (rank
+    /// 10) only. Does not acquire the outer SharedKernel lock.
+    pub fn d3_vm_brk_shrink_split_live_calls_split_read(&self) -> u64 {
+        self.with_telemetry_split_read(|telemetry| telemetry.d3_vm_brk_shrink_split_live_calls)
+    }
+
+    /// Stage 114: reads the D3 live-split-path pages-unmapped counter
+    /// incremented by `try_split_vm_brk_shrink_into_frame`, under
+    /// telemetry_state_lock (rank 10) only. Does not acquire the outer
+    /// SharedKernel lock.
+    pub fn d3_vm_brk_shrink_split_live_pages_unmapped_split_read(&self) -> u64 {
+        self.with_telemetry_split_read(|telemetry| {
+            telemetry.d3_vm_brk_shrink_split_live_pages_unmapped
+        })
     }
 
     /// # Validation status
@@ -670,6 +725,210 @@ impl SharedKernel {
             );
         }
         result
+    }
+
+    /// # Validation status
+    /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — wired into the live
+    ///   pre-`with_cpu` trap path via `syscall_split::try_split_dispatch_into_frame`'s
+    ///   `VmBrk` (NR 14) special case. Services ONLY the genuine page-crossing
+    ///   shrink case (the case `vm_brk_shrink_two_phase` exists for) when at most
+    ///   one CPU is online. Every other `VmBrk` shape — the query
+    ///   (`requested == 0`), growth, a shrink that does not cross a page
+    ///   boundary, a non-group-leader caller, a validation failure, or more than
+    ///   one CPU online — returns `None` before any mutation, so the unchanged
+    ///   global-lock `handle_vm_brk` services it identically to before this
+    ///   stage.
+    ///
+    /// Stage 114 / D-NEXT-2: this is the first call boundary genuinely
+    /// relocated ahead of `SharedKernel::with_cpu` for D3. Every domain
+    /// mutation below runs through a Stage 108 split-mut seam
+    /// (`with_task_tcbs_split_mut` / `with_vm_user_spaces_split_mut` /
+    /// `with_memory_split_mut`); the only global-lock use is the brief
+    /// `current_tid_authoritative` read, exactly mirroring the established
+    /// `try_split_ipc_recv_queued_plain_into_frame` convention above.
+    ///
+    /// ## Single-CPU-online safety proof
+    ///
+    /// Gating on `online_cpu_count_split_read() <= 1` guarantees the ONLY
+    /// online CPU is the requester's own CPU. `compute_tlb_shootdown_request_plan`
+    /// / `live_cpu_bitmap_for_asid` strip the requester's own bit from the
+    /// returned bitmap, so with at most one CPU online that bitmap is always
+    /// `0` — no other CPU can be running the shrinking task's ASID. This split
+    /// path therefore never needs `request_live_asid_shootdown` (the only step
+    /// in the unmap cascade that needs the ipc(3) domain, for which no
+    /// split-mut seam exists) — it simply never calls it, rather than calling
+    /// it and observing an empty target set. Local TLB invalidation still
+    /// happens unconditionally: it is part of `AddressSpace::unmap_page`
+    /// itself, not gated on remote-CPU presence.
+    ///
+    /// Hard rule enforced by this function: it must NEVER call
+    /// `request_live_asid_shootdown` or acquire the ipc(3) or capability(4)
+    /// domain. If `online_cpu_count_split_read() > 1` it returns `None`
+    /// unconditionally before doing ANY mutation, so the global-lock
+    /// `vm_brk_shrink_two_phase` (which still correctly handles the
+    /// multi-CPU-online shootdown case) services the request instead.
+    ///
+    /// ## Lock order
+    ///
+    /// `[no lock]` → scheduler (rank 1, `online_cpu_count_split_read`) →
+    /// `[release]` → `current_tid_authoritative` (briefly takes+releases the
+    /// global lock) → `[no lock]` → task (rank 2, group-leader check) →
+    /// `[release]` → memory (rank 6, brk-bounds read) → `[release]` → per
+    /// unmapped page: vm (rank 5) → `[release]` → memory (rank 6, COW clear +
+    /// mapping-removed bookkeeping + frame reclaim) → `[release]` → task
+    /// (rank 2, pre-write existence re-check) → `[release]` → memory (rank 6,
+    /// final brk-bounds write) → `[release]`. No two domain locks are ever
+    /// held simultaneously; no ipc(3) or capability(4) lock is acquired at all
+    /// on this path.
+    pub fn try_split_vm_brk_shrink_into_frame(
+        &self,
+        cpu: CpuId,
+        frame: &mut TrapFrame,
+    ) -> Option<Result<(), TrapHandleError>> {
+        // Gate: at most one CPU online. Cheap, scheduler-rank-1 read only. See
+        // the safety proof above for why this makes the no-remote-shootdown
+        // invariant hold unconditionally for the rest of this function.
+        if self.online_cpu_count_split_read() > 1 {
+            return None;
+        }
+
+        // Authoritative requester-TID read (binds current_cpu, then
+        // releases). Mirrors the Stage 29A trap-seam discipline: never
+        // current_tid_split_read.
+        let tid = self.current_tid_authoritative(cpu)?;
+
+        // Group-leader check (task rank 2). Matches
+        // `kernel.is_thread_group_leader(tid)`'s exact semantics: an absent
+        // task also reads as "not leader" (`None != Some(_)`).
+        let is_group_leader = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.thread_group_id.0 == tid)
+                .unwrap_or(false)
+        });
+        if !is_group_leader {
+            // Defer to the global-lock path, which produces the canonical
+            // InvalidArgs encoding for a non-leader caller.
+            return None;
+        }
+
+        let requested = frame.arg(crate::kernel::syscall::SYSCALL_ARG_CAP);
+        if requested == 0 {
+            // Query path: no unmap, nothing this seam specializes. Defer.
+            return None;
+        }
+        if crate::kernel::syscall::validate_user_region(requested as u64, 1).is_err() {
+            return None;
+        }
+
+        let Some((base, current_end)) =
+            self.with_memory_split_mut(|memory| KernelState::task_brk_bounds_locked(memory, tid))
+        else {
+            return None;
+        };
+        if requested < base {
+            return None;
+        }
+        if requested >= current_end {
+            // Growth or a no-op request: no unmap needed. Defer to the
+            // global-lock path — keeps this seam scoped exactly to the
+            // shrink-with-unmap case it is named for.
+            return None;
+        }
+
+        let Ok(unmap_start) = crate::kernel::syscall::round_up_page(requested) else {
+            return None;
+        };
+        let Ok(unmap_end) = crate::kernel::syscall::round_up_page(current_end) else {
+            return None;
+        };
+        if unmap_start >= unmap_end {
+            // Shrink without a page-boundary crossing: no unmap needed either.
+            return None;
+        }
+
+        let Some(asid) = self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .and_then(|tcb| tcb.asid)
+        }) else {
+            return Some(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::from(KernelError::UserMemoryFault),
+            )));
+        };
+
+        let mut pages_unmapped: usize = 0;
+        let mut va = unmap_start;
+        while va < unmap_end {
+            let unmap_result = self.with_vm_user_spaces_split_mut(|spaces| {
+                spaces
+                    .get_mut(asid)
+                    .ok_or(VmError::InvalidAsid)?
+                    .unmap_page(VirtAddr(va as u64))
+            });
+            match unmap_result {
+                Ok(Some(mapping)) => {
+                    // Single-CPU-online gate above guarantees no remote CPU
+                    // can be running this ASID, so `request_live_asid_shootdown`
+                    // is never needed here — see the safety proof above.
+                    self.with_memory_split_mut(|memory| {
+                        KernelState::clear_cow_page_locked(memory, asid, VirtAddr(va as u64));
+                        KernelState::note_mapping_removed_locked(memory, mapping.phys);
+                        KernelState::reclaim_memory_object_for_phys_locked(memory, mapping.phys);
+                    });
+                    pages_unmapped += 1;
+                }
+                Ok(None) => {
+                    // Lazy / never-faulted page: nothing to unmap, same as
+                    // the global-lock path.
+                }
+                Err(e) => {
+                    return Some(Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::from(KernelError::Vm(e)),
+                    )));
+                }
+            }
+            va = va.saturating_add(PAGE_SIZE);
+        }
+
+        // Pre-write existence re-check (task rank 2), matching the contract
+        // documented on `KernelState::set_task_brk_bounds_locked`: the
+        // task-existence half of `set_task_brk_bounds` that a pre-`with_cpu`
+        // caller resolves via this seam instead of `with_tcbs`.
+        let task_still_present =
+            self.with_task_tcbs_split_mut(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == tid));
+        if !task_still_present {
+            return Some(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::from(KernelError::TaskMissing),
+            )));
+        }
+
+        let write_result = self.with_memory_split_mut(|memory| {
+            KernelState::set_task_brk_bounds_locked(memory, tid, base, requested)
+        });
+        if let Err(e) = write_result {
+            return Some(Err(TrapHandleError::Syscall(
+                crate::kernel::syscall::SyscallError::from(e),
+            )));
+        }
+
+        self.with_telemetry_split_mut(|telemetry| {
+            telemetry.d3_vm_brk_shrink_split_live_calls =
+                telemetry.d3_vm_brk_shrink_split_live_calls.wrapping_add(1);
+            telemetry.d3_vm_brk_shrink_split_live_pages_unmapped = telemetry
+                .d3_vm_brk_shrink_split_live_pages_unmapped
+                .wrapping_add(pages_unmapped as u64);
+        });
+        crate::yarm_log!(
+            "M2_SEAM_LIVE_D3_BRK_SHRINK pages_unmapped={} asid={}",
+            pages_unmapped,
+            asid.0
+        );
+
+        frame.set_ok(requested, 0, 0);
+        Some(Ok(()))
     }
 
     pub fn handle_trap_with_cpu(

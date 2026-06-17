@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, MemoryObject, MemoryObjectKind, kernel_mut};
+use super::{
+    KernelError, KernelState, MemoryObject, MemoryObjectKind, MemorySubsystem, kernel_mut,
+};
 use crate::kernel::capabilities::{CapId, CapObject, CapRights, Capability};
 use crate::kernel::frame_allocator::FrameAllocError;
 use crate::kernel::scheduler::CpuId;
@@ -70,6 +72,21 @@ impl KernelState {
                 }
             }
         });
+    }
+
+    /// Stage 114 / D-NEXT-2: byte-identical sibling of [`Self::clear_cow_page`]
+    /// that takes `&mut MemorySubsystem` directly instead of `&mut self`, so it
+    /// can be called from inside `SharedKernel::with_memory_split_mut`'s
+    /// closure (i.e. from a pre-`with_cpu` split path) without re-deriving the
+    /// memory lock. `clear_cow_page` itself is intentionally left unmodified —
+    /// this is a pure addition, not a refactor of tested code.
+    pub(crate) fn clear_cow_page_locked(memory: &mut MemorySubsystem, asid: Asid, virt: VirtAddr) {
+        if let Some(set) = memory.cow_pages.get_mut(&asid.0) {
+            set.remove(&virt.0);
+            if set.is_empty() {
+                memory.cow_pages.remove(&asid.0);
+            }
+        }
     }
 
     fn clear_cow_pages_for_asid(&mut self, asid: Asid) {
@@ -736,6 +753,22 @@ impl KernelState {
         })
     }
 
+    /// Stage 114 / D-NEXT-2: byte-identical sibling of [`Self::task_brk_bounds`]
+    /// taking `&mut MemorySubsystem` directly (read-only use) for invocation
+    /// inside `SharedKernel::with_memory_split_mut`'s closure. `task_brk_bounds`
+    /// itself is left unmodified.
+    pub(crate) fn task_brk_bounds_locked(
+        memory: &mut MemorySubsystem,
+        tid: u64,
+    ) -> Option<(usize, usize)> {
+        memory
+            .brk_regions
+            .iter()
+            .flatten()
+            .find(|entry| entry.tid.0 == tid)
+            .map(|entry| (entry.base.0 as usize, entry.end.0 as usize))
+    }
+
     pub fn set_task_brk_bounds(
         &mut self,
         tid: u64,
@@ -761,6 +794,35 @@ impl KernelState {
                 Err(KernelError::TaskTableFull)
             }
         })
+    }
+
+    /// Stage 114 / D-NEXT-2: the memory-domain half of [`Self::set_task_brk_bounds`]
+    /// (the task-existence check is the OTHER half — left to the caller, since a
+    /// pre-`with_cpu` caller resolves that via `SharedKernel::with_task_tcbs_split_mut`
+    /// instead of `with_tcbs`). Byte-identical slot-selection/write logic; `&mut
+    /// MemorySubsystem` instead of `&mut self` so it can run inside
+    /// `with_memory_split_mut`'s closure. `set_task_brk_bounds` itself is left
+    /// unmodified.
+    pub(crate) fn set_task_brk_bounds_locked(
+        memory: &mut MemorySubsystem,
+        tid: u64,
+        base: usize,
+        end: usize,
+    ) -> Result<(), KernelError> {
+        if let Some(slot) = memory
+            .brk_regions
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.tid.0 == tid) || slot.is_none())
+        {
+            *slot = Some(super::BrkRegionRecord {
+                tid: crate::kernel::ipc::ThreadId(tid),
+                base: VirtAddr(base as u64),
+                end: VirtAddr(end as u64),
+            });
+            Ok(())
+        } else {
+            Err(KernelError::TaskTableFull)
+        }
     }
 
     pub(crate) fn resolve_memory_object_phys(

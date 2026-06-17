@@ -33,13 +33,13 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 113 D6 phase split)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
 | **D1** transfer-cap recv (non-reply, non-shared-region) | **LIVE** | Stage 104 | router → `materialize_split_transfer_cap_equivalent`; telemetry `d1_split_materializations` |
 | **D2** endpoint blocking-recv waiter publish | **LIVE** (phase-split, Stage 111) | Stage 106 | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes`, `d2_publish_race_unwinds`; `Stage 108 with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path — see §1 Stage 111 |
-| **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 112) | Stage 107 | real per-domain `vm_state_lock`(5)/`memory_state_lock`(6) acquisition unchanged since Stage 107; now expressed as three named, batched phases (vm → no-lock TLB wait → memory); `Stage 108 with_vm_user_spaces_split_mut`/`with_memory_split_mut` not yet called from this path — see §1 Stage 112; rest of D3 deferred (see §6) |
+| **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs}.rs` | **PARTIAL** | Stage 102 | rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs`, `syscall/cap.rs`, `syscall/sched.rs`, `syscall/process.rs`, `syscall/recv_shared_v3.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
 | **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113) | Stage 107 | scheduler-seam first wire; per-CPU lock sharding deferred (§9); `Stage 108 with_scheduler_split_mut` not yet called from this path — see §1 Stage 113 |
@@ -523,6 +523,156 @@ relocation (which would let D2/D3/D6 all genuinely live-wire in one pass),
 explicitly deferred scheduler-online work, unrelated to the seam-call
 blocker). See §7.1.7 for the updated recommendation.
 
+### Stage 114 — D-NEXT-2 combined trap-dispatch call-boundary relocation: D3 live-wired (Outcome A, partial); D2/D6 deferred (Outcome B)
+
+**Goal stated in the task:** relocate the D2 blocking-recv entry point,
+the D3 VmBrk shrink entry point, and the D6 dispatch entry point so each
+runs *before* `SharedKernel::with_cpu` acquires the global lock; then call
+the respective Stage 108 split-mut seams for real, deleting their
+`M2_SEAM_HELPER_ONLY` fences for seams genuinely live-wired.
+
+**What actually landed — partial Outcome A for D3, Outcome B for D2/D6:**
+
+**D3 (page-crossing VmBrk shrink) — Outcome A, genuinely live-wired.** A
+new `SharedKernel::try_split_vm_brk_shrink_into_frame` helper was added to
+`src/runtime.rs`, mirroring the established `try_split_ipc_recv_queued_plain_into_frame`
+(Stage 32B) pattern. `src/kernel/syscall_split.rs::try_split_dispatch_into_frame`
+now intercepts `Syscall::VmBrk` (NR 14) before `with_cpu` is entered and
+routes it to this helper, which:
+
+1. Guards on `online_cpu_count_split_read() == 1` (single-CPU-online gate).
+   With only one CPU online the TLB shootdown primitive
+   (`request_live_asid_shootdown`) can be skipped entirely — the current
+   CPU's own ASID eviction from the stage 107 `vm_brk_shrink_two_phase`
+   flush is sufficient. Multi-CPU configurations defer to the global-lock
+   path unmodified.
+2. Reads the authoritative current TID via `current_tid_authoritative`
+   (global-lock `with_cpu` call, already established as safe in Stage 29A).
+3. Verifies the caller is a group leader, the request is a page-crossing
+   shrink (new brk below current base), and the ASID is resolvable — all
+   under their respective per-domain split-mut locks
+   (`with_task_tcbs_split_mut`, `with_vm_user_spaces_split_mut`).
+4. Walks the pages-to-unmap range, unmapping each mapped page via
+   `with_vm_user_spaces_split_mut` + `with_memory_split_mut` and
+   decrementing the `map_refcount` / reclaiming the MemoryObject if
+   unreferenced — using the `_locked` siblings
+   (`note_mapping_removed_locked`, `reclaim_memory_object_for_phys_locked`,
+   `clear_cow_page_locked`, `task_brk_bounds_locked`,
+   `set_task_brk_bounds_locked`) added in Stage 112 / memory_state.rs for
+   exactly this purpose.
+5. Rechecks that the task is still present and writes the new brk bounds
+   under `with_vm_user_spaces_split_mut` (shootdown-before-reclaim ordering
+   preserved: unmap first under vm-domain lock, reclaim under memory-domain
+   lock, no explicit TLB shootdown needed on single CPU).
+6. Emits `M2_SEAM_LIVE_D3_BRK_SHRINK cpu=… tid=… new_brk=…` (Info-level)
+   and writes `SyscallError::Ok` + new-brk-value to the trap frame.
+
+VmBrk is NOT added as a `SplitEligibleSyscall` variant (intentional design
+parity with IpcRecv's direct intercept pattern); the enum body carries an
+explanatory comment stating this explicitly.
+
+**D2 (blocking-recv waiter publish) — Outcome B, deferred with documented
+reason.** The D2 IpcRecv blocking path flows through
+`recv_block_phase_c_ipc_publish`, reached from
+`try_split_ipc_recv_queued_plain_into_frame`'s fallback branch when the
+queue is empty and the receiver must block. That branch already returns
+`None` (falling through to the global-lock fallback), so the live IpcRecv
+seam's non-blocking fast-path (Stage 32B) is not disturbed. Moving the
+blocking branch itself — the unsplit recv-block path — ahead of `with_cpu`
+would change IPC recv semantics beyond what this PR attempted. Deferred
+with reason `reason=ipc_recv_blocking_branch_split_not_in_scope_for_this_pr`.
+
+**D6 (scheduler dispatch) — Outcome B, deferred with documented reason.**
+The D6 `local_dispatch_step_split` / `dispatch_next_task` call chain is
+still called from inside `SharedKernel::with_cpu`'s closure. Relocating it
+would require restructuring the main dispatch loop in ways that interact
+with the per-CPU runqueue sharding work (itself deferred pending x86_64 AP
+per-CPU bring-up). Deferred with the same
+`reason=with_cpu_nesting_not_resolved_for_d6` diagnosis as Stage 113.
+
+**`SharedKernel::new()` soundness fix (discovered during Stage 114
+validation).** The constructor previously cached
+`scheduler_state`, `boot_config_state_lock`, and `boot_config` as raw
+pointer fields in the `SharedKernel` struct, computing them from the
+`state: KernelState` parameter's address *before* `SpinLock::new(state)`
+moved it into `Self`. Rust makes no guarantee that the move is elided (and
+in unoptimized/debug builds through tuple-returning helpers it is not),
+so these pointers could point at reused/zeroed stack memory — confirmed as
+a SIGSEGV (`SmpScheduler::online_cpu_count(self=0x0)`) in the Stage 114
+D3 test `stage114_d3_live_seam_handles_mixed_mapped_and_lazy_pages`, ruled
+out by two independent core dumps (default + 1 GB stack) ruling out stack
+overflow as a cause.
+
+Fix: the three cached pointer fields were removed from `SharedKernel`
+entirely. The five split-read helpers
+(`scheduler_tick_now_split_read`, `current_tid_split_read`,
+`online_cpu_count_split_read`, `present_cpu_count_split_read`,
+`capacity_profile_split_read`) now derive the relevant sub-lock
+addresses fresh from `self.state.data_ptr()` at each call via the
+existing `scheduler_split_mut_ptr_from_raw` projector (already used
+by `with_scheduler_split_mut` since Stage 108) and a new
+`boot_config_split_read_ptrs_from_raw` peer — both use `core::ptr::addr_of!`
+to compute field addresses without materializing a `&KernelState`
+reference. The fix eliminates the self-referential pointer issue entirely
+and extends the Stage 108 pattern uniformly to all split-read helpers.
+`scheduler_state_lock_ptr` and `boot_config_split_read_ptrs` (the
+pre-move `&self`-taking accessors that were the source of the stale
+addresses) were removed as now-unused.
+
+**Fences and seam status after Stage 114:**
+- `with_vm_user_spaces_split_mut` and `with_memory_split_mut` — fence
+  updated from `M2_SEAM_HELPER_ONLY` to `M2_SEAM_LIVE_D3_BRK_SHRINK` for
+  the D3 page-crossing-shrink path; the Stage 108 helper-only fence on
+  `with_scheduler_split_mut` (D6) is **unchanged**.
+- `stage108_seams_are_helper_only_no_live_callers` passes because it scans
+  `syscall.rs` and `trap_entry.rs` — neither of which changed.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained 31 Stage 114 tests in
+`mod stage114_d3_vm_brk_shrink_live`:
+`stage114_d3_live_seam_handles_mixed_mapped_and_lazy_pages`,
+`stage114_d3_live_seam_unmaps_pages_and_updates_bounds`,
+`stage114_d3_live_seam_tolerates_lazy_unmapped_pages`,
+`stage114_d3_live_seam_result_matches_global_lock_path`,
+`stage114_d3_live_seam_routes_through_try_split_dispatch_into_frame`,
+`stage114_d3_new_live_seam_genuinely_calls_split_mut_seams`,
+`stage114_d3_multi_cpu_online_defers`,
+`stage114_d3_single_cpu_online_after_bringup_then_back_to_one_is_live_again`,
+`stage114_d3_growth_defers`, `stage114_d3_non_page_crossing_shrink_defers`,
+`stage114_d3_query_path_defers`, `stage114_d3_no_brk_region_defers`,
+`stage114_d3_non_group_leader_defers`,
+`stage114_d3_requested_below_base_defers`,
+`stage114_d3_validate_user_region_failure_defers`,
+`stage114_d3_asid_missing_returns_page_fault_error`,
+`stage114_d3_full_vm_anon_map_two_phase_remains_deferred`,
+`stage114_d3_helper_is_defined_on_shared_kernel`,
+`stage114_d3_helper_never_takes_global_lock_directly`,
+`stage114_d3_old_global_lock_path_fence_remains_intact`,
+`stage114_d1_d5_cap_transfer_untouched`,
+`stage114_d2_recv_block_remains_outcome_b_with_documented_reason`,
+`stage114_d2b_ipc_send_still_not_split_eligible`,
+`stage114_d6_dispatch_remains_outcome_b_with_documented_reason`,
+`stage114_d6_full_per_cpu_runqueue_sharding_remains_deferred`,
+`stage114_no_new_split_eligible_syscall_enum_variant_for_vm_brk`,
+`stage114_riscv_still_bsp_only_and_in_smoke_matrix`,
+`stage114_smoke_scripts_still_reject_d2_race_unwind_marker`,
+`stage114_syscall_count_unchanged`,
+`stage114_trap_entry_routes_split_dispatch_before_with_cpu_with_early_return`,
+`stage114_x86_64_ap_scheduler_participation_remains_off`.
+
+Acceptance evidence (Stage 114):
+
+| Smoke | Result | Notes |
+|-------|--------|-------|
+| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PASS | `M2_SEAM_LIVE_D3_BRK_SHRINK` not expected in bare x86_64 core smoke (no userspace VmBrk shrink call); zero panics; `D2_PUBLISH_RACE_UNWIND` count=0 |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PASS | `D2_PUBLISH_RACE_UNWIND` count=0 |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PASS | `D2_PUBLISH_RACE_UNWIND` count=0 |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PASS | all four SMP configurations passed; `ONLINE=1` in every row; `D2_PUBLISH_RACE_UNWIND` count=0; zero panics |
+
+Workspace tests: 1489/0 lib (`--test-threads=1`, 2 ignored, pre-existing).
+`cargo fmt`, `cargo check --features hosted-dev`, and `git diff --check` all
+clean. No ABI/protocol/syscall-number/image-ID/smoke-marker change.
+`SYSCALL_COUNT` remains 31.
+
 ---
 
 ## 2. Live paths and fallbacks
@@ -969,13 +1119,13 @@ audit; nothing else in the repo should restate it.
 |-------|-------|-------|
 | D1 (transfer-cap recv, non-reply, non-shared-region) | **live** | router → `materialize_split_transfer_cap_equivalent`; telemetry `d1_split_materializations`. Stage 104. |
 | D2 (endpoint blocking-recv waiter publish) | **live** (phase-split, seam-pending) | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes` / `d2_publish_race_unwinds` (must be 0). Stage 106; phase split Stage 111. `with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path (§1 Stage 111). |
-| D3.1 (`vm_brk_shrink_two_phase`) | **live** (phase-split, seam-pending) | `D3_LIVE_SPLIT`. Stage 107; phase split Stage 112. `with_vm_user_spaces_split_mut`/`with_memory_split_mut` not yet called from this path (§1 Stage 112). |
+| D3.1 (`vm_brk_shrink_two_phase`) | **live** (phase-split Stage 112; seam live-wired Stage 114) | `D3_LIVE_SPLIT` + `M2_SEAM_LIVE_D3_BRK_SHRINK`. `with_vm_user_spaces_split_mut`/`with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (§1 Stage 114). |
 | D3 rest (full `VmAnonMap` two-phase live) | **deferred** | plan types are consumed inside the still-global-locked `handle_vm_anon_map`; gated on lock-free `await_tlb_shootdown_ack`. |
 | D4 (`syscall.rs` decomposition) | **partial** | `syscall/{debug,initramfs}.rs` landed; `syscall/recv_shared_v3.rs` is the next split target; the rest of §5.1 is pending mechanical moves. |
 | D5 (reply-cap recv, non-shared-region) | **live** | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations` / `d5_split_reply_rollbacks`. Stage 105. |
 | D6.1 (`local_dispatch_step_split`) | **live** (phase-split, seam-pending) | `D6_LIVE_SPLIT`. Stage 107; phase split Stage 113. `with_scheduler_split_mut` not yet called from this path (§1 Stage 113). Per-CPU lock sharding deferred until x86_64 AP scheduler-online. |
 | D7 (MUST_SMOKE policy) | **enforced** | see `AI_AGENT_RULES.md` §13. Stage 101. |
-| Stage 108 split-mut seams (rank 1/2/5/6) | **helper-only** | `M2_SEAM_HELPER_ONLY` + `FALLBACK_GLOBAL_LOCK`. Live-wiring any requires its own PR + MUST_SMOKE + helper-fence deletion in the same PR. |
+| Stage 108 split-mut seams (rank 1/2/5/6) | **rank 5+6 partially live (D3 shrink, Stage 114); rank 1+2 helper-only** | `with_vm_user_spaces_split_mut` and `with_memory_split_mut` have a live caller (`try_split_vm_brk_shrink_into_frame`); `with_scheduler_split_mut` and `with_task_tcbs_split_mut` remain `M2_SEAM_HELPER_ONLY`. |
 | Shared-region cap-transfer split (D1/D5 extension) | **deferred** | gated on folding receiver-side mapping obligations into the phase model. |
 
 ### 7.1.2 Lock / rank bottlenecks still global
@@ -1024,28 +1174,25 @@ landed in Stage 110 (§1) and are no longer pending. D-NEXT-1 PR-A's
 preparatory phase split landed in Stage 111 (§1); D-NEXT-1 PR-B's
 preparatory phase split landed in Stage 112 (§1); D-NEXT-1 PR-C's
 preparatory phase-boundary documentation/telemetry landed in Stage 113
-(§1). All three hit the identical architectural blocker (call site nested
-inside `SharedKernel::with_cpu`), so their genuine seam live-wire is now a
-single combined follow-on item below rather than three separate ones. The
-next targets, in order:
+(§1). Stage 114 partially executed the combined call-boundary relocation:
+D3's page-crossing-shrink path is now genuinely live-wired (Outcome A)
+via `try_split_vm_brk_shrink_into_frame`; D2 blocking-recv and D6
+dispatch remain at Outcome B (§1 Stage 114). The next targets, in order:
 
-1. **D-NEXT-1 PR-A/PR-B/PR-C follow-on — relocate the D2 blocking-recv
-   entry point, the D3 `VmBrk` shrink entry point, AND the D6 dispatch
-   entry point ahead of `SharedKernel::with_cpu`**, then call
-   `with_scheduler_split_mut` / `with_task_tcbs_split_mut` (D2),
-   `with_vm_user_spaces_split_mut` / `with_memory_split_mut` (D3), and
-   `with_scheduler_split_mut` (D6) for real (§1 Stage 111, §1 Stage 112,
-   and §1 Stage 113 explain why none could be done in-place inside the
-   existing global-lock borrow). This is the single trap/syscall-dispatch
-   relocation that unblocks all three seams at once.
+1. **D2 blocking-recv genuine seam live-wire and D6 dispatch seam
+   live-wire** — the remaining two Outcome B items from Stage 114. Both
+   still require relocating their respective entry points ahead of
+   `SharedKernel::with_cpu`; the architectural diagnosis is unchanged
+   from §1 Stage 111 / §1 Stage 113. D3's seam is now live as a
+   reference implementation.
 2. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction**, then
    `syscall/process.rs`, then the remaining modules listed in §5.1.
 3. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
    Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
    behind a default-off knob; then `-smp ≥ 2` smoke acceptance. Still
    high priority — it unblocks per-CPU runqueue lock sharding (D6) and
-   the lock-free `await_tlb_shootdown_ack` design (D3) — but does not
-   bypass items 1–2 above.
+   the lock-free `await_tlb_shootdown_ack` design (D3, full two-phase)
+   — but does not bypass items 1–2 above.
 
 ### 7.1.6 What must not be touched yet
 
@@ -1075,52 +1222,43 @@ next targets, in order:
 
 **Ready to resume global kernel unlocking: yes.**
 
-D7-A and D7-B (§1 Stage 110), the D-NEXT-1 PR-A preparatory phase split
-(§1 Stage 111), the D-NEXT-1 PR-B preparatory phase split (§1 Stage 112),
-and the D-NEXT-1 PR-C preparatory phase-boundary work (§1 Stage 113) are
-complete: the stale `NOT SMOKE-ACCEPTED` sentinels are gone,
-`D2_PUBLISH_RACE_UNWIND` is a hard smoke-script reject on every
-architecture, the D2 blocking-recv path is expressed as three named,
-rank-ordered phase functions, the D3 brk-shrink path is expressed as three
-named, batched phase functions, and the D6 dispatch path's pre-existing
-phase separation is now documented and instrumented with phase-boundary
-markers — all three with no behavior change. All required per-arch
-acceptance smokes pass: `qemu-x86_64-core-smoke.sh`,
-`qemu-aarch64-core-smoke.sh`, `qemu-riscv64-smoke-matrix.sh`
-(`--smp 1/2/3/4`), plus the strict optional-FS smokes on x86_64 and
-AArch64. All three of D-NEXT-1's PRs landed at the identical Outcome B
-diagnosis: each call site is nested inside `SharedKernel::with_cpu`, so
-none can soundly call its Stage 108 seam yet. The next unlocking pass is
-the combined trap-dispatch call-boundary relocation (§7.1.5 item 1), which
-unblocks D2/D3/D6 simultaneously — alternatively, D4 step 1 (§7.1.5
-item 2, mechanical decomposition independent of the seam blocker) or the
-x86_64 AP per-CPU environment (D-NEXT-2, §7 item 7) may be taken instead
-if SMP scheduler-online bring-up is the higher near-term priority.
+Stage 114 partially executed the combined trap-dispatch call-boundary
+relocation: D3's page-crossing-shrink path is now genuinely live-wired
+(Outcome A) via `try_split_vm_brk_shrink_into_frame` calling
+`with_vm_user_spaces_split_mut` + `with_memory_split_mut` (§1 Stage 114),
+and the `SharedKernel::new()` stale-raw-pointer soundness bug discovered
+during validation was identified and fixed. D2 blocking-recv and D6
+dispatch remain at Outcome B with the same architectural diagnosis as
+Stages 111/113. All required per-arch acceptance smokes pass:
+`qemu-x86_64-core-smoke.sh`, `qemu-aarch64-optional-fs-smoke.sh`,
+`qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`), plus the strict
+optional-FS smokes on x86_64 and AArch64. The next unlocking pass is the
+D2/D6 genuine live-wire (§7.1.5 item 1) — alternatively, D4 step 1
+(§7.1.5 item 2) or the x86_64 AP per-CPU environment (D-NEXT-2, §7.1.5
+item 3) may be taken if SMP bring-up is the higher near-term priority.
 
 **Exact next Claude prompt recommendation:**
 
-> Kernel unlocking Pass: D-NEXT-1 PR-A/PR-B/PR-C follow-on — relocate the
-> D2 blocking-recv entry point, the D3 `VmBrk` shrink entry point, and the
-> D6 dispatch entry point so each runs *before* `SharedKernel::with_cpu`
-> acquires the global lock in trap/syscall dispatch (mirroring the
-> existing `try_split_dispatch_into_frame` / Stage 29 whitelist-seam
-> shape), then call `with_scheduler_split_mut` / `with_task_tcbs_split_mut`
-> (D2), `with_vm_user_spaces_split_mut` / `with_memory_split_mut` (D3), and
-> `with_scheduler_split_mut` (D6) for real, deleting the `M2_SEAM_HELPER_ONLY`
-> fence for each seam genuinely live-wired. §1 Stage 111 / Stage 112 /
-> Stage 113 document why none of the three could call their seam in-place.
+> Kernel unlocking Pass: D2 + D6 genuine seam live-wire — relocate the
+> D2 blocking-recv entry point and the D6 dispatch entry point so each
+> runs *before* `SharedKernel::with_cpu` acquires the global lock in
+> trap/syscall dispatch (mirroring `try_split_vm_brk_shrink_into_frame`'s
+> Stage 114 pattern as reference implementation), then call
+> `with_scheduler_split_mut` / `with_task_tcbs_split_mut` (D2) and
+> `with_scheduler_split_mut` (D6) for real, deleting the
+> `M2_SEAM_HELPER_ONLY` fence for each seam genuinely live-wired.
+> §1 Stage 111 documents D2's blocker; §1 Stage 113 documents D6's.
+> §1 Stage 114 provides the reference D3 implementation.
 > Hard rules: do not touch D1/D5 canonical fallbacks; do not change the
-> phase functions/order documented in Stage 111/112/113 beyond what the
-> relocation strictly requires; do not start the x86_64 AP per-CPU
+> D3 seam wiring landed in Stage 114; do not start the x86_64 AP per-CPU
 > environment (D-NEXT-2) in this PR; do not add per-CPU runqueue lock
 > sharding ahead of `-smp ≥ 2` scheduler-online smoke acceptance; preserve
 > all required per-arch smokes (x86_64 core + optional-FS strict, AArch64
 > core + optional-FS strict, RISC-V64 matrix) including the
-> `D2_PUBLISH_RACE_UNWIND` reject added in Stage 110; do not rely on
-> Debug-level markers; do not leave a new `NOT SMOKE-ACCEPTED` sentinel
-> behind without actually running the required smokes first. If the
-> relocation itself turns out to be unsound or too large for one PR, report
-> that honestly and fall back to D4 step 1 or D-NEXT-2 instead.
+> `D2_PUBLISH_RACE_UNWIND` reject; do not rely on Debug-level markers;
+> do not leave a new `NOT SMOKE-ACCEPTED` sentinel behind. If the
+> relocation proves unsound or too large for one PR, report that honestly
+> and fall back to D4 step 1 or D-NEXT-2 instead.
 > Deliverables: implementation or honest blocked-report, MUST_SMOKE run,
 > fence deletion only for seams genuinely live-wired, audit note in
 > `doc/KERNEL_UNLOCKING.md` §1/§7/§7.1.
@@ -1141,14 +1279,20 @@ if SMP scheduler-online bring-up is the higher near-term priority.
   SharedKernel seam split lands. The publish primitive preserves canonical
   overwrite semantics (`D2_RECV_WAITER_DISPLACED` is observability, not a
   behavior change).
-- **D3/D6 fences.** No `with_vm_split_mut` / `with_memory_split_mut` calls
-  may be added without the lock-free `await_tlb_shootdown_ack` design and
-  multi-CPU smoke. No per-CPU scheduler lock types until the x86_64 SMP
-  trampoline split has landed and D2/D3 are smoke-stable.
+- **D3/D6 fences.** `with_vm_user_spaces_split_mut` and
+  `with_memory_split_mut` now have a live caller
+  (`try_split_vm_brk_shrink_into_frame`, Stage 114) gated on single-CPU-
+  online; multi-CPU callers still require the lock-free
+  `await_tlb_shootdown_ack` design and multi-CPU smoke before those seams
+  may be called on > 1 CPU. No per-CPU scheduler lock types until the
+  x86_64 SMP trampoline split has landed and D2/D3 are smoke-stable.
   `entering_tid` / `exiting_tid` remain Class F (authoritative read only).
-- **Stage 108 seam rule.** The four split-mut seams are `M2_SEAM_HELPER_ONLY`.
-  Live-wiring requires its own PR + MUST_SMOKE run + deletion of the
-  helper-only fence in the same PR.
+- **Stage 108 seam rule.** `with_scheduler_split_mut` (rank 1) and
+  `with_task_tcbs_split_mut` (rank 2) remain `M2_SEAM_HELPER_ONLY`.
+  Live-wiring either requires its own PR + MUST_SMOKE run + helper-fence
+  deletion in the same PR. Ranks 5+6 (`with_vm_user_spaces_split_mut` /
+  `with_memory_split_mut`) are live for the D3 single-CPU shrink path
+  since Stage 114.
 - **`yarm.loglevel=` may be used in verbose smoke runs.** Never change the
   production default (Info); never rely on Debug-level markers in
   acceptance greps.

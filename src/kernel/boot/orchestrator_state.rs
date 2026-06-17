@@ -84,22 +84,31 @@ impl KernelState {
         self.scheduler_state.lock()
     }
 
-    pub(crate) fn scheduler_state_lock_ptr(
-        &self,
-    ) -> *const crate::kernel::lock::SpinLockIrq<SchedulerState> {
-        &self.scheduler_state as *const _
-    }
-
-    pub(crate) fn boot_config_split_read_ptrs(
-        &self,
+    /// Stage 114 fix: raw-pointer sibling of the (removed) pre-move
+    /// `boot_config_split_read_ptrs(&self)`. That method computed pointers
+    /// from the `KernelState` value passed into `SharedKernel::new` *before*
+    /// it was moved into its final `SpinLock<KernelState>` resting place —
+    /// the cached pointers went stale unless the move happened to be elided,
+    /// which Rust never guarantees. Like `fault_split_mut_ptrs_from_raw` /
+    /// `telemetry_split_mut_ptrs_from_raw`, this takes the *live* address of
+    /// the owning `KernelState` (via `SpinLock::data_ptr()`) and derives
+    /// field pointers with `addr_of!`, so callers must recompute it fresh at
+    /// each use rather than caching the result across a move.
+    pub(crate) unsafe fn boot_config_split_read_ptrs_from_raw(
+        state: *const KernelState,
     ) -> (
         *const crate::kernel::lock::SpinLockIrq<()>,
         *const KernelStorage<BootConfigSubsystem>,
     ) {
-        (
-            &self.boot_config_state_lock as *const _,
-            &self.boot_config as *const _,
-        )
+        // SAFETY: callers pass the raw pointer returned by `SharedKernel`'s
+        // owning `SpinLock<KernelState>`. `addr_of!` derives raw field
+        // pointers without creating a reference to the whole KernelState.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).boot_config_state_lock),
+                core::ptr::addr_of!((*state).boot_config),
+            )
+        }
     }
 
     pub(crate) unsafe fn fault_split_mut_ptrs_from_raw(
