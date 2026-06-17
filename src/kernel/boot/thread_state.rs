@@ -50,8 +50,7 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
         let cpu_idx = crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize;
         // SAFETY: single CPU, interrupts disabled (trap path precondition for
         // can_stash_for_lock_drop), no concurrent accessor of FIRST_RESUME_STASH.
-        let ctx =
-            unsafe { crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].take() };
+        let ctx = unsafe { crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].take() };
         let Some(ctx) = ctx else {
             crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=stash_empty");
             loop {
@@ -74,9 +73,7 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
             crate::yarm_log!("D6_FIRST_RESUME_LOCK_REACQUIRE_DONE");
             crate::yarm_log!("D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN");
             let r = crate::arch::trap_entry::post_switch_restore_arch_thread_state(
-                kernel,
-                ctx.cpu_id,
-                None,
+                kernel, ctx.cpu_id, None,
             );
             crate::yarm_log!("D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE");
             r
@@ -84,12 +81,17 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
         // Switch back to the outgoing task. In production, execution never returns
         // from switch_frames here — it jumps to the outgoing task's POINT 2.
         // In test builds (switch_frames is a no-op), we fall through to the spin.
+        //
+        // Pass None for next_kernel_stack_top: the stash-drain switch_frames
+        // (outgoing=A, incoming=B) already set TSS RSP0 = B.stack_top. Passing
+        // A.stack_top here would overwrite that, so B's subsequent interrupts
+        // would land on A's kernel stack — a stack-corruption bug.
         crate::arch::selected_isa::context_switch::switch_frames(
             // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed-size
             // array); no concurrent access (single CPU, interrupts disabled).
             unsafe { &mut *ctx.incoming_frame_ptr },
             unsafe { &*ctx.outgoing_frame_ptr },
-            ctx.outgoing_stack_top,
+            None,
         );
         loop {
             core::hint::spin_loop();

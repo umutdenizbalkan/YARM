@@ -239,11 +239,16 @@ The four highest-impact items, in order of unlock value:
    real first-resume handler that re-acquires the global lock and calls
    `post_switch_restore_arch_thread_state`; `FIRST_RESUME_STASH` and
    `FirstResumeContext` infrastructure is added; `DispatchSwitchPlan` gains
-   `outgoing_stack_top` and `incoming_frame_ptr` is widened to `*mut`. Still
-   Outcome B: `switch_frames` never fires in smoke because only one task is
-   initialized (requires both sides). Next: QEMU smoke acceptance for Stages
-   117–118, then add a second initialized task to reach Outcome A.
-   See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / §7.1.5.
+   `outgoing_stack_top` and `incoming_frame_ptr` is widened to `*mut`. Stage 119
+   (Outcome B) extends initialization to tid=2 (supervisor) via new
+   `BOOTSTRAP_SUPERVISOR_TID = 2` constant, and fixes the TSS RSP0 bug in the
+   trampoline switch-back (was passing `ctx.outgoing_stack_top`, now passes `None`
+   to preserve B's kernel stack top set by the stash-drain). Both tid=1 and tid=2
+   now show `D6_KERNEL_SWITCH_FRAME_INIT_DONE` in x86_64 core smoke. Still
+   Outcome B: smoke quiesces into IPC-blocked tasks before a timer preemption can
+   pair two initialized tasks. Next: either a longer-running user workload or
+   synthetic timer forcing to produce the first real unlocked `switch_frames`.
+   See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / Stage 119 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

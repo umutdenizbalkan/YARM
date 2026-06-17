@@ -673,8 +673,7 @@ impl PerCpuFirstResumeStash {
 /// Consumed by the trampoline on the incoming task's kernel stack.
 ///
 /// VALIDATION: D6_FIRST_RESUME_ENTER / D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE
-pub(crate) static FIRST_RESUME_STASH: [PerCpuFirstResumeStash;
-    crate::kernel::scheduler::MAX_CPUS] =
+pub(crate) static FIRST_RESUME_STASH: [PerCpuFirstResumeStash; crate::kernel::scheduler::MAX_CPUS] =
     [const { PerCpuFirstResumeStash::new() }; crate::kernel::scheduler::MAX_CPUS];
 
 #[cfg(feature = "hosted-dev")]
