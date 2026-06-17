@@ -216,6 +216,27 @@ impl KernelState {
         }
     }
 
+    /// Stage 115: IPC/waiter-publish (rank 3) seam projector.
+    ///
+    /// Completes the seam set for the lock ranks needed by D2 and D6 unlocks.
+    /// Follows the exact `(lock, storage)` pair pattern of ranks 2, 5, and 6.
+    /// Marked helper-only until D2 Phase C can be genuinely moved outside
+    /// `with_cpu` (blocked on `dispatch_next_task` → `switch_frames`).
+    pub(crate) unsafe fn ipc_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut KernelStorage<IpcSubsystem>,
+    ) {
+        // SAFETY: see module pattern note above.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).ipc_state_lock),
+                core::ptr::addr_of_mut!((*state).ipc),
+            )
+        }
+    }
+
     /// Stage 4T+7 split-read: look up the ASID bound to `tid` under only the
     /// task lock (rank 2). Returns `0` if the task is not found or has no ASID.
     ///

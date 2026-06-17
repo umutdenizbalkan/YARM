@@ -225,21 +225,16 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel-unlocking D2 + D6 genuine seam live-wire, then x86_64
-   AP per-CPU environment (D-NEXT-2).** Stage 114 partially executed the
-   combined trap-dispatch relocation: D3's page-crossing VmBrk shrink path
-   is now genuinely live-wired via `try_split_vm_brk_shrink_into_frame`
-   calling `with_vm_user_spaces_split_mut` + `with_memory_split_mut`
-   (Outcome A, Stage 114); a pre-existing `SharedKernel::new()` stale-raw-
-   pointer soundness bug discovered during validation was identified and
-   fixed. D2 blocking-recv and D6 dispatch remain at Outcome B with the same
-   `with_cpu`-nesting diagnosis as Stages 111/113. The next recommended PR
-   is the D2 + D6 genuine live-wire (relocate each entry point ahead of
-   `with_cpu`, call `with_scheduler_split_mut`/`with_task_tcbs_split_mut`
-   for D2 and `with_scheduler_split_mut` for D6 for real — using Stage 114's
-   D3 seam as reference implementation); D4 step 1 is an available fallback.
-   Lock-free `await_tlb_shootdown_ack` and per-CPU runqueue lock sharding
-   (D6) follow once scheduler-online APs exist.
-   See `doc/ARCH_X86_64.md` §4 and `doc/KERNEL_UNLOCKING.md` §7.
+   AP per-CPU environment (D-NEXT-2).** Stage 114 live-wired D3's
+   VmBrk shrink path (Outcome A). Stage 115 attempted D2+D6 genuine
+   live-wire; both remain at Outcome B. The new precise blocker identified
+   in Stage 115: `dispatch_next_task` Phase B → `maybe_switch_kernel_context`
+   → `switch_frames` (arch-specific cooperative kernel context switch,
+   three per-arch impls). The rank-3 IPC split-mut seam (`with_ipc_split_mut`)
+   was added as a genuine deliverable, completing the per-domain seam set
+   (ranks 1/2/3/5/6). The next PR must tackle the `switch_frames`
+   restructuring to enable D2/D6 live-wire, or fall back to D4 step 1 or
+   D-NEXT-2. See `doc/KERNEL_UNLOCKING.md` §1 Stage 115 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating
