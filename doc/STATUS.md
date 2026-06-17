@@ -225,16 +225,17 @@ The four highest-impact items, in order of unlock value:
    `online_cpus` can climb past 1. See `doc/ARCH_RISCV64.md` §10–11.
 
 2. **Kernel-unlocking D2 + D6 genuine seam live-wire, then x86_64
-   AP per-CPU environment (D-NEXT-2).** Stage 114 live-wired D3's
-   VmBrk shrink path (Outcome A). Stages 115–116 addressed the D2/D6
-   blocker iteratively: Stage 115 added the rank-3 IPC seam completing
-   the per-domain seam set (ranks 1/2/3/5/6); Stage 116 removed the
-   `task_state_lock` (rank-2 sub-lock) from crossing the `switch_frames`
-   boundary via `DispatchSwitchPlan`. D2 and D6 remain at Outcome B: the
-   outer global `SpinLock<KernelState>` (from `with_cpu`) still spans
-   `switch_frames`. The next PR must release the global lock before
-   calling `switch_frames`, or fall back to D4 step 1 or D-NEXT-2.
-   See `doc/KERNEL_UNLOCKING.md` §1 Stage 116 / §7.1.5.
+   AP per-CPU environment (D-NEXT-2).** Stage 114 live-wired D3's VmBrk
+   shrink path (Outcome A). Stages 115–116 addressed the D2/D6 blocker
+   iteratively: Stage 115 added the rank-3 IPC seam; Stage 116 removed the
+   `task_state_lock` (rank-2 sub-lock) from crossing `switch_frames` via
+   `DispatchSwitchPlan`. Stage 117 implemented Solution 2: the outer global
+   `SpinLock<KernelState>` (from `with_cpu`) is now dropped before
+   `switch_frames` on single-CPU x86_64/AArch64 production trap paths via the
+   `PerCpuSwitchPlanStash` / `DISPATCH_SWITCH_PLAN_STASH` infrastructure.
+   QEMU smoke acceptance for Stage 117 is the immediate next step; after that,
+   D2/D6 genuine seam live-wire is the main remaining unlock target.
+   See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

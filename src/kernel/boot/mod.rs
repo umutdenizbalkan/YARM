@@ -490,9 +490,11 @@ pub(crate) struct VmAnonMapRollbackTlbPlan {
 ///
 /// Safety invariant: the raw pointer fields are valid only while the outer
 /// global `SpinLock<KernelState>` (from `SharedKernel::with_cpu`) is held
-/// on the current CPU. No cross-CPU sharing occurs.
+/// on the current CPU, OR while interrupts are disabled (single-CPU, trap
+/// path) after the global lock has been dropped for Stage 117 out-of-lock
+/// `switch_frames`. No cross-CPU sharing occurs.
 ///
-/// VALIDATION: D6_SWITCH_PLAN_READY
+/// VALIDATION: D6_SWITCH_PLAN_READY / D6_GLOBAL_LOCK_DROP_PLAN_READY
 pub(crate) struct DispatchSwitchPlan {
     /// TID of the outgoing (currently-running) task.
     pub(crate) outgoing_tid: u64,
@@ -502,7 +504,8 @@ pub(crate) struct DispatchSwitchPlan {
     ///
     /// Derived from `&mut TCB.kernel_context.frame` under `task_state_lock`.
     /// After lock release, valid because `KernelState::tcbs` is a fixed-size
-    /// array (no move/reallocation) and the global lock is still held.
+    /// array (no move/reallocation) and the global lock is still held (Stage 116)
+    /// or interrupts are disabled on a single CPU (Stage 117 stash path).
     pub(crate) outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext,
     /// Raw pointer to the incoming task's `ArchSwitchContext` frame.
     ///
@@ -515,6 +518,84 @@ pub(crate) struct DispatchSwitchPlan {
     /// no reference into TCB storage survives after `task_state_lock` drops.
     pub(crate) incoming_stack_top: Option<u64>,
 }
+
+/// Stage 117: per-CPU stash cell for a `DispatchSwitchPlan` that will be
+/// drained (via `switch_frames`) OUTSIDE the global `SharedKernel::with_cpu`
+/// lock.
+///
+/// # Safety
+///
+/// This cell is only accessed from the trap path on the local CPU, always
+/// with interrupts disabled (hardware trap entry disables IRQs; the outer
+/// `SpinLock<KernelState>` does not save/restore IRQ state, so IRQs remain
+/// disabled after it is dropped). No cross-CPU sharing occurs. Only one plan
+/// can be stashed per CPU at a time.
+pub(crate) struct PerCpuSwitchPlanStash {
+    inner: core::cell::UnsafeCell<Option<DispatchSwitchPlan>>,
+}
+
+// SAFETY: Accessed only from the local CPU's trap path with interrupts
+// disabled. No concurrent access from other threads/CPUs is possible.
+unsafe impl Sync for PerCpuSwitchPlanStash {}
+
+impl PerCpuSwitchPlanStash {
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: core::cell::UnsafeCell::new(None),
+        }
+    }
+
+    /// Store a plan in the stash.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent access (interrupts disabled, single
+    /// CPU).
+    pub(crate) unsafe fn store(&self, plan: DispatchSwitchPlan) {
+        unsafe { *self.inner.get() = Some(plan) }
+    }
+
+    /// Take the plan from the stash (consumes it), leaving the slot empty.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent access (interrupts disabled, single
+    /// CPU).
+    pub(crate) unsafe fn take(&self) -> Option<DispatchSwitchPlan> {
+        unsafe { (*self.inner.get()).take() }
+    }
+
+    /// Return `true` if a plan is currently stashed without consuming it.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent access.
+    pub(crate) unsafe fn has_plan(&self) -> bool {
+        unsafe { (*self.inner.get()).is_some() }
+    }
+}
+
+/// Per-CPU stash for `DispatchSwitchPlan` used by the Stage 117 global-lock
+/// drop path. Index by `CpuId.0`. Accessed only from the trap path on the
+/// local CPU with interrupts disabled.
+///
+/// VALIDATION: D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH
+pub(crate) static DISPATCH_SWITCH_PLAN_STASH: [PerCpuSwitchPlanStash;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { PerCpuSwitchPlanStash::new() }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Per-CPU flag indicating that `handle_trap_entry_shared` is active and will
+/// drain the stash AFTER `with_cpu` returns. When `false`, code calling
+/// `dispatch_next_task` directly (e.g., unit tests) must not stash — there
+/// would be no external drainer and the context switch would be lost.
+///
+/// Set to `true` by `handle_trap_entry_shared` before `with_cpu`, cleared
+/// after the stash drain completes.
+///
+/// VALIDATION: D6_GLOBAL_LOCK_DROP_PLAN_BEGIN
+pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
 #[cfg(feature = "hosted-dev")]
 const MAX_NOTIFICATIONS: usize = 64;

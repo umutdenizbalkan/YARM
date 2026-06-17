@@ -102,6 +102,38 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     )
 }
 
+/// Stage 117: arch-specific post-switch restore, called after `switch_frames`
+/// in the incoming task's context under a re-acquired global lock. Restores
+/// the incoming task's user-mode register state to its trap frame.
+#[cfg(target_arch = "x86_64")]
+fn post_switch_restore_arch_thread_state(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    super::x86_64::trap::restore_arch_thread_state(kernel, cpu, frame)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn post_switch_restore_arch_thread_state(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    super::aarch64::trap::restore_arch_thread_state_post_switch(kernel, cpu, frame)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn post_switch_restore_arch_thread_state(
+    _kernel: &mut KernelState,
+    _cpu: CpuId,
+    _frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    // RISC-V uses a raw-pointer trap path (no `with_cpu`). The stash is never
+    // populated on RISC-V, so this function is never called on that arch.
+    Ok(())
+}
+
 pub fn handle_trap_entry_shared(
     shared: &crate::runtime::SharedKernel,
     cpu: CpuId,
@@ -176,18 +208,90 @@ pub fn handle_trap_entry_shared(
         FaultBookkeepingMode::RecordInHandleTrapEvent
     };
 
-    let result = shared
+    // Stage 117: signal to `maybe_switch_kernel_context` that this CPU is in
+    // the `handle_trap_entry_shared` path and the stash WILL be drained after
+    // `with_cpu` returns. Without this flag, direct-call paths (tests) would
+    // stash a plan with no external drainer, losing the context switch.
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Stage 117: pass `frame.as_deref_mut()` (reborrow) so that `frame` remains
+    // available after `with_cpu` returns for the stash drain below.
+    let inner_result = shared
         .with_cpu(cpu, |kernel| {
             handle_trap_entry_with_fault_bookkeeping_mode(
                 kernel,
                 cpu,
                 context,
-                frame,
+                frame.as_deref_mut(),
                 fault_bookkeeping_mode,
             )
         })
-        .map_err(|err| TrapHandleError::Syscall(err.into()))?;
-    result
+        .map_err(|err| TrapHandleError::Syscall(err.into()));
+
+    // Clear the trap-path-active flag; the stash drain below handles whatever
+    // was stashed during the `with_cpu` call.
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .store(false, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    let inner_result = inner_result?;
+    // `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.
+    // `inner_result: Result<(), TrapHandleError>` from the arch handler.
+
+    // Stage 117: drain the per-CPU switch plan stash.
+    //
+    // If `maybe_switch_kernel_context` stashed a `DispatchSwitchPlan` (single-CPU
+    // x86_64/aarch64 path), call `switch_frames` here with NO global lock held.
+    // Phase A safety: interrupts remain disabled because hardware disabled them
+    // on trap entry and `SpinLock<KernelState>` does not save/restore IRQ state.
+    //
+    // After `switch_frames` the execution context has switched to the INCOMING
+    // task's kernel stack. All local variables below (`frame`, `shared`, `cpu`)
+    // are now the INCOMING task's versions, which were on its own kernel stack
+    // when it was last suspended at this exact code location.
+    let cpu_idx = cpu.0 as usize;
+    if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+        // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
+        let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
+        if let Some(plan) = plan {
+            crate::yarm_log!("D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH");
+            crate::yarm_log!(
+                "D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            // SAFETY: pointers derived from stable KernelState::tcbs storage under
+            // task_state_lock; valid because KernelState is alive for the program
+            // lifetime, the array is fixed-size (no reallocation), and the system is
+            // single-CPU with interrupts disabled (no concurrent modification).
+            // The dereferences are non-aliasing: outgoing and incoming indices were
+            // verified distinct in `maybe_switch_kernel_context`.
+            unsafe {
+                crate::arch::selected_isa::context_switch::switch_frames(
+                    &mut *plan.outgoing_frame_ptr,
+                    &*plan.incoming_frame_ptr,
+                    plan.incoming_stack_top,
+                );
+            }
+            // POINT 2: execution resumes here in the INCOMING task's context.
+            // The INCOMING task's `frame` (on its own kernel stack) is now `frame`.
+            crate::yarm_log!("D6_SWITCH_FRAMES_RETURNED_UNLOCKED");
+            // Re-acquire the global lock to restore the incoming task's arch thread
+            // state (populate its trap frame with its user-mode register context).
+            shared
+                .with_cpu(cpu, |kernel| {
+                    post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
+                })
+                .map_err(|err| TrapHandleError::Syscall(err.into()))??;
+        }
+    }
+
+    inner_result
 }
 
 #[cfg(target_arch = "aarch64")]

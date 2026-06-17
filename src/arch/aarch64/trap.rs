@@ -60,7 +60,7 @@ pub fn last_restored_tls_base(cpu: CpuId) -> Option<usize> {
     (value != 0).then_some(value)
 }
 
-fn restore_arch_thread_state(
+pub(crate) fn restore_arch_thread_state(
     kernel: &mut KernelState,
     cpu: CpuId,
     frame: Option<&mut TrapFrame>,
@@ -134,6 +134,18 @@ fn restore_arch_thread_state(
     #[cfg(not(test))]
     let _ = (cpu, tls);
     Ok(())
+}
+
+/// Stage 117: post-switch arch thread state restore, called after
+/// `switch_frames` in the incoming task's context. `syscall_return` is always
+/// `false` here — the incoming task is resuming from a context switch, not a
+/// direct syscall return.
+pub(crate) fn restore_arch_thread_state_post_switch(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    frame: Option<&mut TrapFrame>,
+) -> Result<(), TrapHandleError> {
+    restore_arch_thread_state(kernel, cpu, frame, false)
 }
 
 fn import_syscall_abi_from_user_gprs(frame: &mut TrapFrame) {
@@ -351,11 +363,21 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         trap_trace!("AARCH64_DISPATCH_NEXT_TID tid={}", exiting_tid.unwrap_or(0));
     }
 
+    // Stage 117: skip restore_arch_thread_state when a global-lock-drop plan
+    // is stashed for this CPU. The restore will be called post-switch in
+    // `handle_trap_entry_shared` after `switch_frames` runs outside the lock.
+    let cpu_idx = cpu.0 as usize;
+    let switch_pending = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() };
     let syscall_return = !task_switched && matches!(event, TrapEvent::Syscall);
-    if let Err(err) = restore_arch_thread_state(kernel, cpu, frame.as_deref_mut(), syscall_return) {
-        crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
-        crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
-        return Err(err);
+    if !switch_pending {
+        if let Err(err) =
+            restore_arch_thread_state(kernel, cpu, frame.as_deref_mut(), syscall_return)
+        {
+            crate::yarm_log!("AARCH64_TRAP_DISPATCH_RESULT err={:?}", err);
+            crate::yarm_log!("AARCH64_TRAP_FAIL_REASON restore_arch_thread_state");
+            return Err(err);
+        }
     }
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {

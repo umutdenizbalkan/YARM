@@ -793,18 +793,22 @@ impl KernelState {
             outgoing_tid,
             incoming_tid
         );
+        crate::yarm_log!(
+            "D6_GLOBAL_LOCK_DROP_PLAN_BEGIN outgoing={} incoming={}",
+            outgoing_tid,
+            incoming_tid
+        );
 
-        // Phase B (Stage 116 / Solution 1): acquire task_state_lock (rank 2),
-        // locate both TCBs, validate kernel-context initialization, extract raw
-        // ArchSwitchContext frame pointers and copy the incoming stack top.
+        // Phase B (Stage 116 / Solution 1, Stage 117): acquire task_state_lock
+        // (rank 2), locate both TCBs, validate kernel-context initialization,
+        // extract raw ArchSwitchContext frame pointers and copy incoming stack top.
         // The sub-lock is released when `with_tcbs_mut` returns — before any
         // call to `switch_frames`.
         //
         // After this block: scheduler_state lock (rank 1) is already gone
         // (dropped by `local_dispatch_step_split`); task_state_lock (rank 2)
         // will be gone; only the outer global `SpinLock<KernelState>` from
-        // `with_cpu` remains held, keeping this CPU non-preemptible with
-        // interrupts disabled.
+        // `with_cpu` remains held on the x86_64/aarch64 path.
         let plan =
             self.with_tcbs_mut(|tcbs| -> Result<Option<DispatchSwitchPlan>, KernelError> {
                 let outgoing_idx = tcbs
@@ -853,14 +857,18 @@ impl KernelState {
                 // (1) `KernelState::tcbs` is `KernelStorage<[Option<TCB>; MAX_TASKS]>` —
                 //     a fixed-size inline array; no move or reallocation can occur
                 //     during the dispatch path.
-                // (2) The outer global `SpinLock<KernelState>` (held by `with_cpu`)
-                //     guarantees exclusive access to all of `KernelState`, including
-                //     `tcbs`, for the remainder of this CPU's trap-handling window.
-                // (3) The outgoing task is currently executing on this CPU only;
+                // (2) On the Stage 116 fallback path: the outer global
+                //     `SpinLock<KernelState>` (held by `with_cpu`) guarantees
+                //     exclusive access to all of `KernelState`.
+                // (3) On the Stage 117 stash path: interrupts are disabled (hardware
+                //     trap entry on x86_64/aarch64) and the system is single-CPU, so
+                //     no concurrent modification of `KernelState` can occur between
+                //     the lock drop and `switch_frames`.
+                // (4) The outgoing task is currently executing on this CPU only;
                 //     its kernel frame cannot be modified by any other CPU.
-                // (4) The incoming task was selected and marked as the next task for
-                //     this CPU by `local_dispatch_step_split`; the scheduler guarantees
-                //     no other CPU will attempt to run it simultaneously.
+                // (5) The incoming task was selected for this CPU by
+                //     `local_dispatch_step_split`; the scheduler guarantees no other
+                //     CPU will attempt to run it simultaneously.
                 let outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
                     &mut outgoing_tcb.kernel_context.frame;
                 let incoming_frame_ptr: *const crate::kernel::task::ArchSwitchContext =
@@ -880,6 +888,61 @@ impl KernelState {
             return Ok(());
         };
 
+        // Stage 117: decide whether to stash the plan for an out-of-lock
+        // `switch_frames` call in `handle_trap_entry_shared`, or fall back to
+        // the Stage 116 direct path (inside the global lock).
+        //
+        // Stash conditions:
+        //   - Not RISC-V: RISC-V uses a raw kernel-state pointer (no `with_cpu`
+        //     global lock to drop), so stashing here would leave a stash that is
+        //     never drained.
+        //   - Single online CPU: multi-CPU correctness for the lock-drop window
+        //     has not been formally proved. Gate on the accepted single-online
+        //     scheduler state.
+        //   - GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: `handle_trap_entry_shared` has
+        //     signalled that it will drain the stash after `with_cpu` returns.
+        //     Without this flag (direct test/non-trap calls to `dispatch_next_task`),
+        //     there is no external drainer and the stash must not be used.
+        let cpu_idx_for_stash = self.current_cpu().0 as usize;
+        let trap_path_active = cpu_idx_for_stash < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx_for_stash]
+                .load(core::sync::atomic::Ordering::Relaxed);
+        let can_stash_for_lock_drop =
+            !cfg!(target_arch = "riscv64") && self.online_cpu_count() <= 1 && trap_path_active;
+
+        if can_stash_for_lock_drop {
+            // Phase C (Stage 117 live path): stash plan so `switch_frames` runs
+            // OUTSIDE the global `SpinLock<KernelState>`. The drain happens in
+            // `handle_trap_entry_shared` after `with_cpu` drops the global lock.
+            // The calling CPU remains non-preemptible because hardware disabled
+            // interrupts on trap entry and `SpinLock` does not restore IRQ state.
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROP_PLAN_READY outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
+            let cpu_idx = self.current_cpu().0 as usize;
+            if cpu_idx < crate::kernel::scheduler::MAX_CPUS {
+                // SAFETY: single CPU, interrupts disabled by hardware trap entry,
+                // no concurrent accessor; stash is only read/drained in the same
+                // CPU's `handle_trap_entry_shared` after this function returns.
+                unsafe {
+                    crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
+                }
+            }
+            // `switch_frames` will be called by the stash drain in
+            // `handle_trap_entry_shared` after the `with_cpu` guard drops.
+            return Ok(());
+        }
+
+        // Stage 116 fallback / deferred path: call `switch_frames` directly
+        // under the global lock. Used for RISC-V (lockless raw-pointer trap path)
+        // or when more than one CPU is online (multi-CPU proof pending).
+        #[cfg(target_arch = "riscv64")]
+        crate::yarm_log!("D6_GLOBAL_LOCK_DROP_DEFERRED reason=riscv_lockless_trap_path");
+        #[cfg(not(target_arch = "riscv64"))]
+        crate::yarm_log!("D6_GLOBAL_LOCK_DROP_DEFERRED reason=multi_cpu_not_proven");
+
         crate::yarm_log!(
             "D6_SWITCH_PLAN_READY outgoing={} incoming={}",
             plan.outgoing_tid,
@@ -892,7 +955,7 @@ impl KernelState {
         // `dispatch_next_task` returned from that call. The task_state_lock
         // (rank 2) was released when `with_tcbs_mut` above returned. The CPU
         // remains non-preemptible because the outer global `SpinLock<KernelState>`
-        // (a `SpinLockIrq`) holds interrupts disabled on this CPU.
+        // from `with_cpu` is still held here.
         //
         // VALIDATION: D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH
         crate::yarm_log!("D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH");
