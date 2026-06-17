@@ -106,7 +106,7 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
 /// in the incoming task's context under a re-acquired global lock. Restores
 /// the incoming task's user-mode register state to its trap frame.
 #[cfg(target_arch = "x86_64")]
-fn post_switch_restore_arch_thread_state(
+pub(crate) fn post_switch_restore_arch_thread_state(
     kernel: &mut KernelState,
     cpu: CpuId,
     frame: Option<&mut TrapFrame>,
@@ -115,7 +115,7 @@ fn post_switch_restore_arch_thread_state(
 }
 
 #[cfg(target_arch = "aarch64")]
-fn post_switch_restore_arch_thread_state(
+pub(crate) fn post_switch_restore_arch_thread_state(
     kernel: &mut KernelState,
     cpu: CpuId,
     frame: Option<&mut TrapFrame>,
@@ -124,7 +124,7 @@ fn post_switch_restore_arch_thread_state(
 }
 
 #[cfg(target_arch = "riscv64")]
-fn post_switch_restore_arch_thread_state(
+pub(crate) fn post_switch_restore_arch_thread_state(
     _kernel: &mut KernelState,
     _cpu: CpuId,
     _frame: Option<&mut TrapFrame>,
@@ -259,12 +259,44 @@ pub fn handle_trap_entry_shared(
         // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
         let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
         if let Some(plan) = plan {
-            crate::yarm_log!("D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH");
+            crate::yarm_log!(
+                "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
             crate::yarm_log!(
                 "D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing={} incoming={}",
                 plan.outgoing_tid,
                 plan.incoming_tid
             );
+            // Stage 118 Part D: detect first-resume path (x86_64 only).
+            // If the incoming frame's RIP points to the trampoline, stash a
+            // FirstResumeContext so the trampoline can switch back after
+            // calling post_switch_restore_arch_thread_state.
+            #[cfg(target_arch = "x86_64")]
+            {
+                unsafe extern "C" {
+                    fn yarm_kernel_thread_switch_trampoline() -> !;
+                }
+                let trampoline_ip =
+                    yarm_kernel_thread_switch_trampoline as *const () as usize;
+                // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed array).
+                let incoming_ip =
+                    unsafe { (*plan.incoming_frame_ptr).instruction_ptr() };
+                if incoming_ip == trampoline_ip {
+                    let ctx = crate::kernel::boot::FirstResumeContext {
+                        cpu_id: cpu,
+                        incoming_tid: plan.incoming_tid,
+                        outgoing_frame_ptr: plan.outgoing_frame_ptr as *const _,
+                        incoming_frame_ptr: plan.incoming_frame_ptr,
+                        outgoing_stack_top: plan.outgoing_stack_top,
+                    };
+                    // SAFETY: single CPU, interrupts disabled.
+                    unsafe {
+                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].store(ctx);
+                    }
+                }
+            }
             // SAFETY: pointers derived from stable KernelState::tcbs storage under
             // task_state_lock; valid because KernelState is alive for the program
             // lifetime, the array is fixed-size (no reallocation), and the system is
@@ -278,9 +310,14 @@ pub fn handle_trap_entry_shared(
                     plan.incoming_stack_top,
                 );
             }
-            // POINT 2: execution resumes here in the INCOMING task's context.
-            // The INCOMING task's `frame` (on its own kernel stack) is now `frame`.
-            crate::yarm_log!("D6_SWITCH_FRAMES_RETURNED_UNLOCKED");
+            // POINT 2: execution resumes here when the outgoing task is switched
+            // back in (either by the normal scheduler or by the first-resume
+            // trampoline switching back after post_switch_restore).
+            crate::yarm_log!(
+                "D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing={} incoming={}",
+                plan.outgoing_tid,
+                plan.incoming_tid
+            );
             // Re-acquire the global lock to restore the incoming task's arch thread
             // state (populate its trap frame with its user-mode register context).
             shared

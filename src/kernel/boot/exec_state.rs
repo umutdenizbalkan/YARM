@@ -851,14 +851,14 @@ impl KernelState {
                         left[outgoing_idx]
                             .as_mut()
                             .ok_or(KernelError::TaskMissing)?,
-                        right[0].as_ref().ok_or(KernelError::TaskMissing)?,
+                        right[0].as_mut().ok_or(KernelError::TaskMissing)?,
                     )
                 } else {
                     let (left, right) = tcbs.split_at_mut(outgoing_idx);
                     (
                         right[0].as_mut().ok_or(KernelError::TaskMissing)?,
                         left[incoming_idx]
-                            .as_ref()
+                            .as_mut()
                             .ok_or(KernelError::TaskMissing)?,
                     )
                 };
@@ -891,8 +891,10 @@ impl KernelState {
                 //     CPU will attempt to run it simultaneously.
                 let outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
                     &mut outgoing_tcb.kernel_context.frame;
-                let incoming_frame_ptr: *const crate::kernel::task::ArchSwitchContext =
-                    &incoming_tcb.kernel_context.frame;
+                let incoming_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
+                    &mut incoming_tcb.kernel_context.frame;
+                let outgoing_stack_top =
+                    outgoing_tcb.kernel_context.stack_top.map(|t| t.0);
 
                 Ok(Some(DispatchSwitchPlan {
                     outgoing_tid,
@@ -900,6 +902,7 @@ impl KernelState {
                     outgoing_frame_ptr,
                     incoming_frame_ptr,
                     incoming_stack_top,
+                    outgoing_stack_top,
                 }))
             })?;
         // task_state_lock (rank 2) is now released.
@@ -1142,6 +1145,42 @@ impl KernelState {
         }
         self.register_task_with_class(spec.tid, spec.class)?;
         crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
+
+        // Stage 118 Part B: narrow production switch-frame init — x86_64 only,
+        // supervisor/init task (tid == 1) only. Sets kernel_context.initialized =
+        // true so the first-resume handler can prove reacquisition of the global
+        // lock via post_switch_restore_arch_thread_state.
+        #[cfg(target_arch = "x86_64")]
+        if spec.tid == BOOTSTRAP_FIRST_USER_TID {
+            let entry =
+                super::thread_state::yarm_kernel_thread_switch_trampoline as *const () as usize;
+            crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN tid={}", spec.tid);
+            match self.initialize_thread_kernel_switch_frame(spec.tid, entry) {
+                Ok(()) => {
+                    let stack = self.with_tcbs(|tcbs| {
+                        tcbs.iter()
+                            .flatten()
+                            .find(|tcb| tcb.tid.0 == spec.tid)
+                            .and_then(|tcb| tcb.kernel_context.stack_top)
+                            .map(|t| t.0)
+                            .unwrap_or(0)
+                    });
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_FRAME_INIT_DONE tid={} entry=0x{:x} stack=0x{:x}",
+                        spec.tid,
+                        entry,
+                        stack,
+                    );
+                }
+                Err(e) => {
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED reason=init_failed tid={} err={:?}",
+                        spec.tid,
+                        e,
+                    );
+                }
+            }
+        }
 
         if spec.spawner_tid != 0 && spec.service_recv_cap != 0 {
             match self.grant_capability_task_to_task_with_rights(
