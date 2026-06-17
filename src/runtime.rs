@@ -442,14 +442,15 @@ impl SharedKernel {
 
     // ── Stage 108 / Milestone 2 Pass 1: per-domain split-mut seams ────────────
     //
-    // VALIDATION: M2_SEAM_HELPER_ONLY (with_scheduler_split_mut ONLY — see below)
+    // VALIDATION: M2_SEAM_HELPER_ONLY (with_scheduler_split_mut,
+    //   with_ipc_split_mut — see below)
     // VALIDATION: M2_SEAM_LIVE_D3_BRK_SHRINK (with_task_tcbs_split_mut /
     //   with_vm_user_spaces_split_mut / with_memory_split_mut)
     // VALIDATION: FALLBACK_GLOBAL_LOCK
     //
-    // The four seams the D3/D6 live unlocks need: scheduler (rank 1),
-    // task/TCB (rank 2), VM/user-spaces (rank 5), memory/frames (rank 6).
-    // Each acquires ONLY its own per-domain lock — never the outer
+    // Seam set after Stage 115: scheduler (rank 1), task/TCB (rank 2),
+    // IPC/waiter-publish (rank 3), VM/user-spaces (rank 5), memory/frames
+    // (rank 6). Each acquires ONLY its own per-domain lock — never the outer
     // SharedKernel lock.
     //
     // Stage 114 / D-NEXT-2 update: `with_task_tcbs_split_mut`,
@@ -461,6 +462,12 @@ impl SharedKernel {
     // live caller — D6 (`local_dispatch_step_split`) remains deferred (see
     // its doc comment in `scheduler_state.rs`) — so its `M2_SEAM_HELPER_ONLY`
     // / dead-code fence is unchanged.
+    //
+    // Stage 115 / D2+D6 Outcome B: `with_ipc_split_mut` (rank 3) is added,
+    // completing the IPC domain seam. It is helper-only; D2 Phase C cannot be
+    // moved outside `with_cpu` until `dispatch_next_task` → `switch_frames`
+    // (arch-specific cooperative kernel context switch) is restructured per
+    // arch. See doc/KERNEL_UNLOCKING.md §Stage-115 for the precise blocker.
     //
     // Lock-held assertion note: the wrapper itself acquires the domain lock
     // and holds the guard across the closure, so a separate debug
@@ -550,6 +557,35 @@ impl SharedKernel {
         let _guard = memory_lock.lock();
         let memory = unsafe { &mut *memory };
         f(kernel_mut(memory))
+    }
+
+    /// Stage 115: IPC/waiter-publish (rank 3) split-mut seam.
+    ///
+    /// # Validation status
+    /// - M2_SEAM_HELPER_ONLY — no live caller as of Stage 115. D2 Phase C
+    ///   (`recv_block_phase_c_ipc_publish`) cannot be moved outside `with_cpu`
+    ///   until `dispatch_next_task` → `maybe_switch_kernel_context` →
+    ///   `switch_frames` (arch-specific cooperative kernel context switch) is
+    ///   restructured per arch; that is the precise Stage 115 blocker.
+    ///
+    /// Callers must not hold any lock of rank ≤ 3 (scheduler, task, or IPC)
+    /// when invoking this seam.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_ipc_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::boot::IpcSubsystem) -> R,
+    ) -> R {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned
+        // by this SharedKernel. `ipc_split_mut_ptrs_from_raw` derives raw
+        // field pointers via addr_of!/addr_of_mut! without forming a
+        // reference to the whole KernelState; `ipc_state_lock` serializes
+        // access to the `ipc` storage.
+        let (ipc_lock, ipc) =
+            unsafe { KernelState::ipc_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let ipc_lock = unsafe { &*ipc_lock };
+        let _guard = ipc_lock.lock();
+        let ipc = unsafe { &mut *ipc };
+        f(kernel_mut(ipc))
     }
 
     fn with_fault_split_read<R>(&self, f: impl FnOnce(&FaultSubsystem) -> R) -> R {
