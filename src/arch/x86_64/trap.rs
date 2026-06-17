@@ -35,7 +35,7 @@ pub fn last_restored_tls_base(cpu: CpuId) -> Option<usize> {
     (value != 0).then_some(value)
 }
 
-fn restore_arch_thread_state(
+pub(crate) fn restore_arch_thread_state(
     kernel: &mut KernelState,
     cpu: CpuId,
     frame: Option<&mut TrapFrame>,
@@ -179,7 +179,15 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         frame.as_deref_mut(),
         fault_bookkeeping_mode,
     )?;
-    restore_arch_thread_state(kernel, cpu, frame)?;
+    // Stage 117: skip restore_arch_thread_state when a global-lock-drop plan
+    // is stashed for this CPU. The restore will be called post-switch in
+    // `handle_trap_entry_shared` after `switch_frames` runs outside the lock.
+    let cpu_idx = cpu.0 as usize;
+    let switch_pending = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() };
+    if !switch_pending {
+        restore_arch_thread_state(kernel, cpu, frame)?;
+    }
     Ok(())
 }
 

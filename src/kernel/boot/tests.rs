@@ -33578,3 +33578,239 @@ mod stage116_solution1_lock_drop_before_switch {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 117: release outer global SpinLock<KernelState> before switch_frames
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage117_global_lock_drop_before_switch {
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    // -----------------------------------------------------------------------
+    // 1. Per-CPU stash infrastructure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage117_per_cpu_stash_struct_exists() {
+        assert!(
+            MOD_SRC.contains("pub(crate) struct PerCpuSwitchPlanStash"),
+            "mod.rs must define PerCpuSwitchPlanStash"
+        );
+        assert!(
+            MOD_SRC.contains("UnsafeCell<Option<DispatchSwitchPlan>>"),
+            "PerCpuSwitchPlanStash must contain UnsafeCell<Option<DispatchSwitchPlan>>"
+        );
+    }
+
+    #[test]
+    fn stage117_dispatch_switch_plan_stash_static_exists() {
+        assert!(
+            MOD_SRC.contains("pub(crate) static DISPATCH_SWITCH_PLAN_STASH"),
+            "mod.rs must define DISPATCH_SWITCH_PLAN_STASH static"
+        );
+        assert!(
+            MOD_SRC.contains("D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH"),
+            "mod.rs must contain D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH validation anchor"
+        );
+    }
+
+    #[test]
+    fn stage117_trap_path_active_flag_exists() {
+        assert!(
+            MOD_SRC.contains("pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE"),
+            "mod.rs must define GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE per-CPU flag"
+        );
+        assert!(
+            MOD_SRC.contains("D6_GLOBAL_LOCK_DROP_PLAN_BEGIN"),
+            "mod.rs must contain D6_GLOBAL_LOCK_DROP_PLAN_BEGIN validation anchor"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. exec_state.rs: maybe_switch_kernel_context stash path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage117_exec_state_emits_global_lock_drop_plan_begin() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_GLOBAL_LOCK_DROP_PLAN_BEGIN"),
+            "exec_state.rs must emit D6_GLOBAL_LOCK_DROP_PLAN_BEGIN in maybe_switch_kernel_context"
+        );
+    }
+
+    #[test]
+    fn stage117_exec_state_emits_global_lock_drop_plan_ready() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_GLOBAL_LOCK_DROP_PLAN_READY"),
+            "exec_state.rs must emit D6_GLOBAL_LOCK_DROP_PLAN_READY when plan is stashed"
+        );
+    }
+
+    #[test]
+    fn stage117_exec_state_emits_deferred_marker() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_GLOBAL_LOCK_DROP_DEFERRED"),
+            "exec_state.rs must emit D6_GLOBAL_LOCK_DROP_DEFERRED on the fallback path"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("riscv_lockless_trap_path"),
+            "exec_state.rs must have riscv_lockless_trap_path deferred reason"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("multi_cpu_not_proven"),
+            "exec_state.rs must have multi_cpu_not_proven deferred reason"
+        );
+    }
+
+    #[test]
+    fn stage117_exec_state_checks_trap_path_active_flag() {
+        assert!(
+            EXEC_STATE_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE"),
+            "exec_state.rs must check GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE before stashing"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("can_stash_for_lock_drop"),
+            "exec_state.rs must compute can_stash_for_lock_drop gate"
+        );
+    }
+
+    #[test]
+    fn stage117_exec_state_stash_gated_on_single_cpu() {
+        assert!(
+            EXEC_STATE_SRC.contains("online_cpu_count() <= 1"),
+            "exec_state.rs must gate the stash path on online_cpu_count() <= 1"
+        );
+    }
+
+    #[test]
+    fn stage117_exec_state_stash_gated_on_riscv_cfg() {
+        assert!(
+            EXEC_STATE_SRC.contains("cfg!(target_arch = \"riscv64\")"),
+            "exec_state.rs must exclude riscv64 from the stash path via cfg!"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. trap_entry.rs: stash drain and switch_frames outside lock
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage117_trap_entry_sets_trap_path_active_flag() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE"),
+            "trap_entry.rs must set/clear GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE"
+        );
+    }
+
+    #[test]
+    fn stage117_trap_entry_emits_global_lock_dropped_before_switch() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH"),
+            "trap_entry.rs must emit D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH before switch_frames"
+        );
+    }
+
+    #[test]
+    fn stage117_trap_entry_emits_switch_frames_enter_unlocked() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_SWITCH_FRAMES_ENTER_UNLOCKED"),
+            "trap_entry.rs must emit D6_SWITCH_FRAMES_ENTER_UNLOCKED before unlocked switch"
+        );
+    }
+
+    #[test]
+    fn stage117_trap_entry_emits_switch_frames_returned_unlocked() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_SWITCH_FRAMES_RETURNED_UNLOCKED"),
+            "trap_entry.rs must emit D6_SWITCH_FRAMES_RETURNED_UNLOCKED after unlocked switch"
+        );
+    }
+
+    #[test]
+    fn stage117_trap_entry_post_switch_restore_function_exists() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("fn post_switch_restore_arch_thread_state"),
+            "trap_entry.rs must define post_switch_restore_arch_thread_state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Arch handlers skip restore_arch_thread_state when stash is pending
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage117_x86_trap_skips_restore_when_stash_pending() {
+        assert!(
+            X86_TRAP_SRC.contains("DISPATCH_SWITCH_PLAN_STASH"),
+            "x86_64/trap.rs must check DISPATCH_SWITCH_PLAN_STASH before restore_arch_thread_state"
+        );
+        assert!(
+            X86_TRAP_SRC.contains("switch_pending"),
+            "x86_64/trap.rs must use a switch_pending flag to skip restore_arch_thread_state"
+        );
+    }
+
+    #[test]
+    fn stage117_aarch64_trap_skips_restore_when_stash_pending() {
+        assert!(
+            AARCH64_TRAP_SRC.contains("DISPATCH_SWITCH_PLAN_STASH"),
+            "aarch64/trap.rs must check DISPATCH_SWITCH_PLAN_STASH before restore_arch_thread_state"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("switch_pending"),
+            "aarch64/trap.rs must use a switch_pending flag to skip restore_arch_thread_state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Stage 116 markers preserved (fallback path still present)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage117_stage116_fallback_markers_preserved() {
+        // The Stage 116 direct switch_frames path remains for RISC-V and multi-CPU.
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH"),
+            "exec_state.rs must preserve D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH (Stage 116 fallback)"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_FRAMES_ENTER"),
+            "exec_state.rs must preserve D6_SWITCH_FRAMES_ENTER (Stage 116 fallback)"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_FRAMES_RETURNED"),
+            "exec_state.rs must preserve D6_SWITCH_FRAMES_RETURNED (Stage 116 fallback)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Invariant checks: Stage 116 seams still present
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage117_dispatch_switch_plan_struct_preserved() {
+        // The DispatchSwitchPlan from Stage 116 must still exist.
+        assert!(
+            MOD_SRC.contains("pub(crate) struct DispatchSwitchPlan"),
+            "DispatchSwitchPlan from Stage 116 must be preserved in Stage 117"
+        );
+        assert!(
+            MOD_SRC.contains("outgoing_frame_ptr: *mut"),
+            "DispatchSwitchPlan raw pointer fields must be preserved"
+        );
+    }
+
+    #[test]
+    fn stage117_syscall_count_unchanged() {
+        let syscall_src = include_str!("../syscall.rs");
+        assert!(
+            syscall_src.contains("pub const VARIANT_COUNT: usize = 23"),
+            "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline)"
+        );
+    }
+}
