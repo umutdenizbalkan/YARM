@@ -229,12 +229,14 @@ The four highest-impact items, in order of unlock value:
    shrink path (Outcome A). Stages 115–116 addressed the D2/D6 blocker
    iteratively: Stage 115 added the rank-3 IPC seam; Stage 116 removed the
    `task_state_lock` (rank-2 sub-lock) from crossing `switch_frames` via
-   `DispatchSwitchPlan`. Stage 117 implemented Solution 2: the outer global
-   `SpinLock<KernelState>` (from `with_cpu`) is now dropped before
-   `switch_frames` on single-CPU x86_64/AArch64 production trap paths via the
-   `PerCpuSwitchPlanStash` / `DISPATCH_SWITCH_PLAN_STASH` infrastructure.
-   QEMU smoke acceptance for Stage 117 is the immediate next step; after that,
-   D2/D6 genuine seam live-wire is the main remaining unlock target.
+   `DispatchSwitchPlan`. Stage 117 (Outcome B) adds the global-lock-drop stash
+   infrastructure (`PerCpuSwitchPlanStash`, `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`)
+   but cannot prove the unlocked path in smoke: no production task has
+   `kernel_context.initialized = true`, so `switch_frames` is never called.
+   Smoke-observable deferred markers (`D6_GLOBAL_LOCK_DROP_DEFERRED
+   reason=no_outgoing_task` / `reason=no_kernel_ctx_switch_frame`) prove the
+   trap path reaches the decision point. Next: QEMU smoke acceptance for Stage 117,
+   then kernel-thread infrastructure to upgrade to Outcome A.
    See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge

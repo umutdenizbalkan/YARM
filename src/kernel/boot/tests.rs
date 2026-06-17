@@ -33667,6 +33667,32 @@ mod stage117_global_lock_drop_before_switch {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // 2b. Smoke-observable deferred markers (Outcome B diagnosis)
+    //     These fire on the production trap path (x86_64/AArch64 non-RISC-V)
+    //     when switch_frames is not called because no tasks have initialized
+    //     kernel contexts.  They appear in smoke logs and prove the production
+    //     path reaches the lock-drop decision point.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage117_exec_state_emits_no_outgoing_task_deferred_reason() {
+        assert!(
+            EXEC_STATE_SRC.contains("no_outgoing_task"),
+            "exec_state.rs must emit D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task \
+             when outgoing_tid is None on the x86_64/AArch64 trap path (IPC blocking dispatch)"
+        );
+    }
+
+    #[test]
+    fn stage117_exec_state_emits_no_kernel_ctx_deferred_reason() {
+        assert!(
+            EXEC_STATE_SRC.contains("no_kernel_ctx_switch_frame"),
+            "exec_state.rs must emit D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_kernel_ctx_switch_frame \
+             when plan is None (tasks lack initialized kernel switch frames) on the trap path"
+        );
+    }
+
     #[test]
     fn stage117_exec_state_checks_trap_path_active_flag() {
         assert!(
