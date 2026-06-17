@@ -226,15 +226,15 @@ The four highest-impact items, in order of unlock value:
 
 2. **Kernel-unlocking D2 + D6 genuine seam live-wire, then x86_64
    AP per-CPU environment (D-NEXT-2).** Stage 114 live-wired D3's
-   VmBrk shrink path (Outcome A). Stage 115 attempted D2+D6 genuine
-   live-wire; both remain at Outcome B. The new precise blocker identified
-   in Stage 115: `dispatch_next_task` Phase B → `maybe_switch_kernel_context`
-   → `switch_frames` (arch-specific cooperative kernel context switch,
-   three per-arch impls). The rank-3 IPC split-mut seam (`with_ipc_split_mut`)
-   was added as a genuine deliverable, completing the per-domain seam set
-   (ranks 1/2/3/5/6). The next PR must tackle the `switch_frames`
-   restructuring to enable D2/D6 live-wire, or fall back to D4 step 1 or
-   D-NEXT-2. See `doc/KERNEL_UNLOCKING.md` §1 Stage 115 / §7.1.5.
+   VmBrk shrink path (Outcome A). Stages 115–116 addressed the D2/D6
+   blocker iteratively: Stage 115 added the rank-3 IPC seam completing
+   the per-domain seam set (ranks 1/2/3/5/6); Stage 116 removed the
+   `task_state_lock` (rank-2 sub-lock) from crossing the `switch_frames`
+   boundary via `DispatchSwitchPlan`. D2 and D6 remain at Outcome B: the
+   outer global `SpinLock<KernelState>` (from `with_cpu`) still spans
+   `switch_frames`. The next PR must release the global lock before
+   calling `switch_frames`, or fall back to D4 step 1 or D-NEXT-2.
+   See `doc/KERNEL_UNLOCKING.md` §1 Stage 116 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating
