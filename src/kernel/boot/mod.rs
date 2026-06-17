@@ -509,14 +509,21 @@ pub(crate) struct DispatchSwitchPlan {
     pub(crate) outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext,
     /// Raw pointer to the incoming task's `ArchSwitchContext` frame.
     ///
-    /// Derived from `&TCB.kernel_context.frame` under `task_state_lock`.
-    /// Same stability argument as `outgoing_frame_ptr`.
-    pub(crate) incoming_frame_ptr: *const crate::kernel::task::ArchSwitchContext,
+    /// Derived from `&mut TCB.kernel_context.frame` under `task_state_lock`.
+    /// Stored as `*mut` so that `yarm_kernel_thread_switch_trampoline` can use
+    /// it as the `prev` parameter of a switch-back `switch_frames` call on the
+    /// first-resume path.
+    pub(crate) incoming_frame_ptr: *mut crate::kernel::task::ArchSwitchContext,
     /// Incoming task's kernel stack top (copied scalar, not a reference).
     ///
     /// Copied from `incoming_tcb.kernel_context.stack_top` under the lock;
     /// no reference into TCB storage survives after `task_state_lock` drops.
     pub(crate) incoming_stack_top: Option<u64>,
+    /// Outgoing task's kernel stack top (copied scalar, not a reference).
+    ///
+    /// Used by the first-resume trampoline when switching back to the outgoing
+    /// task: passed as `next_kernel_stack_top` to update TSS RSP0 on x86_64.
+    pub(crate) outgoing_stack_top: Option<u64>,
 }
 
 /// Stage 117: per-CPU stash cell for a `DispatchSwitchPlan` that will be
@@ -596,6 +603,79 @@ pub(crate) static DISPATCH_SWITCH_PLAN_STASH: [PerCpuSwitchPlanStash;
 pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [core::sync::atomic::AtomicBool;
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 118: context for the first-resume trampoline (`yarm_kernel_thread_switch_trampoline`).
+///
+/// Set by the Stage 117 stash drain in `handle_trap_entry_shared` immediately
+/// before calling `switch_frames` for a first-resume incoming task. Consumed by
+/// the trampoline on the incoming task's first kernel-context-switch resume.
+///
+/// # Safety
+///
+/// Accessed only from the trap path on the local CPU with interrupts disabled.
+/// No cross-CPU sharing occurs. Only one context can be stashed per CPU at a time.
+pub(crate) struct FirstResumeContext {
+    /// CPU ID of the CPU on which the switch is occurring.
+    pub(crate) cpu_id: crate::kernel::scheduler::CpuId,
+    /// TID of the incoming (first-resuming) task.
+    pub(crate) incoming_tid: u64,
+    /// Pointer to the outgoing task's frame (for the switch-back `next` arg).
+    pub(crate) outgoing_frame_ptr: *const crate::kernel::task::ArchSwitchContext,
+    /// Pointer to the incoming task's frame (for the switch-back `prev` arg).
+    pub(crate) incoming_frame_ptr: *mut crate::kernel::task::ArchSwitchContext,
+    /// Outgoing task's kernel stack top for TSS RSP0 update on switch-back.
+    pub(crate) outgoing_stack_top: Option<u64>,
+}
+
+/// Stage 118: per-CPU stash for `FirstResumeContext`.
+///
+/// # Safety
+///
+/// Accessed only from the local CPU's trap path with interrupts disabled.
+/// No concurrent access from other threads or CPUs is possible.
+pub(crate) struct PerCpuFirstResumeStash {
+    inner: core::cell::UnsafeCell<Option<FirstResumeContext>>,
+}
+
+// SAFETY: Accessed only from the local CPU's trap path with interrupts
+// disabled. No concurrent access from other threads/CPUs is possible.
+unsafe impl Sync for PerCpuFirstResumeStash {}
+
+impl PerCpuFirstResumeStash {
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: core::cell::UnsafeCell::new(None),
+        }
+    }
+
+    /// Store a first-resume context in the stash.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent access (interrupts disabled, single CPU).
+    pub(crate) unsafe fn store(&self, ctx: FirstResumeContext) {
+        unsafe { *self.inner.get() = Some(ctx) }
+    }
+
+    /// Take the first-resume context from the stash (consumes it), leaving the slot empty.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure no concurrent access (interrupts disabled, single CPU).
+    pub(crate) unsafe fn take(&self) -> Option<FirstResumeContext> {
+        unsafe { (*self.inner.get()).take() }
+    }
+}
+
+/// Stage 118: per-CPU stash for the first-resume context. Populated by the
+/// stash drain in `handle_trap_entry_shared` before the first `switch_frames`
+/// for a task whose entry point is `yarm_kernel_thread_switch_trampoline`.
+/// Consumed by the trampoline on the incoming task's kernel stack.
+///
+/// VALIDATION: D6_FIRST_RESUME_ENTER / D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE
+pub(crate) static FIRST_RESUME_STASH: [PerCpuFirstResumeStash;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { PerCpuFirstResumeStash::new() }; crate::kernel::scheduler::MAX_CPUS];
 
 #[cfg(feature = "hosted-dev")]
 const MAX_NOTIFICATIONS: usize = 64;

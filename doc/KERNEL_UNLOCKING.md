@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs}.rs` | **PARTIAL** | Stage 102 | rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs`, `syscall/cap.rs`, `syscall/sched.rs`, `syscall/process.rs`, `syscall/recv_shared_v3.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` infrastructure for dropping `SpinLock<KernelState>` before `switch_frames` but remains Outcome B (no production task has `kernel_context.initialized = true`); per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64) — still Outcome B (`switch_frames` never fires: only one task initialized); per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -972,6 +972,170 @@ Acceptance evidence (Stage 117):
 Workspace tests: 1548/0 lib (`--test-threads=1`, 2 ignored, pre-existing crash
 in `load_elf_returns_heap_base_aligned_to_max_pt_load_end` under parallel runner).
 `cargo check --features hosted-dev` and `git diff --check` clean.
+No ABI/protocol/syscall-number/image-ID change.
+`Syscall::VARIANT_COUNT` remains 23.
+
+---
+
+### Stage 118 — Production switch-frame init and first-resume handler (Outcome B — scaffolding, not smoke-proven)
+
+**Goal stated in the task:** implement the narrow next step required before Stage
+117 can become Outcome A: (a) initialize a production kernel switch frame for the
+supervisor/init task (`BOOTSTRAP_FIRST_USER_TID = 1`) on x86_64; (b) replace the
+spin-loop trampoline with a real first-resume handler that re-acquires the global
+lock and calls `post_switch_restore_arch_thread_state`; (c) prove via D6 markers
+that the handler can safely reacquire the lock; (d) keep all behavior safe and
+fallback-gated.
+
+**Outcome: B — preparatory scaffolding; `switch_frames` + first-resume path not
+exercised in production smoke.**
+
+Stage 118 adds the second half of the kernel-thread switch frame infrastructure.
+The `switch_frames` call in `handle_trap_entry_shared` still never fires in
+production smoke: only task 1 (tid = 1) gets `initialized = true`, and
+`switch_frames` requires BOTH outgoing AND incoming tasks to have
+`initialized = true`. No dispatch event pairs two initialized tasks in the current
+smoke scenario.
+
+**Changes by part:**
+
+**Part A — Audit.** `ArchSwitchContext`, `KernelExecutionContext`,
+`provision_default_kernel_context`, `initialize_thread_kernel_switch_frame`,
+`yarm_kernel_thread_switch_trampoline`, `maybe_switch_kernel_context`,
+`post_switch_restore_arch_thread_state`, and the per-arch `switch_frames`
+implementations were audited to verify the type changes and new trampoline design
+are safe.
+
+**Part B — Narrow production init call** (`exec_state.rs`
+`spawn_user_task_from_image`, x86_64 + `tid == BOOTSTRAP_FIRST_USER_TID` only):
+calls `self.initialize_thread_kernel_switch_frame(spec.tid, trampoline_entry)`
+after `register_task_with_class`. Emits:
+- `D6_KERNEL_SWITCH_FRAME_INIT_BEGIN tid=1`
+- `D6_KERNEL_SWITCH_FRAME_INIT_DONE tid=1 entry=0x... stack=0x...` on success
+- `D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED reason=init_failed tid=1 err=...` on failure
+
+Task 1's `kernel_context.initialized` is now set to `true` on x86_64 at spawn
+time. No other task gets `initialized = true` (the gate only fires for
+`tid == BOOTSTRAP_FIRST_USER_TID`).
+
+`DispatchSwitchPlan.incoming_frame_ptr` changed from `*const` to `*mut`
+(trampoline needs mutable access for `switch_frames` `prev` argument).
+`DispatchSwitchPlan.outgoing_stack_top: Option<u64>` added (trampoline needs
+the outgoing task's stack top to restore the TSS RSP0 on switch-back).
+`maybe_switch_kernel_context` updated: `incoming_tcb` now uses `.as_mut()`,
+`incoming_frame_ptr` is `*mut`, and `outgoing_stack_top` is populated.
+
+**Part C — Real first-resume handler** (`thread_state.rs`
+`yarm_kernel_thread_switch_trampoline`):
+
+On non-x86_64: emits `D6_FIRST_RESUME_DEFERRED reason=non_x86_64_arch` and spins.
+
+On x86_64:
+1. Takes `FIRST_RESUME_STASH[BOOTSTRAP_CPU_ID]` (per-CPU context stashed by
+   the trap drain).
+2. Emits `D6_FIRST_RESUME_ENTER tid={incoming} cpu={cpu_id}`.
+3. `Bootstrap::shared_static_ref()` → emits `D6_FIRST_RESUME_DEFERRED
+   reason=shared_not_ready` and spins if `None`.
+4. Emits `D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN`.
+5. `shared.with_cpu(cpu_id, |kernel| { ... })`:
+   - Emits `D6_FIRST_RESUME_LOCK_REACQUIRE_DONE`
+   - Emits `D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN`
+   - Calls `post_switch_restore_arch_thread_state(kernel, cpu_id, None)` → no-op
+     on x86_64 (frame is `None` → `restore_arch_thread_state` returns `Ok(())`)
+   - Emits `D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE`
+6. Calls `switch_frames(&mut *incoming_frame_ptr, &*outgoing_frame_ptr,
+   outgoing_stack_top)` to switch back to the outgoing task. In production,
+   execution never returns here — it resumes the outgoing task at POINT 2 in
+   `handle_trap_entry_shared`.
+7. Defensive spin for test builds (where `switch_frames` is a no-op).
+
+`kernel_switch_frame_trampoline_ip() -> usize` helper added as `pub(crate)` in
+`thread_state.rs`.
+
+**Part D — Integration with Stage 117 stash path** (`trap_entry.rs`):
+
+`post_switch_restore_arch_thread_state` made `pub(crate)` (all three arch
+variants) so the trampoline in `thread_state.rs` can call
+`crate::arch::trap_entry::post_switch_restore_arch_thread_state(...)`.
+
+`D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` and `D6_SWITCH_FRAMES_RETURNED_UNLOCKED`
+now include `outgoing={}` and `incoming={}` fields.
+
+x86_64-gated first-resume detection block added before `switch_frames` in the
+stash drain: compares `incoming_frame.instruction_ptr()` to the trampoline
+address (via `unsafe extern "C" { fn yarm_kernel_thread_switch_trampoline() -> !; }`).
+If equal, populates `FIRST_RESUME_STASH[cpu_idx]` with a `FirstResumeContext`.
+
+Required D6 proof-marker sequence (emitted when the live switch path fires):
+```
+D6_SWITCH_PLAN_READY outgoing=A incoming=B
+D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing=A incoming=B
+D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing=A incoming=B
+D6_FIRST_RESUME_ENTER tid=B cpu=0
+D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN
+D6_FIRST_RESUME_LOCK_REACQUIRE_DONE
+D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN
+D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE
+D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing=A incoming=B
+```
+None of these appear in current smoke (Outcome B — `switch_frames` never fires).
+
+**Part E — Gating.** x86_64 only for the init call and trampoline. Single-CPU
+only (inherited from Stage 117's `can_stash_for_lock_drop` condition). Only when
+both tasks have `initialized = true` (Stage 117 precondition, never met in smoke).
+
+**Part F — New infrastructure types** (`mod.rs`):
+- `FirstResumeContext`: `cpu_id`, `incoming_tid`, `outgoing_frame_ptr: *const`,
+  `incoming_frame_ptr: *mut`, `outgoing_stack_top: Option<u64>`.
+- `PerCpuFirstResumeStash`: `UnsafeCell<Option<FirstResumeContext>>` with
+  `unsafe impl Sync`, `store`, `take` methods.
+- `FIRST_RESUME_STASH: [PerCpuFirstResumeStash; MAX_CPUS]` static.
+
+**Hard rules preserved.** No ABI changes. No syscall number changes. No image ID
+changes. No service protocol changes. No FS gate changes. No x86_64 AP
+scheduler-online. No per-CPU runqueue sharding. No D2-B send blocking. No
+D3-FULL. No `switch_frames` assembly ABI change. No lock handoff / `mem::forget`
+lock guards. No assembly unlock callbacks. RISC-V remains in smoke matrix on
+Stage 117 fallback. `SYSCALL::VARIANT_COUNT` remains 23.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained 21 Stage 118 tests in
+`mod stage118_production_switch_frame_init`:
+`stage118_dispatch_switch_plan_has_outgoing_stack_top`,
+`stage118_dispatch_switch_plan_incoming_frame_ptr_is_mut`,
+`stage118_first_resume_context_struct_exists`,
+`stage118_per_cpu_first_resume_stash_struct_exists`,
+`stage118_first_resume_stash_static_exists`,
+`stage118_exec_state_emits_switch_frame_init_begin`,
+`stage118_exec_state_emits_switch_frame_init_done`,
+`stage118_exec_state_emits_switch_frame_init_deferred`,
+`stage118_exec_state_switch_frame_init_gated_on_x86_64_and_tid1`,
+`stage118_exec_state_incoming_frame_ptr_derived_as_mut`,
+`stage118_exec_state_outgoing_stack_top_in_plan`,
+`stage118_thread_state_trampoline_ip_helper_exists`,
+`stage118_thread_state_trampoline_emits_first_resume_enter`,
+`stage118_thread_state_trampoline_emits_lock_reacquire_markers`,
+`stage118_thread_state_trampoline_emits_post_switch_restore_markers`,
+`stage118_thread_state_trampoline_emits_deferred_on_non_x86_64`,
+`stage118_trap_entry_emits_global_lock_dropped_with_tids`,
+`stage118_trap_entry_emits_switch_frames_returned_with_tids`,
+`stage118_trap_entry_post_switch_restore_is_pub_crate`,
+`stage118_trap_entry_populates_first_resume_stash`,
+`stage118_stage117_seams_preserved`.
+
+Stage 116 test `stage116_dispatch_switch_plan_has_raw_pointer_fields` updated:
+`incoming_frame_ptr: *const` assertion changed to `*mut` to reflect Stage 118's
+widening of the type (trampoline needs `*mut` for `switch_frames` `prev` argument).
+
+Acceptance evidence (Stage 118):
+
+| Smoke | Result | Notes |
+|-------|--------|-------|
+| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PENDING | `D6_KERNEL_SWITCH_FRAME_INIT_DONE tid=1` must appear; `D6_FIRST_RESUME_ENTER` not required (Outcome B) |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PENDING | same |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PENDING | `D6_KERNEL_SWITCH_FRAME_INIT_BEGIN` not emitted on AArch64 (x86_64 only); Stage 117 deferred markers unchanged |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PENDING | RISC-V unchanged; `D6_GLOBAL_LOCK_DROP_DEFERRED reason=riscv_lockless_trap_path` still appears |
+
+Workspace tests: 1569/0 lib (`--test-threads=1`, 2 ignored).
 No ABI/protocol/syscall-number/image-ID change.
 `Syscall::VARIANT_COUNT` remains 23.
 

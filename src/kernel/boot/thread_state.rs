@@ -20,10 +20,80 @@ const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
 const USER_VIRT_TOP_EXCLUSIVE: u64 = crate::kernel::vm::KERNEL_SPACE_BASE;
 const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
 
+/// Returns the raw instruction-pointer value of `yarm_kernel_thread_switch_trampoline`,
+/// used by the trap-entry stash drain to detect the first-resume path.
+pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
+    yarm_kernel_thread_switch_trampoline as *const () as usize
+}
+
+/// First-resume handler. Entered via `switch_frames` when the incoming task's
+/// kernel switch frame has never executed (RIP == trampoline address).
+///
+/// On x86_64: takes the per-CPU `FirstResumeContext` stash, re-acquires the
+/// global lock, calls `post_switch_restore_arch_thread_state` with no trap
+/// frame (no-op on x86_64), then switches back to the outgoing task.
+///
+/// On all other architectures (and as a defensive fallback on x86_64 when the
+/// stash is absent): emits `D6_FIRST_RESUME_DEFERRED` and spins.
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
-    loop {
-        core::hint::spin_loop();
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=non_x86_64_arch");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Single-CPU precondition: the stash is always on CPU 0 (bootstrap CPU).
+        let cpu_idx = crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize;
+        // SAFETY: single CPU, interrupts disabled (trap path precondition for
+        // can_stash_for_lock_drop), no concurrent accessor of FIRST_RESUME_STASH.
+        let ctx =
+            unsafe { crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].take() };
+        let Some(ctx) = ctx else {
+            crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=stash_empty");
+            loop {
+                core::hint::spin_loop();
+            }
+        };
+        crate::yarm_log!(
+            "D6_FIRST_RESUME_ENTER tid={} cpu={}",
+            ctx.incoming_tid,
+            ctx.cpu_id.0
+        );
+        let Some(shared) = super::Bootstrap::shared_static_ref() else {
+            crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=shared_not_ready");
+            loop {
+                core::hint::spin_loop();
+            }
+        };
+        crate::yarm_log!("D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN");
+        let _ = shared.with_cpu(ctx.cpu_id, |kernel| {
+            crate::yarm_log!("D6_FIRST_RESUME_LOCK_REACQUIRE_DONE");
+            crate::yarm_log!("D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN");
+            let r = crate::arch::trap_entry::post_switch_restore_arch_thread_state(
+                kernel,
+                ctx.cpu_id,
+                None,
+            );
+            crate::yarm_log!("D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE");
+            r
+        });
+        // Switch back to the outgoing task. In production, execution never returns
+        // from switch_frames here — it jumps to the outgoing task's POINT 2.
+        // In test builds (switch_frames is a no-op), we fall through to the spin.
+        crate::arch::selected_isa::context_switch::switch_frames(
+            // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed-size
+            // array); no concurrent access (single CPU, interrupts disabled).
+            unsafe { &mut *ctx.incoming_frame_ptr },
+            unsafe { &*ctx.outgoing_frame_ptr },
+            ctx.outgoing_stack_top,
+        );
+        loop {
+            core::hint::spin_loop();
+        }
     }
 }
 

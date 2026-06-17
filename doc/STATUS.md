@@ -233,11 +233,17 @@ The four highest-impact items, in order of unlock value:
    infrastructure (`PerCpuSwitchPlanStash`, `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`)
    but cannot prove the unlocked path in smoke: no production task has
    `kernel_context.initialized = true`, so `switch_frames` is never called.
-   Smoke-observable deferred markers (`D6_GLOBAL_LOCK_DROP_DEFERRED
-   reason=no_outgoing_task` / `reason=no_kernel_ctx_switch_frame`) prove the
-   trap path reaches the decision point. Next: QEMU smoke acceptance for Stage 117,
-   then kernel-thread infrastructure to upgrade to Outcome A.
-   See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / §7.1.5.
+   Stage 118 (Outcome B) adds the second half: `BOOTSTRAP_FIRST_USER_TID` (tid=1)
+   now gets `initialized = true` on x86_64 (via `initialize_thread_kernel_switch_frame`
+   in `spawn_user_task_from_image`); the spin-loop trampoline is replaced with a
+   real first-resume handler that re-acquires the global lock and calls
+   `post_switch_restore_arch_thread_state`; `FIRST_RESUME_STASH` and
+   `FirstResumeContext` infrastructure is added; `DispatchSwitchPlan` gains
+   `outgoing_stack_top` and `incoming_frame_ptr` is widened to `*mut`. Still
+   Outcome B: `switch_frames` never fires in smoke because only one task is
+   initialized (requires both sides). Next: QEMU smoke acceptance for Stages
+   117–118, then add a second initialized task to reach Outcome A.
+   See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

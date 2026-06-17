@@ -33313,8 +33313,8 @@ mod stage116_solution1_lock_drop_before_switch {
             "DispatchSwitchPlan must have outgoing_frame_ptr: *mut ArchSwitchContext"
         );
         assert!(
-            MOD_SRC.contains("incoming_frame_ptr: *const"),
-            "DispatchSwitchPlan must have incoming_frame_ptr: *const ArchSwitchContext"
+            MOD_SRC.contains("incoming_frame_ptr: *mut"),
+            "DispatchSwitchPlan must have incoming_frame_ptr: *mut ArchSwitchContext"
         );
     }
 
@@ -33837,6 +33837,250 @@ mod stage117_global_lock_drop_before_switch {
         assert!(
             syscall_src.contains("pub const VARIANT_COUNT: usize = 23"),
             "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 118: Production switch-frame init and first-resume handler
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage118_production_switch_frame_init {
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // -----------------------------------------------------------------------
+    // 1. DispatchSwitchPlan gains outgoing_stack_top and incoming_frame_ptr
+    //    is now *mut (needed so the trampoline can switch back via switch_frames)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage118_dispatch_switch_plan_has_outgoing_stack_top() {
+        assert!(
+            MOD_SRC.contains("outgoing_stack_top: Option<u64>"),
+            "DispatchSwitchPlan must have outgoing_stack_top: Option<u64> field"
+        );
+    }
+
+    #[test]
+    fn stage118_dispatch_switch_plan_incoming_frame_ptr_is_mut() {
+        assert!(
+            MOD_SRC.contains("incoming_frame_ptr: *mut"),
+            "DispatchSwitchPlan.incoming_frame_ptr must be *mut (trampoline needs to write back)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. FirstResumeContext and FIRST_RESUME_STASH infrastructure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage118_first_resume_context_struct_exists() {
+        assert!(
+            MOD_SRC.contains("pub(crate) struct FirstResumeContext"),
+            "mod.rs must define FirstResumeContext"
+        );
+        assert!(
+            MOD_SRC.contains("incoming_tid: u64"),
+            "FirstResumeContext must have incoming_tid: u64"
+        );
+        assert!(
+            MOD_SRC.contains("outgoing_stack_top"),
+            "FirstResumeContext must have outgoing_stack_top field"
+        );
+    }
+
+    #[test]
+    fn stage118_per_cpu_first_resume_stash_struct_exists() {
+        assert!(
+            MOD_SRC.contains("pub(crate) struct PerCpuFirstResumeStash"),
+            "mod.rs must define PerCpuFirstResumeStash"
+        );
+        assert!(
+            MOD_SRC.contains("UnsafeCell<Option<FirstResumeContext>>"),
+            "PerCpuFirstResumeStash must contain UnsafeCell<Option<FirstResumeContext>>"
+        );
+    }
+
+    #[test]
+    fn stage118_first_resume_stash_static_exists() {
+        assert!(
+            MOD_SRC.contains("pub(crate) static FIRST_RESUME_STASH"),
+            "mod.rs must define FIRST_RESUME_STASH static"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. exec_state.rs: Part B narrow production init call
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage118_exec_state_emits_switch_frame_init_begin() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
+            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_BEGIN in spawn_user_task_from_image"
+        );
+    }
+
+    #[test]
+    fn stage118_exec_state_emits_switch_frame_init_done() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_DONE on success"
+        );
+    }
+
+    #[test]
+    fn stage118_exec_state_emits_switch_frame_init_deferred() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
+            "exec_state.rs must emit D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED on failure"
+        );
+    }
+
+    #[test]
+    fn stage118_exec_state_switch_frame_init_gated_on_x86_64_and_tid1() {
+        assert!(
+            EXEC_STATE_SRC.contains("target_arch = \"x86_64\""),
+            "exec_state.rs switch-frame init must be gated on #[cfg(target_arch = \"x86_64\")]"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
+            "exec_state.rs switch-frame init must be gated on spec.tid == BOOTSTRAP_FIRST_USER_TID"
+        );
+    }
+
+    #[test]
+    fn stage118_exec_state_incoming_frame_ptr_derived_as_mut() {
+        assert!(
+            EXEC_STATE_SRC.contains("incoming_frame_ptr: *mut"),
+            "exec_state.rs must derive incoming_frame_ptr as *mut in maybe_switch_kernel_context"
+        );
+    }
+
+    #[test]
+    fn stage118_exec_state_outgoing_stack_top_in_plan() {
+        assert!(
+            EXEC_STATE_SRC.contains("outgoing_stack_top"),
+            "exec_state.rs must populate outgoing_stack_top in DispatchSwitchPlan construction"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. thread_state.rs: Part C first-resume handler and trampoline IP helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage118_thread_state_trampoline_ip_helper_exists() {
+        assert!(
+            THREAD_STATE_SRC.contains("pub(crate) fn kernel_switch_frame_trampoline_ip"),
+            "thread_state.rs must define pub(crate) fn kernel_switch_frame_trampoline_ip()"
+        );
+    }
+
+    #[test]
+    fn stage118_thread_state_trampoline_emits_first_resume_enter() {
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_ENTER"),
+            "thread_state.rs trampoline must emit D6_FIRST_RESUME_ENTER"
+        );
+    }
+
+    #[test]
+    fn stage118_thread_state_trampoline_emits_lock_reacquire_markers() {
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN"),
+            "thread_state.rs trampoline must emit D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_LOCK_REACQUIRE_DONE"),
+            "thread_state.rs trampoline must emit D6_FIRST_RESUME_LOCK_REACQUIRE_DONE"
+        );
+    }
+
+    #[test]
+    fn stage118_thread_state_trampoline_emits_post_switch_restore_markers() {
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN"),
+            "thread_state.rs trampoline must emit D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE"),
+            "thread_state.rs trampoline must emit D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE"
+        );
+    }
+
+    #[test]
+    fn stage118_thread_state_trampoline_emits_deferred_on_non_x86_64() {
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_DEFERRED"),
+            "thread_state.rs trampoline must emit D6_FIRST_RESUME_DEFERRED on fallback paths"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("non_x86_64_arch"),
+            "thread_state.rs trampoline must have non_x86_64_arch deferred reason"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. trap_entry.rs: Part D first-resume detection and stash population
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage118_trap_entry_emits_global_lock_dropped_with_tids() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing={}"),
+            "trap_entry.rs must emit D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH with outgoing/incoming fields"
+        );
+    }
+
+    #[test]
+    fn stage118_trap_entry_emits_switch_frames_returned_with_tids() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing={}"),
+            "trap_entry.rs must emit D6_SWITCH_FRAMES_RETURNED_UNLOCKED with outgoing/incoming fields"
+        );
+    }
+
+    #[test]
+    fn stage118_trap_entry_post_switch_restore_is_pub_crate() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("pub(crate) fn post_switch_restore_arch_thread_state"),
+            "trap_entry.rs must make post_switch_restore_arch_thread_state pub(crate) for trampoline access"
+        );
+    }
+
+    #[test]
+    fn stage118_trap_entry_populates_first_resume_stash() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("FIRST_RESUME_STASH"),
+            "trap_entry.rs must populate FIRST_RESUME_STASH before switch_frames on first-resume path"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("yarm_kernel_thread_switch_trampoline"),
+            "trap_entry.rs must compare incoming frame IP to trampoline address"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Invariant: Stage 117 seams preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage118_stage117_seams_preserved() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_PLAN_READY"),
+            "Stage 117 D6_SWITCH_PLAN_READY marker must be preserved in Stage 118"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_SWITCH_FRAMES_ENTER_UNLOCKED"),
+            "Stage 117 D6_SWITCH_FRAMES_ENTER_UNLOCKED marker must be preserved in Stage 118"
+        );
+        assert!(
+            MOD_SRC.contains("pub(crate) static DISPATCH_SWITCH_PLAN_STASH"),
+            "Stage 117 DISPATCH_SWITCH_PLAN_STASH must be preserved in Stage 118"
         );
     }
 }
