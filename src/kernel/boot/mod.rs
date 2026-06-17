@@ -480,6 +480,42 @@ pub(crate) struct VmAnonMapRollbackTlbPlan {
     pub(crate) aggregate_target_bitmap: crate::kernel::topology::CpuBitmap,
 }
 
+/// Stage 116 / Solution 1: typed context-switch plan for D6 dispatch.
+///
+/// Built under the `task_state_lock` (rank 2) inside
+/// `maybe_switch_kernel_context` and used after that sub-lock is released.
+/// Contains only raw pointers into stable `KernelState::tcbs` storage and
+/// copied scalar values — no Rust references, no live lock guards, no
+/// borrowed scheduler state survive the sub-lock boundary.
+///
+/// Safety invariant: the raw pointer fields are valid only while the outer
+/// global `SpinLock<KernelState>` (from `SharedKernel::with_cpu`) is held
+/// on the current CPU. No cross-CPU sharing occurs.
+///
+/// VALIDATION: D6_SWITCH_PLAN_READY
+pub(crate) struct DispatchSwitchPlan {
+    /// TID of the outgoing (currently-running) task.
+    pub(crate) outgoing_tid: u64,
+    /// TID of the incoming (next-to-run) task.
+    pub(crate) incoming_tid: u64,
+    /// Raw pointer to the outgoing task's `ArchSwitchContext` frame.
+    ///
+    /// Derived from `&mut TCB.kernel_context.frame` under `task_state_lock`.
+    /// After lock release, valid because `KernelState::tcbs` is a fixed-size
+    /// array (no move/reallocation) and the global lock is still held.
+    pub(crate) outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext,
+    /// Raw pointer to the incoming task's `ArchSwitchContext` frame.
+    ///
+    /// Derived from `&TCB.kernel_context.frame` under `task_state_lock`.
+    /// Same stability argument as `outgoing_frame_ptr`.
+    pub(crate) incoming_frame_ptr: *const crate::kernel::task::ArchSwitchContext,
+    /// Incoming task's kernel stack top (copied scalar, not a reference).
+    ///
+    /// Copied from `incoming_tcb.kernel_context.stack_top` under the lock;
+    /// no reference into TCB storage survives after `task_state_lock` drops.
+    pub(crate) incoming_stack_top: Option<u64>,
+}
+
 #[cfg(feature = "hosted-dev")]
 const MAX_NOTIFICATIONS: usize = 64;
 #[cfg(not(feature = "hosted-dev"))]

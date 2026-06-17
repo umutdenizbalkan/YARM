@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{KernelError, KernelState, SpawnedUserTask, UserImageSpec};
+use super::{DispatchSwitchPlan, KernelError, KernelState, SpawnedUserTask, UserImageSpec};
 use crate::arch::hal::Hal;
 use crate::kernel::capabilities::{CapId, CapRights};
 use crate::kernel::ipc::ThreadId;
@@ -788,54 +788,133 @@ impl KernelState {
             return Ok(());
         }
 
-        let outgoing_idx = self
-            .with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
-            })
-            .ok_or(KernelError::TaskMissing)?;
-        let incoming_idx = self
-            .with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
-            })
-            .ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!(
+            "D6_SWITCH_PLAN_BEGIN outgoing={} incoming={}",
+            outgoing_tid,
+            incoming_tid
+        );
 
-        if outgoing_idx == incoming_idx {
+        // Phase B (Stage 116 / Solution 1): acquire task_state_lock (rank 2),
+        // locate both TCBs, validate kernel-context initialization, extract raw
+        // ArchSwitchContext frame pointers and copy the incoming stack top.
+        // The sub-lock is released when `with_tcbs_mut` returns — before any
+        // call to `switch_frames`.
+        //
+        // After this block: scheduler_state lock (rank 1) is already gone
+        // (dropped by `local_dispatch_step_split`); task_state_lock (rank 2)
+        // will be gone; only the outer global `SpinLock<KernelState>` from
+        // `with_cpu` remains held, keeping this CPU non-preemptible with
+        // interrupts disabled.
+        let plan =
+            self.with_tcbs_mut(|tcbs| -> Result<Option<DispatchSwitchPlan>, KernelError> {
+                let outgoing_idx = tcbs
+                    .iter()
+                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == outgoing_tid))
+                    .ok_or(KernelError::TaskMissing)?;
+                let incoming_idx = tcbs
+                    .iter()
+                    .position(|slot| slot.as_ref().is_some_and(|tcb| tcb.tid.0 == incoming_tid))
+                    .ok_or(KernelError::TaskMissing)?;
+
+                if outgoing_idx == incoming_idx {
+                    return Ok(None);
+                }
+
+                // Split the TCB slice to get simultaneous mutable/shared refs.
+                let (outgoing_tcb, incoming_tcb) = if outgoing_idx < incoming_idx {
+                    let (left, right) = tcbs.split_at_mut(incoming_idx);
+                    (
+                        left[outgoing_idx]
+                            .as_mut()
+                            .ok_or(KernelError::TaskMissing)?,
+                        right[0].as_ref().ok_or(KernelError::TaskMissing)?,
+                    )
+                } else {
+                    let (left, right) = tcbs.split_at_mut(outgoing_idx);
+                    (
+                        right[0].as_mut().ok_or(KernelError::TaskMissing)?,
+                        left[incoming_idx]
+                            .as_ref()
+                            .ok_or(KernelError::TaskMissing)?,
+                    )
+                };
+
+                if !outgoing_tcb.kernel_context.initialized
+                    || !incoming_tcb.kernel_context.initialized
+                {
+                    return Ok(None);
+                }
+
+                let incoming_stack_top = incoming_tcb.kernel_context.stack_top.map(|top| top.0);
+
+                // Derive raw pointers from the live mutable/shared references.
+                // These pointers remain valid after `task_state_lock` is released:
+                //
+                // (1) `KernelState::tcbs` is `KernelStorage<[Option<TCB>; MAX_TASKS]>` —
+                //     a fixed-size inline array; no move or reallocation can occur
+                //     during the dispatch path.
+                // (2) The outer global `SpinLock<KernelState>` (held by `with_cpu`)
+                //     guarantees exclusive access to all of `KernelState`, including
+                //     `tcbs`, for the remainder of this CPU's trap-handling window.
+                // (3) The outgoing task is currently executing on this CPU only;
+                //     its kernel frame cannot be modified by any other CPU.
+                // (4) The incoming task was selected and marked as the next task for
+                //     this CPU by `local_dispatch_step_split`; the scheduler guarantees
+                //     no other CPU will attempt to run it simultaneously.
+                let outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
+                    &mut outgoing_tcb.kernel_context.frame;
+                let incoming_frame_ptr: *const crate::kernel::task::ArchSwitchContext =
+                    &incoming_tcb.kernel_context.frame;
+
+                Ok(Some(DispatchSwitchPlan {
+                    outgoing_tid,
+                    incoming_tid,
+                    outgoing_frame_ptr,
+                    incoming_frame_ptr,
+                    incoming_stack_top,
+                }))
+            })?;
+        // task_state_lock (rank 2) is now released.
+
+        let Some(plan) = plan else {
             return Ok(());
+        };
+
+        crate::yarm_log!(
+            "D6_SWITCH_PLAN_READY outgoing={} incoming={}",
+            plan.outgoing_tid,
+            plan.incoming_tid
+        );
+
+        // Phase C (Stage 116 / Solution 1): no per-domain sub-lock is held
+        // across `switch_frames`. The scheduler_state lock (rank 1) was
+        // released inside `local_dispatch_step_split`'s inner block before
+        // `dispatch_next_task` returned from that call. The task_state_lock
+        // (rank 2) was released when `with_tcbs_mut` above returned. The CPU
+        // remains non-preemptible because the outer global `SpinLock<KernelState>`
+        // (a `SpinLockIrq`) holds interrupts disabled on this CPU.
+        //
+        // VALIDATION: D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH
+        crate::yarm_log!("D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH");
+        crate::yarm_log!("D6_SWITCH_FRAMES_ENTER");
+
+        // SAFETY: The raw pointers were derived from stable `KernelState::tcbs`
+        // storage under `task_state_lock`. After the lock drop the pointed-to
+        // memory remains valid for the reasons documented in the safety note
+        // above (global lock held, fixed-size array, single-CPU dispatch). The
+        // dereferences produce non-aliasing `&mut` and `&` because the two
+        // indices are distinct (checked above) and the global lock prevents any
+        // concurrent modification of `KernelState`.
+        unsafe {
+            crate::arch::selected_isa::context_switch::switch_frames(
+                &mut *plan.outgoing_frame_ptr,
+                &*plan.incoming_frame_ptr,
+                plan.incoming_stack_top,
+            );
         }
 
-        self.with_tcbs_mut(|tcbs| {
-            let (outgoing_tcb, incoming_tcb) = if outgoing_idx < incoming_idx {
-                let (left, right) = tcbs.split_at_mut(incoming_idx);
-                (
-                    left[outgoing_idx]
-                        .as_mut()
-                        .ok_or(KernelError::TaskMissing)?,
-                    right[0].as_mut().ok_or(KernelError::TaskMissing)?,
-                )
-            } else {
-                let (left, right) = tcbs.split_at_mut(outgoing_idx);
-                (
-                    right[0].as_mut().ok_or(KernelError::TaskMissing)?,
-                    left[incoming_idx]
-                        .as_mut()
-                        .ok_or(KernelError::TaskMissing)?,
-                )
-            };
-
-            if !outgoing_tcb.kernel_context.initialized || !incoming_tcb.kernel_context.initialized
-            {
-                return Ok(());
-            }
-
-            crate::arch::selected_isa::context_switch::switch_frames(
-                &mut outgoing_tcb.kernel_context.frame,
-                &incoming_tcb.kernel_context.frame,
-                incoming_tcb.kernel_context.stack_top.map(|top| top.0),
-            );
-            Ok(())
-        })
+        crate::yarm_log!("D6_SWITCH_FRAMES_RETURNED");
+        Ok(())
     }
 
     pub fn futex_wait_current(
@@ -1468,6 +1547,7 @@ impl KernelState {
             crate::yarm_log!("SCHED_NO_RUNNABLE_USER_TASK");
             crate::yarm_log!("SCHED_ENTER_IDLE");
             crate::yarm_log!("D6_DISPATCH_IDLE");
+            crate::yarm_log!("D6_SWITCH_PLAN_IDLE");
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: no_runnable_task");
             }

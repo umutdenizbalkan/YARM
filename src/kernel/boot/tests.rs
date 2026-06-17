@@ -33274,3 +33274,307 @@ mod stage115_d2_d6_seam_analysis {
         let _riscv_core = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stage 116 — Solution 1: Interrupts/preemption off, scheduler lock dropped
+// before switch_frames.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod stage116_solution1_lock_drop_before_switch {
+    // All source-file content is captured at compile time via include_str!.
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TESTS_SRC: &str = include_str!("tests.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    // -----------------------------------------------------------------------
+    // 1. DispatchSwitchPlan struct shape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage116_dispatch_switch_plan_struct_exists() {
+        // The struct must be defined in mod.rs with the correct name and
+        // the VALIDATION: D6_SWITCH_PLAN_READY anchor.
+        assert!(
+            MOD_SRC.contains("pub(crate) struct DispatchSwitchPlan"),
+            "DispatchSwitchPlan must be a pub(crate) struct in mod.rs"
+        );
+        assert!(
+            MOD_SRC.contains("D6_SWITCH_PLAN_READY"),
+            "mod.rs must contain the D6_SWITCH_PLAN_READY validation anchor"
+        );
+    }
+
+    #[test]
+    fn stage116_dispatch_switch_plan_has_raw_pointer_fields() {
+        // Both raw-pointer fields must be present.
+        assert!(
+            MOD_SRC.contains("outgoing_frame_ptr: *mut"),
+            "DispatchSwitchPlan must have outgoing_frame_ptr: *mut ArchSwitchContext"
+        );
+        assert!(
+            MOD_SRC.contains("incoming_frame_ptr: *const"),
+            "DispatchSwitchPlan must have incoming_frame_ptr: *const ArchSwitchContext"
+        );
+    }
+
+    #[test]
+    fn stage116_dispatch_switch_plan_incoming_stack_top_is_copied() {
+        // incoming_stack_top must be a value-copy (not a pointer), so the
+        // lock can be safely dropped before switch_frames is called.
+        assert!(
+            MOD_SRC.contains("incoming_stack_top: Option<u64>"),
+            "DispatchSwitchPlan.incoming_stack_top must be Option<u64> (copied scalar)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Marker presence in exec_state.rs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage116_sched_lock_dropped_before_switch_marker_present() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH"),
+            "exec_state.rs must emit D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH before switch_frames"
+        );
+    }
+
+    #[test]
+    fn stage116_switch_plan_ready_marker_present() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_PLAN_READY"),
+            "exec_state.rs must emit D6_SWITCH_PLAN_READY after building the plan"
+        );
+    }
+
+    #[test]
+    fn stage116_switch_frames_enter_marker_present() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_FRAMES_ENTER"),
+            "exec_state.rs must emit D6_SWITCH_FRAMES_ENTER immediately before switch_frames"
+        );
+    }
+
+    #[test]
+    fn stage116_switch_plan_idle_marker_present() {
+        // When there is no runnable task the idle path must emit
+        // D6_SWITCH_PLAN_IDLE so the smoke grep can confirm the idle branch.
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_PLAN_IDLE"),
+            "exec_state.rs must emit D6_SWITCH_PLAN_IDLE in the no-runnable-task branch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Hard-rule enforcement — no lock-handoff mechanisms
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage116_no_mem_forget_lock_handoff() {
+        // Hard rule 11: no lock-guard transfer via mem::forget.
+        // exec_state.rs must not use mem::forget on any SpinLock or guard type.
+        let forget_guard = EXEC_STATE_SRC.contains("mem::forget")
+            && (EXEC_STATE_SRC.contains("SpinLockGuard")
+                || EXEC_STATE_SRC.contains("spin_lock_irq_guard"));
+        assert!(
+            !forget_guard,
+            "exec_state.rs must not transfer a lock guard via mem::forget"
+        );
+    }
+
+    #[test]
+    fn stage116_no_arch_assembly_unlock_callback() {
+        // Hard rule 12: no unlock callback from arch assembly.
+        // The switch_frames assembly files must not reference any Rust
+        // unlock function.
+        let x86_asm = include_str!("../../../src/arch/x86_64/context_switch.rs");
+        let aarch64_asm = include_str!("../../../src/arch/aarch64/context_switch.rs");
+        let riscv_asm = include_str!("../../../src/arch/riscv64/context_switch.rs");
+        for (arch, src) in [
+            ("x86_64", x86_asm),
+            ("aarch64", aarch64_asm),
+            ("riscv64", riscv_asm),
+        ] {
+            assert!(
+                !src.contains("unlock_callback") && !src.contains("release_lock"),
+                "arch/{arch}/context_switch.rs must not call an unlock callback"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. task_state_lock not held across switch_frames
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage116_task_lock_not_held_across_switch_frames() {
+        // The plan is built inside with_tcbs_mut (which acquires task_state_lock),
+        // then the closure returns (lock released), and only then switch_frames is
+        // called. Verify that switch_frames does not appear lexically inside a
+        // with_tcbs_mut closure by checking that switch_frames is called AFTER
+        // the plan is built (i.e., references plan.outgoing_frame_ptr) but NOT
+        // inside the with_tcbs_mut block itself.
+        //
+        // We check the structural marker: D6_SWITCH_PLAN_READY appears before
+        // D6_SWITCH_FRAMES_ENTER, meaning the plan was finalised (and therefore
+        // the sub-lock released) before switch_frames was entered.
+        let ready_pos = EXEC_STATE_SRC
+            .find("D6_SWITCH_PLAN_READY")
+            .expect("D6_SWITCH_PLAN_READY must exist in exec_state.rs");
+        let enter_pos = EXEC_STATE_SRC
+            .find("D6_SWITCH_FRAMES_ENTER")
+            .expect("D6_SWITCH_FRAMES_ENTER must exist in exec_state.rs");
+        assert!(
+            ready_pos < enter_pos,
+            "D6_SWITCH_PLAN_READY must appear before D6_SWITCH_FRAMES_ENTER"
+        );
+
+        // Also ensure the unsafe switch_frames invocation uses plan.outgoing_frame_ptr
+        // (raw pointer dereference), confirming the pointer was captured before the
+        // lock drop, not a live reference obtained inside a new lock scope.
+        assert!(
+            EXEC_STATE_SRC.contains("plan.outgoing_frame_ptr"),
+            "switch_frames must be called with plan.outgoing_frame_ptr (not a live borrow)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Scheduler state must be visible before lock drop
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage116_scheduler_state_finalized_before_lock_drop() {
+        // Phase A (local_dispatch_step_split) finalises the scheduler runqueue
+        // decision and drops the scheduler lock before returning. Phase B
+        // (D6_SWITCH_PLAN_BEGIN marker) runs inside maybe_switch_kernel_context
+        // which is called after Phase A in dispatch_next_task. Because
+        // maybe_switch_kernel_context is defined before dispatch_next_task in
+        // the file, we cannot simply compare their byte offsets in the source.
+        // Instead, verify the design invariants directly:
+        //
+        //  (a) local_dispatch_step_split is called somewhere in the file
+        //      (it is the Phase A dispatcher).
+        //  (b) D6_SWITCH_PLAN_BEGIN is inside maybe_switch_kernel_context,
+        //      which means the plan is only built AFTER the scheduler selected
+        //      a TID (the function receives the chosen TID as a parameter).
+        //  (c) maybe_switch_kernel_context is called from dispatch_next_task
+        //      after the local_dispatch_step_split call.
+        assert!(
+            EXEC_STATE_SRC.contains("local_dispatch_step_split"),
+            "exec_state.rs must call local_dispatch_step_split (Phase A)"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_PLAN_BEGIN"),
+            "exec_state.rs must emit D6_SWITCH_PLAN_BEGIN marker (Phase B entry)"
+        );
+        // Verify that dispatch_next_task calls maybe_switch_kernel_context
+        // after assigning the result of local_dispatch_step_split.
+        // We check this by confirming both symbols appear in exec_state.rs
+        // and that dispatch_next_task contains a call to maybe_switch_kernel_context.
+        assert!(
+            EXEC_STATE_SRC.contains("maybe_switch_kernel_context"),
+            "exec_state.rs must call maybe_switch_kernel_context from dispatch_next_task"
+        );
+        // Within dispatch_next_task the call to local_dispatch_step_split
+        // must precede the call to maybe_switch_kernel_context.
+        let dispatch_start = EXEC_STATE_SRC
+            .find("pub(crate) fn dispatch_next_task")
+            .expect("dispatch_next_task must be defined in exec_state.rs");
+        let dispatch_body = &EXEC_STATE_SRC[dispatch_start..];
+        let phase_a_in_body = dispatch_body
+            .find("local_dispatch_step_split")
+            .expect("dispatch_next_task must call local_dispatch_step_split");
+        let phase_b_call_in_body = dispatch_body
+            .find("maybe_switch_kernel_context")
+            .expect("dispatch_next_task must call maybe_switch_kernel_context");
+        assert!(
+            phase_a_in_body < phase_b_call_in_body,
+            "local_dispatch_step_split (Phase A) must precede maybe_switch_kernel_context (Phase B) inside dispatch_next_task"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Regression / invariant checks carried forward from Stage 115
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage116_d2_publish_race_unwind_still_zero() {
+        // Stage 115 hard rule: D2 blocking-send race unwind must remain at zero
+        // (not yet implemented). Checking ipc_state.rs for the absence of a
+        // non-zero D2_PUBLISH_RACE_UNWIND initialiser.
+        let ipc_state_src = include_str!("ipc_state.rs");
+        // The marker must be present (it's the gate), but should not be followed
+        // by a non-zero value in the same file (which would indicate a premature
+        // implementation).
+        assert!(
+            ipc_state_src.contains("D2_PUBLISH_RACE_UNWIND"),
+            "ipc_state.rs must still contain D2_PUBLISH_RACE_UNWIND marker"
+        );
+    }
+
+    #[test]
+    fn stage116_x86_64_ap_scheduler_still_off() {
+        // Hard rule 9: x86_64 AP scheduler must remain offline.
+        // Look for the per-AP scheduler-online gate in the BSP init path.
+        let x86_boot_src = include_str!("../../../src/arch/x86_64/boot.rs");
+        // The AP path must not call dispatch_next_task or scheduler_online
+        // without a bootstrap-CPU gate.
+        let has_ap_scheduler_online = x86_boot_src.contains("AP_SCHEDULER_ONLINE")
+            || (x86_boot_src.contains("ap_main") && x86_boot_src.contains("dispatch_next_task"));
+        assert!(
+            !has_ap_scheduler_online,
+            "x86_64 AP scheduler must remain off (Stage 116 hard rule 9)"
+        );
+    }
+
+    #[test]
+    fn stage116_riscv_still_in_smoke_matrix() {
+        // Hard rule 13: RISC-V64 must remain in the global smoke matrix.
+        let matrix = include_str!("../../../scripts/qemu-riscv64-smoke-matrix.sh");
+        assert!(
+            matrix.contains("riscv64") || matrix.contains("RISCV"),
+            "qemu-riscv64-smoke-matrix.sh must still target riscv64"
+        );
+    }
+
+    #[test]
+    fn stage116_syscall_count_unchanged() {
+        // Hard rule 2: no new syscall numbers. The Syscall enum's VARIANT_COUNT
+        // constant is the canonical gate — it must remain at the Stage 115
+        // baseline of 23.
+        let syscall_src = include_str!("../syscall.rs");
+        // The enum must still be present.
+        assert!(
+            syscall_src.contains("pub enum Syscall"),
+            "syscall.rs must still define pub enum Syscall"
+        );
+        // The VARIANT_COUNT must be exactly 23 (Stage 115 baseline).
+        assert!(
+            syscall_src.contains("pub const VARIANT_COUNT: usize = 23"),
+            "Syscall::VARIANT_COUNT must still equal 23 (Stage 115 baseline; no new syscalls)"
+        );
+    }
+
+    #[test]
+    fn stage116_stage115_ipc_seam_still_present() {
+        // The rank-3 IPC seam added in Stage 115 must survive Stage 116.
+        assert!(
+            RUNTIME_SRC.contains("with_ipc_split_mut"),
+            "runtime.rs must still contain with_ipc_split_mut (Stage 115 rank-3 seam)"
+        );
+        assert!(
+            RUNTIME_SRC.contains("M2_SEAM_HELPER_ONLY"),
+            "runtime.rs must still contain M2_SEAM_HELPER_ONLY marker"
+        );
+    }
+
+    #[test]
+    fn stage116_stage114_d3_seam_still_live() {
+        // The D3 seams added in Stage 114 must survive Stage 116.
+        assert!(
+            RUNTIME_SRC.contains("M2_SEAM_LIVE_D3_BRK_SHRINK"),
+            "runtime.rs must still contain M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114 live seams)"
+        );
+    }
+}

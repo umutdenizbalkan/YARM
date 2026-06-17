@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs}.rs` | **PARTIAL** | Stage 102 | rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs`, `syscall/cap.rs`, `syscall/sched.rs`, `syscall/process.rs`, `syscall/recv_shared_v3.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113) | Stage 107 | scheduler-seam first wire; per-CPU lock sharding deferred (§9); `Stage 108 with_scheduler_split_mut` not yet called from this path — see §1 Stage 113 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; per-CPU lock sharding deferred (§9); `Stage 108 with_scheduler_split_mut` not yet called — see §1 Stage 113 / Stage 116 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -760,6 +760,86 @@ No ABI/protocol/syscall-number/image-ID/smoke-marker change.
 
 ---
 
+### Stage 116 — Solution 1: task-lock dropped before `switch_frames` (`DispatchSwitchPlan`)
+
+**Goal stated in the task:** eliminate the `task_state_lock` (rank-2 sub-lock)
+held across `switch_frames` in `maybe_switch_kernel_context` by building a
+typed `DispatchSwitchPlan` under the lock and calling `switch_frames` after the
+lock is released, with only the outer global `SpinLock<KernelState>` (from
+`with_cpu`) still held — keeping the CPU non-preemptible/interrupts disabled.
+
+**Outcome: A — Solution 1 implemented.** `maybe_switch_kernel_context` now
+follows a three-phase model:
+
+- **Phase B** (inside `with_tcbs_mut`): acquires `task_state_lock` (rank 2),
+  locates both outgoing and incoming TCBs, validates kernel-context
+  initialization, derives raw `*mut ArchSwitchContext` / `*const
+  ArchSwitchContext` pointers from the live references, copies
+  `incoming_stack_top: Option<u64>`, builds a `DispatchSwitchPlan` struct, and
+  returns it — releasing the sub-lock when the closure returns.
+- **Phase C** (after `with_tcbs_mut` returns): no per-domain sub-lock held.
+  Emits `D6_SCHED_LOCK_DROPPED_BEFORE_SWITCH`, `D6_SWITCH_FRAMES_ENTER`, then
+  calls `switch_frames` with `unsafe { &mut *plan.outgoing_frame_ptr, &*
+  plan.incoming_frame_ptr, plan.incoming_stack_top }`.
+- **Phase D** (after `switch_frames` returns): emits
+  `D6_SWITCH_FRAMES_RETURNED`; `Ok(())`.
+
+**Safety argument for raw pointers after lock drop:**
+1. `KernelState::tcbs` is a fixed-size inline array (`KernelStorage<[Option<TCB>; MAX_TASKS]>`) — no reallocation.
+2. The outer global `SpinLock<KernelState>` (a `SpinLockIrq`, held by `with_cpu`) guarantees exclusive access to all of `KernelState` on this CPU, including `tcbs`, for the entire trap-handling window.
+3. The outgoing task is executing on this CPU only; its kernel frame cannot be modified by any other CPU.
+4. The incoming task was selected by `local_dispatch_step_split`; the scheduler guarantees no other CPU will schedule it simultaneously.
+
+**`DispatchSwitchPlan` fields** (`pub(crate)` struct in `src/kernel/boot/mod.rs`):
+- `outgoing_tid: u64`
+- `incoming_tid: u64`
+- `outgoing_frame_ptr: *mut crate::kernel::task::ArchSwitchContext`
+- `incoming_frame_ptr: *const crate::kernel::task::ArchSwitchContext`
+- `incoming_stack_top: Option<u64>`
+
+**What this stage does NOT do (hard rules preserved):**
+No ABI changes. No syscall number changes. No image ID changes. No IPC recv ABI
+changes. No D2-B send blocking split. No D3-FULL. No D6-full per-CPU sharding.
+No x86_64 AP scheduler-online. No `switch_frames` assembly ABI change. No lock
+handoff/guard transfer. No arch assembly unlock callback. `SYSCALL::VARIANT_COUNT`
+remains 23.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained 17 Stage 116 tests in
+`mod stage116_solution1_lock_drop_before_switch`:
+`stage116_dispatch_switch_plan_struct_exists`,
+`stage116_dispatch_switch_plan_has_raw_pointer_fields`,
+`stage116_dispatch_switch_plan_incoming_stack_top_is_copied`,
+`stage116_sched_lock_dropped_before_switch_marker_present`,
+`stage116_switch_plan_ready_marker_present`,
+`stage116_switch_frames_enter_marker_present`,
+`stage116_switch_plan_idle_marker_present`,
+`stage116_no_mem_forget_lock_handoff`,
+`stage116_no_arch_assembly_unlock_callback`,
+`stage116_task_lock_not_held_across_switch_frames`,
+`stage116_scheduler_state_finalized_before_lock_drop`,
+`stage116_d2_publish_race_unwind_still_zero`,
+`stage116_x86_64_ap_scheduler_still_off`,
+`stage116_riscv_still_in_smoke_matrix`,
+`stage116_syscall_count_unchanged`,
+`stage116_stage115_ipc_seam_still_present`,
+`stage116_stage114_d3_seam_still_live`.
+
+Acceptance evidence (Stage 116):
+
+| Smoke | Result | Notes |
+|-------|--------|-------|
+| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PASS | all 6 service entries exactly once; boot markers detected |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PASS | FAT skipped (INIT_FAT_SPAWN_SKIPPED=1); all checks passed |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PASS | FAT skipped (INIT_FAT_SPAWN_SKIPPED=1); all checks passed |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PASS | all four SMP configurations passed; timer/PLIC deferred as expected |
+
+Workspace tests: 1527/0 lib (`--test-threads=1`, 2 ignored).
+`cargo check --features hosted-dev` and `git diff --check` clean.
+No ABI/protocol/syscall-number/image-ID/smoke-marker change.
+`Syscall::VARIANT_COUNT` remains 23.
+
+---
+
 ## 2. Live paths and fallbacks
 
 ### D1 + D5 (recv-side cap materialization)
@@ -1275,13 +1355,20 @@ D2+D6 genuine live-wire; both remain at Outcome B because `dispatch_next_task`
 Phase B → `maybe_switch_kernel_context` → `switch_frames` (arch-specific
 cooperative kernel context switch) cannot be moved outside `with_cpu` without
 per-arch restructuring. The rank-3 IPC seam was added as a genuine
-deliverable (completing the seam set). The next targets, in order:
+deliverable (completing the seam set). Stage 116 (§1) implemented Solution 1:
+the `task_state_lock` (rank-2 sub-lock) is no longer held across `switch_frames`;
+`DispatchSwitchPlan` is built inside `with_tcbs_mut` and used after the lock
+is released. This eliminates the per-domain sub-lock from crossing the
+`switch_frames` boundary; only the outer global `SpinLock<KernelState>` (from
+`with_cpu`) still spans it. The next targets, in order:
 
 1. **D2 blocking-recv genuine seam live-wire and D6 dispatch seam
    live-wire** — the remaining two Outcome B items from Stages 114/115.
-   The new precise blocker is `dispatch_next_task` → `switch_frames`
-   (§1 Stage 115). Requires restructuring the post-syscall dispatch flow
-   per-arch before the entry points can be moved ahead of `with_cpu`.
+   With Stage 116 removing the rank-2 sub-lock crossing, the remaining
+   blocker is the outer global `SpinLock<KernelState>` itself being held
+   across `switch_frames`. Eliminating this requires restructuring the
+   post-syscall dispatch flow to release `with_cpu`'s global lock before
+   calling `switch_frames` (requiring per-arch state preservation).
 2. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction**, then
    `syscall/process.rs`, then the remaining modules listed in §5.1.
 3. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
@@ -1319,48 +1406,39 @@ deliverable (completing the seam set). The next targets, in order:
 
 **Ready to resume global kernel unlocking: yes.**
 
-Stage 115 attempted the D2+D6 genuine seam live-wire. Both remain at
-Outcome B; the new precise blocker is `dispatch_next_task` Phase B →
-`maybe_switch_kernel_context` → `switch_frames` (arch-specific cooperative
-kernel context switch — assembly-level, three per-arch implementations:
-x86_64, AArch64, RISC-V64 — not a data copy, a genuine execution-context
-transfer). This blocker was not identified with full precision in
-Stages 111/113 (those only said "call site nested inside `with_cpu`");
-Stage 115 is the first stage to name `switch_frames` specifically. The
-genuine Stage 115 deliverable is the rank-3 IPC split-mut seam
-`with_ipc_split_mut` (completing the per-domain seam set). All required
-per-arch acceptance smokes pass: `qemu-x86_64-core-smoke.sh`,
-`qemu-aarch64-optional-fs-smoke.sh`, `qemu-riscv64-smoke-matrix.sh`
-(`--smp 1/2/3/4`), plus the strict optional-FS smokes on x86_64 and
-AArch64. The next unlocking pass must tackle the `switch_frames`
-restructuring (§7.1.5 item 1), or alternatively take D4 step 1 (§7.1.5
-item 2) or the x86_64 AP per-CPU environment (D-NEXT-2, §7.1.5 item 3).
+Stage 116 implemented Solution 1: the `task_state_lock` (rank-2 sub-lock) is
+no longer held across `switch_frames`. The `DispatchSwitchPlan` struct captures
+raw frame pointers and a copied stack-top scalar inside `with_tcbs_mut`, and
+`switch_frames` is called only after the sub-lock is released. The outer global
+`SpinLock<KernelState>` (from `with_cpu`) still spans `switch_frames`, keeping
+the CPU non-preemptible with interrupts disabled.
+
+D2 and D6 remain at Outcome B for the same structural reason: the outer global
+lock itself still crosses the `switch_frames` boundary. Eliminating that
+requires releasing `with_cpu`'s global lock before calling `switch_frames`,
+which needs per-arch state preservation (user register context must be
+committed, ASID switch done, and task status updated before lock release; then
+`switch_frames` executes outside the lock). That restructuring is the next
+concrete target for genuine D2/D6 live-wire.
+
+All required per-arch acceptance smokes must be run and recorded before this
+stage is complete.
 
 **Exact next Claude prompt recommendation:**
 
-> Kernel unlocking Pass: D2 + D6 genuine seam live-wire with `switch_frames`
-> restructuring — the new precise blocker (identified in Stage 115, §1) is
-> that `dispatch_next_task` Phase B → `maybe_switch_kernel_context` →
-> `switch_frames` (arch-specific cooperative kernel context switch) cannot
-> be moved outside `SharedKernel::with_cpu` without per-arch restructuring
-> of the post-syscall dispatch flow. Stage 115 adds the rank-3 IPC seam
-> as helper-only (`with_ipc_split_mut`) and documents the blocker; the
-> seam set is now complete (ranks 1/2/3/5/6). This pass should either:
-> (a) restructure `dispatch_next_task` so Phase B effects (including
-> `switch_frames`) can execute under a narrower lock or after the global
-> lock is released, or (b) document exactly why that restructuring is
-> unsafe/out-of-scope and fall through to D4 step 1 or D-NEXT-2 instead.
-> Hard rules: do not touch D1/D5 canonical fallbacks; do not change the
-> D3 seam wiring landed in Stage 114; do not start x86_64 AP per-CPU
-> environment (D-NEXT-2) in this PR; do not add per-CPU runqueue lock
-> sharding ahead of `-smp ≥ 2` scheduler-online smoke acceptance; preserve
-> all required per-arch smokes (x86_64 core + optional-FS strict, AArch64
-> core + optional-FS strict, RISC-V64 matrix) including the
-> `D2_PUBLISH_RACE_UNWIND` reject; do not rely on Debug-level markers;
-> do not leave a new `NOT SMOKE-ACCEPTED` sentinel behind. Deliverables:
-> implementation or honest blocked-report, MUST_SMOKE run, fence deletion
-> only for seams genuinely live-wired, audit note in
-> `doc/KERNEL_UNLOCKING.md` §1/§7/§7.1.
+> Kernel unlocking Pass: D2 + D6 genuine seam live-wire — release
+> `SharedKernel::with_cpu` global lock before `switch_frames`. Stage 116
+> removed the rank-2 sub-lock from crossing the `switch_frames` boundary
+> via `DispatchSwitchPlan`. The remaining blocker is the outer global
+> `SpinLock<KernelState>` itself. This pass should restructure
+> `dispatch_next_task` to: (a) complete all scheduler-visible state
+> mutations under the global lock, (b) release the global lock, (c) call
+> `switch_frames` lock-free. Hard rules: no ABI changes; no syscall number
+> changes; no `switch_frames` assembly ABI change; preserve all per-arch
+> smokes; do not start x86_64 AP scheduler-online; do not add per-CPU
+> runqueue sharding; do not implement D2-B send blocking split; do not
+> implement D3-FULL or D6-full. Deliverables: implementation or honest
+> blocked-report, MUST_SMOKE run, audit note in `doc/KERNEL_UNLOCKING.md`.
 
 ---
 
@@ -1390,11 +1468,12 @@ item 2) or the x86_64 AP per-CPU environment (D-NEXT-2, §7.1.5 item 3).
   `with_task_tcbs_split_mut` (rank 2), and `with_ipc_split_mut` (rank 3,
   Stage 115) remain `M2_SEAM_HELPER_ONLY`. Live-wiring any of them
   requires its own PR + MUST_SMOKE run + helper-fence deletion in the
-  same PR. The precise D2/D6 live-wire blocker is `dispatch_next_task`
-  Phase B → `switch_frames` (arch-specific cooperative kernel context
-  switch), documented in §1 Stage 115. Ranks 5+6
-  (`with_vm_user_spaces_split_mut` / `with_memory_split_mut`) are live
-  for the D3 single-CPU shrink path since Stage 114.
+  same PR. The precise D2/D6 live-wire blocker is the outer global
+  `SpinLock<KernelState>` (from `with_cpu`) still crossing the
+  `switch_frames` boundary — the rank-2 sub-lock was removed from that
+  crossing in Stage 116 (`DispatchSwitchPlan`), documented in §1 Stage 116.
+  Ranks 5+6 (`with_vm_user_spaces_split_mut` / `with_memory_split_mut`)
+  are live for the D3 single-CPU shrink path since Stage 114.
 - **`yarm.loglevel=` may be used in verbose smoke runs.** Never change the
   production default (Info); never rely on Debug-level markers in
   acceptance greps.
