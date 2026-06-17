@@ -49,6 +49,7 @@ fn task_missing_with_site(site: &'static str, cpu: u8) -> KernelError {
 }
 
 const BOOTSTRAP_FIRST_USER_TID: u64 = 1;
+const BOOTSTRAP_SUPERVISOR_TID: u64 = 2;
 const DEBUG_YIELD_LOG: bool = false;
 const DEBUG_DISPATCH_CONTEXT_LOG: bool = false;
 static DISPATCH_CONTEXT_LOAD_EVENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -893,8 +894,7 @@ impl KernelState {
                     &mut outgoing_tcb.kernel_context.frame;
                 let incoming_frame_ptr: *mut crate::kernel::task::ArchSwitchContext =
                     &mut incoming_tcb.kernel_context.frame;
-                let outgoing_stack_top =
-                    outgoing_tcb.kernel_context.stack_top.map(|t| t.0);
+                let outgoing_stack_top = outgoing_tcb.kernel_context.stack_top.map(|t| t.0);
 
                 Ok(Some(DispatchSwitchPlan {
                     outgoing_tid,
@@ -1146,12 +1146,13 @@ impl KernelState {
         self.register_task_with_class(spec.tid, spec.class)?;
         crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
 
-        // Stage 118 Part B: narrow production switch-frame init — x86_64 only,
-        // supervisor/init task (tid == 1) only. Sets kernel_context.initialized =
-        // true so the first-resume handler can prove reacquisition of the global
-        // lock via post_switch_restore_arch_thread_state.
+        // Stage 119 Part A: minimal task-pair init — x86_64 only, tid=1 (init
+        // server) and tid=2 (supervisor). Sets kernel_context.initialized = true
+        // for both tasks so that the first timer preemption of tid=1 dispatching
+        // tid=2 as incoming produces a real switch_frames call and the first-resume
+        // handler can prove lock reacquisition via post_switch_restore.
         #[cfg(target_arch = "x86_64")]
-        if spec.tid == BOOTSTRAP_FIRST_USER_TID {
+        if spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID {
             let entry =
                 super::thread_state::yarm_kernel_thread_switch_trampoline as *const () as usize;
             crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN tid={}", spec.tid);

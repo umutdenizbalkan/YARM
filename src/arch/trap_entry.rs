@@ -278,11 +278,9 @@ pub fn handle_trap_entry_shared(
                 unsafe extern "C" {
                     fn yarm_kernel_thread_switch_trampoline() -> !;
                 }
-                let trampoline_ip =
-                    yarm_kernel_thread_switch_trampoline as *const () as usize;
+                let trampoline_ip = yarm_kernel_thread_switch_trampoline as *const () as usize;
                 // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed array).
-                let incoming_ip =
-                    unsafe { (*plan.incoming_frame_ptr).instruction_ptr() };
+                let incoming_ip = unsafe { (*plan.incoming_frame_ptr).instruction_ptr() };
                 if incoming_ip == trampoline_ip {
                     let ctx = crate::kernel::boot::FirstResumeContext {
                         cpu_id: cpu,

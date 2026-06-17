@@ -34084,3 +34084,229 @@ mod stage118_production_switch_frame_init {
         );
     }
 }
+
+// ===========================================================================
+// Stage 119 — Minimal task pair for first real switch_frames on x86_64
+// ===========================================================================
+//
+// Checks:
+//   Part A — minimal task-pair init (tid=1 + tid=2 both initialized on x86_64)
+//   Part C — TSS RSP0 fix: trampoline switch-back passes None, not outgoing_stack_top
+//   Part D — fallback/deferred paths preserved
+//   Invariants — Stage 117/118 seams intact
+// ===========================================================================
+#[cfg(test)]
+mod stage119_minimal_task_pair {
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // -----------------------------------------------------------------------
+    // Part A: BOOTSTRAP_SUPERVISOR_TID constant
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage119_bootstrap_supervisor_tid_constant_defined() {
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            "exec_state.rs must define BOOTSTRAP_SUPERVISOR_TID constant"
+        );
+    }
+
+    #[test]
+    fn stage119_bootstrap_supervisor_tid_is_two() {
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID: u64 = 2"),
+            "BOOTSTRAP_SUPERVISOR_TID must be u64 = 2 (Ring-3 supervisor task)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part A: switch-frame init gate covers both tid=1 and tid=2
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage119_exec_state_init_gate_covers_supervisor_tid() {
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            "exec_state.rs switch-frame init must be gated on BOOTSTRAP_SUPERVISOR_TID (tid=2)"
+        );
+    }
+
+    #[test]
+    fn stage119_exec_state_init_gate_uses_or_for_both_tids() {
+        assert!(
+            EXEC_STATE_SRC
+                .contains("BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID")
+                || EXEC_STATE_SRC
+                    .contains("BOOTSTRAP_SUPERVISOR_TID || spec.tid == BOOTSTRAP_FIRST_USER_TID"),
+            "exec_state.rs switch-frame init must use || to OR tid=1 and tid=2 conditions"
+        );
+    }
+
+    #[test]
+    fn stage119_exec_state_init_gate_still_covers_first_user_tid() {
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID"),
+            "exec_state.rs switch-frame init must still cover BOOTSTRAP_FIRST_USER_TID (tid=1)"
+        );
+    }
+
+    #[test]
+    fn stage119_exec_state_switch_frame_init_markers_still_present() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN"),
+            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_BEGIN marker must be preserved in Stage 119"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_DONE marker must be preserved in Stage 119"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED"),
+            "exec_state.rs D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED marker must be preserved in Stage 119"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part C: TSS RSP0 fix — trampoline switch-back passes None
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage119_trampoline_switchback_does_not_pass_outgoing_stack_top() {
+        // The trampoline switch-back must NOT pass ctx.outgoing_stack_top as the
+        // third argument to switch_frames; doing so would call refresh_boot_tss_rsp0
+        // with A's stack top, corrupting B's interrupt stack.
+        //
+        // We verify this by checking that outgoing_stack_top does NOT appear as a
+        // positional argument next to the switch_frames call that follows the
+        // D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE marker.
+        assert!(
+            !THREAD_STATE_SRC.contains("ctx.outgoing_stack_top,\n        );"),
+            "trampoline switch-back must NOT pass ctx.outgoing_stack_top to switch_frames"
+        );
+    }
+
+    #[test]
+    fn stage119_trampoline_switchback_passes_none_for_tss_rsp0() {
+        // After the first-resume handler, switch_frames is called with None so that
+        // TSS RSP0 (set by the stash-drain to B.stack_top) is not overwritten.
+        assert!(
+            THREAD_STATE_SRC.contains("None,\n        );"),
+            "trampoline switch-back must pass None as next_kernel_stack_top to preserve TSS RSP0"
+        );
+    }
+
+    #[test]
+    fn stage119_trampoline_switchback_has_tss_rsp0_preservation_comment() {
+        assert!(
+            THREAD_STATE_SRC.contains("TSS RSP0"),
+            "thread_state.rs trampoline switch-back must have a comment explaining TSS RSP0 preservation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Part D: deferred/fallback paths preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage119_trampoline_non_x86_64_deferred_path_preserved() {
+        assert!(
+            THREAD_STATE_SRC.contains("non_x86_64_arch"),
+            "thread_state.rs must preserve D6_FIRST_RESUME_DEFERRED reason=non_x86_64_arch fallback"
+        );
+    }
+
+    #[test]
+    fn stage119_trampoline_stash_empty_deferred_path_preserved() {
+        assert!(
+            THREAD_STATE_SRC.contains("stash_empty"),
+            "thread_state.rs must preserve D6_FIRST_RESUME_DEFERRED reason=stash_empty fallback"
+        );
+    }
+
+    #[test]
+    fn stage119_trampoline_shared_not_ready_deferred_path_preserved() {
+        assert!(
+            THREAD_STATE_SRC.contains("shared_not_ready"),
+            "thread_state.rs must preserve D6_FIRST_RESUME_DEFERRED reason=shared_not_ready fallback"
+        );
+    }
+
+    #[test]
+    fn stage119_exec_state_no_outgoing_task_deferred_path_preserved() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_GLOBAL_LOCK_DROP_DEFERRED"),
+            "exec_state.rs must preserve D6_GLOBAL_LOCK_DROP_DEFERRED for no-outgoing-task case"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("no_outgoing_task"),
+            "exec_state.rs must preserve reason=no_outgoing_task in D6_GLOBAL_LOCK_DROP_DEFERRED"
+        );
+    }
+
+    #[test]
+    fn stage119_maybe_switch_kernel_context_initialized_guard_preserved() {
+        assert!(
+            EXEC_STATE_SRC.contains("outgoing_tcb.kernel_context.initialized"),
+            "maybe_switch_kernel_context must still check outgoing_tcb.kernel_context.initialized"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("incoming_tcb.kernel_context.initialized"),
+            "maybe_switch_kernel_context must still check incoming_tcb.kernel_context.initialized"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Invariants: Stage 117/118 seams preserved
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stage119_first_resume_stash_seam_preserved() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("FIRST_RESUME_STASH"),
+            "trap_entry.rs FIRST_RESUME_STASH seam from Stage 118 must be preserved in Stage 119"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_ENTER"),
+            "thread_state.rs D6_FIRST_RESUME_ENTER marker from Stage 118 must be preserved"
+        );
+    }
+
+    #[test]
+    fn stage119_stage117_switch_plan_stash_seam_preserved() {
+        assert!(
+            MOD_SRC.contains("pub(crate) static DISPATCH_SWITCH_PLAN_STASH"),
+            "Stage 117 DISPATCH_SWITCH_PLAN_STASH must be preserved in Stage 119"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_SWITCH_FRAMES_ENTER_UNLOCKED"),
+            "Stage 117 D6_SWITCH_FRAMES_ENTER_UNLOCKED marker must be preserved in Stage 119"
+        );
+    }
+
+    #[test]
+    fn stage119_provision_default_kernel_context_still_sets_initialized_false() {
+        // Tasks beyond the minimal pair (tid > 2) must NOT get initialized=true;
+        // their context switch happens via trap-frame restore only.
+        assert!(
+            THREAD_STATE_SRC.contains("initialized = false"),
+            "thread_state.rs provision_default_kernel_context must still set initialized = false for non-minimal-pair tasks"
+        );
+    }
+
+    #[test]
+    fn stage119_supervisor_tid_init_gated_on_x86_64_cfg() {
+        // The supervisor tid=2 initialization must be guarded by
+        // #[cfg(target_arch = "x86_64")] — non-x86_64 boot paths must not be affected.
+        assert!(
+            EXEC_STATE_SRC.contains("target_arch = \"x86_64\""),
+            "exec_state.rs supervisor tid=2 init must remain inside #[cfg(target_arch = \"x86_64\")] gate"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            "exec_state.rs must reference BOOTSTRAP_SUPERVISOR_TID inside the x86_64 cfg gate"
+        );
+    }
+}

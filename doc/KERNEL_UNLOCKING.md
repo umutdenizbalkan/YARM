@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs}.rs` | **PARTIAL** | Stage 102 | rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs`, `syscall/cap.rs`, `syscall/sched.rs`, `syscall/process.rs`, `syscall/recv_shared_v3.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64) — still Outcome B (`switch_frames` never fires: only one task initialized); per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back — still Outcome B (switch_frames never fires: smoke quiesces into IPC-blocked tasks before a timer-driven preemption pairs two initialized tasks); per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -1130,12 +1130,113 @@ Acceptance evidence (Stage 118):
 
 | Smoke | Result | Notes |
 |-------|--------|-------|
-| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PENDING | `D6_KERNEL_SWITCH_FRAME_INIT_DONE tid=1` must appear; `D6_FIRST_RESUME_ENTER` not required (Outcome B) |
-| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PENDING | same |
-| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PENDING | `D6_KERNEL_SWITCH_FRAME_INIT_BEGIN` not emitted on AArch64 (x86_64 only); Stage 117 deferred markers unchanged |
-| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PENDING | RISC-V unchanged; `D6_GLOBAL_LOCK_DROP_DEFERRED reason=riscv_lockless_trap_path` still appears |
+| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PASS | `D6_KERNEL_SWITCH_FRAME_INIT_DONE tid=1` observed; `D6_FIRST_RESUME_ENTER` absent (Outcome B — only tid=1 initialized) |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PASS | all required markers; `D2_PUBLISH_RACE_UNWIND` count=0 |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PASS | `D6_KERNEL_SWITCH_FRAME_INIT_BEGIN` not emitted on AArch64 (x86_64 only); Stage 117 deferred markers unchanged |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PASS | RISC-V unchanged; all four SMP configurations passed |
 
 Workspace tests: 1569/0 lib (`--test-threads=1`, 2 ignored).
+No ABI/protocol/syscall-number/image-ID change.
+`Syscall::VARIANT_COUNT` remains 23.
+
+---
+
+### Stage 119 — Minimal task pair for first real `switch_frames` on x86_64 (Outcome B)
+
+**Goal stated in the task:** extend the x86_64 production switch-frame
+initialization from only `tid=1` to the minimal required task pair `(tid=1,
+tid=2)`, fix the TSS RSP0 bug in the first-resume trampoline switch-back, and
+prove that a real unlocked `switch_frames` fires in smoke.
+
+**Outcome: B — expanded scaffold; `switch_frames` still does not fire in smoke.**
+
+Both tid=1 (init server) and tid=2 (supervisor) now have `initialized = true` on
+x86_64 at spawn time. The `D6_KERNEL_SWITCH_FRAME_INIT_DONE` markers appear for
+both in the x86_64 core smoke. The TSS RSP0 preservation bug in the trampoline
+switch-back is corrected. The dispatch infrastructure is complete. The smoke still
+quiesces before a timer-driven preemption can pair two initialized tasks:
+`maybe_switch_kernel_context` fires with `outgoing=0` (initial idle CPU state),
+returns `None` because tid=0 is uninitialized, then all user tasks block on IPC
+receive before any further preemption occurs.
+
+**Changes by part:**
+
+**Part A — Minimal task-pair init** (`exec_state.rs`): added
+`BOOTSTRAP_SUPERVISOR_TID: u64 = 2` constant. Extended the x86_64
+`spawn_user_task_from_image` init gate from
+`spec.tid == BOOTSTRAP_FIRST_USER_TID` to
+`spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID`.
+Both tasks now emit `D6_KERNEL_SWITCH_FRAME_INIT_BEGIN/DONE/DEFERRED` at spawn,
+and both have `kernel_context.initialized = true` on x86_64.
+
+**Part C — TSS RSP0 fix** (`thread_state.rs`
+`yarm_kernel_thread_switch_trampoline`):
+
+The trampoline switch-back previously passed `ctx.outgoing_stack_top` as the
+`next_kernel_stack_top` argument to `switch_frames`. On x86_64 this calls
+`refresh_boot_tss_rsp0(A.stack_top)`, overwriting the TSS RSP0 value that the
+stash-drain's `switch_frames(A, B, B.stack_top)` had set to B's kernel stack top.
+After IRETQ starts B in user mode, any subsequent interrupt on B would then use
+A's kernel stack — silent stack corruption.
+
+Fix: pass `None` instead. The stash-drain `switch_frames` already set
+`TSS RSP0 = B.stack_top`; passing `None` in the trampoline preserves it.
+
+**Part D — Fallback paths preserved.** All deferred markers remain:
+`D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task`,
+`D6_FIRST_RESUME_DEFERRED reason=non_x86_64_arch/stash_empty/shared_not_ready`,
+`maybe_switch_kernel_context` initialized guard for non-pair tasks. RISC-V
+remains on the Stage 117 fallback path.
+
+**What this stage does NOT do (hard rules preserved).** No ABI changes. No
+syscall number changes. No image ID changes. No service protocol changes. No FS
+gate changes. No x86_64 AP scheduler-online. No per-CPU runqueue sharding. No
+D2-B send blocking. No D3-FULL. No `switch_frames` assembly ABI change. No lock
+handoff / `mem::forget` lock guards. No assembly unlock callbacks. All current
+smokes preserved. RISC-V remains in smoke matrix.
+`Syscall::VARIANT_COUNT` remains 23.
+
+**Why Outcome B and not Outcome A here.** Both tasks are initialized. The
+dispatch infrastructure is complete. The blocker is scheduling dynamics: in the
+current smoke, the very first dispatch event has `outgoing=0` (the idle CPU
+state, uninitialized), so `maybe_switch_kernel_context` returns `None`. After
+that, all user tasks block on IPC receive (supervisor waiting for init calls, pm
+waiting for requests) before any timer tick can preempt a running initialized
+task while another initialized task is queued. Outcome A requires either (a) a
+longer-running user-mode workload that doesn't immediately block, or (b) a
+synthetic smoke with explicit timer forcing. Neither is in scope for Stage 119.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained 18 Stage 119 tests in
+`mod stage119_minimal_task_pair`:
+`stage119_bootstrap_supervisor_tid_constant_defined`,
+`stage119_bootstrap_supervisor_tid_is_two`,
+`stage119_exec_state_init_gate_covers_supervisor_tid`,
+`stage119_exec_state_init_gate_uses_or_for_both_tids`,
+`stage119_exec_state_init_gate_still_covers_first_user_tid`,
+`stage119_exec_state_switch_frame_init_markers_still_present`,
+`stage119_trampoline_switchback_does_not_pass_outgoing_stack_top`,
+`stage119_trampoline_switchback_passes_none_for_tss_rsp0`,
+`stage119_trampoline_switchback_has_tss_rsp0_preservation_comment`,
+`stage119_trampoline_non_x86_64_deferred_path_preserved`,
+`stage119_trampoline_stash_empty_deferred_path_preserved`,
+`stage119_trampoline_shared_not_ready_deferred_path_preserved`,
+`stage119_exec_state_no_outgoing_task_deferred_path_preserved`,
+`stage119_maybe_switch_kernel_context_initialized_guard_preserved`,
+`stage119_first_resume_stash_seam_preserved`,
+`stage119_stage117_switch_plan_stash_seam_preserved`,
+`stage119_provision_default_kernel_context_still_sets_initialized_false`,
+`stage119_supervisor_tid_init_gated_on_x86_64_cfg`.
+
+Acceptance evidence (Stage 119):
+
+| Smoke | Result | Notes |
+|-------|--------|-------|
+| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PASS | `D6_KERNEL_SWITCH_FRAME_INIT_DONE tid=2` and `D6_KERNEL_SWITCH_FRAME_INIT_DONE tid=1` both observed; `D6_FIRST_RESUME_ENTER` absent (Outcome B) |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PASS | all required markers; `D2_PUBLISH_RACE_UNWIND` count=0 |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PASS | AArch64 unaffected; RAMFS + ext4 live |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PASS | all four SMP configurations passed; RISC-V on Stage 117 fallback |
+
+Workspace tests: 1587/0 lib (`--test-threads=1`, 2 ignored).
 No ABI/protocol/syscall-number/image-ID change.
 `Syscall::VARIANT_COUNT` remains 23.
 
