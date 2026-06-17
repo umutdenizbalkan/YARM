@@ -782,6 +782,26 @@ impl KernelState {
         incoming_tid: u64,
     ) -> Result<(), KernelError> {
         let Some(outgoing_tid) = outgoing_tid else {
+            // No outgoing task: the prior task was blocked/idle before this
+            // dispatch. A kernel-context switch via switch_frames requires a
+            // valid outgoing ArchSwitchContext to save into; dispatch here is
+            // purely via trap-frame restore (restore_arch_thread_state).
+            //
+            // Emit a deferred marker on x86_64/AArch64 trap paths so smoke
+            // logs prove the production path reaches this decision point.
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                let _cpu_idx = self.current_cpu().0 as usize;
+                let _trap_active = _cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                    && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[_cpu_idx]
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                if _trap_active {
+                    crate::yarm_log!(
+                        "D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task incoming={}",
+                        incoming_tid
+                    );
+                }
+            }
             return Ok(());
         };
         if outgoing_tid == incoming_tid {
@@ -885,6 +905,30 @@ impl KernelState {
         // task_state_lock (rank 2) is now released.
 
         let Some(plan) = plan else {
+            // Plan is None: one or both tasks lack an initialized kernel-context
+            // switch frame (kernel_context.initialized == false). Production user
+            // tasks are spawned via provision_default_kernel_context which sets
+            // initialized = false; only explicitly wired kernel threads (set via
+            // initialize_thread_kernel_switch_frame) have initialized == true.
+            // Context switching for these tasks happens entirely via trap-frame
+            // restore; switch_frames is not called.
+            //
+            // Emit a deferred marker on x86_64/AArch64 trap paths so smoke
+            // logs prove the production path reaches this decision point.
+            #[cfg(not(target_arch = "riscv64"))]
+            {
+                let _cpu_idx = self.current_cpu().0 as usize;
+                let _trap_active = _cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                    && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[_cpu_idx]
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                if _trap_active {
+                    crate::yarm_log!(
+                        "D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_kernel_ctx_switch_frame outgoing={} incoming={}",
+                        outgoing_tid,
+                        incoming_tid
+                    );
+                }
+            }
             return Ok(());
         };
 

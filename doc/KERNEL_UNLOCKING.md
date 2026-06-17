@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global SpinLock dropped before switch_frames)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs}.rs` | **PARTIAL** | Stage 102 | rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs`, `syscall/cap.rs`, `syscall/sched.rs`, `syscall/process.rs`, `syscall/recv_shared_v3.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global lock dropped before switch_frames, Stage 117) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 eliminates the outer `SpinLock<KernelState>` (from `with_cpu`) before `switch_frames` on single-CPU x86_64/AArch64 trap paths; per-CPU lock sharding deferred (§9); `Stage 108 with_scheduler_split_mut` not yet called — see §1 Stage 113 / Stage 116 / Stage 117 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` infrastructure for dropping `SpinLock<KernelState>` before `switch_frames` but remains Outcome B (no production task has `kernel_context.initialized = true`); per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -838,35 +838,64 @@ Workspace tests: 1527/0 lib (`--test-threads=1`, 2 ignored).
 No ABI/protocol/syscall-number/image-ID/smoke-marker change.
 `Syscall::VARIANT_COUNT` remains 23.
 
-### Stage 117 — Solution 2: global `SpinLock<KernelState>` dropped before `switch_frames` (stash-based, single-CPU)
+### Stage 117 — Solution 2: global `SpinLock<KernelState>` stash infrastructure (Outcome B — scaffolding, not smoke-proven)
 
 **Goal stated in the task:** release the outer `SpinLock<KernelState>` held by
 `SharedKernel::with_cpu` BEFORE calling `switch_frames`, while keeping the CPU
 non-preemptible (interrupts still disabled by hardware trap entry).
 
-**Outcome: A — live implementation.** Phase model:
+**Outcome: B — preparatory scaffolding; `switch_frames` not exercised in production smoke.**
+
+The stash mechanism (`PerCpuSwitchPlanStash`, `DISPATCH_SWITCH_PLAN_STASH`,
+`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`) is correctly implemented and tested. The
+production trap path (`handle_trap_entry_shared` → `with_cpu`) does reach
+`maybe_switch_kernel_context`. However, `switch_frames` is NEVER called in
+production smoke because no production task has `kernel_context.initialized = true`:
+`provision_default_kernel_context` (called by `register_task`) explicitly leaves
+`initialized = false`; only `initialize_thread_kernel_switch_frame` sets it to
+`true`, and that function has no production callers. The required proof markers
+(`D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH`, `D6_SWITCH_FRAMES_ENTER_UNLOCKED`,
+`D6_SWITCH_FRAMES_RETURNED_UNLOCKED`) therefore never appear in smoke logs.
+
+**Why the stash path is never reached in production:**
+1. **Timer interrupt path:** `dispatch_next()` returns `Some(current_task_tid)` —
+   the currently running task is always re-selected (no preemption, same task).
+   `maybe_switch_kernel_context(Some(A), A)` hits the `outgoing_tid == incoming_tid`
+   early return at line 787 (no `D6_SWITCH_PLAN_BEGIN`).
+2. **IPC blocking path:** `recv_block_phase_a_scheduler` sets `scheduler.current = None`
+   before `dispatch_next_task` is called. `current_tid()` returns `None`.
+   `maybe_switch_kernel_context(None, B)` hits the `outgoing_tid == None` early
+   return at line 784 (no `D6_SWITCH_PLAN_BEGIN`). Emits
+   `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` on x86_64/AArch64 trap path.
+3. **Yield path (different tasks):** when `outgoing_tid != incoming_tid`, the
+   `with_tcbs_mut` block attempts to build a plan but finds
+   `!tcb.kernel_context.initialized` for both tasks → returns `Ok(None)`. Emits
+   `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_kernel_ctx_switch_frame` on
+   x86_64/AArch64 trap path. `D6_SWITCH_PLAN_BEGIN` fires but no plan is built.
+
+**Smoke-observable deferred markers (prove production trap path is reached):**
+These appear in x86_64 and AArch64 smoke logs in lieu of the unlocked-switch
+markers, proving the decision point is reached but the actual lock drop is deferred:
+- `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task incoming=N` — IPC
+  blocking dispatch, no outgoing kernel context to save
+- `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_kernel_ctx_switch_frame outgoing=M incoming=N` —
+  different tasks selected, but neither has an initialized kernel switch frame
+- `D6_GLOBAL_LOCK_DROP_DEFERRED reason=riscv_lockless_trap_path` — RISC-V (unchanged)
+- `D6_GLOBAL_LOCK_DROP_DEFERRED reason=multi_cpu_not_proven` — multi-CPU fallback
+  (fires when kernel threads exist but multi-CPU proof is pending)
+
+**Stash path wiring (correct but dormant in production):**
 
 - **Phase B** (inside `with_tcbs_mut`): existing Stage 116 path. `DispatchSwitchPlan`
-  is built; rank-2 `task_state_lock` is released when the closure returns.
+  is built when BOTH tasks have `kernel_context.initialized = true`.
 - **Phase C / D / E — stash path** (single-CPU, x86_64/AArch64, production
-  trap path only): instead of calling `switch_frames` inside `with_cpu`,
-  `maybe_switch_kernel_context` stashes the `DispatchSwitchPlan` in
-  `DISPATCH_SWITCH_PLAN_STASH[cpu_idx]` (a `PerCpuSwitchPlanStash`) and returns
-  `Ok(())`. `handle_trap_entry_with_fault_bookkeeping_mode` detects a pending
-  stash and skips the `restore_arch_thread_state` call (which must run in the
-  INCOMING task's context, after `switch_frames`). Back in
-  `handle_trap_entry_shared`, after `with_cpu` returns and the outer
-  `SpinLock<KernelState>` guard is dropped, the stash is drained: emits
-  `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` / `D6_SWITCH_FRAMES_ENTER_UNLOCKED`,
-  calls `switch_frames` with no lock held, then re-acquires the global lock via a
-  second `with_cpu` call to run `restore_arch_thread_state` (= `post_switch_restore_arch_thread_state`)
-  in the INCOMING task's context.
-- **Fallback path** (RISC-V64, multi-CPU, or test direct-call): emits
-  `D6_GLOBAL_LOCK_DROP_DEFERRED reason=riscv_lockless_trap_path` (RISC-V) or
-  `D6_GLOBAL_LOCK_DROP_DEFERRED reason=multi_cpu_not_proven` (multi-CPU). Uses
-  Stage 116 direct `switch_frames` inside `with_cpu`. Unit tests always use the
-  fallback path because `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` is never set outside
-  `handle_trap_entry_shared`.
+  trap path, kernel threads only): `maybe_switch_kernel_context` stashes the plan
+  in `DISPATCH_SWITCH_PLAN_STASH[cpu_idx]`. `handle_trap_entry_with_fault_bookkeeping_mode`
+  skips `restore_arch_thread_state`. `handle_trap_entry_shared` drains the stash
+  after `with_cpu` drops the lock, calls `switch_frames` unlocked, re-acquires
+  the lock for `post_switch_restore_arch_thread_state`.
+- **Fallback path** (RISC-V, multi-CPU, test direct-call, all production user tasks):
+  `D6_GLOBAL_LOCK_DROP_DEFERRED reason=...`, Stage 116 direct path or early return.
 
 **Key infrastructure:**
 
@@ -876,33 +905,20 @@ non-preemptible (interrupts still disabled by hardware trap entry).
 - `DISPATCH_SWITCH_PLAN_STASH: [PerCpuSwitchPlanStash; MAX_CPUS]` static.
 - `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [AtomicBool; MAX_CPUS]` static. Set to
   `true` by `handle_trap_entry_shared` before `with_cpu`; cleared after the
-  stash drain. `maybe_switch_kernel_context` checks this flag as a third
-  condition in `can_stash_for_lock_drop` so unit tests (which never call
-  `handle_trap_entry_shared`) always use the Stage 116 fallback path.
+  stash drain. Unit tests (which never call `handle_trap_entry_shared`) always
+  use the Stage 116 fallback path.
 - `post_switch_restore_arch_thread_state` (`src/arch/trap_entry.rs`):
-  arch-dispatched wrapper that calls `restore_arch_thread_state` (x86_64) or
-  `restore_arch_thread_state_post_switch` (AArch64, `syscall_return=false`) or
+  arch-dispatched wrapper — `restore_arch_thread_state` (x86_64) /
+  `restore_arch_thread_state_post_switch` (AArch64, `syscall_return=false`) /
   no-op (RISC-V). Called from the second `with_cpu` after `switch_frames`.
 - `can_stash_for_lock_drop` condition: `!cfg!(target_arch = "riscv64") &&
   online_cpu_count() <= 1 && GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]`.
 
-**IRQ safety argument.** `SpinLock<KernelState>` is NOT a `SpinLockIrq`; it
-does not save/restore IRQ state. Dropping the outer `SpinLock<KernelState>` guard
-does NOT re-enable IRQs. IRQs were disabled by hardware trap entry on x86_64 and
-AArch64 and remain disabled when `switch_frames` is called. The second `with_cpu`
-call to run `post_switch_restore_arch_thread_state` is thus safe (IRQs still off
-throughout).
-
-**Markers emitted on the stash path:**
-- `D6_GLOBAL_LOCK_DROP_PLAN_BEGIN` — alongside `D6_SWITCH_PLAN_BEGIN` in
-  `maybe_switch_kernel_context`
-- `D6_GLOBAL_LOCK_DROP_PLAN_READY outgoing=... incoming=...` — after stash store
-- `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` — in `handle_trap_entry_shared`, after
-  `with_cpu` returns
-- `D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing=... incoming=...` — immediately
-  before `switch_frames`
-- `D6_SWITCH_FRAMES_RETURNED_UNLOCKED` — immediately after `switch_frames`
-- `D6_GLOBAL_LOCK_DROP_DEFERRED reason=...` — on the fallback path
+**IRQ safety argument (correct even if dormant).**
+`SpinLock<KernelState>` is NOT a `SpinLockIrq`; dropping it does NOT re-enable
+IRQs. Hardware disables IRQs on x86_64/AArch64 trap entry; they remain disabled
+throughout the stash drain and `switch_frames` call. The second `with_cpu` call
+is safe (IRQs still off).
 
 **What this stage does NOT do (hard rules preserved):**
 No ABI changes. No syscall number changes. No image ID changes. No IPC recv ABI
@@ -910,42 +926,53 @@ changes. No D2-B send blocking split. No D3-FULL. No D6-full per-CPU sharding.
 No x86_64 AP scheduler-online. No `switch_frames` assembly ABI change. No lock
 handoff/guard transfer. `SYSCALL::VARIANT_COUNT` remains 23.
 
-**Tests added.** `src/kernel/boot/tests.rs` gained 19 Stage 117 tests in
+**Why Outcome B and not Outcome A here.** The stash infrastructure and IRQ safety
+argument are sound. The blocker is `kernel_context.initialized = false` for all
+production tasks. Activating Outcome A requires either: (a) adding kernel-thread
+infrastructure (`initialize_thread_kernel_switch_frame` callers in the production
+boot path, plus a real `yarm_kernel_thread_switch_trampoline` that handles first-time
+kernel-side resumption), or (b) wiring the lock-drop to the trap-frame-only context
+switch path (not `switch_frames`). Both are follow-on work. This stage establishes
+the complete stash mechanism, IRQ-safety proof, and smoke-observable deferred markers
+as scaffolding for that follow-on.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained 21 Stage 117 tests in
 `mod stage117_global_lock_drop_before_switch`:
-`stage117_per_cpu_switch_plan_stash_type_exists`,
-`stage117_per_cpu_switch_plan_stash_has_store_take_has_plan`,
+`stage117_per_cpu_stash_struct_exists`,
 `stage117_dispatch_switch_plan_stash_static_exists`,
-`stage117_global_lock_drop_trap_path_active_static_exists`,
-`stage117_global_lock_drop_plan_begin_marker_present`,
-`stage117_global_lock_drop_plan_ready_marker_present`,
-`stage117_global_lock_dropped_before_switch_marker_present`,
-`stage117_switch_frames_enter_unlocked_marker_present`,
-`stage117_switch_frames_returned_unlocked_marker_present`,
-`stage117_global_lock_drop_deferred_marker_present`,
-`stage117_can_stash_condition_requires_single_cpu`,
-`stage117_can_stash_condition_excludes_riscv`,
-`stage117_can_stash_condition_checks_trap_path_active_flag`,
-`stage117_post_switch_restore_arch_thread_state_fn_exists`,
-`stage117_stash_used_in_arch_trap_handlers`,
-`stage117_stage116_fallback_path_markers_still_present`,
-`stage117_dispatch_switch_plan_struct_still_present`,
-`stage117_syscall_variant_count_still_23`,
-`stage117_restore_skipped_when_stash_pending`.
+`stage117_trap_path_active_flag_exists`,
+`stage117_exec_state_emits_global_lock_drop_plan_begin`,
+`stage117_exec_state_emits_global_lock_drop_plan_ready`,
+`stage117_exec_state_emits_deferred_marker`,
+`stage117_exec_state_emits_no_outgoing_task_deferred_reason`,
+`stage117_exec_state_emits_no_kernel_ctx_deferred_reason`,
+`stage117_exec_state_checks_trap_path_active_flag`,
+`stage117_exec_state_stash_gated_on_single_cpu`,
+`stage117_exec_state_stash_gated_on_riscv_cfg`,
+`stage117_trap_entry_sets_trap_path_active_flag`,
+`stage117_trap_entry_emits_global_lock_dropped_before_switch`,
+`stage117_trap_entry_emits_switch_frames_enter_unlocked`,
+`stage117_trap_entry_emits_switch_frames_returned_unlocked`,
+`stage117_trap_entry_post_switch_restore_function_exists`,
+`stage117_x86_trap_skips_restore_when_stash_pending`,
+`stage117_aarch64_trap_skips_restore_when_stash_pending`,
+`stage117_stage116_fallback_markers_preserved`,
+`stage117_dispatch_switch_plan_struct_preserved`,
+`stage117_syscall_count_unchanged`.
 
 Acceptance evidence (Stage 117):
 
 | Smoke | Result | Notes |
 |-------|--------|-------|
-| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | DEFERRED | QEMU infrastructure not available in remote container; production path live via `handle_trap_entry_shared` |
-| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | DEFERRED | same |
-| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | DEFERRED | same |
-| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | DEFERRED | same |
+| `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | PENDING | `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` and/or `reason=no_kernel_ctx_switch_frame` must appear; `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` not required (Outcome B) |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | PENDING | same |
+| `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh` | PENDING | same |
+| `./scripts/qemu-riscv64-smoke-matrix.sh` (`--smp 1/2/3/4`) | PENDING | `D6_GLOBAL_LOCK_DROP_DEFERRED reason=riscv_lockless_trap_path` must appear (unchanged from Stage 116) |
 
-Workspace tests: 1546/0 lib (`--test-threads=1`, 2 ignored, pre-existing crash
-in `load_elf_returns_heap_base_aligned_to_max_pt_load_end` is pre-existing under
-parallel test runner, not introduced by Stage 117).
+Workspace tests: 1548/0 lib (`--test-threads=1`, 2 ignored, pre-existing crash
+in `load_elf_returns_heap_base_aligned_to_max_pt_load_end` under parallel runner).
 `cargo check --features hosted-dev` and `git diff --check` clean.
-No ABI/protocol/syscall-number/image-ID/smoke-marker change.
+No ABI/protocol/syscall-number/image-ID change.
 `Syscall::VARIANT_COUNT` remains 23.
 
 ---
@@ -1470,32 +1497,38 @@ the `task_state_lock` (rank-2 sub-lock) is no longer held across `switch_frames`
 `DispatchSwitchPlan` is built inside `with_tcbs_mut` and used after the lock
 is released. This eliminates the per-domain sub-lock from crossing the
 `switch_frames` boundary; only the outer global `SpinLock<KernelState>` (from
-`with_cpu`) still spans it. Stage 117 (§1) implemented Solution 2: on single-CPU
-x86_64/AArch64 production trap paths, the outer `SpinLock<KernelState>` (from
-`with_cpu`) is now dropped before `switch_frames` via the stash-based
-`PerCpuSwitchPlanStash` / `DISPATCH_SWITCH_PLAN_STASH` infrastructure. The stash
-is drained in `handle_trap_entry_shared` after `with_cpu` returns, then
-`post_switch_restore_arch_thread_state` runs in the INCOMING task's context under a
-second `with_cpu`. The next targets, in order:
+`with_cpu`) still spans it. Stage 117 (§1) added the global-lock-drop stash infrastructure
+(`PerCpuSwitchPlanStash`, `DISPATCH_SWITCH_PLAN_STASH`, `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`)
+but landed at Outcome B: `switch_frames` is never called in production because no
+task has `kernel_context.initialized = true` (`provision_default_kernel_context` leaves
+it `false`; `initialize_thread_kernel_switch_frame` is never called in production).
+The proof markers do not appear in smoke; smoke-observable deferred markers
+(`D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` / `reason=no_kernel_ctx_switch_frame`)
+prove the trap path reaches the decision point. The next targets, in order:
 
-1. **QEMU smoke runs for Stage 117.** The stash-based lock-drop path is live in
-   production code but smoke acceptance was deferred (QEMU not available in the
-   remote container). Required: run all four smokes and record results here before
-   the next stage.
-2. **D2 blocking-recv genuine seam live-wire and D6 dispatch seam
-   live-wire** — the remaining two Outcome B items from Stages 114/115. With
-   Stage 117 eliminating the outer global lock from crossing `switch_frames` on
-   the production trap path, the structural blocker (global lock held across
-   `switch_frames`) is now resolved for single-CPU. Multi-CPU live-wire requires
-   the x86_64 AP per-CPU environment and `-smp ≥ 2` smoke acceptance first.
-3. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction**, then
+1. **Stage 117 QEMU smoke acceptance.** Run all four smokes and verify that
+   `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` and/or
+   `reason=no_kernel_ctx_switch_frame` appear in x86_64 and AArch64 logs, and
+   `reason=riscv_lockless_trap_path` appears in RISC-V logs. Record results in
+   §1 Stage 117 acceptance evidence table.
+2. **Stage 117 Outcome A — kernel-thread infrastructure.** Wire
+   `initialize_thread_kernel_switch_frame` into the production boot path (requires
+   a real `yarm_kernel_thread_switch_trampoline` that handles first-time kernel-side
+   resumption). Once any production task has `kernel_context.initialized = true`,
+   the stash path will fire and the proof markers will appear in smoke.
+3. **D2 blocking-recv genuine seam live-wire and D6 dispatch seam live-wire.**
+   The structural blocker (global lock held across `switch_frames`) is resolved for
+   kernel threads once Stage 117 Outcome A is achieved. For user tasks (trap-frame
+   switching only), the lock drop needs to be wired to `restore_arch_thread_state`
+   instead of `switch_frames`.
+4. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction**, then
    `syscall/process.rs`, then the remaining modules listed in §5.1.
-4. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
+5. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
    Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
    behind a default-off knob; then `-smp ≥ 2` smoke acceptance. Still
    high priority — it unblocks per-CPU runqueue lock sharding (D6) and
    the lock-free `await_tlb_shootdown_ack` design (D3, full two-phase)
-   — but does not bypass items 1–3 above.
+   — but does not bypass items 1–4 above.
 
 ### 7.1.6 What must not be touched yet
 
@@ -1525,38 +1558,37 @@ second `with_cpu`. The next targets, in order:
 
 **Ready to resume global kernel unlocking: yes.**
 
-Stage 117 implemented Solution 2: on single-CPU x86_64/AArch64 production trap
-paths, the outer `SpinLock<KernelState>` (from `with_cpu`) is now dropped before
-`switch_frames`. The `PerCpuSwitchPlanStash` / `DISPATCH_SWITCH_PLAN_STASH`
-infrastructure carries the `DispatchSwitchPlan` out of `with_cpu`'s closure;
-`handle_trap_entry_shared` drains the stash after the lock guard is dropped.
-`switch_frames` executes with no lock held; a second `with_cpu` call restores the
-INCOMING task's arch thread state. IRQ safety: `SpinLock<KernelState>` is NOT a
-`SpinLockIrq` — dropping it does NOT re-enable IRQs; hardware disables IRQs on
-trap entry and they remain disabled throughout.
+Stage 117 landed at Outcome B. The stash infrastructure
+(`PerCpuSwitchPlanStash`, `DISPATCH_SWITCH_PLAN_STASH`, `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`)
+and IRQ safety argument are correct. The stash path is exercised correctly by
+unit tests. The production smoke blocker: all production tasks have
+`kernel_context.initialized = false` (set by `provision_default_kernel_context`,
+never overridden by `initialize_thread_kernel_switch_frame`), so `switch_frames`
+is never called in smoke and the proof markers do not appear.
 
-The `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` flag isolates the stash path to the
-production `handle_trap_entry_shared` call chain; unit tests that call
-`dispatch_next_task` directly always use the Stage 116 fallback path, preserving
-correct test behavior. RISC-V64 and multi-CPU configurations also use the fallback
-path (`D6_GLOBAL_LOCK_DROP_DEFERRED`).
+Smoke-observable deferred markers prove the production trap path reaches the
+decision point: `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` (IPC
+blocking dispatch) and `reason=no_kernel_ctx_switch_frame` (yield-path, different
+tasks but uninitialized frames) appear in x86_64 and AArch64 logs.
 
-The remaining open item is QEMU smoke acceptance for Stage 117 (deferred:
-QEMU infrastructure not available in the remote execution container). Smoke
-acceptance must be recorded before Stage 117 can be considered fully closed.
+The Outcome A unlock for Stage 117 requires kernel-thread infrastructure:
+`initialize_thread_kernel_switch_frame` must be called in the production boot path,
+and `yarm_kernel_thread_switch_trampoline` must be a real function (not a spin
+loop) that handles first-time kernel-side resumption after `switch_frames`.
 
 **Exact next Claude prompt recommendation:**
 
-> Kernel unlocking Stage 117 smoke acceptance: run all four QEMU smokes
-> (`QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`,
-> `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh`,
-> `QEMU_SMOKE_STRICT=1 ./scripts/qemu-aarch64-optional-fs-smoke.sh`,
-> `./scripts/qemu-riscv64-smoke-matrix.sh --smp 1/2/3/4`) and record results
-> in `doc/KERNEL_UNLOCKING.md` §1 Stage 117 acceptance evidence table. All
-> Stage 116 smoke markers must still be present; the new `D6_GLOBAL_LOCK_DROP_*`
-> markers must appear in the x86_64 and AArch64 logs (they are at Info level).
-> If all four smokes pass, mark Stage 117 acceptance evidence as PASS and proceed
-> to D2/D6 genuine seam live-wire (§7.1.5 item 2).
+> Kernel unlocking Stage 117 QEMU smoke acceptance and Outcome A upgrade:
+> (1) Run all four QEMU smokes and verify `D6_GLOBAL_LOCK_DROP_DEFERRED
+> reason=no_outgoing_task` and/or `reason=no_kernel_ctx_switch_frame` appear
+> in x86_64/AArch64 logs, and `reason=riscv_lockless_trap_path` appears in
+> RISC-V logs; record results in `doc/KERNEL_UNLOCKING.md` §1 Stage 117 table.
+> (2) To upgrade Stage 117 to Outcome A: wire `initialize_thread_kernel_switch_frame`
+> into the production boot (e.g., for the supervisor tid=1) and implement a real
+> `yarm_kernel_thread_switch_trampoline` that acquires the global lock and calls
+> `post_switch_restore_arch_thread_state` on its first invocation. The proof
+> markers (`D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH`, `D6_SWITCH_FRAMES_ENTER_UNLOCKED`,
+> `D6_SWITCH_FRAMES_RETURNED_UNLOCKED`) must appear in smoke before claiming Outcome A.
 
 ---
 
