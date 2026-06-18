@@ -2,9 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{
-    ControlPlaneCnodePlan, IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan,
-    KernelError, KernelState, TransferSharedRegion, VmAnonMapProgressPlan, VmAnonMapValidatedArgs,
-    VmBrkPlan, VmPageMapProgress,
+    IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan, KernelError, KernelState,
+    TransferSharedRegion, VmAnonMapProgressPlan, VmAnonMapValidatedArgs, VmBrkPlan,
+    VmPageMapProgress,
 };
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
@@ -93,6 +93,7 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // unchanged; the `use` re-imports keep the handler call sites textually
 // identical. NOTE: these `mod` declarations must stay AFTER the
 // `syscall_trace!` macro definition above (textual macro scoping).
+mod cap;
 mod debug;
 mod initramfs;
 mod process;
@@ -388,7 +389,7 @@ pub(super) fn current_tid(kernel: &KernelState) -> Result<u64, SyscallError> {
     kernel.current_tid().ok_or(SyscallError::Internal)
 }
 
-fn current_task_has_user_asid(kernel: &KernelState) -> Result<bool, SyscallError> {
+pub(super) fn current_task_has_user_asid(kernel: &KernelState) -> Result<bool, SyscallError> {
     Ok(kernel.task_asid(current_tid(kernel)?).is_some())
 }
 
@@ -2634,84 +2635,14 @@ fn handle_transfer_release(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    if !current_task_has_user_asid(kernel)? {
-        return Err(SyscallError::InvalidArgs);
-    }
-    let transfer_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    let owner = crate::kernel::ipc::ThreadId(current_tid(kernel)?);
-    let (base, map_len) = {
-        let base_arg = frame.arg(SYSCALL_ARG_PTR);
-        let len_arg = frame.arg(SYSCALL_ARG_LEN);
-        if base_arg == 0 && len_arg == 0 {
-            kernel
-                .active_transfer_mapping_for(owner, transfer_cap)
-                .map(|(base, len)| (base.0 as usize, len))
-                .ok_or(SyscallError::InvalidArgs)?
-        } else {
-            if len_arg == 0 || !base_arg.is_multiple_of(PAGE_SIZE) {
-                return Err(SyscallError::InvalidArgs);
-            }
-            (base_arg, round_up_page(len_arg)?)
-        }
-    };
-    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
-    // Stage 7: plan-first ASID resolution before the two-phase unmap loop
-    // (rank-2 task read before vm/memory mutation in loop body).
-    // current_task_has_user_asid (checked above) guarantees task_asid returns Some.
-    let asid = kernel
-        .task_asid(owner.0)
-        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
-    let mut va = base;
-    while va < end {
-        // Stage 7: two-phase unmap — reclaim only after shootdown wait/fast path.
-        // Ok(None) means the page was never mapped; preserve old InvalidArgs behavior.
-        let plan = kernel
-            .unmap_page_phase1(asid, VirtAddr(va as u64))
-            .map_err(SyscallError::from)?;
-        let Some(plan) = plan else {
-            return Err(SyscallError::InvalidArgs);
-        };
-        kernel
-            .execute_tlb_shootdown_wait_plan(plan)
-            .map_err(SyscallError::from)?;
-        va += PAGE_SIZE;
-    }
-
-    let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
-    kernel
-        .revoke_capability_in_cnode(cnode, transfer_cap)
-        .map_err(SyscallError::from)?;
-    if kernel.remove_active_transfer_mapping(owner, transfer_cap) {
-        kernel.note_shared_mem_released(map_len);
-    }
-    frame.set_ok(map_len, 0, 0);
-    Ok(())
+    self::cap::handle_transfer_release(kernel, frame)
 }
 
 fn handle_control_plane_set_cnode_slots(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let requester_tid = current_tid(kernel)?;
-    let target_pid = frame.arg(SYSCALL_ARG_CAP) as u64;
-    let slot_capacity = frame.arg(SYSCALL_ARG_PTR);
-    if target_pid == 0 || slot_capacity == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    // Stage 5B plan-first: snapshot task domain (rank 2) before capability
-    // mutation (rank 4). When the global lock is removed, this read moves to
-    // before the with_cpu() call via split-read on SharedKernel.
-    let plan = ControlPlaneCnodePlan {
-        requester_class: kernel
-            .task_class(requester_tid)
-            .ok_or(SyscallError::from(KernelError::TaskMissing))?,
-        requester_pid: kernel.process_id(requester_tid).unwrap_or(requester_tid),
-    };
-    kernel
-        .control_plane_set_process_cnode_slots_planned(&plan, target_pid, slot_capacity)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(slot_capacity, target_pid as usize, 0);
-    Ok(())
+    self::cap::handle_control_plane_set_cnode_slots(kernel, frame)
 }
 
 fn handle_yield(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
@@ -6271,6 +6202,102 @@ mod tests {
             scheduler_src.contains("SPLIT_RECV_TIMEOUT_DEADLINE")
                 && scheduler_src.contains("MAX_CPUS"),
             "scheduler timeout/preemption policy markers must remain present"
+        );
+    }
+
+    #[test]
+    fn d4_step4_cap_module_extraction_guardrails() {
+        let syscall_src = include_str!("syscall.rs");
+        let cap_src = include_str!("syscall/cap.rs");
+        let process_src = include_str!("syscall/process.rs");
+        let sched_src = include_str!("syscall/sched.rs");
+        let recv_v3_src = include_str!("syscall/recv_shared_v3.rs");
+        let trap_entry_src = include_str!("../arch/trap_entry.rs");
+        let memory_src = include_str!("boot/memory_state.rs");
+        let exec_state_src = include_str!("boot/exec_state.rs");
+        let recv_waiter_split_src = include_str!("recv_waiter_split.rs");
+
+        assert!(
+            syscall_src.contains("mod cap;"),
+            "syscall.rs must declare the cap child module"
+        );
+        assert!(
+            cap_src.contains("pub(super) fn handle_transfer_release")
+                && cap_src.contains("pub(super) fn handle_control_plane_set_cnode_slots"),
+            "cap.rs must host the moved capability syscall handlers"
+        );
+        assert!(
+            syscall_src.contains("self::cap::handle_transfer_release(kernel, frame)")
+                && syscall_src
+                    .contains("self::cap::handle_control_plane_set_cnode_slots(kernel, frame)"),
+            "syscall.rs must keep minimal capability delegation shims"
+        );
+        assert!(
+            syscall_src.contains(
+                "Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots(kernel, frame)"
+            ) && syscall_src.contains(
+                "Syscall::TransferRelease => handle_transfer_release(kernel, frame)"
+            ),
+            "capability syscall dispatch arms must route through the same syscall variants"
+        );
+        assert_eq!(SYSCALL_COUNT, 31, "D4 step 4 must not change syscall count");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "D4 step 4 must not change syscall variant count"
+        );
+        assert!(
+            cap_src.contains("revoke_capability_in_cnode")
+                && cap_src.contains("remove_active_transfer_mapping")
+                && cap_src.contains("note_shared_mem_released")
+                && cap_src.contains("control_plane_set_process_cnode_slots_planned"),
+            "capability release/CNode marker strings must remain in cap.rs"
+        );
+        assert!(
+            cap_src.contains("SyscallError::InvalidArgs")
+                && cap_src.contains("SyscallError::Internal")
+                && cap_src.contains("KernelError::UserMemoryFault")
+                && cap_src.contains("KernelError::TaskMissing"),
+            "capability syscall error handling markers must remain unchanged"
+        );
+        assert!(
+            !syscall_src.contains(&["fn parse_v3_request", "_bytes"].concat())
+                && recv_v3_src.contains(&["fn parse_v3_request", "_bytes"].concat()),
+            "recv_shared_v3 code must stay extracted and not move back into syscall.rs"
+        );
+        assert!(
+            process_src.contains("pub(super) fn handle_spawn_thread")
+                && process_src.contains("pub(super) fn handle_spawn_from_memory_object"),
+            "process extraction must remain intact"
+        );
+        assert!(
+            sched_src.contains("pub(super) fn handle_yield")
+                && sched_src.contains("pub(super) fn handle_futex_wait")
+                && sched_src.contains("pub(super) fn handle_futex_wake"),
+            "scheduler extraction must remain intact"
+        );
+        assert!(
+            trap_entry_src.contains("SWITCH_FRAMES_ENTER")
+                && trap_entry_src.contains("SWITCH_FRAMES_RETURNED"),
+            "Stage 117/118/119 switch-frame source markers must remain present"
+        );
+        assert!(
+            syscall_src.contains("YARM_D1_SPLIT_MATERIALIZE")
+                && syscall_src.contains("YARM_D5_SPLIT_MATERIALIZE"),
+            "D1/D5 cap-transfer split markers must remain present"
+        );
+        assert!(
+            exec_state_src.contains("D6_LIVE_SPLIT")
+                && memory_src.contains("D3_LIVE_SPLIT")
+                && recv_waiter_split_src.contains("publish_recv_waiter_live"),
+            "D2/D3/D6 behavior markers must remain present"
+        );
+        assert!(
+            cap_src.contains("current_task_cnode")
+                && cap_src.contains("round_up_page")
+                && cap_src.contains("revoke_capability_in_cnode")
+                && cap_src.contains("control_plane_set_process_cnode_slots_planned"),
+            "cap generation/refcount/slot semantic call sites must remain in cap.rs"
         );
     }
 
