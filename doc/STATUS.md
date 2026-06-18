@@ -253,13 +253,13 @@ The four highest-impact items, in order of unlock value:
    and a tiny x86_64 shim now stays raw-COM1-only before tail-jumping to the
    Rust first-resume handler. Stage 122 added raw first-instruction breadcrumbs;
    Stage 123 removes the pre-Rust marker bridge call and adds `!RM` at that boundary. Stage 124
-   removes the obsolete shim stack adjustment, preserves the initialized
-   `rsp % 16 == 8` shape at the Rust tail-jump, and adds `!RJ` immediately
-   before `jmp yarm_kernel_thread_switch_trampoline_rust`. QEMU proof validation
-   is pending the local user run. This is a proof harness, not
+   removes the obsolete shim stack adjustment and adds `!RJ`. Stage 125 replaces
+   the direct Rust jump with an x86_64 ABI bridge that emits `!RB`, aligns for a
+   normal `call`, and calls `yarm_kernel_thread_switch_trampoline_rust_real`.
+   QEMU proof validation is pending the local user run. This is a proof harness, not
    scheduler policy; AArch64/RISC-V remain unchanged/fallback-safe. See
    `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / Stage 119 / Stage 120 /
-   Stage 121 / Stage 122 / Stage 123 / Stage 124 / §7.1.5.
+   Stage 121 / Stage 122 / Stage 123 / Stage 124 / Stage 125 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

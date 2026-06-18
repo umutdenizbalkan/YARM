@@ -34473,9 +34473,11 @@ mod stage121_first_resume_abi_diagnostics {
         assert!(
             THREAD_STATE_SRC.contains("global_asm!")
                 && THREAD_STATE_SRC.contains("yarm_kernel_thread_switch_trampoline:")
-                && THREAD_STATE_SRC.contains("jmp yarm_kernel_thread_switch_trampoline_rust")
+                && THREAD_STATE_SRC
+                    .contains("jmp yarm_kernel_thread_switch_trampoline_rust_bridge")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real")
                 && !THREAD_STATE_SRC.contains("call yarm_x86_first_resume_asm_marker"),
-            "x86_64 first resume must enter through the tiny assembly shim without a pre-Rust marker call"
+            "x86_64 first resume must enter through the tiny assembly shim and bridge without a pre-Rust marker call"
         );
         assert!(
             THREAD_STATE_SRC.contains("!RM")
@@ -34662,9 +34664,14 @@ mod stage122_first_instruction_proof {
         );
         let shim = &THREAD_STATE_SRC[label
             ..THREAD_STATE_SRC[label..]
-                .find("\"#")
+                .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
                 .map(|end| label + end)
-                .unwrap_or(THREAD_STATE_SRC.len())];
+                .unwrap_or_else(|| {
+                    THREAD_STATE_SRC[label..]
+                        .find("\"#")
+                        .map(|end| label + end)
+                        .unwrap_or(THREAD_STATE_SRC.len())
+                })];
         assert!(
             !shim.contains("call yarm_x86_first_resume_asm_marker")
                 && !shim.contains("sub rsp, 8")
@@ -34756,9 +34763,14 @@ mod stage123_no_pre_rust_marker_bridge_call {
             .expect("shim label");
         let shim = &THREAD_STATE_SRC[label
             ..THREAD_STATE_SRC[label..]
-                .find("\"#")
+                .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
                 .map(|end| label + end)
-                .unwrap_or(THREAD_STATE_SRC.len())];
+                .unwrap_or_else(|| {
+                    THREAD_STATE_SRC[label..]
+                        .find("\"#")
+                        .map(|end| label + end)
+                        .unwrap_or(THREAD_STATE_SRC.len())
+                })];
         assert!(shim.contains("mov al, 0x21") && shim.contains("mov al, 0x52"));
         assert!(shim.contains("mov al, 0x41"), "shim must keep !RA");
         assert!(shim.contains("mov al, 0x4d"), "shim must emit !RM");
@@ -34827,9 +34839,14 @@ mod stage124_rust_tail_jump_stack_shape {
             .find("yarm_kernel_thread_switch_trampoline:")
             .expect("shim label");
         let end = THREAD_STATE_SRC[label..]
-            .find("\"#")
+            .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
             .map(|offset| label + offset)
-            .unwrap_or(THREAD_STATE_SRC.len());
+            .unwrap_or_else(|| {
+                THREAD_STATE_SRC[label..]
+                    .find("\"#")
+                    .map(|offset| label + offset)
+                    .unwrap_or(THREAD_STATE_SRC.len())
+            });
         &THREAD_STATE_SRC[label..end]
     }
 
@@ -34852,9 +34869,9 @@ mod stage124_rust_tail_jump_stack_shape {
         let shim = shim_source();
         assert!(
             THREAD_STATE_SRC.contains("rsp % 16 == 8")
-                && THREAD_STATE_SRC.contains("fake return slot")
-                && THREAD_STATE_SRC.contains("performs no `sub rsp, 8` / `add rsp, 8`"),
-            "source must document that the initialized fake return slot supplies Rust's SysV entry shape"
+                && THREAD_STATE_SRC.contains("fake return-address slot")
+                && THREAD_STATE_SRC.contains("x86_64 ABI bridge"),
+            "source must document that the initialized fake return slot supplies the bridge/Rust SysV entry shape"
         );
         assert!(
             !shim.contains("sub rsp, 8") && !shim.contains("add rsp, 8"),
@@ -34896,6 +34913,121 @@ mod stage124_rust_tail_jump_stack_shape {
                 && !AARCH64_SWITCH_SRC.contains("!RJ")
                 && !RISCV_SWITCH_SRC.contains("!RJ"),
             "AArch64/RISC-V paths must not gain x86_64 Stage 124 breadcrumbs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 125 — x86_64 first-resume Rust entry bridge
+// ===========================================================================
+#[cfg(test)]
+mod stage125_first_resume_rust_entry_bridge {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn raw_trampoline_source() -> &'static str {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("raw trampoline label");
+        let end = THREAD_STATE_SRC[label..]
+            .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
+            .map(|offset| label + offset)
+            .expect("bridge label after raw trampoline");
+        &THREAD_STATE_SRC[label..end]
+    }
+
+    fn bridge_source() -> &'static str {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline_rust_bridge:")
+            .expect("bridge label");
+        let end = THREAD_STATE_SRC[label..]
+            .find("1:")
+            .map(|offset| label + offset)
+            .expect("bridge return-fault marker loop");
+        &THREAD_STATE_SRC[label..end]
+    }
+
+    #[test]
+    fn stage125_raw_trampoline_targets_bridge_not_rust_handler() {
+        let raw = raw_trampoline_source();
+        assert!(
+            raw.contains("mov al, 0x4a")
+                && raw.contains("jmp yarm_kernel_thread_switch_trampoline_rust_bridge"),
+            "raw trampoline must keep !RJ and jump to the x86_64 ABI bridge"
+        );
+        assert!(
+            !raw.contains("jmp yarm_kernel_thread_switch_trampoline_rust_real")
+                && !raw.contains("jmp yarm_kernel_thread_switch_trampoline_rust\n")
+                && !raw.contains("call yarm_kernel_thread_switch_trampoline_rust"),
+            "raw trampoline must not directly enter a normal Rust ABI function"
+        );
+    }
+
+    #[test]
+    fn stage125_bridge_emits_rb_and_calls_rust_real_handler() {
+        let bridge = bridge_source();
+        let marker_b = bridge.find("mov al, 0x42").expect("B byte for !RB");
+        let stack_adjust = bridge.find("sub rsp, 8").expect("call alignment adjust");
+        let rust_call = bridge
+            .find("call yarm_kernel_thread_switch_trampoline_rust_real")
+            .expect("Rust real handler call");
+        assert!(
+            marker_b < stack_adjust && stack_adjust < rust_call,
+            "bridge must emit !RB, arrange call alignment, then call Rust real handler"
+        );
+        assert!(
+            !bridge.contains("jmp yarm_kernel_thread_switch_trampoline_rust_real"),
+            "bridge must use call, not jmp, for the Rust real handler ABI boundary"
+        );
+    }
+
+    #[test]
+    fn stage125_stack_alignment_and_rust_real_entry_are_documented() {
+        assert!(
+            THREAD_STATE_SRC.contains("x86_64 ABI bridge")
+                && THREAD_STATE_SRC.contains("sub rsp, 8")
+                && THREAD_STATE_SRC.contains("call` enters Rust with SysV callee shape")
+                && THREAD_STATE_SRC.contains("yarm_kernel_thread_switch_trampoline_rust_real"),
+            "bridge stack-alignment contract must be documented and source-pinned"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_RUST_ENTER")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STACK_ALIGN value={}")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_OK")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_MISSING"),
+            "Rust real handler must keep the first-resume diagnostics"
+        );
+    }
+
+    #[test]
+    fn stage125_forbidden_boundaries_remain_closed() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, and mem::forget boundaries must remain closed"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof must remain default-off and boot-knob gated"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RB")
+                && !RISCV_SWITCH_SRC.contains("!RB"),
+            "AArch64/RISC-V paths must not gain x86_64 Stage 125 bridge breadcrumbs"
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")

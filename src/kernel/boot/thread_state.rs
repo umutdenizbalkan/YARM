@@ -51,7 +51,31 @@ yarm_kernel_thread_switch_trampoline:
     out dx, al
     mov al, 0x4a
     out dx, al
-    jmp yarm_kernel_thread_switch_trampoline_rust
+    jmp yarm_kernel_thread_switch_trampoline_rust_bridge
+
+    .global yarm_kernel_thread_switch_trampoline_rust_bridge
+    .type yarm_kernel_thread_switch_trampoline_rust_bridge, @function
+yarm_kernel_thread_switch_trampoline_rust_bridge:
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x42
+    out dx, al
+    sub rsp, 8
+    call yarm_kernel_thread_switch_trampoline_rust_real
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x58
+    out dx, al
+1:
+    cli
+    hlt
+    jmp 1b
 "#
 );
 
@@ -66,41 +90,45 @@ pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
     yarm_kernel_thread_switch_trampoline as *const () as usize
 }
 
-/// Stage 123: the first-resume assembly shim no longer calls a Rust marker
-/// bridge before entering the Rust first-resume handler. The raw COM1 sequence
-/// now emits `!R` at shim entry, `!RA` at the former stack-adjust boundary,
-/// `!RM` where the removed Rust marker bridge used to run, and `!RJ`
-/// immediately before tail-jumping directly to
-/// `yarm_kernel_thread_switch_trampoline_rust`. Because there is no pre-Rust
-/// call anymore, the shim intentionally performs no `sub rsp, 8` / `add rsp, 8`;
-/// the initialized frame's fake return slot already supplies `rsp % 16 == 8`.
-/// VALIDATION: D6_FIRST_RESUME_RUST_ENTER / !RM
+/// Stage 125: the first-resume raw trampoline no longer jumps directly into a
+/// normal Rust ABI function. The raw COM1 sequence emits `!R` at shim entry,
+/// `!RA` at the former stack-adjust boundary, `!RM` where the removed Rust
+/// marker bridge used to run, and `!RJ` immediately before jumping to the
+/// x86_64 ABI bridge `yarm_kernel_thread_switch_trampoline_rust_bridge`. The
+/// bridge emits `!RB`, subtracts 8 from the initialized `rsp % 16 == 8` shape so
+/// the subsequent `call` enters Rust with SysV callee shape, and calls
+/// `yarm_kernel_thread_switch_trampoline_rust_real`.
+/// VALIDATION: D6_FIRST_RESUME_RUST_ENTER / !RM / !RJ / !RB
 #[cfg(all(target_arch = "x86_64", test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
-    yarm_kernel_thread_switch_trampoline_rust()
+    yarm_kernel_thread_switch_trampoline_rust_real()
 }
 
-/// First-resume Rust handler. Entered only through
-/// `yarm_kernel_thread_switch_trampoline` on x86_64: `switch_frames` restores
-/// RIP to that assembly shim, the shim first emits raw COM1 breadcrumbs (`!R`
-/// at entry, `!RA` at the former stack-adjust boundary, `!RM` at the removed
-/// Rust marker-bridge boundary, `!RJ` immediately before the jump), then
-/// tail-jumps here with the original first-resume stack shape. Non-x86_64 keeps the historical direct Rust entry
-/// and immediately defers.
+/// First-resume Rust handler. Entered only through the documented first-resume
+/// entry path. On x86_64, `switch_frames` restores RIP to
+/// `yarm_kernel_thread_switch_trampoline`; that raw shim emits `!R`, `!RA`,
+/// `!RM`, and `!RJ`, then jumps to the assembly ABI bridge. The bridge emits
+/// `!RB`, adjusts the stack for a normal SysV `call`, and calls this Rust real
+/// handler. Non-x86_64 keeps the historical direct Rust entry and immediately
+/// defers.
 ///
 /// x86_64 ABI audit: `switch_frames` saves/restores `[rsp, rip, rbx, rbp,
 /// r12..r15, fxsave]` in `ArchSwitchContext`. It enters the incoming frame with
-/// `mov rsp, [next + 0]` and `jmp [next + 8]` (not `ret`), so the initialized
-/// first-resume stack must look like a normal SysV callee entry: `rsp % 16 == 8`.
-/// The handler is `-> !`; the reserved top word is a fake return-address slot
-/// for ABI shape only and is never consumed. VALIDATION: D6_FIRST_RESUME_RUST_ENTER
+/// `mov rsp, [next + 0]` and `jmp [next + 8]` (not `ret`). The initialized frame
+/// reserves a fake return-address slot so the bridge starts at `rsp % 16 == 8`;
+/// the bridge then uses `sub rsp, 8` before `call`, so this handler is entered
+/// with normal SysV callee shape (`rsp % 16 == 8`). VALIDATION:
+/// D6_FIRST_RESUME_RUST_ENTER
 #[cfg_attr(
     target_arch = "x86_64",
+    unsafe(export_name = "yarm_kernel_thread_switch_trampoline_rust_real")
+)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
     unsafe(export_name = "yarm_kernel_thread_switch_trampoline_rust")
 )]
-#[cfg_attr(not(target_arch = "x86_64"), unsafe(no_mangle))]
-pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust() -> ! {
+pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust_real() -> ! {
     #[cfg(not(target_arch = "x86_64"))]
     {
         crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=non_x86_64_arch");
