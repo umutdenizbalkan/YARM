@@ -1243,8 +1243,7 @@ impl KernelState {
         // handler can prove lock reacquisition via post_switch_restore.
         #[cfg(target_arch = "x86_64")]
         if spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID {
-            let entry =
-                super::thread_state::yarm_kernel_thread_switch_trampoline as *const () as usize;
+            let entry = super::thread_state::kernel_switch_frame_trampoline_ip();
             crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN tid={}", spec.tid);
             match self.initialize_thread_kernel_switch_frame(spec.tid, entry) {
                 Ok(()) => {

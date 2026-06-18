@@ -8580,6 +8580,9 @@ fn kernel_switch_frame_can_be_initialized_for_thread() {
     assert_eq!(context.stack_base, Some(VirtAddr(0x9000_0000)));
     assert_eq!(context.stack_top, Some(VirtAddr(0x9000_4000)));
     assert_eq!(context.frame.instruction_ptr(), 0x1234_5678);
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(context.frame.stack_ptr() & 0xF, 8);
+    #[cfg(not(target_arch = "x86_64"))]
     assert_eq!(context.frame.stack_ptr() & 0xF, 0);
     assert!(context.initialized);
 }
@@ -34445,6 +34448,144 @@ mod stage120_controlled_switch_proof {
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
                 && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
             "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 121 — x86_64 first-resume entry/frame ABI diagnostics
+// ===========================================================================
+#[cfg(test)]
+mod stage121_first_resume_abi_diagnostics {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+
+    #[test]
+    fn stage121_x86_first_resume_has_asm_shim_and_early_markers() {
+        assert!(
+            THREAD_STATE_SRC.contains("global_asm!")
+                && THREAD_STATE_SRC.contains("yarm_kernel_thread_switch_trampoline:")
+                && THREAD_STATE_SRC.contains("call yarm_x86_first_resume_asm_marker")
+                && THREAD_STATE_SRC.contains("jmp yarm_kernel_thread_switch_trampoline_rust"),
+            "x86_64 first resume must enter through the tiny assembly shim"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_ASM_ENTER")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_RUST_ENTER")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STACK_ALIGN value={}")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN"),
+            "first-resume diagnostics must appear before lock reacquire"
+        );
+    }
+
+    #[test]
+    fn stage121_switch_frame_layout_is_pinned_to_x86_restore_order() {
+        assert!(
+            TASK_SRC.contains("#[repr(C, align(16))]")
+                && TASK_SRC.contains("words: [usize; 8]")
+                && TASK_SRC.contains("fxsave: [u8; 512]")
+                && TASK_SRC.contains("const STACK_PTR_IDX: usize = 0")
+                && TASK_SRC.contains("const INSTRUCTION_PTR_IDX: usize = 1"),
+            "ArchSwitchContext layout must keep rsp at word 0 and rip at word 1"
+        );
+        for offset in [
+            "fxsave [rdi + 64]",
+            "mov [rdi + 16], rbx",
+            "mov [rdi + 24], rbp",
+            "mov [rdi + 32], r12",
+            "mov [rdi + 40], r13",
+            "mov [rdi + 48], r14",
+            "mov [rdi + 56], r15",
+            "mov rsp, [rsi + 0]",
+            "jmp [rsi + 8]",
+        ] {
+            assert!(
+                X86_SWITCH_SRC.contains(offset),
+                "x86_64 switch_frames restore/save order changed or undocumented: {offset}"
+            );
+        }
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback") && !X86_SWITCH_SRC.contains("mem::forget"),
+            "switch_frames ABI must not grow callbacks or lock handoff"
+        );
+    }
+
+    #[test]
+    fn stage121_initialized_frame_uses_trampoline_ip_and_sysv_stack_shape() {
+        assert!(
+            THREAD_STATE_SRC.contains("set_instruction_ptr(switch_entry)")
+                && EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip")
+                || EXEC_STATE_SRC
+                    .contains("yarm_kernel_thread_switch_trampoline as *const () as usize"),
+            "initialized production frames must still use the first-resume entry symbol"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("saturating_sub(core::mem::size_of::<usize>())")
+                && THREAD_STATE_SRC.contains("rsp % 16 == 8")
+                && THREAD_STATE_SRC.contains("fake return-address slot")
+                && THREAD_STATE_SRC.contains("not `ret`"),
+            "x86_64 first-resume stack alignment and fake-return-slot handling must be documented"
+        );
+    }
+
+    #[test]
+    fn stage121_first_resume_stash_boundary_is_observable() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("FIRST_RESUME_STASH")
+                && TRAP_ENTRY_SRC.contains("store(ctx)")
+                && TRAP_ENTRY_SRC.find("FIRST_RESUME_STASH").unwrap()
+                    < TRAP_ENTRY_SRC.find("switch_frames(").unwrap(),
+            "FIRST_RESUME_STASH must be populated before switch_frames"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_OK")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_MISSING")
+                && THREAD_STATE_SRC.contains("reason=stash_empty"),
+            "first-resume handler must make stash presence/missing state observable"
+        );
+    }
+
+    #[test]
+    fn stage121_boundaries_and_counts_remain_unchanged() {
+        assert!(
+            !THREAD_STATE_SRC.contains("mem::forget")
+                && !TRAP_ENTRY_SRC.contains("mem::forget")
+                && !MOD_SRC.contains("mem::forget"),
+            "Stage 121 must not use mem::forget lock handoff"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback"),
+            "Stage 121 must not add an assembly unlock callback"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("D6_FIRST_RESUME_ASM_ENTER")
+                && !RISCV_SWITCH_SRC.contains("D6_FIRST_RESUME_ASM_ENTER"),
+            "AArch64/RISC-V switch paths must not gain x86_64 first-resume diagnostics"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof harness must remain default-off and knob-gated"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod sched;")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "D4 module split and syscall counts must remain intact"
         );
     }
 }

@@ -20,23 +20,67 @@ const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
 const USER_VIRT_TOP_EXCLUSIVE: u64 = crate::kernel::vm::KERNEL_SPACE_BASE;
 const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
 
+#[cfg(all(target_arch = "x86_64", not(test)))]
+core::arch::global_asm!(
+    r#"
+    .section .text, "ax", @progbits
+    .global yarm_kernel_thread_switch_trampoline
+    .type yarm_kernel_thread_switch_trampoline, @function
+yarm_kernel_thread_switch_trampoline:
+    sub rsp, 8
+    call yarm_x86_first_resume_asm_marker
+    add rsp, 8
+    jmp yarm_kernel_thread_switch_trampoline_rust
+"#
+);
+
+#[cfg(all(target_arch = "x86_64", not(test)))]
+unsafe extern "C" {
+    pub(crate) fn yarm_kernel_thread_switch_trampoline() -> !;
+}
+
 /// Returns the raw instruction-pointer value of `yarm_kernel_thread_switch_trampoline`,
 /// used by the trap-entry stash drain to detect the first-resume path.
 pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
     yarm_kernel_thread_switch_trampoline as *const () as usize
 }
 
-/// First-resume handler. Entered via `switch_frames` when the incoming task's
-/// kernel switch frame has never executed (RIP == trampoline address).
-///
-/// On x86_64: takes the per-CPU `FirstResumeContext` stash, re-acquires the
-/// global lock, calls `post_switch_restore_arch_thread_state` with no trap
-/// frame (no-op on x86_64), then switches back to the outgoing task.
-///
-/// On all other architectures (and as a defensive fallback on x86_64 when the
-/// stash is absent): emits `D6_FIRST_RESUME_DEFERRED` and spins.
+/// Ultra-early x86_64 first-resume marker called by the assembly shim before it
+/// tail-jumps into the Rust handler. The shim enters from `switch_frames` via a
+/// `jmp`, so it subtracts 8 before this call to present normal SysV alignment to
+/// this Rust function, then restores the first-resume stack shape before the
+/// tail jump. VALIDATION: D6_FIRST_RESUME_ASM_ENTER
+#[cfg(all(target_arch = "x86_64", not(test)))]
+#[unsafe(no_mangle)]
+pub extern "C" fn yarm_x86_first_resume_asm_marker() {
+    crate::yarm_log!("D6_FIRST_RESUME_ASM_ENTER");
+}
+
+#[cfg(all(target_arch = "x86_64", test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
+    yarm_kernel_thread_switch_trampoline_rust()
+}
+
+/// First-resume Rust handler. Entered only through
+/// `yarm_kernel_thread_switch_trampoline` on x86_64: `switch_frames` restores
+/// RIP to that assembly shim, the shim emits `D6_FIRST_RESUME_ASM_ENTER`, fixes
+/// call alignment for that marker call, then tail-jumps here with the original
+/// first-resume stack shape. Non-x86_64 keeps the historical direct Rust entry
+/// and immediately defers.
+///
+/// x86_64 ABI audit: `switch_frames` saves/restores `[rsp, rip, rbx, rbp,
+/// r12..r15, fxsave]` in `ArchSwitchContext`. It enters the incoming frame with
+/// `mov rsp, [next + 0]` and `jmp [next + 8]` (not `ret`), so the initialized
+/// first-resume stack must look like a normal SysV callee entry: `rsp % 16 == 8`.
+/// The handler is `-> !`; the reserved top word is a fake return-address slot
+/// for ABI shape only and is never consumed. VALIDATION: D6_FIRST_RESUME_RUST_ENTER
+#[cfg_attr(
+    target_arch = "x86_64",
+    unsafe(export_name = "yarm_kernel_thread_switch_trampoline_rust")
+)]
+#[cfg_attr(not(target_arch = "x86_64"), unsafe(no_mangle))]
+pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust() -> ! {
     #[cfg(not(target_arch = "x86_64"))]
     {
         crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=non_x86_64_arch");
@@ -46,17 +90,22 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        crate::yarm_log!("D6_FIRST_RESUME_RUST_ENTER");
+        let stack_align = current_stack_alignment_for_diagnostics();
+        crate::yarm_log!("D6_FIRST_RESUME_STACK_ALIGN value={}", stack_align);
         // Single-CPU precondition: the stash is always on CPU 0 (bootstrap CPU).
         let cpu_idx = crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize;
         // SAFETY: single CPU, interrupts disabled (trap path precondition for
         // can_stash_for_lock_drop), no concurrent accessor of FIRST_RESUME_STASH.
         let ctx = unsafe { crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].take() };
         let Some(ctx) = ctx else {
+            crate::yarm_log!("D6_FIRST_RESUME_STASH_MISSING");
             crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=stash_empty");
             loop {
                 core::hint::spin_loop();
             }
         };
+        crate::yarm_log!("D6_FIRST_RESUME_STASH_OK");
         crate::yarm_log!(
             "D6_FIRST_RESUME_ENTER tid={} cpu={}",
             ctx.incoming_tid,
@@ -97,6 +146,17 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
             core::hint::spin_loop();
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn current_stack_alignment_for_diagnostics() -> usize {
+    let rsp: usize;
+    // SAFETY: read-only diagnostic snapshot of the architectural stack pointer.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+    rsp & 0xF
 }
 
 impl KernelState {
@@ -230,7 +290,17 @@ impl KernelState {
                 .stack_top
                 .ok_or(KernelError::WrongObject)?
                 .0 as usize;
-            tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+            // Stage 121 x86_64 first-resume ABI audit: switch_frames enters the
+            // initialized frame with a jump, not a call/ret. A normal SysV Rust
+            // function entry still expects `rsp % 16 == 8`, so reserve one
+            // fake-return-address slot below the 16-byte-aligned stack top on
+            // x86_64. The first-resume handler is `-> !`, so the slot is ABI
+            // shape only and is never read. Non-x86_64 keeps the prior stack top.
+            #[cfg(target_arch = "x86_64")]
+            let entry_stack_ptr = (stack_top & !0xF).saturating_sub(core::mem::size_of::<usize>());
+            #[cfg(not(target_arch = "x86_64"))]
+            let entry_stack_ptr = stack_top & !0xF;
+            tcb.kernel_context.frame.set_stack_ptr(entry_stack_ptr);
             tcb.kernel_context.frame.set_instruction_ptr(switch_entry);
             tcb.kernel_context.initialized = true;
             Ok(())

@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 | D4 steps 1–4 complete: `recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`; rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -1313,6 +1313,84 @@ gate, one-shot atomics, boot knob, initialized tid-pair requirement, reuse of
 preemption/fairness/AP/lock-handoff/assembly-callback changes, AArch64/RISC-V
 non-participation, Stage 119 tid=1/tid=2 initialization, D4 extracted modules,
 `SYSCALL_COUNT == 31`, and `Syscall::VARIANT_COUNT == 23`.
+
+---
+
+### Stage 121 — x86_64 first-resume entry/frame ABI diagnostics and source fix
+
+**Goal stated in the task:** make the x86_64 `switch_frames` restore →
+first-resume boundary diagnosable, and correct the source-level frame/entry ABI
+if the audit shows why the Stage 120 proof crashes after
+`D6_SWITCH_FRAMES_ENTER_UNLOCKED` but before `D6_FIRST_RESUME_ENTER`.
+
+**Outcome: A-source — source audit identified and fixed the first-resume ABI
+shape; QEMU proof validation is pending user/local run.** The Stage 120 proof
+now reaches the unlocked `switch_frames` entry with incoming RIP equal to the
+expected first-resume trampoline. The audited x86_64 switch primitive restores
+`rsp` from `ArchSwitchContext.words[0]` and enters `rip` from
+`ArchSwitchContext.words[1]` using `jmp [rsi + 8]` rather than `ret`. A direct
+Rust `extern "C" fn` entry therefore must still receive normal SysV callee
+stack shape (`rsp % 16 == 8`). Stage 120 initialized the first-resume stack to a
+16-byte-aligned top (`rsp % 16 == 0`), which is not the ABI shape a Rust function
+expects when entered by a jump.
+
+**Fix / diagnostics:**
+
+- x86_64 keeps the `switch_frames` assembly ABI unchanged. No callback, lock
+  handoff, or extra argument was added.
+- The first-resume entry symbol is now a tiny x86_64-only assembly shim,
+  `yarm_kernel_thread_switch_trampoline`, which emits the ultra-early
+  `D6_FIRST_RESUME_ASM_ENTER` marker by calling `yarm_x86_first_resume_asm_marker`
+  with corrected call alignment, restores the original first-resume stack shape,
+  and tail-jumps to the Rust handler `yarm_kernel_thread_switch_trampoline_rust`.
+- `initialize_thread_kernel_switch_frame` now reserves one word below the
+  16-byte-aligned kernel stack top on x86_64, so the first-resume handler sees
+  `rsp % 16 == 8` after `switch_frames` jumps to the shim. The word is a fake
+  return-address slot for ABI shape only; the handler is `-> !`, so it is never
+  consumed. Non-x86_64 keeps the previous stack-top behavior.
+- The Rust handler now emits `D6_FIRST_RESUME_RUST_ENTER`,
+  `D6_FIRST_RESUME_STACK_ALIGN value=...`, `D6_FIRST_RESUME_STASH_OK`, and
+  `D6_FIRST_RESUME_STASH_MISSING` before the existing lock-reacquire markers,
+  making the exact first-resume boundary observable.
+- `FIRST_RESUME_STASH` is still populated in the stash drain before
+  `switch_frames`; `D6_FIRST_RESUME_STASH_MISSING` distinguishes an entry ABI
+  success from a missing-stash failure.
+
+**Expected local validation markers after this source fix:**
+
+```text
+D6_CONTROLLED_SWITCH_PROOF_BEGIN
+D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing=1 incoming=2
+D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing=1 incoming=2
+D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing=1 incoming=2
+D6_FIRST_RESUME_ASM_ENTER
+D6_FIRST_RESUME_RUST_ENTER
+D6_FIRST_RESUME_STACK_ALIGN value=8
+D6_FIRST_RESUME_STASH_OK
+D6_FIRST_RESUME_ENTER tid=2 cpu=0
+D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN
+D6_FIRST_RESUME_LOCK_REACQUIRE_DONE
+D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN
+D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE
+D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing=1 incoming=2
+D6_CONTROLLED_SWITCH_PROOF_DONE
+```
+
+**Hard boundaries preserved:** x86_64 proof-mode path only; Stage 120 remains
+default-off behind `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; no scheduler
+policy, timer/preemption, AP scheduler-online, per-CPU runqueue, D2/D3/D6
+semantic, ABI/syscall/image-ID/service/FS, lock-handoff, `mem::forget`, or
+assembly-unlock-callback change. AArch64 and RISC-V paths are unchanged and do
+not use the x86_64 first-resume shim.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained Stage 121 source checks for
+the x86_64 assembly shim and early markers, `ArchSwitchContext` layout vs.
+`switch_frames` offsets, initialized-frame entry symbol and `rsp % 16 == 8`
+shape, fake return-address documentation, `FIRST_RESUME_STASH` population before
+`switch_frames`, stash-present/missing markers, absence of `mem::forget` /
+assembly unlock callbacks, AArch64/RISC-V non-participation, Stage 120
+default-off gating, D4 extracted modules, `SYSCALL_COUNT == 31`, and
+`Syscall::VARIANT_COUNT == 23`.
 
 ---
 
