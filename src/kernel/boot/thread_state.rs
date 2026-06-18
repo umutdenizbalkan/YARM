@@ -40,7 +40,12 @@ yarm_kernel_thread_switch_trampoline:
     out dx, al
     mov al, 0x41
     out dx, al
-    call yarm_x86_first_resume_asm_marker
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x4d
+    out dx, al
     add rsp, 8
     jmp yarm_kernel_thread_switch_trampoline_rust
 "#
@@ -57,18 +62,12 @@ pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
     yarm_kernel_thread_switch_trampoline as *const () as usize
 }
 
-/// Ultra-early x86_64 first-resume marker called by the assembly shim after
-/// raw COM1 breadcrumbs (`!R` at shim entry, `!RA` after stack adjustment) and
-/// before it tail-jumps into the Rust handler. The shim enters from
-/// `switch_frames` via a `jmp`, so it subtracts 8 before this call to present
-/// normal SysV alignment to this Rust function, then restores the first-resume
-/// stack shape before the tail jump. VALIDATION: D6_FIRST_RESUME_ASM_ENTER
-#[cfg(all(target_arch = "x86_64", not(test)))]
-#[unsafe(no_mangle)]
-pub extern "C" fn yarm_x86_first_resume_asm_marker() {
-    crate::yarm_log!("D6_FIRST_RESUME_ASM_ENTER");
-}
-
+/// Stage 123: the first-resume assembly shim no longer calls a Rust marker
+/// bridge before entering the Rust first-resume handler. The raw COM1 sequence
+/// now emits `!R` at shim entry, `!RA` after stack adjustment, and `!RM` at the
+/// point where the removed Rust marker bridge used to run, then tail-jumps
+/// directly to `yarm_kernel_thread_switch_trampoline_rust`.
+/// VALIDATION: D6_FIRST_RESUME_RUST_ENTER / !RM
 #[cfg(all(target_arch = "x86_64", test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
@@ -78,9 +77,8 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
 /// First-resume Rust handler. Entered only through
 /// `yarm_kernel_thread_switch_trampoline` on x86_64: `switch_frames` restores
 /// RIP to that assembly shim, the shim first emits raw COM1 breadcrumbs (`!R`
-/// before stack adjustment, `!RA` after stack adjustment), emits
-/// `D6_FIRST_RESUME_ASM_ENTER`, fixes call alignment for that marker call, then
-/// tail-jumps here with the original
+/// before stack adjustment, `!RA` after stack adjustment, `!RM` at the removed
+/// Rust marker-bridge boundary), restores stack shape, then tail-jumps here with the original
 /// first-resume stack shape. Non-x86_64 keeps the historical direct Rust entry
 /// and immediately defers.
 ///
