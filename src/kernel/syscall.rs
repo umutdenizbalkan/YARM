@@ -97,6 +97,7 @@ mod debug;
 mod initramfs;
 mod process;
 mod recv_shared_v3;
+mod sched;
 
 use self::debug::handle_debug_log;
 use self::initramfs::{handle_create_initramfs_file_slice_mo, handle_initramfs_read_chunk};
@@ -2713,28 +2714,16 @@ fn handle_control_plane_set_cnode_slots(
     Ok(())
 }
 
+fn handle_yield(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    self::sched::handle_yield(kernel, frame)
+}
+
 fn handle_futex_wait(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let addr = frame.arg(SYSCALL_ARG_CAP);
-    let expected =
-        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let observed =
-        u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
-    let blocked = kernel
-        .futex_wait_current(addr, expected, observed)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(usize::from(blocked), 0, 0);
-    Ok(())
+    self::sched::handle_futex_wait(kernel, frame)
 }
 
 fn handle_futex_wake(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let addr = frame.arg(SYSCALL_ARG_CAP);
-    let max_wake =
-        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let woke = kernel
-        .futex_wake(addr, max_wake)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(woke as usize, 0, 0);
-    Ok(())
+    self::sched::handle_futex_wake(kernel, frame)
 }
 
 fn handle_spawn_thread(
@@ -2989,11 +2978,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
     let syscall = Syscall::decode(frame.syscall_num())?;
     let caller_tid = kernel.current_tid();
     let result = match syscall {
-        Syscall::Yield => {
-            kernel.yield_current().map_err(SyscallError::from)?;
-            frame.set_ok(0, 0, 0);
-            Ok(())
-        }
+        Syscall::Yield => handle_yield(kernel, frame),
         Syscall::IpcSend => handle_ipc_send(kernel, frame),
         Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
         Syscall::IpcRecvTimeout => handle_ipc_recv_timeout(kernel, frame),
@@ -6221,6 +6206,71 @@ mod tests {
                 && syscall_src.contains("Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame)")
                 && syscall_src.contains("Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame)"),
             "process syscall dispatch arms must stay textually stable"
+        );
+    }
+
+    #[test]
+    fn d4_step3_sched_module_extraction_guardrails() {
+        let syscall_src = include_str!("syscall.rs");
+        let sched_src = include_str!("syscall/sched.rs");
+        let process_src = include_str!("syscall/process.rs");
+        let recv_v3_src = include_str!("syscall/recv_shared_v3.rs");
+        let trap_entry_src = include_str!("../arch/trap_entry.rs");
+        let scheduler_src = include_str!("scheduler.rs");
+
+        assert!(
+            syscall_src.contains("mod sched;"),
+            "syscall.rs must declare the sched child module"
+        );
+        assert!(
+            sched_src.contains("pub(super) fn handle_yield")
+                && sched_src.contains("pub(super) fn handle_futex_wait")
+                && sched_src.contains("pub(super) fn handle_futex_wake"),
+            "sched.rs must host the moved scheduler/futex syscall handlers"
+        );
+        assert!(
+            syscall_src.contains("self::sched::handle_yield(kernel, frame)")
+                && syscall_src.contains("self::sched::handle_futex_wait(kernel, frame)")
+                && syscall_src.contains("self::sched::handle_futex_wake(kernel, frame)"),
+            "syscall.rs must keep minimal scheduler delegation shims"
+        );
+        assert!(
+            syscall_src.contains("Syscall::Yield => handle_yield(kernel, frame)")
+                && syscall_src.contains("Syscall::FutexWait => handle_futex_wait(kernel, frame)")
+                && syscall_src.contains("Syscall::FutexWake => handle_futex_wake(kernel, frame)"),
+            "scheduler syscall dispatch arms must route through the same syscall variants"
+        );
+        assert_eq!(SYSCALL_COUNT, 31, "D4 step 3 must not change syscall count");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "D4 step 3 must not change syscall variant count"
+        );
+        assert!(
+            sched_src.contains("yield_current()")
+                && sched_src.contains("futex_wait_current")
+                && sched_src.contains("futex_wake"),
+            "scheduler/futex call markers must remain in sched.rs"
+        );
+        assert!(
+            !syscall_src.contains(&["fn parse_v3_request", "_bytes"].concat())
+                && recv_v3_src.contains(&["fn parse_v3_request", "_bytes"].concat()),
+            "recv_shared_v3 code must stay extracted and not move back into syscall.rs"
+        );
+        assert!(
+            process_src.contains("pub(super) fn handle_spawn_thread")
+                && process_src.contains("pub(super) fn handle_spawn_from_memory_object"),
+            "process extraction must remain intact"
+        );
+        assert!(
+            trap_entry_src.contains("SWITCH_FRAMES_ENTER")
+                && trap_entry_src.contains("SWITCH_FRAMES_RETURNED"),
+            "Stage 117/118/119 switch-frame source markers must remain present"
+        );
+        assert!(
+            scheduler_src.contains("SPLIT_RECV_TIMEOUT_DEADLINE")
+                && scheduler_src.contains("MAX_CPUS"),
+            "scheduler timeout/preemption policy markers must remain present"
         );
     }
 
