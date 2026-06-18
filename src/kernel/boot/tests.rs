@@ -34589,3 +34589,122 @@ mod stage121_first_resume_abi_diagnostics {
         );
     }
 }
+
+// ===========================================================================
+// Stage 122 — x86_64 first-resume trampoline first-instruction proof
+// ===========================================================================
+#[cfg(test)]
+mod stage122_first_instruction_proof {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    #[test]
+    fn stage122_trampoline_ip_names_the_assembly_shim() {
+        assert!(
+            THREAD_STATE_SRC.contains("unsafe extern \"C\"")
+                && THREAD_STATE_SRC
+                    .contains("pub(crate) fn yarm_kernel_thread_switch_trampoline() -> !")
+                && THREAD_STATE_SRC.contains("kernel_switch_frame_trampoline_ip()")
+                && THREAD_STATE_SRC
+                    .contains("yarm_kernel_thread_switch_trampoline as *const () as usize"),
+            "kernel_switch_frame_trampoline_ip must return the assembly shim symbol, not the Rust handler"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip()")
+                && EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "initialized switch frames must log/use the shim entry address"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains(".section .text, \"ax\", @progbits")
+                && THREAD_STATE_SRC.contains(".global yarm_kernel_thread_switch_trampoline")
+                && THREAD_STATE_SRC
+                    .contains(".type yarm_kernel_thread_switch_trampoline, @function"),
+            "the shim must be an executable kernel text symbol"
+        );
+    }
+
+    #[test]
+    fn stage122_raw_marker_precedes_stack_adjust_and_rust_call() {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("shim label");
+        let first_bang = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x21")
+            .expect("! byte");
+        let first_r = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x52")
+            .expect("R byte");
+        let stack_adjust = THREAD_STATE_SRC[label..]
+            .find("sub rsp, 8")
+            .expect("stack adjust");
+        let rust_marker_call = THREAD_STATE_SRC[label..]
+            .find("call yarm_x86_first_resume_asm_marker")
+            .expect("Rust marker call");
+        assert!(
+            first_bang < first_r && first_r < stack_adjust && stack_adjust < rust_marker_call,
+            "raw !R must be emitted before stack adjustment and before Rust marker call"
+        );
+    }
+
+    #[test]
+    fn stage122_post_alignment_marker_precedes_rust_call() {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("shim label");
+        let stack_adjust = THREAD_STATE_SRC[label..]
+            .find("sub rsp, 8")
+            .expect("stack adjust");
+        let post_align_a = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x41")
+            .expect("A byte for !RA");
+        let rust_marker_call = THREAD_STATE_SRC[label..]
+            .find("call yarm_x86_first_resume_asm_marker")
+            .expect("Rust marker call");
+        assert!(
+            stack_adjust < post_align_a && post_align_a < rust_marker_call,
+            "raw !RA must be emitted after stack adjustment but before Rust marker call"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("`!R` at shim entry")
+                && THREAD_STATE_SRC.contains("`!RA` after stack adjustment"),
+            "raw marker boundary meanings must be documented in source"
+        );
+    }
+
+    #[test]
+    fn stage122_forbidden_boundaries_remain_closed() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget"),
+            "switch_frames ABI must remain unchanged with no unlock callback or mem::forget"
+        );
+        assert!(
+            !THREAD_STATE_SRC.contains("mem::forget") && !MOD_SRC.contains("mem::forget"),
+            "first-resume proof must not use lock handoff or mem::forget"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof must remain default-off and boot-knob gated"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RA")
+                && !RISCV_SWITCH_SRC.contains("!RA"),
+            "AArch64/RISC-V switch paths must not gain x86_64 raw first-resume breadcrumbs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}

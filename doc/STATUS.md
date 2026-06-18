@@ -251,10 +251,13 @@ The four highest-impact items, in order of unlock value:
    path. Stage 121 audits and fixes the x86_64 first-resume ABI boundary: the
    initialized switch frame now uses SysV callee stack shape (`rsp % 16 == 8`)
    and a tiny x86_64 shim emits `D6_FIRST_RESUME_ASM_ENTER` before tail-jumping
-   to the Rust first-resume handler. QEMU proof validation is pending the local
-   user run. This is a proof harness, not scheduler policy; AArch64/RISC-V
-   remain unchanged/fallback-safe. See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 /
-   Stage 118 / Stage 119 / Stage 120 / Stage 121 / §7.1.5.
+   to the Rust first-resume handler. Stage 122 adds raw COM1 first-instruction
+   breadcrumbs (`!R` before stack adjustment, `!RA` after stack adjustment) to
+   prove whether `switch_frames` reaches the shim before Rust logging. QEMU proof
+   validation is pending the local user run. This is a proof harness, not
+   scheduler policy; AArch64/RISC-V remain unchanged/fallback-safe. See
+   `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / Stage 119 / Stage 120 /
+   Stage 121 / Stage 122 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

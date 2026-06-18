@@ -27,7 +27,19 @@ core::arch::global_asm!(
     .global yarm_kernel_thread_switch_trampoline
     .type yarm_kernel_thread_switch_trampoline, @function
 yarm_kernel_thread_switch_trampoline:
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
     sub rsp, 8
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x41
+    out dx, al
     call yarm_x86_first_resume_asm_marker
     add rsp, 8
     jmp yarm_kernel_thread_switch_trampoline_rust
@@ -45,11 +57,12 @@ pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
     yarm_kernel_thread_switch_trampoline as *const () as usize
 }
 
-/// Ultra-early x86_64 first-resume marker called by the assembly shim before it
-/// tail-jumps into the Rust handler. The shim enters from `switch_frames` via a
-/// `jmp`, so it subtracts 8 before this call to present normal SysV alignment to
-/// this Rust function, then restores the first-resume stack shape before the
-/// tail jump. VALIDATION: D6_FIRST_RESUME_ASM_ENTER
+/// Ultra-early x86_64 first-resume marker called by the assembly shim after
+/// raw COM1 breadcrumbs (`!R` at shim entry, `!RA` after stack adjustment) and
+/// before it tail-jumps into the Rust handler. The shim enters from
+/// `switch_frames` via a `jmp`, so it subtracts 8 before this call to present
+/// normal SysV alignment to this Rust function, then restores the first-resume
+/// stack shape before the tail jump. VALIDATION: D6_FIRST_RESUME_ASM_ENTER
 #[cfg(all(target_arch = "x86_64", not(test)))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_x86_first_resume_asm_marker() {
@@ -64,8 +77,10 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
 
 /// First-resume Rust handler. Entered only through
 /// `yarm_kernel_thread_switch_trampoline` on x86_64: `switch_frames` restores
-/// RIP to that assembly shim, the shim emits `D6_FIRST_RESUME_ASM_ENTER`, fixes
-/// call alignment for that marker call, then tail-jumps here with the original
+/// RIP to that assembly shim, the shim first emits raw COM1 breadcrumbs (`!R`
+/// before stack adjustment, `!RA` after stack adjustment), emits
+/// `D6_FIRST_RESUME_ASM_ENTER`, fixes call alignment for that marker call, then
+/// tail-jumps here with the original
 /// first-resume stack shape. Non-x86_64 keeps the historical direct Rust entry
 /// and immediately defers.
 ///

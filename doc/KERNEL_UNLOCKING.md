@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 | D4 steps 1–4 complete: `recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`; rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -1391,6 +1391,78 @@ shape, fake return-address documentation, `FIRST_RESUME_STASH` population before
 assembly unlock callbacks, AArch64/RISC-V non-participation, Stage 120
 default-off gating, D4 extracted modules, `SYSCALL_COUNT == 31`, and
 `Syscall::VARIANT_COUNT == 23`.
+
+---
+
+### Stage 122 — x86_64 first-resume trampoline first-instruction proof
+
+**Goal stated in the task:** prove whether the CPU reaches the first instruction
+of `yarm_kernel_thread_switch_trampoline` after x86_64 `switch_frames` restores
+the incoming frame and jumps to the trampoline.
+
+**Outcome: A-source — ultra-early first-instruction breadcrumbs landed; QEMU
+proof validation is pending user/local run.** The Stage 121 local proof log
+showed the controlled pair reached `D6_SWITCH_FRAMES_ENTER_UNLOCKED` and the
+low-level switch breadcrumbs showed the incoming RIP/RSP pair, with
+`rsp % 16 == 8`. No `D6_FIRST_RESUME_ASM_ENTER` / `RUST_ENTER` / `STASH_OK`
+markers appeared, so the remaining boundary is the jump into the first-resume
+trampoline itself.
+
+**Audit result:**
+
+- `kernel_switch_frame_trampoline_ip()` takes the address of the
+  `yarm_kernel_thread_switch_trampoline` assembly shim symbol, not the Rust
+  handler. The Stage 119/120 init path uses that helper when logging
+  `D6_KERNEL_SWITCH_FRAME_INIT_DONE entry=...`, so the logged entry value should
+  match the shim label.
+- The shim is declared in executable kernel text (`.section .text, "ax",
+  @progbits`) with `.global yarm_kernel_thread_switch_trampoline` and function
+  type metadata; there is no Rust symbol alias for the live x86_64 shim in
+  non-test builds.
+- The first raw marker does not depend on stack validity. It writes directly to
+  COM1 with `out dx, al` before `sub rsp, 8`, before any Rust call, and before
+  complex logging.
+
+**Raw marker order:**
+
+```text
+yarm_kernel_thread_switch_trampoline:
+  !R   # emitted through raw COM1 as the first-instruction proof, before stack adjustment
+  sub rsp, 8
+  !RA  # emitted through raw COM1 after stack adjustment, before Rust marker bridge
+  call yarm_x86_first_resume_asm_marker  # logs D6_FIRST_RESUME_ASM_ENTER
+  add rsp, 8
+  jmp yarm_kernel_thread_switch_trampoline_rust
+```
+
+**Local interpretation for the next proof run:**
+
+- no `!R`: `switch_frames` jumps to the wrong address, the target is not
+  executable, or execution faults before the first shim instruction can emit.
+- `!R` but no `!RA`: crash during the earliest stack setup.
+- `!R`/`!RA` but no `D6_FIRST_RESUME_ASM_ENTER`: crash in the Rust marker call or
+  marker bridge.
+- `D6_FIRST_RESUME_ASM_ENTER` but no `D6_FIRST_RESUME_RUST_ENTER`: tail-jump /
+  Rust handler boundary.
+- `D6_FIRST_RESUME_RUST_ENTER` but no `D6_FIRST_RESUME_STASH_OK`: stash
+  visibility or population bug.
+- Full chain to `D6_CONTROLLED_SWITCH_PROOF_DONE`: Stage 120/121/122 live proof
+  succeeds.
+
+**Hard boundaries preserved:** x86_64 first-resume/proof path only; Stage 120
+remains default-off behind `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; no
+scheduler policy, timer/preemption, AP scheduler-online, `switch_frames` ABI,
+lock-handoff, `mem::forget`, assembly-unlock-callback, ABI/syscall/image-ID/
+service/FS-gate, AArch64, or RISC-V behavior change.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained Stage 122 source checks that
+prove the trampoline IP helper names the assembly shim symbol, the shim is an
+executable text symbol, raw `!R` appears before stack adjustment and before the
+Rust marker call, raw `!RA` appears after stack adjustment and before the Rust
+marker call, initialized frames use the trampoline helper, `switch_frames` ABI is
+unchanged, no `mem::forget` / unlock callback is introduced, Stage 120 remains
+default-off, AArch64/RISC-V paths remain untouched, and syscall counts stay at
+`SYSCALL_COUNT == 31` / `Syscall::VARIANT_COUNT == 23`.
 
 ---
 
