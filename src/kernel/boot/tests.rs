@@ -34640,25 +34640,36 @@ mod stage122_first_instruction_proof {
         let first_r = THREAD_STATE_SRC[label..]
             .find("mov al, 0x52")
             .expect("R byte");
-        let stack_adjust = THREAD_STATE_SRC[label..]
-            .find("sub rsp, 8")
-            .expect("stack adjust");
+        let marker_a = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x41")
+            .expect("A byte for !RA");
         let removed_marker_m = THREAD_STATE_SRC[label..]
             .find("mov al, 0x4d")
             .expect("M byte for !RM");
+        let rust_jump_marker_j = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x4a")
+            .expect("J byte for !RJ");
         let tail_jump = THREAD_STATE_SRC[label..]
             .find("jmp yarm_kernel_thread_switch_trampoline_rust")
             .expect("Rust tail jump");
         assert!(
             first_bang < first_r
-                && first_r < stack_adjust
-                && stack_adjust < removed_marker_m
-                && removed_marker_m < tail_jump,
-            "raw !R must be emitted before stack adjustment and before the !RM/tail-jump boundary"
+                && first_r < marker_a
+                && marker_a < removed_marker_m
+                && removed_marker_m < rust_jump_marker_j
+                && rust_jump_marker_j < tail_jump,
+            "raw !R/!RA/!RM/!RJ must be emitted in order before the Rust tail-jump boundary"
         );
+        let shim = &THREAD_STATE_SRC[label
+            ..THREAD_STATE_SRC[label..]
+                .find("\"#")
+                .map(|end| label + end)
+                .unwrap_or(THREAD_STATE_SRC.len())];
         assert!(
-            !THREAD_STATE_SRC.contains("call yarm_x86_first_resume_asm_marker"),
-            "Stage 123 must remove the pre-Rust marker bridge call"
+            !shim.contains("call yarm_x86_first_resume_asm_marker")
+                && !shim.contains("sub rsp, 8")
+                && !shim.contains("add rsp, 8"),
+            "Stage 124 must keep the pre-Rust marker bridge call removed and avoid stack-shape undo/redo"
         );
     }
 
@@ -34667,28 +34678,29 @@ mod stage122_first_instruction_proof {
         let label = THREAD_STATE_SRC
             .find("yarm_kernel_thread_switch_trampoline:")
             .expect("shim label");
-        let stack_adjust = THREAD_STATE_SRC[label..]
-            .find("sub rsp, 8")
-            .expect("stack adjust");
         let post_align_a = THREAD_STATE_SRC[label..]
             .find("mov al, 0x41")
             .expect("A byte for !RA");
         let removed_marker_m = THREAD_STATE_SRC[label..]
             .find("mov al, 0x4d")
             .expect("M byte for !RM");
+        let rust_jump_j = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x4a")
+            .expect("J byte for !RJ");
         let tail_jump = THREAD_STATE_SRC[label..]
             .find("jmp yarm_kernel_thread_switch_trampoline_rust")
             .expect("Rust tail jump");
         assert!(
-            stack_adjust < post_align_a
-                && post_align_a < removed_marker_m
-                && removed_marker_m < tail_jump,
-            "raw !RA and !RM must be emitted after stack adjustment but before the Rust tail jump"
+            post_align_a < removed_marker_m
+                && removed_marker_m < rust_jump_j
+                && rust_jump_j < tail_jump,
+            "raw !RA, !RM, and !RJ must be emitted before the Rust tail jump"
         );
         assert!(
             THREAD_STATE_SRC.contains("`!R` at shim entry")
-                && THREAD_STATE_SRC.contains("`!RA` after stack adjustment")
-                && THREAD_STATE_SRC.contains("`!RM`"),
+                && THREAD_STATE_SRC.contains("`!RA` at the former stack-adjust boundary")
+                && THREAD_STATE_SRC.contains("`!RM`")
+                && THREAD_STATE_SRC.contains("`!RJ`"),
             "raw marker boundary meanings must be documented in source"
         );
     }
@@ -34750,17 +34762,23 @@ mod stage123_no_pre_rust_marker_bridge_call {
         assert!(shim.contains("mov al, 0x21") && shim.contains("mov al, 0x52"));
         assert!(shim.contains("mov al, 0x41"), "shim must keep !RA");
         assert!(shim.contains("mov al, 0x4d"), "shim must emit !RM");
+        assert!(shim.contains("mov al, 0x4a"), "shim must emit !RJ");
         assert!(
             !shim.contains("call yarm_x86_first_resume_asm_marker")
                 && !THREAD_STATE_SRC.contains("fn yarm_x86_first_resume_asm_marker"),
             "Stage 123 must remove the Rust marker bridge call/function before first Rust entry"
         );
         assert!(
-            shim.find("mov al, 0x4d").unwrap()
-                < shim
-                    .find("jmp yarm_kernel_thread_switch_trampoline_rust")
-                    .unwrap(),
-            "!RM must be before tail-jump to Rust handler"
+            shim.find("mov al, 0x4d").unwrap() < shim.find("mov al, 0x4a").unwrap()
+                && shim.find("mov al, 0x4a").unwrap()
+                    < shim
+                        .find("jmp yarm_kernel_thread_switch_trampoline_rust")
+                        .unwrap(),
+            "!RM and !RJ must be before tail-jump to Rust handler"
+        );
+        assert!(
+            !shim.contains("sub rsp, 8") && !shim.contains("add rsp, 8"),
+            "Stage 124 must not adjust away the initialized rsp % 16 == 8 shape before Rust"
         );
     }
 
@@ -34783,6 +34801,101 @@ mod stage123_no_pre_rust_marker_bridge_call {
                 && !AARCH64_SWITCH_SRC.contains("!RM")
                 && !RISCV_SWITCH_SRC.contains("!RM"),
             "AArch64/RISC-V paths must not gain x86 raw breadcrumbs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 124 — x86_64 first-resume Rust tail-jump ABI stack-shape fix
+// ===========================================================================
+#[cfg(test)]
+mod stage124_rust_tail_jump_stack_shape {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn shim_source() -> &'static str {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("shim label");
+        let end = THREAD_STATE_SRC[label..]
+            .find("\"#")
+            .map(|offset| label + offset)
+            .unwrap_or(THREAD_STATE_SRC.len());
+        &THREAD_STATE_SRC[label..end]
+    }
+
+    #[test]
+    fn stage124_marker_and_tail_jump_order_is_pinned() {
+        let shim = shim_source();
+        let marker_m = shim.find("mov al, 0x4d").expect("M byte for !RM");
+        let marker_j = shim.find("mov al, 0x4a").expect("J byte for !RJ");
+        let tail_jump = shim
+            .find("jmp yarm_kernel_thread_switch_trampoline_rust")
+            .expect("Rust tail jump");
+        assert!(
+            marker_m < marker_j && marker_j < tail_jump,
+            "Stage 124 must reach !RM, then !RJ, before the final Rust tail-jump"
+        );
+    }
+
+    #[test]
+    fn stage124_rust_tail_jump_stack_shape_is_documented_and_unmodified() {
+        let shim = shim_source();
+        assert!(
+            THREAD_STATE_SRC.contains("rsp % 16 == 8")
+                && THREAD_STATE_SRC.contains("fake return slot")
+                && THREAD_STATE_SRC.contains("performs no `sub rsp, 8` / `add rsp, 8`"),
+            "source must document that the initialized fake return slot supplies Rust's SysV entry shape"
+        );
+        assert!(
+            !shim.contains("sub rsp, 8") && !shim.contains("add rsp, 8"),
+            "Stage 124 keeps the final Rust tail-jump at the initialized rsp % 16 == 8 shape"
+        );
+    }
+
+    #[test]
+    fn stage124_no_pre_rust_rust_call_is_reintroduced() {
+        let shim = shim_source();
+        assert!(
+            !shim.contains("call yarm_x86_first_resume_asm_marker")
+                && !THREAD_STATE_SRC.contains("fn yarm_x86_first_resume_asm_marker"),
+            "the pre-Rust Rust marker bridge must remain removed"
+        );
+        assert!(
+            !shim.contains("call yarm_kernel_thread_switch_trampoline_rust")
+                && shim.contains("jmp yarm_kernel_thread_switch_trampoline_rust"),
+            "Stage 124 keeps a tail-jump, not a call, into the Rust first-resume handler"
+        );
+    }
+
+    #[test]
+    fn stage124_forbidden_boundaries_remain_closed() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget"),
+            "switch_frames ABI must remain unchanged with no lock handoff"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof must remain default-off and boot-knob gated"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RJ")
+                && !RISCV_SWITCH_SRC.contains("!RJ"),
+            "AArch64/RISC-V paths must not gain x86_64 Stage 124 breadcrumbs"
         );
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")

@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 | D4 steps 1–4 complete: `recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`; rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM` before tail-jumping to Rust; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ` immediately before tail-jumping to Rust with `rsp % 16 == 8`; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -1362,7 +1362,10 @@ D6_CONTROLLED_SWITCH_PROOF_BEGIN
 D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing=1 incoming=2
 D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing=1 incoming=2
 D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing=1 incoming=2
-D6_FIRST_RESUME_ASM_ENTER
+!R
+!RA
+!RM
+!RJ
 D6_FIRST_RESUME_RUST_ENTER
 D6_FIRST_RESUME_STACK_ALIGN value=8
 D6_FIRST_RESUME_STASH_OK
@@ -1419,18 +1422,17 @@ trampoline itself.
   type metadata; there is no Rust symbol alias for the live x86_64 shim in
   non-test builds.
 - The first raw marker does not depend on stack validity. It writes directly to
-  COM1 with `out dx, al` before `sub rsp, 8`, before any Rust call, and before
-  complex logging.
+  COM1 with `out dx, al` before any Rust call and before complex logging; Stage
+  124 later removed the temporary shim stack adjustment entirely.
 
 **Raw marker order:**
 
 ```text
 yarm_kernel_thread_switch_trampoline:
-  !R   # emitted through raw COM1 as the first-instruction proof, before stack adjustment
-  sub rsp, 8
-  !RA  # emitted through raw COM1 after stack adjustment, before Rust marker bridge
-  call yarm_x86_first_resume_asm_marker  # logs D6_FIRST_RESUME_ASM_ENTER
-  add rsp, 8
+  !R   # emitted through raw COM1 as the first-instruction proof
+  !RA  # emitted through raw COM1 at the former stack-adjust boundary
+  !RM  # raw replacement for the removed Rust marker bridge
+  !RJ  # emitted immediately before the Rust tail-jump
   jmp yarm_kernel_thread_switch_trampoline_rust
 ```
 
@@ -1438,11 +1440,10 @@ yarm_kernel_thread_switch_trampoline:
 
 - no `!R`: `switch_frames` jumps to the wrong address, the target is not
   executable, or execution faults before the first shim instruction can emit.
-- `!R` but no `!RA`: crash during the earliest stack setup.
-- `!R`/`!RA` but no `D6_FIRST_RESUME_ASM_ENTER`: crash in the Rust marker call or
-  marker bridge.
-- `D6_FIRST_RESUME_ASM_ENTER` but no `D6_FIRST_RESUME_RUST_ENTER`: tail-jump /
-  Rust handler boundary.
+- `!R` but no `!RA`: crash before the former stack-adjust diagnostic boundary.
+- `!R`/`!RA`/`!RM` but no `!RJ`: crash before the final Rust tail-jump marker.
+- `!RJ` but no `D6_FIRST_RESUME_RUST_ENTER`: tail-jump / Rust handler ABI
+  boundary.
 - `D6_FIRST_RESUME_RUST_ENTER` but no `D6_FIRST_RESUME_STASH_OK`: stash
   visibility or population bug.
 - Full chain to `D6_CONTROLLED_SWITCH_PROOF_DONE`: Stage 120/121/122 live proof
@@ -1456,9 +1457,9 @@ service/FS-gate, AArch64, or RISC-V behavior change.
 
 **Tests added.** `src/kernel/boot/tests.rs` gained Stage 122 source checks that
 prove the trampoline IP helper names the assembly shim symbol, the shim is an
-executable text symbol, raw `!R` appears before stack adjustment and before the
-Rust marker call, raw `!RA` appears after stack adjustment and before the Rust
-marker call, initialized frames use the trampoline helper, `switch_frames` ABI is
+executable text symbol, raw `!R` appears before the Rust tail-jump, raw `!RA`,
+`!RM`, and `!RJ` appear in order before entering Rust, initialized frames use the
+trampoline helper, `switch_frames` ABI is
 unchanged, no `mem::forget` / unlock callback is introduced, Stage 120 remains
 default-off, AArch64/RISC-V paths remain untouched, and syscall counts stay at
 `SYSCALL_COUNT == 31` / `Syscall::VARIANT_COUNT == 23`.
@@ -1476,17 +1477,16 @@ is the pre-Rust call to `yarm_x86_first_resume_asm_marker`.
 x86_64 first-resume shim now stays raw-COM1-only until it tail-jumps into the
 Rust first-resume handler. `!R` and `!RA` remain, and a new `!RM` marker is
 emitted at the point where the Rust marker bridge used to run. The shim then
-restores the stack and jumps directly to `yarm_kernel_thread_switch_trampoline_rust`.
+jumps directly to `yarm_kernel_thread_switch_trampoline_rust`. Stage 124 later removed the now-obsolete stack adjustment so the initialized `rsp % 16 == 8` shape is preserved at the Rust tail-jump.
 
 **Raw marker order after Stage 123:**
 
 ```text
 yarm_kernel_thread_switch_trampoline:
-  !R   # reached shim entry, before stack adjustment
-  sub rsp, 8
-  !RA  # survived stack adjustment
+  !R   # reached shim entry
+  !RA  # reached the former stack-adjust boundary
   !RM  # would-have-entered ASM marker bridge; no Rust call occurs here
-  add rsp, 8
+  !RJ  # final pre-Rust tail-jump marker (Stage 124)
   jmp yarm_kernel_thread_switch_trampoline_rust
 ```
 
@@ -1496,6 +1496,7 @@ yarm_kernel_thread_switch_trampoline:
 !R
 !RA
 !RM
+!RJ
 D6_FIRST_RESUME_RUST_ENTER
 D6_FIRST_RESUME_STACK_ALIGN value=8
 D6_FIRST_RESUME_STASH_OK
@@ -1507,8 +1508,7 @@ boundary is the tail-jump to the Rust first-resume handler / Rust ABI entry.
 
 **Hard boundaries preserved:** x86_64 first-resume/proof path only; Stage 120
 remains default-off behind `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; no
-`switch_frames` ABI change, scheduler policy change, timer/
-preemption change, AP scheduler-online, lock-handoff, `mem::forget`, assembly
+`switch_frames` ABI change, scheduler policy change, timer/preemption change, AP scheduler-online, lock-handoff, `mem::forget`, assembly
 unlock callback, ABI/syscall/image-ID/service/FS-gate change, or AArch64/RISC-V
 behavior change.
 
@@ -1520,6 +1520,70 @@ AArch64/RISC-V paths untouched, and preserves `SYSCALL_COUNT == 31` /
 `Syscall::VARIANT_COUNT == 23`.
 
 ---
+
+### Stage 124 — x86_64 first-resume Rust tail-jump ABI stack-shape fix
+
+**Goal stated in the task:** the Stage 123 local proof reached `!R`, `!RA`, and
+`!RM`, then crashed before `D6_FIRST_RESUME_RUST_ENTER`. That proves
+`switch_frames` reaches the first-resume shim, the raw marker sequence runs, and
+the failure boundary is the final `jmp yarm_kernel_thread_switch_trampoline_rust`
+/ Rust ABI entry.
+
+**Outcome: A-source — source audit identified and fixed the Rust tail-jump stack
+shape. QEMU validation is pending the user/local proof run.** The initialized
+x86_64 first-resume frame already reserves a fake return-address word below the
+16-byte-aligned kernel stack top, so the shim is entered with the normal SysV
+callee shape (`rsp % 16 == 8`). After Stage 123 removed the pre-Rust Rust call,
+the shim no longer needs to realign for an internal call. Keeping a final
+`add rsp, 8` before the tail-jump can undo the fake return-slot shape and enter
+Rust with `rsp % 16 == 0`.
+
+**Fix / diagnostics:**
+
+- The x86_64 first-resume shim remains raw-COM1-only before Rust. It emits `!R`,
+  `!RA`, `!RM`, and the new `!RJ` marker, then tail-jumps directly to
+  `yarm_kernel_thread_switch_trampoline_rust`.
+- The temporary `sub rsp, 8` / `add rsp, 8` shim adjustment is removed. The final
+  tail-jump preserves the initialized `rsp % 16 == 8` shape supplied by the fake
+  return slot.
+- `!RJ` is emitted immediately before the final jump, so local proof logs can
+  distinguish a crash before the tail-jump marker from a Rust entry ABI/target
+  failure.
+
+**Raw marker order after Stage 124:**
+
+```text
+yarm_kernel_thread_switch_trampoline:
+  !R   # reached shim entry
+  !RA  # reached the former stack-adjust boundary; no stack adjustment occurs
+  !RM  # would-have-entered ASM marker bridge; no Rust call occurs here
+  !RJ  # final marker immediately before Rust tail-jump
+  jmp yarm_kernel_thread_switch_trampoline_rust
+```
+
+**Expected local interpretation:**
+
+- `!R !RA !RM` but no `!RJ`: crash before the final jump marker.
+- `!RJ` but no `D6_FIRST_RESUME_RUST_ENTER`: Rust entry ABI or target symbol
+  still wrong.
+- `D6_FIRST_RESUME_RUST_ENTER` but no `D6_FIRST_RESUME_STASH_OK`: stash
+  visibility/population boundary.
+- Full chain to `D6_CONTROLLED_SWITCH_PROOF_DONE`: Stage 120 proof succeeds.
+
+**Hard boundaries preserved:** x86_64 proof-mode path only; Stage 120 remains
+default-off behind `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; no
+`switch_frames` ABI change, scheduler policy change, timer/preemption change, AP
+scheduler-online, per-CPU runqueue, lock-handoff, `mem::forget`, assembly unlock
+callback, ABI/syscall/image-ID/service/FS-gate change, or AArch64/RISC-V
+behavior change.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained Stage 124 source checks that
+prove `!RM` precedes `!RJ`, `!RJ` precedes the Rust tail-jump, the final
+stack-shape contract is documented, `sub rsp, 8` / `add rsp, 8` stay absent from
+the shim, no pre-Rust Rust marker call is reintroduced, the Rust handler remains
+a tail-jump rather than a call, `switch_frames` ABI is unchanged, Stage 120
+remains default-off, AArch64/RISC-V paths remain untouched, and
+`SYSCALL_COUNT == 31` / `Syscall::VARIANT_COUNT == 23`.
 
 ## 2. Live paths and fallbacks
 

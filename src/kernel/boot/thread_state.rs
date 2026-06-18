@@ -32,7 +32,6 @@ yarm_kernel_thread_switch_trampoline:
     out dx, al
     mov al, 0x52
     out dx, al
-    sub rsp, 8
     mov dx, 0x3f8
     mov al, 0x21
     out dx, al
@@ -46,7 +45,12 @@ yarm_kernel_thread_switch_trampoline:
     out dx, al
     mov al, 0x4d
     out dx, al
-    add rsp, 8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x4a
+    out dx, al
     jmp yarm_kernel_thread_switch_trampoline_rust
 "#
 );
@@ -64,9 +68,12 @@ pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
 
 /// Stage 123: the first-resume assembly shim no longer calls a Rust marker
 /// bridge before entering the Rust first-resume handler. The raw COM1 sequence
-/// now emits `!R` at shim entry, `!RA` after stack adjustment, and `!RM` at the
-/// point where the removed Rust marker bridge used to run, then tail-jumps
-/// directly to `yarm_kernel_thread_switch_trampoline_rust`.
+/// now emits `!R` at shim entry, `!RA` at the former stack-adjust boundary,
+/// `!RM` where the removed Rust marker bridge used to run, and `!RJ`
+/// immediately before tail-jumping directly to
+/// `yarm_kernel_thread_switch_trampoline_rust`. Because there is no pre-Rust
+/// call anymore, the shim intentionally performs no `sub rsp, 8` / `add rsp, 8`;
+/// the initialized frame's fake return slot already supplies `rsp % 16 == 8`.
 /// VALIDATION: D6_FIRST_RESUME_RUST_ENTER / !RM
 #[cfg(all(target_arch = "x86_64", test))]
 #[unsafe(no_mangle)]
@@ -77,9 +84,9 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
 /// First-resume Rust handler. Entered only through
 /// `yarm_kernel_thread_switch_trampoline` on x86_64: `switch_frames` restores
 /// RIP to that assembly shim, the shim first emits raw COM1 breadcrumbs (`!R`
-/// before stack adjustment, `!RA` after stack adjustment, `!RM` at the removed
-/// Rust marker-bridge boundary), restores stack shape, then tail-jumps here with the original
-/// first-resume stack shape. Non-x86_64 keeps the historical direct Rust entry
+/// at entry, `!RA` at the former stack-adjust boundary, `!RM` at the removed
+/// Rust marker-bridge boundary, `!RJ` immediately before the jump), then
+/// tail-jumps here with the original first-resume stack shape. Non-x86_64 keeps the historical direct Rust entry
 /// and immediately defers.
 ///
 /// x86_64 ABI audit: `switch_frames` saves/restores `[rsp, rip, rbx, rbp,
