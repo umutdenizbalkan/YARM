@@ -1468,7 +1468,7 @@ pending mechanical moves (each its own PR, no semantic change).
 | `syscall/process.rs` | pending (big, mechanical) |
 | `syscall/initramfs.rs` | **landed** Stage 102 (NR 27/28) |
 | `syscall/debug.rs` | **landed** Stage 102 (NR 15) |
-| `syscall/recv_shared_v3.rs` | pending — next split target |
+| `syscall/recv_shared_v3.rs` | **landed** D4 step 1 (NR 30) |
 
 ### 5.2 D1 audit — answers to the seven readiness questions
 
@@ -1651,8 +1651,9 @@ may not jump ahead of Immediate or bypass their own gates.
    `SharedKernel::with_cpu` in trap dispatch — see §1 Stage 113 for the
    architectural reason. The helper-only fence for this seam remains in
    force until that PR.
-6. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction.** Next mechanical
-   decomposition target per §5.1.
+6. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction.** Complete: NR 30
+   helpers/handler now live in `src/kernel/syscall/recv_shared_v3.rs`;
+   `syscall.rs` keeps the unchanged dispatch arm.
 
 **Concurrent / gated:**
 
@@ -1696,7 +1697,7 @@ audit; nothing else in the repo should restate it.
 | D2 (endpoint blocking-recv waiter publish) | **live** (phase-split, seam-pending) | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes` / `d2_publish_race_unwinds` (must be 0). Stage 106; phase split Stage 111. `with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path (§1 Stage 111). |
 | D3.1 (`vm_brk_shrink_two_phase`) | **live** (phase-split Stage 112; seam live-wired Stage 114) | `D3_LIVE_SPLIT` + `M2_SEAM_LIVE_D3_BRK_SHRINK`. `with_vm_user_spaces_split_mut`/`with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (§1 Stage 114). |
 | D3 rest (full `VmAnonMap` two-phase live) | **deferred** | plan types are consumed inside the still-global-locked `handle_vm_anon_map`; gated on lock-free `await_tlb_shootdown_ack`. |
-| D4 (`syscall.rs` decomposition) | **partial** | `syscall/{debug,initramfs}.rs` landed; `syscall/recv_shared_v3.rs` is the next split target; the rest of §5.1 is pending mechanical moves. |
+| D4 (`syscall.rs` decomposition) | **partial** | `syscall/{debug,initramfs,recv_shared_v3}.rs` landed; the rest of §5.1 is pending mechanical moves. |
 | D5 (reply-cap recv, non-shared-region) | **live** | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations` / `d5_split_reply_rollbacks`. Stage 105. |
 | D6.1 (`local_dispatch_step_split`) | **live** (phase-split, seam-pending) | `D6_LIVE_SPLIT`. Stage 107; phase split Stage 113. `with_scheduler_split_mut` not yet called from this path (§1 Stage 113). Per-CPU lock sharding deferred until x86_64 AP scheduler-online. |
 | D7 (MUST_SMOKE policy) | **enforced** | see `AI_AGENT_RULES.md` §13. Stage 101. |
@@ -1786,7 +1787,7 @@ prove the trap path reaches the decision point. The next targets, in order:
    kernel threads once Stage 117 Outcome A is achieved. For user tasks (trap-frame
    switching only), the lock drop needs to be wired to `restore_arch_thread_state`
    instead of `switch_frames`.
-4. **D4 step 1 — `syscall/recv_shared_v3.rs` extraction**, then
+4. **D4 follow-on syscall decomposition** after completed step 1 (`syscall/recv_shared_v3.rs` extraction), then
    `syscall/process.rs`, then the remaining modules listed in §5.1.
 5. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
    Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
