@@ -319,7 +319,7 @@ impl KernelState {
         })
     }
 
-    /// Stage 126 kernel switch-stack invariant gate.
+    /// Stage 126/127 kernel switch-stack invariant gate.
     ///
     /// `incoming_stack_top`/`stack_top` values are virtual kernel stack tops in
     /// the fixed higher-half kernel-stack arena, not physical addresses. On
@@ -329,7 +329,11 @@ impl KernelState {
     /// (`top - 24`, 0xffff800000007fe8 when top is 0xffff800000008000). Before
     /// publishing `kernel_context.initialized = true`, ensure that page is
     /// present, writable, supervisor/kernel-only (not user), and mapped into the
-    /// active user-CR3 regime used while `switch_frames` executes.
+    /// target task ASID/root that will own the first-resume context. Stage 127
+    /// deliberately avoids active-ASID enumeration as the terminal gate: early
+    /// supervisor/init spawn can initialize a target task before any ASID is
+    /// currently running, but the target task root is still the correct mapping
+    /// authority once `task_asid(tid)` is bound.
     #[cfg(all(target_arch = "x86_64", not(test)))]
     fn ensure_kernel_switch_stack_mapped(
         &mut self,
@@ -377,127 +381,108 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
 
-        let stack_page = VirtAddr(probe_page as u64);
-        let mut asids = [None; super::MAX_TASKS];
-        let mut asid_count = 0usize;
-        self.with_tcbs(|tcbs| {
-            for tcb in tcbs.iter().flatten() {
-                let Some(asid) = tcb.asid else {
-                    continue;
-                };
-                if asids[..asid_count].contains(&Some(asid)) {
-                    continue;
-                }
-                if asid_count < asids.len() {
-                    asids[asid_count] = Some(asid);
-                    asid_count += 1;
-                }
-            }
-        });
-
-        if asid_count == 0 {
+        let Some(target_asid) = self.task_asid(tid) else {
             crate::yarm_log!(
-                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=no_active_asids",
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=target_asid_unavailable",
                 tid,
                 fake_return_probe
             );
             crate::yarm_log!(
-                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=no_active_asids tid={}",
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=target_asid_unavailable tid={}",
+                tid
+            );
+            return Err(KernelError::UserMemoryFault);
+        };
+        if self.with_user_spaces(|spaces| spaces.get(target_asid).is_none()) {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=target_root_unavailable",
+                tid,
+                fake_return_probe
+            );
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=target_root_unavailable tid={}",
                 tid
             );
             return Err(KernelError::VmFull);
         }
 
-        let mut backing_phys = None;
-        for asid in asids[..asid_count].iter().flatten().copied() {
-            if let Some(entry) = page_table::resolve_page(asid, stack_page) {
-                if (entry.0 & PageTableEntry::WRITABLE) == 0 {
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=not_writable",
-                        tid,
-                        fake_return_probe
-                    );
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=not_writable tid={}",
-                        tid
-                    );
-                    return Err(KernelError::VmFull);
-                }
-                if (entry.0 & PageTableEntry::USER) != 0 {
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=user_accessible",
-                        tid,
-                        fake_return_probe
-                    );
-                    crate::yarm_log!(
-                        "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=user_accessible tid={}",
-                        tid
-                    );
-                    return Err(KernelError::VmFull);
-                }
-                backing_phys = Some(entry.addr());
-                break;
-            }
-        }
-
-        let phys = match backing_phys {
-            Some(phys) => phys,
-            None => {
+        let stack_page = VirtAddr(probe_page as u64);
+        let phys = if let Some(entry) = page_table::resolve_page(target_asid, stack_page) {
+            if (entry.0 & PageTableEntry::WRITABLE) == 0 {
                 crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_MAP_BEGIN tid={} va=0x{:x}",
+                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=not_writable",
                     tid,
-                    probe_page
+                    fake_return_probe
                 );
-                let phys = self.alloc_user_data_frame()?;
                 crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_MAP_DONE tid={} va=0x{:x}",
-                    tid,
-                    probe_page
+                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=not_writable tid={}",
+                    tid
                 );
-                phys
+                return Err(KernelError::VmFull);
             }
+            if (entry.0 & PageTableEntry::USER) != 0 {
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=user_accessible",
+                    tid,
+                    fake_return_probe
+                );
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=user_accessible tid={}",
+                    tid
+                );
+                return Err(KernelError::VmFull);
+            }
+            entry.addr()
+        } else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_BEGIN tid={} asid={} va=0x{:x}",
+                tid,
+                target_asid.0,
+                probe_page
+            );
+            let phys = self.alloc_user_data_frame()?;
+            page_table::map_page(
+                target_asid,
+                stack_page,
+                PhysAddr(phys),
+                PageFlags::KERNEL_RW,
+            )
+            .map_err(|_| KernelError::VmFull)?;
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DONE tid={} asid={} va=0x{:x}",
+                tid,
+                target_asid.0,
+                probe_page
+            );
+            phys
         };
 
-        for asid in asids[..asid_count].iter().flatten().copied() {
-            if page_table::resolve_page(asid, stack_page).is_some() {
-                continue;
-            }
+        let Some(entry) = page_table::resolve_page(target_asid, stack_page) else {
             crate::yarm_log!(
-                "D6_KERNEL_SWITCH_STACK_MAP_BEGIN tid={} va=0x{:x}",
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=resolve_after_map_failed",
                 tid,
-                probe_page
+                fake_return_probe
             );
-            page_table::map_page(asid, stack_page, PhysAddr(phys), PageFlags::KERNEL_RW)
-                .map_err(|_| KernelError::VmFull)?;
-            let Some(entry) = page_table::resolve_page(asid, stack_page) else {
-                crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=resolve_after_map_failed",
-                    tid,
-                    fake_return_probe
-                );
-                crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=resolve_after_map_failed tid={}",
-                    tid
-                );
-                return Err(KernelError::VmFull);
-            };
-            if (entry.0 & PageTableEntry::WRITABLE) == 0 || (entry.0 & PageTableEntry::USER) != 0 {
-                crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=mapped_flags_invalid",
-                    tid,
-                    fake_return_probe
-                );
-                crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=mapped_flags_invalid tid={}",
-                    tid
-                );
-                return Err(KernelError::VmFull);
-            }
             crate::yarm_log!(
-                "D6_KERNEL_SWITCH_STACK_MAP_DONE tid={} va=0x{:x}",
-                tid,
-                probe_page
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=resolve_after_map_failed tid={}",
+                tid
             );
+            return Err(KernelError::VmFull);
+        };
+        if entry.addr() != phys
+            || (entry.0 & PageTableEntry::WRITABLE) == 0
+            || (entry.0 & PageTableEntry::USER) != 0
+        {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=mapped_flags_invalid",
+                tid,
+                fake_return_probe
+            );
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=mapped_flags_invalid tid={}",
+                tid
+            );
+            return Err(KernelError::VmFull);
         }
 
         crate::yarm_log!(

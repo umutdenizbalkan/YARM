@@ -1379,6 +1379,47 @@ impl KernelState {
             tcb.asid = Some(asid);
             Ok::<_, KernelError>(())
         })?;
+
+        // Stage 127: Stage 126 correctly refused to publish x86_64 initialized
+        // switch frames without a mapped kernel switch-stack page, but the first
+        // attempt above can run before the target task ASID is bound. Retry at
+        // the first point where the target ASID/root is known so the mapping gate
+        // uses the target task root rather than temporal active-ASID presence.
+        #[cfg(target_arch = "x86_64")]
+        if (spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID)
+            && !self
+                .thread_kernel_context(spec.tid)
+                .is_some_and(|ctx| ctx.initialized)
+        {
+            let entry = super::thread_state::kernel_switch_frame_trampoline_ip();
+            crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid={}", spec.tid);
+            match self.initialize_thread_kernel_switch_frame(spec.tid, entry) {
+                Ok(()) => {
+                    let stack = self.with_tcbs(|tcbs| {
+                        tcbs.iter()
+                            .flatten()
+                            .find(|tcb| tcb.tid.0 == spec.tid)
+                            .and_then(|tcb| tcb.kernel_context.stack_top)
+                            .map(|t| t.0)
+                            .unwrap_or(0)
+                    });
+                    crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}", spec.tid);
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_FRAME_INIT_DONE tid={} entry=0x{:x} stack=0x{:x}",
+                        spec.tid,
+                        entry,
+                        stack,
+                    );
+                }
+                Err(e) => {
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED reason=retry_failed tid={} err={:?}",
+                        spec.tid,
+                        e,
+                    );
+                }
+            }
+        }
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
         }

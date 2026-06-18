@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate, Stage 127 target-ASID stack mapping retry)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 | D4 steps 1–4 complete: `recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`; rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page and maps the top page into active x86_64 user CR3s; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page; Stage 127 corrects that gate to map/check the target task ASID/root and retries after ASID binding instead of depending on temporal active-ASID presence; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -1668,16 +1668,16 @@ uses the x86_64 page-table layer directly and checks the hardware-visible PTEs.
 `ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)` before writing the
 frame RIP/RSP and before `initialized = true`. On x86_64 non-test builds, the
 helper computes the page containing `top - 8`, verifies the same page covers the
-bridge slots (`top - 16` and the observed `top - 24` call-push write), allocates a
-backing frame if no active ASID already maps that page, maps the page into all
-currently active task ASIDs as `PageFlags::KERNEL_RW`, and rejects any present PTE
-that is non-writable or user-accessible. The invariant is now:
+bridge slots (`top - 16` and the observed `top - 24` call-push write), and rejects
+non-writable/user-accessible PTEs. Stage 126 originally attempted to use active
+ASID presence as the mapping target; Stage 127 corrects that below so the final
+invariant is target-root based:
 
 ```text
 kernel_context.initialized == true
   implies the initialized x86_64 switch-stack top page is backed,
-  mapped writable, supervisor/kernel-only, and visible in the active user-CR3
-  regime used by switch_frames.
+  mapped writable, supervisor/kernel-only, and present in the target task
+  ASID/root that will own the first-resume switch frame.
 ```
 
 **Markers.** Stage 126 adds the following initialization/proof diagnostics:
@@ -1708,6 +1708,65 @@ pin the `initialized=true` gate, the `top - 8` / `top - 16` / observed
 Stage 125 bridge marker preservation, `switch_frames` ABI preservation, default-
 off proof gating, AArch64/RISC-V non-impact, and `SYSCALL_COUNT == 31` /
 `Syscall::VARIANT_COUNT == 23`.
+
+### Stage 127 — target-ASID/root switch-stack mapping retry
+
+**Status: Outcome A-source (QEMU validation pending user/local run).** Stage 126
+moved the first-resume proof from an unsafe bridge `callq` page fault to a safe
+initialization deferral. The local proof then showed the remaining blocker:
+`tid=2` reached `D6_KERNEL_SWITCH_STACK_CHECK_BEGIN` but deferred with
+`reason=no_active_asids`, while `tid=1` could later map/check its stack. That
+proved active-ASID enumeration was too temporal for early supervisor/init spawn.
+
+**Audit result.** In `spawn_user_task_from_image`, the first x86_64 switch-frame
+initialization attempt runs immediately after `register_task_with_class`, before
+the task's `tcb.asid = Some(asid)` assignment. Therefore `tid=2` can have a valid
+spawn target ASID/root in the surrounding spawn spec while its TCB does not yet
+publish that ASID. Active ASIDs are the wrong gate: the switch-stack invariant is
+about the target task root that will own the initialized frame, not whether any
+ASID is currently running at that instant. The x86_64 page-table API can map a
+kernel-only page into a specific ASID/root directly once `task_asid(tid)` is
+bound and `AddressSpaceManager::get(target_asid)` confirms the root exists.
+
+**Fix.** `ensure_kernel_switch_stack_mapped` now maps/checks only the target
+`task_asid(tid)` root. If the TCB has not published an ASID yet it emits
+`D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=target_asid_unavailable tid=...`; if
+the ASID lacks a root it emits `reason=target_root_unavailable`. After
+`spawn_user_task_from_image` binds `tcb.asid = Some(asid)`, Stage 127 retries
+initialization for the tid=1/tid=2 proof pair and emits:
+
+- `D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid=...`
+- `D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid=...`
+
+The critical invariant remains:
+
+```text
+kernel_context.initialized == true
+  implies the page containing stack_top - 8 is backed/mapped writable,
+  supervisor/kernel-only, and present in the target task ASID/root that will own
+  the first-resume switch frame.
+```
+
+**Expected local interpretation.** If `tid=2` still defers with
+`target_asid_unavailable` or `target_root_unavailable`, the next boundary is ASID
+creation/binding timing. If `tid=2` reaches `D6_KERNEL_SWITCH_STACK_CHECK_OK` and
+the proof reaches `!RB`, the stack mapping gate is fixed and the next boundary is
+Rust call/prologue or stash. If `D6_FIRST_RESUME_RUST_ENTER` appears, the bridge
+call push succeeded; full chain to `D6_CONTROLLED_SWITCH_PROOF_DONE` proves the
+path end-to-end.
+
+**Hard boundaries preserved:** x86_64 proof/default-off path only; no
+`switch_frames` ABI change, scheduler policy change, timer/preemption change, AP
+scheduler-online, per-CPU runqueue change, lock handoff, `mem::forget`, assembly
+unlock callback, ABI/syscall/image-ID/service/FS-gate change, broad full-stack-
+region mapping, user-accessible stack mapping, or AArch64/RISC-V behavior change.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained Stage 127 source checks that
+pin target-ASID/root mapping, retry-after-ASID-bind ordering, `initialized=true`
+gating, absence of `no_active_asids` as a terminal blocker, narrow `stack_top - 8`
+page mapping, kernel-only writable flags, Stage 125 bridge preservation, default-
+off proof gating, AArch64/RISC-V non-impact, D4 module preservation, and
+`SYSCALL_COUNT == 31` / `Syscall::VARIANT_COUNT == 23`.
 
 ## 2. Live paths and fallbacks
 

@@ -35063,7 +35063,7 @@ mod stage126_kernel_switch_stack_mapping_backing {
 
     fn stack_check_source() -> &'static str {
         let start = THREAD_STATE_SRC
-            .find("Stage 126 kernel switch-stack invariant gate")
+            .find("Stage 126/127 kernel switch-stack invariant gate")
             .expect("Stage 126 stack check helper");
         let end = THREAD_STATE_SRC[start..]
             .find("pub fn initialize_thread_kernel_switch_frame")
@@ -35112,7 +35112,8 @@ mod stage126_kernel_switch_stack_mapping_backing {
         let check = stack_check_source();
         assert!(
             check.contains("virtual kernel stack tops")
-                && check.contains("active user-CR3 regime")
+                && (check.contains("active user-CR3 regime")
+                    || check.contains("target task ASID/root"))
                 && check.contains("page_table::map_page")
                 && check.contains("PageFlags::KERNEL_RW")
                 && check.contains("PageTableEntry::WRITABLE")
@@ -35135,8 +35136,8 @@ mod stage126_kernel_switch_stack_mapping_backing {
         let check = stack_check_source();
         assert!(
             check.contains("alloc_user_data_frame()")
-                && check.contains("backing_phys")
-                && check.contains("resolve_page(asid, stack_page)")
+                && check.contains("target_asid")
+                && check.contains("resolve_page(target_asid, stack_page)")
                 && check.contains("return Err(KernelError::VmFull)")
                 && check.contains("return Err(KernelError::WrongObject)"),
             "initialized x86_64 switch stacks must be backed/mapped or fail initialization"
@@ -35189,6 +35190,157 @@ mod stage126_kernel_switch_stack_mapping_backing {
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
                 && SYSCALL_SRC.contains("mod sched;"),
             "syscall counts and D4 extracted modules must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 127 — x86_64 switch-stack mapping targets task ASID/root
+// ==========================================================================
+#[cfg(test)]
+mod stage127_target_asid_switch_stack_mapping {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn stack_check_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("Stage 126/127 kernel switch-stack invariant gate")
+            .expect("Stage 127 stack check helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("init helper after stack check");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn init_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .expect("init helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub(crate) fn provision_default_kernel_context")
+            .map(|offset| start + offset)
+            .expect("next helper");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    #[test]
+    fn stage127_uses_target_asid_root_not_active_asid_enumeration() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("let Some(target_asid) = self.task_asid(tid)")
+                && check.contains("spaces.get(target_asid).is_none()")
+                && check.contains("page_table::map_page(")
+                && check.contains("target_asid,")
+                && !check.contains("let mut asids = [None; super::MAX_TASKS]")
+                && !check.contains("reason=no_active_asids"),
+            "Stage 127 must map/check the target task ASID/root rather than active-ASID enumeration"
+        );
+    }
+
+    #[test]
+    fn stage127_retry_runs_after_target_asid_is_bound() {
+        let bind = EXEC_STATE_SRC
+            .find("tcb.asid = Some(asid);")
+            .expect("target ASID bind");
+        let retry = EXEC_STATE_SRC
+            .find("D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid={}")
+            .expect("retry marker");
+        assert!(
+            bind < retry,
+            "Stage 127 retry must happen after the target task ASID/root is bound"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}")
+                && EXEC_STATE_SRC.contains("reason=retry_failed")
+                && EXEC_STATE_SRC
+                    .contains("initialize_thread_kernel_switch_frame(spec.tid, entry)"),
+            "Stage 127 must expose retry success/failure markers"
+        );
+    }
+
+    #[test]
+    fn stage127_initialized_true_remains_gated_and_no_active_asids_not_terminal() {
+        let init = init_source();
+        assert!(
+            init.find("self.ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)?")
+                < init.find("tcb.kernel_context.initialized = true"),
+            "initialized=true must remain gated on switch-stack mapping success"
+        );
+        let check = stack_check_source();
+        assert!(
+            check.contains("target_asid_unavailable")
+                && check.contains("target_root_unavailable")
+                && !check.contains("no_active_asids"),
+            "no_active_asids must not be a terminal blocker when target ASID/root is available"
+        );
+    }
+
+    #[test]
+    fn stage127_stack_page_and_mapping_permissions_remain_narrow() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("top - 8")
+                && check.contains("fake_return_probe")
+                && check.contains("probe_page = fake_return_probe")
+                && check.contains("PageFlags::KERNEL_RW")
+                && check.contains("PageTableEntry::WRITABLE")
+                && check.contains("PageTableEntry::USER"),
+            "Stage 127 must keep checking stack_top - 8 and kernel-only writable mapping flags"
+        );
+        assert!(
+            !check.contains("KERNEL_STACK_REGION_SIZE")
+                && !check.contains("for offset")
+                && !check.contains("map full kernel stack region"),
+            "Stage 127 must not broaden into full kernel-stack-region mapping"
+        );
+    }
+
+    #[test]
+    fn stage127_forbidden_boundaries_and_arch_fallbacks_remain_closed() {
+        assert!(
+            THREAD_STATE_SRC.contains("!RB")
+                && THREAD_STATE_SRC.contains("!RJ")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real"),
+            "Stage 125 bridge markers/path must remain intact"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, and mem::forget boundaries must remain closed"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)")
+                && !BOOT_CMDLINE_SRC.contains("d6_switch_proof: Some(true)"),
+            "Stage 120 proof must remain default-off"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK")
+                && !RISCV_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK"),
+            "AArch64/RISC-V paths must remain untouched by x86_64 stack mapping"
+        );
+    }
+
+    #[test]
+    fn stage127_d4_and_syscall_counts_remain_intact() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod sched;"),
+            "D4 modules and syscall counts must remain unchanged"
         );
     }
 }
