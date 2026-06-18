@@ -604,6 +604,58 @@ pub(crate) static GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE: [core::sync::atomic::Atomic
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
+/// Stage 120: x86_64-only controlled one-shot unlocked `switch_frames` proof
+/// harness gate. This is diagnostic/smoke-only, default-off, single-CPU-only,
+/// and does not alter scheduler policy. VALIDATION: D6_CONTROLLED_SWITCH_PROOF_BEGIN
+pub(crate) static D6_CONTROLLED_SWITCH_PROOF_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(crate) static D6_CONTROLLED_SWITCH_PROOF_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(crate) static D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+pub(crate) static D6_CONTROLLED_SWITCH_PROOF_DONE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_d6_controlled_switch_proof_enabled(enabled: bool) {
+    D6_CONTROLLED_SWITCH_PROOF_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+    if !enabled {
+        D6_CONTROLLED_SWITCH_PROOF_STARTED.store(false, core::sync::atomic::Ordering::Release);
+        D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE.store(false, core::sync::atomic::Ordering::Release);
+        D6_CONTROLLED_SWITCH_PROOF_DONE.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+pub(crate) fn d6_controlled_switch_proof_enabled() -> bool {
+    D6_CONTROLLED_SWITCH_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn d6_controlled_switch_proof_done() -> bool {
+    D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn d6_controlled_switch_proof_try_start() -> bool {
+    D6_CONTROLLED_SWITCH_PROOF_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+pub(crate) fn d6_controlled_switch_proof_mark_pending_done() {
+    D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE.store(true, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn d6_controlled_switch_proof_take_pending_done() -> bool {
+    D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE.swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+pub(crate) fn d6_controlled_switch_proof_mark_done() {
+    D6_CONTROLLED_SWITCH_PROOF_DONE.store(true, core::sync::atomic::Ordering::Release);
+}
+
 /// Stage 118: context for the first-resume trampoline (`yarm_kernel_thread_switch_trampoline`).
 ///
 /// Set by the Stage 117 stash drain in `handle_trap_entry_shared` immediately

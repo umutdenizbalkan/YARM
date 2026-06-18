@@ -222,6 +222,17 @@ pub fn handle_trap_entry_shared(
     // available after `with_cpu` returns for the stash drain below.
     let inner_result = shared
         .with_cpu(cpu, |kernel| {
+            // Stage 120: diagnostic-only x86_64 proof hook. Default-off and
+            // one-shot; when enabled it stashes a normal DispatchSwitchPlan
+            // before regular trap handling, so the existing Stage 117 drain
+            // below proves the unlocked switch_frames path without changing
+            // scheduler policy or syscall ABI.
+            #[cfg(target_arch = "x86_64")]
+            kernel
+                .maybe_run_d6_controlled_switch_proof()
+                .map_err(|err| {
+                    TrapHandleError::Syscall(crate::kernel::syscall::SyscallError::from(err))
+                })?;
             handle_trap_entry_with_fault_bookkeeping_mode(
                 kernel,
                 cpu,
@@ -316,6 +327,10 @@ pub fn handle_trap_entry_shared(
                 plan.outgoing_tid,
                 plan.incoming_tid
             );
+            if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
+                crate::kernel::boot::d6_controlled_switch_proof_mark_done();
+                crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DONE");
+            }
             // Re-acquire the global lock to restore the incoming task's arch thread
             // state (populate its trap frame with its user-mode register context).
             shared

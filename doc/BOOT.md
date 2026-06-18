@@ -117,6 +117,7 @@ Current recognized keys:
 | `yarm.max_cpus=N` | Cap present-CPU count | unset (firmware topology) |
 | `yarm.loglevel=0..7` or `emerg\|alert\|crit\|err\|warn\|notice\|info\|debug` | Console loglevel | `Info` (unchanged) |
 | `yarm.x86_ap_rust=1\|true\|yes\|on` / `0\|false\|no\|off` | x86_64 AP Rust-entry gate (see `doc/ARCH_X86_64.md`) | unset |
+| `yarm.d6_switch_proof=1\|true\|yes\|on` / `0\|false\|no\|off` | Stage 120 x86_64-only, single-CPU, one-shot `switch_frames` proof harness gate | unset (disabled) |
 
 Linux-style options are **captured but not policy**:
 

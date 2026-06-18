@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 | D4 steps 1–4 complete: `recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`; rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back — still Outcome B (switch_frames never fires: smoke quiesces into IPC-blocked tasks before a timer-driven preemption pairs two initialized tasks); per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -1239,6 +1239,80 @@ Acceptance evidence (Stage 119):
 Workspace tests: 1587/0 lib (`--test-threads=1`, 2 ignored).
 No ABI/protocol/syscall-number/image-ID change.
 `Syscall::VARIANT_COUNT` remains 23.
+
+
+### Stage 120 — Controlled one-shot x86_64 unlocked `switch_frames` proof harness
+
+**Goal stated in the task:** add a diagnostic-only harness that can force exactly
+one initialized task-to-task kernel context switch on x86_64, single-CPU only, so
+the existing Stage 117/118/119 global-lock-drop + first-resume path can be proven
+without turning it into scheduler policy.
+
+**Outcome: B locally — harness landed, proof smoke pending artifact availability.** The harness is gated by
+the boot command-line knob `yarm.d6_switch_proof=1`; the x86_64 core smoke script
+adds that knob only when invoked as `D6_SWITCH_PROOF=1 QEMU_SMP=1
+./scripts/qemu-x86_64-core-smoke.sh`. Default smokes do not request the proof and
+therefore do not require the proof markers. The harness is intended to produce
+Outcome A once the x86_64 QEMU artifacts are available locally and the proof
+smoke can observe `D6_CONTROLLED_SWITCH_PROOF_DONE`.
+
+**Design:**
+
+- x86_64 only: the live hook is inside `#[cfg(target_arch = "x86_64")]` and the
+  command-line knob is ignored on non-x86_64 builds.
+- Single-CPU only: `maybe_run_d6_controlled_switch_proof` defers with
+  `D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=multi_cpu online_cpus=N` unless
+  `online_cpu_count() == 1`.
+- One-shot only: `D6_CONTROLLED_SWITCH_PROOF_STARTED` uses atomic
+  `compare_exchange`; `D6_CONTROLLED_SWITCH_PROOF_DONE` permanently suppresses
+  repeats after success.
+- Safe pair: the harness waits until current `outgoing=1` and `incoming=2` both
+  have `kernel_context.initialized == true`; otherwise it emits a precise
+  deferred marker (`no_current_tid`, `wrong_outgoing_tid`, or
+  `frames_uninitialized`).
+- Existing path only: after `D6_CONTROLLED_SWITCH_PROOF_BEGIN` and
+  `D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing=1 incoming=2`, it calls
+  `maybe_switch_kernel_context(Some(1), 2)`, which builds the existing
+  `DispatchSwitchPlan`, stores it in `DISPATCH_SWITCH_PLAN_STASH`, drops the
+  global lock in `handle_trap_entry_shared`, calls `switch_frames`, enters the
+  x86_64 first-resume trampoline, reacquires the lock, runs
+  `post_switch_restore_arch_thread_state`, switches back, and finally emits
+  `D6_CONTROLLED_SWITCH_PROOF_DONE`.
+
+**Expected proof markers:**
+
+```text
+D6_CONTROLLED_SWITCH_PROOF_BEGIN
+D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing=1 incoming=2
+D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing=1 incoming=2
+D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing=1 incoming=2
+D6_FIRST_RESUME_ENTER tid=2 cpu=0
+D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN
+D6_FIRST_RESUME_LOCK_REACQUIRE_DONE
+D6_FIRST_RESUME_POST_SWITCH_RESTORE_BEGIN
+D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE
+D6_SWITCH_FRAMES_RETURNED_UNLOCKED outgoing=1 incoming=2
+D6_CONTROLLED_SWITCH_PROOF_DONE
+```
+
+Deferred mode emits `D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=<exact_reason>`
+and never fakes success.
+
+**Hard boundaries preserved:** no timer preemption enablement, no scheduler
+fairness change, no x86_64 AP scheduler-online, no per-CPU runqueue sharding, no
+D2-B send blocking, no D3-FULL VmAnonMap, no `await_tlb_shootdown_ack` redesign,
+no `switch_frames` assembly ABI change, no lock handoff / `mem::forget`, no
+assembly unlock callback, and no ABI/syscall/image-ID/service/FS-gate change.
+AArch64 and RISC-V remain unchanged/fallback-safe; they do not call the proof
+hook and do not require proof markers in smoke.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained Stage 120 source checks in
+`mod stage120_controlled_switch_proof` covering the x86_64-only gate, single-CPU
+gate, one-shot atomics, boot knob, initialized tid-pair requirement, reuse of
+`DispatchSwitchPlan`, reuse of the stash/global-lock-drop path, no timer
+preemption/fairness/AP/lock-handoff/assembly-callback changes, AArch64/RISC-V
+non-participation, Stage 119 tid=1/tid=2 initialization, D4 extracted modules,
+`SYSCALL_COUNT == 31`, and `Syscall::VARIANT_COUNT == 23`.
 
 ---
 

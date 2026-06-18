@@ -244,11 +244,13 @@ The four highest-impact items, in order of unlock value:
    `BOOTSTRAP_SUPERVISOR_TID = 2` constant, and fixes the TSS RSP0 bug in the
    trampoline switch-back (was passing `ctx.outgoing_stack_top`, now passes `None`
    to preserve B's kernel stack top set by the stash-drain). Both tid=1 and tid=2
-   now show `D6_KERNEL_SWITCH_FRAME_INIT_DONE` in x86_64 core smoke. Still
-   Outcome B: smoke quiesces into IPC-blocked tasks before a timer preemption can
-   pair two initialized tasks. Next: either a longer-running user workload or
-   synthetic timer forcing to produce the first real unlocked `switch_frames`.
-   See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / Stage 119 / §7.1.5.
+   now show `D6_KERNEL_SWITCH_FRAME_INIT_DONE` in x86_64 core smoke. Stage 120
+   adds a default-off x86_64/single-CPU/one-shot proof harness gated by
+   `yarm.d6_switch_proof=1` (script opt-in: `D6_SWITCH_PROOF=1`) to force the
+   tid=1 → tid=2 initialized pair through the existing unlocked `switch_frames`
+   path. This is a proof harness, not scheduler policy; AArch64/RISC-V remain
+   unchanged/fallback-safe. See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage
+   118 / Stage 119 / Stage 120 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

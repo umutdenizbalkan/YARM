@@ -973,6 +973,12 @@ impl KernelState {
                 // SAFETY: single CPU, interrupts disabled by hardware trap entry,
                 // no concurrent accessor; stash is only read/drained in the same
                 // CPU's `handle_trap_entry_shared` after this function returns.
+                let already_stashed =
+                    unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() };
+                if already_stashed {
+                    crate::yarm_log!("D6_GLOBAL_LOCK_DROP_DEFERRED reason=stash_occupied");
+                    return Ok(());
+                }
                 unsafe {
                     crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
                 }
@@ -1025,6 +1031,90 @@ impl KernelState {
 
         crate::yarm_log!("D6_SWITCH_FRAMES_RETURNED");
         Ok(())
+    }
+
+    /// Stage 120: x86_64-only, single-CPU-only, boot-knob-gated, one-shot proof
+    /// harness for the existing unlocked `switch_frames` path.
+    ///
+    /// This is not a scheduler policy path: it only runs when the boot command
+    /// line contains `yarm.d6_switch_proof=1`, the current task is tid=1, tid=2
+    /// has an initialized kernel switch frame, and the Stage 117 trap-path stash
+    /// is active. It reuses `DispatchSwitchPlan` via `maybe_switch_kernel_context`
+    /// and disables itself permanently after one stashed proof pair.
+    pub(crate) fn maybe_run_d6_controlled_switch_proof(&mut self) -> Result<(), KernelError> {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            return Ok(());
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+                || crate::kernel::boot::d6_controlled_switch_proof_done()
+            {
+                return Ok(());
+            }
+            if self.online_cpu_count() != 1 {
+                crate::yarm_log!(
+                    "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=multi_cpu online_cpus={}",
+                    self.online_cpu_count()
+                );
+                return Ok(());
+            }
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path_active = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            if !trap_path_active {
+                crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=trap_path_inactive");
+                return Ok(());
+            }
+            let outgoing_tid = match self.current_tid() {
+                Some(BOOTSTRAP_FIRST_USER_TID) => BOOTSTRAP_FIRST_USER_TID,
+                Some(other) => {
+                    if other == BOOTSTRAP_SUPERVISOR_TID {
+                        crate::yarm_log!(
+                            "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=wrong_outgoing_tid tid={}",
+                            other
+                        );
+                    }
+                    return Ok(());
+                }
+                None => {
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=no_current_tid");
+                    return Ok(());
+                }
+            };
+            let incoming_tid = BOOTSTRAP_SUPERVISOR_TID;
+            let frames_ready = self.with_tcbs_mut(|tcbs| {
+                let has_initialized = |tid| {
+                    tcbs.iter()
+                        .flatten()
+                        .any(|tcb| tcb.tid.0 == tid && tcb.kernel_context.initialized)
+                };
+                has_initialized(outgoing_tid) && has_initialized(incoming_tid)
+            });
+            if !frames_ready {
+                crate::yarm_log!(
+                    "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=frames_uninitialized outgoing={} incoming={}",
+                    outgoing_tid,
+                    incoming_tid
+                );
+                return Ok(());
+            }
+            if !crate::kernel::boot::d6_controlled_switch_proof_try_start() {
+                return Ok(());
+            }
+            crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_BEGIN");
+            crate::yarm_log!(
+                "D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing={} incoming={}",
+                outgoing_tid,
+                incoming_tid
+            );
+            self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?;
+            crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
+            Ok(())
+        }
     }
 
     pub fn futex_wait_current(

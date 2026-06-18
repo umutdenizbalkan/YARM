@@ -34310,3 +34310,141 @@ mod stage119_minimal_task_pair {
         );
     }
 }
+
+// ===========================================================================
+// Stage 120 — x86_64 controlled one-shot unlocked switch_frames proof harness
+// ===========================================================================
+#[cfg(test)]
+mod stage120_controlled_switch_proof {
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const X86_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    #[test]
+    fn stage120_proof_is_x86_64_only_and_boot_knob_gated() {
+        assert!(
+            EXEC_STATE_SRC.contains("#[cfg(target_arch = \"x86_64\")]")
+                && EXEC_STATE_SRC.contains("maybe_run_d6_controlled_switch_proof"),
+            "proof hook must be x86_64-only in exec_state.rs"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.d6_switch_proof")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled"),
+            "proof harness must be gated by yarm.d6_switch_proof boot knob"
+        );
+        assert!(
+            X86_SMOKE_SRC.contains("D6_SWITCH_PROOF")
+                && X86_SMOKE_SRC.contains("yarm.d6_switch_proof=1"),
+            "x86_64 smoke proof mode must opt in explicitly"
+        );
+    }
+
+    #[test]
+    fn stage120_proof_is_single_cpu_and_one_shot() {
+        assert!(
+            EXEC_STATE_SRC.contains("self.online_cpu_count() != 1")
+                && EXEC_STATE_SRC.contains("reason=multi_cpu"),
+            "proof harness must defer unless exactly one CPU is online"
+        );
+        assert!(
+            MOD_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_STARTED")
+                && MOD_SRC.contains("compare_exchange")
+                && MOD_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "proof harness must be one-shot and record DONE state"
+        );
+    }
+
+    #[test]
+    fn stage120_proof_requires_initialized_tid_pair_and_uses_dispatch_plan() {
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID")
+                && EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID")
+                && EXEC_STATE_SRC.contains("kernel_context.initialized")
+                && EXEC_STATE_SRC.contains("reason=frames_uninitialized"),
+            "proof harness must require initialized tid=1/tid=2 kernel switch frames"
+        );
+        assert!(
+            EXEC_STATE_SRC
+                .contains("self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)")
+                && MOD_SRC.contains("pub(crate) struct DispatchSwitchPlan"),
+            "proof harness must reuse the existing DispatchSwitchPlan path"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("DISPATCH_SWITCH_PLAN_STASH")
+                && TRAP_ENTRY_SRC.contains("D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH")
+                && TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "proof harness must use the existing stash/global-lock-drop drain"
+        );
+    }
+
+    #[test]
+    fn stage120_proof_preserves_forbidden_boundaries() {
+        assert!(
+            !EXEC_STATE_SRC.contains("enable_timer_preemption")
+                && !TRAP_ENTRY_SRC.contains("enable_timer_preemption"),
+            "proof harness must not enable timer preemption"
+        );
+        assert!(
+            !EXEC_STATE_SRC.contains("mem::forget")
+                && !TRAP_ENTRY_SRC.contains("mem::forget")
+                && !MOD_SRC.contains("mem::forget"),
+            "proof harness must not use mem::forget or lock handoff"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback"),
+            "switch_frames assembly ABI must not grow an unlock callback"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("restore_arch_thread_state")
+                && RISCV_TRAP_SRC.contains("restore_arch_thread_state")
+                && !AARCH64_TRAP_SRC.contains("D6_CONTROLLED_SWITCH_PROOF")
+                && !RISCV_TRAP_SRC.contains("D6_CONTROLLED_SWITCH_PROOF"),
+            "AArch64/RISC-V trap paths must remain present and unaltered by the x86 proof"
+        );
+    }
+
+    #[test]
+    fn stage120_markers_and_existing_counts_are_preserved() {
+        for marker in [
+            "D6_CONTROLLED_SWITCH_PROOF_BEGIN",
+            "D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing={}",
+            "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=",
+            "D6_CONTROLLED_SWITCH_PROOF_DONE",
+            "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH",
+            "D6_SWITCH_FRAMES_ENTER_UNLOCKED",
+            "D6_FIRST_RESUME_ENTER",
+            "D6_SWITCH_FRAMES_RETURNED_UNLOCKED",
+        ] {
+            assert!(
+                EXEC_STATE_SRC.contains(marker)
+                    || TRAP_ENTRY_SRC.contains(marker)
+                    || MOD_SRC.contains(marker),
+                "Stage 120 marker missing: {marker}"
+            );
+        }
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE")
+                && EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            "Stage 119 tid=1/tid=2 initialization must remain intact"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod sched;")
+                && SYSCALL_SRC.contains("mod cap;"),
+            "D4 extracted syscall modules must remain intact"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
