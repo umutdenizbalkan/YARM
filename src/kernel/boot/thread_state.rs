@@ -319,7 +319,7 @@ impl KernelState {
         })
     }
 
-    /// Stage 126/127 kernel switch-stack invariant gate.
+    /// Stage 126/127/128 kernel switch-stack invariant gate.
     ///
     /// `incoming_stack_top`/`stack_top` values are virtual kernel stack tops in
     /// the fixed higher-half kernel-stack arena, not physical addresses. On
@@ -329,11 +329,16 @@ impl KernelState {
     /// (`top - 24`, 0xffff800000007fe8 when top is 0xffff800000008000). Before
     /// publishing `kernel_context.initialized = true`, ensure that page is
     /// present, writable, supervisor/kernel-only (not user), and mapped into the
-    /// target task ASID/root that will own the first-resume context. Stage 127
-    /// deliberately avoids active-ASID enumeration as the terminal gate: early
-    /// supervisor/init spawn can initialize a target task before any ASID is
-    /// currently running, but the target task root is still the correct mapping
-    /// authority once `task_asid(tid)` is bound.
+    /// target task ASID/root that owns the first-resume context.
+    ///
+    /// Stage 127 deliberately avoids active-ASID enumeration as the terminal
+    /// gate: early supervisor/init spawn can initialize a target task before any
+    /// ASID is currently running, but the target task root is still the correct
+    /// initial mapping authority once `task_asid(tid)` is bound. Stage 128 adds
+    /// the stronger CR3 coverage invariant: `switch_frames` is only a kernel
+    /// stack/register switch and does not switch CR3, so the incoming stack page
+    /// must also be installed as a kernel-shared mapping in every existing task
+    /// root that may be the active/outgoing CR3 when the bridge uses that stack.
     #[cfg(all(target_arch = "x86_64", not(test)))]
     fn ensure_kernel_switch_stack_mapped(
         &mut self,
@@ -343,6 +348,10 @@ impl KernelState {
     ) -> Result<(), KernelError> {
         use crate::arch::selected_isa::page_table::{self, PageTableEntry};
         use crate::kernel::vm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+        fn validate_entry(entry: page_table::PageTableEntry) -> bool {
+            (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
+        }
 
         crate::yarm_log!(
             "D6_KERNEL_SWITCH_STACK_CHECK_BEGIN tid={} top=0x{:x}",
@@ -408,26 +417,21 @@ impl KernelState {
 
         let stack_page = VirtAddr(probe_page as u64);
         let phys = if let Some(entry) = page_table::resolve_page(target_asid, stack_page) {
-            if (entry.0 & PageTableEntry::WRITABLE) == 0 {
+            if !validate_entry(entry) {
+                let reason = if (entry.0 & PageTableEntry::WRITABLE) == 0 {
+                    "not_writable"
+                } else {
+                    "user_accessible"
+                };
                 crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=not_writable",
+                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason={}",
                     tid,
-                    fake_return_probe
+                    fake_return_probe,
+                    reason
                 );
                 crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=not_writable tid={}",
-                    tid
-                );
-                return Err(KernelError::VmFull);
-            }
-            if (entry.0 & PageTableEntry::USER) != 0 {
-                crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=user_accessible",
-                    tid,
-                    fake_return_probe
-                );
-                crate::yarm_log!(
-                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=user_accessible tid={}",
+                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason={} tid={}",
+                    reason,
                     tid
                 );
                 return Err(KernelError::VmFull);
@@ -457,6 +461,74 @@ impl KernelState {
             phys
         };
 
+        // Stage 128: because `switch_frames` does not switch CR3, an incoming
+        // stack may be used while the outgoing task's root is still active.
+        // Install the same supervisor-only backing page in every currently
+        // existing task root (plus the target root) instead of relying on a
+        // target-ASID-only mapping. This is intentionally narrow: one page, not
+        // the full kernel-stack arena.
+        let mut roots = [None; super::MAX_TASKS];
+        roots[0] = Some(target_asid);
+        self.with_tcbs(|tcbs| {
+            let mut len = 1usize;
+            for tcb in tcbs.iter().flatten() {
+                let Some(asid) = tcb.asid else {
+                    continue;
+                };
+                if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
+                    continue;
+                }
+                if roots[..len].iter().any(|entry| *entry == Some(asid)) {
+                    continue;
+                }
+                if len < roots.len() {
+                    roots[len] = Some(asid);
+                    len += 1;
+                }
+            }
+        });
+
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_MAP_SHARED_BEGIN tid={} va=0x{:x}",
+            tid,
+            probe_page
+        );
+        for asid in roots.iter().flatten().copied() {
+            let result = match page_table::resolve_page(asid, stack_page) {
+                Some(entry) if entry.addr() == phys && validate_entry(entry) => "already_ok",
+                Some(_) => {
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_STACK_MAP_SHARED_ROOT tid={} asid={} va=0x{:x} result=conflict",
+                        tid,
+                        asid.0,
+                        probe_page
+                    );
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_STACK_MAP_SHARED_DEFERRED reason=shared_root_conflict tid={}",
+                        tid
+                    );
+                    return Err(KernelError::VmFull);
+                }
+                None => {
+                    page_table::map_page(asid, stack_page, PhysAddr(phys), PageFlags::KERNEL_RW)
+                        .map_err(|_| KernelError::VmFull)?;
+                    "mapped"
+                }
+            };
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_SHARED_ROOT tid={} asid={} va=0x{:x} result={}",
+                tid,
+                asid.0,
+                probe_page,
+                result
+            );
+        }
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_MAP_SHARED_DONE tid={} va=0x{:x}",
+            tid,
+            probe_page
+        );
+
         let Some(entry) = page_table::resolve_page(target_asid, stack_page) else {
             crate::yarm_log!(
                 "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=resolve_after_map_failed",
@@ -469,10 +541,7 @@ impl KernelState {
             );
             return Err(KernelError::VmFull);
         };
-        if entry.addr() != phys
-            || (entry.0 & PageTableEntry::WRITABLE) == 0
-            || (entry.0 & PageTableEntry::USER) != 0
-        {
+        if entry.addr() != phys || !validate_entry(entry) {
             crate::yarm_log!(
                 "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=mapped_flags_invalid",
                 tid,
@@ -493,12 +562,110 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 128 proof-time active-root guard.
+    ///
+    /// `switch_frames` switches callee-saved registers and the kernel stack; it
+    /// does not switch CR3. The Stage 120 proof therefore checks the incoming
+    /// switch-stack page against `hal.active_asid()` before dropping the global
+    /// lock, proving the stack is visible in the root that is active at the
+    /// bridge `callq` return-address push.
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
+        &mut self,
+        tid: u64,
+    ) -> Result<(), KernelError> {
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
+        use crate::kernel::vm::{PAGE_SIZE, VirtAddr};
+
+        let active_asid = self.hal.active_asid();
+        let cr3 = active_asid.and_then(page_table::cr3_for_asid).unwrap_or(0);
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT cpu={} active_asid={} cr3=0x{:x}",
+            self.current_cpu().0,
+            active_asid.map_or(0, |asid| asid.0),
+            cr3
+        );
+        let Some(active_asid) = active_asid else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid=0 probe=0x0 reason=active_asid_unavailable",
+                tid
+            );
+            return Err(KernelError::UserMemoryFault);
+        };
+        let (stack_base, stack_top) = self.with_tcbs(|tcbs| {
+            let tcb = tcbs
+                .iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            let stack_base = tcb
+                .kernel_context
+                .stack_base
+                .ok_or(KernelError::WrongObject)?
+                .0;
+            let stack_top = tcb
+                .kernel_context
+                .stack_top
+                .ok_or(KernelError::WrongObject)?
+                .0;
+            Ok::<_, KernelError>((stack_base as usize, stack_top as usize))
+        })?;
+        let aligned_top = stack_top & !0xF;
+        let fake_return_probe = aligned_top
+            .checked_sub(core::mem::size_of::<usize>())
+            .ok_or(KernelError::WrongObject)?;
+        let probe_page = fake_return_probe & !(PAGE_SIZE - 1);
+        if probe_page < stack_base {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=stack_bounds",
+                tid,
+                active_asid.0,
+                fake_return_probe
+            );
+            return Err(KernelError::WrongObject);
+        }
+        let stack_page = VirtAddr(probe_page as u64);
+        let Some(entry) = page_table::resolve_page(active_asid, stack_page) else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=not_mapped",
+                tid,
+                active_asid.0,
+                fake_return_probe
+            );
+            return Err(KernelError::VmFull);
+        };
+        if (entry.0 & PageTableEntry::WRITABLE) == 0 || (entry.0 & PageTableEntry::USER) != 0 {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=flags_invalid",
+                tid,
+                active_asid.0,
+                fake_return_probe
+            );
+            return Err(KernelError::VmFull);
+        }
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK tid={} active_asid={} probe=0x{:x}",
+            tid,
+            active_asid.0,
+            fake_return_probe
+        );
+        Ok(())
+    }
+
     #[cfg(any(not(target_arch = "x86_64"), test))]
     fn ensure_kernel_switch_stack_mapped(
         &mut self,
         _tid: u64,
         _stack_base: usize,
         _stack_top: usize,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    #[cfg(any(not(target_arch = "x86_64"), test))]
+    pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
+        &mut self,
+        _tid: u64,
     ) -> Result<(), KernelError> {
         Ok(())
     }

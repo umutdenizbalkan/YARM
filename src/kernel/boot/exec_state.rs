@@ -1102,6 +1102,19 @@ impl KernelState {
                 );
                 return Ok(());
             }
+            // Stage 128: `switch_frames` does not switch CR3; it changes the
+            // kernel stack while the outgoing/current root is still active.
+            // Before stashing the proof plan, prove that the incoming stack page
+            // is visible and supervisor-writable in that active root.
+            if let Err(err) = self.ensure_active_root_can_use_kernel_switch_stack(incoming_tid) {
+                crate::yarm_log!(
+                    "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=active_stack_unmapped outgoing={} incoming={} err={:?}",
+                    outgoing_tid,
+                    incoming_tid,
+                    err
+                );
+                return Ok(());
+            }
             if !crate::kernel::boot::d6_controlled_switch_proof_try_start() {
                 return Ok(());
             }
