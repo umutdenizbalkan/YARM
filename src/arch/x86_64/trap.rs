@@ -214,7 +214,7 @@ fn d6_emit_post_cleanup_first_trap_diag(
     let rsp_derived = cr2.wrapping_add(8);
     let kernel_ptr = kernel as *const _ as usize as u64;
     let current_tid = kernel.current_tid().unwrap_or(u64::MAX);
-    let active_asid_num = kernel.hal.active_asid().map_or(0, |a| a.0);
+    let active_asid_num = kernel.d6_diag_active_asid_num();
     let tss_rsp0 = super::descriptor_tables::read_boot_tss_rsp0();
     let (stack_base, stack_top) = kernel.with_tcbs(|tcbs| {
         tcbs.iter()
