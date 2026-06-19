@@ -35,7 +35,7 @@ exec-load policy, and capability-materialization rules.
 | Optional FS strict | ✅ RAMFS + ext4 live; FAT skipped |
 | AP Rust online (`yarm.x86_ap_rust=1`) | ✅ Stage 109 outcome A — AP enters Rust and parks |
 | Production scheduler | BSP only; `online_cpu_count()` stays at 1; AP `started_secondary` reported separately |
-| D6 switch proof | 🧪 default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; Stage 128 now maps/checks initialized x86_64 switch-stack pages in target and active/kernel-shared task roots before the default-off proof stashes `switch_frames`; QEMU proof validation pending local run |
+| D6 switch proof | 🧪 default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; Stage 128 maps/checks initialized x86_64 switch-stack pages in target and active/kernel-shared task roots; Stage 129 adds on-demand active-root repair (fixes VmFull deferral when active ASID was created after incoming stack init); QEMU proof validation pending local run |
 | AP scheduler participation | ❌ deferred — blocked on the AP per-CPU environment (GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu`) |
 | Timer interrupts on APs | ❌ APs have no IDT; `cli` stays set; no AP scheduler ticks |
 
