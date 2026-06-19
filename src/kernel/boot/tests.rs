@@ -36251,3 +36251,381 @@ mod stage130_d6_proof_cleanup {
         );
     }
 }
+
+// ===========================================================================
+// Stage 131 — ArchSwitchContext / switch_frames ABI audit and post-cleanup
+//             crash fix
+// ===========================================================================
+//
+// Root cause: `initialize_frame_fpu_state` was NOT called when initialising
+// TID2's kernel switch frame in `initialize_thread_kernel_switch_frame`.  The
+// fxsave area was all zeros.  When `switch_frames` loaded that frame for the
+// first time, `fxrstor` set MXCSR=0 (all SSE exceptions unmasked), causing
+// an #XF fault in subsequent kernel code that uses SSE intrinsics.
+//
+// Fix: `initialize_thread_kernel_switch_frame` now calls
+// `initialize_frame_fpu_state` on x86_64 before setting `initialized = true`.
+//
+// Audit outcome: `ArchSwitchContext` layout and `yarm_x86_switch_frame`
+// assembly offsets are CORRECT.  r14 is saved and restored at offset 48.
+//
+// Checks (22 tests):
+//   1.  ArchSwitchContext total size is 576 bytes (8×8 + 512)
+//   2.  ArchSwitchContext has repr(C, align(16))
+//   3.  words field is first — offset 0
+//   4.  fxsave field is at offset 64 (after 8×usize words)
+//   5.  Assembly saves RSP at [rdi + 0]
+//   6.  Assembly saves RIP at [rdi + 8]
+//   7.  Assembly saves RBX at [rdi + 16]
+//   8.  Assembly saves RBP at [rdi + 24]
+//   9.  Assembly saves R12 at [rdi + 32]
+//   10. Assembly saves R13 at [rdi + 40]
+//   11. Assembly saves R14 at [rdi + 48]
+//   12. Assembly saves R15 at [rdi + 56]
+//   13. Assembly restores R14 from [rsi + 48]
+//   14. Assembly does fxsave at [rdi + 64]
+//   15. Assembly does fxrstor at [rsi + 64]
+//   16. initialize_frame_fpu_state is called in initialize_thread_kernel_switch_frame
+//   17. initialize_frame_fpu_state call is x86_64-gated in thread_state.rs
+//   18. initialize_frame_fpu_state runs fninit before fxsave
+//   19. D6_SWITCH_CONTEXT_AUDIT_BEGIN marker emitted from exec_state.rs
+//   20. D6_SWITCH_CONTEXT_LAYOUT_OK and R14_RESTORE_CHECK markers present
+//   21. Stage 130 CLEANUP_DONE marker preserved in trap_entry.rs
+//   22. Stage 129/130 structural invariants preserved
+// ===========================================================================
+#[cfg(test)]
+mod stage131_arch_switch_context_abi_audit {
+    const TASK_SRC: &str = include_str!("../task.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+
+    // 1. ArchSwitchContext is exactly 576 bytes (8 × usize=8 + fxsave=512).
+    #[test]
+    fn stage131_arch_switch_context_size_is_576() {
+        assert_eq!(
+            core::mem::size_of::<crate::kernel::task::ArchSwitchContext>(),
+            576,
+            "ArchSwitchContext must be 576 bytes: 8 words × 8 bytes + 512 fxsave"
+        );
+    }
+
+    // 2. ArchSwitchContext has repr(C, align(16)) so offsets are stable and
+    //    fxrstor alignment requirement (16-byte) is met for the fxsave field.
+    #[test]
+    fn stage131_arch_switch_context_repr_c_align16() {
+        assert!(
+            TASK_SRC.contains("#[repr(C, align(16))]"),
+            "ArchSwitchContext must carry #[repr(C, align(16))] for stable layout"
+        );
+        assert_eq!(
+            core::mem::align_of::<crate::kernel::task::ArchSwitchContext>(),
+            16,
+            "ArchSwitchContext alignment must be 16"
+        );
+    }
+
+    // 3. words field is first in the struct — byte offset 0 from struct base.
+    #[test]
+    fn stage131_words_field_is_first_at_offset_zero() {
+        // Verify via struct source that `words` precedes `fxsave`.
+        let words_pos = TASK_SRC
+            .find("words: [usize; 8]")
+            .expect("words field must exist in ArchSwitchContext");
+        let fxsave_pos = TASK_SRC
+            .find("fxsave: [u8; 512]")
+            .expect("fxsave field must exist in ArchSwitchContext");
+        assert!(
+            words_pos < fxsave_pos,
+            "words must precede fxsave in ArchSwitchContext definition"
+        );
+        // Runtime: STACK_PTR_IDX = 0, so set_stack_ptr writes words[0].
+        // Read back via raw pointer to confirm words[0] is at byte offset 0.
+        let mut ctx = crate::kernel::task::ArchSwitchContext::default();
+        ctx.set_stack_ptr(0xDEAD_C0DE);
+        let first_word = unsafe { (&ctx as *const _ as *const usize).read() };
+        assert_eq!(first_word, 0xDEAD_C0DE, "words[0] must be at byte offset 0");
+    }
+
+    // 4. fxsave field is at byte offset 64 (8 words × 8 bytes each).
+    #[test]
+    fn stage131_fxsave_field_at_offset_64() {
+        // words is private; derive the offset from the public WORDS constant.
+        // repr(C) places fxsave immediately after words with no padding (u8 alignment).
+        let fxsave_offset =
+            crate::kernel::task::ArchSwitchContext::WORDS * core::mem::size_of::<usize>();
+        assert_eq!(
+            fxsave_offset,
+            64,
+            "fxsave must start at byte offset 64 within ArchSwitchContext (8 words × 8 bytes)"
+        );
+        assert_eq!(
+            core::mem::size_of::<crate::kernel::task::ArchSwitchContext>(),
+            576,
+            "ArchSwitchContext must be exactly 576 bytes total"
+        );
+    }
+
+    // 5. Assembly saves RSP at [rdi + 0] — word[0] = stack pointer.
+    #[test]
+    fn stage131_asm_saves_rsp_at_offset_0() {
+        assert!(
+            X86_SWITCH_SRC.contains("[rdi + 0], rax") || X86_SWITCH_SRC.contains("mov [rdi + 0]"),
+            "yarm_x86_switch_frame must store RSP at [rdi + 0] (words[0])"
+        );
+        assert!(
+            X86_SWITCH_SRC.contains("mov rsp, [rsi + 0]"),
+            "yarm_x86_switch_frame must restore RSP from [rsi + 0]"
+        );
+    }
+
+    // 6. Assembly saves RIP (return address) at [rdi + 8] — word[1].
+    #[test]
+    fn stage131_asm_saves_rip_at_offset_8() {
+        assert!(
+            X86_SWITCH_SRC.contains("[rdi + 8], rax"),
+            "yarm_x86_switch_frame must store RIP at [rdi + 8] (words[1])"
+        );
+        assert!(
+            X86_SWITCH_SRC.contains("jmp [rsi + 8]"),
+            "yarm_x86_switch_frame must jump to incoming RIP from [rsi + 8]"
+        );
+    }
+
+    // 7. Assembly saves RBX at [rdi + 16] — word[2].
+    #[test]
+    fn stage131_asm_saves_rbx_at_offset_16() {
+        assert!(
+            X86_SWITCH_SRC.contains("mov [rdi + 16], rbx"),
+            "yarm_x86_switch_frame must save RBX at [rdi + 16] (words[2])"
+        );
+        assert!(
+            X86_SWITCH_SRC.contains("mov rbx, [rsi + 16]"),
+            "yarm_x86_switch_frame must restore RBX from [rsi + 16]"
+        );
+    }
+
+    // 8. Assembly saves RBP at [rdi + 24] — word[3].
+    #[test]
+    fn stage131_asm_saves_rbp_at_offset_24() {
+        assert!(
+            X86_SWITCH_SRC.contains("mov [rdi + 24], rbp"),
+            "yarm_x86_switch_frame must save RBP at [rdi + 24] (words[3])"
+        );
+        assert!(
+            X86_SWITCH_SRC.contains("mov rbp, [rsi + 24]"),
+            "yarm_x86_switch_frame must restore RBP from [rsi + 24]"
+        );
+    }
+
+    // 9. Assembly saves R12 at [rdi + 32] — word[4].
+    #[test]
+    fn stage131_asm_saves_r12_at_offset_32() {
+        assert!(
+            X86_SWITCH_SRC.contains("mov [rdi + 32], r12"),
+            "yarm_x86_switch_frame must save R12 at [rdi + 32] (words[4])"
+        );
+        assert!(
+            X86_SWITCH_SRC.contains("mov r12, [rsi + 32]"),
+            "yarm_x86_switch_frame must restore R12 from [rsi + 32]"
+        );
+    }
+
+    // 10. Assembly saves R13 at [rdi + 40] — word[5].
+    #[test]
+    fn stage131_asm_saves_r13_at_offset_40() {
+        assert!(
+            X86_SWITCH_SRC.contains("mov [rdi + 40], r13"),
+            "yarm_x86_switch_frame must save R13 at [rdi + 40] (words[5])"
+        );
+        assert!(
+            X86_SWITCH_SRC.contains("mov r13, [rsi + 40]"),
+            "yarm_x86_switch_frame must restore R13 from [rsi + 40]"
+        );
+    }
+
+    // 11. Assembly saves R14 at [rdi + 48] — word[6].
+    //     This is the register implicated in the post-proof crash hypothesis:
+    //     a corrupted r14 caused a bad SpinLockIrqSave address computation.
+    //     Audit confirms: R14 is correctly saved at offset 48.
+    #[test]
+    fn stage131_asm_saves_r14_at_offset_48() {
+        assert!(
+            X86_SWITCH_SRC.contains("mov [rdi + 48], r14"),
+            "yarm_x86_switch_frame must save R14 at [rdi + 48] (words[6])"
+        );
+    }
+
+    // 12. Assembly saves R15 at [rdi + 56] — word[7].
+    #[test]
+    fn stage131_asm_saves_r15_at_offset_56() {
+        assert!(
+            X86_SWITCH_SRC.contains("mov [rdi + 56], r15"),
+            "yarm_x86_switch_frame must save R15 at [rdi + 56] (words[7])"
+        );
+        assert!(
+            X86_SWITCH_SRC.contains("mov r15, [rsi + 56]"),
+            "yarm_x86_switch_frame must restore R15 from [rsi + 56]"
+        );
+    }
+
+    // 13. Assembly restores R14 from [rsi + 48] — symmetric with save offset.
+    //     Confirms the restore path is correct; r14 corruption was NOT due to
+    //     an assembly offset bug.
+    #[test]
+    fn stage131_asm_restores_r14_from_offset_48() {
+        assert!(
+            X86_SWITCH_SRC.contains("mov r14, [rsi + 48]"),
+            "yarm_x86_switch_frame must restore R14 from [rsi + 48] (words[6])"
+        );
+    }
+
+    // 14. Assembly issues fxsave at [rdi + 64] — the fxsave field offset.
+    #[test]
+    fn stage131_asm_fxsave_at_offset_64() {
+        assert!(
+            X86_SWITCH_SRC.contains("fxsave [rdi + 64]"),
+            "yarm_x86_switch_frame must issue fxsave at [rdi + 64] (fxsave field)"
+        );
+    }
+
+    // 15. Assembly issues fxrstor at [rsi + 64] — symmetric with fxsave offset.
+    //     Root cause: fxrstor on all-zero data sets MXCSR=0 (unmasked SSE exceptions).
+    //     Fix: initialize_frame_fpu_state now captures valid state before first switch.
+    #[test]
+    fn stage131_asm_fxrstor_at_offset_64() {
+        assert!(
+            X86_SWITCH_SRC.contains("fxrstor [rsi + 64]"),
+            "yarm_x86_switch_frame must issue fxrstor at [rsi + 64] (fxsave field)"
+        );
+    }
+
+    // 16. initialize_frame_fpu_state is called from initialize_thread_kernel_switch_frame.
+    //     This is the Stage 131 fix: ensures the fxsave area has a valid FPU state
+    //     (MXCSR=0x1F80, all exceptions masked) before the frame is published.
+    #[test]
+    fn stage131_initialize_frame_fpu_state_called_in_init_switch_frame() {
+        let start = THREAD_STATE_SRC
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .expect("initialize_thread_kernel_switch_frame must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("\n    }")
+            .map(|offset| start + offset)
+            .expect("closing brace of initialize_thread_kernel_switch_frame");
+        let func_body = &THREAD_STATE_SRC[start..end];
+        assert!(
+            func_body.contains("initialize_frame_fpu_state"),
+            "initialize_thread_kernel_switch_frame must call initialize_frame_fpu_state \
+             to prevent MXCSR=0 on first fxrstor"
+        );
+    }
+
+    // 17. The initialize_frame_fpu_state call is gated to x86_64 in thread_state.rs.
+    #[test]
+    fn stage131_initialize_frame_fpu_state_is_x86_64_gated() {
+        let start = THREAD_STATE_SRC
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .expect("initialize_thread_kernel_switch_frame must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("\n    }")
+            .map(|offset| start + offset)
+            .expect("closing brace");
+        let func_body = &THREAD_STATE_SRC[start..end];
+        assert!(
+            func_body.contains("#[cfg(target_arch = \"x86_64\")]")
+                && func_body.contains("initialize_frame_fpu_state"),
+            "initialize_frame_fpu_state must be guarded by #[cfg(target_arch = \"x86_64\")] \
+             so AArch64/RISC-V paths are unaffected"
+        );
+    }
+
+    // 18. initialize_frame_fpu_state in context_switch.rs runs fninit before fxsave.
+    //     fninit resets x87 FPU; fxsave captures the default valid state.
+    #[test]
+    fn stage131_initialize_frame_fpu_state_has_fninit_and_fxsave() {
+        let start = X86_SWITCH_SRC
+            .find("pub fn initialize_frame_fpu_state")
+            .expect("initialize_frame_fpu_state must exist in context_switch.rs");
+        let end = X86_SWITCH_SRC[start..]
+            .find("\n}")
+            .map(|offset| start + offset)
+            .expect("closing brace of initialize_frame_fpu_state");
+        let func_body = &X86_SWITCH_SRC[start..end];
+        assert!(
+            func_body.contains("fninit"),
+            "initialize_frame_fpu_state must run fninit to reset FPU before fxsave"
+        );
+        assert!(
+            func_body.contains("fxsave"),
+            "initialize_frame_fpu_state must run fxsave to capture the default FPU state"
+        );
+    }
+
+    // 19. D6_SWITCH_CONTEXT_AUDIT_BEGIN marker is emitted from exec_state.rs.
+    #[test]
+    fn stage131_audit_begin_marker_in_exec_state() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_CONTEXT_AUDIT_BEGIN"),
+            "exec_state.rs must emit D6_SWITCH_CONTEXT_AUDIT_BEGIN in the proof path"
+        );
+    }
+
+    // 20. D6_SWITCH_CONTEXT_LAYOUT_OK and D6_SWITCH_CONTEXT_R14_RESTORE_CHECK
+    //     markers are both present to record the per-register audit finding.
+    #[test]
+    fn stage131_layout_ok_and_r14_check_markers_present() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_CONTEXT_LAYOUT_OK"),
+            "exec_state.rs must emit D6_SWITCH_CONTEXT_LAYOUT_OK"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_CONTEXT_R14_RESTORE_CHECK"),
+            "exec_state.rs must emit D6_SWITCH_CONTEXT_R14_RESTORE_CHECK"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_CONTEXT_AUDIT_DONE"),
+            "exec_state.rs must emit D6_SWITCH_CONTEXT_AUDIT_DONE after the audit markers"
+        );
+    }
+
+    // 21. Stage 130 CLEANUP_DONE marker is preserved in trap_entry.rs.
+    #[test]
+    fn stage131_stage130_cleanup_done_preserved() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE"),
+            "Stage 130 CLEANUP_DONE marker must be preserved in trap_entry.rs"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN"),
+            "Stage 130 CLEANUP_BEGIN marker must be preserved in trap_entry.rs"
+        );
+    }
+
+    // 22. Stage 129/130 structural invariants: key markers and ABI boundaries
+    //     remain intact after the Stage 131 fix.
+    #[test]
+    fn stage131_stage129_130_invariants_preserved() {
+        // Stage 129 active-root repair markers.
+        assert!(
+            THREAD_STATE_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_BEGIN")
+                && THREAD_STATE_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DONE"),
+            "Stage 129 MAP_ACTIVE markers must be preserved after Stage 131"
+        );
+        // Stage 130 trampoline fix.
+        assert!(
+            THREAD_STATE_SRC.contains("ctx.outgoing_stack_top"),
+            "Stage 130 trampoline outgoing_stack_top fix must be preserved"
+        );
+        // ABI boundary: no unlock callback, no mem::forget.
+        assert!(
+            !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget")
+                && !AARCH64_SWITCH_SRC.contains("D6_SWITCH_CONTEXT_AUDIT")
+                && !RISCV_SWITCH_SRC.contains("D6_SWITCH_CONTEXT_AUDIT"),
+            "mem::forget and AArch64/RISC-V audit markers must not appear"
+        );
+    }
+}

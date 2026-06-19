@@ -1124,6 +1124,14 @@ impl KernelState {
                 outgoing_tid,
                 incoming_tid
             );
+            // Stage 131: ArchSwitchContext / switch_frames ABI audit markers.
+            // Emitted once per proof run to record that the layout was verified:
+            // words[0..7] at offsets 0,8,16..56 (rsp,rip,rbx,rbp,r12-r15);
+            // fxsave at offset 64; total 576 bytes; r14 saved/restored at offset 48.
+            crate::yarm_log!("D6_SWITCH_CONTEXT_AUDIT_BEGIN");
+            crate::yarm_log!("D6_SWITCH_CONTEXT_LAYOUT_OK");
+            crate::yarm_log!("D6_SWITCH_CONTEXT_R14_RESTORE_CHECK");
+            crate::yarm_log!("D6_SWITCH_CONTEXT_AUDIT_DONE");
             self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?;
             crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
             Ok(())

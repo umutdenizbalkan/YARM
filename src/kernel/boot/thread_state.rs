@@ -910,6 +910,17 @@ impl KernelState {
             let entry_stack_ptr = stack_top & !0xF;
             tcb.kernel_context.frame.set_stack_ptr(entry_stack_ptr);
             tcb.kernel_context.frame.set_instruction_ptr(switch_entry);
+            // Stage 131: initialise the fxsave area with a valid FPU state so
+            // `fxrstor` on first switch does not load MXCSR=0 (all SSE exceptions
+            // unmasked). All-zero fxsave is an invalid state: MXCSR=0 disables every
+            // SSE exception mask, causing #XF on the next SSE operation in kernel
+            // code (including format-string helpers compiled with SSE intrinsics).
+            // `initialize_frame_fpu_state` runs `fninit; fxsave` to capture the
+            // current valid state (MXCSR=0x1F80, x87 CW=0x037F).
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::selected_isa::context_switch::initialize_frame_fpu_state(
+                &mut tcb.kernel_context.frame,
+            );
             tcb.kernel_context.initialized = true;
             Ok(())
         })

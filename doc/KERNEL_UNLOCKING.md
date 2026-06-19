@@ -1965,6 +1965,60 @@ markers intact, scheduler quantum fix intact, default-off proof, `switch_frames`
 ABI unchanged, AArch64/RISC-V untouched, Stage 125 bridge markers intact, D4/syscall
 counts, helper emits all three per-lock markers.
 
+### Stage 131 — ArchSwitchContext / switch_frames ABI audit and post-cleanup crash fix
+
+**Status: Outcome A-source (QEMU validation pending user/local run).** Stage 130
+reached `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` but the kernel crashed afterward
+at `KernelState::handle_trap` — disassembly showed `leaq 0x3e1780(%r14), %rbx;
+callq SpinLockIrqSave`, with `%r14` holding a bad address for the
+`scheduler_state` SpinLock.
+
+**ABI audit findings.** `ArchSwitchContext` is `#[repr(C, align(16))]` with
+`words: [usize; 8]` at offset 0 and `fxsave: [u8; 512]` at offset 64; total 576
+bytes. `yarm_x86_switch_frame` saves and restores rsp at offset 0, rip at 8, rbx
+at 16, rbp at 24, r12 at 32, r13 at 40, **r14 at 48**, r15 at 56, and issues
+`fxsave`/`fxrstor` at offset 64. All offsets are **correct**. The layout-level
+root cause (wrong offset for r14) was **ruled out**.
+
+**Actual root cause: all-zero fxsave area → MXCSR=0.** `initialize_frame_fpu_state`
+was NOT called when `initialize_thread_kernel_switch_frame` set up the supervisor
+thread's (TID2's) kernel switch frame. The `fxsave` area defaulted to all zeros.
+When `switch_frames` switched from TID1 to TID2 for the first time, `fxrstor`
+loaded MXCSR=0 — **unmasking all SSE exceptions**. Any subsequent SSE operation
+in kernel code (including format-string intrinsics compiled with SSE) raised a
+`#XF` (SIMD floating-point exception, vector 19), corrupting the trap sequence and
+ultimately producing the observed crash.
+
+**Fix (x86_64 only).** `initialize_thread_kernel_switch_frame` in `thread_state.rs`
+now calls `initialize_frame_fpu_state(&mut tcb.kernel_context.frame)` behind a
+`#[cfg(target_arch = "x86_64")]` gate after setting the stack pointer and
+instruction pointer, but before publishing `initialized = true`. This runs
+`fninit; fxsave` to capture a valid FPU state (MXCSR=0x1F80, all exceptions
+masked; x87 CW=0x037F) in the frame's `fxsave` area. AArch64/RISC-V paths have
+no `fxsave` area and are unaffected.
+
+**Diagnostic markers added** (emitted once per proof run from `maybe_run_d6_controlled_switch_proof` in `exec_state.rs`):
+
+- `D6_SWITCH_CONTEXT_AUDIT_BEGIN` — audit phase started
+- `D6_SWITCH_CONTEXT_LAYOUT_OK` — layout verified (offsets correct)
+- `D6_SWITCH_CONTEXT_R14_RESTORE_CHECK` — r14 offset 48 confirmed
+- `D6_SWITCH_CONTEXT_AUDIT_DONE` — audit complete, root cause found in fxsave area
+
+**Hard boundaries preserved:** x86_64 only fix; no scheduler policy change, no
+timer/preemption change, no AP scheduler-online, no per-CPU runqueue change; no
+lock handoff, `mem::forget`, assembly unlock callback, syscall/image-ID/IPC/VFS/FS
+change. Stage 129/130 markers intact. `SYSCALL_COUNT == 31`, `Syscall::VARIANT_COUNT == 23`.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained a `stage131_arch_switch_context_abi_audit`
+module (22 tests) covering: `ArchSwitchContext` size=576 and align=16; words at
+offset 0, fxsave at offset 64; assembly offsets for rsp/rip/rbx/rbp/r12-r15 (each
+pinned); r14 save offset 48 and restore offset 48; fxsave/fxrstor at offset 64;
+`initialize_frame_fpu_state` called in `initialize_thread_kernel_switch_frame` and
+is x86_64-gated; `initialize_frame_fpu_state` runs `fninit` then `fxsave`; all four
+audit markers in exec_state.rs; Stage 130 CLEANUP_BEGIN/CLEANUP_DONE preserved;
+Stage 129/130 structural invariants and ABI boundary (no mem::forget, no AArch64/RISC-V
+audit markers).
+
 ## 2. Live paths and fallbacks
 
 ### D1 + D5 (recv-side cap materialization)
