@@ -179,16 +179,17 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust_real() -> ! {
         // from switch_frames here — it jumps to the outgoing task's POINT 2.
         // In test builds (switch_frames is a no-op), we fall through to the spin.
         //
-        // Pass None for next_kernel_stack_top: the stash-drain switch_frames
-        // (outgoing=A, incoming=B) already set TSS RSP0 = B.stack_top. Passing
-        // A.stack_top here would overwrite that, so B's subsequent interrupts
-        // would land on A's kernel stack — a stack-corruption bug.
+        // Pass ctx.outgoing_stack_top so TSS RSP0 is updated to the outgoing
+        // task's (TID1's) kernel stack top. Without this, TSS RSP0 still points
+        // to TID2's kernel stack top from the initial stash-drain switch, and any
+        // interrupt that fires while TID1 is in user mode would push its frame
+        // onto TID2's kernel stack — a stack-corruption bug.
         crate::arch::selected_isa::context_switch::switch_frames(
             // SAFETY: incoming_frame_ptr is stable (KernelState::tcbs fixed-size
             // array); no concurrent access (single CPU, interrupts disabled).
             unsafe { &mut *ctx.incoming_frame_ptr },
             unsafe { &*ctx.outgoing_frame_ptr },
-            None,
+            ctx.outgoing_stack_top,
         );
         loop {
             core::hint::spin_loop();

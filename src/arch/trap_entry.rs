@@ -327,15 +327,51 @@ pub fn handle_trap_entry_shared(
                 plan.outgoing_tid,
                 plan.incoming_tid
             );
-            if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
-                crate::kernel::boot::d6_controlled_switch_proof_mark_done();
-                crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DONE");
-            }
+            let is_proof_done =
+                if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
+                    crate::kernel::boot::d6_controlled_switch_proof_mark_done();
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DONE");
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN");
+                    // Dispatch stash was consumed by take() above — re-verify empty.
+                    let dispatch_clear = unsafe {
+                        !crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan()
+                    };
+                    // First-resume stash was consumed by the trampoline — verify empty.
+                    let resume_clear = unsafe {
+                        crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx]
+                            .take()
+                            .is_none()
+                    };
+                    if dispatch_clear && resume_clear {
+                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STASH_CLEAR_OK");
+                    }
+                    // PENDING_DONE was swapped to false by take_pending_done; verify.
+                    let pending_clear =
+                        !crate::kernel::boot::D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE
+                            .load(core::sync::atomic::Ordering::Acquire);
+                    // GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE was cleared before the stash drain.
+                    let trap_path_clear = cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+                        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                            .load(core::sync::atomic::Ordering::Relaxed);
+                    if pending_clear && trap_path_clear {
+                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK");
+                    }
+                    true
+                } else {
+                    false
+                };
             // Re-acquire the global lock to restore the incoming task's arch thread
             // state (populate its trap frame with its user-mode register context).
             shared
                 .with_cpu(cpu, |kernel| {
-                    post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
+                    let result =
+                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut());
+                    if is_proof_done {
+                        #[cfg(target_arch = "x86_64")]
+                        kernel.d6_emit_proof_cleanup_arch_markers();
+                        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
+                    }
+                    result
                 })
                 .map_err(|err| TrapHandleError::Syscall(err.into()))??;
         }
