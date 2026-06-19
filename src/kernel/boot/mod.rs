@@ -623,6 +623,15 @@ pub(crate) static D6_CONTROLLED_SWITCH_PROOF_DONE: core::sync::atomic::AtomicBoo
 pub(crate) static D6_POST_CLEANUP_DIAG_PENDING: [core::sync::atomic::AtomicBool;
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+/// Stage 133: per-CPU one-shot flag set after D6 proof CLEANUP_DONE.
+/// Consumed by the x86_64 trap dispatcher on the first post-cleanup #PF,
+/// BEFORE acquiring any KernelState lock, to emit D6_PRE_LOCK_PF_DIAG_*
+/// markers with raw trap register values: actual RIP, RSP (hardware-saved),
+/// R14 (from the trap stub push), RSP-8, computed lock pointer, and a
+/// classification label (stack_push / r14_lockptr / other).
+pub(crate) static D6_PRE_LOCK_PF_DIAG_PENDING: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
 pub(crate) fn set_d6_controlled_switch_proof_enabled(enabled: bool) {
     D6_CONTROLLED_SWITCH_PROOF_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);

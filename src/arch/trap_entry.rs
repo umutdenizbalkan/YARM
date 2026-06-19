@@ -369,6 +369,9 @@ pub fn handle_trap_entry_shared(
                     if is_proof_done {
                         #[cfg(target_arch = "x86_64")]
                         kernel.d6_emit_proof_cleanup_arch_markers();
+                        // Stage 133: verify ASID 1 maps the fault page before emitting DONE.
+                        #[cfg(target_arch = "x86_64")]
+                        kernel.d6_check_asid1_stack_page_mapped();
                         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
                     }
                     result
@@ -379,6 +382,10 @@ pub fn handle_trap_entry_shared(
                 let cpu_idx_set = cpu.0 as usize;
                 if cpu_idx_set < crate::kernel::scheduler::MAX_CPUS {
                     crate::kernel::boot::D6_POST_CLEANUP_DIAG_PENDING[cpu_idx_set]
+                        .store(true, core::sync::atomic::Ordering::Release);
+                    // Stage 133: arm the pre-lock #PF register diagnostic.
+                    #[cfg(target_arch = "x86_64")]
+                    crate::kernel::boot::D6_PRE_LOCK_PF_DIAG_PENDING[cpu_idx_set]
                         .store(true, core::sync::atomic::Ordering::Release);
                 }
             }
