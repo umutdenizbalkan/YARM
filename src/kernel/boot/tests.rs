@@ -37192,3 +37192,151 @@ mod stage133_pre_lock_pf_diag {
         );
     }
 }
+
+// ===========================================================================
+// Stage 134 — Kernel stack depth / stack_base audit
+// ===========================================================================
+#[cfg(test)]
+mod stage134_kernel_stack_audit {
+    use super::Bootstrap;
+
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TRAP_RS_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+
+    // Crash-site constants (from the observed Stage 133/134 fault).
+    const OLD_KERNEL_STACK_REGION_SIZE: usize = 0x4000;
+    const OBSERVED_FAULT_PAGE: usize = 0xffff_8000_0000_b000;
+    const OBSERVED_RSP: usize = 0xffff_8000_0000_bfc0;
+    const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
+    // tid=1 was at idx=3 in the TCB array (base = REGION_BASE + 3 * 0x4000 = 0xffff80000000c000).
+    const TID1_IDX: usize = 3;
+
+    // 1. Prove fault page 0xffff80000000b000 is below the old stack base for idx=3.
+    #[test]
+    fn stage134_fault_page_below_old_stack_base() {
+        let old_base = KERNEL_STACK_REGION_BASE + TID1_IDX * OLD_KERNEL_STACK_REGION_SIZE;
+        assert!(
+            OBSERVED_FAULT_PAGE < old_base,
+            "fault page 0x{:x} must be below old stack base 0x{:x} — confirms overflow",
+            OBSERVED_FAULT_PAGE,
+            old_base
+        );
+    }
+
+    // 2. New KERNEL_STACK_REGION_SIZE must be larger than the old 16 KB.
+    #[test]
+    fn stage134_region_size_increased_beyond_16kb() {
+        assert!(
+            THREAD_STATE_SRC.contains("KERNEL_STACK_REGION_SIZE: usize = 0x8000"),
+            "KERNEL_STACK_REGION_SIZE must be increased to 0x8000 (32 KB) in thread_state.rs"
+        );
+    }
+
+    // 3. KERNEL_STACK_GUARD_SIZE declared as at least one page.
+    #[test]
+    fn stage134_guard_size_constant_is_one_page() {
+        assert!(
+            THREAD_STATE_SRC.contains("KERNEL_STACK_GUARD_SIZE"),
+            "thread_state.rs must declare KERNEL_STACK_GUARD_SIZE"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("KERNEL_STACK_GUARD_SIZE: usize = 0x1000"),
+            "KERNEL_STACK_GUARD_SIZE must equal one page (0x1000)"
+        );
+    }
+
+    // 4. New actual stack size (REGION_SIZE - GUARD_SIZE) exceeds the observed
+    //    overflow depth (old REGION_SIZE + bytes past old base).
+    #[test]
+    fn stage134_new_actual_stack_covers_observed_rsp() {
+        let new_region_size: usize = 0x8000;
+        let new_guard_size: usize = 0x1000;
+        let new_actual_stack = new_region_size - new_guard_size;
+
+        let old_base = KERNEL_STACK_REGION_BASE + TID1_IDX * OLD_KERNEL_STACK_REGION_SIZE;
+        // RSP descended 0x40 bytes below old_base at time of crash.
+        let overflow_depth = old_base - OBSERVED_RSP;
+        let required_stack_size = OLD_KERNEL_STACK_REGION_SIZE + overflow_depth;
+
+        assert!(
+            new_actual_stack > required_stack_size,
+            "new actual stack 0x{:x} must exceed required depth 0x{:x} (old_size=0x{:x} + overflow=0x{:x})",
+            new_actual_stack,
+            required_stack_size,
+            OLD_KERNEL_STACK_REGION_SIZE,
+            overflow_depth,
+        );
+    }
+
+    // 5. provision_default_kernel_context computes region_base then adds guard.
+    #[test]
+    fn stage134_provision_skips_guard_page_for_stack_base() {
+        assert!(
+            THREAD_STATE_SRC.contains("region_base"),
+            "provision_default_kernel_context must compute region_base separately from stack_base"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("KERNEL_STACK_GUARD_SIZE"),
+            "provision_default_kernel_context must add KERNEL_STACK_GUARD_SIZE to form stack_base"
+        );
+    }
+
+    // 6. KERNEL_STACK_RANGE diagnostic emitted from thread_state.rs.
+    #[test]
+    fn stage134_kernel_stack_range_diagnostic_emitted() {
+        assert!(
+            THREAD_STATE_SRC.contains("KERNEL_STACK_RANGE"),
+            "thread_state.rs must emit KERNEL_STACK_RANGE diagnostic"
+        );
+    }
+
+    // 7. KERNEL_STACK_WATERMARK diagnostic emitted from trap.rs.
+    #[test]
+    fn stage134_kernel_stack_watermark_emitted_in_trap_rs() {
+        assert!(
+            TRAP_RS_SRC.contains("KERNEL_STACK_WATERMARK"),
+            "trap.rs must emit KERNEL_STACK_WATERMARK diagnostic"
+        );
+    }
+
+    // 8. KERNEL_STACK_OVERFLOW_DETECTED diagnostic emitted from trap.rs.
+    #[test]
+    fn stage134_kernel_stack_overflow_detected_emitted_in_trap_rs() {
+        assert!(
+            TRAP_RS_SRC.contains("KERNEL_STACK_OVERFLOW_DETECTED"),
+            "trap.rs must emit KERNEL_STACK_OVERFLOW_DETECTED diagnostic"
+        );
+    }
+
+    // 9. Functional: provision_default_kernel_context places stack_base one guard
+    //    page above the region boundary and gives stack size = REGION_SIZE - GUARD.
+    #[test]
+    fn stage134_provisioned_stack_base_skips_guard_page() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(300).expect("register task 300");
+        let ctx = state.thread_kernel_context(300).expect("context");
+        let base = ctx.stack_base.expect("stack_base set").0 as usize;
+        let top = ctx.stack_top.expect("stack_top set").0 as usize;
+
+        let new_region_size: usize = 0x8000;
+        let new_guard_size: usize = 0x1000;
+
+        // base must be at guard_size offset within its region slot.
+        assert_eq!(
+            base % new_region_size,
+            new_guard_size,
+            "stack_base 0x{:x} must be offset from region start by guard_size 0x{:x}",
+            base,
+            new_guard_size
+        );
+        // Actual mapped stack = REGION_SIZE - GUARD_SIZE.
+        assert_eq!(
+            top - base,
+            new_region_size - new_guard_size,
+            "actual stack size 0x{:x} must equal region_size(0x{:x}) - guard_size(0x{:x})",
+            top - base,
+            new_region_size,
+            new_guard_size
+        );
+    }
+}

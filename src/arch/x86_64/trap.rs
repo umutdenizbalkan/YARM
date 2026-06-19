@@ -243,6 +243,10 @@ fn d6_emit_post_cleanup_first_trap_diag(
     } else {
         "unknown"
     };
+    // Stage 134: stack watermark — cr2 is the fault address and serves as
+    // an approximate lower bound on where RSP was (RSP <= cr2 + small offset).
+    let stack_used = stack_top.saturating_sub(cr2);
+    let stack_limit = stack_top.saturating_sub(stack_base);
     crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_BEGIN");
     crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_VECTOR value=0x{:x}", vector);
     crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_ERROR value=0x{:x}", error_code);
@@ -274,6 +278,21 @@ fn d6_emit_post_cleanup_first_trap_diag(
         "D6_POST_CLEANUP_FIRST_TRAP_STACK_CLASS class={}",
         stack_class
     );
+    crate::yarm_log!(
+        "KERNEL_STACK_WATERMARK tid={} rsp=0x{:x} used={} limit={}",
+        current_tid,
+        cr2,
+        stack_used,
+        stack_limit
+    );
+    if cr2 < stack_base {
+        crate::yarm_log!(
+            "KERNEL_STACK_OVERFLOW_DETECTED tid={} rsp=0x{:x} base=0x{:x}",
+            current_tid,
+            cr2,
+            stack_base
+        );
+    }
     crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_DONE");
 }
 
