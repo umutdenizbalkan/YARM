@@ -170,9 +170,13 @@ impl KernelState {
     pub fn block_current_cpu(&mut self) -> Option<u64> {
         let cpu = self.current_cpu();
         let mut sched = self.scheduler_state();
-        kernel_mut(&mut sched.scheduler)
+        let blocked = kernel_mut(&mut sched.scheduler)
             .block_current_on(cpu)
-            .map(|tid| tid.0)
+            .map(|tid| tid.0);
+        if blocked.is_some() {
+            sched.timer.reset_quantum();
+        }
+        blocked
     }
 
     pub fn enqueue_current_cpu(&mut self, tid: u64) -> Result<(), KernelError> {
