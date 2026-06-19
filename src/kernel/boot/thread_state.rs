@@ -11,8 +11,16 @@ use crate::kernel::task::{
 use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::Asid;
 
-const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
-const KERNEL_STACK_REGION_SIZE: usize = 0x4000;
+pub(crate) const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
+/// Stage 134: increased from 0x4000 (16 KB) to 0x8000 (32 KB) per slot to
+/// accommodate the handle_trap → syscall → spawn → create_user_space call
+/// chain that overflowed a 16 KB stack by ~0x40 bytes (RSP descended to
+/// 0xffff80000000bfc0, 0x40 below the old base 0xffff80000000c000).
+pub(crate) const KERNEL_STACK_REGION_SIZE: usize = 0x8000;
+/// Stage 134: one unmapped guard page at the bottom of every kernel-switch-
+/// stack region.  `provision_default_kernel_context` sets stack_base =
+/// region_base + KERNEL_STACK_GUARD_SIZE so the guard is never backed.
+pub(crate) const KERNEL_STACK_GUARD_SIZE: usize = 0x1000;
 const USER_STACK_STRIDE_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
 const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
@@ -1074,13 +1082,26 @@ impl KernelState {
             })
             .ok_or(KernelError::TaskMissing)?;
 
-        let stack_base = KERNEL_STACK_REGION_BASE
+        // Stage 134: compute region_base separately so the guard page offset
+        // (KERNEL_STACK_GUARD_SIZE) can be applied.  The region layout is:
+        //   [region_base,  region_base + GUARD)  → unmapped guard page
+        //   [region_base + GUARD, region_base + REGION_SIZE)  → mapped stack
+        let region_base = KERNEL_STACK_REGION_BASE
             .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
             .ok_or(KernelError::VmFull)?;
-        let stack_top = stack_base
+        let stack_base = region_base
+            .checked_add(KERNEL_STACK_GUARD_SIZE)
+            .ok_or(KernelError::VmFull)?;
+        let stack_top = region_base
             .checked_add(KERNEL_STACK_REGION_SIZE)
             .ok_or(KernelError::VmFull)?;
         self.set_thread_kernel_stack(tid, stack_base, stack_top)?;
+        crate::yarm_log!(
+            "KERNEL_STACK_RANGE tid={} base=0x{:x} top=0x{:x}",
+            tid,
+            stack_base,
+            stack_top
+        );
 
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
