@@ -800,7 +800,11 @@ impl PhysicalFrameAllocator {
     }
 }
 
-static PT_FRAME_ALLOCATOR: SpinLockIrq<Option<PhysicalFrameAllocator>> = SpinLockIrq::new(None);
+// Stage 135: static holds an uninitialized PhysicalFrameAllocator in .bss;
+// ensure_pt_allocator_initialized calls init_from_memory_map in-place, avoiding
+// the ~209 KB stack frame that a local `let mut allocator = new_uninit()` would create.
+static PT_FRAME_ALLOCATOR: SpinLockIrq<PhysicalFrameAllocator> =
+    SpinLockIrq::new(PhysicalFrameAllocator::new_uninit());
 
 const MAX_GLOBAL_RESERVED: usize = 12;
 
@@ -923,29 +927,26 @@ fn default_pt_allocator_regions() -> [MemoryRegion; 1] {
 
 fn ensure_pt_allocator_initialized() -> Result<(), FrameAllocError> {
     let mut guard = PT_FRAME_ALLOCATOR.lock();
-    if guard.is_some() {
+    if guard.initialized {
         return Ok(());
     }
-    let mut allocator = PhysicalFrameAllocator::new_uninit();
-    allocator.init_from_memory_map(&default_pt_allocator_regions())?;
-    *guard = Some(allocator);
+    crate::yarm_log!("PT_ALLOCATOR_INIT_BEGIN");
+    // PT_ALLOCATOR_INIT_NO_STACK_SCRATCH: init runs in-place on static storage;
+    // no local PhysicalFrameAllocator is constructed on the stack.
+    guard.init_from_memory_map(&default_pt_allocator_regions())?;
+    crate::yarm_log!("PT_ALLOCATOR_INIT_NO_STACK_SCRATCH");
+    crate::yarm_log!("PT_ALLOCATOR_INIT_DONE");
     Ok(())
 }
 
 pub fn init_pt_frame_allocator(regions: &[MemoryRegion]) -> Result<(), FrameAllocError> {
-    let mut allocator = PhysicalFrameAllocator::new_uninit();
-    allocator.init_from_memory_map(regions)?;
-    *PT_FRAME_ALLOCATOR.lock() = Some(allocator);
-    Ok(())
+    PT_FRAME_ALLOCATOR.lock().init_from_memory_map(regions)
 }
 
 pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
     ensure_pt_allocator_initialized()?;
     let mut guard = PT_FRAME_ALLOCATOR.lock();
-    let pa = guard
-        .as_mut()
-        .ok_or(FrameAllocError::Uninitialized)?
-        .alloc_frame()?;
+    let pa = guard.alloc_frame()?;
     #[cfg(all(not(feature = "hosted-dev"), feature = "trace_frame_alloc"))]
     crate::yarm_log!("PT_ALLOC_FRAME pa=0x{:x}", pa);
     Ok(pa)
@@ -956,20 +957,12 @@ pub fn alloc_pt_contiguous_frames(pages: usize) -> Result<u64, FrameAllocError> 
         return Err(FrameAllocError::InvalidMemoryMap);
     }
     ensure_pt_allocator_initialized()?;
-    let mut guard = PT_FRAME_ALLOCATOR.lock();
-    guard
-        .as_mut()
-        .ok_or(FrameAllocError::Uninitialized)?
-        .alloc_contiguous(pages)
+    PT_FRAME_ALLOCATOR.lock().alloc_contiguous(pages)
 }
 
 pub fn free_pt_frame(phys: u64) -> Result<(), FrameAllocError> {
     ensure_pt_allocator_initialized()?;
-    let mut guard = PT_FRAME_ALLOCATOR.lock();
-    guard
-        .as_mut()
-        .ok_or(FrameAllocError::Uninitialized)?
-        .free_frame(phys)
+    PT_FRAME_ALLOCATOR.lock().free_frame(phys)
 }
 
 pub fn free_pt_contiguous_frames(base_phys: u64, pages: usize) -> Result<(), FrameAllocError> {
@@ -977,11 +970,7 @@ pub fn free_pt_contiguous_frames(base_phys: u64, pages: usize) -> Result<(), Fra
         return Err(FrameAllocError::InvalidMemoryMap);
     }
     ensure_pt_allocator_initialized()?;
-    let mut guard = PT_FRAME_ALLOCATOR.lock();
-    guard
-        .as_mut()
-        .ok_or(FrameAllocError::Uninitialized)?
-        .free_contiguous(base_phys, pages)
+    PT_FRAME_ALLOCATOR.lock().free_contiguous(base_phys, pages)
 }
 
 const fn align_down(value: u64) -> u64 {

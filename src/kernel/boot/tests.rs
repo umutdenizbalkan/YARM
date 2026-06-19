@@ -37340,3 +37340,137 @@ mod stage134_kernel_stack_audit {
         );
     }
 }
+
+// ===========================================================================
+// Stage 135 — Remove huge stack frame in ensure_pt_allocator_initialized
+// ===========================================================================
+#[cfg(test)]
+mod stage135_pt_allocator_no_stack_scratch {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const FRAME_ALLOC_SRC: &str = include_str!("../frame_allocator.rs");
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+
+    // 1. ensure_pt_allocator_initialized must not create a local PhysicalFrameAllocator.
+    //    The old pattern `let mut allocator = PhysicalFrameAllocator::new_uninit()` inside
+    //    ensure_pt_allocator_initialized caused a ~209 KB stack frame (subq $0x33140, %rsp).
+    #[test]
+    fn stage135_no_local_pfa_in_ensure_pt_initialized() {
+        // The source must not contain the large-stack anti-pattern as a local variable
+        // inside ensure_pt_allocator_initialized.  We detect this by checking that
+        // the static initializer uses new_uninit() but the function body does not re-create one.
+        let fn_start = FRAME_ALLOC_SRC
+            .find("fn ensure_pt_allocator_initialized")
+            .expect("ensure_pt_allocator_initialized must exist");
+        // Find the closing brace of the function (next `}` on its own line after the fn).
+        let fn_body_start = fn_start
+            + FRAME_ALLOC_SRC[fn_start..]
+                .find('{')
+                .expect("opening brace");
+        let fn_body = &FRAME_ALLOC_SRC[fn_body_start..];
+        // The function body must not contain `PhysicalFrameAllocator::new_uninit()` as
+        // a local binding — that is the large-stack anti-pattern we removed in Stage 135.
+        assert!(
+            !fn_body[..fn_body.find('}').unwrap_or(fn_body.len())]
+                .contains("let mut allocator = PhysicalFrameAllocator::new_uninit()"),
+            "ensure_pt_allocator_initialized must not create a local PhysicalFrameAllocator"
+        );
+    }
+
+    // 2. PT_FRAME_ALLOCATOR static must hold PhysicalFrameAllocator directly (no Option).
+    #[test]
+    fn stage135_pt_frame_allocator_static_not_option() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("SpinLockIrq<PhysicalFrameAllocator>"),
+            "PT_FRAME_ALLOCATOR must be SpinLockIrq<PhysicalFrameAllocator> (not Option)"
+        );
+        assert!(
+            !FRAME_ALLOC_SRC.contains("SpinLockIrq<Option<PhysicalFrameAllocator>>"),
+            "PT_FRAME_ALLOCATOR must not wrap PhysicalFrameAllocator in Option after Stage 135"
+        );
+    }
+
+    // 3. PT_ALLOCATOR_INIT_BEGIN marker must be present.
+    #[test]
+    fn stage135_pt_allocator_init_begin_marker() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("PT_ALLOCATOR_INIT_BEGIN"),
+            "frame_allocator.rs must emit PT_ALLOCATOR_INIT_BEGIN"
+        );
+    }
+
+    // 4. PT_ALLOCATOR_INIT_NO_STACK_SCRATCH marker must be present.
+    #[test]
+    fn stage135_pt_allocator_init_no_stack_scratch_marker() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("PT_ALLOCATOR_INIT_NO_STACK_SCRATCH"),
+            "frame_allocator.rs must emit PT_ALLOCATOR_INIT_NO_STACK_SCRATCH"
+        );
+    }
+
+    // 5. PT_ALLOCATOR_INIT_DONE marker must be present.
+    #[test]
+    fn stage135_pt_allocator_init_done_marker() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("PT_ALLOCATOR_INIT_DONE"),
+            "frame_allocator.rs must emit PT_ALLOCATOR_INIT_DONE"
+        );
+    }
+
+    // 6. Stage 134 stack constants remain sane.
+    #[test]
+    fn stage135_stage134_constants_sane() {
+        use crate::kernel::boot::thread_state::{
+            KERNEL_STACK_GUARD_SIZE, KERNEL_STACK_REGION_SIZE,
+        };
+        assert_eq!(
+            KERNEL_STACK_REGION_SIZE, 0x8000,
+            "Stage 134 increased KERNEL_STACK_REGION_SIZE to 32 KB"
+        );
+        assert_eq!(
+            KERNEL_STACK_GUARD_SIZE, 0x1000,
+            "Stage 134 guard page must be exactly one page"
+        );
+        // Usable stack = REGION_SIZE - GUARD_SIZE must be at least 24 KB.
+        assert!(
+            KERNEL_STACK_REGION_SIZE - KERNEL_STACK_GUARD_SIZE >= 24 * 1024,
+            "usable kernel stack must be at least 24 KB"
+        );
+        // Check that the thread_state source still carries the Stage 134 constants.
+        assert!(
+            THREAD_STATE_SRC.contains("KERNEL_STACK_REGION_SIZE"),
+            "thread_state.rs must define KERNEL_STACK_REGION_SIZE"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("KERNEL_STACK_GUARD_SIZE"),
+            "thread_state.rs must define KERNEL_STACK_GUARD_SIZE"
+        );
+    }
+
+    // 7. D6 switch-proof mode must remain default-off (gated by boot knob).
+    #[test]
+    fn stage135_d6_proof_default_off() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled"),
+            "d6_switch_proof must be an Optional boot knob (default-off)"
+        );
+    }
+
+    // 8. SYSCALL_COUNT must remain 31.
+    #[test]
+    fn stage135_syscall_count_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 135 must not change SYSCALL_COUNT");
+    }
+
+    // 9. Syscall::VARIANT_COUNT must remain 23.
+    #[test]
+    fn stage135_syscall_variant_count_unchanged() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 135 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}
