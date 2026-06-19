@@ -35346,6 +35346,262 @@ mod stage127_target_asid_switch_stack_mapping {
 }
 
 // ===========================================================================
+// Stage 129 — active-root switch-stack mapping repair / VmFull fix
+// ==========================================================================
+#[cfg(test)]
+mod stage129_active_root_repair {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn active_check_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("Stage 128/129 proof-time active-root guard with on-demand repair")
+            .expect("Stage 129 active-root guard");
+        let end = THREAD_STATE_SRC[start..]
+            .find("#[cfg(any(not(target_arch = \"x86_64\"), test))]")
+            .map(|offset| start + offset)
+            .expect("fallback cfg after active-root guard");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn init_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .expect("init helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub(crate) fn provision_default_kernel_context")
+            .map(|offset| start + offset)
+            .expect("next helper");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    // 1. Active-root repair path does not rely on user VM capacity.
+    #[test]
+    fn stage129_active_root_repair_bypasses_user_vm_accounting() {
+        let active = active_check_source();
+        // The repair uses page_table::map_page directly — not user VM region
+        // accounting via with_user_spaces_mut or map_user_page.
+        assert!(
+            active.contains("page_table::map_page(")
+                && active.contains("PhysAddr(phys)")
+                && active.contains("PageFlags::KERNEL_RW"),
+            "active-root repair must use page_table::map_page directly, not user VM accounting"
+        );
+        assert!(
+            !active.contains("map_user_page")
+                && !active.contains("with_user_spaces_mut")
+                && !active.contains("USER_RW")
+                && !active.contains("USER_RX"),
+            "active-root repair must not use user VM region helpers"
+        );
+    }
+
+    // 2. VmFull source is classified, not opaque.
+    #[test]
+    fn stage129_vmfull_source_is_classified() {
+        let active = active_check_source();
+        assert!(
+            active.contains("page_table_capacity")
+                && active.contains("page_table_invalid_addr")
+                && active.contains("target_not_mapped")
+                && active.contains("target_asid_missing"),
+            "Stage 129 must classify VmFull source: page_table_capacity, page_table_invalid_addr, target_not_mapped, target_asid_missing"
+        );
+    }
+
+    // 3. Helper maps only the page containing stack_top - 8.
+    #[test]
+    fn stage129_maps_only_probe_page() {
+        let active = active_check_source();
+        // Must use fake_return_probe / probe_page (top - 8), not the full arena.
+        assert!(
+            active.contains("fake_return_probe")
+                && active.contains("probe_page = fake_return_probe")
+                && active.contains("stack_page = VirtAddr(probe_page as u64)"),
+            "Stage 129 active-root repair must map exactly the page containing stack_top - 8"
+        );
+        assert!(
+            !active.contains("KERNEL_STACK_REGION_SIZE"),
+            "Stage 129 must not map the full kernel-stack arena"
+        );
+    }
+
+    // 4. Mapping flags are kernel-only, writable, non-user.
+    #[test]
+    fn stage129_mapping_flags_are_kernel_only_writable() {
+        let active = active_check_source();
+        assert!(
+            active.contains("PageFlags::KERNEL_RW"),
+            "Stage 129 active-root repair must use PageFlags::KERNEL_RW"
+        );
+        // Verify user bit rejection after map.
+        assert!(
+            active.contains("PageTableEntry::WRITABLE")
+                && active.contains("PageTableEntry::USER")
+                && active.contains("user_accessible"),
+            "Stage 129 must check WRITABLE and reject USER flag after repair"
+        );
+    }
+
+    // 5. Existing correct PTE is accepted idempotently.
+    #[test]
+    fn stage129_existing_correct_pte_accepted_idempotently() {
+        let active = active_check_source();
+        // The early fast-path check handles already-mapped-correctly case.
+        assert!(
+            active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK")
+                && active.contains("return Ok(())"),
+            "Stage 129 must accept existing correct PTE idempotently before attempting repair"
+        );
+        // The match arm checks both WRITABLE and !USER.
+        assert!(
+            active.contains("(entry.0 & PageTableEntry::WRITABLE) != 0")
+                && active.contains("(entry.0 & PageTableEntry::USER) == 0"),
+            "Stage 129 idempotent check must verify WRITABLE and not USER"
+        );
+    }
+
+    // 6. Existing user-accessible PTE is rejected.
+    #[test]
+    fn stage129_existing_user_accessible_pte_is_rejected() {
+        let active = active_check_source();
+        assert!(
+            active.contains("user_accessible")
+                && active.contains("return Err(KernelError::VmFull)"),
+            "Stage 129 must reject existing user-accessible PTE"
+        );
+    }
+
+    // 7. Active/outgoing ASID is checked before stashing the proof plan.
+    #[test]
+    fn stage129_active_asid_checked_before_proof_stash() {
+        let proof = EXEC_STATE_SRC;
+        let active_check = proof
+            .find("ensure_active_root_can_use_kernel_switch_stack(incoming_tid)")
+            .expect("active-root guard call in proof path");
+        let stash = proof
+            .find("self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?")
+            .expect("proof stash call");
+        assert!(
+            active_check < stash,
+            "Stage 129 active-root check must precede the proof stash call"
+        );
+        assert!(
+            proof.contains("reason=active_stack_unmapped"),
+            "Proof must emit active_stack_unmapped deferral when check fails"
+        );
+    }
+
+    // 8. Repeated proof attempts do not endlessly spam identical mapping failures.
+    #[test]
+    fn stage129_one_shot_failure_flag_prevents_log_spam() {
+        let active = active_check_source();
+        assert!(
+            active.contains("ACTIVE_ROOT_REPAIR_FAILED")
+                && active.contains("load(Ordering::Relaxed)")
+                && active.contains("store(true, Ordering::Relaxed)"),
+            "Stage 129 must use a one-shot AtomicBool to prevent repeated failure log spam"
+        );
+    }
+
+    // 9. initialized=true remains gated on mapping proof.
+    #[test]
+    fn stage129_initialized_gated_on_mapping_proof() {
+        let init = init_source();
+        assert!(
+            init.find("self.ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)?")
+                < init.find("tcb.kernel_context.initialized = true"),
+            "initialized=true must remain gated on ensure_kernel_switch_stack_mapped"
+        );
+    }
+
+    // 10. Stage 125 bridge markers remain intact.
+    #[test]
+    fn stage129_stage125_bridge_markers_intact() {
+        assert!(
+            THREAD_STATE_SRC.contains("!RB")
+                && THREAD_STATE_SRC.contains("!RJ")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real"),
+            "Stage 125 bridge markers and path must remain intact"
+        );
+    }
+
+    // 11. Stage 120 proof remains default-off.
+    #[test]
+    fn stage129_proof_remains_default_off() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)")
+                && !BOOT_CMDLINE_SRC.contains("d6_switch_proof: Some(true)"),
+            "Stage 120 proof must remain default-off"
+        );
+    }
+
+    // 12. switch_frames ABI unchanged.
+    #[test]
+    fn stage129_switch_frames_abi_unchanged() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, mem::forget must remain unchanged"
+        );
+    }
+
+    // 13/14. No lock handoff / mem::forget / assembly unlock callback.
+    #[test]
+    fn stage129_no_forbidden_patterns() {
+        assert!(
+            !THREAD_STATE_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("unlock_callback"),
+            "Stage 129 must not add mem::forget or assembly unlock callback"
+        );
+    }
+
+    // 15. AArch64/RISC-V untouched.
+    #[test]
+    fn stage129_aarch64_riscv_untouched() {
+        assert!(
+            !AARCH64_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE")
+                && !RISCV_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE"),
+            "AArch64/RISC-V paths must not be touched by Stage 129 x86_64 active-root repair"
+        );
+    }
+
+    // 16/17/18. D4 modules, SYSCALL_COUNT, and VARIANT_COUNT unchanged.
+    #[test]
+    fn stage129_d4_modules_and_syscall_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod sched;"),
+            "D4 modules and syscall counts must remain unchanged"
+        );
+    }
+
+    // New markers present.
+    #[test]
+    fn stage129_new_markers_present() {
+        let active = active_check_source();
+        assert!(
+            active.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_BEGIN")
+                && active.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DONE")
+                && active.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED")
+                && active.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED"),
+            "Stage 129 must emit MAP_ACTIVE_BEGIN, MAP_ACTIVE_DONE, MAP_ACTIVE_FAILED, MAP_ACTIVE_DEFERRED markers"
+        );
+    }
+}
+
 // Stage 128 — x86_64 switch-stack mapping covers active CR3 roots
 // ==========================================================================
 #[cfg(test)]
@@ -35370,9 +35626,11 @@ mod stage128_active_cr3_switch_stack_mapping {
     }
 
     fn active_check_source() -> &'static str {
+        // Stage 129 updated the doc comment; search for the stable substring that
+        // appears in both Stage 128 and Stage 128/129 guard doc comments.
         let start = THREAD_STATE_SRC
-            .find("Stage 128 proof-time active-root guard")
-            .expect("Stage 128 active-root guard");
+            .find("proof-time active-root guard")
+            .expect("Stage 128/129 active-root guard");
         let end = THREAD_STATE_SRC[start..]
             .find("#[cfg(any(not(target_arch = \"x86_64\"), test))]")
             .map(|offset| start + offset)

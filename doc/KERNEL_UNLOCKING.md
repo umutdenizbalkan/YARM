@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate, Stage 127 target-ASID stack mapping retry, Stage 128 active-CR3 shared switch-stack coverage)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate, Stage 127 target-ASID stack mapping retry, Stage 128 active-CR3 shared switch-stack coverage, Stage 129 active-root VmFull on-demand repair)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -42,7 +42,7 @@ Directive labels are stable across stages:
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
 | **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 | D4 steps 1–4 complete: `recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`; rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs` pending (§7) |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
-| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page; Stage 127 corrects that gate to map/check the target task ASID/root and retries after ASID binding instead of depending on temporal active-ASID presence; Stage 128 strengthens the invariant again by mapping/checking the incoming switch-stack page in every existing task root that may be the active/outgoing CR3 during `switch_frames`, plus an active-root proof check before stashing; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
+| **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page; Stage 127 corrects that gate to map/check the target task ASID/root and retries after ASID binding instead of depending on temporal active-ASID presence; Stage 128 strengthens the invariant again by mapping/checking the incoming switch-stack page in every existing task root that may be the active/outgoing CR3 during `switch_frames`, plus an active-root proof check before stashing; Stage 129 fixes the VmFull capacity-blocker by adding on-demand repair in the active-root guard when the active ASID was created after the incoming stack was initialized; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
 
 ### Milestone 1 — Stage 106 acceptance
@@ -1844,6 +1844,72 @@ pin the CR3 audit, active-root proof check before stashing, shared-root one-page
 mapping, kernel-only writable flags, `initialized=true` gate, Stage 125 bridge
 markers, default-off proof gating, AArch64/RISC-V non-impact, D4 module
 preservation, and `SYSCALL_COUNT == 31` / `Syscall::VARIANT_COUNT == 23`.
+
+### Stage 129 — fix x86_64 active-root switch-stack mapping VmFull / capacity blocker
+
+**Status: Outcome A-source (QEMU validation pending user/local run).** Stage 128
+strengthened the invariant so the proof safely deferred with
+`D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=active_stack_unmapped outgoing=1 incoming=2 err=VmFull`
+instead of faulting. Stage 129 fixes the underlying blocker.
+
+**Local diagnostic.** The deferred log showed:
+```text
+D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=active_stack_unmapped outgoing=1 incoming=2 err=VmFull
+```
+`ensure_active_root_can_use_kernel_switch_stack()` called `resolve_page(active_asid=1, stack_page=0xffff800000007ff8)`, got `None`, and returned `KernelError::VmFull` — not a true capacity error, but the fallback error code for "page not found."
+
+**Root cause.** ASID 1 (the outgoing task's root) was created *after*
+`initialize_thread_kernel_switch_frame(tid=2)` ran. The Stage 128 shared-root
+loop maps the incoming switch-stack page into all existing task roots, but ASID 1
+did not exist at that time, so it was never included.
+
+**Fix.** `ensure_active_root_can_use_kernel_switch_stack()` now performs on-demand
+repair when `resolve_page(active_asid, stack_page)` returns `None`:
+
+1. Look up the physical address from the target ASID (`task_asid(incoming_tid)`)
+   via `resolve_page(target_asid, stack_page)` — the target was properly mapped at
+   init time.
+2. Call `page_table::map_page(active_asid, stack_page, PhysAddr(phys), PageFlags::KERNEL_RW)`
+   directly, bypassing user VM-region accounting.
+3. Verify with a second `resolve_page` call that the PTE is now writable and
+   supervisor-only.
+4. If repair succeeds, emit `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DONE` and return OK.
+5. If repair fails, classify the error (`page_table_capacity`, `page_table_invalid_addr`,
+   `target_not_mapped`, `target_asid_missing`), set a one-shot `ACTIVE_ROOT_REPAIR_FAILED`
+   `AtomicBool` to prevent log spam, emit `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED` /
+   `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED`, and return `Err(VmFull)`.
+
+The fast path (correct PTE already present) returns OK immediately without repair
+(idempotent). Wrong-flags PTEs (non-writable or user-accessible) reject with a
+classified reason without attempting repair.
+
+**Strengthened invariant.** After Stage 129 the active-root guard can self-heal
+the case where the active/outgoing ASID was created after the incoming task's
+switch-stack was initialized, eliminating the `VmFull` capacity-blocker deferral
+for normal task orderings.
+
+**Markers.** Stage 129 keeps all Stage 126/127/128 markers and adds:
+
+- `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_BEGIN tid=... active_asid=... probe=0x...`
+- `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DONE tid=... active_asid=... probe=0x...`
+- `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED tid=... active_asid=... probe=0x... reason=...`
+- `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED tid=... active_asid=... probe=0x... reason=...`
+- `D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK tid=... active_asid=... probe=0x...` (refined — now emitted after successful repair too)
+
+**Hard boundaries preserved:** x86_64 proof/default-off path only; no
+`switch_frames` ABI change, scheduler policy change, timer/preemption change, AP
+scheduler-online, per-CPU runqueue change, lock handoff, `mem::forget`, assembly
+unlock callback, ABI/syscall/image-ID/service/FS-gate change, broad full-stack-
+region mapping, user-accessible stack mapping, or AArch64/RISC-V behavior change.
+`SYSCALL_COUNT == 31`, `Syscall::VARIANT_COUNT == 23`.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained a `stage129_active_root_repair`
+module (18 tests) covering: bypasses user VM accounting, VmFull source classified,
+maps only the probe page, kernel-only writable flags, idempotent PTE acceptance,
+user-accessible PTE rejection, active ASID checked before stash, one-shot
+`ACTIVE_ROOT_REPAIR_FAILED` flag, initialized gate, bridge markers, default-off
+proof, `switch_frames` ABI unchanged, no forbidden patterns, AArch64/RISC-V
+untouched, D4/syscall counts, new Stage 129 markers present in source.
 
 ## 2. Live paths and fallbacks
 

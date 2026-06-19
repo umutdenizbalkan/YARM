@@ -562,20 +562,37 @@ impl KernelState {
         Ok(())
     }
 
-    /// Stage 128 proof-time active-root guard.
+    /// Stage 128/129 proof-time active-root guard with on-demand repair.
     ///
     /// `switch_frames` switches callee-saved registers and the kernel stack; it
     /// does not switch CR3. The Stage 120 proof therefore checks the incoming
     /// switch-stack page against `hal.active_asid()` before dropping the global
     /// lock, proving the stack is visible in the root that is active at the
     /// bridge `callq` return-address push.
+    ///
+    /// Stage 129: when the active/outgoing ASID does not have the page mapped
+    /// (e.g., because it was created after `ensure_kernel_switch_stack_mapped`
+    /// ran its shared-root loop), attempt a direct page-table repair using the
+    /// physical frame already installed in the target ASID. This bypasses user
+    /// VM-region capacity accounting because kernel-half switch-stack pages are
+    /// not user-space VM regions.
     #[cfg(all(target_arch = "x86_64", not(test)))]
     pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
         &mut self,
         tid: u64,
     ) -> Result<(), KernelError> {
-        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
-        use crate::kernel::vm::{PAGE_SIZE, VirtAddr};
+        use core::sync::atomic::Ordering;
+
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry, PageTableError};
+        use crate::kernel::vm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+        // One-shot flag: if a prior repair attempt failed permanently (capacity
+        // or invalid-address error), skip the repair on subsequent proof calls to
+        // avoid spamming the log.  Success resets nothing — the page stays mapped,
+        // so future calls see ACTIVE_CHECK_OK before reaching this flag check.
+        #[cfg(all(target_arch = "x86_64", not(test)))]
+        static ACTIVE_ROOT_REPAIR_FAILED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
 
         let active_asid = self.hal.active_asid();
         let cr3 = active_asid.and_then(page_table::cr3_for_asid).unwrap_or(0);
@@ -625,24 +642,198 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
         let stack_page = VirtAddr(probe_page as u64);
+
+        // --- Check whether the page is already correctly mapped. --------------
+        match page_table::resolve_page(active_asid, stack_page) {
+            Some(entry)
+                if (entry.0 & PageTableEntry::WRITABLE) != 0
+                    && (entry.0 & PageTableEntry::USER) == 0 =>
+            {
+                // Already mapped with correct kernel-only writable flags.
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK tid={} active_asid={} probe=0x{:x}",
+                    tid,
+                    active_asid.0,
+                    fake_return_probe
+                );
+                return Ok(());
+            }
+            Some(entry) => {
+                // Page exists but flags are wrong: user-accessible or not writable.
+                // Reject — do not overwrite a mapping with unexpected permissions.
+                let reason = if (entry.0 & PageTableEntry::USER) != 0 {
+                    "user_accessible"
+                } else {
+                    "not_writable"
+                };
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason={}",
+                    tid,
+                    active_asid.0,
+                    fake_return_probe,
+                    reason
+                );
+                return Err(KernelError::VmFull);
+            }
+            None => {
+                // Not mapped in the active ASID.  Stage 129: attempt repair.
+            }
+        }
+
+        // --- Stage 129: active-root repair. ----------------------------------
+        // The page is missing from ASID `active_asid`.  This happens when ASID
+        // `active_asid` was created after `ensure_kernel_switch_stack_mapped`
+        // ran its shared-root loop for `tid`, so the loop never included it.
+        //
+        // Obtain the physical frame address from the target ASID (the incoming
+        // task's own root, which was the mapping authority at init time) and
+        // install it directly in `active_asid`'s page tables.  This is a direct
+        // page-table write — no user VM-region capacity accounting is involved.
+
+        if ACTIVE_ROOT_REPAIR_FAILED.load(Ordering::Relaxed) {
+            // A prior repair attempt for this session failed permanently.
+            // Return the same error without re-logging to avoid log spam.
+            return Err(KernelError::VmFull);
+        }
+
+        // Get the target ASID (incoming task's address space).
+        let target_asid = match self.task_asid(tid) {
+            Some(asid) => asid,
+            None => {
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED tid={} active_asid={} va=0x{:x} reason=target_asid_missing",
+                    tid,
+                    active_asid.0,
+                    probe_page
+                );
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED reason=target_asid_missing tid={} active_asid={}",
+                    tid,
+                    active_asid.0
+                );
+                ACTIVE_ROOT_REPAIR_FAILED.store(true, Ordering::Relaxed);
+                return Err(KernelError::UserMemoryFault);
+            }
+        };
+
+        // Resolve the physical address from the target ASID's page table.
+        let phys = match page_table::resolve_page(target_asid, stack_page) {
+            Some(e)
+                if (e.0 & PageTableEntry::WRITABLE) != 0 && (e.0 & PageTableEntry::USER) == 0 =>
+            {
+                e.addr()
+            }
+            Some(e) => {
+                let reason = if (e.0 & PageTableEntry::USER) != 0 {
+                    "user_vm_capacity"
+                } else {
+                    "target_not_writable"
+                };
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED tid={} active_asid={} va=0x{:x} reason={}",
+                    tid,
+                    active_asid.0,
+                    probe_page,
+                    reason
+                );
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED reason={} tid={} active_asid={}",
+                    reason,
+                    tid,
+                    active_asid.0
+                );
+                ACTIVE_ROOT_REPAIR_FAILED.store(true, Ordering::Relaxed);
+                return Err(KernelError::VmFull);
+            }
+            None => {
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED tid={} active_asid={} va=0x{:x} reason=target_not_mapped",
+                    tid,
+                    active_asid.0,
+                    probe_page
+                );
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED reason=target_not_mapped tid={} active_asid={}",
+                    tid,
+                    active_asid.0
+                );
+                ACTIVE_ROOT_REPAIR_FAILED.store(true, Ordering::Relaxed);
+                return Err(KernelError::VmFull);
+            }
+        };
+
+        // Map the exact page containing stack_top - 8 into the active ASID.
+        // Flags: supervisor (kernel-only), writable, not user-accessible.
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_BEGIN tid={} active_asid={} va=0x{:x}",
+            tid,
+            active_asid.0,
+            probe_page
+        );
+        match page_table::map_page(
+            active_asid,
+            stack_page,
+            PhysAddr(phys),
+            PageFlags::KERNEL_RW,
+        ) {
+            Ok(_) => {}
+            Err(err) => {
+                let reason = match err {
+                    PageTableError::OutOfMemory => "page_table_capacity",
+                    PageTableError::InvalidAddress => "page_table_invalid_addr",
+                };
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED tid={} active_asid={} va=0x{:x} reason={}",
+                    tid,
+                    active_asid.0,
+                    probe_page,
+                    reason
+                );
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED reason={} tid={} active_asid={}",
+                    reason,
+                    tid,
+                    active_asid.0
+                );
+                ACTIVE_ROOT_REPAIR_FAILED.store(true, Ordering::Relaxed);
+                return Err(KernelError::VmFull);
+            }
+        }
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DONE tid={} active_asid={} va=0x{:x}",
+            tid,
+            active_asid.0,
+            probe_page
+        );
+
+        // Verify the repair: re-resolve and confirm supervisor-only writable flags.
         let Some(entry) = page_table::resolve_page(active_asid, stack_page) else {
             crate::yarm_log!(
-                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=not_mapped",
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=verify_after_map_failed",
                 tid,
                 active_asid.0,
                 fake_return_probe
             );
+            ACTIVE_ROOT_REPAIR_FAILED.store(true, Ordering::Relaxed);
             return Err(KernelError::VmFull);
         };
         if (entry.0 & PageTableEntry::WRITABLE) == 0 || (entry.0 & PageTableEntry::USER) != 0 {
+            let reason = if (entry.0 & PageTableEntry::USER) != 0 {
+                "user_accessible"
+            } else {
+                "not_writable"
+            };
             crate::yarm_log!(
-                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=flags_invalid",
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason={}",
                 tid,
                 active_asid.0,
-                fake_return_probe
+                fake_return_probe,
+                reason
             );
+            ACTIVE_ROOT_REPAIR_FAILED.store(true, Ordering::Relaxed);
             return Err(KernelError::VmFull);
         }
+
         crate::yarm_log!(
             "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK tid={} active_asid={} probe=0x{:x}",
             tid,
