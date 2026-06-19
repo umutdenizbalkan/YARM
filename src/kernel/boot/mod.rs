@@ -615,6 +615,14 @@ pub(crate) static D6_CONTROLLED_SWITCH_PROOF_PENDING_DONE: core::sync::atomic::A
     core::sync::atomic::AtomicBool::new(false);
 pub(crate) static D6_CONTROLLED_SWITCH_PROOF_DONE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Stage 132: per-CPU one-shot flag set after D6 proof CLEANUP_DONE.
+/// Consumed by the x86_64 trap handler on the first post-cleanup trap entry to
+/// emit D6_POST_CLEANUP_FIRST_TRAP_* diagnostic markers capturing vector, error
+/// code, CR2, RSP (derived), R14 (kernel ptr), TID, ASID, TSS RSP0, and stack
+/// classification (cr2_below_mapped_stack / cr2_inside_mapped_stack / unknown).
+pub(crate) static D6_POST_CLEANUP_DIAG_PENDING: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
 
 pub(crate) fn set_d6_controlled_switch_proof_enabled(enabled: bool) {
     D6_CONTROLLED_SWITCH_PROOF_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);

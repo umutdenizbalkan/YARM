@@ -36358,8 +36358,7 @@ mod stage131_arch_switch_context_abi_audit {
         let fxsave_offset =
             crate::kernel::task::ArchSwitchContext::WORDS * core::mem::size_of::<usize>();
         assert_eq!(
-            fxsave_offset,
-            64,
+            fxsave_offset, 64,
             "fxsave must start at byte offset 64 within ArchSwitchContext (8 words × 8 bytes)"
         );
         assert_eq!(
@@ -36626,6 +36625,357 @@ mod stage131_arch_switch_context_abi_audit {
                 && !AARCH64_SWITCH_SRC.contains("D6_SWITCH_CONTEXT_AUDIT")
                 && !RISCV_SWITCH_SRC.contains("D6_SWITCH_CONTEXT_AUDIT"),
             "mem::forget and AArch64/RISC-V audit markers must not appear"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 132: post-cleanup #PF diagnosis and full-stack mapping fix
+// ===========================================================================
+#[cfg(test)]
+mod stage132_post_cleanup_pf_diagnosis {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const X86_TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const DESCRIPTOR_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+
+    fn full_stack_map_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_full_proof_switch_stack_mapped")
+            .expect("Stage 132 full-stack map function");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("init function after full-stack map");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn proof_source() -> &'static str {
+        let start = EXEC_STATE_SRC
+            .find("fn maybe_run_d6_controlled_switch_proof")
+            .expect("Stage 132 proof function");
+        let end = EXEC_STATE_SRC[start..]
+            .find("pub fn futex_wait_current")
+            .map(|offset| start + offset)
+            .expect("next fn after proof");
+        &EXEC_STATE_SRC[start..end]
+    }
+
+    fn diag_fn_source() -> &'static str {
+        let start = X86_TRAP_SRC
+            .find("fn d6_emit_post_cleanup_first_trap_diag")
+            .expect("Stage 132 diag function");
+        let end = X86_TRAP_SRC[start..]
+            .find("#[cfg(test)]")
+            .map(|offset| start + offset)
+            .expect("test module after diag fn");
+        &X86_TRAP_SRC[start..end]
+    }
+
+    // 1. D6_POST_CLEANUP_DIAG_PENDING is declared in mod.rs as a per-CPU array.
+    #[test]
+    fn stage132_diag_pending_flag_declared_in_mod() {
+        assert!(
+            MOD_SRC.contains("D6_POST_CLEANUP_DIAG_PENDING"),
+            "Stage 132 must declare D6_POST_CLEANUP_DIAG_PENDING in mod.rs"
+        );
+        assert!(
+            MOD_SRC.contains("AtomicBool"),
+            "D6_POST_CLEANUP_DIAG_PENDING must be AtomicBool"
+        );
+    }
+
+    // 2. D6_POST_CLEANUP_DIAG_PENDING is set in trap_entry.rs after CLEANUP_DONE.
+    #[test]
+    fn stage132_diag_pending_set_after_cleanup_done() {
+        let done_pos = TRAP_ENTRY_SRC
+            .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE")
+            .expect("CLEANUP_DONE marker");
+        let flag_pos = TRAP_ENTRY_SRC
+            .find("D6_POST_CLEANUP_DIAG_PENDING")
+            .expect("D6_POST_CLEANUP_DIAG_PENDING set");
+        assert!(
+            flag_pos > done_pos,
+            "D6_POST_CLEANUP_DIAG_PENDING must be set after CLEANUP_DONE in trap_entry.rs"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("store(true"),
+            "D6_POST_CLEANUP_DIAG_PENDING must be set to true"
+        );
+    }
+
+    // 3. D6_POST_CLEANUP_DIAG_PENDING is consumed (swapped to false) in x86_64/trap.rs.
+    #[test]
+    fn stage132_diag_pending_consumed_in_x86_trap() {
+        assert!(
+            X86_TRAP_SRC.contains("D6_POST_CLEANUP_DIAG_PENDING"),
+            "x86_64/trap.rs must consume D6_POST_CLEANUP_DIAG_PENDING"
+        );
+        assert!(
+            X86_TRAP_SRC.contains("swap(false"),
+            "D6_POST_CLEANUP_DIAG_PENDING must be drained with swap(false)"
+        );
+    }
+
+    // 4. Diagnostic emission happens before handle_trap_event.
+    #[test]
+    fn stage132_diag_emitted_before_handle_trap_event() {
+        let diag_pos = X86_TRAP_SRC
+            .find("d6_emit_post_cleanup_first_trap_diag")
+            .expect("diag call");
+        let event_pos = X86_TRAP_SRC
+            .find("handle_trap_event_with_fault_bookkeeping_mode")
+            .expect("handle_trap_event call");
+        assert!(
+            diag_pos < event_pos,
+            "diagnostic must be emitted before handle_trap_event"
+        );
+    }
+
+    // 5. d6_emit_post_cleanup_first_trap_diag emits all required markers.
+    #[test]
+    fn stage132_diag_fn_emits_required_markers() {
+        let src = diag_fn_source();
+        for marker in &[
+            "D6_POST_CLEANUP_FIRST_TRAP_BEGIN",
+            "D6_POST_CLEANUP_FIRST_TRAP_VECTOR",
+            "D6_POST_CLEANUP_FIRST_TRAP_ERROR",
+            "D6_POST_CLEANUP_FIRST_TRAP_CR2",
+            "D6_POST_CLEANUP_FIRST_TRAP_RSP",
+            "D6_POST_CLEANUP_FIRST_TRAP_R14",
+            "D6_POST_CLEANUP_FIRST_TRAP_CURRENT",
+            "D6_POST_CLEANUP_FIRST_TRAP_ASID",
+            "D6_POST_CLEANUP_FIRST_TRAP_TSS_RSP0",
+            "D6_POST_CLEANUP_FIRST_TRAP_CR2_EQUALS_RSP_MINUS_8",
+            "D6_POST_CLEANUP_FIRST_TRAP_STACK_CLASS",
+            "D6_POST_CLEANUP_FIRST_TRAP_DONE",
+        ] {
+            assert!(
+                src.contains(marker),
+                "d6_emit_post_cleanup_first_trap_diag must emit {}",
+                marker
+            );
+        }
+    }
+
+    // 6. Stack classification labels all present in the diag function.
+    #[test]
+    fn stage132_diag_fn_has_all_stack_class_labels() {
+        let src = diag_fn_source();
+        for label in &[
+            "cr2_below_mapped_stack",
+            "cr2_inside_mapped_stack",
+            "cr2_below_expected_stack_page",
+            "rsp_above_expected_stack_top",
+            "unknown",
+        ] {
+            assert!(
+                src.contains(label),
+                "stack class label '{}' must be present in diag function",
+                label
+            );
+        }
+    }
+
+    // 7. CR2 == RSP-8 invariant is captured.
+    #[test]
+    fn stage132_diag_fn_captures_cr2_eq_rsp_minus_8() {
+        let src = diag_fn_source();
+        assert!(
+            src.contains("cr2_eq_rsp_m8"),
+            "diag function must check cr2_eq_rsp_m8 (callq write-fault invariant)"
+        );
+        assert!(
+            src.contains("wrapping_add(8)"),
+            "rsp must be derived as cr2.wrapping_add(8)"
+        );
+    }
+
+    // 8. TSS RSP0 is read via read_boot_tss_rsp0 from descriptor_tables.
+    #[test]
+    fn stage132_diag_fn_reads_tss_rsp0() {
+        let src = diag_fn_source();
+        assert!(
+            src.contains("read_boot_tss_rsp0"),
+            "diag function must read TSS RSP0 via read_boot_tss_rsp0()"
+        );
+    }
+
+    // 9. read_boot_tss_rsp0 is declared in descriptor_tables.rs.
+    #[test]
+    fn stage132_read_boot_tss_rsp0_declared() {
+        assert!(
+            DESCRIPTOR_SRC.contains("fn read_boot_tss_rsp0"),
+            "descriptor_tables.rs must declare read_boot_tss_rsp0"
+        );
+        assert!(
+            DESCRIPTOR_SRC.contains("YARM_X86_SYSCALL_RSP0"),
+            "read_boot_tss_rsp0 must read YARM_X86_SYSCALL_RSP0"
+        );
+    }
+
+    // 10. d6_ensure_full_proof_switch_stack_mapped is declared in thread_state.rs.
+    #[test]
+    fn stage132_full_stack_map_fn_declared() {
+        assert!(
+            THREAD_STATE_SRC.contains("d6_ensure_full_proof_switch_stack_mapped"),
+            "thread_state.rs must declare d6_ensure_full_proof_switch_stack_mapped"
+        );
+    }
+
+    // 11. Full-stack map function uses a while loop (not for offset), no region-size constant.
+    #[test]
+    fn stage132_full_stack_map_uses_while_not_region_size() {
+        let src = full_stack_map_source();
+        assert!(
+            src.contains("while page_addr < stack_top"),
+            "d6_ensure_full_proof_switch_stack_mapped must iterate with while"
+        );
+        assert!(
+            !src.contains("KERNEL_STACK_REGION_SIZE"),
+            "d6_ensure_full_proof_switch_stack_mapped must not reference KERNEL_STACK_REGION_SIZE"
+        );
+        assert!(
+            src.contains("stack_base") && src.contains("stack_top"),
+            "full-stack map must use stack_base and stack_top bounds"
+        );
+    }
+
+    // 12. Full-stack map emits D6_PROOF_FULL_STACK_MAP_* markers.
+    #[test]
+    fn stage132_full_stack_map_emits_markers() {
+        let src = full_stack_map_source();
+        for marker in &[
+            "D6_PROOF_FULL_STACK_MAP_BEGIN",
+            "D6_PROOF_FULL_STACK_MAP_PAGE_MAPPED",
+            "D6_PROOF_FULL_STACK_MAP_SKIP",
+            "D6_PROOF_FULL_STACK_MAP_DONE",
+        ] {
+            assert!(
+                src.contains(marker),
+                "d6_ensure_full_proof_switch_stack_mapped must emit {}",
+                marker
+            );
+        }
+    }
+
+    // 13. Full-stack map uses KERNEL_RW flags (supervisor-only writable pages).
+    #[test]
+    fn stage132_full_stack_map_uses_kernel_rw() {
+        let src = full_stack_map_source();
+        assert!(
+            src.contains("PageFlags::KERNEL_RW"),
+            "d6_ensure_full_proof_switch_stack_mapped must use PageFlags::KERNEL_RW"
+        );
+    }
+
+    // 14. Full-stack map is called for BOTH proof tasks in exec_state.rs.
+    #[test]
+    fn stage132_full_stack_map_called_for_both_tids() {
+        let src = proof_source();
+        let count = src
+            .matches("d6_ensure_full_proof_switch_stack_mapped")
+            .count();
+        assert!(
+            count >= 2,
+            "d6_ensure_full_proof_switch_stack_mapped must be called for both proof tasks (outgoing + incoming), found {}",
+            count
+        );
+    }
+
+    // 15. Full-stack map calls precede maybe_switch_kernel_context.
+    #[test]
+    fn stage132_full_stack_map_called_before_switch() {
+        let src = proof_source();
+        let map_pos = src
+            .find("d6_ensure_full_proof_switch_stack_mapped")
+            .expect("full-stack map call");
+        let switch_pos = src
+            .find("maybe_switch_kernel_context")
+            .expect("maybe_switch_kernel_context call");
+        assert!(
+            map_pos < switch_pos,
+            "d6_ensure_full_proof_switch_stack_mapped must be called before maybe_switch_kernel_context"
+        );
+    }
+
+    // 16. Full-stack map failure causes early return (deferred), not a panic.
+    #[test]
+    fn stage132_full_stack_map_failure_returns_early() {
+        let src = proof_source();
+        assert!(
+            src.contains("D6_PROOF_FULL_STACK_MAP_FAILED"),
+            "full-stack map failure must emit D6_PROOF_FULL_STACK_MAP_FAILED and return Ok(())"
+        );
+        assert!(
+            src.contains("return Ok(())"),
+            "proof must return Ok(()) on full-stack map failure"
+        );
+    }
+
+    // 17. D6_POST_CLEANUP_DIAG_PENDING is inside `if is_proof_done` in trap_entry.rs.
+    #[test]
+    fn stage132_diag_pending_gated_on_is_proof_done() {
+        let is_done_pos = TRAP_ENTRY_SRC
+            .find("if is_proof_done")
+            .expect("is_proof_done check");
+        let flag_pos = TRAP_ENTRY_SRC
+            .find("D6_POST_CLEANUP_DIAG_PENDING")
+            .expect("D6_POST_CLEANUP_DIAG_PENDING");
+        assert!(
+            flag_pos > is_done_pos,
+            "D6_POST_CLEANUP_DIAG_PENDING must appear after `if is_proof_done`"
+        );
+    }
+
+    // 18. AArch64 and RISC-V code must not contain Stage 132 markers.
+    #[test]
+    fn stage132_aarch64_riscv_untouched() {
+        assert!(
+            !AARCH64_SWITCH_SRC.contains("D6_PROOF_FULL_STACK_MAP")
+                && !AARCH64_SWITCH_SRC.contains("D6_POST_CLEANUP_FIRST_TRAP"),
+            "AArch64 context_switch must not contain Stage 132 markers"
+        );
+        assert!(
+            !RISCV_SWITCH_SRC.contains("D6_PROOF_FULL_STACK_MAP")
+                && !RISCV_SWITCH_SRC.contains("D6_POST_CLEANUP_FIRST_TRAP"),
+            "RISC-V context_switch must not contain Stage 132 markers"
+        );
+    }
+
+    // 19. ensure_kernel_switch_stack_mapped is NOT modified by Stage 132
+    //     (the top-page-only mapping is preserved for Stage 127/128/129 tests).
+    #[test]
+    fn stage132_ensure_kernel_switch_stack_mapped_unchanged() {
+        assert!(
+            THREAD_STATE_SRC.contains("fake_return_probe")
+                && THREAD_STATE_SRC.contains("probe_page = fake_return_probe"),
+            "ensure_kernel_switch_stack_mapped top-page logic must be preserved"
+        );
+        assert!(
+            !THREAD_STATE_SRC
+                .find("fn ensure_kernel_switch_stack_mapped")
+                .is_none(),
+            "ensure_kernel_switch_stack_mapped must still exist"
+        );
+    }
+
+    // 20. Stage 132 diag function is gated on not(feature = "hosted-dev").
+    #[test]
+    fn stage132_diag_fn_gated_on_not_hosted_dev() {
+        let diag_pos = X86_TRAP_SRC
+            .find("fn d6_emit_post_cleanup_first_trap_diag")
+            .expect("diag function");
+        let cfg_pos = X86_TRAP_SRC[..diag_pos]
+            .rfind("not(feature = \"hosted-dev\")")
+            .expect("not(feature=hosted-dev) gate before diag fn");
+        assert!(
+            cfg_pos < diag_pos,
+            "d6_emit_post_cleanup_first_trap_diag must be gated on not(feature = hosted-dev)"
         );
     }
 }

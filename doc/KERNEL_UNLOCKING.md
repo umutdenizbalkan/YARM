@@ -2019,6 +2019,97 @@ audit markers in exec_state.rs; Stage 130 CLEANUP_BEGIN/CLEANUP_DONE preserved;
 Stage 129/130 structural invariants and ABI boundary (no mem::forget, no AArch64/RISC-V
 audit markers).
 
+### Stage 132 — Post-cleanup #PF diagnosis and full-stack mapping fix
+
+**Status: Outcome A-source (QEMU validation pending user/local run).** Stage 131
+assumed the post-cleanup crash was `#XF` (vector 19) from MXCSR=0, but the actual
+crash token from hardware was `!Fv000000000000000e e0000000000000002`, which is
+`#PF` (vector 0x0e = 14), error code 0x2 (kernel write to non-present page).
+CR2 = `0xffff80000000d9d8`, which is several kilobytes below the only mapped page
+(`0xffff80000000f000`–`0xffff800000010000`).
+
+**Stage 131 correction.** Stage 131's fxsave fix is still correct and necessary
+(MXCSR=0 from all-zero fxsave would cause `#XF` on any SSE operation), but that
+was not the first crash after CLEANUP_DONE. The immediate crash is a `#PF` on the
+kernel stack — the fxsave fix will matter once the stack is fully mapped.
+
+**Root cause: single mapped stack page.** `ensure_kernel_switch_stack_mapped`
+(Stage 127) maps only the **top page** of the kernel switch stack — the one
+containing `stack_top - 8` (the fake return address slot). After the D6 proof
+handoff, TSS RSP0 is set to TID1's `stack_top` (`0xffff800000010000`). The very
+first kernel trap after proof completion re-enters `handle_trap` (called from
+`KernelState::handle_trap`), which grows the stack approximately 9760 bytes deep
+via `SpinLockIrqSave` before any user code runs. At that depth, RSP has descended
+well below the single 4 KB mapped page. When `callq SpinLockIrqSave` pushes the
+return address to RSP-8, the CPU faults: CR2 = RSP-8 = `0xffff80000000d9d8` —
+an unmapped kernel address → `#PF`, error code 0x2 (present=0, write=1, kernel).
+
+**Diagnostic instrumentation.** To capture the exact fault parameters before any
+fix is applied:
+
+- `D6_POST_CLEANUP_DIAG_PENDING` — per-CPU `AtomicBool` array in `mod.rs`; set
+  to `true` (under `if is_proof_done`) in `trap_entry.rs` immediately after
+  `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` is logged; consumed (swapped to false)
+  at the very start of the next `handle_trap_entry_with_fault_bookkeeping_mode`
+  entry in `x86_64/trap.rs` (after `ensure_boot_descriptor_tables_scaffolded`).
+- `d6_emit_post_cleanup_first_trap_diag(kernel, cpu, context)` — new x86_64-only
+  function in `x86_64/trap.rs` (gated on `not(feature = "hosted-dev")`). Captures:
+  vector, error code, CR2, derived RSP (= CR2 + 8), kernel pointer (R14 proxy),
+  current TID, active ASID, CR3 (as ASID), TSS RSP0 (via new
+  `read_boot_tss_rsp0()` accessor in `descriptor_tables.rs`), CR2==RSP-8 flag, and
+  a stack classification label.
+- `read_boot_tss_rsp0()` — new accessor in `descriptor_tables.rs` that reads
+  `YARM_X86_SYSCALL_RSP0` (the atomic mirror of TSS RSP0) with `Acquire` ordering.
+
+**Stack classification labels** emitted by `D6_POST_CLEANUP_FIRST_TRAP_STACK_CLASS`:
+- `cr2_below_mapped_stack` — CR2 is in stack bounds but below the single mapped page
+- `cr2_inside_mapped_stack` — CR2 is inside the top (mapped) page (unexpected)
+- `cr2_below_expected_stack_page` — CR2 is below stack_base entirely
+- `rsp_above_expected_stack_top` — RSP is above stack_top (likely wrong TSS RSP0)
+- `unknown` — none of the above
+
+**Diagnostic markers** emitted by `d6_emit_post_cleanup_first_trap_diag`:
+`D6_POST_CLEANUP_FIRST_TRAP_BEGIN`, `_VECTOR`, `_ERROR`, `_CR2`, `_RIP`, `_RSP`,
+`_R14`, `_CURRENT`, `_ASID`, `_CR3`, `_TSS_RSP0`, `_CR2_EQUALS_RSP_MINUS_8`,
+`_STACK_CLASS`, `D6_POST_CLEANUP_FIRST_TRAP_DONE`.
+
+**Fix: map all stack pages before the proof switch.**
+`d6_ensure_full_proof_switch_stack_mapped(tid)` — new function in `thread_state.rs`
+(real version: `#[cfg(all(target_arch = "x86_64", not(test)))]`; stub returns
+`Ok(())` under test/non-x86). Called from `maybe_run_d6_controlled_switch_proof`
+in `exec_state.rs` for **both** `outgoing_tid` and `incoming_tid`, before
+`maybe_switch_kernel_context`. Iterates page-by-page from `stack_base` to
+`stack_top` using a `while` loop (no `KERNEL_STACK_REGION_SIZE` reference —
+Stage 127/128/129 test invariants preserved). For each page: resolves in target
+ASID; allocates a new physical frame if absent (`alloc_user_data_frame`); maps in
+target ASID (`PageFlags::KERNEL_RW`); shares in every other currently-live ASID.
+On failure, emits `D6_PROOF_FULL_STACK_MAP_FAILED` and returns `Ok(())` (deferred,
+no panic).
+
+**Markers emitted** by `d6_ensure_full_proof_switch_stack_mapped`:
+`D6_PROOF_FULL_STACK_MAP_BEGIN tid=... base=0x... top=0x...`,
+`D6_PROOF_FULL_STACK_MAP_SKIP tid=... va=0x...` (already-mapped pages),
+`D6_PROOF_FULL_STACK_MAP_PAGE_MAPPED tid=... va=0x...` (newly mapped),
+`D6_PROOF_FULL_STACK_MAP_DONE tid=...`.
+
+**Hard boundaries preserved.** x86_64 proof-mode only; `ensure_kernel_switch_stack_mapped`
+unchanged; no `KERNEL_STACK_REGION_SIZE` in new code; no timer/preemption,
+AP scheduler-online, per-CPU runqueue, lock handoff, `mem::forget`, assembly unlock
+callback, syscall/image-ID/IPC/VFS/FS change; AArch64/RISC-V untouched.
+`SYSCALL_COUNT == 31`, `Syscall::VARIANT_COUNT == 23`.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained a `stage132_post_cleanup_pf_diagnosis`
+module (20 tests) covering: `D6_POST_CLEANUP_DIAG_PENDING` declared in `mod.rs`
+and set after `CLEANUP_DONE`; pending flag consumed via `swap(false)` in x86
+trap.rs; diagnostic emitted before `handle_trap_event`; all 12 required `D6_POST_CLEANUP_FIRST_TRAP_*`
+markers; all 5 stack-class labels; CR2==RSP-8 and `wrapping_add(8)` derivation;
+`read_boot_tss_rsp0` accessor; `d6_ensure_full_proof_switch_stack_mapped` declared;
+while-loop iteration without `KERNEL_STACK_REGION_SIZE`; all 4 `D6_PROOF_FULL_STACK_MAP_*`
+markers; `PageFlags::KERNEL_RW`; called for both tids before `maybe_switch_kernel_context`;
+failure emits `D6_PROOF_FULL_STACK_MAP_FAILED` and returns `Ok(())`; gated on
+`is_proof_done`; AArch64/RISC-V untouched; `ensure_kernel_switch_stack_mapped`
+unmodified; diag function gated on `not(feature = "hosted-dev")`.
+
 ## 2. Live paths and fallbacks
 
 ### D1 + D5 (recv-side cap materialization)
