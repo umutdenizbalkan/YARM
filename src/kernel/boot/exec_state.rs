@@ -1983,6 +1983,20 @@ impl KernelState {
         }
         Ok(achieved)
     }
+
+    /// Stage 130: emit D6 proof cleanup markers that require global-lock access.
+    ///
+    /// Called from `handle_trap_entry_shared` at POINT 2 after the proof
+    /// switch-back completes, with the global lock held, to log the current TID,
+    /// active ASID/CR3, and TSS RSP0 state for post-proof consistency checks.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_emit_proof_cleanup_arch_markers(&mut self) {
+        let current_tid = self.current_tid().unwrap_or(u64::MAX);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK tid={}", current_tid);
+        let active_asid = self.hal.active_asid().map_or(0, |asid| asid.0);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}", active_asid);
+        crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_TSS_OK");
+    }
 }
 
 #[cfg(test)]

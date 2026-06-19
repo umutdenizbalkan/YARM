@@ -34173,31 +34173,32 @@ mod stage119_minimal_task_pair {
     }
 
     // -----------------------------------------------------------------------
-    // Part C: TSS RSP0 fix — trampoline switch-back passes None
+    // Part C: TSS RSP0 — trampoline switch-back stack-top argument
+    //
+    // Stage 119 exposed the TSS RSP0 mismatch problem. Stage 130 corrected it:
+    // the trampoline now passes ctx.outgoing_stack_top (TID1's kernel stack top)
+    // so that TSS RSP0 is properly restored after the proof switch-back.
     // -----------------------------------------------------------------------
 
     #[test]
     fn stage119_trampoline_switchback_does_not_pass_outgoing_stack_top() {
-        // The trampoline switch-back must NOT pass ctx.outgoing_stack_top as the
-        // third argument to switch_frames; doing so would call refresh_boot_tss_rsp0
-        // with A's stack top, corrupting B's interrupt stack.
-        //
-        // We verify this by checking that outgoing_stack_top does NOT appear as a
-        // positional argument next to the switch_frames call that follows the
-        // D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE marker.
+        // Stage 130 corrected this: the trampoline switch-back now passes
+        // ctx.outgoing_stack_top so that TSS RSP0 is restored to TID1's stack
+        // top after the proof round-trip. Verify the field is threaded through.
         assert!(
-            !THREAD_STATE_SRC.contains("ctx.outgoing_stack_top,\n        );"),
-            "trampoline switch-back must NOT pass ctx.outgoing_stack_top to switch_frames"
+            THREAD_STATE_SRC.contains("ctx.outgoing_stack_top"),
+            "trampoline switch-back must pass ctx.outgoing_stack_top to restore TSS RSP0"
         );
     }
 
     #[test]
     fn stage119_trampoline_switchback_passes_none_for_tss_rsp0() {
-        // After the first-resume handler, switch_frames is called with None so that
-        // TSS RSP0 (set by the stash-drain to B.stack_top) is not overwritten.
+        // Stage 130 corrected the None → ctx.outgoing_stack_top transition.
+        // Verify the FirstResumeContext field carries the outgoing stack top
+        // so the trampoline can pass it to switch_frames.
         assert!(
-            THREAD_STATE_SRC.contains("None,\n        );"),
-            "trampoline switch-back must pass None as next_kernel_stack_top to preserve TSS RSP0"
+            THREAD_STATE_SRC.contains("outgoing_stack_top"),
+            "FirstResumeContext.outgoing_stack_top must be accessible in thread_state.rs"
         );
     }
 
@@ -34205,7 +34206,7 @@ mod stage119_minimal_task_pair {
     fn stage119_trampoline_switchback_has_tss_rsp0_preservation_comment() {
         assert!(
             THREAD_STATE_SRC.contains("TSS RSP0"),
-            "thread_state.rs trampoline switch-back must have a comment explaining TSS RSP0 preservation"
+            "thread_state.rs trampoline switch-back must have a comment explaining TSS RSP0"
         );
     }
 
@@ -35931,6 +35932,322 @@ mod stage128_active_cr3_switch_stack_mapping {
                 && SYSCALL_SRC.contains("mod recv_shared_v3;")
                 && SYSCALL_SRC.contains("mod sched;"),
             "D4 modules and syscall counts must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 130 — D6 controlled switch proof cleanup / post-proof stability
+// ===========================================================================
+#[cfg(test)]
+mod stage130_d6_proof_cleanup {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SCHEDULER_STATE_SRC: &str = include_str!("scheduler_state.rs");
+    const SCHEDULER_TIMER_SRC: &str = include_str!("../scheduler_timer.rs");
+
+    fn trampoline_switch_back_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("D6_FIRST_RESUME_RUST_ENTER")
+            .expect("trampoline entry marker");
+        let end = THREAD_STATE_SRC[start..]
+            .find("fn current_stack_alignment_for_diagnostics")
+            .map(|offset| start + offset)
+            .expect("fn after trampoline");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn cleanup_block_source() -> &'static str {
+        let start = TRAP_ENTRY_SRC
+            .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN")
+            .expect("Stage 130 CLEANUP_BEGIN marker");
+        let end = TRAP_ENTRY_SRC[start..]
+            .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE")
+            .map(|offset| start + offset + "D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE".len())
+            .expect("Stage 130 CLEANUP_DONE marker after CLEANUP_BEGIN");
+        &TRAP_ENTRY_SRC[start..end]
+    }
+
+    // 1. Trampoline switch-back passes ctx.outgoing_stack_top — not None — so TSS
+    //    RSP0 is updated to the outgoing (TID1) kernel stack top on switch-back.
+    #[test]
+    fn stage130_trampoline_switch_back_passes_outgoing_stack_top() {
+        let tramp = trampoline_switch_back_source();
+        assert!(
+            tramp.contains("ctx.outgoing_stack_top"),
+            "Stage 130 trampoline switch-back must pass ctx.outgoing_stack_top to switch_frames"
+        );
+    }
+
+    // 2. Trampoline switch-back no longer passes a bare None for next_kernel_stack_top.
+    #[test]
+    fn stage130_trampoline_switch_back_does_not_pass_none() {
+        let tramp = trampoline_switch_back_source();
+        let switch_call_pos = tramp
+            .find("selected_isa::context_switch::switch_frames")
+            .expect("switch_frames call in trampoline");
+        // Scan from the switch_frames call up to the spin loop that follows it.
+        // We cannot use find(");") to delimit the arg list because the SAFETY
+        // comment inside the call also contains `);`.
+        let after_switch = &tramp[switch_call_pos..];
+        let call_block_end = after_switch
+            .find("loop {")
+            .expect("spin loop sentinel after switch_frames in trampoline");
+        let call_block = &after_switch[..call_block_end];
+        assert!(
+            call_block.contains("outgoing_stack_top"),
+            "Stage 130 trampoline switch_frames must use outgoing_stack_top, not None"
+        );
+        assert!(
+            !call_block.contains("\n            None,"),
+            "Stage 130 trampoline must not pass bare None as next_kernel_stack_top"
+        );
+    }
+
+    // 3. FirstResumeContext stores and propagates outgoing_stack_top for TSS RSP0.
+    //    The field is declared in boot/mod.rs; usage in thread_state.rs (trampoline)
+    //    and trap_entry.rs (stash population) verify it is correctly threaded through.
+    #[test]
+    fn stage130_first_resume_context_stores_outgoing_stack_top() {
+        // Trampoline (thread_state.rs) must use ctx.outgoing_stack_top.
+        assert!(
+            trampoline_switch_back_source().contains("ctx.outgoing_stack_top"),
+            "Trampoline must pass ctx.outgoing_stack_top to the switch-back switch_frames call"
+        );
+        // Stash drain (trap_entry.rs) must copy plan.outgoing_stack_top into the context.
+        assert!(
+            TRAP_ENTRY_SRC.contains("outgoing_stack_top: plan.outgoing_stack_top"),
+            "Stash drain must copy plan.outgoing_stack_top into FirstResumeContext"
+        );
+    }
+
+    // 4. CLEANUP_BEGIN marker is present in trap_entry.rs after DONE.
+    #[test]
+    fn stage130_cleanup_begin_marker_in_trap_entry() {
+        let done_pos = TRAP_ENTRY_SRC
+            .find("D6_CONTROLLED_SWITCH_PROOF_DONE")
+            .expect("DONE marker");
+        let begin_pos = TRAP_ENTRY_SRC
+            .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN")
+            .expect("Stage 130 CLEANUP_BEGIN marker");
+        assert!(
+            begin_pos > done_pos,
+            "CLEANUP_BEGIN must appear after DONE in trap_entry.rs"
+        );
+    }
+
+    // 5. STASH_CLEAR_OK marker is emitted after verifying both stashes are empty.
+    #[test]
+    fn stage130_stash_clear_ok_marker_in_trap_entry() {
+        let cleanup = cleanup_block_source();
+        assert!(
+            cleanup.contains("D6_CONTROLLED_SWITCH_PROOF_STASH_CLEAR_OK"),
+            "Stage 130 cleanup block must emit STASH_CLEAR_OK"
+        );
+        assert!(
+            cleanup.contains("has_plan()") && cleanup.contains("FIRST_RESUME_STASH"),
+            "Stage 130 stash-clear check must verify both DISPATCH and FIRST_RESUME stashes"
+        );
+    }
+
+    // 6. STATE_CLEAR_OK marker is emitted after verifying atomics are quiesced.
+    #[test]
+    fn stage130_state_clear_ok_marker_in_trap_entry() {
+        let cleanup = cleanup_block_source();
+        assert!(
+            cleanup.contains("D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK"),
+            "Stage 130 cleanup block must emit STATE_CLEAR_OK"
+        );
+        assert!(
+            cleanup.contains("PENDING_DONE")
+                && cleanup.contains("GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE"),
+            "Stage 130 state-clear check must verify PENDING_DONE and GLOBAL_LOCK_DROP atomics"
+        );
+    }
+
+    // 7. CURRENT_OK marker is emitted from the arch-gated cleanup helper.
+    #[test]
+    fn stage130_current_ok_marker_emitted_by_cleanup_helper() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK tid={}"),
+            "Stage 130 must emit CURRENT_OK tid=... from d6_emit_proof_cleanup_arch_markers"
+        );
+    }
+
+    // 8. CR3_OK marker is emitted with the active ASID.
+    #[test]
+    fn stage130_cr3_ok_marker_emitted_by_cleanup_helper() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}"),
+            "Stage 130 must emit CR3_OK asid=... from d6_emit_proof_cleanup_arch_markers"
+        );
+    }
+
+    // 9. TSS_OK and CLEANUP_DONE markers are present.
+    #[test]
+    fn stage130_tss_ok_and_cleanup_done_markers_present() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_TSS_OK"),
+            "Stage 130 must emit TSS_OK from d6_emit_proof_cleanup_arch_markers"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE"),
+            "Stage 130 must emit CLEANUP_DONE in trap_entry.rs"
+        );
+    }
+
+    // 10. Cleanup helper is gated to x86_64 so non-x86 arch paths are unaffected.
+    #[test]
+    fn stage130_cleanup_helper_is_x86_64_only() {
+        assert!(
+            EXEC_STATE_SRC.contains(
+                "#[cfg(target_arch = \"x86_64\")]\n    pub(crate) fn d6_emit_proof_cleanup_arch_markers"
+            ),
+            "d6_emit_proof_cleanup_arch_markers must be gated to x86_64"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("d6_emit_proof_cleanup_arch_markers"),
+            "d6_emit_proof_cleanup_arch_markers must be called from trap_entry.rs"
+        );
+    }
+
+    // 11. CLEANUP_DONE is outside the x86_64 cfg gate (emitted on all arches when proof done).
+    #[test]
+    fn stage130_cleanup_done_emitted_unconditionally() {
+        let x86_gate = TRAP_ENTRY_SRC
+            .find("d6_emit_proof_cleanup_arch_markers")
+            .expect("call to cleanup arch helper");
+        let cleanup_done = TRAP_ENTRY_SRC
+            .rfind("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE")
+            .expect("CLEANUP_DONE marker");
+        assert!(
+            cleanup_done > x86_gate,
+            "CLEANUP_DONE must appear after the x86_64-gated arch marker call"
+        );
+    }
+
+    // 12. Proof one-shot enforcement: STARTED CAS prevents repeated attempts.
+    #[test]
+    fn stage130_proof_one_shot_enforcement_via_cas() {
+        assert!(
+            EXEC_STATE_SRC.contains("d6_controlled_switch_proof_try_start()"),
+            "Proof start must use a CAS-based try_start guard"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("!crate::kernel::boot::d6_controlled_switch_proof_try_start()"),
+            "Proof entry must return Ok(()) early when CAS fails (already started)"
+        );
+    }
+
+    // 13. Stage 129 active-root repair markers still present in thread_state.rs.
+    #[test]
+    fn stage130_stage129_active_root_repair_markers_intact() {
+        assert!(
+            THREAD_STATE_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_BEGIN")
+                && THREAD_STATE_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DONE")
+                && THREAD_STATE_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED")
+                && THREAD_STATE_SRC.contains("D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_DEFERRED"),
+            "Stage 129 MAP_ACTIVE markers must remain intact in thread_state.rs"
+        );
+    }
+
+    // 14. Scheduler quantum fix (reset_quantum) from scheduler correctness stage is intact.
+    #[test]
+    fn stage130_scheduler_quantum_fix_intact() {
+        assert!(
+            SCHEDULER_TIMER_SRC.contains("pub fn reset_quantum(")
+                && SCHEDULER_TIMER_SRC.contains("self.ticks_remaining = self.quantum_ticks"),
+            "scheduler_timer.rs reset_quantum API must remain intact"
+        );
+        assert!(
+            SCHEDULER_STATE_SRC.contains("reset_quantum()"),
+            "scheduler_state.rs block_current_cpu must still call reset_quantum"
+        );
+    }
+
+    // 15. Stage 120 proof remains default-off.
+    #[test]
+    fn stage130_proof_remains_default_off() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)")
+                && !BOOT_CMDLINE_SRC.contains("d6_switch_proof: Some(true)"),
+            "Stage 120 proof must remain default-off (no d6_switch_proof: Some(true))"
+        );
+    }
+
+    // 16. switch_frames ABI unchanged — no assembly unlock callback, no mem::forget.
+    #[test]
+    fn stage130_switch_frames_abi_unchanged() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, and mem::forget boundaries must remain closed"
+        );
+    }
+
+    // 17. AArch64 and RISC-V paths are not affected by Stage 130 changes.
+    #[test]
+    fn stage130_aarch64_riscv_untouched() {
+        assert!(
+            !AARCH64_SWITCH_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP")
+                && !RISCV_SWITCH_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP"),
+            "Stage 130 cleanup markers must not appear in AArch64/RISC-V switch paths"
+        );
+    }
+
+    // 18. Stage 125 bridge markers remain intact.
+    #[test]
+    fn stage130_stage125_bridge_markers_intact() {
+        assert!(
+            THREAD_STATE_SRC.contains("!RB")
+                && THREAD_STATE_SRC.contains("!RJ")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real"),
+            "Stage 125 bridge markers and trampoline bridge path must remain intact"
+        );
+    }
+
+    // 19. D4 modules and syscall counts unchanged.
+    #[test]
+    fn stage130_d4_modules_and_syscall_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod sched;"),
+            "D4 modules and syscall counts must remain unchanged"
+        );
+    }
+
+    // 20. d6_emit_proof_cleanup_arch_markers exists and emits all three per-lock markers.
+    #[test]
+    fn stage130_cleanup_arch_helper_emits_all_three_markers() {
+        let start = EXEC_STATE_SRC
+            .find("pub(crate) fn d6_emit_proof_cleanup_arch_markers")
+            .expect("d6_emit_proof_cleanup_arch_markers must exist in exec_state.rs");
+        let end = EXEC_STATE_SRC[start..]
+            .find("\n    }")
+            .map(|offset| start + offset)
+            .expect("closing brace of cleanup helper");
+        let helper = &EXEC_STATE_SRC[start..end];
+        assert!(
+            helper.contains("current_tid()")
+                && helper.contains("active_asid()")
+                && helper.contains("D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK")
+                && helper.contains("D6_CONTROLLED_SWITCH_PROOF_CR3_OK")
+                && helper.contains("D6_CONTROLLED_SWITCH_PROOF_TSS_OK"),
+            "d6_emit_proof_cleanup_arch_markers must query current_tid/active_asid \
+             and emit CURRENT_OK, CR3_OK, TSS_OK"
         );
     }
 }

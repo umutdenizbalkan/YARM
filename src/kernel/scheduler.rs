@@ -815,7 +815,11 @@ mod tests {
 
         // TID 0 must no longer be tracked in membership (can re-enqueue without error).
         assert!(!sched.membership_contains(ThreadId(0)));
-        assert!(sched.enqueue_with_priority(ThreadId(0), TaskPriority::Normal).is_ok());
+        assert!(
+            sched
+                .enqueue_with_priority(ThreadId(0), TaskPriority::Normal)
+                .is_ok()
+        );
     }
 
     #[test]

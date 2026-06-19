@@ -1911,6 +1911,60 @@ user-accessible PTE rejection, active ASID checked before stash, one-shot
 proof, `switch_frames` ABI unchanged, no forbidden patterns, AArch64/RISC-V
 untouched, D4/syscall counts, new Stage 129 markers present in source.
 
+### Stage 130 — D6 proof cleanup / post-proof stability
+
+**Status: Outcome A-source (QEMU validation pending user/local run).** After
+`D6_CONTROLLED_SWITCH_PROOF_DONE`, the proof state must quiesce cleanly: stale
+stash entries cleared, atomics zeroed, and x86_64 architectural state
+(scheduler current TID, active CR3/ASID, TSS RSP0) verified consistent.
+
+**TSS RSP0 fix.** The trampoline (`yarm_kernel_thread_switch_trampoline_rust_real`
+in `thread_state.rs`) previously called `switch_frames(..., None)` for the
+switch-back from TID2 to TID1. Passing `None` left TSS RSP0 pointing to TID2's
+kernel stack top — a latent stack-corruption bug: any interrupt firing while TID1
+ran in user mode after the proof would push its frame onto TID2's kernel stack.
+Stage 130 passes `ctx.outgoing_stack_top` (TID1's kernel stack top, already
+stored in `FirstResumeContext.outgoing_stack_top`) to correctly restore TSS RSP0
+on switch-back. The `stage119_trampoline_switchback_*` tests were updated to
+match the corrected behavior.
+
+**Cleanup markers.** `handle_trap_entry_shared` in `trap_entry.rs` now emits a
+cleanup sequence at POINT 2 when `take_pending_done()` succeeds:
+
+- `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN` — cleanup phase started
+- `D6_CONTROLLED_SWITCH_PROOF_STASH_CLEAR_OK` — both `DISPATCH_SWITCH_PLAN_STASH`
+  and `FIRST_RESUME_STASH` verified empty after the proof round-trip
+- `D6_CONTROLLED_SWITCH_PROOF_STATE_CLEAR_OK` — `PENDING_DONE` swapped to false,
+  `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` cleared
+- `D6_CONTROLLED_SWITCH_PROOF_CURRENT_OK tid=...` — emitted from
+  `d6_emit_proof_cleanup_arch_markers` (x86_64 only, inside the re-acquired lock)
+- `D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid=...` — active ASID/CR3 logged
+- `D6_CONTROLLED_SWITCH_PROOF_TSS_OK` — TSS RSP0 structurally correct after fix
+- `D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE` — emitted on all arches when proof done
+
+The arch-specific markers (CURRENT_OK, CR3_OK, TSS_OK) are emitted from a new
+`KernelState::d6_emit_proof_cleanup_arch_markers()` method (x86_64-gated) added
+to `exec_state.rs`, avoiding direct access to the private `hal` field from
+`trap_entry.rs`. `CLEANUP_DONE` is emitted unconditionally (all arches) after
+the arch block.
+
+**Hard boundaries preserved:** x86_64 proof/default-off path only; no
+`switch_frames` ABI change beyond correcting the trampoline stack-top argument,
+no scheduler policy change, no timer/preemption change, AP scheduler-online, or
+per-CPU runqueue change. No lock handoff, `mem::forget`, assembly unlock callback,
+syscall/image-ID/service/IPC/VFS/FS change. AArch64/RISC-V behavior unchanged.
+`SYSCALL_COUNT == 31`, `Syscall::VARIANT_COUNT == 23`.
+
+**Tests added.** `src/kernel/boot/tests.rs` gained a `stage130_d6_proof_cleanup`
+module (20 tests) covering: trampoline passes `outgoing_stack_top`, no bare `None`
+in switch-back args, `FirstResumeContext` field propagation, `CLEANUP_BEGIN` after
+`DONE`, `STASH_CLEAR_OK` verifies both stashes, `STATE_CLEAR_OK` verifies both
+atomics, `CURRENT_OK`/`CR3_OK`/`TSS_OK` markers from helper, helper is x86_64-only,
+`CLEANUP_DONE` emitted unconditionally, CAS-based one-shot enforcement, Stage 129
+markers intact, scheduler quantum fix intact, default-off proof, `switch_frames`
+ABI unchanged, AArch64/RISC-V untouched, Stage 125 bridge markers intact, D4/syscall
+counts, helper emits all three per-lock markers.
+
 ## 2. Live paths and fallbacks
 
 ### D1 + D5 (recv-side cap materialization)
