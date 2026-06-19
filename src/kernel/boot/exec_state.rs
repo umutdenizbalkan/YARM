@@ -2025,6 +2025,75 @@ impl KernelState {
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}", active_asid);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_TSS_OK");
     }
+
+    /// Stage 133: software page-table walk to verify ASID 1 maps page 0xffff80000000d000.
+    ///
+    /// Reads the current CR3 (which at CLEANUP_DONE is TID1/ASID1's root) and walks
+    /// the 4-level page table for the exact page that contained the observed
+    /// CR2=0xffff80000000d9d8.  Emits D6_ASID1_PAGE_CHECK_* markers before CLEANUP_DONE.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_check_asid1_stack_page_mapped(&self) {
+        const CHECK_PAGE: u64 = 0xffff_8000_0000_d000;
+        #[cfg(not(test))]
+        {
+            const VIRT_OFFSET: u64 = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
+            let pml4_phys = unsafe {
+                let mut cr3: u64;
+                core::arch::asm!(
+                    "mov {}, cr3",
+                    out(reg) cr3,
+                    options(nomem, preserves_flags)
+                );
+                cr3 & 0x000F_FFFF_FFFF_F000
+            };
+            crate::yarm_log!("D6_ASID1_PAGE_CHECK_CR3 phys=0x{:x}", pml4_phys);
+            let pte = unsafe { d6_x86_walk_4level(CHECK_PAGE, pml4_phys, VIRT_OFFSET) };
+            match pte {
+                Some(p) => crate::yarm_log!(
+                    "D6_ASID1_PAGE_CHECK_MAPPED present=yes pte=0x{:x} page=0x{:016x}",
+                    p,
+                    CHECK_PAGE
+                ),
+                None => crate::yarm_log!(
+                    "D6_ASID1_PAGE_CHECK_MAPPED present=no page=0x{:016x}",
+                    CHECK_PAGE
+                ),
+            }
+        }
+        // In test builds the page walk is unavailable; suppress the unused-variable warning.
+        #[cfg(test)]
+        let _ = CHECK_PAGE;
+    }
+}
+
+/// Stage 133: 4-level x86_64 software page-table walk.
+/// Returns the leaf PTE if the page is present at any level (1G/2M/4K),
+/// None if any level is not-present.
+#[cfg(all(not(test), target_arch = "x86_64"))]
+unsafe fn d6_x86_walk_4level(va: u64, pml4_phys: u64, virt_offset: u64) -> Option<u64> {
+    let pml4e = d6_read_pte(pml4_phys, (va >> 39) & 0x1FF, virt_offset)?;
+    let pdp_phys = pml4e & 0x000F_FFFF_FFFF_F000;
+    let pdpe = d6_read_pte(pdp_phys, (va >> 30) & 0x1FF, virt_offset)?;
+    if pdpe & (1 << 7) != 0 {
+        return Some(pdpe);
+    }
+    let pd_phys = pdpe & 0x000F_FFFF_FFFF_F000;
+    let pde = d6_read_pte(pd_phys, (va >> 21) & 0x1FF, virt_offset)?;
+    if pde & (1 << 7) != 0 {
+        return Some(pde);
+    }
+    let pt_phys = pde & 0x000F_FFFF_FFFF_F000;
+    d6_read_pte(pt_phys, (va >> 12) & 0x1FF, virt_offset)
+}
+
+#[cfg(all(not(test), target_arch = "x86_64"))]
+#[inline]
+unsafe fn d6_read_pte(table_phys: u64, idx: u64, virt_offset: u64) -> Option<u64> {
+    let virt = table_phys
+        .wrapping_add(virt_offset)
+        .wrapping_add(idx.wrapping_mul(8));
+    let entry = core::ptr::read_volatile(virt as *const u64);
+    if entry & 1 == 0 { None } else { Some(entry) }
 }
 
 #[cfg(test)]

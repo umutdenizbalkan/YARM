@@ -36979,3 +36979,216 @@ mod stage132_post_cleanup_pf_diagnosis {
         );
     }
 }
+
+// ===========================================================================
+// Stage 133: pre-lock #PF diagnostic and ASID 1 stack-page mapping check
+// ===========================================================================
+#[cfg(test)]
+mod stage133_pre_lock_pf_diag {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const DESCRIPTOR_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+
+    fn pre_lock_diag_fn_source() -> &'static str {
+        let start = DESCRIPTOR_SRC
+            .find("fn d6_emit_pre_lock_pf_diag")
+            .expect("Stage 133 pre-lock diag function in descriptor_tables.rs");
+        let end = DESCRIPTOR_SRC[start..]
+            .find("\n#[cfg")
+            .map(|offset| start + offset)
+            .expect("next cfg-gated item after pre-lock diag fn");
+        &DESCRIPTOR_SRC[start..end]
+    }
+
+    fn asid_check_fn_source() -> &'static str {
+        let start = EXEC_STATE_SRC
+            .find("fn d6_check_asid1_stack_page_mapped")
+            .expect("Stage 133 ASID page check method in exec_state.rs");
+        // Grab up to the next method or closing brace of the impl block.
+        let end = EXEC_STATE_SRC[start..]
+            .find("D6_ASID1_PAGE_CHECK_MAPPED present=no")
+            .map(|offset| start + offset + 40)
+            .unwrap_or(start + 1500);
+        &EXEC_STATE_SRC[start..end]
+    }
+
+    // 1. D6_PRE_LOCK_PF_DIAG_PENDING is declared in mod.rs as a per-CPU AtomicBool array.
+    #[test]
+    fn stage133_pre_lock_flag_declared_in_mod() {
+        assert!(
+            MOD_SRC.contains("D6_PRE_LOCK_PF_DIAG_PENDING"),
+            "Stage 133 must declare D6_PRE_LOCK_PF_DIAG_PENDING in mod.rs"
+        );
+        assert!(
+            MOD_SRC.contains("AtomicBool"),
+            "D6_PRE_LOCK_PF_DIAG_PENDING must use AtomicBool"
+        );
+    }
+
+    // 2. D6_PRE_LOCK_PF_DIAG_PENDING is set in trap_entry.rs inside if is_proof_done.
+    #[test]
+    fn stage133_pre_lock_flag_set_in_trap_entry() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_PRE_LOCK_PF_DIAG_PENDING"),
+            "trap_entry.rs must set D6_PRE_LOCK_PF_DIAG_PENDING"
+        );
+        let is_done_pos = TRAP_ENTRY_SRC
+            .find("if is_proof_done")
+            .expect("is_proof_done gate");
+        let flag_pos = TRAP_ENTRY_SRC
+            .find("D6_PRE_LOCK_PF_DIAG_PENDING")
+            .expect("D6_PRE_LOCK_PF_DIAG_PENDING in trap_entry.rs");
+        assert!(
+            flag_pos > is_done_pos,
+            "D6_PRE_LOCK_PF_DIAG_PENDING must be set inside if is_proof_done"
+        );
+    }
+
+    // 3. D6_PRE_LOCK_PF_DIAG_PENDING is consumed in descriptor_tables.rs with swap(false).
+    #[test]
+    fn stage133_pre_lock_flag_consumed_in_descriptor_tables() {
+        assert!(
+            DESCRIPTOR_SRC.contains("D6_PRE_LOCK_PF_DIAG_PENDING"),
+            "descriptor_tables.rs must consume D6_PRE_LOCK_PF_DIAG_PENDING"
+        );
+        let flag_pos = DESCRIPTOR_SRC
+            .find("D6_PRE_LOCK_PF_DIAG_PENDING")
+            .expect("D6_PRE_LOCK_PF_DIAG_PENDING in descriptor_tables.rs");
+        let nearby = &DESCRIPTOR_SRC[flag_pos..flag_pos + 200];
+        assert!(
+            nearby.contains("swap(false"),
+            "D6_PRE_LOCK_PF_DIAG_PENDING must be consumed with swap(false"
+        );
+    }
+
+    // 4. Pre-lock check fires only on VEC_PAGE_FAULT.
+    #[test]
+    fn stage133_pre_lock_check_gated_on_page_fault_vector() {
+        let flag_pos = DESCRIPTOR_SRC
+            .find("D6_PRE_LOCK_PF_DIAG_PENDING")
+            .expect("D6_PRE_LOCK_PF_DIAG_PENDING");
+        let context_before = &DESCRIPTOR_SRC[flag_pos.saturating_sub(300)..flag_pos];
+        assert!(
+            context_before.contains("VEC_PAGE_FAULT"),
+            "pre-lock diagnostic must be gated on VEC_PAGE_FAULT"
+        );
+    }
+
+    // 5. d6_emit_pre_lock_pf_diag emits all required D6_PRE_LOCK_PF_DIAG_* markers.
+    #[test]
+    fn stage133_pre_lock_diag_fn_emits_required_markers() {
+        let src = pre_lock_diag_fn_source();
+        for marker in &[
+            "D6_PRE_LOCK_PF_DIAG_BEGIN",
+            "D6_PRE_LOCK_PF_DIAG_VECTOR",
+            "D6_PRE_LOCK_PF_DIAG_ERROR",
+            "D6_PRE_LOCK_PF_DIAG_CR2",
+            "D6_PRE_LOCK_PF_DIAG_RIP",
+            "D6_PRE_LOCK_PF_DIAG_RSP",
+            "D6_PRE_LOCK_PF_DIAG_R14",
+            "D6_PRE_LOCK_PF_DIAG_RSP_MINUS_8",
+            "D6_PRE_LOCK_PF_DIAG_LOCKPTR",
+            "D6_PRE_LOCK_PF_DIAG_CLASS",
+            "D6_PRE_LOCK_PF_DIAG_DONE",
+        ] {
+            assert!(
+                src.contains(marker),
+                "d6_emit_pre_lock_pf_diag must emit {}",
+                marker
+            );
+        }
+    }
+
+    // 6. Classification uses HANDLE_TRAP_LOCK_OFFSET = 0x3e_1780.
+    #[test]
+    fn stage133_pre_lock_diag_uses_correct_lock_offset() {
+        let src = pre_lock_diag_fn_source();
+        assert!(
+            src.contains("0x3e_1780"),
+            "d6_emit_pre_lock_pf_diag must use HANDLE_TRAP_LOCK_OFFSET = 0x3e_1780"
+        );
+        assert!(
+            src.contains("HANDLE_TRAP_LOCK_OFFSET"),
+            "lock offset must be named HANDLE_TRAP_LOCK_OFFSET"
+        );
+    }
+
+    // 7. Classification labels stack_push, r14_lockptr, other are all present.
+    #[test]
+    fn stage133_pre_lock_diag_has_all_class_labels() {
+        let src = pre_lock_diag_fn_source();
+        for label in &["stack_push", "r14_lockptr", "other"] {
+            assert!(
+                src.contains(label),
+                "d6_emit_pre_lock_pf_diag must contain classification label '{}'",
+                label
+            );
+        }
+    }
+
+    // 8. d6_check_asid1_stack_page_mapped exists in exec_state.rs gated to x86_64.
+    #[test]
+    fn stage133_asid_check_fn_exists_gated_x86_64() {
+        assert!(
+            EXEC_STATE_SRC.contains("fn d6_check_asid1_stack_page_mapped"),
+            "exec_state.rs must declare d6_check_asid1_stack_page_mapped"
+        );
+        let fn_pos = EXEC_STATE_SRC
+            .find("fn d6_check_asid1_stack_page_mapped")
+            .expect("fn position");
+        let cfg_before = &EXEC_STATE_SRC[fn_pos.saturating_sub(100)..fn_pos];
+        assert!(
+            cfg_before.contains("x86_64"),
+            "d6_check_asid1_stack_page_mapped must be gated on target_arch = x86_64"
+        );
+    }
+
+    // 9. d6_check_asid1_stack_page_mapped is called before CLEANUP_DONE in trap_entry.rs.
+    #[test]
+    fn stage133_asid_check_called_before_cleanup_done() {
+        let check_pos = TRAP_ENTRY_SRC
+            .find("d6_check_asid1_stack_page_mapped")
+            .expect("d6_check_asid1_stack_page_mapped call in trap_entry.rs");
+        let done_pos = TRAP_ENTRY_SRC
+            .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE")
+            .expect("CLEANUP_DONE marker");
+        assert!(
+            check_pos < done_pos,
+            "d6_check_asid1_stack_page_mapped must be called before CLEANUP_DONE"
+        );
+    }
+
+    // 10. d6_check_asid1_stack_page_mapped emits D6_ASID1_PAGE_CHECK_* markers.
+    #[test]
+    fn stage133_asid_check_fn_emits_markers() {
+        let src = asid_check_fn_source();
+        for marker in &["D6_ASID1_PAGE_CHECK_CR3", "D6_ASID1_PAGE_CHECK_MAPPED"] {
+            assert!(
+                src.contains(marker),
+                "d6_check_asid1_stack_page_mapped must emit {}",
+                marker
+            );
+        }
+    }
+
+    // 11. ASID check targets the specific fault page 0xffff_8000_0000_d000.
+    #[test]
+    fn stage133_asid_check_targets_correct_page() {
+        let src = asid_check_fn_source();
+        assert!(
+            src.contains("0xffff_8000_0000_d000"),
+            "d6_check_asid1_stack_page_mapped must check page 0xffff_8000_0000_d000"
+        );
+    }
+
+    // 12. ASID check reads CR3 from hardware directly (not from KernelState).
+    #[test]
+    fn stage133_asid_check_reads_cr3_from_hardware() {
+        let src = asid_check_fn_source();
+        assert!(
+            src.contains("cr3"),
+            "d6_check_asid1_stack_page_mapped must read CR3 register"
+        );
+    }
+}

@@ -857,6 +857,58 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 ) {
 }
 
+/// Stage 133: pre-lock one-shot #PF diagnostic.
+///
+/// Called from `yarm_x86_dispatch_trap_from_stub` on the first post-cleanup
+/// page fault, before any KernelState lock is acquired.  Uses the raw values
+/// from the hardware interrupt frame (RIP, RSP) and the trap stub's pushed
+/// register file (R14) to emit D6_PRE_LOCK_PF_DIAG_* markers and classify
+/// the fault:
+///
+///   stack_push  — CR2 == RSP-8  (a kernel push hit an unmapped page)
+///   r14_lockptr — CR2 == R14 + HANDLE_TRAP_LOCK_OFFSET  (r14 is garbage)
+///   other       — neither of the above
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn d6_emit_pre_lock_pf_diag(
+    vector: u64,
+    error_code: u64,
+    cr2: u64,
+    regs: *const X86SavedRegs,
+    interrupt_frame: *const X86InterruptStackFrame,
+) {
+    // HANDLE_TRAP_LOCK_OFFSET: offset of the SpinLock computed by
+    // `leaq 0x3e1780(%r14), %rbx` inside the trap handler.
+    const HANDLE_TRAP_LOCK_OFFSET: u64 = 0x3e_1780;
+    let (rip, rsp, r14) = unsafe {
+        let frame = &*interrupt_frame;
+        let saved = &*regs;
+        (frame.rip, frame.rsp, saved.r14)
+    };
+    let rsp_minus_8 = rsp.wrapping_sub(8);
+    let lockptr = r14.wrapping_add(HANDLE_TRAP_LOCK_OFFSET);
+    let class = if cr2 == rsp_minus_8 {
+        "stack_push"
+    } else if cr2 == lockptr {
+        "r14_lockptr"
+    } else {
+        "other"
+    };
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_BEGIN");
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_VECTOR value=0x{:x}", vector);
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_ERROR value=0x{:x}", error_code);
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_CR2 value=0x{:016x}", cr2);
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_RIP value=0x{:016x}", rip);
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_RSP value=0x{:016x}", rsp);
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_R14 value=0x{:016x}", r14);
+    crate::yarm_log!(
+        "D6_PRE_LOCK_PF_DIAG_RSP_MINUS_8 value=0x{:016x}",
+        rsp_minus_8
+    );
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_LOCKPTR value=0x{:016x}", lockptr);
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_CLASS class={}", class);
+    crate::yarm_log!("D6_PRE_LOCK_PF_DIAG_DONE");
+}
+
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 extern "C" fn yarm_x86_dispatch_trap_from_stub(
@@ -893,6 +945,19 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         fault_addr,
     };
     let cpu = current_cpu_id();
+
+    // Stage 133: pre-lock one-shot #PF diagnostic — fires before any KernelState
+    // lock is acquired, giving access to raw trap-stub register values.
+    #[cfg(not(feature = "hosted-dev"))]
+    if vector as usize == VEC_PAGE_FAULT {
+        let pre_lock_cpu_idx = cpu.0 as usize;
+        if pre_lock_cpu_idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::D6_PRE_LOCK_PF_DIAG_PENDING[pre_lock_cpu_idx]
+                .swap(false, Ordering::AcqRel)
+        {
+            d6_emit_pre_lock_pf_diag(vector, error_code, fault_addr, regs, interrupt_frame);
+        }
+    }
 
     // Stage 2N: prefer SharedKernel path when available.
     if let Some(shared) = trap_shared_kernel() {
