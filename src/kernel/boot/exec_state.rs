@@ -973,6 +973,12 @@ impl KernelState {
                 // SAFETY: single CPU, interrupts disabled by hardware trap entry,
                 // no concurrent accessor; stash is only read/drained in the same
                 // CPU's `handle_trap_entry_shared` after this function returns.
+                let already_stashed =
+                    unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].has_plan() };
+                if already_stashed {
+                    crate::yarm_log!("D6_GLOBAL_LOCK_DROP_DEFERRED reason=stash_occupied");
+                    return Ok(());
+                }
                 unsafe {
                     crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].store(plan);
                 }
@@ -1025,6 +1031,103 @@ impl KernelState {
 
         crate::yarm_log!("D6_SWITCH_FRAMES_RETURNED");
         Ok(())
+    }
+
+    /// Stage 120: x86_64-only, single-CPU-only, boot-knob-gated, one-shot proof
+    /// harness for the existing unlocked `switch_frames` path.
+    ///
+    /// This is not a scheduler policy path: it only runs when the boot command
+    /// line contains `yarm.d6_switch_proof=1`, the current task is tid=1, tid=2
+    /// has an initialized kernel switch frame, and the Stage 117 trap-path stash
+    /// is active. It reuses `DispatchSwitchPlan` via `maybe_switch_kernel_context`
+    /// and disables itself permanently after one stashed proof pair.
+    pub(crate) fn maybe_run_d6_controlled_switch_proof(&mut self) -> Result<(), KernelError> {
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            return Ok(());
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+                || crate::kernel::boot::d6_controlled_switch_proof_done()
+            {
+                return Ok(());
+            }
+            if self.online_cpu_count() != 1 {
+                crate::yarm_log!(
+                    "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=multi_cpu online_cpus={}",
+                    self.online_cpu_count()
+                );
+                return Ok(());
+            }
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path_active = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            if !trap_path_active {
+                crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=trap_path_inactive");
+                return Ok(());
+            }
+            let outgoing_tid = match self.current_tid() {
+                Some(BOOTSTRAP_FIRST_USER_TID) => BOOTSTRAP_FIRST_USER_TID,
+                Some(other) => {
+                    if other == BOOTSTRAP_SUPERVISOR_TID {
+                        crate::yarm_log!(
+                            "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=wrong_outgoing_tid tid={}",
+                            other
+                        );
+                    }
+                    return Ok(());
+                }
+                None => {
+                    crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=no_current_tid");
+                    return Ok(());
+                }
+            };
+            let incoming_tid = BOOTSTRAP_SUPERVISOR_TID;
+            let frames_ready = self.with_tcbs_mut(|tcbs| {
+                let has_initialized = |tid| {
+                    tcbs.iter()
+                        .flatten()
+                        .any(|tcb| tcb.tid.0 == tid && tcb.kernel_context.initialized)
+                };
+                has_initialized(outgoing_tid) && has_initialized(incoming_tid)
+            });
+            if !frames_ready {
+                crate::yarm_log!(
+                    "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=frames_uninitialized outgoing={} incoming={}",
+                    outgoing_tid,
+                    incoming_tid
+                );
+                return Ok(());
+            }
+            // Stage 128: `switch_frames` does not switch CR3; it changes the
+            // kernel stack while the outgoing/current root is still active.
+            // Before stashing the proof plan, prove that the incoming stack page
+            // is visible and supervisor-writable in that active root.
+            if let Err(err) = self.ensure_active_root_can_use_kernel_switch_stack(incoming_tid) {
+                crate::yarm_log!(
+                    "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=active_stack_unmapped outgoing={} incoming={} err={:?}",
+                    outgoing_tid,
+                    incoming_tid,
+                    err
+                );
+                return Ok(());
+            }
+            if !crate::kernel::boot::d6_controlled_switch_proof_try_start() {
+                return Ok(());
+            }
+            crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_BEGIN");
+            crate::yarm_log!(
+                "D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing={} incoming={}",
+                outgoing_tid,
+                incoming_tid
+            );
+            self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?;
+            crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
+            Ok(())
+        }
     }
 
     pub fn futex_wait_current(
@@ -1153,8 +1256,7 @@ impl KernelState {
         // handler can prove lock reacquisition via post_switch_restore.
         #[cfg(target_arch = "x86_64")]
         if spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID {
-            let entry =
-                super::thread_state::yarm_kernel_thread_switch_trampoline as *const () as usize;
+            let entry = super::thread_state::kernel_switch_frame_trampoline_ip();
             crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_BEGIN tid={}", spec.tid);
             match self.initialize_thread_kernel_switch_frame(spec.tid, entry) {
                 Ok(()) => {
@@ -1290,6 +1392,47 @@ impl KernelState {
             tcb.asid = Some(asid);
             Ok::<_, KernelError>(())
         })?;
+
+        // Stage 127: Stage 126 correctly refused to publish x86_64 initialized
+        // switch frames without a mapped kernel switch-stack page, but the first
+        // attempt above can run before the target task ASID is bound. Retry at
+        // the first point where the target ASID/root is known so the mapping gate
+        // uses the target task root rather than temporal active-ASID presence.
+        #[cfg(target_arch = "x86_64")]
+        if (spec.tid == BOOTSTRAP_FIRST_USER_TID || spec.tid == BOOTSTRAP_SUPERVISOR_TID)
+            && !self
+                .thread_kernel_context(spec.tid)
+                .is_some_and(|ctx| ctx.initialized)
+        {
+            let entry = super::thread_state::kernel_switch_frame_trampoline_ip();
+            crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid={}", spec.tid);
+            match self.initialize_thread_kernel_switch_frame(spec.tid, entry) {
+                Ok(()) => {
+                    let stack = self.with_tcbs(|tcbs| {
+                        tcbs.iter()
+                            .flatten()
+                            .find(|tcb| tcb.tid.0 == spec.tid)
+                            .and_then(|tcb| tcb.kernel_context.stack_top)
+                            .map(|t| t.0)
+                            .unwrap_or(0)
+                    });
+                    crate::yarm_log!("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}", spec.tid);
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_FRAME_INIT_DONE tid={} entry=0x{:x} stack=0x{:x}",
+                        spec.tid,
+                        entry,
+                        stack,
+                    );
+                }
+                Err(e) => {
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED reason=retry_failed tid={} err={:?}",
+                        spec.tid,
+                        e,
+                    );
+                }
+            }
+        }
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("BOOTSTRAP_STAGE: before stack allocation");
         }

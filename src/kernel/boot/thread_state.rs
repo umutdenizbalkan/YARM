@@ -20,23 +20,115 @@ const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
 const USER_VIRT_TOP_EXCLUSIVE: u64 = crate::kernel::vm::KERNEL_SPACE_BASE;
 const USER_STACK_TOP_BASE: u64 = USER_VIRT_TOP_EXCLUSIVE - USER_STACK_STRIDE_BYTES;
 
+#[cfg(all(target_arch = "x86_64", not(test)))]
+core::arch::global_asm!(
+    r#"
+    .section .text, "ax", @progbits
+    .global yarm_kernel_thread_switch_trampoline
+    .type yarm_kernel_thread_switch_trampoline, @function
+yarm_kernel_thread_switch_trampoline:
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x41
+    out dx, al
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x4d
+    out dx, al
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x4a
+    out dx, al
+    jmp yarm_kernel_thread_switch_trampoline_rust_bridge
+
+    .global yarm_kernel_thread_switch_trampoline_rust_bridge
+    .type yarm_kernel_thread_switch_trampoline_rust_bridge, @function
+yarm_kernel_thread_switch_trampoline_rust_bridge:
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x42
+    out dx, al
+    sub rsp, 8
+    call yarm_kernel_thread_switch_trampoline_rust_real
+    mov dx, 0x3f8
+    mov al, 0x21
+    out dx, al
+    mov al, 0x52
+    out dx, al
+    mov al, 0x58
+    out dx, al
+1:
+    cli
+    hlt
+    jmp 1b
+"#
+);
+
+#[cfg(all(target_arch = "x86_64", not(test)))]
+unsafe extern "C" {
+    pub(crate) fn yarm_kernel_thread_switch_trampoline() -> !;
+}
+
 /// Returns the raw instruction-pointer value of `yarm_kernel_thread_switch_trampoline`,
 /// used by the trap-entry stash drain to detect the first-resume path.
 pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
     yarm_kernel_thread_switch_trampoline as *const () as usize
 }
 
-/// First-resume handler. Entered via `switch_frames` when the incoming task's
-/// kernel switch frame has never executed (RIP == trampoline address).
-///
-/// On x86_64: takes the per-CPU `FirstResumeContext` stash, re-acquires the
-/// global lock, calls `post_switch_restore_arch_thread_state` with no trap
-/// frame (no-op on x86_64), then switches back to the outgoing task.
-///
-/// On all other architectures (and as a defensive fallback on x86_64 when the
-/// stash is absent): emits `D6_FIRST_RESUME_DEFERRED` and spins.
+/// Stage 125: the first-resume raw trampoline no longer jumps directly into a
+/// normal Rust ABI function. The raw COM1 sequence emits `!R` at shim entry,
+/// `!RA` at the former stack-adjust boundary, `!RM` where the removed Rust
+/// marker bridge used to run, and `!RJ` immediately before jumping to the
+/// x86_64 ABI bridge `yarm_kernel_thread_switch_trampoline_rust_bridge`. The
+/// bridge emits `!RB`, subtracts 8 from the initialized `rsp % 16 == 8` shape so
+/// the subsequent `call` enters Rust with SysV callee shape, and calls
+/// `yarm_kernel_thread_switch_trampoline_rust_real`.
+/// VALIDATION: D6_FIRST_RESUME_RUST_ENTER / !RM / !RJ / !RB
+#[cfg(all(target_arch = "x86_64", test))]
 #[unsafe(no_mangle)]
 pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
+    yarm_kernel_thread_switch_trampoline_rust_real()
+}
+
+/// First-resume Rust handler. Entered only through the documented first-resume
+/// entry path. On x86_64, `switch_frames` restores RIP to
+/// `yarm_kernel_thread_switch_trampoline`; that raw shim emits `!R`, `!RA`,
+/// `!RM`, and `!RJ`, then jumps to the assembly ABI bridge. The bridge emits
+/// `!RB`, adjusts the stack for a normal SysV `call`, and calls this Rust real
+/// handler. Non-x86_64 keeps the historical direct Rust entry and immediately
+/// defers.
+///
+/// x86_64 ABI audit: `switch_frames` saves/restores `[rsp, rip, rbx, rbp,
+/// r12..r15, fxsave]` in `ArchSwitchContext`. It enters the incoming frame with
+/// `mov rsp, [next + 0]` and `jmp [next + 8]` (not `ret`). The initialized frame
+/// reserves a fake return-address slot so the bridge starts at `rsp % 16 == 8`;
+/// the bridge then uses `sub rsp, 8` before `call`, so this handler is entered
+/// with normal SysV callee shape (`rsp % 16 == 8`). VALIDATION:
+/// D6_FIRST_RESUME_RUST_ENTER
+#[cfg_attr(
+    target_arch = "x86_64",
+    unsafe(export_name = "yarm_kernel_thread_switch_trampoline_rust_real")
+)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    unsafe(export_name = "yarm_kernel_thread_switch_trampoline_rust")
+)]
+pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust_real() -> ! {
     #[cfg(not(target_arch = "x86_64"))]
     {
         crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=non_x86_64_arch");
@@ -46,17 +138,22 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
     }
     #[cfg(target_arch = "x86_64")]
     {
+        crate::yarm_log!("D6_FIRST_RESUME_RUST_ENTER");
+        let stack_align = current_stack_alignment_for_diagnostics();
+        crate::yarm_log!("D6_FIRST_RESUME_STACK_ALIGN value={}", stack_align);
         // Single-CPU precondition: the stash is always on CPU 0 (bootstrap CPU).
         let cpu_idx = crate::arch::platform_constants::BOOTSTRAP_CPU_ID as usize;
         // SAFETY: single CPU, interrupts disabled (trap path precondition for
         // can_stash_for_lock_drop), no concurrent accessor of FIRST_RESUME_STASH.
         let ctx = unsafe { crate::kernel::boot::FIRST_RESUME_STASH[cpu_idx].take() };
         let Some(ctx) = ctx else {
+            crate::yarm_log!("D6_FIRST_RESUME_STASH_MISSING");
             crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=stash_empty");
             loop {
                 core::hint::spin_loop();
             }
         };
+        crate::yarm_log!("D6_FIRST_RESUME_STASH_OK");
         crate::yarm_log!(
             "D6_FIRST_RESUME_ENTER tid={} cpu={}",
             ctx.incoming_tid,
@@ -97,6 +194,17 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline() -> ! {
             core::hint::spin_loop();
         }
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn current_stack_alignment_for_diagnostics() -> usize {
+    let rsp: usize;
+    // SAFETY: read-only diagnostic snapshot of the architectural stack pointer.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+    }
+    rsp & 0xF
 }
 
 impl KernelState {
@@ -211,6 +319,357 @@ impl KernelState {
         })
     }
 
+    /// Stage 126/127/128 kernel switch-stack invariant gate.
+    ///
+    /// `incoming_stack_top`/`stack_top` values are virtual kernel stack tops in
+    /// the fixed higher-half kernel-stack arena, not physical addresses. On
+    /// x86_64 the Stage 125 bridge performs `sub rsp, 8; call rust_real`, so the
+    /// page below the aligned top must cover the fake return slot (`top - 8`),
+    /// the bridge alignment slot (`top - 16`), and the observed call-push write
+    /// (`top - 24`, 0xffff800000007fe8 when top is 0xffff800000008000). Before
+    /// publishing `kernel_context.initialized = true`, ensure that page is
+    /// present, writable, supervisor/kernel-only (not user), and mapped into the
+    /// target task ASID/root that owns the first-resume context.
+    ///
+    /// Stage 127 deliberately avoids active-ASID enumeration as the terminal
+    /// gate: early supervisor/init spawn can initialize a target task before any
+    /// ASID is currently running, but the target task root is still the correct
+    /// initial mapping authority once `task_asid(tid)` is bound. Stage 128 adds
+    /// the stronger CR3 coverage invariant: `switch_frames` is only a kernel
+    /// stack/register switch and does not switch CR3, so the incoming stack page
+    /// must also be installed as a kernel-shared mapping in every existing task
+    /// root that may be the active/outgoing CR3 when the bridge uses that stack.
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    fn ensure_kernel_switch_stack_mapped(
+        &mut self,
+        tid: u64,
+        stack_base: usize,
+        stack_top: usize,
+    ) -> Result<(), KernelError> {
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
+        use crate::kernel::vm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+        fn validate_entry(entry: page_table::PageTableEntry) -> bool {
+            (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
+        }
+
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_CHECK_BEGIN tid={} top=0x{:x}",
+            tid,
+            stack_top
+        );
+
+        let aligned_top = stack_top & !0xF;
+        let fake_return_probe = aligned_top
+            .checked_sub(core::mem::size_of::<usize>())
+            .ok_or(KernelError::WrongObject)?;
+        let bridge_slot_probe = aligned_top
+            .checked_sub(2 * core::mem::size_of::<usize>())
+            .ok_or(KernelError::WrongObject)?;
+        let call_push_probe = aligned_top
+            .checked_sub(3 * core::mem::size_of::<usize>())
+            .ok_or(KernelError::WrongObject)?;
+        let probe_page = fake_return_probe & !(PAGE_SIZE - 1);
+
+        if stack_base == 0
+            || stack_base >= stack_top
+            || probe_page < stack_base
+            || call_push_probe < stack_base
+            || fake_return_probe >= stack_top
+            || bridge_slot_probe >= stack_top
+        {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=stack_bounds",
+                tid,
+                fake_return_probe
+            );
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=stack_bounds tid={}",
+                tid
+            );
+            return Err(KernelError::WrongObject);
+        }
+
+        let Some(target_asid) = self.task_asid(tid) else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=target_asid_unavailable",
+                tid,
+                fake_return_probe
+            );
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=target_asid_unavailable tid={}",
+                tid
+            );
+            return Err(KernelError::UserMemoryFault);
+        };
+        if self.with_user_spaces(|spaces| spaces.get(target_asid).is_none()) {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=target_root_unavailable",
+                tid,
+                fake_return_probe
+            );
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=target_root_unavailable tid={}",
+                tid
+            );
+            return Err(KernelError::VmFull);
+        }
+
+        let stack_page = VirtAddr(probe_page as u64);
+        let phys = if let Some(entry) = page_table::resolve_page(target_asid, stack_page) {
+            if !validate_entry(entry) {
+                let reason = if (entry.0 & PageTableEntry::WRITABLE) == 0 {
+                    "not_writable"
+                } else {
+                    "user_accessible"
+                };
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason={}",
+                    tid,
+                    fake_return_probe,
+                    reason
+                );
+                crate::yarm_log!(
+                    "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason={} tid={}",
+                    reason,
+                    tid
+                );
+                return Err(KernelError::VmFull);
+            }
+            entry.addr()
+        } else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_BEGIN tid={} asid={} va=0x{:x}",
+                tid,
+                target_asid.0,
+                probe_page
+            );
+            let phys = self.alloc_user_data_frame()?;
+            page_table::map_page(
+                target_asid,
+                stack_page,
+                PhysAddr(phys),
+                PageFlags::KERNEL_RW,
+            )
+            .map_err(|_| KernelError::VmFull)?;
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DONE tid={} asid={} va=0x{:x}",
+                tid,
+                target_asid.0,
+                probe_page
+            );
+            phys
+        };
+
+        // Stage 128: because `switch_frames` does not switch CR3, an incoming
+        // stack may be used while the outgoing task's root is still active.
+        // Install the same supervisor-only backing page in every currently
+        // existing task root (plus the target root) instead of relying on a
+        // target-ASID-only mapping. This is intentionally narrow: one page, not
+        // the full kernel-stack arena.
+        let mut roots = [None; super::MAX_TASKS];
+        roots[0] = Some(target_asid);
+        self.with_tcbs(|tcbs| {
+            let mut len = 1usize;
+            for tcb in tcbs.iter().flatten() {
+                let Some(asid) = tcb.asid else {
+                    continue;
+                };
+                if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
+                    continue;
+                }
+                if roots[..len].iter().any(|entry| *entry == Some(asid)) {
+                    continue;
+                }
+                if len < roots.len() {
+                    roots[len] = Some(asid);
+                    len += 1;
+                }
+            }
+        });
+
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_MAP_SHARED_BEGIN tid={} va=0x{:x}",
+            tid,
+            probe_page
+        );
+        for asid in roots.iter().flatten().copied() {
+            let result = match page_table::resolve_page(asid, stack_page) {
+                Some(entry) if entry.addr() == phys && validate_entry(entry) => "already_ok",
+                Some(_) => {
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_STACK_MAP_SHARED_ROOT tid={} asid={} va=0x{:x} result=conflict",
+                        tid,
+                        asid.0,
+                        probe_page
+                    );
+                    crate::yarm_log!(
+                        "D6_KERNEL_SWITCH_STACK_MAP_SHARED_DEFERRED reason=shared_root_conflict tid={}",
+                        tid
+                    );
+                    return Err(KernelError::VmFull);
+                }
+                None => {
+                    page_table::map_page(asid, stack_page, PhysAddr(phys), PageFlags::KERNEL_RW)
+                        .map_err(|_| KernelError::VmFull)?;
+                    "mapped"
+                }
+            };
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_SHARED_ROOT tid={} asid={} va=0x{:x} result={}",
+                tid,
+                asid.0,
+                probe_page,
+                result
+            );
+        }
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_MAP_SHARED_DONE tid={} va=0x{:x}",
+            tid,
+            probe_page
+        );
+
+        let Some(entry) = page_table::resolve_page(target_asid, stack_page) else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=resolve_after_map_failed",
+                tid,
+                fake_return_probe
+            );
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=resolve_after_map_failed tid={}",
+                tid
+            );
+            return Err(KernelError::VmFull);
+        };
+        if entry.addr() != phys || !validate_entry(entry) {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid={} probe=0x{:x} reason=mapped_flags_invalid",
+                tid,
+                fake_return_probe
+            );
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_MAP_DEFERRED reason=mapped_flags_invalid tid={}",
+                tid
+            );
+            return Err(KernelError::VmFull);
+        }
+
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_CHECK_OK tid={} probe=0x{:x}",
+            tid,
+            fake_return_probe
+        );
+        Ok(())
+    }
+
+    /// Stage 128 proof-time active-root guard.
+    ///
+    /// `switch_frames` switches callee-saved registers and the kernel stack; it
+    /// does not switch CR3. The Stage 120 proof therefore checks the incoming
+    /// switch-stack page against `hal.active_asid()` before dropping the global
+    /// lock, proving the stack is visible in the root that is active at the
+    /// bridge `callq` return-address push.
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
+        &mut self,
+        tid: u64,
+    ) -> Result<(), KernelError> {
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
+        use crate::kernel::vm::{PAGE_SIZE, VirtAddr};
+
+        let active_asid = self.hal.active_asid();
+        let cr3 = active_asid.and_then(page_table::cr3_for_asid).unwrap_or(0);
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT cpu={} active_asid={} cr3=0x{:x}",
+            self.current_cpu().0,
+            active_asid.map_or(0, |asid| asid.0),
+            cr3
+        );
+        let Some(active_asid) = active_asid else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid=0 probe=0x0 reason=active_asid_unavailable",
+                tid
+            );
+            return Err(KernelError::UserMemoryFault);
+        };
+        let (stack_base, stack_top) = self.with_tcbs(|tcbs| {
+            let tcb = tcbs
+                .iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            let stack_base = tcb
+                .kernel_context
+                .stack_base
+                .ok_or(KernelError::WrongObject)?
+                .0;
+            let stack_top = tcb
+                .kernel_context
+                .stack_top
+                .ok_or(KernelError::WrongObject)?
+                .0;
+            Ok::<_, KernelError>((stack_base as usize, stack_top as usize))
+        })?;
+        let aligned_top = stack_top & !0xF;
+        let fake_return_probe = aligned_top
+            .checked_sub(core::mem::size_of::<usize>())
+            .ok_or(KernelError::WrongObject)?;
+        let probe_page = fake_return_probe & !(PAGE_SIZE - 1);
+        if probe_page < stack_base {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=stack_bounds",
+                tid,
+                active_asid.0,
+                fake_return_probe
+            );
+            return Err(KernelError::WrongObject);
+        }
+        let stack_page = VirtAddr(probe_page as u64);
+        let Some(entry) = page_table::resolve_page(active_asid, stack_page) else {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=not_mapped",
+                tid,
+                active_asid.0,
+                fake_return_probe
+            );
+            return Err(KernelError::VmFull);
+        };
+        if (entry.0 & PageTableEntry::WRITABLE) == 0 || (entry.0 & PageTableEntry::USER) != 0 {
+            crate::yarm_log!(
+                "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED tid={} active_asid={} probe=0x{:x} reason=flags_invalid",
+                tid,
+                active_asid.0,
+                fake_return_probe
+            );
+            return Err(KernelError::VmFull);
+        }
+        crate::yarm_log!(
+            "D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK tid={} active_asid={} probe=0x{:x}",
+            tid,
+            active_asid.0,
+            fake_return_probe
+        );
+        Ok(())
+    }
+
+    #[cfg(any(not(target_arch = "x86_64"), test))]
+    fn ensure_kernel_switch_stack_mapped(
+        &mut self,
+        _tid: u64,
+        _stack_base: usize,
+        _stack_top: usize,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    #[cfg(any(not(target_arch = "x86_64"), test))]
+    pub(crate) fn ensure_active_root_can_use_kernel_switch_stack(
+        &mut self,
+        _tid: u64,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
     pub fn initialize_thread_kernel_switch_frame(
         &mut self,
         tid: u64,
@@ -219,18 +678,45 @@ impl KernelState {
         if switch_entry == 0 {
             return Err(KernelError::WrongObject);
         }
+        let (stack_base, stack_top) = self.with_tcbs(|tcbs| {
+            let tcb = tcbs
+                .iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            let stack_base = tcb
+                .kernel_context
+                .stack_base
+                .ok_or(KernelError::WrongObject)?
+                .0 as usize;
+            let stack_top = tcb
+                .kernel_context
+                .stack_top
+                .ok_or(KernelError::WrongObject)?
+                .0 as usize;
+            Ok((stack_base, stack_top))
+        })?;
+        self.ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)?;
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
                 .flatten()
                 .find(|tcb| tcb.tid.0 == tid)
                 .ok_or(KernelError::TaskMissing)?;
-            let stack_top = tcb
-                .kernel_context
-                .stack_top
-                .ok_or(KernelError::WrongObject)?
-                .0 as usize;
-            tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
+            // Stage 121 x86_64 first-resume ABI audit: switch_frames enters the
+            // initialized frame with a jump, not a call/ret. A normal SysV Rust
+            // function entry still expects `rsp % 16 == 8`, so reserve one
+            // fake-return-address slot below the 16-byte-aligned stack top on
+            // x86_64. Stage 126 additionally requires the page containing the
+            // fake slot (`stack_top - 8`) and bridge call-push area
+            // (`stack_top - 16` and the observed `stack_top - 24` push to
+            // 0xffff800000007fe8 for top 0xffff800000008000) to be backed and
+            // supervisor-writable before `initialized = true` is published.
+            #[cfg(target_arch = "x86_64")]
+            let entry_stack_ptr = (stack_top & !0xF).saturating_sub(core::mem::size_of::<usize>());
+            #[cfg(not(target_arch = "x86_64"))]
+            let entry_stack_ptr = stack_top & !0xF;
+            tcb.kernel_context.frame.set_stack_ptr(entry_stack_ptr);
             tcb.kernel_context.frame.set_instruction_ptr(switch_entry);
             tcb.kernel_context.initialized = true;
             Ok(())

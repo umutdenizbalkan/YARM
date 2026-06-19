@@ -8580,6 +8580,9 @@ fn kernel_switch_frame_can_be_initialized_for_thread() {
     assert_eq!(context.stack_base, Some(VirtAddr(0x9000_0000)));
     assert_eq!(context.stack_top, Some(VirtAddr(0x9000_4000)));
     assert_eq!(context.frame.instruction_ptr(), 0x1234_5678);
+    #[cfg(target_arch = "x86_64")]
+    assert_eq!(context.frame.stack_ptr() & 0xF, 8);
+    #[cfg(not(target_arch = "x86_64"))]
     assert_eq!(context.frame.stack_ptr() & 0xF, 0);
     assert!(context.initialized);
 }
@@ -34307,6 +34310,1206 @@ mod stage119_minimal_task_pair {
         assert!(
             EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
             "exec_state.rs must reference BOOTSTRAP_SUPERVISOR_TID inside the x86_64 cfg gate"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 120 — x86_64 controlled one-shot unlocked switch_frames proof harness
+// ===========================================================================
+#[cfg(test)]
+mod stage120_controlled_switch_proof {
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const X86_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    #[test]
+    fn stage120_proof_is_x86_64_only_and_boot_knob_gated() {
+        assert!(
+            EXEC_STATE_SRC.contains("#[cfg(target_arch = \"x86_64\")]")
+                && EXEC_STATE_SRC.contains("maybe_run_d6_controlled_switch_proof"),
+            "proof hook must be x86_64-only in exec_state.rs"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.d6_switch_proof")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled"),
+            "proof harness must be gated by yarm.d6_switch_proof boot knob"
+        );
+        assert!(
+            X86_SMOKE_SRC.contains("D6_SWITCH_PROOF")
+                && X86_SMOKE_SRC.contains("yarm.d6_switch_proof=1"),
+            "x86_64 smoke proof mode must opt in explicitly"
+        );
+    }
+
+    #[test]
+    fn stage120_proof_is_single_cpu_and_one_shot() {
+        assert!(
+            EXEC_STATE_SRC.contains("self.online_cpu_count() != 1")
+                && EXEC_STATE_SRC.contains("reason=multi_cpu"),
+            "proof harness must defer unless exactly one CPU is online"
+        );
+        assert!(
+            MOD_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_STARTED")
+                && MOD_SRC.contains("compare_exchange")
+                && MOD_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "proof harness must be one-shot and record DONE state"
+        );
+    }
+
+    #[test]
+    fn stage120_proof_requires_initialized_tid_pair_and_uses_dispatch_plan() {
+        assert!(
+            EXEC_STATE_SRC.contains("BOOTSTRAP_FIRST_USER_TID")
+                && EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID")
+                && EXEC_STATE_SRC.contains("kernel_context.initialized")
+                && EXEC_STATE_SRC.contains("reason=frames_uninitialized"),
+            "proof harness must require initialized tid=1/tid=2 kernel switch frames"
+        );
+        assert!(
+            EXEC_STATE_SRC
+                .contains("self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)")
+                && MOD_SRC.contains("pub(crate) struct DispatchSwitchPlan"),
+            "proof harness must reuse the existing DispatchSwitchPlan path"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("DISPATCH_SWITCH_PLAN_STASH")
+                && TRAP_ENTRY_SRC.contains("D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH")
+                && TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "proof harness must use the existing stash/global-lock-drop drain"
+        );
+    }
+
+    #[test]
+    fn stage120_proof_preserves_forbidden_boundaries() {
+        assert!(
+            !EXEC_STATE_SRC.contains("enable_timer_preemption")
+                && !TRAP_ENTRY_SRC.contains("enable_timer_preemption"),
+            "proof harness must not enable timer preemption"
+        );
+        assert!(
+            !EXEC_STATE_SRC.contains("mem::forget")
+                && !TRAP_ENTRY_SRC.contains("mem::forget")
+                && !MOD_SRC.contains("mem::forget"),
+            "proof harness must not use mem::forget or lock handoff"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback"),
+            "switch_frames assembly ABI must not grow an unlock callback"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("restore_arch_thread_state")
+                && RISCV_TRAP_SRC.contains("restore_arch_thread_state")
+                && !AARCH64_TRAP_SRC.contains("D6_CONTROLLED_SWITCH_PROOF")
+                && !RISCV_TRAP_SRC.contains("D6_CONTROLLED_SWITCH_PROOF"),
+            "AArch64/RISC-V trap paths must remain present and unaltered by the x86 proof"
+        );
+    }
+
+    #[test]
+    fn stage120_markers_and_existing_counts_are_preserved() {
+        for marker in [
+            "D6_CONTROLLED_SWITCH_PROOF_BEGIN",
+            "D6_CONTROLLED_SWITCH_PROOF_PAIR outgoing={}",
+            "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=",
+            "D6_CONTROLLED_SWITCH_PROOF_DONE",
+            "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH",
+            "D6_SWITCH_FRAMES_ENTER_UNLOCKED",
+            "D6_FIRST_RESUME_ENTER",
+            "D6_SWITCH_FRAMES_RETURNED_UNLOCKED",
+        ] {
+            assert!(
+                EXEC_STATE_SRC.contains(marker)
+                    || TRAP_ENTRY_SRC.contains(marker)
+                    || MOD_SRC.contains(marker),
+                "Stage 120 marker missing: {marker}"
+            );
+        }
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE")
+                && EXEC_STATE_SRC.contains("BOOTSTRAP_SUPERVISOR_TID"),
+            "Stage 119 tid=1/tid=2 initialization must remain intact"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod sched;")
+                && SYSCALL_SRC.contains("mod cap;"),
+            "D4 extracted syscall modules must remain intact"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 121 — x86_64 first-resume entry/frame ABI diagnostics
+// ===========================================================================
+#[cfg(test)]
+mod stage121_first_resume_abi_diagnostics {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TASK_SRC: &str = include_str!("../task.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+
+    #[test]
+    fn stage121_x86_first_resume_has_asm_shim_and_early_markers() {
+        assert!(
+            THREAD_STATE_SRC.contains("global_asm!")
+                && THREAD_STATE_SRC.contains("yarm_kernel_thread_switch_trampoline:")
+                && THREAD_STATE_SRC
+                    .contains("jmp yarm_kernel_thread_switch_trampoline_rust_bridge")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real")
+                && !THREAD_STATE_SRC.contains("call yarm_x86_first_resume_asm_marker"),
+            "x86_64 first resume must enter through the tiny assembly shim and bridge without a pre-Rust marker call"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("!RM")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_RUST_ENTER")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STACK_ALIGN value={}")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_LOCK_REACQUIRE_BEGIN"),
+            "first-resume diagnostics must appear before lock reacquire"
+        );
+    }
+
+    #[test]
+    fn stage121_switch_frame_layout_is_pinned_to_x86_restore_order() {
+        assert!(
+            TASK_SRC.contains("#[repr(C, align(16))]")
+                && TASK_SRC.contains("words: [usize; 8]")
+                && TASK_SRC.contains("fxsave: [u8; 512]")
+                && TASK_SRC.contains("const STACK_PTR_IDX: usize = 0")
+                && TASK_SRC.contains("const INSTRUCTION_PTR_IDX: usize = 1"),
+            "ArchSwitchContext layout must keep rsp at word 0 and rip at word 1"
+        );
+        for offset in [
+            "fxsave [rdi + 64]",
+            "mov [rdi + 16], rbx",
+            "mov [rdi + 24], rbp",
+            "mov [rdi + 32], r12",
+            "mov [rdi + 40], r13",
+            "mov [rdi + 48], r14",
+            "mov [rdi + 56], r15",
+            "mov rsp, [rsi + 0]",
+            "jmp [rsi + 8]",
+        ] {
+            assert!(
+                X86_SWITCH_SRC.contains(offset),
+                "x86_64 switch_frames restore/save order changed or undocumented: {offset}"
+            );
+        }
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback") && !X86_SWITCH_SRC.contains("mem::forget"),
+            "switch_frames ABI must not grow callbacks or lock handoff"
+        );
+    }
+
+    #[test]
+    fn stage121_initialized_frame_uses_trampoline_ip_and_sysv_stack_shape() {
+        assert!(
+            THREAD_STATE_SRC.contains("set_instruction_ptr(switch_entry)")
+                && EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip")
+                || EXEC_STATE_SRC
+                    .contains("yarm_kernel_thread_switch_trampoline as *const () as usize"),
+            "initialized production frames must still use the first-resume entry symbol"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("saturating_sub(core::mem::size_of::<usize>())")
+                && THREAD_STATE_SRC.contains("rsp % 16 == 8")
+                && THREAD_STATE_SRC.contains("fake return-address slot")
+                && THREAD_STATE_SRC.contains("not `ret`"),
+            "x86_64 first-resume stack alignment and fake-return-slot handling must be documented"
+        );
+    }
+
+    #[test]
+    fn stage121_first_resume_stash_boundary_is_observable() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("FIRST_RESUME_STASH")
+                && TRAP_ENTRY_SRC.contains("store(ctx)")
+                && TRAP_ENTRY_SRC.find("FIRST_RESUME_STASH").unwrap()
+                    < TRAP_ENTRY_SRC.find("switch_frames(").unwrap(),
+            "FIRST_RESUME_STASH must be populated before switch_frames"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_OK")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_MISSING")
+                && THREAD_STATE_SRC.contains("reason=stash_empty"),
+            "first-resume handler must make stash presence/missing state observable"
+        );
+    }
+
+    #[test]
+    fn stage121_boundaries_and_counts_remain_unchanged() {
+        assert!(
+            !THREAD_STATE_SRC.contains("mem::forget")
+                && !TRAP_ENTRY_SRC.contains("mem::forget")
+                && !MOD_SRC.contains("mem::forget"),
+            "Stage 121 must not use mem::forget lock handoff"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback"),
+            "Stage 121 must not add an assembly unlock callback"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RM")
+                && !RISCV_SWITCH_SRC.contains("!RM"),
+            "AArch64/RISC-V switch paths must not gain x86_64 first-resume diagnostics"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof harness must remain default-off and knob-gated"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod sched;")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "D4 module split and syscall counts must remain intact"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 122 — x86_64 first-resume trampoline first-instruction proof
+// ===========================================================================
+#[cfg(test)]
+mod stage122_first_instruction_proof {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    #[test]
+    fn stage122_trampoline_ip_names_the_assembly_shim() {
+        assert!(
+            THREAD_STATE_SRC.contains("unsafe extern \"C\"")
+                && THREAD_STATE_SRC
+                    .contains("pub(crate) fn yarm_kernel_thread_switch_trampoline() -> !")
+                && THREAD_STATE_SRC.contains("kernel_switch_frame_trampoline_ip()")
+                && THREAD_STATE_SRC
+                    .contains("yarm_kernel_thread_switch_trampoline as *const () as usize"),
+            "kernel_switch_frame_trampoline_ip must return the assembly shim symbol, not the Rust handler"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("kernel_switch_frame_trampoline_ip()")
+                && EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DONE"),
+            "initialized switch frames must log/use the shim entry address"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains(".section .text, \"ax\", @progbits")
+                && THREAD_STATE_SRC.contains(".global yarm_kernel_thread_switch_trampoline")
+                && THREAD_STATE_SRC
+                    .contains(".type yarm_kernel_thread_switch_trampoline, @function"),
+            "the shim must be an executable kernel text symbol"
+        );
+    }
+
+    #[test]
+    fn stage122_raw_marker_precedes_stack_adjust_and_rust_call() {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("shim label");
+        let first_bang = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x21")
+            .expect("! byte");
+        let first_r = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x52")
+            .expect("R byte");
+        let marker_a = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x41")
+            .expect("A byte for !RA");
+        let removed_marker_m = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x4d")
+            .expect("M byte for !RM");
+        let rust_jump_marker_j = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x4a")
+            .expect("J byte for !RJ");
+        let tail_jump = THREAD_STATE_SRC[label..]
+            .find("jmp yarm_kernel_thread_switch_trampoline_rust")
+            .expect("Rust tail jump");
+        assert!(
+            first_bang < first_r
+                && first_r < marker_a
+                && marker_a < removed_marker_m
+                && removed_marker_m < rust_jump_marker_j
+                && rust_jump_marker_j < tail_jump,
+            "raw !R/!RA/!RM/!RJ must be emitted in order before the Rust tail-jump boundary"
+        );
+        let shim = &THREAD_STATE_SRC[label
+            ..THREAD_STATE_SRC[label..]
+                .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
+                .map(|end| label + end)
+                .unwrap_or_else(|| {
+                    THREAD_STATE_SRC[label..]
+                        .find("\"#")
+                        .map(|end| label + end)
+                        .unwrap_or(THREAD_STATE_SRC.len())
+                })];
+        assert!(
+            !shim.contains("call yarm_x86_first_resume_asm_marker")
+                && !shim.contains("sub rsp, 8")
+                && !shim.contains("add rsp, 8"),
+            "Stage 124 must keep the pre-Rust marker bridge call removed and avoid stack-shape undo/redo"
+        );
+    }
+
+    #[test]
+    fn stage122_post_alignment_marker_precedes_rust_call() {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("shim label");
+        let post_align_a = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x41")
+            .expect("A byte for !RA");
+        let removed_marker_m = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x4d")
+            .expect("M byte for !RM");
+        let rust_jump_j = THREAD_STATE_SRC[label..]
+            .find("mov al, 0x4a")
+            .expect("J byte for !RJ");
+        let tail_jump = THREAD_STATE_SRC[label..]
+            .find("jmp yarm_kernel_thread_switch_trampoline_rust")
+            .expect("Rust tail jump");
+        assert!(
+            post_align_a < removed_marker_m
+                && removed_marker_m < rust_jump_j
+                && rust_jump_j < tail_jump,
+            "raw !RA, !RM, and !RJ must be emitted before the Rust tail jump"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("`!R` at shim entry")
+                && THREAD_STATE_SRC.contains("`!RA` at the former stack-adjust boundary")
+                && THREAD_STATE_SRC.contains("`!RM`")
+                && THREAD_STATE_SRC.contains("`!RJ`"),
+            "raw marker boundary meanings must be documented in source"
+        );
+    }
+
+    #[test]
+    fn stage122_forbidden_boundaries_remain_closed() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget"),
+            "switch_frames ABI must remain unchanged with no unlock callback or mem::forget"
+        );
+        assert!(
+            !THREAD_STATE_SRC.contains("mem::forget") && !MOD_SRC.contains("mem::forget"),
+            "first-resume proof must not use lock handoff or mem::forget"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof must remain default-off and boot-knob gated"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RA")
+                && !RISCV_SWITCH_SRC.contains("!RA"),
+            "AArch64/RISC-V switch paths must not gain x86_64 raw first-resume breadcrumbs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 123 — remove Rust call from first-resume asm marker boundary
+// ===========================================================================
+#[cfg(test)]
+mod stage123_no_pre_rust_marker_bridge_call {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    #[test]
+    fn stage123_trampoline_has_only_raw_markers_before_rust_tail_jump() {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("shim label");
+        let shim = &THREAD_STATE_SRC[label
+            ..THREAD_STATE_SRC[label..]
+                .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
+                .map(|end| label + end)
+                .unwrap_or_else(|| {
+                    THREAD_STATE_SRC[label..]
+                        .find("\"#")
+                        .map(|end| label + end)
+                        .unwrap_or(THREAD_STATE_SRC.len())
+                })];
+        assert!(shim.contains("mov al, 0x21") && shim.contains("mov al, 0x52"));
+        assert!(shim.contains("mov al, 0x41"), "shim must keep !RA");
+        assert!(shim.contains("mov al, 0x4d"), "shim must emit !RM");
+        assert!(shim.contains("mov al, 0x4a"), "shim must emit !RJ");
+        assert!(
+            !shim.contains("call yarm_x86_first_resume_asm_marker")
+                && !THREAD_STATE_SRC.contains("fn yarm_x86_first_resume_asm_marker"),
+            "Stage 123 must remove the Rust marker bridge call/function before first Rust entry"
+        );
+        assert!(
+            shim.find("mov al, 0x4d").unwrap() < shim.find("mov al, 0x4a").unwrap()
+                && shim.find("mov al, 0x4a").unwrap()
+                    < shim
+                        .find("jmp yarm_kernel_thread_switch_trampoline_rust")
+                        .unwrap(),
+            "!RM and !RJ must be before tail-jump to Rust handler"
+        );
+        assert!(
+            !shim.contains("sub rsp, 8") && !shim.contains("add rsp, 8"),
+            "Stage 124 must not adjust away the initialized rsp % 16 == 8 shape before Rust"
+        );
+    }
+
+    #[test]
+    fn stage123_boundaries_remain_closed() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget"),
+            "switch_frames ABI must remain unchanged"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof must remain default-off"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RM")
+                && !RISCV_SWITCH_SRC.contains("!RM"),
+            "AArch64/RISC-V paths must not gain x86 raw breadcrumbs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 124 — x86_64 first-resume Rust tail-jump ABI stack-shape fix
+// ===========================================================================
+#[cfg(test)]
+mod stage124_rust_tail_jump_stack_shape {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn shim_source() -> &'static str {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("shim label");
+        let end = THREAD_STATE_SRC[label..]
+            .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
+            .map(|offset| label + offset)
+            .unwrap_or_else(|| {
+                THREAD_STATE_SRC[label..]
+                    .find("\"#")
+                    .map(|offset| label + offset)
+                    .unwrap_or(THREAD_STATE_SRC.len())
+            });
+        &THREAD_STATE_SRC[label..end]
+    }
+
+    #[test]
+    fn stage124_marker_and_tail_jump_order_is_pinned() {
+        let shim = shim_source();
+        let marker_m = shim.find("mov al, 0x4d").expect("M byte for !RM");
+        let marker_j = shim.find("mov al, 0x4a").expect("J byte for !RJ");
+        let tail_jump = shim
+            .find("jmp yarm_kernel_thread_switch_trampoline_rust")
+            .expect("Rust tail jump");
+        assert!(
+            marker_m < marker_j && marker_j < tail_jump,
+            "Stage 124 must reach !RM, then !RJ, before the final Rust tail-jump"
+        );
+    }
+
+    #[test]
+    fn stage124_rust_tail_jump_stack_shape_is_documented_and_unmodified() {
+        let shim = shim_source();
+        assert!(
+            THREAD_STATE_SRC.contains("rsp % 16 == 8")
+                && THREAD_STATE_SRC.contains("fake return-address slot")
+                && THREAD_STATE_SRC.contains("x86_64 ABI bridge"),
+            "source must document that the initialized fake return slot supplies the bridge/Rust SysV entry shape"
+        );
+        assert!(
+            !shim.contains("sub rsp, 8") && !shim.contains("add rsp, 8"),
+            "Stage 124 keeps the final Rust tail-jump at the initialized rsp % 16 == 8 shape"
+        );
+    }
+
+    #[test]
+    fn stage124_no_pre_rust_rust_call_is_reintroduced() {
+        let shim = shim_source();
+        assert!(
+            !shim.contains("call yarm_x86_first_resume_asm_marker")
+                && !THREAD_STATE_SRC.contains("fn yarm_x86_first_resume_asm_marker"),
+            "the pre-Rust Rust marker bridge must remain removed"
+        );
+        assert!(
+            !shim.contains("call yarm_kernel_thread_switch_trampoline_rust")
+                && shim.contains("jmp yarm_kernel_thread_switch_trampoline_rust"),
+            "Stage 124 keeps a tail-jump, not a call, into the Rust first-resume handler"
+        );
+    }
+
+    #[test]
+    fn stage124_forbidden_boundaries_remain_closed() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget"),
+            "switch_frames ABI must remain unchanged with no lock handoff"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof must remain default-off and boot-knob gated"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RJ")
+                && !RISCV_SWITCH_SRC.contains("!RJ"),
+            "AArch64/RISC-V paths must not gain x86_64 Stage 124 breadcrumbs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 125 — x86_64 first-resume Rust entry bridge
+// ===========================================================================
+#[cfg(test)]
+mod stage125_first_resume_rust_entry_bridge {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn raw_trampoline_source() -> &'static str {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline:")
+            .expect("raw trampoline label");
+        let end = THREAD_STATE_SRC[label..]
+            .find(".global yarm_kernel_thread_switch_trampoline_rust_bridge")
+            .map(|offset| label + offset)
+            .expect("bridge label after raw trampoline");
+        &THREAD_STATE_SRC[label..end]
+    }
+
+    fn bridge_source() -> &'static str {
+        let label = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline_rust_bridge:")
+            .expect("bridge label");
+        let end = THREAD_STATE_SRC[label..]
+            .find("1:")
+            .map(|offset| label + offset)
+            .expect("bridge return-fault marker loop");
+        &THREAD_STATE_SRC[label..end]
+    }
+
+    #[test]
+    fn stage125_raw_trampoline_targets_bridge_not_rust_handler() {
+        let raw = raw_trampoline_source();
+        assert!(
+            raw.contains("mov al, 0x4a")
+                && raw.contains("jmp yarm_kernel_thread_switch_trampoline_rust_bridge"),
+            "raw trampoline must keep !RJ and jump to the x86_64 ABI bridge"
+        );
+        assert!(
+            !raw.contains("jmp yarm_kernel_thread_switch_trampoline_rust_real")
+                && !raw.contains("jmp yarm_kernel_thread_switch_trampoline_rust\n")
+                && !raw.contains("call yarm_kernel_thread_switch_trampoline_rust"),
+            "raw trampoline must not directly enter a normal Rust ABI function"
+        );
+    }
+
+    #[test]
+    fn stage125_bridge_emits_rb_and_calls_rust_real_handler() {
+        let bridge = bridge_source();
+        let marker_b = bridge.find("mov al, 0x42").expect("B byte for !RB");
+        let stack_adjust = bridge.find("sub rsp, 8").expect("call alignment adjust");
+        let rust_call = bridge
+            .find("call yarm_kernel_thread_switch_trampoline_rust_real")
+            .expect("Rust real handler call");
+        assert!(
+            marker_b < stack_adjust && stack_adjust < rust_call,
+            "bridge must emit !RB, arrange call alignment, then call Rust real handler"
+        );
+        assert!(
+            !bridge.contains("jmp yarm_kernel_thread_switch_trampoline_rust_real"),
+            "bridge must use call, not jmp, for the Rust real handler ABI boundary"
+        );
+    }
+
+    #[test]
+    fn stage125_stack_alignment_and_rust_real_entry_are_documented() {
+        assert!(
+            THREAD_STATE_SRC.contains("x86_64 ABI bridge")
+                && THREAD_STATE_SRC.contains("sub rsp, 8")
+                && THREAD_STATE_SRC.contains("call` enters Rust with SysV callee shape")
+                && THREAD_STATE_SRC.contains("yarm_kernel_thread_switch_trampoline_rust_real"),
+            "bridge stack-alignment contract must be documented and source-pinned"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("D6_FIRST_RESUME_RUST_ENTER")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STACK_ALIGN value={}")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_OK")
+                && THREAD_STATE_SRC.contains("D6_FIRST_RESUME_STASH_MISSING"),
+            "Rust real handler must keep the first-resume diagnostics"
+        );
+    }
+
+    #[test]
+    fn stage125_forbidden_boundaries_remain_closed() {
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, and mem::forget boundaries must remain closed"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)"),
+            "Stage 120 proof must remain default-off and boot-knob gated"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("!RB")
+                && !RISCV_SWITCH_SRC.contains("!RB"),
+            "AArch64/RISC-V paths must not gain x86_64 Stage 125 bridge breadcrumbs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "syscall count and variant count must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 126 — x86_64 kernel switch-stack mapping/backing invariant
+// ==========================================================================
+#[cfg(test)]
+mod stage126_kernel_switch_stack_mapping_backing {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn init_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .expect("init helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub(crate) fn provision_default_kernel_context")
+            .map(|offset| start + offset)
+            .expect("next helper");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn stack_check_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("Stage 126/127/128 kernel switch-stack invariant gate")
+            .expect("Stage 126 stack check helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("init helper after stack check");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    #[test]
+    fn stage126_initialized_true_is_gated_on_stack_mapping_success() {
+        let init = init_source();
+        let gate = init
+            .find("self.ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)?")
+            .expect("mapping/backing gate before publishing initialized");
+        let initialized = init
+            .find("tcb.kernel_context.initialized = true")
+            .expect("initialized publish");
+        assert!(
+            gate < initialized,
+            "Stage 126 must check/map the switch stack before initialized=true"
+        );
+    }
+
+    #[test]
+    fn stage126_page_below_stack_top_and_observed_fault_are_documented() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("top - 8")
+                && check.contains("top - 16")
+                && check.contains("top - 24")
+                && check.contains("0xffff800000007fe8")
+                && check.contains("0xffff800000008000"),
+            "Stage 126 must document the observed call-push fault page pattern"
+        );
+        assert!(
+            check.contains("fake_return_probe")
+                && check.contains("bridge_slot_probe")
+                && check.contains("call_push_probe")
+                && check.contains("probe_page"),
+            "Stage 126 must explicitly consider the page below stack_top"
+        );
+    }
+
+    #[test]
+    fn stage126_kernel_stack_mapping_is_supervisor_writable_and_cr3_visible() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("virtual kernel stack tops")
+                && (check.contains("active user-CR3 regime")
+                    || check.contains("target task ASID/root"))
+                && check.contains("page_table::map_page")
+                && check.contains("PageFlags::KERNEL_RW")
+                && check.contains("PageTableEntry::WRITABLE")
+                && check.contains("PageTableEntry::USER"),
+            "Stage 126 must pin virtual-stack semantics and kernel-only writable CR3-visible mapping"
+        );
+        assert!(
+            check.contains("D6_KERNEL_SWITCH_STACK_CHECK_BEGIN")
+                && check.contains("D6_KERNEL_SWITCH_STACK_CHECK_OK")
+                && check.contains("D6_KERNEL_SWITCH_STACK_CHECK_FAILED")
+                && check.contains("D6_KERNEL_SWITCH_STACK_MAP_BEGIN")
+                && check.contains("D6_KERNEL_SWITCH_STACK_MAP_DONE")
+                && check.contains("D6_KERNEL_SWITCH_STACK_MAP_DEFERRED"),
+            "Stage 126 stack-check/map markers must remain present"
+        );
+    }
+
+    #[test]
+    fn stage126_initialized_x8664_switch_stacks_are_not_synthetic_only() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("alloc_user_data_frame()")
+                && check.contains("target_asid")
+                && check.contains("resolve_page(target_asid, stack_page)")
+                && check.contains("return Err(KernelError::VmFull)")
+                && check.contains("return Err(KernelError::WrongObject)"),
+            "initialized x86_64 switch stacks must be backed/mapped or fail initialization"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_DEFERRED")
+                && EXEC_STATE_SRC.contains("initialize_thread_kernel_switch_frame"),
+            "production frame initialization must still surface explicit deferral on failure"
+        );
+    }
+
+    #[test]
+    fn stage126_stage125_bridge_and_switch_frames_boundaries_remain_intact() {
+        assert!(
+            THREAD_STATE_SRC.contains("!RB")
+                && THREAD_STATE_SRC
+                    .contains("jmp yarm_kernel_thread_switch_trampoline_rust_bridge")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real"),
+            "Stage 125 bridge markers/path must remain intact"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, and mem::forget boundaries must remain closed"
+        );
+    }
+
+    #[test]
+    fn stage126_default_off_arch_and_d4_invariants_remain_intact() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)")
+                && !BOOT_CMDLINE_SRC.contains("d6_switch_proof: Some(true)"),
+            "Stage 120 proof must remain default-off and boot-knob gated"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK")
+                && !RISCV_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK"),
+            "AArch64/RISC-V paths must not gain x86_64 Stage 126 stack diagnostics"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod sched;"),
+            "syscall counts and D4 extracted modules must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 127 — x86_64 switch-stack mapping targets task ASID/root
+// ==========================================================================
+#[cfg(test)]
+mod stage127_target_asid_switch_stack_mapping {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn stack_check_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("Stage 126/127/128 kernel switch-stack invariant gate")
+            .expect("Stage 127 stack check helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("init helper after stack check");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn init_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .expect("init helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub(crate) fn provision_default_kernel_context")
+            .map(|offset| start + offset)
+            .expect("next helper");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    #[test]
+    fn stage127_uses_target_asid_root_not_active_asid_enumeration() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("let Some(target_asid) = self.task_asid(tid)")
+                && check.contains("spaces.get(target_asid).is_none()")
+                && check.contains("page_table::map_page(")
+                && check.contains("target_asid,")
+                && !check.contains("let mut asids = [None; super::MAX_TASKS]")
+                && !check.contains("reason=no_active_asids"),
+            "Stage 127 must map/check the target task ASID/root rather than active-ASID enumeration"
+        );
+    }
+
+    #[test]
+    fn stage127_retry_runs_after_target_asid_is_bound() {
+        let bind = EXEC_STATE_SRC
+            .find("tcb.asid = Some(asid);")
+            .expect("target ASID bind");
+        let retry = EXEC_STATE_SRC
+            .find("D6_KERNEL_SWITCH_FRAME_INIT_RETRY tid={}")
+            .expect("retry marker");
+        assert!(
+            bind < retry,
+            "Stage 127 retry must happen after the target task ASID/root is bound"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_KERNEL_SWITCH_FRAME_INIT_RETRY_DONE tid={}")
+                && EXEC_STATE_SRC.contains("reason=retry_failed")
+                && EXEC_STATE_SRC
+                    .contains("initialize_thread_kernel_switch_frame(spec.tid, entry)"),
+            "Stage 127 must expose retry success/failure markers"
+        );
+    }
+
+    #[test]
+    fn stage127_initialized_true_remains_gated_and_no_active_asids_not_terminal() {
+        let init = init_source();
+        assert!(
+            init.find("self.ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)?")
+                < init.find("tcb.kernel_context.initialized = true"),
+            "initialized=true must remain gated on switch-stack mapping success"
+        );
+        let check = stack_check_source();
+        assert!(
+            check.contains("target_asid_unavailable")
+                && check.contains("target_root_unavailable")
+                && !check.contains("no_active_asids"),
+            "no_active_asids must not be a terminal blocker when target ASID/root is available"
+        );
+    }
+
+    #[test]
+    fn stage127_stack_page_and_mapping_permissions_remain_narrow() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("top - 8")
+                && check.contains("fake_return_probe")
+                && check.contains("probe_page = fake_return_probe")
+                && check.contains("PageFlags::KERNEL_RW")
+                && check.contains("PageTableEntry::WRITABLE")
+                && check.contains("PageTableEntry::USER"),
+            "Stage 127 must keep checking stack_top - 8 and kernel-only writable mapping flags"
+        );
+        assert!(
+            !check.contains("KERNEL_STACK_REGION_SIZE")
+                && !check.contains("for offset")
+                && !check.contains("map full kernel stack region"),
+            "Stage 127 must not broaden into full kernel-stack-region mapping"
+        );
+    }
+
+    #[test]
+    fn stage127_forbidden_boundaries_and_arch_fallbacks_remain_closed() {
+        assert!(
+            THREAD_STATE_SRC.contains("!RB")
+                && THREAD_STATE_SRC.contains("!RJ")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real"),
+            "Stage 125 bridge markers/path must remain intact"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, and mem::forget boundaries must remain closed"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)")
+                && !BOOT_CMDLINE_SRC.contains("d6_switch_proof: Some(true)"),
+            "Stage 120 proof must remain default-off"
+        );
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK")
+                && !RISCV_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK"),
+            "AArch64/RISC-V paths must remain untouched by x86_64 stack mapping"
+        );
+    }
+
+    #[test]
+    fn stage127_d4_and_syscall_counts_remain_intact() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod sched;"),
+            "D4 modules and syscall counts must remain unchanged"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 128 — x86_64 switch-stack mapping covers active CR3 roots
+// ==========================================================================
+#[cfg(test)]
+mod stage128_active_cr3_switch_stack_mapping {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const X86_SWITCH_SRC: &str = include_str!("../../arch/x86_64/context_switch.rs");
+    const AARCH64_SWITCH_SRC: &str = include_str!("../../arch/aarch64/context_switch.rs");
+    const RISCV_SWITCH_SRC: &str = include_str!("../../arch/riscv64/context_switch.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    fn stack_check_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("Stage 126/127/128 kernel switch-stack invariant gate")
+            .expect("Stage 128 stack check helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("init helper after stack check");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn active_check_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("Stage 128 proof-time active-root guard")
+            .expect("Stage 128 active-root guard");
+        let end = THREAD_STATE_SRC[start..]
+            .find("#[cfg(any(not(target_arch = \"x86_64\"), test))]")
+            .map(|offset| start + offset)
+            .expect("fallback after active-root guard");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn init_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .expect("init helper");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub(crate) fn provision_default_kernel_context")
+            .map(|offset| start + offset)
+            .expect("next helper");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    #[test]
+    fn stage128_documents_switch_frames_does_not_switch_cr3() {
+        let check = stack_check_source();
+        let active = active_check_source();
+        assert!(
+            check.contains("switch_frames` is only a kernel")
+                && check.contains("does not switch CR3")
+                && active.contains("does not switch CR3")
+                && active.contains("bridge `callq` return-address push"),
+            "Stage 128 must document that switch_frames changes stacks/registers, not CR3"
+        );
+    }
+
+    #[test]
+    fn stage128_mapping_is_not_target_asid_only() {
+        let check = stack_check_source();
+        assert!(
+            check.contains("D6_KERNEL_SWITCH_STACK_MAP_SHARED_BEGIN")
+                && check.contains("D6_KERNEL_SWITCH_STACK_MAP_SHARED_ROOT")
+                && check.contains("D6_KERNEL_SWITCH_STACK_MAP_SHARED_DONE")
+                && check.contains("D6_KERNEL_SWITCH_STACK_MAP_SHARED_DEFERRED")
+                && check.contains("let mut roots = [None; super::MAX_TASKS]")
+                && check.contains("tcb.asid")
+                && check.contains(
+                    "page_table::map_page(asid, stack_page, PhysAddr(phys), PageFlags::KERNEL_RW)"
+                ),
+            "Stage 128 must install the switch-stack page into existing task roots, not only the target root"
+        );
+    }
+
+    #[test]
+    fn stage128_proof_checks_active_outgoing_root_before_stashing() {
+        let active = active_check_source();
+        let proof = EXEC_STATE_SRC;
+        assert!(
+            active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_ROOT")
+                && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_OK")
+                && active.contains("D6_KERNEL_SWITCH_STACK_ACTIVE_CHECK_FAILED")
+                && active.contains("self.hal.active_asid()")
+                && active.contains("page_table::resolve_page(active_asid, stack_page)"),
+            "Stage 128 must expose active-root diagnostics and check the currently active ASID"
+        );
+        let active_check = proof
+            .find("ensure_active_root_can_use_kernel_switch_stack(incoming_tid)")
+            .expect("active-root guard call");
+        let stash = proof
+            .find("self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?")
+            .expect("proof stash call");
+        assert!(
+            active_check < stash && proof.contains("reason=active_stack_unmapped"),
+            "Stage 128 proof must check the active/outgoing root before stashing switch_frames"
+        );
+    }
+
+    #[test]
+    fn stage128_keeps_stack_page_permissions_and_initialized_gate_narrow() {
+        let check = stack_check_source();
+        let init = init_source();
+        assert!(
+            check.contains("top - 8")
+                && check.contains("fake_return_probe")
+                && check.contains("probe_page = fake_return_probe")
+                && check.contains("PageFlags::KERNEL_RW")
+                && check.contains("PageTableEntry::WRITABLE")
+                && check.contains("PageTableEntry::USER"),
+            "Stage 128 must keep checking stack_top - 8 and kernel-only writable flags"
+        );
+        assert!(
+            !check.contains("KERNEL_STACK_REGION_SIZE")
+                && !check.contains("map full kernel stack region"),
+            "Stage 128 must not map the entire kernel-stack arena"
+        );
+        assert!(
+            init.find("self.ensure_kernel_switch_stack_mapped(tid, stack_base, stack_top)?")
+                < init.find("tcb.kernel_context.initialized = true"),
+            "initialized=true must remain gated on mapping proof"
+        );
+    }
+
+    #[test]
+    fn stage128_bridge_default_off_and_forbidden_boundaries_remain_intact() {
+        assert!(
+            THREAD_STATE_SRC.contains("!RB")
+                && THREAD_STATE_SRC.contains("!RJ")
+                && THREAD_STATE_SRC.contains("call yarm_kernel_thread_switch_trampoline_rust_real"),
+            "Stage 125 bridge markers/path must remain intact"
+        );
+        assert!(
+            BOOT_CMDLINE_SRC.contains("d6_switch_proof: Option<bool>")
+                && BOOT_CMDLINE_SRC.contains("set_d6_controlled_switch_proof_enabled(enabled)")
+                && !BOOT_CMDLINE_SRC.contains("d6_switch_proof: Some(true)"),
+            "Stage 120 proof must remain default-off"
+        );
+        assert!(
+            !X86_SWITCH_SRC.contains("unlock_callback")
+                && !X86_SWITCH_SRC.contains("assembly unlock callback")
+                && !X86_SWITCH_SRC.contains("mem::forget")
+                && !THREAD_STATE_SRC.contains("mem::forget"),
+            "switch_frames ABI, lock handoff, and mem::forget boundaries must remain closed"
+        );
+    }
+
+    #[test]
+    fn stage128_arch_fallbacks_d4_and_syscall_counts_remain_intact() {
+        assert!(
+            AARCH64_SWITCH_SRC.contains("switch_frames")
+                && RISCV_SWITCH_SRC.contains("switch_frames")
+                && !AARCH64_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK")
+                && !RISCV_SWITCH_SRC.contains("D6_KERNEL_SWITCH_STACK"),
+            "AArch64/RISC-V paths must remain untouched by x86_64 active-root checks"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23")
+                && SYSCALL_SRC.contains("mod cap;")
+                && SYSCALL_SRC.contains("mod process;")
+                && SYSCALL_SRC.contains("mod recv_shared_v3;")
+                && SYSCALL_SRC.contains("mod sched;"),
+            "D4 modules and syscall counts must remain unchanged"
         );
     }
 }

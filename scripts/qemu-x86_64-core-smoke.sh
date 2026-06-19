@@ -26,6 +26,10 @@ QEMU_MEMORY=${QEMU_MEMORY:-512M}
 QEMU_SMP=1
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
+D6_SWITCH_PROOF=${D6_SWITCH_PROOF:-0}
+if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
+fi
 
 if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
   echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"
@@ -513,6 +517,27 @@ if [[ "$service_count_fail" -eq 0 ]]; then
   echo "[ok] x86_64 core smoke: all 6 service entries present exactly once"
 else
   echo "[warn] x86_64 core smoke: completed with service entry warnings (status=$QEMU_STATUS)"
+fi
+
+if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
+  proof_fail=0
+  for proof_marker in \
+    "D6_CONTROLLED_SWITCH_PROOF_DONE" \
+    "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH" \
+    "D6_SWITCH_FRAMES_ENTER_UNLOCKED" \
+    "D6_FIRST_RESUME_ENTER" \
+    "D6_SWITCH_FRAMES_RETURNED_UNLOCKED"; do
+    if log_has_pattern "$proof_marker"; then
+      echo "[ok] D6 switch proof marker present: $proof_marker"
+    else
+      echo "[error] D6 switch proof marker missing: $proof_marker"
+      proof_fail=1
+    fi
+  done
+  if [[ "$proof_fail" -eq 1 ]]; then
+    echo "[error] D6 switch proof mode FAILED"
+    exit 1
+  fi
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

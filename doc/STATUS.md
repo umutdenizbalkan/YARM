@@ -35,6 +35,7 @@ exec-load policy, and capability-materialization rules.
 | Optional FS strict | ✅ RAMFS + ext4 live; FAT skipped |
 | AP Rust online (`yarm.x86_ap_rust=1`) | ✅ Stage 109 outcome A — AP enters Rust and parks |
 | Production scheduler | BSP only; `online_cpu_count()` stays at 1; AP `started_secondary` reported separately |
+| D6 switch proof | 🧪 default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1`; Stage 128 now maps/checks initialized x86_64 switch-stack pages in target and active/kernel-shared task roots before the default-off proof stashes `switch_frames`; QEMU proof validation pending local run |
 | AP scheduler participation | ❌ deferred — blocked on the AP per-CPU environment (GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu`) |
 | Timer interrupts on APs | ❌ APs have no IDT; `cli` stays set; no AP scheduler ticks |
 
@@ -244,11 +245,22 @@ The four highest-impact items, in order of unlock value:
    `BOOTSTRAP_SUPERVISOR_TID = 2` constant, and fixes the TSS RSP0 bug in the
    trampoline switch-back (was passing `ctx.outgoing_stack_top`, now passes `None`
    to preserve B's kernel stack top set by the stash-drain). Both tid=1 and tid=2
-   now show `D6_KERNEL_SWITCH_FRAME_INIT_DONE` in x86_64 core smoke. Still
-   Outcome B: smoke quiesces into IPC-blocked tasks before a timer preemption can
-   pair two initialized tasks. Next: either a longer-running user workload or
-   synthetic timer forcing to produce the first real unlocked `switch_frames`.
-   See `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / Stage 119 / §7.1.5.
+   now show `D6_KERNEL_SWITCH_FRAME_INIT_DONE` in x86_64 core smoke. Stage 120
+   adds a default-off x86_64/single-CPU/one-shot proof harness gated by
+   `yarm.d6_switch_proof=1` (script opt-in: `D6_SWITCH_PROOF=1`) to force the
+   tid=1 → tid=2 initialized pair through the existing unlocked `switch_frames`
+   path. Stage 121 audits and fixes the x86_64 first-resume ABI boundary: the
+   initialized switch frame now uses SysV callee stack shape (`rsp % 16 == 8`)
+   and a tiny x86_64 shim now stays raw-COM1-only before tail-jumping to the
+   Rust first-resume handler. Stage 122 added raw first-instruction breadcrumbs;
+   Stage 123 removes the pre-Rust marker bridge call and adds `!RM` at that boundary. Stage 124
+   removes the obsolete shim stack adjustment and adds `!RJ`. Stage 125 replaces
+   the direct Rust jump with an x86_64 ABI bridge that emits `!RB`, aligns for a
+   normal `call`, and calls `yarm_kernel_thread_switch_trampoline_rust_real`.
+   QEMU proof validation is pending the local user run. This is a proof harness, not
+   scheduler policy; AArch64/RISC-V remain unchanged/fallback-safe. See
+   `doc/KERNEL_UNLOCKING.md` §1 Stage 117 / Stage 118 / Stage 119 / Stage 120 /
+   Stage 121 / Stage 122 / Stage 123 / Stage 124 / Stage 125 / §7.1.5.
 
 3. **RPi5 HH-5 — high-half initrd / allocator bridge.** Build the bridge
    so HH-5 can consume the existing Stage 2C loader without violating

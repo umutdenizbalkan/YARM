@@ -2,9 +2,9 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{
-    ControlPlaneCnodePlan, IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan,
-    KernelError, KernelState, MemoryObjectKind, TransferSharedRegion, VmAnonMapProgressPlan,
-    VmAnonMapValidatedArgs, VmBrkPlan, VmPageMapProgress,
+    IpcEndpointRecvResult, IpcEndpointSendResult, IpcSchedulerPlan, KernelError, KernelState,
+    TransferSharedRegion, VmAnonMapProgressPlan, VmAnonMapValidatedArgs, VmBrkPlan,
+    VmPageMapProgress,
 };
 use super::capabilities::{CapId, CapObject, CapRights, Capability};
 use super::ipc::{
@@ -12,11 +12,10 @@ use super::ipc::{
 };
 use super::trap::{FaultAccess, FaultInfo};
 use super::trapframe::TrapFrame;
-use super::vm::{Asid, CachePolicy, Mapping, PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+use super::vm::{Asid, PAGE_SIZE, PageFlags, VirtAddr};
 use crate::arch::syscall_abi;
-use crate::kernel::boot::{TrapHandleError, UserImageSpec};
-use crate::kernel::task::{BlockedRecvState, RecvAbiVariant, TaskClass};
-use yarm_srv_common::{cpio::CpioArchive, elf::ElfImageInfo};
+use crate::kernel::boot::TrapHandleError;
+use crate::kernel::task::{BlockedRecvState, RecvAbiVariant};
 
 pub const SYSCALL_ABI_VERSION: u16 = 10;
 pub const SYSCALL_YIELD_NR: usize = 0;
@@ -94,8 +93,12 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // unchanged; the `use` re-imports keep the handler call sites textually
 // identical. NOTE: these `mod` declarations must stay AFTER the
 // `syscall_trace!` macro definition above (textual macro scoping).
+mod cap;
 mod debug;
 mod initramfs;
+mod process;
+mod recv_shared_v3;
+mod sched;
 
 use self::debug::handle_debug_log;
 use self::initramfs::{handle_create_initramfs_file_slice_mo, handle_initramfs_read_chunk};
@@ -382,15 +385,15 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     Ok(())
 }
 
-fn current_tid(kernel: &KernelState) -> Result<u64, SyscallError> {
+pub(super) fn current_tid(kernel: &KernelState) -> Result<u64, SyscallError> {
     kernel.current_tid().ok_or(SyscallError::Internal)
 }
 
-fn current_task_has_user_asid(kernel: &KernelState) -> Result<bool, SyscallError> {
+pub(super) fn current_task_has_user_asid(kernel: &KernelState) -> Result<bool, SyscallError> {
     Ok(kernel.task_asid(current_tid(kernel)?).is_some())
 }
 
-fn record_user_fault(
+pub(super) fn record_user_fault(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
     addr: usize,
@@ -463,7 +466,7 @@ fn materialize_received_transfer_cap(
     Ok(Some(derived.0))
 }
 
-fn materialize_received_message_cap(
+pub(super) fn materialize_received_message_cap(
     kernel: &mut KernelState,
     endpoint: CapObject,
     receiver_tid: u64,
@@ -731,7 +734,7 @@ pub(crate) fn validate_user_region(offset: u64, len: u64) -> Result<(), SyscallE
     Ok(())
 }
 
-fn validate_endpoint_right(
+pub(super) fn validate_endpoint_right(
     kernel: &KernelState,
     cap: CapId,
     right: CapRights,
@@ -2632,1098 +2635,67 @@ fn handle_transfer_release(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    if !current_task_has_user_asid(kernel)? {
-        return Err(SyscallError::InvalidArgs);
-    }
-    let transfer_cap = CapId(frame.arg(SYSCALL_ARG_CAP) as u64);
-    let owner = crate::kernel::ipc::ThreadId(current_tid(kernel)?);
-    let (base, map_len) = {
-        let base_arg = frame.arg(SYSCALL_ARG_PTR);
-        let len_arg = frame.arg(SYSCALL_ARG_LEN);
-        if base_arg == 0 && len_arg == 0 {
-            kernel
-                .active_transfer_mapping_for(owner, transfer_cap)
-                .map(|(base, len)| (base.0 as usize, len))
-                .ok_or(SyscallError::InvalidArgs)?
-        } else {
-            if len_arg == 0 || !base_arg.is_multiple_of(PAGE_SIZE) {
-                return Err(SyscallError::InvalidArgs);
-            }
-            (base_arg, round_up_page(len_arg)?)
-        }
-    };
-    let end = base.checked_add(map_len).ok_or(SyscallError::InvalidArgs)?;
-    // Stage 7: plan-first ASID resolution before the two-phase unmap loop
-    // (rank-2 task read before vm/memory mutation in loop body).
-    // current_task_has_user_asid (checked above) guarantees task_asid returns Some.
-    let asid = kernel
-        .task_asid(owner.0)
-        .ok_or(SyscallError::from(KernelError::UserMemoryFault))?;
-    let mut va = base;
-    while va < end {
-        // Stage 7: two-phase unmap — reclaim only after shootdown wait/fast path.
-        // Ok(None) means the page was never mapped; preserve old InvalidArgs behavior.
-        let plan = kernel
-            .unmap_page_phase1(asid, VirtAddr(va as u64))
-            .map_err(SyscallError::from)?;
-        let Some(plan) = plan else {
-            return Err(SyscallError::InvalidArgs);
-        };
-        kernel
-            .execute_tlb_shootdown_wait_plan(plan)
-            .map_err(SyscallError::from)?;
-        va += PAGE_SIZE;
-    }
-
-    let cnode = kernel.current_task_cnode().ok_or(SyscallError::Internal)?;
-    kernel
-        .revoke_capability_in_cnode(cnode, transfer_cap)
-        .map_err(SyscallError::from)?;
-    if kernel.remove_active_transfer_mapping(owner, transfer_cap) {
-        kernel.note_shared_mem_released(map_len);
-    }
-    frame.set_ok(map_len, 0, 0);
-    Ok(())
+    self::cap::handle_transfer_release(kernel, frame)
 }
 
 fn handle_control_plane_set_cnode_slots(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let requester_tid = current_tid(kernel)?;
-    let target_pid = frame.arg(SYSCALL_ARG_CAP) as u64;
-    let slot_capacity = frame.arg(SYSCALL_ARG_PTR);
-    if target_pid == 0 || slot_capacity == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    // Stage 5B plan-first: snapshot task domain (rank 2) before capability
-    // mutation (rank 4). When the global lock is removed, this read moves to
-    // before the with_cpu() call via split-read on SharedKernel.
-    let plan = ControlPlaneCnodePlan {
-        requester_class: kernel
-            .task_class(requester_tid)
-            .ok_or(SyscallError::from(KernelError::TaskMissing))?,
-        requester_pid: kernel.process_id(requester_tid).unwrap_or(requester_tid),
-    };
-    kernel
-        .control_plane_set_process_cnode_slots_planned(&plan, target_pid, slot_capacity)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(slot_capacity, target_pid as usize, 0);
-    Ok(())
+    self::cap::handle_control_plane_set_cnode_slots(kernel, frame)
+}
+
+fn handle_yield(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
+    self::sched::handle_yield(kernel, frame)
 }
 
 fn handle_futex_wait(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let addr = frame.arg(SYSCALL_ARG_CAP);
-    let expected =
-        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let observed =
-        u32::try_from(frame.arg(SYSCALL_ARG_LEN)).map_err(|_| SyscallError::InvalidArgs)?;
-    let blocked = kernel
-        .futex_wait_current(addr, expected, observed)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(usize::from(blocked), 0, 0);
-    Ok(())
+    self::sched::handle_futex_wait(kernel, frame)
 }
 
 fn handle_futex_wake(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let addr = frame.arg(SYSCALL_ARG_CAP);
-    let max_wake =
-        u32::try_from(frame.arg(SYSCALL_ARG_PTR)).map_err(|_| SyscallError::InvalidArgs)?;
-    let woke = kernel
-        .futex_wake(addr, max_wake)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(woke as usize, 0, 0);
-    Ok(())
+    self::sched::handle_futex_wake(kernel, frame)
 }
 
 fn handle_spawn_thread(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let parent_tid = current_tid(kernel)?;
-    let tls_base = frame.arg(SYSCALL_ARG_CAP);
-    let user_stack_top = frame.arg(SYSCALL_ARG_PTR);
-    let user_entry = frame.arg(SYSCALL_ARG_LEN);
-    let tid = kernel
-        .spawn_user_thread(parent_tid, tls_base, user_stack_top, user_entry)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(
-        usize::try_from(tid).map_err(|_| SyscallError::Internal)?,
-        0,
-        0,
-    );
-    Ok(())
+    self::process::handle_spawn_thread(kernel, frame)
 }
 
 fn handle_fork(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
-    let parent_tid = current_tid(kernel)?;
-    let child_tid = kernel
-        .fork_user_process_cow(parent_tid)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(
-        usize::try_from(child_tid).map_err(|_| SyscallError::Internal)?,
-        0,
-        0,
-    );
-    Ok(())
+    self::process::handle_fork(kernel, frame)
 }
 
 fn handle_spawn_process(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    fn normalize_initrd_phys_ptr(raw_ptr: u64) -> Result<u64, SyscallError> {
-        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
-        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
-        if virt_base > phys_base && raw_ptr >= virt_base {
-            let off = raw_ptr
-                .checked_sub(virt_base)
-                .ok_or(SyscallError::Internal)?;
-            let phys = phys_base.checked_add(off).ok_or(SyscallError::Internal)?;
-            return Ok(phys);
-        }
-        if raw_ptr < virt_base || virt_base == phys_base {
-            return Ok(raw_ptr);
-        }
-        crate::yarm_log!(
-            "INITRAMFS_INITRD_ADDR_INVALID raw_ptr=0x{:x} virt_base=0x{:x} phys_base=0x{:x}",
-            raw_ptr,
-            virt_base,
-            phys_base
-        );
-        Err(SyscallError::InvalidArgs)
-    }
-
-    let image_id = frame.arg(SYSCALL_ARG_CAP) as u64;
-    let parent_pid = frame.arg(SYSCALL_ARG_PTR) as u64;
-    let startup_args_ptr = frame.arg(SYSCALL_ARG_LEN);
-    let startup_args_count = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0);
-    crate::yarm_log!(
-        "KSPAWN_ENTER image_id={} parent_pid={} args_count={}",
-        image_id,
-        parent_pid,
-        startup_args_count
-    );
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
-    // For initramfs_srv (image_id=4), we will map the boot initrd read-only
-    // into its address space and pass the user VA + length via startup slots 15/16.
-    // The mapping happens after the ASID is created below.
-    const INITRAMFS_IMAGE_ID: u64 = 4;
-    const INITRD_USER_VA_BASE: u64 = 0x0C00_0000;
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_PATH path={}", image_path);
-    let initrd =
-        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-    let entry = CpioArchive::new(initrd)
-        .find(image_path)
-        .map_err(|_| SyscallError::InvalidArgs)?
-        .ok_or(SyscallError::InvalidArgs)?;
-    let elf_bytes = entry.file_data();
-    crate::yarm_log!("KSPAWN_ELF_FOUND size={}", elf_bytes.len());
-    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
-    let tid = kernel.allocate_thread_id().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=allocate_tid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=create_asid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
-    kernel
-        .load_elf_pt_load_segments(asid, elf_bytes)
-        .map_err(|err| {
-            crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
-
-    // Map boot initrd pages read-only into initramfs_srv (image_id=4).
-    // This provides the CPIO data in userspace without syscall bridge.
-    if image_id == INITRAMFS_IMAGE_ID {
-        if let Some(initrd) = crate::kernel::boot::Bootstrap::boot_initrd_bytes() {
-            let initrd_virt_raw = initrd.as_ptr() as u64;
-            let initrd_phys_raw = normalize_initrd_phys_ptr(initrd_virt_raw)?;
-            let initrd_len = initrd.len() as u64;
-            let mut first6 = [0u8; 6];
-            let first6_len = core::cmp::min(initrd.len(), first6.len());
-            first6[..first6_len].copy_from_slice(&initrd[..first6_len]);
-            crate::yarm_log!(
-                "INITRAMFS_INITRD_SOURCE_RANGE raw_ptr=0x{:x} phys_start=0x{:x} len={}",
-                initrd_virt_raw,
-                initrd_phys_raw,
-                initrd_len
-            );
-            crate::yarm_log!("INITRAMFS_INITRD_FIRST6 bytes={:?}", first6);
-            let page: u64 = PAGE_SIZE as u64;
-            let phys_start = initrd_phys_raw & !(page - 1);
-            let phys_end = (initrd_phys_raw + initrd_len + page - 1) & !(page - 1);
-            let pages_to_map = ((phys_end - phys_start) / page) as usize;
-            let initrd_offset_in_first_page = (initrd_phys_raw - phys_start) as u64;
-            crate::yarm_log!(
-                "INITRAMFS_INITRD_MAP_BEGIN phys_start=0x{:x} phys_end=0x{:x} len={} pages={}",
-                phys_start,
-                phys_end,
-                initrd_len,
-                pages_to_map
-            );
-            let initrd_flags = PageFlags {
-                read: true,
-                write: false,
-                execute: false,
-                user: true,
-                cache_policy: CachePolicy::WriteBack,
-            };
-            let mut map_ok = true;
-            for i in 0..pages_to_map {
-                let virt = VirtAddr(INITRD_USER_VA_BASE + (i as u64) * page);
-                let phys = PhysAddr(phys_start + (i as u64) * page);
-                if let Err(e) = kernel.map_user_page_in_asid_raw(
-                    asid,
-                    virt,
-                    Mapping {
-                        phys,
-                        flags: initrd_flags,
-                    },
-                ) {
-                    crate::yarm_log!(
-                        "INITRAMFS_INITRD_MAP_FAIL page={} virt=0x{:x} err={:?}",
-                        i,
-                        virt.0,
-                        e
-                    );
-                    map_ok = false;
-                    break;
-                }
-            }
-            if map_ok {
-                let user_initrd_ptr = INITRD_USER_VA_BASE + initrd_offset_in_first_page;
-                startup_args[15] = user_initrd_ptr;
-                startup_args[16] = initrd_len;
-                crate::yarm_log!(
-                    "INITRAMFS_INITRD_MAP_DONE user_ptr=0x{:x} len={} rights=ro",
-                    user_initrd_ptr,
-                    initrd_len
-                );
-            }
-        } else {
-            crate::yarm_log!("INITRAMFS_INITRD_MAP_SKIP reason=no_boot_initrd");
-        }
-    }
-
-    let spawner_tid = current_tid(kernel).unwrap_or(0);
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    // If the caller supplied a parent_pid, grant a SEND copy of the new endpoint
-    // into the parent's cnode and return that local cap so the parent can use it
-    // directly without going through the spawner.
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATED parent_tid={} cap={}",
-                    parent_pid,
-                    cap.0
-                );
-                cap.0
-            }
-            Err(e) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATE_FAIL parent_tid={} err={:?}",
-                    parent_pid,
-                    e
-                );
-                service_send_cap
-            }
-        }
-    } else {
-        service_send_cap
-    };
-
-    crate::yarm_log!(
-        "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
-        tid,
-        asid.0,
-        elf.entry,
-        parent_pid,
-        startup_args_count
-    );
-    let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry: elf.entry as usize,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
-        .map_err(|err| {
-            crate::yarm_log!(
-                "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
-                tid,
-                asid.0,
-                err
-            );
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
-    // When parent delegation occurred, pack both the spawner's own send cap (high
-    // 32 bits) and the parent-delegated cap (low 32 bits) into ret2 so the
-    // spawner can use its own copy while forwarding the parent's copy.
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
-    Ok(())
-}
-
-/// Kernel-side staging buffer for ELF images supplied via SpawnProcessFromUserBuf
-/// and SpawnFromInitramfsFile.
-///
-/// A proper per-call allocation would require a kernel heap; the static buffer
-/// avoids that dependency at the cost of exclusivity.  Rather than rely on an
-/// out-of-band "single caller" comment guarding a `static mut`, the buffer is
-/// wrapped in [`TakeOnceStagingBuffer`], which encodes exclusive access in the
-/// type system: the only way to obtain a mutable view is via `try_take`, which
-/// uses an atomic claim flag.  The claim is released when the returned
-/// [`StagingBufferClaim`] guard is dropped, so the buffer can be reused by the
-/// next spawn syscall (PM issues one spawn at a time, and a syscall handler runs
-/// to completion before the next is dispatched).  If a claim is somehow already
-/// outstanding the handler returns a stable error instead of aliasing the buffer.
-static VFS_ELF_STAGING: TakeOnceStagingBuffer<{ 128 * 1024 }> = TakeOnceStagingBuffer::new();
-
-/// A statically-allocated byte buffer that hands out at most one outstanding
-/// mutable claim at a time.
-///
-/// The single-use ("take-once") invariant is enforced by an [`AtomicBool`]:
-/// `try_take` atomically flips `claimed` from `false` to `true`, returning a
-/// guard on success and `None` if a claim is already outstanding.  Dropping the
-/// guard resets the flag, allowing reuse on the next call.  This replaces a raw
-/// `static mut` and the `static_mut_refs` lint exposure with a type whose only
-/// safe access path is exclusive by construction.
-struct TakeOnceStagingBuffer<const N: usize> {
-    claimed: core::sync::atomic::AtomicBool,
-    data: core::cell::UnsafeCell<[u8; N]>,
-}
-
-// SAFETY: the only access to `data` is through `try_take`, which uses the atomic
-// `claimed` flag to guarantee that at most one `StagingBufferClaim` exists at a
-// time.  No two threads can obtain overlapping mutable references to `data`.
-unsafe impl<const N: usize> Sync for TakeOnceStagingBuffer<N> {}
-
-impl<const N: usize> TakeOnceStagingBuffer<N> {
-    const fn new() -> Self {
-        Self {
-            claimed: core::sync::atomic::AtomicBool::new(false),
-            data: core::cell::UnsafeCell::new([0u8; N]),
-        }
-    }
-
-    /// Atomically claim exclusive access to the buffer.  Returns `None` if a
-    /// claim is already outstanding.
-    fn try_take(&'static self) -> Option<StagingBufferClaim<'static, N>> {
-        use core::sync::atomic::Ordering;
-        self.claimed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .ok()
-            .map(|_| StagingBufferClaim { buf: self })
-    }
-}
-
-/// RAII guard proving exclusive access to a [`TakeOnceStagingBuffer`].  Not
-/// `Clone`/`Copy`: only one can exist at a time.  Releases the claim on drop.
-struct StagingBufferClaim<'a, const N: usize> {
-    buf: &'a TakeOnceStagingBuffer<N>,
-}
-
-impl<'a, const N: usize> StagingBufferClaim<'a, N> {
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: holding this guard means `claimed == true` and (because
-        // `try_take` is the only producer and the flag is reset only on drop)
-        // no other `StagingBufferClaim` for the same buffer exists, so this is
-        // the unique mutable reference to `data`.
-        unsafe { &mut *self.buf.data.get() }
-    }
-}
-
-impl<'a, const N: usize> Drop for StagingBufferClaim<'a, N> {
-    fn drop(&mut self) {
-        self.buf
-            .claimed
-            .store(false, core::sync::atomic::Ordering::Release);
-    }
+    self::process::handle_spawn_process(kernel, frame)
 }
 
 fn handle_spawn_process_from_user_buf(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let image_id = frame.arg(0) as u64;
-    let elf_user_ptr = frame.arg(1);
-    let elf_len = frame.arg(2);
-    let parent_pid = frame.arg(3) as u64;
-    let startup_args_ptr = frame.arg(4);
-    let startup_args_count = frame.arg(5);
-    crate::yarm_log!(
-        "KSPAWN_ENTER image_id={} parent_pid={} args_count={}",
-        image_id,
-        parent_pid,
-        startup_args_count
-    );
-    if elf_len == 0 || elf_len > 128 * 1024 || elf_user_ptr == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    validate_user_region(elf_user_ptr as u64, elf_len as u64)?;
-    // Exclusive, type-checked access to the shared ELF staging buffer; the claim
-    // is released when `staging_claim` drops at end of handler.
-    let mut staging_claim = VFS_ELF_STAGING.try_take().ok_or(SyscallError::Internal)?;
-    let staging = staging_claim.as_mut_slice();
-    kernel
-        .copy_from_current_user_into_slice(elf_user_ptr, elf_len, staging)
-        .map_err(SyscallError::from)?;
-    let elf_bytes = &staging[..elf_len];
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_PATH path={}", image_path);
-    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_ELF_PARSED entry={}", elf.entry);
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
-    let tid = kernel.allocate_thread_id().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=allocate_tid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    let (asid, _aspace_cap) = kernel.create_user_address_space().map_err(|err| {
-        crate::yarm_log!("KSPAWN_FAIL phase=create_asid err={:?}", err);
-        SyscallError::from(err)
-    })?;
-    crate::yarm_log!("KSPAWN_ASID_OK tid={} asid={}", tid, asid.0);
-    kernel
-        .load_elf_pt_load_segments(asid, elf_bytes)
-        .map_err(|err| {
-            crate::yarm_log!("KSPAWN_FAIL phase=load_elf err={:?}", err);
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_LOAD_OK tid={}", tid);
-    let spawner_tid = current_tid(kernel).unwrap_or(0);
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATED parent_tid={} cap={}",
-                    parent_pid,
-                    cap.0
-                );
-                cap.0
-            }
-            Err(e) => {
-                crate::yarm_log!(
-                    "KSPAWN_PARENT_SEND_DELEGATE_FAIL parent_tid={} err={:?}",
-                    parent_pid,
-                    e
-                );
-                service_send_cap
-            }
-        }
-    } else {
-        service_send_cap
-    };
-    crate::yarm_log!(
-        "KSPAWN_BEFORE_SPAWN_TASK tid={} asid={} entry=0x{:x} parent_pid={} args_count={}",
-        tid,
-        asid.0,
-        elf.entry,
-        parent_pid,
-        startup_args_count
-    );
-    let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry: elf.entry as usize,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
-        .map_err(|err| {
-            crate::yarm_log!(
-                "KSPAWN_SPAWN_TASK_FAIL tid={} asid={} err={:?}",
-                tid,
-                asid.0,
-                err
-            );
-            SyscallError::from(err)
-        })?;
-    crate::yarm_log!("KSPAWN_TASK_READY tid={}", spawned.tid);
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
-    Ok(())
+    self::process::handle_spawn_process_from_user_buf(kernel, frame)
 }
 
 /// Spawn a process directly from a named file in the boot initramfs CPIO.
-///
-/// ABI: arg0=image_id, arg1=name_ptr, arg2=name_len, arg3=parent_pid,
-///      arg4=startup_args_ptr, arg5=startup_args_count
-///
-/// Reads the ELF into the kernel-side staging buffer (no user-space buffer),
-/// then spawns exactly like `SpawnProcessFromUserBuf`.
 fn handle_spawn_from_initramfs_file(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    let image_id = frame.arg(0) as u64;
-    let name_ptr = frame.arg(1);
-    let name_len = frame.arg(2);
-    let parent_pid = frame.arg(3) as u64;
-    let startup_args_ptr = frame.arg(4);
-    let startup_args_count = frame.arg(5);
-
-    if name_len == 0 || name_len > 128 {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    let name_buf = kernel
-        .copy_from_current_user(name_ptr, name_len)
-        .map_err(|_| SyscallError::InvalidArgs)?;
-    let name =
-        core::str::from_utf8(&name_buf[..name_len]).map_err(|_| SyscallError::InvalidArgs)?;
-    let name = name.strip_prefix('/').unwrap_or(name);
-
-    let initrd =
-        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-    let entry = CpioArchive::new(initrd)
-        .find(name)
-        .map_err(|_| SyscallError::InvalidArgs)?
-        .ok_or(SyscallError::InvalidArgs)?;
-    let data = entry.file_data();
-
-    crate::yarm_log!(
-        "KSPAWN_FROM_CPIO image_id={} name={} file_size={}",
-        image_id,
-        name,
-        data.len()
-    );
-
-    // Exclusive, type-checked access to the shared ELF staging buffer; the claim
-    // is released when `staging_claim` drops at end of handler.
-    let mut staging_claim = VFS_ELF_STAGING.try_take().ok_or(SyscallError::Internal)?;
-    let staging = staging_claim.as_mut_slice();
-    let elf_len = data.len();
-    if elf_len == 0 || elf_len > staging.len() {
-        return Err(SyscallError::InvalidArgs);
-    }
-    staging[..elf_len].copy_from_slice(data);
-    let elf_bytes = &staging[..elf_len];
-
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_FROM_CPIO path={}", image_path);
-    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
-    crate::yarm_log!("KSPAWN_FROM_CPIO entry=0x{:x}", elf.entry);
-
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
-
-    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    let (asid, _aspace_cap) = kernel
-        .create_user_address_space()
-        .map_err(SyscallError::from)?;
-    crate::yarm_log!("KSPAWN_FROM_CPIO tid={} asid={}", tid, asid.0);
-
-    kernel
-        .load_elf_pt_load_segments(asid, elf_bytes)
-        .map_err(SyscallError::from)?;
-
-    let spawner_tid = current_tid(kernel).unwrap_or(0);
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => cap.0,
-            Err(_) => service_send_cap,
-        }
-    } else {
-        service_send_cap
-    };
-
-    let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry: elf.entry as usize,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
-        .map_err(SyscallError::from)?;
-
-    crate::yarm_log!("KSPAWN_FROM_CPIO spawned_tid={}", spawned.tid);
-
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
-    Ok(())
-}
-
-fn spawn_image_path_for_image_id(image_id: u64) -> Option<&'static str> {
-    match image_id {
-        0 => Some("init"),
-        1 => Some("sbin/supervisor"),
-        2 => Some("sbin/process_manager"),
-        3 => Some("sbin/init_server"),
-        4 => Some("sbin/initramfs_srv"),
-        5 => Some("sbin/devfs_srv"),
-        6 => Some("sbin/vfs_server"),
-        7 => Some("sbin/driver_manager"),
-        8 => Some("sbin/blkcache_srv"),
-        9 => Some("sbin/virtio_blk_srv"),
-        // Stage 81B: optional FS servers staged in CPIO by Stage 80.
-        // Kernel path table entries required for Phase 3A/Phase 2B spawn
-        // to succeed when INIT_SPAWN_OPTIONAL_FS_SERVERS is enabled.
-        10 => Some("sbin/fat_srv"),
-        11 => Some("sbin/ramfs_srv"),
-        12 => Some("sbin/ext4_srv"),
-        _ => None,
-    }
-}
-
-fn copy_spawn_startup_args(
-    kernel: &KernelState,
-    startup_args_ptr: usize,
-    startup_args_count: usize,
-) -> Result<[u64; UserImageSpec::DEFAULT_STARTUP_ARGS.len()], SyscallError> {
-    let mut out = UserImageSpec::DEFAULT_STARTUP_ARGS;
-    if startup_args_count == 0 {
-        return Ok(out);
-    }
-    if startup_args_count > out.len() || startup_args_ptr == 0 {
-        return Err(SyscallError::InvalidArgs);
-    }
-    let byte_len = startup_args_count
-        .checked_mul(core::mem::size_of::<u64>())
-        .ok_or(SyscallError::InvalidArgs)?;
-    validate_user_region(startup_args_ptr as u64, byte_len as u64)?;
-    // copy_from_current_user is limited to Message::MAX_PAYLOAD (128 bytes) per call.
-    // Read in chunks so that larger startup_args arrays (e.g. 18 * 8 = 144 bytes) work.
-    let mut slot_idx = 0usize;
-    let mut bytes_remaining = byte_len;
-    let mut ptr = startup_args_ptr;
-    while bytes_remaining > 0 {
-        let chunk_bytes = bytes_remaining.min(crate::kernel::ipc::Message::MAX_PAYLOAD);
-        let payload = kernel
-            .copy_from_current_user(ptr, chunk_bytes)
-            .map_err(SyscallError::from)?;
-        for chunk in payload[..chunk_bytes].chunks_exact(core::mem::size_of::<u64>()) {
-            if slot_idx >= out.len() {
-                break;
-            }
-            let mut word = [0u8; 8];
-            word.copy_from_slice(chunk);
-            out[slot_idx] = u64::from_le_bytes(word);
-            slot_idx += 1;
-        }
-        ptr = ptr
-            .checked_add(chunk_bytes)
-            .ok_or(SyscallError::InvalidArgs)?;
-        bytes_remaining -= chunk_bytes;
-    }
-    Ok(out)
+    self::process::handle_spawn_from_initramfs_file(kernel, frame)
 }
 
 /// Phase 3A: Spawn a process from an InitramfsFileSlice MemoryObject capability.
-///
-/// Access control: caller must be PM (TID == PM_BOOTSTRAP_TID).
-///
-/// ABI: arg0=image_id, arg1=mo_cap (CapId), arg2=parent_pid,
-///      arg3=startup_args_ptr, arg4=startup_args_count
-///
-/// Resolves the MemoryObject → reads initrd slice → loads ELF via load_elf_with_mo_zero_copy
-/// → spawns exactly like SpawnFromInitramfsFile.
-///
-/// Returns: ret0=0, ret1=spawned_tid, ret2=packed_send_caps on success.
 fn handle_spawn_from_memory_object(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    // Access gate: PM only.
-    let caller_tid = current_tid(kernel)?;
-    if caller_tid != PM_BOOTSTRAP_TID {
-        crate::yarm_log!("SPAWN_FROM_MO_DENIED tid={} reason=not_pm", caller_tid);
-        return Err(SyscallError::MissingRight);
-    }
-
-    let image_id = frame.arg(0) as u64;
-    let mo_cap_raw = frame.arg(1) as u64;
-    let parent_pid = frame.arg(2) as u64;
-    let startup_args_ptr = frame.arg(3);
-    let startup_args_count = frame.arg(4);
-
-    crate::yarm_log!(
-        "SPAWN_FROM_MO_ENTER image_id={} mo_cap={} parent_pid={}",
-        image_id,
-        mo_cap_raw,
-        parent_pid
-    );
-
-    let mo_cap = CapId(mo_cap_raw);
-
-    // Resolve capability → must be a MemoryObject.
-    let capability = kernel
-        .resolve_capability_for_task(caller_tid, mo_cap)
-        .map_err(SyscallError::from)?;
-    let mo_id = match capability.object {
-        CapObject::MemoryObject { id } => id,
-        _ => {
-            crate::yarm_log!(
-                "SPAWN_FROM_MO_WRONG_CAP image_id={} mo_cap={}",
-                image_id,
-                mo_cap_raw
-            );
-            return Err(SyscallError::WrongObject);
-        }
-    };
-
-    // Look up MemoryObject slot to get the InitramfsFileSlice kind.
-    let (file_data_offset, file_len) = kernel
-        .with_memory_state(|memory| {
-            memory
-                .memory_objects
-                .iter()
-                .flatten()
-                .find(|mo| mo.id == mo_id)
-                .and_then(|mo| match mo.kind {
-                    MemoryObjectKind::InitramfsFileSlice {
-                        initrd_offset,
-                        file_len,
-                    } => Some((initrd_offset as usize, file_len as usize)),
-                    _ => None,
-                })
-                .ok_or(KernelError::WrongObject)
-        })
-        .map_err(SyscallError::from)?;
-
-    let initrd =
-        crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-
-    if file_data_offset
-        .checked_add(file_len)
-        .ok_or(SyscallError::InvalidArgs)?
-        > initrd.len()
-    {
-        crate::yarm_log!(
-            "SPAWN_FROM_MO_BOUNDS_ERR image_id={} off={} len={} initrd_len={}",
-            image_id,
-            file_data_offset,
-            file_len,
-            initrd.len()
-        );
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    let elf_bytes = &initrd[file_data_offset..file_data_offset + file_len];
-    crate::yarm_log!(
-        "SPAWN_FROM_MO_ELF image_id={} elf_len={}",
-        image_id,
-        elf_bytes.len()
-    );
-
-    // Parse ELF for entry point.
-    let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
-    crate::yarm_log!("SPAWN_FROM_MO_ENTRY entry=0x{:x}", elf.entry);
-
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
-
-    let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
-    startup_args[2] = 0;
-    let extra_send_caps = [
-        startup_args[13],
-        startup_args[14],
-        startup_args[15],
-        startup_args[16],
-    ];
-    startup_args[12] = 0;
-    startup_args[13] = 0;
-    startup_args[14] = 0;
-    startup_args[15] = 0;
-    startup_args[16] = 0;
-
-    let tid = kernel.allocate_thread_id().map_err(SyscallError::from)?;
-    let (asid, _aspace_cap) = kernel
-        .create_user_address_space()
-        .map_err(SyscallError::from)?;
-    crate::yarm_log!("SPAWN_FROM_MO_TID tid={} asid={}", tid, asid.0);
-
-    // Compute physical base of the initrd blob for zero-copy feasibility check.
-    let initrd_virt_raw = initrd.as_ptr() as u64;
-    let initrd_phys_base = {
-        let virt_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE;
-        let phys_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_PHYS_BASE;
-        if virt_base > phys_base && initrd_virt_raw >= virt_base {
-            initrd_virt_raw - virt_base + phys_base
-        } else {
-            initrd_virt_raw
-        }
-    };
-
-    // Load ELF using zero-copy path (falls back to copy if alignment not feasible).
-    let (entry, _first_vaddr, _heap_base, zc_pages, copied_pages) = kernel
-        .load_elf_with_mo_zero_copy(
-            image_id,
-            asid,
-            elf_bytes,
-            initrd_phys_base,
-            file_data_offset as u64,
-        )
-        .map_err(SyscallError::from)?;
-
-    crate::yarm_log!(
-        "PM_ELF_ZC_DONE image_id={} path={} zc_pages={} copied_pages={}",
-        image_id,
-        image_path,
-        zc_pages,
-        copied_pages
-    );
-
-    let spawner_tid = caller_tid;
-    let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
-        Ok((_, send_cap, recv_cap)) => {
-            crate::yarm_log!(
-                "KSPAWN_EP_CREATED spawner_tid={} send_cap={} recv_cap={}",
-                spawner_tid,
-                send_cap.0,
-                recv_cap.0
-            );
-            (send_cap.0, recv_cap.0)
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_EP_CREATE_FAIL err={:?}", e);
-            (0u64, 0u64)
-        }
-    };
-    let service_reply_recv_cap = match kernel.create_endpoint(8) {
-        Ok((eid, _, recv_cap)) => {
-            crate::yarm_log!(
-                "SPAWN_SERVICE_REPLY_RECV_CAP_CREATED endpoint={} cap={}",
-                eid,
-                recv_cap.0
-            );
-            recv_cap.0
-        }
-        Err(e) => {
-            crate::yarm_log!("KSPAWN_REPLY_EP_CREATE_FAIL err={:?}", e);
-            0u64
-        }
-    };
-    let caller_send_cap = if parent_pid != 0 && service_send_cap != 0 {
-        match kernel.grant_capability_task_to_task_with_rights(
-            spawner_tid,
-            CapId(service_send_cap),
-            parent_pid,
-            CapRights::SEND,
-        ) {
-            Ok(cap) => cap.0,
-            Err(_) => service_send_cap,
-        }
-    } else {
-        service_send_cap
-    };
-
-    let spawned = kernel
-        .spawn_user_task_from_image(UserImageSpec {
-            tid,
-            entry,
-            asid: Some(asid),
-            class: TaskClass::SystemServer,
-            startup_args,
-            spawner_tid,
-            service_recv_cap,
-            service_reply_recv_cap,
-            extra_send_caps,
-        })
-        .map_err(SyscallError::from)?;
-
-    crate::yarm_log!(
-        "SPAWN_FROM_MO_OK image_id={} spawned_tid={}",
-        image_id,
-        spawned.tid
-    );
-
-    let packed_ret2 =
-        if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {
-            ((service_send_cap as u64) << 32) | (caller_send_cap as u64)
-        } else {
-            caller_send_cap as u64
-        };
-    frame.set_ok(
-        0,
-        usize::try_from(spawned.tid).map_err(|_| SyscallError::Internal)?,
-        packed_ret2 as usize,
-    );
-    Ok(())
+    self::process::handle_spawn_from_memory_object(kernel, frame)
 }
 
 /// Undo physical mappings for [addr, mapped_end) on partial VmAnonMap failure.
@@ -3908,669 +2880,17 @@ fn handle_vm_brk(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), 
     Ok(())
 }
 
-// ── Stage 42+43: recv_shared_v3 helpers ──────────────────────────────────────
-
-/// Parse a `RecvSharedV3Request` from a raw byte buffer at the wire-format offsets.
-///
-/// Bytes below 64 are required; bytes [64..80] (the `reserved` fields) default
-/// to zero when absent so validation still passes for a minimal 64-byte record.
-fn parse_v3_request_bytes(
-    buf: &[u8],
-) -> crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request {
-    use crate::kernel::recv_core::recv_shared_v3::RecvSharedV3Request;
-    macro_rules! u32le {
-        ($off:expr) => {
-            u32::from_le_bytes([buf[$off], buf[$off + 1], buf[$off + 2], buf[$off + 3]])
-        };
-    }
-    macro_rules! u64le {
-        ($off:expr) => {
-            if buf.len() >= $off + 8 {
-                u64::from_le_bytes([
-                    buf[$off],
-                    buf[$off + 1],
-                    buf[$off + 2],
-                    buf[$off + 3],
-                    buf[$off + 4],
-                    buf[$off + 5],
-                    buf[$off + 6],
-                    buf[$off + 7],
-                ])
-            } else {
-                0u64
-            }
-        };
-    }
-    RecvSharedV3Request {
-        version: u32le!(0),
-        record_len: u32le!(4),
-        endpoint_cap: u64le!(8),
-        payload_ptr: u64le!(16),
-        payload_len: u64le!(24),
-        metadata_ptr: u64le!(32),
-        metadata_len: u64le!(40),
-        map_intent: u32le!(48),
-        flags: u32le!(52),
-        timeout_ticks: u64le!(56),
-        reserved: [u64le!(64), u64le!(72)],
-    }
-}
-
-/// Write a v3 output record to user memory at `out_ptr` if the buffer is valid.
-///
-/// `out_ptr == 0` or `out_len < 80` — silently skip (caller may call with
-/// metadata_ptr/metadata_len from the request without a null check).
-///
-/// Writes `min(out_len, 120)` bytes so callers with larger buffers receive
-/// new fields without breaking existing 80-byte or 88-byte callers.
-///
-/// Byte layout (must match `#[repr(C)] RecvSharedV3Output` field offsets):
-///   [0..40]   authoritative fields (version … transferred_cap)
-///   [40..44]  object_kind (u32)
-///   [44..48]  0 (C-layout padding before u64)
-///   [48..56]  object_generation (u64)
-///   [56..60]  effective_rights (u32)
-///   [60..64]  0 (C-layout padding before u64)
-///   [64..72]  exact_object_size (u64) — authoritative for MemoryObject (Stage 49); 0 otherwise
-///   [72..80]  region_offset — always 0 (FUTURE)
-///   [80..88]  exact_region_len (u64) — authoritative for DmaRegion (Stage 50); 0 otherwise
-///   [88..96]  mapped_base (u64) — VA of live mapping; 0 if no mapping (Stage 58+59)
-///   [96..104] page_rounded_mapped_len (u64) — 0 if no mapping (Stage 58+59)
-///   [104..108] actual_mapping_perm (u32) — 1=RO, 3=RW, 0=none (Stage 58+59)
-///   [108..112] C-layout padding
-///   [112..120] cleanup_token (u64) — nonzero when mapping live (Stage 58+59)
-#[allow(clippy::too_many_arguments)]
-fn write_v3_output_to_user(
-    kernel: &mut KernelState,
-    out_ptr: u64,
-    out_len: u64,
-    result_status: u32,
-    sender_tid: u64,
-    message_len: u32,
-    message_flags: u32,
-    transferred_cap: u64,
-    object_kind: u32,
-    object_generation: u64,
-    effective_rights: u32,
-    exact_object_size: u64,
-    exact_region_len: u64,
-    mapped_base: u64,
-    page_rounded_mapped_len: u64,
-    actual_mapping_perm: u32,
-    cleanup_token: u64,
-) -> bool {
-    use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_OUTPUT_LEN, V3_VERSION};
-    if out_ptr == 0 || out_len < V3_MIN_OUTPUT_LEN as u64 {
-        return false;
-    }
-    let mut out = [0u8; 120];
-    out[0..4].copy_from_slice(&V3_VERSION.to_le_bytes());
-    out[4..8].copy_from_slice(&(V3_MIN_OUTPUT_LEN as u32).to_le_bytes());
-    out[8..12].copy_from_slice(&(SYSCALL_ABI_VERSION as u32).to_le_bytes());
-    out[12..16].copy_from_slice(&result_status.to_le_bytes());
-    out[16..24].copy_from_slice(&sender_tid.to_le_bytes());
-    out[24..28].copy_from_slice(&message_len.to_le_bytes());
-    out[28..32].copy_from_slice(&message_flags.to_le_bytes());
-    out[32..40].copy_from_slice(&transferred_cap.to_le_bytes());
-    // Stage 47+48 object introspection fields.
-    out[40..44].copy_from_slice(&object_kind.to_le_bytes());
-    // out[44..48]: C-layout padding (already 0).
-    out[48..56].copy_from_slice(&object_generation.to_le_bytes());
-    out[56..60].copy_from_slice(&effective_rights.to_le_bytes());
-    // out[60..64]: C-layout padding (already 0).
-    // Stage 49: exact_object_size for MemoryObject; 0 for all other kinds.
-    out[64..72].copy_from_slice(&exact_object_size.to_le_bytes());
-    // out[72..80]: region_offset — FUTURE, always 0.
-    // Stage 50: exact_region_len for DmaRegion; 0 for all other kinds.
-    out[80..88].copy_from_slice(&exact_region_len.to_le_bytes());
-    // Stage 58+59: live mapping output fields (0 when no mapping).
-    out[88..96].copy_from_slice(&mapped_base.to_le_bytes());
-    out[96..104].copy_from_slice(&page_rounded_mapped_len.to_le_bytes());
-    out[104..108].copy_from_slice(&actual_mapping_perm.to_le_bytes());
-    // out[108..112]: C-layout padding (already 0).
-    out[112..120].copy_from_slice(&cleanup_token.to_le_bytes());
-    let write_len = (out_len as usize).min(120);
-    kernel
-        .copy_to_current_user(out_ptr as usize, &out[..write_len])
-        .is_ok()
-}
-
-/// Map a [`CapObject`] variant to its `RecvSharedV3ObjectKind` discriminant.
-fn recv_v3_object_kind(obj: crate::kernel::capabilities::CapObject) -> u32 {
-    use crate::kernel::capabilities::CapObject;
-    match obj {
-        CapObject::MemoryObject { .. } => 1,
-        CapObject::Endpoint { .. } => 2,
-        CapObject::Reply { .. } => 3,
-        CapObject::Notification { .. } => 4,
-        // Stage 52+53: DmaRegion is now a first-class object kind (discriminant 5).
-        CapObject::DmaRegion { .. } => 5,
-        _ => 0xFF,
-    }
-}
-
-/// Return the object generation stored in a [`CapObject`], or 0 if unavailable.
-fn recv_v3_object_generation(obj: crate::kernel::capabilities::CapObject) -> u64 {
-    use crate::kernel::capabilities::CapObject;
-    match obj {
-        CapObject::Endpoint { generation, .. } => generation,
-        CapObject::Notification { generation, .. } => generation,
-        CapObject::Reply { generation, .. } => generation,
-        _ => 0,
-    }
-}
-
-/// Return the exact byte size of a [`CapObject::MemoryObject`] from the kernel registry.
-///
-/// Returns the page-aligned byte length stored in `MemorySubsystem.memory_objects`.
-/// Returns 0 for all other cap kinds (not fabricated — genuinely unavailable).
-fn recv_v3_exact_object_size(
-    kernel: &KernelState,
-    obj: crate::kernel::capabilities::CapObject,
-) -> u64 {
-    use crate::kernel::capabilities::CapObject;
-    let CapObject::MemoryObject { id } = obj else {
-        return 0;
-    };
-    kernel.with_memory_state(|memory| {
-        memory
-            .memory_objects
-            .iter()
-            .flatten()
-            .find(|entry| entry.id == id)
-            .map(|entry| entry.len as u64)
-            .unwrap_or(0)
-    })
-}
-
-/// Return the exact byte length of a [`CapObject::DmaRegion`] sub-region.
-///
-/// The length is embedded directly in the cap — no registry lookup needed.
-/// Returns 0 for all other cap kinds (not fabricated — genuinely unavailable).
-fn recv_v3_exact_region_len(obj: crate::kernel::capabilities::CapObject) -> u64 {
-    use crate::kernel::capabilities::CapObject;
-    match obj {
-        CapObject::DmaRegion { len, .. } => len,
-        _ => 0,
-    }
-}
-
 /// VALIDATION: SPLIT_FAST_PATH_ONLY
-/// Stage 101 (audit): NR 30 RecvSharedV3 reuses the `try_recv_core_user_plain`
-/// split-recv adapter for the dequeue+writeback. The trap-entry seam itself
-/// still routes NR 30 through the global-lock dispatch (`dispatch()`), but the
-/// IPC dequeue inside this handler runs against the same split adapter as
-/// Stage 36. See doc/KERNEL_UNLOCKING.md
-///
 /// Stage 42+43: handle the `recv_shared_v3` syscall (NR 30).
 ///
-/// # Constraints (Stage 42+43)
-///
-/// - **Non-blocking only**: `timeout_ticks` must be 0.  Blocking paths require
-///   `RecvAbiVariant::RecvSharedV3` in task.rs — deferred to a future stage.
-/// - **No mapped receive**: `map_intent` must be 0.  VM mapping on the split
-///   path is not yet proven equivalent.
-/// - **Cap-transfer**: fully supported via the canonical receive core
-///   (`ipc_try_recv_queued_with_cap_transfer`); rollback on writeback failure.
-///
-/// # ABI
-///
-/// - `arg0` = `req_ptr` — pointer to a `RecvSharedV3Request` record in user space.
-/// - `arg1` = `req_len` — byte length of the record (≥ 64 required).
-/// - Output written to `request.metadata_ptr` (if non-null, len ≥ 80).
-/// - Frame registers on success: `ret0` = sender_tid, `ret1` = message_len,
-///   `ret2` = transferred_cap (or `SYSCALL_NO_TRANSFER_CAP`).
+/// D4 step 1: syscall.rs keeps this minimal delegation shim so dispatch and
+/// source-grep guard rails stay stable; implementation lives in
+/// `syscall/recv_shared_v3.rs`.
 fn handle_recv_shared_v3(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
-    use crate::kernel::recv_core::recv_shared_v3::{V3_MIN_REQUEST_LEN, validate_v3_request};
-    use crate::kernel::recv_core::{
-        RecvBlockingPolicy, RecvMapIntent, RecvMetaTarget, RecvOutcome, RecvPayloadTarget,
-        RecvRequest, RecvRequestKind, RecvSchedulerWakePlan, RecvTransferPolicy,
-        RecvUserWritebackOutcome, execute_user_asid_plain_writeback, try_recv_core_user_plain,
-    };
-
-    const V3_STATUS_OK: u32 = 0;
-    const V3_STATUS_WOULD_BLOCK: u32 = 1;
-
-    let req_ptr = frame.arg(0);
-    let req_len = frame.arg(1);
-
-    if req_len < V3_MIN_REQUEST_LEN as usize {
-        return Err(SyscallError::InvalidArgs);
-    }
-    let read_len = req_len.min(80);
-    let mut req_bytes = [0u8; 80];
-    kernel
-        .copy_from_current_user_into_slice(req_ptr, read_len, &mut req_bytes[..read_len])
-        .map_err(|_| SyscallError::PageFault)?;
-
-    let req = parse_v3_request_bytes(&req_bytes);
-
-    if validate_v3_request(&req).is_err() {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    // Stage 42+43: blocking not implemented — full blocking requires
-    // RecvAbiVariant::RecvSharedV3 in task.rs and wake-path changes.
-    if req.timeout_ticks != 0 {
-        return Err(SyscallError::WouldBlock);
-    }
-
-    // Stage 58+59: map_intent is now live for DmaRegion read-only.
-    // When map_intent != 0 the caller must supply at least V3_LIVE_OUTPUT_LEN bytes
-    // so mapped_base, page_rounded_mapped_len, actual_mapping_perm, and cleanup_token
-    // can all be written.  Smaller buffers are rejected to prevent silent token loss.
-    if req.map_intent != 0
-        && req.metadata_len < crate::kernel::recv_core::recv_shared_v3::V3_LIVE_OUTPUT_LEN as u64
-    {
-        return Err(SyscallError::InvalidArgs);
-    }
-
-    // Stage 72: MAP_READ|MAP_WRITE (0x3) is permitted for the READ_SHARED_REPLY profile.
-    // Rights enforcement: compute_recv_v3_mapping_plan checks CAP_RIGHT_MAP + CAP_RIGHT_WRITE;
-    // InsufficientRights → rollback + InvalidArgs below.
-    // NX: hardcoded (execute: false) in all recv_shared_v3 page mappings.
-    // Cleanup: ActiveTransferMapping carries owner_tid+cap+base+len regardless of perm;
-    // purge_active_transfer_mappings_for_pid cleans both read-only and read-write mappings.
-    // WRITE-only (0x2) is already rejected: validate_v3_request above requires READ bit.
-
-    let caller_tid = current_tid(kernel)?;
-    let recv_cap = CapId(req.endpoint_cap);
-
-    validate_endpoint_right(kernel, recv_cap, CapRights::RECEIVE)?;
-    let endpoint_cap = kernel
-        .current_task_cnode()
-        .and_then(|cnode| kernel.capability_for_cnode_local(cnode, recv_cap))
-        .and_then(|cap| kernel.capability_object_live(cap.object).map(|_| cap));
-    let Some(ep_cap) = endpoint_cap else {
-        return Err(SyscallError::InvalidCapability);
-    };
-    let endpoint = ep_cap.object;
-
-    let request = RecvRequest {
-        kind: RecvRequestKind::NonblockingProbe,
-        requester_tid: caller_tid,
-        recv_cap,
-        payload_target: RecvPayloadTarget::UserMemory {
-            ptr: req.payload_ptr as usize,
-            len: req.payload_len as usize,
-        },
-        meta_target: RecvMetaTarget::None,
-        blocking: RecvBlockingPolicy::NoWait,
-        transfer: RecvTransferPolicy::LegacyFull,
-        map_intent: RecvMapIntent::None,
-    };
-
-    crate::yarm_log!("RECV_V3_ENTER tid={} cap={}", caller_tid, recv_cap.0);
-    let outcome = try_recv_core_user_plain(kernel, &request, endpoint);
-
-    match outcome {
-        RecvOutcome::WouldBlock | RecvOutcome::FallbackRequired(_) => {
-            let _ = write_v3_output_to_user(
-                kernel,
-                req.metadata_ptr,
-                req.metadata_len,
-                V3_STATUS_WOULD_BLOCK,
-                0,
-                0,
-                0,
-                SYSCALL_NO_TRANSFER_CAP,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-            );
-            crate::yarm_log!("RECV_V3_WOULD_BLOCK tid={}", caller_tid);
-            return Err(SyscallError::WouldBlock);
-        }
-        RecvOutcome::TimedOut => return Err(SyscallError::TimedOut),
-        RecvOutcome::Error(e) => return Err(SyscallError::from(e)),
-        RecvOutcome::Delivered(delivery) => {
-            // Cap materialization BEFORE writeback — matches full-path §58 ordering.
-            let is_reply_cap = (delivery.msg.flags & Message::FLAG_REPLY_CAP) != 0;
-            let materialized_cap: Option<u64> = if let Some(_plan) = delivery.cap_transfer {
-                match materialize_received_message_cap(
-                    kernel,
-                    endpoint,
-                    caller_tid,
-                    delivery.msg.sender_tid.0,
-                    &delivery.msg,
-                ) {
-                    Ok(cap) => cap,
-                    Err(e) => return Err(e),
-                }
-            } else {
-                None
-            };
-
-            // Deferred sender wake BEFORE writeback — matches §58 ordering.
-            if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
-                let _ = kernel.apply_split_sender_wake_plan(wake_tid);
-            }
-
-            let payload_len = delivery.msg.as_slice().len();
-            let sender_tid_raw = delivery.msg.sender_tid.0;
-            let message_flags_raw = delivery.msg.flags as u32;
-            let xfer_cap_out = materialized_cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
-
-            // Stage 47+48 + Stage 49 + Stage 50: resolve object metadata from the materialized cap.
-            // Resolve capability first (borrows kernel briefly), then query size separately.
-            let (obj_kind, obj_gen, eff_rights, exact_obj_size, exact_reg_len) =
-                match materialized_cap {
-                    Some(cap_id_raw) => {
-                        let resolved = kernel
-                            .capability_service()
-                            .resolve_current_task_capability(CapId(cap_id_raw));
-                        if let Some(cap) = resolved {
-                            (
-                                recv_v3_object_kind(cap.object),
-                                recv_v3_object_generation(cap.object),
-                                u32::from(cap.rights_bits()),
-                                recv_v3_exact_object_size(kernel, cap.object),
-                                recv_v3_exact_region_len(cap.object),
-                            )
-                        } else {
-                            (0, 0, 0, 0, 0)
-                        }
-                    }
-                    None => (0, 0, 0, 0, 0),
-                };
-
-            // Stage 58+59: live DmaRegion/MemoryObject read-only (or RW) mapping.
-            // Order: materialize cap → metadata → map pages → register token → output.
-            // On any failure: rollback mapped pages + cleanup slot + rollback cap.
-            // Stage 60: 6th element (map_rollback) carries (Asid, CapId) for
-            // post-writeback rollback if copy_to_current_user fails.
-            let (
-                mapped_base,
-                mapped_len_out,
-                actual_perm,
-                cleanup_token,
-                skip_payload,
-                map_rollback,
-            ) = if req.map_intent != 0 {
-                use crate::kernel::capabilities::CapObject;
-                use crate::kernel::recv_core::recv_shared_v3::{
-                    MAP_PERM_READ_ONLY, MAP_PERM_READ_WRITE, RecvV3MappingPlan,
-                    compute_recv_v3_mapping_plan,
-                };
-
-                let Some(cap_id_raw) = materialized_cap else {
-                    // map_intent requires a cap-transfer message
-                    return Err(SyscallError::InvalidArgs);
-                };
-                let cap_id = CapId(cap_id_raw);
-
-                // Use eff_rights (already resolved above) for plan computation.
-                let plan = compute_recv_v3_mapping_plan(
-                    delivery.msg.opcode,
-                    req.map_intent,
-                    req.payload_ptr,
-                    req.payload_len,
-                    eff_rights as u8,
-                    exact_reg_len,
-                    PAGE_SIZE as u64,
-                );
-
-                match plan {
-                    RecvV3MappingPlan::Map {
-                        map_va,
-                        mapped_len,
-                        read_only,
-                    } => {
-                        // Resolve physical start: mo.phys + dma.offset.
-                        // Separate cap lookup (Copy) and memory lookup (immutable borrow).
-                        let dma_fields = kernel
-                            .capability_service()
-                            .resolve_current_task_capability(cap_id)
-                            .and_then(|cap| match cap.object {
-                                CapObject::DmaRegion { id, offset, .. } => Some((id, offset)),
-                                CapObject::MemoryObject { id } => Some((id, 0u64)),
-                                _ => None,
-                            });
-                        let phys_start = dma_fields.and_then(|(mo_id, dma_offset)| {
-                            kernel.with_memory_state(|m| {
-                                m.memory_objects
-                                    .iter()
-                                    .flatten()
-                                    .find(|e| e.id == mo_id)
-                                    .map(|e| PhysAddr(e.phys.0 + dma_offset))
-                            })
-                        });
-                        let phys_start = match phys_start {
-                            Some(p) => p,
-                            None => {
-                                kernel.rollback_materialized_recv_cap(
-                                    caller_tid,
-                                    cap_id,
-                                    is_reply_cap,
-                                );
-                                return Err(SyscallError::InvalidArgs);
-                            }
-                        };
-
-                        let receiver_asid = match kernel.task_asid(caller_tid) {
-                            Some(a) => a,
-                            None => {
-                                kernel.rollback_materialized_recv_cap(
-                                    caller_tid,
-                                    cap_id,
-                                    is_reply_cap,
-                                );
-                                return Err(SyscallError::InvalidArgs);
-                            }
-                        };
-
-                        let map_flags = PageFlags {
-                            read: true,
-                            write: !read_only,
-                            execute: false,
-                            user: true,
-                            cache_policy: CachePolicy::WriteBack,
-                        };
-                        let num_pages = (mapped_len / PAGE_SIZE as u64) as usize;
-                        for page_idx in 0..num_pages {
-                            let virt = VirtAddr(map_va + page_idx as u64 * PAGE_SIZE as u64);
-                            let phys = PhysAddr(phys_start.0 + page_idx as u64 * PAGE_SIZE as u64);
-                            if kernel
-                                .map_user_page_in_asid_raw(
-                                    receiver_asid,
-                                    virt,
-                                    Mapping {
-                                        phys,
-                                        flags: map_flags,
-                                    },
-                                )
-                                .is_err()
-                            {
-                                let rollback_len = page_idx * PAGE_SIZE;
-                                if rollback_len > 0 {
-                                    kernel.unmap_range_two_phase(
-                                        receiver_asid,
-                                        map_va as usize,
-                                        rollback_len,
-                                    );
-                                }
-                                kernel.rollback_materialized_recv_cap(
-                                    caller_tid,
-                                    cap_id,
-                                    is_reply_cap,
-                                );
-                                return Err(SyscallError::InvalidArgs);
-                            }
-                        }
-
-                        if kernel
-                            .register_active_transfer_mapping(
-                                crate::kernel::ipc::ThreadId(caller_tid),
-                                cap_id,
-                                VirtAddr(map_va),
-                                mapped_len as usize,
-                            )
-                            .is_err()
-                        {
-                            kernel.unmap_range_two_phase(
-                                receiver_asid,
-                                map_va as usize,
-                                mapped_len as usize,
-                            );
-                            kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
-                            return Err(SyscallError::InvalidArgs);
-                        }
-
-                        crate::yarm_log!(
-                            "RECV_V3_MAPPED tid={} va=0x{:x} len={} ro={}",
-                            caller_tid,
-                            map_va,
-                            mapped_len,
-                            read_only
-                        );
-                        let perm = if read_only {
-                            MAP_PERM_READ_ONLY
-                        } else {
-                            MAP_PERM_READ_WRITE
-                        };
-                        // cleanup_token = xfer_cap_out (full CapId.0, encodes slot+generation).
-                        // Stage 60: stale tokens are generation-safe because CapId encodes
-                        // generation in bits[63:16]; a revoked-then-reused slot has a
-                        // different CapId and will not match the stored active mapping entry.
-                        (
-                            map_va,
-                            mapped_len,
-                            perm,
-                            xfer_cap_out,
-                            true,
-                            Some((receiver_asid, cap_id)),
-                        )
-                    }
-                    RecvV3MappingPlan::Skip => {
-                        // map_intent != 0 but received message is not OPCODE_SHARED_MEM.
-                        kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
-                        return Err(SyscallError::InvalidArgs);
-                    }
-                    RecvV3MappingPlan::InvalidRegion | RecvV3MappingPlan::InsufficientRights => {
-                        kernel.rollback_materialized_recv_cap(caller_tid, cap_id, is_reply_cap);
-                        return Err(SyscallError::InvalidArgs);
-                    }
-                }
-            } else {
-                (0u64, 0u64, 0u32, 0u64, false, None)
-            };
-
-            if skip_payload {
-                // Mapping done: payload_ptr is the mapping target VA, not an inline
-                // payload buffer. Skip copy. All info is in v3 metadata output.
-                // Stage 60: if metadata writeback fails the caller never receives the
-                // cleanup_token, so it cannot call TransferRelease. Roll back the mapping,
-                // remove the registry entry, and revoke the materialized cap so no resources
-                // leak.
-                let wrote_ok = write_v3_output_to_user(
-                    kernel,
-                    req.metadata_ptr,
-                    req.metadata_len,
-                    V3_STATUS_OK,
-                    sender_tid_raw,
-                    0,
-                    message_flags_raw,
-                    xfer_cap_out,
-                    obj_kind,
-                    obj_gen,
-                    eff_rights,
-                    exact_obj_size,
-                    exact_reg_len,
-                    mapped_base,
-                    mapped_len_out,
-                    actual_perm,
-                    cleanup_token,
-                );
-                if !wrote_ok {
-                    if let Some((rb_asid, rb_cap)) = map_rollback {
-                        kernel.unmap_range_two_phase(
-                            rb_asid,
-                            mapped_base as usize,
-                            mapped_len_out as usize,
-                        );
-                        kernel.remove_active_transfer_mapping(
-                            crate::kernel::ipc::ThreadId(caller_tid),
-                            rb_cap,
-                        );
-                        kernel.rollback_materialized_recv_cap(caller_tid, rb_cap, is_reply_cap);
-                    }
-                    crate::yarm_log!(
-                        "RECV_V3_WRITEBACK_FAIL_ROLLBACK tid={} cap={}",
-                        caller_tid,
-                        xfer_cap_out
-                    );
-                    return Err(SyscallError::InvalidArgs);
-                }
-                frame.set_ok(
-                    usize::try_from(sender_tid_raw).unwrap_or(0),
-                    0,
-                    usize::try_from(xfer_cap_out).unwrap_or(usize::MAX),
-                );
-                crate::yarm_log!(
-                    "RECV_V3_LIVE_MAPPED tid={} sender={}",
-                    caller_tid,
-                    sender_tid_raw
-                );
-                return Ok(());
-            }
-
-            match execute_user_asid_plain_writeback(kernel, &delivery) {
-                RecvUserWritebackOutcome::Ok => {
-                    let _ = write_v3_output_to_user(
-                        kernel,
-                        req.metadata_ptr,
-                        req.metadata_len,
-                        V3_STATUS_OK,
-                        sender_tid_raw,
-                        payload_len as u32,
-                        message_flags_raw,
-                        xfer_cap_out,
-                        obj_kind,
-                        obj_gen,
-                        eff_rights,
-                        exact_obj_size,
-                        exact_reg_len,
-                        0,
-                        0,
-                        0,
-                        0,
-                    );
-                    frame.set_ok(
-                        usize::try_from(sender_tid_raw).unwrap_or(0),
-                        payload_len,
-                        usize::try_from(xfer_cap_out).unwrap_or(usize::MAX),
-                    );
-                    crate::yarm_log!("RECV_V3_LIVE tid={} sender={}", caller_tid, sender_tid_raw);
-                }
-                RecvUserWritebackOutcome::UndersizedBuffer => {
-                    // Rollback cap — buffer too small, message consumed, §58.
-                    if let Some(cap_id) = materialized_cap {
-                        kernel.rollback_materialized_recv_cap(
-                            caller_tid,
-                            CapId(cap_id),
-                            is_reply_cap,
-                        );
-                    }
-                    return Err(SyscallError::InvalidArgs);
-                }
-                RecvUserWritebackOutcome::CopyFault { user_ptr } => {
-                    // No rollback on payload copy fault — message consumed, §58.
-                    record_user_fault(kernel, frame, user_ptr, FaultAccess::Write);
-                    return Ok(());
-                }
-            }
-            Ok(())
-        }
-    }
+    self::recv_shared_v3::handle_recv_shared_v3(kernel, frame)
 }
 
 pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
@@ -4589,11 +2909,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
     let syscall = Syscall::decode(frame.syscall_num())?;
     let caller_tid = kernel.current_tid();
     let result = match syscall {
-        Syscall::Yield => {
-            kernel.yield_current().map_err(SyscallError::from)?;
-            frame.set_ok(0, 0, 0);
-            Ok(())
-        }
+        Syscall::Yield => handle_yield(kernel, frame),
         Syscall::IpcSend => handle_ipc_send(kernel, frame),
         Syscall::IpcRecv => handle_ipc_recv(kernel, frame),
         Syscall::IpcRecvTimeout => handle_ipc_recv_timeout(kernel, frame),
@@ -4701,8 +3017,10 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
 
 #[cfg(test)]
 mod tests {
+    use super::process::TakeOnceStagingBuffer;
     use super::*;
     use crate::kernel::boot::Bootstrap;
+    use crate::kernel::boot::UserImageSpec;
     use crate::kernel::ipc::{EndpointMode, IPC_REGISTER_WORDS};
     use crate::kernel::scheduler_timer::Timer;
     use crate::kernel::trapframe::TrapFrame;
@@ -7445,7 +5763,7 @@ mod tests {
 
     #[test]
     fn stage81b_spawn_path_table_covers_optional_fs_image_ids() {
-        let src = include_str!("syscall.rs");
+        let src = include_str!("syscall/process.rs");
         assert!(
             src.contains("10 => Some(\"sbin/fat_srv\")"),
             "spawn_image_path_for_image_id must map image_id=10 to sbin/fat_srv"
@@ -7462,7 +5780,7 @@ mod tests {
 
     #[test]
     fn stage81b_spawn_path_table_unknown_high_id_returns_none() {
-        let src = include_str!("syscall.rs");
+        let src = include_str!("syscall/process.rs");
         // The wildcard arm must be the fallthrough; no ID ≥ 13 must be listed.
         assert!(
             src.contains("_ => None"),
@@ -7496,7 +5814,7 @@ mod tests {
         // Both Phase 2B (spawn_process_from_user_buf, NR=24) and Phase 3A
         // (spawn_from_memory_object, NR=29) route through
         // spawn_image_path_for_image_id. Verify both callers are present.
-        let src = include_str!("syscall.rs");
+        let src = include_str!("syscall/process.rs");
         let count = src
             .matches("spawn_image_path_for_image_id(image_id)")
             .count();
@@ -7756,6 +6074,232 @@ mod tests {
     }
 
     // ── Stage 102: mechanical syscall decomposition — source-scan tests ───────
+
+    #[test]
+    fn d4_step2_process_module_extraction_guardrails() {
+        let syscall_src = include_str!("syscall.rs");
+        let process_src = include_str!("syscall/process.rs");
+        let recv_v3_src = include_str!("syscall/recv_shared_v3.rs");
+        let trap_entry_src = include_str!("../arch/trap_entry.rs");
+
+        assert!(
+            syscall_src.contains("mod process;"),
+            "syscall.rs must declare the process child module"
+        );
+        assert!(
+            process_src.contains("pub(super) fn handle_spawn_thread")
+                && process_src.contains("pub(super) fn handle_fork")
+                && process_src.contains("pub(super) fn handle_spawn_process")
+                && process_src.contains("pub(super) fn handle_spawn_process_from_user_buf")
+                && process_src.contains("pub(super) fn handle_spawn_from_initramfs_file")
+                && process_src.contains("pub(super) fn handle_spawn_from_memory_object"),
+            "process.rs must host the moved process syscall handlers"
+        );
+        assert!(
+            syscall_src.contains("self::process::handle_spawn_thread(kernel, frame)")
+                && syscall_src.contains("self::process::handle_fork(kernel, frame)")
+                && syscall_src.contains("self::process::handle_spawn_process(kernel, frame)")
+                && syscall_src
+                    .contains("self::process::handle_spawn_process_from_user_buf(kernel, frame)")
+                && syscall_src
+                    .contains("self::process::handle_spawn_from_initramfs_file(kernel, frame)")
+                && syscall_src
+                    .contains("self::process::handle_spawn_from_memory_object(kernel, frame)"),
+            "syscall.rs must keep minimal process delegation shims"
+        );
+        assert_eq!(SYSCALL_COUNT, 31, "D4 step 2 must not change syscall count");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "D4 step 2 must not change syscall variant count"
+        );
+        assert!(
+            process_src.contains("KSPAWN_ENTER")
+                && process_src.contains("KSPAWN_FROM_CPIO")
+                && process_src.contains("SPAWN_FROM_MO_ENTER"),
+            "process syscall marker strings must remain in the process module"
+        );
+        assert!(
+            !syscall_src.contains(&["fn parse_v3_request", "_bytes"].concat())
+                && recv_v3_src.contains(&["fn parse_v3_request", "_bytes"].concat()),
+            "recv_shared_v3 code must stay extracted and not move back into syscall.rs"
+        );
+        assert!(
+            trap_entry_src.contains("SWITCH_FRAMES_ENTER")
+                && trap_entry_src.contains("SWITCH_FRAMES_RETURNED"),
+            "Stage 117/118/119 switch-frame source markers must remain present"
+        );
+        assert!(
+            syscall_src.contains("Syscall::SpawnThread => handle_spawn_thread(kernel, frame)")
+                && syscall_src.contains("Syscall::Fork => handle_fork(kernel, frame)")
+                && syscall_src.contains("Syscall::SpawnProcess => handle_spawn_process(kernel, frame)")
+                && syscall_src.contains("Syscall::SpawnProcessFromUserBuf => handle_spawn_process_from_user_buf(kernel, frame)")
+                && syscall_src.contains("Syscall::SpawnFromInitramfsFile => handle_spawn_from_initramfs_file(kernel, frame)")
+                && syscall_src.contains("Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame)"),
+            "process syscall dispatch arms must stay textually stable"
+        );
+    }
+
+    #[test]
+    fn d4_step3_sched_module_extraction_guardrails() {
+        let syscall_src = include_str!("syscall.rs");
+        let sched_src = include_str!("syscall/sched.rs");
+        let process_src = include_str!("syscall/process.rs");
+        let recv_v3_src = include_str!("syscall/recv_shared_v3.rs");
+        let trap_entry_src = include_str!("../arch/trap_entry.rs");
+        let scheduler_src = include_str!("scheduler.rs");
+
+        assert!(
+            syscall_src.contains("mod sched;"),
+            "syscall.rs must declare the sched child module"
+        );
+        assert!(
+            sched_src.contains("pub(super) fn handle_yield")
+                && sched_src.contains("pub(super) fn handle_futex_wait")
+                && sched_src.contains("pub(super) fn handle_futex_wake"),
+            "sched.rs must host the moved scheduler/futex syscall handlers"
+        );
+        assert!(
+            syscall_src.contains("self::sched::handle_yield(kernel, frame)")
+                && syscall_src.contains("self::sched::handle_futex_wait(kernel, frame)")
+                && syscall_src.contains("self::sched::handle_futex_wake(kernel, frame)"),
+            "syscall.rs must keep minimal scheduler delegation shims"
+        );
+        assert!(
+            syscall_src.contains("Syscall::Yield => handle_yield(kernel, frame)")
+                && syscall_src.contains("Syscall::FutexWait => handle_futex_wait(kernel, frame)")
+                && syscall_src.contains("Syscall::FutexWake => handle_futex_wake(kernel, frame)"),
+            "scheduler syscall dispatch arms must route through the same syscall variants"
+        );
+        assert_eq!(SYSCALL_COUNT, 31, "D4 step 3 must not change syscall count");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "D4 step 3 must not change syscall variant count"
+        );
+        assert!(
+            sched_src.contains("yield_current()")
+                && sched_src.contains("futex_wait_current")
+                && sched_src.contains("futex_wake"),
+            "scheduler/futex call markers must remain in sched.rs"
+        );
+        assert!(
+            !syscall_src.contains(&["fn parse_v3_request", "_bytes"].concat())
+                && recv_v3_src.contains(&["fn parse_v3_request", "_bytes"].concat()),
+            "recv_shared_v3 code must stay extracted and not move back into syscall.rs"
+        );
+        assert!(
+            process_src.contains("pub(super) fn handle_spawn_thread")
+                && process_src.contains("pub(super) fn handle_spawn_from_memory_object"),
+            "process extraction must remain intact"
+        );
+        assert!(
+            trap_entry_src.contains("SWITCH_FRAMES_ENTER")
+                && trap_entry_src.contains("SWITCH_FRAMES_RETURNED"),
+            "Stage 117/118/119 switch-frame source markers must remain present"
+        );
+        assert!(
+            scheduler_src.contains("SPLIT_RECV_TIMEOUT_DEADLINE")
+                && scheduler_src.contains("MAX_CPUS"),
+            "scheduler timeout/preemption policy markers must remain present"
+        );
+    }
+
+    #[test]
+    fn d4_step4_cap_module_extraction_guardrails() {
+        let syscall_src = include_str!("syscall.rs");
+        let cap_src = include_str!("syscall/cap.rs");
+        let process_src = include_str!("syscall/process.rs");
+        let sched_src = include_str!("syscall/sched.rs");
+        let recv_v3_src = include_str!("syscall/recv_shared_v3.rs");
+        let trap_entry_src = include_str!("../arch/trap_entry.rs");
+        let memory_src = include_str!("boot/memory_state.rs");
+        let exec_state_src = include_str!("boot/exec_state.rs");
+        let recv_waiter_split_src = include_str!("recv_waiter_split.rs");
+
+        assert!(
+            syscall_src.contains("mod cap;"),
+            "syscall.rs must declare the cap child module"
+        );
+        assert!(
+            cap_src.contains("pub(super) fn handle_transfer_release")
+                && cap_src.contains("pub(super) fn handle_control_plane_set_cnode_slots"),
+            "cap.rs must host the moved capability syscall handlers"
+        );
+        assert!(
+            syscall_src.contains("self::cap::handle_transfer_release(kernel, frame)")
+                && syscall_src
+                    .contains("self::cap::handle_control_plane_set_cnode_slots(kernel, frame)"),
+            "syscall.rs must keep minimal capability delegation shims"
+        );
+        assert!(
+            syscall_src.contains(
+                "Syscall::ControlPlaneSetCnodeSlots => handle_control_plane_set_cnode_slots(kernel, frame)"
+            ) && syscall_src.contains(
+                "Syscall::TransferRelease => handle_transfer_release(kernel, frame)"
+            ),
+            "capability syscall dispatch arms must route through the same syscall variants"
+        );
+        assert_eq!(SYSCALL_COUNT, 31, "D4 step 4 must not change syscall count");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "D4 step 4 must not change syscall variant count"
+        );
+        assert!(
+            cap_src.contains("revoke_capability_in_cnode")
+                && cap_src.contains("remove_active_transfer_mapping")
+                && cap_src.contains("note_shared_mem_released")
+                && cap_src.contains("control_plane_set_process_cnode_slots_planned"),
+            "capability release/CNode marker strings must remain in cap.rs"
+        );
+        assert!(
+            cap_src.contains("SyscallError::InvalidArgs")
+                && cap_src.contains("SyscallError::Internal")
+                && cap_src.contains("KernelError::UserMemoryFault")
+                && cap_src.contains("KernelError::TaskMissing"),
+            "capability syscall error handling markers must remain unchanged"
+        );
+        assert!(
+            !syscall_src.contains(&["fn parse_v3_request", "_bytes"].concat())
+                && recv_v3_src.contains(&["fn parse_v3_request", "_bytes"].concat()),
+            "recv_shared_v3 code must stay extracted and not move back into syscall.rs"
+        );
+        assert!(
+            process_src.contains("pub(super) fn handle_spawn_thread")
+                && process_src.contains("pub(super) fn handle_spawn_from_memory_object"),
+            "process extraction must remain intact"
+        );
+        assert!(
+            sched_src.contains("pub(super) fn handle_yield")
+                && sched_src.contains("pub(super) fn handle_futex_wait")
+                && sched_src.contains("pub(super) fn handle_futex_wake"),
+            "scheduler extraction must remain intact"
+        );
+        assert!(
+            trap_entry_src.contains("SWITCH_FRAMES_ENTER")
+                && trap_entry_src.contains("SWITCH_FRAMES_RETURNED"),
+            "Stage 117/118/119 switch-frame source markers must remain present"
+        );
+        assert!(
+            syscall_src.contains("YARM_D1_SPLIT_MATERIALIZE")
+                && syscall_src.contains("YARM_D5_SPLIT_MATERIALIZE"),
+            "D1/D5 cap-transfer split markers must remain present"
+        );
+        assert!(
+            exec_state_src.contains("D6_LIVE_SPLIT")
+                && memory_src.contains("D3_LIVE_SPLIT")
+                && recv_waiter_split_src.contains("publish_recv_waiter_live"),
+            "D2/D3/D6 behavior markers must remain present"
+        );
+        assert!(
+            cap_src.contains("current_task_cnode")
+                && cap_src.contains("round_up_page")
+                && cap_src.contains("revoke_capability_in_cnode")
+                && cap_src.contains("control_plane_set_process_cnode_slots_planned"),
+            "cap generation/refcount/slot semantic call sites must remain in cap.rs"
+        );
+    }
 
     #[test]
     fn stage102_split_modules_exist_and_host_moved_handlers() {

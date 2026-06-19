@@ -104,8 +104,10 @@ static BOOT_COMMAND_LINE: SpinLock<BootCommandLine> = SpinLock::new(BootCommandL
 
 /// Applies the YARM boot-option knobs carried by a captured command line.
 ///
-/// Stage 108/109: `yarm.loglevel=` sets the console loglevel and
-/// `yarm.x86_ap_rust=` flips the x86_64 AP Rust-entry gate. Knobs are applied
+/// Stage 108/109/120: `yarm.loglevel=` sets the console loglevel,
+/// `yarm.x86_ap_rust=` flips the x86_64 AP Rust-entry gate, and
+/// `yarm.d6_switch_proof=` gates the x86_64-only controlled one-shot
+/// switch proof harness. Knobs are applied
 /// ONLY when present and valid; otherwise production defaults are kept. The
 /// `BootCommandLine` storage itself stays policy-neutral. This is the single
 /// chokepoint every arch boot path routes through, so no arch boot file needs
@@ -118,10 +120,20 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         );
         crate::yarm_log!("YARM_LOGLEVEL_SET level={}", level);
     }
-    #[cfg(target_arch = "x86_64")]
     if let Some(enabled) = parsed.x86_ap_rust {
-        crate::arch::x86_64::smp::set_ap_rust_entry_enabled(enabled);
-        crate::yarm_log!("YARM_X86_AP_RUST_SET enabled={}", enabled);
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::smp::set_ap_rust_entry_enabled(enabled);
+            crate::yarm_log!("YARM_X86_AP_RUST_SET enabled={}", enabled);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = enabled;
+    }
+    if let Some(enabled) = parsed.d6_switch_proof {
+        #[cfg(target_arch = "x86_64")]
+        crate::kernel::boot::set_d6_controlled_switch_proof_enabled(enabled);
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = enabled;
     }
 }
 
@@ -196,6 +208,11 @@ pub struct YarmBootOptions<'a> {
     /// the knob exists as Pass 2 scaffolding so the cmdline plumbing for
     /// Pass 3's live Rust-entry wiring is already in place and testable.
     pub x86_ap_rust: Option<bool>,
+    /// Stage 120: `yarm.d6_switch_proof=1` gates the x86_64-only,
+    /// single-CPU-only, one-shot unlocked `switch_frames` proof harness.
+    /// Non-x86_64 builds parse but ignore the knob so AArch64/RISC-V
+    /// behavior remains unchanged.
+    pub d6_switch_proof: Option<bool>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -266,14 +283,21 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
             options.console_loglevel = parse_loglevel_value(value);
         }
         if key == b"yarm.x86_ap_rust" {
-            options.x86_ap_rust = match value {
-                b"1" | b"true" | b"yes" | b"on" => Some(true),
-                b"0" | b"false" | b"no" | b"off" => Some(false),
-                _ => None,
-            };
+            options.x86_ap_rust = parse_bool_knob(value);
+        }
+        if key == b"yarm.d6_switch_proof" {
+            options.d6_switch_proof = parse_bool_knob(value);
         }
     }
     options
+}
+
+fn parse_bool_knob(value: &[u8]) -> Option<bool> {
+    match value {
+        b"1" | b"true" | b"yes" | b"on" => Some(true),
+        b"0" | b"false" | b"no" | b"off" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_platform_option(value: &[u8]) -> Option<PlatformOption> {
