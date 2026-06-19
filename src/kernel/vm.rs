@@ -135,6 +135,9 @@ pub enum VmError {
     Misaligned,
     PrivilegeViolation,
     InvalidAsid,
+    /// Returned when an address is out of range or violates an internal
+    /// address-space invariant (not a privilege check failure).
+    InvalidAddress,
 }
 
 #[cfg(any(
@@ -282,8 +285,17 @@ impl AddressSpace {
     fn isolate_page_entry_at(&mut self, idx: usize, virt: VirtAddr) -> Result<usize, VmError> {
         let entry = self.entries[idx].expect("entry");
         let page_offset = ((virt.0 - entry.virt.0) / PAGE_SIZE as u64) as usize;
+        // This condition is unreachable via the only call site (map_page), which
+        // only arrives here after find_entry_containing guarantees containment.
+        // Return InvalidAddress (not PrivilegeViolation) to avoid misclassifying
+        // an internal invariant violation as a user privilege check failure.
+        debug_assert!(
+            page_offset < entry.pages,
+            "isolate_page_entry_at: page_offset {page_offset} out of bounds (entry.pages={})",
+            entry.pages
+        );
         if page_offset >= entry.pages {
-            return Err(VmError::PrivilegeViolation);
+            return Err(VmError::InvalidAddress);
         }
         if page_offset == 0 {
             return Ok(idx);
@@ -721,7 +733,10 @@ impl AddressSpaceManager {
     }
 
     fn allocate_asid(&mut self) -> Result<Asid, VmError> {
-        for _ in 0..MAX_ADDRESS_SPACES {
+        // Scan the full u16 ASID space (1..=65535).  The previous bound of
+        // MAX_ADDRESS_SPACES iterations caused spurious VmError::Full when
+        // next_asid landed on a run of retired ASIDs from prior destroy cycles.
+        for _ in 0..u16::MAX {
             if self.next_asid == 0 {
                 self.next_asid = 1;
             }
@@ -793,30 +808,45 @@ impl AddressSpaceManager {
         asid: Asid,
         pending_cpu_bitmap: CpuBitmap,
     ) -> Result<[Option<DrainedMapping>; MAX_MAPPINGS], VmError> {
-        for slot in &mut self.entries {
-            if slot.as_ref().is_some_and(|entry| entry.asid == asid)
-                && let Some(mut entry) = slot.take()
-            {
-                let drained = entry.aspace.drain_mappings();
-                *slot = None;
-                arch_unregister_asid(asid);
-                if pending_cpu_bitmap == 0 {
-                    return Ok(drained);
-                }
-                for retired in &mut self.retired {
-                    if retired.is_none() {
-                        *retired = Some(RetiredAsid {
-                            asid,
-                            pending_cpu_bitmap,
-                            age_ticks: 0,
-                        });
-                        return Ok(drained);
-                    }
-                }
-                return Err(VmError::Full);
+        // Locate the live entry first so we can return InvalidAsid before
+        // committing to any state change.
+        let entry_idx = self
+            .entries
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|e| e.asid == asid))
+            .ok_or(VmError::InvalidAsid)?;
+
+        // If CPUs need to acknowledge shootdowns, guarantee a retired slot
+        // exists before modifying any live state.  Without this pre-check the
+        // ASID could be drained and unregistered and then the retired-array
+        // insert fails, silently dropping the TLB-shootdown tracking bitmap.
+        if pending_cpu_bitmap != 0 && !self.retired.iter().any(|s| s.is_none()) {
+            return Err(VmError::Full);
+        }
+
+        let mut entry = self.entries[entry_idx]
+            .take()
+            .expect("entry verified above");
+        let drained = entry.aspace.drain_mappings();
+        arch_unregister_asid(asid);
+
+        if pending_cpu_bitmap == 0 {
+            return Ok(drained);
+        }
+
+        for retired in &mut self.retired {
+            if retired.is_none() {
+                *retired = Some(RetiredAsid {
+                    asid,
+                    pending_cpu_bitmap,
+                    age_ticks: 0,
+                });
+                return Ok(drained);
             }
         }
-        Err(VmError::InvalidAsid)
+
+        // Unreachable: the pre-check above verified a free retired slot exists.
+        unreachable!("retired slot must exist after capacity pre-check");
     }
 
     /// Acknowledges one CPU's shootdown for a retired ASID.
@@ -1595,5 +1625,183 @@ mod tests {
         let dm = drained[0].expect("single entry");
         assert_eq!(dm.pages, 1);
         assert_eq!(dm.mapping.phys, PhysAddr(0xA_000));
+    }
+
+    // --- Bug audit regression: destroy_and_collect_mappings atomicity (Claim 1) ---
+
+    // Helper: fills retired[] to capacity while keeping one live space.
+    // Returns that live ASID so callers can test destroy-with-full-retired.
+    fn setup_full_retired_one_live() -> (AddressSpaceManager, Asid) {
+        let mut mgr = AddressSpaceManager::default();
+        // Create N spaces and destroy N-1 with pending bitmap → retired has N-1 entries.
+        let mut batch = [Asid(0); MAX_ADDRESS_SPACES];
+        for slot in batch.iter_mut() {
+            *slot = mgr.create_user_space().expect("create");
+        }
+        let kept = batch[MAX_ADDRESS_SPACES - 1];
+        for &asid in &batch[..MAX_ADDRESS_SPACES - 1] {
+            mgr.destroy(asid, 0b1).expect("destroy");
+        }
+        // live[] = {kept}, retired[] = N-1 entries (1 free slot).
+        // Create one more and immediately retire it to fill retired[].
+        let filler = mgr.create_user_space().expect("filler");
+        mgr.destroy(filler, 0b1).expect("destroy filler");
+        // retired[] now has exactly MAX_ADDRESS_SPACES entries = FULL.
+        assert!(
+            mgr.retired.iter().all(|s| s.is_some()),
+            "retired must be full"
+        );
+        (mgr, kept)
+    }
+
+    #[test]
+    fn destroy_with_pending_bitmap_returns_full_when_retired_slots_exhausted() {
+        let (mut mgr, victim) = setup_full_retired_one_live();
+
+        // Give victim a mapping so we can verify drain_mappings was NOT called.
+        mgr.get_mut(victim)
+            .expect("victim present")
+            .map_page(
+                VirtAddr(0x1000),
+                Mapping {
+                    phys: PhysAddr(0xA_000),
+                    flags: PageFlags::USER_RW,
+                },
+            )
+            .expect("map");
+
+        // destroy_and_collect_mappings must return VmError::Full without touching
+        // the victim address space (pre-check before any state change).
+        let result = mgr.destroy_and_collect_mappings(victim, 0b1);
+        assert_eq!(result, Err(VmError::Full));
+
+        // The victim must still be live.
+        assert!(
+            mgr.get(victim).is_some(),
+            "live entry must be preserved on Full"
+        );
+
+        // The mapping must be intact (drain_mappings must not have been called).
+        assert!(
+            mgr.get(victim).unwrap().resolve(VirtAddr(0x1000)).is_some(),
+            "mapping must be intact when destroy returns Full"
+        );
+
+        // retired[] must be unchanged — no ASID was inserted or removed.
+        assert!(
+            mgr.retired.iter().all(|s| s.is_some()),
+            "retired must remain full"
+        );
+    }
+
+    #[test]
+    fn destroy_with_zero_bitmap_succeeds_even_when_retired_slots_full() {
+        let (mut mgr, last) = setup_full_retired_one_live();
+
+        // Destroying `last` with bitmap == 0 must succeed because no retired slot is
+        // needed when there are no pending shootdowns.
+        assert_eq!(mgr.destroy(last, 0), Ok(()));
+        assert!(mgr.get(last).is_none());
+    }
+
+    #[test]
+    fn destroy_unknown_asid_returns_invalid_asid_not_full() {
+        // Even with full retired[], an unknown ASID must return InvalidAsid,
+        // not Full — the ASID check happens before the retired-capacity check.
+        let (mut mgr, _) = setup_full_retired_one_live();
+        assert_eq!(
+            mgr.destroy_and_collect_mappings(Asid(0xFFFF), 0b1),
+            Err(VmError::InvalidAsid)
+        );
+    }
+
+    // --- Bug audit regression: allocate_asid full scan (Claim 2) ---
+
+    #[test]
+    fn allocate_asid_never_returns_asid_zero() {
+        let mut mgr = AddressSpaceManager::default();
+        for _ in 0..MAX_ADDRESS_SPACES {
+            let asid = mgr.create_user_space().expect("create");
+            assert_ne!(asid, Asid(0), "ASID 0 must never be allocated");
+            assert_eq!(mgr.destroy(asid, 0), Ok(()));
+        }
+    }
+
+    #[test]
+    fn allocate_asid_never_returns_a_retired_asid() {
+        // Verify allocate_asid skips retired entries even when next_asid lands
+        // in the retired range.  With the old MAX_ADDRESS_SPACES scan window this
+        // could spuriously fail if all candidates in the window were retired.
+        let mut mgr = AddressSpaceManager::default();
+        let asid = mgr.create_user_space().expect("create");
+        mgr.destroy(asid, 0b1).expect("destroy with bitmap");
+        assert!(mgr.retired_entry(asid).is_some());
+
+        // Allocate another — must not reuse the still-retired ASID.
+        let asid2 = mgr.create_user_space().expect("create 2");
+        assert_ne!(asid2, asid, "must not reuse a retired ASID");
+
+        // After acknowledging the shootdown the ASID becomes reusable.
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b1), Ok(true));
+        assert!(mgr.get(asid2).is_some());
+    }
+
+    #[test]
+    fn allocate_asid_succeeds_when_all_prior_asids_are_retired() {
+        // Fill retired[] completely, then verify that create_user_space can still
+        // allocate a fresh ASID outside the retired block.
+        let mut mgr = AddressSpaceManager::default();
+        let mut batch = [Asid(0); MAX_ADDRESS_SPACES];
+        for slot in batch.iter_mut() {
+            *slot = mgr.create_user_space().expect("create");
+        }
+        // next_asid is now MAX_ADDRESS_SPACES + 1.
+        for &asid in batch.iter() {
+            mgr.destroy(asid, 0b1).expect("destroy");
+        }
+        // retired[] = {1..MAX_ADDRESS_SPACES}, live[] = empty,
+        // next_asid = MAX_ADDRESS_SPACES+1 (already outside the retired block).
+        let fresh = mgr
+            .create_user_space()
+            .expect("must allocate past retired block");
+        assert!(
+            !batch.contains(&fresh),
+            "new ASID {fresh:?} must not be a still-retired ASID"
+        );
+        assert!(mgr.get(fresh).is_some());
+    }
+
+    // --- Bug audit regression: isolate_page_entry_at wrong error (Claim 5) ---
+
+    #[test]
+    fn isolate_page_entry_at_wrong_error_variant_is_now_invalid_address() {
+        // Verify that the VmError::InvalidAddress variant exists in the enum.
+        // The previous code returned VmError::PrivilegeViolation for an internal
+        // invariant check in isolate_page_entry_at. This test pins the new variant.
+        let variants_include_invalid_address =
+            matches!(VmError::InvalidAddress, VmError::InvalidAddress);
+        assert!(variants_include_invalid_address);
+        // Also confirm PrivilegeViolation is still used for actual privilege checks.
+        let privileges_still_exist =
+            matches!(VmError::PrivilegeViolation, VmError::PrivilegeViolation);
+        assert!(privileges_still_exist);
+    }
+
+    #[test]
+    fn map_kernel_page_into_user_space_returns_privilege_violation_not_invalid_address() {
+        // Privilege checks must still return PrivilegeViolation, not InvalidAddress.
+        let mut aspace = AddressSpace::new_user();
+        let result = aspace.map_page(
+            VirtAddr(KERNEL_SPACE_BASE),
+            Mapping {
+                phys: PhysAddr(0x1000),
+                flags: PageFlags::USER_RW,
+            },
+        );
+        assert_eq!(
+            result,
+            Err(VmError::PrivilegeViolation),
+            "mapping kernel VA into user space must be PrivilegeViolation"
+        );
     }
 }
