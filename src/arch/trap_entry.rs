@@ -374,6 +374,14 @@ pub fn handle_trap_entry_shared(
                     result
                 })
                 .map_err(|err| TrapHandleError::Syscall(err.into()))??;
+            // Stage 132: arm the first post-cleanup trap diagnostic.
+            if is_proof_done {
+                let cpu_idx_set = cpu.0 as usize;
+                if cpu_idx_set < crate::kernel::scheduler::MAX_CPUS {
+                    crate::kernel::boot::D6_POST_CLEANUP_DIAG_PENDING[cpu_idx_set]
+                        .store(true, core::sync::atomic::Ordering::Release);
+                }
+            }
         }
     }
 

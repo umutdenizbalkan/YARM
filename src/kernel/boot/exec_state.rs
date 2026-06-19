@@ -1132,6 +1132,26 @@ impl KernelState {
             crate::yarm_log!("D6_SWITCH_CONTEXT_LAYOUT_OK");
             crate::yarm_log!("D6_SWITCH_CONTEXT_R14_RESTORE_CHECK");
             crate::yarm_log!("D6_SWITCH_CONTEXT_AUDIT_DONE");
+            // Stage 132: map all kernel-switch-stack pages for both proof tasks
+            // before the switch.  The top-page-only mapping left by Stage 127 is
+            // insufficient: the first post-proof trap handler grows ~9 KB deep,
+            // crashing below the single mapped page (#PF write to unmapped stack).
+            if let Err(err) = self.d6_ensure_full_proof_switch_stack_mapped(outgoing_tid) {
+                crate::yarm_log!(
+                    "D6_PROOF_FULL_STACK_MAP_FAILED tid={} err={:?}",
+                    outgoing_tid,
+                    err
+                );
+                return Ok(());
+            }
+            if let Err(err) = self.d6_ensure_full_proof_switch_stack_mapped(incoming_tid) {
+                crate::yarm_log!(
+                    "D6_PROOF_FULL_STACK_MAP_FAILED tid={} err={:?}",
+                    incoming_tid,
+                    err
+                );
+                return Ok(());
+            }
             self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?;
             crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
             Ok(())

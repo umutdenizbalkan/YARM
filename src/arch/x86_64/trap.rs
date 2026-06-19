@@ -156,6 +156,17 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
     fault_bookkeeping_mode: FaultBookkeepingMode,
 ) -> Result<(), TrapHandleError> {
     super::descriptor_tables::ensure_boot_descriptor_tables_scaffolded();
+    // Stage 132: one-shot post-cleanup #PF diagnostic, armed after CLEANUP_DONE.
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx < crate::kernel::scheduler::MAX_CPUS
+            && crate::kernel::boot::D6_POST_CLEANUP_DIAG_PENDING[cpu_idx]
+                .swap(false, core::sync::atomic::Ordering::AcqRel)
+        {
+            d6_emit_post_cleanup_first_trap_diag(kernel, cpu, context);
+        }
+    }
     // NOTE(arch/x86_64): Architecture-specific IDT setup and assembly trap stubs
     // funnel hardware entries into this Rust dispatcher. Tests may still construct
     // synthetic contexts directly, but real trap/interrupt/syscall vectors now use
@@ -189,6 +200,81 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         restore_arch_thread_state(kernel, cpu, frame)?;
     }
     Ok(())
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn d6_emit_post_cleanup_first_trap_diag(
+    kernel: &mut KernelState,
+    _cpu: CpuId,
+    context: X86TrapContext,
+) {
+    let vector = context.vector;
+    let error_code = context.error_code;
+    let cr2 = context.fault_addr;
+    let rsp_derived = cr2.wrapping_add(8);
+    let kernel_ptr = kernel as *const _ as usize as u64;
+    let current_tid = kernel.current_tid().unwrap_or(u64::MAX);
+    let active_asid_num = kernel.hal.active_asid().map_or(0, |a| a.0);
+    let tss_rsp0 = super::descriptor_tables::read_boot_tss_rsp0();
+    let (stack_base, stack_top) = kernel.with_tcbs(|tcbs| {
+        tcbs.iter()
+            .flatten()
+            .find(|tcb| tcb.tid.0 == current_tid)
+            .map(|tcb| {
+                (
+                    tcb.kernel_context.stack_base.map_or(0u64, |v| v.0),
+                    tcb.kernel_context.stack_top.map_or(0u64, |v| v.0),
+                )
+            })
+            .unwrap_or((0u64, 0u64))
+    });
+    let mapped_page_bottom = stack_top.saturating_sub(4096u64);
+    let cr2_eq_rsp_m8 = cr2 == rsp_derived.wrapping_sub(8);
+    let in_full_stack = cr2 >= stack_base && cr2 < stack_top;
+    let in_mapped_page = cr2 >= mapped_page_bottom && cr2 < stack_top;
+    let stack_class = if cr2_eq_rsp_m8 && in_full_stack && !in_mapped_page {
+        "cr2_below_mapped_stack"
+    } else if cr2_eq_rsp_m8 && in_mapped_page {
+        "cr2_inside_mapped_stack"
+    } else if cr2 < stack_base {
+        "cr2_below_expected_stack_page"
+    } else if cr2 >= stack_top {
+        "rsp_above_expected_stack_top"
+    } else {
+        "unknown"
+    };
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_BEGIN");
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_VECTOR value=0x{:x}", vector);
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_ERROR value=0x{:x}", error_code);
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_CR2 value=0x{:x}", cr2);
+    crate::yarm_log!(
+        "D6_POST_CLEANUP_FIRST_TRAP_RIP value=unknown_kernel_mode tid={}",
+        current_tid
+    );
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_RSP value=0x{:x}", rsp_derived);
+    crate::yarm_log!(
+        "D6_POST_CLEANUP_FIRST_TRAP_R14 value=kernel_ptr=0x{:x}",
+        kernel_ptr
+    );
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_CURRENT tid={}", current_tid);
+    crate::yarm_log!(
+        "D6_POST_CLEANUP_FIRST_TRAP_ASID value=0x{:x}",
+        active_asid_num
+    );
+    crate::yarm_log!(
+        "D6_POST_CLEANUP_FIRST_TRAP_CR3 value=asid=0x{:x}",
+        active_asid_num
+    );
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_TSS_RSP0 value=0x{:x}", tss_rsp0);
+    crate::yarm_log!(
+        "D6_POST_CLEANUP_FIRST_TRAP_CR2_EQUALS_RSP_MINUS_8 {}",
+        if cr2_eq_rsp_m8 { "yes" } else { "no" }
+    );
+    crate::yarm_log!(
+        "D6_POST_CLEANUP_FIRST_TRAP_STACK_CLASS class={}",
+        stack_class
+    );
+    crate::yarm_log!("D6_POST_CLEANUP_FIRST_TRAP_DONE");
 }
 
 #[cfg(test)]

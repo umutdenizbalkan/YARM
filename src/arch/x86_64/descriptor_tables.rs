@@ -1622,6 +1622,15 @@ pub fn refresh_boot_tss_rsp0(rsp0: u64) {
 pub fn refresh_boot_tss_rsp0(_rsp0: u64) {}
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn read_boot_tss_rsp0() -> u64 {
+    YARM_X86_SYSCALL_RSP0.load(core::sync::atomic::Ordering::Acquire)
+}
+#[cfg(any(feature = "hosted-dev", not(target_arch = "x86_64")))]
+pub(crate) fn read_boot_tss_rsp0() -> u64 {
+    0
+}
+
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 unsafe extern "C" {
     fn yarm_x86_enter_ring3(
         entry: u64,

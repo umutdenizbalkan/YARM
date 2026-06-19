@@ -862,6 +862,146 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 132: map ALL kernel-switch-stack pages (stack_base..stack_top) for
+    /// a proof task.  `ensure_kernel_switch_stack_mapped` (Stage 127) maps only
+    /// the top page.  After the D6 proof handoff, TSS RSP0 points to stack_top,
+    /// and the first kernel trap handler grows ~9 KB deep — well below the single
+    /// mapped page — causing a #PF (write to unmapped kernel stack).  This
+    /// function closes that gap by allocating and sharing every page in the full
+    /// stack range WITHOUT touching `ensure_kernel_switch_stack_mapped` and
+    /// without using the region-size constant (preserving Stage 127–129 invariants).
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    pub(crate) fn d6_ensure_full_proof_switch_stack_mapped(
+        &mut self,
+        tid: u64,
+    ) -> Result<(), KernelError> {
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
+        use crate::kernel::vm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+        fn validate_entry(entry: PageTableEntry) -> bool {
+            (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
+        }
+
+        let (stack_base, stack_top) = self.with_tcbs(|tcbs| {
+            let tcb = tcbs
+                .iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            let stack_base = tcb
+                .kernel_context
+                .stack_base
+                .ok_or(KernelError::WrongObject)?
+                .0 as usize;
+            let stack_top = tcb
+                .kernel_context
+                .stack_top
+                .ok_or(KernelError::WrongObject)?
+                .0 as usize;
+            Ok::<_, KernelError>((stack_base, stack_top))
+        })?;
+
+        if stack_base == 0 || stack_base >= stack_top {
+            return Err(KernelError::WrongObject);
+        }
+
+        let Some(target_asid) = self.task_asid(tid) else {
+            return Err(KernelError::UserMemoryFault);
+        };
+
+        // Collect all ASIDs before the allocation loop so &mut self is free for
+        // alloc_user_data_frame without nested borrow conflicts.
+        let mut roots = [None; super::MAX_TASKS];
+        roots[0] = Some(target_asid);
+        self.with_tcbs(|tcbs| {
+            let mut len = 1usize;
+            for tcb in tcbs.iter().flatten() {
+                let Some(asid) = tcb.asid else {
+                    continue;
+                };
+                if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
+                    continue;
+                }
+                if roots[..len].iter().any(|e| *e == Some(asid)) {
+                    continue;
+                }
+                if len < roots.len() {
+                    roots[len] = Some(asid);
+                    len += 1;
+                }
+            }
+        });
+
+        crate::yarm_log!(
+            "D6_PROOF_FULL_STACK_MAP_BEGIN tid={} base=0x{:x} top=0x{:x}",
+            tid,
+            stack_base,
+            stack_top
+        );
+
+        let mut page_addr = stack_base & !(PAGE_SIZE - 1);
+        while page_addr < stack_top {
+            let stack_page = VirtAddr(page_addr as u64);
+            let phys = if let Some(entry) = page_table::resolve_page(target_asid, stack_page) {
+                if validate_entry(entry) {
+                    crate::yarm_log!(
+                        "D6_PROOF_FULL_STACK_MAP_SKIP tid={} va=0x{:x}",
+                        tid,
+                        page_addr
+                    );
+                    page_addr = page_addr.saturating_add(PAGE_SIZE);
+                    continue;
+                }
+                return Err(KernelError::VmFull);
+            } else {
+                let phys = self.alloc_user_data_frame()?;
+                page_table::map_page(
+                    target_asid,
+                    stack_page,
+                    PhysAddr(phys),
+                    PageFlags::KERNEL_RW,
+                )
+                .map_err(|_| KernelError::VmFull)?;
+                phys
+            };
+            for asid in roots.iter().flatten().copied() {
+                if asid == target_asid {
+                    continue;
+                }
+                match page_table::resolve_page(asid, stack_page) {
+                    Some(e) if e.addr() == phys && validate_entry(e) => {}
+                    None => {
+                        page_table::map_page(
+                            asid,
+                            stack_page,
+                            PhysAddr(phys),
+                            PageFlags::KERNEL_RW,
+                        )
+                        .map_err(|_| KernelError::VmFull)?;
+                    }
+                    _ => return Err(KernelError::VmFull),
+                }
+            }
+            crate::yarm_log!(
+                "D6_PROOF_FULL_STACK_MAP_PAGE_MAPPED tid={} va=0x{:x}",
+                tid,
+                page_addr
+            );
+            page_addr = page_addr.saturating_add(PAGE_SIZE);
+        }
+
+        crate::yarm_log!("D6_PROOF_FULL_STACK_MAP_DONE tid={}", tid);
+        Ok(())
+    }
+
+    #[cfg(any(not(target_arch = "x86_64"), test))]
+    pub(crate) fn d6_ensure_full_proof_switch_stack_mapped(
+        &mut self,
+        _tid: u64,
+    ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
     pub fn initialize_thread_kernel_switch_frame(
         &mut self,
         tid: u64,
