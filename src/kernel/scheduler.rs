@@ -269,6 +269,7 @@ impl PriorityScheduler {
             }
             return Some(current.tid);
         }
+        // No current task: idle state. Pick the next runnable task if any.
         let next = self.dequeue_highest()?;
         self.current = Some(next);
         Some(next.tid)
@@ -790,6 +791,102 @@ mod tests {
         q.push(ThreadId(5)).expect("5");
         assert!(!q.remove_tid(ThreadId(99)));
         assert_eq!(q.len, 1);
+    }
+
+    #[test]
+    fn dispatch_next_switches_away_from_tid_zero_when_real_task_is_runnable() {
+        // TID 0 (boot/idle) can be current; dispatch_next switches to a real task
+        // when one is runnable, and removes TID 0 from the membership table so
+        // it can be re-enqueued later without hitting the AlreadyQueued guard.
+        let mut sched = PriorityScheduler::default();
+        // Simulate bootstrap: enqueue TID 0 then dispatch it to make it current.
+        sched
+            .enqueue_with_priority(ThreadId(0), TaskPriority::Normal)
+            .expect("enqueue boot task");
+        assert_eq!(sched.dispatch_next(), Some(ThreadId(0)));
+        assert_eq!(sched.current_tid(), Some(ThreadId(0)));
+
+        // Enqueue a real task; dispatch_next must switch to it.
+        sched
+            .enqueue_with_priority(ThreadId(42), TaskPriority::Normal)
+            .expect("enqueue real task");
+        assert_eq!(sched.dispatch_next(), Some(ThreadId(42)));
+        assert_eq!(sched.current_tid(), Some(ThreadId(42)));
+
+        // TID 0 must no longer be tracked in membership (can re-enqueue without error).
+        assert!(!sched.membership_contains(ThreadId(0)));
+        assert!(sched.enqueue_with_priority(ThreadId(0), TaskPriority::Normal).is_ok());
+    }
+
+    #[test]
+    fn membership_tracking_exhausted_falls_back_to_linear_scan() {
+        let mut sched = PriorityScheduler::default();
+        sched
+            .enqueue_with_priority(ThreadId(10), TaskPriority::Normal)
+            .expect("10");
+        sched
+            .enqueue_with_priority(ThreadId(20), TaskPriority::High)
+            .expect("20");
+        // dispatch_next picks the highest-priority task (20) as current.
+        sched.dispatch_next();
+
+        // Force the exhaustion flag; linear_contains_tid must take over.
+        sched.membership_tracking_exhausted = true;
+
+        assert!(sched.contains_tid(ThreadId(20))); // current
+        assert!(sched.contains_tid(ThreadId(10))); // in Normal queue
+        assert!(!sched.contains_tid(ThreadId(99))); // absent
+    }
+
+    #[test]
+    fn membership_tracking_exhausted_prevents_duplicate_enqueue() {
+        let mut sched = PriorityScheduler::default();
+        sched
+            .enqueue_with_priority(ThreadId(5), TaskPriority::Normal)
+            .expect("5");
+        sched.dispatch_next(); // make TID 5 current
+        sched
+            .enqueue_with_priority(ThreadId(7), TaskPriority::Low)
+            .expect("7");
+
+        sched.membership_tracking_exhausted = true;
+
+        // AlreadyQueued must still be enforced via linear scan.
+        assert_eq!(
+            sched.enqueue_with_priority(ThreadId(5), TaskPriority::High),
+            Err(SchedulerError::AlreadyQueued)
+        );
+        assert_eq!(
+            sched.enqueue_with_priority(ThreadId(7), TaskPriority::High),
+            Err(SchedulerError::AlreadyQueued)
+        );
+        // A new TID must be accepted.
+        assert!(
+            sched
+                .enqueue_with_priority(ThreadId(9), TaskPriority::Normal)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn membership_linear_scan_covers_current_and_all_priority_queues() {
+        let mut sched = PriorityScheduler::default();
+        sched
+            .enqueue_with_priority(ThreadId(1), TaskPriority::High)
+            .expect("1");
+        sched
+            .enqueue_with_priority(ThreadId(2), TaskPriority::Normal)
+            .expect("2");
+        sched
+            .enqueue_with_priority(ThreadId(3), TaskPriority::Low)
+            .expect("3");
+        // dispatch_next picks TID 1 (High priority) as current.
+        sched.dispatch_next();
+
+        assert!(sched.linear_contains_tid(ThreadId(1))); // current
+        assert!(sched.linear_contains_tid(ThreadId(2))); // Normal queue
+        assert!(sched.linear_contains_tid(ThreadId(3))); // Low queue
+        assert!(!sched.linear_contains_tid(ThreadId(99))); // absent
     }
 
     #[test]

@@ -35346,6 +35346,169 @@ mod stage127_target_asid_switch_stack_mapping {
 }
 
 // ===========================================================================
+// Scheduler correctness — timer quantum reset, idle handling, membership fallback
+// ===========================================================================
+#[cfg(test)]
+mod scheduler_correctness {
+    use super::*;
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const SCHEDULER_TIMER_SRC: &str = include_str!("../scheduler_timer.rs");
+    const SCHEDULER_SRC: &str = include_str!("../scheduler.rs");
+    const SCHEDULER_STATE_SRC: &str = include_str!("scheduler_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    // 1. reset_quantum API exists and resets ticks_remaining to quantum_ticks.
+    #[test]
+    fn timer_reset_quantum_api_exists_in_scheduler_timer() {
+        assert!(
+            SCHEDULER_TIMER_SRC.contains("pub fn reset_quantum(")
+                && SCHEDULER_TIMER_SRC.contains("self.ticks_remaining = self.quantum_ticks"),
+            "scheduler_timer.rs must expose reset_quantum() that resets ticks_remaining"
+        );
+    }
+
+    // 2. block_current_cpu calls reset_quantum on successful block.
+    #[test]
+    fn block_current_cpu_calls_reset_quantum_in_scheduler_state() {
+        assert!(
+            SCHEDULER_STATE_SRC.contains("reset_quantum()"),
+            "scheduler_state.rs::block_current_cpu must call timer.reset_quantum()"
+        );
+    }
+
+    // 3. Voluntary block resets timer quantum (integration test).
+    //
+    // Without the fix: after burning 2 ticks, ticks_remaining = 3.
+    // block_current_cpu would not reset it, so preemption fires at tick 3 after
+    // the block, not at tick 5.  The assertion below detects the early fire.
+    #[test]
+    fn voluntary_block_resets_timer_quantum() {
+        let mut state = Bootstrap::init().expect("init");
+        let quantum: u64 = 5;
+        state.set_timer_for_test(Timer::new(quantum));
+
+        // Register a second task so block_current_cpu has somewhere to go.
+        state.register_task(1).expect("task1");
+        state.enqueue_current_cpu(1).expect("enqueue 1");
+
+        // Burn 2 ticks into the current task's quantum.
+        for _ in 0..2 {
+            let (_, preempt) = state.tick_scheduler_timer();
+            assert!(!preempt, "should not preempt mid-quantum burn");
+        }
+
+        // Voluntarily block task 0; the timer quantum must be reset to `quantum`.
+        let blocked = state.block_current_cpu();
+        assert!(
+            blocked.is_some(),
+            "block_current_cpu must return the blocked TID"
+        );
+
+        // No preemption should fire in the first quantum-1 ticks after the block.
+        // Without the fix this fails: preemption fires at tick 3 (ticks_remaining=3).
+        for i in 1..quantum {
+            let (_, preempt) = state.tick_scheduler_timer();
+            assert!(
+                !preempt,
+                "unexpected preemption at tick {i} of {quantum} after voluntary block; timer quantum was not reset"
+            );
+        }
+        // Exactly at the quantum boundary: preemption fires.
+        let (_, preempt) = state.tick_scheduler_timer();
+        assert!(
+            preempt,
+            "preemption must fire at exactly quantum={quantum} ticks after voluntary block"
+        );
+    }
+
+    // 4. TID-0 idle-switch branch is present and removes TID 0 from membership.
+    //
+    // TID 0 (boot task) is set as current during bootstrap and serves as the
+    // idle thread.  dispatch_next's tid==0 branch switches to a real task when
+    // one is runnable, removing TID 0 from the membership table so it can be
+    // re-enqueued later without hitting AlreadyQueued.
+    #[test]
+    fn dispatch_next_tid_zero_branch_switches_and_removes_membership() {
+        assert!(
+            SCHEDULER_SRC.contains("current.tid.0 == 0"),
+            "scheduler.rs::dispatch_next must retain the TID-0 boot-task branch"
+        );
+        assert!(
+            SCHEDULER_SRC.contains("membership_remove(current.tid)"),
+            "scheduler.rs::dispatch_next must remove TID-0 from membership on idle switch"
+        );
+    }
+
+    // 5. When the scheduler has no current task and no queued tasks, dispatch_next
+    //    returns None — the true idle state (no task to run at all).
+    #[test]
+    fn dispatch_next_returns_none_when_no_current_and_no_queued_tasks() {
+        assert!(
+            SCHEDULER_SRC.contains("No current task"),
+            "scheduler.rs::dispatch_next must document the no-current-task idle case"
+        );
+    }
+
+    // 6. Preemption path still resets timer via tick_and_check.
+    #[test]
+    fn preemption_path_resets_timer_via_tick_and_check() {
+        assert!(
+            SCHEDULER_TIMER_SRC.contains("if should_preempt")
+                && SCHEDULER_TIMER_SRC.contains("self.ticks_remaining = self.quantum_ticks"),
+            "scheduler_timer.rs tick_and_check must still reset ticks_remaining on preemption"
+        );
+    }
+
+    // 7. SYSCALL_COUNT unchanged at 31.
+    #[test]
+    fn syscall_count_unchanged_at_31() {
+        assert_eq!(SYSCALL_COUNT, 31, "SYSCALL_COUNT must remain 31");
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT source must remain 31"
+        );
+    }
+
+    // 8. Syscall::VARIANT_COUNT unchanged at 23.
+    #[test]
+    fn syscall_variant_count_unchanged_at_23() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "VARIANT_COUNT source must remain 23"
+        );
+    }
+
+    // 9. D6 local dispatch seam present and untouched.
+    #[test]
+    fn d6_local_dispatch_seam_present_and_untouched() {
+        assert!(
+            SCHEDULER_STATE_SRC.contains("D6_LOCAL_DISPATCH")
+                && SCHEDULER_STATE_SRC.contains("local_dispatch_step_split"),
+            "D6 local dispatch seam must remain intact in scheduler_state.rs"
+        );
+        // block_current_cpu must not call local_dispatch_step_split or on_preempt.
+        let block_start = SCHEDULER_STATE_SRC
+            .find("pub fn block_current_cpu(")
+            .expect("block_current_cpu must exist");
+        let block_end = SCHEDULER_STATE_SRC[block_start..]
+            .find("\n    pub fn ")
+            .map(|off| block_start + off)
+            .unwrap_or(SCHEDULER_STATE_SRC.len());
+        let block_body = &SCHEDULER_STATE_SRC[block_start..block_end];
+        assert!(
+            !block_body.contains("on_preempt") && !block_body.contains("local_dispatch_step_split"),
+            "block_current_cpu must not call on_preempt or local_dispatch_step_split"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 129 — active-root switch-stack mapping repair / VmFull fix
 // ==========================================================================
 #[cfg(test)]

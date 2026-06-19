@@ -56,6 +56,15 @@ impl Timer {
     pub const fn quantum(&self) -> u64 {
         self.quantum_ticks
     }
+
+    /// Reset the remaining quantum to the full quantum length.
+    ///
+    /// Call this on voluntary task switches (block, yield-to-other) so the
+    /// next scheduled task always starts with a full quantum rather than
+    /// inheriting the stale remainder from the task that just left the CPU.
+    pub fn reset_quantum(&mut self) {
+        self.ticks_remaining = self.quantum_ticks;
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +119,22 @@ mod tests {
         assert_eq!(timer.tick_and_check(), (TickInstant(2), true));
         assert_eq!(timer.tick_and_check(), (TickInstant(3), false));
         assert_eq!(timer.tick_and_check(), (TickInstant(4), true));
+    }
+
+    #[test]
+    fn reset_quantum_restores_full_quantum_mid_flight() {
+        let mut timer = Timer::new(5);
+        // Burn 2 ticks into the quantum (ticks_remaining drops to 3)
+        assert_eq!(timer.tick_and_check().1, false);
+        assert_eq!(timer.tick_and_check().1, false);
+        // Reset: ticks_remaining must be restored to quantum (5)
+        timer.reset_quantum();
+        // Must not preempt for the next 4 ticks
+        assert_eq!(timer.tick_and_check().1, false);
+        assert_eq!(timer.tick_and_check().1, false);
+        assert_eq!(timer.tick_and_check().1, false);
+        assert_eq!(timer.tick_and_check().1, false);
+        // 5th tick after reset: preemption fires
+        assert_eq!(timer.tick_and_check().1, true);
     }
 }
