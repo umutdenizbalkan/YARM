@@ -2064,6 +2064,12 @@ impl KernelState {
         #[cfg(test)]
         let _ = CHECK_PAGE;
     }
+
+    /// Stage 133: narrow diagnostic accessor — returns the numeric ASID currently
+    /// active in the HAL without exposing the private `hal` field.
+    pub(crate) fn d6_diag_active_asid_num(&self) -> usize {
+        self.hal.active_asid().map_or(0, |a| a.0 as usize)
+    }
 }
 
 /// Stage 133: 4-level x86_64 software page-table walk.
