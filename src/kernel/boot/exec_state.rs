@@ -1152,6 +1152,13 @@ impl KernelState {
                 );
                 return Ok(());
             }
+            // Stage 139: capture hardware CR3 just before the proof switch so the
+            // cleanup can detect any divergence and restore it.
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+                crate::yarm_log!("D6_PROOF_CR3_BEFORE cr3=0x{:016x}", hw_cr3);
+            }
             self.maybe_switch_kernel_context(Some(outgoing_tid), incoming_tid)?;
             crate::kernel::boot::d6_controlled_switch_proof_mark_pending_done();
             Ok(())
@@ -2024,6 +2031,22 @@ impl KernelState {
         let active_asid = self.hal.active_asid().map_or(0, |asid| asid.0);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CR3_OK asid={}", active_asid);
         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_TSS_OK");
+        // Stage 139: force-restore hardware CR3 to the current task's address
+        // space so that subsequent ASID switches see a consistent starting state.
+        // The D6 proof switches kernel stacks without touching CR3; on return the
+        // hardware CR3 may lag the HAL-tracked ASID, causing activate_asid() to
+        // fail for service tasks that are scheduled immediately after cleanup.
+        #[cfg(not(feature = "hosted-dev"))]
+        if let Some(task_asid) = self.task_asid(current_tid) {
+            let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+            crate::yarm_log!(
+                "D6_PROOF_CR3_CLEANUP_RESTORE hw_cr3=0x{:016x} task_asid={}",
+                hw_cr3,
+                task_asid.0
+            );
+            self.hal.switch_address_space(task_asid);
+            crate::yarm_log!("D6_PROOF_CR3_CLEANUP_OK");
+        }
     }
 
     /// Stage 133: software page-table walk to verify ASID 1 maps page 0xffff80000000d000.

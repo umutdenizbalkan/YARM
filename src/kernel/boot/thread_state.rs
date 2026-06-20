@@ -181,6 +181,14 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust_real() -> ! {
                 kernel, ctx.cpu_id, None,
             );
             crate::yarm_log!("D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE");
+            // Stage 139: capture hardware CR3 after post-switch restore so the
+            // cleanup diagnostics can track any CR3 divergence introduced by
+            // the proof's lock-drop switch.
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+                crate::yarm_log!("D6_PROOF_CR3_AFTER_FIRST_RESUME cr3=0x{:016x}", hw_cr3);
+            }
             r
         });
         // Switch back to the outgoing task. In production, execution never returns
