@@ -37601,3 +37601,178 @@ mod stage136_pfa_no_method_stack_frames {
         );
     }
 }
+
+// ===========================================================================
+// Stage 137 — diagnose/fix repeated tid=10000 user stack page fault loop
+// ===========================================================================
+#[cfg(test)]
+mod stage137_demand_pf_loop_fix {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    // 1. PAGE_FAULT_RAW is emitted using the hardware interrupt-frame RIP
+    //    (frame.saved_pc), not a stale task-context field.  The log must
+    //    appear before set_current_cpu (before the first KernelState mutation)
+    //    and must reference frame_rip from saved_pc.
+    #[test]
+    fn stage137_page_fault_raw_uses_frame_saved_pc() {
+        assert!(
+            TRAP_SRC.contains("PAGE_FAULT_RAW"),
+            "trap.rs must emit PAGE_FAULT_RAW"
+        );
+        assert!(
+            TRAP_SRC.contains("frame_rip=0x"),
+            "PAGE_FAULT_RAW must include frame_rip field"
+        );
+        // The diagnostic block must precede set_current_cpu so it fires before
+        // any KernelState mutation.
+        let raw_pos = TRAP_SRC
+            .find("PAGE_FAULT_RAW")
+            .expect("PAGE_FAULT_RAW must be present");
+        let set_cpu_pos = TRAP_SRC
+            .find("kernel.set_current_cpu(cpu)")
+            .expect("set_current_cpu must be present");
+        assert!(
+            raw_pos < set_cpu_pos,
+            "PAGE_FAULT_RAW must be logged before kernel.set_current_cpu"
+        );
+        // Must pull saved_pc from the hardware frame, not from a task context.
+        assert!(
+            TRAP_SRC.contains("f.saved_pc"),
+            "PAGE_FAULT_RAW must read frame_rip from f.saved_pc"
+        );
+    }
+
+    // 2. x86_64 PF error-code bit decoding is covered: PAGE_FAULT_X86_ERROR
+    //    must decode present (bit 0), write (bit 1), user (bit 2),
+    //    reserved (bit 3) and instr (bit 4).
+    #[test]
+    fn stage137_x86_error_bits_decoded() {
+        assert!(
+            TRAP_SRC.contains("PAGE_FAULT_X86_ERROR"),
+            "trap.rs must emit PAGE_FAULT_X86_ERROR"
+        );
+        assert!(
+            TRAP_SRC.contains("present={}"),
+            "PAGE_FAULT_X86_ERROR must include present field"
+        );
+        assert!(
+            TRAP_SRC.contains("write={}"),
+            "PAGE_FAULT_X86_ERROR must include write field"
+        );
+        assert!(
+            TRAP_SRC.contains("user={}"),
+            "PAGE_FAULT_X86_ERROR must include user field"
+        );
+        assert!(
+            TRAP_SRC.contains("instr={}"),
+            "PAGE_FAULT_X86_ERROR must include instr field"
+        );
+        assert!(
+            TRAP_SRC.contains("reserved={}"),
+            "PAGE_FAULT_X86_ERROR must include reserved field"
+        );
+    }
+
+    // 3. PAGE_FAULT_HANDLED_DEMAND is only emitted after post-map PTE
+    //    verification passes (pte_ok check).  The verify log must precede
+    //    the handled log.
+    #[test]
+    fn stage137_handled_demand_requires_pte_verification() {
+        assert!(
+            FAULT_SRC.contains("PAGE_FAULT_DEMAND_VERIFY"),
+            "fault_state.rs must emit PAGE_FAULT_DEMAND_VERIFY"
+        );
+        assert!(
+            FAULT_SRC.contains("pte_ok"),
+            "fault_state.rs must have a pte_ok gate before PAGE_FAULT_HANDLED_DEMAND"
+        );
+        // DEMAND_VERIFY must appear before HANDLED_DEMAND in source order.
+        let verify_pos = FAULT_SRC
+            .find("PAGE_FAULT_DEMAND_VERIFY")
+            .expect("PAGE_FAULT_DEMAND_VERIFY must be present");
+        let handled_pos = FAULT_SRC
+            .find("PAGE_FAULT_HANDLED_DEMAND")
+            .expect("PAGE_FAULT_HANDLED_DEMAND must be present");
+        assert!(
+            verify_pos < handled_pos,
+            "PAGE_FAULT_DEMAND_VERIFY must precede PAGE_FAULT_HANDLED_DEMAND in source"
+        );
+        // PAGE_FAULT_HANDLED_DEMAND must be inside an `if pte_ok` guard.
+        let after_verify = &FAULT_SRC[verify_pos..];
+        let handled_rel = after_verify
+            .find("PAGE_FAULT_HANDLED_DEMAND")
+            .expect("HANDLED_DEMAND after VERIFY");
+        let between = &after_verify[..handled_rel];
+        assert!(
+            between.contains("if pte_ok"),
+            "PAGE_FAULT_HANDLED_DEMAND must be guarded by `if pte_ok`"
+        );
+    }
+
+    // 4. Demand verification resolves the page in BOTH the task ASID and the
+    //    active ASID (as tracked by hal.active_asid).
+    #[test]
+    fn stage137_demand_verify_checks_both_asids() {
+        assert!(
+            FAULT_SRC.contains("task_asid"),
+            "fault_state.rs must resolve task_asid"
+        );
+        assert!(
+            FAULT_SRC.contains("active_asid"),
+            "fault_state.rs must resolve active_asid"
+        );
+        // Both resolve_page calls must appear in the demand-verify block.
+        let verify_pos = FAULT_SRC
+            .find("PAGE_FAULT_DEMAND_VERIFY")
+            .expect("PAGE_FAULT_DEMAND_VERIFY must be present");
+        let before_verify = &FAULT_SRC[..verify_pos];
+        // Count occurrences of resolve_page in the region preceding DEMAND_VERIFY
+        let resolve_count = before_verify.matches("resolve_page(task_asid").count()
+            + before_verify.matches("resolve_page(active_asid").count();
+        assert!(
+            resolve_count >= 2,
+            "Both task_asid and active_asid resolve_page calls must precede PAGE_FAULT_DEMAND_VERIFY"
+        );
+    }
+
+    // 5. The user stack top page that contains the USER_STACK_RESOLVE probe
+    //    (top-8 = 0x7ffb1ddfff8) also contains the faulting address
+    //    (0x7ffb1ddffef9).  Both addresses fall in page 0x7ffb1ddff000.
+    #[test]
+    fn stage137_fault_addr_and_probe_share_stack_top_page() {
+        const STACK_TOP: u64 = 0x7ffb1de00000;
+        const PROBE: u64 = STACK_TOP - 8; // 0x7ffb1ddfff8
+        const FAULT_ADDR: u64 = 0x7ffb1ddffef9;
+        const PAGE_MASK: u64 = !0xFFF;
+
+        let probe_page = PROBE & PAGE_MASK;
+        let fault_page = FAULT_ADDR & PAGE_MASK;
+        assert_eq!(
+            probe_page, fault_page,
+            "USER_STACK_RESOLVE probe and fault addr must be in the same page: probe_page=0x{probe_page:x} fault_page=0x{fault_page:x}"
+        );
+        assert_eq!(
+            probe_page, 0x7ffb1ddff000,
+            "top-of-stack page must be 0x7ffb1ddff000"
+        );
+    }
+
+    // 6. SYSCALL_COUNT must remain 31.
+    #[test]
+    fn stage137_syscall_count_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 137 must not change SYSCALL_COUNT");
+    }
+
+    // 7. Syscall::VARIANT_COUNT must remain 23.
+    #[test]
+    fn stage137_syscall_variant_count_unchanged() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 137 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}
