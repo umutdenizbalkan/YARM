@@ -521,7 +521,38 @@ impl KernelState {
                     if pte_ok && !active_present && active_asid.0 != task_asid.0 {
                         self.hal.switch_address_space(task_asid);
                     }
-                    if pte_ok {
+                    // Stage 138: hardware CR3 PTE walk to confirm the CPU will
+                    // actually see the page as accessible after demand mapping.
+                    // Software VM resolve says present, but the CPU may be
+                    // walking a different (stale) page table.
+                    // Only performed on real x86_64 hardware; hosted-dev (test)
+                    // mode has no real page tables so hw_demand_ok is trivially true.
+                    #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+                    let hw_demand_ok = {
+                        let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+                        let hw_root = hw_cr3 & !0xfffu64;
+                        let (pml4e, pdpte, pde, hw_pte) =
+                            crate::arch::x86_64::page_table::hw_pte_walk_verbose(hw_root, page.0);
+                        let hw_present = (hw_pte & 1) != 0;
+                        let hw_user = (hw_pte & 4) != 0;
+                        let hw_writable = (hw_pte & 2) != 0;
+                        crate::yarm_log!(
+                            "PAGE_FAULT_POST_DEMAND_HW_PTE_WALK cr3=0x{:016x} va=0x{:016x} pml4e=0x{:016x} pdpte=0x{:016x} pde=0x{:016x} pte=0x{:016x} present={} user={} writable={}",
+                            hw_cr3,
+                            page.0,
+                            pml4e,
+                            pdpte,
+                            pde,
+                            hw_pte,
+                            hw_present as u8,
+                            hw_user as u8,
+                            hw_writable as u8,
+                        );
+                        hw_present && hw_user && (!need_write || hw_writable)
+                    };
+                    #[cfg(any(not(target_arch = "x86_64"), feature = "hosted-dev"))]
+                    let hw_demand_ok = true;
+                    if pte_ok && hw_demand_ok {
                         crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
                         return Ok(());
                     }

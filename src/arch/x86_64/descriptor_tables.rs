@@ -857,6 +857,127 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
 ) {
 }
 
+/// Stage 138: hardware-proven #PF frame and PTE state diagnostic.
+///
+/// Called from `yarm_x86_dispatch_trap_from_stub` on every #PF BEFORE
+/// `build_trap_frame_from_saved_regs`, so all values come directly from
+/// hardware, not from any Rust TrapFrame reinterpretation.
+///
+/// Emits (in order):
+///   PAGE_FAULT_HW_REGS  — raw CR3, CR2, kernel RSP from inline asm
+///   PAGE_FAULT_FRAME_WORDS — 8 raw qwords centred on the interrupt frame ptr
+///   PAGE_FAULT_FRAME_DECODE — decodes words as CPL3 #PF frame fields
+///   PAGE_FAULT_HW_PTE_WALK (×2) — 4-level walks for CR2 page and RIP page
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+fn emit_pf_frame_hw_diag(fault_addr: u64, interrupt_frame: *const X86InterruptStackFrame) {
+    let mut hw_cr3: u64;
+    let mut rsp_kernel: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {cr3}, cr3",
+            "mov {rsp}, rsp",
+            cr3 = out(reg) hw_cr3,
+            rsp = out(reg) rsp_kernel,
+            options(nostack, preserves_flags),
+        );
+    }
+    crate::yarm_log!(
+        "PAGE_FAULT_HW_REGS cr2=0x{:016x} cr3=0x{:016x} rsp_kernel=0x{:016x}",
+        fault_addr,
+        hw_cr3,
+        rsp_kernel,
+    );
+
+    // Read 8 raw u64 words: w0 = error_code (interrupt_frame - 8),
+    // w1..w5 = rip/cs/rflags/user_rsp/ss (the CPU-pushed interrupt frame),
+    // w6..w7 = words beyond the frame (for layout sanity checking).
+    let frame_ptr = interrupt_frame as *const u64;
+    let words: [u64; 8] = unsafe {
+        [
+            *frame_ptr.sub(1), // error_code
+            *frame_ptr.add(0), // rip
+            *frame_ptr.add(1), // cs
+            *frame_ptr.add(2), // rflags
+            *frame_ptr.add(3), // user_rsp (CPL3 only)
+            *frame_ptr.add(4), // ss
+            *frame_ptr.add(5), // beyond frame
+            *frame_ptr.add(6), // beyond frame
+        ]
+    };
+    crate::yarm_log!(
+        "PAGE_FAULT_FRAME_WORDS ptr=0x{:016x} w0=0x{:016x} w1=0x{:016x} w2=0x{:016x} w3=0x{:016x} w4=0x{:016x} w5=0x{:016x} w6=0x{:016x} w7=0x{:016x}",
+        frame_ptr as u64,
+        words[0],
+        words[1],
+        words[2],
+        words[3],
+        words[4],
+        words[5],
+        words[6],
+        words[7],
+    );
+
+    // Decode as CPL3 #PF interrupt frame: error/rip/cs/rflags/user_rsp/ss
+    let decoded_error = words[0];
+    let decoded_rip = words[1];
+    let decoded_cs = words[2];
+    let decoded_rflags = words[3];
+    let decoded_user_rsp = words[4];
+    let decoded_ss = words[5];
+    crate::yarm_log!(
+        "PAGE_FAULT_FRAME_DECODE error=0x{:x} rip=0x{:016x} cs=0x{:x} rflags=0x{:016x} user_rsp=0x{:016x} ss=0x{:x}",
+        decoded_error,
+        decoded_rip,
+        decoded_cs,
+        decoded_rflags,
+        decoded_user_rsp,
+        decoded_ss,
+    );
+
+    // 4-level hardware PTE walk for the CR2 page.
+    let hw_root = hw_cr3 & !0xfffu64;
+    let cr2_page = fault_addr & !0xfffu64;
+    let (pml4e, pdpte, pde, pte) =
+        crate::arch::x86_64::page_table::hw_pte_walk_verbose(hw_root, cr2_page);
+    let pte_present = (pte & 1) != 0;
+    let pte_user = (pte & 4) != 0;
+    let pte_writable = (pte & 2) != 0;
+    crate::yarm_log!(
+        "PAGE_FAULT_HW_PTE_WALK cr3=0x{:016x} va=0x{:016x} pml4e=0x{:016x} pdpte=0x{:016x} pde=0x{:016x} pte=0x{:016x} present={} user={} writable={}",
+        hw_cr3,
+        cr2_page,
+        pml4e,
+        pdpte,
+        pde,
+        pte,
+        pte_present as u8,
+        pte_user as u8,
+        pte_writable as u8,
+    );
+
+    // 4-level hardware PTE walk for the RIP page (decoded from interrupt frame).
+    let rip_page = decoded_rip & !0xfffu64;
+    let (pml4e2, pdpte2, pde2, pte2) =
+        crate::arch::x86_64::page_table::hw_pte_walk_verbose(hw_root, rip_page);
+    let pte2_present = (pte2 & 1) != 0;
+    let pte2_user = (pte2 & 4) != 0;
+    let pte2_writable = (pte2 & 2) != 0;
+    crate::yarm_log!(
+        "PAGE_FAULT_HW_PTE_WALK cr3=0x{:016x} va=0x{:016x} pml4e=0x{:016x} pdpte=0x{:016x} pde=0x{:016x} pte=0x{:016x} present={} user={} writable={}",
+        hw_cr3,
+        rip_page,
+        pml4e2,
+        pdpte2,
+        pde2,
+        pte2,
+        pte2_present as u8,
+        pte2_user as u8,
+        pte2_writable as u8,
+    );
+
+    let _ = decoded_cs; // used only in the log above
+}
+
 /// Stage 133: pre-lock one-shot #PF diagnostic.
 ///
 /// Called from `yarm_x86_dispatch_trap_from_stub` on the first post-cleanup
@@ -957,6 +1078,15 @@ extern "C" fn yarm_x86_dispatch_trap_from_stub(
         {
             d6_emit_pre_lock_pf_diag(vector, error_code, fault_addr, regs, interrupt_frame);
         }
+    }
+
+    // Stage 138: hardware-proven #PF frame and PTE diagnostic.
+    // Must be called before build_trap_frame_from_saved_regs so that all values
+    // are read directly from hardware interrupt-frame memory, not from any Rust
+    // TrapFrame reinterpretation.
+    #[cfg(not(feature = "hosted-dev"))]
+    if vector as usize == VEC_PAGE_FAULT {
+        emit_pf_frame_hw_diag(fault_addr, interrupt_frame);
     }
 
     // Stage 2N: prefer SharedKernel path when available.

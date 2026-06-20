@@ -201,6 +201,36 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             (error >> 3) & 1,
         );
     }
+    // Stage 138: compare hardware CR3 against HAL-tracked active CR3 and the
+    // task's expected CR3.  A mismatch here explains why software VM says the
+    // page is present while the CPU keeps taking not-present faults: the
+    // hardware is walking a different page table than the software resolves.
+    #[cfg(not(feature = "hosted-dev"))]
+    if context.vector == VEC_PAGE_FAULT {
+        let mut hw_cr3: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr3",
+                out(reg) hw_cr3,
+                options(nostack, preserves_flags),
+            );
+        }
+        let active_asid_num = kernel.d6_diag_active_asid_num();
+        let active_asid = crate::kernel::vm::Asid(active_asid_num as u16);
+        let active_cr3 =
+            crate::arch::x86_64::page_table::cr3_for_asid(active_asid).unwrap_or(u64::MAX);
+        let tid = kernel.current_tid().unwrap_or(u64::MAX);
+        let task_asid = kernel.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0));
+        let task_cr3 = crate::arch::x86_64::page_table::cr3_for_asid(task_asid).unwrap_or(u64::MAX);
+        crate::yarm_log!(
+            "PAGE_FAULT_CR3_COMPARE hw_cr3=0x{:016x} active_asid={} active_cr3=0x{:016x} task_asid={} task_cr3=0x{:016x}",
+            hw_cr3,
+            active_asid.0,
+            active_cr3,
+            task_asid.0,
+            task_cr3,
+        );
+    }
     // NOTE(arch/x86_64): Architecture-specific IDT setup and assembly trap stubs
     // funnel hardware entries into this Rust dispatcher. Tests may still construct
     // synthetic contexts directly, but real trap/interrupt/syscall vectors now use
