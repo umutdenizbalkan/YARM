@@ -37474,3 +37474,130 @@ mod stage135_pt_allocator_no_stack_scratch {
         );
     }
 }
+
+// ===========================================================================
+// Stage 136 — Eliminate huge PhysicalFrameAllocator method stack frames
+// ===========================================================================
+#[cfg(test)]
+mod stage136_pfa_no_method_stack_frames {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const FRAME_ALLOC_SRC: &str = include_str!("../frame_allocator.rs");
+
+    // 1. PhysicalFrameAllocator must not implement Copy.
+    //    Find the #[derive(...)] immediately before `pub struct PhysicalFrameAllocator`
+    //    and verify it does not include Copy.
+    #[test]
+    fn stage136_pfa_not_copy() {
+        let pfa_pos = FRAME_ALLOC_SRC
+            .find("pub struct PhysicalFrameAllocator")
+            .expect("PhysicalFrameAllocator must be defined");
+        let before_struct = &FRAME_ALLOC_SRC[..pfa_pos];
+        let derive_start = before_struct
+            .rfind("#[derive(")
+            .expect("derive attr before PFA");
+        let derive_end = FRAME_ALLOC_SRC[derive_start..]
+            .find(']')
+            .expect("closing ]");
+        let derive_text = &FRAME_ALLOC_SRC[derive_start..derive_start + derive_end + 1];
+        assert!(
+            !derive_text.contains("Copy"),
+            "PhysicalFrameAllocator derive must not include Copy after Stage 136: {derive_text}"
+        );
+    }
+
+    // 2. No large rollback copy pattern: `let mut next = *self` must not appear.
+    #[test]
+    fn stage136_no_let_next_self_copy() {
+        assert!(
+            !FRAME_ALLOC_SRC.contains("let mut next = *self"),
+            "frame_allocator.rs must not contain 'let mut next = *self' after Stage 136"
+        );
+        assert!(
+            !FRAME_ALLOC_SRC.contains("let next = *self"),
+            "frame_allocator.rs must not contain 'let next = *self' after Stage 136"
+        );
+    }
+
+    // 3. No large frame_refs stack copy: `let old = self.frame_refs` must not appear.
+    #[test]
+    fn stage136_no_stack_frame_refs_copy() {
+        assert!(
+            !FRAME_ALLOC_SRC.contains("let old = self.frame_refs"),
+            "compact_frame_refs must not copy frame_refs to a stack local after Stage 136"
+        );
+    }
+
+    // 4. FREE_CONTIG_SCRATCH static must be present (proves .bss approach is in place).
+    #[test]
+    fn stage136_free_contig_scratch_present() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("FREE_CONTIG_SCRATCH"),
+            "frame_allocator.rs must define FREE_CONTIG_SCRATCH for free_contiguous"
+        );
+    }
+
+    // 5. COMPACT_SCRATCH static must be present.
+    #[test]
+    fn stage136_compact_scratch_present() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("COMPACT_SCRATCH"),
+            "frame_allocator.rs must define COMPACT_SCRATCH for compact_frame_refs"
+        );
+    }
+
+    // 6. pfa_clone_to helper must be present (stack-safe field-by-field copy).
+    #[test]
+    fn stage136_pfa_clone_to_helper_present() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("fn pfa_clone_to"),
+            "frame_allocator.rs must define pfa_clone_to for stack-safe PFA copying"
+        );
+        assert!(
+            FRAME_ALLOC_SRC.contains("copy_from_slice"),
+            "pfa_clone_to must use copy_from_slice to avoid stack temporaries"
+        );
+    }
+
+    // 7. compact_frame_refs must be #[inline(never)].
+    #[test]
+    fn stage136_compact_frame_refs_not_inlined() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("#[inline(never)]\n    fn compact_frame_refs"),
+            "compact_frame_refs must be #[inline(never)] to prevent 192 KB frame inlining"
+        );
+    }
+
+    // 8. Stage 135 markers must still be present.
+    #[test]
+    fn stage136_stage135_markers_preserved() {
+        assert!(
+            FRAME_ALLOC_SRC.contains("PT_ALLOCATOR_INIT_BEGIN"),
+            "PT_ALLOCATOR_INIT_BEGIN marker from Stage 135 must remain"
+        );
+        assert!(
+            FRAME_ALLOC_SRC.contains("PT_ALLOCATOR_INIT_NO_STACK_SCRATCH"),
+            "PT_ALLOCATOR_INIT_NO_STACK_SCRATCH marker from Stage 135 must remain"
+        );
+        assert!(
+            FRAME_ALLOC_SRC.contains("PT_ALLOCATOR_INIT_DONE"),
+            "PT_ALLOCATOR_INIT_DONE marker from Stage 135 must remain"
+        );
+    }
+
+    // 9. SYSCALL_COUNT must remain 31.
+    #[test]
+    fn stage136_syscall_count_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 136 must not change SYSCALL_COUNT");
+    }
+
+    // 10. Syscall::VARIANT_COUNT must remain 23.
+    #[test]
+    fn stage136_syscall_variant_count_unchanged() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 136 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}

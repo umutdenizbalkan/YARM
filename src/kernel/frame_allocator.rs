@@ -72,7 +72,10 @@ struct FrameRefTelemetry {
     insert_capacity_failures: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Stage 136: Copy removed to prevent accidental 209 KB stack copies.
+// Clone is kept for test helpers (hosted-dev has small MAX_TRACKED_FRAME_REFS).
+// Production code that needs to copy a PFA uses pfa_clone_to().
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhysicalFrameAllocator {
     base_phys: u64,
     end_phys_exclusive: u64,
@@ -308,18 +311,20 @@ impl PhysicalFrameAllocator {
             return Err(FrameAllocError::OutOfRange);
         }
 
-        // Work on a copy first: if any untrack or extent insertion fails, the
-        // public allocator state (refcounts, free list, and accounting) remains
-        // unchanged. Zero-ref pages are batched into maximal contiguous runs so
-        // a large block free does not consume one metadata extent per page.
-        let mut next = *self;
+        // Stage 136: work on a .bss scratch copy rather than a 209 KB stack copy.
+        // Transactional semantics are preserved: self is only updated on success.
+        // Lock order: caller holds the per-allocator SpinLockIrq; we now take
+        // FREE_CONTIG_SCRATCH — consistent ordering prevents deadlock.
+        let mut scratch = FREE_CONTIG_SCRATCH.lock();
+        pfa_clone_to(self, &mut scratch);
+
         let mut pending_run_start = 0u64;
         let mut pending_run_pages = 0usize;
         let mut freed_pages = 0usize;
 
         for page in 0..pages {
             let phys = start_phys.saturating_add((page as u64).saturating_mul(PAGE_SIZE_U64));
-            let remaining = next.untrack_frame_ref(phys)?;
+            let remaining = scratch.untrack_frame_ref(phys)?;
             if remaining == 0 {
                 if pending_run_pages == 0 {
                     pending_run_start = phys;
@@ -328,21 +333,21 @@ impl PhysicalFrameAllocator {
                     pending_run_pages += 1;
                 }
             } else if pending_run_pages != 0 {
-                next.insert_extent_unsorted(pending_run_start, pending_run_pages)?;
+                scratch.insert_extent_unsorted(pending_run_start, pending_run_pages)?;
                 freed_pages += pending_run_pages;
                 pending_run_pages = 0;
             }
         }
 
         if pending_run_pages != 0 {
-            next.insert_extent_unsorted(pending_run_start, pending_run_pages)?;
+            scratch.insert_extent_unsorted(pending_run_start, pending_run_pages)?;
             freed_pages += pending_run_pages;
         }
 
-        next.free_frames = next.free_frames.saturating_add(freed_pages);
-        next.sort_extents();
-        next.refresh_run_metadata();
-        *self = next;
+        scratch.free_frames = scratch.free_frames.saturating_add(freed_pages);
+        scratch.sort_extents();
+        scratch.refresh_run_metadata();
+        pfa_clone_to(&scratch, self);
         Ok(())
     }
 
@@ -516,13 +521,10 @@ impl PhysicalFrameAllocator {
             }
         }
         self.record_frame_ref_lookup(MAX_TRACKED_FRAME_REFS, false);
-        if self
-            .frame_refs
-            .iter()
-            .any(|slot| matches!(slot, FrameRefSlot::Tombstone))
-        {
-            self.compact_frame_refs();
-        }
+        // Stage 136: compaction deliberately omitted from the lookup path.
+        // Lookup correctness is unaffected by tombstones (probing skips them).
+        // Compaction runs on the insert path (find_frame_ref_insert_slot) where
+        // it is needed to recover probing headroom.
         None
     }
 
@@ -692,11 +694,17 @@ impl PhysicalFrameAllocator {
         true
     }
 
+    // Stage 136: #[inline(never)] prevents the COMPACT_SCRATCH lock acquisition and
+    // frame_refs array operations from bloating callers' stack frames.
+    #[inline(never)]
     fn compact_frame_refs(&mut self) {
-        let old = self.frame_refs;
+        // Acquire the module-level scratch buffer (in .bss, not stack).
+        // copy_from_slice is a memcpy — no 192 KB stack temporary.
+        let mut scratch = COMPACT_SCRATCH.lock();
+        scratch.copy_from_slice(&self.frame_refs);
         self.frame_refs = [const { FrameRefSlot::Empty }; MAX_TRACKED_FRAME_REFS];
-        for slot in old {
-            let FrameRefSlot::Occupied(entry) = slot else {
+        for slot in scratch.iter() {
+            let FrameRefSlot::Occupied(entry) = *slot else {
                 continue;
             };
             let start = self.frame_ref_hash(entry.phys);
@@ -707,6 +715,9 @@ impl PhysicalFrameAllocator {
                     break;
                 }
             }
+        }
+        for slot in scratch.iter_mut() {
+            *slot = FrameRefSlot::Empty;
         }
     }
 
@@ -798,6 +809,36 @@ impl PhysicalFrameAllocator {
             }
         }
     }
+}
+
+// Stage 136: scratch buffer for compact_frame_refs — lives in .bss (not stack).
+// Sized to match the frame_refs table. Lock order: always acquire the per-allocator
+// SpinLockIrq BEFORE this lock so the two allocators (PT + main) serialise here.
+static COMPACT_SCRATCH: SpinLockIrq<[FrameRefSlot; MAX_TRACKED_FRAME_REFS]> =
+    SpinLockIrq::new([const { FrameRefSlot::Empty }; MAX_TRACKED_FRAME_REFS]);
+
+// Stage 136: scratch buffer for free_contiguous two-phase commit — lives in .bss.
+// Lock order: always acquire the per-allocator SpinLockIrq BEFORE this lock.
+static FREE_CONTIG_SCRATCH: SpinLockIrq<PhysicalFrameAllocator> =
+    SpinLockIrq::new(PhysicalFrameAllocator::new_uninit());
+
+// Copy all fields of `src` into `dst` without creating a 209 KB stack temporary.
+// Large array fields are copied via copy_from_slice (memcpy), small fields directly.
+// Used by free_contiguous for transactional two-phase commit under FREE_CONTIG_SCRATCH.
+#[inline(never)]
+fn pfa_clone_to(src: &PhysicalFrameAllocator, dst: &mut PhysicalFrameAllocator) {
+    dst.base_phys = src.base_phys;
+    dst.end_phys_exclusive = src.end_phys_exclusive;
+    dst.total_frames = src.total_frames;
+    dst.free_frames = src.free_frames;
+    dst.initialized = src.initialized;
+    dst.extents.copy_from_slice(&src.extents);
+    dst.largest_free_run_pages = src.largest_free_run_pages;
+    dst.run_hint_by_class
+        .copy_from_slice(&src.run_hint_by_class);
+    dst.single_page_hint_idx = src.single_page_hint_idx;
+    dst.frame_refs.copy_from_slice(&src.frame_refs);
+    dst.frame_ref_telemetry = src.frame_ref_telemetry;
 }
 
 // Stage 135: static holds an uninitialized PhysicalFrameAllocator in .bss;
@@ -1084,8 +1125,9 @@ mod tests {
         left: &PhysicalFrameAllocator,
         right: &PhysicalFrameAllocator,
     ) {
-        let mut left = *left;
-        let mut right = *right;
+        // Clone is fine in hosted-dev tests (MAX_TRACKED_FRAME_REFS=256, ~12 KB).
+        let mut left = left.clone();
+        let mut right = right.clone();
         left.frame_ref_telemetry = FrameRefTelemetry::default();
         right.frame_ref_telemetry = FrameRefTelemetry::default();
         assert_eq!(left, right);
@@ -1164,6 +1206,38 @@ mod tests {
         assert_allocator_invariants(&alloc);
     }
 
+    // Stage 136: frame_ref_slot no longer compacts on lookup (compaction moved to
+    // insert path only). This test verifies the new behaviour: lookup is correct
+    // with tombstones, but does NOT trigger compaction.
+    #[test]
+    fn frame_ref_slot_lookup_correct_with_tombstones_no_compact() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        alloc.base_phys = 0;
+        alloc.end_phys_exclusive = ((MAX_TRACKED_FRAME_REFS + 2) as u64) * PAGE_SIZE_U64;
+        alloc.total_frames = 1;
+        alloc.free_frames = 0;
+        alloc.initialized = true;
+        for slot in &mut alloc.frame_refs {
+            *slot = FrameRefSlot::Tombstone;
+        }
+        let live_phys = PAGE_SIZE_U64;
+        let live_slot = alloc.frame_ref_hash(live_phys);
+        alloc.frame_refs[live_slot] = FrameRefSlot::Occupied(FrameRefCount {
+            phys: live_phys,
+            refs: 1,
+        });
+
+        assert_eq!(tombstone_count(&alloc), MAX_TRACKED_FRAME_REFS - 1);
+        // Lookup of a missing entry: returns None without compacting.
+        assert!(alloc.frame_ref_slot(2 * PAGE_SIZE_U64).is_none());
+        // Stage 136: tombstones are NOT cleared by frame_ref_slot.
+        assert_eq!(tombstone_count(&alloc), MAX_TRACKED_FRAME_REFS - 1);
+        // The live entry is still found correctly despite tombstones.
+        assert_eq!(tracked_ref_count(&alloc), 1);
+        assert_eq!(alloc.frame_refcount(live_phys).expect("live ref"), 1);
+    }
+
+    // Compaction via compact_frame_refs (called from the insert path) still works.
     #[test]
     fn frame_ref_compaction_purges_tombstones_and_preserves_entries() {
         let mut alloc = PhysicalFrameAllocator::new_uninit();
@@ -1183,17 +1257,18 @@ mod tests {
         });
 
         assert_eq!(tombstone_count(&alloc), MAX_TRACKED_FRAME_REFS - 1);
-        assert!(alloc.frame_ref_slot(2 * PAGE_SIZE_U64).is_none());
+        alloc.compact_frame_refs();
         assert_eq!(tombstone_count(&alloc), 0);
         assert_eq!(tracked_ref_count(&alloc), 1);
         assert_eq!(alloc.frame_refcount(live_phys).expect("live ref"), 1);
 
+        // After compaction the table has Empty slots; a miss terminates early.
         let before_probes = alloc.frame_ref_telemetry.lookup_probes_total;
         assert!(alloc.frame_ref_slot(3 * PAGE_SIZE_U64).is_none());
         let miss_probes = alloc.frame_ref_telemetry.lookup_probes_total - before_probes;
         assert!(
             miss_probes < MAX_TRACKED_FRAME_REFS as u64,
-            "compacted miss should stop at an Empty slot, not scan the full table"
+            "post-compact miss should stop at an Empty slot, not scan the full table"
         );
     }
 
@@ -1555,7 +1630,7 @@ mod tests {
             .init_from_memory_map(&regions)
             .expect("init full extents");
         assert_eq!(extent_count(&alloc), MAX_FREE_EXTENTS);
-        let before = alloc;
+        let before = alloc.clone();
 
         assert_eq!(
             alloc.reserve_frame(0x7200_1000),
@@ -1669,7 +1744,7 @@ mod tests {
             refs: 1,
         });
         alloc.refresh_run_metadata();
-        let before = alloc;
+        let before = alloc.clone();
 
         assert_eq!(
             alloc.free_contiguous(alloc.base_phys, 1),
@@ -1748,7 +1823,7 @@ mod tests {
                 .track_new_frame_ref((idx as u64) * PAGE_SIZE_U64)
                 .expect("fill frame ref table");
         }
-        let before = alloc;
+        let before = alloc.clone();
         assert_eq!(
             alloc.track_new_frame_ref((MAX_TRACKED_FRAME_REFS as u64) * PAGE_SIZE_U64),
             Err(FrameAllocError::CapacityExceeded)
