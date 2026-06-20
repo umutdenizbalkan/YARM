@@ -38229,3 +38229,180 @@ mod stage140_user_return_cr3 {
         );
     }
 }
+
+// ── Stage 141 — repair kernel return context before CR3 force-write ──────────
+#[cfg(test)]
+mod stage141_kernel_return_ctx_repair {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const TRAP_RS_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const PAGE_TABLE_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    // 1. ensure_user_return_cr3 must NOT bare-write CR3 before the return-context
+    //    mapping helper runs: within the mismatch path, the call to
+    //    ensure_kernel_return_context_mapped_for_asid must precede
+    //    write_cr3_for_asid, and the force-write must be guarded by ctx_mapped.
+    #[test]
+    fn stage141_force_write_is_gated_on_return_ctx_mapping() {
+        let fn_start = TRAP_RS_SRC
+            .find("fn ensure_user_return_cr3")
+            .expect("ensure_user_return_cr3 must be defined in trap.rs");
+        let fn_body = &TRAP_RS_SRC[fn_start..];
+        let map_pos = fn_body
+            .find("ensure_kernel_return_context_mapped_for_asid")
+            .expect("ensure_user_return_cr3 must call the return-context mapping helper");
+        let write_pos = fn_body
+            .find("write_cr3_for_asid")
+            .expect("ensure_user_return_cr3 must still force-write CR3 on the safe path");
+        assert!(
+            map_pos < write_pos,
+            "return-context mapping must precede write_cr3_for_asid in ensure_user_return_cr3"
+        );
+        // The force-write must be inside an `if ctx_mapped` guard.
+        let guard_pos = fn_body
+            .find("if ctx_mapped")
+            .expect("write_cr3_for_asid must be guarded by `if ctx_mapped`");
+        assert!(
+            guard_pos < write_pos,
+            "write_cr3_for_asid must be inside the `if ctx_mapped` guard"
+        );
+        // ensure_user_return_cr3 itself must not contain a raw `mov cr3` write;
+        // the only CR3 write goes through the guarded write_cr3_for_asid helper.
+        assert!(
+            !fn_body[..write_pos].contains("mov cr3"),
+            "ensure_user_return_cr3 must not bare-write CR3 with inline asm"
+        );
+    }
+
+    // 2. The kernel-return mapping helper must map the RSP page supervisor-only
+    //    writable (KERNEL_RW).
+    #[test]
+    fn stage141_rsp_page_mapped_supervisor_writable() {
+        let fn_start = PAGE_TABLE_SRC
+            .find("fn ensure_kernel_return_context_mapped_for_asid")
+            .expect("ensure_kernel_return_context_mapped_for_asid must be defined");
+        let fn_body = &PAGE_TABLE_SRC[fn_start..];
+        assert!(
+            fn_body.contains("PageFlags::KERNEL_RW"),
+            "RSP page must be mapped with KERNEL_RW (supervisor-only writable)"
+        );
+        assert!(
+            fn_body.contains("\"rsp\""),
+            "helper must distinguish the rsp page kind"
+        );
+        // The mapping primitive must reject user-accessible kernel pages.
+        let helper_start = PAGE_TABLE_SRC
+            .find("fn ensure_kernel_return_page_mapped")
+            .expect("ensure_kernel_return_page_mapped must be defined");
+        let helper_body = &PAGE_TABLE_SRC[helper_start..];
+        assert!(
+            helper_body.contains("!flags.user"),
+            "ensure_kernel_return_page_mapped must assert the page is supervisor-only"
+        );
+    }
+
+    // 3. The kernel-return mapping helper must map/prove the RIP page
+    //    supervisor-only executable (user=false, execute=true).
+    #[test]
+    fn stage141_rip_page_mapped_supervisor_executable() {
+        let fn_start = PAGE_TABLE_SRC
+            .find("fn ensure_kernel_return_context_mapped_for_asid")
+            .expect("ensure_kernel_return_context_mapped_for_asid must be defined");
+        let fn_body = &PAGE_TABLE_SRC[fn_start..];
+        let rip_pos = fn_body
+            .find("\"rip\"")
+            .expect("helper must distinguish the rip page kind");
+        // Within the rip mapping call, flags must be supervisor-only executable.
+        let around_rip = &fn_body[rip_pos.saturating_sub(200)..rip_pos.saturating_add(200)];
+        assert!(
+            around_rip.contains("execute: true"),
+            "RIP page must be mapped executable"
+        );
+        assert!(
+            around_rip.contains("user: false"),
+            "RIP page must be mapped supervisor-only (user: false)"
+        );
+    }
+
+    // 4. ASID_SWITCH_ABORT_DETAIL marker must exist in page_table.rs and must be
+    //    emitted alongside (not instead of) ASID_SWITCH_ABORT.
+    #[test]
+    fn stage141_asid_switch_abort_detail_marker_exists() {
+        assert!(
+            PAGE_TABLE_SRC.contains("ASID_SWITCH_ABORT_DETAIL"),
+            "page_table.rs must emit ASID_SWITCH_ABORT_DETAIL"
+        );
+        // ASID_SWITCH_ABORT must NOT be suppressed.
+        assert!(
+            PAGE_TABLE_SRC.contains("\"ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing\""),
+            "ASID_SWITCH_ABORT must remain (improved with detail, not removed)"
+        );
+        let detail_pos = PAGE_TABLE_SRC
+            .find("ASID_SWITCH_ABORT_DETAIL")
+            .expect("DETAIL present");
+        let around = &PAGE_TABLE_SRC[detail_pos..detail_pos.saturating_add(300)];
+        assert!(
+            around.contains("missing=") && around.contains("va="),
+            "ASID_SWITCH_ABORT_DETAIL must report which mapping is missing and its va"
+        );
+    }
+
+    // 5. The USER_CR3_RETURN_CTX_MAP_* markers must all exist, in order.
+    #[test]
+    fn stage141_return_ctx_map_markers_exist() {
+        for marker in [
+            "USER_CR3_RETURN_CTX_MAP_BEGIN",
+            "USER_CR3_RETURN_CTX_MAP_PAGE",
+            "USER_CR3_RETURN_CTX_MAP_OK",
+        ] {
+            assert!(
+                PAGE_TABLE_SRC.contains(marker),
+                "page_table.rs must emit {marker}"
+            );
+        }
+        let begin_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_CTX_MAP_BEGIN")
+            .expect("BEGIN present");
+        let ok_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_CTX_MAP_OK")
+            .expect("OK present");
+        assert!(begin_pos < ok_pos, "BEGIN must precede OK in source");
+    }
+
+    // 6. The Stage 140 pre-IRET markers must remain present.
+    #[test]
+    fn stage141_pre_iret_markers_remain() {
+        for marker in [
+            "USER_CR3_PRE_IRET_CHECK",
+            "USER_CR3_PRE_IRET_SWITCH",
+            "USER_CR3_PRE_IRET_OK",
+        ] {
+            assert!(TRAP_RS_SRC.contains(marker), "trap.rs must retain {marker}");
+        }
+    }
+
+    // 7. PAGE_FAULT_HANDLED_DEMAND must still be gated on the hardware PTE walk.
+    #[test]
+    fn stage141_handled_demand_still_gated_on_hw_walk() {
+        let handled_pos = FAULT_SRC
+            .find("PAGE_FAULT_HANDLED_DEMAND")
+            .expect("PAGE_FAULT_HANDLED_DEMAND must remain in fault_state.rs");
+        let before = &FAULT_SRC[..handled_pos];
+        assert!(
+            before.contains("hw_demand_ok"),
+            "PAGE_FAULT_HANDLED_DEMAND must remain inside an hw_demand_ok gate"
+        );
+    }
+
+    // 8-9. Syscall ABI must not change.
+    #[test]
+    fn stage141_syscall_counts_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 141 must not change SYSCALL_COUNT");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 141 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}

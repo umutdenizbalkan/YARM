@@ -856,6 +856,21 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
             );
         }
         if !rip_ok || !rsp_ok {
+            let missing = match (rip_ok, rsp_ok) {
+                (false, false) => "both",
+                (false, true) => "rip",
+                (true, false) => "rsp",
+                (true, true) => "none",
+            };
+            let missing_va = if !rsp_ok { rsp_probe } else { rip };
+            crate::yarm_log!(
+                "ASID_SWITCH_ABORT_DETAIL asid={} reason=kernel_mapping_missing rip=0x{:x} rsp=0x{:x} missing={} va=0x{:x}",
+                asid.0,
+                rip,
+                rsp_probe,
+                missing,
+                missing_va
+            );
             crate::yarm_log!(
                 "ASID_SWITCH_ABORT asid={} reason=kernel_mapping_missing",
                 asid.0
@@ -894,9 +909,16 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     Ok(cr3)
 }
 
-/// Force-write CR3 for `asid` bypassing the kernel-RSP/RIP mapping safety check.
-/// Only call immediately before a ring-3 return (IRET/SYSRET), when the kernel
-/// stack is about to be abandoned.
+/// Force-write CR3 for `asid` bypassing the kernel-RSP/RIP mapping safety check
+/// in `activate_asid`.
+///
+/// SAFETY/CONTRACT (Stage 141): this is NOT an unconditional bypass.  The caller
+/// MUST first prove the live kernel return context (RIP page + RSP page) is
+/// mapped in the target ASID root via
+/// `ensure_kernel_return_context_mapped_for_asid`, and MUST call this only
+/// immediately before a ring-3 return (IRET/SYSRET).  Writing CR3 to a root that
+/// lacks the live kernel stack page faults on the very next kernel instruction
+/// (the Stage 140 crash); the mapping helper is what makes this safe.
 #[cfg(not(feature = "hosted-dev"))]
 pub fn write_cr3_for_asid(asid: Asid) -> Option<u64> {
     let cr3 = cr3_for_asid(asid)?;
@@ -909,6 +931,132 @@ pub fn write_cr3_for_asid(asid: Asid) -> Option<u64> {
 #[cfg(feature = "hosted-dev")]
 pub fn write_cr3_for_asid(_asid: Asid) -> Option<u64> {
     None
+}
+
+/// Stage 141: ensure the live kernel return context — the page containing the
+/// current kernel RIP and the page containing the current kernel RSP — is mapped
+/// in `asid`'s root before CR3 is switched to it.
+///
+/// This is the repair that the CR3-switch mapping guard was protecting against:
+/// after the D6 controlled-switch proof, dispatch of a service task can run on a
+/// kernel stack page that is absent from the service task's ASID root.  Switching
+/// CR3 there faults immediately (Stage 140).  Here we replicate the live kernel
+/// page(s) into the target root with supervisor-only flags (never user) so the
+/// subsequent force-write is safe.
+///
+/// Returns true only when both the RSP and RIP pages resolve in the target root
+/// afterwards.
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+pub fn ensure_kernel_return_context_mapped_for_asid(asid: Asid, rip: u64, rsp: u64) -> bool {
+    let target_root = match cr3_for_asid(asid) {
+        Some(cr3) => cr3 & PAGE_MASK,
+        None => return false,
+    };
+    let live_root = detect_active_root_phys_from_cr3().unwrap_or(0);
+    crate::yarm_log!(
+        "USER_CR3_RETURN_CTX_MAP_BEGIN asid={} rip=0x{:x} rsp=0x{:x}",
+        asid.0,
+        rip,
+        rsp
+    );
+    // RSP page: supervisor-only writable (KERNEL_RW, user=false).
+    let rsp_ok = ensure_kernel_return_page_mapped(
+        asid,
+        target_root,
+        live_root,
+        rsp & PAGE_MASK,
+        "rsp",
+        PageFlags::KERNEL_RW,
+    );
+    // RIP page: supervisor-only executable (kernel RX, user=false).
+    let rip_ok = ensure_kernel_return_page_mapped(
+        asid,
+        target_root,
+        live_root,
+        rip & PAGE_MASK,
+        "rip",
+        PageFlags {
+            read: true,
+            write: false,
+            execute: true,
+            user: false,
+            cache_policy: CachePolicy::WriteBack,
+        },
+    );
+    if rsp_ok && rip_ok {
+        crate::yarm_log!("USER_CR3_RETURN_CTX_MAP_OK asid={}", asid.0);
+        true
+    } else {
+        crate::yarm_log!(
+            "USER_CR3_RETURN_CTX_MAP_FAILED asid={} rsp_ok={} rip_ok={}",
+            asid.0,
+            rsp_ok,
+            rip_ok
+        );
+        false
+    }
+}
+
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+fn ensure_kernel_return_page_mapped(
+    asid: Asid,
+    target_root: u64,
+    live_root: u64,
+    page_va: u64,
+    kind: &str,
+    flags: PageFlags,
+) -> bool {
+    // A kernel return page must never be user-accessible.
+    debug_assert!(!flags.user, "kernel return page must be supervisor-only");
+    // Already present in the target root (e.g. shared higher-half kernel text).
+    if resolve_page_in_root(target_root, VirtAddr(page_va)).is_some() {
+        crate::yarm_log!(
+            "USER_CR3_RETURN_CTX_MAP_PAGE asid={} va=0x{:x} kind={} result=already_ok",
+            asid.0,
+            page_va,
+            kind
+        );
+        return true;
+    }
+    // Resolve the backing physical frame from the live (current hardware) root,
+    // where we are presently executing, and replicate it into the target root.
+    let Some(src) = resolve_page_in_root(live_root, VirtAddr(page_va)) else {
+        crate::yarm_log!(
+            "USER_CR3_RETURN_CTX_MAP_PAGE asid={} va=0x{:x} kind={} result=src_unmapped",
+            asid.0,
+            page_va,
+            kind
+        );
+        return false;
+    };
+    let phys = src.addr();
+    match map_page(asid, VirtAddr(page_va), PhysAddr(phys), flags) {
+        Ok(_) => {
+            let now_ok = resolve_page_in_root(target_root, VirtAddr(page_va)).is_some();
+            crate::yarm_log!(
+                "USER_CR3_RETURN_CTX_MAP_PAGE asid={} va=0x{:x} kind={} result={}",
+                asid.0,
+                page_va,
+                kind,
+                if now_ok { "mapped" } else { "map_unverified" }
+            );
+            now_ok
+        }
+        Err(_) => {
+            crate::yarm_log!(
+                "USER_CR3_RETURN_CTX_MAP_PAGE asid={} va=0x{:x} kind={} result=map_failed",
+                asid.0,
+                page_va,
+                kind
+            );
+            false
+        }
+    }
+}
+
+#[cfg(any(feature = "hosted-dev", test))]
+pub fn ensure_kernel_return_context_mapped_for_asid(_asid: Asid, _rip: u64, _rsp: u64) -> bool {
+    true
 }
 
 pub fn map_page(
