@@ -1,7 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! IPC syscall handlers (IpcSend, IpcRecv, IpcRecvTimeout, IpcCall, IpcReply).
+//! IPC syscall handlers — implementation module only.
+//!
+//! **Dispatch ownership:** `syscall.rs` owns the syscall-number dispatch table and calls
+//! into this module through thin shims. This module must never acquire dispatch ownership,
+//! decode syscall numbers, or introduce a second dispatch layer.
+//!
+//! **Boundary invariants (must not change without a dedicated audit stage):**
+//! - IPC ABI: syscall argument positions, return-register encoding, and error codes are
+//!   frozen in `syscall.rs`. Constants live there; do not duplicate or redefine them here.
+//! - Cap-slot materialization and revocation ordering: `materialize_received_message_cap`
+//!   and `complete_blocked_recv_for_waiter` remain in `syscall.rs` as `pub(crate)`.
+//!   They must not be moved here without a separate lock-ordering audit.
+//! - Reply-cap one-shot semantics: `ipc_reply` consumes the reply-cap slot atomically.
+//!   Nothing in this module may re-order that consumption relative to payload delivery.
+//! - Shared-memory mapping rights: attenuation and rights checks happen before
+//!   `map_shared_region_into_receiver`. Do not reorder without a rights-audit stage.
+//! - User-memory copy ordering: `copy_from_current_user` / `copy_to_current_user` calls
+//!   must only appear inside the five `pub(super)` handlers, not in private helpers.
+//! - Lock ordering: private helpers must not acquire `ipc_state_lock` directly; they
+//!   call `KernelState` methods that manage lock rank internally.
 
 use super::{
     IPC_RECV_META_V2_ENCODED_LEN, OPCODE_INLINE, OPCODE_SHARED_MEM, SYSCALL_ARG_CAP,
