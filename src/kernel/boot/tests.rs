@@ -39071,7 +39071,9 @@ mod stage145_vm_module_extraction {
     // 7. VM syscall numbers unchanged.
     #[test]
     fn stage145_vm_syscall_numbers_unchanged() {
-        use crate::kernel::syscall::{SYSCALL_VM_ANON_MAP_NR, SYSCALL_VM_BRK_NR, SYSCALL_VM_MAP_NR};
+        use crate::kernel::syscall::{
+            SYSCALL_VM_ANON_MAP_NR, SYSCALL_VM_BRK_NR, SYSCALL_VM_MAP_NR,
+        };
         assert_eq!(SYSCALL_VM_MAP_NR, 3);
         assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
         assert_eq!(SYSCALL_VM_BRK_NR, 14);
@@ -39120,6 +39122,205 @@ mod stage145_vm_module_extraction {
         assert!(
             SYSCALL_SRC.contains("pub const SYSCALL_VM_MAP_PROT_EXEC"),
             "SYSCALL_VM_MAP_PROT_EXEC must remain in syscall.rs"
+        );
+    }
+}
+
+mod stage146_ipc_module_extraction {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+
+    // 1. ipc.rs must declare the five pub(super) handler functions.
+    #[test]
+    fn stage146_ipc_module_has_five_handlers() {
+        assert!(
+            IPC_SRC.contains("pub(super) fn handle_ipc_send("),
+            "ipc.rs must contain pub(super) fn handle_ipc_send"
+        );
+        assert!(
+            IPC_SRC.contains("pub(super) fn handle_ipc_recv("),
+            "ipc.rs must contain pub(super) fn handle_ipc_recv"
+        );
+        assert!(
+            IPC_SRC.contains("pub(super) fn handle_ipc_recv_timeout("),
+            "ipc.rs must contain pub(super) fn handle_ipc_recv_timeout"
+        );
+        assert!(
+            IPC_SRC.contains("pub(super) fn handle_ipc_call("),
+            "ipc.rs must contain pub(super) fn handle_ipc_call"
+        );
+        assert!(
+            IPC_SRC.contains("pub(super) fn handle_ipc_reply("),
+            "ipc.rs must contain pub(super) fn handle_ipc_reply"
+        );
+    }
+
+    // 2. Private IPC helpers must live in ipc.rs and not in syscall.rs.
+    #[test]
+    fn stage146_ipc_helpers_live_in_ipc_module() {
+        for helper in &[
+            "fn transfer_flag_bits(",
+            "fn validate_transfer_cap(",
+            "fn validate_shared_mem_transfer_rights(",
+            "fn stash_transfer_handle(",
+            "fn inline_payload_from_frame(",
+            "fn map_shared_region_into_receiver(",
+            "fn revoke_current_transfer_cap_best_effort(",
+            "fn attenuate_transfer_cap_for_recv_intent(",
+            "fn recv_shared_mem_map_intent_flags(",
+            "fn handle_ipc_recv_result(",
+            "fn handle_ipc_recv_result_with_empty_error(",
+        ] {
+            assert!(
+                IPC_SRC.contains(helper),
+                "ipc.rs must contain {helper}"
+            );
+            assert!(
+                !SYSCALL_SRC.contains(helper),
+                "syscall.rs must NOT contain {helper} (moved to ipc.rs)"
+            );
+        }
+    }
+
+    // 3. syscall.rs must declare `mod ipc;` in the decomposition block.
+    #[test]
+    fn stage146_syscall_declares_ipc_module() {
+        assert!(
+            SYSCALL_SRC.contains("mod ipc;"),
+            "syscall.rs must declare `mod ipc;`"
+        );
+    }
+
+    // 4. syscall.rs must have thin shims delegating to self::ipc::.
+    #[test]
+    fn stage146_dispatch_delegates_to_ipc_module() {
+        assert!(
+            SYSCALL_SRC.contains("self::ipc::handle_ipc_send("),
+            "syscall.rs must delegate IpcSend to self::ipc::handle_ipc_send"
+        );
+        assert!(
+            SYSCALL_SRC.contains("self::ipc::handle_ipc_recv("),
+            "syscall.rs must delegate IpcRecv to self::ipc::handle_ipc_recv"
+        );
+        assert!(
+            SYSCALL_SRC.contains("self::ipc::handle_ipc_recv_timeout("),
+            "syscall.rs must delegate IpcRecvTimeout to self::ipc::handle_ipc_recv_timeout"
+        );
+        assert!(
+            SYSCALL_SRC.contains("self::ipc::handle_ipc_call("),
+            "syscall.rs must delegate IpcCall to self::ipc::handle_ipc_call"
+        );
+        assert!(
+            SYSCALL_SRC.contains("self::ipc::handle_ipc_reply("),
+            "syscall.rs must delegate IpcReply to self::ipc::handle_ipc_reply"
+        );
+    }
+
+    // 5. Shared helpers that stayed must remain in syscall.rs as pub(super).
+    #[test]
+    fn stage146_shared_helpers_remain_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn try_endpoint_split_recv("),
+            "try_endpoint_split_recv must remain pub(super) in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn encode_transfer_cap_ret("),
+            "encode_transfer_cap_ret must remain pub(super) in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn should_strip_inline_opcode_prefix("),
+            "should_strip_inline_opcode_prefix must remain pub(super) in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn clear_blocked_recv_state("),
+            "clear_blocked_recv_state must remain pub(super) in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn sender_tid_to_ret("),
+            "sender_tid_to_ret must remain pub(super) in syscall.rs"
+        );
+    }
+
+    // 6. ipc.rs imports shared helpers from super (not duplicating them).
+    #[test]
+    fn stage146_ipc_imports_helpers_from_super() {
+        assert!(
+            IPC_SRC.contains("super::") && IPC_SRC.contains("try_endpoint_split_recv"),
+            "ipc.rs must import try_endpoint_split_recv from super"
+        );
+        assert!(
+            IPC_SRC.contains("super::") && IPC_SRC.contains("encode_transfer_cap_ret"),
+            "ipc.rs must import encode_transfer_cap_ret from super"
+        );
+        assert!(
+            IPC_SRC.contains("super::") && IPC_SRC.contains("should_strip_inline_opcode_prefix"),
+            "ipc.rs must import should_strip_inline_opcode_prefix from super"
+        );
+    }
+
+    // 7. IPC syscall numbers unchanged.
+    #[test]
+    fn stage146_ipc_syscall_numbers_unchanged() {
+        use crate::kernel::syscall::{
+            SYSCALL_IPC_CALL_NR, SYSCALL_IPC_RECV_NR, SYSCALL_IPC_RECV_TIMEOUT_NR,
+            SYSCALL_IPC_REPLY_NR, SYSCALL_IPC_SEND_NR,
+        };
+        assert_eq!(SYSCALL_IPC_SEND_NR, 1);
+        assert_eq!(SYSCALL_IPC_RECV_NR, 2);
+        assert_eq!(SYSCALL_IPC_RECV_TIMEOUT_NR, 5);
+        assert_eq!(SYSCALL_IPC_CALL_NR, 6);
+        assert_eq!(SYSCALL_IPC_REPLY_NR, 7);
+    }
+
+    // 8. SYSCALL_COUNT unchanged.
+    #[test]
+    fn stage146_syscall_count() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 146 must not change SYSCALL_COUNT");
+    }
+
+    // 9. Syscall::VARIANT_COUNT unchanged.
+    #[test]
+    fn stage146_syscall_variant_count() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 146 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+
+    // 10. ipc.rs must not contain inline dispatch logic.
+    #[test]
+    fn stage146_ipc_module_has_no_dispatch_logic() {
+        assert!(
+            !IPC_SRC.contains("fn dispatch("),
+            "ipc.rs must not contain a dispatch function"
+        );
+        assert!(
+            !IPC_SRC.contains("Syscall::decode("),
+            "ipc.rs must not decode syscall numbers"
+        );
+    }
+
+    // 11. syscall.rs dispatch fn must own all five IpcSend/Recv/Call/Reply arms.
+    #[test]
+    fn stage146_syscall_rs_owns_dispatch() {
+        assert!(
+            SYSCALL_SRC.contains("Syscall::IpcSend"),
+            "syscall.rs dispatch must handle IpcSend"
+        );
+        assert!(
+            SYSCALL_SRC.contains("Syscall::IpcRecv"),
+            "syscall.rs dispatch must handle IpcRecv"
+        );
+        assert!(
+            SYSCALL_SRC.contains("Syscall::IpcCall"),
+            "syscall.rs dispatch must handle IpcCall"
+        );
+        assert!(
+            SYSCALL_SRC.contains("Syscall::IpcReply"),
+            "syscall.rs dispatch must handle IpcReply"
         );
     }
 }
