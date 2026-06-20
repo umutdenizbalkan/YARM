@@ -38275,8 +38275,10 @@ mod stage141_kernel_return_ctx_repair {
         );
     }
 
-    // 2. The kernel-return mapping helper must map the RSP page supervisor-only
-    //    writable (KERNEL_RW).
+    // 2. The kernel-return mapping helper must map the RSP/stack pages
+    //    supervisor-only writable (KERNEL_RW).  Stage 142 replaces the
+    //    single-RSP-page approach with a full stack-window loop, so the
+    //    "rsp" kind string is gone, but KERNEL_RW must still be present.
     #[test]
     fn stage141_rsp_page_mapped_supervisor_writable() {
         let fn_start = PAGE_TABLE_SRC
@@ -38285,11 +38287,14 @@ mod stage141_kernel_return_ctx_repair {
         let fn_body = &PAGE_TABLE_SRC[fn_start..];
         assert!(
             fn_body.contains("PageFlags::KERNEL_RW"),
-            "RSP page must be mapped with KERNEL_RW (supervisor-only writable)"
+            "stack pages must be mapped with KERNEL_RW (supervisor-only writable)"
         );
+        // Stage 142 uses a stack-window loop (USER_CR3_RETURN_STACK_MAP_BEGIN)
+        // instead of the single-RSP-page call.  Either the old "rsp" kind or
+        // the new stack-window marker must be present.
         assert!(
-            fn_body.contains("\"rsp\""),
-            "helper must distinguish the rsp page kind"
+            fn_body.contains("USER_CR3_RETURN_STACK_MAP_BEGIN") || fn_body.contains("\"rsp\""),
+            "either full stack-window mapping or rsp-page mapping must be present"
         );
         // The mapping primitive must reject user-accessible kernel pages.
         let helper_start = PAGE_TABLE_SRC
@@ -38403,6 +38408,230 @@ mod stage141_kernel_return_ctx_repair {
             Syscall::VARIANT_COUNT,
             23,
             "Stage 141 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}
+
+// ── Stage 142 — map the full live kernel stack window before user-return CR3 switch ──
+#[cfg(test)]
+mod stage142_stack_window_mapping {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const TRAP_RS_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const PAGE_TABLE_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    // 1. ensure_kernel_return_context_mapped_for_asid must accept stack_base and
+    //    stack_top parameters, not a bare rsp: u64.
+    #[test]
+    fn stage142_ensure_signature_uses_stack_bounds() {
+        let fn_start = PAGE_TABLE_SRC
+            .find("fn ensure_kernel_return_context_mapped_for_asid")
+            .expect("function must be defined in page_table.rs");
+        let fn_body = &PAGE_TABLE_SRC[fn_start..];
+        let sig_end = fn_body
+            .find("->")
+            .expect("function must have a return type");
+        let sig = &fn_body[..sig_end];
+        assert!(
+            sig.contains("stack_base"),
+            "signature must include a stack_base parameter"
+        );
+        assert!(
+            sig.contains("stack_top"),
+            "signature must include a stack_top parameter"
+        );
+        assert!(
+            !sig.contains("rsp: u64"),
+            "Stage 142 must replace the bare rsp: u64 param with stack_base+stack_top"
+        );
+    }
+
+    // 2. ensure_user_return_cr3 in trap.rs must look up the TCB kernel stack
+    //    bounds via with_tcbs before calling ensure_kernel_return_context_mapped_for_asid.
+    #[test]
+    fn stage142_trap_looks_up_tcb_stack_bounds() {
+        let fn_start = TRAP_RS_SRC
+            .find("fn ensure_user_return_cr3")
+            .expect("ensure_user_return_cr3 must be defined in trap.rs");
+        let fn_body = &TRAP_RS_SRC[fn_start..];
+        assert!(
+            fn_body.contains("with_tcbs"),
+            "ensure_user_return_cr3 must call kernel.with_tcbs to look up TCB stack bounds"
+        );
+        assert!(
+            fn_body.contains("stack_base") && fn_body.contains("stack_top"),
+            "ensure_user_return_cr3 must compute stack_base and stack_top from TCB or fallback"
+        );
+        // with_tcbs must appear before the call to ensure_kernel_return_context_mapped_for_asid.
+        let tcbs_pos = fn_body.find("with_tcbs").expect("with_tcbs present");
+        let map_pos = fn_body
+            .find("ensure_kernel_return_context_mapped_for_asid")
+            .expect("ensure_kernel_return_context_mapped_for_asid call must be present");
+        assert!(
+            tcbs_pos < map_pos,
+            "TCB stack-bounds lookup must precede the mapping call"
+        );
+    }
+
+    // 3. The mapping function must contain a while-loop over the full stack window.
+    #[test]
+    fn stage142_stack_loop_covers_full_window() {
+        let fn_start = PAGE_TABLE_SRC
+            .find("fn ensure_kernel_return_context_mapped_for_asid")
+            .expect("function must be defined in page_table.rs");
+        let fn_body = &PAGE_TABLE_SRC[fn_start..];
+        assert!(
+            fn_body.contains("while page_va < stack_top"),
+            "function must iterate stack pages with a while loop driven by stack_top"
+        );
+        assert!(
+            fn_body.contains("PAGE_SIZE_U64"),
+            "loop must advance page_va by PAGE_SIZE_U64 each iteration"
+        );
+    }
+
+    // 4. USER_CR3_RETURN_STACK_MAP_BEGIN marker must exist in page_table.rs.
+    #[test]
+    fn stage142_stack_map_begin_marker() {
+        assert!(
+            PAGE_TABLE_SRC.contains("USER_CR3_RETURN_STACK_MAP_BEGIN"),
+            "page_table.rs must emit USER_CR3_RETURN_STACK_MAP_BEGIN"
+        );
+        // BEGIN must carry base and top fields.
+        let marker_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_STACK_MAP_BEGIN")
+            .expect("marker present");
+        let around = &PAGE_TABLE_SRC[marker_pos..marker_pos.saturating_add(200)];
+        assert!(
+            around.contains("base=") && around.contains("top="),
+            "USER_CR3_RETURN_STACK_MAP_BEGIN must report base= and top="
+        );
+    }
+
+    // 5. USER_CR3_RETURN_STACK_MAP_PAGE marker must exist in page_table.rs.
+    #[test]
+    fn stage142_stack_map_page_marker() {
+        assert!(
+            PAGE_TABLE_SRC.contains("USER_CR3_RETURN_STACK_MAP_PAGE"),
+            "page_table.rs must emit USER_CR3_RETURN_STACK_MAP_PAGE per stack page"
+        );
+        // Marker must report va, present, user, writable fields.
+        let marker_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_STACK_MAP_PAGE")
+            .expect("marker present");
+        let around = &PAGE_TABLE_SRC[marker_pos..marker_pos.saturating_add(200)];
+        assert!(
+            around.contains("va=") && around.contains("present="),
+            "USER_CR3_RETURN_STACK_MAP_PAGE must report va= and present="
+        );
+    }
+
+    // 6. USER_CR3_RETURN_STACK_MAP_OK marker must exist in page_table.rs and
+    //    appear after USER_CR3_RETURN_STACK_MAP_BEGIN.
+    #[test]
+    fn stage142_stack_map_ok_marker() {
+        assert!(
+            PAGE_TABLE_SRC.contains("USER_CR3_RETURN_STACK_MAP_OK"),
+            "page_table.rs must emit USER_CR3_RETURN_STACK_MAP_OK on success"
+        );
+        let begin_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_STACK_MAP_BEGIN")
+            .expect("BEGIN present");
+        let ok_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_STACK_MAP_OK")
+            .expect("OK present");
+        assert!(
+            begin_pos < ok_pos,
+            "USER_CR3_RETURN_STACK_MAP_BEGIN must precede USER_CR3_RETURN_STACK_MAP_OK"
+        );
+    }
+
+    // 7. USER_CR3_RETURN_STACK_PROBE marker must exist and report present/user/writable.
+    #[test]
+    fn stage142_stack_probe_marker_has_present_user_writable() {
+        assert!(
+            PAGE_TABLE_SRC.contains("USER_CR3_RETURN_STACK_PROBE"),
+            "page_table.rs must emit USER_CR3_RETURN_STACK_PROBE to verify each mapped page"
+        );
+        let marker_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_STACK_PROBE")
+            .expect("marker present");
+        let around = &PAGE_TABLE_SRC[marker_pos..marker_pos.saturating_add(200)];
+        assert!(
+            around.contains("present="),
+            "USER_CR3_RETURN_STACK_PROBE must include present= field"
+        );
+        assert!(
+            around.contains("user="),
+            "USER_CR3_RETURN_STACK_PROBE must include user= field"
+        );
+        assert!(
+            around.contains("writable="),
+            "USER_CR3_RETURN_STACK_PROBE must include writable= field"
+        );
+    }
+
+    // 8. Stack pages in the window must be mapped with KERNEL_RW (never user-accessible).
+    #[test]
+    fn stage142_stack_pages_use_kernel_rw_not_user() {
+        let fn_start = PAGE_TABLE_SRC
+            .find("fn ensure_kernel_return_context_mapped_for_asid")
+            .expect("function must be defined in page_table.rs");
+        let fn_body = &PAGE_TABLE_SRC[fn_start..];
+        assert!(
+            fn_body.contains("PageFlags::KERNEL_RW"),
+            "stack window mapping must use PageFlags::KERNEL_RW (supervisor-only writable)"
+        );
+        // The loop section from STACK_MAP_BEGIN to STACK_MAP_OK must not use USER flags.
+        let begin_pos = fn_body
+            .find("USER_CR3_RETURN_STACK_MAP_BEGIN")
+            .expect("STACK_MAP_BEGIN present");
+        let ok_pos = fn_body
+            .find("USER_CR3_RETURN_STACK_MAP_OK")
+            .expect("STACK_MAP_OK present");
+        let loop_section = &fn_body[begin_pos..ok_pos];
+        assert!(
+            !loop_section.contains("user: true"),
+            "stack window mapping must never use user: true"
+        );
+    }
+
+    // 9. Stage 140/141 diagnostic markers must remain present.
+    #[test]
+    fn stage142_stage141_stage140_markers_remain() {
+        for marker in [
+            "USER_CR3_PRE_IRET_CHECK",
+            "USER_CR3_PRE_IRET_SWITCH",
+            "USER_CR3_PRE_IRET_OK",
+        ] {
+            assert!(TRAP_RS_SRC.contains(marker), "trap.rs must retain {marker}");
+        }
+        for marker in [
+            "USER_CR3_RETURN_CTX_MAP_BEGIN",
+            "USER_CR3_RETURN_CTX_MAP_OK",
+            "ASID_SWITCH_ABORT_DETAIL",
+        ] {
+            assert!(
+                PAGE_TABLE_SRC.contains(marker),
+                "page_table.rs must retain {marker}"
+            );
+        }
+        // Stage 138: hardware fault diagnostics must remain.
+        assert!(
+            FAULT_SRC.contains("PAGE_FAULT_HANDLED_DEMAND"),
+            "fault_state.rs must retain PAGE_FAULT_HANDLED_DEMAND"
+        );
+    }
+
+    // 10. Syscall ABI must not change.
+    #[test]
+    fn stage142_syscall_counts_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 142 must not change SYSCALL_COUNT");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 142 must not change Syscall::VARIANT_COUNT"
         );
     }
 }

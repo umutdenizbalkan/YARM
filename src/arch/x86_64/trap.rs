@@ -102,19 +102,45 @@ pub(crate) fn ensure_user_return_cr3(
             hw_cr3,
         );
         if hw_cr3 != task_cr3 {
-            // Stage 141: the bare CR3 force-write Stage 140 used crashed because
-            // the live kernel return context (RIP/RSP pages) was not mapped in
-            // the target service-task root. Repair the mapping FIRST, then only
-            // force-write CR3 once the return context is proven present.
+            // Stage 141/142: repair the kernel return context before force-writing CR3.
             let mut rip: u64 = 0;
             let mut rsp: u64 = 0;
             unsafe {
                 core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nostack, preserves_flags));
                 core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
             }
+            // Stage 142: look up the full kernel stack bounds for this tid from
+            // the TCB so the entire live stack window is mapped, not only the
+            // single page that contained the sampled RSP (Stage 141's approach
+            // failed when the post-switch call chain dug ~8 KiB deeper).
+            let (tcb_stack_base, tcb_stack_top) = kernel.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == tid)
+                    .map(|tcb| {
+                        (
+                            tcb.kernel_context.stack_base.map_or(0u64, |v| v.0),
+                            tcb.kernel_context.stack_top.map_or(0u64, |v| v.0),
+                        )
+                    })
+                    .unwrap_or((0u64, 0u64))
+            });
+            // Fallback: conservative 28 KiB window below sampled RSP when TCB
+            // bounds are unavailable (e.g. uninitialized early-boot task).
+            const STACK_PAGE_SZ: u64 = 4096;
+            const STACK_FLOOR: u64 = 0xFFFF_8000_0000_1000; // region_base + guard_size
+            let (stack_base, stack_top) = if tcb_stack_base != 0 && tcb_stack_top != 0 {
+                (tcb_stack_base, tcb_stack_top)
+            } else {
+                let top = (rsp & !(STACK_PAGE_SZ - 1)) + STACK_PAGE_SZ;
+                let base = (rsp & !(STACK_PAGE_SZ - 1))
+                    .saturating_sub(28 * 1024)
+                    .max(STACK_FLOOR);
+                (base, top)
+            };
             let ctx_mapped =
                 crate::arch::x86_64::page_table::ensure_kernel_return_context_mapped_for_asid(
-                    task_asid, rip, rsp,
+                    task_asid, rip, stack_base, stack_top,
                 );
             crate::yarm_log!(
                 "USER_CR3_PRE_IRET_SWITCH tid={} from=0x{:016x} to=0x{:016x} ctx_mapped={}",
