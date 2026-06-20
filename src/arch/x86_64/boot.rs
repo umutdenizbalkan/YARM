@@ -1035,6 +1035,8 @@ pub fn enter_dispatched_user_task_if_available(
         if DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("USER_ENTRY rip=0x{:x}", context.instruction_ptr.0);
         }
+        // Stage 140: enforce hw CR3 == task_cr3 immediately before IRET.
+        super::trap::ensure_user_return_cr3(kernel, tid, asid);
         #[allow(unreachable_code)]
         {
             // The stack pointer was pre-adjusted to RSP ≡ 8 (mod 16) at task

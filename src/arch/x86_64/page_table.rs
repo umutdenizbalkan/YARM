@@ -894,6 +894,23 @@ pub fn activate_asid(asid: Asid) -> Result<u64, PageTableError> {
     Ok(cr3)
 }
 
+/// Force-write CR3 for `asid` bypassing the kernel-RSP/RIP mapping safety check.
+/// Only call immediately before a ring-3 return (IRET/SYSRET), when the kernel
+/// stack is about to be abandoned.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn write_cr3_for_asid(asid: Asid) -> Option<u64> {
+    let cr3 = cr3_for_asid(asid)?;
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags));
+    }
+    Some(cr3)
+}
+
+#[cfg(feature = "hosted-dev")]
+pub fn write_cr3_for_asid(_asid: Asid) -> Option<u64> {
+    None
+}
+
 pub fn map_page(
     asid: Asid,
     virt: VirtAddr,
