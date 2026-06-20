@@ -40,7 +40,7 @@ Directive labels are stable across stages:
 | **D1** transfer-cap recv (non-reply, non-shared-region) | **LIVE** | Stage 104 | router → `materialize_split_transfer_cap_equivalent`; telemetry `d1_split_materializations` |
 | **D2** endpoint blocking-recv waiter publish | **LIVE** (phase-split, Stage 111) | Stage 106 | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes`, `d2_publish_race_unwinds`; `Stage 108 with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path — see §1 Stage 111 |
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
-| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 | D4 steps 1–4 complete: `recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`; rest of `syscall/dispatch.rs`, `syscall/ipc.rs`, `syscall/ipc_recv_core.rs`, `syscall/mm.rs` pending (§7) |
+| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 + Stage 145/146 | All 8 handler modules landed; `syscall/dispatch.rs` and shared-helper extraction pending (§5.1); see Stage 148 decomposition map |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
 | **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page; Stage 127 corrects that gate to map/check the target task ASID/root and retries after ASID binding instead of depending on temporal active-ASID presence; Stage 128 strengthens the invariant again by mapping/checking the incoming switch-stack page in every existing task root that may be the active/outgoing CR3 during `switch_frames`, plus an active-root proof check before stashing; Stage 129 fixes the VmFull capacity-blocker by adding on-demand repair in the active-root guard when the active ASID was created after the incoming stack was initialized; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
@@ -2324,19 +2324,30 @@ content below is what any unlocking-stage gate test should reference.
 
 Target module layout. Modules already split are marked LIVE; the rest are
 pending mechanical moves (each its own PR, no semantic change).
+Updated Stage 148 to reflect Stage 145 (vm.rs) and Stage 146 (ipc.rs) landings.
 
 | Target module | Status |
 |---------------|--------|
-| `syscall/dispatch.rs` | pending (after IPC group lands) |
-| `syscall/ipc.rs` | frozen until D1 lands |
-| `syscall/ipc_recv_core.rs` | frozen until D1 lands |
-| `syscall/mm.rs` | frozen until D3 |
+| `syscall/dispatch.rs` | pending (after shared helper audit) |
+| `syscall/ipc_recv_core.rs` | deferred — `complete_blocked_recv_for_waiter` and cap-slot ordering require D1/D5 audit first |
+| `syscall/vm.rs` | **landed** Stage 145 (NR 3/13/14 VmMap/AnonMap/Brk) |
+| `syscall/ipc.rs` | **landed** Stage 146 (NR 1/2/5/6/7 IpcSend/Recv/RecvTimeout/Call/Reply) |
 | `syscall/cap.rs` | **landed** D4 step 4 (TransferRelease / CNode slot control handlers) |
 | `syscall/sched.rs` | **landed** D4 step 3 (yield/futex scheduler handlers) |
 | `syscall/process.rs` | **landed** D4 step 2 (process-domain spawn/fork handlers) |
 | `syscall/initramfs.rs` | **landed** Stage 102 (NR 27/28) |
 | `syscall/debug.rs` | **landed** Stage 102 (NR 15) |
 | `syscall/recv_shared_v3.rs` | **landed** D4 step 1 (NR 30) |
+
+**Remaining in syscall.rs (Stage 148 audit, classified):**
+
+| Group | Items | Classification |
+|-------|-------|----------------|
+| [D] dispatch-owned | `Syscall` enum, `SyscallError`, `SYSCALL_COUNT`, ABI constants, thin shims, `pub fn dispatch()` | Must stay in syscall.rs |
+| [S] shared cross-boundary | `current_tid`, `current_task_has_user_asid`, `record_user_fault`, `validate_user_region`, `round_up_page`, `validate_endpoint_right` | Stay until a common helpers module is created |
+| [I] IPC cross-boundary | `complete_blocked_recv_for_waiter`, `clear_blocked_recv_state`, `encode_transfer_cap_ret`, `materialize_received_message_cap` + routing helpers, `try_endpoint_split_recv`, `should_strip_inline_opcode_prefix`, `sender_tid_to_ret`, `transfer_cap_arg`, `decode_ipc_send_timeout_ticks` | Stay until D1/D5 global-lock-drop phase |
+| [R] split-recv seam | `try_split_recv_queued_plain_into_frame_locked` (test), `try_split_recv_queued_plain_with_snapshot_locked` (live) | Stay for D2/D3 split-path protocol |
+| [X] future extract, risky | `materialize_received_message_cap` (cap-slot + TrapFrame ordering), `complete_blocked_recv_for_waiter` (same) | Dedicated cap-slot/lock-ordering audit required |
 
 ### 5.2 D1 audit — answers to the seven readiness questions
 
