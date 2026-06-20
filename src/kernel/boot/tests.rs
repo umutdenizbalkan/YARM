@@ -37933,3 +37933,136 @@ mod stage138_pf_frame_and_hw_pte_proof {
         );
     }
 }
+
+// ── Stage 139 — D6_SWITCH_PROOF hardware CR3 restore after proof cleanup ──────
+#[cfg(test)]
+mod stage139_d6_proof_cr3_cleanup {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // 1. D6_PROOF_CR3_BEFORE marker must be emitted before the proof switch in
+    //    exec_state.rs, inside maybe_run_d6_controlled_switch_proof.
+    #[test]
+    fn stage139_proof_cr3_before_marker_in_exec_state() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_PROOF_CR3_BEFORE"),
+            "exec_state.rs must emit D6_PROOF_CR3_BEFORE before the proof switch"
+        );
+        // Must appear before maybe_switch_kernel_context in the proof function.
+        let before_pos = EXEC_STATE_SRC
+            .find("D6_PROOF_CR3_BEFORE")
+            .expect("D6_PROOF_CR3_BEFORE must be present");
+        let switch_pos = EXEC_STATE_SRC
+            .find("maybe_switch_kernel_context(Some(outgoing_tid)")
+            .expect("maybe_switch_kernel_context(Some(outgoing_tid)) call must be present");
+        assert!(
+            before_pos < switch_pos,
+            "D6_PROOF_CR3_BEFORE must appear before maybe_switch_kernel_context: before@{before_pos} switch@{switch_pos}"
+        );
+    }
+
+    // 2. D6_PROOF_CR3_AFTER_FIRST_RESUME marker must be emitted from the first-resume
+    //    trampoline in thread_state.rs after post_switch_restore returns.
+    #[test]
+    fn stage139_proof_cr3_after_first_resume_in_thread_state() {
+        assert!(
+            THREAD_STATE_SRC.contains("D6_PROOF_CR3_AFTER_FIRST_RESUME"),
+            "thread_state.rs trampoline must emit D6_PROOF_CR3_AFTER_FIRST_RESUME"
+        );
+        // Must appear after D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE.
+        let restore_done_pos = THREAD_STATE_SRC
+            .find("D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE")
+            .expect("D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE must be present");
+        let after_pos = THREAD_STATE_SRC
+            .find("D6_PROOF_CR3_AFTER_FIRST_RESUME")
+            .expect("D6_PROOF_CR3_AFTER_FIRST_RESUME must be present");
+        assert!(
+            restore_done_pos < after_pos,
+            "D6_PROOF_CR3_AFTER_FIRST_RESUME must come after D6_FIRST_RESUME_POST_SWITCH_RESTORE_DONE"
+        );
+    }
+
+    // 3. D6_PROOF_CR3_AFTER_SWITCH_BACK marker must be emitted at POINT 2 in
+    //    trap_entry.rs after switch_frames returns.
+    #[test]
+    fn stage139_proof_cr3_after_switch_back_in_trap_entry() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_PROOF_CR3_AFTER_SWITCH_BACK"),
+            "trap_entry.rs must emit D6_PROOF_CR3_AFTER_SWITCH_BACK at POINT 2"
+        );
+        // Must appear after D6_SWITCH_FRAMES_RETURNED_UNLOCKED.
+        let returned_pos = TRAP_ENTRY_SRC
+            .find("D6_SWITCH_FRAMES_RETURNED_UNLOCKED")
+            .expect("D6_SWITCH_FRAMES_RETURNED_UNLOCKED must be present");
+        let after_pos = TRAP_ENTRY_SRC
+            .find("D6_PROOF_CR3_AFTER_SWITCH_BACK")
+            .expect("D6_PROOF_CR3_AFTER_SWITCH_BACK must be present");
+        assert!(
+            returned_pos < after_pos,
+            "D6_PROOF_CR3_AFTER_SWITCH_BACK must come after D6_SWITCH_FRAMES_RETURNED_UNLOCKED"
+        );
+    }
+
+    // 4. D6_PROOF_CR3_CLEANUP_RESTORE marker must be emitted inside
+    //    d6_emit_proof_cleanup_arch_markers in exec_state.rs.
+    #[test]
+    fn stage139_proof_cr3_cleanup_restore_in_exec_state() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_PROOF_CR3_CLEANUP_RESTORE"),
+            "exec_state.rs d6_emit_proof_cleanup_arch_markers must emit D6_PROOF_CR3_CLEANUP_RESTORE"
+        );
+    }
+
+    // 5. D6_PROOF_CR3_CLEANUP_OK marker must be emitted after the restore.
+    #[test]
+    fn stage139_proof_cr3_cleanup_ok_in_exec_state() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_PROOF_CR3_CLEANUP_OK"),
+            "exec_state.rs d6_emit_proof_cleanup_arch_markers must emit D6_PROOF_CR3_CLEANUP_OK"
+        );
+        // RESTORE must precede OK.
+        let restore_pos = EXEC_STATE_SRC
+            .find("D6_PROOF_CR3_CLEANUP_RESTORE")
+            .expect("D6_PROOF_CR3_CLEANUP_RESTORE must be present");
+        let ok_pos = EXEC_STATE_SRC
+            .find("D6_PROOF_CR3_CLEANUP_OK")
+            .expect("D6_PROOF_CR3_CLEANUP_OK must be present");
+        assert!(
+            restore_pos < ok_pos,
+            "D6_PROOF_CR3_CLEANUP_RESTORE must precede D6_PROOF_CR3_CLEANUP_OK"
+        );
+    }
+
+    // 6. The CR3 restore must call switch_address_space in the cleanup function
+    //    so that both the hardware CR3 and the HAL active_asid are updated.
+    #[test]
+    fn stage139_cleanup_restore_calls_switch_address_space() {
+        // Find d6_emit_proof_cleanup_arch_markers function body.
+        let fn_start = EXEC_STATE_SRC
+            .find("fn d6_emit_proof_cleanup_arch_markers")
+            .expect("d6_emit_proof_cleanup_arch_markers must be present");
+        let fn_body = &EXEC_STATE_SRC[fn_start..];
+        assert!(
+            fn_body.contains("switch_address_space"),
+            "d6_emit_proof_cleanup_arch_markers must call switch_address_space to restore hardware CR3"
+        );
+        assert!(
+            fn_body.contains("D6_PROOF_CR3_CLEANUP_RESTORE"),
+            "d6_emit_proof_cleanup_arch_markers must emit D6_PROOF_CR3_CLEANUP_RESTORE"
+        );
+    }
+
+    // 7. SYSCALL_COUNT and Syscall::VARIANT_COUNT must remain unchanged.
+    #[test]
+    fn stage139_syscall_count_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 139 must not change SYSCALL_COUNT");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 139 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}

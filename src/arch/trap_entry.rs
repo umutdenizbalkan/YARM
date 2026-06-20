@@ -327,6 +327,15 @@ pub fn handle_trap_entry_shared(
                 plan.outgoing_tid,
                 plan.incoming_tid
             );
+            // Stage 139: hardware CR3 snapshot at POINT 2, before proof cleanup
+            // restores the correct address space.  The proof path does not touch
+            // CR3 in switch_frames or the trampoline, so this captures any
+            // divergence introduced by the proof's lock-drop switch.
+            #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+            {
+                let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+                crate::yarm_log!("D6_PROOF_CR3_AFTER_SWITCH_BACK cr3=0x{:016x}", hw_cr3);
+            }
             let is_proof_done =
                 if crate::kernel::boot::d6_controlled_switch_proof_take_pending_done() {
                     crate::kernel::boot::d6_controlled_switch_proof_mark_done();
