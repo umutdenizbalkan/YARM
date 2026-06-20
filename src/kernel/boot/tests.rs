@@ -37776,3 +37776,160 @@ mod stage137_demand_pf_loop_fix {
         );
     }
 }
+
+// ── Stage 138 — x86_64 #PF trap-frame layout and hardware CR3 PTE state ──────
+#[cfg(test)]
+mod stage138_pf_frame_and_hw_pte_proof {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    #[cfg(target_arch = "x86_64")]
+    const DTABLES_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    #[cfg(target_arch = "x86_64")]
+    const TRAP_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    // 1. x86_64 CPL3 #PF interrupt frame layout: interrupt_frame pointer points
+    //    to RIP; error_code is at -8, then RIP/CS/RFLAGS/RSP/SS in order.
+    //    Stage 138 decodes frame words as w0=error_code, w1=rip, …, w4=user_rsp.
+    //    Verify that descriptor_tables.rs encodes this layout in the diagnostic.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stage138_frame_decode_layout_in_source() {
+        // emit_pf_frame_hw_diag must be present
+        assert!(
+            DTABLES_SRC.contains("emit_pf_frame_hw_diag"),
+            "descriptor_tables.rs must define emit_pf_frame_hw_diag"
+        );
+        // error_code is at frame_ptr - 1 (i.e. -8 bytes from rip)
+        assert!(
+            DTABLES_SRC.contains("frame_ptr.sub(1)"),
+            "error_code must be read as frame_ptr.sub(1) in emit_pf_frame_hw_diag"
+        );
+        // user_rsp is at frame_ptr + 3 (offset +24, the 4th CPU-pushed word)
+        assert!(
+            DTABLES_SRC.contains("frame_ptr.add(3)"),
+            "user_rsp must be read as frame_ptr.add(3) in emit_pf_frame_hw_diag"
+        );
+        // PAGE_FAULT_FRAME_DECODE must be emitted
+        assert!(
+            DTABLES_SRC.contains("PAGE_FAULT_FRAME_DECODE"),
+            "descriptor_tables.rs must emit PAGE_FAULT_FRAME_DECODE"
+        );
+        // PAGE_FAULT_FRAME_WORDS must be emitted
+        assert!(
+            DTABLES_SRC.contains("PAGE_FAULT_FRAME_WORDS"),
+            "descriptor_tables.rs must emit PAGE_FAULT_FRAME_WORDS"
+        );
+    }
+
+    // 2. PAGE_FAULT_RAW / PAGE_FAULT_FRAME_DECODE must use hardware-proven frame
+    //    values (decoded from the interrupt frame memory), not from cached TrapFrame
+    //    state.  The HW_REGS diagnostic must be emitted BEFORE build_trap_frame.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stage138_hw_diag_emitted_before_build_trap_frame() {
+        // emit_pf_frame_hw_diag must appear before build_trap_frame_from_saved_regs
+        // in the dispatch function.
+        let hw_diag_pos = DTABLES_SRC
+            .find("emit_pf_frame_hw_diag(fault_addr")
+            .expect("emit_pf_frame_hw_diag call site must be present");
+        let build_frame_pos = DTABLES_SRC
+            .find("build_trap_frame_from_saved_regs(regs")
+            .expect("build_trap_frame_from_saved_regs call site must be present");
+        assert!(
+            hw_diag_pos < build_frame_pos,
+            "emit_pf_frame_hw_diag must be called before build_trap_frame_from_saved_regs: hw_diag@{hw_diag_pos} build_frame@{build_frame_pos}"
+        );
+        // PAGE_FAULT_HW_REGS must be emitted by the diagnostic
+        assert!(
+            DTABLES_SRC.contains("PAGE_FAULT_HW_REGS"),
+            "descriptor_tables.rs must emit PAGE_FAULT_HW_REGS"
+        );
+    }
+
+    // 3. PAGE_FAULT_HANDLED_DEMAND must be guarded by both pte_ok (software) and
+    //    hw_demand_ok (hardware CR3 walk success) — not just software resolve.
+    #[test]
+    fn stage138_handled_demand_requires_hw_walk_ok() {
+        let handled_pos = FAULT_SRC
+            .find("PAGE_FAULT_HANDLED_DEMAND")
+            .expect("PAGE_FAULT_HANDLED_DEMAND must be present in fault_state.rs");
+        // Find the nearest preceding if-guard
+        let before_handled = &FAULT_SRC[..handled_pos];
+        // The guard must mention hw_demand_ok
+        assert!(
+            before_handled.contains("hw_demand_ok"),
+            "PAGE_FAULT_HANDLED_DEMAND must be inside an `if … hw_demand_ok` guard"
+        );
+        // Verify PAGE_FAULT_POST_DEMAND_HW_PTE_WALK precedes HANDLED_DEMAND
+        let post_walk_pos = FAULT_SRC
+            .find("PAGE_FAULT_POST_DEMAND_HW_PTE_WALK")
+            .expect("PAGE_FAULT_POST_DEMAND_HW_PTE_WALK must be present in fault_state.rs");
+        assert!(
+            post_walk_pos < handled_pos,
+            "PAGE_FAULT_POST_DEMAND_HW_PTE_WALK must precede PAGE_FAULT_HANDLED_DEMAND in source"
+        );
+    }
+
+    // 4. Hardware CR3 compare marker must be present in trap.rs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stage138_hw_cr3_compare_marker_exists() {
+        assert!(
+            TRAP_SRC.contains("PAGE_FAULT_CR3_COMPARE"),
+            "trap.rs must emit PAGE_FAULT_CR3_COMPARE"
+        );
+        // Must compare hw_cr3, active_cr3, and task_cr3
+        assert!(
+            TRAP_SRC.contains("hw_cr3"),
+            "PAGE_FAULT_CR3_COMPARE block must read hw_cr3 via inline asm"
+        );
+        assert!(
+            TRAP_SRC.contains("task_cr3"),
+            "PAGE_FAULT_CR3_COMPARE block must resolve task_cr3"
+        );
+        assert!(
+            TRAP_SRC.contains("active_cr3"),
+            "PAGE_FAULT_CR3_COMPARE block must resolve active_cr3"
+        );
+    }
+
+    // 5. Hardware PTE walk markers must exist in descriptor_tables.rs for both
+    //    the CR2 page and the RIP page.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn stage138_hw_pte_walk_markers_exist() {
+        // There must be at least two PAGE_FAULT_HW_PTE_WALK emissions (CR2 + RIP).
+        let count = DTABLES_SRC.matches("PAGE_FAULT_HW_PTE_WALK").count();
+        assert!(
+            count >= 2,
+            "descriptor_tables.rs must emit PAGE_FAULT_HW_PTE_WALK at least twice (CR2 page and RIP page), found {count}"
+        );
+        // hw_pte_walk_verbose must be called in the diagnostic function
+        assert!(
+            DTABLES_SRC.contains("hw_pte_walk_verbose"),
+            "descriptor_tables.rs must call hw_pte_walk_verbose"
+        );
+        // The post-demand walk must be in fault_state.rs
+        assert!(
+            FAULT_SRC.contains("PAGE_FAULT_POST_DEMAND_HW_PTE_WALK"),
+            "fault_state.rs must emit PAGE_FAULT_POST_DEMAND_HW_PTE_WALK"
+        );
+    }
+
+    // 6. SYSCALL_COUNT must remain 31.
+    #[test]
+    fn stage138_syscall_count_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 138 must not change SYSCALL_COUNT");
+    }
+
+    // 7. Syscall::VARIANT_COUNT must remain 23.
+    #[test]
+    fn stage138_syscall_variant_count_unchanged() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 138 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}

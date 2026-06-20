@@ -1128,6 +1128,59 @@ unsafe fn write_raw_table_entry(
     Ok(())
 }
 
+/// Stage 138: read the actual hardware CR3 register.
+/// Returns the raw CR3 value including PCID bits.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn read_hw_cr3() -> u64 {
+    let mut cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nostack, preserves_flags));
+    }
+    cr3
+}
+
+#[cfg(feature = "hosted-dev")]
+pub fn read_hw_cr3() -> u64 {
+    0
+}
+
+/// Stage 138: 4-level hardware PTE walk from an arbitrary CR3 root.
+/// Returns (pml4e, pdpte, pde, pte) raw entry values; 0 for levels not reached.
+#[cfg(all(not(feature = "hosted-dev"), not(test)))]
+pub fn hw_pte_walk_verbose(root_phys: u64, virt: u64) -> (u64, u64, u64, u64) {
+    let root = root_phys & PAGE_MASK;
+    let pml4e_raw = unsafe { read_raw_table_entry(root, pml4_index(virt)) }
+        .map(|e| e.0)
+        .unwrap_or(0);
+    if (pml4e_raw & PageTableEntry::PRESENT) == 0 {
+        return (pml4e_raw, 0, 0, 0);
+    }
+    let pdpt_phys = pml4e_raw & PTE_ADDR_MASK;
+    let pdpte_raw = unsafe { read_raw_table_entry(pdpt_phys, pdpt_index(virt)) }
+        .map(|e| e.0)
+        .unwrap_or(0);
+    if (pdpte_raw & PageTableEntry::PRESENT) == 0 || (pdpte_raw & PageTableEntry::HUGE_PAGE) != 0 {
+        return (pml4e_raw, pdpte_raw, 0, 0);
+    }
+    let pd_phys = pdpte_raw & PTE_ADDR_MASK;
+    let pde_raw = unsafe { read_raw_table_entry(pd_phys, pd_index(virt)) }
+        .map(|e| e.0)
+        .unwrap_or(0);
+    if (pde_raw & PageTableEntry::PRESENT) == 0 || (pde_raw & PageTableEntry::HUGE_PAGE) != 0 {
+        return (pml4e_raw, pdpte_raw, pde_raw, 0);
+    }
+    let pt_phys = pde_raw & PTE_ADDR_MASK;
+    let pte_raw = unsafe { read_raw_table_entry(pt_phys, pt_index(virt)) }
+        .map(|e| e.0)
+        .unwrap_or(0);
+    (pml4e_raw, pdpte_raw, pde_raw, pte_raw)
+}
+
+#[cfg(any(feature = "hosted-dev", test))]
+pub fn hw_pte_walk_verbose(_root_phys: u64, _virt: u64) -> (u64, u64, u64, u64) {
+    (0, 0, 0, 0)
+}
+
 pub fn invalidate_page(virt: VirtAddr) {
     #[cfg(feature = "hosted-dev")]
     {
