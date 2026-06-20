@@ -61,7 +61,64 @@ pub(crate) fn restore_arch_thread_state(
     if idx < MAX_CPUS {
         LAST_RESTORED_TLS_BASE[idx].store(tls.unwrap_or(0), Ordering::Relaxed);
     }
+    // Stage 140: enforce hw CR3 == task_cr3 before the assembly stub does IRET.
+    if let Some(tid) = kernel.current_tid() {
+        if tid != 0 {
+            if let Some(task_asid) = kernel.task_asid(tid) {
+                ensure_user_return_cr3(kernel, tid, task_asid);
+            }
+        }
+    }
     Ok(())
+}
+
+/// Enforce hardware CR3 == task_cr3 immediately before a ring-3 return.
+/// Reads the actual hardware CR3 (not HAL bookkeeping) and force-writes it when
+/// there is a mismatch. No-op in normal runs; repairs the invariant that D6
+/// proof switches can break.
+pub(crate) fn ensure_user_return_cr3(
+    kernel: &KernelState,
+    tid: u64,
+    task_asid: crate::kernel::vm::Asid,
+) {
+    #[cfg(not(feature = "hosted-dev"))]
+    {
+        let task_cr3 = match crate::arch::x86_64::page_table::cr3_for_asid(task_asid) {
+            Some(c) => c,
+            None => return,
+        };
+        let active_asid_num = kernel.d6_diag_active_asid_num();
+        let active_asid = crate::kernel::vm::Asid(active_asid_num as u16);
+        let active_cr3 =
+            crate::arch::x86_64::page_table::cr3_for_asid(active_asid).unwrap_or(u64::MAX);
+        let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+        crate::yarm_log!(
+            "USER_CR3_PRE_IRET_CHECK tid={} task_asid={} task_cr3=0x{:016x} active_asid={} active_cr3=0x{:016x} hw_cr3=0x{:016x}",
+            tid,
+            task_asid.0,
+            task_cr3,
+            active_asid.0,
+            active_cr3,
+            hw_cr3,
+        );
+        if hw_cr3 != task_cr3 {
+            crate::yarm_log!(
+                "USER_CR3_PRE_IRET_SWITCH tid={} from=0x{:016x} to=0x{:016x}",
+                tid,
+                hw_cr3,
+                task_cr3,
+            );
+            crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid);
+        }
+        let final_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+        crate::yarm_log!(
+            "USER_CR3_PRE_IRET_OK tid={} hw_cr3=0x{:016x}",
+            tid,
+            final_cr3
+        );
+    }
+    #[cfg(feature = "hosted-dev")]
+    let _ = (kernel, tid, task_asid);
 }
 
 #[cfg(not(feature = "hosted-dev"))]

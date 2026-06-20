@@ -38066,3 +38066,166 @@ mod stage139_d6_proof_cr3_cleanup {
         );
     }
 }
+
+// ── Stage 140 — enforce hw CR3 == task_cr3 before every x86_64 ring-3 return ─
+#[cfg(test)]
+mod stage140_user_return_cr3 {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const TRAP_RS_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const BOOT_RS_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const PAGE_TABLE_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    // 1. The x86_64 return-from-trap path (restore_arch_thread_state) must call
+    //    ensure_user_return_cr3 before the assembly stub does IRET.
+    #[test]
+    fn stage140_restore_arch_calls_ensure_user_return_cr3() {
+        let fn_start = TRAP_RS_SRC
+            .find("fn restore_arch_thread_state")
+            .expect("restore_arch_thread_state must be present in trap.rs");
+        let fn_body = &TRAP_RS_SRC[fn_start..];
+        assert!(
+            fn_body.contains("ensure_user_return_cr3"),
+            "restore_arch_thread_state must call ensure_user_return_cr3 before returning"
+        );
+    }
+
+    // 1b. The initial-dispatch path (enter_dispatched_user_task_if_available in
+    //     boot.rs) must also call ensure_user_return_cr3 before enter_user_mode_iret.
+    #[test]
+    fn stage140_enter_dispatched_calls_ensure_user_return_cr3() {
+        let fn_start = BOOT_RS_SRC
+            .find("fn enter_dispatched_user_task_if_available")
+            .expect("enter_dispatched_user_task_if_available must be present in boot.rs");
+        let fn_body = &BOOT_RS_SRC[fn_start..];
+        assert!(
+            fn_body.contains("ensure_user_return_cr3"),
+            "enter_dispatched_user_task_if_available must call ensure_user_return_cr3 before IRET"
+        );
+        // ensure_user_return_cr3 must appear before enter_user_mode_iret in source order.
+        let ensure_pos = fn_body
+            .find("ensure_user_return_cr3")
+            .expect("ensure_user_return_cr3 in enter_dispatched");
+        let iret_pos = fn_body
+            .find("enter_user_mode_iret")
+            .expect("enter_user_mode_iret in enter_dispatched");
+        assert!(
+            ensure_pos < iret_pos,
+            "ensure_user_return_cr3 must precede enter_user_mode_iret in boot.rs"
+        );
+    }
+
+    // 2. ensure_user_return_cr3 must read hardware CR3 and compare it to task_cr3.
+    #[test]
+    fn stage140_ensure_compares_hw_cr3_to_task_cr3() {
+        let fn_start = TRAP_RS_SRC
+            .find("fn ensure_user_return_cr3")
+            .expect("ensure_user_return_cr3 must be defined in trap.rs");
+        let fn_body = &TRAP_RS_SRC[fn_start..];
+        assert!(
+            fn_body.contains("read_hw_cr3"),
+            "ensure_user_return_cr3 must call read_hw_cr3() to read the hardware CR3"
+        );
+        assert!(
+            fn_body.contains("task_cr3"),
+            "ensure_user_return_cr3 must compute task_cr3 from cr3_for_asid"
+        );
+        assert!(
+            fn_body.contains("hw_cr3 != task_cr3"),
+            "ensure_user_return_cr3 must compare hw_cr3 against task_cr3"
+        );
+    }
+
+    // 3. The mismatch path must force-write CR3 via write_cr3_for_asid (bypassing
+    //    HAL active_asid short-circuit), not via switch_address_space.
+    #[test]
+    fn stage140_mismatch_uses_write_cr3_for_asid_not_hal() {
+        let fn_start = TRAP_RS_SRC
+            .find("fn ensure_user_return_cr3")
+            .expect("ensure_user_return_cr3 must be defined in trap.rs");
+        let fn_body = &TRAP_RS_SRC[fn_start..];
+        assert!(
+            fn_body.contains("write_cr3_for_asid"),
+            "mismatch path must call write_cr3_for_asid to force-write CR3"
+        );
+        // write_cr3_for_asid must exist in page_table.rs and bypass activate_asid.
+        assert!(
+            PAGE_TABLE_SRC.contains("fn write_cr3_for_asid"),
+            "write_cr3_for_asid must be defined in page_table.rs"
+        );
+        assert!(
+            !PAGE_TABLE_SRC
+                .find("fn write_cr3_for_asid")
+                .map(|p| PAGE_TABLE_SRC[p..].contains("activate_asid"))
+                .unwrap_or(false),
+            "write_cr3_for_asid must NOT call activate_asid (that has the RSP/RIP safety check)"
+        );
+    }
+
+    // 4. All three diagnostic markers must exist in trap.rs.
+    #[test]
+    fn stage140_diagnostic_markers_exist() {
+        assert!(
+            TRAP_RS_SRC.contains("USER_CR3_PRE_IRET_CHECK"),
+            "trap.rs must contain USER_CR3_PRE_IRET_CHECK marker"
+        );
+        assert!(
+            TRAP_RS_SRC.contains("USER_CR3_PRE_IRET_SWITCH"),
+            "trap.rs must contain USER_CR3_PRE_IRET_SWITCH marker"
+        );
+        assert!(
+            TRAP_RS_SRC.contains("USER_CR3_PRE_IRET_OK"),
+            "trap.rs must contain USER_CR3_PRE_IRET_OK marker"
+        );
+        // CHECK must precede SWITCH must precede OK in source order.
+        let check_pos = TRAP_RS_SRC
+            .find("USER_CR3_PRE_IRET_CHECK")
+            .expect("CHECK present");
+        let switch_pos = TRAP_RS_SRC
+            .find("USER_CR3_PRE_IRET_SWITCH")
+            .expect("SWITCH present");
+        let ok_pos = TRAP_RS_SRC
+            .find("USER_CR3_PRE_IRET_OK")
+            .expect("OK present");
+        assert!(
+            check_pos < switch_pos,
+            "CHECK must precede SWITCH in source"
+        );
+        assert!(switch_pos < ok_pos, "SWITCH must precede OK in source");
+    }
+
+    // 5. D6_PROOF_CR3_CLEANUP_OK from Stage 139 must remain present.
+    #[test]
+    fn stage140_d6_proof_cr3_cleanup_ok_still_present() {
+        assert!(
+            EXEC_STATE_SRC.contains("D6_PROOF_CR3_CLEANUP_OK"),
+            "Stage 139 D6_PROOF_CR3_CLEANUP_OK must remain in exec_state.rs"
+        );
+    }
+
+    // 6. PAGE_FAULT_HANDLED_DEMAND must still be gated on the hardware PTE walk.
+    #[test]
+    fn stage140_handled_demand_still_gated_on_hw_walk() {
+        let handled_pos = FAULT_SRC
+            .find("PAGE_FAULT_HANDLED_DEMAND")
+            .expect("PAGE_FAULT_HANDLED_DEMAND must remain in fault_state.rs");
+        let before = &FAULT_SRC[..handled_pos];
+        assert!(
+            before.contains("hw_demand_ok"),
+            "PAGE_FAULT_HANDLED_DEMAND must remain inside an hw_demand_ok gate"
+        );
+    }
+
+    // 7-8. Syscall ABI must not change.
+    #[test]
+    fn stage140_syscall_counts_unchanged() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 140 must not change SYSCALL_COUNT");
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 140 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}
