@@ -753,6 +753,63 @@ rpi5_hh_retained_marker!(RPI5_HH_READ_VBAR_BEGIN_MARKER, b"RPI5_HH_READ_VBAR_BEG
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(
+    RPI5_HH_READ_VBAR_CAPTURED_MARKER,
+    b"RPI5_HH_READ_VBAR_CAPTURED"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_VBAR_HEX_BEGIN_MARKER, b"RPI5_HH_VBAR_HEX_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_VBAR_HEX_DIGIT_BEGIN_MARKER,
+    b"RPI5_HH_VBAR_HEX_DIGIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_VBAR_HEX_DIGIT_DONE_MARKER,
+    b"RPI5_HH_VBAR_HEX_DIGIT_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH_VBAR_HEX_DONE_MARKER, b"RPI5_HH_VBAR_HEX_DONE");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_VBAR_HEX_FAILED_MARKER,
+    b"RPI5_HH_VBAR_HEX_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH3_VBAR_HEX_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH3_FAULT_BOUNDARY reason=vbar_hex_output"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
     RPI5_HH_READ_VBAR_DONE_MARKER,
     b"RPI5_HH_READ_VBAR_DONE value=0x"
 );
@@ -1136,6 +1193,18 @@ fn rpi5_hh_sp_hex_fail(reason: &[u8]) -> ! {
     let _ = rpi5_hh_write_bytes(&RPI5_HH_SP_HEX_FAILED_MARKER);
     let _ = rpi5_hh_write_line(reason);
     let _ = rpi5_hh_write_line(&RPI5_HH3_SP_HEX_FAULT_BOUNDARY_MARKER);
+    rpi5_hh_halt()
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh_vbar_hex_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(&RPI5_HH_VBAR_HEX_FAILED_MARKER);
+    let _ = rpi5_hh_write_line(reason);
+    let _ = rpi5_hh_write_line(&RPI5_HH3_VBAR_HEX_FAULT_BOUNDARY_MARKER);
     rpi5_hh_halt()
 }
 
@@ -1612,9 +1681,93 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
     unsafe {
         core::arch::asm!("mrs {vbar}, VBAR_EL1", vbar = out(reg) vbar, options(nomem, nostack, preserves_flags));
     }
-    if !rpi5_hh_write_hex_line(&RPI5_HH_READ_VBAR_DONE_MARKER, vbar) {
-        rpi5_hh_fail(b"read_vbar_done_uart_timeout");
+    if !rpi5_hh_write_line(&RPI5_HH_READ_VBAR_CAPTURED_MARKER) {
+        rpi5_hh_vbar_hex_fail(b"vbar_captured_marker_uart_timeout");
     }
+
+    const HH_VBAR_HEX_TX_POLL_LIMIT: usize = 0x1_0000;
+    let hh_vbar_hex_data = RPI5_HH_UART_VIRT as *mut u32;
+    let hh_vbar_hex_flags = (RPI5_HH_UART_VIRT + 0x18) as *const u32;
+    macro_rules! rpi5_hh_vbar_hex_write_byte {
+        ($byte:expr, $reason:literal) => {{
+            let mut poll = 0usize;
+            while poll < HH_VBAR_HEX_TX_POLL_LIMIT {
+                if unsafe { core::ptr::read_volatile(hh_vbar_hex_flags) } & (1 << 5) == 0 {
+                    break;
+                }
+                poll += 1;
+            }
+            if poll == HH_VBAR_HEX_TX_POLL_LIMIT {
+                rpi5_hh_vbar_hex_fail($reason);
+            }
+            unsafe {
+                core::ptr::write_volatile(hh_vbar_hex_data, $byte as u32);
+            }
+        }};
+    }
+
+    marker_index = 0;
+    let vbar_hex_begin = core::ptr::addr_of!(RPI5_HH_VBAR_HEX_BEGIN_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_VBAR_HEX_BEGIN_MARKER.len() {
+        let byte = unsafe { core::ptr::read(vbar_hex_begin.add(marker_index)) };
+        rpi5_hh_vbar_hex_write_byte!(byte, b"vbar_hex_begin_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_vbar_hex_write_byte!(b'\r', b"vbar_hex_begin_cr_uart_timeout");
+    rpi5_hh_vbar_hex_write_byte!(b'\n', b"vbar_hex_begin_lf_uart_timeout");
+
+    marker_index = 0;
+    let vbar_digit_begin = core::ptr::addr_of!(RPI5_HH_VBAR_HEX_DIGIT_BEGIN_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_VBAR_HEX_DIGIT_BEGIN_MARKER.len() {
+        let byte = unsafe { core::ptr::read(vbar_digit_begin.add(marker_index)) };
+        rpi5_hh_vbar_hex_write_byte!(byte, b"vbar_digit_begin_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_vbar_hex_write_byte!(b'\r', b"vbar_digit_begin_cr_uart_timeout");
+    rpi5_hh_vbar_hex_write_byte!(b'\n', b"vbar_digit_begin_lf_uart_timeout");
+
+    prefix_index = 0;
+    let vbar_prefix = core::ptr::addr_of!(RPI5_HH_READ_VBAR_DONE_MARKER).cast::<u8>();
+    while prefix_index < RPI5_HH_READ_VBAR_DONE_MARKER.len() {
+        let byte = unsafe { core::ptr::read(vbar_prefix.add(prefix_index)) };
+        rpi5_hh_vbar_hex_write_byte!(byte, b"vbar_prefix_uart_timeout");
+        prefix_index += 1;
+    }
+
+    nibble_index = 0;
+    while nibble_index < 16 {
+        let shift = 60 - nibble_index * 4;
+        let nibble = ((vbar >> shift) & 0xf) as u8;
+        let digit = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+        rpi5_hh_vbar_hex_write_byte!(digit, b"vbar_hex_digit_uart_timeout");
+        nibble_index += 1;
+    }
+    rpi5_hh_vbar_hex_write_byte!(b'\r', b"vbar_value_cr_uart_timeout");
+    rpi5_hh_vbar_hex_write_byte!(b'\n', b"vbar_value_lf_uart_timeout");
+
+    marker_index = 0;
+    let vbar_digit_done = core::ptr::addr_of!(RPI5_HH_VBAR_HEX_DIGIT_DONE_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_VBAR_HEX_DIGIT_DONE_MARKER.len() {
+        let byte = unsafe { core::ptr::read(vbar_digit_done.add(marker_index)) };
+        rpi5_hh_vbar_hex_write_byte!(byte, b"vbar_digit_done_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_vbar_hex_write_byte!(b'\r', b"vbar_digit_done_cr_uart_timeout");
+    rpi5_hh_vbar_hex_write_byte!(b'\n', b"vbar_digit_done_lf_uart_timeout");
+
+    marker_index = 0;
+    let vbar_hex_done = core::ptr::addr_of!(RPI5_HH_VBAR_HEX_DONE_MARKER).cast::<u8>();
+    while marker_index < RPI5_HH_VBAR_HEX_DONE_MARKER.len() {
+        let byte = unsafe { core::ptr::read(vbar_hex_done.add(marker_index)) };
+        rpi5_hh_vbar_hex_write_byte!(byte, b"vbar_hex_done_uart_timeout");
+        marker_index += 1;
+    }
+    rpi5_hh_vbar_hex_write_byte!(b'\r', b"vbar_hex_done_cr_uart_timeout");
+    rpi5_hh_vbar_hex_write_byte!(b'\n', b"vbar_hex_done_lf_uart_timeout");
 
     if !rpi5_hh_write_line(&RPI5_HH_READ_TTBR_BEGIN_MARKER) {
         rpi5_hh_halt();
