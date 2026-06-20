@@ -1,16 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! Stage 150: IPC frame argument codec helpers.
+//! Stage 150/151: IPC frame argument codec helpers — pure ABI/frame codec only.
 //!
-//! Pure encoding/decoding functions for IPC syscall ABI arguments. These
-//! operate only on `TrapFrame` and `Message` values — no kernel state
-//! mutation, no lock acquisition, no IPC ordering dependency.
+//! ## Module boundary invariants (audited Stage 151)
+//!
+//! This module is **pure IPC ABI/frame codec only**. Specifically:
+//!
+//! - **No kernel-state mutation.** Functions take `&KernelState` at most for
+//!   ABI argument reads; no `&mut KernelState` parameter appears here.
+//! - **No lock acquisition.** No rank-tagged lock (IPC, scheduler, task-state,
+//!   VM, or memory) is acquired here.
+//! - **No cap-slot materialization.** Cap-table grant, take, revoke, and
+//!   received-message cap materialization remain in `syscall.rs` / `ipc.rs`.
+//! - **No VM or shared-memory mapping.** Shared-region mapping and all VM
+//!   mapping helpers remain in `syscall.rs` / `ipc.rs` / `vm.rs`.
+//! - **No reply-cap lifecycle handling.** Reply-cap mint, take, and rollback
+//!   remain in `syscall.rs`.
+//! - **`syscall.rs` remains dispatch owner.** The dispatch function and the
+//!   `Syscall` enum are defined in `syscall.rs`; this module contains no
+//!   dispatch logic.
+//! - **`syscall/ipc.rs` remains stateful IPC implementation owner.** The
+//!   blocking-send, blocking-recv, call, reply, and waiter-delivery state
+//!   machines live in `ipc.rs` and `syscall.rs`, not here.
 //!
 //! Mechanically extracted from `syscall.rs` with zero behavior change.
-//! `syscall.rs` re-imports all items so existing call sites (split-recv
-//! seam, `dispatch`, `complete_blocked_recv_for_waiter`, and `ipc.rs`) are
-//! unaffected.
+//! `syscall.rs` re-imports all items so existing call sites in the
+//! split-recv seam, the dispatch path, the waiter-delivery path, and
+//! `ipc.rs` are unaffected.
 
 use super::{
     OPCODE_INLINE, SYSCALL_ARG_INLINE_PAYLOAD1, SYSCALL_ARG_TRANSFER_CAP, SYSCALL_NO_TRANSFER_CAP,
