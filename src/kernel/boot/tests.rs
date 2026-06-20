@@ -39217,7 +39217,9 @@ mod stage146_ipc_module_extraction {
         );
     }
 
-    // 5. Shared helpers that stayed must remain in syscall.rs as pub(super).
+    // 5. [I] helpers that must stay in syscall.rs post-Stage-150.
+    //    Note: encode_transfer_cap_ret, should_strip_inline_opcode_prefix,
+    //    sender_tid_to_ret moved to ipc_abi.rs in Stage 150 and re-imported here.
     #[test]
     fn stage146_shared_helpers_remain_in_syscall_rs() {
         assert!(
@@ -39225,20 +39227,22 @@ mod stage146_ipc_module_extraction {
             "try_endpoint_split_recv must remain pub(super) in syscall.rs"
         );
         assert!(
-            SYSCALL_SRC.contains("pub(super) fn encode_transfer_cap_ret("),
-            "encode_transfer_cap_ret must remain pub(super) in syscall.rs"
-        );
-        assert!(
-            SYSCALL_SRC.contains("pub(super) fn should_strip_inline_opcode_prefix("),
-            "should_strip_inline_opcode_prefix must remain pub(super) in syscall.rs"
-        );
-        assert!(
             SYSCALL_SRC.contains("pub(super) fn clear_blocked_recv_state("),
             "clear_blocked_recv_state must remain pub(super) in syscall.rs"
         );
+        // encode_transfer_cap_ret, should_strip_inline_opcode_prefix, sender_tid_to_ret
+        // moved to ipc_abi.rs in Stage 150; accessible via private re-import.
         assert!(
-            SYSCALL_SRC.contains("pub(super) fn sender_tid_to_ret("),
-            "sender_tid_to_ret must remain pub(super) in syscall.rs"
+            SYSCALL_SRC.contains("use self::ipc_abi::{"),
+            "ipc_abi functions must be re-imported in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("encode_transfer_cap_ret"),
+            "encode_transfer_cap_ret must be accessible from syscall.rs namespace"
+        );
+        assert!(
+            SYSCALL_SRC.contains("sender_tid_to_ret"),
+            "sender_tid_to_ret must be accessible from syscall.rs namespace"
         );
     }
 
@@ -39796,13 +39800,13 @@ mod stage148_decomposition_map {
         );
     }
 
-    // 10. Decomposition map comment is present in syscall.rs (updated by Stage 149).
+    // 10. Decomposition map comment is present in syscall.rs (updated by Stage 150).
     #[test]
     fn stage148_decomposition_map_comment_present() {
-        // Stage 149 updated the header to 145–149; 148 marker no longer present.
+        // Stage 150 updated the header to 145–150; earlier markers no longer present.
         assert!(
-            SYSCALL_SRC.contains("Stage 102/145\u{2013}149"),
-            "Stage 148/149 decomposition map comment must be present in syscall.rs"
+            SYSCALL_SRC.contains("Stage 102/145\u{2013}150"),
+            "Stage 148–150 decomposition map comment must be present in syscall.rs"
         );
         assert!(
             SYSCALL_SRC.contains("[D] dispatch-owned"),
@@ -39986,6 +39990,193 @@ mod stage149_helpers_extraction {
         assert!(
             HELPERS_SRC.contains("[S] group"),
             "helpers.rs module doc must identify the [S] group"
+        );
+    }
+}
+
+// Stage 150: IPC frame ABI codec extraction into syscall/ipc_abi.rs.
+//
+// Guard tests verify:
+// - ipc_abi.rs declared as a module in syscall.rs
+// - the five functions defined in ipc_abi.rs with pub(super) visibility
+// - their function bodies absent from syscall.rs
+// - syscall.rs re-imports them so split-recv, dispatch, and ipc.rs callers work
+// - ipc.rs still imports them via super:: (no duplication)
+// - dispatch ownership invariants unchanged
+// - D6/CR3/PF markers still present
+mod stage150_ipc_abi_extraction {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_ABI_SRC: &str = include_str!("../syscall/ipc_abi.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+
+    // 1. ipc_abi.rs is declared as a module in syscall.rs.
+    #[test]
+    fn stage150_ipc_abi_mod_declared() {
+        assert!(
+            SYSCALL_SRC.contains("mod ipc_abi;"),
+            "mod ipc_abi must be declared in syscall.rs"
+        );
+    }
+
+    // 2. All five IPC ABI codec functions are defined in ipc_abi.rs.
+    #[test]
+    fn stage150_codec_functions_in_ipc_abi() {
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn sender_tid_to_ret("),
+            "sender_tid_to_ret must be pub(super) in ipc_abi.rs"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn transfer_cap_arg("),
+            "transfer_cap_arg must be pub(super) in ipc_abi.rs"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn decode_ipc_send_timeout_ticks("),
+            "decode_ipc_send_timeout_ticks must be pub(super) in ipc_abi.rs"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn encode_transfer_cap_ret("),
+            "encode_transfer_cap_ret must be pub(super) in ipc_abi.rs"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn should_strip_inline_opcode_prefix("),
+            "should_strip_inline_opcode_prefix must be pub(super) in ipc_abi.rs"
+        );
+    }
+
+    // 3. Function bodies are absent from syscall.rs (moved to ipc_abi.rs).
+    #[test]
+    fn stage150_codec_bodies_removed_from_syscall_rs() {
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn sender_tid_to_ret("),
+            "sender_tid_to_ret function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn transfer_cap_arg("),
+            "transfer_cap_arg function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn decode_ipc_send_timeout_ticks("),
+            "decode_ipc_send_timeout_ticks function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn encode_transfer_cap_ret("),
+            "encode_transfer_cap_ret function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn should_strip_inline_opcode_prefix("),
+            "should_strip_inline_opcode_prefix function body must not be in syscall.rs"
+        );
+    }
+
+    // 4. syscall.rs re-imports ipc_abi functions so callers in the same file
+    //    (split-recv seam, dispatch) still compile unchanged.
+    #[test]
+    fn stage150_ipc_abi_reimported_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("use self::ipc_abi::{"),
+            "ipc_abi functions must be re-imported into syscall.rs namespace"
+        );
+        assert!(
+            SYSCALL_SRC.contains("encode_transfer_cap_ret,") || SYSCALL_SRC.contains("encode_transfer_cap_ret}"),
+            "encode_transfer_cap_ret must appear in the ipc_abi re-import"
+        );
+        assert!(
+            SYSCALL_SRC.contains("should_strip_inline_opcode_prefix,") || SYSCALL_SRC.contains("should_strip_inline_opcode_prefix}"),
+            "should_strip_inline_opcode_prefix must appear in the ipc_abi re-import"
+        );
+    }
+
+    // 5. ipc.rs continues to import these from super:: (not redefined).
+    #[test]
+    fn stage150_ipc_still_imports_from_super() {
+        assert!(
+            IPC_SRC.contains("super::") && IPC_SRC.contains("encode_transfer_cap_ret"),
+            "ipc.rs must still import encode_transfer_cap_ret from super"
+        );
+        assert!(
+            IPC_SRC.contains("super::") && IPC_SRC.contains("should_strip_inline_opcode_prefix"),
+            "ipc.rs must still import should_strip_inline_opcode_prefix from super"
+        );
+        assert!(
+            IPC_SRC.contains("super::") && IPC_SRC.contains("sender_tid_to_ret"),
+            "ipc.rs must still import sender_tid_to_ret from super"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("fn dispatch("),
+            "ipc_abi.rs must not define any dispatch function"
+        );
+    }
+
+    // 6. ipc_abi.rs does not duplicate any ABI constants.
+    #[test]
+    fn stage150_no_abi_constant_duplication_in_ipc_abi() {
+        assert!(
+            !IPC_ABI_SRC.contains("const SYSCALL_ARG_CAP:"),
+            "ipc_abi.rs must not redefine SYSCALL_ARG_CAP"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("const SYSCALL_COUNT:"),
+            "ipc_abi.rs must not redefine SYSCALL_COUNT"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("pub const SYSCALL_NO_TRANSFER_CAP:"),
+            "ipc_abi.rs must not redefine SYSCALL_NO_TRANSFER_CAP"
+        );
+    }
+
+    // 7. pub fn dispatch() still lives only in syscall.rs.
+    #[test]
+    fn stage150_dispatch_ownership_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub fn dispatch("),
+            "pub fn dispatch must remain in syscall.rs"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("pub fn dispatch("),
+            "ipc_abi.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn dispatch("),
+            "ipc.rs must not define pub fn dispatch"
+        );
+    }
+
+    // 8. SYSCALL_COUNT and VARIANT_COUNT assertions still present.
+    #[test]
+    fn stage150_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
+            "VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 9. D6/CR3/PF diagnostic markers still present in syscall.rs.
+    #[test]
+    fn stage150_d6_markers_present() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "D6 LIVE_OFF_TRAP marker must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "D6 GLOBAL_LOCK_SLOW_PATH marker must remain in syscall.rs"
+        );
+    }
+
+    // 10. ipc_abi.rs module doc references Stage 150.
+    #[test]
+    fn stage150_ipc_abi_module_doc() {
+        assert!(
+            IPC_ABI_SRC.contains("Stage 150"),
+            "ipc_abi.rs must have a module doc referencing Stage 150"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("IPC frame"),
+            "ipc_abi.rs module doc must describe the IPC frame codec role"
         );
     }
 }
