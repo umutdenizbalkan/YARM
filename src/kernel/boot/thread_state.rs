@@ -92,10 +92,20 @@ unsafe extern "C" {
     pub(crate) fn yarm_kernel_thread_switch_trampoline() -> !;
 }
 
-/// Returns the raw instruction-pointer value of `yarm_kernel_thread_switch_trampoline`,
-/// used by the trap-entry stash drain to detect the first-resume path.
+/// Returns the instruction-pointer address to use for the first-resume switch
+/// frame.  On x86_64 this is the raw assembly shim address
+/// (`yarm_kernel_thread_switch_trampoline`) so the D6 proof COM1 markers fire
+/// before the Rust handler runs.  On non-x86_64 architectures the shim does
+/// not exist; return the Rust real handler directly.
 pub(crate) fn kernel_switch_frame_trampoline_ip() -> usize {
-    yarm_kernel_thread_switch_trampoline as *const () as usize
+    #[cfg(target_arch = "x86_64")]
+    {
+        yarm_kernel_thread_switch_trampoline as *const () as usize
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        yarm_kernel_thread_switch_trampoline_rust_real as *const () as usize
+    }
 }
 
 /// Stage 125: the first-resume raw trampoline no longer jumps directly into a
@@ -1120,7 +1130,7 @@ impl KernelState {
             tcb.kernel_context.frame.set_stack_ptr(stack_top & !0xF);
             tcb.kernel_context
                 .frame
-                .set_instruction_ptr(yarm_kernel_thread_switch_trampoline as *const () as usize);
+                .set_instruction_ptr(kernel_switch_frame_trampoline_ip());
             tcb.kernel_context.initialized = false;
             tcb.kernel_context.owns_stack = true;
             Ok(())

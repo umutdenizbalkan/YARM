@@ -38845,3 +38845,120 @@ mod stage143_live_stack_selection {
         );
     }
 }
+
+// ── Stage 144 — gate x86_64-only trampoline symbol; arch-safe kernel_switch_frame_trampoline_ip ──
+#[cfg(test)]
+mod stage144_arch_safe_trampoline_ip {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // 1. Direct references to yarm_kernel_thread_switch_trampoline (without _rust or _bridge
+    //    suffix) must only appear inside x86_64-cfg-gated blocks in thread_state.rs.
+    #[test]
+    fn stage144_trampoline_symbol_refs_are_x86_64_only() {
+        // The extern "C" declaration is gated.
+        let extern_pos = THREAD_STATE_SRC
+            .find("unsafe extern \"C\"")
+            .expect("extern block must exist");
+        let cfg_before = THREAD_STATE_SRC[..extern_pos]
+            .rfind("target_arch = \"x86_64\"")
+            .expect("extern block must be preceded by x86_64 cfg");
+        assert!(
+            THREAD_STATE_SRC[cfg_before..extern_pos].len() < 200,
+            "x86_64 cfg must be close to the extern block"
+        );
+        // The raw symbol cast must live inside the x86_64 arm of kernel_switch_frame_trampoline_ip.
+        let cast_pos = THREAD_STATE_SRC
+            .find("yarm_kernel_thread_switch_trampoline as *const () as usize")
+            .expect("raw cast must still exist in x86_64 arm");
+        let cfg_before_cast = THREAD_STATE_SRC[..cast_pos]
+            .rfind("target_arch = \"x86_64\"")
+            .expect("raw cast must be guarded by x86_64 cfg");
+        assert!(
+            THREAD_STATE_SRC[cfg_before_cast..cast_pos].len() < 200,
+            "x86_64 cfg must be close to the raw cast"
+        );
+    }
+
+    // 2. Common initialization must use kernel_switch_frame_trampoline_ip(), not the raw symbol.
+    #[test]
+    fn stage144_provision_uses_trampoline_ip_helper() {
+        let fn_start = THREAD_STATE_SRC
+            .find("fn provision_default_kernel_context")
+            .expect("provision_default_kernel_context must exist");
+        // The function spans ~50 lines; search from its start to the next `pub(crate) fn`.
+        let fn_end = THREAD_STATE_SRC[fn_start..]
+            .find("\n    pub(crate) fn release_kernel_context")
+            .map(|rel| fn_start + rel)
+            .unwrap_or(THREAD_STATE_SRC.len());
+        let fn_body = &THREAD_STATE_SRC[fn_start..fn_end];
+        assert!(
+            fn_body.contains("kernel_switch_frame_trampoline_ip()"),
+            "provision_default_kernel_context must call kernel_switch_frame_trampoline_ip()"
+        );
+        assert!(
+            !fn_body.contains("yarm_kernel_thread_switch_trampoline as *const"),
+            "provision_default_kernel_context must not reference the raw asm symbol directly"
+        );
+    }
+
+    // 3. kernel_switch_frame_trampoline_ip must have a non-x86_64 fallback path.
+    #[test]
+    fn stage144_trampoline_ip_has_non_x86_fallback() {
+        let fn_start = THREAD_STATE_SRC
+            .find("fn kernel_switch_frame_trampoline_ip()")
+            .expect("function must be defined");
+        let fn_body = &THREAD_STATE_SRC[fn_start..fn_start.saturating_add(400)];
+        assert!(
+            fn_body.contains("not(target_arch = \"x86_64\")"),
+            "kernel_switch_frame_trampoline_ip must have a non-x86_64 cfg arm"
+        );
+        assert!(
+            fn_body.contains("yarm_kernel_thread_switch_trampoline_rust_real"),
+            "non-x86_64 arm must return the Rust real handler address"
+        );
+    }
+
+    // 4. trap_entry.rs references to the raw shim must remain x86_64-gated.
+    #[test]
+    fn stage144_trap_entry_trampoline_ref_is_x86_64_gated() {
+        let raw_ref_pos = TRAP_ENTRY_SRC
+            .find("yarm_kernel_thread_switch_trampoline")
+            .expect("trap_entry.rs must reference the trampoline for the stash check");
+        let cfg_before = TRAP_ENTRY_SRC[..raw_ref_pos]
+            .rfind("target_arch = \"x86_64\"")
+            .expect("trap_entry.rs trampoline reference must be inside x86_64 cfg block");
+        assert!(
+            TRAP_ENTRY_SRC[cfg_before..raw_ref_pos].len() < 300,
+            "x86_64 cfg must precede the trampoline reference in trap_entry.rs"
+        );
+    }
+
+    // 5. D6 proof must remain x86_64/default-off.
+    #[test]
+    fn stage144_d6_proof_remains_default_off() {
+        let boot_cmdline = include_str!("../boot_command_line.rs");
+        assert!(
+            boot_cmdline.contains("d6_switch_proof: Option<bool>"),
+            "D6 proof knob must remain Option<bool> (default-off)"
+        );
+    }
+
+    // 6. SYSCALL_COUNT unchanged.
+    #[test]
+    fn stage144_syscall_count() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 144 must not change SYSCALL_COUNT");
+    }
+
+    // 7. Syscall::VARIANT_COUNT unchanged.
+    #[test]
+    fn stage144_syscall_variant_count() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 144 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}
