@@ -39586,3 +39586,240 @@ mod stage147_ipc_boundary_audit {
         );
     }
 }
+
+// Stage 148: syscall.rs decomposition map — structural guard tests.
+//
+// These tests verify the static decomposition invariants established by Stage 148:
+// - All 8 submodules declared in syscall.rs
+// - No submodule defines a competing dispatch function
+// - Shared cross-boundary helpers remain in syscall.rs
+// - SYSCALL_COUNT==31 and VARIANT_COUNT==23 assertions present
+// - No ABI constants duplicated in submodules
+// - D6/CR3/PF diagnostic markers still present
+mod stage148_decomposition_map {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const CAP_SRC: &str = include_str!("../syscall/cap.rs");
+    const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
+    const INITRAMFS_SRC: &str = include_str!("../syscall/initramfs.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const RECV_SHARED_V3_SRC: &str = include_str!("../syscall/recv_shared_v3.rs");
+    const SCHED_SRC: &str = include_str!("../syscall/sched.rs");
+    const VM_SRC: &str = include_str!("../syscall/vm.rs");
+
+    // 1. All 8 submodule declarations are present in syscall.rs.
+    #[test]
+    fn stage148_all_submodules_declared() {
+        assert!(
+            SYSCALL_SRC.contains("mod cap;"),
+            "mod cap must be declared in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod debug;"),
+            "mod debug must be declared in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod initramfs;"),
+            "mod initramfs must be declared in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod ipc;"),
+            "mod ipc must be declared in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod process;"),
+            "mod process must be declared in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod recv_shared_v3;"),
+            "mod recv_shared_v3 must be declared in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod sched;"),
+            "mod sched must be declared in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("mod vm;"),
+            "mod vm must be declared in syscall.rs"
+        );
+    }
+
+    // 2. No submodule defines a competing pub fn dispatch().
+    #[test]
+    fn stage148_no_submodule_defines_dispatch() {
+        assert!(
+            !CAP_SRC.contains("pub fn dispatch("),
+            "cap.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !DEBUG_SRC.contains("pub fn dispatch("),
+            "debug.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !INITRAMFS_SRC.contains("pub fn dispatch("),
+            "initramfs.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn dispatch("),
+            "ipc.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !PROCESS_SRC.contains("pub fn dispatch("),
+            "process.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !RECV_SHARED_V3_SRC.contains("pub fn dispatch("),
+            "recv_shared_v3.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !SCHED_SRC.contains("pub fn dispatch("),
+            "sched.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !VM_SRC.contains("pub fn dispatch("),
+            "vm.rs must not define pub fn dispatch"
+        );
+    }
+
+    // 3. pub fn dispatch() is owned by syscall.rs.
+    #[test]
+    fn stage148_dispatch_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub fn dispatch("),
+            "pub fn dispatch must remain in syscall.rs"
+        );
+    }
+
+    // 4. SYSCALL_COUNT == 31 compile-time assertion is present in syscall.rs.
+    #[test]
+    fn stage148_syscall_count_assertion() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must be 31 in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[(); SYSCALL_COUNT] = [(); 31]"),
+            "compile-time SYSCALL_COUNT==31 assertion must be in syscall.rs"
+        );
+    }
+
+    // 5. VARIANT_COUNT == 23 compile-time declaration is present in syscall.rs.
+    #[test]
+    fn stage148_variant_count_declaration() {
+        assert!(
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
+            "VARIANT_COUNT must be 23 in syscall.rs"
+        );
+    }
+
+    // 6. Shared cross-boundary helpers remain in syscall.rs.
+    #[test]
+    fn stage148_shared_helpers_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn validate_user_region("),
+            "validate_user_region must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn round_up_page("),
+            "round_up_page must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("),
+            "complete_blocked_recv_for_waiter must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
+            "materialize_received_message_cap must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn try_endpoint_split_recv("),
+            "try_endpoint_split_recv must remain in syscall.rs"
+        );
+    }
+
+    // 7. Split-recv seam helpers remain in syscall.rs.
+    #[test]
+    fn stage148_split_recv_seam_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn try_split_recv_queued_plain_into_frame_locked("),
+            "try_split_recv_queued_plain_into_frame_locked must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked("),
+            "try_split_recv_queued_plain_with_snapshot_locked must remain in syscall.rs"
+        );
+    }
+
+    // 8. ABI constants are not duplicated in any submodule.
+    #[test]
+    fn stage148_no_abi_constant_duplication() {
+        for src in [
+            CAP_SRC,
+            DEBUG_SRC,
+            INITRAMFS_SRC,
+            PROCESS_SRC,
+            RECV_SHARED_V3_SRC,
+            SCHED_SRC,
+            VM_SRC,
+        ] {
+            assert!(
+                !src.contains("const SYSCALL_ARG_CAP:"),
+                "submodule must not redefine SYSCALL_ARG_CAP"
+            );
+            assert!(
+                !src.contains("const SYSCALL_ARG_PTR:"),
+                "submodule must not redefine SYSCALL_ARG_PTR"
+            );
+            assert!(
+                !src.contains("const SYSCALL_ARG_TRANSFER_CAP:"),
+                "submodule must not redefine SYSCALL_ARG_TRANSFER_CAP"
+            );
+        }
+    }
+
+    // 9. D6/CR3/PF diagnostic markers still present in syscall.rs.
+    #[test]
+    fn stage148_d6_cr3_pf_markers_present() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "D6 LIVE_OFF_TRAP marker must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: SPLIT_FAST_PATH_ONLY"),
+            "D6 SPLIT_FAST_PATH_ONLY marker must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "D6 GLOBAL_LOCK_SLOW_PATH marker must remain in syscall.rs"
+        );
+    }
+
+    // 10. Decomposition map comment is present in syscall.rs.
+    #[test]
+    fn stage148_decomposition_map_comment_present() {
+        assert!(
+            SYSCALL_SRC.contains("Stage 102/145\u{2013}148"),
+            "Stage 148 decomposition map comment must be present in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[D] dispatch-owned"),
+            "decomposition map must include [D] dispatch-owned classification"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[S] shared cross-boundary helper"),
+            "decomposition map must include [S] shared cross-boundary helper classification"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[I] IPC cross-boundary"),
+            "decomposition map must include [I] IPC cross-boundary classification"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[R] split-recv seam"),
+            "decomposition map must include [R] split-recv seam classification"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[X] future extract"),
+            "decomposition map must include [X] future extract classification"
+        );
+    }
+}

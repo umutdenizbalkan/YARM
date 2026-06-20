@@ -80,12 +80,41 @@ const INITRAMFS_READ_CHUNK_TRACE: bool = false;
 /// Temporary Phase 2B bridge constant — replace with page-cap grant in Phase 3.
 const PM_BOOTSTRAP_TID: u64 = 3;
 
-// ── Stage 102: mechanical syscall decomposition (zero behavior change) ───────
-// Child modules split from this file per the decomposition map in
-// doc/KERNEL_UNLOCKING.md The dispatch arms below are
-// unchanged; the `use` re-imports keep the handler call sites textually
-// identical. NOTE: these `mod` declarations must stay AFTER the
-// `syscall_trace!` macro definition above (textual macro scoping).
+// ── Stage 102/145–148: mechanical syscall decomposition (zero behavior change) ─
+// Extracted submodules (D4 steps). Each module contains only the handler
+// implementation; syscall.rs retains dispatch ownership.
+//
+// LANDED:
+//   syscall/debug.rs          Stage 102 — NR 15 DebugLog
+//   syscall/initramfs.rs      Stage 102 — NR 27/28 initramfs helpers
+//   syscall/recv_shared_v3.rs D4 step 1 — NR 30 RecvSharedV3
+//   syscall/process.rs        D4 step 2 — NR 11/12/23/24/26/29 spawn/fork
+//   syscall/sched.rs          D4 step 3 — NR 0/9/10 yield/futex
+//   syscall/cap.rs            D4 step 4 — NR 4/8 TransferRelease/CNodeSlots
+//   syscall/vm.rs             Stage 145 — NR 3/13/14 VmMap/AnonMap/Brk
+//   syscall/ipc.rs            Stage 146 — NR 1/2/5/6/7 IpcSend/Recv/Call/Reply
+//
+// REMAINING IN syscall.rs (classification):
+//   [D] dispatch-owned — must stay: Syscall enum, SyscallError, SYSCALL_COUNT,
+//       ABI constants, thin shims, pub fn dispatch()
+//   [S] shared cross-boundary helper — stays until a common helpers module is
+//       created: current_tid, current_task_has_user_asid, record_user_fault,
+//       validate_user_region, round_up_page, validate_endpoint_right
+//   [I] IPC cross-boundary — stays until D1/D5 global-lock-drop phase:
+//       complete_blocked_recv_for_waiter, clear_blocked_recv_state,
+//       encode_transfer_cap_ret, materialize_received_message_cap and
+//       its routing helpers, try_endpoint_split_recv,
+//       should_strip_inline_opcode_prefix, sender_tid_to_ret,
+//       transfer_cap_arg, decode_ipc_send_timeout_ticks
+//   [R] split-recv seam — stays for D2/D3 split-path protocol:
+//       try_split_recv_queued_plain_into_frame_locked (test helper),
+//       try_split_recv_queued_plain_with_snapshot_locked (live split path)
+//   [X] future extract, risky — dedicated audit required before moving:
+//       materialize_received_message_cap (cap-slot + TrapFrame ordering),
+//       complete_blocked_recv_for_waiter (same)
+//
+// NOTE: these `mod` declarations must stay AFTER the `syscall_trace!` macro
+// definition above (textual macro scoping).
 mod cap;
 mod debug;
 mod initramfs;
@@ -4349,7 +4378,7 @@ mod tests {
             "syscall/dispatch.rs",
             "syscall/ipc.rs",
             "syscall/ipc_recv_core.rs",
-            "syscall/mm.rs",
+            "syscall/vm.rs",
             "syscall/cap.rs",
             "syscall/sched.rs",
             "syscall/process.rs",
