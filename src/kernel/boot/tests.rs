@@ -39173,10 +39173,7 @@ mod stage146_ipc_module_extraction {
             "fn handle_ipc_recv_result(",
             "fn handle_ipc_recv_result_with_empty_error(",
         ] {
-            assert!(
-                IPC_SRC.contains(helper),
-                "ipc.rs must contain {helper}"
-            );
+            assert!(IPC_SRC.contains(helper), "ipc.rs must contain {helper}");
             assert!(
                 !SYSCALL_SRC.contains(helper),
                 "syscall.rs must NOT contain {helper} (moved to ipc.rs)"
@@ -39321,6 +39318,271 @@ mod stage146_ipc_module_extraction {
         assert!(
             SYSCALL_SRC.contains("Syscall::IpcReply"),
             "syscall.rs dispatch must handle IpcReply"
+        );
+    }
+}
+
+mod stage147_ipc_boundary_audit {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // 1. IPC handlers in ipc.rs are pub(super), never bare pub.
+    #[test]
+    fn stage147_ipc_handlers_are_pub_super_not_pub() {
+        assert!(
+            !IPC_SRC.contains("pub fn handle_ipc_send("),
+            "handle_ipc_send must not be bare pub"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn handle_ipc_recv("),
+            "handle_ipc_recv must not be bare pub"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn handle_ipc_recv_timeout("),
+            "handle_ipc_recv_timeout must not be bare pub"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn handle_ipc_call("),
+            "handle_ipc_call must not be bare pub"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn handle_ipc_reply("),
+            "handle_ipc_reply must not be bare pub"
+        );
+    }
+
+    // 2. The eleven exclusive private helpers in ipc.rs are module-private (no pub prefix).
+    #[test]
+    fn stage147_ipc_exclusive_helpers_are_private() {
+        assert!(
+            !IPC_SRC.contains("pub(super) fn transfer_flag_bits("),
+            "transfer_flag_bits must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn transfer_flag_bits("),
+            "transfer_flag_bits must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn validate_transfer_cap("),
+            "validate_transfer_cap must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn validate_transfer_cap("),
+            "validate_transfer_cap must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn validate_shared_mem_transfer_rights("),
+            "validate_shared_mem_transfer_rights must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn stash_transfer_handle("),
+            "stash_transfer_handle must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn inline_payload_from_frame("),
+            "inline_payload_from_frame must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn map_shared_region_into_receiver("),
+            "map_shared_region_into_receiver must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn revoke_current_transfer_cap_best_effort("),
+            "revoke_current_transfer_cap must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn attenuate_transfer_cap_for_recv_intent("),
+            "attenuate_transfer_cap must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn recv_shared_mem_map_intent_flags("),
+            "recv_shared_mem_map_intent_flags must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn handle_ipc_recv_result("),
+            "handle_ipc_recv_result must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn handle_ipc_recv_result("),
+            "handle_ipc_recv_result must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub(super) fn handle_ipc_recv_result_with_empty_error("),
+            "handle_ipc_recv_result_with_empty_error must be private"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn handle_ipc_recv_result_with_empty_error("),
+            "handle_ipc_recv_result_with_empty_error must be private"
+        );
+    }
+
+    // 3. complete_blocked_recv_for_waiter must stay in syscall.rs as pub(crate), not move to ipc.rs.
+    #[test]
+    fn stage147_complete_blocked_recv_stays_in_syscall() {
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("),
+            "complete_blocked_recv_for_waiter must remain pub(crate) in syscall.rs"
+        );
+        assert!(
+            !IPC_SRC.contains("fn complete_blocked_recv_for_waiter("),
+            "complete_blocked_recv_for_waiter must not be defined in ipc.rs"
+        );
+    }
+
+    // 4. materialize_received_message_cap must stay in syscall.rs, not move to ipc.rs.
+    #[test]
+    fn stage147_materialize_cap_stays_in_syscall() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
+            "materialize_received_message_cap must remain in syscall.rs"
+        );
+        assert!(
+            !IPC_SRC.contains("fn materialize_received_message_cap("),
+            "materialize_received_message_cap must not be defined in ipc.rs"
+        );
+    }
+
+    // 5. pub fn dispatch remains in syscall.rs (not moved into a submodule).
+    #[test]
+    fn stage147_dispatch_function_is_pub_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub fn dispatch("),
+            "pub fn dispatch must remain in syscall.rs"
+        );
+        assert!(
+            !IPC_SRC.contains("pub fn dispatch("),
+            "ipc.rs must not contain a dispatch function"
+        );
+    }
+
+    // 6. VALIDATION markers for the IPC split path are preserved in both files.
+    #[test]
+    fn stage147_validation_markers_preserved() {
+        // try_endpoint_split_recv carries LIVE_OFF_TRAP + SPLIT_FAST_PATH_ONLY in syscall.rs.
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "syscall.rs must retain VALIDATION: LIVE_OFF_TRAP for try_endpoint_split_recv"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: SPLIT_FAST_PATH_ONLY"),
+            "syscall.rs must retain VALIDATION: SPLIT_FAST_PATH_ONLY"
+        );
+        // handle_ipc_reply carries GLOBAL_LOCK_SLOW_PATH in syscall.rs shim comment.
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "syscall.rs must retain VALIDATION: GLOBAL_LOCK_SLOW_PATH for handle_ipc_reply"
+        );
+        // Moved handlers preserve the LIVE_OFF_TRAP / SPLIT_FAST_PATH_ONLY markers in ipc.rs.
+        assert!(
+            IPC_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "ipc.rs must retain VALIDATION: LIVE_OFF_TRAP for split-send/call fast paths"
+        );
+        assert!(
+            IPC_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "ipc.rs must retain VALIDATION: GLOBAL_LOCK_SLOW_PATH for handle_ipc_reply"
+        );
+    }
+
+    // 7. IPC ABI argument constants live in syscall.rs, not redefined in ipc.rs.
+    #[test]
+    fn stage147_ipc_abi_constants_owned_by_syscall_rs() {
+        // Each constant must be defined in syscall.rs.
+        assert!(
+            SYSCALL_SRC.contains("const SYSCALL_ARG_CAP:"),
+            "SYSCALL_ARG_CAP must be in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("const SYSCALL_ARG_PTR:"),
+            "SYSCALL_ARG_PTR must be in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("const SYSCALL_ARG_LEN:"),
+            "SYSCALL_ARG_LEN must be in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("const SYSCALL_ARG_TRANSFER_CAP:"),
+            "SYSCALL_ARG_TRANSFER_CAP must be in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("const SYSCALL_NO_TRANSFER_CAP:"),
+            "SYSCALL_NO_TRANSFER_CAP must be in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("const SYSCALL_RECV_META_REPLY_CAP:"),
+            "SYSCALL_RECV_META_REPLY_CAP must be in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("const SYSCALL_RECV_META_TRANSFERRED_CAP:"),
+            "SYSCALL_RECV_META_TRANSFERRED_CAP must be in syscall.rs"
+        );
+        // ipc.rs must not redefine any of these (may import them via use super::).
+        assert!(
+            !IPC_SRC.contains("const SYSCALL_ARG_CAP:"),
+            "ipc.rs must not redefine SYSCALL_ARG_CAP"
+        );
+        assert!(
+            !IPC_SRC.contains("const SYSCALL_ARG_PTR:"),
+            "ipc.rs must not redefine SYSCALL_ARG_PTR"
+        );
+        assert!(
+            !IPC_SRC.contains("const SYSCALL_ARG_LEN:"),
+            "ipc.rs must not redefine SYSCALL_ARG_LEN"
+        );
+        assert!(
+            !IPC_SRC.contains("const SYSCALL_ARG_TRANSFER_CAP:"),
+            "ipc.rs must not redefine SYSCALL_ARG_TRANSFER_CAP"
+        );
+        assert!(
+            !IPC_SRC.contains("const SYSCALL_NO_TRANSFER_CAP:"),
+            "ipc.rs must not redefine SYSCALL_NO_TRANSFER_CAP"
+        );
+        assert!(
+            !IPC_SRC.contains("const SYSCALL_RECV_META_REPLY_CAP:"),
+            "ipc.rs must not redefine SYSCALL_RECV_META_REPLY_CAP"
+        );
+        assert!(
+            !IPC_SRC.contains("const SYSCALL_RECV_META_TRANSFERRED_CAP:"),
+            "ipc.rs must not redefine SYSCALL_RECV_META_TRANSFERRED_CAP"
+        );
+    }
+
+    // 8. D6 proof markers in arch/trap_entry.rs are unchanged by Stage 146/147.
+    #[test]
+    fn stage147_d6_proof_markers_unchanged() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "D6_CONTROLLED_SWITCH_PROOF_DONE must remain in arch/trap_entry.rs"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_BEGIN"),
+            "D6 cleanup marker must remain in arch/trap_entry.rs"
+        );
+    }
+
+    // 9. ipc.rs module doc declares implementation-only ownership.
+    #[test]
+    fn stage147_ipc_module_doc_present() {
+        assert!(
+            IPC_SRC.contains("implementation module only"),
+            "ipc.rs module doc must state it is implementation-only"
+        );
+        assert!(
+            IPC_SRC.contains("owns the syscall-number dispatch table"),
+            "ipc.rs module doc must state that syscall.rs owns dispatch"
+        );
+    }
+
+    // 10. The IPC_RECV_META_V2_ENCODED_LEN constant is pub(super) in syscall.rs (ABI-stable).
+    #[test]
+    fn stage147_recv_meta_len_constant_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must remain pub(super) const in syscall.rs"
+        );
+        assert!(
+            !IPC_SRC.contains("const IPC_RECV_META_V2_ENCODED_LEN"),
+            "ipc.rs must not redefine IPC_RECV_META_V2_ENCODED_LEN"
         );
     }
 }
