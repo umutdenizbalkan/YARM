@@ -38962,3 +38962,164 @@ mod stage144_arch_safe_trampoline_ip {
         );
     }
 }
+
+mod stage145_vm_module_extraction {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const VM_SRC: &str = include_str!("../syscall/vm.rs");
+
+    // 1. vm.rs must exist and declare the three pub(super) handlers.
+    #[test]
+    fn stage145_vm_module_has_three_handlers() {
+        assert!(
+            VM_SRC.contains("pub(super) fn handle_vm_map("),
+            "vm.rs must contain handle_vm_map"
+        );
+        assert!(
+            VM_SRC.contains("pub(super) fn handle_vm_anon_map("),
+            "vm.rs must contain handle_vm_anon_map"
+        );
+        assert!(
+            VM_SRC.contains("pub(super) fn handle_vm_brk("),
+            "vm.rs must contain handle_vm_brk"
+        );
+    }
+
+    // 2. vm_map_page_flags, validate_anon_map_args, rollback_anon_map must live in vm.rs only.
+    #[test]
+    fn stage145_vm_helpers_live_in_vm_module() {
+        assert!(
+            VM_SRC.contains("fn vm_map_page_flags("),
+            "vm.rs must contain vm_map_page_flags"
+        );
+        assert!(
+            VM_SRC.contains("fn validate_anon_map_args("),
+            "vm.rs must contain validate_anon_map_args"
+        );
+        assert!(
+            VM_SRC.contains("fn rollback_anon_map("),
+            "vm.rs must contain rollback_anon_map"
+        );
+        // These private helpers must not remain in the parent syscall.rs.
+        assert!(
+            !SYSCALL_SRC.contains("fn vm_map_page_flags("),
+            "syscall.rs must NOT contain vm_map_page_flags (moved to vm.rs)"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("fn validate_anon_map_args("),
+            "syscall.rs must NOT contain validate_anon_map_args (moved to vm.rs)"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("fn rollback_anon_map("),
+            "syscall.rs must NOT contain rollback_anon_map (moved to vm.rs)"
+        );
+    }
+
+    // 3. syscall.rs must declare `mod vm;` inside the decomposition block.
+    #[test]
+    fn stage145_syscall_declares_vm_module() {
+        assert!(
+            SYSCALL_SRC.contains("mod vm;"),
+            "syscall.rs must declare `mod vm;`"
+        );
+    }
+
+    // 4. syscall.rs dispatch arms must delegate via self::vm::.
+    #[test]
+    fn stage145_dispatch_delegates_to_vm_module() {
+        assert!(
+            SYSCALL_SRC.contains("self::vm::handle_vm_map("),
+            "syscall.rs must delegate VmMap to self::vm::handle_vm_map"
+        );
+        assert!(
+            SYSCALL_SRC.contains("self::vm::handle_vm_anon_map("),
+            "syscall.rs must delegate VmAnonMap to self::vm::handle_vm_anon_map"
+        );
+        assert!(
+            SYSCALL_SRC.contains("self::vm::handle_vm_brk("),
+            "syscall.rs must delegate VmBrk to self::vm::handle_vm_brk"
+        );
+    }
+
+    // 5. round_up_page and validate_user_region must remain in syscall.rs (used by IPC code).
+    #[test]
+    fn stage145_shared_helpers_remain_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn round_up_page("),
+            "round_up_page must remain pub(crate) in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn validate_user_region("),
+            "validate_user_region must remain pub(crate) in syscall.rs"
+        );
+    }
+
+    // 6. vm.rs must import round_up_page and validate_user_region from super (syscall.rs).
+    #[test]
+    fn stage145_vm_imports_helpers_from_super() {
+        assert!(
+            VM_SRC.contains("round_up_page") && VM_SRC.contains("super::"),
+            "vm.rs must import round_up_page from super"
+        );
+        assert!(
+            VM_SRC.contains("validate_user_region") && VM_SRC.contains("super::"),
+            "vm.rs must import validate_user_region from super"
+        );
+    }
+
+    // 7. VM syscall numbers unchanged.
+    #[test]
+    fn stage145_vm_syscall_numbers_unchanged() {
+        use crate::kernel::syscall::{SYSCALL_VM_ANON_MAP_NR, SYSCALL_VM_BRK_NR, SYSCALL_VM_MAP_NR};
+        assert_eq!(SYSCALL_VM_MAP_NR, 3);
+        assert_eq!(SYSCALL_VM_ANON_MAP_NR, 13);
+        assert_eq!(SYSCALL_VM_BRK_NR, 14);
+    }
+
+    // 8. SYSCALL_COUNT unchanged.
+    #[test]
+    fn stage145_syscall_count() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 145 must not change SYSCALL_COUNT");
+    }
+
+    // 9. Syscall::VARIANT_COUNT unchanged.
+    #[test]
+    fn stage145_syscall_variant_count() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 145 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+
+    // 10. vm.rs must not contain any inline dispatch (must not call kernel.dispatch or match syscall).
+    #[test]
+    fn stage145_vm_module_has_no_dispatch_logic() {
+        assert!(
+            !VM_SRC.contains("fn dispatch("),
+            "vm.rs must not contain a dispatch function"
+        );
+        assert!(
+            !VM_SRC.contains("Syscall::decode("),
+            "vm.rs must not decode syscall numbers"
+        );
+    }
+
+    // 11. VM prot constants remain in syscall.rs (ABI-stable, used by userspace contracts).
+    #[test]
+    fn stage145_prot_constants_remain_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_VM_MAP_PROT_READ"),
+            "SYSCALL_VM_MAP_PROT_READ must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_VM_MAP_PROT_WRITE"),
+            "SYSCALL_VM_MAP_PROT_WRITE must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_VM_MAP_PROT_EXEC"),
+            "SYSCALL_VM_MAP_PROT_EXEC must remain in syscall.rs"
+        );
+    }
+}
