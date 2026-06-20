@@ -102,13 +102,38 @@ pub(crate) fn ensure_user_return_cr3(
             hw_cr3,
         );
         if hw_cr3 != task_cr3 {
+            // Stage 141: the bare CR3 force-write Stage 140 used crashed because
+            // the live kernel return context (RIP/RSP pages) was not mapped in
+            // the target service-task root. Repair the mapping FIRST, then only
+            // force-write CR3 once the return context is proven present.
+            let mut rip: u64 = 0;
+            let mut rsp: u64 = 0;
+            unsafe {
+                core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nostack, preserves_flags));
+                core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
+            }
+            let ctx_mapped =
+                crate::arch::x86_64::page_table::ensure_kernel_return_context_mapped_for_asid(
+                    task_asid, rip, rsp,
+                );
             crate::yarm_log!(
-                "USER_CR3_PRE_IRET_SWITCH tid={} from=0x{:016x} to=0x{:016x}",
+                "USER_CR3_PRE_IRET_SWITCH tid={} from=0x{:016x} to=0x{:016x} ctx_mapped={}",
                 tid,
                 hw_cr3,
                 task_cr3,
+                ctx_mapped,
             );
-            crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid);
+            if ctx_mapped {
+                // Guarded force path: return-context mapping proven, safe to write.
+                crate::arch::x86_64::page_table::write_cr3_for_asid(task_asid);
+            } else {
+                // Do not switch into a root that lacks the live kernel stack;
+                // that is the exact #PF Stage 140 caused. Leave hw CR3 as-is.
+                crate::yarm_log!(
+                    "USER_CR3_PRE_IRET_SKIP tid={} reason=return_ctx_unmapped",
+                    tid
+                );
+            }
         }
         let final_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
         crate::yarm_log!(
