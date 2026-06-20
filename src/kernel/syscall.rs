@@ -80,7 +80,7 @@ const INITRAMFS_READ_CHUNK_TRACE: bool = false;
 /// Temporary Phase 2B bridge constant — replace with page-cap grant in Phase 3.
 const PM_BOOTSTRAP_TID: u64 = 3;
 
-// ── Stage 102/145–149: mechanical syscall decomposition (zero behavior change) ─
+// ── Stage 102/145–150: mechanical syscall decomposition (zero behavior change) ─
 // Extracted submodules (D4 steps). Each module contains only the handler
 // implementation; syscall.rs retains dispatch ownership.
 //
@@ -97,16 +97,18 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 //                                         round_up_page, record_user_fault,
 //                                         validate_endpoint_right,
 //                                         current_task_has_user_asid
+//   syscall/ipc_abi.rs        Stage 150 — IPC frame codec: sender_tid_to_ret,
+//                                         transfer_cap_arg, encode_transfer_cap_ret,
+//                                         decode_ipc_send_timeout_ticks,
+//                                         should_strip_inline_opcode_prefix
 //
 // REMAINING IN syscall.rs (classification):
 //   [D] dispatch-owned — must stay: Syscall enum, SyscallError, SYSCALL_COUNT,
 //       ABI constants, thin shims, pub fn dispatch()
 //   [I] IPC cross-boundary — stays until D1/D5 global-lock-drop phase:
 //       complete_blocked_recv_for_waiter, clear_blocked_recv_state,
-//       encode_transfer_cap_ret, materialize_received_message_cap and
-//       its routing helpers, try_endpoint_split_recv,
-//       should_strip_inline_opcode_prefix, sender_tid_to_ret,
-//       transfer_cap_arg, decode_ipc_send_timeout_ticks
+//       materialize_received_message_cap and its routing helpers,
+//       try_endpoint_split_recv
 //   [R] split-recv seam — stays for D2/D3 split-path protocol:
 //       try_split_recv_queued_plain_into_frame_locked (test helper),
 //       try_split_recv_queued_plain_with_snapshot_locked (live split path)
@@ -121,6 +123,7 @@ mod debug;
 mod helpers;
 mod initramfs;
 mod ipc;
+mod ipc_abi;
 mod process;
 mod recv_shared_v3;
 mod sched;
@@ -128,12 +131,18 @@ mod vm;
 
 // Stage 149: [S] shared helper re-exports so sibling modules and external
 // callers (runtime.rs) keep their existing use-paths unchanged.
-use self::debug::handle_debug_log;
 use self::helpers::{
     current_task_has_user_asid, current_tid, record_user_fault, validate_endpoint_right,
 };
 pub(crate) use self::helpers::{round_up_page, validate_user_region};
+// Stage 150: IPC frame ABI codec re-import so split-recv seam, dispatch, and
+// complete_blocked_recv_for_waiter keep their existing call sites unchanged.
+use self::debug::handle_debug_log;
 use self::initramfs::{handle_create_initramfs_file_slice_mo, handle_initramfs_read_chunk};
+use self::ipc_abi::{
+    decode_ipc_send_timeout_ticks, encode_transfer_cap_ret, sender_tid_to_ret,
+    should_strip_inline_opcode_prefix, transfer_cap_arg,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -414,34 +423,6 @@ pub(crate) fn complete_blocked_recv_for_waiter(
         waiter_tid
     );
     crate::yarm_log!("IPC_RECV_BLOCKED_COMPLETE tid={}", waiter_tid);
-    Ok(())
-}
-
-pub(super) fn sender_tid_to_ret(tid: u64) -> Result<usize, SyscallError> {
-    usize::try_from(tid).map_err(|_| SyscallError::Internal)
-}
-
-pub(super) fn transfer_cap_arg(
-    _kernel: &KernelState,
-    frame: &TrapFrame,
-) -> Result<Option<CapId>, SyscallError> {
-    let raw = frame.arg(SYSCALL_ARG_TRANSFER_CAP) as u64;
-    if raw == SYSCALL_NO_TRANSFER_CAP {
-        return Ok(None);
-    }
-    Ok(Some(CapId(raw)))
-}
-
-pub(super) fn decode_ipc_send_timeout_ticks(frame: &TrapFrame) -> u64 {
-    frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1) as u64
-}
-
-pub(super) fn encode_transfer_cap_ret(
-    frame: &mut TrapFrame,
-    cap: Option<u64>,
-) -> Result<(), SyscallError> {
-    let value = cap.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
-    frame.set_ret2(usize::try_from(value).map_err(|_| SyscallError::Internal)?);
     Ok(())
 }
 
@@ -787,13 +768,6 @@ fn handle_ipc_call(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<()
 // See doc/KERNEL_UNLOCKING.md
 fn handle_ipc_reply(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     self::ipc::handle_ipc_reply(kernel, frame)
-}
-
-#[inline]
-pub(super) fn should_strip_inline_opcode_prefix(msg: &Message) -> bool {
-    msg.opcode == OPCODE_INLINE
-        && ((msg.flags & Message::FLAG_REPLY_CAP) != 0
-            || (msg.flags & Message::FLAG_CAP_TRANSFER) != 0)
 }
 
 /// Stage 31: queued-plain IPC recv fast-path attempt (helper-only).
