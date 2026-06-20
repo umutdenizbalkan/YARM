@@ -39042,16 +39042,18 @@ mod stage145_vm_module_extraction {
         );
     }
 
-    // 5. round_up_page and validate_user_region must remain in syscall.rs (used by IPC code).
+    // 5. round_up_page and validate_user_region must be accessible from syscall.rs
+    //    (Stage 149 moved the bodies to helpers.rs but keeps pub(crate) re-exports here).
     #[test]
     fn stage145_shared_helpers_remain_in_syscall_rs() {
+        // Function bodies moved to helpers.rs in Stage 149; re-exported as pub(crate).
         assert!(
-            SYSCALL_SRC.contains("pub(crate) fn round_up_page("),
-            "round_up_page must remain pub(crate) in syscall.rs"
+            SYSCALL_SRC.contains("round_up_page"),
+            "round_up_page must be accessible from syscall.rs namespace"
         );
         assert!(
-            SYSCALL_SRC.contains("pub(crate) fn validate_user_region("),
-            "validate_user_region must remain pub(crate) in syscall.rs"
+            SYSCALL_SRC.contains("validate_user_region"),
+            "validate_user_region must be accessible from syscall.rs namespace"
         );
     }
 
@@ -39712,17 +39714,11 @@ mod stage148_decomposition_map {
         );
     }
 
-    // 6. Shared cross-boundary helpers remain in syscall.rs.
+    // 6. Cross-boundary helpers that must remain in syscall.rs post-Stage-149.
+    //    Note: validate_user_region and round_up_page moved to helpers.rs in Stage 149
+    //    and are re-exported from syscall.rs; their function bodies are no longer here.
     #[test]
     fn stage148_shared_helpers_in_syscall_rs() {
-        assert!(
-            SYSCALL_SRC.contains("pub(crate) fn validate_user_region("),
-            "validate_user_region must remain in syscall.rs"
-        );
-        assert!(
-            SYSCALL_SRC.contains("pub(crate) fn round_up_page("),
-            "round_up_page must remain in syscall.rs"
-        );
         assert!(
             SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("),
             "complete_blocked_recv_for_waiter must remain in syscall.rs"
@@ -39734,6 +39730,12 @@ mod stage148_decomposition_map {
         assert!(
             SYSCALL_SRC.contains("pub(super) fn try_endpoint_split_recv("),
             "try_endpoint_split_recv must remain in syscall.rs"
+        );
+        // validate_user_region and round_up_page are re-exported (Stage 149).
+        assert!(
+            SYSCALL_SRC
+                .contains("pub(crate) use self::helpers::{round_up_page, validate_user_region}"),
+            "validate_user_region and round_up_page must be re-exported from syscall.rs"
         );
     }
 
@@ -39794,20 +39796,22 @@ mod stage148_decomposition_map {
         );
     }
 
-    // 10. Decomposition map comment is present in syscall.rs.
+    // 10. Decomposition map comment is present in syscall.rs (updated by Stage 149).
     #[test]
     fn stage148_decomposition_map_comment_present() {
+        // Stage 149 updated the header to 145–149; 148 marker no longer present.
         assert!(
-            SYSCALL_SRC.contains("Stage 102/145\u{2013}148"),
-            "Stage 148 decomposition map comment must be present in syscall.rs"
+            SYSCALL_SRC.contains("Stage 102/145\u{2013}149"),
+            "Stage 148/149 decomposition map comment must be present in syscall.rs"
         );
         assert!(
             SYSCALL_SRC.contains("[D] dispatch-owned"),
             "decomposition map must include [D] dispatch-owned classification"
         );
+        // [S] group landed in helpers.rs (Stage 149); no longer in REMAINING section.
         assert!(
-            SYSCALL_SRC.contains("[S] shared cross-boundary helper"),
-            "decomposition map must include [S] shared cross-boundary helper classification"
+            SYSCALL_SRC.contains("Stage 149 \u{2014} [S]"),
+            "helpers.rs [S] landing must be recorded in the decomposition map"
         );
         assert!(
             SYSCALL_SRC.contains("[I] IPC cross-boundary"),
@@ -39820,6 +39824,168 @@ mod stage148_decomposition_map {
         assert!(
             SYSCALL_SRC.contains("[X] future extract"),
             "decomposition map must include [X] future extract classification"
+        );
+    }
+}
+
+// Stage 149: helpers.rs extraction of [S] shared cross-boundary helpers.
+//
+// Guard tests verify:
+// - helpers.rs declares all six [S] functions with correct visibility
+// - syscall.rs re-exports the pub(crate) items so external callers are unaffected
+// - sibling modules can still access helpers via `use super::*` (private re-exports)
+// - [S] helpers are absent as function definitions from syscall.rs
+// - no duplication of the [S] functions in handler submodules
+mod stage149_helpers_extraction {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const HELPERS_SRC: &str = include_str!("../syscall/helpers.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const VM_SRC: &str = include_str!("../syscall/vm.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const RECV_SHARED_V3_SRC: &str = include_str!("../syscall/recv_shared_v3.rs");
+
+    // 1. helpers.rs is declared as a module in syscall.rs.
+    #[test]
+    fn stage149_helpers_mod_declared() {
+        assert!(
+            SYSCALL_SRC.contains("mod helpers;"),
+            "mod helpers must be declared in syscall.rs"
+        );
+    }
+
+    // 2. All six [S] functions are defined in helpers.rs.
+    #[test]
+    fn stage149_s_group_functions_in_helpers() {
+        assert!(
+            HELPERS_SRC.contains("pub(super) fn current_tid("),
+            "current_tid must be defined in helpers.rs"
+        );
+        assert!(
+            HELPERS_SRC.contains("pub(super) fn current_task_has_user_asid("),
+            "current_task_has_user_asid must be defined in helpers.rs"
+        );
+        assert!(
+            HELPERS_SRC.contains("pub(super) fn record_user_fault("),
+            "record_user_fault must be defined in helpers.rs"
+        );
+        assert!(
+            HELPERS_SRC.contains("pub(crate) fn validate_user_region("),
+            "validate_user_region must be pub(crate) in helpers.rs"
+        );
+        assert!(
+            HELPERS_SRC.contains("pub(super) fn validate_endpoint_right("),
+            "validate_endpoint_right must be defined in helpers.rs"
+        );
+        assert!(
+            HELPERS_SRC.contains("pub(crate) fn round_up_page("),
+            "round_up_page must be pub(crate) in helpers.rs"
+        );
+    }
+
+    // 3. [S] function bodies are absent from syscall.rs (moved to helpers.rs).
+    #[test]
+    fn stage149_s_group_bodies_removed_from_syscall_rs() {
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn current_tid("),
+            "current_tid function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn current_task_has_user_asid("),
+            "current_task_has_user_asid function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn record_user_fault("),
+            "record_user_fault function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(crate) fn validate_user_region("),
+            "validate_user_region function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(super) fn validate_endpoint_right("),
+            "validate_endpoint_right function body must not be in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub(crate) fn round_up_page("),
+            "round_up_page function body must not be in syscall.rs"
+        );
+    }
+
+    // 4. pub(crate) items are re-exported from syscall.rs so external call sites
+    //    (e.g., runtime.rs) keep their existing path crate::kernel::syscall::X.
+    #[test]
+    fn stage149_pub_crate_helpers_reexported() {
+        assert!(
+            SYSCALL_SRC
+                .contains("pub(crate) use self::helpers::{round_up_page, validate_user_region}"),
+            "validate_user_region and round_up_page must be pub(crate) re-exported from syscall.rs"
+        );
+    }
+
+    // 5. Private re-export of pub(super) helpers lets sibling modules keep
+    //    their `use super::X` imports unchanged.
+    #[test]
+    fn stage149_super_helpers_privately_reexported() {
+        assert!(
+            SYSCALL_SRC.contains("use self::helpers::{"),
+            "pub(super) helpers must be privately re-exported into syscall.rs namespace"
+        );
+        assert!(
+            SYSCALL_SRC.contains("current_tid,") || SYSCALL_SRC.contains("current_tid}"),
+            "current_tid must appear in the private re-export list in syscall.rs"
+        );
+    }
+
+    // 6. No [S] function is duplicated in the IPC or VM handler modules.
+    #[test]
+    fn stage149_no_s_group_duplication_in_handlers() {
+        for src in [IPC_SRC, VM_SRC, PROCESS_SRC, RECV_SHARED_V3_SRC] {
+            assert!(
+                !src.contains("fn current_tid("),
+                "handler module must not redefine current_tid"
+            );
+            assert!(
+                !src.contains("fn validate_user_region("),
+                "handler module must not redefine validate_user_region"
+            );
+            assert!(
+                !src.contains("fn round_up_page("),
+                "handler module must not redefine round_up_page"
+            );
+            assert!(
+                !src.contains("fn record_user_fault("),
+                "handler module must not redefine record_user_fault"
+            );
+            assert!(
+                !src.contains("fn validate_endpoint_right("),
+                "handler module must not redefine validate_endpoint_right"
+            );
+        }
+    }
+
+    // 7. helpers.rs does not define a dispatch function.
+    #[test]
+    fn stage149_helpers_no_dispatch() {
+        assert!(
+            !HELPERS_SRC.contains("pub fn dispatch("),
+            "helpers.rs must not define pub fn dispatch"
+        );
+        assert!(
+            !HELPERS_SRC.contains("fn dispatch("),
+            "helpers.rs must not define any dispatch function"
+        );
+    }
+
+    // 8. helpers.rs module doc states it is a Stage 149 extraction.
+    #[test]
+    fn stage149_helpers_module_doc() {
+        assert!(
+            HELPERS_SRC.contains("Stage 149"),
+            "helpers.rs must have a module doc referencing Stage 149"
+        );
+        assert!(
+            HELPERS_SRC.contains("[S] group"),
+            "helpers.rs module doc must identify the [S] group"
         );
     }
 }
