@@ -40077,11 +40077,13 @@ mod stage150_ipc_abi_extraction {
             "ipc_abi functions must be re-imported into syscall.rs namespace"
         );
         assert!(
-            SYSCALL_SRC.contains("encode_transfer_cap_ret,") || SYSCALL_SRC.contains("encode_transfer_cap_ret}"),
+            SYSCALL_SRC.contains("encode_transfer_cap_ret,")
+                || SYSCALL_SRC.contains("encode_transfer_cap_ret}"),
             "encode_transfer_cap_ret must appear in the ipc_abi re-import"
         );
         assert!(
-            SYSCALL_SRC.contains("should_strip_inline_opcode_prefix,") || SYSCALL_SRC.contains("should_strip_inline_opcode_prefix}"),
+            SYSCALL_SRC.contains("should_strip_inline_opcode_prefix,")
+                || SYSCALL_SRC.contains("should_strip_inline_opcode_prefix}"),
             "should_strip_inline_opcode_prefix must appear in the ipc_abi re-import"
         );
     }
@@ -40177,6 +40179,221 @@ mod stage150_ipc_abi_extraction {
         assert!(
             IPC_ABI_SRC.contains("IPC frame"),
             "ipc_abi.rs module doc must describe the IPC frame codec role"
+        );
+    }
+}
+
+// Stage 151: IPC ABI/module boundary audit.
+//
+// Guard tests verify that syscall/ipc_abi.rs remains pure IPC frame/argument
+// codec logic and that stateful IPC ordering and cap-slot materialization
+// remain outside it.
+mod stage151_ipc_abi_boundary_audit {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_ABI_SRC: &str = include_str!("../syscall/ipc_abi.rs");
+
+    // 1. Module doc explicitly states the pure-codec invariant.
+    #[test]
+    fn stage151_module_doc_pure_codec_invariant() {
+        assert!(
+            IPC_ABI_SRC.contains("pure IPC ABI/frame codec only"),
+            "ipc_abi.rs module doc must declare pure-codec invariant"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("No kernel-state mutation"),
+            "ipc_abi.rs module doc must state no kernel-state mutation"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("No lock acquisition"),
+            "ipc_abi.rs module doc must state no lock acquisition"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("No cap-slot materialization"),
+            "ipc_abi.rs module doc must state no cap-slot materialization"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("No VM or shared-memory mapping"),
+            "ipc_abi.rs module doc must state no VM/shared-memory mapping"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("No reply-cap lifecycle handling"),
+            "ipc_abi.rs module doc must state no reply-cap lifecycle handling"
+        );
+    }
+
+    // 2. Module doc names syscall.rs as dispatch owner and ipc.rs as stateful IPC owner.
+    #[test]
+    fn stage151_module_doc_ownership_statements() {
+        assert!(
+            IPC_ABI_SRC.contains("syscall.rs` remains dispatch owner"),
+            "ipc_abi.rs module doc must name syscall.rs as dispatch owner"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("syscall/ipc.rs` remains stateful IPC implementation owner"),
+            "ipc_abi.rs module doc must name ipc.rs as stateful IPC owner"
+        );
+    }
+
+    // 3. ipc_abi.rs does not reference ipc_state_lock (no lock acquisition).
+    #[test]
+    fn stage151_no_ipc_state_lock_in_ipc_abi() {
+        assert!(
+            !IPC_ABI_SRC.contains("ipc_state_lock"),
+            "ipc_abi.rs must not reference ipc_state_lock"
+        );
+    }
+
+    // 4. ipc_abi.rs does not reference complete_blocked_recv_for_waiter.
+    #[test]
+    fn stage151_no_complete_blocked_recv_in_ipc_abi() {
+        assert!(
+            !IPC_ABI_SRC.contains("complete_blocked_recv_for_waiter"),
+            "ipc_abi.rs must not reference complete_blocked_recv_for_waiter"
+        );
+    }
+
+    // 5. ipc_abi.rs does not reference materialize_received_message_cap.
+    #[test]
+    fn stage151_no_materialize_cap_in_ipc_abi() {
+        assert!(
+            !IPC_ABI_SRC.contains("materialize_received_message_cap"),
+            "ipc_abi.rs must not reference materialize_received_message_cap"
+        );
+    }
+
+    // 6. ipc_abi.rs does not reference map_shared_region_into_receiver.
+    #[test]
+    fn stage151_no_shared_region_map_in_ipc_abi() {
+        assert!(
+            !IPC_ABI_SRC.contains("map_shared_region_into_receiver"),
+            "ipc_abi.rs must not reference map_shared_region_into_receiver"
+        );
+    }
+
+    // 7. ipc_abi.rs does not call cap-table mutation helpers.
+    #[test]
+    fn stage151_no_cap_mutation_in_ipc_abi() {
+        assert!(
+            !IPC_ABI_SRC.contains("grant_capability"),
+            "ipc_abi.rs must not call grant_capability helpers"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("take_capability"),
+            "ipc_abi.rs must not call take_capability helpers"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("remove_capability"),
+            "ipc_abi.rs must not call remove_capability helpers"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("revoke_capability"),
+            "ipc_abi.rs must not call revoke_capability helpers"
+        );
+    }
+
+    // 8. ipc_abi.rs does not call VM mapping helpers.
+    #[test]
+    fn stage151_no_vm_mapping_in_ipc_abi() {
+        assert!(
+            !IPC_ABI_SRC.contains("vm_map_"),
+            "ipc_abi.rs must not call vm_map_* helpers"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("map_shared_region"),
+            "ipc_abi.rs must not call map_shared_region"
+        );
+    }
+
+    // 9. IPC_RECV_META_V2_ENCODED_LEN remains in syscall.rs, not ipc_abi.rs.
+    #[test]
+    fn stage151_recv_meta_len_stays_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must remain defined in syscall.rs"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must not be defined or referenced in ipc_abi.rs"
+        );
+    }
+
+    // 10. All functions in ipc_abi.rs are pub(super), not pub (fully public).
+    #[test]
+    fn stage151_all_functions_pub_super_not_pub() {
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn sender_tid_to_ret("),
+            "sender_tid_to_ret must be pub(super) fn"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("pub fn sender_tid_to_ret("),
+            "sender_tid_to_ret must not be bare pub fn"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn transfer_cap_arg("),
+            "transfer_cap_arg must be pub(super) fn"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("pub fn transfer_cap_arg("),
+            "transfer_cap_arg must not be bare pub fn"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn encode_transfer_cap_ret("),
+            "encode_transfer_cap_ret must be pub(super) fn"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("pub fn encode_transfer_cap_ret("),
+            "encode_transfer_cap_ret must not be bare pub fn"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn decode_ipc_send_timeout_ticks("),
+            "decode_ipc_send_timeout_ticks must be pub(super) fn"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("pub fn decode_ipc_send_timeout_ticks("),
+            "decode_ipc_send_timeout_ticks must not be bare pub fn"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pub(super) fn should_strip_inline_opcode_prefix("),
+            "should_strip_inline_opcode_prefix must be pub(super) fn"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("pub fn should_strip_inline_opcode_prefix("),
+            "should_strip_inline_opcode_prefix must not be bare pub fn"
+        );
+    }
+
+    // 11. Stage 151 audit note present in ipc_abi.rs module doc.
+    #[test]
+    fn stage151_audit_note_in_module_doc() {
+        assert!(
+            IPC_ABI_SRC.contains("Stage 151"),
+            "ipc_abi.rs module doc must reference Stage 151 boundary audit"
+        );
+    }
+
+    // 12. SYSCALL_COUNT and VARIANT_COUNT unchanged.
+    #[test]
+    fn stage151_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VARIANT_COUNT: usize = 23"),
+            "VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 13. D6/CR3/PF diagnostic markers still present in syscall.rs.
+    #[test]
+    fn stage151_d6_markers_present() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "D6 LIVE_OFF_TRAP marker must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "D6 GLOBAL_LOCK_SLOW_PATH marker must remain in syscall.rs"
         );
     }
 }
