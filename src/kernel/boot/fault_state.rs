@@ -14,6 +14,42 @@ const STRICT_UNKNOWN_TRAPS: bool = !cfg!(feature = "hosted-dev");
 const DEMAND_STACK_GROWTH_WINDOW: u64 = 8 * 1024 * 1024;
 #[allow(dead_code)]
 const DEBUG_TIMER_LOG: bool = false;
+
+// Stage 137: arch-specific PTE flag check for demand-page verification.
+// Returns true iff the PTE grants user-mode read access (and write if need_write).
+#[cfg(target_arch = "x86_64")]
+fn demand_pte_flags_ok(
+    pte: crate::arch::selected_isa::page_table::PageTableEntry,
+    need_write: bool,
+) -> bool {
+    use crate::arch::selected_isa::page_table::PageTableEntry;
+    let user = (pte.0 & PageTableEntry::USER) != 0;
+    let writable = (pte.0 & PageTableEntry::WRITABLE) != 0;
+    user && (!need_write || writable)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn demand_pte_flags_ok(
+    pte: crate::arch::selected_isa::page_table::PageTableEntry,
+    need_write: bool,
+) -> bool {
+    use crate::arch::selected_isa::page_table::PageTableEntry;
+    let user = (pte.0 & PageTableEntry::USER) != 0;
+    let read_only = (pte.0 & PageTableEntry::READ_ONLY) != 0;
+    user && (!need_write || !read_only)
+}
+
+#[cfg(target_arch = "riscv64")]
+fn demand_pte_flags_ok(
+    pte: crate::arch::selected_isa::page_table::PageTableEntry,
+    need_write: bool,
+) -> bool {
+    use crate::arch::selected_isa::page_table::PageTableEntry;
+    let user = (pte.0 & PageTableEntry::USER) != 0;
+    let readable = (pte.0 & PageTableEntry::READ) != 0;
+    let writable = (pte.0 & PageTableEntry::WRITE) != 0;
+    user && readable && (!need_write || writable)
+}
 /// Supervisor fault notification wire ABI payload length.
 ///
 /// Layout (little-endian):
@@ -112,6 +148,11 @@ impl KernelState {
             .resolve(page)
             .is_some();
         if already_mapped {
+            // Stage 137: the page is already in VmSpace but the TLB may hold a
+            // stale not-present entry from the original fault.  INVLPG flushes
+            // that entry so the CPU re-walks the hardware page table and finds
+            // the valid PTE instead of re-faulting indefinitely.
+            crate::arch::selected_isa::page_table::invalidate_page(page);
             return Ok(true);
         }
 
@@ -443,8 +484,47 @@ impl KernelState {
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)?
                 {
-                    crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
-                    return Ok(());
+                    // Stage 137: verify the hardware PTE is accessible before
+                    // declaring the fault handled.  Also fix ASID/CR3 if the
+                    // task's address space differs from what the HAL recorded.
+                    let page = fault.addr.page_align_down();
+                    let need_write = matches!(fault.access, FaultAccess::Write);
+                    let tid = self.current_tid().unwrap_or(u64::MAX);
+                    let task_asid = self.task_asid(tid).unwrap_or(crate::kernel::vm::Asid(0));
+                    let active_asid_num = self.d6_diag_active_asid_num();
+                    let active_asid = crate::kernel::vm::Asid(active_asid_num as u16);
+                    let task_pte =
+                        crate::arch::selected_isa::page_table::resolve_page(task_asid, page);
+                    let active_pte = if active_asid.0 != task_asid.0 {
+                        crate::arch::selected_isa::page_table::resolve_page(active_asid, page)
+                    } else {
+                        task_pte
+                    };
+                    let task_present = task_pte.is_some();
+                    let active_present = active_pte.is_some();
+                    let task_flags = task_pte.map(|p| p.0).unwrap_or(0);
+                    let active_flags = active_pte.map(|p| p.0).unwrap_or(0);
+                    crate::yarm_log!(
+                        "PAGE_FAULT_DEMAND_VERIFY tid={} page=0x{:x} task_asid={} active_asid={} task_present={} active_present={} task_flags=0x{:x} active_flags=0x{:x}",
+                        tid,
+                        page.0,
+                        task_asid.0,
+                        active_asid.0,
+                        task_present,
+                        active_present,
+                        task_flags,
+                        active_flags,
+                    );
+                    let pte_ok = task_pte
+                        .map(|p| demand_pte_flags_ok(p, need_write))
+                        .unwrap_or(false);
+                    if pte_ok && !active_present && active_asid.0 != task_asid.0 {
+                        self.hal.switch_address_space(task_asid);
+                    }
+                    if pte_ok {
+                        crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
+                        return Ok(());
+                    }
                 }
                 crate::yarm_log!(
                     "PAGE_FAULT_UNHANDLED tid={} addr=0x{:x} access={:?} rip=0x{:x}",

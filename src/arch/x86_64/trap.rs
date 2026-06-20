@@ -167,6 +167,40 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             d6_emit_post_cleanup_first_trap_diag(kernel, cpu, context);
         }
     }
+    // Stage 137: log raw hardware fault context before any KernelState mutation.
+    // frame_rip = hardware interrupt-frame RIP (the true faulting PC).
+    if context.vector == VEC_PAGE_FAULT {
+        let tid = kernel.current_tid().unwrap_or(u64::MAX);
+        let error = context.error_code;
+        let frame_rip = frame.as_ref().map(|f| f.saved_pc).unwrap_or(0);
+        let frame_rsp = frame.as_ref().map(|f| f.saved_sp).unwrap_or(0);
+        let frame_rax = frame.as_ref().map(|f| f.user_gpr(0)).unwrap_or(0);
+        let frame_rcx = frame.as_ref().map(|f| f.user_gpr(2)).unwrap_or(0);
+        let frame_rdi = frame.as_ref().map(|f| f.user_gpr(5)).unwrap_or(0);
+        let frame_rsi = frame.as_ref().map(|f| f.user_gpr(4)).unwrap_or(0);
+        crate::yarm_log!(
+            "PAGE_FAULT_RAW tid={} vector=0x{:x} error=0x{:x} cr2=0x{:x} frame_rip=0x{:x} frame_rsp=0x{:x} rax=0x{:x} rcx=0x{:x} rdi=0x{:x} rsi=0x{:x}",
+            tid,
+            context.vector,
+            error,
+            context.fault_addr,
+            frame_rip,
+            frame_rsp,
+            frame_rax,
+            frame_rcx,
+            frame_rdi,
+            frame_rsi,
+        );
+        crate::yarm_log!(
+            "PAGE_FAULT_X86_ERROR raw=0x{:x} present={} write={} user={} instr={} reserved={}",
+            error,
+            (error >> 0) & 1,
+            (error >> 1) & 1,
+            (error >> 2) & 1,
+            (error >> 4) & 1,
+            (error >> 3) & 1,
+        );
+    }
     // NOTE(arch/x86_64): Architecture-specific IDT setup and assembly trap stubs
     // funnel hardware entries into this Rust dispatcher. Tests may still construct
     // synthetic contexts directly, but real trap/interrupt/syscall vectors now use
