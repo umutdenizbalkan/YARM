@@ -38421,8 +38421,8 @@ mod stage142_stack_window_mapping {
     const PAGE_TABLE_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
     const FAULT_SRC: &str = include_str!("fault_state.rs");
 
-    // 1. ensure_kernel_return_context_mapped_for_asid must accept stack_base and
-    //    stack_top parameters, not a bare rsp: u64.
+    // 1. ensure_kernel_return_context_mapped_for_asid must accept stack_base,
+    //    stack_top, and rsp parameters (Stage 143 re-adds rsp alongside the bounds).
     #[test]
     fn stage142_ensure_signature_uses_stack_bounds() {
         let fn_start = PAGE_TABLE_SRC
@@ -38441,14 +38441,12 @@ mod stage142_stack_window_mapping {
             sig.contains("stack_top"),
             "signature must include a stack_top parameter"
         );
-        assert!(
-            !sig.contains("rsp: u64"),
-            "Stage 142 must replace the bare rsp: u64 param with stack_base+stack_top"
-        );
+        // Stage 143 re-introduces rsp: u64 alongside stack_base+stack_top for
+        // range verification; all three coexisting is the correct Stage 143 state.
     }
 
-    // 2. ensure_user_return_cr3 in trap.rs must look up the TCB kernel stack
-    //    bounds via with_tcbs before calling ensure_kernel_return_context_mapped_for_asid.
+    // 2. ensure_user_return_cr3 in trap.rs must call find_kernel_stack_bounds_containing_rsp
+    //    (Stage 143: with_tcbs is now inside that helper, not directly in ensure_user_return_cr3).
     #[test]
     fn stage142_trap_looks_up_tcb_stack_bounds() {
         let fn_start = TRAP_RS_SRC
@@ -38456,21 +38454,23 @@ mod stage142_stack_window_mapping {
             .expect("ensure_user_return_cr3 must be defined in trap.rs");
         let fn_body = &TRAP_RS_SRC[fn_start..];
         assert!(
-            fn_body.contains("with_tcbs"),
-            "ensure_user_return_cr3 must call kernel.with_tcbs to look up TCB stack bounds"
+            fn_body.contains("find_kernel_stack_bounds_containing_rsp"),
+            "ensure_user_return_cr3 must call find_kernel_stack_bounds_containing_rsp"
         );
         assert!(
             fn_body.contains("stack_base") && fn_body.contains("stack_top"),
-            "ensure_user_return_cr3 must compute stack_base and stack_top from TCB or fallback"
+            "ensure_user_return_cr3 must use stack_base and stack_top from the helper"
         );
-        // with_tcbs must appear before the call to ensure_kernel_return_context_mapped_for_asid.
-        let tcbs_pos = fn_body.find("with_tcbs").expect("with_tcbs present");
+        // The helper call must appear before ensure_kernel_return_context_mapped_for_asid.
+        let helper_pos = fn_body
+            .find("find_kernel_stack_bounds_containing_rsp")
+            .expect("helper call must be present");
         let map_pos = fn_body
             .find("ensure_kernel_return_context_mapped_for_asid")
             .expect("ensure_kernel_return_context_mapped_for_asid call must be present");
         assert!(
-            tcbs_pos < map_pos,
-            "TCB stack-bounds lookup must precede the mapping call"
+            helper_pos < map_pos,
+            "find_kernel_stack_bounds_containing_rsp must precede the mapping call"
         );
     }
 
@@ -38632,6 +38632,216 @@ mod stage142_stack_window_mapping {
             Syscall::VARIANT_COUNT,
             23,
             "Stage 142 must not change Syscall::VARIANT_COUNT"
+        );
+    }
+}
+
+// ── Stage 143 — map live kernel stack containing sampled RSP, not target TCB stack ──
+#[cfg(test)]
+mod stage143_live_stack_selection {
+    use crate::kernel::syscall::{SYSCALL_COUNT, Syscall};
+
+    const TRAP_RS_SRC: &str = include_str!("../../arch/x86_64/trap.rs");
+    const PAGE_TABLE_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    // 1. ensure_user_return_cr3 must pass rsp to ensure_kernel_return_context_mapped_for_asid.
+    #[test]
+    fn stage143_ensure_user_return_cr3_passes_rsp_to_helper() {
+        let fn_start = TRAP_RS_SRC
+            .find("fn ensure_user_return_cr3")
+            .expect("ensure_user_return_cr3 must be defined in trap.rs");
+        let fn_body = &TRAP_RS_SRC[fn_start..];
+        let call_pos = fn_body
+            .find("ensure_kernel_return_context_mapped_for_asid")
+            .expect("mapping helper call must be present");
+        // Grab enough text after the call site to see the argument list.
+        let call_site = &fn_body[call_pos..call_pos.saturating_add(300)];
+        assert!(
+            call_site.contains("rsp"),
+            "call to ensure_kernel_return_context_mapped_for_asid must include rsp argument"
+        );
+    }
+
+    // 2. find_kernel_stack_bounds_containing_rsp must scan all TCBs for rsp in range.
+    #[test]
+    fn stage143_stack_selection_finds_stack_containing_rsp() {
+        assert!(
+            TRAP_RS_SRC.contains("fn find_kernel_stack_bounds_containing_rsp"),
+            "trap.rs must define find_kernel_stack_bounds_containing_rsp"
+        );
+        let fn_start = TRAP_RS_SRC
+            .find("fn find_kernel_stack_bounds_containing_rsp")
+            .expect("function present");
+        let fn_body = &TRAP_RS_SRC[fn_start..fn_start.saturating_add(800)];
+        assert!(
+            fn_body.contains("with_tcbs"),
+            "find_kernel_stack_bounds_containing_rsp must use with_tcbs to scan all TCBs"
+        );
+        assert!(
+            fn_body.contains("rsp >= base") || fn_body.contains("base <= rsp"),
+            "helper must check rsp >= base"
+        );
+        assert!(
+            fn_body.contains("rsp < top") || fn_body.contains("top > rsp"),
+            "helper must check rsp < top"
+        );
+    }
+
+    // 3. ensure_kernel_return_context_mapped_for_asid must fail with reason=rsp_not_in_range
+    //    when the selected stack window does not contain sampled RSP.
+    #[test]
+    fn stage143_helper_refuses_ok_if_rsp_outside_range() {
+        assert!(
+            PAGE_TABLE_SRC.contains("reason=rsp_not_in_range"),
+            "page_table.rs must emit USER_CR3_RETURN_STACK_MAP_FAILED reason=rsp_not_in_range"
+        );
+        // The range check must appear before the stack-map loop (before STACK_MAP_BEGIN).
+        let check_pos = PAGE_TABLE_SRC
+            .find("rsp_not_in_range")
+            .expect("rsp_not_in_range present");
+        let begin_pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_STACK_MAP_BEGIN")
+            .expect("STACK_MAP_BEGIN present");
+        assert!(
+            check_pos < begin_pos,
+            "rsp range check must appear before STACK_MAP_BEGIN loop"
+        );
+    }
+
+    // 4. The RSP page must be a hard failure when absent from the live root.
+    #[test]
+    fn stage143_helper_refuses_ok_if_rsp_page_not_mapped() {
+        assert!(
+            PAGE_TABLE_SRC.contains("rsp_page_absent_from_live"),
+            "page_table.rs must fail with reason=rsp_page_absent_from_live when RSP page missing from live root"
+        );
+        assert!(
+            PAGE_TABLE_SRC.contains("rsp_page_not_in_target"),
+            "page_table.rs must fail with reason=rsp_page_not_in_target when RSP page absent from target after mapping"
+        );
+    }
+
+    // 5. USER_CR3_RETURN_STACK_SELECT marker must appear in trap.rs with all required fields.
+    #[test]
+    fn stage143_stack_select_marker_exists() {
+        assert!(
+            TRAP_RS_SRC.contains("USER_CR3_RETURN_STACK_SELECT"),
+            "trap.rs must emit USER_CR3_RETURN_STACK_SELECT"
+        );
+        let pos = TRAP_RS_SRC
+            .find("USER_CR3_RETURN_STACK_SELECT")
+            .expect("marker present");
+        let around = &TRAP_RS_SRC[pos..pos.saturating_add(300)];
+        assert!(
+            around.contains("rsp="),
+            "USER_CR3_RETURN_STACK_SELECT must include rsp="
+        );
+        assert!(
+            around.contains("base="),
+            "USER_CR3_RETURN_STACK_SELECT must include base="
+        );
+        assert!(
+            around.contains("top="),
+            "USER_CR3_RETURN_STACK_SELECT must include top="
+        );
+        assert!(
+            around.contains("owner_tid="),
+            "USER_CR3_RETURN_STACK_SELECT must include owner_tid="
+        );
+    }
+
+    // 6. USER_CR3_RETURN_STACK_MAP_FAILED must include a reason= field in page_table.rs.
+    #[test]
+    fn stage143_stack_map_failed_marker_with_reason() {
+        assert!(
+            PAGE_TABLE_SRC.contains("USER_CR3_RETURN_STACK_MAP_FAILED"),
+            "page_table.rs must emit USER_CR3_RETURN_STACK_MAP_FAILED"
+        );
+        let pos = PAGE_TABLE_SRC
+            .find("USER_CR3_RETURN_STACK_MAP_FAILED")
+            .expect("marker present");
+        let around = &PAGE_TABLE_SRC[pos..pos.saturating_add(200)];
+        assert!(
+            around.contains("reason="),
+            "USER_CR3_RETURN_STACK_MAP_FAILED must include reason= field"
+        );
+    }
+
+    // 7. USER_CR3_RETURN_STACK_MAP_OK must be emitted only inside an `if stack_all_ok` block.
+    #[test]
+    fn stage143_stack_map_ok_gated_on_verification() {
+        let fn_start = PAGE_TABLE_SRC
+            .find("fn ensure_kernel_return_context_mapped_for_asid")
+            .expect("function must be defined in page_table.rs");
+        let fn_body = &PAGE_TABLE_SRC[fn_start..];
+        let gate_pos = fn_body
+            .find("if stack_all_ok")
+            .expect("if stack_all_ok gate must exist in the function");
+        let ok_pos = fn_body
+            .find("USER_CR3_RETURN_STACK_MAP_OK")
+            .expect("USER_CR3_RETURN_STACK_MAP_OK must exist");
+        assert!(
+            gate_pos < ok_pos,
+            "USER_CR3_RETURN_STACK_MAP_OK must appear after the `if stack_all_ok` gate"
+        );
+    }
+
+    // 8. write_cr3_for_asid must remain gated behind ctx_mapped in trap.rs.
+    #[test]
+    fn stage143_write_cr3_gated_behind_ctx_mapped() {
+        let fn_start = TRAP_RS_SRC
+            .find("fn ensure_user_return_cr3")
+            .expect("ensure_user_return_cr3 must be defined in trap.rs");
+        let fn_body = &TRAP_RS_SRC[fn_start..];
+        let gate_pos = fn_body
+            .find("if ctx_mapped")
+            .expect("if ctx_mapped gate must exist");
+        let write_pos = fn_body
+            .find("write_cr3_for_asid")
+            .expect("write_cr3_for_asid must be called");
+        assert!(
+            gate_pos < write_pos,
+            "write_cr3_for_asid must appear after the `if ctx_mapped` gate"
+        );
+    }
+
+    // 9. PAGE_FAULT_HANDLED_DEMAND in fault_state.rs must remain gated on hw_demand_ok.
+    #[test]
+    fn stage143_handled_demand_still_gated_on_hw_walk() {
+        assert!(
+            FAULT_SRC.contains("PAGE_FAULT_HANDLED_DEMAND"),
+            "fault_state.rs must retain PAGE_FAULT_HANDLED_DEMAND"
+        );
+        assert!(
+            FAULT_SRC.contains("hw_demand_ok"),
+            "fault_state.rs must retain hw_demand_ok guard for PAGE_FAULT_HANDLED_DEMAND"
+        );
+        let gate_pos = FAULT_SRC
+            .find("hw_demand_ok")
+            .expect("hw_demand_ok guard present");
+        let handled_pos = FAULT_SRC
+            .find("PAGE_FAULT_HANDLED_DEMAND")
+            .expect("marker present");
+        assert!(
+            gate_pos < handled_pos,
+            "hw_demand_ok guard must precede PAGE_FAULT_HANDLED_DEMAND"
+        );
+    }
+
+    // 10. Syscall count must not change.
+    #[test]
+    fn stage143_syscall_count() {
+        assert_eq!(SYSCALL_COUNT, 31, "Stage 143 must not change SYSCALL_COUNT");
+    }
+
+    // 11. Syscall variant count must not change.
+    #[test]
+    fn stage143_syscall_variant_count() {
+        assert_eq!(
+            Syscall::VARIANT_COUNT,
+            23,
+            "Stage 143 must not change Syscall::VARIANT_COUNT"
         );
     }
 }
