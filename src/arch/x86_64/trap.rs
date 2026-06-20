@@ -109,38 +109,21 @@ pub(crate) fn ensure_user_return_cr3(
                 core::arch::asm!("lea {}, [rip + 0]", out(reg) rip, options(nostack, preserves_flags));
                 core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nostack, preserves_flags));
             }
-            // Stage 142: look up the full kernel stack bounds for this tid from
-            // the TCB so the entire live stack window is mapped, not only the
-            // single page that contained the sampled RSP (Stage 141's approach
-            // failed when the post-switch call chain dug ~8 KiB deeper).
-            let (tcb_stack_base, tcb_stack_top) = kernel.with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == tid)
-                    .map(|tcb| {
-                        (
-                            tcb.kernel_context.stack_base.map_or(0u64, |v| v.0),
-                            tcb.kernel_context.stack_top.map_or(0u64, |v| v.0),
-                        )
-                    })
-                    .unwrap_or((0u64, 0u64))
-            });
-            // Fallback: conservative 28 KiB window below sampled RSP when TCB
-            // bounds are unavailable (e.g. uninitialized early-boot task).
-            const STACK_PAGE_SZ: u64 = 4096;
-            const STACK_FLOOR: u64 = 0xFFFF_8000_0000_1000; // region_base + guard_size
-            let (stack_base, stack_top) = if tcb_stack_base != 0 && tcb_stack_top != 0 {
-                (tcb_stack_base, tcb_stack_top)
-            } else {
-                let top = (rsp & !(STACK_PAGE_SZ - 1)) + STACK_PAGE_SZ;
-                let base = (rsp & !(STACK_PAGE_SZ - 1))
-                    .saturating_sub(28 * 1024)
-                    .max(STACK_FLOOR);
-                (base, top)
-            };
+            // Stage 143: scan ALL TCBs for the one whose stack contains the
+            // sampled RSP, so the correct live kernel stack is mapped rather
+            // than the target task's own TCB stack (which may be idle).
+            let (stack_base, stack_top, owner_tid) =
+                find_kernel_stack_bounds_containing_rsp(kernel, rsp);
+            crate::yarm_log!(
+                "USER_CR3_RETURN_STACK_SELECT rsp=0x{:x} base=0x{:x} top=0x{:x} owner_tid={}",
+                rsp,
+                stack_base,
+                stack_top,
+                owner_tid,
+            );
             let ctx_mapped =
                 crate::arch::x86_64::page_table::ensure_kernel_return_context_mapped_for_asid(
-                    task_asid, rip, stack_base, stack_top,
+                    task_asid, rip, rsp, stack_base, stack_top,
                 );
             crate::yarm_log!(
                 "USER_CR3_PRE_IRET_SWITCH tid={} from=0x{:016x} to=0x{:016x} ctx_mapped={}",
@@ -170,6 +153,30 @@ pub(crate) fn ensure_user_return_cr3(
     }
     #[cfg(feature = "hosted-dev")]
     let _ = (kernel, tid, task_asid);
+}
+
+#[cfg(not(feature = "hosted-dev"))]
+fn find_kernel_stack_bounds_containing_rsp(kernel: &KernelState, rsp: u64) -> (u64, u64, u64) {
+    let found = kernel.with_tcbs(|tcbs| {
+        tcbs.iter().flatten().find_map(|tcb| {
+            let base = tcb.kernel_context.stack_base.map_or(0u64, |v| v.0);
+            let top = tcb.kernel_context.stack_top.map_or(0u64, |v| v.0);
+            if base != 0 && top != 0 && rsp >= base && rsp < top {
+                Some((base, top, tcb.tid.0))
+            } else {
+                None
+            }
+        })
+    });
+    found.unwrap_or_else(|| {
+        const PAGE_SZ: u64 = 4096;
+        const STACK_FLOOR: u64 = 0xFFFF_8000_0000_1000;
+        let top = (rsp & !(PAGE_SZ - 1)) + PAGE_SZ;
+        let base = (rsp & !(PAGE_SZ - 1))
+            .saturating_sub(28 * 1024)
+            .max(STACK_FLOOR);
+        (base, top, 0)
+    })
 }
 
 #[cfg(not(feature = "hosted-dev"))]

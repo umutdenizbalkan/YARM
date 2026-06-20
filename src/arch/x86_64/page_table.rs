@@ -933,21 +933,21 @@ pub fn write_cr3_for_asid(_asid: Asid) -> Option<u64> {
     None
 }
 
-/// Stage 141/142: ensure the kernel return context is fully mapped in `asid`'s
-/// root before CR3 is switched to it.
+/// Stage 141/142/143: ensure the kernel return context is fully mapped in
+/// `asid`'s root before CR3 is switched to it.
 ///
-/// Stage 141 repaired the RIP page and the single RSP page.  Stage 142 replaces
-/// the single RSP-page mapping with a full stack-window mapping: every page in
-/// `[stack_base, stack_top)` that is currently present in the live hardware root
-/// is replicated supervisor-only into the target root.  Pages absent from the
-/// live root are skipped because the kernel cannot be touching them right now.
+/// Stage 143 adds `rsp`: the sampled live RSP, used to:
+///   - verify the selected `[stack_base, stack_top)` actually covers the live RSP
+///   - treat the RSP page specially: absent from live root is a hard failure
+///     (wrong stack selected), not a silent skip
 ///
-/// Returns true when the RIP page and all live stack pages resolve in the target
-/// root afterwards.
+/// Returns true when the RIP page and all live stack pages (including the RSP
+/// page) are verified present in the target root afterwards.
 #[cfg(all(not(feature = "hosted-dev"), not(test)))]
 pub fn ensure_kernel_return_context_mapped_for_asid(
     asid: Asid,
     rip: u64,
+    rsp: u64,
     stack_base: u64,
     stack_top: u64,
 ) -> bool {
@@ -957,16 +957,25 @@ pub fn ensure_kernel_return_context_mapped_for_asid(
     };
     let live_root = detect_active_root_phys_from_cr3().unwrap_or(0);
     crate::yarm_log!(
-        "USER_CR3_RETURN_CTX_MAP_BEGIN asid={} rip=0x{:x} stack_base=0x{:x} stack_top=0x{:x}",
+        "USER_CR3_RETURN_CTX_MAP_BEGIN asid={} rip=0x{:x} rsp=0x{:x} stack_base=0x{:x} stack_top=0x{:x}",
         asid.0,
         rip,
+        rsp,
         stack_base,
         stack_top
     );
-    // Stage 142: map the full kernel stack window [stack_base, stack_top).
-    // Only pages present in the live hardware root are replicated; unaccessed
-    // pages are safe to leave unmapped — the kernel cannot touch them between
-    // here and IRET without first faulting under the current (live) root.
+    // Stage 143: verify the selected stack window actually contains sampled RSP.
+    if rsp < stack_base || rsp >= stack_top {
+        crate::yarm_log!(
+            "USER_CR3_RETURN_STACK_MAP_FAILED asid={} reason=rsp_not_in_range rsp=0x{:x} base=0x{:x} top=0x{:x}",
+            asid.0,
+            rsp,
+            stack_base,
+            stack_top
+        );
+        return false;
+    }
+    let rsp_page = rsp & PAGE_MASK;
     crate::yarm_log!(
         "USER_CR3_RETURN_STACK_MAP_BEGIN asid={} base=0x{:x} top=0x{:x}",
         asid.0,
@@ -976,23 +985,48 @@ pub fn ensure_kernel_return_context_mapped_for_asid(
     let mut stack_all_ok = true;
     let mut page_va = stack_base & PAGE_MASK;
     while page_va < stack_top {
+        let is_rsp_page = page_va == rsp_page;
         let already_mapped = resolve_page_in_root(target_root, VirtAddr(page_va)).is_some();
         if !already_mapped {
-            if let Some(src) = resolve_page_in_root(live_root, VirtAddr(page_va)) {
-                let phys = src.addr();
-                match map_page(
-                    asid,
-                    VirtAddr(page_va),
-                    PhysAddr(phys),
-                    PageFlags::KERNEL_RW,
-                ) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        stack_all_ok = false;
+            match resolve_page_in_root(live_root, VirtAddr(page_va)) {
+                Some(src) => {
+                    let phys = src.addr();
+                    match map_page(
+                        asid,
+                        VirtAddr(page_va),
+                        PhysAddr(phys),
+                        PageFlags::KERNEL_RW,
+                    ) {
+                        Ok(_) => {}
+                        Err(_) => {
+                            stack_all_ok = false;
+                        }
                     }
                 }
+                None => {
+                    if is_rsp_page {
+                        // RSP page absent from live root means the wrong stack
+                        // was selected; the CPU is certainly executing on it.
+                        crate::yarm_log!(
+                            "USER_CR3_RETURN_STACK_MAP_FAILED asid={} reason=rsp_page_absent_from_live va=0x{:x}",
+                            asid.0,
+                            page_va
+                        );
+                        stack_all_ok = false;
+                    }
+                    // else: non-RSP page absent from live root — kernel not
+                    // currently using this page, safe to leave unmapped.
+                }
             }
-            // else: absent from live root — kernel is not using this page now.
+        }
+        // Stage 143: after the mapping attempt, the RSP page must be present.
+        if is_rsp_page && resolve_page_in_root(target_root, VirtAddr(page_va)).is_none() {
+            crate::yarm_log!(
+                "USER_CR3_RETURN_STACK_MAP_FAILED asid={} reason=rsp_page_not_in_target va=0x{:x}",
+                asid.0,
+                page_va
+            );
+            stack_all_ok = false;
         }
         let pte = resolve_page_in_root(target_root, VirtAddr(page_va));
         let present = pte.is_some();
@@ -1017,9 +1051,18 @@ pub fn ensure_kernel_return_context_mapped_for_asid(
         page_va += PAGE_SIZE_U64;
     }
     if stack_all_ok {
-        crate::yarm_log!("USER_CR3_RETURN_STACK_MAP_OK asid={}", asid.0);
+        crate::yarm_log!(
+            "USER_CR3_RETURN_STACK_MAP_OK asid={} base=0x{:x} top=0x{:x} rsp=0x{:x}",
+            asid.0,
+            stack_base,
+            stack_top,
+            rsp
+        );
     } else {
-        crate::yarm_log!("USER_CR3_RETURN_STACK_MAP_FAILED asid={}", asid.0);
+        crate::yarm_log!(
+            "USER_CR3_RETURN_STACK_MAP_FAILED asid={} reason=stack_verification_failed",
+            asid.0
+        );
     }
     // RIP page: supervisor-only executable (kernel RX, user=false).
     let rip_ok = ensure_kernel_return_page_mapped(
@@ -1111,6 +1154,7 @@ fn ensure_kernel_return_page_mapped(
 pub fn ensure_kernel_return_context_mapped_for_asid(
     _asid: Asid,
     _rip: u64,
+    _rsp: u64,
     _stack_base: u64,
     _stack_top: u64,
 ) -> bool {
