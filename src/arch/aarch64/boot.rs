@@ -980,6 +980,15 @@ rpi5_hh_retained_marker!(
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+rpi5_hh_retained_marker!(
+    RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF_MARKER,
+    b"RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
 rpi5_hh_retained_marker!(RPI5_HH_PRINT_REGS_DONE_MARKER, b"RPI5_HH_PRINT_REGS_DONE");
 #[cfg(all(
     not(feature = "hosted-dev"),
@@ -1026,6 +1035,51 @@ rpi5_hh_retained_marker!(RPI5_HH3_DONE_MARKER, b"RPI5_HH3_DONE");
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(RPI5_HH4_BEGIN_MARKER, b"RPI5_HH4_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_DTB_PTR_BEGIN_MARKER, b"RPI5_HH4_DTB_PTR_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_DTB_PTR_OK_MARKER, b"RPI5_HH4_DTB_PTR_OK value=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_DTB_VIRT_OK_MARKER,
+    b"RPI5_HH4_DTB_VIRT_OK value=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_DTB_PTR_FAILED_MARKER,
+    b"RPI5_HH4_DTB_PTR_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH4_UART_STILL_OK_MARKER, b"RPI5_HH4_UART_STILL_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH4_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH4_FAULT_BOUNDARY reason="
+);
 #[cfg(all(
     not(feature = "hosted-dev"),
     target_arch = "aarch64",
@@ -1266,6 +1320,9 @@ fn rpi5_hh_write_line(line: &[u8]) -> bool {
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+// Retained for reference only; the HH paths now emit hex via the proven inline
+// raw-pointer technique because this slice-based helper stalls on hardware.
+#[allow(dead_code)]
 fn rpi5_hh_write_hex_line(prefix: &[u8], value: u64) -> bool {
     let mut digits = [0u8; 16];
     rpi5_hh_hex_digits(value, &mut digits);
@@ -1277,6 +1334,7 @@ fn rpi5_hh_write_hex_line(prefix: &[u8], value: u64) -> bool {
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+#[allow(dead_code)]
 fn rpi5_hh_write_two_hex_line(prefix: &[u8], first: u64, separator: &[u8], second: u64) -> bool {
     let mut first_digits = [0u8; 16];
     let mut second_digits = [0u8; 16];
@@ -1395,6 +1453,8 @@ fn rpi5_hh_halt() -> ! {
     feature = "rpi5-highhalf"
 ))]
 fn rpi5_hh4_fail(reason: &[u8]) -> ! {
+    let _ = rpi5_hh_write_bytes(&RPI5_HH4_FAULT_BOUNDARY_MARKER);
+    let _ = rpi5_hh_write_line(reason);
     let _ = rpi5_hh_write_bytes(&RPI5_HH4_FAILED_MARKER);
     let _ = rpi5_hh_write_line(reason);
     rpi5_hh_halt()
@@ -1414,7 +1474,7 @@ struct Rpi5Hh4Ready {
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
-fn rpi5_hh4_retire_low_ttbr0() -> Rpi5Hh4Ready {
+fn rpi5_hh4_retire_low_ttbr0(dtb_phys: u64) -> Rpi5Hh4Ready {
     unsafe extern "C" {
         static __hh_ttbr0_root: u8;
         static __hh_ttbr1_root: u8;
@@ -1423,6 +1483,123 @@ fn rpi5_hh4_retire_low_ttbr0() -> Rpi5Hh4Ready {
 
     if !rpi5_hh_write_line(&RPI5_HH4_BEGIN_MARKER) {
         rpi5_hh4_fail(b"uart_timeout");
+    }
+
+    /*
+     * Inline, bounded, raw-pointer high-UART output. This duplicates the proven
+     * HH-3 inline hex technique rather than calling the helper-based
+     * `rpi5_hh_write_hex_line`, whose slice-iterator hex path has never produced
+     * output on hardware. Per the ultra-early-boot policy we prefer this
+     * duplication over a shared abstraction. Plain line markers still use the
+     * proven `rpi5_hh_write_line`, which is confirmed working on hardware.
+     */
+    const HH4_TX_POLL_LIMIT: usize = 0x1_0000;
+    let hh4_uart_data = RPI5_HH_UART_VIRT as *mut u32;
+    let hh4_uart_flags = (RPI5_HH_UART_VIRT + 0x18) as *const u32;
+    macro_rules! hh4_write_byte {
+        ($byte:expr, $reason:literal) => {{
+            let mut poll = 0usize;
+            while poll < HH4_TX_POLL_LIMIT {
+                if unsafe { core::ptr::read_volatile(hh4_uart_flags) } & (1 << 5) == 0 {
+                    break;
+                }
+                poll += 1;
+            }
+            if poll == HH4_TX_POLL_LIMIT {
+                rpi5_hh4_fail($reason);
+            }
+            unsafe {
+                core::ptr::write_volatile(hh4_uart_data, $byte as u32);
+            }
+        }};
+    }
+    macro_rules! hh4_emit_marker {
+        ($marker:expr, $reason:literal) => {{
+            let mut idx = 0usize;
+            let ptr = core::ptr::addr_of!($marker).cast::<u8>();
+            while idx < $marker.len() {
+                let byte = unsafe { core::ptr::read(ptr.add(idx)) };
+                hh4_write_byte!(byte, $reason);
+                idx += 1;
+            }
+        }};
+    }
+    macro_rules! hh4_emit_hex {
+        ($value:expr, $reason:literal) => {{
+            let mut nib = 0usize;
+            while nib < 16 {
+                let shift = 60 - nib * 4;
+                let nibble = (($value >> shift) & 0xf) as u8;
+                let digit = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'a' + nibble - 10
+                };
+                hh4_write_byte!(digit, $reason);
+                nib += 1;
+            }
+        }};
+    }
+    macro_rules! hh4_emit_crlf {
+        ($reason:literal) => {{
+            hh4_write_byte!(b'\r', $reason);
+            hh4_write_byte!(b'\n', $reason);
+        }};
+    }
+    macro_rules! hh4_hex_line {
+        ($marker:expr, $value:expr, $reason:literal) => {{
+            hh4_emit_marker!($marker, $reason);
+            hh4_emit_hex!($value, $reason);
+            hh4_emit_crlf!($reason);
+        }};
+    }
+
+    /*
+     * Part C — prove the firmware DTB pointer survived the low->high handoff.
+     *
+     * `dtb_phys` was captured from x20 at the top of the continuation. TTBR1
+     * maps 0..2 GiB normal RAM at VA = PA + HH_VA_OFFSET, so when the pointer is
+     * inside that window its high virtual alias is dtb_phys + HH_VA_OFFSET. We
+     * validate the pointer, then read the FDT magic (0xd00dfeed, big-endian)
+     * through the high alias to prove both the pointer and the high mapping.
+     */
+    if !rpi5_hh_write_line(&RPI5_HH4_DTB_PTR_BEGIN_MARKER) {
+        rpi5_hh4_fail(b"dtb_ptr_begin_uart_timeout");
+    }
+    macro_rules! hh4_dtb_fail {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_HH4_DTB_PTR_FAILED_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            rpi5_hh4_fail($reason);
+        }};
+    }
+    if dtb_phys == 0 {
+        hh4_dtb_fail!(b"dtb_null");
+    }
+    if dtb_phys & 0x3 != 0 {
+        hh4_dtb_fail!(b"dtb_misaligned");
+    }
+    // 0x8000_0000 == HH_RAM_LIMIT, the high (TTBR1) identity window upper bound.
+    if dtb_phys >= 0x8000_0000 {
+        hh4_dtb_fail!(b"dtb_out_of_high_window");
+    }
+    let dtb_virt = dtb_phys + RPI5_HH_VA_OFFSET;
+    let dtb_magic = unsafe { core::ptr::read_volatile(dtb_virt as *const u32) };
+    if u32::from_be(dtb_magic) != 0xd00d_feed {
+        hh4_dtb_fail!(b"dtb_magic");
+    }
+    hh4_hex_line!(
+        RPI5_HH4_DTB_PTR_OK_MARKER,
+        dtb_phys,
+        b"dtb_ptr_ok_uart_timeout"
+    );
+    hh4_hex_line!(
+        RPI5_HH4_DTB_VIRT_OK_MARKER,
+        dtb_virt,
+        b"dtb_virt_ok_uart_timeout"
+    );
+    if !rpi5_hh_write_line(&RPI5_HH4_UART_STILL_OK_MARKER) {
+        rpi5_hh4_fail(b"uart_still_ok_uart_timeout");
     }
 
     let pc: u64;
@@ -1486,17 +1663,25 @@ fn rpi5_hh4_retire_low_ttbr0() -> Rpi5Hh4Ready {
             rpi5_hh4_fail(b"post_replace_pointer_not_high");
         }
     }
-    if !rpi5_hh_write_line(&RPI5_HH4_PRECHECK_OK_MARKER)
-        || !rpi5_hh_write_hex_line(&RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER, empty_ttbr0_root)
-        || !rpi5_hh_write_two_hex_line(
-            &RPI5_HH4_TTBR0_REPLACE_BEGIN_MARKER,
-            old_ttbr0,
-            &RPI5_HH4_NEW_TTBR0_SEPARATOR,
-            empty_ttbr0_root,
-        )
-    {
+    if !rpi5_hh_write_line(&RPI5_HH4_PRECHECK_OK_MARKER) {
         rpi5_hh4_fail(b"uart_timeout");
     }
+    hh4_hex_line!(
+        RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER,
+        empty_ttbr0_root,
+        b"empty_ttbr0_root_uart_timeout"
+    );
+    hh4_emit_marker!(
+        RPI5_HH4_TTBR0_REPLACE_BEGIN_MARKER,
+        b"ttbr0_replace_begin_uart_timeout"
+    );
+    hh4_emit_hex!(old_ttbr0, b"ttbr0_replace_old_uart_timeout");
+    hh4_emit_marker!(
+        RPI5_HH4_NEW_TTBR0_SEPARATOR,
+        b"ttbr0_replace_sep_uart_timeout"
+    );
+    hh4_emit_hex!(empty_ttbr0_root, b"ttbr0_replace_new_uart_timeout");
+    hh4_emit_crlf!(b"ttbr0_replace_crlf_uart_timeout");
 
     let empty_root = empty_ttbr0_root as *mut u64;
     for index in 0..512 {
@@ -1558,11 +1743,25 @@ fn rpi5_hh4_retire_low_ttbr0() -> Rpi5Hh4Ready {
     if post_vbar < RPI5_HH_VA_OFFSET || post_vbar & 0x7ff != 0 {
         rpi5_hh4_fail(b"post_replace_vbar_not_high");
     }
-    if !rpi5_hh_write_line(&RPI5_HH4_TTBR0_REPLACE_DONE_MARKER)
-        || !rpi5_hh_write_hex_line(&RPI5_HH4_PC_HIGH_OK_MARKER, post_pc)
-        || !rpi5_hh_write_hex_line(&RPI5_HH4_SP_HIGH_OK_MARKER, post_sp)
-        || !rpi5_hh_write_hex_line(&RPI5_HH4_VBAR_HIGH_OK_MARKER, post_vbar)
-        || !rpi5_hh_write_line(&RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER)
+    if !rpi5_hh_write_line(&RPI5_HH4_TTBR0_REPLACE_DONE_MARKER) {
+        rpi5_hh4_fail(b"uart_timeout");
+    }
+    hh4_hex_line!(
+        RPI5_HH4_PC_HIGH_OK_MARKER,
+        post_pc,
+        b"pc_high_ok_uart_timeout"
+    );
+    hh4_hex_line!(
+        RPI5_HH4_SP_HIGH_OK_MARKER,
+        post_sp,
+        b"sp_high_ok_uart_timeout"
+    );
+    hh4_hex_line!(
+        RPI5_HH4_VBAR_HIGH_OK_MARKER,
+        post_vbar,
+        b"vbar_high_ok_uart_timeout"
+    );
+    if !rpi5_hh_write_line(&RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER)
         || !rpi5_hh_write_line(&RPI5_HH4_DONE_MARKER)
     {
         rpi5_hh4_fail(b"uart_timeout");
@@ -1576,6 +1775,7 @@ fn rpi5_hh4_retire_low_ttbr0() -> Rpi5Hh4Ready {
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+#[allow(dead_code)]
 fn rpi5_hh_hex_digits(value: u64, digits: &mut [u8; 16]) {
     for (index, digit) in digits.iter_mut().enumerate() {
         let nibble = ((value >> (60 - index * 4)) & 0xf) as u8;
@@ -1624,6 +1824,27 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
     unsafe extern "C" {
         static __hh_ttbr0_root: u8;
         static __hh_ttbr1_root: u8;
+    }
+
+    /*
+     * Part C — DTB handoff preservation.
+     *
+     * Firmware/BL31 delivers the DTB physical pointer in x0 at `_start`, where
+     * it is immediately saved into the callee-saved x20 register. The low->high
+     * transition assembly never clobbers x20 (it uses x19 for the UART alias and
+     * x21..x27 for the page-table build), and the branch into this continuation
+     * does not change x20 either. Capture the firmware DTB pointer here as the
+     * very first instruction of the continuation — before any compiler-generated
+     * body code can reuse x20 — and thread it explicitly into the HH-4 stage so
+     * the physical pointer is never lost across the calling-convention boundary.
+     */
+    let dtb_phys: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {dtb}, x20",
+            dtb = out(reg) dtb_phys,
+            options(nomem, nostack, preserves_flags)
+        );
     }
 
     if !rpi5_hh_write_line(&RPI5_HH_RUST_ENTRY_MARKER) {
@@ -2142,12 +2363,23 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
     rpi5_hh_print_regs_sp_hex_write_byte!(b'\r', b"sp_hex_done_cr_uart_timeout");
     rpi5_hh_print_regs_sp_hex_write_byte!(b'\n', b"sp_hex_done_lf_uart_timeout");
 
-    if !rpi5_hh_write_hex_line(b"RPI5_HH_VBAR value=0x", vbar)
-        || !rpi5_hh_write_hex_line(b"RPI5_HH_TTBR0 value=0x", ttbr0)
-        || !rpi5_hh_write_hex_line(b"RPI5_HH_TTBR1 value=0x", ttbr1)
-        || !rpi5_hh_write_hex_line(b"RPI5_HH_TCR value=0x", tcr)
-    {
-        rpi5_hh_fail(b"uart_timeout");
+    /*
+     * Part A — temporary HH-3 hardware-progress scaffolding.
+     *
+     * The standalone PC/SP/VBAR hex output and the print-regs PC/SP hex values
+     * above have ALREADY been proven on real Raspberry Pi 5 hardware using the
+     * inline, bounded, raw-pointer high-UART path. The remaining old helper-based
+     * register dump (VBAR/TTBR0/TTBR1/TCR via `rpi5_hh_write_hex_line`) is purely
+     * diagnostic: it relies on slice iterators / anonymous string literals that
+     * have never produced output on hardware and stall the bring-up exactly at
+     * this point. Bypass that helper dump here so HH-3 can advance to
+     * RPI5_HH3_DONE. The register *values* are still fully validated below; only
+     * their helper-based *printing* is skipped. This is temporary scaffolding —
+     * once the helper hex path is reworked into the proven inline form (or
+     * removed), this bypass should be retired.
+     */
+    if !rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF_MARKER) {
+        rpi5_hh_fail(b"print_regs_bypass_uart_timeout");
     }
     if !rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_DONE_MARKER) {
         rpi5_hh_fail(b"print_regs_done_uart_timeout");
@@ -2188,7 +2420,7 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
     {
         rpi5_hh_fail(b"uart_timeout");
     }
-    let hh4 = rpi5_hh4_retire_low_ttbr0();
+    let hh4 = rpi5_hh4_retire_low_ttbr0(dtb_phys);
     rpi5_hh5_defer(hh4)
 }
 

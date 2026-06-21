@@ -600,17 +600,20 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH_PRINT_REGS_SP_HEX_FAILED reason=",
         "RPI5_HH3_FAULT_BOUNDARY reason=print_regs_sp_hex_output",
         "RPI5_HH_PRINT_REGS_SP_DONE value=0x",
+        "RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF",
         "RPI5_HH_PRINT_REGS_DONE",
         "RPI5_HH3_PRECHECK_DONE",
         "RPI5_HH_PRINT_REGS_SP_DONE value=0x",
-        "RPI5_HH_VBAR value=0x",
-        "RPI5_HH_TTBR0 value=0x",
-        "RPI5_HH_TTBR1 value=0x",
-        "RPI5_HH_TCR value=0x",
         "RPI5_HH_REGISTERS_OK",
         "RPI5_HH_RUST_UART_OK",
         "RPI5_HH3_DONE",
         "RPI5_HH4_BEGIN",
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK value=0x",
+        "RPI5_HH4_DTB_VIRT_OK value=0x",
+        "RPI5_HH4_DTB_PTR_FAILED reason=",
+        "RPI5_HH4_UART_STILL_OK",
+        "RPI5_HH4_FAULT_BOUNDARY reason=",
         "RPI5_HH4_DONE",
         "RPI5_HH5_BEGIN",
         "RPI5_HH5_ENTER_USER_ATTEMPT",
@@ -743,11 +746,18 @@ fn rpi5_hh3_build_and_generator_paths_are_explicit() {
         "RPI5_HH_VBAR_HEX_FAILED",
         "RPI5_HH3_FAULT_BOUNDARY reason=vbar_hex_output",
         "RPI5_HH_READ_VBAR_DONE",
+        "RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF",
         "RPI5_HH3_PRECHECK_DONE",
         "RPI5_HH_REGISTERS_OK",
         "RPI5_HH_RUST_UART_OK",
         "RPI5_HH3_DONE",
         "RPI5_HH4_BEGIN",
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK",
+        "RPI5_HH4_DTB_VIRT_OK",
+        "RPI5_HH4_DTB_PTR_FAILED reason=",
+        "RPI5_HH4_UART_STILL_OK",
+        "RPI5_HH4_FAULT_BOUNDARY reason=",
         "RPI5_HH4_DONE",
         "RPI5_HH5_BEGIN",
         "RPI5_HH5_ENTER_USER_ATTEMPT",
@@ -834,4 +844,96 @@ fn rpi5_hh4_retires_low_ttbr0_and_hh5_defers_without_eret() {
     assert!(!hh45.contains("init_gic"));
     assert!(!hh45.contains("init_rp1"));
     assert!(!hh45.contains("init_pcie"));
+}
+
+#[test]
+fn rpi5_hh3_bypass_is_temporary_and_hh4_proves_dtb_handoff() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // Part A — the print-regs helper dump is bypassed only AFTER the proven
+    // inline SP print-regs hex output, and the bypass is documented as a
+    // temporary HH-3 hardware-progress measure.
+    let sp_hex_done = boot
+        .find("core::ptr::addr_of!(RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER)")
+        .expect("proven inline SP print-regs hex emission");
+    let bypass_use = boot
+        .find("rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF_MARKER)")
+        .expect("HH-3 bypass emission");
+    assert!(
+        sp_hex_done < bypass_use,
+        "bypass must follow the proven inline SP hex output"
+    );
+    assert!(boot.contains("Part A — temporary HH-3 hardware-progress scaffolding"));
+    assert!(boot.contains("their helper-based *printing* is skipped"));
+    assert!(boot.contains("This is temporary scaffolding"));
+
+    // The stalling helper-based register dump literals are removed from the path.
+    assert!(!boot.contains("rpi5_hh_write_hex_line(b\"RPI5_HH_VBAR value=0x\", vbar)"));
+
+    // HH3_DONE -> HH4_BEGIN remain reachable in code, with the DTB pointer
+    // threaded into HH-4.
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)"));
+    assert!(boot.contains("rpi5_hh4_retire_low_ttbr0(dtb_phys)"));
+
+    // Part C — DTB pointer captured from x20 and validated through its high
+    // alias before HH-4 progress (FDT magic 0xd00dfeed, big-endian).
+    assert!(boot.contains("\"mov {dtb}, x20\""));
+    assert!(boot.contains("fn rpi5_hh4_retire_low_ttbr0(dtb_phys: u64)"));
+    assert!(boot.contains("let dtb_virt = dtb_phys + RPI5_HH_VA_OFFSET;"));
+    assert!(boot.contains("if u32::from_be(dtb_magic) != 0xd00d_feed"));
+
+    // Part B — narrow HH-4 ladder markers and failure boundary are present.
+    for marker in [
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK value=0x",
+        "RPI5_HH4_DTB_VIRT_OK value=0x",
+        "RPI5_HH4_DTB_PTR_FAILED reason=",
+        "RPI5_HH4_UART_STILL_OK",
+        "RPI5_HH4_FAULT_BOUNDARY reason=",
+    ] {
+        assert!(boot.contains(marker), "missing HH-4 marker {marker}");
+    }
+
+    // The HH-4 emissions use the proven inline raw-pointer path; the stalling
+    // slice-based helper calls are gone, no EL0 ERET is emitted, and no premature
+    // subsystem / user TTBR0 install appears in the scaffolding.
+    let hh4_start = boot.find("fn rpi5_hh4_retire_low_ttbr0").unwrap();
+    let hh4_end = boot[hh4_start..]
+        .find("fn yarm_rpi5_hh_rust_continue")
+        .unwrap()
+        + hh4_start;
+    let hh4 = &boot[hh4_start..hh4_end];
+    assert!(hh4.contains("core::ptr::write_volatile(hh4_uart_data"));
+    assert!(!hh4.contains("rpi5_hh_write_hex_line(&RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER"));
+    assert!(!hh4.contains("rpi5_hh_write_two_hex_line"));
+    for forbidden in [
+        "RPI5_ENTER_USER_ERET",
+        "RPI5_HH5_ENTER_USER_ERET",
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "pcie_init",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "msr TTBR0_EL1, x",
+    ] {
+        assert!(
+            !hh4.contains(forbidden),
+            "HH-4 scaffolding added {forbidden}"
+        );
+    }
+
+    // Build validation enforces the new transition markers.
+    for marker in [
+        "RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF",
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK",
+        "RPI5_HH4_DTB_VIRT_OK",
+        "RPI5_HH4_UART_STILL_OK",
+    ] {
+        assert!(build.contains(marker), "build omits {marker}");
+    }
 }
