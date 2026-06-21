@@ -35,10 +35,14 @@ In-tree but **not yet re-confirmed on hardware**: the FDT walker advance bug was
 fixed and the walk now emits precise phase markers
 (`RPI5_HH5_FDT_HEADER_OK`, `RPI5_HH5_FDT_BLOCKS_OK`, `RPI5_HH5_FDT_CHOSEN_FOUND`,
 …), a missing initrd is non-fatal (`RPI5_HH5_INITRD_FAILED reason=missing`), and
-the bridge builds an allocator/handoff descriptor before deferring with a precise
-reason (`RPI5_HH5_DEFERRED reason=initrd_missing` or
-`reason=normal_kernel_entry_requires_low_allocator`). This still needs a
-hardware run to confirm. See `doc/RPI5_BRINGUP.md` and
+the bridge now brings up a **real high-half physical-frame allocator** in the
+TTBR1-mapped HH heap plus a boot-info record (`RPI5_HH5_ALLOC_ADAPTER_OK`,
+`RPI5_KERNEL_PMEM_OK`, `RPI5_KERNEL_BOOTINFO_OK`). The old
+`normal_kernel_entry_requires_low_allocator` deferral is therefore replaced; the
+remaining blocker is the kernel global heap / full VM layout
+(`RPI5_HH5_DEFERRED reason=kernel_bootstrap_requires_global_heap_and_full_vm`, or
+`reason=initrd_missing` when no initrd is present). This still needs a hardware
+run to confirm. See `doc/RPI5_BRINGUP.md` and
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## First userspace target

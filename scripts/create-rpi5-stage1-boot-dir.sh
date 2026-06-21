@@ -271,12 +271,19 @@ Expected high-half diagnostic markers:
   RPI5_HH5_ALLOC_BRIDGE_OK
   RPI5_HH5_HANDOFF_BEGIN
   RPI5_HH5_HANDOFF_OK virt=0x...
-  RPI5_HH5_DEFERRED reason=normal_kernel_entry_requires_low_allocator  (or reason=initrd_missing)
+  RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN / RPI5_HH5_NORMAL_BOOT_AUDIT_DONE
+  RPI5_HH5_BOOT_INPUT_OK virt=0x...
+  RPI5_HH5_ALLOC_ADAPTER_BEGIN / RPI5_HH5_ALLOC_ADAPTER_OK
+  RPI5_HH5_ENTER_KERNEL_BEGIN
+  RPI5_KERNEL_ENTRY_BEGIN / RPI5_KERNEL_DTB_PARSE_OK / RPI5_KERNEL_INITRD_OK
+  RPI5_KERNEL_PMEM_OK / RPI5_KERNEL_BOOTINFO_OK
+  RPI5_HH5_DEFERRED reason=kernel_bootstrap_requires_global_heap_and_full_vm  (or reason=initrd_missing)
   RPI5_HH5_DONE status=deferred
 
-HH-5 builds a high-alias-only initrd/allocator/handoff bridge, then defers
-normal kernel entry (which still needs a low-physical allocator) with a precise
-reason. An initrd may be staged with --initrd-input; if present in the DTB
+HH-5 builds a high-alias-only initrd/allocator/handoff bridge, then brings up a
+real high-half physical-frame allocator and boot-info record before deferring at
+the normal kernel bootstrap (which still needs the kernel global heap and full
+VM layout). An initrd may be staged with --initrd-input; if present in the DTB
 /chosen node it is discovered and validated, otherwise HH-5 reports it missing.
 EOF_HIGHHALF
 fi

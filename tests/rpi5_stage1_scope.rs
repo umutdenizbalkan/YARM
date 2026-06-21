@@ -1016,8 +1016,11 @@ fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
         assert!(!hh5.contains(forbidden), "HH5 bridge added {forbidden}");
     }
 
-    // Deferral remains explicit and precise (no silent hang).
-    assert!(hh5.contains("normal_kernel_entry_requires_low_allocator"));
+    // Deferral remains explicit and precise (no silent hang). The old
+    // low-allocator deferral has been replaced by a real high-half boot
+    // allocator; the remaining blocker is the kernel global heap / full VM.
+    assert!(!hh5.contains("normal_kernel_entry_requires_low_allocator"));
+    assert!(hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
     assert!(hh5.contains("initrd_missing"));
 
     // Build + fixture validators require the new HH5 markers.
@@ -1128,4 +1131,83 @@ fn rpi5_hh5_fdt_walker_is_bounded_with_precise_phase_markers() {
     assert!(boot.contains("RPI5_HH5_DEFERRED reason="));
     assert!(boot.contains("b\"bad_cell_width\""));
     assert!(boot.contains("b\"initrd_missing\""));
+}
+
+#[test]
+fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // Task A-D markers exist in source and are required by the image validator.
+    for marker in [
+        "RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN",
+        "RPI5_HH5_NORMAL_BOOT_AUDIT_DONE",
+        "RPI5_HH5_BOOT_INPUT_OK virt=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_OK",
+        "RPI5_HH5_ALLOC_ADAPTER_FAILED reason=",
+        "RPI5_HH5_ENTER_KERNEL_BEGIN",
+        "RPI5_KERNEL_ENTRY_BEGIN",
+        "RPI5_KERNEL_DTB_PARSE_BEGIN",
+        "RPI5_KERNEL_DTB_PARSE_OK",
+        "RPI5_KERNEL_INITRD_OK",
+        "RPI5_KERNEL_PMEM_BEGIN",
+        "RPI5_KERNEL_PMEM_OK free_pages=0x",
+        "RPI5_KERNEL_BOOTINFO_OK",
+    ] {
+        assert!(boot.contains(marker), "boot omits bridge marker {marker}");
+        assert!(build.contains(marker), "build omits bridge marker {marker}");
+    }
+
+    // Isolate the HH5 bridge body.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Task C: a real PhysicalFrameAllocator is placed at a HIGH virtual address
+    // (HH heap bump region), initialized over a bounded usable window, and
+    // never built from a low-VA pointer.
+    assert!(hh5.contains("PhysicalFrameAllocator"));
+    assert!(hh5.contains("init_from_memory_map(&regions)"));
+    assert!(hh5.contains("alloc_meta_virt as *mut PhysicalFrameAllocator"));
+    assert!(hh5.contains("alloc_frame()"));
+    assert!(hh5.contains("free_frame(test_frame)"));
+    // Allocator metadata pointer is a high VA, not a *_phys cast.
+    assert!(!hh5.contains("alloc_base_phys as *"));
+    assert!(!hh5.contains("usable_start as *"));
+
+    // Task D: boot-info record lives at a high VA and is read back.
+    assert!(hh5.contains("bootinfo_virt as *mut Rpi5HhKernelBootInfo"));
+    assert!(hh5.contains("RPI5_HH_BOOTINFO_MAGIC"));
+
+    // The window stays inside the TTBR1 2 GiB high map.
+    assert!(hh5.contains("0x8000_0000"));
+
+    // Precise deferral; still no userspace, no subsystem starts, no ERET.
+    assert!(hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
+    assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("core::arch::asm!(\"eret\""));
+    assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
+    for forbidden in [
+        "bootstrap_first_user_task",
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "panic!",
+        "unwrap()",
+        "yarm_log!",
+        "printk",
+        "scheduler",
+    ] {
+        assert!(!hh5.contains(forbidden), "bridge added {forbidden}");
+    }
 }

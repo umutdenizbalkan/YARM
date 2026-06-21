@@ -1392,6 +1392,126 @@ rpi5_hh_retained_marker!(
     RPI5_HH5_ENTER_KERNEL_BEGIN_MARKER,
     b"RPI5_HH5_ENTER_KERNEL_BEGIN"
 );
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN_MARKER,
+    b"RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_NORMAL_BOOT_AUDIT_DONE_MARKER,
+    b"RPI5_HH5_NORMAL_BOOT_AUDIT_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_BOOT_INPUT_OK_MARKER,
+    b"RPI5_HH5_BOOT_INPUT_OK virt=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_RANGE_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_RANGE usable_start=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_USABLE_END_SEP_MARKER,
+    b" usable_end=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_FAILED_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_ENTRY_BEGIN_MARKER, b"RPI5_KERNEL_ENTRY_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_DTB_PARSE_BEGIN_MARKER,
+    b"RPI5_KERNEL_DTB_PARSE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_DTB_PARSE_OK_MARKER, b"RPI5_KERNEL_DTB_PARSE_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_INITRD_OK_MARKER, b"RPI5_KERNEL_INITRD_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_PMEM_BEGIN_MARKER, b"RPI5_KERNEL_PMEM_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_PMEM_OK_MARKER,
+    b"RPI5_KERNEL_PMEM_OK free_pages=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_BOOTINFO_OK_MARKER, b"RPI5_KERNEL_BOOTINFO_OK");
 // Devicetree reference names compared via raw-pointer reads (no anonymous
 // literals, no slice iterators) so the lookup stays on the proven HH path.
 #[cfg(all(
@@ -2390,6 +2510,35 @@ struct Rpi5HhBootHandoff {
 ))]
 const RPI5_HH5_HANDOFF_MAGIC: u64 = 0x5250_4935_4848_3542; // "RPI5HH5B"
 
+/// Compact high-half boot-info record produced by the HH5 kernel-entry shim
+/// once the high-half physical-frame allocator is initialized. Lives at a high
+/// virtual address in the HH heap; no field is ever dereferenced through a low
+/// VA. This is the high-half equivalent of the normal kernel boot-info, built
+/// without the normal kernel's global heap or full VM layout.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Rpi5HhKernelBootInfo {
+    magic: u64,
+    total_frames: u64,
+    free_frames: u64,
+    usable_start: u64,
+    usable_end: u64,
+    handoff_virt: u64,
+    max_cpus: u64,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH_BOOTINFO_MAGIC: u64 = 0x5250_4935_4B42_4900; // "RPI5KBI\0"
+
 /*
  * HH-5 high-half initrd / allocator bridge.
  *
@@ -2677,21 +2826,217 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     }
     hh5_hex_line!(RPI5_HH5_HANDOFF_OK_MARKER, heap_virt_start);
 
-    /*
-     * Part E — normal kernel entry is intentionally NOT called.
-     *
-     * The bridge above is proven, but the normal YARM bootstrap still requires a
-     * low-physical frame allocator and low identity mappings that HH-4 retired.
-     * Bridging that safely is the next milestone; until then we defer with a
-     * precise reason rather than faulting. No task scheduling, GIC, RP1, PCIe,
-     * or service chain is started, no user TTBR0 is installed, and no EL0 ERET
-     * is executed.
-     */
-    if initrd_present {
-        hh5_defer!(b"normal_kernel_entry_requires_low_allocator");
-    } else {
+    // Without an initrd there is nothing to boot from; defer as before.
+    if !initrd_present {
         hh5_defer!(b"initrd_missing");
     }
+
+    /*
+     * Task A — normal-boot audit.
+     *
+     * The previous low-allocator deferral was too pessimistic:
+     * `PhysicalFrameAllocator` is fully self-contained (all bookkeeping lives
+     * inside the struct and `alloc_frame` returns physical addresses as plain
+     * numbers), so it needs no low direct map. It only needs its metadata placed
+     * at a mapped address. We can therefore place it in the TTBR1-mapped HH heap
+     * (high alias) and bring up a real boot allocator without ever touching a
+     * low VA. Re-affirm the high-alias contract first.
+     */
+    if !rpi5_hh_write_line(&RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    if dtb_virt != dtb_phys + RPI5_HH_VA_OFFSET {
+        hh5_fault!(b"audit_dtb_alias");
+    }
+    if initrd_virt_start != initrd_phys_start + RPI5_HH_VA_OFFSET
+        || initrd_virt_end != initrd_phys_end + RPI5_HH_VA_OFFSET
+    {
+        hh5_fault!(b"audit_initrd_alias");
+    }
+    if heap_virt_start != heap_phys_start + RPI5_HH_VA_OFFSET {
+        hh5_fault!(b"audit_heap_alias");
+    }
+    if kernel_phys_end <= kernel_phys_start {
+        hh5_fault!(b"audit_kernel_range");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_NORMAL_BOOT_AUDIT_DONE_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // Task B — high-half-safe boot input adapter: re-read the handoff through
+    // its high alias and prove it before any allocator work consumes it.
+    let bi_magic = unsafe { core::ptr::read_volatile(heap_virt_start as *const u64) };
+    if bi_magic != RPI5_HH5_HANDOFF_MAGIC {
+        hh5_fault!(b"boot_input_readback");
+    }
+    hh5_hex_line!(RPI5_HH5_BOOT_INPUT_OK_MARKER, heap_virt_start);
+
+    // Task C — allocator adapter: place a real PhysicalFrameAllocator at a high
+    // virtual address in the HH heap and initialize it over a conservative,
+    // bounded usable window that sits above every firmware/boot artifact and
+    // inside the TTBR1 high map (so every allocated frame has a high alias).
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    macro_rules! alloc_fail {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_ALLOC_ADAPTER_FAILED_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_FAULT_BOUNDARY_MARKER);
+            let _ = rpi5_hh_write_line(b"alloc_adapter");
+            rpi5_hh_halt()
+        }};
+    }
+
+    use crate::kernel::frame_allocator::{MemoryRegion, PhysicalFrameAllocator};
+
+    // Reserve everything the firmware and boot occupy: the whole YARM image
+    // (boot + page tables + HH heap + stack + kernel), the DTB, and the initrd.
+    let dtb_end = dtb_phys + dtb_size;
+    let mut reserved_top = kernel_phys_end;
+    if dtb_end > reserved_top {
+        reserved_top = dtb_end;
+    }
+    if initrd_phys_end > reserved_top {
+        reserved_top = initrd_phys_end;
+    }
+    // 2 MiB-align up past all artifacts; bound the boot window to 64 MiB and the
+    // TTBR1 high-map limit (2 GiB).
+    let usable_start = (reserved_top + 0x1f_ffff) & !0x1f_ffffu64;
+    const HH_PMEM_WINDOW: u64 = 0x0400_0000;
+    let mut usable_end = usable_start + HH_PMEM_WINDOW;
+    if usable_end > 0x8000_0000 {
+        usable_end = 0x8000_0000;
+    }
+    if usable_start >= 0x8000_0000 || usable_end <= usable_start + 0x1000 {
+        alloc_fail!(b"no_usable_window");
+    }
+
+    // Place allocator metadata at a high VA inside the HH heap bump region.
+    let alloc_align = core::mem::align_of::<PhysicalFrameAllocator>() as u64;
+    let alloc_size = core::mem::size_of::<PhysicalFrameAllocator>() as u64;
+    let alloc_meta_virt = (alloc_base_virt + (alloc_align - 1)) & !(alloc_align - 1);
+    if alloc_meta_virt + alloc_size > heap_virt_end {
+        alloc_fail!(b"metadata_fit");
+    }
+    let regions = [MemoryRegion {
+        start: usable_start,
+        len: usable_end - usable_start,
+        usable: true,
+    }];
+    let alloc_ptr = alloc_meta_virt as *mut PhysicalFrameAllocator;
+    unsafe {
+        core::ptr::write(alloc_ptr, PhysicalFrameAllocator::new_uninit());
+    }
+    let allocator = unsafe { &mut *alloc_ptr };
+    if allocator.init_from_memory_map(&regions).is_err() {
+        alloc_fail!(b"frame_init");
+    }
+    // Prove the allocator hands out an in-window, page-aligned frame and returns
+    // it cleanly (no frame memory is touched).
+    let free_before = allocator.free_frames();
+    let test_frame = match allocator.alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            alloc_fail!(b"test_alloc");
+            0
+        }
+    };
+    if test_frame < usable_start || test_frame >= usable_end || (test_frame & 0xfff) != 0 {
+        alloc_fail!(b"test_frame_range");
+    }
+    if allocator.free_frame(test_frame).is_err() {
+        alloc_fail!(b"test_free");
+    }
+    if allocator.free_frames() != free_before {
+        alloc_fail!(b"test_free_count");
+    }
+    hh5_emit_marker!(RPI5_HH5_ALLOC_ADAPTER_RANGE_MARKER);
+    hh5_emit_hex!(usable_start);
+    hh5_emit_marker!(RPI5_HH5_ALLOC_ADAPTER_USABLE_END_SEP_MARKER);
+    hh5_emit_hex!(usable_end);
+    hh5_crlf!();
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // Task D — high-half kernel-entry shim. Performs the boot steps that are
+    // safe without the normal kernel's global heap / full VM layout, each gated
+    // by a marker, then defers at the precise remaining blocker.
+    if !rpi5_hh_write_line(&RPI5_HH5_ENTER_KERNEL_BEGIN_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_ENTRY_BEGIN_MARKER)
+    {
+        rpi5_hh_halt();
+    }
+
+    // DTB parse: re-affirm the FDT magic through the high alias (the /chosen walk
+    // already succeeded above).
+    if !rpi5_hh_write_line(&RPI5_KERNEL_DTB_PARSE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let reparse_magic = unsafe { core::ptr::read_volatile(dtb_virt as *const u32) };
+    if u32::from_be(reparse_magic) != 0xd00d_feed || !chosen.walk_ok {
+        hh5_fault!(b"dtb_reparse");
+    }
+    if !rpi5_hh_write_line(&RPI5_KERNEL_DTB_PARSE_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    if !rpi5_hh_write_line(&RPI5_KERNEL_INITRD_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // PMEM: the high-half allocator created above is the boot physical-memory
+    // allocator. Report its free-frame count as proof of a working pmem.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_PMEM_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let free_frames = allocator.free_frames() as u64;
+    if free_frames == 0 {
+        hh5_fault!(b"pmem_empty");
+    }
+    hh5_hex_line!(RPI5_KERNEL_PMEM_OK_MARKER, free_frames);
+
+    // Boot info: build a compact high-half boot-info record after the allocator
+    // metadata, then read its magic back to prove it.
+    let bootinfo_align = core::mem::align_of::<Rpi5HhKernelBootInfo>() as u64;
+    let bootinfo_size = core::mem::size_of::<Rpi5HhKernelBootInfo>() as u64;
+    let bootinfo_virt =
+        (alloc_meta_virt + alloc_size + (bootinfo_align - 1)) & !(bootinfo_align - 1);
+    if bootinfo_virt + bootinfo_size > heap_virt_end {
+        hh5_fault!(b"bootinfo_fit");
+    }
+    let bootinfo = Rpi5HhKernelBootInfo {
+        magic: RPI5_HH_BOOTINFO_MAGIC,
+        total_frames: allocator.total_frames() as u64,
+        free_frames,
+        usable_start,
+        usable_end,
+        handoff_virt: heap_virt_start,
+        max_cpus: 1,
+    };
+    let bootinfo_ptr = bootinfo_virt as *mut Rpi5HhKernelBootInfo;
+    unsafe {
+        core::ptr::write_volatile(bootinfo_ptr, bootinfo);
+    }
+    let bootinfo_rb = unsafe { core::ptr::read_volatile(bootinfo_virt as *const u64) };
+    if bootinfo_rb != RPI5_HH_BOOTINFO_MAGIC {
+        hh5_fault!(b"bootinfo_readback");
+    }
+    if !rpi5_hh_write_line(&RPI5_KERNEL_BOOTINFO_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    /*
+     * Precise remaining blocker. The boot input, a real high-half physical
+     * allocator, and a high-half boot-info record are all proven. The next step
+     * — constructing the normal `KernelState`, ELF-loading init from the
+     * initramfs, building a user address space, installing a user TTBR0, and
+     * ERET to EL0 — needs the kernel global heap and the full kernel VM layout,
+     * neither of which the HH diagnostic environment provides. Defer precisely;
+     * no scheduling, GIC, RP1, PCIe, service chain, user TTBR0, or EL0 ERET.
+     */
+    hh5_defer!(b"kernel_bootstrap_requires_global_heap_and_full_vm");
 }
 
 #[cfg(all(

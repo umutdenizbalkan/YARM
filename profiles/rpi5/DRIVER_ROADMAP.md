@@ -28,10 +28,15 @@ Fixed in-tree but **not yet re-confirmed on hardware**: the FDT walker advance
 bug (it skipped the 8-byte `FDT_PROP` header), bounded phase markers
 (`RPI5_HH5_FDT_HEADER_OK`, `RPI5_HH5_FDT_BLOCKS_OK`, `RPI5_HH5_FDT_CHOSEN_FOUND`,
 `RPI5_HH5_FDT_CHOSEN_SCAN_DONE`), a non-fatal missing-initrd path
-(`RPI5_HH5_INITRD_FAILED reason=missing`), and an allocator-bridge + handoff
-descriptor (`RPI5_HH5_ALLOC_BRIDGE_OK`, `RPI5_HH5_HANDOFF_OK`) followed by a
-precise deferral (`RPI5_HH5_DEFERRED reason=initrd_missing` or
-`reason=normal_kernel_entry_requires_low_allocator`).
+(`RPI5_HH5_INITRD_FAILED reason=missing`), an allocator-bridge + handoff
+descriptor (`RPI5_HH5_ALLOC_BRIDGE_OK`, `RPI5_HH5_HANDOFF_OK`), and a
+normal-kernel-entry bridge that brings up a real high-half physical-frame
+allocator and boot-info record (`RPI5_HH5_ALLOC_ADAPTER_OK`,
+`RPI5_KERNEL_PMEM_OK`, `RPI5_KERNEL_BOOTINFO_OK`) before a precise deferral
+(`RPI5_HH5_DEFERRED reason=kernel_bootstrap_requires_global_heap_and_full_vm`, or
+`reason=initrd_missing`). The earlier `normal_kernel_entry_requires_low_allocator`
+blocker is resolved: `PhysicalFrameAllocator` is self-contained and needs no low
+direct map, so it runs from the TTBR1-mapped HH heap.
 
 Normal kernel entry, `ENTER_USER`, `/sbin/initramfs_srv`, `devfs`, `vfs`, and
 `driver_manager` are **not reached on RPi5 yet**. Everything in the driver
@@ -179,9 +184,13 @@ Boot path to userspace:
 - **RPi5-BOOT-2** — Initrd/load bridge works after the HH4 no-low-VA TTBR0
   retirement (allocator bridge + handoff descriptor at a high VA). *In-tree;
   needs hardware confirmation.*
-- **RPi5-BOOT-3** — Enter normal kernel bootstrap from the HH5 handoff
-  (replace the current `normal_kernel_entry_requires_low_allocator` deferral
-  with a high-half-safe allocator). *Open.*
+- **RPi5-BOOT-3** — Enter normal kernel bootstrap from the HH5 handoff. *Partly
+  done in-tree:* a high-half-safe `PhysicalFrameAllocator` + boot-info record now
+  run from the HH heap (`RPI5_KERNEL_PMEM_OK`, `RPI5_KERNEL_BOOTINFO_OK`),
+  resolving the low-allocator blocker. *Remaining:* the kernel global heap and
+  full VM layout for `KernelState`/init-task bootstrap
+  (`reason=kernel_bootstrap_requires_global_heap_and_full_vm`). Needs hardware
+  confirmation.
 - **RPi5-BOOT-4** — Reach the first `ENTER_USER`. *Open.*
 - **RPi5-BOOT-5** — Reach `/sbin/initramfs_srv`. *Open.*
 - **RPi5-BOOT-6** — Reach `devfs` + `vfs` + `driver_manager`
@@ -209,8 +218,13 @@ Driver path (each strictly after RPi5-BOOT-6):
 - [ ] Confirm RPi5-BOOT-1/2 on real hardware (expect `RPI5_HH5_FDT_CHOSEN_FOUND`,
       `RPI5_HH5_INITRD_FAILED reason=missing` or initrd range, `RPI5_HH5_HANDOFF_OK`,
       `RPI5_HH5_DEFERRED`).
-- [ ] Design the high-half-safe boot allocator so HH5 can call normal kernel init
-      (RPi5-BOOT-3) instead of deferring.
+- [x] High-half-safe boot allocator + boot-info record (RPi5-BOOT-3, allocator
+      half): `PhysicalFrameAllocator` now runs from the HH heap via its high
+      alias (`RPI5_KERNEL_PMEM_OK`, `RPI5_KERNEL_BOOTINFO_OK`).
+- [ ] Provide the kernel global heap + full kernel VM layout so HH5 can build
+      `KernelState` / load init and stop deferring at
+      `kernel_bootstrap_requires_global_heap_and_full_vm` (RPi5-BOOT-3 remainder
+      → RPi5-BOOT-4).
 - [ ] Define the RP1 PCIe discovery + BAR grant path before any RP1 driver.
 - [ ] Define the interrupt-domain model (GIC + RP1 over PCIe MSI) before irqmux
       hardware wiring.
