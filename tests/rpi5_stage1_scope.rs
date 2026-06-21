@@ -1160,8 +1160,14 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
         "RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_DONE",
         "RPI5_HH5_ALLOC_ADAPTER_INIT_DONE",
         "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_OK",
         "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK frame=0x",
         "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_DONE",
         "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_OK",
         "RPI5_HH5_ALLOC_ADAPTER_OK",
         "RPI5_HH5_ALLOC_ADAPTER_FAILED reason=",
@@ -1199,8 +1205,18 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     );
     assert!(!hh5.contains("init_from_memory_map"));
     assert!(hh5.contains("alloc_meta_virt as *mut PhysicalFrameAllocator"));
-    assert!(hh5.contains("alloc_frame()"));
-    assert!(hh5.contains("free_frame(test_frame)"));
+    // The probe uses the lean BOOT-PROBE alloc/free (no lock/log/panic/clone),
+    // not the generic alloc_frame/free_frame which take global SpinLockIrqs.
+    assert!(hh5.contains("alloc_frame_boot_probe()"));
+    assert!(hh5.contains("free_frame_boot_probe(test_frame)"));
+    assert!(!hh5.contains(".alloc_frame()"));
+    assert!(!hh5.contains(".free_frame("));
+    // Probe failures are precise and routed through the alloc_adapter_probe
+    // fault boundary.
+    assert!(hh5.contains("probe_alloc_returned_error"));
+    assert!(hh5.contains("probe_alloc_out_of_range"));
+    assert!(hh5.contains("probe_free_returned_error"));
+    assert!(hh5.contains("alloc_adapter_probe"));
     // Allocator metadata pointer is a high VA, not a *_phys cast.
     assert!(!hh5.contains("alloc_base_phys as *"));
     assert!(!hh5.contains("usable_start as *"));

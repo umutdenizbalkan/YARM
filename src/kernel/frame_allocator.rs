@@ -234,6 +234,75 @@ impl PhysicalFrameAllocator {
         Ok(())
     }
 
+    /// Boot-only single-frame allocation probe.
+    ///
+    /// The generic [`Self::alloc_frame`] is unsafe to call in the RPi5 HH5
+    /// early high-half path: it takes the `GLOBAL_RESERVED_RANGES` `SpinLockIrq`,
+    /// uses `yarm_log!`/`panic!`/`expect` on the reserved-overlap guard, and the
+    /// matching [`Self::free_frame`] clones the whole ~209 KiB allocator into a
+    /// `SpinLockIrq` scratch (`pfa_clone_to`). None of that is available or
+    /// permitted before the normal kernel is up.
+    ///
+    /// This probe instead takes the first 4 KiB of the first non-empty free
+    /// extent with bounded loops only: no lock, no logging, no panic/expect, no
+    /// large copy or large array, no frame-ref hash mutation, and it never
+    /// dereferences the physical frame memory. It is symmetric with
+    /// [`Self::free_frame_boot_probe`] (which reinserts the page, merging it back
+    /// into the source extent), so an alloc+free pair restores the exact prior
+    /// state. Returns the physical frame address.
+    pub fn alloc_frame_boot_probe(&mut self) -> Result<u64, FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
+        if self.free_frames == 0 {
+            return Err(FrameAllocError::OutOfMemory);
+        }
+        let mut chosen = None;
+        for idx in 0..self.extents.len() {
+            if let Some(extent) = self.extents[idx] {
+                if extent.pages > 0 {
+                    chosen = Some((idx, extent));
+                    break;
+                }
+            }
+        }
+        let Some((idx, extent)) = chosen else {
+            return Err(FrameAllocError::OutOfMemory);
+        };
+        let frame = extent.start_phys;
+        if extent.pages == 1 {
+            self.extents[idx] = None;
+        } else {
+            self.extents[idx] = Some(FreeExtent {
+                start_phys: extent.start_phys.saturating_add(PAGE_SIZE_U64),
+                pages: extent.pages - 1,
+            });
+        }
+        self.free_frames = self.free_frames.saturating_sub(1);
+        self.refresh_run_metadata();
+        Ok(frame)
+    }
+
+    /// Boot-only single-frame free probe, symmetric with
+    /// [`Self::alloc_frame_boot_probe`]. Reinserts the page as a free extent
+    /// (`insert_extent_unsorted` merges it back into the adjacent source extent).
+    /// No lock, no logging, no panic/expect, no large copy, no frame-ref hash.
+    pub fn free_frame_boot_probe(&mut self, phys: u64) -> Result<(), FrameAllocError> {
+        if !self.initialized {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
+        if !phys.is_multiple_of(PAGE_SIZE_U64) {
+            return Err(FrameAllocError::Misaligned);
+        }
+        if phys < self.base_phys || phys >= self.end_phys_exclusive {
+            return Err(FrameAllocError::OutOfRange);
+        }
+        self.insert_extent_unsorted(phys, 1)?;
+        self.free_frames = self.free_frames.saturating_add(1);
+        self.refresh_run_metadata();
+        Ok(())
+    }
+
     pub fn alloc_frame(&mut self) -> Result<u64, FrameAllocError> {
         if !self.initialized {
             return Err(FrameAllocError::InvalidMemoryMap);
@@ -1117,6 +1186,55 @@ mod tests {
         assert_eq!(alloc.free_frames(), 63);
         alloc.free_frame(frame).expect("free frame");
         assert_eq!(alloc.free_frames(), 64);
+    }
+
+    #[test]
+    fn boot_probe_alloc_then_free_restores_state() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        // Mirror the HH5 bring-up shape (single region) but size the window to the
+        // build's tracking capacity so the test is valid on hosted-dev (cap 256)
+        // and bare-metal (cap 8192) alike.
+        let pages = (PhysicalFrameAllocator::tracked_frame_capacity() / 2) as u64;
+        let len = pages * PAGE_SIZE_U64;
+        let base = 0x100_0000u64;
+        alloc
+            .init_single_region_assume_zeroed(base, len)
+            .expect("bring-up window initializes");
+        assert_eq!(alloc.free_frames() as u64, pages);
+        let frame = alloc
+            .alloc_frame_boot_probe()
+            .expect("boot probe allocates one frame");
+        // Allocated frame is page-aligned and inside the window.
+        assert_eq!(frame % PAGE_SIZE_U64, 0);
+        assert!(frame >= base && frame < base + len);
+        assert_eq!(alloc.free_frames() as u64, pages - 1);
+        alloc
+            .free_frame_boot_probe(frame)
+            .expect("boot probe frees the frame");
+        // Free merges the page back; counters and single-extent state restored.
+        assert_eq!(alloc.free_frames() as u64, pages);
+        assert_eq!(alloc.total_frames() as u64, pages);
+    }
+
+    #[test]
+    fn boot_probe_alloc_rejects_uninitialized_and_free_validates_range() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        assert_eq!(
+            alloc.alloc_frame_boot_probe(),
+            Err(FrameAllocError::InvalidMemoryMap)
+        );
+        alloc
+            .init_single_region_assume_zeroed(0x100_0000, 64 * PAGE_SIZE_U64)
+            .expect("init");
+        // Misaligned and out-of-range frees are rejected without panicking.
+        assert_eq!(
+            alloc.free_frame_boot_probe(0x100_0001),
+            Err(FrameAllocError::Misaligned)
+        );
+        assert_eq!(
+            alloc.free_frame_boot_probe(0x80_0000),
+            Err(FrameAllocError::OutOfRange)
+        );
     }
 
     #[test]

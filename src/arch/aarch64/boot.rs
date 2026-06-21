@@ -1560,6 +1560,42 @@ rpi5_hh_retained_marker!(
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_DONE_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
     RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK_MARKER,
     b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK frame=0x"
 );
@@ -1571,6 +1607,24 @@ rpi5_hh_retained_marker!(
 rpi5_hh_retained_marker!(
     RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN_MARKER,
     b"RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_DONE_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_DONE"
 );
 #[cfg(all(
     not(feature = "hosted-dev"),
@@ -3172,28 +3226,67 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         rpi5_hh_halt();
     }
 
-    // --- Probe: one alloc/free, each separately marked (no frame memory read). ---
+    // --- Probe: one alloc/free via the lean BOOT-PROBE path. The generic
+    // alloc/free methods are unsafe here: they take global SpinLockIrqs, use
+    // normal-kernel logging and abort paths on a reserved-overlap guard, and the
+    // free path clones the whole ~209 KiB allocator into a lock-guarded scratch
+    // (pfa_clone_to). The boot probe uses bounded loops only: no lock, no
+    // logging, no abort, no large copy, and it never dereferences the physical
+    // frame memory. Each substep is marked. ---
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN_MARKER) {
         rpi5_hh_halt();
     }
+    macro_rules! probe_fail {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_ALLOC_ADAPTER_FAILED_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_FAULT_BOUNDARY_MARKER);
+            let _ = rpi5_hh_write_line(b"alloc_adapter_probe");
+            rpi5_hh_halt()
+        }};
+    }
+
     let free_before = allocator.free_frames();
-    let test_frame = match allocator.alloc_frame() {
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let test_frame = match allocator.alloc_frame_boot_probe() {
         Ok(frame) => frame,
         Err(_) => {
-            alloc_fail!(b"probe_alloc");
+            probe_fail!(b"probe_alloc_returned_error");
             0
         }
     };
-    if test_frame < usable_start || test_frame >= usable_end || (test_frame & 0xfff) != 0 {
-        alloc_fail!(b"probe_alloc");
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_DONE_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // Validate the frame is page-aligned and strictly inside the bring-up window.
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    if (test_frame & 0xfff) != 0 || test_frame < usable_start || test_frame >= usable_end {
+        probe_fail!(b"probe_alloc_out_of_range");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_OK_MARKER) {
+        rpi5_hh_halt();
     }
     hh5_hex_line!(RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK_MARKER, test_frame);
 
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN_MARKER) {
         rpi5_hh_halt();
     }
-    if allocator.free_frame(test_frame).is_err() || allocator.free_frames() != free_before {
-        alloc_fail!(b"probe_free");
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    if allocator.free_frame_boot_probe(test_frame).is_err() {
+        probe_fail!(b"probe_free_returned_error");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_DONE_MARKER) {
+        rpi5_hh_halt();
+    }
+    if allocator.free_frames() != free_before {
+        probe_fail!(b"probe_free_returned_error");
     }
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_OK_MARKER) {
         rpi5_hh_halt();
