@@ -1187,6 +1187,90 @@ rpi5_hh_retained_marker!(RPI5_HH5_DTB_CHOSEN_OK_MARKER, b"RPI5_HH5_DTB_CHOSEN_OK
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FDT_HEADER_BEGIN_MARKER,
+    b"RPI5_HH5_FDT_HEADER_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_FDT_HEADER_OK_MARKER, b"RPI5_HH5_FDT_HEADER_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FDT_BLOCKS_BEGIN_MARKER,
+    b"RPI5_HH5_FDT_BLOCKS_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_FDT_BLOCKS_OK_MARKER, b"RPI5_HH5_FDT_BLOCKS_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FDT_CHOSEN_SCAN_BEGIN_MARKER,
+    b"RPI5_HH5_FDT_CHOSEN_SCAN_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FDT_CHOSEN_FOUND_MARKER,
+    b"RPI5_HH5_FDT_CHOSEN_FOUND"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FDT_CHOSEN_SCAN_DONE_MARKER,
+    b"RPI5_HH5_FDT_CHOSEN_SCAN_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FDT_INITRD_PROPS_BEGIN_MARKER,
+    b"RPI5_HH5_FDT_INITRD_PROPS_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FDT_INITRD_PROPS_DONE_MARKER,
+    b"RPI5_HH5_FDT_INITRD_PROPS_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_DTB_WALK_FAILED_MARKER,
+    b"RPI5_HH5_DTB_WALK_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
 rpi5_hh_retained_marker!(RPI5_HH5_INITRD_BEGIN_MARKER, b"RPI5_HH5_INITRD_BEGIN");
 #[cfg(all(
     not(feature = "hosted-dev"),
@@ -1991,6 +2075,7 @@ unsafe fn hh5_be64(va: u64) -> u64 {
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
+#[allow(dead_code)]
 unsafe fn hh5_cstr_len(va: u64, max: usize) -> usize {
     let mut i = 0usize;
     while i < max {
@@ -2033,7 +2118,9 @@ unsafe fn hh5_name_eq(name_va: u64, ref_va: u64, ref_len: usize) -> bool {
 #[derive(Clone, Copy)]
 struct Hh5Chosen {
     walk_ok: bool,
+    chosen_found: bool,
     initrd_present: bool,
+    bad_cell_width: bool,
     initrd_start: u64,
     initrd_end: u64,
     bootargs_va: u64,
@@ -2053,15 +2140,54 @@ struct Hh5Chosen {
 unsafe fn hh5_parse_chosen(dtb_virt: u64) -> Hh5Chosen {
     let mut out = Hh5Chosen {
         walk_ok: false,
+        chosen_found: false,
         initrd_present: false,
+        bad_cell_width: false,
         initrd_start: 0,
         initrd_end: 0,
         bootargs_va: 0,
         bootargs_len: 0,
     };
+
+    // Precise structural failure: emit the specific reason then return not-ok.
+    // `out` is returned so the caller can still emit the generic fault boundary.
+    macro_rules! walk_fail {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_DTB_WALK_FAILED_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            return out;
+        }};
+    }
+
+    // --- Task B(1,2): header fields (all big-endian u32) and block bounds. ---
+    let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_HEADER_BEGIN_MARKER);
+    let totalsize = unsafe { hh5_be32(dtb_virt + 0x04) } as u64;
     let off_struct = unsafe { hh5_be32(dtb_virt + 0x08) } as u64;
     let off_strings = unsafe { hh5_be32(dtb_virt + 0x0c) } as u64;
+    let version = unsafe { hh5_be32(dtb_virt + 0x14) };
+    let size_strings = unsafe { hh5_be32(dtb_virt + 0x20) } as u64;
     let size_struct = unsafe { hh5_be32(dtb_virt + 0x24) } as u64;
+    // A sane firmware DTB is far below 1 MiB; size_dt_struct/strings need v17.
+    if totalsize < 0x40 || totalsize > 0x0010_0000 {
+        walk_fail!(b"header");
+    }
+    if version < 17 {
+        walk_fail!(b"header");
+    }
+    let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_HEADER_OK_MARKER);
+
+    let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_BLOCKS_BEGIN_MARKER);
+    if off_struct < 0x28 || (off_struct & 0x3) != 0 || off_struct > totalsize {
+        walk_fail!(b"blocks");
+    }
+    if size_struct == 0 || off_struct + size_struct > totalsize {
+        walk_fail!(b"blocks");
+    }
+    if off_strings > totalsize || off_strings + size_strings > totalsize {
+        walk_fail!(b"blocks");
+    }
+    let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_BLOCKS_OK_MARKER);
+
     let mut p = dtb_virt + off_struct;
     let struct_end = dtb_virt + off_struct + size_struct;
     let strings_base = dtb_virt + off_strings;
@@ -2078,42 +2204,89 @@ unsafe fn hh5_parse_chosen(dtb_virt: u64) -> Hh5Chosen {
     let mut ended = false;
     let mut guard: u32 = 0;
     const GUARD_MAX: u32 = 1 << 20;
+    const DEPTH_MAX: i32 = 64;
 
-    while p + 4 <= struct_end && guard < GUARD_MAX {
+    let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_CHOSEN_SCAN_BEGIN_MARKER);
+
+    while guard < GUARD_MAX {
         guard += 1;
+        // Task B: every token read is bounds-checked (4-byte aligned).
+        if p + 4 > struct_end {
+            walk_fail!(b"token_bounds");
+        }
         let token = unsafe { hh5_be32(p) };
         p += 4;
         if token == 0x1 {
             // FDT_BEGIN_NODE: unit name follows, NUL-terminated, padded to 4.
+            // The root node has an empty name (immediate NUL), which is valid.
             let name_va = p;
             depth += 1;
+            if depth > DEPTH_MAX {
+                walk_fail!(b"depth_overflow");
+            }
+            let avail = struct_end - p;
+            let mut nl = 0u64;
+            let mut terminated = false;
+            while nl < avail && nl < 256 {
+                if unsafe { core::ptr::read_volatile((name_va + nl) as *const u8) } == 0 {
+                    terminated = true;
+                    break;
+                }
+                nl += 1;
+            }
+            if !terminated {
+                walk_fail!(b"node_name_bounds");
+            }
             if chosen_depth < 0
                 && unsafe { hh5_name_eq(name_va, chosen_ref, RPI5_HH5_NAME_CHOSEN.len()) }
             {
                 chosen_depth = depth;
+                out.chosen_found = true;
+                let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_CHOSEN_FOUND_MARKER);
+                let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_INITRD_PROPS_BEGIN_MARKER);
             }
-            let nlen = unsafe { hh5_cstr_len(name_va, 256) } as u64 + 1;
-            p += (nlen + 3) & !3;
+            let adv = ((nl + 1) + 3) & !3;
+            if p + adv > struct_end {
+                walk_fail!(b"node_name_bounds");
+            }
+            p += adv;
         } else if token == 0x2 {
             // FDT_END_NODE
+            if depth <= 0 {
+                walk_fail!(b"bad_token");
+            }
             if chosen_depth == depth {
                 chosen_depth = -1;
+                let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_INITRD_PROPS_DONE_MARKER);
             }
             depth -= 1;
         } else if token == 0x3 {
             // FDT_PROP: len(u32), nameoff(u32), value[len], padded to 4.
+            if p + 8 > struct_end {
+                walk_fail!(b"prop_bounds");
+            }
             let prop_len = unsafe { hh5_be32(p) } as u64;
             let nameoff = unsafe { hh5_be32(p + 4) } as u64;
             let val_va = p + 8;
+            let val_adv = (prop_len + 3) & !3;
+            if val_va + val_adv > struct_end {
+                walk_fail!(b"prop_bounds");
+            }
+            if nameoff >= size_strings {
+                walk_fail!(b"string_bounds");
+            }
             if chosen_depth >= 0 && depth == chosen_depth {
                 let name_va = strings_base + nameoff;
                 if unsafe { hh5_name_eq(name_va, start_ref, RPI5_HH5_NAME_INITRD_START.len()) } {
+                    // Task D: accept 4- or 8-byte cells; flag any other width.
                     if prop_len == 4 {
                         out.initrd_start = unsafe { hh5_be32(val_va) } as u64;
                         have_start = true;
                     } else if prop_len == 8 {
                         out.initrd_start = unsafe { hh5_be64(val_va) };
                         have_start = true;
+                    } else {
+                        out.bad_cell_width = true;
                     }
                 } else if unsafe { hh5_name_eq(name_va, end_ref, RPI5_HH5_NAME_INITRD_END.len()) } {
                     if prop_len == 4 {
@@ -2122,6 +2295,8 @@ unsafe fn hh5_parse_chosen(dtb_virt: u64) -> Hh5Chosen {
                     } else if prop_len == 8 {
                         out.initrd_end = unsafe { hh5_be64(val_va) };
                         have_end = true;
+                    } else {
+                        out.bad_cell_width = true;
                     }
                 } else if unsafe {
                     hh5_name_eq(name_va, bootargs_ref, RPI5_HH5_NAME_BOOTARGS.len())
@@ -2130,21 +2305,29 @@ unsafe fn hh5_parse_chosen(dtb_virt: u64) -> Hh5Chosen {
                     out.bootargs_len = prop_len;
                 }
             }
-            p += (prop_len + 3) & !3;
+            // Advance past the 8-byte property header AND the padded value.
+            p = val_va + val_adv;
         } else if token == 0x4 {
-            // FDT_NOP
+            // FDT_NOP: no extra data.
         } else if token == 0x9 {
             // FDT_END
             ended = true;
             break;
         } else {
-            // Unknown token: stop walking, report not-ok.
-            break;
+            walk_fail!(b"bad_token");
         }
     }
 
-    out.walk_ok = ended;
-    out.initrd_present = ended && have_start && have_end;
+    if !ended {
+        walk_fail!(b"token_bounds");
+    }
+    let _ = rpi5_hh_write_line(&RPI5_HH5_FDT_CHOSEN_SCAN_DONE_MARKER);
+    if !out.chosen_found {
+        walk_fail!(b"chosen_missing");
+    }
+
+    out.walk_ok = true;
+    out.initrd_present = have_start && have_end && !out.bad_cell_width;
     out
 }
 
@@ -2366,7 +2549,11 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     let mut initrd_virt_start = 0u64;
     let mut initrd_virt_end = 0u64;
 
-    if !chosen.initrd_present {
+    if chosen.bad_cell_width {
+        // /chosen had an initrd property with an unsupported cell width.
+        let _ = rpi5_hh_write_bytes(&RPI5_HH5_INITRD_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"bad_cell_width");
+    } else if !chosen.initrd_present {
         let _ = rpi5_hh_write_bytes(&RPI5_HH5_INITRD_FAILED_MARKER);
         let _ = rpi5_hh_write_line(b"missing");
     } else {

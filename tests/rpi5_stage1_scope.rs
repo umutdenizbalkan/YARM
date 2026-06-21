@@ -1031,3 +1031,101 @@ fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
         assert!(build.contains(marker), "build omits HH5 marker {marker}");
     }
 }
+
+#[test]
+fn rpi5_hh5_fdt_walker_is_bounded_with_precise_phase_markers() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // Phase + specific failure markers are defined so hardware can pinpoint the
+    // exact FDT walk substep.
+    for marker in [
+        "RPI5_HH5_FDT_HEADER_BEGIN",
+        "RPI5_HH5_FDT_HEADER_OK",
+        "RPI5_HH5_FDT_BLOCKS_BEGIN",
+        "RPI5_HH5_FDT_BLOCKS_OK",
+        "RPI5_HH5_FDT_CHOSEN_SCAN_BEGIN",
+        "RPI5_HH5_FDT_CHOSEN_FOUND",
+        "RPI5_HH5_FDT_CHOSEN_SCAN_DONE",
+        "RPI5_HH5_FDT_INITRD_PROPS_BEGIN",
+        "RPI5_HH5_FDT_INITRD_PROPS_DONE",
+        "RPI5_HH5_DTB_WALK_FAILED reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits FDT marker {marker}");
+        assert!(build.contains(marker), "build omits FDT marker {marker}");
+    }
+
+    // Isolate the walker body.
+    let start = boot
+        .find("unsafe fn hh5_parse_chosen(dtb_virt: u64)")
+        .unwrap();
+    let end = boot[start..]
+        .find("fn hh5_overlaps")
+        .map(|o| o + start)
+        .unwrap();
+    let w = &boot[start..end];
+
+    // Root-cause fix: the FDT_PROP advance must skip the 8-byte header AND the
+    // padded value; the old buggy form (advancing only the padded value) is gone.
+    assert!(w.contains("p = val_va + val_adv;"));
+    assert!(!w.contains("p += (prop_len + 3) & !3;"));
+    assert!(w.contains("let val_va = p + 8;"));
+
+    // Every structural failure class has a precise reason (Task A/B).
+    for reason in [
+        "b\"header\"",
+        "b\"blocks\"",
+        "b\"token_bounds\"",
+        "b\"node_name_bounds\"",
+        "b\"prop_bounds\"",
+        "b\"string_bounds\"",
+        "b\"bad_token\"",
+        "b\"depth_overflow\"",
+        "b\"chosen_missing\"",
+    ] {
+        assert!(w.contains(reason), "walker missing failure reason {reason}");
+    }
+
+    // Bounds checks are present before each read.
+    assert!(w.contains("if p + 4 > struct_end"));
+    assert!(w.contains("if p + 8 > struct_end"));
+    assert!(w.contains("if val_va + val_adv > struct_end"));
+    assert!(w.contains("if nameoff >= size_strings"));
+    assert!(w.contains("depth > DEPTH_MAX"));
+
+    // Task D: both 4- and 8-byte initrd cells, other widths flagged not fatal.
+    assert!(w.contains("if prop_len == 4"));
+    assert!(w.contains("else if prop_len == 8"));
+    assert!(w.contains("out.bad_cell_width = true"));
+
+    // Missing initrd is non-fatal: walk_ok is set on FDT_END regardless of
+    // whether initrd props exist; chosen-missing is the only chosen failure.
+    assert!(w.contains("out.walk_ok = true;"));
+    assert!(w.contains("out.initrd_present = have_start && have_end && !out.bad_cell_width;"));
+
+    // High-alias-only: the walker reads through dtb_virt, never a low phys ptr.
+    assert!(!w.contains("dtb_phys"));
+    assert!(w.contains("hh5_be32(dtb_virt"));
+
+    // No panic/format/asserts, no large stack arrays in the walker.
+    for forbidden in [
+        "panic!",
+        "unwrap()",
+        "assert!",
+        "assert_eq!",
+        "yarm_log!",
+        "printk",
+        "write!",
+        "format!",
+    ] {
+        assert!(!w.contains(forbidden), "walker contains {forbidden}");
+    }
+    assert!(!w.contains("[0u8;"));
+    assert!(!w.contains("[0u8 ;"));
+
+    // The missing-initrd path in the bridge maps to a clean defer, and the
+    // bad-cell-width property is reported without faulting.
+    assert!(boot.contains("RPI5_HH5_DEFERRED reason="));
+    assert!(boot.contains("b\"bad_cell_width\""));
+    assert!(boot.contains("b\"initrd_missing\""));
+}
