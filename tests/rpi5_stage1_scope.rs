@@ -1138,12 +1138,26 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     let boot = include_str!("../src/arch/aarch64/boot.rs");
     let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
 
-    // Task A-D markers exist in source and are required by the image validator.
+    // Task A-D markers exist in source and are required by the image validator,
+    // including the granular allocator-adapter phase markers (Task A) so a hang
+    // pinpoints the exact substep.
     for marker in [
         "RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN",
         "RPI5_HH5_NORMAL_BOOT_AUDIT_DONE",
         "RPI5_HH5_BOOT_INPUT_OK virt=0x",
         "RPI5_HH5_ALLOC_ADAPTER_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_LAYOUT_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_LAYOUT_OK",
+        "RPI5_HH5_ALLOC_ADAPTER_STORAGE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_STORAGE_OK virt=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_ZERO_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_ZERO_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK frame=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_OK",
         "RPI5_HH5_ALLOC_ADAPTER_OK",
         "RPI5_HH5_ALLOC_ADAPTER_FAILED reason=",
         "RPI5_HH5_ENTER_KERNEL_BEGIN",
@@ -1180,6 +1194,26 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     // Allocator metadata pointer is a high VA, not a *_phys cast.
     assert!(!hh5.contains("alloc_base_phys as *"));
     assert!(!hh5.contains("usable_start as *"));
+
+    // Task B: the ~209 KB PhysicalFrameAllocator is NEVER a by-value local. It is
+    // initialized in place: zeroed via a bounded volatile loop, then init through
+    // `&mut`. No new_uninit() temporary, no MaybeUninit local, no by-value copy.
+    assert!(!hh5.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(!hh5.contains("MaybeUninit<PhysicalFrameAllocator>"));
+    assert!(!hh5.contains("MaybeUninit::<PhysicalFrameAllocator>"));
+    assert!(!hh5.contains("core::ptr::write(alloc_ptr"));
+    assert!(!hh5.contains("let allocator = PhysicalFrameAllocator"));
+    assert!(hh5.contains("&mut *alloc_ptr"));
+    // Storage is zeroed in place with a bounded volatile loop (Task D).
+    assert!(hh5.contains("write_volatile((alloc_meta_virt + zi * 8) as *mut u64, 0)"));
+    // Storage is proven before being touched (Task C): bounds + alignment vs heap
+    // and handoff, never a low VA.
+    assert!(hh5.contains("alloc_meta_virt < heap_virt_start"));
+    assert!(hh5.contains("alloc_meta_virt < handoff_end"));
+    assert!(hh5.contains("alloc_meta_virt < RPI5_HH_VA_OFFSET"));
+    // No large stack arrays in the bridge.
+    assert!(!hh5.contains("[0u8;"));
+    assert!(!hh5.contains("[0u8 ;"));
 
     // Task D: boot-info record lives at a high VA and is read back.
     assert!(hh5.contains("bootinfo_virt as *mut Rpi5HhKernelBootInfo"));

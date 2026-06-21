@@ -1434,6 +1434,114 @@ rpi5_hh_retained_marker!(
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_LAYOUT_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_LAYOUT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_LAYOUT_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_LAYOUT_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_STORAGE_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_STORAGE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_STORAGE_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_STORAGE_OK virt=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_ZERO_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_ZERO_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_ZERO_DONE_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_ZERO_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_INIT_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_INIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_INIT_DONE_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_INIT_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK frame=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
     RPI5_HH5_ALLOC_ADAPTER_RANGE_MARKER,
     b"RPI5_HH5_ALLOC_ADAPTER_RANGE usable_start=0x"
 );
@@ -2871,10 +2979,13 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     }
     hh5_hex_line!(RPI5_HH5_BOOT_INPUT_OK_MARKER, heap_virt_start);
 
-    // Task C — allocator adapter: place a real PhysicalFrameAllocator at a high
-    // virtual address in the HH heap and initialize it over a conservative,
-    // bounded usable window that sits above every firmware/boot artifact and
-    // inside the TTBR1 high map (so every allocated frame has a high alias).
+    // Task C — allocator adapter. `PhysicalFrameAllocator` is ~209 KB, so it must
+    // NEVER be materialized as a by-value local (that pushed a huge temporary
+    // onto the stack and stalled the bring-up). It is initialized DIRECTLY in
+    // place at a high virtual address in the HH heap: zero the destination with a
+    // bounded volatile loop (yielding a valid all-zero == new_uninit value), then
+    // call `init_from_memory_map` through `&mut`. No full allocator value ever
+    // crosses the stack. Each substep is bracketed by a marker.
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_BEGIN_MARKER) {
         rpi5_hh_halt();
     }
@@ -2890,6 +3001,10 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
 
     use crate::kernel::frame_allocator::{MemoryRegion, PhysicalFrameAllocator};
 
+    // --- Layout: compute the usable window and the in-heap storage address. ---
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_LAYOUT_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     // Reserve everything the firmware and boot occupy: the whole YARM image
     // (boot + page tables + HH heap + stack + kernel), the DTB, and the initrd.
     let dtb_end = dtb_phys + dtb_size;
@@ -2909,15 +3024,55 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         usable_end = 0x8000_0000;
     }
     if usable_start >= 0x8000_0000 || usable_end <= usable_start + 0x1000 {
-        alloc_fail!(b"no_usable_window");
+        alloc_fail!(b"layout");
     }
-
-    // Place allocator metadata at a high VA inside the HH heap bump region.
     let alloc_align = core::mem::align_of::<PhysicalFrameAllocator>() as u64;
     let alloc_size = core::mem::size_of::<PhysicalFrameAllocator>() as u64;
     let alloc_meta_virt = (alloc_base_virt + (alloc_align - 1)) & !(alloc_align - 1);
-    if alloc_meta_virt + alloc_size > heap_virt_end {
-        alloc_fail!(b"metadata_fit");
+    let alloc_meta_end = alloc_meta_virt + alloc_size;
+    if alloc_meta_end > heap_virt_end || alloc_meta_end < alloc_meta_virt {
+        alloc_fail!(b"layout");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_LAYOUT_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // --- Storage: prove the destination before touching it. ---
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_STORAGE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let handoff_end = heap_virt_start + core::mem::size_of::<Rpi5HhBootHandoff>() as u64;
+    if alloc_meta_virt < RPI5_HH_VA_OFFSET
+        || alloc_meta_virt < heap_virt_start
+        || alloc_meta_end > heap_virt_end
+        || alloc_meta_virt < handoff_end
+        || (alloc_meta_virt & (alloc_align - 1)) != 0
+    {
+        alloc_fail!(b"storage");
+    }
+    hh5_hex_line!(RPI5_HH5_ALLOC_ADAPTER_STORAGE_OK_MARKER, alloc_meta_virt);
+
+    // --- Zero the storage in place (bounded volatile loop, no slices/memset). ---
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_ZERO_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    // alloc_size is a multiple of 8 (struct is u64-aligned); round up defensively.
+    let zero_words = (alloc_size + 7) / 8;
+    let mut zi = 0u64;
+    while zi < zero_words {
+        unsafe {
+            core::ptr::write_volatile((alloc_meta_virt + zi * 8) as *mut u64, 0);
+        }
+        zi += 1;
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_ZERO_DONE_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // --- Init in place: the zeroed storage is a valid (all-None/Empty) value, so
+    // forming &mut and calling init_from_memory_map never copies a full value. ---
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_INIT_BEGIN_MARKER) {
+        rpi5_hh_halt();
     }
     let regions = [MemoryRegion {
         start: usable_start,
@@ -2925,32 +3080,41 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         usable: true,
     }];
     let alloc_ptr = alloc_meta_virt as *mut PhysicalFrameAllocator;
-    unsafe {
-        core::ptr::write(alloc_ptr, PhysicalFrameAllocator::new_uninit());
-    }
     let allocator = unsafe { &mut *alloc_ptr };
     if allocator.init_from_memory_map(&regions).is_err() {
-        alloc_fail!(b"frame_init");
+        alloc_fail!(b"init");
     }
-    // Prove the allocator hands out an in-window, page-aligned frame and returns
-    // it cleanly (no frame memory is touched).
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_INIT_DONE_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // --- Probe: one alloc/free, each separately marked (no frame memory read). ---
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     let free_before = allocator.free_frames();
     let test_frame = match allocator.alloc_frame() {
         Ok(frame) => frame,
         Err(_) => {
-            alloc_fail!(b"test_alloc");
+            alloc_fail!(b"probe_alloc");
             0
         }
     };
     if test_frame < usable_start || test_frame >= usable_end || (test_frame & 0xfff) != 0 {
-        alloc_fail!(b"test_frame_range");
+        alloc_fail!(b"probe_alloc");
     }
-    if allocator.free_frame(test_frame).is_err() {
-        alloc_fail!(b"test_free");
+    hh5_hex_line!(RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK_MARKER, test_frame);
+
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN_MARKER) {
+        rpi5_hh_halt();
     }
-    if allocator.free_frames() != free_before {
-        alloc_fail!(b"test_free_count");
+    if allocator.free_frame(test_frame).is_err() || allocator.free_frames() != free_before {
+        alloc_fail!(b"probe_free");
     }
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
     hh5_emit_marker!(RPI5_HH5_ALLOC_ADAPTER_RANGE_MARKER);
     hh5_emit_hex!(usable_start);
     hh5_emit_marker!(RPI5_HH5_ALLOC_ADAPTER_USABLE_END_SEP_MARKER);
