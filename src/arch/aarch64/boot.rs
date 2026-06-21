@@ -1173,6 +1173,173 @@ rpi5_hh_retained_marker!(RPI5_HH5_BEGIN_MARKER, b"RPI5_HH5_BEGIN");
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(
+    RPI5_HH5_DTB_CHOSEN_BEGIN_MARKER,
+    b"RPI5_HH5_DTB_CHOSEN_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_DTB_CHOSEN_OK_MARKER, b"RPI5_HH5_DTB_CHOSEN_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_INITRD_BEGIN_MARKER, b"RPI5_HH5_INITRD_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INITRD_RANGE_MARKER,
+    b"RPI5_HH5_INITRD_RANGE phys_start=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_INITRD_PHYS_END_SEP_MARKER, b" phys_end=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INITRD_VIRT_MARKER,
+    b"RPI5_HH5_INITRD_VIRT virt_start=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_INITRD_VIRT_END_SEP_MARKER, b" virt_end=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_INITRD_OK_MARKER, b"RPI5_HH5_INITRD_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_INITRD_FAILED_MARKER,
+    b"RPI5_HH5_INITRD_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_BRIDGE_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_BRIDGE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_BRIDGE_RANGE_MARKER,
+    b"RPI5_HH5_ALLOC_BRIDGE_RANGE phys=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_ALLOC_BRIDGE_VIRT_SEP_MARKER, b" virt=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_ALLOC_BRIDGE_SIZE_SEP_MARKER, b" size=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_ALLOC_BRIDGE_OK_MARKER, b"RPI5_HH5_ALLOC_BRIDGE_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_BRIDGE_FAILED_MARKER,
+    b"RPI5_HH5_ALLOC_BRIDGE_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_HANDOFF_BEGIN_MARKER, b"RPI5_HH5_HANDOFF_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_HANDOFF_OK_MARKER, b"RPI5_HH5_HANDOFF_OK virt=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_FAULT_BOUNDARY_MARKER,
+    b"RPI5_HH5_FAULT_BOUNDARY reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ENTER_KERNEL_BEGIN_MARKER,
+    b"RPI5_HH5_ENTER_KERNEL_BEGIN"
+);
+// Devicetree reference names compared via raw-pointer reads (no anonymous
+// literals, no slice iterators) so the lookup stays on the proven HH path.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_NAME_CHOSEN, b"chosen");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_NAME_INITRD_START, b"linux,initrd-start");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_NAME_INITRD_END, b"linux,initrd-end");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_HH5_NAME_BOOTARGS, b"bootargs");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
     RPI5_HH5_INITRD_READY_MARKER,
     b"RPI5_HH5_INITRD_READY start=0x"
 );
@@ -1467,6 +1634,9 @@ fn rpi5_hh4_fail(reason: &[u8]) -> ! {
 ))]
 struct Rpi5Hh4Ready {
     empty_ttbr0_root: u64,
+    ttbr1_root: u64,
+    dtb_phys: u64,
+    dtb_virt: u64,
 }
 
 #[cfg(all(
@@ -1657,7 +1827,7 @@ fn rpi5_hh4_retire_low_ttbr0(dtb_phys: u64) -> Rpi5Hh4Ready {
         core::ptr::addr_of!(RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER) as u64,
         core::ptr::addr_of!(RPI5_HH4_DONE_MARKER) as u64,
         rpi5_hh4_retire_low_ttbr0 as usize as u64,
-        rpi5_hh5_defer as usize as u64,
+        rpi5_hh5_bridge as usize as u64,
     ] {
         if address < RPI5_HH_VA_OFFSET {
             rpi5_hh4_fail(b"post_replace_pointer_not_high");
@@ -1767,7 +1937,12 @@ fn rpi5_hh4_retire_low_ttbr0(dtb_phys: u64) -> Rpi5Hh4Ready {
         rpi5_hh4_fail(b"uart_timeout");
     }
 
-    Rpi5Hh4Ready { empty_ttbr0_root }
+    Rpi5Hh4Ready {
+        empty_ttbr0_root,
+        ttbr1_root: expected_ttbr1,
+        dtb_phys,
+        dtb_virt,
+    }
 }
 
 #[cfg(all(
@@ -1787,13 +1962,283 @@ fn rpi5_hh_hex_digits(value: u64, digits: &mut [u8; 16]) {
     }
 }
 
+/// Read a big-endian u32 from a high virtual address (DTB content lives in the
+/// TTBR1-mapped 0..2 GiB window). Uses an unaligned read so it is valid for any
+/// 4-byte-aligned structure offset regardless of pointer provenance.
 #[cfg(all(
     not(feature = "hosted-dev"),
     target_arch = "aarch64",
     feature = "rpi5-highhalf"
 ))]
-fn rpi5_hh5_defer(hh4: Rpi5Hh4Ready) -> ! {
-    if hh4.empty_ttbr0_root == 0 {
+unsafe fn hh5_be32(va: u64) -> u32 {
+    u32::from_be(unsafe { core::ptr::read_unaligned(va as *const u32) })
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+unsafe fn hh5_be64(va: u64) -> u64 {
+    let hi = unsafe { hh5_be32(va) } as u64;
+    let lo = unsafe { hh5_be32(va + 4) } as u64;
+    (hi << 32) | lo
+}
+
+/// Bounded NUL-terminated string length over a high virtual address.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+unsafe fn hh5_cstr_len(va: u64, max: usize) -> usize {
+    let mut i = 0usize;
+    while i < max {
+        let byte = unsafe { core::ptr::read_volatile((va + i as u64) as *const u8) };
+        if byte == 0 {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Exact comparison of a NUL-terminated devicetree name at `name_va` against a
+/// retained reference byte string. Both sides are read with raw pointers (no
+/// slice iterators, no anonymous literals) to stay on the proven HH path.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+unsafe fn hh5_name_eq(name_va: u64, ref_va: u64, ref_len: usize) -> bool {
+    let mut i = 0usize;
+    while i < ref_len {
+        let a = unsafe { core::ptr::read_volatile((name_va + i as u64) as *const u8) };
+        let b = unsafe { core::ptr::read((ref_va + i as u64) as *const u8) };
+        if a != b {
+            return false;
+        }
+        i += 1;
+    }
+    let term = unsafe { core::ptr::read_volatile((name_va + ref_len as u64) as *const u8) };
+    term == 0
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+#[derive(Clone, Copy)]
+struct Hh5Chosen {
+    walk_ok: bool,
+    initrd_present: bool,
+    initrd_start: u64,
+    initrd_end: u64,
+    bootargs_va: u64,
+    bootargs_len: u64,
+}
+
+/// Minimal, bounded, high-alias-only flattened-devicetree walker that extracts
+/// the `/chosen` `linux,initrd-start` / `linux,initrd-end` / `bootargs`
+/// properties. It never dereferences a low physical address: every read targets
+/// `dtb_virt` (the TTBR1 high alias of the firmware DTB). FDT layout per the
+/// Devicetree Specification chapter 5 (all header/token words big-endian).
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+unsafe fn hh5_parse_chosen(dtb_virt: u64) -> Hh5Chosen {
+    let mut out = Hh5Chosen {
+        walk_ok: false,
+        initrd_present: false,
+        initrd_start: 0,
+        initrd_end: 0,
+        bootargs_va: 0,
+        bootargs_len: 0,
+    };
+    let off_struct = unsafe { hh5_be32(dtb_virt + 0x08) } as u64;
+    let off_strings = unsafe { hh5_be32(dtb_virt + 0x0c) } as u64;
+    let size_struct = unsafe { hh5_be32(dtb_virt + 0x24) } as u64;
+    let mut p = dtb_virt + off_struct;
+    let struct_end = dtb_virt + off_struct + size_struct;
+    let strings_base = dtb_virt + off_strings;
+
+    let chosen_ref = core::ptr::addr_of!(RPI5_HH5_NAME_CHOSEN) as u64;
+    let start_ref = core::ptr::addr_of!(RPI5_HH5_NAME_INITRD_START) as u64;
+    let end_ref = core::ptr::addr_of!(RPI5_HH5_NAME_INITRD_END) as u64;
+    let bootargs_ref = core::ptr::addr_of!(RPI5_HH5_NAME_BOOTARGS) as u64;
+
+    let mut depth: i32 = 0;
+    let mut chosen_depth: i32 = -1;
+    let mut have_start = false;
+    let mut have_end = false;
+    let mut ended = false;
+    let mut guard: u32 = 0;
+    const GUARD_MAX: u32 = 1 << 20;
+
+    while p + 4 <= struct_end && guard < GUARD_MAX {
+        guard += 1;
+        let token = unsafe { hh5_be32(p) };
+        p += 4;
+        if token == 0x1 {
+            // FDT_BEGIN_NODE: unit name follows, NUL-terminated, padded to 4.
+            let name_va = p;
+            depth += 1;
+            if chosen_depth < 0
+                && unsafe { hh5_name_eq(name_va, chosen_ref, RPI5_HH5_NAME_CHOSEN.len()) }
+            {
+                chosen_depth = depth;
+            }
+            let nlen = unsafe { hh5_cstr_len(name_va, 256) } as u64 + 1;
+            p += (nlen + 3) & !3;
+        } else if token == 0x2 {
+            // FDT_END_NODE
+            if chosen_depth == depth {
+                chosen_depth = -1;
+            }
+            depth -= 1;
+        } else if token == 0x3 {
+            // FDT_PROP: len(u32), nameoff(u32), value[len], padded to 4.
+            let prop_len = unsafe { hh5_be32(p) } as u64;
+            let nameoff = unsafe { hh5_be32(p + 4) } as u64;
+            let val_va = p + 8;
+            if chosen_depth >= 0 && depth == chosen_depth {
+                let name_va = strings_base + nameoff;
+                if unsafe { hh5_name_eq(name_va, start_ref, RPI5_HH5_NAME_INITRD_START.len()) } {
+                    if prop_len == 4 {
+                        out.initrd_start = unsafe { hh5_be32(val_va) } as u64;
+                        have_start = true;
+                    } else if prop_len == 8 {
+                        out.initrd_start = unsafe { hh5_be64(val_va) };
+                        have_start = true;
+                    }
+                } else if unsafe { hh5_name_eq(name_va, end_ref, RPI5_HH5_NAME_INITRD_END.len()) } {
+                    if prop_len == 4 {
+                        out.initrd_end = unsafe { hh5_be32(val_va) } as u64;
+                        have_end = true;
+                    } else if prop_len == 8 {
+                        out.initrd_end = unsafe { hh5_be64(val_va) };
+                        have_end = true;
+                    }
+                } else if unsafe {
+                    hh5_name_eq(name_va, bootargs_ref, RPI5_HH5_NAME_BOOTARGS.len())
+                } {
+                    out.bootargs_va = val_va;
+                    out.bootargs_len = prop_len;
+                }
+            }
+            p += (prop_len + 3) & !3;
+        } else if token == 0x4 {
+            // FDT_NOP
+        } else if token == 0x9 {
+            // FDT_END
+            ended = true;
+            break;
+        } else {
+            // Unknown token: stop walking, report not-ok.
+            break;
+        }
+    }
+
+    out.walk_ok = ended;
+    out.initrd_present = ended && have_start && have_end;
+    out
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+#[inline]
+fn hh5_overlaps(a0: u64, a1: u64, b0: u64, b1: u64) -> bool {
+    a0 < b1 && b0 < a1
+}
+
+/// High-half boot handoff descriptor. Lives at a high virtual address (the
+/// TTBR1 heap alias) and carries only values that are safe to consume after the
+/// HH-4 low-VA retirement: high virtual aliases plus the original physical
+/// ranges for bookkeeping. No field is ever dereferenced through a low VA.
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Rpi5HhBootHandoff {
+    magic: u64,
+    version: u64,
+    dtb_phys: u64,
+    dtb_virt: u64,
+    dtb_size: u64,
+    kernel_phys_start: u64,
+    kernel_phys_end: u64,
+    kernel_virt_start: u64,
+    kernel_virt_end: u64,
+    heap_phys_start: u64,
+    heap_phys_end: u64,
+    heap_virt_start: u64,
+    heap_virt_end: u64,
+    uart_phys: u64,
+    uart_virt: u64,
+    initrd_phys_start: u64,
+    initrd_phys_end: u64,
+    initrd_virt_start: u64,
+    initrd_virt_end: u64,
+    initrd_present: u64,
+    empty_ttbr0_root: u64,
+    ttbr1_root: u64,
+    alloc_base_virt: u64,
+    alloc_next_virt: u64,
+    alloc_end_virt: u64,
+    cmdline_virt: u64,
+    cmdline_len: u64,
+    max_cpus: u64,
+}
+
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+const RPI5_HH5_HANDOFF_MAGIC: u64 = 0x5250_4935_4848_3542; // "RPI5HH5B"
+
+/*
+ * HH-5 high-half initrd / allocator bridge.
+ *
+ * Part A audit — the previous deferral reason
+ * (`high_half_initrd_allocator_bridge_not_ready`) was accurate: the existing
+ * normal-kernel bootstrap (the Stage2C builder and PhysicalFrameAllocator) owns
+ * a LOW-physical frame allocator and dereferences the firmware DTB/initrd
+ * through low identity pointers. After HH-4 retired the low TTBR0 root, low VAs
+ * are unmapped, so calling that path would fault. HH-5 therefore builds a
+ * high-alias-only bridge (DTB parse, initrd discovery, bump allocator, handoff
+ * descriptor) entirely from TTBR1-mapped memory, then defers normal kernel
+ * entry with a precise reason instead of violating the no-low-VA contract.
+ *
+ * Invariants: every memory access uses a high alias; no low VA is dereferenced;
+ * no formatting/panic/assert; bounded UART output; no GIC/RP1/PCIe/task
+ * scheduling/service-chain start; no user TTBR0 install; no EL0 ERET.
+ */
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
+    unsafe extern "C" {
+        static __boot_low_start: u8;
+        static __kernel_phys_start: u8;
+        static __kernel_phys_end: u8;
+        static __hh_heap_start: u8;
+        static __hh_heap_end: u8;
+    }
+
+    if hh4.empty_ttbr0_root == 0 || hh4.dtb_virt < RPI5_HH_VA_OFFSET {
         let _ = rpi5_hh_write_bytes(&RPI5_HH5_FAILED_MARKER);
         let _ = rpi5_hh_write_line(b"hh4_not_ready");
         rpi5_hh_halt();
@@ -1801,17 +2246,265 @@ fn rpi5_hh5_defer(hh4: Rpi5Hh4Ready) -> ! {
     if !rpi5_hh_write_line(&RPI5_HH5_BEGIN_MARKER) {
         rpi5_hh_halt();
     }
+
+    // Inline, bounded, raw-pointer high-UART output (proven HH path). Plain
+    // line markers continue to use rpi5_hh_write_line.
+    const HH5_TX_POLL_LIMIT: usize = 0x1_0000;
+    let hh5_uart_data = RPI5_HH_UART_VIRT as *mut u32;
+    let hh5_uart_flags = (RPI5_HH_UART_VIRT + 0x18) as *const u32;
+    macro_rules! hh5_write_byte {
+        ($byte:expr) => {{
+            let mut poll = 0usize;
+            while poll < HH5_TX_POLL_LIMIT {
+                if unsafe { core::ptr::read_volatile(hh5_uart_flags) } & (1 << 5) == 0 {
+                    break;
+                }
+                poll += 1;
+            }
+            if poll == HH5_TX_POLL_LIMIT {
+                rpi5_hh_halt();
+            }
+            unsafe {
+                core::ptr::write_volatile(hh5_uart_data, $byte as u32);
+            }
+        }};
+    }
+    macro_rules! hh5_emit_marker {
+        ($marker:expr) => {{
+            let mut idx = 0usize;
+            let ptr = core::ptr::addr_of!($marker).cast::<u8>();
+            while idx < $marker.len() {
+                let byte = unsafe { core::ptr::read(ptr.add(idx)) };
+                hh5_write_byte!(byte);
+                idx += 1;
+            }
+        }};
+    }
+    macro_rules! hh5_emit_hex {
+        ($value:expr) => {{
+            let mut nib = 0usize;
+            while nib < 16 {
+                let shift = 60 - nib * 4;
+                let nibble = (($value >> shift) & 0xf) as u8;
+                let digit = if nibble < 10 {
+                    b'0' + nibble
+                } else {
+                    b'a' + nibble - 10
+                };
+                hh5_write_byte!(digit);
+                nib += 1;
+            }
+        }};
+    }
+    macro_rules! hh5_crlf {
+        () => {{
+            hh5_write_byte!(b'\r');
+            hh5_write_byte!(b'\n');
+        }};
+    }
+    macro_rules! hh5_hex_line {
+        ($marker:expr, $value:expr) => {{
+            hh5_emit_marker!($marker);
+            hh5_emit_hex!($value);
+            hh5_crlf!();
+        }};
+    }
+    macro_rules! hh5_fault {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_FAULT_BOUNDARY_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            rpi5_hh_halt();
+        }};
+    }
+    macro_rules! hh5_defer {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_DEFERRED_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            let _ = rpi5_hh_write_line(&RPI5_HH5_DONE_DEFERRED_MARKER);
+            rpi5_hh_halt();
+        }};
+    }
+
+    let dtb_phys = hh4.dtb_phys;
+    let dtb_virt = hh4.dtb_virt;
+
+    // Re-prove the DTB magic through the high alias before trusting any offset.
+    let dtb_magic = unsafe { core::ptr::read_volatile(dtb_virt as *const u32) };
+    if u32::from_be(dtb_magic) != 0xd00d_feed {
+        hh5_fault!(b"dtb_magic");
+    }
+    let dtb_size = unsafe { hh5_be32(dtb_virt + 4) } as u64;
+    if dtb_size < 0x40 || dtb_phys + dtb_size > 0x8000_0000 {
+        hh5_fault!(b"dtb_size");
+    }
+
+    // Part B — parse /chosen for the initrd range and bootargs.
+    if !rpi5_hh_write_line(&RPI5_HH5_DTB_CHOSEN_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let chosen = unsafe { hh5_parse_chosen(dtb_virt) };
+    if !chosen.walk_ok {
+        hh5_fault!(b"initrd_dtb_walk");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_DTB_CHOSEN_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH5_INITRD_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    let image_start = core::ptr::addr_of!(__boot_low_start) as u64;
+    let kernel_phys_start = core::ptr::addr_of!(__kernel_phys_start) as u64;
+    let kernel_phys_end = core::ptr::addr_of!(__kernel_phys_end) as u64;
+    let heap_phys_start = core::ptr::addr_of!(__hh_heap_start) as u64;
+    let heap_phys_end = core::ptr::addr_of!(__hh_heap_end) as u64;
+
+    let mut initrd_present = false;
+    let mut initrd_phys_start = 0u64;
+    let mut initrd_phys_end = 0u64;
+    let mut initrd_virt_start = 0u64;
+    let mut initrd_virt_end = 0u64;
+
+    if !chosen.initrd_present {
+        let _ = rpi5_hh_write_bytes(&RPI5_HH5_INITRD_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"missing");
+    } else {
+        let s = chosen.initrd_start;
+        let e = chosen.initrd_end;
+        // `linux,initrd-end` is exclusive (first byte past the image).
+        if s >= e {
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_INITRD_FAILED_MARKER);
+            let _ = rpi5_hh_write_line(b"bad_range");
+        } else if e > 0x8000_0000 {
+            // Outside the TTBR1 high window, so no safe high alias exists.
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_INITRD_FAILED_MARKER);
+            let _ = rpi5_hh_write_line(b"not_mapped");
+        } else if hh5_overlaps(s, e, image_start, kernel_phys_end) {
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_INITRD_FAILED_MARKER);
+            let _ = rpi5_hh_write_line(b"overlap_kernel");
+        } else if hh5_overlaps(s, e, dtb_phys, dtb_phys + dtb_size) {
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_INITRD_FAILED_MARKER);
+            let _ = rpi5_hh_write_line(b"overlap_dtb");
+        } else {
+            initrd_present = true;
+            initrd_phys_start = s;
+            initrd_phys_end = e;
+            initrd_virt_start = s + RPI5_HH_VA_OFFSET;
+            initrd_virt_end = e + RPI5_HH_VA_OFFSET;
+            hh5_emit_marker!(RPI5_HH5_INITRD_RANGE_MARKER);
+            hh5_emit_hex!(initrd_phys_start);
+            hh5_emit_marker!(RPI5_HH5_INITRD_PHYS_END_SEP_MARKER);
+            hh5_emit_hex!(initrd_phys_end);
+            hh5_crlf!();
+            hh5_emit_marker!(RPI5_HH5_INITRD_VIRT_MARKER);
+            hh5_emit_hex!(initrd_virt_start);
+            hh5_emit_marker!(RPI5_HH5_INITRD_VIRT_END_SEP_MARKER);
+            hh5_emit_hex!(initrd_virt_end);
+            hh5_crlf!();
+            if !rpi5_hh_write_line(&RPI5_HH5_INITRD_OK_MARKER) {
+                rpi5_hh_halt();
+            }
+        }
+    }
+
+    // Part C — high-half boot allocator bridge over the already-mapped heap.
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_BRIDGE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    if heap_phys_end <= heap_phys_start || heap_phys_end > 0x8000_0000 {
+        let _ = rpi5_hh_write_bytes(&RPI5_HH5_ALLOC_BRIDGE_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"heap_range");
+        hh5_fault!(b"alloc_bridge_heap_range");
+    }
+    let heap_virt_start = heap_phys_start + RPI5_HH_VA_OFFSET;
+    let heap_virt_end = heap_phys_end + RPI5_HH_VA_OFFSET;
+    let heap_size = heap_phys_end - heap_phys_start;
+    hh5_emit_marker!(RPI5_HH5_ALLOC_BRIDGE_RANGE_MARKER);
+    hh5_emit_hex!(heap_phys_start);
+    hh5_emit_marker!(RPI5_HH5_ALLOC_BRIDGE_VIRT_SEP_MARKER);
+    hh5_emit_hex!(heap_virt_start);
+    hh5_emit_marker!(RPI5_HH5_ALLOC_BRIDGE_SIZE_SEP_MARKER);
+    hh5_emit_hex!(heap_size);
+    hh5_crlf!();
+
+    // Part D — build the handoff descriptor at the start of the high heap, then
+    // reserve the rest of the heap as a bump region the future kernel bridge can
+    // consume without touching any low VA.
+    let descriptor_size = core::mem::size_of::<Rpi5HhBootHandoff>() as u64;
+    let alloc_base_virt = (heap_virt_start + descriptor_size + 63) & !63;
+    if alloc_base_virt >= heap_virt_end {
+        let _ = rpi5_hh_write_bytes(&RPI5_HH5_ALLOC_BRIDGE_FAILED_MARKER);
+        let _ = rpi5_hh_write_line(b"descriptor_too_large");
+        hh5_fault!(b"alloc_bridge_descriptor");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_BRIDGE_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    if !rpi5_hh_write_line(&RPI5_HH5_HANDOFF_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let handoff = Rpi5HhBootHandoff {
+        magic: RPI5_HH5_HANDOFF_MAGIC,
+        version: 1,
+        dtb_phys,
+        dtb_virt,
+        dtb_size,
+        kernel_phys_start,
+        kernel_phys_end,
+        kernel_virt_start: kernel_phys_start + RPI5_HH_VA_OFFSET,
+        kernel_virt_end: kernel_phys_end + RPI5_HH_VA_OFFSET,
+        heap_phys_start,
+        heap_phys_end,
+        heap_virt_start,
+        heap_virt_end,
+        uart_phys: 0x10_7d00_1000,
+        uart_virt: RPI5_HH_UART_VIRT as u64,
+        initrd_phys_start,
+        initrd_phys_end,
+        initrd_virt_start,
+        initrd_virt_end,
+        initrd_present: initrd_present as u64,
+        empty_ttbr0_root: hh4.empty_ttbr0_root,
+        ttbr1_root: hh4.ttbr1_root,
+        alloc_base_virt,
+        alloc_next_virt: alloc_base_virt,
+        alloc_end_virt: heap_virt_end,
+        cmdline_virt: if chosen.bootargs_va != 0 {
+            chosen.bootargs_va
+        } else {
+            0
+        },
+        cmdline_len: chosen.bootargs_len,
+        max_cpus: 1,
+    };
+    let handoff_ptr = heap_virt_start as *mut Rpi5HhBootHandoff;
+    unsafe {
+        core::ptr::write_volatile(handoff_ptr, handoff);
+    }
+    // Prove the descriptor is readable back through its high alias.
+    let magic_rb = unsafe { core::ptr::read_volatile(heap_virt_start as *const u64) };
+    if magic_rb != RPI5_HH5_HANDOFF_MAGIC {
+        hh5_fault!(b"handoff_readback");
+    }
+    hh5_hex_line!(RPI5_HH5_HANDOFF_OK_MARKER, heap_virt_start);
+
     /*
-     * Outcome C: HH-4 has retired the low identity root, but the existing
-     * Stage2C builder owns a low-physical allocator and consumes the firmware
-     * DTB/initrd through low pointers. Reusing it here would violate HH-4's
-     * no-low-VA contract. Keep the future attempt/ERET/trap markers retained
-     * for artifact auditing, but do not emit them and do not execute ERET.
+     * Part E — normal kernel entry is intentionally NOT called.
+     *
+     * The bridge above is proven, but the normal YARM bootstrap still requires a
+     * low-physical frame allocator and low identity mappings that HH-4 retired.
+     * Bridging that safely is the next milestone; until then we defer with a
+     * precise reason rather than faulting. No task scheduling, GIC, RP1, PCIe,
+     * or service chain is started, no user TTBR0 is installed, and no EL0 ERET
+     * is executed.
      */
-    let _ = rpi5_hh_write_bytes(&RPI5_HH5_DEFERRED_MARKER);
-    let _ = rpi5_hh_write_line(b"high_half_initrd_allocator_bridge_not_ready");
-    let _ = rpi5_hh_write_line(&RPI5_HH5_DONE_DEFERRED_MARKER);
-    rpi5_hh_halt()
+    if initrd_present {
+        hh5_defer!(b"normal_kernel_entry_requires_low_allocator");
+    } else {
+        hh5_defer!(b"initrd_missing");
+    }
 }
 
 #[cfg(all(
@@ -2421,7 +3114,7 @@ extern "C" fn yarm_rpi5_hh_rust_continue() -> ! {
         rpi5_hh_fail(b"uart_timeout");
     }
     let hh4 = rpi5_hh4_retire_low_ttbr0(dtb_phys);
-    rpi5_hh5_defer(hh4)
+    rpi5_hh5_bridge(hh4)
 }
 
 #[cfg(all(

@@ -262,11 +262,22 @@ Expected high-half diagnostic markers:
   RPI5_HH4_UART_AFTER_TTBR0_OK
   RPI5_HH4_DONE
   RPI5_HH5_BEGIN
-  RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready
+  RPI5_HH5_DTB_CHOSEN_BEGIN
+  RPI5_HH5_DTB_CHOSEN_OK
+  RPI5_HH5_INITRD_BEGIN
+  RPI5_HH5_INITRD_RANGE / RPI5_HH5_INITRD_OK   (or RPI5_HH5_INITRD_FAILED reason=missing)
+  RPI5_HH5_ALLOC_BRIDGE_BEGIN
+  RPI5_HH5_ALLOC_BRIDGE_RANGE
+  RPI5_HH5_ALLOC_BRIDGE_OK
+  RPI5_HH5_HANDOFF_BEGIN
+  RPI5_HH5_HANDOFF_OK virt=0x...
+  RPI5_HH5_DEFERRED reason=normal_kernel_entry_requires_low_allocator  (or reason=initrd_missing)
   RPI5_HH5_DONE status=deferred
 
-An initrd may still be staged with --initrd-input, but HH-3 does not require or
-consume it.
+HH-5 builds a high-alias-only initrd/allocator/handoff bridge, then defers
+normal kernel entry (which still needs a low-physical allocator) with a precise
+reason. An initrd may be staged with --initrd-input; if present in the DTB
+/chosen node it is discovered and validated, otherwise HH-5 reports it missing.
 EOF_HIGHHALF
 fi
 

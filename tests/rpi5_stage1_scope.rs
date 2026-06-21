@@ -833,7 +833,7 @@ fn rpi5_hh4_retires_low_ttbr0_and_hh5_defers_without_eret() {
     assert!(hh45.contains("\"dsb ish\""));
     assert!(hh45.contains("RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER"));
     assert!(hh45.contains("Rpi5Hh4Ready"));
-    assert!(hh45.contains("fn rpi5_hh5_defer(hh4: Rpi5Hh4Ready) -> !"));
+    assert!(hh45.contains("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !"));
     assert!(hh45.contains("high_half_initrd_allocator_bridge_not_ready"));
     assert!(!hh45.contains("core::arch::asm!(\"eret\""));
     assert!(!boot.contains("RPI5_HH5_ENTER_USER_ERET"));
@@ -935,5 +935,99 @@ fn rpi5_hh3_bypass_is_temporary_and_hh4_proves_dtb_handoff() {
         "RPI5_HH4_UART_STILL_OK",
     ] {
         assert!(build.contains(marker), "build omits {marker}");
+    }
+}
+
+#[test]
+fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // The bridge replaces the bare deferral with real DTB/initrd/allocator/
+    // handoff work, and the new markers are present in source.
+    for marker in [
+        "RPI5_HH5_DTB_CHOSEN_BEGIN",
+        "RPI5_HH5_DTB_CHOSEN_OK",
+        "RPI5_HH5_INITRD_BEGIN",
+        "RPI5_HH5_INITRD_RANGE phys_start=0x",
+        "RPI5_HH5_INITRD_VIRT virt_start=0x",
+        "RPI5_HH5_INITRD_OK",
+        "RPI5_HH5_INITRD_FAILED reason=",
+        "RPI5_HH5_ALLOC_BRIDGE_BEGIN",
+        "RPI5_HH5_ALLOC_BRIDGE_RANGE phys=0x",
+        "RPI5_HH5_ALLOC_BRIDGE_OK",
+        "RPI5_HH5_HANDOFF_BEGIN",
+        "RPI5_HH5_HANDOFF_OK virt=0x",
+        "RPI5_HH5_FAULT_BOUNDARY reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits HH5 marker {marker}");
+    }
+
+    // Isolate the HH5 bridge body for structural checks.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Part B/C/D: DTB and initrd are read through the high virtual alias, and the
+    // allocator/handoff live at high virtual addresses (PA + HH_VA_OFFSET).
+    assert!(hh5.contains("hh5_parse_chosen(dtb_virt)"));
+    assert!(hh5.contains("heap_phys_start + RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("initrd_virt_start = s + RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("heap_virt_start as *mut Rpi5HhBootHandoff"));
+    assert!(hh5.contains("RPI5_HH5_HANDOFF_MAGIC"));
+
+    // Overlap protection against the kernel image and the DTB.
+    assert!(hh5.contains("overlap_kernel"));
+    assert!(hh5.contains("overlap_dtb"));
+
+    // No low-VA dereference after HH4: the bridge never builds a raw pointer
+    // directly from a *_phys value; all dereferences go through *_virt aliases.
+    assert!(!hh5.contains("dtb_phys as *const"));
+    assert!(!hh5.contains("dtb_phys as *mut"));
+    assert!(!hh5.contains("initrd_phys_start as *"));
+    assert!(!hh5.contains("heap_phys_start as *"));
+
+    // No userspace entry, no premature subsystems, no panics/formatting.
+    assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("RPI5_HH5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("core::arch::asm!(\"eret\""));
+    assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
+    for forbidden in [
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "pcie_init",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "bootstrap_first_user_task",
+        "yarm_log!",
+        "printk",
+        "panic!",
+        "unwrap()",
+        "scheduler",
+    ] {
+        assert!(!hh5.contains(forbidden), "HH5 bridge added {forbidden}");
+    }
+
+    // Deferral remains explicit and precise (no silent hang).
+    assert!(hh5.contains("normal_kernel_entry_requires_low_allocator"));
+    assert!(hh5.contains("initrd_missing"));
+
+    // Build + fixture validators require the new HH5 markers.
+    for marker in [
+        "RPI5_HH5_DTB_CHOSEN_BEGIN",
+        "RPI5_HH5_INITRD_BEGIN",
+        "RPI5_HH5_ALLOC_BRIDGE_BEGIN",
+        "RPI5_HH5_HANDOFF_BEGIN",
+        "RPI5_HH5_DEFERRED reason=",
+    ] {
+        assert!(build.contains(marker), "build omits HH5 marker {marker}");
     }
 }
