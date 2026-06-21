@@ -592,10 +592,17 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH_PRINT_REGS_FIRST_HEX_FAILED reason=",
         "RPI5_HH3_FAULT_BOUNDARY reason=print_regs_first_hex_output",
         "RPI5_HH_PRINT_REGS_FIRST_DONE value=0x",
+        "RPI5_HH_PRINT_REGS_SP_BEGIN",
+        "RPI5_HH_PRINT_REGS_SP_HEX_BEGIN",
+        "RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_BEGIN",
+        "RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_DONE",
+        "RPI5_HH_PRINT_REGS_SP_HEX_DONE",
+        "RPI5_HH_PRINT_REGS_SP_HEX_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=print_regs_sp_hex_output",
+        "RPI5_HH_PRINT_REGS_SP_DONE value=0x",
         "RPI5_HH_PRINT_REGS_DONE",
         "RPI5_HH3_PRECHECK_DONE",
-        "RPI5_HH_PRINT_REGS_FIRST_DONE value=0x",
-        "RPI5_HH_SP value=0x",
+        "RPI5_HH_PRINT_REGS_SP_DONE value=0x",
         "RPI5_HH_VBAR value=0x",
         "RPI5_HH_TTBR0 value=0x",
         "RPI5_HH_TTBR1 value=0x",
@@ -651,10 +658,22 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
     assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DIGIT_BEGIN_MARKER"));
     assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DIGIT_DONE_MARKER"));
     assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER"));
     assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_FAILED_MARKER"));
     assert!(boot.contains("RPI5_HH3_PRINT_REGS_FIRST_HEX_FAULT_BOUNDARY_MARKER"));
     assert!(boot.contains("core::ptr::write_volatile(hh_print_regs_first_hex_data, $byte as u32)"));
     assert!(!boot.contains("rpi5_hh_write_hex_line(b\"RPI5_HH_PC value=0x\", pc)"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_FAILED_MARKER"));
+    assert!(boot.contains("RPI5_HH3_PRINT_REGS_SP_HEX_FAULT_BOUNDARY_MARKER"));
+    assert!(boot.contains("core::ptr::write_volatile(hh_print_regs_sp_hex_data, $byte as u32)"));
+    assert!(!boot.contains("rpi5_hh_write_hex_line(b\"RPI5_HH_SP value=0x\", sp)"));
     assert!(boot.contains("RPI5_HH_VA_OFFSET: u64 = 0xffff_ff80_0000_0000"));
     assert!(boot.contains("tcr & (1 << 23) != 0"));
     assert!(policy.contains("plan_rpi5_high_half_transition"));
@@ -775,6 +794,9 @@ fn rpi5_hh3_success_markers_are_retained_in_the_high_image() {
     assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_BEGIN_MARKER"));
     assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_BEGIN_MARKER"));
     assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)"));
 }
 
