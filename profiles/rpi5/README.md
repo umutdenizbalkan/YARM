@@ -1,96 +1,83 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright 2026 Umut Deniz Balkan -->
 
-# Raspberry Pi 5 service-manifest example
+# Raspberry Pi 5 profile
 
-This directory is a **documentation/example-only** Raspberry Pi 5 profile. It
-does not enable Raspberry Pi 5 hardware boot, is not packed automatically, and
-is not consumed by init or any other runtime component.
+This directory is the Raspberry Pi 5 **service-profile** scaffold: a strict
+example service list plus a driver/boot roadmap. It is documentation and
+prospective profile data only. It does **not** enable a Raspberry Pi 5 driver
+stack and it does **not** cause any service to be spawned.
 
-## Strict example manifest
+Hardware bring-up detail (the high-half boot stages, markers, and scripts) is
+owned by [`doc/RPI5_BRINGUP.md`](../../doc/RPI5_BRINGUP.md). This file does not
+duplicate it; it only summarizes status and points at the driver roadmap.
 
-`services-core.manifest` follows the MANIFEST-1 v1 syntax:
+## Current real-hardware status (conservative)
 
-- UTF-8 text;
-- one absolute service path per nonempty line;
-- blank lines and full-line `#` comments only;
-- no inline comments or metadata fields; and
+YARM boots farther on real Raspberry Pi 5 than earlier revisions of this profile
+claimed, but it does **not** yet reach normal kernel entry, userspace, or live
+driver spawning. The high-half (HH) diagnostic path is what runs on hardware
+today.
+
+Proven on real RPi5 hardware (UART log markers):
+
+- `RPI5_HH3_DONE` — high-half register/UART proof complete.
+- `RPI5_HH4_BEGIN` … `RPI5_HH4_DONE` — DTB pointer preserved
+  (`RPI5_HH4_DTB_PTR_OK value=0x2efec600`, `RPI5_HH4_DTB_VIRT_OK
+  value=0xffffff802efec600`), low TTBR0 identity map retired, high PC/SP/VBAR
+  validated, UART still alive after the TTBR0 replacement.
+- `RPI5_HH5_BEGIN` — high-half initrd/allocator bridge stage entered.
+
+Last confirmed hardware blocker: HH5 stopped inside the flattened-devicetree
+`/chosen` / initrd walk (`RPI5_HH5_FAULT_BOUNDARY reason=initrd_dtb_walk`).
+
+In-tree but **not yet re-confirmed on hardware**: the FDT walker advance bug was
+fixed and the walk now emits precise phase markers
+(`RPI5_HH5_FDT_HEADER_OK`, `RPI5_HH5_FDT_BLOCKS_OK`, `RPI5_HH5_FDT_CHOSEN_FOUND`,
+…), a missing initrd is non-fatal (`RPI5_HH5_INITRD_FAILED reason=missing`), and
+the bridge builds an allocator/handoff descriptor before deferring with a precise
+reason (`RPI5_HH5_DEFERRED reason=initrd_missing` or
+`reason=normal_kernel_entry_requires_low_allocator`). This still needs a
+hardware run to confirm. See `doc/RPI5_BRINGUP.md` and
+[`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
+
+## First userspace target
+
+Normal kernel bootstrap, `ENTER_USER`, and `/sbin/initramfs_srv` are **not yet
+reached on RPi5**. The blocker is that the normal kernel bootstrap still requires
+a low-physical frame allocator and low identity mappings that HH4 deliberately
+retired. The next milestone is a high-half handoff into normal kernel init; see
+the milestone ladder in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
+
+## `services-core.manifest`
+
+`services-core.manifest` is a strict MANIFEST-1 v1 example:
+
+- UTF-8 text; one absolute service path per nonempty line;
+- blank lines and full-line `#` comments only; no inline comments;
 - no duplicate, relative, or whitespace-containing paths.
 
-The example intentionally contains only paths guaranteed by the current common
-QEMU initramfs staging flow and useful as a platform-neutral foundation:
-
-| Path | Intended future role |
-| --- | --- |
-| `/sbin/initramfs_srv` | Read-only access to files packed in the boot CPIO. |
-| `/sbin/devfs_srv` | Device namespace service. |
-| `/sbin/vfs_server` | VFS routing and mount coordination. The current packed name is `vfs_server`, not `vfs_srv`. |
-| `/sbin/driver_manager` | Future platform-device and driver registration coordination. |
-| `/sbin/blkcache_srv` | Platform-neutral block-cache layer above a future Pi block backend. |
-
-The file is not a claim about startup order. It is only prospective selection
-data for an init-owned policy that does not exist yet.
-
-## Deferred Raspberry Pi 5 services and drivers
-
-A useful bare-metal Raspberry Pi 5 profile will eventually need more than the
-strict example. These items are intentionally documented here rather than
-listed in `services-core.manifest`, because their Raspberry Pi 5 implementation,
-CPIO staging, or platform integration is not yet guaranteed:
-
-- serial/UART console driver;
-- mailbox/property interface driver;
-- GPIO driver;
-- SD/eMMC/MMC block driver;
-- IRQ routing through `irqmux_srv`;
-- `ramfs_srv` for writable volatile storage;
-- `fat_srv` and `ext4_srv` after a Pi block backend is available;
-- driver-manager platform registry and device-tree matching;
-- xHCI/USB host support later; and
-- optional network stack services such as net-device support, `netmgr_srv`,
-  `tcpip_srv`, and `socket_srv` later.
-
-The repository declares several of these service binaries today, but the
-current common CPIO packer does not guarantee all of their paths. Add them to a
-strict profile only after the relevant artifact build stages and Pi-specific
-hardware contracts exist.
-
-## Future boot flow
-
-The intended future command line is:
-
-```text
-yarm.manifest=/boot/services-core.txt
-```
-
-A future Pi image builder could place this example at that CPIO path, but no
-current code performs that selection. The required staged flow is:
-
-1. **BOOTCMD-3** provides an immutable command-line or manifest-path handoff to
-   init.
-2. Init reads the selected text file from CPIO.
-3. The MANIFEST-1 helper validates v1 syntax.
-4. The MANIFEST-2 helper checks that every listed path exists as a regular ELF
-   file in the archive.
-5. Init applies profile fallback or fail-closed policy.
-6. PM remains the spawn authority.
-7. The supervisor remains the fault and restart authority.
-
-MANIFEST-1 and MANIFEST-2 remain helper-only today. Init does not consume this
-file, and the current runtime service order is unchanged.
-
-## CPIO alignment requirement
-
-Every ELF packed into a future Pi CPIO must retain 4096-byte file-data alignment
-and produce the mandatory build-time `ALIGN_PROOF ... aligned=true` marker. The
-MANIFEST-2 existence/ELF-magic validator does not replace or duplicate this
-packer requirement.
+It intentionally lists only services that already have a build-declared binary
+and an `image_id` in the runtime spawn table (`initramfs_srv`, `devfs_srv`,
+`vfs_server`, `driver_manager`, `blkcache_srv`). It is **not** a startup-order
+claim and is **not** consumed by init today — no code selects or applies it.
+Raspberry Pi-specific driver binaries (`uart_srv`, `irqmux_srv`, `rp1_gpio_srv`)
+are deliberately **omitted** until RPi5 userspace actually reaches
+`driver_manager` and those drivers have a validated hardware path. See the
+driver inventory in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning
 
-This profile does not assert that:
+This profile does **not** assert that:
 
-- Raspberry Pi 5 boots YARM today;
-- the listed services have Pi-specific hardware support;
-- device-tree discovery or platform matching is implemented;
+- Raspberry Pi 5 reaches userspace or runs any service today (it does not — it
+  halts in the HH5 diagnostic path);
+- the listed services have Raspberry Pi 5-specific hardware support;
+- device-tree-driven device discovery, MMIO/IRQ resource assignment, or driver
+  spawning is implemented;
 - the manifest is handed to init; or
-- any listed service will be spawned because this file exists.
+- any listed service is spawned because this file exists.
+
+What it *does* assert is audited and conservative: the boot markers above are
+real, the manifest paths are real build targets, and the deferred driver work is
+inventoried with explicit blockers in `DRIVER_ROADMAP.md`.
