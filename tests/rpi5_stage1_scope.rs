@@ -1016,11 +1016,12 @@ fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
         assert!(!hh5.contains(forbidden), "HH5 bridge added {forbidden}");
     }
 
-    // Deferral remains explicit and precise (no silent hang). The old
-    // low-allocator deferral has been replaced by a real high-half boot
-    // allocator; the remaining blocker is the kernel global heap / full VM.
+    // Deferral remains explicit and precise (no silent hang). BOOT-4 builds a
+    // high-half kernel heap region + validates the VM, then defers at the global
+    // allocator's low-direct-map dependency (not the old generic blocker).
     assert!(!hh5.contains("normal_kernel_entry_requires_low_allocator"));
-    assert!(hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
+    assert!(!hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
+    assert!(hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
     assert!(hh5.contains("initrd_missing"));
 
     // Build + fixture validators require the new HH5 markers.
@@ -1259,7 +1260,7 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     assert!(hh5.contains("0x8000_0000"));
 
     // Precise deferral; still no userspace, no subsystem starts, no ERET.
-    assert!(hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
+    assert!(hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1279,5 +1280,82 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
         "scheduler",
     ] {
         assert!(!hh5.contains(forbidden), "bridge added {forbidden}");
+    }
+}
+
+#[test]
+fn rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // BOOT-4 markers exist in source and are required by the image validator.
+    for marker in [
+        "RPI5_BOOT4_GLOBAL_HEAP_AUDIT_BEGIN",
+        "RPI5_BOOT4_GLOBAL_HEAP_AUDIT_DONE",
+        "RPI5_KERNEL_GLOBAL_HEAP_BEGIN",
+        "RPI5_KERNEL_GLOBAL_HEAP_RANGE virt=0x",
+        "RPI5_KERNEL_GLOBAL_HEAP_OK",
+        "RPI5_KERNEL_GLOBAL_HEAP_FAILED reason=",
+        "RPI5_KERNEL_VM_BEGIN",
+        "RPI5_KERNEL_VM_LAYOUT_OK",
+        "RPI5_KERNEL_VM_OK",
+        "RPI5_KERNEL_VM_FAILED reason=",
+        "RPI5_BOOT4_FAULT_BOUNDARY reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits BOOT4 marker {marker}");
+        assert!(build.contains(marker), "build omits BOOT4 marker {marker}");
+    }
+
+    // Isolate the HH5 bridge body.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Task B: the kernel heap region is carved from the validated window and
+    // accessed only through its high alias (PA + HH_VA_OFFSET); proven mapped via
+    // first/last sentinel read-back, not a low VA and not a large loop.
+    assert!(hh5.contains("kheap_phys_start + RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("kheap_virt_start as *mut u64"));
+    assert!(hh5.contains("const KERNEL_HEAP_SIZE: u64 = 0x0040_0000"));
+    // Heap region overlap protection against image/dtb/initrd/HH heap
+    // (formatting-robust: the call may be wrapped across lines).
+    assert!(hh5.contains("hh5_overlaps("));
+    assert!(hh5.contains("kheap_phys_start"));
+    assert!(hh5.contains("kheap_phys_end"));
+
+    // Task A: the audit names the exact blocker (global allocator low direct map).
+    assert!(hh5.contains("low identity direct map"));
+
+    // Task D: KernelState is NOT constructed; deferral is precise and there is no
+    // userspace entry, no user TTBR0 install, no EL0 ERET, no big stack array, no
+    // by-value allocator, and no premature subsystem start.
+    assert!(hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
+    assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("core::arch::asm!(\"eret\""));
+    assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
+    assert!(!hh5.contains("[0u8;"));
+    assert!(!hh5.contains("PhysicalFrameAllocator::new_uninit()"));
+    for forbidden in [
+        "bootstrap_first_user_task",
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "panic!",
+        "unwrap()",
+        "expect(",
+        "yarm_log!",
+        "printk",
+        "scheduler",
+    ] {
+        assert!(!hh5.contains(forbidden), "BOOT4 bridge added {forbidden}");
     }
 }

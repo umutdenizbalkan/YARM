@@ -167,6 +167,17 @@ for marker in \
   RPI5_KERNEL_PMEM_BEGIN \
   'RPI5_KERNEL_PMEM_OK free_pages=0x' \
   RPI5_KERNEL_BOOTINFO_OK \
+  RPI5_BOOT4_GLOBAL_HEAP_AUDIT_BEGIN \
+  RPI5_BOOT4_GLOBAL_HEAP_AUDIT_DONE \
+  RPI5_KERNEL_GLOBAL_HEAP_BEGIN \
+  'RPI5_KERNEL_GLOBAL_HEAP_RANGE virt=0x' \
+  RPI5_KERNEL_GLOBAL_HEAP_OK \
+  'RPI5_KERNEL_GLOBAL_HEAP_FAILED reason=' \
+  RPI5_KERNEL_VM_BEGIN \
+  RPI5_KERNEL_VM_LAYOUT_OK \
+  RPI5_KERNEL_VM_OK \
+  'RPI5_KERNEL_VM_FAILED reason=' \
+  'RPI5_BOOT4_FAULT_BOUNDARY reason=' \
   'RPI5_HH5_FAULT_BOUNDARY reason=' \
   'RPI5_HH5_DEFERRED reason=' \
   'RPI5_HH5_DONE status=deferred' \
@@ -252,8 +263,10 @@ assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH5_DTB_CHOSEN_BEGIN'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH5_HANDOFF_OK virt=0x'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_HH5_ALLOC_ADAPTER_OK'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_KERNEL_BOOTINFO_OK'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_KERNEL_GLOBAL_HEAP_OK'
+assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'RPI5_KERNEL_VM_OK'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" \
-  'RPI5_HH5_DEFERRED reason=kernel_bootstrap_requires_global_heap_and_full_vm'
+  'RPI5_HH5_DEFERRED reason=kernel_state_requires_global_allocator_low_direct_map'
 assert_contains "$hh_boot/README-RPI5-STAGE1.txt" 'high-alias-only initrd/allocator/handoff bridge'
 [[ ! -e "$hh_boot/initramfs-stage2a.cpio" ]] || fail "HH mode unexpectedly required an initrd"
 

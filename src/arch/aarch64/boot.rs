@@ -1719,6 +1719,102 @@ rpi5_hh_retained_marker!(
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(RPI5_KERNEL_BOOTINFO_OK_MARKER, b"RPI5_KERNEL_BOOTINFO_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT4_GLOBAL_HEAP_AUDIT_BEGIN_MARKER,
+    b"RPI5_BOOT4_GLOBAL_HEAP_AUDIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT4_GLOBAL_HEAP_AUDIT_DONE_MARKER,
+    b"RPI5_BOOT4_GLOBAL_HEAP_AUDIT_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT4_FAULT_BOUNDARY_MARKER,
+    b"RPI5_BOOT4_FAULT_BOUNDARY reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_HEAP_BEGIN_MARKER,
+    b"RPI5_KERNEL_GLOBAL_HEAP_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_HEAP_RANGE_MARKER,
+    b"RPI5_KERNEL_GLOBAL_HEAP_RANGE virt=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_GLOBAL_HEAP_SIZE_SEP_MARKER, b" size=0x");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_HEAP_OK_MARKER,
+    b"RPI5_KERNEL_GLOBAL_HEAP_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_HEAP_FAILED_MARKER,
+    b"RPI5_KERNEL_GLOBAL_HEAP_FAILED reason="
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_VM_BEGIN_MARKER, b"RPI5_KERNEL_VM_BEGIN");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_VM_LAYOUT_OK_MARKER, b"RPI5_KERNEL_VM_LAYOUT_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(RPI5_KERNEL_VM_OK_MARKER, b"RPI5_KERNEL_VM_OK");
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_VM_FAILED_MARKER,
+    b"RPI5_KERNEL_VM_FAILED reason="
+);
 // Devicetree reference names compared via raw-pointer reads (no anonymous
 // literals, no slice iterators) so the lookup stays on the proven HH path.
 #[cfg(all(
@@ -3368,16 +3464,169 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         rpi5_hh_halt();
     }
 
+    // ===================== BOOT-4 global heap + kernel VM =====================
+    macro_rules! boot4_fail {
+        ($failed_marker:expr, $reason:literal, $boundary_reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&$failed_marker);
+            let _ = rpi5_hh_write_line($reason);
+            let _ = rpi5_hh_write_bytes(&RPI5_BOOT4_FAULT_BOUNDARY_MARKER);
+            let _ = rpi5_hh_write_line($boundary_reason);
+            rpi5_hh_halt()
+        }};
+    }
+
     /*
-     * Precise remaining blocker. The boot input, a real high-half physical
-     * allocator, and a high-half boot-info record are all proven. The next step
-     * — constructing the normal `KernelState`, ELF-loading init from the
-     * initramfs, building a user address space, installing a user TTBR0, and
-     * ERET to EL0 — needs the kernel global heap and the full kernel VM layout,
-     * neither of which the HH diagnostic environment provides. Defer precisely;
-     * no scheduling, GIC, RP1, PCIe, service chain, user TTBR0, or EL0 ERET.
+     * Task A — global-heap / KernelState audit.
+     *
+     * Finding: the AArch64 global allocator (`KernelGlobalAllocator`) reaches
+     * every backing frame through the low identity direct map — its
+     * `phys_to_ptr` returns the physical address itself as the kernel pointer,
+     * and it draws frames from `PT_FRAME_ALLOCATOR` describing low RAM. HH4
+     * retired the low TTBR0 identity map, so any allocation through it would
+     * touch an unmapped low VA. Constructing the normal `KernelState` allocates
+     * through that global allocator, so it cannot run here yet. BOOT-4 therefore
+     * builds and proves a high-alias-only kernel heap REGION and re-validates the
+     * high-half VM, then defers precisely before any allocation. The future
+     * milestone is an arch-owned high-half phys<->virt direct map so the global
+     * allocator can be backed by this region.
      */
-    hh5_defer!(b"kernel_bootstrap_requires_global_heap_and_full_vm");
+    if !rpi5_hh_write_line(&RPI5_BOOT4_GLOBAL_HEAP_AUDIT_BEGIN_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT4_GLOBAL_HEAP_AUDIT_DONE_MARKER)
+    {
+        rpi5_hh_halt();
+    }
+
+    // Task B — high-half-safe kernel heap region, carved from the top of the
+    // already-validated 16 MiB bring-up window (all of which is free RAM above
+    // every firmware/boot artifact and inside the TTBR1 high map). Accessed only
+    // through its high alias; no low VA, no large local, no normal allocator.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_HEAP_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    const KERNEL_HEAP_SIZE: u64 = 0x0040_0000; // 4 MiB
+    if usable_end - usable_start < KERNEL_HEAP_SIZE {
+        boot4_fail!(
+            RPI5_KERNEL_GLOBAL_HEAP_FAILED_MARKER,
+            b"window_too_small",
+            b"global_heap"
+        );
+    }
+    let kheap_phys_start = (usable_end - KERNEL_HEAP_SIZE) & !0xfffu64;
+    let kheap_phys_end = kheap_phys_start + KERNEL_HEAP_SIZE;
+    // Stay inside the validated window and the TTBR1 high map; do not collide
+    // with the boot-probe front of the window.
+    if kheap_phys_start < usable_start
+        || kheap_phys_end > usable_end
+        || kheap_phys_end > 0x8000_0000
+    {
+        boot4_fail!(
+            RPI5_KERNEL_GLOBAL_HEAP_FAILED_MARKER,
+            b"out_of_window",
+            b"global_heap"
+        );
+    }
+    // The window already sits above the kernel image, DTB, initrd, HH heap, and
+    // page tables, but re-prove no overlap with any of them defensively.
+    if hh5_overlaps(
+        kheap_phys_start,
+        kheap_phys_end,
+        image_start,
+        kernel_phys_end,
+    ) || hh5_overlaps(
+        kheap_phys_start,
+        kheap_phys_end,
+        dtb_phys,
+        dtb_phys + dtb_size,
+    ) || hh5_overlaps(
+        kheap_phys_start,
+        kheap_phys_end,
+        initrd_phys_start,
+        initrd_phys_end,
+    ) || hh5_overlaps(
+        kheap_phys_start,
+        kheap_phys_end,
+        heap_phys_start,
+        heap_phys_end,
+    ) {
+        boot4_fail!(
+            RPI5_KERNEL_GLOBAL_HEAP_FAILED_MARKER,
+            b"overlap",
+            b"global_heap"
+        );
+    }
+    let kheap_virt_start = kheap_phys_start + RPI5_HH_VA_OFFSET;
+    // Prove the region is mapped and writable end to end without a large loop:
+    // write+read-back a sentinel at the first and last 8 bytes.
+    const KHEAP_SENTINEL_A: u64 = 0x5250_4935_4B48_5031; // "RPI5KHP1"
+    const KHEAP_SENTINEL_B: u64 = 0x5250_4935_4B48_5032; // "RPI5KHP2"
+    unsafe {
+        core::ptr::write_volatile(kheap_virt_start as *mut u64, KHEAP_SENTINEL_A);
+        core::ptr::write_volatile(
+            (kheap_virt_start + KERNEL_HEAP_SIZE - 8) as *mut u64,
+            KHEAP_SENTINEL_B,
+        );
+    }
+    let kheap_rb_a = unsafe { core::ptr::read_volatile(kheap_virt_start as *const u64) };
+    let kheap_rb_b = unsafe {
+        core::ptr::read_volatile((kheap_virt_start + KERNEL_HEAP_SIZE - 8) as *const u64)
+    };
+    if kheap_rb_a != KHEAP_SENTINEL_A || kheap_rb_b != KHEAP_SENTINEL_B {
+        boot4_fail!(
+            RPI5_KERNEL_GLOBAL_HEAP_FAILED_MARKER,
+            b"readback",
+            b"global_heap"
+        );
+    }
+    hh5_emit_marker!(RPI5_KERNEL_GLOBAL_HEAP_RANGE_MARKER);
+    hh5_emit_hex!(kheap_virt_start);
+    hh5_emit_marker!(RPI5_KERNEL_GLOBAL_HEAP_SIZE_SEP_MARKER);
+    hh5_emit_hex!(KERNEL_HEAP_SIZE);
+    hh5_crlf!();
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_HEAP_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // Task C — validate the high-half VM layout actually present: every region
+    // the kernel needs to reach lives inside the TTBR1 0..2 GiB high map and its
+    // virtual alias is phys + HH_VA_OFFSET.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_VM_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    if kernel_phys_end > 0x8000_0000 || kernel_phys_end <= kernel_phys_start {
+        boot4_fail!(RPI5_KERNEL_VM_FAILED_MARKER, b"kernel_range", b"kernel_vm");
+    }
+    if dtb_phys + dtb_size > 0x8000_0000 {
+        boot4_fail!(RPI5_KERNEL_VM_FAILED_MARKER, b"dtb_range", b"kernel_vm");
+    }
+    if initrd_phys_end > 0x8000_0000 {
+        boot4_fail!(RPI5_KERNEL_VM_FAILED_MARKER, b"initrd_range", b"kernel_vm");
+    }
+    if heap_phys_end > 0x8000_0000 || kheap_phys_end > 0x8000_0000 {
+        boot4_fail!(RPI5_KERNEL_VM_FAILED_MARKER, b"heap_range", b"kernel_vm");
+    }
+    // The UART high alias is already proven in use by every marker above.
+    if RPI5_HH_UART_VIRT as u64 != 0x10_7d00_1000 + RPI5_HH_VA_OFFSET {
+        boot4_fail!(RPI5_KERNEL_VM_FAILED_MARKER, b"uart_alias", b"kernel_vm");
+    }
+    if !rpi5_hh_write_line(&RPI5_KERNEL_VM_LAYOUT_OK_MARKER)
+        || !rpi5_hh_write_line(&RPI5_KERNEL_VM_OK_MARKER)
+    {
+        rpi5_hh_halt();
+    }
+
+    /*
+     * Task D — KernelState is intentionally NOT constructed.
+     *
+     * A high-alias-only kernel heap region now exists and the high-half VM is
+     * validated, but `KernelState` construction allocates through the global
+     * allocator, whose AArch64 frame->pointer conversion still assumes the low
+     * identity direct map HH4 retired (see the audit above). Building it here
+     * would dereference an unmapped low VA. Defer precisely before any
+     * allocation: no scheduling, GIC, RP1, PCIe, service chain, user TTBR0, or
+     * EL0 ERET. The next milestone is an arch-owned high-half direct map that
+     * backs the global allocator with this region.
+     */
+    hh5_defer!(b"kernel_state_requires_global_allocator_low_direct_map");
 }
 
 #[cfg(all(

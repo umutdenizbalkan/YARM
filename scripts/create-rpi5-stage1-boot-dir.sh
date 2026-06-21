@@ -277,7 +277,8 @@ Expected high-half diagnostic markers:
   RPI5_HH5_ENTER_KERNEL_BEGIN
   RPI5_KERNEL_ENTRY_BEGIN / RPI5_KERNEL_DTB_PARSE_OK / RPI5_KERNEL_INITRD_OK
   RPI5_KERNEL_PMEM_OK / RPI5_KERNEL_BOOTINFO_OK
-  RPI5_HH5_DEFERRED reason=kernel_bootstrap_requires_global_heap_and_full_vm  (or reason=initrd_missing)
+  RPI5_KERNEL_GLOBAL_HEAP_OK / RPI5_KERNEL_VM_OK
+  RPI5_HH5_DEFERRED reason=kernel_state_requires_global_allocator_low_direct_map  (or reason=initrd_missing)
   RPI5_HH5_DONE status=deferred
 
 HH-5 builds a high-alias-only initrd/allocator/handoff bridge, then brings up a

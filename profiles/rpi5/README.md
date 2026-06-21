@@ -37,11 +37,13 @@ fixed and the walk now emits precise phase markers
 …), a missing initrd is non-fatal (`RPI5_HH5_INITRD_FAILED reason=missing`), and
 the bridge now brings up a **real high-half physical-frame allocator** in the
 TTBR1-mapped HH heap plus a boot-info record (`RPI5_HH5_ALLOC_ADAPTER_OK`,
-`RPI5_KERNEL_PMEM_OK`, `RPI5_KERNEL_BOOTINFO_OK`). The old
-`normal_kernel_entry_requires_low_allocator` deferral is therefore replaced; the
-remaining blocker is the kernel global heap / full VM layout
-(`RPI5_HH5_DEFERRED reason=kernel_bootstrap_requires_global_heap_and_full_vm`, or
-`reason=initrd_missing` when no initrd is present). This still needs a hardware
+`RPI5_KERNEL_PMEM_OK`, `RPI5_KERNEL_BOOTINFO_OK`), and BOOT-4 then builds a
+high-alias-only kernel heap region and re-validates the high-half VM
+(`RPI5_KERNEL_GLOBAL_HEAP_OK`, `RPI5_KERNEL_VM_OK`). The remaining blocker is now
+narrowed: the AArch64 global allocator reaches frames through the low identity
+direct map HH4 retired, so `KernelState` cannot allocate yet
+(`RPI5_HH5_DEFERRED reason=kernel_state_requires_global_allocator_low_direct_map`,
+or `reason=initrd_missing` when no initrd is present). This still needs a hardware
 run to confirm. See `doc/RPI5_BRINGUP.md` and
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
