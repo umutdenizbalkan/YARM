@@ -1153,6 +1153,11 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
         "RPI5_HH5_ALLOC_ADAPTER_ZERO_BEGIN",
         "RPI5_HH5_ALLOC_ADAPTER_ZERO_DONE",
         "RPI5_HH5_ALLOC_ADAPTER_INIT_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_OK pages=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_CAPACITY_OK capacity=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_DONE",
         "RPI5_HH5_ALLOC_ADAPTER_INIT_DONE",
         "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN",
         "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK frame=0x",
@@ -1185,15 +1190,30 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
 
     // Task C: a real PhysicalFrameAllocator is placed at a HIGH virtual address
     // (HH heap bump region), initialized over a bounded usable window, and
-    // never built from a low-VA pointer.
+    // never built from a low-VA pointer. Init uses the lean in-place helper that
+    // assumes pre-zeroed storage (no big array re-materialization), not the full
+    // init_from_memory_map.
     assert!(hh5.contains("PhysicalFrameAllocator"));
-    assert!(hh5.contains("init_from_memory_map(&regions)"));
+    assert!(
+        hh5.contains("init_single_region_assume_zeroed(usable_start, usable_end - usable_start)")
+    );
+    assert!(!hh5.contains("init_from_memory_map"));
     assert!(hh5.contains("alloc_meta_virt as *mut PhysicalFrameAllocator"));
     assert!(hh5.contains("alloc_frame()"));
     assert!(hh5.contains("free_frame(test_frame)"));
     // Allocator metadata pointer is a high VA, not a *_phys cast.
     assert!(!hh5.contains("alloc_base_phys as *"));
     assert!(!hh5.contains("usable_start as *"));
+
+    // Task C: the bring-up window is bounded to 16 MiB and the page count is
+    // checked against the allocator's per-frame tracking capacity before init.
+    assert!(hh5.contains("const HH_PMEM_WINDOW: u64 = 0x0100_0000"));
+    assert!(hh5.contains("PhysicalFrameAllocator::tracked_frame_capacity()"));
+    assert!(hh5.contains("usable_pages > frame_capacity"));
+    assert!(hh5.contains("init_range_capacity"));
+    assert!(hh5.contains("init_returned_error"));
+    // 16 MiB / 4 KiB = 4096 pages, well under MAX_TRACKED_FRAME_REFS (8192).
+    assert!(hh5.contains("alloc_adapter_init"));
 
     // Task B: the ~209 KB PhysicalFrameAllocator is NEVER a by-value local. It is
     // initialized in place: zeroed via a bounded volatile loop, then init through

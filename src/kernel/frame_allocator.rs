@@ -181,6 +181,59 @@ impl PhysicalFrameAllocator {
         Ok(())
     }
 
+    /// Per-frame reference-tracking capacity. A bring-up usable window must keep
+    /// its page count at or below this so a later full sweep cannot exceed the
+    /// fixed `frame_refs` table.
+    pub const fn tracked_frame_capacity() -> usize {
+        MAX_TRACKED_FRAME_REFS
+    }
+
+    /// In-place, non-panicking init for a SINGLE usable region that assumes
+    /// `self` is already fully zeroed (every byte 0 == `new_uninit`: all
+    /// `extents`/`run_hint_by_class`/`single_page_hint_idx` `None`, every
+    /// `frame_refs` slot `Empty`, all counters 0, `initialized == false`).
+    ///
+    /// Unlike [`Self::init_from_memory_map`], it never re-materializes the large
+    /// `frame_refs` (~196 KiB) or `extents` arrays, so it emits no big
+    /// memset/memcpy and creates no large local. Intended for the RPi5 HH5
+    /// high-half bring-up allocator, whose storage is pre-zeroed in place. The
+    /// caller MUST have zeroed the whole `size_of::<PhysicalFrameAllocator>()`
+    /// destination first. Rejects empty or over-capacity windows.
+    pub fn init_single_region_assume_zeroed(
+        &mut self,
+        start_phys: u64,
+        len: u64,
+    ) -> Result<(), FrameAllocError> {
+        let start = align_up_checked(start_phys).ok_or(FrameAllocError::InvalidMemoryMap)?;
+        let end_raw = start_phys
+            .checked_add(len)
+            .ok_or(FrameAllocError::InvalidMemoryMap)?;
+        let end = align_down(end_raw);
+        if end <= start {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
+        let pages = ((end - start) / PAGE_SIZE_U64) as usize;
+        if pages == 0 {
+            return Err(FrameAllocError::InvalidMemoryMap);
+        }
+        if pages > MAX_TRACKED_FRAME_REFS {
+            return Err(FrameAllocError::CapacityExceeded);
+        }
+        // `self` is assumed all-zero, so the large arrays already hold their
+        // empty state; only scalar fields and the single free extent are written.
+        self.base_phys = align_down(start);
+        self.end_phys_exclusive = end;
+        self.total_frames = pages;
+        self.free_frames = pages;
+        self.initialized = true;
+        self.extents[0] = Some(FreeExtent {
+            start_phys: start,
+            pages,
+        });
+        self.refresh_run_metadata();
+        Ok(())
+    }
+
     pub fn alloc_frame(&mut self) -> Result<u64, FrameAllocError> {
         if !self.initialized {
             return Err(FrameAllocError::InvalidMemoryMap);
@@ -1033,6 +1086,54 @@ const fn align_up_checked(value: u64) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::std::vec::Vec;
+
+    #[test]
+    fn assume_zeroed_init_rejects_over_capacity_window() {
+        // new_uninit() is the all-zero state the helper assumes.
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        let cap = PhysicalFrameAllocator::tracked_frame_capacity();
+        let too_many = (cap as u64 + 1) * PAGE_SIZE_U64;
+        assert_eq!(
+            alloc.init_single_region_assume_zeroed(0x10_0000, too_many),
+            Err(FrameAllocError::CapacityExceeded)
+        );
+        assert!(!alloc.initialized);
+    }
+
+    #[test]
+    fn assume_zeroed_init_accepts_safe_window_and_allocates_one_frame() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        // 64 pages, well within hosted-dev capacity.
+        let len = 64 * PAGE_SIZE_U64;
+        alloc
+            .init_single_region_assume_zeroed(0x20_0000, len)
+            .expect("safe window initializes");
+        assert!(alloc.initialized);
+        assert_eq!(alloc.total_frames(), 64);
+        assert_eq!(alloc.free_frames(), 64);
+        let frame = alloc.alloc_frame().expect("alloc one frame");
+        assert!(frame >= 0x20_0000 && frame < 0x20_0000 + len);
+        assert_eq!(frame % PAGE_SIZE_U64, 0);
+        assert_eq!(alloc.free_frames(), 63);
+        alloc.free_frame(frame).expect("free frame");
+        assert_eq!(alloc.free_frames(), 64);
+    }
+
+    #[test]
+    fn assume_zeroed_init_rejects_empty_window() {
+        let mut alloc = PhysicalFrameAllocator::new_uninit();
+        assert!(
+            alloc
+                .init_single_region_assume_zeroed(0x10_0000, 0)
+                .is_err()
+        );
+        assert!(
+            alloc
+                .init_single_region_assume_zeroed(0x10_0000, 0x800)
+                .is_err()
+        );
+        assert!(!alloc.initialized);
+    }
 
     fn extent_end(extent: FreeExtent) -> u64 {
         extent

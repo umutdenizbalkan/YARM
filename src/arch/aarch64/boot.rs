@@ -1506,6 +1506,51 @@ rpi5_hh_retained_marker!(
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_OK pages=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_INIT_CAPACITY_OK_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_INIT_CAPACITY_OK capacity=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_BEGIN_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_DONE_MARKER,
+    b"RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
     RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN_MARKER,
     b"RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN"
 );
@@ -2984,8 +3029,8 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     // onto the stack and stalled the bring-up). It is initialized DIRECTLY in
     // place at a high virtual address in the HH heap: zero the destination with a
     // bounded volatile loop (yielding a valid all-zero == new_uninit value), then
-    // call `init_from_memory_map` through `&mut`. No full allocator value ever
-    // crosses the stack. Each substep is bracketed by a marker.
+    // run the lean in-place single-region init through `&mut`. No full allocator
+    // value ever crosses the stack. Each substep is bracketed by a marker.
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_BEGIN_MARKER) {
         rpi5_hh_halt();
     }
@@ -2999,7 +3044,7 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         }};
     }
 
-    use crate::kernel::frame_allocator::{MemoryRegion, PhysicalFrameAllocator};
+    use crate::kernel::frame_allocator::PhysicalFrameAllocator;
 
     // --- Layout: compute the usable window and the in-heap storage address. ---
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_LAYOUT_BEGIN_MARKER) {
@@ -3015,10 +3060,13 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     if initrd_phys_end > reserved_top {
         reserved_top = initrd_phys_end;
     }
-    // 2 MiB-align up past all artifacts; bound the boot window to 64 MiB and the
-    // TTBR1 high-map limit (2 GiB).
+    // 2 MiB-align up past all artifacts; bound the bring-up window and the TTBR1
+    // high-map limit (2 GiB). This is a TEMPORARY bring-up allocator window, not
+    // the final DTB /memory map. It is kept at 16 MiB (4096 pages) so the page
+    // count stays well under the allocator's per-frame tracking capacity
+    // (MAX_TRACKED_FRAME_REFS, 8192 == 32 MiB); see Task C / the capacity guard.
     let usable_start = (reserved_top + 0x1f_ffff) & !0x1f_ffffu64;
-    const HH_PMEM_WINDOW: u64 = 0x0400_0000;
+    const HH_PMEM_WINDOW: u64 = 0x0100_0000;
     let mut usable_end = usable_start + HH_PMEM_WINDOW;
     if usable_end > 0x8000_0000 {
         usable_end = 0x8000_0000;
@@ -3069,20 +3117,56 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         rpi5_hh_halt();
     }
 
-    // --- Init in place: the zeroed storage is a valid (all-None/Empty) value, so
-    // forming &mut and calling init_from_memory_map never copies a full value. ---
+    // --- Init in place. The zeroed storage is a valid (all-None/Empty) value,
+    // so `init_single_region_assume_zeroed` only writes scalar fields + one free
+    // extent: it NEVER re-materializes the ~196 KiB `frame_refs` / `extents`
+    // arrays (the big memset/memcpy that stalled the previous full memory-map
+    // init). It is non-panicking and bounded. ---
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_INIT_BEGIN_MARKER) {
         rpi5_hh_halt();
     }
-    let regions = [MemoryRegion {
-        start: usable_start,
-        len: usable_end - usable_start,
-        usable: true,
-    }];
+    macro_rules! alloc_init_fail {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_ALLOC_ADAPTER_FAILED_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            let _ = rpi5_hh_write_bytes(&RPI5_HH5_FAULT_BOUNDARY_MARKER);
+            let _ = rpi5_hh_write_line(b"alloc_adapter_init");
+            rpi5_hh_halt()
+        }};
+    }
+
+    // Range + capacity: the bring-up window must fit the per-frame tracking
+    // capacity so no later sweep can exceed MAX_TRACKED_FRAME_REFS.
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let usable_pages = (usable_end - usable_start) >> 12;
+    let frame_capacity = PhysicalFrameAllocator::tracked_frame_capacity() as u64;
+    if usable_pages == 0 {
+        alloc_init_fail!(b"init_range_capacity");
+    }
+    hh5_hex_line!(RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_OK_MARKER, usable_pages);
+    if usable_pages > frame_capacity {
+        alloc_init_fail!(b"init_range_capacity");
+    }
+    hh5_hex_line!(
+        RPI5_HH5_ALLOC_ADAPTER_INIT_CAPACITY_OK_MARKER,
+        frame_capacity
+    );
+
     let alloc_ptr = alloc_meta_virt as *mut PhysicalFrameAllocator;
     let allocator = unsafe { &mut *alloc_ptr };
-    if allocator.init_from_memory_map(&regions).is_err() {
-        alloc_fail!(b"init");
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    if allocator
+        .init_single_region_assume_zeroed(usable_start, usable_end - usable_start)
+        .is_err()
+    {
+        alloc_init_fail!(b"init_returned_error");
+    }
+    if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_DONE_MARKER) {
+        rpi5_hh_halt();
     }
     if !rpi5_hh_write_line(&RPI5_HH5_ALLOC_ADAPTER_INIT_DONE_MARKER) {
         rpi5_hh_halt();
