@@ -43,6 +43,14 @@ esac
 
 ORACLE_SNAPSHOT="${ORACLE_SNAPSHOT:-ipc-oracle-markers-$ARCH.txt}"
 
+# Oracle coverage mode (Stage 157):
+#   basic    (default) — prove >=1 recv-v2 meta delivery (Stage 156 contract,
+#                         unchanged). reply/transfer/rollback/wake only recorded.
+#   extended           — additionally require the reply-cap one-shot and
+#                         transfer-cap materialize markers, which now fire on the
+#                         LIVE D1/D5 split path that every spawn cycle drives.
+ORACLE_MODE="${ORACLE_MODE:-basic}"
+
 # Healthy-delivery success markers (Stage 156). Not all fire on every boot, so
 # only the "at least one recv-v2 meta delivered" invariant is hard-required.
 ORACLE_MARKERS=(
@@ -60,6 +68,21 @@ REQUIRED_ANY=(
   "IPC_RECV_V2_META_BLOCKED_WAITER_OK"
   "IPC_RECV_V2_META_IMMEDIATE_OK"
   "IPC_RECV_V2_META_QUEUED_SPLIT_OK"
+)
+
+# Extended mode: cap-transfer and reply-cap one-shot delivery must both be
+# proven. The init control-plane spawn workload (spawn_v5_cap -> ipc_call with a
+# reply cap + delegated send caps) drives both on the live D1/D5 split path every
+# boot, so these are hard-required once ORACLE_MODE=extended.
+#
+# IPC_RECV_V2_ROLLBACK_OK is a *fault*-path marker (recv-v2 meta user-copy fault)
+# and is correctly absent on a healthy boot; IPC_RECV_V2_SENDER_WAKE_ORDER_OK is
+# contention-dependent. Both stay recorded-only here and are covered by the
+# hosted seam tests; deterministic QEMU triggering is left to a fault/contention
+# workload (see doc/IPC_RECV_V2_ORACLE.md).
+EXTENDED_REQUIRED=(
+  "IPC_REPLY_CAP_ONESHOT_OK"
+  "IPC_TRANSFER_CAP_MATERIALIZE_OK"
 )
 
 # Fatal IPC regressions — their presence fails the oracle.
@@ -127,6 +150,22 @@ for r in "${REQUIRED_ANY[@]}"; do
 done
 if [[ "$any_required" -ne 1 ]]; then
   echo "[err] ipc-oracle: no recv-v2 meta delivery marker present (delivery regressed)"
+  rc=1
+fi
+
+# Extended mode: reply-cap + transfer-cap delivery must both be proven.
+if [[ "$ORACLE_MODE" == "extended" ]]; then
+  echo "[info] ipc-oracle: extended mode — requiring reply-cap + transfer-cap delivery"
+  for r in "${EXTENDED_REQUIRED[@]}"; do
+    if printf '%s\n' "${present[@]:-}" | rg -q "^$r$"; then
+      echo "[ok]   extended-required present: $r"
+    else
+      echo "[err] ipc-oracle: extended-required marker absent: $r"
+      rc=1
+    fi
+  done
+elif [[ "$ORACLE_MODE" != "basic" ]]; then
+  echo "[err] ipc-oracle: unknown ORACLE_MODE='$ORACLE_MODE' (expected basic|extended)"
   rc=1
 fi
 
