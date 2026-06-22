@@ -41068,9 +41068,16 @@ mod stage154_ipc_recv_core_boundary {
             SYSCALL_SRC.contains("mod ipc_recv_core;"),
             "syscall.rs must declare `mod ipc_recv_core;`"
         );
+        // Stage 155 widened the encoder to pub(crate) so kernel/recv_core.rs
+        // (outside the syscall subtree) can converge onto it; it must NOT be
+        // bare pub.
         assert!(
-            IPC_RECV_CORE_SRC.contains("pub(super) fn encode_recv_v2_meta("),
-            "ipc_recv_core.rs must define the migrated pure encode_recv_v2_meta"
+            IPC_RECV_CORE_SRC.contains("pub(crate) fn encode_recv_v2_meta("),
+            "ipc_recv_core.rs must define the migrated pure encode_recv_v2_meta as pub(crate)"
+        );
+        assert!(
+            !IPC_RECV_CORE_SRC.contains("pub fn encode_recv_v2_meta("),
+            "encode_recv_v2_meta must not be widened to bare pub"
         );
         assert!(
             SYSCALL_SRC.contains("self::ipc_recv_core::encode_recv_v2_meta("),
@@ -41260,6 +41267,244 @@ mod stage154_ipc_recv_core_boundary {
             assert!(
                 !IPC_RECV_CORE_SRC.contains(def),
                 "Stage 154 must NOT move stateful seam `{def}` into ipc_recv_core.rs"
+            );
+        }
+    }
+}
+
+// Stage 155: recv-v2 meta codec convergence — boundary guard tests.
+//
+// Stage 155 converged all three production recv-v2 metadata encoders
+// (blocked-waiter in syscall.rs, immediate full-recv in syscall/ipc.rs, queued
+// user-ASID split in kernel/recv_core.rs) onto the single pure
+// `ipc_recv_core::encode_recv_v2_meta`. This is a pure-codec unification: NO
+// stateful IPC/cap code moved, NO cap/reply/materialization re-homed. These
+// guards prove the single-encoder invariant and that the boundary is intact.
+mod stage155_recv_v2_codec_convergence {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_ABI_SRC: &str = include_str!("../syscall/ipc_abi.rs");
+    const RECV_CORE_SRC: &str = include_str!("../recv_core.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // Production files that previously held an inline recv-v2 encoder; none may
+    // still write the recv-v2 frame field-by-field (the codec is now single).
+    const CONVERGED_PROD_SRCS: &[(&str, &str)] = &[
+        ("syscall.rs", SYSCALL_SRC),
+        ("syscall/ipc.rs", IPC_SRC),
+        ("recv_core.rs", RECV_CORE_SRC),
+    ];
+
+    // 1. The single pure encoder exists, pub(crate), not bare pub.
+    #[test]
+    fn stage155_single_encoder_exists() {
+        assert!(
+            IPC_RECV_CORE_SRC.contains("pub(crate) fn encode_recv_v2_meta("),
+            "ipc_recv_core.rs must define the single pub(crate) encode_recv_v2_meta"
+        );
+        assert!(
+            !IPC_RECV_CORE_SRC.contains("pub fn encode_recv_v2_meta("),
+            "encode_recv_v2_meta must not be bare pub"
+        );
+    }
+
+    // 2. syscall.rs blocked-waiter path calls the helper.
+    #[test]
+    fn stage155_blocked_waiter_uses_helper() {
+        assert!(
+            SYSCALL_SRC.contains("self::ipc_recv_core::encode_recv_v2_meta("),
+            "blocked-waiter path in syscall.rs must call the single encoder"
+        );
+    }
+
+    // 3. syscall/ipc.rs immediate full-recv path calls the helper.
+    #[test]
+    fn stage155_ipc_immediate_path_uses_helper() {
+        assert!(
+            IPC_SRC.contains("ipc_recv_core::encode_recv_v2_meta("),
+            "syscall/ipc.rs immediate full-recv path must call the single encoder"
+        );
+    }
+
+    // 4. kernel/recv_core.rs queued split path calls the helper (cross-module).
+    #[test]
+    fn stage155_recv_core_path_uses_helper() {
+        assert!(
+            RECV_CORE_SRC.contains("crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta("),
+            "kernel/recv_core.rs must call the single encoder via its crate path"
+        );
+    }
+
+    // 5. No duplicate production inline recv-v2 encoder remains: the field-by-
+    //    field `meta[..].copy_from_slice(` writes must exist ONLY in
+    //    ipc_recv_core.rs. (recv_shared_v3.rs uses a different `out[..]` NR-30
+    //    format and is not a recv-v2 encoder.)
+    #[test]
+    fn stage155_no_duplicate_inline_encoder() {
+        for (name, src) in CONVERGED_PROD_SRCS {
+            for write in &[
+                "meta[8..10].copy_from_slice(",
+                "meta[12..16].copy_from_slice(",
+                "meta[16..24].copy_from_slice(",
+                "meta[24..32].copy_from_slice(",
+                "meta[32..40].copy_from_slice(",
+            ] {
+                assert!(
+                    !src.contains(write),
+                    "{name} must not contain an inline recv-v2 encoder write `{write}` \
+                     (converged onto ipc_recv_core::encode_recv_v2_meta)"
+                );
+            }
+        }
+        // The single encoder is the one place those writes live.
+        assert!(
+            IPC_RECV_CORE_SRC.contains("meta[8..10].copy_from_slice("),
+            "ipc_recv_core.rs must hold the single recv-v2 encoder body"
+        );
+    }
+
+    // 6. IPC_RECV_META_V2_ENCODED_LEN has exactly one definition (syscall.rs);
+    //    ipc_recv_core.rs references it via `use super::`.
+    #[test]
+    fn stage155_recv_meta_len_single_definition() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "the single IPC_RECV_META_V2_ENCODED_LEN definition must stay in syscall.rs"
+        );
+        for (name, src) in &[
+            ("ipc_recv_core.rs", IPC_RECV_CORE_SRC),
+            ("ipc.rs", IPC_SRC),
+            ("recv_core.rs", RECV_CORE_SRC),
+        ] {
+            assert!(
+                !src.contains("const IPC_RECV_META_V2_ENCODED_LEN"),
+                "{name} must not define IPC_RECV_META_V2_ENCODED_LEN (single definition)"
+            );
+        }
+        assert!(
+            IPC_RECV_CORE_SRC.contains("use super::IPC_RECV_META_V2_ENCODED_LEN"),
+            "ipc_recv_core.rs must reference the constant via `use super::`"
+        );
+    }
+
+    // 7/8. Dispatch ownership unchanged.
+    #[test]
+    fn stage155_dispatch_ownership_unchanged() {
+        assert!(
+            !IPC_RECV_CORE_SRC.contains("fn dispatch("),
+            "ipc_recv_core.rs must not define dispatch"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub fn dispatch("),
+            "pub fn dispatch must remain in syscall.rs"
+        );
+    }
+
+    // 9. All stateful cap/materialization seams remain pinned in syscall.rs and
+    //    are NOT moved into ipc_recv_core.rs (pure-codec stage only).
+    #[test]
+    fn stage155_stateful_seams_still_pinned() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn materialize_received_message_cap(",
+            "fn materialize_received_message_cap_routed(",
+            "fn materialize_received_transfer_cap(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain defined in syscall.rs"
+            );
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(def),
+                "Stage 155 must NOT move stateful seam `{def}` into ipc_recv_core.rs"
+            );
+        }
+    }
+
+    // 10. Stage 153 and Stage 154 ordering/audit notes remain.
+    #[test]
+    fn stage155_prior_ordering_notes_remain() {
+        assert!(
+            SYSCALL_SRC.contains("Stage 153: D1/D5 IPC/cap seam ownership/order proof"),
+            "Stage 153 ordering proof note must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("Stage 154: D1/D5 cap-boundary migration scaffold"),
+            "Stage 154 cap-boundary note must remain in syscall.rs"
+        );
+        // The two distinct delivery orderings stay documented in ipc_recv_core.rs.
+        assert!(
+            IPC_RECV_CORE_SRC.contains("copy-BEFORE-materialize")
+                && IPC_RECV_CORE_SRC.contains("materialize-BEFORE-copy"),
+            "ipc_recv_core.rs must keep documenting both delivery orderings"
+        );
+    }
+
+    // 11/12. Counts unchanged.
+    #[test]
+    fn stage155_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 13. D6/CR3/PF diagnostic markers remain.
+    #[test]
+    fn stage155_d6_cr3_pf_markers_remain() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "syscall.rs must retain VALIDATION: LIVE_OFF_TRAP"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "arch/trap_entry.rs must retain the D6 controlled-switch proof marker"
+        );
+    }
+
+    // 14. ipc_recv_core.rs and ipc_abi.rs remain pure (call-form side-effect check).
+    #[test]
+    fn stage155_pure_modules_stay_pure() {
+        for forbidden_call in &[
+            "materialize_received_message_cap(",
+            "set_reply_cap_waiter_cap(",
+            "rollback_materialized_recv_cap(",
+            "mint_capability_in_cnode(",
+            "grant_task_to_task_with_rights(",
+            "copy_to_user(",
+            "map_shared_region(",
+        ] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(forbidden_call),
+                "ipc_recv_core.rs must remain pure: must not CALL `{forbidden_call}`"
+            );
+            assert!(
+                !IPC_ABI_SRC.contains(forbidden_call),
+                "ipc_abi.rs must remain pure: must not CALL `{forbidden_call}`"
+            );
+        }
+        assert!(
+            !IPC_RECV_CORE_SRC.contains("ipc_state_lock"),
+            "ipc_recv_core.rs must not reference ipc_state_lock"
+        );
+    }
+
+    // 15. The recv-v2 codec convergence did not bleed into RPi5 boot code: the
+    //     pure codec module carries no RPi5/boot-path references.
+    #[test]
+    fn stage155_no_rpi5_boot_coupling_in_codec() {
+        for marker in &["rpi5", "build-rpi5", "RPI5", "high_half_boot"] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(marker),
+                "the recv-v2 codec module must not reference RPi5 boot (`{marker}`)"
             );
         }
     }
