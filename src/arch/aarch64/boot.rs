@@ -394,6 +394,31 @@ _start:
     bl .Lhh_write_cstr
     adr x0, .Lhh_vbar_ok
     bl .Lhh_write_cstr
+
+    // Zero the kernel .bss before any Rust code runs. The default AArch64
+    // _start clears .bss at low identity; this high-half trampoline never did,
+    // so every Rust static in .bss (spin-lock flags, the PT frame allocator,
+    // reserved-range table, slab class locks) held firmware-garbage. That made
+    // the first PT_FRAME_ALLOCATOR.lock() in BOOT-4 spin forever on a garbage
+    // `held` flag, hanging right after RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN.
+    // __bss_start/__bss_end are high-VA symbols mapped by TTBR1 (the kernel
+    // image is within the proven 0..2 GiB window), so this runs after the MMU
+    // is enabled and the high branch is taken. The boot stack lives in a
+    // separate :boot .bss.bootstack section outside [__bss_start,__bss_end),
+    // so it is untouched.
+    adr x0, .Lhh_bss_clear_begin
+    bl .Lhh_write_cstr
+    ldr x0, =__bss_start
+    ldr x1, =__bss_end
+.Lhh_bss_zero:
+    cmp x0, x1
+    b.hs .Lhh_bss_zero_done
+    str xzr, [x0], #8
+    b .Lhh_bss_zero
+.Lhh_bss_zero_done:
+    adr x0, .Lhh_bss_clear_done
+    bl .Lhh_write_cstr
+
     ldr x0, =yarm_rpi5_hh_rust_continue
     br x0
 
@@ -530,6 +555,8 @@ _start:
 .Lhh_jump_high:       .asciz "RPI5_HH_JUMP_HIGH\r\n"
 .Lhh_high_ok:         .asciz "RPI5_HH_HIGH_ENTRY_OK\r\n"
 .Lhh_vbar_ok:         .asciz "RPI5_HH_VBAR_HIGH_OK\r\n"
+.Lhh_bss_clear_begin: .asciz "RPI5_HH_BSS_CLEAR_BEGIN\r\n"
+.Lhh_bss_clear_done:  .asciz "RPI5_HH_BSS_CLEAR_DONE\r\n"
 .Lhh_failed_roots:    .asciz "RPI5_HH_PLAN_FAILED reason=invalid_or_shared_roots\r\n"
 .Lhh_failed_range:    .asciz "RPI5_HH_PLAN_FAILED reason=range_outside_high_map\r\n"
 .Lhh_failed_dtb:      .asciz "RPI5_HH_PLAN_FAILED reason=invalid_dtb_range\r\n"
@@ -1848,6 +1875,60 @@ rpi5_hh_retained_marker!(
     feature = "rpi5-highhalf"
 ))]
 rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_BEGIN_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK virt=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_BEGIN_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_DONE_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_BEGIN_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_DONE_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
     RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE_MARKER,
     b"RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE phys=0x"
 );
@@ -1886,6 +1967,33 @@ rpi5_hh_retained_marker!(
 rpi5_hh_retained_marker!(
     RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_BEGIN_MARKER,
     b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_BEGIN_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_OK_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_OK ptr=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_SENTINEL_OK_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_SENTINEL_OK"
 );
 #[cfg(all(
     not(feature = "hosted-dev"),
@@ -3747,19 +3855,58 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN_MARKER) {
         rpi5_hh_halt();
     }
-    // Seed PT_FRAME_ALLOCATOR (the global allocator's frame source) leanly over
-    // the kernel heap region's PHYSICAL range; this also makes the normal
-    // `ensure_pt_allocator_initialized` (which logs and re-materializes the big
-    // arrays) a no-op. The HH5 boot-probe allocator that covers the full window
-    // is dormant after its probe, so there is no live double-ownership.
+
+    // Task B/C — bring up PT_FRAME_ALLOCATOR (the global allocator's frame
+    // source) over the kernel heap region's PHYSICAL range, with a marker before
+    // every operation so any hang is localized to storage / zero / init rather
+    // than the opaque _BEGIN.
+    //
+    // PT_FRAME_ALLOCATOR is the global frame-allocator static. Its high-half VA
+    // is mapped + writable here (it lives in the kernel .bss, which the
+    // high-half trampoline now zeroes before any Rust runs, and is inside the
+    // proven 0..2 GiB TTBR1 window). The init path is the lean
+    // init_single_region_assume_zeroed: it never re-materializes the large
+    // tracking arrays, never logs, never faults, and never copies the allocator
+    // by value. The generic ensure_pt_allocator_initialized is a no-op
+    // afterward.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let pt_storage_addr = crate::kernel::frame_allocator::rpi5_hh_pt_allocator_storage_addr();
+    if pt_storage_addr < RPI5_HH_VA_OFFSET {
+        galloc_fail!(b"pt_storage");
+    }
+    hh5_hex_line!(
+        RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK_MARKER,
+        pt_storage_addr
+    );
+
+    // Defensively zero the PT allocator storage in place (bounded volatile loop;
+    // see `rpi5_hh_zero_pt_allocator_storage`). This guarantees the lock's `held`
+    // flag and the `assume_zeroed` contract regardless of `.bss` state.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    crate::kernel::frame_allocator::rpi5_hh_zero_pt_allocator_storage();
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_DONE_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     if crate::kernel::frame_allocator::rpi5_hh_init_pt_allocator_single_region(
         kheap_phys_start,
         KERNEL_HEAP_SIZE,
     )
     .is_err()
     {
-        galloc_fail!(b"pt_allocator_init");
+        galloc_fail!(b"pt_init");
     }
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_DONE_MARKER) {
+        rpi5_hh_halt();
+    }
+
     hh5_emit_marker!(RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE_MARKER);
     hh5_emit_hex!(kheap_phys_start);
     hh5_emit_marker!(RPI5_HH5_ALLOC_BRIDGE_VIRT_SEP_MARKER);
@@ -3798,6 +3945,9 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
             core::alloc::Layout::new::<u64>()
         }
     };
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
     let probe_ptr = unsafe {
         core::alloc::GlobalAlloc::alloc(
             &crate::kernel::global_allocator::KERNEL_GLOBAL_ALLOCATOR,
@@ -3805,7 +3955,7 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         )
     };
     if probe_ptr.is_null() {
-        galloc_fail!(b"probe_null");
+        galloc_fail!(b"probe_alloc");
     }
     let probe_va = probe_ptr as u64;
     if probe_va < RPI5_HH_VA_OFFSET
@@ -3814,6 +3964,7 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     {
         galloc_fail!(b"probe_low_va");
     }
+    hh5_hex_line!(RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_OK_MARKER, probe_va);
     const GALLOC_PROBE_SENTINEL: u64 = 0x5250_4935_4741_4c31; // "RPI5GAL1"
     unsafe {
         core::ptr::write_volatile(probe_ptr as *mut u64, GALLOC_PROBE_SENTINEL);
@@ -3822,6 +3973,11 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
     if probe_rb != GALLOC_PROBE_SENTINEL {
         galloc_fail!(b"probe_readback");
     }
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_SENTINEL_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+    // The probe object is intentionally leaked: the global allocator's free path
+    // is not exercised at this bring-up stage.
     hh5_hex_line!(RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_OK_MARKER, probe_va);
     if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK_MARKER) {
         rpi5_hh_halt();

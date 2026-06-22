@@ -1127,6 +1127,40 @@ pub fn rpi5_hh_init_pt_allocator_single_region(
     guard.init_single_region_assume_zeroed(start_phys, len)
 }
 
+/// RPi5-highhalf-only: high-half virtual address of the shared `PT_FRAME_ALLOCATOR`
+/// static storage. The BOOT-4 bridge emits this for diagnostics before touching
+/// the storage so a hang can be localized to the static itself.
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-highhalf"))]
+pub fn rpi5_hh_pt_allocator_storage_addr() -> u64 {
+    core::ptr::addr_of!(PT_FRAME_ALLOCATOR) as u64
+}
+
+/// RPi5-highhalf-only: zero the `PT_FRAME_ALLOCATOR` static storage in place with
+/// a bounded volatile byte loop.
+///
+/// The high-half trampoline now clears the kernel `.bss` before any Rust runs, so
+/// this is normally redundant; it is kept as a defensive, marker-bracketed step so
+/// the PT allocator's `assume_zeroed` contract (and its spin-lock `held` flag) is
+/// guaranteed valid regardless of `.bss` state. It must run before the first
+/// `.lock()` of the static. No large stack object is created (it is an in-place
+/// memset), no `PhysicalFrameAllocator` is materialized by value, no lock is taken,
+/// and there is no logging/panic. `SpinLockIrq`'s fields (`AtomicBool` + `UnsafeCell`)
+/// are interior-mutable, so writing the whole struct's bytes through a derived raw
+/// pointer is sound on this single-core, IRQ-disabled bring-up path.
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-highhalf"))]
+pub fn rpi5_hh_zero_pt_allocator_storage() {
+    let ptr = core::ptr::addr_of!(PT_FRAME_ALLOCATOR) as *mut u8;
+    let len = core::mem::size_of::<SpinLockIrq<PhysicalFrameAllocator>>();
+    let mut idx = 0usize;
+    while idx < len {
+        // SAFETY: `ptr` covers exactly `len` bytes of the static; the write stays
+        // in bounds. See the function doc for the interior-mutability/aliasing
+        // justification on this pre-use, single-threaded path.
+        unsafe { core::ptr::write_volatile(ptr.add(idx), 0u8) };
+        idx += 1;
+    }
+}
+
 pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
     ensure_pt_allocator_initialized()?;
     let mut guard = PT_FRAME_ALLOCATOR.lock();

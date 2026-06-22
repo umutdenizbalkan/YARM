@@ -43,7 +43,14 @@ high-alias-only kernel heap region and re-validates the high-half VM
 high-half phys↔virt direct-map offset (default identity for QEMU/non-RPi5) and
 wires the kernel global allocator to the high-half heap, proving a real
 high-half allocation (`RPI5_KERNEL_PHYSMAP_SWITCH_OK`,
-`RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK`). The remaining blocker is now narrowed
+`RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK`). The high-half boot trampoline now
+also zeroes the kernel `.bss` before any Rust runs (`RPI5_HH_BSS_CLEAR_BEGIN`,
+`RPI5_HH_BSS_CLEAR_DONE`) — the default `_start` always did, but the high-half
+path did not, so the frame-allocator spin-lock had a garbage state that hung the
+first allocator lock; the global-allocator bring-up now emits per-step markers
+(`RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK`,
+`…_PT_ZERO_DONE`, `…_PT_INIT_DONE`, `…_PROBE_ALLOC_OK`,
+`…_PROBE_SENTINEL_OK`). The remaining blocker is now narrowed
 to the scheduler/IRQ subsystem that `KernelState` bootstrap needs
 (`RPI5_HH5_DEFERRED reason=kernel_state_requires_scheduler_init`, or
 `reason=initrd_missing` when no initrd is present). This still needs a hardware

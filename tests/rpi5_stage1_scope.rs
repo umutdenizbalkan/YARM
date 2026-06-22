@@ -1420,3 +1420,121 @@ fn rpi5_boot4_physmap_bridge_is_gated_and_preserves_default_identity() {
         );
     }
 }
+
+#[test]
+fn rpi5_boot4_global_allocator_pt_init_is_markered_and_bss_is_zeroed() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let frame = include_str!("../src/kernel/frame_allocator.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+    let fixture = include_str!("../scripts/test-create-rpi5-stage1-boot-dir.sh");
+
+    // Root-cause fix: the high-half trampoline now zeroes the kernel .bss before
+    // any Rust runs (the default _start did; the HH _start did not). Without this,
+    // the PT_FRAME_ALLOCATOR spin-lock `held` flag was firmware-garbage and the
+    // first .lock() spun forever right after RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN.
+    // It must run on the high-VA branch (MMU enabled), using __bss_start/__bss_end.
+    let high_entry = boot.find(".Lhh_high_entry:").expect("hh high entry label");
+    let high_branch = boot[high_entry..]
+        .find("=yarm_rpi5_hh_rust_continue")
+        .map(|o| o + high_entry)
+        .expect("branch into rust continuation");
+    let high = &boot[high_entry..high_branch];
+    assert!(
+        high.contains(".Lhh_bss_zero"),
+        "high-half entry must zero .bss before Rust runs"
+    );
+    assert!(high.contains("=__bss_start"));
+    assert!(high.contains("=__bss_end"));
+    assert!(high.contains(".Lhh_bss_clear_begin"));
+    assert!(high.contains(".Lhh_bss_clear_done"));
+    // The marker strings themselves are defined in the asm .rodata block.
+    assert!(boot.contains("RPI5_HH_BSS_CLEAR_BEGIN"));
+    assert!(boot.contains("RPI5_HH_BSS_CLEAR_DONE"));
+
+    // Granular markers bracket every PT-allocator step after BEGIN.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Ordering: PT storage/zero/init all happen before the physmap switch, which
+    // happens before any allocation probe (Task D).
+    let pt_storage = hh5.find("PT_STORAGE_BEGIN").expect("pt storage marker");
+    let pt_init_done = hh5.find("PT_INIT_DONE").expect("pt init done marker");
+    let switch = hh5.find("PHYSMAP_SWITCH_BEGIN").expect("switch marker");
+    let switch_ok = hh5
+        .find("set_highmap_offset(RPI5_HH_VA_OFFSET)")
+        .expect("switch call");
+    let probe_alloc = hh5.find("GlobalAlloc::alloc(").expect("probe alloc call");
+    assert!(
+        pt_storage < pt_init_done && pt_init_done < switch && switch < switch_ok,
+        "PT allocator must be set up before the physmap switch"
+    );
+    assert!(
+        switch_ok < probe_alloc,
+        "physmap must switch before the allocator probe (Task D)"
+    );
+
+    // The PT-allocator bring-up here must not materialize a by-value allocator,
+    // use new_uninit/MaybeUninit/core::ptr::write into the storage, or
+    // panic/log/unwrap (Task B/F). Inspect just the global-allocator section.
+    let galloc = hh5
+        .find("RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN_MARKER")
+        .map(|o| &hh5[o..])
+        .expect("global allocator section");
+    assert!(!galloc.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(!galloc.contains("MaybeUninit<PhysicalFrameAllocator>"));
+    assert!(!galloc.contains("MaybeUninit::<PhysicalFrameAllocator>"));
+    assert!(!galloc.contains("panic!"));
+    assert!(!galloc.contains(".unwrap()"));
+    assert!(!galloc.contains(".expect("));
+    assert!(!galloc.contains("yarm_log!"));
+
+    // The frame-allocator helpers are lean: in-place zero (volatile loop), and a
+    // single-region init that early-returns when already initialized — no big
+    // array re-materialization, no by-value allocator.
+    let zero_fn = frame
+        .find("pub fn rpi5_hh_zero_pt_allocator_storage()")
+        .map(|o| &frame[o..o + 1200])
+        .expect("zero helper");
+    assert!(zero_fn.contains("write_volatile"));
+    assert!(!zero_fn.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(frame.contains("pub fn rpi5_hh_pt_allocator_storage_addr() -> u64"));
+
+    // The new granular markers are present in source and required by the
+    // image/fixture validators.
+    for marker in [
+        "RPI5_HH_BSS_CLEAR_BEGIN",
+        "RPI5_HH_BSS_CLEAR_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK virt=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_OK ptr=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_SENTINEL_OK",
+    ] {
+        assert!(boot.contains(marker), "boot omits marker {marker}");
+        assert!(build.contains(marker), "build omits marker {marker}");
+        assert!(fixture.contains(marker), "fixture omits marker {marker}");
+    }
+
+    // Still no user TTBR0 / EL0 ERET / SMP / GIC / RP1 / PCIe / scheduler start
+    // introduced by this change.
+    for forbidden in [
+        "RPI5_ENTER_USER_ERET",
+        "start_scheduler",
+        "start_secondary_cpus",
+    ] {
+        assert!(
+            !hh5.contains(forbidden),
+            "HH5 bridge must not contain {forbidden}"
+        );
+    }
+}
