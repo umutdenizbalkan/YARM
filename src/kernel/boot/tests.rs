@@ -41509,3 +41509,215 @@ mod stage155_recv_v2_codec_convergence {
         }
     }
 }
+
+// Stage 156: IPC recv/reply/transfer/split smoke oracle — boundary guard tests.
+//
+// Stage 156 adds a QEMU smoke oracle (markers + script) to prove byte-identical
+// recv-v2 / reply-cap / transfer-cap / split delivery BEFORE any future stateful
+// cap-boundary re-home. QEMU was unavailable in the authoring environment, so NO
+// stateful seam was moved (Option A). These guards lock the oracle's existence
+// and re-assert that the Stage 155 convergence and the pinned-seam boundary are
+// unchanged. See doc/KERNEL_UNLOCKING.md §5.1.4.
+mod stage156_ipc_smoke_oracle {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_ABI_SRC: &str = include_str!("../syscall/ipc_abi.rs");
+    const RECV_CORE_SRC: &str = include_str!("../recv_core.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const ORACLE_SCRIPT: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+
+    // The seven Stage 156 oracle markers.
+    const ORACLE_MARKERS: &[&str] = &[
+        "IPC_RECV_V2_META_BLOCKED_WAITER_OK",
+        "IPC_RECV_V2_META_IMMEDIATE_OK",
+        "IPC_RECV_V2_META_QUEUED_SPLIT_OK",
+        "IPC_REPLY_CAP_ONESHOT_OK",
+        "IPC_TRANSFER_CAP_MATERIALIZE_OK",
+        "IPC_RECV_V2_ROLLBACK_OK",
+        "IPC_RECV_V2_SENDER_WAKE_ORDER_OK",
+    ];
+
+    // 1. Stage 155 encoder convergence remains true: the single pure encoder is
+    //    defined in ipc_recv_core.rs and no production path re-grew an inline
+    //    recv-v2 encoder.
+    #[test]
+    fn stage156_encoder_convergence_intact() {
+        assert!(
+            IPC_RECV_CORE_SRC.contains("pub(crate) fn encode_recv_v2_meta("),
+            "the single pure encode_recv_v2_meta must remain in ipc_recv_core.rs"
+        );
+        for (name, src) in &[
+            ("syscall.rs", SYSCALL_SRC),
+            ("syscall/ipc.rs", IPC_SRC),
+            ("recv_core.rs", RECV_CORE_SRC),
+        ] {
+            assert!(
+                !src.contains("meta[8..10].copy_from_slice("),
+                "{name} must not re-grow an inline recv-v2 encoder"
+            );
+        }
+    }
+
+    // 2. ipc_recv_core.rs still owns only pure codec/helper logic (call-form
+    //    side-effect check) — adding the oracle markers must not have leaked any
+    //    stateful call into the pure module.
+    #[test]
+    fn stage156_ipc_recv_core_still_pure() {
+        for forbidden_call in &[
+            "materialize_received_message_cap(",
+            "set_reply_cap_waiter_cap(",
+            "rollback_materialized_recv_cap(",
+            "mint_capability_in_cnode(",
+            "grant_task_to_task_with_rights(",
+            "copy_to_user(",
+            "map_shared_region(",
+        ] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(forbidden_call),
+                "ipc_recv_core.rs must remain pure: must not CALL `{forbidden_call}`"
+            );
+        }
+        assert!(
+            !IPC_RECV_CORE_SRC.contains("ipc_state_lock"),
+            "ipc_recv_core.rs must not reference ipc_state_lock"
+        );
+    }
+
+    // 3/6. Stateful cap/materialization seams remain pinned in syscall.rs and
+    //      were NOT moved into ipc_recv_core.rs (Option A: QEMU unavailable).
+    #[test]
+    fn stage156_stateful_seams_still_pinned() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn materialize_received_message_cap(",
+            "fn materialize_received_message_cap_routed(",
+            "fn materialize_received_transfer_cap(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain defined in syscall.rs"
+            );
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(def),
+                "Stage 156 (QEMU unavailable) must NOT move `{def}` into ipc_recv_core.rs"
+            );
+        }
+    }
+
+    // 4. Every Stage 156 oracle marker is emitted somewhere in the kernel IPC
+    //    delivery paths (syscall.rs or syscall/ipc.rs).
+    #[test]
+    fn stage156_oracle_markers_exist_in_source() {
+        for m in ORACLE_MARKERS {
+            assert!(
+                SYSCALL_SRC.contains(m) || IPC_SRC.contains(m),
+                "oracle marker `{m}` must be emitted in the IPC delivery paths"
+            );
+        }
+    }
+
+    // 5. The smoke script exists and greps for every oracle marker, and defines
+    //    the fatal-marker and regression-baseline gates.
+    #[test]
+    fn stage156_smoke_script_checks_markers() {
+        for m in ORACLE_MARKERS {
+            assert!(
+                ORACLE_SCRIPT.contains(m),
+                "qemu-ipc-recv-v2-oracle-smoke.sh must check oracle marker `{m}`"
+            );
+        }
+        assert!(
+            ORACLE_SCRIPT.contains("FATAL_MARKERS"),
+            "oracle script must define a fatal-marker gate"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("ORACLE_BASELINE"),
+            "oracle script must support a regression baseline"
+        );
+        // Covers x86_64 / aarch64 / riscv64.
+        for arch in &["x86_64", "aarch64", "riscv64"] {
+            assert!(
+                ORACLE_SCRIPT.contains(arch),
+                "oracle script must handle the {arch} core smoke"
+            );
+        }
+    }
+
+    // 7. IPC_RECV_META_V2_ENCODED_LEN keeps a single definition in syscall.rs.
+    #[test]
+    fn stage156_recv_meta_len_single_definition() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN single definition must stay in syscall.rs"
+        );
+        for (name, src) in &[
+            ("ipc_recv_core.rs", IPC_RECV_CORE_SRC),
+            ("ipc.rs", IPC_SRC),
+            ("recv_core.rs", RECV_CORE_SRC),
+        ] {
+            assert!(
+                !src.contains("const IPC_RECV_META_V2_ENCODED_LEN"),
+                "{name} must not define IPC_RECV_META_V2_ENCODED_LEN"
+            );
+        }
+    }
+
+    // 8/9. Counts unchanged.
+    #[test]
+    fn stage156_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 10. D6/CR3/PF diagnostic markers remain.
+    #[test]
+    fn stage156_d6_cr3_pf_markers_remain() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "syscall.rs must retain VALIDATION: LIVE_OFF_TRAP"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "arch/trap_entry.rs must retain the D6 controlled-switch proof marker"
+        );
+    }
+
+    // 11. The oracle additions did not couple into RPi5 boot code: neither the
+    //     pure codec module nor the oracle script reference RPi5 boot.
+    #[test]
+    fn stage156_no_rpi5_boot_coupling() {
+        for marker in &["rpi5", "build-rpi5", "RPI5", "high_half_boot"] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(marker),
+                "ipc_recv_core.rs must not reference RPi5 boot (`{marker}`)"
+            );
+            assert!(
+                !ORACLE_SCRIPT.contains(marker),
+                "the IPC oracle script must not reference RPi5 boot (`{marker}`)"
+            );
+        }
+    }
+
+    // Extra: ipc_abi.rs purity unchanged.
+    #[test]
+    fn stage156_ipc_abi_still_pure() {
+        assert!(
+            !IPC_ABI_SRC.contains("ipc_state_lock"),
+            "ipc_abi.rs must not reference ipc_state_lock"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("materialize_received_message_cap("),
+            "ipc_abi.rs must not call cap materialization"
+        );
+    }
+}
