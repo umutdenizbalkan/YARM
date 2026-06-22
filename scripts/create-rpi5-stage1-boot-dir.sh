@@ -248,20 +248,50 @@ Expected high-half diagnostic markers:
   RPI5_HH_ENABLE_DONE
   RPI5_HH_JUMP_HIGH
   RPI5_HH_HIGH_ENTRY_OK
+  RPI5_HH_BSS_CLEAR_BEGIN / RPI5_HH_BSS_CLEAR_DONE
   RPI5_HH_RUST_ENTRY
   RPI5_HH_REGISTERS_OK
   RPI5_HH_RUST_UART_OK
+  RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF
   RPI5_HH3_DONE
   RPI5_HH4_BEGIN
+  RPI5_HH4_DTB_PTR_BEGIN
+  RPI5_HH4_DTB_PTR_OK
+  RPI5_HH4_DTB_VIRT_OK
+  RPI5_HH4_UART_STILL_OK
   RPI5_HH4_TTBR0_REPLACE_DONE
   RPI5_HH4_UART_AFTER_TTBR0_OK
   RPI5_HH4_DONE
   RPI5_HH5_BEGIN
-  RPI5_HH5_DEFERRED reason=high_half_initrd_allocator_bridge_not_ready
+  RPI5_HH5_DTB_CHOSEN_BEGIN
+  RPI5_HH5_DTB_CHOSEN_OK
+  RPI5_HH5_INITRD_BEGIN
+  RPI5_HH5_INITRD_RANGE / RPI5_HH5_INITRD_OK   (or RPI5_HH5_INITRD_FAILED reason=missing)
+  RPI5_HH5_ALLOC_BRIDGE_BEGIN
+  RPI5_HH5_ALLOC_BRIDGE_RANGE
+  RPI5_HH5_ALLOC_BRIDGE_OK
+  RPI5_HH5_HANDOFF_BEGIN
+  RPI5_HH5_HANDOFF_OK virt=0x...
+  RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN / RPI5_HH5_NORMAL_BOOT_AUDIT_DONE
+  RPI5_HH5_BOOT_INPUT_OK virt=0x...
+  RPI5_HH5_ALLOC_ADAPTER_BEGIN / RPI5_HH5_ALLOC_ADAPTER_OK
+  RPI5_HH5_ENTER_KERNEL_BEGIN
+  RPI5_KERNEL_ENTRY_BEGIN / RPI5_KERNEL_DTB_PARSE_OK / RPI5_KERNEL_INITRD_OK
+  RPI5_KERNEL_PMEM_OK / RPI5_KERNEL_BOOTINFO_OK
+  RPI5_KERNEL_GLOBAL_HEAP_OK / RPI5_KERNEL_VM_OK
+  RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN
+  RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK virt=0x... / PT_ZERO_DONE / PT_INIT_DONE
+  RPI5_KERNEL_PHYSMAP_SWITCH_OK offset=0xffffff8000000000
+  RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_OK ptr=0xffffff80... / PROBE_SENTINEL_OK
+  RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK
+  RPI5_HH5_DEFERRED reason=kernel_state_requires_scheduler_init  (or reason=initrd_missing)
   RPI5_HH5_DONE status=deferred
 
-An initrd may still be staged with --initrd-input, but HH-3 does not require or
-consume it.
+HH-5 builds a high-alias-only initrd/allocator/handoff bridge, then brings up a
+real high-half physical-frame allocator and boot-info record before deferring at
+the normal kernel bootstrap (which still needs the kernel global heap and full
+VM layout). An initrd may be staged with --initrd-input; if present in the DTB
+/chosen node it is discovered and validated, otherwise HH-5 reports it missing.
 EOF_HIGHHALF
 fi
 

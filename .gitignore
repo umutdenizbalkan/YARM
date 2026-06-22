@@ -3,6 +3,7 @@
 /target
 /build-aarch64/
 /build-riscv64/
+/build-rpi5/
 /build-x86_64/
 /rustc-ice-*.txt
 *.log

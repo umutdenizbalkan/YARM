@@ -564,24 +564,56 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
         "RPI5_HH_READ_PC_FAILED reason=",
         "RPI5_HH3_FAULT_BOUNDARY reason=pc_read_or_print",
         "RPI5_HH_READ_SP_BEGIN",
+        "RPI5_HH_READ_SP_CAPTURED",
+        "RPI5_HH_SP_HEX_BEGIN",
+        "RPI5_HH_SP_HEX_DIGIT_BEGIN",
+        "RPI5_HH_SP_HEX_DIGIT_DONE",
+        "RPI5_HH_SP_HEX_DONE",
+        "RPI5_HH_SP_HEX_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=sp_hex_output",
         "RPI5_HH_READ_SP_DONE value=0x",
         "RPI5_HH_READ_VBAR_BEGIN",
+        "RPI5_HH_READ_VBAR_CAPTURED",
+        "RPI5_HH_VBAR_HEX_BEGIN",
+        "RPI5_HH_VBAR_HEX_DIGIT_BEGIN",
+        "RPI5_HH_VBAR_HEX_DIGIT_DONE",
+        "RPI5_HH_VBAR_HEX_DONE",
+        "RPI5_HH_VBAR_HEX_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=vbar_hex_output",
         "RPI5_HH_READ_VBAR_DONE value=0x",
         "RPI5_HH_READ_TTBR_BEGIN",
         "RPI5_HH_READ_TTBR_DONE",
         "RPI5_HH_PRINT_REGS_BEGIN",
+        "RPI5_HH_PRINT_REGS_FIRST_BEGIN",
+        "RPI5_HH_PRINT_REGS_FIRST_HEX_BEGIN",
+        "RPI5_HH_PRINT_REGS_FIRST_HEX_DIGIT_BEGIN",
+        "RPI5_HH_PRINT_REGS_FIRST_HEX_DIGIT_DONE",
+        "RPI5_HH_PRINT_REGS_FIRST_HEX_DONE",
+        "RPI5_HH_PRINT_REGS_FIRST_HEX_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=print_regs_first_hex_output",
+        "RPI5_HH_PRINT_REGS_FIRST_DONE value=0x",
+        "RPI5_HH_PRINT_REGS_SP_BEGIN",
+        "RPI5_HH_PRINT_REGS_SP_HEX_BEGIN",
+        "RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_BEGIN",
+        "RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_DONE",
+        "RPI5_HH_PRINT_REGS_SP_HEX_DONE",
+        "RPI5_HH_PRINT_REGS_SP_HEX_FAILED reason=",
+        "RPI5_HH3_FAULT_BOUNDARY reason=print_regs_sp_hex_output",
+        "RPI5_HH_PRINT_REGS_SP_DONE value=0x",
+        "RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF",
         "RPI5_HH_PRINT_REGS_DONE",
         "RPI5_HH3_PRECHECK_DONE",
-        "RPI5_HH_PC value=0x",
-        "RPI5_HH_SP value=0x",
-        "RPI5_HH_VBAR value=0x",
-        "RPI5_HH_TTBR0 value=0x",
-        "RPI5_HH_TTBR1 value=0x",
-        "RPI5_HH_TCR value=0x",
+        "RPI5_HH_PRINT_REGS_SP_DONE value=0x",
         "RPI5_HH_REGISTERS_OK",
         "RPI5_HH_RUST_UART_OK",
         "RPI5_HH3_DONE",
         "RPI5_HH4_BEGIN",
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK value=0x",
+        "RPI5_HH4_DTB_VIRT_OK value=0x",
+        "RPI5_HH4_DTB_PTR_FAILED reason=",
+        "RPI5_HH4_UART_STILL_OK",
+        "RPI5_HH4_FAULT_BOUNDARY reason=",
         "RPI5_HH4_DONE",
         "RPI5_HH5_BEGIN",
         "RPI5_HH5_ENTER_USER_ATTEMPT",
@@ -601,6 +633,50 @@ fn rpi5_hh2_transition_is_explicit_bounded_and_never_enters_el0() {
     assert!(boot.contains("while nibble_index < 16"));
     assert!(boot.contains("core::ptr::write_volatile(hh_pc_hex_data, $byte as u32)"));
     assert!(!boot.contains("rpi5_hh_write_hex_line(&RPI5_HH_READ_PC_DONE_MARKER, pc)"));
+    assert!(boot.contains("RPI5_HH_READ_SP_CAPTURED_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_READ_VBAR_CAPTURED_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_FAILED_MARKER"));
+    assert!(boot.contains("RPI5_HH3_SP_HEX_FAULT_BOUNDARY_MARKER"));
+    assert!(boot.contains("core::ptr::write_volatile(hh_sp_hex_data, $byte as u32)"));
+    assert!(!boot.contains("rpi5_hh_write_hex_line(&RPI5_HH_READ_SP_DONE_MARKER, sp)"));
+    assert!(boot.contains("RPI5_HH_READ_VBAR_CAPTURED_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_FAILED_MARKER"));
+    assert!(boot.contains("RPI5_HH3_VBAR_HEX_FAULT_BOUNDARY_MARKER"));
+    assert!(boot.contains("core::ptr::write_volatile(hh_vbar_hex_data, $byte as u32)"));
+    assert!(!boot.contains("rpi5_hh_write_hex_line(&RPI5_HH_READ_VBAR_DONE_MARKER, vbar)"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_FAILED_MARKER"));
+    assert!(boot.contains("RPI5_HH3_PRINT_REGS_FIRST_HEX_FAULT_BOUNDARY_MARKER"));
+    assert!(boot.contains("core::ptr::write_volatile(hh_print_regs_first_hex_data, $byte as u32)"));
+    assert!(!boot.contains("rpi5_hh_write_hex_line(b\"RPI5_HH_PC value=0x\", pc)"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_FAILED_MARKER"));
+    assert!(boot.contains("RPI5_HH3_PRINT_REGS_SP_HEX_FAULT_BOUNDARY_MARKER"));
+    assert!(boot.contains("core::ptr::write_volatile(hh_print_regs_sp_hex_data, $byte as u32)"));
+    assert!(!boot.contains("rpi5_hh_write_hex_line(b\"RPI5_HH_SP value=0x\", sp)"));
     assert!(boot.contains("RPI5_HH_VA_OFFSET: u64 = 0xffff_ff80_0000_0000"));
     assert!(boot.contains("tcr & (1 << 23) != 0"));
     assert!(policy.contains("plan_rpi5_high_half_transition"));
@@ -653,14 +729,35 @@ fn rpi5_hh3_build_and_generator_paths_are_explicit() {
         "RPI5_HH_READ_PC_FAILED",
         "RPI5_HH3_FAULT_BOUNDARY reason=pc_read_or_print",
         "RPI5_HH_READ_SP_BEGIN",
+        "RPI5_HH_READ_SP_CAPTURED",
+        "RPI5_HH_SP_HEX_BEGIN",
+        "RPI5_HH_SP_HEX_DIGIT_BEGIN",
+        "RPI5_HH_SP_HEX_DIGIT_DONE",
+        "RPI5_HH_SP_HEX_DONE",
+        "RPI5_HH_SP_HEX_FAILED",
+        "RPI5_HH3_FAULT_BOUNDARY reason=sp_hex_output",
         "RPI5_HH_READ_SP_DONE",
         "RPI5_HH_READ_VBAR_BEGIN",
+        "RPI5_HH_READ_VBAR_CAPTURED",
+        "RPI5_HH_VBAR_HEX_BEGIN",
+        "RPI5_HH_VBAR_HEX_DIGIT_BEGIN",
+        "RPI5_HH_VBAR_HEX_DIGIT_DONE",
+        "RPI5_HH_VBAR_HEX_DONE",
+        "RPI5_HH_VBAR_HEX_FAILED",
+        "RPI5_HH3_FAULT_BOUNDARY reason=vbar_hex_output",
         "RPI5_HH_READ_VBAR_DONE",
+        "RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF",
         "RPI5_HH3_PRECHECK_DONE",
         "RPI5_HH_REGISTERS_OK",
         "RPI5_HH_RUST_UART_OK",
         "RPI5_HH3_DONE",
         "RPI5_HH4_BEGIN",
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK",
+        "RPI5_HH4_DTB_VIRT_OK",
+        "RPI5_HH4_DTB_PTR_FAILED reason=",
+        "RPI5_HH4_UART_STILL_OK",
+        "RPI5_HH4_FAULT_BOUNDARY reason=",
         "RPI5_HH4_DONE",
         "RPI5_HH5_BEGIN",
         "RPI5_HH5_ENTER_USER_ATTEMPT",
@@ -691,9 +788,25 @@ fn rpi5_hh3_success_markers_are_retained_in_the_high_image() {
     assert!(boot.contains("RPI5_HH_HEX_DIGIT_BEGIN_MARKER"));
     assert!(boot.contains("RPI5_HH_HEX_DIGIT_DONE_MARKER"));
     assert!(boot.contains("RPI5_HH_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_READ_SP_CAPTURED_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_SP_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_READ_VBAR_CAPTURED_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DIGIT_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DIGIT_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_VBAR_HEX_DONE_MARKER"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_PRECHECK_DONE_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_REGISTERS_OK_MARKER)"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH_RUST_UART_OK_MARKER)"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_FIRST_HEX_DONE_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_BEGIN_MARKER"));
+    assert!(boot.contains("RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER"));
     assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)"));
 }
 
@@ -720,15 +833,708 @@ fn rpi5_hh4_retires_low_ttbr0_and_hh5_defers_without_eret() {
     assert!(hh45.contains("\"dsb ish\""));
     assert!(hh45.contains("RPI5_HH4_UART_AFTER_TTBR0_OK_MARKER"));
     assert!(hh45.contains("Rpi5Hh4Ready"));
-    assert!(hh45.contains("fn rpi5_hh5_defer(hh4: Rpi5Hh4Ready) -> !"));
+    assert!(hh45.contains("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !"));
     assert!(hh45.contains("high_half_initrd_allocator_bridge_not_ready"));
     assert!(!hh45.contains("core::arch::asm!(\"eret\""));
     assert!(!boot.contains("RPI5_HH5_ENTER_USER_ERET"));
     assert!(!boot.contains("RPI5_HH5_FIRST_USER_TRAP"));
     assert!(!hh45.contains("yarm_log!"));
     assert!(!hh45.contains("printk"));
-    assert!(!hh45.contains("scheduler"));
+    // No scheduler is *started* (a deferral reason/comment may name it).
+    assert!(!hh45.contains("start_scheduler"));
     assert!(!hh45.contains("init_gic"));
     assert!(!hh45.contains("init_rp1"));
     assert!(!hh45.contains("init_pcie"));
+}
+
+#[test]
+fn rpi5_hh3_bypass_is_temporary_and_hh4_proves_dtb_handoff() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // Part A — the print-regs helper dump is bypassed only AFTER the proven
+    // inline SP print-regs hex output, and the bypass is documented as a
+    // temporary HH-3 hardware-progress measure.
+    let sp_hex_done = boot
+        .find("core::ptr::addr_of!(RPI5_HH_PRINT_REGS_SP_HEX_DONE_MARKER)")
+        .expect("proven inline SP print-regs hex emission");
+    let bypass_use = boot
+        .find("rpi5_hh_write_line(&RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF_MARKER)")
+        .expect("HH-3 bypass emission");
+    assert!(
+        sp_hex_done < bypass_use,
+        "bypass must follow the proven inline SP hex output"
+    );
+    assert!(boot.contains("Part A — temporary HH-3 hardware-progress scaffolding"));
+    assert!(boot.contains("their helper-based *printing* is skipped"));
+    assert!(boot.contains("This is temporary scaffolding"));
+
+    // The stalling helper-based register dump literals are removed from the path.
+    assert!(!boot.contains("rpi5_hh_write_hex_line(b\"RPI5_HH_VBAR value=0x\", vbar)"));
+
+    // HH3_DONE -> HH4_BEGIN remain reachable in code, with the DTB pointer
+    // threaded into HH-4.
+    assert!(boot.contains("rpi5_hh_write_line(&RPI5_HH3_DONE_MARKER)"));
+    assert!(boot.contains("rpi5_hh4_retire_low_ttbr0(dtb_phys)"));
+
+    // Part C — DTB pointer captured from x20 and validated through its high
+    // alias before HH-4 progress (FDT magic 0xd00dfeed, big-endian).
+    assert!(boot.contains("\"mov {dtb}, x20\""));
+    assert!(boot.contains("fn rpi5_hh4_retire_low_ttbr0(dtb_phys: u64)"));
+    assert!(boot.contains("let dtb_virt = dtb_phys + RPI5_HH_VA_OFFSET;"));
+    assert!(boot.contains("if u32::from_be(dtb_magic) != 0xd00d_feed"));
+
+    // Part B — narrow HH-4 ladder markers and failure boundary are present.
+    for marker in [
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK value=0x",
+        "RPI5_HH4_DTB_VIRT_OK value=0x",
+        "RPI5_HH4_DTB_PTR_FAILED reason=",
+        "RPI5_HH4_UART_STILL_OK",
+        "RPI5_HH4_FAULT_BOUNDARY reason=",
+    ] {
+        assert!(boot.contains(marker), "missing HH-4 marker {marker}");
+    }
+
+    // The HH-4 emissions use the proven inline raw-pointer path; the stalling
+    // slice-based helper calls are gone, no EL0 ERET is emitted, and no premature
+    // subsystem / user TTBR0 install appears in the scaffolding.
+    let hh4_start = boot.find("fn rpi5_hh4_retire_low_ttbr0").unwrap();
+    let hh4_end = boot[hh4_start..]
+        .find("fn yarm_rpi5_hh_rust_continue")
+        .unwrap()
+        + hh4_start;
+    let hh4 = &boot[hh4_start..hh4_end];
+    assert!(hh4.contains("core::ptr::write_volatile(hh4_uart_data"));
+    assert!(!hh4.contains("rpi5_hh_write_hex_line(&RPI5_HH4_EMPTY_TTBR0_ROOT_MARKER"));
+    assert!(!hh4.contains("rpi5_hh_write_two_hex_line"));
+    for forbidden in [
+        "RPI5_ENTER_USER_ERET",
+        "RPI5_HH5_ENTER_USER_ERET",
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "pcie_init",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "msr TTBR0_EL1, x",
+    ] {
+        assert!(
+            !hh4.contains(forbidden),
+            "HH-4 scaffolding added {forbidden}"
+        );
+    }
+
+    // Build validation enforces the new transition markers.
+    for marker in [
+        "RPI5_HH_PRINT_REGS_BYPASS_FOR_HH3_PROOF",
+        "RPI5_HH4_DTB_PTR_BEGIN",
+        "RPI5_HH4_DTB_PTR_OK",
+        "RPI5_HH4_DTB_VIRT_OK",
+        "RPI5_HH4_UART_STILL_OK",
+    ] {
+        assert!(build.contains(marker), "build omits {marker}");
+    }
+}
+
+#[test]
+fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // The bridge replaces the bare deferral with real DTB/initrd/allocator/
+    // handoff work, and the new markers are present in source.
+    for marker in [
+        "RPI5_HH5_DTB_CHOSEN_BEGIN",
+        "RPI5_HH5_DTB_CHOSEN_OK",
+        "RPI5_HH5_INITRD_BEGIN",
+        "RPI5_HH5_INITRD_RANGE phys_start=0x",
+        "RPI5_HH5_INITRD_VIRT virt_start=0x",
+        "RPI5_HH5_INITRD_OK",
+        "RPI5_HH5_INITRD_FAILED reason=",
+        "RPI5_HH5_ALLOC_BRIDGE_BEGIN",
+        "RPI5_HH5_ALLOC_BRIDGE_RANGE phys=0x",
+        "RPI5_HH5_ALLOC_BRIDGE_OK",
+        "RPI5_HH5_HANDOFF_BEGIN",
+        "RPI5_HH5_HANDOFF_OK virt=0x",
+        "RPI5_HH5_FAULT_BOUNDARY reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits HH5 marker {marker}");
+    }
+
+    // Isolate the HH5 bridge body for structural checks.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Part B/C/D: DTB and initrd are read through the high virtual alias, and the
+    // allocator/handoff live at high virtual addresses (PA + HH_VA_OFFSET).
+    assert!(hh5.contains("hh5_parse_chosen(dtb_virt)"));
+    assert!(hh5.contains("heap_phys_start + RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("initrd_virt_start = s + RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("heap_virt_start as *mut Rpi5HhBootHandoff"));
+    assert!(hh5.contains("RPI5_HH5_HANDOFF_MAGIC"));
+
+    // Overlap protection against the kernel image and the DTB.
+    assert!(hh5.contains("overlap_kernel"));
+    assert!(hh5.contains("overlap_dtb"));
+
+    // No low-VA dereference after HH4: the bridge never builds a raw pointer
+    // directly from a *_phys value; all dereferences go through *_virt aliases.
+    assert!(!hh5.contains("dtb_phys as *const"));
+    assert!(!hh5.contains("dtb_phys as *mut"));
+    assert!(!hh5.contains("initrd_phys_start as *"));
+    assert!(!hh5.contains("heap_phys_start as *"));
+
+    // No userspace entry, no premature subsystems, no panics/formatting.
+    assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("RPI5_HH5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("core::arch::asm!(\"eret\""));
+    assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
+    for forbidden in [
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "pcie_init",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "bootstrap_first_user_task",
+        "yarm_log!",
+        "printk",
+        "panic!",
+        "unwrap()",
+    ] {
+        assert!(!hh5.contains(forbidden), "HH5 bridge added {forbidden}");
+    }
+
+    // Deferral remains explicit and precise (no silent hang). BOOT-4 now wires
+    // the global allocator to the high-half heap and defers at the scheduler/IRQ
+    // bring-up (not the older generic / low-direct-map blockers).
+    assert!(!hh5.contains("normal_kernel_entry_requires_low_allocator"));
+    assert!(!hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
+    assert!(!hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
+    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(hh5.contains("initrd_missing"));
+
+    // Build + fixture validators require the new HH5 markers.
+    for marker in [
+        "RPI5_HH5_DTB_CHOSEN_BEGIN",
+        "RPI5_HH5_INITRD_BEGIN",
+        "RPI5_HH5_ALLOC_BRIDGE_BEGIN",
+        "RPI5_HH5_HANDOFF_BEGIN",
+        "RPI5_HH5_DEFERRED reason=",
+    ] {
+        assert!(build.contains(marker), "build omits HH5 marker {marker}");
+    }
+}
+
+#[test]
+fn rpi5_hh5_fdt_walker_is_bounded_with_precise_phase_markers() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // Phase + specific failure markers are defined so hardware can pinpoint the
+    // exact FDT walk substep.
+    for marker in [
+        "RPI5_HH5_FDT_HEADER_BEGIN",
+        "RPI5_HH5_FDT_HEADER_OK",
+        "RPI5_HH5_FDT_BLOCKS_BEGIN",
+        "RPI5_HH5_FDT_BLOCKS_OK",
+        "RPI5_HH5_FDT_CHOSEN_SCAN_BEGIN",
+        "RPI5_HH5_FDT_CHOSEN_FOUND",
+        "RPI5_HH5_FDT_CHOSEN_SCAN_DONE",
+        "RPI5_HH5_FDT_INITRD_PROPS_BEGIN",
+        "RPI5_HH5_FDT_INITRD_PROPS_DONE",
+        "RPI5_HH5_DTB_WALK_FAILED reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits FDT marker {marker}");
+        assert!(build.contains(marker), "build omits FDT marker {marker}");
+    }
+
+    // Isolate the walker body.
+    let start = boot
+        .find("unsafe fn hh5_parse_chosen(dtb_virt: u64)")
+        .unwrap();
+    let end = boot[start..]
+        .find("fn hh5_overlaps")
+        .map(|o| o + start)
+        .unwrap();
+    let w = &boot[start..end];
+
+    // Root-cause fix: the FDT_PROP advance must skip the 8-byte header AND the
+    // padded value; the old buggy form (advancing only the padded value) is gone.
+    assert!(w.contains("p = val_va + val_adv;"));
+    assert!(!w.contains("p += (prop_len + 3) & !3;"));
+    assert!(w.contains("let val_va = p + 8;"));
+
+    // Every structural failure class has a precise reason (Task A/B).
+    for reason in [
+        "b\"header\"",
+        "b\"blocks\"",
+        "b\"token_bounds\"",
+        "b\"node_name_bounds\"",
+        "b\"prop_bounds\"",
+        "b\"string_bounds\"",
+        "b\"bad_token\"",
+        "b\"depth_overflow\"",
+        "b\"chosen_missing\"",
+    ] {
+        assert!(w.contains(reason), "walker missing failure reason {reason}");
+    }
+
+    // Bounds checks are present before each read.
+    assert!(w.contains("if p + 4 > struct_end"));
+    assert!(w.contains("if p + 8 > struct_end"));
+    assert!(w.contains("if val_va + val_adv > struct_end"));
+    assert!(w.contains("if nameoff >= size_strings"));
+    assert!(w.contains("depth > DEPTH_MAX"));
+
+    // Task D: both 4- and 8-byte initrd cells, other widths flagged not fatal.
+    assert!(w.contains("if prop_len == 4"));
+    assert!(w.contains("else if prop_len == 8"));
+    assert!(w.contains("out.bad_cell_width = true"));
+
+    // Missing initrd is non-fatal: walk_ok is set on FDT_END regardless of
+    // whether initrd props exist; chosen-missing is the only chosen failure.
+    assert!(w.contains("out.walk_ok = true;"));
+    assert!(w.contains("out.initrd_present = have_start && have_end && !out.bad_cell_width;"));
+
+    // High-alias-only: the walker reads through dtb_virt, never a low phys ptr.
+    assert!(!w.contains("dtb_phys"));
+    assert!(w.contains("hh5_be32(dtb_virt"));
+
+    // No panic/format/asserts, no large stack arrays in the walker.
+    for forbidden in [
+        "panic!",
+        "unwrap()",
+        "assert!",
+        "assert_eq!",
+        "yarm_log!",
+        "printk",
+        "write!",
+        "format!",
+    ] {
+        assert!(!w.contains(forbidden), "walker contains {forbidden}");
+    }
+    assert!(!w.contains("[0u8;"));
+    assert!(!w.contains("[0u8 ;"));
+
+    // The missing-initrd path in the bridge maps to a clean defer, and the
+    // bad-cell-width property is reported without faulting.
+    assert!(boot.contains("RPI5_HH5_DEFERRED reason="));
+    assert!(boot.contains("b\"bad_cell_width\""));
+    assert!(boot.contains("b\"initrd_missing\""));
+}
+
+#[test]
+fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // Task A-D markers exist in source and are required by the image validator,
+    // including the granular allocator-adapter phase markers (Task A) so a hang
+    // pinpoints the exact substep.
+    for marker in [
+        "RPI5_HH5_NORMAL_BOOT_AUDIT_BEGIN",
+        "RPI5_HH5_NORMAL_BOOT_AUDIT_DONE",
+        "RPI5_HH5_BOOT_INPUT_OK virt=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_LAYOUT_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_LAYOUT_OK",
+        "RPI5_HH5_ALLOC_ADAPTER_STORAGE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_STORAGE_OK virt=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_ZERO_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_ZERO_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_RANGE_OK pages=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_CAPACITY_OK capacity=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_CALL_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_INIT_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_CALL_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_VALIDATE_OK",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_ALLOC_OK frame=0x",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_BEGIN",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_CALL_DONE",
+        "RPI5_HH5_ALLOC_ADAPTER_PROBE_FREE_OK",
+        "RPI5_HH5_ALLOC_ADAPTER_OK",
+        "RPI5_HH5_ALLOC_ADAPTER_FAILED reason=",
+        "RPI5_HH5_ENTER_KERNEL_BEGIN",
+        "RPI5_KERNEL_ENTRY_BEGIN",
+        "RPI5_KERNEL_DTB_PARSE_BEGIN",
+        "RPI5_KERNEL_DTB_PARSE_OK",
+        "RPI5_KERNEL_INITRD_OK",
+        "RPI5_KERNEL_PMEM_BEGIN",
+        "RPI5_KERNEL_PMEM_OK free_pages=0x",
+        "RPI5_KERNEL_BOOTINFO_OK",
+    ] {
+        assert!(boot.contains(marker), "boot omits bridge marker {marker}");
+        assert!(build.contains(marker), "build omits bridge marker {marker}");
+    }
+
+    // Isolate the HH5 bridge body.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Task C: a real PhysicalFrameAllocator is placed at a HIGH virtual address
+    // (HH heap bump region), initialized over a bounded usable window, and
+    // never built from a low-VA pointer. Init uses the lean in-place helper that
+    // assumes pre-zeroed storage (no big array re-materialization), not the full
+    // init_from_memory_map.
+    assert!(hh5.contains("PhysicalFrameAllocator"));
+    assert!(
+        hh5.contains("init_single_region_assume_zeroed(usable_start, usable_end - usable_start)")
+    );
+    assert!(!hh5.contains("init_from_memory_map"));
+    assert!(hh5.contains("alloc_meta_virt as *mut PhysicalFrameAllocator"));
+    // The probe uses the lean BOOT-PROBE alloc/free (no lock/log/panic/clone),
+    // not the generic alloc_frame/free_frame which take global SpinLockIrqs.
+    assert!(hh5.contains("alloc_frame_boot_probe()"));
+    assert!(hh5.contains("free_frame_boot_probe(test_frame)"));
+    assert!(!hh5.contains(".alloc_frame()"));
+    assert!(!hh5.contains(".free_frame("));
+    // Probe failures are precise and routed through the alloc_adapter_probe
+    // fault boundary.
+    assert!(hh5.contains("probe_alloc_returned_error"));
+    assert!(hh5.contains("probe_alloc_out_of_range"));
+    assert!(hh5.contains("probe_free_returned_error"));
+    assert!(hh5.contains("alloc_adapter_probe"));
+    // Allocator metadata pointer is a high VA, not a *_phys cast.
+    assert!(!hh5.contains("alloc_base_phys as *"));
+    assert!(!hh5.contains("usable_start as *"));
+
+    // Task C: the bring-up window is bounded to 16 MiB and the page count is
+    // checked against the allocator's per-frame tracking capacity before init.
+    assert!(hh5.contains("const HH_PMEM_WINDOW: u64 = 0x0100_0000"));
+    assert!(hh5.contains("PhysicalFrameAllocator::tracked_frame_capacity()"));
+    assert!(hh5.contains("usable_pages > frame_capacity"));
+    assert!(hh5.contains("init_range_capacity"));
+    assert!(hh5.contains("init_returned_error"));
+    // 16 MiB / 4 KiB = 4096 pages, well under MAX_TRACKED_FRAME_REFS (8192).
+    assert!(hh5.contains("alloc_adapter_init"));
+
+    // Task B: the ~209 KB PhysicalFrameAllocator is NEVER a by-value local. It is
+    // initialized in place: zeroed via a bounded volatile loop, then init through
+    // `&mut`. No new_uninit() temporary, no MaybeUninit local, no by-value copy.
+    assert!(!hh5.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(!hh5.contains("MaybeUninit<PhysicalFrameAllocator>"));
+    assert!(!hh5.contains("MaybeUninit::<PhysicalFrameAllocator>"));
+    assert!(!hh5.contains("core::ptr::write(alloc_ptr"));
+    assert!(!hh5.contains("let allocator = PhysicalFrameAllocator"));
+    assert!(hh5.contains("&mut *alloc_ptr"));
+    // Storage is zeroed in place with a bounded volatile loop (Task D).
+    assert!(hh5.contains("write_volatile((alloc_meta_virt + zi * 8) as *mut u64, 0)"));
+    // Storage is proven before being touched (Task C): bounds + alignment vs heap
+    // and handoff, never a low VA.
+    assert!(hh5.contains("alloc_meta_virt < heap_virt_start"));
+    assert!(hh5.contains("alloc_meta_virt < handoff_end"));
+    assert!(hh5.contains("alloc_meta_virt < RPI5_HH_VA_OFFSET"));
+    // No large stack arrays in the bridge.
+    assert!(!hh5.contains("[0u8;"));
+    assert!(!hh5.contains("[0u8 ;"));
+
+    // Task D: boot-info record lives at a high VA and is read back.
+    assert!(hh5.contains("bootinfo_virt as *mut Rpi5HhKernelBootInfo"));
+    assert!(hh5.contains("RPI5_HH_BOOTINFO_MAGIC"));
+
+    // The window stays inside the TTBR1 2 GiB high map.
+    assert!(hh5.contains("0x8000_0000"));
+
+    // Precise deferral; still no userspace, no subsystem starts, no ERET.
+    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("core::arch::asm!(\"eret\""));
+    assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
+    for forbidden in [
+        "bootstrap_first_user_task",
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "panic!",
+        "unwrap()",
+        "yarm_log!",
+        "printk",
+    ] {
+        assert!(!hh5.contains(forbidden), "bridge added {forbidden}");
+    }
+}
+
+#[test]
+fn rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // BOOT-4 markers exist in source and are required by the image validator.
+    for marker in [
+        "RPI5_BOOT4_GLOBAL_HEAP_AUDIT_BEGIN",
+        "RPI5_BOOT4_GLOBAL_HEAP_AUDIT_DONE",
+        "RPI5_KERNEL_GLOBAL_HEAP_BEGIN",
+        "RPI5_KERNEL_GLOBAL_HEAP_RANGE virt=0x",
+        "RPI5_KERNEL_GLOBAL_HEAP_OK",
+        "RPI5_KERNEL_GLOBAL_HEAP_FAILED reason=",
+        "RPI5_KERNEL_VM_BEGIN",
+        "RPI5_KERNEL_VM_LAYOUT_OK",
+        "RPI5_KERNEL_VM_OK",
+        "RPI5_KERNEL_VM_FAILED reason=",
+        "RPI5_BOOT4_FAULT_BOUNDARY reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits BOOT4 marker {marker}");
+        assert!(build.contains(marker), "build omits BOOT4 marker {marker}");
+    }
+
+    // Isolate the HH5 bridge body.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Task B: the kernel heap region is carved from the validated window and
+    // accessed only through its high alias (PA + HH_VA_OFFSET); proven mapped via
+    // first/last sentinel read-back, not a low VA and not a large loop.
+    assert!(hh5.contains("kheap_phys_start + RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("kheap_virt_start as *mut u64"));
+    assert!(hh5.contains("const KERNEL_HEAP_SIZE: u64 = 0x0040_0000"));
+    // Heap region overlap protection against image/dtb/initrd/HH heap
+    // (formatting-robust: the call may be wrapped across lines).
+    assert!(hh5.contains("hh5_overlaps("));
+    assert!(hh5.contains("kheap_phys_start"));
+    assert!(hh5.contains("kheap_phys_end"));
+
+    // Task A: the audit names the exact blocker (global allocator low direct map).
+    assert!(hh5.contains("low identity direct map"));
+
+    // Task D: KernelState is NOT constructed; deferral is precise and there is no
+    // userspace entry, no user TTBR0 install, no EL0 ERET, no big stack array, no
+    // by-value allocator, and no premature subsystem start.
+    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
+    assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
+    assert!(!hh5.contains("core::arch::asm!(\"eret\""));
+    assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
+    assert!(!hh5.contains("[0u8;"));
+    assert!(!hh5.contains("PhysicalFrameAllocator::new_uninit()"));
+    for forbidden in [
+        "bootstrap_first_user_task",
+        "init_gic",
+        "init_rp1",
+        "init_pcie",
+        "start_scheduler",
+        "start_secondary_cpus",
+        "service_chain",
+        "SpawnV5",
+        "panic!",
+        "unwrap()",
+        "expect(",
+        "yarm_log!",
+        "printk",
+    ] {
+        assert!(!hh5.contains(forbidden), "BOOT4 bridge added {forbidden}");
+    }
+}
+
+#[test]
+fn rpi5_boot4_physmap_bridge_is_gated_and_preserves_default_identity() {
+    let allocator = include_str!("../src/kernel/global_allocator.rs");
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // The gated direct-map offset exists only under the rpi5-highhalf feature,
+    // defaults to identity (0), and is read by phys_to_ptr/ptr_to_phys on the
+    // gated branch only. The default AArch64/RISC-V branch is pure identity.
+    assert!(allocator.contains("#[cfg(feature = \"rpi5-highhalf\")]"));
+    assert!(allocator.contains("static HIGHMAP_OFFSET: core::sync::atomic::AtomicU64"));
+    assert!(allocator.contains("AtomicU64::new(0)"));
+    assert!(allocator.contains("pub fn set_highmap_offset(offset: u64)"));
+    assert!(
+        allocator.contains("#[cfg(all(target_arch = \"aarch64\", feature = \"rpi5-highhalf\"))]")
+    );
+    // Default/QEMU path keeps identity phys_to_ptr / ptr_to_phys.
+    assert!(allocator.contains("return phys as usize as *mut u8;"));
+    assert!(allocator.contains("return ptr as usize as u64;"));
+    // The offset is applied only via the gated wrapping_add path, never as an
+    // unconditional semantic change.
+    assert!(allocator.contains("phys.wrapping_add(off)"));
+
+    // BOOT-4 switches the offset to HH_VA_OFFSET only after VM_OK and wires the
+    // global allocator to the high-half heap, proving a high-half allocation.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+    assert!(hh5.contains("set_highmap_offset(RPI5_HH_VA_OFFSET)"));
+    assert!(hh5.contains("rpi5_hh_init_pt_allocator_single_region("));
+    assert!(hh5.contains("GlobalAlloc::alloc("));
+    // Probe proves the returned pointer is a high-half alias, not a low VA.
+    assert!(hh5.contains("probe_va < RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("GALLOC_PROBE_SENTINEL"));
+
+    // Markers exist in source and are required by the image validator.
+    for marker in [
+        "RPI5_BOOT4_PHYSMAP_AUDIT_BEGIN",
+        "RPI5_BOOT4_PHYSMAP_AUDIT_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE phys=0x",
+        "RPI5_KERNEL_PHYSMAP_SWITCH_BEGIN",
+        "RPI5_KERNEL_PHYSMAP_SWITCH_OK offset=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PHYSMAP_OK",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_OK ptr=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_FAILED reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits physmap marker {marker}");
+        assert!(
+            build.contains(marker),
+            "build omits physmap marker {marker}"
+        );
+    }
+}
+
+#[test]
+fn rpi5_boot4_global_allocator_pt_init_is_markered_and_bss_is_zeroed() {
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let frame = include_str!("../src/kernel/frame_allocator.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+    let fixture = include_str!("../scripts/test-create-rpi5-stage1-boot-dir.sh");
+
+    // Root-cause fix: the high-half trampoline now zeroes the kernel .bss before
+    // any Rust runs (the default _start did; the HH _start did not). Without this,
+    // the PT_FRAME_ALLOCATOR spin-lock `held` flag was firmware-garbage and the
+    // first .lock() spun forever right after RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN.
+    // It must run on the high-VA branch (MMU enabled), using __bss_start/__bss_end.
+    let high_entry = boot.find(".Lhh_high_entry:").expect("hh high entry label");
+    let high_branch = boot[high_entry..]
+        .find("=yarm_rpi5_hh_rust_continue")
+        .map(|o| o + high_entry)
+        .expect("branch into rust continuation");
+    let high = &boot[high_entry..high_branch];
+    assert!(
+        high.contains(".Lhh_bss_zero"),
+        "high-half entry must zero .bss before Rust runs"
+    );
+    assert!(high.contains("=__bss_start"));
+    assert!(high.contains("=__bss_end"));
+    assert!(high.contains(".Lhh_bss_clear_begin"));
+    assert!(high.contains(".Lhh_bss_clear_done"));
+    // The marker strings themselves are defined in the asm .rodata block.
+    assert!(boot.contains("RPI5_HH_BSS_CLEAR_BEGIN"));
+    assert!(boot.contains("RPI5_HH_BSS_CLEAR_DONE"));
+
+    // Granular markers bracket every PT-allocator step after BEGIN.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+
+    // Ordering: PT storage/zero/init all happen before the physmap switch, which
+    // happens before any allocation probe (Task D).
+    let pt_storage = hh5.find("PT_STORAGE_BEGIN").expect("pt storage marker");
+    let pt_init_done = hh5.find("PT_INIT_DONE").expect("pt init done marker");
+    let switch = hh5.find("PHYSMAP_SWITCH_BEGIN").expect("switch marker");
+    let switch_ok = hh5
+        .find("set_highmap_offset(RPI5_HH_VA_OFFSET)")
+        .expect("switch call");
+    let probe_alloc = hh5.find("GlobalAlloc::alloc(").expect("probe alloc call");
+    assert!(
+        pt_storage < pt_init_done && pt_init_done < switch && switch < switch_ok,
+        "PT allocator must be set up before the physmap switch"
+    );
+    assert!(
+        switch_ok < probe_alloc,
+        "physmap must switch before the allocator probe (Task D)"
+    );
+
+    // The PT-allocator bring-up here must not materialize a by-value allocator,
+    // use new_uninit/MaybeUninit/core::ptr::write into the storage, or
+    // panic/log/unwrap (Task B/F). Inspect just the global-allocator section.
+    let galloc = hh5
+        .find("RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN_MARKER")
+        .map(|o| &hh5[o..])
+        .expect("global allocator section");
+    assert!(!galloc.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(!galloc.contains("MaybeUninit<PhysicalFrameAllocator>"));
+    assert!(!galloc.contains("MaybeUninit::<PhysicalFrameAllocator>"));
+    assert!(!galloc.contains("panic!"));
+    assert!(!galloc.contains(".unwrap()"));
+    assert!(!galloc.contains(".expect("));
+    assert!(!galloc.contains("yarm_log!"));
+
+    // The frame-allocator helpers are lean: in-place zero (volatile loop), and a
+    // single-region init that early-returns when already initialized — no big
+    // array re-materialization, no by-value allocator.
+    let zero_fn = frame
+        .find("pub fn rpi5_hh_zero_pt_allocator_storage()")
+        .map(|o| &frame[o..o + 1200])
+        .expect("zero helper");
+    assert!(zero_fn.contains("write_volatile"));
+    assert!(!zero_fn.contains("PhysicalFrameAllocator::new_uninit()"));
+    assert!(frame.contains("pub fn rpi5_hh_pt_allocator_storage_addr() -> u64"));
+
+    // The new granular markers are present in source and required by the
+    // image/fixture validators.
+    for marker in [
+        "RPI5_HH_BSS_CLEAR_BEGIN",
+        "RPI5_HH_BSS_CLEAR_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_STORAGE_OK virt=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_ZERO_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PT_INIT_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_ALLOC_OK ptr=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_SENTINEL_OK",
+    ] {
+        assert!(boot.contains(marker), "boot omits marker {marker}");
+        assert!(build.contains(marker), "build omits marker {marker}");
+        assert!(fixture.contains(marker), "fixture omits marker {marker}");
+    }
+
+    // Still no user TTBR0 / EL0 ERET / SMP / GIC / RP1 / PCIe / scheduler start
+    // introduced by this change.
+    for forbidden in [
+        "RPI5_ENTER_USER_ERET",
+        "start_scheduler",
+        "start_secondary_cpus",
+    ] {
+        assert!(
+            !hh5.contains(forbidden),
+            "HH5 bridge must not contain {forbidden}"
+        );
+    }
 }
