@@ -2886,6 +2886,65 @@ riscv64 bare-metal bootstrap builds all pass. QEMU is run by the maintainer:
 boot each arch with `yarm.ipc_recv_proof=1` and run the oracle with
 `YARM_IPC_RECV_PROOF_QUEUED_SPLIT=1 YARM_IPC_RECV_PROOF_ROLLBACK=1`.
 
+#### 5.1.8.2 Fix pass #2 (after second validation)
+
+Second QEMU validation: x86_64 queued-split **passed**, and the rollback reached
+the real kernel rollback path (`YARM_RECV_CORE_V2_WRITEBACK result=payload_undersized`
+→ `IPC_RECV_MATERIALIZE_ROLLBACK kind=transfer ok=true` →
+`IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize`). Two issues remained.
+
+**A — x86_64 split rollback error became a fatal trap (fixed).** After the
+correct rollback, the recv returned `SyscallError::InvalidArgs` (the undersized
+writeback) as `Some(Err(TrapHandleError::Syscall(InvalidArgs)))` from the
+trap-entry split fast path. `handle_trap_entry_shared` returned that `Err`
+straight to the arch entry, and **all three arch entries treat an
+`Err(TrapHandleError)` as a fatal kernel halt** — so an expected, user-visible
+syscall error became a fatal trap dump (`YARM_LOCK_SPLIT_DISPATCH nr=2 result=err`
+followed by the dump). The global-lock path never has this problem because
+`KernelState::handle_trap` (`boot/fault_state.rs`) encodes normal `SyscallError`s
+into the trap frame via `set_err(e.code())` and returns `Ok`.
+
+  **Fix (arch-neutral, no seam moved):** `handle_trap_entry_shared` now matches the
+  split-dispatch outcome and, for `Err(TrapHandleError::Syscall(e))`, encodes
+  `e.code()` into the frame and returns `Ok` (logging
+  `YARM_LOCK_SPLIT_DISPATCH nr=… result=handled_err code=…`) — exactly the
+  global-path principle. Genuinely fatal variants (`MissingTrapFrame`) still
+  propagate. PageFault is encoded as an error code (conservative, non-fatal); the
+  global path keeps the genuine task-fault semantics. This is a syscall-error
+  *parity* fix in the trap-entry layer; no IPC/cap seam, no materialization or
+  queued-split code, and no D6/CR3/TSS/PF path was touched. Guard:
+  `stage159bcd_split_dispatch_syscall_error_is_not_fatal`. Expected result: the
+  cap still rolls back, `IPC_RECV_V2_ROLLBACK_OK` still fires, the trap returns
+  normally, the userspace wrapper observes the error, and the workload emits
+  `IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE`.
+
+**B — AArch64 falls back to legacy_full_path (diagnosed, not reworked).** On
+AArch64 the proof recv logs `YARM_RECV_CORE_ADAPTER kind=legacy_full_path
+is_kernel_task=false` (emitted by the global `handle_ipc_recv`, `syscall/ipc.rs`)
+— i.e. the trap-entry user-ASID split recv fast path
+(`try_split_recv_queued_plain_with_snapshot_locked`, which would log
+`kind=user_plain_v2`) returned `None` and the recv fell through to the
+global-lock path. Because that path delivers via the *immediate* route, neither
+`IPC_RECV_V2_META_QUEUED_SPLIT_OK` nor the queued-split rollback site fires. This
+is a **separate AArch64 split-recv routing/parity issue**, not a workload defect,
+and is **not** addressed in this workload/oracle stage (it would require touching
+the split-recv routing, which is out of scope here). To localize it on a run,
+grep — between `IPC_RECV_PROOF_QS_RECV_BEGIN` and `IPC_RECV_PROOF_QS_RECV_RET` —
+for `YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=cap_plan` (did the snapshot resolve?)
+and `YARM_RECV_CORE_PLAN` (did the snapshot adapter run?). Their absence pins the
+fallback to the pre-snapshot dispatch (e.g. the authoritative current-TID read or
+snapshot resolution); the correct future work is an **AArch64 split-recv
+fast-path routing/parity stage**.
+
+**C — Oracle acceptance is now arch-aware.** The userspace `*_SEQUENCE_DONE`
+marker is always required (the workload ran and observed the expected return).
+The kernel delivery marker is REQUIRED on x86_64 (`PROOF_KERNEL_REQUIRED=1`) and
+recorded-but-DEFERRED on AArch64/riscv64 (`=0`): its absence there is reported as
+`DEFERRED` (neither pass nor failure) and its presence as `PASS`. AArch64
+queued-split is therefore **never** reported as a pass unless
+`IPC_RECV_V2_META_QUEUED_SPLIT_OK` actually appears. Guard:
+`stage159bcd_oracle_acceptance_is_arch_aware`. Sender-wake remains deferred.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

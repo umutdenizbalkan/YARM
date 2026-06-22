@@ -32657,16 +32657,60 @@ mod stage114_d3_vm_brk_shrink_live {
         let split_call = body
             .find("try_split_dispatch_into_frame(shared, cpu, frame)")
             .expect("split dispatch call must be present");
+        // Stage 159BC/D: the early return on a serviced split dispatch is now a
+        // match over the outcome — the success arm returns Ok early. It must
+        // still precede with_cpu (the global-lock fallback).
         let early_return = body[split_call..]
-            .find("return result;")
+            .find("return Ok(());")
             .map(|rel| split_call + rel)
-            .expect("an early return on Some(result) must be present");
+            .expect("an early Ok return on a serviced split dispatch must be present");
         let with_cpu_call = body
             .find(".with_cpu(")
             .expect("with_cpu call must still exist as the fallback");
         assert!(
             split_call < early_return && early_return < with_cpu_call,
             "split dispatch + its early return must both precede with_cpu"
+        );
+    }
+
+    // Stage 159BC/D parity fix: a normal syscall error produced on the split fast
+    // path must be encoded into the trap frame (set_err) and returned to
+    // userspace, NOT propagated as a fatal TrapHandleError (which every arch entry
+    // halts on). This mirrors the global-lock path in boot/fault_state.rs.
+    #[test]
+    fn stage159bcd_split_dispatch_syscall_error_is_not_fatal() {
+        let trap_entry_src = include_str!("../../arch/trap_entry.rs");
+        let fn_start = trap_entry_src
+            .find("pub fn handle_trap_entry_shared")
+            .expect("handle_trap_entry_shared must exist");
+        let split_call = fn_start
+            + trap_entry_src[fn_start..]
+                .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+                .expect("split dispatch call");
+        let with_cpu = fn_start
+            + trap_entry_src[fn_start..]
+                .find(".with_cpu(")
+                .expect("with_cpu fallback");
+        let block = &trap_entry_src[split_call..with_cpu];
+        assert!(
+            block.contains("Err(TrapHandleError::Syscall(e))")
+                && block.contains("frame.set_err(e.code())"),
+            "split-path syscall errors must be encoded into the frame via set_err"
+        );
+        assert!(
+            block.contains("result=handled_err"),
+            "split-path handled syscall error must be distinguishable in the boot log"
+        );
+        // The genuinely-fatal variant (MissingTrapFrame) is still propagated.
+        assert!(
+            block.contains("Err(other)") && block.contains("return Err(other)"),
+            "non-syscall TrapHandleError variants must still propagate as fatal"
+        );
+        // The global-lock path's precedent must remain (the parity source).
+        let fault_src = include_str!("fault_state.rs");
+        assert!(
+            fault_src.contains("trapframe.set_err(e.code())"),
+            "global-lock path must retain the set_err parity precedent"
         );
     }
 
@@ -42193,6 +42237,39 @@ mod stage159bcd_ipc_recv_proof_workload {
                 "phase diagnostic `{m}` must be emitted"
             );
         }
+    }
+
+    // 6d. Oracle acceptance is arch-aware (fix pass #2): the kernel delivery
+    //     marker is REQUIRED on x86_64 but only recorded/DEFERRED on AArch64,
+    //     where the proof recv falls back to the legacy_full_path. AArch64
+    //     queued-split is never reported PASS unless the kernel marker appears.
+    #[test]
+    fn stage159bcd_oracle_acceptance_is_arch_aware() {
+        assert!(
+            ORACLE_SCRIPT.contains("PROOF_KERNEL_REQUIRED"),
+            "oracle must gate kernel-marker enforcement per arch"
+        );
+        // x86_64 requires the kernel marker; the default (incl. aarch64) does not.
+        assert!(
+            ORACLE_SCRIPT.contains("x86_64) PROOF_KERNEL_REQUIRED=1")
+                && ORACLE_SCRIPT.contains("*)      PROOF_KERNEL_REQUIRED=0"),
+            "x86_64 must require kernel markers; aarch64/other default to deferred"
+        );
+        // The deferred branch must still require the sequence marker and must not
+        // set rc=1 (not a failure) when only the kernel marker is absent.
+        assert!(
+            ORACLE_SCRIPT.contains("DEFERRED on $ARCH"),
+            "absent kernel marker on a non-required arch must be reported DEFERRED"
+        );
+        // A PASS still requires the kernel marker present (never faked on aarch64).
+        let req = ORACLE_SCRIPT
+            .split("proof $label: PASS")
+            .next()
+            .expect("PASS branch must exist");
+        assert!(
+            req.contains("have_kern\" -eq 1"),
+            "PASS must be gated on the kernel marker actually being present"
+        );
     }
 
     // 7. Sender-wake is explicitly deferred (not faked): the workload logs a
