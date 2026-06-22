@@ -207,6 +207,21 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // IPC_RECV_META_V2_ENCODED_LEN there, and inlining the literal 40 would
 // duplicate the ABI constant. Stage 153 therefore moves no code.
 //
+// ── Stage 154: D1/D5 cap-boundary migration scaffold (Option 2: pure helper) ──
+// Stage 154 creates the dedicated landing module `syscall/ipc_recv_core.rs` and
+// migrates the ONE genuinely pure fragment of the recv cluster — the recv-v2
+// metadata byte codec — into it as `encode_recv_v2_meta` (pub(super)). This is
+// byte-for-byte identical and is called at the exact same point in
+// complete_blocked_recv_for_waiter (after materialization, before the meta
+// copy), so every Stage 153 ordering proof is preserved. The new module is NOT
+// ipc_abi.rs, so the stage151 purity guard does not apply; it only *references*
+// IPC_RECV_META_V2_ENCODED_LEN via `super::` (single definition stays here).
+// The stateful seams (complete_blocked_recv_for_waiter, the materialize_* trio,
+// the D1/D5 router, try_split_*/try_endpoint_split_recv, clear_blocked_recv_state)
+// and the const itself REMAIN pinned in syscall.rs: re-homing them requires
+// QEMU smoke proof of byte-identical delivery, which is unavailable here. See
+// doc/KERNEL_UNLOCKING.md §5.1.2 and boot::tests::stage154_ipc_recv_core_boundary.
+//
 // NOTE: these `mod` declarations must stay AFTER the `syscall_trace!` macro
 // definition above (textual macro scoping).
 mod cap;
@@ -215,6 +230,10 @@ mod helpers;
 mod initramfs;
 mod ipc;
 mod ipc_abi;
+// Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta
+// codec today; the stateful cap/materialization seams stay in syscall.rs until
+// a QEMU-validated re-home (doc/KERNEL_UNLOCKING.md §5.1.2).
+mod ipc_recv_core;
 mod process;
 mod recv_shared_v3;
 mod sched;
@@ -452,7 +471,6 @@ pub(crate) fn complete_blocked_recv_for_waiter(
                 .unwrap_or(SYSCALL_NO_TRANSFER_CAP)
         );
     }
-    let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
     let cap_id = recv_local_transfer.unwrap_or(SYSCALL_NO_TRANSFER_CAP);
     if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
         crate::yarm_log!(
@@ -461,13 +479,17 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             cap_id
         );
     }
-    meta[0..8].copy_from_slice(&0u64.to_le_bytes());
-    meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
-    meta[10..12].copy_from_slice(&0u16.to_le_bytes());
-    meta[12..16].copy_from_slice(&(app_payload.len() as u32).to_le_bytes());
-    meta[16..24].copy_from_slice(&cap_id.to_le_bytes());
-    meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
-    meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+    // Stage 154: pure recv-v2 meta serialization moved to ipc_recv_core.rs.
+    // Byte-for-byte identical to the prior inline encoding; called at the exact
+    // same point (after materialization, before the meta copy) so the
+    // copy-before/after and rollback ordering is unchanged.
+    let meta = self::ipc_recv_core::encode_recv_v2_meta(
+        app_opcode,
+        app_payload.len() as u32,
+        cap_id,
+        recv_meta_flags as u64,
+        msg.sender_tid.0,
+    );
     match kernel.copy_to_user(
         waiter_asid,
         VirtAddr(blocked_state.meta_user_ptr as u64),
