@@ -40757,3 +40757,246 @@ mod stage152_syscall_decomposition_completeness_audit {
         }
     }
 }
+
+// Stage 153: D1/D5 IPC/cap seam ownership/order audit — boundary guard tests.
+//
+// Stage 153 is an audit/proof stage: it MOVES NO CODE. These guards lock the
+// pinned IPC/cap recv cluster in syscall.rs (the cluster a future
+// `syscall/ipc_recv_core.rs` would have to absorb) and assert that no submodule
+// has quietly taken ownership of cap-slot materialization, the reply-cap
+// lifecycle, or the recv-v2 metadata constant. They complement (do not replace)
+// the Stage 104/147/148/152 guards. See doc/KERNEL_UNLOCKING.md §5.1.1.
+mod stage153_ipc_cap_boundary_audit {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const CAP_SRC: &str = include_str!("../syscall/cap.rs");
+    const IPC_ABI_SRC: &str = include_str!("../syscall/ipc_abi.rs");
+    const RECV_SHARED_V3_SRC: &str = include_str!("../syscall/recv_shared_v3.rs");
+    const HELPERS_SRC: &str = include_str!("../syscall/helpers.rs");
+    const SCHED_SRC: &str = include_str!("../syscall/sched.rs");
+    const VM_SRC: &str = include_str!("../syscall/vm.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
+    const INITRAMFS_SRC: &str = include_str!("../syscall/initramfs.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // Every submodule source EXCEPT syscall.rs — used to prove the pinned
+    // functions are not duplicated anywhere outside their owner.
+    const ALL_SUBMODULE_SRCS: &[(&str, &str)] = &[
+        ("cap.rs", CAP_SRC),
+        ("debug.rs", DEBUG_SRC),
+        ("helpers.rs", HELPERS_SRC),
+        ("initramfs.rs", INITRAMFS_SRC),
+        ("ipc.rs", IPC_SRC),
+        ("ipc_abi.rs", IPC_ABI_SRC),
+        ("process.rs", PROCESS_SRC),
+        ("recv_shared_v3.rs", RECV_SHARED_V3_SRC),
+        ("sched.rs", SCHED_SRC),
+        ("vm.rs", VM_SRC),
+    ];
+
+    // The full pinned-seam set audited by Stage 153. Each `fn NAME(` definition
+    // must appear in syscall.rs and in NO submodule.
+    const PINNED_FN_DEFS: &[&str] = &[
+        "fn clear_blocked_recv_state(",
+        "fn complete_blocked_recv_for_waiter(",
+        "fn materialize_received_transfer_cap(",
+        "fn materialize_received_message_cap(",
+        "fn materialize_received_message_cap_routed(",
+        "fn try_endpoint_split_recv(",
+        "fn try_split_recv_queued_plain_into_frame_locked(",
+        "fn try_split_recv_queued_plain_with_snapshot_locked(",
+    ];
+
+    // 1. All pinned functions are still defined in syscall.rs.
+    #[test]
+    fn stage153_pinned_functions_defined_in_syscall_rs() {
+        for def in PINNED_FN_DEFS {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "pinned seam `{def}` must remain defined in syscall.rs"
+            );
+        }
+    }
+
+    // 2. None of the pinned functions is duplicated/defined in any submodule
+    //    (ipc.rs, cap.rs, or any other current/new module).
+    #[test]
+    fn stage153_pinned_functions_not_duplicated_in_submodules() {
+        for def in PINNED_FN_DEFS {
+            for (name, src) in ALL_SUBMODULE_SRCS {
+                assert!(
+                    !src.contains(def),
+                    "submodule {name} must not define `{def}` (pinned to syscall.rs)"
+                );
+            }
+        }
+    }
+
+    // 3. complete_blocked_recv_for_waiter keeps its required pub(crate)
+    //    visibility (external callers: boot/ipc_state.rs).
+    #[test]
+    fn stage153_complete_blocked_recv_is_pub_crate() {
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("),
+            "complete_blocked_recv_for_waiter must remain pub(crate) in syscall.rs"
+        );
+    }
+
+    // 4/5/6. The cap-materialization trio stays in syscall.rs with its current
+    //        visibility surface (canonical, transfer helper, D1/D5 router).
+    #[test]
+    fn stage153_cap_materialization_trio_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
+            "materialize_received_message_cap must remain pub(super) in syscall.rs"
+        );
+        // private helper (no visibility keyword) — must not have leaked wider.
+        assert!(
+            SYSCALL_SRC.contains("fn materialize_received_transfer_cap("),
+            "materialize_received_transfer_cap must remain defined in syscall.rs"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("pub fn materialize_received_transfer_cap(")
+                && !SYSCALL_SRC.contains("pub(crate) fn materialize_received_transfer_cap(")
+                && !SYSCALL_SRC.contains("pub(super) fn materialize_received_transfer_cap("),
+            "materialize_received_transfer_cap must stay module-private (cap-mutation helper)"
+        );
+        assert!(
+            SYSCALL_SRC.contains("fn materialize_received_message_cap_routed("),
+            "materialize_received_message_cap_routed must remain defined in syscall.rs"
+        );
+    }
+
+    // 7. IPC_RECV_META_V2_ENCODED_LEN remains defined in syscall.rs (recv-v2
+    //    metadata layout owner) and is not duplicated in any submodule.
+    #[test]
+    fn stage153_recv_meta_len_owned_by_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must remain pub(super) const in syscall.rs"
+        );
+        for (name, src) in ALL_SUBMODULE_SRCS {
+            assert!(
+                !src.contains("const IPC_RECV_META_V2_ENCODED_LEN"),
+                "{name} must not define/duplicate IPC_RECV_META_V2_ENCODED_LEN"
+            );
+        }
+    }
+
+    // 8. ipc.rs does not directly own cap-slot materialization: it may CALL the
+    //    canonical helper (import from super), but must not DEFINE the
+    //    materialize/router functions, nor mint/grant reply caps itself.
+    #[test]
+    fn stage153_ipc_module_does_not_own_cap_materialization() {
+        assert!(
+            !IPC_SRC.contains("fn materialize_received_message_cap("),
+            "ipc.rs must not define materialize_received_message_cap"
+        );
+        assert!(
+            !IPC_SRC.contains("fn materialize_received_message_cap_routed("),
+            "ipc.rs must not define the D1/D5 cap router"
+        );
+        assert!(
+            !IPC_SRC.contains("fn materialize_received_transfer_cap("),
+            "ipc.rs must not define the transfer-cap materializer"
+        );
+        // The reply-cap one-shot record API is owned by the syscall-side
+        // materializer, not minted directly inside ipc.rs.
+        assert!(
+            !IPC_SRC.contains("set_reply_cap_waiter_cap("),
+            "ipc.rs must not drive the reply-cap one-shot record (owned by syscall.rs)"
+        );
+    }
+
+    // 9. ipc_abi.rs remains pure: no kernel-state / cap / VM mutation, no IPC
+    //    lock, no reply-cap lifecycle, no cap materialization.
+    #[test]
+    fn stage153_ipc_abi_remains_pure() {
+        for forbidden in &[
+            "ipc_state_lock",
+            "materialize_received_message_cap",
+            "set_reply_cap_waiter_cap",
+            "rollback_materialized_recv_cap",
+            "mint_capability_in_cnode",
+            "grant_task_to_task_with_rights",
+            "copy_to_user",
+            "map_shared_region",
+        ] {
+            assert!(
+                !IPC_ABI_SRC.contains(forbidden),
+                "ipc_abi.rs must remain pure: must not reference `{forbidden}`"
+            );
+        }
+    }
+
+    // 10. Stage 153 is audit-only: it does NOT create syscall/ipc_recv_core.rs,
+    //     and syscall.rs does not declare `mod ipc_recv_core;`.
+    #[test]
+    fn stage153_no_ipc_recv_core_module_created() {
+        assert!(
+            !SYSCALL_SRC.contains("mod ipc_recv_core;"),
+            "Stage 153 must not declare mod ipc_recv_core (audit-only stage)"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("self::ipc_recv_core::"),
+            "Stage 153 must not delegate to a nonexistent ipc_recv_core module"
+        );
+    }
+
+    // 11/12. Syscall counts unchanged.
+    #[test]
+    fn stage153_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[(); SYSCALL_COUNT] = [(); 31]"),
+            "compile-time SYSCALL_COUNT==31 assertion must remain"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 13. D6/CR3/PF diagnostic markers remain (syscall.rs + arch/trap_entry.rs).
+    #[test]
+    fn stage153_d6_cr3_pf_markers_remain() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "syscall.rs must retain VALIDATION: LIVE_OFF_TRAP"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: SPLIT_FAST_PATH_ONLY"),
+            "syscall.rs must retain VALIDATION: SPLIT_FAST_PATH_ONLY"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "syscall.rs must retain VALIDATION: GLOBAL_LOCK_SLOW_PATH"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "arch/trap_entry.rs must retain the D6 controlled-switch proof marker"
+        );
+    }
+
+    // 14. Stage 152 irreducible-core note remains, and the Stage 153 proof map
+    //     is recorded in syscall.rs and the doc.
+    #[test]
+    fn stage153_audit_notes_present() {
+        assert!(
+            SYSCALL_SRC.contains("irreducible core"),
+            "Stage 152 irreducible-core note must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("Stage 153: D1/D5 IPC/cap seam ownership/order proof"),
+            "syscall.rs must record the Stage 153 ownership/order proof"
+        );
+        assert!(
+            SYSCALL_SRC.contains("BLOCKER SUMMARY for ipc_recv_core.rs"),
+            "syscall.rs Stage 153 note must state the ipc_recv_core.rs blocker summary"
+        );
+    }
+}

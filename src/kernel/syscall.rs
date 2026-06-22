@@ -136,6 +136,77 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // stage152_syscall_decomposition_completeness_audit so future agents cannot
 // silently undo the boundaries. See doc/KERNEL_UNLOCKING.md §5.1.
 //
+// ── Stage 153: D1/D5 IPC/cap seam ownership/order proof (no code moved) ────────
+// Audit answering "what would a future syscall/ipc_recv_core.rs require?".
+// Lock ranks per doc/KERNEL_LOCKING.md §4: scheduler=2, task=3, ipc=4,
+// capability=5, vm=6, memory=7, telemetry=11. The mandatory nesting order is
+// scheduler → task → ipc → capability → vm.  Per-seam proof (full prose in
+// doc/KERNEL_UNLOCKING.md §5.3):
+//
+//   clear_blocked_recv_state  [task]      pure blocked-recv-state clear; no cap,
+//       no ipc, no user copy, no scheduler. Mutates only tcb.blocked_recv_state.
+//       Stays: shared blocked-recv-state owner; pinned by stage147.
+//
+//   try_endpoint_split_recv   [ipc]       IPC-domain dequeue only; returns a
+//       deferred IpcSchedulerPlan (wake applied by caller AFTER all locks drop).
+//       No cap mutation, no user copy. Stays: LIVE_OFF_TRAP seam; stage147/148.
+//
+//   try_split_recv_queued_plain_into_frame_locked [cap-read,ipc] (test helper)
+//       Plain kernel-task dequeue + frame writeback; default-denies user-ASID
+//       and recv-v2. No cap mutation, no user copy. Stays: Stage 31 regression
+//       anchor; stage148.
+//
+//   materialize_received_transfer_cap [ipc→capability] (private)
+//       Phase A: take_transfer_envelope (ipc 4). Phase B: resolve +
+//       grant_task_to_task_with_rights (capability 5) — CAP MUTATION. Stays:
+//       cap-mutation helper; hard rule forbids moving without a cap-boundary
+//       stage.
+//
+//   materialize_received_message_cap [ipc→capability]  (pub(super))
+//       Reply arm: take_transfer_envelope → verify Reply object live →
+//       mint_capability_in_cnode → set_reply_cap_waiter_cap (one-shot reply-cap
+//       record). Transfer arm: delegates to materialize_received_transfer_cap.
+//       CAP MUTATION + REPLY-CAP LIFECYCLE. Canonical fallback used by ipc.rs
+//       full-recv path and recv_shared_v3 (NR 30). Stays: hard rule;
+//       stage147/148.
+//
+//   materialize_received_message_cap_routed [ipc→capability] (private)
+//       D1/D5 router: cap_transfer_split split engine for transfer (D1) and
+//       reply (D5) arms; canonical fallback for shared-region / FallbackRequired.
+//       CAP MUTATION. Two live call sites (complete_blocked_recv_for_waiter,
+//       try_split_recv_queued_plain_with_snapshot_locked). Stays: Stage 104
+//       guard pins definition + call sites in syscall.rs.
+//
+//   complete_blocked_recv_for_waiter [task→capability→vm→task] (pub(crate))
+//       recv-v2 blocked-waiter delivery. Order: take blocked_recv_state (task 3)
+//       → resolve recv cap (capability 5) → copy payload to user (vm 6) →
+//       materialize_received_message_cap_routed (cap mint/grant + reply-cap) →
+//       encode recv-v2 meta → copy meta to user (vm 6); ON META FAULT roll back
+//       the freshly minted cap (capability 5) → zero return GPRs (task 3) →
+//       clear state. CAP MUTATION + REPLY-CAP + USER COPY + TCB writeback, all
+//       order-critical. Also called from boot/ipc_state.rs. Stays: hard rule;
+//       stage147/148.
+//
+//   try_split_recv_queued_plain_with_snapshot_locked [ipc→capability→scheduler→vm]
+//       (pub(crate)) live queued split-recv. Order (matches full path §58):
+//       dequeue under ipc (4, released inside recv_core) → materialize cap via
+//       router (capability 5) → apply_split_sender_wake_plan (scheduler 2) →
+//       user writeback (vm 6) → rollback cap on writeback fault. CAP MUTATION +
+//       REPLY-CAP + USER COPY + SCHEDULER WAKE. Called from runtime.rs. Stays:
+//       ordering-sensitive; stage148; calls Stage-104-pinned router.
+//
+// BLOCKER SUMMARY for ipc_recv_core.rs: a move is blocked because (a) the cap
+// router materialize_received_message_cap_routed is pinned to syscall.rs by the
+// Stage 104 guard; (b) the cluster spans the capability mutation + reply-cap
+// one-shot lifecycle, which the hard rules forbid relocating without a dedicated
+// audited cap-boundary stage; (c) complete_blocked_recv_for_waiter has an
+// external caller (boot/ipc_state.rs) and orchestrates a task→cap→vm→task order
+// that must not be re-sequenced. NO pure helper is extractable here: the only
+// pure fragment (recv-v2 meta byte-encoding) cannot live in the natural home
+// (ipc_abi.rs) because the stage151 purity guard forbids referencing
+// IPC_RECV_META_V2_ENCODED_LEN there, and inlining the literal 40 would
+// duplicate the ABI constant. Stage 153 therefore moves no code.
+//
 // NOTE: these `mod` declarations must stay AFTER the `syscall_trace!` macro
 // definition above (textual macro scoping).
 mod cap;
