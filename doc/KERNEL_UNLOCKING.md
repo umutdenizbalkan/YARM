@@ -2371,6 +2371,99 @@ dispatch" (dispatch.rs) or require the D1/D5 cap-slot/lock-ordering audit
 | [R] split-recv seam | `try_split_recv_queued_plain_into_frame_locked` (test), `try_split_recv_queued_plain_with_snapshot_locked` (live) | Stay for D2/D3 split-path protocol |
 | [X] future extract, risky | `materialize_received_message_cap` (cap-slot + TrapFrame ordering), `complete_blocked_recv_for_waiter` (same) | Dedicated cap-slot/lock-ordering audit required |
 
+### 5.1.1 Stage 153 — D1/D5 IPC/cap seam ownership/order audit
+
+Stage 153 is a **dedicated audit/proof stage** for the pinned IPC/cap cluster
+that a future `syscall/ipc_recv_core.rs` would need to absorb. **No code is
+moved.** The mandatory lock-nesting order (doc/KERNEL_LOCKING.md §4) referenced
+below is: `scheduler_state` (rank 2) → `task_state` (rank 3) → `ipc_state`
+(rank 4) → `capability_state` (rank 5) → `vm_state` (rank 6).
+
+**Per-seam ownership/order proof.** For each function: locks it may touch /
+cap-slot mutation / receiver-local cap materialization / reply-cap lifecycle /
+blocked-recv state / user-memory copy / scheduler-or-TCB mutation / IPC-lock
+coexistence / required before–after ordering / why it stays.
+
+| Seam | Locks | Cap mut | Materializes | Reply-cap | Blocked-recv | User copy | Sched/TCB | Why it stays |
+|------|-------|---------|--------------|-----------|--------------|-----------|-----------|--------------|
+| `clear_blocked_recv_state` | task (3) | no | no | no | **yes (clear)** | no | TCB field | shared blocked-recv-state owner; pinned stage147 |
+| `try_endpoint_split_recv` | ipc (4) | no | no | no | no | no | returns deferred wake plan only | `LIVE_OFF_TRAP` seam; pinned stage147/148 |
+| `try_split_recv_queued_plain_into_frame_locked` (test) | cap-read (5), ipc (4) | no | no | no | no | no | no (rejects sender-waiter refill) | Stage 31 regression anchor; pinned stage148 |
+| `materialize_received_transfer_cap` (priv) | ipc (4) → capability (5) | **yes (grant)** | yes | no | no | no | cnode/cap tables | cap-mutation helper; hard rule |
+| `materialize_received_message_cap` | ipc (4) → capability (5) | **yes (mint/grant)** | yes | **yes (one-shot mint + record)** | no | no | cnode/cap tables | reply-cap one-shot + cap-slot mint ordering; hard rule + stage147/148 |
+| `materialize_received_message_cap_routed` (priv) | ipc (4) → capability (5) | **yes (split or canonical)** | yes | **yes (D5 arm)** | no | no | cnode/cap tables + D1/D5 telemetry | D1/D5 router; **Stage 104 guard pins definition + call sites in syscall.rs** |
+| `complete_blocked_recv_for_waiter` | task (3) → capability (5) → vm (6) → task (3) | **yes (via router)** | yes | **yes (mint + rollback on meta fault)** | **yes (take→clear)** | **yes (payload + meta)** | zeroes return GPRs (TCB) | cross-domain order-critical; external caller `boot/ipc_state.rs`; hard rule + stage147/148 |
+| `try_split_recv_queued_plain_with_snapshot_locked` (live) | ipc (4) → capability (5) → scheduler (2) → vm (6) | **yes (via router)** | yes | **yes (rollback on writeback fault)** | no | **yes (user_plain / v2)** | applies sender wake | ordering-sensitive live split; pinned stage148; calls Stage-104 router |
+
+**Exact ordering invariants (must be preserved by any future move):**
+
+1. `complete_blocked_recv_for_waiter` (recv-v2 blocked-waiter delivery): take
+   `blocked_recv_state` (task 3) → resolve recv cap (capability 5) → **copy
+   payload to user (vm 6)** → `materialize_received_message_cap_routed` (cap
+   mint/grant + reply-cap record) → encode recv-v2 meta → **copy meta to user
+   (vm 6)**; on meta-copy fault **roll back the freshly-minted cap** (capability
+   5) to avoid a cnode-slot / reply-cap leak → zero the four x86_64 return-GPR
+   slots (task 3) → clear state. Payload copy precedes materialization here.
+2. `try_split_recv_queued_plain_with_snapshot_locked` (queued split-recv) uses
+   the **opposite** payload/materialize order, matching the full-path §58
+   sequence: dequeue under ipc (4, released inside `recv_core`) → **materialize
+   cap first** (capability 5) → apply sender wake (scheduler 2) → user writeback
+   (vm 6) → roll back cap on writeback fault. The two delivery paths therefore
+   encode *different* but individually load-bearing orderings; they cannot be
+   collapsed into one core routine without preserving both.
+3. Reply caps are **one-shot**: `materialize_received_message_cap` mints the
+   Reply object directly (bypassing the delegation-link table) and records the
+   minted `CapId` via `set_reply_cap_waiter_cap`; `ipc_reply` later fast-revokes
+   exactly that slot. Any move must keep mint-then-record atomic w.r.t. the
+   delivery that exposes the cap to the receiver.
+4. The D1/D5 router runs the `cap_transfer_split` phase-separated engine for the
+   transfer (D1) and reply (D5) arms and falls back to the canonical helper for
+   shared-region (`OPCODE_SHARED_MEM`) and every `FallbackRequired` outcome;
+   failure log markers are byte-identical to the canonical arms (smoke-log
+   contract).
+
+**Current blockers for `syscall/ipc_recv_core.rs`:**
+
+- **B1 (guard pin).** `materialize_received_message_cap_routed` is pinned to
+  `syscall.rs` by the Stage 104 guard (`stage104_live_wire_call_sites_present`),
+  which asserts both its definition and ≥3 occurrences of the call live in
+  `syscall.rs`. Relocating the router would break that guard.
+- **B2 (cap/reply lifecycle).** The cluster performs capability-slot mutation
+  (`mint_capability_in_cnode`, `grant_task_to_task_with_rights`) and the reply-
+  cap one-shot lifecycle (`set_reply_cap_waiter_cap`, `rollback_materialized_recv_cap`).
+  The hard rules forbid relocating cap/CNode mutation helpers except in a
+  dedicated, audited cap-boundary stage.
+- **B3 (external caller + order).** `complete_blocked_recv_for_waiter` is
+  `pub(crate)` and called from `boot/ipc_state.rs`; it interleaves task → cap →
+  vm → task domains in a fault-rollback-safe order that must not be re-sequenced.
+- **B4 (no pure helper).** The only genuinely pure fragment in the cluster is the
+  recv-v2 metadata byte-encoding (a function of opcode, payload length, cap id,
+  flags, sender tid → `[u8; IPC_RECV_META_V2_ENCODED_LEN]`). Its natural home is
+  the pure-codec module `ipc_abi.rs`, but the Stage 151 purity guard
+  (`stage151_recv_meta_len_stays_in_syscall_rs`) forbids referencing
+  `IPC_RECV_META_V2_ENCODED_LEN` there, and inlining the literal `40` would
+  duplicate the ABI constant. So even the pure fragment has no safe new home
+  today; Stage 153 extracts nothing.
+
+**What a future move would require (preconditions, in order):**
+
+1. A dedicated **cap-boundary stage** that relocates the Stage 104 router and its
+   guard together (update `stage104_live_wire_call_sites_present` to target the
+   new module), proving the split engine's equivalence tests still hold.
+2. A home for the recv-v2 meta codec that does not duplicate
+   `IPC_RECV_META_V2_ENCODED_LEN` — e.g. a new `ipc_recv_core.rs` that *owns* the
+   const (moved out of `syscall.rs`) with the Stage 147/151/152 guards updated in
+   the same change, or a const re-export contract that keeps a single definition.
+3. Re-pointing the `boot/ipc_state.rs` and `runtime.rs` external call sites and
+   re-homing the Stage 147/148/152 pins to the new module.
+4. Bare-metal + QEMU smoke validation that the recv-v2 / reply-cap / split-recv
+   delivery markers are byte-identical before and after.
+
+**What must remain in `syscall.rs` until then:** all eight seams above, the
+`IPC_RECV_META_V2_ENCODED_LEN` constant, the reply-cap one-shot record/rollback
+calls, the D1/D5 router, and `pub fn dispatch`. Stage 153 hardens these with
+`boot::tests::stage153_ipc_cap_boundary_audit`.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
