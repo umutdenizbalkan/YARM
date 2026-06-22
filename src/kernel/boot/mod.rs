@@ -673,6 +673,25 @@ pub(crate) fn d6_controlled_switch_proof_mark_done() {
     D6_CONTROLLED_SWITCH_PROOF_DONE.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// Stage 159: `yarm.ipc_recv_proof=1` gate for the default-off userspace IPC
+/// recv-v2 oracle exercise client. When set, the control-plane bootstrap
+/// provisions a dedicated loopback endpoint into the exercise workload, which
+/// then deterministically drives the three recv-v2 delivery markers that a
+/// normal boot does not reliably exercise on every arch:
+/// `IPC_RECV_V2_META_QUEUED_SPLIT_OK`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, and
+/// `IPC_RECV_V2_ROLLBACK_OK`. Diagnostic/smoke-only, arch-neutral, default-off;
+/// it provisions nothing and runs nothing unless explicitly enabled.
+pub(crate) static IPC_RECV_ORACLE_PROOF_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipc_recv_oracle_proof_enabled(enabled: bool) {
+    IPC_RECV_ORACLE_PROOF_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipc_recv_oracle_proof_enabled() -> bool {
+    IPC_RECV_ORACLE_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Stage 118: context for the first-resume trampoline (`yarm_kernel_thread_switch_trampoline`).
 ///
 /// Set by the Stage 117 stash drain in `handle_trap_entry_shared` immediately
