@@ -40,7 +40,7 @@ Directive labels are stable across stages:
 | **D1** transfer-cap recv (non-reply, non-shared-region) | **LIVE** | Stage 104 | router → `materialize_split_transfer_cap_equivalent`; telemetry `d1_split_materializations` |
 | **D2** endpoint blocking-recv waiter publish | **LIVE** (phase-split, Stage 111) | Stage 106 | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes`, `d2_publish_race_unwinds`; `Stage 108 with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path — see §1 Stage 111 |
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
-| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc,helpers,ipc_abi}.rs` | **COMPLETE (mechanical)** | Stage 102 + D4 steps 1–4 + Stage 145/146/149/150/151 + **Stage 152 completeness audit** | 10 modules landed (8 handler + 2 shared-helper/codec); `ipc_abi.rs` boundary-audited Stage 151; Stage 152 audits the decomposition as complete to its irreducible IPC/cap dispatch core (no new module, no source move) and guard-hardens the full boundary surface; `dispatch.rs` is not planned (syscall.rs stays dispatch owner) and `ipc_recv_core.rs` remains deferred to the D1/D5 cap-slot audit (§5.1); see Stage 148–152 decomposition map |
+| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc,helpers,ipc_abi,ipc_recv_core}.rs` | **COMPLETE (mechanical) + cap-boundary in progress** | Stage 102 + D4 steps 1–4 + Stage 145/146/149/150/151 + **Stage 152** completeness audit + **Stage 153** seam audit + **Stage 154** cap-boundary scaffold | 11 modules landed; mechanical decomposition complete (Stage 152); Stage 153 proved the IPC/cap seams are order-pinned; Stage 154 created `ipc_recv_core.rs` and migrated the pure recv-v2 meta codec (Option 2), leaving the stateful cap/materialization seams pinned in `syscall.rs` pending a QEMU-validated re-home (§5.1.2); `dispatch.rs` not planned (syscall.rs stays dispatch owner); see Stage 148–154 decomposition map |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
 | **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page; Stage 127 corrects that gate to map/check the target task ASID/root and retries after ASID binding instead of depending on temporal active-ASID presence; Stage 128 strengthens the invariant again by mapping/checking the incoming switch-stack page in every existing task root that may be the active/outgoing CR3 during `switch_frames`, plus an active-root proof check before stashing; Stage 129 fixes the VmFull capacity-blocker by adding on-demand repair in the active-root guard when the active ASID was created after the incoming stack was initialized; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
@@ -2350,7 +2350,7 @@ dispatch" (dispatch.rs) or require the D1/D5 cap-slot/lock-ordering audit
 | Target module | Status |
 |---------------|--------|
 | `syscall/dispatch.rs` | **not planned** — would violate "syscall.rs remains dispatch owner" / "no submodule defines dispatch"; dispatch stays in syscall.rs |
-| `syscall/ipc_recv_core.rs` | deferred — `complete_blocked_recv_for_waiter` and cap-slot ordering require D1/D5 audit first |
+| `syscall/ipc_recv_core.rs` | **landed (scaffold)** Stage 154 — D1/D5 cap-boundary landing zone; holds the pure `encode_recv_v2_meta` codec only. The stateful cap/materialization seams and `complete_blocked_recv_for_waiter` remain in `syscall.rs` until a QEMU-validated re-home (§5.1.2) |
 | `syscall/ipc_abi.rs` | **landed** Stage 150; **audited** Stage 151 — pure ABI/frame codec only (no kernel-state mutation, no lock acquisition, no cap-slot materialization, no VM/shared-memory mapping, no reply-cap lifecycle); `syscall.rs` remains dispatch owner; `ipc.rs` remains stateful IPC owner |
 | `syscall/helpers.rs` | **landed** Stage 149 ([S] current_tid, validate_user_region, round_up_page, record_user_fault, validate_endpoint_right, current_task_has_user_asid) |
 | `syscall/vm.rs` | **landed** Stage 145 (NR 3/13/14 VmMap/AnonMap/Brk) |
@@ -2463,6 +2463,67 @@ coexistence / required before–after ordering / why it stays.
 `IPC_RECV_META_V2_ENCODED_LEN` constant, the reply-cap one-shot record/rollback
 calls, the D1/D5 router, and `pub fn dispatch`. Stage 153 hardens these with
 `boot::tests::stage153_ipc_cap_boundary_audit`.
+
+### 5.1.2 Stage 154 — D1/D5 cap-boundary migration scaffold (Option 2)
+
+Stage 154 begins the dedicated cap-boundary migration toward
+`syscall/ipc_recv_core.rs`. **Chosen outcome: Option 2 — pure-helper move.** It
+creates the landing module and migrates the single genuinely pure fragment of
+the recv cluster; it does **not** re-home any stateful cap/materialization seam.
+
+**Seam migration classification** (per the Stage 153 proof):
+
+| Seam | Stage 154 class | Disposition |
+|------|-----------------|-------------|
+| recv-v2 meta byte-encoder | (4) pure helper split | **Moved** → `ipc_recv_core::encode_recv_v2_meta` |
+| `clear_blocked_recv_state` | (3) must remain | pinned in syscall.rs |
+| `try_endpoint_split_recv` | (3) must remain | pinned (LIVE_OFF_TRAP seam) |
+| `try_split_recv_queued_plain_into_frame_locked` | (3) must remain | Stage 31 regression anchor |
+| `try_split_recv_queued_plain_with_snapshot_locked` | (5) until QEMU smoke | live split; cap+wake+copy ordering |
+| `materialize_received_transfer_cap` | (2) move only with guard re-home | cap-mutation helper |
+| `materialize_received_message_cap` | (2) move only with guard re-home | cap mint/grant + reply-cap |
+| `materialize_received_message_cap_routed` | (2) move only with guard re-home | Stage 104-pinned D1/D5 router |
+| `complete_blocked_recv_for_waiter` | (5) until QEMU smoke | external caller + task→cap→vm→task order |
+| `IPC_RECV_META_V2_ENCODED_LEN` | (3) single definition stays | referenced from `ipc_recv_core` via `super::` |
+
+**What moved:** `encode_recv_v2_meta(opcode, payload_len, cap_id, recv_meta_flags,
+sender_tid) -> [u8; IPC_RECV_META_V2_ENCODED_LEN]`. It is a pure byte codec — no
+kernel state, no lock, no cap mutation, no reply-cap lifecycle, no user-memory
+copy, no VM mutation — and is byte-for-byte identical to the prior inline
+encoding. (The parallel inline encoders in `syscall/ipc.rs` and
+`kernel/recv_core.rs` are intentionally left untouched this stage; converging
+them onto this single definition is a future step.)
+
+**How the Stage 153 ordering proofs remain true:** the encoder is invoked at the
+identical point of the blocked-waiter path — after `materialize_received_message_cap_routed`
+and after the payload copy, immediately before the meta `copy_to_user` — so the
+copy-before-materialize-then-meta sequence, the rollback-on-meta-fault, the
+return-GPR zeroing, and the blocked-state clear are all unchanged. The encoder
+has no side effects, so it cannot perturb any lock, cap, or copy ordering. The
+queued-split path, the cap router, and the reply-cap lifecycle are not touched.
+
+**Why Option 3 (full re-home) was NOT chosen:** the cap/materialization cluster
+is classified (5) "must remain until QEMU smoke proves behavior." QEMU
+(`qemu-system-*`) is unavailable in this environment, so the byte-identical
+recv-v2 / reply-cap / split-recv delivery markers cannot be smoke-validated here.
+Re-homing the Stage 104-pinned router and the order-critical delivery functions
+without that proof would violate the Stage 153 finding. Those seams stay pinned.
+
+**Roadmap — future D1/D5 unlock (Stage 155+ candidate), in order:**
+
+1. With QEMU available: converge the `ipc.rs` and `recv_core.rs` inline recv-v2
+   encoders onto `ipc_recv_core::encode_recv_v2_meta` (still pure), smoke-proving
+   byte-identical delivery.
+2. Re-home the Stage 104 D1/D5 router + the `materialize_*` trio into
+   `ipc_recv_core.rs`, moving `IPC_RECV_META_V2_ENCODED_LEN`'s single definition
+   with them and updating the Stage 104/147/148/152/153 guards to enforce the new
+   ownership (not weaken it); re-point `boot/ipc_state.rs` and `runtime.rs`.
+3. Re-home `complete_blocked_recv_for_waiter` and the live split path last, each
+   gated on a QEMU smoke proving the recv-v2 / reply-cap / split-recv markers are
+   byte-identical before and after.
+
+Stage 154 hardens the current boundary with
+`boot::tests::stage154_ipc_recv_core_boundary`.
 
 ### 5.2 D1 audit — answers to the seven readiness questions
 

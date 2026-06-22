@@ -40930,17 +40930,34 @@ mod stage153_ipc_cap_boundary_audit {
         }
     }
 
-    // 10. Stage 153 is audit-only: it does NOT create syscall/ipc_recv_core.rs,
-    //     and syscall.rs does not declare `mod ipc_recv_core;`.
+    // 10. Stage 153 was audit-only. Stage 154 then DELIBERATELY created
+    //     syscall/ipc_recv_core.rs as a pure-helper scaffold (Option 2). This
+    //     guard is updated (per the hard-rule allowance) to an equally-strong
+    //     replacement: now that the module exists, it must NOT own dispatch and
+    //     must NOT absorb any stateful cap/materialization seam — only the pure
+    //     encoder. The detailed enforcement lives in stage154_*.
     #[test]
-    fn stage153_no_ipc_recv_core_module_created() {
+    fn stage153_ipc_recv_core_stays_pure_helper_only() {
+        const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
         assert!(
-            !SYSCALL_SRC.contains("mod ipc_recv_core;"),
-            "Stage 153 must not declare mod ipc_recv_core (audit-only stage)"
+            !IPC_RECV_CORE_SRC.contains("fn dispatch("),
+            "ipc_recv_core.rs must not define dispatch"
         );
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn materialize_received_message_cap(",
+            "fn materialize_received_message_cap_routed(",
+            "fn materialize_received_transfer_cap(",
+        ] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(def),
+                "ipc_recv_core.rs must not own stateful seam `{def}` \
+                 (Stage 154 moved only the pure recv-v2 encoder)"
+            );
+        }
         assert!(
-            !SYSCALL_SRC.contains("self::ipc_recv_core::"),
-            "Stage 153 must not delegate to a nonexistent ipc_recv_core module"
+            SYSCALL_SRC.contains("pub fn dispatch("),
+            "pub fn dispatch must remain in syscall.rs"
         );
     }
 
@@ -40998,5 +41015,252 @@ mod stage153_ipc_cap_boundary_audit {
             SYSCALL_SRC.contains("BLOCKER SUMMARY for ipc_recv_core.rs"),
             "syscall.rs Stage 153 note must state the ipc_recv_core.rs blocker summary"
         );
+    }
+}
+
+// Stage 154: D1/D5 cap-boundary migration scaffold — boundary guard tests.
+//
+// Stage 154 chose Option 2 (pure-helper move): it created
+// `syscall/ipc_recv_core.rs` and migrated ONLY the pure recv-v2 meta byte codec
+// (`encode_recv_v2_meta`). The stateful cap/materialization seams and
+// `complete_blocked_recv_for_waiter` remain pinned in `syscall.rs` (re-home
+// requires QEMU smoke proof, unavailable here). These guards lock that boundary
+// and prove the new module stays pure and never owns dispatch. They complement
+// the Stage 104/147/148/152/153 guards. See doc/KERNEL_UNLOCKING.md §5.1.2.
+mod stage154_ipc_recv_core_boundary {
+    // include_str! proves the module file exists (Option 2 outcome).
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_ABI_SRC: &str = include_str!("../syscall/ipc_abi.rs");
+    const CAP_SRC: &str = include_str!("../syscall/cap.rs");
+    const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
+    const HELPERS_SRC: &str = include_str!("../syscall/helpers.rs");
+    const INITRAMFS_SRC: &str = include_str!("../syscall/initramfs.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const RECV_SHARED_V3_SRC: &str = include_str!("../syscall/recv_shared_v3.rs");
+    const SCHED_SRC: &str = include_str!("../syscall/sched.rs");
+    const VM_SRC: &str = include_str!("../syscall/vm.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // Every module source that must NOT define IPC_RECV_META_V2_ENCODED_LEN as a
+    // const (single-definition invariant). ipc_recv_core.rs is included: it must
+    // only `use super::` the constant, never redefine it.
+    const NON_SYSCALL_SRCS: &[(&str, &str)] = &[
+        ("cap.rs", CAP_SRC),
+        ("debug.rs", DEBUG_SRC),
+        ("helpers.rs", HELPERS_SRC),
+        ("initramfs.rs", INITRAMFS_SRC),
+        ("ipc.rs", IPC_SRC),
+        ("ipc_abi.rs", IPC_ABI_SRC),
+        ("ipc_recv_core.rs", IPC_RECV_CORE_SRC),
+        ("process.rs", PROCESS_SRC),
+        ("recv_shared_v3.rs", RECV_SHARED_V3_SRC),
+        ("sched.rs", SCHED_SRC),
+        ("vm.rs", VM_SRC),
+    ];
+
+    // 1. ipc_recv_core.rs exists (Option 2) and is declared in syscall.rs, and it
+    //    holds the migrated pure encoder.
+    #[test]
+    fn stage154_module_exists_and_declared() {
+        assert!(
+            SYSCALL_SRC.contains("mod ipc_recv_core;"),
+            "syscall.rs must declare `mod ipc_recv_core;`"
+        );
+        assert!(
+            IPC_RECV_CORE_SRC.contains("pub(super) fn encode_recv_v2_meta("),
+            "ipc_recv_core.rs must define the migrated pure encode_recv_v2_meta"
+        );
+        assert!(
+            SYSCALL_SRC.contains("self::ipc_recv_core::encode_recv_v2_meta("),
+            "syscall.rs blocked-waiter path must call the migrated encoder"
+        );
+        // The inline encoding must be gone from syscall.rs (no duplicate codec).
+        assert!(
+            !SYSCALL_SRC.contains("meta[8..10].copy_from_slice(&app_opcode"),
+            "the inline recv-v2 meta encoding must be removed from syscall.rs"
+        );
+    }
+
+    // 2. ipc_recv_core.rs does not define dispatch (no dispatch ownership).
+    #[test]
+    fn stage154_module_does_not_define_dispatch() {
+        assert!(
+            !IPC_RECV_CORE_SRC.contains("fn dispatch("),
+            "ipc_recv_core.rs must not define any dispatch function"
+        );
+    }
+
+    // 3. syscall.rs still owns pub fn dispatch.
+    #[test]
+    fn stage154_dispatch_stays_in_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub fn dispatch("),
+            "pub fn dispatch must remain in syscall.rs"
+        );
+    }
+
+    // 4/5. Counts unchanged.
+    #[test]
+    fn stage154_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[(); SYSCALL_COUNT] = [(); 31]"),
+            "compile-time SYSCALL_COUNT==31 assertion must remain"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 6. IPC_RECV_META_V2_ENCODED_LEN has exactly one definition (in syscall.rs);
+    //    ipc_recv_core.rs only references it via `use super::`.
+    #[test]
+    fn stage154_recv_meta_len_single_definition() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "the single IPC_RECV_META_V2_ENCODED_LEN definition must stay in syscall.rs"
+        );
+        for (name, src) in NON_SYSCALL_SRCS {
+            assert!(
+                !src.contains("const IPC_RECV_META_V2_ENCODED_LEN"),
+                "{name} must not define IPC_RECV_META_V2_ENCODED_LEN (single definition)"
+            );
+        }
+        assert!(
+            IPC_RECV_CORE_SRC.contains("use super::IPC_RECV_META_V2_ENCODED_LEN"),
+            "ipc_recv_core.rs must reference the constant via `use super::`, not redefine it"
+        );
+    }
+
+    // 7. Stage 153 ordering proof note remains in syscall.rs.
+    #[test]
+    fn stage154_stage153_ordering_note_remains() {
+        assert!(
+            SYSCALL_SRC.contains("Stage 153: D1/D5 IPC/cap seam ownership/order proof"),
+            "the Stage 153 ownership/order proof note must remain in syscall.rs"
+        );
+    }
+
+    // 8/9/10/11. The module doc records the load-bearing orderings and lifecycles.
+    #[test]
+    fn stage154_module_documents_orderings() {
+        // Blocked-waiter copy-before-materialize.
+        assert!(
+            IPC_RECV_CORE_SRC.contains("copy-BEFORE-materialize"),
+            "ipc_recv_core.rs must document blocked-waiter copy-before-materialize ordering"
+        );
+        // Queued-split materialize-before-copy + wake ordering.
+        assert!(
+            IPC_RECV_CORE_SRC.contains("materialize-BEFORE-copy"),
+            "ipc_recv_core.rs must document queued-split materialize-before-copy ordering"
+        );
+        assert!(
+            IPC_RECV_CORE_SRC.contains("apply sender wake"),
+            "ipc_recv_core.rs must document the queued-split sender-wake ordering"
+        );
+        // Reply-cap one-shot semantics.
+        assert!(
+            IPC_RECV_CORE_SRC.contains("one-shot"),
+            "ipc_recv_core.rs must document reply-cap one-shot lifecycle"
+        );
+        // Rollback semantics.
+        assert!(
+            IPC_RECV_CORE_SRC.contains("Rollback rules"),
+            "ipc_recv_core.rs must document rollback semantics"
+        );
+    }
+
+    // 12. D6/CR3/PF diagnostic markers remain.
+    #[test]
+    fn stage154_d6_cr3_pf_markers_remain() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "syscall.rs must retain VALIDATION: LIVE_OFF_TRAP"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "syscall.rs must retain VALIDATION: GLOBAL_LOCK_SLOW_PATH"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "arch/trap_entry.rs must retain the D6 controlled-switch proof marker"
+        );
+    }
+
+    // 13. ipc_recv_core.rs (and ipc_abi.rs) remain pure: no cap mutation, no IPC
+    //     lock, no reply-cap lifecycle, no user copy, no VM mutation. The module
+    //     docs are allowed to *name* these APIs to describe the future
+    //     migration, so we forbid the CALL form (`name(`) — an actual side
+    //     effect — for the function-style APIs, and the bare lock name.
+    #[test]
+    fn stage154_recv_core_and_ipc_abi_remain_pure() {
+        // Call-form forbidden: a parenthesized call is a real side effect.
+        for forbidden_call in &[
+            "materialize_received_message_cap(",
+            "set_reply_cap_waiter_cap(",
+            "rollback_materialized_recv_cap(",
+            "mint_capability_in_cnode(",
+            "grant_task_to_task_with_rights(",
+            "copy_to_user(",
+            "map_shared_region(",
+        ] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(forbidden_call),
+                "ipc_recv_core.rs must remain pure: must not CALL `{forbidden_call}`"
+            );
+            assert!(
+                !IPC_ABI_SRC.contains(forbidden_call),
+                "ipc_abi.rs must remain pure: must not CALL `{forbidden_call}`"
+            );
+        }
+        // Lock acquisition: the lock name must not appear at all.
+        assert!(
+            !IPC_RECV_CORE_SRC.contains("ipc_state_lock"),
+            "ipc_recv_core.rs must not reference ipc_state_lock"
+        );
+        assert!(
+            !IPC_ABI_SRC.contains("ipc_state_lock"),
+            "ipc_abi.rs must not reference ipc_state_lock"
+        );
+    }
+
+    // 14. ipc.rs remains the stateful IPC implementation owner.
+    #[test]
+    fn stage154_ipc_module_remains_stateful_owner() {
+        assert!(
+            IPC_SRC.contains("implementation module only"),
+            "ipc.rs must keep its stateful-IPC implementation-only boundary doc"
+        );
+    }
+
+    // 15. syscall.rs remains the seam owner: this stage re-homed only a PURE
+    //     helper, so every stateful cap/materialization seam still lives in
+    //     syscall.rs and NOT in ipc_recv_core.rs.
+    #[test]
+    fn stage154_stateful_seams_still_pinned_in_syscall_rs() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn materialize_received_message_cap(",
+            "fn materialize_received_message_cap_routed(",
+            "fn materialize_received_transfer_cap(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain defined in syscall.rs"
+            );
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(def),
+                "Stage 154 must NOT move stateful seam `{def}` into ipc_recv_core.rs"
+            );
+        }
     }
 }
