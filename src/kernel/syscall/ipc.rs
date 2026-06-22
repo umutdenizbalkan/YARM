@@ -1256,9 +1256,16 @@ fn handle_ipc_recv_result_with_empty_error(
                             is_reply,
                         );
                         let _ = encode_transfer_cap_ret(frame, None);
+                        // Stage 156 IPC oracle: rollback on immediate meta-copy fault.
+                        crate::yarm_log!(
+                            "IPC_RECV_V2_ROLLBACK_OK site=immediate_meta reply={}",
+                            is_reply
+                        );
                     }
                     return Err(SyscallError::from(copy_err));
                 }
+                // Stage 156 IPC oracle: immediate full-recv recv-v2 meta delivered.
+                crate::yarm_log!("IPC_RECV_V2_META_IMMEDIATE_OK len=40");
             }
 
             if current_task_has_user_asid(kernel)? {

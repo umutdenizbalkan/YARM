@@ -515,6 +515,12 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             if let Some(materialized) = recv_local_transfer {
                 let is_reply = (msg.flags & Message::FLAG_REPLY_CAP) != 0;
                 kernel.rollback_materialized_recv_cap(waiter_tid, CapId(materialized), is_reply);
+                // Stage 156 IPC oracle: rollback on blocked-waiter meta-copy fault.
+                crate::yarm_log!(
+                    "IPC_RECV_V2_ROLLBACK_OK site=blocked_meta tid={} reply={}",
+                    waiter_tid,
+                    is_reply
+                );
             }
             return Err(SyscallError::InvalidArgs);
         }
@@ -543,6 +549,11 @@ pub(crate) fn complete_blocked_recv_for_waiter(
         waiter_tid
     );
     crate::yarm_log!("IPC_RECV_BLOCKED_COMPLETE tid={}", waiter_tid);
+    // Stage 156 IPC oracle: blocked-waiter recv-v2 meta (40 bytes) delivered.
+    crate::yarm_log!(
+        "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+        waiter_tid
+    );
     Ok(())
 }
 
@@ -570,6 +581,12 @@ fn materialize_received_transfer_cap(
             source_capability.rights(),
         )
         .map_err(SyscallError::from)?;
+    // Stage 156 IPC oracle: transfer-cap grant materialized into the receiver.
+    crate::yarm_log!(
+        "IPC_TRANSFER_CAP_MATERIALIZE_OK receiver_tid={} local_cap={}",
+        receiver_tid,
+        derived.0
+    );
     Ok(Some(derived.0))
 }
 
@@ -692,6 +709,13 @@ pub(super) fn materialize_received_message_cap(
         kernel.set_reply_cap_waiter_cap(reply_index, reply_generation, minted);
         crate::yarm_log!(
             "IPC_RECV_REPLY_CAP_MATERIALIZE_OK waiter_tid={} local_reply_cap={}",
+            receiver_tid,
+            minted.0
+        );
+        // Stage 156 IPC oracle: reply-cap one-shot minted + recorded for the
+        // exact-slot fast-revoke that ipc_reply performs on consumption.
+        crate::yarm_log!(
+            "IPC_REPLY_CAP_ONESHOT_OK waiter_tid={} local_reply_cap={}",
             receiver_tid,
             minted.0
         );
@@ -1149,6 +1173,12 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
             // ipc_state_lock already released; scheduler lock (rank 1) is safe.
             if let RecvSchedulerWakePlan::WakeSender(wake_tid) = delivery.scheduler {
                 let _ = kernel.apply_split_sender_wake_plan(wake_tid);
+                // Stage 156 IPC oracle: sender wake applied BEFORE user writeback
+                // (queued split recv ordering, §56).
+                crate::yarm_log!(
+                    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK wake_tid={} phase=before_writeback",
+                    wake_tid.0
+                );
             }
 
             match delivery.writeback {
@@ -1209,6 +1239,8 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                             frame.set_ok(0, payload_len, frame.ret2());
                             crate::yarm_log!("YARM_RECV_CORE_LIVE kind=user_plain_v2");
                             crate::yarm_log!("YARM_RECV_CORE_V2_WRITEBACK result=ok");
+                            // Stage 156 IPC oracle: queued-split recv-v2 meta delivered.
+                            crate::yarm_log!("IPC_RECV_V2_META_QUEUED_SPLIT_OK len=40");
                         }
                         RecvV2WritebackOutcome::PayloadUndersized => {
                             // Stage 42+43: rollback materialized cap (matches full path §58).
@@ -1222,6 +1254,11 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                                     is_reply_cap,
                                 );
                                 let _ = encode_transfer_cap_ret(frame, None);
+                                // Stage 156 IPC oracle: rollback on queued-split undersize.
+                                crate::yarm_log!(
+                                    "IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize reply={}",
+                                    is_reply_cap
+                                );
                             }
                             return Some(Err(TrapHandleError::Syscall(SyscallError::InvalidArgs)));
                         }
@@ -1235,6 +1272,11 @@ pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked(
                                     is_reply_cap,
                                 );
                                 let _ = encode_transfer_cap_ret(frame, None);
+                                // Stage 156 IPC oracle: rollback on queued-split meta fault.
+                                crate::yarm_log!(
+                                    "IPC_RECV_V2_ROLLBACK_OK site=queued_split_meta reply={}",
+                                    is_reply_cap
+                                );
                             }
                             return Some(Err(TrapHandleError::Syscall(SyscallError::PageFault)));
                         }
