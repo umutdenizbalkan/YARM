@@ -840,7 +840,8 @@ fn rpi5_hh4_retires_low_ttbr0_and_hh5_defers_without_eret() {
     assert!(!boot.contains("RPI5_HH5_FIRST_USER_TRAP"));
     assert!(!hh45.contains("yarm_log!"));
     assert!(!hh45.contains("printk"));
-    assert!(!hh45.contains("scheduler"));
+    // No scheduler is *started* (a deferral reason/comment may name it).
+    assert!(!hh45.contains("start_scheduler"));
     assert!(!hh45.contains("init_gic"));
     assert!(!hh45.contains("init_rp1"));
     assert!(!hh45.contains("init_pcie"));
@@ -1011,17 +1012,17 @@ fn rpi5_hh5_bridge_uses_high_aliases_and_defers_without_eret() {
         "printk",
         "panic!",
         "unwrap()",
-        "scheduler",
     ] {
         assert!(!hh5.contains(forbidden), "HH5 bridge added {forbidden}");
     }
 
-    // Deferral remains explicit and precise (no silent hang). BOOT-4 builds a
-    // high-half kernel heap region + validates the VM, then defers at the global
-    // allocator's low-direct-map dependency (not the old generic blocker).
+    // Deferral remains explicit and precise (no silent hang). BOOT-4 now wires
+    // the global allocator to the high-half heap and defers at the scheduler/IRQ
+    // bring-up (not the older generic / low-direct-map blockers).
     assert!(!hh5.contains("normal_kernel_entry_requires_low_allocator"));
     assert!(!hh5.contains("kernel_bootstrap_requires_global_heap_and_full_vm"));
-    assert!(hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
+    assert!(!hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
+    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
     assert!(hh5.contains("initrd_missing"));
 
     // Build + fixture validators require the new HH5 markers.
@@ -1260,7 +1261,7 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
     assert!(hh5.contains("0x8000_0000"));
 
     // Precise deferral; still no userspace, no subsystem starts, no ERET.
-    assert!(hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
+    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1277,7 +1278,6 @@ fn rpi5_hh5_normal_kernel_entry_bridge_is_high_half_safe_and_defers_precisely() 
         "unwrap()",
         "yarm_log!",
         "printk",
-        "scheduler",
     ] {
         assert!(!hh5.contains(forbidden), "bridge added {forbidden}");
     }
@@ -1334,7 +1334,7 @@ fn rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely() {
     // Task D: KernelState is NOT constructed; deferral is precise and there is no
     // userspace entry, no user TTBR0 install, no EL0 ERET, no big stack array, no
     // by-value allocator, and no premature subsystem start.
-    assert!(hh5.contains("kernel_state_requires_global_allocator_low_direct_map"));
+    assert!(hh5.contains("kernel_state_requires_scheduler_init"));
     assert!(!hh5.contains("RPI5_ENTER_USER_ERET"));
     assert!(!hh5.contains("core::arch::asm!(\"eret\""));
     assert!(!hh5.contains("\"msr TTBR0_EL1, x"));
@@ -1354,8 +1354,69 @@ fn rpi5_boot4_builds_high_half_heap_and_vm_then_defers_precisely() {
         "expect(",
         "yarm_log!",
         "printk",
-        "scheduler",
     ] {
         assert!(!hh5.contains(forbidden), "BOOT4 bridge added {forbidden}");
+    }
+}
+
+#[test]
+fn rpi5_boot4_physmap_bridge_is_gated_and_preserves_default_identity() {
+    let allocator = include_str!("../src/kernel/global_allocator.rs");
+    let boot = include_str!("../src/arch/aarch64/boot.rs");
+    let build = include_str!("../scripts/build-rpi5-highhalf-artifact.sh");
+
+    // The gated direct-map offset exists only under the rpi5-highhalf feature,
+    // defaults to identity (0), and is read by phys_to_ptr/ptr_to_phys on the
+    // gated branch only. The default AArch64/RISC-V branch is pure identity.
+    assert!(allocator.contains("#[cfg(feature = \"rpi5-highhalf\")]"));
+    assert!(allocator.contains("static HIGHMAP_OFFSET: core::sync::atomic::AtomicU64"));
+    assert!(allocator.contains("AtomicU64::new(0)"));
+    assert!(allocator.contains("pub fn set_highmap_offset(offset: u64)"));
+    assert!(
+        allocator.contains("#[cfg(all(target_arch = \"aarch64\", feature = \"rpi5-highhalf\"))]")
+    );
+    // Default/QEMU path keeps identity phys_to_ptr / ptr_to_phys.
+    assert!(allocator.contains("return phys as usize as *mut u8;"));
+    assert!(allocator.contains("return ptr as usize as u64;"));
+    // The offset is applied only via the gated wrapping_add path, never as an
+    // unconditional semantic change.
+    assert!(allocator.contains("phys.wrapping_add(off)"));
+
+    // BOOT-4 switches the offset to HH_VA_OFFSET only after VM_OK and wires the
+    // global allocator to the high-half heap, proving a high-half allocation.
+    let start = boot
+        .find("fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> !")
+        .unwrap();
+    let end = boot[start..]
+        .find("extern \"C\" fn yarm_rpi5_hh_rust_continue")
+        .map(|o| o + start)
+        .unwrap();
+    let hh5 = &boot[start..end];
+    assert!(hh5.contains("set_highmap_offset(RPI5_HH_VA_OFFSET)"));
+    assert!(hh5.contains("rpi5_hh_init_pt_allocator_single_region("));
+    assert!(hh5.contains("GlobalAlloc::alloc("));
+    // Probe proves the returned pointer is a high-half alias, not a low VA.
+    assert!(hh5.contains("probe_va < RPI5_HH_VA_OFFSET"));
+    assert!(hh5.contains("GALLOC_PROBE_SENTINEL"));
+
+    // Markers exist in source and are required by the image validator.
+    for marker in [
+        "RPI5_BOOT4_PHYSMAP_AUDIT_BEGIN",
+        "RPI5_BOOT4_PHYSMAP_AUDIT_DONE",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE phys=0x",
+        "RPI5_KERNEL_PHYSMAP_SWITCH_BEGIN",
+        "RPI5_KERNEL_PHYSMAP_SWITCH_OK offset=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PHYSMAP_OK",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_BEGIN",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_OK ptr=0x",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK",
+        "RPI5_KERNEL_GLOBAL_ALLOCATOR_FAILED reason=",
+    ] {
+        assert!(boot.contains(marker), "boot omits physmap marker {marker}");
+        assert!(
+            build.contains(marker),
+            "build omits physmap marker {marker}"
+        );
     }
 }

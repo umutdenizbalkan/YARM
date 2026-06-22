@@ -1815,6 +1815,105 @@ rpi5_hh_retained_marker!(
     RPI5_KERNEL_VM_FAILED_MARKER,
     b"RPI5_KERNEL_VM_FAILED reason="
 );
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT4_PHYSMAP_AUDIT_BEGIN_MARKER,
+    b"RPI5_BOOT4_PHYSMAP_AUDIT_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_BOOT4_PHYSMAP_AUDIT_DONE_MARKER,
+    b"RPI5_BOOT4_PHYSMAP_AUDIT_DONE"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE phys=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_PHYSMAP_SWITCH_BEGIN_MARKER,
+    b"RPI5_KERNEL_PHYSMAP_SWITCH_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_PHYSMAP_SWITCH_OK_MARKER,
+    b"RPI5_KERNEL_PHYSMAP_SWITCH_OK offset=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PHYSMAP_OK_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PHYSMAP_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_BEGIN_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_BEGIN"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_OK_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_OK ptr=0x"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK"
+);
+#[cfg(all(
+    not(feature = "hosted-dev"),
+    target_arch = "aarch64",
+    feature = "rpi5-highhalf"
+))]
+rpi5_hh_retained_marker!(
+    RPI5_KERNEL_GLOBAL_ALLOCATOR_FAILED_MARKER,
+    b"RPI5_KERNEL_GLOBAL_ALLOCATOR_FAILED reason="
+);
 // Devicetree reference names compared via raw-pointer reads (no anonymous
 // literals, no slice iterators) so the lookup stays on the proven HH path.
 #[cfg(all(
@@ -3614,19 +3713,132 @@ fn rpi5_hh5_bridge(hh4: Rpi5Hh4Ready) -> ! {
         rpi5_hh_halt();
     }
 
+    // ============ BOOT-4 phys<->virt direct-map bridge for the allocator ======
+    macro_rules! galloc_fail {
+        ($reason:literal) => {{
+            let _ = rpi5_hh_write_bytes(&RPI5_KERNEL_GLOBAL_ALLOCATOR_FAILED_MARKER);
+            let _ = rpi5_hh_write_line($reason);
+            let _ = rpi5_hh_write_bytes(&RPI5_BOOT4_FAULT_BOUNDARY_MARKER);
+            let _ = rpi5_hh_write_line(b"global_allocator");
+            rpi5_hh_halt()
+        }};
+    }
+
     /*
-     * Task D — KernelState is intentionally NOT constructed.
+     * Task A — phys<->virt direct-map audit.
      *
-     * A high-alias-only kernel heap region now exists and the high-half VM is
-     * validated, but `KernelState` construction allocates through the global
-     * allocator, whose AArch64 frame->pointer conversion still assumes the low
-     * identity direct map HH4 retired (see the audit above). Building it here
-     * would dereference an unmapped low VA. Defer precisely before any
-     * allocation: no scheduling, GIC, RP1, PCIe, service chain, user TTBR0, or
-     * EL0 ERET. The next milestone is an arch-owned high-half direct map that
-     * backs the global allocator with this region.
+     * The kernel global allocator draws frames from PT_FRAME_ALLOCATOR and maps
+     * each to a pointer via `phys_to_ptr`, which on default AArch64/QEMU is the
+     * low identity map (`phys`). HH4 retired that map. The gated
+     * `rpi5-highhalf` build adds a runtime HIGHMAP_OFFSET to `phys_to_ptr` /
+     * `ptr_to_phys` (0 == identity by default, so QEMU/default behavior is
+     * unchanged); BOOT-4 sets it to HH_VA_OFFSET only here, after HH4 + the VM
+     * validation above. The PT allocator is then seeded leanly over the
+     * high-half kernel heap region so the global allocator's frames live inside
+     * the TTBR1 high map.
      */
-    hh5_defer!(b"kernel_state_requires_global_allocator_low_direct_map");
+    if !rpi5_hh_write_line(&RPI5_BOOT4_PHYSMAP_AUDIT_BEGIN_MARKER)
+        || !rpi5_hh_write_line(&RPI5_BOOT4_PHYSMAP_AUDIT_DONE_MARKER)
+    {
+        rpi5_hh_halt();
+    }
+
+    // Task C — wire the global allocator to the BOOT-4 high-half heap region.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    // Seed PT_FRAME_ALLOCATOR (the global allocator's frame source) leanly over
+    // the kernel heap region's PHYSICAL range; this also makes the normal
+    // `ensure_pt_allocator_initialized` (which logs and re-materializes the big
+    // arrays) a no-op. The HH5 boot-probe allocator that covers the full window
+    // is dormant after its probe, so there is no live double-ownership.
+    if crate::kernel::frame_allocator::rpi5_hh_init_pt_allocator_single_region(
+        kheap_phys_start,
+        KERNEL_HEAP_SIZE,
+    )
+    .is_err()
+    {
+        galloc_fail!(b"pt_allocator_init");
+    }
+    hh5_emit_marker!(RPI5_KERNEL_GLOBAL_ALLOCATOR_HEAP_RANGE_MARKER);
+    hh5_emit_hex!(kheap_phys_start);
+    hh5_emit_marker!(RPI5_HH5_ALLOC_BRIDGE_VIRT_SEP_MARKER);
+    hh5_emit_hex!(kheap_virt_start);
+    hh5_emit_marker!(RPI5_HH5_ALLOC_BRIDGE_SIZE_SEP_MARKER);
+    hh5_emit_hex!(KERNEL_HEAP_SIZE);
+    hh5_crlf!();
+
+    // Switch the gated direct-map offset to the high alias.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_PHYSMAP_SWITCH_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    crate::kernel::global_allocator::set_highmap_offset(RPI5_HH_VA_OFFSET);
+    let installed_offset = crate::kernel::global_allocator::highmap_offset();
+    if installed_offset != RPI5_HH_VA_OFFSET {
+        galloc_fail!(b"physmap_switch");
+    }
+    hh5_hex_line!(RPI5_KERNEL_PHYSMAP_SWITCH_OK_MARKER, installed_offset);
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PHYSMAP_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    // Probe: allocate one small object through the real kernel global allocator
+    // (the path Box/Vec use). Prove the returned pointer is a high-half alias
+    // inside the kernel heap region, write/read a sentinel, then deliberately
+    // leak it — the allocator free path clones the ~209 KiB allocator under a
+    // lock and is intentionally not exercised at this bring-up stage.
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_BEGIN_MARKER) {
+        rpi5_hh_halt();
+    }
+    let probe_layout = match core::alloc::Layout::from_size_align(64, 16) {
+        Ok(layout) => layout,
+        Err(_) => {
+            galloc_fail!(b"probe_layout");
+            #[allow(unreachable_code)]
+            core::alloc::Layout::new::<u64>()
+        }
+    };
+    let probe_ptr = unsafe {
+        core::alloc::GlobalAlloc::alloc(
+            &crate::kernel::global_allocator::KERNEL_GLOBAL_ALLOCATOR,
+            probe_layout,
+        )
+    };
+    if probe_ptr.is_null() {
+        galloc_fail!(b"probe_null");
+    }
+    let probe_va = probe_ptr as u64;
+    if probe_va < RPI5_HH_VA_OFFSET
+        || probe_va < kheap_virt_start
+        || probe_va >= kheap_virt_start + KERNEL_HEAP_SIZE
+    {
+        galloc_fail!(b"probe_low_va");
+    }
+    const GALLOC_PROBE_SENTINEL: u64 = 0x5250_4935_4741_4c31; // "RPI5GAL1"
+    unsafe {
+        core::ptr::write_volatile(probe_ptr as *mut u64, GALLOC_PROBE_SENTINEL);
+    }
+    let probe_rb = unsafe { core::ptr::read_volatile(probe_ptr as *const u64) };
+    if probe_rb != GALLOC_PROBE_SENTINEL {
+        galloc_fail!(b"probe_readback");
+    }
+    hh5_hex_line!(RPI5_KERNEL_GLOBAL_ALLOCATOR_PROBE_OK_MARKER, probe_va);
+    if !rpi5_hh_write_line(&RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK_MARKER) {
+        rpi5_hh_halt();
+    }
+
+    /*
+     * Task D — KernelState is intentionally NOT constructed yet.
+     *
+     * The kernel global allocator now hands out high-half memory (proven above),
+     * so heap allocation works. But `KernelState` bootstrap brings up the
+     * scheduler, per-CPU state, thread/IPC/capability tables, and the trap/IRQ
+     * model — none of which are initialized on this UART-only high-half path, and
+     * which the hard constraints forbid starting here. Defer precisely before
+     * touching them: no scheduler/SMP/GIC/RP1/PCIe/driver start, no user TTBR0,
+     * no EL0 ERET. The next milestone wires the scheduler/IRQ subsystem.
+     */
+    hh5_defer!(b"kernel_state_requires_scheduler_init");
 }
 
 #[cfg(all(

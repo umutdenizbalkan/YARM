@@ -78,6 +78,33 @@ mod non_hosted {
     static SLAB_CLASS_LOCK_7: SpinLockIrq<u64> = SpinLockIrq::new(0);
     static LARGE_ALLOC_LOCK: SpinLockIrq<()> = SpinLockIrq::new(());
 
+    // RPi5 high-half phys<->virt direct-map offset (Task B, gated).
+    //
+    // Default AArch64/QEMU keeps `phys_to_ptr(phys) = phys` (low identity direct
+    // map) — see `phys_to_ptr` below. The RPi5 HH4 transition retires that low
+    // identity map, so after it the kernel must reach allocator frames through
+    // the TTBR1 high alias (`phys + HH_VA_OFFSET`). To avoid any change to the
+    // default/QEMU path, this offset only exists and is only consulted under the
+    // `rpi5-highhalf` feature. It starts at 0 (identity — correct during low/
+    // early boot before HH4) and is switched to HH_VA_OFFSET exactly once, after
+    // HH4 + high-half VM validation, via `set_highmap_offset`.
+    #[cfg(feature = "rpi5-highhalf")]
+    static HIGHMAP_OFFSET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+    /// RPi5-highhalf-only: install the phys->virt direct-map offset used by the
+    /// kernel global allocator after HH4 retires the low identity map. 0 means
+    /// identity (default).
+    #[cfg(feature = "rpi5-highhalf")]
+    pub fn set_highmap_offset(offset: u64) {
+        HIGHMAP_OFFSET.store(offset, core::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// RPi5-highhalf-only: read the current direct-map offset (0 == identity).
+    #[cfg(feature = "rpi5-highhalf")]
+    pub fn highmap_offset() -> u64 {
+        HIGHMAP_OFFSET.load(core::sync::atomic::Ordering::SeqCst)
+    }
+
     #[derive(Clone, Copy)]
     pub struct KernelGlobalAllocator;
 
@@ -112,7 +139,19 @@ mod non_hosted {
             // on these ports, not a proven direct-map offset for every allocator frame.
             // Future higher-half ports should provide an arch-owned phys<->kernel-virt helper
             // and update this conversion together with the corresponding bootstrap mappings.
-            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            //
+            // RPi5 high-half is exactly such a port: gated by `rpi5-highhalf`, it adds the
+            // runtime HIGHMAP_OFFSET (0 == identity by default, HH_VA_OFFSET after HH4). The
+            // default/QEMU AArch64 build keeps pure identity below.
+            #[cfg(all(target_arch = "aarch64", feature = "rpi5-highhalf"))]
+            {
+                let off = HIGHMAP_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+                return phys.wrapping_add(off) as usize as *mut u8;
+            }
+            #[cfg(all(
+                any(target_arch = "aarch64", target_arch = "riscv64"),
+                not(all(target_arch = "aarch64", feature = "rpi5-highhalf"))
+            ))]
             {
                 return phys as usize as *mut u8;
             }
@@ -136,7 +175,16 @@ mod non_hosted {
                 return (ptr as usize as u64)
                     .saturating_sub(platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE);
             }
-            #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+            // RPi5 high-half: invert the gated HIGHMAP_OFFSET (0 == identity).
+            #[cfg(all(target_arch = "aarch64", feature = "rpi5-highhalf"))]
+            {
+                let off = HIGHMAP_OFFSET.load(core::sync::atomic::Ordering::Relaxed);
+                return (ptr as usize as u64).wrapping_sub(off);
+            }
+            #[cfg(all(
+                any(target_arch = "aarch64", target_arch = "riscv64"),
+                not(all(target_arch = "aarch64", feature = "rpi5-highhalf"))
+            ))]
             {
                 return ptr as usize as u64;
             }
@@ -645,6 +693,8 @@ pub use hosted::KernelGlobalAllocator;
 pub use non_hosted::KERNEL_GLOBAL_ALLOCATOR;
 #[cfg(not(feature = "hosted-dev"))]
 pub use non_hosted::KernelGlobalAllocator;
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-highhalf"))]
+pub use non_hosted::{highmap_offset, set_highmap_offset};
 
 #[cfg(all(test, feature = "hosted-dev"))]
 mod hosted_dev_allocator_model_tests {

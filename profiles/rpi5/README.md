@@ -39,11 +39,14 @@ the bridge now brings up a **real high-half physical-frame allocator** in the
 TTBR1-mapped HH heap plus a boot-info record (`RPI5_HH5_ALLOC_ADAPTER_OK`,
 `RPI5_KERNEL_PMEM_OK`, `RPI5_KERNEL_BOOTINFO_OK`), and BOOT-4 then builds a
 high-alias-only kernel heap region and re-validates the high-half VM
-(`RPI5_KERNEL_GLOBAL_HEAP_OK`, `RPI5_KERNEL_VM_OK`). The remaining blocker is now
-narrowed: the AArch64 global allocator reaches frames through the low identity
-direct map HH4 retired, so `KernelState` cannot allocate yet
-(`RPI5_HH5_DEFERRED reason=kernel_state_requires_global_allocator_low_direct_map`,
-or `reason=initrd_missing` when no initrd is present). This still needs a hardware
+(`RPI5_KERNEL_GLOBAL_HEAP_OK`, `RPI5_KERNEL_VM_OK`). BOOT-4 then installs a gated
+high-half phys↔virt direct-map offset (default identity for QEMU/non-RPi5) and
+wires the kernel global allocator to the high-half heap, proving a real
+high-half allocation (`RPI5_KERNEL_PHYSMAP_SWITCH_OK`,
+`RPI5_KERNEL_GLOBAL_ALLOCATOR_HIGHMAP_OK`). The remaining blocker is now narrowed
+to the scheduler/IRQ subsystem that `KernelState` bootstrap needs
+(`RPI5_HH5_DEFERRED reason=kernel_state_requires_scheduler_init`, or
+`reason=initrd_missing` when no initrd is present). This still needs a hardware
 run to confirm. See `doc/RPI5_BRINGUP.md` and
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 

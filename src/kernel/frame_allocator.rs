@@ -1106,6 +1106,27 @@ pub fn init_pt_frame_allocator(regions: &[MemoryRegion]) -> Result<(), FrameAllo
     PT_FRAME_ALLOCATOR.lock().init_from_memory_map(regions)
 }
 
+/// RPi5-highhalf-only: initialize the shared PT frame allocator (the kernel
+/// global allocator's frame source) in place over a single high-half-safe
+/// region, using the lean `init_single_region_assume_zeroed` path. This avoids
+/// both the ~196 KiB array re-materialization and the `yarm_log!` calls of
+/// `ensure_pt_allocator_initialized`/`init_from_memory_map`, neither of which is
+/// safe in the early high-half bring-up. The static is `new_uninit()` (all-zero)
+/// until the first allocation, which the assume-zeroed contract requires;
+/// pre-initializing it here also makes `ensure_pt_allocator_initialized` a no-op
+/// (it early-returns on `initialized`). Idempotent.
+#[cfg(all(not(feature = "hosted-dev"), feature = "rpi5-highhalf"))]
+pub fn rpi5_hh_init_pt_allocator_single_region(
+    start_phys: u64,
+    len: u64,
+) -> Result<(), FrameAllocError> {
+    let mut guard = PT_FRAME_ALLOCATOR.lock();
+    if guard.initialized {
+        return Ok(());
+    }
+    guard.init_single_region_assume_zeroed(start_phys, len)
+}
+
 pub fn alloc_pt_frame() -> Result<u64, FrameAllocError> {
     ensure_pt_allocator_initialized()?;
     let mut guard = PT_FRAME_ALLOCATOR.lock();
