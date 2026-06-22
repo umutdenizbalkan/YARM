@@ -51,8 +51,22 @@ ORACLE_SNAPSHOT="${ORACLE_SNAPSHOT:-ipc-oracle-markers-$ARCH.txt}"
 #                         LIVE D1/D5 split path that every spawn cycle drives.
 ORACLE_MODE="${ORACLE_MODE:-basic}"
 
+# Stage 159BC/D — userspace IPC recv-v2 oracle proof workload (default-off).
+# When the kernel is booted with `yarm.ipc_recv_proof=1`, the init control-plane
+# runs a deterministic loopback workload (send-to-self enqueue + recv-from-self
+# drain) that drives specific kernel recv-v2 delivery markers. These per-subtest
+# requirements are OFF by default and enabled independently; a requirement is
+# only checked when its knob is set (the boot must actually have been launched
+# with the proof knob for them to appear). Each maps a userspace "DONE" marker
+# (proof workload claims the trigger) to the kernel marker it must produce.
+YARM_IPC_RECV_PROOF_QUEUED_SPLIT="${YARM_IPC_RECV_PROOF_QUEUED_SPLIT:-0}"
+YARM_IPC_RECV_PROOF_ROLLBACK="${YARM_IPC_RECV_PROOF_ROLLBACK:-0}"
+YARM_IPC_RECV_PROOF_SENDER_WAKE="${YARM_IPC_RECV_PROOF_SENDER_WAKE:-0}"
+
 # Healthy-delivery success markers (Stage 156). Not all fire on every boot, so
 # only the "at least one recv-v2 meta delivered" invariant is hard-required.
+# The IPC_RECV_PROOF_*_DONE markers (Stage 159BC/D) are emitted by the userspace
+# proof workload and recorded here so the snapshot reflects what it claimed.
 ORACLE_MARKERS=(
   "IPC_RECV_V2_META_BLOCKED_WAITER_OK"
   "IPC_RECV_V2_META_IMMEDIATE_OK"
@@ -61,6 +75,9 @@ ORACLE_MARKERS=(
   "IPC_TRANSFER_CAP_MATERIALIZE_OK"
   "IPC_RECV_V2_ROLLBACK_OK"
   "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
+  "IPC_RECV_PROOF_QUEUED_SPLIT_DONE"
+  "IPC_RECV_PROOF_ROLLBACK_DONE"
+  "IPC_RECV_PROOF_SENDER_WAKE_DONE"
 )
 
 # At least one recv-v2 meta delivery marker must appear on a healthy boot.
@@ -167,6 +184,50 @@ if [[ "$ORACLE_MODE" == "extended" ]]; then
 elif [[ "$ORACLE_MODE" != "basic" ]]; then
   echo "[err] ipc-oracle: unknown ORACLE_MODE='$ORACLE_MODE' (expected basic|extended)"
   rc=1
+fi
+
+# Stage 159BC/D — independent userspace proof-workload requirements. Each is only
+# enforced when its knob is set (the boot must have used yarm.ipc_recv_proof=1).
+# A requirement passes when BOTH the userspace DONE marker (workload claims it
+# drove the path) and the kernel delivery marker are present.
+proof_require() {
+  # $1 = human label, $2 = userspace DONE marker, $3 = kernel marker
+  local label="$1" done_marker="$2" kern_marker="$3"
+  local have_done=0 have_kern=0
+  printf '%s\n' "${present[@]:-}" | rg -q "^$done_marker$" && have_done=1
+  printf '%s\n' "${present[@]:-}" | rg -q "^$kern_marker$" && have_kern=1
+  if [[ "$have_done" -eq 1 && "$have_kern" -eq 1 ]]; then
+    echo "[ok]   proof $label: PASS ($done_marker + $kern_marker)"
+  else
+    echo "[err] ipc-oracle: proof $label: MISSING (done=$have_done kernel=$have_kern; need $done_marker + $kern_marker)"
+    rc=1
+  fi
+}
+
+if [[ "$YARM_IPC_RECV_PROOF_QUEUED_SPLIT" == "1" ]]; then
+  echo "[info] ipc-oracle: proof queued-split: REQUIRED"
+  proof_require "queued-split" "IPC_RECV_PROOF_QUEUED_SPLIT_DONE" "IPC_RECV_V2_META_QUEUED_SPLIT_OK"
+else
+  echo "[info] ipc-oracle: proof queued-split: not required"
+fi
+
+if [[ "$YARM_IPC_RECV_PROOF_ROLLBACK" == "1" ]]; then
+  echo "[info] ipc-oracle: proof rollback: REQUIRED"
+  proof_require "rollback" "IPC_RECV_PROOF_ROLLBACK_DONE" "IPC_RECV_V2_ROLLBACK_OK"
+else
+  echo "[info] ipc-oracle: proof rollback: not required"
+fi
+
+if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
+  # Sender-wake is intentionally DEFERRED in the Stage 159BC/D workload (it needs
+  # a second blocked-sender context that cannot be sequenced without a timing
+  # race). The workload does not claim it, so requiring it here will fail by
+  # design until a deterministic implementation lands. Do not enable this knob
+  # before then.
+  echo "[info] ipc-oracle: proof sender-wake: REQUIRED"
+  proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
+else
+  echo "[info] ipc-oracle: proof sender-wake: not required (deferred — see doc/KERNEL_UNLOCKING.md)"
 fi
 
 # Regression gate: every baseline marker must still be present.

@@ -1358,6 +1358,16 @@ pub fn bootstrap_first_user_task(
     init_args[1] = pm_inbound_send_init.0;
     init_args[2] = init_reply_recv_init.0;
     init_args[9] = RING3_SUPERVISOR_TID;
+    // Stage 159BC/D: knob-gated (`yarm.ipc_recv_proof=1`) IPC recv-v2 oracle
+    // loopback. Slots 6/7 (init_alert_send/recv, unused by init's bootstrap) are
+    // populated ONLY when the proof knob is set; a normal boot leaves them zero
+    // and init runs byte-identically.
+    if let Some((proof_send_cap, proof_recv_cap)) =
+        crate::kernel::boot::provision_init_ipc_recv_proof_loopback(kernel, RING3_INIT_SERVER_TID)
+    {
+        init_args[6] = proof_send_cap as u64;
+        init_args[7] = proof_recv_cap as u64;
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

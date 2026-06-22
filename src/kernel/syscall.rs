@@ -578,7 +578,6 @@ pub(crate) use self::ipc_recv_core::{
     materialize_received_message_cap, materialize_received_message_cap_routed,
 };
 
-
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     self::ipc::handle_ipc_send(kernel, frame)
 }

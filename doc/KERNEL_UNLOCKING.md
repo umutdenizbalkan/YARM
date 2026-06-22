@@ -2740,6 +2740,99 @@ manual on AArch64) — at minimum `IPC_RECV_V2_META_BLOCKED_WAITER_OK`,
 `IPC_TRANSFER_CAP_MATERIALIZE_OK`. Queued split remains recorded-only for AArch64
 until a deterministic queued-split workload exists.
 
+### 5.1.7 Stage 159A — `yarm.ipc_recv_proof` knob foundation (accepted)
+
+Stage 159A landed and was **accepted** the arch-neutral, default-off boot knob
+`yarm.ipc_recv_proof=1`, mirroring the `yarm.d6_switch_proof` plumbing:
+`BootOptions.ipc_recv_proof` parse → `apply_boot_option_knobs` →
+`kernel::boot::{set_ipc_recv_oracle_proof_enabled, ipc_recv_oracle_proof_enabled}`.
+When off (the default) it provisions nothing and runs nothing; normal boot is
+byte-identical.
+
+Validated for 159A: x86_64 extended oracle PASS; AArch64 boot with the knob
+PASS; AArch64 service + reply/transfer markers present; only non-fatal
+`BLOCKED_WOULDBLOCK_CLASSIFY ... nonfatal=true` in the fatal grep (normal
+blocking-IPC classification). Accepted markers: `IPC_RECV_V2_META_BLOCKED_WAITER_OK`,
+`IPC_RECV_V2_META_IMMEDIATE_OK`, `IPC_REPLY_CAP_ONESHOT_OK`,
+`IPC_TRANSFER_CAP_MATERIALIZE_OK`.
+
+### 5.1.8 Stage 159BC/D — userspace IPC recv-v2 oracle workload (workload/oracle only)
+
+Goal: deterministically drive the three still-missing recv-v2 delivery markers
+— `IPC_RECV_V2_META_QUEUED_SPLIT_OK` (notably absent on AArch64),
+`IPC_RECV_V2_ROLLBACK_OK`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` — using **only** a
+real userspace workload. **No IPC/cap code moved**; this is workload + oracle
+coverage. All five hard-ruled stateful seams (`complete_blocked_recv_for_waiter`,
+`try_endpoint_split_recv`, `try_split_recv_queued_plain_with_snapshot_locked`,
+`try_split_recv_queued_plain_into_frame_locked`, `clear_blocked_recv_state`)
+stay exactly where Stage 158 pinned them; SYSCALL_COUNT stays 31 and
+`Syscall::VARIANT_COUNT` stays 23 (no ABI change).
+
+**Production endpoint constraint.** Userspace cannot mint endpoints — there is
+no create-endpoint syscall; every endpoint is minted by the kernel and its caps
+delivered through the spawn / `ControlPlaneSetCnodeSlots` cap-delegation
+protocol. So the workload cannot conjure its own channel. The
+architecture-native solution: the kernel bootstrap, **gated by the knob**, mints
+one loopback endpoint and grants the init server (TID 1) **both** a SEND and a
+RECV cap to it (`provision_init_ipc_recv_proof_loopback` in
+`src/kernel/boot/mod.rs`, called from all three arch first-user bootstraps). The
+caps land in init's otherwise-unused startup slots 6/7 (`init_alert_send_ep` /
+`init_alert_recv_ep` — init never receives an alert endpoint in the bootstrap
+today, so reusing them needs no slot/ABI change). Their joint presence is the
+userspace gate: a normal boot leaves both zero and init runs byte-identically.
+
+**Why a loopback (single process).** Holding both caps in one process makes the
+queued-split and rollback subtests fully deterministic with one thread, no
+timing race: a send-to-self enqueues (no receiver is blocked), then a
+recv-from-self drains the queued message through the kernel queued-split
+delivery path. `run_ipc_recv_proof_workload` in the init service runs after all
+service spawns, before init parks.
+
+**Implemented subtests** (emit a userspace `*_DONE` marker; the kernel emits the
+real delivery marker):
+
+* **Queued split** — enqueue a plain message, drain with a normal recv-v2 →
+  kernel `IPC_RECV_V2_META_QUEUED_SPLIT_OK`; workload
+  `IPC_RECV_PROOF_QUEUED_SPLIT_DONE`.
+* **Rollback** — enqueue a cap-bearing message (carrying a transferable cap),
+  drain with a deliberately undersized payload buffer
+  (`yarm_user_rt::syscall::ipc_recv_v2_proof_undersized`). The kernel
+  materializes the carried cap, finds the payload buffer too small
+  (`RecvV2WritebackOutcome::PayloadUndersized`), and rolls the cap back →
+  `IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize`; workload
+  `IPC_RECV_PROOF_ROLLBACK_DONE`. The undersize trigger is used (rather than a
+  bad meta pointer) precisely because it is deterministic and needs no
+  unmapped-address guess.
+
+**Deferred subtest (not faked).**
+
+* **Sender-wake** — `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` fires only when a sender
+  is *blocked* in `ipc_send` (full-queue or rendezvous) at the instant the
+  receiver drains. That requires a second execution context whose blocked state
+  cannot be observed/sequenced from userspace without a timing race — the exact
+  thing this stage forbids. It is left unimplemented: the workload logs
+  `IPC_RECV_PROOF_SENDER_WAKE_DEFERRED` and never emits a `*_DONE` marker, and no
+  `SpawnThread` user-rt wrapper was added. A future deterministic
+  implementation (a minimal user-thread blocked sender with an observable
+  ready-then-block protocol) can lift it.
+
+**Oracle script.** `scripts/qemu-ipc-recv-v2-oracle-smoke.sh` is unchanged in
+basic mode. Three independent, default-off proof requirements were added —
+`YARM_IPC_RECV_PROOF_QUEUED_SPLIT`, `YARM_IPC_RECV_PROOF_ROLLBACK`,
+`YARM_IPC_RECV_PROOF_SENDER_WAKE` — each enforced only when set, and only passing
+when **both** the userspace `*_DONE` marker and the kernel marker are present.
+The script reports each as required/pass/missing and reports sender-wake as
+deferred. The sender-wake knob exists but will fail by design until the deferred
+subtest lands (do not enable it before then). The three `IPC_RECV_PROOF_*_DONE`
+markers are recorded in the snapshot.
+
+**Validation in-repo:** `cargo fmt`, `cargo check --features hosted-dev`,
+`cargo test --lib --features hosted-dev` (incl. the `stage159bcd_*` guards),
+`cargo test --test rpi5_stage1_scope`, `git diff --check`, and x86_64 / aarch64 /
+riscv64 bare-metal bootstrap builds all pass. QEMU is run by the maintainer:
+boot each arch with `yarm.ipc_recv_proof=1` and run the oracle with
+`YARM_IPC_RECV_PROOF_QUEUED_SPLIT=1 YARM_IPC_RECV_PROOF_ROLLBACK=1`.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

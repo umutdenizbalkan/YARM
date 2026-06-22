@@ -464,7 +464,6 @@ pub(crate) fn materialize_received_message_cap_routed(
     materialize_received_message_cap(kernel, endpoint, receiver_tid, sender_tid, msg)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

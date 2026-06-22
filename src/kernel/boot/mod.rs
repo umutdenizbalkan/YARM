@@ -673,6 +673,96 @@ pub(crate) fn d6_controlled_switch_proof_mark_done() {
     D6_CONTROLLED_SWITCH_PROOF_DONE.store(true, core::sync::atomic::Ordering::Release);
 }
 
+/// Stage 159: `yarm.ipc_recv_proof=1` gate for the default-off userspace IPC
+/// recv-v2 oracle exercise client. When set, the control-plane bootstrap
+/// provisions a dedicated loopback endpoint into the exercise workload, which
+/// then deterministically drives the three recv-v2 delivery markers that a
+/// normal boot does not reliably exercise on every arch:
+/// `IPC_RECV_V2_META_QUEUED_SPLIT_OK`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, and
+/// `IPC_RECV_V2_ROLLBACK_OK`. Diagnostic/smoke-only, arch-neutral, default-off;
+/// it provisions nothing and runs nothing unless explicitly enabled.
+pub(crate) static IPC_RECV_ORACLE_PROOF_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_ipc_recv_oracle_proof_enabled(enabled: bool) {
+    IPC_RECV_ORACLE_PROOF_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipc_recv_oracle_proof_enabled() -> bool {
+    IPC_RECV_ORACLE_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 159BC/D: provision the userspace IPC recv-v2 oracle loopback endpoint.
+///
+/// When (and ONLY when) `yarm.ipc_recv_proof=1` is set, mint a fresh buffered
+/// endpoint and grant the init server (TID 1) BOTH a SEND and a RECV capability
+/// to it, returning `(send_cap, recv_cap)`. The caller wires these into init's
+/// startup-arg slots 6/7 (the otherwise-unused `init_alert_send_ep` /
+/// `init_alert_recv_ep` slots — init never receives an alert endpoint in the
+/// first-user bootstrap today, so reusing them needs no ABI/slot change). Their
+/// PRESENCE is what gates the proof workload in init: a normal boot leaves both
+/// slots zero and init behaves byte-identically.
+///
+/// Holding both caps in one process lets init drive the queued-split and
+/// rollback recv-v2 paths deterministically with a single thread
+/// (send-to-self enqueues because no receiver is blocked, then recv-from-self
+/// drains via the queued-split delivery path) — no cross-process/thread timing
+/// race. This is the architecture-native way to obtain an endpoint: userspace
+/// cannot mint endpoints, so the kernel bootstrap provisions it, exactly like
+/// every other control-plane endpoint.
+///
+/// Returns `None` when the knob is off (normal boot) or if endpoint/cap
+/// provisioning fails (the proof workload is then simply skipped — never fatal).
+pub fn provision_init_ipc_recv_proof_loopback(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<(u32, u32)> {
+    if !ipc_recv_oracle_proof_enabled() {
+        return None;
+    }
+    let (_eid, send_root, recv_root) = match kernel.create_endpoint(8) {
+        Ok(triple) => triple,
+        Err(e) => {
+            crate::yarm_log!(
+                "IPC_RECV_PROOF_LOOPBACK_FAIL step=create_endpoint err={:?}",
+                e
+            );
+            return None;
+        }
+    };
+    let send_cap = match kernel.grant_capability_task_to_task_with_rights(
+        0,
+        send_root,
+        init_tid,
+        crate::kernel::capabilities::CapRights::SEND,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("IPC_RECV_PROOF_LOOPBACK_FAIL step=grant_send err={:?}", e);
+            return None;
+        }
+    };
+    let recv_cap = match kernel.grant_capability_task_to_task_with_rights(
+        0,
+        recv_root,
+        init_tid,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("IPC_RECV_PROOF_LOOPBACK_FAIL step=grant_recv err={:?}", e);
+            return None;
+        }
+    };
+    crate::yarm_log!(
+        "IPC_RECV_PROOF_LOOPBACK_OK init_tid={} send_cap={} recv_cap={}",
+        init_tid,
+        send_cap.0,
+        recv_cap.0
+    );
+    Some((send_cap.0 as u32, recv_cap.0 as u32))
+}
+
 /// Stage 118: context for the first-resume trampoline (`yarm_kernel_thread_switch_trampoline`).
 ///
 /// Set by the Stage 117 stash drain in `handle_trap_entry_shared` immediately

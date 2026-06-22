@@ -344,6 +344,60 @@ pub mod syscall {
         }))
     }
 
+    /// Stage 159BC/D proof-only recv-v2 with a deliberately undersized payload
+    /// buffer.
+    ///
+    /// This is used ONLY by the default-off `yarm.ipc_recv_proof` oracle
+    /// workload to deterministically drive the kernel queued-split rollback
+    /// path: when a queued cap-bearing message is drained, the kernel
+    /// materializes the carried capability and THEN discovers the receiver's
+    /// payload buffer is too small (`RecvV2WritebackOutcome::PayloadUndersized`),
+    /// rolling the freshly-minted cap back (`IPC_RECV_V2_ROLLBACK_OK
+    /// site=queued_split_undersize`). The meta pointer is fully valid — only the
+    /// payload region is intentionally too small — so the fault is a clean,
+    /// deterministic undersize, not an unmapped-address guess.
+    ///
+    /// Returns `Ok(())` if the recv unexpectedly succeeded (no rollback), or the
+    /// `SyscallError` the kernel returned for the undersized writeback
+    /// (`InvalidArgs` on the undersize path). NOT for production IPC.
+    #[inline]
+    pub unsafe fn ipc_recv_v2_proof_undersized(
+        ep_cap: u32,
+    ) -> core::result::Result<(), SyscallError> {
+        // Deliberately tiny payload buffer: any queued message with a payload
+        // larger than this drives the undersize rollback path.
+        let mut payload = [0u8; 8];
+        let mut meta = IpcRecvMetaV2 {
+            status: u64::MAX,
+            opcode: 0,
+            flags: 0,
+            payload_len: 0,
+            cap_id: SYSCALL_NO_TRANSFER_CAP,
+            recv_meta_flags: 0,
+            sender_tid: 0,
+        };
+        let args = [
+            ep_cap as usize,
+            payload.as_mut_ptr() as usize,
+            payload.len(),
+            (&mut meta as *mut IpcRecvMetaV2) as usize,
+            core::mem::size_of::<IpcRecvMetaV2>(),
+            SYSCALL_RECV_MAP_INTENT_DEFAULT,
+        ];
+        // SAFETY: Uses architecture syscall ABI to enter kernel. The payload
+        // pointer is valid and writable; only its length is deliberately small.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_RECV_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 && meta.status == u64::MAX {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
     #[inline]
     pub unsafe fn ipc_recv_with_deadline(
         ep_cap: u32,

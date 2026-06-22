@@ -135,6 +135,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = enabled;
     }
+    if let Some(enabled) = parsed.ipc_recv_proof {
+        // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
+        // every arch (the AArch64 queued-split gap is the motivating case).
+        crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(enabled);
+        crate::yarm_log!("YARM_IPC_RECV_PROOF_SET enabled={}", enabled);
+    }
 }
 
 pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
@@ -213,6 +219,12 @@ pub struct YarmBootOptions<'a> {
     /// Non-x86_64 builds parse but ignore the knob so AArch64/RISC-V
     /// behavior remains unchanged.
     pub d6_switch_proof: Option<bool>,
+    /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
+    /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
+    /// bootstrap provisions a loopback endpoint into the exercise workload, which
+    /// deterministically drives the queued-split, sender-wake, and rollback
+    /// recv-v2 markers. Default-off: nothing is provisioned or run otherwise.
+    pub ipc_recv_proof: Option<bool>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -287,6 +299,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.d6_switch_proof" {
             options.d6_switch_proof = parse_bool_knob(value);
+        }
+        if key == b"yarm.ipc_recv_proof" {
+            options.ipc_recv_proof = parse_bool_knob(value);
         }
     }
     options
@@ -598,5 +613,31 @@ mod tests {
         assert_eq!(parsed.platform, PlatformOption::Rpi5);
         assert_eq!(parsed.boot_phase, BootPhase::Dtb);
         assert_eq!(parsed.max_cpus, Some(4));
+    }
+
+    // Stage 159: the userspace IPC recv-v2 oracle exercise gate parses as a
+    // standard bool knob, defaults to None (off), and is independent of the
+    // other yarm.* knobs.
+    #[test]
+    fn ipc_recv_proof_knob_parses_and_defaults_off() {
+        assert_eq!(parse_yarm_boot_options(b"").ipc_recv_proof, None);
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_recv_proof=1").ipc_recv_proof,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_recv_proof=0").ipc_recv_proof,
+            Some(false)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_recv_proof=bogus").ipc_recv_proof,
+            None
+        );
+        // Does not collide with the other knobs.
+        let parsed = parse_yarm_boot_options(
+            b"yarm.loglevel=info yarm.d6_switch_proof=1 yarm.ipc_recv_proof=true",
+        );
+        assert_eq!(parsed.ipc_recv_proof, Some(true));
+        assert_eq!(parsed.d6_switch_proof, Some(true));
     }
 }

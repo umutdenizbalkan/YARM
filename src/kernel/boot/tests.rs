@@ -40553,7 +40553,8 @@ mod stage152_syscall_decomposition_completeness_audit {
                 "materialize_received_message_cap must live in ipc_recv_core.rs (Stage 158)"
             );
             assert!(
-                IPC_RECV_CORE_SRC.contains("pub(crate) fn materialize_received_message_cap_routed("),
+                IPC_RECV_CORE_SRC
+                    .contains("pub(crate) fn materialize_received_message_cap_routed("),
                 "materialize_received_message_cap_routed must live in ipc_recv_core.rs (Stage 158)"
             );
             assert!(
@@ -41882,7 +41883,10 @@ mod stage157_ipc_oracle_live_path {
         // Each oracle marker must appear at least twice: once on the live split
         // arm and once on the canonical fallback arm. This pins the path-agnostic
         // property (the oracle fires regardless of which arm runs).
-        for m in ["IPC_TRANSFER_CAP_MATERIALIZE_OK", "IPC_REPLY_CAP_ONESHOT_OK"] {
+        for m in [
+            "IPC_TRANSFER_CAP_MATERIALIZE_OK",
+            "IPC_REPLY_CAP_ONESHOT_OK",
+        ] {
             assert!(
                 IPC_RECV_CORE_SRC.matches(m).count() >= 2,
                 "`{m}` must be emitted on both the live split arm and the canonical arm"
@@ -41903,7 +41907,10 @@ mod stage157_ipc_oracle_live_path {
             ORACLE_SCRIPT.contains("EXTENDED_REQUIRED"),
             "oracle script must define the extended-required marker set"
         );
-        for m in ["IPC_REPLY_CAP_ONESHOT_OK", "IPC_TRANSFER_CAP_MATERIALIZE_OK"] {
+        for m in [
+            "IPC_REPLY_CAP_ONESHOT_OK",
+            "IPC_TRANSFER_CAP_MATERIALIZE_OK",
+        ] {
             assert!(
                 ORACLE_SCRIPT.contains(m),
                 "extended mode must require `{m}`"
@@ -41921,7 +41928,10 @@ mod stage157_ipc_oracle_live_path {
             .nth(1)
             .and_then(|s| s.split(')').next())
             .expect("EXTENDED_REQUIRED block must exist");
-        for m in ["IPC_RECV_V2_ROLLBACK_OK", "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"] {
+        for m in [
+            "IPC_RECV_V2_ROLLBACK_OK",
+            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK",
+        ] {
             assert!(
                 !extended_block.contains(m),
                 "fault/contention marker `{m}` must not be hard-required on a healthy boot"
@@ -41941,5 +41951,248 @@ mod stage157_ipc_oracle_live_path {
             ORACLE_SCRIPT.contains("ORACLE_MODE:-basic"),
             "default oracle mode must remain basic (Stage 156 contract unchanged)"
         );
+    }
+}
+
+// Stage 159BC/D — userspace IPC recv-v2 oracle proof workload guards. These pin
+// the workload as default-off, isolated, and stateful-seam-neutral: it must
+// drive markers ONLY through real userspace syscalls against a kernel-
+// provisioned loopback endpoint, never by moving IPC/cap code or adding a
+// kernel-side user-MMU / second-Bootstrap harness.
+mod stage159bcd_ipc_recv_proof_workload {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ORACLE_SCRIPT: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const INIT_SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV64_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    // 1. The workload is gated by the yarm.ipc_recv_proof knob and provisioned
+    //    only when the knob is set — nothing runs on a normal boot.
+    #[test]
+    fn stage159bcd_workload_is_default_off() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.ipc_recv_proof")
+                && MOD_SRC.contains("fn ipc_recv_oracle_proof_enabled"),
+            "proof workload must be gated by the yarm.ipc_recv_proof knob"
+        );
+        // The kernel-side provisioning helper returns early (None) unless the
+        // knob is enabled, so slots 6/7 stay zero on a normal boot.
+        let helper = MOD_SRC
+            .split("fn provision_init_ipc_recv_proof_loopback")
+            .nth(1)
+            .expect("provisioning helper must exist");
+        let head = &helper[..helper.len().min(400)];
+        assert!(
+            head.contains("if !ipc_recv_oracle_proof_enabled()") && head.contains("return None;"),
+            "provisioning must no-op (return None) when the knob is off"
+        );
+        // init runs the workload only when BOTH loopback slots are present.
+        assert!(
+            INIT_SERVICE_SRC.contains("ctx.init_alert_send_ep")
+                && INIT_SERVICE_SRC.contains("run_ipc_recv_proof_workload"),
+            "init must gate the proof workload on the presence of both loopback caps"
+        );
+    }
+
+    // 2. No separate proof BINARY is added: the workload rides init (already in
+    //    the boot set), so there is no new entry in the normal service manifest.
+    #[test]
+    fn stage159bcd_no_new_service_binary() {
+        // The control-plane bin set is unchanged (init_server/supervisor/pm/
+        // driver_manager/vfs_server). A new proof bin would appear here.
+        let cargo = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
+        for forbidden in &["ipc_recv_proof", "recv_proof_srv", "oracle_proof"] {
+            assert!(
+                !cargo.contains(forbidden),
+                "no dedicated proof service binary may be added ({forbidden})"
+            );
+        }
+        // The workload lives in init's service module, not a manifest service.
+        assert!(
+            INIT_SERVICE_SRC.contains("fn run_ipc_recv_proof_workload"),
+            "proof workload must ride the existing init server"
+        );
+    }
+
+    // 3. No stateful IPC/cap seam moved: the hard-ruled functions stay exactly
+    //    where Stage 156/158 pinned them.
+    #[test]
+    fn stage159bcd_no_stateful_seam_moved() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(def),
+                "stateful seam `{def}` must not move"
+            );
+        }
+        // Materialization cluster stays in ipc_recv_core.rs (Stage 158 home).
+        assert!(
+            IPC_RECV_CORE_SRC.contains("fn materialize_received_message_cap_routed("),
+            "materialization seam must remain in ipc_recv_core.rs"
+        );
+    }
+
+    // 4. No kernel-side synthetic user-MMU harness and no second Bootstrap::init
+    //    driving user memory: the markers come from real userspace syscalls.
+    #[test]
+    fn stage159bcd_no_kernel_user_mmu_or_bootstrap_harness() {
+        // The provisioning helper only mints an endpoint + grants caps; it must
+        // NOT fabricate user mappings or spin up a Bootstrap.
+        let helper = MOD_SRC
+            .split("fn provision_init_ipc_recv_proof_loopback")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("provisioning helper must exist");
+        for forbidden in &[
+            "Bootstrap::init",
+            "copy_to_user",
+            "map_user",
+            "user_asid_for_test",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "proof provisioning must not add a kernel user-MMU/Bootstrap harness ({forbidden})"
+            );
+        }
+        // The userspace side drives real syscalls.
+        assert!(
+            INIT_SERVICE_SRC.contains("yarm_user_rt::syscall::ipc_send")
+                && INIT_SERVICE_SRC.contains("ipc_recv_v2"),
+            "proof workload must use real userspace IPC syscalls"
+        );
+    }
+
+    // 5. The kernel delivery markers each subtest targets are emitted in the
+    //    real IPC paths (not by the workload itself).
+    #[test]
+    fn stage159bcd_target_markers_are_kernel_emitted() {
+        for m in &[
+            "IPC_RECV_V2_META_QUEUED_SPLIT_OK",
+            "IPC_RECV_V2_ROLLBACK_OK",
+            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(m),
+                "kernel delivery marker `{m}` must be emitted by the kernel IPC path"
+            );
+        }
+        // The workload may DESCRIBE the kernel markers in doc comments, but must
+        // never EMIT one itself (no faking): no user_log! prints an
+        // `IPC_RECV_V2_` marker from userspace.
+        assert!(
+            !INIT_SERVICE_SRC.contains("user_log!(\"IPC_RECV_V2_"),
+            "userspace workload must NOT emit (fake) any kernel IPC_RECV_V2_* marker"
+        );
+        // The userspace DONE markers belong to the workload, not the kernel.
+        for m in &[
+            "IPC_RECV_PROOF_QUEUED_SPLIT_DONE",
+            "IPC_RECV_PROOF_ROLLBACK_DONE",
+        ] {
+            assert!(
+                INIT_SERVICE_SRC.contains(m),
+                "workload must emit its userspace DONE marker `{m}`"
+            );
+        }
+    }
+
+    // 6. Basic oracle mode is unchanged; extended/proof mode can independently
+    //    require queued-split and rollback.
+    #[test]
+    fn stage159bcd_oracle_modes() {
+        assert!(
+            ORACLE_SCRIPT.contains("ORACLE_MODE:-basic") && ORACLE_SCRIPT.contains("REQUIRED_ANY"),
+            "basic mode contract must be unchanged"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_QUEUED_SPLIT")
+                && ORACLE_SCRIPT.contains("IPC_RECV_V2_META_QUEUED_SPLIT_OK"),
+            "proof mode must support an independent queued-split requirement"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_ROLLBACK")
+                && ORACLE_SCRIPT.contains("IPC_RECV_PROOF_ROLLBACK_DONE"),
+            "proof mode must support an independent rollback requirement"
+        );
+    }
+
+    // 7. Sender-wake is explicitly deferred (not faked): the workload logs a
+    //    DEFERRED marker and never emits IPC_RECV_PROOF_SENDER_WAKE_DONE.
+    #[test]
+    fn stage159bcd_sender_wake_deferred_not_faked() {
+        assert!(
+            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED"),
+            "sender-wake must be explicitly logged as deferred"
+        );
+        assert!(
+            !INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DONE"),
+            "deferred sender-wake must NOT emit a DONE marker (no fake)"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("deferred"),
+            "oracle script must report sender-wake as deferred"
+        );
+        // The minimal undersized-payload recv wrapper exists for the rollback
+        // subtest; no SpawnThread wrapper was added for the deferred sender-wake.
+        assert!(
+            USER_RT_SRC.contains("fn ipc_recv_v2_proof_undersized"),
+            "rollback subtest's undersized recv wrapper must exist"
+        );
+    }
+
+    // 8. Syscall/IPC ABI counts are unchanged.
+    #[test]
+    fn stage159bcd_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 9. Provisioning is gated identically across all three arch boots and the
+    //    RPi5/x86 D6 paths are not coupled.
+    #[test]
+    fn stage159bcd_arch_boots_gated_uniformly() {
+        for (arch, src) in &[
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV64_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("provision_init_ipc_recv_proof_loopback"),
+                "{arch} boot must call the gated provisioning helper"
+            );
+        }
+        // Not wired through any D6/CR3/TSS/PF path.
+        let x86_block = X86_BOOT_SRC
+            .split("provision_init_ipc_recv_proof_loopback")
+            .nth(1)
+            .map(|s| &s[..s.len().min(200)])
+            .unwrap_or("");
+        for forbidden in &["CR3", "TSS", "D6_", "page_fault"] {
+            assert!(
+                !x86_block.contains(forbidden),
+                "x86 proof provisioning must not touch the {forbidden} path"
+            );
+        }
     }
 }
