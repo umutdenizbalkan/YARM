@@ -1224,14 +1224,18 @@ fn handle_ipc_recv_result_with_empty_error(
             if recv_v2_meta_written {
                 // recv-v2: write metadata struct to the caller's meta buffer.
                 // ret0 will be 0 (success) since all metadata goes into the meta struct.
-                let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
-                meta[0..8].copy_from_slice(&(sender as u64).to_le_bytes());
-                meta[8..10].copy_from_slice(&app_opcode.to_le_bytes());
-                meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
-                meta[12..16].copy_from_slice(&(app_payload.len() as u32).to_le_bytes());
-                meta[16..24].copy_from_slice(&(frame.ret2() as u64).to_le_bytes());
-                meta[24..32].copy_from_slice(&(recv_meta_flags as u64).to_le_bytes());
-                meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+                // Stage 155: byte-identical to the prior inline encoding; the
+                // status word ([0..8]) carries `sender` and [10..12] carries
+                // `msg.flags` for this immediate full-recv path.
+                let meta = super::ipc_recv_core::encode_recv_v2_meta(
+                    sender as u64,
+                    app_opcode,
+                    msg.flags,
+                    app_payload.len() as u32,
+                    frame.ret2() as u64,
+                    recv_meta_flags as u64,
+                    msg.sender_tid.0,
+                );
                 crate::yarm_log!(
                     "IPC_RECV_OUT_META_REPLY status={} opcode={} len={} flags={} sender_tid={}",
                     sender,

@@ -1065,23 +1065,21 @@ pub(crate) fn execute_user_asid_plain_v2_writeback(
     let msg = &delivery.msg;
     let app_payload = msg.as_slice();
 
-    // Build the 40-byte IpcRecvMetaV2 struct.
-    // Layout and ordering MUST match handle_ipc_recv_result_with_empty_error (§55):
-    //   [0..8]   sender as u64 (= msg.sender_tid.0; same value since 64-bit usize)
-    //   [8..10]  app_opcode = msg.opcode (no prefix stripping for plain messages)
-    //   [10..12] msg.flags
-    //   [12..16] app_payload.len() as u32
-    //   [16..24] Message::NO_TRANSFER_CAP (plain: recv_local_transfer = None)
-    //   [24..32] 0u64 (recv_meta_flags = 0 for plain: no reply/transfer flags)
-    //   [32..40] msg.sender_tid.0 (raw sender TID)
-    let mut meta = [0u8; META_V2_MIN_LEN];
-    meta[0..8].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
-    meta[8..10].copy_from_slice(&msg.opcode.to_le_bytes());
-    meta[10..12].copy_from_slice(&msg.flags.to_le_bytes());
-    meta[12..16].copy_from_slice(&(app_payload.len() as u32).to_le_bytes());
-    meta[16..24].copy_from_slice(&Message::NO_TRANSFER_CAP.to_le_bytes());
-    meta[24..32].copy_from_slice(&0u64.to_le_bytes());
-    meta[32..40].copy_from_slice(&msg.sender_tid.0.to_le_bytes());
+    // Build the 40-byte IpcRecvMetaV2 struct via the single recv-v2 codec.
+    // Stage 155: byte-identical to the prior inline encoding and to
+    // handle_ipc_recv_result_with_empty_error (§55). For this plain user-ASID
+    // split path: status ([0..8]) and sender ([32..40]) both = msg.sender_tid.0
+    // (same value for 64-bit usize); [10..12] = msg.flags; cap id =
+    // NO_TRANSFER_CAP and recv_meta_flags = 0 (plain: no reply/transfer flags).
+    let meta = crate::kernel::syscall::ipc_recv_core::encode_recv_v2_meta(
+        msg.sender_tid.0,
+        msg.opcode,
+        msg.flags,
+        app_payload.len() as u32,
+        Message::NO_TRANSFER_CAP,
+        0,
+        msg.sender_tid.0,
+    );
 
     // Copy meta FIRST — matching full-path ordering (§55).
     // On fault: message consumed, caller returns Err(PageFault) (no cap rollback for plain).

@@ -83,34 +83,49 @@ use super::IPC_RECV_META_V2_ENCODED_LEN;
 
 /// Serialize the 40-byte recv-v2 metadata frame.
 ///
-/// **Pure byte codec.** Byte-for-byte identical to the inline encoding that
-/// `complete_blocked_recv_for_waiter` performed before Stage 154 (and to the
-/// parallel encoders in `syscall/ipc.rs` and `kernel/recv_core.rs`, which a
-/// future stage may converge onto this single definition). The layout is part
-/// of the frozen recv-v2 ABI and must not change:
+/// **Pure byte codec.** This is the single implementation of the frozen recv-v2
+/// metadata frame layout. Stage 155 converged all three production encoders
+/// onto it: the blocked-waiter path (`complete_blocked_recv_for_waiter` in
+/// `syscall.rs`), the immediate full-recv path (`syscall/ipc.rs`), and the
+/// queued user-ASID split path (`kernel/recv_core.rs`).
 ///
-/// | offset | bytes | field                         |
-/// |--------|-------|-------------------------------|
-/// | 0..8   | u64   | reserved (always 0)           |
-/// | 8..10  | u16   | application opcode            |
-/// | 10..12 | u16   | reserved (always 0)           |
-/// | 12..16 | u32   | application payload length    |
-/// | 16..24 | u64   | receiver-local cap id         |
-/// | 24..32 | u64   | recv-meta flags               |
-/// | 32..40 | u64   | sender tid                    |
+/// The **field offsets** are identical across all paths and frozen by the ABI.
+/// Two field *values* historically differed per delivery path, so they are
+/// explicit parameters rather than hardcoded — this keeps every converged call
+/// site **byte-for-byte identical** to its previous inline encoding:
+///   * `status` (`[0..8]`): blocked-waiter writes `0`; the immediate and queued
+///     paths write the sender/status word.
+///   * `msg_flags` (`[10..12]`): blocked-waiter writes `0`; the immediate and
+///     queued paths write `msg.flags`.
+///
+/// | offset | bytes | field                         | param            |
+/// |--------|-------|-------------------------------|------------------|
+/// | 0..8   | u64   | status / sender word          | `status`         |
+/// | 8..10  | u16   | application opcode            | `opcode`         |
+/// | 10..12 | u16   | message flags word            | `msg_flags`      |
+/// | 12..16 | u32   | application payload length    | `payload_len`    |
+/// | 16..24 | u64   | receiver-local cap id         | `cap_id`         |
+/// | 24..32 | u64   | recv-meta flags               | `recv_meta_flags`|
+/// | 32..40 | u64   | sender tid                    | `sender_tid`     |
 ///
 /// No kernel state, no locks, no cap mutation, no user copy, no VM mutation.
-pub(super) fn encode_recv_v2_meta(
+///
+/// `pub(crate)` (not `pub(super)`): `kernel/recv_core.rs` lives outside the
+/// `syscall` module subtree and is a genuine cross-module caller (Stage 155
+/// convergence). Never widen to bare `pub`.
+pub(crate) fn encode_recv_v2_meta(
+    status: u64,
     opcode: u16,
+    msg_flags: u16,
     payload_len: u32,
     cap_id: u64,
     recv_meta_flags: u64,
     sender_tid: u64,
 ) -> [u8; IPC_RECV_META_V2_ENCODED_LEN] {
     let mut meta = [0u8; IPC_RECV_META_V2_ENCODED_LEN];
-    meta[0..8].copy_from_slice(&0u64.to_le_bytes());
+    meta[0..8].copy_from_slice(&status.to_le_bytes());
     meta[8..10].copy_from_slice(&opcode.to_le_bytes());
-    meta[10..12].copy_from_slice(&0u16.to_le_bytes());
+    meta[10..12].copy_from_slice(&msg_flags.to_le_bytes());
     meta[12..16].copy_from_slice(&payload_len.to_le_bytes());
     meta[16..24].copy_from_slice(&cap_id.to_le_bytes());
     meta[24..32].copy_from_slice(&recv_meta_flags.to_le_bytes());
@@ -127,11 +142,23 @@ mod tests {
     // integration tests make on the user-visible meta buffer.
     #[test]
     fn encode_recv_v2_meta_matches_frozen_layout() {
-        let meta = encode_recv_v2_meta(0x1234, 0x0000_ABCD, 0x1122_3344_5566_7788, 0b10, 0x42);
+        let meta = encode_recv_v2_meta(
+            0x00FE_DCBA_9876_5432,
+            0x1234,
+            0xBEEF,
+            0x0000_ABCD,
+            0x1122_3344_5566_7788,
+            0b10,
+            0x42,
+        );
         assert_eq!(meta.len(), 40, "recv-v2 meta frame must be 40 bytes");
-        assert_eq!(&meta[0..8], &0u64.to_le_bytes(), "reserved word 0");
+        assert_eq!(
+            &meta[0..8],
+            &0x00FE_DCBA_9876_5432u64.to_le_bytes(),
+            "status word"
+        );
         assert_eq!(&meta[8..10], &0x1234u16.to_le_bytes(), "opcode");
-        assert_eq!(&meta[10..12], &0u16.to_le_bytes(), "reserved word 1");
+        assert_eq!(&meta[10..12], &0xBEEFu16.to_le_bytes(), "msg flags word");
         assert_eq!(&meta[12..16], &0x0000_ABCDu32.to_le_bytes(), "payload len");
         assert_eq!(
             &meta[16..24],
@@ -140,5 +167,19 @@ mod tests {
         );
         assert_eq!(&meta[24..32], &0b10u64.to_le_bytes(), "recv-meta flags");
         assert_eq!(&meta[32..40], &0x42u64.to_le_bytes(), "sender tid");
+    }
+
+    // Each converged call site must reproduce its prior inline bytes. These
+    // recreate the three historical encodings field-by-field.
+    #[test]
+    fn encode_recv_v2_meta_reproduces_per_path_bytes() {
+        // Blocked-waiter path: status=0, msg_flags=0.
+        let blocked = encode_recv_v2_meta(0, 7, 0, 3, 99, 1, 5);
+        assert_eq!(&blocked[0..8], &0u64.to_le_bytes());
+        assert_eq!(&blocked[10..12], &0u16.to_le_bytes());
+        // Immediate / queued paths: status and msg_flags carry real values.
+        let immediate = encode_recv_v2_meta(5, 7, 0x0021, 3, 99, 1, 5);
+        assert_eq!(&immediate[0..8], &5u64.to_le_bytes());
+        assert_eq!(&immediate[10..12], &0x0021u16.to_le_bytes());
     }
 }

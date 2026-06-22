@@ -210,7 +210,8 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // ── Stage 154: D1/D5 cap-boundary migration scaffold (Option 2: pure helper) ──
 // Stage 154 creates the dedicated landing module `syscall/ipc_recv_core.rs` and
 // migrates the ONE genuinely pure fragment of the recv cluster — the recv-v2
-// metadata byte codec — into it as `encode_recv_v2_meta` (pub(super)). This is
+// metadata byte codec — into it as `encode_recv_v2_meta` (pub(crate) since
+// Stage 155, so kernel/recv_core.rs can converge onto it too). This is
 // byte-for-byte identical and is called at the exact same point in
 // complete_blocked_recv_for_waiter (after materialization, before the meta
 // copy), so every Stage 153 ordering proof is preserved. The new module is NOT
@@ -233,7 +234,9 @@ mod ipc_abi;
 // Stage 154: D1/D5 cap-boundary landing zone. Holds the pure recv-v2 meta
 // codec today; the stateful cap/materialization seams stay in syscall.rs until
 // a QEMU-validated re-home (doc/KERNEL_UNLOCKING.md §5.1.2).
-mod ipc_recv_core;
+// Stage 155: `pub(crate)` so `kernel/recv_core.rs` (outside the syscall subtree)
+// can call the single `encode_recv_v2_meta` codec. Module holds pure code only.
+pub(crate) mod ipc_recv_core;
 mod process;
 mod recv_shared_v3;
 mod sched;
@@ -483,8 +486,12 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     // Byte-for-byte identical to the prior inline encoding; called at the exact
     // same point (after materialization, before the meta copy) so the
     // copy-before/after and rollback ordering is unchanged.
+    // Blocked-waiter encoding: status word and msg-flags word are 0 here
+    // (byte-identical to the pre-Stage-154 inline encoding).
     let meta = self::ipc_recv_core::encode_recv_v2_meta(
+        0,
         app_opcode,
+        0,
         app_payload.len() as u32,
         cap_id,
         recv_meta_flags as u64,
