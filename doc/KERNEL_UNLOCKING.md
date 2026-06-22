@@ -40,7 +40,7 @@ Directive labels are stable across stages:
 | **D1** transfer-cap recv (non-reply, non-shared-region) | **LIVE** | Stage 104 | router → `materialize_split_transfer_cap_equivalent`; telemetry `d1_split_materializations` |
 | **D2** endpoint blocking-recv waiter publish | **LIVE** (phase-split, Stage 111) | Stage 106 | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes`, `d2_publish_race_unwinds`; `Stage 108 with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path — see §1 Stage 111 |
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
-| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc,helpers,ipc_abi}.rs` | **PARTIAL** | Stage 102 + D4 steps 1–4 + Stage 145/146/149/150/151 | 10 modules landed (8 handler + 2 shared-helper/codec); `ipc_abi.rs` boundary-audited Stage 151; `syscall/dispatch.rs` and remaining IPC-cross-boundary extraction pending (§5.1); see Stage 148–151 decomposition map |
+| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc,helpers,ipc_abi}.rs` | **COMPLETE (mechanical)** | Stage 102 + D4 steps 1–4 + Stage 145/146/149/150/151 + **Stage 152 completeness audit** | 10 modules landed (8 handler + 2 shared-helper/codec); `ipc_abi.rs` boundary-audited Stage 151; Stage 152 audits the decomposition as complete to its irreducible IPC/cap dispatch core (no new module, no source move) and guard-hardens the full boundary surface; `dispatch.rs` is not planned (syscall.rs stays dispatch owner) and `ipc_recv_core.rs` remains deferred to the D1/D5 cap-slot audit (§5.1); see Stage 148–152 decomposition map |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
 | **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page; Stage 127 corrects that gate to map/check the target task ASID/root and retries after ASID binding instead of depending on temporal active-ASID presence; Stage 128 strengthens the invariant again by mapping/checking the incoming switch-stack page in every existing task root that may be the active/outgoing CR3 during `switch_frames`, plus an active-root proof check before stashing; Stage 129 fixes the VmFull capacity-blocker by adding on-demand repair in the active-root guard when the active ASID was created after the incoming stack was initialized; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
@@ -2324,11 +2324,32 @@ content below is what any unlocking-stage gate test should reference.
 
 Target module layout. Modules already split are marked LIVE; the rest are
 pending mechanical moves (each its own PR, no semantic change).
-Updated Stage 151 to reflect Stage 151 (ipc_abi.rs boundary audit).
+Updated Stage 152 (decomposition-completeness audit; ipc_abi.rs boundary
+audit landed Stage 151).
+
+**Stage 152 — decomposition is at its irreducible core.** The mechanical D4
+decomposition is complete: 10 submodules landed (8 handler + 2
+shared-helper/codec), covering every low-risk implementation group named in the
+plan (debug, initramfs, control/cap, process, sched, vm). The implementation
+that remains in `syscall.rs` is exclusively the dispatch table, the ABI
+types/constants, the thin delegation shims, and the IPC/cap cross-boundary
+seams. Each remaining seam is forbidden to move by the hard boundary rules
+**and** is already pinned in place by an existing source-guard test (Stage 104
+pins `materialize_received_message_cap_routed`; Stage 147/148 pin
+`try_endpoint_split_recv`, both `try_split_recv_queued_plain_*` seams,
+`clear_blocked_recv_state`, `complete_blocked_recv_for_waiter`, and
+`materialize_received_message_cap`). No further low-risk extraction is
+available, so Stage 152 lands **no new module and moves no source**; it instead
+hardens the whole boundary surface with `boot::tests::
+stage152_syscall_decomposition_completeness_audit`. `syscall/dispatch.rs` and
+`syscall/ipc_recv_core.rs` remain deferred — splitting either would either
+violate "syscall.rs remains dispatch owner" / "no submodule may define
+dispatch" (dispatch.rs) or require the D1/D5 cap-slot/lock-ordering audit
+(ipc_recv_core.rs).
 
 | Target module | Status |
 |---------------|--------|
-| `syscall/dispatch.rs` | pending (after IPC cross-boundary audit) |
+| `syscall/dispatch.rs` | **not planned** — would violate "syscall.rs remains dispatch owner" / "no submodule defines dispatch"; dispatch stays in syscall.rs |
 | `syscall/ipc_recv_core.rs` | deferred — `complete_blocked_recv_for_waiter` and cap-slot ordering require D1/D5 audit first |
 | `syscall/ipc_abi.rs` | **landed** Stage 150; **audited** Stage 151 — pure ABI/frame codec only (no kernel-state mutation, no lock acquisition, no cap-slot materialization, no VM/shared-memory mapping, no reply-cap lifecycle); `syscall.rs` remains dispatch owner; `ipc.rs` remains stateful IPC owner |
 | `syscall/helpers.rs` | **landed** Stage 149 ([S] current_tid, validate_user_region, round_up_page, record_user_fault, validate_endpoint_right, current_task_has_user_asid) |
@@ -2341,7 +2362,7 @@ Updated Stage 151 to reflect Stage 151 (ipc_abi.rs boundary audit).
 | `syscall/debug.rs` | **landed** Stage 102 (NR 15) |
 | `syscall/recv_shared_v3.rs` | **landed** D4 step 1 (NR 30) |
 
-**Remaining in syscall.rs (Stage 151 audit, classified):**
+**Remaining in syscall.rs (Stage 152 audit, classified — irreducible core):**
 
 | Group | Items | Classification |
 |-------|-------|----------------|
@@ -2544,9 +2565,15 @@ may not jump ahead of Immediate or bypass their own gates.
    lock-free `await_tlb_shootdown_ack` design (D3) — but must not bypass
    D7-A/D7-B and must not jump ahead of the Next items above without an
    explicit gating review.
-8. **D4 follow-on split** — D4 steps 1–4 complete: `recv_shared_v3.rs`,
-   `process.rs`, `sched.rs`, `cap.rs`. Continue with the remaining modules in
-   §5.1.
+8. **D4 mechanical decomposition — COMPLETE (Stage 152).** D4 steps 1–4 plus
+   Stage 145/146/149/150/151 landed all 10 submodules
+   (`recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`, `vm.rs`, `ipc.rs`,
+   `helpers.rs`, `ipc_abi.rs`, `debug.rs`, `initramfs.rs`). Stage 152 audits the
+   decomposition as complete to its irreducible IPC/cap dispatch core: the only
+   implementation left in `syscall.rs` is the dispatch table, ABI types/shims,
+   and the IPC/cap cross-boundary seams that the hard rules + existing
+   source-guards pin in place. No further low-risk module remains to peel off
+   (§5.1).
 9. **D3-FULL / D6-full / D2-B** — full `VmAnonMap` two-phase live,
    per-CPU runqueue lock sharding, and any shared-region cap-transfer
    split (D1/D5 extension) — remain gated on item 7 (AP scheduler-online)
@@ -2578,7 +2605,7 @@ audit; nothing else in the repo should restate it.
 | D2 (endpoint blocking-recv waiter publish) | **live** (phase-split, seam-pending) | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes` / `d2_publish_race_unwinds` (must be 0). Stage 106; phase split Stage 111. `with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path (§1 Stage 111). |
 | D3.1 (`vm_brk_shrink_two_phase`) | **live** (phase-split Stage 112; seam live-wired Stage 114) | `D3_LIVE_SPLIT` + `M2_SEAM_LIVE_D3_BRK_SHRINK`. `with_vm_user_spaces_split_mut`/`with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (§1 Stage 114). |
 | D3 rest (full `VmAnonMap` two-phase live) | **deferred** | plan types are consumed inside the still-global-locked `handle_vm_anon_map`; gated on lock-free `await_tlb_shootdown_ack`. |
-| D4 (`syscall.rs` decomposition) | **partial** | `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap}.rs` landed; D4 steps 1–4 complete (`recv_shared_v3.rs`, `process.rs`, `sched.rs`, `cap.rs`); the rest of §5.1 is pending mechanical moves. |
+| D4 (`syscall.rs` decomposition) | **complete (mechanical)** | All 10 submodules landed (`debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc,helpers,ipc_abi`); Stage 152 audits the decomposition as complete to its irreducible IPC/cap dispatch core — what remains in `syscall.rs` is dispatch + cross-boundary seams pinned by the hard rules and existing source-guards (§5.1). |
 | D5 (reply-cap recv, non-shared-region) | **live** | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations` / `d5_split_reply_rollbacks`. Stage 105. |
 | D6.1 (`local_dispatch_step_split`) | **live** (phase-split, seam-pending) | `D6_LIVE_SPLIT`. Stage 107; phase split Stage 113. `with_scheduler_split_mut` not yet called from this path (§1 Stage 113). Per-CPU lock sharding deferred until x86_64 AP scheduler-online. |
 | D7 (MUST_SMOKE policy) | **enforced** | see `AI_AGENT_RULES.md` §13. Stage 101. |
@@ -2668,8 +2695,10 @@ prove the trap path reaches the decision point. The next targets, in order:
    kernel threads once Stage 117 Outcome A is achieved. For user tasks (trap-frame
    switching only), the lock drop needs to be wired to `restore_arch_thread_state`
    instead of `switch_frames`.
-4. **D4 follow-on syscall decomposition** after completed steps 1–4 (`syscall/recv_shared_v3.rs`, `syscall/process.rs`, `syscall/sched.rs`, and `syscall/cap.rs` extraction), then
-   the remaining modules listed in §5.1.
+4. **D4 syscall decomposition — mechanically complete (Stage 152).** All 10
+   submodules landed; the decomposition has reached its irreducible IPC/cap
+   dispatch core. Any further unlocking here is the D1/D5 cap-slot/lock-ordering
+   audit work, not a mechanical module move (§5.1).
 5. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
    Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
    behind a default-off knob; then `-smp ≥ 2` smoke acceptance. Still

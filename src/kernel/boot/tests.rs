@@ -40397,3 +40397,363 @@ mod stage151_ipc_abi_boundary_audit {
         );
     }
 }
+
+// Stage 152: syscall decomposition-completeness audit + boundary guard-hardening.
+//
+// Stage 152 lands NO new submodule and moves NO source: the mechanical D4
+// decomposition has reached its irreducible IPC/cap dispatch core. Every
+// implementation item still in syscall.rs is either dispatch-owned [D] or an
+// IPC/cap cross-boundary seam ([I]/[R]/[X]) whose move is forbidden by the hard
+// boundary rules AND already pinned by an existing guard (Stage 104/146/147/148).
+// These tests lock the FULL boundary surface so a future agent cannot silently
+// undo it: the complete 10-module set, dispatch ownership, the pinned IPC/cap
+// functions, ABI/visibility contracts, low-risk module hygiene, and the absence
+// of any stale `syscall/mm.rs` reference.
+mod stage152_syscall_decomposition_completeness_audit {
+    // Including each submodule source via include_str! also proves, at compile
+    // time, that every module FILE exists (Task E item 2).
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const CAP_SRC: &str = include_str!("../syscall/cap.rs");
+    const DEBUG_SRC: &str = include_str!("../syscall/debug.rs");
+    const HELPERS_SRC: &str = include_str!("../syscall/helpers.rs");
+    const INITRAMFS_SRC: &str = include_str!("../syscall/initramfs.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_ABI_SRC: &str = include_str!("../syscall/ipc_abi.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const RECV_SHARED_V3_SRC: &str = include_str!("../syscall/recv_shared_v3.rs");
+    const SCHED_SRC: &str = include_str!("../syscall/sched.rs");
+    const VM_SRC: &str = include_str!("../syscall/vm.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const UNLOCKING_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The complete landed module set (10), as the exact `mod x;` declarations
+    // expected in syscall.rs. `dispatch` is intentionally NOT a module — it
+    // stays in syscall.rs.
+    const SUBMODULE_DECLS: &[&str] = &[
+        "mod cap;",
+        "mod debug;",
+        "mod helpers;",
+        "mod initramfs;",
+        "mod ipc;",
+        "mod ipc_abi;",
+        "mod process;",
+        "mod recv_shared_v3;",
+        "mod sched;",
+        "mod vm;",
+    ];
+
+    // The genuinely low-risk modules: non-cap-mutating, non-IPC-ordering. These
+    // must NOT touch IPC locks, cap-slot materialization, or reply-cap lifecycle.
+    const LOW_RISK_SRCS: &[(&str, &str)] = &[
+        ("debug.rs", DEBUG_SRC),
+        ("initramfs.rs", INITRAMFS_SRC),
+        ("sched.rs", SCHED_SRC),
+        ("vm.rs", VM_SRC),
+        ("helpers.rs", HELPERS_SRC),
+        ("ipc_abi.rs", IPC_ABI_SRC),
+    ];
+
+    const ALL_SUBMODULE_SRCS: &[(&str, &str)] = &[
+        ("cap.rs", CAP_SRC),
+        ("debug.rs", DEBUG_SRC),
+        ("helpers.rs", HELPERS_SRC),
+        ("initramfs.rs", INITRAMFS_SRC),
+        ("ipc.rs", IPC_SRC),
+        ("ipc_abi.rs", IPC_ABI_SRC),
+        ("process.rs", PROCESS_SRC),
+        ("recv_shared_v3.rs", RECV_SHARED_V3_SRC),
+        ("sched.rs", SCHED_SRC),
+        ("vm.rs", VM_SRC),
+    ];
+
+    // 1. Every one of the 10 module declarations exists in syscall.rs.
+    #[test]
+    fn stage152_all_ten_modules_declared() {
+        for decl in SUBMODULE_DECLS {
+            assert!(
+                SYSCALL_SRC.contains(decl),
+                "syscall.rs must declare `{decl}` (decomposition completeness)"
+            );
+        }
+        assert_eq!(
+            SUBMODULE_DECLS.len(),
+            10,
+            "the landed syscall submodule set must remain exactly 10 modules"
+        );
+    }
+
+    // 2. No submodule defines a competing dispatch function (any visibility).
+    #[test]
+    fn stage152_no_submodule_defines_dispatch() {
+        for (name, src) in ALL_SUBMODULE_SRCS {
+            assert!(
+                !src.contains("fn dispatch("),
+                "submodule {name} must not define any dispatch function"
+            );
+        }
+    }
+
+    // 3. `pub fn dispatch` is owned exclusively by syscall.rs.
+    #[test]
+    fn stage152_dispatch_owned_by_syscall_rs() {
+        assert!(
+            SYSCALL_SRC.contains("pub fn dispatch("),
+            "pub fn dispatch must remain in syscall.rs"
+        );
+    }
+
+    // 4. SYSCALL_COUNT == 31 (constant + compile-time assertion) preserved.
+    #[test]
+    fn stage152_syscall_count_is_31() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("[(); SYSCALL_COUNT] = [(); 31]"),
+            "compile-time SYSCALL_COUNT==31 assertion must remain in syscall.rs"
+        );
+    }
+
+    // 5. Syscall::VARIANT_COUNT == 23 preserved.
+    #[test]
+    fn stage152_variant_count_is_23() {
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 6. The pinned IPC/cap cross-boundary functions remain in syscall.rs with
+    //    their exact visibilities, and are NOT redefined in any submodule.
+    #[test]
+    fn stage152_pinned_seams_stay_in_syscall_rs() {
+        // complete_blocked_recv_for_waiter — pub(crate), must stay (hard rule).
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("),
+            "complete_blocked_recv_for_waiter must remain pub(crate) in syscall.rs"
+        );
+        // materialize_received_message_cap — pub(super), must stay (hard rule).
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
+            "materialize_received_message_cap must remain pub(super) in syscall.rs"
+        );
+        // materialize_received_message_cap_routed — Stage 104 router seam.
+        assert!(
+            SYSCALL_SRC.contains("fn materialize_received_message_cap_routed("),
+            "materialize_received_message_cap_routed must remain defined in syscall.rs"
+        );
+        // clear_blocked_recv_state — pub(super), blocked-recv state helper.
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn clear_blocked_recv_state("),
+            "clear_blocked_recv_state must remain pub(super) in syscall.rs"
+        );
+        // try_endpoint_split_recv — pub(super) split fast-path seam.
+        assert!(
+            SYSCALL_SRC.contains("pub(super) fn try_endpoint_split_recv("),
+            "try_endpoint_split_recv must remain pub(super) in syscall.rs"
+        );
+        // Both split-recv seams stay (test helper + live path).
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn try_split_recv_queued_plain_into_frame_locked("),
+            "try_split_recv_queued_plain_into_frame_locked must remain in syscall.rs"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub(crate) fn try_split_recv_queued_plain_with_snapshot_locked("),
+            "try_split_recv_queued_plain_with_snapshot_locked must remain in syscall.rs"
+        );
+        // None of these is redefined in a submodule.
+        for (name, src) in ALL_SUBMODULE_SRCS {
+            assert!(
+                !src.contains("fn complete_blocked_recv_for_waiter("),
+                "{name} must not define complete_blocked_recv_for_waiter"
+            );
+            assert!(
+                !src.contains("fn materialize_received_message_cap_routed("),
+                "{name} must not define materialize_received_message_cap_routed"
+            );
+            assert!(
+                !src.contains("fn try_endpoint_split_recv("),
+                "{name} must not define try_endpoint_split_recv"
+            );
+        }
+    }
+
+    // 7. IPC_RECV_META_V2_ENCODED_LEN stays in syscall.rs (pub(super) const) and
+    //    is never duplicated/redefined in any submodule (recv-v2 metadata layout).
+    #[test]
+    fn stage152_recv_meta_len_not_duplicated() {
+        assert!(
+            SYSCALL_SRC.contains("pub(super) const IPC_RECV_META_V2_ENCODED_LEN"),
+            "IPC_RECV_META_V2_ENCODED_LEN must remain pub(super) const in syscall.rs"
+        );
+        for (name, src) in ALL_SUBMODULE_SRCS {
+            assert!(
+                !src.contains("const IPC_RECV_META_V2_ENCODED_LEN"),
+                "{name} must not define/duplicate IPC_RECV_META_V2_ENCODED_LEN"
+            );
+        }
+    }
+
+    // 8. Module boundary docs are intact: ipc.rs stateful, ipc_abi.rs pure codec,
+    //    syscall.rs dispatch owner.
+    #[test]
+    fn stage152_boundary_docs_intact() {
+        assert!(
+            IPC_SRC.contains("implementation module only"),
+            "ipc.rs must keep its stateful-IPC implementation-only boundary doc"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("pure IPC ABI/frame codec only"),
+            "ipc_abi.rs must keep its pure-codec boundary doc"
+        );
+        assert!(
+            IPC_ABI_SRC.contains("syscall.rs` remains dispatch owner"),
+            "ipc_abi.rs doc must keep naming syscall.rs as dispatch owner"
+        );
+    }
+
+    // 9. helpers.rs visibility / re-export contract remains (Stage 149).
+    #[test]
+    fn stage152_helpers_reexport_contract_intact() {
+        assert!(
+            SYSCALL_SRC
+                .contains("pub(crate) use self::helpers::{round_up_page, validate_user_region}"),
+            "syscall.rs must keep re-exporting helpers' pub(crate) items"
+        );
+        assert!(
+            SYSCALL_SRC.contains("use self::helpers::{"),
+            "syscall.rs must keep the private re-export of pub(super) helpers"
+        );
+        assert!(
+            HELPERS_SRC.contains("[S] group"),
+            "helpers.rs must keep identifying the [S] group in its module doc"
+        );
+    }
+
+    // 10. D6/CR3/PF diagnostic markers preserved (must not be removed).
+    #[test]
+    fn stage152_d6_cr3_pf_markers_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: LIVE_OFF_TRAP"),
+            "syscall.rs must retain VALIDATION: LIVE_OFF_TRAP"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: SPLIT_FAST_PATH_ONLY"),
+            "syscall.rs must retain VALIDATION: SPLIT_FAST_PATH_ONLY"
+        );
+        assert!(
+            SYSCALL_SRC.contains("VALIDATION: GLOBAL_LOCK_SLOW_PATH"),
+            "syscall.rs must retain VALIDATION: GLOBAL_LOCK_SLOW_PATH"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE"),
+            "arch/trap_entry.rs must retain the D6 controlled-switch proof marker"
+        );
+    }
+
+    // 11. Low-risk module hygiene: only the audited IPC module (ipc.rs) may touch
+    //     ipc_state_lock. No other submodule may reference it.
+    #[test]
+    fn stage152_only_ipc_module_touches_ipc_state_lock() {
+        for (name, src) in ALL_SUBMODULE_SRCS {
+            if *name == "ipc.rs" {
+                continue;
+            }
+            assert!(
+                !src.contains("ipc_state_lock"),
+                "{name} must not reference ipc_state_lock (only the audited ipc.rs may)"
+            );
+        }
+    }
+
+    // 12. Low-risk modules do not mention cap-slot materialization or reply-cap
+    //     lifecycle (those belong to the IPC/cap seams in syscall.rs / ipc.rs /
+    //     recv_shared_v3.rs).
+    #[test]
+    fn stage152_low_risk_modules_free_of_cap_lifecycle() {
+        for (name, src) in LOW_RISK_SRCS {
+            assert!(
+                !src.contains("materialize_received_message_cap"),
+                "{name} (low-risk) must not mention cap-slot materialization"
+            );
+            assert!(
+                !src.contains("set_reply_cap_waiter_cap"),
+                "{name} (low-risk) must not mention reply-cap lifecycle"
+            );
+            assert!(
+                !src.contains("rollback_materialized_recv_cap"),
+                "{name} (low-risk) must not mention materialized-cap rollback"
+            );
+        }
+    }
+
+    // 13. ipc.rs still imports the split-recv seam from super (no duplicate copy).
+    #[test]
+    fn stage152_ipc_imports_split_recv_from_super() {
+        assert!(
+            IPC_SRC.contains("try_endpoint_split_recv"),
+            "ipc.rs must keep importing try_endpoint_split_recv from super"
+        );
+        assert!(
+            IPC_SRC.contains("clear_blocked_recv_state"),
+            "ipc.rs must keep importing clear_blocked_recv_state from super"
+        );
+    }
+
+    // 14. No stale `syscall/mm.rs` reference anywhere we control: not declared as a
+    //     module, not referenced in syscall.rs, and not mentioned in the doc.
+    #[test]
+    fn stage152_no_stale_mm_module_reference() {
+        assert!(
+            !SYSCALL_SRC.contains("mod mm;"),
+            "syscall.rs must not declare a nonexistent `mod mm;`"
+        );
+        assert!(
+            !SYSCALL_SRC.contains("syscall/mm.rs"),
+            "syscall.rs must not reference a nonexistent syscall/mm.rs"
+        );
+        assert!(
+            !UNLOCKING_DOC.contains("syscall/mm.rs"),
+            "KERNEL_UNLOCKING.md must not mention a nonexistent syscall/mm.rs"
+        );
+    }
+
+    // 15. The Stage 152 audit is recorded in the decomposition map and the doc,
+    //     including the irreducible-core rationale.
+    #[test]
+    fn stage152_audit_recorded_in_map_and_doc() {
+        assert!(
+            SYSCALL_SRC.contains("Stage 152: decomposition-completeness audit"),
+            "syscall.rs decomposition map must record the Stage 152 audit"
+        );
+        assert!(
+            SYSCALL_SRC.contains("irreducible core"),
+            "syscall.rs map must state the decomposition reached its irreducible core"
+        );
+        assert!(
+            UNLOCKING_DOC.contains("irreducible IPC/cap dispatch core"),
+            "KERNEL_UNLOCKING.md must describe the irreducible IPC/cap dispatch core"
+        );
+        assert!(
+            UNLOCKING_DOC.contains("stage152_syscall_decomposition_completeness_audit"),
+            "KERNEL_UNLOCKING.md must name the Stage 152 guard module"
+        );
+    }
+
+    // 16. No submodule re-declares dispatch ownership by redefining the Syscall
+    //     enum or SYSCALL_COUNT (ABI/dispatch types are syscall.rs-owned).
+    #[test]
+    fn stage152_submodules_do_not_own_dispatch_types() {
+        for (name, src) in ALL_SUBMODULE_SRCS {
+            assert!(
+                !src.contains("pub enum Syscall"),
+                "{name} must not redefine the Syscall dispatch enum"
+            );
+            assert!(
+                !src.contains("const SYSCALL_COUNT:"),
+                "{name} must not redefine SYSCALL_COUNT"
+            );
+        }
+    }
+}
