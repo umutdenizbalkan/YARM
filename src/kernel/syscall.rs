@@ -116,6 +116,26 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 //       materialize_received_message_cap (cap-slot + TrapFrame ordering),
 //       complete_blocked_recv_for_waiter (same)
 //
+// ── Stage 152: decomposition-completeness audit (zero behavior change) ─────────
+// Stage 152 is an audit + guard-hardening pass; it lands NO new submodule and
+// moves NO source. Rationale: the mechanical D4 decomposition has reached its
+// irreducible core. Every implementation item still in syscall.rs is one of:
+//   * [D] the dispatch table / ABI types / thin delegation shims, or
+//   * [I]/[R]/[X] an IPC/cap cross-boundary seam whose move is forbidden by the
+//     hard boundary rules AND already pinned in place by existing source-guard
+//     tests (stage104 pins `materialize_received_message_cap_routed`;
+//     stage147/148 pin `try_endpoint_split_recv`, the two
+//     `try_split_recv_queued_plain_*` seams, `clear_blocked_recv_state`,
+//     `complete_blocked_recv_for_waiter`, and `materialize_received_message_cap`).
+// There is therefore no remaining low-risk, non-cap, non-ordering group to peel
+// off. The "preferred safe groups" (debug, initramfs, control/cap, process,
+// sched, vm) all landed in earlier stages. Stage 152 instead locks the full
+// boundary surface (module set, visibilities, dispatch ownership,
+// SYSCALL_COUNT==31 / VARIANT_COUNT==23, the pinned IPC/cap functions, low-risk
+// module hygiene, no stale nonexistent-`mm`-submodule reference) via boot::tests::
+// stage152_syscall_decomposition_completeness_audit so future agents cannot
+// silently undo the boundaries. See doc/KERNEL_UNLOCKING.md §5.1.
+//
 // NOTE: these `mod` declarations must stay AFTER the `syscall_trace!` macro
 // definition above (textual macro scoping).
 mod cap;
