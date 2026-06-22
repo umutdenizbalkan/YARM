@@ -39436,12 +39436,20 @@ mod stage147_ipc_boundary_audit {
         );
     }
 
-    // 4. materialize_received_message_cap must stay in syscall.rs, not move to ipc.rs.
+    // 4. materialize_received_message_cap is the recv-side cap-materialization
+    //    cluster; Stage 158 re-homed it into ipc_recv_core.rs (re-exported by
+    //    syscall.rs). It must never be defined in ipc.rs.
     #[test]
     fn stage147_materialize_cap_stays_in_syscall() {
+        const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
         assert!(
-            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
-            "materialize_received_message_cap must remain in syscall.rs"
+            IPC_RECV_CORE_SRC.contains("pub(crate) fn materialize_received_message_cap("),
+            "materialize_received_message_cap must live in ipc_recv_core.rs (Stage 158 re-home)"
+        );
+        assert!(
+            SYSCALL_SRC.contains("use self::ipc_recv_core::{")
+                && SYSCALL_SRC.contains("materialize_received_message_cap"),
+            "syscall.rs must re-export materialize_received_message_cap from ipc_recv_core"
         );
         assert!(
             !IPC_SRC.contains("fn materialize_received_message_cap("),
@@ -39727,9 +39735,12 @@ mod stage148_decomposition_map {
             SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("),
             "complete_blocked_recv_for_waiter must remain in syscall.rs"
         );
+        // Stage 158: materialize_received_message_cap re-homed to ipc_recv_core.rs
+        // (re-exported by syscall.rs).
         assert!(
-            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
-            "materialize_received_message_cap must remain in syscall.rs"
+            SYSCALL_SRC.contains("use self::ipc_recv_core::{")
+                && SYSCALL_SRC.contains("materialize_received_message_cap"),
+            "materialize_received_message_cap must be re-exported from ipc_recv_core"
         );
         assert!(
             SYSCALL_SRC.contains("pub(super) fn try_endpoint_split_recv("),
@@ -40533,16 +40544,23 @@ mod stage152_syscall_decomposition_completeness_audit {
             SYSCALL_SRC.contains("pub(crate) fn complete_blocked_recv_for_waiter("),
             "complete_blocked_recv_for_waiter must remain pub(crate) in syscall.rs"
         );
-        // materialize_received_message_cap — pub(super), must stay (hard rule).
-        assert!(
-            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
-            "materialize_received_message_cap must remain pub(super) in syscall.rs"
-        );
-        // materialize_received_message_cap_routed — Stage 104 router seam.
-        assert!(
-            SYSCALL_SRC.contains("fn materialize_received_message_cap_routed("),
-            "materialize_received_message_cap_routed must remain defined in syscall.rs"
-        );
+        // materialize_received_message_cap + _routed — Stage 158 re-homed the
+        // cap-materialization cluster into ipc_recv_core.rs (re-exported here).
+        {
+            const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+            assert!(
+                IPC_RECV_CORE_SRC.contains("pub(crate) fn materialize_received_message_cap("),
+                "materialize_received_message_cap must live in ipc_recv_core.rs (Stage 158)"
+            );
+            assert!(
+                IPC_RECV_CORE_SRC.contains("pub(crate) fn materialize_received_message_cap_routed("),
+                "materialize_received_message_cap_routed must live in ipc_recv_core.rs (Stage 158)"
+            );
+            assert!(
+                SYSCALL_SRC.contains("use self::ipc_recv_core::{"),
+                "syscall.rs must re-export the cap-materialization cluster from ipc_recv_core"
+            );
+        }
         // clear_blocked_recv_state — pub(super), blocked-recv state helper.
         assert!(
             SYSCALL_SRC.contains("pub(super) fn clear_blocked_recv_state("),
@@ -40808,13 +40826,36 @@ mod stage153_ipc_cap_boundary_audit {
         "fn try_split_recv_queued_plain_with_snapshot_locked(",
     ];
 
-    // 1. All pinned functions are still defined in syscall.rs.
+    // Stage 158: the cap-materialization trio re-homed to ipc_recv_core.rs; the
+    // queued-split delivery cluster stays in syscall.rs (no cross-arch proof for
+    // IPC_RECV_V2_META_QUEUED_SPLIT_OK on AArch64 — queued split must not move).
+    const CORE_OWNED_FN_DEFS: &[&str] = &[
+        "fn materialize_received_transfer_cap(",
+        "fn materialize_received_message_cap(",
+        "fn materialize_received_message_cap_routed(",
+    ];
+    const SYSCALL_OWNED_FN_DEFS: &[&str] = &[
+        "fn clear_blocked_recv_state(",
+        "fn complete_blocked_recv_for_waiter(",
+        "fn try_endpoint_split_recv(",
+        "fn try_split_recv_queued_plain_into_frame_locked(",
+        "fn try_split_recv_queued_plain_with_snapshot_locked(",
+    ];
+
+    // 1. Each pinned function is defined in its post-Stage-158 owner module.
     #[test]
     fn stage153_pinned_functions_defined_in_syscall_rs() {
-        for def in PINNED_FN_DEFS {
+        const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+        for def in SYSCALL_OWNED_FN_DEFS {
             assert!(
                 SYSCALL_SRC.contains(def),
                 "pinned seam `{def}` must remain defined in syscall.rs"
+            );
+        }
+        for def in CORE_OWNED_FN_DEFS {
+            assert!(
+                IPC_RECV_CORE_SRC.contains(def),
+                "cap-materialization seam `{def}` must live in ipc_recv_core.rs (Stage 158)"
             );
         }
     }
@@ -40843,28 +40884,35 @@ mod stage153_ipc_cap_boundary_audit {
         );
     }
 
-    // 4/5/6. The cap-materialization trio stays in syscall.rs with its current
-    //        visibility surface (canonical, transfer helper, D1/D5 router).
+    // 4/5/6. Stage 158: the cap-materialization trio re-homed to ipc_recv_core.rs.
+    //        The two entry points are pub(crate) (re-exported by syscall.rs); the
+    //        transfer helper stays module-private (cap-mutation helper).
     #[test]
     fn stage153_cap_materialization_trio_in_syscall_rs() {
+        const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
         assert!(
-            SYSCALL_SRC.contains("pub(super) fn materialize_received_message_cap("),
-            "materialize_received_message_cap must remain pub(super) in syscall.rs"
+            IPC_RECV_CORE_SRC.contains("pub(crate) fn materialize_received_message_cap("),
+            "materialize_received_message_cap must be pub(crate) in ipc_recv_core.rs"
         );
         // private helper (no visibility keyword) — must not have leaked wider.
         assert!(
-            SYSCALL_SRC.contains("fn materialize_received_transfer_cap("),
-            "materialize_received_transfer_cap must remain defined in syscall.rs"
+            IPC_RECV_CORE_SRC.contains("fn materialize_received_transfer_cap("),
+            "materialize_received_transfer_cap must remain defined in ipc_recv_core.rs"
         );
         assert!(
-            !SYSCALL_SRC.contains("pub fn materialize_received_transfer_cap(")
-                && !SYSCALL_SRC.contains("pub(crate) fn materialize_received_transfer_cap(")
-                && !SYSCALL_SRC.contains("pub(super) fn materialize_received_transfer_cap("),
+            !IPC_RECV_CORE_SRC.contains("pub fn materialize_received_transfer_cap(")
+                && !IPC_RECV_CORE_SRC.contains("pub(crate) fn materialize_received_transfer_cap(")
+                && !IPC_RECV_CORE_SRC.contains("pub(super) fn materialize_received_transfer_cap("),
             "materialize_received_transfer_cap must stay module-private (cap-mutation helper)"
         );
         assert!(
-            SYSCALL_SRC.contains("fn materialize_received_message_cap_routed("),
-            "materialize_received_message_cap_routed must remain defined in syscall.rs"
+            IPC_RECV_CORE_SRC.contains("pub(crate) fn materialize_received_message_cap_routed("),
+            "materialize_received_message_cap_routed must be pub(crate) in ipc_recv_core.rs"
+        );
+        // syscall.rs must re-export both entry points so all call sites resolve.
+        assert!(
+            SYSCALL_SRC.contains("use self::ipc_recv_core::{"),
+            "syscall.rs must re-export the cap-materialization cluster"
         );
     }
 
@@ -40930,12 +40978,15 @@ mod stage153_ipc_cap_boundary_audit {
         }
     }
 
-    // 10. Stage 153 was audit-only. Stage 154 then DELIBERATELY created
-    //     syscall/ipc_recv_core.rs as a pure-helper scaffold (Option 2). This
-    //     guard is updated (per the hard-rule allowance) to an equally-strong
-    //     replacement: now that the module exists, it must NOT own dispatch and
-    //     must NOT absorb any stateful cap/materialization seam — only the pure
-    //     encoder. The detailed enforcement lives in stage154_*.
+    // 10. Stage 153 was audit-only; Stage 154 created ipc_recv_core.rs as a pure
+    //     encoder scaffold; Stage 158 then re-homed the cap-materialization trio
+    //     into it (QEMU-validated). This guard is updated (per the hard-rule
+    //     allowance) to an equally-strong replacement: ipc_recv_core.rs must NOT
+    //     own dispatch and must NOT absorb the queued-split DELIVERY cluster
+    //     (complete_blocked_recv_for_waiter + the try_split_* / try_endpoint_split
+    //     seams), which has no cross-arch byte-identical proof (AArch64 manual
+    //     oracle did not exercise IPC_RECV_V2_META_QUEUED_SPLIT_OK). Owning the
+    //     cap-materialization trio is now allowed and enforced by tests 1/4/5/6.
     #[test]
     fn stage153_ipc_recv_core_stays_pure_helper_only() {
         const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
@@ -40945,14 +40996,15 @@ mod stage153_ipc_cap_boundary_audit {
         );
         for def in &[
             "fn complete_blocked_recv_for_waiter(",
-            "fn materialize_received_message_cap(",
-            "fn materialize_received_message_cap_routed(",
-            "fn materialize_received_transfer_cap(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn clear_blocked_recv_state(",
         ] {
             assert!(
                 !IPC_RECV_CORE_SRC.contains(def),
-                "ipc_recv_core.rs must not own stateful seam `{def}` \
-                 (Stage 154 moved only the pure recv-v2 encoder)"
+                "ipc_recv_core.rs must not own queued-split delivery seam `{def}` \
+                 (no cross-arch QUEUED_SPLIT proof — must stay in syscall.rs)"
             );
         }
         assert!(
@@ -41200,14 +41252,14 @@ mod stage154_ipc_recv_core_boundary {
         );
     }
 
-    // 13. ipc_recv_core.rs (and ipc_abi.rs) remain pure: no cap mutation, no IPC
-    //     lock, no reply-cap lifecycle, no user copy, no VM mutation. The module
-    //     docs are allowed to *name* these APIs to describe the future
-    //     migration, so we forbid the CALL form (`name(`) — an actual side
-    //     effect — for the function-style APIs, and the bare lock name.
+    // 13. ipc_abi.rs remains fully pure. ipc_recv_core.rs, after Stage 158, owns
+    //     the cap-materialization cluster, so it legitimately mints/grants/records
+    //     reply caps — but it must NOT absorb the queued-split DELIVERY concerns
+    //     that stayed in syscall.rs: user writeback (copy_to_user), shared-region
+    //     mapping (map_shared_region), the rollback driver, or the IPC lock.
     #[test]
     fn stage154_recv_core_and_ipc_abi_remain_pure() {
-        // Call-form forbidden: a parenthesized call is a real side effect.
+        // ipc_abi.rs: fully pure — none of these stateful calls may appear.
         for forbidden_call in &[
             "materialize_received_message_cap(",
             "set_reply_cap_waiter_cap(",
@@ -41218,15 +41270,22 @@ mod stage154_ipc_recv_core_boundary {
             "map_shared_region(",
         ] {
             assert!(
-                !IPC_RECV_CORE_SRC.contains(forbidden_call),
-                "ipc_recv_core.rs must remain pure: must not CALL `{forbidden_call}`"
-            );
-            assert!(
                 !IPC_ABI_SRC.contains(forbidden_call),
                 "ipc_abi.rs must remain pure: must not CALL `{forbidden_call}`"
             );
         }
-        // Lock acquisition: the lock name must not appear at all.
+        // ipc_recv_core.rs: must not absorb the delivery concerns that stayed.
+        for forbidden_call in &[
+            "rollback_materialized_recv_cap(",
+            "copy_to_user(",
+            "map_shared_region(",
+        ] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(forbidden_call),
+                "ipc_recv_core.rs must not absorb delivery concern: must not CALL `{forbidden_call}`"
+            );
+        }
+        // Lock acquisition: the lock name must not appear in either module.
         assert!(
             !IPC_RECV_CORE_SRC.contains("ipc_state_lock"),
             "ipc_recv_core.rs must not reference ipc_state_lock"
@@ -41246,27 +41305,40 @@ mod stage154_ipc_recv_core_boundary {
         );
     }
 
-    // 15. syscall.rs remains the seam owner: this stage re-homed only a PURE
-    //     helper, so every stateful cap/materialization seam still lives in
-    //     syscall.rs and NOT in ipc_recv_core.rs.
+    // 15. Seam ownership after Stage 158: the queued-split DELIVERY cluster still
+    //     lives in syscall.rs and NOT in ipc_recv_core.rs (no cross-arch
+    //     QUEUED_SPLIT proof). The cap-materialization trio was re-homed into
+    //     ipc_recv_core.rs (QEMU-validated) and must NOT remain defined in
+    //     syscall.rs (it is re-exported instead).
     #[test]
     fn stage154_stateful_seams_still_pinned_in_syscall_rs() {
         for def in &[
             "fn complete_blocked_recv_for_waiter(",
-            "fn materialize_received_message_cap(",
-            "fn materialize_received_message_cap_routed(",
-            "fn materialize_received_transfer_cap(",
             "fn try_endpoint_split_recv(",
             "fn try_split_recv_queued_plain_with_snapshot_locked(",
             "fn clear_blocked_recv_state(",
         ] {
             assert!(
                 SYSCALL_SRC.contains(def),
-                "stateful seam `{def}` must remain defined in syscall.rs"
+                "queued-split seam `{def}` must remain defined in syscall.rs"
             );
             assert!(
                 !IPC_RECV_CORE_SRC.contains(def),
-                "Stage 154 must NOT move stateful seam `{def}` into ipc_recv_core.rs"
+                "queued-split seam `{def}` must NOT move into ipc_recv_core.rs"
+            );
+        }
+        for def in &[
+            "fn materialize_received_message_cap(",
+            "fn materialize_received_message_cap_routed(",
+            "fn materialize_received_transfer_cap(",
+        ] {
+            assert!(
+                IPC_RECV_CORE_SRC.contains(def),
+                "Stage 158 cap-materialization seam `{def}` must live in ipc_recv_core.rs"
+            );
+            assert!(
+                !SYSCALL_SRC.contains(def),
+                "Stage 158 re-homed `{def}`; syscall.rs must re-export, not define it"
             );
         }
     }
@@ -41401,26 +41473,38 @@ mod stage155_recv_v2_codec_convergence {
         );
     }
 
-    // 9. All stateful cap/materialization seams remain pinned in syscall.rs and
-    //    are NOT moved into ipc_recv_core.rs (pure-codec stage only).
+    // 9. Seam ownership after Stage 158: the queued-split delivery cluster stays
+    //    pinned in syscall.rs; the cap-materialization trio lives in
+    //    ipc_recv_core.rs (re-exported by syscall.rs).
     #[test]
     fn stage155_stateful_seams_still_pinned() {
         for def in &[
             "fn complete_blocked_recv_for_waiter(",
-            "fn materialize_received_message_cap(",
-            "fn materialize_received_message_cap_routed(",
-            "fn materialize_received_transfer_cap(",
             "fn try_endpoint_split_recv(",
             "fn try_split_recv_queued_plain_with_snapshot_locked(",
             "fn clear_blocked_recv_state(",
         ] {
             assert!(
                 SYSCALL_SRC.contains(def),
-                "stateful seam `{def}` must remain defined in syscall.rs"
+                "queued-split seam `{def}` must remain defined in syscall.rs"
             );
             assert!(
                 !IPC_RECV_CORE_SRC.contains(def),
-                "Stage 155 must NOT move stateful seam `{def}` into ipc_recv_core.rs"
+                "queued-split seam `{def}` must NOT move into ipc_recv_core.rs"
+            );
+        }
+        for def in &[
+            "fn materialize_received_message_cap(",
+            "fn materialize_received_message_cap_routed(",
+            "fn materialize_received_transfer_cap(",
+        ] {
+            assert!(
+                IPC_RECV_CORE_SRC.contains(def),
+                "cap-materialization seam `{def}` must live in ipc_recv_core.rs (Stage 158)"
+            );
+            assert!(
+                !SYSCALL_SRC.contains(def),
+                "Stage 158 re-homed `{def}`; syscall.rs must re-export, not define it"
             );
         }
     }
@@ -41473,6 +41557,7 @@ mod stage155_recv_v2_codec_convergence {
     // 14. ipc_recv_core.rs and ipc_abi.rs remain pure (call-form side-effect check).
     #[test]
     fn stage155_pure_modules_stay_pure() {
+        // ipc_abi.rs stays fully pure.
         for forbidden_call in &[
             "materialize_received_message_cap(",
             "set_reply_cap_waiter_cap(",
@@ -41483,12 +41568,20 @@ mod stage155_recv_v2_codec_convergence {
             "map_shared_region(",
         ] {
             assert!(
-                !IPC_RECV_CORE_SRC.contains(forbidden_call),
-                "ipc_recv_core.rs must remain pure: must not CALL `{forbidden_call}`"
-            );
-            assert!(
                 !IPC_ABI_SRC.contains(forbidden_call),
                 "ipc_abi.rs must remain pure: must not CALL `{forbidden_call}`"
+            );
+        }
+        // ipc_recv_core.rs (Stage 158 owns cap-materialization) must still not
+        // absorb the queued-split delivery concerns that stayed in syscall.rs.
+        for forbidden_call in &[
+            "rollback_materialized_recv_cap(",
+            "copy_to_user(",
+            "map_shared_region(",
+        ] {
+            assert!(
+                !IPC_RECV_CORE_SRC.contains(forbidden_call),
+                "ipc_recv_core.rs must not absorb delivery concern: must not CALL `{forbidden_call}`"
             );
         }
         assert!(
@@ -41559,62 +41652,80 @@ mod stage156_ipc_smoke_oracle {
         }
     }
 
-    // 2. ipc_recv_core.rs still owns only pure codec/helper logic (call-form
-    //    side-effect check) — adding the oracle markers must not have leaked any
-    //    stateful call into the pure module.
+    // 2. ipc_recv_core.rs boundary after Stage 158. It now legitimately owns the
+    //    cap-materialization cluster (so mint_capability_in_cnode /
+    //    grant_task_to_task_with_rights / set_reply_cap_waiter_cap are expected),
+    //    but it must NOT absorb the queued-split DELIVERY concerns that stayed in
+    //    syscall.rs: no user writeback (copy_to_user), no shared-region mapping
+    //    (map_shared_region), no rollback driver, and no IPC-lock reference.
     #[test]
     fn stage156_ipc_recv_core_still_pure() {
         for forbidden_call in &[
-            "materialize_received_message_cap(",
-            "set_reply_cap_waiter_cap(",
             "rollback_materialized_recv_cap(",
-            "mint_capability_in_cnode(",
-            "grant_task_to_task_with_rights(",
             "copy_to_user(",
             "map_shared_region(",
         ] {
             assert!(
                 !IPC_RECV_CORE_SRC.contains(forbidden_call),
-                "ipc_recv_core.rs must remain pure: must not CALL `{forbidden_call}`"
+                "ipc_recv_core.rs must not absorb delivery concern: must not CALL `{forbidden_call}`"
             );
         }
         assert!(
             !IPC_RECV_CORE_SRC.contains("ipc_state_lock"),
             "ipc_recv_core.rs must not reference ipc_state_lock"
         );
+        // Positive: the cap-materialization cluster it now owns really is here.
+        assert!(
+            IPC_RECV_CORE_SRC.contains("mint_capability_in_cnode(")
+                && IPC_RECV_CORE_SRC.contains("grant_task_to_task_with_rights("),
+            "ipc_recv_core.rs must own the cap-materialization cluster after Stage 158"
+        );
     }
 
-    // 3/6. Stateful cap/materialization seams remain pinned in syscall.rs and
-    //      were NOT moved into ipc_recv_core.rs (Option A: QEMU unavailable).
+    // 3/6. Seam ownership after Stage 158: the queued-split delivery cluster
+    //      stays in syscall.rs; the cap-materialization trio moved to
+    //      ipc_recv_core.rs (QEMU-validated; queued split has no cross-arch proof).
     #[test]
     fn stage156_stateful_seams_still_pinned() {
         for def in &[
-            "fn complete_blocked_recv_for_waiter(",
             "fn materialize_received_message_cap(",
             "fn materialize_received_message_cap_routed(",
             "fn materialize_received_transfer_cap(",
+        ] {
+            assert!(
+                IPC_RECV_CORE_SRC.contains(def),
+                "cap-materialization seam `{def}` must live in ipc_recv_core.rs (Stage 158)"
+            );
+            assert!(
+                !SYSCALL_SRC.contains(def),
+                "Stage 158 re-homed `{def}`; syscall.rs must re-export, not define it"
+            );
+        }
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
             "fn try_endpoint_split_recv(",
             "fn try_split_recv_queued_plain_with_snapshot_locked(",
             "fn clear_blocked_recv_state(",
         ] {
             assert!(
                 SYSCALL_SRC.contains(def),
-                "stateful seam `{def}` must remain defined in syscall.rs"
+                "queued-split seam `{def}` must remain defined in syscall.rs"
             );
             assert!(
                 !IPC_RECV_CORE_SRC.contains(def),
-                "Stage 156 (QEMU unavailable) must NOT move `{def}` into ipc_recv_core.rs"
+                "queued-split seam `{def}` must NOT move into ipc_recv_core.rs"
             );
         }
     }
 
     // 4. Every Stage 156 oracle marker is emitted somewhere in the kernel IPC
-    //    delivery paths (syscall.rs or syscall/ipc.rs).
+    //    delivery paths. After Stage 158 the reply/transfer materialize markers
+    //    live in ipc_recv_core.rs (the re-homed cluster), so include it.
     #[test]
     fn stage156_oracle_markers_exist_in_source() {
         for m in ORACLE_MARKERS {
             assert!(
-                SYSCALL_SRC.contains(m) || IPC_SRC.contains(m),
+                SYSCALL_SRC.contains(m) || IPC_SRC.contains(m) || IPC_RECV_CORE_SRC.contains(m),
                 "oracle marker `{m}` must be emitted in the IPC delivery paths"
             );
         }
@@ -41736,13 +41847,15 @@ mod stage156_ipc_smoke_oracle {
 #[cfg(test)]
 mod stage157_ipc_oracle_live_path {
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
     const ORACLE_SCRIPT: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
 
     // 1. The reply-cap and transfer-cap oracle markers are emitted on the LIVE
     //    split arms (alongside the YARM_D1/D5_SPLIT_MATERIALIZE markers), not
-    //    only in the canonical fallback. We check co-location by confirming both
-    //    the split marker and the oracle marker appear in syscall.rs and that the
-    //    routed materializer still returns through the split arms first.
+    //    only in the canonical fallback. Stage 158 re-homed the router + canonical
+    //    helpers into ipc_recv_core.rs, so both the split markers and the oracle
+    //    markers now live there. We check co-location and the path-agnostic
+    //    property (the oracle fires whichever arm runs).
     #[test]
     fn stage157_live_split_arms_emit_oracle_markers() {
         for m in [
@@ -41752,21 +41865,26 @@ mod stage157_ipc_oracle_live_path {
             "IPC_REPLY_CAP_ONESHOT_OK",
         ] {
             assert!(
-                SYSCALL_SRC.contains(m),
-                "syscall.rs must emit `{m}` so the live boot workload proves it"
+                IPC_RECV_CORE_SRC.contains(m),
+                "ipc_recv_core.rs must emit `{m}` so the live boot workload proves it"
             );
         }
         // The routed materializer is the live entry the recv paths call.
         assert!(
-            SYSCALL_SRC.contains("fn materialize_received_message_cap_routed"),
-            "the live split router must still exist"
+            IPC_RECV_CORE_SRC.contains("fn materialize_received_message_cap_routed"),
+            "the live split router must still exist (in ipc_recv_core.rs after Stage 158)"
         );
-        // Each oracle marker must appear at least twice in syscall.rs: once on the
-        // live split arm and once on the canonical fallback arm. This pins the
-        // path-agnostic property (the oracle fires regardless of which arm runs).
+        // syscall.rs re-exports the router so all recv call sites resolve.
+        assert!(
+            SYSCALL_SRC.contains("materialize_received_message_cap_routed"),
+            "syscall.rs must still reference (re-export + call) the router"
+        );
+        // Each oracle marker must appear at least twice: once on the live split
+        // arm and once on the canonical fallback arm. This pins the path-agnostic
+        // property (the oracle fires regardless of which arm runs).
         for m in ["IPC_TRANSFER_CAP_MATERIALIZE_OK", "IPC_REPLY_CAP_ONESHOT_OK"] {
             assert!(
-                SYSCALL_SRC.matches(m).count() >= 2,
+                IPC_RECV_CORE_SRC.matches(m).count() >= 2,
                 "`{m}` must be emitted on both the live split arm and the canonical arm"
             );
         }

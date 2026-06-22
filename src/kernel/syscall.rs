@@ -2,7 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 use super::boot::{IpcEndpointRecvResult, IpcSchedulerPlan, KernelError, KernelState};
-use super::capabilities::{CapId, CapObject, CapRights, Capability};
+use super::capabilities::{CapId, CapObject, CapRights};
 use super::ipc::{Message, pack_register_payload};
 use super::trap::FaultAccess;
 use super::trapframe::TrapFrame;
@@ -222,6 +222,20 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // and the const itself REMAIN pinned in syscall.rs: re-homing them requires
 // QEMU smoke proof of byte-identical delivery, which is unavailable here. See
 // doc/KERNEL_UNLOCKING.md §5.1.2 and boot::tests::stage154_ipc_recv_core_boundary.
+//
+// ── Stage 158: cap-materialization trio re-homed (QEMU-validated) ─────────────
+// With the Stage 156/157 oracle validated on x86_64 (extended) and AArch64
+// (manual) for the D1/D5 materialization markers, the cap-materialization trio
+// — materialize_received_transfer_cap, materialize_received_message_cap, and the
+// D1/D5 router materialize_received_message_cap_routed — moved into
+// ipc_recv_core.rs. syscall.rs re-exports the two entry points (see the
+// `pub(crate) use self::ipc_recv_core::{...}` below), so the BLOCKER SUMMARY
+// above is historical for that trio. The queued-split DELIVERY cluster
+// (complete_blocked_recv_for_waiter, try_endpoint_split_recv, the
+// try_split_recv_queued_plain_*_locked seams, clear_blocked_recv_state) STAYS
+// pinned here: the AArch64 manual oracle did not exercise
+// IPC_RECV_V2_META_QUEUED_SPLIT_OK, so queued-split has no cross-arch
+// byte-identical proof and must not move. See doc/KERNEL_UNLOCKING.md §5.1.6.
 //
 // NOTE: these `mod` declarations must stay AFTER the `syscall_trace!` macro
 // definition above (textual macro scoping).
@@ -557,313 +571,13 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     Ok(())
 }
 
-fn materialize_received_transfer_cap(
-    kernel: &mut KernelState,
-    transfer_handle: Option<u64>,
-    endpoint: CapObject,
-    receiver_tid: u64,
-) -> Result<Option<u64>, SyscallError> {
-    let Some(handle) = transfer_handle else {
-        return Ok(None);
-    };
-    let envelope = kernel
-        .take_transfer_envelope(handle, endpoint, crate::kernel::ipc::ThreadId(receiver_tid))
-        .ok_or(SyscallError::InvalidCapability)?;
-    let source_capability = kernel
-        .resolve_capability_for_task(envelope.source_tid.0, envelope.source_cap)
-        .map_err(SyscallError::from)?;
-    let derived = kernel
-        .capability_service_mut()
-        .grant_task_to_task_with_rights(
-            envelope.source_tid.0,
-            envelope.source_cap,
-            receiver_tid,
-            source_capability.rights(),
-        )
-        .map_err(SyscallError::from)?;
-    // Stage 156 IPC oracle: transfer-cap grant materialized into the receiver.
-    crate::yarm_log!(
-        "IPC_TRANSFER_CAP_MATERIALIZE_OK receiver_tid={} local_cap={}",
-        receiver_tid,
-        derived.0
-    );
-    Ok(Some(derived.0))
-}
+// Stage 158: the cap-materialization cluster (router + two canonical helpers)
+// re-homed into `ipc_recv_core.rs`. Re-export the two entry points so every
+// existing call site here and every sibling `super::` import keeps resolving.
+pub(crate) use self::ipc_recv_core::{
+    materialize_received_message_cap, materialize_received_message_cap_routed,
+};
 
-pub(super) fn materialize_received_message_cap(
-    kernel: &mut KernelState,
-    endpoint: CapObject,
-    receiver_tid: u64,
-    _sender_tid: u64,
-    msg: &Message,
-) -> Result<Option<u64>, SyscallError> {
-    let raw = msg.transferred_cap().map(|c| c.0);
-    let (kind, value) = if (msg.flags & Message::FLAG_REPLY_CAP) != 0 {
-        ("reply", raw)
-    } else if (msg.flags & (Message::FLAG_CAP_TRANSFER | Message::FLAG_CAP_TRANSFER_PLAIN)) != 0 {
-        ("transfer", raw)
-    } else {
-        ("none", None)
-    };
-    let Some(raw_value) = value else {
-        return Ok(None);
-    };
-
-    if kind == "reply" {
-        // ── Direct-mint path for Reply caps ───────────────────────────────────────
-        // Reply caps are one-shot and non-delegatable.  We intentionally bypass
-        // `grant_task_to_task_with_rights` (which would call `record_delegated_capability_link`)
-        // and instead:
-        //   1. Take the transfer envelope to recover the underlying Reply object.
-        //   2. Verify the Reply cap is still live in the global registry.
-        //   3. Mint the Reply object directly into the receiver's cnode.
-        //   4. Record the resulting CapId in the global ReplyCapRecord so that
-        //      `ipc_reply` can later fast-revoke the exact slot.
-        //
-        // This prevents delegation-link table saturation (MAX_DELEGATED_CAPABILITY_LINKS
-        // entries would fill after ~1012 PM→VFS cycles on AArch64 freestanding, causing
-        // `CapabilityFull` in `record_delegated_capability_link`, which left an already-
-        // minted cap leaked in the receiver's cnode on every subsequent cycle, eventually
-        // exhausting the 512-slot freestanding cnode).
-        let envelope = match kernel.take_transfer_envelope(
-            raw_value,
-            endpoint,
-            crate::kernel::ipc::ThreadId(receiver_tid),
-        ) {
-            Some(e) => e,
-            None => {
-                crate::yarm_log!(
-                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=no_envelope",
-                    raw_value
-                );
-                return Err(SyscallError::InvalidCapability);
-            }
-        };
-        let (reply_index, reply_generation) = match envelope.source_object {
-            CapObject::Reply { index, generation } => (index, generation),
-            _ => {
-                crate::yarm_log!(
-                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=source_not_reply_object",
-                    raw_value
-                );
-                return Err(SyscallError::WrongObject);
-            }
-        };
-        let reply_object = CapObject::Reply {
-            index: reply_index,
-            generation: reply_generation,
-        };
-        crate::yarm_log!(
-            "IPC_RECV_REPLY_CAP_MATERIALIZE_BEGIN waiter_tid={} raw={} reply_index={} reply_generation={}",
-            receiver_tid,
-            raw_value,
-            reply_index,
-            reply_generation
-        );
-        if kernel.capability_object_live(reply_object).is_none() {
-            crate::yarm_log!(
-                "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=reply_object_not_live",
-                raw_value
-            );
-            return Err(SyscallError::InvalidCapability);
-        }
-        let dest_cnode = match kernel.task_cnode(receiver_tid) {
-            Some(cnode) => cnode,
-            None => {
-                crate::yarm_log!(
-                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=no_receiver_cnode",
-                    raw_value
-                );
-                return Err(SyscallError::InvalidCapability);
-            }
-        };
-        let minted = match kernel
-            .mint_capability_in_cnode(dest_cnode, Capability::new(reply_object, CapRights::SEND))
-        {
-            Ok(cap) => cap,
-            Err(err) => {
-                let (cnode_used, cnode_capacity) = kernel
-                    .cnode_slot_capacity(dest_cnode)
-                    .map(|cap| {
-                        let used = kernel.cnode_occupied_slots(dest_cnode).unwrap_or(0);
-                        (used, cap)
-                    })
-                    .unwrap_or((0, 0));
-                crate::yarm_log!(
-                    "IPC_RECV_REPLY_CAP_MATERIALIZE_FAIL waiter_tid={} reason={:?} cnode_used={} cnode_capacity={}",
-                    receiver_tid,
-                    err,
-                    cnode_used,
-                    cnode_capacity
-                );
-                crate::yarm_log!(
-                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err={:?}",
-                    raw_value,
-                    err
-                );
-                return Err(SyscallError::from(err));
-            }
-        };
-        // Record the materialized CapId in the global ReplyCapRecord so that
-        // ipc_reply can fast-revoke the exact slot using a kernel-controlled value.
-        kernel.set_reply_cap_waiter_cap(reply_index, reply_generation, minted);
-        crate::yarm_log!(
-            "IPC_RECV_REPLY_CAP_MATERIALIZE_OK waiter_tid={} local_reply_cap={}",
-            receiver_tid,
-            minted.0
-        );
-        // Stage 156 IPC oracle: reply-cap one-shot minted + recorded for the
-        // exact-slot fast-revoke that ipc_reply performs on consumption.
-        crate::yarm_log!(
-            "IPC_REPLY_CAP_ONESHOT_OK waiter_tid={} local_reply_cap={}",
-            receiver_tid,
-            minted.0
-        );
-        return Ok(Some(minted.0));
-    }
-
-    // ── Transfer-cap path (FLAG_CAP_TRANSFER) ────────────────────────────────
-    match materialize_received_transfer_cap(kernel, Some(raw_value), endpoint, receiver_tid) {
-        Ok(local_cap) => Ok(local_cap),
-        Err(first_err) => {
-            crate::yarm_log!(
-                "IPC_RECV_CAP_MATERIALIZE_FAILED kind={} raw={} err={:?}",
-                kind,
-                raw_value,
-                first_err
-            );
-            Err(first_err)
-        }
-    }
-}
-
-/// Stage 104 / D1: route recv-side cap materialization through the
-/// phase-separated split engine for the supported case; keep everything else
-/// on the canonical global-lock path.
-///
-/// VALIDATION: D1_LIVE_SPLIT — live-wired at two delivery sites:
-///   1. `complete_blocked_recv_for_waiter` (recv-v2 blocked-receiver delivery,
-///      Stage 4K/4O seam),
-///   2. `try_split_recv_queued_plain_with_snapshot_locked` (queued split-recv,
-///      Stage 36/37/42+43 seam).
-/// VALIDATION: FALLBACK_GLOBAL_LOCK — `FLAG_REPLY_CAP` (D5 deferred),
-///   shared-region transfers (`OPCODE_SHARED_MEM`), and every
-///   `FallbackRequired` outcome continue through
-///   `materialize_received_message_cap` unchanged. The legacy full recv path
-///   (`handle_ipc_recv_result_with_empty_error`) and the NR 30 RecvSharedV3
-///   handler intentionally keep calling the canonical helper directly.
-///
-/// Supported case (increments `d1_split_materializations` telemetry):
-/// `FLAG_CAP_TRANSFER` / `FLAG_CAP_TRANSFER_PLAIN`, non-reply, with
-/// `msg.opcode != OPCODE_SHARED_MEM`. Phase A (IPC rank 3 envelope take +
-/// capability rank 4 rights read) and Phase B (capability rank 4
-/// `grant_task_to_task_with_rights`) run through
-/// `cap_transfer_split::materialize_split_transfer_cap_equivalent`, which is
-/// equivalence-tested against the canonical transfer arm (byte-equal CapId,
-/// slot object, slot rights — `stage103_equivalence_split_matches_direct_take_plus_grant`).
-///
-/// Failure logging is byte-identical to the canonical transfer arm
-/// (`IPC_RECV_CAP_MATERIALIZE_FAILED kind=transfer raw=.. err=..`) so smoke
-/// log contracts are unchanged. Success additionally emits the new
-/// `YARM_D1_SPLIT_MATERIALIZE` marker (additive; no script greps it as
-/// forbidden).
-fn materialize_received_message_cap_routed(
-    kernel: &mut KernelState,
-    endpoint: CapObject,
-    receiver_tid: u64,
-    sender_tid: u64,
-    msg: &Message,
-) -> Result<Option<u64>, SyscallError> {
-    use crate::kernel::cap_transfer_split::{
-        CapTransferSplitResult, materialize_split_reply_cap_equivalent,
-        materialize_split_transfer_cap_equivalent,
-    };
-    // D1 supported scope (Pass 1 / Stage 104): non-shared-region only.
-    // Shared-region transfers carry receiver-side mapping obligations outside
-    // the materialize step; they keep the canonical path per the Stage 103
-    // audit (doc/KERNEL_UNLOCKING.md).
-    //
-    // D5 supported scope (Pass 2 / Stage 105): FLAG_REPLY_CAP, non-shared-region
-    // only. Phase B' uses try_set_reply_cap_waiter_cap with mint rollback on
-    // the stale race window. See doc/KERNEL_UNLOCKING.md
-    if msg.opcode != OPCODE_SHARED_MEM {
-        // ── D1 transfer-cap arm ──────────────────────────────────────────────
-        match materialize_split_transfer_cap_equivalent(kernel, endpoint, receiver_tid, msg) {
-            CapTransferSplitResult::None => {} // not a transfer-cap; try reply arm below
-            CapTransferSplitResult::Materialized(local_cap) => {
-                kernel.note_d1_split_materialize();
-                crate::yarm_log!(
-                    "YARM_D1_SPLIT_MATERIALIZE kind=transfer receiver_tid={} local_cap={}",
-                    receiver_tid,
-                    local_cap
-                );
-                // Stage 157 IPC oracle: transfer-cap materialized on the LIVE D1
-                // split path (the path real boots actually take). Same marker as
-                // the canonical arm so the oracle is path-agnostic.
-                crate::yarm_log!(
-                    "IPC_TRANSFER_CAP_MATERIALIZE_OK receiver_tid={} local_cap={}",
-                    receiver_tid,
-                    local_cap
-                );
-                return Ok(Some(local_cap));
-            }
-            CapTransferSplitResult::Failed(err) => {
-                // Byte-identical failure marker to the canonical transfer arm.
-                crate::yarm_log!(
-                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=transfer raw={} err={:?}",
-                    msg.transferred_cap()
-                        .map(|c| c.0)
-                        .unwrap_or(SYSCALL_NO_TRANSFER_CAP),
-                    err
-                );
-                return Err(err);
-            }
-            CapTransferSplitResult::FallbackRequired => {
-                // Reserved for future fallback subcases that the transfer arm
-                // cannot service; nothing produces this today, but keep the
-                // arm wired so it falls through to the canonical helper.
-            }
-        }
-        // ── D5 reply-cap arm ─────────────────────────────────────────────────
-        match materialize_split_reply_cap_equivalent(kernel, endpoint, receiver_tid, msg) {
-            CapTransferSplitResult::None => {} // not a reply-cap; fall to canonical
-            CapTransferSplitResult::Materialized(local_cap) => {
-                kernel.note_d5_split_reply_materialize();
-                crate::yarm_log!(
-                    "YARM_D5_SPLIT_MATERIALIZE kind=reply receiver_tid={} local_cap={}",
-                    receiver_tid,
-                    local_cap
-                );
-                // Stage 157 IPC oracle: reply-cap one-shot materialized on the
-                // LIVE D5 split path (the path real boots actually take). Same
-                // marker as the canonical arm so the oracle is path-agnostic.
-                crate::yarm_log!(
-                    "IPC_REPLY_CAP_ONESHOT_OK receiver_tid={} local_reply_cap={}",
-                    receiver_tid,
-                    local_cap
-                );
-                return Ok(Some(local_cap));
-            }
-            CapTransferSplitResult::Failed(err) => {
-                // Byte-identical failure marker to the canonical reply arm.
-                crate::yarm_log!(
-                    "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err={:?}",
-                    msg.transferred_cap()
-                        .map(|c| c.0)
-                        .unwrap_or(SYSCALL_NO_TRANSFER_CAP),
-                    err
-                );
-                return Err(err);
-            }
-            CapTransferSplitResult::FallbackRequired => {
-                // Reserved for future reply-cap subcases the split engine
-                // cannot service; nothing produces this today.
-            }
-        }
-    }
-    // VALIDATION: FALLBACK_GLOBAL_LOCK
-    materialize_received_message_cap(kernel, endpoint, receiver_tid, sender_tid, msg)
-}
 
 fn handle_ipc_send(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     self::ipc::handle_ipc_send(kernel, frame)

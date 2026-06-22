@@ -897,45 +897,40 @@ mod tests {
 
     #[test]
     fn stage104_live_wire_call_sites_present() {
-        // Stage 104 replaces the Stage 103 helper-only invariant: the split
-        // engine is now live-wired through the router in syscall.rs at exactly
-        // two delivery seams. The router itself must keep the canonical
-        // fallback call.
+        // Stage 104 live-wired the split engine through the router at exactly two
+        // delivery seams. Stage 158 re-homed the router + canonical helper into
+        // syscall/ipc_recv_core.rs (re-exported by syscall.rs); the two delivery
+        // CALL SITES (complete_blocked_recv_for_waiter + the queued split path)
+        // stay in syscall.rs.
+        let core_src = include_str!("syscall/ipc_recv_core.rs");
         let syscall_src = include_str!("syscall.rs");
         assert!(
-            syscall_src.contains("fn materialize_received_message_cap_routed"),
-            "syscall.rs must define the Stage 104 D1 router"
+            core_src.contains("fn materialize_received_message_cap_routed"),
+            "ipc_recv_core.rs must define the Stage 104 D1 router (Stage 158 re-home)"
         );
         assert!(
-            syscall_src.contains("materialize_split_transfer_cap_equivalent"),
+            core_src.contains("materialize_split_transfer_cap_equivalent"),
             "router must call the split engine"
         );
-        // The two routed delivery seams.
+        // The two routed delivery seams remain in syscall.rs (plus its tests).
         let routed_calls = syscall_src
             .matches("materialize_received_message_cap_routed(")
             .count();
         assert!(
-            routed_calls >= 3, // 1 definition + 2 call sites
+            routed_calls >= 2,
             "router must be called from complete_blocked_recv_for_waiter and \
-             try_split_recv_queued_plain_with_snapshot_locked (found {routed_calls} occurrences)"
+             try_split_recv_queued_plain_with_snapshot_locked (found {routed_calls} in syscall.rs)"
         );
-        // The canonical fallback MUST remain inside the router (global-lock
-        // path preserved): 1 definition + router fallback + legacy full path
-        // + NR 30 handler. (`materialize_received_message_cap_routed(` does
-        // not match this pattern — the paren follows `_routed`.)
-        let canonical_calls = syscall_src
-            .matches("materialize_received_message_cap(")
-            .count();
+        // The canonical helper + its router fallback live in ipc_recv_core.rs:
+        // 1 definition + the router fallback call = >=2 occurrences.
+        let canonical_calls = core_src.matches("materialize_received_message_cap(").count();
         assert!(
-            canonical_calls >= 4,
-            "canonical materialize_received_message_cap must remain: definition, \
-             router fallback, legacy full path, NR 30 handler \
-             (found {canonical_calls} occurrences)"
+            canonical_calls >= 2,
+            "canonical materialize_received_message_cap must remain in ipc_recv_core.rs: \
+             definition + router fallback (found {canonical_calls})"
         );
-        // The legacy full recv path and NR 30 stay on the canonical helper —
-        // the router is scoped to the two split seams only.
         assert!(
-            syscall_src.contains("fn materialize_received_message_cap"),
+            core_src.contains("fn materialize_received_message_cap"),
             "canonical helper must not be removed"
         );
     }
@@ -952,9 +947,9 @@ mod tests {
             "module has cleared smoke acceptance (Stage 110, doc/KERNEL_UNLOCKING.md §1); \
              the stale not-smoke-accepted disclosure must not be reintroduced"
         );
-        // The router in syscall.rs carries the same labels.
-        let syscall_src = include_str!("syscall.rs");
-        assert!(syscall_src.contains("VALIDATION: D1_LIVE_SPLIT"));
+        // The router carries the same labels; Stage 158 moved it to ipc_recv_core.rs.
+        let core_src = include_str!("syscall/ipc_recv_core.rs");
+        assert!(core_src.contains("VALIDATION: D1_LIVE_SPLIT"));
     }
 
     #[test]
