@@ -972,6 +972,15 @@ pub fn run() {
         yarm_user_rt::user_log!("INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled");
     }
 
+    // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The
+    // kernel bootstrap provisions slots 6/7 (init_alert_send/recv) with a
+    // dedicated loopback endpoint ONLY when `yarm.ipc_recv_proof=1`; their joint
+    // presence is the gate. A normal boot leaves them None and skips this
+    // entirely.
+    if let (Some(proof_send), Some(proof_recv)) = (ctx.init_alert_send_ep, ctx.init_alert_recv_ep) {
+        run_ipc_recv_proof_workload(proof_send, proof_recv);
+    }
+
     let Some(alert_recv) = ctx.init_alert_recv_ep else {
         return;
     };
@@ -981,6 +990,107 @@ pub fn run() {
         let _ = unsafe { yarm_user_rt::syscall::ipc_recv(alert_recv) };
     }
 }
+
+/// Stage 159BC/D: deterministic userspace IPC recv-v2 oracle workload.
+///
+/// Runs ONLY under `yarm.ipc_recv_proof=1` (gated by the kernel-provisioned
+/// loopback endpoint in slots 6/7). `proof_send` and `proof_recv` are a SEND and
+/// a RECV capability to the SAME fresh endpoint, both held by init, so each
+/// subtest is single-threaded and race-free: a send-to-self enqueues (no
+/// receiver is blocked), then a recv-from-self drains the queued message via the
+/// kernel queued-split delivery path.
+///
+/// Subtest 1 — queued split: enqueue a plain message, then drain it with a
+/// normal recv-v2. The drain takes the queued-split writeback path and the
+/// kernel emits `IPC_RECV_V2_META_QUEUED_SPLIT_OK`.
+///
+/// Subtest 2 — rollback: enqueue a cap-bearing message (carrying a transferable
+/// cap), then drain it with a deliberately undersized payload buffer. The kernel
+/// materializes the carried cap, discovers the payload buffer is too small, and
+/// rolls the freshly-minted cap back — emitting
+/// `IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize`.
+///
+/// Subtest 3 — sender-wake: DEFERRED. Driving `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`
+/// requires a second execution context blocked in `ipc_send` (a full-queue or
+/// rendezvous sender) at the instant the receiver drains, which cannot be made
+/// deterministic without observing the sender's blocked state — exactly the
+/// timing race this stage forbids. It is intentionally left unimplemented (no
+/// fake marker) and documented in doc/KERNEL_UNLOCKING.md.
+#[cfg(not(test))]
+fn run_ipc_recv_proof_workload(proof_send: u32, proof_recv: u32) {
+    use yarm_user_rt::ipc::Message;
+
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_BEGIN send_cap={} recv_cap={}",
+        proof_send,
+        proof_recv
+    );
+
+    // ── Subtest 1: queued split ──────────────────────────────────────────────
+    // Enqueue a small plain message (no cap), then drain via recv-v2.
+    if let Ok(msg) = Message::with_header(0, IPC_RECV_PROOF_OPCODE, 0, None, &[0xA5u8; 8]) {
+        // SAFETY: proof_send is a kernel-provisioned SEND cap to init's own
+        // loopback endpoint. No receiver is blocked, so the message enqueues.
+        let send = unsafe { yarm_user_rt::syscall::ipc_send(proof_send, &msg) };
+        if send.is_ok() {
+            // SAFETY: proof_recv is the matching RECV cap; the message is queued,
+            // so this drains it through the queued-split delivery path.
+            match unsafe { yarm_user_rt::syscall::ipc_recv_v2(proof_recv) } {
+                Ok(Some(_)) => {
+                    yarm_user_rt::user_log!("IPC_RECV_PROOF_QUEUED_SPLIT_DONE result=ok");
+                }
+                other => {
+                    yarm_user_rt::user_log!(
+                        "IPC_RECV_PROOF_QUEUED_SPLIT_DONE result=unexpected ok={}",
+                        other.is_ok()
+                    );
+                }
+            }
+        } else {
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_QUEUED_SPLIT_SEND_FAIL");
+        }
+    }
+
+    // ── Subtest 2: rollback (cap materialize + undersized writeback) ─────────
+    // Enqueue a cap-bearing message whose payload (32 bytes) exceeds the
+    // undersized recv buffer (8 bytes). We transfer the loopback SEND cap itself
+    // — a cap init definitely holds; the kernel materializes it into init's cnode
+    // on drain and then rolls it back when the writeback is found undersized.
+    if let Ok(cap_msg) = Message::with_header(
+        0,
+        IPC_RECV_PROOF_OPCODE,
+        Message::FLAG_CAP_TRANSFER,
+        Some(proof_send as u64),
+        &[0x5Au8; 32],
+    ) {
+        // SAFETY: same loopback SEND cap; carries a transferable cap, enqueues.
+        let send = unsafe { yarm_user_rt::syscall::ipc_send(proof_send, &cap_msg) };
+        if send.is_ok() {
+            // SAFETY: undersized-payload recv on the matching RECV cap drives the
+            // kernel queued-split rollback path; an Err return is the expected,
+            // correct outcome here.
+            match unsafe { yarm_user_rt::syscall::ipc_recv_v2_proof_undersized(proof_recv) } {
+                Err(_) => {
+                    yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_DONE result=rolled_back");
+                }
+                Ok(()) => {
+                    yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_DONE result=unexpected_ok");
+                }
+            }
+        } else {
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_SEND_FAIL");
+        }
+    }
+
+    // ── Subtest 3: sender-wake — intentionally deferred (not faked). ─────────
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED reason=needs_blocked_sender");
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_END");
+}
+
+/// Application opcode used by the Stage 159BC/D proof workload's loopback
+/// messages. Arbitrary and proof-local.
+#[cfg(not(test))]
+const IPC_RECV_PROOF_OPCODE: u16 = 0x0F9D;
 
 #[cfg(test)]
 mod tests {

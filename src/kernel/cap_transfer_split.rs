@@ -923,7 +923,9 @@ mod tests {
         );
         // The canonical helper + its router fallback live in ipc_recv_core.rs:
         // 1 definition + the router fallback call = >=2 occurrences.
-        let canonical_calls = core_src.matches("materialize_received_message_cap(").count();
+        let canonical_calls = core_src
+            .matches("materialize_received_message_cap(")
+            .count();
         assert!(
             canonical_calls >= 2,
             "canonical materialize_received_message_cap must remain in ipc_recv_core.rs: \
