@@ -40,7 +40,7 @@ Directive labels are stable across stages:
 | **D1** transfer-cap recv (non-reply, non-shared-region) | **LIVE** | Stage 104 | router → `materialize_split_transfer_cap_equivalent`; telemetry `d1_split_materializations` |
 | **D2** endpoint blocking-recv waiter publish | **LIVE** (phase-split, Stage 111) | Stage 106 | `publish_recv_waiter_live` via `recv_block_phase_c_ipc_publish`; telemetry `d2_recv_waiter_publishes`, `d2_publish_race_unwinds`; `Stage 108 with_scheduler_split_mut`/`with_task_tcbs_split_mut` not yet called from this path — see §1 Stage 111 |
 | **D3.1** `vm_brk_shrink_two_phase` (`D3_LIVE_SPLIT`) | **LIVE** (phase-split Stage 112; seam live-wired Stage 114) | Stage 107 | `with_vm_user_spaces_split_mut` + `with_memory_split_mut` now called from `try_split_vm_brk_shrink_into_frame` for the single-CPU-online page-crossing-shrink case (Outcome A, Stage 114); D3 full/two-phase and VmAnonMap remain deferred (see §6) |
-| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc,helpers,ipc_abi,ipc_recv_core}.rs` | **COMPLETE (mechanical) + cap-boundary in progress** | Stage 102 + D4 steps 1–4 + Stage 145/146/149/150/151 + **Stage 152** completeness audit + **Stage 153** seam audit + **Stage 154** cap-boundary scaffold + **Stage 155** recv-v2 codec convergence + **Stage 156** IPC smoke oracle | 11 modules landed; mechanical decomposition complete (Stage 152); Stage 153 proved the IPC/cap seams are order-pinned; Stage 154 created `ipc_recv_core.rs` and migrated the pure recv-v2 meta codec (Option 2); Stage 155 converged all 3 production recv-v2 meta encoders onto that single pure helper (byte-identical); Stage 156 added a QEMU byte-identical delivery smoke oracle (markers + `scripts/qemu-ipc-recv-v2-oracle-smoke.sh`) — QEMU unavailable, so no stateful seam moved; **Stage 157** moved the reply-cap/transfer-cap oracle markers onto the *live* D1/D5 split arms (they were stranded on the canonical fallback that real boots never reach) and added an `extended` oracle mode that hard-requires them — proven by the existing init spawn workload, no new client; the stateful cap/materialization seams remain pinned in `syscall.rs` pending a QEMU-validated re-home (§5.1.2/§5.1.3/§5.1.4/§5.1.5); `dispatch.rs` not planned (syscall.rs stays dispatch owner); see Stage 148–157 decomposition map |
+| **D4** `syscall/{debug,initramfs,recv_shared_v3,process,sched,cap,vm,ipc,helpers,ipc_abi,ipc_recv_core}.rs` | **COMPLETE (mechanical) + cap-boundary in progress** | Stage 102 + D4 steps 1–4 + Stage 145/146/149/150/151 + **Stage 152** completeness audit + **Stage 153** seam audit + **Stage 154** cap-boundary scaffold + **Stage 155** recv-v2 codec convergence + **Stage 156** IPC smoke oracle | 11 modules landed; mechanical decomposition complete (Stage 152); Stage 153 proved the IPC/cap seams are order-pinned; Stage 154 created `ipc_recv_core.rs` and migrated the pure recv-v2 meta codec (Option 2); Stage 155 converged all 3 production recv-v2 meta encoders onto that single pure helper (byte-identical); Stage 156 added a QEMU byte-identical delivery smoke oracle (markers + `scripts/qemu-ipc-recv-v2-oracle-smoke.sh`) — QEMU unavailable, so no stateful seam moved; **Stage 157** moved the reply-cap/transfer-cap oracle markers onto the *live* D1/D5 split arms (they were stranded on the canonical fallback that real boots never reach) and added an `extended` oracle mode that hard-requires them — proven by the existing init spawn workload, no new client; **Stage 158** then used the validated oracle (x86_64 extended + AArch64 manual) to re-home the cap-materialization trio (`materialize_received_message_cap_routed`, `materialize_received_message_cap`, `materialize_received_transfer_cap`) into `ipc_recv_core.rs` (re-exported from `syscall.rs`); the queued-split DELIVERY cluster stays pinned in `syscall.rs` (AArch64 did not exercise `IPC_RECV_V2_META_QUEUED_SPLIT_OK`, so no cross-arch proof); see §5.1.2/§5.1.3/§5.1.4/§5.1.5/§5.1.6; `dispatch.rs` not planned (syscall.rs stays dispatch owner); see Stage 148–158 decomposition map |
 | **D5** reply-cap recv (non-shared-region) | **LIVE** | Stage 105 | fallible record-set + mint rollback on stale; telemetry `d5_split_reply_materializations`, `d5_split_reply_rollbacks` |
 | **D6.1** `local_dispatch_step_split` (`D6_LIVE_SPLIT`) | **LIVE** (phase-split, Stage 113; task-lock drop before switch_frames, Stage 116; global-lock stash scaffold, Stage 117 Outcome B; first-resume handler + switch-frame init, Stage 118 Outcome B; minimal task pair + TSS RSP0 fix, Stage 119 Outcome B) | Stage 107 | scheduler-seam first wire; Stage 116 eliminates `task_state_lock` (rank 2) held across `switch_frames` via `DispatchSwitchPlan`; Stage 117 adds `PerCpuSwitchPlanStash` / `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`; Stage 118 adds `FIRST_RESUME_STASH` / real trampoline / production init for tid=1 (x86_64); Stage 119 extends init to tid=2 and fixes TSS RSP0 in trampoline switch-back; Stage 120 adds a default-off `yarm.d6_switch_proof=1` / `D6_SWITCH_PROOF=1` x86_64 single-CPU one-shot proof harness for the unlocked `switch_frames` path; Stage 121 audits/fixes the x86_64 first-resume ABI boundary with an assembly shim + SysV stack shape diagnostics; Stage 122 adds raw COM1 `!R`/`!RA` first-instruction breadcrumbs to prove whether the CPU reaches the shim before Rust logging; Stage 123 removes the pre-Rust marker bridge call and replaces it with raw `!RM`; Stage 124 removes the obsolete shim stack adjustment and adds raw `!RJ`; Stage 125 routes `!RJ` to an x86_64 ABI bridge that emits `!RB`, aligns for a normal `call`, and calls the Rust real handler; Stage 126 gates `initialized=true` on a mapped writable kernel-only switch-stack page; Stage 127 corrects that gate to map/check the target task ASID/root and retries after ASID binding instead of depending on temporal active-ASID presence; Stage 128 strengthens the invariant again by mapping/checking the incoming switch-stack page in every existing task root that may be the active/outgoing CR3 during `switch_frames`, plus an active-root proof check before stashing; Stage 129 fixes the VmFull capacity-blocker by adding on-demand repair in the active-root guard when the active ASID was created after the incoming stack was initialized; per-CPU lock sharding deferred (§9); see §1 Stage 116 / Stage 117 / Stage 118 / Stage 119 |
 | **D7** MUST_SMOKE policy | **ENFORCED** | Stage 101 | see `AI_AGENT_RULES.md` §13 |
@@ -2688,6 +2688,57 @@ Stage 157 hardens this with `boot::tests::stage157_ipc_oracle_live_path` (live
 split arms emit both markers, both arms carry each marker, extended mode requires
 exactly the two cap-delivery markers, fault/contention markers are *not*
 promoted to required, and the basic-mode default is preserved).
+
+### 5.1.6 Stage 158 — cap-materialization trio re-home (QEMU-validated)
+
+The Stage 156/157 oracle was run on real hardware/emulation and recorded:
+
+* **x86_64** — `ORACLE_MODE=extended` **PASS**: all three recv-v2 meta markers
+  present, plus `IPC_REPLY_CAP_ONESHOT_OK` and `IPC_TRANSFER_CAP_MATERIALIZE_OK`.
+* **AArch64** (manual) — present: `IPC_RECV_V2_META_BLOCKED_WAITER_OK`,
+  `IPC_RECV_V2_META_IMMEDIATE_OK`, `IPC_REPLY_CAP_ONESHOT_OK`,
+  `IPC_TRANSFER_CAP_MATERIALIZE_OK`. **Missing**: `IPC_RECV_V2_META_QUEUED_SPLIT_OK`
+  (queued-split delivery was not exercised on this manual run).
+
+**Accepted interpretation.** AArch64 validates the D1/D5
+materialization/router markers; it does **not** validate queued-split delivery
+on this run. Therefore Stage 158 re-homes **only** the byte-identical-proven
+cap-materialization cluster and leaves queued-split code untouched.
+
+**Moved into `syscall/ipc_recv_core.rs`** (re-exported from `syscall.rs` via
+`pub(crate) use self::ipc_recv_core::{materialize_received_message_cap,
+materialize_received_message_cap_routed}` so every call site and sibling
+`super::` import resolves unchanged; behaviour and all log markers are
+byte-identical to the pre-move code):
+
+* `materialize_received_message_cap_routed` — the D1/D5 split router
+* `materialize_received_message_cap` — canonical reply/transfer materializer
+* `materialize_received_transfer_cap` — module-private transfer helper
+
+**Explicitly NOT moved (queued-split delivery cluster, stays in `syscall.rs`):**
+`complete_blocked_recv_for_waiter`, `try_endpoint_split_recv`,
+`try_split_recv_queued_plain_with_snapshot_locked`,
+`try_split_recv_queued_plain_into_frame_locked`, `clear_blocked_recv_state`, and
+the queued-split writeback/delivery code — none has a cross-arch byte-identical
+proof (AArch64 did not exercise `IPC_RECV_V2_META_QUEUED_SPLIT_OK`).
+
+**Guard re-homing (re-home, do not weaken).** The Stage 147/148/152/153/154/155/
+156/157 and Stage 104 guards that previously pinned the trio to `syscall.rs` were
+updated to enforce the new ownership: the trio must now be defined in
+`ipc_recv_core.rs` (router + canonical entry points `pub(crate)`, transfer helper
+module-private) and re-exported from `syscall.rs`; the queued-split cluster must
+remain defined in `syscall.rs` and must NOT appear in `ipc_recv_core.rs`. The
+`ipc_recv_core.rs` purity guards now permit the cap-materialization calls
+(`mint_capability_in_cnode`, `grant_task_to_task_with_rights`,
+`set_reply_cap_waiter_cap`) it legitimately owns, while still forbidding the
+delivery concerns that stayed (`copy_to_user`, `map_shared_region`,
+`rollback_materialized_recv_cap`, `ipc_state_lock`).
+
+**Re-validation requested after Stage 158** (`ORACLE_MODE=extended` on x86_64;
+manual on AArch64) — at minimum `IPC_RECV_V2_META_BLOCKED_WAITER_OK`,
+`IPC_RECV_V2_META_IMMEDIATE_OK`, `IPC_REPLY_CAP_ONESHOT_OK`,
+`IPC_TRANSFER_CAP_MATERIALIZE_OK`. Queued split remains recorded-only for AArch64
+until a deterministic queued-split workload exists.
 
 ### 5.2 D1 audit — answers to the seven readiness questions
 
