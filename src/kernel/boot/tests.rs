@@ -42099,20 +42099,21 @@ mod stage159bcd_ipc_recv_proof_workload {
             !INIT_SERVICE_SRC.contains("user_log!(\"IPC_RECV_V2_"),
             "userspace workload must NOT emit (fake) any kernel IPC_RECV_V2_* marker"
         );
-        // The userspace DONE markers belong to the workload, not the kernel.
+        // The userspace SEQUENCE markers belong to the workload, not the kernel.
         for m in &[
-            "IPC_RECV_PROOF_QUEUED_SPLIT_DONE",
-            "IPC_RECV_PROOF_ROLLBACK_DONE",
+            "IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE",
+            "IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE",
         ] {
             assert!(
                 INIT_SERVICE_SRC.contains(m),
-                "workload must emit its userspace DONE marker `{m}`"
+                "workload must emit its userspace SEQUENCE marker `{m}`"
             );
         }
     }
 
     // 6. Basic oracle mode is unchanged; extended/proof mode can independently
-    //    require queued-split and rollback.
+    //    require queued-split and rollback, each pairing a SEQUENCE marker with
+    //    the kernel marker.
     #[test]
     fn stage159bcd_oracle_modes() {
         assert!(
@@ -42121,14 +42122,77 @@ mod stage159bcd_ipc_recv_proof_workload {
         );
         assert!(
             ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_QUEUED_SPLIT")
-                && ORACLE_SCRIPT.contains("IPC_RECV_V2_META_QUEUED_SPLIT_OK"),
-            "proof mode must support an independent queued-split requirement"
+                && ORACLE_SCRIPT.contains("IPC_RECV_V2_META_QUEUED_SPLIT_OK")
+                && ORACLE_SCRIPT.contains("IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE"),
+            "proof mode must require BOTH the kernel and sequence queued-split markers"
         );
         assert!(
             ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_ROLLBACK")
-                && ORACLE_SCRIPT.contains("IPC_RECV_PROOF_ROLLBACK_DONE"),
-            "proof mode must support an independent rollback requirement"
+                && ORACLE_SCRIPT.contains("IPC_RECV_V2_ROLLBACK_OK")
+                && ORACLE_SCRIPT.contains("IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE"),
+            "proof mode must require BOTH the kernel and sequence rollback markers"
         );
+    }
+
+    // 6b. Enabling any proof requirement env var implies the kernel boot knob:
+    //     the oracle exports IPC_RECV_PROOF=1 and the per-arch core smokes append
+    //     yarm.ipc_recv_proof=1 to the kernel cmdline. Without this the workload
+    //     never runs (the original x86_64 failure).
+    #[test]
+    fn stage159bcd_proof_env_implies_boot_knob() {
+        assert!(
+            ORACLE_SCRIPT.contains("export IPC_RECV_PROOF=1"),
+            "oracle must export IPC_RECV_PROOF=1 when a proof requirement is set"
+        );
+        const X86_SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+        const AARCH64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+        for (arch, src) in &[("x86_64", X86_SMOKE), ("aarch64", AARCH64_SMOKE)] {
+            assert!(
+                src.contains("IPC_RECV_PROOF") && src.contains("yarm.ipc_recv_proof=1"),
+                "{arch} core smoke must append yarm.ipc_recv_proof=1 when IPC_RECV_PROOF=1"
+            );
+        }
+    }
+
+    // 6c. The SEQUENCE markers are emitted CONDITIONALLY (only after the observed
+    //     expected syscall outcome), not unconditionally after the call returns.
+    #[test]
+    fn stage159bcd_sequence_markers_are_conditional() {
+        // Queued-split SEQUENCE marker only inside the Ok(Some(_)) delivered arm.
+        let qs = INIT_SERVICE_SRC
+            .split("IPC_RECV_PROOF_QS_RECV_BEGIN")
+            .nth(1)
+            .expect("queued-split recv block must exist");
+        let qs_seq_pos = qs
+            .find("IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE")
+            .expect("queued-split sequence marker must exist");
+        let qs_ok_pos = qs.find("Ok(Some(received))").expect("delivered arm");
+        assert!(
+            qs_ok_pos < qs_seq_pos,
+            "queued-split SEQUENCE marker must be gated on the delivered (Ok(Some)) arm"
+        );
+        // Rollback SEQUENCE marker only when recv.is_err() (the expected failure).
+        let rb = INIT_SERVICE_SRC
+            .split("IPC_RECV_PROOF_ROLLBACK_RECV_BEGIN")
+            .nth(1)
+            .expect("rollback recv block must exist");
+        assert!(
+            rb.contains("if recv.is_err()")
+                && rb.find("if recv.is_err()").unwrap()
+                    < rb.find("IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE").unwrap(),
+            "rollback SEQUENCE marker must be gated on the expected error return"
+        );
+        // Phase diagnostics with codes must exist for the next-run divergence pin.
+        for m in &[
+            "IPC_RECV_PROOF_QS_SEND_RET code=",
+            "IPC_RECV_PROOF_QS_RECV_RET",
+            "IPC_RECV_PROOF_ROLLBACK_RECV_RET code=",
+        ] {
+            assert!(
+                INIT_SERVICE_SRC.contains(m),
+                "phase diagnostic `{m}` must be emitted"
+            );
+        }
     }
 
     // 7. Sender-wake is explicitly deferred (not faked): the workload logs a

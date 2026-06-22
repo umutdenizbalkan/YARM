@@ -30,6 +30,13 @@ D6_SWITCH_PROOF=${D6_SWITCH_PROOF:-0}
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
+# Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
+# is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
+# whenever any proof requirement env var is enabled, so honor it here.
+IPC_RECV_PROOF=${IPC_RECV_PROOF:-0}
+if [[ "$IPC_RECV_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_recv_proof="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_recv_proof=1"
+fi
 
 if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
   echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"

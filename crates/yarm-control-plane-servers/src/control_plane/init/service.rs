@@ -1019,43 +1019,73 @@ pub fn run() {
 #[cfg(not(test))]
 fn run_ipc_recv_proof_workload(proof_send: u32, proof_recv: u32) {
     use yarm_user_rt::ipc::Message;
+    use yarm_user_rt::syscall::SyscallError;
 
+    // SyscallError is #[repr(usize)] with explicit discriminants; expose a small
+    // numeric code for phase diagnostics (0 == ok). This lets the next QEMU run
+    // pin exactly where each subtest diverges from the intended kernel path.
+    fn code(r: &Result<(), SyscallError>) -> usize {
+        match r {
+            Ok(()) => 0,
+            Err(e) => *e as usize,
+        }
+    }
+
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_BEGIN");
     yarm_user_rt::user_log!(
-        "IPC_RECV_PROOF_BEGIN send_cap={} recv_cap={}",
+        "IPC_RECV_PROOF_CAPS send={} recv={}",
         proof_send,
         proof_recv
     );
 
     // ── Subtest 1: queued split ──────────────────────────────────────────────
-    // Enqueue a small plain message (no cap), then drain via recv-v2.
+    // Enqueue a small plain message (no cap), then drain via recv-v2. The DONE
+    // marker is emitted ONLY when the recv actually returned a message; the
+    // authoritative proof is the kernel marker IPC_RECV_V2_META_QUEUED_SPLIT_OK,
+    // required separately by the oracle. To diagnose a path divergence on the
+    // next run, also grep the kernel-side YARM_RECV_CORE_PLAN /
+    // YARM_RECV_CORE_ADAPTER / YARM_RECV_CORE_FALLBACK markers between
+    // QS_RECV_BEGIN and QS_RECV_RET.
     if let Ok(msg) = Message::with_header(0, IPC_RECV_PROOF_OPCODE, 0, None, &[0xA5u8; 8]) {
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_QS_SEND_BEGIN");
         // SAFETY: proof_send is a kernel-provisioned SEND cap to init's own
         // loopback endpoint. No receiver is blocked, so the message enqueues.
         let send = unsafe { yarm_user_rt::syscall::ipc_send(proof_send, &msg) };
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_QS_SEND_RET code={}", code(&send));
         if send.is_ok() {
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_QS_RECV_BEGIN");
             // SAFETY: proof_recv is the matching RECV cap; the message is queued,
-            // so this drains it through the queued-split delivery path.
+            // so a split-path recv drains it through the queued-split path.
             match unsafe { yarm_user_rt::syscall::ipc_recv_v2(proof_recv) } {
-                Ok(Some(_)) => {
-                    yarm_user_rt::user_log!("IPC_RECV_PROOF_QUEUED_SPLIT_DONE result=ok");
-                }
-                other => {
+                Ok(Some(received)) => {
                     yarm_user_rt::user_log!(
-                        "IPC_RECV_PROOF_QUEUED_SPLIT_DONE result=unexpected ok={}",
-                        other.is_ok()
+                        "IPC_RECV_PROOF_QS_RECV_RET code=0 payload_len={} sender_tid={}",
+                        received.message.as_slice().len(),
+                        received.sender_tid
                     );
+                    // Honest: the userspace sequence observed a delivered message.
+                    // It does NOT (and cannot) assert which kernel path delivered
+                    // it — the oracle pairs this with the kernel marker.
+                    yarm_user_rt::user_log!("IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE");
+                }
+                Ok(None) => {
+                    yarm_user_rt::user_log!("IPC_RECV_PROOF_QS_RECV_RET code=wouldblock");
+                }
+                Err(e) => {
+                    yarm_user_rt::user_log!("IPC_RECV_PROOF_QS_RECV_RET code={}", e as usize);
                 }
             }
-        } else {
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_QUEUED_SPLIT_SEND_FAIL");
         }
     }
 
     // ── Subtest 2: rollback (cap materialize + undersized writeback) ─────────
     // Enqueue a cap-bearing message whose payload (32 bytes) exceeds the
     // undersized recv buffer (8 bytes). We transfer the loopback SEND cap itself
-    // — a cap init definitely holds; the kernel materializes it into init's cnode
-    // on drain and then rolls it back when the writeback is found undersized.
+    // — a cap init definitely holds; on a split-path drain the kernel
+    // materializes it then rolls it back when the writeback is found undersized
+    // (IPC_RECV_V2_ROLLBACK_OK site=queued_split_undersize). The SEQUENCE marker
+    // is emitted ONLY on the expected error return; the kernel marker is the
+    // authoritative proof, required separately by the oracle.
     if let Ok(cap_msg) = Message::with_header(
         0,
         IPC_RECV_PROOF_OPCODE,
@@ -1063,22 +1093,21 @@ fn run_ipc_recv_proof_workload(proof_send: u32, proof_recv: u32) {
         Some(proof_send as u64),
         &[0x5Au8; 32],
     ) {
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_SEND_BEGIN");
         // SAFETY: same loopback SEND cap; carries a transferable cap, enqueues.
         let send = unsafe { yarm_user_rt::syscall::ipc_send(proof_send, &cap_msg) };
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_SEND_RET code={}", code(&send));
         if send.is_ok() {
-            // SAFETY: undersized-payload recv on the matching RECV cap drives the
-            // kernel queued-split rollback path; an Err return is the expected,
-            // correct outcome here.
-            match unsafe { yarm_user_rt::syscall::ipc_recv_v2_proof_undersized(proof_recv) } {
-                Err(_) => {
-                    yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_DONE result=rolled_back");
-                }
-                Ok(()) => {
-                    yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_DONE result=unexpected_ok");
-                }
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_RECV_BEGIN");
+            // SAFETY: undersized-payload recv on the matching RECV cap; an Err
+            // return (InvalidArgs on the undersize path) is the expected outcome.
+            let recv = unsafe { yarm_user_rt::syscall::ipc_recv_v2_proof_undersized(proof_recv) };
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_RECV_RET code={}", code(&recv));
+            if recv.is_err() {
+                // Honest: observed the expected failure return. The oracle pairs
+                // this with the kernel IPC_RECV_V2_ROLLBACK_OK marker.
+                yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE");
             }
-        } else {
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_ROLLBACK_SEND_FAIL");
         }
     }
 

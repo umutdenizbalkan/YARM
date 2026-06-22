@@ -2820,11 +2820,64 @@ real delivery marker):
 basic mode. Three independent, default-off proof requirements were added —
 `YARM_IPC_RECV_PROOF_QUEUED_SPLIT`, `YARM_IPC_RECV_PROOF_ROLLBACK`,
 `YARM_IPC_RECV_PROOF_SENDER_WAKE` — each enforced only when set, and only passing
-when **both** the userspace `*_DONE` marker and the kernel marker are present.
-The script reports each as required/pass/missing and reports sender-wake as
-deferred. The sender-wake knob exists but will fail by design until the deferred
-subtest lands (do not enable it before then). The three `IPC_RECV_PROOF_*_DONE`
-markers are recorded in the snapshot.
+when **both** the userspace `*_SEQUENCE_DONE` marker and the kernel marker are
+present. The script reports each as required/pass/missing and reports sender-wake
+as deferred. The sender-wake knob exists but will fail by design until the
+deferred subtest lands (do not enable it before then).
+
+#### 5.1.8.1 Fix pass (after first validation)
+
+First QEMU validation surfaced two defects, both now fixed:
+
+1. **x86_64 workload never ran.** The oracle delegated to the per-arch core
+   smoke, which never appended the boot knob, so x86_64 booted without
+   `yarm.ipc_recv_proof=1`. **Fix:** when any proof requirement env var is set the
+   oracle now exports `IPC_RECV_PROOF=1`, and both the x86_64 and AArch64 core
+   smokes append `yarm.ipc_recv_proof=1` to the kernel cmdline (mirroring the
+   `D6_SWITCH_PROOF` plumbing). A guard
+   (`stage159bcd_proof_env_implies_boot_knob`) pins this.
+
+2. **DONE markers were dishonest.** On AArch64 the workload ran and emitted
+   `*_DONE` even though no kernel delivery marker fired — because the markers were
+   emitted unconditionally after the syscall returned. Root cause: the
+   `IPC_RECV_V2_META_QUEUED_SPLIT_OK` / queued-split `IPC_RECV_V2_ROLLBACK_OK`
+   markers are emitted **only** by the trap-entry split fast-path
+   (`try_split_recv_queued_plain_with_snapshot_locked`). When that path falls
+   back, the recv is serviced by the global-lock `handle_ipc_recv`, which delivers
+   the queued message via the *immediate* path (`IPC_RECV_V2_META_IMMEDIATE_OK`)
+   and the undersized recv does not hit the queued-split rollback site. The
+   workload cannot observe which kernel path delivered, so a `DONE` after the call
+   returns proves nothing.
+
+   **Fix (honesty + diagnostics):**
+   * The userspace markers are renamed to `*_SEQUENCE_DONE` and emitted **only**
+     on the observed expected outcome — queued-split only inside the `Ok(Some(_))`
+     delivered arm, rollback only on the expected `Err` return.
+   * The oracle requires the kernel delivery marker **separately** (and primarily);
+     a sequence marker alone cannot pass a requirement.
+   * Per-phase diagnostics now bracket every operation with return/value codes
+     (`IPC_RECV_PROOF_{QS,ROLLBACK}_{SEND,RECV}_{BEGIN,RET}`, `code=`,
+     `payload_len=`, `sender_tid=`) so the next run pins exactly where a subtest
+     diverges. To see *why* the split path was taken or skipped, grep the
+     kernel-side `YARM_RECV_CORE_PLAN` / `YARM_RECV_CORE_ADAPTER` /
+     `YARM_RECV_CORE_FALLBACK` / `YARM_LOCK_SPLIT_IPC_RECV` markers between the
+     `*_RECV_BEGIN` and `*_RECV_RET` lines.
+
+   Guards `stage159bcd_sequence_markers_are_conditional` and (updated)
+   `stage159bcd_target_markers_are_kernel_emitted` pin the conditional emission.
+
+**Open item carried forward.** The queued-split and queued-split-rollback kernel
+markers both depend on the recv being serviced by the trap-entry split path. On
+x86_64 normal boots already exercise that path (the marker appears), so the fixed
+knob plumbing is expected to make the workload reproduce both on x86_64. On
+AArch64 the split path has not been observed to deliver a queued recv (the
+pre-existing Stage 158 observation), so the kernel markers may remain absent even
+with the workload running — that would be a property of the AArch64 split-recv
+path, **not** a workload defect, and is intentionally *not* "fixed" here by moving
+any IPC/cap seam. The next run's phase diagnostics + `YARM_RECV_CORE_*` markers
+will confirm whether the AArch64 split path runs and, if it falls back, the exact
+`FallbackReason`; remediation of that (if desired) is a separate, seam-touching
+effort outside this workload/oracle stage.
 
 **Validation in-repo:** `cargo fmt`, `cargo check --features hosted-dev`,
 `cargo test --lib --features hosted-dev` (incl. the `stage159bcd_*` guards),

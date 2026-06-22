@@ -15,6 +15,14 @@ QEMU_SMP=${QEMU_SMP:-2}
 # Keep kernel cmdline empty by default until AArch64 command-line parsing is
 # explicitly validated. Override if needed via KERNEL_CMDLINE=...
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-}
+# Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
+# is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
+# whenever any proof requirement env var is enabled (AArch64 cmdline parsing of
+# this knob is validated). Append it without disturbing any explicit override.
+IPC_RECV_PROOF=${IPC_RECV_PROOF:-0}
+if [[ "$IPC_RECV_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_recv_proof="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_recv_proof=1"
+fi
 
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
