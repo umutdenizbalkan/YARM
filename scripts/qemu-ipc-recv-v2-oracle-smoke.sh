@@ -57,16 +57,28 @@ ORACLE_MODE="${ORACLE_MODE:-basic}"
 # drain) that drives specific kernel recv-v2 delivery markers. These per-subtest
 # requirements are OFF by default and enabled independently; a requirement is
 # only checked when its knob is set (the boot must actually have been launched
-# with the proof knob for them to appear). Each maps a userspace "DONE" marker
-# (proof workload claims the trigger) to the kernel marker it must produce.
+# with the proof knob for them to appear). Each pairs a userspace SEQUENCE marker
+# (the workload observed the expected *syscall return*, NOT the kernel path) with
+# the kernel delivery marker that is the authoritative proof.
 YARM_IPC_RECV_PROOF_QUEUED_SPLIT="${YARM_IPC_RECV_PROOF_QUEUED_SPLIT:-0}"
 YARM_IPC_RECV_PROOF_ROLLBACK="${YARM_IPC_RECV_PROOF_ROLLBACK:-0}"
 YARM_IPC_RECV_PROOF_SENDER_WAKE="${YARM_IPC_RECV_PROOF_SENDER_WAKE:-0}"
 
+# Whenever any proof requirement is enabled, the kernel MUST be booted with
+# yarm.ipc_recv_proof=1 or the workload never runs. Export IPC_RECV_PROOF=1 so the
+# per-arch core smoke appends the boot knob to the kernel cmdline. Basic mode
+# (no proof env vars) leaves this unset and the cmdline unchanged.
+if [[ "$YARM_IPC_RECV_PROOF_QUEUED_SPLIT" == "1" \
+   || "$YARM_IPC_RECV_PROOF_ROLLBACK" == "1" \
+   || "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
+  export IPC_RECV_PROOF=1
+  echo "[info] ipc-oracle: proof env set -> booting kernel with yarm.ipc_recv_proof=1"
+fi
+
 # Healthy-delivery success markers (Stage 156). Not all fire on every boot, so
 # only the "at least one recv-v2 meta delivered" invariant is hard-required.
-# The IPC_RECV_PROOF_*_DONE markers (Stage 159BC/D) are emitted by the userspace
-# proof workload and recorded here so the snapshot reflects what it claimed.
+# The IPC_RECV_PROOF_*_SEQUENCE_DONE markers (Stage 159BC/D) are emitted by the
+# userspace proof workload only on the expected syscall return, and recorded here.
 ORACLE_MARKERS=(
   "IPC_RECV_V2_META_BLOCKED_WAITER_OK"
   "IPC_RECV_V2_META_IMMEDIATE_OK"
@@ -75,9 +87,8 @@ ORACLE_MARKERS=(
   "IPC_TRANSFER_CAP_MATERIALIZE_OK"
   "IPC_RECV_V2_ROLLBACK_OK"
   "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
-  "IPC_RECV_PROOF_QUEUED_SPLIT_DONE"
-  "IPC_RECV_PROOF_ROLLBACK_DONE"
-  "IPC_RECV_PROOF_SENDER_WAKE_DONE"
+  "IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE"
+  "IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE"
 )
 
 # At least one recv-v2 meta delivery marker must appear on a healthy boot.
@@ -188,32 +199,34 @@ fi
 
 # Stage 159BC/D — independent userspace proof-workload requirements. Each is only
 # enforced when its knob is set (the boot must have used yarm.ipc_recv_proof=1).
-# A requirement passes when BOTH the userspace DONE marker (workload claims it
-# drove the path) and the kernel delivery marker are present.
+# A requirement passes when BOTH the userspace SEQUENCE marker (the workload
+# observed the expected syscall return) AND the kernel delivery marker (the
+# authoritative proof of the path) are present. The kernel marker is required
+# separately precisely because userspace cannot tell which kernel path delivered.
 proof_require() {
-  # $1 = human label, $2 = userspace DONE marker, $3 = kernel marker
-  local label="$1" done_marker="$2" kern_marker="$3"
-  local have_done=0 have_kern=0
-  printf '%s\n' "${present[@]:-}" | rg -q "^$done_marker$" && have_done=1
+  # $1 = human label, $2 = userspace SEQUENCE marker, $3 = kernel marker
+  local label="$1" seq_marker="$2" kern_marker="$3"
+  local have_seq=0 have_kern=0
+  printf '%s\n' "${present[@]:-}" | rg -q "^$seq_marker$" && have_seq=1
   printf '%s\n' "${present[@]:-}" | rg -q "^$kern_marker$" && have_kern=1
-  if [[ "$have_done" -eq 1 && "$have_kern" -eq 1 ]]; then
-    echo "[ok]   proof $label: PASS ($done_marker + $kern_marker)"
+  if [[ "$have_seq" -eq 1 && "$have_kern" -eq 1 ]]; then
+    echo "[ok]   proof $label: PASS ($seq_marker + $kern_marker)"
   else
-    echo "[err] ipc-oracle: proof $label: MISSING (done=$have_done kernel=$have_kern; need $done_marker + $kern_marker)"
+    echo "[err] ipc-oracle: proof $label: MISSING (sequence=$have_seq kernel=$have_kern; need $seq_marker + $kern_marker)"
     rc=1
   fi
 }
 
 if [[ "$YARM_IPC_RECV_PROOF_QUEUED_SPLIT" == "1" ]]; then
   echo "[info] ipc-oracle: proof queued-split: REQUIRED"
-  proof_require "queued-split" "IPC_RECV_PROOF_QUEUED_SPLIT_DONE" "IPC_RECV_V2_META_QUEUED_SPLIT_OK"
+  proof_require "queued-split" "IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE" "IPC_RECV_V2_META_QUEUED_SPLIT_OK"
 else
   echo "[info] ipc-oracle: proof queued-split: not required"
 fi
 
 if [[ "$YARM_IPC_RECV_PROOF_ROLLBACK" == "1" ]]; then
   echo "[info] ipc-oracle: proof rollback: REQUIRED"
-  proof_require "rollback" "IPC_RECV_PROOF_ROLLBACK_DONE" "IPC_RECV_V2_ROLLBACK_OK"
+  proof_require "rollback" "IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE" "IPC_RECV_V2_ROLLBACK_OK"
 else
   echo "[info] ipc-oracle: proof rollback: not required"
 fi
