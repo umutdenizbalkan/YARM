@@ -797,6 +797,14 @@ fn materialize_received_message_cap_routed(
                     receiver_tid,
                     local_cap
                 );
+                // Stage 157 IPC oracle: transfer-cap materialized on the LIVE D1
+                // split path (the path real boots actually take). Same marker as
+                // the canonical arm so the oracle is path-agnostic.
+                crate::yarm_log!(
+                    "IPC_TRANSFER_CAP_MATERIALIZE_OK receiver_tid={} local_cap={}",
+                    receiver_tid,
+                    local_cap
+                );
                 return Ok(Some(local_cap));
             }
             CapTransferSplitResult::Failed(err) => {
@@ -823,6 +831,14 @@ fn materialize_received_message_cap_routed(
                 kernel.note_d5_split_reply_materialize();
                 crate::yarm_log!(
                     "YARM_D5_SPLIT_MATERIALIZE kind=reply receiver_tid={} local_cap={}",
+                    receiver_tid,
+                    local_cap
+                );
+                // Stage 157 IPC oracle: reply-cap one-shot materialized on the
+                // LIVE D5 split path (the path real boots actually take). Same
+                // marker as the canonical arm so the oracle is path-agnostic.
+                crate::yarm_log!(
+                    "IPC_REPLY_CAP_ONESHOT_OK receiver_tid={} local_reply_cap={}",
                     receiver_tid,
                     local_cap
                 );

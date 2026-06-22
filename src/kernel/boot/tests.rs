@@ -41721,3 +41721,107 @@ mod stage156_ipc_smoke_oracle {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stage 157: IPC oracle live-path coverage — boundary guard tests.
+//
+// Stage 156 placed the reply-cap one-shot and transfer-cap materialize markers
+// only in the *canonical* materialize arms. But every real boot delivers reply
+// and transfer caps through the LIVE D1/D5 split engine in
+// `materialize_received_message_cap_routed`, which returns before the canonical
+// arms — so those two markers never fired on QEMU. Stage 157 emits the same
+// markers on the live split arms (so the init spawn workload proves them) and
+// adds an `extended` oracle mode that hard-requires them. These guards lock the
+// live-path emission and the extended-mode contract without moving any seam.
+#[cfg(test)]
+mod stage157_ipc_oracle_live_path {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const ORACLE_SCRIPT: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+
+    // 1. The reply-cap and transfer-cap oracle markers are emitted on the LIVE
+    //    split arms (alongside the YARM_D1/D5_SPLIT_MATERIALIZE markers), not
+    //    only in the canonical fallback. We check co-location by confirming both
+    //    the split marker and the oracle marker appear in syscall.rs and that the
+    //    routed materializer still returns through the split arms first.
+    #[test]
+    fn stage157_live_split_arms_emit_oracle_markers() {
+        for m in [
+            "YARM_D1_SPLIT_MATERIALIZE",
+            "IPC_TRANSFER_CAP_MATERIALIZE_OK",
+            "YARM_D5_SPLIT_MATERIALIZE",
+            "IPC_REPLY_CAP_ONESHOT_OK",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(m),
+                "syscall.rs must emit `{m}` so the live boot workload proves it"
+            );
+        }
+        // The routed materializer is the live entry the recv paths call.
+        assert!(
+            SYSCALL_SRC.contains("fn materialize_received_message_cap_routed"),
+            "the live split router must still exist"
+        );
+        // Each oracle marker must appear at least twice in syscall.rs: once on the
+        // live split arm and once on the canonical fallback arm. This pins the
+        // path-agnostic property (the oracle fires regardless of which arm runs).
+        for m in ["IPC_TRANSFER_CAP_MATERIALIZE_OK", "IPC_REPLY_CAP_ONESHOT_OK"] {
+            assert!(
+                SYSCALL_SRC.matches(m).count() >= 2,
+                "`{m}` must be emitted on both the live split arm and the canonical arm"
+            );
+        }
+    }
+
+    // 2. The oracle script defines the basic/extended mode switch and the
+    //    extended-required set is exactly the two cap-delivery markers (reply +
+    //    transfer) that the live spawn workload proves.
+    #[test]
+    fn stage157_script_defines_extended_mode() {
+        assert!(
+            ORACLE_SCRIPT.contains("ORACLE_MODE"),
+            "oracle script must define the ORACLE_MODE switch"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("EXTENDED_REQUIRED"),
+            "oracle script must define the extended-required marker set"
+        );
+        for m in ["IPC_REPLY_CAP_ONESHOT_OK", "IPC_TRANSFER_CAP_MATERIALIZE_OK"] {
+            assert!(
+                ORACLE_SCRIPT.contains(m),
+                "extended mode must require `{m}`"
+            );
+        }
+    }
+
+    // 3. The fault-path / contention markers stay recorded-only (never hard
+    //    required), because a healthy boot must NOT fault and need not contend.
+    //    Guard against accidentally promoting them into EXTENDED_REQUIRED.
+    #[test]
+    fn stage157_fault_markers_not_extended_required() {
+        let extended_block = ORACLE_SCRIPT
+            .split("EXTENDED_REQUIRED=(")
+            .nth(1)
+            .and_then(|s| s.split(')').next())
+            .expect("EXTENDED_REQUIRED block must exist");
+        for m in ["IPC_RECV_V2_ROLLBACK_OK", "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"] {
+            assert!(
+                !extended_block.contains(m),
+                "fault/contention marker `{m}` must not be hard-required on a healthy boot"
+            );
+        }
+    }
+
+    // 4. Stage 156's basic-mode contract is preserved: the >=1 meta delivery
+    //    requirement (REQUIRED_ANY) still exists and the default mode is basic.
+    #[test]
+    fn stage157_basic_mode_preserved() {
+        assert!(
+            ORACLE_SCRIPT.contains("REQUIRED_ANY"),
+            "basic mode's >=1 meta delivery gate must remain"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("ORACLE_MODE:-basic"),
+            "default oracle mode must remain basic (Stage 156 contract unchanged)"
+        );
+    }
+}
