@@ -2945,6 +2945,59 @@ queued-split is therefore **never** reported as a pass unless
 `IPC_RECV_V2_META_QUEUED_SPLIT_OK` actually appears. Guard:
 `stage159bcd_oracle_acceptance_is_arch_aware`. Sender-wake remains deferred.
 
+### 5.1.9 Stage 160 — AArch64 split-recv fast-path routing/parity
+
+**x86_64 Stage 159BC/D is accepted** (third validation): queued-split and rollback
+proofs pass, the rollback `InvalidArgs` is handled as a normal syscall error
+(`result=handled_err`), and there is no fatal trap dump.
+
+**AArch64 was deferred** because the proof recv routed through
+`YARM_RECV_CORE_ADAPTER kind=legacy_full_path` — the trap-entry user-ASID
+queued-split fast path returned `None` and the recv fell to the global-lock
+immediate path, which never emits `IPC_RECV_V2_META_QUEUED_SPLIT_OK` /
+`IPC_RECV_V2_ROLLBACK_OK`.
+
+**Root cause (CPU-binding parity gap, not arch-specific delivery).** The
+trap-entry split recv resolves the requester TID under `with_cpu(cpu)` but then
+ran the snapshot dispatch (`try_split_recv_queued_plain_with_snapshot_locked`)
+under `SharedKernel::with` — which does **not** bind `current_cpu`. That seam
+computes its receiver class from the *ambient* current task
+(`current_task_has_user_asid` → `current_tid`, read off `current_cpu`), exactly
+as the global-lock path does — but the global-lock path always runs under
+`with_cpu(cpu)` (`handle_trap_entry_shared`). On a single-CPU boot (the x86_64
+smoke runs `-smp 1`) `current_cpu` is always CPU0, so the unbound read happened
+to be correct. On a multi-CPU boot (the AArch64 smoke runs `-smp 2`) the unbound
+read could observe another CPU's current task → `is_kernel_task = true` →
+`plan_recv_core` returns `FallbackRequired(RecvV2MetaUserCopy)` (a kernel task
+cannot take a V2-meta user copy) → `None` → global `legacy_full_path`.
+
+**Fix (smallest parity change; no seam moved).** In
+`SharedKernel::try_split_ipc_recv_queued_plain_into_frame` (`src/runtime.rs`) the
+snapshot dispatch now runs under `with_cpu(cpu, …)` instead of the unbound
+`with`, so `current_cpu` is bound to the trapping CPU for the receiver-class
+read — identical to the global-lock path. This touches only the runtime dispatch
+layer: the pinned delivery seam
+(`try_split_recv_queued_plain_with_snapshot_locked`) is byte-identical and stays
+in `syscall.rs`; no materialization or queued-split delivery code moved; no
+syscall/IPC ABI change (`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`); RPi5 boot
+and the x86_64 D6/CR3/TSS/PF paths are untouched; the global-lock fallback is
+unchanged. x86_64 (`-smp 1`) is behaviourally unchanged (binding CPU0 is a no-op
+there), so the x86_64 proof oracle stays green.
+
+**Diagnostics.** `YARM_SPLIT_RECV_PROBE step={enter,tid,snapshot,bind_cpu,outcome}`
+now brackets each decision point in the split-recv method, so a boot log pins the
+exact step if any residual fallback remains. Guards:
+`stage160_both_arches_share_trap_dispatch_hook`,
+`stage160_split_recv_binds_current_cpu`, `stage160_fallback_diagnostics_exist`,
+`stage160_no_stateful_seam_moved`, `stage160_no_rpi5_coupling_counts_unchanged`.
+
+**Expected after Stage 160.** On AArch64 the proof recv should now resolve the
+user-ASID receiver class correctly and take the queued-split path, emitting
+`IPC_RECV_V2_META_QUEUED_SPLIT_OK` and `IPC_RECV_V2_ROLLBACK_OK` alongside the
+proof sequence markers. If any fallback remains, the `YARM_SPLIT_RECV_PROBE`
+trail plus `YARM_RECV_CORE_PLAN` / `YARM_RECV_CORE_FALLBACK` identify the exact
+blocker. (QEMU is run by the maintainer.)
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
