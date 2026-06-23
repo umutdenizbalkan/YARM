@@ -46,7 +46,8 @@ mocks.
   retains compatibility aliases only.
 - It defines an `RpiPropertyTransport` trait, a firmware client, and property
   tags, with a deterministic hosted mock transport. The real MMIO transport is
-  deferred and the service `run()` is empty.
+  deferred and the service `run()` emits `RPI_FIRMWARE_SRV_ENTRY` followed by
+  `RPI_FIRMWARE_SRV_DEFERRED_NO_MMIO_GRANT`.
 - **No `rpi_firmware_srv` bin is added**; the crate manifest declares no such
   binary and the crate root exposes no firmware `run_*` entrypoint. The scaffold
   is **not live-spawned** and **not hardware-proven**.
@@ -93,13 +94,39 @@ mocks.
 
 - `driver_manager` (control-plane) is **live-spawned in the QEMU flow**
   (`image_id=7`) as a driver registry handling `REGISTER` / `GRANT_IRQ` /
-  `GRANT_DMA` / `RESTARTED`. It does not parse the DTB and does not spawn driver
-  binaries. See [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
+  `GRANT_DMA` / `RESTARTED`. It now also has an inert userspace-only
+  `PlatformInventory` / `DeviceRecord` model for future RPi5 candidates
+  (`Uart`, `Mailbox`, `Gpio`, `IrqMux`, `Block`, `Unknown`) with compatible
+  strings, MMIO ranges, IRQs, candidate driver names, and deferred status. The
+  DRS-1B hardening makes privileged requests fail closed: verified `sender_tid`
+  metadata is required, payload TIDs are diagnostic only, inventory records
+  authorize IRQ/MMIO/DMA requests before any runtime call, sender-scoped read-only
+  queries return inert inventory/MMIO/IRQ/status data without caps, and production
+  no-op hardware control returns errors instead of dummy `CapId(0)` grants. DRS-2
+  adds a hosted fake-FDT parser harness that converts bounded synthetic RPi5-style
+  nodes into inert inventory records for tests only; DRS-2B extends those hosted
+  tests with parent-bus cell inheritance, minimal `ranges` translation, bounded
+  IRQ parsing, and malformed bus/resource rejection. RP1 child resources remain
+  PCIe/BAR-relative and deferred. DRS-3 adds a policy-only `SpawnPlan` generator
+  over inert inventory records so hosted tests can describe future driver
+  eligibility and blockers without invoking PM or runtime hardware control. DRS-4
+  adds a mock spawn-authority decision model that consumes those plans and emits
+  inert approvals/denials only; it still does not call PM/supervisor services or
+  spawn anything. DRS-5 adds mock resource-grant bundle descriptions for approved
+  or denied plan entries; these list inert MMIO/IRQ/DMA/transport/clock/pinmux
+  requirements but never include `CapId`s or perform grant operations. The
+  harness does not parse the live boot DTB, grant resources, perform MMIO, or
+  spawn driver binaries. See
+  [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
 
 ## Summary
 
 The generic/backend split is in place for UART, GPIO, and block; the RPi
-firmware mailbox is a transport scaffold. Of the Raspberry Pi 5-relevant
+firmware mailbox is a transport scaffold. DRS-1 audited every declared
+`yarm-driver-servers` binary (`blkcache_srv`, `console_driver`, `input_srv`,
+`irqmux_srv`, `uart_srv`, `virtio_blk_srv`, `virtio_gpu_srv`, `virtio_net_srv`,
+`rp1_gpio_srv`) and the RPi-facing modules (`uart`, PL011, `mailbox`/firmware,
+`gpio`, RP1 GPIO, `irqmux`). Of the Raspberry Pi 5-relevant
 servers, none are live-spawned with real hardware integration: they are
 mock/protocol-ready and **not hardware-proven**, pending the platform discovery,
 MMIO-grant, and interrupt-domain work tracked in

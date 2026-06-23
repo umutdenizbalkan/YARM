@@ -79,8 +79,25 @@ and an `image_id` in the runtime spawn table (`initramfs_srv`, `devfs_srv`,
 claim and is **not** consumed by init today — no code selects or applies it.
 Raspberry Pi-specific driver binaries (`uart_srv`, `irqmux_srv`, `rp1_gpio_srv`)
 are deliberately **omitted** until RPi5 userspace actually reaches
-`driver_manager` and those drivers have a validated hardware path. See the
-driver inventory in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
+`driver_manager` and those drivers have a validated hardware path. The
+firmware-property scaffold is also mock-only: no `rpi_firmware_srv` binary is
+declared, and its entrypoint only logs deferred no-MMIO-grant markers. The
+`driver_manager` likewise requires verified sender identity for privileged
+requests, exposes only sender-scoped inert resource-query data, and will not
+mint fake hardware grants when production hardware control is unavailable. DRS-2
+and DRS-2B add only a hosted fake-DTB parser harness for tests, including bounded
+parent-bus cell inheritance, minimal fake `ranges` translation, and limited
+inert IRQ parsing; it does not parse the live boot DTB. DRS-3 adds an inert
+policy-only spawn-plan generator so tests can explain which candidate services
+would be eligible or blocked without calling PM, spawning, granting caps, or
+touching MMIO. DRS-4 adds a mock spawn-authority decision model that turns those
+plans into inert approvals/denials without calling PM/supervisor services,
+spawning, granting caps, or touching MMIO. DRS-5 adds mock resource-grant bundle
+descriptions; they list inert MMIO/IRQ/DMA/transport/clock/pinmux requirements
+but contain no real `CapId`s and perform no grant operations. RP1 GPIO resources
+remain PCIe/BAR-relative and deferred rather than direct BCM2712 MMIO. See the
+driver inventory in
+[`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning
 
@@ -90,7 +107,11 @@ This profile does **not** assert that:
   halts in the HH5 diagnostic path);
 - the listed services have Raspberry Pi 5-specific hardware support;
 - device-tree-driven device discovery, MMIO/IRQ resource assignment, or driver
-  spawning is implemented;
+  spawning is implemented (DRS-1 through DRS-5 add only a userspace-only fake
+  inventory, fail-closed authorization model, inert read-only resource query
+  model, hosted fake-DTB/parser-bus harness, and policy-only spawn-plan model in
+  `driver_manager` tests, plus mock spawn-authority decisions and resource-grant
+  bundle descriptions);
 - the manifest is handed to init; or
 - any listed service is spawned because this file exists.
 
