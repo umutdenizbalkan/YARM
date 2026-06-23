@@ -221,12 +221,30 @@ pub(crate) fn split_finalize_handled_syscall(
         let _ = kernel.set_thread_user_context(tid, ctx);
     }
     crate::yarm_log!(
+        "AARCH64_SPLIT_CONTEXT_SAVE_DONE x0=0x{:x}",
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0)
+    );
+    crate::yarm_log!(
         "AARCH64_SPLIT_SVC_ADVANCE_DONE pc=0x{:016x}",
         resume_pc as u64
     );
+    // Export ordering mirrors the global non-task-switched syscall-return path
+    // (context-save → restore → export). `restore_arch_thread_state` does not
+    // touch the error lane, so `export_syscall_result_to_user_gprs` still sees the
+    // error encoded by `set_err` and writes it to x0. The diagnostics prove
+    // x0_after carries the error code (e.g. InvalidArgs = 2) on the rollback path.
+    crate::yarm_log!(
+        "AARCH64_SPLIT_ABI_EXPORT_BEGIN err={} x0_before=0x{:x}",
+        frame.error_code().unwrap_or(0),
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0)
+    );
     restore_arch_thread_state(kernel, cpu, Some(frame), true)?;
     export_syscall_result_to_user_gprs(frame);
-    crate::yarm_log!("AARCH64_SPLIT_ABI_EXPORT_DONE");
+    crate::yarm_log!(
+        "AARCH64_SPLIT_ABI_EXPORT_DONE err={} x0_after=0x{:x}",
+        frame.error_code().unwrap_or(0),
+        frame.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0)
+    );
     Ok(())
 }
 

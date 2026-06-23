@@ -42652,3 +42652,137 @@ mod stage160c_aarch64_trap_abi_bracketing {
         let _ = X86_BOOT_SRC;
     }
 }
+
+// Stage 160D — AArch64 split handled-error export parity + userspace error
+// detection. The split finalize export mirrors the global ordering (context-save
+// → restore → export), and the proof undersize recv wrapper detects the error
+// from x0 (not the meta.status heuristic, which is invalid once the recv-v2
+// writeback has copied the meta before detecting the undersized payload).
+mod stage160d_aarch64_split_error_export_parity {
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+
+    // 1. The split finalize export ordering mirrors the global path exactly:
+    //    context-save (set_thread_user_context) → restore_arch_thread_state →
+    //    export_syscall_result_to_user_gprs.
+    #[test]
+    fn stage160d_split_finalize_mirrors_global_export_order() {
+        let f = AARCH64_TRAP_SRC
+            .split("fn split_finalize_handled_syscall")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("split finalize must exist");
+        let ctx_save = f
+            .find("set_thread_user_context(tid, ctx)")
+            .expect("context save");
+        let restore = f
+            .find("restore_arch_thread_state(kernel, cpu, Some(frame), true)")
+            .expect("restore");
+        let export = f
+            .find("export_syscall_result_to_user_gprs(frame)")
+            .expect("export");
+        assert!(
+            ctx_save < restore && restore < export,
+            "split finalize must order context-save → restore → export, mirroring the global path"
+        );
+    }
+
+    // 2. Handled syscall errors are exported (the error lane survives restore and
+    //    reaches x0). Diagnostics prove x0_after carries the error code.
+    #[test]
+    fn stage160d_handled_error_export_diagnostics() {
+        for marker in &[
+            "AARCH64_SPLIT_ABI_EXPORT_BEGIN err=",
+            "x0_before=",
+            "AARCH64_SPLIT_ABI_EXPORT_DONE err=",
+            "x0_after=",
+            "AARCH64_SPLIT_CONTEXT_SAVE_DONE x0=",
+            "AARCH64_SPLIT_SVC_ADVANCE_DONE pc=",
+        ] {
+            assert!(
+                AARCH64_TRAP_SRC.contains(marker),
+                "export-parity diagnostic `{marker}` must exist"
+            );
+        }
+    }
+
+    // 3. The proof undersize recv wrapper detects the error from x0, NOT the
+    //    invalid meta.status heuristic (meta is written before the undersize is
+    //    detected, so meta.status != u64::MAX on the rollback).
+    #[test]
+    fn stage160d_proof_wrapper_detects_error_from_x0() {
+        let w = USER_RT_SRC
+            .split("fn ipc_recv_v2_proof_undersized")
+            .nth(1)
+            .and_then(|s| s.split("\n    #[inline]").next())
+            .expect("proof undersize wrapper must exist");
+        // The aarch64/riscv64 branch must check ret0 directly, not gate on
+        // meta.status == u64::MAX.
+        assert!(
+            w.contains("if ret.ret0 != 0 {"),
+            "proof undersize wrapper must detect the error from a non-zero x0"
+        );
+        assert!(
+            !w.contains("ret.ret0 != 0 && meta.status == u64::MAX"),
+            "proof undersize wrapper must NOT use the meta.status heuristic (invalid for the undersize rollback)"
+        );
+    }
+
+    // 4. SVC PC advance is applied exactly once on the handled split path (single
+    //    +4 site in the finalize).
+    #[test]
+    fn stage160d_svc_advance_exactly_once() {
+        let f = AARCH64_TRAP_SRC
+            .split("fn split_finalize_handled_syscall")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("split finalize must exist");
+        assert_eq!(
+            f.matches("last_vector_raw_elr().wrapping_add(4)").count(),
+            1,
+            "SVC PC advance must occur exactly once on the handled split path"
+        );
+        assert_eq!(
+            f.matches("frame.set_saved_pc(").count(),
+            1,
+            "saved_pc must be set exactly once in the finalize"
+        );
+    }
+
+    // 5. No IPC/cap seam moved; counts unchanged; RPi5 untouched; x86_64 D6 hook
+    //    intact; the finalize stays proof-knob-gated at its call sites.
+    #[test]
+    fn stage160d_invariants() {
+        for def in &[
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_endpoint_split_recv(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts must be unchanged"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("maybe_run_d6_controlled_switch_proof"),
+            "x86_64 D6 proof hook must remain intact"
+        );
+        // The export-parity work is reached only through the proof-knob-gated
+        // finalize hook (Stage 160C), so normal boots are unaffected.
+        let hook = TRAP_ENTRY_SRC
+            .find("fn finalize_split_handled_syscall(")
+            .map(|p| &TRAP_ENTRY_SRC[p..(p + 600).min(TRAP_ENTRY_SRC.len())])
+            .unwrap_or("");
+        assert!(
+            hook.contains("ipc_recv_oracle_proof_enabled()"),
+            "the finalize hook must stay proof-knob-gated"
+        );
+    }
+}
