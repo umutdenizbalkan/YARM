@@ -112,8 +112,11 @@ mocks.
   eligibility and blockers without invoking PM or runtime hardware control. DRS-4
   adds a mock spawn-authority decision model that consumes those plans and emits
   inert approvals/denials only; it still does not call PM/supervisor services or
-  spawn anything. The harness does not parse the live boot DTB, grant resources,
-  perform MMIO, or spawn driver binaries. See
+  spawn anything. DRS-5 adds mock resource-grant bundle descriptions for approved
+  or denied plan entries; these list inert MMIO/IRQ/DMA/transport/clock/pinmux
+  requirements but never include `CapId`s or perform grant operations. The
+  harness does not parse the live boot DTB, grant resources, perform MMIO, or
+  spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
 
 ## Summary

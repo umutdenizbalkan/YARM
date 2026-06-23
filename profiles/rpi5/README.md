@@ -92,9 +92,11 @@ policy-only spawn-plan generator so tests can explain which candidate services
 would be eligible or blocked without calling PM, spawning, granting caps, or
 touching MMIO. DRS-4 adds a mock spawn-authority decision model that turns those
 plans into inert approvals/denials without calling PM/supervisor services,
-spawning, granting caps, or touching MMIO. RP1 GPIO resources remain
-PCIe/BAR-relative and deferred rather than direct BCM2712 MMIO. See the driver
-inventory in
+spawning, granting caps, or touching MMIO. DRS-5 adds mock resource-grant bundle
+descriptions; they list inert MMIO/IRQ/DMA/transport/clock/pinmux requirements
+but contain no real `CapId`s and perform no grant operations. RP1 GPIO resources
+remain PCIe/BAR-relative and deferred rather than direct BCM2712 MMIO. See the
+driver inventory in
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning
@@ -105,10 +107,11 @@ This profile does **not** assert that:
   halts in the HH5 diagnostic path);
 - the listed services have Raspberry Pi 5-specific hardware support;
 - device-tree-driven device discovery, MMIO/IRQ resource assignment, or driver
-  spawning is implemented (DRS-1 through DRS-4 add only a userspace-only fake
+  spawning is implemented (DRS-1 through DRS-5 add only a userspace-only fake
   inventory, fail-closed authorization model, inert read-only resource query
   model, hosted fake-DTB/parser-bus harness, and policy-only spawn-plan model in
-  `driver_manager` tests, plus mock spawn-authority decisions);
+  `driver_manager` tests, plus mock spawn-authority decisions and resource-grant
+  bundle descriptions);
 - the manifest is handed to init; or
 - any listed service is spawned because this file exists.
 

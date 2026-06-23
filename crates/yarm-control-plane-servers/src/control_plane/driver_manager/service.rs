@@ -310,6 +310,7 @@ fn bounded_str(bytes: &[u8], len: usize) -> Option<&str> {
 }
 
 const MAX_DEVICES: usize = 32;
+const MAX_RESOURCE_GRANT_ENTRIES: usize = MAX_DEVICES * 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnAction {
@@ -352,6 +353,43 @@ pub enum SpawnDenialReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceGrantKind {
+    Mmio,
+    Irq,
+    Dma,
+    MailboxTransport,
+    PcieBar,
+    Pinmux,
+    Clock,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceGrantRequirement {
+    WouldRequest,
+    Deferred,
+    Denied,
+    Unsupported,
+    AlreadySatisfied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceGrantBlocker {
+    MissingMmioAuthority,
+    MissingIrqRouting,
+    MissingDmaPolicy,
+    RequiresPcieBarDiscovery,
+    RequiresMailboxTransport,
+    RequiresCacheMaintenancePolicy,
+    RequiresPinmuxOwnership,
+    RequiresClockDiscovery,
+    DeviceDeferred,
+    DeviceUnsupported,
+    SpawnNotApproved,
+    UnknownResource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnPolicy {
     pub uart_prereqs_available: bool,
     pub irqmux_prereqs_available: bool,
@@ -368,6 +406,21 @@ pub struct SpawnAuthorityRequest {
 pub struct SpawnAuthorityPolicy {
     pub spawn_authority_available: bool,
     pub policy_allows_spawn: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceGrantPolicy {
+    pub describe_uart_clock: bool,
+    pub describe_uart_pinmux: bool,
+}
+
+impl ResourceGrantPolicy {
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            describe_uart_clock: true,
+            describe_uart_pinmux: true,
+        }
+    }
 }
 
 impl SpawnAuthorityPolicy {
@@ -484,6 +537,95 @@ impl SpawnAuthorityDecision {
 pub struct SpawnAuthorityDecisions {
     decisions: [Option<SpawnAuthorityDecision>; MAX_DEVICES],
     len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceGrantEntry {
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub kind: ResourceGrantKind,
+    pub requirement: ResourceGrantRequirement,
+    pub mock_resource_id: Option<u32>,
+    pub blockers: [Option<ResourceGrantBlocker>; 6],
+}
+
+impl ResourceGrantEntry {
+    fn new(
+        device: &DeviceRecord,
+        kind: ResourceGrantKind,
+        requirement: ResourceGrantRequirement,
+    ) -> Self {
+        Self {
+            compatible: device.compatible,
+            compatible_len: device.compatible_len,
+            driver_candidate: device.driver_candidate,
+            driver_candidate_len: device.driver_candidate_len,
+            kind,
+            requirement,
+            mock_resource_id: None,
+            blockers: [None; 6],
+        }
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn has_blocker(&self, blocker: ResourceGrantBlocker) -> bool {
+        self.blockers.iter().any(|entry| *entry == Some(blocker))
+    }
+
+    fn with_mock_resource_id(mut self, mock_resource_id: u32) -> Self {
+        self.mock_resource_id = Some(mock_resource_id);
+        self
+    }
+
+    fn push_blocker(&mut self, blocker: ResourceGrantBlocker) -> Result<(), KernelIpcError> {
+        if self.has_blocker(blocker) {
+            return Ok(());
+        }
+        let Some(slot) = self.blockers.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(blocker);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct ResourceGrantBundle {
+    entries: [Option<ResourceGrantEntry>; MAX_RESOURCE_GRANT_ENTRIES],
+    len: usize,
+}
+
+impl ResourceGrantBundle {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_RESOURCE_GRANT_ENTRIES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResourceGrantEntry> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|entry| entry.as_ref())
+    }
+
+    fn push(&mut self, entry: ResourceGrantEntry) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_RESOURCE_GRANT_ENTRIES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+        Ok(())
+    }
 }
 
 impl SpawnAuthorityDecisions {
@@ -780,6 +922,193 @@ impl PlatformInventory {
         }
         Ok(plan)
     }
+
+    pub fn build_resource_grant_bundle(
+        &self,
+        plan: &SpawnPlan,
+        decisions: &SpawnAuthorityDecisions,
+        policy: ResourceGrantPolicy,
+    ) -> Result<ResourceGrantBundle, KernelIpcError> {
+        let mut bundle = ResourceGrantBundle::new();
+        for ((device, plan_entry), decision) in self.iter().zip(plan.iter()).zip(decisions.iter()) {
+            if device.compatible() != plan_entry.compatible()
+                || device.compatible() != decision.compatible()
+            {
+                return Err(KernelIpcError::WrongObject);
+            }
+            append_resource_requirements(device, plan_entry, decision, policy, &mut bundle)?;
+        }
+        Ok(bundle)
+    }
+}
+
+fn append_resource_requirements(
+    device: &DeviceRecord,
+    plan_entry: &SpawnPlanEntry,
+    decision: &SpawnAuthorityDecision,
+    policy: ResourceGrantPolicy,
+    bundle: &mut ResourceGrantBundle,
+) -> Result<(), KernelIpcError> {
+    if decision.approval.is_some() && matches!(plan_entry.action, SpawnAction::WouldSpawn) {
+        return append_approved_resource_requirements(device, policy, bundle);
+    }
+    append_blocked_resource_requirements(device, plan_entry, bundle)
+}
+
+fn append_approved_resource_requirements(
+    device: &DeviceRecord,
+    policy: ResourceGrantPolicy,
+    bundle: &mut ResourceGrantBundle,
+) -> Result<(), KernelIpcError> {
+    match device.class {
+        DeviceClass::Uart => {
+            let next_id =
+                u32::try_from(bundle.len() + 1).map_err(|_| KernelIpcError::WrongObject)?;
+            bundle.push(
+                ResourceGrantEntry::new(
+                    device,
+                    ResourceGrantKind::Mmio,
+                    ResourceGrantRequirement::WouldRequest,
+                )
+                .with_mock_resource_id(next_id),
+            )?;
+            let next_id =
+                u32::try_from(bundle.len() + 1).map_err(|_| KernelIpcError::WrongObject)?;
+            bundle.push(
+                ResourceGrantEntry::new(
+                    device,
+                    ResourceGrantKind::Irq,
+                    ResourceGrantRequirement::WouldRequest,
+                )
+                .with_mock_resource_id(next_id),
+            )?;
+            if policy.describe_uart_clock {
+                let next_id =
+                    u32::try_from(bundle.len() + 1).map_err(|_| KernelIpcError::WrongObject)?;
+                bundle.push(
+                    ResourceGrantEntry::new(
+                        device,
+                        ResourceGrantKind::Clock,
+                        ResourceGrantRequirement::WouldRequest,
+                    )
+                    .with_mock_resource_id(next_id),
+                )?;
+            }
+            if policy.describe_uart_pinmux {
+                let next_id =
+                    u32::try_from(bundle.len() + 1).map_err(|_| KernelIpcError::WrongObject)?;
+                bundle.push(
+                    ResourceGrantEntry::new(
+                        device,
+                        ResourceGrantKind::Pinmux,
+                        ResourceGrantRequirement::WouldRequest,
+                    )
+                    .with_mock_resource_id(next_id),
+                )?;
+            }
+        }
+        DeviceClass::IrqMux => {
+            let next_id =
+                u32::try_from(bundle.len() + 1).map_err(|_| KernelIpcError::WrongObject)?;
+            bundle.push(
+                ResourceGrantEntry::new(
+                    device,
+                    ResourceGrantKind::Irq,
+                    ResourceGrantRequirement::WouldRequest,
+                )
+                .with_mock_resource_id(next_id),
+            )?;
+        }
+        _ => return Err(KernelIpcError::WrongObject),
+    }
+    Ok(())
+}
+
+fn append_blocked_resource_requirements(
+    device: &DeviceRecord,
+    plan_entry: &SpawnPlanEntry,
+    bundle: &mut ResourceGrantBundle,
+) -> Result<(), KernelIpcError> {
+    match device.class {
+        DeviceClass::Gpio => {
+            let mut pcie = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::PcieBar,
+                ResourceGrantRequirement::Deferred,
+            );
+            pcie.push_blocker(ResourceGrantBlocker::RequiresPcieBarDiscovery)?;
+            pcie.push_blocker(ResourceGrantBlocker::DeviceDeferred)?;
+            bundle.push(pcie)?;
+            let mut mmio = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::Mmio,
+                ResourceGrantRequirement::Deferred,
+            );
+            mmio.push_blocker(ResourceGrantBlocker::RequiresPcieBarDiscovery)?;
+            mmio.push_blocker(ResourceGrantBlocker::MissingMmioAuthority)?;
+            mmio.push_blocker(ResourceGrantBlocker::DeviceDeferred)?;
+            bundle.push(mmio)?;
+        }
+        DeviceClass::Mailbox => {
+            let mut transport = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::MailboxTransport,
+                ResourceGrantRequirement::Deferred,
+            );
+            transport.push_blocker(ResourceGrantBlocker::RequiresMailboxTransport)?;
+            transport.push_blocker(ResourceGrantBlocker::DeviceDeferred)?;
+            bundle.push(transport)?;
+            let mut dma = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::Dma,
+                ResourceGrantRequirement::Deferred,
+            );
+            dma.push_blocker(ResourceGrantBlocker::RequiresCacheMaintenancePolicy)?;
+            dma.push_blocker(ResourceGrantBlocker::MissingDmaPolicy)?;
+            dma.push_blocker(ResourceGrantBlocker::DeviceDeferred)?;
+            bundle.push(dma)?;
+            let mut mmio = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::Mmio,
+                ResourceGrantRequirement::Deferred,
+            );
+            mmio.push_blocker(ResourceGrantBlocker::MissingMmioAuthority)?;
+            mmio.push_blocker(ResourceGrantBlocker::DeviceDeferred)?;
+            bundle.push(mmio)?;
+        }
+        DeviceClass::IrqMux => {
+            let mut irq = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::Irq,
+                ResourceGrantRequirement::Deferred,
+            );
+            irq.push_blocker(ResourceGrantBlocker::MissingIrqRouting)?;
+            if !matches!(plan_entry.action, SpawnAction::WouldSpawn) {
+                irq.push_blocker(ResourceGrantBlocker::SpawnNotApproved)?;
+            }
+            bundle.push(irq)?;
+        }
+        DeviceClass::Unknown => {
+            let mut unknown = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::Unknown,
+                ResourceGrantRequirement::Unsupported,
+            );
+            unknown.push_blocker(ResourceGrantBlocker::DeviceUnsupported)?;
+            unknown.push_blocker(ResourceGrantBlocker::UnknownResource)?;
+            bundle.push(unknown)?;
+        }
+        DeviceClass::Uart | DeviceClass::Block => {
+            let mut denied = ResourceGrantEntry::new(
+                device,
+                ResourceGrantKind::Unknown,
+                ResourceGrantRequirement::Denied,
+            );
+            denied.push_blocker(ResourceGrantBlocker::SpawnNotApproved)?;
+            bundle.push(denied)?;
+        }
+    }
+    Ok(())
 }
 
 fn classify_spawn_plan_entry(
@@ -1831,6 +2160,15 @@ mod tests {
             .expect("spawn authority decision")
     }
 
+    fn grant_entries<'a>(
+        bundle: &'a ResourceGrantBundle,
+        compatible: &'a str,
+    ) -> impl Iterator<Item = &'a ResourceGrantEntry> + 'a {
+        bundle
+            .iter()
+            .filter(move |entry| entry.compatible() == Some(compatible))
+    }
+
     #[test]
     fn spawn_plan_for_fake_rpi5_inventory_is_policy_only_and_deterministic() {
         let mut inventory = PlatformInventory::new();
@@ -2154,6 +2492,166 @@ mod tests {
                 .unwrap()
                 .has_reason(SpawnDenialReason::AlreadyRunning)
         );
+    }
+
+    #[test]
+    fn approved_pl011_spawn_produces_inert_resource_grant_requirements() {
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let registry = DriverRegistry::new();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let decisions = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 4,
+                },
+                SpawnAuthorityPolicy::allow_hosted_mock_spawns(),
+            )
+            .unwrap();
+        let bundle = inventory
+            .build_resource_grant_bundle(&plan, &decisions, ResourceGrantPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let grants: [_; 4] =
+            core::array::from_fn(|index| grant_entries(&bundle, "arm,pl011").nth(index).unwrap());
+        assert_eq!(bundle.len(), 4);
+        assert_eq!(grants[0].kind, ResourceGrantKind::Mmio);
+        assert_eq!(grants[1].kind, ResourceGrantKind::Irq);
+        assert_eq!(grants[2].kind, ResourceGrantKind::Clock);
+        assert_eq!(grants[3].kind, ResourceGrantKind::Pinmux);
+        for grant in grants {
+            assert_eq!(grant.requirement, ResourceGrantRequirement::WouldRequest);
+            assert!(grant.mock_resource_id.is_some());
+            assert!(
+                grant.mock_resource_id.unwrap() > 0,
+                "mock resource IDs are inert and must not be CapId(0)"
+            );
+        }
+    }
+
+    #[test]
+    fn denied_or_deferred_spawns_do_not_produce_live_grant_requests() {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "arm,pl011",
+                    DeviceClass::Uart,
+                    "uart_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_mmio(0, 0x107d_0010_0000, 0x1000)
+                .unwrap()
+                .with_irq(0, 121)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,rp1-gpio",
+                    DeviceClass::Gpio,
+                    "rp1_gpio_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_mmio(0, 0x1_0000, 0x1000)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,firmware",
+                    DeviceClass::Mailbox,
+                    "rpi_firmware",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "yarm,irqmux",
+                    DeviceClass::IrqMux,
+                    "irqmux_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_irq(0, 5)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "vendor,unknown",
+                    DeviceClass::Unknown,
+                    "unknown",
+                    DeviceStatus::Unsupported,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let registry = DriverRegistry::new();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let decisions = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 5,
+                },
+                SpawnAuthorityPolicy::fail_closed(),
+            )
+            .unwrap();
+        let before_inventory_len = inventory.len();
+        let before_registry_len = registry.len();
+        let bundle = inventory
+            .build_resource_grant_bundle(&plan, &decisions, ResourceGrantPolicy::hosted_fake_rpi5())
+            .unwrap();
+        assert_eq!(inventory.len(), before_inventory_len);
+        assert_eq!(registry.len(), before_registry_len);
+        assert!(
+            bundle
+                .iter()
+                .all(|entry| entry.requirement != ResourceGrantRequirement::WouldRequest),
+            "denied authority cannot produce would-request grants"
+        );
+
+        let rp1: [_; 2] = core::array::from_fn(|index| {
+            grant_entries(&bundle, "raspberrypi,rp1-gpio")
+                .nth(index)
+                .unwrap()
+        });
+        assert_eq!(rp1[0].kind, ResourceGrantKind::PcieBar);
+        assert!(rp1[0].has_blocker(ResourceGrantBlocker::RequiresPcieBarDiscovery));
+        assert_eq!(rp1[1].kind, ResourceGrantKind::Mmio);
+        assert!(rp1[1].has_blocker(ResourceGrantBlocker::MissingMmioAuthority));
+
+        let mailbox: [_; 3] = core::array::from_fn(|index| {
+            grant_entries(&bundle, "raspberrypi,firmware")
+                .nth(index)
+                .unwrap()
+        });
+        assert_eq!(mailbox[0].kind, ResourceGrantKind::MailboxTransport);
+        assert!(mailbox[0].has_blocker(ResourceGrantBlocker::RequiresMailboxTransport));
+        assert_eq!(mailbox[1].kind, ResourceGrantKind::Dma);
+        assert!(mailbox[1].has_blocker(ResourceGrantBlocker::RequiresCacheMaintenancePolicy));
+        assert_eq!(mailbox[2].kind, ResourceGrantKind::Mmio);
+        assert!(mailbox[2].has_blocker(ResourceGrantBlocker::MissingMmioAuthority));
+
+        let irqmux = grant_entries(&bundle, "yarm,irqmux").next().unwrap();
+        assert_eq!(irqmux.kind, ResourceGrantKind::Irq);
+        assert!(irqmux.has_blocker(ResourceGrantBlocker::MissingIrqRouting));
+
+        let unknown = grant_entries(&bundle, "vendor,unknown").next().unwrap();
+        assert_eq!(unknown.requirement, ResourceGrantRequirement::Unsupported);
+        assert!(unknown.has_blocker(ResourceGrantBlocker::DeviceUnsupported));
     }
 
     #[test]
