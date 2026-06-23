@@ -1979,6 +1979,466 @@ fn rollback_step_for_reservation(reservation: PmSpawnReservation) -> PmSpawnRoll
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverHealthStatus {
+    NotStarted,
+    Starting,
+    Healthy,
+    Unresponsive,
+    Crashed,
+    Exited,
+    RestartPending,
+    RestartDenied,
+    RestartRequested,
+    Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverHealthEvent {
+    Registered,
+    Heartbeat,
+    MissedHeartbeat,
+    CrashReported,
+    ExitReported,
+    ManualRestartRequested,
+    PolicyRestartRequested,
+    RestartDenied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverHealthFailure {
+    MissingHealthRecord,
+    HealthTableFull,
+    NotAccounted,
+    DeviceNotRestartable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverHealthPolicy {
+    pub max_missed_heartbeats: u8,
+}
+
+impl DriverHealthPolicy {
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            max_missed_heartbeats: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverHealthRecord {
+    pub mock_request_id: u32,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub status: DriverHealthStatus,
+    pub last_event: Option<DriverHealthEvent>,
+    pub restart_count: u8,
+    pub missed_heartbeats: u8,
+}
+
+impl DriverHealthRecord {
+    fn from_request(request: &DriverSpawnRequest, status: DriverHealthStatus) -> Self {
+        Self {
+            mock_request_id: request.mock_request_id,
+            compatible: request.compatible,
+            compatible_len: request.compatible_len,
+            driver_candidate: request.driver_candidate,
+            driver_candidate_len: request.driver_candidate_len,
+            status,
+            last_event: None,
+            restart_count: 0,
+            missed_heartbeats: 0,
+        }
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverHealthTable {
+    records: [Option<DriverHealthRecord>; MAX_DEVICES],
+    len: usize,
+}
+
+impl DriverHealthTable {
+    pub const fn new() -> Self {
+        Self {
+            records: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DriverHealthRecord> {
+        self.records[..self.len]
+            .iter()
+            .filter_map(|record| record.as_ref())
+    }
+
+    pub fn record_for(&self, compatible: &str) -> Option<&DriverHealthRecord> {
+        self.iter()
+            .find(|record| record.compatible() == Some(compatible))
+    }
+
+    fn record_for_mut(&mut self, compatible: &str) -> Option<&mut DriverHealthRecord> {
+        self.records[..self.len]
+            .iter_mut()
+            .filter_map(|record| record.as_mut())
+            .find(|record| record.compatible() == Some(compatible))
+    }
+
+    pub fn sync_from_spawn_reports(
+        requests: &DriverSpawnRequestBundle,
+        validation: &PmSpawnValidationReport,
+        accounting: &PmSpawnAccountingReport,
+    ) -> Result<Self, KernelIpcError> {
+        let mut table = Self::new();
+        for ((request, validation), accounting) in requests
+            .iter()
+            .zip(validation.iter())
+            .zip(accounting.iter())
+        {
+            if request.mock_request_id != validation.mock_request_id
+                || request.mock_request_id != accounting.mock_request_id
+                || request.compatible() != validation.compatible()
+                || request.compatible() != accounting.compatible()
+            {
+                return Err(KernelIpcError::WrongObject);
+            }
+            if matches!(
+                accounting.status,
+                PmSpawnAccountingStatus::WouldCommit | PmSpawnAccountingStatus::WouldReserve
+            ) {
+                table.push(DriverHealthRecord::from_request(
+                    request,
+                    DriverHealthStatus::Starting,
+                ))?;
+            }
+        }
+        Ok(table)
+    }
+
+    fn push(&mut self, record: DriverHealthRecord) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.records[self.len] = Some(record);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn apply_event(
+        &mut self,
+        compatible: &str,
+        event: DriverHealthEvent,
+        policy: DriverHealthPolicy,
+    ) -> Result<(), KernelIpcError> {
+        let record = self
+            .record_for_mut(compatible)
+            .ok_or(KernelIpcError::TaskMissing)?;
+        record.last_event = Some(event);
+        match event {
+            DriverHealthEvent::Registered => {
+                if matches!(
+                    record.status,
+                    DriverHealthStatus::Starting
+                        | DriverHealthStatus::RestartPending
+                        | DriverHealthStatus::RestartRequested
+                ) {
+                    record.status = DriverHealthStatus::Healthy;
+                    record.missed_heartbeats = 0;
+                }
+            }
+            DriverHealthEvent::Heartbeat => {
+                if !matches!(
+                    record.status,
+                    DriverHealthStatus::Crashed
+                        | DriverHealthStatus::Exited
+                        | DriverHealthStatus::Disabled
+                ) {
+                    record.status = DriverHealthStatus::Healthy;
+                    record.missed_heartbeats = 0;
+                }
+            }
+            DriverHealthEvent::MissedHeartbeat => {
+                record.missed_heartbeats = record.missed_heartbeats.saturating_add(1);
+                if record.missed_heartbeats >= policy.max_missed_heartbeats {
+                    record.status = DriverHealthStatus::Unresponsive;
+                }
+            }
+            DriverHealthEvent::CrashReported => record.status = DriverHealthStatus::Crashed,
+            DriverHealthEvent::ExitReported => record.status = DriverHealthStatus::Exited,
+            DriverHealthEvent::ManualRestartRequested
+            | DriverHealthEvent::PolicyRestartRequested => {
+                record.status = DriverHealthStatus::RestartPending;
+            }
+            DriverHealthEvent::RestartDenied => record.status = DriverHealthStatus::RestartDenied,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverRestartReason {
+    Crashed,
+    Unresponsive,
+    ExitedUnexpectedly,
+    Manual,
+    DependencyRestarted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverRestartDecision {
+    WouldRequest,
+    Denied,
+    Noop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverRestartBlocker {
+    RestartLimitExceeded,
+    DeviceDeferred,
+    DeviceUnsupported,
+    MissingSpawnRequest,
+    MissingPmAuthority,
+    ResourcePolicyDenied,
+    AlreadyHealthy,
+    AlreadyRestartPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverRestartRequestPolicy {
+    pub max_restarts: u8,
+    pub backoff_ms: u32,
+    pub manual_restart_healthy_allowed: bool,
+    pub pm_restart_authority: bool,
+}
+
+impl DriverRestartRequestPolicy {
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            max_restarts: 3,
+            backoff_ms: 1000,
+            manual_restart_healthy_allowed: false,
+            pm_restart_authority: true,
+        }
+    }
+
+    pub const fn without_pm_authority(mut self) -> Self {
+        self.pm_restart_authority = false;
+        self
+    }
+
+    pub const fn with_max_restarts(mut self, max_restarts: u8) -> Self {
+        self.max_restarts = max_restarts;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverRestartRequest {
+    pub mock_restart_request_id: u32,
+    pub original_mock_request_id: u32,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub reason: Option<DriverRestartReason>,
+    pub decision: DriverRestartDecision,
+    pub restart_count: u8,
+    pub backoff_ms: u32,
+    pub resource_requirements:
+        [Option<DriverSpawnResourceRequirement>; MAX_DRIVER_SPAWN_REQUEST_RESOURCES],
+    pub startup_cap_requirements: [Option<StartupCapRequirement>; MAX_STARTUP_CAP_REQUIREMENTS],
+    pub blockers: [Option<DriverRestartBlocker>; MAX_DRIVER_SPAWN_BLOCKERS],
+}
+
+impl DriverRestartRequest {
+    fn from_request(
+        request: &DriverSpawnRequest,
+        index: usize,
+        policy: DriverRestartRequestPolicy,
+    ) -> Result<Self, KernelIpcError> {
+        Ok(Self {
+            mock_restart_request_id: u32::try_from(index + 1)
+                .map_err(|_| KernelIpcError::WrongObject)?,
+            original_mock_request_id: request.mock_request_id,
+            compatible: request.compatible,
+            compatible_len: request.compatible_len,
+            driver_candidate: request.driver_candidate,
+            driver_candidate_len: request.driver_candidate_len,
+            reason: None,
+            decision: DriverRestartDecision::Noop,
+            restart_count: 0,
+            backoff_ms: policy.backoff_ms,
+            resource_requirements: request.resource_requirements,
+            startup_cap_requirements: request.startup_cap_requirements,
+            blockers: [None; MAX_DRIVER_SPAWN_BLOCKERS],
+        })
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn has_blocker(&self, blocker: DriverRestartBlocker) -> bool {
+        self.blockers.iter().any(|entry| *entry == Some(blocker))
+    }
+
+    pub fn has_resource_requirement(&self, kind: ResourceGrantKind) -> bool {
+        self.resource_requirements
+            .iter()
+            .filter_map(|entry| *entry)
+            .any(|entry| entry.kind == kind)
+    }
+
+    pub fn has_startup_cap_requirement(&self, requirement: StartupCapRequirement) -> bool {
+        self.startup_cap_requirements
+            .iter()
+            .any(|entry| *entry == Some(requirement))
+    }
+
+    fn push_blocker(&mut self, blocker: DriverRestartBlocker) -> Result<(), KernelIpcError> {
+        if self.has_blocker(blocker) {
+            return Ok(());
+        }
+        let Some(slot) = self.blockers.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(blocker);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverRestartRequestBundle {
+    requests: [Option<DriverRestartRequest>; MAX_DEVICES],
+    len: usize,
+}
+
+impl DriverRestartRequestBundle {
+    pub const fn new() -> Self {
+        Self {
+            requests: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DriverRestartRequest> {
+        self.requests[..self.len]
+            .iter()
+            .filter_map(|request| request.as_ref())
+    }
+
+    fn push(&mut self, request: DriverRestartRequest) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.requests[self.len] = Some(request);
+        self.len += 1;
+        Ok(())
+    }
+}
+
+impl DriverSpawnRequestBundle {
+    pub fn build_restart_request_bundle(
+        &self,
+        health: &DriverHealthTable,
+        policy: DriverRestartRequestPolicy,
+    ) -> Result<DriverRestartRequestBundle, KernelIpcError> {
+        let mut bundle = DriverRestartRequestBundle::new();
+        for (index, request) in self.iter().enumerate() {
+            let mut restart = DriverRestartRequest::from_request(request, index, policy)?;
+            match request.status {
+                DriverSpawnRequestStatus::Deferred | DriverSpawnRequestStatus::Denied => {
+                    restart.decision = DriverRestartDecision::Denied;
+                    restart.push_blocker(DriverRestartBlocker::DeviceDeferred)?;
+                }
+                DriverSpawnRequestStatus::Unsupported => {
+                    restart.decision = DriverRestartDecision::Denied;
+                    restart.push_blocker(DriverRestartBlocker::DeviceUnsupported)?;
+                }
+                DriverSpawnRequestStatus::AlreadyRunning => {
+                    restart.decision = DriverRestartDecision::Noop;
+                    restart.push_blocker(DriverRestartBlocker::AlreadyRestartPending)?;
+                }
+                DriverSpawnRequestStatus::ReadyForPmValidation => {
+                    match health.record_for(request.compatible().unwrap_or("")) {
+                        Some(record) => apply_restart_policy(&mut restart, record, policy)?,
+                        None => {
+                            restart.decision = DriverRestartDecision::Denied;
+                            restart.push_blocker(DriverRestartBlocker::MissingSpawnRequest)?;
+                        }
+                    }
+                }
+            }
+            bundle.push(restart)?;
+        }
+        Ok(bundle)
+    }
+}
+
+fn apply_restart_policy(
+    restart: &mut DriverRestartRequest,
+    record: &DriverHealthRecord,
+    policy: DriverRestartRequestPolicy,
+) -> Result<(), KernelIpcError> {
+    restart.restart_count = record.restart_count;
+    if !policy.pm_restart_authority {
+        restart.decision = DriverRestartDecision::Denied;
+        restart.push_blocker(DriverRestartBlocker::MissingPmAuthority)?;
+        return Ok(());
+    }
+    if record.restart_count >= policy.max_restarts {
+        restart.decision = DriverRestartDecision::Denied;
+        restart.push_blocker(DriverRestartBlocker::RestartLimitExceeded)?;
+        return Ok(());
+    }
+    match record.status {
+        DriverHealthStatus::Crashed => {
+            restart.reason = Some(DriverRestartReason::Crashed);
+            restart.decision = DriverRestartDecision::WouldRequest;
+        }
+        DriverHealthStatus::Unresponsive => {
+            restart.reason = Some(DriverRestartReason::Unresponsive);
+            restart.decision = DriverRestartDecision::WouldRequest;
+        }
+        DriverHealthStatus::Exited => {
+            restart.reason = Some(DriverRestartReason::ExitedUnexpectedly);
+            restart.decision = DriverRestartDecision::WouldRequest;
+        }
+        DriverHealthStatus::RestartPending | DriverHealthStatus::RestartRequested => {
+            restart.decision = DriverRestartDecision::Noop;
+            restart.push_blocker(DriverRestartBlocker::AlreadyRestartPending)?;
+        }
+        DriverHealthStatus::Healthy if policy.manual_restart_healthy_allowed => {
+            restart.reason = Some(DriverRestartReason::Manual);
+            restart.decision = DriverRestartDecision::WouldRequest;
+        }
+        DriverHealthStatus::Healthy => {
+            restart.decision = DriverRestartDecision::Noop;
+            restart.push_blocker(DriverRestartBlocker::AlreadyHealthy)?;
+        }
+        _ => {
+            restart.decision = DriverRestartDecision::Denied;
+            restart.push_blocker(DriverRestartBlocker::MissingSpawnRequest)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct PlatformInventory {
     devices: [Option<DeviceRecord>; MAX_DEVICES],
@@ -4616,6 +5076,194 @@ mod tests {
         for entry in accounting.iter() {
             assert_ne!(entry.mock_request_id, 0);
         }
+    }
+
+    fn restart_request<'a>(
+        bundle: &'a DriverRestartRequestBundle,
+        compatible: &str,
+    ) -> &'a DriverRestartRequest {
+        bundle
+            .iter()
+            .find(|request| request.compatible() == Some(compatible))
+            .expect("restart request")
+    }
+
+    fn build_healthy_pl011_table() -> (DriverSpawnRequestBundle, DriverHealthTable) {
+        let (_, requests, validation, accounting) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::hosted_fake_rpi5());
+        let mut health =
+            DriverHealthTable::sync_from_spawn_reports(&requests, &validation, &accounting)
+                .unwrap();
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::Registered,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        (requests, health)
+    }
+
+    #[test]
+    fn accepted_pl011_becomes_healthy_after_registration_and_heartbeat() {
+        let (requests, mut health) = build_healthy_pl011_table();
+        assert_eq!(requests.ready_count(), 1);
+        let pl011 = health.record_for("arm,pl011").unwrap();
+        assert_eq!(pl011.status, DriverHealthStatus::Healthy);
+        assert_eq!(pl011.last_event, Some(DriverHealthEvent::Registered));
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::Heartbeat,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let pl011 = health.record_for("arm,pl011").unwrap();
+        assert_eq!(pl011.status, DriverHealthStatus::Healthy);
+        assert_eq!(pl011.last_event, Some(DriverHealthEvent::Heartbeat));
+    }
+
+    #[test]
+    fn missed_heartbeat_and_crash_update_health_status() {
+        let (_, mut health) = build_healthy_pl011_table();
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::MissedHeartbeat,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(
+            health.record_for("arm,pl011").unwrap().status,
+            DriverHealthStatus::Unresponsive
+        );
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::CrashReported,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(
+            health.record_for("arm,pl011").unwrap().status,
+            DriverHealthStatus::Crashed
+        );
+    }
+
+    #[test]
+    fn crashed_pl011_produces_inert_pm_restart_request_with_original_descriptors() {
+        let (requests, mut health) = build_healthy_pl011_table();
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::CrashReported,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let restart = requests
+            .build_restart_request_bundle(&health, DriverRestartRequestPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let pl011 = restart_request(&restart, "arm,pl011");
+        assert_eq!(pl011.decision, DriverRestartDecision::WouldRequest);
+        assert_eq!(pl011.reason, Some(DriverRestartReason::Crashed));
+        assert_eq!(
+            pl011.original_mock_request_id,
+            request_for(&requests, "arm,pl011").mock_request_id
+        );
+        assert!(pl011.has_resource_requirement(ResourceGrantKind::Mmio));
+        assert!(pl011.has_resource_requirement(ResourceGrantKind::Irq));
+        assert!(
+            pl011.has_startup_cap_requirement(StartupCapRequirement::DriverManagerControlEndpoint)
+        );
+        assert!(pl011.has_startup_cap_requirement(StartupCapRequirement::IrqNotification));
+    }
+
+    #[test]
+    fn restart_policy_denies_limit_deferred_mailbox_unknown_and_healthy() {
+        let (requests, mut health) = build_healthy_pl011_table();
+        {
+            let record = health.record_for_mut("arm,pl011").unwrap();
+            record.status = DriverHealthStatus::Crashed;
+            record.restart_count = 3;
+        }
+        let restart = requests
+            .build_restart_request_bundle(
+                &health,
+                DriverRestartRequestPolicy::hosted_fake_rpi5().with_max_restarts(3),
+            )
+            .unwrap();
+        let pl011 = restart_request(&restart, "arm,pl011");
+        assert_eq!(pl011.decision, DriverRestartDecision::Denied);
+        assert!(pl011.has_blocker(DriverRestartBlocker::RestartLimitExceeded));
+
+        let rp1 = restart_request(&restart, "raspberrypi,rp1-gpio");
+        assert_eq!(rp1.decision, DriverRestartDecision::Denied);
+        assert!(rp1.has_blocker(DriverRestartBlocker::DeviceDeferred));
+        let mailbox = restart_request(&restart, "raspberrypi,firmware");
+        assert_eq!(mailbox.decision, DriverRestartDecision::Denied);
+        assert!(mailbox.has_blocker(DriverRestartBlocker::DeviceDeferred));
+        let unknown = restart_request(&restart, "vendor,unknown");
+        assert_eq!(unknown.decision, DriverRestartDecision::Denied);
+        assert!(unknown.has_blocker(DriverRestartBlocker::DeviceUnsupported));
+
+        let (requests, health) = build_healthy_pl011_table();
+        let healthy_restart = requests
+            .build_restart_request_bundle(&health, DriverRestartRequestPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let pl011 = restart_request(&healthy_restart, "arm,pl011");
+        assert_eq!(pl011.decision, DriverRestartDecision::Noop);
+        assert!(pl011.has_blocker(DriverRestartBlocker::AlreadyHealthy));
+    }
+
+    #[test]
+    fn restart_bundle_generation_is_deterministic_bounded_and_non_mutating() {
+        let (requests, mut health) = build_healthy_pl011_table();
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::CrashReported,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let requests_snapshot = requests.clone();
+        let health_snapshot = health.clone();
+        let first = requests
+            .build_restart_request_bundle(&health, DriverRestartRequestPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let second = requests
+            .build_restart_request_bundle(&health, DriverRestartRequestPolicy::hosted_fake_rpi5())
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), requests.len());
+        assert!(first.len() <= MAX_DEVICES);
+        assert_eq!(requests, requests_snapshot);
+        assert_eq!(health, health_snapshot);
+    }
+
+    #[test]
+    fn health_and_restart_simulation_does_not_call_pm_control_caps_grants_restart_or_mmio() {
+        let (requests, mut health) = build_healthy_pl011_table();
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::CrashReported,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let restart = requests
+            .build_restart_request_bundle(&health, DriverRestartRequestPolicy::hosted_fake_rpi5())
+            .unwrap();
+        assert_eq!(
+            restart_request(&restart, "arm,pl011").decision,
+            DriverRestartDecision::WouldRequest
+        );
+        let runtime = MockDriverControl::new();
+        assert_eq!(runtime.irq_line.get(), None);
+        assert_eq!(runtime.dma_request.get(), None);
+        assert_eq!(runtime.irq_grant.get(), None);
+        assert_eq!(runtime.dma_grant.get(), None);
+        assert_eq!(runtime.restarted.get(), None);
+        assert_eq!(runtime.registered.get(), None);
     }
 
     #[test]
