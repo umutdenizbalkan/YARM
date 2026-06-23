@@ -311,6 +311,139 @@ fn bounded_str(bytes: &[u8], len: usize) -> Option<&str> {
 
 const MAX_DEVICES: usize = 32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnAction {
+    WouldSpawn,
+    Deferred,
+    Unsupported,
+    AlreadyRunning,
+    NoCandidate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnBlocker {
+    MissingMmioGrant,
+    MissingIrqRoute,
+    MissingDmaPolicy,
+    DeferredNoMmioGrant,
+    RequiresPcieBarDiscovery,
+    UnsupportedDevice,
+    UnknownCandidate,
+    AlreadyRegistered,
+    MissingSpawnAuthority,
+    MissingMailboxTransport,
+    MissingCachePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnPolicy {
+    pub uart_prereqs_available: bool,
+    pub irqmux_prereqs_available: bool,
+    pub spawn_authority_available: bool,
+}
+
+impl SpawnPolicy {
+    pub const fn fail_closed() -> Self {
+        Self {
+            uart_prereqs_available: false,
+            irqmux_prereqs_available: false,
+            spawn_authority_available: false,
+        }
+    }
+
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            uart_prereqs_available: true,
+            irqmux_prereqs_available: false,
+            spawn_authority_available: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnPlanEntry {
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub class: DeviceClass,
+    pub status: DeviceStatus,
+    pub action: SpawnAction,
+    pub blockers: [Option<SpawnBlocker>; 6],
+}
+
+impl SpawnPlanEntry {
+    fn from_device(device: &DeviceRecord, action: SpawnAction) -> Self {
+        Self {
+            compatible: device.compatible,
+            compatible_len: device.compatible_len,
+            driver_candidate: device.driver_candidate,
+            driver_candidate_len: device.driver_candidate_len,
+            class: device.class,
+            status: device.status,
+            action,
+            blockers: [None; 6],
+        }
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn driver_candidate(&self) -> Option<&str> {
+        bounded_str(&self.driver_candidate, self.driver_candidate_len)
+    }
+
+    pub fn has_blocker(&self, blocker: SpawnBlocker) -> bool {
+        self.blockers.iter().any(|entry| *entry == Some(blocker))
+    }
+
+    fn push_blocker(&mut self, blocker: SpawnBlocker) -> Result<(), KernelIpcError> {
+        if self.has_blocker(blocker) {
+            return Ok(());
+        }
+        let Some(slot) = self.blockers.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(blocker);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct SpawnPlan {
+    entries: [Option<SpawnPlanEntry>; MAX_DEVICES],
+    len: usize,
+}
+
+impl SpawnPlan {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SpawnPlanEntry> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|entry| entry.as_ref())
+    }
+
+    fn push(&mut self, entry: SpawnPlanEntry) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct PlatformInventory {
     devices: [Option<DeviceRecord>; MAX_DEVICES],
@@ -406,6 +539,132 @@ impl PlatformInventory {
         self.assigned_device_for(tid)
             .ok_or(KernelIpcError::TaskMissing)
     }
+
+    pub fn build_spawn_plan(
+        &self,
+        registry: &DriverRegistry,
+        policy: SpawnPolicy,
+    ) -> Result<SpawnPlan, KernelIpcError> {
+        let mut plan = SpawnPlan::new();
+        for device in self.iter() {
+            let mut entry = classify_spawn_plan_entry(device, registry, policy)?;
+            if !policy.spawn_authority_available {
+                if matches!(entry.action, SpawnAction::WouldSpawn) {
+                    entry.action = SpawnAction::Deferred;
+                }
+                if matches!(entry.action, SpawnAction::Deferred) {
+                    entry.push_blocker(SpawnBlocker::MissingSpawnAuthority)?;
+                }
+            }
+            plan.push(entry)?;
+        }
+        Ok(plan)
+    }
+}
+
+fn classify_spawn_plan_entry(
+    device: &DeviceRecord,
+    registry: &DriverRegistry,
+    policy: SpawnPolicy,
+) -> Result<SpawnPlanEntry, KernelIpcError> {
+    if let Some(tid) = device.assigned_tid
+        && registry.get(tid).is_some()
+    {
+        let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::AlreadyRunning);
+        entry.push_blocker(SpawnBlocker::AlreadyRegistered)?;
+        return Ok(entry);
+    }
+
+    if matches!(device.class, DeviceClass::Unknown)
+        || matches!(device.status, DeviceStatus::Unsupported)
+    {
+        let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::Unsupported);
+        entry.push_blocker(SpawnBlocker::UnsupportedDevice)?;
+        return Ok(entry);
+    }
+
+    let candidate = device.driver_candidate();
+    if candidate.is_none() || candidate == Some("unknown") || device.driver_candidate_len == 0 {
+        let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::NoCandidate);
+        entry.push_blocker(SpawnBlocker::UnknownCandidate)?;
+        return Ok(entry);
+    }
+
+    match device.status {
+        DeviceStatus::Discovered => classify_discovered_device(device, policy),
+        DeviceStatus::DeferredNoMmioGrant => classify_deferred_mmio_device(device),
+        DeviceStatus::DeferredNoIrqRoute => {
+            let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::Deferred);
+            entry.push_blocker(SpawnBlocker::MissingIrqRoute)?;
+            Ok(entry)
+        }
+        DeviceStatus::DeferredNoHardwareControl => {
+            let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::Deferred);
+            entry.push_blocker(SpawnBlocker::MissingSpawnAuthority)?;
+            Ok(entry)
+        }
+        DeviceStatus::Unsupported => unreachable!(),
+    }
+}
+
+fn classify_discovered_device(
+    device: &DeviceRecord,
+    policy: SpawnPolicy,
+) -> Result<SpawnPlanEntry, KernelIpcError> {
+    match device.class {
+        DeviceClass::Uart if policy.uart_prereqs_available => {
+            let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::WouldSpawn);
+            if !device.mmio_ranges.iter().any(Option::is_some) {
+                entry.action = SpawnAction::Deferred;
+                entry.push_blocker(SpawnBlocker::MissingMmioGrant)?;
+            }
+            if !device.irq_lines.iter().any(Option::is_some) {
+                entry.action = SpawnAction::Deferred;
+                entry.push_blocker(SpawnBlocker::MissingIrqRoute)?;
+            }
+            Ok(entry)
+        }
+        DeviceClass::IrqMux if policy.irqmux_prereqs_available => {
+            Ok(SpawnPlanEntry::from_device(device, SpawnAction::WouldSpawn))
+        }
+        DeviceClass::IrqMux => {
+            let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::Deferred);
+            entry.push_blocker(SpawnBlocker::MissingIrqRoute)?;
+            Ok(entry)
+        }
+        DeviceClass::Uart => {
+            let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::Deferred);
+            entry.push_blocker(SpawnBlocker::MissingMmioGrant)?;
+            entry.push_blocker(SpawnBlocker::MissingIrqRoute)?;
+            Ok(entry)
+        }
+        DeviceClass::Mailbox | DeviceClass::Gpio | DeviceClass::Block => {
+            classify_deferred_mmio_device(device)
+        }
+        DeviceClass::Unknown => {
+            let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::Unsupported);
+            entry.push_blocker(SpawnBlocker::UnsupportedDevice)?;
+            Ok(entry)
+        }
+    }
+}
+
+fn classify_deferred_mmio_device(device: &DeviceRecord) -> Result<SpawnPlanEntry, KernelIpcError> {
+    let mut entry = SpawnPlanEntry::from_device(device, SpawnAction::Deferred);
+    entry.push_blocker(SpawnBlocker::DeferredNoMmioGrant)?;
+    entry.push_blocker(SpawnBlocker::MissingMmioGrant)?;
+    match device.class {
+        DeviceClass::Gpio => {
+            entry.push_blocker(SpawnBlocker::RequiresPcieBarDiscovery)?;
+        }
+        DeviceClass::Mailbox => {
+            entry.push_blocker(SpawnBlocker::MissingMailboxTransport)?;
+            entry.push_blocker(SpawnBlocker::MissingCachePolicy)?;
+            entry.push_blocker(SpawnBlocker::MissingDmaPolicy)?;
+        }
+        _ => {}
+    }
+    Ok(entry)
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,6 +1593,167 @@ mod tests {
             assert_eq!(reply.as_slice().len(), expected_len);
             assert_eq!(reply.transferred_cap(), None);
         }
+    }
+
+    fn spawn_entry<'a>(plan: &'a SpawnPlan, compatible: &str) -> &'a SpawnPlanEntry {
+        plan.iter()
+            .find(|entry| entry.compatible() == Some(compatible))
+            .expect("spawn plan entry")
+    }
+
+    #[test]
+    fn spawn_plan_for_fake_rpi5_inventory_is_policy_only_and_deterministic() {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "arm,pl011",
+                    DeviceClass::Uart,
+                    "uart_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_mmio(0, 0x107d_0010_0000, 0x1000)
+                .unwrap()
+                .with_irq(0, 121)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,firmware",
+                    DeviceClass::Mailbox,
+                    "rpi_firmware",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,rp1-gpio",
+                    DeviceClass::Gpio,
+                    "rp1_gpio_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_mmio(0, 0x1_0000, 0x1000)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "yarm,irqmux",
+                    DeviceClass::IrqMux,
+                    "irqmux_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_irq(0, 5)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "vendor,unknown",
+                    DeviceClass::Unknown,
+                    "unknown",
+                    DeviceStatus::Unsupported,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let registry = DriverRegistry::new();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .expect("spawn plan");
+        assert_eq!(plan.len(), 5);
+        assert_eq!(
+            spawn_entry(&plan, "arm,pl011").action,
+            SpawnAction::WouldSpawn
+        );
+
+        let mailbox = spawn_entry(&plan, "raspberrypi,firmware");
+        assert_eq!(mailbox.action, SpawnAction::Deferred);
+        assert!(mailbox.has_blocker(SpawnBlocker::MissingMailboxTransport));
+        assert!(mailbox.has_blocker(SpawnBlocker::MissingCachePolicy));
+        assert!(mailbox.has_blocker(SpawnBlocker::MissingMmioGrant));
+
+        let rp1 = spawn_entry(&plan, "raspberrypi,rp1-gpio");
+        assert_eq!(rp1.action, SpawnAction::Deferred);
+        assert!(rp1.has_blocker(SpawnBlocker::RequiresPcieBarDiscovery));
+        assert!(rp1.has_blocker(SpawnBlocker::DeferredNoMmioGrant));
+        assert!(rp1.has_blocker(SpawnBlocker::MissingMmioGrant));
+
+        let irqmux = spawn_entry(&plan, "yarm,irqmux");
+        assert_eq!(irqmux.action, SpawnAction::Deferred);
+        assert!(irqmux.has_blocker(SpawnBlocker::MissingIrqRoute));
+
+        let unknown = spawn_entry(&plan, "vendor,unknown");
+        assert_eq!(unknown.action, SpawnAction::Unsupported);
+        assert!(unknown.has_blocker(SpawnBlocker::UnsupportedDevice));
+
+        let ordered: [&str; 5] =
+            core::array::from_fn(|index| plan.iter().nth(index).unwrap().compatible().unwrap());
+        assert_eq!(
+            ordered,
+            [
+                "arm,pl011",
+                "raspberrypi,firmware",
+                "raspberrypi,rp1-gpio",
+                "yarm,irqmux",
+                "vendor,unknown"
+            ]
+        );
+    }
+
+    #[test]
+    fn spawn_plan_fail_closed_policy_and_registry_state_are_inert() {
+        let mut inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "arm,pl011",
+                    DeviceClass::Uart,
+                    "uart_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_mmio(0, 0x107d_0020_0000, 0x1000)
+                .unwrap()
+                .with_irq(0, 122)
+                .unwrap(),
+            )
+            .unwrap();
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let before_len = registry.len();
+
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::fail_closed())
+            .expect("spawn plan");
+        assert_eq!(
+            registry.len(),
+            before_len,
+            "planning must not mutate registry"
+        );
+        let assigned = spawn_entry(&plan, "arm,pl011");
+        assert_eq!(assigned.action, SpawnAction::AlreadyRunning);
+        assert!(assigned.has_blocker(SpawnBlocker::AlreadyRegistered));
+        let unassigned_duplicate = plan
+            .iter()
+            .filter(|entry| entry.compatible() == Some("arm,pl011"))
+            .nth(1)
+            .expect("duplicate entry remains deterministic");
+        assert_eq!(unassigned_duplicate.action, SpawnAction::Deferred);
+        assert!(unassigned_duplicate.has_blocker(SpawnBlocker::MissingMmioGrant));
+        assert!(unassigned_duplicate.has_blocker(SpawnBlocker::MissingIrqRoute));
+        assert!(unassigned_duplicate.has_blocker(SpawnBlocker::MissingSpawnAuthority));
     }
 
     #[test]

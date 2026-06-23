@@ -480,8 +480,8 @@ mod tests {
 
     use super::*;
     use crate::control_plane::driver_manager::service::{
-        DRIVER_OP_QUERY_MY_IRQS, DRIVER_OP_QUERY_MY_MMIO, DriverRegistry,
-        handle_request_with_sender,
+        DRIVER_OP_QUERY_MY_IRQS, DRIVER_OP_QUERY_MY_MMIO, DriverRegistry, SpawnAction,
+        SpawnBlocker, SpawnPolicy, handle_request_with_sender,
     };
     use alloc::vec;
     use core::cell::Cell;
@@ -1044,5 +1044,27 @@ mod tests {
             0,
             "deferred RP1 grant fails before control ops"
         );
+    }
+
+    #[test]
+    fn parsed_inventory_can_feed_policy_only_spawn_plan_without_side_effects() {
+        let parsed = parse_fake_rpi5_fdt_to_inventory(&valid_rpi5_like_blob()).unwrap();
+        let registry = DriverRegistry::new();
+        let plan = parsed
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        assert_eq!(plan.len(), 4, "disabled fake FDT node stays skipped");
+        let uart = plan
+            .iter()
+            .find(|entry| entry.compatible() == Some("arm,pl011"))
+            .unwrap();
+        assert_eq!(uart.action, SpawnAction::WouldSpawn);
+        let rp1 = plan
+            .iter()
+            .find(|entry| entry.compatible() == Some("raspberrypi,rp1-gpio"))
+            .unwrap();
+        assert_eq!(rp1.action, SpawnAction::Deferred);
+        assert!(rp1.has_blocker(SpawnBlocker::RequiresPcieBarDiscovery));
+        assert!(rp1.has_blocker(SpawnBlocker::MissingMmioGrant));
     }
 }
