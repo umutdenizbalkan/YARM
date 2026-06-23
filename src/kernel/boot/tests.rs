@@ -42337,3 +42337,109 @@ mod stage159bcd_ipc_recv_proof_workload {
         }
     }
 }
+
+// Stage 160 — AArch64 split-recv fast-path routing/parity. The trap-entry split
+// recv used `self.with` (no CPU binding); on a multi-CPU boot the snapshot recv
+// read `is_kernel_task` off the wrong CPU's current task and fell back to the
+// global legacy path. The fix binds `current_cpu` via `with_cpu`, matching the
+// global-lock path — a runtime-layer parity change, NOT an IPC/cap seam move.
+mod stage160_aarch64_split_recv_routing {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const X86_DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+
+    // 1. Both x86_64 and AArch64 route the live trap through the SAME shared
+    //    dispatch entry, so the split-recv hook is reached identically.
+    #[test]
+    fn stage160_both_arches_share_trap_dispatch_hook() {
+        for (arch, src) in &[("x86_64", X86_DESC_SRC), ("aarch64", AARCH64_BOOT_SRC)] {
+            assert!(
+                src.contains("dispatch_trap_entry_with_shared_kernel"),
+                "{arch} live trap must route through the shared split-dispatch entry"
+            );
+        }
+        assert!(
+            TRAP_ENTRY_SRC.contains("try_split_dispatch_into_frame(shared, cpu, frame)"),
+            "shared trap entry must invoke the split dispatch for both arches"
+        );
+    }
+
+    // 2. The parity fix: the split-recv snapshot dispatch binds current_cpu via
+    //    with_cpu (mirroring the global-lock path), not the unbound `with`.
+    #[test]
+    fn stage160_split_recv_binds_current_cpu() {
+        let m = RUNTIME_SRC
+            .split("fn try_split_ipc_recv_queued_plain_into_frame")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub fn ").next())
+            .expect("split recv method must exist");
+        assert!(
+            m.contains("self.with_cpu(cpu, |state|")
+                && m.contains("try_split_recv_queued_plain_with_snapshot_locked("),
+            "split recv must bind current_cpu (with_cpu) before the snapshot dispatch"
+        );
+        assert!(
+            !m.contains("self.with(|state|"),
+            "split recv must not run the snapshot dispatch under the unbound `with`"
+        );
+        // Document the why: the global-lock path also binds the CPU.
+        assert!(
+            TRAP_ENTRY_SRC.contains(".with_cpu(cpu, |kernel|"),
+            "global-lock path must remain the with_cpu parity reference"
+        );
+    }
+
+    // 3. Fallback localization diagnostics exist so a run pins the exact step.
+    #[test]
+    fn stage160_fallback_diagnostics_exist() {
+        for probe in &[
+            "YARM_SPLIT_RECV_PROBE step=enter",
+            "YARM_SPLIT_RECV_PROBE step=tid",
+            "YARM_SPLIT_RECV_PROBE step=outcome",
+        ] {
+            assert!(
+                RUNTIME_SRC.contains(probe),
+                "split-recv fallback diagnostic `{probe}` must exist"
+            );
+        }
+    }
+
+    // 4. No IPC/cap delivery seam was moved by this stage; the queued-split
+    //    snapshot delivery stays defined in syscall.rs.
+    #[test]
+    fn stage160_no_stateful_seam_moved() {
+        for def in &[
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn try_endpoint_split_recv(",
+            "fn complete_blocked_recv_for_waiter(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain defined in syscall.rs"
+            );
+        }
+        // The fix lives in the runtime dispatch layer, not the seam body.
+        assert!(
+            !RUNTIME_SRC.contains("fn try_split_recv_queued_plain_with_snapshot_locked("),
+            "the pinned seam must not have moved into runtime.rs"
+        );
+    }
+
+    // 5. No RPi5 boot coupling and ABI counts unchanged.
+    #[test]
+    fn stage160_no_rpi5_coupling_counts_unchanged() {
+        assert!(
+            !RUNTIME_SRC.contains("rpi5") && !RUNTIME_SRC.contains("RPI5"),
+            "the runtime parity fix must not couple to RPi5 boot"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts must be unchanged"
+        );
+    }
+}

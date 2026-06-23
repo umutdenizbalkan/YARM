@@ -717,9 +717,21 @@ impl SharedKernel {
         cpu: CpuId,
         frame: &mut TrapFrame,
     ) -> Option<Result<(), TrapHandleError>> {
+        // Stage 160 diagnostics: pin exactly where (if anywhere) the AArch64 split
+        // recv falls back to the global legacy path. Each step logs result=ok or a
+        // reason, so the boot log localizes the divergence to a single step.
+        crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=enter nr=2 cpu={}", cpu.0);
+
         // Authoritative requester-TID read (binds current_cpu, then releases).
         // Mirrors the Stage 29A trap-seam discipline: never current_tid_split_read.
-        let requester_tid = self.current_tid_authoritative(cpu)?;
+        let Some(requester_tid) = self.current_tid_authoritative(cpu) else {
+            crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=tid result=none cpu={}", cpu.0);
+            return None;
+        };
+        crate::yarm_log!(
+            "YARM_SPLIT_RECV_PROBE step=tid result=ok requester_tid={}",
+            requester_tid
+        );
 
         // Stage 32: resolve the endpoint receive cap via the phase-separated
         // split-read (task(2) read+release → capability(4) read+release), with
@@ -730,6 +742,10 @@ impl SharedKernel {
         let snapshot = match self.resolve_endpoint_recv_cap_split_read(requester_tid, recv_cap) {
             Ok(snapshot) => snapshot,
             Err(e) => {
+                crate::yarm_log!(
+                    "YARM_SPLIT_RECV_PROBE step=snapshot result=err recv_cap={}",
+                    recv_cap.0
+                );
                 return Some(Err(TrapHandleError::Syscall(
                     crate::kernel::syscall::SyscallError::from(e),
                 )));
@@ -742,23 +758,54 @@ impl SharedKernel {
             snapshot.endpoint_index().map(|i| i as i64).unwrap_or(-1)
         );
 
-        // Stage 32: the cap lock is RELEASED; only now acquire the IPC domain
-        // (via the global `with` for this helper-only path) for the dequeue +
-        // kernel-task writeback. The snapshot's endpoint object is revalidated
+        // Stage 32: the cap lock is RELEASED; only now acquire the IPC domain for
+        // the dequeue + writeback. The snapshot's endpoint object is revalidated
         // for liveness under ipc_state_lock inside the dequeue. The capability
         // lock and the IPC lock are NEVER held simultaneously.
-        let result = self.with(|state| {
+        //
+        // Stage 160 parity fix: use `with_cpu(cpu, …)` (not `with`) so `current_cpu`
+        // is bound to the trapping CPU for the duration of the snapshot dispatch.
+        // The snapshot recv computes `is_kernel_task` from the AMBIENT current task
+        // (`current_task_has_user_asid` → `current_tid`), which is read off
+        // `current_cpu`. The global-lock path always binds the CPU (see
+        // `handle_trap_entry_shared`'s `with_cpu`); the split path used `with`,
+        // which left `current_cpu` unbound. On a single-CPU boot (x86_64 smoke)
+        // `current_cpu` is always CPU0 so it happened to be correct; on a
+        // multi-CPU boot (AArch64 smoke, SMP=2) it could observe another CPU's
+        // current task → `is_kernel_task=true` → `plan_recv_core` returns
+        // `FallbackRequired(RecvV2MetaUserCopy)` (kernel task + V2 meta) → `None` →
+        // the recv fell through to the global `legacy_full_path`, never emitting
+        // the queued-split markers. Binding the CPU here makes the user-ASID
+        // receiver class resolve identically to the global path.
+        let result = match self.with_cpu(cpu, |state| {
             crate::kernel::syscall::try_split_recv_queued_plain_with_snapshot_locked(
                 state, frame, &snapshot,
             )
-        });
-        // Stage 32B per-phase telemetry: only mark the LIVE success path (a plain
-        // message was dequeued and the kernel-task lanes were written). Fallbacks
-        // (`None`) and propagated errors stay silent to keep boot-log noise low.
-        if matches!(result, Some(Ok(()))) {
-            crate::yarm_log!(
-                "YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=writeback result=ok target=kernel"
-            );
+        }) {
+            Ok(result) => result,
+            Err(_) => {
+                // current_cpu bind failed (e.g. CPU offline) — fall back to the
+                // unchanged global-lock path for the canonical handling.
+                crate::yarm_log!(
+                    "YARM_SPLIT_RECV_PROBE step=bind_cpu result=err cpu={}",
+                    cpu.0
+                );
+                return None;
+            }
+        };
+        match result {
+            Some(Ok(())) => {
+                crate::yarm_log!(
+                    "YARM_LOCK_SPLIT_IPC_RECV nr=2 phase=writeback result=ok target=user_or_kernel"
+                );
+                crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=outcome result=serviced_ok");
+            }
+            Some(Err(_)) => {
+                crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=outcome result=serviced_err");
+            }
+            None => {
+                crate::yarm_log!("YARM_SPLIT_RECV_PROBE step=outcome result=fallback");
+            }
         }
         result
     }
