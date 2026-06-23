@@ -2998,6 +2998,55 @@ proof sequence markers. If any fallback remains, the `YARM_SPLIT_RECV_PROBE`
 trail plus `YARM_RECV_CORE_PLAN` / `YARM_RECV_CORE_FALLBACK` identify the exact
 blocker. (QEMU is run by the maintainer.)
 
+#### 5.1.9.1 Stage 160B — AArch64 recv split-dispatch routing audit (diagnostic)
+
+The Stage 160 CPU-binding fix did not change AArch64: the runtime logs showed the
+proof recv never reaching `try_split_ipc_recv_queued_plain_into_frame` at all (no
+`YARM_SPLIT_RECV_PROBE`), going straight to the global `legacy_full_path`. The
+failure is **above** that helper, in `try_split_dispatch_into_frame` / the trap
+routing into it.
+
+**Root cause (frame ABI import ordering).** `TrapFrame` carries the syscall ABI in
+three separate places: `syscall_num`, `args[]`, and `user_gprs[]`. The
+arch-neutral split dispatcher decides eligibility from the *decoded*
+`frame.syscall_num()` / `frame.arg()`. On x86_64 the trap stub fills those before
+the shared dispatch, so the split path sees the real NR. On AArch64 the vector
+handler builds the trap_frame with **only** `set_user_gpr` (x0–x30); the decoded
+`syscall_num`/`args` are populated by `import_syscall_abi_from_user_gprs`
+(x8→`syscall_num`, x0–x5→`args`), which runs at `arch/aarch64/trap.rs:246` inside
+the **global** handler — i.e. *after* the split dispatch. So when
+`try_split_dispatch_into_frame` runs on AArch64, `frame.syscall_num()` is still
+`0`; it decodes as `Yield`, the NR gate rejects it, and every recv falls through
+to the global path (which then imports the ABI and dispatches `IpcRecv` →
+`legacy_full_path`).
+
+**Diagnostics added (proof-knob–gated, arch-neutral).**
+`YARM_SPLIT_DISPATCH_ENTER nr=…`, `YARM_SPLIT_DISPATCH_FALLBACK reason={nr_undecodable,nr_not_eligible} nr=…`,
+`YARM_SPLIT_DISPATCH_RECV_CONSIDER nr=…`, `YARM_SPLIT_DISPATCH_RECV_CALL`. On the
+same proof boot these show the contrast directly: x86_64 logs `ENTER nr=2 →
+RECV_CONSIDER → RECV_CALL → YARM_SPLIT_RECV_PROBE step=enter`, while AArch64 logs
+`ENTER nr=0 → FALLBACK reason=nr_not_eligible nr=0`. Gated behind
+`ipc_recv_oracle_proof_enabled()` so normal/fast boots are unchanged. Guards:
+`stage160b_routing_diagnostics_exist`, `stage160b_diagnostics_gated_by_proof_knob`,
+`stage160b_no_seam_moved_and_abi_helpers_intact`, `stage160b_counts_unchanged`.
+
+**Why this is NOT fixed in this pass (deferred to a dedicated arch-integration
+stage).** Making the AArch64 split path actually service the recv is not a narrow
+change: the split path returns early from `handle_trap_entry_shared`, bypassing
+not only the ABI **import** (before) but also the result **export**
+(`export_syscall_result_to_user_gprs`, ret lanes → user GPRs — AArch64 returns
+results via user GPRs, unlike x86_64 where the ret lanes are the return registers)
+and the **SVC PC-advance** (`needs_plus4`, `arch/aarch64/trap.rs:272-293`), both of
+which currently run only inside the global handler. Enabling the split path on
+AArch64 without those would route real recvs through a path that never returns
+results or advances past the `SVC`, risking corrupted IPC / an `SVC` re-execution
+loop — and it cannot be validated here (no QEMU). Per the stage's own fallback
+clause ("if not obvious and narrow, leave it diagnostic-only and report"), the fix
+is scoped as a follow-up: bracket the shared dispatch on AArch64 with import
+(before) and export + PC-advance (after) so the split path participates in the
+full syscall ABI exactly as the global path does. x86_64 stays green and untouched;
+RPi5 boot and the global-lock fallback are untouched.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
