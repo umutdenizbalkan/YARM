@@ -11,6 +11,8 @@ live-DTB parsing, PM calls, or boot-chain changes. DRS-7 adds an inert
 it still produces data only and does not call PM. DRS-8 adds an inert
 PM-validation simulation over those records; validation is modeled for hosted
 tests but is not executed by real PM and still has no PM/supervisor call path.
+DRS-9 adds an inert PM accounting and rollback simulation over accepted validation
+reports; reservations and rollback steps are descriptive only.
 
 The current DRS models remain advisory mock policy/data models. They describe
 what a safe future request would contain, but they do not transfer authority.
@@ -51,11 +53,14 @@ The current hosted and mock-safe DRS path is:
 7. DRS-7 inert `DriverSpawnRequestBundle` / `DriverSpawnRequest` records.
 8. DRS-8 inert `PmSpawnValidationReport` records that simulate PM validation
    outcomes without invoking PM.
+9. DRS-9 inert `PmSpawnAccountingReport` records that simulate PM reservations,
+   commits, and rollback plans without touching live resources.
 
 This pipeline is descriptive. It never calls PM or supervisor services, never
 spawns a task, never grants resources, never transfers caps, and never touches
-MMIO. The DRS-8 validation report is an audit artifact only; real PM remains the
-only future process-creation, cap-minting, grant, startup-cap-delivery, and
+MMIO. The DRS-8 validation report and DRS-9 accounting report are audit artifacts
+only; real PM remains the only future process-creation, address-space setup,
+resource-accounting, rollback, cap-minting, grant, startup-cap-delivery, and
 handle-return authority.
 
 ### Future live pipeline
@@ -227,8 +232,8 @@ DRS-6 explicitly does not add:
 - kernel ABI, syscall ABI, IPC ABI, cap-logic, scheduler, VM, trap-entry, RPi5
   boot, or init-bootstrap changes;
 - PM or supervisor-service calls;
-- live use of the inert DRS-7 request records or DRS-8 validation reports as
-  process-creation authority;
+- live use of the inert DRS-7 request records, DRS-8 validation reports, or
+  DRS-9 accounting reports as process-creation/accounting authority;
 - service-manifest behavior changes.
 
 Driver Manager remains advisory only in this stage.
@@ -253,6 +258,10 @@ The existing DRS models map to the future contract as follows:
   defer, mark unsupported, or no-op each inert request after checking mock
   verified DM identity, version, image policy, startup-cap layout, inventory
   resource matching, and conservative resource blockers.
+- DRS-9 `PmSpawnAccountingReport` simulates descriptive PM reservations, commit
+  outcomes, and reverse-order rollback plans for injected partial failures.
+  Future live implementation must perform all real accounting and rollback inside
+  PM, not Driver Manager.
 - No mock model itself grants authority, mints caps, calls PM, creates a task, or
-  touches MMIO. A possible next step is a mock rollback/accounting simulation or
-  a live-spawn API design review, still without live implementation.
+  touches MMIO. A possible next step is health/restart request simulation or a
+  live-spawn API design review, still without live implementation.

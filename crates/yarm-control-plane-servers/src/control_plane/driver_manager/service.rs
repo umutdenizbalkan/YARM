@@ -1131,6 +1131,34 @@ impl DriverSpawnRequestBundle {
         Ok(report)
     }
 
+    pub fn simulate_pm_accounting(
+        &self,
+        validation_report: &PmSpawnValidationReport,
+        policy: PmSpawnAccountingPolicy,
+    ) -> Result<PmSpawnAccountingReport, KernelIpcError> {
+        let mut report = PmSpawnAccountingReport::new();
+        let mut committed_so_far = 0usize;
+        for (request, validation) in self.iter().zip(validation_report.iter()) {
+            if request.compatible() != validation.compatible()
+                || request.mock_request_id != validation.mock_request_id
+            {
+                return Err(KernelIpcError::WrongObject);
+            }
+            let entry =
+                simulate_pm_spawn_accounting_entry(request, validation, policy, committed_so_far)?;
+            if entry.status == PmSpawnAccountingStatus::WouldCommit {
+                committed_so_far = committed_so_far
+                    .checked_add(1)
+                    .ok_or(KernelIpcError::CapabilityFull)?;
+            }
+            report.push(entry)?;
+        }
+        if report.len() != self.len() || report.len() != validation_report.len() {
+            return Err(KernelIpcError::WrongObject);
+        }
+        Ok(report)
+    }
+
     fn push(&mut self, request: DriverSpawnRequest) -> Result<(), KernelIpcError> {
         if self.len >= MAX_DEVICES {
             return Err(KernelIpcError::CapabilityFull);
@@ -1582,6 +1610,372 @@ fn pm_failure_from_resource_blocker(blocker: ResourceGrantBlocker) -> PmSpawnVal
         ResourceGrantBlocker::DeviceUnsupported => PmSpawnValidationFailure::DeviceUnsupported,
         ResourceGrantBlocker::SpawnNotApproved => PmSpawnValidationFailure::PolicyDenied,
         ResourceGrantBlocker::UnknownResource => PmSpawnValidationFailure::ResourceNotAssigned,
+    }
+}
+
+const MAX_PM_SPAWN_RESERVATIONS: usize = 12;
+const MAX_PM_SPAWN_ROLLBACK_STEPS: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmSpawnAccountingStatus {
+    WouldReserve,
+    WouldCommit,
+    WouldRollback,
+    WouldReject,
+    Deferred,
+    Unsupported,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmSpawnReservation {
+    ProcessSlot,
+    AddressSpace,
+    CNodeSlots,
+    MmioWindow,
+    IrqRoute,
+    DmaWindow,
+    StartupCapSlots,
+    HandleSlot,
+    HealthMonitorSlot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmSpawnRollbackStep {
+    ReleaseProcessSlot,
+    DestroyAddressSpace,
+    RevokeMintedCaps,
+    ReleaseMmioReservation,
+    ReleaseIrqReservation,
+    ReleaseDmaReservation,
+    ClearStartupCapSlots,
+    DropHandle,
+    ClearHealthMonitor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmSpawnAccountingFailure {
+    ValidationNotAccepted,
+    PolicyDenied,
+    ResourceLimitExceeded,
+    MissingStartupCapLayout,
+    InjectedFailureBeforeReservation,
+    InjectedFailureAfterReservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmSpawnFailureInjectionPoint {
+    None,
+    BeforeAnyReservation,
+    AfterProcessSlot,
+    AfterAddressSpace,
+    AfterStartupCapSlots,
+    AfterMmio,
+    AfterIrq,
+    AfterHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmSpawnAccountingPolicy {
+    pub accounting_allowed: bool,
+    pub max_commits: usize,
+    pub commit_successful_reservations: bool,
+    pub failure_injection: PmSpawnFailureInjectionPoint,
+}
+
+impl PmSpawnAccountingPolicy {
+    pub const fn fail_closed() -> Self {
+        Self {
+            accounting_allowed: false,
+            max_commits: 0,
+            commit_successful_reservations: false,
+            failure_injection: PmSpawnFailureInjectionPoint::None,
+        }
+    }
+
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            accounting_allowed: true,
+            max_commits: MAX_DEVICES,
+            commit_successful_reservations: true,
+            failure_injection: PmSpawnFailureInjectionPoint::None,
+        }
+    }
+
+    pub const fn with_failure(mut self, failure_injection: PmSpawnFailureInjectionPoint) -> Self {
+        self.failure_injection = failure_injection;
+        self
+    }
+
+    pub const fn with_max_commits(mut self, max_commits: usize) -> Self {
+        self.max_commits = max_commits;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmSpawnAccountingEntry {
+    pub mock_request_id: u32,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub status: PmSpawnAccountingStatus,
+    pub reservations: [Option<PmSpawnReservation>; MAX_PM_SPAWN_RESERVATIONS],
+    pub rollback_steps: [Option<PmSpawnRollbackStep>; MAX_PM_SPAWN_ROLLBACK_STEPS],
+    pub failures: [Option<PmSpawnAccountingFailure>; MAX_DRIVER_SPAWN_BLOCKERS],
+}
+
+impl PmSpawnAccountingEntry {
+    fn from_request(request: &DriverSpawnRequest, status: PmSpawnAccountingStatus) -> Self {
+        Self {
+            mock_request_id: request.mock_request_id,
+            compatible: request.compatible,
+            compatible_len: request.compatible_len,
+            status,
+            reservations: [None; MAX_PM_SPAWN_RESERVATIONS],
+            rollback_steps: [None; MAX_PM_SPAWN_ROLLBACK_STEPS],
+            failures: [None; MAX_DRIVER_SPAWN_BLOCKERS],
+        }
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn has_reservation(&self, reservation: PmSpawnReservation) -> bool {
+        self.reservations
+            .iter()
+            .any(|entry| *entry == Some(reservation))
+    }
+
+    pub fn has_rollback_step(&self, step: PmSpawnRollbackStep) -> bool {
+        self.rollback_steps.iter().any(|entry| *entry == Some(step))
+    }
+
+    pub fn has_failure(&self, failure: PmSpawnAccountingFailure) -> bool {
+        self.failures.iter().any(|entry| *entry == Some(failure))
+    }
+
+    fn push_reservation(&mut self, reservation: PmSpawnReservation) -> Result<(), KernelIpcError> {
+        let Some(slot) = self.reservations.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(reservation);
+        Ok(())
+    }
+
+    fn push_rollback_step(&mut self, step: PmSpawnRollbackStep) -> Result<(), KernelIpcError> {
+        let Some(slot) = self.rollback_steps.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(step);
+        Ok(())
+    }
+
+    fn push_failure(&mut self, failure: PmSpawnAccountingFailure) -> Result<(), KernelIpcError> {
+        if self.has_failure(failure) {
+            return Ok(());
+        }
+        let Some(slot) = self.failures.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(failure);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmSpawnAccountingReport {
+    entries: [Option<PmSpawnAccountingEntry>; MAX_DEVICES],
+    len: usize,
+}
+
+impl PmSpawnAccountingReport {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PmSpawnAccountingEntry> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|entry| entry.as_ref())
+    }
+
+    pub fn committed_count(&self) -> usize {
+        self.iter()
+            .filter(|entry| entry.status == PmSpawnAccountingStatus::WouldCommit)
+            .count()
+    }
+
+    fn push(&mut self, entry: PmSpawnAccountingEntry) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+        Ok(())
+    }
+}
+
+fn simulate_pm_spawn_accounting_entry(
+    request: &DriverSpawnRequest,
+    validation: &PmSpawnValidationEntry,
+    policy: PmSpawnAccountingPolicy,
+    committed_so_far: usize,
+) -> Result<PmSpawnAccountingEntry, KernelIpcError> {
+    let base_status = match validation.status {
+        PmSpawnValidationStatus::WouldAccept => PmSpawnAccountingStatus::WouldReserve,
+        PmSpawnValidationStatus::WouldReject => PmSpawnAccountingStatus::WouldReject,
+        PmSpawnValidationStatus::Deferred => PmSpawnAccountingStatus::Deferred,
+        PmSpawnValidationStatus::Unsupported => PmSpawnAccountingStatus::Unsupported,
+        PmSpawnValidationStatus::AlreadyRunning => PmSpawnAccountingStatus::AlreadyRunning,
+    };
+    let mut entry = PmSpawnAccountingEntry::from_request(request, base_status);
+    if validation.status != PmSpawnValidationStatus::WouldAccept {
+        entry.push_failure(PmSpawnAccountingFailure::ValidationNotAccepted)?;
+        return Ok(entry);
+    }
+    if !policy.accounting_allowed {
+        entry.status = PmSpawnAccountingStatus::WouldReject;
+        entry.push_failure(PmSpawnAccountingFailure::PolicyDenied)?;
+        return Ok(entry);
+    }
+    if committed_so_far >= policy.max_commits {
+        entry.status = PmSpawnAccountingStatus::WouldReject;
+        entry.push_failure(PmSpawnAccountingFailure::ResourceLimitExceeded)?;
+        return Ok(entry);
+    }
+    if validation.has_failure(PmSpawnValidationFailure::MissingStartupCapLayout) {
+        entry.status = PmSpawnAccountingStatus::WouldReject;
+        entry.push_failure(PmSpawnAccountingFailure::MissingStartupCapLayout)?;
+        return Ok(entry);
+    }
+    if policy.failure_injection == PmSpawnFailureInjectionPoint::BeforeAnyReservation {
+        entry.status = PmSpawnAccountingStatus::WouldRollback;
+        entry.push_failure(PmSpawnAccountingFailure::InjectedFailureBeforeReservation)?;
+        return Ok(entry);
+    }
+
+    let reservation_plan = reservation_plan_for_request(request);
+    for reservation in reservation_plan
+        .iter()
+        .filter_map(|reservation| *reservation)
+    {
+        entry.push_reservation(reservation)?;
+        if failure_matches_reservation(policy.failure_injection, reservation) {
+            entry.status = PmSpawnAccountingStatus::WouldRollback;
+            entry.push_failure(PmSpawnAccountingFailure::InjectedFailureAfterReservation)?;
+            append_reverse_rollback_steps(&mut entry)?;
+            return Ok(entry);
+        }
+    }
+    entry.status = if policy.commit_successful_reservations {
+        PmSpawnAccountingStatus::WouldCommit
+    } else {
+        PmSpawnAccountingStatus::WouldReserve
+    };
+    Ok(entry)
+}
+
+fn reservation_plan_for_request(
+    request: &DriverSpawnRequest,
+) -> [Option<PmSpawnReservation>; MAX_PM_SPAWN_RESERVATIONS] {
+    let mut plan = [None; MAX_PM_SPAWN_RESERVATIONS];
+    let mut len = 0usize;
+    push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::ProcessSlot);
+    push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::AddressSpace);
+    push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::CNodeSlots);
+    push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::StartupCapSlots);
+    for resource in request
+        .resource_requirements
+        .iter()
+        .filter_map(|entry| *entry)
+    {
+        match resource.kind {
+            ResourceGrantKind::Mmio => {
+                push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::MmioWindow)
+            }
+            ResourceGrantKind::Irq => {
+                push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::IrqRoute)
+            }
+            ResourceGrantKind::Dma => {
+                push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::DmaWindow)
+            }
+            _ => {}
+        }
+    }
+    push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::HandleSlot);
+    push_reservation_plan(&mut plan, &mut len, PmSpawnReservation::HealthMonitorSlot);
+    plan
+}
+
+fn push_reservation_plan(
+    plan: &mut [Option<PmSpawnReservation>; MAX_PM_SPAWN_RESERVATIONS],
+    len: &mut usize,
+    reservation: PmSpawnReservation,
+) {
+    if *len < MAX_PM_SPAWN_RESERVATIONS {
+        plan[*len] = Some(reservation);
+        *len += 1;
+    }
+}
+
+fn failure_matches_reservation(
+    failure_injection: PmSpawnFailureInjectionPoint,
+    reservation: PmSpawnReservation,
+) -> bool {
+    matches!(
+        (failure_injection, reservation),
+        (
+            PmSpawnFailureInjectionPoint::AfterProcessSlot,
+            PmSpawnReservation::ProcessSlot
+        ) | (
+            PmSpawnFailureInjectionPoint::AfterAddressSpace,
+            PmSpawnReservation::AddressSpace
+        ) | (
+            PmSpawnFailureInjectionPoint::AfterStartupCapSlots,
+            PmSpawnReservation::StartupCapSlots
+        ) | (
+            PmSpawnFailureInjectionPoint::AfterMmio,
+            PmSpawnReservation::MmioWindow
+        ) | (
+            PmSpawnFailureInjectionPoint::AfterIrq,
+            PmSpawnReservation::IrqRoute
+        ) | (
+            PmSpawnFailureInjectionPoint::AfterHandle,
+            PmSpawnReservation::HandleSlot
+        )
+    )
+}
+
+fn append_reverse_rollback_steps(entry: &mut PmSpawnAccountingEntry) -> Result<(), KernelIpcError> {
+    let mut index = MAX_PM_SPAWN_RESERVATIONS;
+    while index > 0 {
+        index -= 1;
+        if let Some(reservation) = entry.reservations[index] {
+            entry.push_rollback_step(rollback_step_for_reservation(reservation))?;
+        }
+    }
+    Ok(())
+}
+
+fn rollback_step_for_reservation(reservation: PmSpawnReservation) -> PmSpawnRollbackStep {
+    match reservation {
+        PmSpawnReservation::ProcessSlot => PmSpawnRollbackStep::ReleaseProcessSlot,
+        PmSpawnReservation::AddressSpace => PmSpawnRollbackStep::DestroyAddressSpace,
+        PmSpawnReservation::CNodeSlots => PmSpawnRollbackStep::RevokeMintedCaps,
+        PmSpawnReservation::MmioWindow => PmSpawnRollbackStep::ReleaseMmioReservation,
+        PmSpawnReservation::IrqRoute => PmSpawnRollbackStep::ReleaseIrqReservation,
+        PmSpawnReservation::DmaWindow => PmSpawnRollbackStep::ReleaseDmaReservation,
+        PmSpawnReservation::StartupCapSlots => PmSpawnRollbackStep::ClearStartupCapSlots,
+        PmSpawnReservation::HandleSlot => PmSpawnRollbackStep::DropHandle,
+        PmSpawnReservation::HealthMonitorSlot => PmSpawnRollbackStep::ClearHealthMonitor,
     }
 }
 
@@ -4001,6 +4395,225 @@ mod tests {
         assert_eq!(runtime.dma_grant.get(), None);
         assert_eq!(runtime.registered.get(), None);
         for entry in report.iter() {
+            assert_ne!(entry.mock_request_id, 0);
+        }
+    }
+
+    fn accounting_entry<'a>(
+        report: &'a PmSpawnAccountingReport,
+        compatible: &str,
+    ) -> &'a PmSpawnAccountingEntry {
+        report
+            .iter()
+            .find(|entry| entry.compatible() == Some(compatible))
+            .expect("pm accounting entry")
+    }
+
+    fn build_fake_rpi5_accounting_report(
+        policy: PmSpawnAccountingPolicy,
+    ) -> (
+        PlatformInventory,
+        DriverSpawnRequestBundle,
+        PmSpawnValidationReport,
+        PmSpawnAccountingReport,
+    ) {
+        let (inventory, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let validation = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let accounting = requests
+            .simulate_pm_accounting(&validation, policy)
+            .unwrap();
+        (inventory, requests, validation, accounting)
+    }
+
+    #[test]
+    fn pm_accounting_accepted_fake_pl011_produces_descriptive_reservations() {
+        let (_, _, _, accounting) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::hosted_fake_rpi5());
+        assert_eq!(accounting.len(), 5);
+        assert_eq!(accounting.committed_count(), 1);
+        let pl011 = accounting_entry(&accounting, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnAccountingStatus::WouldCommit);
+        for reservation in [
+            PmSpawnReservation::ProcessSlot,
+            PmSpawnReservation::AddressSpace,
+            PmSpawnReservation::CNodeSlots,
+            PmSpawnReservation::StartupCapSlots,
+            PmSpawnReservation::MmioWindow,
+            PmSpawnReservation::IrqRoute,
+            PmSpawnReservation::HandleSlot,
+            PmSpawnReservation::HealthMonitorSlot,
+        ] {
+            assert!(
+                pl011.has_reservation(reservation),
+                "missing {reservation:?}"
+            );
+        }
+        assert!(pl011.rollback_steps.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pm_accounting_fail_closed_and_resource_limit_reject_without_reservations() {
+        let (_, _, _, fail_closed) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::fail_closed());
+        let pl011 = accounting_entry(&fail_closed, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnAccountingStatus::WouldReject);
+        assert!(pl011.has_failure(PmSpawnAccountingFailure::PolicyDenied));
+        assert!(pl011.reservations.iter().all(Option::is_none));
+
+        let policy = PmSpawnAccountingPolicy::hosted_fake_rpi5().with_max_commits(0);
+        let (_, _, _, limited) = build_fake_rpi5_accounting_report(policy);
+        let pl011 = accounting_entry(&limited, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnAccountingStatus::WouldReject);
+        assert!(pl011.has_failure(PmSpawnAccountingFailure::ResourceLimitExceeded));
+        assert!(pl011.reservations.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pm_accounting_rollback_after_process_slot_is_reverse_and_descriptive() {
+        let policy = PmSpawnAccountingPolicy::hosted_fake_rpi5()
+            .with_failure(PmSpawnFailureInjectionPoint::AfterProcessSlot);
+        let (_, _, _, accounting) = build_fake_rpi5_accounting_report(policy);
+        let pl011 = accounting_entry(&accounting, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnAccountingStatus::WouldRollback);
+        assert!(pl011.has_reservation(PmSpawnReservation::ProcessSlot));
+        assert_eq!(
+            pl011.rollback_steps[0],
+            Some(PmSpawnRollbackStep::ReleaseProcessSlot)
+        );
+        assert!(pl011.rollback_steps[1].is_none());
+    }
+
+    #[test]
+    fn pm_accounting_rollback_after_address_space_is_reverse_order() {
+        let policy = PmSpawnAccountingPolicy::hosted_fake_rpi5()
+            .with_failure(PmSpawnFailureInjectionPoint::AfterAddressSpace);
+        let (_, _, _, accounting) = build_fake_rpi5_accounting_report(policy);
+        let pl011 = accounting_entry(&accounting, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnAccountingStatus::WouldRollback);
+        assert_eq!(
+            pl011.rollback_steps[0],
+            Some(PmSpawnRollbackStep::DestroyAddressSpace)
+        );
+        assert_eq!(
+            pl011.rollback_steps[1],
+            Some(PmSpawnRollbackStep::ReleaseProcessSlot)
+        );
+        assert!(pl011.rollback_steps[2].is_none());
+    }
+
+    #[test]
+    fn pm_accounting_rollback_after_irq_includes_reverse_irq_and_mmio_release() {
+        let policy = PmSpawnAccountingPolicy::hosted_fake_rpi5()
+            .with_failure(PmSpawnFailureInjectionPoint::AfterIrq);
+        let (_, _, _, accounting) = build_fake_rpi5_accounting_report(policy);
+        let pl011 = accounting_entry(&accounting, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnAccountingStatus::WouldRollback);
+        assert!(pl011.has_rollback_step(PmSpawnRollbackStep::ReleaseIrqReservation));
+        assert!(pl011.has_rollback_step(PmSpawnRollbackStep::ReleaseMmioReservation));
+        let irq_index = pl011
+            .rollback_steps
+            .iter()
+            .position(|step| *step == Some(PmSpawnRollbackStep::ReleaseIrqReservation))
+            .unwrap();
+        let mmio_index = pl011
+            .rollback_steps
+            .iter()
+            .position(|step| *step == Some(PmSpawnRollbackStep::ReleaseMmioReservation))
+            .unwrap();
+        assert!(
+            irq_index < mmio_index,
+            "rollback must be reverse reservation order"
+        );
+        assert!(pl011.rollback_steps.iter().all(|step| {
+            !matches!(step, Some(PmSpawnRollbackStep::RevokeMintedCaps))
+                || pl011.has_reservation(PmSpawnReservation::CNodeSlots)
+        }));
+    }
+
+    #[test]
+    fn pm_accounting_keeps_deferred_unsupported_and_running_without_new_reservations() {
+        let (_, _, _, accounting) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::hosted_fake_rpi5());
+        let rp1 = accounting_entry(&accounting, "raspberrypi,rp1-gpio");
+        assert_eq!(rp1.status, PmSpawnAccountingStatus::Deferred);
+        assert!(rp1.reservations.iter().all(Option::is_none));
+        let mailbox = accounting_entry(&accounting, "raspberrypi,firmware");
+        assert_eq!(mailbox.status, PmSpawnAccountingStatus::Deferred);
+        assert!(mailbox.reservations.iter().all(Option::is_none));
+        let unknown = accounting_entry(&accounting, "vendor,unknown");
+        assert_eq!(unknown.status, PmSpawnAccountingStatus::Unsupported);
+        assert!(unknown.reservations.iter().all(Option::is_none));
+
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let decisions = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 10,
+                },
+                SpawnAuthorityPolicy::allow_hosted_mock_spawns(),
+            )
+            .unwrap();
+        let grants = inventory
+            .build_resource_grant_bundle(&plan, &decisions, ResourceGrantPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let requests = inventory
+            .build_driver_spawn_request_bundle(&plan, &decisions, &grants)
+            .unwrap();
+        let validation = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let accounting = requests
+            .simulate_pm_accounting(&validation, PmSpawnAccountingPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let running = accounting_entry(&accounting, "arm,pl011");
+        assert_eq!(running.status, PmSpawnAccountingStatus::AlreadyRunning);
+        assert!(running.reservations.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pm_accounting_report_is_deterministic_bounded_and_non_mutating() {
+        let (inventory, requests, validation, first) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::hosted_fake_rpi5());
+        let requests_snapshot = requests.clone();
+        let validation_snapshot = validation.clone();
+        let second = requests
+            .simulate_pm_accounting(&validation, PmSpawnAccountingPolicy::hosted_fake_rpi5())
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), requests.len());
+        assert!(first.len() <= MAX_DEVICES);
+        assert_eq!(requests, requests_snapshot);
+        assert_eq!(validation, validation_snapshot);
+        assert_eq!(inventory.len(), 5);
+    }
+
+    #[test]
+    fn pm_accounting_does_not_call_driver_control_pm_supervisor_caps_grants_spawn_or_mmio() {
+        let (_, _, _, accounting) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::hosted_fake_rpi5());
+        assert_eq!(accounting.committed_count(), 1);
+        let runtime = MockDriverControl::new();
+        assert_eq!(runtime.irq_line.get(), None);
+        assert_eq!(runtime.dma_request.get(), None);
+        assert_eq!(runtime.irq_grant.get(), None);
+        assert_eq!(runtime.dma_grant.get(), None);
+        assert_eq!(runtime.registered.get(), None);
+        for entry in accounting.iter() {
             assert_ne!(entry.mock_request_id, 0);
         }
     }

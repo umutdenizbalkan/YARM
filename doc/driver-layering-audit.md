@@ -121,7 +121,9 @@ mocks.
   and returns handles. DRS-7 adds the bounded inert `DriverSpawnRequest` model and
   descriptive startup-cap/resource requirement descriptors. DRS-8 adds an inert
   PM-validation simulation with mock verified-DM identity and conservative
-  resource/startup checks. Both remain data only and are not PM calls or grants. The harness does not parse the live boot DTB, grant
+  resource/startup checks. DRS-9 adds inert PM accounting/rollback simulation with
+  descriptive reservations and reverse-order rollback steps. All remain data only
+  and are not PM calls or grants. The harness does not parse the live boot DTB, grant
   resources, perform MMIO, call PM, or spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md) and the design-only future
   DM↔PM spawn contract in

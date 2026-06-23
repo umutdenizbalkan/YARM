@@ -188,9 +188,10 @@ state 9 today.
   resource and startup-cap requirements are descriptive only. PL011 can become
   `ReadyForPmValidation` in hosted data. DRS-8 adds an inert PM-validation
   simulation that can mark that PL011 request `WouldAccept` only under mock
-  verified-DM-identity/image/resource/startup-cap policy, while RP1 GPIO and
-  mailbox remain deferred/BAR- or transport/cache/MMIO-blocked and no PM call
-  occurs.
+  verified-DM-identity/image/resource/startup-cap policy. DRS-9 can then model
+  descriptive PL011 reservations and reverse-order rollback plans, while RP1 GPIO
+  and mailbox remain deferred/BAR- or transport/cache/MMIO-blocked and no PM
+  call occurs.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.
