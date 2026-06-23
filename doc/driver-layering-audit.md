@@ -102,8 +102,10 @@ mocks.
   metadata is required, payload TIDs are diagnostic only, inventory records
   authorize IRQ/MMIO/DMA requests before any runtime call, sender-scoped read-only
   queries return inert inventory/MMIO/IRQ/status data without caps, and production
-  no-op hardware control returns errors instead of dummy `CapId(0)` grants. It
-  does not parse the DTB and does not spawn driver binaries. See
+  no-op hardware control returns errors instead of dummy `CapId(0)` grants. DRS-2
+  adds a hosted fake-FDT parser harness that converts bounded synthetic RPi5-style
+  nodes into inert inventory records for tests only. It does not parse the live
+  boot DTB and does not spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
 
 ## Summary

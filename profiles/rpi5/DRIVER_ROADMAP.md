@@ -148,11 +148,13 @@ state 9 today.
   assigned device record, and deferred/unknown records fail closed. DRS-1C adds
   sender-scoped read-only queries for a driver's own assigned record, MMIO
   ranges, IRQ lines, candidate/class, DMA-constraint placeholder, and deferred
-  status; these replies are descriptive data only and never carry caps. Hosted
-  tests use a fake RPi5 inventory selecting PL011, RP1 GPIO, firmware mailbox,
-  and irqmux candidates without spawning drivers. Production no-op hardware
-  control now returns errors and never fabricates `CapId(0)` grants. On RPi5 it
-  is additionally blocked because userspace is not reached.
+  status; these replies are descriptive data only and never carry caps. DRS-2 adds a hosted fake-FDT parser harness that accepts bounded synthetic
+  RPi5-style nodes and produces the same inert records for tests only; it does
+  not parse the live boot DTB. Hosted tests use fake PL011, RP1 GPIO, firmware
+  mailbox, irqmux, disabled, and unknown-compatible nodes without spawning
+  drivers. Production no-op hardware control now returns errors and never
+  fabricates `CapId(0)` grants. On RPi5 it is additionally blocked because
+  userspace is not reached.
 
 ## 5. Driver-manager integration plan (RPi5)
 
@@ -162,9 +164,9 @@ state 9 today.
    virtual pointer already proven at HH4 (`RPI5_HH4_DTB_VIRT_OK`), and a
    read-only device inventory derived from it — **without** starting any
    hardware-heavy driver.
-3. Add a fake-DTB parser harness that produces the DRS-1/DRS-1B/DRS-1C
-   inventory, authorization, and read-only query records (compatible string,
-   MMIO region, IRQ line, DMA constraints) without changing spawn authority.
+3. Promote the DRS-2 fake-FDT parser into a live-DTB design only after sender
+   identity, resource-grant policy, PCIe/RP1 BAR discovery, IRQ routing, and PM
+   spawn authority are specified; until then it remains a hosted parser harness.
 4. Only then register/grant resources to a driver and let PM spawn it, gated per
    the safe-driver ordering in milestone RPi5-DRV-2.
 
