@@ -89,6 +89,7 @@ ORACLE_MARKERS=(
   "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
   "IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE"
   "IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE"
+  "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"
 )
 
 # At least one recv-v2 meta delivery marker must appear on a healthy boot.
@@ -256,15 +257,20 @@ else
 fi
 
 if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
-  # Sender-wake is intentionally DEFERRED in the Stage 159BC/D workload (it needs
-  # a second blocked-sender context that cannot be sequenced without a timing
-  # race). The workload does not claim it, so requiring it here will fail by
-  # design until a deterministic implementation lands. Do not enable this knob
-  # before then.
+  # Stage 161: sender-wake requires BOTH the kernel delivery marker
+  # IPC_RECV_V2_SENDER_WAKE_ORDER_OK and the userspace sequence marker
+  # IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE. It remains DEFERRED: a pure
+  # userspace workload cannot deterministically create AND observe a blocked
+  # sender before the receiver drain on a multi-CPU boot (no userspace-observable
+  # "sender is a waiter" signal and no userspace CPU-affinity control; the proof
+  # runs after secondary CPUs are released). Requiring it therefore fails by
+  # design until the minimal proof-gated infrastructure lands (see
+  # doc/KERNEL_UNLOCKING.md §5.1.9.4 — proposed Stage 162). Do NOT enable this
+  # knob before then.
   echo "[info] ipc-oracle: proof sender-wake: REQUIRED"
-  proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
+  proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
 else
-  echo "[info] ipc-oracle: proof sender-wake: not required (deferred — see doc/KERNEL_UNLOCKING.md)"
+  echo "[info] ipc-oracle: proof sender-wake: not required (DEFERRED — see doc/KERNEL_UNLOCKING.md §5.1.9.4)"
 fi
 
 # Regression gate: every baseline marker must still be present.
