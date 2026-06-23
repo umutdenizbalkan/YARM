@@ -104,8 +104,11 @@ mocks.
   queries return inert inventory/MMIO/IRQ/status data without caps, and production
   no-op hardware control returns errors instead of dummy `CapId(0)` grants. DRS-2
   adds a hosted fake-FDT parser harness that converts bounded synthetic RPi5-style
-  nodes into inert inventory records for tests only. It does not parse the live
-  boot DTB and does not spawn driver binaries. See
+  nodes into inert inventory records for tests only; DRS-2B extends those hosted
+  tests with parent-bus cell inheritance, minimal `ranges` translation, bounded
+  IRQ parsing, and malformed bus/resource rejection. RP1 child resources remain
+  PCIe/BAR-relative and deferred. The harness does not parse the live boot DTB,
+  grant resources, perform MMIO, or spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
 
 ## Summary

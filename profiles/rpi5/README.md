@@ -85,9 +85,11 @@ declared, and its entrypoint only logs deferred no-MMIO-grant markers. The
 `driver_manager` likewise requires verified sender identity for privileged
 requests, exposes only sender-scoped inert resource-query data, and will not
 mint fake hardware grants when production hardware control is unavailable. DRS-2
-adds only a hosted fake-DTB parser harness for tests; it does not parse the live
-boot DTB. See
-the driver inventory in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
+and DRS-2B add only a hosted fake-DTB parser harness for tests, including bounded
+parent-bus cell inheritance, minimal fake `ranges` translation, and limited
+inert IRQ parsing; it does not parse the live boot DTB. RP1 GPIO resources
+remain PCIe/BAR-relative and deferred rather than direct BCM2712 MMIO. See the
+driver inventory in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning
 
@@ -97,9 +99,9 @@ This profile does **not** assert that:
   halts in the HH5 diagnostic path);
 - the listed services have Raspberry Pi 5-specific hardware support;
 - device-tree-driven device discovery, MMIO/IRQ resource assignment, or driver
-  spawning is implemented (DRS-1 through DRS-2 add only a userspace-only fake
+  spawning is implemented (DRS-1 through DRS-2B add only a userspace-only fake
   inventory, fail-closed authorization model, inert read-only resource query
-  model, and hosted fake-DTB parser harness in `driver_manager` tests);
+  model, and hosted fake-DTB/parser-bus harness in `driver_manager` tests);
 - the manifest is handed to init; or
 - any listed service is spawned because this file exists.
 

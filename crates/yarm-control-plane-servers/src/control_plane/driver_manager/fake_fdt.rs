@@ -21,6 +21,7 @@ const FDT_HEADER_LEN: usize = 40;
 const MAX_NODE_NAME: usize = 64;
 const MAX_PROP_NAME: usize = 64;
 const MAX_COMPATIBLE: usize = 64;
+const MAX_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeFdtError {
@@ -28,9 +29,15 @@ pub enum FakeFdtError {
     BadMagic,
     BadTotalsize,
     BadBlock,
+    BadStructBlock,
+    BadStringsBlock,
     BadToken,
     BadString,
     BadProperty,
+    MalformedReg,
+    MalformedRanges,
+    TranslationOverflow,
+    BadInterrupt,
     Unterminated,
     Inventory(KernelIpcError),
 }
@@ -58,6 +65,8 @@ struct CurrentNode {
     status_disabled: bool,
     reg: Option<MmioRange>,
     irq: Option<u32>,
+    parent_bus: BusContext,
+    child_bus: BusContext,
 }
 
 impl CurrentNode {
@@ -70,16 +79,20 @@ impl CurrentNode {
             status_disabled: false,
             reg: None,
             irq: None,
+            parent_bus: BusContext::root(),
+            child_bus: BusContext::root(),
         }
     }
 
-    fn reset(&mut self, name: &[u8]) -> Result<(), FakeFdtError> {
+    fn reset(&mut self, name: &[u8], parent_bus: BusContext) -> Result<(), FakeFdtError> {
         if name.len() > self.name.len() {
             return Err(FakeFdtError::BadString);
         }
         *self = Self::empty();
         self.name[..name.len()].copy_from_slice(name);
         self.name_len = name.len();
+        self.parent_bus = parent_bus;
+        self.child_bus = parent_bus;
         Ok(())
     }
 
@@ -93,9 +106,32 @@ impl CurrentNode {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ParserState {
+struct RangeTranslation {
+    child_base: u64,
+    parent_base: u64,
+    size: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BusContext {
     address_cells: usize,
     size_cells: usize,
+    range: Option<RangeTranslation>,
+}
+
+impl BusContext {
+    const fn root() -> Self {
+        Self {
+            address_cells: 2,
+            size_cells: 1,
+            range: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParserState {
+    bus_stack: [BusContext; MAX_DEPTH],
     current: CurrentNode,
     depth: usize,
 }
@@ -103,10 +139,20 @@ struct ParserState {
 impl ParserState {
     const fn new() -> Self {
         Self {
-            address_cells: 2,
-            size_cells: 1,
+            bus_stack: [BusContext::root(); MAX_DEPTH],
             current: CurrentNode::empty(),
             depth: 0,
+        }
+    }
+
+    fn current_parent_bus(&self) -> Result<BusContext, FakeFdtError> {
+        if self.depth == 0 {
+            Ok(BusContext::root())
+        } else {
+            self.bus_stack
+                .get(self.depth - 1)
+                .copied()
+                .ok_or(FakeFdtError::BadBlock)
         }
     }
 }
@@ -127,8 +173,13 @@ pub fn parse_fake_rpi5_fdt_to_inventory(blob: &[u8]) -> Result<PlatformInventory
             FDT_BEGIN_NODE => {
                 let (name, next) = read_cstr(struct_block, cursor, MAX_NODE_NAME)?;
                 cursor = align4(next)?;
+                let parent_bus = state.current_parent_bus()?;
                 state.depth = state.depth.checked_add(1).ok_or(FakeFdtError::BadBlock)?;
-                state.current.reset(name)?;
+                if state.depth > MAX_DEPTH {
+                    return Err(FakeFdtError::BadBlock);
+                }
+                state.bus_stack[state.depth - 1] = parent_bus;
+                state.current.reset(name, parent_bus)?;
             }
             FDT_END_NODE => {
                 if state.depth == 0 {
@@ -137,6 +188,7 @@ pub fn parse_fake_rpi5_fdt_to_inventory(blob: &[u8]) -> Result<PlatformInventory
                 if !state.current.is_root() {
                     maybe_add_record(&state.current, &mut inventory)?;
                 }
+                state.bus_stack[state.depth - 1] = state.current.child_bus;
                 state.current = CurrentNode::empty();
                 state.depth -= 1;
             }
@@ -184,23 +236,23 @@ fn parse_header(blob: &[u8]) -> Result<FdtHeader, FakeFdtError> {
     let off_dt_strings =
         usize::try_from(read_be_u32_at(blob, 12)?).map_err(|_| FakeFdtError::BadBlock)?;
     let size_dt_strings =
-        usize::try_from(read_be_u32_at(blob, 32)?).map_err(|_| FakeFdtError::BadBlock)?;
+        usize::try_from(read_be_u32_at(blob, 32)?).map_err(|_| FakeFdtError::BadStringsBlock)?;
     let size_dt_struct =
-        usize::try_from(read_be_u32_at(blob, 36)?).map_err(|_| FakeFdtError::BadBlock)?;
-    checked_range(blob, off_dt_struct, size_dt_struct)?;
-    checked_range(blob, off_dt_strings, size_dt_strings)?;
+        usize::try_from(read_be_u32_at(blob, 36)?).map_err(|_| FakeFdtError::BadStructBlock)?;
+    checked_range(blob, off_dt_struct, size_dt_struct).map_err(|_| FakeFdtError::BadStructBlock)?;
+    checked_range(blob, off_dt_strings, size_dt_strings)
+        .map_err(|_| FakeFdtError::BadStringsBlock)?;
     let struct_end = off_dt_struct
         .checked_add(size_dt_struct)
-        .ok_or(FakeFdtError::BadBlock)?;
+        .ok_or(FakeFdtError::BadStructBlock)?;
     let strings_end = off_dt_strings
         .checked_add(size_dt_strings)
-        .ok_or(FakeFdtError::BadBlock)?;
-    if off_dt_struct >= totalsize
-        || off_dt_strings >= totalsize
-        || struct_end > totalsize
-        || strings_end > totalsize
-    {
-        return Err(FakeFdtError::BadBlock);
+        .ok_or(FakeFdtError::BadStringsBlock)?;
+    if off_dt_struct >= totalsize || struct_end > totalsize {
+        return Err(FakeFdtError::BadStructBlock);
+    }
+    if off_dt_strings >= totalsize || strings_end > totalsize {
+        return Err(FakeFdtError::BadStringsBlock);
     }
     Ok(FdtHeader {
         off_dt_struct,
@@ -212,27 +264,40 @@ fn parse_header(blob: &[u8]) -> Result<FdtHeader, FakeFdtError> {
 
 fn apply_property(state: &mut ParserState, name: &[u8], value: &[u8]) -> Result<(), FakeFdtError> {
     match name {
-        b"#address-cells" if state.current.is_root() => {
-            state.address_cells = usize::try_from(read_be_u32_at(value, 0)?)
+        b"#address-cells" => {
+            state.current.child_bus.address_cells = usize::try_from(read_be_u32_at(value, 0)?)
                 .map_err(|_| FakeFdtError::BadProperty)?;
-            if state.address_cells == 0 || state.address_cells > 2 {
+            if state.current.child_bus.address_cells == 0
+                || state.current.child_bus.address_cells > 2
+            {
                 return Err(FakeFdtError::BadProperty);
             }
         }
-        b"#size-cells" if state.current.is_root() => {
-            state.size_cells = usize::try_from(read_be_u32_at(value, 0)?)
+        b"#size-cells" => {
+            state.current.child_bus.size_cells = usize::try_from(read_be_u32_at(value, 0)?)
                 .map_err(|_| FakeFdtError::BadProperty)?;
-            if state.size_cells == 0 || state.size_cells > 2 {
+            if state.current.child_bus.size_cells == 0 || state.current.child_bus.size_cells > 2 {
                 return Err(FakeFdtError::BadProperty);
             }
         }
         b"compatible" => set_compatible(&mut state.current, value)?,
-        b"reg" => {
-            state.current.reg = Some(parse_reg(value, state.address_cells, state.size_cells)?)
+        b"reg" => state.current.reg = Some(parse_reg(value, state.current.parent_bus)?),
+        b"ranges" => {
+            state.current.child_bus.range =
+                parse_ranges(value, state.current.child_bus, state.current.parent_bus)?;
         }
-        b"interrupts" | b"yarm,irq" => state.current.irq = Some(read_be_u32_at(value, 0)?),
+        b"interrupts" | b"yarm,irq" => {
+            if value.len() != 4 {
+                return Err(FakeFdtError::BadInterrupt);
+            }
+            state.current.irq = Some(read_be_u32_at(value, 0)?)
+        }
         b"status" => state.current.status_disabled = first_cstr_eq(value, b"disabled")?,
+        b"interrupt-parent" => return Err(FakeFdtError::BadInterrupt),
         _ => {}
+    }
+    if state.depth > 0 {
+        state.bus_stack[state.depth - 1] = state.current.child_bus;
     }
     Ok(())
 }
@@ -289,21 +354,19 @@ fn set_compatible(node: &mut CurrentNode, value: &[u8]) -> Result<(), FakeFdtErr
     Ok(())
 }
 
-fn parse_reg(
-    value: &[u8],
-    address_cells: usize,
-    size_cells: usize,
-) -> Result<MmioRange, FakeFdtError> {
-    let cells = address_cells
-        .checked_add(size_cells)
-        .ok_or(FakeFdtError::BadProperty)?;
-    let needed = cells.checked_mul(4).ok_or(FakeFdtError::BadProperty)?;
-    if value.len() < needed {
-        return Err(FakeFdtError::BadProperty);
+fn parse_reg(value: &[u8], parent_bus: BusContext) -> Result<MmioRange, FakeFdtError> {
+    let cells = parent_bus
+        .address_cells
+        .checked_add(parent_bus.size_cells)
+        .ok_or(FakeFdtError::MalformedReg)?;
+    let needed = cells.checked_mul(4).ok_or(FakeFdtError::MalformedReg)?;
+    if value.len() != needed {
+        return Err(FakeFdtError::MalformedReg);
     }
     let mut cursor = 0usize;
-    let base = read_cells(value, &mut cursor, address_cells)?;
-    let len = read_cells(value, &mut cursor, size_cells)?;
+    let child_base = read_cells(value, &mut cursor, parent_bus.address_cells)?;
+    let len = read_cells(value, &mut cursor, parent_bus.size_cells)?;
+    let base = translate_address(parent_bus, child_base)?;
     MmioRange::new(base, len).map_err(FakeFdtError::Inventory)
 }
 
@@ -315,6 +378,58 @@ fn read_cells(value: &[u8], cursor: &mut usize, cells: usize) -> Result<u64, Fak
         *cursor = cursor.checked_add(4).ok_or(FakeFdtError::BadProperty)?;
     }
     Ok(out)
+}
+
+fn parse_ranges(
+    value: &[u8],
+    child_bus: BusContext,
+    parent_bus: BusContext,
+) -> Result<Option<RangeTranslation>, FakeFdtError> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let cells = child_bus
+        .address_cells
+        .checked_add(parent_bus.address_cells)
+        .and_then(|cells| cells.checked_add(child_bus.size_cells))
+        .ok_or(FakeFdtError::MalformedRanges)?;
+    let needed = cells.checked_mul(4).ok_or(FakeFdtError::MalformedRanges)?;
+    if value.len() != needed {
+        return Err(FakeFdtError::MalformedRanges);
+    }
+    let mut cursor = 0usize;
+    let child_base = read_cells(value, &mut cursor, child_bus.address_cells)?;
+    let parent_base = read_cells(value, &mut cursor, parent_bus.address_cells)?;
+    let size = read_cells(value, &mut cursor, child_bus.size_cells)?;
+    if size == 0 {
+        return Err(FakeFdtError::MalformedRanges);
+    }
+    Ok(Some(RangeTranslation {
+        child_base,
+        parent_base,
+        size,
+    }))
+}
+
+fn translate_address(parent_bus: BusContext, child_base: u64) -> Result<u64, FakeFdtError> {
+    let Some(range) = parent_bus.range else {
+        // Test policy: absent ranges means identity/no translation. This keeps
+        // BAR-relative fake buses descriptive and not live-grantable unless a
+        // later inventory policy marks the device grantable.
+        return Ok(child_base);
+    };
+    let range_end = range
+        .child_base
+        .checked_add(range.size)
+        .ok_or(FakeFdtError::TranslationOverflow)?;
+    if child_base < range.child_base || child_base >= range_end {
+        return Err(FakeFdtError::MalformedRanges);
+    }
+    let offset = child_base - range.child_base;
+    range
+        .parent_base
+        .checked_add(offset)
+        .ok_or(FakeFdtError::TranslationOverflow)
 }
 
 fn first_cstr_eq(value: &[u8], expected: &[u8]) -> Result<bool, FakeFdtError> {
@@ -442,6 +557,14 @@ mod tests {
             bytes.extend_from_slice(&u32::try_from(base & 0xffff_ffff).unwrap().to_be_bytes());
             bytes.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
             self.prop("reg", &bytes);
+        }
+
+        fn prop_cells(&mut self, name: &'static str, cells: &[u32]) {
+            let mut bytes = Vec::new();
+            for cell in cells {
+                bytes.extend_from_slice(&cell.to_be_bytes());
+            }
+            self.prop(name, &bytes);
         }
 
         fn pad_structure(&mut self) {
@@ -597,6 +720,79 @@ mod tests {
     }
 
     #[test]
+    fn root_two_cell_address_and_two_cell_size_reg_parses() {
+        let mut b = FakeFdtBuilder::new();
+        b.begin("");
+        b.prop_u32("#address-cells", 2);
+        b.prop_u32("#size-cells", 2);
+        b.begin("serial@107d00100000");
+        b.prop_str("compatible", "arm,pl011");
+        b.prop_cells("reg", &[0x107d, 0x0010_0000, 0, 0x2000]);
+        b.prop_u32("interrupts", 121);
+        b.end_node();
+        b.end_node();
+        let inventory = parse_fake_rpi5_fdt_to_inventory(&b.finish()).unwrap();
+        let uart = inventory.candidates_for(DeviceClass::Uart).next().unwrap();
+        assert_eq!(
+            uart.mmio_ranges[0],
+            Some(MmioRange {
+                base: 0x107d_0010_0000,
+                len: 0x2000
+            })
+        );
+    }
+
+    #[test]
+    fn child_bus_cell_inheritance_and_ranges_translate_mmio() {
+        let mut b = base_tree();
+        b.begin("soc");
+        b.prop_u32("#address-cells", 1);
+        b.prop_u32("#size-cells", 1);
+        b.prop_cells("ranges", &[0x1000_0000, 0x107d, 0x0000_0000, 0x0010_0000]);
+        b.begin("serial@10001000");
+        b.prop_str("compatible", "arm,pl011");
+        b.prop_cells("reg", &[0x1000_1000, 0x1000]);
+        b.prop_u32("interrupts", 44);
+        b.end_node();
+        b.end_node();
+        b.end_node();
+        let inventory = parse_fake_rpi5_fdt_to_inventory(&b.finish()).unwrap();
+        let uart = inventory.candidates_for(DeviceClass::Uart).next().unwrap();
+        assert_eq!(
+            uart.mmio_ranges[0],
+            Some(MmioRange {
+                base: 0x107d_0000_1000,
+                len: 0x1000
+            })
+        );
+    }
+
+    #[test]
+    fn nested_bus_inherits_parent_cells_without_ranges_as_identity() {
+        let mut b = base_tree();
+        b.begin("soc");
+        b.prop_u32("#address-cells", 1);
+        b.prop_u32("#size-cells", 1);
+        b.begin("simple-bus");
+        b.begin("serial@2000");
+        b.prop_str("compatible", "arm,pl011");
+        b.prop_cells("reg", &[0x2000, 0x100]);
+        b.end_node();
+        b.end_node();
+        b.end_node();
+        b.end_node();
+        let inventory = parse_fake_rpi5_fdt_to_inventory(&b.finish()).unwrap();
+        let uart = inventory.candidates_for(DeviceClass::Uart).next().unwrap();
+        assert_eq!(
+            uart.mmio_ranges[0],
+            Some(MmioRange {
+                base: 0x2000,
+                len: 0x100
+            })
+        );
+    }
+
+    #[test]
     fn malformed_fdt_inputs_are_rejected_cleanly() {
         assert!(matches!(
             parse_fake_rpi5_fdt_to_inventory(&[]),
@@ -618,8 +814,105 @@ mod tests {
         write_header_word(&mut bad_struct, 36, u32::MAX);
         assert!(matches!(
             parse_fake_rpi5_fdt_to_inventory(&bad_struct),
-            Err(FakeFdtError::BadBlock)
+            Err(FakeFdtError::BadStructBlock)
         ));
+    }
+
+    #[test]
+    fn malformed_cells_reg_ranges_and_irq_reject_cleanly() {
+        let mut bad_cells = base_tree();
+        bad_cells.prop_u32("#address-cells", 3);
+        bad_cells.end_node();
+        assert!(matches!(
+            parse_fake_rpi5_fdt_to_inventory(&bad_cells.finish()),
+            Err(FakeFdtError::BadProperty)
+        ));
+
+        let mut truncated_reg = base_tree();
+        truncated_reg.begin("serial");
+        truncated_reg.prop_str("compatible", "arm,pl011");
+        truncated_reg.prop_cells("reg", &[0x107d, 0x1000]);
+        truncated_reg.end_node();
+        truncated_reg.end_node();
+        assert!(matches!(
+            parse_fake_rpi5_fdt_to_inventory(&truncated_reg.finish()),
+            Err(FakeFdtError::MalformedReg)
+        ));
+
+        let mut bad_ranges = base_tree();
+        bad_ranges.begin("soc");
+        bad_ranges.prop_u32("#address-cells", 1);
+        bad_ranges.prop_u32("#size-cells", 1);
+        bad_ranges.prop_cells("ranges", &[0, 0x107d]);
+        bad_ranges.end_node();
+        bad_ranges.end_node();
+        assert!(matches!(
+            parse_fake_rpi5_fdt_to_inventory(&bad_ranges.finish()),
+            Err(FakeFdtError::MalformedRanges)
+        ));
+
+        let mut bad_irq = base_tree();
+        bad_irq.begin("serial");
+        bad_irq.prop_str("compatible", "arm,pl011");
+        bad_irq.prop_cells("interrupts", &[1, 2]);
+        bad_irq.end_node();
+        bad_irq.end_node();
+        assert!(matches!(
+            parse_fake_rpi5_fdt_to_inventory(&bad_irq.finish()),
+            Err(FakeFdtError::BadInterrupt)
+        ));
+    }
+
+    #[test]
+    fn ranges_translation_overflow_rejects() {
+        let mut b = base_tree();
+        b.begin("soc");
+        b.prop_u32("#address-cells", 1);
+        b.prop_u32("#size-cells", 1);
+        b.prop_cells("ranges", &[0, u32::MAX, u32::MAX, 0x1000]);
+        b.begin("serial");
+        b.prop_str("compatible", "arm,pl011");
+        b.prop_cells("reg", &[0x100, 0x100]);
+        b.end_node();
+        b.end_node();
+        b.end_node();
+        assert!(matches!(
+            parse_fake_rpi5_fdt_to_inventory(&b.finish()),
+            Err(FakeFdtError::TranslationOverflow)
+        ));
+    }
+
+    #[test]
+    fn rp1_child_under_pcie_parent_remains_bar_relative_and_deferred() {
+        let mut b = base_tree();
+        b.begin("pcie");
+        b.prop_u32("#address-cells", 1);
+        b.prop_u32("#size-cells", 1);
+        b.begin("rp1");
+        b.begin("gpio@10000");
+        b.prop_str("compatible", "raspberrypi,rp1-gpio");
+        b.prop_cells("reg", &[0x1_0000, 0x1000]);
+        b.prop_u32("interrupts", 33);
+        b.end_node();
+        b.end_node();
+        b.end_node();
+        b.end_node();
+        let parsed = parse_fake_rpi5_fdt_to_inventory(&b.finish()).unwrap();
+        let gpio = *parsed.candidates_for(DeviceClass::Gpio).next().unwrap();
+        assert_eq!(gpio.status, DeviceStatus::DeferredNoMmioGrant);
+        assert_eq!(
+            gpio.mmio_ranges[0],
+            Some(MmioRange {
+                base: 0x1_0000,
+                len: 0x1000
+            })
+        );
+        let mut inventory = PlatformInventory::new();
+        inventory.add(gpio.assigned_to(11).unwrap()).unwrap();
+        assert_eq!(
+            inventory.authorize_mmio(11, 0x1_0000, 0x1000),
+            Err(KernelIpcError::MissingRight)
+        );
     }
 
     #[test]
