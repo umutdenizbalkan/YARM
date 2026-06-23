@@ -3110,6 +3110,67 @@ kind=user_plain_v2 → IPC_RECV_V2_META_QUEUED_SPLIT_OK`, then for rollback
 and the userspace `IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE` /
 `IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE`. (QEMU is run by the maintainer.)
 
+#### 5.1.9.3 Stage 160D — AArch64 split handled-error export parity
+
+Stage 160C made the AArch64 split path fire both kernel markers
+(`IPC_RECV_V2_META_QUEUED_SPLIT_OK`, `IPC_RECV_V2_ROLLBACK_OK`) with no fatal
+trap, and the queued-split sequence completed. The rollback userspace completion
+still failed: kernel `…result=handled_err code=2`, but userspace logged
+`IPC_RECV_PROOF_ROLLBACK_RECV_RET code=0` and `…ROLLBACK_SEQUENCE_DONE` was
+missing.
+
+**Audit (Task A/B) — the export ordering was already correct.** The global
+AArch64 non-task-switched syscall-return order is context-save
+(`set_thread_user_context`) → `restore_arch_thread_state` →
+`export_syscall_result_to_user_gprs`; `restore_arch_thread_state` /
+`apply_user_context` only restore GPR/PC/SP and do **not** touch the error lane,
+so the export still writes the `set_err` error code to x0. The split finalize
+already mirrors that order exactly. Decisive evidence it was not an export bug:
+the **global** AArch64 path returned `code=0` for the same rollback recv too (the
+Stage 160 pre-split run).
+
+**Real root cause — the AArch64 recv-v2 error heuristic, not the export.** The
+recv-v2 writeback is meta-first: it copies the 40-byte meta (with
+`status = sender_tid`) and only *then* detects the undersized payload and rolls
+back. So `meta.status` is no longer `u64::MAX` on the rollback. The proof
+undersize wrapper's AArch64 detection was `ret0 != 0 && meta.status == u64::MAX`
+— the second clause is false once the meta has been written, so the wrapper
+returned `Ok` (`code=0`) even though x0 carried the error. x86_64 is immune
+because it reads a dedicated `ret.error` lane, not the meta heuristic.
+
+**Fix (Task C).** AArch64/riscv64 have no separate error lane; the kernel encodes
+the failure into x0 via `set_err` + the Stage 160C export, and a successful
+recv-v2 sets x0 = 0. So for this proof-only undersize recv a **non-zero x0 IS the
+error**: `ipc_recv_v2_proof_undersized` now detects it with `if ret.ret0 != 0`
+(dropping the invalid `meta.status` clause). This is a userspace-helper
+interpretation change only — no syscall/IPC ABI change, and the general
+`ipc_recv_v2` wrapper (which needs the `meta.status` heuristic to separate
+WouldBlock from a delivered message) is untouched. The export ordering is kept
+(mirrors global) and proven by diagnostics.
+
+**Diagnostics (Task D).** `split_finalize_handled_syscall` now logs
+`AARCH64_SPLIT_CONTEXT_SAVE_DONE x0=…`, `AARCH64_SPLIT_SVC_ADVANCE_DONE pc=…`,
+`AARCH64_SPLIT_ABI_EXPORT_BEGIN err=… x0_before=…`, and
+`AARCH64_SPLIT_ABI_EXPORT_DONE err=… x0_after=…`. On the rollback, `x0_after`
+must be `0x2` (InvalidArgs), proving the kernel export is correct and that the
+prior `code=0` came solely from the userspace heuristic.
+
+**Constraints.** No IPC/cap seam moved (the v2 meta-first writeback is the pinned
+delivery seam and is left untouched — the fix is in the userspace wrapper +
+arch-layer diagnostics); no ABI change (`SYSCALL_COUNT == 31`,
+`VARIANT_COUNT == 23`); RPi5 boot untouched; x86_64 D6/CR3/TSS/PF intact and the
+x86_64 oracle stays green; the AArch64 split bracketing remains proof-knob-gated.
+Guards: `stage160d_split_finalize_mirrors_global_export_order`,
+`stage160d_handled_error_export_diagnostics`,
+`stage160d_proof_wrapper_detects_error_from_x0`,
+`stage160d_svc_advance_exactly_once`, `stage160d_invariants`.
+
+**Expected after Stage 160D (AArch64 proof boot).** `…result=handled_err code=2`,
+`AARCH64_SPLIT_ABI_EXPORT_DONE err=2 x0_after=0x2`,
+`IPC_RECV_PROOF_ROLLBACK_RECV_RET code=2` (nonzero), and
+`IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE` present — alongside the queued-split
+markers and with no fatal trap. (QEMU is run by the maintainer.)
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

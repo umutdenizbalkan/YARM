@@ -391,8 +391,18 @@ pub mod syscall {
         if ret.error != 0 {
             return Err(decode_syscall_error(ret.error));
         }
+        // AArch64/riscv64 return the syscall result via x0 (ret0); there is no
+        // separate error lane. The general `ipc_recv_v2` distinguishes a delivered
+        // message from WouldBlock with the `meta.status == u64::MAX` heuristic, but
+        // that heuristic is INVALID for the undersize rollback: the recv-v2
+        // writeback copies the meta FIRST (status = sender_tid) and only THEN
+        // detects the undersized payload and rolls back, so `meta.status` is no
+        // longer `u64::MAX` even though the syscall failed. The kernel encodes the
+        // failure (InvalidArgs) into x0 via `set_err` + the Stage 160C export, so
+        // for this proof-only undersize recv a non-zero x0 IS the error (a
+        // successful recv-v2 sets x0 = 0). Detect it directly from x0.
         #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-        if ret.ret0 != 0 && meta.status == u64::MAX {
+        if ret.ret0 != 0 {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
