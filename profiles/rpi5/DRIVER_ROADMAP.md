@@ -142,10 +142,14 @@ state 9 today.
   DRS-1 adds only an inert userspace inventory model: `DeviceClass`
   (`Uart`, `Mailbox`, `Gpio`, `IrqMux`, `Block`, `Unknown`) plus
   `DeviceRecord` compatible strings, MMIO ranges, IRQ lines, candidate driver
-  names, and deferred status. Hosted tests use a fake RPi5 inventory selecting
-  PL011, RP1 GPIO, firmware mailbox, and irqmux candidates without registering
-  or spawning them. On RPi5 it is additionally blocked because userspace is not
-  reached.
+  names, and deferred status. DRS-1B makes that inventory an inert
+  authorization input: privileged requests require verified sender identity,
+  payload TIDs cannot authorize another driver, listed resources must match the
+  assigned device record, and deferred/unknown records fail closed. Hosted tests
+  use a fake RPi5 inventory selecting PL011, RP1 GPIO, firmware mailbox, and
+  irqmux candidates without spawning drivers. Production no-op hardware control
+  now returns errors and never fabricates `CapId(0)` grants. On RPi5 it is
+  additionally blocked because userspace is not reached.
 
 ## 5. Driver-manager integration plan (RPi5)
 
@@ -155,9 +159,9 @@ state 9 today.
    virtual pointer already proven at HH4 (`RPI5_HH4_DTB_VIRT_OK`), and a
    read-only device inventory derived from it — **without** starting any
    hardware-heavy driver.
-3. Promote the DRS-1 userspace-only inventory model into a real DTB-derived
-   inventory path (compatible string, MMIO region, IRQ line, DMA constraints)
-   without changing spawn authority.
+3. Promote the DRS-1/DRS-1B inventory and authorization model into a real
+   DTB-derived inventory path (compatible string, MMIO region, IRQ line, DMA
+   constraints) without changing spawn authority.
 4. Only then register/grant resources to a driver and let PM spawn it, gated per
    the safe-driver ordering in milestone RPi5-DRV-2.
 

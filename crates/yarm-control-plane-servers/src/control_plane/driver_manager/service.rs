@@ -24,6 +24,14 @@ fn read_u64(payload: &[u8], offset: usize) -> Result<u64, KernelIpcError> {
     Ok(u64::from_le_bytes(arr))
 }
 
+fn read_u16_checked(payload: &[u8], offset: usize) -> Result<u16, KernelIpcError> {
+    u16::try_from(read_u64(payload, offset)?).map_err(|_| KernelIpcError::WrongObject)
+}
+
+fn read_usize_checked(payload: &[u8], offset: usize) -> Result<usize, KernelIpcError> {
+    usize::try_from(read_u64(payload, offset)?).map_err(|_| KernelIpcError::WrongObject)
+}
+
 fn ok_reply(
     opcode: u16,
     value: u64,
@@ -31,6 +39,9 @@ fn ok_reply(
 ) -> Result<Message, KernelIpcError> {
     let payload = value.to_le_bytes();
     let (flags, cap) = if let Some(cap_id) = transferred_cap {
+        if cap_id.0 == 0 {
+            return Err(KernelIpcError::InvalidCapability);
+        }
         (Message::FLAG_CAP_TRANSFER, Some(cap_id.0))
     } else {
         (0, None)
@@ -92,10 +103,15 @@ impl DriverRegistry {
         }
     }
 
-    /// Register a driver by tid.  If the tid is already registered, the
-    /// existing record is returned without modification.  Returns `Err` when
-    /// the table is full.
+    /// Register a driver by verified sender tid.
+    ///
+    /// The table is append-only: no remove path exists, so `records[..len]` is
+    /// always densely occupied. Restart handling must update only an existing
+    /// verified-sender record and must not append a replacement record.
     pub fn register(&mut self, tid: u64) -> Result<(), KernelIpcError> {
+        if tid == 0 {
+            return Err(KernelIpcError::MissingRight);
+        }
         // Duplicate: return Ok without creating a second entry.
         if self.records[..self.len]
             .iter()
@@ -108,6 +124,18 @@ impl DriverRegistry {
         }
         self.records[self.len] = Some(DriverRecord::new(tid));
         self.len += 1;
+        Ok(())
+    }
+
+    pub fn note_restarted(&mut self, tid: u64) -> Result<(), KernelIpcError> {
+        let Some(record) = self.records[..self.len]
+            .iter_mut()
+            .filter_map(|record| record.as_mut())
+            .find(|record| record.tid == tid)
+        else {
+            return Err(KernelIpcError::TaskMissing);
+        };
+        record.liveness = DriverLiveness::Alive;
         Ok(())
     }
 
@@ -142,6 +170,7 @@ pub enum DeviceStatus {
     Discovered,
     DeferredNoMmioGrant,
     DeferredNoIrqRoute,
+    DeferredNoHardwareControl,
     Unsupported,
 }
 
@@ -149,6 +178,19 @@ pub enum DeviceStatus {
 pub struct MmioRange {
     pub base: u64,
     pub len: u64,
+}
+
+impl MmioRange {
+    pub fn new(base: u64, len: u64) -> Result<Self, KernelIpcError> {
+        if len == 0 || base.checked_add(len - 1).is_none() {
+            return Err(KernelIpcError::WrongObject);
+        }
+        Ok(Self { base, len })
+    }
+
+    pub fn contains_exact(&self, base: u64, len: u64) -> bool {
+        self.base == base && self.len == len
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +203,7 @@ pub struct DeviceRecord {
     pub driver_candidate: [u8; 32],
     pub driver_candidate_len: usize,
     pub status: DeviceStatus,
+    pub assigned_tid: Option<u64>,
 }
 
 impl DeviceRecord {
@@ -182,6 +225,7 @@ impl DeviceRecord {
             driver_candidate: [0; 32],
             driver_candidate_len: driver_candidate.len(),
             status,
+            assigned_tid: None,
         };
         record.compatible[..compatible.len()].copy_from_slice(compatible.as_bytes());
         record.driver_candidate[..driver_candidate.len()]
@@ -190,18 +234,18 @@ impl DeviceRecord {
     }
 
     pub fn compatible(&self) -> Option<&str> {
-        core::str::from_utf8(&self.compatible[..self.compatible_len]).ok()
+        bounded_str(&self.compatible, self.compatible_len)
     }
 
     pub fn driver_candidate(&self) -> Option<&str> {
-        core::str::from_utf8(&self.driver_candidate[..self.driver_candidate_len]).ok()
+        bounded_str(&self.driver_candidate, self.driver_candidate_len)
     }
 
     pub fn with_mmio(mut self, index: usize, base: u64, len: u64) -> Result<Self, KernelIpcError> {
-        if index >= self.mmio_ranges.len() || len == 0 {
+        if index >= self.mmio_ranges.len() {
             return Err(KernelIpcError::WrongObject);
         }
-        self.mmio_ranges[index] = Some(MmioRange { base, len });
+        self.mmio_ranges[index] = Some(MmioRange::new(base, len)?);
         Ok(self)
     }
 
@@ -212,6 +256,24 @@ impl DeviceRecord {
         self.irq_lines[index] = Some(line);
         Ok(self)
     }
+
+    pub fn assigned_to(mut self, tid: u64) -> Result<Self, KernelIpcError> {
+        if tid == 0 {
+            return Err(KernelIpcError::MissingRight);
+        }
+        self.assigned_tid = Some(tid);
+        Ok(self)
+    }
+
+    fn is_live_grantable(&self) -> bool {
+        matches!(self.status, DeviceStatus::Discovered)
+    }
+}
+
+fn bounded_str(bytes: &[u8], len: usize) -> Option<&str> {
+    bytes
+        .get(..len)
+        .and_then(|slice| core::str::from_utf8(slice).ok())
 }
 
 const MAX_DEVICES: usize = 32;
@@ -254,6 +316,57 @@ impl PlatformInventory {
 
     pub fn candidates_for(&self, class: DeviceClass) -> impl Iterator<Item = &DeviceRecord> {
         self.iter().filter(move |record| record.class == class)
+    }
+
+    fn assigned_device_for(&self, tid: u64) -> Option<&DeviceRecord> {
+        self.iter().find(|record| record.assigned_tid == Some(tid))
+    }
+
+    pub fn authorize_irq(&self, tid: u64, line: u16) -> Result<(), KernelIpcError> {
+        let device = self
+            .assigned_device_for(tid)
+            .ok_or(KernelIpcError::MissingRight)?;
+        if !device.is_live_grantable() {
+            return Err(KernelIpcError::MissingRight);
+        }
+        if device
+            .irq_lines
+            .iter()
+            .any(|irq| irq == &Some(u32::from(line)))
+        {
+            Ok(())
+        } else {
+            Err(KernelIpcError::MissingRight)
+        }
+    }
+
+    pub fn authorize_mmio(&self, tid: u64, base: u64, len: u64) -> Result<(), KernelIpcError> {
+        let device = self
+            .assigned_device_for(tid)
+            .ok_or(KernelIpcError::MissingRight)?;
+        if !device.is_live_grantable() {
+            return Err(KernelIpcError::MissingRight);
+        }
+        if device.mmio_ranges.iter().any(|range| {
+            range
+                .map(|range| range.contains_exact(base, len))
+                .unwrap_or(false)
+        }) {
+            Ok(())
+        } else {
+            Err(KernelIpcError::MissingRight)
+        }
+    }
+
+    pub fn authorize_dma(&self, tid: u64) -> Result<(), KernelIpcError> {
+        let device = self
+            .assigned_device_for(tid)
+            .ok_or(KernelIpcError::MissingRight)?;
+        if device.is_live_grantable() && !matches!(device.class, DeviceClass::Unknown) {
+            Ok(())
+        } else {
+            Err(KernelIpcError::MissingRight)
+        }
     }
 }
 
@@ -372,12 +485,39 @@ impl DriverService {
         &self.inventory
     }
 
+    pub fn inventory_mut(&mut self) -> &mut PlatformInventory {
+        &mut self.inventory
+    }
+
     pub fn handle(
         &mut self,
         runtime: &mut impl DriverControlOps,
         request: Message,
     ) -> Result<Message, KernelIpcError> {
-        let reply = handle_request(&mut self.registry, runtime, request)?;
+        let reply = handle_request_with_sender(
+            &mut self.registry,
+            &self.inventory,
+            runtime,
+            request,
+            None,
+        )?;
+        self.handled = self.handled.saturating_add(1);
+        Ok(reply)
+    }
+
+    pub fn handle_from_sender(
+        &mut self,
+        runtime: &mut impl DriverControlOps,
+        request: Message,
+        verified_sender_tid: u64,
+    ) -> Result<Message, KernelIpcError> {
+        let reply = handle_request_with_sender(
+            &mut self.registry,
+            &self.inventory,
+            runtime,
+            request,
+            Some(verified_sender_tid),
+        )?;
         self.handled = self.handled.saturating_add(1);
         Ok(reply)
     }
@@ -399,39 +539,82 @@ pub fn handle_request(
     runtime: &mut impl DriverControlOps,
     request: Message,
 ) -> Result<Message, KernelIpcError> {
+    handle_request_with_sender(registry, &PlatformInventory::new(), runtime, request, None)
+}
+
+pub fn handle_request_with_sender(
+    registry: &mut DriverRegistry,
+    inventory: &PlatformInventory,
+    runtime: &mut impl DriverControlOps,
+    request: Message,
+    verified_sender_tid: Option<u64>,
+) -> Result<Message, KernelIpcError> {
     let payload = request.as_slice();
+    let sender_tid = verified_sender_tid
+        .filter(|tid| *tid != 0)
+        .ok_or(KernelIpcError::MissingRight);
     match request.opcode {
         DRIVER_OP_REGISTER => {
-            let tid = read_u64(payload, 0)?;
+            let claimed_tid = read_u64(payload, 0)?;
+            let tid = verified_tid_or_reject_spoof(sender_tid?, claimed_tid)?;
             // Record in local registry first; then inform kernel runtime.
             registry.register(tid)?;
             runtime.register_driver(tid)?;
             ok_reply(DRIVER_OP_REGISTER, tid, None)
         }
         DRIVER_OP_GRANT_IRQ => {
-            let tid = read_u64(payload, 0)?;
-            let line = read_u64(payload, 8)? as u16;
+            let claimed_tid = read_u64(payload, 0)?;
+            let tid = verified_tid_or_reject_spoof(sender_tid?, claimed_tid)?;
+            let line = read_u16_checked(payload, 8)?;
+            inventory.authorize_irq(tid, line)?;
             let cap = runtime.mint_irq_cap(line)?;
             runtime.grant_driver_irq(tid, cap)?;
-            ok_reply(DRIVER_OP_GRANT_IRQ, line as u64, Some(cap))
+            ok_reply(DRIVER_OP_GRANT_IRQ, u64::from(line), Some(cap))
         }
         DRIVER_OP_GRANT_DMA => {
-            let tid = read_u64(payload, 0)?;
+            let claimed_tid = read_u64(payload, 0)?;
+            let tid = verified_tid_or_reject_spoof(sender_tid?, claimed_tid)?;
             let mem_cap = CapId(read_u64(payload, 8)?);
-            let offset = read_u64(payload, 16)? as usize;
-            let len = read_u64(payload, 24)? as usize;
+            if mem_cap.0 == 0 {
+                return Err(KernelIpcError::InvalidCapability);
+            }
+            let offset = read_usize_checked(payload, 16)?;
+            let len = read_usize_checked(payload, 24)?;
+            if len == 0 || offset.checked_add(len).is_none() {
+                return Err(KernelIpcError::WrongObject);
+            }
+            inventory.authorize_dma(tid)?;
             let cap = runtime.mint_dma_region_cap(mem_cap, offset, len)?;
             runtime.grant_driver_dma(tid, cap)?;
-            ok_reply(DRIVER_OP_GRANT_DMA, len as u64, Some(cap))
+            ok_reply(
+                DRIVER_OP_GRANT_DMA,
+                u64::try_from(len).map_err(|_| KernelIpcError::WrongObject)?,
+                Some(cap),
+            )
         }
         DRIVER_OP_RESTARTED => {
-            let tid = read_u64(payload, 0)?;
+            let claimed_tid = read_u64(payload, 0)?;
+            let tid = verified_tid_or_reject_spoof(sender_tid?, claimed_tid)?;
             let token = read_u64(payload, 8)?;
+            registry.note_restarted(tid)?;
             runtime.restart_task(tid, token)?;
             ok_reply(DRIVER_OP_RESTARTED, tid, None)
         }
         _ => Err(KernelIpcError::WrongObject),
     }
+}
+
+fn verified_tid_or_reject_spoof(
+    verified_sender_tid: u64,
+    claimed_tid: u64,
+) -> Result<u64, KernelIpcError> {
+    if verified_sender_tid == 0 {
+        return Err(KernelIpcError::MissingRight);
+    }
+    if claimed_tid != 0 && claimed_tid != verified_sender_tid {
+        return Err(KernelIpcError::MissingRight);
+    }
+    Ok(verified_sender_tid)
 }
 
 // ---------------------------------------------------------------------------
@@ -446,13 +629,13 @@ struct NoopDriverControl;
 #[cfg(not(test))]
 impl DriverControlOps for NoopDriverControl {
     fn register_driver(&mut self, _tid: u64) -> Result<(), KernelIpcError> {
-        Ok(())
+        Err(KernelIpcError::MissingRight)
     }
     fn mint_irq_cap(&mut self, _line: u16) -> Result<CapId, KernelIpcError> {
-        Ok(CapId(0))
+        Err(KernelIpcError::MissingRight)
     }
     fn grant_driver_irq(&mut self, _tid: u64, _cap: CapId) -> Result<(), KernelIpcError> {
-        Ok(())
+        Err(KernelIpcError::MissingRight)
     }
     fn mint_dma_region_cap(
         &mut self,
@@ -460,13 +643,13 @@ impl DriverControlOps for NoopDriverControl {
         _offset: usize,
         _len: usize,
     ) -> Result<CapId, KernelIpcError> {
-        Ok(CapId(0))
+        Err(KernelIpcError::MissingRight)
     }
     fn grant_driver_dma(&mut self, _tid: u64, _cap: CapId) -> Result<(), KernelIpcError> {
-        Ok(())
+        Err(KernelIpcError::MissingRight)
     }
     fn restart_task(&mut self, _tid: u64, _token: u64) -> Result<(), KernelIpcError> {
-        Ok(())
+        Err(KernelIpcError::MissingRight)
     }
 }
 
@@ -487,6 +670,7 @@ pub fn run() {
         let mut service = DriverService::new();
         let mut runtime = NoopDriverControl;
         yarm_user_rt::user_log!("DRIVER_MANAGER_READY");
+        yarm_user_rt::user_log!("DRIVER_MANAGER_HW_CONTROL_UNAVAILABLE");
         yarm_user_rt::user_log!("DRIVER_MANAGER_BLOCKING_RECV_LOOP");
 
         loop {
@@ -500,7 +684,7 @@ pub fn run() {
                         msg.opcode,
                         reply_cap.unwrap_or(u32::MAX)
                     );
-                    match service.handle(&mut runtime, msg) {
+                    match service.handle_from_sender(&mut runtime, msg, received.sender_tid) {
                         Ok(reply) => {
                             if let Some(cap) = reply_cap {
                                 // SAFETY: kernel validates reply capability rights/object.
@@ -509,6 +693,9 @@ pub fn run() {
                         }
                         Err(e) => {
                             yarm_user_rt::user_log!("DRIVER_MANAGER_HANDLE_ERR err={:?}", e);
+                            if matches!(e, KernelIpcError::MissingRight) {
+                                yarm_user_rt::user_log!("DRIVER_MANAGER_GRANT_DEFERRED_NO_CONTROL");
+                            }
                         }
                     }
                 }
@@ -534,12 +721,77 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
     #[cfg(feature = "legacy-tests")]
     use yarm::kernel::boot::Bootstrap;
     #[cfg(feature = "legacy-tests")]
     use yarm::std::thread;
     #[cfg(feature = "legacy-tests")]
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, pack_driver_pair};
+
+    #[derive(Debug)]
+    struct MockDriverControl {
+        next_irq_cap: CapId,
+        next_dma_cap: CapId,
+        registered: Cell<Option<u64>>,
+        irq_line: Cell<Option<u16>>,
+        irq_grant: Cell<Option<(u64, CapId)>>,
+        dma_request: Cell<Option<(CapId, usize, usize)>>,
+        dma_grant: Cell<Option<(u64, CapId)>>,
+        restarted: Cell<Option<(u64, u64)>>,
+    }
+
+    impl MockDriverControl {
+        const fn new() -> Self {
+            Self {
+                next_irq_cap: CapId(41),
+                next_dma_cap: CapId(42),
+                registered: Cell::new(None),
+                irq_line: Cell::new(None),
+                irq_grant: Cell::new(None),
+                dma_request: Cell::new(None),
+                dma_grant: Cell::new(None),
+                restarted: Cell::new(None),
+            }
+        }
+    }
+
+    impl DriverControlOps for MockDriverControl {
+        fn register_driver(&mut self, tid: u64) -> Result<(), KernelIpcError> {
+            self.registered.set(Some(tid));
+            Ok(())
+        }
+
+        fn mint_irq_cap(&mut self, line: u16) -> Result<CapId, KernelIpcError> {
+            self.irq_line.set(Some(line));
+            Ok(self.next_irq_cap)
+        }
+
+        fn grant_driver_irq(&mut self, tid: u64, cap: CapId) -> Result<(), KernelIpcError> {
+            self.irq_grant.set(Some((tid, cap)));
+            Ok(())
+        }
+
+        fn mint_dma_region_cap(
+            &mut self,
+            mem_cap: CapId,
+            offset: usize,
+            len: usize,
+        ) -> Result<CapId, KernelIpcError> {
+            self.dma_request.set(Some((mem_cap, offset, len)));
+            Ok(self.next_dma_cap)
+        }
+
+        fn grant_driver_dma(&mut self, tid: u64, cap: CapId) -> Result<(), KernelIpcError> {
+            self.dma_grant.set(Some((tid, cap)));
+            Ok(())
+        }
+
+        fn restart_task(&mut self, tid: u64, token: u64) -> Result<(), KernelIpcError> {
+            self.restarted.set(Some((tid, token)));
+            Ok(())
+        }
+    }
 
     #[cfg(feature = "legacy-tests")]
     fn run_with_large_stack<F>(f: F)
@@ -626,12 +878,270 @@ mod tests {
     #[test]
     fn registry_capacity_is_enforced() {
         let mut registry = DriverRegistry::new();
-        for i in 0..MAX_DRIVERS as u64 {
+        let max_drivers_u64 = u64::try_from(MAX_DRIVERS).unwrap();
+        for i in 1..=max_drivers_u64 {
             registry.register(i).expect("fill");
         }
         assert_eq!(registry.len(), MAX_DRIVERS);
-        let result = registry.register(MAX_DRIVERS as u64);
+        let result = registry.register(max_drivers_u64 + 1);
         assert!(result.is_err(), "should fail when table is full");
+    }
+
+    fn msg(opcode: u16, words: &[u64]) -> Message {
+        let mut payload = [0u8; 32];
+        for (index, word) in words.iter().enumerate() {
+            let start = index * 8;
+            payload[start..start + 8].copy_from_slice(&word.to_le_bytes());
+        }
+        Message::with_header(0, opcode, 0, None, &payload[..words.len() * 8]).unwrap()
+    }
+
+    fn pl011_inventory(tid: u64, status: DeviceStatus) -> PlatformInventory {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new("arm,pl011", DeviceClass::Uart, "pl011_uart", status)
+                    .unwrap()
+                    .with_mmio(0, 0x107d_0010_0000, 0x1000)
+                    .unwrap()
+                    .with_irq(0, 121)
+                    .unwrap()
+                    .assigned_to(tid)
+                    .unwrap(),
+            )
+            .unwrap();
+        inventory
+    }
+
+    #[test]
+    fn privileged_requests_require_verified_sender_and_reject_spoofed_tid() {
+        let mut registry = DriverRegistry::new();
+        let inventory = PlatformInventory::new();
+        let mut runtime = MockDriverControl::new();
+        let register = msg(DRIVER_OP_REGISTER, &[7]);
+        assert_eq!(
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, register, None),
+            Err(KernelIpcError::MissingRight)
+        );
+
+        let forged = msg(DRIVER_OP_REGISTER, &[7]);
+        assert_eq!(
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, forged, Some(8)),
+            Err(KernelIpcError::MissingRight)
+        );
+
+        let diagnostic_zero = msg(DRIVER_OP_REGISTER, &[0]);
+        let reply = handle_request_with_sender(
+            &mut registry,
+            &inventory,
+            &mut runtime,
+            diagnostic_zero,
+            Some(8),
+        )
+        .expect("register verified sender");
+        assert_eq!(reply.opcode, DRIVER_OP_REGISTER);
+        assert_eq!(registry.get(8).map(|record| record.tid), Some(8));
+        assert_eq!(runtime.registered.get(), Some(8));
+    }
+
+    #[test]
+    fn irq_line_overflow_is_rejected_instead_of_truncated() {
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut runtime = MockDriverControl::new();
+        let overflow_irq = msg(DRIVER_OP_GRANT_IRQ, &[7, 0x1_0005]);
+        assert_eq!(
+            handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                overflow_irq,
+                Some(7)
+            ),
+            Err(KernelIpcError::WrongObject)
+        );
+        assert_eq!(runtime.irq_line.get(), None);
+    }
+
+    #[test]
+    fn valid_irq_boundary_reaches_mock_control_without_dummy_zero_cap() {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "test,max-irq",
+                    DeviceClass::IrqMux,
+                    "irqmux_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_irq(0, u32::from(u16::MAX))
+                .unwrap()
+                .assigned_to(9)
+                .unwrap(),
+            )
+            .unwrap();
+        let mut registry = DriverRegistry::new();
+        registry.register(9).unwrap();
+        let mut runtime = MockDriverControl::new();
+        let request = msg(DRIVER_OP_GRANT_IRQ, &[9, u64::from(u16::MAX)]);
+        let reply =
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, request, Some(9))
+                .expect("max u16 irq is valid");
+        assert_eq!(reply.transferred_cap().map(|cap| cap.0), Some(41));
+        assert_eq!(runtime.irq_line.get(), Some(u16::MAX));
+    }
+
+    #[test]
+    fn dma_bounds_and_cap_ids_are_checked() {
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut runtime = MockDriverControl::new();
+        let zero_cap = msg(DRIVER_OP_GRANT_DMA, &[7, 0, 0, 4096]);
+        assert_eq!(
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, zero_cap, Some(7)),
+            Err(KernelIpcError::InvalidCapability)
+        );
+        let zero_len = msg(DRIVER_OP_GRANT_DMA, &[7, 10, 0, 0]);
+        assert_eq!(
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, zero_len, Some(7)),
+            Err(KernelIpcError::WrongObject)
+        );
+
+        let valid = msg(DRIVER_OP_GRANT_DMA, &[7, 10, 0, 4096]);
+        let reply =
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, valid, Some(7))
+                .expect("valid dma request");
+        assert_eq!(reply.transferred_cap().map(|cap| cap.0), Some(42));
+        assert_eq!(runtime.dma_request.get(), Some((CapId(10), 0, 4096)));
+    }
+
+    #[test]
+    fn zero_cap_success_from_runtime_is_rejected() {
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut runtime = MockDriverControl::new();
+        runtime.next_irq_cap = CapId(0);
+        let request = msg(DRIVER_OP_GRANT_IRQ, &[7, 121]);
+        assert_eq!(
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, request, Some(7)),
+            Err(KernelIpcError::InvalidCapability)
+        );
+    }
+
+    #[test]
+    fn inventory_authorizes_only_assigned_live_resources() {
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        registry.register(8).unwrap();
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut runtime = MockDriverControl::new();
+
+        let wrong_driver = msg(DRIVER_OP_GRANT_IRQ, &[8, 121]);
+        assert_eq!(
+            handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                wrong_driver,
+                Some(8)
+            ),
+            Err(KernelIpcError::MissingRight)
+        );
+
+        let wrong_irq = msg(DRIVER_OP_GRANT_IRQ, &[7, 122]);
+        assert_eq!(
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, wrong_irq, Some(7)),
+            Err(KernelIpcError::MissingRight)
+        );
+    }
+
+    #[test]
+    fn deferred_rp1_mailbox_and_unknown_devices_do_not_authorize_hardware() {
+        let mut inventory = PlatformInventory::new();
+        for (tid, compatible, class, candidate, status) in [
+            (
+                10,
+                "raspberrypi,rp1-gpio",
+                DeviceClass::Gpio,
+                "rp1_gpio_srv",
+                DeviceStatus::DeferredNoMmioGrant,
+            ),
+            (
+                11,
+                "raspberrypi,firmware",
+                DeviceClass::Mailbox,
+                "rpi_firmware_srv",
+                DeviceStatus::DeferredNoMmioGrant,
+            ),
+            (
+                12,
+                "unknown,device",
+                DeviceClass::Unknown,
+                "unknown",
+                DeviceStatus::Unsupported,
+            ),
+        ] {
+            inventory
+                .add(
+                    DeviceRecord::new(compatible, class, candidate, status)
+                        .unwrap()
+                        .with_irq(0, 1)
+                        .unwrap()
+                        .assigned_to(tid)
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            inventory.authorize_irq(10, 1),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(
+            inventory.authorize_irq(11, 1),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(
+            inventory.authorize_dma(12),
+            Err(KernelIpcError::MissingRight)
+        );
+    }
+
+    #[test]
+    fn mmio_range_overflow_and_authorization_are_checked() {
+        assert!(MmioRange::new(u64::MAX, 2).is_err());
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        assert_eq!(
+            inventory.authorize_mmio(7, 0x107d_0010_0000, 0x1000),
+            Ok(())
+        );
+        assert_eq!(
+            inventory.authorize_mmio(7, 0x107d_0010_0000, 0x2000),
+            Err(KernelIpcError::MissingRight)
+        );
+    }
+
+    #[test]
+    fn restart_updates_existing_verified_record_without_duplicate() {
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let inventory = PlatformInventory::new();
+        let mut runtime = MockDriverControl::new();
+        let request = msg(DRIVER_OP_RESTARTED, &[7, 0xabc]);
+        handle_request_with_sender(&mut registry, &inventory, &mut runtime, request, Some(7))
+            .expect("restart existing");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(runtime.restarted.get(), Some((7, 0xabc)));
+
+        let missing = msg(DRIVER_OP_RESTARTED, &[8, 0xabc]);
+        assert_eq!(
+            handle_request_with_sender(&mut registry, &inventory, &mut runtime, missing, Some(8)),
+            Err(KernelIpcError::TaskMissing)
+        );
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]
@@ -734,5 +1244,23 @@ mod tests {
                 .with_mmio(0, 0x1000, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn corrupted_string_lengths_do_not_panic() {
+        let mut record = DeviceRecord::new(
+            "arm,pl011",
+            DeviceClass::Uart,
+            "pl011_uart",
+            DeviceStatus::Discovered,
+        )
+        .unwrap();
+        assert_eq!(record.compatible(), Some("arm,pl011"));
+        assert_eq!(record.driver_candidate(), Some("pl011_uart"));
+
+        record.compatible_len = usize::MAX;
+        record.driver_candidate_len = usize::MAX;
+        assert_eq!(record.compatible(), None);
+        assert_eq!(record.driver_candidate(), None);
     }
 }

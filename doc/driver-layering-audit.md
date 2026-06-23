@@ -97,7 +97,10 @@ mocks.
   `GRANT_DMA` / `RESTARTED`. It now also has an inert userspace-only
   `PlatformInventory` / `DeviceRecord` model for future RPi5 candidates
   (`Uart`, `Mailbox`, `Gpio`, `IrqMux`, `Block`, `Unknown`) with compatible
-  strings, MMIO ranges, IRQs, candidate driver names, and deferred status. It
+  strings, MMIO ranges, IRQs, candidate driver names, and deferred status. The DRS-1B hardening makes privileged requests fail closed: verified
+  `sender_tid` metadata is required, payload TIDs are diagnostic only, inventory
+  records authorize IRQ/MMIO/DMA requests before any runtime call, and production
+  no-op hardware control returns errors instead of dummy `CapId(0)` grants. It
   does not parse the DTB and does not spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
 
