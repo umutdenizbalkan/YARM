@@ -155,11 +155,22 @@ pub fn handle_trap_entry_shared(
     // events (page faults, timer/external IRQs) never enter the seam.
     if matches!(decode_trap_context(context), TrapEvent::Syscall) {
         if let Some(frame) = frame.as_deref_mut() {
+            // Stage 160C: import the decoded syscall ABI into the frame BEFORE the
+            // split dispatch inspects it (AArch64-only, proof-knob-gated; no-op on
+            // x86_64/riscv64). Without this the AArch64 split dispatch sees nr=0
+            // and always falls back (Stage 160B).
+            pre_split_import_syscall_abi(frame);
             if let Some(result) =
                 crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
             {
                 match result {
                     Ok(()) => {
+                        // Stage 160C: a HANDLED split syscall must return to
+                        // userspace via the arch syscall-return ABI (export results
+                        // + advance past the trap instruction). AArch64-only and
+                        // proof-knob-gated; no-op on x86_64/riscv64, whose trap
+                        // return already does this from the ret lanes.
+                        finalize_split_handled_syscall(shared, cpu, frame);
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result=ok",
                             frame.syscall_num(),
@@ -186,6 +197,11 @@ pub fn handle_trap_entry_shared(
                     // path retains the genuine task-fault semantics.
                     Err(TrapHandleError::Syscall(e)) => {
                         frame.set_err(e.code());
+                        // Stage 160C: same arch syscall-return ABI as the success
+                        // arm — the error code must reach userspace (AArch64 via the
+                        // user GPR lanes) and the SVC must advance (this is a
+                        // completed syscall, not a WouldBlock retry).
+                        finalize_split_handled_syscall(shared, cpu, frame);
                         crate::yarm_log!(
                             "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result=handled_err code={}",
                             frame.syscall_num(),
@@ -491,6 +507,43 @@ pub fn dispatch_trap_entry_with_shared_kernel(
     frame: Option<&mut TrapFrame>,
 ) -> Result<(), TrapHandleError> {
     handle_trap_entry_shared(shared, cpu, context, frame)
+}
+
+// Stage 160C: AArch64 trap-ABI bracketing hooks for the pre-global-lock split
+// dispatch. Gated behind the IPC recv oracle proof knob so the newly-enabled
+// AArch64 split-dispatch path is exercised ONLY during oracle proof validation;
+// a normal boot leaves the knob off, the import is skipped, the split dispatch
+// keeps seeing `syscall_num=0` and falls back to the global path exactly as
+// before (byte-identical). x86_64 / riscv64 are no-ops: x86_64's trap stub
+// already populates the decoded ABI and returns results via the ret lanes, and
+// riscv64 does not enter `handle_trap_entry_shared`.
+#[cfg(target_arch = "aarch64")]
+fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {
+    if crate::kernel::boot::ipc_recv_oracle_proof_enabled() {
+        super::aarch64::trap::split_import_syscall_abi(frame);
+    }
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}
+
+#[cfg(target_arch = "aarch64")]
+fn finalize_split_handled_syscall(
+    shared: &crate::runtime::SharedKernel,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) {
+    if crate::kernel::boot::ipc_recv_oracle_proof_enabled() {
+        let _ = shared.with_cpu(cpu, |kernel| {
+            super::aarch64::trap::split_finalize_handled_syscall(kernel, cpu, frame)
+        });
+    }
+}
+#[cfg(not(target_arch = "aarch64"))]
+fn finalize_split_handled_syscall(
+    _shared: &crate::runtime::SharedKernel,
+    _cpu: CpuId,
+    _frame: &mut TrapFrame,
+) {
 }
 
 #[cfg(not(any(

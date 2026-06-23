@@ -3047,6 +3047,69 @@ is scoped as a follow-up: bracket the shared dispatch on AArch64 with import
 full syscall ABI exactly as the global path does. x86_64 stays green and untouched;
 RPi5 boot and the global-lock fallback are untouched.
 
+#### 5.1.9.2 Stage 160C — AArch64 trap-ABI bracketing for split dispatch
+
+Implements the follow-up scoped in 5.1.9.1: bracket the pre-global-lock split
+dispatch with the AArch64 syscall ABI so split-eligible syscalls are both
+*entered* and *returned* correctly.
+
+**Import (before split).** `handle_trap_entry_shared` now calls an arch hook
+`pre_split_import_syscall_abi(frame)` immediately before
+`try_split_dispatch_into_frame`. On AArch64 it runs `split_import_syscall_abi`,
+which reuses the existing `import_syscall_abi_from_user_gprs` (x8→`syscall_num`,
+x0–x5→`args`) and logs `AARCH64_SPLIT_ABI_IMPORT_DONE nr=…`. The split dispatch
+now sees the real NR (e.g. `nr=2`) instead of `0`.
+
+**Export + SVC-advance (after a handled split).** Both the `Ok` and the
+handled-error arms of the split-dispatch match call
+`finalize_split_handled_syscall(shared, cpu, frame)`. On AArch64 it runs
+`split_finalize_handled_syscall` under `with_cpu`, mirroring the global
+non-task-switched syscall-return path: set the resume PC to
+`last_vector_raw_elr() + 4` (the **same** formula the proven global
+`IpcRecv`-success path uses), `set_thread_user_context`,
+`restore_arch_thread_state(syscall_return = true)`, then
+`export_syscall_result_to_user_gprs`. It always advances +4 because the split
+path returns `Some` ONLY for a *completed* syscall (success or a definitive error
+such as the rollback `InvalidArgs`); `WouldBlock` (the only retry case) returns
+`None` and stays on the global path with its own retry-PC policy. Diagnostics:
+`AARCH64_SPLIT_SVC_ADVANCE_DONE pc=…`, `AARCH64_SPLIT_ABI_EXPORT_DONE`.
+
+**Fallback path unchanged.** When the split dispatch returns `None`, the syscall
+falls through to the unchanged global path (which re-imports the ABI
+idempotently, dispatches, exports, and applies its own PC policy). No finalize
+runs on the fallback path.
+
+**Gated for safe incremental validation.** Both hooks are gated behind the IPC
+recv oracle proof knob (`ipc_recv_oracle_proof_enabled()`). With the knob OFF
+(every normal boot), the import is skipped, so the AArch64 split dispatch keeps
+seeing `syscall_num=0` and falls back exactly as before — **normal AArch64 boots
+are byte-identical**, eliminating the risk of routing real recvs through the
+newly-enabled path before it is QEMU-validated. With the knob ON (the oracle
+proof boot) the AArch64 split path is fully active. x86_64 / riscv64 hooks are
+compile-time no-ops: x86_64 already populates the decoded ABI and returns via the
+ret lanes, and riscv64 does not enter `handle_trap_entry_shared`. Un-gating for
+general AArch64 split-dispatch is a follow-up once the maintainer confirms the
+proof boot.
+
+**Constraints.** No IPC/cap seam moved (the fix is purely in the trap-entry/arch
+layer; it reuses the existing AArch64 import/export helpers); no ABI change
+(`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`); RPi5 boot untouched; the x86_64 D6
+proof hook in `trap_entry.rs` is intact and x86_64 behavior is unchanged. Guards:
+`stage160c_imports_abi_before_split_dispatch`,
+`stage160c_exports_and_advances_on_handled_split`,
+`stage160c_bracketing_gated_by_proof_knob`,
+`stage160c_non_aarch64_hooks_are_noops`,
+`stage160c_no_seam_moved_counts_and_x86_intact`.
+
+**Expected after Stage 160C (AArch64 proof boot).** `YARM_SPLIT_DISPATCH_ENTER
+nr=2 → RECV_CONSIDER → RECV_CALL → YARM_SPLIT_RECV_PROBE step=enter →
+YARM_RECV_CORE_PLAN plan=UserPlainV2Eligible → YARM_RECV_CORE_ADAPTER
+kind=user_plain_v2 → IPC_RECV_V2_META_QUEUED_SPLIT_OK`, then for rollback
+`IPC_RECV_V2_ROLLBACK_OK`, with `AARCH64_SPLIT_ABI_IMPORT_DONE` /
+`AARCH64_SPLIT_SVC_ADVANCE_DONE` / `AARCH64_SPLIT_ABI_EXPORT_DONE` bracketing each,
+and the userspace `IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE` /
+`IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE`. (QEMU is run by the maintainer.)
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

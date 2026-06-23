@@ -42526,3 +42526,129 @@ mod stage160b_aarch64_recv_split_dispatch_audit {
         );
     }
 }
+
+// Stage 160C — AArch64 trap-ABI bracketing for split dispatch. The shared trap
+// entry imports the decoded syscall ABI before the split dispatch and, for a
+// HANDLED split syscall, exports the result + advances past the SVC, mirroring
+// the global path. Gated behind the proof knob so normal boots are unchanged.
+mod stage160c_aarch64_trap_abi_bracketing {
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+
+    // 1. The shared trap entry imports the syscall ABI BEFORE the split dispatch.
+    #[test]
+    fn stage160c_imports_abi_before_split_dispatch() {
+        let fn_start = TRAP_ENTRY_SRC
+            .find("pub fn handle_trap_entry_shared")
+            .expect("handle_trap_entry_shared");
+        let body = &TRAP_ENTRY_SRC[fn_start..];
+        let import_pos = body
+            .find("pre_split_import_syscall_abi(frame)")
+            .expect("pre-split import hook must be called");
+        let dispatch_pos = body
+            .find("try_split_dispatch_into_frame(shared, cpu, frame)")
+            .expect("split dispatch call");
+        assert!(
+            import_pos < dispatch_pos,
+            "the syscall-ABI import must precede the split dispatch"
+        );
+        // The AArch64 import reuses the existing global import helper.
+        assert!(
+            AARCH64_TRAP_SRC.contains("fn split_import_syscall_abi(")
+                && AARCH64_TRAP_SRC.contains("import_syscall_abi_from_user_gprs(frame)")
+                && AARCH64_TRAP_SRC.contains("AARCH64_SPLIT_ABI_IMPORT_DONE"),
+            "AArch64 split import must reuse import_syscall_abi_from_user_gprs and log"
+        );
+    }
+
+    // 2. A handled split syscall exports results to user GPRs and advances the
+    //    SVC PC on BOTH the success and the handled-error arms.
+    #[test]
+    fn stage160c_exports_and_advances_on_handled_split() {
+        assert_eq!(
+            TRAP_ENTRY_SRC
+                .matches("finalize_split_handled_syscall(shared, cpu, frame)")
+                .count(),
+            2,
+            "finalize must run on both the Ok and handled-error split arms"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("fn split_finalize_handled_syscall(")
+                && AARCH64_TRAP_SRC.contains("export_syscall_result_to_user_gprs(frame)")
+                && AARCH64_TRAP_SRC.contains("AARCH64_SPLIT_ABI_EXPORT_DONE")
+                && AARCH64_TRAP_SRC.contains("AARCH64_SPLIT_SVC_ADVANCE_DONE"),
+            "AArch64 finalize must export results and advance the SVC PC, with diagnostics"
+        );
+        // The advance uses the same resume PC as the proven global recv-success
+        // path (raw vector ELR + 4).
+        assert!(
+            AARCH64_TRAP_SRC.contains("last_vector_raw_elr().wrapping_add(4)"),
+            "split SVC advance must reuse the global recv-success resume PC (raw + 4)"
+        );
+    }
+
+    // 3. The bracketing is gated behind the proof knob so normal boots are
+    //    byte-identical (import skipped → split sees nr=0 → unchanged fallback).
+    #[test]
+    fn stage160c_bracketing_gated_by_proof_knob() {
+        for hook in &[
+            "fn pre_split_import_syscall_abi(frame: &mut TrapFrame) {",
+            "fn finalize_split_handled_syscall(",
+        ] {
+            let pos = TRAP_ENTRY_SRC
+                .find(hook)
+                .unwrap_or_else(|| panic!("hook {hook} must be defined"));
+            let end = (pos + 600).min(TRAP_ENTRY_SRC.len());
+            let body = &TRAP_ENTRY_SRC[pos..end];
+            assert!(
+                body.contains("ipc_recv_oracle_proof_enabled()"),
+                "hook {hook} must be gated behind the proof knob"
+            );
+        }
+    }
+
+    // 4. x86_64 / riscv64 hooks are no-ops (their trap return is unchanged).
+    #[test]
+    fn stage160c_non_aarch64_hooks_are_noops() {
+        assert!(
+            TRAP_ENTRY_SRC.contains(
+                "#[cfg(not(target_arch = \"aarch64\"))]\nfn pre_split_import_syscall_abi(_frame: &mut TrapFrame) {}"
+            ),
+            "non-aarch64 pre-split import must be a no-op"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("#[cfg(not(target_arch = \"aarch64\"))]"),
+            "non-aarch64 finalize must be cfg-gated to a no-op"
+        );
+    }
+
+    // 5. No IPC/cap seam moved; counts unchanged; x86_64 D6/CR3/PF markers remain.
+    #[test]
+    fn stage160c_no_seam_moved_counts_and_x86_intact() {
+        for def in &[
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_endpoint_split_recv(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts must be unchanged"
+        );
+        // The x86_64 D6 proof hook lives in the same trap-entry file I edited; it
+        // must remain present and untouched (gated, x86_64-only).
+        assert!(
+            TRAP_ENTRY_SRC.contains("maybe_run_d6_controlled_switch_proof")
+                && TRAP_ENTRY_SRC.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "x86_64 D6 proof hook in trap_entry.rs must remain intact"
+        );
+        let _ = X86_BOOT_SRC;
+    }
+}
