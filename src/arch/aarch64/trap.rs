@@ -176,6 +176,60 @@ fn export_syscall_result_to_user_gprs(frame: &mut TrapFrame) {
     }
 }
 
+/// Stage 160C: AArch64 trap-ABI bracketing for the pre-global-lock split
+/// dispatch — IMPORT half. Decodes the syscall ABI (x8 → `syscall_num`,
+/// x0–x5 → `args[]`) from the user GPRs into the `TrapFrame` *before* the split
+/// dispatcher inspects it. Without this, the AArch64 vector handler hands the
+/// shared trap entry a frame whose decoded `syscall_num`/`args` are still zero
+/// (they are normally populated by `import_syscall_abi_from_user_gprs` only
+/// inside the global handler, which runs *after* the split dispatch), so every
+/// split-eligible syscall was rejected at the NR gate (`nr=0`) and fell back to
+/// the global `legacy_full_path` (Stage 160B diagnosis).
+///
+/// Reuses the exact same import helper the global path uses, so the split path
+/// sees byte-identical decoded ABI.
+pub(crate) fn split_import_syscall_abi(frame: &mut TrapFrame) {
+    import_syscall_abi_from_user_gprs(frame);
+    crate::yarm_log!("AARCH64_SPLIT_ABI_IMPORT_DONE nr={}", frame.syscall_num());
+}
+
+/// Stage 160C: AArch64 trap-ABI bracketing — EXPORT + SVC-advance half. Runs
+/// only when the split dispatcher actually HANDLED the syscall (returned
+/// `Some`), to return its result to userspace exactly like the global path does
+/// for a non-task-switched syscall.
+///
+/// The split path returns `Some` ONLY for a *completed* syscall — a successful
+/// delivery or a definitive error (e.g. the recv-v2 queued-split rollback's
+/// `InvalidArgs`). `WouldBlock` (the only retry case) returns `None` and stays on
+/// the global path, which keeps its own block-and-retry PC policy. A completed
+/// syscall therefore ALWAYS advances past the `SVC`, using the SAME resume PC the
+/// proven global `IpcRecv`-success path uses (`last_vector_raw_elr() + 4`). The
+/// export + `set_thread_user_context` + `restore_arch_thread_state` sequence and
+/// ordering mirror the global non-task-switched syscall-return path
+/// (`handle_trap_entry_with_fault_bookkeeping_mode`). The split path never
+/// switches tasks, so `task_switched == false` always holds here.
+pub(crate) fn split_finalize_handled_syscall(
+    kernel: &mut KernelState,
+    cpu: CpuId,
+    frame: &mut TrapFrame,
+) -> Result<(), TrapHandleError> {
+    let resume_pc = crate::arch::aarch64::boot::last_vector_raw_elr().wrapping_add(4) as usize;
+    frame.set_saved_pc(resume_pc);
+    if let Some(tid) = kernel.current_tid() {
+        let mut ctx = frame.capture_user_context();
+        ctx.instruction_ptr = crate::kernel::vm::VirtAddr(resume_pc as u64);
+        let _ = kernel.set_thread_user_context(tid, ctx);
+    }
+    crate::yarm_log!(
+        "AARCH64_SPLIT_SVC_ADVANCE_DONE pc=0x{:016x}",
+        resume_pc as u64
+    );
+    restore_arch_thread_state(kernel, cpu, Some(frame), true)?;
+    export_syscall_result_to_user_gprs(frame);
+    crate::yarm_log!("AARCH64_SPLIT_ABI_EXPORT_DONE");
+    Ok(())
+}
+
 pub fn decode_trap_context(context: Aarch64TrapContext) -> TrapEvent {
     if context.is_timer_irq {
         return TrapEvent::TimerInterrupt;
