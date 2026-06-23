@@ -42285,7 +42285,7 @@ mod stage159bcd_ipc_recv_proof_workload {
             "deferred sender-wake must NOT emit a DONE marker (no fake)"
         );
         assert!(
-            ORACLE_SCRIPT.contains("deferred"),
+            ORACLE_SCRIPT.contains("DEFERRED"),
             "oracle script must report sender-wake as deferred"
         );
         // The minimal undersized-payload recv wrapper exists for the rollback
@@ -42783,6 +42783,131 @@ mod stage160d_aarch64_split_error_export_parity {
         assert!(
             hook.contains("ipc_recv_oracle_proof_enabled()"),
             "the finalize hook must stay proof-knob-gated"
+        );
+    }
+}
+
+// Stage 161 — deterministic sender-wake oracle proof. The marker
+// IPC_RECV_V2_SENDER_WAKE_ORDER_OK requires a blocked sender-waiter present when
+// the receiver drains; a pure userspace workload cannot create+observe that
+// deterministically on a multi-CPU boot, so sender-wake stays DEFERRED (not
+// faked). These guards pin the deferral and the unchanged queued-split/rollback
+// proofs.
+mod stage161_sender_wake_deferred {
+    const INIT_SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const ORACLE_SCRIPT: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const AARCH64_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const CP_CARGO: &str = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
+
+    // 1. Sender-wake is deferred, NOT faked: the workload logs a DEFERRED marker
+    //    and never emits the userspace sequence marker or the kernel marker.
+    #[test]
+    fn stage161_sender_wake_deferred_not_faked() {
+        assert!(
+            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED"),
+            "workload must log sender-wake as DEFERRED"
+        );
+        assert!(
+            !INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "workload must NOT emit the sender-wake sequence marker while deferred"
+        );
+        assert!(
+            !INIT_SERVICE_SRC.contains("user_log!(\"IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "workload must NOT fake the kernel sender-wake marker"
+        );
+        // The kernel sender-wake marker is emitted by the real IPC path only.
+        assert!(
+            SYSCALL_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "kernel sender-wake marker must be emitted by the real split recv path"
+        );
+    }
+
+    // 2. The sender-wake requirement is default-off and, when requested, requires
+    //    BOTH the kernel marker and the userspace sequence marker (so the deferred
+    //    state fails by design rather than silently passing).
+    #[test]
+    fn stage161_oracle_sender_wake_requires_both_when_requested() {
+        assert!(
+            ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_SENDER_WAKE:-0}"),
+            "sender-wake requirement must default to off"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("proof_require \"sender-wake\" \"IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE\" \"IPC_RECV_V2_SENDER_WAKE_ORDER_OK\""),
+            "sender-wake must require both the sequence and kernel markers when enabled"
+        );
+        // proof_require always needs the userspace sequence marker first, so the
+        // deferred state (never emitted) fails by design rather than passing.
+        assert!(
+            ORACLE_SCRIPT.contains("sequence marker absent"),
+            "a missing sequence marker must be a hard failure (not silently passed)"
+        );
+    }
+
+    // 3. Queued-split + rollback proofs remain required when their env vars are
+    //    set (unchanged by this stage).
+    #[test]
+    fn stage161_queued_split_and_rollback_still_required() {
+        assert!(
+            ORACLE_SCRIPT.contains("proof_require \"queued-split\" \"IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE\" \"IPC_RECV_V2_META_QUEUED_SPLIT_OK\""),
+            "queued-split requirement must remain"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("proof_require \"rollback\" \"IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE\" \"IPC_RECV_V2_ROLLBACK_OK\""),
+            "rollback requirement must remain"
+        );
+    }
+
+    // 4. The sender-wake env var (like the other proof env vars) implies the
+    //    yarm.ipc_recv_proof boot knob, and basic mode stays unchanged.
+    #[test]
+    fn stage161_env_implies_boot_knob_and_basic_unchanged() {
+        assert!(
+            ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_SENDER_WAKE\" == \"1\"")
+                && ORACLE_SCRIPT.contains("export IPC_RECV_PROOF=1"),
+            "any proof env var (incl. sender-wake) must imply the boot knob"
+        );
+        for (arch, src) in &[("x86_64", X86_SMOKE_SRC), ("aarch64", AARCH64_SMOKE_SRC)] {
+            assert!(
+                src.contains("yarm.ipc_recv_proof=1"),
+                "{arch} core smoke must append the boot knob when IPC_RECV_PROOF=1"
+            );
+        }
+        assert!(
+            ORACLE_SCRIPT.contains("ORACLE_MODE:-basic"),
+            "basic mode must remain unchanged"
+        );
+    }
+
+    // 5. No new service binary (no normal manifest pollution); the proof still
+    //    rides init; no IPC/cap seam moved; counts unchanged.
+    #[test]
+    fn stage161_no_manifest_pollution_no_seam_moved_counts() {
+        for forbidden in &["sender_wake_srv", "ipc_recv_proof", "oracle_proof"] {
+            assert!(
+                !CP_CARGO.contains(forbidden),
+                "no dedicated proof/sender-wake service binary may be added ({forbidden})"
+            );
+        }
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts must be unchanged"
         );
     }
 }

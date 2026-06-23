@@ -3171,6 +3171,74 @@ Guards: `stage160d_split_finalize_mirrors_global_export_order`,
 `IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE` present — alongside the queued-split
 markers and with no fatal trap. (QEMU is run by the maintainer.)
 
+#### 5.1.9.4 Stage 161 — deterministic sender-wake oracle proof (DEFERRED, not faked)
+
+**Stage 160D accepted:** the cross-arch queued-split + rollback proof is complete.
+x86_64 and AArch64 both prove `IPC_RECV_V2_META_QUEUED_SPLIT_OK` +
+`IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE` and `IPC_RECV_V2_ROLLBACK_OK` +
+`IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE`, with no fatal trap. `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`
+is the only remaining oracle marker.
+
+**Trigger requirement.** `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` fires only when
+`ipc_try_recv_queued_with_cap_transfer` returns `ReceivedWithSenderWake` — i.e. a
+sender is **blocked as a waiter** (queue full + a *timed/blocking* send) at the
+instant the receiver drains. The sender must already be in the endpoint
+sender-waiter list before the drain.
+
+**Why a pure userspace workload cannot do this deterministically (the Stage 161
+blocker).** Stage 161's scope is "workload/oracle coverage only", preferring an
+existing spawn pattern over broad thread infrastructure. Within that scope it is
+not achievable, for several independent reasons:
+
+* The userspace `ipc_send` is **non-blocking** (`send_timeout_ticks == 0` →
+  `WouldBlock` on a full queue, so the sender never becomes a waiter). Creating a
+  waiter needs a *timed/blocking* send wrapper, which does not exist.
+* There is **no userspace-observable "a sender is a waiter on endpoint E" signal**
+  and **no userspace CPU-affinity control**.
+* The proof runs **after the secondary CPUs are released**
+  (`bootstrap_first_user_task` only *enqueues* init;
+  `release_secondary_cpus_after_bootstrap()` runs before the scheduler dispatches
+  init), and a spawned thread is placed by `enqueue_balanced` on the least-loaded
+  CPU — so on AArch64 `-smp 2` a spawned sender thread runs concurrently on CPU1
+  and can drain-race the receiver. Without an observable or affinity pin, the
+  receiver cannot deterministically drain *after* the sender has blocked; it can
+  only be made to *sometimes* coincide (a timing race), which the stage forbids.
+
+On x86_64 `-smp 1` a single-CPU scheduler hand-off would be deterministic, but the
+acceptance requires BOTH arches, and shipping that x86-only path still needs the
+unvalidatable timed-send + spawn-thread + stack infrastructure. So sender-wake is
+kept **DEFERRED, not faked**: the workload logs
+`IPC_RECV_PROOF_SENDER_WAKE_DEFERRED reason=needs_deterministic_blocked_sender_multicpu`
+and never emits `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; the kernel marker is
+never faked. The oracle's `YARM_IPC_RECV_PROOF_SENDER_WAKE=1` requirement remains
+default-off and, when set, requires BOTH
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` and `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`
+— so it fails by design (sequence marker absent) until the infrastructure lands.
+Do NOT enable that knob before then. Queued-split + rollback remain green and
+required when their env vars are set. Guards: `stage161_*`.
+
+**Proposed Stage 162 (minimal proof-gated infrastructure for determinism).** Add,
+all gated behind `yarm.ipc_recv_proof=1`:
+
+1. a timed blocking-send user-rt wrapper (`ipc_send_with_timeout`) so the sender
+   genuinely blocks and becomes a real waiter;
+2. a minimal `spawn_thread` user-rt wrapper + a small fixed proof stack;
+3. a **proof-gated CPU-affinity pin** so the spawned proof sender thread is
+   enqueued on init's CPU (`enqueue_on(cpu)` instead of `enqueue_balanced`),
+   giving a single-CPU `init → sender → init` hand-off that is deterministic on
+   both `-smp 1` and `-smp 2`.
+
+Then the deterministic sequence is: init fills the loopback endpoint to capacity →
+spawns the (CPU-pinned) sender thread → `yield`s so the sender runs and **blocks**
+on the full queue (real waiter) → init `recv-v2` drains one →
+`ReceivedWithSenderWake` → `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` → init observes the
+sender made progress and emits `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`. The
+phase markers requested for Stage 161 (`..._BEGIN`, `..._SETUP_*`,
+`..._SENDER_BLOCKED`, `..._RECV_RET`, `..._SENDER_DONE`, `..._SEQUENCE_DONE`)
+belong to that workload. This keeps it real (the sender genuinely blocks; the
+kernel marker fires on the real wake-order point) and adds no syscall/IPC ABI
+change. None of this moves an IPC/cap seam.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

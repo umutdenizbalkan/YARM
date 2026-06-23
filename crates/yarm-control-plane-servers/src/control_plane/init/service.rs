@@ -1111,8 +1111,21 @@ fn run_ipc_recv_proof_workload(proof_send: u32, proof_recv: u32) {
         }
     }
 
-    // ── Subtest 3: sender-wake — intentionally deferred (not faked). ─────────
-    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED reason=needs_blocked_sender");
+    // ── Subtest 3: sender-wake — intentionally DEFERRED (Stage 161; not faked).
+    // IPC_RECV_V2_SENDER_WAKE_ORDER_OK fires only when the receiver drains a
+    // queued message while a sender is BLOCKED as a waiter (queue full + a timed
+    // blocking send). A pure userspace workload cannot drive this deterministically
+    // on a multi-CPU boot: there is no userspace-observable "sender is a waiter"
+    // signal and no userspace CPU-affinity control, and the proof runs after the
+    // secondary CPUs are released — so a spawned sender thread can drain-race the
+    // receiver across CPUs. Making it deterministic needs minimal proof-gated
+    // infrastructure (a timed blocking-send wrapper, a spawn-thread wrapper + stack,
+    // and a CPU-affinity pin so init↦sender↦init hand off on one CPU), which is out
+    // of this stage's "workload/oracle only" scope. See doc/KERNEL_UNLOCKING.md
+    // §5.1.9.4 (proposed Stage 162). The workload never emits a SEQUENCE_DONE here.
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_DEFERRED reason=needs_deterministic_blocked_sender_multicpu"
+    );
     yarm_user_rt::user_log!("IPC_RECV_PROOF_END");
 }
 
