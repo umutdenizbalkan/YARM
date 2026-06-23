@@ -186,8 +186,11 @@ state 9 today.
   `DriverSpawnRequestBundle` / `DriverSpawnRequest` model over the existing
   inventory, spawn-plan, mock-authority, and resource-bundle pipeline; its
   resource and startup-cap requirements are descriptive only. PL011 can become
-  `ReadyForPmValidation` in hosted data, while RP1 GPIO and mailbox remain
-  deferred/BAR- or transport/cache/MMIO-blocked and no PM call occurs.
+  `ReadyForPmValidation` in hosted data. DRS-8 adds an inert PM-validation
+  simulation that can mark that PL011 request `WouldAccept` only under mock
+  verified-DM-identity/image/resource/startup-cap policy, while RP1 GPIO and
+  mailbox remain deferred/BAR- or transport/cache/MMIO-blocked and no PM call
+  occurs.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.

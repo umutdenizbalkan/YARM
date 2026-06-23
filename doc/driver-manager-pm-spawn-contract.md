@@ -8,7 +8,9 @@ This document records the intended **future** contract between Driver Manager
 DRS-6 does not add live spawning, hardware grants, capability minting, real MMIO,
 live-DTB parsing, PM calls, or boot-chain changes. DRS-7 adds an inert
 `DriverSpawnRequest` model that connects the mock pipeline to this contract, but
-it still produces data only and does not call PM.
+it still produces data only and does not call PM. DRS-8 adds an inert
+PM-validation simulation over those records; validation is modeled for hosted
+tests but is not executed by real PM and still has no PM/supervisor call path.
 
 The current DRS models remain advisory mock policy/data models. They describe
 what a safe future request would contain, but they do not transfer authority.
@@ -47,10 +49,14 @@ The current hosted and mock-safe DRS path is:
 5. Mock `SpawnAuthorityDecision` approvals or denials.
 6. Mock `ResourceGrantBundle` descriptions.
 7. DRS-7 inert `DriverSpawnRequestBundle` / `DriverSpawnRequest` records.
+8. DRS-8 inert `PmSpawnValidationReport` records that simulate PM validation
+   outcomes without invoking PM.
 
 This pipeline is descriptive. It never calls PM or supervisor services, never
 spawns a task, never grants resources, never transfers caps, and never touches
-MMIO.
+MMIO. The DRS-8 validation report is an audit artifact only; real PM remains the
+only future process-creation, cap-minting, grant, startup-cap-delivery, and
+handle-return authority.
 
 ### Future live pipeline
 
@@ -62,7 +68,9 @@ The intended live path is:
 3. Driver Manager converts an eligible plan into a PM-facing
    `DriverSpawnRequest`.
 4. PM authenticates the sender and validates the request against platform
-   inventory, resource ownership, accounting limits, and isolation policy.
+   inventory, resource ownership, accounting limits, and isolation policy. DRS-8
+   models this step inertly with a mock verified-DM-identity policy bit; payload
+   or self-claimed identity is not trusted.
 5. PM mints or obtains the needed capabilities and sets up the driver's address
    space.
 6. PM creates the driver process.
@@ -219,7 +227,8 @@ DRS-6 explicitly does not add:
 - kernel ABI, syscall ABI, IPC ABI, cap-logic, scheduler, VM, trap-entry, RPi5
   boot, or init-bootstrap changes;
 - PM or supervisor-service calls;
-- live use of the inert DRS-7 request records as process-creation authority;
+- live use of the inert DRS-7 request records or DRS-8 validation reports as
+  process-creation authority;
 - service-manifest behavior changes.
 
 Driver Manager remains advisory only in this stage.
@@ -240,5 +249,10 @@ The existing DRS models map to the future contract as follows:
   inventory/plan/authority/grant-bundle pipeline. Approved PL011 entries may be
   `ReadyForPmValidation`; deferred, denied, unknown, and already-running entries
   remain inert records and are not spawn requests.
+- DRS-8 `PmSpawnValidationReport` simulates whether PM would accept, reject,
+  defer, mark unsupported, or no-op each inert request after checking mock
+  verified DM identity, version, image policy, startup-cap layout, inventory
+  resource matching, and conservative resource blockers.
 - No mock model itself grants authority, mints caps, calls PM, creates a task, or
-  touches MMIO.
+  touches MMIO. A possible next step is a mock rollback/accounting simulation or
+  a live-spawn API design review, still without live implementation.

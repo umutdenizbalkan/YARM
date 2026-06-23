@@ -1082,7 +1082,7 @@ impl DriverSpawnRequest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DriverSpawnRequestBundle {
     requests: [Option<DriverSpawnRequest>; MAX_DEVICES],
     len: usize,
@@ -1110,6 +1110,25 @@ impl DriverSpawnRequestBundle {
         self.iter()
             .filter(|request| request.status == DriverSpawnRequestStatus::ReadyForPmValidation)
             .count()
+    }
+
+    pub fn simulate_pm_validation(
+        &self,
+        inventory: Option<&PlatformInventory>,
+        policy: PmSpawnValidationPolicy,
+    ) -> Result<PmSpawnValidationReport, KernelIpcError> {
+        let mut report = PmSpawnValidationReport::new();
+        let mut accepted_so_far = 0usize;
+        for request in self.iter() {
+            let entry = validate_pm_spawn_request(request, inventory, policy, accepted_so_far)?;
+            if entry.status == PmSpawnValidationStatus::WouldAccept {
+                accepted_so_far = accepted_so_far
+                    .checked_add(1)
+                    .ok_or(KernelIpcError::CapabilityFull)?;
+            }
+            report.push(entry)?;
+        }
+        Ok(report)
     }
 
     fn push(&mut self, request: DriverSpawnRequest) -> Result<(), KernelIpcError> {
@@ -1205,6 +1224,364 @@ fn request_blocker_from_resource_blocker(
         ResourceGrantBlocker::DeviceUnsupported => DriverSpawnRequestBlocker::UnsupportedDevice,
         ResourceGrantBlocker::SpawnNotApproved => DriverSpawnRequestBlocker::SpawnNotApproved,
         ResourceGrantBlocker::UnknownResource => DriverSpawnRequestBlocker::UnknownResource,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmSpawnValidationStatus {
+    WouldAccept,
+    WouldReject,
+    Deferred,
+    Unsupported,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmSpawnValidationFailure {
+    MissingVerifiedDriverManager,
+    RequestVersionUnsupported,
+    SpawnRequestNotReady,
+    DeviceDeferred,
+    DeviceUnsupported,
+    ResourceNotAssigned,
+    ResourceDeferred,
+    MissingMmioAuthority,
+    MissingIrqRouting,
+    MissingDmaPolicy,
+    MissingPcieBar,
+    MissingMailboxTransport,
+    MissingCachePolicy,
+    MissingStartupCapLayout,
+    ImageNotAllowed,
+    ResourceLimitExceeded,
+    AlreadyRunning,
+    PolicyDenied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmSpawnValidationPolicy {
+    pub verified_driver_manager_identity: bool,
+    pub supported_request_version: u16,
+    pub allow_uart_srv_image: bool,
+    pub allow_irqmux_srv_image: bool,
+    pub max_would_accept: usize,
+    pub require_inventory_match: bool,
+}
+
+impl PmSpawnValidationPolicy {
+    pub const fn fail_closed() -> Self {
+        Self {
+            verified_driver_manager_identity: false,
+            supported_request_version: 1,
+            allow_uart_srv_image: false,
+            allow_irqmux_srv_image: false,
+            max_would_accept: 0,
+            require_inventory_match: true,
+        }
+    }
+
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            verified_driver_manager_identity: true,
+            supported_request_version: 1,
+            allow_uart_srv_image: true,
+            allow_irqmux_srv_image: false,
+            max_would_accept: MAX_DEVICES,
+            require_inventory_match: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmSpawnValidationEntry {
+    pub mock_request_id: u32,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub status: PmSpawnValidationStatus,
+    pub failures: [Option<PmSpawnValidationFailure>; MAX_DRIVER_SPAWN_BLOCKERS],
+}
+
+impl PmSpawnValidationEntry {
+    fn from_request(request: &DriverSpawnRequest) -> Self {
+        Self {
+            mock_request_id: request.mock_request_id,
+            compatible: request.compatible,
+            compatible_len: request.compatible_len,
+            driver_candidate: request.driver_candidate,
+            driver_candidate_len: request.driver_candidate_len,
+            status: PmSpawnValidationStatus::WouldReject,
+            failures: [None; MAX_DRIVER_SPAWN_BLOCKERS],
+        }
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn has_failure(&self, failure: PmSpawnValidationFailure) -> bool {
+        self.failures.iter().any(|entry| *entry == Some(failure))
+    }
+
+    fn push_failure(&mut self, failure: PmSpawnValidationFailure) -> Result<(), KernelIpcError> {
+        if self.has_failure(failure) {
+            return Ok(());
+        }
+        let Some(slot) = self.failures.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(failure);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmSpawnValidationReport {
+    entries: [Option<PmSpawnValidationEntry>; MAX_DEVICES],
+    len: usize,
+}
+
+impl PmSpawnValidationReport {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &PmSpawnValidationEntry> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|entry| entry.as_ref())
+    }
+
+    pub fn would_accept_count(&self) -> usize {
+        self.iter()
+            .filter(|entry| entry.status == PmSpawnValidationStatus::WouldAccept)
+            .count()
+    }
+
+    fn push(&mut self, entry: PmSpawnValidationEntry) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+        Ok(())
+    }
+}
+
+fn validate_pm_spawn_request(
+    request: &DriverSpawnRequest,
+    inventory: Option<&PlatformInventory>,
+    policy: PmSpawnValidationPolicy,
+    accepted_so_far: usize,
+) -> Result<PmSpawnValidationEntry, KernelIpcError> {
+    let mut entry = PmSpawnValidationEntry::from_request(request);
+    match request.status {
+        DriverSpawnRequestStatus::Deferred => {
+            entry.status = PmSpawnValidationStatus::Deferred;
+            entry.push_failure(PmSpawnValidationFailure::SpawnRequestNotReady)?;
+            entry.push_failure(PmSpawnValidationFailure::DeviceDeferred)?;
+        }
+        DriverSpawnRequestStatus::Unsupported => {
+            entry.status = PmSpawnValidationStatus::Unsupported;
+            entry.push_failure(PmSpawnValidationFailure::SpawnRequestNotReady)?;
+            entry.push_failure(PmSpawnValidationFailure::DeviceUnsupported)?;
+        }
+        DriverSpawnRequestStatus::AlreadyRunning => {
+            entry.status = PmSpawnValidationStatus::AlreadyRunning;
+            entry.push_failure(PmSpawnValidationFailure::AlreadyRunning)?;
+        }
+        DriverSpawnRequestStatus::Denied => {
+            entry.status = PmSpawnValidationStatus::WouldReject;
+            entry.push_failure(PmSpawnValidationFailure::SpawnRequestNotReady)?;
+            entry.push_failure(PmSpawnValidationFailure::PolicyDenied)?;
+        }
+        DriverSpawnRequestStatus::ReadyForPmValidation => {
+            entry.status = PmSpawnValidationStatus::WouldAccept;
+        }
+    }
+
+    if !policy.verified_driver_manager_identity {
+        entry.push_failure(PmSpawnValidationFailure::MissingVerifiedDriverManager)?;
+    }
+    if request.request_version != policy.supported_request_version {
+        entry.push_failure(PmSpawnValidationFailure::RequestVersionUnsupported)?;
+    }
+    if !image_allowed_by_policy(request, policy) {
+        entry.push_failure(PmSpawnValidationFailure::ImageNotAllowed)?;
+    }
+    if accepted_so_far >= policy.max_would_accept
+        && request.status == DriverSpawnRequestStatus::ReadyForPmValidation
+    {
+        entry.push_failure(PmSpawnValidationFailure::ResourceLimitExceeded)?;
+    }
+    validate_startup_cap_layout(request, &mut entry)?;
+    validate_request_resources(request, inventory, policy, &mut entry)?;
+    for blocker in request.blockers.iter().filter_map(|blocker| *blocker) {
+        entry.push_failure(pm_failure_from_request_blocker(blocker))?;
+    }
+
+    if entry.failures.iter().any(Option::is_some)
+        && entry.status == PmSpawnValidationStatus::WouldAccept
+    {
+        entry.status = PmSpawnValidationStatus::WouldReject;
+    }
+    Ok(entry)
+}
+
+fn image_allowed_by_policy(request: &DriverSpawnRequest, policy: PmSpawnValidationPolicy) -> bool {
+    match request.driver_candidate() {
+        Some("uart_srv") => policy.allow_uart_srv_image,
+        Some("irqmux_srv") => policy.allow_irqmux_srv_image,
+        _ => false,
+    }
+}
+
+fn validate_startup_cap_layout(
+    request: &DriverSpawnRequest,
+    entry: &mut PmSpawnValidationEntry,
+) -> Result<(), KernelIpcError> {
+    for required in [
+        StartupCapRequirement::DriverManagerControlEndpoint,
+        StartupCapRequirement::DriverRegistrationEndpoint,
+        StartupCapRequirement::FaultOrRestartEndpoint,
+    ] {
+        if !request.has_startup_cap_requirement(required) {
+            entry.push_failure(PmSpawnValidationFailure::MissingStartupCapLayout)?;
+        }
+    }
+    for resource in request
+        .resource_requirements
+        .iter()
+        .filter_map(|entry| *entry)
+    {
+        let required = match resource.kind {
+            ResourceGrantKind::Mmio => Some(StartupCapRequirement::Mmio),
+            ResourceGrantKind::Irq => Some(StartupCapRequirement::IrqNotification),
+            ResourceGrantKind::Dma => Some(StartupCapRequirement::DmaOrIommu),
+            ResourceGrantKind::MailboxTransport => Some(StartupCapRequirement::MailboxTransport),
+            _ => None,
+        };
+        if let Some(required) = required
+            && !request.has_startup_cap_requirement(required)
+        {
+            entry.push_failure(PmSpawnValidationFailure::MissingStartupCapLayout)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_request_resources(
+    request: &DriverSpawnRequest,
+    inventory: Option<&PlatformInventory>,
+    policy: PmSpawnValidationPolicy,
+    entry: &mut PmSpawnValidationEntry,
+) -> Result<(), KernelIpcError> {
+    let inventory_record = if policy.require_inventory_match {
+        match inventory.and_then(|inventory| inventory.iter().nth(request.device_record_index)) {
+            Some(device)
+                if device.compatible() == request.compatible()
+                    && device.driver_candidate() == request.driver_candidate()
+                    && device.class == request.device_class =>
+            {
+                Some(device)
+            }
+            _ => {
+                entry.push_failure(PmSpawnValidationFailure::ResourceNotAssigned)?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    for resource in request
+        .resource_requirements
+        .iter()
+        .filter_map(|entry| *entry)
+    {
+        if resource.mock_resource_id == Some(0) {
+            entry.push_failure(PmSpawnValidationFailure::ResourceNotAssigned)?;
+        }
+        if resource.requirement != ResourceGrantRequirement::WouldRequest {
+            entry.push_failure(PmSpawnValidationFailure::ResourceDeferred)?;
+        }
+        for blocker in resource.blockers.iter().filter_map(|blocker| *blocker) {
+            entry.push_failure(pm_failure_from_resource_blocker(blocker))?;
+        }
+        if let Some(device) = inventory_record {
+            match resource.kind {
+                ResourceGrantKind::Mmio if !device.mmio_ranges.iter().any(Option::is_some) => {
+                    entry.push_failure(PmSpawnValidationFailure::ResourceNotAssigned)?;
+                }
+                ResourceGrantKind::Irq if !device.irq_lines.iter().any(Option::is_some) => {
+                    entry.push_failure(PmSpawnValidationFailure::ResourceNotAssigned)?;
+                }
+                ResourceGrantKind::PcieBar => {
+                    entry.push_failure(PmSpawnValidationFailure::MissingPcieBar)?;
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pm_failure_from_request_blocker(blocker: DriverSpawnRequestBlocker) -> PmSpawnValidationFailure {
+    match blocker {
+        DriverSpawnRequestBlocker::MissingSpawnAuthority => PmSpawnValidationFailure::PolicyDenied,
+        DriverSpawnRequestBlocker::PlanEntryDeferred => PmSpawnValidationFailure::DeviceDeferred,
+        DriverSpawnRequestBlocker::MissingMmioGrant => {
+            PmSpawnValidationFailure::MissingMmioAuthority
+        }
+        DriverSpawnRequestBlocker::MissingIrqRoute => PmSpawnValidationFailure::MissingIrqRouting,
+        DriverSpawnRequestBlocker::MissingDmaPolicy => PmSpawnValidationFailure::MissingDmaPolicy,
+        DriverSpawnRequestBlocker::RequiresPcieBarDiscovery => {
+            PmSpawnValidationFailure::MissingPcieBar
+        }
+        DriverSpawnRequestBlocker::MissingMailboxTransport => {
+            PmSpawnValidationFailure::MissingMailboxTransport
+        }
+        DriverSpawnRequestBlocker::MissingCachePolicy => {
+            PmSpawnValidationFailure::MissingCachePolicy
+        }
+        DriverSpawnRequestBlocker::UnsupportedDevice => PmSpawnValidationFailure::DeviceUnsupported,
+        DriverSpawnRequestBlocker::UnknownCandidate => PmSpawnValidationFailure::ImageNotAllowed,
+        DriverSpawnRequestBlocker::AlreadyRunning => PmSpawnValidationFailure::AlreadyRunning,
+        DriverSpawnRequestBlocker::PolicyDenied => PmSpawnValidationFailure::PolicyDenied,
+        DriverSpawnRequestBlocker::SpawnNotApproved => PmSpawnValidationFailure::PolicyDenied,
+        DriverSpawnRequestBlocker::UnknownResource => PmSpawnValidationFailure::ResourceNotAssigned,
+        DriverSpawnRequestBlocker::DeviceDeferred => PmSpawnValidationFailure::DeviceDeferred,
+    }
+}
+
+fn pm_failure_from_resource_blocker(blocker: ResourceGrantBlocker) -> PmSpawnValidationFailure {
+    match blocker {
+        ResourceGrantBlocker::MissingMmioAuthority => {
+            PmSpawnValidationFailure::MissingMmioAuthority
+        }
+        ResourceGrantBlocker::MissingIrqRouting => PmSpawnValidationFailure::MissingIrqRouting,
+        ResourceGrantBlocker::MissingDmaPolicy => PmSpawnValidationFailure::MissingDmaPolicy,
+        ResourceGrantBlocker::RequiresPcieBarDiscovery => PmSpawnValidationFailure::MissingPcieBar,
+        ResourceGrantBlocker::RequiresMailboxTransport => {
+            PmSpawnValidationFailure::MissingMailboxTransport
+        }
+        ResourceGrantBlocker::RequiresCacheMaintenancePolicy => {
+            PmSpawnValidationFailure::MissingCachePolicy
+        }
+        ResourceGrantBlocker::RequiresPinmuxOwnership => PmSpawnValidationFailure::PolicyDenied,
+        ResourceGrantBlocker::RequiresClockDiscovery => PmSpawnValidationFailure::PolicyDenied,
+        ResourceGrantBlocker::DeviceDeferred => PmSpawnValidationFailure::DeviceDeferred,
+        ResourceGrantBlocker::DeviceUnsupported => PmSpawnValidationFailure::DeviceUnsupported,
+        ResourceGrantBlocker::SpawnNotApproved => PmSpawnValidationFailure::PolicyDenied,
+        ResourceGrantBlocker::UnknownResource => PmSpawnValidationFailure::ResourceNotAssigned,
     }
 }
 
@@ -3393,6 +3770,239 @@ mod tests {
         // Keep a runtime instance alive to prove the request-bundle helper has no
         // parameter through which it could call PM/supervisor/control operations.
         let _ = &mut runtime;
+    }
+
+    fn validation_entry<'a>(
+        report: &'a PmSpawnValidationReport,
+        compatible: &str,
+    ) -> &'a PmSpawnValidationEntry {
+        report
+            .iter()
+            .find(|entry| entry.compatible() == Some(compatible))
+            .expect("pm validation entry")
+    }
+
+    #[test]
+    fn pm_validation_accepts_approved_pl011_only_with_identity_image_resources_and_caps() {
+        let (inventory, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let report = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(report.len(), 5);
+        assert_eq!(report.would_accept_count(), 1);
+        let pl011 = validation_entry(&report, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnValidationStatus::WouldAccept);
+        assert!(pl011.failures.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pm_validation_missing_verified_dm_identity_rejects_pl011() {
+        let (inventory, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let mut policy = PmSpawnValidationPolicy::hosted_fake_rpi5();
+        policy.verified_driver_manager_identity = false;
+        let report = requests
+            .simulate_pm_validation(Some(&inventory), policy)
+            .unwrap();
+        assert_eq!(report.would_accept_count(), 0);
+        let pl011 = validation_entry(&report, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnValidationStatus::WouldReject);
+        assert!(pl011.has_failure(PmSpawnValidationFailure::MissingVerifiedDriverManager));
+    }
+
+    #[test]
+    fn pm_validation_rejects_unsupported_request_version_and_fail_closed_policy() {
+        let (inventory, _, _, _, mut requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        requests.requests[0].as_mut().unwrap().request_version = 2;
+        let version_report = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let pl011 = validation_entry(&version_report, "arm,pl011");
+        assert_eq!(pl011.status, PmSpawnValidationStatus::WouldReject);
+        assert!(pl011.has_failure(PmSpawnValidationFailure::RequestVersionUnsupported));
+
+        let (_, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let fail_closed = requests
+            .simulate_pm_validation(Some(&inventory), PmSpawnValidationPolicy::fail_closed())
+            .unwrap();
+        assert_eq!(fail_closed.would_accept_count(), 0);
+        assert!(
+            fail_closed
+                .iter()
+                .all(|entry| entry.status != PmSpawnValidationStatus::WouldAccept)
+        );
+        assert!(
+            validation_entry(&fail_closed, "arm,pl011")
+                .has_failure(PmSpawnValidationFailure::MissingVerifiedDriverManager)
+        );
+        assert!(
+            validation_entry(&fail_closed, "arm,pl011")
+                .has_failure(PmSpawnValidationFailure::ImageNotAllowed)
+        );
+    }
+
+    #[test]
+    fn pm_validation_keeps_rp1_mailbox_irqmux_unknown_and_running_rejected_or_deferred() {
+        let (inventory, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let report = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+
+        let rp1 = validation_entry(&report, "raspberrypi,rp1-gpio");
+        assert_eq!(rp1.status, PmSpawnValidationStatus::Deferred);
+        assert!(rp1.has_failure(PmSpawnValidationFailure::MissingPcieBar));
+        assert!(rp1.has_failure(PmSpawnValidationFailure::MissingMmioAuthority));
+
+        let mailbox = validation_entry(&report, "raspberrypi,firmware");
+        assert_eq!(mailbox.status, PmSpawnValidationStatus::Deferred);
+        assert!(mailbox.has_failure(PmSpawnValidationFailure::MissingMailboxTransport));
+        assert!(mailbox.has_failure(PmSpawnValidationFailure::MissingCachePolicy));
+        assert!(mailbox.has_failure(PmSpawnValidationFailure::MissingDmaPolicy));
+        assert!(mailbox.has_failure(PmSpawnValidationFailure::MissingMmioAuthority));
+
+        let irqmux = validation_entry(&report, "yarm,irqmux");
+        assert_eq!(irqmux.status, PmSpawnValidationStatus::Deferred);
+        assert!(irqmux.has_failure(PmSpawnValidationFailure::MissingIrqRouting));
+
+        let unknown = validation_entry(&report, "vendor,unknown");
+        assert_eq!(unknown.status, PmSpawnValidationStatus::Unsupported);
+        assert!(unknown.has_failure(PmSpawnValidationFailure::DeviceUnsupported));
+
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let decisions = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 9,
+                },
+                SpawnAuthorityPolicy::allow_hosted_mock_spawns(),
+            )
+            .unwrap();
+        let grants = inventory
+            .build_resource_grant_bundle(&plan, &decisions, ResourceGrantPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let running_requests = inventory
+            .build_driver_spawn_request_bundle(&plan, &decisions, &grants)
+            .unwrap();
+        let running_report = running_requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let running = validation_entry(&running_report, "arm,pl011");
+        assert_eq!(running.status, PmSpawnValidationStatus::AlreadyRunning);
+        assert!(running.has_failure(PmSpawnValidationFailure::AlreadyRunning));
+    }
+
+    #[test]
+    fn pm_validation_rejects_missing_startup_cap_layout_and_resource_mismatch() {
+        let (inventory, _, _, _, mut requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let pl011 = requests.requests[0].as_mut().unwrap();
+        pl011.startup_cap_requirements = [None; MAX_STARTUP_CAP_REQUIREMENTS];
+        let missing_caps = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let pl011_entry = validation_entry(&missing_caps, "arm,pl011");
+        assert_eq!(pl011_entry.status, PmSpawnValidationStatus::WouldReject);
+        assert!(pl011_entry.has_failure(PmSpawnValidationFailure::MissingStartupCapLayout));
+
+        let (_, _, _, _, mut requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        requests.requests[0].as_mut().unwrap().device_record_index = 31;
+        let mismatch = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let pl011_entry = validation_entry(&mismatch, "arm,pl011");
+        assert_eq!(pl011_entry.status, PmSpawnValidationStatus::WouldReject);
+        assert!(pl011_entry.has_failure(PmSpawnValidationFailure::ResourceNotAssigned));
+    }
+
+    #[test]
+    fn pm_validation_report_is_deterministic_bounded_and_non_mutating() {
+        let (inventory, plan, decisions, grants, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let request_snapshot = requests.clone();
+        let before = (
+            inventory.len(),
+            plan.len(),
+            decisions.len(),
+            grants.len(),
+            requests.len(),
+        );
+        let first = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let second = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), requests.len());
+        assert!(first.len() <= MAX_DEVICES);
+        assert_eq!(requests, request_snapshot);
+        assert_eq!(
+            before,
+            (
+                inventory.len(),
+                plan.len(),
+                decisions.len(),
+                grants.len(),
+                requests.len()
+            )
+        );
+    }
+
+    #[test]
+    fn pm_validation_does_not_call_driver_control_pm_supervisor_caps_grants_or_mmio() {
+        let (inventory, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let report = requests
+            .simulate_pm_validation(
+                Some(&inventory),
+                PmSpawnValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(report.would_accept_count(), 1);
+        let runtime = MockDriverControl::new();
+        assert_eq!(runtime.irq_line.get(), None);
+        assert_eq!(runtime.dma_request.get(), None);
+        assert_eq!(runtime.irq_grant.get(), None);
+        assert_eq!(runtime.dma_grant.get(), None);
+        assert_eq!(runtime.registered.get(), None);
+        for entry in report.iter() {
+            assert_ne!(entry.mock_request_id, 0);
+        }
     }
 
     #[test]

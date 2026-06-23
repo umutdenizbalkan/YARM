@@ -119,8 +119,9 @@ mocks.
   PM-facing `DriverSpawnRequest`s, while PM validates, creates processes, sets up
   address spaces, accounts resources, mints future caps, delivers startup caps,
   and returns handles. DRS-7 adds the bounded inert `DriverSpawnRequest` model and
-  descriptive startup-cap/resource requirement descriptors, but they remain data
-  only and are not PM calls or grants. The harness does not parse the live boot DTB, grant
+  descriptive startup-cap/resource requirement descriptors. DRS-8 adds an inert
+  PM-validation simulation with mock verified-DM identity and conservative
+  resource/startup checks. Both remain data only and are not PM calls or grants. The harness does not parse the live boot DTB, grant
   resources, perform MMIO, call PM, or spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md) and the design-only future
   DM↔PM spawn contract in

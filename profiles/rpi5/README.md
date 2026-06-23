@@ -102,7 +102,9 @@ Driver Manager remains advisory/policy-only, and PM remains responsible for
 validation, process creation, address-space setup, accounting, capability
 minting, startup-cap delivery, and handles. DRS-7 adds only an inert
 `DriverSpawnRequest` model with descriptive resource and startup-cap
-requirements; it still does not call PM, spawn, grant, mint caps, or touch MMIO. See the driver inventory in
+requirements. DRS-8 adds an inert PM-validation simulation over those records;
+it models PM checks but still does not call PM, spawn, grant, mint caps, return
+handles, or touch MMIO. See the driver inventory in
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning
