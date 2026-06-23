@@ -3239,6 +3239,84 @@ belong to that workload. This keeps it real (the sender genuinely blocks; the
 kernel marker fires on the real wake-order point) and adds no syscall/IPC ABI
 change. None of this moves an IPC/cap seam.
 
+#### 5.1.9.5 Stage 162 — sender-wake proof infrastructure (feasibility audit; still DEFERRED)
+
+Stage 162 set out to build the minimal proof-gated infrastructure to make
+sender-wake **strictly deterministic** and then prove
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` + `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`.
+A full feasibility audit of the four parts was done. Three of the four pieces are
+buildable; the determinism requirement is the hard blocker, so sender-wake stays
+**DEFERRED, not faked**, and queued-split + rollback remain green and untouched.
+
+**Part A — timed/blocking send wrapper: feasible (no blocker).** The kernel reads
+the send timeout from `frame.arg(SYSCALL_ARG_INLINE_PAYLOAD1)` (arg slot 4) via
+`decode_ipc_send_timeout_ticks` for a user-ASID sender; the public `ipc_send`
+zeroes that slot (non-blocking). A proof wrapper that sets slot 4 to a non-zero
+timeout routes to `ipc_send_with_deadline`, so the sender genuinely blocks and
+becomes a real waiter — reusing the existing ABI with **no syscall/ABI change**.
+
+**Part B — second execution context: feasible but from-scratch.** `SpawnThread`
+(NR 11) and `Fork` (NR 12) exist in the kernel; a thread shares the parent cnode
+(so it inherits init's proof caps directly) and `Fork` inherits "ordinary
+userspace IPC/memory-object caps". **But there is no existing userspace
+thread/fork usage anywhere in the tree** — the user-rt thread-bootstrap ABI
+(entry trampoline, stack/TLS setup, no-return convention) would be invented from
+scratch and is entirely unvalidatable here. A faulty thread bootstrap faults/hangs
+the boot.
+
+**Part C/D — deterministic ordering: the hard blocker.** init is already pinned to
+`BOOTSTRAP_CPU_ID`, and a proof-gated affinity pin could keep a spawned sender
+thread on the same CPU, and `ipc_send` wakes a receiver by marking it runnable
+(no immediate `YieldTo` handoff) — all of which favors a single-CPU hand-off.
+**However, the timer preempts running user tasks** (`should_preempt` in
+`KernelState::handle_trap`), so *any* pure-userspace handshake (a second endpoint,
+a futex, or a yield-poll) has a sub-microsecond race window between the sender
+signalling "ready" and the sender actually blocking: if the timer fires in that
+gap and the receiver drains first, the sender never blocks (the queue is no longer
+full) and the marker never fires. That is precisely the "timing race" the stage
+forbids. The **only strictly race-free signal is one emitted by the kernel at the
+exact `enqueue_sender_waiter` point** for the proof endpoint. Delivering that to
+userspace needs either a futex wait-address channel that does not exist
+(registering init's wait word with the kernel would be a new mechanism), or
+sending/waking from inside the locked sender-waiter-enqueue path — a lock-ordering
+hazard in the IPC state code. Both are non-trivial, risky kernel-IPC-path changes
+that cannot be validated without QEMU.
+
+**Blast-radius consideration.** The queued-split + rollback proofs run under the
+*same* `yarm.ipc_recv_proof=1` knob, so a from-scratch sender-wake workload (or a
+risky IPC-path coordination hook) landed blind could destabilize the
+currently-green proof boots. The honest, low-risk decision is therefore to keep
+sender-wake deferred rather than ship a large, unvalidatable, boot-risking change.
+
+**Proposed Stage 163 (concrete, strictly race-free design).** All proof-gated and
+behind a *separate* `yarm.ipc_recv_proof_sender_wake=1` sub-knob so the green
+queued-split/rollback proof boots are never affected even if it misbehaves:
+
+1. Provision a second proof endpoint `E2` (signal channel) into init alongside the
+   `E1` loopback (the kernel already mints the loopback in
+   `provision_init_ipc_recv_proof_loopback`).
+2. Add a proof-only timed blocking-send user-rt wrapper (Part A) and a minimal
+   proof-only `SpawnThread` wrapper with one small static stack (Part B); pin the
+   spawned sender to init's CPU (Part C).
+3. **Strict signal:** in the sender-waiter-enqueue path, *only* when
+   `ipc_recv_oracle_proof_enabled()` and the endpoint is the proof `E1`, emit
+   `IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT endpoint=.. tid=..` and stage a
+   deferred wake of init's `E2` recv (computed under the lock, applied after lock
+   release — mirroring the existing `IpcSchedulerPlan`/`apply_split_*_wake_plan`
+   deferred-wake discipline, so no lock-ordering violation). init does a blocking
+   recv on `E2`; it returns exactly when the sender is provably a waiter, with no
+   race window.
+4. init then `recv-v2` drains `E1` → the real path emits
+   `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`; init confirms the sender's message arrived
+   (sender_tid match) and emits `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`.
+
+This keeps the sender genuinely blocked, the kernel marker genuinely emitted at the
+real wake-order point (never faked), no IPC/cap seam moved, and no syscall/IPC ABI
+change. The oracle's `YARM_IPC_RECV_PROOF_SENDER_WAKE=1` requirement (added in
+Stage 161, requiring BOTH `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` and
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK`) stays default-off and fails by design until
+that lands. Queued-split + rollback remain green and required.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
