@@ -100,7 +100,9 @@ a design-only DM↔PM live-spawn contract in
 [`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md):
 Driver Manager remains advisory/policy-only, and PM remains responsible for
 validation, process creation, address-space setup, accounting, capability
-minting, startup-cap delivery, and handles. See the driver inventory in
+minting, startup-cap delivery, and handles. DRS-7 adds only an inert
+`DriverSpawnRequest` model with descriptive resource and startup-cap
+requirements; it still does not call PM, spawn, grant, mint caps, or touch MMIO. See the driver inventory in
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning

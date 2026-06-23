@@ -118,7 +118,9 @@ mocks.
   documents the future live DM↔PM contract: Driver Manager builds policy and
   PM-facing `DriverSpawnRequest`s, while PM validates, creates processes, sets up
   address spaces, accounts resources, mints future caps, delivers startup caps,
-  and returns handles. The harness does not parse the live boot DTB, grant
+  and returns handles. DRS-7 adds the bounded inert `DriverSpawnRequest` model and
+  descriptive startup-cap/resource requirement descriptors, but they remain data
+  only and are not PM calls or grants. The harness does not parse the live boot DTB, grant
   resources, perform MMIO, call PM, or spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md) and the design-only future
   DM↔PM spawn contract in

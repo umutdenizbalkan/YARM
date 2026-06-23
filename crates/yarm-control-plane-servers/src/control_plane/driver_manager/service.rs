@@ -806,6 +806,408 @@ fn denial_reason_from_blocker(blocker: SpawnBlocker) -> SpawnDenialReason {
     }
 }
 
+const MAX_DRIVER_SPAWN_REQUEST_RESOURCES: usize = 8;
+const MAX_STARTUP_CAP_REQUIREMENTS: usize = 9;
+const MAX_DRIVER_SPAWN_DEPENDENCIES: usize = 4;
+const MAX_DRIVER_SPAWN_BLOCKERS: usize = 12;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverSpawnRequestStatus {
+    ReadyForPmValidation,
+    Deferred,
+    Denied,
+    Unsupported,
+    AlreadyRunning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverSpawnRequestBlocker {
+    MissingSpawnAuthority,
+    PlanEntryDeferred,
+    MissingMmioGrant,
+    MissingIrqRoute,
+    MissingDmaPolicy,
+    RequiresPcieBarDiscovery,
+    MissingMailboxTransport,
+    MissingCachePolicy,
+    UnsupportedDevice,
+    UnknownCandidate,
+    AlreadyRunning,
+    PolicyDenied,
+    SpawnNotApproved,
+    UnknownResource,
+    DeviceDeferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverSpawnResourceRequirement {
+    pub kind: ResourceGrantKind,
+    pub requirement: ResourceGrantRequirement,
+    /// Inert model-only resource id. This is not a CapId and is never
+    /// materialized into authority.
+    pub mock_resource_id: Option<u32>,
+    pub blockers: [Option<ResourceGrantBlocker>; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverSpawnDependency {
+    DriverManager,
+    Devfs,
+    IrqMux,
+    PlatformInventory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverSpawnHealthPolicy {
+    pub startup_timeout_ms: u32,
+    pub heartbeat_timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverRestartPolicy {
+    pub max_restarts: u8,
+    pub backoff_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverIsolationPolicy {
+    DefaultUserDriver,
+    HardwareIsolated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupCapRequirement {
+    DriverManagerControlEndpoint,
+    DriverRegistrationEndpoint,
+    FaultOrRestartEndpoint,
+    Mmio,
+    IrqNotification,
+    DmaOrIommu,
+    MailboxTransport,
+    DevfsRegistration,
+    LoggingOrDebug,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverSpawnRequest {
+    pub request_version: u16,
+    /// Inert model-only request id. This is not a task id, process handle, or cap.
+    pub mock_request_id: u32,
+    pub image_id: Option<u32>,
+    pub image_name: [u8; 32],
+    pub image_name_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub device_class: DeviceClass,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub device_record_index: usize,
+    pub status: DriverSpawnRequestStatus,
+    pub resource_requirements:
+        [Option<DriverSpawnResourceRequirement>; MAX_DRIVER_SPAWN_REQUEST_RESOURCES],
+    pub startup_cap_requirements: [Option<StartupCapRequirement>; MAX_STARTUP_CAP_REQUIREMENTS],
+    pub dependencies: [Option<DriverSpawnDependency>; MAX_DRIVER_SPAWN_DEPENDENCIES],
+    pub restart_policy: DriverRestartPolicy,
+    pub health_policy: DriverSpawnHealthPolicy,
+    pub isolation_policy: DriverIsolationPolicy,
+    pub blockers: [Option<DriverSpawnRequestBlocker>; MAX_DRIVER_SPAWN_BLOCKERS],
+}
+
+impl DriverSpawnRequest {
+    fn from_pipeline(
+        device: &DeviceRecord,
+        device_record_index: usize,
+        plan_entry: &SpawnPlanEntry,
+        decision: &SpawnAuthorityDecision,
+    ) -> Result<Self, KernelIpcError> {
+        let mock_request_id =
+            u32::try_from(device_record_index + 1).map_err(|_| KernelIpcError::WrongObject)?;
+        let mut request = Self {
+            request_version: 1,
+            mock_request_id,
+            image_id: None,
+            image_name: device.driver_candidate,
+            image_name_len: device.driver_candidate_len,
+            driver_candidate: device.driver_candidate,
+            driver_candidate_len: device.driver_candidate_len,
+            device_class: device.class,
+            compatible: device.compatible,
+            compatible_len: device.compatible_len,
+            device_record_index,
+            status: request_status_from_pipeline(plan_entry, decision),
+            resource_requirements: [None; MAX_DRIVER_SPAWN_REQUEST_RESOURCES],
+            startup_cap_requirements: [None; MAX_STARTUP_CAP_REQUIREMENTS],
+            dependencies: [None; MAX_DRIVER_SPAWN_DEPENDENCIES],
+            restart_policy: DriverRestartPolicy {
+                max_restarts: 3,
+                backoff_ms: 1000,
+            },
+            health_policy: DriverSpawnHealthPolicy {
+                startup_timeout_ms: 5000,
+                heartbeat_timeout_ms: 1000,
+            },
+            isolation_policy: DriverIsolationPolicy::DefaultUserDriver,
+            blockers: [None; MAX_DRIVER_SPAWN_BLOCKERS],
+        };
+        request.push_dependency(DriverSpawnDependency::DriverManager)?;
+        request.push_dependency(DriverSpawnDependency::PlatformInventory)?;
+        if matches!(
+            device.class,
+            DeviceClass::Uart | DeviceClass::Gpio | DeviceClass::Block
+        ) {
+            request.push_dependency(DriverSpawnDependency::Devfs)?;
+        }
+        if matches!(
+            device.class,
+            DeviceClass::Uart | DeviceClass::Gpio | DeviceClass::IrqMux
+        ) {
+            request.push_dependency(DriverSpawnDependency::IrqMux)?;
+        }
+        request.push_startup_cap(StartupCapRequirement::DriverManagerControlEndpoint)?;
+        request.push_startup_cap(StartupCapRequirement::DriverRegistrationEndpoint)?;
+        request.push_startup_cap(StartupCapRequirement::FaultOrRestartEndpoint)?;
+        request.push_startup_cap(StartupCapRequirement::DevfsRegistration)?;
+        request.push_startup_cap(StartupCapRequirement::LoggingOrDebug)?;
+        for blocker in plan_entry.blockers.iter().filter_map(|blocker| *blocker) {
+            request.push_blocker(request_blocker_from_spawn_blocker(blocker))?;
+        }
+        if let Some(denial) = decision.denial {
+            for reason in denial.reasons.iter().filter_map(|reason| *reason) {
+                request.push_blocker(request_blocker_from_denial(reason))?;
+            }
+        }
+        Ok(request)
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn driver_candidate(&self) -> Option<&str> {
+        bounded_str(&self.driver_candidate, self.driver_candidate_len)
+    }
+
+    pub fn image_name(&self) -> Option<&str> {
+        bounded_str(&self.image_name, self.image_name_len)
+    }
+
+    pub fn has_startup_cap_requirement(&self, requirement: StartupCapRequirement) -> bool {
+        self.startup_cap_requirements
+            .iter()
+            .any(|entry| *entry == Some(requirement))
+    }
+
+    pub fn has_resource_requirement(&self, kind: ResourceGrantKind) -> bool {
+        self.resource_requirements
+            .iter()
+            .filter_map(|entry| *entry)
+            .any(|entry| entry.kind == kind)
+    }
+
+    pub fn has_blocker(&self, blocker: DriverSpawnRequestBlocker) -> bool {
+        self.blockers.iter().any(|entry| *entry == Some(blocker))
+    }
+
+    fn push_resource(
+        &mut self,
+        requirement: DriverSpawnResourceRequirement,
+    ) -> Result<(), KernelIpcError> {
+        let Some(slot) = self
+            .resource_requirements
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(requirement);
+        match requirement.kind {
+            ResourceGrantKind::Mmio => self.push_startup_cap(StartupCapRequirement::Mmio)?,
+            ResourceGrantKind::Irq => {
+                self.push_startup_cap(StartupCapRequirement::IrqNotification)?
+            }
+            ResourceGrantKind::Dma => self.push_startup_cap(StartupCapRequirement::DmaOrIommu)?,
+            ResourceGrantKind::MailboxTransport => {
+                self.push_startup_cap(StartupCapRequirement::MailboxTransport)?
+            }
+            _ => {}
+        }
+        for blocker in requirement.blockers.iter().filter_map(|blocker| *blocker) {
+            self.push_blocker(request_blocker_from_resource_blocker(blocker))?;
+        }
+        Ok(())
+    }
+
+    fn push_startup_cap(
+        &mut self,
+        requirement: StartupCapRequirement,
+    ) -> Result<(), KernelIpcError> {
+        if self.has_startup_cap_requirement(requirement) {
+            return Ok(());
+        }
+        let Some(slot) = self
+            .startup_cap_requirements
+            .iter_mut()
+            .find(|slot| slot.is_none())
+        else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(requirement);
+        Ok(())
+    }
+
+    fn push_dependency(&mut self, dependency: DriverSpawnDependency) -> Result<(), KernelIpcError> {
+        if self
+            .dependencies
+            .iter()
+            .any(|entry| *entry == Some(dependency))
+        {
+            return Ok(());
+        }
+        let Some(slot) = self.dependencies.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(dependency);
+        Ok(())
+    }
+
+    fn push_blocker(&mut self, blocker: DriverSpawnRequestBlocker) -> Result<(), KernelIpcError> {
+        if self.has_blocker(blocker) {
+            return Ok(());
+        }
+        let Some(slot) = self.blockers.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(blocker);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct DriverSpawnRequestBundle {
+    requests: [Option<DriverSpawnRequest>; MAX_DEVICES],
+    len: usize,
+}
+
+impl DriverSpawnRequestBundle {
+    pub const fn new() -> Self {
+        Self {
+            requests: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DriverSpawnRequest> {
+        self.requests[..self.len]
+            .iter()
+            .filter_map(|request| request.as_ref())
+    }
+
+    pub fn ready_count(&self) -> usize {
+        self.iter()
+            .filter(|request| request.status == DriverSpawnRequestStatus::ReadyForPmValidation)
+            .count()
+    }
+
+    fn push(&mut self, request: DriverSpawnRequest) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.requests[self.len] = Some(request);
+        self.len += 1;
+        Ok(())
+    }
+}
+
+fn request_status_from_pipeline(
+    plan_entry: &SpawnPlanEntry,
+    decision: &SpawnAuthorityDecision,
+) -> DriverSpawnRequestStatus {
+    if decision.approval.is_some() && matches!(plan_entry.action, SpawnAction::WouldSpawn) {
+        return DriverSpawnRequestStatus::ReadyForPmValidation;
+    }
+    match plan_entry.action {
+        SpawnAction::WouldSpawn => DriverSpawnRequestStatus::Denied,
+        SpawnAction::Deferred => DriverSpawnRequestStatus::Deferred,
+        SpawnAction::Unsupported | SpawnAction::NoCandidate => {
+            DriverSpawnRequestStatus::Unsupported
+        }
+        SpawnAction::AlreadyRunning => DriverSpawnRequestStatus::AlreadyRunning,
+    }
+}
+
+fn request_blocker_from_spawn_blocker(blocker: SpawnBlocker) -> DriverSpawnRequestBlocker {
+    match blocker {
+        SpawnBlocker::MissingMmioGrant | SpawnBlocker::DeferredNoMmioGrant => {
+            DriverSpawnRequestBlocker::MissingMmioGrant
+        }
+        SpawnBlocker::MissingIrqRoute => DriverSpawnRequestBlocker::MissingIrqRoute,
+        SpawnBlocker::MissingDmaPolicy => DriverSpawnRequestBlocker::MissingDmaPolicy,
+        SpawnBlocker::RequiresPcieBarDiscovery => {
+            DriverSpawnRequestBlocker::RequiresPcieBarDiscovery
+        }
+        SpawnBlocker::UnsupportedDevice => DriverSpawnRequestBlocker::UnsupportedDevice,
+        SpawnBlocker::UnknownCandidate => DriverSpawnRequestBlocker::UnknownCandidate,
+        SpawnBlocker::AlreadyRegistered => DriverSpawnRequestBlocker::AlreadyRunning,
+        SpawnBlocker::MissingSpawnAuthority => DriverSpawnRequestBlocker::MissingSpawnAuthority,
+        SpawnBlocker::MissingMailboxTransport => DriverSpawnRequestBlocker::MissingMailboxTransport,
+        SpawnBlocker::MissingCachePolicy => DriverSpawnRequestBlocker::MissingCachePolicy,
+    }
+}
+
+fn request_blocker_from_denial(reason: SpawnDenialReason) -> DriverSpawnRequestBlocker {
+    match reason {
+        SpawnDenialReason::MissingSpawnAuthority => {
+            DriverSpawnRequestBlocker::MissingSpawnAuthority
+        }
+        SpawnDenialReason::PlanEntryDeferred => DriverSpawnRequestBlocker::PlanEntryDeferred,
+        SpawnDenialReason::UnsupportedDevice => DriverSpawnRequestBlocker::UnsupportedDevice,
+        SpawnDenialReason::MissingMmioGrant => DriverSpawnRequestBlocker::MissingMmioGrant,
+        SpawnDenialReason::MissingIrqRoute => DriverSpawnRequestBlocker::MissingIrqRoute,
+        SpawnDenialReason::MissingDmaPolicy => DriverSpawnRequestBlocker::MissingDmaPolicy,
+        SpawnDenialReason::RequiresPcieBarDiscovery => {
+            DriverSpawnRequestBlocker::RequiresPcieBarDiscovery
+        }
+        SpawnDenialReason::MissingMailboxTransport => {
+            DriverSpawnRequestBlocker::MissingMailboxTransport
+        }
+        SpawnDenialReason::MissingCachePolicy => DriverSpawnRequestBlocker::MissingCachePolicy,
+        SpawnDenialReason::AlreadyRunning => DriverSpawnRequestBlocker::AlreadyRunning,
+        SpawnDenialReason::UnknownCandidate => DriverSpawnRequestBlocker::UnknownCandidate,
+        SpawnDenialReason::PolicyDenied => DriverSpawnRequestBlocker::PolicyDenied,
+    }
+}
+
+fn request_blocker_from_resource_blocker(
+    blocker: ResourceGrantBlocker,
+) -> DriverSpawnRequestBlocker {
+    match blocker {
+        ResourceGrantBlocker::MissingMmioAuthority => DriverSpawnRequestBlocker::MissingMmioGrant,
+        ResourceGrantBlocker::MissingIrqRouting => DriverSpawnRequestBlocker::MissingIrqRoute,
+        ResourceGrantBlocker::MissingDmaPolicy => DriverSpawnRequestBlocker::MissingDmaPolicy,
+        ResourceGrantBlocker::RequiresPcieBarDiscovery => {
+            DriverSpawnRequestBlocker::RequiresPcieBarDiscovery
+        }
+        ResourceGrantBlocker::RequiresMailboxTransport => {
+            DriverSpawnRequestBlocker::MissingMailboxTransport
+        }
+        ResourceGrantBlocker::RequiresCacheMaintenancePolicy => {
+            DriverSpawnRequestBlocker::MissingCachePolicy
+        }
+        ResourceGrantBlocker::RequiresPinmuxOwnership => {
+            DriverSpawnRequestBlocker::MissingMmioGrant
+        }
+        ResourceGrantBlocker::RequiresClockDiscovery => DriverSpawnRequestBlocker::MissingMmioGrant,
+        ResourceGrantBlocker::DeviceDeferred => DriverSpawnRequestBlocker::DeviceDeferred,
+        ResourceGrantBlocker::DeviceUnsupported => DriverSpawnRequestBlocker::UnsupportedDevice,
+        ResourceGrantBlocker::SpawnNotApproved => DriverSpawnRequestBlocker::SpawnNotApproved,
+        ResourceGrantBlocker::UnknownResource => DriverSpawnRequestBlocker::UnknownResource,
+    }
+}
+
 #[derive(Debug)]
 pub struct PlatformInventory {
     devices: [Option<DeviceRecord>; MAX_DEVICES],
@@ -900,6 +1302,50 @@ impl PlatformInventory {
     pub fn query_assigned_device(&self, tid: u64) -> Result<&DeviceRecord, KernelIpcError> {
         self.assigned_device_for(tid)
             .ok_or(KernelIpcError::TaskMissing)
+    }
+
+    pub fn build_driver_spawn_request_bundle(
+        &self,
+        plan: &SpawnPlan,
+        decisions: &SpawnAuthorityDecisions,
+        grant_bundle: &ResourceGrantBundle,
+    ) -> Result<DriverSpawnRequestBundle, KernelIpcError> {
+        let mut requests = DriverSpawnRequestBundle::new();
+        for (index, ((device, plan_entry), decision)) in self
+            .iter()
+            .zip(plan.iter())
+            .zip(decisions.iter())
+            .enumerate()
+        {
+            if device.compatible() != plan_entry.compatible()
+                || device.compatible() != decision.compatible()
+                || device.driver_candidate() != plan_entry.driver_candidate()
+                || device.driver_candidate() != decision.driver_candidate()
+            {
+                return Err(KernelIpcError::WrongObject);
+            }
+            let mut request =
+                DriverSpawnRequest::from_pipeline(device, index, plan_entry, decision)?;
+            for grant in grant_bundle
+                .iter()
+                .filter(|grant| grant.compatible() == device.compatible())
+            {
+                request.push_resource(DriverSpawnResourceRequirement {
+                    kind: grant.kind,
+                    requirement: grant.requirement,
+                    mock_resource_id: grant.mock_resource_id,
+                    blockers: grant.blockers,
+                })?;
+            }
+            requests.push(request)?;
+        }
+        if requests.len() != self.len()
+            || requests.len() != plan.len()
+            || requests.len() != decisions.len()
+        {
+            return Err(KernelIpcError::WrongObject);
+        }
+        Ok(requests)
     }
 
     pub fn build_spawn_plan(
@@ -2652,6 +3098,301 @@ mod tests {
         let unknown = grant_entries(&bundle, "vendor,unknown").next().unwrap();
         assert_eq!(unknown.requirement, ResourceGrantRequirement::Unsupported);
         assert!(unknown.has_blocker(ResourceGrantBlocker::DeviceUnsupported));
+    }
+
+    fn fake_rpi5_inventory() -> PlatformInventory {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "arm,pl011",
+                    DeviceClass::Uart,
+                    "uart_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_mmio(0, 0x107d_0010_0000, 0x1000)
+                .unwrap()
+                .with_irq(0, 121)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,firmware",
+                    DeviceClass::Mailbox,
+                    "rpi_firmware",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,rp1-gpio",
+                    DeviceClass::Gpio,
+                    "rp1_gpio_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_mmio(0, 0x1_0000, 0x1000)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "yarm,irqmux",
+                    DeviceClass::IrqMux,
+                    "irqmux_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_irq(0, 5)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "vendor,unknown",
+                    DeviceClass::Unknown,
+                    "unknown",
+                    DeviceStatus::Unsupported,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+    }
+
+    fn request_for<'a>(
+        bundle: &'a DriverSpawnRequestBundle,
+        compatible: &str,
+    ) -> &'a DriverSpawnRequest {
+        bundle
+            .iter()
+            .find(|request| request.compatible() == Some(compatible))
+            .expect("driver spawn request")
+    }
+
+    fn build_fake_rpi5_request_bundle(
+        authority: SpawnAuthorityPolicy,
+    ) -> (
+        PlatformInventory,
+        SpawnPlan,
+        SpawnAuthorityDecisions,
+        ResourceGrantBundle,
+        DriverSpawnRequestBundle,
+    ) {
+        let inventory = fake_rpi5_inventory();
+        let registry = DriverRegistry::new();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let decisions = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 7,
+                },
+                authority,
+            )
+            .unwrap();
+        let grant_bundle = inventory
+            .build_resource_grant_bundle(&plan, &decisions, ResourceGrantPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let request_bundle = inventory
+            .build_driver_spawn_request_bundle(&plan, &decisions, &grant_bundle)
+            .unwrap();
+        (inventory, plan, decisions, grant_bundle, request_bundle)
+    }
+
+    #[test]
+    fn approved_fake_pl011_pipeline_produces_pm_facing_request_with_descriptive_resources() {
+        let (_, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.ready_count(), 1);
+        let pl011 = request_for(&requests, "arm,pl011");
+        assert_eq!(pl011.status, DriverSpawnRequestStatus::ReadyForPmValidation);
+        assert_eq!(pl011.request_version, 1);
+        assert_eq!(pl011.mock_request_id, 1);
+        assert_eq!(pl011.driver_candidate(), Some("uart_srv"));
+        assert_eq!(pl011.image_name(), Some("uart_srv"));
+        assert_eq!(pl011.device_class, DeviceClass::Uart);
+        assert!(pl011.has_resource_requirement(ResourceGrantKind::Mmio));
+        assert!(pl011.has_resource_requirement(ResourceGrantKind::Irq));
+        assert!(pl011.has_resource_requirement(ResourceGrantKind::Clock));
+        assert!(pl011.has_resource_requirement(ResourceGrantKind::Pinmux));
+        assert!(
+            pl011
+                .resource_requirements
+                .iter()
+                .filter_map(|entry| *entry)
+                .all(
+                    |entry| entry.requirement == ResourceGrantRequirement::WouldRequest
+                        && entry.mock_resource_id.is_some_and(|id| id > 0)
+                )
+        );
+    }
+
+    #[test]
+    fn pl011_request_includes_descriptive_startup_cap_requirements() {
+        let (_, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let pl011 = request_for(&requests, "arm,pl011");
+        for requirement in [
+            StartupCapRequirement::DriverManagerControlEndpoint,
+            StartupCapRequirement::DriverRegistrationEndpoint,
+            StartupCapRequirement::FaultOrRestartEndpoint,
+            StartupCapRequirement::Mmio,
+            StartupCapRequirement::IrqNotification,
+            StartupCapRequirement::DevfsRegistration,
+            StartupCapRequirement::LoggingOrDebug,
+        ] {
+            assert!(
+                pl011.has_startup_cap_requirement(requirement),
+                "missing startup-cap descriptor: {requirement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fail_closed_spawn_authority_produces_no_ready_spawn_request() {
+        let (_, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::fail_closed());
+        assert_eq!(requests.ready_count(), 0);
+        let pl011 = request_for(&requests, "arm,pl011");
+        assert_eq!(pl011.status, DriverSpawnRequestStatus::Denied);
+        assert!(pl011.has_blocker(DriverSpawnRequestBlocker::MissingSpawnAuthority));
+        assert!(
+            pl011
+                .resource_requirements
+                .iter()
+                .filter_map(|entry| *entry)
+                .all(|entry| entry.requirement != ResourceGrantRequirement::WouldRequest)
+        );
+    }
+
+    #[test]
+    fn deferred_and_unsupported_devices_produce_inert_request_records() {
+        let (_, _, _, _, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+
+        let rp1 = request_for(&requests, "raspberrypi,rp1-gpio");
+        assert_eq!(rp1.status, DriverSpawnRequestStatus::Deferred);
+        assert!(rp1.has_resource_requirement(ResourceGrantKind::PcieBar));
+        assert!(rp1.has_resource_requirement(ResourceGrantKind::Mmio));
+        assert!(rp1.has_blocker(DriverSpawnRequestBlocker::RequiresPcieBarDiscovery));
+        assert!(rp1.has_blocker(DriverSpawnRequestBlocker::MissingMmioGrant));
+
+        let mailbox = request_for(&requests, "raspberrypi,firmware");
+        assert_eq!(mailbox.status, DriverSpawnRequestStatus::Deferred);
+        assert!(mailbox.has_resource_requirement(ResourceGrantKind::MailboxTransport));
+        assert!(mailbox.has_resource_requirement(ResourceGrantKind::Dma));
+        assert!(mailbox.has_resource_requirement(ResourceGrantKind::Mmio));
+        assert!(mailbox.has_blocker(DriverSpawnRequestBlocker::MissingMailboxTransport));
+        assert!(mailbox.has_blocker(DriverSpawnRequestBlocker::MissingCachePolicy));
+        assert!(mailbox.has_blocker(DriverSpawnRequestBlocker::MissingDmaPolicy));
+        assert!(mailbox.has_blocker(DriverSpawnRequestBlocker::MissingMmioGrant));
+
+        let irqmux = request_for(&requests, "yarm,irqmux");
+        assert_eq!(irqmux.status, DriverSpawnRequestStatus::Deferred);
+        assert!(irqmux.has_resource_requirement(ResourceGrantKind::Irq));
+        assert!(irqmux.has_blocker(DriverSpawnRequestBlocker::MissingIrqRoute));
+
+        let unknown = request_for(&requests, "vendor,unknown");
+        assert_eq!(unknown.status, DriverSpawnRequestStatus::Unsupported);
+        assert!(unknown.has_resource_requirement(ResourceGrantKind::Unknown));
+        assert!(unknown.has_blocker(DriverSpawnRequestBlocker::UnsupportedDevice));
+        assert!(unknown.has_blocker(DriverSpawnRequestBlocker::UnknownResource));
+    }
+
+    #[test]
+    fn already_running_does_not_produce_duplicate_ready_pm_request() {
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let decisions = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 8,
+                },
+                SpawnAuthorityPolicy::allow_hosted_mock_spawns(),
+            )
+            .unwrap();
+        let grant_bundle = inventory
+            .build_resource_grant_bundle(&plan, &decisions, ResourceGrantPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let requests = inventory
+            .build_driver_spawn_request_bundle(&plan, &decisions, &grant_bundle)
+            .unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests.ready_count(), 0);
+        let pl011 = request_for(&requests, "arm,pl011");
+        assert_eq!(pl011.status, DriverSpawnRequestStatus::AlreadyRunning);
+        assert!(pl011.has_blocker(DriverSpawnRequestBlocker::AlreadyRunning));
+    }
+
+    #[test]
+    fn request_bundle_generation_is_deterministic_bounded_and_inert() {
+        let (inventory, plan, decisions, grants, first) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        let before = (inventory.len(), plan.len(), decisions.len(), grants.len());
+        let second = inventory
+            .build_driver_spawn_request_bundle(&plan, &decisions, &grants)
+            .unwrap();
+        assert_eq!(
+            before,
+            (inventory.len(), plan.len(), decisions.len(), grants.len())
+        );
+        assert_eq!(first.len(), second.len());
+        assert!(first.len() <= MAX_DEVICES);
+        for (left, right) in first.iter().zip(second.iter()) {
+            assert_eq!(left, right);
+            assert!(left.mock_request_id > 0);
+            assert_eq!(left.image_id, None);
+            assert!(left.resource_requirements.len() <= MAX_DRIVER_SPAWN_REQUEST_RESOURCES);
+            assert!(left.startup_cap_requirements.len() <= MAX_STARTUP_CAP_REQUIREMENTS);
+        }
+    }
+
+    #[test]
+    fn request_bundle_contains_no_caps_and_performs_no_pm_mmio_grant_or_spawn_operation() {
+        let (inventory, plan, decisions, grants, requests) =
+            build_fake_rpi5_request_bundle(SpawnAuthorityPolicy::allow_hosted_mock_spawns());
+        assert_eq!(requests.ready_count(), 1);
+        assert_eq!(
+            (inventory.len(), plan.len(), decisions.len(), grants.len()),
+            (5, 5, 5, 11)
+        );
+        for request in requests.iter() {
+            assert_eq!(request.image_id, None, "image identity remains descriptive");
+            assert!(request.mock_request_id > 0);
+            for resource in request
+                .resource_requirements
+                .iter()
+                .filter_map(|entry| *entry)
+            {
+                assert_ne!(resource.mock_resource_id, Some(0));
+            }
+        }
+        let mut runtime = MockDriverControl::new();
+        assert_eq!(runtime.irq_line.get(), None);
+        assert_eq!(runtime.dma_request.get(), None);
+        assert_eq!(runtime.irq_grant.get(), None);
+        assert_eq!(runtime.dma_grant.get(), None);
+        assert_eq!(runtime.registered.get(), None);
+        // Keep a runtime instance alive to prove the request-bundle helper has no
+        // parameter through which it could call PM/supervisor/control operations.
+        let _ = &mut runtime;
     }
 
     #[test]

@@ -6,7 +6,9 @@
 This document records the intended **future** contract between Driver Manager
 (DM) and Process Manager (PM) for live driver spawning. It is a design note only:
 DRS-6 does not add live spawning, hardware grants, capability minting, real MMIO,
-live-DTB parsing, PM calls, or boot-chain changes.
+live-DTB parsing, PM calls, or boot-chain changes. DRS-7 adds an inert
+`DriverSpawnRequest` model that connects the mock pipeline to this contract, but
+it still produces data only and does not call PM.
 
 The current DRS models remain advisory mock policy/data models. They describe
 what a safe future request would contain, but they do not transfer authority.
@@ -44,6 +46,7 @@ The current hosted and mock-safe DRS path is:
 4. Policy-only `SpawnPlan` entries.
 5. Mock `SpawnAuthorityDecision` approvals or denials.
 6. Mock `ResourceGrantBundle` descriptions.
+7. DRS-7 inert `DriverSpawnRequestBundle` / `DriverSpawnRequest` records.
 
 This pipeline is descriptive. It never calls PM or supervisor services, never
 spawns a task, never grants resources, never transfers caps, and never touches
@@ -72,7 +75,10 @@ The intended live path is:
 
 ## 3. PM-facing `DriverSpawnRequest` shape
 
-A future `DriverSpawnRequest` should be versioned and explicit. A conceptual
+DRS-7 models this request shape with bounded inert Rust types near the
+`driver_manager` policy code. The model is PM-facing data only: request IDs and
+resource IDs are mock identifiers, not `CapId`s, process handles, or authority.
+A future live `DriverSpawnRequest` should be versioned and explicit. A conceptual
 shape is:
 
 | Field | Purpose |
@@ -98,14 +104,19 @@ shape is:
 | `startup_timeout` / `health_expectation` | Expected registration and heartbeat deadlines. |
 | `rollback_behavior` | Required cleanup semantics if setup or registration fails. |
 
-Every resource field is a requirement, not a grant. PM must derive actual
-mechanism from validated platform state and kernel policy.
+Every resource field is a requirement, not a grant. DRS-7 copies/describes the
+mock `ResourceGrantBundle` requirements into the inert request model so hosted
+tests can inspect MMIO/IRQ/DMA/mailbox/BAR/pinmux/clock needs without granting
+anything. PM must derive actual mechanism from validated platform state and
+kernel policy in a later live stage.
 
 ## 4. Startup-cap layout proposal
 
 The driver startup interface should use a stable, documented slot layout before
-any implementation. The following layout is descriptive only; every cap listed
-here is **future** until PM implements and validates it.
+any implementation. DRS-7 adds `StartupCapRequirement` descriptors for this
+layout, but they are descriptive only and do not mint, transfer, or install caps.
+The following layout is descriptive only; every cap listed here is **future**
+until PM implements and validates it.
 
 | Slot | Future cap | Description |
 | --- | --- | --- |
@@ -208,6 +219,7 @@ DRS-6 explicitly does not add:
 - kernel ABI, syscall ABI, IPC ABI, cap-logic, scheduler, VM, trap-entry, RPi5
   boot, or init-bootstrap changes;
 - PM or supervisor-service calls;
+- live use of the inert DRS-7 request records as process-creation authority;
 - service-manifest behavior changes.
 
 Driver Manager remains advisory only in this stage.
@@ -222,7 +234,11 @@ The existing DRS models map to the future contract as follows:
   ordering.
 - `SpawnAuthorityDecision` represents mock PM approval/denial for tests; it is
   not a PM response and carries no authority.
-- `ResourceGrantBundle` becomes the descriptive source for future
+- `ResourceGrantBundle` becomes the descriptive source for DRS-7
   `DriverSpawnRequest.resource_requirements`; it does not grant anything.
+- DRS-7 `DriverSpawnRequestBundle` is the inert PM-facing projection of the
+  inventory/plan/authority/grant-bundle pipeline. Approved PL011 entries may be
+  `ReadyForPmValidation`; deferred, denied, unknown, and already-running entries
+  remain inert records and are not spawn requests.
 - No mock model itself grants authority, mints caps, calls PM, creates a task, or
   touches MMIO.
