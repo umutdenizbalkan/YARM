@@ -412,6 +412,7 @@ impl KernelState {
         endpoint_idx: usize,
         waiter: SenderWaiter,
     ) -> Result<(), KernelError> {
+        let waiter_tid = waiter.tid.0;
         self.with_ipc_state_mut(|ipc| {
             // Defence-in-depth: verify endpoint still exists.
             ipc.endpoints
@@ -424,6 +425,22 @@ impl KernelState {
                 .find(|s| s.is_none())
             {
                 *slot = Some(waiter);
+                // Stage 163 (sub-knob-gated, no-op otherwise): the sender is now a
+                // real waiter on this endpoint. If this is the proof loopback E1,
+                // push the deterministic waiter-present signal into the proof
+                // coordination endpoint E2 WITHIN this same `ipc_state_lock`
+                // critical section, so init (which non-blocking-polls E2) drains E1
+                // only after the sender is provably blocked — race-free on SMP.
+                // No scheduler/cap/user-copy work here (init polls; no wake needed),
+                // so no lock-order hazard.
+                if let Some(e2_idx) = super::proof_sender_wake_coordination_target(endpoint_idx) {
+                    super::proof_sender_wake_push_coordination_locked(ipc, e2_idx, waiter_tid);
+                    crate::yarm_log!(
+                        "IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT endpoint={} tid={}",
+                        endpoint_idx,
+                        waiter_tid
+                    );
+                }
                 return Ok(());
             }
             Err(KernelError::EndpointQueueFull)

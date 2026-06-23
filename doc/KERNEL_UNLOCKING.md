@@ -3317,6 +3317,91 @@ Stage 161, requiring BOTH `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` and
 `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`) stays default-off and fails by design until
 that lands. Queued-split + rollback remain green and required.
 
+#### 5.1.9.6 Stage 163 — proof-gated deterministic sender-wake oracle (IMPLEMENTED)
+
+Stage 163 lands the design proposed in 5.1.9.5, with two simplifications that make
+it strictly *less* risky than the proposal. Sender-wake is now **proven, not
+deferred**, and is isolated behind a **separate** sub-knob
+`yarm.ipc_recv_proof_sender_wake=1` layered atop `yarm.ipc_recv_proof=1`. With the
+sub-knob absent, *nothing* changes: the kernel coordination hook is inert, the
+second coordination endpoint `E2` is never provisioned, the sender-wake workload
+never runs, and the already-green queued-split + rollback proof boots (which set
+only the base knob) are byte-for-byte unchanged.
+
+**Sub-knob (Task A).** `boot_command_line.rs` parses
+`yarm.ipc_recv_proof_sender_wake` into `BootOptions.ipc_recv_proof_sender_wake`
+(default `None` → off), applied to the `IPC_RECV_PROOF_SENDER_WAKE_ENABLED`
+atomic. `boot::ipc_recv_proof_sender_wake_active()` is the AND of the base proof
+knob and the sub-knob — the single precondition for any sender-wake behavior. The
+parser is verified to not prefix-alias the base knob.
+
+**Timed/blocking send wrapper (Task B).** `yarm_user_rt::syscall::ipc_send_timeout_ticks`
+is `ipc_send` with arg slot 4 (`SYSCALL_ARG_INLINE_PAYLOAD1`) set to a non-zero
+timeout, routing the kernel to `ipc_send_with_deadline` so the sender genuinely
+blocks and becomes a real waiter. This **reuses the existing send ABI — no syscall
+or IPC ABI change** (`SYSCALL_COUNT == 31`, `Syscall::VARIANT_COUNT == 23`
+unchanged).
+
+**Second execution context (Task C) — Fork, not SpawnThread.** The proposal
+suggested a from-scratch `SpawnThread` bootstrap; we chose **`Fork` (NR 12)**
+instead because there is no existing userspace thread-bootstrap pattern (entry
+trampoline / stack / TLS) to reuse, whereas `Fork` returns child-tid to the parent
+and `0` to the child, inheriting init's COW address space and ordinary IPC caps
+with no manual stack/TLS setup. `yarm_user_rt::syscall::fork()` wraps NR 12. The
+child is the blocked sender; the parent (init) is the receiver. The child parks in
+a `yield_now` loop after its send and never re-enters init's flow.
+
+**Proof-gated kernel coordination hook (Task D).** When and only when
+`proof_sender_wake_coordination_target(endpoint_idx)` returns `Some(e2_idx)` — i.e.
+the sub-knob is active *and* `endpoint_idx` is the provisioned proof `E1` — the
+`enqueue_sender_waiter` path calls `proof_sender_wake_push_coordination_locked`,
+which pushes a one-byte signal into `E2`'s queue **inside the same `ipc_state_lock`
+critical section** that makes the proof sender a waiter on `E1`, and logs
+`IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT`. This is even simpler than the proposed
+deferred wake: because init **non-blocking-polls** `E2` (rather than blocking-recv),
+**no scheduler wake is needed at all**, so the hook does *zero* scheduler / cap /
+user-copy work under the lock — it only mutates `E2`'s in-domain message queue.
+There is therefore **no lock-order hazard** (the proposed `apply_split_*_wake_plan`
+deferred-wake dance is unnecessary). "E2 has the signal" is an atomic proxy for
+"the sender is a waiter on E1", with no race window even on SMP — so the timer-
+preemption race that blocked Stages 161/162 is closed without any CPU-affinity pin.
+The kernel mints `E2` in `provision_init_ipc_recv_proof_sender_wake_e2` (gated on
+`ipc_recv_proof_sender_wake_active()`) and grants init a RECEIVE cap, wired into
+init startup slot 13 (`service_extra_cap_0`, otherwise unused) identically across
+the x86_64 / AArch64 / riscv64 boots, on none of the D6/CR3/TSS/PF or RPi5 paths.
+
+**Deterministic sequence (Task E).** `run_ipc_recv_proof_sender_wake` (init): (1)
+fills `E1` to capacity with plain non-blocking sends; (2) forks; (3) the child does
+a TIMED blocking send on the full `E1` → becomes a real sender-waiter, triggering
+the kernel hook → `E2` signal; (4) init non-blocking-polls `E2` (bounded) until the
+signal appears — exactly when the sender is provably a waiter; (5) init `recv-v2`
+drains `E1` (NR 2 → trap-entry split path), the real path emits
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` and refills + wakes the sender; (6) init drains
+until it observes the child's own message (`sender_tid == child`) and only then
+emits `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`. ~12 phase markers
+(`..._BEGIN/_SETUP/_FILL/_SENDER_*/_RECV_*/_SEQUENCE_DONE`) bracket the run. All
+waits are bounded so a missing child (e.g. fork failure) degrades to a logged
+give-up (`..._NO_WAITER_SIGNAL` / `..._SENDER_MSG_ABSENT`), never a hang. The
+kernel marker is **never faked** from userspace; `SEQUENCE_DONE` is gated on real
+observed child progress.
+
+**Oracle (Task F).** `qemu-ipc-recv-v2-oracle-smoke.sh` with
+`YARM_IPC_RECV_PROOF_SENDER_WAKE=1` exports both `IPC_RECV_PROOF=1` and
+`IPC_RECV_PROOF_SENDER_WAKE=1`, the per-arch core smokes append both boot knobs,
+and `proof_require "sender-wake"` requires BOTH the userspace `SEQUENCE_DONE` and
+the kernel `SENDER_WAKE_ORDER_OK`. As with queued-split, the kernel marker (emitted
+only on the trap-entry split path via `apply_split_sender_wake_plan`) is REQUIRED
+on x86_64 and DEFERRED on AArch64/riscv64 (whose proof recv falls back to
+`legacy_full_path`) — the existing per-arch `proof_require` policy.
+
+**Isolation invariant.** Queued-split + rollback remain green and required under the
+base knob alone; their boots never provision `E2`, never run the sender-wake
+workload, and never hit the coordination hook. No IPC/cap stateful seam
+(`complete_blocked_recv_for_waiter`, `try_endpoint_split_recv`,
+`try_split_recv_queued_plain_*`, `clear_blocked_recv_state`) was moved. Stage 163
+guards in `boot/tests.rs::stage163_sender_wake_proven` pin every one of these
+properties.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

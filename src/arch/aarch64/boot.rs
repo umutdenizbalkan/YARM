@@ -7733,6 +7733,14 @@ pub fn bootstrap_first_user_task(
         init_args[6] = proof_send_cap as u64;
         init_args[7] = proof_recv_cap as u64;
     }
+    // Stage 163: sub-knob-gated (`yarm.ipc_recv_proof_sender_wake=1`) coordination
+    // endpoint E2 recv cap in slot 13 (service_extra_cap_0, unused by init).
+    if let Some(e2_recv_cap) = crate::kernel::boot::provision_init_ipc_recv_proof_sender_wake_e2(
+        kernel,
+        RING3_INIT_SERVER_TID,
+    ) {
+        init_args[13] = e2_recv_cap as u64;
+    }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
         RING3_INIT_SERVER_TID,

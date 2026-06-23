@@ -692,6 +692,60 @@ pub fn ipc_recv_oracle_proof_enabled() -> bool {
     IPC_RECV_ORACLE_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 163: `yarm.ipc_recv_proof_sender_wake=1` SUB-knob, layered on top of
+/// `yarm.ipc_recv_proof=1`. Default-off and independent: the sender-wake
+/// coordination hook and workload run ONLY when BOTH knobs are set, so the
+/// already-green queued-split + rollback proof boots (which set only
+/// `yarm.ipc_recv_proof=1`) are completely unaffected. When enabled, the
+/// bootstrap additionally provisions a second proof "coordination" endpoint (E2)
+/// and the sender-waiter-enqueue path emits a deterministic, race-free
+/// waiter-present signal into E2 (see `proof_sender_wake_*` below).
+pub(crate) static IPC_RECV_PROOF_SENDER_WAKE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Endpoint INDEX of the proof loopback endpoint E1 (the fill/drain channel), and
+/// of the proof coordination endpoint E2 (the waiter-present signal channel),
+/// captured at provision time when the sender-wake sub-knob is set. `usize::MAX`
+/// means "not provisioned" so the enqueue-waiter hook is a no-op. Only the
+/// kernel reads these (to recognize E1 in the sender-waiter-enqueue path and to
+/// push the coordination message into E2).
+pub(crate) static IPC_RECV_PROOF_SENDER_WAKE_E1_IDX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub(crate) static IPC_RECV_PROOF_SENDER_WAKE_E2_IDX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub(crate) fn set_ipc_recv_proof_sender_wake_enabled(enabled: bool) {
+    IPC_RECV_PROOF_SENDER_WAKE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn ipc_recv_proof_sender_wake_enabled() -> bool {
+    IPC_RECV_PROOF_SENDER_WAKE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// True only when BOTH the base proof knob and the sender-wake sub-knob are set —
+/// the precondition for any sender-wake coordination/workload behavior.
+pub fn ipc_recv_proof_sender_wake_active() -> bool {
+    ipc_recv_oracle_proof_enabled() && ipc_recv_proof_sender_wake_enabled()
+}
+
+/// If `endpoint_idx` is the provisioned proof loopback E1 (and the sender-wake
+/// sub-knob is active), return the coordination endpoint E2's index so the caller
+/// can push the deterministic waiter-present signal. Returns `None` otherwise —
+/// so this is a strict no-op on every endpoint except the proof E1, and only
+/// under the sub-knob.
+pub(crate) fn proof_sender_wake_coordination_target(endpoint_idx: usize) -> Option<usize> {
+    if !ipc_recv_proof_sender_wake_active() {
+        return None;
+    }
+    let e1 = IPC_RECV_PROOF_SENDER_WAKE_E1_IDX.load(core::sync::atomic::Ordering::Acquire);
+    let e2 = IPC_RECV_PROOF_SENDER_WAKE_E2_IDX.load(core::sync::atomic::Ordering::Acquire);
+    if e1 != usize::MAX && e2 != usize::MAX && endpoint_idx == e1 {
+        Some(e2)
+    } else {
+        None
+    }
+}
+
 /// Stage 159BC/D: provision the userspace IPC recv-v2 oracle loopback endpoint.
 ///
 /// When (and ONLY when) `yarm.ipc_recv_proof=1` is set, mint a fresh buffered
@@ -720,7 +774,7 @@ pub fn provision_init_ipc_recv_proof_loopback(
     if !ipc_recv_oracle_proof_enabled() {
         return None;
     }
-    let (_eid, send_root, recv_root) = match kernel.create_endpoint(8) {
+    let (e1_idx, send_root, recv_root) = match kernel.create_endpoint(8) {
         Ok(triple) => triple,
         Err(e) => {
             crate::yarm_log!(
@@ -730,6 +784,10 @@ pub fn provision_init_ipc_recv_proof_loopback(
             return None;
         }
     };
+    // Stage 163: remember E1's endpoint index so the (sub-knob-gated)
+    // sender-waiter-enqueue hook can recognize it. Stored unconditionally here;
+    // the hook is still inert unless the sender-wake sub-knob is also set.
+    IPC_RECV_PROOF_SENDER_WAKE_E1_IDX.store(e1_idx, core::sync::atomic::Ordering::Release);
     let send_cap = match kernel.grant_capability_task_to_task_with_rights(
         0,
         send_root,
@@ -761,6 +819,77 @@ pub fn provision_init_ipc_recv_proof_loopback(
         recv_cap.0
     );
     Some((send_cap.0 as u32, recv_cap.0 as u32))
+}
+
+/// Stage 163: provision the second proof "coordination" endpoint E2 for the
+/// sender-wake proof, and grant init (TID 1) a RECEIVE cap to it. Returns the
+/// recv cap, which the caller wires into init's startup slot 13
+/// (`service_extra_cap_0`, unused by init). Active ONLY when BOTH the base proof
+/// knob and the sender-wake sub-knob are set — so queued-split + rollback proof
+/// boots (base knob only) never get E2 and the sender-waiter-enqueue hook stays
+/// inert (E2 index left unset).
+///
+/// E2 carries the deterministic, race-free "sender is a waiter" signal: the
+/// kernel pushes a coordination message into E2 from inside the same
+/// `enqueue_sender_waiter` critical section that makes the proof sender a waiter
+/// on E1, so init (which non-blocking-polls E2) drains E1 only after the sender
+/// is provably blocked.
+pub fn provision_init_ipc_recv_proof_sender_wake_e2(
+    kernel: &mut KernelState,
+    init_tid: u64,
+) -> Option<u32> {
+    if !ipc_recv_proof_sender_wake_active() {
+        return None;
+    }
+    let (e2_idx, _send_root, recv_root) = match kernel.create_endpoint(8) {
+        Ok(triple) => triple,
+        Err(e) => {
+            crate::yarm_log!("IPC_RECV_PROOF_SW_E2_FAIL step=create_endpoint err={:?}", e);
+            return None;
+        }
+    };
+    let recv_cap = match kernel.grant_capability_task_to_task_with_rights(
+        0,
+        recv_root,
+        init_tid,
+        crate::kernel::capabilities::CapRights::RECEIVE,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            crate::yarm_log!("IPC_RECV_PROOF_SW_E2_FAIL step=grant_recv err={:?}", e);
+            return None;
+        }
+    };
+    IPC_RECV_PROOF_SENDER_WAKE_E2_IDX.store(e2_idx, core::sync::atomic::Ordering::Release);
+    crate::yarm_log!(
+        "IPC_RECV_PROOF_SW_E2_OK init_tid={} e1_idx={} e2_idx={} recv_cap={}",
+        init_tid,
+        IPC_RECV_PROOF_SENDER_WAKE_E1_IDX.load(core::sync::atomic::Ordering::Acquire),
+        e2_idx,
+        recv_cap.0
+    );
+    Some(recv_cap.0 as u32)
+}
+
+/// Stage 163: push the deterministic waiter-present coordination message into the
+/// proof coordination endpoint E2. Called from the sender-waiter-enqueue path
+/// (which already holds `ipc_state_lock`), so E2's queue — in the same IPC
+/// domain — is mutated within the SAME critical section as the waiter enqueue,
+/// making "E2 has the signal" an atomic proxy for "the sender is a waiter on E1".
+/// No scheduler/cap/user-copy work is done here (init non-blocking-polls E2, so no
+/// wake is needed), so there is no lock-order hazard. Best-effort: a full E2 queue
+/// (already signalled) is harmless.
+pub(crate) fn proof_sender_wake_push_coordination_locked(
+    ipc: &mut defs::IpcSubsystem,
+    e2_idx: usize,
+    waiter_tid: u64,
+) {
+    if let Some(Some(endpoint_storage)) = ipc.endpoints.get_mut(e2_idx) {
+        let endpoint = defs::kernel_mut(endpoint_storage);
+        if let Ok(msg) = Message::with_header(waiter_tid, 0, 0, None, &[0xE2u8]) {
+            let _ = endpoint.send(msg);
+        }
+    }
 }
 
 /// Stage 118: context for the first-resume trampoline (`yarm_kernel_thread_switch_trampoline`).
