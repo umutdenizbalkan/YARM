@@ -42443,3 +42443,86 @@ mod stage160_aarch64_split_recv_routing {
         );
     }
 }
+
+// Stage 160B — AArch64 recv split-dispatch routing audit. Diagnostics pin the
+// pre-helper fallback: the AArch64 trap frame's decoded syscall ABI
+// (syscall_num/args) is imported from the user GPRs only inside the GLOBAL
+// handler, AFTER the split dispatch runs — so the split dispatch sees nr=0 and
+// the NR gate rejects every recv before the helper. The full fix (import before +
+// export after + SVC PC-advance for the split path on AArch64) is a separate
+// arch-integration stage; this stage is diagnostic-only and does NOT enable the
+// not-yet-safe split path on AArch64.
+mod stage160b_aarch64_recv_split_dispatch_audit {
+    const SYSCALL_SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+
+    // 1. The requested routing diagnostics exist in the split dispatcher.
+    #[test]
+    fn stage160b_routing_diagnostics_exist() {
+        for marker in &[
+            "YARM_SPLIT_DISPATCH_ENTER nr=",
+            "YARM_SPLIT_DISPATCH_FALLBACK reason=",
+            "YARM_SPLIT_DISPATCH_RECV_CONSIDER nr=",
+            "YARM_SPLIT_DISPATCH_RECV_CALL",
+        ] {
+            assert!(
+                SYSCALL_SPLIT_SRC.contains(marker),
+                "split-dispatch routing diagnostic `{marker}` must exist"
+            );
+        }
+        // Both pre-helper fallback reasons are distinguishable.
+        assert!(
+            SYSCALL_SPLIT_SRC.contains("reason=nr_undecodable")
+                && SYSCALL_SPLIT_SRC.contains("reason=nr_not_eligible"),
+            "the two pre-helper NR-gate fallback reasons must be distinguishable"
+        );
+    }
+
+    // 2. Diagnostics are gated behind the proof knob so normal/fast boots stay
+    //    clean (no per-syscall log spam when the oracle proof is not requested).
+    #[test]
+    fn stage160b_diagnostics_gated_by_proof_knob() {
+        let block = SYSCALL_SPLIT_SRC
+            .split("fn try_split_dispatch_into_frame")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("dispatcher must exist");
+        assert!(
+            block.contains("ipc_recv_oracle_proof_enabled()") && block.contains("if probe"),
+            "routing diagnostics must be gated by the ipc_recv_oracle_proof knob"
+        );
+    }
+
+    // 3. This stage is diagnostic-only: it must NOT have moved any IPC/cap seam,
+    //    and the AArch64 syscall-ABI import/export helpers remain where they are
+    //    (the fix that would reorder them is deferred to a dedicated stage).
+    #[test]
+    fn stage160b_no_seam_moved_and_abi_helpers_intact() {
+        for def in &[
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_endpoint_split_recv(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            AARCH64_TRAP_SRC.contains("fn import_syscall_abi_from_user_gprs(")
+                && AARCH64_TRAP_SRC.contains("fn export_syscall_result_to_user_gprs("),
+            "AArch64 syscall-ABI import/export helpers must remain present"
+        );
+    }
+
+    // 4. Counts unchanged.
+    #[test]
+    fn stage160b_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts must be unchanged"
+        );
+    }
+}

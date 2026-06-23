@@ -210,9 +210,36 @@ pub(crate) fn try_split_dispatch_into_frame(
 ) -> Option<Result<(), TrapHandleError>> {
     use crate::kernel::syscall::{SYSCALL_ARG_CAP, SYSCALL_ARG_PTR};
 
+    // Stage 160B diagnostics (proof-knob–gated so normal/fast boots stay clean):
+    // pin exactly where a syscall enters or skips the pre-global-lock split
+    // dispatch. These read the frame's *decoded* syscall ABI (`syscall_num()` /
+    // `arg()`), which is the same source the eligibility checks below use — so a
+    // mismatch versus the real trapped syscall (e.g. an AArch64 frame whose
+    // syscall_num/args have not yet been imported from the user GPRs) shows up
+    // directly as `nr=0`.
+    let probe = crate::kernel::boot::ipc_recv_oracle_proof_enabled();
+    let raw_nr = frame.syscall_num();
+    if probe {
+        crate::yarm_log!("YARM_SPLIT_DISPATCH_ENTER nr={}", raw_nr);
+    }
+
     // Default-deny by syscall number first (cheap, no lock).
-    let syscall = Syscall::decode(frame.syscall_num()).ok()?;
+    let Ok(syscall) = Syscall::decode(raw_nr) else {
+        if probe {
+            crate::yarm_log!(
+                "YARM_SPLIT_DISPATCH_FALLBACK reason=nr_undecodable nr={}",
+                raw_nr
+            );
+        }
+        return None;
+    };
     if classify_split_eligible_nr_only(syscall).is_none() {
+        if probe {
+            crate::yarm_log!(
+                "YARM_SPLIT_DISPATCH_FALLBACK reason=nr_not_eligible nr={}",
+                raw_nr
+            );
+        }
         return None;
     }
 
@@ -224,6 +251,10 @@ pub(crate) fn try_split_dispatch_into_frame(
     // would-be-fallback into a `Some(Err(..))` (it only returns `Some(Err)` for a
     // cap-resolution error the old path would have raised identically).
     if matches!(syscall, Syscall::IpcRecv) {
+        if probe {
+            crate::yarm_log!("YARM_SPLIT_DISPATCH_RECV_CONSIDER nr={}", raw_nr);
+            crate::yarm_log!("YARM_SPLIT_DISPATCH_RECV_CALL");
+        }
         return try_split_ipc_recv_queued_plain_into_frame(shared, cpu, frame);
     }
 
