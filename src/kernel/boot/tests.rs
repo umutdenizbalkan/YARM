@@ -42911,3 +42911,118 @@ mod stage161_sender_wake_deferred {
         );
     }
 }
+
+// Stage 162 — sender-wake proof infrastructure feasibility audit. Strict
+// determinism requires a kernel coordination signal at sender-waiter-enqueue
+// (the timer preempts running user tasks, so any pure-userspace handshake has a
+// race window). That risky kernel-IPC-path change is NOT landed blind; sender-wake
+// stays DEFERRED (not faked) and the green queued-split/rollback proofs are
+// untouched. These guards pin that no risky half-built infra was introduced and
+// the invariants hold.
+mod stage162_sender_wake_infra_deferred {
+    const INIT_SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const ORACLE_SCRIPT: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // 1. Sender-wake remains deferred-not-faked: the workload still logs a DEFERRED
+    //    marker and never emits the userspace sequence marker, and no userspace
+    //    timed-blocking-send or SpawnThread proof wrapper was half-wired in.
+    #[test]
+    fn stage162_no_partial_infra_and_still_deferred() {
+        assert!(
+            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED")
+                && !INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "sender-wake must remain deferred (no userspace sequence marker emitted)"
+        );
+        // No half-built second-context or timed-send proof wrappers (those land in
+        // the proposed Stage 163, fully wired, not partially).
+        for absent in &[
+            "fn ipc_send_timeout",
+            "fn spawn_thread",
+            "SYSCALL_SPAWN_THREAD_NR",
+            "SYSCALL_FORK_NR",
+        ] {
+            assert!(
+                !USER_RT_SRC.contains(absent),
+                "no half-built sender-wake infra (`{absent}`) may be introduced in this stage"
+            );
+        }
+    }
+
+    // 2. No risky kernel coordination hook was landed in the sender-waiter-enqueue
+    //    path (the strictly-race-free signal is deferred to Stage 163).
+    #[test]
+    fn stage162_no_kernel_waiter_enqueue_hook_landed() {
+        let enqueue = IPC_STATE_SRC
+            .split("fn enqueue_sender_waiter")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .or_else(|| {
+                IPC_STATE_SRC
+                    .split("fn enqueue_sender_waiter")
+                    .nth(1)
+                    .map(|s| &s[..s.len().min(1200)])
+            })
+            .expect("enqueue_sender_waiter must exist");
+        assert!(
+            !enqueue.contains("IPC_RECV_PROOF_SENDER_WAKE")
+                && !enqueue.contains("ipc_recv_oracle_proof_enabled"),
+            "no proof coordination hook may be landed in enqueue_sender_waiter this stage"
+        );
+    }
+
+    // 3. Queued-split + rollback proofs remain required when their env vars are set
+    //    (green coverage untouched), and sender-wake stays default-off requiring
+    //    BOTH markers when explicitly enabled.
+    #[test]
+    fn stage162_green_proofs_intact_sender_wake_optional() {
+        assert!(
+            ORACLE_SCRIPT.contains("proof_require \"queued-split\" \"IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE\" \"IPC_RECV_V2_META_QUEUED_SPLIT_OK\"")
+                && ORACLE_SCRIPT.contains("proof_require \"rollback\" \"IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE\" \"IPC_RECV_V2_ROLLBACK_OK\""),
+            "queued-split + rollback requirements must remain"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_SENDER_WAKE:-0}")
+                && ORACLE_SCRIPT.contains("proof_require \"sender-wake\" \"IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE\" \"IPC_RECV_V2_SENDER_WAKE_ORDER_OK\""),
+            "sender-wake must stay default-off and require both markers when enabled"
+        );
+    }
+
+    // 4. The deferral + proposed strictly-race-free Stage 163 design is documented.
+    #[test]
+    fn stage162_blocker_and_design_documented() {
+        assert!(
+            DOC_SRC.contains("Stage 162 — sender-wake proof infrastructure")
+                && DOC_SRC.contains("enqueue_sender_waiter")
+                && DOC_SRC.contains("Proposed Stage 163"),
+            "Stage 162 feasibility audit + proposed Stage 163 design must be documented"
+        );
+    }
+
+    // 5. No IPC/cap seam moved; counts unchanged.
+    #[test]
+    fn stage162_no_seam_moved_counts_unchanged() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts must be unchanged"
+        );
+    }
+}
