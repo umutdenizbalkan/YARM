@@ -8,7 +8,9 @@ current high-half (HH) diagnostic boot to a first safe driver spawn. This is a
 **conservative audit**, not a feature claim. Hardware bring-up detail is owned by
 [`doc/RPI5_BRINGUP.md`](../../doc/RPI5_BRINGUP.md); driver/IRQ contracts live in
 [`doc/DRIVER_PROTOCOL.md`](../../doc/DRIVER_PROTOCOL.md) and
-[`doc/IRQMUX_CONTRACT.md`](../../doc/IRQMUX_CONTRACT.md).
+[`doc/IRQMUX_CONTRACT.md`](../../doc/IRQMUX_CONTRACT.md). The future live
+Driver Manager ↔ Process Manager spawn boundary is documented in
+[`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md).
 
 ## 1. Current verified boot status
 
@@ -174,6 +176,13 @@ state 9 today.
   requirements only, RP1 remains blocked on PCIe/BAR and MMIO authority, and
   mailbox/firmware remains blocked on transport/cache/MMIO policy. Bundles do
   not contain real `CapId`s, transfer caps, call grant syscalls, or touch MMIO.
+  DRS-6 documents the future live Driver Manager ↔ Process Manager spawn
+  contract in [`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md):
+  Driver Manager remains policy/advisory-only and builds future
+  `DriverSpawnRequest`s, while PM remains the mechanism owner for validation,
+  process creation, address spaces, accounting, capability minting, startup-cap
+  delivery, and handles. DRS-6 adds no live spawn path, grants, caps, PM calls,
+  MMIO, or live-DTB parsing.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.
@@ -191,8 +200,9 @@ state 9 today.
    identity, resource-grant policy, PCIe/RP1 BAR discovery, IRQ routing, and PM
    spawn authority are specified; until then they remain hosted/inert planning
    harnesses.
-4. Write the live driver-manager ↔ PM/supervisor spawn-authority and startup-cap
-   contract design document before any live spawn path.
+4. Keep the live driver-manager ↔ PM spawn-authority and startup-cap contract
+   design in [`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md)
+   as the gate before any live spawn path.
 5. Only then register/grant resources to a driver and let PM spawn it, gated per
    the safe-driver ordering in milestone RPi5-DRV-2.
 

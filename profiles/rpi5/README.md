@@ -95,8 +95,12 @@ plans into inert approvals/denials without calling PM/supervisor services,
 spawning, granting caps, or touching MMIO. DRS-5 adds mock resource-grant bundle
 descriptions; they list inert MMIO/IRQ/DMA/transport/clock/pinmux requirements
 but contain no real `CapId`s and perform no grant operations. RP1 GPIO resources
-remain PCIe/BAR-relative and deferred rather than direct BCM2712 MMIO. See the
-driver inventory in
+remain PCIe/BAR-relative and deferred rather than direct BCM2712 MMIO. DRS-6 adds
+a design-only DM↔PM live-spawn contract in
+[`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md):
+Driver Manager remains advisory/policy-only, and PM remains responsible for
+validation, process creation, address-space setup, accounting, capability
+minting, startup-cap delivery, and handles. See the driver inventory in
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning

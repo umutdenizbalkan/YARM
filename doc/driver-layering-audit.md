@@ -114,10 +114,15 @@ mocks.
   inert approvals/denials only; it still does not call PM/supervisor services or
   spawn anything. DRS-5 adds mock resource-grant bundle descriptions for approved
   or denied plan entries; these list inert MMIO/IRQ/DMA/transport/clock/pinmux
-  requirements but never include `CapId`s or perform grant operations. The
-  harness does not parse the live boot DTB, grant resources, perform MMIO, or
-  spawn driver binaries. See
-  [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
+  requirements but never include `CapId`s or perform grant operations. DRS-6
+  documents the future live DM↔PM contract: Driver Manager builds policy and
+  PM-facing `DriverSpawnRequest`s, while PM validates, creates processes, sets up
+  address spaces, accounts resources, mints future caps, delivers startup caps,
+  and returns handles. The harness does not parse the live boot DTB, grant
+  resources, perform MMIO, call PM, or spawn driver binaries. See
+  [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md) and the design-only future
+  DM↔PM spawn contract in
+  [`driver-manager-pm-spawn-contract.md`](driver-manager-pm-spawn-contract.md).
 
 ## Summary
 
