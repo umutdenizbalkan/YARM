@@ -336,10 +336,54 @@ pub enum SpawnBlocker {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnDenialReason {
+    MissingSpawnAuthority,
+    PlanEntryDeferred,
+    UnsupportedDevice,
+    MissingMmioGrant,
+    MissingIrqRoute,
+    MissingDmaPolicy,
+    RequiresPcieBarDiscovery,
+    MissingMailboxTransport,
+    MissingCachePolicy,
+    AlreadyRunning,
+    UnknownCandidate,
+    PolicyDenied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpawnPolicy {
     pub uart_prereqs_available: bool,
     pub irqmux_prereqs_available: bool,
     pub spawn_authority_available: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnAuthorityRequest {
+    pub requester_tid: Option<u64>,
+    pub mock_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnAuthorityPolicy {
+    pub spawn_authority_available: bool,
+    pub policy_allows_spawn: bool,
+}
+
+impl SpawnAuthorityPolicy {
+    pub const fn fail_closed() -> Self {
+        Self {
+            spawn_authority_available: false,
+            policy_allows_spawn: false,
+        }
+    }
+
+    pub const fn allow_hosted_mock_spawns() -> Self {
+        Self {
+            spawn_authority_available: true,
+            policy_allows_spawn: true,
+        }
+    }
 }
 
 impl SpawnPolicy {
@@ -370,6 +414,104 @@ pub struct SpawnPlanEntry {
     pub status: DeviceStatus,
     pub action: SpawnAction,
     pub blockers: [Option<SpawnBlocker>; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnApproval {
+    pub mock_spawn_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnDenial {
+    pub reasons: [Option<SpawnDenialReason>; 6],
+}
+
+impl SpawnDenial {
+    const fn empty() -> Self {
+        Self { reasons: [None; 6] }
+    }
+
+    pub fn has_reason(&self, reason: SpawnDenialReason) -> bool {
+        self.reasons.iter().any(|entry| *entry == Some(reason))
+    }
+
+    fn push_reason(&mut self, reason: SpawnDenialReason) -> Result<(), KernelIpcError> {
+        if self.has_reason(reason) {
+            return Ok(());
+        }
+        let Some(slot) = self.reasons.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(reason);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpawnAuthorityDecision {
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub action: SpawnAction,
+    pub approval: Option<SpawnApproval>,
+    pub denial: Option<SpawnDenial>,
+}
+
+impl SpawnAuthorityDecision {
+    fn from_entry(entry: &SpawnPlanEntry) -> Self {
+        Self {
+            compatible: entry.compatible,
+            compatible_len: entry.compatible_len,
+            driver_candidate: entry.driver_candidate,
+            driver_candidate_len: entry.driver_candidate_len,
+            action: entry.action,
+            approval: None,
+            denial: None,
+        }
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn driver_candidate(&self) -> Option<&str> {
+        bounded_str(&self.driver_candidate, self.driver_candidate_len)
+    }
+}
+
+#[derive(Debug)]
+pub struct SpawnAuthorityDecisions {
+    decisions: [Option<SpawnAuthorityDecision>; MAX_DEVICES],
+    len: usize,
+}
+
+impl SpawnAuthorityDecisions {
+    pub const fn new() -> Self {
+        Self {
+            decisions: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SpawnAuthorityDecision> {
+        self.decisions[..self.len]
+            .iter()
+            .filter_map(|decision| decision.as_ref())
+    }
+
+    fn push(&mut self, decision: SpawnAuthorityDecision) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.decisions[self.len] = Some(decision);
+        self.len += 1;
+        Ok(())
+    }
 }
 
 impl SpawnPlanEntry {
@@ -441,6 +583,84 @@ impl SpawnPlan {
         self.entries[self.len] = Some(entry);
         self.len += 1;
         Ok(())
+    }
+
+    pub fn evaluate_spawn_authority(
+        &self,
+        _request: SpawnAuthorityRequest,
+        policy: SpawnAuthorityPolicy,
+    ) -> Result<SpawnAuthorityDecisions, KernelIpcError> {
+        let mut decisions = SpawnAuthorityDecisions::new();
+        for (index, entry) in self.iter().enumerate() {
+            decisions.push(evaluate_spawn_entry(entry, index, policy)?)?;
+        }
+        Ok(decisions)
+    }
+}
+
+fn evaluate_spawn_entry(
+    entry: &SpawnPlanEntry,
+    index: usize,
+    policy: SpawnAuthorityPolicy,
+) -> Result<SpawnAuthorityDecision, KernelIpcError> {
+    let mut decision = SpawnAuthorityDecision::from_entry(entry);
+    match entry.action {
+        SpawnAction::WouldSpawn
+            if policy.spawn_authority_available && policy.policy_allows_spawn =>
+        {
+            decision.approval = Some(SpawnApproval {
+                mock_spawn_id: u32::try_from(index + 1).map_err(|_| KernelIpcError::WrongObject)?,
+            });
+        }
+        SpawnAction::WouldSpawn if !policy.spawn_authority_available => {
+            decision.denial = Some(denial_with_reason(
+                SpawnDenialReason::MissingSpawnAuthority,
+            )?);
+        }
+        SpawnAction::WouldSpawn => {
+            decision.denial = Some(denial_with_reason(SpawnDenialReason::PolicyDenied)?);
+        }
+        SpawnAction::Deferred => {
+            let mut denial = SpawnDenial::empty();
+            denial.push_reason(SpawnDenialReason::PlanEntryDeferred)?;
+            for blocker in entry.blockers.iter().filter_map(|blocker| *blocker) {
+                denial.push_reason(denial_reason_from_blocker(blocker))?;
+            }
+            decision.denial = Some(denial);
+        }
+        SpawnAction::Unsupported => {
+            decision.denial = Some(denial_with_reason(SpawnDenialReason::UnsupportedDevice)?);
+        }
+        SpawnAction::AlreadyRunning => {
+            decision.denial = Some(denial_with_reason(SpawnDenialReason::AlreadyRunning)?);
+        }
+        SpawnAction::NoCandidate => {
+            decision.denial = Some(denial_with_reason(SpawnDenialReason::UnknownCandidate)?);
+        }
+    }
+    Ok(decision)
+}
+
+fn denial_with_reason(reason: SpawnDenialReason) -> Result<SpawnDenial, KernelIpcError> {
+    let mut denial = SpawnDenial::empty();
+    denial.push_reason(reason)?;
+    Ok(denial)
+}
+
+fn denial_reason_from_blocker(blocker: SpawnBlocker) -> SpawnDenialReason {
+    match blocker {
+        SpawnBlocker::MissingMmioGrant | SpawnBlocker::DeferredNoMmioGrant => {
+            SpawnDenialReason::MissingMmioGrant
+        }
+        SpawnBlocker::MissingIrqRoute => SpawnDenialReason::MissingIrqRoute,
+        SpawnBlocker::MissingDmaPolicy => SpawnDenialReason::MissingDmaPolicy,
+        SpawnBlocker::RequiresPcieBarDiscovery => SpawnDenialReason::RequiresPcieBarDiscovery,
+        SpawnBlocker::UnsupportedDevice => SpawnDenialReason::UnsupportedDevice,
+        SpawnBlocker::UnknownCandidate => SpawnDenialReason::UnknownCandidate,
+        SpawnBlocker::AlreadyRegistered => SpawnDenialReason::AlreadyRunning,
+        SpawnBlocker::MissingSpawnAuthority => SpawnDenialReason::MissingSpawnAuthority,
+        SpawnBlocker::MissingMailboxTransport => SpawnDenialReason::MissingMailboxTransport,
+        SpawnBlocker::MissingCachePolicy => SpawnDenialReason::MissingCachePolicy,
     }
 }
 
@@ -1601,6 +1821,16 @@ mod tests {
             .expect("spawn plan entry")
     }
 
+    fn authority_decision<'a>(
+        decisions: &'a SpawnAuthorityDecisions,
+        compatible: &str,
+    ) -> &'a SpawnAuthorityDecision {
+        decisions
+            .iter()
+            .find(|decision| decision.compatible() == Some(compatible))
+            .expect("spawn authority decision")
+    }
+
     #[test]
     fn spawn_plan_for_fake_rpi5_inventory_is_policy_only_and_deterministic() {
         let mut inventory = PlatformInventory::new();
@@ -1754,6 +1984,176 @@ mod tests {
         assert!(unassigned_duplicate.has_blocker(SpawnBlocker::MissingMmioGrant));
         assert!(unassigned_duplicate.has_blocker(SpawnBlocker::MissingIrqRoute));
         assert!(unassigned_duplicate.has_blocker(SpawnBlocker::MissingSpawnAuthority));
+    }
+
+    #[test]
+    fn spawn_authority_approves_only_would_spawn_entries_with_mock_authority() {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "arm,pl011",
+                    DeviceClass::Uart,
+                    "uart_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_mmio(0, 0x107d_0010_0000, 0x1000)
+                .unwrap()
+                .with_irq(0, 121)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,firmware",
+                    DeviceClass::Mailbox,
+                    "rpi_firmware",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,rp1-gpio",
+                    DeviceClass::Gpio,
+                    "rp1_gpio_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_mmio(0, 0x1_0000, 0x1000)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "yarm,irqmux",
+                    DeviceClass::IrqMux,
+                    "irqmux_srv",
+                    DeviceStatus::Discovered,
+                )
+                .unwrap()
+                .with_irq(0, 5)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "vendor,unknown",
+                    DeviceClass::Unknown,
+                    "unknown",
+                    DeviceStatus::Unsupported,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let registry = DriverRegistry::new();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let decisions = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: None,
+                    mock_epoch: 1,
+                },
+                SpawnAuthorityPolicy::allow_hosted_mock_spawns(),
+            )
+            .unwrap();
+        assert_eq!(decisions.len(), 5);
+        let uart = authority_decision(&decisions, "arm,pl011");
+        assert_eq!(
+            uart.approval.map(|approval| approval.mock_spawn_id),
+            Some(1)
+        );
+        assert_eq!(uart.denial, None);
+
+        let mailbox = authority_decision(&decisions, "raspberrypi,firmware");
+        let mailbox_denial = mailbox.denial.expect("mailbox denied");
+        assert!(mailbox_denial.has_reason(SpawnDenialReason::PlanEntryDeferred));
+        assert!(mailbox_denial.has_reason(SpawnDenialReason::MissingMailboxTransport));
+        assert!(mailbox_denial.has_reason(SpawnDenialReason::MissingCachePolicy));
+        assert!(mailbox_denial.has_reason(SpawnDenialReason::MissingMmioGrant));
+
+        let rp1 = authority_decision(&decisions, "raspberrypi,rp1-gpio");
+        let rp1_denial = rp1.denial.expect("rp1 denied");
+        assert!(rp1_denial.has_reason(SpawnDenialReason::PlanEntryDeferred));
+        assert!(rp1_denial.has_reason(SpawnDenialReason::RequiresPcieBarDiscovery));
+        assert!(rp1_denial.has_reason(SpawnDenialReason::MissingMmioGrant));
+
+        let irqmux = authority_decision(&decisions, "yarm,irqmux");
+        assert!(
+            irqmux
+                .denial
+                .unwrap()
+                .has_reason(SpawnDenialReason::MissingIrqRoute)
+        );
+        let unknown = authority_decision(&decisions, "vendor,unknown");
+        assert!(
+            unknown
+                .denial
+                .unwrap()
+                .has_reason(SpawnDenialReason::UnsupportedDevice)
+        );
+    }
+
+    #[test]
+    fn spawn_authority_fail_closed_and_already_running_are_noop_denials() {
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut registry = DriverRegistry::new();
+        let before_len = registry.len();
+        let plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let fail_closed = plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 2,
+                },
+                SpawnAuthorityPolicy::fail_closed(),
+            )
+            .unwrap();
+        let denied_uart = authority_decision(&fail_closed, "arm,pl011");
+        assert_eq!(denied_uart.approval, None);
+        assert!(
+            denied_uart
+                .denial
+                .unwrap()
+                .has_reason(SpawnDenialReason::MissingSpawnAuthority)
+        );
+        assert_eq!(
+            registry.len(),
+            before_len,
+            "authority checks do not mutate registry"
+        );
+
+        registry.register(7).unwrap();
+        let already_running_plan = inventory
+            .build_spawn_plan(&registry, SpawnPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let already_running = already_running_plan
+            .evaluate_spawn_authority(
+                SpawnAuthorityRequest {
+                    requester_tid: Some(3),
+                    mock_epoch: 3,
+                },
+                SpawnAuthorityPolicy::allow_hosted_mock_spawns(),
+            )
+            .unwrap();
+        let running_uart = authority_decision(&already_running, "arm,pl011");
+        assert_eq!(running_uart.approval, None);
+        assert!(
+            running_uart
+                .denial
+                .unwrap()
+                .has_reason(SpawnDenialReason::AlreadyRunning)
+        );
     }
 
     #[test]

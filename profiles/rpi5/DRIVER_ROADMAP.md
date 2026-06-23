@@ -163,9 +163,14 @@ state 9 today.
   `WouldSpawn`, keep RP1 GPIO deferred on PCIe/BAR and MMIO blockers, keep
   mailbox/firmware deferred on transport/cache/MMIO policy, keep irqmux deferred
   on IRQ-routing policy, and mark unknown devices unsupported. It is descriptive
-  only: no PM call, no live spawn, no grant, no cap, and no MMIO. Production
-  no-op hardware control now returns errors and never fabricates `CapId(0)`
-  grants. On RPi5 it is additionally blocked because userspace is not reached.
+  only: no PM call, no live spawn, no grant, no cap, and no MMIO. DRS-4 consumes
+  those plan entries with a mock spawn-authority policy to produce inert
+  approvals/denials. Only `WouldSpawn` entries approved by the mock policy become
+  approved records; deferred RP1 GPIO, mailbox/firmware, irqmux, unknown, and
+  already-running entries remain denials carrying their blockers/reasons. This is
+  still not a PM/supervisor call and cannot spawn. Production no-op hardware
+  control now returns errors and never fabricates `CapId(0)` grants. On RPi5 it
+  is additionally blocked because userspace is not reached.
 
 ## 5. Driver-manager integration plan (RPi5)
 
@@ -175,12 +180,12 @@ state 9 today.
    virtual pointer already proven at HH4 (`RPI5_HH4_DTB_VIRT_OK`), and a
    read-only device inventory derived from it — **without** starting any
    hardware-heavy driver.
-3. Promote the DRS-2/DRS-2B fake-FDT parser and DRS-3 spawn-plan model into a
-   live-DTB design only after sender identity, resource-grant policy, PCIe/RP1
-   BAR discovery, IRQ routing, and PM spawn authority are specified; until then
-   they remain hosted/inert planning harnesses.
-4. Add a mock supervisor/PM spawn-authority handshake model before any live
-   spawn path.
+3. Promote the DRS-2/DRS-2B fake-FDT parser plus DRS-3/DRS-4 plan/authority
+   models into a live-DTB design only after sender identity, resource-grant
+   policy, PCIe/RP1 BAR discovery, IRQ routing, and PM spawn authority are
+   specified; until then they remain hosted/inert planning harnesses.
+4. Add a mock resource-grant bundle model, or write the live driver-manager ↔
+   PM/supervisor spawn-authority design document, before any live spawn path.
 5. Only then register/grant resources to a driver and let PM spawn it, gated per
    the safe-driver ordering in milestone RPi5-DRV-2.
 

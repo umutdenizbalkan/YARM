@@ -109,9 +109,11 @@ mocks.
   IRQ parsing, and malformed bus/resource rejection. RP1 child resources remain
   PCIe/BAR-relative and deferred. DRS-3 adds a policy-only `SpawnPlan` generator
   over inert inventory records so hosted tests can describe future driver
-  eligibility and blockers without invoking PM or runtime hardware control. The
-  harness does not parse the live boot DTB, grant resources, perform MMIO, or
-  spawn driver binaries. See
+  eligibility and blockers without invoking PM or runtime hardware control. DRS-4
+  adds a mock spawn-authority decision model that consumes those plans and emits
+  inert approvals/denials only; it still does not call PM/supervisor services or
+  spawn anything. The harness does not parse the live boot DTB, grant resources,
+  perform MMIO, or spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
 
 ## Summary
