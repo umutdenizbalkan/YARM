@@ -61,6 +61,10 @@ pub mod syscall {
     pub const SYSCALL_CONTROL_PLANE_SET_CNODE_SLOTS_NR: usize = 8;
     const SYSCALL_FUTEX_WAIT_NR: usize = 9;
     const SYSCALL_YIELD_NR: usize = 0;
+    /// Stage 163 proof-only: `Fork` (NR 12). Already part of the frozen syscall
+    /// ABI; this constant only re-exposes the existing number for the sender-wake
+    /// proof's second execution context — it does NOT add a syscall.
+    const SYSCALL_FORK_NR: usize = 12;
     pub const SYSCALL_SPAWN_PROCESS_NR: usize = 23;
     pub const SYSCALL_SPAWN_PROCESS_FROM_USER_BUF_NR: usize = 24;
     pub const SYSCALL_SPAWN_FROM_INITRAMFS_FILE_NR: usize = 26;
@@ -242,6 +246,68 @@ pub mod syscall {
             return Err(decode_syscall_error(ret.ret0));
         }
         Ok(())
+    }
+
+    /// Stage 163 proof-only: timed/blocking `IpcSend`. Identical to `ipc_send`
+    /// except it sets the send-timeout field (`SYSCALL_ARG_INLINE_PAYLOAD1`, arg
+    /// slot 4) to `timeout_ticks`, which the kernel routes through
+    /// `ipc_send_with_deadline`. On a FULL endpoint the sender then becomes a real
+    /// blocked sender-waiter (instead of the non-blocking `ipc_send`'s immediate
+    /// `WouldBlock`), and the send completes successfully once a receiver drain
+    /// frees a slot and refills this sender's message. Reuses the existing
+    /// `IpcSend` syscall + ABI — no syscall number or IPC ABI change. Returns the
+    /// kernel result (`Ok` on woken-and-delivered; `TimedOut` if the deadline
+    /// elapses first).
+    #[inline]
+    pub unsafe fn ipc_send_timeout_ticks(
+        ep_cap: u32,
+        msg: &Message,
+        timeout_ticks: u64,
+    ) -> core::result::Result<(), SyscallError> {
+        let (frame, frame_len, _tx_cap, _msg_flags) = ipc_call_prepare(msg);
+        let transfer_cap = msg
+            .transferred_cap()
+            .map(|cap| cap.0 as usize)
+            .unwrap_or(SYSCALL_NO_TRANSFER_CAP as usize);
+        let args = [
+            ep_cap as usize,
+            frame.as_ptr() as usize,
+            frame_len,
+            0,
+            timeout_ticks as usize,
+            transfer_cap,
+        ];
+        // SAFETY: Uses architecture syscall ABI to enter kernel.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_IPC_SEND_NR, args) };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
+    }
+
+    /// Stage 163 proof-only: `Fork` (NR 12). Returns the new child's TID to the
+    /// parent and `0` to the child (POSIX-style; the kernel sets the child's
+    /// return register to 0 via `child.user_context.arg0 = 0`). The child inherits
+    /// a COW copy of the parent address space and its ordinary userspace IPC caps,
+    /// so it can reuse the parent's proof endpoint caps with no manual stack/TLS
+    /// bootstrap. Reuses the existing `Fork` syscall — no ABI change.
+    ///
+    /// Returns the raw return register (`ret0`): `0` in the child, the child TID
+    /// (non-zero) in the parent. Fork failure is not distinguishable from a child
+    /// TID on the AArch64 ABI (no separate error lane), so the proof-only caller
+    /// must tolerate a missing child (bounded coordination poll, never an
+    /// unbounded wait).
+    #[inline]
+    pub unsafe fn fork() -> u64 {
+        let args = [0usize; 6];
+        // SAFETY: Uses architecture syscall ABI to enter kernel.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_FORK_NR, args) };
+        ret.ret0 as u64
     }
 
     #[inline]

@@ -42272,24 +42272,24 @@ mod stage159bcd_ipc_recv_proof_workload {
         );
     }
 
-    // 7. Sender-wake is explicitly deferred (not faked): the workload logs a
-    //    DEFERRED marker and never emits IPC_RECV_PROOF_SENDER_WAKE_DONE.
+    // 7. The single-context base workload (yarm.ipc_recv_proof=1 only) never fakes
+    //    the kernel sender-wake marker. Sender-wake is now proven by the separate
+    //    sub-knob-gated workload (Stage 163); the base workload only gates it and
+    //    never emits IPC_RECV_V2_SENDER_WAKE_ORDER_OK itself.
     #[test]
-    fn stage159bcd_sender_wake_deferred_not_faked() {
+    fn stage159bcd_sender_wake_not_faked_by_base_workload() {
         assert!(
-            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED"),
-            "sender-wake must be explicitly logged as deferred"
+            !INIT_SERVICE_SRC.contains("user_log!(\"IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "the workload must NEVER fake the kernel sender-wake marker"
         );
+        // The base workload defers the actual sender-wake drive to the sub-knob
+        // workload and records that gate, instead of faking a result.
         assert!(
-            !INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DONE"),
-            "deferred sender-wake must NOT emit a DONE marker (no fake)"
+            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SUBKNOB_ABSENT")
+                && INIT_SERVICE_SRC.contains("fn run_ipc_recv_proof_sender_wake"),
+            "sender-wake must be a separate sub-knob-gated workload, gated (not faked) by the base path"
         );
-        assert!(
-            ORACLE_SCRIPT.contains("DEFERRED"),
-            "oracle script must report sender-wake as deferred"
-        );
-        // The minimal undersized-payload recv wrapper exists for the rollback
-        // subtest; no SpawnThread wrapper was added for the deferred sender-wake.
+        // The rollback subtest's undersized recv wrapper still exists.
         assert!(
             USER_RT_SRC.contains("fn ipc_recv_v2_proof_undersized"),
             "rollback subtest's undersized recv wrapper must exist"
@@ -42803,23 +42803,32 @@ mod stage161_sender_wake_deferred {
     const AARCH64_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
     const CP_CARGO: &str = include_str!("../../../crates/yarm-control-plane-servers/Cargo.toml");
 
-    // 1. Sender-wake is deferred, NOT faked: the workload logs a DEFERRED marker
-    //    and never emits the userspace sequence marker or the kernel marker.
+    // 1. Sender-wake is now PROVEN (Stage 163), never faked: the workload emits the
+    //    userspace sequence marker ONLY after observing the real child's message,
+    //    and the kernel marker is emitted exclusively by the real split recv path.
     #[test]
-    fn stage161_sender_wake_deferred_not_faked() {
+    fn stage161_sender_wake_proven_not_faked() {
+        // The workload emits the sequence marker (it is no longer deferred)...
         assert!(
-            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED"),
-            "workload must log sender-wake as DEFERRED"
+            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "sender-wake workload must emit the sequence marker once proven"
         );
+        // ...but ONLY on observed child progress (got_child), never unconditionally.
+        let seq_emit = INIT_SERVICE_SRC
+            .split("if got_child {")
+            .nth(1)
+            .map(|s| &s[..s.len().min(220)])
+            .unwrap_or("");
         assert!(
-            !INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
-            "workload must NOT emit the sender-wake sequence marker while deferred"
+            seq_emit.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "sequence marker must be gated on observing the real child's message"
         );
+        // The kernel marker is NEVER faked from userspace.
         assert!(
             !INIT_SERVICE_SRC.contains("user_log!(\"IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
             "workload must NOT fake the kernel sender-wake marker"
         );
-        // The kernel sender-wake marker is emitted by the real IPC path only.
+        // The kernel sender-wake marker is emitted by the real split recv path only.
         assert!(
             SYSCALL_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
             "kernel sender-wake marker must be emitted by the real split recv path"
@@ -42929,35 +42938,35 @@ mod stage162_sender_wake_infra_deferred {
     const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
 
-    // 1. Sender-wake remains deferred-not-faked: the workload still logs a DEFERRED
-    //    marker and never emits the userspace sequence marker, and no userspace
-    //    timed-blocking-send or SpawnThread proof wrapper was half-wired in.
+    // 1. Stage 163 landed the sender-wake infra FULLY (not partially): the
+    //    second-context (fork) + timed blocking-send wrappers exist in user-rt and
+    //    the workload emits the sequence marker only on observed child progress.
     #[test]
-    fn stage162_no_partial_infra_and_still_deferred() {
+    fn stage162_infra_fully_wired_not_partial() {
         assert!(
-            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_DEFERRED")
-                && !INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
-            "sender-wake must remain deferred (no userspace sequence marker emitted)"
+            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "sender-wake workload must emit the sequence marker once proven"
         );
-        // No half-built second-context or timed-send proof wrappers (those land in
-        // the proposed Stage 163, fully wired, not partially).
-        for absent in &[
-            "fn ipc_send_timeout",
-            "fn spawn_thread",
-            "SYSCALL_SPAWN_THREAD_NR",
-            "SYSCALL_FORK_NR",
-        ] {
+        // Both proof wrappers must exist (fully wired, used by the workload).
+        for present in &["fn ipc_send_timeout_ticks", "fn fork", "SYSCALL_FORK_NR"] {
             assert!(
-                !USER_RT_SRC.contains(absent),
-                "no half-built sender-wake infra (`{absent}`) may be introduced in this stage"
+                USER_RT_SRC.contains(present),
+                "Stage 163 sender-wake infra (`{present}`) must be present in user-rt"
             );
         }
+        // The timed-send wrapper is actually used by the child sender path.
+        assert!(
+            INIT_SERVICE_SRC.contains("ipc_send_timeout_ticks")
+                && INIT_SERVICE_SRC.contains("fork()"),
+            "the workload must use the timed blocking-send + fork wrappers"
+        );
     }
 
-    // 2. No risky kernel coordination hook was landed in the sender-waiter-enqueue
-    //    path (the strictly-race-free signal is deferred to Stage 163).
+    // 2. The proof-gated kernel coordination hook IS landed in enqueue_sender_waiter
+    //    (Stage 163), and it is gated — it fires only via the proof target helper,
+    //    never unconditionally.
     #[test]
-    fn stage162_no_kernel_waiter_enqueue_hook_landed() {
+    fn stage162_kernel_waiter_enqueue_hook_landed_and_gated() {
         let enqueue = IPC_STATE_SRC
             .split("fn enqueue_sender_waiter")
             .nth(1)
@@ -42970,9 +42979,16 @@ mod stage162_sender_wake_infra_deferred {
             })
             .expect("enqueue_sender_waiter must exist");
         assert!(
-            !enqueue.contains("IPC_RECV_PROOF_SENDER_WAKE")
-                && !enqueue.contains("ipc_recv_oracle_proof_enabled"),
-            "no proof coordination hook may be landed in enqueue_sender_waiter this stage"
+            enqueue.contains("proof_sender_wake_coordination_target")
+                && enqueue.contains("IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT"),
+            "the proof-gated waiter-present coordination hook must be landed in enqueue_sender_waiter"
+        );
+        // The hook is gated behind the proof target helper (returns None unless the
+        // sub-knob is active AND the endpoint is the proof E1), never unconditional.
+        assert!(
+            enqueue.contains("if let Some(")
+                && enqueue.contains("proof_sender_wake_coordination_target("),
+            "the hook must be conditional on the proof-gated coordination target"
         );
     }
 
@@ -42993,14 +43009,15 @@ mod stage162_sender_wake_infra_deferred {
         );
     }
 
-    // 4. The deferral + proposed strictly-race-free Stage 163 design is documented.
+    // 4. The Stage 162 feasibility audit AND the implemented Stage 163
+    //    strictly-race-free coordination design are both documented.
     #[test]
     fn stage162_blocker_and_design_documented() {
         assert!(
             DOC_SRC.contains("Stage 162 — sender-wake proof infrastructure")
                 && DOC_SRC.contains("enqueue_sender_waiter")
-                && DOC_SRC.contains("Proposed Stage 163"),
-            "Stage 162 feasibility audit + proposed Stage 163 design must be documented"
+                && DOC_SRC.contains("Stage 163"),
+            "Stage 162 feasibility audit + implemented Stage 163 design must be documented"
         );
     }
 
@@ -43024,5 +43041,265 @@ mod stage162_sender_wake_infra_deferred {
                 && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
             "syscall/IPC counts must be unchanged"
         );
+    }
+}
+
+// Stage 163 — proof-gated deterministic sender-wake oracle. Sender-wake is now
+// PROVEN (no longer deferred), isolated behind a dedicated sub-knob
+// `yarm.ipc_recv_proof_sender_wake=1` layered atop `yarm.ipc_recv_proof=1`. A
+// proof-gated kernel coordination hook in `enqueue_sender_waiter` pushes a
+// waiter-present signal into a second endpoint (E2) inside the SAME critical
+// section that makes the proof sender a waiter, closing the pure-userspace race.
+// These guards pin: default-off isolation; the hook + second context + timed send
+// are all proof-gated; the kernel marker is never faked; the oracle requires both
+// markers; the green queued-split + rollback proofs stay isolated and intact; no
+// IPC/cap seam moved; no RPi5 / x86 D6 coupling; counts unchanged.
+mod stage163_sender_wake_proven {
+    const BOOT_MOD_SRC: &str = include_str!("mod.rs");
+    const BOOT_CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const USER_RT_SRC: &str = include_str!("../../../crates/yarm-user-rt/src/lib.rs");
+    const INIT_SERVICE_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const ORACLE_SCRIPT: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+    const RISCV64_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    // 1. The sub-knob is a real, independent boot knob that defaults OFF, and is
+    //    parsed without aliasing the base `yarm.ipc_recv_proof` knob.
+    #[test]
+    fn stage163_subknob_parses_and_defaults_off() {
+        assert!(
+            BOOT_CMDLINE_SRC.contains("yarm.ipc_recv_proof_sender_wake")
+                && BOOT_CMDLINE_SRC.contains("pub ipc_recv_proof_sender_wake: Option<bool>"),
+            "the sender-wake sub-knob must be a parsed BootOptions field"
+        );
+        // The atomic flag defaults to false (default-off).
+        assert!(
+            BOOT_MOD_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_ENABLED")
+                && BOOT_MOD_SRC.contains("AtomicBool::new(false)"),
+            "the sender-wake enable flag must default to false"
+        );
+    }
+
+    // 2. Any sender-wake behavior requires BOTH knobs: the `active` gate is the
+    //    logical AND of the base proof knob and the sub-knob.
+    #[test]
+    fn stage163_active_requires_both_knobs() {
+        let active = BOOT_MOD_SRC
+            .split("fn ipc_recv_proof_sender_wake_active()")
+            .nth(1)
+            .map(|s| &s[..s.len().min(160)])
+            .expect("ipc_recv_proof_sender_wake_active must exist");
+        assert!(
+            active.contains("ipc_recv_oracle_proof_enabled()")
+                && active.contains("ipc_recv_proof_sender_wake_enabled()"),
+            "sender-wake must require BOTH the base proof knob and the sub-knob"
+        );
+    }
+
+    // 3. The waiter-present coordination hook is landed in enqueue_sender_waiter and
+    //    is strictly proof-gated (fires only via the coordination-target helper,
+    //    which returns None unless the sub-knob is active AND the endpoint is E1).
+    #[test]
+    fn stage163_waiter_present_hook_proof_gated() {
+        let enqueue = IPC_STATE_SRC
+            .split("fn enqueue_sender_waiter")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .expect("enqueue_sender_waiter must exist");
+        assert!(
+            enqueue.contains("proof_sender_wake_coordination_target")
+                && enqueue.contains("IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT"),
+            "the proof-gated waiter-present hook must be in enqueue_sender_waiter"
+        );
+        // The target helper is the gate: returns None unless the sub-knob is active.
+        let target = BOOT_MOD_SRC
+            .split("fn proof_sender_wake_coordination_target")
+            .nth(1)
+            .map(|s| &s[..s.len().min(400)])
+            .expect("coordination target helper must exist");
+        assert!(
+            target.contains("if !ipc_recv_proof_sender_wake_active()")
+                && target.contains("return None"),
+            "the coordination target must be a no-op unless the sub-knob is active"
+        );
+    }
+
+    // 4. The coordination push does NO scheduler/cap/user-copy work while holding
+    //    ipc_state_lock (no lock-order hazard): it only enqueues into E2's queue.
+    #[test]
+    fn stage163_coordination_push_no_lock_order_hazard() {
+        let push = BOOT_MOD_SRC
+            .split("fn proof_sender_wake_push_coordination_locked")
+            .nth(1)
+            .map(|s| &s[..s.len().min(800)])
+            .expect("coordination push helper must exist");
+        for forbidden in &[
+            "schedule",
+            "apply_split_sender_wake_plan",
+            "grant_capability",
+            "copy_to_user",
+            "copy_from_user",
+            ".wake(",
+        ] {
+            assert!(
+                !push.contains(forbidden),
+                "coordination push must not perform `{forbidden}` while holding ipc_state_lock"
+            );
+        }
+    }
+
+    // 5. The second execution context is a real fork (proof-gated by the E2 cap),
+    //    and the timed blocking-send wrapper uses the existing send ABI.
+    #[test]
+    fn stage163_second_context_and_timed_send_present() {
+        assert!(
+            USER_RT_SRC.contains("const SYSCALL_FORK_NR")
+                && USER_RT_SRC.contains("fn fork")
+                && USER_RT_SRC.contains("fn ipc_send_timeout_ticks"),
+            "fork + timed blocking-send wrappers must exist in user-rt"
+        );
+        // The sender-wake workload runs ONLY when the E2 coordination cap is present
+        // (slot 13 / service_extra_cap_0), which the kernel provides only under the
+        // sub-knob — so it is gated, not unconditional.
+        assert!(
+            INIT_SERVICE_SRC.contains("if let Some(e2_recv) = ctx.service_extra_cap_0")
+                && INIT_SERVICE_SRC
+                    .contains("run_ipc_recv_proof_sender_wake(proof_send, proof_recv, e2_recv)"),
+            "the sender-wake workload must be gated on the proof-provisioned E2 cap"
+        );
+    }
+
+    // 6. The kernel sender-wake marker is NEVER faked from userspace, and the
+    //    userspace sequence marker is emitted only on observed real child progress.
+    #[test]
+    fn stage163_marker_not_faked() {
+        assert!(
+            !INIT_SERVICE_SRC.contains("user_log!(\"IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "userspace must NEVER emit the kernel sender-wake marker"
+        );
+        // The kernel marker comes from the real split recv path in syscall.rs.
+        assert!(
+            SYSCALL_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK")
+                && SYSCALL_SRC.contains("apply_split_sender_wake_plan"),
+            "the kernel marker must be emitted by the real split sender-wake path"
+        );
+        // SEQUENCE_DONE is gated on got_child (the receiver actually saw the
+        // forked sender's own message), never emitted unconditionally.
+        let after_gate = INIT_SERVICE_SRC
+            .split("if got_child {")
+            .nth(1)
+            .map(|s| &s[..s.len().min(220)])
+            .unwrap_or("");
+        assert!(
+            after_gate.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "sequence marker must be gated on observing the real child's message"
+        );
+    }
+
+    // 7. The oracle requires BOTH the userspace sequence marker and the kernel
+    //    marker when sender-wake is requested, and the requirement defaults off.
+    #[test]
+    fn stage163_oracle_requires_both_when_requested() {
+        assert!(
+            ORACLE_SCRIPT.contains("YARM_IPC_RECV_PROOF_SENDER_WAKE:-0}"),
+            "sender-wake oracle requirement must default off"
+        );
+        assert!(
+            ORACLE_SCRIPT.contains("proof_require \"sender-wake\" \"IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE\" \"IPC_RECV_V2_SENDER_WAKE_ORDER_OK\""),
+            "when requested, sender-wake must require both markers"
+        );
+        // Requesting it must export the sub-knob so the kernel boots with it.
+        assert!(
+            ORACLE_SCRIPT.contains("export IPC_RECV_PROOF_SENDER_WAKE=1"),
+            "the oracle must enable the boot sub-knob when sender-wake is requested"
+        );
+    }
+
+    // 8. Queued-split + rollback proofs stay isolated and intact: they remain
+    //    required, run under the base knob only, and E2 is provisioned ONLY under
+    //    the sub-knob (so their boots are unchanged).
+    #[test]
+    fn stage163_queued_split_rollback_isolated_and_intact() {
+        assert!(
+            ORACLE_SCRIPT.contains("proof_require \"queued-split\" \"IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE\" \"IPC_RECV_V2_META_QUEUED_SPLIT_OK\"")
+                && ORACLE_SCRIPT.contains("proof_require \"rollback\" \"IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE\" \"IPC_RECV_V2_ROLLBACK_OK\""),
+            "queued-split + rollback requirements must remain"
+        );
+        // E2 provisioning is gated on the sub-knob (active = both knobs).
+        let e2 = BOOT_MOD_SRC
+            .split("fn provision_init_ipc_recv_proof_sender_wake_e2")
+            .nth(1)
+            .map(|s| &s[..s.len().min(200)])
+            .expect("E2 provisioning helper must exist");
+        assert!(
+            e2.contains("if !ipc_recv_proof_sender_wake_active()"),
+            "E2 must be provisioned only when the sub-knob is active"
+        );
+    }
+
+    // 9. No IPC/cap stateful seam was moved out of syscall.rs.
+    #[test]
+    fn stage163_no_seam_moved() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+    }
+
+    // 10. Syscall / IPC ABI counts are unchanged (the timed send reuses the
+    //     existing ipc_send ABI; fork is the existing NR 12).
+    #[test]
+    fn stage163_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts must be unchanged"
+        );
+        assert!(
+            USER_RT_SRC.contains("const SYSCALL_FORK_NR: usize = 12;"),
+            "fork must use the existing syscall NR 12 (no new syscall)"
+        );
+    }
+
+    // 11. E2 provisioning is wired identically across all three arch boots and is
+    //     NOT coupled to the x86 D6/CR3/TSS/PF path or to RPi5 boot.
+    #[test]
+    fn stage163_arch_boots_gated_uniformly_no_d6_no_rpi5() {
+        for (arch, src) in &[
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV64_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("provision_init_ipc_recv_proof_sender_wake_e2")
+                    && src.contains("init_args[13]"),
+                "{arch} boot must wire the E2 coordination cap into slot 13"
+            );
+        }
+        // The x86 E2 wiring must not touch the D6/CR3/TSS/PF machinery or RPi5.
+        let x86_block = X86_BOOT_SRC
+            .split("provision_init_ipc_recv_proof_sender_wake_e2")
+            .nth(1)
+            .map(|s| &s[..s.len().min(200)])
+            .unwrap_or("");
+        for forbidden in &["CR3", "TSS", "D6_", "page_fault", "rpi5", "RPi5", "bcm2712"] {
+            assert!(
+                !x86_block.contains(forbidden),
+                "x86 E2 provisioning must not touch the {forbidden} path"
+            );
+        }
     }
 }

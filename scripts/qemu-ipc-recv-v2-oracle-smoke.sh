@@ -74,6 +74,17 @@ if [[ "$YARM_IPC_RECV_PROOF_QUEUED_SPLIT" == "1" \
   export IPC_RECV_PROOF=1
   echo "[info] ipc-oracle: proof env set -> booting kernel with yarm.ipc_recv_proof=1"
 fi
+# Stage 163 — the sender-wake proof is isolated behind its own boot sub-knob
+# yarm.ipc_recv_proof_sender_wake=1, which gates BOTH the kernel proof-gated
+# waiter-present coordination hook AND the userspace deterministic sender-wake
+# workload (and the provisioning of the second coordination endpoint E2). The
+# queued-split + rollback proofs deliberately do NOT set it, so their boots are
+# byte-for-byte unchanged. Export it so the per-arch core smoke appends the
+# sub-knob to the kernel cmdline only when sender-wake is being proven.
+if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
+  export IPC_RECV_PROOF_SENDER_WAKE=1
+  echo "[info] ipc-oracle: sender-wake proof env set -> booting kernel with yarm.ipc_recv_proof_sender_wake=1"
+fi
 
 # Healthy-delivery success markers (Stage 156). Not all fire on every boot, so
 # only the "at least one recv-v2 meta delivered" invariant is hard-required.
@@ -257,20 +268,25 @@ else
 fi
 
 if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
-  # Stage 161: sender-wake requires BOTH the kernel delivery marker
+  # Stage 163: sender-wake requires BOTH the kernel delivery marker
   # IPC_RECV_V2_SENDER_WAKE_ORDER_OK and the userspace sequence marker
-  # IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE. It remains DEFERRED: a pure
-  # userspace workload cannot deterministically create AND observe a blocked
-  # sender before the receiver drain on a multi-CPU boot (no userspace-observable
-  # "sender is a waiter" signal and no userspace CPU-affinity control; the proof
-  # runs after secondary CPUs are released). Requiring it therefore fails by
-  # design until the minimal proof-gated infrastructure lands (see
-  # doc/KERNEL_UNLOCKING.md §5.1.9.4 — proposed Stage 162). Do NOT enable this
-  # knob before then.
+  # IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE. The pure-userspace race (Stage
+  # 161/162 deferral: a workload cannot deterministically create AND observe a
+  # blocked sender before the receiver drain on a multi-CPU boot) is closed by a
+  # proof-gated kernel coordination hook: when the sub-knob is set, the kernel
+  # pushes a one-byte signal onto the second endpoint E2 inside the SAME
+  # enqueue_sender_waiter critical section as the waiter enqueue, so the receiver
+  # only drains E1 after the sender is provably a waiter — making the handshake
+  # deterministic without CPU pinning. The userspace SEQUENCE marker is therefore
+  # always required. The kernel SENDER_WAKE_ORDER marker is emitted only on the
+  # trap-entry split-recv fast path (apply_split_sender_wake_plan); like the
+  # queued-split kernel marker it is REQUIRED on x86_64 and DEFERRED on
+  # AArch64/riscv64 (whose proof recv falls back to legacy_full_path) — exactly
+  # the per-arch policy proof_require already applies.
   echo "[info] ipc-oracle: proof sender-wake: REQUIRED"
   proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
 else
-  echo "[info] ipc-oracle: proof sender-wake: not required (DEFERRED — see doc/KERNEL_UNLOCKING.md §5.1.9.4)"
+  echo "[info] ipc-oracle: proof sender-wake: not required"
 fi
 
 # Regression gate: every baseline marker must still be present.

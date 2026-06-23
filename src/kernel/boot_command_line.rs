@@ -141,6 +141,12 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         crate::kernel::boot::set_ipc_recv_oracle_proof_enabled(enabled);
         crate::yarm_log!("YARM_IPC_RECV_PROOF_SET enabled={}", enabled);
     }
+    if let Some(enabled) = parsed.ipc_recv_proof_sender_wake {
+        // Stage 163 sub-knob: only meaningful in combination with the base proof
+        // knob above; gates the sender-wake coordination hook + workload.
+        crate::kernel::boot::set_ipc_recv_proof_sender_wake_enabled(enabled);
+        crate::yarm_log!("YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled={}", enabled);
+    }
 }
 
 pub fn set_raw_cmdline_from_bytes(source: &[u8]) -> BootCommandLine {
@@ -225,6 +231,11 @@ pub struct YarmBootOptions<'a> {
     /// deterministically drives the queued-split, sender-wake, and rollback
     /// recv-v2 markers. Default-off: nothing is provisioned or run otherwise.
     pub ipc_recv_proof: Option<bool>,
+    /// Stage 163: `yarm.ipc_recv_proof_sender_wake=1` SUB-knob. Default-off and
+    /// only meaningful with `ipc_recv_proof`; gates the deterministic sender-wake
+    /// coordination hook + workload, isolating it from the green queued-split +
+    /// rollback proof boots.
+    pub ipc_recv_proof_sender_wake: Option<bool>,
 }
 
 /// Parse a `yarm.loglevel=` value: digit 0–7 or a level name.
@@ -302,6 +313,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);
+        }
+        if key == b"yarm.ipc_recv_proof_sender_wake" {
+            options.ipc_recv_proof_sender_wake = parse_bool_knob(value);
         }
     }
     options
@@ -639,5 +653,35 @@ mod tests {
         );
         assert_eq!(parsed.ipc_recv_proof, Some(true));
         assert_eq!(parsed.d6_switch_proof, Some(true));
+    }
+
+    // Stage 163: the sender-wake SUB-knob parses as a standard bool knob, defaults
+    // to None (off), and is independent of the base ipc_recv_proof knob — the two
+    // keys must not alias (one is a prefix of the other).
+    #[test]
+    fn ipc_recv_proof_sender_wake_subknob_parses_and_defaults_off() {
+        assert_eq!(
+            parse_yarm_boot_options(b"").ipc_recv_proof_sender_wake,
+            None
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_recv_proof_sender_wake=1")
+                .ipc_recv_proof_sender_wake,
+            Some(true)
+        );
+        assert_eq!(
+            parse_yarm_boot_options(b"yarm.ipc_recv_proof_sender_wake=0")
+                .ipc_recv_proof_sender_wake,
+            Some(false)
+        );
+        // The base knob alone must NOT set the sub-knob (no prefix aliasing).
+        let base_only = parse_yarm_boot_options(b"yarm.ipc_recv_proof=1");
+        assert_eq!(base_only.ipc_recv_proof, Some(true));
+        assert_eq!(base_only.ipc_recv_proof_sender_wake, None);
+        // Both together parse independently.
+        let both =
+            parse_yarm_boot_options(b"yarm.ipc_recv_proof=1 yarm.ipc_recv_proof_sender_wake=1");
+        assert_eq!(both.ipc_recv_proof, Some(true));
+        assert_eq!(both.ipc_recv_proof_sender_wake, Some(true));
     }
 }

@@ -37,6 +37,12 @@ IPC_RECV_PROOF=${IPC_RECV_PROOF:-0}
 if [[ "$IPC_RECV_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_recv_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_recv_proof=1"
 fi
+# Stage 163: the sender-wake proof additionally needs the sub-knob
+# yarm.ipc_recv_proof_sender_wake=1 (gates the coordination hook + workload).
+IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-0}
+if [[ "$IPC_RECV_PROOF_SENDER_WAKE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_recv_proof_sender_wake="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.ipc_recv_proof_sender_wake=1"
+fi
 
 if [[ "$KERNEL_CMDLINE" != *"console="* ]] || [[ "${#KERNEL_CMDLINE}" -lt 12 ]]; then
   echo "[warn] suspicious KERNEL_CMDLINE override detected: '$KERNEL_CMDLINE'"
