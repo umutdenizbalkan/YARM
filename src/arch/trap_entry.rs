@@ -158,15 +158,53 @@ pub fn handle_trap_entry_shared(
             if let Some(result) =
                 crate::kernel::syscall_split::try_split_dispatch_into_frame(shared, cpu, frame)
             {
-                crate::yarm_log!(
-                    "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result={}",
-                    frame.syscall_num(),
-                    cpu.0,
-                    if result.is_ok() { "ok" } else { "err" }
-                );
-                // task_switched == false (no scheduler interaction); skip the
-                // global lock entirely.
-                return result;
+                match result {
+                    Ok(()) => {
+                        crate::yarm_log!(
+                            "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result=ok",
+                            frame.syscall_num(),
+                            cpu.0,
+                        );
+                        // task_switched == false (no scheduler interaction); skip
+                        // the global lock entirely.
+                        return Ok(());
+                    }
+                    // Stage 159BC/D parity fix: a NORMAL syscall error produced on
+                    // the split fast path (e.g. the recv-v2 queued-split rollback
+                    // returning InvalidArgs after an undersized writeback, having
+                    // already rolled the materialized cap back) must be encoded
+                    // into the trap frame and returned to userspace — exactly as
+                    // the global-lock path does in `KernelState::handle_trap`
+                    // (boot/fault_state.rs). All three arch entry points treat an
+                    // `Err(TrapHandleError)` return as a FATAL kernel halt, so
+                    // propagating a normal syscall error here turned an expected
+                    // user-visible error into a fatal trap dump. The split path
+                    // stashes no switch plan, so returning `Ok` here is complete.
+                    //
+                    // PageFault is encoded as an error code (conservative,
+                    // non-fatal) rather than killing the task; the global-lock
+                    // path retains the genuine task-fault semantics.
+                    Err(TrapHandleError::Syscall(e)) => {
+                        frame.set_err(e.code());
+                        crate::yarm_log!(
+                            "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result=handled_err code={}",
+                            frame.syscall_num(),
+                            cpu.0,
+                            e.code(),
+                        );
+                        return Ok(());
+                    }
+                    // MissingTrapFrame (and any future non-syscall variant) is a
+                    // genuine kernel-side failure; propagate it unchanged.
+                    Err(other) => {
+                        crate::yarm_log!(
+                            "YARM_LOCK_SPLIT_DISPATCH nr={} cpu={} result=err",
+                            frame.syscall_num(),
+                            cpu.0,
+                        );
+                        return Err(other);
+                    }
+                }
             }
         }
     }
