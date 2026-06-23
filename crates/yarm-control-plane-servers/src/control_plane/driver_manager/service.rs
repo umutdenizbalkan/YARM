@@ -13,6 +13,14 @@ use yarm_user_rt::runtime::{DriverControlOps, KernelIpcError};
 // TODO: MMIO/IOPORT bind opcodes (future)
 // TODO: Device enumeration opcode (future)
 // TODO: Heartbeat / watchdog opcode (future)
+// Userspace-only, driver_manager-local query opcodes. These are not syscall or
+// global IPC ABI additions; they are inert data replies for hosted scaffolding
+// and future driver-manager protocol work.
+pub const DRIVER_OP_QUERY_MY_DEVICE: u16 = 0x4450;
+pub const DRIVER_OP_QUERY_MY_MMIO: u16 = 0x4451;
+pub const DRIVER_OP_QUERY_MY_IRQS: u16 = 0x4452;
+pub const DRIVER_OP_QUERY_MY_CANDIDATE: u16 = 0x4453;
+pub const DRIVER_OP_QUERY_MY_DMA: u16 = 0x4454;
 
 fn read_u64(payload: &[u8], offset: usize) -> Result<u64, KernelIpcError> {
     let end = offset.checked_add(8).ok_or(KernelIpcError::WrongObject)?;
@@ -47,6 +55,10 @@ fn ok_reply(
         (0, None)
     };
     Message::with_header(0, opcode, flags, cap, &payload).map_err(|_| KernelIpcError::WrongObject)
+}
+
+fn inert_reply(opcode: u16, payload: &[u8]) -> Result<Message, KernelIpcError> {
+    Message::with_header(0, opcode, 0, None, payload).map_err(|_| KernelIpcError::WrongObject)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +282,27 @@ impl DeviceRecord {
     }
 }
 
+fn device_class_code(class: DeviceClass) -> u32 {
+    match class {
+        DeviceClass::Uart => 1,
+        DeviceClass::Mailbox => 2,
+        DeviceClass::Gpio => 3,
+        DeviceClass::IrqMux => 4,
+        DeviceClass::Block => 5,
+        DeviceClass::Unknown => 0,
+    }
+}
+
+fn device_status_code(status: DeviceStatus) -> u32 {
+    match status {
+        DeviceStatus::Discovered => 1,
+        DeviceStatus::DeferredNoMmioGrant => 2,
+        DeviceStatus::DeferredNoIrqRoute => 3,
+        DeviceStatus::DeferredNoHardwareControl => 4,
+        DeviceStatus::Unsupported => 0,
+    }
+}
+
 fn bounded_str(bytes: &[u8], len: usize) -> Option<&str> {
     bytes
         .get(..len)
@@ -318,7 +351,7 @@ impl PlatformInventory {
         self.iter().filter(move |record| record.class == class)
     }
 
-    fn assigned_device_for(&self, tid: u64) -> Option<&DeviceRecord> {
+    pub fn assigned_device_for(&self, tid: u64) -> Option<&DeviceRecord> {
         self.iter().find(|record| record.assigned_tid == Some(tid))
     }
 
@@ -367,6 +400,11 @@ impl PlatformInventory {
         } else {
             Err(KernelIpcError::MissingRight)
         }
+    }
+
+    pub fn query_assigned_device(&self, tid: u64) -> Result<&DeviceRecord, KernelIpcError> {
+        self.assigned_device_for(tid)
+            .ok_or(KernelIpcError::TaskMissing)
     }
 }
 
@@ -542,6 +580,101 @@ pub fn handle_request(
     handle_request_with_sender(registry, &PlatformInventory::new(), runtime, request, None)
 }
 
+fn mmio_count(record: &DeviceRecord) -> usize {
+    record
+        .mmio_ranges
+        .iter()
+        .filter(|range| range.is_some())
+        .count()
+}
+
+fn irq_count(record: &DeviceRecord) -> usize {
+    record.irq_lines.iter().filter(|irq| irq.is_some()).count()
+}
+
+fn count_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(0)
+}
+
+fn encode_device_summary(record: &DeviceRecord) -> [u8; 16] {
+    let mut payload = [0u8; 16];
+    payload[0..4].copy_from_slice(&device_class_code(record.class).to_le_bytes());
+    payload[4..8].copy_from_slice(&device_status_code(record.status).to_le_bytes());
+    payload[8..12].copy_from_slice(&count_u32(mmio_count(record)).to_le_bytes());
+    payload[12..16].copy_from_slice(&count_u32(irq_count(record)).to_le_bytes());
+    payload
+}
+
+fn encode_mmio_ranges(record: &DeviceRecord) -> [u8; 72] {
+    let mut payload = [0u8; 72];
+    payload[0..4].copy_from_slice(&count_u32(mmio_count(record)).to_le_bytes());
+    let mut cursor = 8;
+    for range in record.mmio_ranges.iter().flatten() {
+        payload[cursor..cursor + 8].copy_from_slice(&range.base.to_le_bytes());
+        payload[cursor + 8..cursor + 16].copy_from_slice(&range.len.to_le_bytes());
+        cursor += 16;
+    }
+    payload
+}
+
+fn encode_irq_lines(record: &DeviceRecord) -> [u8; 40] {
+    let mut payload = [0u8; 40];
+    payload[0..4].copy_from_slice(&count_u32(irq_count(record)).to_le_bytes());
+    let mut cursor = 8;
+    for irq in record.irq_lines.iter().flatten() {
+        payload[cursor..cursor + 4].copy_from_slice(&irq.to_le_bytes());
+        cursor += 4;
+    }
+    payload
+}
+
+fn encode_candidate(record: &DeviceRecord) -> [u8; 112] {
+    let mut payload = [0u8; 112];
+    payload[0..4].copy_from_slice(&device_class_code(record.class).to_le_bytes());
+    payload[4..8].copy_from_slice(&device_status_code(record.status).to_le_bytes());
+    let compatible_len = record.compatible().map(|value| value.len()).unwrap_or(0);
+    let candidate_len = record
+        .driver_candidate()
+        .map(|value| value.len())
+        .unwrap_or(0);
+    payload[8..12].copy_from_slice(&count_u32(compatible_len).to_le_bytes());
+    payload[12..16].copy_from_slice(&count_u32(candidate_len).to_le_bytes());
+    if let Some(compatible) = record.compatible() {
+        payload[16..16 + compatible.len()].copy_from_slice(compatible.as_bytes());
+    }
+    if let Some(candidate) = record.driver_candidate() {
+        payload[80..80 + candidate.len()].copy_from_slice(candidate.as_bytes());
+    }
+    payload
+}
+
+fn encode_dma_constraints(record: &DeviceRecord) -> [u8; 16] {
+    let mut payload = [0u8; 16];
+    payload[0..4].copy_from_slice(&device_class_code(record.class).to_le_bytes());
+    payload[4..8].copy_from_slice(&device_status_code(record.status).to_le_bytes());
+    // No DMA constraints are modeled yet. The zero count is inert data, not a grant.
+    payload[8..12].copy_from_slice(&0u32.to_le_bytes());
+    payload
+}
+
+fn handle_query_request(
+    inventory: &PlatformInventory,
+    request: &Message,
+    sender_tid: Result<u64, KernelIpcError>,
+) -> Result<Message, KernelIpcError> {
+    let claimed_tid = read_u64(request.as_slice(), 0)?;
+    let tid = verified_tid_or_reject_spoof(sender_tid?, claimed_tid)?;
+    let record = inventory.query_assigned_device(tid)?;
+    match request.opcode {
+        DRIVER_OP_QUERY_MY_DEVICE => inert_reply(request.opcode, &encode_device_summary(record)),
+        DRIVER_OP_QUERY_MY_MMIO => inert_reply(request.opcode, &encode_mmio_ranges(record)),
+        DRIVER_OP_QUERY_MY_IRQS => inert_reply(request.opcode, &encode_irq_lines(record)),
+        DRIVER_OP_QUERY_MY_CANDIDATE => inert_reply(request.opcode, &encode_candidate(record)),
+        DRIVER_OP_QUERY_MY_DMA => inert_reply(request.opcode, &encode_dma_constraints(record)),
+        _ => Err(KernelIpcError::WrongObject),
+    }
+}
+
 pub fn handle_request_with_sender(
     registry: &mut DriverRegistry,
     inventory: &PlatformInventory,
@@ -554,6 +687,11 @@ pub fn handle_request_with_sender(
         .filter(|tid| *tid != 0)
         .ok_or(KernelIpcError::MissingRight);
     match request.opcode {
+        DRIVER_OP_QUERY_MY_DEVICE
+        | DRIVER_OP_QUERY_MY_MMIO
+        | DRIVER_OP_QUERY_MY_IRQS
+        | DRIVER_OP_QUERY_MY_CANDIDATE
+        | DRIVER_OP_QUERY_MY_DMA => handle_query_request(inventory, &request, sender_tid),
         DRIVER_OP_REGISTER => {
             let claimed_tid = read_u64(payload, 0)?;
             let tid = verified_tid_or_reject_spoof(sender_tid?, claimed_tid)?;
@@ -913,6 +1051,18 @@ mod tests {
         inventory
     }
 
+    fn read_reply_u32(reply: &Message, offset: usize) -> u32 {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&reply.as_slice()[offset..offset + 4]);
+        u32::from_le_bytes(bytes)
+    }
+
+    fn read_reply_u64(reply: &Message, offset: usize) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&reply.as_slice()[offset..offset + 8]);
+        u64::from_le_bytes(bytes)
+    }
+
     #[test]
     fn privileged_requests_require_verified_sender_and_reject_spoofed_tid() {
         let mut registry = DriverRegistry::new();
@@ -942,6 +1092,248 @@ mod tests {
         assert_eq!(reply.opcode, DRIVER_OP_REGISTER);
         assert_eq!(registry.get(8).map(|record| record.tid), Some(8));
         assert_eq!(runtime.registered.get(), Some(8));
+    }
+
+    #[test]
+    fn pl011_driver_can_query_inert_assigned_device_mmio_irq_and_candidate() {
+        let mut registry = DriverRegistry::new();
+        registry.register(7).unwrap();
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut runtime = MockDriverControl::new();
+
+        let before_len = registry.len();
+        let summary = handle_request_with_sender(
+            &mut registry,
+            &inventory,
+            &mut runtime,
+            msg(DRIVER_OP_QUERY_MY_DEVICE, &[7]),
+            Some(7),
+        )
+        .expect("query summary");
+        assert_eq!(summary.transferred_cap(), None);
+        assert_eq!(
+            read_reply_u32(&summary, 0),
+            device_class_code(DeviceClass::Uart)
+        );
+        assert_eq!(
+            read_reply_u32(&summary, 4),
+            device_status_code(DeviceStatus::Discovered)
+        );
+        assert_eq!(read_reply_u32(&summary, 8), 1);
+        assert_eq!(read_reply_u32(&summary, 12), 1);
+
+        let mmio = handle_request_with_sender(
+            &mut registry,
+            &inventory,
+            &mut runtime,
+            msg(DRIVER_OP_QUERY_MY_MMIO, &[0]),
+            Some(7),
+        )
+        .expect("query mmio");
+        assert_eq!(mmio.transferred_cap(), None);
+        assert_eq!(read_reply_u32(&mmio, 0), 1);
+        assert_eq!(read_reply_u64(&mmio, 8), 0x107d_0010_0000);
+        assert_eq!(read_reply_u64(&mmio, 16), 0x1000);
+
+        let irqs = handle_request_with_sender(
+            &mut registry,
+            &inventory,
+            &mut runtime,
+            msg(DRIVER_OP_QUERY_MY_IRQS, &[7]),
+            Some(7),
+        )
+        .expect("query irqs");
+        assert_eq!(irqs.transferred_cap(), None);
+        assert_eq!(read_reply_u32(&irqs, 0), 1);
+        assert_eq!(read_reply_u32(&irqs, 8), 121);
+
+        let candidate = handle_request_with_sender(
+            &mut registry,
+            &inventory,
+            &mut runtime,
+            msg(DRIVER_OP_QUERY_MY_CANDIDATE, &[7]),
+            Some(7),
+        )
+        .expect("query candidate");
+        assert_eq!(candidate.transferred_cap(), None);
+        assert_eq!(candidate.as_slice().len(), 112);
+        assert_eq!(
+            read_reply_u32(&candidate, 0),
+            device_class_code(DeviceClass::Uart)
+        );
+        assert_eq!(
+            read_reply_u32(&candidate, 8),
+            u32::try_from("arm,pl011".len()).unwrap()
+        );
+        assert_eq!(
+            read_reply_u32(&candidate, 12),
+            u32::try_from("pl011_uart".len()).unwrap()
+        );
+        assert_eq!(&candidate.as_slice()[16..25], b"arm,pl011");
+        assert_eq!(&candidate.as_slice()[80..90], b"pl011_uart");
+
+        let dma = handle_request_with_sender(
+            &mut registry,
+            &inventory,
+            &mut runtime,
+            msg(DRIVER_OP_QUERY_MY_DMA, &[7]),
+            Some(7),
+        )
+        .expect("query dma");
+        assert_eq!(dma.transferred_cap(), None);
+        assert_eq!(read_reply_u32(&dma, 8), 0);
+        assert_eq!(
+            registry.len(),
+            before_len,
+            "queries must not append registry records"
+        );
+        assert_eq!(runtime.registered.get(), None);
+        assert_eq!(runtime.irq_line.get(), None);
+        assert_eq!(runtime.dma_request.get(), None);
+        assert_eq!(runtime.restarted.get(), None);
+    }
+
+    #[test]
+    fn query_requires_verified_sender_and_cannot_spoof_other_assignment() {
+        let mut registry = DriverRegistry::new();
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut runtime = MockDriverControl::new();
+
+        assert_eq!(
+            handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                msg(DRIVER_OP_QUERY_MY_DEVICE, &[7]),
+                None,
+            ),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(
+            handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                msg(DRIVER_OP_QUERY_MY_DEVICE, &[7]),
+                Some(8),
+            ),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(
+            handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                msg(DRIVER_OP_QUERY_MY_DEVICE, &[0]),
+                Some(8),
+            ),
+            Err(KernelIpcError::TaskMissing)
+        );
+    }
+
+    #[test]
+    fn deferred_rp1_and_mailbox_can_query_status_but_not_receive_grants() {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,rp1-gpio",
+                    DeviceClass::Gpio,
+                    "rp1_gpio_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_mmio(0, 0x1_0000, 0x1000)
+                .unwrap()
+                .with_irq(0, 33)
+                .unwrap()
+                .assigned_to(10)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,firmware",
+                    DeviceClass::Mailbox,
+                    "rpi_firmware_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_irq(0, 34)
+                .unwrap()
+                .assigned_to(11)
+                .unwrap(),
+            )
+            .unwrap();
+        let mut registry = DriverRegistry::new();
+        registry.register(10).unwrap();
+        registry.register(11).unwrap();
+        let mut runtime = MockDriverControl::new();
+
+        for (tid, class) in [(10, DeviceClass::Gpio), (11, DeviceClass::Mailbox)] {
+            let reply = handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                msg(DRIVER_OP_QUERY_MY_DEVICE, &[tid]),
+                Some(tid),
+            )
+            .expect("deferred query succeeds");
+            assert_eq!(reply.transferred_cap(), None);
+            assert_eq!(read_reply_u32(&reply, 0), device_class_code(class));
+            assert_eq!(
+                read_reply_u32(&reply, 4),
+                device_status_code(DeviceStatus::DeferredNoMmioGrant)
+            );
+        }
+
+        assert_eq!(
+            handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                msg(DRIVER_OP_GRANT_IRQ, &[10, 33]),
+                Some(10),
+            ),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(
+            handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                msg(DRIVER_OP_GRANT_IRQ, &[11, 34]),
+                Some(11),
+            ),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(runtime.irq_line.get(), None);
+    }
+
+    #[test]
+    fn query_output_is_bounded_stable_and_cap_free() {
+        let mut registry = DriverRegistry::new();
+        let inventory = pl011_inventory(7, DeviceStatus::Discovered);
+        let mut runtime = MockDriverControl::new();
+        for (opcode, expected_len) in [
+            (DRIVER_OP_QUERY_MY_DEVICE, 16),
+            (DRIVER_OP_QUERY_MY_MMIO, 72),
+            (DRIVER_OP_QUERY_MY_IRQS, 40),
+            (DRIVER_OP_QUERY_MY_CANDIDATE, 112),
+            (DRIVER_OP_QUERY_MY_DMA, 16),
+        ] {
+            let reply = handle_request_with_sender(
+                &mut registry,
+                &inventory,
+                &mut runtime,
+                msg(opcode, &[7]),
+                Some(7),
+            )
+            .expect("query");
+            assert_eq!(reply.as_slice().len(), expected_len);
+            assert_eq!(reply.transferred_cap(), None);
+        }
     }
 
     #[test]
