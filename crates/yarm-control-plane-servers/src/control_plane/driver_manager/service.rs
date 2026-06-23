@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 use yarm::kernel::boot::{KernelError, KernelState};
 use yarm_ipc_abi::driver_abi::{
     DRIVER_OP_GRANT_DMA, DRIVER_OP_GRANT_IRQ, DRIVER_OP_REGISTER, DRIVER_OP_RESTARTED,
@@ -124,23 +124,157 @@ impl DriverRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Platform inventory model (userspace-only, no DTB parsing or spawning)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceClass {
+    Uart,
+    Mailbox,
+    Gpio,
+    IrqMux,
+    Block,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceStatus {
+    Discovered,
+    DeferredNoMmioGrant,
+    DeferredNoIrqRoute,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioRange {
+    pub base: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRecord {
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub class: DeviceClass,
+    pub mmio_ranges: [Option<MmioRange>; 4],
+    pub irq_lines: [Option<u32>; 8],
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub status: DeviceStatus,
+}
+
+impl DeviceRecord {
+    pub fn new(
+        compatible: &str,
+        class: DeviceClass,
+        driver_candidate: &str,
+        status: DeviceStatus,
+    ) -> Result<Self, KernelIpcError> {
+        if compatible.is_empty() || compatible.len() > 64 || driver_candidate.len() > 32 {
+            return Err(KernelIpcError::WrongObject);
+        }
+        let mut record = Self {
+            compatible: [0; 64],
+            compatible_len: compatible.len(),
+            class,
+            mmio_ranges: [None; 4],
+            irq_lines: [None; 8],
+            driver_candidate: [0; 32],
+            driver_candidate_len: driver_candidate.len(),
+            status,
+        };
+        record.compatible[..compatible.len()].copy_from_slice(compatible.as_bytes());
+        record.driver_candidate[..driver_candidate.len()]
+            .copy_from_slice(driver_candidate.as_bytes());
+        Ok(record)
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        core::str::from_utf8(&self.compatible[..self.compatible_len]).ok()
+    }
+
+    pub fn driver_candidate(&self) -> Option<&str> {
+        core::str::from_utf8(&self.driver_candidate[..self.driver_candidate_len]).ok()
+    }
+
+    pub fn with_mmio(mut self, index: usize, base: u64, len: u64) -> Result<Self, KernelIpcError> {
+        if index >= self.mmio_ranges.len() || len == 0 {
+            return Err(KernelIpcError::WrongObject);
+        }
+        self.mmio_ranges[index] = Some(MmioRange { base, len });
+        Ok(self)
+    }
+
+    pub fn with_irq(mut self, index: usize, line: u32) -> Result<Self, KernelIpcError> {
+        if index >= self.irq_lines.len() {
+            return Err(KernelIpcError::WrongObject);
+        }
+        self.irq_lines[index] = Some(line);
+        Ok(self)
+    }
+}
+
+const MAX_DEVICES: usize = 32;
+
+#[derive(Debug)]
+pub struct PlatformInventory {
+    devices: [Option<DeviceRecord>; MAX_DEVICES],
+    len: usize,
+}
+
+impl PlatformInventory {
+    pub const fn new() -> Self {
+        Self {
+            devices: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub fn add(&mut self, record: DeviceRecord) -> Result<(), KernelIpcError> {
+        if record.compatible_len == 0 || record.driver_candidate_len == 0 {
+            return Err(KernelIpcError::WrongObject);
+        }
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.devices[self.len] = Some(record);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DeviceRecord> {
+        self.devices[..self.len]
+            .iter()
+            .filter_map(|record| record.as_ref())
+    }
+
+    pub fn candidates_for(&self, class: DeviceClass) -> impl Iterator<Item = &DeviceRecord> {
+        self.iter().filter(move |record| record.class == class)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KernelDriverControl (test-only runtime adapter)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 pub struct KernelDriverControl<'a> {
     kernel: &'a mut KernelState,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 impl<'a> KernelDriverControl<'a> {
     pub const fn new(kernel: &'a mut KernelState) -> Self {
         Self { kernel }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 impl DriverControlOps for KernelDriverControl<'_> {
     fn register_driver(&mut self, tid: u64) -> Result<(), KernelIpcError> {
         self.kernel
@@ -184,7 +318,7 @@ impl DriverControlOps for KernelDriverControl<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-tests"))]
 fn map_kernel_ipc_error(err: KernelError) -> KernelIpcError {
     match err {
         KernelError::MissingRight => KernelIpcError::MissingRight,
@@ -213,6 +347,7 @@ fn map_kernel_ipc_error(err: KernelError) -> KernelIpcError {
 #[derive(Debug)]
 pub struct DriverService {
     registry: DriverRegistry,
+    inventory: PlatformInventory,
     handled: usize,
 }
 
@@ -220,6 +355,7 @@ impl DriverService {
     pub const fn new() -> Self {
         Self {
             registry: DriverRegistry::new(),
+            inventory: PlatformInventory::new(),
             handled: 0,
         }
     }
@@ -230,6 +366,10 @@ impl DriverService {
 
     pub fn registry(&self) -> &DriverRegistry {
         &self.registry
+    }
+
+    pub fn inventory(&self) -> &PlatformInventory {
+        &self.inventory
     }
 
     pub fn handle(
@@ -394,10 +534,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "legacy-tests")]
     use yarm::kernel::boot::Bootstrap;
+    #[cfg(feature = "legacy-tests")]
     use yarm::std::thread;
+    #[cfg(feature = "legacy-tests")]
     use yarm_ipc_abi::driver_abi::{DRIVER_OP_GRANT_IRQ, pack_driver_pair};
 
+    #[cfg(feature = "legacy-tests")]
     fn run_with_large_stack<F>(f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -409,6 +553,7 @@ mod tests {
         handle.join().expect("join large-stack test thread");
     }
 
+    #[cfg(feature = "legacy-tests")]
     #[test]
     fn driver_manager_register_and_grant_irq_roundtrip() {
         run_with_large_stack(|| {
@@ -433,6 +578,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "legacy-tests")]
     #[test]
     fn driver_service_tracks_handled_requests() {
         run_with_large_stack(|| {
@@ -486,5 +632,107 @@ mod tests {
         assert_eq!(registry.len(), MAX_DRIVERS);
         let result = registry.register(MAX_DRIVERS as u64);
         assert!(result.is_err(), "should fail when table is full");
+    }
+
+    #[test]
+    fn platform_inventory_accepts_fake_rpi5_driver_candidates_without_spawning() {
+        let mut inventory = PlatformInventory::new();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "arm,pl011",
+                    DeviceClass::Uart,
+                    "pl011_uart",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_mmio(0, 0x107d_0010_0000, 0x1000)
+                .unwrap()
+                .with_irq(0, 121)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,rp1-gpio",
+                    DeviceClass::Gpio,
+                    "rp1_gpio_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap()
+                .with_mmio(0, 0, 0x1000)
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "raspberrypi,firmware",
+                    DeviceClass::Mailbox,
+                    "rpi_firmware_srv",
+                    DeviceStatus::DeferredNoMmioGrant,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        inventory
+            .add(
+                DeviceRecord::new(
+                    "yarm,irqmux",
+                    DeviceClass::IrqMux,
+                    "irqmux_srv",
+                    DeviceStatus::DeferredNoIrqRoute,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(inventory.len(), 4);
+        assert_eq!(
+            inventory
+                .candidates_for(DeviceClass::Uart)
+                .next()
+                .and_then(DeviceRecord::driver_candidate),
+            Some("pl011_uart")
+        );
+        assert_eq!(
+            inventory
+                .candidates_for(DeviceClass::Gpio)
+                .next()
+                .and_then(DeviceRecord::compatible),
+            Some("raspberrypi,rp1-gpio")
+        );
+
+        let service = DriverService::new();
+        assert_eq!(service.handled_count(), 0);
+        assert_eq!(service.registry().len(), 0);
+        assert_eq!(
+            service.inventory().len(),
+            0,
+            "inventory model is inert and does not spawn/register by default"
+        );
+    }
+
+    #[test]
+    fn platform_inventory_rejects_malformed_records() {
+        assert!(
+            DeviceRecord::new("", DeviceClass::Unknown, "drv", DeviceStatus::Unsupported).is_err()
+        );
+        assert!(
+            DeviceRecord::new(
+                "ok",
+                DeviceClass::Unknown,
+                "abcdefghijklmnopqrstuvwxyz0123456789",
+                DeviceStatus::Unsupported
+            )
+            .is_err()
+        );
+        assert!(
+            DeviceRecord::new("ok", DeviceClass::Unknown, "drv", DeviceStatus::Unsupported)
+                .unwrap()
+                .with_mmio(0, 0x1000, 0)
+                .is_err()
+        );
     }
 }

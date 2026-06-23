@@ -79,7 +79,9 @@ and an `image_id` in the runtime spawn table (`initramfs_srv`, `devfs_srv`,
 claim and is **not** consumed by init today — no code selects or applies it.
 Raspberry Pi-specific driver binaries (`uart_srv`, `irqmux_srv`, `rp1_gpio_srv`)
 are deliberately **omitted** until RPi5 userspace actually reaches
-`driver_manager` and those drivers have a validated hardware path. See the
+`driver_manager` and those drivers have a validated hardware path. The
+firmware-property scaffold is also mock-only: no `rpi_firmware_srv` binary is
+declared, and its entrypoint only logs deferred no-MMIO-grant markers. See the
 driver inventory in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning
@@ -90,7 +92,8 @@ This profile does **not** assert that:
   halts in the HH5 diagnostic path);
 - the listed services have Raspberry Pi 5-specific hardware support;
 - device-tree-driven device discovery, MMIO/IRQ resource assignment, or driver
-  spawning is implemented;
+  spawning is implemented (DRS-1 adds only a userspace-only fake inventory model
+  in `driver_manager` tests);
 - the manifest is handed to init; or
 - any listed service is spawned because this file exists.
 

@@ -72,7 +72,7 @@ state 9 today.
 | `uart_srv` (generic) | 1,3,4,5,7,8 | No (no `image_id`) | Yes | `UartDeviceOps` trait; `run()` logs `UART_SRV_DEFERRED_NO_MMIO_GRANT`. |
 | PL011 backend | 2,3,4 | n/a | Yes | `Pl011UartDevice<B: UartRegisterIo>`; DR/FR/IBRD/FBRD/LCRH/CR/IMSC/ICR; MMIO abstracted, mock-safe, nonblocking. |
 | `console_driver` bin | 5,7 | No | Indirect | Build-declared bin; its `run()` calls `run_devfs()`. Not in spawn table; the live devfs is `devfs_srv`. |
-| mailbox / RPi firmware property (`drivers/firmware/rpi`) | 2,3,4,7,8 | No (no bin) | Yes | `RpiPropertyTransport` trait + property tags; `run()` is empty; real MMIO transport deferred; **no `rpi_firmware_srv` bin**. |
+| mailbox / RPi firmware property (`drivers/firmware/rpi`) | 2,3,4,7,8 | No (no bin) | Yes | `RpiPropertyTransport` trait + property tags; `run()` emits `RPI_FIRMWARE_SRV_ENTRY` and `RPI_FIRMWARE_SRV_DEFERRED_NO_MMIO_GRANT`; real MMIO transport deferred; **no `rpi_firmware_srv` bin**. |
 | generic GPIO (`drivers/gpio`) | 1,3 | n/a | Yes | `GpioDeviceOps` trait + pin/mode/pull/direction types; no registers/discovery. |
 | `rp1_gpio_srv` | 2,3,4,5,7,8 | No (no `image_id`) | Yes | `Rp1GpioDevice<B: RegisterIo>` over RP1 GPIO_CTRL/SYS_RIO/PADS (54 pins); `run()` logs `RP1_GPIO_SRV_DEFERRED_NO_MMIO_GRANT`. |
 | `irqmux_srv` | 1,3,4,5,7,8 | No (no `image_id`) | Yes (software model) | `IrqMuxService` software route/grant authorization; real recv loop; **no GIC / RP1 hardware wiring**. See `doc/IRQMUX_CONTRACT.md`. |
@@ -107,7 +107,7 @@ state 9 today.
 - Missing: real MMIO mailbox transport (channel-8 doorbell/status polling), bus
   vs. physical address translation, cache maintenance and 16-byte buffer
   alignment, and post-HH4 high-VA safety. No service binary is declared and
-  `run()` is empty — it is a scaffold, not a driver. Note that BCM2712/Pi 5
+  `run()` only logs deferred markers — it is a scaffold, not a driver. Note that BCM2712/Pi 5
   firmware-interface specifics differ from the legacy VideoCore mailbox and must
   be validated against the Pi 5 firmware before any transport is enabled.
 
@@ -137,11 +137,15 @@ state 9 today.
   registry with `REGISTER`, `GRANT_IRQ`, `GRANT_DMA`, `RESTARTED`, backed by
   kernel runtime ops that mint/grant IRQ and DMA-region capabilities and restart
   tasks. Emits `DRIVER_MANAGER_READY`.
-- Missing for an RPi5 first driver spawn: it does **not** parse the DTB, does
-  **not** enumerate or classify devices (`DriverClass::Unknown` only; MMIO/IOPORT
-  bind opcodes, device-enumeration, and heartbeat/watchdog are explicit TODOs),
-  and does **not** spawn driver binaries (PM remains the spawn authority). On
-  RPi5 it is additionally blocked because userspace is not reached.
+- Missing for an RPi5 first driver spawn: it does **not** parse the DTB or
+  spawn driver binaries (PM remains the spawn authority).
+  DRS-1 adds only an inert userspace inventory model: `DeviceClass`
+  (`Uart`, `Mailbox`, `Gpio`, `IrqMux`, `Block`, `Unknown`) plus
+  `DeviceRecord` compatible strings, MMIO ranges, IRQ lines, candidate driver
+  names, and deferred status. Hosted tests use a fake RPi5 inventory selecting
+  PL011, RP1 GPIO, firmware mailbox, and irqmux candidates without registering
+  or spawning them. On RPi5 it is additionally blocked because userspace is not
+  reached.
 
 ## 5. Driver-manager integration plan (RPi5)
 
@@ -151,8 +155,9 @@ state 9 today.
    virtual pointer already proven at HH4 (`RPI5_HH4_DTB_VIRT_OK`), and a
    read-only device inventory derived from it — **without** starting any
    hardware-heavy driver.
-3. Extend the driver ABI/registry with device records (compatible string, MMIO
-   region, IRQ line, DMA constraints) instead of the current `Unknown` class.
+3. Promote the DRS-1 userspace-only inventory model into a real DTB-derived
+   inventory path (compatible string, MMIO region, IRQ line, DMA constraints)
+   without changing spawn authority.
 4. Only then register/grant resources to a driver and let PM spawn it, gated per
    the safe-driver ordering in milestone RPi5-DRV-2.
 

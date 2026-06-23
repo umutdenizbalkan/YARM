@@ -52,7 +52,10 @@ pub fn dispatch_rpi_firmware_request<T: RpiPropertyTransport>(
 
 /// Deferred entrypoint: deliberately no IPC receive loop, startup-slot access,
 /// MMIO discovery, or volatile access.
-pub fn run() {}
+pub fn run() {
+    yarm_user_rt::user_log!("RPI_FIRMWARE_SRV_ENTRY");
+    yarm_user_rt::user_log!("RPI_FIRMWARE_SRV_DEFERRED_NO_MMIO_GRANT");
+}
 
 #[cfg(test)]
 mod tests {
@@ -86,6 +89,7 @@ mod tests {
         assert!(!service.contains(&volatile_read));
         assert!(!transport.contains(&volatile_read));
         assert!(transport.contains("#[cfg(not(feature = \"hosted-dev\"))]"));
-        assert!(service.contains("pub fn run() {}"));
+        assert!(service.contains("RPI_FIRMWARE_SRV_ENTRY"));
+        assert!(service.contains("RPI_FIRMWARE_SRV_DEFERRED_NO_MMIO_GRANT"));
     }
 }

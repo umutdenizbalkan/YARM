@@ -4,7 +4,6 @@
 //! Deprecated legacy namespace.
 //! Workspace crates under `crates/` are the runtime dispatch entrypoints.
 
-#[cfg(any(not(test), feature = "legacy-tests"))]
 pub mod driver_manager;
 #[cfg(any(not(test), feature = "legacy-tests"))]
 pub mod init;

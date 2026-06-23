@@ -46,7 +46,8 @@ mocks.
   retains compatibility aliases only.
 - It defines an `RpiPropertyTransport` trait, a firmware client, and property
   tags, with a deterministic hosted mock transport. The real MMIO transport is
-  deferred and the service `run()` is empty.
+  deferred and the service `run()` emits `RPI_FIRMWARE_SRV_ENTRY` followed by
+  `RPI_FIRMWARE_SRV_DEFERRED_NO_MMIO_GRANT`.
 - **No `rpi_firmware_srv` bin is added**; the crate manifest declares no such
   binary and the crate root exposes no firmware `run_*` entrypoint. The scaffold
   is **not live-spawned** and **not hardware-proven**.
@@ -93,13 +94,21 @@ mocks.
 
 - `driver_manager` (control-plane) is **live-spawned in the QEMU flow**
   (`image_id=7`) as a driver registry handling `REGISTER` / `GRANT_IRQ` /
-  `GRANT_DMA` / `RESTARTED`. It does not parse the DTB and does not spawn driver
-  binaries. See [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
+  `GRANT_DMA` / `RESTARTED`. It now also has an inert userspace-only
+  `PlatformInventory` / `DeviceRecord` model for future RPi5 candidates
+  (`Uart`, `Mailbox`, `Gpio`, `IrqMux`, `Block`, `Unknown`) with compatible
+  strings, MMIO ranges, IRQs, candidate driver names, and deferred status. It
+  does not parse the DTB and does not spawn driver binaries. See
+  [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
 
 ## Summary
 
 The generic/backend split is in place for UART, GPIO, and block; the RPi
-firmware mailbox is a transport scaffold. Of the Raspberry Pi 5-relevant
+firmware mailbox is a transport scaffold. DRS-1 audited every declared
+`yarm-driver-servers` binary (`blkcache_srv`, `console_driver`, `input_srv`,
+`irqmux_srv`, `uart_srv`, `virtio_blk_srv`, `virtio_gpu_srv`, `virtio_net_srv`,
+`rp1_gpio_srv`) and the RPi-facing modules (`uart`, PL011, `mailbox`/firmware,
+`gpio`, RP1 GPIO, `irqmux`). Of the Raspberry Pi 5-relevant
 servers, none are live-spawned with real hardware integration: they are
 mock/protocol-ready and **not hardware-proven**, pending the platform discovery,
 MMIO-grant, and interrupt-domain work tracked in
