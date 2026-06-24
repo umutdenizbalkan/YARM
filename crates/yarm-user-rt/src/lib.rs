@@ -297,17 +297,23 @@ pub mod syscall {
     /// so it can reuse the parent's proof endpoint caps with no manual stack/TLS
     /// bootstrap. Reuses the existing `Fork` syscall — no ABI change.
     ///
-    /// Returns the raw return register (`ret0`): `0` in the child, the child TID
-    /// (non-zero) in the parent. Fork failure is not distinguishable from a child
-    /// TID on the AArch64 ABI (no separate error lane), so the proof-only caller
-    /// must tolerate a missing child (bounded coordination poll, never an
-    /// unbounded wait).
+    /// Returns `None` on a fork failure that the ABI can flag (x86_64 sets the
+    /// separate error lane), `Some(0)` in the child, and `Some(child_tid)` in the
+    /// parent. On AArch64/riscv64 there is no separate error lane, so a failure
+    /// there cannot be distinguished from a child TID and is returned as
+    /// `Some(value)`; the proof-only caller must therefore still tolerate a missing
+    /// child (bounded coordination poll, never an unbounded wait). Reuses the
+    /// existing `Fork` syscall — no ABI change.
     #[inline]
-    pub unsafe fn fork() -> u64 {
+    pub unsafe fn fork() -> Option<u64> {
         let args = [0usize; 6];
         // SAFETY: Uses architecture syscall ABI to enter kernel.
         let ret = unsafe { crate::arch::raw_syscall(SYSCALL_FORK_NR, args) };
-        ret.ret0 as u64
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return None;
+        }
+        Some(ret.ret0 as u64)
     }
 
     #[inline]

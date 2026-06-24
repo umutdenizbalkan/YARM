@@ -1290,36 +1290,67 @@ fn run_ipc_recv_proof_sender_wake(
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_STOP_FULL idx={}", filled);
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_DONE count={}", filled);
 
-    // (2) Fork: child == sender, parent (init) == receiver.
+    // (5) Fork — child == sender, parent (init) == receiver. Explicit FORK_BEGIN /
+    // FORK_RET (raw + role) markers expose the fork return and the role decision so
+    // an AArch64 fork that never starts a runnable child is directly visible: the
+    // child-side markers (FORK_RET role=child, CHILD_ENTRY, SENDER_START) are then
+    // absent while the parent proceeds. The parent NEVER polls E2 until fork has
+    // returned its parent-side child pid (step 6 below).
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_BEGIN");
     // SAFETY: proof-only fork; the child inherits init's COW address space + proof
     // caps and parks after its blocking send (never returns into init's flow).
-    let pid = unsafe { yarm_user_rt::syscall::fork() };
-    if pid == 0 {
-        // ── CHILD: the real blocked sender ──
-        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_START");
-        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_BLOCKING_SEND_BEGIN");
-        if let Ok(msg) = Message::with_header(0, IPC_RECV_PROOF_OPCODE, 0, None, &[0x5Eu8; 8]) {
-            // SAFETY: timed blocking send on the FULL E1 → the child becomes a real
-            // sender-waiter; completes once init's drain frees a slot and refills it.
-            let _ = unsafe {
-                yarm_user_rt::syscall::ipc_send_timeout_ticks(
-                    e1_send,
-                    &msg,
-                    SENDER_SEND_TIMEOUT_TICKS,
-                )
-            };
+    let fork_ret = unsafe { yarm_user_rt::syscall::fork() };
+    let pid = match fork_ret {
+        None => {
+            // x86_64 flagged a fork failure on the separate error lane. Abort
+            // boundedly — never spin on E2 for a child that does not exist.
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=err role=err");
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED");
+            return;
         }
-        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE");
-        // Park the child: do NOT return into init's post-proof flow.
-        loop {
-            let _ = yarm_user_rt::syscall::yield_now();
+        Some(0) => {
+            // ── CHILD: the real blocked sender. CHILD_ENTRY/SENDER_START are emitted
+            // BEFORE the timed blocking send so the ordering is observable. ──
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=0 role=child");
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_CHILD_ENTRY");
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_START");
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_BLOCKING_SEND_BEGIN");
+            if let Ok(msg) = Message::with_header(0, IPC_RECV_PROOF_OPCODE, 0, None, &[0x5Eu8; 8]) {
+                // SAFETY: timed blocking send on the FULL E1 → the child becomes a
+                // real sender-waiter; completes once init's drain frees a slot and
+                // refills it.
+                let _ = unsafe {
+                    yarm_user_rt::syscall::ipc_send_timeout_ticks(
+                        e1_send,
+                        &msg,
+                        SENDER_SEND_TIMEOUT_TICKS,
+                    )
+                };
+            }
+            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE");
+            // Park the child: do NOT return into init's post-proof flow.
+            loop {
+                let _ = yarm_user_rt::syscall::yield_now();
+            }
         }
-    }
+        Some(child_pid) => {
+            // ── PARENT (init): the receiver. Has a concrete child pid. ──
+            yarm_user_rt::user_log!(
+                "IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw={} role=parent",
+                child_pid
+            );
+            child_pid
+        }
+    };
 
-    // ── PARENT (init): the receiver ──
-    // (4) Non-blocking-poll E2 until the kernel's waiter-present coordination signal
-    // appears. The signal carries the waiter's TID (Message::sender_tid). Bounded so
-    // a missing child never hangs the boot.
+    // (6) PARENT only: now that fork has returned a parent-side child pid, wait for
+    // the kernel's waiter-present coordination signal on E2. Non-blocking-poll;
+    // bounded so a missing/never-scheduled child can never hang the boot. The signal
+    // carries the waiter's TID (Message::sender_tid).
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN child_pid={}",
+        pid
+    );
     let mut waiter_tid: Option<u64> = None;
     for _ in 0..E2_POLL_MAX {
         let _ = yarm_user_rt::syscall::yield_now();
@@ -1345,7 +1376,7 @@ fn run_ipc_recv_proof_sender_wake(
         waiter_tid,
         pid
     );
-    // (4b) The waiter MUST be the forked child, never init. A waiter-present for
+    // (6b) The waiter MUST be the forked child, never init. A waiter-present for
     // init would mean init blocked during fill (the Stage 163A bug) — reject it.
     if waiter_tid == init_tid {
         yarm_user_rt::user_log!(
@@ -1364,7 +1395,7 @@ fn run_ipc_recv_proof_sender_wake(
         return;
     }
 
-    // (5) Wake-trigger drain: recv-v2 (NR 2 → trap-entry split path). The queue is
+    // (7) Wake-trigger drain: recv-v2 (NR 2 → trap-entry split path). The queue is
     // full and the child is a waiter, so this drains a queued message, refills the
     // child's message, and the real path emits IPC_RECV_V2_SENDER_WAKE_ORDER_OK.
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_RECV_BEGIN");
@@ -1387,7 +1418,7 @@ fn run_ipc_recv_proof_sender_wake(
             yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_RECV_RET code={}", e as usize);
         }
     }
-    // (6) Drain the remaining queued messages (non-blocking, so empty never blocks)
+    // (8) Drain the remaining queued messages (non-blocking, so empty never blocks)
     // until the child's own message is observed — concrete proof of sender progress.
     if !got_child {
         for _ in 0..DRAIN_MAX {

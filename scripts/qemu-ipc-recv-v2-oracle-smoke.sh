@@ -135,17 +135,33 @@ FATAL_MARKERS=(
 # Skip cleanly if QEMU is unavailable (matches the core-smoke convention).
 require_qemu_or_warn "$QEMU_BIN" "$QEMU_SMOKE_STRICT"
 
-# Delegate the boot to the existing per-arch core smoke; it captures QEMU output
-# to $LOGFILE (default $CORE_LOG). It warns+exits 0 if artifacts are missing.
+# Delegate the boot to the existing per-arch core smoke. It captures the QEMU
+# serial output to $LOGFILE (=$CORE_LOG) AND tees it to ITS stdout. Stage 163B:
+# the previous oracle analyzed $CORE_LOG, which could disagree with the actually
+# captured run output (stale file, or a path mismatch). To remove ALL ambiguity we
+# capture the core-smoke's COMBINED stdout/stderr into one explicit oracle run log
+# and then analyze a single normalized analysis log (that captured output UNION the
+# raw serial $CORE_LOG, so the raw markers are present no matter which path carries
+# them). Every marker check below reads ONLY $ANALYSIS_LOG via one helper.
 export LOGFILE="$CORE_LOG"
-echo "[info] ipc-oracle: booting $ARCH via $CORE_SMOKE (log: $CORE_LOG)"
+CORE_RUN_LOG="ipc-oracle-core-stdout-$ARCH.log"
+ANALYSIS_LOG="ipc-oracle-run-$ARCH.log"
+rm -f "$CORE_RUN_LOG" "$ANALYSIS_LOG"
+echo "[info] ipc-oracle: booting $ARCH via $CORE_SMOKE (serial log: $CORE_LOG, run log: $CORE_RUN_LOG)"
 set +e
-QEMU_SMOKE_STRICT="$QEMU_SMOKE_STRICT" LOGFILE="$CORE_LOG" "$CORE_SMOKE"
-CORE_STATUS=$?
+QEMU_SMOKE_STRICT="$QEMU_SMOKE_STRICT" LOGFILE="$CORE_LOG" "$CORE_SMOKE" 2>&1 | tee "$CORE_RUN_LOG"
+CORE_STATUS=${PIPESTATUS[0]}
 set -e
 
-if [[ ! -s "$CORE_LOG" ]]; then
-  echo "[warn] ipc-oracle: no boot log produced (QEMU/artifacts likely unavailable); skipping"
+# Build the single analysis log: the captured core-smoke run output first, then the
+# raw serial $CORE_LOG appended, both with CR normalized to LF so every marker that
+# reached EITHER sink is visible to one consistent text scan.
+: >"$ANALYSIS_LOG"
+[[ -f "$CORE_RUN_LOG" ]] && tr '\r' '\n' <"$CORE_RUN_LOG" >>"$ANALYSIS_LOG"
+[[ -f "$CORE_LOG" ]] && tr '\r' '\n' <"$CORE_LOG" >>"$ANALYSIS_LOG"
+
+if [[ ! -s "$ANALYSIS_LOG" ]]; then
+  echo "[warn] ipc-oracle: no boot output produced (QEMU/artifacts likely unavailable); skipping"
   [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
   exit 0
 fi
@@ -155,11 +171,21 @@ if [[ "$CORE_STATUS" -ne 0 ]]; then
   exit 1
 fi
 
-echo "[info] ipc-oracle: analyzing IPC delivery markers in $CORE_LOG"
+# Single source of truth for every marker check: fixed-string match against the one
+# analysis log. Using `-F` (literal) avoids any regex/word-boundary surprises.
+marker_present() {
+  # $1 = literal marker, $2 = file (defaults to $ANALYSIS_LOG)
+  local marker="$1" file="${2:-$ANALYSIS_LOG}"
+  [[ -s "$file" ]] || return 1
+  rg -F -q -a "$marker" "$file"
+}
+
+ANALYSIS_BYTES=$(wc -c <"$ANALYSIS_LOG" 2>/dev/null | tr -d ' ')
+echo "[info] ipc-oracle: analyzing markers in $ANALYSIS_LOG (bytes=${ANALYSIS_BYTES:-0}) — single source for initial scan + proof_require"
 : >"$ORACLE_SNAPSHOT"
 present=()
 for m in "${ORACLE_MARKERS[@]}"; do
-  if rg -n -m 1 "$m" "$CORE_LOG" >/dev/null 2>&1; then
+  if marker_present "$m"; then
     echo "[ok]   present: $m"
     echo "$m" >>"$ORACLE_SNAPSHOT"
     present+=("$m")
@@ -174,7 +200,7 @@ rc=0
 
 # Fatal markers must not appear.
 for f in "${FATAL_MARKERS[@]}"; do
-  if rg -n -m 1 "$f" "$CORE_LOG" >/dev/null 2>&1; then
+  if marker_present "$f"; then
     echo "[err] ipc-oracle: fatal IPC marker present: $f"
     rc=1
   fi
@@ -183,7 +209,7 @@ done
 # At least one recv-v2 meta delivery must be proven.
 any_required=0
 for r in "${REQUIRED_ANY[@]}"; do
-  if printf '%s\n' "${present[@]:-}" | rg -q "^$r$"; then
+  if marker_present "$r"; then
     any_required=1
     break
   fi
@@ -197,7 +223,7 @@ fi
 if [[ "$ORACLE_MODE" == "extended" ]]; then
   echo "[info] ipc-oracle: extended mode — requiring reply-cap + transfer-cap delivery"
   for r in "${EXTENDED_REQUIRED[@]}"; do
-    if printf '%s\n' "${present[@]:-}" | rg -q "^$r$"; then
+    if marker_present "$r"; then
       echo "[ok]   extended-required present: $r"
     else
       echo "[err] ipc-oracle: extended-required marker absent: $r"
@@ -234,18 +260,17 @@ proof_require() {
   # $1 = human label, $2 = userspace SEQUENCE marker, $3 = kernel marker
   local label="$1" seq_marker="$2" kern_marker="$3"
   local have_seq=0 have_kern=0
-  # Stage 163A: analyze the ACTUAL current boot log produced by THIS run
-  # ($CORE_LOG, written by the per-arch core smoke we just invoked), not an
-  # in-memory/file marker snapshot. A marker present in the raw log must never be
-  # reported absent. `tr` normalizes CR-terminated serial lines; `rg -a` treats
-  # the log as text even if it contains stray binary bytes.
-  if [[ -s "$CORE_LOG" ]] && tr '\r' '\n' <"$CORE_LOG" | rg -q -a "$seq_marker"; then
+  # Stage 163B: analyze the SAME single analysis log the initial scan used
+  # ($ANALYSIS_LOG = captured core-smoke run output UNION raw serial), via the one
+  # `marker_present` helper — never a separate file/snapshot/mechanism, so a marker
+  # the initial scan found can never be reported absent here.
+  if marker_present "$seq_marker"; then
     have_seq=1
   fi
-  if [[ -s "$CORE_LOG" ]] && tr '\r' '\n' <"$CORE_LOG" | rg -q -a "$kern_marker"; then
+  if marker_present "$kern_marker"; then
     have_kern=1
   fi
-  echo "[info] ipc-oracle: proof $label: analyzing $CORE_LOG (have_seq=$have_seq have_kern=$have_kern)"
+  echo "[info] ipc-oracle: proof $label: analyzing $ANALYSIS_LOG (have_seq=$have_seq have_kern=$have_kern)"
   # The userspace sequence marker is always required: the workload must have run
   # and observed the expected syscall return.
   if [[ "$have_seq" -ne 1 ]]; then
