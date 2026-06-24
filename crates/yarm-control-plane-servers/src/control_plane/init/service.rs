@@ -984,7 +984,17 @@ pub fn run() {
         // does ONLY under `yarm.ipc_recv_proof_sender_wake=1`. So queued-split +
         // rollback proof boots (base knob only) leave E2 None and skip this.
         if let Some(e2_recv) = ctx.service_extra_cap_0 {
-            run_ipc_recv_proof_sender_wake(proof_send, proof_recv, e2_recv);
+            // Slot 14 (service_extra_cap_1) carries E1's buffered capacity, so init
+            // can fill E1 to EXACTLY full with non-blocking sends and never become a
+            // sender-waiter itself. Default to a safe small capacity if absent.
+            let e1_capacity = ctx.service_extra_cap_1.unwrap_or(8) as usize;
+            run_ipc_recv_proof_sender_wake(
+                proof_send,
+                proof_recv,
+                e2_recv,
+                e1_capacity,
+                ctx.task_id,
+            );
         } else {
             // Sub-knob absent: sender-wake is intentionally not driven (no fake
             // marker). The queued-split + rollback proof above stands alone.
@@ -1142,67 +1152,142 @@ fn run_ipc_recv_proof_workload(proof_send: u32, proof_recv: u32) {
 #[cfg(not(test))]
 const IPC_RECV_PROOF_OPCODE: u16 = 0x0F9D;
 
-/// Stage 163: deterministic sender-wake proof workload.
+/// Stage 163 / 163A: deterministic sender-wake proof workload.
 ///
 /// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and
 /// `yarm.ipc_recv_proof_sender_wake=1` (gated by the presence of the kernel-
 /// provisioned coordination endpoint E2 recv cap). Proves
-/// `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` via a REAL blocked sender-waiter, with the
-/// drain ordered deterministically — race-free even on SMP — by a kernel
-/// coordination signal:
+/// `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` via a REAL blocked sender-waiter that is the
+/// forked CHILD (never init), with the drain ordered deterministically — race-free
+/// even on SMP — by a kernel coordination signal:
 ///
-/// 1. init fills the loopback endpoint E1 to capacity with plain non-blocking
-///    sends (last accepted send leaves E1 full).
+/// 0. init drains any leftover messages from E1 (the base queued-split/rollback
+///    subtests share E1), so the fill below starts from empty.
+/// 1. init fills E1 to EXACTLY its buffered capacity with NON-BLOCKING sends. This
+///    is the Stage 163A fix: a buffered send on a FULL endpoint *blocks* the sender
+///    as a waiter even with a zero timeout (the kernel has no try-send for buffered
+///    full — see `ipc_send_with_optional_deadline`). Filling exactly `e1_capacity`
+///    (never one more) guarantees every fill send succeeds and **init never becomes
+///    a sender-waiter**. The capacity is supplied by the kernel via startup slot 14.
 /// 2. init forks; the child (fork returns 0) is the sender, the parent (init) is
 ///    the receiver. The child inherits init's proof caps via the COW fork.
-/// 3. the child does a TIMED blocking send on the full E1 → it becomes a real
-///    sender-waiter. The kernel's `enqueue_sender_waiter` hook, in the SAME
-///    `ipc_state_lock` critical section, pushes a waiter-present signal into E2.
+/// 3. the child does a TIMED blocking send on the now-full E1 → it becomes the
+///    real sender-waiter. The kernel's `enqueue_sender_waiter` hook, in the SAME
+///    `ipc_state_lock` critical section, pushes a waiter-present signal (carrying
+///    the waiter's TID) into E2.
 /// 4. init non-blocking-polls E2; the signal appears EXACTLY when the sender is
-///    provably a waiter (atomic with the enqueue), so there is no race window.
+///    provably a waiter (atomic with the enqueue), so there is no race window. init
+///    verifies the signalled TID is the forked child (and NOT init) before
+///    proceeding — a waiter-present for init would be a fill-phase bug, reported as
+///    `..._WAITER_UNEXPECTED` and never accepted as proof.
 /// 5. init `recv-v2` drains E1 (NR 2 → trap-entry split path). The real kernel
-///    path emits `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` and refills + wakes the
-///    sender.
-/// 6. init drains until it observes the child's own message (sender_tid == child)
-///    — concrete proof the sender made progress — then emits
+///    path emits `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` and refills + wakes the sender.
+/// 6. init confirms it observed the child's own message (sender_tid == child) —
+///    concrete proof the sender made progress — then emits
 ///    `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`.
 ///
 /// The child parks (never returns into init's flow). All waits are bounded so a
 /// missing child (e.g. fork failure) degrades to a logged give-up, never a hang.
 #[cfg(not(test))]
-fn run_ipc_recv_proof_sender_wake(e1_send: u32, e1_recv: u32, e2_recv: u32) {
+fn run_ipc_recv_proof_sender_wake(
+    e1_send: u32,
+    e1_recv: u32,
+    e2_recv: u32,
+    e1_capacity: usize,
+    init_tid: u64,
+) {
     use yarm_user_rt::ipc::Message;
 
     // Large enough that init always drains well before the sender's send deadline
     // (init drains immediately after the coordination signal).
     const SENDER_SEND_TIMEOUT_TICKS: u64 = 1_000_000_000;
-    const FILL_MAX: usize = 64;
+    // Defensive clamp so a misconfigured capacity can never loop pathologically.
+    const FILL_CAP_MAX: usize = 256;
+    const PREDRAIN_MAX: usize = 512;
     const E2_POLL_MAX: usize = 200_000;
     const DRAIN_MAX: usize = 72;
 
+    let fill_target = if e1_capacity == 0 || e1_capacity > FILL_CAP_MAX {
+        // Fall back to a safe small fill; never 0 (we need E1 full) and never huge.
+        8
+    } else {
+        e1_capacity
+    };
+
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_BEGIN");
     yarm_user_rt::user_log!(
-        "IPC_RECV_PROOF_SENDER_WAKE_SETUP_BEGIN e1_send={} e1_recv={} e2_recv={}",
+        "IPC_RECV_PROOF_SENDER_WAKE_SETUP_BEGIN e1_send={} e1_recv={} e2_recv={} e1_capacity={} init_tid={}",
         e1_send,
         e1_recv,
-        e2_recv
+        e2_recv,
+        fill_target,
+        init_tid
     );
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SETUP_DONE");
 
-    // (1) Fill E1 to capacity with plain non-blocking sends.
-    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_BEGIN");
+    // (0) Drain any leftover messages from the base subtests so the fill starts
+    // empty (non-blocking; empty returns Ok(None)/WouldBlock — never blocks init).
+    let mut predrained = 0usize;
+    for _ in 0..PREDRAIN_MAX {
+        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e1_recv, 0) } {
+            Ok(Some(_)) => predrained += 1,
+            _ => break,
+        }
+    }
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_PREDRAIN_DONE count={}",
+        predrained
+    );
+
+    // (1) Fill E1 to EXACTLY capacity with NON-BLOCKING sends. Sending exactly
+    // `fill_target` messages into an empty buffered endpoint of that capacity makes
+    // every send succeed and leaves E1 full WITHOUT init ever blocking. We stop at
+    // capacity and never attempt the (capacity+1)-th send (which would block init).
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_FILL_BEGIN target={}",
+        fill_target
+    );
     let mut filled = 0usize;
-    while filled < FILL_MAX {
+    let mut fill_blocker = false;
+    while filled < fill_target {
         let Ok(msg) = Message::with_header(0, IPC_RECV_PROOF_OPCODE, 0, None, &[0xF1u8; 8]) else {
             break;
         };
-        // SAFETY: e1_send is a kernel-provisioned SEND cap to init's proof
-        // loopback. Non-blocking: WouldBlock means the queue is now full.
-        match unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) } {
-            Ok(()) => filled += 1,
-            Err(_) => break,
+        // SAFETY: e1_send is a kernel-provisioned SEND cap to init's proof loopback.
+        // Non-blocking send; within capacity it always queues (Ok).
+        let r = unsafe { yarm_user_rt::syscall::ipc_send(e1_send, &msg) };
+        match r {
+            Ok(()) => {
+                yarm_user_rt::user_log!(
+                    "IPC_RECV_PROOF_SENDER_WAKE_FILL_SEND_RET idx={} code=0",
+                    filled
+                );
+                filled += 1;
+            }
+            Err(e) => {
+                // Unexpected within capacity: a non-blocking send that returns an
+                // error here means init was at risk of becoming a sender-waiter.
+                // Stop immediately; do NOT proceed (init must never block in fill).
+                yarm_user_rt::user_log!(
+                    "IPC_RECV_PROOF_SENDER_WAKE_FILL_SEND_RET idx={} code={}",
+                    filled,
+                    e as usize
+                );
+                yarm_user_rt::user_log!(
+                    "IPC_RECV_PROOF_SENDER_WAKE_FILL_UNEXPECTED_BLOCKER idx={} tid={}",
+                    filled,
+                    init_tid
+                );
+                fill_blocker = true;
+                break;
+            }
         }
     }
+    if fill_blocker {
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_ABORT count={}", filled);
+        return;
+    }
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_STOP_FULL idx={}", filled);
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_DONE count={}", filled);
 
     // (2) Fork: child == sender, parent (init) == receiver.
@@ -1232,24 +1317,48 @@ fn run_ipc_recv_proof_sender_wake(e1_send: u32, e1_recv: u32, e2_recv: u32) {
     }
 
     // ── PARENT (init): the receiver ──
-    // (4) Non-blocking-poll E2 until the kernel's waiter-present coordination
-    // signal appears. Bounded so a missing child never hangs the boot.
-    let mut waiter_present = false;
+    // (4) Non-blocking-poll E2 until the kernel's waiter-present coordination signal
+    // appears. The signal carries the waiter's TID (Message::sender_tid). Bounded so
+    // a missing child never hangs the boot.
+    let mut waiter_tid: Option<u64> = None;
     for _ in 0..E2_POLL_MAX {
         let _ = yarm_user_rt::syscall::yield_now();
         // SAFETY: e2_recv is init's RECV cap to the proof coordination endpoint;
         // timeout 0 makes this a non-blocking probe.
         match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e2_recv, 0) } {
-            Ok(Some(_)) => {
-                waiter_present = true;
+            Ok(Some(sig)) => {
+                waiter_tid = Some(sig.sender_tid.0);
                 break;
             }
             _ => continue,
         }
     }
-    if !waiter_present {
+    let Some(waiter_tid) = waiter_tid else {
         yarm_user_rt::user_log!(
             "IPC_RECV_PROOF_SENDER_WAKE_NO_WAITER_SIGNAL child_pid={}",
+            pid
+        );
+        return;
+    };
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED waiter_tid={} child_pid={}",
+        waiter_tid,
+        pid
+    );
+    // (4b) The waiter MUST be the forked child, never init. A waiter-present for
+    // init would mean init blocked during fill (the Stage 163A bug) — reject it.
+    if waiter_tid == init_tid {
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_SENDER_WAKE_WAITER_UNEXPECTED tid={}",
+            waiter_tid
+        );
+        return;
+    }
+    if waiter_tid != pid {
+        // Not init, but also not the child we forked — do not fake progress.
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_SENDER_WAKE_WAITER_MISMATCH waiter_tid={} child_pid={}",
+            waiter_tid,
             pid
         );
         return;

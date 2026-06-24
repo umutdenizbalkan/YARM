@@ -43168,8 +43168,7 @@ mod stage163_sender_wake_proven {
         // sub-knob — so it is gated, not unconditional.
         assert!(
             INIT_SERVICE_SRC.contains("if let Some(e2_recv) = ctx.service_extra_cap_0")
-                && INIT_SERVICE_SRC
-                    .contains("run_ipc_recv_proof_sender_wake(proof_send, proof_recv, e2_recv)"),
+                && INIT_SERVICE_SRC.contains("run_ipc_recv_proof_sender_wake("),
             "the sender-wake workload must be gated on the proof-provisioned E2 cap"
         );
     }
@@ -43217,6 +43216,17 @@ mod stage163_sender_wake_proven {
         assert!(
             ORACLE_SCRIPT.contains("export IPC_RECV_PROOF_SENDER_WAKE=1"),
             "the oracle must enable the boot sub-knob when sender-wake is requested"
+        );
+        // Stage 163A: proof_require must analyze the ACTUAL current boot log
+        // ($CORE_LOG) directly, not an in-memory present[] snapshot.
+        let pr = ORACLE_SCRIPT
+            .split("proof_require() {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("proof_require must exist");
+        assert!(
+            pr.contains("\"$CORE_LOG\"") && !pr.contains("${present[@]"),
+            "proof_require must grep the live $CORE_LOG, not the present[] snapshot"
         );
     }
 
@@ -43301,5 +43311,130 @@ mod stage163_sender_wake_proven {
                 "x86 E2 provisioning must not touch the {forbidden} path"
             );
         }
+    }
+
+    // ── Stage 163A — fix sender-wake sequencing + oracle log analysis ──────────
+
+    // 12. The FILL phase is NON-BLOCKING and never uses a timed/blocking send.
+    //     init fills E1 to exactly its communicated capacity with `ipc_send`; the
+    //     timed blocking send (`ipc_send_timeout_ticks`) appears ONLY in the child
+    //     sender branch, never in the fill loop — so init can never become a
+    //     sender-waiter during fill.
+    #[test]
+    fn stage163a_fill_is_nonblocking_no_timeout_send() {
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .expect("sender-wake workload must exist");
+        // Isolate the fill phase (FILL_BEGIN .. FILL_DONE).
+        let fill = workload
+            .split("IPC_RECV_PROOF_SENDER_WAKE_FILL_BEGIN")
+            .nth(1)
+            .and_then(|s| s.split("IPC_RECV_PROOF_SENDER_WAKE_FILL_DONE").next())
+            .expect("fill phase must exist");
+        assert!(
+            fill.contains("syscall::ipc_send(") && !fill.contains("ipc_send_timeout_ticks"),
+            "the fill phase must use non-blocking ipc_send and never a timed/blocking send"
+        );
+        // The timed blocking send is used only inside the child sender branch.
+        let child = workload
+            .split("if pid == 0 {")
+            .nth(1)
+            .and_then(|s| s.split("// ── PARENT").next())
+            .expect("child branch must exist");
+        assert!(
+            child.contains("ipc_send_timeout_ticks"),
+            "the timed blocking send must live in the child sender branch"
+        );
+        // The fill is bounded by a capacity supplied to the workload (not an
+        // open-ended fill-until-block that could overrun and block init).
+        assert!(
+            workload.contains("e1_capacity") && workload.contains("fill_target"),
+            "the fill must be bounded by the communicated E1 capacity"
+        );
+    }
+
+    // 13. A waiter-present signal is only accepted as proof when it belongs to the
+    //     forked child. A waiter-present for init (tid=1) is rejected as
+    //     WAITER_UNEXPECTED and never completes the sequence.
+    #[test]
+    fn stage163a_waiter_present_must_be_child_not_init() {
+        assert!(
+            INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_WAITER_UNEXPECTED"),
+            "a waiter-present for init must be reported as WAITER_UNEXPECTED"
+        );
+        // The reject is gated on the signalled waiter tid equalling init's own tid.
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .expect("sender-wake workload must exist");
+        assert!(
+            workload.contains("waiter_tid == init_tid") && workload.contains("waiter_tid != pid"),
+            "the proof must verify the waiter is the child (== pid) and not init"
+        );
+        // The workload receives init's own tid to make that check.
+        assert!(
+            INIT_SERVICE_SRC.contains("init_tid: u64") && INIT_SERVICE_SRC.contains("ctx.task_id"),
+            "the workload must know init's own tid for the waiter-identity check"
+        );
+    }
+
+    // 14. SEQUENCE_DONE requires the full ordered trail: fill-done, the child's
+    //     sender-start, the waiter-present observation, the recv return, and the
+    //     observed child message — never emitted unconditionally.
+    #[test]
+    fn stage163a_sequence_requires_full_trail() {
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .expect("sender-wake workload must exist");
+        for marker in &[
+            "IPC_RECV_PROOF_SENDER_WAKE_FILL_DONE",
+            "IPC_RECV_PROOF_SENDER_WAKE_SENDER_START",
+            "IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED",
+            "IPC_RECV_PROOF_SENDER_WAKE_RECV_RET",
+            "IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE observed=1",
+        ] {
+            assert!(
+                workload.contains(marker),
+                "the sequence trail must include `{marker}`"
+            );
+        }
+        // SEQUENCE_DONE only after observing the child's message (got_child gate).
+        let after_gate = workload
+            .split("if got_child {")
+            .nth(1)
+            .map(|s| &s[..s.len().min(220)])
+            .unwrap_or("");
+        assert!(
+            after_gate.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "SEQUENCE_DONE must be gated on observing the real child's message"
+        );
+    }
+
+    // 15. E1's buffered capacity is communicated to init (kernel const + slot 14)
+    //     so the fill can stop exactly at full. The loopback uses that same const.
+    #[test]
+    fn stage163a_capacity_communicated_via_slot_14() {
+        assert!(
+            BOOT_MOD_SRC.contains("pub const IPC_RECV_PROOF_E1_DEPTH: usize")
+                && BOOT_MOD_SRC.contains("create_endpoint(IPC_RECV_PROOF_E1_DEPTH)"),
+            "E1 must be created with the named capacity const"
+        );
+        for (arch, src) in &[
+            ("x86_64", X86_BOOT_SRC),
+            ("aarch64", AARCH64_BOOT_SRC),
+            ("riscv64", RISCV64_BOOT_SRC),
+        ] {
+            assert!(
+                src.contains("init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64"),
+                "{arch} boot must communicate E1 capacity via slot 14"
+            );
+        }
+        // init reads the capacity from service_extra_cap_1 (slot 14).
+        assert!(
+            INIT_SERVICE_SRC.contains("ctx.service_extra_cap_1"),
+            "init must read E1 capacity from service_extra_cap_1 (slot 14)"
+        );
     }
 }

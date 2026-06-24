@@ -1375,6 +1375,9 @@ pub fn bootstrap_first_user_task(
         RING3_INIT_SERVER_TID,
     ) {
         init_args[13] = e2_recv_cap as u64;
+        // Stage 163A: communicate E1's buffered capacity (slot 14, service_extra_cap_1)
+        // so init fills E1 to exactly full with non-blocking sends and never blocks.
+        init_args[14] = crate::kernel::boot::IPC_RECV_PROOF_E1_DEPTH as u64;
     }
     crate::yarm_log!(
         "YARM_FIRST_USER_STARTUP_ARGS tid={} arg0={} arg1={} arg2={} arg3={}",
