@@ -1548,19 +1548,45 @@ impl KernelState {
     }
 
     pub fn fork_user_process_cow(&mut self, parent_tid: u64) -> Result<u64, KernelError> {
-        let parent = self
-            .with_tcbs(|tcbs| {
-                tcbs.iter()
-                    .flatten()
-                    .find(|tcb| tcb.tid.0 == parent_tid)
-                    .cloned()
-            })
-            .ok_or(KernelError::TaskMissing)?;
-        let parent_class = self
-            .task_class(parent_tid)
-            .ok_or(KernelError::TaskMissing)?;
-        let parent_asid = parent.asid.ok_or(KernelError::UserMemoryFault)?;
-        let child_asid = self.clone_user_address_space_cow(parent_asid)?;
+        // Stage 163C: proof-gated step diagnostics (active only under the sender-wake
+        // sub-knob). Behavior is unchanged; only logging is added.
+        let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+        let Some(parent) = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == parent_tid)
+                .cloned()
+        }) else {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_PRECHECK_FAIL reason=parent_tcb_missing");
+            }
+            return Err(KernelError::TaskMissing);
+        };
+        let Some(parent_class) = self.task_class(parent_tid) else {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_PRECHECK_FAIL reason=parent_class_missing");
+            }
+            return Err(KernelError::TaskMissing);
+        };
+        let Some(parent_asid) = parent.asid else {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_PRECHECK_FAIL reason=parent_asid_missing");
+            }
+            return Err(KernelError::UserMemoryFault);
+        };
+        if proof {
+            crate::yarm_log!("FORK_PROOF_PRECHECK_OK parent_tid={}", parent_tid);
+            crate::yarm_log!("FORK_PROOF_COW_BEGIN");
+        }
+        let child_asid = match self.clone_user_address_space_cow(parent_asid) {
+            Ok(asid) => asid,
+            Err(e) => {
+                if proof {
+                    crate::yarm_log!("FORK_PROOF_COW_FAIL reason={:?}", e);
+                }
+                return Err(e);
+            }
+        };
 
         // All steps below must destroy child_asid on failure to prevent leaking
         // the cloned address space when post-clone task setup fails.
@@ -1578,11 +1604,54 @@ impl KernelState {
         child_asid: Asid,
         parent_tid: u64,
     ) -> Result<u64, KernelError> {
-        let child_tid = self.allocate_thread_id()?;
-        self.register_task_with_class(child_tid, parent_class)?;
-        let child_cnode = self.task_cnode(child_tid).ok_or(KernelError::TaskMissing)?;
-        self.set_process_cnode_for_pid(child_tid, child_cnode)?;
-        self.inherit_parent_capabilities_for_fork(parent_tid, child_tid)?;
+        // Stage 163C: proof-gated step diagnostics (active only under the sub-knob).
+        let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+        if proof {
+            crate::yarm_log!("FORK_PROOF_ALLOC_CHILD_BEGIN");
+        }
+        let child_tid = match self.allocate_thread_id() {
+            Ok(t) => t,
+            Err(e) => {
+                if proof {
+                    crate::yarm_log!("FORK_PROOF_ALLOC_CHILD_FAIL reason={:?}", e);
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.register_task_with_class(child_tid, parent_class) {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_ALLOC_CHILD_FAIL reason={:?} step=register", e);
+            }
+            return Err(e);
+        }
+        if proof {
+            crate::yarm_log!("FORK_PROOF_ALLOC_CHILD_OK child_tid={}", child_tid);
+            crate::yarm_log!("FORK_PROOF_CNODE_BEGIN");
+        }
+        let Some(child_cnode) = self.task_cnode(child_tid) else {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_CNODE_FAIL reason=child_cnode_missing");
+            }
+            return Err(KernelError::TaskMissing);
+        };
+        if let Err(e) = self.set_process_cnode_for_pid(child_tid, child_cnode) {
+            if proof {
+                crate::yarm_log!(
+                    "FORK_PROOF_CNODE_FAIL reason={:?} step=set_process_cnode",
+                    e
+                );
+            }
+            return Err(e);
+        }
+        if let Err(e) = self.inherit_parent_capabilities_for_fork(parent_tid, child_tid) {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_CNODE_FAIL reason={:?} step=inherit_caps", e);
+            }
+            return Err(e);
+        }
+        if proof {
+            crate::yarm_log!("FORK_PROOF_CHILD_TF_BEGIN");
+        }
         self.with_tcbs_mut(|tcbs| {
             let child = tcbs
                 .iter_mut()
@@ -1601,6 +1670,12 @@ impl KernelState {
             child.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
+        if proof {
+            crate::yarm_log!(
+                "FORK_PROOF_CHILD_TF_RET0_SET child_tid={} ret0=0",
+                child_tid
+            );
+        }
         if parent.tls_ptr.is_some()
             && let Some(slot) = self.tls_restore_pending.iter_mut().find(|slot| {
                 slot.is_some_and(|pending_tid| pending_tid.0 == child_tid) || slot.is_none()
@@ -1616,7 +1691,18 @@ impl KernelState {
         if let Some((base, end)) = self.task_brk_bounds(parent_tid) {
             self.set_task_brk_bounds(child_tid, base, end)?;
         }
-        let _ = self.enqueue_task(child_tid)?;
+        if proof {
+            crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_BEGIN child_tid={}", child_tid);
+        }
+        if let Err(e) = self.enqueue_task(child_tid) {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_FAIL reason={:?}", e);
+            }
+            return Err(e);
+        }
+        if proof {
+            crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_OK child_tid={}", child_tid);
+        }
         Ok(child_tid)
     }
 }

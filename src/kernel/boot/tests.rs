@@ -42954,10 +42954,11 @@ mod stage162_sender_wake_infra_deferred {
                 "Stage 163 sender-wake infra (`{present}`) must be present in user-rt"
             );
         }
-        // The timed-send wrapper is actually used by the child sender path.
+        // The timed-send wrapper is actually used by the child sender path; the
+        // workload drives fork via the non-lossy fork_raw wrapper (Stage 163C).
         assert!(
             INIT_SERVICE_SRC.contains("ipc_send_timeout_ticks")
-                && INIT_SERVICE_SRC.contains("fork()"),
+                && INIT_SERVICE_SRC.contains("fork_raw()"),
             "the workload must use the timed blocking-send + fork wrappers"
         );
     }
@@ -43067,6 +43068,8 @@ mod stage163_sender_wake_proven {
     const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
     const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
     const RISCV64_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const PROCESS_SYSCALL_SRC: &str = include_str!("../syscall/process.rs");
 
     // 1. The sub-knob is a real, independent boot knob that defaults OFF, and is
     //    parsed without aliasing the base `yarm.ipc_recv_proof` knob.
@@ -43547,7 +43550,7 @@ mod stage163_sender_wake_proven {
         let fail_arm = workload
             .split("IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED")
             .nth(1)
-            .map(|s| &s[..s.len().min(60)])
+            .map(|s| &s[..s.len().min(240)])
             .unwrap_or("");
         assert!(
             fail_arm.contains("return"),
@@ -43597,6 +43600,144 @@ mod stage163_sender_wake_proven {
         assert!(
             after_gate.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
             "SEQUENCE_DONE must be gated on got_child"
+        );
+    }
+
+    // ── Stage 163C — fork failure audit/diagnostics ───────────────────────────
+
+    // 20. The fork diagnostics are non-lossy: the workload logs every raw return
+    //     lane (ret0/ret1/ret2/err/arch) and decodes the actual error code+meaning,
+    //     not a bare "raw=err". fork_raw() exposes all lanes without conversion.
+    #[test]
+    fn stage163c_fork_diagnostics_non_lossy() {
+        assert!(
+            USER_RT_SRC.contains("pub unsafe fn fork_raw()")
+                && USER_RT_SRC.contains("pub struct ForkSyscallRet")
+                && USER_RT_SRC.contains("pub err: u64"),
+            "fork_raw must expose all raw return lanes including the error lane"
+        );
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .expect("workload");
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_BEGIN")
+                && workload.contains("FORK_SYSCALL_RET ret0=")
+                && workload.contains("err=")
+                && workload.contains("IPC_RECV_PROOF_SENDER_WAKE_FORK_DECODE code="),
+            "the workload must log all fork return lanes + a decoded code/meaning"
+        );
+    }
+
+    // 21. A fork failure is NOT silently collapsed to a bare raw=err: FORK_FAILED
+    //     carries the actual code + meaning, and the sequence cannot continue
+    //     (the failure arm returns).
+    #[test]
+    fn stage163c_fork_failure_carries_code_and_aborts() {
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .expect("workload");
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED code="),
+            "FORK_FAILED must carry the actual error code (not a bare raw=err)"
+        );
+        // The fork-failure arm returns before any E2 poll.
+        let fail = workload
+            .split("IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED code=")
+            .nth(1)
+            .map(|s| &s[..s.len().min(260)])
+            .unwrap_or("");
+        assert!(
+            fail.contains("return"),
+            "the sender-wake sequence must not continue after a fork failure"
+        );
+    }
+
+    // 22. The kernel emits proof-gated, step-level fork diagnostics so the failing
+    //     step + reason is visible, and they are gated on the sub-knob (never in a
+    //     normal boot).
+    #[test]
+    fn stage163c_kernel_fork_diagnostics_gated() {
+        // Entry/return diagnostics in the syscall handler.
+        assert!(
+            PROCESS_SYSCALL_SRC.contains("FORK_PROOF_ENTER")
+                && PROCESS_SYSCALL_SRC.contains("FORK_PROOF_RETURN_ERR code=")
+                && PROCESS_SYSCALL_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "handle_fork must log proof-gated enter + return-error diagnostics"
+        );
+        // Step-level diagnostics in the clone path.
+        for marker in &[
+            "FORK_PROOF_PRECHECK_OK",
+            "FORK_PROOF_COW_BEGIN",
+            "FORK_PROOF_COW_FAIL",
+            "FORK_PROOF_ALLOC_CHILD_BEGIN",
+            "FORK_PROOF_ALLOC_CHILD_FAIL",
+            "FORK_PROOF_CNODE_BEGIN",
+            "FORK_PROOF_CHILD_TF_RET0_SET",
+            "FORK_PROOF_CHILD_ENQUEUE_OK",
+        ] {
+            assert!(
+                THREAD_STATE_SRC.contains(marker),
+                "fork clone path must emit `{marker}`"
+            );
+        }
+        // Gated on the sub-knob: every FORK_PROOF_ marker is behind a proof check.
+        assert!(
+            THREAD_STATE_SRC.contains("ipc_recv_proof_sender_wake_active()")
+                && THREAD_STATE_SRC.contains("if proof {"),
+            "kernel fork diagnostics must be proof-gated"
+        );
+    }
+
+    // 23. A clean-state fork smoke runs BEFORE E1 is filled, so a fork failure with
+    //     an empty E1 rules the full-buffer state in or out.
+    #[test]
+    fn stage163c_clean_state_fork_smoke_before_fill() {
+        assert!(
+            INIT_SERVICE_SRC.contains("fn run_ipc_recv_proof_fork_smoke")
+                && INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_FORK_SMOKE_BEGIN")
+                && INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_FORK_SMOKE_CHILD_ENTRY")
+                && INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_FORK_SMOKE_FAILED code="),
+            "a clean-state fork smoke with child/parent/failed markers must exist"
+        );
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .expect("workload");
+        let i_smoke = workload
+            .find("run_ipc_recv_proof_fork_smoke()")
+            .expect("smoke call");
+        let i_fill = workload
+            .find("IPC_RECV_PROOF_SENDER_WAKE_FILL_BEGIN")
+            .expect("FILL_BEGIN");
+        assert!(
+            i_smoke < i_fill,
+            "the clean-state fork smoke must run before the E1 fill"
+        );
+    }
+
+    // 24. The fork diagnostics did not move any IPC/cap seam and did not change the
+    //     syscall/IPC counts; fork still uses NR 12.
+    #[test]
+    fn stage163c_no_seam_moved_counts_unchanged() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;")
+                && USER_RT_SRC.contains("const SYSCALL_FORK_NR: usize = 12;"),
+            "counts unchanged and fork still NR 12"
         );
     }
 }

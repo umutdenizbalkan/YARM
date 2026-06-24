@@ -1152,6 +1152,69 @@ fn run_ipc_recv_proof_workload(proof_send: u32, proof_recv: u32) {
 #[cfg(not(test))]
 const IPC_RECV_PROOF_OPCODE: u16 = 0x0F9D;
 
+/// Stage 163C: map a syscall error code (the kernel's `SyscallError as usize`,
+/// matching `decode_syscall_error`) to a human label for the fork diagnostics. A
+/// value `>= 0x100` is treated as "stale_or_internal" — on x86_64 a successful
+/// forked child can carry a stale nonzero error lane (RCX = the SYSCALL-clobbered
+/// return RIP), which is a large address, not a small error code.
+#[cfg(not(test))]
+const fn fork_err_meaning(code: u64) -> &'static str {
+    match code {
+        0 => "ok",
+        1 => "InvalidNumber",
+        2 => "InvalidArgs",
+        3 => "InvalidCapability",
+        4 => "MissingRight",
+        5 => "WrongObject",
+        6 => "QueueFull",
+        7 => "WouldBlock",
+        8 => "PageFault",
+        9 => "TimedOut",
+        10..=255 => "Internal",
+        _ => "stale_or_internal",
+    }
+}
+
+/// Stage 163C: clean-state fork smoke, run BEFORE E1 is filled. Determines whether
+/// a full E1 / queued IPC state is implicated in a fork failure — if this fails too,
+/// the full buffer is ruled out. Runs only inside the sub-knob-gated sender-wake
+/// workload, so base queued-split/rollback proofs are unaffected. The smoke child
+/// parks; the parent logs the outcome and returns.
+#[cfg(not(test))]
+fn run_ipc_recv_proof_fork_smoke() {
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_FORK_SMOKE_BEGIN");
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_BEGIN smoke=1");
+    // SAFETY: proof-only raw fork; exposes every return lane for diagnosis.
+    let r = unsafe { yarm_user_rt::syscall::fork_raw() };
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_FORK_SMOKE_SYSCALL_RET ret0={} ret1={} ret2={} err={} arch={}",
+        r.ret0,
+        r.ret1,
+        r.ret2,
+        r.err,
+        r.arch
+    );
+    if r.ret0 != 0 {
+        // Parent with a concrete child pid → fork works in a clean state.
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_FORK_SMOKE_PARENT child_pid={}", r.ret0);
+        return;
+    }
+    if r.err != 0 && r.err < 0x100 {
+        // ret0 == 0 with a small known error code → a genuine fork failure.
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_FORK_SMOKE_FAILED code={} meaning={}",
+            r.err,
+            fork_err_meaning(r.err)
+        );
+        return;
+    }
+    // ret0 == 0 with err == 0 (or a large stale lane) → the child.
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_FORK_SMOKE_CHILD_ENTRY");
+    loop {
+        let _ = yarm_user_rt::syscall::yield_now();
+    }
+}
+
 /// Stage 163 / 163A: deterministic sender-wake proof workload.
 ///
 /// Runs ONLY under BOTH `yarm.ipc_recv_proof=1` and
@@ -1225,6 +1288,10 @@ fn run_ipc_recv_proof_sender_wake(
     );
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SETUP_DONE");
 
+    // (pre) Clean-state fork smoke BEFORE E1 is filled (Stage 163C). If fork fails
+    // here too, a full E1 / queued IPC state is ruled out as the cause.
+    run_ipc_recv_proof_fork_smoke();
+
     // (0) Drain any leftover messages from the base subtests so the fill starts
     // empty (non-blocking; empty returns Ok(None)/WouldBlock — never blocks init).
     let mut predrained = 0usize;
@@ -1290,56 +1357,74 @@ fn run_ipc_recv_proof_sender_wake(
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_STOP_FULL idx={}", filled);
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FILL_DONE count={}", filled);
 
-    // (5) Fork — child == sender, parent (init) == receiver. Explicit FORK_BEGIN /
-    // FORK_RET (raw + role) markers expose the fork return and the role decision so
-    // an AArch64 fork that never starts a runnable child is directly visible: the
-    // child-side markers (FORK_RET role=child, CHILD_ENTRY, SENDER_START) are then
-    // absent while the parent proceeds. The parent NEVER polls E2 until fork has
-    // returned its parent-side child pid (step 6 below).
+    // (5) Fork — child == sender, parent (init) == receiver. Stage 163C: the fork
+    // syscall's full return lanes (ret0/ret1/ret2/err) are logged BEFORE any lossy
+    // conversion, then decoded, so a fork failure exposes its exact error code (not
+    // a bare "raw=err"). The parent NEVER polls E2 until fork has returned its
+    // parent-side child pid (step 6 below).
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_BEGIN");
-    // SAFETY: proof-only fork; the child inherits init's COW address space + proof
-    // caps and parks after its blocking send (never returns into init's flow).
-    let fork_ret = unsafe { yarm_user_rt::syscall::fork() };
-    let pid = match fork_ret {
-        None => {
-            // x86_64 flagged a fork failure on the separate error lane. Abort
-            // boundedly — never spin on E2 for a child that does not exist.
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=err role=err");
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED");
-            return;
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_BEGIN smoke=0");
+    // SAFETY: proof-only raw fork; the child inherits init's COW address space +
+    // proof caps and parks after its blocking send (never returns into init's flow).
+    let fr = unsafe { yarm_user_rt::syscall::fork_raw() };
+    yarm_user_rt::user_log!(
+        "IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_RET ret0={} ret1={} ret2={} err={} arch={}",
+        fr.ret0,
+        fr.ret1,
+        fr.ret2,
+        fr.err,
+        fr.arch
+    );
+    // Decode role from the raw lanes: ret0 != 0 → parent (child pid = ret0); ret0 == 0
+    // with a small known error code → a genuine failure; ret0 == 0 with err == 0 (or a
+    // large/stale lane) → the child.
+    let pid = if fr.ret0 != 0 {
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_DECODE code={} meaning={}",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw={} role=parent",
+            fr.ret0
+        );
+        fr.ret0
+    } else if fr.err != 0 && fr.err < 0x100 {
+        // Genuine fork failure: abort boundedly — never spin on E2 for a missing child.
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_DECODE code={} meaning={}",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=err role=err");
+        yarm_user_rt::user_log!(
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED code={} meaning={}",
+            fr.err,
+            fork_err_meaning(fr.err)
+        );
+        return;
+    } else {
+        // ── CHILD: the real blocked sender. CHILD_ENTRY/SENDER_START are emitted
+        // BEFORE the timed blocking send so the ordering is observable. ──
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=0 role=child");
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_CHILD_ENTRY");
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_START");
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_BLOCKING_SEND_BEGIN");
+        if let Ok(msg) = Message::with_header(0, IPC_RECV_PROOF_OPCODE, 0, None, &[0x5Eu8; 8]) {
+            // SAFETY: timed blocking send on the FULL E1 → the child becomes a real
+            // sender-waiter; completes once init's drain frees a slot and refills it.
+            let _ = unsafe {
+                yarm_user_rt::syscall::ipc_send_timeout_ticks(
+                    e1_send,
+                    &msg,
+                    SENDER_SEND_TIMEOUT_TICKS,
+                )
+            };
         }
-        Some(0) => {
-            // ── CHILD: the real blocked sender. CHILD_ENTRY/SENDER_START are emitted
-            // BEFORE the timed blocking send so the ordering is observable. ──
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=0 role=child");
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_CHILD_ENTRY");
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_START");
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_BLOCKING_SEND_BEGIN");
-            if let Ok(msg) = Message::with_header(0, IPC_RECV_PROOF_OPCODE, 0, None, &[0x5Eu8; 8]) {
-                // SAFETY: timed blocking send on the FULL E1 → the child becomes a
-                // real sender-waiter; completes once init's drain frees a slot and
-                // refills it.
-                let _ = unsafe {
-                    yarm_user_rt::syscall::ipc_send_timeout_ticks(
-                        e1_send,
-                        &msg,
-                        SENDER_SEND_TIMEOUT_TICKS,
-                    )
-                };
-            }
-            yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE");
-            // Park the child: do NOT return into init's post-proof flow.
-            loop {
-                let _ = yarm_user_rt::syscall::yield_now();
-            }
-        }
-        Some(child_pid) => {
-            // ── PARENT (init): the receiver. Has a concrete child pid. ──
-            yarm_user_rt::user_log!(
-                "IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw={} role=parent",
-                child_pid
-            );
-            child_pid
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE");
+        // Park the child: do NOT return into init's post-proof flow.
+        loop {
+            let _ = yarm_user_rt::syscall::yield_now();
         }
     };
 

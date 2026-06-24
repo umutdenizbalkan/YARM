@@ -316,6 +316,47 @@ pub mod syscall {
         Some(ret.ret0 as u64)
     }
 
+    /// All raw return lanes from a `Fork` (NR 12) syscall, exposed without lossy
+    /// conversion. Stage 163C: the previous wrappers collapsed every fork outcome to
+    /// `None`/`Some` and hid the actual error code; this lets the proof workload log
+    /// `ret0/ret1/ret2/err` and decode role + error meaning faithfully. `arch` is the
+    /// target name so the log records which ABI produced these lanes.
+    #[derive(Debug, Clone, Copy)]
+    pub struct ForkSyscallRet {
+        pub ret0: u64,
+        pub ret1: u64,
+        pub ret2: u64,
+        pub err: u64,
+        pub arch: &'static str,
+    }
+
+    /// Stage 163C proof-only: raw `Fork` (NR 12) that returns every return lane
+    /// (`ret0/ret1/ret2/err`) without conversion, so the caller can log the exact
+    /// kernel return and decode role/error itself. Reuses the existing `Fork`
+    /// syscall — no ABI change.
+    #[inline]
+    pub unsafe fn fork_raw() -> ForkSyscallRet {
+        let args = [0usize; 6];
+        // SAFETY: Uses architecture syscall ABI to enter kernel.
+        let ret = unsafe { crate::arch::raw_syscall(SYSCALL_FORK_NR, args) };
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else if cfg!(target_arch = "riscv64") {
+            "riscv64"
+        } else {
+            "unknown"
+        };
+        ForkSyscallRet {
+            ret0: ret.ret0 as u64,
+            ret1: ret.ret1 as u64,
+            ret2: ret.ret2 as u64,
+            err: ret.error as u64,
+            arch,
+        }
+    }
+
     #[inline]
     pub unsafe fn ipc_recv(ep_cap: u32) -> core::result::Result<Option<Message>, SyscallError> {
         match unsafe { ipc_recv_v2(ep_cap) }? {

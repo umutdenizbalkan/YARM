@@ -3526,6 +3526,69 @@ and before the E2 wait with full diagnostics; and `SEQUENCE_DONE` requires the f
 ordered trail (fork → child-entry/sender-start → waiter-observed → recv-ret →
 sender-done).
 
+#### 5.1.9.9 Stage 163C — fork failure audit + diagnostics
+
+Stage 163B's single-log oracle fix was validated, but the sender-wake run then
+showed the fork wrapper logging `FORK_RET raw=err role=err` + `FORK_FAILED` with
+**no** `role=parent` ever appearing. Only `role=err` with no parent means fork
+returned an error to the single init process — a **genuine fork failure before any
+child exists**, not a child with a stale return lane. (The earlier "AArch64 child
+first-resume" hypothesis was therefore premature: there is no child to resume.)
+Notably, Stage 163B's wrapper change — `if ret.error != 0 { return None }` on
+x86_64 — is what surfaced this; the Stage 163A wrapper ignored the error lane.
+
+Stage 163C is an audit: it makes the failure self-describing without faking
+anything. Base queued-split + rollback stay green; nothing is gated except behind
+the sender-wake sub-knob.
+
+**Non-lossy userspace fork diagnostics.** A new `fork_raw()` returns every return
+lane (`ret0/ret1/ret2/err/arch`) with no conversion. The workload logs
+`FORK_SYSCALL_BEGIN`, `FORK_SYSCALL_RET ret0=.. ret1=.. ret2=.. err=.. arch=..`,
+then a decoded `FORK_DECODE code=.. meaning=..` and, on failure,
+`FORK_FAILED code=.. meaning=..` (mapping the `SyscallError` discriminant, e.g.
+`8 → PageFault`, `6 → QueueFull`, `2 → InvalidArgs`). Role decode is by `ret0`
+(`!= 0` → parent; `== 0` with a small known error code → failure; `== 0` with
+`err == 0` or a large/stale lane → child), so a future successful child whose
+x86_64 error lane is a stale RCX is not misread as a failure.
+
+**Proof-gated kernel fork diagnostics.** Under the sub-knob only, `handle_fork`
+emits `FORK_PROOF_ENTER` / `FORK_PROOF_PARENT_RET` / `FORK_PROOF_RETURN_ERR code=..
+reason=..`, and the clone path emits step markers — `FORK_PROOF_PRECHECK_OK`,
+`FORK_PROOF_COW_BEGIN`/`_FAIL`, `FORK_PROOF_ALLOC_CHILD_BEGIN`/`_OK`/`_FAIL`,
+`FORK_PROOF_CNODE_BEGIN`/`_FAIL`, `FORK_PROOF_CHILD_TF_RET0_SET`,
+`FORK_PROOF_CHILD_ENQUEUE_BEGIN`/`_OK`/`_FAIL` — so the exact failing step and
+`KernelError` reason are visible. Behavior is unchanged; only logging is added, and
+nothing fires on a normal boot.
+
+**Clean-state fork smoke.** Before E1 is filled, the workload runs
+`run_ipc_recv_proof_fork_smoke` (`FORK_SMOKE_BEGIN` → `FORK_SMOKE_SYSCALL_RET ...` →
+`FORK_SMOKE_PARENT` / `FORK_SMOKE_CHILD_ENTRY` / `FORK_SMOKE_FAILED code=..`). If
+fork fails here too — with an empty E1 — the full buffer / queued IPC state is ruled
+out, isolating the cause from the proof's own setup.
+
+**Audit answers (to be confirmed by the next run's `FORK_PROOF_*` trail).** Fork
+(NR 12) is reached (`FORK_PROOF_ENTER` will print). The kernel path is
+`handle_fork → fork_user_process_cow` (precheck → `clone_user_address_space_cow`
+COW → `fork_complete_post_clone`: `allocate_thread_id` → `register_task_with_class`
+→ cnode + `inherit_parent_capabilities_for_fork` → child TCB (`arg0=0`, `Runnable`)
+→ `enqueue_task`). Each step now has a marker, so the next run names the failing
+step. The decoded `err`/`reason` distinguishes missing-right / invalid-args /
+capacity-full / VM-COW / cnode / enqueue. The clean-state smoke answers whether the
+full E1 is implicated. The existing hosted fork/COW unit tests exercise a synthetic
+path, not this live init-after-bootstrap fork under the post-merge resource state —
+which is why the diagnostics run on real hardware/QEMU. The Stage 163B wrapper
+decode was the immediate change that exposed the error; Stage 163C makes it fully
+faithful. **The fix (Task E) is deferred until the next run names the exact failing
+step and code** — no blind broadening of fork semantics, and
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` is never faked.
+
+No syscall/IPC ABI change, no IPC/cap seam moved, counts unchanged
+(`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`, fork still NR 12), RPi5 untouched.
+New `stage163c_*` guards pin: fork diagnostics are non-lossy and expose the actual
+error code; a failure is not collapsed to a bare `raw=err` and the sequence aborts;
+the kernel step-level diagnostics exist and are proof-gated; and the clean-state
+smoke runs before the fill.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
