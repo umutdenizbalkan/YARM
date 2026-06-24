@@ -42,15 +42,33 @@ pub(super) fn handle_fork(
     frame: &mut TrapFrame,
 ) -> Result<(), SyscallError> {
     let parent_tid = current_tid(kernel)?;
-    let child_tid = kernel
-        .fork_user_process_cow(parent_tid)
-        .map_err(SyscallError::from)?;
-    frame.set_ok(
-        usize::try_from(child_tid).map_err(|_| SyscallError::Internal)?,
-        0,
-        0,
-    );
-    Ok(())
+    // Stage 163C: proof-gated fork diagnostics (only when the sender-wake sub-knob
+    // is active, so normal boot logs are never polluted). Pinpoints whether the
+    // failure is before/after child allocation and its exact reason.
+    let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+    if proof {
+        crate::yarm_log!("FORK_PROOF_ENTER parent_tid={}", parent_tid);
+    }
+    match kernel.fork_user_process_cow(parent_tid) {
+        Ok(child_tid) => {
+            if proof {
+                crate::yarm_log!("FORK_PROOF_PARENT_RET child_tid={}", child_tid);
+            }
+            frame.set_ok(
+                usize::try_from(child_tid).map_err(|_| SyscallError::Internal)?,
+                0,
+                0,
+            );
+            Ok(())
+        }
+        Err(e) => {
+            let se = SyscallError::from(e);
+            if proof {
+                crate::yarm_log!("FORK_PROOF_RETURN_ERR code={} reason={:?}", se as usize, e);
+            }
+            Err(se)
+        }
+    }
 }
 
 pub(super) fn handle_spawn_process(
