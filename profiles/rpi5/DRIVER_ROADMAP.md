@@ -203,9 +203,12 @@ state 9 today.
   fail closed. DRS-14 adds an inert readout surface for those dependency and
   cascade records: verified senders may query only their own assigned mock
   instance, replies are bounded and cap-free, payload TIDs are diagnostic only,
-  and queries do not mutate health/dependency/restart/cascade state. PM remains
-  the only future mechanism owner; no PM/supervisor call, spawn, restart, cap
-  mint/revoke, grant, teardown, or MMIO occurs.
+  and queries do not mutate health/dependency/restart/cascade state. DRS-15 adds
+  a diagnostics snapshot readout that combines existing advisory sections for the
+  sender's own mock instance; missing optional reports are not-evaluated by
+  default, and no global/admin diagnostics query exists. PM remains the only
+  future mechanism owner; no PM/supervisor call, spawn, restart, cap mint/revoke,
+  grant, teardown, or MMIO occurs.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.

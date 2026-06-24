@@ -81,6 +81,10 @@ The current hosted and mock-safe DRS path is:
     sender-scoped diagnostic replies for a driver's own dependency and cascade
     state. Payload TIDs are diagnostic only and spoofed claims fail closed; these
     driver-manager-local opcodes are not syscall ABI or global IPC ABI additions.
+15. DRS-15 inert diagnostics snapshots aggregate the sender's existing advisory
+    inventory, spawn, resource, PM-validation/accounting, instance, health,
+    restart, dependency, and cascade state into one bounded cap-free reply. The
+    local query is sender-scoped only; no global/admin diagnostics query exists.
 
 This pipeline is descriptive. It never calls PM or supervisor services, never
 spawns a task, never grants resources, never transfers caps, and never touches
@@ -318,6 +322,11 @@ The existing DRS models map to the future contract as follows:
   treat payload TIDs as diagnostic only, return fixed-size cap-free payloads,
   and do not create duplicate restart requests or mutate inventory, registry,
   health, dependency, restart, or cascade state.
+- DRS-15 diagnostics snapshots are read-only aggregations of existing inert
+  reports. Missing optional inputs are reported as not evaluated unless a test
+  policy asks to fail closed. Snapshots create no new authority, do not recompute
+  restart/cascade reports, and do not call PM, supervisor, runtime control ops,
+  or any spawn/restart/teardown/grant/cap/MMIO path.
 - No mock model itself grants authority, mints caps, revokes caps, calls PM, creates or restarts
   a task, or touches MMIO. A possible next step is a live-spawn/restart API
   design review or a handoff ABI review, still without live implementation.
