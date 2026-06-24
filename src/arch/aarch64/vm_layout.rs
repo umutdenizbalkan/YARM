@@ -20,7 +20,11 @@ pub const MAX_MAPPINGS: usize = 128;
 
 #[cfg(feature = "hosted-dev")]
 pub const MAX_ADDRESS_SPACES: usize = 16;
+// Stage 163D: raised 32 -> 48 (mirrors x86_64). The COW fork clone allocates a new
+// user address space; the expanded service set left no free ASID slot (or derived
+// page-table-page / ASID-root budget) under the old 32-slot bound, so fork failed
+// with `Vm(Full)`. 48 gives headroom for the current services plus a forked child.
 #[cfg(not(feature = "hosted-dev"))]
-pub const MAX_ADDRESS_SPACES: usize = 32;
+pub const MAX_ADDRESS_SPACES: usize = 48;
 
 pub const PROFILE_IS_PLACEHOLDER: bool = true;

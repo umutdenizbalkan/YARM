@@ -338,12 +338,51 @@ impl KernelState {
         &mut self,
         parent_asid: Asid,
     ) -> Result<Asid, KernelError> {
+        // Stage 163D: proof-gated COW exhaustion diagnostics (active only under the
+        // sender-wake sub-knob). Reports the exact full structure + used/cap so a
+        // `Vm(Full)` names its site. Behavior is unchanged; only logging is added.
+        let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
         if self.with_user_spaces(|spaces| spaces.get(parent_asid).is_none()) {
             return Err(KernelError::Vm(VmError::InvalidAsid));
         }
-        let child_asid = self
-            .with_user_spaces_mut(|spaces| spaces.create_user_space())
-            .map_err(KernelError::Vm)?;
+        if proof {
+            let (live, cap, retired, parent_vmas) = self.with_user_spaces(|spaces| {
+                (
+                    spaces.live_count(),
+                    spaces.slot_capacity(),
+                    spaces.retired_count(),
+                    spaces.get(parent_asid).map(|a| a.mappings()).unwrap_or(0),
+                )
+            });
+            crate::yarm_log!(
+                "FORK_PROOF_COW_STATS parent_asid={} vmas_used={} vmas_cap={}",
+                parent_asid.0,
+                parent_vmas,
+                crate::kernel::vm::MAX_MAPPINGS
+            );
+            crate::yarm_log!(
+                "FORK_PROOF_COW_STATS_ASID asid_used={} asid_cap={} asid_retired={}",
+                live,
+                cap,
+                retired
+            );
+        }
+        let child_asid = match self.with_user_spaces_mut(|spaces| spaces.create_user_space()) {
+            Ok(asid) => asid,
+            Err(e) => {
+                if proof {
+                    let (live, cap) = self
+                        .with_user_spaces(|spaces| (spaces.live_count(), spaces.slot_capacity()));
+                    crate::yarm_log!(
+                        "FORK_PROOF_COW_FAIL_DETAIL site=create_user_space used={} cap={} reason=Vm({:?})",
+                        live,
+                        cap,
+                        e
+                    );
+                }
+                return Err(KernelError::Vm(e));
+            }
+        };
 
         // Track parent pages we write-protected during the clone.  On any
         // failure we must restore their write permission so the parent process
@@ -373,6 +412,15 @@ impl KernelState {
                     flags: shared_flags,
                 },
             ) {
+                if proof {
+                    crate::yarm_log!(
+                        "FORK_PROOF_COW_FAIL_DETAIL site=map_child index={} used={} cap={} reason={:?}",
+                        index,
+                        index,
+                        crate::kernel::vm::MAX_MAPPINGS,
+                        err
+                    );
+                }
                 let _ = self.destroy_user_address_space_by_asid(child_asid);
                 self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                 return Err(err);
@@ -386,6 +434,13 @@ impl KernelState {
                         flags: shared_flags,
                     },
                 ) {
+                    if proof {
+                        crate::yarm_log!(
+                            "FORK_PROOF_COW_FAIL_DETAIL site=map_parent index={} reason={:?}",
+                            index,
+                            err
+                        );
+                    }
                     let _ = self.destroy_user_address_space_by_asid(child_asid);
                     self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                     return Err(err);
@@ -394,11 +449,25 @@ impl KernelState {
                 // rollback covers it even if mark_cow_page(parent) fails.
                 wp_parent_virts.push(virt);
                 if let Err(err) = self.mark_cow_page(parent_asid, virt) {
+                    if proof {
+                        crate::yarm_log!(
+                            "FORK_PROOF_COW_FAIL_DETAIL site=mark_cow_parent index={} reason={:?}",
+                            index,
+                            err
+                        );
+                    }
                     let _ = self.destroy_user_address_space_by_asid(child_asid);
                     self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                     return Err(err);
                 }
                 if let Err(err) = self.mark_cow_page(child_asid, virt) {
+                    if proof {
+                        crate::yarm_log!(
+                            "FORK_PROOF_COW_FAIL_DETAIL site=mark_cow_child index={} reason={:?}",
+                            index,
+                            err
+                        );
+                    }
                     let _ = self.destroy_user_address_space_by_asid(child_asid);
                     self.restore_parent_write_permissions(parent_asid, &wp_parent_virts);
                     return Err(err);

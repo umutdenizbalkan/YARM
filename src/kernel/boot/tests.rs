@@ -43070,6 +43070,12 @@ mod stage163_sender_wake_proven {
     const RISCV64_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
     const PROCESS_SYSCALL_SRC: &str = include_str!("../syscall/process.rs");
+    const MEMORY_STATE_SRC: &str = include_str!("memory_state.rs");
+    const VM_SRC: &str = include_str!("../vm.rs");
+    const X86_VM_LAYOUT_SRC: &str = include_str!("../../arch/x86_64/vm_layout.rs");
+    const AARCH64_VM_LAYOUT_SRC: &str = include_str!("../../arch/aarch64/vm_layout.rs");
+    const RISCV64_VM_LAYOUT_SRC: &str = include_str!("../../arch/riscv64/vm_layout.rs");
+    const X86_PAGE_TABLE_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
 
     // 1. The sub-knob is a real, independent boot knob that defaults OFF, and is
     //    parsed without aliasing the base `yarm.ipc_recv_proof` knob.
@@ -43739,5 +43745,103 @@ mod stage163_sender_wake_proven {
                 && USER_RT_SRC.contains("const SYSCALL_FORK_NR: usize = 12;"),
             "counts unchanged and fork still NR 12"
         );
+    }
+
+    // ── Stage 163D — fork COW Vm(Full) fix + exhaustion diagnostics ────────────
+
+    // 25. The COW clone names the exact full structure + site/used/cap, gated on the
+    //     sub-knob (never in a normal boot).
+    #[test]
+    fn stage163d_cow_failure_diagnostics_have_site_and_counts() {
+        assert!(
+            MEMORY_STATE_SRC.contains("FORK_PROOF_COW_STATS")
+                && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_STATS_ASID")
+                && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_FAIL_DETAIL site=create_user_space")
+                && MEMORY_STATE_SRC.contains("FORK_PROOF_COW_FAIL_DETAIL site=map_child"),
+            "the COW clone must log COW_STATS + per-site COW_FAIL_DETAIL with used/cap"
+        );
+        assert!(
+            MEMORY_STATE_SRC.contains("ipc_recv_proof_sender_wake_active()")
+                && MEMORY_STATE_SRC.contains("if proof {"),
+            "the COW exhaustion diagnostics must be proof-gated"
+        );
+        // The address-space table exposes live/cap counts for the diagnostics.
+        assert!(
+            VM_SRC.contains("pub fn live_count(&self)")
+                && VM_SRC.contains("pub const fn slot_capacity(&self)")
+                && VM_SRC.contains("pub fn retired_count(&self)"),
+            "AddressSpaceManager must expose live/slot-capacity/retired counts"
+        );
+    }
+
+    // 26. The Vm(Full) fix: the bare-metal user-address-space bound was raised to 48
+    //     on all three arches (hosted-dev stays 16, so unit-test capacity behavior is
+    //     unchanged). All three arches share the bump (the COW path is arch-shared).
+    #[test]
+    fn stage163d_address_space_bound_raised_for_fork_headroom() {
+        for (arch, src) in &[
+            ("x86_64", X86_VM_LAYOUT_SRC),
+            ("aarch64", AARCH64_VM_LAYOUT_SRC),
+            ("riscv64", RISCV64_VM_LAYOUT_SRC),
+        ] {
+            assert!(
+                src.contains("#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 48;"),
+                "{arch} bare-metal MAX_ADDRESS_SPACES must be raised to 48 for fork headroom"
+            );
+            assert!(
+                src.contains(
+                    "#[cfg(feature = \"hosted-dev\")]\npub const MAX_ADDRESS_SPACES: usize = 16;"
+                ),
+                "{arch} hosted-dev MAX_ADDRESS_SPACES must remain 16 (unit-test capacity unchanged)"
+            );
+        }
+    }
+
+    // 27. The derived page-table pools still scale FROM MAX_ADDRESS_SPACES (the bump
+    //     relieves ASID-slot, PT-page, and ASID-root exhaustion together) — the
+    //     CR3/page-table derivation logic is unchanged, only the input bound.
+    #[test]
+    fn stage163d_pt_pools_still_derive_from_address_space_bound() {
+        assert!(
+            X86_PAGE_TABLE_SRC
+                .contains("const MAX_ASID_ROOTS: usize = vm_layout::MAX_ADDRESS_SPACES * 8;"),
+            "MAX_ASID_ROOTS must still derive from MAX_ADDRESS_SPACES"
+        );
+        assert!(
+            X86_PAGE_TABLE_SRC
+                .contains("const MAX_PT_PAGES: usize = vm_layout::MAX_ADDRESS_SPACES"),
+            "MAX_PT_PAGES must still derive from MAX_ADDRESS_SPACES"
+        );
+    }
+
+    // 28. The fix did not move any IPC/cap seam, did not change syscall/IPC counts,
+    //     did not touch RPi5 boot, and did not alter x86_64 D6/CR3/TSS/PF logic.
+    #[test]
+    fn stage163d_no_seam_no_count_no_rpi5_no_d6_change() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        // The vm_layout bump touches only the address-space bound — not RPi5 boot
+        // and not any D6/CR3/TSS/PF identifier.
+        for forbidden in &["rpi5", "RPi5", "bcm2712", "D6_", "CR3", "TSS", "page_fault"] {
+            assert!(
+                !X86_VM_LAYOUT_SRC.contains(forbidden),
+                "vm_layout must not reference the {forbidden} path"
+            );
+        }
     }
 }

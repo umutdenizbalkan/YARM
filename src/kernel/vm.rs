@@ -774,6 +774,24 @@ impl AddressSpaceManager {
             .map(|entry| &entry.aspace)
     }
 
+    /// Number of live user address spaces currently occupying a slot, and the
+    /// fixed slot capacity. Stage 163D: used by the proof-gated fork COW
+    /// diagnostics to report `Vm(Full)` exhaustion of the address-space table.
+    pub fn live_count(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    pub const fn slot_capacity(&self) -> usize {
+        MAX_ADDRESS_SPACES
+    }
+
+    /// Number of retired-but-not-yet-acknowledged ASIDs (pending TLB shootdown).
+    /// A large value here points at a shootdown-acknowledgement leak rather than a
+    /// genuine capacity shortfall.
+    pub fn retired_count(&self) -> usize {
+        self.retired.iter().flatten().count()
+    }
+
     pub fn get_mut(&mut self, asid: Asid) -> Option<&mut AddressSpace> {
         self.entries
             .iter_mut()
