@@ -692,6 +692,13 @@ pub fn ipc_recv_oracle_proof_enabled() -> bool {
     IPC_RECV_ORACLE_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 163A: buffered capacity (max queue depth) of the proof loopback endpoint
+/// E1. Communicated to init (startup slot 14) so the sender-wake workload can fill
+/// E1 to EXACTLY full with non-blocking sends and never become a sender-waiter
+/// itself — a buffered send on a full endpoint blocks the sender even with a zero
+/// timeout, so init must never attempt the (capacity+1)-th send.
+pub const IPC_RECV_PROOF_E1_DEPTH: usize = 8;
+
 /// Stage 163: `yarm.ipc_recv_proof_sender_wake=1` SUB-knob, layered on top of
 /// `yarm.ipc_recv_proof=1`. Default-off and independent: the sender-wake
 /// coordination hook and workload run ONLY when BOTH knobs are set, so the
@@ -774,7 +781,7 @@ pub fn provision_init_ipc_recv_proof_loopback(
     if !ipc_recv_oracle_proof_enabled() {
         return None;
     }
-    let (e1_idx, send_root, recv_root) = match kernel.create_endpoint(8) {
+    let (e1_idx, send_root, recv_root) = match kernel.create_endpoint(IPC_RECV_PROOF_E1_DEPTH) {
         Ok(triple) => triple,
         Err(e) => {
             crate::yarm_log!(

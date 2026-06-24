@@ -3402,6 +3402,69 @@ workload, and never hit the coordination hook. No IPC/cap stateful seam
 guards in `boot/tests.rs::stage163_sender_wake_proven` pin every one of these
 properties.
 
+#### 5.1.9.7 Stage 163A — fix sender-wake sequencing + oracle log analysis
+
+Initial Stage 163 validation on QEMU surfaced two defects. Base queued-split +
+rollback stayed green on x86_64 and AArch64 throughout.
+
+**Defect 1 — AArch64 fill blocked init (`tid=1`) before the fork.** The boot log
+showed `IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT endpoint=6 tid=1` during the FILL
+phase, before `FILL_DONE`/fork/`SENDER_START`, and the sequence then stalled. Root
+cause: a buffered `IpcSend` on a **full** endpoint *blocks the sender as a waiter
+even with a zero timeout* — `ipc_send_with_optional_deadline` has no try-send for a
+full buffered queue; the `!queued` branch calls `block_current_on_send_with_deadline`
+with `deadline = None`. The Stage 163 fill used a fixed `FILL_MAX = 64` overrun
+against an 8-deep endpoint, so init's 9th fill send blocked init itself as a
+sender-waiter (firing the coordination hook for init's own TID) and deadlocked,
+since init is also the receiver. The user's suggested "non-blocking fill-until-
+WouldBlock" is not achievable with the current kernel for exactly this reason. (Why
+x86_64 happened to complete is timing-dependent and was not relied upon.)
+
+The fix makes init fill to **exactly** E1's buffered capacity and never one more,
+so every fill send succeeds and init never blocks:
+
+- The kernel publishes E1's capacity to init. `boot::IPC_RECV_PROOF_E1_DEPTH` (the
+  same const the loopback's `create_endpoint` uses) is written into init startup
+  slot 14 (`service_extra_cap_1`, unused by init) whenever the sub-knob provisions
+  E2. init reads it as the fill target (defaulting to a safe small value).
+- The workload first **drains** any residual E1 messages (the base subtests share
+  E1), then fills exactly `capacity` messages with non-blocking `ipc_send`,
+  emitting `FILL_SEND_RET idx/code`, `FILL_STOP_FULL`, and `FILL_DONE count`. A
+  fill send that ever returns an error is treated as a fill-phase blocker
+  (`FILL_UNEXPECTED_BLOCKER tid=..`) and the proof aborts rather than risk blocking
+  init. The timed/blocking send (`ipc_send_timeout_ticks`) now appears ONLY in the
+  forked child's sender branch — never in fill.
+- Only then does init fork; the **child** does the timed blocking send on the full
+  E1 and is the sole sender-waiter, so the coordination hook fires for the child's
+  TID, not init's.
+
+**Defect 2 — oracle false negative on x86_64.** The oracle's `proof_require`
+evaluated an in-memory `present[]` array (a per-marker snapshot) rather than the
+live boot log, so a marker truly present in the raw `$CORE_LOG` could be reported
+absent. `proof_require` now greps the actual current core-smoke log
+(`tr '\r' '\n' < "$CORE_LOG" | rg -a`) for BOTH the sequence and kernel markers,
+echoes which log it analyzed plus `have_seq`/`have_kern`, and is no longer coupled
+to any snapshot. The per-arch policy is unchanged: x86_64 requires the kernel
+marker, AArch64/riscv64 defer it (split recv falls back to `legacy_full_path`).
+
+**Waiter-identity defense (kernel-agnostic).** Because the kernel cannot know the
+expected child TID, init verifies it from userspace. The E2 coordination message
+carries the waiter's TID (`Message::sender_tid`); init reads it, logs
+`WAITER_OBSERVED waiter_tid=.. child_pid=..`, and proceeds ONLY when the waiter is
+the forked child. A waiter-present for init (`tid == init_tid`) is rejected as
+`WAITER_UNEXPECTED` (and a non-child, non-init waiter as `WAITER_MISMATCH`); neither
+completes the sequence. `SEQUENCE_DONE` still requires the full trail — fill-done,
+the child's sender-start, the waiter observation, the recv return, and the observed
+child message (`sender_tid == child`).
+
+No syscall/IPC ABI change (slot 14 is internal kernel→init bootstrap state, not a
+syscall/IPC contract), no IPC/cap seam moved, counts unchanged
+(`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`), RPi5 boot untouched. New guards in
+`boot/tests.rs::stage163_sender_wake_proven` (`stage163a_*`) pin: fill is
+non-blocking and never uses a timed send; a waiter-present for init is not accepted
+as proof; `SEQUENCE_DONE` requires the full ordered trail; the oracle analyzes the
+live log; and the capacity is communicated via slot 14.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

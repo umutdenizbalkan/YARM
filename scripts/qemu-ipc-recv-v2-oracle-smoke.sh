@@ -234,8 +234,18 @@ proof_require() {
   # $1 = human label, $2 = userspace SEQUENCE marker, $3 = kernel marker
   local label="$1" seq_marker="$2" kern_marker="$3"
   local have_seq=0 have_kern=0
-  printf '%s\n' "${present[@]:-}" | rg -q "^$seq_marker$" && have_seq=1
-  printf '%s\n' "${present[@]:-}" | rg -q "^$kern_marker$" && have_kern=1
+  # Stage 163A: analyze the ACTUAL current boot log produced by THIS run
+  # ($CORE_LOG, written by the per-arch core smoke we just invoked), not an
+  # in-memory/file marker snapshot. A marker present in the raw log must never be
+  # reported absent. `tr` normalizes CR-terminated serial lines; `rg -a` treats
+  # the log as text even if it contains stray binary bytes.
+  if [[ -s "$CORE_LOG" ]] && tr '\r' '\n' <"$CORE_LOG" | rg -q -a "$seq_marker"; then
+    have_seq=1
+  fi
+  if [[ -s "$CORE_LOG" ]] && tr '\r' '\n' <"$CORE_LOG" | rg -q -a "$kern_marker"; then
+    have_kern=1
+  fi
+  echo "[info] ipc-oracle: proof $label: analyzing $CORE_LOG (have_seq=$have_seq have_kern=$have_kern)"
   # The userspace sequence marker is always required: the workload must have run
   # and observed the expected syscall return.
   if [[ "$have_seq" -ne 1 ]]; then
