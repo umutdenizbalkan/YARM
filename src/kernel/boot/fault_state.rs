@@ -123,7 +123,7 @@ impl KernelState {
         })
     }
 
-    fn try_handle_demand_page_fault(
+    pub(crate) fn try_handle_demand_page_fault(
         &mut self,
         fault: crate::arch::trap::FaultInfo,
     ) -> Result<bool, KernelError> {
@@ -141,13 +141,23 @@ impl KernelState {
         if !self.fault_addr_in_demand_backed_region(tid, page.0) {
             return Ok(false);
         }
-        let already_mapped = self
+        let existing = self
             .user_spaces
             .get(asid)
             .ok_or(KernelError::Vm(crate::kernel::vm::VmError::InvalidAsid))?
-            .resolve(page)
-            .is_some();
-        if already_mapped {
+            .resolve(page);
+        if let Some(mapping) = existing {
+            // Stage 163G fix: the page is already in the address space. Only treat
+            // this as a demand fault (stale-TLB re-walk) if the EXISTING mapping
+            // actually satisfies the faulting access. A WRITE fault on a present
+            // read-only page is a protection/COW fault, NOT a demand fault — masking
+            // it here (INVLPG + claim handled) would loop forever on an unchanged
+            // RO PTE. Decline so the caller routes it to COW / task-fault instead.
+            let write_satisfied =
+                !matches!(fault.access, FaultAccess::Write) || mapping.flags.write;
+            if !write_satisfied {
+                return Ok(false);
+            }
             // Stage 137: the page is already in VmSpace but the TLB may hold a
             // stale not-present entry from the original fault.  INVLPG flushes
             // that entry so the CPU re-walks the hardware page table and finds
@@ -467,6 +477,38 @@ impl KernelState {
                     fault.access,
                     frame.as_ref().map(|f| f.saved_pc).unwrap_or(0)
                 );
+                // Stage 163G: proof-gated page-fault classification diagnostics
+                // (active only under the sender-wake sub-knob, so normal boots are
+                // not polluted). Reveals why a present write fault routes to demand:
+                // whether the page is found, writable, COW-marked, and demand-backed.
+                if crate::kernel::boot::ipc_recv_proof_sender_wake_active()
+                    && let Some(tid) = self.current_tid()
+                    && let Some(asid) = self.task_asid(tid)
+                {
+                    let page = fault.addr.page_align_down();
+                    let mapping =
+                        self.with_user_spaces(|s| s.get(asid).and_then(|a| a.resolve(page)));
+                    let cow = self.is_cow_page(asid, page);
+                    let demand = self.fault_addr_in_demand_backed_region(tid, page.0);
+                    crate::yarm_log!(
+                        "PF_PROOF_CLASSIFY tid={} asid={} va=0x{:x} access={:?}",
+                        tid,
+                        asid.0,
+                        fault.addr.0,
+                        fault.access
+                    );
+                    crate::yarm_log!(
+                        "PF_PROOF_LOOKUP_MAPPING tid={} asid={} va=0x{:x} found={} writable={} cow={} demand={} phys=0x{:x}",
+                        tid,
+                        asid.0,
+                        page.0,
+                        mapping.is_some() as u8,
+                        mapping.map(|m| m.flags.write as u8).unwrap_or(0),
+                        cow as u8,
+                        demand as u8,
+                        mapping.map(|m| m.phys.0).unwrap_or(0)
+                    );
+                }
                 if matches!(fault.access, FaultAccess::Write) {
                     if let Some(tid) = self.current_tid()
                         && let Some(asid) = self.task_asid(tid)

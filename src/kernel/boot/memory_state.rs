@@ -564,6 +564,36 @@ impl KernelState {
                         return Err(err);
                     }
                 }
+            } else {
+                // Stage 163G fix: a run can be READ-ONLY in the parent yet still be
+                // copy-on-write *shared* — e.g. a page write-protected by an EARLIER
+                // fork that the parent has not written since. Such a parent page
+                // carries a COW mark; the new child shares it read-only and MUST also
+                // be COW-marked, otherwise the child's first write finds the page
+                // present+RO but NOT a COW page, so `try_handle_cow_fault` declines
+                // and the fault loops (the observed x86_64 error=0x7 present/write
+                // loop). Genuinely read-only runs (code/rodata, no parent COW mark)
+                // are shared directly with no COW mark — a write there is a real
+                // protection fault, as intended.
+                for p in 0..pages {
+                    let pv = VirtAddr(virt.0 + p as u64 * page_sz);
+                    if self.is_cow_page(parent_asid, pv) {
+                        if let Err(err) = self.mark_cow_page(child_asid, pv) {
+                            if proof {
+                                crate::yarm_log!(
+                                    "FORK_PROOF_COW_FAIL_DETAIL site=mark_cow_child_inherited va=0x{:x} reason={:?}",
+                                    pv.0,
+                                    err
+                                );
+                            }
+                            self.rollback_cow_clone(child_asid, parent_asid, &wp_runs, proof);
+                            return Err(err);
+                        }
+                        if proof {
+                            crate::yarm_log!("FORK_PROOF_COW_INHERIT_SHARED va=0x{:x}", pv.0);
+                        }
+                    }
+                }
             }
         }
 
@@ -669,15 +699,41 @@ impl KernelState {
         asid: Asid,
         fault_addr: VirtAddr,
     ) -> Result<bool, KernelError> {
+        // Stage 163G: proof-gated COW-handler diagnostics (sender-wake sub-knob only).
+        let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
         let page = fault_addr.page_align_down();
         if !self.is_cow_page(asid, page) {
+            if proof {
+                crate::yarm_log!(
+                    "PF_PROOF_COW_CONSIDER asid={} va=0x{:x} reason=not_cow_page",
+                    asid.0,
+                    page.0
+                );
+            }
             return Ok(false);
+        }
+        if proof {
+            crate::yarm_log!(
+                "PF_PROOF_COW_HANDLE_BEGIN asid={} va=0x{:x}",
+                asid.0,
+                page.0
+            );
         }
         let mapping = self
             .with_user_spaces(|spaces| spaces.get(asid).and_then(|aspace| aspace.resolve(page)))
             .ok_or(KernelError::UserMemoryFault)?;
         if mapping.flags.write {
+            // Already writable (e.g. a stale COW mark after a prior copy): just clear
+            // the mark; the write will now succeed.
             self.clear_cow_page(asid, page);
+            if proof {
+                crate::yarm_log!(
+                    "PF_PROOF_COW_HANDLE_OK asid={} va=0x{:x} new_pa=0x{:x} pte_writable=1 path=already_writable",
+                    asid.0,
+                    page.0,
+                    mapping.phys.0
+                );
+            }
             return Ok(true);
         }
         let (_id, new_mem_cap) = self.alloc_anonymous_memory_object()?;
@@ -687,12 +743,26 @@ impl KernelState {
                 if let Some(cnode) = self.current_task_cnode() {
                     let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
                 }
+                if proof {
+                    crate::yarm_log!(
+                        "PF_PROOF_COW_HANDLE_FAIL asid={} va=0x{:x} reason=resolve_phys",
+                        asid.0,
+                        page.0
+                    );
+                }
                 return Err(e);
             }
         };
         if let Err(e) = self.copy_frame_contents_for_cow(asid, mapping.phys, new_phys) {
             if let Some(cnode) = self.current_task_cnode() {
                 let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
+            }
+            if proof {
+                crate::yarm_log!(
+                    "PF_PROOF_COW_HANDLE_FAIL asid={} va=0x{:x} reason=copy_frame",
+                    asid.0,
+                    page.0
+                );
             }
             return Err(e);
         }
@@ -709,9 +779,28 @@ impl KernelState {
             if let Some(cnode) = self.current_task_cnode() {
                 let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
             }
+            if proof {
+                crate::yarm_log!(
+                    "PF_PROOF_COW_HANDLE_FAIL asid={} va=0x{:x} reason=remap",
+                    asid.0,
+                    page.0
+                );
+            }
             return Err(e);
         }
         self.clear_cow_page(asid, page);
+        if proof {
+            // Confirm the post-COW PTE is present + writable for the faulting ASID.
+            let post =
+                self.with_user_spaces(|spaces| spaces.get(asid).and_then(|a| a.resolve(page)));
+            crate::yarm_log!(
+                "PF_PROOF_COW_HANDLE_OK asid={} va=0x{:x} new_pa=0x{:x} pte_writable={} path=private_copy",
+                asid.0,
+                page.0,
+                new_phys.0,
+                post.map(|m| m.flags.write as u8).unwrap_or(0)
+            );
+        }
         Ok(true)
     }
 

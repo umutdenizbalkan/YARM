@@ -7417,7 +7417,10 @@ fn fork_cow_clone_failure_leaves_parent_unchanged() {
         .with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()))
         .expect("count");
     let before_writable = state
-        .with_user_spaces(|s| s.get(parent_asid).and_then(|a| a.resolve(VirtAddr(0x10000))))
+        .with_user_spaces(|s| {
+            s.get(parent_asid)
+                .and_then(|a| a.resolve(VirtAddr(0x10000)))
+        })
         .expect("mapping")
         .flags
         .write;
@@ -7427,13 +7430,19 @@ fn fork_cow_clone_failure_leaves_parent_unchanged() {
     while state.create_user_address_space().is_ok() {}
 
     let result = state.clone_user_address_space_cow(parent_asid);
-    assert!(result.is_err(), "fork must fail when no child ASID is available");
+    assert!(
+        result.is_err(),
+        "fork must fail when no child ASID is available"
+    );
 
     let after_count = state
         .with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()))
         .expect("count");
     let after_writable = state
-        .with_user_spaces(|s| s.get(parent_asid).and_then(|a| a.resolve(VirtAddr(0x10000))))
+        .with_user_spaces(|s| {
+            s.get(parent_asid)
+                .and_then(|a| a.resolve(VirtAddr(0x10000)))
+        })
         .expect("mapping")
         .flags
         .write;
@@ -7448,6 +7457,98 @@ fn fork_cow_clone_failure_leaves_parent_unchanged() {
     assert!(
         !state.is_cow_page(parent_asid, VirtAddr(0x10000)),
         "failed fork must not leave a stale COW mark on the parent"
+    );
+}
+
+// Stage 163G: re-forking a parent that holds a page RO-COW-shared from an EARLIER
+// fork must propagate the COW mark to the new child. Otherwise the child's first
+// write finds the page present+read-only but NOT COW-marked, COW declines, and the
+// fault loops (the observed x86_64 error=0x7 present/write loop). The grandchild's
+// write must resolve to a private writable page.
+#[test]
+fn fork_refork_propagates_cow_mark_to_grandchild() {
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(70).expect("parent");
+    state.bind_task_asid(70, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(70).expect("enqueue");
+    state.yield_current().expect("switch to task70");
+
+    let (_id, cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, cap, VirtAddr(0x6000), PageFlags::USER_RW)
+        .expect("map parent");
+
+    // First fork: the parent page becomes read-only + COW (shared with child1).
+    let child1 = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("fork 1");
+    assert!(state.is_cow_page(parent_asid, VirtAddr(0x6000)));
+    assert!(state.is_cow_page(child1, VirtAddr(0x6000)));
+
+    // The parent has NOT written the page; it is still read-only + COW. Fork again.
+    let child2 = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("fork 2");
+    assert!(
+        state.is_cow_page(child2, VirtAddr(0x6000)),
+        "grandchild must inherit the COW mark for the RO-COW-shared page"
+    );
+
+    // The grandchild's write resolves to a private writable page (no loop).
+    assert!(
+        state
+            .try_handle_cow_fault(child2, VirtAddr(0x6000))
+            .expect("cow fault"),
+        "grandchild COW write must be handled"
+    );
+    let m = state
+        .with_user_spaces(|s| s.get(child2).and_then(|a| a.resolve(VirtAddr(0x6000))))
+        .expect("child2 mapping");
+    assert!(m.flags.write, "grandchild gets a private writable page");
+    assert!(
+        !state.is_cow_page(child2, VirtAddr(0x6000)),
+        "COW mark cleared after the copy"
+    );
+}
+
+// Stage 163G: the demand handler must NOT claim to handle a WRITE fault on a page
+// that is present but read-only (a protection/COW fault). Masking it (INVLPG + Ok)
+// loops forever on an unchanged RO PTE. Demand must decline so the fault routes to
+// COW / task-fault instead.
+#[test]
+fn demand_declines_present_read_only_write_fault() {
+    let mut state = Bootstrap::init().expect("init");
+    let (asid, _) = state.create_user_address_space().expect("asid");
+    state.bind_task_asid(0, asid).expect("bind");
+    state.set_task_brk_bounds(0, 0x4000, 0x8000).expect("brk");
+    // Map a present READ-ONLY page inside the demand (brk) region.
+    let (_id, cap) = state.alloc_anonymous_memory_object().expect("mem");
+    state
+        .map_user_page_in_asid_with_caps(asid, cap, VirtAddr(0x5000), PageFlags::USER_RX)
+        .expect("map ro");
+
+    let write_fault = FaultInfo {
+        addr: VirtAddr(0x5000),
+        access: FaultAccess::Write,
+    };
+    assert!(
+        !state
+            .try_handle_demand_page_fault(write_fault)
+            .expect("demand"),
+        "demand must decline a present read-only WRITE fault (not mask it)"
+    );
+
+    // A READ fault on the same present page is still satisfiable → demand handles it.
+    let read_fault = FaultInfo {
+        addr: VirtAddr(0x5000),
+        access: FaultAccess::Read,
+    };
+    assert!(
+        state
+            .try_handle_demand_page_fault(read_fault)
+            .expect("demand"),
+        "demand still handles a satisfiable read fault on the present page"
     );
 }
 
@@ -44067,6 +44168,128 @@ mod stage163_sender_wake_proven {
             assert!(
                 !clone.contains(forbidden),
                 "COW clone must not reference the {forbidden} path"
+            );
+        }
+    }
+}
+
+// Stage 163G — fork-child COW write-fault / page-fault routing. The forked child's
+// present/write/user fault (error=0x7) on a COW-shared stack page must route to the
+// COW handler (private copy), not be masked by the demand handler. Two fixes: the
+// clone propagates COW marks to a child for pages held RO-COW from an earlier fork;
+// and the demand handler no longer claims a present read-only WRITE fault.
+mod stage163g_cow_pagefault {
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const MEMORY_STATE_SRC: &str = include_str!("memory_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_VM_LAYOUT_SRC: &str = include_str!("../../arch/x86_64/vm_layout.rs");
+
+    // 1. The demand handler must not mask a present read-only WRITE fault: the
+    //    already-mapped branch checks write satisfiability before claiming handled.
+    #[test]
+    fn stage163g_demand_does_not_mask_present_write_protect_fault() {
+        let demand = FAULT_SRC
+            .split("fn try_handle_demand_page_fault")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .or_else(|| {
+                FAULT_SRC
+                    .split("fn try_handle_demand_page_fault")
+                    .nth(1)
+                    .map(|s| &s[..s.len().min(1400)])
+            })
+            .expect("demand handler must exist");
+        assert!(
+            demand.contains("write_satisfied")
+                && demand.contains("mapping.flags.write")
+                && demand.contains("return Ok(false)"),
+            "demand already-mapped branch must decline an unsatisfiable write fault"
+        );
+    }
+
+    // 2. The COW handler emits proof-gated diagnostics so a present write fault that
+    //    routes to demand is explainable, and page-fault classification is logged.
+    #[test]
+    fn stage163g_cow_and_pagefault_diagnostics_exist() {
+        for marker in &["PF_PROOF_CLASSIFY", "PF_PROOF_LOOKUP_MAPPING"] {
+            assert!(
+                FAULT_SRC.contains(marker),
+                "fault handler must emit `{marker}`"
+            );
+        }
+        for marker in &[
+            "PF_PROOF_COW_CONSIDER",
+            "PF_PROOF_COW_HANDLE_BEGIN",
+            "PF_PROOF_COW_HANDLE_OK",
+            "PF_PROOF_COW_HANDLE_FAIL",
+        ] {
+            assert!(
+                MEMORY_STATE_SRC.contains(marker),
+                "COW handler must emit `{marker}`"
+            );
+        }
+        // The diagnostics are proof-gated (sender-wake sub-knob), not in normal boots.
+        assert!(
+            FAULT_SRC.contains("ipc_recv_proof_sender_wake_active()")
+                && MEMORY_STATE_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "page-fault/COW diagnostics must be proof-gated"
+        );
+    }
+
+    // 3. The clone propagates COW marks to the child for pages held RO-COW from an
+    //    earlier fork (the inherited-shared branch), keeping write-protect in place.
+    #[test]
+    fn stage163g_clone_propagates_inherited_cow_marks() {
+        let clone = MEMORY_STATE_SRC
+            .split("fn clone_user_address_space_cow(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn rollback_cow_clone(").next())
+            .expect("clone fn");
+        assert!(
+            clone.contains("is_cow_page(parent_asid, pv)")
+                && clone.contains("mark_cow_page(child_asid, pv)")
+                && clone.contains("FORK_PROOF_COW_INHERIT_SHARED"),
+            "clone must COW-mark the child for RO-COW-inherited parent pages"
+        );
+        // Stage 163E in-place write-protect is preserved (no eager per-page split).
+        assert!(
+            clone.contains("write_protect_run_head_in_place(virt)"),
+            "clone must keep the in-place (no-split) parent write-protect"
+        );
+    }
+
+    // 4. No IPC/cap seam moved; counts unchanged; RPi5 untouched; D6/CR3/TSS not
+    //    altered by the fault fix; MAX_ADDRESS_SPACES stays 32.
+    #[test]
+    fn stage163g_no_seam_no_count_no_rpi5_no_d6() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        assert!(
+            X86_VM_LAYOUT_SRC.contains(
+                "#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"
+            ),
+            "MAX_ADDRESS_SPACES stays 32"
+        );
+        // The fault-routing fix must not touch the D6/CR3/TSS switch machinery.
+        for forbidden in &["D6_CONTROLLED", "switch_frames", "write_cr3", "load_tss"] {
+            assert!(
+                !FAULT_SRC.contains(forbidden),
+                "fault routing must not reference the {forbidden} path"
             );
         }
     }
