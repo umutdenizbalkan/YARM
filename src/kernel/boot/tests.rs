@@ -7395,6 +7395,62 @@ fn fork_cow_clone_is_transactional_no_parent_mapping_leak() {
     assert_ne!(c1, c2, "each fork yields a distinct child address space");
 }
 
+// Stage 163F (item 14): a COW fork that fails (here: the address-space table is
+// full, so the child cannot be created) must leave the PARENT byte-identical — same
+// mapping count AND same write permissions (no half-applied COW write-protect).
+#[test]
+fn fork_cow_clone_failure_leaves_parent_unchanged() {
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(62).expect("parent");
+    state.bind_task_asid(62, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(62).expect("enqueue");
+    state.yield_current().expect("switch to task62");
+
+    for v in [0x10000u64, 0x11000] {
+        let (_id, cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(parent_asid, cap, VirtAddr(v), PageFlags::USER_RW)
+            .expect("map parent");
+    }
+    let before_count = state
+        .with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()))
+        .expect("count");
+    let before_writable = state
+        .with_user_spaces(|s| s.get(parent_asid).and_then(|a| a.resolve(VirtAddr(0x10000))))
+        .expect("mapping")
+        .flags
+        .write;
+    assert!(before_writable, "parent page starts writable");
+
+    // Exhaust the address-space table so the next clone's create_user_space fails.
+    while state.create_user_address_space().is_ok() {}
+
+    let result = state.clone_user_address_space_cow(parent_asid);
+    assert!(result.is_err(), "fork must fail when no child ASID is available");
+
+    let after_count = state
+        .with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()))
+        .expect("count");
+    let after_writable = state
+        .with_user_spaces(|s| s.get(parent_asid).and_then(|a| a.resolve(VirtAddr(0x10000))))
+        .expect("mapping")
+        .flags
+        .write;
+    assert_eq!(
+        before_count, after_count,
+        "failed fork must not change the parent mapping count"
+    );
+    assert_eq!(
+        before_writable, after_writable,
+        "failed fork must not leave the parent write-protected (no half-applied COW)"
+    );
+    assert!(
+        !state.is_cow_page(parent_asid, VirtAddr(0x10000)),
+        "failed fork must not leave a stale COW mark on the parent"
+    );
+}
+
 #[test]
 fn fork_cow_write_fault_gives_child_private_frame() {
     // After fork, a write to a COW page in the child must allocate a new

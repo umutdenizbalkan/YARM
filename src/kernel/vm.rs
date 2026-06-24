@@ -31,8 +31,45 @@ impl VirtAddr {
             None => Self(u64::MAX & !mask),
         }
     }
+
+    /// Checked byte addition. Returns `None` on `u64` overflow. Stage 163F: any
+    /// range-sensitive call site (computing an end address from a size that could
+    /// be large or attacker-influenced) MUST use this rather than the `Add`
+    /// operator, which wraps silently (see the `Add` impl below).
+    pub const fn checked_add(self, rhs: u64) -> Option<Self> {
+        match self.0.checked_add(rhs) {
+            Some(v) => Some(Self(v)),
+            None => None,
+        }
+    }
+
+    /// True if this address is in canonical form for the target ISA.
+    ///
+    /// On x86_64 the top 17 bits [63:47] must be all-equal (sign-extension of bit
+    /// 47); a non-canonical address `#GP`s on use, so e.g. `0x0001_0000_0000_0000`
+    /// must NOT be accepted as a valid user address even though it compares below
+    /// `KERNEL_SPACE_BASE`. AArch64 (Sv48/TTBR split) and RISC-V (Sv39/Sv48) have
+    /// their own valid-range rules handled by the page-table backend; this software
+    /// VM split treats any address below `KERNEL_SPACE_BASE` as user, so the
+    /// canonical check is cfg-gated to x86_64 and is a no-op elsewhere.
+    pub const fn is_canonical(self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let top = self.0 >> 47;
+            top == 0 || top == 0x1_FFFF
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            true
+        }
+    }
 }
 
+/// NOTE (Stage 163F): this operator uses **wrapping** arithmetic. It is kept for
+/// ergonomics in tight page-walk loops where `rhs` is a small, already-in-bounds
+/// page offset. It MUST NOT be used to compute an end address from an untrusted or
+/// potentially large size — use [`VirtAddr::checked_add`] there. Overflow wraps
+/// silently and will not be caught.
 impl core::ops::Add<u64> for VirtAddr {
     type Output = Self;
 
@@ -50,6 +87,17 @@ impl PhysAddr {
     }
 }
 
+/// Address-space identifier.
+///
+/// The inner `u16` is `pub` for ergonomics and is constructed directly only in
+/// known internal/test paths (the allocator in [`AddressSpaceManager::allocate_asid`]
+/// and kernel-bootstrap/test code). The allocator NEVER hands out `Asid(0)`
+/// (`next_asid` starts at 1 and wraps to 1, never 0), because 0 is reserved as the
+/// "no ASID" / kernel sentinel and, on x86_64, PCID 0 is special-cased. Stage 163F:
+/// callers minting an ASID must go through `create_user_space`; do not fabricate a
+/// raw `Asid(n)` outside the allocator/tests. (Sealing the field behind a `TryFrom`
+/// is deferred: the inner field is referenced pervasively across the boot/arch
+/// layers and a wide API refactor is out of scope for this VM audit.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Asid(pub u16);
 
@@ -109,6 +157,12 @@ impl PageFlags {
         cache_policy: CachePolicy::Device,
     };
 
+    /// Guard page: no read/write/execute and not user-accessible. Stage 163F audit:
+    /// the `cache_policy` here is **irrelevant** — a guard page must never be made
+    /// present (its purpose is to fault on any access), so its memory type is never
+    /// consulted by hardware. The `WriteBack` value is an inert default; it carries
+    /// no caching semantics for an inaccessible page. (If a guard page were ever
+    /// accidentally mapped present that would be the bug to fix, not this field.)
     pub const GUARD: Self = Self {
         read: false,
         write: false,
@@ -128,6 +182,16 @@ pub const PAGE_SIZE: usize = vm_layout::PAGE_SIZE;
 pub const KERNEL_SPACE_BASE: u64 = vm_layout::KERNEL_SPACE_BASE;
 pub const MAX_MAPPINGS: usize = vm_layout::MAX_MAPPINGS;
 pub const MAX_ADDRESS_SPACES: usize = vm_layout::MAX_ADDRESS_SPACES;
+
+// Stage 163F audit (item 10): the AddressSpaceManager lookup paths
+// (get/get_mut/cr3_for_asid + retired scans) are O(N) linear over fixed arrays.
+// That is only acceptable while N stays small; pin the bound at compile time so a
+// future widening forces a deliberate revisit of the lookup structure rather than
+// silently regressing every ASID lookup.
+const _: () = assert!(
+    MAX_ADDRESS_SPACES <= 64,
+    "MAX_ADDRESS_SPACES grew beyond the linear-scan budget; revisit lookup structure"
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmError {
@@ -258,6 +322,12 @@ struct Entry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrainedMapping {
+    /// Run head virtual address (Stage 163F): lets callers reconstruct exactly
+    /// which virtual range `[virt, virt + pages * PAGE_SIZE)` was unmapped, not just
+    /// the physical range. The current consumer (frame reclaim) only needs `phys` +
+    /// `pages`, but recording `virt` makes the drained record self-describing for
+    /// future callers (e.g. range-targeted TLB shootdown).
+    pub virt: VirtAddr,
     pub mapping: Mapping,
     pub pages: usize,
 }
@@ -343,8 +413,44 @@ impl AddressSpace {
         }
     }
 
+    /// Exclusive end virtual address of a run. Stage 163F: uses **saturating**
+    /// arithmetic so a corrupted `pages` count can never wrap the end below the
+    /// base (which would corrupt the sorted-table binary search and adjacency
+    /// checks). A saturated `u64::MAX` end is a safe upper bound: it is never equal
+    /// to a page-aligned `virt`, so it can only ever cause a "not adjacent" / "not
+    /// contained" decision, never a false merge.
     fn entry_end_virt(entry: &Entry) -> u64 {
-        entry.virt.0 + (entry.pages as u64 * PAGE_SIZE as u64)
+        entry
+            .virt
+            .0
+            .saturating_add((entry.pages as u64).saturating_mul(PAGE_SIZE as u64))
+    }
+
+    /// Stage 163F: true iff the run `prev` is immediately followed — in BOTH virt
+    /// and phys, with identical flags — by a single page at (`virt`, `phys`), so the
+    /// page can be coalesced onto the END of `prev`. Uses checked arithmetic for the
+    /// phys-end computation: an overflow yields `false` ("cannot merge"), never a
+    /// false merge on a corrupted `pages`.
+    fn run_precedes_page(prev: &Entry, virt: VirtAddr, phys: PhysAddr, flags: PageFlags) -> bool {
+        if prev.mapping.flags != flags || Self::entry_end_virt(prev) != virt.0 {
+            return false;
+        }
+        let prev_phys_end = prev
+            .mapping
+            .phys
+            .0
+            .checked_add((prev.pages as u64).saturating_mul(PAGE_SIZE as u64));
+        prev_phys_end == Some(phys.0)
+    }
+
+    /// Stage 163F: true iff a single page at (`virt`, `phys`) is immediately
+    /// followed — in BOTH virt and phys, with identical flags — by the run `next`,
+    /// so the page can be coalesced onto the FRONT of `next`. Checked arithmetic:
+    /// overflow yields `false` ("cannot merge").
+    fn page_precedes_run(virt: VirtAddr, phys: PhysAddr, flags: PageFlags, next: &Entry) -> bool {
+        next.mapping.flags == flags
+            && virt.0.checked_add(PAGE_SIZE as u64) == Some(next.virt.0)
+            && phys.0.checked_add(PAGE_SIZE as u64) == Some(next.mapping.phys.0)
     }
 
     fn find_entry_containing(&self, virt: VirtAddr) -> Option<usize> {
@@ -415,6 +521,16 @@ impl AddressSpace {
             || !mapping.phys.0.is_multiple_of(PAGE_SIZE as u64)
         {
             return Err(VmError::Misaligned);
+        }
+
+        // Stage 163F (item 8): reject non-canonical virtual addresses. On x86_64 a
+        // mapping at e.g. 0x0001_0000_0000_0000 (bit 48 set, bit 47 clear) is below
+        // KERNEL_SPACE_BASE — so `is_user()` would say "user" — yet the CPU `#GP`s on
+        // any access to it. `is_canonical()` is cfg-gated (no-op on AArch64/RISC-V,
+        // whose own range rules are enforced by the page-table backend), so this
+        // only tightens x86_64 and leaves the canonical kernel/user ranges accepted.
+        if !virt.is_canonical() {
+            return Err(VmError::InvalidAddress);
         }
 
         if !self.mapping_is_allowed(virt, mapping.flags) {
@@ -501,19 +617,14 @@ impl AddressSpace {
                 arch_map_page(self.asid, virt, mapping)?;
                 let prev_merge = i > 0
                     && self.entries[i - 1].is_some_and(|prev| {
-                        prev.mapping.flags == mapping.flags
-                            && Self::entry_end_virt(&prev) == virt.0
-                            && prev.mapping.phys.0 + (prev.pages as u64 * PAGE_SIZE as u64)
-                                == mapping.phys.0
+                        Self::run_precedes_page(&prev, virt, mapping.phys, mapping.flags)
                     });
                 if prev_merge {
                     // Bug 6 fix: also check if the new page bridges into the next
                     // run so all three entries can be collapsed into one.
                     let next_also_merges = i < self.len
                         && self.entries[i].is_some_and(|next| {
-                            next.mapping.flags == mapping.flags
-                                && virt.0 + PAGE_SIZE as u64 == next.virt.0
-                                && mapping.phys.0 + PAGE_SIZE as u64 == next.mapping.phys.0
+                            Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
                         });
                     if next_also_merges {
                         let next_pages = self.entries[i].expect("next").pages;
@@ -531,9 +642,7 @@ impl AddressSpace {
 
                 let next_merge = i < self.len
                     && self.entries[i].is_some_and(|next| {
-                        next.mapping.flags == mapping.flags
-                            && virt.0 + PAGE_SIZE as u64 == next.virt.0
-                            && mapping.phys.0 + PAGE_SIZE as u64 == next.mapping.phys.0
+                        Self::page_precedes_run(virt, mapping.phys, mapping.flags, &next)
                     });
                 if next_merge {
                     let next = self.entries[i].as_mut().expect("next");
@@ -737,13 +846,39 @@ impl AddressSpace {
         self.entries[idx].as_mut().expect("entry").mapping.flags = flags;
     }
 
+    /// True if `phys` falls within ANY mapped run, i.e. in
+    /// `[base, base + pages * PAGE_SIZE)` for some entry. Stage 163F: previously
+    /// this compared only against the run's BASE phys, so a query for a non-base
+    /// page of a multi-page run (e.g. base 0x20000, run 3 pages, query 0x21000)
+    /// wrongly returned `false` — which, for a future frame-reclaim guard built on
+    /// this, would risk reclaiming a still-mapped frame. Now it tests containment
+    /// over the whole run with checked arithmetic (overflow ⇒ the run reaches the
+    /// top of the address space, so any `phys >= base` is contained).
     pub fn has_mapping_for_phys(&self, phys: PhysAddr) -> bool {
-        self.entries[..self.len]
-            .iter()
-            .flatten()
-            .any(|entry| entry.mapping.phys == phys)
+        self.entries[..self.len].iter().flatten().any(|entry| {
+            let base = entry.mapping.phys.0;
+            match (entry.pages as u64)
+                .checked_mul(PAGE_SIZE as u64)
+                .and_then(|span| base.checked_add(span))
+            {
+                Some(end) => base <= phys.0 && phys.0 < end,
+                None => base <= phys.0,
+            }
+        })
     }
 
+    /// Drain every mapping (unmapping each page) and return them by value.
+    ///
+    /// Stack note (Stage 163F audit, item 9): the returned
+    /// `[Option<DrainedMapping>; MAX_MAPPINGS]` is a fixed-size, by-value array
+    /// (~`MAX_MAPPINGS` * `size_of::<Option<DrainedMapping>>()` ≈ a few KiB). It is
+    /// allocation-free (`no_std`-friendly) but lives on the stack. The only callers
+    /// are address-space *destruction* paths (`destroy_and_collect_mappings` ←
+    /// `KernelState::destroy_user_address_space*`), which run in syscall/teardown
+    /// context with an ordinary kernel stack — NOT in interrupt/trap-entry or deeply
+    /// recursive paths — so the one-frame array is safe. Do not call this from a
+    /// stack-constrained (IRQ/exception) context; if that is ever needed, switch to
+    /// a visitor/callback drain rather than introducing heap allocation.
     pub fn drain_mappings(&mut self) -> [Option<DrainedMapping>; MAX_MAPPINGS] {
         let mut drained: [Option<DrainedMapping>; MAX_MAPPINGS] = [None; MAX_MAPPINGS];
         for (idx, slot) in self.entries.iter_mut().take(self.len).enumerate() {
@@ -756,6 +891,7 @@ impl AddressSpace {
                 );
             }
             drained[idx] = Some(DrainedMapping {
+                virt: entry.virt,
                 mapping: entry.mapping,
                 pages: entry.pages,
             });
@@ -787,6 +923,25 @@ pub struct RetiredAsid {
 /// `MAX_ADDRESS_SPACES` are destroyed simultaneously with pending shootdowns,
 /// no further `destroy()` call can retire another ASID until an existing
 /// retired slot is cleared by `acknowledge_shootdown()`.
+///
+/// ## Concurrency (Stage 163F audit, item 6)
+///
+/// `AddressSpaceManager` and the [`AddressSpace`]es it owns hold **no interior
+/// locks**. All access — read or mutate — requires external exclusive access. In
+/// this kernel that owner is the VM domain lock (rank 5): every entry point reaches
+/// this type through `KernelState::with_user_spaces` / `with_user_spaces_mut`
+/// (`orchestrator_state.rs`), which hold the VM `SpinLock` guard across the closure.
+/// Do not store a reference to this manager (or an `AddressSpace`) past the end of
+/// such a closure, and do not access it from two CPUs without that lock.
+///
+/// ## Lookup cost (Stage 163F audit, item 10)
+///
+/// `get` / `get_mut` / `cr3_for_asid` and the retired-slot scans are O(N) linear
+/// over `entries`/`retired`. This is intentional: `MAX_ADDRESS_SPACES` is small
+/// (32) and a fixed-array scan is cache-friendly and allocation-free. A
+/// `const` assertion below pins that bound so the linear scan stays cheap; if the
+/// bound ever grows large, revisit the lookup structure (NOT a heap hash map in
+/// this `no_std` kernel).
 #[derive(Debug)]
 pub struct AddressSpaceManager {
     next_asid: u16,
@@ -836,19 +991,23 @@ impl AddressSpaceManager {
     }
 
     pub fn create_user_space(&mut self) -> Result<Asid, VmError> {
+        // Stage 163F: confirm a free `entries` slot BEFORE allocating/registering an
+        // ASID. The previous order allocated an ASID number and registered an arch
+        // page-table root, then rolled back (`arch_unregister_asid`) when the slot
+        // table was full — a needless allocate-then-undo. Checking the slot first
+        // means a full manager performs NO ASID allocation and NO arch registration.
+        let slot_idx = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .ok_or(VmError::Full)?;
         let asid = self.allocate_asid()?;
         arch_register_asid(asid)?;
-        for slot in &mut self.entries {
-            if slot.is_none() {
-                *slot = Some(AsEntry {
-                    asid,
-                    aspace: AddressSpace::new_user_with_asid(asid),
-                });
-                return Ok(asid);
-            }
-        }
-        arch_unregister_asid(asid);
-        Err(VmError::Full)
+        self.entries[slot_idx] = Some(AsEntry {
+            asid,
+            aspace: AddressSpace::new_user_with_asid(asid),
+        });
+        Ok(asid)
     }
 
     pub fn get(&self, asid: Asid) -> Option<&AddressSpace> {
@@ -961,6 +1120,14 @@ impl AddressSpaceManager {
         asid: Asid,
         cpu_bit: CpuBitmap,
     ) -> Result<bool, VmError> {
+        // Stage 163F: a zero `cpu_bit` clears nothing (`pending &= !0` is a no-op) and
+        // would silently report "not yet complete" without making progress — almost
+        // certainly a caller bug. Catch it in debug builds; in release it stays a
+        // harmless no-op returning `Ok(false)` (or `Ok(true)` if already empty).
+        debug_assert!(
+            cpu_bit != 0,
+            "acknowledge_shootdown called with empty cpu_bit (no CPU acknowledged)"
+        );
         for slot in &mut self.retired {
             if let Some(retired) = slot.as_mut()
                 && retired.asid == asid
@@ -988,6 +1155,15 @@ impl AddressSpaceManager {
     ///
     /// Retired ASIDs are no longer force-freed on timeout; they remain retired
     /// until every targeted CPU explicitly acknowledges shootdown completion.
+    ///
+    /// Returns `0` **by design** (Stage 163F audit, item 7): the `usize` is the
+    /// "number of ASIDs whose shootdown timed out and should be escalated", and the
+    /// timeout-escalation mechanism is intentionally deferred (see
+    /// `doc/KERNEL_LOCKING.md` §20.3 / §36.7 and `KERNEL_TEST_RULES.md` N+25.9). The
+    /// caller in `scheduler_state.rs` is written to fire `escalate_tlb_shootdown_
+    /// timeout` only when this returns `> 0`, so the return type is the wired-in
+    /// hook for a future implementation — NOT dead. Tests assert it stays `0`; do
+    /// not change the signature without lifting that documented contract.
     pub fn tick_retired_shootdowns(&mut self) -> usize {
         for slot in &mut self.retired {
             let Some(retired) = slot.as_mut() else {
@@ -1974,5 +2150,196 @@ mod tests {
             Err(VmError::PrivilegeViolation),
             "mapping kernel VA into user space must be PrivilegeViolation"
         );
+    }
+
+    // ── Stage 163F VM audit regression tests ──────────────────────────────────
+
+    // Item 1: has_mapping_for_phys covers the whole run, not just the base page.
+    #[test]
+    fn has_mapping_for_phys_covers_whole_run() {
+        let mut aspace = AddressSpace::new_user();
+        let rw = PageFlags::USER_RW;
+        // Build a 3-page run at VA 0x10000, PA 0x20000.
+        for p in 0..3u64 {
+            aspace
+                .map_page(
+                    VirtAddr(0x10_000 + p * PAGE_SIZE as u64),
+                    Mapping {
+                        phys: PhysAddr(0x20_000 + p * PAGE_SIZE as u64),
+                        flags: rw,
+                    },
+                )
+                .expect("map");
+        }
+        assert_eq!(aspace.mappings(), 1, "contiguous pages form one run");
+        // base, middle, last page → contained.
+        assert!(aspace.has_mapping_for_phys(PhysAddr(0x20_000)), "base page");
+        assert!(
+            aspace.has_mapping_for_phys(PhysAddr(0x21_000)),
+            "middle page (the bug: was false)"
+        );
+        assert!(aspace.has_mapping_for_phys(PhysAddr(0x22_000)), "last page");
+        // just-past-end and just-before-base → not contained.
+        assert!(
+            !aspace.has_mapping_for_phys(PhysAddr(0x23_000)),
+            "just past end"
+        );
+        assert!(
+            !aspace.has_mapping_for_phys(PhysAddr(0x1F_000)),
+            "just before base"
+        );
+    }
+
+    // Item 2: VirtAddr::checked_add reports overflow; Add wraps (documented).
+    #[test]
+    fn virt_addr_checked_add_detects_overflow() {
+        assert_eq!(VirtAddr(0x1000).checked_add(0x1000), Some(VirtAddr(0x2000)));
+        assert_eq!(VirtAddr(u64::MAX).checked_add(1), None);
+        assert_eq!(VirtAddr(u64::MAX - 3).checked_add(10), None);
+        // The Add operator intentionally wraps (kept for in-bounds page offsets).
+        assert_eq!((VirtAddr(u64::MAX) + 1).0, 0);
+    }
+
+    // Item 3: coalescing uses checked arithmetic — an overflowing phys end must not
+    // produce a false merge. Two runs whose phys would "wrap into" each other must
+    // stay distinct.
+    #[test]
+    fn coalescing_does_not_merge_on_phys_overflow() {
+        let mut aspace = AddressSpace::new_user();
+        let rw = PageFlags::USER_RW;
+        // A run near the top of the physical space: PA base = u64::MAX-PAGE_SIZE+1
+        // (one page). Its "phys end" would overflow u64.
+        let top_page_phys = PhysAddr(u64::MAX - (PAGE_SIZE as u64) + 1);
+        aspace
+            .map_page(
+                VirtAddr(0x40_000),
+                Mapping {
+                    phys: top_page_phys,
+                    flags: rw,
+                },
+            )
+            .expect("map top page");
+        // A second page adjacent in VA but with PA 0 (so a wrapped phys-end would
+        // falsely equal it). It must NOT merge — checked arithmetic treats the
+        // overflowing end as "not adjacent".
+        aspace
+            .map_page(
+                VirtAddr(0x41_000),
+                Mapping {
+                    phys: PhysAddr(0),
+                    flags: rw,
+                },
+            )
+            .expect("map second page");
+        assert_eq!(
+            aspace.mappings(),
+            2,
+            "phys-end overflow must not coalesce distinct runs"
+        );
+    }
+
+    // Item 4: drained mappings preserve virt, phys, and page count.
+    #[test]
+    fn drain_mappings_preserves_virt_phys_pages() {
+        let mut aspace = AddressSpace::new_user();
+        let rw = PageFlags::USER_RW;
+        for p in 0..2u64 {
+            aspace
+                .map_page(
+                    VirtAddr(0x30_000 + p * PAGE_SIZE as u64),
+                    Mapping {
+                        phys: PhysAddr(0x80_000 + p * PAGE_SIZE as u64),
+                        flags: rw,
+                    },
+                )
+                .expect("map");
+        }
+        let drained = aspace.drain_mappings();
+        let dm = drained.into_iter().flatten().next().expect("one run");
+        assert_eq!(dm.virt, VirtAddr(0x30_000), "drained run preserves virt");
+        assert_eq!(dm.mapping.phys, PhysAddr(0x80_000), "preserves phys");
+        assert_eq!(dm.pages, 2, "preserves page count");
+    }
+
+    // Item 5: a full manager performs no ASID allocation/registration, and a freed
+    // slot lets the next create succeed (no state corruption on the full path).
+    #[test]
+    fn create_user_space_full_then_freed_recovers() {
+        let mut mgr = AddressSpaceManager::default();
+        for _ in 0..MAX_ADDRESS_SPACES {
+            assert!(mgr.create_user_space().is_ok());
+        }
+        assert_eq!(
+            mgr.create_user_space(),
+            Err(VmError::Full),
+            "full manager must reject before allocating an ASID"
+        );
+        // Free one (pending=0 → immediately reusable) and retry.
+        let live = mgr.live_count();
+        assert_eq!(live, MAX_ADDRESS_SPACES);
+        // Destroy the first live ASID we can find.
+        let some_asid = (1u16..=u16::MAX)
+            .map(Asid)
+            .find(|a| mgr.get(*a).is_some())
+            .expect("a live asid");
+        assert_eq!(mgr.destroy(some_asid, 0), Ok(()));
+        assert!(
+            mgr.create_user_space().is_ok(),
+            "a freed slot must allow a new create"
+        );
+    }
+
+    // Item 12: acknowledging an unset (but nonzero) CPU bit leaves the pending set
+    // unchanged and reports "not yet complete".
+    #[test]
+    fn acknowledge_shootdown_unset_bit_is_noop() {
+        let mut mgr = AddressSpaceManager::default();
+        let asid = mgr.create_user_space().expect("asid");
+        assert_eq!(mgr.destroy(asid, 0b0110), Ok(()));
+        // Bit 0 is not in the pending set {1,2}: no progress, still pending.
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b0001), Ok(false));
+        // The real bits still complete it.
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b0010), Ok(false));
+        assert_eq!(mgr.acknowledge_shootdown(asid, 0b0100), Ok(true));
+    }
+
+    // Item 8: canonical-address policy (x86_64 only) — non-canonical user addresses
+    // are rejected by map_page; canonical low/high addresses are accepted by the
+    // is_canonical predicate.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn map_page_rejects_non_canonical_x86_64() {
+        assert!(VirtAddr(0x1000).is_canonical(), "low user VA is canonical");
+        assert!(
+            VirtAddr(KERNEL_SPACE_BASE).is_canonical(),
+            "kernel base is canonical"
+        );
+        let non_canonical = VirtAddr(0x0001_0000_0000_0000);
+        assert!(
+            !non_canonical.is_canonical(),
+            "0x0001_0000_0000_0000 is non-canonical"
+        );
+        let mut aspace = AddressSpace::new_user();
+        assert_eq!(
+            aspace.map_page(
+                non_canonical,
+                Mapping {
+                    phys: PhysAddr(0x9_000),
+                    flags: PageFlags::USER_RW,
+                }
+            ),
+            Err(VmError::InvalidAddress),
+            "map_page must reject a non-canonical user VA"
+        );
+    }
+
+    // Item 13: the ASID allocator never hands out Asid(0).
+    #[test]
+    fn allocate_asid_never_zero() {
+        let mut mgr = AddressSpaceManager::default();
+        for _ in 0..MAX_ADDRESS_SPACES {
+            let a = mgr.create_user_space().expect("asid");
+            assert_ne!(a, Asid(0), "ASID 0 is reserved and must never be allocated");
+        }
     }
 }
