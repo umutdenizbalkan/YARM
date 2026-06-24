@@ -195,7 +195,13 @@ state 9 today.
   reverse-order rollback for that inert request. DRS-12 can correlate the mock
   PL011 PM handle, verified driver registration, PM death notification, health,
   and restart request, while RP1 GPIO and mailbox remain deferred/BAR- or
-  transport/cache/MMIO-blocked and no live PM call or restart occurs.
+  transport/cache/MMIO-blocked and no live PM call or restart occurs. DRS-13
+  adds an inert dependency graph and restart-cascade report: Driver Manager can
+  recommend consumer quiesce/restart/restart-after-provider ordering, irqmux
+  provider crashes can mark IRQ consumers affected, restart limits and
+  restart-pending state block duplicate recommendations, and dependency cycles
+  fail closed. PM remains the only future mechanism owner; no PM/supervisor
+  call, spawn, restart, cap mint/revoke, grant, teardown, or MMIO occurs.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.
