@@ -3465,6 +3465,67 @@ non-blocking and never uses a timed send; a waiter-present for init is not accep
 as proof; `SEQUENCE_DONE` requires the full ordered trail; the oracle analyzes the
 live log; and the capacity is communicated via slot 14.
 
+#### 5.1.9.8 Stage 163B — single-log oracle + fork ordering/diagnostics
+
+Stage 163A fixed the fill overrun (init no longer blocks during fill — confirmed on
+AArch64: `WAITER_PRESENT tid=1` during fill is gone) but validation exposed two
+remaining problems. Base queued-split + rollback stayed green on x86_64 and AArch64.
+
+**Defect 1 — the oracle still false-negatived on x86_64, even reading `$CORE_LOG`.**
+The initial marker scan found the markers but `proof_require` reported
+`have_seq=0 have_kern=0` for the *same* markers (and the same effect hit the
+queued-split kernel marker), proving the two checks were not reading the same bytes.
+Rather than keep chasing which file `$CORE_LOG` resolved to, Stage 163B makes the
+oracle analyze **one** log through **one** helper:
+
+- The delegated core-smoke's combined stdout/stderr is captured explicitly into
+  `ipc-oracle-core-stdout-$ARCH.log` via `tee` (with `CORE_STATUS` preserved from
+  `PIPESTATUS[0]`). The core-smoke tees the raw QEMU serial to its stdout, so this
+  captures exactly the markers the run produced.
+- A single `ANALYSIS_LOG=ipc-oracle-run-$ARCH.log` is built as the CR-normalized
+  union of that captured output and the raw serial `$CORE_LOG`, so a marker that
+  reached either sink is visible to one consistent scan. The analyzed path + byte
+  count are printed.
+- Every marker check — initial scan, fatal/required/extended, and `proof_require` —
+  now goes through one `marker_present "$marker" "$ANALYSIS_LOG"` helper using
+  fixed-string `rg -F`. `proof_require` no longer reads a separate file or the
+  `present[]` snapshot, so a marker the initial scan saw can never be reported
+  absent. A standalone functional check confirms `proof_require sender-wake`
+  returns PASS when a log contains both sender-wake markers.
+
+**Defect 2 — AArch64 sender-wake never produced a sender.** After `FILL_DONE`, the
+AArch64 log showed init looping on the E2 non-blocking receive with **no child
+markers at all** — no `SENDER_START`. The forked child was never observed running,
+so the waiter-present signal could never be produced. Stage 163B adds explicit
+fork-ordering diagnostics and tightens the contract so the next run pinpoints the
+cause rather than presenting an opaque poll loop:
+
+- `fork()` now returns `Option<u64>`: `None` on an ABI-flagged failure (x86_64's
+  separate error lane), `Some(0)` in the child, `Some(child_tid)` in the parent. On
+  AArch64/riscv64 there is no error lane, so a failure there still returns
+  `Some(value)` and the bounded poll + waiter-identity checks catch it.
+- The workload emits `FORK_BEGIN`, then `FORK_RET raw=.. role=parent|child|err`
+  inside each branch, `CHILD_ENTRY` + `SENDER_START` in the child before the timed
+  blocking send, and `PARENT_WAIT_BEGIN child_pid=..` in the parent. The parent
+  reaches the E2 poll ONLY through the `Some(child_pid)` arm — it never polls E2
+  before fork has returned a parent-side child pid. A `None` (failed) fork emits
+  `FORK_FAILED` and returns immediately, never spinning on E2.
+
+This makes the AArch64 failure mode self-describing on the next run: if
+`FORK_RET role=child`/`CHILD_ENTRY` are absent while the parent logs
+`FORK_RET role=parent`, the child task is created (it is enqueued `Runnable` with
+`arg0=0` in `fork_complete_post_clone`) but is not resuming into userspace on
+AArch64 — a fork-child first-resume / COW concern to address next, distinct from the
+proof workload. The proof does **not** fake `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`:
+without an observed child waiter it stops at the appropriate diagnostic marker.
+
+No syscall/IPC ABI change, no IPC/cap seam moved, counts unchanged, RPi5 untouched,
+base proofs green. New `stage163b_*` guards pin: the oracle uses one analysis log +
+one helper; `fork` reports failure distinctly; the fork is ordered after `FILL_DONE`
+and before the E2 wait with full diagnostics; and `SEQUENCE_DONE` requires the full
+ordered trail (fork → child-entry/sender-start → waiter-observed → recv-ret →
+sender-done).
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

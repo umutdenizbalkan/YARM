@@ -43217,16 +43217,16 @@ mod stage163_sender_wake_proven {
             ORACLE_SCRIPT.contains("export IPC_RECV_PROOF_SENDER_WAKE=1"),
             "the oracle must enable the boot sub-knob when sender-wake is requested"
         );
-        // Stage 163A: proof_require must analyze the ACTUAL current boot log
-        // ($CORE_LOG) directly, not an in-memory present[] snapshot.
+        // Stage 163B: proof_require must analyze the single analysis log via the
+        // shared marker_present helper, not an in-memory present[] snapshot.
         let pr = ORACLE_SCRIPT
             .split("proof_require() {")
             .nth(1)
             .and_then(|s| s.split("\n}").next())
             .expect("proof_require must exist");
         assert!(
-            pr.contains("\"$CORE_LOG\"") && !pr.contains("${present[@]"),
-            "proof_require must grep the live $CORE_LOG, not the present[] snapshot"
+            pr.contains("marker_present") && !pr.contains("${present[@]"),
+            "proof_require must use marker_present, not the present[] snapshot"
         );
     }
 
@@ -43336,11 +43336,15 @@ mod stage163_sender_wake_proven {
             fill.contains("syscall::ipc_send(") && !fill.contains("ipc_send_timeout_ticks"),
             "the fill phase must use non-blocking ipc_send and never a timed/blocking send"
         );
-        // The timed blocking send is used only inside the child sender branch.
+        // The timed blocking send is used only inside the child sender branch
+        // (the `Some(0) =>` fork arm), bracketed by CHILD_ENTRY .. SENDER_DONE.
         let child = workload
-            .split("if pid == 0 {")
+            .split("IPC_RECV_PROOF_SENDER_WAKE_CHILD_ENTRY")
             .nth(1)
-            .and_then(|s| s.split("// ── PARENT").next())
+            .and_then(|s| {
+                s.split("IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN")
+                    .next()
+            })
             .expect("child branch must exist");
         assert!(
             child.contains("ipc_send_timeout_ticks"),
@@ -43435,6 +43439,164 @@ mod stage163_sender_wake_proven {
         assert!(
             INIT_SERVICE_SRC.contains("ctx.service_extra_cap_1"),
             "init must read E1 capacity from service_extra_cap_1 (slot 14)"
+        );
+    }
+
+    // ── Stage 163B — fork ordering/diagnostics + single-log oracle ─────────────
+
+    // 16. The oracle analyzes ONE consistent run log via ONE helper. proof_require,
+    //     the initial scan, the fatal/required/extended checks all use
+    //     `marker_present` against `$ANALYSIS_LOG`; the core-smoke output is
+    //     captured explicitly and proof_require no longer reads a separate file.
+    #[test]
+    fn stage163b_oracle_single_log_one_helper() {
+        assert!(
+            ORACLE_SCRIPT.contains("ANALYSIS_LOG=\"ipc-oracle-run-$ARCH.log\"")
+                && ORACLE_SCRIPT.contains("marker_present()"),
+            "the oracle must build one analysis log and one marker_present helper"
+        );
+        // The core-smoke output is captured into the analysis log via tee.
+        assert!(
+            ORACLE_SCRIPT.contains("| tee \"$CORE_RUN_LOG\"")
+                && ORACLE_SCRIPT.contains("CORE_STATUS=${PIPESTATUS[0]}"),
+            "the oracle must capture the delegated core-smoke output explicitly"
+        );
+        // proof_require must use marker_present and reference $ANALYSIS_LOG, and must
+        // NOT re-read $CORE_LOG or the present[] snapshot.
+        let pr = ORACLE_SCRIPT
+            .split("proof_require() {")
+            .nth(1)
+            .and_then(|s| s.split("\n}").next())
+            .expect("proof_require must exist");
+        assert!(
+            pr.contains("marker_present \"$seq_marker\"")
+                && pr.contains("marker_present \"$kern_marker\"")
+                && pr.contains("$ANALYSIS_LOG"),
+            "proof_require must evaluate markers via marker_present against $ANALYSIS_LOG"
+        );
+        assert!(
+            !pr.contains("$CORE_LOG") && !pr.contains("${present[@]"),
+            "proof_require must not read a separate $CORE_LOG or the present[] snapshot"
+        );
+    }
+
+    // 17. fork() reports failure distinctly (x86 error lane → None) so the workload
+    //     can emit FORK_FAILED instead of misreading a failed fork as the child.
+    #[test]
+    fn stage163b_fork_reports_failure() {
+        let fork_fn = USER_RT_SRC
+            .split("pub unsafe fn fork()")
+            .nth(1)
+            .and_then(|s| s.split("\n    #[inline]").next())
+            .or_else(|| {
+                USER_RT_SRC
+                    .split("pub unsafe fn fork()")
+                    .nth(1)
+                    .map(|s| &s[..s.len().min(600)])
+            })
+            .expect("fork wrapper must exist");
+        assert!(
+            fork_fn.contains("-> Option<u64>")
+                && fork_fn.contains("ret.error != 0")
+                && fork_fn.contains("return None"),
+            "fork must return None on an ABI-flagged failure (x86 error lane)"
+        );
+    }
+
+    // 18. The fork is ordered AFTER FILL_DONE and BEFORE any E2 wait, with explicit
+    //     diagnostic markers; the parent only polls E2 once it has a child pid.
+    #[test]
+    fn stage163b_fork_ordered_and_diagnosed() {
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .expect("sender-wake workload must exist");
+        // Required ordering markers all present.
+        for marker in &[
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_BEGIN",
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=0 role=child",
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_RET raw=err role=err",
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED",
+            "IPC_RECV_PROOF_SENDER_WAKE_CHILD_ENTRY",
+            "IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN child_pid=",
+        ] {
+            assert!(
+                workload.contains(marker),
+                "fork diagnostics must include `{marker}`"
+            );
+        }
+        // Ordering: FILL_DONE precedes FORK_BEGIN precedes PARENT_WAIT_BEGIN precedes
+        // the E2 poll (ipc_recv_with_deadline(e2_recv, 0)).
+        let i_fill = workload
+            .find("IPC_RECV_PROOF_SENDER_WAKE_FILL_DONE")
+            .expect("FILL_DONE");
+        let i_fork = workload
+            .find("IPC_RECV_PROOF_SENDER_WAKE_FORK_BEGIN")
+            .expect("FORK_BEGIN");
+        let i_wait = workload
+            .find("IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN")
+            .expect("PARENT_WAIT_BEGIN");
+        let i_poll = workload
+            .find("ipc_recv_with_deadline(e2_recv, 0)")
+            .expect("E2 poll");
+        assert!(
+            i_fill < i_fork && i_fork < i_wait && i_wait < i_poll,
+            "fork must happen after FILL_DONE and before the E2 wait/poll"
+        );
+        // A fork failure aborts (returns) rather than spinning on E2.
+        let fail_arm = workload
+            .split("IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED")
+            .nth(1)
+            .map(|s| &s[..s.len().min(60)])
+            .unwrap_or("");
+        assert!(
+            fail_arm.contains("return"),
+            "a fork failure must abort boundedly (return), never poll E2"
+        );
+    }
+
+    // 19. SEQUENCE_DONE cannot be reached without the full ordered trail: the child
+    //     branch markers, the waiter observation, the recv return, and the observed
+    //     child message all precede it in source order.
+    #[test]
+    fn stage163b_sequence_requires_full_ordered_trail() {
+        let workload = INIT_SERVICE_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .and_then(|s| s.split("\n#[cfg(test)]").next())
+            .unwrap_or_else(|| {
+                INIT_SERVICE_SRC
+                    .split("fn run_ipc_recv_proof_sender_wake")
+                    .nth(1)
+                    .expect("workload")
+            });
+        let seq_done = workload
+            .find("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE")
+            .expect("SEQUENCE_DONE");
+        for earlier in &[
+            "IPC_RECV_PROOF_SENDER_WAKE_FORK_BEGIN",
+            "IPC_RECV_PROOF_SENDER_WAKE_SENDER_START",
+            "IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED",
+            "IPC_RECV_PROOF_SENDER_WAKE_RECV_BEGIN",
+            "IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE observed=1",
+        ] {
+            let at = workload
+                .find(earlier)
+                .unwrap_or_else(|| panic!("missing trail marker {earlier}"));
+            assert!(
+                at < seq_done,
+                "`{earlier}` must precede SEQUENCE_DONE in the workload"
+            );
+        }
+        // And SEQUENCE_DONE is still gated on observing the child's message.
+        let after_gate = workload
+            .split("if got_child {")
+            .nth(1)
+            .map(|s| &s[..s.len().min(220)])
+            .unwrap_or("");
+        assert!(
+            after_gate.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "SEQUENCE_DONE must be gated on got_child"
         );
     }
 }
