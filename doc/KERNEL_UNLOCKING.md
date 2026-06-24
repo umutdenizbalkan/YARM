@@ -3719,6 +3719,67 @@ role=parent/child` → `CHILD_ENTRY` → `SENDER_START` → `WAITER_PRESENT tid=
 `WAITER_OBSERVED` → `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` → `SEQUENCE_DONE`; nothing is
 faked.
 
+#### 5.1.9.12 Stage 163F — VM module audit
+
+Before re-running the Stage 163E QEMU smoke, the VM module was audited (14 claims).
+Fixes confined to `vm.rs` (+ tests): `has_mapping_for_phys` now tests whole-run
+containment (was base-only); `VirtAddr::checked_add` + documented wrapping `Add`;
+checked-arithmetic coalescing (`entry_end_virt` saturates, new
+`run_precedes_page`/`page_precedes_run`); `create_user_space` checks a free slot
+before allocating an ASID; `is_canonical` + `map_page` rejects non-canonical x86_64
+VAs; `DrainedMapping` gained `virt`; `acknowledge_shootdown` debug-asserts a nonzero
+bit. Documented/guarded: external-lock contract, `tick_retired_shootdowns`'s
+intentional `0`, `drain_mappings` stack array, linear-scan bound (`const` assert
+`MAX_ADDRESS_SPACES <= 64`), GUARD cache policy, `Asid` never-zero contract. No
+IPC/cap seam moved; counts unchanged; `MAX_ADDRESS_SPACES` stayed 32.
+
+#### 5.1.9.13 Stage 163G — fork-child COW page-fault routing
+
+Stage 163E/163F got the x86_64 sender-wake fork past `Vm(Full)` to a running child
+(`tid=10008`, `task_asid=12`, child CR3 active), but the child then looped on a
+present/write/user fault (`error=0x7`) at a stack address, the handler logging
+`PAGE_FAULT_HANDLED_DEMAND` forever. The fault routing already tries COW before
+demand for write faults, so `HANDLED_DEMAND` means `try_handle_cow_fault` declined
+(the page was not COW-marked) and demand then mis-handled it. Two real bugs fixed:
+
+1. **Demand masked a present write-protect fault.** `try_handle_demand_page_fault`'s
+   `already_mapped` branch did `invalidate_page` + `return Ok(true)` for *any* present
+   page in a demand region — including a present **read-only** page faulting on
+   **write**, which is a protection/COW fault, not a stale-TLB demand fault. It now
+   checks write satisfiability (`!Write || mapping.flags.write`) and **declines**
+   (`Ok(false)`) an unsatisfiable write so the fault routes to COW / task-fault
+   instead of looping on an unchanged RO PTE.
+
+2. **Re-fork did not propagate COW marks.** Stage 163E only COW-marked the child for
+   parent runs that were currently *writable*. But a parent can hold a page
+   **read-only because it is COW-shared from an EARLIER fork** (the proof runs a
+   clean-state smoke fork before the sender-wake fork). Such an RO-COW page was
+   shared with the new child read-only but **not** COW-marked, so the child's first
+   write found it present+RO and not-COW → `try_handle_cow_fault` declined → loop.
+   The clone now also COW-marks the child for any parent page that is currently
+   `is_cow_page` even when its run is read-only (logged `FORK_PROOF_COW_INHERIT_SHARED`),
+   keeping the Stage 163E in-place (no-split) write-protect for writable runs.
+
+**Diagnostics (proof-gated, sender-wake sub-knob only):** `PF_PROOF_CLASSIFY` and
+`PF_PROOF_LOOKUP_MAPPING` (found/writable/cow/demand/phys) at fault entry, and
+`PF_PROOF_COW_CONSIDER`/`_HANDLE_BEGIN`/`_HANDLE_OK`/`_HANDLE_FAIL` in the COW
+handler. These pinpoint, on the next run, whether the faulting page is
+RO-not-COW-marked (fix 2 applies) or writable-in-software-but-RO-in-hardware (a
+distinct page-table-writeback issue for a follow-up). Nothing is faked: the marker
+still comes only from the real split path.
+
+**Regression tests:** `fork_refork_propagates_cow_mark_to_grandchild` (a twice-forked
+parent's RO-COW page is COW-marked in the grandchild and its write yields a private
+writable page) and `demand_declines_present_read_only_write_fault` (demand declines a
+present-RO write, still handles a satisfiable read). New `stage163g_*` guards pin the
+demand write-check, the proof-gated diagnostics, the inherited-COW propagation, and
+the no-seam/no-count/no-RPi5/no-D6 / `MAX_ADDRESS_SPACES==32` invariants.
+
+No syscall/IPC ABI change, no IPC/cap seam moved, counts unchanged
+(`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`), RPi5 untouched, x86_64
+D6/CR3/TSS/PF switch machinery untouched (the fix is confined to page-fault routing
++ COW marking). `MAX_ADDRESS_SPACES` remains 32.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
