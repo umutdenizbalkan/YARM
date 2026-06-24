@@ -79,8 +79,39 @@ and an `image_id` in the runtime spawn table (`initramfs_srv`, `devfs_srv`,
 claim and is **not** consumed by init today — no code selects or applies it.
 Raspberry Pi-specific driver binaries (`uart_srv`, `irqmux_srv`, `rp1_gpio_srv`)
 are deliberately **omitted** until RPi5 userspace actually reaches
-`driver_manager` and those drivers have a validated hardware path. See the
-driver inventory in [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
+`driver_manager` and those drivers have a validated hardware path. The
+firmware-property scaffold is also mock-only: no `rpi_firmware_srv` binary is
+declared, and its entrypoint only logs deferred no-MMIO-grant markers. The
+`driver_manager` likewise requires verified sender identity for privileged
+requests, exposes only sender-scoped inert resource-query data, and will not
+mint fake hardware grants when production hardware control is unavailable. DRS-2
+and DRS-2B add only a hosted fake-DTB parser harness for tests, including bounded
+parent-bus cell inheritance, minimal fake `ranges` translation, and limited
+inert IRQ parsing; it does not parse the live boot DTB. DRS-3 adds an inert
+policy-only spawn-plan generator so tests can explain which candidate services
+would be eligible or blocked without calling PM, spawning, granting caps, or
+touching MMIO. DRS-4 adds a mock spawn-authority decision model that turns those
+plans into inert approvals/denials without calling PM/supervisor services,
+spawning, granting caps, or touching MMIO. DRS-5 adds mock resource-grant bundle
+descriptions; they list inert MMIO/IRQ/DMA/transport/clock/pinmux requirements
+but contain no real `CapId`s and perform no grant operations. RP1 GPIO resources
+remain PCIe/BAR-relative and deferred rather than direct BCM2712 MMIO. DRS-6 adds
+a design-only DM↔PM live-spawn contract in
+[`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md):
+Driver Manager remains advisory/policy-only, and PM remains responsible for
+validation, process creation, address-space setup, accounting, capability
+minting, startup-cap delivery, and handles. DRS-7 adds only an inert
+`DriverSpawnRequest` model with descriptive resource and startup-cap
+requirements. DRS-8 adds an inert PM-validation simulation over those records;
+it models PM checks. DRS-9 adds inert PM accounting/rollback simulation with
+descriptive reservations and rollback steps. DRS-10 adds inert health and
+restart-request modeling. DRS-11 adds inert PM restart validation/accounting and
+rollback simulation for those restart requests. DRS-12 adds inert correlation of
+mock PM process handles, verified driver registration, PM death notification,
+health, and restart requests. These stages still do not call
+PM, spawn/restart,
+grant, mint caps, allocate address spaces, return handles, or touch MMIO. See the driver inventory in
+[`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
 ## Scope warning
 
@@ -90,7 +121,11 @@ This profile does **not** assert that:
   halts in the HH5 diagnostic path);
 - the listed services have Raspberry Pi 5-specific hardware support;
 - device-tree-driven device discovery, MMIO/IRQ resource assignment, or driver
-  spawning is implemented;
+  spawning is implemented (DRS-1 through DRS-5 add only a userspace-only fake
+  inventory, fail-closed authorization model, inert read-only resource query
+  model, hosted fake-DTB/parser-bus harness, and policy-only spawn-plan model in
+  `driver_manager` tests, plus mock spawn-authority decisions and resource-grant
+  bundle descriptions);
 - the manifest is handed to init; or
 - any listed service is spawned because this file exists.
 

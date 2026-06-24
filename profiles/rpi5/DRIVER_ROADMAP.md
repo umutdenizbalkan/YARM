@@ -8,7 +8,9 @@ current high-half (HH) diagnostic boot to a first safe driver spawn. This is a
 **conservative audit**, not a feature claim. Hardware bring-up detail is owned by
 [`doc/RPI5_BRINGUP.md`](../../doc/RPI5_BRINGUP.md); driver/IRQ contracts live in
 [`doc/DRIVER_PROTOCOL.md`](../../doc/DRIVER_PROTOCOL.md) and
-[`doc/IRQMUX_CONTRACT.md`](../../doc/IRQMUX_CONTRACT.md).
+[`doc/IRQMUX_CONTRACT.md`](../../doc/IRQMUX_CONTRACT.md). The future live
+Driver Manager ↔ Process Manager spawn boundary is documented in
+[`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md).
 
 ## 1. Current verified boot status
 
@@ -72,7 +74,7 @@ state 9 today.
 | `uart_srv` (generic) | 1,3,4,5,7,8 | No (no `image_id`) | Yes | `UartDeviceOps` trait; `run()` logs `UART_SRV_DEFERRED_NO_MMIO_GRANT`. |
 | PL011 backend | 2,3,4 | n/a | Yes | `Pl011UartDevice<B: UartRegisterIo>`; DR/FR/IBRD/FBRD/LCRH/CR/IMSC/ICR; MMIO abstracted, mock-safe, nonblocking. |
 | `console_driver` bin | 5,7 | No | Indirect | Build-declared bin; its `run()` calls `run_devfs()`. Not in spawn table; the live devfs is `devfs_srv`. |
-| mailbox / RPi firmware property (`drivers/firmware/rpi`) | 2,3,4,7,8 | No (no bin) | Yes | `RpiPropertyTransport` trait + property tags; `run()` is empty; real MMIO transport deferred; **no `rpi_firmware_srv` bin**. |
+| mailbox / RPi firmware property (`drivers/firmware/rpi`) | 2,3,4,7,8 | No (no bin) | Yes | `RpiPropertyTransport` trait + property tags; `run()` emits `RPI_FIRMWARE_SRV_ENTRY` and `RPI_FIRMWARE_SRV_DEFERRED_NO_MMIO_GRANT`; real MMIO transport deferred; **no `rpi_firmware_srv` bin**. |
 | generic GPIO (`drivers/gpio`) | 1,3 | n/a | Yes | `GpioDeviceOps` trait + pin/mode/pull/direction types; no registers/discovery. |
 | `rp1_gpio_srv` | 2,3,4,5,7,8 | No (no `image_id`) | Yes | `Rp1GpioDevice<B: RegisterIo>` over RP1 GPIO_CTRL/SYS_RIO/PADS (54 pins); `run()` logs `RP1_GPIO_SRV_DEFERRED_NO_MMIO_GRANT`. |
 | `irqmux_srv` | 1,3,4,5,7,8 | No (no `image_id`) | Yes (software model) | `IrqMuxService` software route/grant authorization; real recv loop; **no GIC / RP1 hardware wiring**. See `doc/IRQMUX_CONTRACT.md`. |
@@ -107,7 +109,7 @@ state 9 today.
 - Missing: real MMIO mailbox transport (channel-8 doorbell/status polling), bus
   vs. physical address translation, cache maintenance and 16-byte buffer
   alignment, and post-HH4 high-VA safety. No service binary is declared and
-  `run()` is empty — it is a scaffold, not a driver. Note that BCM2712/Pi 5
+  `run()` only logs deferred markers — it is a scaffold, not a driver. Note that BCM2712/Pi 5
   firmware-interface specifics differ from the legacy VideoCore mailbox and must
   be validated against the Pi 5 firmware before any transport is enabled.
 
@@ -137,11 +139,66 @@ state 9 today.
   registry with `REGISTER`, `GRANT_IRQ`, `GRANT_DMA`, `RESTARTED`, backed by
   kernel runtime ops that mint/grant IRQ and DMA-region capabilities and restart
   tasks. Emits `DRIVER_MANAGER_READY`.
-- Missing for an RPi5 first driver spawn: it does **not** parse the DTB, does
-  **not** enumerate or classify devices (`DriverClass::Unknown` only; MMIO/IOPORT
-  bind opcodes, device-enumeration, and heartbeat/watchdog are explicit TODOs),
-  and does **not** spawn driver binaries (PM remains the spawn authority). On
-  RPi5 it is additionally blocked because userspace is not reached.
+- Missing for an RPi5 first driver spawn: it does **not** parse the DTB or
+  spawn driver binaries (PM remains the spawn authority).
+  DRS-1 adds only an inert userspace inventory model: `DeviceClass`
+  (`Uart`, `Mailbox`, `Gpio`, `IrqMux`, `Block`, `Unknown`) plus
+  `DeviceRecord` compatible strings, MMIO ranges, IRQ lines, candidate driver
+  names, and deferred status. DRS-1B makes that inventory an inert
+  authorization input: privileged requests require verified sender identity,
+  payload TIDs cannot authorize another driver, listed resources must match the
+  assigned device record, and deferred/unknown records fail closed. DRS-1C adds
+  sender-scoped read-only queries for a driver's own assigned record, MMIO
+  ranges, IRQ lines, candidate/class, DMA-constraint placeholder, and deferred
+  status; these replies are descriptive data only and never carry caps. DRS-2
+  adds a hosted fake-FDT parser harness that accepts bounded synthetic RPi5-style
+  nodes and produces the same inert records for tests only; it does not parse the
+  live boot DTB. DRS-2B hardens that harness around root/child
+  `#address-cells` / `#size-cells` inheritance, minimal fake `ranges`
+  translation, malformed `reg` / `ranges` / IRQ rejection, and no-`ranges`
+  identity behavior for descriptive test buses. Hosted tests use fake PL011, RP1
+  GPIO below a PCIe/RP1-style parent, firmware mailbox, irqmux, disabled, and
+  unknown-compatible nodes without spawning drivers. RP1 GPIO remains
+  PCIe/BAR-relative and `DeferredNoMmioGrant`; it must not become a direct
+  BCM2712 MMIO range. DRS-3 adds a policy-only spawn-plan generator over inert
+  inventory records. The plan can mark a hosted-test PL011 record as
+  `WouldSpawn`, keep RP1 GPIO deferred on PCIe/BAR and MMIO blockers, keep
+  mailbox/firmware deferred on transport/cache/MMIO policy, keep irqmux deferred
+  on IRQ-routing policy, and mark unknown devices unsupported. It is descriptive
+  only: no PM call, no live spawn, no grant, no cap, and no MMIO. DRS-4 consumes
+  those plan entries with a mock spawn-authority policy to produce inert
+  approvals/denials. Only `WouldSpawn` entries approved by the mock policy become
+  approved records; deferred RP1 GPIO, mailbox/firmware, irqmux, unknown, and
+  already-running entries remain denials carrying their blockers/reasons. This is
+  still not a PM/supervisor call and cannot spawn. DRS-5 adds mock
+  resource-grant bundles: approved fake PL011 entries describe inert
+  MMIO/IRQ/clock/pinmux requirements, denied/deferred entries describe blocked
+  requirements only, RP1 remains blocked on PCIe/BAR and MMIO authority, and
+  mailbox/firmware remains blocked on transport/cache/MMIO policy. Bundles do
+  not contain real `CapId`s, transfer caps, call grant syscalls, or touch MMIO.
+  DRS-6 documents the future live Driver Manager ↔ Process Manager spawn
+  contract in [`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md):
+  Driver Manager remains policy/advisory-only and builds future
+  `DriverSpawnRequest`s, while PM remains the mechanism owner for validation,
+  process creation, address spaces, accounting, capability minting, startup-cap
+  delivery, and handles. DRS-6 adds no live spawn path, grants, caps, PM calls,
+  MMIO, or live-DTB parsing. DRS-7 adds a bounded inert
+  `DriverSpawnRequestBundle` / `DriverSpawnRequest` model over the existing
+  inventory, spawn-plan, mock-authority, and resource-bundle pipeline; its
+  resource and startup-cap requirements are descriptive only. PL011 can become
+  `ReadyForPmValidation` in hosted data. DRS-8 adds an inert PM-validation
+  simulation that can mark that PL011 request `WouldAccept` only under mock
+  verified-DM-identity/image/resource/startup-cap policy. DRS-9 can then model
+  descriptive PL011 reservations and reverse-order rollback plans. DRS-10 can
+  model PL011 health, crash, and an inert PM-facing restart request. DRS-11 can
+  simulate PM restart validation/accounting, replacement reservations, and
+  reverse-order rollback for that inert request. DRS-12 can correlate the mock
+  PL011 PM handle, verified driver registration, PM death notification, health,
+  and restart request, while RP1 GPIO and mailbox remain deferred/BAR- or
+  transport/cache/MMIO-blocked and no live PM call or restart occurs.
+  Production no-op hardware control now returns errors and never fabricates
+  `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
+  reached.
 
 ## 5. Driver-manager integration plan (RPi5)
 
@@ -151,9 +208,15 @@ state 9 today.
    virtual pointer already proven at HH4 (`RPI5_HH4_DTB_VIRT_OK`), and a
    read-only device inventory derived from it — **without** starting any
    hardware-heavy driver.
-3. Extend the driver ABI/registry with device records (compatible string, MMIO
-   region, IRQ line, DMA constraints) instead of the current `Unknown` class.
-4. Only then register/grant resources to a driver and let PM spawn it, gated per
+3. Promote the DRS-2/DRS-2B fake-FDT parser plus DRS-3 through DRS-5
+   plan/authority/grant-bundle models into a live-DTB design only after sender
+   identity, resource-grant policy, PCIe/RP1 BAR discovery, IRQ routing, and PM
+   spawn authority are specified; until then they remain hosted/inert planning
+   harnesses.
+4. Keep the live driver-manager ↔ PM spawn-authority and startup-cap contract
+   design in [`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md)
+   as the gate before any live spawn path.
+5. Only then register/grant resources to a driver and let PM spawn it, gated per
    the safe-driver ordering in milestone RPi5-DRV-2.
 
 ## 6. Hardware-reference notes (conceptual, no GPL code copied)
