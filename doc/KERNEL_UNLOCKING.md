@@ -3648,6 +3648,77 @@ untouched, x86_64 D6/CR3/TSS/PF logic untouched. New `stage163d_*` guards pin th
 diagnostics, the raised bound (with hosted-dev held at 16), the unchanged pool
 derivations, and the no-seam/no-count/no-RPi5/no-D6 invariants.
 
+> **Correction (Stage 163E).** The Stage 163D 32→48 bump was a *misdiagnosis*. The
+> next run's diagnostics showed `asid_used=11 asid_cap=48 asid_retired=0` — the ASID
+> table was never the binding structure. The real `Vm(Full)` was at
+> `site=map_parent index=127`, and the failed fork *leaked* the parent table from
+> `vmas_used=80` to `128`. Stage 163E reverts the bump and fixes the actual bug.
+
+#### 5.1.9.11 Stage 163E — transactional, run-preserving COW fork clone
+
+Stage 163D's per-site diagnostics localised the failure precisely: the COW clone
+fails at `map_parent index=127` with `Vm(Full)`, and — critically — a *failed* fork
+leaves the parent mutated (`vmas_used` 80 → 128), so the second fork starts already
+full. So the bug was twofold: a non-transactional mutation/leak, AND a table balloon.
+
+**Root cause.** The old `clone_user_address_space_cow` iterated the *live* parent
+table and re-mapped each page write-protected. Re-mapping a single page inside a
+multi-page run **splits** that run (the map primitive isolates the page), so the
+loop then walked the split-off tails and kept splitting — ballooning the parent
+table one entry per page until it hit `MAX_MAPPINGS = 128` and failed at
+`map_parent`. The only rollback (`restore_parent_write_permissions`) restored write
+*permission* but never undid the *splits*, so the parent stayed bloated. This is
+`asid_used=11/48` proof that ASIDs were irrelevant — the binding structure was the
+per-ASID mapping (VMA) table.
+
+**Fix — snapshot + preflight + in-place write-protect + full rollback.** The COW
+fault handler (`try_handle_cow_fault`) already splits a run lazily on the first
+write, so eager per-page splitting at clone time is unnecessary. The rewritten clone:
+
+1. **Snapshots** the parent's runs `(head virt, phys, flags, pages)` before any
+   mutation and iterates the *snapshot*, never the live table (no runaway).
+2. **Preflights**: the child needs at most one entry per parent run (adjacent
+   same-flag pages MERGE in the child, never grow) and the parent is write-protected
+   in place (entry count unchanged), so the only bindable capacity is the child
+   table. If `required_child > MAX_MAPPINGS` it returns `Vm(Full)` **before any
+   mutation** — a rejected fork leaves the parent byte-identical.
+3. **Maps whole runs into the child** page-by-page (they merge → run-compact).
+4. **Write-protects each parent run IN PLACE** via the new
+   `AddressSpace::write_protect_run_head_in_place` — clears the run's write flag and
+   updates every page's hardware PTE but does **not** split the entry, so the parent
+   table never grows. The per-page split happens lazily on the first write.
+5. **Records every parent write-protect** and, on any later failure, calls
+   `rollback_cow_clone`: destroy the partial child, restore each parent run's flags
+   in place, and clear the COW marks — leaving the parent byte-identical.
+
+Because the parent table no longer balloons (init's 80 runs stay 80) and the child
+stays run-compact (≤ 80), the fork now fits comfortably in `MAX_MAPPINGS = 128`
+**with no capacity bump** — so Stage 163E also **reverts** the Stage 163D
+`MAX_ADDRESS_SPACES` 48 → 32 (the well-tested value; `asid_used=11` leaves ample
+headroom).
+
+**Diagnostics** (proof-gated): `FORK_PROOF_COW_STATS_BEFORE`,
+`FORK_PROOF_COW_PREFLIGHT required_parent/available_parent/required_child/available_child`,
+`FORK_PROOF_COW_MAP_PARENT_BEGIN/OK/FAIL`, `FORK_PROOF_COW_ROLLBACK_BEGIN/DONE`, and
+`FORK_PROOF_COW_STATS_AFTER_FAIL` (which must show `parent_used` equal to its
+pre-clone value). **Regression tests**: `write_protect_run_head_in_place_does_not_
+split_or_grow` (data-structure level: a 4-page run stays one entry through
+write-protect + restore) and `fork_cow_clone_is_transactional_no_parent_mapping_leak`
+(integration level: two successive forks leave the parent entry count unchanged).
+All 26 existing COW/fork tests still pass (single-page mappings behave identically —
+in-place == old for `pages == 1`).
+
+No syscall/IPC ABI change, no IPC/cap seam moved, counts unchanged
+(`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`, fork still NR 12), RPi5 boot
+untouched, x86_64 D6/CR3/TSS/PF logic untouched. New `stage163e_*` guards pin the
+transactional preflight/rollback, the in-place (no-split) parent write-protect, and
+the reverted bound; the stale `stage163d` ASID-bump guard was updated to assert the
+revert. Sender-wake remains pending a real run, where the expected trail is
+`FORK_SMOKE ... err=0` → `FORK_SMOKE_CHILD_ENTRY`, then `FILL_DONE` → `FORK_RET
+role=parent/child` → `CHILD_ENTRY` → `SENDER_START` → `WAITER_PRESENT tid=<child>` →
+`WAITER_OBSERVED` → `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` → `SEQUENCE_DONE`; nothing is
+faked.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
