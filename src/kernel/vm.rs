@@ -652,6 +652,91 @@ impl AddressSpace {
         })
     }
 
+    /// Stage 163E: like [`Self::mapping_at`], but also exposes the run's page count.
+    /// A COW fork uses this to copy a whole run into the child and write-protect the
+    /// parent run *in place* (without splitting it into per-page entries), so the
+    /// parent mapping table does not balloon during the clone.
+    pub fn run_at(&self, index: usize) -> Option<(VirtAddr, Mapping, usize)> {
+        if index >= self.len {
+            return None;
+        }
+        let entry = self.entries[index]?;
+        Some((entry.virt, entry.mapping, entry.pages))
+    }
+
+    /// Stage 163E: clear the write flag of the entire run whose head is exactly
+    /// `virt`, updating the hardware PTE of every page in the run but NOT splitting
+    /// the software entry — so `len` is unchanged. Returns the previous flags for
+    /// rollback. A run that is already read-only is left untouched. This supports
+    /// COW fork: a writable run becomes one read-only run, and the per-page split
+    /// happens lazily in `try_handle_cow_fault` on the first write. On a hardware
+    /// failure mid-run the already-updated pages are restored before returning.
+    pub fn write_protect_run_head_in_place(
+        &mut self,
+        virt: VirtAddr,
+    ) -> Result<PageFlags, VmError> {
+        let idx = self
+            .find_entry_index(virt)
+            .map_err(|_| VmError::InvalidAddress)?;
+        let entry = self.entries[idx].expect("entry");
+        let old = entry.mapping.flags;
+        if !old.write {
+            return Ok(old);
+        }
+        let mut new = old;
+        new.write = false;
+        let base = entry.virt;
+        let base_phys = entry.mapping.phys;
+        let pages = entry.pages;
+        for p in 0..pages {
+            let pv = VirtAddr(base.0 + p as u64 * PAGE_SIZE as u64);
+            let pp = PhysAddr(base_phys.0 + p as u64 * PAGE_SIZE as u64);
+            if let Err(e) = arch_map_page(
+                self.asid,
+                pv,
+                Mapping {
+                    phys: pp,
+                    flags: new,
+                },
+            ) {
+                for q in 0..p {
+                    let qv = VirtAddr(base.0 + q as u64 * PAGE_SIZE as u64);
+                    let qp = PhysAddr(base_phys.0 + q as u64 * PAGE_SIZE as u64);
+                    let _ = arch_map_page(
+                        self.asid,
+                        qv,
+                        Mapping {
+                            phys: qp,
+                            flags: old,
+                        },
+                    );
+                }
+                return Err(e);
+            }
+        }
+        self.entries[idx].as_mut().expect("entry").mapping.flags = new;
+        Ok(old)
+    }
+
+    /// Stage 163E: rollback companion to [`Self::write_protect_run_head_in_place`].
+    /// Best-effort: restore the run head's flags (software + every page's hardware
+    /// PTE) so a failed COW fork leaves the parent byte-identical to before.
+    pub fn restore_run_head_flags_in_place(&mut self, virt: VirtAddr, flags: PageFlags) {
+        let Ok(idx) = self.find_entry_index(virt) else {
+            return;
+        };
+        let entry = self.entries[idx].expect("entry");
+        let base = entry.virt;
+        let base_phys = entry.mapping.phys;
+        let pages = entry.pages;
+        for p in 0..pages {
+            let pv = VirtAddr(base.0 + p as u64 * PAGE_SIZE as u64);
+            let pp = PhysAddr(base_phys.0 + p as u64 * PAGE_SIZE as u64);
+            let _ = arch_map_page(self.asid, pv, Mapping { phys: pp, flags });
+        }
+        self.entries[idx].as_mut().expect("entry").mapping.flags = flags;
+    }
+
     pub fn has_mapping_for_phys(&self, phys: PhysAddr) -> bool {
         self.entries[..self.len]
             .iter()
@@ -1256,6 +1341,74 @@ mod tests {
             assert!(mgr.create_user_space().is_ok());
         }
         assert_eq!(mgr.create_user_space(), Err(VmError::Full));
+    }
+
+    // Stage 163E regression: write-protecting a multi-page run for COW must update
+    // the run's flags IN PLACE, never split it into per-page entries. The prior
+    // per-page re-map split runs and ballooned the parent table to MAX_MAPPINGS,
+    // failing fork with Vm(Full) and leaking the parent's entry count.
+    #[test]
+    fn write_protect_run_head_in_place_does_not_split_or_grow() {
+        let mut aspace = AddressSpace::new_user();
+        let rw = PageFlags {
+            read: true,
+            write: true,
+            execute: false,
+            user: true,
+            cache_policy: CachePolicy::WriteBack,
+        };
+        // Four contiguous (VA+PA) same-flag pages merge into ONE run entry.
+        for p in 0..4u64 {
+            let virt = VirtAddr(0x10_000 + p * PAGE_SIZE as u64);
+            let phys = PhysAddr(0x40_000 + p * PAGE_SIZE as u64);
+            assert_eq!(aspace.map_page(virt, Mapping { phys, flags: rw }), Ok(None));
+        }
+        assert_eq!(
+            aspace.mappings(),
+            1,
+            "4 contiguous same-flag pages must form one run"
+        );
+        assert_eq!(aspace.run_at(0).expect("run").2, 4, "run is 4 pages");
+
+        // Write-protect the run head in place: NO split (len stays 1), whole run RO.
+        let old = aspace
+            .write_protect_run_head_in_place(VirtAddr(0x10_000))
+            .expect("write-protect run");
+        assert!(old.write, "returned previous flags must be writable");
+        assert_eq!(
+            aspace.mappings(),
+            1,
+            "write-protect must not split the run (no bloat)"
+        );
+        let (_v, m, pages) = aspace.run_at(0).expect("run");
+        assert!(!m.flags.write, "run must be read-only after write-protect");
+        assert_eq!(pages, 4, "run page count unchanged");
+
+        // Rollback restores the writable flag in place (still one entry).
+        aspace.restore_run_head_flags_in_place(VirtAddr(0x10_000), old);
+        assert_eq!(aspace.mappings(), 1, "restore must not split either");
+        assert!(
+            aspace.run_at(0).expect("run").1.flags.write,
+            "rollback restores the writable flag"
+        );
+
+        // An already-read-only run is left untouched (idempotent, no split).
+        let mut ro_space = AddressSpace::new_user();
+        assert_eq!(
+            ro_space.map_page(
+                VirtAddr(0x20_000),
+                Mapping {
+                    phys: PhysAddr(0x50_000),
+                    flags: PageFlags::USER_RX,
+                }
+            ),
+            Ok(None)
+        );
+        let prev = ro_space
+            .write_protect_run_head_in_place(VirtAddr(0x20_000))
+            .expect("noop write-protect");
+        assert!(!prev.write);
+        assert_eq!(ro_space.mappings(), 1);
     }
 
     #[test]

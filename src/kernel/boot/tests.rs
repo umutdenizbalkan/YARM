@@ -7347,6 +7347,54 @@ fn fork_both_exit_reclaims_shared_frame() {
     );
 }
 
+// Stage 163E regression: a COW fork must not grow the parent's mapping table, and
+// repeated forks must each start from the same parent entry count (no leak). The
+// prior per-page-split algorithm ballooned the parent table and left it mutated.
+#[test]
+fn fork_cow_clone_is_transactional_no_parent_mapping_leak() {
+    let mut state = Bootstrap::init().expect("init");
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(61).expect("parent");
+    state.bind_task_asid(61, parent_asid).expect("bind parent");
+    state.enqueue_current_cpu(61).expect("enqueue");
+    state.yield_current().expect("switch to task61");
+
+    for v in [0x10000u64, 0x11000, 0x12000] {
+        let (_id, cap) = state.alloc_anonymous_memory_object().expect("mem");
+        state
+            .map_user_page_in_asid_with_caps(parent_asid, cap, VirtAddr(v), PageFlags::USER_RW)
+            .expect("map parent");
+    }
+    let before = state
+        .with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()))
+        .expect("parent count");
+
+    // First fork: parent entry count must be unchanged (in-place write-protect).
+    let c1 = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("fork 1");
+    let after1 = state
+        .with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()))
+        .expect("parent count");
+    assert_eq!(
+        before, after1,
+        "fork must not grow the parent mapping table (no per-page-split balloon)"
+    );
+
+    // Second fork must start from the SAME parent count (no accumulation/leak).
+    let c2 = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("fork 2");
+    let after2 = state
+        .with_user_spaces(|s| s.get(parent_asid).map(|a| a.mappings()))
+        .expect("parent count");
+    assert_eq!(
+        before, after2,
+        "repeated fork must not accumulate parent entries"
+    );
+    assert_ne!(c1, c2, "each fork yields a distinct child address space");
+}
+
 #[test]
 fn fork_cow_write_fault_gives_child_private_frame() {
     // After fork, a write to a COW page in the child must allocate a new
@@ -43774,25 +43822,26 @@ mod stage163_sender_wake_proven {
         );
     }
 
-    // 26. The Vm(Full) fix: the bare-metal user-address-space bound was raised to 48
-    //     on all three arches (hosted-dev stays 16, so unit-test capacity behavior is
-    //     unchanged). All three arches share the bump (the COW path is arch-shared).
+    // 26. Stage 163E reverted the Stage 163D 32 -> 48 bump: diagnostics proved the
+    //     ASID table was NOT the binding structure (asid_used=11/48), so the bound is
+    //     back to the well-tested 32 on all three arches (hosted-dev stays 16). The
+    //     real fix is the transactional run-preserving COW clone, not capacity.
     #[test]
-    fn stage163d_address_space_bound_raised_for_fork_headroom() {
+    fn stage163d_address_space_bound_reverted_not_the_binding_structure() {
         for (arch, src) in &[
             ("x86_64", X86_VM_LAYOUT_SRC),
             ("aarch64", AARCH64_VM_LAYOUT_SRC),
             ("riscv64", RISCV64_VM_LAYOUT_SRC),
         ] {
             assert!(
-                src.contains("#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 48;"),
-                "{arch} bare-metal MAX_ADDRESS_SPACES must be raised to 48 for fork headroom"
+                src.contains("#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"),
+                "{arch} bare-metal MAX_ADDRESS_SPACES must be reverted to 32"
             );
             assert!(
                 src.contains(
                     "#[cfg(feature = \"hosted-dev\")]\npub const MAX_ADDRESS_SPACES: usize = 16;"
                 ),
-                "{arch} hosted-dev MAX_ADDRESS_SPACES must remain 16 (unit-test capacity unchanged)"
+                "{arch} hosted-dev MAX_ADDRESS_SPACES must remain 16"
             );
         }
     }
@@ -43841,6 +43890,127 @@ mod stage163_sender_wake_proven {
             assert!(
                 !X86_VM_LAYOUT_SRC.contains(forbidden),
                 "vm_layout must not reference the {forbidden} path"
+            );
+        }
+    }
+
+    // ── Stage 163E — transactional, run-preserving COW fork clone ──────────────
+
+    // 29. The COW clone is transactional: it snapshots the parent first, preflights
+    //     child capacity (rejecting BEFORE any mutation), and rolls back fully on a
+    //     mid-clone failure. The before/after parent-count diagnostics are present.
+    #[test]
+    fn stage163e_cow_clone_is_transactional() {
+        // Preflight + before/after stats + rollback markers exist.
+        for marker in &[
+            "FORK_PROOF_COW_STATS_BEFORE parent_used=",
+            "FORK_PROOF_COW_PREFLIGHT required_parent=",
+            "FORK_PROOF_COW_FAIL_DETAIL site=preflight_child",
+            "FORK_PROOF_COW_ROLLBACK_BEGIN parent_used=",
+            "FORK_PROOF_COW_ROLLBACK_DONE parent_used=",
+            "FORK_PROOF_COW_STATS_AFTER_FAIL parent_used=",
+            "FORK_PROOF_COW_MAP_PARENT_BEGIN",
+            "FORK_PROOF_COW_MAP_PARENT_OK",
+            "FORK_PROOF_COW_MAP_PARENT_FAIL",
+        ] {
+            assert!(
+                MEMORY_STATE_SRC.contains(marker),
+                "COW clone must emit `{marker}`"
+            );
+        }
+        // Preflight rejects BEFORE mutating: within the clone function, the
+        // over-capacity check returns before create_user_space is called.
+        let clone_fn = MEMORY_STATE_SRC
+            .split("fn clone_user_address_space_cow(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn rollback_cow_clone(").next())
+            .expect("clone fn");
+        let i_preflight = clone_fn
+            .find("if required_child > available_child {")
+            .expect("preflight check");
+        let i_create = clone_fn
+            .find("spaces.create_user_space()")
+            .expect("create_user_space");
+        assert!(
+            i_preflight < i_create,
+            "preflight must run before create_user_space (no mutation on reject)"
+        );
+        // The clone uses a snapshot + rollback helper, not the live-table walk.
+        assert!(
+            MEMORY_STATE_SRC.contains("fn rollback_cow_clone(")
+                && MEMORY_STATE_SRC.contains(
+                    "let snapshot: alloc::vec::Vec<(VirtAddr, PhysAddr, PageFlags, usize)>"
+                ),
+            "the clone must snapshot the parent and have a rollback helper"
+        );
+    }
+
+    // 30. The parent is write-protected IN PLACE (no per-page split): the clone uses
+    //     the run-level write_protect helper, and there is a regression test proving
+    //     a multi-page run is not split (no parent table balloon).
+    #[test]
+    fn stage163e_parent_write_protect_is_in_place() {
+        assert!(
+            VM_SRC.contains("pub fn write_protect_run_head_in_place(")
+                && VM_SRC.contains("pub fn restore_run_head_flags_in_place(")
+                && VM_SRC.contains("pub fn run_at("),
+            "AddressSpace must expose run_at + in-place write-protect/restore helpers"
+        );
+        // The in-place write-protect must NOT touch `self.len` (no split).
+        let wp = VM_SRC
+            .split("pub fn write_protect_run_head_in_place(")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub fn ").next())
+            .expect("write_protect fn");
+        assert!(
+            !wp.contains("self.len"),
+            "in-place write-protect must not modify the entry count (no split)"
+        );
+        // The clone drives the parent write-protect via the in-place helper, not via
+        // a second map_user_page_in_asid_raw on the parent.
+        assert!(
+            MEMORY_STATE_SRC.contains("write_protect_run_head_in_place(virt)"),
+            "the clone must write-protect the parent run in place"
+        );
+        // Regression tests exist (data-structure level + integration level).
+        assert!(
+            VM_SRC.contains("fn write_protect_run_head_in_place_does_not_split_or_grow"),
+            "a no-split regression test must exist"
+        );
+    }
+
+    // 31. The fix moved no IPC/cap seam, kept counts, left RPi5 + D6/CR3/TSS/PF
+    //     untouched, and reverted the misdiagnosed ASID bump.
+    #[test]
+    fn stage163e_no_seam_no_count_no_rpi5_no_d6() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        // The COW clone change is confined to VM state — it must not reference RPi5
+        // boot or the x86 D6/CR3/TSS/PF machinery.
+        let clone = MEMORY_STATE_SRC
+            .split("fn clone_user_address_space_cow(")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn copy_frame_contents_for_cow(").next())
+            .expect("clone fn");
+        for forbidden in &["rpi5", "RPi5", "bcm2712", "D6_", "CR3", "TSS"] {
+            assert!(
+                !clone.contains(forbidden),
+                "COW clone must not reference the {forbidden} path"
             );
         }
     }
