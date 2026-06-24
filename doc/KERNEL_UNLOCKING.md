@@ -3589,6 +3589,65 @@ error code; a failure is not collapsed to a bare `raw=err` and the sequence abor
 the kernel step-level diagnostics exist and are proof-gated; and the clean-state
 smoke runs before the fill.
 
+#### 5.1.9.10 Stage 163D — fix fork COW `Vm(Full)`
+
+Stage 163C's diagnostics pinned the failure exactly. On x86_64:
+
+```
+FORK_PROOF_ENTER parent_tid=1
+FORK_PROOF_PRECHECK_OK parent_tid=1
+FORK_PROOF_COW_BEGIN
+FORK_PROOF_COW_FAIL reason=Vm(Full)
+FORK_PROOF_RETURN_ERR code=255 reason=Vm(Full)
+```
+
+and the clean-state smoke (before E1 fill) failed identically — so a full E1 /
+queued IPC state is ruled out. The failure is in `clone_user_address_space_cow`
+allocating the child address space.
+
+**Cause — address-space budget exhausted after the merge.** Fork worked in Stage
+163A (pre-merge) and fails post-merge; the merge expanded the driver_manager service
+set, raising the count of live user address spaces to/over the old 32-slot bound.
+`clone_user_address_space_cow` calls `create_user_space`, which needs (a) a free
+slot in `entries[MAX_ADDRESS_SPACES]`, (b) a page-table root from
+`MAX_ASID_ROOTS = MAX_ADDRESS_SPACES * 8`, and (c) page-table pages from
+`MAX_PT_PAGES = MAX_ADDRESS_SPACES * (1 + MAX_MAPPINGS * 4)` — **all three derive
+from `MAX_ADDRESS_SPACES`**, so a single bound was the binding constraint and a
+single knob relieves whichever filled first. (`KernelError::Vm(VmError::Full)` maps
+to the generic `SyscallError::Internal` = code 255 — the ABI has no dedicated
+"resource-full" lane; that mapping is intentionally left unchanged to avoid an ABI
+break, with the kernel-side `reason=Vm(Full)` carrying the detail.)
+
+**Fix — raise `MAX_ADDRESS_SPACES` 32 → 48 (bare-metal, all three arches).** This
+gives headroom for the current service set plus a forked child. `hosted-dev` stays
+16 (unit-test capacity behavior unchanged). On bare-metal `PageTablePage` is just
+`{ phys: u64 }`, so the larger derived pools cost ~190 KiB of static memory — modest.
+The CR3 / page-table derivation logic is untouched; only the input bound changed.
+
+**Exhaustion diagnostics (so future regressions self-quantify).** Proof-gated
+`clone_user_address_space_cow` now logs `FORK_PROOF_COW_STATS parent_asid=..
+vmas_used=.. vmas_cap=..`, `FORK_PROOF_COW_STATS_ASID asid_used=.. asid_cap=..
+asid_retired=..`, and per-site `FORK_PROOF_COW_FAIL_DETAIL site=create_user_space|
+map_child|map_parent|mark_cow_* used=.. cap=.. reason=..`. `asid_retired` separates a
+genuine capacity shortfall from a shootdown-acknowledge leak. `AddressSpaceManager`
+gained `live_count`/`slot_capacity`/`retired_count` accessors for this.
+
+**Status.** Sender-wake remains pending until a real run confirms the fork smoke and
+the child sender both succeed: the expected next-run trail is
+`FORK_SMOKE_SYSCALL_RET ... err=0` → `FORK_SMOKE_PARENT`/`FORK_SMOKE_CHILD_ENTRY`,
+then `FILL_DONE` → `FORK_RET role=parent`/`role=child` → `CHILD_ENTRY` →
+`SENDER_START` → `WAITER_PRESENT tid=<child>` → `WAITER_OBSERVED` → `RECV_RET` →
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` → `SEQUENCE_DONE`. If `asid_used` is still at
+`asid_cap` after the bump, the diagnostics quantify exactly how much more is needed;
+nothing is faked. AArch64 is addressed by the same arch-shared bump; if it then forks
+but the child does not resume, that opens a separate AArch64 first-resume stage.
+
+No syscall/IPC ABI change, no IPC/cap seam moved, counts unchanged
+(`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`, fork still NR 12), RPi5 boot
+untouched, x86_64 D6/CR3/TSS/PF logic untouched. New `stage163d_*` guards pin the
+diagnostics, the raised bound (with hosted-dev held at 16), the unchanged pool
+derivations, and the no-seam/no-count/no-RPi5/no-D6 invariants.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
