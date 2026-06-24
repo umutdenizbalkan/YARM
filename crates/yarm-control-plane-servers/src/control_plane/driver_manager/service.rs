@@ -2289,6 +2289,10 @@ impl DriverRestartRequest {
         bounded_str(&self.compatible, self.compatible_len)
     }
 
+    pub fn driver_candidate(&self) -> Option<&str> {
+        bounded_str(&self.driver_candidate, self.driver_candidate_len)
+    }
+
     pub fn has_blocker(&self, blocker: DriverRestartBlocker) -> bool {
         self.blockers.iter().any(|entry| *entry == Some(blocker))
     }
@@ -2437,6 +2441,726 @@ fn apply_restart_policy(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartValidationStatus {
+    WouldAcceptRestart,
+    WouldRejectRestart,
+    Deferred,
+    Unsupported,
+    AlreadyRunning,
+    AlreadyRestartPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartValidationFailure {
+    MissingVerifiedDriverManager,
+    RestartRequestNotReady,
+    RestartLimitExceeded,
+    DeviceDeferred,
+    DeviceUnsupported,
+    MissingOriginalSpawnRequest,
+    MissingOriginalAccountingRecord,
+    ResourcePolicyDenied,
+    MissingMmioAuthority,
+    MissingIrqRouting,
+    MissingDmaPolicy,
+    MissingPcieBar,
+    MissingMailboxTransport,
+    MissingCachePolicy,
+    MissingStartupCapLayout,
+    ImageNotAllowed,
+    AlreadyHealthy,
+    AlreadyRestartPending,
+    PolicyDenied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartValidationPolicy {
+    pub verified_driver_manager_identity: bool,
+    pub allow_uart_srv_image: bool,
+    pub max_restarts: u8,
+    pub allow_manual_healthy_restart: bool,
+    pub require_original_accounting: bool,
+}
+
+impl PmRestartValidationPolicy {
+    pub const fn fail_closed() -> Self {
+        Self {
+            verified_driver_manager_identity: false,
+            allow_uart_srv_image: false,
+            max_restarts: 0,
+            allow_manual_healthy_restart: false,
+            require_original_accounting: true,
+        }
+    }
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            verified_driver_manager_identity: true,
+            allow_uart_srv_image: true,
+            max_restarts: 3,
+            allow_manual_healthy_restart: false,
+            require_original_accounting: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartValidationEntry {
+    pub mock_restart_request_id: u32,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub status: PmRestartValidationStatus,
+    pub failures: [Option<PmRestartValidationFailure>; MAX_DRIVER_SPAWN_BLOCKERS],
+}
+
+impl PmRestartValidationEntry {
+    fn from_restart(request: &DriverRestartRequest, status: PmRestartValidationStatus) -> Self {
+        Self {
+            mock_restart_request_id: request.mock_restart_request_id,
+            compatible: request.compatible,
+            compatible_len: request.compatible_len,
+            status,
+            failures: [None; MAX_DRIVER_SPAWN_BLOCKERS],
+        }
+    }
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+    pub fn has_failure(&self, failure: PmRestartValidationFailure) -> bool {
+        self.failures.iter().any(|entry| *entry == Some(failure))
+    }
+    fn push_failure(&mut self, failure: PmRestartValidationFailure) -> Result<(), KernelIpcError> {
+        if self.has_failure(failure) {
+            return Ok(());
+        }
+        let Some(slot) = self.failures.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(failure);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmRestartValidationReport {
+    entries: [Option<PmRestartValidationEntry>; MAX_DEVICES],
+    len: usize,
+}
+
+impl PmRestartValidationReport {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &PmRestartValidationEntry> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|entry| entry.as_ref())
+    }
+    pub fn would_accept_count(&self) -> usize {
+        self.iter()
+            .filter(|entry| entry.status == PmRestartValidationStatus::WouldAcceptRestart)
+            .count()
+    }
+    fn push(&mut self, entry: PmRestartValidationEntry) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartAccountingStatus {
+    WouldReserveRestart,
+    WouldCommitRestart,
+    WouldRollbackRestart,
+    WouldRejectRestart,
+    Deferred,
+    Unsupported,
+    AlreadyRestartPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartReservation {
+    RestartSlot,
+    ReplacementProcessSlot,
+    ReplacementAddressSpace,
+    ReplacementCNodeSlots,
+    StartupCapSlots,
+    MmioWindowReuse,
+    IrqRouteReuse,
+    DmaWindowReuse,
+    ReplacementHandleSlot,
+    HealthMonitorUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartRollbackStep {
+    ReleaseRestartSlot,
+    DestroyReplacementAddressSpace,
+    RevokeReplacementCaps,
+    ReleaseReplacementProcessSlot,
+    ClearReplacementStartupCaps,
+    DropReplacementHandle,
+    RestoreOldHealthState,
+    ClearRestartPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartAccountingFailure {
+    ValidationNotAccepted,
+    PolicyDenied,
+    ResourceLimitExceeded,
+    InjectedFailureBeforeReservation,
+    InjectedFailureAfterReservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartFailureInjectionPoint {
+    None,
+    BeforeAnyRestartReservation,
+    AfterRestartSlot,
+    AfterReplacementProcessSlot,
+    AfterReplacementAddressSpace,
+    AfterReplacementStartupCaps,
+    AfterReplacementHandle,
+    AfterHealthMonitorUpdate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartAccountingPolicy {
+    pub accounting_allowed: bool,
+    pub max_commits: usize,
+    pub failure_injection: PmRestartFailureInjectionPoint,
+}
+
+impl PmRestartAccountingPolicy {
+    pub const fn fail_closed() -> Self {
+        Self {
+            accounting_allowed: false,
+            max_commits: 0,
+            failure_injection: PmRestartFailureInjectionPoint::None,
+        }
+    }
+    pub const fn hosted_fake_rpi5() -> Self {
+        Self {
+            accounting_allowed: true,
+            max_commits: MAX_DEVICES,
+            failure_injection: PmRestartFailureInjectionPoint::None,
+        }
+    }
+    pub const fn with_failure(mut self, failure_injection: PmRestartFailureInjectionPoint) -> Self {
+        self.failure_injection = failure_injection;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartAccountingEntry {
+    pub mock_restart_request_id: u32,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub status: PmRestartAccountingStatus,
+    pub reservations: [Option<PmRestartReservation>; MAX_PM_SPAWN_RESERVATIONS],
+    pub rollback_steps: [Option<PmRestartRollbackStep>; MAX_PM_SPAWN_ROLLBACK_STEPS],
+    pub failures: [Option<PmRestartAccountingFailure>; MAX_DRIVER_SPAWN_BLOCKERS],
+}
+
+impl PmRestartAccountingEntry {
+    fn from_validation(
+        entry: &PmRestartValidationEntry,
+        status: PmRestartAccountingStatus,
+    ) -> Self {
+        Self {
+            mock_restart_request_id: entry.mock_restart_request_id,
+            compatible: entry.compatible,
+            compatible_len: entry.compatible_len,
+            status,
+            reservations: [None; MAX_PM_SPAWN_RESERVATIONS],
+            rollback_steps: [None; MAX_PM_SPAWN_ROLLBACK_STEPS],
+            failures: [None; MAX_DRIVER_SPAWN_BLOCKERS],
+        }
+    }
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+    pub fn has_reservation(&self, reservation: PmRestartReservation) -> bool {
+        self.reservations
+            .iter()
+            .any(|entry| *entry == Some(reservation))
+    }
+    pub fn has_rollback_step(&self, step: PmRestartRollbackStep) -> bool {
+        self.rollback_steps.iter().any(|entry| *entry == Some(step))
+    }
+    pub fn has_failure(&self, failure: PmRestartAccountingFailure) -> bool {
+        self.failures.iter().any(|entry| *entry == Some(failure))
+    }
+    fn push_reservation(
+        &mut self,
+        reservation: PmRestartReservation,
+    ) -> Result<(), KernelIpcError> {
+        let Some(slot) = self.reservations.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(reservation);
+        Ok(())
+    }
+    fn push_rollback_step(&mut self, step: PmRestartRollbackStep) -> Result<(), KernelIpcError> {
+        let Some(slot) = self.rollback_steps.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(step);
+        Ok(())
+    }
+    fn push_failure(&mut self, failure: PmRestartAccountingFailure) -> Result<(), KernelIpcError> {
+        if self.has_failure(failure) {
+            return Ok(());
+        }
+        let Some(slot) = self.failures.iter_mut().find(|slot| slot.is_none()) else {
+            return Err(KernelIpcError::CapabilityFull);
+        };
+        *slot = Some(failure);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PmRestartAccountingReport {
+    entries: [Option<PmRestartAccountingEntry>; MAX_DEVICES],
+    len: usize,
+}
+
+impl PmRestartAccountingReport {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+    pub fn iter(&self) -> impl Iterator<Item = &PmRestartAccountingEntry> {
+        self.entries[..self.len]
+            .iter()
+            .filter_map(|entry| entry.as_ref())
+    }
+    pub fn committed_count(&self) -> usize {
+        self.iter()
+            .filter(|entry| entry.status == PmRestartAccountingStatus::WouldCommitRestart)
+            .count()
+    }
+    fn push(&mut self, entry: PmRestartAccountingEntry) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.entries[self.len] = Some(entry);
+        self.len += 1;
+        Ok(())
+    }
+}
+
+impl DriverRestartRequestBundle {
+    pub fn simulate_pm_restart_validation(
+        &self,
+        original_requests: &DriverSpawnRequestBundle,
+        original_accounting: Option<&PmSpawnAccountingReport>,
+        policy: PmRestartValidationPolicy,
+    ) -> Result<PmRestartValidationReport, KernelIpcError> {
+        let mut report = PmRestartValidationReport::new();
+        for restart in self.iter() {
+            report.push(validate_pm_restart_request(
+                restart,
+                original_requests,
+                original_accounting,
+                policy,
+            )?)?;
+        }
+        Ok(report)
+    }
+
+    pub fn simulate_pm_restart_accounting(
+        &self,
+        validation: &PmRestartValidationReport,
+        policy: PmRestartAccountingPolicy,
+    ) -> Result<PmRestartAccountingReport, KernelIpcError> {
+        let mut report = PmRestartAccountingReport::new();
+        let mut committed = 0usize;
+        for (restart, validation_entry) in self.iter().zip(validation.iter()) {
+            if restart.mock_restart_request_id != validation_entry.mock_restart_request_id
+                || restart.compatible() != validation_entry.compatible()
+            {
+                return Err(KernelIpcError::WrongObject);
+            }
+            let entry =
+                simulate_pm_restart_accounting_entry(restart, validation_entry, policy, committed)?;
+            if entry.status == PmRestartAccountingStatus::WouldCommitRestart {
+                committed = committed
+                    .checked_add(1)
+                    .ok_or(KernelIpcError::CapabilityFull)?;
+            }
+            report.push(entry)?;
+        }
+        if report.len() != self.len() || report.len() != validation.len() {
+            return Err(KernelIpcError::WrongObject);
+        }
+        Ok(report)
+    }
+}
+
+fn validate_pm_restart_request(
+    restart: &DriverRestartRequest,
+    original_requests: &DriverSpawnRequestBundle,
+    original_accounting: Option<&PmSpawnAccountingReport>,
+    policy: PmRestartValidationPolicy,
+) -> Result<PmRestartValidationEntry, KernelIpcError> {
+    let mut entry = match restart.decision {
+        DriverRestartDecision::WouldRequest => PmRestartValidationEntry::from_restart(
+            restart,
+            PmRestartValidationStatus::WouldAcceptRestart,
+        ),
+        DriverRestartDecision::Denied
+            if restart.has_blocker(DriverRestartBlocker::DeviceDeferred) =>
+        {
+            PmRestartValidationEntry::from_restart(restart, PmRestartValidationStatus::Deferred)
+        }
+        DriverRestartDecision::Denied
+            if restart.has_blocker(DriverRestartBlocker::DeviceUnsupported) =>
+        {
+            PmRestartValidationEntry::from_restart(restart, PmRestartValidationStatus::Unsupported)
+        }
+        DriverRestartDecision::Noop
+            if restart.has_blocker(DriverRestartBlocker::AlreadyRestartPending) =>
+        {
+            PmRestartValidationEntry::from_restart(
+                restart,
+                PmRestartValidationStatus::AlreadyRestartPending,
+            )
+        }
+        DriverRestartDecision::Noop => PmRestartValidationEntry::from_restart(
+            restart,
+            PmRestartValidationStatus::AlreadyRunning,
+        ),
+        DriverRestartDecision::Denied => PmRestartValidationEntry::from_restart(
+            restart,
+            PmRestartValidationStatus::WouldRejectRestart,
+        ),
+    };
+    if restart.decision != DriverRestartDecision::WouldRequest {
+        entry.push_failure(PmRestartValidationFailure::RestartRequestNotReady)?;
+    }
+    if !policy.verified_driver_manager_identity {
+        entry.push_failure(PmRestartValidationFailure::MissingVerifiedDriverManager)?;
+    }
+    if restart.restart_count >= policy.max_restarts {
+        entry.push_failure(PmRestartValidationFailure::RestartLimitExceeded)?;
+    }
+    if restart.driver_candidate_len == 0
+        || restart.driver_candidate() != Some("uart_srv")
+        || !policy.allow_uart_srv_image
+    {
+        entry.push_failure(PmRestartValidationFailure::ImageNotAllowed)?;
+    }
+    if !restart.has_startup_cap_requirement(StartupCapRequirement::DriverManagerControlEndpoint)
+        || !restart.has_startup_cap_requirement(StartupCapRequirement::DriverRegistrationEndpoint)
+    {
+        entry.push_failure(PmRestartValidationFailure::MissingStartupCapLayout)?;
+    }
+    let original = original_requests.iter().find(|request| {
+        request.mock_request_id == restart.original_mock_request_id
+            && request.compatible() == restart.compatible()
+    });
+    if original.is_none() {
+        entry.push_failure(PmRestartValidationFailure::MissingOriginalSpawnRequest)?;
+    }
+    if policy.require_original_accounting {
+        let accounted = original_accounting.and_then(|report| {
+            report.iter().find(|acc| {
+                acc.mock_request_id == restart.original_mock_request_id
+                    && acc.compatible() == restart.compatible()
+                    && acc.status == PmSpawnAccountingStatus::WouldCommit
+            })
+        });
+        if accounted.is_none() {
+            entry.push_failure(PmRestartValidationFailure::MissingOriginalAccountingRecord)?;
+        }
+    }
+    for resource in restart
+        .resource_requirements
+        .iter()
+        .filter_map(|entry| *entry)
+    {
+        if resource.requirement != ResourceGrantRequirement::WouldRequest {
+            entry.push_failure(PmRestartValidationFailure::ResourcePolicyDenied)?;
+        }
+        match resource.kind {
+            ResourceGrantKind::Mmio
+                if !restart.has_startup_cap_requirement(StartupCapRequirement::Mmio) =>
+            {
+                entry.push_failure(PmRestartValidationFailure::MissingMmioAuthority)?
+            }
+            ResourceGrantKind::Irq
+                if !restart.has_startup_cap_requirement(StartupCapRequirement::IrqNotification) =>
+            {
+                entry.push_failure(PmRestartValidationFailure::MissingIrqRouting)?
+            }
+            ResourceGrantKind::Dma
+                if !restart.has_startup_cap_requirement(StartupCapRequirement::DmaOrIommu) =>
+            {
+                entry.push_failure(PmRestartValidationFailure::MissingDmaPolicy)?
+            }
+            ResourceGrantKind::PcieBar => {
+                entry.push_failure(PmRestartValidationFailure::MissingPcieBar)?
+            }
+            ResourceGrantKind::MailboxTransport => {
+                entry.push_failure(PmRestartValidationFailure::MissingMailboxTransport)?
+            }
+            _ => {}
+        }
+        for blocker in resource.blockers.iter().filter_map(|blocker| *blocker) {
+            entry.push_failure(pm_restart_failure_from_resource_blocker(blocker))?;
+        }
+    }
+    for blocker in restart.blockers.iter().filter_map(|blocker| *blocker) {
+        entry.push_failure(pm_restart_failure_from_restart_blocker(blocker))?;
+    }
+    if entry.failures.iter().any(Option::is_some)
+        && entry.status == PmRestartValidationStatus::WouldAcceptRestart
+    {
+        entry.status = PmRestartValidationStatus::WouldRejectRestart;
+    }
+    Ok(entry)
+}
+
+fn pm_restart_failure_from_restart_blocker(
+    blocker: DriverRestartBlocker,
+) -> PmRestartValidationFailure {
+    match blocker {
+        DriverRestartBlocker::RestartLimitExceeded => {
+            PmRestartValidationFailure::RestartLimitExceeded
+        }
+        DriverRestartBlocker::DeviceDeferred => PmRestartValidationFailure::DeviceDeferred,
+        DriverRestartBlocker::DeviceUnsupported => PmRestartValidationFailure::DeviceUnsupported,
+        DriverRestartBlocker::MissingSpawnRequest => {
+            PmRestartValidationFailure::MissingOriginalSpawnRequest
+        }
+        DriverRestartBlocker::MissingPmAuthority => PmRestartValidationFailure::PolicyDenied,
+        DriverRestartBlocker::ResourcePolicyDenied => {
+            PmRestartValidationFailure::ResourcePolicyDenied
+        }
+        DriverRestartBlocker::AlreadyHealthy => PmRestartValidationFailure::AlreadyHealthy,
+        DriverRestartBlocker::AlreadyRestartPending => {
+            PmRestartValidationFailure::AlreadyRestartPending
+        }
+    }
+}
+
+fn pm_restart_failure_from_resource_blocker(
+    blocker: ResourceGrantBlocker,
+) -> PmRestartValidationFailure {
+    match blocker {
+        ResourceGrantBlocker::MissingMmioAuthority => {
+            PmRestartValidationFailure::MissingMmioAuthority
+        }
+        ResourceGrantBlocker::MissingIrqRouting => PmRestartValidationFailure::MissingIrqRouting,
+        ResourceGrantBlocker::MissingDmaPolicy => PmRestartValidationFailure::MissingDmaPolicy,
+        ResourceGrantBlocker::RequiresPcieBarDiscovery => {
+            PmRestartValidationFailure::MissingPcieBar
+        }
+        ResourceGrantBlocker::RequiresMailboxTransport => {
+            PmRestartValidationFailure::MissingMailboxTransport
+        }
+        ResourceGrantBlocker::RequiresCacheMaintenancePolicy => {
+            PmRestartValidationFailure::MissingCachePolicy
+        }
+        ResourceGrantBlocker::DeviceDeferred => PmRestartValidationFailure::DeviceDeferred,
+        ResourceGrantBlocker::DeviceUnsupported => PmRestartValidationFailure::DeviceUnsupported,
+        _ => PmRestartValidationFailure::ResourcePolicyDenied,
+    }
+}
+
+fn simulate_pm_restart_accounting_entry(
+    restart: &DriverRestartRequest,
+    validation: &PmRestartValidationEntry,
+    policy: PmRestartAccountingPolicy,
+    committed_so_far: usize,
+) -> Result<PmRestartAccountingEntry, KernelIpcError> {
+    let base = match validation.status {
+        PmRestartValidationStatus::WouldAcceptRestart => {
+            PmRestartAccountingStatus::WouldReserveRestart
+        }
+        PmRestartValidationStatus::Deferred => PmRestartAccountingStatus::Deferred,
+        PmRestartValidationStatus::Unsupported => PmRestartAccountingStatus::Unsupported,
+        PmRestartValidationStatus::AlreadyRestartPending
+        | PmRestartValidationStatus::AlreadyRunning => {
+            PmRestartAccountingStatus::AlreadyRestartPending
+        }
+        PmRestartValidationStatus::WouldRejectRestart => {
+            PmRestartAccountingStatus::WouldRejectRestart
+        }
+    };
+    let mut entry = PmRestartAccountingEntry::from_validation(validation, base);
+    if validation.status != PmRestartValidationStatus::WouldAcceptRestart {
+        entry.push_failure(PmRestartAccountingFailure::ValidationNotAccepted)?;
+        return Ok(entry);
+    }
+    if !policy.accounting_allowed {
+        entry.status = PmRestartAccountingStatus::WouldRejectRestart;
+        entry.push_failure(PmRestartAccountingFailure::PolicyDenied)?;
+        return Ok(entry);
+    }
+    if committed_so_far >= policy.max_commits {
+        entry.status = PmRestartAccountingStatus::WouldRejectRestart;
+        entry.push_failure(PmRestartAccountingFailure::ResourceLimitExceeded)?;
+        return Ok(entry);
+    }
+    if policy.failure_injection == PmRestartFailureInjectionPoint::BeforeAnyRestartReservation {
+        entry.status = PmRestartAccountingStatus::WouldRollbackRestart;
+        entry.push_failure(PmRestartAccountingFailure::InjectedFailureBeforeReservation)?;
+        return Ok(entry);
+    }
+    let plan = restart_reservation_plan(restart);
+    for reservation in plan.iter().filter_map(|reservation| *reservation) {
+        entry.push_reservation(reservation)?;
+        if restart_failure_matches_reservation(policy.failure_injection, reservation) {
+            entry.status = PmRestartAccountingStatus::WouldRollbackRestart;
+            entry.push_failure(PmRestartAccountingFailure::InjectedFailureAfterReservation)?;
+            append_reverse_restart_rollback_steps(&mut entry)?;
+            return Ok(entry);
+        }
+    }
+    entry.status = PmRestartAccountingStatus::WouldCommitRestart;
+    Ok(entry)
+}
+
+fn restart_reservation_plan(
+    restart: &DriverRestartRequest,
+) -> [Option<PmRestartReservation>; MAX_PM_SPAWN_RESERVATIONS] {
+    let mut plan = [None; MAX_PM_SPAWN_RESERVATIONS];
+    let mut len = 0usize;
+    push_restart_reservation(&mut plan, &mut len, PmRestartReservation::RestartSlot);
+    push_restart_reservation(
+        &mut plan,
+        &mut len,
+        PmRestartReservation::ReplacementProcessSlot,
+    );
+    push_restart_reservation(
+        &mut plan,
+        &mut len,
+        PmRestartReservation::ReplacementAddressSpace,
+    );
+    push_restart_reservation(
+        &mut plan,
+        &mut len,
+        PmRestartReservation::ReplacementCNodeSlots,
+    );
+    push_restart_reservation(&mut plan, &mut len, PmRestartReservation::StartupCapSlots);
+    for resource in restart
+        .resource_requirements
+        .iter()
+        .filter_map(|entry| *entry)
+    {
+        match resource.kind {
+            ResourceGrantKind::Mmio => {
+                push_restart_reservation(&mut plan, &mut len, PmRestartReservation::MmioWindowReuse)
+            }
+            ResourceGrantKind::Irq => {
+                push_restart_reservation(&mut plan, &mut len, PmRestartReservation::IrqRouteReuse)
+            }
+            ResourceGrantKind::Dma => {
+                push_restart_reservation(&mut plan, &mut len, PmRestartReservation::DmaWindowReuse)
+            }
+            _ => {}
+        }
+    }
+    push_restart_reservation(
+        &mut plan,
+        &mut len,
+        PmRestartReservation::ReplacementHandleSlot,
+    );
+    push_restart_reservation(
+        &mut plan,
+        &mut len,
+        PmRestartReservation::HealthMonitorUpdate,
+    );
+    plan
+}
+fn push_restart_reservation(
+    plan: &mut [Option<PmRestartReservation>; MAX_PM_SPAWN_RESERVATIONS],
+    len: &mut usize,
+    reservation: PmRestartReservation,
+) {
+    if *len < MAX_PM_SPAWN_RESERVATIONS {
+        plan[*len] = Some(reservation);
+        *len += 1;
+    }
+}
+fn restart_failure_matches_reservation(
+    injection: PmRestartFailureInjectionPoint,
+    reservation: PmRestartReservation,
+) -> bool {
+    matches!(
+        (injection, reservation),
+        (
+            PmRestartFailureInjectionPoint::AfterRestartSlot,
+            PmRestartReservation::RestartSlot
+        ) | (
+            PmRestartFailureInjectionPoint::AfterReplacementProcessSlot,
+            PmRestartReservation::ReplacementProcessSlot
+        ) | (
+            PmRestartFailureInjectionPoint::AfterReplacementAddressSpace,
+            PmRestartReservation::ReplacementAddressSpace
+        ) | (
+            PmRestartFailureInjectionPoint::AfterReplacementStartupCaps,
+            PmRestartReservation::StartupCapSlots
+        ) | (
+            PmRestartFailureInjectionPoint::AfterReplacementHandle,
+            PmRestartReservation::ReplacementHandleSlot
+        ) | (
+            PmRestartFailureInjectionPoint::AfterHealthMonitorUpdate,
+            PmRestartReservation::HealthMonitorUpdate
+        )
+    )
+}
+fn append_reverse_restart_rollback_steps(
+    entry: &mut PmRestartAccountingEntry,
+) -> Result<(), KernelIpcError> {
+    let mut index = MAX_PM_SPAWN_RESERVATIONS;
+    while index > 0 {
+        index -= 1;
+        if let Some(reservation) = entry.reservations[index] {
+            entry.push_rollback_step(restart_rollback_for_reservation(reservation))?;
+        }
+    }
+    Ok(())
+}
+fn restart_rollback_for_reservation(reservation: PmRestartReservation) -> PmRestartRollbackStep {
+    match reservation {
+        PmRestartReservation::RestartSlot => PmRestartRollbackStep::ReleaseRestartSlot,
+        PmRestartReservation::ReplacementProcessSlot => {
+            PmRestartRollbackStep::ReleaseReplacementProcessSlot
+        }
+        PmRestartReservation::ReplacementAddressSpace => {
+            PmRestartRollbackStep::DestroyReplacementAddressSpace
+        }
+        PmRestartReservation::ReplacementCNodeSlots => PmRestartRollbackStep::RevokeReplacementCaps,
+        PmRestartReservation::StartupCapSlots => PmRestartRollbackStep::ClearReplacementStartupCaps,
+        PmRestartReservation::ReplacementHandleSlot => PmRestartRollbackStep::DropReplacementHandle,
+        PmRestartReservation::HealthMonitorUpdate => PmRestartRollbackStep::RestoreOldHealthState,
+        PmRestartReservation::MmioWindowReuse
+        | PmRestartReservation::IrqRouteReuse
+        | PmRestartReservation::DmaWindowReuse => PmRestartRollbackStep::ClearRestartPending,
+    }
 }
 
 #[derive(Debug)]
@@ -5264,6 +5988,321 @@ mod tests {
         assert_eq!(runtime.dma_grant.get(), None);
         assert_eq!(runtime.restarted.get(), None);
         assert_eq!(runtime.registered.get(), None);
+    }
+
+    fn restart_validation_entry<'a>(
+        report: &'a PmRestartValidationReport,
+        compatible: &str,
+    ) -> &'a PmRestartValidationEntry {
+        report
+            .iter()
+            .find(|entry| entry.compatible() == Some(compatible))
+            .expect("restart validation entry")
+    }
+
+    fn restart_accounting_entry<'a>(
+        report: &'a PmRestartAccountingReport,
+        compatible: &str,
+    ) -> &'a PmRestartAccountingEntry {
+        report
+            .iter()
+            .find(|entry| entry.compatible() == Some(compatible))
+            .expect("restart accounting entry")
+    }
+
+    fn build_crashed_pl011_restart_pipeline() -> (
+        DriverSpawnRequestBundle,
+        PmSpawnAccountingReport,
+        DriverHealthTable,
+        DriverRestartRequestBundle,
+        PmRestartValidationReport,
+    ) {
+        let (_, requests, validation, accounting) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::hosted_fake_rpi5());
+        let mut health =
+            DriverHealthTable::sync_from_spawn_reports(&requests, &validation, &accounting)
+                .unwrap();
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::Registered,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        health
+            .apply_event(
+                "arm,pl011",
+                DriverHealthEvent::CrashReported,
+                DriverHealthPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let restart = requests
+            .build_restart_request_bundle(&health, DriverRestartRequestPolicy::hosted_fake_rpi5())
+            .unwrap();
+        let restart_validation = restart
+            .simulate_pm_restart_validation(
+                &requests,
+                Some(&accounting),
+                PmRestartValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        (requests, accounting, health, restart, restart_validation)
+    }
+
+    #[test]
+    fn pm_restart_validation_accepts_crashed_pl011_with_identity_accounting_and_resources() {
+        let (_, _, _, restart, validation) = build_crashed_pl011_restart_pipeline();
+        assert_eq!(restart.len(), 5);
+        assert_eq!(validation.len(), restart.len());
+        assert_eq!(validation.would_accept_count(), 1);
+        let pl011 = restart_validation_entry(&validation, "arm,pl011");
+        assert_eq!(pl011.status, PmRestartValidationStatus::WouldAcceptRestart);
+        assert!(pl011.failures.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pm_restart_validation_rejects_missing_identity_limit_original_and_startup_caps() {
+        let (requests, accounting, _, mut restart, _) = build_crashed_pl011_restart_pipeline();
+        let missing_identity = restart
+            .simulate_pm_restart_validation(
+                &requests,
+                Some(&accounting),
+                PmRestartValidationPolicy {
+                    verified_driver_manager_identity: false,
+                    ..PmRestartValidationPolicy::hosted_fake_rpi5()
+                },
+            )
+            .unwrap();
+        let pl011 = restart_validation_entry(&missing_identity, "arm,pl011");
+        assert_eq!(pl011.status, PmRestartValidationStatus::WouldRejectRestart);
+        assert!(pl011.has_failure(PmRestartValidationFailure::MissingVerifiedDriverManager));
+
+        let limited = restart
+            .simulate_pm_restart_validation(
+                &requests,
+                Some(&accounting),
+                PmRestartValidationPolicy {
+                    max_restarts: 0,
+                    ..PmRestartValidationPolicy::hosted_fake_rpi5()
+                },
+            )
+            .unwrap();
+        let pl011 = restart_validation_entry(&limited, "arm,pl011");
+        assert!(pl011.has_failure(PmRestartValidationFailure::RestartLimitExceeded));
+
+        restart.requests[0]
+            .as_mut()
+            .unwrap()
+            .original_mock_request_id = 999;
+        let missing_original = restart
+            .simulate_pm_restart_validation(
+                &requests,
+                Some(&accounting),
+                PmRestartValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let pl011 = restart_validation_entry(&missing_original, "arm,pl011");
+        assert!(pl011.has_failure(PmRestartValidationFailure::MissingOriginalSpawnRequest));
+
+        let pl011_restart = restart.requests[0].as_mut().unwrap();
+        pl011_restart.original_mock_request_id =
+            request_for(&requests, "arm,pl011").mock_request_id;
+        pl011_restart.startup_cap_requirements = [None; MAX_STARTUP_CAP_REQUIREMENTS];
+        let missing_caps = restart
+            .simulate_pm_restart_validation(
+                &requests,
+                Some(&accounting),
+                PmRestartValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let pl011 = restart_validation_entry(&missing_caps, "arm,pl011");
+        assert!(pl011.has_failure(PmRestartValidationFailure::MissingStartupCapLayout));
+    }
+
+    #[test]
+    fn pm_restart_validation_keeps_deferred_mailbox_unknown_and_healthy_nonaccepted() {
+        let (requests, accounting, _, restart, validation) = build_crashed_pl011_restart_pipeline();
+        let rp1 = restart_validation_entry(&validation, "raspberrypi,rp1-gpio");
+        assert_eq!(rp1.status, PmRestartValidationStatus::Deferred);
+        assert!(rp1.has_failure(PmRestartValidationFailure::DeviceDeferred));
+        assert!(rp1.has_failure(PmRestartValidationFailure::MissingPcieBar));
+        let mailbox = restart_validation_entry(&validation, "raspberrypi,firmware");
+        assert_eq!(mailbox.status, PmRestartValidationStatus::Deferred);
+        assert!(mailbox.has_failure(PmRestartValidationFailure::MissingMailboxTransport));
+        assert!(mailbox.has_failure(PmRestartValidationFailure::MissingCachePolicy));
+        let unknown = restart_validation_entry(&validation, "vendor,unknown");
+        assert_eq!(unknown.status, PmRestartValidationStatus::Unsupported);
+        assert!(unknown.has_failure(PmRestartValidationFailure::DeviceUnsupported));
+
+        let (healthy_requests, healthy_health) = build_healthy_pl011_table();
+        let healthy_restart = healthy_requests
+            .build_restart_request_bundle(
+                &healthy_health,
+                DriverRestartRequestPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let healthy_validation = healthy_restart
+            .simulate_pm_restart_validation(
+                &healthy_requests,
+                Some(&accounting),
+                PmRestartValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let pl011 = restart_validation_entry(&healthy_validation, "arm,pl011");
+        assert_eq!(pl011.status, PmRestartValidationStatus::AlreadyRunning);
+        assert!(pl011.has_failure(PmRestartValidationFailure::AlreadyHealthy));
+        assert_eq!(
+            restart_request(&restart, "arm,pl011").decision,
+            DriverRestartDecision::WouldRequest
+        );
+        assert_eq!(requests.len(), restart.len());
+    }
+
+    #[test]
+    fn pm_restart_accounting_commits_accepted_pl011_descriptive_replacement_reservations() {
+        let (_, _, _, restart, validation) = build_crashed_pl011_restart_pipeline();
+        let accounting = restart
+            .simulate_pm_restart_accounting(
+                &validation,
+                PmRestartAccountingPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(accounting.len(), restart.len());
+        assert_eq!(accounting.committed_count(), 1);
+        let pl011 = restart_accounting_entry(&accounting, "arm,pl011");
+        assert_eq!(pl011.status, PmRestartAccountingStatus::WouldCommitRestart);
+        for reservation in [
+            PmRestartReservation::RestartSlot,
+            PmRestartReservation::ReplacementProcessSlot,
+            PmRestartReservation::ReplacementAddressSpace,
+            PmRestartReservation::ReplacementCNodeSlots,
+            PmRestartReservation::StartupCapSlots,
+            PmRestartReservation::MmioWindowReuse,
+            PmRestartReservation::IrqRouteReuse,
+            PmRestartReservation::ReplacementHandleSlot,
+            PmRestartReservation::HealthMonitorUpdate,
+        ] {
+            assert!(
+                pl011.has_reservation(reservation),
+                "missing {reservation:?}"
+            );
+        }
+        assert!(pl011.rollback_steps.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn pm_restart_accounting_fail_closed_and_rollback_reverse() {
+        let (_, _, _, restart, validation) = build_crashed_pl011_restart_pipeline();
+        let rejected = restart
+            .simulate_pm_restart_accounting(&validation, PmRestartAccountingPolicy::fail_closed())
+            .unwrap();
+        let pl011 = restart_accounting_entry(&rejected, "arm,pl011");
+        assert_eq!(pl011.status, PmRestartAccountingStatus::WouldRejectRestart);
+        assert!(pl011.has_failure(PmRestartAccountingFailure::PolicyDenied));
+        assert!(pl011.reservations.iter().all(Option::is_none));
+
+        let after_address_space = restart
+            .simulate_pm_restart_accounting(
+                &validation,
+                PmRestartAccountingPolicy::hosted_fake_rpi5()
+                    .with_failure(PmRestartFailureInjectionPoint::AfterReplacementAddressSpace),
+            )
+            .unwrap();
+        let pl011 = restart_accounting_entry(&after_address_space, "arm,pl011");
+        assert_eq!(
+            pl011.status,
+            PmRestartAccountingStatus::WouldRollbackRestart
+        );
+        assert_eq!(
+            pl011.rollback_steps[0],
+            Some(PmRestartRollbackStep::DestroyReplacementAddressSpace)
+        );
+        assert_eq!(
+            pl011.rollback_steps[1],
+            Some(PmRestartRollbackStep::ReleaseReplacementProcessSlot)
+        );
+        assert_eq!(
+            pl011.rollback_steps[2],
+            Some(PmRestartRollbackStep::ReleaseRestartSlot)
+        );
+
+        let after_handle = restart
+            .simulate_pm_restart_accounting(
+                &validation,
+                PmRestartAccountingPolicy::hosted_fake_rpi5()
+                    .with_failure(PmRestartFailureInjectionPoint::AfterReplacementHandle),
+            )
+            .unwrap();
+        let pl011 = restart_accounting_entry(&after_handle, "arm,pl011");
+        assert_eq!(
+            pl011.status,
+            PmRestartAccountingStatus::WouldRollbackRestart
+        );
+        assert!(pl011.has_rollback_step(PmRestartRollbackStep::DropReplacementHandle));
+        assert!(pl011.has_rollback_step(PmRestartRollbackStep::ClearReplacementStartupCaps));
+        assert!(pl011.has_rollback_step(PmRestartRollbackStep::DestroyReplacementAddressSpace));
+        assert!(pl011.has_rollback_step(PmRestartRollbackStep::ReleaseReplacementProcessSlot));
+        assert!(pl011.has_rollback_step(PmRestartRollbackStep::ReleaseRestartSlot));
+        let handle_index = pl011
+            .rollback_steps
+            .iter()
+            .position(|step| *step == Some(PmRestartRollbackStep::DropReplacementHandle))
+            .unwrap();
+        let startup_index = pl011
+            .rollback_steps
+            .iter()
+            .position(|step| *step == Some(PmRestartRollbackStep::ClearReplacementStartupCaps))
+            .unwrap();
+        assert!(handle_index < startup_index);
+    }
+
+    #[test]
+    fn pm_restart_reports_are_deterministic_bounded_non_mutating_and_inert() {
+        let (requests, accounting, health, restart, validation) =
+            build_crashed_pl011_restart_pipeline();
+        let requests_snapshot = requests.clone();
+        let accounting_snapshot = accounting.clone();
+        let health_snapshot = health.clone();
+        let restart_snapshot = restart.clone();
+        let validation_snapshot = validation.clone();
+        let validation_again = restart
+            .simulate_pm_restart_validation(
+                &requests,
+                Some(&accounting),
+                PmRestartValidationPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let accounting_report = restart
+            .simulate_pm_restart_accounting(
+                &validation,
+                PmRestartAccountingPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let accounting_again = restart
+            .simulate_pm_restart_accounting(
+                &validation_again,
+                PmRestartAccountingPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(validation, validation_again);
+        assert_eq!(accounting_report, accounting_again);
+        assert!(validation.len() <= MAX_DEVICES);
+        assert!(accounting_report.len() <= MAX_DEVICES);
+        assert_eq!(requests, requests_snapshot);
+        assert_eq!(accounting, accounting_snapshot);
+        assert_eq!(health, health_snapshot);
+        assert_eq!(restart, restart_snapshot);
+        assert_eq!(validation, validation_snapshot);
+        let runtime = MockDriverControl::new();
+        assert_eq!(runtime.irq_line.get(), None);
+        assert_eq!(runtime.dma_request.get(), None);
+        assert_eq!(runtime.irq_grant.get(), None);
+        assert_eq!(runtime.dma_grant.get(), None);
+        assert_eq!(runtime.restarted.get(), None);
+        assert_eq!(runtime.registered.get(), None);
+        for entry in accounting_report.iter() {
+            assert_ne!(entry.mock_restart_request_id, 0);
+        }
     }
 
     #[test]

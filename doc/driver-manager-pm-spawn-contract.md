@@ -14,7 +14,10 @@ tests but is not executed by real PM and still has no PM/supervisor call path.
 DRS-9 adds an inert PM accounting and rollback simulation over accepted validation
 reports; reservations and rollback steps are descriptive only. DRS-10 adds inert
 driver health tracking and PM-facing restart-request construction; restart
-requests are descriptive only and do not restart anything.
+requests are descriptive only and do not restart anything. DRS-11 adds inert PM
+restart-validation and restart-accounting/rollback simulation; those reports are
+audit artifacts only and still do not call PM, restart, spawn, mint caps, grant
+resources, allocate address spaces, tear down processes, or touch MMIO.
 
 The current DRS models remain advisory mock policy/data models. They describe
 what a safe future request would contain, but they do not transfer authority.
@@ -59,11 +62,16 @@ The current hosted and mock-safe DRS path is:
    commits, and rollback plans without touching live resources.
 10. DRS-10 inert `DriverHealthTable` and `DriverRestartRequestBundle` records
     that model health policy and PM-facing restart requests without invoking PM.
+11. DRS-11 inert `PmRestartValidationReport` and
+    `PmRestartAccountingReport` records that simulate PM restart checks,
+    replacement-process reservations, commit, and reverse-order rollback without
+    invoking PM.
 
 This pipeline is descriptive. It never calls PM or supervisor services, never
 spawns a task, never grants resources, never transfers caps, and never touches
-MMIO. The DRS-8 validation report and DRS-9 accounting report are audit artifacts
-only; real PM remains the only future process-creation, restart mechanism,
+MMIO. The DRS-8 validation report, DRS-9 accounting report, and DRS-11 restart
+validation/accounting reports are audit artifacts only; real PM remains the only
+future process-creation, restart mechanism,
 address-space setup, resource-accounting, rollback, cap-minting, grant,
 startup-cap-delivery, and handle-return authority. Driver Manager observes
 health and decides restart policy, but PM owns the mechanism.
@@ -238,8 +246,9 @@ DRS-6 explicitly does not add:
   boot, or init-bootstrap changes;
 - PM or supervisor-service calls;
 - live use of the inert DRS-7 request records, DRS-8 validation reports,
-  DRS-9 accounting reports, or DRS-10 restart requests as
-  process-creation/restart/accounting authority;
+  DRS-9 accounting reports, DRS-10 restart requests, or DRS-11 restart
+  validation/accounting reports as process-creation/restart/accounting
+  authority;
 - service-manifest behavior changes.
 
 Driver Manager remains advisory only in this stage.
@@ -272,6 +281,12 @@ The existing DRS models map to the future contract as follows:
   heartbeat, crash, and exit events, then constructs inert PM-facing restart
   requests that reference the original `DriverSpawnRequest` descriptors. PM
   remains the only future restart/spawn mechanism.
+- DRS-11 `PmRestartValidationReport` and `PmRestartAccountingReport` simulate
+  whether PM would accept a restart request, reserve replacement process/address
+  space/startup-cap/handle/health-monitor slots, commit, or produce reverse-order
+  rollback steps. Future live implementation must perform real restart
+  validation, accounting, teardown, and rollback inside PM, not Driver Manager.
 - No mock model itself grants authority, mints caps, calls PM, creates or restarts
-  a task, or touches MMIO. A possible next step is restart validation/accounting
+  a task, or touches MMIO. A possible next step is a live-spawn/restart API
+  design review or a handoff ABI review, still without live implementation.
   simulation or a live-spawn API design review, still without live implementation.

@@ -105,7 +105,9 @@ minting, startup-cap delivery, and handles. DRS-7 adds only an inert
 requirements. DRS-8 adds an inert PM-validation simulation over those records;
 it models PM checks. DRS-9 adds inert PM accounting/rollback simulation with
 descriptive reservations and rollback steps. DRS-10 adds inert health and
-restart-request modeling. These stages still do not call PM, spawn/restart,
+restart-request modeling. DRS-11 adds inert PM restart validation/accounting and
+rollback simulation for those restart requests. These stages still do not call
+PM, spawn/restart,
 grant, mint caps, allocate address spaces, return handles, or touch MMIO. See the driver inventory in
 [`DRIVER_ROADMAP.md`](DRIVER_ROADMAP.md).
 
