@@ -200,8 +200,12 @@ state 9 today.
   recommend consumer quiesce/restart/restart-after-provider ordering, irqmux
   provider crashes can mark IRQ consumers affected, restart limits and
   restart-pending state block duplicate recommendations, and dependency cycles
-  fail closed. PM remains the only future mechanism owner; no PM/supervisor
-  call, spawn, restart, cap mint/revoke, grant, teardown, or MMIO occurs.
+  fail closed. DRS-14 adds an inert readout surface for those dependency and
+  cascade records: verified senders may query only their own assigned mock
+  instance, replies are bounded and cap-free, payload TIDs are diagnostic only,
+  and queries do not mutate health/dependency/restart/cascade state. PM remains
+  the only future mechanism owner; no PM/supervisor call, spawn, restart, cap
+  mint/revoke, grant, teardown, or MMIO occurs.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.

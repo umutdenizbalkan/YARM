@@ -21,6 +21,10 @@ pub const DRIVER_OP_QUERY_MY_MMIO: u16 = 0x4451;
 pub const DRIVER_OP_QUERY_MY_IRQS: u16 = 0x4452;
 pub const DRIVER_OP_QUERY_MY_CANDIDATE: u16 = 0x4453;
 pub const DRIVER_OP_QUERY_MY_DMA: u16 = 0x4454;
+pub const DRIVER_OP_QUERY_MY_DEPENDENCIES: u16 = 0x4455;
+pub const DRIVER_OP_QUERY_MY_DEPENDENCY_STATUS: u16 = 0x4456;
+pub const DRIVER_OP_QUERY_MY_CASCADE_STATUS: u16 = 0x4457;
+pub const DRIVER_OP_QUERY_MY_RESTART_RECOMMENDATION: u16 = 0x4458;
 
 fn read_u64(payload: &[u8], offset: usize) -> Result<u64, KernelIpcError> {
     let end = offset.checked_add(8).ok_or(KernelIpcError::WrongObject)?;
@@ -3043,6 +3047,520 @@ fn restart_for(
     restarts
         .iter()
         .find(|request| request.original_mock_request_id == mock_request_id)
+}
+
+const MAX_DEPENDENCY_QUERY_RECORDS: usize = 2;
+const DEPENDENCY_LIST_REPLY_BYTES: usize = 16 + (MAX_DEPENDENCY_QUERY_RECORDS * 40);
+const DEPENDENCY_STATUS_REPLY_BYTES: usize = 96;
+const CASCADE_STATUS_REPLY_BYTES: usize = 96;
+const RESTART_RECOMMENDATION_REPLY_BYTES: usize = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencySummaryReply {
+    pub dependency_count: u32,
+    pub deferred_count: u32,
+    pub unsupported_count: u32,
+    pub cycle_blocked_count: u32,
+}
+
+impl DependencySummaryReply {
+    pub const BYTE_LEN: usize = 16;
+
+    pub fn encode(&self) -> [u8; Self::BYTE_LEN] {
+        let mut payload = [0u8; Self::BYTE_LEN];
+        payload[0..4].copy_from_slice(&self.dependency_count.to_le_bytes());
+        payload[4..8].copy_from_slice(&self.deferred_count.to_le_bytes());
+        payload[8..12].copy_from_slice(&self.unsupported_count.to_le_bytes());
+        payload[12..16].copy_from_slice(&self.cycle_blocked_count.to_le_bytes());
+        payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyListReply {
+    pub dependency_count: u32,
+    pub encoded_count: u32,
+    pub truncated: bool,
+    pub entries: [Option<DependencyListEntry>; MAX_DEPENDENCY_QUERY_RECORDS],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyListEntry {
+    pub dependency_id: u32,
+    pub provider_mock_request_id: u32,
+    pub consumer_mock_request_id: u32,
+    pub kind: DriverDependencyKind,
+    pub status: DriverDependencyStatus,
+    pub first_failure: Option<DriverDependencyFailure>,
+    pub provider_name: [u8; 16],
+    pub provider_name_len: usize,
+}
+
+impl DependencyListReply {
+    pub const BYTE_LEN: usize = DEPENDENCY_LIST_REPLY_BYTES;
+
+    pub fn encode(&self) -> [u8; Self::BYTE_LEN] {
+        let mut payload = [0u8; Self::BYTE_LEN];
+        payload[0..4].copy_from_slice(&self.dependency_count.to_le_bytes());
+        payload[4..8].copy_from_slice(&self.encoded_count.to_le_bytes());
+        payload[8..12].copy_from_slice(&(self.truncated as u32).to_le_bytes());
+        let mut cursor = 16;
+        for entry in self.entries.iter().filter_map(|entry| *entry) {
+            payload[cursor..cursor + 4].copy_from_slice(&entry.dependency_id.to_le_bytes());
+            payload[cursor + 4..cursor + 8]
+                .copy_from_slice(&entry.provider_mock_request_id.to_le_bytes());
+            payload[cursor + 8..cursor + 12]
+                .copy_from_slice(&entry.consumer_mock_request_id.to_le_bytes());
+            payload[cursor + 12..cursor + 16]
+                .copy_from_slice(&dependency_kind_code(entry.kind).to_le_bytes());
+            payload[cursor + 16..cursor + 20]
+                .copy_from_slice(&dependency_status_code(entry.status).to_le_bytes());
+            payload[cursor + 20..cursor + 24].copy_from_slice(
+                &entry
+                    .first_failure
+                    .map(dependency_failure_code)
+                    .unwrap_or(0)
+                    .to_le_bytes(),
+            );
+            payload[cursor + 24..cursor + 28]
+                .copy_from_slice(&count_u32(entry.provider_name_len).to_le_bytes());
+            payload[cursor + 28..cursor + 28 + entry.provider_name_len]
+                .copy_from_slice(&entry.provider_name[..entry.provider_name_len]);
+            cursor += 40;
+        }
+        payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DependencyStatusReply {
+    pub status: DriverDependencyStatus,
+    pub first_failure: Option<DriverDependencyFailure>,
+    pub dependency_count: u32,
+    pub deferred: bool,
+    pub unsupported: bool,
+    pub satisfied: bool,
+    pub cycle_blocked: bool,
+}
+
+impl DependencyStatusReply {
+    pub const BYTE_LEN: usize = DEPENDENCY_STATUS_REPLY_BYTES;
+
+    pub fn encode(&self) -> [u8; Self::BYTE_LEN] {
+        let mut payload = [0u8; Self::BYTE_LEN];
+        payload[0..4].copy_from_slice(&dependency_status_code(self.status).to_le_bytes());
+        payload[4..8].copy_from_slice(
+            &self
+                .first_failure
+                .map(dependency_failure_code)
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
+        payload[8..12].copy_from_slice(&self.dependency_count.to_le_bytes());
+        payload[12..16].copy_from_slice(&(self.deferred as u32).to_le_bytes());
+        payload[16..20].copy_from_slice(&(self.unsupported as u32).to_le_bytes());
+        payload[20..24].copy_from_slice(&(self.satisfied as u32).to_le_bytes());
+        payload[24..28].copy_from_slice(&(self.cycle_blocked as u32).to_le_bytes());
+        payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CascadeStatusReply {
+    pub action: DriverRestartCascadeAction,
+    pub reason: Option<DriverRestartCascadeReason>,
+    pub first_blocker: Option<DriverRestartCascadeBlocker>,
+    pub affected_provider_mock_request_id: u32,
+    pub affected_consumer_mock_request_id: u32,
+    pub referenced_restart_request_id: u32,
+    pub entry_count: u32,
+}
+
+impl CascadeStatusReply {
+    pub const BYTE_LEN: usize = CASCADE_STATUS_REPLY_BYTES;
+
+    pub fn encode(&self) -> [u8; Self::BYTE_LEN] {
+        let mut payload = [0u8; Self::BYTE_LEN];
+        payload[0..4].copy_from_slice(&cascade_action_code(self.action).to_le_bytes());
+        payload[4..8].copy_from_slice(
+            &self
+                .reason
+                .map(cascade_reason_code)
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
+        payload[8..12].copy_from_slice(
+            &self
+                .first_blocker
+                .map(cascade_blocker_code)
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
+        payload[12..16].copy_from_slice(&self.affected_provider_mock_request_id.to_le_bytes());
+        payload[16..20].copy_from_slice(&self.affected_consumer_mock_request_id.to_le_bytes());
+        payload[20..24].copy_from_slice(&self.referenced_restart_request_id.to_le_bytes());
+        payload[24..28].copy_from_slice(&self.entry_count.to_le_bytes());
+        payload
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestartRecommendationReply {
+    pub action: DriverRestartCascadeAction,
+    pub would_recommend_restart: bool,
+    pub would_recommend_quiesce: bool,
+    pub would_recommend_after_provider: bool,
+    pub referenced_restart_request_id: u32,
+    pub first_blocker: Option<DriverRestartCascadeBlocker>,
+}
+
+impl RestartRecommendationReply {
+    pub const BYTE_LEN: usize = RESTART_RECOMMENDATION_REPLY_BYTES;
+
+    pub fn encode(&self) -> [u8; Self::BYTE_LEN] {
+        let mut payload = [0u8; Self::BYTE_LEN];
+        payload[0..4].copy_from_slice(&cascade_action_code(self.action).to_le_bytes());
+        payload[4..8].copy_from_slice(&(self.would_recommend_restart as u32).to_le_bytes());
+        payload[8..12].copy_from_slice(&(self.would_recommend_quiesce as u32).to_le_bytes());
+        payload[12..16]
+            .copy_from_slice(&(self.would_recommend_after_provider as u32).to_le_bytes());
+        payload[16..20].copy_from_slice(&self.referenced_restart_request_id.to_le_bytes());
+        payload[20..24].copy_from_slice(
+            &self
+                .first_blocker
+                .map(cascade_blocker_code)
+                .unwrap_or(0)
+                .to_le_bytes(),
+        );
+        payload
+    }
+}
+
+pub struct DependencyReadoutContext<'a> {
+    pub inventory: &'a PlatformInventory,
+    pub graph: &'a DriverDependencyGraph,
+    pub cascade: &'a DriverRestartCascadeReport,
+}
+
+pub fn handle_dependency_readout_query(
+    context: DependencyReadoutContext<'_>,
+    request: &Message,
+    verified_sender_tid: Option<u64>,
+) -> Result<Message, KernelIpcError> {
+    let sender_tid = verified_sender_tid
+        .filter(|tid| *tid != 0)
+        .ok_or(KernelIpcError::MissingRight)?;
+    let claimed_tid = read_u64(request.as_slice(), 0)?;
+    let tid = verified_tid_or_reject_spoof(sender_tid, claimed_tid)?;
+    let device = context.inventory.query_assigned_device(tid)?;
+    match request.opcode {
+        DRIVER_OP_QUERY_MY_DEPENDENCIES => inert_reply(
+            request.opcode,
+            &dependency_list_reply(context.graph, device).encode(),
+        ),
+        DRIVER_OP_QUERY_MY_DEPENDENCY_STATUS => inert_reply(
+            request.opcode,
+            &dependency_status_reply(context.graph, context.cascade, device).encode(),
+        ),
+        DRIVER_OP_QUERY_MY_CASCADE_STATUS => inert_reply(
+            request.opcode,
+            &cascade_status_reply(context.graph, context.cascade, device).encode(),
+        ),
+        DRIVER_OP_QUERY_MY_RESTART_RECOMMENDATION => inert_reply(
+            request.opcode,
+            &restart_recommendation_reply(context.graph, context.cascade, device).encode(),
+        ),
+        _ => Err(KernelIpcError::WrongObject),
+    }
+}
+
+fn dependency_records_for_device<'a>(
+    graph: &'a DriverDependencyGraph,
+    device: &'a DeviceRecord,
+) -> impl Iterator<Item = &'a DriverDependencyRecord> + 'a {
+    let compatible = device.compatible();
+    graph
+        .iter()
+        .filter(move |record| record.consumer_compatible() == compatible)
+}
+
+fn cascade_entries_for_device<'a>(
+    graph: &'a DriverDependencyGraph,
+    cascade: &'a DriverRestartCascadeReport,
+    device: &'a DeviceRecord,
+) -> impl Iterator<Item = &'a DriverRestartCascadeEntry> + 'a {
+    let compatible = device.compatible();
+    cascade.iter().filter(move |entry| {
+        graph.iter().any(|record| {
+            record.mock_dependency_id == entry.dependency_id
+                && record.consumer_compatible() == compatible
+        })
+    })
+}
+
+fn dependency_summary_reply(
+    graph: &DriverDependencyGraph,
+    cascade: &DriverRestartCascadeReport,
+    device: &DeviceRecord,
+) -> DependencySummaryReply {
+    let mut reply = DependencySummaryReply {
+        dependency_count: 0,
+        deferred_count: 0,
+        unsupported_count: 0,
+        cycle_blocked_count: 0,
+    };
+    for record in dependency_records_for_device(graph, device) {
+        reply.dependency_count = reply.dependency_count.saturating_add(1);
+        if matches!(record.status, DriverDependencyStatus::Deferred) {
+            reply.deferred_count = reply.deferred_count.saturating_add(1);
+        }
+        if matches!(record.status, DriverDependencyStatus::Unsupported) {
+            reply.unsupported_count = reply.unsupported_count.saturating_add(1);
+        }
+    }
+    for entry in cascade_entries_for_device(graph, cascade, device) {
+        if entry.has_cascade_blocker(DriverRestartCascadeBlocker::DependencyCycle) {
+            reply.cycle_blocked_count = reply.cycle_blocked_count.saturating_add(1);
+        }
+    }
+    reply
+}
+
+fn dependency_list_reply(
+    graph: &DriverDependencyGraph,
+    device: &DeviceRecord,
+) -> DependencyListReply {
+    let mut reply = DependencyListReply {
+        dependency_count: 0,
+        encoded_count: 0,
+        truncated: false,
+        entries: [None; MAX_DEPENDENCY_QUERY_RECORDS],
+    };
+    for record in dependency_records_for_device(graph, device) {
+        let index = reply.dependency_count as usize;
+        reply.dependency_count = reply.dependency_count.saturating_add(1);
+        if index >= MAX_DEPENDENCY_QUERY_RECORDS {
+            reply.truncated = true;
+            continue;
+        }
+        let mut provider_name = [0u8; 16];
+        let provider = record.provider_compatible().unwrap_or("unknown").as_bytes();
+        let provider_len = provider.len().min(provider_name.len());
+        provider_name[..provider_len].copy_from_slice(&provider[..provider_len]);
+        reply.entries[index] = Some(DependencyListEntry {
+            dependency_id: record.mock_dependency_id,
+            provider_mock_request_id: record.provider_mock_request_id.unwrap_or(0),
+            consumer_mock_request_id: record.consumer_mock_request_id,
+            kind: record.kind,
+            status: record.status,
+            first_failure: record.failures.iter().filter_map(|failure| *failure).next(),
+            provider_name,
+            provider_name_len: provider_len,
+        });
+        reply.encoded_count = reply.encoded_count.saturating_add(1);
+    }
+    reply
+}
+
+fn dependency_status_reply(
+    graph: &DriverDependencyGraph,
+    cascade: &DriverRestartCascadeReport,
+    device: &DeviceRecord,
+) -> DependencyStatusReply {
+    let summary = dependency_summary_reply(graph, cascade, device);
+    let mut status = DriverDependencyStatus::Satisfied;
+    let mut first_failure = None;
+    for record in dependency_records_for_device(graph, device) {
+        if first_failure.is_none() {
+            first_failure = record.failures.iter().filter_map(|failure| *failure).next();
+        }
+        status = merge_dependency_status(status, record.status);
+    }
+    let mut cycle_blocked = summary.cycle_blocked_count != 0;
+    for entry in cascade_entries_for_device(graph, cascade, device) {
+        if entry.has_cascade_blocker(DriverRestartCascadeBlocker::DependencyCycle) {
+            cycle_blocked = true;
+            status = DriverDependencyStatus::CascadeBlocked;
+            first_failure = Some(DriverDependencyFailure::DependencyCycle);
+        }
+        if entry.has_cascade_blocker(DriverRestartCascadeBlocker::UnknownDependency)
+            && status != DriverDependencyStatus::Unsupported
+        {
+            status = DriverDependencyStatus::CascadeBlocked;
+            first_failure.get_or_insert(DriverDependencyFailure::UnknownDependency);
+        }
+    }
+    DependencyStatusReply {
+        status,
+        first_failure,
+        dependency_count: summary.dependency_count,
+        deferred: summary.deferred_count != 0,
+        unsupported: summary.unsupported_count != 0,
+        satisfied: status == DriverDependencyStatus::Satisfied,
+        cycle_blocked,
+    }
+}
+
+fn cascade_status_reply(
+    graph: &DriverDependencyGraph,
+    cascade: &DriverRestartCascadeReport,
+    device: &DeviceRecord,
+) -> CascadeStatusReply {
+    let mut reply = CascadeStatusReply {
+        action: DriverRestartCascadeAction::NoAction,
+        reason: None,
+        first_blocker: None,
+        affected_provider_mock_request_id: 0,
+        affected_consumer_mock_request_id: 0,
+        referenced_restart_request_id: 0,
+        entry_count: 0,
+    };
+    for entry in cascade_entries_for_device(graph, cascade, device) {
+        reply.entry_count = reply.entry_count.saturating_add(1);
+        if cascade_action_priority(entry.action) >= cascade_action_priority(reply.action) {
+            reply.action = entry.action;
+            reply.reason = entry.reason;
+            reply.first_blocker = entry.blockers.iter().filter_map(|blocker| *blocker).next();
+            reply.affected_provider_mock_request_id = entry.provider_mock_request_id.unwrap_or(0);
+            reply.affected_consumer_mock_request_id = entry.consumer_mock_request_id;
+            reply.referenced_restart_request_id = entry.referenced_restart_request_id.unwrap_or(0);
+        }
+    }
+    reply
+}
+
+fn restart_recommendation_reply(
+    graph: &DriverDependencyGraph,
+    cascade: &DriverRestartCascadeReport,
+    device: &DeviceRecord,
+) -> RestartRecommendationReply {
+    let cascade = cascade_status_reply(graph, cascade, device);
+    RestartRecommendationReply {
+        action: cascade.action,
+        would_recommend_restart: cascade.action
+            == DriverRestartCascadeAction::RecommendConsumerRestart,
+        would_recommend_quiesce: cascade.action
+            == DriverRestartCascadeAction::RecommendConsumerQuiesce,
+        would_recommend_after_provider: cascade.action
+            == DriverRestartCascadeAction::RecommendRestartAfterProvider,
+        referenced_restart_request_id: cascade.referenced_restart_request_id,
+        first_blocker: cascade.first_blocker,
+    }
+}
+
+fn merge_dependency_status(
+    current: DriverDependencyStatus,
+    next: DriverDependencyStatus,
+) -> DriverDependencyStatus {
+    if dependency_status_priority(next) > dependency_status_priority(current) {
+        next
+    } else {
+        current
+    }
+}
+
+fn dependency_status_priority(status: DriverDependencyStatus) -> u8 {
+    match status {
+        DriverDependencyStatus::Satisfied => 0,
+        DriverDependencyStatus::ConsumerRestartRecommended => 1,
+        DriverDependencyStatus::ProviderRestartPending => 2,
+        DriverDependencyStatus::ProviderCrashed => 3,
+        DriverDependencyStatus::Deferred | DriverDependencyStatus::Missing => 4,
+        DriverDependencyStatus::Unsupported => 5,
+        DriverDependencyStatus::CascadeBlocked => 6,
+    }
+}
+
+fn cascade_action_priority(action: DriverRestartCascadeAction) -> u8 {
+    match action {
+        DriverRestartCascadeAction::NoAction => 0,
+        DriverRestartCascadeAction::MarkProviderUnhealthy => 1,
+        DriverRestartCascadeAction::RecommendConsumerQuiesce => 2,
+        DriverRestartCascadeAction::RecommendRestartAfterProvider => 3,
+        DriverRestartCascadeAction::RecommendConsumerRestart => 4,
+        DriverRestartCascadeAction::DeferCascade => 5,
+        DriverRestartCascadeAction::Unsupported => 6,
+        DriverRestartCascadeAction::DenyCascade => 7,
+    }
+}
+
+fn dependency_kind_code(kind: DriverDependencyKind) -> u32 {
+    match kind {
+        DriverDependencyKind::UsesService => 1,
+        DriverDependencyKind::ProvidesService => 2,
+        DriverDependencyKind::RequiresDevice => 3,
+        DriverDependencyKind::RequiresBus => 4,
+        DriverDependencyKind::RequiresIrqMux => 5,
+        DriverDependencyKind::RequiresMailbox => 6,
+        DriverDependencyKind::RequiresBlockBackend => 7,
+        DriverDependencyKind::RequiresFilesystem => 8,
+        DriverDependencyKind::RequiresNetwork => 9,
+        DriverDependencyKind::DebugOnly => 10,
+    }
+}
+
+fn dependency_status_code(status: DriverDependencyStatus) -> u32 {
+    match status {
+        DriverDependencyStatus::Satisfied => 1,
+        DriverDependencyStatus::Missing => 2,
+        DriverDependencyStatus::Deferred => 3,
+        DriverDependencyStatus::Unsupported => 4,
+        DriverDependencyStatus::ProviderCrashed => 5,
+        DriverDependencyStatus::ProviderRestartPending => 6,
+        DriverDependencyStatus::ConsumerRestartRecommended => 7,
+        DriverDependencyStatus::CascadeBlocked => 8,
+    }
+}
+
+fn dependency_failure_code(failure: DriverDependencyFailure) -> u32 {
+    match failure {
+        DriverDependencyFailure::MissingProvider => 1,
+        DriverDependencyFailure::ProviderDeferred => 2,
+        DriverDependencyFailure::ProviderUnsupported => 3,
+        DriverDependencyFailure::ProviderUnhealthy => 4,
+        DriverDependencyFailure::UnknownDependency => 5,
+        DriverDependencyFailure::DependencyCycle => 6,
+        DriverDependencyFailure::DisabledOrDeferredConsumer => 7,
+    }
+}
+
+fn cascade_action_code(action: DriverRestartCascadeAction) -> u32 {
+    match action {
+        DriverRestartCascadeAction::NoAction => 1,
+        DriverRestartCascadeAction::MarkProviderUnhealthy => 2,
+        DriverRestartCascadeAction::RecommendConsumerRestart => 3,
+        DriverRestartCascadeAction::RecommendConsumerQuiesce => 4,
+        DriverRestartCascadeAction::RecommendRestartAfterProvider => 5,
+        DriverRestartCascadeAction::DenyCascade => 6,
+        DriverRestartCascadeAction::DeferCascade => 7,
+        DriverRestartCascadeAction::Unsupported => 8,
+    }
+}
+
+fn cascade_reason_code(reason: DriverRestartCascadeReason) -> u32 {
+    match reason {
+        DriverRestartCascadeReason::ProviderCrashed => 1,
+        DriverRestartCascadeReason::ProviderExited => 2,
+        DriverRestartCascadeReason::ProviderUnresponsive => 3,
+        DriverRestartCascadeReason::ProviderRestartPending => 4,
+        DriverRestartCascadeReason::DependencyMissing => 5,
+        DriverRestartCascadeReason::ManualPolicy => 6,
+        DriverRestartCascadeReason::HealthPolicy => 7,
+    }
+}
+
+fn cascade_blocker_code(blocker: DriverRestartCascadeBlocker) -> u32 {
+    match blocker {
+        DriverRestartCascadeBlocker::ProviderDeferred => 1,
+        DriverRestartCascadeBlocker::ProviderUnsupported => 2,
+        DriverRestartCascadeBlocker::ConsumerAlreadyHealthy => 3,
+        DriverRestartCascadeBlocker::ConsumerAlreadyRestartPending => 4,
+        DriverRestartCascadeBlocker::RestartLimitExceeded => 5,
+        DriverRestartCascadeBlocker::MissingPmAuthority => 6,
+        DriverRestartCascadeBlocker::ResourcePolicyDenied => 7,
+        DriverRestartCascadeBlocker::DependencyCycle => 8,
+        DriverRestartCascadeBlocker::UnknownDependency => 9,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8364,6 +8882,460 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
         assert!(first.len() <= MAX_RESTART_CASCADE_ENTRIES);
+        assert_eq!(control.registered.get(), None);
+        assert_eq!(control.irq_grant.get(), None);
+        assert_eq!(control.dma_grant.get(), None);
+        assert_eq!(control.restarted.get(), None);
+    }
+
+    fn readout_inventory(devices: &[DeviceRecord]) -> PlatformInventory {
+        let mut inventory = PlatformInventory::new();
+        for device in devices {
+            inventory.add(*device).unwrap();
+        }
+        inventory
+    }
+
+    fn readout_query(
+        opcode: u16,
+        tid: u64,
+        inventory: &PlatformInventory,
+        graph: &DriverDependencyGraph,
+        cascade: &DriverRestartCascadeReport,
+        sender: Option<u64>,
+    ) -> Result<Message, KernelIpcError> {
+        handle_dependency_readout_query(
+            DependencyReadoutContext {
+                inventory,
+                graph,
+                cascade,
+            },
+            &msg(opcode, &[tid]),
+            sender,
+        )
+    }
+
+    fn payload_u32(payload: &[u8], offset: usize) -> u32 {
+        let mut bytes = [0u8; 4];
+        bytes.copy_from_slice(&payload[offset..offset + 4]);
+        u32::from_le_bytes(bytes)
+    }
+
+    #[test]
+    fn drs14_pl011_queries_empty_satisfied_dependency_status() {
+        let device = DeviceRecord::new(
+            "arm,pl011",
+            DeviceClass::Uart,
+            "uart_srv",
+            DeviceStatus::Discovered,
+        )
+        .unwrap()
+        .assigned_to(7)
+        .unwrap();
+        let inventory = readout_inventory(&[device]);
+        let graph = DriverDependencyGraph::new();
+        let cascade = DriverRestartCascadeReport::new();
+        let reply = readout_query(
+            DRIVER_OP_QUERY_MY_DEPENDENCY_STATUS,
+            7,
+            &inventory,
+            &graph,
+            &cascade,
+            Some(7),
+        )
+        .unwrap();
+        assert_eq!(reply.transferred_cap(), None);
+        assert_eq!(reply.as_slice().len(), DependencyStatusReply::BYTE_LEN);
+        assert_eq!(
+            payload_u32(reply.as_slice(), 0),
+            dependency_status_code(DriverDependencyStatus::Satisfied)
+        );
+        assert_eq!(payload_u32(reply.as_slice(), 8), 0);
+        assert_eq!(payload_u32(reply.as_slice(), 20), 1);
+    }
+
+    #[test]
+    fn drs14_rp1_and_mailbox_query_deferred_status_cap_free() {
+        let gpio_device = DeviceRecord::new(
+            "raspberrypi,rp1-gpio",
+            DeviceClass::Gpio,
+            "gpio_srv",
+            DeviceStatus::DeferredNoMmioGrant,
+        )
+        .unwrap()
+        .assigned_to(8)
+        .unwrap();
+        let mailbox_device = DeviceRecord::new(
+            "brcm,bcm2835-mbox",
+            DeviceClass::Mailbox,
+            "mailbox_srv",
+            DeviceStatus::DeferredNoMmioGrant,
+        )
+        .unwrap()
+        .assigned_to(9)
+        .unwrap();
+        let inventory = readout_inventory(&[gpio_device, mailbox_device]);
+        let mut graph = DriverDependencyGraph::new();
+        let mut rp1 = DriverDependencyRecord::new_mock(
+            1,
+            1,
+            None,
+            "raspberrypi,rp1-gpio",
+            "mock-pcie-rp1-bar",
+            DriverDependencyKind::RequiresBus,
+            DriverDependencyStatus::Deferred,
+        )
+        .unwrap();
+        rp1.push_failure(DriverDependencyFailure::ProviderDeferred)
+            .unwrap();
+        graph.push(rp1).unwrap();
+        let mut mailbox = DriverDependencyRecord::new_mock(
+            2,
+            2,
+            None,
+            "brcm,bcm2835-mbox",
+            "mock-mailbox-transport-cache-mmio",
+            DriverDependencyKind::RequiresMailbox,
+            DriverDependencyStatus::Deferred,
+        )
+        .unwrap();
+        mailbox
+            .push_failure(DriverDependencyFailure::ProviderDeferred)
+            .unwrap();
+        graph.push(mailbox).unwrap();
+        let cascade = graph
+            .build_restart_cascade_report(
+                &DriverHealthTable::new(),
+                &DriverRestartRequestBundle::new(),
+                DriverRestartCascadePolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        for tid in [8, 9] {
+            let reply = readout_query(
+                DRIVER_OP_QUERY_MY_DEPENDENCY_STATUS,
+                tid,
+                &inventory,
+                &graph,
+                &cascade,
+                Some(tid),
+            )
+            .unwrap();
+            assert_eq!(reply.transferred_cap(), None);
+            assert_eq!(
+                payload_u32(reply.as_slice(), 0),
+                dependency_status_code(DriverDependencyStatus::Deferred)
+            );
+            assert_eq!(payload_u32(reply.as_slice(), 12), 1);
+        }
+    }
+
+    #[test]
+    fn drs14_irqmux_provider_crash_queries_advisory_cascade_impact() {
+        let consumer_device = DeviceRecord::new(
+            "test,gpio",
+            DeviceClass::Gpio,
+            "gpio_srv",
+            DeviceStatus::Discovered,
+        )
+        .unwrap()
+        .assigned_to(10)
+        .unwrap();
+        let inventory = readout_inventory(&[consumer_device]);
+        let consumer = dependency_test_request(
+            2,
+            "test,gpio",
+            DeviceClass::Gpio,
+            DriverSpawnRequestStatus::ReadyForPmValidation,
+        );
+        let health = dependency_test_health_table(&[dependency_test_health(
+            &consumer,
+            DriverHealthStatus::Unresponsive,
+            0,
+        )]);
+        let mut graph = DriverDependencyGraph::new();
+        graph
+            .push(
+                DriverDependencyRecord::new_mock(
+                    1,
+                    2,
+                    Some(1),
+                    "test,gpio",
+                    "yarm,irqmux",
+                    DriverDependencyKind::RequiresIrqMux,
+                    DriverDependencyStatus::ProviderCrashed,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let cascade = graph
+            .build_restart_cascade_report(
+                &health,
+                &DriverRestartRequestBundle::new(),
+                DriverRestartCascadePolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let reply = readout_query(
+            DRIVER_OP_QUERY_MY_CASCADE_STATUS,
+            10,
+            &inventory,
+            &graph,
+            &cascade,
+            Some(10),
+        )
+        .unwrap();
+        assert_eq!(reply.transferred_cap(), None);
+        assert_eq!(
+            payload_u32(reply.as_slice(), 0),
+            cascade_action_code(DriverRestartCascadeAction::RecommendConsumerRestart)
+        );
+        let restart = readout_query(
+            DRIVER_OP_QUERY_MY_RESTART_RECOMMENDATION,
+            10,
+            &inventory,
+            &graph,
+            &cascade,
+            Some(10),
+        )
+        .unwrap();
+        assert_eq!(payload_u32(restart.as_slice(), 4), 1);
+    }
+
+    #[test]
+    fn drs14_unknown_and_cycle_queries_fail_closed() {
+        let unknown_device = DeviceRecord::new(
+            "vendor,unknown",
+            DeviceClass::Unknown,
+            "unknown_srv",
+            DeviceStatus::Unsupported,
+        )
+        .unwrap()
+        .assigned_to(11)
+        .unwrap();
+        let cycle_device = DeviceRecord::new(
+            "mock,a",
+            DeviceClass::Block,
+            "block_srv",
+            DeviceStatus::Discovered,
+        )
+        .unwrap()
+        .assigned_to(12)
+        .unwrap();
+        let inventory = readout_inventory(&[unknown_device, cycle_device]);
+        let mut graph = DriverDependencyGraph::new();
+        let mut unknown = DriverDependencyRecord::new_mock(
+            1,
+            1,
+            None,
+            "vendor,unknown",
+            "mock-unknown-provider",
+            DriverDependencyKind::RequiresDevice,
+            DriverDependencyStatus::Unsupported,
+        )
+        .unwrap();
+        unknown
+            .push_failure(DriverDependencyFailure::UnknownDependency)
+            .unwrap();
+        graph.push(unknown).unwrap();
+        graph
+            .push(
+                DriverDependencyRecord::new_mock(
+                    2,
+                    2,
+                    Some(3),
+                    "mock,a",
+                    "mock,b",
+                    DriverDependencyKind::UsesService,
+                    DriverDependencyStatus::ProviderCrashed,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        graph
+            .push(
+                DriverDependencyRecord::new_mock(
+                    3,
+                    3,
+                    Some(2),
+                    "mock,b",
+                    "mock,a",
+                    DriverDependencyKind::UsesService,
+                    DriverDependencyStatus::ProviderCrashed,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let a = dependency_test_request(
+            2,
+            "mock,a",
+            DeviceClass::Block,
+            DriverSpawnRequestStatus::ReadyForPmValidation,
+        );
+        let b = dependency_test_request(
+            3,
+            "mock,b",
+            DeviceClass::Block,
+            DriverSpawnRequestStatus::ReadyForPmValidation,
+        );
+        let health = dependency_test_health_table(&[
+            dependency_test_health(&a, DriverHealthStatus::Unresponsive, 0),
+            dependency_test_health(&b, DriverHealthStatus::Unresponsive, 0),
+        ]);
+        let cascade = graph
+            .build_restart_cascade_report(
+                &health,
+                &DriverRestartRequestBundle::new(),
+                DriverRestartCascadePolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let unknown_reply = readout_query(
+            DRIVER_OP_QUERY_MY_DEPENDENCY_STATUS,
+            11,
+            &inventory,
+            &graph,
+            &cascade,
+            Some(11),
+        )
+        .unwrap();
+        assert_eq!(
+            payload_u32(unknown_reply.as_slice(), 0),
+            dependency_status_code(DriverDependencyStatus::Unsupported)
+        );
+        assert_eq!(
+            payload_u32(unknown_reply.as_slice(), 4),
+            dependency_failure_code(DriverDependencyFailure::UnknownDependency)
+        );
+        let cycle_reply = readout_query(
+            DRIVER_OP_QUERY_MY_DEPENDENCY_STATUS,
+            12,
+            &inventory,
+            &graph,
+            &cascade,
+            Some(12),
+        )
+        .unwrap();
+        assert_eq!(
+            payload_u32(cycle_reply.as_slice(), 0),
+            dependency_status_code(DriverDependencyStatus::CascadeBlocked)
+        );
+        assert_eq!(
+            payload_u32(cycle_reply.as_slice(), 4),
+            dependency_failure_code(DriverDependencyFailure::DependencyCycle)
+        );
+    }
+
+    #[test]
+    fn drs14_sender_scope_rejects_missing_spoofed_and_unassigned() {
+        let device = DeviceRecord::new(
+            "arm,pl011",
+            DeviceClass::Uart,
+            "uart_srv",
+            DeviceStatus::Discovered,
+        )
+        .unwrap()
+        .assigned_to(7)
+        .unwrap();
+        let inventory = readout_inventory(&[device]);
+        let graph = DriverDependencyGraph::new();
+        let cascade = DriverRestartCascadeReport::new();
+        assert_eq!(
+            readout_query(
+                DRIVER_OP_QUERY_MY_DEPENDENCIES,
+                7,
+                &inventory,
+                &graph,
+                &cascade,
+                None
+            ),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(
+            readout_query(
+                DRIVER_OP_QUERY_MY_DEPENDENCIES,
+                7,
+                &inventory,
+                &graph,
+                &cascade,
+                Some(8)
+            ),
+            Err(KernelIpcError::MissingRight)
+        );
+        assert_eq!(
+            readout_query(
+                DRIVER_OP_QUERY_MY_DEPENDENCIES,
+                0,
+                &inventory,
+                &graph,
+                &cascade,
+                Some(99)
+            ),
+            Err(KernelIpcError::TaskMissing)
+        );
+    }
+
+    #[test]
+    fn drs14_replies_are_bounded_cap_free_and_queries_do_not_mutate_or_call_control_ops() {
+        let control = MockDriverControl::new();
+        let device = DeviceRecord::new(
+            "mock,consumer",
+            DeviceClass::Block,
+            "block_srv",
+            DeviceStatus::Discovered,
+        )
+        .unwrap()
+        .assigned_to(13)
+        .unwrap();
+        let inventory = readout_inventory(&[device]);
+        let mut graph = DriverDependencyGraph::new();
+        graph
+            .push(
+                DriverDependencyRecord::new_mock(
+                    1,
+                    1,
+                    None,
+                    "mock,consumer",
+                    "mock,provider",
+                    DriverDependencyKind::UsesService,
+                    DriverDependencyStatus::Satisfied,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let graph_before = graph.clone();
+        let cascade = graph
+            .build_restart_cascade_report(
+                &DriverHealthTable::new(),
+                &DriverRestartRequestBundle::new(),
+                DriverRestartCascadePolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        let cascade_before = cascade.clone();
+        let inventory_len = inventory.len();
+        let lengths = [
+            (
+                DRIVER_OP_QUERY_MY_DEPENDENCIES,
+                DependencyListReply::BYTE_LEN,
+            ),
+            (
+                DRIVER_OP_QUERY_MY_DEPENDENCY_STATUS,
+                DependencyStatusReply::BYTE_LEN,
+            ),
+            (
+                DRIVER_OP_QUERY_MY_CASCADE_STATUS,
+                CascadeStatusReply::BYTE_LEN,
+            ),
+            (
+                DRIVER_OP_QUERY_MY_RESTART_RECOMMENDATION,
+                RestartRecommendationReply::BYTE_LEN,
+            ),
+        ];
+        for (opcode, len) in lengths {
+            let reply = readout_query(opcode, 13, &inventory, &graph, &cascade, Some(13)).unwrap();
+            assert_eq!(reply.as_slice().len(), len);
+            assert_eq!(reply.transferred_cap(), None);
+        }
+        assert_eq!(inventory.len(), inventory_len);
+        assert_eq!(graph, graph_before);
+        assert_eq!(cascade, cascade_before);
         assert_eq!(control.registered.get(), None);
         assert_eq!(control.irq_grant.get(), None);
         assert_eq!(control.dma_grant.get(), None);

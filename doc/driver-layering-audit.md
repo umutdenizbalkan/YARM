@@ -129,8 +129,10 @@ mocks.
   death-notification, health, and restart-request correlation. DRS-13 adds
   inert dependency-health and restart-cascade modeling for provider/consumer
   impact, restart ordering recommendations, and fail-closed dependency-cycle
-  detection. All remain data only and are not PM calls, supervisor calls,
-  restarts, cap mint/revoke operations, grants, teardown, or MMIO. The harness
+  detection. DRS-14 adds bounded sender-scoped dependency/cascade readouts with
+  verified identity, diagnostic-only payload TIDs, and cap-free replies. All
+  remain data only and are not PM calls, supervisor calls, restarts, cap
+  mint/revoke operations, grants, teardown, or MMIO. The harness
   does not parse the live boot DTB, grant resources, perform MMIO, call PM, or
   spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md) and the design-only future

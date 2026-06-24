@@ -77,6 +77,10 @@ The current hosted and mock-safe DRS path is:
     records that model provider/consumer health, deferred RP1/mailbox
     dependencies, IRQ consumer impact, restart ordering recommendations, and
     fail-closed dependency-cycle handling without invoking PM.
+14. DRS-14 inert dependency/cascade query readouts expose bounded, cap-free,
+    sender-scoped diagnostic replies for a driver's own dependency and cascade
+    state. Payload TIDs are diagnostic only and spoofed claims fail closed; these
+    driver-manager-local opcodes are not syscall ABI or global IPC ABI additions.
 
 This pipeline is descriptive. It never calls PM or supervisor services, never
 spawns a task, never grants resources, never transfers caps, and never touches
@@ -309,6 +313,11 @@ The existing DRS models map to the future contract as follows:
   cap mint/revoke, startup-cap delivery, and handles. RP1 GPIO remains deferred
   on PCIe/RP1 BAR policy; mailbox remains deferred on transport/cache/MMIO
   policy; dependency cycles and unknown providers become cascade blockers.
+- DRS-14 dependency/cascade readouts are also advisory only: queries require
+  verified sender identity, are scoped to the sender's assigned inert instance,
+  treat payload TIDs as diagnostic only, return fixed-size cap-free payloads,
+  and do not create duplicate restart requests or mutate inventory, registry,
+  health, dependency, restart, or cascade state.
 - No mock model itself grants authority, mints caps, revokes caps, calls PM, creates or restarts
   a task, or touches MMIO. A possible next step is a live-spawn/restart API
   design review or a handoff ABI review, still without live implementation.
