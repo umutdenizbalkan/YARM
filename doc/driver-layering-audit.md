@@ -114,10 +114,24 @@ mocks.
   inert approvals/denials only; it still does not call PM/supervisor services or
   spawn anything. DRS-5 adds mock resource-grant bundle descriptions for approved
   or denied plan entries; these list inert MMIO/IRQ/DMA/transport/clock/pinmux
-  requirements but never include `CapId`s or perform grant operations. The
-  harness does not parse the live boot DTB, grant resources, perform MMIO, or
-  spawn driver binaries. See
-  [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md).
+  requirements but never include `CapId`s or perform grant operations. DRS-6
+  documents the future live DM↔PM contract: Driver Manager builds policy and
+  PM-facing `DriverSpawnRequest`s, while PM validates, creates processes, sets up
+  address spaces, accounts resources, mints future caps, delivers startup caps,
+  and returns handles. DRS-7 adds the bounded inert `DriverSpawnRequest` model and
+  descriptive startup-cap/resource requirement descriptors. DRS-8 adds an inert
+  PM-validation simulation with mock verified-DM identity and conservative
+  resource/startup checks. DRS-9 adds inert PM accounting/rollback simulation with
+  descriptive reservations and reverse-order rollback steps. DRS-10 adds inert
+  health tracking and PM-facing restart-request construction. DRS-11 adds inert
+  PM restart validation/accounting and reverse-order restart rollback simulation.
+  DRS-12 adds inert mock PM handle, verified driver-registration, PM
+  death-notification, health, and restart-request correlation. All remain data
+  only and are not PM calls, restarts, cap mint/revoke operations, or grants. The harness does not parse the live boot DTB, grant
+  resources, perform MMIO, call PM, or spawn driver binaries. See
+  [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md) and the design-only future
+  DM↔PM spawn contract in
+  [`driver-manager-pm-spawn-contract.md`](driver-manager-pm-spawn-contract.md).
 
 ## Summary
 

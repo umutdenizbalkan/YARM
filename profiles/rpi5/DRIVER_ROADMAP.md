@@ -8,7 +8,9 @@ current high-half (HH) diagnostic boot to a first safe driver spawn. This is a
 **conservative audit**, not a feature claim. Hardware bring-up detail is owned by
 [`doc/RPI5_BRINGUP.md`](../../doc/RPI5_BRINGUP.md); driver/IRQ contracts live in
 [`doc/DRIVER_PROTOCOL.md`](../../doc/DRIVER_PROTOCOL.md) and
-[`doc/IRQMUX_CONTRACT.md`](../../doc/IRQMUX_CONTRACT.md).
+[`doc/IRQMUX_CONTRACT.md`](../../doc/IRQMUX_CONTRACT.md). The future live
+Driver Manager ↔ Process Manager spawn boundary is documented in
+[`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md).
 
 ## 1. Current verified boot status
 
@@ -174,6 +176,26 @@ state 9 today.
   requirements only, RP1 remains blocked on PCIe/BAR and MMIO authority, and
   mailbox/firmware remains blocked on transport/cache/MMIO policy. Bundles do
   not contain real `CapId`s, transfer caps, call grant syscalls, or touch MMIO.
+  DRS-6 documents the future live Driver Manager ↔ Process Manager spawn
+  contract in [`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md):
+  Driver Manager remains policy/advisory-only and builds future
+  `DriverSpawnRequest`s, while PM remains the mechanism owner for validation,
+  process creation, address spaces, accounting, capability minting, startup-cap
+  delivery, and handles. DRS-6 adds no live spawn path, grants, caps, PM calls,
+  MMIO, or live-DTB parsing. DRS-7 adds a bounded inert
+  `DriverSpawnRequestBundle` / `DriverSpawnRequest` model over the existing
+  inventory, spawn-plan, mock-authority, and resource-bundle pipeline; its
+  resource and startup-cap requirements are descriptive only. PL011 can become
+  `ReadyForPmValidation` in hosted data. DRS-8 adds an inert PM-validation
+  simulation that can mark that PL011 request `WouldAccept` only under mock
+  verified-DM-identity/image/resource/startup-cap policy. DRS-9 can then model
+  descriptive PL011 reservations and reverse-order rollback plans. DRS-10 can
+  model PL011 health, crash, and an inert PM-facing restart request. DRS-11 can
+  simulate PM restart validation/accounting, replacement reservations, and
+  reverse-order rollback for that inert request. DRS-12 can correlate the mock
+  PL011 PM handle, verified driver registration, PM death notification, health,
+  and restart request, while RP1 GPIO and mailbox remain deferred/BAR- or
+  transport/cache/MMIO-blocked and no live PM call or restart occurs.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.
@@ -191,8 +213,9 @@ state 9 today.
    identity, resource-grant policy, PCIe/RP1 BAR discovery, IRQ routing, and PM
    spawn authority are specified; until then they remain hosted/inert planning
    harnesses.
-4. Write the live driver-manager ↔ PM/supervisor spawn-authority and startup-cap
-   contract design document before any live spawn path.
+4. Keep the live driver-manager ↔ PM spawn-authority and startup-cap contract
+   design in [`doc/driver-manager-pm-spawn-contract.md`](../../doc/driver-manager-pm-spawn-contract.md)
+   as the gate before any live spawn path.
 5. Only then register/grant resources to a driver and let PM spawn it, gated per
    the safe-driver ordering in milestone RPi5-DRV-2.
 
