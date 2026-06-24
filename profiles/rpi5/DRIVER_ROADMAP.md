@@ -192,9 +192,10 @@ state 9 today.
   descriptive PL011 reservations and reverse-order rollback plans. DRS-10 can
   model PL011 health, crash, and an inert PM-facing restart request. DRS-11 can
   simulate PM restart validation/accounting, replacement reservations, and
-  reverse-order rollback for that inert request, while RP1 GPIO and mailbox
-  remain deferred/BAR- or transport/cache/MMIO-blocked and no live PM call or
-  restart occurs.
+  reverse-order rollback for that inert request. DRS-12 can correlate the mock
+  PL011 PM handle, verified driver registration, PM death notification, health,
+  and restart request, while RP1 GPIO and mailbox remain deferred/BAR- or
+  transport/cache/MMIO-blocked and no live PM call or restart occurs.
   Production no-op hardware control now returns errors and never fabricates
   `CapId(0)` grants. On RPi5 it is additionally blocked because userspace is not
   reached.

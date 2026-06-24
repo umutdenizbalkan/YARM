@@ -17,7 +17,11 @@ driver health tracking and PM-facing restart-request construction; restart
 requests are descriptive only and do not restart anything. DRS-11 adds inert PM
 restart-validation and restart-accounting/rollback simulation; those reports are
 audit artifacts only and still do not call PM, restart, spawn, mint caps, grant
-resources, allocate address spaces, tear down processes, or touch MMIO.
+resources, allocate address spaces, tear down processes, or touch MMIO. DRS-12
+adds inert correlation among mock PM process handles, driver self-registration,
+PM death notifications, health updates, and restart-request construction; it
+uses verified mock identities only and treats payload-claimed TIDs as diagnostic
+text, not authority.
 
 The current DRS models remain advisory mock policy/data models. They describe
 what a safe future request would contain, but they do not transfer authority.
@@ -66,11 +70,15 @@ The current hosted and mock-safe DRS path is:
     `PmRestartAccountingReport` records that simulate PM restart checks,
     replacement-process reservations, commit, and reverse-order rollback without
     invoking PM.
+12. DRS-12 inert `DriverInstanceTable` records that correlate mock PM process
+    handles, verified driver self-registration, PM death notifications, health
+    state, and PM-facing restart-request construction without invoking PM.
 
 This pipeline is descriptive. It never calls PM or supervisor services, never
 spawns a task, never grants resources, never transfers caps, and never touches
-MMIO. The DRS-8 validation report, DRS-9 accounting report, and DRS-11 restart
-validation/accounting reports are audit artifacts only; real PM remains the only
+MMIO. The DRS-8 validation report, DRS-9 accounting report, DRS-11 restart
+validation/accounting reports, and DRS-12 instance/death-correlation records are
+audit artifacts only; real PM remains the only
 future process-creation, restart mechanism,
 address-space setup, resource-accounting, rollback, cap-minting, grant,
 startup-cap-delivery, and handle-return authority. Driver Manager observes
@@ -166,7 +174,8 @@ mechanism selected by PM and kernel policy.
   Manager using kernel-provided sender metadata.
 - Driver Manager must verify the driver identity on registration using
   kernel-provided sender metadata and PM-returned handles/labels, not a
-  self-claimed payload TID.
+  self-claimed payload TID. DRS-12 models this with inert verified-sender
+  identities matched against mock PM handles.
 - Payload-claimed TIDs, image names, or record IDs are diagnostic and routing
   hints only; they are never authority.
 - All privileged requests use kernel-provided sender identity metadata.
@@ -246,9 +255,9 @@ DRS-6 explicitly does not add:
   boot, or init-bootstrap changes;
 - PM or supervisor-service calls;
 - live use of the inert DRS-7 request records, DRS-8 validation reports,
-  DRS-9 accounting reports, DRS-10 restart requests, or DRS-11 restart
-  validation/accounting reports as process-creation/restart/accounting
-  authority;
+  DRS-9 accounting reports, DRS-10 restart requests, DRS-11 restart
+  validation/accounting reports, or DRS-12 instance/death-correlation records as
+  process-creation/restart/accounting/death-notification authority;
 - service-manifest behavior changes.
 
 Driver Manager remains advisory only in this stage.
@@ -286,7 +295,12 @@ The existing DRS models map to the future contract as follows:
   space/startup-cap/handle/health-monitor slots, commit, or produce reverse-order
   rollback steps. Future live implementation must perform real restart
   validation, accounting, teardown, and rollback inside PM, not Driver Manager.
-- No mock model itself grants authority, mints caps, calls PM, creates or restarts
+- DRS-12 `DriverInstanceTable` and `PmDeathNotification` correlate accepted mock
+  PM handles, verified driver registration, PM death reports, health status, and
+  restart-request construction. Real PM will be the future source of process
+  handles and death notifications, while Driver Manager only observes and
+  requests policy actions.
+- No mock model itself grants authority, mints caps, revokes caps, calls PM, creates or restarts
   a task, or touches MMIO. A possible next step is a live-spawn/restart API
   design review or a handoff ABI review, still without live implementation.
   simulation or a live-spawn API design review, still without live implementation.

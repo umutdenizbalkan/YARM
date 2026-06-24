@@ -309,6 +309,15 @@ fn bounded_str(bytes: &[u8], len: usize) -> Option<&str> {
         .and_then(|slice| core::str::from_utf8(slice).ok())
 }
 
+fn bounded_bytes<const N: usize>(value: &str) -> Result<([u8; N], usize), KernelIpcError> {
+    if value.is_empty() || value.len() > N {
+        return Err(KernelIpcError::WrongObject);
+    }
+    let mut bytes = [0u8; N];
+    bytes[..value.len()].copy_from_slice(value.as_bytes());
+    Ok((bytes, value.len()))
+}
+
 const MAX_DEVICES: usize = 32;
 const MAX_RESOURCE_GRANT_ENTRIES: usize = MAX_DEVICES * 4;
 
@@ -3160,6 +3169,398 @@ fn restart_rollback_for_reservation(reservation: PmRestartReservation) -> PmRest
         PmRestartReservation::MmioWindowReuse
         | PmRestartReservation::IrqRouteReuse
         | PmRestartReservation::DmaWindowReuse => PmRestartRollbackStep::ClearRestartPending,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockPmProcessHandle {
+    pub mock_handle_id: u32,
+}
+
+impl MockPmProcessHandle {
+    fn from_request(request: &DriverSpawnRequest) -> Self {
+        Self {
+            mock_handle_id: 0xD000_0000 | request.mock_request_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverInstanceId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverInstanceStatus {
+    SpawnRequested,
+    PmAccepted,
+    Starting,
+    Registered,
+    Healthy,
+    Unresponsive,
+    DeathReported,
+    RestartRequested,
+    RestartPending,
+    RestartDenied,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverInstanceFailure {
+    MissingVerifiedSender,
+    MissingVerifiedPm,
+    MissingExpectedInstance,
+    SpoofedRegistration,
+    DeferredOrUnsupportedDevice,
+    DuplicateMismatch,
+    UnknownPmHandle,
+    AlreadyStopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverSelfRegistration {
+    pub verified_sender_identity: Option<u32>,
+    pub payload_claimed_tid: Option<u64>,
+    pub pm_handle: MockPmProcessHandle,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+}
+
+impl DriverSelfRegistration {
+    pub fn new(
+        verified_sender_identity: Option<u32>,
+        payload_claimed_tid: Option<u64>,
+        pm_handle: MockPmProcessHandle,
+        compatible: &str,
+        driver_candidate: &str,
+    ) -> Result<Self, KernelIpcError> {
+        let (compatible, compatible_len) = bounded_bytes::<64>(compatible)?;
+        let (driver_candidate, driver_candidate_len) = bounded_bytes::<32>(driver_candidate)?;
+        Ok(Self {
+            verified_sender_identity,
+            payload_claimed_tid,
+            pm_handle,
+            compatible,
+            compatible_len,
+            driver_candidate,
+            driver_candidate_len,
+        })
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn driver_candidate(&self) -> Option<&str> {
+        bounded_str(&self.driver_candidate, self.driver_candidate_len)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverInstanceRecord {
+    pub instance_id: DriverInstanceId,
+    pub pm_handle: MockPmProcessHandle,
+    pub original_mock_request_id: u32,
+    pub expected_driver_identity: u32,
+    pub compatible: [u8; 64],
+    pub compatible_len: usize,
+    pub driver_candidate: [u8; 32],
+    pub driver_candidate_len: usize,
+    pub status: DriverInstanceStatus,
+    pub last_failure: Option<DriverInstanceFailure>,
+    pub last_payload_claimed_tid: Option<u64>,
+}
+
+impl DriverInstanceRecord {
+    fn from_request(request: &DriverSpawnRequest) -> Self {
+        Self {
+            instance_id: DriverInstanceId(request.mock_request_id),
+            pm_handle: MockPmProcessHandle::from_request(request),
+            original_mock_request_id: request.mock_request_id,
+            expected_driver_identity: 0xA000_0000 | request.mock_request_id,
+            compatible: request.compatible,
+            compatible_len: request.compatible_len,
+            driver_candidate: request.driver_candidate,
+            driver_candidate_len: request.driver_candidate_len,
+            status: DriverInstanceStatus::Starting,
+            last_failure: None,
+            last_payload_claimed_tid: None,
+        }
+    }
+
+    pub fn compatible(&self) -> Option<&str> {
+        bounded_str(&self.compatible, self.compatible_len)
+    }
+
+    pub fn driver_candidate(&self) -> Option<&str> {
+        bounded_str(&self.driver_candidate, self.driver_candidate_len)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverInstanceTable {
+    records: [Option<DriverInstanceRecord>; MAX_DEVICES],
+    len: usize,
+}
+
+impl DriverInstanceTable {
+    pub const fn new() -> Self {
+        Self {
+            records: [None; MAX_DEVICES],
+            len: 0,
+        }
+    }
+
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &DriverInstanceRecord> {
+        self.records[..self.len]
+            .iter()
+            .filter_map(|record| record.as_ref())
+    }
+
+    pub fn record_for(&self, compatible: &str) -> Option<&DriverInstanceRecord> {
+        self.iter()
+            .find(|record| record.compatible() == Some(compatible))
+    }
+
+    pub fn record_for_handle(&self, handle: MockPmProcessHandle) -> Option<&DriverInstanceRecord> {
+        self.iter().find(|record| record.pm_handle == handle)
+    }
+
+    fn record_for_handle_mut(
+        &mut self,
+        handle: MockPmProcessHandle,
+    ) -> Option<&mut DriverInstanceRecord> {
+        self.records[..self.len]
+            .iter_mut()
+            .filter_map(|record| record.as_mut())
+            .find(|record| record.pm_handle == handle)
+    }
+
+    fn push(&mut self, record: DriverInstanceRecord) -> Result<(), KernelIpcError> {
+        if self.len >= MAX_DEVICES {
+            return Err(KernelIpcError::CapabilityFull);
+        }
+        self.records[self.len] = Some(record);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn sync_from_spawn_accounting(
+        requests: &DriverSpawnRequestBundle,
+        accounting: &PmSpawnAccountingReport,
+    ) -> Result<Self, KernelIpcError> {
+        let mut table = Self::new();
+        for (request, accounting) in requests.iter().zip(accounting.iter()) {
+            if request.mock_request_id != accounting.mock_request_id
+                || request.compatible() != accounting.compatible()
+            {
+                return Err(KernelIpcError::WrongObject);
+            }
+            if accounting.status == PmSpawnAccountingStatus::WouldCommit {
+                table.push(DriverInstanceRecord::from_request(request))?;
+            }
+        }
+        Ok(table)
+    }
+
+    pub fn apply_driver_registration(
+        &mut self,
+        health: &mut DriverHealthTable,
+        registration: DriverSelfRegistration,
+        policy: DriverHealthPolicy,
+    ) -> DriverInstanceCorrelationResult {
+        let Some(record) = self.record_for_handle_mut(registration.pm_handle) else {
+            return DriverInstanceCorrelationResult::failure(
+                DriverInstanceStatus::Stopped,
+                DriverInstanceFailure::MissingExpectedInstance,
+            );
+        };
+        record.last_payload_claimed_tid = registration.payload_claimed_tid;
+        if registration.verified_sender_identity != Some(record.expected_driver_identity) {
+            record.last_failure = Some(DriverInstanceFailure::MissingVerifiedSender);
+            return DriverInstanceCorrelationResult::failure(
+                record.status,
+                DriverInstanceFailure::MissingVerifiedSender,
+            );
+        }
+        if registration.compatible() != record.compatible()
+            || registration.driver_candidate() != record.driver_candidate()
+        {
+            record.last_failure = Some(DriverInstanceFailure::SpoofedRegistration);
+            return DriverInstanceCorrelationResult::failure(
+                record.status,
+                DriverInstanceFailure::SpoofedRegistration,
+            );
+        }
+        if matches!(
+            record.status,
+            DriverInstanceStatus::Healthy | DriverInstanceStatus::Registered
+        ) {
+            return DriverInstanceCorrelationResult::success(record.status);
+        }
+        if !matches!(
+            record.status,
+            DriverInstanceStatus::Starting | DriverInstanceStatus::PmAccepted
+        ) {
+            record.last_failure = Some(DriverInstanceFailure::DeferredOrUnsupportedDevice);
+            return DriverInstanceCorrelationResult::failure(
+                record.status,
+                DriverInstanceFailure::DeferredOrUnsupportedDevice,
+            );
+        }
+        record.status = DriverInstanceStatus::Registered;
+        let compatible = record.compatible().unwrap_or("");
+        let health_result = health.apply_event(compatible, DriverHealthEvent::Registered, policy);
+        if health_result.is_ok() {
+            record.status = DriverInstanceStatus::Healthy;
+        }
+        record.last_failure = None;
+        DriverInstanceCorrelationResult::success(record.status)
+    }
+
+    pub fn correlate_pm_death_notification(
+        &mut self,
+        health: &mut DriverHealthTable,
+        requests: &DriverSpawnRequestBundle,
+        notification: PmDeathNotification,
+        restart_policy: DriverRestartRequestPolicy,
+    ) -> Result<(PmDeathCorrelationResult, DriverRestartRequestBundle), KernelIpcError> {
+        if !notification.verified_pm_identity {
+            return Ok((
+                PmDeathCorrelationResult::failure(
+                    DriverInstanceStatus::Stopped,
+                    PmDeathCorrelationFailure::MissingVerifiedPm,
+                ),
+                DriverRestartRequestBundle::new(),
+            ));
+        }
+        let Some(record) = self.record_for_handle_mut(notification.pm_handle) else {
+            return Ok((
+                PmDeathCorrelationResult::failure(
+                    DriverInstanceStatus::Stopped,
+                    PmDeathCorrelationFailure::UnknownPmHandle,
+                ),
+                DriverRestartRequestBundle::new(),
+            ));
+        };
+        if record.status == DriverInstanceStatus::Stopped {
+            return Ok((
+                PmDeathCorrelationResult::failure(
+                    DriverInstanceStatus::Stopped,
+                    PmDeathCorrelationFailure::AlreadyStopped,
+                ),
+                DriverRestartRequestBundle::new(),
+            ));
+        }
+        let compatible = record.compatible;
+        let compatible_len = record.compatible_len;
+        let event = match notification.reason {
+            PmDeathReason::Crash | PmDeathReason::Fault | PmDeathReason::StartupTimeout => {
+                DriverHealthEvent::CrashReported
+            }
+            PmDeathReason::Exit | PmDeathReason::Killed => DriverHealthEvent::ExitReported,
+            PmDeathReason::Unknown => DriverHealthEvent::CrashReported,
+        };
+        let compatible_str =
+            bounded_str(&compatible, compatible_len).ok_or(KernelIpcError::WrongObject)?;
+        health.apply_event(
+            compatible_str,
+            event,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        )?;
+        record.status = match notification.reason {
+            PmDeathReason::Exit | PmDeathReason::Killed => DriverInstanceStatus::Stopped,
+            _ => DriverInstanceStatus::DeathReported,
+        };
+        let restart = requests.build_restart_request_bundle(health, restart_policy)?;
+        let restart_requested = restart.iter().any(|request| {
+            request.compatible() == Some(compatible_str)
+                && request.decision == DriverRestartDecision::WouldRequest
+        });
+        if restart_requested {
+            record.status = DriverInstanceStatus::RestartRequested;
+        }
+        Ok((
+            PmDeathCorrelationResult {
+                pm_handle: notification.pm_handle,
+                status: record.status,
+                reason: Some(notification.reason),
+                restart_requested,
+                failure: None,
+            },
+            restart,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DriverInstanceCorrelationResult {
+    pub status: DriverInstanceStatus,
+    pub failure: Option<DriverInstanceFailure>,
+}
+
+impl DriverInstanceCorrelationResult {
+    fn success(status: DriverInstanceStatus) -> Self {
+        Self {
+            status,
+            failure: None,
+        }
+    }
+
+    fn failure(status: DriverInstanceStatus, failure: DriverInstanceFailure) -> Self {
+        Self {
+            status,
+            failure: Some(failure),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmDeathReason {
+    Crash,
+    Exit,
+    Killed,
+    Fault,
+    StartupTimeout,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmDeathNotification {
+    pub verified_pm_identity: bool,
+    pub pm_handle: MockPmProcessHandle,
+    pub reason: PmDeathReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmDeathCorrelationFailure {
+    MissingVerifiedPm,
+    UnknownPmHandle,
+    AlreadyStopped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmDeathCorrelationResult {
+    pub pm_handle: MockPmProcessHandle,
+    pub status: DriverInstanceStatus,
+    pub reason: Option<PmDeathReason>,
+    pub restart_requested: bool,
+    pub failure: Option<PmDeathCorrelationFailure>,
+}
+
+impl PmDeathCorrelationResult {
+    fn failure(status: DriverInstanceStatus, failure: PmDeathCorrelationFailure) -> Self {
+        Self {
+            pm_handle: MockPmProcessHandle { mock_handle_id: 0 },
+            status,
+            reason: None,
+            restart_requested: false,
+            failure: Some(failure),
+        }
     }
 }
 
@@ -6303,6 +6704,283 @@ mod tests {
         for entry in accounting_report.iter() {
             assert_ne!(entry.mock_restart_request_id, 0);
         }
+    }
+
+    fn build_driver_instance_pipeline() -> (
+        DriverSpawnRequestBundle,
+        PmSpawnAccountingReport,
+        DriverHealthTable,
+        DriverInstanceTable,
+    ) {
+        let (_, requests, validation, accounting) =
+            build_fake_rpi5_accounting_report(PmSpawnAccountingPolicy::hosted_fake_rpi5());
+        let health =
+            DriverHealthTable::sync_from_spawn_reports(&requests, &validation, &accounting)
+                .unwrap();
+        let instances =
+            DriverInstanceTable::sync_from_spawn_accounting(&requests, &accounting).unwrap();
+        (requests, accounting, health, instances)
+    }
+
+    fn pl011_registration(record: &DriverInstanceRecord) -> DriverSelfRegistration {
+        DriverSelfRegistration::new(
+            Some(record.expected_driver_identity),
+            Some(0xDEAD_BEEF),
+            record.pm_handle,
+            "arm,pl011",
+            "uart_srv",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn accepted_accounted_pl011_spawn_becomes_expected_instance_and_registers_healthy() {
+        let (_, _, mut health, mut instances) = build_driver_instance_pipeline();
+        assert_eq!(instances.len(), 1);
+        let initial = instances.record_for("arm,pl011").unwrap();
+        assert_eq!(initial.status, DriverInstanceStatus::Starting);
+        assert_ne!(initial.pm_handle.mock_handle_id, 0);
+        let registration = pl011_registration(initial);
+        let result = instances.apply_driver_registration(
+            &mut health,
+            registration,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        assert_eq!(result.failure, None);
+        assert_eq!(result.status, DriverInstanceStatus::Healthy);
+        let pl011 = instances.record_for("arm,pl011").unwrap();
+        assert_eq!(pl011.status, DriverInstanceStatus::Healthy);
+        assert_eq!(pl011.last_payload_claimed_tid, Some(0xDEAD_BEEF));
+        assert_eq!(
+            health.record_for("arm,pl011").unwrap().status,
+            DriverHealthStatus::Healthy
+        );
+
+        let duplicate = instances.apply_driver_registration(
+            &mut health,
+            registration,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        assert_eq!(duplicate.failure, None);
+        assert_eq!(duplicate.status, DriverInstanceStatus::Healthy);
+    }
+
+    #[test]
+    fn driver_registration_requires_verified_sender_and_rejects_spoofed_or_deferred_devices() {
+        let (_, _, mut health, mut instances) = build_driver_instance_pipeline();
+        let pl011 = *instances.record_for("arm,pl011").unwrap();
+        let missing_sender = DriverSelfRegistration::new(
+            None,
+            Some(u64::from(pl011.expected_driver_identity)),
+            pl011.pm_handle,
+            "arm,pl011",
+            "uart_srv",
+        )
+        .unwrap();
+        let result = instances.apply_driver_registration(
+            &mut health,
+            missing_sender,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        assert_eq!(
+            result.failure,
+            Some(DriverInstanceFailure::MissingVerifiedSender)
+        );
+        assert_eq!(
+            instances.record_for("arm,pl011").unwrap().status,
+            DriverInstanceStatus::Starting
+        );
+
+        let spoofed = DriverSelfRegistration::new(
+            Some(pl011.expected_driver_identity),
+            None,
+            pl011.pm_handle,
+            "raspberrypi,rp1-gpio",
+            "rp1_gpio_srv",
+        )
+        .unwrap();
+        let result = instances.apply_driver_registration(
+            &mut health,
+            spoofed,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        assert_eq!(
+            result.failure,
+            Some(DriverInstanceFailure::SpoofedRegistration)
+        );
+        assert!(instances.record_for("raspberrypi,rp1-gpio").is_none());
+        assert!(instances.record_for("raspberrypi,firmware").is_none());
+        assert!(instances.record_for("vendor,unknown").is_none());
+
+        let deferred_handle = MockPmProcessHandle {
+            mock_handle_id: 0xD000_0002,
+        };
+        let deferred = DriverSelfRegistration::new(
+            Some(0xA000_0002),
+            None,
+            deferred_handle,
+            "raspberrypi,rp1-gpio",
+            "rp1_gpio_srv",
+        )
+        .unwrap();
+        let result = instances.apply_driver_registration(
+            &mut health,
+            deferred,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        assert_eq!(
+            result.failure,
+            Some(DriverInstanceFailure::MissingExpectedInstance)
+        );
+    }
+
+    #[test]
+    fn verified_pm_death_notification_moves_pl011_to_crashed_and_builds_restart_request() {
+        let (requests, _, mut health, mut instances) = build_driver_instance_pipeline();
+        let registration = pl011_registration(instances.record_for("arm,pl011").unwrap());
+        instances.apply_driver_registration(
+            &mut health,
+            registration,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        let handle = instances.record_for("arm,pl011").unwrap().pm_handle;
+        let (result, restart) = instances
+            .correlate_pm_death_notification(
+                &mut health,
+                &requests,
+                PmDeathNotification {
+                    verified_pm_identity: true,
+                    pm_handle: handle,
+                    reason: PmDeathReason::Crash,
+                },
+                DriverRestartRequestPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(result.failure, None);
+        assert!(result.restart_requested);
+        assert_eq!(result.status, DriverInstanceStatus::RestartRequested);
+        assert_eq!(
+            health.record_for("arm,pl011").unwrap().status,
+            DriverHealthStatus::Crashed
+        );
+        let pl011_restart = restart_request(&restart, "arm,pl011");
+        assert_eq!(pl011_restart.decision, DriverRestartDecision::WouldRequest);
+        assert_eq!(pl011_restart.reason, Some(DriverRestartReason::Crashed));
+    }
+
+    #[test]
+    fn pm_death_notification_rejects_invalid_pm_unknown_handle_and_enforces_restart_limit() {
+        let (requests, _, mut health, mut instances) = build_driver_instance_pipeline();
+        let registration = pl011_registration(instances.record_for("arm,pl011").unwrap());
+        instances.apply_driver_registration(
+            &mut health,
+            registration,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        let handle = instances.record_for("arm,pl011").unwrap().pm_handle;
+        let (invalid_pm, restart) = instances
+            .correlate_pm_death_notification(
+                &mut health,
+                &requests,
+                PmDeathNotification {
+                    verified_pm_identity: false,
+                    pm_handle: handle,
+                    reason: PmDeathReason::Crash,
+                },
+                DriverRestartRequestPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(
+            invalid_pm.failure,
+            Some(PmDeathCorrelationFailure::MissingVerifiedPm)
+        );
+        assert_eq!(restart.len(), 0);
+
+        let (unknown, restart) = instances
+            .correlate_pm_death_notification(
+                &mut health,
+                &requests,
+                PmDeathNotification {
+                    verified_pm_identity: true,
+                    pm_handle: MockPmProcessHandle {
+                        mock_handle_id: 0xFFFF_FFFE,
+                    },
+                    reason: PmDeathReason::Crash,
+                },
+                DriverRestartRequestPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(
+            unknown.failure,
+            Some(PmDeathCorrelationFailure::UnknownPmHandle)
+        );
+        assert_eq!(restart.len(), 0);
+
+        health.record_for_mut("arm,pl011").unwrap().restart_count = 3;
+        let (limited, restart) = instances
+            .correlate_pm_death_notification(
+                &mut health,
+                &requests,
+                PmDeathNotification {
+                    verified_pm_identity: true,
+                    pm_handle: handle,
+                    reason: PmDeathReason::Crash,
+                },
+                DriverRestartRequestPolicy::hosted_fake_rpi5().with_max_restarts(3),
+            )
+            .unwrap();
+        assert!(!limited.restart_requested);
+        let pl011_restart = restart_request(&restart, "arm,pl011");
+        assert_eq!(pl011_restart.decision, DriverRestartDecision::Denied);
+        assert!(pl011_restart.has_blocker(DriverRestartBlocker::RestartLimitExceeded));
+    }
+
+    #[test]
+    fn registration_and_death_correlation_are_deterministic_bounded_and_inert() {
+        let (requests, accounting, mut health, mut instances) = build_driver_instance_pipeline();
+        let requests_snapshot = requests.clone();
+        let accounting_snapshot = accounting.clone();
+        assert!(instances.len() <= MAX_DEVICES);
+        assert_eq!(instances.len(), 1);
+        let registration = pl011_registration(instances.record_for("arm,pl011").unwrap());
+        let first = instances.apply_driver_registration(
+            &mut health,
+            registration,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        let second = instances.apply_driver_registration(
+            &mut health,
+            registration,
+            DriverHealthPolicy::hosted_fake_rpi5(),
+        );
+        assert_eq!(first, second);
+        let instances_before_death = instances.clone();
+        let health_before_death = health.clone();
+        let handle = instances.record_for("arm,pl011").unwrap().pm_handle;
+        let (_, restart) = instances
+            .correlate_pm_death_notification(
+                &mut health,
+                &requests,
+                PmDeathNotification {
+                    verified_pm_identity: true,
+                    pm_handle: handle,
+                    reason: PmDeathReason::Crash,
+                },
+                DriverRestartRequestPolicy::hosted_fake_rpi5(),
+            )
+            .unwrap();
+        assert_eq!(restart.len(), requests.len());
+        assert_eq!(requests, requests_snapshot);
+        assert_eq!(accounting, accounting_snapshot);
+        assert_ne!(instances, instances_before_death);
+        assert_ne!(health, health_before_death);
+        let runtime = MockDriverControl::new();
+        assert_eq!(runtime.irq_line.get(), None);
+        assert_eq!(runtime.dma_request.get(), None);
+        assert_eq!(runtime.irq_grant.get(), None);
+        assert_eq!(runtime.dma_grant.get(), None);
+        assert_eq!(runtime.restarted.get(), None);
+        assert_eq!(runtime.registered.get(), None);
     }
 
     #[test]

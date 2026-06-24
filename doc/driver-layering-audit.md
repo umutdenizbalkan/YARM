@@ -125,7 +125,9 @@ mocks.
   descriptive reservations and reverse-order rollback steps. DRS-10 adds inert
   health tracking and PM-facing restart-request construction. DRS-11 adds inert
   PM restart validation/accounting and reverse-order restart rollback simulation.
-  All remain data only and are not PM calls, restarts, or grants. The harness does not parse the live boot DTB, grant
+  DRS-12 adds inert mock PM handle, verified driver-registration, PM
+  death-notification, health, and restart-request correlation. All remain data
+  only and are not PM calls, restarts, cap mint/revoke operations, or grants. The harness does not parse the live boot DTB, grant
   resources, perform MMIO, call PM, or spawn driver binaries. See
   [`DRIVER_PROTOCOL.md`](DRIVER_PROTOCOL.md) and the design-only future
   DM↔PM spawn contract in
