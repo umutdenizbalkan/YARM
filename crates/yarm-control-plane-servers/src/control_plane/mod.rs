@@ -872,4 +872,82 @@ mod tests {
             }
         }
     }
+
+    // ── SUP-2: supervisor inert PM restart model guardrails ──────────────────
+
+    #[test]
+    fn sup2_supervisor_pm_restart_contract_model_is_inert_and_bounded() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pub struct SupervisorRestartRequest",
+            "pub struct SupervisorRestartRequestBundle",
+            "pub enum SupervisorRestartReason",
+            "pub enum SupervisorRestartBlocker",
+            "pub enum SupervisorRestartRequestStatus",
+            "pub struct SupervisorRestartTokenRef",
+            "pub struct SupervisorPmHandleRef",
+            "pub enum SupervisorRestartRequestFailure",
+            "MAX_RESTART_REQUESTS: usize = MAX_MANAGED_SERVICES",
+            "SupervisorPmRestartValidationReport",
+            "SupervisorPmRestartAccountingReport",
+            "SupervisorPmRestartRollbackStep",
+        ] {
+            assert!(
+                src.contains(needle),
+                "supervisor SUP-2 model must include {needle}"
+            );
+        }
+        assert!(
+            src.contains("redacted_fingerprint") && !src.contains("token={}"),
+            "restart-token model/logging should use redacted token refs, not full token logs"
+        );
+    }
+
+    #[test]
+    fn sup2_supervisor_runtime_restart_execution_remains_fail_closed() {
+        let src = include_str!("supervisor/service.rs");
+        for marker in &[
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILT",
+            "SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP",
+            "SUPERVISOR_PM_RESTART_VALIDATION_DEFERRED",
+            "SUPERVISOR_PM_RESTART_ACCOUNTING_DEFERRED",
+        ] {
+            assert!(
+                src.contains(marker),
+                "runtime must preserve visible marker {marker}"
+            );
+        }
+        assert!(
+            src.contains("fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError>")
+                && src.contains("Err(KernelError::InvalidCapability)"),
+            "runtime restart op must not fake production success"
+        );
+    }
+
+    #[test]
+    fn sup2_supervisor_contract_does_not_call_live_pm_spawn_restart_or_caps() {
+        let src = include_str!("supervisor/service.rs");
+        let model_start = src
+            .find("pub struct SupervisorRestartRequest")
+            .expect("SUP-2 restart request model must be present");
+        let model_end = src
+            .find("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct ManagedServiceRecord")
+            .unwrap_or(src.len());
+        let model_section = &src[model_start..model_end];
+        for forbidden in &[
+            "restart_task(",
+            "ipc_send(",
+            "ipc_reply(",
+            "grant_driver_irq",
+            "mint_irq_cap",
+            "delegate_driver_bundle(",
+            "alloc_anonymous_memory_object",
+            "create_iova_space_cap",
+        ] {
+            assert!(
+                !model_section.contains(forbidden),
+                "SUP-2 model must be inert and not call {forbidden}"
+            );
+        }
+    }
 }

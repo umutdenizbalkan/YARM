@@ -303,6 +303,287 @@ pub struct SupervisorStepOutcome {
     pub tick_advanced: bool,
 }
 
+const MAX_RESTART_REQUESTS: usize = MAX_MANAGED_SERVICES;
+const MAX_PM_RESTART_RESERVATIONS: usize = 7;
+const MAX_PM_RESTART_ROLLBACK_STEPS: usize = MAX_PM_RESTART_RESERVATIONS;
+pub const SUPERVISOR_PM_RESTART_REQUEST_VERSION: u16 = 1;
+const SUPERVISOR_PM_RESTART_AUTHORITY_MARKER: u32 = 0x5355_5052;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorRestartReason {
+    Fault,
+    NormalExit,
+    CrashLoop,
+    DependencyFailed { failed_tid: u64 },
+    ManualPolicy,
+    HealthTimeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorRestartTokenRef {
+    pub owner_tid: u64,
+    pub redacted_fingerprint: u16,
+}
+
+impl SupervisorRestartTokenRef {
+    fn from_token(owner_tid: u64, token: u64) -> Self {
+        Self {
+            owner_tid,
+            redacted_fingerprint: ((token >> 48) as u16) ^ (token as u16),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmHandleRef {
+    pub mock_request_id: u32,
+    pub authority_marker: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorRestartBlocker {
+    NoRestartPolicy,
+    BlockedNoDependentToken { dependent_tid: u64, failed_tid: u64 },
+    BlockedRestartLimit,
+    MissingRestartToken,
+    ManualStopNoRestart,
+    PmAuthorityUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorRestartRequestStatus {
+    WouldRequestPmRestart,
+    Blocked(SupervisorRestartBlocker),
+    NoAction,
+    AlreadyPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorRestartRequestFailure {
+    BundleFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorRestartPolicy {
+    pub request_version: u16,
+    pub pm_authority_available: bool,
+    pub fail_closed: bool,
+    pub include_no_action_entries: bool,
+}
+
+impl Default for SupervisorRestartPolicy {
+    fn default() -> Self {
+        Self {
+            request_version: SUPERVISOR_PM_RESTART_REQUEST_VERSION,
+            pm_authority_available: true,
+            fail_closed: true,
+            include_no_action_entries: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorRestartRequest {
+    pub request_version: u16,
+    pub tid: u64,
+    pub service_kind: ManagedServiceKind,
+    pub service_name: &'static str,
+    pub restart_token: Option<SupervisorRestartTokenRef>,
+    pub restart_owner: RestartOwner,
+    pub reason: SupervisorRestartReason,
+    pub backoff_due_tick: u64,
+    pub attempt_count: u8,
+    pub dependency_cause: Option<u64>,
+    pub degraded: bool,
+    pub pm_handle: SupervisorPmHandleRef,
+    pub status: SupervisorRestartRequestStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorRestartRequestBundle {
+    pub entries: [Option<SupervisorRestartRequest>; MAX_RESTART_REQUESTS],
+    pub len: usize,
+}
+
+impl SupervisorRestartRequestBundle {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; MAX_RESTART_REQUESTS],
+            len: 0,
+        }
+    }
+
+    fn push(
+        &mut self,
+        request: SupervisorRestartRequest,
+    ) -> Result<(), SupervisorRestartRequestFailure> {
+        if self.len >= self.entries.len() {
+            return Err(SupervisorRestartRequestFailure::BundleFull);
+        }
+        self.entries[self.len] = Some(request);
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = SupervisorRestartRequest> + '_ {
+        self.entries[..self.len].iter().flatten().copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartValidationStatus {
+    WouldAccept,
+    WouldReject,
+    Deferred,
+    NoAction,
+    AlreadyPending,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartValidationFailure {
+    MissingVerifiedSupervisorIdentity,
+    MissingRestartToken,
+    RestartTokenWrongOwner,
+    MissingTargetRecord,
+    RestartLimitExceeded,
+    DependencyBlocked,
+    PmAuthorityUnavailable,
+    UnsupportedVersion,
+    FailClosedPolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartValidationPolicy {
+    pub verified_supervisor_tid: Option<u64>,
+    pub pm_authority_available: bool,
+    pub supported_version: u16,
+    pub fail_closed: bool,
+}
+
+impl Default for SupervisorPmRestartValidationPolicy {
+    fn default() -> Self {
+        Self {
+            verified_supervisor_tid: Some(0),
+            pm_authority_available: true,
+            supported_version: SUPERVISOR_PM_RESTART_REQUEST_VERSION,
+            fail_closed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartValidationEntry {
+    pub tid: u64,
+    pub request_id: u32,
+    pub status: SupervisorPmRestartValidationStatus,
+    pub failure: Option<SupervisorPmRestartValidationFailure>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartValidationReport {
+    pub entries: [Option<SupervisorPmRestartValidationEntry>; MAX_RESTART_REQUESTS],
+    pub len: usize,
+}
+
+impl SupervisorPmRestartValidationReport {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; MAX_RESTART_REQUESTS],
+            len: 0,
+        }
+    }
+    fn push(&mut self, entry: SupervisorPmRestartValidationEntry) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(entry);
+            self.len += 1;
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = SupervisorPmRestartValidationEntry> + '_ {
+        self.entries[..self.len].iter().flatten().copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartReservation {
+    RestartSlot,
+    ReplacementTaskSlot,
+    AddressSpaceSlot,
+    CNodeSlot,
+    StartupCapDeliverySlot,
+    HealthMonitorSlot,
+    InitAlertSlot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartAccountingStatus {
+    Reserved,
+    RolledBack,
+    Deferred,
+    NoAction,
+    Rejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartFailureInjectionPoint {
+    None,
+    AfterReplacementTaskSlot,
+    AfterStartupCapSlot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartAccountingPolicy {
+    pub failure_injection: SupervisorPmRestartFailureInjectionPoint,
+}
+
+impl Default for SupervisorPmRestartAccountingPolicy {
+    fn default() -> Self {
+        Self {
+            failure_injection: SupervisorPmRestartFailureInjectionPoint::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartRollbackStep {
+    pub tid: u64,
+    pub reservation: SupervisorPmRestartReservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartAccountingEntry {
+    pub tid: u64,
+    pub request_id: u32,
+    pub status: SupervisorPmRestartAccountingStatus,
+    pub reservations: [Option<SupervisorPmRestartReservation>; MAX_PM_RESTART_RESERVATIONS],
+    pub reservation_len: usize,
+    pub rollback: [Option<SupervisorPmRestartRollbackStep>; MAX_PM_RESTART_ROLLBACK_STEPS],
+    pub rollback_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartAccountingReport {
+    pub entries: [Option<SupervisorPmRestartAccountingEntry>; MAX_RESTART_REQUESTS],
+    pub len: usize,
+}
+
+impl SupervisorPmRestartAccountingReport {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; MAX_RESTART_REQUESTS],
+            len: 0,
+        }
+    }
+    fn push(&mut self, entry: SupervisorPmRestartAccountingEntry) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(entry);
+            self.len += 1;
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = SupervisorPmRestartAccountingEntry> + '_ {
+        self.entries[..self.len].iter().flatten().copied()
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DriverRecoveryPlan {
     irq_line: u16,
@@ -732,6 +1013,27 @@ impl SupervisorService {
             let restart_token = record
                 .pending_restart_token
                 .ok_or(KernelError::WrongObject)?;
+            #[cfg(not(test))]
+            {
+                let request = self.build_restart_request_for_record(
+                    record,
+                    SupervisorRestartPolicy::default(),
+                    SupervisorRestartReason::Fault,
+                );
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_PM_RESTART_REQUEST_BUILT tid={} request_id={} due_tick={} attempt={} token_ref={:04x}",
+                    request.tid,
+                    request.pm_handle.mock_request_id,
+                    request.backoff_due_tick,
+                    request.attempt_count,
+                    request
+                        .restart_token
+                        .map(|token| token.redacted_fingerprint)
+                        .unwrap_or(0)
+                );
+                yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_VALIDATION_DEFERRED");
+                yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_ACCOUNTING_DEFERRED");
+            }
             restart_ops.restart_task(record.tid, restart_token)?;
             record.last_restart_tick = self.current_tick;
             record.pending_restart_due = None;
@@ -820,6 +1122,277 @@ impl SupervisorService {
             );
             Err(KernelError::MissingRight)
         }
+    }
+
+    fn service_name(kind: ManagedServiceKind) -> &'static str {
+        match kind {
+            ManagedServiceKind::Core(CoreServiceKind::ProcessManager) => "process_manager",
+            ManagedServiceKind::Core(CoreServiceKind::Vfs) => "vfs",
+            ManagedServiceKind::Core(CoreServiceKind::Supervisor) => "supervisor",
+            ManagedServiceKind::Driver => "driver",
+        }
+    }
+
+    fn restart_owner_for_kind(kind: ManagedServiceKind) -> RestartOwner {
+        match kind {
+            ManagedServiceKind::Core(core) => CoreServicePolicyTable::restart_owner_for(core),
+            ManagedServiceKind::Driver => RestartOwner::Supervisor,
+        }
+    }
+
+    fn mock_restart_request_id(tid: u64, due_tick: TickInstant, attempt_count: u8) -> u32 {
+        ((tid as u32) << 8) ^ (due_tick.0 as u32) ^ attempt_count as u32
+    }
+
+    fn build_restart_request_for_record(
+        &self,
+        record: ManagedServiceRecord,
+        policy: SupervisorRestartPolicy,
+        reason: SupervisorRestartReason,
+    ) -> SupervisorRestartRequest {
+        let restart_policy = self.policy_for(record);
+        let due_tick = record.pending_restart_due.map(|tick| tick.0).unwrap_or(0);
+        let dependency_cause = match reason {
+            SupervisorRestartReason::DependencyFailed { failed_tid } => Some(failed_tid),
+            _ => None,
+        };
+        let status = if record.pending_restart_due.is_none() {
+            SupervisorRestartRequestStatus::NoAction
+        } else if record.restart_attempts > restart_policy.max_restarts {
+            SupervisorRestartRequestStatus::Blocked(SupervisorRestartBlocker::BlockedRestartLimit)
+        } else if !policy.pm_authority_available {
+            SupervisorRestartRequestStatus::Blocked(
+                SupervisorRestartBlocker::PmAuthorityUnavailable,
+            )
+        } else if record.pending_restart_token.is_none() {
+            SupervisorRestartRequestStatus::Blocked(SupervisorRestartBlocker::MissingRestartToken)
+        } else {
+            SupervisorRestartRequestStatus::WouldRequestPmRestart
+        };
+        SupervisorRestartRequest {
+            request_version: policy.request_version,
+            tid: record.tid,
+            service_kind: record.kind,
+            service_name: Self::service_name(record.kind),
+            restart_token: record
+                .pending_restart_token
+                .map(|token| SupervisorRestartTokenRef::from_token(record.tid, token)),
+            restart_owner: Self::restart_owner_for_kind(record.kind),
+            reason,
+            backoff_due_tick: due_tick,
+            attempt_count: record.restart_attempts,
+            dependency_cause,
+            degraded: self.degraded,
+            pm_handle: SupervisorPmHandleRef {
+                mock_request_id: Self::mock_restart_request_id(
+                    record.tid,
+                    record.pending_restart_due.unwrap_or(TickInstant(0)),
+                    record.restart_attempts,
+                ),
+                authority_marker: SUPERVISOR_PM_RESTART_AUTHORITY_MARKER,
+            },
+            status,
+        }
+    }
+
+    pub fn build_restart_request_bundle(
+        &self,
+        policy: SupervisorRestartPolicy,
+    ) -> Result<SupervisorRestartRequestBundle, SupervisorRestartRequestFailure> {
+        let mut bundle = SupervisorRestartRequestBundle::empty();
+        for record in self.managed.iter().flatten().copied() {
+            if record.pending_restart_due.is_some() || policy.include_no_action_entries {
+                bundle.push(self.build_restart_request_for_record(
+                    record,
+                    policy,
+                    SupervisorRestartReason::Fault,
+                ))?;
+            }
+        }
+        Ok(bundle)
+    }
+
+    pub fn build_dependency_blocked_restart_request(
+        &self,
+        dependent_tid: u64,
+        failed_tid: u64,
+    ) -> Option<SupervisorRestartRequest> {
+        let record = self.find_record(dependent_tid)?;
+        let mut request = self.build_restart_request_for_record(
+            record,
+            SupervisorRestartPolicy::default(),
+            SupervisorRestartReason::DependencyFailed { failed_tid },
+        );
+        request.status = SupervisorRestartRequestStatus::Blocked(
+            SupervisorRestartBlocker::BlockedNoDependentToken {
+                dependent_tid,
+                failed_tid,
+            },
+        );
+        request.restart_token = None;
+        Some(request)
+    }
+
+    pub fn validate_restart_request_bundle(
+        &self,
+        bundle: SupervisorRestartRequestBundle,
+        policy: SupervisorPmRestartValidationPolicy,
+    ) -> SupervisorPmRestartValidationReport {
+        let mut report = SupervisorPmRestartValidationReport::empty();
+        for request in bundle.iter() {
+            let (status, failure) = if request.request_version != policy.supported_version {
+                (
+                    SupervisorPmRestartValidationStatus::Unsupported,
+                    Some(SupervisorPmRestartValidationFailure::UnsupportedVersion),
+                )
+            } else if policy.fail_closed {
+                (
+                    SupervisorPmRestartValidationStatus::WouldReject,
+                    Some(SupervisorPmRestartValidationFailure::FailClosedPolicy),
+                )
+            } else if policy.verified_supervisor_tid.is_none() {
+                (
+                    SupervisorPmRestartValidationStatus::WouldReject,
+                    Some(SupervisorPmRestartValidationFailure::MissingVerifiedSupervisorIdentity),
+                )
+            } else if !policy.pm_authority_available {
+                (
+                    SupervisorPmRestartValidationStatus::Deferred,
+                    Some(SupervisorPmRestartValidationFailure::PmAuthorityUnavailable),
+                )
+            } else if matches!(request.status, SupervisorRestartRequestStatus::NoAction) {
+                (SupervisorPmRestartValidationStatus::NoAction, None)
+            } else if matches!(
+                request.status,
+                SupervisorRestartRequestStatus::AlreadyPending
+            ) {
+                (SupervisorPmRestartValidationStatus::AlreadyPending, None)
+            } else if let SupervisorRestartRequestStatus::Blocked(blocker) = request.status {
+                let failure = match blocker {
+                    SupervisorRestartBlocker::BlockedRestartLimit => {
+                        SupervisorPmRestartValidationFailure::RestartLimitExceeded
+                    }
+                    SupervisorRestartBlocker::BlockedNoDependentToken { .. } => {
+                        SupervisorPmRestartValidationFailure::DependencyBlocked
+                    }
+                    SupervisorRestartBlocker::MissingRestartToken => {
+                        SupervisorPmRestartValidationFailure::MissingRestartToken
+                    }
+                    SupervisorRestartBlocker::PmAuthorityUnavailable => {
+                        SupervisorPmRestartValidationFailure::PmAuthorityUnavailable
+                    }
+                    _ => SupervisorPmRestartValidationFailure::DependencyBlocked,
+                };
+                (
+                    SupervisorPmRestartValidationStatus::WouldReject,
+                    Some(failure),
+                )
+            } else {
+                match (self.find_record(request.tid), request.restart_token) {
+                    (None, _) => (
+                        SupervisorPmRestartValidationStatus::WouldReject,
+                        Some(SupervisorPmRestartValidationFailure::MissingTargetRecord),
+                    ),
+                    (_, None) => (
+                        SupervisorPmRestartValidationStatus::WouldReject,
+                        Some(SupervisorPmRestartValidationFailure::MissingRestartToken),
+                    ),
+                    (Some(_), Some(token_ref)) if token_ref.owner_tid != request.tid => (
+                        SupervisorPmRestartValidationStatus::WouldReject,
+                        Some(SupervisorPmRestartValidationFailure::RestartTokenWrongOwner),
+                    ),
+                    (Some(record), Some(_))
+                        if request.attempt_count > self.policy_for(record).max_restarts =>
+                    {
+                        (
+                            SupervisorPmRestartValidationStatus::WouldReject,
+                            Some(SupervisorPmRestartValidationFailure::RestartLimitExceeded),
+                        )
+                    }
+                    (Some(_), Some(_)) => (SupervisorPmRestartValidationStatus::WouldAccept, None),
+                }
+            };
+            report.push(SupervisorPmRestartValidationEntry {
+                tid: request.tid,
+                request_id: request.pm_handle.mock_request_id,
+                status,
+                failure,
+            });
+        }
+        report
+    }
+
+    pub fn account_restart_validation_report(
+        &self,
+        validation: SupervisorPmRestartValidationReport,
+        policy: SupervisorPmRestartAccountingPolicy,
+    ) -> SupervisorPmRestartAccountingReport {
+        let mut report = SupervisorPmRestartAccountingReport::empty();
+        for entry in validation.iter() {
+            let mut accounting = SupervisorPmRestartAccountingEntry {
+                tid: entry.tid,
+                request_id: entry.request_id,
+                status: SupervisorPmRestartAccountingStatus::NoAction,
+                reservations: [None; MAX_PM_RESTART_RESERVATIONS],
+                reservation_len: 0,
+                rollback: [None; MAX_PM_RESTART_ROLLBACK_STEPS],
+                rollback_len: 0,
+            };
+            if entry.status != SupervisorPmRestartValidationStatus::WouldAccept {
+                accounting.status = match entry.status {
+                    SupervisorPmRestartValidationStatus::Deferred => {
+                        SupervisorPmRestartAccountingStatus::Deferred
+                    }
+                    SupervisorPmRestartValidationStatus::NoAction => {
+                        SupervisorPmRestartAccountingStatus::NoAction
+                    }
+                    _ => SupervisorPmRestartAccountingStatus::Rejected,
+                };
+                report.push(accounting);
+                continue;
+            }
+
+            let reservations = [
+                SupervisorPmRestartReservation::RestartSlot,
+                SupervisorPmRestartReservation::ReplacementTaskSlot,
+                SupervisorPmRestartReservation::AddressSpaceSlot,
+                SupervisorPmRestartReservation::CNodeSlot,
+                SupervisorPmRestartReservation::StartupCapDeliverySlot,
+                SupervisorPmRestartReservation::HealthMonitorSlot,
+                SupervisorPmRestartReservation::InitAlertSlot,
+            ];
+            let failure_after = match policy.failure_injection {
+                SupervisorPmRestartFailureInjectionPoint::None => reservations.len(),
+                SupervisorPmRestartFailureInjectionPoint::AfterReplacementTaskSlot => 2,
+                SupervisorPmRestartFailureInjectionPoint::AfterStartupCapSlot => 5,
+            };
+            let reserve_len = failure_after.min(reservations.len());
+            let mut idx = 0;
+            while idx < reserve_len {
+                accounting.reservations[idx] = Some(reservations[idx]);
+                accounting.reservation_len += 1;
+                idx += 1;
+            }
+            if reserve_len == reservations.len()
+                && policy.failure_injection == SupervisorPmRestartFailureInjectionPoint::None
+            {
+                accounting.status = SupervisorPmRestartAccountingStatus::Reserved;
+            } else {
+                accounting.status = SupervisorPmRestartAccountingStatus::RolledBack;
+                let mut rollback_idx = 0;
+                while rollback_idx < reserve_len {
+                    let reservation = reservations[reserve_len - 1 - rollback_idx];
+                    accounting.rollback[rollback_idx] = Some(SupervisorPmRestartRollbackStep {
+                        tid: entry.tid,
+                        reservation,
+                    });
+                    accounting.rollback_len += 1;
+                    rollback_idx += 1;
+                }
+            }
+            report.push(accounting);
+        }
+        report
     }
 
     #[cfg(test)]
@@ -1658,6 +2231,7 @@ impl SupervisorTaskExitOps for RuntimeSupervisorTaskExitOps {
 impl SupervisorRestartRedelegationOps for RuntimeSupervisorTaskExitOps {
     fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError> {
         yarm_user_rt::user_log!("SUPERVISOR_RESTART_REQUEST_DEFERRED_NO_PM_OP");
+        yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP");
         Err(KernelError::InvalidCapability)
     }
 

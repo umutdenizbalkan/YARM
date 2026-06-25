@@ -80,3 +80,72 @@ logical and visible in logs.
 5. Add bounded fault-priority polling once boot-chain risk is validated.
 6. Add health checks, crash dumps, alert rate limiting that remains visible,
    graceful shutdown, metrics, and configurable restart policies.
+
+## SUP-2 supervisor ↔ PM restart-request contract
+
+SUP-2 adds an inert, userspace-only restart-request model. It does not restart,
+spawn, tear down, mint caps, revoke caps, grant MMIO/IRQ/DMA, allocate address
+spaces, perform MMIO, or call a live Process Manager operation.
+
+### Authority boundary
+
+- Supervisor owns observation and policy: exits/faults, degradation decisions,
+  backoff scheduling, dependency restart policy, init-alert construction, and
+  inert PM restart-request construction.
+- Process Manager owns mechanism: process creation/restart/teardown, restart-token
+  validation, address-space setup, resource accounting, capability delivery, and
+  task cleanup.
+- Kernel owns low-level task, capability, VM, scheduler, and trap mechanisms.
+
+### Inert request shape
+
+`SupervisorRestartRequestBundle` is a bounded fixed-size collection of
+`SupervisorRestartRequest` entries. Each entry records the supervised TID, service
+kind/name, restart owner, restart reason, redacted `SupervisorRestartTokenRef`,
+backoff due tick, attempt count, dependency cause, degraded flag, PM authority
+marker, and mock request ID. It intentionally stores descriptive references only,
+not live process handles or new capability IDs.
+
+Restart reasons model fault, normal exit, crash loop, dependency failure, manual
+policy, and health timeout cases. Request statuses distinguish
+`WouldRequestPmRestart`, blockers such as `BlockedNoDependentToken` and
+`BlockedRestartLimit`, `NoAction`, and `AlreadyPending`.
+
+### Validation simulation
+
+`SupervisorPmRestartValidationReport` simulates PM-side checks without sending IPC.
+It verifies supervisor identity, request version, PM authority availability,
+target-record existence, token ownership, attempt limits, dependency blockers, and
+fail-closed policy. Outcomes are descriptive only: `WouldAccept`, `WouldReject`,
+`Deferred`, `NoAction`, `AlreadyPending`, and `Unsupported`.
+
+### Accounting and rollback simulation
+
+`SupervisorPmRestartAccountingReport` simulates descriptive reservations for an
+accepted restart request: restart slot, replacement task slot, address-space slot,
+CNode slot, startup-cap delivery slot, health-monitor slot, and init-alert slot.
+Failure injection produces reverse-order rollback descriptors only. No real PM,
+kernel, cap, address-space, or task operation is performed.
+
+### Runtime production behavior
+
+Production runtime restart execution remains fail-closed. The supervisor may build
+and log an inert request using `SUPERVISOR_PM_RESTART_REQUEST_BUILT`, but live
+execution returns an explicit unavailable/deferred error and logs
+`SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP`,
+`SUPERVISOR_PM_RESTART_VALIDATION_DEFERRED`, and
+`SUPERVISOR_PM_RESTART_ACCOUNTING_DEFERRED` until a real PM restart mechanism is
+specified and wired.
+
+### Token and sender security
+
+Restart-token references are scoped to the target TID and log only a redacted
+fingerprint. Dependent restarts must use the dependent service's token; the failed
+service token is never a substitute. Control and fault paths continue to require
+verified sender metadata as described above.
+
+### Deferred live work
+
+A real timer endpoint, PM restart IPC contract, PM resource-accounting API,
+capability-bound token transport, live cleanup/reclamation, and automatic
+supervisor state replay remain deferred.
