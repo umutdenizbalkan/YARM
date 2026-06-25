@@ -6832,10 +6832,19 @@ fn fork_child_preserves_parent_registers_except_arg0() {
             ..Default::default()
         })
         .expect("parent");
+    // Stage 163J: seed a non-zero return lane (user_gprs[0]). On x86_64 this is
+    // RAX, which at syscall entry holds the syscall NUMBER (NR_fork == 12). The
+    // child must NOT inherit it — it must see a zero return register — while all
+    // other GPR lanes are preserved verbatim.
+    let mut parent_gprs = [0usize; 32];
+    parent_gprs[0] = 12; // rax = NR_fork (the value that wrongly leaked as ret0)
+    parent_gprs[1] = 0xB1; // rbx
+    parent_gprs[6] = 0xBADC0FFE; // rbp / a callee-saved value to preserve
+    parent_gprs[14] = 0xF00D; // r15
     let parent_ctx = UserRegisterContext {
         instruction_ptr: VirtAddr(0x8123),
         stack_ptr: VirtAddr(0x8FFF_0000),
-        user_gprs: [0; 32],
+        user_gprs: parent_gprs,
         arg0: 0xAAAA,
         arg1: 0x1111,
         arg2: 0x2222,
@@ -6854,6 +6863,20 @@ fn fork_child_preserves_parent_registers_except_arg0() {
 
     assert_eq!(child_ctx.instruction_ptr, parent_ctx.instruction_ptr);
     assert_eq!(child_ctx.stack_ptr, parent_ctx.stack_ptr);
+    // The return lane is zeroed in the child (this is what the user observes as
+    // fork's `ret0`), and is NOT the leaked syscall number / ASID.
+    assert_eq!(
+        child_ctx.user_gprs[0], 0,
+        "child fork return lane (user_gprs[0]/rax) must be 0, not the parent's NR"
+    );
+    assert_ne!(
+        child_ctx.user_gprs[0], 12,
+        "child must not return the fork syscall number / ASID-like value"
+    );
+    // Every other GPR lane is preserved verbatim from the parent.
+    assert_eq!(child_ctx.user_gprs[1], 0xB1);
+    assert_eq!(child_ctx.user_gprs[6], 0xBADC0FFE);
+    assert_eq!(child_ctx.user_gprs[14], 0xF00D);
     assert_eq!(child_ctx.arg0, 0);
     assert_eq!(child_ctx.arg1, parent_ctx.arg1);
     assert_eq!(child_ctx.arg2, parent_ctx.arg2);
@@ -43885,7 +43908,7 @@ mod stage163_sender_wake_proven {
             "FORK_PROOF_ALLOC_CHILD_BEGIN",
             "FORK_PROOF_ALLOC_CHILD_FAIL",
             "FORK_PROOF_CNODE_BEGIN",
-            "FORK_PROOF_CHILD_TF_RET0_SET",
+            "FORK_PROOF_CHILD_RET_SET",
             "FORK_PROOF_CHILD_ENQUEUE_OK",
         ] {
             assert!(
@@ -44637,5 +44660,203 @@ mod stage163i_stale_tlb_recovery {
                 && !X86_BOOT_SRC.contains("1u64 << 17"),
             "boot must not enable CR4.PCIDE"
         );
+    }
+}
+
+mod stage163j_fork_return_lane {
+    const THREAD_SRC: &str = include_str!("thread_state.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const MEM_SRC: &str = include_str!("memory_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_PT_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+    const X86_VM_LAYOUT_SRC: &str = include_str!("../../arch/x86_64/vm_layout.rs");
+    const INIT_SVC_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    fn fork_complete_body() -> &'static str {
+        THREAD_SRC
+            .split("fn fork_complete_post_clone")
+            .nth(1)
+            .map(|s| &s[..s.len().min(4000)])
+            .expect("fork_complete_post_clone body")
+    }
+
+    // 1. The child's AUTHORITATIVE return lane is the saved GPR snapshot
+    //    (user_gprs[0] = x86_64 RAX), zeroed at the child-frame creation point —
+    //    not merely `arg0` (which only feeds the new-task rdi path).
+    #[test]
+    fn stage163j_child_return_lane_gpr0_zeroed() {
+        let body = fork_complete_body();
+        assert!(
+            body.contains("child.user_context.user_gprs[0] = 0;"),
+            "child fork return lane (user_gprs[0]/rax) must be explicitly zeroed"
+        );
+        assert!(
+            body.contains("child.user_context = parent.user_context;"),
+            "child context is cloned from the parent first"
+        );
+        // The clone must precede the return-lane override (snapshot-then-override).
+        let clone_at = body
+            .find("child.user_context = parent.user_context;")
+            .expect("clone");
+        let zero_at = body
+            .find("child.user_context.user_gprs[0] = 0;")
+            .expect("zero");
+        assert!(
+            clone_at < zero_at,
+            "the return lane must be overridden AFTER copying the parent context"
+        );
+    }
+
+    // 2. The parent's fork return is the child TID (ret0 = child_tid, err = 0).
+    #[test]
+    fn stage163j_parent_returns_child_tid() {
+        let handler = PROCESS_SRC
+            .split("fn handle_fork")
+            .nth(1)
+            .map(|s| &s[..s.len().min(1200)])
+            .expect("handle_fork body");
+        assert!(
+            handler.contains("frame.set_ok(") && handler.contains("usize::try_from(child_tid)"),
+            "parent fork return must be child_tid via set_ok"
+        );
+    }
+
+    // 3. The kernel never writes the ASID (a kernel-internal id) into the user
+    //    return lane in the fork path.
+    #[test]
+    fn stage163j_asid_does_not_leak_into_return_lane() {
+        let body = fork_complete_body();
+        for forbidden in &[
+            "user_gprs[0] = child_asid",
+            "user_gprs[0] = asid",
+            "arg0 = child_asid",
+            "arg0 = asid",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "ASID must never be written to the user return lane (`{forbidden}`)"
+            );
+        }
+    }
+
+    // 4. The x86_64 resumed-task restore delivers RAX from user_gpr(0), which is
+    //    exactly the lane Stage 163J zeroes — pinning why the fix lands.
+    #[test]
+    fn stage163j_x86_resume_restores_rax_from_gpr0() {
+        let f = DESC_SRC
+            .split("fn write_task_gprs_to_saved_regs")
+            .nth(1)
+            .map(|s| &s[..s.len().min(3000)])
+            .expect("write_task_gprs_to_saved_regs body");
+        assert!(
+            f.contains("regs.rax = trap_frame.user_gpr(0) as u64;"),
+            "resumed-task restore must source RAX from user_gpr(0)"
+        );
+        // First-resume diagnostic that surfaces the delivered RAX lane.
+        assert!(
+            f.contains("FORK_PROOF_FIRST_RESUME_AFTER_ARCH_RESTORE"),
+            "first-resume must trace the delivered return lane (proof-gated)"
+        );
+    }
+
+    // 5. Proof diagnostics exist and are proof-gated.
+    #[test]
+    fn stage163j_emits_fork_return_diagnostics() {
+        for marker in &[
+            "FORK_PROOF_CHILD_RET_SET",
+            "FORK_PROOF_PARENT_RET_SET",
+            "FORK_PROOF_CHILD_FRAME_BEFORE_ENQUEUE",
+        ] {
+            assert!(
+                THREAD_SRC.contains(marker),
+                "fork path must emit `{marker}`"
+            );
+        }
+        assert!(
+            THREAD_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "fork diagnostics must be proof-gated"
+        );
+        assert!(
+            DESC_SRC.contains("FORK_PROOF_FIRST_RESUME_AFTER_ARCH_RESTORE")
+                && DESC_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "first-resume diagnostic must exist and be proof-gated"
+        );
+    }
+
+    // 6. The userspace smoke decodes role from the return lane (ret0==0 → child)
+    //    and was NOT hacked to treat `ret0 == asid` as the child — the fix is in
+    //    the kernel.
+    #[test]
+    fn stage163j_userspace_decode_keys_on_zero_not_asid() {
+        assert!(
+            INIT_SVC_SRC.contains("IPC_RECV_PROOF_FORK_SMOKE_CHILD_ENTRY")
+                && INIT_SVC_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_CHILD_ENTRY"),
+            "smoke/proof child paths must log CHILD_ENTRY"
+        );
+        assert!(
+            INIT_SVC_SRC.contains("if r.ret0 != 0 {") && INIT_SVC_SRC.contains("if fr.ret0 != 0 {"),
+            "role must be decoded from ret0 (parent iff ret0 != 0)"
+        );
+        for forbidden in &["== asid", "== child_asid", "ret0 == 12", "asid_as_child"] {
+            assert!(
+                !INIT_SVC_SRC.contains(forbidden),
+                "userspace must not treat an ASID-like ret0 as the child (`{forbidden}`)"
+            );
+        }
+    }
+
+    // 7. Stage 163E COW clone remains transactional/run-preserving and Stage 163I
+    //    PF / intermediate-permission behavior remains intact.
+    #[test]
+    fn stage163j_preserves_163e_cow_and_163i_pf() {
+        assert!(
+            MEM_SRC.contains("write_protect_run_head_in_place")
+                && MEM_SRC.contains("required_child"),
+            "Stage 163E transactional/run-preserving COW clone must remain"
+        );
+        assert!(
+            X86_PT_SRC.contains("pub fn repair_user_path_intermediates")
+                && FAULT_SRC.contains("eff_present && eff_user && (!need_write || eff_writable)"),
+            "Stage 163I PF/intermediate-permission behavior must remain intact"
+        );
+    }
+
+    // 8. Confinement: no IPC/cap seam moved, counts unchanged, RPi5 untouched,
+    //    MAX_ADDRESS_SPACES stays 32.
+    #[test]
+    fn stage163j_confinement_counts_and_bounds() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        assert!(
+            X86_VM_LAYOUT_SRC.contains(
+                "#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"
+            ),
+            "MAX_ADDRESS_SPACES stays 32"
+        );
+        for forbidden in &["rpi5", "RPi5", "bcm2712"] {
+            assert!(
+                !THREAD_SRC.contains(forbidden),
+                "fork path must not reference the {forbidden} path"
+            );
+        }
     }
 }
