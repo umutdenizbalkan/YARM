@@ -188,3 +188,11 @@ token, unknown target, restart limit exceeded, dependency blocker, resource
 unavailable, rollback failure, unsupported version, timer unavailable, and already
 restarting. The codec remains non-dispatching until all matrix rows have either
 hosted oracle coverage or live conformance coverage.
+
+## SUP-8 signoff package linkage
+
+SUP-8 freezes the codec layout tables, reserved-field policy, reviewer signoff
+checklist, and golden-vector signoff table in `doc/process-manager-restart-contract.md`.
+The package is still non-live: candidate opcodes `15`/`16` remain unallocated,
+PM dispatch remains absent, and supervisor PM restart send remains absent until a
+future SUP-live promotion stage satisfies every signoff item.

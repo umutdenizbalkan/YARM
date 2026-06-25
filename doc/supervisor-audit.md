@@ -214,3 +214,11 @@ SUP-7 adds review-only PM restart request/reply codecs and golden vectors behind
 the test/`hosted-dev` gate. The live global IPC ABI remains unchanged, PM runtime
 dispatch and supervisor send paths remain absent, process IPC opcode count remains
 14, and production restart behavior remains deferred/fail-closed.
+
+## SUP-8 ABI-review signoff package
+
+SUP-8 freezes the non-live codec offsets/lengths, reserved-field policy, reviewer
+signoff checklist, golden-vector table, and promotion guardrails. Candidate
+opcodes `15`/`16` remain unallocated, the live global IPC ABI remains unchanged,
+PM dispatch and supervisor send paths remain absent, and production restart remains
+fail-closed/deferred.

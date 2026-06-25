@@ -20,12 +20,20 @@ pub const PM_RESTART_REQUEST_SERVICE_NAME_OFFSET: usize = 29;
 pub const PM_RESTART_REQUEST_REASON_OFFSET: usize = 61;
 pub const PM_RESTART_REQUEST_TOKEN_OWNER_OFFSET: usize = 86;
 pub const PM_RESTART_REQUEST_TOKEN_FINGERPRINT_OFFSET: usize = 94;
+/// Reserved byte after token scope. Must encode as zero; decoders reject nonzero.
+pub const PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET: usize = 97;
 
 pub const PM_RESTART_REPLY_VERSION_OFFSET: usize = 0;
 pub const PM_RESTART_REPLY_REQUEST_ID_OFFSET: usize = 2;
 pub const PM_RESTART_REPLY_STATUS_OFFSET: usize = 18;
 pub const PM_RESTART_REPLY_FAILURE_OFFSET: usize = 20;
 pub const PM_RESTART_REPLY_RETRY_TICK_OFFSET: usize = 42;
+
+// SUP-8 reserved-field policy: every byte named reserved in this review codec
+// must encode as zero, and decode must reject nonzero values. Future extension
+// requires a version bump or an explicit compatibility rule in the ABI signoff.
+// `policy_flags` are descriptive review flags only; live authority must come
+// from verified sender/token capability state, not from payload flags alone.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmRestartReviewCodecError {
@@ -375,7 +383,7 @@ pub fn decode_pm_restart_request_v1(
     if bytes[96] > 1 || !token_scoped {
         return Err(PmRestartReviewCodecError::RawOrUnscopedToken);
     }
-    if bytes[97] != 0 {
+    if bytes[PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET] != 0 {
         return Err(PmRestartReviewCodecError::NonzeroReserved);
     }
     let mut service_name = [0u8; PM_RESTART_REVIEW_SERVICE_NAME_MAX];

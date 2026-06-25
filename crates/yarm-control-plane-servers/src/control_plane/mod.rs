@@ -1661,4 +1661,75 @@ mod tests {
             "production restart remains deferred/fail-closed"
         );
     }
+
+    // ── SUP-8: ABI-review signoff guardrails ───────────────────────────────
+
+    #[test]
+    fn sup8_signoff_tables_and_reserved_policy_are_present() {
+        let doc = include_str!("../../../../doc/process-manager-restart-contract.md");
+        for needle in &[
+            "## SUP-8 ABI-review signoff package",
+            "### Request V1 frozen layout",
+            "### Reply V1 frozen layout",
+            "Request V1 total length is frozen at 110 bytes",
+            "Reply V1 total length is frozen at 50 bytes",
+            "`token.reserved` | 97 | 1",
+            "decode must reject nonzero reserved",
+            "No PR may promote this codec into `yarm-ipc-abi` or runtime dispatch",
+            "QEMU x86_64 and AArch64 boot smoke results",
+            "### Golden-vector signoff table",
+            "### Conformance matrix completeness",
+        ] {
+            assert!(
+                doc.contains(needle),
+                "SUP-8 signoff doc must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup8_promotion_guardrails_keep_live_paths_absent() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let codec_src = include_str!("process_manager/restart_abi_review.rs");
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-8 must not promote restart opcodes into live process ABI"
+        );
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-8 must not add PM dispatch or supervisor send path"
+        );
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "ipc_send(",
+            "ipc_call(",
+            "ipc_reply(",
+            "mint",
+            "revoke",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !codec_src.contains(forbidden),
+                "SUP-8 review codec must remain non-live and not call {forbidden}"
+            );
+        }
+        assert!(
+            codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && codec_src.contains("NonzeroReserved"),
+            "SUP-8 codec must name and reject reserved-byte misuse"
+        );
+        assert!(
+            supervisor_src.contains("redacted_fingerprint")
+                && !supervisor_src.contains("unwrap_or(event.restart_token)")
+                && supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            "SUP-8 must preserve redaction, dependent-token, and deferred-runtime guardrails"
+        );
+    }
 }

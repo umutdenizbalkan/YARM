@@ -115,3 +115,10 @@ SUP-7 prepares non-dispatching PM restart ABI codecs behind the review gate. The
 supervisor still does not send PM restart IPC; production restart remains
 fail-closed/deferred until a future live-ABI PR promotes the codec and passes the
 SUP-6 conformance matrix.
+
+## SUP-8 promotion gate
+
+SUP-8 adds the ABI-review signoff package but does not change supervisor runtime
+behavior. The supervisor remains requestor-only and must not send PM restart IPC
+until a future SUP-live stage promotes the codec, passes signoff, and preserves
+fail-closed fallback.

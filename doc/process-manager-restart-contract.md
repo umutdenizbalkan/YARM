@@ -223,3 +223,122 @@ Candidate opcode names remain `PROC_OP_PM_RESTART_V1` and
 the request and `16` for the reply because the live process IPC opcode count is
 currently 14, but these numbers are **not allocated**, are not present in
 `yarm-ipc-abi`, and remain absent from PM/supervisor runtime dispatch.
+
+## SUP-8 ABI-review signoff package
+
+SUP-8 freezes the review codec layout for signoff, but it is still non-live. The
+codec remains in `restart_abi_review.rs`, candidate opcodes `15`/`16` remain
+unallocated, no `yarm-ipc-abi` constants exist for them, and no PM dispatch or
+supervisor send path exists. Promotion requires an explicit future SUP-live stage
+that updates the global ABI, dispatch, smoke evidence, and this documentation in
+one reviewed PR.
+
+### Request V1 frozen layout
+
+| Field | Offset | Length | Type / endian | Valid range | Rejection behavior | Status | Authority-bearing? |
+|---|---:|---:|---|---|---|---|---|
+| `version` | 0 | 2 | `u16` LE | `1` | reject `UnsupportedVersion` | current | descriptive |
+| `request_id` | 2 | 8 | `u64` LE | any | none; correlation only | current | no |
+| `supervisor_tid` | 10 | 8 | `u64` LE | any; verified externally | payload never trusted as authority | current | descriptive only |
+| `target_tid` | 18 | 8 | `u64` LE | known PM target | PM rejects unknown target | current | identifies target, not authority |
+| `service_kind` | 26 | 2 | `u16` LE | reviewed enum values | future live invalid enum rejects | current | descriptive |
+| `service_name_len` | 28 | 1 | `u8` | `0..=32` | reject `OversizedServiceName` | current | no |
+| `service_name` | 29 | 32 | bytes | first `service_name_len` bytes meaningful | decode is deterministic; name is debug only | current | no |
+| `restart_reason` | 61 | 2 | `u16` LE | `1..=6` | reject `InvalidEnum` | current | policy input |
+| `attempt_count` | 63 | 2 | `u16` LE | policy-bounded | PM rejects over limit | current | policy input |
+| `due_tick` | 65 | 8 | `u64` LE | monotonic tick domain | PM/supervisor defer if timer unavailable | current | no |
+| `dependency_cause_tid` | 73 | 8 | `u64` LE | `0` or known TID | PM may reject/defer blocker | current | no |
+| `degraded_hint` | 81 | 1 | `u8` bool | `0` or `1` | future live invalid bool rejects | current | descriptive |
+| `policy_flags` | 82 | 4 | `u32` LE | review flags; ignore-safe only when documented | unknown authority-bearing flags must fail closed in live ABI | future-policy | descriptive only |
+| `token.owner_tid` | 86 | 8 | `u64` LE | must equal target for scoped token | reject wrong owner | current | token descriptor input |
+| `token.redacted_fingerprint` | 94 | 2 | `u16` LE | redacted fingerprint only | raw token material is not accepted | current | no raw authority |
+| `token.scoped` | 96 | 1 | `u8` bool | must be `1` | reject `RawOrUnscopedToken` | current | authority hint checked by PM state |
+| `token.reserved` | 97 | 1 | reserved byte | must be `0` | reject `NonzeroReserved` | reserved | no |
+| `startup_cap_policy` | 98 | 4 | `u32` LE | reviewed descriptor | unsupported layout rejects | future-policy | descriptive |
+| `rollback_policy` | 102 | 4 | `u32` LE | reviewed descriptor | unsupported rollback rejects | future-policy | descriptive |
+| `health_monitor_policy` | 106 | 4 | `u32` LE | reviewed descriptor | unsupported policy rejects/defer | future-policy | descriptive |
+
+Request V1 total length is frozen at 110 bytes.
+
+### Reply V1 frozen layout
+
+| Field | Offset | Length | Type / endian | Valid range | Rejection behavior | Status | Authority-bearing? |
+|---|---:|---:|---|---|---|---|---|
+| `version` | 0 | 2 | `u16` LE | `1` | reject `UnsupportedVersion` | current | no |
+| `request_id` | 2 | 8 | `u64` LE | any | correlation only | current | no |
+| `target_tid` | 10 | 8 | `u64` LE | requested target | mismatch rejected by caller policy | current | identifies target |
+| `status` | 18 | 2 | `u16` LE | `1..=7` | reject `InvalidEnum` | current | result descriptor |
+| `failure` | 20 | 2 | `u16` LE | `0..=10` | reject `InvalidEnum` | current | result descriptor |
+| `replacement_handle_kind` | 22 | 2 | `u16` LE | reviewed PM handle kind | unsupported kind rejects in live caller | future-policy | PM-scoped descriptor only |
+| `replacement_handle_value` | 24 | 8 | `u64` LE | opaque PM handle | not a CapId/TID authority | future-policy | PM-scoped descriptor only |
+| `cleanup_status` | 32 | 2 | `u16` LE | reviewed status | unknown rejects/fails closed in live caller | future-policy | descriptive |
+| `accounting_status` | 34 | 2 | `u16` LE | reviewed status | unknown rejects/fails closed in live caller | future-policy | descriptive |
+| `startup_cap_status` | 36 | 2 | `u16` LE | reviewed status | unknown rejects/fails closed in live caller | future-policy | descriptive |
+| `health_monitor_status` | 38 | 2 | `u16` LE | reviewed status | unknown rejects/fails closed in live caller | future-policy | descriptive |
+| `rollback_status` | 40 | 2 | `u16` LE | reviewed status | unknown rejects/fails closed in live caller | future-policy | descriptive |
+| `next_retry_tick` | 42 | 8 | `u64` LE | `0` or monotonic retry tick | caller defers, never executes early | current | no |
+
+Reply V1 total length is frozen at 50 bytes. Reply V1 currently has no reserved
+bytes; any future reserved field requires a version bump or explicit compatibility
+rule.
+
+### Reserved field and flag policy
+
+All reserved bytes must encode as zero, and decode must reject nonzero reserved
+bytes. Unknown enum values fail closed. Unknown flags fail closed unless the
+signoff table marks them ignore-safe and documents why they are not authority.
+Future extension requires a version bump or an explicit compatibility rule.
+Candidate opcode values `15`/`16` remain unallocated until live ABI approval.
+
+### Reviewer signoff checklist
+
+No PR may promote this codec into `yarm-ipc-abi` or runtime dispatch until every
+item below is explicitly signed off:
+
+- [ ] opcode numeric allocation;
+- [ ] wire layout offsets and byte lengths;
+- [ ] little-endian encoding;
+- [ ] bounded string behavior;
+- [ ] enum/status/failure behavior;
+- [ ] reserved fields and future-use policy;
+- [ ] token authority model;
+- [ ] verified supervisor sender model;
+- [ ] PM rollback/accounting invariants;
+- [ ] timer/backoff semantics;
+- [ ] unsupported-version behavior;
+- [ ] QEMU x86_64 and AArch64 boot smoke results;
+- [ ] rollback injection tests;
+- [ ] security review.
+
+### Golden-vector signoff table
+
+| Vector | Payload kind | Length | Status/failure | Matrix row | Valid/malformed | Expected decode |
+|---|---|---:|---|---|---|---|
+| valid restart request | request | 110 | n/a | valid supervisor request | valid | request roundtrip |
+| accepted reply | reply | 50 | `Accepted/None` | valid supervisor request | valid | reply roundtrip |
+| untrusted sender reply | reply | 50 | `Rejected/MissingRight` | untrusted sender | valid | reply roundtrip |
+| wrong-token reply | reply | 50 | `Rejected/WrongTokenOwner` | wrong token owner | valid | reply roundtrip |
+| raw-token reply | reply | 50 | `Rejected/RawTokenUnsupported` | raw token | valid | reply roundtrip |
+| unknown-target reply | reply | 50 | `NoSuchTarget/None` | unknown target | valid | reply roundtrip |
+| restart-limit reply | reply | 50 | `Rejected/RestartLimitExceeded` | restart limit exceeded | valid | reply roundtrip |
+| dependency-blocker reply | reply | 50 | `Deferred/DependencyBlocked` | dependency blocker | valid | reply roundtrip |
+| resource-unavailable reply | reply | 50 | `Deferred/ResourceUnavailable` | resource unavailable | valid | reply roundtrip |
+| startup-cap unsupported | PM oracle | n/a | `Rejected/StartupCapLayoutUnsupported` | startup-cap unsupported | valid oracle | oracle rejects |
+| rollback-failure reply | reply | 50 | `RolledBack/RollbackFailed` | rollback failure | valid | reply roundtrip |
+| unsupported-version reply | reply | 50 | `UnsupportedVersion/UnsupportedVersion` | unsupported version | valid | reply roundtrip |
+| timer-unavailable reply | reply | 50 | `Deferred/TimerUnavailable` | timer unavailable | valid | reply roundtrip |
+| already-restarting reply | reply | 50 | `AlreadyRestarting/None` | already restarting | valid | reply roundtrip |
+| already-running duplicate | PM oracle | n/a | `Rejected/DuplicateRunningRestart` | already running duplicate | valid oracle | oracle rejects |
+| rollback alert delivery | supervisor model | n/a | rolled-back alert/degraded | rollback alert delivery | valid model | alert/degraded state |
+| truncated request | request | `<110` | n/a | malformed input | malformed | `Malformed` |
+| invalid enum request | request | 110 | n/a | malformed input | malformed | `InvalidEnum` |
+| raw/unscoped token request | request | 110 | n/a | raw token | malformed | `RawOrUnscopedToken` |
+| nonzero reserved request | request | 110 | n/a | reserved policy | malformed | `NonzeroReserved` |
+
+### Conformance matrix completeness
+
+Every SUP-6 row now has one of: a SUP-7 golden vector, an existing PM oracle test,
+an existing supervisor model test, or a documented future live test. Startup-cap
+unsupported, already-running duplicate, and rollback alert delivery remain covered
+by oracle/model rows rather than wire-only vectors because live dispatch is still
+disabled.
