@@ -1510,6 +1510,128 @@ mod tests {
         assert_eq!(request.token.owner_tid, 77);
         assert_eq!(request.token.redacted_fingerprint, 0xCAFE);
         assert_eq!(oracle_from_request(request), oracle);
+
+        let reply_oracle = Sup4PmRestartOracleReplyDescriptor {
+            request_id: 42,
+            target_tid: 77,
+            status: PmRestartReviewReplyStatus::Deferred,
+            failure: PmRestartReviewFailure::TimerUnavailable,
+            retry_tick: 233,
+        };
+        let reply = reply_from_sup4_oracle(reply_oracle);
+        assert_eq!(reply.request_id, 42);
+        assert_eq!(reply.target_tid, 77);
+        assert_eq!(reply.status, PmRestartReviewReplyStatus::Deferred);
+        assert_eq!(reply.failure, PmRestartReviewFailure::TimerUnavailable);
+        assert_eq!(reply.next_retry_tick, 233);
+        assert_eq!(oracle_from_reply(reply), reply_oracle);
+    }
+
+    #[test]
+    fn sup7_codec_vectors_cover_sup6_matrix_rows() {
+        use self::pm_restart_abi_review::*;
+        let rows = [
+            (
+                "valid supervisor request",
+                PmRestartReviewReplyStatus::Accepted,
+                PmRestartReviewFailure::None,
+                0,
+            ),
+            (
+                "untrusted sender",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::MissingRight,
+                0,
+            ),
+            (
+                "wrong token owner",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::WrongTokenOwner,
+                0,
+            ),
+            (
+                "raw token",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::RawTokenUnsupported,
+                0,
+            ),
+            (
+                "unknown target",
+                PmRestartReviewReplyStatus::NoSuchTarget,
+                PmRestartReviewFailure::None,
+                0,
+            ),
+            (
+                "restart limit exceeded",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::RestartLimitExceeded,
+                0,
+            ),
+            (
+                "dependency blocker",
+                PmRestartReviewReplyStatus::Deferred,
+                PmRestartReviewFailure::DependencyBlocked,
+                55,
+            ),
+            (
+                "resource unavailable",
+                PmRestartReviewReplyStatus::Deferred,
+                PmRestartReviewFailure::ResourceUnavailable,
+                89,
+            ),
+            (
+                "rollback failure",
+                PmRestartReviewReplyStatus::RolledBack,
+                PmRestartReviewFailure::RollbackFailed,
+                0,
+            ),
+            (
+                "unsupported version",
+                PmRestartReviewReplyStatus::UnsupportedVersion,
+                PmRestartReviewFailure::UnsupportedVersion,
+                0,
+            ),
+            (
+                "timer unavailable",
+                PmRestartReviewReplyStatus::Deferred,
+                PmRestartReviewFailure::TimerUnavailable,
+                144,
+            ),
+            (
+                "already restarting",
+                PmRestartReviewReplyStatus::AlreadyRestarting,
+                PmRestartReviewFailure::None,
+                0,
+            ),
+        ];
+        for (idx, (row, status, failure, retry_tick)) in rows.iter().enumerate() {
+            let reply = PmRestartReplyV1Review {
+                version: PM_RESTART_REVIEW_VERSION_V1,
+                request_id: 0x7000 + idx as u64,
+                target_tid: 77,
+                status: *status,
+                failure: *failure,
+                replacement_handle_kind: (*status == PmRestartReviewReplyStatus::Accepted) as u16,
+                replacement_handle_value: if *status == PmRestartReviewReplyStatus::Accepted {
+                    0x504d_5355_5037
+                } else {
+                    0
+                },
+                cleanup_status: 0,
+                accounting_status: 0,
+                startup_cap_status: 0,
+                health_monitor_status: 0,
+                rollback_status: (*status == PmRestartReviewReplyStatus::RolledBack) as u16,
+                next_retry_tick: *retry_tick,
+            };
+            let encoded = encode_pm_restart_reply_v1(&reply).expect(row);
+            assert_eq!(encoded.len(), PM_RESTART_REPLY_V1_LEN, "{row}");
+            assert_eq!(
+                decode_pm_restart_reply_v1(&encoded).expect(row),
+                reply,
+                "{row}"
+            );
+        }
     }
 
     #[test]

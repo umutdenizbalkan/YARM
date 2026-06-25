@@ -219,5 +219,7 @@ token rejection, timer-unavailable deferral, rolled-back reply, and unsupported
 version reply.
 
 Candidate opcode names remain `PROC_OP_PM_RESTART_V1` and
-`PROC_OP_PM_RESTART_REPLY_V1`, but they are still not allocated and remain absent
-from the live global process IPC ABI.
+`PROC_OP_PM_RESTART_REPLY_V1`. ABI-review candidate numeric values are `15` for
+the request and `16` for the reply because the live process IPC opcode count is
+currently 14, but these numbers are **not allocated**, are not present in
+`yarm-ipc-abi`, and remain absent from PM/supervisor runtime dispatch.

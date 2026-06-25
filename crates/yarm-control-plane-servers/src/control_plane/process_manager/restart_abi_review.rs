@@ -228,6 +228,15 @@ pub struct Sup4PmRestartOracleDescriptor {
     pub token_fingerprint: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sup4PmRestartOracleReplyDescriptor {
+    pub request_id: u32,
+    pub target_tid: u64,
+    pub status: PmRestartReviewReplyStatus,
+    pub failure: PmRestartReviewFailure,
+    pub retry_tick: u64,
+}
+
 pub fn request_from_sup4_oracle(
     oracle: Sup4PmRestartOracleDescriptor,
 ) -> Result<PmRestartRequestV1Review, PmRestartReviewCodecError> {
@@ -256,6 +265,40 @@ pub fn oracle_from_request(request: PmRestartRequestV1Review) -> Sup4PmRestartOr
         dependency_cause_tid: request.dependency_cause_tid,
         token_owner_tid: request.token.owner_tid,
         token_fingerprint: request.token.redacted_fingerprint,
+    }
+}
+
+pub fn reply_from_sup4_oracle(
+    oracle: Sup4PmRestartOracleReplyDescriptor,
+) -> PmRestartReplyV1Review {
+    PmRestartReplyV1Review {
+        version: PM_RESTART_REVIEW_VERSION_V1,
+        request_id: oracle.request_id as u64,
+        target_tid: oracle.target_tid,
+        status: oracle.status,
+        failure: oracle.failure,
+        replacement_handle_kind: (oracle.status == PmRestartReviewReplyStatus::Accepted) as u16,
+        replacement_handle_value: if oracle.status == PmRestartReviewReplyStatus::Accepted {
+            0x504d_5355_5037
+        } else {
+            0
+        },
+        cleanup_status: 0,
+        accounting_status: 0,
+        startup_cap_status: 0,
+        health_monitor_status: 0,
+        rollback_status: (oracle.status == PmRestartReviewReplyStatus::RolledBack) as u16,
+        next_retry_tick: oracle.retry_tick,
+    }
+}
+
+pub fn oracle_from_reply(reply: PmRestartReplyV1Review) -> Sup4PmRestartOracleReplyDescriptor {
+    Sup4PmRestartOracleReplyDescriptor {
+        request_id: reply.request_id as u32,
+        target_tid: reply.target_tid,
+        status: reply.status,
+        failure: reply.failure,
+        retry_tick: reply.next_retry_tick,
     }
 }
 

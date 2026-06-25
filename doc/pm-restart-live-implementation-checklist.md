@@ -183,9 +183,8 @@ are complete:
 ## SUP-7 codec golden vector linkage
 
 SUP-7 adds review-only codec golden vectors that map back to the conformance
-matrix rows: valid supervisor request, wrong token owner, timer unavailable,
-rollback failure, unsupported version, and accepted reply. Future live work must
-extend these vectors for untrusted sender, raw token, unknown target, restart
-limit exceeded, dependency blocker, resource unavailable, and already restarting
-before enabling dispatch. The codec remains non-dispatching until all matrix rows
-have either hosted oracle coverage or live conformance coverage.
+matrix rows: valid supervisor request, untrusted sender, wrong token owner, raw
+token, unknown target, restart limit exceeded, dependency blocker, resource
+unavailable, rollback failure, unsupported version, timer unavailable, and already
+restarting. The codec remains non-dispatching until all matrix rows have either
+hosted oracle coverage or live conformance coverage.
