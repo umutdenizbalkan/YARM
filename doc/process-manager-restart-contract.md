@@ -186,4 +186,12 @@ the production runtime retains deferred/no-PM-client markers.
 Live PM restart requires a new ABI review, verified supervisor endpoint authority,
 capability-bound token validation, PM-owned teardown/replacement/resource
 accounting, rollback implementation, startup-cap delivery, health-monitor
-registration, and reply delivery. None are implemented by SUP-4/SUP-5.
+registration, and reply delivery. None are implemented by SUP-4/SUP-5/SUP-6.
+
+## SUP-6 live implementation checklist link
+
+SUP-6 adds `doc/pm-restart-live-implementation-checklist.md` as the review
+checklist and conformance matrix for future live PM restart work. It is not live
+implementation: proposed opcode names remain unallocated, global IPC ABI remains
+unchanged, and future SUP-7/live work must pass the checklist before enabling any
+runtime restart path.

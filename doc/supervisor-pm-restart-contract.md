@@ -101,3 +101,10 @@ The reviewed global PM restart IPC ABI is now specified as an RFC-only section i
 still only the requestor, PM is the only future executor, and kernel mechanisms
 remain external. Future live work requires explicit ABI approval before adding
 `PROC_OP_PM_RESTART_V1` or wiring any PM client.
+
+## SUP-6 conformance handoff
+
+SUP-6 adds the live-implementation review checklist and conformance matrix in
+`doc/pm-restart-live-implementation-checklist.md`. The supervisor remains only the
+requestor until future live work passes that matrix, including verified sender,
+scoped-token, fail-closed fallback, timer/backoff, and rollback-injection gates.

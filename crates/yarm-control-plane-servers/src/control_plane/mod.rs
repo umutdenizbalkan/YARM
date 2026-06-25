@@ -1208,4 +1208,108 @@ mod tests {
             "missing dependent token must remain visibly blocked"
         );
     }
+
+    // ── SUP-6: live restart checklist/conformance guardrails ────────────────
+
+    #[test]
+    fn sup6_conformance_matrix_covers_required_live_behaviors() {
+        let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        for row in &[
+            "pm_restart_live_valid_supervisor_request_accepts",
+            "pm_restart_live_untrusted_sender_rejected",
+            "pm_restart_live_wrong_token_owner_rejected",
+            "pm_restart_live_raw_token_rejected",
+            "pm_restart_live_unknown_target_no_such_target",
+            "pm_restart_live_restart_limit_rejected",
+            "pm_restart_live_dependency_blocker_deferred",
+            "pm_restart_live_resource_preflight_deferred",
+            "pm_restart_live_startup_cap_layout_rejected",
+            "pm_restart_live_rollback_after_replacement_task",
+            "pm_restart_live_rollback_after_startup_cap",
+            "pm_restart_live_unsupported_version_rejected",
+            "pm_restart_live_timer_unavailable_deferred",
+            "pm_restart_live_duplicate_already_restarting",
+            "pm_restart_live_already_running_duplicate_rejected",
+            "pm_restart_live_rollback_alerts_init_supervisor",
+        ] {
+            assert!(
+                checklist.contains(row),
+                "SUP-6 matrix must include future conformance row {row}"
+            );
+        }
+        for expected in &[
+            "Accepted",
+            "Rejected/MissingRight",
+            "Rejected/WrongTokenOwner",
+            "Rejected/RawTokenUnsupported",
+            "NoSuchTarget",
+            "Rejected/RestartLimitExceeded",
+            "Deferred/DependencyBlocked",
+            "Deferred/ResourceUnavailable",
+            "Rejected/StartupCapLayoutUnsupported",
+            "RolledBack",
+            "UnsupportedVersion",
+            "AlreadyRestarting",
+        ] {
+            assert!(
+                checklist.contains(expected),
+                "SUP-6 matrix must pin expected reply/status {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup6_live_enablement_checklist_requires_security_accounting_and_smokes() {
+        let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        for gate in &[
+            "ABI numeric assignment approved",
+            "PM verified sender path implemented",
+            "Scoped/capability-bound token validation implemented",
+            "PM accounting and rollback implemented",
+            "Timer endpoint available",
+            "Supervisor production PM client implemented",
+            "Rollback injection hosted tests pass",
+            "x86_64 and AArch64 boot smokes are unaffected",
+            "Docs are updated from RFC/proposed status to live status",
+        ] {
+            assert!(
+                checklist.contains(gate),
+                "SUP-6 live enablement checklist must require {gate}"
+            );
+        }
+        assert!(
+            checklist.contains("Raw/unscoped restart tokens are not accepted")
+                && checklist
+                    .contains("Dependent restart uses the dependent service's own token only")
+                && checklist.contains("Logs use redacted token fingerprints/references only"),
+            "SUP-6 token authority checklist must preserve scoped/redacted dependent-token rules"
+        );
+    }
+
+    #[test]
+    fn sup6_remains_non_live_and_keeps_abi_counts_unchanged() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        assert!(
+            checklist.contains("Numeric values are **not allocated** in SUP-6")
+                && checklist.contains("does not add global IPC ABI opcodes"),
+            "SUP-6 must document non-live numeric opcode status"
+        );
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-6 must not add live PM restart opcodes"
+        );
+        assert_eq!(
+            abi_src.matches("pub const PROC_OP_").count(),
+            14,
+            "SUP-6 must keep process IPC opcode count unchanged"
+        );
+        assert!(
+            syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            "SUP-6 must not change syscall count"
+        );
+    }
 }

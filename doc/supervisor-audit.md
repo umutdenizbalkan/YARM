@@ -199,3 +199,11 @@ production global IPC ABI, syscall count remains unchanged, and source guardrail
 continue to require redacted token refs, no dependent-token fallback, no live PM
 IPC/restart/spawn/teardown/cap/resource calls in model regions, and deferred
 production markers until live ABI approval.
+
+## SUP-6 live implementation review matrix
+
+SUP-6 remains design/test-artifact-only. It adds the PM restart live enablement
+checklist and conformance matrix, plus guardrails that keep proposed opcode names
+absent from the live global IPC ABI, preserve process IPC opcode count and
+`SYSCALL_COUNT`, require inert model regions, and require redacted token/dependent
+token protections before future SUP-7/live work.
