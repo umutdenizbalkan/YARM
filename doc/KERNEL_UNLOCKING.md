@@ -3917,6 +3917,79 @@ D6/CR3/TSS *switch* machinery untouched beyond the page-fault TLB fix, Stage 163
 transactional/run-preserving COW clone preserved, `MAX_ADDRESS_SPACES` remains 32,
 and PCIDE stays disabled.
 
+#### 5.1.9.16 Stage 163J — fork child return-lane / first-resume correctness
+
+Stage 163I cleared the page-fault/COW loop (the child/parent stack faults now
+route correctly through COW: `PF_PROOF_COW_HANDLE_OK ... path=private_copy →
+PAGE_FAULT_HANDLED_COW`). QEMU then exposed the next blocker: the **fork child
+returns as the parent**.
+
+```
+tid=1:     FORK_SMOKE_SYSCALL_RET ret0=10008 err=0   ; parent: child pid
+tid=1:     FORK_SMOKE_PARENT child_pid=10008
+tid=10008: FORK_SMOKE_SYSCALL_RET ret0=12 err=0      ; child WRONGLY sees 12
+tid=10008: FORK_SMOKE_PARENT child_pid=12            ; misclassified as parent
+```
+
+The child must see `ret0 == 0` and log `CHILD_ENTRY`; instead it saw `12` and
+recursively re-ran the sender-wake workload, whose second fork then failed
+(`err=255`), so `SENDER_START`/`WAITER_PRESENT`/`SEQUENCE_DONE` were never
+reached.
+
+**Why the child saw `ret0 = 12` (Task A).** `12` is **`NR_fork`**, the fork
+syscall number — which also happened to equal the child's ASID (`12`), making it
+*look* like an ASID leak. It is not the ASID; it is a stale syscall number in the
+return register, for a precise reason:
+
+- The fork child is a **resumed** task. On x86_64 a resumed task is restored by
+  `write_task_gprs_to_saved_regs`, which sets `rax = trap_frame.user_gpr(0)`.
+- At syscall entry `build_trap_frame_from_saved_regs` records `user_gpr(0) = rax`,
+  and on a `syscall` the user's `rax` holds the **syscall number** (`NR_fork =
+  12`). So the parent's captured context has `user_gprs[0] = 12`.
+- `fork_complete_post_clone` cloned the parent context and set
+  `child.user_context.arg0 = 0` — but `arg0` only feeds `rdi`/`arg(0)` on the
+  **new-task** entry path. The child is a *resumed* task, so `arg0` never reaches
+  its `rax`; the inherited `user_gprs[0] = 12` is delivered verbatim.
+
+So the return lane was set in the wrong place: `arg0` instead of the saved-GPR
+return register. (No ASID is ever written to a user return lane; `12` was purely
+the syscall number.)
+
+**Fix (Task C, minimal, at the authoritative child-frame creation point).**
+After cloning the parent context, zero the real return lane:
+`child.user_context.user_gprs[0] = 0;` (x86_64 `RAX`), keeping `arg0 = 0`. This
+mirrors how `complete_blocked_recv_for_waiter` delivers a resumed task's return
+value through `user_gpr(0)`. The userspace decode (`ret0 != 0 → parent`,
+`ret0 == 0 && err == 0 → child`) was already correct and was **not** changed —
+in particular it was not hacked to treat an ASID-like `ret0` as the child; this
+was a kernel fork-ABI bug fixed in the kernel.
+
+**Diagnostics (Task B):** proof-gated `FORK_PROOF_CHILD_RET_SET`,
+`FORK_PROOF_PARENT_RET_SET`, `FORK_PROOF_CHILD_FRAME_BEFORE_ENQUEUE`, and an
+x86_64 `FORK_PROOF_FIRST_RESUME_AFTER_ARCH_RESTORE` that logs the `rax` actually
+delivered by the resumed-task restore — proving the lane end-to-end.
+
+**Expected x86_64 QEMU after fix (Task E):**
+`tid=1: FORK_SMOKE_SYSCALL_RET ret0=<child> → FORK_SMOKE_PARENT` and
+`tid=<child>: FORK_SMOKE_SYSCALL_RET ret0=0 → FORK_SMOKE_CHILD_ENTRY`; then
+`FILL_DONE → FORK_RET role=parent/child → CHILD_ENTRY → SENDER_START`, child
+blocks on full E1, `WAITER_PRESENT`, parent observes,
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK → IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`.
+
+**AArch64 (Task F):** not chased here. Its resume path delivers x0 from
+`frame.ret0()` (not `user_gpr(0)`), a different mechanism; zeroing `user_gprs[0]`
+is harmless there. Reclassify AArch64's `nr=0`/yield loop separately after
+x86_64 passes.
+
+The `stage163j_*` source guards pin the zeroed return lane (snapshot-then-
+override), the parent `child_tid` return, the absence of any ASID→return-lane
+write, the x86_64 `rax = user_gpr(0)` restore + first-resume trace, the
+proof-gated diagnostics, the unchanged userspace decode, and that Stage 163E COW
+and Stage 163I PF/intermediate-permission behavior remain intact. No syscall/IPC
+ABI change, no IPC/cap seam moved, counts unchanged (`SYSCALL_COUNT == 31`,
+`VARIANT_COUNT == 23`), RPi5 untouched, the D6/CR3/TSS/PF machinery untouched
+beyond the fork-child return-lane fix, and `MAX_ADDRESS_SPACES` remains 32.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

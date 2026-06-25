@@ -755,6 +755,18 @@ fn write_task_gprs_to_saved_regs(
         regs.r10 = 0;
         regs.r11 = 0;
     }
+    // Stage 163J: proof-gated trace of the return lane actually delivered on a
+    // first/resumed entry, so a fork child returning a stale syscall-number in
+    // RAX (the observed `ret0=12`) is unambiguous. `rax` here is exactly what
+    // IRETQ/SYSRET will load into the user return register.
+    if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+        crate::yarm_log!(
+            "FORK_PROOF_FIRST_RESUME_AFTER_ARCH_RESTORE rax={} user_gpr0={} is_new_task={}",
+            regs.rax,
+            trap_frame.user_gpr(0),
+            is_new_task as u8
+        );
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

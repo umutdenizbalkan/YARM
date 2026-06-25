@@ -1666,13 +1666,31 @@ impl KernelState {
             // Fork child resumes with the same user register context as parent;
             // only the return register differs (`0` in the child).
             child.user_context = parent.user_context;
+            // Stage 163J: the AUTHORITATIVE child return lane is the saved GPR
+            // snapshot, NOT `arg0`. On x86_64 a resumed task is restored by
+            // `write_task_gprs_to_saved_regs` with `rax = user_gpr(0)`, and at
+            // syscall entry `user_gpr(0)` is loaded with `rax` = the syscall
+            // NUMBER (NR_fork = 12). The child inherits that 12 from the parent
+            // snapshot, so `arg0 = 0` (which only feeds `rdi`/`arg(0)` on the
+            // NEW-task path) never reaches the child's `rax` and it returns 12 —
+            // misclassifying itself as the parent. Zero `user_gprs[0]` so the
+            // child's return register is 0 across the resumed-task restore. This
+            // mirrors how `complete_blocked_recv_for_waiter` delivers a resumed
+            // task's return value through `user_gpr(0)`.
+            child.user_context.user_gprs[0] = 0;
             child.user_context.arg0 = 0;
             child.status = TaskStatus::Runnable;
             Ok::<_, KernelError>(())
         })?;
         if proof {
             crate::yarm_log!(
-                "FORK_PROOF_CHILD_TF_RET0_SET child_tid={} ret0=0",
+                "FORK_PROOF_CHILD_RET_SET child_tid={} ret0=0 user_gpr0=0 err=0",
+                child_tid
+            );
+            crate::yarm_log!(
+                "FORK_PROOF_PARENT_RET_SET parent_tid={} child_tid={} ret0={} err=0",
+                parent_tid,
+                child_tid,
                 child_tid
             );
         }
@@ -1692,6 +1710,17 @@ impl KernelState {
             self.set_task_brk_bounds(child_tid, base, end)?;
         }
         if proof {
+            let frame = self.thread_user_context(child_tid);
+            let (rip, rsp, rax) = frame
+                .map(|c| (c.instruction_ptr.0, c.stack_ptr.0, c.user_gprs[0] as u64))
+                .unwrap_or((0, 0, 0));
+            crate::yarm_log!(
+                "FORK_PROOF_CHILD_FRAME_BEFORE_ENQUEUE tid={} rip=0x{:x} rsp=0x{:x} rax={} ret0=0 err=0",
+                child_tid,
+                rip,
+                rsp,
+                rax
+            );
             crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_BEGIN child_tid={}", child_tid);
         }
         if let Err(e) = self.enqueue_task(child_tid) {
