@@ -25,6 +25,7 @@ mod tests {
         ));
     }
 
+    use alloc::vec::Vec;
     use yarm_ipc_abi::process_abi::{decode_spawn_v5_reply, encode_spawn_v5_reply};
 
     fn spawn_v5_reply_is_success(pid: u64, _service_send_cap: u64) -> bool {
@@ -1730,6 +1731,175 @@ mod tests {
                 && !supervisor_src.contains("unwrap_or(event.restart_token)")
                 && supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
             "SUP-8 must preserve redaction, dependent-token, and deferred-runtime guardrails"
+        );
+    }
+
+    // ── SUP-9: pre-live promotion dry-run readiness guardrails ─────────────
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartPromotionReadinessStatus {
+        ReadyForReviewOnly,
+        MissingArtifacts,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartPromotionReadinessFailure {
+        MissingFrozenRequestSize,
+        MissingFrozenReplySize,
+        MissingConformanceMatrix,
+        MissingReservedPolicy,
+        MissingGoldenVectors,
+        CandidateOpcodesNotUnallocated,
+        LiveAbiOpcodePresent,
+        DispatchPresent,
+        MissingFailClosedMarker,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PmRestartPromotionReadinessReport {
+        status: PmRestartPromotionReadinessStatus,
+        failures: Vec<PmRestartPromotionReadinessFailure>,
+    }
+
+    fn evaluate_pm_restart_promotion_readiness(
+        process_contract_doc: &str,
+        checklist_doc: &str,
+        promotion_plan_doc: &str,
+        live_abi_src: &str,
+        pm_src: &str,
+        supervisor_src: &str,
+    ) -> PmRestartPromotionReadinessReport {
+        let mut failures = Vec::new();
+        if !process_contract_doc.contains("Request V1 total length is frozen at 110 bytes") {
+            failures.push(PmRestartPromotionReadinessFailure::MissingFrozenRequestSize);
+        }
+        if !process_contract_doc.contains("Reply V1 total length is frozen at 50 bytes") {
+            failures.push(PmRestartPromotionReadinessFailure::MissingFrozenReplySize);
+        }
+        if !checklist_doc.contains("conformance")
+            && !process_contract_doc.contains("Conformance matrix completeness")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::MissingConformanceMatrix);
+        }
+        if !process_contract_doc.contains("Reserved field and flag policy")
+            || !process_contract_doc.contains("decode must reject nonzero reserved")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::MissingReservedPolicy);
+        }
+        if !process_contract_doc.contains("Golden-vector signoff table")
+            || !promotion_plan_doc.contains("codec golden vectors exist")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::MissingGoldenVectors);
+        }
+        if !process_contract_doc.contains("candidate opcodes `15`/`16` remain")
+            || !promotion_plan_doc.contains("candidate values `15` and `16` explicitly unallocated")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::CandidateOpcodesNotUnallocated);
+        }
+        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
+            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::LiveAbiOpcodePresent);
+        }
+        if pm_src.contains("PROC_OP_PM_RESTART_V1")
+            || supervisor_src.contains("PROC_OP_PM_RESTART_V1")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::DispatchPresent);
+        }
+        if !supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT") {
+            failures.push(PmRestartPromotionReadinessFailure::MissingFailClosedMarker);
+        }
+        let status = if failures.is_empty() {
+            PmRestartPromotionReadinessStatus::ReadyForReviewOnly
+        } else {
+            PmRestartPromotionReadinessStatus::MissingArtifacts
+        };
+        PmRestartPromotionReadinessReport { status, failures }
+    }
+
+    #[test]
+    fn sup9_promotion_readiness_reports_review_only_not_live() {
+        let process_doc = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let checklist_doc =
+            include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        let promotion_doc = include_str!("../../../../doc/pm-restart-live-promotion-plan.md");
+        let live_abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+
+        let report = evaluate_pm_restart_promotion_readiness(
+            process_doc,
+            checklist_doc,
+            promotion_doc,
+            live_abi_src,
+            pm_src,
+            supervisor_src,
+        );
+        assert_eq!(
+            report.status,
+            PmRestartPromotionReadinessStatus::ReadyForReviewOnly
+        );
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn sup9_promotion_plan_contains_required_future_sequence_and_evidence() {
+        let promotion_doc = include_str!("../../../../doc/pm-restart-live-promotion-plan.md");
+        for needle in &[
+            "# SUP-9 PM restart live-promotion dry-run plan",
+            "## Future SUP-live promotion sequence",
+            "### 1. ABI approval",
+            "### 2. PM dispatch wiring",
+            "### 3. Supervisor PM client wiring",
+            "### 4. PM mechanism implementation",
+            "### 5. Timer/backoff integration",
+            "### 6. Rollout",
+            "## Promotion PR checklist",
+            "## Dry-run readiness model",
+            "## Future rollback-injection test plan",
+            "## Future QEMU acceptance plan",
+            "x86_64 normal boot unchanged",
+            "AArch64 normal boot unchanged",
+        ] {
+            assert!(
+                promotion_doc.contains(needle),
+                "SUP-9 promotion plan must contain {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup9_source_guardrails_keep_promotion_non_live() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let codec_src = include_str!("process_manager/restart_abi_review.rs");
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-9 must keep candidate opcodes absent from live ABI"
+        );
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-9 must not add dispatch or send paths"
+        );
+        assert!(
+            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            "production restart path must remain visibly deferred"
+        );
+        assert!(
+            codec_src.contains("PM_RESTART_REQUEST_V1_LEN: usize = 110")
+                && codec_src.contains("PM_RESTART_REPLY_V1_LEN: usize = 50")
+                && codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && codec_src.contains("NonzeroReserved"),
+            "SUP-9 must preserve frozen sizes and reserved-byte decode rejection"
+        );
+        assert!(
+            supervisor_src.contains("redacted_fingerprint")
+                && !supervisor_src.contains("unwrap_or(event.restart_token)"),
+            "SUP-9 must preserve token redaction and dependent-token no-fallback rule"
         );
     }
 }

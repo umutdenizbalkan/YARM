@@ -222,3 +222,10 @@ signoff checklist, golden-vector table, and promotion guardrails. Candidate
 opcodes `15`/`16` remain unallocated, the live global IPC ABI remains unchanged,
 PM dispatch and supervisor send paths remain absent, and production restart remains
 fail-closed/deferred.
+
+## SUP-9 pre-live promotion dry-run
+
+SUP-9 adds `doc/pm-restart-live-promotion-plan.md` and a dry-run readiness model.
+It is not live implementation: candidate opcodes remain unallocated, global IPC
+ABI and syscall ABI remain unchanged, PM dispatch and supervisor send remain
+absent, and restart/spawn/teardown/cap/resource behavior remains disabled.

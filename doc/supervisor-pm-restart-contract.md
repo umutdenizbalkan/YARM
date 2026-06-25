@@ -122,3 +122,10 @@ SUP-8 adds the ABI-review signoff package but does not change supervisor runtime
 behavior. The supervisor remains requestor-only and must not send PM restart IPC
 until a future SUP-live stage promotes the codec, passes signoff, and preserves
 fail-closed fallback.
+
+## SUP-9 dry-run promotion plan
+
+SUP-9 links the supervisor contract to `doc/pm-restart-live-promotion-plan.md`.
+The supervisor remains requestor-only and production restart remains fail-closed;
+a future live stage must satisfy the SUP-8 signoff package and SUP-9 checklist
+before any supervisor PM restart send path is enabled.

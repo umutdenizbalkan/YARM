@@ -196,3 +196,11 @@ checklist, and golden-vector signoff table in `doc/process-manager-restart-contr
 The package is still non-live: candidate opcodes `15`/`16` remain unallocated,
 PM dispatch remains absent, and supervisor PM restart send remains absent until a
 future SUP-live promotion stage satisfies every signoff item.
+
+## SUP-9 promotion dry-run link
+
+SUP-9 adds `doc/pm-restart-live-promotion-plan.md` with the future promotion
+sequence, promotion PR checklist, dry-run readiness model, rollback-injection
+plan, and QEMU acceptance plan. SUP-9 is not live implementation; future SUP-live
+work must satisfy SUP-8 and SUP-9 before adding opcodes, PM dispatch, supervisor
+send, or PM restart mechanisms.

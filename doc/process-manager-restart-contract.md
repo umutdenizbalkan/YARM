@@ -342,3 +342,11 @@ an existing supervisor model test, or a documented future live test. Startup-cap
 unsupported, already-running duplicate, and rollback alert delivery remain covered
 by oracle/model rows rather than wire-only vectors because live dispatch is still
 disabled.
+
+## SUP-9 pre-live promotion dry-run
+
+SUP-9 adds `doc/pm-restart-live-promotion-plan.md` as a planning-only promotion
+sequence for a future live stage. It does not allocate opcodes, update
+`yarm-ipc-abi`, add PM dispatch, add supervisor send, or perform restart/spawn/
+teardown/cap/resource work. Future live work must satisfy both the SUP-8 signoff
+package and the SUP-9 promotion checklist before enabling runtime dispatch.
