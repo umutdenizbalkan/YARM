@@ -44294,3 +44294,143 @@ mod stage163g_cow_pagefault {
         }
     }
 }
+
+// Stage 163H — fork-child software-vs-hardware PTE mismatch. QEMU diagnostics showed
+// the child stack page as software writable=1/cow=0/demand=1, but the ACTIVE page
+// table the CPU walks was a DIFFERENT ASID with a stale/wrong present entry
+// (active_flags=0x80000007 vs task_flags=...104dd007), so the demand-verify never
+// corrected CR3 (its switch was gated on the active entry being ABSENT) and the
+// child re-faulted forever. The fix broadens the existing CR3 correction to cover a
+// stale-but-present mismatch, and adds fully-decoded before/after HW PTE diagnostics.
+mod stage163h_fork_child_pte_mismatch {
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_VM_LAYOUT_SRC: &str = include_str!("../../arch/x86_64/vm_layout.rs");
+
+    // 1. The demand-verify CR3 correction now switches on a stale-but-present
+    //    mismatch (active ASID differs AND its PTE flags differ from the task's),
+    //    not only when the active entry is absent.
+    #[test]
+    fn stage163h_demand_verify_switches_on_stale_present_mismatch() {
+        let verify = FAULT_SRC
+            .split("PAGE_FAULT_DEMAND_VERIFY")
+            .nth(1)
+            .and_then(|s| s.split("PAGE_FAULT_HANDLED_DEMAND").next())
+            .expect("demand verify block");
+        assert!(
+            verify.contains("active_mismatch")
+                && verify.contains("active_asid.0 != task_asid.0 && active_flags != task_flags")
+                && verify.contains("switch_address_space(task_asid)")
+                && verify.contains("invalidate_page(page)"),
+            "demand verify must correct CR3 on a stale-but-present active mismatch + invalidate"
+        );
+        assert!(
+            verify.contains("hw_demand_ok"),
+            "HANDLED_DEMAND must remain gated on the hardware PTE walk"
+        );
+    }
+
+    // 2. Fully-decoded before/after hardware PTE diagnostics exist and decode bits
+    //    (present/writable/user/nx) plus the software flags — no ambiguous raw-only.
+    #[test]
+    fn stage163h_hw_pte_diagnostics_decode_bits() {
+        for marker in &[
+            "PF_PROOF_HW_PTE_BEFORE",
+            "PF_PROOF_HW_PTE_AFTER",
+            "PF_PROOF_DEMAND_CONSIDER",
+            "PF_PROOF_DEMAND_DECLINE",
+        ] {
+            assert!(
+                FAULT_SRC.contains(marker),
+                "fault handler must emit `{marker}`"
+            );
+        }
+        let helper = FAULT_SRC
+            .split("fn pf_proof_log_hw_pte")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub(crate) fn ").next())
+            .expect("hw pte helper");
+        for token in &[
+            "read_hw_cr3()",
+            "present=",
+            "writable=",
+            "user=",
+            "nx=",
+            "writable_sw=",
+            "cow_sw=",
+            "demand_sw=",
+        ] {
+            assert!(
+                helper.contains(token),
+                "HW PTE diagnostic must decode `{token}`"
+            );
+        }
+        assert!(
+            FAULT_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "PTE diagnostics must be proof-gated"
+        );
+    }
+
+    // 3. The Stage 163G write-satisfiability decline is preserved: demand cannot claim
+    //    a present write fault it does not resolve.
+    #[test]
+    fn stage163h_demand_still_declines_unsatisfiable_present_write() {
+        let demand = FAULT_SRC
+            .split("fn try_handle_demand_page_fault")
+            .nth(1)
+            .and_then(|s| s.split("\n    fn ").next())
+            .or_else(|| {
+                FAULT_SRC
+                    .split("fn try_handle_demand_page_fault")
+                    .nth(1)
+                    .map(|s| &s[..s.len().min(2200)])
+            })
+            .expect("demand handler");
+        assert!(
+            demand.contains("write_satisfied") && demand.contains("return Ok(false)"),
+            "demand must decline an unsatisfiable present write fault"
+        );
+    }
+
+    // 4. No IPC/cap seam moved; counts unchanged; RPi5 untouched; the fix is confined
+    //    to the page-fault path; MAX_ADDRESS_SPACES stays 32.
+    #[test]
+    fn stage163h_no_seam_no_count_no_rpi5_bounds() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        assert!(
+            X86_VM_LAYOUT_SRC.contains(
+                "#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"
+            ),
+            "MAX_ADDRESS_SPACES stays 32"
+        );
+        for forbidden in &[
+            "rpi5",
+            "RPi5",
+            "bcm2712",
+            "D6_CONTROLLED",
+            "switch_frames",
+            "load_tss",
+        ] {
+            assert!(
+                !FAULT_SRC.contains(forbidden),
+                "fault path must not reference the {forbidden} path"
+            );
+        }
+    }
+}

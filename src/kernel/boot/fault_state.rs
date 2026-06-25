@@ -123,6 +123,61 @@ impl KernelState {
         })
     }
 
+    /// Stage 163H: proof-gated, fully-decoded page-table-entry diagnostic. Logs the
+    /// SOFTWARE shadow flags (writable / cow / demand-region) alongside the ACTIVE
+    /// hardware CR3's decoded PTE bits (present / writable / user / nx + raw) for the
+    /// faulting page, so a software-vs-hardware mismatch is unambiguous. The hardware
+    /// walk reads the REAL active CR3 (`read_hw_cr3`), not an ASID-indexed resolve,
+    /// so it reflects exactly what the CPU walks.
+    fn pf_proof_log_hw_pte(
+        &self,
+        label: &str,
+        tid: u64,
+        asid: crate::kernel::vm::Asid,
+        page: crate::kernel::vm::VirtAddr,
+    ) {
+        let sw = self.with_user_spaces(|s| s.get(asid).and_then(|a| a.resolve(page)));
+        let sw_writable = sw.map(|m| m.flags.write as u8).unwrap_or(0);
+        let sw_cow = self.is_cow_page(asid, page) as u8;
+        let sw_demand = self.fault_addr_in_demand_backed_region(tid, page.0) as u8;
+        #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+        {
+            let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+            let hw_root = hw_cr3 & !0xfffu64;
+            let (_pml4e, _pdpte, _pde, hw_pte) =
+                crate::arch::x86_64::page_table::hw_pte_walk_verbose(hw_root, page.0);
+            crate::yarm_log!(
+                "{} tid={} asid={} va=0x{:x} cr3=0x{:x} raw=0x{:x} present={} writable={} user={} nx={} cow_sw={} writable_sw={} demand_sw={}",
+                label,
+                tid,
+                asid.0,
+                page.0,
+                hw_cr3,
+                hw_pte,
+                (hw_pte & 1) as u8,
+                ((hw_pte >> 1) & 1) as u8,
+                ((hw_pte >> 2) & 1) as u8,
+                ((hw_pte >> 63) & 1) as u8,
+                sw_cow,
+                sw_writable,
+                sw_demand
+            );
+        }
+        #[cfg(not(all(target_arch = "x86_64", not(feature = "hosted-dev"))))]
+        {
+            crate::yarm_log!(
+                "{} tid={} asid={} va=0x{:x} cow_sw={} writable_sw={} demand_sw={} hw_pte=unavailable_target",
+                label,
+                tid,
+                asid.0,
+                page.0,
+                sw_cow,
+                sw_writable,
+                sw_demand
+            );
+        }
+    }
+
     pub(crate) fn try_handle_demand_page_fault(
         &mut self,
         fault: crate::arch::trap::FaultInfo,
@@ -155,7 +210,26 @@ impl KernelState {
             // RO PTE. Decline so the caller routes it to COW / task-fault instead.
             let write_satisfied =
                 !matches!(fault.access, FaultAccess::Write) || mapping.flags.write;
+            if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                crate::yarm_log!(
+                    "PF_PROOF_DEMAND_CONSIDER tid={} asid={} va=0x{:x} write_fault={} sw_writable={} write_satisfied={}",
+                    tid,
+                    asid.0,
+                    page.0,
+                    matches!(fault.access, FaultAccess::Write) as u8,
+                    mapping.flags.write as u8,
+                    write_satisfied as u8
+                );
+            }
             if !write_satisfied {
+                if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                    crate::yarm_log!(
+                        "PF_PROOF_DEMAND_DECLINE tid={} asid={} va=0x{:x} reason=present_write_not_satisfied",
+                        tid,
+                        asid.0,
+                        page.0
+                    );
+                }
                 return Ok(false);
             }
             // Stage 137: the page is already in VmSpace but the TLB may hold a
@@ -508,6 +582,10 @@ impl KernelState {
                         demand as u8,
                         mapping.map(|m| m.phys.0).unwrap_or(0)
                     );
+                    // Stage 163H: decode the ACTIVE CR3's hardware PTE before any
+                    // handling, so a software-writable / hardware-faulting mismatch is
+                    // unambiguous (the hardware walk reads the real active CR3).
+                    self.pf_proof_log_hw_pte("PF_PROOF_HW_PTE_BEFORE", tid, asid, page);
                 }
                 if matches!(fault.access, FaultAccess::Write) {
                     if let Some(tid) = self.current_tid()
@@ -560,8 +638,33 @@ impl KernelState {
                     let pte_ok = task_pte
                         .map(|p| demand_pte_flags_ok(p, need_write))
                         .unwrap_or(false);
-                    if pte_ok && !active_present && active_asid.0 != task_asid.0 {
+                    // Stage 163H: the running task MUST execute on its OWN ASID's
+                    // page table. The previous condition only corrected CR3 when the
+                    // active entry was ABSENT, which missed the observed fork-child
+                    // case: the active page table is a DIFFERENT ASID holding a
+                    // stale/wrong but PRESENT entry (active_flags=0x80000007, phys
+                    // 0x80000000) while the task's own ASID maps the page correctly
+                    // (task_flags=...104dd007). The CPU then walks the wrong table and
+                    // re-faults forever. Switch whenever the active table is a
+                    // different ASID whose PTE for this page disagrees with the task's
+                    // correct mapping, then invalidate so the CPU re-walks the right
+                    // table. (When active == task, flags match and we never switch.)
+                    let active_mismatch =
+                        active_asid.0 != task_asid.0 && active_flags != task_flags;
+                    if pte_ok && active_mismatch {
+                        if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                            crate::yarm_log!(
+                                "PF_PROOF_DEMAND_SWITCH_CR3 tid={} page=0x{:x} from_asid={} to_asid={} active_flags=0x{:x} task_flags=0x{:x}",
+                                tid,
+                                page.0,
+                                active_asid.0,
+                                task_asid.0,
+                                active_flags,
+                                task_flags
+                            );
+                        }
                         self.hal.switch_address_space(task_asid);
+                        crate::arch::selected_isa::page_table::invalidate_page(page);
                     }
                     // Stage 138: hardware CR3 PTE walk to confirm the CPU will
                     // actually see the page as accessible after demand mapping.
@@ -594,6 +697,12 @@ impl KernelState {
                     };
                     #[cfg(any(not(target_arch = "x86_64"), feature = "hosted-dev"))]
                     let hw_demand_ok = true;
+                    // Stage 163H: decode the ACTIVE CR3's PTE AFTER demand handling +
+                    // any CR3 correction, so the next run shows whether the active
+                    // hardware mapping is now writable (matching the task ASID).
+                    if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                        self.pf_proof_log_hw_pte("PF_PROOF_HW_PTE_AFTER", tid, task_asid, page);
+                    }
                     if pte_ok && hw_demand_ok {
                         crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
                         return Ok(());
