@@ -108,3 +108,10 @@ SUP-6 adds the live-implementation review checklist and conformance matrix in
 `doc/pm-restart-live-implementation-checklist.md`. The supervisor remains only the
 requestor until future live work passes that matrix, including verified sender,
 scoped-token, fail-closed fallback, timer/backoff, and rollback-injection gates.
+
+## SUP-7 codec-review handoff
+
+SUP-7 prepares non-dispatching PM restart ABI codecs behind the review gate. The
+supervisor still does not send PM restart IPC; production restart remains
+fail-closed/deferred until a future live-ABI PR promotes the codec and passes the
+SUP-6 conformance matrix.

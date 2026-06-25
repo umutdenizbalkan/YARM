@@ -207,3 +207,10 @@ checklist and conformance matrix, plus guardrails that keep proposed opcode name
 absent from the live global IPC ABI, preserve process IPC opcode count and
 `SYSCALL_COUNT`, require inert model regions, and require redacted token/dependent
 token protections before future SUP-7/live work.
+
+## SUP-7 non-dispatching codec review
+
+SUP-7 adds review-only PM restart request/reply codecs and golden vectors behind
+the test/`hosted-dev` gate. The live global IPC ABI remains unchanged, PM runtime
+dispatch and supervisor send paths remain absent, process IPC opcode count remains
+14, and production restart behavior remains deferred/fail-closed.

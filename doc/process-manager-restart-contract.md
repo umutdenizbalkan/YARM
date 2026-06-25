@@ -186,7 +186,7 @@ the production runtime retains deferred/no-PM-client markers.
 Live PM restart requires a new ABI review, verified supervisor endpoint authority,
 capability-bound token validation, PM-owned teardown/replacement/resource
 accounting, rollback implementation, startup-cap delivery, health-monitor
-registration, and reply delivery. None are implemented by SUP-4/SUP-5/SUP-6.
+registration, and reply delivery. None are implemented by SUP-4/SUP-5/SUP-6/SUP-7.
 
 ## SUP-6 live implementation checklist link
 
@@ -195,3 +195,29 @@ checklist and conformance matrix for future live PM restart work. It is not live
 implementation: proposed opcode names remain unallocated, global IPC ABI remains
 unchanged, and future SUP-7/live work must pass the checklist before enabling any
 runtime restart path.
+
+## SUP-7 non-dispatching codec review artifacts
+
+SUP-7 adds fixed-size request/reply codec structs and little-endian encode/decode
+helpers in `crates/yarm-control-plane-servers/src/control_plane/process_manager/restart_abi_review.rs`.
+The module is review-only, compiled behind the test/`hosted-dev` gate, and is not
+referenced by PM runtime dispatch. Future live implementation must explicitly
+promote the reviewed codec into `yarm-ipc-abi`, assign numeric opcodes, and add
+dispatch in a separate approved live-ABI PR.
+
+The request codec mirrors the SUP-5 request layout with bounded 32-byte service
+name storage, scoped/redacted token descriptor, restart reason, attempt/backoff
+fields, dependency cause, degraded hint, and startup-cap/rollback/health policy
+descriptors. Decode rejects malformed length, unsupported version, invalid enum
+values, oversized names, raw/unscoped tokens, and nonzero reserved fields.
+
+The reply codec mirrors the SUP-5 reply layout with accepted/rejected/deferred/
+rolled-back/unsupported/already-restarting/no-such-target statuses, failure code,
+mock replacement-handle descriptor fields, accounting/status descriptors, rollback
+status, and retry tick. Golden vectors cover valid request, accepted reply, wrong
+token rejection, timer-unavailable deferral, rolled-back reply, and unsupported
+version reply.
+
+Candidate opcode names remain `PROC_OP_PM_RESTART_V1` and
+`PROC_OP_PM_RESTART_REPLY_V1`, but they are still not allocated and remain absent
+from the live global process IPC ABI.

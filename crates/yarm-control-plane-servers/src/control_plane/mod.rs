@@ -17,6 +17,14 @@ pub mod vfs;
 
 #[cfg(test)]
 mod tests {
+    #[allow(dead_code)]
+    mod pm_restart_abi_review {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/control_plane/process_manager/restart_abi_review.rs"
+        ));
+    }
+
     use yarm_ipc_abi::process_abi::{decode_spawn_v5_reply, encode_spawn_v5_reply};
 
     fn spawn_v5_reply_is_success(pid: u64, _service_send_cap: u64) -> bool {
@@ -1310,6 +1318,225 @@ mod tests {
             syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;")
                 && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"),
             "SUP-6 must not change syscall count"
+        );
+    }
+
+    // ── SUP-7: non-dispatching restart ABI codec review ─────────────────────
+
+    fn sup7_valid_request() -> pm_restart_abi_review::PmRestartRequestV1Review {
+        let mut request = pm_restart_abi_review::PmRestartRequestV1Review::new(
+            0x0102_0304_0506_0708,
+            4,
+            77,
+            3,
+            b"vfs",
+            pm_restart_abi_review::PmRestartReviewReason::Fault,
+            pm_restart_abi_review::PmRestartReviewTokenDescriptor::scoped(77, 0xBEEF),
+        )
+        .expect("valid request");
+        request.attempt_count = 2;
+        request.due_tick = 99;
+        request.dependency_cause_tid = 11;
+        request.degraded_hint = true;
+        request.policy_flags = 0x55AA;
+        request.startup_cap_policy = 1;
+        request.rollback_policy = 2;
+        request.health_monitor_policy = 3;
+        request
+    }
+
+    #[test]
+    fn sup7_request_codec_roundtrip_and_offsets_are_stable() {
+        use self::pm_restart_abi_review::*;
+        let request = sup7_valid_request();
+        let encoded = encode_pm_restart_request_v1(&request).expect("encode");
+        assert_eq!(encoded.len(), PM_RESTART_REQUEST_V1_LEN);
+        assert_eq!(PM_RESTART_REQUEST_V1_LEN, 110);
+        assert_eq!(PM_RESTART_REQUEST_VERSION_OFFSET, 0);
+        assert_eq!(PM_RESTART_REQUEST_ID_OFFSET, 2);
+        assert_eq!(PM_RESTART_REQUEST_TARGET_TID_OFFSET, 18);
+        assert_eq!(PM_RESTART_REQUEST_SERVICE_NAME_OFFSET, 29);
+        assert_eq!(PM_RESTART_REQUEST_TOKEN_FINGERPRINT_OFFSET, 94);
+        assert_eq!(
+            &encoded[PM_RESTART_REQUEST_ID_OFFSET..PM_RESTART_REQUEST_ID_OFFSET + 8],
+            &0x0102_0304_0506_0708u64.to_le_bytes()
+        );
+        assert_eq!(encoded[PM_RESTART_REQUEST_SERVICE_NAME_LEN_OFFSET], 3);
+        assert_eq!(&encoded[PM_RESTART_REQUEST_SERVICE_NAME_OFFSET..32], b"vfs");
+        assert_eq!(
+            decode_pm_restart_request_v1(&encoded).expect("decode"),
+            request
+        );
+        assert!(
+            !encoded
+                .windows(8)
+                .any(|window| window == 0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes()),
+            "SUP-7 request codec must not encode raw restart-token bytes"
+        );
+    }
+
+    #[test]
+    fn sup7_reply_codec_golden_vectors_roundtrip() {
+        use self::pm_restart_abi_review::*;
+        let accepted = accepted_reply(7, 77);
+        let rejected_wrong_token = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::Rejected,
+            failure: PmRestartReviewFailure::WrongTokenOwner,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            ..accepted
+        };
+        let deferred_timer = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::Deferred,
+            failure: PmRestartReviewFailure::TimerUnavailable,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            next_retry_tick: 123,
+            ..accepted
+        };
+        let rolled_back = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::RolledBack,
+            failure: PmRestartReviewFailure::RollbackFailed,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            rollback_status: 9,
+            ..accepted
+        };
+        let unsupported = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::UnsupportedVersion,
+            failure: PmRestartReviewFailure::UnsupportedVersion,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            ..accepted
+        };
+        for reply in &[
+            accepted,
+            rejected_wrong_token,
+            deferred_timer,
+            rolled_back,
+            unsupported,
+        ] {
+            let encoded = encode_pm_restart_reply_v1(reply).expect("encode reply");
+            assert_eq!(encoded.len(), PM_RESTART_REPLY_V1_LEN);
+            assert_eq!(PM_RESTART_REPLY_V1_LEN, 50);
+            assert_eq!(PM_RESTART_REPLY_STATUS_OFFSET, 18);
+            assert_eq!(PM_RESTART_REPLY_FAILURE_OFFSET, 20);
+            assert_eq!(PM_RESTART_REPLY_RETRY_TICK_OFFSET, 42);
+            assert_eq!(
+                decode_pm_restart_reply_v1(&encoded).expect("decode reply"),
+                *reply
+            );
+        }
+    }
+
+    #[test]
+    fn sup7_codec_rejects_malformed_invalid_and_raw_inputs() {
+        use self::pm_restart_abi_review::*;
+        let request = sup7_valid_request();
+        let encoded = encode_pm_restart_request_v1(&request).expect("encode");
+        assert_eq!(
+            decode_pm_restart_request_v1(&encoded[..encoded.len() - 1]),
+            Err(PmRestartReviewCodecError::Malformed)
+        );
+        let mut bad_version = encoded;
+        bad_version[0] = 2;
+        assert_eq!(
+            decode_pm_restart_request_v1(&bad_version),
+            Err(PmRestartReviewCodecError::UnsupportedVersion)
+        );
+        let mut invalid_reason = encoded;
+        invalid_reason[PM_RESTART_REQUEST_REASON_OFFSET..PM_RESTART_REQUEST_REASON_OFFSET + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(
+            decode_pm_restart_request_v1(&invalid_reason),
+            Err(PmRestartReviewCodecError::InvalidEnum)
+        );
+        let mut raw_token = encoded;
+        raw_token[96] = 0;
+        assert_eq!(
+            decode_pm_restart_request_v1(&raw_token),
+            Err(PmRestartReviewCodecError::RawOrUnscopedToken)
+        );
+        let mut reserved = encoded;
+        reserved[97] = 1;
+        assert_eq!(
+            decode_pm_restart_request_v1(&reserved),
+            Err(PmRestartReviewCodecError::NonzeroReserved)
+        );
+        assert_eq!(
+            PmRestartRequestV1Review::new(
+                1,
+                4,
+                77,
+                1,
+                &[b'x'; PM_RESTART_REVIEW_SERVICE_NAME_MAX + 1],
+                PmRestartReviewReason::Fault,
+                PmRestartReviewTokenDescriptor::scoped(77, 0x1111),
+            ),
+            Err(PmRestartReviewCodecError::OversizedServiceName)
+        );
+        let mut invalid_reply = encode_pm_restart_reply_v1(&accepted_reply(7, 77)).expect("reply");
+        invalid_reply[PM_RESTART_REPLY_STATUS_OFFSET..PM_RESTART_REPLY_STATUS_OFFSET + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(
+            decode_pm_restart_reply_v1(&invalid_reply),
+            Err(PmRestartReviewCodecError::InvalidEnum)
+        );
+    }
+
+    #[test]
+    fn sup7_sup4_oracle_bridge_preserves_restart_fields() {
+        use self::pm_restart_abi_review::*;
+        let oracle = Sup4PmRestartOracleDescriptor {
+            request_id: 42,
+            target_tid: 77,
+            restart_reason: PmRestartReviewReason::DependencyFailed,
+            attempt_count: 3,
+            due_tick: 144,
+            dependency_cause_tid: 12,
+            token_owner_tid: 77,
+            token_fingerprint: 0xCAFE,
+        };
+        let request = request_from_sup4_oracle(oracle).expect("bridge to codec");
+        assert_eq!(request.request_id, 42);
+        assert_eq!(request.target_tid, 77);
+        assert_eq!(
+            request.restart_reason,
+            PmRestartReviewReason::DependencyFailed
+        );
+        assert_eq!(request.attempt_count, 3);
+        assert_eq!(request.due_tick, 144);
+        assert_eq!(request.dependency_cause_tid, 12);
+        assert_eq!(request.token.owner_tid, 77);
+        assert_eq!(request.token.redacted_fingerprint, 0xCAFE);
+        assert_eq!(oracle_from_request(request), oracle);
+    }
+
+    #[test]
+    fn sup7_codec_review_does_not_add_live_dispatch_or_send_paths() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_mod_src = include_str!("process_manager/mod.rs");
+        assert!(
+            pm_mod_src.contains("restart_abi_review")
+                && pm_mod_src.contains(r#"feature = "hosted-dev""#),
+            "SUP-7 codec must stay behind the hosted-dev/test review gate"
+        );
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-7 codec review must not add live global IPC ABI opcodes"
+        );
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-7 must not add PM dispatch or supervisor send path"
+        );
+        assert!(
+            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            "production restart remains deferred/fail-closed"
         );
     }
 }
