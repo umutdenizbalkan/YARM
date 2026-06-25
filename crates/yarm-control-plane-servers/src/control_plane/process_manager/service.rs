@@ -174,6 +174,568 @@ struct RestartTokenRecord {
     token: u64,
 }
 
+const PM_RESTART_CONTRACT_VERSION_V1: u16 = 1;
+const PM_RESTART_MAX_ENTRIES: usize = 8;
+const PM_RESTART_MAX_ROLLBACK_STEPS: usize = 8;
+const PM_RESTART_AUTHORITY_MARKER: u32 = 0x504d_5253;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartReason {
+    Fault,
+    NormalExit,
+    CrashLoop,
+    DependencyFailed,
+    ManualPolicy,
+    HealthTimeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartTokenRef {
+    pub owner_tid: u64,
+    pub redacted_fingerprint: u16,
+    pub scoped: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartRequestDescriptor {
+    pub version: u16,
+    pub request_id: u32,
+    pub supervisor_tid: Option<u64>,
+    pub target_tid: u64,
+    pub service_name: &'static str,
+    pub token_ref: Option<PmRestartTokenRef>,
+    pub reason: PmRestartReason,
+    pub attempt_count: u8,
+    pub max_attempts: u8,
+    pub due_tick: u64,
+    pub dependency_blocked: bool,
+    pub already_restarting: bool,
+    pub already_running: bool,
+    pub startup_cap_layout_supported: bool,
+    pub rollback_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartAuthority {
+    VerifiedSupervisor,
+    MissingSupervisorIdentity,
+    UntrustedSender,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartTokenCheck {
+    ScopedToTarget,
+    Missing,
+    WrongOwner,
+    RawUnscoped,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartSenderCheck {
+    Verified,
+    MissingIdentity,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartValidationStatus {
+    WouldAccept,
+    WouldReject,
+    WouldDefer,
+    UnsupportedVersion,
+    AlreadyRestarting,
+    NoSuchTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartValidationFailure {
+    None,
+    MissingVerifiedSupervisorIdentity,
+    UntrustedSender,
+    MissingRestartAuthority,
+    NoSuchTarget,
+    MissingToken,
+    WrongTokenOwner,
+    RawUnscopedToken,
+    RestartLimitExceeded,
+    ReasonDisallowed,
+    AlreadyRestarting,
+    DuplicateRunningRestart,
+    DependencyBlocked,
+    ResourcePreflightUnavailable,
+    StartupCapLayoutUnsupported,
+    RollbackUnsupported,
+    FailClosedPolicy,
+    UnsupportedVersion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartValidationPolicy {
+    pub supported_version: u16,
+    pub verified_supervisor_tid: Option<u64>,
+    pub trusted_supervisor_tid: u64,
+    pub target_exists: bool,
+    pub resource_preflight_available: bool,
+    pub allow_running_duplicate_restart: bool,
+    pub allow_dependency_restart: bool,
+    pub allow_normal_exit_restart: bool,
+    pub fail_closed: bool,
+}
+
+impl Default for PmRestartValidationPolicy {
+    fn default() -> Self {
+        Self {
+            supported_version: PM_RESTART_CONTRACT_VERSION_V1,
+            verified_supervisor_tid: Some(4),
+            trusted_supervisor_tid: 4,
+            target_exists: true,
+            resource_preflight_available: true,
+            allow_running_duplicate_restart: false,
+            allow_dependency_restart: true,
+            allow_normal_exit_restart: false,
+            fail_closed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartValidationEntry {
+    pub request_id: u32,
+    pub target_tid: u64,
+    pub status: PmRestartValidationStatus,
+    pub failure: PmRestartValidationFailure,
+    pub sender_check: PmRestartSenderCheck,
+    pub token_check: PmRestartTokenCheck,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartValidationReport {
+    pub entries: [Option<PmRestartValidationEntry>; PM_RESTART_MAX_ENTRIES],
+    pub len: usize,
+}
+
+impl PmRestartValidationReport {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; PM_RESTART_MAX_ENTRIES],
+            len: 0,
+        }
+    }
+    fn push(&mut self, entry: PmRestartValidationEntry) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(entry);
+            self.len += 1;
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = PmRestartValidationEntry> + '_ {
+        self.entries[..self.len].iter().flatten().copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartReservation {
+    OldTaskTeardownSlot,
+    ReplacementTaskSlot,
+    AddressSpaceSlot,
+    CNodeStartupCapSlots,
+    InheritedServiceCaps,
+    FaultEndpointRestartMonitorSlot,
+    PmHandleSlot,
+    InitSupervisorNotificationSlot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartFailureInjectionPoint {
+    None,
+    AfterReplacementTaskReservation,
+    AfterStartupCapReservation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartRollbackStep {
+    pub target_tid: u64,
+    pub reservation: PmRestartReservation,
+    pub old_task_remains_degraded: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartRollbackPlan {
+    pub steps: [Option<PmRestartRollbackStep>; PM_RESTART_MAX_ROLLBACK_STEPS],
+    pub len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartAccountingEntry {
+    pub request_id: u32,
+    pub target_tid: u64,
+    pub reservations: [Option<PmRestartReservation>; PM_RESTART_MAX_ROLLBACK_STEPS],
+    pub reservation_len: usize,
+    pub rollback: PmRestartRollbackPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartAccountingPlan {
+    pub entries: [Option<PmRestartAccountingEntry>; PM_RESTART_MAX_ENTRIES],
+    pub len: usize,
+}
+
+impl PmRestartAccountingPlan {
+    const fn empty() -> Self {
+        Self {
+            entries: [None; PM_RESTART_MAX_ENTRIES],
+            len: 0,
+        }
+    }
+    fn push(&mut self, entry: PmRestartAccountingEntry) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(entry);
+            self.len += 1;
+        }
+    }
+    pub fn iter(&self) -> impl Iterator<Item = PmRestartAccountingEntry> + '_ {
+        self.entries[..self.len].iter().flatten().copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartReplyStatus {
+    Accepted,
+    Rejected,
+    Deferred,
+    RolledBack,
+    UnsupportedVersion,
+    AlreadyRestarting,
+    NoSuchTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PmRestartReplyFailure {
+    None,
+    ValidationFailed(PmRestartValidationFailure),
+    AccountingRollbackRequired,
+    UnsupportedVersion,
+    NoSuchTarget,
+    AlreadyRestarting,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmReplacementHandleDescriptor {
+    pub mock_pm_handle: u32,
+    pub target_tid: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRollbackResultDescriptor {
+    pub rolled_back: bool,
+    pub steps: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PmRestartReplyDescriptor {
+    pub request_id: u32,
+    pub target_tid: u64,
+    pub status: PmRestartReplyStatus,
+    pub replacement: Option<PmReplacementHandleDescriptor>,
+    pub cleanup_status: &'static str,
+    pub accounting_status: &'static str,
+    pub startup_cap_status: &'static str,
+    pub health_monitor_status: &'static str,
+    pub rollback: PmRollbackResultDescriptor,
+    pub failure: PmRestartReplyFailure,
+    pub retry_tick: Option<u64>,
+}
+
+pub fn validate_pm_restart_request(
+    request: PmRestartRequestDescriptor,
+    policy: PmRestartValidationPolicy,
+) -> PmRestartValidationReport {
+    let mut report = PmRestartValidationReport::empty();
+    let sender_check = match policy.verified_supervisor_tid {
+        Some(tid) if tid == policy.trusted_supervisor_tid => PmRestartSenderCheck::Verified,
+        Some(_) => PmRestartSenderCheck::Untrusted,
+        None => PmRestartSenderCheck::MissingIdentity,
+    };
+    let token_check = match request.token_ref {
+        Some(token) if !token.scoped => PmRestartTokenCheck::RawUnscoped,
+        Some(token) if token.owner_tid != request.target_tid => PmRestartTokenCheck::WrongOwner,
+        Some(_) => PmRestartTokenCheck::ScopedToTarget,
+        None => PmRestartTokenCheck::Missing,
+    };
+    let (status, failure) = if request.version != policy.supported_version {
+        (
+            PmRestartValidationStatus::UnsupportedVersion,
+            PmRestartValidationFailure::UnsupportedVersion,
+        )
+    } else if policy.fail_closed {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::FailClosedPolicy,
+        )
+    } else if sender_check == PmRestartSenderCheck::MissingIdentity {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::MissingVerifiedSupervisorIdentity,
+        )
+    } else if sender_check == PmRestartSenderCheck::Untrusted {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::UntrustedSender,
+        )
+    } else if request.supervisor_tid != Some(policy.trusted_supervisor_tid) {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::MissingRestartAuthority,
+        )
+    } else if !policy.target_exists {
+        (
+            PmRestartValidationStatus::NoSuchTarget,
+            PmRestartValidationFailure::NoSuchTarget,
+        )
+    } else if token_check == PmRestartTokenCheck::Missing {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::MissingToken,
+        )
+    } else if token_check == PmRestartTokenCheck::WrongOwner {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::WrongTokenOwner,
+        )
+    } else if token_check == PmRestartTokenCheck::RawUnscoped {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::RawUnscopedToken,
+        )
+    } else if request.attempt_count > request.max_attempts {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::RestartLimitExceeded,
+        )
+    } else if request.reason == PmRestartReason::NormalExit && !policy.allow_normal_exit_restart {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::ReasonDisallowed,
+        )
+    } else if request.already_restarting {
+        (
+            PmRestartValidationStatus::AlreadyRestarting,
+            PmRestartValidationFailure::AlreadyRestarting,
+        )
+    } else if request.already_running && !policy.allow_running_duplicate_restart {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::DuplicateRunningRestart,
+        )
+    } else if request.dependency_blocked && !policy.allow_dependency_restart {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::DependencyBlocked,
+        )
+    } else if !policy.resource_preflight_available {
+        (
+            PmRestartValidationStatus::WouldDefer,
+            PmRestartValidationFailure::ResourcePreflightUnavailable,
+        )
+    } else if !request.startup_cap_layout_supported {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::StartupCapLayoutUnsupported,
+        )
+    } else if !request.rollback_supported {
+        (
+            PmRestartValidationStatus::WouldReject,
+            PmRestartValidationFailure::RollbackUnsupported,
+        )
+    } else {
+        (
+            PmRestartValidationStatus::WouldAccept,
+            PmRestartValidationFailure::None,
+        )
+    };
+    report.push(PmRestartValidationEntry {
+        request_id: request.request_id,
+        target_tid: request.target_tid,
+        status,
+        failure,
+        sender_check,
+        token_check,
+    });
+    report
+}
+
+pub fn plan_pm_restart_accounting(
+    validation: PmRestartValidationReport,
+    failure: PmRestartFailureInjectionPoint,
+) -> PmRestartAccountingPlan {
+    let mut plan = PmRestartAccountingPlan::empty();
+    for entry in validation.iter() {
+        if entry.status != PmRestartValidationStatus::WouldAccept {
+            continue;
+        }
+        let reservations = [
+            PmRestartReservation::OldTaskTeardownSlot,
+            PmRestartReservation::ReplacementTaskSlot,
+            PmRestartReservation::AddressSpaceSlot,
+            PmRestartReservation::CNodeStartupCapSlots,
+            PmRestartReservation::InheritedServiceCaps,
+            PmRestartReservation::FaultEndpointRestartMonitorSlot,
+            PmRestartReservation::PmHandleSlot,
+            PmRestartReservation::InitSupervisorNotificationSlot,
+        ];
+        let reserve_len = match failure {
+            PmRestartFailureInjectionPoint::None => reservations.len(),
+            PmRestartFailureInjectionPoint::AfterReplacementTaskReservation => 2,
+            PmRestartFailureInjectionPoint::AfterStartupCapReservation => 4,
+        };
+        let mut accounting = PmRestartAccountingEntry {
+            request_id: entry.request_id,
+            target_tid: entry.target_tid,
+            reservations: [None; PM_RESTART_MAX_ROLLBACK_STEPS],
+            reservation_len: reserve_len,
+            rollback: PmRestartRollbackPlan {
+                steps: [None; PM_RESTART_MAX_ROLLBACK_STEPS],
+                len: 0,
+            },
+        };
+        for idx in 0..reserve_len {
+            accounting.reservations[idx] = Some(reservations[idx]);
+        }
+        if failure != PmRestartFailureInjectionPoint::None {
+            for idx in 0..reserve_len {
+                accounting.rollback.steps[idx] = Some(PmRestartRollbackStep {
+                    target_tid: entry.target_tid,
+                    reservation: reservations[reserve_len - 1 - idx],
+                    old_task_remains_degraded: true,
+                });
+                accounting.rollback.len += 1;
+            }
+        }
+        plan.push(accounting);
+    }
+    plan
+}
+
+pub fn build_pm_restart_reply_descriptor(
+    validation: PmRestartValidationEntry,
+    accounting: Option<PmRestartAccountingEntry>,
+    retry_tick: Option<u64>,
+) -> PmRestartReplyDescriptor {
+    match validation.status {
+        PmRestartValidationStatus::WouldAccept => {
+            let rolled_back = accounting
+                .as_ref()
+                .is_some_and(|entry| entry.rollback.len > 0);
+            PmRestartReplyDescriptor {
+                request_id: validation.request_id,
+                target_tid: validation.target_tid,
+                status: if rolled_back {
+                    PmRestartReplyStatus::RolledBack
+                } else {
+                    PmRestartReplyStatus::Accepted
+                },
+                replacement: (!rolled_back).then_some(PmReplacementHandleDescriptor {
+                    mock_pm_handle: PM_RESTART_AUTHORITY_MARKER ^ validation.request_id,
+                    target_tid: validation.target_tid,
+                }),
+                cleanup_status: "descriptive_only",
+                accounting_status: "descriptive_only",
+                startup_cap_status: "descriptive_only",
+                health_monitor_status: "descriptive_only",
+                rollback: PmRollbackResultDescriptor {
+                    rolled_back,
+                    steps: accounting.map(|entry| entry.rollback.len).unwrap_or(0),
+                },
+                failure: if rolled_back {
+                    PmRestartReplyFailure::AccountingRollbackRequired
+                } else {
+                    PmRestartReplyFailure::None
+                },
+                retry_tick: None,
+            }
+        }
+        PmRestartValidationStatus::WouldDefer => PmRestartReplyDescriptor {
+            request_id: validation.request_id,
+            target_tid: validation.target_tid,
+            status: PmRestartReplyStatus::Deferred,
+            replacement: None,
+            cleanup_status: "not_started",
+            accounting_status: "deferred",
+            startup_cap_status: "not_started",
+            health_monitor_status: "not_started",
+            rollback: PmRollbackResultDescriptor {
+                rolled_back: false,
+                steps: 0,
+            },
+            failure: PmRestartReplyFailure::ValidationFailed(validation.failure),
+            retry_tick,
+        },
+        PmRestartValidationStatus::UnsupportedVersion => PmRestartReplyDescriptor {
+            request_id: validation.request_id,
+            target_tid: validation.target_tid,
+            status: PmRestartReplyStatus::UnsupportedVersion,
+            replacement: None,
+            cleanup_status: "not_started",
+            accounting_status: "not_started",
+            startup_cap_status: "not_started",
+            health_monitor_status: "not_started",
+            rollback: PmRollbackResultDescriptor {
+                rolled_back: false,
+                steps: 0,
+            },
+            failure: PmRestartReplyFailure::UnsupportedVersion,
+            retry_tick: None,
+        },
+        PmRestartValidationStatus::AlreadyRestarting => PmRestartReplyDescriptor {
+            request_id: validation.request_id,
+            target_tid: validation.target_tid,
+            status: PmRestartReplyStatus::AlreadyRestarting,
+            replacement: None,
+            cleanup_status: "not_started",
+            accounting_status: "not_started",
+            startup_cap_status: "not_started",
+            health_monitor_status: "not_started",
+            rollback: PmRollbackResultDescriptor {
+                rolled_back: false,
+                steps: 0,
+            },
+            failure: PmRestartReplyFailure::AlreadyRestarting,
+            retry_tick: None,
+        },
+        PmRestartValidationStatus::NoSuchTarget => PmRestartReplyDescriptor {
+            request_id: validation.request_id,
+            target_tid: validation.target_tid,
+            status: PmRestartReplyStatus::NoSuchTarget,
+            replacement: None,
+            cleanup_status: "not_started",
+            accounting_status: "not_started",
+            startup_cap_status: "not_started",
+            health_monitor_status: "not_started",
+            rollback: PmRollbackResultDescriptor {
+                rolled_back: false,
+                steps: 0,
+            },
+            failure: PmRestartReplyFailure::NoSuchTarget,
+            retry_tick: None,
+        },
+        PmRestartValidationStatus::WouldReject => PmRestartReplyDescriptor {
+            request_id: validation.request_id,
+            target_tid: validation.target_tid,
+            status: PmRestartReplyStatus::Rejected,
+            replacement: None,
+            cleanup_status: "not_started",
+            accounting_status: "not_started",
+            startup_cap_status: "not_started",
+            health_monitor_status: "not_started",
+            rollback: PmRollbackResultDescriptor {
+                rolled_back: false,
+                steps: 0,
+            },
+            failure: PmRestartReplyFailure::ValidationFailed(validation.failure),
+            retry_tick: None,
+        },
+    }
+}
+
 #[derive(Debug)]
 #[cfg(test)]
 struct KernelProcessManagerAdapter {

@@ -85,3 +85,11 @@ Before live PM wiring, future work must define the real PM IPC opcode/reply ABI,
 verified sender contract, capability-bound token transport, PM resource cleanup
 and rollback APIs, timer endpoint semantics, alert rate limiting, and supervisor
 state replay. None of those mechanisms are implemented by SUP-3.
+
+## SUP-4 PM-side oracle dependency
+
+SUP-4 adds the PM-side acceptance oracle for this supervisor contract. The
+supervisor remains the requestor and policy owner; PM remains the only component
+that may eventually execute restart mechanism. The future supervisor request
+shape in this document must validate against PM-side `PmRestartRequestDescriptor`
+semantics before any live PM client is wired.

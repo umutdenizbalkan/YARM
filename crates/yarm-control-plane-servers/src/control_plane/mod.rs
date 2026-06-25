@@ -1040,4 +1040,96 @@ mod tests {
             "SUP-3 must not add a new live PM restart IPC call"
         );
     }
+
+    // ── SUP-4: PM-side inert restart validation/accounting oracle ───────────
+
+    #[test]
+    fn sup4_pm_restart_validation_model_is_bounded_and_inert() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "pub struct PmRestartRequestDescriptor",
+            "pub struct PmRestartValidationReport",
+            "pub enum PmRestartValidationStatus",
+            "pub enum PmRestartValidationFailure",
+            "pub struct PmRestartValidationPolicy",
+            "pub enum PmRestartAuthority",
+            "pub enum PmRestartTokenCheck",
+            "pub enum PmRestartSenderCheck",
+            "PM_RESTART_MAX_ENTRIES: usize = 8",
+            "validate_pm_restart_request",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-4 PM validation model must include {needle}"
+            );
+        }
+        assert!(
+            pm_src.contains("RawUnscopedToken")
+                && pm_src.contains("WrongTokenOwner")
+                && pm_src.contains("MissingVerifiedSupervisorIdentity"),
+            "PM validation must reject unscoped tokens, wrong owners, and missing supervisor identity"
+        );
+    }
+
+    #[test]
+    fn sup4_pm_restart_accounting_and_reply_are_descriptive_only() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "pub struct PmRestartAccountingPlan",
+            "pub enum PmRestartReservation",
+            "OldTaskTeardownSlot",
+            "ReplacementTaskSlot",
+            "AddressSpaceSlot",
+            "CNodeStartupCapSlots",
+            "pub struct PmRestartRollbackPlan",
+            "pub struct PmRestartReplyDescriptor",
+            "pub enum PmRestartReplyStatus",
+            "pub enum PmRestartReplyFailure",
+            "PmReplacementHandleDescriptor",
+            "build_pm_restart_reply_descriptor",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-4 PM accounting/reply model must include {needle}"
+            );
+        }
+        let model_start = pm_src
+            .find("pub struct PmRestartRequestDescriptor")
+            .expect("SUP-4 PM model must be present");
+        let model_end = pm_src
+            .find("#[derive(Debug)]\n#[cfg(test)]")
+            .unwrap_or(pm_src.len());
+        let model = &pm_src[model_start..model_end];
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "ipc_send(",
+            "ipc_reply(",
+            "mint",
+            "revoke",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !model.contains(forbidden),
+                "SUP-4 PM model must not call {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup4_does_not_change_global_ipc_abi_or_add_live_restart_opcode() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        assert!(
+            !abi_src.contains("PROC_OP_SUPERVISOR_RESTART")
+                && !abi_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-4 must not change global process IPC ABI constants"
+        );
+        assert!(
+            pm_src.contains("PM_RESTART_CONTRACT_VERSION_V1")
+                && !pm_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-4 may define local oracle versioning but no live PM restart opcode"
+        );
+    }
 }

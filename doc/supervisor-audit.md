@@ -178,3 +178,15 @@ Runtime remains fail-closed and logs `SUPERVISOR_PM_RESTART_CONTRACT_BUILT`,
 `SUPERVISOR_TIMER_ENDPOINT_DEFERRED`, and
 `SUPERVISOR_BACKOFF_LOGICAL_TICK_ONLY` until the live PM client and timer source
 exist.
+
+## SUP-4 PM-side restart validation/accounting oracle
+
+SUP-4 defines the PM side of the future restart contract as an inert oracle. It
+adds PM-local descriptors for validation, accounting/rollback planning, and reply
+construction without changing global IPC ABI or adding live PM restart behavior.
+PM validation owns verified supervisor identity checks, scoped-token ownership,
+target existence, attempt limits, reason policy, dependency blockers, resource
+preflight, startup-cap layout support, rollback support, and fail-closed policy.
+PM accounting models only descriptive reservations and reverse-order rollback
+steps. The future opcode names remain documentation-only; no `yarm-ipc-abi`
+constant is added at this stage.
