@@ -584,6 +584,186 @@ impl SupervisorPmRestartAccountingReport {
         self.entries[..self.len].iter().flatten().copied()
     }
 }
+
+pub type SupervisorPmRestartContractVersion = u16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartWireLimits {
+    pub max_requests: usize,
+    pub max_service_name_bytes: usize,
+    pub max_reply_entries: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartContract {
+    pub version: SupervisorPmRestartContractVersion,
+    pub wire_limits: SupervisorPmRestartWireLimits,
+    pub requires_verified_supervisor_identity: bool,
+    pub token_must_be_scoped_to_target: bool,
+    pub mock_only: bool,
+}
+
+impl Default for SupervisorPmRestartContract {
+    fn default() -> Self {
+        Self {
+            version: SUPERVISOR_PM_RESTART_REQUEST_VERSION,
+            wire_limits: SupervisorPmRestartWireLimits {
+                max_requests: MAX_RESTART_REQUESTS,
+                max_service_name_bytes: 32,
+                max_reply_entries: MAX_RESTART_REQUESTS,
+            },
+            requires_verified_supervisor_identity: true,
+            token_must_be_scoped_to_target: true,
+            mock_only: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartDescriptorStatus {
+    Sendable,
+    NonSendable(SupervisorRestartBlocker),
+    Deferred(SupervisorRestartBlocker),
+    NoAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorStartupCapabilityBehavior {
+    PreserveExisting,
+    RequestPmDelivery,
+    DeferredNoCaps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorHealthMonitorBehavior {
+    PreserveExisting,
+    RequestRegistration,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorRollbackExpectation {
+    PmRollbackRequired,
+    SupervisorNoRollbackAuthority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartRequestV1 {
+    pub version: SupervisorPmRestartContractVersion,
+    pub descriptor_status: SupervisorPmRestartDescriptorStatus,
+    pub requires_verified_supervisor_identity: bool,
+    pub target_tid: u64,
+    pub service_kind: ManagedServiceKind,
+    pub service_name: &'static str,
+    pub restart_token: Option<SupervisorRestartTokenRef>,
+    pub restart_reason: SupervisorRestartReason,
+    pub attempt_count: u8,
+    pub due_tick: u64,
+    pub dependency_cause: Option<u64>,
+    pub degraded_hint: bool,
+    pub policy_flags: u32,
+    pub startup_capability_behavior: SupervisorStartupCapabilityBehavior,
+    pub health_monitor_behavior: SupervisorHealthMonitorBehavior,
+    pub rollback_expectation: SupervisorRollbackExpectation,
+    pub mock_request_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartReplyStatus {
+    Accepted,
+    Rejected,
+    Deferred,
+    RolledBack,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartReplyFailure {
+    None,
+    InvalidVersion,
+    MissingSupervisorIdentity,
+    TokenRejected,
+    TargetUnknown,
+    RestartLimitExceeded,
+    AccountingFailed,
+    StartupCapDeliveryFailed,
+    HealthMonitorFailed,
+    RollbackFailed,
+    PmUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmReplacementHandleRef {
+    pub mock_generation: u32,
+    pub mock_pm_slot: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartReplyV1 {
+    pub version: SupervisorPmRestartContractVersion,
+    pub request_id: u32,
+    pub status: SupervisorPmRestartReplyStatus,
+    pub replacement: Option<SupervisorPmReplacementHandleRef>,
+    pub old_task_cleanup: SupervisorPmRestartAccountingStatus,
+    pub accounting_result: SupervisorPmRestartAccountingStatus,
+    pub startup_cap_delivery: SupervisorPmRestartAccountingStatus,
+    pub health_monitor_registration: SupervisorPmRestartAccountingStatus,
+    pub rollback_result: SupervisorPmRestartAccountingStatus,
+    pub failure: SupervisorPmRestartReplyFailure,
+    pub next_retry_tick: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorTimerMode {
+    LogicalTickOnly,
+    FutureTimerEndpoint,
+    FuturePmTimerSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorBackoffSchedule {
+    pub base_ticks: u64,
+    pub max_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorBackoffDecision {
+    DueAt(TickInstant),
+    DeferredNoTimer,
+    OverflowCapped(TickInstant),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorTimerEvent {
+    pub mode: SupervisorTimerMode,
+    pub tick: TickInstant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorTimerFailure {
+    EndpointUnavailable,
+    TickOverflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorPmRestartReplyOutcomeStatus {
+    AcceptedRecorded,
+    RejectedBlocked,
+    DeferredRetryScheduled,
+    RollbackMarkedDegraded,
+    InvalidVersionRejected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupervisorPmRestartReplyOutcome {
+    pub tid: u64,
+    pub request_id: u32,
+    pub status: SupervisorPmRestartReplyOutcomeStatus,
+    pub replacement: Option<SupervisorPmReplacementHandleRef>,
+    pub retry_tick: Option<TickInstant>,
+    pub degraded: bool,
+    pub failure: SupervisorPmRestartReplyFailure,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DriverRecoveryPlan {
     irq_line: u16,
@@ -1020,6 +1200,10 @@ impl SupervisorService {
                     SupervisorRestartPolicy::default(),
                     SupervisorRestartReason::Fault,
                 );
+                let descriptor = self.map_restart_request_to_pm_descriptor(
+                    request,
+                    SupervisorPmRestartContract::default(),
+                );
                 yarm_user_rt::user_log!(
                     "SUPERVISOR_PM_RESTART_REQUEST_BUILT tid={} request_id={} due_tick={} attempt={} token_ref={:04x}",
                     request.tid,
@@ -1031,6 +1215,15 @@ impl SupervisorService {
                         .map(|token| token.redacted_fingerprint)
                         .unwrap_or(0)
                 );
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_PM_RESTART_CONTRACT_BUILT tid={} request_id={} version={}",
+                    descriptor.target_tid,
+                    descriptor.mock_request_id,
+                    descriptor.version
+                );
+                yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT");
+                yarm_user_rt::user_log!("SUPERVISOR_TIMER_ENDPOINT_DEFERRED");
+                yarm_user_rt::user_log!("SUPERVISOR_BACKOFF_LOGICAL_TICK_ONLY");
                 yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_VALIDATION_DEFERRED");
                 yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_ACCOUNTING_DEFERRED");
             }
@@ -1393,6 +1586,145 @@ impl SupervisorService {
             report.push(accounting);
         }
         report
+    }
+
+    pub fn map_restart_request_to_pm_descriptor(
+        &self,
+        request: SupervisorRestartRequest,
+        contract: SupervisorPmRestartContract,
+    ) -> SupervisorPmRestartRequestV1 {
+        let descriptor_status = match request.status {
+            SupervisorRestartRequestStatus::WouldRequestPmRestart
+                if request.restart_token.is_some() && contract.mock_only =>
+            {
+                SupervisorPmRestartDescriptorStatus::Sendable
+            }
+            SupervisorRestartRequestStatus::WouldRequestPmRestart => {
+                SupervisorPmRestartDescriptorStatus::NonSendable(
+                    SupervisorRestartBlocker::MissingRestartToken,
+                )
+            }
+            SupervisorRestartRequestStatus::Blocked(
+                SupervisorRestartBlocker::PmAuthorityUnavailable,
+            ) => SupervisorPmRestartDescriptorStatus::Deferred(
+                SupervisorRestartBlocker::PmAuthorityUnavailable,
+            ),
+            SupervisorRestartRequestStatus::Blocked(blocker) => {
+                SupervisorPmRestartDescriptorStatus::NonSendable(blocker)
+            }
+            SupervisorRestartRequestStatus::NoAction => {
+                SupervisorPmRestartDescriptorStatus::NoAction
+            }
+            SupervisorRestartRequestStatus::AlreadyPending => {
+                SupervisorPmRestartDescriptorStatus::NonSendable(
+                    SupervisorRestartBlocker::ManualStopNoRestart,
+                )
+            }
+        };
+        SupervisorPmRestartRequestV1 {
+            version: contract.version,
+            descriptor_status,
+            requires_verified_supervisor_identity: contract.requires_verified_supervisor_identity,
+            target_tid: request.tid,
+            service_kind: request.service_kind,
+            service_name: request.service_name,
+            restart_token: request.restart_token,
+            restart_reason: request.reason,
+            attempt_count: request.attempt_count,
+            due_tick: request.backoff_due_tick,
+            dependency_cause: request.dependency_cause,
+            degraded_hint: request.degraded,
+            policy_flags: (request.restart_owner == RestartOwner::Supervisor) as u32,
+            startup_capability_behavior: SupervisorStartupCapabilityBehavior::RequestPmDelivery,
+            health_monitor_behavior: SupervisorHealthMonitorBehavior::RequestRegistration,
+            rollback_expectation: SupervisorRollbackExpectation::PmRollbackRequired,
+            mock_request_id: request.pm_handle.mock_request_id,
+        }
+    }
+
+    pub fn compute_backoff_decision(
+        current_tick: TickInstant,
+        attempt_count: u8,
+        schedule: SupervisorBackoffSchedule,
+        timer_mode: SupervisorTimerMode,
+    ) -> SupervisorBackoffDecision {
+        if matches!(timer_mode, SupervisorTimerMode::FutureTimerEndpoint)
+            && schedule.base_ticks == 0
+        {
+            return SupervisorBackoffDecision::DeferredNoTimer;
+        }
+        let multiplier_shift = attempt_count.min(16) as u32;
+        let multiplier = 1u64.checked_shl(multiplier_shift).unwrap_or(u64::MAX);
+        let uncapped = schedule.base_ticks.saturating_mul(multiplier);
+        let capped = uncapped.min(schedule.max_ticks);
+        match current_tick.0.checked_add(capped) {
+            Some(tick) if uncapped <= schedule.max_ticks => {
+                SupervisorBackoffDecision::DueAt(TickInstant(tick))
+            }
+            Some(tick) => SupervisorBackoffDecision::OverflowCapped(TickInstant(tick)),
+            None => SupervisorBackoffDecision::OverflowCapped(TickInstant(u64::MAX)),
+        }
+    }
+
+    pub fn due_restart_ready(timer: SupervisorTimerEvent, due_tick: TickInstant) -> bool {
+        timer.tick.0 >= due_tick.0
+    }
+
+    pub fn apply_pm_restart_reply_model(
+        &self,
+        request: SupervisorPmRestartRequestV1,
+        reply: SupervisorPmRestartReplyV1,
+    ) -> SupervisorPmRestartReplyOutcome {
+        if reply.version != request.version {
+            return SupervisorPmRestartReplyOutcome {
+                tid: request.target_tid,
+                request_id: request.mock_request_id,
+                status: SupervisorPmRestartReplyOutcomeStatus::InvalidVersionRejected,
+                replacement: None,
+                retry_tick: None,
+                degraded: true,
+                failure: SupervisorPmRestartReplyFailure::InvalidVersion,
+            };
+        }
+        match reply.status {
+            SupervisorPmRestartReplyStatus::Accepted => SupervisorPmRestartReplyOutcome {
+                tid: request.target_tid,
+                request_id: reply.request_id,
+                status: SupervisorPmRestartReplyOutcomeStatus::AcceptedRecorded,
+                replacement: reply.replacement,
+                retry_tick: None,
+                degraded: false,
+                failure: reply.failure,
+            },
+            SupervisorPmRestartReplyStatus::Deferred => SupervisorPmRestartReplyOutcome {
+                tid: request.target_tid,
+                request_id: reply.request_id,
+                status: SupervisorPmRestartReplyOutcomeStatus::DeferredRetryScheduled,
+                replacement: None,
+                retry_tick: reply.next_retry_tick.map(TickInstant),
+                degraded: false,
+                failure: reply.failure,
+            },
+            SupervisorPmRestartReplyStatus::RolledBack => SupervisorPmRestartReplyOutcome {
+                tid: request.target_tid,
+                request_id: reply.request_id,
+                status: SupervisorPmRestartReplyOutcomeStatus::RollbackMarkedDegraded,
+                replacement: reply.replacement,
+                retry_tick: None,
+                degraded: true,
+                failure: reply.failure,
+            },
+            SupervisorPmRestartReplyStatus::Rejected
+            | SupervisorPmRestartReplyStatus::Unsupported => SupervisorPmRestartReplyOutcome {
+                tid: request.target_tid,
+                request_id: reply.request_id,
+                status: SupervisorPmRestartReplyOutcomeStatus::RejectedBlocked,
+                replacement: None,
+                retry_tick: None,
+                degraded: true,
+                failure: reply.failure,
+            },
+        }
     }
 
     #[cfg(test)]

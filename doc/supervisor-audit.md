@@ -149,3 +149,32 @@ verified sender metadata as described above.
 A real timer endpoint, PM restart IPC contract, PM resource-accounting API,
 capability-bound token transport, live cleanup/reclamation, and automatic
 supervisor state replay remain deferred.
+
+## SUP-3 PM restart IPC contract and timer/backoff oracle
+
+SUP-3 adds design/model-only descriptors for the future supervisor → PM restart
+IPC contract. `SupervisorPmRestartContract`, `SupervisorPmRestartRequestV1`, and
+`SupervisorPmRestartReplyV1` describe the versioned request/reply shape without
+adding a global IPC ABI opcode or sending PM IPC. Mapping from SUP-2 restart
+requests preserves target TID, service metadata, restart reason, attempt count,
+due tick, dependency cause, degraded hint, mock request ID, and redacted token
+reference. Blocked, missing-token, restart-limit, no-action, already-pending, and
+PM-authority-unavailable entries remain non-sendable/deferred descriptors.
+
+Timer semantics remain explicit: production is `LogicalTickOnly`, not wall-clock.
+Future execution requires a timer endpoint or PM/kernel timer source. Backoff is
+monotonic in supervisor tick domain, capped/saturating on overflow, and deferred
+when a future timer endpoint is unavailable. Due restarts are evaluated only after
+a tick/timer event.
+
+The PM reply model is inert: accepted replies record mock replacement handles,
+rejected replies keep the restart blocked/degraded in the model, deferred replies
+produce retry ticks, rolled-back replies mark degraded rollback failure, and
+invalid versions are rejected. No live PM handle, task restart, cleanup, cap, VM,
+or resource operation is performed.
+
+Runtime remains fail-closed and logs `SUPERVISOR_PM_RESTART_CONTRACT_BUILT`,
+`SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT`,
+`SUPERVISOR_TIMER_ENDPOINT_DEFERRED`, and
+`SUPERVISOR_BACKOFF_LOGICAL_TICK_ONLY` until the live PM client and timer source
+exist.

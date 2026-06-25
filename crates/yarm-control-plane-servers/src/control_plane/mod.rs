@@ -950,4 +950,94 @@ mod tests {
             );
         }
     }
+
+    // ── SUP-3: supervisor PM restart IPC contract and timer oracle ──────────
+
+    #[test]
+    fn sup3_supervisor_pm_restart_contract_descriptor_is_versioned_and_bounded() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pub struct SupervisorPmRestartContract",
+            "pub struct SupervisorPmRestartRequestV1",
+            "pub struct SupervisorPmRestartReplyV1",
+            "pub enum SupervisorPmRestartReplyStatus",
+            "pub enum SupervisorPmRestartReplyFailure",
+            "pub type SupervisorPmRestartContractVersion = u16",
+            "pub struct SupervisorPmRestartWireLimits",
+            "max_requests: MAX_RESTART_REQUESTS",
+            "mock_only: true",
+        ] {
+            assert!(src.contains(needle), "SUP-3 contract must include {needle}");
+        }
+    }
+
+    #[test]
+    fn sup3_restart_request_mapping_and_reply_model_remain_inert() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "map_restart_request_to_pm_descriptor",
+            "SupervisorPmRestartDescriptorStatus::Sendable",
+            "SupervisorPmRestartDescriptorStatus::NonSendable",
+            "SupervisorPmRestartDescriptorStatus::Deferred",
+            "SupervisorRestartBlocker::MissingRestartToken",
+            "apply_pm_restart_reply_model",
+            "AcceptedRecorded",
+            "DeferredRetryScheduled",
+            "RollbackMarkedDegraded",
+            "InvalidVersionRejected",
+        ] {
+            assert!(
+                src.contains(needle),
+                "SUP-3 mapping/reply model must include {needle}"
+            );
+        }
+        assert!(
+            src.contains("restart_token: request.restart_token")
+                && src.contains("redacted_fingerprint")
+                && !src.contains("raw_token"),
+            "SUP-3 descriptor must preserve redacted token refs without raw tokens"
+        );
+    }
+
+    #[test]
+    fn sup3_timer_backoff_semantics_are_logical_and_fail_closed() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pub enum SupervisorTimerMode",
+            "LogicalTickOnly",
+            "FutureTimerEndpoint",
+            "pub struct SupervisorBackoffSchedule",
+            "pub enum SupervisorBackoffDecision",
+            "DeferredNoTimer",
+            "OverflowCapped",
+            "compute_backoff_decision",
+            "due_restart_ready",
+            "SUPERVISOR_TIMER_ENDPOINT_DEFERRED",
+            "SUPERVISOR_BACKOFF_LOGICAL_TICK_ONLY",
+        ] {
+            assert!(
+                src.contains(needle),
+                "SUP-3 timer/backoff model must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup3_runtime_pm_restart_ipc_remains_deferred() {
+        let src = include_str!("supervisor/service.rs");
+        for marker in &[
+            "SUPERVISOR_PM_RESTART_CONTRACT_BUILT",
+            "SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT",
+            "SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP",
+        ] {
+            assert!(
+                src.contains(marker),
+                "runtime must preserve SUP-3 marker {marker}"
+            );
+        }
+        assert!(
+            !src.contains("PROC_OP_SUPERVISOR_RESTART") && !src.contains("PM_RESTART_SEND_LIVE"),
+            "SUP-3 must not add a new live PM restart IPC call"
+        );
+    }
 }
