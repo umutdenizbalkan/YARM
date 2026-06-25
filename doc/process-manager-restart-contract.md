@@ -350,3 +350,10 @@ sequence for a future live stage. It does not allocate opcodes, update
 `yarm-ipc-abi`, add PM dispatch, add supervisor send, or perform restart/spawn/
 teardown/cap/resource work. Future live work must satisfy both the SUP-8 signoff
 package and the SUP-9 promotion checklist before enabling runtime dispatch.
+
+## SUP-10 live-readiness evidence pack
+
+SUP-10 adds `doc/pm-restart-live-readiness-evidence.md` as evidence and exact
+future-diff planning only. It does not enable live ABI/runtime behavior; future
+SUP-live work must explicitly change status from proposed/review-only to live and
+satisfy the SUP-8, SUP-9, and SUP-10 checklists before adding opcodes or dispatch.

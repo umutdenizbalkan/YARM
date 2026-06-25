@@ -204,3 +204,10 @@ sequence, promotion PR checklist, dry-run readiness model, rollback-injection
 plan, and QEMU acceptance plan. SUP-9 is not live implementation; future SUP-live
 work must satisfy SUP-8 and SUP-9 before adding opcodes, PM dispatch, supervisor
 send, or PM restart mechanisms.
+
+## SUP-10 evidence pack link
+
+SUP-10 adds `doc/pm-restart-live-readiness-evidence.md`, mapping current evidence
+to missing live proof and spelling out the exact future diff plan. SUP-10 does
+not enable live ABI/runtime behavior; future SUP-live work must explicitly change
+status from proposed to live and satisfy all checklists.

@@ -129,3 +129,10 @@ SUP-9 links the supervisor contract to `doc/pm-restart-live-promotion-plan.md`.
 The supervisor remains requestor-only and production restart remains fail-closed;
 a future live stage must satisfy the SUP-8 signoff package and SUP-9 checklist
 before any supervisor PM restart send path is enabled.
+
+## SUP-10 evidence pack
+
+SUP-10 links this supervisor contract to `doc/pm-restart-live-readiness-evidence.md`.
+The supervisor remains requestor-only and fail-closed; any future SUP-live stage
+must explicitly change the contract from proposed to live after satisfying the
+SUP-8, SUP-9, and SUP-10 gates.

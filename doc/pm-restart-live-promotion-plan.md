@@ -141,3 +141,10 @@ SUP-9 creates this promotion plan and dry-run readiness model only. Future live
 work must explicitly satisfy SUP-8 and SUP-9 checklists before enabling any
 runtime path. PM remains the executor, supervisor remains the requestor, and the
 kernel remains the low-level mechanism provider.
+
+## SUP-10 evidence pack link
+
+SUP-10 adds `doc/pm-restart-live-readiness-evidence.md` with the live-readiness
+evidence matrix, go/no-go report model, and exact future diff plan. SUP-10 is not
+live implementation and does not allocate opcodes, dispatch PM restart requests,
+or enable supervisor PM restart sends.

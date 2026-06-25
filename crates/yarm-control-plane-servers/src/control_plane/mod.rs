@@ -1902,4 +1902,206 @@ mod tests {
             "SUP-9 must preserve token redaction and dependent-token no-fallback rule"
         );
     }
+
+    // ── SUP-10: live-readiness evidence pack guardrails ────────────────────
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartLiveReadinessGoNoGoStatus {
+        GoForAbiReview,
+        NoGoMissingEvidence,
+        NoGoLiveAlreadyChanged,
+        NoGoDispatchPresent,
+        NoGoSupervisorSendPresent,
+        NoGoRuntimeNotFailClosed,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartLiveReadinessFailure {
+        MissingFrozenSizes,
+        MissingPromotionPlan,
+        LiveOpcodePresent,
+        ProcessOpcodeCountChanged,
+        SyscallCountChanged,
+        DispatchPresent,
+        SupervisorSendPresent,
+        MissingFailClosedMarker,
+        MissingRollbackInjectionPlan,
+        MissingQemuAcceptancePlan,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PmRestartLiveReadinessGoNoGoReport {
+        status: PmRestartLiveReadinessGoNoGoStatus,
+        failures: Vec<PmRestartLiveReadinessFailure>,
+    }
+
+    fn evaluate_pm_restart_live_readiness_go_no_go(
+        evidence_doc: &str,
+        promotion_doc: &str,
+        process_contract_doc: &str,
+        live_abi_src: &str,
+        syscall_src: &str,
+        pm_src: &str,
+        supervisor_src: &str,
+    ) -> PmRestartLiveReadinessGoNoGoReport {
+        let mut failures = Vec::new();
+        if !process_contract_doc.contains("Request V1 total length is frozen at 110 bytes")
+            || !process_contract_doc.contains("Reply V1 total length is frozen at 50 bytes")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingFrozenSizes);
+        }
+        if !promotion_doc.contains("# SUP-9 PM restart live-promotion dry-run plan")
+            || !evidence_doc.contains("Exact future live PR diff plan")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingPromotionPlan);
+        }
+        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
+            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+        {
+            failures.push(PmRestartLiveReadinessFailure::LiveOpcodePresent);
+        }
+        if live_abi_src.matches("pub const PROC_OP_").count() != 14 {
+            failures.push(PmRestartLiveReadinessFailure::ProcessOpcodeCountChanged);
+        }
+        if !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;") {
+            failures.push(PmRestartLiveReadinessFailure::SyscallCountChanged);
+        }
+        if pm_src.contains("PROC_OP_PM_RESTART_V1") {
+            failures.push(PmRestartLiveReadinessFailure::DispatchPresent);
+        }
+        if supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
+            failures.push(PmRestartLiveReadinessFailure::SupervisorSendPresent);
+        }
+        if !supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT") {
+            failures.push(PmRestartLiveReadinessFailure::MissingFailClosedMarker);
+        }
+        if !evidence_doc.contains("Future rollback-injection scripts and markers")
+            || !promotion_doc.contains("Future rollback-injection test plan")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingRollbackInjectionPlan);
+        }
+        if !evidence_doc.contains("Future rollback-injection scripts and markers")
+            || !promotion_doc.contains("Future QEMU acceptance plan")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingQemuAcceptancePlan);
+        }
+
+        let status = if failures.iter().any(|failure| {
+            matches!(
+                failure,
+                PmRestartLiveReadinessFailure::LiveOpcodePresent
+                    | PmRestartLiveReadinessFailure::ProcessOpcodeCountChanged
+                    | PmRestartLiveReadinessFailure::SyscallCountChanged
+            )
+        }) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoLiveAlreadyChanged
+        } else if failures.contains(&PmRestartLiveReadinessFailure::DispatchPresent) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoDispatchPresent
+        } else if failures.contains(&PmRestartLiveReadinessFailure::SupervisorSendPresent) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoSupervisorSendPresent
+        } else if failures.contains(&PmRestartLiveReadinessFailure::MissingFailClosedMarker) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoRuntimeNotFailClosed
+        } else if failures.is_empty() {
+            PmRestartLiveReadinessGoNoGoStatus::GoForAbiReview
+        } else {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoMissingEvidence
+        };
+        PmRestartLiveReadinessGoNoGoReport { status, failures }
+    }
+
+    #[test]
+    fn sup10_go_no_go_report_is_for_abi_review_only() {
+        let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        let promotion_doc = include_str!("../../../../doc/pm-restart-live-promotion-plan.md");
+        let process_doc = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let live_abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+
+        let report = evaluate_pm_restart_live_readiness_go_no_go(
+            evidence_doc,
+            promotion_doc,
+            process_doc,
+            live_abi_src,
+            syscall_src,
+            pm_src,
+            supervisor_src,
+        );
+        assert_eq!(
+            report.status,
+            PmRestartLiveReadinessGoNoGoStatus::GoForAbiReview
+        );
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn sup10_evidence_doc_contains_matrix_diff_plan_and_future_markers() {
+        let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        for needle in &[
+            "# SUP-10 PM restart live-readiness evidence pack",
+            "## Evidence summary from SUP-1 through SUP-9",
+            "## Exact future live PR diff plan",
+            "### 1. `yarm-ipc-abi` / process IPC ABI",
+            "### 2. Process Manager",
+            "### 3. Supervisor",
+            "### 4. PM mechanism",
+            "### 5. Timer/backoff",
+            "### 6. Tests, scripts, and docs",
+            "## Readiness evidence matrix",
+            "## Go/no-go report model",
+            "## Future rollback-injection scripts and markers",
+            "scripts/qemu-supervisor-pm-restart-accepted-smoke.sh",
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "PM_RESTART_REPLY_DEFERRED",
+        ] {
+            assert!(
+                evidence_doc.contains(needle),
+                "SUP-10 evidence doc must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup10_source_guardrails_keep_live_enablement_absent() {
+        let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+        );
+        assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"));
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-10 must not add PM dispatch or supervisor send"
+        );
+        for future_marker in &[
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "PM_RESTART_V1_DECODE_OK",
+            "PM_RESTART_SENDER_OK",
+            "PM_RESTART_TOKEN_OK",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_ROLLBACK_BEGIN",
+            "PM_RESTART_REPLY_ACCEPTED",
+            "PM_RESTART_REPLY_REJECTED",
+            "PM_RESTART_REPLY_DEFERRED",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+        ] {
+            assert!(
+                evidence_doc.contains(future_marker),
+                "future marker must be documented: {future_marker}"
+            );
+            assert!(
+                !pm_src.contains(future_marker) && !supervisor_src.contains(future_marker),
+                "future marker must not be emitted by current runtime: {future_marker}"
+            );
+        }
+        assert!(supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"));
+    }
 }

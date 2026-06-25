@@ -229,3 +229,10 @@ SUP-9 adds `doc/pm-restart-live-promotion-plan.md` and a dry-run readiness model
 It is not live implementation: candidate opcodes remain unallocated, global IPC
 ABI and syscall ABI remain unchanged, PM dispatch and supervisor send remain
 absent, and restart/spawn/teardown/cap/resource behavior remains disabled.
+
+## SUP-10 live-readiness evidence pack
+
+SUP-10 adds `doc/pm-restart-live-readiness-evidence.md` and a GoForAbiReview-only
+source guard. It is evidence/diff planning only: live global IPC ABI, syscall ABI,
+PM dispatch, supervisor send, and restart/spawn/teardown/cap/resource behavior
+remain unchanged and disabled.
