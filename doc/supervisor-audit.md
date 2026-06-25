@@ -190,3 +190,12 @@ preflight, startup-cap layout support, rollback support, and fail-closed policy.
 PM accounting models only descriptive reservations and reverse-order rollback
 steps. The future opcode names remain documentation-only; no `yarm-ipc-abi`
 constant is added at this stage.
+
+## SUP-5 restart IPC ABI RFC guardrails
+
+SUP-5 adds the reviewed global PM restart IPC ABI as RFC text only. Proposed names
+`PROC_OP_PM_RESTART_V1` and `PROC_OP_PM_RESTART_REPLY_V1` remain absent from the
+production global IPC ABI, syscall count remains unchanged, and source guardrails
+continue to require redacted token refs, no dependent-token fallback, no live PM
+IPC/restart/spawn/teardown/cap/resource calls in model regions, and deferred
+production markers until live ABI approval.

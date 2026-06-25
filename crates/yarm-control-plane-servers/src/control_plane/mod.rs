@@ -1132,4 +1132,80 @@ mod tests {
             "SUP-4 may define local oracle versioning but no live PM restart opcode"
         );
     }
+
+    // ── SUP-5: restart IPC ABI RFC guardrails ───────────────────────────────
+
+    #[test]
+    fn sup5_global_restart_opcode_remains_rfc_only() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-5 RFC must not add live global PM restart IPC opcodes"
+        );
+        assert_eq!(
+            abi_src.matches("pub const PROC_OP_").count(),
+            14,
+            "SUP-5 must not change the process IPC opcode count"
+        );
+        assert!(
+            syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            "SUP-5 must not change syscall count"
+        );
+    }
+
+    #[test]
+    fn sup5_restart_models_remain_inert_and_deferred() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_model_start = pm_src
+            .find("pub struct PmRestartRequestDescriptor")
+            .expect("SUP-4/SUP-5 PM model must be present");
+        let pm_model_end = pm_src
+            .find("#[derive(Debug)]\n#[cfg(test)]")
+            .unwrap_or(pm_src.len());
+        let pm_model = &pm_src[pm_model_start..pm_model_end];
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "ipc_send(",
+            "ipc_call(",
+            "ipc_reply(",
+            "mint",
+            "revoke",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !pm_model.contains(forbidden),
+                "SUP-5 PM oracle region must remain non-live and not call {forbidden}"
+            );
+        }
+        assert!(
+            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT")
+                && supervisor_src.contains("SUPERVISOR_PM_RESTART_CONTRACT_BUILT"),
+            "production supervisor restart path must stay visibly deferred"
+        );
+    }
+
+    #[test]
+    fn sup5_token_redaction_and_dependent_token_rule_hold() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        assert!(
+            supervisor_src.contains("redacted_fingerprint")
+                && pm_src.contains("redacted_fingerprint"),
+            "restart token model must expose redacted fingerprints, not raw log material"
+        );
+        assert!(
+            !supervisor_src.contains("unwrap_or(event.restart_token)"),
+            "dependent restart must never fall back to the failed task's token"
+        );
+        assert!(
+            supervisor_src.contains("SUPERVISOR_DEPENDENT_RESTART_BLOCKED_NO_TOKEN"),
+            "missing dependent token must remain visibly blocked"
+        );
+    }
 }

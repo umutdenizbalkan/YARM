@@ -93,3 +93,11 @@ supervisor remains the requestor and policy owner; PM remains the only component
 that may eventually execute restart mechanism. The future supervisor request
 shape in this document must validate against PM-side `PmRestartRequestDescriptor`
 semantics before any live PM client is wired.
+
+## SUP-5 RFC cross-link
+
+The reviewed global PM restart IPC ABI is now specified as an RFC-only section in
+`doc/process-manager-restart-contract.md`. SUP-5 remains non-live: supervisor is
+still only the requestor, PM is the only future executor, and kernel mechanisms
+remain external. Future live work requires explicit ABI approval before adding
+`PROC_OP_PM_RESTART_V1` or wiring any PM client.
