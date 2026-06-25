@@ -3829,6 +3829,94 @@ D6/CR3/TSS *switch* machinery untouched beyond broadening the existing demand-ve
 `switch_address_space` correction, Stage 163E transactional/run-preserving COW clone
 preserved, `MAX_ADDRESS_SPACES` remains 32.
 
+#### 5.1.9.15 Stage 163I — writable demand page that still faults: intermediate permission + stale TLB
+
+Stage 163H corrected the CR3-vs-ASID mismatch, but QEMU then showed the child
+still looping on the *same* page with the active table now **correct and
+unchanged**:
+
+```
+PF_PROOF_HW_PTE_BEFORE ... cr3=0x100e1000 raw=0x80000000104dd007 present=1 writable=1 user=1 nx=1
+PAGE_FAULT_DEMAND_VERIFY ... (active_asid == task_asid, no switch)
+PF_PROOF_HW_PTE_AFTER  ... cr3=0x100e1000 raw=0x80000000104dd007
+PAGE_FAULT_HANDLED_DEMAND   (repeats forever)
+```
+
+Decoding the evidence (Task A):
+
+- `raw=0x80000000104dd007` = present + writable + user + NX, phys `0x104dd000`.
+  The **leaf** PTE is genuinely writable; `cow=0` is correct (a private demand
+  stack page, never COW).
+- `cr3=0x100e1000` has its low 12 bits clear → **PCIDE is disabled**
+  (`arch/x86_64/boot.rs` sets CR4 = PAE|OSFXSR|OSXMMEXCPT + conditional
+  SMEP/SMAP, never bit 17). So there is a single TLB namespace and a per-page
+  `invlpg` on this CPU *must* clear a stale leaf entry — yet it loops. A stale
+  *leaf* TLB entry alone therefore cannot be the whole story.
+
+Two real causes were masked by **leaf-only** checks:
+
+1. **Intermediate permission (root cause).** On x86_64 the effective access
+   rights are the logical-AND of the bits in *every* paging-structure entry used
+   to translate the address (Intel SDM Vol. 3A §4.6), not just the leaf. A
+   writable+user leaf under an intermediate (PML4E/PDPTE/PDE) that lacks USER (or
+   WRITABLE) is still inaccessible and faults `present+write+user` (error 0x7)
+   forever. `walk_or_create_table` returned an already-present intermediate
+   **without upgrading its flags**, so an intermediate first created for a
+   stricter mapping permanently gated the permissive leaf. The leaf-only
+   `hw_demand_ok` and `pf_proof_log_hw_pte` could not see it.
+2. **Stale local-CPU TLB.** A per-page `invlpg` only guarantees the current
+   PCID's entry for one address; the recovery escalates to a full architectural
+   flush to drop any cached translation the per-page form missed.
+
+**Fix (minimal, in the page-fault/TLB path):**
+
+- `walk_or_create_table` now OR-widens an existing intermediate with the
+  USER|WRITABLE bits the requested mapping needs (never narrows, never touches
+  huge leaves) — the root-cause fix at map time.
+- A new arch entry point `repair_user_path_intermediates(asid, va)` widens any
+  already-installed under-permissioned intermediate **in place** (leaf
+  untouched), and `flush_tlb_local_full()` forces a full local TLB flush by
+  reloading CR3 with architectural-flush semantics (it does not change the active
+  root, so it never switches address spaces). Both exist on all three arches so
+  the shared handler links; the repair is a real walk only on x86_64 (the
+  AND-of-levels architecture), a typed no-op on AArch64/RISC-V where permissions
+  live on the leaf.
+- The demand "already-present" branch, on a **write** fault, now repairs
+  intermediates, issues `invlpg`, then `flush_tlb_local_full()` before returning
+  handled. The non-write recovery keeps the cheap per-page `invlpg`.
+- `hw_demand_ok` now folds the **effective** permission across the whole walk
+  (`eff_present && eff_user && (!need_write || eff_writable)`), so an
+  under-permissioned intermediate can never again loop as `HANDLED_DEMAND`; if it
+  somehow recurs the fault routes to the task-fault path with the full
+  per-level walk logged.
+
+**Diagnostics (Task B):** proof-gated `PF_PROOF_TLB_STALE_CANDIDATE`,
+`PF_PROOF_INTERMEDIATE_REPAIR levels_upgraded=N`, `PF_PROOF_INVLPG_BEGIN/DONE`,
+`PF_PROOF_CR3_RELOAD_BEGIN/DONE`, and
+`PF_PROOF_DEMAND_HANDLE_OK reason=already_writable_after_flush`, plus the
+`PAGE_FAULT_POST_DEMAND_HW_PTE_WALK` line extended with `eff_present/eff_user/
+eff_writable`. `PF_PROOF_HW_PTE_BEFORE/_AFTER` are retained.
+
+**Expected QEMU sequence (Task E):** for `va=0x7fffffbff000` the recovery fires
+**at most once** — `PF_PROOF_TLB_STALE_CANDIDATE` → `PF_PROOF_INTERMEDIATE_REPAIR`
+→ `PF_PROOF_INVLPG_BEGIN/DONE` → `PF_PROOF_CR3_RELOAD_BEGIN/DONE` →
+`PF_PROOF_DEMAND_HANDLE_OK reason=already_writable_after_flush` →
+`PAGE_FAULT_HANDLED_DEMAND` — then the child makes progress to `SENDER_START` →
+`WAITER_PRESENT` → `WAITER_OBSERVED` →
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` →
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`.
+
+This is again primarily a hardware-path (real CR3/PTE/TLB) change validated by
+QEMU; the hosted suite covers the unchanged COW/demand behavior and the
+`stage163i_*` source guards pin the write-recovery escalation, the effective
+AND-of-levels gate, the `walk_or_create_table` upgrade, the cross-arch helper
+definitions, the preserved Stage 163G decline, and that the recovery never
+touches COW state. No syscall/IPC ABI change, no IPC/cap seam moved, counts
+unchanged (`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`), RPi5 untouched, the
+D6/CR3/TSS *switch* machinery untouched beyond the page-fault TLB fix, Stage 163E
+transactional/run-preserving COW clone preserved, `MAX_ADDRESS_SPACES` remains 32,
+and PCIDE stays disabled.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

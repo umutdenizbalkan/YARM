@@ -500,6 +500,31 @@ pub fn invalidate_asid(asid: Asid) {
     }
 }
 
+/// Stage 163I: full local TLB flush (all address translations on this hart).
+///
+/// Mirrors the x86_64 entry point used by the shared page-fault recovery path.
+/// On a present write fault that recurs despite a per-page invalidation, this
+/// drops every translation so the hart re-walks the page table.
+pub fn flush_tlb_local_full() {
+    #[cfg(any(test, feature = "hosted-dev"))]
+    {}
+
+    #[cfg(all(not(feature = "hosted-dev"), not(test)))]
+    unsafe {
+        core::arch::asm!("sfence.vma x0, x0", options(nostack, preserves_flags));
+    }
+}
+
+/// Stage 163I: x86_64 needs to widen under-permissioned intermediate paging
+/// entries (the AND-of-levels access check denies a permissive leaf). RISC-V
+/// carries R/W/X/U permission bits only on leaf PTEs (non-leaf entries with no
+/// R/W/X are pure pointers), so there is no intermediate-permission repair to
+/// perform; this is a typed no-op kept so the shared fault handler can call one
+/// symbol across architectures.
+pub fn repair_user_path_intermediates(_asid: Asid, _virt: VirtAddr) -> u8 {
+    0
+}
+
 #[cfg(test)]
 pub fn take_last_invalidated_asid_for_test() -> Option<Asid> {
     LAST_INVALIDATED_ASID.lock().take()

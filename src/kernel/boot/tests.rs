@@ -44434,3 +44434,208 @@ mod stage163h_fork_child_pte_mismatch {
         }
     }
 }
+
+mod stage163i_stale_tlb_recovery {
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_PT_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+    const AARCH64_PT_SRC: &str = include_str!("../../arch/aarch64/page_table.rs");
+    const RISCV64_PT_SRC: &str = include_str!("../../arch/riscv64/page_table.rs");
+    const X86_VM_LAYOUT_SRC: &str = include_str!("../../arch/x86_64/vm_layout.rs");
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+
+    fn demand_handler() -> &'static str {
+        FAULT_SRC
+            .split("fn try_handle_demand_page_fault")
+            .nth(1)
+            .map(|s| &s[..s.len().min(7000)])
+            .expect("demand handler body")
+    }
+
+    // 1. A WRITE fault on an already-present writable page (the stale /
+    //    under-permissioned loop) escalates beyond a bare INVLPG: it repairs
+    //    intermediate permissions AND forces a full local TLB flush before
+    //    claiming the fault handled.
+    #[test]
+    fn stage163i_write_recovery_repairs_and_full_flushes() {
+        let demand = demand_handler();
+        let write_arm = demand
+            .split("if matches!(fault.access, FaultAccess::Write) {")
+            .nth(1)
+            .and_then(|s| s.split("return Ok(true);").next())
+            .expect("write recovery arm");
+        assert!(
+            write_arm.contains("repair_user_path_intermediates"),
+            "write recovery must repair under-permissioned intermediate entries"
+        );
+        assert!(
+            write_arm.contains("flush_tlb_local_full"),
+            "write recovery must force a full local TLB flush, not just INVLPG"
+        );
+        assert!(
+            write_arm.contains("invalidate_page(page)"),
+            "write recovery still issues the per-page INVLPG first"
+        );
+    }
+
+    // 2. The stale-TLB recovery emits its proof-gated trace markers.
+    #[test]
+    fn stage163i_emits_tlb_recovery_diagnostics() {
+        for marker in &[
+            "PF_PROOF_TLB_STALE_CANDIDATE",
+            "PF_PROOF_INTERMEDIATE_REPAIR",
+            "PF_PROOF_INVLPG_BEGIN",
+            "PF_PROOF_INVLPG_DONE",
+            "PF_PROOF_CR3_RELOAD_BEGIN",
+            "PF_PROOF_CR3_RELOAD_DONE",
+            "reason=already_writable_after_flush",
+        ] {
+            assert!(
+                FAULT_SRC.contains(marker),
+                "fault handler must emit `{marker}`"
+            );
+        }
+        // The recovery markers must be proof-gated (default-off).
+        let demand = demand_handler();
+        assert!(
+            demand
+                .contains("let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();"),
+            "TLB recovery diagnostics must be proof-gated"
+        );
+    }
+
+    // 3. HANDLED_DEMAND is gated on the EFFECTIVE permission across the whole
+    //    hardware walk (AND of all levels), not just the leaf PTE bits — so an
+    //    under-permissioned intermediate can no longer loop as "handled".
+    #[test]
+    fn stage163i_handled_demand_uses_effective_walk_permission() {
+        for token in &[
+            "let eff_present = walk.iter().all",
+            "let eff_user = walk.iter().all",
+            "let eff_writable = walk.iter().all",
+            "let walk = [pml4e, pdpte, pde, hw_pte];",
+        ] {
+            assert!(
+                FAULT_SRC.contains(token),
+                "hw_demand_ok must fold the full walk via `{token}`"
+            );
+        }
+        assert!(
+            FAULT_SRC.contains("eff_present && eff_user && (!need_write || eff_writable)"),
+            "hardware demand-ok must require the effective (AND-of-levels) permission"
+        );
+    }
+
+    // 4. walk_or_create_table widens an existing intermediate's USER|WRITABLE
+    //    bits instead of returning it untouched — the root cause fix at map
+    //    time — and only ever ADDS bits (never narrows, never touches huge
+    //    leaves).
+    #[test]
+    fn stage163i_walk_or_create_upgrades_intermediate_flags() {
+        let body = X86_PT_SRC
+            .split("fn walk_or_create_table")
+            .nth(1)
+            .map(|s| &s[..s.len().min(1400)])
+            .expect("walk_or_create_table body");
+        assert!(
+            body.contains("entry.0 | want") && body.contains("WRITABLE | PageTableEntry::USER"),
+            "existing intermediate must be OR-upgraded with USER|WRITABLE"
+        );
+        assert!(
+            body.contains("HUGE_PAGE") && body.contains("entry.0 & want != want"),
+            "upgrade must skip huge leaves and only add missing bits"
+        );
+    }
+
+    // 5. The full-flush and intermediate-repair entry points exist on every
+    //    architecture so the shared fault handler links across targets.
+    #[test]
+    fn stage163i_tlb_helpers_defined_on_all_arches() {
+        for (name, src) in &[
+            ("x86_64", X86_PT_SRC),
+            ("aarch64", AARCH64_PT_SRC),
+            ("riscv64", RISCV64_PT_SRC),
+        ] {
+            assert!(
+                src.contains("pub fn flush_tlb_local_full"),
+                "{name} page_table must define flush_tlb_local_full"
+            );
+            assert!(
+                src.contains("pub fn repair_user_path_intermediates"),
+                "{name} page_table must define repair_user_path_intermediates"
+            );
+        }
+        // x86_64's full flush reloads CR3 (architectural flush); the per-arch
+        // repair is a real walk only on x86_64 (the AND-of-levels arch).
+        assert!(
+            X86_PT_SRC.contains("fn flush_tlb_local_full")
+                && X86_PT_SRC.contains("fallback_flush_tlb_via_cr3()"),
+            "x86_64 full flush must reload CR3 via fallback_flush_tlb_via_cr3"
+        );
+    }
+
+    // 6. The Stage 163G write-satisfiability decline is preserved (a present
+    //    write fault on a read-only page is NOT masked as handled).
+    #[test]
+    fn stage163i_preserves_163g_present_ro_decline() {
+        let demand = demand_handler();
+        assert!(
+            demand.contains("write_satisfied") && demand.contains("return Ok(false)"),
+            "present read-only write fault must still decline (Stage 163G)"
+        );
+    }
+
+    // 7. The repair never marks the page as COW (cow=0 is correct for a private
+    //    demand stack page) — the recovery path does not touch COW state.
+    #[test]
+    fn stage163i_recovery_does_not_touch_cow() {
+        let demand = demand_handler();
+        let write_arm = demand
+            .split("matches!(fault.access, FaultAccess::Write)")
+            .nth(1)
+            .and_then(|s| s.split("return Ok(true);").next())
+            .expect("write recovery arm");
+        assert!(
+            !write_arm.contains("mark_cow_page") && !write_arm.contains("try_handle_cow_fault"),
+            "stale-TLB recovery must not introduce COW marking"
+        );
+    }
+
+    // 8. Confinement: no IPC/cap seam moved, syscall/IPC counts unchanged,
+    //    MAX_ADDRESS_SPACES stays 32, and PCIDE remains off (the analysis basis:
+    //    single TLB namespace, cr3 low bits clear).
+    #[test]
+    fn stage163i_confinement_counts_and_bounds() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        assert!(
+            X86_VM_LAYOUT_SRC.contains(
+                "#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"
+            ),
+            "MAX_ADDRESS_SPACES stays 32"
+        );
+        // boot.rs must not have started enabling CR4.PCIDE: the recovery
+        // reasoning (single TLB namespace, cr3 low bits clear) depends on it
+        // staying off. Match the bit-17 CR4 OR-masks exactly to avoid colliding
+        // with the SMEP/SMAP masks (0x100000 / 0x200000) already present.
+        assert!(
+            !X86_BOOT_SRC.contains("PCIDE")
+                && !X86_BOOT_SRC.contains("or eax, 0x20000\n")
+                && !X86_BOOT_SRC.contains("1u64 << 17"),
+            "boot must not enable CR4.PCIDE"
+        );
+    }
+}
