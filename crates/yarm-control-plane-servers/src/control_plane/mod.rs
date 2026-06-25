@@ -17,6 +17,15 @@ pub mod vfs;
 
 #[cfg(test)]
 mod tests {
+    #[allow(dead_code)]
+    mod pm_restart_abi_review {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/control_plane/process_manager/restart_abi_review.rs"
+        ));
+    }
+
+    use alloc::vec::Vec;
     use yarm_ipc_abi::process_abi::{decode_spawn_v5_reply, encode_spawn_v5_reply};
 
     fn spawn_v5_reply_is_success(pid: u64, _service_send_cap: u64) -> bool {
@@ -871,5 +880,1228 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── SUP-2: supervisor inert PM restart model guardrails ──────────────────
+
+    #[test]
+    fn sup2_supervisor_pm_restart_contract_model_is_inert_and_bounded() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pub struct SupervisorRestartRequest",
+            "pub struct SupervisorRestartRequestBundle",
+            "pub enum SupervisorRestartReason",
+            "pub enum SupervisorRestartBlocker",
+            "pub enum SupervisorRestartRequestStatus",
+            "pub struct SupervisorRestartTokenRef",
+            "pub struct SupervisorPmHandleRef",
+            "pub enum SupervisorRestartRequestFailure",
+            "MAX_RESTART_REQUESTS: usize = MAX_MANAGED_SERVICES",
+            "SupervisorPmRestartValidationReport",
+            "SupervisorPmRestartAccountingReport",
+            "SupervisorPmRestartRollbackStep",
+        ] {
+            assert!(
+                src.contains(needle),
+                "supervisor SUP-2 model must include {needle}"
+            );
+        }
+        assert!(
+            src.contains("redacted_fingerprint") && !src.contains("token={}"),
+            "restart-token model/logging should use redacted token refs, not full token logs"
+        );
+    }
+
+    #[test]
+    fn sup2_supervisor_runtime_restart_execution_remains_fail_closed() {
+        let src = include_str!("supervisor/service.rs");
+        for marker in &[
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILT",
+            "SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP",
+            "SUPERVISOR_PM_RESTART_VALIDATION_DEFERRED",
+            "SUPERVISOR_PM_RESTART_ACCOUNTING_DEFERRED",
+        ] {
+            assert!(
+                src.contains(marker),
+                "runtime must preserve visible marker {marker}"
+            );
+        }
+        assert!(
+            src.contains("fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError>")
+                && src.contains("Err(KernelError::InvalidCapability)"),
+            "runtime restart op must not fake production success"
+        );
+    }
+
+    #[test]
+    fn sup2_supervisor_contract_does_not_call_live_pm_spawn_restart_or_caps() {
+        let src = include_str!("supervisor/service.rs");
+        let model_start = src
+            .find("pub struct SupervisorRestartRequest")
+            .expect("SUP-2 restart request model must be present");
+        let model_end = src
+            .find("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct ManagedServiceRecord")
+            .unwrap_or(src.len());
+        let model_section = &src[model_start..model_end];
+        for forbidden in &[
+            "restart_task(",
+            "ipc_send(",
+            "ipc_reply(",
+            "grant_driver_irq",
+            "mint_irq_cap",
+            "delegate_driver_bundle(",
+            "alloc_anonymous_memory_object",
+            "create_iova_space_cap",
+        ] {
+            assert!(
+                !model_section.contains(forbidden),
+                "SUP-2 model must be inert and not call {forbidden}"
+            );
+        }
+    }
+
+    // ── SUP-3: supervisor PM restart IPC contract and timer oracle ──────────
+
+    #[test]
+    fn sup3_supervisor_pm_restart_contract_descriptor_is_versioned_and_bounded() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pub struct SupervisorPmRestartContract",
+            "pub struct SupervisorPmRestartRequestV1",
+            "pub struct SupervisorPmRestartReplyV1",
+            "pub enum SupervisorPmRestartReplyStatus",
+            "pub enum SupervisorPmRestartReplyFailure",
+            "pub type SupervisorPmRestartContractVersion = u16",
+            "pub struct SupervisorPmRestartWireLimits",
+            "max_requests: MAX_RESTART_REQUESTS",
+            "mock_only: true",
+        ] {
+            assert!(src.contains(needle), "SUP-3 contract must include {needle}");
+        }
+    }
+
+    #[test]
+    fn sup3_restart_request_mapping_and_reply_model_remain_inert() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "map_restart_request_to_pm_descriptor",
+            "SupervisorPmRestartDescriptorStatus::Sendable",
+            "SupervisorPmRestartDescriptorStatus::NonSendable",
+            "SupervisorPmRestartDescriptorStatus::Deferred",
+            "SupervisorRestartBlocker::MissingRestartToken",
+            "apply_pm_restart_reply_model",
+            "AcceptedRecorded",
+            "DeferredRetryScheduled",
+            "RollbackMarkedDegraded",
+            "InvalidVersionRejected",
+        ] {
+            assert!(
+                src.contains(needle),
+                "SUP-3 mapping/reply model must include {needle}"
+            );
+        }
+        assert!(
+            src.contains("restart_token: request.restart_token")
+                && src.contains("redacted_fingerprint")
+                && !src.contains("raw_token"),
+            "SUP-3 descriptor must preserve redacted token refs without raw tokens"
+        );
+    }
+
+    #[test]
+    fn sup3_timer_backoff_semantics_are_logical_and_fail_closed() {
+        let src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pub enum SupervisorTimerMode",
+            "LogicalTickOnly",
+            "FutureTimerEndpoint",
+            "pub struct SupervisorBackoffSchedule",
+            "pub enum SupervisorBackoffDecision",
+            "DeferredNoTimer",
+            "OverflowCapped",
+            "compute_backoff_decision",
+            "due_restart_ready",
+            "SUPERVISOR_TIMER_ENDPOINT_DEFERRED",
+            "SUPERVISOR_BACKOFF_LOGICAL_TICK_ONLY",
+        ] {
+            assert!(
+                src.contains(needle),
+                "SUP-3 timer/backoff model must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup3_runtime_pm_restart_ipc_remains_deferred() {
+        let src = include_str!("supervisor/service.rs");
+        for marker in &[
+            "SUPERVISOR_PM_RESTART_CONTRACT_BUILT",
+            "SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT",
+            "SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP",
+        ] {
+            assert!(
+                src.contains(marker),
+                "runtime must preserve SUP-3 marker {marker}"
+            );
+        }
+        assert!(
+            !src.contains("PROC_OP_SUPERVISOR_RESTART") && !src.contains("PM_RESTART_SEND_LIVE"),
+            "SUP-3 must not add a new live PM restart IPC call"
+        );
+    }
+
+    // ── SUP-4: PM-side inert restart validation/accounting oracle ───────────
+
+    #[test]
+    fn sup4_pm_restart_validation_model_is_bounded_and_inert() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "pub struct PmRestartRequestDescriptor",
+            "pub struct PmRestartValidationReport",
+            "pub enum PmRestartValidationStatus",
+            "pub enum PmRestartValidationFailure",
+            "pub struct PmRestartValidationPolicy",
+            "pub enum PmRestartAuthority",
+            "pub enum PmRestartTokenCheck",
+            "pub enum PmRestartSenderCheck",
+            "PM_RESTART_MAX_ENTRIES: usize = 8",
+            "validate_pm_restart_request",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-4 PM validation model must include {needle}"
+            );
+        }
+        assert!(
+            pm_src.contains("RawUnscopedToken")
+                && pm_src.contains("WrongTokenOwner")
+                && pm_src.contains("MissingVerifiedSupervisorIdentity"),
+            "PM validation must reject unscoped tokens, wrong owners, and missing supervisor identity"
+        );
+    }
+
+    #[test]
+    fn sup4_pm_restart_accounting_and_reply_are_descriptive_only() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "pub struct PmRestartAccountingPlan",
+            "pub enum PmRestartReservation",
+            "OldTaskTeardownSlot",
+            "ReplacementTaskSlot",
+            "AddressSpaceSlot",
+            "CNodeStartupCapSlots",
+            "pub struct PmRestartRollbackPlan",
+            "pub struct PmRestartReplyDescriptor",
+            "pub enum PmRestartReplyStatus",
+            "pub enum PmRestartReplyFailure",
+            "PmReplacementHandleDescriptor",
+            "build_pm_restart_reply_descriptor",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-4 PM accounting/reply model must include {needle}"
+            );
+        }
+        let model_start = pm_src
+            .find("pub struct PmRestartRequestDescriptor")
+            .expect("SUP-4 PM model must be present");
+        let model_end = pm_src
+            .find("#[derive(Debug)]\n#[cfg(test)]")
+            .unwrap_or(pm_src.len());
+        let model = &pm_src[model_start..model_end];
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "ipc_send(",
+            "ipc_reply(",
+            "mint",
+            "revoke",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !model.contains(forbidden),
+                "SUP-4 PM model must not call {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup4_does_not_change_global_ipc_abi_or_add_live_restart_opcode() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        assert!(
+            !abi_src.contains("PROC_OP_SUPERVISOR_RESTART")
+                && !abi_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-4 must not change global process IPC ABI constants"
+        );
+        assert!(
+            pm_src.contains("PM_RESTART_CONTRACT_VERSION_V1")
+                && !pm_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-4 may define local oracle versioning but no live PM restart opcode"
+        );
+    }
+
+    // ── SUP-5: restart IPC ABI RFC guardrails ───────────────────────────────
+
+    #[test]
+    fn sup5_global_restart_opcode_remains_rfc_only() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-5 RFC must not add live global PM restart IPC opcodes"
+        );
+        assert_eq!(
+            abi_src.matches("pub const PROC_OP_").count(),
+            14,
+            "SUP-5 must not change the process IPC opcode count"
+        );
+        assert!(
+            syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            "SUP-5 must not change syscall count"
+        );
+    }
+
+    #[test]
+    fn sup5_restart_models_remain_inert_and_deferred() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_model_start = pm_src
+            .find("pub struct PmRestartRequestDescriptor")
+            .expect("SUP-4/SUP-5 PM model must be present");
+        let pm_model_end = pm_src
+            .find("#[derive(Debug)]\n#[cfg(test)]")
+            .unwrap_or(pm_src.len());
+        let pm_model = &pm_src[pm_model_start..pm_model_end];
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "ipc_send(",
+            "ipc_call(",
+            "ipc_reply(",
+            "mint",
+            "revoke",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !pm_model.contains(forbidden),
+                "SUP-5 PM oracle region must remain non-live and not call {forbidden}"
+            );
+        }
+        assert!(
+            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT")
+                && supervisor_src.contains("SUPERVISOR_PM_RESTART_CONTRACT_BUILT"),
+            "production supervisor restart path must stay visibly deferred"
+        );
+    }
+
+    #[test]
+    fn sup5_token_redaction_and_dependent_token_rule_hold() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        assert!(
+            supervisor_src.contains("redacted_fingerprint")
+                && pm_src.contains("redacted_fingerprint"),
+            "restart token model must expose redacted fingerprints, not raw log material"
+        );
+        assert!(
+            !supervisor_src.contains("unwrap_or(event.restart_token)"),
+            "dependent restart must never fall back to the failed task's token"
+        );
+        assert!(
+            supervisor_src.contains("SUPERVISOR_DEPENDENT_RESTART_BLOCKED_NO_TOKEN"),
+            "missing dependent token must remain visibly blocked"
+        );
+    }
+
+    // ── SUP-6: live restart checklist/conformance guardrails ────────────────
+
+    #[test]
+    fn sup6_conformance_matrix_covers_required_live_behaviors() {
+        let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        for row in &[
+            "pm_restart_live_valid_supervisor_request_accepts",
+            "pm_restart_live_untrusted_sender_rejected",
+            "pm_restart_live_wrong_token_owner_rejected",
+            "pm_restart_live_raw_token_rejected",
+            "pm_restart_live_unknown_target_no_such_target",
+            "pm_restart_live_restart_limit_rejected",
+            "pm_restart_live_dependency_blocker_deferred",
+            "pm_restart_live_resource_preflight_deferred",
+            "pm_restart_live_startup_cap_layout_rejected",
+            "pm_restart_live_rollback_after_replacement_task",
+            "pm_restart_live_rollback_after_startup_cap",
+            "pm_restart_live_unsupported_version_rejected",
+            "pm_restart_live_timer_unavailable_deferred",
+            "pm_restart_live_duplicate_already_restarting",
+            "pm_restart_live_already_running_duplicate_rejected",
+            "pm_restart_live_rollback_alerts_init_supervisor",
+        ] {
+            assert!(
+                checklist.contains(row),
+                "SUP-6 matrix must include future conformance row {row}"
+            );
+        }
+        for expected in &[
+            "Accepted",
+            "Rejected/MissingRight",
+            "Rejected/WrongTokenOwner",
+            "Rejected/RawTokenUnsupported",
+            "NoSuchTarget",
+            "Rejected/RestartLimitExceeded",
+            "Deferred/DependencyBlocked",
+            "Deferred/ResourceUnavailable",
+            "Rejected/StartupCapLayoutUnsupported",
+            "RolledBack",
+            "UnsupportedVersion",
+            "AlreadyRestarting",
+        ] {
+            assert!(
+                checklist.contains(expected),
+                "SUP-6 matrix must pin expected reply/status {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup6_live_enablement_checklist_requires_security_accounting_and_smokes() {
+        let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        for gate in &[
+            "ABI numeric assignment approved",
+            "PM verified sender path implemented",
+            "Scoped/capability-bound token validation implemented",
+            "PM accounting and rollback implemented",
+            "Timer endpoint available",
+            "Supervisor production PM client implemented",
+            "Rollback injection hosted tests pass",
+            "x86_64 and AArch64 boot smokes are unaffected",
+            "Docs are updated from RFC/proposed status to live status",
+        ] {
+            assert!(
+                checklist.contains(gate),
+                "SUP-6 live enablement checklist must require {gate}"
+            );
+        }
+        assert!(
+            checklist.contains("Raw/unscoped restart tokens are not accepted")
+                && checklist
+                    .contains("Dependent restart uses the dependent service's own token only")
+                && checklist.contains("Logs use redacted token fingerprints/references only"),
+            "SUP-6 token authority checklist must preserve scoped/redacted dependent-token rules"
+        );
+    }
+
+    #[test]
+    fn sup6_remains_non_live_and_keeps_abi_counts_unchanged() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        assert!(
+            checklist.contains("Numeric values are **not allocated** in SUP-6")
+                && checklist.contains("does not add global IPC ABI opcodes"),
+            "SUP-6 must document non-live numeric opcode status"
+        );
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-6 must not add live PM restart opcodes"
+        );
+        assert_eq!(
+            abi_src.matches("pub const PROC_OP_").count(),
+            14,
+            "SUP-6 must keep process IPC opcode count unchanged"
+        );
+        assert!(
+            syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            "SUP-6 must not change syscall count"
+        );
+    }
+
+    // ── SUP-7: non-dispatching restart ABI codec review ─────────────────────
+
+    fn sup7_valid_request() -> pm_restart_abi_review::PmRestartRequestV1Review {
+        let mut request = pm_restart_abi_review::PmRestartRequestV1Review::new(
+            0x0102_0304_0506_0708,
+            4,
+            77,
+            3,
+            b"vfs",
+            pm_restart_abi_review::PmRestartReviewReason::Fault,
+            pm_restart_abi_review::PmRestartReviewTokenDescriptor::scoped(77, 0xBEEF),
+        )
+        .expect("valid request");
+        request.attempt_count = 2;
+        request.due_tick = 99;
+        request.dependency_cause_tid = 11;
+        request.degraded_hint = true;
+        request.policy_flags = 0x55AA;
+        request.startup_cap_policy = 1;
+        request.rollback_policy = 2;
+        request.health_monitor_policy = 3;
+        request
+    }
+
+    #[test]
+    fn sup7_request_codec_roundtrip_and_offsets_are_stable() {
+        use self::pm_restart_abi_review::*;
+        let request = sup7_valid_request();
+        let encoded = encode_pm_restart_request_v1(&request).expect("encode");
+        assert_eq!(encoded.len(), PM_RESTART_REQUEST_V1_LEN);
+        assert_eq!(PM_RESTART_REQUEST_V1_LEN, 110);
+        assert_eq!(PM_RESTART_REQUEST_VERSION_OFFSET, 0);
+        assert_eq!(PM_RESTART_REQUEST_ID_OFFSET, 2);
+        assert_eq!(PM_RESTART_REQUEST_TARGET_TID_OFFSET, 18);
+        assert_eq!(PM_RESTART_REQUEST_SERVICE_NAME_OFFSET, 29);
+        assert_eq!(PM_RESTART_REQUEST_TOKEN_FINGERPRINT_OFFSET, 94);
+        assert_eq!(
+            &encoded[PM_RESTART_REQUEST_ID_OFFSET..PM_RESTART_REQUEST_ID_OFFSET + 8],
+            &0x0102_0304_0506_0708u64.to_le_bytes()
+        );
+        assert_eq!(encoded[PM_RESTART_REQUEST_SERVICE_NAME_LEN_OFFSET], 3);
+        assert_eq!(&encoded[PM_RESTART_REQUEST_SERVICE_NAME_OFFSET..32], b"vfs");
+        assert_eq!(
+            decode_pm_restart_request_v1(&encoded).expect("decode"),
+            request
+        );
+        assert!(
+            !encoded
+                .windows(8)
+                .any(|window| window == 0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes()),
+            "SUP-7 request codec must not encode raw restart-token bytes"
+        );
+    }
+
+    #[test]
+    fn sup7_reply_codec_golden_vectors_roundtrip() {
+        use self::pm_restart_abi_review::*;
+        let accepted = accepted_reply(7, 77);
+        let rejected_wrong_token = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::Rejected,
+            failure: PmRestartReviewFailure::WrongTokenOwner,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            ..accepted
+        };
+        let deferred_timer = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::Deferred,
+            failure: PmRestartReviewFailure::TimerUnavailable,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            next_retry_tick: 123,
+            ..accepted
+        };
+        let rolled_back = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::RolledBack,
+            failure: PmRestartReviewFailure::RollbackFailed,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            rollback_status: 9,
+            ..accepted
+        };
+        let unsupported = PmRestartReplyV1Review {
+            status: PmRestartReviewReplyStatus::UnsupportedVersion,
+            failure: PmRestartReviewFailure::UnsupportedVersion,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            ..accepted
+        };
+        for reply in &[
+            accepted,
+            rejected_wrong_token,
+            deferred_timer,
+            rolled_back,
+            unsupported,
+        ] {
+            let encoded = encode_pm_restart_reply_v1(reply).expect("encode reply");
+            assert_eq!(encoded.len(), PM_RESTART_REPLY_V1_LEN);
+            assert_eq!(PM_RESTART_REPLY_V1_LEN, 50);
+            assert_eq!(PM_RESTART_REPLY_STATUS_OFFSET, 18);
+            assert_eq!(PM_RESTART_REPLY_FAILURE_OFFSET, 20);
+            assert_eq!(PM_RESTART_REPLY_RETRY_TICK_OFFSET, 42);
+            assert_eq!(
+                decode_pm_restart_reply_v1(&encoded).expect("decode reply"),
+                *reply
+            );
+        }
+    }
+
+    #[test]
+    fn sup7_codec_rejects_malformed_invalid_and_raw_inputs() {
+        use self::pm_restart_abi_review::*;
+        let request = sup7_valid_request();
+        let encoded = encode_pm_restart_request_v1(&request).expect("encode");
+        assert_eq!(
+            decode_pm_restart_request_v1(&encoded[..encoded.len() - 1]),
+            Err(PmRestartReviewCodecError::Malformed)
+        );
+        let mut bad_version = encoded;
+        bad_version[0] = 2;
+        assert_eq!(
+            decode_pm_restart_request_v1(&bad_version),
+            Err(PmRestartReviewCodecError::UnsupportedVersion)
+        );
+        let mut invalid_reason = encoded;
+        invalid_reason[PM_RESTART_REQUEST_REASON_OFFSET..PM_RESTART_REQUEST_REASON_OFFSET + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(
+            decode_pm_restart_request_v1(&invalid_reason),
+            Err(PmRestartReviewCodecError::InvalidEnum)
+        );
+        let mut raw_token = encoded;
+        raw_token[96] = 0;
+        assert_eq!(
+            decode_pm_restart_request_v1(&raw_token),
+            Err(PmRestartReviewCodecError::RawOrUnscopedToken)
+        );
+        let mut reserved = encoded;
+        reserved[97] = 1;
+        assert_eq!(
+            decode_pm_restart_request_v1(&reserved),
+            Err(PmRestartReviewCodecError::NonzeroReserved)
+        );
+        assert_eq!(
+            PmRestartRequestV1Review::new(
+                1,
+                4,
+                77,
+                1,
+                &[b'x'; PM_RESTART_REVIEW_SERVICE_NAME_MAX + 1],
+                PmRestartReviewReason::Fault,
+                PmRestartReviewTokenDescriptor::scoped(77, 0x1111),
+            ),
+            Err(PmRestartReviewCodecError::OversizedServiceName)
+        );
+        let mut invalid_reply = encode_pm_restart_reply_v1(&accepted_reply(7, 77)).expect("reply");
+        invalid_reply[PM_RESTART_REPLY_STATUS_OFFSET..PM_RESTART_REPLY_STATUS_OFFSET + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        assert_eq!(
+            decode_pm_restart_reply_v1(&invalid_reply),
+            Err(PmRestartReviewCodecError::InvalidEnum)
+        );
+    }
+
+    #[test]
+    fn sup7_sup4_oracle_bridge_preserves_restart_fields() {
+        use self::pm_restart_abi_review::*;
+        let oracle = Sup4PmRestartOracleDescriptor {
+            request_id: 42,
+            target_tid: 77,
+            restart_reason: PmRestartReviewReason::DependencyFailed,
+            attempt_count: 3,
+            due_tick: 144,
+            dependency_cause_tid: 12,
+            token_owner_tid: 77,
+            token_fingerprint: 0xCAFE,
+        };
+        let request = request_from_sup4_oracle(oracle).expect("bridge to codec");
+        assert_eq!(request.request_id, 42);
+        assert_eq!(request.target_tid, 77);
+        assert_eq!(
+            request.restart_reason,
+            PmRestartReviewReason::DependencyFailed
+        );
+        assert_eq!(request.attempt_count, 3);
+        assert_eq!(request.due_tick, 144);
+        assert_eq!(request.dependency_cause_tid, 12);
+        assert_eq!(request.token.owner_tid, 77);
+        assert_eq!(request.token.redacted_fingerprint, 0xCAFE);
+        assert_eq!(oracle_from_request(request), oracle);
+
+        let reply_oracle = Sup4PmRestartOracleReplyDescriptor {
+            request_id: 42,
+            target_tid: 77,
+            status: PmRestartReviewReplyStatus::Deferred,
+            failure: PmRestartReviewFailure::TimerUnavailable,
+            retry_tick: 233,
+        };
+        let reply = reply_from_sup4_oracle(reply_oracle);
+        assert_eq!(reply.request_id, 42);
+        assert_eq!(reply.target_tid, 77);
+        assert_eq!(reply.status, PmRestartReviewReplyStatus::Deferred);
+        assert_eq!(reply.failure, PmRestartReviewFailure::TimerUnavailable);
+        assert_eq!(reply.next_retry_tick, 233);
+        assert_eq!(oracle_from_reply(reply), reply_oracle);
+    }
+
+    #[test]
+    fn sup7_codec_vectors_cover_sup6_matrix_rows() {
+        use self::pm_restart_abi_review::*;
+        let rows = [
+            (
+                "valid supervisor request",
+                PmRestartReviewReplyStatus::Accepted,
+                PmRestartReviewFailure::None,
+                0,
+            ),
+            (
+                "untrusted sender",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::MissingRight,
+                0,
+            ),
+            (
+                "wrong token owner",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::WrongTokenOwner,
+                0,
+            ),
+            (
+                "raw token",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::RawTokenUnsupported,
+                0,
+            ),
+            (
+                "unknown target",
+                PmRestartReviewReplyStatus::NoSuchTarget,
+                PmRestartReviewFailure::None,
+                0,
+            ),
+            (
+                "restart limit exceeded",
+                PmRestartReviewReplyStatus::Rejected,
+                PmRestartReviewFailure::RestartLimitExceeded,
+                0,
+            ),
+            (
+                "dependency blocker",
+                PmRestartReviewReplyStatus::Deferred,
+                PmRestartReviewFailure::DependencyBlocked,
+                55,
+            ),
+            (
+                "resource unavailable",
+                PmRestartReviewReplyStatus::Deferred,
+                PmRestartReviewFailure::ResourceUnavailable,
+                89,
+            ),
+            (
+                "rollback failure",
+                PmRestartReviewReplyStatus::RolledBack,
+                PmRestartReviewFailure::RollbackFailed,
+                0,
+            ),
+            (
+                "unsupported version",
+                PmRestartReviewReplyStatus::UnsupportedVersion,
+                PmRestartReviewFailure::UnsupportedVersion,
+                0,
+            ),
+            (
+                "timer unavailable",
+                PmRestartReviewReplyStatus::Deferred,
+                PmRestartReviewFailure::TimerUnavailable,
+                144,
+            ),
+            (
+                "already restarting",
+                PmRestartReviewReplyStatus::AlreadyRestarting,
+                PmRestartReviewFailure::None,
+                0,
+            ),
+        ];
+        for (idx, (row, status, failure, retry_tick)) in rows.iter().enumerate() {
+            let reply = PmRestartReplyV1Review {
+                version: PM_RESTART_REVIEW_VERSION_V1,
+                request_id: 0x7000 + idx as u64,
+                target_tid: 77,
+                status: *status,
+                failure: *failure,
+                replacement_handle_kind: (*status == PmRestartReviewReplyStatus::Accepted) as u16,
+                replacement_handle_value: if *status == PmRestartReviewReplyStatus::Accepted {
+                    0x504d_5355_5037
+                } else {
+                    0
+                },
+                cleanup_status: 0,
+                accounting_status: 0,
+                startup_cap_status: 0,
+                health_monitor_status: 0,
+                rollback_status: (*status == PmRestartReviewReplyStatus::RolledBack) as u16,
+                next_retry_tick: *retry_tick,
+            };
+            let encoded = encode_pm_restart_reply_v1(&reply).expect(row);
+            assert_eq!(encoded.len(), PM_RESTART_REPLY_V1_LEN, "{row}");
+            assert_eq!(
+                decode_pm_restart_reply_v1(&encoded).expect(row),
+                reply,
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup7_codec_review_does_not_add_live_dispatch_or_send_paths() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_mod_src = include_str!("process_manager/mod.rs");
+        assert!(
+            pm_mod_src.contains("restart_abi_review")
+                && pm_mod_src.contains(r#"feature = "hosted-dev""#),
+            "SUP-7 codec must stay behind the hosted-dev/test review gate"
+        );
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-7 codec review must not add live global IPC ABI opcodes"
+        );
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-7 must not add PM dispatch or supervisor send path"
+        );
+        assert!(
+            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            "production restart remains deferred/fail-closed"
+        );
+    }
+
+    // ── SUP-8: ABI-review signoff guardrails ───────────────────────────────
+
+    #[test]
+    fn sup8_signoff_tables_and_reserved_policy_are_present() {
+        let doc = include_str!("../../../../doc/process-manager-restart-contract.md");
+        for needle in &[
+            "## SUP-8 ABI-review signoff package",
+            "### Request V1 frozen layout",
+            "### Reply V1 frozen layout",
+            "Request V1 total length is frozen at 110 bytes",
+            "Reply V1 total length is frozen at 50 bytes",
+            "`token.reserved` | 97 | 1",
+            "decode must reject nonzero reserved",
+            "No PR may promote this codec into `yarm-ipc-abi` or runtime dispatch",
+            "QEMU x86_64 and AArch64 boot smoke results",
+            "### Golden-vector signoff table",
+            "### Conformance matrix completeness",
+        ] {
+            assert!(
+                doc.contains(needle),
+                "SUP-8 signoff doc must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup8_promotion_guardrails_keep_live_paths_absent() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let codec_src = include_str!("process_manager/restart_abi_review.rs");
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-8 must not promote restart opcodes into live process ABI"
+        );
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-8 must not add PM dispatch or supervisor send path"
+        );
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "ipc_send(",
+            "ipc_call(",
+            "ipc_reply(",
+            "mint",
+            "revoke",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !codec_src.contains(forbidden),
+                "SUP-8 review codec must remain non-live and not call {forbidden}"
+            );
+        }
+        assert!(
+            codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && codec_src.contains("NonzeroReserved"),
+            "SUP-8 codec must name and reject reserved-byte misuse"
+        );
+        assert!(
+            supervisor_src.contains("redacted_fingerprint")
+                && !supervisor_src.contains("unwrap_or(event.restart_token)")
+                && supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            "SUP-8 must preserve redaction, dependent-token, and deferred-runtime guardrails"
+        );
+    }
+
+    // ── SUP-9: pre-live promotion dry-run readiness guardrails ─────────────
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartPromotionReadinessStatus {
+        ReadyForReviewOnly,
+        MissingArtifacts,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartPromotionReadinessFailure {
+        MissingFrozenRequestSize,
+        MissingFrozenReplySize,
+        MissingConformanceMatrix,
+        MissingReservedPolicy,
+        MissingGoldenVectors,
+        CandidateOpcodesNotUnallocated,
+        LiveAbiOpcodePresent,
+        DispatchPresent,
+        MissingFailClosedMarker,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PmRestartPromotionReadinessReport {
+        status: PmRestartPromotionReadinessStatus,
+        failures: Vec<PmRestartPromotionReadinessFailure>,
+    }
+
+    fn evaluate_pm_restart_promotion_readiness(
+        process_contract_doc: &str,
+        checklist_doc: &str,
+        promotion_plan_doc: &str,
+        live_abi_src: &str,
+        pm_src: &str,
+        supervisor_src: &str,
+    ) -> PmRestartPromotionReadinessReport {
+        let mut failures = Vec::new();
+        if !process_contract_doc.contains("Request V1 total length is frozen at 110 bytes") {
+            failures.push(PmRestartPromotionReadinessFailure::MissingFrozenRequestSize);
+        }
+        if !process_contract_doc.contains("Reply V1 total length is frozen at 50 bytes") {
+            failures.push(PmRestartPromotionReadinessFailure::MissingFrozenReplySize);
+        }
+        if !checklist_doc.contains("conformance")
+            && !process_contract_doc.contains("Conformance matrix completeness")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::MissingConformanceMatrix);
+        }
+        if !process_contract_doc.contains("Reserved field and flag policy")
+            || !process_contract_doc.contains("decode must reject nonzero reserved")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::MissingReservedPolicy);
+        }
+        if !process_contract_doc.contains("Golden-vector signoff table")
+            || !promotion_plan_doc.contains("codec golden vectors exist")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::MissingGoldenVectors);
+        }
+        if !process_contract_doc.contains("candidate opcodes `15`/`16` remain")
+            || !promotion_plan_doc.contains("candidate values `15` and `16` explicitly unallocated")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::CandidateOpcodesNotUnallocated);
+        }
+        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
+            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::LiveAbiOpcodePresent);
+        }
+        if pm_src.contains("PROC_OP_PM_RESTART_V1")
+            || supervisor_src.contains("PROC_OP_PM_RESTART_V1")
+        {
+            failures.push(PmRestartPromotionReadinessFailure::DispatchPresent);
+        }
+        if !supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT") {
+            failures.push(PmRestartPromotionReadinessFailure::MissingFailClosedMarker);
+        }
+        let status = if failures.is_empty() {
+            PmRestartPromotionReadinessStatus::ReadyForReviewOnly
+        } else {
+            PmRestartPromotionReadinessStatus::MissingArtifacts
+        };
+        PmRestartPromotionReadinessReport { status, failures }
+    }
+
+    #[test]
+    fn sup9_promotion_readiness_reports_review_only_not_live() {
+        let process_doc = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let checklist_doc =
+            include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
+        let promotion_doc = include_str!("../../../../doc/pm-restart-live-promotion-plan.md");
+        let live_abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+
+        let report = evaluate_pm_restart_promotion_readiness(
+            process_doc,
+            checklist_doc,
+            promotion_doc,
+            live_abi_src,
+            pm_src,
+            supervisor_src,
+        );
+        assert_eq!(
+            report.status,
+            PmRestartPromotionReadinessStatus::ReadyForReviewOnly
+        );
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn sup9_promotion_plan_contains_required_future_sequence_and_evidence() {
+        let promotion_doc = include_str!("../../../../doc/pm-restart-live-promotion-plan.md");
+        for needle in &[
+            "# SUP-9 PM restart live-promotion dry-run plan",
+            "## Future SUP-live promotion sequence",
+            "### 1. ABI approval",
+            "### 2. PM dispatch wiring",
+            "### 3. Supervisor PM client wiring",
+            "### 4. PM mechanism implementation",
+            "### 5. Timer/backoff integration",
+            "### 6. Rollout",
+            "## Promotion PR checklist",
+            "## Dry-run readiness model",
+            "## Future rollback-injection test plan",
+            "## Future QEMU acceptance plan",
+            "x86_64 normal boot unchanged",
+            "AArch64 normal boot unchanged",
+        ] {
+            assert!(
+                promotion_doc.contains(needle),
+                "SUP-9 promotion plan must contain {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup9_source_guardrails_keep_promotion_non_live() {
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let codec_src = include_str!("process_manager/restart_abi_review.rs");
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            "SUP-9 must keep candidate opcodes absent from live ABI"
+        );
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-9 must not add dispatch or send paths"
+        );
+        assert!(
+            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            "production restart path must remain visibly deferred"
+        );
+        assert!(
+            codec_src.contains("PM_RESTART_REQUEST_V1_LEN: usize = 110")
+                && codec_src.contains("PM_RESTART_REPLY_V1_LEN: usize = 50")
+                && codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && codec_src.contains("NonzeroReserved"),
+            "SUP-9 must preserve frozen sizes and reserved-byte decode rejection"
+        );
+        assert!(
+            supervisor_src.contains("redacted_fingerprint")
+                && !supervisor_src.contains("unwrap_or(event.restart_token)"),
+            "SUP-9 must preserve token redaction and dependent-token no-fallback rule"
+        );
+    }
+
+    // ── SUP-10: live-readiness evidence pack guardrails ────────────────────
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartLiveReadinessGoNoGoStatus {
+        GoForAbiReview,
+        NoGoMissingEvidence,
+        NoGoLiveAlreadyChanged,
+        NoGoDispatchPresent,
+        NoGoSupervisorSendPresent,
+        NoGoRuntimeNotFailClosed,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PmRestartLiveReadinessFailure {
+        MissingFrozenSizes,
+        MissingPromotionPlan,
+        LiveOpcodePresent,
+        ProcessOpcodeCountChanged,
+        SyscallCountChanged,
+        DispatchPresent,
+        SupervisorSendPresent,
+        MissingFailClosedMarker,
+        MissingRollbackInjectionPlan,
+        MissingQemuAcceptancePlan,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PmRestartLiveReadinessGoNoGoReport {
+        status: PmRestartLiveReadinessGoNoGoStatus,
+        failures: Vec<PmRestartLiveReadinessFailure>,
+    }
+
+    fn evaluate_pm_restart_live_readiness_go_no_go(
+        evidence_doc: &str,
+        promotion_doc: &str,
+        process_contract_doc: &str,
+        live_abi_src: &str,
+        syscall_src: &str,
+        pm_src: &str,
+        supervisor_src: &str,
+    ) -> PmRestartLiveReadinessGoNoGoReport {
+        let mut failures = Vec::new();
+        if !process_contract_doc.contains("Request V1 total length is frozen at 110 bytes")
+            || !process_contract_doc.contains("Reply V1 total length is frozen at 50 bytes")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingFrozenSizes);
+        }
+        if !promotion_doc.contains("# SUP-9 PM restart live-promotion dry-run plan")
+            || !evidence_doc.contains("Exact future live PR diff plan")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingPromotionPlan);
+        }
+        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
+            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+        {
+            failures.push(PmRestartLiveReadinessFailure::LiveOpcodePresent);
+        }
+        if live_abi_src.matches("pub const PROC_OP_").count() != 14 {
+            failures.push(PmRestartLiveReadinessFailure::ProcessOpcodeCountChanged);
+        }
+        if !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;") {
+            failures.push(PmRestartLiveReadinessFailure::SyscallCountChanged);
+        }
+        if pm_src.contains("PROC_OP_PM_RESTART_V1") {
+            failures.push(PmRestartLiveReadinessFailure::DispatchPresent);
+        }
+        if supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
+            failures.push(PmRestartLiveReadinessFailure::SupervisorSendPresent);
+        }
+        if !supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT") {
+            failures.push(PmRestartLiveReadinessFailure::MissingFailClosedMarker);
+        }
+        if !evidence_doc.contains("Future rollback-injection scripts and markers")
+            || !promotion_doc.contains("Future rollback-injection test plan")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingRollbackInjectionPlan);
+        }
+        if !evidence_doc.contains("Future rollback-injection scripts and markers")
+            || !promotion_doc.contains("Future QEMU acceptance plan")
+        {
+            failures.push(PmRestartLiveReadinessFailure::MissingQemuAcceptancePlan);
+        }
+
+        let status = if failures.iter().any(|failure| {
+            matches!(
+                failure,
+                PmRestartLiveReadinessFailure::LiveOpcodePresent
+                    | PmRestartLiveReadinessFailure::ProcessOpcodeCountChanged
+                    | PmRestartLiveReadinessFailure::SyscallCountChanged
+            )
+        }) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoLiveAlreadyChanged
+        } else if failures.contains(&PmRestartLiveReadinessFailure::DispatchPresent) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoDispatchPresent
+        } else if failures.contains(&PmRestartLiveReadinessFailure::SupervisorSendPresent) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoSupervisorSendPresent
+        } else if failures.contains(&PmRestartLiveReadinessFailure::MissingFailClosedMarker) {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoRuntimeNotFailClosed
+        } else if failures.is_empty() {
+            PmRestartLiveReadinessGoNoGoStatus::GoForAbiReview
+        } else {
+            PmRestartLiveReadinessGoNoGoStatus::NoGoMissingEvidence
+        };
+        PmRestartLiveReadinessGoNoGoReport { status, failures }
+    }
+
+    #[test]
+    fn sup10_go_no_go_report_is_for_abi_review_only() {
+        let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        let promotion_doc = include_str!("../../../../doc/pm-restart-live-promotion-plan.md");
+        let process_doc = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let live_abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+
+        let report = evaluate_pm_restart_live_readiness_go_no_go(
+            evidence_doc,
+            promotion_doc,
+            process_doc,
+            live_abi_src,
+            syscall_src,
+            pm_src,
+            supervisor_src,
+        );
+        assert_eq!(
+            report.status,
+            PmRestartLiveReadinessGoNoGoStatus::GoForAbiReview
+        );
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn sup10_evidence_doc_contains_matrix_diff_plan_and_future_markers() {
+        let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        for needle in &[
+            "# SUP-10 PM restart live-readiness evidence pack",
+            "## Evidence summary from SUP-1 through SUP-9",
+            "## Exact future live PR diff plan",
+            "### 1. `yarm-ipc-abi` / process IPC ABI",
+            "### 2. Process Manager",
+            "### 3. Supervisor",
+            "### 4. PM mechanism",
+            "### 5. Timer/backoff",
+            "### 6. Tests, scripts, and docs",
+            "## Readiness evidence matrix",
+            "## Go/no-go report model",
+            "## Future rollback-injection scripts and markers",
+            "scripts/qemu-supervisor-pm-restart-accepted-smoke.sh",
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "PM_RESTART_REPLY_DEFERRED",
+        ] {
+            assert!(
+                evidence_doc.contains(needle),
+                "SUP-10 evidence doc must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup10_source_guardrails_keep_live_enablement_absent() {
+        let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
+        let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert!(
+            !abi_src.contains("PROC_OP_PM_RESTART_V1")
+                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+        );
+        assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"));
+        assert!(
+            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-10 must not add PM dispatch or supervisor send"
+        );
+        for future_marker in &[
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "PM_RESTART_V1_DECODE_OK",
+            "PM_RESTART_SENDER_OK",
+            "PM_RESTART_TOKEN_OK",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_ROLLBACK_BEGIN",
+            "PM_RESTART_REPLY_ACCEPTED",
+            "PM_RESTART_REPLY_REJECTED",
+            "PM_RESTART_REPLY_DEFERRED",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+        ] {
+            assert!(
+                evidence_doc.contains(future_marker),
+                "future marker must be documented: {future_marker}"
+            );
+            assert!(
+                !pm_src.contains(future_marker) && !supervisor_src.contains(future_marker),
+                "future marker must not be emitted by current runtime: {future_marker}"
+            );
+        }
+        assert!(supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"));
     }
 }
