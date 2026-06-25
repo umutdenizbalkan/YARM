@@ -3780,6 +3780,55 @@ No syscall/IPC ABI change, no IPC/cap seam moved, counts unchanged
 D6/CR3/TSS/PF switch machinery untouched (the fix is confined to page-fault routing
 + COW marking). `MAX_ADDRESS_SPACES` remains 32.
 
+#### 5.1.9.14 Stage 163H — fork-child software-vs-hardware PTE mismatch
+
+Stage 163G's diagnostics on QEMU were decisive. The faulting child stack page was
+**not** an RO-COW-inherited page at all — it was a demand-mapped private page:
+
+```
+PF_PROOF_LOOKUP_MAPPING ... va=0x7fffffbff000 found=1 writable=1 cow=0 demand=1 phys=0x104dd000
+PF_PROOF_COW_CONSIDER  ... reason=not_cow_page
+PAGE_FAULT_DEMAND_VERIFY ... task_flags=0x80000000104dd007 active_flags=0x80000007
+PAGE_FAULT_HANDLED_DEMAND   (repeats forever)
+```
+
+So the page is correctly writable in the **child's own ASID** (`task_flags`:
+present/write/user/NX, phys `0x104dd000`), but the **active page table the CPU
+actually walks** is a *different* ASID holding a stale, wrong, but **present** entry
+(`active_flags=0x80000007`: phys `0x80000000`, no NX). The CPU therefore keeps
+walking the wrong table and re-faulting. There is no software/hardware flag mismatch
+within the child's ASID — the mismatch is **CR3 vs the child's ASID**: the fork
+child was running on a stale/incorrect active page table for this page.
+
+The demand-verify already had a CR3-correction (`switch_address_space(task_asid)`)
+"to fix ASID/CR3 if the task's address space differs from what the HAL recorded"
+(Stage 137), but it only fired when the active entry was **absent**
+(`!active_present`). Here the wrong active entry is *present*, so the correction
+never ran and `HANDLED_DEMAND` returned to userspace on the wrong CR3 → loop.
+
+**Fix (minimal, in the page-fault path):** broaden the existing correction to also
+fire on a *stale-but-present* mismatch — when the active table is a different ASID
+whose PTE flags for the page disagree with the task's correct mapping
+(`active_asid != task_asid && active_flags != task_flags`) — then
+`switch_address_space(task_asid)` and `invalidate_page` so the CPU re-walks the
+child's own table. When active == task the flags match and nothing switches.
+`HANDLED_DEMAND` remains gated on the post-correction `hw_demand_ok` hardware walk.
+
+**Diagnostics (Task B):** a fully-decoded `pf_proof_log_hw_pte` helper logs
+`PF_PROOF_HW_PTE_BEFORE`/`_AFTER` (real active-CR3 walk: present/writable/user/nx +
+raw, alongside the software writable/cow/demand flags), plus `PF_PROOF_DEMAND_
+CONSIDER`/`_DECLINE` and `PF_PROOF_DEMAND_SWITCH_CR3` — all proof-gated. These make
+any residual SW-vs-HW or CR3 mismatch unambiguous on the next run.
+
+Most of this fix is a hardware-path (real CR3/PTE) change validated by QEMU; the
+hosted suite covers the unchanged COW/demand behavior, and `stage163h_*` source
+guards pin the broadened switch condition, the decoded diagnostics, and the
+preserved Stage 163G decline. No syscall/IPC ABI change, no IPC/cap seam moved,
+counts unchanged (`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`), RPi5 untouched, the
+D6/CR3/TSS *switch* machinery untouched beyond broadening the existing demand-verify
+`switch_address_space` correction, Stage 163E transactional/run-preserving COW clone
+preserved, `MAX_ADDRESS_SPACES` remains 32.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through
