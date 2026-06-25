@@ -621,6 +621,20 @@ fn walk_or_create_table(
 ) -> Result<u64, PageTableError> {
     let entry = read_table_entry(state, table_phys, index).ok_or(PageTableError::InvalidAddress)?;
     if entry.is_present() {
+        // Stage 163I: an intermediate created for a stricter mapping (e.g. a
+        // non-user page) must be widened when a more-permissive leaf is mapped
+        // under it, otherwise the AND-of-levels access check denies the new
+        // leaf (present+write+user faults that no INVLPG can clear). Only ADD
+        // bits the requested mapping needs; never narrow an existing entry, and
+        // never touch huge-page leaves.
+        if (entry.0 & PageTableEntry::HUGE_PAGE) == 0 {
+            let want = table_flags_from_page_flags(flags)
+                & (PageTableEntry::WRITABLE | PageTableEntry::USER);
+            if entry.0 & want != want {
+                let upgraded = PageTableEntry(entry.0 | want);
+                write_table_entry(state, table_phys, index, upgraded)?;
+            }
+        }
         return Ok(entry.addr());
     }
 
@@ -1458,6 +1472,72 @@ pub fn invalidate_page(virt: VirtAddr) {
     unsafe {
         core::arch::asm!("invlpg [{addr}]", addr = in(reg) virt.0 as usize, options(nostack, preserves_flags));
     }
+}
+
+/// Stage 163I: force a full local-CPU TLB flush by reloading CR3 with the
+/// architectural-flush (no-flush bit clear) semantics.
+///
+/// `invalidate_page` (INVLPG) only guarantees flushing the *current* PCID's
+/// entry for one linear address. When a present write fault recurs on a page
+/// whose hardware PTE is already present+writable+user (a stale-translation
+/// loop the per-page INVLPG provably did not clear), this reloads CR3 to drop
+/// every non-global TLB entry for the active address space, guaranteeing the
+/// CPU re-walks the page table on the next access. It does not change the
+/// active root (CR3 is reloaded with its own value), so it never switches
+/// address spaces.
+pub fn flush_tlb_local_full() {
+    #[cfg(not(feature = "hosted-dev"))]
+    unsafe {
+        fallback_flush_tlb_via_cr3();
+    }
+}
+
+/// Stage 163I: ensure every intermediate paging-structure entry (PML4E, PDPTE,
+/// PDE) on the translation path for `virt` carries USER|WRITABLE, repairing any
+/// that were first created for a stricter (e.g. non-user) mapping.
+///
+/// On x86_64 the effective access rights are the logical-AND of the bits in
+/// EVERY paging-structure entry used to translate an address (Intel SDM Vol. 3A
+/// 4.6). A leaf PTE that is present+writable+user is therefore still
+/// inaccessible to user-mode writes if any upper-level entry has USER=0 — and
+/// the CPU faults `present+write+user` (error 0x7) on it forever, which INVLPG
+/// cannot fix because it is a genuine permission denial, not a stale entry.
+/// `walk_or_create_table` returns an existing intermediate without upgrading
+/// its flags, so this repairs the path in place. The leaf entry is NOT touched
+/// (per-page permissions stay governed by the leaf). Returns the number of
+/// intermediate levels that were upgraded.
+#[cfg(not(feature = "hosted-dev"))]
+pub fn repair_user_path_intermediates(asid: Asid, virt: VirtAddr) -> u8 {
+    let mut state = PAGE_TABLE_STATE.lock();
+    let Some(root_phys) = state.asid_root_phys(asid) else {
+        return 0;
+    };
+    let levels = [pml4_index(virt.0), pdpt_index(virt.0), pd_index(virt.0)];
+    let needed = PageTableEntry::USER | PageTableEntry::WRITABLE;
+    let mut table_phys = root_phys;
+    let mut repaired = 0u8;
+    for &level in &levels {
+        let Some(entry) = read_table_entry(&state, table_phys, level) else {
+            break;
+        };
+        if !entry.is_present() || (entry.0 & PageTableEntry::HUGE_PAGE) != 0 {
+            break;
+        }
+        if entry.0 & needed != needed {
+            let upgraded = PageTableEntry(entry.0 | needed);
+            if write_table_entry(&mut state, table_phys, level, upgraded).is_err() {
+                break;
+            }
+            repaired += 1;
+        }
+        table_phys = entry.addr();
+    }
+    repaired
+}
+
+#[cfg(feature = "hosted-dev")]
+pub fn repair_user_path_intermediates(_asid: Asid, _virt: VirtAddr) -> u8 {
+    0
 }
 
 #[cfg(not(feature = "hosted-dev"))]

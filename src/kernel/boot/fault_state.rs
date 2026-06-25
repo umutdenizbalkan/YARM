@@ -236,6 +236,58 @@ impl KernelState {
             // stale not-present entry from the original fault.  INVLPG flushes
             // that entry so the CPU re-walks the hardware page table and finds
             // the valid PTE instead of re-faulting indefinitely.
+            let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+            if matches!(fault.access, FaultAccess::Write) {
+                // Stage 163I: a WRITE fault on a page that is ALREADY present
+                // and writable is not a fresh demand map — it is a stale /
+                // under-permissioned-translation loop. The leaf PTE is writable,
+                // so plain per-page INVLPG provably does not clear it (observed
+                // present+write+user error 0x7 recurring with cr3 unchanged and
+                // the leaf raw PTE = ...007). Two real causes are repaired here:
+                //   1. an intermediate paging entry that lacks USER|WRITABLE, so
+                //      the AND-of-levels check denies the write regardless of the
+                //      leaf (repair_user_path_intermediates widens it in place);
+                //   2. a stale local-CPU TLB entry the single-page INVLPG missed
+                //      (flush_tlb_local_full reloads CR3 to drop the whole space).
+                if proof {
+                    crate::yarm_log!(
+                        "PF_PROOF_TLB_STALE_CANDIDATE tid={} asid={} va=0x{:x} sw_writable=1",
+                        tid,
+                        asid.0,
+                        page.0
+                    );
+                }
+                let repaired =
+                    crate::arch::selected_isa::page_table::repair_user_path_intermediates(
+                        asid, page,
+                    );
+                if proof {
+                    crate::yarm_log!(
+                        "PF_PROOF_INTERMEDIATE_REPAIR tid={} asid={} va=0x{:x} levels_upgraded={}",
+                        tid,
+                        asid.0,
+                        page.0,
+                        repaired
+                    );
+                    crate::yarm_log!("PF_PROOF_INVLPG_BEGIN va=0x{:x}", page.0);
+                }
+                crate::arch::selected_isa::page_table::invalidate_page(page);
+                if proof {
+                    crate::yarm_log!("PF_PROOF_INVLPG_DONE va=0x{:x}", page.0);
+                    crate::yarm_log!("PF_PROOF_CR3_RELOAD_BEGIN va=0x{:x}", page.0);
+                }
+                crate::arch::selected_isa::page_table::flush_tlb_local_full();
+                if proof {
+                    crate::yarm_log!("PF_PROOF_CR3_RELOAD_DONE va=0x{:x}", page.0);
+                    crate::yarm_log!(
+                        "PF_PROOF_DEMAND_HANDLE_OK tid={} asid={} va=0x{:x} reason=already_writable_after_flush",
+                        tid,
+                        asid.0,
+                        page.0
+                    );
+                }
+                return Ok(true);
+            }
             crate::arch::selected_isa::page_table::invalidate_page(page);
             return Ok(true);
         }
@@ -678,11 +730,23 @@ impl KernelState {
                         let hw_root = hw_cr3 & !0xfffu64;
                         let (pml4e, pdpte, pde, hw_pte) =
                             crate::arch::x86_64::page_table::hw_pte_walk_verbose(hw_root, page.0);
+                        // Stage 163I: effective access rights are the logical-AND
+                        // of the bits across EVERY paging-structure entry used to
+                        // translate the address (Intel SDM Vol. 3A 4.6), not just
+                        // the leaf. A writable+user leaf under an intermediate
+                        // that lacks USER/WRITABLE is still inaccessible and faults
+                        // present+write+user forever; the leaf-only check masked
+                        // that and let HANDLED_DEMAND loop. Require the whole walk
+                        // to grant the access before declaring it satisfied.
+                        let walk = [pml4e, pdpte, pde, hw_pte];
+                        let eff_present = walk.iter().all(|e| (e & 1) != 0);
+                        let eff_writable = walk.iter().all(|e| (e & 2) != 0);
+                        let eff_user = walk.iter().all(|e| (e & 4) != 0);
                         let hw_present = (hw_pte & 1) != 0;
                         let hw_user = (hw_pte & 4) != 0;
                         let hw_writable = (hw_pte & 2) != 0;
                         crate::yarm_log!(
-                            "PAGE_FAULT_POST_DEMAND_HW_PTE_WALK cr3=0x{:016x} va=0x{:016x} pml4e=0x{:016x} pdpte=0x{:016x} pde=0x{:016x} pte=0x{:016x} present={} user={} writable={}",
+                            "PAGE_FAULT_POST_DEMAND_HW_PTE_WALK cr3=0x{:016x} va=0x{:016x} pml4e=0x{:016x} pdpte=0x{:016x} pde=0x{:016x} pte=0x{:016x} present={} user={} writable={} eff_present={} eff_user={} eff_writable={}",
                             hw_cr3,
                             page.0,
                             pml4e,
@@ -692,8 +756,11 @@ impl KernelState {
                             hw_present as u8,
                             hw_user as u8,
                             hw_writable as u8,
+                            eff_present as u8,
+                            eff_user as u8,
+                            eff_writable as u8,
                         );
-                        hw_present && hw_user && (!need_write || hw_writable)
+                        eff_present && eff_user && (!need_write || eff_writable)
                     };
                     #[cfg(any(not(target_arch = "x86_64"), feature = "hosted-dev"))]
                     let hw_demand_ok = true;
