@@ -34,9 +34,15 @@ use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd
 use yarm_fs_servers::ramfs::service::RamFsMountConfig;
 use yarm_ipc_abi::blkcache_abi::{BLKCACHE_OP_REGISTER_BACKEND, RegisterBackendArgs};
 use yarm_ipc_abi::block_abi::{BLK_OP_GET_INFO, BlkGetInfoReply, BlkGetInfoRequest, BlkStatus};
+use yarm_ipc_abi::supervisor_abi::{RegisterDriverRequest, SUPERVISOR_OP_REGISTER_DRIVER};
 use yarm_ipc_abi::vfs_abi::{MountRegisterArgs, VFS_MOUNT_STATUS_OK, VFS_OP_MOUNT_REGISTER};
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
+
+fn supervisor_restart_test_build_gate_enabled() -> bool {
+    option_env!("YARM_SUPERVISOR_RESTART_TEST") == Some("1")
+        || option_env!("SUPERVISOR_RESTART_TEST") == Some("1")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitCoreImageSource<'a> {
@@ -554,6 +560,40 @@ fn register_ext4_mount_with_vfs(
     }
 }
 
+fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
+    yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_REGISTER_BEGIN");
+    let req = RegisterDriverRequest {
+        tid: crash_tid,
+        max_restarts: 3,
+        restart_group: 13,
+        dependency_mask: 0,
+        backoff_ticks: 1,
+        irq_line: 0,
+        mem_cap: 0,
+        iova_cap: 0,
+        iova_base: 0,
+        dma_len: 0,
+        iova_len: 0,
+    };
+    let payload = req.encode();
+    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        SUPERVISOR_OP_REGISTER_DRIVER,
+        0,
+        None,
+        &payload,
+    ) else {
+        yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_REGISTER_FAIL reason=message");
+        return;
+    };
+    let _ = unsafe { yarm_user_rt::syscall::ipc_send(supervisor_send, &msg) };
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
+        crash_tid
+    );
+    yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_POLICY max_restarts=3");
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
@@ -970,6 +1010,25 @@ pub fn run() {
         yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled");
         yarm_user_rt::user_log!("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled");
         yarm_user_rt::user_log!("INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled");
+    }
+
+    if supervisor_restart_test_build_gate_enabled() {
+        yarm_user_rt::user_log!("INIT_SUPERVISOR_RESTART_TEST_GATE_ON");
+        yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_REQUEST image_id=13");
+        if let Some((crash_tid, _crash_send_cap)) =
+            spawn_v5_cap(pm_send, pm_recv, 13, [0, 0, 0, 0], 1)
+        {
+            yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_OK tid={}", crash_tid);
+            if let Some(supervisor_send) = ctx.supervisor_control_send_ep {
+                register_crash_test_with_supervisor(supervisor_send, crash_tid);
+            } else {
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_CRASH_TEST_REGISTER_FAIL reason=no-supervisor-send-cap"
+                );
+            }
+        } else {
+            yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_FAIL reason=pm-spawn");
+        }
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

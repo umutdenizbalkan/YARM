@@ -2705,6 +2705,80 @@ mod tests {
     }
 
     #[test]
+    fn sup_l6b_runtime_handoff_markers_and_guardrails_are_wired() {
+        let init_src = include_str!("init/service.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
+
+        for needle in &[
+            "option_env!(\"YARM_SUPERVISOR_RESTART_TEST\") == Some(\"1\")",
+            "INIT_SUPERVISOR_RESTART_TEST_GATE_ON",
+            "INIT_CRASH_TEST_SPAWN_REQUEST image_id=13",
+            "spawn_v5_cap(pm_send, pm_recv, 13, [0, 0, 0, 0], 1)",
+            "SUPERVISOR_CRASH_TEST_REGISTER_BEGIN",
+            "RegisterDriverRequest",
+            "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
+            "SUPERVISOR_CRASH_TEST_POLICY max_restarts=3",
+        ] {
+            assert!(
+                init_src.contains(needle),
+                "init source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "PM_SUPERVISOR_RESTART_TEST_GATE_ON",
+            "PM_CRASH_TEST_SPAWN_REQUEST image_id={}",
+            "PM_CRASH_TEST_SPAWN_OK tid={}",
+            "PM_CRASH_TEST_LIFECYCLE_RECORDED tid={} image_id={}",
+            "PM_CRASH_TEST_RESTART_TOKEN_RECORDED tid={} fingerprint={}",
+            "crash_test_restart_token_for_tid",
+            "target_record.image_id == CRASH_TEST_SRV_IMAGE_ID",
+            "pm_vfs_spawn_inline(",
+        ] {
+            assert!(pm_src.contains(needle), "PM source must contain {needle}");
+        }
+        for needle in &[
+            "SUPERVISOR_RESTART_TEST_GATE_ON",
+            "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
+            "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
+            "SUPERVISOR_RESTART_SCHEDULED attempt={} max={}",
+            "SUPERVISOR_RESTART_LIMIT_EXCEEDED attempts={}",
+            "SUPERVISOR_SERVICE_DEGRADED_FINAL",
+            "record.tid = replacement_handle_value",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "supervisor source must contain {needle}"
+            );
+        }
+        assert!(smoke.contains("require_count \"CRASH_TEST_SRV_ENTRY\" 4"));
+        assert!(pm_src.contains("VFS_SERVICE_IMAGE_ID_MAX: u64 = 12"));
+        assert!(pm_src.contains("6 => Some(b\"/initramfs/sbin/vfs_server\")"));
+        assert!(
+            !pm_src.contains("image_id >= 7") && !pm_src.contains("7..=13"),
+            "SUP-L6B must not broaden VFS ranges"
+        );
+        for forbidden in &[
+            "restart_any_image",
+            "restart_any_lifecycle",
+            "slot = 13",
+            "slot=13",
+            "fabricate",
+        ] {
+            assert!(
+                !pm_src.contains(forbidden) && !init_src.contains(forbidden),
+                "SUP-L6B must not introduce {forbidden}"
+            );
+        }
+        assert!(
+            !supervisor_src.contains("spawn_process_with_startup_caps(")
+                && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),
+            "supervisor must not execute restart locally"
+        );
+    }
+
+    #[test]
     fn sup10_source_guardrails_keep_live_enablement_absent() {
         let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");

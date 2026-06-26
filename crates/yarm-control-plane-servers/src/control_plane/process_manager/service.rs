@@ -231,6 +231,16 @@ const CRASH_TEST_SRV_NAME: &[u8] = b"crash_test_srv";
 #[allow(dead_code)]
 const CRASH_TEST_DEFAULT_MAX_RESTARTS: u16 = 3;
 const PM_CRASH_TEST_RESTART_SPEC_MAX: usize = 2;
+const PM_CRASH_TEST_RESTART_TOKEN_TAG: u64 = 0x4352_4153_4854_0000;
+
+fn supervisor_restart_test_build_gate_enabled() -> bool {
+    option_env!("YARM_SUPERVISOR_RESTART_TEST") == Some("1")
+        || option_env!("SUPERVISOR_RESTART_TEST") == Some("1")
+}
+
+fn crash_test_restart_token_for_tid(tid: u64) -> u64 {
+    PM_CRASH_TEST_RESTART_TOKEN_TAG | (tid & 0xffff)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CrashTestRestartSpec {
@@ -1542,6 +1552,11 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
 
 impl ProcessService {
     pub fn new() -> Self {
+        let supervisor_restart_test_enabled = supervisor_restart_test_build_gate_enabled();
+        #[cfg(not(test))]
+        if supervisor_restart_test_enabled {
+            yarm_user_rt::user_log!("PM_SUPERVISOR_RESTART_TEST_GATE_ON");
+        }
         Self {
             manager: KernelProcessManagerAdapter::new(),
             policy_records: [None; 64],
@@ -1549,8 +1564,8 @@ impl ProcessService {
             restart_control_send_cap: yarm_user_rt::runtime::startup_context()
                 .process_manager_restart_control_send_cap,
             lifecycle_table: LifecycleTable::new(),
-            pm_restart_mechanism_enabled: false,
-            supervisor_restart_test_enabled: false,
+            pm_restart_mechanism_enabled: supervisor_restart_test_enabled,
+            supervisor_restart_test_enabled,
             sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection::None,
             pm_restart_in_progress: [None; PM_RESTART_MAX_IN_PROGRESS],
             crash_test_restart_specs: [None; PM_CRASH_TEST_RESTART_SPEC_MAX],
@@ -1983,6 +1998,14 @@ impl ProcessService {
                     // spawner_cap:  non-zero only when parent_pid != 0; this is PM's own
                     //               copy of the service send cap (high 32 bits of ret2).
                     // pm_send_cap:  whichever of the above lives in PM's own CNode.
+                    if self.supervisor_restart_test_enabled
+                        && req.image_id == CRASH_TEST_SRV_IMAGE_ID
+                    {
+                        yarm_user_rt::user_log!(
+                            "PM_CRASH_TEST_SPAWN_REQUEST image_id={}",
+                            req.image_id
+                        );
+                    }
                     let source = resolve_spawn_load_source_with_restart_test(
                         req.image_id,
                         self.supervisor_restart_test_enabled,
@@ -2081,6 +2104,23 @@ impl ProcessService {
                         req.parent_pid.0,
                         recorded as u8
                     );
+                    if self.supervisor_restart_test_enabled
+                        && req.image_id == CRASH_TEST_SRV_IMAGE_ID
+                    {
+                        yarm_user_rt::user_log!("PM_CRASH_TEST_SPAWN_OK tid={}", tid);
+                        yarm_user_rt::user_log!(
+                            "PM_CRASH_TEST_LIFECYCLE_RECORDED tid={} image_id={}",
+                            tid,
+                            CRASH_TEST_SRV_IMAGE_ID
+                        );
+                        let token = crash_test_restart_token_for_tid(tid);
+                        let _ = self.record_restart_token(tid, token);
+                        yarm_user_rt::user_log!(
+                            "PM_CRASH_TEST_RESTART_TOKEN_RECORDED tid={} fingerprint={}",
+                            tid,
+                            (token & 0xffff) as u16
+                        );
+                    }
                     let encoded = encode_spawn_v5_reply(tid, caller_cap);
                     yarm_user_rt::user_log!(
                         "PM_SPAWN_V5_CAP_REPLY tid={} caller_cap={} pm_send_cap={} len={}",
@@ -2333,8 +2373,11 @@ impl ProcessService {
         &mut self,
         original: ServiceLifecycleRecord,
     ) -> Result<u64, ProcessManagerError> {
-        if original.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID
-            || resolve_spawn_load_source(original.image_id)? != SpawnLoadSource::DirectInitrd
+        let crash_test_restart_supported =
+            self.supervisor_restart_test_enabled && original.image_id == CRASH_TEST_SRV_IMAGE_ID;
+        if !crash_test_restart_supported
+            && (original.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID
+                || resolve_spawn_load_source(original.image_id)? != SpawnLoadSource::DirectInitrd)
         {
             return Err(ProcessManagerError::Unsupported);
         }
@@ -2350,6 +2393,27 @@ impl ProcessService {
         }
         #[cfg(not(test))]
         {
+            if crash_test_restart_supported {
+                let vfs_send_cap = self
+                    .lifecycle_table
+                    .get_by_image_id(6)
+                    .map(|rec| rec.pm_service_send_cap)
+                    .unwrap_or(0);
+                if vfs_send_cap == 0 {
+                    return Err(ProcessManagerError::Unsupported);
+                }
+                let startup_args = [0u64; 18];
+                let (tid, _, _) = unsafe {
+                    pm_vfs_spawn_inline(
+                        original.image_id,
+                        original.parent_tid,
+                        &startup_args,
+                        vfs_send_cap,
+                        self.supervisor_restart_test_enabled,
+                    )
+                }?;
+                return Ok(tid);
+            }
             let backend = KernelProcessSpawnBackend::new();
             backend.spawn(original.image_id, original.parent_tid)
         }
@@ -2481,7 +2545,11 @@ impl ProcessService {
             );
         }
         yarm_user_rt::user_log!("PM_RESTART_MECHANISM_GATE_ON");
-        if target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID {
+        let crash_test_restart_supported = self.supervisor_restart_test_enabled
+            && target_record.image_id == CRASH_TEST_SRV_IMAGE_ID;
+        if target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID
+            && !crash_test_restart_supported
+        {
             yarm_user_rt::user_log!(
                 "PM_RESTART_MECHANISM_DEFERRED reason=unsupported_service image_id={}",
                 target_record.image_id
@@ -2494,7 +2562,9 @@ impl ProcessService {
                 request.due_tick,
             );
         }
-        if resolve_spawn_load_source(target_record.image_id)? != SpawnLoadSource::DirectInitrd {
+        if !crash_test_restart_supported
+            && resolve_spawn_load_source(target_record.image_id)? != SpawnLoadSource::DirectInitrd
+        {
             yarm_user_rt::user_log!("PM_RESTART_MECHANISM_DEFERRED reason=missing_restart_spec");
             return Self::pm_restart_reply(
                 AbiPmRestartReplyStatus::Deferred,
@@ -2585,6 +2655,21 @@ impl ProcessService {
                 request.request_id,
                 request.target_tid,
                 "lifecycle_record",
+            );
+        }
+        if self.supervisor_restart_test_enabled && target_record.image_id == CRASH_TEST_SRV_IMAGE_ID
+        {
+            yarm_user_rt::user_log!(
+                "PM_CRASH_TEST_LIFECYCLE_RECORDED tid={} image_id={}",
+                replacement_tid,
+                CRASH_TEST_SRV_IMAGE_ID
+            );
+            let token = crash_test_restart_token_for_tid(replacement_tid);
+            let _ = self.record_restart_token(replacement_tid, token);
+            yarm_user_rt::user_log!(
+                "PM_CRASH_TEST_RESTART_TOKEN_RECORDED tid={} fingerprint={}",
+                replacement_tid,
+                (token & 0xffff) as u16
             );
         }
         if self

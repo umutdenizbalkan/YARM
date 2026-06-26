@@ -58,6 +58,11 @@ const SUPERVISOR_FAULT_EXIT_CODE_TAG: u64 = 0xF000_0000_0000_0000u64;
 const SUPERVISOR_FAULT_EXIT_CODE_ACCESS_SHIFT: u64 = 56;
 const SUPERVISOR_FAULT_EXIT_CODE_ADDR_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
+fn supervisor_restart_test_build_gate_enabled() -> bool {
+    option_env!("YARM_SUPERVISOR_RESTART_TEST") == Some("1")
+        || option_env!("SUPERVISOR_RESTART_TEST") == Some("1")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaultAccess {
     Read = 0,
@@ -549,11 +554,12 @@ impl SupervisorService {
         runtime_handoff: SupervisorRuntimeHandoff,
     ) -> Result<Self, KernelError> {
         let (init_tid, handoff) = runtime_handoff.into_fault_handoff()?;
-        Ok(Self::new(
-            init_tid,
-            handoff,
-            CoreServicePolicyTable::baseline(),
-        ))
+        let mut service = Self::new(init_tid, handoff, CoreServicePolicyTable::baseline());
+        if supervisor_restart_test_build_gate_enabled() {
+            service.pm_restart_acceptance_enabled = true;
+            yarm_user_rt::user_log!("SUPERVISOR_RESTART_TEST_GATE_ON");
+        }
+        Ok(service)
     }
 
     pub const fn degraded(&self) -> bool {
@@ -805,6 +811,12 @@ impl SupervisorService {
             record.pending_restart_reason.as_pm_reason(),
             record.pending_restart_reason.dependency_cause_tid()
         );
+        #[cfg(not(test))]
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_RESTART_SCHEDULED attempt={} max={}",
+            record.restart_attempts,
+            policy.max_restarts
+        );
         Ok(record.pending_restart_due.expect("due set"))
     }
 
@@ -865,6 +877,16 @@ impl SupervisorService {
                         iova_len: req.iova_len as usize,
                     },
                 )?;
+                if supervisor_restart_test_build_gate_enabled()
+                    && req.max_restarts == 3
+                    && req.restart_group == 13
+                {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
+                        req.tid
+                    );
+                    yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_POLICY max_restarts=3");
+                }
             }
             SUPERVISOR_OP_QUERY_STATUS => {
                 let req = SupervisorStatusRequest::decode(request.as_slice())
@@ -960,6 +982,9 @@ impl SupervisorService {
                     record.restart_deferred_by_pm = false;
                     record.restart_rejected_by_pm = false;
                     record.restart_deferred_no_pm_client_logged = false;
+                    if replacement_handle_value != 0 {
+                        record.tid = replacement_handle_value;
+                    }
                     record.pm_restart_state = SupervisorPmRestartState::RestartAccepted;
                     self.degraded = false;
                     #[cfg(not(test))]
@@ -1322,6 +1347,13 @@ impl SupervisorService {
             exhausted
         };
         if within_window_exhausted {
+            #[cfg(not(test))]
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_RESTART_LIMIT_EXCEEDED attempts={}",
+                policy.max_restarts
+            );
+            #[cfg(not(test))]
+            yarm_user_rt::user_log!("SUPERVISOR_SERVICE_DEGRADED_FINAL");
             self.degraded = true;
             let mark_result = task_exit_ops.mark_task_dead(event.tid);
             let alert_result = self.send_init_alert(
@@ -1656,6 +1688,11 @@ pub fn run() {
                                                 fault.tid,
                                             ) {
                                                 Ok(Some(restart_token)) => {
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
+                                                        fault.tid,
+                                                        (restart_token & 0xffff) as u16
+                                                    );
                                                     let event = TaskExitedEvent {
                                                         tid: fault.tid,
                                                         exit_code: fault.synthetic_exit_code(),
