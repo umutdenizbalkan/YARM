@@ -2849,8 +2849,31 @@ unsafe fn pm_vfs_spawn_inline(
         }?,
         None => unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?,
     };
+    let first4 = [
+        image.first().copied().unwrap_or(0),
+        image.get(1).copied().unwrap_or(0),
+        image.get(2).copied().unwrap_or(0),
+        image.get(3).copied().unwrap_or(0),
+    ];
+    yarm_user_rt::user_log!(
+        "PM_VFS_SPAWN_LOAD_REPLY image_id={} status=ok len={}",
+        image_id,
+        image.len()
+    );
+    yarm_user_rt::user_log!(
+        "PM_VFS_SPAWN_LOAD_FIRST4 image_id={} bytes=[{:02x} {:02x} {:02x} {:02x}]",
+        image_id,
+        first4[0],
+        first4[1],
+        first4[2],
+        first4[3]
+    );
     if image.is_empty() {
         yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode err=empty-elf",
+            image_id
+        );
         return Err(ProcessManagerError::Malformed);
     }
     // Verify ELF magic before attempting spawn.
@@ -2861,8 +2884,13 @@ unsafe fn pm_vfs_spawn_inline(
             image_id,
             &image[..first4_end]
         );
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=elf_parse err=bad-elf-magic",
+            image_id
+        );
         return Err(ProcessManagerError::Malformed);
     }
+    yarm_user_rt::user_log!("PM_VFS_SPAWN_ELF_MAGIC_OK image_id={}", image_id);
     yarm_user_rt::user_log!(
         "PM_VFS_SPAWN_FROM_VFS_BYTES image_id={} len={} first4={:x?}",
         image_id,
@@ -2902,6 +2930,11 @@ unsafe fn pm_vfs_spawn_inline(
         }
         Err(e) => {
             yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err={:?}", image_id, e);
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
+                image_id,
+                e
+            );
             Err(ProcessManagerError::TableFull)
         }
     }
@@ -3095,6 +3128,11 @@ unsafe fn pm_try_grant_ro_and_spawn(
                     image_id,
                     e
                 );
+                yarm_user_rt::user_log!(
+                    "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create err={:?}",
+                    image_id,
+                    e
+                );
                 // Close fd on error.
                 if let Ok(close_msg) = build_close_message(fd) {
                     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -3111,6 +3149,10 @@ unsafe fn pm_try_grant_ro_and_spawn(
             grant_reply.opcode,
             transferred_cap.is_some()
         );
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create err=grant_ro_unsupported",
+            image_id
+        );
         if let Ok(close_msg) = build_close_message(fd) {
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
         }
@@ -3123,6 +3165,12 @@ unsafe fn pm_try_grant_ro_and_spawn(
     let reply_payload = grant_reply.as_slice();
     let file_grant_reply = yarm_ipc_abi::vfs_abi::FileGrantRoReply::decode(reply_payload);
     let file_len = file_grant_reply.map(|r| r.file_len).unwrap_or(0);
+    if file_grant_reply.is_none() {
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode err=grant_ro_reply_decode",
+            image_id
+        );
+    }
 
     yarm_user_rt::user_log!(
         "PM_VFS_GRANT_RO_RECEIVED image_id={} len={} cap={}",
@@ -3160,11 +3208,20 @@ unsafe fn pm_try_grant_ro_and_spawn(
                 "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_unsupported",
                 image_id
             );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo err=unsupported",
+                image_id
+            );
             Err(ProcessManagerError::Unsupported)
         }
         Err(e) => {
             yarm_user_rt::user_log!(
                 "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_err err={:?}",
+                image_id,
+                e
+            );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
                 image_id,
                 e
             );

@@ -34,9 +34,10 @@ pub const INITRAMFS_VIRTIO_BLK_PATH: &[u8] = b"/initramfs/sbin/virtio_blk_srv";
 pub const INITRAMFS_FAT_SRV_PATH: &[u8] = b"/initramfs/sbin/fat_srv";
 pub const INITRAMFS_RAMFS_SRV_PATH: &[u8] = b"/initramfs/sbin/ramfs_srv";
 pub const INITRAMFS_EXT4_SRV_PATH: &[u8] = b"/initramfs/sbin/ext4_srv";
+pub const INITRAMFS_CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv";
 
 const MAX_INITRAMFS_HANDLES: usize = 16;
-const MAX_INITRAMFS_INODES: usize = 14;
+const MAX_INITRAMFS_INODES: usize = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InitramfsInode {
@@ -139,6 +140,10 @@ impl InitramfsBackend {
                     path: INITRAMFS_EXT4_SRV_PATH,
                     file_len: 1536,
                 }),
+                Some(InitramfsInode {
+                    path: INITRAMFS_CRASH_TEST_SRV_PATH,
+                    file_len: 0,
+                }),
             ],
             metrics: InitramfsMetrics {
                 open_count: 0,
@@ -177,6 +182,7 @@ impl InitramfsBackend {
                 b"sbin/fat_srv" => INITRAMFS_FAT_SRV_PATH,
                 b"sbin/ramfs_srv" => INITRAMFS_RAMFS_SRV_PATH,
                 b"sbin/ext4_srv" => INITRAMFS_EXT4_SRV_PATH,
+                b"sbin/crash_test_srv" => INITRAMFS_CRASH_TEST_SRV_PATH,
                 _ => continue,
             };
             if let Some(idx) = backend.lookup_slot(path) {
@@ -203,6 +209,10 @@ impl InitramfsBackend {
 
     fn lookup_by_path(&self, path: &[u8]) -> Result<usize, VfsError> {
         self.lookup_slot(path).ok_or(VfsError::InvalidPath)
+    }
+
+    fn is_crash_test_path(path: &[u8]) -> bool {
+        path == INITRAMFS_CRASH_TEST_SRV_PATH || path == b"/sbin/crash_test_srv"
     }
 
     fn inode_for_fd(&self, fd: u64) -> Result<InitramfsInode, VfsError> {
@@ -233,6 +243,25 @@ impl InitramfsBackend {
     pub fn file_len_for_fd(&self, fd: u64) -> Option<u64> {
         let inode = self.inode_for_fd(fd).ok()?;
         Some(inode.file_len)
+    }
+
+    pub fn cpio_debug_info_for_fd(&self, fd: u64) -> Option<(usize, usize, [u8; 4])> {
+        let inode = self.inode_for_fd(fd).ok()?;
+        let cpio = self.cpio?;
+        let name = inode
+            .path
+            .strip_prefix(b"/initramfs/")
+            .unwrap_or(inode.path);
+        let entry = CpioArchive::new(cpio)
+            .find(core::str::from_utf8(name).ok()?)
+            .ok()
+            .flatten()?;
+        let data = entry.file_data();
+        let mut first4 = [0u8; 4];
+        let n = core::cmp::min(data.len(), first4.len());
+        first4[..n].copy_from_slice(&data[..n]);
+        let offset = (data.as_ptr() as usize).saturating_sub(cpio.as_ptr() as usize);
+        Some((data.len(), offset, first4))
     }
 
     fn alloc_handle(&mut self, inode_idx: usize) -> Result<u64, VfsError> {
@@ -268,7 +297,10 @@ impl InitramfsBackend {
     fn is_late_exec_path(path: &[u8]) -> bool {
         matches!(
             path,
-            INITRAMFS_DRIVER_MANAGER_PATH | INITRAMFS_BLKCACHE_PATH | INITRAMFS_VIRTIO_BLK_PATH
+            INITRAMFS_DRIVER_MANAGER_PATH
+                | INITRAMFS_BLKCACHE_PATH
+                | INITRAMFS_VIRTIO_BLK_PATH
+                | INITRAMFS_CRASH_TEST_SRV_PATH
         )
     }
 
@@ -292,6 +324,10 @@ impl InitramfsBackend {
 
 impl VfsBackend for InitramfsBackend {
     fn openat_path(&mut self, path: &[u8]) -> Result<u64, VfsError> {
+        if Self::is_crash_test_path(path) {
+            let display = core::str::from_utf8(path).unwrap_or("<path-bytes>");
+            yarm_user_rt::user_log!("INITRAMFS_LOOKUP_BEGIN path={}", display);
+        }
         if let Err(err) = self.reject_placeholder_exec_path(path) {
             self.metrics.error_count = self.metrics.error_count.saturating_add(1);
             return Err(err);
@@ -302,6 +338,19 @@ impl VfsBackend for InitramfsBackend {
         {
             Ok(fd) => {
                 self.metrics.open_count = self.metrics.open_count.saturating_add(1);
+                if Self::is_crash_test_path(path) {
+                    if let Some(handle) =
+                        self.handles.iter().flatten().find(|handle| handle.fd == fd)
+                    {
+                        if let Some(inode) = self.inodes[handle.inode_idx] {
+                            yarm_user_rt::user_log!(
+                                "INITRAMFS_LOOKUP_HIT path=sbin/crash_test_srv size={} offset={}",
+                                inode.file_len,
+                                0
+                            );
+                        }
+                    }
+                }
                 Ok(fd)
             }
             Err(err) => {
@@ -356,6 +405,8 @@ impl VfsBackend for InitramfsBackend {
         else {
             return Ok((0, 0));
         };
+        let entry_offset =
+            (entry.file_data().as_ptr() as usize).saturating_sub(cpio.as_ptr() as usize);
         let handle = self
             .handles
             .iter_mut()
@@ -370,6 +421,28 @@ impl VfsBackend for InitramfsBackend {
         let n = core::cmp::min(want, data.len() - handle.cursor);
         out[..n].copy_from_slice(&data[handle.cursor..handle.cursor + n]);
         handle.cursor += n;
+        if inode.path == INITRAMFS_CRASH_TEST_SRV_PATH {
+            let b0 = out.first().copied().unwrap_or(0);
+            let b1 = out.get(1).copied().unwrap_or(0);
+            let b2 = out.get(2).copied().unwrap_or(0);
+            let b3 = out.get(3).copied().unwrap_or(0);
+            yarm_user_rt::user_log!(
+                "INITRAMFS_READ_DONE path=sbin/crash_test_srv bytes={} first4=[{:02x} {:02x} {:02x} {:02x}]",
+                n,
+                b0,
+                b1,
+                b2,
+                b3
+            );
+            if n >= 4 && &out[..4] == b"\x7fELF" {
+                yarm_user_rt::user_log!("INITRAMFS_READ_ELF_MAGIC_OK path=sbin/crash_test_srv");
+            }
+            yarm_user_rt::user_log!(
+                "INITRAMFS_LOOKUP_HIT path=sbin/crash_test_srv size={} offset={}",
+                data.len(),
+                entry_offset
+            );
+        }
         self.metrics.read_count = self.metrics.read_count.saturating_add(1);
         self.metrics.bytes_read = self.metrics.bytes_read.saturating_add(n as u64);
         Ok((n as u64, n))

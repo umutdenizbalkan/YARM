@@ -59,6 +59,12 @@ fn build_runtime_backend() -> (InitramfsBackend, InitramfsBackendSource, usize) 
                 .flatten()
                 .filter(|e| e.is_regular_file())
                 .count();
+            yarm_user_rt::user_log!(
+                "INITRAMFS_CPIO_ENTRY_COUNT count={} cap={} truncated={}",
+                entries,
+                15,
+                (entries > 15) as u8
+            );
             if entries == 0 {
                 let mut first6 = [0u8; 6];
                 let first6_len = core::cmp::min(cpio.len(), first6.len());
@@ -266,6 +272,11 @@ pub fn run() {
                             let file_len_opt = svc.backend().file_len_for_fd(args.fd);
                             match (cpio_name_opt, file_len_opt) {
                                 (Some(cpio_name), Some(file_len)) => {
+                                    let crash_debug = if cpio_name == b"sbin/crash_test_srv" {
+                                        svc.backend().cpio_debug_info_for_fd(args.fd)
+                                    } else {
+                                        None
+                                    };
                                     let max_len = core::cmp::min(args.requested_len as usize, 4096);
                                     // SAFETY: initramfs_write_to_pm_buf delegates to kernel
                                     // syscall nr=27 with arg5=PM_BOOTSTRAP_TID (3), which writes
@@ -281,6 +292,26 @@ pub fn run() {
                                     };
                                     match result {
                                         Ok(copied_len) => {
+                                            if let Some((size, offset, first4)) = crash_debug {
+                                                yarm_user_rt::user_log!(
+                                                    "INITRAMFS_LOOKUP_HIT path=sbin/crash_test_srv size={} offset={}",
+                                                    size,
+                                                    offset
+                                                );
+                                                yarm_user_rt::user_log!(
+                                                    "INITRAMFS_READ_DONE path=sbin/crash_test_srv bytes={} first4=[{:02x} {:02x} {:02x} {:02x}]",
+                                                    copied_len,
+                                                    first4[0],
+                                                    first4[1],
+                                                    first4[2],
+                                                    first4[3]
+                                                );
+                                                if first4 == *b"\x7fELF" {
+                                                    yarm_user_rt::user_log!(
+                                                        "INITRAMFS_READ_ELF_MAGIC_OK path=sbin/crash_test_srv"
+                                                    );
+                                                }
+                                            }
                                             let eof = copied_len == 0
                                                 || args.offset.saturating_add(copied_len as u64)
                                                     >= file_len;
@@ -356,6 +387,30 @@ pub fn run() {
                                 let cpio_name_opt = svc.backend().cpio_name_for_fd(args.fd);
                                 match cpio_name_opt {
                                     Some(cpio_name) => {
+                                        if cpio_name == b"sbin/crash_test_srv" {
+                                            if let Some((size, offset, first4)) =
+                                                svc.backend().cpio_debug_info_for_fd(args.fd)
+                                            {
+                                                yarm_user_rt::user_log!(
+                                                    "INITRAMFS_LOOKUP_HIT path=sbin/crash_test_srv size={} offset={}",
+                                                    size,
+                                                    offset
+                                                );
+                                                yarm_user_rt::user_log!(
+                                                    "INITRAMFS_READ_DONE path=sbin/crash_test_srv bytes={} first4=[{:02x} {:02x} {:02x} {:02x}]",
+                                                    size,
+                                                    first4[0],
+                                                    first4[1],
+                                                    first4[2],
+                                                    first4[3]
+                                                );
+                                                if first4 == *b"\x7fELF" {
+                                                    yarm_user_rt::user_log!(
+                                                        "INITRAMFS_READ_ELF_MAGIC_OK path=sbin/crash_test_srv"
+                                                    );
+                                                }
+                                            }
+                                        }
                                         // Create InitramfsFileSlice MemoryObject via kernel syscall nr=28.
                                         // SAFETY: cpio_name is a static/long-lived byte slice from the CPIO archive.
                                         let result = unsafe {

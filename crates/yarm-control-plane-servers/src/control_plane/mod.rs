@@ -2709,6 +2709,10 @@ mod tests {
         let init_src = include_str!("init/service.rs");
         let pm_src = include_str!("process_manager/service.rs");
         let supervisor_src = include_str!("supervisor/service.rs");
+        let initramfs_archive_src =
+            include_str!("../../../yarm-fs-servers/src/fs/initramfs/archive.rs");
+        let initramfs_service_src =
+            include_str!("../../../yarm-fs-servers/src/fs/initramfs/service.rs");
         let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
 
         for needle in &[
@@ -2732,12 +2736,36 @@ mod tests {
             "PM_CRASH_TEST_SPAWN_OK tid={}",
             "PM_CRASH_TEST_LIFECYCLE_RECORDED tid={} image_id={}",
             "PM_CRASH_TEST_RESTART_TOKEN_RECORDED tid={} fingerprint={}",
+            "PM_VFS_SPAWN_LOAD_REPLY image_id={} status=ok len={}",
+            "PM_VFS_SPAWN_LOAD_FIRST4 image_id={} bytes=[{:02x} {:02x} {:02x} {:02x}]",
+            "PM_VFS_SPAWN_ELF_MAGIC_OK image_id={}",
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode",
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create",
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo",
             "crash_test_restart_token_for_tid",
             "target_record.image_id == CRASH_TEST_SRV_IMAGE_ID",
             "pm_vfs_spawn_inline(",
         ] {
             assert!(pm_src.contains(needle), "PM source must contain {needle}");
         }
+        for needle in &[
+            "INITRAMFS_CRASH_TEST_SRV_PATH",
+            "b\"sbin/crash_test_srv\" => INITRAMFS_CRASH_TEST_SRV_PATH",
+            "INITRAMFS_LOOKUP_BEGIN path={}",
+            "INITRAMFS_LOOKUP_HIT path=sbin/crash_test_srv size={} offset={}",
+            "INITRAMFS_READ_DONE path=sbin/crash_test_srv bytes={} first4=[{:02x} {:02x} {:02x} {:02x}]",
+            "INITRAMFS_READ_ELF_MAGIC_OK path=sbin/crash_test_srv",
+        ] {
+            assert!(
+                initramfs_archive_src.contains(needle) || initramfs_service_src.contains(needle),
+                "initramfs source must contain {needle}"
+            );
+        }
+        assert!(
+            initramfs_service_src
+                .contains("INITRAMFS_CPIO_ENTRY_COUNT count={} cap={} truncated={}"),
+            "initramfs runtime must log CPIO entry count/cap/truncation"
+        );
         for needle in &[
             "SUPERVISOR_RESTART_TEST_GATE_ON",
             "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
