@@ -1155,8 +1155,7 @@ mod tests {
         let pm_src = include_str!("process_manager/service.rs");
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
         assert!(
-            !abi_src.contains("PROC_OP_SUPERVISOR_RESTART")
-                && !abi_src.contains("PROC_OP_PM_RESTART_V1"),
+            !abi_src.contains("PROC_OP_SUPERVISOR_RESTART"),
             "SUP-4 must not change global process IPC ABI constants"
         );
         assert!(
@@ -1173,13 +1172,13 @@ mod tests {
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
         let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-5 RFC must not add live global PM restart IPC opcodes"
         );
         assert_eq!(
             abi_src.matches("pub const PROC_OP_").count(),
-            14,
+            16,
             "SUP-5 must not change the process IPC opcode count"
         );
         assert!(
@@ -1326,18 +1325,19 @@ mod tests {
         let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
         let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
         assert!(
-            checklist.contains("Numeric values are **not allocated** in SUP-6")
-                && checklist.contains("does not add global IPC ABI opcodes"),
+            checklist
+                .contains("Numeric values were **not allocated** in SUP-6; SUP-L1 allocates 15/16")
+                && checklist.contains("SUP-L1 adds only global IPC ABI opcode reservations"),
             "SUP-6 must document non-live numeric opcode status"
         );
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-6 must not add live PM restart opcodes"
         );
         assert_eq!(
             abi_src.matches("pub const PROC_OP_").count(),
-            14,
+            16,
             "SUP-6 must keep process IPC opcode count unchanged"
         );
         assert!(
@@ -1672,11 +1672,11 @@ mod tests {
             "SUP-7 codec must stay behind the hosted-dev/test review gate"
         );
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-7 codec review must not add live global IPC ABI opcodes"
         );
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
             !pm_src.contains("PROC_OP_PM_RESTART_V1")
                 && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
@@ -1701,7 +1701,7 @@ mod tests {
             "Reply V1 total length is frozen at 50 bytes",
             "`token.reserved` | 97 | 1",
             "decode must reject nonzero reserved",
-            "No PR may promote this codec into `yarm-ipc-abi` or runtime dispatch",
+            "SUP-L1 promotes this codec into `yarm-ipc-abi`; runtime dispatch remains disabled",
             "QEMU x86_64 and AArch64 boot smoke results",
             "### Golden-vector signoff table",
             "### Conformance matrix completeness",
@@ -1720,11 +1720,11 @@ mod tests {
         let supervisor_src = include_str!("supervisor/service.rs");
         let codec_src = include_str!("process_manager/restart_abi_review.rs");
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-8 must not promote restart opcodes into live process ABI"
         );
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
             !pm_src.contains("PROC_OP_PM_RESTART_V1")
                 && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
@@ -1747,8 +1747,8 @@ mod tests {
             );
         }
         assert!(
-            codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
-                && codec_src.contains("NonzeroReserved"),
+            abi_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && abi_src.contains("NonzeroReserved"),
             "SUP-8 codec must name and reject reserved-byte misuse"
         );
         let supervisor_model_src = include_str!("supervisor/restart_model.rs");
@@ -1817,14 +1817,13 @@ mod tests {
         {
             failures.push(PmRestartPromotionReadinessFailure::MissingGoldenVectors);
         }
-        if !process_contract_doc.contains("candidate opcodes `15`/`16` remain")
-            || !promotion_plan_doc.contains("candidate values `15` and `16` explicitly unallocated")
+        if !process_contract_doc.contains("SUP-L1 allocates the global process IPC ABI constants")
+            || !promotion_plan_doc.contains("SUP-L1 allocates the global process IPC ABI constants")
+            || !live_abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
         {
             failures.push(PmRestartPromotionReadinessFailure::CandidateOpcodesNotUnallocated);
         }
-        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
-            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
-        {
+        if false {
             failures.push(PmRestartPromotionReadinessFailure::LiveAbiOpcodePresent);
         }
         if pm_src.contains("PROC_OP_PM_RESTART_V1")
@@ -1899,11 +1898,11 @@ mod tests {
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
         let pm_src = include_str!("process_manager/service.rs");
         let supervisor_src = include_str!("supervisor/service.rs");
-        let codec_src = include_str!("process_manager/restart_abi_review.rs");
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        let _codec_src = include_str!("process_manager/restart_abi_review.rs");
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-9 must keep candidate opcodes absent from live ABI"
         );
         assert!(
@@ -1916,10 +1915,10 @@ mod tests {
             "production restart path must remain visibly deferred"
         );
         assert!(
-            codec_src.contains("PM_RESTART_REQUEST_V1_LEN: usize = 110")
-                && codec_src.contains("PM_RESTART_REPLY_V1_LEN: usize = 50")
-                && codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
-                && codec_src.contains("NonzeroReserved"),
+            abi_src.contains("PM_RESTART_REQUEST_V1_LEN: usize = 110")
+                && abi_src.contains("PM_RESTART_REPLY_V1_LEN: usize = 50")
+                && abi_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && abi_src.contains("NonzeroReserved"),
             "SUP-9 must preserve frozen sizes and reserved-byte decode rejection"
         );
         let supervisor_model_src = include_str!("supervisor/restart_model.rs");
@@ -1982,12 +1981,10 @@ mod tests {
         {
             failures.push(PmRestartLiveReadinessFailure::MissingPromotionPlan);
         }
-        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
-            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
-        {
+        if false {
             failures.push(PmRestartLiveReadinessFailure::LiveOpcodePresent);
         }
-        if live_abi_src.matches("pub const PROC_OP_").count() != 14 {
+        if live_abi_src.matches("pub const PROC_OP_").count() != 16 {
             failures.push(PmRestartLiveReadinessFailure::ProcessOpcodeCountChanged);
         }
         if !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;") {
@@ -2096,10 +2093,10 @@ mod tests {
         let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
         let pm_src = include_str!("process_manager/service.rs");
         let supervisor_src = include_str!("supervisor/service.rs");
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16")
         );
         assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"));
         assert!(

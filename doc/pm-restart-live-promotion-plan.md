@@ -16,7 +16,7 @@ package before any runtime path is enabled.
 ### 1. ABI approval
 
 1. Approve numeric opcode allocation for the request and reply opcodes. SUP-9
-   keeps candidate values `15` and `16` explicitly unallocated.
+   keeps allocated values `15` and `16` explicitly reserved.
 2. Re-approve Request V1 at 110 bytes and Reply V1 at 50 bytes from
    `doc/process-manager-restart-contract.md`.
 3. Promote the reviewed codec into the global process IPC ABI source only after
@@ -148,3 +148,19 @@ SUP-10 adds `doc/pm-restart-live-readiness-evidence.md` with the live-readiness
 evidence matrix, go/no-go report model, and exact future diff plan. SUP-10 is not
 live implementation and does not allocate opcodes, dispatch PM restart requests,
 or enable supervisor PM restart sends.
+
+## SUP-L1 ABI reservation status
+
+SUP-L1 allocates the global process IPC ABI constants `PROC_OP_PM_RESTART_V1 = 15`
+and `PROC_OP_PM_RESTART_REPLY_V1 = 16` and promotes the reviewed fixed-size
+Request V1 / Reply V1 codecs into the shared process IPC ABI layer. Before
+SUP-L1 the process IPC opcode count was 14; after SUP-L1 it is 16 because the
+restart request/reply numbers are allocated.
+
+This is an ABI reservation/promotion only. PM runtime dispatch remains disabled,
+the supervisor PM restart send path remains disabled, and the PM restart
+mechanism remains unimplemented. PM must reject/defer any restart request until
+later live-gated work. The next stage, SUP-L2, is limited to PM decode and
+validation only and still must not restart, spawn, tear down tasks, allocate
+address spaces, mint/revoke caps, grant MMIO/IRQ/DMA, perform MMIO, or fake PM
+restart success.

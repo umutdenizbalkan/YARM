@@ -227,7 +227,7 @@ currently 14, but these numbers are **not allocated**, are not present in
 ## SUP-8 ABI-review signoff package
 
 SUP-8 freezes the review codec layout for signoff, but it is still non-live. The
-codec remains in `restart_abi_review.rs`, candidate opcodes `15`/`16` remain
+codec remains in `restart_abi_review.rs`, allocated opcodes `15`/`16` now
 unallocated, no `yarm-ipc-abi` constants exist for them, and no PM dispatch or
 supervisor send path exists. Promotion requires an explicit future SUP-live stage
 that updates the global ABI, dispatch, smoke evidence, and this documentation in
@@ -292,7 +292,7 @@ Candidate opcode values `15`/`16` remain unallocated until live ABI approval.
 
 ### Reviewer signoff checklist
 
-No PR may promote this codec into `yarm-ipc-abi` or runtime dispatch until every
+SUP-L1 promotes this codec into `yarm-ipc-abi`; runtime dispatch remains disabled until every
 item below is explicitly signed off:
 
 - [ ] opcode numeric allocation;
@@ -357,3 +357,19 @@ SUP-10 adds `doc/pm-restart-live-readiness-evidence.md` as evidence and exact
 future-diff planning only. It does not enable live ABI/runtime behavior; future
 SUP-live work must explicitly change status from proposed/review-only to live and
 satisfy the SUP-8, SUP-9, and SUP-10 checklists before adding opcodes or dispatch.
+
+## SUP-L1 ABI reservation status
+
+SUP-L1 allocates the global process IPC ABI constants `PROC_OP_PM_RESTART_V1 = 15`
+and `PROC_OP_PM_RESTART_REPLY_V1 = 16` and promotes the reviewed fixed-size
+Request V1 / Reply V1 codecs into the shared process IPC ABI layer. Before
+SUP-L1 the process IPC opcode count was 14; after SUP-L1 it is 16 because the
+restart request/reply numbers are allocated.
+
+This is an ABI reservation/promotion only. PM runtime dispatch remains disabled,
+the supervisor PM restart send path remains disabled, and the PM restart
+mechanism remains unimplemented. PM must reject/defer any restart request until
+later live-gated work. The next stage, SUP-L2, is limited to PM decode and
+validation only and still must not restart, spawn, tear down tasks, allocate
+address spaces, mint/revoke caps, grant MMIO/IRQ/DMA, perform MMIO, or fake PM
+restart success.

@@ -282,3 +282,19 @@ PM dispatch, supervisor PM restart send path, restart/spawn/teardown,
 capability/resource behavior, MMIO/IRQ/DMA grant, syscall ABI change, or global
 IPC ABI change exists. Future live work should start at SUP-L1 rather than adding
 more review-only model expansion.
+
+## SUP-L1 ABI reservation status
+
+SUP-L1 allocates the global process IPC ABI constants `PROC_OP_PM_RESTART_V1 = 15`
+and `PROC_OP_PM_RESTART_REPLY_V1 = 16` and promotes the reviewed fixed-size
+Request V1 / Reply V1 codecs into the shared process IPC ABI layer. Before
+SUP-L1 the process IPC opcode count was 14; after SUP-L1 it is 16 because the
+restart request/reply numbers are allocated.
+
+This is an ABI reservation/promotion only. PM runtime dispatch remains disabled,
+the supervisor PM restart send path remains disabled, and the PM restart
+mechanism remains unimplemented. PM must reject/defer any restart request until
+later live-gated work. The next stage, SUP-L2, is limited to PM decode and
+validation only and still must not restart, spawn, tear down tasks, allocate
+address spaces, mint/revoke caps, grant MMIO/IRQ/DMA, perform MMIO, or fake PM
+restart success.

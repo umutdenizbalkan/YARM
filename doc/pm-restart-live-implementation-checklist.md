@@ -4,7 +4,7 @@
 # PM restart live-implementation checklist and conformance matrix (SUP-6)
 
 SUP-6 is not a live restart implementation. It adds review and conformance
-artifacts only. It does not add global IPC ABI opcodes, does not change syscall
+artifacts only. It SUP-L1 adds only global IPC ABI opcode reservations, does not change syscall
 ABI, does not wire supervisor-to-PM restart IPC, and does not create/restart/tear
 down tasks, allocate address spaces, mint/revoke capabilities, grant MMIO/IRQ/DMA,
 or perform MMIO. Future SUP-7/live work must pass this checklist before enabling
@@ -135,7 +135,7 @@ this table.
 ## Numeric opcode candidates (not allocated)
 
 The candidate opcode names are `PROC_OP_PM_RESTART_V1` and
-`PROC_OP_PM_RESTART_REPLY_V1`. Numeric values are **not allocated** in SUP-6.
+`PROC_OP_PM_RESTART_REPLY_V1`. Numeric values were **not allocated** in SUP-6; SUP-L1 allocates 15/16.
 Candidate selection for a future ABI review must:
 
 - avoid collision with the current process IPC opcode count of 14;
@@ -211,3 +211,19 @@ SUP-10 adds `doc/pm-restart-live-readiness-evidence.md`, mapping current evidenc
 to missing live proof and spelling out the exact future diff plan. SUP-10 does
 not enable live ABI/runtime behavior; future SUP-live work must explicitly change
 status from proposed to live and satisfy all checklists.
+
+## SUP-L1 ABI reservation status
+
+SUP-L1 allocates the global process IPC ABI constants `PROC_OP_PM_RESTART_V1 = 15`
+and `PROC_OP_PM_RESTART_REPLY_V1 = 16` and promotes the reviewed fixed-size
+Request V1 / Reply V1 codecs into the shared process IPC ABI layer. Before
+SUP-L1 the process IPC opcode count was 14; after SUP-L1 it is 16 because the
+restart request/reply numbers are allocated.
+
+This is an ABI reservation/promotion only. PM runtime dispatch remains disabled,
+the supervisor PM restart send path remains disabled, and the PM restart
+mechanism remains unimplemented. PM must reject/defer any restart request until
+later live-gated work. The next stage, SUP-L2, is limited to PM decode and
+validation only and still must not restart, spawn, tear down tasks, allocate
+address spaces, mint/revoke caps, grant MMIO/IRQ/DMA, perform MMIO, or fake PM
+restart success.
