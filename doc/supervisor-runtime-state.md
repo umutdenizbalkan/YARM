@@ -221,3 +221,63 @@ is added. The future expected sequence is:
 `SUPERVISOR_PM_RESTART_REPLY_RECV`, and
 `SUPERVISOR_PM_RESTART_STATE_UPDATED`. Full QEMU acceptance remains SUP-L5 before
 any broadening beyond direct-initrd image_id == 6.
+
+## SUP-L5 MissingImageId/MissingRestartSpec audit: crash-test workload blocked
+
+SUP-L5 audited the deterministic crash-test restart workload request and does **not**
+add `crash_test_srv` in this change. No crash-test image id is selected in SUP-L5
+because the current safe image-id contract has no unused direct-initrd service id
+that can be assigned without touching kernel or architecture code, and the hard
+rules forbid those changes.
+
+Spawn/image-id audit result:
+
+1. **Image id mappings:** PM classifies image ids `1..=6` as direct-initrd and
+   `7..=12` as VFS-backed. The concrete PM path table maps image ids 4, 5, and 6
+   to `/initramfs/sbin/initramfs_srv`, `/initramfs/sbin/devfs_srv`, and
+   `/initramfs/sbin/vfs_server`; ids 7 through 12 are late VFS-backed services.
+2. **Currently used image ids:** init currently spawns image ids 4, 5, 6, 7, 8,
+   9 and optional/test-gated filesystems at ids 10, 11, and 12. Existing PM
+   lifecycle bootstrap also seeds supervisor/init metadata outside the free
+   service range.
+3. **Crash-test image id:** none selected. Reusing image id 6 would make the VFS
+   service crash and would violate the warning not to repurpose a core service;
+   assigning id 13 would require a new spawn/load mapping and restart metadata
+   path that is not present under the no-kernel/no-arch/no-slot-invention rules.
+4. **PM spawn path:** current PM spawn uses `PROC_OP_SPAWN_V5_CAP`, then either
+   the direct-initrd kernel-backed spawn path for ids 1..=6 or the VFS-backed
+   `pm_vfs_spawn_inline` path for ids 7..=12. SUP-L5 does not duplicate or bypass
+   this path.
+5. **Lifecycle records:** PM records spawned services in `LifecycleTable` as
+   `ServiceLifecycleRecord { tid, image_id, parent_tid, pm_service_send_cap,
+   state }`.
+6. **Restart metadata:** the current narrow SUP-L4/SUP-L4A replacement path only
+   has enough PM-owned direct-initrd metadata for the explicitly gated supported
+   class. It does not store a separate crash-test restart spec, generation
+   counter, delay/mode config, or cap-bound restart authority for a new dummy
+   service.
+7. **Startup caps:** normal services rely on the existing PM/init startup-cap
+   conventions; SUP-L5 does not hard-code CNode slots, fabricate caps, or install
+   endpoint caps manually.
+8. **Replacement helper:** the only allowed replacement helper remains the
+   existing PM-owned direct-initrd helper used by the gated SUP-L4 path; no
+   generic restart-any-image helper is introduced.
+9. **Sufficiency:** current PM state is insufficient to restart a new dummy
+   service without inventing image-id mapping or restart metadata, so the correct
+   outcome is `MissingImageId` / `MissingRestartSpec` and no `Accepted` reply.
+
+Fail-closed behavior for this stage: the crash-test service is not staged into
+normal boot, no QEMU crash-restart smoke script is added, and no marker-count
+claim is made. The expected future workload remains: four
+`CRASH_TEST_SRV_ENTRY` markers for generations 1..4, exactly three
+`PM_RESTART_REPLY_ACCEPTED` markers, exactly three
+`SUPERVISOR_PM_RESTART_STATE_UPDATED` markers, then one
+`SUPERVISOR_RESTART_LIMIT_EXCEEDED attempts=3` and one
+`SUPERVISOR_SERVICE_DEGRADED_FINAL`. Until a safe image id and PM-owned restart
+metadata are added, `PM_RESTART_REPLY_ACCEPTED` must not appear for a crash-test
+image.
+
+Guardrails remain unchanged: `PROCESS_IPC_OPCODE_COUNT == 16`,
+`SYSCALL_COUNT == 31`, no kernel/arch/RPi5/driver-manager DRS changes, no broad
+restart-any-image support, no manual cap/slot invention, no raw token authority,
+and no supervisor-side restart execution.

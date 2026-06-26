@@ -2368,6 +2368,96 @@ mod tests {
     }
 
     #[test]
+    fn sup_l5_spawn_image_id_audit_blocks_crash_test_without_safe_direct_initrd_id() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let init_src = include_str!("init/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        for needle in &[
+            "const BOOTSTRAP_IMAGE_ID_MIN: u64 = 1",
+            "const BOOTSTRAP_SERVICE_IMAGE_ID_MAX: u64 = 6",
+            "const VFS_SERVICE_IMAGE_ID_MIN: u64 = 7",
+            "const VFS_SERVICE_IMAGE_ID_MAX: u64 = 12",
+            "resolve_spawn_load_source(image_id: u64)",
+            r#"4 => b"/initramfs/sbin/initramfs_srv""#,
+            r#"5 => b"/initramfs/sbin/devfs_srv""#,
+            r#"6 => b"/initramfs/sbin/vfs_server""#,
+            r#"12 => b"/initramfs/sbin/ext4_srv""#,
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L5 image audit must find existing mapping {needle}"
+            );
+        }
+        for needle in &[
+            "image_id=4",
+            "image_id=5",
+            "image_id=6",
+            "image_id=7",
+            "image_id=8",
+            "image_id=9",
+            "image_id=10",
+            "image_id=11",
+            "image_id=12",
+        ] {
+            assert!(
+                init_src.contains(needle),
+                "SUP-L5 audit must find current init usage {needle}"
+            );
+        }
+        let crash_name = ["crash", "_test", "_srv"].concat();
+        assert!(
+            !pm_src.contains(crash_name.as_str()) && !init_src.contains(crash_name.as_str()),
+            "SUP-L5 must not stage crash_test_srv without a safe image id and restart metadata"
+        );
+        assert!(contract.contains("SUP-L5 MissingImageId/MissingRestartSpec audit"));
+        assert!(contract.contains("No crash-test image id is selected in SUP-L5"));
+    }
+
+    #[test]
+    fn sup_l5_missing_restart_spec_guardrails_preserve_no_slot_cap_invention() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let handler_start = pm_src.find("fn handle_pm_restart_v1").expect("handler");
+        let handler_end = pm_src[handler_start..]
+            .find("fn execute_restart_via_kernel_cap")
+            .map(|offset| handler_start + offset)
+            .unwrap_or(pm_src.len());
+        let handler = &pm_src[handler_start..handler_end];
+        assert!(handler.contains("PM_RESTART_MECHANISM_DEFERRED reason=missing_restart_spec"));
+        assert!(handler.contains("target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID"));
+        assert!(!handler.contains("restart_any_image"));
+        assert!(!handler.contains("restart_any_lifecycle"));
+        for forbidden in &[
+            ["hard", "_coded", "_cnode", "_slot"].concat(),
+            ["fabricate", "_cap"].concat(),
+            ["manual", "_cap"].concat(),
+            ["install", "_endpoint", "_cap"].concat(),
+            ["grant", "_driver_irq"].concat(),
+            ["grant", "_mmio"].concat(),
+            ["grant", "_dma"].concat(),
+            ["perform", "_mmio"].concat(),
+        ] {
+            assert!(
+                !handler.contains(forbidden.as_str())
+                    && !supervisor_src.contains(forbidden.as_str()),
+                "SUP-L5 MissingRestartSpec path must not invent slots/caps/resources: {forbidden}"
+            );
+        }
+        for needle in &[
+            "MissingImageId",
+            "MissingRestartSpec",
+            "PROCESS_IPC_OPCODE_COUNT == 16",
+            "SYSCALL_COUNT == 31",
+        ] {
+            assert!(
+                contract.contains(needle),
+                "SUP-L5 docs must preserve fail-closed audit item {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn sup_l2_pm_restart_decode_validation_dispatch_is_present_and_bounded() {
         let pm_src = include_str!("process_manager/service.rs");
         for needle in &[
