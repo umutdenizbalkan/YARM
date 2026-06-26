@@ -215,6 +215,17 @@ const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6;
 const SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 const PM_RESTART_MAX_IN_PROGRESS: usize = 4;
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupL4PmRestartRollbackInjection {
+    None,
+    AfterReservationBeforeSpawn,
+    SpawnFailure,
+    AfterReplacementTidBeforeLifecycleRecord,
+    LifecycleRecordFailure,
+    ReplyConstructionFailure,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PmRestartInProgress {
     request_id: u64,
@@ -1073,6 +1084,7 @@ pub struct ProcessService {
     /// Lifecycle table: one entry per successfully spawned service.
     lifecycle_table: LifecycleTable,
     pm_restart_mechanism_enabled: bool,
+    sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection,
     pm_restart_in_progress: [Option<PmRestartInProgress>; PM_RESTART_MAX_IN_PROGRESS],
     handled: usize,
 }
@@ -1469,6 +1481,7 @@ impl ProcessService {
                 .process_manager_restart_control_send_cap,
             lifecycle_table: LifecycleTable::new(),
             pm_restart_mechanism_enabled: false,
+            sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection::None,
             pm_restart_in_progress: [None; PM_RESTART_MAX_IN_PROGRESS],
             handled: 0,
         }
@@ -1481,6 +1494,14 @@ impl ProcessService {
     #[cfg(test)]
     fn enable_sup_l4_pm_restart_mechanism_for_tests(&mut self) {
         self.pm_restart_mechanism_enabled = true;
+    }
+
+    #[cfg(test)]
+    fn enable_sup_l4_pm_restart_rollback_injection_for_tests(
+        &mut self,
+        injection: SupL4PmRestartRollbackInjection,
+    ) {
+        self.sup_l4_pm_restart_rollback_injection = injection;
     }
 
     /// Record a lifecycle entry for a bootstrap service spawned before PM's
@@ -2161,6 +2182,25 @@ impl ProcessService {
         }
     }
 
+    fn rollback_pm_restart(
+        &mut self,
+        request_id: u64,
+        target_tid: u64,
+        reason: &'static str,
+    ) -> Result<Message, ProcessManagerError> {
+        yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason={}", reason);
+        self.clear_pm_restart_reservation(request_id);
+        yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason={}", reason);
+        yarm_user_rt::user_log!("PM_RESTART_REPLY_ROLLED_BACK reason={}", reason);
+        Self::pm_restart_reply(
+            AbiPmRestartReplyStatus::RolledBack,
+            AbiPmRestartFailure::ResourceUnavailable,
+            request_id,
+            target_tid,
+            0,
+        )
+    }
+
     fn spawn_sup_l4_replacement(
         &mut self,
         original: ServiceLifecycleRecord,
@@ -2346,41 +2386,65 @@ impl ProcessService {
             .reserve_pm_restart(request.request_id, request.target_tid)
             .is_err()
         {
-            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=reservation");
-            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=reservation");
-            return Self::pm_restart_reply(
-                AbiPmRestartReplyStatus::RolledBack,
-                AbiPmRestartFailure::ResourceUnavailable,
-                request.request_id,
-                request.target_tid,
-                0,
-            );
+            return self.rollback_pm_restart(request.request_id, request.target_tid, "reservation");
         }
         yarm_user_rt::user_log!(
             "PM_RESTART_RESERVE_REPLACEMENT_OK request_id={} target_tid={}",
             request.request_id,
             request.target_tid
         );
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::AfterReservationBeforeSpawn
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "after_reservation_before_spawn",
+            );
+        }
         yarm_user_rt::user_log!(
             "PM_RESTART_SPAWN_BEGIN image_id={} target_tid={}",
             target_record.image_id,
             request.target_tid
         );
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::SpawnFailure
+        {
+            return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
+        }
         let replacement_tid = match self.spawn_sup_l4_replacement(target_record) {
             Ok(tid) if tid != 0 => tid,
             _ => {
-                yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=spawn");
-                self.clear_pm_restart_reservation(request.request_id);
-                yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=spawn");
-                return Self::pm_restart_reply(
-                    AbiPmRestartReplyStatus::RolledBack,
-                    AbiPmRestartFailure::ResourceUnavailable,
-                    request.request_id,
-                    request.target_tid,
-                    0,
-                );
+                return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
             }
         };
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::AfterReplacementTidBeforeLifecycleRecord
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "after_replacement_tid_before_lifecycle_record",
+            );
+        }
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::LifecycleRecordFailure
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "lifecycle_record",
+            );
+        }
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::ReplyConstructionFailure
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "reply_construction",
+            );
+        }
         let recorded = self.lifecycle_table.record(ServiceLifecycleRecord {
             tid: replacement_tid,
             image_id: target_record.image_id,
@@ -2389,31 +2453,17 @@ impl ProcessService {
             state: ServiceState::Spawned,
         });
         if !recorded {
-            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=lifecycle_record");
-            self.clear_pm_restart_reservation(request.request_id);
-            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=lifecycle_record");
-            return Self::pm_restart_reply(
-                AbiPmRestartReplyStatus::RolledBack,
-                AbiPmRestartFailure::ResourceUnavailable,
+            return self.rollback_pm_restart(
                 request.request_id,
                 request.target_tid,
-                0,
+                "lifecycle_record",
             );
         }
         if self
             .complete_pm_restart_reservation(request.request_id, replacement_tid)
             .is_err()
         {
-            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=accounting");
-            self.clear_pm_restart_reservation(request.request_id);
-            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=accounting");
-            return Self::pm_restart_reply(
-                AbiPmRestartReplyStatus::RolledBack,
-                AbiPmRestartFailure::ResourceUnavailable,
-                request.request_id,
-                request.target_tid,
-                0,
-            );
+            return self.rollback_pm_restart(request.request_id, request.target_tid, "accounting");
         }
         yarm_user_rt::user_log!(
             "PM_RESTART_SPAWN_OK target_tid={} replacement_tid={}",
@@ -4429,6 +4479,102 @@ mod tests {
                 .lifecycle_table()
                 .get_by_tid(reply.replacement_handle_value)
                 .is_some()
+        );
+    }
+
+    fn sup_l4_assert_rolled_back_without_replacement(reply: AbiPmRestartReplyV1) {
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::RolledBack);
+        assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_token_fingerprint_mismatch_rejected() {
+        let mut service = ProcessService::new();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let request = AbiPmRestartRequestV1::new(
+            14,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            77,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(77, 0xBEEF),
+        )
+        .expect("request");
+        let payload =
+            yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&request).expect("encode");
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::WrongTokenOwner);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_duplicate_in_progress_reservation_rolls_back_or_rejects() {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        service
+            .reserve_pm_restart(99, 77)
+            .expect("seed in-progress reservation");
+        let payload = pm_restart_request_payload(15, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        sup_l4_assert_rolled_back_without_replacement(reply);
+        assert!(service.lifecycle_table().get_by_tid(77).is_some());
+    }
+
+    fn pm_restart_v1_sup_l4_rollback_injection(
+        injection: SupL4PmRestartRollbackInjection,
+        request_id: u64,
+    ) {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        service.enable_sup_l4_pm_restart_rollback_injection_for_tests(injection);
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let before_len = service.lifecycle_table().len();
+        let payload = pm_restart_request_payload(request_id, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        sup_l4_assert_rolled_back_without_replacement(reply);
+        assert_eq!(service.lifecycle_table().len(), before_len);
+        assert!(service.lifecycle_table().get_by_tid(77).is_some());
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_after_reservation_before_spawn() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::AfterReservationBeforeSpawn,
+            16,
+        );
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_spawn_failure() {
+        pm_restart_v1_sup_l4_rollback_injection(SupL4PmRestartRollbackInjection::SpawnFailure, 17);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_after_replacement_before_lifecycle() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::AfterReplacementTidBeforeLifecycleRecord,
+            18,
+        );
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_lifecycle_record_failure() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::LifecycleRecordFailure,
+            19,
+        );
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_reply_construction_failure() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::ReplyConstructionFailure,
+            20,
         );
     }
 

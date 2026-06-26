@@ -2263,6 +2263,111 @@ mod tests {
     }
 
     #[test]
+    fn sup_l4a_pm_restart_supported_image_audit_and_marker_plan_are_documented() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let evidence = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        for needle in &[
+            "const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6",
+            "resolve_spawn_load_source(original.image_id)? != SpawnLoadSource::DirectInitrd",
+            "ServiceLifecycleRecord",
+            "lifecycle_table.record(ServiceLifecycleRecord",
+            "pm_service_send_cap: 0",
+            "PM_RESTART_TOKEN_OK",
+            "PM_RESTART_REPLY_ROLLED_BACK",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L4A source audit must find {needle}"
+            );
+        }
+        for needle in &[
+            "SUP-L4A",
+            "direct-initrd image_id == 6",
+            "not broaden restart support",
+            "Full QEMU acceptance remains SUP-L5",
+        ] {
+            assert!(
+                contract.contains(needle) || evidence.contains(needle),
+                "SUP-L4A docs must contain {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l4a_hosted_success_negative_and_rollback_coverage_is_present() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pm_restart_v1_sup_l4_gate_off_supported_target_still_defers",
+            "pm_restart_v1_sup_l4_gate_on_unsupported_service_defers",
+            "pm_restart_v1_malformed_truncated_payload_rejected",
+            "pm_restart_v1_untrusted_and_spoofed_supervisor_rejected",
+            "pm_restart_v1_token_target_and_limit_validation_rejects",
+            "pm_restart_v1_sup_l4_token_fingerprint_mismatch_rejected",
+            "pm_restart_v1_sup_l4_duplicate_in_progress_reservation_rolls_back_or_rejects",
+            "pm_restart_v1_sup_l4_gate_on_supported_service_accepts_with_replacement",
+            "pm_restart_v1_sup_l4_rollback_after_reservation_before_spawn",
+            "pm_restart_v1_sup_l4_rollback_spawn_failure",
+            "pm_restart_v1_sup_l4_rollback_after_replacement_before_lifecycle",
+            "pm_restart_v1_sup_l4_rollback_lifecycle_record_failure",
+            "pm_restart_v1_sup_l4_rollback_reply_construction_failure",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L4A PM hosted/source coverage must include {needle}"
+            );
+        }
+        for needle in &[
+            "reply.request_id != client_request.request_id",
+            "reply.target_tid != client_request.target_tid",
+            "reply.replacement_handle_kind != 0",
+            "reply.replacement_handle_value != 0",
+            "accepted_reply_enabled",
+            "SupervisorPmRestartClientResult::ProtocolViolationAccepted",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L4A supervisor coverage/handling must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l4a_no_broad_restart_and_resource_guardrails_hold() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let handler_start = pm_src.find("fn handle_pm_restart_v1").expect("handler");
+        let handler_end = pm_src[handler_start..]
+            .find("fn execute_restart_via_kernel_cap")
+            .map(|offset| handler_start + offset)
+            .unwrap_or(pm_src.len());
+        let handler = &pm_src[handler_start..handler_end];
+        assert!(handler.contains("target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID"));
+        assert!(handler.contains("SupL4PmRestartRollbackInjection"));
+        assert!(handler.contains("pm_restart_mechanism_enabled"));
+        assert!(!handler.contains("image_id == 7"));
+        assert!(!handler.contains("image_id == 8"));
+        assert!(!handler.contains("image_id == 9"));
+        for forbidden in &[
+            ["grant", "_driver_irq"].concat(),
+            ["grant", "_mmio"].concat(),
+            ["grant", "_dma"].concat(),
+            ["perform", "_mmio"].concat(),
+            ["spawn_process", "_with_startup_caps("].concat(),
+            ["restart", "_any_lifecycle"].concat(),
+        ] {
+            assert!(
+                !handler.contains(forbidden.as_str())
+                    && !supervisor_src.contains(forbidden.as_str()),
+                "SUP-L4A must not introduce broad/resource behavior {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn sup_l2_pm_restart_decode_validation_dispatch_is_present_and_bounded() {
         let pm_src = include_str!("process_manager/service.rs");
         for needle in &[

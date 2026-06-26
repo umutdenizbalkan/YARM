@@ -415,3 +415,59 @@ Expected future QEMU markers for this prototype are:
 `SUPERVISOR_PM_RESTART_STATE_UPDATED`. SUP-L4 does not add process opcodes,
 does not change syscall ABI, and keeps `PROCESS_IPC_OPCODE_COUNT == 16` and
 `SYSCALL_COUNT == 31`.
+
+## SUP-L4A hardening evidence: gated single-service restart proof
+
+SUP-L4A does not broaden restart support. The only live prototype target remains
+exactly the PM-known **direct-initrd image_id == 6** lifecycle class. In the
+current bootstrap contract this image id represents the VFS direct-initrd service
+class used by PM for startup-cap-sensitive service handoff; SUP-L4A treats the
+numeric lifecycle record as the authority boundary and does not infer support for
+image_id 7/8/9 or any generic lifecycle record.
+
+Audit result:
+
+1. **Supported service:** direct-initrd image_id == 6 only.
+2. **Lifecycle storage:** PM stores the original and replacement records in the
+   fixed `LifecycleTable` as `ServiceLifecycleRecord { tid, image_id, parent_tid,
+   pm_service_send_cap, state }`.
+3. **Spawn spec reconstruction:** PM reconstructs the replacement from PM-owned
+   lifecycle metadata: `image_id`, `parent_tid`, and the existing direct-initrd
+   spawn/load path. No payload TID or payload cap id is trusted as authority.
+4. **Startup caps:** the SUP-L4A replacement uses the existing PM-owned
+   direct-initrd spawn path and records `pm_service_send_cap = 0`; no driver,
+   MMIO, IRQ, DMA, or broad startup-cap grant path is added.
+5. **Security-relevant difference:** the replacement is intentionally narrower
+   than broad service restart. It reuses only PM-known image/parent metadata and
+   scoped/redacted token validation; cap-bound restart authority remains future
+   work before any wider class can be enabled.
+6. **Unsupported:** all non-image_id-6 services, non-direct-initrd sources,
+   broad dependency cascades, final cap-bound restart tokens, resource cleanup,
+   and generic restart-any-lifecycle-record remain unsupported.
+
+Hosted evidence now covers the deterministic success path and negative/rollback
+cases for the exact supported class: gate-off deferral, unsupported image,
+missing/no target, untrusted sender, supervisor_tid spoofing, wrong token owner,
+token fingerprint mismatch, raw/unscoped tokens, attempt-limit rejection,
+dependency/startup-cap policy rejection, duplicate in-progress reservation,
+rollback after reservation, rollback at spawn, rollback after replacement TID but
+before lifecycle record, lifecycle-record failure, and modeled reply-construction
+rollback. Rollback emits `PM_RESTART_ROLLBACK_BEGIN`,
+`PM_RESTART_ROLLBACK_DONE`, and `PM_RESTART_REPLY_ROLLED_BACK`, clears the
+reservation, returns no Accepted reply, and keeps replacement handles zero.
+
+Supervisor acceptance remains gated and strict: Accepted replies update state only
+when the supervisor acceptance gate is enabled and the reply request_id,
+target_tid, replacement handle kind, and replacement handle value all validate.
+Zero-handle Accepted replies, mismatched request_id/target_tid, and Accepted while
+the gate is off remain protocol violations. Supervisor never executes restart
+locally; PM remains the only mechanism owner.
+
+QEMU readiness is marker-only for SUP-L4A unless a deterministic restart workload
+is added. The future expected sequence is:
+`SUPERVISOR_PM_RESTART_SEND_BEGIN`, `PM_RESTART_V1_DECODE_OK`,
+`PM_RESTART_SENDER_OK`, `PM_RESTART_TOKEN_OK`, `PM_RESTART_ACCOUNTING_BEGIN`,
+`PM_RESTART_SPAWN_BEGIN`, `PM_RESTART_SPAWN_OK`, `PM_RESTART_REPLY_ACCEPTED`,
+`SUPERVISOR_PM_RESTART_REPLY_RECV`, and
+`SUPERVISOR_PM_RESTART_STATE_UPDATED`. Full QEMU acceptance remains SUP-L5 before
+any broadening beyond direct-initrd image_id == 6.
