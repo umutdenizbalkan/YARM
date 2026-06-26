@@ -164,3 +164,18 @@ later live-gated work. The next stage, SUP-L2, is limited to PM decode and
 validation only and still must not restart, spawn, tear down tasks, allocate
 address spaces, mint/revoke caps, grant MMIO/IRQ/DMA, perform MMIO, or fake PM
 restart success.
+
+## SUP-L2 PM decode/validation-only status
+
+SUP-L2 adds Process Manager dispatch recognition for `PROC_OP_PM_RESTART_V1`
+only to decode the canonical `PmRestartRequestV1`, validate sender identity and
+request policy, and encode canonical `PmRestartReplyV1` rejected/deferred
+responses. The supervisor still does not send `PROC_OP_PM_RESTART_V1`; SUP-L2
+therefore has no live supervisor PM restart IPC path.
+
+The PM restart mechanism remains unavailable. Valid requests are deferred with no
+replacement handle; they are never accepted and never report fake restart success.
+SUP-L2 does not restart, spawn, tear down tasks, allocate address spaces,
+mint/revoke caps, grant MMIO/IRQ/DMA, perform MMIO, or change syscall/process IPC
+ABI counts. The next stage, SUP-L3, may add the supervisor send path, but still
+must not execute restart.

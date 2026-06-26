@@ -1160,7 +1160,8 @@ mod tests {
         );
         assert!(
             pm_src.contains("PM_RESTART_CONTRACT_VERSION_V1")
-                && !pm_src.contains("PROC_OP_PM_RESTART_V1"),
+                && pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && !pm_src.contains("PM_RESTART_REPLY_ACCEPTED"),
             "SUP-4 may define local oracle versioning but no live PM restart opcode"
         );
     }
@@ -1678,7 +1679,7 @@ mod tests {
         );
         assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
                 && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-7 must not add PM dispatch or supervisor send path"
         );
@@ -1726,7 +1727,7 @@ mod tests {
         );
         assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
                 && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-8 must not add PM dispatch or supervisor send path"
         );
@@ -1826,7 +1827,7 @@ mod tests {
         if false {
             failures.push(PmRestartPromotionReadinessFailure::LiveAbiOpcodePresent);
         }
-        if pm_src.contains("PROC_OP_PM_RESTART_V1")
+        if !pm_src.contains("PROC_OP_PM_RESTART_V1")
             || supervisor_src.contains("PROC_OP_PM_RESTART_V1")
         {
             failures.push(PmRestartPromotionReadinessFailure::DispatchPresent);
@@ -1906,7 +1907,7 @@ mod tests {
             "SUP-9 must keep candidate opcodes absent from live ABI"
         );
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
                 && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-9 must not add dispatch or send paths"
         );
@@ -1990,7 +1991,7 @@ mod tests {
         if !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;") {
             failures.push(PmRestartLiveReadinessFailure::SyscallCountChanged);
         }
-        if pm_src.contains("PROC_OP_PM_RESTART_V1") {
+        if !pm_src.contains("PROC_OP_PM_RESTART_V1") {
             failures.push(PmRestartLiveReadinessFailure::DispatchPresent);
         }
         if supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
@@ -2087,6 +2088,63 @@ mod tests {
     }
 
     #[test]
+    fn sup_l2_pm_restart_decode_validation_dispatch_is_present_and_bounded() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "PROC_OP_PM_RESTART_V1 =>",
+            "decode_pm_restart_request_v1(msg.as_slice())",
+            "PM_RESTART_V1_DISPATCH_ENTER",
+            "PM_RESTART_V1_DECODE_OK",
+            "PM_RESTART_V1_DECODE_FAIL",
+            "PM_RESTART_SENDER_OK",
+            "PM_RESTART_SENDER_REJECTED",
+            "PM_RESTART_VALIDATE_OK",
+            "PM_RESTART_VALIDATE_REJECTED",
+            "PM_RESTART_MECHANISM_DEFERRED",
+            "PM_RESTART_REPLY_DEFERRED",
+            "PM_RESTART_REPLY_REJECTED",
+            "encode_pm_restart_reply_v1(&reply)",
+            "replacement_handle_kind: 0",
+            "replacement_handle_value: 0",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L2 PM source must contain {needle}"
+            );
+        }
+        let accepted_marker = ["PM_RESTART_REPLY_", "ACCEPTED"].concat();
+        assert!(!pm_src.contains(accepted_marker.as_str()));
+    }
+
+    #[test]
+    fn sup_l2_pm_restart_dispatch_has_no_execution_cap_or_resource_calls() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let start = pm_src
+            .find("PROC_OP_PM_RESTART_V1 =>")
+            .expect("dispatch arm");
+        let end = pm_src[start..]
+            .find("PROC_OP_LIFECYCLE_QUERY")
+            .map(|offset| start + offset)
+            .unwrap_or(pm_src.len());
+        let dispatch = &pm_src[start..end];
+        for forbidden in &[
+            "spawn_process(",
+            "spawn_process_with_startup_caps(",
+            "execute_restart_via_kernel_cap(",
+            "record_restart_token(",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+            "mint",
+            "revoke",
+        ] {
+            assert!(
+                !dispatch.contains(forbidden),
+                "SUP-L2 dispatch must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn sup10_source_guardrails_keep_live_enablement_absent() {
         let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
@@ -2100,7 +2158,7 @@ mod tests {
         );
         assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"));
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
                 && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-10 must not add PM dispatch or supervisor send"
         );
@@ -2121,10 +2179,14 @@ mod tests {
                 evidence_doc.contains(future_marker),
                 "future marker must be documented: {future_marker}"
             );
-            assert!(
-                !pm_src.contains(future_marker) && !supervisor_src.contains(future_marker),
-                "future marker must not be emitted by current runtime: {future_marker}"
-            );
+            if *future_marker == "PM_RESTART_REPLY_ACCEPTED"
+                || future_marker.starts_with("SUPERVISOR_PM_RESTART")
+            {
+                assert!(
+                    !pm_src.contains(future_marker) && !supervisor_src.contains(future_marker),
+                    "future marker must not be emitted by current runtime: {future_marker}"
+                );
+            }
         }
         assert!(supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"));
     }

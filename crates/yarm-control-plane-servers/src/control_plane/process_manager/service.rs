@@ -13,10 +13,15 @@ use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, LIFECYCLE_STATE_SPAWNED, LifecycleQueryReply,
     LifecycleQueryRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
-    PROC_OP_LIFECYCLE_QUERY, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
-    PROC_OP_SPAWN_V4, PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
+    PROC_OP_LIFECYCLE_QUERY, PROC_OP_PM_RESTART_REPLY_V1, PROC_OP_PM_RESTART_V1,
+    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4,
+    PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
+    PmRestartCodecError as AbiPmRestartCodecError, PmRestartFailure as AbiPmRestartFailure,
+    PmRestartReason as AbiPmRestartReason, PmRestartReplyStatus as AbiPmRestartReplyStatus,
+    PmRestartReplyV1 as AbiPmRestartReplyV1, PmRestartRequestV1 as AbiPmRestartRequestV1,
     RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs,
-    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args, encode_spawn_v5_reply,
+    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args, decode_pm_restart_request_v1,
+    encode_pm_restart_reply_v1, encode_spawn_v5_reply,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -147,16 +152,42 @@ impl WaitPidV2Result {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessRequest {
-    GetPid { caller_tid: u64 },
-    GetPpid { caller_tid: u64 },
-    Exit { caller_tid: u64, code: u64 },
+    GetPid {
+        caller_tid: u64,
+    },
+    GetPpid {
+        caller_tid: u64,
+    },
+    Exit {
+        caller_tid: u64,
+        code: u64,
+    },
     SpawnV2(SpawnV2Request),
     SpawnV5Cap(SpawnV5CapRequest),
     WaitPidV2(WaitPidV2Request),
-    TaskRestartToken { tid: u64 },
-    RegisterSupervisedTask { tid: u64, restart_token: u64 },
-    ExecuteRestart { tid: u64, restart_token: u64 },
-    LifecycleQuery { tid: u64 },
+    TaskRestartToken {
+        tid: u64,
+    },
+    RegisterSupervisedTask {
+        tid: u64,
+        restart_token: u64,
+    },
+    ExecuteRestart {
+        tid: u64,
+        restart_token: u64,
+    },
+    LifecycleQuery {
+        tid: u64,
+    },
+    PmRestartV1 {
+        request: AbiPmRestartRequestV1,
+        sender_tid: u64,
+    },
+    PmRestartV1DecodeFailed {
+        request_id: u64,
+        target_tid: u64,
+        failure: AbiPmRestartCodecError,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +209,8 @@ const PM_RESTART_CONTRACT_VERSION_V1: u16 = 1;
 const PM_RESTART_MAX_ENTRIES: usize = 8;
 const PM_RESTART_MAX_ROLLBACK_STEPS: usize = 8;
 const PM_RESTART_AUTHORITY_MARKER: u32 = 0x504d_5253;
+const PM_RESTART_TRUSTED_SUPERVISOR_TID: u64 = 4;
+const PM_RESTART_MAX_ATTEMPTS_V1: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmRestartReason {
@@ -1563,6 +1596,33 @@ impl ProcessService {
                     restart_token: args.restart_token,
                 })
             }
+            PROC_OP_PM_RESTART_V1 => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_V1_DISPATCH_ENTER sender_tid={}",
+                    msg.sender_tid.0
+                );
+                match decode_pm_restart_request_v1(msg.as_slice()) {
+                    Ok(request) => {
+                        yarm_user_rt::user_log!(
+                            "PM_RESTART_V1_DECODE_OK request_id={} target_tid={}",
+                            request.request_id,
+                            request.target_tid
+                        );
+                        Ok(ProcessRequest::PmRestartV1 {
+                            request,
+                            sender_tid: msg.sender_tid.0,
+                        })
+                    }
+                    Err(failure) => {
+                        yarm_user_rt::user_log!("PM_RESTART_V1_DECODE_FAIL reason={:?}", failure);
+                        Ok(ProcessRequest::PmRestartV1DecodeFailed {
+                            request_id: 0,
+                            target_tid: 0,
+                            failure,
+                        })
+                    }
+                }
+            }
             PROC_OP_LIFECYCLE_QUERY => {
                 let args = LifecycleQueryRequest::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
@@ -1919,6 +1979,15 @@ impl ProcessService {
                 Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
+            ProcessRequest::PmRestartV1 {
+                request,
+                sender_tid,
+            } => self.handle_pm_restart_v1(request, sender_tid),
+            ProcessRequest::PmRestartV1DecodeFailed {
+                request_id,
+                target_tid,
+                failure,
+            } => Self::pm_restart_decode_failure_reply(failure, request_id, target_tid),
             ProcessRequest::LifecycleQuery { tid } => {
                 yarm_user_rt::user_log!("PM_LIFECYCLE_QUERY_RECV tid={}", tid);
                 let reply = match self.lifecycle_table.get_by_tid(tid) {
@@ -1940,6 +2009,172 @@ impl ProcessService {
                     .map_err(|_| ProcessManagerError::Malformed)
             }
         }
+    }
+
+    fn pm_restart_reply(
+        status: AbiPmRestartReplyStatus,
+        failure: AbiPmRestartFailure,
+        request_id: u64,
+        target_tid: u64,
+        next_retry_tick: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        let reply = AbiPmRestartReplyV1 {
+            version: yarm_ipc_abi::process_abi::PM_RESTART_VERSION_V1,
+            request_id,
+            target_tid,
+            status,
+            failure,
+            replacement_handle_kind: 0,
+            replacement_handle_value: 0,
+            cleanup_status: 0,
+            accounting_status: 0,
+            startup_cap_status: 0,
+            health_monitor_status: 0,
+            rollback_status: 0,
+            next_retry_tick,
+        };
+        let encoded =
+            encode_pm_restart_reply_v1(&reply).map_err(|_| ProcessManagerError::Malformed)?;
+        Message::with_header(0, PROC_OP_PM_RESTART_REPLY_V1, 0, None, &encoded)
+            .map_err(|_| ProcessManagerError::Malformed)
+    }
+
+    fn pm_restart_decode_failure_reply(
+        failure: AbiPmRestartCodecError,
+        request_id: u64,
+        target_tid: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        let (status, failure) = match failure {
+            AbiPmRestartCodecError::UnsupportedVersion => (
+                AbiPmRestartReplyStatus::UnsupportedVersion,
+                AbiPmRestartFailure::UnsupportedVersion,
+            ),
+            AbiPmRestartCodecError::RawOrUnscopedToken => (
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::RawTokenUnsupported,
+            ),
+            AbiPmRestartCodecError::OversizedServiceName
+            | AbiPmRestartCodecError::Malformed
+            | AbiPmRestartCodecError::InvalidEnum
+            | AbiPmRestartCodecError::NonzeroReserved => (
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::UnsupportedVersion,
+            ),
+        };
+        Self::pm_restart_reply(status, failure, request_id, target_tid, 0)
+    }
+
+    fn handle_pm_restart_v1(
+        &self,
+        request: AbiPmRestartRequestV1,
+        sender_tid: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        if sender_tid == 0 || sender_tid != PM_RESTART_TRUSTED_SUPERVISOR_TID {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_SENDER_REJECTED sender_tid={} payload_supervisor_tid={}",
+                sender_tid,
+                request.supervisor_tid
+            );
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=sender");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=sender");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::MissingRight,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        if request.supervisor_tid != 0 && request.supervisor_tid != sender_tid {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_SENDER_REJECTED sender_tid={} payload_supervisor_tid={}",
+                sender_tid,
+                request.supervisor_tid
+            );
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=spoofed_supervisor_tid");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=spoofed_supervisor_tid");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::MissingRight,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        yarm_user_rt::user_log!("PM_RESTART_SENDER_OK sender_tid={}", sender_tid);
+
+        let rejected = |failure: AbiPmRestartFailure, reason: &'static str| {
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason={}", reason);
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason={}", reason);
+            Self::pm_restart_reply(
+                match failure {
+                    AbiPmRestartFailure::None => AbiPmRestartReplyStatus::Rejected,
+                    _ => AbiPmRestartReplyStatus::Rejected,
+                },
+                failure,
+                request.request_id,
+                request.target_tid,
+                0,
+            )
+        };
+
+        if self
+            .lifecycle_table
+            .get_by_tid(request.target_tid)
+            .is_none()
+        {
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=no_such_target");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=no_such_target");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::NoSuchTarget,
+                AbiPmRestartFailure::None,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        if !request.token.scoped {
+            return rejected(
+                AbiPmRestartFailure::RawTokenUnsupported,
+                "raw_or_unscoped_token",
+            );
+        }
+        if request.token.owner_tid != request.target_tid {
+            return rejected(AbiPmRestartFailure::WrongTokenOwner, "wrong_token_owner");
+        }
+        if request.attempt_count > PM_RESTART_MAX_ATTEMPTS_V1 {
+            return rejected(
+                AbiPmRestartFailure::RestartLimitExceeded,
+                "restart_limit_exceeded",
+            );
+        }
+        if request.restart_reason == AbiPmRestartReason::NormalExit {
+            return rejected(AbiPmRestartFailure::MissingRight, "reason_disallowed");
+        }
+        if request.dependency_cause_tid != 0 {
+            return rejected(AbiPmRestartFailure::DependencyBlocked, "dependency_blocked");
+        }
+        if request.startup_cap_policy != 0 {
+            return rejected(
+                AbiPmRestartFailure::StartupCapLayoutUnsupported,
+                "startup_cap_layout_unsupported",
+            );
+        }
+
+        yarm_user_rt::user_log!(
+            "PM_RESTART_VALIDATE_OK request_id={} target_tid={}",
+            request.request_id,
+            request.target_tid
+        );
+        yarm_user_rt::user_log!("PM_RESTART_MECHANISM_DEFERRED reason=mechanism_unavailable");
+        yarm_user_rt::user_log!("PM_RESTART_REPLY_DEFERRED reason=mechanism_unavailable");
+        Self::pm_restart_reply(
+            AbiPmRestartReplyStatus::Deferred,
+            AbiPmRestartFailure::ResourceUnavailable,
+            request.request_id,
+            request.target_tid,
+            request.due_tick,
+        )
     }
 
     fn execute_restart_via_kernel_cap(&self, tid: u64, restart_token: u64) -> u8 {
@@ -3734,6 +3969,181 @@ mod tests {
             call(&mut service, 9, 77),
             ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED
         );
+    }
+
+    fn seed_pm_restart_target(service: &mut ProcessService, tid: u64) {
+        assert!(service.seed_bootstrap_lifecycle_record(tid, 42));
+    }
+
+    fn pm_restart_request_payload(
+        request_id: u64,
+        supervisor_tid: u64,
+        target_tid: u64,
+    ) -> [u8; yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_V1_LEN] {
+        let request = AbiPmRestartRequestV1::new(
+            request_id,
+            supervisor_tid,
+            target_tid,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(target_tid, 0xCAFE),
+        )
+        .expect("valid restart request");
+        yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&request).expect("encode")
+    }
+
+    fn pm_restart_call(
+        service: &mut ProcessService,
+        sender_tid: u64,
+        payload: &[u8],
+    ) -> AbiPmRestartReplyV1 {
+        let request = Message::with_header(sender_tid, PROC_OP_PM_RESTART_V1, 0, None, payload)
+            .expect("request");
+        let reply_msg = service.handle(request).expect("reply");
+        assert_eq!(reply_msg.opcode, PROC_OP_PM_RESTART_REPLY_V1);
+        assert_eq!(
+            reply_msg.as_slice().len(),
+            yarm_ipc_abi::process_abi::PM_RESTART_REPLY_V1_LEN
+        );
+        yarm_ipc_abi::process_abi::decode_pm_restart_reply_v1(reply_msg.as_slice())
+            .expect("decode reply")
+    }
+
+    #[test]
+    fn pm_restart_v1_malformed_truncated_payload_rejected() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(1, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            &payload[..109],
+        );
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_unsupported_version_and_invalid_enum_rejected() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let mut payload = pm_restart_request_payload(2, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        payload[0..2].copy_from_slice(&2u16.to_le_bytes());
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::UnsupportedVersion);
+        assert_eq!(reply.failure, AbiPmRestartFailure::UnsupportedVersion);
+
+        let mut payload = pm_restart_request_payload(3, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        payload[yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_REASON_OFFSET
+            ..yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_REASON_OFFSET + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.replacement_handle_kind, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_untrusted_and_spoofed_supervisor_rejected() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(4, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, 3, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
+
+        let payload = pm_restart_request_payload(5, 99, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
+    }
+
+    #[test]
+    fn pm_restart_v1_token_target_and_limit_validation_rejects() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+
+        let mut raw = pm_restart_request_payload(6, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        raw[96] = 0;
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &raw);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::RawTokenUnsupported);
+
+        let wrong_owner = AbiPmRestartRequestV1::new(
+            7,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            77,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(88, 0xCAFE),
+        )
+        .expect("request");
+        let wrong_owner =
+            yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&wrong_owner).expect("encode");
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            &wrong_owner,
+        );
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::WrongTokenOwner);
+
+        let unknown = pm_restart_request_payload(8, PM_RESTART_TRUSTED_SUPERVISOR_TID, 404);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &unknown);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::NoSuchTarget);
+
+        let mut limit = AbiPmRestartRequestV1::new(
+            9,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            77,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(77, 0xCAFE),
+        )
+        .expect("request");
+        limit.attempt_count = PM_RESTART_MAX_ATTEMPTS_V1 + 1;
+        let limit =
+            yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&limit).expect("encode");
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &limit);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::RestartLimitExceeded);
+    }
+
+    #[test]
+    fn pm_restart_v1_valid_request_defers_without_replacement_handle() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(10, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
+        assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_source_guard_no_execution_or_accepted_success() {
+        let src = include_str!("service.rs");
+        let dispatch_start = src.find("PROC_OP_PM_RESTART_V1 =>").expect("dispatch arm");
+        let dispatch = &src[dispatch_start..];
+        for forbidden in &[
+            "spawn_process(",
+            "spawn_process_with_startup_caps(",
+            "execute_restart_via_kernel_cap(",
+            "record_restart_token(",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !dispatch.contains(forbidden),
+                "SUP-L2 PM restart dispatch must not contain {forbidden}"
+            );
+        }
+        let accepted_marker = ["PM_RESTART_REPLY_", "ACCEPTED"].concat();
+        assert!(!dispatch.contains(accepted_marker.as_str()));
     }
 
     #[test]
