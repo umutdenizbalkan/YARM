@@ -1164,8 +1164,9 @@ mod tests {
         assert!(
             pm_src.contains("PM_RESTART_CONTRACT_VERSION_V1")
                 && pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !pm_src.contains("PM_RESTART_REPLY_ACCEPTED"),
-            "SUP-4 may define local oracle versioning but no live PM restart opcode"
+                && pm_src.contains("pm_restart_mechanism_enabled")
+                && pm_src.contains("SUP_L4_SUPPORTED_RESTART_IMAGE_ID"),
+            "SUP-L4 may add one gated PM-owned restart path but no new live PM restart opcode"
         );
     }
 
@@ -2115,7 +2116,11 @@ mod tests {
                 "SUP-L3 supervisor source must contain {needle}"
             );
         }
-        assert!(!supervisor_src.contains("SUPERVISOR_PM_RESTART_STATE_UPDATED"));
+        assert!(
+            supervisor_src.contains("pm_restart_acceptance_enabled")
+                && supervisor_src.contains("SUPERVISOR_PM_RESTART_STATE_UPDATED"),
+            "SUP-L4 permits supervisor state update only behind accepted-reply gating"
+        );
     }
 
     #[test]
@@ -2187,6 +2192,77 @@ mod tests {
     }
 
     #[test]
+    fn sup_l4_pm_restart_live_prototype_is_gated_narrow_and_rollback_safe() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_restart_start = pm_src
+            .find("fn handle_pm_restart_v1")
+            .expect("PM restart handler");
+        let pm_restart_end = pm_src[pm_restart_start..]
+            .find("fn execute_restart_via_kernel_cap")
+            .map(|offset| pm_restart_start + offset)
+            .unwrap_or(pm_src.len());
+        let pm_restart_handler = &pm_src[pm_restart_start..pm_restart_end];
+        let supervisor_client_start = supervisor_src
+            .find("fn send_pm_restart_v1_via_process_manager")
+            .expect("supervisor PM restart client");
+        let supervisor_client_end = supervisor_src[supervisor_client_start..]
+            .find("fn execute_restart_via_process_manager")
+            .map(|offset| supervisor_client_start + offset)
+            .unwrap_or(supervisor_src.len());
+        let supervisor_client = &supervisor_src[supervisor_client_start..supervisor_client_end];
+        for needle in &[
+            "const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6",
+            "pm_restart_mechanism_enabled: bool",
+            "PM_RESTART_MECHANISM_GATE_OFF",
+            "PM_RESTART_MECHANISM_GATE_ON",
+            "reserve_pm_restart",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_RESERVE_REPLACEMENT_OK",
+            "spawn_sup_l4_replacement",
+            "PM_RESTART_SPAWN_BEGIN",
+            "PM_RESTART_SPAWN_OK",
+            "PM_RESTART_ROLLBACK_BEGIN",
+            "PM_RESTART_ROLLBACK_DONE",
+            "PM_RESTART_REPLY_ACCEPTED",
+            "pm_restart_v1_sup_l4_gate_off_supported_target_still_defers",
+            "pm_restart_v1_sup_l4_gate_on_unsupported_service_defers",
+            "pm_restart_v1_sup_l4_gate_on_supported_service_accepts_with_replacement",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L4 PM source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "pm_restart_acceptance_enabled: bool",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+            "reply.replacement_handle_kind != 0",
+            "reply.replacement_handle_value != 0",
+            "SupervisorPmRestartClientResult::Accepted",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L4 supervisor source must contain {needle}"
+            );
+        }
+        for forbidden in &[
+            ["grant", "_driver_irq"].concat(),
+            ["grant", "_mmio"].concat(),
+            ["grant", "_dma"].concat(),
+            ["perform", "_mmio"].concat(),
+            ["spawn_process", "_with_startup_caps("].concat(),
+        ] {
+            assert!(
+                !pm_restart_handler.contains(forbidden.as_str())
+                    && !supervisor_client.contains(forbidden.as_str()),
+                "SUP-L4 prototype must not add broad/resource behavior {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn sup_l2_pm_restart_decode_validation_dispatch_is_present_and_bounded() {
         let pm_src = include_str!("process_manager/service.rs");
         for needle in &[
@@ -2200,19 +2276,24 @@ mod tests {
             "PM_RESTART_VALIDATE_OK",
             "PM_RESTART_VALIDATE_REJECTED",
             "PM_RESTART_MECHANISM_DEFERRED",
+            "PM_RESTART_MECHANISM_GATE_OFF",
             "PM_RESTART_REPLY_DEFERRED",
             "PM_RESTART_REPLY_REJECTED",
             "encode_pm_restart_reply_v1(&reply)",
-            "replacement_handle_kind: 0",
-            "replacement_handle_value: 0",
+            "replacement_handle_kind",
+            "replacement_handle_value",
         ] {
             assert!(
                 pm_src.contains(needle),
                 "SUP-L2 PM source must contain {needle}"
             );
         }
-        let accepted_marker = ["PM_RESTART_REPLY_", "ACCEPTED"].concat();
-        assert!(!pm_src.contains(accepted_marker.as_str()));
+        assert!(
+            pm_src.contains("PM_RESTART_REPLY_ACCEPTED")
+                && pm_src.contains("pm_restart_mechanism_enabled")
+                && pm_src.contains("SUP_L4_SUPPORTED_RESTART_IMAGE_ID"),
+            "SUP-L4 accepted marker must exist only behind the mechanism gate and supported image guard"
+        );
     }
 
     #[test]
@@ -2278,14 +2359,14 @@ mod tests {
                 evidence_doc.contains(future_marker),
                 "future marker must be documented: {future_marker}"
             );
-            if *future_marker == "PM_RESTART_REPLY_ACCEPTED"
-                || *future_marker == "SUPERVISOR_PM_RESTART_STATE_UPDATED"
-            {
-                assert!(
-                    !pm_src.contains(future_marker) && !supervisor_src.contains(future_marker),
-                    "future marker must not be emitted by current runtime: {future_marker}"
-                );
-            }
+            let accepted_is_now_gated = *future_marker == "PM_RESTART_REPLY_ACCEPTED"
+                || *future_marker == "SUPERVISOR_PM_RESTART_STATE_UPDATED";
+            assert!(
+                !accepted_is_now_gated
+                    || (pm_src.contains("pm_restart_mechanism_enabled")
+                        && supervisor_src.contains("pm_restart_acceptance_enabled")),
+                "SUP-L4 accepted/state markers must be gate-protected: {future_marker}"
+            );
         }
         assert!(supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"));
     }

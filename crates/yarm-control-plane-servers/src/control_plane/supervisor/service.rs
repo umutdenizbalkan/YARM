@@ -361,6 +361,7 @@ enum SupervisorPmRestartState {
     PmClientSendFailed,
     ProtocolViolation,
     AwaitingMechanismUnavailable,
+    RestartAccepted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -377,6 +378,7 @@ pub(crate) struct SupervisorPmRestartClientRequest {
     policy_flags: u32,
     token_owner_tid: u64,
     token_fingerprint: u16,
+    accepted_reply_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,6 +389,10 @@ pub(crate) enum SupervisorPmRestartClientResult {
     },
     Rejected {
         failure: PmRestartFailure,
+    },
+    Accepted {
+        replacement_handle_kind: u16,
+        replacement_handle_value: u64,
     },
     ProtocolViolationAccepted,
     MalformedReply,
@@ -429,6 +435,7 @@ pub struct SupervisorService {
     degraded: bool,
     current_tick: TickInstant,
     next_pm_restart_request_id: u64,
+    pm_restart_acceptance_enabled: bool,
     #[cfg(test)]
     test_disable_budgeted_receive_for_tracked_tid: Option<u64>,
 }
@@ -531,6 +538,7 @@ impl SupervisorService {
             degraded: false,
             current_tick: TickInstant(0),
             next_pm_restart_request_id: 1,
+            pm_restart_acceptance_enabled: false,
             #[cfg(test)]
             test_disable_budgeted_receive_for_tracked_tid: None,
         }
@@ -554,6 +562,11 @@ impl SupervisorService {
 
     pub const fn current_tick(&self) -> TickInstant {
         self.current_tick
+    }
+
+    #[cfg(test)]
+    fn enable_sup_l4_pm_restart_acceptance_for_tests(&mut self) {
+        self.pm_restart_acceptance_enabled = true;
     }
 
     pub fn advance_ticks(&mut self, delta: TickDuration) {
@@ -919,6 +932,7 @@ impl SupervisorService {
                 policy_flags: 0,
                 token_owner_tid: record.tid,
                 token_fingerprint: (restart_token & 0xffff) as u16,
+                accepted_reply_enabled: self.pm_restart_acceptance_enabled,
             };
             #[cfg(not(test))]
             yarm_user_rt::user_log!(
@@ -934,6 +948,29 @@ impl SupervisorService {
             );
             let client_result = restart_ops.restart_task(client_request);
             match client_result {
+                SupervisorPmRestartClientResult::Accepted {
+                    replacement_handle_kind,
+                    replacement_handle_value,
+                } => {
+                    record.last_restart_tick = self.current_tick;
+                    record.pending_restart_due = None;
+                    record.pending_restart_token = None;
+                    record.pending_pm_request_id = None;
+                    record.restart_blocked_no_pm_client = false;
+                    record.restart_deferred_by_pm = false;
+                    record.restart_rejected_by_pm = false;
+                    record.restart_deferred_no_pm_client_logged = false;
+                    record.pm_restart_state = SupervisorPmRestartState::RestartAccepted;
+                    self.degraded = false;
+                    #[cfg(not(test))]
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_PM_RESTART_STATE_UPDATED tid={} request_id={} replacement_handle_kind={} replacement_handle_value={}",
+                        record.tid,
+                        request_id,
+                        replacement_handle_kind,
+                        replacement_handle_value
+                    );
+                }
                 SupervisorPmRestartClientResult::Deferred {
                     failure,
                     retry_tick,
@@ -1999,6 +2036,22 @@ fn send_pm_restart_v1_via_process_manager(
             }
         }
         PmRestartReplyStatus::Accepted => {
+            if client_request.accepted_reply_enabled
+                && reply.replacement_handle_kind != 0
+                && reply.replacement_handle_value != 0
+            {
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED tid={} request_id={} replacement_handle_kind={} replacement_handle_value={}",
+                    client_request.target_tid,
+                    client_request.request_id,
+                    reply.replacement_handle_kind,
+                    reply.replacement_handle_value
+                );
+                return SupervisorPmRestartClientResult::Accepted {
+                    replacement_handle_kind: reply.replacement_handle_kind,
+                    replacement_handle_value: reply.replacement_handle_value,
+                };
+            }
             yarm_user_rt::user_log!(
                 "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_ACCEPTED tid={} request_id={}",
                 client_request.target_tid,

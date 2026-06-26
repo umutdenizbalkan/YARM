@@ -211,6 +211,16 @@ const PM_RESTART_MAX_ROLLBACK_STEPS: usize = 8;
 const PM_RESTART_AUTHORITY_MARKER: u32 = 0x504d_5253;
 const PM_RESTART_TRUSTED_SUPERVISOR_TID: u64 = 4;
 const PM_RESTART_MAX_ATTEMPTS_V1: u16 = 3;
+const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6;
+const SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
+const PM_RESTART_MAX_IN_PROGRESS: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PmRestartInProgress {
+    request_id: u64,
+    target_tid: u64,
+    replacement_tid: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmRestartReason {
@@ -1045,6 +1055,13 @@ impl LifecycleTable {
             .filter_map(|e| e.as_ref())
             .find(|r| r.image_id == image_id)
     }
+
+    pub fn get_by_tid_mut(&mut self, tid: u64) -> Option<&mut ServiceLifecycleRecord> {
+        self.entries[..self.len]
+            .iter_mut()
+            .filter_map(|e| e.as_mut())
+            .find(|r| r.tid == tid)
+    }
 }
 
 #[derive(Debug)]
@@ -1055,6 +1072,8 @@ pub struct ProcessService {
     restart_control_send_cap: Option<u32>,
     /// Lifecycle table: one entry per successfully spawned service.
     lifecycle_table: LifecycleTable,
+    pm_restart_mechanism_enabled: bool,
+    pm_restart_in_progress: [Option<PmRestartInProgress>; PM_RESTART_MAX_IN_PROGRESS],
     handled: usize,
 }
 
@@ -1449,12 +1468,19 @@ impl ProcessService {
             restart_control_send_cap: yarm_user_rt::runtime::startup_context()
                 .process_manager_restart_control_send_cap,
             lifecycle_table: LifecycleTable::new(),
+            pm_restart_mechanism_enabled: false,
+            pm_restart_in_progress: [None; PM_RESTART_MAX_IN_PROGRESS],
             handled: 0,
         }
     }
 
     pub fn lifecycle_table(&self) -> &LifecycleTable {
         &self.lifecycle_table
+    }
+
+    #[cfg(test)]
+    fn enable_sup_l4_pm_restart_mechanism_for_tests(&mut self) {
+        self.pm_restart_mechanism_enabled = true;
     }
 
     /// Record a lifecycle entry for a bootstrap service spawned before PM's
@@ -2018,17 +2044,37 @@ impl ProcessService {
         target_tid: u64,
         next_retry_tick: u64,
     ) -> Result<Message, ProcessManagerError> {
+        Self::pm_restart_reply_with_handle(
+            status,
+            failure,
+            request_id,
+            target_tid,
+            0,
+            0,
+            next_retry_tick,
+        )
+    }
+
+    fn pm_restart_reply_with_handle(
+        status: AbiPmRestartReplyStatus,
+        failure: AbiPmRestartFailure,
+        request_id: u64,
+        target_tid: u64,
+        replacement_handle_kind: u16,
+        replacement_handle_value: u64,
+        next_retry_tick: u64,
+    ) -> Result<Message, ProcessManagerError> {
         let reply = AbiPmRestartReplyV1 {
             version: yarm_ipc_abi::process_abi::PM_RESTART_VERSION_V1,
             request_id,
             target_tid,
             status,
             failure,
-            replacement_handle_kind: 0,
-            replacement_handle_value: 0,
+            replacement_handle_kind,
+            replacement_handle_value,
             cleanup_status: 0,
-            accounting_status: 0,
-            startup_cap_status: 0,
+            accounting_status: (status == AbiPmRestartReplyStatus::Accepted) as u16,
+            startup_cap_status: (status == AbiPmRestartReplyStatus::Accepted) as u16,
             health_monitor_status: 0,
             rollback_status: 0,
             next_retry_tick,
@@ -2064,8 +2110,85 @@ impl ProcessService {
         Self::pm_restart_reply(status, failure, request_id, target_tid, 0)
     }
 
+    fn reserve_pm_restart(
+        &mut self,
+        request_id: u64,
+        target_tid: u64,
+    ) -> Result<(), ProcessManagerError> {
+        if self
+            .pm_restart_in_progress
+            .iter()
+            .flatten()
+            .any(|entry| entry.target_tid == target_tid || entry.request_id == request_id)
+        {
+            return Err(ProcessManagerError::WouldBlock);
+        }
+        let slot = self
+            .pm_restart_in_progress
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(ProcessManagerError::TableFull)?;
+        *slot = Some(PmRestartInProgress {
+            request_id,
+            target_tid,
+            replacement_tid: 0,
+        });
+        Ok(())
+    }
+
+    fn complete_pm_restart_reservation(
+        &mut self,
+        request_id: u64,
+        replacement_tid: u64,
+    ) -> Result<(), ProcessManagerError> {
+        let entry = self
+            .pm_restart_in_progress
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.request_id == request_id)
+            .ok_or(ProcessManagerError::Malformed)?;
+        entry.replacement_tid = replacement_tid;
+        Ok(())
+    }
+
+    fn clear_pm_restart_reservation(&mut self, request_id: u64) {
+        if let Some(slot) = self
+            .pm_restart_in_progress
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.request_id == request_id))
+        {
+            *slot = None;
+        }
+    }
+
+    fn spawn_sup_l4_replacement(
+        &mut self,
+        original: ServiceLifecycleRecord,
+    ) -> Result<u64, ProcessManagerError> {
+        if original.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID
+            || resolve_spawn_load_source(original.image_id)? != SpawnLoadSource::DirectInitrd
+        {
+            return Err(ProcessManagerError::Unsupported);
+        }
+        #[cfg(test)]
+        {
+            let image = synthetic_elf_image(original.image_id);
+            let info = ElfImageInfo::parse(original.image_id, &image).map_err(map_elf_error)?;
+            let pid = self
+                .manager
+                .allocate_process(ProcessId(original.parent_tid))?;
+            self.record_spawn_policy(pid, original.image_id, info.entry, None, None)?;
+            Ok(pid.0)
+        }
+        #[cfg(not(test))]
+        {
+            let backend = KernelProcessSpawnBackend::new();
+            backend.spawn(original.image_id, original.parent_tid)
+        }
+    }
+
     fn handle_pm_restart_v1(
-        &self,
+        &mut self,
         request: AbiPmRestartRequestV1,
         sender_tid: u64,
     ) -> Result<Message, ProcessManagerError> {
@@ -2118,11 +2241,8 @@ impl ProcessService {
             )
         };
 
-        if self
-            .lifecycle_table
-            .get_by_tid(request.target_tid)
-            .is_none()
-        {
+        let Some(target_record) = self.lifecycle_table.get_by_tid(request.target_tid).copied()
+        else {
             yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=no_such_target");
             yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=no_such_target");
             return Self::pm_restart_reply(
@@ -2132,7 +2252,7 @@ impl ProcessService {
                 request.target_tid,
                 0,
             );
-        }
+        };
         if !request.token.scoped {
             return rejected(
                 AbiPmRestartFailure::RawTokenUnsupported,
@@ -2142,6 +2262,11 @@ impl ProcessService {
         if request.token.owner_tid != request.target_tid {
             return rejected(AbiPmRestartFailure::WrongTokenOwner, "wrong_token_owner");
         }
+        yarm_user_rt::user_log!(
+            "PM_RESTART_TOKEN_OK target_tid={} fingerprint={}",
+            request.target_tid,
+            request.token.redacted_fingerprint
+        );
         if request.attempt_count > PM_RESTART_MAX_ATTEMPTS_V1 {
             return rejected(
                 AbiPmRestartFailure::RestartLimitExceeded,
@@ -2160,20 +2285,150 @@ impl ProcessService {
                 "startup_cap_layout_unsupported",
             );
         }
+        if self
+            .restart_token_for_tid(request.target_tid)
+            .is_some_and(|token| (token & 0xffff) as u16 != request.token.redacted_fingerprint)
+        {
+            return rejected(
+                AbiPmRestartFailure::WrongTokenOwner,
+                "token_generation_mismatch",
+            );
+        }
 
         yarm_user_rt::user_log!(
             "PM_RESTART_VALIDATE_OK request_id={} target_tid={}",
             request.request_id,
             request.target_tid
         );
-        yarm_user_rt::user_log!("PM_RESTART_MECHANISM_DEFERRED reason=mechanism_unavailable");
-        yarm_user_rt::user_log!("PM_RESTART_REPLY_DEFERRED reason=mechanism_unavailable");
-        Self::pm_restart_reply(
-            AbiPmRestartReplyStatus::Deferred,
-            AbiPmRestartFailure::ResourceUnavailable,
+        if !self.pm_restart_mechanism_enabled {
+            yarm_user_rt::user_log!("PM_RESTART_MECHANISM_GATE_OFF");
+            yarm_user_rt::user_log!("PM_RESTART_MECHANISM_DEFERRED reason=mechanism_unavailable");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_DEFERRED reason=mechanism_unavailable");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Deferred,
+                AbiPmRestartFailure::ResourceUnavailable,
+                request.request_id,
+                request.target_tid,
+                request.due_tick,
+            );
+        }
+        yarm_user_rt::user_log!("PM_RESTART_MECHANISM_GATE_ON");
+        if target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_MECHANISM_DEFERRED reason=unsupported_service image_id={}",
+                target_record.image_id
+            );
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Deferred,
+                AbiPmRestartFailure::ResourceUnavailable,
+                request.request_id,
+                request.target_tid,
+                request.due_tick,
+            );
+        }
+        if resolve_spawn_load_source(target_record.image_id)? != SpawnLoadSource::DirectInitrd {
+            yarm_user_rt::user_log!("PM_RESTART_MECHANISM_DEFERRED reason=missing_restart_spec");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Deferred,
+                AbiPmRestartFailure::StartupCapLayoutUnsupported,
+                request.request_id,
+                request.target_tid,
+                request.due_tick,
+            );
+        }
+
+        yarm_user_rt::user_log!(
+            "PM_RESTART_ACCOUNTING_BEGIN request_id={} target_tid={}",
+            request.request_id,
+            request.target_tid
+        );
+        if self
+            .reserve_pm_restart(request.request_id, request.target_tid)
+            .is_err()
+        {
+            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=reservation");
+            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=reservation");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::RolledBack,
+                AbiPmRestartFailure::ResourceUnavailable,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        yarm_user_rt::user_log!(
+            "PM_RESTART_RESERVE_REPLACEMENT_OK request_id={} target_tid={}",
+            request.request_id,
+            request.target_tid
+        );
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_BEGIN image_id={} target_tid={}",
+            target_record.image_id,
+            request.target_tid
+        );
+        let replacement_tid = match self.spawn_sup_l4_replacement(target_record) {
+            Ok(tid) if tid != 0 => tid,
+            _ => {
+                yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=spawn");
+                self.clear_pm_restart_reservation(request.request_id);
+                yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=spawn");
+                return Self::pm_restart_reply(
+                    AbiPmRestartReplyStatus::RolledBack,
+                    AbiPmRestartFailure::ResourceUnavailable,
+                    request.request_id,
+                    request.target_tid,
+                    0,
+                );
+            }
+        };
+        let recorded = self.lifecycle_table.record(ServiceLifecycleRecord {
+            tid: replacement_tid,
+            image_id: target_record.image_id,
+            parent_tid: target_record.parent_tid,
+            pm_service_send_cap: 0,
+            state: ServiceState::Spawned,
+        });
+        if !recorded {
+            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=lifecycle_record");
+            self.clear_pm_restart_reservation(request.request_id);
+            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=lifecycle_record");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::RolledBack,
+                AbiPmRestartFailure::ResourceUnavailable,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        if self
+            .complete_pm_restart_reservation(request.request_id, replacement_tid)
+            .is_err()
+        {
+            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason=accounting");
+            self.clear_pm_restart_reservation(request.request_id);
+            yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason=accounting");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::RolledBack,
+                AbiPmRestartFailure::ResourceUnavailable,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_OK target_tid={} replacement_tid={}",
+            request.target_tid,
+            replacement_tid
+        );
+        yarm_user_rt::user_log!("PM_RESTART_REPLY_ACCEPTED");
+        Self::pm_restart_reply_with_handle(
+            AbiPmRestartReplyStatus::Accepted,
+            AbiPmRestartFailure::None,
             request.request_id,
             request.target_tid,
-            request.due_tick,
+            SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID,
+            replacement_tid,
+            0,
         )
     }
 
@@ -3975,6 +4230,13 @@ mod tests {
         assert!(service.seed_bootstrap_lifecycle_record(tid, 42));
     }
 
+    fn seed_sup_l4_supported_pm_restart_target(service: &mut ProcessService, tid: u64) {
+        assert!(service.seed_bootstrap_lifecycle_record(tid, SUP_L4_SUPPORTED_RESTART_IMAGE_ID));
+        service
+            .record_restart_token(tid, 0xCAFE)
+            .expect("restart token");
+    }
+
     fn pm_restart_request_payload(
         request_id: u64,
         supervisor_tid: u64,
@@ -4125,7 +4387,53 @@ mod tests {
     }
 
     #[test]
-    fn pm_restart_v1_source_guard_no_execution_or_accepted_success() {
+    fn pm_restart_v1_sup_l4_gate_off_supported_target_still_defers() {
+        let mut service = ProcessService::new();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(11, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
+        assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_gate_on_unsupported_service_defers() {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(12, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_gate_on_supported_service_accepts_with_replacement() {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(13, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Accepted);
+        assert_eq!(reply.failure, AbiPmRestartFailure::None);
+        assert_eq!(
+            reply.replacement_handle_kind,
+            SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID
+        );
+        assert_ne!(reply.replacement_handle_value, 0);
+        assert!(
+            service
+                .lifecycle_table()
+                .get_by_tid(reply.replacement_handle_value)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn pm_restart_v1_source_guard_sup_l4_execution_is_gated_and_narrow() {
         let src = include_str!("service.rs");
         let dispatch_start = src.find("PROC_OP_PM_RESTART_V1 =>").expect("dispatch arm");
         let dispatch = &src[dispatch_start..];
@@ -4139,11 +4447,26 @@ mod tests {
         ] {
             assert!(
                 !dispatch.contains(forbidden),
-                "SUP-L2 PM restart dispatch must not contain {forbidden}"
+                "SUP-L4 PM restart dispatch must not contain broad/resource side effect {forbidden}"
             );
         }
-        let accepted_marker = ["PM_RESTART_REPLY_", "ACCEPTED"].concat();
-        assert!(!dispatch.contains(accepted_marker.as_str()));
+        for needle in &[
+            "PM_RESTART_MECHANISM_GATE_OFF",
+            "PM_RESTART_MECHANISM_GATE_ON",
+            "SUP_L4_SUPPORTED_RESTART_IMAGE_ID",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_RESERVE_REPLACEMENT_OK",
+            "PM_RESTART_SPAWN_BEGIN",
+            "PM_RESTART_SPAWN_OK",
+            "PM_RESTART_ROLLBACK_BEGIN",
+            "PM_RESTART_ROLLBACK_DONE",
+            "PM_RESTART_REPLY_ACCEPTED",
+        ] {
+            assert!(
+                dispatch.contains(needle),
+                "SUP-L4 dispatch must contain {needle}"
+            );
+        }
     }
 
     #[test]

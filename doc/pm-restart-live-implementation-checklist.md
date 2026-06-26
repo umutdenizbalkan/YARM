@@ -257,3 +257,49 @@ protocol violation until SUP-L4 and must not mark restart success. SUP-L3 does
 not restart, spawn, tear down tasks, allocate address spaces, mint/revoke caps,
 grant MMIO/IRQ/DMA, perform MMIO, change process opcode count, or change syscall
 ABI. The next stage, SUP-L4, will implement one narrow PM restart mechanism.
+
+## SUP-L4 narrow live restart prototype
+
+SUP-L4 introduces the first narrow PM-owned live restart prototype behind an
+explicit PM mechanism gate. The gate defaults off, so valid PM restart requests
+continue to return Deferred/MechanismUnavailable unless a test/hosted policy
+explicitly enables the SUP-L4 mechanism.
+
+The supported target is intentionally limited to one PM-known direct-initrd
+service class: lifecycle records with image id 6. PM already stores the target
+TID, image id, parent TID, and lifecycle state for these records. The prototype
+uses the existing PM-owned direct-initrd spawn path to create a replacement task
+and records the replacement in PM lifecycle bookkeeping. It does not implement
+broad restart for arbitrary services, dependency cascades, driver/resource
+restart, real timer integration, resource cleanup, or final capability-bound
+token authority.
+
+Before mutation, PM still validates the verified supervisor sender, diagnostic
+`supervisor_tid`, target lifecycle record, scoped/redacted token ownership,
+optional token fingerprint, attempt count, restart reason, dependency blocker,
+and startup-cap policy. Unsupported service classes, missing restart specs,
+closed gates, bad senders, wrong token owners, raw/unscoped tokens, and exhausted
+attempts produce Rejected/Deferred replies with zero replacement handles.
+
+When the gate is on and the single supported service passes validation, PM marks
+the restart operation in progress, reserves replacement accounting, builds the
+replacement from the PM-known lifecycle spec, runs the existing PM-owned spawn
+mechanism, records the replacement lifecycle entry, and replies Accepted only
+after the replacement TID exists and has been recorded. Failures after reservation
+enter rollback, clear the reservation, leave the old failed/degraded task state
+truthful, and reply RolledBack/Deferred/Rejected without a replacement handle.
+
+Supervisor Accepted handling is correspondingly gated. A reply is accepted only
+when the request id and target TID match, the SUP-L4 acceptance gate is enabled,
+and the replacement handle kind/value are nonzero. Valid Accepted replies clear
+pending restart state and emit `SUPERVISOR_PM_RESTART_STATE_UPDATED`; mismatched
+or zero-handle Accepted replies remain protocol violations.
+
+Expected future QEMU markers for this prototype are:
+`SUPERVISOR_PM_RESTART_SEND_BEGIN`, `PM_RESTART_V1_DECODE_OK`,
+`PM_RESTART_SENDER_OK`, `PM_RESTART_TOKEN_OK`, `PM_RESTART_ACCOUNTING_BEGIN`,
+`PM_RESTART_SPAWN_BEGIN`, `PM_RESTART_SPAWN_OK`, `PM_RESTART_REPLY_ACCEPTED`,
+`SUPERVISOR_PM_RESTART_REPLY_RECV`, and
+`SUPERVISOR_PM_RESTART_STATE_UPDATED`. SUP-L4 does not add process opcodes,
+does not change syscall ABI, and keeps `PROCESS_IPC_OPCODE_COUNT == 16` and
+`SYSCALL_COUNT == 31`.
