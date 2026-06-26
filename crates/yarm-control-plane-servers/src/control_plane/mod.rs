@@ -916,10 +916,10 @@ mod tests {
     fn sup2_supervisor_runtime_restart_execution_remains_fail_closed() {
         let src = include_str!("supervisor/service.rs");
         for marker in &[
-            "SUPERVISOR_PM_RESTART_REQUEST_BUILT",
-            "SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP",
-            "SUPERVISOR_PM_RESTART_VALIDATION_DEFERRED",
-            "SUPERVISOR_PM_RESTART_ACCOUNTING_DEFERRED",
+            "SUPERVISOR_RESTART_SCHEDULED",
+            "SUPERVISOR_RESTART_DUE_CHECK",
+            "SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT",
+            "RestartBlockedNoPmClient",
         ] {
             assert!(
                 src.contains(marker),
@@ -1021,8 +1021,8 @@ mod tests {
             "OverflowCapped",
             "compute_backoff_decision",
             "due_restart_ready",
-            "SUPERVISOR_TIMER_ENDPOINT_DEFERRED",
-            "SUPERVISOR_BACKOFF_LOGICAL_TICK_ONLY",
+            "SUPERVISOR_RESTART_DUE_CHECK",
+            "RestartBlockedNoPmClient",
         ] {
             assert!(
                 src.contains(needle),
@@ -1035,9 +1035,9 @@ mod tests {
     fn sup3_runtime_pm_restart_ipc_remains_deferred() {
         let src = include_str!("supervisor/service.rs");
         for marker in &[
-            "SUPERVISOR_PM_RESTART_CONTRACT_BUILT",
-            "SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT",
-            "SUPERVISOR_PM_RESTART_EXEC_DEFERRED_NO_PM_OP",
+            "SUPERVISOR_RESTART_SCHEDULED",
+            "SUPERVISOR_RESTART_DUE_CHECK",
+            "SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT",
         ] {
             assert!(
                 src.contains(marker),
@@ -1193,8 +1193,8 @@ mod tests {
             );
         }
         assert!(
-            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT")
-                && supervisor_src.contains("SUPERVISOR_PM_RESTART_CONTRACT_BUILT"),
+            supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT")
+                && supervisor_src.contains("RestartBlockedNoPmClient"),
             "production supervisor restart path must stay visibly deferred"
         );
     }
@@ -1658,7 +1658,7 @@ mod tests {
             "SUP-7 must not add PM dispatch or supervisor send path"
         );
         assert!(
-            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"),
             "production restart remains deferred/fail-closed"
         );
     }
@@ -1729,7 +1729,7 @@ mod tests {
         assert!(
             supervisor_src.contains("redacted_fingerprint")
                 && !supervisor_src.contains("unwrap_or(event.restart_token)")
-                && supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+                && supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"),
             "SUP-8 must preserve redaction, dependent-token, and deferred-runtime guardrails"
         );
     }
@@ -1806,7 +1806,7 @@ mod tests {
         {
             failures.push(PmRestartPromotionReadinessFailure::DispatchPresent);
         }
-        if !supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT") {
+        if !supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT") {
             failures.push(PmRestartPromotionReadinessFailure::MissingFailClosedMarker);
         }
         let status = if failures.is_empty() {
@@ -1886,7 +1886,7 @@ mod tests {
             "SUP-9 must not add dispatch or send paths"
         );
         assert!(
-            supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"),
+            supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"),
             "production restart path must remain visibly deferred"
         );
         assert!(
@@ -1972,7 +1972,7 @@ mod tests {
         if supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
             failures.push(PmRestartLiveReadinessFailure::SupervisorSendPresent);
         }
-        if !supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT") {
+        if !supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT") {
             failures.push(PmRestartLiveReadinessFailure::MissingFailClosedMarker);
         }
         if !evidence_doc.contains("Future rollback-injection scripts and markers")
@@ -2102,6 +2102,6 @@ mod tests {
                 "future marker must not be emitted by current runtime: {future_marker}"
             );
         }
-        assert!(supervisor_src.contains("SUPERVISOR_PM_RESTART_IPC_DEFERRED_NO_PM_CLIENT"));
+        assert!(supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"));
     }
 }
