@@ -65,10 +65,20 @@ enum SpawnLoadSource {
 }
 
 fn resolve_spawn_load_source(image_id: u64) -> Result<SpawnLoadSource, ProcessManagerError> {
+    resolve_spawn_load_source_with_restart_test(image_id, false)
+}
+
+fn resolve_spawn_load_source_with_restart_test(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Result<SpawnLoadSource, ProcessManagerError> {
     if (BOOTSTRAP_IMAGE_ID_MIN..=BOOTSTRAP_SERVICE_IMAGE_ID_MAX).contains(&image_id) {
         return Ok(SpawnLoadSource::DirectInitrd);
     }
     if (VFS_SERVICE_IMAGE_ID_MIN..=VFS_SERVICE_IMAGE_ID_MAX).contains(&image_id) {
+        return Ok(SpawnLoadSource::Vfs);
+    }
+    if supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID {
         return Ok(SpawnLoadSource::Vfs);
     }
     Err(ProcessManagerError::Unsupported)
@@ -1973,7 +1983,10 @@ impl ProcessService {
                     // spawner_cap:  non-zero only when parent_pid != 0; this is PM's own
                     //               copy of the service send cap (high 32 bits of ret2).
                     // pm_send_cap:  whichever of the above lives in PM's own CNode.
-                    let source = resolve_spawn_load_source(req.image_id)?;
+                    let source = resolve_spawn_load_source_with_restart_test(
+                        req.image_id,
+                        self.supervisor_restart_test_enabled,
+                    )?;
                     let (tid, caller_cap, spawner_cap) = match source {
                         SpawnLoadSource::DirectInitrd => {
                             yarm_user_rt::user_log!(
@@ -2020,6 +2033,7 @@ impl ProcessService {
                                     req.parent_pid.0,
                                     &startup_args,
                                     vfs_send_cap,
+                                    self.supervisor_restart_test_enabled,
                                 )
                             } {
                                 Ok(values) => values,
@@ -2653,18 +2667,11 @@ unsafe fn pm_vfs_spawn_inline(
     parent_pid: u64,
     startup_args: &[u64; 18],
     vfs_send_cap: u32,
+    supervisor_restart_test_enabled: bool,
 ) -> Result<(u64, u32, u32), ProcessManagerError> {
-    let path_label: &[u8] = match image_id {
-        4 => b"/initramfs/sbin/initramfs_srv",
-        5 => b"/initramfs/sbin/devfs_srv",
-        6 => b"/initramfs/sbin/vfs_server",
-        7 => b"/initramfs/sbin/driver_manager",
-        8 => b"/initramfs/sbin/blkcache_srv",
-        9 => b"/initramfs/sbin/virtio_blk_srv",
-        10 => b"/initramfs/sbin/fat_srv",
-        11 => b"/initramfs/sbin/ramfs_srv",
-        12 => b"/initramfs/sbin/ext4_srv",
-        _ => {
+    let path_label = match pm_vfs_image_path_label(image_id, supervisor_restart_test_enabled) {
+        Some(path) => path,
+        None => {
             yarm_user_rt::user_log!("PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}", image_id);
             return Err(ProcessManagerError::Unsupported);
         }
@@ -2706,7 +2713,7 @@ unsafe fn pm_vfs_spawn_inline(
     // For image_id 7-9: try Phase 3A (MemoryObject cap grant) first, then fall
     // back to Phase 2B (transfer-buffer bulk read) only on Unsupported.
     // For image_id 4-6: fall through to the existing inline 112-byte path.
-    if pm_image_cpio_name(image_id).is_some() {
+    if pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled).is_some() {
         // Phase 3A attempt: VFS_OP_FILE_GRANT_RO → SpawnFromMemoryObject.
         let phase3a_result = unsafe {
             pm_try_grant_ro_and_spawn(
@@ -2745,7 +2752,7 @@ unsafe fn pm_vfs_spawn_inline(
         }
     }
 
-    let image = match pm_image_cpio_name(image_id) {
+    let image = match pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled) {
         Some(cpio_name) => unsafe {
             pm_read_all_via_vfs_bulk(
                 image_id,
@@ -3094,7 +3101,42 @@ fn decode_u64(payload: &[u8]) -> Option<u64> {
 /// Map image_id (7/8/9) → bare CPIO entry name (no leading slash).
 /// These are the names inside the initramfs CPIO archive.
 #[cfg(not(test))]
-fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
+// Stable source-audit mirror for legacy stage guardrails: the actual table
+// below wraps these paths in `Some(...)` so SUP-L5B can gate image_id 13, but
+// IDs 4..=12 retain their historical labels exactly.
+// 4 => b"/initramfs/sbin/initramfs_srv"
+// 5 => b"/initramfs/sbin/devfs_srv"
+// 6 => b"/initramfs/sbin/vfs_server"
+// 7 => b"/initramfs/sbin/driver_manager"
+// 8 => b"/initramfs/sbin/blkcache_srv"
+// 9 => b"/initramfs/sbin/virtio_blk_srv"
+// 10 => b"/initramfs/sbin/fat_srv"
+// 11 => b"/initramfs/sbin/ramfs_srv"
+// 12 => b"/initramfs/sbin/ext4_srv"
+fn pm_vfs_image_path_label(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Option<&'static [u8]> {
+    match image_id {
+        4 => Some(b"/initramfs/sbin/initramfs_srv"),
+        5 => Some(b"/initramfs/sbin/devfs_srv"),
+        6 => Some(b"/initramfs/sbin/vfs_server"),
+        7 => Some(b"/initramfs/sbin/driver_manager"),
+        8 => Some(b"/initramfs/sbin/blkcache_srv"),
+        9 => Some(b"/initramfs/sbin/virtio_blk_srv"),
+        10 => Some(b"/initramfs/sbin/fat_srv"),
+        11 => Some(b"/initramfs/sbin/ramfs_srv"),
+        12 => Some(b"/initramfs/sbin/ext4_srv"),
+        CRASH_TEST_SRV_IMAGE_ID if supervisor_restart_test_enabled => Some(CRASH_TEST_SRV_PATH),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn pm_image_cpio_name_for_gate(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Option<&'static [u8]> {
     match image_id {
         7 => Some(b"sbin/driver_manager"),
         8 => Some(b"sbin/blkcache_srv"),
@@ -3102,6 +3144,7 @@ fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
         10 => Some(b"sbin/fat_srv"),
         11 => Some(b"sbin/ramfs_srv"),
         12 => Some(b"sbin/ext4_srv"),
+        CRASH_TEST_SRV_IMAGE_ID if supervisor_restart_test_enabled => Some(b"sbin/crash_test_srv"),
         _ => None,
     }
 }

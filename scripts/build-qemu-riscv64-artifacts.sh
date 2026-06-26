@@ -23,6 +23,7 @@ DRIVER_MANAGER_BIN=${DRIVER_MANAGER_BIN:-driver_manager}
 RAMFS_SERVER_BIN=${RAMFS_SERVER_BIN:-ramfs_srv}
 FAT_SERVER_BIN=${FAT_SERVER_BIN:-fat_srv}
 EXT4_SERVER_BIN=${EXT4_SERVER_BIN:-ext4_srv}
+CRASH_TEST_SERVER_BIN=${CRASH_TEST_SERVER_BIN:-crash_test_srv}
 KERNEL_BIN=${KERNEL_BIN:-kernel_boot}
 SERVER_PACKAGE=${SERVER_PACKAGE:-yarm-control-plane-servers}
 INITRAMFS_SERVER_PACKAGE=${INITRAMFS_SERVER_PACKAGE:-yarm-fs-servers}
@@ -40,12 +41,14 @@ DRIVER_MANAGER_ELF=${DRIVER_MANAGER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERV
 RAMFS_SERVER_ELF=${RAMFS_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${RAMFS_SERVER_BIN}}
 FAT_SERVER_ELF=${FAT_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${FAT_SERVER_BIN}}
 EXT4_SERVER_ELF=${EXT4_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${EXT4_SERVER_BIN}}
+CRASH_TEST_SERVER_ELF=${CRASH_TEST_SERVER_ELF:-target/${SERVER_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${CRASH_TEST_SERVER_BIN}}
 KERNEL_ELF=${KERNEL_ELF:-target/${KERNEL_RUST_TARGET_DIR}/${SERVER_BUILD_PROFILE}/${KERNEL_BIN}}
 INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-riscv64.bin}
 ARTIFACTS_STRICT=${ARTIFACTS_STRICT:-0}
 BOOTSTRAP_FEATURE_ARGS=${BOOTSTRAP_FEATURE_ARGS:---no-default-features}
 BUILD_STD_COMPONENTS=${BUILD_STD_COMPONENTS:-core,alloc,compiler_builtins,panic_abort}
+BUILD_LOG=${BUILD_LOG:-$OUT_DIR/riscv64-build.log}
 
 mkdir -p "$OUT_DIR"
 common_prepare_rootfs_dirs
@@ -95,8 +98,15 @@ FAT_SERVER_BUILD_STATUS=$?
 echo "[info] building ${INITRAMFS_SERVER_PACKAGE}/${EXT4_SERVER_BIN} for ${SERVER_RUST_TARGET}"
 cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$INITRAMFS_SERVER_PACKAGE" --bin "$EXT4_SERVER_BIN" "${CARGO_Z_ARGS[@]}"
 EXT4_SERVER_BUILD_STATUS=$?
+if common_supervisor_restart_test_enabled; then
+  echo "[info] building ${SERVER_PACKAGE}/${CRASH_TEST_SERVER_BIN} for ${SERVER_RUST_TARGET} (supervisor restart test)" | tee -a "$BUILD_LOG"
+  cargo build --target "$SERVER_RUST_TARGET" --profile "$SERVER_BUILD_PROFILE" ${BOOTSTRAP_FEATURE_ARGS} -p "$SERVER_PACKAGE" --bin "$CRASH_TEST_SERVER_BIN" "${CARGO_Z_ARGS[@]}" 2>&1 | tee -a "$BUILD_LOG"
+  CRASH_TEST_SERVER_BUILD_STATUS=$?
+else
+  CRASH_TEST_SERVER_BUILD_STATUS=0
+fi
 set -e
-[[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$PM_BUILD_STATUS" -ne 0 || "$SUPERVISOR_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 || "$DEVFS_SERVER_BUILD_STATUS" -ne 0 || "$VFS_SERVER_BUILD_STATUS" -ne 0 || "$BLKCACHE_SERVER_BUILD_STATUS" -ne 0 || "$VIRTIO_BLK_SERVER_BUILD_STATUS" -ne 0 || "$DRIVER_MANAGER_BUILD_STATUS" -ne 0 || "$RAMFS_SERVER_BUILD_STATUS" -ne 0 || "$FAT_SERVER_BUILD_STATUS" -ne 0 || "$EXT4_SERVER_BUILD_STATUS" -ne 0 ]] && common_exit_if_strict_mode
+[[ "$KERNEL_BUILD_STATUS" -ne 0 || "$SERVER_BUILD_STATUS" -ne 0 || "$PM_BUILD_STATUS" -ne 0 || "$SUPERVISOR_BUILD_STATUS" -ne 0 || "$INITRAMFS_SERVER_BUILD_STATUS" -ne 0 || "$DEVFS_SERVER_BUILD_STATUS" -ne 0 || "$VFS_SERVER_BUILD_STATUS" -ne 0 || "$BLKCACHE_SERVER_BUILD_STATUS" -ne 0 || "$VIRTIO_BLK_SERVER_BUILD_STATUS" -ne 0 || "$DRIVER_MANAGER_BUILD_STATUS" -ne 0 || "$RAMFS_SERVER_BUILD_STATUS" -ne 0 || "$FAT_SERVER_BUILD_STATUS" -ne 0 || "$EXT4_SERVER_BUILD_STATUS" -ne 0 || "$CRASH_TEST_SERVER_BUILD_STATUS" -ne 0 ]] && common_exit_if_strict_mode
 
 common_stage_server_init_elf || true
 common_stage_aux_server_elf || true
@@ -110,6 +120,7 @@ common_stage_driver_manager_elf || true
 common_stage_ramfs_server_elf || true
 common_stage_fat_server_elf || true
 common_stage_ext4_server_elf || true
+common_stage_crash_test_server_elf || true
 common_verify_initramfs_stage_paths || true
 common_create_initramfs_aligned
 

@@ -2567,6 +2567,68 @@ mod tests {
     }
 
     #[test]
+    fn sup_l5b_crash_test_binary_and_staging_are_test_gated() {
+        let cargo_toml = include_str!("../../Cargo.toml");
+        let crash_srv = include_str!("../bin/crash_test_srv.rs");
+        let common_script = include_str!("../../../../scripts/lib/build-qemu-artifacts-common.sh");
+        let init_src = include_str!("init/service.rs");
+
+        assert!(cargo_toml.contains("name = \"crash_test_srv\""));
+        for marker in &[
+            "CRASH_TEST_SRV_ENTRY",
+            "CRASH_TEST_SRV_READY",
+            "CRASH_TEST_SRV_FAULT_NOW",
+            "CRASH_TEST_DELAY_YIELDS",
+        ] {
+            assert!(
+                crash_srv.contains(marker),
+                "crash_test_srv must contain {marker}"
+            );
+        }
+        assert!(crash_srv.contains("startup_context()"));
+        assert!(crash_srv.contains("yield_now()"));
+        assert!(crash_srv.contains("write_volatile"));
+        assert!(common_script.contains("common_supervisor_restart_test_enabled"));
+        assert!(common_script.contains("YARM_SUPERVISOR_RESTART_TEST"));
+        assert!(common_script.contains("/sbin/crash_test_srv"));
+        assert!(common_script.contains("CRASH_TEST_IMAGE_ID_ASSIGNED image_id=13"));
+        assert!(common_script.contains("CRASH_TEST_IMAGE_GATED"));
+        assert!(
+            !init_src.contains("crash_test_srv"),
+            "normal service-core init must not stage or start crash_test_srv"
+        );
+    }
+
+    #[test]
+    fn sup_l5b_image_id_13_uses_gated_existing_vfs_spawn_path_only() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "CRASH_TEST_SRV_IMAGE_ID: u64 = 13",
+            "CRASH_TEST_SRV_PATH: &[u8] = b\"/initramfs/sbin/crash_test_srv\"",
+            "resolve_spawn_load_source_with_restart_test",
+            "supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID",
+            "pm_vfs_spawn_inline(",
+            "pm_image_cpio_name_for_gate",
+            "Some(b\"sbin/crash_test_srv\")",
+            "SpawnLoadSource::Vfs",
+        ] {
+            assert!(pm_src.contains(needle), "PM source must contain {needle}");
+        }
+        assert!(pm_src.contains("VFS_SERVICE_IMAGE_ID_MAX: u64 = 12"));
+        assert!(pm_src.contains("resolve_spawn_load_source(CRASH_TEST_SRV_IMAGE_ID)"));
+        assert!(
+            !pm_src.contains("image_id >= 7") && !pm_src.contains("7..=13"),
+            "SUP-L5B must not broaden VFS-backed restart/spawn ranges generically"
+        );
+        for forbidden in &["slot = 13", "slot=13", "install endpoint cap", "fabricate"] {
+            assert!(
+                !pm_src.contains(forbidden),
+                "SUP-L5B must not invent slots/caps: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn sup10_source_guardrails_keep_live_enablement_absent() {
         let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");

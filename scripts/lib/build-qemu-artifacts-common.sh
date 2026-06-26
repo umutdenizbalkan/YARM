@@ -416,9 +416,47 @@ common_stage_ext4_server_elf() {
   echo "[ok] staged ext4 server ELF as /sbin/ext4_srv"
 }
 
+common_supervisor_restart_test_enabled() {
+  [[ "${YARM_SUPERVISOR_RESTART_TEST:-${SUPERVISOR_RESTART_TEST:-0}}" == "1" ]]
+}
+
+common_stage_crash_test_server_elf() {
+  if ! common_supervisor_restart_test_enabled; then
+    echo "[info] CRASH_TEST_IMAGE_GATED: supervisor restart test disabled; not staging /sbin/crash_test_srv"
+    return 0
+  fi
+
+  if [[ ! -f "$CRASH_TEST_SERVER_ELF" ]]; then
+    echo "[warn] crash_test server ELF missing: $CRASH_TEST_SERVER_ELF"
+    common_exit_if_strict_mode
+    return 1
+  fi
+
+  cp "$CRASH_TEST_SERVER_ELF" "$ROOTFS_DIR/sbin/crash_test_srv"
+  chmod +x "$ROOTFS_DIR/sbin/crash_test_srv"
+
+  if command -v readelf >/dev/null 2>&1; then
+    local readelf_out
+    readelf_out="$(readelf -W -l "$CRASH_TEST_SERVER_ELF")"
+    if printf '%s\n' "$readelf_out" | rg -q 'LOAD\s+.*RWE'; then
+      echo "[error] crash_test_srv ELF has forbidden RWE PT_LOAD segment: $CRASH_TEST_SERVER_ELF"
+      return 1
+    fi
+  else
+    echo "[warn] readelf not found; skipping PT_LOAD RWE check for $CRASH_TEST_SERVER_ELF"
+  fi
+
+  echo "[ok] staged crash_test_srv ELF as /sbin/crash_test_srv"
+  echo "CRASH_TEST_IMAGE_ID_ASSIGNED image_id=13"
+}
+
 common_verify_initramfs_stage_paths() {
   local missing=0
-  for path in "init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor" "sbin/ramfs_srv" "sbin/fat_srv" "sbin/ext4_srv"; do
+  local required_paths=("init" "sbin/init_server" "sbin/initramfs_srv" "sbin/devfs_srv" "sbin/vfs_server" "sbin/driver_manager" "sbin/blkcache_srv" "sbin/virtio_blk_srv" "sbin/process_manager" "sbin/supervisor" "sbin/ramfs_srv" "sbin/fat_srv" "sbin/ext4_srv")
+  if common_supervisor_restart_test_enabled; then
+    required_paths+=("sbin/crash_test_srv")
+  fi
+  for path in "${required_paths[@]}"; do
     if [[ ! -f "$ROOTFS_DIR/$path" ]]; then
       echo "[error] expected initramfs path missing: $ROOTFS_DIR/$path"
       missing=1
