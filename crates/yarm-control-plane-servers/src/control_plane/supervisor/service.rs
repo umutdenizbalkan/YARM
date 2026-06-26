@@ -9,8 +9,10 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 #[cfg(not(test))]
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, LifecycleQueryReply, LifecycleQueryRequest,
-    PROC_OP_EXECUTE_RESTART, PROC_OP_LIFECYCLE_QUERY, PROC_OP_TASK_RESTART_TOKEN,
-    TaskRestartTokenReply, TaskRestartTokenRequest,
+    PROC_OP_EXECUTE_RESTART, PROC_OP_LIFECYCLE_QUERY, PROC_OP_PM_RESTART_V1,
+    PROC_OP_TASK_RESTART_TOKEN, PmRestartReason, PmRestartReplyStatus, PmRestartRequestV1,
+    PmRestartTokenDescriptor, TaskRestartTokenReply, TaskRestartTokenRequest,
+    decode_pm_restart_reply_v1, encode_pm_restart_request_v1,
 };
 use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
@@ -334,6 +336,8 @@ struct ManagedServiceRecord {
     pending_restart_due: Option<TickInstant>,
     pending_restart_token: Option<u64>,
     restart_blocked_no_pm_client: bool,
+    restart_deferred_by_pm: bool,
+    restart_rejected_by_pm: bool,
     restart_deferred_no_pm_client_logged: bool,
     pending_redelegation: bool,
     driver_policy: Option<ServiceRestartPolicy>,
@@ -538,6 +542,8 @@ impl SupervisorService {
             pending_restart_due: None,
             pending_restart_token: None,
             restart_blocked_no_pm_client: false,
+            restart_deferred_by_pm: false,
+            restart_rejected_by_pm: false,
             restart_deferred_no_pm_client_logged: false,
             pending_redelegation: false,
             driver_policy: None,
@@ -566,6 +572,8 @@ impl SupervisorService {
             pending_restart_due: None,
             pending_restart_token: None,
             restart_blocked_no_pm_client: false,
+            restart_deferred_by_pm: false,
+            restart_rejected_by_pm: false,
             restart_deferred_no_pm_client_logged: false,
             pending_redelegation: false,
             driver_policy: Some(policy),
@@ -771,7 +779,11 @@ impl SupervisorService {
             match restart_ops.restart_task(record.tid, restart_token) {
                 Ok(()) => {}
                 Err(_err) => {
-                    record.restart_blocked_no_pm_client = true;
+                    match _err {
+                        KernelError::WouldBlock => record.restart_deferred_by_pm = true,
+                        KernelError::WrongObject => record.restart_rejected_by_pm = true,
+                        _ => record.restart_blocked_no_pm_client = true,
+                    }
                     if !record.restart_deferred_no_pm_client_logged {
                         #[cfg(not(test))]
                         yarm_user_rt::user_log!(
@@ -792,6 +804,8 @@ impl SupervisorService {
             record.pending_restart_due = None;
             record.pending_restart_token = None;
             record.restart_blocked_no_pm_client = false;
+            record.restart_deferred_by_pm = false;
+            record.restart_rejected_by_pm = false;
             record.restart_deferred_no_pm_client_logged = false;
             if matches!(record.kind, ManagedServiceKind::Driver) {
                 let plan = record.driver_plan;
@@ -1380,6 +1394,8 @@ pub fn run() {
                         let mut ops = RuntimeSupervisorTaskExitOps {
                             token_tid: 0,
                             token: 0,
+                            supervisor_tid: startup.task_id,
+                            process_manager_caps,
                         };
                         if let Err(err) = supervisor.handle_control_request(&mut ops, msg) {
                             yarm_user_rt::user_log!(
@@ -1430,6 +1446,8 @@ pub fn run() {
                                                     let mut ops = RuntimeSupervisorTaskExitOps {
                                                         token_tid: fault.tid,
                                                         token: restart_token,
+                                                        supervisor_tid: startup.task_id,
+                                                        process_manager_caps,
                                                     };
                                                     match supervisor
                                                         .handle_task_exit(&mut ops, event)
@@ -1493,6 +1511,8 @@ pub fn run() {
                                         let mut ops = RuntimeSupervisorTaskExitOps {
                                             token_tid: event.tid,
                                             token: event.restart_token,
+                                            supervisor_tid: startup.task_id,
+                                            process_manager_caps,
                                         };
                                         match supervisor.handle_task_exit(&mut ops, event) {
                                             Ok(decision) => yarm_user_rt::user_log!(
@@ -1540,6 +1560,8 @@ pub fn run() {
                 let mut ops = RuntimeSupervisorTaskExitOps {
                     token_tid: 0,
                     token: 0,
+                    supervisor_tid: startup.task_id,
+                    process_manager_caps,
                 };
                 match supervisor.execute_due_restarts(&mut ops) {
                     Ok(count) if count > 0 => {
@@ -1643,6 +1665,89 @@ fn query_lifecycle_via_process_manager(
 }
 
 #[cfg(not(test))]
+fn send_pm_restart_v1_via_process_manager(
+    process_manager_caps: Option<(u32, u32)>,
+    supervisor_tid: u64,
+    tid: u64,
+    restart_token: u64,
+) -> Result<(), KernelError> {
+    let Some((req_cap, rep_cap)) = process_manager_caps else {
+        yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_FAIL reason=no-pm-client");
+        return Err(KernelError::InvalidCapability);
+    };
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_PM_RESTART_REQUEST_BUILD_BEGIN tid={} supervisor_tid={}",
+        tid,
+        supervisor_tid
+    );
+    let request = PmRestartRequestV1::new(
+        tid,
+        supervisor_tid,
+        tid,
+        1,
+        b"supervised-service",
+        PmRestartReason::Fault,
+        PmRestartTokenDescriptor::scoped(tid, (restart_token & 0xffff) as u16),
+    )
+    .map_err(|_| {
+        yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_REQUEST_BUILD_FAIL tid={}", tid);
+        KernelError::WrongObject
+    })?;
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_PM_RESTART_REQUEST_BUILD_OK request_id={} target_tid={}",
+        request.request_id,
+        request.target_tid
+    );
+    let encoded = encode_pm_restart_request_v1(&request).map_err(|_| KernelError::WrongObject)?;
+    let msg = Message::with_header(supervisor_tid, PROC_OP_PM_RESTART_V1, 0, None, &encoded)
+        .map_err(|_| KernelError::WrongObject)?;
+    yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_BEGIN tid={}", tid);
+    // SAFETY: Uses kernel-provided PM request/reply caps when present. No cap is
+    // encoded in the payload as restart authority.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) }.map_err(|_| {
+        yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_FAIL reason=ipc_call");
+        KernelError::WrongObject
+    })?;
+    yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_OK tid={}", tid);
+    let reply_msg = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) }
+        .map_err(|_| KernelError::WrongObject)?
+        .ok_or(KernelError::WouldBlock)?;
+    yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_REPLY_RECV tid={}", tid);
+    let reply =
+        decode_pm_restart_reply_v1(reply_msg.as_slice()).map_err(|_| KernelError::WrongObject)?;
+    match reply.status {
+        PmRestartReplyStatus::Deferred => {
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_PM_RESTART_REPLY_DEFERRED tid={} failure={:?}",
+                tid,
+                reply.failure
+            );
+            Err(KernelError::WouldBlock)
+        }
+        PmRestartReplyStatus::Rejected
+        | PmRestartReplyStatus::NoSuchTarget
+        | PmRestartReplyStatus::UnsupportedVersion
+        | PmRestartReplyStatus::AlreadyRestarting
+        | PmRestartReplyStatus::RolledBack => {
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_PM_RESTART_REPLY_REJECTED tid={} status={:?} failure={:?}",
+                tid,
+                reply.status,
+                reply.failure
+            );
+            Err(KernelError::WrongObject)
+        }
+        PmRestartReplyStatus::Accepted => {
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_ACCEPTED tid={}",
+                tid
+            );
+            Err(KernelError::WrongObject)
+        }
+    }
+}
+
+#[cfg(not(test))]
 #[allow(dead_code)]
 fn execute_restart_via_process_manager(
     transport: &mut impl IpcTransport,
@@ -1674,6 +1779,8 @@ fn execute_restart_via_process_manager(
 struct RuntimeSupervisorTaskExitOps {
     token_tid: u64,
     token: u64,
+    supervisor_tid: u64,
+    process_manager_caps: Option<(u32, u32)>,
 }
 
 #[cfg(not(test))]
@@ -1701,9 +1808,13 @@ impl SupervisorTaskExitOps for RuntimeSupervisorTaskExitOps {
 
 #[cfg(not(test))]
 impl SupervisorRestartRedelegationOps for RuntimeSupervisorTaskExitOps {
-    fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError> {
-        yarm_user_rt::user_log!("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT");
-        Err(KernelError::InvalidCapability)
+    fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError> {
+        send_pm_restart_v1_via_process_manager(
+            self.process_manager_caps,
+            self.supervisor_tid,
+            tid,
+            restart_token,
+        )
     }
 
     fn delegate_driver_bundle(

@@ -1680,7 +1680,7 @@ mod tests {
         assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
             pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-7 must not add PM dispatch or supervisor send path"
         );
         assert!(
@@ -1728,7 +1728,7 @@ mod tests {
         assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
             pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-8 must not add PM dispatch or supervisor send path"
         );
         for forbidden in &[
@@ -1828,7 +1828,7 @@ mod tests {
             failures.push(PmRestartPromotionReadinessFailure::LiveAbiOpcodePresent);
         }
         if !pm_src.contains("PROC_OP_PM_RESTART_V1")
-            || supervisor_src.contains("PROC_OP_PM_RESTART_V1")
+            || !supervisor_src.contains("PROC_OP_PM_RESTART_V1")
         {
             failures.push(PmRestartPromotionReadinessFailure::DispatchPresent);
         }
@@ -1908,7 +1908,7 @@ mod tests {
         );
         assert!(
             pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-9 must not add dispatch or send paths"
         );
         assert!(
@@ -1994,7 +1994,7 @@ mod tests {
         if !pm_src.contains("PROC_OP_PM_RESTART_V1") {
             failures.push(PmRestartLiveReadinessFailure::DispatchPresent);
         }
-        if supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
+        if !supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
             failures.push(PmRestartLiveReadinessFailure::SupervisorSendPresent);
         }
         if !supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT") {
@@ -2088,6 +2088,62 @@ mod tests {
     }
 
     #[test]
+    fn sup_l3_supervisor_pm_restart_client_send_receive_is_bounded() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "send_pm_restart_v1_via_process_manager",
+            "PmRestartRequestV1::new",
+            "encode_pm_restart_request_v1(&request)",
+            "PROC_OP_PM_RESTART_V1",
+            "decode_pm_restart_reply_v1(reply_msg.as_slice())",
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILD_BEGIN",
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILD_OK",
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILD_FAIL",
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "SUPERVISOR_PM_RESTART_SEND_OK",
+            "SUPERVISOR_PM_RESTART_SEND_FAIL",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_DEFERRED",
+            "SUPERVISOR_PM_RESTART_REPLY_REJECTED",
+            "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_ACCEPTED",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L3 supervisor source must contain {needle}"
+            );
+        }
+        assert!(!supervisor_src.contains("SUPERVISOR_PM_RESTART_STATE_UPDATED"));
+    }
+
+    #[test]
+    fn sup_l3_supervisor_pm_restart_client_does_not_execute_restart_or_clear_success() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let start = supervisor_src
+            .find("fn send_pm_restart_v1_via_process_manager")
+            .expect("PM restart client helper");
+        let end = supervisor_src[start..]
+            .find("fn execute_restart_via_process_manager")
+            .map(|offset| start + offset)
+            .unwrap_or(supervisor_src.len());
+        let helper = &supervisor_src[start..end];
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "delegate_driver_bundle(",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+            "mint",
+            "revoke",
+            "STATE_UPDATED",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "SUP-L3 client helper must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn sup_l2_pm_restart_decode_validation_dispatch_is_present_and_bounded() {
         let pm_src = include_str!("process_manager/service.rs");
         for needle in &[
@@ -2159,8 +2215,8 @@ mod tests {
         assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"));
         assert!(
             pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
-            "SUP-10 must not add PM dispatch or supervisor send"
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-L3 permits PM dispatch and supervisor send but no restart success"
         );
         for future_marker in &[
             "SUPERVISOR_PM_RESTART_SEND_BEGIN",
@@ -2180,7 +2236,7 @@ mod tests {
                 "future marker must be documented: {future_marker}"
             );
             if *future_marker == "PM_RESTART_REPLY_ACCEPTED"
-                || future_marker.starts_with("SUPERVISOR_PM_RESTART")
+                || *future_marker == "SUPERVISOR_PM_RESTART_STATE_UPDATED"
             {
                 assert!(
                     !pm_src.contains(future_marker) && !supervisor_src.contains(future_marker),

@@ -313,3 +313,18 @@ SUP-L2 does not restart, spawn, tear down tasks, allocate address spaces,
 mint/revoke caps, grant MMIO/IRQ/DMA, perform MMIO, or change syscall/process IPC
 ABI counts. The next stage, SUP-L3, may add the supervisor send path, but still
 must not execute restart.
+
+## SUP-L3 supervisor PM restart client status
+
+SUP-L3 adds the supervisor PM restart client send/receive path for
+`PROC_OP_PM_RESTART_V1` when PM request/reply endpoint authority is configured.
+The supervisor builds canonical `PmRestartRequestV1` payloads, sends them to PM,
+and decodes canonical `PmRestartReplyV1` responses.
+
+PM remains decode/validation/deferred only: no PM restart mechanism exists yet.
+Deferred or rejected PM replies preserve dead/degraded supervisor state and block
+repeat sends rather than clearing the failure. Any Accepted reply is treated as a
+protocol violation until SUP-L4 and must not mark restart success. SUP-L3 does
+not restart, spawn, tear down tasks, allocate address spaces, mint/revoke caps,
+grant MMIO/IRQ/DMA, perform MMIO, change process opcode count, or change syscall
+ABI. The next stage, SUP-L4, will implement one narrow PM restart mechanism.
