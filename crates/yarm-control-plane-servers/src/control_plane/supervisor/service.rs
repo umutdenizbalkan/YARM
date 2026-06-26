@@ -10,9 +10,12 @@ use yarm::kernel::boot::{DriverBundlePlan, KernelError, KernelState};
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, LifecycleQueryReply, LifecycleQueryRequest,
     PROC_OP_EXECUTE_RESTART, PROC_OP_LIFECYCLE_QUERY, PROC_OP_PM_RESTART_V1,
-    PROC_OP_TASK_RESTART_TOKEN, PmRestartReason, PmRestartReplyStatus, PmRestartRequestV1,
-    PmRestartTokenDescriptor, TaskRestartTokenReply, TaskRestartTokenRequest,
+    PROC_OP_TASK_RESTART_TOKEN, TaskRestartTokenReply, TaskRestartTokenRequest,
     decode_pm_restart_reply_v1, encode_pm_restart_request_v1,
+};
+use yarm_ipc_abi::process_abi::{
+    PmRestartFailure, PmRestartReason, PmRestartReplyStatus, PmRestartRequestV1,
+    PmRestartTokenDescriptor,
 };
 use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
@@ -323,6 +326,76 @@ pub(crate) struct DriverRecoveryPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SupervisorRestartReason {
+    Fault,
+    NormalExit,
+    Dependency { cause_tid: u64 },
+    ManualPolicy,
+}
+
+impl SupervisorRestartReason {
+    const fn dependency_cause_tid(self) -> u64 {
+        match self {
+            Self::Dependency { cause_tid } => cause_tid,
+            _ => 0,
+        }
+    }
+
+    const fn as_pm_reason(self) -> PmRestartReason {
+        match self {
+            Self::Fault => PmRestartReason::Fault,
+            Self::NormalExit => PmRestartReason::NormalExit,
+            Self::Dependency { .. } => PmRestartReason::DependencyFailed,
+            Self::ManualPolicy => PmRestartReason::ManualPolicy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupervisorPmRestartState {
+    PendingDue,
+    BlockedNoPmClient,
+    PmDeferred,
+    PmRejected,
+    PmClientSendFailed,
+    ProtocolViolation,
+    AwaitingMechanismUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SupervisorPmRestartClientRequest {
+    request_id: u64,
+    supervisor_tid: u64,
+    target_tid: u64,
+    service_kind: u16,
+    service_name: &'static [u8],
+    reason: SupervisorRestartReason,
+    attempt_count: u16,
+    due_tick: u64,
+    degraded_hint: bool,
+    policy_flags: u32,
+    token_owner_tid: u64,
+    token_fingerprint: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorPmRestartClientResult {
+    Deferred {
+        failure: PmRestartFailure,
+        retry_tick: u64,
+    },
+    Rejected {
+        failure: PmRestartFailure,
+    },
+    ProtocolViolationAccepted,
+    MalformedReply,
+    SendFailed,
+    NoPmClient,
+    BuildFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ManagedServiceRecord {
     tid: u64,
     kind: ManagedServiceKind,
@@ -339,6 +412,9 @@ struct ManagedServiceRecord {
     restart_deferred_by_pm: bool,
     restart_rejected_by_pm: bool,
     restart_deferred_no_pm_client_logged: bool,
+    pm_restart_state: SupervisorPmRestartState,
+    pending_restart_reason: SupervisorRestartReason,
+    pending_pm_request_id: Option<u64>,
     pending_redelegation: bool,
     driver_policy: Option<ServiceRestartPolicy>,
     driver_plan: Option<DriverRecoveryPlan>,
@@ -352,6 +428,7 @@ pub struct SupervisorService {
     managed: [Option<ManagedServiceRecord>; MAX_MANAGED_SERVICES],
     degraded: bool,
     current_tick: TickInstant,
+    next_pm_restart_request_id: u64,
     #[cfg(test)]
     test_disable_budgeted_receive_for_tracked_tid: Option<u64>,
 }
@@ -362,7 +439,11 @@ pub trait SupervisorOutboundMessageOps {
 }
 
 pub(crate) trait SupervisorRestartRedelegationOps: SupervisorOutboundMessageOps {
-    fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError>;
+    fn restart_task(
+        &mut self,
+        request: SupervisorPmRestartClientRequest,
+    ) -> SupervisorPmRestartClientResult;
+    #[allow(dead_code)]
     fn delegate_driver_bundle(
         &mut self,
         server_tid: u64,
@@ -400,8 +481,11 @@ impl SupervisorOutboundMessageOps for KernelSupervisorOutboundMessageOps<'_> {
 
 #[cfg(test)]
 impl SupervisorRestartRedelegationOps for KernelSupervisorOutboundMessageOps<'_> {
-    fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError> {
-        self.kernel.restart_task(tid, restart_token)
+    fn restart_task(
+        &mut self,
+        _request: SupervisorPmRestartClientRequest,
+    ) -> SupervisorPmRestartClientResult {
+        SupervisorPmRestartClientResult::SendFailed
     }
 
     fn delegate_driver_bundle(
@@ -446,6 +530,7 @@ impl SupervisorService {
             managed: [None; MAX_MANAGED_SERVICES],
             degraded: false,
             current_tick: TickInstant(0),
+            next_pm_restart_request_id: 1,
             #[cfg(test)]
             test_disable_budgeted_receive_for_tracked_tid: None,
         }
@@ -545,6 +630,9 @@ impl SupervisorService {
             restart_deferred_by_pm: false,
             restart_rejected_by_pm: false,
             restart_deferred_no_pm_client_logged: false,
+            pm_restart_state: SupervisorPmRestartState::BlockedNoPmClient,
+            pending_restart_reason: SupervisorRestartReason::Fault,
+            pending_pm_request_id: None,
             pending_redelegation: false,
             driver_policy: None,
             driver_plan: None,
@@ -575,6 +663,9 @@ impl SupervisorService {
             restart_deferred_by_pm: false,
             restart_rejected_by_pm: false,
             restart_deferred_no_pm_client_logged: false,
+            pm_restart_state: SupervisorPmRestartState::BlockedNoPmClient,
+            pending_restart_reason: SupervisorRestartReason::Fault,
+            pending_pm_request_id: None,
             pending_redelegation: false,
             driver_policy: Some(policy),
             driver_plan: Some(plan),
@@ -638,7 +729,39 @@ impl SupervisorService {
         out
     }
 
-    fn schedule_restart(&mut self, tid: u64, token: u64) -> Result<TickInstant, KernelError> {
+    fn next_pm_restart_request_id(&mut self) -> Result<u64, KernelError> {
+        let request_id = self.next_pm_restart_request_id;
+        self.next_pm_restart_request_id = self
+            .next_pm_restart_request_id
+            .checked_add(1)
+            .ok_or(KernelError::WrongObject)?;
+        Ok(request_id)
+    }
+
+    const fn service_kind_code(kind: ManagedServiceKind) -> u16 {
+        match kind {
+            ManagedServiceKind::Core(CoreServiceKind::ProcessManager) => 1,
+            ManagedServiceKind::Core(CoreServiceKind::Vfs) => 2,
+            ManagedServiceKind::Core(CoreServiceKind::Supervisor) => 3,
+            ManagedServiceKind::Driver => 100,
+        }
+    }
+
+    const fn service_name_bytes(kind: ManagedServiceKind) -> &'static [u8] {
+        match kind {
+            ManagedServiceKind::Core(CoreServiceKind::ProcessManager) => b"process_manager",
+            ManagedServiceKind::Core(CoreServiceKind::Vfs) => b"vfs",
+            ManagedServiceKind::Core(CoreServiceKind::Supervisor) => b"supervisor",
+            ManagedServiceKind::Driver => b"driver",
+        }
+    }
+
+    fn schedule_restart_with_reason(
+        &mut self,
+        tid: u64,
+        token: u64,
+        reason: SupervisorRestartReason,
+    ) -> Result<TickInstant, KernelError> {
         let snapshot = self.find_record(tid).ok_or(KernelError::TaskMissing)?;
         let policy = self.policy_for(snapshot);
         let restart_window_ticks = self.handoff.restart_window_ticks;
@@ -654,13 +777,20 @@ impl SupervisorService {
         record.pending_restart_due = Some(current_tick + TickDuration(policy.backoff_ticks));
         record.pending_restart_token = Some(token);
         record.restart_blocked_no_pm_client = false;
+        record.restart_deferred_by_pm = false;
+        record.restart_rejected_by_pm = false;
         record.restart_deferred_no_pm_client_logged = false;
+        record.pm_restart_state = SupervisorPmRestartState::PendingDue;
+        record.pending_restart_reason = reason;
+        record.pending_pm_request_id = None;
         #[cfg(not(test))]
         yarm_user_rt::user_log!(
-            "SUPERVISOR_RESTART_SCHEDULED tid={} due_tick={} attempt={}",
+            "SUPERVISOR_RESTART_SCHEDULED tid={} due_tick={} attempt={} reason={:?} dependency_cause_tid={}",
             tid,
             record.pending_restart_due.expect("due set").0,
-            record.restart_attempts
+            record.restart_attempts,
+            record.pending_restart_reason.as_pm_reason(),
+            record.pending_restart_reason.dependency_cause_tid()
         );
         Ok(record.pending_restart_due.expect("due set"))
     }
@@ -744,7 +874,7 @@ impl SupervisorService {
         &mut self,
         restart_ops: &mut impl SupervisorRestartRedelegationOps,
     ) -> Result<usize, KernelError> {
-        let mut restarted = 0usize;
+        let restarted = 0usize;
         let mut idx = 0usize;
         while idx < self.managed.len() {
             let Some(mut record) = self.managed[idx] else {
@@ -759,31 +889,85 @@ impl SupervisorService {
                 idx += 1;
                 continue;
             }
-            if record.restart_blocked_no_pm_client {
+            if !matches!(
+                record.pm_restart_state,
+                SupervisorPmRestartState::PendingDue
+            ) {
                 self.managed[idx] = Some(record);
                 idx += 1;
                 continue;
             }
-            let restart_token = record
-                .pending_restart_token
-                .ok_or(KernelError::WrongObject)?;
+            let Some(restart_token) = record.pending_restart_token else {
+                record.pm_restart_state = SupervisorPmRestartState::BlockedNoPmClient;
+                record.restart_blocked_no_pm_client = true;
+                self.managed[idx] = Some(record);
+                idx += 1;
+                continue;
+            };
+            let request_id = self.next_pm_restart_request_id()?;
+            record.pending_pm_request_id = Some(request_id);
+            let client_request = SupervisorPmRestartClientRequest {
+                request_id,
+                supervisor_tid: self.handoff.supervisor_tid,
+                target_tid: record.tid,
+                service_kind: Self::service_kind_code(record.kind),
+                service_name: Self::service_name_bytes(record.kind),
+                reason: record.pending_restart_reason,
+                attempt_count: record.restart_attempts as u16,
+                due_tick: due.0,
+                degraded_hint: self.degraded,
+                policy_flags: 0,
+                token_owner_tid: record.tid,
+                token_fingerprint: (restart_token & 0xffff) as u16,
+            };
             #[cfg(not(test))]
             yarm_user_rt::user_log!(
-                "SUPERVISOR_RESTART_DUE_CHECK tid={} service={} reason=fault due_tick={} attempt={} blocked_no_pm_client={}",
+                "SUPERVISOR_RESTART_DUE_CHECK tid={} service={} request_id={} reason={:?} dependency_cause_tid={} due_tick={} attempt={} state={:?}",
                 record.tid,
                 Self::service_name(record.kind),
+                request_id,
+                record.pending_restart_reason.as_pm_reason(),
+                record.pending_restart_reason.dependency_cause_tid(),
                 due.0,
                 record.restart_attempts,
-                record.restart_blocked_no_pm_client
+                record.pm_restart_state
             );
-            match restart_ops.restart_task(record.tid, restart_token) {
-                Ok(()) => {}
-                Err(_err) => {
-                    match _err {
-                        KernelError::WouldBlock => record.restart_deferred_by_pm = true,
-                        KernelError::WrongObject => record.restart_rejected_by_pm = true,
-                        _ => record.restart_blocked_no_pm_client = true,
-                    }
+            let client_result = restart_ops.restart_task(client_request);
+            match client_result {
+                SupervisorPmRestartClientResult::Deferred {
+                    failure,
+                    retry_tick,
+                } => {
+                    record.restart_deferred_by_pm = true;
+                    record.pm_restart_state = if failure == PmRestartFailure::ResourceUnavailable {
+                        SupervisorPmRestartState::AwaitingMechanismUnavailable
+                    } else {
+                        SupervisorPmRestartState::PmDeferred
+                    };
+                    #[cfg(not(test))]
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_PM_RESTART_REPLY_DEFERRED_STATE tid={} request_id={} failure={:?} retry_tick={} state={:?}",
+                        record.tid,
+                        request_id,
+                        failure,
+                        retry_tick,
+                        record.pm_restart_state
+                    );
+                }
+                SupervisorPmRestartClientResult::Rejected { failure } => {
+                    record.restart_rejected_by_pm = true;
+                    record.pm_restart_state = SupervisorPmRestartState::PmRejected;
+                    #[cfg(not(test))]
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_PM_RESTART_REPLY_REJECTED_STATE tid={} request_id={} failure={:?}",
+                        record.tid,
+                        request_id,
+                        failure
+                    );
+                }
+                SupervisorPmRestartClientResult::NoPmClient => {
+                    record.restart_blocked_no_pm_client = true;
+                    record.pm_restart_state = SupervisorPmRestartState::BlockedNoPmClient;
                     if !record.restart_deferred_no_pm_client_logged {
                         #[cfg(not(test))]
                         yarm_user_rt::user_log!(
@@ -795,36 +979,19 @@ impl SupervisorService {
                         );
                         record.restart_deferred_no_pm_client_logged = true;
                     }
-                    self.managed[idx] = Some(record);
-                    idx += 1;
-                    continue;
                 }
-            }
-            record.last_restart_tick = self.current_tick;
-            record.pending_restart_due = None;
-            record.pending_restart_token = None;
-            record.restart_blocked_no_pm_client = false;
-            record.restart_deferred_by_pm = false;
-            record.restart_rejected_by_pm = false;
-            record.restart_deferred_no_pm_client_logged = false;
-            if matches!(record.kind, ManagedServiceKind::Driver) {
-                let plan = record.driver_plan;
-                if let Some(plan) = plan {
-                    restart_ops.delegate_driver_bundle(record.tid, plan)?;
-                    record.pending_redelegation = false;
-                } else {
-                    record.pending_redelegation = true;
-                    self.send_init_alert(
-                        restart_ops,
-                        InitAlert {
-                            tid: record.tid,
-                            kind: InitAlertKind::RedelegationRequired,
-                        },
-                    )?;
+                SupervisorPmRestartClientResult::SendFailed => {
+                    record.pm_restart_state = SupervisorPmRestartState::PmClientSendFailed;
+                }
+                SupervisorPmRestartClientResult::MalformedReply
+                | SupervisorPmRestartClientResult::ProtocolViolationAccepted => {
+                    record.pm_restart_state = SupervisorPmRestartState::ProtocolViolation;
+                }
+                SupervisorPmRestartClientResult::BuildFailed => {
+                    record.pm_restart_state = SupervisorPmRestartState::ProtocolViolation;
                 }
             }
             self.managed[idx] = Some(record);
-            restarted += 1;
             idx += 1;
         }
         Ok(restarted)
@@ -1135,7 +1302,15 @@ impl SupervisorService {
             });
         }
 
-        let due_tick = self.schedule_restart(event.tid, event.restart_token)?;
+        let restart_reason = if (event.exit_code & SUPERVISOR_FAULT_EXIT_CODE_TAG)
+            == SUPERVISOR_FAULT_EXIT_CODE_TAG
+        {
+            SupervisorRestartReason::Fault
+        } else {
+            SupervisorRestartReason::NormalExit
+        };
+        let due_tick =
+            self.schedule_restart_with_reason(event.tid, event.restart_token, restart_reason)?;
         for dependent_tid in self.dependent_tids(snapshot).into_iter().flatten() {
             let Some(token) = task_exit_ops.task_restart_token(dependent_tid) else {
                 #[cfg(not(test))]
@@ -1146,7 +1321,13 @@ impl SupervisorService {
                 );
                 continue;
             };
-            let _ = self.schedule_restart(dependent_tid, token);
+            let _ = self.schedule_restart_with_reason(
+                dependent_tid,
+                token,
+                SupervisorRestartReason::Dependency {
+                    cause_tid: event.tid,
+                },
+            );
         }
         Ok(SupervisorDecision::ScheduledRestart {
             tid: event.tid,
@@ -1667,62 +1848,139 @@ fn query_lifecycle_via_process_manager(
 #[cfg(not(test))]
 fn send_pm_restart_v1_via_process_manager(
     process_manager_caps: Option<(u32, u32)>,
-    supervisor_tid: u64,
-    tid: u64,
-    restart_token: u64,
-) -> Result<(), KernelError> {
+    client_request: SupervisorPmRestartClientRequest,
+) -> SupervisorPmRestartClientResult {
     let Some((req_cap, rep_cap)) = process_manager_caps else {
         yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_FAIL reason=no-pm-client");
-        return Err(KernelError::InvalidCapability);
+        return SupervisorPmRestartClientResult::NoPmClient;
+    };
+    if client_request.token_owner_tid != client_request.target_tid {
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILD_FAIL tid={} reason=token-owner-mismatch",
+            client_request.target_tid
+        );
+        return SupervisorPmRestartClientResult::BuildFailed;
     };
     yarm_user_rt::user_log!(
-        "SUPERVISOR_PM_RESTART_REQUEST_BUILD_BEGIN tid={} supervisor_tid={}",
-        tid,
-        supervisor_tid
+        "SUPERVISOR_PM_RESTART_REQUEST_BUILD_BEGIN tid={} request_id={} supervisor_tid={} service_kind={} reason={:?} dependency_cause_tid={}",
+        client_request.target_tid,
+        client_request.request_id,
+        client_request.supervisor_tid,
+        client_request.service_kind,
+        client_request.reason.as_pm_reason(),
+        client_request.reason.dependency_cause_tid()
     );
-    let request = PmRestartRequestV1::new(
-        tid,
-        supervisor_tid,
-        tid,
-        1,
-        b"supervised-service",
-        PmRestartReason::Fault,
-        PmRestartTokenDescriptor::scoped(tid, (restart_token & 0xffff) as u16),
-    )
-    .map_err(|_| {
-        yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_REQUEST_BUILD_FAIL tid={}", tid);
-        KernelError::WrongObject
-    })?;
+    let mut request = match PmRestartRequestV1::new(
+        client_request.request_id,
+        client_request.supervisor_tid,
+        client_request.target_tid,
+        client_request.service_kind,
+        client_request.service_name,
+        client_request.reason.as_pm_reason(),
+        PmRestartTokenDescriptor::scoped(
+            client_request.token_owner_tid,
+            client_request.token_fingerprint,
+        ),
+    ) {
+        Ok(request) => request,
+        Err(_err) => {
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_PM_RESTART_REQUEST_BUILD_FAIL tid={} reason=codec",
+                client_request.target_tid
+            );
+            return SupervisorPmRestartClientResult::BuildFailed;
+        }
+    };
+    request.attempt_count = client_request.attempt_count;
+    request.due_tick = client_request.due_tick;
+    request.dependency_cause_tid = client_request.reason.dependency_cause_tid();
+    request.degraded_hint = client_request.degraded_hint;
+    request.policy_flags = client_request.policy_flags;
     yarm_user_rt::user_log!(
-        "SUPERVISOR_PM_RESTART_REQUEST_BUILD_OK request_id={} target_tid={}",
+        "SUPERVISOR_PM_RESTART_REQUEST_BUILD_OK request_id={} target_tid={} service_name_len={}",
         request.request_id,
-        request.target_tid
+        request.target_tid,
+        request.service_name_len
     );
-    let encoded = encode_pm_restart_request_v1(&request).map_err(|_| KernelError::WrongObject)?;
-    let msg = Message::with_header(supervisor_tid, PROC_OP_PM_RESTART_V1, 0, None, &encoded)
-        .map_err(|_| KernelError::WrongObject)?;
-    yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_BEGIN tid={}", tid);
+    let encoded = match encode_pm_restart_request_v1(&request) {
+        Ok(encoded) => encoded,
+        Err(_err) => return SupervisorPmRestartClientResult::BuildFailed,
+    };
+    let msg = match Message::with_header(
+        client_request.supervisor_tid,
+        PROC_OP_PM_RESTART_V1,
+        0,
+        None,
+        &encoded,
+    ) {
+        Ok(msg) => msg,
+        Err(_err) => return SupervisorPmRestartClientResult::BuildFailed,
+    };
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_PM_RESTART_SEND_BEGIN tid={} request_id={}",
+        client_request.target_tid,
+        client_request.request_id
+    );
     // SAFETY: Uses kernel-provided PM request/reply caps when present. No cap is
     // encoded in the payload as restart authority.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) }.map_err(|_| {
+    if unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) }.is_err() {
         yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_FAIL reason=ipc_call");
-        KernelError::WrongObject
-    })?;
-    yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_SEND_OK tid={}", tid);
-    let reply_msg = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) }
-        .map_err(|_| KernelError::WrongObject)?
-        .ok_or(KernelError::WouldBlock)?;
-    yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_REPLY_RECV tid={}", tid);
-    let reply =
-        decode_pm_restart_reply_v1(reply_msg.as_slice()).map_err(|_| KernelError::WrongObject)?;
+        return SupervisorPmRestartClientResult::SendFailed;
+    }
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_PM_RESTART_SEND_OK tid={} request_id={}",
+        client_request.target_tid,
+        client_request.request_id
+    );
+    let reply_msg = match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) } {
+        Ok(Some(reply_msg)) => reply_msg,
+        Ok(None) => return SupervisorPmRestartClientResult::SendFailed,
+        Err(_err) => return SupervisorPmRestartClientResult::SendFailed,
+    };
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_PM_RESTART_REPLY_RECV tid={} request_id={}",
+        client_request.target_tid,
+        client_request.request_id
+    );
+    let reply = match decode_pm_restart_reply_v1(reply_msg.as_slice()) {
+        Ok(reply) => reply,
+        Err(_err) => return SupervisorPmRestartClientResult::MalformedReply,
+    };
+    if reply.request_id != client_request.request_id
+        || reply.target_tid != client_request.target_tid
+    {
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_MISMATCH request_id={} reply_request_id={} target_tid={} reply_target_tid={}",
+            client_request.request_id,
+            reply.request_id,
+            client_request.target_tid,
+            reply.target_tid
+        );
+        return SupervisorPmRestartClientResult::MalformedReply;
+    }
+    if !matches!(reply.status, PmRestartReplyStatus::Accepted)
+        && (reply.replacement_handle_kind != 0 || reply.replacement_handle_value != 0)
+    {
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_REPLACEMENT_HANDLE tid={} request_id={}",
+            client_request.target_tid,
+            client_request.request_id
+        );
+        return SupervisorPmRestartClientResult::MalformedReply;
+    }
     match reply.status {
         PmRestartReplyStatus::Deferred => {
             yarm_user_rt::user_log!(
-                "SUPERVISOR_PM_RESTART_REPLY_DEFERRED tid={} failure={:?}",
-                tid,
-                reply.failure
+                "SUPERVISOR_PM_RESTART_REPLY_DEFERRED tid={} request_id={} failure={:?} retry_tick={}",
+                client_request.target_tid,
+                client_request.request_id,
+                reply.failure,
+                reply.next_retry_tick
             );
-            Err(KernelError::WouldBlock)
+            SupervisorPmRestartClientResult::Deferred {
+                failure: reply.failure,
+                retry_tick: reply.next_retry_tick,
+            }
         }
         PmRestartReplyStatus::Rejected
         | PmRestartReplyStatus::NoSuchTarget
@@ -1730,19 +1988,23 @@ fn send_pm_restart_v1_via_process_manager(
         | PmRestartReplyStatus::AlreadyRestarting
         | PmRestartReplyStatus::RolledBack => {
             yarm_user_rt::user_log!(
-                "SUPERVISOR_PM_RESTART_REPLY_REJECTED tid={} status={:?} failure={:?}",
-                tid,
+                "SUPERVISOR_PM_RESTART_REPLY_REJECTED tid={} request_id={} status={:?} failure={:?}",
+                client_request.target_tid,
+                client_request.request_id,
                 reply.status,
                 reply.failure
             );
-            Err(KernelError::WrongObject)
+            SupervisorPmRestartClientResult::Rejected {
+                failure: reply.failure,
+            }
         }
         PmRestartReplyStatus::Accepted => {
             yarm_user_rt::user_log!(
-                "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_ACCEPTED tid={}",
-                tid
+                "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_ACCEPTED tid={} request_id={}",
+                client_request.target_tid,
+                client_request.request_id
             );
-            Err(KernelError::WrongObject)
+            SupervisorPmRestartClientResult::ProtocolViolationAccepted
         }
     }
 }
@@ -1808,13 +2070,15 @@ impl SupervisorTaskExitOps for RuntimeSupervisorTaskExitOps {
 
 #[cfg(not(test))]
 impl SupervisorRestartRedelegationOps for RuntimeSupervisorTaskExitOps {
-    fn restart_task(&mut self, tid: u64, restart_token: u64) -> Result<(), KernelError> {
-        send_pm_restart_v1_via_process_manager(
-            self.process_manager_caps,
-            self.supervisor_tid,
-            tid,
-            restart_token,
-        )
+    fn restart_task(
+        &mut self,
+        request: SupervisorPmRestartClientRequest,
+    ) -> SupervisorPmRestartClientResult {
+        let request = SupervisorPmRestartClientRequest {
+            supervisor_tid: self.supervisor_tid,
+            ..request
+        };
+        send_pm_restart_v1_via_process_manager(self.process_manager_caps, request)
     }
 
     fn delegate_driver_bundle(
@@ -1870,8 +2134,14 @@ mod tests {
     }
 
     impl SupervisorRestartRedelegationOps for MockOutboundOps {
-        fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError> {
-            Ok(())
+        fn restart_task(
+            &mut self,
+            _request: SupervisorPmRestartClientRequest,
+        ) -> SupervisorPmRestartClientResult {
+            SupervisorPmRestartClientResult::Deferred {
+                failure: PmRestartFailure::ResourceUnavailable,
+                retry_tick: 0,
+            }
         }
 
         fn delegate_driver_bundle(
@@ -1897,9 +2167,12 @@ mod tests {
     }
 
     impl SupervisorRestartRedelegationOps for FailingRestartOps {
-        fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError> {
+        fn restart_task(
+            &mut self,
+            _request: SupervisorPmRestartClientRequest,
+        ) -> SupervisorPmRestartClientResult {
             self.attempts += 1;
-            Err(KernelError::InvalidCapability)
+            SupervisorPmRestartClientResult::NoPmClient
         }
         fn delegate_driver_bundle(
             &mut self,

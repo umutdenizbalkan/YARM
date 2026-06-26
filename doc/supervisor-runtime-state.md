@@ -78,3 +78,44 @@ protocol violation until SUP-L4 and must not mark restart success. SUP-L3 does
 not restart, spawn, tear down tasks, allocate address spaces, mint/revoke caps,
 grant MMIO/IRQ/DMA, perform MMIO, change process opcode count, or change syscall
 ABI. The next stage, SUP-L4, will implement one narrow PM restart mechanism.
+
+## SUP-L3A client semantics hardening
+
+SUP-L3A is a supervisor PM-restart client semantics hardening stage only. It does
+not add PM restart execution and does not change the global process IPC ABI:
+`PROC_OP_PM_RESTART_V1` remains 15, `PROC_OP_PM_RESTART_REPLY_V1` remains 16,
+and `PROCESS_IPC_OPCODE_COUNT` remains 16.
+
+The supervisor now maps PM restart client outcomes through a typed internal
+result instead of generic syscall/control-plane errors. Deferred PM replies,
+rejected PM replies, accepted-reply protocol violations, malformed replies,
+transport send failures, missing PM clients, and request-build failures remain
+separate states. Deferred/rejected replies preserve the dead/degraded service
+state and do not clear restart state as success.
+
+Supervisor PM restart request IDs are monotonic/generation-style IDs allocated by
+the supervisor for each due request. Repeated requests for the same target receive
+distinct request IDs, overflow fails closed before issuing a request, and a
+synchronous PM reply must match both request ID and target TID before supervisor
+state changes.
+
+Request construction derives service kind and bounded service name from the
+managed service record. Restart reason is derived from the scheduled event:
+fault reports encode Fault, normal task exits encode NormalExit, and dependency
+restarts encode DependencyFailed with `dependency_cause_tid` set to the failed
+service TID. SUP-L3A continues to encode only a scoped/redacted token descriptor;
+raw tokens and local CapIds are not encoded as restart authority, missing tokens
+prevent sends, and live capability-bound restart authority remains SUP-L4-or-later
+work.
+
+Reply validation is fail-closed: malformed replies, mismatched request IDs,
+mismatched target TIDs, Accepted status, or nonzero replacement handles on
+Deferred/Rejected replies are protocol violations or malformed outcomes. Valid PM
+requests still defer with mechanism unavailable; no Accepted success path or
+replacement handle is honored in SUP-L3A.
+
+The due-restart runtime state machine is explicit and non-overlapping:
+PendingDue, BlockedNoPmClient, PmDeferred, PmRejected, PmClientSendFailed,
+ProtocolViolation, and AwaitingMechanismUnavailable. PM-deferred/rejected states
+avoid busy-loop resends and preserve fail-closed behavior until a later staged
+mechanism is implemented.

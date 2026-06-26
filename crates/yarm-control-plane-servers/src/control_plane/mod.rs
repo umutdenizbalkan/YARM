@@ -927,9 +927,12 @@ mod tests {
             );
         }
         assert!(
-            src.contains("fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError>")
-                && src.contains("Err(KernelError::InvalidCapability)"),
-            "runtime restart op must not fake production success"
+            src.contains("SupervisorPmRestartClientResult")
+                && src.contains("NoPmClient")
+                && !src.contains(
+                    "fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError>"
+                ),
+            "runtime restart op must use typed PM client results instead of fake production success"
         );
     }
 
@@ -2141,6 +2144,46 @@ mod tests {
                 "SUP-L3 client helper must not contain {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn sup_l3a_supervisor_pm_client_semantics_are_typed_and_hardened() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "enum SupervisorPmRestartClientResult",
+            "Deferred {",
+            "Rejected {",
+            "ProtocolViolationAccepted",
+            "MalformedReply",
+            "SendFailed",
+            "NoPmClient",
+            "BuildFailed",
+            "next_pm_restart_request_id",
+            "checked_add(1)",
+            "reply.request_id != client_request.request_id",
+            "reply.target_tid != client_request.target_tid",
+            "replacement_handle_kind != 0",
+            "SupervisorRestartReason::Dependency",
+            "service_kind_code",
+            "service_name_bytes",
+            "token_owner_tid != client_request.target_tid",
+            "SupervisorPmRestartState",
+            "PmDeferred",
+            "PmRejected",
+            "PmClientSendFailed",
+            "ProtocolViolation",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L3A supervisor source must contain {needle}"
+            );
+        }
+        assert!(
+            !supervisor_src.contains("request_id: tid")
+                && !supervisor_src.contains("b\"supervised-service\"")
+                && !supervisor_src.contains("service_kind, 1"),
+            "SUP-L3A request IDs, service names, and service kind must be derived"
+        );
     }
 
     #[test]
