@@ -236,3 +236,49 @@ SUP-10 adds `doc/pm-restart-live-readiness-evidence.md` and a GoForAbiReview-onl
 source guard. It is evidence/diff planning only: live global IPC ABI, syscall ABI,
 PM dispatch, supervisor send, and restart/spawn/teardown/cap/resource behavior
 remain unchanged and disabled.
+
+## SUP-11 runtime cleanup (2026-06-26)
+
+SUP-11 is a production supervisor runtime cleanup, not the live PM restart
+implementation. The runtime now keeps one restart execution path: authoritative
+fault/task-exit reports schedule restart state through `handle_task_exit`, and
+actual execution is considered only by the due-restart sweep. The direct
+fault-handler execute-restart bypass is disabled so fault and task-exited paths
+share backoff and cannot double-attempt a restart.
+
+Production restart execution remains fail-closed because no live PM client or
+restart opcode is allocated. When the due-restart sweep reaches such a record it
+marks the record as `RestartBlockedNoPmClient`, leaves the task dead/degraded or
+pending, and emits a single structured
+`SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT` line with tid, service, reason,
+due tick, attempt count, and state. Later loop iterations do not repeatedly call
+the unavailable PM path or recreate the old multi-line deferred spam pattern.
+
+Bad fault senders are rejected with `SUPERVISOR_FAULT_SENDER_REJECTED` but no
+longer abort the live loop with `continue`; normal tick advancement and due
+restart maintenance still run after rejection. Authoritative production
+fault/task-exit reports are accepted only from a kernel-origin fault endpoint
+sender, the registered Process Manager, or another explicit trusted lifecycle
+authority. Claimed-task self-reporting is not treated as authoritative fault
+origin; it must be modeled separately as health/degraded reporting if needed.
+
+Remaining live gaps are unchanged: a real PM restart client, timer endpoint,
+cap-bound restart token, and PM cleanup/rollback are still absent. SUP-11 does
+not allocate live PM restart opcodes, wire supervisor-to-PM restart IPC, spawn or
+tear down tasks, allocate address spaces, mint/revoke capabilities, grant
+MMIO/IRQ/DMA, perform MMIO, or change syscall/global IPC ABI.
+
+## SUP-12 mechanical restart-model extraction (2026-06-26)
+
+SUP-12 is mechanical extraction only. The SUP-2 through SUP-10 non-live restart
+contract/model/readiness definitions and helper methods are isolated in
+`crates/yarm-control-plane-servers/src/control_plane/supervisor/restart_model.rs`,
+which is compiled only for hosted-dev/test guardrails. The production
+`service.rs` hot path keeps SUP-11 runtime state, scheduling, fault validation,
+run-loop, fail-closed deferred restart markers, and runtime ops.
+
+Production behavior remains unchanged from SUP-11: no live PM restart client,
+PM dispatch, supervisor PM restart send path, restart/spawn/teardown,
+capability/resource behavior, MMIO/IRQ/DMA grant, syscall ABI change, or global
+IPC ABI change exists. Future live work should start at SUP-L1 rather than adding
+more review-only model expansion.

@@ -136,3 +136,27 @@ SUP-10 links this supervisor contract to `doc/pm-restart-live-readiness-evidence
 The supervisor remains requestor-only and fail-closed; any future SUP-live stage
 must explicitly change the contract from proposed to live after satisfying the
 SUP-8, SUP-9, and SUP-10 gates.
+
+## SUP-11 runtime boundary update (2026-06-26)
+
+The SUP-2 through SUP-10 restart contract/model remains non-live. SUP-11 moves
+production behavior toward the modeled contract by removing the direct
+fault-handler PM execute-restart bypass, but it intentionally does not wire a
+live PM restart send path. Helpers that query or execute PM restart IPC are
+legacy/deferred scaffolding and must not be called by production fault/task-exit
+restart execution until a future task introduces the real contract-compliant PM
+client, opcodes, cap-bound token flow, cleanup, and rollback semantics.
+
+Production restart records now use a blocked/deferred runtime state when the due
+sweep finds no PM client. This preserves fail-closed behavior without
+busy-looping or clearing service state as if restart succeeded. New runtime
+markers are `SUPERVISOR_RESTART_SCHEDULED`, `SUPERVISOR_RESTART_DUE_CHECK`, and
+`SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT`.
+
+## SUP-12 model extraction boundary (2026-06-26)
+
+The restart contract/model code now lives in the gated supervisor
+`restart_model.rs` module for hosted-dev/test/docs guardrails. This is a
+mechanical location change only: the contract remains non-live, no PM IPC or
+runtime dispatch is enabled, and production restart execution remains the SUP-11
+fail-closed due-restart path.
