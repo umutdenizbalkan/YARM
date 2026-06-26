@@ -362,3 +362,46 @@ Guardrails remain unchanged: `PROCESS_IPC_OPCODE_COUNT == 16`,
 `SYSCALL_COUNT == 31`, no kernel/arch/RPi5/driver-manager DRS changes, no broad
 restart-any-image support, no manual cap/slot invention, no raw token authority,
 and no supervisor-side restart execution.
+
+## SUP-L5A safe crash-test image metadata: test-gated image id 13
+
+SUP-L5A resolves the SUP-L5 MissingImageId planning blocker without adding the
+`crash_test_srv` service binary and without changing normal boot. The selected
+future crash-test image id is `CRASH_TEST_SRV_IMAGE_ID = 13`; it is unique relative
+to the existing direct-initrd ids `1..=6` and VFS-backed ids `7..=12`, and image
+id 6 remains `vfs_server`.
+
+The mapping is test-gated only. PM records source/docs markers
+`CRASH_TEST_IMAGE_ID_ASSIGNED image_id=13` and `CRASH_TEST_IMAGE_GATED`, and the
+path descriptor is `/initramfs/sbin/crash_test_srv`, but PM exposes that mapping
+only when the supervisor restart test gate is enabled. Normal production boot and
+RPi5 profiles do not spawn or stage `crash_test_srv`.
+
+SUP-L5A selects the existing VFS-backed PM spawn path for the future crash-test
+service because direct-initrd ids are occupied and broadening the direct-initrd
+range would affect bootstrap behavior. The metadata references the existing
+`pm_vfs_spawn_inline` path and does not duplicate spawn logic.
+
+The PM-owned restart metadata is bounded and descriptor-only. A crash-test restart
+spec records:
+
+- original image id 13;
+- service name `crash_test_srv`;
+- parent/supervisor owner TIDs;
+- default `max_restarts = 3`;
+- scoped/redacted token fingerprint descriptor;
+- load source `Vfs` and the gated path descriptor.
+
+The spec deliberately does **not** store local CapIds as authority, hard-coded
+CNode slots, endpoint-cap installations, manually fabricated caps, or driver /
+MMIO / IRQ / DMA resource descriptors. Missing spec remains `MissingRestartSpec`,
+and the crash-test image is unavailable unless the restart-test gate is enabled.
+SUP-L4 production restart support remains narrow: image id 6 is still the existing
+gated SUP-L4 class, and image id 13 is restart-test-only future metadata. There is
+no generic restart-any-image or restart-any-lifecycle path.
+
+No crash-test workload is added in SUP-L5A. A future SUP-L5B should add the
+`crash_test_srv` binary and manifest/profile staging under the same test gate. A
+future SUP-L6 should add the deterministic QEMU restart-count smoke that expects
+four crash-test generations, exactly three Accepted PM restart replies, and the
+final restart-limit/degraded markers.

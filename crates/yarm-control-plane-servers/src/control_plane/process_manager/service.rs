@@ -214,6 +214,63 @@ const PM_RESTART_MAX_ATTEMPTS_V1: u16 = 3;
 const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6;
 const SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 const PM_RESTART_MAX_IN_PROGRESS: usize = 4;
+const CRASH_TEST_SRV_IMAGE_ID: u64 = 13;
+const CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv";
+#[allow(dead_code)]
+const CRASH_TEST_SRV_NAME: &[u8] = b"crash_test_srv";
+#[allow(dead_code)]
+const CRASH_TEST_DEFAULT_MAX_RESTARTS: u16 = 3;
+const PM_CRASH_TEST_RESTART_SPEC_MAX: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrashTestRestartSpec {
+    target_tid: u64,
+    image_id: u64,
+    parent_tid: u64,
+    supervisor_tid: u64,
+    max_restarts: u16,
+    token_fingerprint: u16,
+    load_source: SpawnLoadSource,
+    service_name_len: u8,
+    service_name: [u8; 16],
+}
+
+impl CrashTestRestartSpec {
+    #[allow(dead_code)]
+    const fn new(
+        target_tid: u64,
+        parent_tid: u64,
+        supervisor_tid: u64,
+        token_fingerprint: u16,
+    ) -> Self {
+        let mut service_name = [0u8; 16];
+        service_name[0] = b'c';
+        service_name[1] = b'r';
+        service_name[2] = b'a';
+        service_name[3] = b's';
+        service_name[4] = b'h';
+        service_name[5] = b'_';
+        service_name[6] = b't';
+        service_name[7] = b'e';
+        service_name[8] = b's';
+        service_name[9] = b't';
+        service_name[10] = b'_';
+        service_name[11] = b's';
+        service_name[12] = b'r';
+        service_name[13] = b'v';
+        Self {
+            target_tid,
+            image_id: CRASH_TEST_SRV_IMAGE_ID,
+            parent_tid,
+            supervisor_tid,
+            max_restarts: CRASH_TEST_DEFAULT_MAX_RESTARTS,
+            token_fingerprint,
+            load_source: SpawnLoadSource::Vfs,
+            service_name_len: CRASH_TEST_SRV_NAME.len() as u8,
+            service_name,
+        }
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1084,8 +1141,10 @@ pub struct ProcessService {
     /// Lifecycle table: one entry per successfully spawned service.
     lifecycle_table: LifecycleTable,
     pm_restart_mechanism_enabled: bool,
+    supervisor_restart_test_enabled: bool,
     sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection,
     pm_restart_in_progress: [Option<PmRestartInProgress>; PM_RESTART_MAX_IN_PROGRESS],
+    crash_test_restart_specs: [Option<CrashTestRestartSpec>; PM_CRASH_TEST_RESTART_SPEC_MAX],
     handled: usize,
 }
 
@@ -1481,8 +1540,10 @@ impl ProcessService {
                 .process_manager_restart_control_send_cap,
             lifecycle_table: LifecycleTable::new(),
             pm_restart_mechanism_enabled: false,
+            supervisor_restart_test_enabled: false,
             sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection::None,
             pm_restart_in_progress: [None; PM_RESTART_MAX_IN_PROGRESS],
+            crash_test_restart_specs: [None; PM_CRASH_TEST_RESTART_SPEC_MAX],
             handled: 0,
         }
     }
@@ -1502,6 +1563,59 @@ impl ProcessService {
         injection: SupL4PmRestartRollbackInjection,
     ) {
         self.sup_l4_pm_restart_rollback_injection = injection;
+    }
+
+    #[cfg(test)]
+    fn enable_supervisor_restart_test_for_tests(&mut self) {
+        self.supervisor_restart_test_enabled = true;
+    }
+
+    #[allow(dead_code)]
+    fn crash_test_image_path(&self, image_id: u64) -> Option<&'static [u8]> {
+        if self.supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID {
+            yarm_user_rt::user_log!(
+                "CRASH_TEST_IMAGE_ID_ASSIGNED image_id={}",
+                CRASH_TEST_SRV_IMAGE_ID
+            );
+            yarm_user_rt::user_log!("CRASH_TEST_IMAGE_GATED");
+            Some(CRASH_TEST_SRV_PATH)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn register_crash_test_restart_spec_for_tests(
+        &mut self,
+        target_tid: u64,
+        parent_tid: u64,
+        supervisor_tid: u64,
+        token_fingerprint: u16,
+    ) -> Result<(), ProcessManagerError> {
+        if !self.supervisor_restart_test_enabled {
+            return Err(ProcessManagerError::Unsupported);
+        }
+        let slot = self
+            .crash_test_restart_specs
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(ProcessManagerError::TableFull)?;
+        *slot = Some(CrashTestRestartSpec::new(
+            target_tid,
+            parent_tid,
+            supervisor_tid,
+            token_fingerprint,
+        ));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn crash_test_restart_spec_for_tid(&self, target_tid: u64) -> Option<CrashTestRestartSpec> {
+        self.crash_test_restart_specs
+            .iter()
+            .flatten()
+            .copied()
+            .find(|spec| spec.target_tid == target_tid)
     }
 
     /// Record a lifecycle entry for a bootstrap service spawned before PM's
@@ -4576,6 +4690,58 @@ mod tests {
             SupL4PmRestartRollbackInjection::ReplyConstructionFailure,
             20,
         );
+    }
+
+    #[test]
+    fn sup_l5a_crash_test_image_mapping_is_gate_only_and_unique() {
+        let mut service = ProcessService::new();
+        assert_eq!(CRASH_TEST_SRV_IMAGE_ID, 13);
+        assert_ne!(CRASH_TEST_SRV_IMAGE_ID, SUP_L4_SUPPORTED_RESTART_IMAGE_ID);
+        assert_eq!(
+            resolve_spawn_load_source(6).ok(),
+            Some(SpawnLoadSource::DirectInitrd)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(12).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(CRASH_TEST_SRV_IMAGE_ID),
+            Err(ProcessManagerError::Unsupported)
+        );
+        assert_eq!(service.crash_test_image_path(CRASH_TEST_SRV_IMAGE_ID), None);
+        service.enable_supervisor_restart_test_for_tests();
+        assert_eq!(
+            service.crash_test_image_path(CRASH_TEST_SRV_IMAGE_ID),
+            Some(CRASH_TEST_SRV_PATH)
+        );
+    }
+
+    #[test]
+    fn sup_l5a_crash_test_restart_spec_is_gate_only_bounded_and_cap_free() {
+        let mut service = ProcessService::new();
+        assert_eq!(
+            service.register_crash_test_restart_spec_for_tests(77, 1, 4, 0xCAFE),
+            Err(ProcessManagerError::Unsupported)
+        );
+        service.enable_supervisor_restart_test_for_tests();
+        service
+            .register_crash_test_restart_spec_for_tests(77, 1, 4, 0xCAFE)
+            .expect("register crash-test restart spec");
+        let spec = service
+            .crash_test_restart_spec_for_tid(77)
+            .expect("restart spec");
+        assert_eq!(spec.image_id, CRASH_TEST_SRV_IMAGE_ID);
+        assert_eq!(spec.parent_tid, 1);
+        assert_eq!(spec.supervisor_tid, PM_RESTART_TRUSTED_SUPERVISOR_TID);
+        assert_eq!(spec.max_restarts, CRASH_TEST_DEFAULT_MAX_RESTARTS);
+        assert_eq!(spec.token_fingerprint, 0xCAFE);
+        assert_eq!(spec.load_source, SpawnLoadSource::Vfs);
+        assert_eq!(
+            &spec.service_name[..spec.service_name_len as usize],
+            CRASH_TEST_SRV_NAME
+        );
+        assert!(service.crash_test_restart_spec_for_tid(404).is_none());
     }
 
     #[test]

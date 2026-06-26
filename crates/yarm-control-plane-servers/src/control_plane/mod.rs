@@ -2406,11 +2406,58 @@ mod tests {
         }
         let crash_name = ["crash", "_test", "_srv"].concat();
         assert!(
-            !pm_src.contains(crash_name.as_str()) && !init_src.contains(crash_name.as_str()),
-            "SUP-L5 must not stage crash_test_srv without a safe image id and restart metadata"
+            !init_src.contains(crash_name.as_str()),
+            "SUP-L5A must not stage crash_test_srv in normal init boot"
         );
+        assert!(pm_src.contains("const CRASH_TEST_SRV_IMAGE_ID: u64 = 13"));
         assert!(contract.contains("SUP-L5 MissingImageId/MissingRestartSpec audit"));
-        assert!(contract.contains("No crash-test image id is selected in SUP-L5"));
+        assert!(contract.contains("SUP-L5A safe crash-test image metadata"));
+    }
+
+    #[test]
+    fn sup_l5a_crash_test_image_id_and_restart_metadata_are_test_gated() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let init_src = include_str!("init/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        for needle in &[
+            "const CRASH_TEST_SRV_IMAGE_ID: u64 = 13",
+            r#"const CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv""#,
+            "CRASH_TEST_IMAGE_ID_ASSIGNED image_id={}",
+            "CRASH_TEST_IMAGE_GATED",
+            "supervisor_restart_test_enabled",
+            "crash_test_restart_specs",
+            "CrashTestRestartSpec",
+            "load_source: SpawnLoadSource::Vfs",
+            "register_crash_test_restart_spec_for_tests",
+            "crash_test_restart_spec_for_tid",
+            "pm_vfs_spawn_inline",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L5A PM source must contain gated metadata item {needle}"
+            );
+        }
+        let crash_name = ["crash", "_test", "_srv"].concat();
+        assert!(
+            !init_src.contains(crash_name.as_str()),
+            "SUP-L5A must not add crash_test_srv to normal production boot"
+        );
+        for forbidden in &[
+            ["image_id >= 7", " && restart"].concat(),
+            ["restart", "_any", "_image"].concat(),
+            ["restart", "_any", "_lifecycle"].concat(),
+            ["slot", " = 13"].concat(),
+            ["fabricate", "_cap"].concat(),
+            ["install", "_endpoint", "_cap"].concat(),
+        ] {
+            assert!(
+                !pm_src.contains(forbidden.as_str()),
+                "SUP-L5A must not broaden restart or invent slots/caps: {forbidden}"
+            );
+        }
+        assert!(contract.contains("CRASH_TEST_SRV_IMAGE_ID = 13"));
+        assert!(contract.contains("future SUP-L5B"));
+        assert!(contract.contains("future SUP-L6"));
     }
 
     #[test]
