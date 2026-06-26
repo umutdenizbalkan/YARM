@@ -152,3 +152,11 @@ sweep finds no PM client. This preserves fail-closed behavior without
 busy-looping or clearing service state as if restart succeeded. New runtime
 markers are `SUPERVISOR_RESTART_SCHEDULED`, `SUPERVISOR_RESTART_DUE_CHECK`, and
 `SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT`.
+
+## SUP-12 model extraction boundary (2026-06-26)
+
+The restart contract/model code now lives in the gated supervisor
+`restart_model.rs` module for hosted-dev/test/docs guardrails. This is a
+mechanical location change only: the contract remains non-live, no PM IPC or
+runtime dispatch is enabled, and production restart execution remains the SUP-11
+fail-closed due-restart path.

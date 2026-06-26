@@ -267,3 +267,18 @@ cap-bound restart token, and PM cleanup/rollback are still absent. SUP-11 does
 not allocate live PM restart opcodes, wire supervisor-to-PM restart IPC, spawn or
 tear down tasks, allocate address spaces, mint/revoke capabilities, grant
 MMIO/IRQ/DMA, perform MMIO, or change syscall/global IPC ABI.
+
+## SUP-12 mechanical restart-model extraction (2026-06-26)
+
+SUP-12 is mechanical extraction only. The SUP-2 through SUP-10 non-live restart
+contract/model/readiness definitions and helper methods are isolated in
+`crates/yarm-control-plane-servers/src/control_plane/supervisor/restart_model.rs`,
+which is compiled only for hosted-dev/test guardrails. The production
+`service.rs` hot path keeps SUP-11 runtime state, scheduling, fault validation,
+run-loop, fail-closed deferred restart markers, and runtime ops.
+
+Production behavior remains unchanged from SUP-11: no live PM restart client,
+PM dispatch, supervisor PM restart send path, restart/spawn/teardown,
+capability/resource behavior, MMIO/IRQ/DMA grant, syscall ABI change, or global
+IPC ABI change exists. Future live work should start at SUP-L1 rather than adding
+more review-only model expansion.

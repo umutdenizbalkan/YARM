@@ -886,7 +886,7 @@ mod tests {
 
     #[test]
     fn sup2_supervisor_pm_restart_contract_model_is_inert_and_bounded() {
-        let src = include_str!("supervisor/service.rs");
+        let src = include_str!("supervisor/restart_model.rs");
         for needle in &[
             "pub struct SupervisorRestartRequest",
             "pub struct SupervisorRestartRequestBundle",
@@ -935,13 +935,11 @@ mod tests {
 
     #[test]
     fn sup2_supervisor_contract_does_not_call_live_pm_spawn_restart_or_caps() {
-        let src = include_str!("supervisor/service.rs");
+        let src = include_str!("supervisor/restart_model.rs");
         let model_start = src
             .find("pub struct SupervisorRestartRequest")
             .expect("SUP-2 restart request model must be present");
-        let model_end = src
-            .find("#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct ManagedServiceRecord")
-            .unwrap_or(src.len());
+        let model_end = src.find("impl SupervisorService {").unwrap_or(src.len());
         let model_section = &src[model_start..model_end];
         for forbidden in &[
             "restart_task(",
@@ -964,7 +962,7 @@ mod tests {
 
     #[test]
     fn sup3_supervisor_pm_restart_contract_descriptor_is_versioned_and_bounded() {
-        let src = include_str!("supervisor/service.rs");
+        let src = include_str!("supervisor/restart_model.rs");
         for needle in &[
             "pub struct SupervisorPmRestartContract",
             "pub struct SupervisorPmRestartRequestV1",
@@ -982,7 +980,7 @@ mod tests {
 
     #[test]
     fn sup3_restart_request_mapping_and_reply_model_remain_inert() {
-        let src = include_str!("supervisor/service.rs");
+        let src = include_str!("supervisor/restart_model.rs");
         for needle in &[
             "map_restart_request_to_pm_descriptor",
             "SupervisorPmRestartDescriptorStatus::Sendable",
@@ -1010,7 +1008,8 @@ mod tests {
 
     #[test]
     fn sup3_timer_backoff_semantics_are_logical_and_fail_closed() {
-        let src = include_str!("supervisor/service.rs");
+        let src = include_str!("supervisor/restart_model.rs");
+        let service_src = include_str!("supervisor/service.rs");
         for needle in &[
             "pub enum SupervisorTimerMode",
             "LogicalTickOnly",
@@ -1021,14 +1020,14 @@ mod tests {
             "OverflowCapped",
             "compute_backoff_decision",
             "due_restart_ready",
-            "SUPERVISOR_RESTART_DUE_CHECK",
-            "RestartBlockedNoPmClient",
         ] {
             assert!(
                 src.contains(needle),
                 "SUP-3 timer/backoff model must include {needle}"
             );
         }
+        assert!(service_src.contains("SUPERVISOR_RESTART_DUE_CHECK"));
+        assert!(service_src.contains("RestartBlockedNoPmClient"));
     }
 
     #[test]
@@ -1050,6 +1049,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sup12_supervisor_restart_model_is_extracted_and_gated() {
+        let service_src = include_str!("supervisor/service.rs");
+        let model_src = include_str!("supervisor/restart_model.rs");
+        for moved in &[
+            "SupervisorPmRestartContract",
+            "SupervisorPmRestartRequestV1",
+            "SupervisorPmRestartReplyV1",
+            "SupervisorPmRestartValidationReport",
+            "SupervisorPmRestartAccountingReport",
+            "SupervisorPmRestartRollbackStep",
+        ] {
+            assert!(
+                !service_src.contains(moved),
+                "service.rs should not retain extracted model type {moved}"
+            );
+            assert!(
+                model_src.contains(moved),
+                "restart_model.rs should contain extracted model type {moved}"
+            );
+        }
+        assert!(model_src.contains("#![cfg(any(test, feature = \"hosted-dev\"))]"));
+        assert!(service_src.contains("#[path = \"restart_model.rs\"]"));
+        assert!(service_src.contains("pub(crate) use restart_model::*"));
+    }
     // ── SUP-4: PM-side inert restart validation/accounting oracle ───────────
 
     #[test]
@@ -1202,9 +1226,10 @@ mod tests {
     #[test]
     fn sup5_token_redaction_and_dependent_token_rule_hold() {
         let supervisor_src = include_str!("supervisor/service.rs");
+        let supervisor_model_src = include_str!("supervisor/restart_model.rs");
         let pm_src = include_str!("process_manager/service.rs");
         assert!(
-            supervisor_src.contains("redacted_fingerprint")
+            supervisor_model_src.contains("redacted_fingerprint")
                 && pm_src.contains("redacted_fingerprint"),
             "restart token model must expose redacted fingerprints, not raw log material"
         );
@@ -1726,8 +1751,9 @@ mod tests {
                 && codec_src.contains("NonzeroReserved"),
             "SUP-8 codec must name and reject reserved-byte misuse"
         );
+        let supervisor_model_src = include_str!("supervisor/restart_model.rs");
         assert!(
-            supervisor_src.contains("redacted_fingerprint")
+            supervisor_model_src.contains("redacted_fingerprint")
                 && !supervisor_src.contains("unwrap_or(event.restart_token)")
                 && supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"),
             "SUP-8 must preserve redaction, dependent-token, and deferred-runtime guardrails"
@@ -1896,8 +1922,9 @@ mod tests {
                 && codec_src.contains("NonzeroReserved"),
             "SUP-9 must preserve frozen sizes and reserved-byte decode rejection"
         );
+        let supervisor_model_src = include_str!("supervisor/restart_model.rs");
         assert!(
-            supervisor_src.contains("redacted_fingerprint")
+            supervisor_model_src.contains("redacted_fingerprint")
                 && !supervisor_src.contains("unwrap_or(event.restart_token)"),
             "SUP-9 must preserve token redaction and dependent-token no-fallback rule"
         );

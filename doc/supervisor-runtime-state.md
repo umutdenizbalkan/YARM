@@ -24,3 +24,11 @@ Direct PM restart helper calls remain disabled/deferred for production restart
 execution. Future live work must provide a real PM client, timer endpoint,
 cap-bound token, cleanup/rollback, and contract-compliant accounting before any
 actual restart/spawn/teardown/resource changes are permitted.
+
+## SUP-12 note
+
+SUP-12 mechanically moves non-live restart contract/model/readiness code out of
+`service.rs` into the gated `restart_model.rs` module. Runtime state and behavior
+remain SUP-11 fail-closed: scheduling, due checks, blocked/no-PM-client state,
+invalid sender rejection, and compact deferred logging are unchanged. Future live
+restart work should begin at SUP-L1.
