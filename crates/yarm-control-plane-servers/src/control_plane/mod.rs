@@ -2629,6 +2629,82 @@ mod tests {
     }
 
     #[test]
+    fn sup_l6_crash_restart_smoke_script_has_exact_oracle_and_fails_closed() {
+        let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
+        let common_script = include_str!("../../../../scripts/lib/build-qemu-artifacts-common.sh");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let init_src = include_str!("init/service.rs");
+
+        for needle in &[
+            "YARM_SUPERVISOR_RESTART_TEST=1",
+            "SUPERVISOR_RESTART_TEST=1",
+            "yarm.supervisor_restart_test=1",
+            "require_count \"CRASH_TEST_SRV_ENTRY\" 4",
+            "require_count \"CRASH_TEST_SRV_READY\" 4",
+            "CRASH_TEST_SRV_EXIT_NOW",
+            "CRASH_TEST_SRV_FAULT_NOW",
+            "require_count \"PM_RESTART_REPLY_ACCEPTED\" 3",
+            "require_count \"SUPERVISOR_PM_RESTART_STATE_UPDATED\" 3",
+            "require_count \"SUPERVISOR_RESTART_LIMIT_EXCEEDED\" 1",
+            "require_count \"SUPERVISOR_SERVICE_DEGRADED_FINAL\" 1",
+            "accepted\" -ge 4",
+            "state_updates\" -ge 4",
+            "fatal_patterns=",
+            "DOUBLE_FAULT",
+            "DATA_ABORT",
+            "KERNEL_FAULT",
+            "MissingRight",
+            "marker snapshot",
+        ] {
+            assert!(
+                smoke.contains(needle),
+                "SUP-L6 smoke script must contain {needle}"
+            );
+        }
+        for marker in &[
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "PM_RESTART_V1_DECODE_OK",
+            "PM_RESTART_SENDER_OK",
+            "PM_RESTART_VALIDATE_OK",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_RESERVE_REPLACEMENT_OK",
+            "PM_RESTART_SPAWN_BEGIN",
+            "PM_RESTART_SPAWN_OK",
+            "PM_RESTART_REPLY_ACCEPTED",
+        ] {
+            assert!(smoke.contains(marker), "SUP-L6 smoke must require {marker}");
+        }
+        assert!(
+            common_script
+                .contains("supervisor restart test disabled; not staging /sbin/crash_test_srv")
+        );
+        assert!(
+            pm_src
+                .contains("supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID")
+        );
+        assert!(pm_src.contains("Some(b\"sbin/crash_test_srv\")"));
+        assert!(pm_src.contains("VFS_SERVICE_IMAGE_ID_MAX: u64 = 12"));
+        assert!(pm_src.contains("6 => Some(b\"/initramfs/sbin/vfs_server\")"));
+        assert!(
+            !pm_src.contains("image_id >= 7") && !pm_src.contains("7..=13"),
+            "SUP-L6 must not broaden restart/spawn image ranges"
+        );
+        assert!(
+            !init_src.contains("crash_test_srv"),
+            "normal init/service-core path must remain free of crash_test_srv"
+        );
+        assert!(supervisor_src.contains("send_pm_restart_v1_via_process_manager"));
+        assert!(
+            !supervisor_src.contains("spawn_process_with_startup_caps(")
+                && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),
+            "supervisor must not execute restart locally"
+        );
+    }
+
+    #[test]
     fn sup10_source_guardrails_keep_live_enablement_absent() {
         let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
