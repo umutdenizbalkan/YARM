@@ -826,6 +826,13 @@ impl SupervisorService {
         request: Message,
     ) -> Result<(), KernelError> {
         self.validate_control_sender(&request)?;
+        #[cfg(not(test))]
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_CONTROL_SENDER_OK sender={}",
+            request.sender_tid.0
+        );
+        #[cfg(not(test))]
+        yarm_user_rt::user_log!("SUPERVISOR_CONTROL_DISPATCH opcode={}", request.opcode);
         match request.opcode {
             SUPERVISOR_OP_REGISTER_CORE_SERVICE => {
                 let req = RegisterCoreServiceRequest::decode(request.as_slice())
@@ -865,6 +872,10 @@ impl SupervisorService {
                         if supervisor_restart_test_build_gate_enabled() {
                             yarm_user_rt::user_log!(
                                 "SUPERVISOR_CRASH_TEST_REGISTER_FAIL tid=0 reason=decode"
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_CONTROL_WRONG_OBJECT site=register-driver-decode opcode={} reason=payload-decode",
+                                request.opcode
                             );
                         }
                         return Err(KernelError::WrongObject);
@@ -928,7 +939,14 @@ impl SupervisorService {
                     .ok_or(KernelError::WrongObject)?;
                 let _ = self.complete_redelegation(req.tid);
             }
-            _ => return Err(KernelError::WrongObject),
+            _ => {
+                #[cfg(not(test))]
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_CONTROL_WRONG_OBJECT site=dispatch opcode={} reason=unknown-opcode",
+                    request.opcode
+                );
+                return Err(KernelError::WrongObject);
+            }
         }
         Ok(())
     }
@@ -1665,10 +1683,64 @@ pub fn run() {
                 match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
                     Ok(Some(msg)) => {
                         made_progress = true;
+                        let payload = msg.as_slice();
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_CONTROL_RECV sender={} opcode={} len={}",
+                            msg.sender_tid.0,
+                            msg.opcode,
+                            payload.len()
+                        );
+                        let first = [
+                            payload.first().copied().unwrap_or(0),
+                            payload.get(1).copied().unwrap_or(0),
+                            payload.get(2).copied().unwrap_or(0),
+                            payload.get(3).copied().unwrap_or(0),
+                            payload.get(4).copied().unwrap_or(0),
+                            payload.get(5).copied().unwrap_or(0),
+                            payload.get(6).copied().unwrap_or(0),
+                            payload.get(7).copied().unwrap_or(0),
+                        ];
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_CONTROL_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
+                            first[0],
+                            first[1],
+                            first[2],
+                            first[3],
+                            first[4],
+                            first[5],
+                            first[6],
+                            first[7],
+                            payload.len()
+                        );
                         yarm_user_rt::user_log!(
                             "supervisor.srv control msg: opcode={}",
                             msg.opcode
                         );
+                        let msg = if msg.opcode == 0 && payload.len() >= 2 {
+                            let framed_opcode = u16::from_le_bytes([payload[0], payload[1]]);
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_CONTROL_DISPATCH opcode={}",
+                                framed_opcode
+                            );
+                            match Message::with_header(
+                                msg.sender_tid.0,
+                                framed_opcode,
+                                msg.flags,
+                                msg.transferred_cap().map(|cap| cap.0),
+                                &payload[2..],
+                            ) {
+                                Ok(normalized) => normalized,
+                                Err(_) => {
+                                    yarm_user_rt::user_log!(
+                                        "SUPERVISOR_CONTROL_WRONG_OBJECT site=inline-normalize opcode={} reason=message",
+                                        framed_opcode
+                                    );
+                                    msg
+                                }
+                            }
+                        } else {
+                            msg
+                        };
                         let mut ops = RuntimeSupervisorTaskExitOps {
                             token_tid: 0,
                             token: 0,

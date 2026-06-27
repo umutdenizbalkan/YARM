@@ -2733,6 +2733,8 @@ mod tests {
             "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty",
             "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=decode",
             "INIT_CRASH_TEST_REGISTER_BEGIN tid={}",
+            "INIT_CRASH_TEST_REGISTER_META opcode={} flags={} len={}",
+            "INIT_CRASH_TEST_REGISTER_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
             "INIT_CRASH_TEST_REGISTER_SEND cap={} tid={}",
             "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=no-supervisor-send-cap",
             "INIT_CRASH_TEST_REGISTER_OK tid={}",
@@ -2803,6 +2805,11 @@ mod tests {
         }
         for needle in &[
             "SUPERVISOR_RESTART_TEST_GATE_ON",
+            "SUPERVISOR_CONTROL_RECV sender={} opcode={} len={}",
+            "SUPERVISOR_CONTROL_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
+            "SUPERVISOR_CONTROL_SENDER_OK sender={}",
+            "SUPERVISOR_CONTROL_DISPATCH opcode={}",
+            "SUPERVISOR_CONTROL_WRONG_OBJECT site=dispatch opcode={} reason=unknown-opcode",
             "SUPERVISOR_CRASH_TEST_REGISTER_BEGIN tid={}",
             "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
             "SUPERVISOR_CRASH_TEST_REGISTER_FAIL tid={} reason={:?}",

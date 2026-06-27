@@ -617,6 +617,34 @@ fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
         return;
     };
     yarm_user_rt::user_log!(
+        "INIT_CRASH_TEST_REGISTER_META opcode={} flags={} len={}",
+        SUPERVISOR_OP_REGISTER_DRIVER,
+        0,
+        payload.len()
+    );
+    let first = [
+        payload.first().copied().unwrap_or(0),
+        payload.get(1).copied().unwrap_or(0),
+        payload.get(2).copied().unwrap_or(0),
+        payload.get(3).copied().unwrap_or(0),
+        payload.get(4).copied().unwrap_or(0),
+        payload.get(5).copied().unwrap_or(0),
+        payload.get(6).copied().unwrap_or(0),
+        payload.get(7).copied().unwrap_or(0),
+    ];
+    yarm_user_rt::user_log!(
+        "INIT_CRASH_TEST_REGISTER_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
+        first[0],
+        first[1],
+        first[2],
+        first[3],
+        first[4],
+        first[5],
+        first[6],
+        first[7],
+        payload.len()
+    );
+    yarm_user_rt::user_log!(
         "INIT_CRASH_TEST_REGISTER_SEND cap={} tid={}",
         supervisor_send,
         crash_tid
