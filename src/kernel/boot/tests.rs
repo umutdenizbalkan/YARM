@@ -16716,6 +16716,47 @@ fn fault_handler_report_message_visible_via_ipc_state() {
 }
 
 #[test]
+fn page_fault_report_falls_back_to_supervisor_endpoint_when_no_fault_handler() {
+    // SUP-L6J: production QEMU registers the supervisor fault/task-exit endpoint
+    // as `supervisor_endpoint`, while the older page-fault reporting helper only
+    // used `fault_handler_endpoint`.  A registered crash-test service fault must
+    // therefore still reach the supervisor endpoint without a userspace self-report.
+    let mut state = Bootstrap::init().expect("init");
+    let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+    state
+        .set_supervisor_endpoint(recv_cap)
+        .expect("set supervisor endpoint");
+
+    let fault = super::super::trap::FaultInfo {
+        addr: VirtAddr(0xBEEF),
+        access: super::super::trap::FaultAccess::Write,
+    };
+    state.emit_fault_report_for_fault_for_test(10008, fault);
+
+    let queued = state.with_ipc_state(|ipc| {
+        ipc.endpoints[endpoint_idx]
+            .as_ref()
+            .map(|ep| super::kernel_ref(ep).queued())
+            .unwrap_or(0)
+    });
+    assert_eq!(
+        queued, 1,
+        "fault report must fall back to the supervisor endpoint when no explicit fault handler exists"
+    );
+
+    let report = state
+        .ipc_recv(recv_cap)
+        .expect("supervisor recv")
+        .expect("fault report");
+    assert_eq!(report.sender_tid.0, 0);
+    let decoded = super::fault_state::SupervisorFaultReportWire::decode(report.as_slice())
+        .expect("decode fault wire");
+    assert_eq!(decoded.faulting_tid, 10008);
+    assert_eq!(decoded.fault_addr, 0xBEEF);
+    assert_eq!(decoded.access, super::super::trap::FaultAccess::Write);
+}
+
+#[test]
 fn register_task_tcb_and_class_consistent_after_allocation() {
     // Regression test for Bug D: register_task_with_class_and_cnode_slots_in_process
     // used to mutate self.tcbs[idx] and self.task_classes[idx] directly without

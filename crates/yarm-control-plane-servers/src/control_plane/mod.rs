@@ -2719,6 +2719,8 @@ mod tests {
         let x86_boot_src = include_str!("../../../../src/arch/x86_64/boot.rs");
         let aarch64_boot_src = include_str!("../../../../src/arch/aarch64/boot.rs");
         let riscv64_boot_src = include_str!("../../../../src/arch/riscv64/boot.rs");
+        let kernel_fault_src = include_str!("../../../../src/kernel/boot/fault_state.rs");
+        let kernel_restart_src = include_str!("../../../../src/kernel/boot/restart_state.rs");
         let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
 
         for needle in &[
@@ -2817,9 +2819,12 @@ mod tests {
             "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY tid={}",
             "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
             "SUPERVISOR_FAULT_REPORT_RECV claimed_tid={} sender_tid={}",
+            "SUPERVISOR_FAULT_SENDER_OK tid={} sender={}",
             "SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}",
+            "SUPERVISOR_FAULT_REPORT_REJECTED tid={} sender={} reason={:?}",
             "SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}",
             "SUPERVISOR_RESTART_SCHEDULED attempt={} max={}",
+            "SUPERVISOR_RESTART_DUE tid={} attempt={}",
             "SUPERVISOR_RESTART_LIMIT_EXCEEDED attempts={}",
             "SUPERVISOR_SERVICE_DEGRADED_FINAL",
             "record.tid = replacement_handle_value",
@@ -2827,6 +2832,30 @@ mod tests {
             assert!(
                 supervisor_src.contains(needle),
                 "supervisor source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "TASK_FAULT_CURRENT tid={} fault_addr=0x{:x} access={:?}",
+            "TASK_FAULT_REPORT_BEGIN tid={}",
+            "TASK_FAULT_REPORT_SENT tid={} target={}",
+            "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
+            "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
+            ".fault_handler_endpoint",
+            ".supervisor_endpoint",
+        ] {
+            assert!(
+                kernel_fault_src.contains(needle),
+                "kernel fault source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "TASK_EXITED_REPORT_BEGIN tid={}",
+            "TASK_EXITED_REPORT_SENT tid={} target=supervisor",
+            "TASK_EXITED_REPORT_FAIL tid={} reason=no-supervisor-endpoint",
+        ] {
+            assert!(
+                kernel_restart_src.contains(needle),
+                "kernel restart source must contain {needle}"
             );
         }
         assert!(smoke.contains("require_count \"CRASH_TEST_SRV_ENTRY\" 4"));

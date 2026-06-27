@@ -310,8 +310,22 @@ impl KernelState {
     }
 
     fn emit_fault_report_for_fault(&mut self, faulted_tid: u64, fault: FaultInfo) {
-        let endpoint_idx = self.with_fault_state(|faults| faults.fault_handler_endpoint);
-        let Some(endpoint_idx) = endpoint_idx else {
+        crate::yarm_log!("TASK_FAULT_REPORT_BEGIN tid={}", faulted_tid);
+        let route = self.with_fault_state(|faults| {
+            faults
+                .fault_handler_endpoint
+                .map(|endpoint_idx| (endpoint_idx, "fault-handler"))
+                .or_else(|| {
+                    faults
+                        .supervisor_endpoint
+                        .map(|endpoint_idx| (endpoint_idx, "supervisor"))
+                })
+        });
+        let Some((endpoint_idx, target)) = route else {
+            crate::yarm_log!(
+                "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
+                faulted_tid
+            );
             return;
         };
 
@@ -324,12 +338,26 @@ impl KernelState {
 
         let msg = match Message::new(0, &payload) {
             Ok(msg) => msg,
-            Err(_) => return,
+            Err(_) => {
+                crate::yarm_log!("TASK_FAULT_REPORT_FAIL tid={} reason=message", faulted_tid);
+                return;
+            }
         };
 
         // send_message_to_endpoint_and_wake enqueues under ipc_state_lock
         // (rank 3) and wakes outside the lock (task lock rank 2 < ipc rank 3).
-        let _ = self.send_message_to_endpoint_and_wake(endpoint_idx, msg);
+        match self.send_message_to_endpoint_and_wake(endpoint_idx, msg) {
+            Ok(()) => crate::yarm_log!(
+                "TASK_FAULT_REPORT_SENT tid={} target={}",
+                faulted_tid,
+                target
+            ),
+            Err(err) => crate::yarm_log!(
+                "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
+                faulted_tid,
+                err
+            ),
+        }
     }
 
     fn emit_fault_report(&mut self, faulted_tid: u64) {

@@ -17,7 +17,12 @@ impl KernelState {
         code: u64,
         restart_token: u64,
     ) -> Result<(), KernelError> {
+        crate::yarm_log!("TASK_EXITED_REPORT_BEGIN tid={}", tid);
         let Some(endpoint_idx) = self.with_fault_state(|faults| faults.supervisor_endpoint) else {
+            crate::yarm_log!(
+                "TASK_EXITED_REPORT_FAIL tid={} reason=no-supervisor-endpoint",
+                tid
+            );
             return Ok(());
         };
         let msg = Message::with_header(
@@ -28,7 +33,16 @@ impl KernelState {
             &encode_task_exited_event(tid, code, restart_token),
         )
         .map_err(|_| KernelError::WrongObject)?;
-        self.send_message_to_endpoint_and_wake(endpoint_idx, msg)
+        match self.send_message_to_endpoint_and_wake(endpoint_idx, msg) {
+            Ok(()) => {
+                crate::yarm_log!("TASK_EXITED_REPORT_SENT tid={} target=supervisor", tid);
+                Ok(())
+            }
+            Err(err) => {
+                crate::yarm_log!("TASK_EXITED_REPORT_FAIL tid={} reason={:?}", tid, err);
+                Err(err)
+            }
+        }
     }
 
     pub fn report_transfer_revoke_to_supervisor(

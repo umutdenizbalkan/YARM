@@ -1786,7 +1786,18 @@ pub fn run() {
                                             yarm_user_rt::user_log!(
                                                 "SUPERVISOR_FAULT_SENDER_REJECTED"
                                             );
+                                            yarm_user_rt::user_log!(
+                                                "SUPERVISOR_FAULT_REPORT_REJECTED tid={} sender={} reason={:?}",
+                                                fault.tid,
+                                                msg.sender_tid.0,
+                                                err
+                                            );
                                         } else {
+                                            yarm_user_rt::user_log!(
+                                                "SUPERVISOR_FAULT_SENDER_OK tid={} sender={}",
+                                                fault.tid,
+                                                msg.sender_tid.0
+                                            );
                                             yarm_user_rt::user_log!(
                                                 "SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}",
                                                 fault.tid
@@ -1826,11 +1837,24 @@ pub fn run() {
                                                                 due_tick,
                                                                 ..
                                                             },
-                                                        ) => yarm_user_rt::user_log!(
-                                                            "supervisor.srv restart scheduled through due path only: tid={}, due_tick={}",
-                                                            tid,
-                                                            due_tick.0
-                                                        ),
+                                                        ) => {
+                                                            yarm_user_rt::user_log!(
+                                                                "supervisor.srv restart scheduled through due path only: tid={}, due_tick={}",
+                                                                tid,
+                                                                due_tick.0
+                                                            );
+                                                            let attempt = supervisor
+                                                                .find_record(tid)
+                                                                .map(|record| {
+                                                                    record.restart_attempts
+                                                                })
+                                                                .unwrap_or(0);
+                                                            yarm_user_rt::user_log!(
+                                                                "SUPERVISOR_RESTART_DUE tid={} attempt={}",
+                                                                tid,
+                                                                attempt
+                                                            );
+                                                        }
                                                         Ok(_) => {}
                                                         Err(err) => yarm_user_rt::user_log!(
                                                             "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
