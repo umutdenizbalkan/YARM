@@ -225,6 +225,8 @@ const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6;
 const SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 const PM_RESTART_MAX_IN_PROGRESS: usize = 4;
 const CRASH_TEST_SRV_IMAGE_ID: u64 = 13;
+#[cfg(not(test))]
+const CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID: u64 = 12;
 const CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv";
 #[allow(dead_code)]
 const CRASH_TEST_SRV_NAME: &[u8] = b"crash_test_srv";
@@ -240,6 +242,24 @@ fn supervisor_restart_test_build_gate_enabled() -> bool {
 
 fn crash_test_restart_token_for_tid(tid: u64) -> u64 {
     PM_CRASH_TEST_RESTART_TOKEN_TAG | (tid & 0xffff)
+}
+
+#[cfg(not(test))]
+fn kernel_spawn_policy_image_id_for_vfs_spawn(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Result<u64, ProcessManagerError> {
+    if image_id == CRASH_TEST_SRV_IMAGE_ID {
+        if supervisor_restart_test_enabled {
+            yarm_user_rt::user_log!(
+                "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=1 reason=restart-test-gate"
+            );
+            return Ok(CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID);
+        }
+        yarm_user_rt::user_log!("PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=0 reason=gate-off");
+        return Err(ProcessManagerError::Unsupported);
+    }
+    Ok(image_id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2066,6 +2086,19 @@ impl ProcessService {
                                         req.image_id,
                                         err
                                     );
+                                    if self.supervisor_restart_test_enabled
+                                        && req.image_id == CRASH_TEST_SRV_IMAGE_ID
+                                    {
+                                        yarm_user_rt::user_log!(
+                                            "PM_SPAWN_FROM_MO_TABLE_STATS image_id=13 table=pm_lifecycle used={} cap={}",
+                                            self.lifecycle_table.len,
+                                            MAX_LIFECYCLE_ENTRIES
+                                        );
+                                        yarm_user_rt::user_log!(
+                                            "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id=13 site=policy err={:?}",
+                                            err
+                                        );
+                                    }
                                     let encoded = encode_spawn_v5_reply(0, 0);
                                     return Message::with_header(
                                         0,
@@ -2798,7 +2831,20 @@ unsafe fn pm_vfs_spawn_inline(
     // For image_id 7-9: try Phase 3A (MemoryObject cap grant) first, then fall
     // back to Phase 2B (transfer-buffer bulk read) only on Unsupported.
     // For image_id 4-6: fall through to the existing inline 112-byte path.
-    if pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled).is_some() {
+    let crash_test_vfs_image =
+        supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID;
+    if crash_test_vfs_image {
+        yarm_user_rt::user_log!("PM_SPAWN_FROM_MO_ENTER image_id=13");
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=1 reason=restart-test-gate"
+        );
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id=13 site=policy err=kernel-path-table-lacks-image13 fallback=user_buf"
+        );
+    }
+    if !crash_test_vfs_image
+        && pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled).is_some()
+    {
         // Phase 3A attempt: VFS_OP_FILE_GRANT_RO → SpawnFromMemoryObject.
         let phase3a_result = unsafe {
             pm_try_grant_ro_and_spawn(
@@ -2898,9 +2944,11 @@ unsafe fn pm_vfs_spawn_inline(
         &image[..4]
     );
     let image_len = image.len();
+    let kernel_spawn_image_id =
+        kernel_spawn_policy_image_id_for_vfs_spawn(image_id, supervisor_restart_test_enabled)?;
     let result = unsafe {
         yarm_user_rt::syscall::spawn_process_from_user_buf(
-            image_id,
+            kernel_spawn_image_id,
             image.as_ptr(),
             image_len,
             parent_pid,
@@ -2935,7 +2983,17 @@ unsafe fn pm_vfs_spawn_inline(
                 image_id,
                 e
             );
-            Err(ProcessManagerError::TableFull)
+            yarm_user_rt::user_log!(
+                "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
+                image_id,
+                e
+            );
+            match e {
+                yarm_user_rt::syscall::SyscallError::InvalidArgs => {
+                    Err(ProcessManagerError::Unsupported)
+                }
+                _ => Err(ProcessManagerError::TableFull),
+            }
         }
     }
 }
