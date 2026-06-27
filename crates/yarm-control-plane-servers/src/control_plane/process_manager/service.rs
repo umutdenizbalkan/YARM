@@ -177,6 +177,7 @@ pub enum ProcessRequest {
     WaitPidV2(WaitPidV2Request),
     TaskRestartToken {
         tid: u64,
+        sender_tid: u64,
     },
     RegisterSupervisedTask {
         tid: u64,
@@ -1784,7 +1785,10 @@ impl ProcessService {
             PROC_OP_TASK_RESTART_TOKEN => {
                 let args = TaskRestartTokenRequest::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
-                Ok(ProcessRequest::TaskRestartToken { tid: args.tid })
+                Ok(ProcessRequest::TaskRestartToken {
+                    tid: args.tid,
+                    sender_tid: msg.sender_tid.0,
+                })
             }
             PROC_OP_REGISTER_SUPERVISED_TASK => {
                 let args = RegisterSupervisedTask::decode(msg.as_slice())
@@ -2203,10 +2207,19 @@ impl ProcessService {
                 Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &result.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
-            ProcessRequest::TaskRestartToken { tid } => {
-                let reply = TaskRestartTokenReply::new(
-                    self.restart_token_for_tid(tid).is_some(),
-                    self.restart_token_for_tid(tid).unwrap_or(0),
+            ProcessRequest::TaskRestartToken { tid, sender_tid } => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TOKEN_QUERY_RECV tid={} sender={}",
+                    tid,
+                    sender_tid
+                );
+                let token = self.restart_token_for_tid(tid);
+                let reply = TaskRestartTokenReply::new(token.is_some(), token.unwrap_or(0));
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TOKEN_QUERY_REPLY tid={} status={} fingerprint={}",
+                    tid,
+                    reply.found,
+                    (reply.token & 0xffff) as u16
                 );
                 Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)

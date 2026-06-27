@@ -2704,6 +2704,11 @@ mod tests {
             "SUP-L6N restart-token lookup must use the existing PM request/reply-cap call path"
         );
         assert!(
+            supervisor_src.contains("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}")
+                && supervisor_src.contains("ipc_recv_v2(rep_cap)"),
+            "SUP-L6O token lookup must wait for and decode the PM reply before reporting missing-token"
+        );
+        assert!(
             !supervisor_src.contains("spawn_process_with_startup_caps(")
                 && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),
             "supervisor must not execute restart locally"
@@ -2769,6 +2774,8 @@ mod tests {
             "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=0 reason=gate-off",
             "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id=13 site=policy",
             "PM_SPAWN_FROM_MO_TABLE_STATS image_id=13 table=pm_lifecycle used={} cap={}",
+            "PM_RESTART_TOKEN_QUERY_RECV tid={} sender={}",
+            "PM_RESTART_TOKEN_QUERY_REPLY tid={} status={} fingerprint={}",
             "CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID: u64 = 12",
             "crash_test_restart_token_for_tid",
             "target_record.image_id == CRASH_TEST_SRV_IMAGE_ID",
@@ -2833,8 +2840,14 @@ mod tests {
             "SUPERVISOR_RECORD_LOOKUP tid={} result=found",
             "SUPERVISOR_RECORD_LOOKUP tid={} result=missing",
             "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
-            "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source=pm",
+            "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source={}",
             "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=0 source=missing",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_BEGIN tid={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_REPLY tid={} status={} len={} fingerprint={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_DECODE_OK tid={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_DECODE_FAIL tid={} reason=payload",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=",
             "SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}",
             "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=",
             "SUPERVISOR_HANDLE_TASK_EXIT_ERR tid={} err={:?}",

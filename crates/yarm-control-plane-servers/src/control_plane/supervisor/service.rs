@@ -1897,21 +1897,55 @@ pub fn run() {
                                                     );
                                                 }
                                             }
-                                            match query_restart_token_via_process_manager(
-                                                &mut transport,
-                                                process_manager_caps,
-                                                fault.tid,
-                                            ) {
-                                                Ok(Some(restart_token)) => {
+                                            let token_result = supervisor
+                                                .find_record(fault.tid)
+                                                .and_then(|record| record.pending_restart_token)
+                                                .map(|token| Ok(Some((token, "record"))))
+                                                .unwrap_or_else(|| {
+                                                    query_restart_token_via_process_manager(
+                                                        &mut transport,
+                                                        process_manager_caps,
+                                                        fault.tid,
+                                                    )
+                                                    .map(|token| {
+                                                        token.map(|token| (token, "pm-query"))
+                                                    })
+                                                });
+                                            match token_result {
+                                                Ok(Some((restart_token, token_source))) => {
                                                     yarm_user_rt::user_log!(
-                                                        "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source=pm",
-                                                        fault.tid
+                                                        "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source={}",
+                                                        fault.tid,
+                                                        token_source
                                                     );
                                                     yarm_user_rt::user_log!(
                                                         "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
                                                         fault.tid,
                                                         (restart_token & 0xffff) as u16
                                                     );
+                                                    if token_source == "pm-query" {
+                                                        if let Some(record) =
+                                                            supervisor.find_record_mut(fault.tid)
+                                                        {
+                                                            record.pending_restart_token =
+                                                                Some(restart_token);
+                                                        }
+                                                        if let Some(record) =
+                                                            supervisor.find_record(fault.tid)
+                                                        {
+                                                            let policy =
+                                                                supervisor.policy_for(record);
+                                                            yarm_user_rt::user_log!(
+                                                                "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
+                                                                fault.tid,
+                                                                policy.max_restarts,
+                                                                record.restart_attempts,
+                                                                1usize,
+                                                                record.pm_restart_state,
+                                                                supervisor.degraded
+                                                            );
+                                                        }
+                                                    }
                                                     let event = TaskExitedEvent {
                                                         tid: fault.tid,
                                                         exit_code: fault.synthetic_exit_code(),
@@ -2133,19 +2167,53 @@ fn query_restart_token_via_process_manager(
     let Some((req_cap, rep_cap)) = process_manager_caps else {
         return Ok(None);
     };
+    yarm_user_rt::user_log!("SUPERVISOR_RESTART_TOKEN_QUERY_BEGIN tid={}", tid);
     let req = TaskRestartTokenRequest::new(tid);
     let msg = Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &req.encode())
         .map_err(|_| KernelError::WrongObject)?;
     // Use the same PM request/reply-cap call convention as lifecycle and restart
     // requests; a plain send cannot carry the reply cap PM needs to answer.
-    let _ = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) };
-    let Some(reply_msg) = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) }
-        .map_err(|_| KernelError::WrongObject)?
+    unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) }.map_err(|_| {
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=ipc-call",
+            tid
+        );
+        KernelError::WrongObject
+    })?;
+    yarm_user_rt::user_log!("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}", tid);
+    let Some(received) = unsafe { yarm_user_rt::syscall::ipc_recv_v2(rep_cap) }.map_err(|_| {
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=recv",
+            tid
+        );
+        KernelError::WrongObject
+    })?
     else {
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=no-reply",
+            tid
+        );
         return Ok(None);
     };
-    let reply = TaskRestartTokenReply::decode(reply_msg.as_slice())
-        .map_err(|_| KernelError::WrongObject)?;
+    let reply_msg = received.message;
+    let reply = match TaskRestartTokenReply::decode(reply_msg.as_slice()) {
+        Ok(reply) => reply,
+        Err(_) => {
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_RESTART_TOKEN_QUERY_DECODE_FAIL tid={} reason=payload",
+                tid
+            );
+            return Err(KernelError::WrongObject);
+        }
+    };
+    yarm_user_rt::user_log!("SUPERVISOR_RESTART_TOKEN_QUERY_DECODE_OK tid={}", tid);
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_RESTART_TOKEN_QUERY_REPLY tid={} status={} len={} fingerprint={}",
+        tid,
+        reply.found,
+        reply_msg.as_slice().len(),
+        (reply.token & 0xffff) as u16
+    );
     Ok(reply.found_token())
 }
 

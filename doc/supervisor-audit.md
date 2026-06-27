@@ -689,3 +689,22 @@ or any change to the exact SUP-L6 marker-count oracle. If scheduling succeeds bu
 PM restart send/decode is the next blocker, the next expected markers are
 `SUPERVISOR_RESTART_DUE` and then `SUPERVISOR_PM_RESTART_SEND_BEGIN` or a precise
 PM-client failure marker.
+
+### SUP-L6O restart-token state after accepted fault
+
+SUP-L6N proved that the supervisor reaches the post-fault accepted path, but the
+first accepted crash-test fault still stopped before `handle_task_exit` because
+`SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY` was only a diagnostic registration
+marker: registration did not place a token in the managed record, and the PM token
+query used a non-blocking reply poll that could report missing before PM's reply
+was delivered.
+
+SUP-L6O keeps token authority scoped to the existing PM restart-token mechanism.
+The accepted-fault path now uses a record token first when present, otherwise
+sends the existing `PROC_OP_TASK_RESTART_TOKEN` query to PM, blocks on the existing
+reply-cap receive path until the PM reply is available, decodes the reply before
+reporting missing, stores a successful PM token in the managed record, and only
+then calls `handle_task_exit`. The supervisor logs query begin/call/reply/decode
+markers plus token source (`record` or `pm-query`) and continues to use the
+existing scheduler. No new opcode, startup slot, cap path, PM Accepted shortcut,
+supervisor-local restart execution, or SUP-L6 marker-count oracle change is made.
