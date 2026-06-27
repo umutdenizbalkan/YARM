@@ -2711,6 +2711,7 @@ mod tests {
         let init_src = include_str!("init/service.rs");
         let pm_src = include_str!("process_manager/service.rs");
         let supervisor_src = include_str!("supervisor/service.rs");
+        let user_rt_src = include_str!("../../../yarm-user-rt/src/lib.rs");
         let initramfs_archive_src =
             include_str!("../../../yarm-fs-servers/src/fs/initramfs/archive.rs");
         let initramfs_service_src =
@@ -2722,8 +2723,12 @@ mod tests {
             "INIT_SUPERVISOR_RESTART_TEST_GATE_ON",
             "INIT_CRASH_TEST_SPAWN_REQUEST image_id=13",
             "spawn_v5_cap(pm_send, pm_recv, 13, [0, 0, 0, 0], 1)",
+            "INIT_STARTUP_SLOT_SUPERVISOR_CONTROL_SEND raw={}",
+            "STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP",
             "INIT_SUPERVISOR_CONTROL_SEND_CAP_PRESENT cap={}",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=zero",
             "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=decode",
             "INIT_CRASH_TEST_REGISTER_BEGIN tid={}",
             "INIT_CRASH_TEST_REGISTER_SEND cap={} tid={}",
             "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=no-supervisor-send-cap",
@@ -2777,6 +2782,9 @@ mod tests {
                 .contains("INITRAMFS_CPIO_ENTRY_COUNT count={} cap={} truncated={}"),
             "initramfs runtime must log CPIO entry count/cap/truncation"
         );
+        assert!(user_rt_src.contains("STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP: usize = 4"));
+        assert!(user_rt_src.contains("supervisor_control_send_ep = cap_from_slot"));
+        assert!(user_rt_src.contains("startup_arg_slot(index: usize)"));
         for needle in &[
             "SUPERVISOR_RESTART_TEST_GATE_ON",
             "SUPERVISOR_CRASH_TEST_REGISTER_BEGIN tid={}",

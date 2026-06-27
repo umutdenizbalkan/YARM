@@ -563,15 +563,25 @@ fn register_ext4_mount_with_vfs(
 fn crash_test_supervisor_control_send_cap(
     ctx: &yarm_user_rt::runtime::StartupContext,
 ) -> Option<u32> {
+    let raw = yarm_user_rt::runtime::startup_arg_slot(
+        yarm_user_rt::runtime::STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP,
+    )
+    .unwrap_or(0);
+    yarm_user_rt::user_log!("INIT_STARTUP_SLOT_SUPERVISOR_CONTROL_SEND raw={}", raw);
     match ctx.supervisor_control_send_ep {
         Some(cap) => {
             yarm_user_rt::user_log!("INIT_SUPERVISOR_CONTROL_SEND_CAP_PRESENT cap={}", cap);
             Some(cap)
         }
         None => {
-            yarm_user_rt::user_log!(
-                "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty"
-            );
+            if raw == 0 {
+                yarm_user_rt::user_log!("INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=zero");
+                yarm_user_rt::user_log!(
+                    "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty"
+                );
+            } else {
+                yarm_user_rt::user_log!("INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=decode");
+            }
             None
         }
     }

@@ -457,3 +457,9 @@ Failure reporting is also tightened: `InvalidArgs` from the spawn syscall is no 
 User evidence after SUP-L6D shows image_id 13 spawn succeeds and `crash_test_srv` reaches userspace before deliberately faulting. SUP-L6E adds the registration-send evidence needed for the next QEMU run: init logs whether the existing supervisor control SEND cap is present, logs the exact crash-test registration send attempt, and supervisor logs registration begin/accept/fail only from its control receive path.
 
 If the next run reaches `SUPERVISOR_CRASH_TEST_REGISTER_OK`, the expected next evidence is `SUPERVISOR_FAULT_REPORT_RECV`, `SUPERVISOR_FAULT_REPORT_ACCEPTED`, `SUPERVISOR_HANDLE_TASK_EXIT_BEGIN`, and `SUPERVISOR_RESTART_SCHEDULED attempt=1 max=3`. If it still reports `INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING`, the next blocker is `MissingSupervisorControlSendCap`. The SUP-L6 marker-count oracle remains exact and unchanged.
+
+### SUP-L6F supervisor control SEND startup handoff audit
+
+SUP-L6F confirms the crash-test registration blocker is the existing supervisor-control SEND startup handoff into init. The startup ABI already defines `STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP` and `StartupContext::supervisor_control_send_ep`; init now logs the raw slot value with `INIT_STARTUP_SLOT_SUPERVISOR_CONTROL_SEND raw=<n>` before decoding it. A raw zero value is reported as `INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=zero` and `reason=startup-slot-empty`; a nonzero value that still fails `StartupContext` decoding is reported as `reason=decode`.
+
+No new startup slot, endpoint, CNode slot, or fabricated cap is introduced. If QEMU continues to show raw zero, the exact deferred blocker is production/bootstrap provisioning of the already-defined supervisor control SEND cap into init's existing startup slot. Fixing that requires the existing startup handoff producer; SUP-L6F does not broaden restart support, weaken the oracle, or fake registration success.
