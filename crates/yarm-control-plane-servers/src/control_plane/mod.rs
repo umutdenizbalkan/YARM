@@ -2794,8 +2794,11 @@ mod tests {
                 "supervisor still receives the existing control SEND startup slot"
             );
             assert!(
-                !arch_boot_src.contains("init_args[4] ="),
-                "SUP-L6G audit: production init startup slot 4 remains unpopulated here"
+                arch_boot_src.contains("sup_ctrl_send_init")
+                    && arch_boot_src.contains("RING3_INIT_SERVER_TID")
+                    && arch_boot_src.contains("CapRights::SEND")
+                    && arch_boot_src.contains("init_args[4] = c.0"),
+                "SUP-L6H must provision init slot 4 from an init-local SEND cap"
             );
         }
         for needle in &[

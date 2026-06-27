@@ -1258,6 +1258,22 @@ pub fn bootstrap_first_user_task(
     } else {
         None
     };
+    let sup_ctrl_send_init = if supervisor_aei.is_some() {
+        let c = kernel.grant_capability_task_to_task_with_rights(
+            0,
+            sup_ctrl_send_root,
+            RING3_INIT_SERVER_TID,
+            crate::kernel::capabilities::CapRights::SEND,
+        )?;
+        crate::yarm_log!(
+            "CAP_GRANT_BOOT dst_tid={} slot=4 cap={} rights=SEND result=ok",
+            RING3_INIT_SERVER_TID,
+            c.0
+        );
+        Some(c)
+    } else {
+        None
+    };
     let sup_ctrl_recv_sup = if supervisor_aei.is_some() {
         let c = kernel.grant_capability_task_to_task_with_rights(
             0,
@@ -1357,6 +1373,9 @@ pub fn bootstrap_first_user_task(
     init_args[0] = RING3_INIT_SERVER_TID;
     init_args[1] = pm_inbound_send_init.0;
     init_args[2] = init_reply_recv_init.0;
+    if let Some(c) = sup_ctrl_send_init {
+        init_args[4] = c.0;
+    }
     init_args[9] = RING3_SUPERVISOR_TID;
     // Stage 159BC/D: knob-gated (`yarm.ipc_recv_proof=1`) IPC recv-v2 oracle
     // loopback. Slots 6/7 (init_alert_send/recv, unused by init's bootstrap) are
