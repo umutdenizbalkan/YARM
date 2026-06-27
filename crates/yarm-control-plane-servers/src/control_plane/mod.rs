@@ -2721,6 +2721,7 @@ mod tests {
         let riscv64_boot_src = include_str!("../../../../src/arch/riscv64/boot.rs");
         let kernel_fault_src = include_str!("../../../../src/kernel/boot/fault_state.rs");
         let kernel_restart_src = include_str!("../../../../src/kernel/boot/restart_state.rs");
+        let kernel_syscall_ipc_src = include_str!("../../../../src/kernel/syscall/ipc.rs");
         let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
 
         for needle in &[
@@ -2837,6 +2838,14 @@ mod tests {
         for needle in &[
             "TASK_FAULT_CURRENT tid={} fault_addr=0x{:x} access={:?}",
             "TASK_FAULT_REPORT_BEGIN tid={}",
+            "TASK_FAULT_REPORT_TARGET tid={} endpoint={} generation={}",
+            "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE endpoint={} waiters={} queued={}",
+            "TASK_FAULT_REPORT_SENDER tid={} sender_tid=0 opcode={} len={}",
+            "TASK_FAULT_REPORT_ENQUEUE_BEGIN tid={} endpoint={} generation={}",
+            "TASK_FAULT_REPORT_ENQUEUE_OK tid={} endpoint={} queued={} woke={}",
+            "TASK_FAULT_REPORT_QUEUE_STATE_AFTER endpoint={} waiters={} queued={}",
+            "TASK_FAULT_REPORT_SENT tid={} target={} endpoint={} generation={}",
+            "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason={:?}",
             "TASK_FAULT_REPORT_SENT tid={} target={}",
             "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
             "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
@@ -2856,6 +2865,16 @@ mod tests {
             assert!(
                 kernel_restart_src.contains(needle),
                 "kernel restart source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "SUPERVISOR_FAULT_RECV_CAP cap={} endpoint={} generation={}",
+            "faults.fault_handler_endpoint == Some(index) || faults.supervisor_endpoint == Some(index)",
+            "recv_tid == 2 && is_supervisor_fault_endpoint",
+        ] {
+            assert!(
+                kernel_syscall_ipc_src.contains(needle),
+                "kernel syscall IPC source must contain {needle}"
             );
         }
         assert!(smoke.contains("require_count \"CRASH_TEST_SRV_ENTRY\" 4"));
