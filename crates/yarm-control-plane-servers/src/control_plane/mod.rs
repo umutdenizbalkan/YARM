@@ -2700,6 +2700,10 @@ mod tests {
         );
         assert!(supervisor_src.contains("send_pm_restart_v1_via_process_manager"));
         assert!(
+            supervisor_src.contains("ipc_call(req_cap, rep_cap, &msg)"),
+            "SUP-L6N restart-token lookup must use the existing PM request/reply-cap call path"
+        );
+        assert!(
             !supervisor_src.contains("spawn_process_with_startup_caps(")
                 && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),
             "supervisor must not execute restart locally"
@@ -2823,7 +2827,18 @@ mod tests {
             "SUPERVISOR_FAULT_SENDER_OK tid={} sender={}",
             "SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}",
             "SUPERVISOR_FAULT_REPORT_REJECTED tid={} sender={} reason={:?}",
+            "SUPERVISOR_POST_FAULT_ACCEPT_BEGIN tid={}",
+            "SUPERVISOR_POST_FAULT_ACCEPT_CALL_HANDLE_EXIT tid={}",
+            "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=",
+            "SUPERVISOR_RECORD_LOOKUP tid={} result=found",
+            "SUPERVISOR_RECORD_LOOKUP tid={} result=missing",
+            "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
+            "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source=pm",
+            "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=0 source=missing",
             "SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}",
+            "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=",
+            "SUPERVISOR_HANDLE_TASK_EXIT_ERR tid={} err={:?}",
+            "SUPERVISOR_RESTART_SCHEDULE_FAIL tid={} reason={:?}",
             "SUPERVISOR_RESTART_SCHEDULED attempt={} max={}",
             "SUPERVISOR_RESTART_DUE tid={} attempt={}",
             "SUPERVISOR_RESTART_LIMIT_EXCEEDED attempts={}",

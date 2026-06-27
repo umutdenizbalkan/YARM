@@ -418,3 +418,24 @@ The intended delivery path remains unchanged: the kernel-owned fault report uses
 SUP-L6L proved the fault-report endpoint identities matched: supervisor was blocked on endpoint 3 and the kernel-origin fault report targeted endpoint 3. The failing state was the delivery helper path, not the endpoint route: the old kernel-origin helper enqueued the fault report, removed/woke the waiter, and left `queued=1`, so supervisor resumed with an `Internal` recv error before `IPC_RECV_BLOCKED_*` completion markers could appear.
 
 SUP-L6M chooses the direct blocked-recv completion path. When a recv-v2 waiter is already registered on the supervisor fault endpoint, the kernel fault-report helper now reuses the normal `complete_blocked_recv_for_waiter` semantics: copy the fault-report payload and metadata with `sender_tid=0`, clear the endpoint waiter, wake the supervisor, and leave no queued stranded report. The queue/retry path remains only for the no-waiter or non-recv-v2 fallback. No syscall, IPC opcode, startup slot, cap path, broad restart policy, user self-report, PM Accepted marker, or SUP-L6 marker-count oracle is changed.
+
+### SUP-L6N accepted-fault restart scheduling
+
+SUP-L6M made the kernel-origin crash-test fault report reach the supervisor and pass
+sender validation. SUP-L6N identifies the next blocker as the supervisor
+post-acceptance token path: the runtime accepted the fault report, but its
+restart-token lookup used a plain send/receive sequence rather than the existing
+PM request/reply-cap call convention, so PM did not receive the reply capability
+needed to answer and `handle_task_exit` was never reached.
+
+SUP-L6N keeps PM Accepted semantics unchanged and fixes only that post-acceptance
+bridge: the supervisor now queries the restart token through the existing PM
+request/reply-cap `ipc_call` path, logs managed-record and token state, and then
+calls the existing `handle_task_exit` / `schedule_restart_with_reason` path for
+attempt 1. The change adds diagnostics for missing records, missing tokens,
+handle-exit errors, and schedule failures; it does not add opcodes, startup
+slots, capabilities, supervisor-local restart execution, broader restart policy,
+or any change to the exact SUP-L6 marker-count oracle. If scheduling succeeds but
+PM restart send/decode is the next blocker, the next expected markers are
+`SUPERVISOR_RESTART_DUE` and then `SUPERVISOR_PM_RESTART_SEND_BEGIN` or a precise
+PM-client failure marker.

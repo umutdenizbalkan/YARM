@@ -1357,9 +1357,36 @@ impl SupervisorService {
         task_exit_ops: &mut impl SupervisorTaskExitOps,
         event: TaskExitedEvent,
     ) -> Result<SupervisorDecision, KernelError> {
+        #[cfg(not(test))]
+        yarm_user_rt::user_log!("SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}", event.tid);
         let Some(snapshot) = self.find_record(event.tid) else {
+            #[cfg(not(test))]
+            {
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_RECORD_LOOKUP tid={} result=missing",
+                    event.tid
+                );
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=ignored-missing-record",
+                    event.tid
+                );
+            }
             return Ok(SupervisorDecision::Ignored { tid: event.tid });
         };
+        let policy_snapshot = self.policy_for(snapshot);
+        #[cfg(not(test))]
+        {
+            yarm_user_rt::user_log!("SUPERVISOR_RECORD_LOOKUP tid={} result=found", event.tid);
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
+                event.tid,
+                policy_snapshot.max_restarts,
+                snapshot.restart_attempts,
+                usize::from(snapshot.pending_restart_token.is_some()),
+                snapshot.pm_restart_state,
+                self.degraded
+            );
+        }
         if matches!(snapshot.kind, ManagedServiceKind::Core(kind) if CoreServicePolicyTable::restart_owner_for(kind) == RestartOwner::Init)
         {
             self.send_init_alert(
@@ -1369,6 +1396,11 @@ impl SupervisorService {
                     kind: InitAlertKind::SupervisorRestarted,
                 },
             )?;
+            #[cfg(not(test))]
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=ignored-init-owner",
+                event.tid
+            );
             return Ok(SupervisorDecision::Ignored { tid: event.tid });
         }
         let policy = self.policy_for(snapshot);
@@ -1411,6 +1443,11 @@ impl SupervisorService {
             );
             mark_result?;
             alert_result?;
+            #[cfg(not(test))]
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=degraded-final",
+                event.tid
+            );
             return Ok(SupervisorDecision::MarkedDead {
                 tid: event.tid,
                 kind: snapshot.kind,
@@ -1425,7 +1462,31 @@ impl SupervisorService {
             SupervisorRestartReason::NormalExit
         };
         let due_tick =
-            self.schedule_restart_with_reason(event.tid, event.restart_token, restart_reason)?;
+            match self.schedule_restart_with_reason(event.tid, event.restart_token, restart_reason)
+            {
+                Ok(due_tick) => due_tick,
+                Err(err) => {
+                    #[cfg(not(test))]
+                    {
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_RESTART_SCHEDULE_FAIL tid={} reason={:?}",
+                            event.tid,
+                            err
+                        );
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_HANDLE_TASK_EXIT_ERR tid={} err={:?}",
+                            event.tid,
+                            err
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+        #[cfg(not(test))]
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=scheduled-restart",
+            event.tid
+        );
         for dependent_tid in self.dependent_tids(snapshot).into_iter().flatten() {
             let Some(token) = task_exit_ops.task_restart_token(dependent_tid) else {
                 #[cfg(not(test))]
@@ -1802,12 +1863,50 @@ pub fn run() {
                                                 "SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}",
                                                 fault.tid
                                             );
+                                            yarm_user_rt::user_log!(
+                                                "SUPERVISOR_POST_FAULT_ACCEPT_BEGIN tid={}",
+                                                fault.tid
+                                            );
+                                            match supervisor.find_record(fault.tid) {
+                                                Some(record) => {
+                                                    let policy = supervisor.policy_for(record);
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_RECORD_LOOKUP tid={} result=found",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
+                                                        fault.tid,
+                                                        policy.max_restarts,
+                                                        record.restart_attempts,
+                                                        usize::from(
+                                                            record.pending_restart_token.is_some()
+                                                        ),
+                                                        record.pm_restart_state,
+                                                        supervisor.degraded
+                                                    );
+                                                }
+                                                None => {
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_RECORD_LOOKUP tid={} result=missing",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=missing-record",
+                                                        fault.tid
+                                                    );
+                                                }
+                                            }
                                             match query_restart_token_via_process_manager(
                                                 &mut transport,
                                                 process_manager_caps,
                                                 fault.tid,
                                             ) {
                                                 Ok(Some(restart_token)) => {
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source=pm",
+                                                        fault.tid
+                                                    );
                                                     yarm_user_rt::user_log!(
                                                         "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
                                                         fault.tid,
@@ -1819,7 +1918,7 @@ pub fn run() {
                                                         restart_token,
                                                     };
                                                     yarm_user_rt::user_log!(
-                                                        "SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}",
+                                                        "SUPERVISOR_POST_FAULT_ACCEPT_CALL_HANDLE_EXIT tid={}",
                                                         fault.tid
                                                     );
                                                     let mut ops = RuntimeSupervisorTaskExitOps {
@@ -1856,24 +1955,50 @@ pub fn run() {
                                                             );
                                                         }
                                                         Ok(_) => {}
-                                                        Err(err) => yarm_user_rt::user_log!(
-                                                            "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
-                                                            fault.tid,
-                                                            err
-                                                        ),
+                                                        Err(err) => {
+                                                            yarm_user_rt::user_log!(
+                                                                "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
+                                                                fault.tid,
+                                                                err
+                                                            );
+                                                            yarm_user_rt::user_log!(
+                                                                "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=handle-exit-err",
+                                                                fault.tid
+                                                            );
+                                                        }
                                                     }
                                                 }
-                                                Ok(None) => yarm_user_rt::user_log!(
-                                                    "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={:?}; restart-token lookup unsupported/unavailable in runtime path",
-                                                    fault.tid,
-                                                    fault.fault_addr,
-                                                    fault.access
-                                                ),
-                                                Err(err) => yarm_user_rt::user_log!(
-                                                    "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
-                                                    fault.tid,
-                                                    err
-                                                ),
+                                                Ok(None) => {
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=0 source=missing",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=missing-token",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "supervisor.srv fault report received: tid={}, addr=0x{:x}, access={:?}; restart-token lookup unsupported/unavailable in runtime path",
+                                                        fault.tid,
+                                                        fault.fault_addr,
+                                                        fault.access
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=0 source=missing",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=token-query-err",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
+                                                        fault.tid,
+                                                        err
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -2001,7 +2126,7 @@ fn supervisor_idle_wait(
 
 #[cfg(not(test))]
 fn query_restart_token_via_process_manager(
-    transport: &mut impl IpcTransport,
+    _transport: &mut impl IpcTransport,
     process_manager_caps: Option<(u32, u32)>,
     tid: u64,
 ) -> Result<Option<u64>, KernelError> {
@@ -2011,11 +2136,10 @@ fn query_restart_token_via_process_manager(
     let req = TaskRestartTokenRequest::new(tid);
     let msg = Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &req.encode())
         .map_err(|_| KernelError::WrongObject)?;
-    transport
-        .send(req_cap, &msg)
-        .map_err(|_| KernelError::WrongObject)?;
-    let Some(reply_msg) = transport
-        .recv(rep_cap)
+    // Use the same PM request/reply-cap call convention as lifecycle and restart
+    // requests; a plain send cannot carry the reply cap PM needs to answer.
+    let _ = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) };
+    let Some(reply_msg) = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) }
         .map_err(|_| KernelError::WrongObject)?
     else {
         return Ok(None);
@@ -2725,6 +2849,60 @@ mod tests {
                 .expect("status")
                 .pending_restart_due,
             10
+        );
+    }
+
+    #[test]
+    fn accepted_kernel_fault_report_schedules_restart_attempt_one() {
+        let handoff =
+            InitFaultHandoff::new(1, CapId(10), CapId(11), CapId(12), CapId(13), CapId(14), 20);
+        let mut supervisor = SupervisorService::new(1, handoff, CoreServicePolicyTable::baseline());
+        supervisor
+            .register_driver(
+                10008,
+                ServiceRestartPolicy {
+                    max_restarts: 3,
+                    backoff_ticks: 0,
+                },
+                13,
+                0,
+                DriverRecoveryPlan {
+                    irq_line: 0,
+                    mem_cap: CapId(0),
+                    dma_len: 0,
+                    iova_cap: CapId(0),
+                    iova_base: 0,
+                    iova_len: 0,
+                },
+            )
+            .expect("register crash-test service");
+        let fault = SupervisorFaultReportWire {
+            tid: 10008,
+            fault_addr: 0,
+            access: 2,
+            flags: 0,
+        };
+        let msg =
+            Message::with_header(0, SUPERVISOR_OP_FAULT_REPORT_WIRE, 0, None, &fault.encode())
+                .expect("fault message");
+        let mut ops = MockOutboundOps::default();
+        let outcome = supervisor
+            .handle_supervisor_event(
+                &mut ops,
+                &mut MockOutboundOps::default(),
+                SupervisorEvent::Fault(msg),
+            )
+            .expect("accepted kernel fault");
+
+        assert_eq!(outcome.handled, 1);
+        let status = supervisor.status_for(10008).expect("record");
+        assert_eq!(status.restart_attempts, 1);
+        assert_eq!(status.max_restarts, 3);
+        assert_eq!(status.pending_restart_due, 0);
+        assert_eq!(status.pending_restart_token, 0xAA00 + 10008);
+        assert_eq!(
+            status.pm_restart_state,
+            SupervisorPmRestartState::PendingDue as u8
         );
     }
 
