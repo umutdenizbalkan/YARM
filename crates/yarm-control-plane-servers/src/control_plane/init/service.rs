@@ -560,8 +560,25 @@ fn register_ext4_mount_with_vfs(
     }
 }
 
+fn crash_test_supervisor_control_send_cap(
+    ctx: &yarm_user_rt::runtime::StartupContext,
+) -> Option<u32> {
+    match ctx.supervisor_control_send_ep {
+        Some(cap) => {
+            yarm_user_rt::user_log!("INIT_SUPERVISOR_CONTROL_SEND_CAP_PRESENT cap={}", cap);
+            Some(cap)
+        }
+        None => {
+            yarm_user_rt::user_log!(
+                "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty"
+            );
+            None
+        }
+    }
+}
+
 fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
-    yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_REGISTER_BEGIN");
+    yarm_user_rt::user_log!("INIT_CRASH_TEST_REGISTER_BEGIN tid={}", crash_tid);
     let req = RegisterDriverRequest {
         tid: crash_tid,
         max_restarts: 3,
@@ -583,15 +600,25 @@ fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
         None,
         &payload,
     ) else {
-        yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_REGISTER_FAIL reason=message");
+        yarm_user_rt::user_log!(
+            "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=message",
+            crash_tid
+        );
         return;
     };
-    let _ = unsafe { yarm_user_rt::syscall::ipc_send(supervisor_send, &msg) };
     yarm_user_rt::user_log!(
-        "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
+        "INIT_CRASH_TEST_REGISTER_SEND cap={} tid={}",
+        supervisor_send,
         crash_tid
     );
-    yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_POLICY max_restarts=3");
+    match unsafe { yarm_user_rt::syscall::ipc_send(supervisor_send, &msg) } {
+        Ok(()) => yarm_user_rt::user_log!("INIT_CRASH_TEST_REGISTER_OK tid={}", crash_tid),
+        Err(err) => yarm_user_rt::user_log!(
+            "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=ipc-send err={:?}",
+            crash_tid,
+            err
+        ),
+    }
 }
 
 pub fn run() {
@@ -1019,11 +1046,12 @@ pub fn run() {
             spawn_v5_cap(pm_send, pm_recv, 13, [0, 0, 0, 0], 1)
         {
             yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_OK tid={}", crash_tid);
-            if let Some(supervisor_send) = ctx.supervisor_control_send_ep {
+            if let Some(supervisor_send) = crash_test_supervisor_control_send_cap(&ctx) {
                 register_crash_test_with_supervisor(supervisor_send, crash_tid);
             } else {
                 yarm_user_rt::user_log!(
-                    "SUPERVISOR_CRASH_TEST_REGISTER_FAIL reason=no-supervisor-send-cap"
+                    "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=no-supervisor-send-cap",
+                    crash_tid
                 );
             }
         } else {

@@ -33,6 +33,10 @@ fn emit_start_markers() {
 
 #[inline]
 fn wait_for_test_delay() {
+    #[cfg(not(feature = "hosted-dev"))]
+    yarm_user_rt::user_log!("CRASH_TEST_SRV_DELAY_BEGIN");
+    #[cfg(feature = "hosted-dev")]
+    eprintln!("CRASH_TEST_SRV_DELAY_BEGIN");
     for _ in 0..CRASH_TEST_DELAY_YIELDS {
         #[cfg(not(feature = "hosted-dev"))]
         {
@@ -41,6 +45,10 @@ fn wait_for_test_delay() {
         #[cfg(feature = "hosted-dev")]
         core::hint::spin_loop();
     }
+    #[cfg(not(feature = "hosted-dev"))]
+    yarm_user_rt::user_log!("CRASH_TEST_SRV_DELAY_DONE");
+    #[cfg(feature = "hosted-dev")]
+    eprintln!("CRASH_TEST_SRV_DELAY_DONE");
 }
 
 #[cfg(feature = "hosted-dev")]

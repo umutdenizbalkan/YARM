@@ -858,9 +858,26 @@ impl SupervisorService {
                 }
             }
             SUPERVISOR_OP_REGISTER_DRIVER => {
-                let req = RegisterDriverRequest::decode(request.as_slice())
-                    .ok_or(KernelError::WrongObject)?;
-                self.register_driver(
+                let req = match RegisterDriverRequest::decode(request.as_slice()) {
+                    Some(req) => req,
+                    None => {
+                        #[cfg(not(test))]
+                        if supervisor_restart_test_build_gate_enabled() {
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_CRASH_TEST_REGISTER_FAIL tid=0 reason=decode"
+                            );
+                        }
+                        return Err(KernelError::WrongObject);
+                    }
+                };
+                let crash_test_registration = supervisor_restart_test_build_gate_enabled()
+                    && req.max_restarts == 3
+                    && req.restart_group == 13;
+                #[cfg(not(test))]
+                if crash_test_registration {
+                    yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_REGISTER_BEGIN tid={}", req.tid);
+                }
+                if let Err(err) = self.register_driver(
                     req.tid,
                     ServiceRestartPolicy {
                         max_restarts: req.max_restarts,
@@ -876,16 +893,27 @@ impl SupervisorService {
                         iova_base: req.iova_base as usize,
                         iova_len: req.iova_len as usize,
                     },
-                )?;
-                if supervisor_restart_test_build_gate_enabled()
-                    && req.max_restarts == 3
-                    && req.restart_group == 13
-                {
+                ) {
+                    #[cfg(not(test))]
+                    if crash_test_registration {
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_CRASH_TEST_REGISTER_FAIL tid={} reason={:?}",
+                            req.tid,
+                            err
+                        );
+                    }
+                    return Err(err);
+                }
+                if crash_test_registration {
                     yarm_user_rt::user_log!(
                         "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
                         req.tid
                     );
                     yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_POLICY max_restarts=3");
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY tid={}",
+                        req.tid
+                    );
                 }
             }
             SUPERVISOR_OP_QUERY_STATUS => {
@@ -1667,6 +1695,11 @@ pub fn run() {
                             SUPERVISOR_OP_FAULT_REPORT_WIRE => {
                                 match SupervisorFaultReportWire::decode(msg.as_slice()) {
                                     Some(fault) => {
+                                        yarm_user_rt::user_log!(
+                                            "SUPERVISOR_FAULT_REPORT_RECV claimed_tid={} sender_tid={}",
+                                            fault.tid,
+                                            msg.sender_tid.0
+                                        );
                                         if let Err(err) = supervisor.validate_fault_sender(
                                             msg.sender_tid.0,
                                             fault.tid,
@@ -1682,6 +1715,10 @@ pub fn run() {
                                                 "SUPERVISOR_FAULT_SENDER_REJECTED"
                                             );
                                         } else {
+                                            yarm_user_rt::user_log!(
+                                                "SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}",
+                                                fault.tid
+                                            );
                                             match query_restart_token_via_process_manager(
                                                 &mut transport,
                                                 process_manager_caps,
@@ -1698,6 +1735,10 @@ pub fn run() {
                                                         exit_code: fault.synthetic_exit_code(),
                                                         restart_token,
                                                     };
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}",
+                                                        fault.tid
+                                                    );
                                                     let mut ops = RuntimeSupervisorTaskExitOps {
                                                         token_tid: fault.tid,
                                                         token: restart_token,

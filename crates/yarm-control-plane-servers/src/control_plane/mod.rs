@@ -2577,6 +2577,8 @@ mod tests {
         for marker in &[
             "CRASH_TEST_SRV_ENTRY",
             "CRASH_TEST_SRV_READY",
+            "CRASH_TEST_SRV_DELAY_BEGIN",
+            "CRASH_TEST_SRV_DELAY_DONE",
             "CRASH_TEST_SRV_FAULT_NOW",
             "CRASH_TEST_DELAY_YIELDS",
         ] {
@@ -2720,10 +2722,13 @@ mod tests {
             "INIT_SUPERVISOR_RESTART_TEST_GATE_ON",
             "INIT_CRASH_TEST_SPAWN_REQUEST image_id=13",
             "spawn_v5_cap(pm_send, pm_recv, 13, [0, 0, 0, 0], 1)",
-            "SUPERVISOR_CRASH_TEST_REGISTER_BEGIN",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_PRESENT cap={}",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty",
+            "INIT_CRASH_TEST_REGISTER_BEGIN tid={}",
+            "INIT_CRASH_TEST_REGISTER_SEND cap={} tid={}",
+            "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=no-supervisor-send-cap",
+            "INIT_CRASH_TEST_REGISTER_OK tid={}",
             "RegisterDriverRequest",
-            "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
-            "SUPERVISOR_CRASH_TEST_POLICY max_restarts=3",
         ] {
             assert!(
                 init_src.contains(needle),
@@ -2774,8 +2779,15 @@ mod tests {
         );
         for needle in &[
             "SUPERVISOR_RESTART_TEST_GATE_ON",
+            "SUPERVISOR_CRASH_TEST_REGISTER_BEGIN tid={}",
             "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
+            "SUPERVISOR_CRASH_TEST_REGISTER_FAIL tid={} reason={:?}",
+            "SUPERVISOR_CRASH_TEST_POLICY max_restarts=3",
+            "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY tid={}",
             "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
+            "SUPERVISOR_FAULT_REPORT_RECV claimed_tid={} sender_tid={}",
+            "SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}",
+            "SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}",
             "SUPERVISOR_RESTART_SCHEDULED attempt={} max={}",
             "SUPERVISOR_RESTART_LIMIT_EXCEEDED attempts={}",
             "SUPERVISOR_SERVICE_DEGRADED_FINAL",
