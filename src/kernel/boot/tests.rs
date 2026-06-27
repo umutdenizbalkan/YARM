@@ -16757,6 +16757,97 @@ fn page_fault_report_falls_back_to_supervisor_endpoint_when_no_fault_handler() {
 }
 
 #[test]
+fn kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_queue() {
+    // SUP-L6M: kernel-origin fault reports must use the same direct blocked-recv
+    // completion semantics as normal IPC send when supervisor is already blocked
+    // on the fault endpoint.  Waking the waiter while leaving the report queued
+    // makes userspace resume with an Internal recv error and strands the report.
+    let mut state = Bootstrap::init().expect("init");
+    state.register_task(1).expect("supervisor task");
+
+    let (endpoint_idx, _send_cap, recv_cap_global) = state.create_endpoint(4).expect("endpoint");
+    state
+        .set_supervisor_endpoint(recv_cap_global)
+        .expect("set supervisor endpoint");
+    let recv_cap_task1 = state
+        .grant_capability_task_to_task(0, recv_cap_global, 1)
+        .expect("grant supervisor recv cap");
+
+    let payload_ptr = 0x3000usize;
+    let meta_ptr = 0x4000usize;
+    let asid = map_ipc_recv_syscall_buffers_for_task(&mut state, 1, payload_ptr, meta_ptr, 0xD000);
+
+    state.enqueue_current_cpu(1).expect("enqueue supervisor");
+    state.yield_current().expect("switch to supervisor");
+    assert_eq!(state.current_tid(), Some(1));
+
+    let mut recv_frame = TrapFrame::new(
+        crate::kernel::syscall::Syscall::IpcRecv as usize,
+        [recv_cap_task1.0 as usize, payload_ptr, 32, meta_ptr, 40, 0],
+    );
+    state
+        .handle_trap(Trap::Syscall, Some(&mut recv_frame))
+        .expect("supervisor recv blocks");
+    assert_eq!(state.current_tid(), Some(0));
+    assert_eq!(
+        state.with_ipc_state(|ipc| ipc.endpoint_waiters[endpoint_idx]),
+        Some(ThreadId(1)),
+        "supervisor must be the fault endpoint waiter"
+    );
+
+    let fault = super::super::trap::FaultInfo {
+        addr: VirtAddr(0xCAFE),
+        access: super::super::trap::FaultAccess::Write,
+    };
+    state.emit_fault_report_for_fault_for_test(10008, fault);
+
+    let (waiter, queued) = state.with_ipc_state(|ipc| {
+        (
+            ipc.endpoint_waiters[endpoint_idx],
+            ipc.endpoints[endpoint_idx]
+                .as_ref()
+                .map(|ep| super::kernel_ref(ep).queued())
+                .unwrap_or(0),
+        )
+    });
+    assert_eq!(waiter, None, "direct completion must clear endpoint waiter");
+    assert_eq!(
+        queued, 0,
+        "direct completion must not strand a queued report"
+    );
+    assert!(
+        matches!(
+            state.task_status(1),
+            Some(TaskStatus::Runnable | TaskStatus::Running)
+        ),
+        "supervisor must be runnable after direct fault-report completion"
+    );
+
+    let payload = state
+        .read_user_memory_for_asid(asid, payload_ptr, 17)
+        .expect("read fault payload");
+    let report = super::fault_state::SupervisorFaultReportWire::decode(&payload[..17])
+        .expect("decode delivered fault report");
+    assert_eq!(report.faulting_tid, 10008);
+    assert_eq!(report.fault_addr, 0xCAFE);
+    assert_eq!(report.access, super::super::trap::FaultAccess::Write);
+
+    let meta = state
+        .read_user_memory_for_asid(asid, meta_ptr, 40)
+        .expect("read fault meta");
+    assert_eq!(
+        u32::from_le_bytes(meta[12..16].try_into().expect("payload len")),
+        17,
+        "fault payload length must be preserved"
+    );
+    assert_eq!(
+        u64::from_le_bytes(meta[32..40].try_into().expect("sender tid")),
+        0,
+        "kernel-origin fault report must preserve sender_tid=0"
+    );
+}
+
+#[test]
 fn register_task_tcb_and_class_consistent_after_allocation() {
     // Regression test for Bug D: register_task_with_class_and_cnode_slots_in_process
     // used to mutate self.tcbs[idx] and self.task_classes[idx] directly without
