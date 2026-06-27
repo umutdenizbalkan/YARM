@@ -2716,6 +2716,9 @@ mod tests {
             include_str!("../../../yarm-fs-servers/src/fs/initramfs/archive.rs");
         let initramfs_service_src =
             include_str!("../../../yarm-fs-servers/src/fs/initramfs/service.rs");
+        let x86_boot_src = include_str!("../../../../src/arch/x86_64/boot.rs");
+        let aarch64_boot_src = include_str!("../../../../src/arch/aarch64/boot.rs");
+        let riscv64_boot_src = include_str!("../../../../src/arch/riscv64/boot.rs");
         let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
 
         for needle in &[
@@ -2785,6 +2788,16 @@ mod tests {
         assert!(user_rt_src.contains("STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP: usize = 4"));
         assert!(user_rt_src.contains("supervisor_control_send_ep = cap_from_slot"));
         assert!(user_rt_src.contains("startup_arg_slot(index: usize)"));
+        for arch_boot_src in &[x86_boot_src, aarch64_boot_src, riscv64_boot_src] {
+            assert!(
+                arch_boot_src.contains("sup_args[4] = c.0"),
+                "supervisor still receives the existing control SEND startup slot"
+            );
+            assert!(
+                !arch_boot_src.contains("init_args[4] ="),
+                "SUP-L6G audit: production init startup slot 4 remains unpopulated here"
+            );
+        }
         for needle in &[
             "SUPERVISOR_RESTART_TEST_GATE_ON",
             "SUPERVISOR_CRASH_TEST_REGISTER_BEGIN tid={}",
