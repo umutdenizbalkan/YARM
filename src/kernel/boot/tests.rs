@@ -45540,3 +45540,136 @@ mod stage163n_sender_wake_fix {
         );
     }
 }
+
+// ── Stage 163O: E2 poll retry-on-timeout + RISC-V A0 preservation ───────────
+mod stage163o_e2_poll_fix {
+    const INIT_SVC_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    fn e2_poll_body() -> &'static str {
+        INIT_SVC_SRC
+            .split("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN")
+            .nth(1)
+            .and_then(|s| s.split("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_EXHAUSTED").next())
+            .expect("E2 poll loop body")
+    }
+
+    fn non_syscall_else_body() -> &'static str {
+        // Isolate the non-syscall else branch in the RISC-V trap bridge.
+        // It follows the ecall branch (`} else if scause == EXC_USER_ECALL {`)
+        // and ends before the next statement.
+        RISCV_BOOT_SRC
+            .split("} else {\n        // Non-syscall trap")
+            .nth(1)
+            .and_then(|s| s.split("\n    }\n\n    // The active satp").next())
+            .expect("non-syscall else branch body in RISC-V boot bridge")
+    }
+
+    // Task A: E2 poll loop treats Err(TimedOut) as retry, not break.
+    // Root cause: on iter 0, Phase 2 of ipc_recv_with_optional_deadline
+    // runs in the same kernel call before the child is scheduled, so
+    // received.is_none()=true → timed_out=true → Err(TimedOut). The old
+    // Err(_) arm broke the loop; the fix groups TimedOut/WouldBlock with
+    // Ok(None) as retry conditions.
+    #[test]
+    fn stage163o_e2_poll_timed_out_grouped_with_ok_none() {
+        let body = e2_poll_body();
+        assert!(
+            body.contains("SyscallError::TimedOut"),
+            "E2 poll loop must handle SyscallError::TimedOut"
+        );
+        assert!(
+            body.contains("SyscallError::WouldBlock"),
+            "E2 poll loop must handle SyscallError::WouldBlock"
+        );
+        // The TimedOut/WouldBlock arms must be retry arms (no break after them).
+        // Find TimedOut, then WouldBlock, then the slice between WouldBlock
+        // and the next Err(_) break arm — that slice must not contain a break.
+        let timed_out_pos = body
+            .find("SyscallError::TimedOut")
+            .expect("TimedOut arm must exist");
+        let would_block_pos = body
+            .find("SyscallError::WouldBlock")
+            .expect("WouldBlock arm must exist");
+        assert!(
+            timed_out_pos < would_block_pos,
+            "SyscallError::TimedOut must appear before SyscallError::WouldBlock (multi-arm pattern)"
+        );
+        // After WouldBlock arm, there must be a break in the subsequent Err(_) arm.
+        let after_would_block = &body[would_block_pos..];
+        let break_pos_rel = after_would_block
+            .find("break 'e2_poll")
+            .expect("break arm must exist after WouldBlock");
+        // Verify nothing between WouldBlock and the break constitutes a retry-path break.
+        let between = &after_would_block[..break_pos_rel];
+        assert!(
+            !between.contains("break 'e2_poll"),
+            "No break must appear between WouldBlock and the final break arm"
+        );
+    }
+
+    // Task A: Err(TimedOut) arm must NOT itself contain break 'e2_poll.
+    #[test]
+    fn stage163o_e2_poll_timed_out_arm_is_not_break() {
+        let body = e2_poll_body();
+        // Extract the slice from TimedOut to the next Err(_) arm to verify
+        // there is no break between them.
+        let timed_out_pos = body
+            .find("SyscallError::TimedOut")
+            .expect("TimedOut arm must exist");
+        let after = &body[timed_out_pos..];
+        // The break arm (Err(_) => { break }) appears after the retry arm.
+        // There must NOT be a `break 'e2_poll` between TimedOut and WouldBlock.
+        let to_would_block = after
+            .find("SyscallError::WouldBlock")
+            .expect("WouldBlock arm must follow TimedOut");
+        let between = &after[..to_would_block];
+        assert!(
+            !between.contains("break 'e2_poll"),
+            "No break must appear between TimedOut and WouldBlock arms"
+        );
+    }
+
+    // Task C: Non-syscall else branch in RISC-V boot bridge must NOT write
+    // frame.regs[A0] from tframe.user_gpr(10). The TCB snapshot used by
+    // apply_user_context is stale: it was synced at ecall entry, not updated
+    // when the fork handler exports ret0=child_tid. A COW fault firing
+    // immediately after fork return would clobber a0=child_tid to 0.
+    #[test]
+    fn stage163o_riscv_non_syscall_else_does_not_write_a0_from_tframe() {
+        let body = non_syscall_else_body();
+        assert!(
+            !body.contains("tframe.user_gpr(10)"),
+            "non-syscall else branch must NOT write frame.regs[A0] from tframe.user_gpr(10) \
+             (stale TCB would clobber fork return a0=child_tid)"
+        );
+        assert!(
+            !body.contains("tframe.user_gpr(11)"),
+            "non-syscall else branch must NOT write A1 from tframe.user_gpr(11)"
+        );
+    }
+
+    // Task C: Non-syscall else branch must emit the RISC-V A0 preserve markers.
+    #[test]
+    fn stage163o_riscv_non_syscall_else_has_preserve_markers() {
+        let body = non_syscall_else_body();
+        assert!(
+            body.contains("RISCV_NON_SYSCALL_TRAP_FRAME_SAVE"),
+            "non-syscall else branch must emit RISCV_NON_SYSCALL_TRAP_FRAME_SAVE marker"
+        );
+        assert!(
+            body.contains("RISCV_PAGE_FAULT_PRESERVE_GPRS"),
+            "non-syscall else branch must emit RISCV_PAGE_FAULT_PRESERVE_GPRS marker"
+        );
+        assert!(
+            body.contains("RISCV_POST_FAULT_TRAP_RETURN"),
+            "non-syscall else branch must emit RISCV_POST_FAULT_TRAP_RETURN marker"
+        );
+        assert!(
+            body.contains("RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT"),
+            "non-syscall else branch must emit RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT marker"
+        );
+    }
+}

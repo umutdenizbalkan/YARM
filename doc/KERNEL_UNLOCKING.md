@@ -4259,6 +4259,117 @@ architectures and verify:
   (confirms parent's fork return value is the child TID).
 - `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` is reached on all architectures.
 
+#### 5.1.9.21 Stage 163O — E2 poll retry-on-timeout + RISC-V A0 preservation
+
+**Goal.** After Stage 163N, the E2 poll loop still silently failed on all
+architectures because `Err(TimedOut)` was treated as a fatal break condition.
+Additionally, on RISC-V, a post-fork COW page fault clobbered the parent's
+a0=child_tid before it could log the fork result, causing a role-swap bug.
+
+**Root cause — Task A: E2 poll `Err(TimedOut)` treated as break**
+
+`ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)` on iter 0:
+
+1. Phase 1 (immediate) finds E2 queue empty — child not yet scheduled.
+2. `block_current_on_receive_with_deadline` is called; Phase C calls
+   `dispatch_next_task()` which sets `current_tid=child` but does NOT switch
+   CPU context (YARM dispatch model: context switch happens at trap-bridge
+   return, not in kernel code).
+3. Phase 2 runs immediately in the **same kernel call** before the child has
+   had any CPU time: `ipc_recv_endpoint_take` returns `(None, None)`.
+4. `timed_out = fired || received.is_none()` → `true` → `Err(TimedOut)`.
+
+The `Err(_) => break 'e2_poll` arm exited the loop after ONE iteration.  The
+child then ran (trap bridge sret'd to it), enqueued itself as sender-waiter on
+E1, kernel pushed to E2.  Timer fired, parent resumed — but the poll loop had
+already exited.  On iter 1, `try_endpoint_split_recv` (Phase 1) would have
+found the queued E2 message and returned `Ok(Some(sig))` immediately.
+
+**Fix — Task A** (`service.rs`):
+
+Grouped `Err(TimedOut)` and `Err(WouldBlock)` with `Ok(None)` as retry arms:
+
+```rust
+Ok(None)
+| Err(yarm_user_rt::syscall::SyscallError::TimedOut)
+| Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+    // Timeout or would-block — child not yet a sender-waiter; yield and retry.
+}
+Err(_) => { break 'e2_poll; }
+```
+
+**Root cause — Task B: RISC-V non-syscall trap clobbers fork return A0**
+
+After fork ecall, the kernel sets `frame.regs[A0] = tframe.ret0() = child_tid`
+and sret returns to the parent with a0=child_tid.  The parent's first
+instruction after fork (e.g., `user_log!` store) triggers a COW page fault
+(scause=0xf).
+
+The non-syscall else branch in `yarm_riscv64_trap_bridge` wrote:
+```rust
+frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;  // BUG
+```
+
+After `restore_arch_thread_state` → `apply_user_context`, `tframe.user_gprs`
+is reloaded from the TCB snapshot taken at **fork ecall entry**
+(`sync_current_thread_from_frame`), which has `user_gprs[10]=0` (pre-ecall
+a0).  The fork handler exports ret0=child_tid AFTER the sync; that value is
+never saved back.  So `tframe.user_gpr(10)=0` clobbers a0=child_tid → parent
+sees a0=0 → thinks it's the child → role-swap bug.
+
+**Fix — Task B** (`src/arch/riscv64/boot.rs`):
+
+Removed all `tframe.user_gpr()` writes from the non-syscall else branch.  The
+mirror loop (lines 824–838) already skips A0–A7, so `frame.regs[A0..A7]` still
+hold the hardware-saved values from the ASM trap saver — exactly what we need
+for a same-task non-syscall trap.
+
+**New RISC-V diagnostic markers** (gated on `ipc_recv_proof_sender_wake_active()`):
+
+| Marker | When |
+|--------|------|
+| `RISCV_NON_SYSCALL_TRAP_FRAME_SAVE tid=<t> scause=<s>` | Non-syscall else branch entered |
+| `RISCV_PAGE_FAULT_PRESERVE_GPRS tid=<t> a0=<v> a1=<v>` | A0/A1 hardware-preserved values logged |
+| `RISCV_POST_FAULT_TRAP_RETURN tid=<t> a0=<v>` | A0 value about to be restored to userspace |
+| `RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT tid=<t> a0=<v>` | Non-zero a0 preserved (fork return intact) |
+
+**Unit-test guards added** (`src/kernel/boot/tests.rs`, module
+`stage163o_e2_poll_fix`):
+
+| Test | What it verifies |
+|------|-----------------|
+| `stage163o_e2_poll_timed_out_grouped_with_ok_none` | TimedOut/WouldBlock before the break arm |
+| `stage163o_e2_poll_timed_out_arm_is_not_break` | No break between TimedOut and WouldBlock |
+| `stage163o_riscv_non_syscall_else_does_not_write_a0_from_tframe` | A0/A1 NOT written from `tframe.user_gpr()` |
+| `stage163o_riscv_non_syscall_else_has_preserve_markers` | All four new RISC-V markers present |
+
+**Preserved invariants:**
+
+- Stage 163J x86_64 child return lane (`user_gprs[0]=0`) untouched.
+- Stage 163K no-smoke-interference untouched.
+- Stage 163L AArch64/RISC-V parent return fix untouched.
+- Stage 163M x86_64 nonfatal `IpcSend` classification untouched.
+- Stage 163N `enqueue_woken_task` fork-child placement untouched.
+- No syscall/IPC ABI change, no IPC/cap seam moved.
+- Counts unchanged (`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`,
+  `MAX_ADDRESS_SPACES == 32`).
+- RPi5 boot behavior untouched.
+
+**User action required (QEMU smoke):**
+
+Run `yarm.ipc_recv_proof=1 yarm.ipc_recv_proof_sender_wake=1` on all three
+architectures and verify:
+
+- x86_64: `^IPC_RECV_V2_SENDER_WAKE_ORDER_OK` appears (real recv-v2 split
+  path fired the sender-wake).
+- All arches: `USER_LOG .*msg=IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED`
+  appears (E2 poll succeeded, waiter TID captured).
+- All arches: `USER_LOG .*msg=IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`
+  appears (full proof sequence completed).
+- No `BLOCKED_WOULDBLOCK_FATAL`, `CapabilityFull`, or `TaskTableFull` errors.
+- RISC-V: `RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT` appears when a COW
+  fault fires after fork (confirms a0=child_tid was preserved).
+
 ---
 
 ### 5.2 D1 audit — answers to the seven readiness questions

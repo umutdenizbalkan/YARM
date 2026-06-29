@@ -1470,14 +1470,17 @@ fn run_ipc_recv_proof_sender_wake(
         pid
     );
     let mut waiter_tid: Option<u64> = None;
-    // Stage 163N Task A: poll E2 with short blocking yields so the scheduler
+    // Stage 163O Task A fix: poll E2 with short blocking yields so the scheduler
     // can run the child on the same CPU (AArch64/RISC-V single-core paths).
     // Each iteration calls ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS):
     //   Phase 1 (immediate): if the kernel already pushed the signal, returns
     //   Ok(Some(sig)) immediately without blocking.
-    //   Phase 2 (block): if not yet pushed, blocks for E2_POLL_YIELD_TICKS
-    //   ticks, yielding the CPU so the child can be scheduled, then returns
-    //   Ok(None) on timeout.
+    //   Phase 2 (block): if not yet pushed, blocks until woken or deadline.
+    //   On iter 0 Phase 2 runs in the same kernel call before the child has
+    //   had CPU time; received.is_none()=true → timed_out=true → Err(TimedOut).
+    //   This is expected: treat Err(TimedOut)/Err(WouldBlock) as Ok(None).
+    //   On iter 1+, Phase 1's try_endpoint_split_recv finds the queued E2
+    //   signal and returns Ok(Some) immediately.
     // This avoids the lock-order hazard: the kernel push path holds
     // ipc_state_lock and cannot acquire the scheduler lock to wake a blocked
     // receiver; polling means we never block long enough to miss the signal.
@@ -1495,11 +1498,15 @@ fn run_ipc_recv_proof_sender_wake(
                 waiter_tid = Some(sig.sender_tid.0);
                 break 'e2_poll;
             }
-            Ok(None) => {
-                // Timeout — child not yet a sender-waiter; loop and yield again.
+            Ok(None)
+            | Err(yarm_user_rt::syscall::SyscallError::TimedOut)
+            | Err(yarm_user_rt::syscall::SyscallError::WouldBlock) => {
+                // Timeout or would-block — child not yet a sender-waiter;
+                // yield and retry. Err(TimedOut) is the normal outcome on
+                // iter 0 when Phase 2 executes before the child is scheduled.
             }
             Err(_) => {
-                // Unexpected error — break out and let the no-waiter path handle it.
+                // Genuinely unexpected error — abort the poll.
                 break 'e2_poll;
             }
         }
@@ -1867,6 +1874,76 @@ mod tests {
         assert!(
             !smoke_section.contains("ipc_recv_with_deadline(pm_recv, 0)"),
             "blkcache smoke must not use non-blocking ipc_recv_with_deadline(pm_recv, 0) for GET_INFO reply"
+        );
+    }
+
+    // ── Stage 163O: E2 poll loop retry-on-timeout fix ────────────────────────
+
+    #[test]
+    fn e2_poll_loop_treats_timed_out_as_retry_not_break() {
+        // The Err(TimedOut) arm must NOT break the loop — it must fall through
+        // like Ok(None) so iter 1 can find the queued E2 signal via Phase 1.
+        let src = include_str!("service.rs");
+        let poll_begin = src
+            .find("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN")
+            .expect("E2 poll begin marker must be present");
+        let poll_hit = src
+            .find("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT")
+            .expect("E2 poll hit marker must be present");
+        let poll_section = &src[poll_begin..poll_hit];
+        assert!(
+            poll_section.contains("SyscallError::TimedOut"),
+            "E2 poll loop must handle SyscallError::TimedOut as a retry condition"
+        );
+        assert!(
+            poll_section.contains("SyscallError::WouldBlock"),
+            "E2 poll loop must handle SyscallError::WouldBlock as a retry condition"
+        );
+    }
+
+    #[test]
+    fn e2_poll_loop_timed_out_arm_does_not_break() {
+        // Verify the TimedOut arm is NOT followed immediately by break — it
+        // must be grouped with Ok(None) so the loop continues.
+        let src = include_str!("service.rs");
+        let timed_out_pos = src
+            .find("SyscallError::TimedOut")
+            .expect("TimedOut arm must exist in E2 poll");
+        // The arm should share its body with Ok(None), not have its own break.
+        let arm_slice = &src[timed_out_pos..timed_out_pos + 120];
+        assert!(
+            !arm_slice.contains("break 'e2_poll"),
+            "SyscallError::TimedOut arm must NOT contain break 'e2_poll (must be a retry arm)"
+        );
+    }
+
+    #[test]
+    fn e2_poll_loop_sequence_done_marker_present() {
+        let src = include_str!("service.rs");
+        assert!(
+            src.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "sender-wake proof must emit SEQUENCE_DONE marker on success"
+        );
+        assert!(
+            src.contains("IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED"),
+            "sender-wake proof must emit WAITER_OBSERVED marker after E2 signal"
+        );
+    }
+
+    #[test]
+    fn e2_poll_loop_exhausted_does_not_reach_sequence_done() {
+        // Structural check: EXHAUSTED and NO_WAITER_SIGNAL appear before
+        // SEQUENCE_DONE, so an exhausted poll will return early.
+        let src = include_str!("service.rs");
+        let exhausted_pos = src
+            .find("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_EXHAUSTED")
+            .expect("EXHAUSTED marker must be present");
+        let done_pos = src
+            .find("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE")
+            .expect("SEQUENCE_DONE marker must be present");
+        assert!(
+            exhausted_pos < done_pos,
+            "EXHAUSTED must appear before SEQUENCE_DONE — exhausted path must return early"
         );
     }
 }
