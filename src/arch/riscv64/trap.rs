@@ -114,13 +114,15 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         fault_bookkeeping_mode,
     )?;
     // Stage 163L: restore FIRST so apply_user_context (called inside
-    // resume_current_thread_with_frame) does not overwrite saved_pc with the
-    // TCB's pre-syscall ecall address, undoing the +4 advance below, and does
-    // not zero a0 (user_gprs[10]) from the pre-syscall TCB snapshot.
+    // resume_current_thread_with_frame) does not zero a0 (user_gprs[10])
+    // from the pre-syscall TCB snapshot before we can export ret0 below.
     restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;
-    // RISC-V ecall does not advance SEPC automatically.  Advance saved_pc by 4
-    // AFTER restore so sret resumes at the instruction after the ecall.  Also
-    // export ret0→a0 and ret1→a1 (or error→a0) so userspace sees the correct
+    // RISC-V ecall does not advance SEPC automatically, but the boot bridge
+    // (yarm_riscv64_trap_bridge) pre-advances tframe.saved_pc by +4 before
+    // calling handle_trap_entry so that sync_current_thread_from_frame captures
+    // sepc+4 into the TCB.  Stage 163L's restore reloads that sepc+4; adding
+    // another +4 here would double-advance to sepc+8 (Stage 163M regression fix).
+    // Export ret0→a0 and ret1→a1 (or error→a0) so userspace sees the correct
     // syscall return value — apply_user_context zeroed a0 from the pre-syscall
     // TCB snapshot.
     if context.scause == EXC_USER_ECALL {
@@ -135,7 +137,6 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
                     f.error
                 );
             }
-            f.saved_pc = f.saved_pc.wrapping_add(4);
             if let Some(err) = f.error_code() {
                 f.set_user_gpr(10, err);
             } else {

@@ -1168,7 +1168,13 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         );
         let blocking_syscall = match syscall {
             Syscall::IpcRecv | Syscall::IpcCall => true,
-            Syscall::IpcSend => decode_ipc_send_timeout_ticks(frame) == 0,
+            // IpcSend can always block the caller (Synchronous endpoints block even with
+            // timeout=0; deadline endpoints block with timeout!=0).  The `caller_blocked`
+            // check below is the true discriminator — nonfatal iff the task actually
+            // ended up in Blocked(EndpointSend).  Treating IpcSend as non-blocking here
+            // would fire BLOCKED_WOULDBLOCK_FATAL for every legitimate blocked sender
+            // (Stage 163M regression fix: was `== 0` then `!= 0`, both wrong).
+            Syscall::IpcSend => true,
             _ => false,
         };
         crate::yarm_log!(
@@ -1198,6 +1204,15 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
                 frame.syscall_num()
             );
             syscall_trace!("AARCH64_TRAP_DISPATCH_RESULT blocked");
+            if crate::kernel::boot::ipc_recv_proof_sender_wake_active()
+                && matches!(syscall, Syscall::IpcSend)
+            {
+                crate::yarm_log!(
+                    "IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK tid={} nr={}",
+                    caller_tid.unwrap_or(0),
+                    frame.syscall_num()
+                );
+            }
             return Ok(());
         }
         crate::yarm_log!(
@@ -1768,8 +1783,9 @@ mod tests {
                 SYSCALL_NO_TRANSFER_CAP as usize,
             ],
         );
-        let err = dispatch(&mut state, &mut frame).expect_err("blocked send");
-        assert_eq!(err, SyscallError::WouldBlock);
+        // Stage 163M: IpcSend is always classified as potentially blocking.
+        // caller_blocked=true → nonfatal path → Ok(()), dispatch switches away.
+        dispatch(&mut state, &mut frame).expect("blocking send: nonfatal, dispatches away");
         assert_eq!(
             state.task_status(1),
             Some(crate::kernel::task::TaskStatus::Blocked(

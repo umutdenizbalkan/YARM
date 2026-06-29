@@ -472,9 +472,18 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
             // still hold the original input arguments (e.g. fork arg0=0), so the
             // mirror destroys the exported ret0=child_tid.  Re-save the TCB so
             // the updated context persists across any switch-plan stash.
-            trapframe.set_arg(0, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0));
-            trapframe.set_arg(1, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1));
-            trapframe.set_arg(2, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2));
+            trapframe.set_arg(
+                0,
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
+            );
+            trapframe.set_arg(
+                1,
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),
+            );
+            trapframe.set_arg(
+                2,
+                trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2),
+            );
             if let Some(tid) = kernel.current_tid() {
                 let ctx = trapframe.capture_user_context();
                 let _ = kernel.set_thread_user_context(tid, ctx);

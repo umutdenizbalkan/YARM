@@ -704,11 +704,13 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // Build the generic TrapFrame from the saved register file.
     let mut tframe = crate::kernel::trapframe::TrapFrame::zeroed();
     // For ecall we pre-advance saved_pc by 4 so the TCB snapshot taken inside
-    // `dispatch_syscall -> sync_current_thread_from_frame` captures the
-    // post-ecall PC. handle_trap_entry's own +4 (applied after sync) is then
-    // a no-op when followed by restore_arch_thread_state's apply_user_context
-    // (which re-loads PC from the just-saved TCB context). Without this the
-    // resumed user PC would land back on the same ecall and loop forever.
+    // `sync_current_thread_from_frame` captures sepc+4 as the post-ecall PC.
+    // This is the sole PC-advance for RISC-V ecalls: handle_trap_entry (Stage
+    // 163L+) does NOT add its own +4 because restore_arch_thread_state reloads
+    // saved_pc from the TCB (sepc+4), and a redundant +4 would double-advance
+    // to sepc+8 causing an instruction page fault (Stage 163M regression fix).
+    // Without this pre-advance the blocked task's TCB would hold the raw ecall
+    // address, causing an infinite ecall loop on resume.
     let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };
     tframe.set_saved_pc(sepc + advance);
     tframe.set_saved_sp(user_sp);
@@ -746,11 +748,10 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         }
     }
 
-    // For ecall the pre-advanced PC (sepc+4) is what gets snapshotted into the
-    // TCB by `dispatch_syscall -> sync_current_thread_from_frame`. The generic
-    // handler then applies its own +4 to tframe.saved_pc, but
-    // `restore_arch_thread_state -> apply_user_context` immediately reloads
-    // saved_pc from the TCB, so the net resumed PC is sepc+4 exactly once.
+    // For ecall the pre-advanced PC (sepc+4) is snapshotted into the TCB by
+    // `sync_current_thread_from_frame`. Stage 163L's restore_arch_thread_state
+    // reloads that sepc+4 into tframe.saved_pc; handle_trap_entry does NOT apply
+    // its own +4 (Stage 163M fix), so the net resumed PC is sepc+4 exactly once.
     let ctx = crate::arch::riscv64::trap::Riscv64TrapContext { scause, stval };
     let handle_result =
         crate::arch::riscv64::trap::handle_trap_entry(kernel, cpu, ctx, Some(&mut tframe));

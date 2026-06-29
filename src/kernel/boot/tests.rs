@@ -43895,7 +43895,8 @@ mod stage163_sender_wake_proven {
             );
         }
         // Ordering: FILL_DONE precedes FORK_BEGIN precedes PARENT_WAIT_BEGIN precedes
-        // the E2 poll (ipc_recv_with_deadline(e2_recv, 0)).
+        // the E2 wait (ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)).
+        // Stage 163M: E2 wait is now a single blocking recv (not a NoWait loop).
         let i_fill = workload
             .find("IPC_RECV_PROOF_SENDER_WAKE_FILL_DONE")
             .expect("FILL_DONE");
@@ -43906,8 +43907,8 @@ mod stage163_sender_wake_proven {
             .find("IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN")
             .expect("PARENT_WAIT_BEGIN");
         let i_poll = workload
-            .find("ipc_recv_with_deadline(e2_recv, 0)")
-            .expect("E2 poll");
+            .find("ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)")
+            .expect("E2 blocking wait with deadline");
         assert!(
             i_fill < i_fork && i_fork < i_wait && i_wait < i_poll,
             "fork must happen after FILL_DONE and before the E2 wait/poll"
@@ -45158,19 +45159,28 @@ mod stage163l_nonx86_fork_return {
             .expect("sender-wake workload body")
     }
 
-    // 1. RISC-V: restore must happen BEFORE the PC+4 advance and a0 export.
+    // 1. RISC-V: restore must happen BEFORE the a0 export; no explicit +4 advance
+    //    (Stage 163M: boot bridge pre-advances sepc so double-advance is avoided).
     #[test]
-    fn stage163l_riscv_restore_before_pc_advance() {
+    fn stage163l_riscv_restore_before_a0_export() {
         let body = riscv_trap_entry();
         let restore_pos = body
             .find("restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())")
             .expect("restore_arch_thread_state must use as_deref_mut in RISC-V trap");
-        let advance_pos = body
-            .find("f.saved_pc = f.saved_pc.wrapping_add(4)")
-            .expect("PC+4 advance must exist in RISC-V trap");
+        let export_pos = body
+            .find("f.set_user_gpr(10, f.ret0())")
+            .expect("a0 export (set_user_gpr(10, ret0)) must exist in RISC-V trap");
         assert!(
-            restore_pos < advance_pos,
-            "restore_arch_thread_state must come BEFORE saved_pc += 4 in RISC-V trap"
+            restore_pos < export_pos,
+            "restore_arch_thread_state must come BEFORE a0 export in RISC-V trap"
+        );
+        // Stage 163M: explicit PC+4 advance removed; the boot bridge
+        // (yarm_riscv64_trap_bridge) pre-advances tframe.saved_pc by +4 before
+        // calling handle_trap_entry so the TCB already holds sepc+4.  Adding +4
+        // again would double-advance to sepc+8 (instruction page fault).
+        assert!(
+            !body.contains("f.saved_pc = f.saved_pc.wrapping_add(4)"),
+            "RISC-V trap must NOT have explicit PC+4 advance (boot bridge pre-advances; Stage 163M)"
         );
     }
 
@@ -45216,23 +45226,28 @@ mod stage163l_nonx86_fork_return {
     // 4. AArch64: args[0..2] are synced from exported user_gprs after export.
     #[test]
     fn stage163l_aarch64_args_synced_after_export() {
+        // Verify that set_arg(N, user_gpr(REG_XN)) is called for each of the
+        // three return-value registers.  The check uses the REG_XN argument
+        // as a formatting-stable witness; the trailing `,` confirms it is
+        // passed as a function argument (not merely mentioned in a comment).
         assert!(
-            AARCH64_TRAP_SRC.contains(
-                "trapframe.set_arg(0, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0))"
-            ),
+            AARCH64_TRAP_SRC
+                .contains("trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),"),
             "AArch64 must sync arg(0) from user_gpr(REG_X0) after export"
         );
         assert!(
-            AARCH64_TRAP_SRC.contains(
-                "trapframe.set_arg(1, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1))"
-            ),
+            AARCH64_TRAP_SRC
+                .contains("trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),"),
             "AArch64 must sync arg(1) from user_gpr(REG_X1) after export"
         );
         assert!(
-            AARCH64_TRAP_SRC.contains(
-                "trapframe.set_arg(2, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2))"
-            ),
+            AARCH64_TRAP_SRC
+                .contains("trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2),"),
             "AArch64 must sync arg(2) from user_gpr(REG_X2) after export"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("trapframe.set_arg("),
+            "AArch64 must call set_arg to sync args after export"
         );
     }
 
@@ -45281,8 +45296,14 @@ mod stage163l_nonx86_fork_return {
             .find("IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=child")
             .expect("PARK_BEGIN role=child must exist in workload");
         let park_region = &workload[park_begin_pos..];
-        let next_loop = park_region.find("loop {").expect("park loop must exist after PARK_BEGIN");
-        let loop_body = &park_region[next_loop..park_region[next_loop..].find('}').map(|p| next_loop + p + 1).unwrap_or(park_region.len())];
+        let next_loop = park_region
+            .find("loop {")
+            .expect("park loop must exist after PARK_BEGIN");
+        let loop_body = &park_region[next_loop
+            ..park_region[next_loop..]
+                .find('}')
+                .map(|p| next_loop + p + 1)
+                .unwrap_or(park_region.len())];
         assert!(
             !loop_body.contains("yield_now"),
             "child park loop must not use yield_now"
@@ -45345,6 +45366,147 @@ mod stage163l_nonx86_fork_return {
                 "#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"
             ),
             "MAX_ADDRESS_SPACES stays 32"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage163m_sender_wake_completion {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+    const INIT_SVC_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    fn riscv_trap_entry() -> &'static str {
+        RISCV_TRAP_SRC
+            .split("fn handle_trap_entry_with_fault_bookkeeping_mode")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("RISC-V handle_trap_entry_with_fault_bookkeeping_mode body")
+    }
+
+    fn sender_wake_workload() -> &'static str {
+        INIT_SVC_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("sender-wake workload body")
+    }
+
+    // Task A: IpcSend is classified as always-potentially-blocking (nonfatal determined
+    // by caller_blocked, not by the timeout value).
+    #[test]
+    fn stage163m_ipc_send_always_classified_as_blocking() {
+        let classify_block = SYSCALL_SRC
+            .split("let blocking_syscall = match syscall {")
+            .nth(1)
+            .and_then(|s| s.split("};").next())
+            .expect("blocking_syscall match block");
+        assert!(
+            classify_block.contains("Syscall::IpcSend => true"),
+            "IpcSend must be classified as always-potentially-blocking (caller_blocked discriminates)"
+        );
+        assert!(
+            !classify_block.contains("decode_ipc_send_timeout_ticks"),
+            "blocking_syscall for IpcSend must NOT depend on timeout; caller_blocked is the discriminator"
+        );
+    }
+
+    // Task A: proof marker emitted in nonfatal IpcSend-blocked path.
+    #[test]
+    fn stage163m_blocked_ok_marker_in_nonfatal_send_path() {
+        assert!(
+            SYSCALL_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK"),
+            "nonfatal IpcSend path must emit IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK marker"
+        );
+        let ok_marker_region = SYSCALL_SRC
+            .split("IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK")
+            .nth(1)
+            .expect("marker must appear at least once");
+        assert!(
+            ok_marker_region.contains("Syscall::IpcSend"),
+            "BLOCKED_OK marker must be guarded by Syscall::IpcSend check"
+        );
+    }
+
+    // Task B: E2 coordination wait uses a single blocking recv, not a NoWait loop.
+    #[test]
+    fn stage163m_e2_wait_uses_blocking_recv() {
+        let workload = sender_wake_workload();
+        let e2_wait_region = workload
+            .split("IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN")
+            .nth(1)
+            .and_then(|s| s.split("IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED").next())
+            .expect("E2 wait region between PARENT_WAIT_BEGIN and WAITER_OBSERVED");
+        assert!(
+            !e2_wait_region.contains("for _ in 0..E2_POLL_MAX"),
+            "E2 wait must not use a polling loop (Stage 163M: replaced with blocking recv)"
+        );
+        assert!(
+            !e2_wait_region.contains("yield_now()"),
+            "E2 wait must not call yield_now() (starves child on AArch64/RISC-V)"
+        );
+        assert!(
+            e2_wait_region.contains("ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)"),
+            "E2 wait must call ipc_recv_with_deadline with E2_WAIT_DEADLINE_TICKS"
+        );
+    }
+
+    // Task B: E2_WAIT_DEADLINE_TICKS is defined and bounded below SENDER_SEND_TIMEOUT_TICKS.
+    #[test]
+    fn stage163m_e2_deadline_defined_and_bounded() {
+        assert!(
+            INIT_SVC_SRC.contains("const E2_WAIT_DEADLINE_TICKS: u64 = 500_000_000"),
+            "E2_WAIT_DEADLINE_TICKS must be defined as 500_000_000"
+        );
+        assert!(
+            INIT_SVC_SRC.contains("const SENDER_SEND_TIMEOUT_TICKS: u64 = 1_000_000_000"),
+            "SENDER_SEND_TIMEOUT_TICKS must remain 1_000_000_000"
+        );
+    }
+
+    // Task C: RISC-V trap handler has no explicit PC+4 advance (boot bridge pre-advances).
+    #[test]
+    fn stage163m_riscv_no_explicit_pc_advance() {
+        let body = riscv_trap_entry();
+        assert!(
+            !body.contains("f.saved_pc = f.saved_pc.wrapping_add(4)"),
+            "RISC-V handle_trap_entry must NOT add +4 to saved_pc; boot bridge pre-advances sepc"
+        );
+    }
+
+    // Task C: boot bridge still pre-advances sepc for ecall so TCB gets sepc+4.
+    #[test]
+    fn stage163m_riscv_boot_bridge_preadvances_sepc() {
+        let bridge = RISCV_BOOT_SRC
+            .split("fn yarm_riscv64_trap_bridge")
+            .nth(1)
+            .expect("yarm_riscv64_trap_bridge body");
+        assert!(
+            bridge.contains("let advance = if scause == EXC_USER_ECALL { 4 } else { 0 };"),
+            "boot bridge must pre-advance saved_pc by 4 for ecall"
+        );
+        assert!(
+            bridge.contains("tframe.set_saved_pc(sepc + advance);"),
+            "boot bridge must set tframe.saved_pc = sepc + advance"
+        );
+    }
+
+    // Task C: a0/a1 export still present and ordered after restore.
+    #[test]
+    fn stage163m_riscv_a0_export_after_restore() {
+        let body = riscv_trap_entry();
+        let restore_pos = body
+            .find("restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())")
+            .expect("restore must be present");
+        let export_pos = body
+            .find("f.set_user_gpr(10, f.ret0())")
+            .expect("a0 export must be present");
+        assert!(
+            restore_pos < export_pos,
+            "restore must precede a0/a1 export in RISC-V trap"
         );
     }
 }

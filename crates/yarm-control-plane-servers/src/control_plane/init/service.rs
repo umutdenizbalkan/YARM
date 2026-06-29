@@ -1399,7 +1399,12 @@ fn run_ipc_recv_proof_sender_wake(
     // Defensive clamp so a misconfigured capacity can never loop pathologically.
     const FILL_CAP_MAX: usize = 256;
     const PREDRAIN_MAX: usize = 512;
-    const E2_POLL_MAX: usize = 200_000;
+    // Blocking deadline for the parent to wait on E2 coordination signal: the
+    // kernel pushes the signal as soon as the child becomes a waiter, so this
+    // just needs to be long enough for the child to be scheduled and execute its
+    // blocking send.  Must be < SENDER_SEND_TIMEOUT_TICKS so we bail before
+    // the child's own timeout expires.
+    const E2_WAIT_DEADLINE_TICKS: u64 = 500_000_000;
     const DRAIN_MAX: usize = 72;
 
     let fill_target = if e1_capacity == 0 || e1_capacity > FILL_CAP_MAX {
@@ -1577,17 +1582,18 @@ fn run_ipc_recv_proof_sender_wake(
         pid
     );
     let mut waiter_tid: Option<u64> = None;
-    for _ in 0..E2_POLL_MAX {
-        let _ = yarm_user_rt::syscall::yield_now();
-        // SAFETY: e2_recv is init's RECV cap to the proof coordination endpoint;
-        // timeout 0 makes this a non-blocking probe.
-        match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e2_recv, 0) } {
-            Ok(Some(sig)) => {
-                waiter_tid = Some(sig.sender_tid.0);
-                break;
-            }
-            _ => continue,
+    // SAFETY: e2_recv is init's RECV cap to the proof coordination endpoint.
+    // Block until the kernel pushes the waiter-present signal (which happens
+    // atomically when the child becomes a sender-waiter on E1) or the deadline
+    // expires.  A single blocking recv lets the child get CPU time instead of
+    // the parent busy-polling with NoWait + yield, which on AArch64 and RISC-V
+    // starves the child because yield(nr=0) doesn't give them a scheduling slot.
+    match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS) }
+    {
+        Ok(Some(sig)) => {
+            waiter_tid = Some(sig.sender_tid.0);
         }
+        _ => {}
     }
     let Some(waiter_tid) = waiter_tid else {
         yarm_user_rt::user_log!(
