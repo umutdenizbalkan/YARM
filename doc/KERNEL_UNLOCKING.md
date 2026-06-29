@@ -3990,6 +3990,55 @@ ABI change, no IPC/cap seam moved, counts unchanged (`SYSCALL_COUNT == 31`,
 `VARIANT_COUNT == 23`), RPi5 untouched, the D6/CR3/TSS/PF machinery untouched
 beyond the fork-child return-lane fix, and `MAX_ADDRESS_SPACES` remains 32.
 
+#### 5.1.9.17 Stage 163K — remove fork-smoke capacity interference
+
+With Stage 163J the x86_64 fork child returns `ret0=0` and logs
+`FORK_SMOKE_CHILD_ENTRY` (and `FORK_PROOF_FIRST_RESUME_AFTER_ARCH_RESTORE` shows
+`rax=0`). QEMU then exposed the next blocker — the **real** sender-wake fork
+failed:
+
+```
+FORK_PROOF_ALLOC_CHILD_FAIL reason=CapabilityFull step=register
+FORK_PROOF_RETURN_ERR code=255 reason=CapabilityFull
+IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED code=255 meaning=Internal
+```
+
+The proof did **two** forks: a clean-state diagnostic smoke (Stage 163C) and then
+the real sender-wake fork. The smoke child (tid=10008) succeeded and then *parks
+and yields forever*.
+
+**Capacity source (Task A).** `CapabilityFull` at `step=register` comes from
+`ensure_cnode_space_with_slots`, which enforces the **global aggregate CNode-slot
+budget** `max_total_cnode_slots`: every live process reserves `slot_capacity`,
+and the sum across all live `cnode_spaces` must stay within budget. (The
+*task-table* limit is a distinct `TaskTableFull`, not this error.) The parked
+smoke child permanently holds its reservation, so the second (real) fork's CNode
+reservation overflowed the budget — i.e. the smoke child was consuming the
+capacity the sender child needed. A new proof-gated
+`FORK_PROOF_ALLOC_CHILD_CAPACITY step=register reason=… live_tasks=… max_tasks=…
+reserved_cnode_slots=… max_total_cnode_slots=…` line in `fork_complete_post_clone`
+makes the exhausted pool explicit.
+
+**Fix (Task B, minimal).** The clean-state fork smoke is no longer called from
+the required sender-wake path — the real sender-wake fork is itself the fork
+proof, so acceptance needs exactly **one** live fork child. The smoke remains
+defined as a diagnostic-only helper (`#[allow(dead_code)]`), off by default, so
+it can be re-enabled for ad-hoc diagnosis without reintroducing the regression.
+No exit/reap infrastructure was added.
+
+**Expected x86_64 sender-wake sequence (Task C):** `FILL_DONE count=8 →
+FORK_BEGIN → FORK_RET role=parent child_pid=<child>` / `<child>: FORK_RET
+role=child → CHILD_ENTRY → SENDER_START`, child timed-send blocks on full E1,
+`IPC_RECV_PROOF_SENDER_WAKE_WAITER_PRESENT tid=<child>`, parent `WAITER_OBSERVED`,
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK → IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`.
+
+`stage163k_*` guards pin: the acceptance path forks exactly once and does not
+invoke the smoke; the smoke is diagnostic-only/uncalled; the register-fail path
+reports the CNode-slot budget; and Stage 163J return-lane, Stage 163E COW, and
+Stage 163I PF/intermediate-permission behavior all remain intact. No syscall/IPC
+ABI change, no IPC/cap seam moved, counts unchanged (`SYSCALL_COUNT == 31`,
+`VARIANT_COUNT == 23`), RPi5 untouched, `MAX_ADDRESS_SPACES` remains 32.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

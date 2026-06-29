@@ -43924,30 +43924,31 @@ mod stage163_sender_wake_proven {
         );
     }
 
-    // 23. A clean-state fork smoke runs BEFORE E1 is filled, so a fork failure with
-    //     an empty E1 rules the full-buffer state in or out.
+    // 23. Stage 163K: the clean-state fork smoke remains DEFINED as a
+    //     diagnostic-only helper, but is NO LONGER called from the required
+    //     sender-wake acceptance path (its parked child held a CNode-space
+    //     reservation that starved the real sender-wake fork).
     #[test]
-    fn stage163c_clean_state_fork_smoke_before_fill() {
+    fn stage163c_clean_state_fork_smoke_is_diagnostic_only() {
         assert!(
             INIT_SERVICE_SRC.contains("fn run_ipc_recv_proof_fork_smoke")
                 && INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_FORK_SMOKE_BEGIN")
                 && INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_FORK_SMOKE_CHILD_ENTRY")
                 && INIT_SERVICE_SRC.contains("IPC_RECV_PROOF_FORK_SMOKE_FAILED code="),
-            "a clean-state fork smoke with child/parent/failed markers must exist"
+            "the diagnostic-only fork smoke helper must remain defined"
+        );
+        // The helper is dead-code-allowed (diagnostic-only), not invoked anywhere.
+        assert!(
+            INIT_SERVICE_SRC.contains("#[allow(dead_code)]"),
+            "the smoke helper must be marked diagnostic-only (allow(dead_code))"
         );
         let workload = INIT_SERVICE_SRC
             .split("fn run_ipc_recv_proof_sender_wake")
             .nth(1)
             .expect("workload");
-        let i_smoke = workload
-            .find("run_ipc_recv_proof_fork_smoke()")
-            .expect("smoke call");
-        let i_fill = workload
-            .find("IPC_RECV_PROOF_SENDER_WAKE_FILL_BEGIN")
-            .expect("FILL_BEGIN");
         assert!(
-            i_smoke < i_fill,
-            "the clean-state fork smoke must run before the E1 fill"
+            !workload.contains("run_ipc_recv_proof_fork_smoke()"),
+            "the sender-wake acceptance path must NOT call the fork smoke"
         );
     }
 
@@ -44680,7 +44681,7 @@ mod stage163j_fork_return_lane {
         THREAD_SRC
             .split("fn fork_complete_post_clone")
             .nth(1)
-            .map(|s| &s[..s.len().min(4000)])
+            .map(|s| &s[..s.len().min(6500)])
             .expect("fork_complete_post_clone body")
     }
 
@@ -44858,5 +44859,136 @@ mod stage163j_fork_return_lane {
                 "fork path must not reference the {forbidden} path"
             );
         }
+    }
+}
+
+mod stage163k_no_smoke_interference {
+    const THREAD_SRC: &str = include_str!("thread_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const MEM_SRC: &str = include_str!("memory_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_PT_SRC: &str = include_str!("../../arch/x86_64/page_table.rs");
+    const X86_VM_LAYOUT_SRC: &str = include_str!("../../arch/x86_64/vm_layout.rs");
+    const INIT_SVC_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    fn sender_wake_workload() -> &'static str {
+        INIT_SVC_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("sender-wake workload body")
+    }
+
+    // 1. The required sender-wake acceptance path performs EXACTLY ONE fork
+    //    (the real sender child) — the smoke fork is not in it.
+    #[test]
+    fn stage163k_acceptance_path_forks_exactly_once() {
+        let workload = sender_wake_workload();
+        let forks = workload.matches("fork_raw()").count();
+        assert_eq!(
+            forks, 1,
+            "sender-wake acceptance path must perform exactly one fork, found {forks}"
+        );
+        assert!(
+            !workload.contains("run_ipc_recv_proof_fork_smoke()"),
+            "sender-wake acceptance path must not invoke the diagnostic fork smoke"
+        );
+    }
+
+    // 2. The smoke helper is diagnostic-only (defined, dead-code-allowed, never
+    //    called) so its parked child cannot consume the CNode-slot budget the
+    //    real sender child needs.
+    #[test]
+    fn stage163k_smoke_is_diagnostic_only_and_uncalled() {
+        assert!(
+            INIT_SVC_SRC.contains("fn run_ipc_recv_proof_fork_smoke")
+                && INIT_SVC_SRC.contains("#[allow(dead_code)]"),
+            "smoke must remain defined as a diagnostic-only (dead-code-allowed) helper"
+        );
+        // No call site anywhere in the init service.
+        assert!(
+            !INIT_SVC_SRC.contains("run_ipc_recv_proof_fork_smoke();"),
+            "the fork smoke must have no call site (off by default)"
+        );
+    }
+
+    // 3. The kernel surfaces WHICH capacity is exhausted on a register failure, so
+    //    a `CapabilityFull step=register` is attributable to the global CNode-slot
+    //    budget rather than the task table.
+    #[test]
+    fn stage163k_register_fail_reports_capacity_source() {
+        let body = THREAD_SRC
+            .split("fn fork_complete_post_clone")
+            .nth(1)
+            .map(|s| &s[..s.len().min(6500)])
+            .expect("fork_complete_post_clone body");
+        assert!(
+            body.contains("FORK_PROOF_ALLOC_CHILD_CAPACITY")
+                && body.contains("max_total_cnode_slots")
+                && body.contains("reserved_cnode_slots")
+                && body.contains("max_tasks"),
+            "register-fail must log the global CNode-slot budget vs. task-table capacity"
+        );
+    }
+
+    // 4. Stage 163J child return-lane fix remains intact (ret0/rax/user_gpr0 = 0).
+    #[test]
+    fn stage163k_preserves_163j_return_lane() {
+        let body = THREAD_SRC
+            .split("fn fork_complete_post_clone")
+            .nth(1)
+            .map(|s| &s[..s.len().min(6500)])
+            .expect("fork_complete_post_clone body");
+        assert!(
+            body.contains("child.user_context.user_gprs[0] = 0;"),
+            "Stage 163J: child return lane (user_gprs[0]/rax) must stay zeroed"
+        );
+    }
+
+    // 5. Stage 163E COW clone and Stage 163I PF/intermediate-permission behavior
+    //    remain intact.
+    #[test]
+    fn stage163k_preserves_163e_cow_and_163i_pf() {
+        assert!(
+            MEM_SRC.contains("write_protect_run_head_in_place")
+                && MEM_SRC.contains("required_child"),
+            "Stage 163E transactional/run-preserving COW clone must remain"
+        );
+        assert!(
+            X86_PT_SRC.contains("pub fn repair_user_path_intermediates")
+                && FAULT_SRC.contains("eff_present && eff_user && (!need_write || eff_writable)"),
+            "Stage 163I PF/intermediate-permission behavior must remain intact"
+        );
+    }
+
+    // 6. Confinement: no IPC/cap seam moved, counts unchanged, RPi5 untouched,
+    //    MAX_ADDRESS_SPACES stays 32.
+    #[test]
+    fn stage163k_confinement_counts_and_bounds() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        assert!(
+            X86_VM_LAYOUT_SRC.contains(
+                "#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"
+            ),
+            "MAX_ADDRESS_SPACES stays 32"
+        );
     }
 }

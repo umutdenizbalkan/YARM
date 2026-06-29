@@ -1620,6 +1620,31 @@ impl KernelState {
         };
         if let Err(e) = self.register_task_with_class(child_tid, parent_class) {
             if proof {
+                // Stage 163K: pinpoint WHICH capacity is exhausted. A `register`
+                // failure with `CapabilityFull` is the GLOBAL aggregate CNode-slot
+                // budget (`max_total_cnode_slots`): every live process reserves
+                // `slot_capacity` in `ensure_cnode_space_with_slots`, and the sum
+                // across all live cnode_spaces must stay within budget. A stale
+                // parked child (e.g. an un-reaped fork smoke) holds a reservation
+                // and can push the next fork over the cap.
+                let limits = self.runtime_capacity_config();
+                let live_tasks = self.with_tcbs(|tcbs| tcbs.iter().flatten().count());
+                let reserved_cnode_slots = self.with_capability_state(|capability| {
+                    capability
+                        .cnode_spaces
+                        .iter()
+                        .flatten()
+                        .map(|space| space.slot_capacity)
+                        .sum::<usize>()
+                });
+                crate::yarm_log!(
+                    "FORK_PROOF_ALLOC_CHILD_CAPACITY step=register reason={:?} live_tasks={} max_tasks={} reserved_cnode_slots={} max_total_cnode_slots={}",
+                    e,
+                    live_tasks,
+                    limits.max_tasks,
+                    reserved_cnode_slots,
+                    limits.max_total_cnode_slots
+                );
                 crate::yarm_log!("FORK_PROOF_ALLOC_CHILD_FAIL reason={:?} step=register", e);
             }
             return Err(e);
