@@ -958,14 +958,25 @@ impl KernelState {
             }
         });
 
+        // Stage 165B: start one guard page BELOW stack_base.  The proof's deep
+        // post-switch call chain (`handle_trap` → `process_ipc_timeout_deadlines`,
+        // ~8 KiB frame) overflows `[stack_base, stack_top)` into the region's
+        // guard-adjacent page (observed #PF: CR2 = RSP − 8, both in
+        // `[region_base, stack_base)`).  For the default-off proof we back that
+        // single page (still supervisor-only) for BOTH proof participants so the
+        // post-proof trap path cannot fault regardless of which participant's
+        // region is current.  Production stacks (no `yarm.d6_switch_proof=1`) keep
+        // their guard page unmapped — this path runs only under the proof knob.
+        let region_base = (stack_base & !(PAGE_SIZE - 1)).saturating_sub(KERNEL_STACK_GUARD_SIZE);
         crate::yarm_log!(
-            "D6_PROOF_FULL_STACK_MAP_BEGIN tid={} base=0x{:x} top=0x{:x}",
+            "D6_PROOF_FULL_STACK_MAP_BEGIN tid={} region_base=0x{:x} base=0x{:x} top=0x{:x}",
             tid,
+            region_base,
             stack_base,
             stack_top
         );
 
-        let mut page_addr = stack_base & !(PAGE_SIZE - 1);
+        let mut page_addr = region_base;
         while page_addr < stack_top {
             let stack_page = VirtAddr(page_addr as u64);
             let phys = if let Some(entry) = page_table::resolve_page(target_asid, stack_page) {
@@ -1025,6 +1036,161 @@ impl KernelState {
         &mut self,
         _tid: u64,
     ) -> Result<(), KernelError> {
+        Ok(())
+    }
+
+    /// Stage 165B: map the FULL kernel-stack region containing the *sampled live
+    /// RSP* for the D6 controlled-switch proof.
+    ///
+    /// `d6_ensure_full_proof_switch_stack_mapped` maps `[stack_base, stack_top)`
+    /// selected by *task identity*.  But the proof's deep post-switch call chain
+    /// (`handle_trap` → `process_ipc_timeout_deadlines`, which allocates and
+    /// zeroes an ~8 KiB frame) grows the *live* kernel stack below `stack_base`,
+    /// into the region's guard-adjacent page.  The observed Stage 165 #PF was a
+    /// supervisor write (error 0x2) to `CR2 = RSP − 8` with both inside
+    /// `[region_base, stack_base)` (e.g. `0xffff_8000_0001_8dd8`, region idx 3,
+    /// whose mapped stack starts at `stack_base = 0x…1_9000`).
+    ///
+    /// Because the proof is a default-off diagnostic, this function selects the
+    /// stack region by **RSP containment** (not by assuming a tid) and maps every
+    /// page of `[region_base, region_top)` — including the page below
+    /// `stack_base` — supervisor-only writable in the active root and every task
+    /// root, so the proof can return to idle without a fatal #PF.  The
+    /// guard-adjacent page is backed *only* for the live proof region; production
+    /// per-task stacks (provisioned with their unmapped guard page) are untouched
+    /// because this path runs solely under `yarm.d6_switch_proof=1`.
+    #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
+    pub(crate) fn d6_ensure_live_rsp_region_mapped(
+        &mut self,
+        sampled_rsp: usize,
+    ) -> Result<(), KernelError> {
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
+        use crate::kernel::vm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+        fn validate_entry(entry: PageTableEntry) -> bool {
+            (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
+        }
+
+        // Select the stack region by RSP containment, NOT target task identity.
+        if sampled_rsp < KERNEL_STACK_REGION_BASE {
+            crate::yarm_log!(
+                "D6_PROOF_LIVE_RSP_STACK_SKIP reason=rsp_outside_kernel_stack_region rsp=0x{:x}",
+                sampled_rsp
+            );
+            return Ok(());
+        }
+        let offset = sampled_rsp - KERNEL_STACK_REGION_BASE;
+        let idx = offset / KERNEL_STACK_REGION_SIZE;
+        let region_base = KERNEL_STACK_REGION_BASE
+            .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
+            .ok_or(KernelError::VmFull)?;
+        let region_top = region_base
+            .checked_add(KERNEL_STACK_REGION_SIZE)
+            .ok_or(KernelError::VmFull)?;
+        let rsp_page = sampled_rsp & !(PAGE_SIZE - 1);
+
+        let Some(target_asid) = self.hal.active_asid() else {
+            crate::yarm_log!(
+                "D6_PROOF_LIVE_RSP_STACK_SKIP reason=no_active_asid rsp=0x{:x}",
+                sampled_rsp
+            );
+            return Ok(());
+        };
+
+        // Collect all task ASIDs before the allocation loop (mirrors
+        // `d6_ensure_full_proof_switch_stack_mapped`) so each live-region page is
+        // shared into every root that may be active during a post-proof trap.
+        let mut roots = [None; super::MAX_TASKS];
+        roots[0] = Some(target_asid);
+        self.with_tcbs(|tcbs| {
+            let mut len = 1usize;
+            for tcb in tcbs.iter().flatten() {
+                let Some(asid) = tcb.asid else {
+                    continue;
+                };
+                if self.with_user_spaces(|spaces| spaces.get(asid).is_none()) {
+                    continue;
+                }
+                if roots[..len].iter().any(|e| *e == Some(asid)) {
+                    continue;
+                }
+                if len < roots.len() {
+                    roots[len] = Some(asid);
+                    len += 1;
+                }
+            }
+        });
+
+        crate::yarm_log!(
+            "D6_PROOF_LIVE_RSP_STACK_MAP_BEGIN rsp=0x{:x} rsp_page=0x{:x} region_base=0x{:x} region_top=0x{:x}",
+            sampled_rsp,
+            rsp_page,
+            region_base,
+            region_top
+        );
+
+        // Map the ENTIRE region (region_base..region_top), not just the top page:
+        // the live RSP can have descended below stack_base into the
+        // guard-adjacent page, and the next trap frame grows further still.
+        let mut covers_rsp_page = false;
+        let mut page_addr = region_base;
+        while page_addr < region_top {
+            let stack_page = VirtAddr(page_addr as u64);
+            let phys = if let Some(entry) = page_table::resolve_page(target_asid, stack_page) {
+                if validate_entry(entry) {
+                    if page_addr == rsp_page {
+                        covers_rsp_page = true;
+                    }
+                    crate::yarm_log!("D6_PROOF_LIVE_RSP_STACK_MAP_SKIP va=0x{:x}", page_addr);
+                    page_addr = page_addr.saturating_add(PAGE_SIZE);
+                    continue;
+                }
+                return Err(KernelError::VmFull);
+            } else {
+                let phys = self.alloc_user_data_frame()?;
+                page_table::map_page(
+                    target_asid,
+                    stack_page,
+                    PhysAddr(phys),
+                    PageFlags::KERNEL_RW,
+                )
+                .map_err(|_| KernelError::VmFull)?;
+                phys
+            };
+            for asid in roots.iter().flatten().copied() {
+                if asid == target_asid {
+                    continue;
+                }
+                match page_table::resolve_page(asid, stack_page) {
+                    Some(e) if e.addr() == phys && validate_entry(e) => {}
+                    None => {
+                        page_table::map_page(
+                            asid,
+                            stack_page,
+                            PhysAddr(phys),
+                            PageFlags::KERNEL_RW,
+                        )
+                        .map_err(|_| KernelError::VmFull)?;
+                    }
+                    _ => return Err(KernelError::VmFull),
+                }
+            }
+            if page_addr == rsp_page {
+                covers_rsp_page = true;
+            }
+            crate::yarm_log!("D6_PROOF_LIVE_RSP_STACK_MAP_PAGE va=0x{:x}", page_addr);
+            page_addr = page_addr.saturating_add(PAGE_SIZE);
+        }
+
+        // Coverage proof: the mapped range MUST include the page that contains the
+        // sampled live RSP (the page family the post-proof trap frame faults in).
+        crate::yarm_log!(
+            "D6_PROOF_LIVE_RSP_STACK_MAP_DONE region_base=0x{:x} region_top=0x{:x} rsp_page=0x{:x} covers_rsp_page={}",
+            region_base,
+            region_top,
+            rsp_page,
+            covers_rsp_page
+        );
         Ok(())
     }
 
