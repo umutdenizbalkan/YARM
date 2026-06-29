@@ -885,15 +885,40 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
         frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
     } else {
-        // Non-syscall trap, same task continuing — preserve all user a-regs
-        // exactly as the trap captured them.
-        frame.regs[RiscvTrapFrame::A0] = tframe.user_gpr(10) as u64;
-        frame.regs[RiscvTrapFrame::A1] = tframe.user_gpr(11) as u64;
-        frame.regs[RiscvTrapFrame::A2] = tframe.user_gpr(12) as u64;
-        frame.regs[RiscvTrapFrame::A3] = tframe.user_gpr(13) as u64;
-        frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
-        frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
-        frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+        // Non-syscall trap (e.g. COW/demand page fault), same task.
+        // frame.regs[A0..A7] already hold the hardware-saved values from the
+        // ASM trap saver: the mirror loop above skips them, so they are
+        // intact. Do NOT overwrite from tframe.user_gpr() — apply_user_context
+        // reloads tframe.user_gprs from the TCB snapshot taken at the last
+        // ecall entry, which does not include post-syscall ret0 exports (e.g.
+        // fork sets ret0=child_tid after sync_current_thread_from_frame, so
+        // TCB still has user_gprs[10]=0; writing frame.regs[A0] from it
+        // clobbers the parent's a0=child_tid and causes a role-swap bug).
+        if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+            crate::yarm_log!(
+                "RISCV_NON_SYSCALL_TRAP_FRAME_SAVE tid={} scause={:#x}",
+                resume_tid,
+                scause
+            );
+            crate::yarm_log!(
+                "RISCV_PAGE_FAULT_PRESERVE_GPRS tid={} a0={:#x} a1={:#x}",
+                resume_tid,
+                frame.regs[RiscvTrapFrame::A0],
+                frame.regs[RiscvTrapFrame::A1]
+            );
+            crate::yarm_log!(
+                "RISCV_POST_FAULT_TRAP_RETURN tid={} a0={:#x}",
+                resume_tid,
+                frame.regs[RiscvTrapFrame::A0]
+            );
+            if frame.regs[RiscvTrapFrame::A0] != 0 {
+                crate::yarm_log!(
+                    "RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT tid={} a0={:#x}",
+                    resume_tid,
+                    frame.regs[RiscvTrapFrame::A0]
+                );
+            }
+        }
     }
 
     // The active satp may have changed if dispatch_next_task picked a
