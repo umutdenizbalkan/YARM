@@ -454,7 +454,50 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
 
     if !task_switched && matches!(event, TrapEvent::Syscall) {
         if let Some(trapframe) = frame.as_deref_mut() {
+            if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                let tid = kernel.current_tid().unwrap_or(0);
+                crate::yarm_log!(
+                    "AARCH64_FORK_PARENT_RET_BEFORE_RETURN tid={} ret0={} x0={} err={}",
+                    tid,
+                    trapframe.ret0(),
+                    trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
+                    trapframe.error
+                );
+            }
             export_syscall_result_to_user_gprs(trapframe);
+            // Stage 163L: sync args[0..2] to match the just-exported user_gprs
+            // so that a post-switch resume via restore_arch_thread_state(syscall_return=false)
+            // gets the correct values.  That path runs the arg-mirror which sets
+            // user_gprs[x0..x2] = args[0..2]; without this update, args[0..2]
+            // still hold the original input arguments (e.g. fork arg0=0), so the
+            // mirror destroys the exported ret0=child_tid.  Re-save the TCB so
+            // the updated context persists across any switch-plan stash.
+            trapframe.set_arg(0, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0));
+            trapframe.set_arg(1, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1));
+            trapframe.set_arg(2, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2));
+            if let Some(tid) = kernel.current_tid() {
+                let ctx = trapframe.capture_user_context();
+                let _ = kernel.set_thread_user_context(tid, ctx);
+            }
+            if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                let tid = kernel.current_tid().unwrap_or(0);
+                let nr = trapframe.syscall_num();
+                crate::yarm_log!(
+                    "NONX86_SYSCALL_RETURN_LANE_SET arch=aarch64 tid={} nr={} ret0={} err={}",
+                    tid,
+                    nr,
+                    trapframe.ret0(),
+                    trapframe.error
+                );
+                crate::yarm_log!(
+                    "AARCH64_TRAP_RETURN_FRAME tid={} x0={} x1={} x2={} err={}",
+                    tid,
+                    trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0),
+                    trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1),
+                    trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2),
+                    trapframe.error
+                );
+            }
             trap_trace!(
                 "AARCH64_POST_RESTORE_EXPORT tid={} x0={} x1={} x2={}",
                 kernel.current_tid().unwrap_or(0),

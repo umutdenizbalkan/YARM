@@ -1433,10 +1433,13 @@ fn run_ipc_recv_proof_sender_wake(
                 )
             };
         }
-        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE");
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_CHILD_DONE");
         // Park the child: do NOT return into init's post-proof flow.
+        // Block on the proof endpoint rather than spinning on yield (nr=0) to
+        // avoid polluting the syscall trace with repeated nr=0 noise.
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=child");
         loop {
-            let _ = yarm_user_rt::syscall::yield_now();
+            let _ = unsafe { yarm_user_rt::syscall::ipc_recv(e1_recv) };
         }
     };
 
@@ -1533,6 +1536,9 @@ fn run_ipc_recv_proof_sender_wake(
     if got_child {
         yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE observed=1");
         yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE");
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_PARENT_DONE");
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=parent");
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_PARKED role=parent");
     } else {
         yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SENDER_MSG_ABSENT");
     }
