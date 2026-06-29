@@ -33,7 +33,7 @@ Directive labels are stable across stages:
 
 ---
 
-## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate, Stage 127 target-ASID stack mapping retry, Stage 128 active-CR3 shared switch-stack coverage, Stage 129 active-root VmFull on-demand repair)
+## 1. Live status (Milestone 1 declared, Milestone 2 Pass 2, Stage 114 D3 live-seam wire, Stage 115 IPC rank-3 seam added, Stage 116 task-lock dropped before switch_frames, Stage 117 global-lock-drop stash scaffold Outcome B, Stage 118 first-resume handler + production switch-frame init Outcome B, Stage 119 minimal task pair + TSS RSP0 fix Outcome B, Stage 120 controlled x86_64 switch proof harness, Stage 121 first-resume ABI diagnostics, Stage 122 first-instruction proof, Stage 123 no pre-Rust marker call, Stage 124 Rust tail-jump stack-shape fix, Stage 125 Rust entry bridge, Stage 126 kernel switch-stack mapping/backing gate, Stage 127 target-ASID stack mapping retry, Stage 128 active-CR3 shared switch-stack coverage, Stage 129 active-root VmFull on-demand repair, Stage 163P cross-arch accepted sender-wake regression oracle)
 
 | Item | Status | Live since | Notes |
 |------|--------|-----------|-------|
@@ -4468,18 +4468,27 @@ placement; no syscall/IPC ABI change, no IPC/cap seam moved; `SYSCALL_COUNT == 3
 `VARIANT_COUNT == 23`, `MAX_ADDRESS_SPACES == 32`; RPi5 boot untouched; no
 `BLOCKED_WOULDBLOCK_FATAL` for the expected proof child block.
 
-**User action required (QEMU smoke).** This environment has no QEMU; the matrix
-below must be run by the user. Run `yarm.ipc_recv_proof=1
-yarm.ipc_recv_proof_sender_wake=1` on x86_64, AArch64, RISC-V and verify:
+**Acceptance evidence (Stage 163P — ACCEPTED on x86_64, AArch64, RISC-V):**
 
-- All arches: `USER_LOG .*msg=IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT`,
-  `...WAITER_OBSERVED`, `...SEQUENCE_DONE`.
-- x86_64: a real line matching `^IPC_RECV_V2_SENDER_WAKE_ORDER_OK`.
-- RISC-V: `FORK_SYSCALL_RET ret0=<child_tid>` / `FORK_RET raw=<child_tid> role=parent`
-  in the parent and `FORK_RET raw=0 role=child` in the child (no `raw=4223961`,
-  no `arch_code=0xc`); `RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT` on the COW
-  fault.
-- No `BLOCKED_WOULDBLOCK_FATAL`, `CapabilityFull`, `TaskTableFull`.
+| Arch | Marker / evidence | Result |
+|------|-------------------|--------|
+| x86_64 | `^IPC_RECV_V2_SENDER_WAKE_ORDER_OK` (real recv-v2 split kernel marker, line-start anchored) | PASS |
+| x86_64 | `USER_LOG .*msg=IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` | PASS |
+| x86_64 | no `BLOCKED_WOULDBLOCK_FATAL`, no `CapabilityFull`, no `TaskTableFull` | PASS |
+| AArch64 | parent role, child role, waiter present, waiter observed, sequence done | PASS |
+| AArch64 | no fatal / capacity markers | PASS |
+| RISC-V | parent `raw=10008`, child `raw=0` | PASS |
+| RISC-V | waiter present, waiter observed, sequence done | PASS |
+| RISC-V | no `raw=4223961` regression, no `arch_code=0xc` regression | PASS |
+| RISC-V | no fatal / capacity markers | PASS |
+
+> **Stage 163P is now a cross-arch regression oracle workload, not the current
+> kernel-unlocking frontier.** It must continue to pass on all three architectures
+> under `yarm.ipc_recv_proof=1 yarm.ipc_recv_proof_sender_wake=1`; treat any
+> regression as a blocker before any future live-wire PR. The current unlocking
+> frontier is D6-SWITCH — dropping the global `SpinLock<KernelState>` across
+> cooperative kernel context switch / `switch_frames` — see §7.1.5 for the
+> re-anchored roadmap.
 
 ---
 
@@ -4765,58 +4774,66 @@ absence is visible at every boot.
 
 ### 7.1.5 Next unlocking implementation targets (in order)
 
-D7-A (sentinel cleanup) and D7-B (`D2_PUBLISH_RACE_UNWIND` smoke grep)
-landed in Stage 110 (§1) and are no longer pending. D-NEXT-1 PR-A's
-preparatory phase split landed in Stage 111 (§1); D-NEXT-1 PR-B's
-preparatory phase split landed in Stage 112 (§1); D-NEXT-1 PR-C's
-preparatory phase-boundary documentation/telemetry landed in Stage 113
-(§1). Stage 114 partially executed the combined call-boundary relocation:
-D3's page-crossing-shrink path is now genuinely live-wired (Outcome A)
-via `try_split_vm_brk_shrink_into_frame`; D2 blocking-recv and D6
-dispatch remain at Outcome B (§1 Stage 114). Stage 115 (§1) attempted the
-D2+D6 genuine live-wire; both remain at Outcome B because `dispatch_next_task`
-Phase B → `maybe_switch_kernel_context` → `switch_frames` (arch-specific
-cooperative kernel context switch) cannot be moved outside `with_cpu` without
-per-arch restructuring. The rank-3 IPC seam was added as a genuine
-deliverable (completing the seam set). Stage 116 (§1) implemented Solution 1:
-the `task_state_lock` (rank-2 sub-lock) is no longer held across `switch_frames`;
-`DispatchSwitchPlan` is built inside `with_tcbs_mut` and used after the lock
-is released. This eliminates the per-domain sub-lock from crossing the
-`switch_frames` boundary; only the outer global `SpinLock<KernelState>` (from
-`with_cpu`) still spans it. Stage 117 (§1) added the global-lock-drop stash infrastructure
-(`PerCpuSwitchPlanStash`, `DISPATCH_SWITCH_PLAN_STASH`, `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`)
-but landed at Outcome B: `switch_frames` is never called in production because no
-task has `kernel_context.initialized = true` (`provision_default_kernel_context` leaves
-it `false`; `initialize_thread_kernel_switch_frame` is never called in production).
-The proof markers do not appear in smoke; smoke-observable deferred markers
-(`D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` / `reason=no_kernel_ctx_switch_frame`)
-prove the trap path reaches the decision point. The next targets, in order:
+**Rebaselined after Stage 163P acceptance (Cycle 13 review).** The fork/sender-wake
+saga (Stages 163A–163P) is now accepted as a cross-arch oracle. That oracle is not the
+kernel-unlocking frontier — it is a regression gate. The real gate blocking D2-GENUINE
+and D6-GENUINE is still **D6/SWITCH**: the global `SpinLock<KernelState>` is still
+held across cooperative kernel context switch / `switch_frames`. Stages 117–129 + the
+default-off `D6_SWITCH_PROOF` harness (Stages 120–132 + 139) put all the plumbing in
+place. The next items drive that plumbing into the production smoke path. D4 is
+mechanically complete (Stage 152). The roadmap, in order:
 
-1. **Stage 117 QEMU smoke acceptance.** Run all four smokes and verify that
-   `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` and/or
-   `reason=no_kernel_ctx_switch_frame` appear in x86_64 and AArch64 logs, and
-   `reason=riscv_lockless_trap_path` appears in RISC-V logs. Record results in
-   §1 Stage 117 acceptance evidence table.
-2. **Stage 117 Outcome A — kernel-thread infrastructure.** Wire
-   `initialize_thread_kernel_switch_frame` into the production boot path (requires
-   a real `yarm_kernel_thread_switch_trampoline` that handles first-time kernel-side
-   resumption). Once any production task has `kernel_context.initialized = true`,
-   the stash path will fire and the proof markers will appear in smoke.
-3. **D2 blocking-recv genuine seam live-wire and D6 dispatch seam live-wire.**
-   The structural blocker (global lock held across `switch_frames`) is resolved for
-   kernel threads once Stage 117 Outcome A is achieved. For user tasks (trap-frame
-   switching only), the lock drop needs to be wired to `restore_arch_thread_state`
-   instead of `switch_frames`.
-4. **D4 syscall decomposition — mechanically complete (Stage 152).** All 10
-   submodules landed; the decomposition has reached its irreducible IPC/cap
-   dispatch core. Any further unlocking here is the D1/D5 cap-slot/lock-ordering
-   audit work, not a mechanical module move (§5.1).
-5. **D-NEXT-2 — x86_64 AP per-CPU environment → scheduler-online.**
-   Per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`,
-   behind a default-off knob; then `-smp ≥ 2` smoke acceptance. Still
-   high priority — it unblocks per-CPU runqueue lock sharding (D6) and
-   the lock-free `await_tlb_shootdown_ack` design (D3, full two-phase)
-   — but does not bypass items 1–4 above.
+1. **D6-SWITCH-SMOKE — get the unlocked `switch_frames` proof markers into core smoke.**
+   The `D6_SWITCH_PROOF=1` harness (Stages 120–132 + 139) demonstrates the unlocked
+   path on x86_64 under a controlled pair. The next step is to move that gate from
+   default-off proof mode into the default core smoke so that
+   `D6_SWITCH_FRAMES_ENTER_UNLOCKED` and `D6_SWITCH_FRAMES_RETURNED_UNLOCKED` appear
+   in a regular (non-`D6_SWITCH_PROOF=1`) x86_64 core smoke. Accepted evidence: both
+   markers appear at least once in `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`
+   without the proof knob; `D6_GLOBAL_LOCK_DROP_DEFERRED` must no longer appear for
+   the switched task pair. (Outcome B: preparatory phase split, no genuine seam call.)
+
+2. **D6-SWITCH-A — genuine Outcome A on x86_64: drop global lock before `switch_frames`
+   in the production trap path.** The `PerCpuSwitchPlanStash` /
+   `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` stash infrastructure (Stage 117) and the
+   first-resume handler (Stage 118) are already in place. Wire
+   `initialize_thread_kernel_switch_frame` into the production boot path for at least
+   one tid (supervisor, tid=2, is the canonical first target) and verify that
+   `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` + `D6_SWITCH_FRAMES_ENTER_UNLOCKED` +
+   `D6_SWITCH_FRAMES_RETURNED_UNLOCKED` appear in the x86_64 core smoke without the
+   proof knob. The helper-only fence on `with_scheduler_split_mut` (rank 1) must be
+   deleted in the same PR. (Outcome A: genuine seam live-wire, helper-only fence deleted.)
+
+3. **D6-GENUINE — D6 dispatch seam fully live-wired.** Extend the Outcome A unlock to
+   all production tasks on x86_64; verify that the deferred markers
+   (`D6_GLOBAL_LOCK_DROP_DEFERRED`) no longer appear in the default x86_64 smoke.
+   Gated on D6-SWITCH-A.
+
+4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
+   global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
+   `block_current_on_receive_with_deadline` call boundary ahead of
+   `SharedKernel::with_cpu` so that `with_scheduler_split_mut` (rank 1) and
+   `with_task_tcbs_split_mut` (rank 2) are called without the outer global-lock
+   borrow. Delete the helper-only fences for those two seams in the same PR.
+   Gated on D6-GENUINE.
+
+5. **D2-B — D2 send-blocking split.** Full send-side blocking split; no behavior change
+   from current enqueue path. Gated on D2-GENUINE.
+
+6. **D6-SWITCH-CROSSARCH — extend D6-SWITCH-A to AArch64 and RISC-V.** AArch64 uses
+   the same `switch_frames` shape; RISC-V uses its own trap-frame switch. Both must
+   show the unlocked markers in their core smokes before per-CPU runqueue lock sharding
+   (D6-full) can be unblocked. Gated on D6-SWITCH-A.
+
+7. **D3-FULL — full `VmAnonMap` two-phase live.** Requires lock-free
+   `await_tlb_shootdown_ack` design and multi-CPU smoke proof. Gated on D6-SWITCH-A
+   (for per-CPU environment) and D6-SWITCH-CROSSARCH (for multi-CPU smoke readiness).
+
+8. **D1-D5-AUDIT — cap-slot / lock-ordering audit.** D4 is mechanically complete
+   (Stage 152). Any remaining unlocking work in the cap/IPC space is the D1/D5
+   cap-slot/lock-ordering audit (§5.1), not a mechanical module move. This is
+   concurrent with D6-GENUINE / D2-GENUINE but must not introduce new seam callers
+   without the helper-only fence rule (§6.6, §8).
 
 ### 7.1.6 What must not be touched yet
 
@@ -4844,39 +4861,31 @@ prove the trap path reaches the decision point. The next targets, in order:
 
 ### 7.1.7 Readiness verdict
 
-**Ready to resume global kernel unlocking: yes.**
+**Ready to resume global kernel unlocking: yes. Current frontier: D6-SWITCH.**
 
-Stage 117 landed at Outcome B. The stash infrastructure
-(`PerCpuSwitchPlanStash`, `DISPATCH_SWITCH_PLAN_STASH`, `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`)
-and IRQ safety argument are correct. The stash path is exercised correctly by
-unit tests. The production smoke blocker: all production tasks have
-`kernel_context.initialized = false` (set by `provision_default_kernel_context`,
-never overridden by `initialize_thread_kernel_switch_frame`), so `switch_frames`
-is never called in smoke and the proof markers do not appear.
+Stage 163P is accepted on x86_64, AArch64, and RISC-V (§5.1.9.22). The
+fork/sender-wake oracle is now a **regression gate**, not the development
+frontier. The Cycle 13 review re-establishes D6-SWITCH as the blocking
+gate for D2-GENUINE and D6-GENUINE.
 
-Smoke-observable deferred markers prove the production trap path reaches the
-decision point: `D6_GLOBAL_LOCK_DROP_DEFERRED reason=no_outgoing_task` (IPC
-blocking dispatch) and `reason=no_kernel_ctx_switch_frame` (yield-path, different
-tasks but uninitialized frames) appear in x86_64 and AArch64 logs.
+The plumbing is in place: Stages 117–129 + the default-off `D6_SWITCH_PROOF`
+harness (Stages 120–132 + 139) proved the unlocked `switch_frames` path on
+x86_64 under a controlled pair. The next concrete step is **D6-SWITCH-SMOKE**
+(§7.1.5 item 1): move that gate from the proof knob into the default x86_64
+core smoke so that `D6_SWITCH_FRAMES_ENTER_UNLOCKED` and
+`D6_SWITCH_FRAMES_RETURNED_UNLOCKED` appear without `D6_SWITCH_PROOF=1`.
+Once that lands, **D6-SWITCH-A** (§7.1.5 item 2) completes the Outcome A
+live-wire: wire `initialize_thread_kernel_switch_frame` into the production
+boot path for the supervisor (tid=2), delete the `with_scheduler_split_mut`
+helper-only fence, and confirm `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` in
+smoke.
 
-The Outcome A unlock for Stage 117 requires kernel-thread infrastructure:
-`initialize_thread_kernel_switch_frame` must be called in the production boot path,
-and `yarm_kernel_thread_switch_trampoline` must be a real function (not a spin
-loop) that handles first-time kernel-side resumption after `switch_frames`.
+**Vocabulary reminder (preserved across all stages):**
 
-**Exact next Claude prompt recommendation:**
-
-> Kernel unlocking Stage 117 QEMU smoke acceptance and Outcome A upgrade:
-> (1) Run all four QEMU smokes and verify `D6_GLOBAL_LOCK_DROP_DEFERRED
-> reason=no_outgoing_task` and/or `reason=no_kernel_ctx_switch_frame` appear
-> in x86_64/AArch64 logs, and `reason=riscv_lockless_trap_path` appears in
-> RISC-V logs; record results in `doc/KERNEL_UNLOCKING.md` §1 Stage 117 table.
-> (2) To upgrade Stage 117 to Outcome A: wire `initialize_thread_kernel_switch_frame`
-> into the production boot (e.g., for the supervisor tid=1) and implement a real
-> `yarm_kernel_thread_switch_trampoline` that acquires the global lock and calls
-> `post_switch_restore_arch_thread_state` on its first invocation. The proof
-> markers (`D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH`, `D6_SWITCH_FRAMES_ENTER_UNLOCKED`,
-> `D6_SWITCH_FRAMES_RETURNED_UNLOCKED`) must appear in smoke before claiming Outcome A.
+- **Outcome B** — preparatory phase split, no genuine seam call; helper-only
+  fence on `with_scheduler_split_mut` / `with_task_tcbs_split_mut` stays.
+- **Outcome A** — genuine seam live-wire; helper-only fence deleted in the
+  same PR; proof markers appear in the default core smoke.
 
 ---
 
@@ -4920,6 +4929,42 @@ loop) that handles first-time kernel-side resumption after `switch_frames`.
   smokes actually run; no future live-wire PR may leave that sentinel
   behind once smoke acceptance is recorded (§1 Stage 110). Enforced
   repo-wide by `kernel::boot::tests::no_stale_not_smoke_accepted_sentinels_in_src`.
+- **Strict oracle marker rules (sender-wake regression oracle).**
+  1. **Never count `[info] absent : MARKER` as success.** A log line
+     reporting a marker absent is not evidence the marker fired. Only a
+     direct, positive match of the marker string counts.
+  2. **x86_64 order marker must match `^IPC_RECV_V2_SENDER_WAKE_ORDER_OK`**
+     (anchored at the start of the line). A substring match anywhere in a
+     line (e.g. in a diagnostic summary) is not sufficient; the kernel
+     emits this marker only on the live recv-v2 split path.
+  3. **Sequence-done marker must match
+     `USER_LOG .*msg=IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`** — the
+     `USER_LOG` prefix confirms it was emitted by userspace (init task), not
+     by a kernel diagnostic or a grep of a summary line.
+- **Sender-wake workload preservation rules.**
+  1. **Do not replace the Stage 163P cooperative non-blocking E2 probe /
+     `yield_now()` loop with a blocking deadline recv.** The cooperative
+     design (`ipc_recv_with_deadline(e2_recv, 0)` + `yield_now()` between
+     probes) is what allows the parent to hand the CPU to the child without
+     depending on a timer interrupt. A blocking deadline recv re-introduces
+     the `BLOCKED_WOULDBLOCK_FATAL` race that Stage 163P fixed. Pinned by
+     the `stage163p_e2_poll_is_nonblocking` and related guards.
+  2. **Do not use `enqueue_task` for fork proof child placement unless
+     remote wake / IPI is proven.** Stage 163N fixed this by switching to
+     `enqueue_woken_task`, which places the child on the same CPU as the
+     fork-calling parent, eliminating the need for cross-CPU IPIs. Reverting
+     to `enqueue_task` reintroduces the AArch64 multi-CPU deadlock where the
+     child lands on a remote CPU and no IPI is sent. Pinned by
+     `stage163n_fork_child_enqueued_with_woken_task`.
+  3. **RISC-V same-task non-syscall traps must not mirror stale TCB GPR
+     snapshots over live hardware frame.** The Stage 163P fix gates TCB
+     writeback strictly on `task_switched || ecall`; the non-syscall
+     (non-ecall, same-task) branch preserves the full hardware frame without
+     overwriting it from the TCB snapshot. Reverting this causes the fork
+     child to read a stale `a0` (from the parent's pre-fork TCB snapshot)
+     instead of the kernel-written child `a0=0`. Pinned by
+     `stage163p_riscv_non_syscall_branch_preserves_full_hw_frame` and
+     `stage163p_riscv_writeback_gated_on_switch_or_ecall`.
 
 ---
 
