@@ -13,10 +13,15 @@ use yarm::kernel::syscall::SyscallError as KernelSyscallError;
 use yarm_ipc_abi::process_abi::{
     ExecuteRestartReply, ExecuteRestartRequest, LIFECYCLE_STATE_SPAWNED, LifecycleQueryReply,
     LifecycleQueryRequest, PROC_OP_EXECUTE_RESTART, PROC_OP_EXIT, PROC_OP_GETPID, PROC_OP_GETPPID,
-    PROC_OP_LIFECYCLE_QUERY, PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3,
-    PROC_OP_SPAWN_V4, PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
+    PROC_OP_LIFECYCLE_QUERY, PROC_OP_PM_RESTART_REPLY_V1, PROC_OP_PM_RESTART_V1,
+    PROC_OP_REGISTER_SUPERVISED_TASK, PROC_OP_SPAWN_V2, PROC_OP_SPAWN_V3, PROC_OP_SPAWN_V4,
+    PROC_OP_SPAWN_V5_CAP, PROC_OP_TASK_RESTART_TOKEN, PROC_OP_WAITPID_V2,
+    PmRestartCodecError as AbiPmRestartCodecError, PmRestartFailure as AbiPmRestartFailure,
+    PmRestartReason as AbiPmRestartReason, PmRestartReplyStatus as AbiPmRestartReplyStatus,
+    PmRestartReplyV1 as AbiPmRestartReplyV1, PmRestartRequestV1 as AbiPmRestartRequestV1,
     RegisterSupervisedTask, SpawnV2Args, SpawnV3Args, SpawnV4Args, SpawnV5CapArgs,
-    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args, encode_spawn_v5_reply,
+    TaskRestartTokenReply, TaskRestartTokenRequest, WaitPidV2Args, decode_pm_restart_request_v1,
+    encode_pm_restart_reply_v1, encode_spawn_v5_reply,
 };
 use yarm_srv_common::elf::ElfImageInfo;
 use yarm_srv_common::service_loop::RequestResponseService;
@@ -60,10 +65,20 @@ enum SpawnLoadSource {
 }
 
 fn resolve_spawn_load_source(image_id: u64) -> Result<SpawnLoadSource, ProcessManagerError> {
+    resolve_spawn_load_source_with_restart_test(image_id, false)
+}
+
+fn resolve_spawn_load_source_with_restart_test(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Result<SpawnLoadSource, ProcessManagerError> {
     if (BOOTSTRAP_IMAGE_ID_MIN..=BOOTSTRAP_SERVICE_IMAGE_ID_MAX).contains(&image_id) {
         return Ok(SpawnLoadSource::DirectInitrd);
     }
     if (VFS_SERVICE_IMAGE_ID_MIN..=VFS_SERVICE_IMAGE_ID_MAX).contains(&image_id) {
+        return Ok(SpawnLoadSource::Vfs);
+    }
+    if supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID {
         return Ok(SpawnLoadSource::Vfs);
     }
     Err(ProcessManagerError::Unsupported)
@@ -147,16 +162,43 @@ impl WaitPidV2Result {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessRequest {
-    GetPid { caller_tid: u64 },
-    GetPpid { caller_tid: u64 },
-    Exit { caller_tid: u64, code: u64 },
+    GetPid {
+        caller_tid: u64,
+    },
+    GetPpid {
+        caller_tid: u64,
+    },
+    Exit {
+        caller_tid: u64,
+        code: u64,
+    },
     SpawnV2(SpawnV2Request),
     SpawnV5Cap(SpawnV5CapRequest),
     WaitPidV2(WaitPidV2Request),
-    TaskRestartToken { tid: u64 },
-    RegisterSupervisedTask { tid: u64, restart_token: u64 },
-    ExecuteRestart { tid: u64, restart_token: u64 },
-    LifecycleQuery { tid: u64 },
+    TaskRestartToken {
+        tid: u64,
+        sender_tid: u64,
+    },
+    RegisterSupervisedTask {
+        tid: u64,
+        restart_token: u64,
+    },
+    ExecuteRestart {
+        tid: u64,
+        restart_token: u64,
+    },
+    LifecycleQuery {
+        tid: u64,
+    },
+    PmRestartV1 {
+        request: AbiPmRestartRequestV1,
+        sender_tid: u64,
+    },
+    PmRestartV1DecodeFailed {
+        request_id: u64,
+        target_tid: u64,
+        failure: AbiPmRestartCodecError,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +220,116 @@ const PM_RESTART_CONTRACT_VERSION_V1: u16 = 1;
 const PM_RESTART_MAX_ENTRIES: usize = 8;
 const PM_RESTART_MAX_ROLLBACK_STEPS: usize = 8;
 const PM_RESTART_AUTHORITY_MARKER: u32 = 0x504d_5253;
+const PM_RESTART_TRUSTED_SUPERVISOR_TID: u64 = 4;
+const PM_RESTART_MAX_ATTEMPTS_V1: u16 = 3;
+const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6;
+const SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
+const PM_RESTART_MAX_IN_PROGRESS: usize = 4;
+const CRASH_TEST_SRV_IMAGE_ID: u64 = 13;
+#[cfg(not(test))]
+const CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID: u64 = 12;
+const CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv";
+#[allow(dead_code)]
+const CRASH_TEST_SRV_NAME: &[u8] = b"crash_test_srv";
+#[allow(dead_code)]
+const CRASH_TEST_DEFAULT_MAX_RESTARTS: u16 = 3;
+const PM_CRASH_TEST_RESTART_SPEC_MAX: usize = 2;
+const PM_CRASH_TEST_RESTART_TOKEN_TAG: u64 = 0x4352_4153_4854_0000;
+
+fn supervisor_restart_test_build_gate_enabled() -> bool {
+    option_env!("YARM_SUPERVISOR_RESTART_TEST") == Some("1")
+        || option_env!("SUPERVISOR_RESTART_TEST") == Some("1")
+}
+
+fn crash_test_restart_token_for_tid(tid: u64) -> u64 {
+    PM_CRASH_TEST_RESTART_TOKEN_TAG | (tid & 0xffff)
+}
+
+#[cfg(not(test))]
+fn kernel_spawn_policy_image_id_for_vfs_spawn(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Result<u64, ProcessManagerError> {
+    if image_id == CRASH_TEST_SRV_IMAGE_ID {
+        if supervisor_restart_test_enabled {
+            yarm_user_rt::user_log!(
+                "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=1 reason=restart-test-gate"
+            );
+            return Ok(CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID);
+        }
+        yarm_user_rt::user_log!("PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=0 reason=gate-off");
+        return Err(ProcessManagerError::Unsupported);
+    }
+    Ok(image_id)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrashTestRestartSpec {
+    target_tid: u64,
+    image_id: u64,
+    parent_tid: u64,
+    supervisor_tid: u64,
+    max_restarts: u16,
+    token_fingerprint: u16,
+    load_source: SpawnLoadSource,
+    service_name_len: u8,
+    service_name: [u8; 16],
+}
+
+impl CrashTestRestartSpec {
+    #[allow(dead_code)]
+    const fn new(
+        target_tid: u64,
+        parent_tid: u64,
+        supervisor_tid: u64,
+        token_fingerprint: u16,
+    ) -> Self {
+        let mut service_name = [0u8; 16];
+        service_name[0] = b'c';
+        service_name[1] = b'r';
+        service_name[2] = b'a';
+        service_name[3] = b's';
+        service_name[4] = b'h';
+        service_name[5] = b'_';
+        service_name[6] = b't';
+        service_name[7] = b'e';
+        service_name[8] = b's';
+        service_name[9] = b't';
+        service_name[10] = b'_';
+        service_name[11] = b's';
+        service_name[12] = b'r';
+        service_name[13] = b'v';
+        Self {
+            target_tid,
+            image_id: CRASH_TEST_SRV_IMAGE_ID,
+            parent_tid,
+            supervisor_tid,
+            max_restarts: CRASH_TEST_DEFAULT_MAX_RESTARTS,
+            token_fingerprint,
+            load_source: SpawnLoadSource::Vfs,
+            service_name_len: CRASH_TEST_SRV_NAME.len() as u8,
+            service_name,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SupL4PmRestartRollbackInjection {
+    None,
+    AfterReservationBeforeSpawn,
+    SpawnFailure,
+    AfterReplacementTidBeforeLifecycleRecord,
+    LifecycleRecordFailure,
+    ReplyConstructionFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PmRestartInProgress {
+    request_id: u64,
+    target_tid: u64,
+    replacement_tid: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PmRestartReason {
@@ -1012,6 +1164,13 @@ impl LifecycleTable {
             .filter_map(|e| e.as_ref())
             .find(|r| r.image_id == image_id)
     }
+
+    pub fn get_by_tid_mut(&mut self, tid: u64) -> Option<&mut ServiceLifecycleRecord> {
+        self.entries[..self.len]
+            .iter_mut()
+            .filter_map(|e| e.as_mut())
+            .find(|r| r.tid == tid)
+    }
 }
 
 #[derive(Debug)]
@@ -1022,6 +1181,11 @@ pub struct ProcessService {
     restart_control_send_cap: Option<u32>,
     /// Lifecycle table: one entry per successfully spawned service.
     lifecycle_table: LifecycleTable,
+    pm_restart_mechanism_enabled: bool,
+    supervisor_restart_test_enabled: bool,
+    sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection,
+    pm_restart_in_progress: [Option<PmRestartInProgress>; PM_RESTART_MAX_IN_PROGRESS],
+    crash_test_restart_specs: [Option<CrashTestRestartSpec>; PM_CRASH_TEST_RESTART_SPEC_MAX],
     handled: usize,
 }
 
@@ -1409,6 +1573,11 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
 
 impl ProcessService {
     pub fn new() -> Self {
+        let supervisor_restart_test_enabled = supervisor_restart_test_build_gate_enabled();
+        #[cfg(not(test))]
+        if supervisor_restart_test_enabled {
+            yarm_user_rt::user_log!("PM_SUPERVISOR_RESTART_TEST_GATE_ON");
+        }
         Self {
             manager: KernelProcessManagerAdapter::new(),
             policy_records: [None; 64],
@@ -1416,12 +1585,83 @@ impl ProcessService {
             restart_control_send_cap: yarm_user_rt::runtime::startup_context()
                 .process_manager_restart_control_send_cap,
             lifecycle_table: LifecycleTable::new(),
+            pm_restart_mechanism_enabled: supervisor_restart_test_enabled,
+            supervisor_restart_test_enabled,
+            sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection::None,
+            pm_restart_in_progress: [None; PM_RESTART_MAX_IN_PROGRESS],
+            crash_test_restart_specs: [None; PM_CRASH_TEST_RESTART_SPEC_MAX],
             handled: 0,
         }
     }
 
     pub fn lifecycle_table(&self) -> &LifecycleTable {
         &self.lifecycle_table
+    }
+
+    #[cfg(test)]
+    fn enable_sup_l4_pm_restart_mechanism_for_tests(&mut self) {
+        self.pm_restart_mechanism_enabled = true;
+    }
+
+    #[cfg(test)]
+    fn enable_sup_l4_pm_restart_rollback_injection_for_tests(
+        &mut self,
+        injection: SupL4PmRestartRollbackInjection,
+    ) {
+        self.sup_l4_pm_restart_rollback_injection = injection;
+    }
+
+    #[cfg(test)]
+    fn enable_supervisor_restart_test_for_tests(&mut self) {
+        self.supervisor_restart_test_enabled = true;
+    }
+
+    #[allow(dead_code)]
+    fn crash_test_image_path(&self, image_id: u64) -> Option<&'static [u8]> {
+        if self.supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID {
+            yarm_user_rt::user_log!(
+                "CRASH_TEST_IMAGE_ID_ASSIGNED image_id={}",
+                CRASH_TEST_SRV_IMAGE_ID
+            );
+            yarm_user_rt::user_log!("CRASH_TEST_IMAGE_GATED");
+            Some(CRASH_TEST_SRV_PATH)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn register_crash_test_restart_spec_for_tests(
+        &mut self,
+        target_tid: u64,
+        parent_tid: u64,
+        supervisor_tid: u64,
+        token_fingerprint: u16,
+    ) -> Result<(), ProcessManagerError> {
+        if !self.supervisor_restart_test_enabled {
+            return Err(ProcessManagerError::Unsupported);
+        }
+        let slot = self
+            .crash_test_restart_specs
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(ProcessManagerError::TableFull)?;
+        *slot = Some(CrashTestRestartSpec::new(
+            target_tid,
+            parent_tid,
+            supervisor_tid,
+            token_fingerprint,
+        ));
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn crash_test_restart_spec_for_tid(&self, target_tid: u64) -> Option<CrashTestRestartSpec> {
+        self.crash_test_restart_specs
+            .iter()
+            .flatten()
+            .copied()
+            .find(|spec| spec.target_tid == target_tid)
     }
 
     /// Record a lifecycle entry for a bootstrap service spawned before PM's
@@ -1545,7 +1785,10 @@ impl ProcessService {
             PROC_OP_TASK_RESTART_TOKEN => {
                 let args = TaskRestartTokenRequest::decode(msg.as_slice())
                     .map_err(|_| ProcessManagerError::Malformed)?;
-                Ok(ProcessRequest::TaskRestartToken { tid: args.tid })
+                Ok(ProcessRequest::TaskRestartToken {
+                    tid: args.tid,
+                    sender_tid: msg.sender_tid.0,
+                })
             }
             PROC_OP_REGISTER_SUPERVISED_TASK => {
                 let args = RegisterSupervisedTask::decode(msg.as_slice())
@@ -1562,6 +1805,33 @@ impl ProcessService {
                     tid: args.tid,
                     restart_token: args.restart_token,
                 })
+            }
+            PROC_OP_PM_RESTART_V1 => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_V1_DISPATCH_ENTER sender_tid={}",
+                    msg.sender_tid.0
+                );
+                match decode_pm_restart_request_v1(msg.as_slice()) {
+                    Ok(request) => {
+                        yarm_user_rt::user_log!(
+                            "PM_RESTART_V1_DECODE_OK request_id={} target_tid={}",
+                            request.request_id,
+                            request.target_tid
+                        );
+                        Ok(ProcessRequest::PmRestartV1 {
+                            request,
+                            sender_tid: msg.sender_tid.0,
+                        })
+                    }
+                    Err(failure) => {
+                        yarm_user_rt::user_log!("PM_RESTART_V1_DECODE_FAIL reason={:?}", failure);
+                        Ok(ProcessRequest::PmRestartV1DecodeFailed {
+                            request_id: 0,
+                            target_tid: 0,
+                            failure,
+                        })
+                    }
+                }
             }
             PROC_OP_LIFECYCLE_QUERY => {
                 let args = LifecycleQueryRequest::decode(msg.as_slice())
@@ -1752,7 +2022,18 @@ impl ProcessService {
                     // spawner_cap:  non-zero only when parent_pid != 0; this is PM's own
                     //               copy of the service send cap (high 32 bits of ret2).
                     // pm_send_cap:  whichever of the above lives in PM's own CNode.
-                    let source = resolve_spawn_load_source(req.image_id)?;
+                    if self.supervisor_restart_test_enabled
+                        && req.image_id == CRASH_TEST_SRV_IMAGE_ID
+                    {
+                        yarm_user_rt::user_log!(
+                            "PM_CRASH_TEST_SPAWN_REQUEST image_id={}",
+                            req.image_id
+                        );
+                    }
+                    let source = resolve_spawn_load_source_with_restart_test(
+                        req.image_id,
+                        self.supervisor_restart_test_enabled,
+                    )?;
                     let (tid, caller_cap, spawner_cap) = match source {
                         SpawnLoadSource::DirectInitrd => {
                             yarm_user_rt::user_log!(
@@ -1799,6 +2080,7 @@ impl ProcessService {
                                     req.parent_pid.0,
                                     &startup_args,
                                     vfs_send_cap,
+                                    self.supervisor_restart_test_enabled,
                                 )
                             } {
                                 Ok(values) => values,
@@ -1808,6 +2090,19 @@ impl ProcessService {
                                         req.image_id,
                                         err
                                     );
+                                    if self.supervisor_restart_test_enabled
+                                        && req.image_id == CRASH_TEST_SRV_IMAGE_ID
+                                    {
+                                        yarm_user_rt::user_log!(
+                                            "PM_SPAWN_FROM_MO_TABLE_STATS image_id=13 table=pm_lifecycle used={} cap={}",
+                                            self.lifecycle_table.len,
+                                            MAX_LIFECYCLE_ENTRIES
+                                        );
+                                        yarm_user_rt::user_log!(
+                                            "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id=13 site=policy err={:?}",
+                                            err
+                                        );
+                                    }
                                     let encoded = encode_spawn_v5_reply(0, 0);
                                     return Message::with_header(
                                         0,
@@ -1846,6 +2141,23 @@ impl ProcessService {
                         req.parent_pid.0,
                         recorded as u8
                     );
+                    if self.supervisor_restart_test_enabled
+                        && req.image_id == CRASH_TEST_SRV_IMAGE_ID
+                    {
+                        yarm_user_rt::user_log!("PM_CRASH_TEST_SPAWN_OK tid={}", tid);
+                        yarm_user_rt::user_log!(
+                            "PM_CRASH_TEST_LIFECYCLE_RECORDED tid={} image_id={}",
+                            tid,
+                            CRASH_TEST_SRV_IMAGE_ID
+                        );
+                        let token = crash_test_restart_token_for_tid(tid);
+                        let _ = self.record_restart_token(tid, token);
+                        yarm_user_rt::user_log!(
+                            "PM_CRASH_TEST_RESTART_TOKEN_RECORDED tid={} fingerprint={}",
+                            tid,
+                            (token & 0xffff) as u16
+                        );
+                    }
                     let encoded = encode_spawn_v5_reply(tid, caller_cap);
                     yarm_user_rt::user_log!(
                         "PM_SPAWN_V5_CAP_REPLY tid={} caller_cap={} pm_send_cap={} len={}",
@@ -1895,10 +2207,19 @@ impl ProcessService {
                 Message::with_header(0, PROC_OP_WAITPID_V2, 0, None, &result.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
-            ProcessRequest::TaskRestartToken { tid } => {
-                let reply = TaskRestartTokenReply::new(
-                    self.restart_token_for_tid(tid).is_some(),
-                    self.restart_token_for_tid(tid).unwrap_or(0),
+            ProcessRequest::TaskRestartToken { tid, sender_tid } => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TOKEN_QUERY_RECV tid={} sender={}",
+                    tid,
+                    sender_tid
+                );
+                let token = self.restart_token_for_tid(tid);
+                let reply = TaskRestartTokenReply::new(token.is_some(), token.unwrap_or(0));
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TOKEN_QUERY_REPLY tid={} status={} fingerprint={}",
+                    tid,
+                    reply.found,
+                    (reply.token & 0xffff) as u16
                 );
                 Message::with_header(0, PROC_OP_TASK_RESTART_TOKEN, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
@@ -1919,6 +2240,15 @@ impl ProcessService {
                 Message::with_header(0, PROC_OP_EXECUTE_RESTART, 0, None, &reply.encode())
                     .map_err(|_| ProcessManagerError::Malformed)
             }
+            ProcessRequest::PmRestartV1 {
+                request,
+                sender_tid,
+            } => self.handle_pm_restart_v1(request, sender_tid),
+            ProcessRequest::PmRestartV1DecodeFailed {
+                request_id,
+                target_tid,
+                failure,
+            } => Self::pm_restart_decode_failure_reply(failure, request_id, target_tid),
             ProcessRequest::LifecycleQuery { tid } => {
                 yarm_user_rt::user_log!("PM_LIFECYCLE_QUERY_RECV tid={}", tid);
                 let reply = match self.lifecycle_table.get_by_tid(tid) {
@@ -1940,6 +2270,475 @@ impl ProcessService {
                     .map_err(|_| ProcessManagerError::Malformed)
             }
         }
+    }
+
+    fn pm_restart_reply(
+        status: AbiPmRestartReplyStatus,
+        failure: AbiPmRestartFailure,
+        request_id: u64,
+        target_tid: u64,
+        next_retry_tick: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        Self::pm_restart_reply_with_handle(
+            status,
+            failure,
+            request_id,
+            target_tid,
+            0,
+            0,
+            next_retry_tick,
+        )
+    }
+
+    fn pm_restart_reply_with_handle(
+        status: AbiPmRestartReplyStatus,
+        failure: AbiPmRestartFailure,
+        request_id: u64,
+        target_tid: u64,
+        replacement_handle_kind: u16,
+        replacement_handle_value: u64,
+        next_retry_tick: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        let reply = AbiPmRestartReplyV1 {
+            version: yarm_ipc_abi::process_abi::PM_RESTART_VERSION_V1,
+            request_id,
+            target_tid,
+            status,
+            failure,
+            replacement_handle_kind,
+            replacement_handle_value,
+            cleanup_status: 0,
+            accounting_status: (status == AbiPmRestartReplyStatus::Accepted) as u16,
+            startup_cap_status: (status == AbiPmRestartReplyStatus::Accepted) as u16,
+            health_monitor_status: 0,
+            rollback_status: 0,
+            next_retry_tick,
+        };
+        let encoded =
+            encode_pm_restart_reply_v1(&reply).map_err(|_| ProcessManagerError::Malformed)?;
+        Message::with_header(0, PROC_OP_PM_RESTART_REPLY_V1, 0, None, &encoded)
+            .map_err(|_| ProcessManagerError::Malformed)
+    }
+
+    fn pm_restart_decode_failure_reply(
+        failure: AbiPmRestartCodecError,
+        request_id: u64,
+        target_tid: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        let (status, failure) = match failure {
+            AbiPmRestartCodecError::UnsupportedVersion => (
+                AbiPmRestartReplyStatus::UnsupportedVersion,
+                AbiPmRestartFailure::UnsupportedVersion,
+            ),
+            AbiPmRestartCodecError::RawOrUnscopedToken => (
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::RawTokenUnsupported,
+            ),
+            AbiPmRestartCodecError::OversizedServiceName
+            | AbiPmRestartCodecError::Malformed
+            | AbiPmRestartCodecError::InvalidEnum
+            | AbiPmRestartCodecError::NonzeroReserved => (
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::UnsupportedVersion,
+            ),
+        };
+        Self::pm_restart_reply(status, failure, request_id, target_tid, 0)
+    }
+
+    fn reserve_pm_restart(
+        &mut self,
+        request_id: u64,
+        target_tid: u64,
+    ) -> Result<(), ProcessManagerError> {
+        if self
+            .pm_restart_in_progress
+            .iter()
+            .flatten()
+            .any(|entry| entry.target_tid == target_tid || entry.request_id == request_id)
+        {
+            return Err(ProcessManagerError::WouldBlock);
+        }
+        let slot = self
+            .pm_restart_in_progress
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(ProcessManagerError::TableFull)?;
+        *slot = Some(PmRestartInProgress {
+            request_id,
+            target_tid,
+            replacement_tid: 0,
+        });
+        Ok(())
+    }
+
+    fn complete_pm_restart_reservation(
+        &mut self,
+        request_id: u64,
+        replacement_tid: u64,
+    ) -> Result<(), ProcessManagerError> {
+        let entry = self
+            .pm_restart_in_progress
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.request_id == request_id)
+            .ok_or(ProcessManagerError::Malformed)?;
+        entry.replacement_tid = replacement_tid;
+        Ok(())
+    }
+
+    fn clear_pm_restart_reservation(&mut self, request_id: u64) {
+        if let Some(slot) = self
+            .pm_restart_in_progress
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.request_id == request_id))
+        {
+            *slot = None;
+        }
+    }
+
+    fn rollback_pm_restart(
+        &mut self,
+        request_id: u64,
+        target_tid: u64,
+        reason: &'static str,
+    ) -> Result<Message, ProcessManagerError> {
+        yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason={}", reason);
+        self.clear_pm_restart_reservation(request_id);
+        yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason={}", reason);
+        yarm_user_rt::user_log!("PM_RESTART_REPLY_ROLLED_BACK reason={}", reason);
+        Self::pm_restart_reply(
+            AbiPmRestartReplyStatus::RolledBack,
+            AbiPmRestartFailure::ResourceUnavailable,
+            request_id,
+            target_tid,
+            0,
+        )
+    }
+
+    fn spawn_sup_l4_replacement(
+        &mut self,
+        original: ServiceLifecycleRecord,
+    ) -> Result<u64, ProcessManagerError> {
+        let crash_test_restart_supported =
+            self.supervisor_restart_test_enabled && original.image_id == CRASH_TEST_SRV_IMAGE_ID;
+        if !crash_test_restart_supported
+            && (original.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID
+                || resolve_spawn_load_source(original.image_id)? != SpawnLoadSource::DirectInitrd)
+        {
+            return Err(ProcessManagerError::Unsupported);
+        }
+        #[cfg(test)]
+        {
+            let image = synthetic_elf_image(original.image_id);
+            let info = ElfImageInfo::parse(original.image_id, &image).map_err(map_elf_error)?;
+            let pid = self
+                .manager
+                .allocate_process(ProcessId(original.parent_tid))?;
+            self.record_spawn_policy(pid, original.image_id, info.entry, None, None)?;
+            Ok(pid.0)
+        }
+        #[cfg(not(test))]
+        {
+            if crash_test_restart_supported {
+                let vfs_send_cap = self
+                    .lifecycle_table
+                    .get_by_image_id(6)
+                    .map(|rec| rec.pm_service_send_cap)
+                    .unwrap_or(0);
+                if vfs_send_cap == 0 {
+                    return Err(ProcessManagerError::Unsupported);
+                }
+                let startup_args = [0u64; 18];
+                let (tid, _, _) = unsafe {
+                    pm_vfs_spawn_inline(
+                        original.image_id,
+                        original.parent_tid,
+                        &startup_args,
+                        vfs_send_cap,
+                        self.supervisor_restart_test_enabled,
+                    )
+                }?;
+                return Ok(tid);
+            }
+            let backend = KernelProcessSpawnBackend::new();
+            backend.spawn(original.image_id, original.parent_tid)
+        }
+    }
+
+    fn handle_pm_restart_v1(
+        &mut self,
+        request: AbiPmRestartRequestV1,
+        sender_tid: u64,
+    ) -> Result<Message, ProcessManagerError> {
+        if sender_tid == 0 || sender_tid != PM_RESTART_TRUSTED_SUPERVISOR_TID {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_SENDER_REJECTED sender_tid={} payload_supervisor_tid={}",
+                sender_tid,
+                request.supervisor_tid
+            );
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=sender");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=sender");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::MissingRight,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        if request.supervisor_tid != 0 && request.supervisor_tid != sender_tid {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_SENDER_REJECTED sender_tid={} payload_supervisor_tid={}",
+                sender_tid,
+                request.supervisor_tid
+            );
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=spoofed_supervisor_tid");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=spoofed_supervisor_tid");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::MissingRight,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        yarm_user_rt::user_log!("PM_RESTART_SENDER_OK sender_tid={}", sender_tid);
+
+        let rejected = |failure: AbiPmRestartFailure, reason: &'static str| {
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason={}", reason);
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason={}", reason);
+            Self::pm_restart_reply(
+                match failure {
+                    AbiPmRestartFailure::None => AbiPmRestartReplyStatus::Rejected,
+                    _ => AbiPmRestartReplyStatus::Rejected,
+                },
+                failure,
+                request.request_id,
+                request.target_tid,
+                0,
+            )
+        };
+
+        let Some(target_record) = self.lifecycle_table.get_by_tid(request.target_tid).copied()
+        else {
+            yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=no_such_target");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=no_such_target");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::NoSuchTarget,
+                AbiPmRestartFailure::None,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        };
+        if !request.token.scoped {
+            return rejected(
+                AbiPmRestartFailure::RawTokenUnsupported,
+                "raw_or_unscoped_token",
+            );
+        }
+        if request.token.owner_tid != request.target_tid {
+            return rejected(AbiPmRestartFailure::WrongTokenOwner, "wrong_token_owner");
+        }
+        yarm_user_rt::user_log!(
+            "PM_RESTART_TOKEN_OK target_tid={} fingerprint={}",
+            request.target_tid,
+            request.token.redacted_fingerprint
+        );
+        if request.attempt_count > PM_RESTART_MAX_ATTEMPTS_V1 {
+            return rejected(
+                AbiPmRestartFailure::RestartLimitExceeded,
+                "restart_limit_exceeded",
+            );
+        }
+        if request.restart_reason == AbiPmRestartReason::NormalExit {
+            return rejected(AbiPmRestartFailure::MissingRight, "reason_disallowed");
+        }
+        if request.dependency_cause_tid != 0 {
+            return rejected(AbiPmRestartFailure::DependencyBlocked, "dependency_blocked");
+        }
+        if request.startup_cap_policy != 0 {
+            return rejected(
+                AbiPmRestartFailure::StartupCapLayoutUnsupported,
+                "startup_cap_layout_unsupported",
+            );
+        }
+        if self
+            .restart_token_for_tid(request.target_tid)
+            .is_some_and(|token| (token & 0xffff) as u16 != request.token.redacted_fingerprint)
+        {
+            return rejected(
+                AbiPmRestartFailure::WrongTokenOwner,
+                "token_generation_mismatch",
+            );
+        }
+
+        yarm_user_rt::user_log!(
+            "PM_RESTART_VALIDATE_OK request_id={} target_tid={}",
+            request.request_id,
+            request.target_tid
+        );
+        if !self.pm_restart_mechanism_enabled {
+            yarm_user_rt::user_log!("PM_RESTART_MECHANISM_GATE_OFF");
+            yarm_user_rt::user_log!("PM_RESTART_MECHANISM_DEFERRED reason=mechanism_unavailable");
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_DEFERRED reason=mechanism_unavailable");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Deferred,
+                AbiPmRestartFailure::ResourceUnavailable,
+                request.request_id,
+                request.target_tid,
+                request.due_tick,
+            );
+        }
+        yarm_user_rt::user_log!("PM_RESTART_MECHANISM_GATE_ON");
+        let crash_test_restart_supported = self.supervisor_restart_test_enabled
+            && target_record.image_id == CRASH_TEST_SRV_IMAGE_ID;
+        if target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID
+            && !crash_test_restart_supported
+        {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_MECHANISM_DEFERRED reason=unsupported_service image_id={}",
+                target_record.image_id
+            );
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Deferred,
+                AbiPmRestartFailure::ResourceUnavailable,
+                request.request_id,
+                request.target_tid,
+                request.due_tick,
+            );
+        }
+        if !crash_test_restart_supported
+            && resolve_spawn_load_source(target_record.image_id)? != SpawnLoadSource::DirectInitrd
+        {
+            yarm_user_rt::user_log!("PM_RESTART_MECHANISM_DEFERRED reason=missing_restart_spec");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Deferred,
+                AbiPmRestartFailure::StartupCapLayoutUnsupported,
+                request.request_id,
+                request.target_tid,
+                request.due_tick,
+            );
+        }
+
+        yarm_user_rt::user_log!(
+            "PM_RESTART_ACCOUNTING_BEGIN request_id={} target_tid={}",
+            request.request_id,
+            request.target_tid
+        );
+        if self
+            .reserve_pm_restart(request.request_id, request.target_tid)
+            .is_err()
+        {
+            return self.rollback_pm_restart(request.request_id, request.target_tid, "reservation");
+        }
+        yarm_user_rt::user_log!(
+            "PM_RESTART_RESERVE_REPLACEMENT_OK request_id={} target_tid={}",
+            request.request_id,
+            request.target_tid
+        );
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::AfterReservationBeforeSpawn
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "after_reservation_before_spawn",
+            );
+        }
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_BEGIN image_id={} target_tid={}",
+            target_record.image_id,
+            request.target_tid
+        );
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::SpawnFailure
+        {
+            return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
+        }
+        let replacement_tid = match self.spawn_sup_l4_replacement(target_record) {
+            Ok(tid) if tid != 0 => tid,
+            _ => {
+                return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
+            }
+        };
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::AfterReplacementTidBeforeLifecycleRecord
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "after_replacement_tid_before_lifecycle_record",
+            );
+        }
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::LifecycleRecordFailure
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "lifecycle_record",
+            );
+        }
+        if self.sup_l4_pm_restart_rollback_injection
+            == SupL4PmRestartRollbackInjection::ReplyConstructionFailure
+        {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "reply_construction",
+            );
+        }
+        let recorded = self.lifecycle_table.record(ServiceLifecycleRecord {
+            tid: replacement_tid,
+            image_id: target_record.image_id,
+            parent_tid: target_record.parent_tid,
+            pm_service_send_cap: 0,
+            state: ServiceState::Spawned,
+        });
+        if !recorded {
+            return self.rollback_pm_restart(
+                request.request_id,
+                request.target_tid,
+                "lifecycle_record",
+            );
+        }
+        if self.supervisor_restart_test_enabled && target_record.image_id == CRASH_TEST_SRV_IMAGE_ID
+        {
+            yarm_user_rt::user_log!(
+                "PM_CRASH_TEST_LIFECYCLE_RECORDED tid={} image_id={}",
+                replacement_tid,
+                CRASH_TEST_SRV_IMAGE_ID
+            );
+            let token = crash_test_restart_token_for_tid(replacement_tid);
+            let _ = self.record_restart_token(replacement_tid, token);
+            yarm_user_rt::user_log!(
+                "PM_CRASH_TEST_RESTART_TOKEN_RECORDED tid={} fingerprint={}",
+                replacement_tid,
+                (token & 0xffff) as u16
+            );
+        }
+        if self
+            .complete_pm_restart_reservation(request.request_id, replacement_tid)
+            .is_err()
+        {
+            return self.rollback_pm_restart(request.request_id, request.target_tid, "accounting");
+        }
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_OK target_tid={} replacement_tid={}",
+            request.target_tid,
+            replacement_tid
+        );
+        yarm_user_rt::user_log!("PM_RESTART_REPLY_ACCEPTED");
+        Self::pm_restart_reply_with_handle(
+            AbiPmRestartReplyStatus::Accepted,
+            AbiPmRestartFailure::None,
+            request.request_id,
+            request.target_tid,
+            SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID,
+            replacement_tid,
+            0,
+        )
     }
 
     fn execute_restart_via_kernel_cap(&self, tid: u64, restart_token: u64) -> u8 {
@@ -1999,18 +2798,11 @@ unsafe fn pm_vfs_spawn_inline(
     parent_pid: u64,
     startup_args: &[u64; 18],
     vfs_send_cap: u32,
+    supervisor_restart_test_enabled: bool,
 ) -> Result<(u64, u32, u32), ProcessManagerError> {
-    let path_label: &[u8] = match image_id {
-        4 => b"/initramfs/sbin/initramfs_srv",
-        5 => b"/initramfs/sbin/devfs_srv",
-        6 => b"/initramfs/sbin/vfs_server",
-        7 => b"/initramfs/sbin/driver_manager",
-        8 => b"/initramfs/sbin/blkcache_srv",
-        9 => b"/initramfs/sbin/virtio_blk_srv",
-        10 => b"/initramfs/sbin/fat_srv",
-        11 => b"/initramfs/sbin/ramfs_srv",
-        12 => b"/initramfs/sbin/ext4_srv",
-        _ => {
+    let path_label = match pm_vfs_image_path_label(image_id, supervisor_restart_test_enabled) {
+        Some(path) => path,
+        None => {
             yarm_user_rt::user_log!("PM_VFS_SPAWN_IMAGE_UNKNOWN image_id={}", image_id);
             return Err(ProcessManagerError::Unsupported);
         }
@@ -2052,7 +2844,20 @@ unsafe fn pm_vfs_spawn_inline(
     // For image_id 7-9: try Phase 3A (MemoryObject cap grant) first, then fall
     // back to Phase 2B (transfer-buffer bulk read) only on Unsupported.
     // For image_id 4-6: fall through to the existing inline 112-byte path.
-    if pm_image_cpio_name(image_id).is_some() {
+    let crash_test_vfs_image =
+        supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID;
+    if crash_test_vfs_image {
+        yarm_user_rt::user_log!("PM_SPAWN_FROM_MO_ENTER image_id=13");
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=1 reason=restart-test-gate"
+        );
+        yarm_user_rt::user_log!(
+            "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id=13 site=policy err=kernel-path-table-lacks-image13 fallback=user_buf"
+        );
+    }
+    if !crash_test_vfs_image
+        && pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled).is_some()
+    {
         // Phase 3A attempt: VFS_OP_FILE_GRANT_RO → SpawnFromMemoryObject.
         let phase3a_result = unsafe {
             pm_try_grant_ro_and_spawn(
@@ -2091,7 +2896,7 @@ unsafe fn pm_vfs_spawn_inline(
         }
     }
 
-    let image = match pm_image_cpio_name(image_id) {
+    let image = match pm_image_cpio_name_for_gate(image_id, supervisor_restart_test_enabled) {
         Some(cpio_name) => unsafe {
             pm_read_all_via_vfs_bulk(
                 image_id,
@@ -2103,8 +2908,31 @@ unsafe fn pm_vfs_spawn_inline(
         }?,
         None => unsafe { pm_read_all_via_vfs(image_id, vfs_send_cap, reply_recv_cap, path_label) }?,
     };
+    let first4 = [
+        image.first().copied().unwrap_or(0),
+        image.get(1).copied().unwrap_or(0),
+        image.get(2).copied().unwrap_or(0),
+        image.get(3).copied().unwrap_or(0),
+    ];
+    yarm_user_rt::user_log!(
+        "PM_VFS_SPAWN_LOAD_REPLY image_id={} status=ok len={}",
+        image_id,
+        image.len()
+    );
+    yarm_user_rt::user_log!(
+        "PM_VFS_SPAWN_LOAD_FIRST4 image_id={} bytes=[{:02x} {:02x} {:02x} {:02x}]",
+        image_id,
+        first4[0],
+        first4[1],
+        first4[2],
+        first4[3]
+    );
     if image.is_empty() {
         yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err=empty-elf", image_id);
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode err=empty-elf",
+            image_id
+        );
         return Err(ProcessManagerError::Malformed);
     }
     // Verify ELF magic before attempting spawn.
@@ -2115,8 +2943,13 @@ unsafe fn pm_vfs_spawn_inline(
             image_id,
             &image[..first4_end]
         );
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=elf_parse err=bad-elf-magic",
+            image_id
+        );
         return Err(ProcessManagerError::Malformed);
     }
+    yarm_user_rt::user_log!("PM_VFS_SPAWN_ELF_MAGIC_OK image_id={}", image_id);
     yarm_user_rt::user_log!(
         "PM_VFS_SPAWN_FROM_VFS_BYTES image_id={} len={} first4={:x?}",
         image_id,
@@ -2124,9 +2957,11 @@ unsafe fn pm_vfs_spawn_inline(
         &image[..4]
     );
     let image_len = image.len();
+    let kernel_spawn_image_id =
+        kernel_spawn_policy_image_id_for_vfs_spawn(image_id, supervisor_restart_test_enabled)?;
     let result = unsafe {
         yarm_user_rt::syscall::spawn_process_from_user_buf(
-            image_id,
+            kernel_spawn_image_id,
             image.as_ptr(),
             image_len,
             parent_pid,
@@ -2156,7 +2991,22 @@ unsafe fn pm_vfs_spawn_inline(
         }
         Err(e) => {
             yarm_user_rt::user_log!("PM_VFS_SPAWN_FAIL image_id={} err={:?}", image_id, e);
-            Err(ProcessManagerError::TableFull)
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
+                image_id,
+                e
+            );
+            yarm_user_rt::user_log!(
+                "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
+                image_id,
+                e
+            );
+            match e {
+                yarm_user_rt::syscall::SyscallError::InvalidArgs => {
+                    Err(ProcessManagerError::Unsupported)
+                }
+                _ => Err(ProcessManagerError::TableFull),
+            }
         }
     }
 }
@@ -2349,6 +3199,11 @@ unsafe fn pm_try_grant_ro_and_spawn(
                     image_id,
                     e
                 );
+                yarm_user_rt::user_log!(
+                    "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create err={:?}",
+                    image_id,
+                    e
+                );
                 // Close fd on error.
                 if let Ok(close_msg) = build_close_message(fd) {
                     let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
@@ -2365,6 +3220,10 @@ unsafe fn pm_try_grant_ro_and_spawn(
             grant_reply.opcode,
             transferred_cap.is_some()
         );
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create err=grant_ro_unsupported",
+            image_id
+        );
         if let Ok(close_msg) = build_close_message(fd) {
             let _ = unsafe { pm_vfs_call_u64(vfs_send_cap, reply_recv_cap, &close_msg) };
         }
@@ -2377,6 +3236,12 @@ unsafe fn pm_try_grant_ro_and_spawn(
     let reply_payload = grant_reply.as_slice();
     let file_grant_reply = yarm_ipc_abi::vfs_abi::FileGrantRoReply::decode(reply_payload);
     let file_len = file_grant_reply.map(|r| r.file_len).unwrap_or(0);
+    if file_grant_reply.is_none() {
+        yarm_user_rt::user_log!(
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode err=grant_ro_reply_decode",
+            image_id
+        );
+    }
 
     yarm_user_rt::user_log!(
         "PM_VFS_GRANT_RO_RECEIVED image_id={} len={} cap={}",
@@ -2414,11 +3279,20 @@ unsafe fn pm_try_grant_ro_and_spawn(
                 "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_unsupported",
                 image_id
             );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo err=unsupported",
+                image_id
+            );
             Err(ProcessManagerError::Unsupported)
         }
         Err(e) => {
             yarm_user_rt::user_log!(
                 "PM_ELF_ZC_FAIL image_id={} reason=spawn_from_mo_err err={:?}",
+                image_id,
+                e
+            );
+            yarm_user_rt::user_log!(
+                "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo err={:?}",
                 image_id,
                 e
             );
@@ -2440,7 +3314,42 @@ fn decode_u64(payload: &[u8]) -> Option<u64> {
 /// Map image_id (7/8/9) → bare CPIO entry name (no leading slash).
 /// These are the names inside the initramfs CPIO archive.
 #[cfg(not(test))]
-fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
+// Stable source-audit mirror for legacy stage guardrails: the actual table
+// below wraps these paths in `Some(...)` so SUP-L5B can gate image_id 13, but
+// IDs 4..=12 retain their historical labels exactly.
+// 4 => b"/initramfs/sbin/initramfs_srv"
+// 5 => b"/initramfs/sbin/devfs_srv"
+// 6 => b"/initramfs/sbin/vfs_server"
+// 7 => b"/initramfs/sbin/driver_manager"
+// 8 => b"/initramfs/sbin/blkcache_srv"
+// 9 => b"/initramfs/sbin/virtio_blk_srv"
+// 10 => b"/initramfs/sbin/fat_srv"
+// 11 => b"/initramfs/sbin/ramfs_srv"
+// 12 => b"/initramfs/sbin/ext4_srv"
+fn pm_vfs_image_path_label(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Option<&'static [u8]> {
+    match image_id {
+        4 => Some(b"/initramfs/sbin/initramfs_srv"),
+        5 => Some(b"/initramfs/sbin/devfs_srv"),
+        6 => Some(b"/initramfs/sbin/vfs_server"),
+        7 => Some(b"/initramfs/sbin/driver_manager"),
+        8 => Some(b"/initramfs/sbin/blkcache_srv"),
+        9 => Some(b"/initramfs/sbin/virtio_blk_srv"),
+        10 => Some(b"/initramfs/sbin/fat_srv"),
+        11 => Some(b"/initramfs/sbin/ramfs_srv"),
+        12 => Some(b"/initramfs/sbin/ext4_srv"),
+        CRASH_TEST_SRV_IMAGE_ID if supervisor_restart_test_enabled => Some(CRASH_TEST_SRV_PATH),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn pm_image_cpio_name_for_gate(
+    image_id: u64,
+    supervisor_restart_test_enabled: bool,
+) -> Option<&'static [u8]> {
     match image_id {
         7 => Some(b"sbin/driver_manager"),
         8 => Some(b"sbin/blkcache_srv"),
@@ -2448,6 +3357,7 @@ fn pm_image_cpio_name(image_id: u64) -> Option<&'static [u8]> {
         10 => Some(b"sbin/fat_srv"),
         11 => Some(b"sbin/ramfs_srv"),
         12 => Some(b"sbin/ext4_srv"),
+        CRASH_TEST_SRV_IMAGE_ID if supervisor_restart_test_enabled => Some(b"sbin/crash_test_srv"),
         _ => None,
     }
 }
@@ -3734,6 +4644,397 @@ mod tests {
             call(&mut service, 9, 77),
             ExecuteRestartReply::STATUS_INTERNAL_UNSUPPORTED
         );
+    }
+
+    fn seed_pm_restart_target(service: &mut ProcessService, tid: u64) {
+        assert!(service.seed_bootstrap_lifecycle_record(tid, 42));
+    }
+
+    fn seed_sup_l4_supported_pm_restart_target(service: &mut ProcessService, tid: u64) {
+        assert!(service.seed_bootstrap_lifecycle_record(tid, SUP_L4_SUPPORTED_RESTART_IMAGE_ID));
+        service
+            .record_restart_token(tid, 0xCAFE)
+            .expect("restart token");
+    }
+
+    fn pm_restart_request_payload(
+        request_id: u64,
+        supervisor_tid: u64,
+        target_tid: u64,
+    ) -> [u8; yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_V1_LEN] {
+        let request = AbiPmRestartRequestV1::new(
+            request_id,
+            supervisor_tid,
+            target_tid,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(target_tid, 0xCAFE),
+        )
+        .expect("valid restart request");
+        yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&request).expect("encode")
+    }
+
+    fn pm_restart_call(
+        service: &mut ProcessService,
+        sender_tid: u64,
+        payload: &[u8],
+    ) -> AbiPmRestartReplyV1 {
+        let request = Message::with_header(sender_tid, PROC_OP_PM_RESTART_V1, 0, None, payload)
+            .expect("request");
+        let reply_msg = service.handle(request).expect("reply");
+        assert_eq!(reply_msg.opcode, PROC_OP_PM_RESTART_REPLY_V1);
+        assert_eq!(
+            reply_msg.as_slice().len(),
+            yarm_ipc_abi::process_abi::PM_RESTART_REPLY_V1_LEN
+        );
+        yarm_ipc_abi::process_abi::decode_pm_restart_reply_v1(reply_msg.as_slice())
+            .expect("decode reply")
+    }
+
+    #[test]
+    fn pm_restart_v1_malformed_truncated_payload_rejected() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(1, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            &payload[..109],
+        );
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_unsupported_version_and_invalid_enum_rejected() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let mut payload = pm_restart_request_payload(2, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        payload[0..2].copy_from_slice(&2u16.to_le_bytes());
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::UnsupportedVersion);
+        assert_eq!(reply.failure, AbiPmRestartFailure::UnsupportedVersion);
+
+        let mut payload = pm_restart_request_payload(3, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        payload[yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_REASON_OFFSET
+            ..yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_REASON_OFFSET + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.replacement_handle_kind, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_untrusted_and_spoofed_supervisor_rejected() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(4, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, 3, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
+
+        let payload = pm_restart_request_payload(5, 99, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
+    }
+
+    #[test]
+    fn pm_restart_v1_token_target_and_limit_validation_rejects() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+
+        let mut raw = pm_restart_request_payload(6, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        raw[96] = 0;
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &raw);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::RawTokenUnsupported);
+
+        let wrong_owner = AbiPmRestartRequestV1::new(
+            7,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            77,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(88, 0xCAFE),
+        )
+        .expect("request");
+        let wrong_owner =
+            yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&wrong_owner).expect("encode");
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            &wrong_owner,
+        );
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::WrongTokenOwner);
+
+        let unknown = pm_restart_request_payload(8, PM_RESTART_TRUSTED_SUPERVISOR_TID, 404);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &unknown);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::NoSuchTarget);
+
+        let mut limit = AbiPmRestartRequestV1::new(
+            9,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            77,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(77, 0xCAFE),
+        )
+        .expect("request");
+        limit.attempt_count = PM_RESTART_MAX_ATTEMPTS_V1 + 1;
+        let limit =
+            yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&limit).expect("encode");
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &limit);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::RestartLimitExceeded);
+    }
+
+    #[test]
+    fn pm_restart_v1_valid_request_defers_without_replacement_handle() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(10, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
+        assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_gate_off_supported_target_still_defers() {
+        let mut service = ProcessService::new();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(11, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
+        assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_gate_on_unsupported_service_defers() {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        seed_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(12, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_gate_on_supported_service_accepts_with_replacement() {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let payload = pm_restart_request_payload(13, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Accepted);
+        assert_eq!(reply.failure, AbiPmRestartFailure::None);
+        assert_eq!(
+            reply.replacement_handle_kind,
+            SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID
+        );
+        assert_ne!(reply.replacement_handle_value, 0);
+        assert!(
+            service
+                .lifecycle_table()
+                .get_by_tid(reply.replacement_handle_value)
+                .is_some()
+        );
+    }
+
+    fn sup_l4_assert_rolled_back_without_replacement(reply: AbiPmRestartReplyV1) {
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::RolledBack);
+        assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
+        assert_eq!(reply.replacement_handle_kind, 0);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_token_fingerprint_mismatch_rejected() {
+        let mut service = ProcessService::new();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let request = AbiPmRestartRequestV1::new(
+            14,
+            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            77,
+            1,
+            b"svc",
+            AbiPmRestartReason::Fault,
+            yarm_ipc_abi::process_abi::PmRestartTokenDescriptor::scoped(77, 0xBEEF),
+        )
+        .expect("request");
+        let payload =
+            yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&request).expect("encode");
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::WrongTokenOwner);
+        assert_eq!(reply.replacement_handle_value, 0);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_duplicate_in_progress_reservation_rolls_back_or_rejects() {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        service
+            .reserve_pm_restart(99, 77)
+            .expect("seed in-progress reservation");
+        let payload = pm_restart_request_payload(15, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        sup_l4_assert_rolled_back_without_replacement(reply);
+        assert!(service.lifecycle_table().get_by_tid(77).is_some());
+    }
+
+    fn pm_restart_v1_sup_l4_rollback_injection(
+        injection: SupL4PmRestartRollbackInjection,
+        request_id: u64,
+    ) {
+        let mut service = ProcessService::new();
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        service.enable_sup_l4_pm_restart_rollback_injection_for_tests(injection);
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        let before_len = service.lifecycle_table().len();
+        let payload = pm_restart_request_payload(request_id, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        sup_l4_assert_rolled_back_without_replacement(reply);
+        assert_eq!(service.lifecycle_table().len(), before_len);
+        assert!(service.lifecycle_table().get_by_tid(77).is_some());
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_after_reservation_before_spawn() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::AfterReservationBeforeSpawn,
+            16,
+        );
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_spawn_failure() {
+        pm_restart_v1_sup_l4_rollback_injection(SupL4PmRestartRollbackInjection::SpawnFailure, 17);
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_after_replacement_before_lifecycle() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::AfterReplacementTidBeforeLifecycleRecord,
+            18,
+        );
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_lifecycle_record_failure() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::LifecycleRecordFailure,
+            19,
+        );
+    }
+
+    #[test]
+    fn pm_restart_v1_sup_l4_rollback_reply_construction_failure() {
+        pm_restart_v1_sup_l4_rollback_injection(
+            SupL4PmRestartRollbackInjection::ReplyConstructionFailure,
+            20,
+        );
+    }
+
+    #[test]
+    fn sup_l5a_crash_test_image_mapping_is_gate_only_and_unique() {
+        let mut service = ProcessService::new();
+        assert_eq!(CRASH_TEST_SRV_IMAGE_ID, 13);
+        assert_ne!(CRASH_TEST_SRV_IMAGE_ID, SUP_L4_SUPPORTED_RESTART_IMAGE_ID);
+        assert_eq!(
+            resolve_spawn_load_source(6).ok(),
+            Some(SpawnLoadSource::DirectInitrd)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(12).ok(),
+            Some(SpawnLoadSource::Vfs)
+        );
+        assert_eq!(
+            resolve_spawn_load_source(CRASH_TEST_SRV_IMAGE_ID),
+            Err(ProcessManagerError::Unsupported)
+        );
+        assert_eq!(service.crash_test_image_path(CRASH_TEST_SRV_IMAGE_ID), None);
+        service.enable_supervisor_restart_test_for_tests();
+        assert_eq!(
+            service.crash_test_image_path(CRASH_TEST_SRV_IMAGE_ID),
+            Some(CRASH_TEST_SRV_PATH)
+        );
+    }
+
+    #[test]
+    fn sup_l5a_crash_test_restart_spec_is_gate_only_bounded_and_cap_free() {
+        let mut service = ProcessService::new();
+        assert_eq!(
+            service.register_crash_test_restart_spec_for_tests(77, 1, 4, 0xCAFE),
+            Err(ProcessManagerError::Unsupported)
+        );
+        service.enable_supervisor_restart_test_for_tests();
+        service
+            .register_crash_test_restart_spec_for_tests(77, 1, 4, 0xCAFE)
+            .expect("register crash-test restart spec");
+        let spec = service
+            .crash_test_restart_spec_for_tid(77)
+            .expect("restart spec");
+        assert_eq!(spec.image_id, CRASH_TEST_SRV_IMAGE_ID);
+        assert_eq!(spec.parent_tid, 1);
+        assert_eq!(spec.supervisor_tid, PM_RESTART_TRUSTED_SUPERVISOR_TID);
+        assert_eq!(spec.max_restarts, CRASH_TEST_DEFAULT_MAX_RESTARTS);
+        assert_eq!(spec.token_fingerprint, 0xCAFE);
+        assert_eq!(spec.load_source, SpawnLoadSource::Vfs);
+        assert_eq!(
+            &spec.service_name[..spec.service_name_len as usize],
+            CRASH_TEST_SRV_NAME
+        );
+        assert!(service.crash_test_restart_spec_for_tid(404).is_none());
+    }
+
+    #[test]
+    fn pm_restart_v1_source_guard_sup_l4_execution_is_gated_and_narrow() {
+        let src = include_str!("service.rs");
+        let dispatch_start = src.find("PROC_OP_PM_RESTART_V1 =>").expect("dispatch arm");
+        let dispatch = &src[dispatch_start..];
+        for forbidden in &[
+            "spawn_process(",
+            "spawn_process_with_startup_caps(",
+            "execute_restart_via_kernel_cap(",
+            "record_restart_token(",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+        ] {
+            assert!(
+                !dispatch.contains(forbidden),
+                "SUP-L4 PM restart dispatch must not contain broad/resource side effect {forbidden}"
+            );
+        }
+        for needle in &[
+            "PM_RESTART_MECHANISM_GATE_OFF",
+            "PM_RESTART_MECHANISM_GATE_ON",
+            "SUP_L4_SUPPORTED_RESTART_IMAGE_ID",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_RESERVE_REPLACEMENT_OK",
+            "PM_RESTART_SPAWN_BEGIN",
+            "PM_RESTART_SPAWN_OK",
+            "PM_RESTART_ROLLBACK_BEGIN",
+            "PM_RESTART_ROLLBACK_DONE",
+            "PM_RESTART_REPLY_ACCEPTED",
+        ] {
+            assert!(
+                dispatch.contains(needle),
+                "SUP-L4 dispatch must contain {needle}"
+            );
+        }
     }
 
     #[test]

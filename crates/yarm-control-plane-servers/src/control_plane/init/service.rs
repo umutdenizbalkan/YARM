@@ -34,9 +34,15 @@ use yarm_fs_servers::initramfs::{InitramfsBackend, InitramfsService, boot_initrd
 use yarm_fs_servers::ramfs::service::RamFsMountConfig;
 use yarm_ipc_abi::blkcache_abi::{BLKCACHE_OP_REGISTER_BACKEND, RegisterBackendArgs};
 use yarm_ipc_abi::block_abi::{BLK_OP_GET_INFO, BlkGetInfoReply, BlkGetInfoRequest, BlkStatus};
+use yarm_ipc_abi::supervisor_abi::{RegisterDriverRequest, SUPERVISOR_OP_REGISTER_DRIVER};
 use yarm_ipc_abi::vfs_abi::{MountRegisterArgs, VFS_MOUNT_STATUS_OK, VFS_OP_MOUNT_REGISTER};
 #[cfg(test)]
 use yarm_ipc_abi::vfs_abi::{VFS_OP_OPENAT, VFS_OP_READ};
+
+fn supervisor_restart_test_build_gate_enabled() -> bool {
+    option_env!("YARM_SUPERVISOR_RESTART_TEST") == Some("1")
+        || option_env!("SUPERVISOR_RESTART_TEST") == Some("1")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitCoreImageSource<'a> {
@@ -554,6 +560,105 @@ fn register_ext4_mount_with_vfs(
     }
 }
 
+fn crash_test_supervisor_control_send_cap(
+    ctx: &yarm_user_rt::runtime::StartupContext,
+) -> Option<u32> {
+    let raw = yarm_user_rt::runtime::startup_arg_slot(
+        yarm_user_rt::runtime::STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP,
+    )
+    .unwrap_or(0);
+    yarm_user_rt::user_log!("INIT_STARTUP_SLOT_SUPERVISOR_CONTROL_SEND raw={}", raw);
+    match ctx.supervisor_control_send_ep {
+        Some(cap) => {
+            yarm_user_rt::user_log!("INIT_SUPERVISOR_CONTROL_SEND_CAP_PRESENT cap={}", cap);
+            Some(cap)
+        }
+        None => {
+            if raw == 0 {
+                yarm_user_rt::user_log!("INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=zero");
+                yarm_user_rt::user_log!(
+                    "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty"
+                );
+            } else {
+                yarm_user_rt::user_log!("INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=decode");
+            }
+            None
+        }
+    }
+}
+
+fn register_crash_test_with_supervisor(supervisor_send: u32, crash_tid: u64) {
+    yarm_user_rt::user_log!("INIT_CRASH_TEST_REGISTER_BEGIN tid={}", crash_tid);
+    let req = RegisterDriverRequest {
+        tid: crash_tid,
+        max_restarts: 3,
+        restart_group: 13,
+        dependency_mask: 0,
+        backoff_ticks: 1,
+        irq_line: 0,
+        mem_cap: 0,
+        iova_cap: 0,
+        iova_base: 0,
+        dma_len: 0,
+        iova_len: 0,
+    };
+    let payload = req.encode();
+    let Ok(msg) = yarm_user_rt::ipc::Message::with_header(
+        0,
+        SUPERVISOR_OP_REGISTER_DRIVER,
+        0,
+        None,
+        &payload,
+    ) else {
+        yarm_user_rt::user_log!(
+            "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=message",
+            crash_tid
+        );
+        return;
+    };
+    yarm_user_rt::user_log!(
+        "INIT_CRASH_TEST_REGISTER_META opcode={} flags={} len={}",
+        SUPERVISOR_OP_REGISTER_DRIVER,
+        0,
+        payload.len()
+    );
+    let first = [
+        payload.first().copied().unwrap_or(0),
+        payload.get(1).copied().unwrap_or(0),
+        payload.get(2).copied().unwrap_or(0),
+        payload.get(3).copied().unwrap_or(0),
+        payload.get(4).copied().unwrap_or(0),
+        payload.get(5).copied().unwrap_or(0),
+        payload.get(6).copied().unwrap_or(0),
+        payload.get(7).copied().unwrap_or(0),
+    ];
+    yarm_user_rt::user_log!(
+        "INIT_CRASH_TEST_REGISTER_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
+        first[0],
+        first[1],
+        first[2],
+        first[3],
+        first[4],
+        first[5],
+        first[6],
+        first[7],
+        payload.len()
+    );
+    yarm_user_rt::user_log!(
+        "INIT_CRASH_TEST_REGISTER_SEND cap={} tid={}",
+        supervisor_send,
+        crash_tid
+    );
+    match unsafe { yarm_user_rt::syscall::ipc_send(supervisor_send, &msg) } {
+        Ok(()) => yarm_user_rt::user_log!("INIT_CRASH_TEST_REGISTER_OK tid={}", crash_tid),
+        Err(err) => yarm_user_rt::user_log!(
+            "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=ipc-send err={:?}",
+            crash_tid,
+            err
+        ),
+    }
+}
+
 pub fn run() {
     yarm_user_rt::user_log!("INIT_RUN_ENTER");
     let ctx = yarm_user_rt::runtime::startup_context();
@@ -970,6 +1075,26 @@ pub fn run() {
         yarm_user_rt::user_log!("INIT_RAMFS_SPAWN_SKIPPED reason=profile_disabled");
         yarm_user_rt::user_log!("INIT_FAT_SPAWN_SKIPPED reason=profile_disabled");
         yarm_user_rt::user_log!("INIT_EXT4_SPAWN_SKIPPED reason=profile_disabled");
+    }
+
+    if supervisor_restart_test_build_gate_enabled() {
+        yarm_user_rt::user_log!("INIT_SUPERVISOR_RESTART_TEST_GATE_ON");
+        yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_REQUEST image_id=13");
+        if let Some((crash_tid, _crash_send_cap)) =
+            spawn_v5_cap(pm_send, pm_recv, 13, [0, 0, 0, 0], 1)
+        {
+            yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_OK tid={}", crash_tid);
+            if let Some(supervisor_send) = crash_test_supervisor_control_send_cap(&ctx) {
+                register_crash_test_with_supervisor(supervisor_send, crash_tid);
+            } else {
+                yarm_user_rt::user_log!(
+                    "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=no-supervisor-send-cap",
+                    crash_tid
+                );
+            }
+        } else {
+            yarm_user_rt::user_log!("INIT_CRASH_TEST_SPAWN_FAIL reason=pm-spawn");
+        }
     }
 
     // Stage 159BC/D: default-off userspace IPC recv-v2 oracle workload. The

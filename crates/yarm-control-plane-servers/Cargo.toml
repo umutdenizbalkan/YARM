@@ -58,3 +58,8 @@ test = false
 name = "vfs_server"
 path = "src/bin/vfs_server.rs"
 test = false
+
+[[bin]]
+name = "crash_test_srv"
+path = "src/bin/crash_test_srv.rs"
+test = false

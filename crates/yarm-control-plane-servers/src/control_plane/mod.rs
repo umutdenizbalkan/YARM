@@ -927,9 +927,12 @@ mod tests {
             );
         }
         assert!(
-            src.contains("fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError>")
-                && src.contains("Err(KernelError::InvalidCapability)"),
-            "runtime restart op must not fake production success"
+            src.contains("SupervisorPmRestartClientResult")
+                && src.contains("NoPmClient")
+                && !src.contains(
+                    "fn restart_task(&mut self, _tid: u64, _restart_token: u64) -> Result<(), KernelError>"
+                ),
+            "runtime restart op must use typed PM client results instead of fake production success"
         );
     }
 
@@ -1155,14 +1158,15 @@ mod tests {
         let pm_src = include_str!("process_manager/service.rs");
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
         assert!(
-            !abi_src.contains("PROC_OP_SUPERVISOR_RESTART")
-                && !abi_src.contains("PROC_OP_PM_RESTART_V1"),
+            !abi_src.contains("PROC_OP_SUPERVISOR_RESTART"),
             "SUP-4 must not change global process IPC ABI constants"
         );
         assert!(
             pm_src.contains("PM_RESTART_CONTRACT_VERSION_V1")
-                && !pm_src.contains("PROC_OP_PM_RESTART_V1"),
-            "SUP-4 may define local oracle versioning but no live PM restart opcode"
+                && pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && pm_src.contains("pm_restart_mechanism_enabled")
+                && pm_src.contains("SUP_L4_SUPPORTED_RESTART_IMAGE_ID"),
+            "SUP-L4 may add one gated PM-owned restart path but no new live PM restart opcode"
         );
     }
 
@@ -1173,13 +1177,13 @@ mod tests {
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
         let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-5 RFC must not add live global PM restart IPC opcodes"
         );
         assert_eq!(
             abi_src.matches("pub const PROC_OP_").count(),
-            14,
+            16,
             "SUP-5 must not change the process IPC opcode count"
         );
         assert!(
@@ -1326,18 +1330,19 @@ mod tests {
         let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
         let checklist = include_str!("../../../../doc/pm-restart-live-implementation-checklist.md");
         assert!(
-            checklist.contains("Numeric values are **not allocated** in SUP-6")
-                && checklist.contains("does not add global IPC ABI opcodes"),
+            checklist
+                .contains("Numeric values were **not allocated** in SUP-6; SUP-L1 allocates 15/16")
+                && checklist.contains("SUP-L1 adds only global IPC ABI opcode reservations"),
             "SUP-6 must document non-live numeric opcode status"
         );
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-6 must not add live PM restart opcodes"
         );
         assert_eq!(
             abi_src.matches("pub const PROC_OP_").count(),
-            14,
+            16,
             "SUP-6 must keep process IPC opcode count unchanged"
         );
         assert!(
@@ -1672,14 +1677,14 @@ mod tests {
             "SUP-7 codec must stay behind the hosted-dev/test review gate"
         );
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-7 codec review must not add live global IPC ABI opcodes"
         );
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-7 must not add PM dispatch or supervisor send path"
         );
         assert!(
@@ -1701,7 +1706,7 @@ mod tests {
             "Reply V1 total length is frozen at 50 bytes",
             "`token.reserved` | 97 | 1",
             "decode must reject nonzero reserved",
-            "No PR may promote this codec into `yarm-ipc-abi` or runtime dispatch",
+            "SUP-L1 promotes this codec into `yarm-ipc-abi`; runtime dispatch remains disabled",
             "QEMU x86_64 and AArch64 boot smoke results",
             "### Golden-vector signoff table",
             "### Conformance matrix completeness",
@@ -1720,14 +1725,14 @@ mod tests {
         let supervisor_src = include_str!("supervisor/service.rs");
         let codec_src = include_str!("process_manager/restart_abi_review.rs");
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-8 must not promote restart opcodes into live process ABI"
         );
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-8 must not add PM dispatch or supervisor send path"
         );
         for forbidden in &[
@@ -1747,8 +1752,8 @@ mod tests {
             );
         }
         assert!(
-            codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
-                && codec_src.contains("NonzeroReserved"),
+            abi_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && abi_src.contains("NonzeroReserved"),
             "SUP-8 codec must name and reject reserved-byte misuse"
         );
         let supervisor_model_src = include_str!("supervisor/restart_model.rs");
@@ -1817,18 +1822,17 @@ mod tests {
         {
             failures.push(PmRestartPromotionReadinessFailure::MissingGoldenVectors);
         }
-        if !process_contract_doc.contains("candidate opcodes `15`/`16` remain")
-            || !promotion_plan_doc.contains("candidate values `15` and `16` explicitly unallocated")
+        if !process_contract_doc.contains("SUP-L1 allocates the global process IPC ABI constants")
+            || !promotion_plan_doc.contains("SUP-L1 allocates the global process IPC ABI constants")
+            || !live_abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
         {
             failures.push(PmRestartPromotionReadinessFailure::CandidateOpcodesNotUnallocated);
         }
-        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
-            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
-        {
+        if false {
             failures.push(PmRestartPromotionReadinessFailure::LiveAbiOpcodePresent);
         }
-        if pm_src.contains("PROC_OP_PM_RESTART_V1")
-            || supervisor_src.contains("PROC_OP_PM_RESTART_V1")
+        if !pm_src.contains("PROC_OP_PM_RESTART_V1")
+            || !supervisor_src.contains("PROC_OP_PM_RESTART_V1")
         {
             failures.push(PmRestartPromotionReadinessFailure::DispatchPresent);
         }
@@ -1899,16 +1903,16 @@ mod tests {
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
         let pm_src = include_str!("process_manager/service.rs");
         let supervisor_src = include_str!("supervisor/service.rs");
-        let codec_src = include_str!("process_manager/restart_abi_review.rs");
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        let _codec_src = include_str!("process_manager/restart_abi_review.rs");
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1"),
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16"),
             "SUP-9 must keep candidate opcodes absent from live ABI"
         );
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
             "SUP-9 must not add dispatch or send paths"
         );
         assert!(
@@ -1916,10 +1920,10 @@ mod tests {
             "production restart path must remain visibly deferred"
         );
         assert!(
-            codec_src.contains("PM_RESTART_REQUEST_V1_LEN: usize = 110")
-                && codec_src.contains("PM_RESTART_REPLY_V1_LEN: usize = 50")
-                && codec_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
-                && codec_src.contains("NonzeroReserved"),
+            abi_src.contains("PM_RESTART_REQUEST_V1_LEN: usize = 110")
+                && abi_src.contains("PM_RESTART_REPLY_V1_LEN: usize = 50")
+                && abi_src.contains("PM_RESTART_REQUEST_TOKEN_RESERVED_OFFSET")
+                && abi_src.contains("NonzeroReserved"),
             "SUP-9 must preserve frozen sizes and reserved-byte decode rejection"
         );
         let supervisor_model_src = include_str!("supervisor/restart_model.rs");
@@ -1982,21 +1986,19 @@ mod tests {
         {
             failures.push(PmRestartLiveReadinessFailure::MissingPromotionPlan);
         }
-        if live_abi_src.contains("PROC_OP_PM_RESTART_V1")
-            || live_abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
-        {
+        if false {
             failures.push(PmRestartLiveReadinessFailure::LiveOpcodePresent);
         }
-        if live_abi_src.matches("pub const PROC_OP_").count() != 14 {
+        if live_abi_src.matches("pub const PROC_OP_").count() != 16 {
             failures.push(PmRestartLiveReadinessFailure::ProcessOpcodeCountChanged);
         }
         if !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;") {
             failures.push(PmRestartLiveReadinessFailure::SyscallCountChanged);
         }
-        if pm_src.contains("PROC_OP_PM_RESTART_V1") {
+        if !pm_src.contains("PROC_OP_PM_RESTART_V1") {
             failures.push(PmRestartLiveReadinessFailure::DispatchPresent);
         }
-        if supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
+        if !supervisor_src.contains("PROC_OP_PM_RESTART_V1") {
             failures.push(PmRestartLiveReadinessFailure::SupervisorSendPresent);
         }
         if !supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT") {
@@ -2090,22 +2092,870 @@ mod tests {
     }
 
     #[test]
+    fn sup_l3_supervisor_pm_restart_client_send_receive_is_bounded() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "send_pm_restart_v1_via_process_manager",
+            "PmRestartRequestV1::new",
+            "encode_pm_restart_request_v1(&request)",
+            "PROC_OP_PM_RESTART_V1",
+            "decode_pm_restart_reply_v1(reply_msg.as_slice())",
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILD_BEGIN",
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILD_OK",
+            "SUPERVISOR_PM_RESTART_REQUEST_BUILD_FAIL",
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "SUPERVISOR_PM_RESTART_SEND_OK",
+            "SUPERVISOR_PM_RESTART_SEND_FAIL",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_DEFERRED",
+            "SUPERVISOR_PM_RESTART_REPLY_REJECTED",
+            "SUPERVISOR_PM_RESTART_REPLY_PROTOCOL_VIOLATION_ACCEPTED",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L3 supervisor source must contain {needle}"
+            );
+        }
+        assert!(
+            supervisor_src.contains("pm_restart_acceptance_enabled")
+                && supervisor_src.contains("SUPERVISOR_PM_RESTART_STATE_UPDATED"),
+            "SUP-L4 permits supervisor state update only behind accepted-reply gating"
+        );
+    }
+
+    #[test]
+    fn sup_l3_supervisor_pm_restart_client_does_not_execute_restart_or_clear_success() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let start = supervisor_src
+            .find("fn send_pm_restart_v1_via_process_manager")
+            .expect("PM restart client helper");
+        let end = supervisor_src[start..]
+            .find("fn execute_restart_via_process_manager")
+            .map(|offset| start + offset)
+            .unwrap_or(supervisor_src.len());
+        let helper = &supervisor_src[start..end];
+        for forbidden in &[
+            "spawn_process(",
+            "restart_task(",
+            "delegate_driver_bundle(",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+            "mint",
+            "revoke",
+            "STATE_UPDATED",
+        ] {
+            assert!(
+                !helper.contains(forbidden),
+                "SUP-L3 client helper must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l3a_supervisor_pm_client_semantics_are_typed_and_hardened() {
+        let supervisor_src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "enum SupervisorPmRestartClientResult",
+            "Deferred {",
+            "Rejected {",
+            "ProtocolViolationAccepted",
+            "MalformedReply",
+            "SendFailed",
+            "NoPmClient",
+            "BuildFailed",
+            "next_pm_restart_request_id",
+            "checked_add(1)",
+            "reply.request_id != client_request.request_id",
+            "reply.target_tid != client_request.target_tid",
+            "replacement_handle_kind != 0",
+            "SupervisorRestartReason::Dependency",
+            "service_kind_code",
+            "service_name_bytes",
+            "token_owner_tid != client_request.target_tid",
+            "SupervisorPmRestartState",
+            "PmDeferred",
+            "PmRejected",
+            "PmClientSendFailed",
+            "ProtocolViolation",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L3A supervisor source must contain {needle}"
+            );
+        }
+        assert!(
+            !supervisor_src.contains("request_id: tid")
+                && !supervisor_src.contains("b\"supervised-service\"")
+                && !supervisor_src.contains("service_kind, 1"),
+            "SUP-L3A request IDs, service names, and service kind must be derived"
+        );
+    }
+
+    #[test]
+    fn sup_l4_pm_restart_live_prototype_is_gated_narrow_and_rollback_safe() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let pm_restart_start = pm_src
+            .find("fn handle_pm_restart_v1")
+            .expect("PM restart handler");
+        let pm_restart_end = pm_src[pm_restart_start..]
+            .find("fn execute_restart_via_kernel_cap")
+            .map(|offset| pm_restart_start + offset)
+            .unwrap_or(pm_src.len());
+        let pm_restart_handler = &pm_src[pm_restart_start..pm_restart_end];
+        let supervisor_client_start = supervisor_src
+            .find("fn send_pm_restart_v1_via_process_manager")
+            .expect("supervisor PM restart client");
+        let supervisor_client_end = supervisor_src[supervisor_client_start..]
+            .find("fn execute_restart_via_process_manager")
+            .map(|offset| supervisor_client_start + offset)
+            .unwrap_or(supervisor_src.len());
+        let supervisor_client = &supervisor_src[supervisor_client_start..supervisor_client_end];
+        for needle in &[
+            "const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6",
+            "pm_restart_mechanism_enabled: bool",
+            "PM_RESTART_MECHANISM_GATE_OFF",
+            "PM_RESTART_MECHANISM_GATE_ON",
+            "reserve_pm_restart",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_RESERVE_REPLACEMENT_OK",
+            "spawn_sup_l4_replacement",
+            "PM_RESTART_SPAWN_BEGIN",
+            "PM_RESTART_SPAWN_OK",
+            "PM_RESTART_ROLLBACK_BEGIN",
+            "PM_RESTART_ROLLBACK_DONE",
+            "PM_RESTART_REPLY_ACCEPTED",
+            "pm_restart_v1_sup_l4_gate_off_supported_target_still_defers",
+            "pm_restart_v1_sup_l4_gate_on_unsupported_service_defers",
+            "pm_restart_v1_sup_l4_gate_on_supported_service_accepts_with_replacement",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L4 PM source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "pm_restart_acceptance_enabled: bool",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+            "reply.replacement_handle_kind != 0",
+            "reply.replacement_handle_value != 0",
+            "SupervisorPmRestartClientResult::Accepted",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L4 supervisor source must contain {needle}"
+            );
+        }
+        for forbidden in &[
+            ["grant", "_driver_irq"].concat(),
+            ["grant", "_mmio"].concat(),
+            ["grant", "_dma"].concat(),
+            ["perform", "_mmio"].concat(),
+            ["spawn_process", "_with_startup_caps("].concat(),
+        ] {
+            assert!(
+                !pm_restart_handler.contains(forbidden.as_str())
+                    && !supervisor_client.contains(forbidden.as_str()),
+                "SUP-L4 prototype must not add broad/resource behavior {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l4a_pm_restart_supported_image_audit_and_marker_plan_are_documented() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let evidence = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
+        for needle in &[
+            "const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6",
+            "resolve_spawn_load_source(original.image_id)? != SpawnLoadSource::DirectInitrd",
+            "ServiceLifecycleRecord",
+            "lifecycle_table.record(ServiceLifecycleRecord",
+            "pm_service_send_cap: 0",
+            "PM_RESTART_TOKEN_OK",
+            "PM_RESTART_REPLY_ROLLED_BACK",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L4A source audit must find {needle}"
+            );
+        }
+        for needle in &[
+            "SUP-L4A",
+            "direct-initrd image_id == 6",
+            "not broaden restart support",
+            "Full QEMU acceptance remains SUP-L5",
+        ] {
+            assert!(
+                contract.contains(needle) || evidence.contains(needle),
+                "SUP-L4A docs must contain {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l4a_hosted_success_negative_and_rollback_coverage_is_present() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        for needle in &[
+            "pm_restart_v1_sup_l4_gate_off_supported_target_still_defers",
+            "pm_restart_v1_sup_l4_gate_on_unsupported_service_defers",
+            "pm_restart_v1_malformed_truncated_payload_rejected",
+            "pm_restart_v1_untrusted_and_spoofed_supervisor_rejected",
+            "pm_restart_v1_token_target_and_limit_validation_rejects",
+            "pm_restart_v1_sup_l4_token_fingerprint_mismatch_rejected",
+            "pm_restart_v1_sup_l4_duplicate_in_progress_reservation_rolls_back_or_rejects",
+            "pm_restart_v1_sup_l4_gate_on_supported_service_accepts_with_replacement",
+            "pm_restart_v1_sup_l4_rollback_after_reservation_before_spawn",
+            "pm_restart_v1_sup_l4_rollback_spawn_failure",
+            "pm_restart_v1_sup_l4_rollback_after_replacement_before_lifecycle",
+            "pm_restart_v1_sup_l4_rollback_lifecycle_record_failure",
+            "pm_restart_v1_sup_l4_rollback_reply_construction_failure",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L4A PM hosted/source coverage must include {needle}"
+            );
+        }
+        for needle in &[
+            "reply.request_id != client_request.request_id",
+            "reply.target_tid != client_request.target_tid",
+            "reply.replacement_handle_kind != 0",
+            "reply.replacement_handle_value != 0",
+            "accepted_reply_enabled",
+            "SupervisorPmRestartClientResult::ProtocolViolationAccepted",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L4A supervisor coverage/handling must include {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l4a_no_broad_restart_and_resource_guardrails_hold() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let handler_start = pm_src.find("fn handle_pm_restart_v1").expect("handler");
+        let handler_end = pm_src[handler_start..]
+            .find("fn execute_restart_via_kernel_cap")
+            .map(|offset| handler_start + offset)
+            .unwrap_or(pm_src.len());
+        let handler = &pm_src[handler_start..handler_end];
+        assert!(handler.contains("target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID"));
+        assert!(handler.contains("SupL4PmRestartRollbackInjection"));
+        assert!(handler.contains("pm_restart_mechanism_enabled"));
+        assert!(!handler.contains("image_id == 7"));
+        assert!(!handler.contains("image_id == 8"));
+        assert!(!handler.contains("image_id == 9"));
+        for forbidden in &[
+            ["grant", "_driver_irq"].concat(),
+            ["grant", "_mmio"].concat(),
+            ["grant", "_dma"].concat(),
+            ["perform", "_mmio"].concat(),
+            ["spawn_process", "_with_startup_caps("].concat(),
+            ["restart", "_any_lifecycle"].concat(),
+        ] {
+            assert!(
+                !handler.contains(forbidden.as_str())
+                    && !supervisor_src.contains(forbidden.as_str()),
+                "SUP-L4A must not introduce broad/resource behavior {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l5_spawn_image_id_audit_blocks_crash_test_without_safe_direct_initrd_id() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let init_src = include_str!("init/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        for needle in &[
+            "const BOOTSTRAP_IMAGE_ID_MIN: u64 = 1",
+            "const BOOTSTRAP_SERVICE_IMAGE_ID_MAX: u64 = 6",
+            "const VFS_SERVICE_IMAGE_ID_MIN: u64 = 7",
+            "const VFS_SERVICE_IMAGE_ID_MAX: u64 = 12",
+            "resolve_spawn_load_source(image_id: u64)",
+            r#"4 => b"/initramfs/sbin/initramfs_srv""#,
+            r#"5 => b"/initramfs/sbin/devfs_srv""#,
+            r#"6 => b"/initramfs/sbin/vfs_server""#,
+            r#"12 => b"/initramfs/sbin/ext4_srv""#,
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L5 image audit must find existing mapping {needle}"
+            );
+        }
+        for needle in &[
+            "image_id=4",
+            "image_id=5",
+            "image_id=6",
+            "image_id=7",
+            "image_id=8",
+            "image_id=9",
+            "image_id=10",
+            "image_id=11",
+            "image_id=12",
+        ] {
+            assert!(
+                init_src.contains(needle),
+                "SUP-L5 audit must find current init usage {needle}"
+            );
+        }
+        let crash_name = ["crash", "_test", "_srv"].concat();
+        assert!(
+            !init_src.contains(crash_name.as_str()),
+            "SUP-L5A must not stage crash_test_srv in normal init boot"
+        );
+        assert!(pm_src.contains("const CRASH_TEST_SRV_IMAGE_ID: u64 = 13"));
+        assert!(contract.contains("SUP-L5 MissingImageId/MissingRestartSpec audit"));
+        assert!(contract.contains("SUP-L5A safe crash-test image metadata"));
+    }
+
+    #[test]
+    fn sup_l5a_crash_test_image_id_and_restart_metadata_are_test_gated() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let init_src = include_str!("init/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        for needle in &[
+            "const CRASH_TEST_SRV_IMAGE_ID: u64 = 13",
+            r#"const CRASH_TEST_SRV_PATH: &[u8] = b"/initramfs/sbin/crash_test_srv""#,
+            "CRASH_TEST_IMAGE_ID_ASSIGNED image_id={}",
+            "CRASH_TEST_IMAGE_GATED",
+            "supervisor_restart_test_enabled",
+            "crash_test_restart_specs",
+            "CrashTestRestartSpec",
+            "load_source: SpawnLoadSource::Vfs",
+            "register_crash_test_restart_spec_for_tests",
+            "crash_test_restart_spec_for_tid",
+            "pm_vfs_spawn_inline",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L5A PM source must contain gated metadata item {needle}"
+            );
+        }
+        let crash_name = ["crash", "_test", "_srv"].concat();
+        assert!(
+            !init_src.contains(crash_name.as_str()),
+            "SUP-L5A must not add crash_test_srv to normal production boot"
+        );
+        for forbidden in &[
+            ["image_id >= 7", " && restart"].concat(),
+            ["restart", "_any", "_image"].concat(),
+            ["restart", "_any", "_lifecycle"].concat(),
+            ["slot", " = 13"].concat(),
+            ["fabricate", "_cap"].concat(),
+            ["install", "_endpoint", "_cap"].concat(),
+        ] {
+            assert!(
+                !pm_src.contains(forbidden.as_str()),
+                "SUP-L5A must not broaden restart or invent slots/caps: {forbidden}"
+            );
+        }
+        assert!(contract.contains("CRASH_TEST_SRV_IMAGE_ID = 13"));
+        assert!(contract.contains("future SUP-L5B"));
+        assert!(contract.contains("future SUP-L6"));
+    }
+
+    #[test]
+    fn sup_l5_missing_restart_spec_guardrails_preserve_no_slot_cap_invention() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let contract = include_str!("../../../../doc/process-manager-restart-contract.md");
+        let handler_start = pm_src.find("fn handle_pm_restart_v1").expect("handler");
+        let handler_end = pm_src[handler_start..]
+            .find("fn execute_restart_via_kernel_cap")
+            .map(|offset| handler_start + offset)
+            .unwrap_or(pm_src.len());
+        let handler = &pm_src[handler_start..handler_end];
+        assert!(handler.contains("PM_RESTART_MECHANISM_DEFERRED reason=missing_restart_spec"));
+        assert!(handler.contains("target_record.image_id != SUP_L4_SUPPORTED_RESTART_IMAGE_ID"));
+        assert!(!handler.contains("restart_any_image"));
+        assert!(!handler.contains("restart_any_lifecycle"));
+        for forbidden in &[
+            ["hard", "_coded", "_cnode", "_slot"].concat(),
+            ["fabricate", "_cap"].concat(),
+            ["manual", "_cap"].concat(),
+            ["install", "_endpoint", "_cap"].concat(),
+            ["grant", "_driver_irq"].concat(),
+            ["grant", "_mmio"].concat(),
+            ["grant", "_dma"].concat(),
+            ["perform", "_mmio"].concat(),
+        ] {
+            assert!(
+                !handler.contains(forbidden.as_str())
+                    && !supervisor_src.contains(forbidden.as_str()),
+                "SUP-L5 MissingRestartSpec path must not invent slots/caps/resources: {forbidden}"
+            );
+        }
+        for needle in &[
+            "MissingImageId",
+            "MissingRestartSpec",
+            "PROCESS_IPC_OPCODE_COUNT == 16",
+            "SYSCALL_COUNT == 31",
+        ] {
+            assert!(
+                contract.contains(needle),
+                "SUP-L5 docs must preserve fail-closed audit item {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l2_pm_restart_decode_validation_dispatch_is_present_and_bounded() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "PROC_OP_PM_RESTART_V1 =>",
+            "decode_pm_restart_request_v1(msg.as_slice())",
+            "PM_RESTART_V1_DISPATCH_ENTER",
+            "PM_RESTART_V1_DECODE_OK",
+            "PM_RESTART_V1_DECODE_FAIL",
+            "PM_RESTART_SENDER_OK",
+            "PM_RESTART_SENDER_REJECTED",
+            "PM_RESTART_VALIDATE_OK",
+            "PM_RESTART_VALIDATE_REJECTED",
+            "PM_RESTART_MECHANISM_DEFERRED",
+            "PM_RESTART_MECHANISM_GATE_OFF",
+            "PM_RESTART_REPLY_DEFERRED",
+            "PM_RESTART_REPLY_REJECTED",
+            "encode_pm_restart_reply_v1(&reply)",
+            "replacement_handle_kind",
+            "replacement_handle_value",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L2 PM source must contain {needle}"
+            );
+        }
+        assert!(
+            pm_src.contains("PM_RESTART_REPLY_ACCEPTED")
+                && pm_src.contains("pm_restart_mechanism_enabled")
+                && pm_src.contains("SUP_L4_SUPPORTED_RESTART_IMAGE_ID"),
+            "SUP-L4 accepted marker must exist only behind the mechanism gate and supported image guard"
+        );
+    }
+
+    #[test]
+    fn sup_l2_pm_restart_dispatch_has_no_execution_cap_or_resource_calls() {
+        let pm_src = include_str!("process_manager/service.rs");
+        let start = pm_src
+            .find("PROC_OP_PM_RESTART_V1 =>")
+            .expect("dispatch arm");
+        let end = pm_src[start..]
+            .find("PROC_OP_LIFECYCLE_QUERY")
+            .map(|offset| start + offset)
+            .unwrap_or(pm_src.len());
+        let dispatch = &pm_src[start..end];
+        for forbidden in &[
+            "spawn_process(",
+            "spawn_process_with_startup_caps(",
+            "execute_restart_via_kernel_cap(",
+            "record_restart_token(",
+            "grant_driver_irq",
+            "alloc_anonymous_memory_object",
+            "mint",
+            "revoke",
+        ] {
+            assert!(
+                !dispatch.contains(forbidden),
+                "SUP-L2 dispatch must not contain {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l5b_crash_test_binary_and_staging_are_test_gated() {
+        let cargo_toml = include_str!("../../Cargo.toml");
+        let crash_srv = include_str!("../bin/crash_test_srv.rs");
+        let common_script = include_str!("../../../../scripts/lib/build-qemu-artifacts-common.sh");
+        let init_src = include_str!("init/service.rs");
+
+        assert!(cargo_toml.contains("name = \"crash_test_srv\""));
+        for marker in &[
+            "CRASH_TEST_SRV_ENTRY",
+            "CRASH_TEST_SRV_READY",
+            "CRASH_TEST_SRV_DELAY_BEGIN",
+            "CRASH_TEST_SRV_DELAY_DONE",
+            "CRASH_TEST_SRV_FAULT_NOW",
+            "CRASH_TEST_DELAY_YIELDS",
+        ] {
+            assert!(
+                crash_srv.contains(marker),
+                "crash_test_srv must contain {marker}"
+            );
+        }
+        assert!(crash_srv.contains("startup_context()"));
+        assert!(crash_srv.contains("yield_now()"));
+        assert!(crash_srv.contains("write_volatile"));
+        assert!(common_script.contains("common_supervisor_restart_test_enabled"));
+        assert!(common_script.contains("YARM_SUPERVISOR_RESTART_TEST"));
+        assert!(common_script.contains("/sbin/crash_test_srv"));
+        assert!(common_script.contains("CRASH_TEST_IMAGE_ID_ASSIGNED image_id=13"));
+        assert!(common_script.contains("CRASH_TEST_IMAGE_GATED"));
+        assert!(
+            !init_src.contains("crash_test_srv"),
+            "normal service-core init must not stage or start crash_test_srv"
+        );
+    }
+
+    #[test]
+    fn sup_l5b_image_id_13_uses_gated_existing_vfs_spawn_path_only() {
+        let pm_src = include_str!("process_manager/service.rs");
+        for needle in &[
+            "CRASH_TEST_SRV_IMAGE_ID: u64 = 13",
+            "CRASH_TEST_SRV_PATH: &[u8] = b\"/initramfs/sbin/crash_test_srv\"",
+            "resolve_spawn_load_source_with_restart_test",
+            "supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID",
+            "pm_vfs_spawn_inline(",
+            "pm_image_cpio_name_for_gate",
+            "Some(b\"sbin/crash_test_srv\")",
+            "SpawnLoadSource::Vfs",
+        ] {
+            assert!(pm_src.contains(needle), "PM source must contain {needle}");
+        }
+        assert!(pm_src.contains("VFS_SERVICE_IMAGE_ID_MAX: u64 = 12"));
+        assert!(pm_src.contains("resolve_spawn_load_source(CRASH_TEST_SRV_IMAGE_ID)"));
+        assert!(
+            !pm_src.contains("image_id >= 7") && !pm_src.contains("7..=13"),
+            "SUP-L5B must not broaden VFS-backed restart/spawn ranges generically"
+        );
+        for forbidden in &["slot = 13", "slot=13", "install endpoint cap", "fabricate"] {
+            assert!(
+                !pm_src.contains(forbidden),
+                "SUP-L5B must not invent slots/caps: {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn sup_l6_crash_restart_smoke_script_has_exact_oracle_and_fails_closed() {
+        let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
+        let common_script = include_str!("../../../../scripts/lib/build-qemu-artifacts-common.sh");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let init_src = include_str!("init/service.rs");
+
+        for needle in &[
+            "YARM_SUPERVISOR_RESTART_TEST=1",
+            "SUPERVISOR_RESTART_TEST=1",
+            "yarm.supervisor_restart_test=1",
+            "require_count \"CRASH_TEST_SRV_ENTRY\" 4",
+            "require_count \"CRASH_TEST_SRV_READY\" 4",
+            "CRASH_TEST_SRV_EXIT_NOW",
+            "CRASH_TEST_SRV_FAULT_NOW",
+            "require_count \"PM_RESTART_REPLY_ACCEPTED\" 3",
+            "require_count \"SUPERVISOR_PM_RESTART_STATE_UPDATED\" 3",
+            "require_count \"SUPERVISOR_RESTART_LIMIT_EXCEEDED\" 1",
+            "require_count \"SUPERVISOR_SERVICE_DEGRADED_FINAL\" 1",
+            "accepted\" -ge 4",
+            "state_updates\" -ge 4",
+            "fatal_patterns=",
+            "DOUBLE_FAULT",
+            "DATA_ABORT",
+            "KERNEL_FAULT",
+            "MissingRight",
+            "marker snapshot",
+        ] {
+            assert!(
+                smoke.contains(needle),
+                "SUP-L6 smoke script must contain {needle}"
+            );
+        }
+        for marker in &[
+            "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "PM_RESTART_V1_DECODE_OK",
+            "PM_RESTART_SENDER_OK",
+            "PM_RESTART_VALIDATE_OK",
+            "PM_RESTART_ACCOUNTING_BEGIN",
+            "PM_RESTART_RESERVE_REPLACEMENT_OK",
+            "PM_RESTART_SPAWN_BEGIN",
+            "PM_RESTART_SPAWN_OK",
+            "PM_RESTART_REPLY_ACCEPTED",
+        ] {
+            assert!(smoke.contains(marker), "SUP-L6 smoke must require {marker}");
+        }
+        assert!(
+            common_script
+                .contains("supervisor restart test disabled; not staging /sbin/crash_test_srv")
+        );
+        assert!(
+            pm_src
+                .contains("supervisor_restart_test_enabled && image_id == CRASH_TEST_SRV_IMAGE_ID")
+        );
+        assert!(pm_src.contains("Some(b\"sbin/crash_test_srv\")"));
+        assert!(pm_src.contains("VFS_SERVICE_IMAGE_ID_MAX: u64 = 12"));
+        assert!(pm_src.contains("6 => Some(b\"/initramfs/sbin/vfs_server\")"));
+        assert!(
+            !pm_src.contains("image_id >= 7") && !pm_src.contains("7..=13"),
+            "SUP-L6 must not broaden restart/spawn image ranges"
+        );
+        assert!(
+            !init_src.contains("crash_test_srv"),
+            "normal init/service-core path must remain free of crash_test_srv"
+        );
+        assert!(supervisor_src.contains("send_pm_restart_v1_via_process_manager"));
+        assert!(
+            supervisor_src.contains("ipc_call(req_cap, rep_cap, &msg)"),
+            "SUP-L6N restart-token lookup must use the existing PM request/reply-cap call path"
+        );
+        assert!(
+            supervisor_src.contains("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}")
+                && supervisor_src.contains("ipc_recv_v2(rep_cap)"),
+            "SUP-L6O token lookup must wait for and decode the PM reply before reporting missing-token"
+        );
+        assert!(
+            !supervisor_src.contains("spawn_process_with_startup_caps(")
+                && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),
+            "supervisor must not execute restart locally"
+        );
+    }
+
+    #[test]
+    fn sup_l6b_runtime_handoff_markers_and_guardrails_are_wired() {
+        let init_src = include_str!("init/service.rs");
+        let pm_src = include_str!("process_manager/service.rs");
+        let supervisor_src = include_str!("supervisor/service.rs");
+        let user_rt_src = include_str!("../../../yarm-user-rt/src/lib.rs");
+        let initramfs_archive_src =
+            include_str!("../../../yarm-fs-servers/src/fs/initramfs/archive.rs");
+        let initramfs_service_src =
+            include_str!("../../../yarm-fs-servers/src/fs/initramfs/service.rs");
+        let x86_boot_src = include_str!("../../../../src/arch/x86_64/boot.rs");
+        let aarch64_boot_src = include_str!("../../../../src/arch/aarch64/boot.rs");
+        let riscv64_boot_src = include_str!("../../../../src/arch/riscv64/boot.rs");
+        let kernel_fault_src = include_str!("../../../../src/kernel/boot/fault_state.rs");
+        let kernel_restart_src = include_str!("../../../../src/kernel/boot/restart_state.rs");
+        let kernel_syscall_ipc_src = include_str!("../../../../src/kernel/syscall/ipc.rs");
+        let smoke = include_str!("../../../../scripts/qemu-supervisor-crash-restart-smoke.sh");
+
+        for needle in &[
+            "option_env!(\"YARM_SUPERVISOR_RESTART_TEST\") == Some(\"1\")",
+            "INIT_SUPERVISOR_RESTART_TEST_GATE_ON",
+            "INIT_CRASH_TEST_SPAWN_REQUEST image_id=13",
+            "spawn_v5_cap(pm_send, pm_recv, 13, [0, 0, 0, 0], 1)",
+            "INIT_STARTUP_SLOT_SUPERVISOR_CONTROL_SEND raw={}",
+            "STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_PRESENT cap={}",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=zero",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=startup-slot-empty",
+            "INIT_SUPERVISOR_CONTROL_SEND_CAP_MISSING reason=decode",
+            "INIT_CRASH_TEST_REGISTER_BEGIN tid={}",
+            "INIT_CRASH_TEST_REGISTER_META opcode={} flags={} len={}",
+            "INIT_CRASH_TEST_REGISTER_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
+            "INIT_CRASH_TEST_REGISTER_SEND cap={} tid={}",
+            "INIT_CRASH_TEST_REGISTER_FAIL tid={} reason=no-supervisor-send-cap",
+            "INIT_CRASH_TEST_REGISTER_OK tid={}",
+            "RegisterDriverRequest",
+        ] {
+            assert!(
+                init_src.contains(needle),
+                "init source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "PM_SUPERVISOR_RESTART_TEST_GATE_ON",
+            "PM_CRASH_TEST_SPAWN_REQUEST image_id={}",
+            "PM_CRASH_TEST_SPAWN_OK tid={}",
+            "PM_CRASH_TEST_LIFECYCLE_RECORDED tid={} image_id={}",
+            "PM_CRASH_TEST_RESTART_TOKEN_RECORDED tid={} fingerprint={}",
+            "PM_VFS_SPAWN_LOAD_REPLY image_id={} status=ok len={}",
+            "PM_VFS_SPAWN_LOAD_FIRST4 image_id={} bytes=[{:02x} {:02x} {:02x} {:02x}]",
+            "PM_VFS_SPAWN_ELF_MAGIC_OK image_id={}",
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=reply_decode",
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=mo_create",
+            "PM_VFS_SPAWN_FAIL_DETAIL image_id={} site=spawn_from_mo",
+            "PM_SPAWN_FROM_MO_ENTER image_id=13",
+            "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=1 reason=restart-test-gate",
+            "PM_SPAWN_FROM_MO_POLICY image_id=13 allowed=0 reason=gate-off",
+            "PM_SPAWN_FROM_MO_FAIL_DETAIL image_id=13 site=policy",
+            "PM_SPAWN_FROM_MO_TABLE_STATS image_id=13 table=pm_lifecycle used={} cap={}",
+            "PM_RESTART_TOKEN_QUERY_RECV tid={} sender={}",
+            "PM_RESTART_TOKEN_QUERY_REPLY tid={} status={} fingerprint={}",
+            "CRASH_TEST_KERNEL_SPAWN_POLICY_IMAGE_ID: u64 = 12",
+            "crash_test_restart_token_for_tid",
+            "target_record.image_id == CRASH_TEST_SRV_IMAGE_ID",
+            "pm_vfs_spawn_inline(",
+        ] {
+            assert!(pm_src.contains(needle), "PM source must contain {needle}");
+        }
+        for needle in &[
+            "INITRAMFS_CRASH_TEST_SRV_PATH",
+            "b\"sbin/crash_test_srv\" => INITRAMFS_CRASH_TEST_SRV_PATH",
+            "INITRAMFS_LOOKUP_BEGIN path={}",
+            "INITRAMFS_LOOKUP_HIT path=sbin/crash_test_srv size={} offset={}",
+            "INITRAMFS_READ_DONE path=sbin/crash_test_srv bytes={} first4=[{:02x} {:02x} {:02x} {:02x}]",
+            "INITRAMFS_READ_ELF_MAGIC_OK path=sbin/crash_test_srv",
+        ] {
+            assert!(
+                initramfs_archive_src.contains(needle) || initramfs_service_src.contains(needle),
+                "initramfs source must contain {needle}"
+            );
+        }
+        assert!(
+            initramfs_service_src
+                .contains("INITRAMFS_CPIO_ENTRY_COUNT count={} cap={} truncated={}"),
+            "initramfs runtime must log CPIO entry count/cap/truncation"
+        );
+        assert!(user_rt_src.contains("STARTUP_SLOT_SUPERVISOR_CONTROL_SEND_EP: usize = 4"));
+        assert!(user_rt_src.contains("supervisor_control_send_ep = cap_from_slot"));
+        assert!(user_rt_src.contains("startup_arg_slot(index: usize)"));
+        for arch_boot_src in &[x86_boot_src, aarch64_boot_src, riscv64_boot_src] {
+            assert!(
+                arch_boot_src.contains("sup_args[4] = c.0"),
+                "supervisor still receives the existing control SEND startup slot"
+            );
+            assert!(
+                arch_boot_src.contains("sup_ctrl_send_init")
+                    && arch_boot_src.contains("RING3_INIT_SERVER_TID")
+                    && arch_boot_src.contains("CapRights::SEND")
+                    && arch_boot_src.contains("init_args[4] = c.0"),
+                "SUP-L6H must provision init slot 4 from an init-local SEND cap"
+            );
+        }
+        for needle in &[
+            "SUPERVISOR_RESTART_TEST_GATE_ON",
+            "SUPERVISOR_CONTROL_RECV sender={} opcode={} len={}",
+            "SUPERVISOR_CONTROL_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
+            "SUPERVISOR_CONTROL_SENDER_OK sender={}",
+            "SUPERVISOR_CONTROL_DISPATCH opcode={}",
+            "SUPERVISOR_CONTROL_WRONG_OBJECT site=dispatch opcode={} reason=unknown-opcode",
+            "SUPERVISOR_CRASH_TEST_REGISTER_BEGIN tid={}",
+            "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
+            "SUPERVISOR_CRASH_TEST_REGISTER_FAIL tid={} reason={:?}",
+            "SUPERVISOR_CRASH_TEST_POLICY max_restarts=3",
+            "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY tid={}",
+            "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
+            "SUPERVISOR_FAULT_REPORT_RECV claimed_tid={} sender_tid={}",
+            "SUPERVISOR_FAULT_SENDER_OK tid={} sender={}",
+            "SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}",
+            "SUPERVISOR_FAULT_REPORT_REJECTED tid={} sender={} reason={:?}",
+            "SUPERVISOR_POST_FAULT_ACCEPT_BEGIN tid={}",
+            "SUPERVISOR_POST_FAULT_ACCEPT_CALL_HANDLE_EXIT tid={}",
+            "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=",
+            "SUPERVISOR_RECORD_LOOKUP tid={} result=found",
+            "SUPERVISOR_RECORD_LOOKUP tid={} result=missing",
+            "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
+            "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source={}",
+            "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=0 source=missing",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_BEGIN tid={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_REPLY tid={} status={} len={} fingerprint={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_DECODE_OK tid={}",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_DECODE_FAIL tid={} reason=payload",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=",
+            "SUPERVISOR_HANDLE_TASK_EXIT_BEGIN tid={}",
+            "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=",
+            "SUPERVISOR_HANDLE_TASK_EXIT_ERR tid={} err={:?}",
+            "SUPERVISOR_RESTART_SCHEDULE_FAIL tid={} reason={:?}",
+            "SUPERVISOR_RESTART_SCHEDULED attempt={} max={}",
+            "SUPERVISOR_RESTART_DUE tid={} attempt={}",
+            "SUPERVISOR_RESTART_LIMIT_EXCEEDED attempts={}",
+            "SUPERVISOR_SERVICE_DEGRADED_FINAL",
+            "record.tid = replacement_handle_value",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "supervisor source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "TASK_FAULT_CURRENT tid={} fault_addr=0x{:x} access={:?}",
+            "TASK_FAULT_REPORT_BEGIN tid={}",
+            "TASK_FAULT_REPORT_TARGET tid={} endpoint={} generation={}",
+            "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE endpoint={} waiters={} queued={}",
+            "TASK_FAULT_REPORT_SENDER tid={} sender_tid=0 opcode={} len={}",
+            "TASK_FAULT_REPORT_ENQUEUE_BEGIN tid={} endpoint={} generation={}",
+            "TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND endpoint={} waiter_tid={}",
+            "TASK_FAULT_REPORT_BLOCKED_COMPLETE_BEGIN endpoint={} waiter_tid={}",
+            "TASK_FAULT_REPORT_BLOCKED_COMPLETE_OK endpoint={} waiter_tid={}",
+            "TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL endpoint={} waiter_tid={} reason={:?}",
+            "TASK_FAULT_REPORT_WAKE_RUNNABLE endpoint={} waiter_tid={}",
+            "complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg)",
+            "ipc_clear_plain_receiver_waiter_only(endpoint_idx, waiter_tid)",
+            "apply_split_receiver_wake_plan(waiter_tid)",
+            "TASK_FAULT_REPORT_ENQUEUE_OK tid={} endpoint={} queued={} woke={}",
+            "TASK_FAULT_REPORT_QUEUE_STATE_AFTER endpoint={} waiters={} queued={}",
+            "TASK_FAULT_REPORT_SENT tid={} target={} endpoint={} generation={}",
+            "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason={:?}",
+            "TASK_FAULT_REPORT_SENT tid={} target={}",
+            "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
+            "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
+            ".fault_handler_endpoint",
+            ".supervisor_endpoint",
+        ] {
+            assert!(
+                kernel_fault_src.contains(needle),
+                "kernel fault source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "TASK_EXITED_REPORT_BEGIN tid={}",
+            "TASK_EXITED_REPORT_SENT tid={} target=supervisor",
+            "TASK_EXITED_REPORT_FAIL tid={} reason=no-supervisor-endpoint",
+        ] {
+            assert!(
+                kernel_restart_src.contains(needle),
+                "kernel restart source must contain {needle}"
+            );
+        }
+        for needle in &[
+            "SUPERVISOR_FAULT_RECV_CAP cap={} endpoint={} generation={}",
+            "faults.fault_handler_endpoint == Some(index) || faults.supervisor_endpoint == Some(index)",
+            "recv_tid == 2 && is_supervisor_fault_endpoint",
+        ] {
+            assert!(
+                kernel_syscall_ipc_src.contains(needle),
+                "kernel syscall IPC source must contain {needle}"
+            );
+        }
+        assert!(smoke.contains("require_count \"CRASH_TEST_SRV_ENTRY\" 4"));
+        assert!(pm_src.contains("VFS_SERVICE_IMAGE_ID_MAX: u64 = 12"));
+        assert!(pm_src.contains("6 => Some(b\"/initramfs/sbin/vfs_server\")"));
+        assert!(
+            !pm_src.contains("image_id >= 7") && !pm_src.contains("7..=13"),
+            "SUP-L6B must not broaden VFS ranges"
+        );
+        for forbidden in &[
+            "restart_any_image",
+            "restart_any_lifecycle",
+            "slot = 13",
+            "slot=13",
+            "fabricate",
+        ] {
+            assert!(
+                !pm_src.contains(forbidden) && !init_src.contains(forbidden),
+                "SUP-L6B must not introduce {forbidden}"
+            );
+        }
+        assert!(
+            !supervisor_src.contains("spawn_process_with_startup_caps(")
+                && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),
+            "supervisor must not execute restart locally"
+        );
+    }
+
+    #[test]
     fn sup10_source_guardrails_keep_live_enablement_absent() {
         let evidence_doc = include_str!("../../../../doc/pm-restart-live-readiness-evidence.md");
         let abi_src = include_str!("../../../yarm-ipc-abi/src/process_abi.rs");
         let syscall_src = include_str!("../../../../src/kernel/syscall.rs");
         let pm_src = include_str!("process_manager/service.rs");
         let supervisor_src = include_str!("supervisor/service.rs");
-        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 14);
+        assert_eq!(abi_src.matches("pub const PROC_OP_").count(), 16);
         assert!(
-            !abi_src.contains("PROC_OP_PM_RESTART_V1")
-                && !abi_src.contains("PROC_OP_PM_RESTART_REPLY_V1")
+            abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
+                && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16")
         );
         assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"));
         assert!(
-            !pm_src.contains("PROC_OP_PM_RESTART_V1")
-                && !supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
-            "SUP-10 must not add PM dispatch or supervisor send"
+            pm_src.contains("PROC_OP_PM_RESTART_V1")
+                && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),
+            "SUP-L3 permits PM dispatch and supervisor send but no restart success"
         );
         for future_marker in &[
             "SUPERVISOR_PM_RESTART_SEND_BEGIN",
@@ -2124,9 +2974,13 @@ mod tests {
                 evidence_doc.contains(future_marker),
                 "future marker must be documented: {future_marker}"
             );
+            let accepted_is_now_gated = *future_marker == "PM_RESTART_REPLY_ACCEPTED"
+                || *future_marker == "SUPERVISOR_PM_RESTART_STATE_UPDATED";
             assert!(
-                !pm_src.contains(future_marker) && !supervisor_src.contains(future_marker),
-                "future marker must not be emitted by current runtime: {future_marker}"
+                !accepted_is_now_gated
+                    || (pm_src.contains("pm_restart_mechanism_enabled")
+                        && supervisor_src.contains("pm_restart_acceptance_enabled")),
+                "SUP-L4 accepted/state markers must be gate-protected: {future_marker}"
             );
         }
         assert!(supervisor_src.contains("SUPERVISOR_RESTART_EXEC_DEFERRED_NO_PM_CLIENT"));

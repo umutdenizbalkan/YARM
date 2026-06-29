@@ -64,6 +64,28 @@ fn validate_transfer_cap(kernel: &KernelState, cap: CapId) -> Result<(), Syscall
     Ok(())
 }
 
+fn log_supervisor_fault_recv_cap_if_applicable(
+    kernel: &KernelState,
+    recv_tid: u64,
+    cap: CapId,
+    endpoint: CapObject,
+) {
+    let CapObject::Endpoint { index, generation } = endpoint else {
+        return;
+    };
+    let is_supervisor_fault_endpoint = kernel.with_fault_state(|faults| {
+        faults.fault_handler_endpoint == Some(index) || faults.supervisor_endpoint == Some(index)
+    });
+    if recv_tid == 2 && is_supervisor_fault_endpoint {
+        crate::yarm_log!(
+            "SUPERVISOR_FAULT_RECV_CAP cap={} endpoint={} generation={}",
+            cap.0,
+            index,
+            generation
+        );
+    }
+}
+
 fn validate_shared_mem_transfer_rights(
     capability: &crate::kernel::capabilities::Capability,
 ) -> Result<(), SyscallError> {
@@ -558,6 +580,7 @@ pub(super) fn handle_ipc_recv(
         cap.0,
         endpoint
     );
+    log_supervisor_fault_recv_cap_if_applicable(kernel, recv_tid, cap, endpoint);
     // Stage 4C/4D/4J: attempt immediate split recv; fallback to full ipc_recv path.
     let (received, split_scheduler_plan) =
         if let Some((msg, plan)) = try_endpoint_split_recv(kernel, endpoint)? {
@@ -661,6 +684,7 @@ pub(super) fn handle_ipc_recv_timeout(
         cap.0,
         endpoint
     );
+    log_supervisor_fault_recv_cap_if_applicable(kernel, recv_tid, cap, endpoint);
     let timeout_ticks = frame.arg(SYSCALL_ARG_INLINE_PAYLOAD0) as u64;
     let user_ptr = frame.arg(SYSCALL_ARG_PTR);
     let user_len = frame.arg(SYSCALL_ARG_LEN);

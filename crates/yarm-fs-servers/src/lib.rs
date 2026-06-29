@@ -850,7 +850,8 @@ mod stage88_tests {
 mod stage89_tests {
     use crate::fs::common::vfs_ipc::VfsBackend;
     use crate::fs::initramfs::archive::{
-        INITRAMFS_EXT4_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH, InitramfsBackend,
+        INITRAMFS_CRASH_TEST_SRV_PATH, INITRAMFS_EXT4_SRV_PATH, INITRAMFS_RAMFS_SRV_PATH,
+        InitramfsBackend,
     };
 
     // ── Root-cause fix: ext4_srv path is now registered in the inode table ──
@@ -874,12 +875,12 @@ mod stage89_tests {
     }
 
     #[test]
-    fn stage89_initramfs_max_inodes_is_14() {
-        // Validates that the inode table was bumped to accommodate ext4_srv.
+    fn stage89_initramfs_max_inodes_is_15() {
+        // Validates that the inode table covers ext4_srv plus the gated crash-test path.
         let src = include_str!("fs/initramfs/archive.rs");
         assert!(
-            src.contains("const MAX_INITRAMFS_INODES: usize = 14;"),
-            "MAX_INITRAMFS_INODES must be 14 after adding ext4_srv"
+            src.contains("const MAX_INITRAMFS_INODES: usize = 15;"),
+            "MAX_INITRAMFS_INODES must be 15 after adding the gated crash-test path"
         );
     }
 
@@ -894,6 +895,14 @@ mod stage89_tests {
         assert!(
             src.contains("b\"sbin/ext4_srv\" => INITRAMFS_EXT4_SRV_PATH"),
             "from_cpio_newc match must include ext4_srv arm"
+        );
+    }
+
+    #[test]
+    fn stage89_initramfs_crash_test_srv_path_constant_defined() {
+        assert_eq!(
+            INITRAMFS_CRASH_TEST_SRV_PATH,
+            b"/initramfs/sbin/crash_test_srv"
         );
     }
 
@@ -1589,18 +1598,17 @@ mod stage91_tests {
 
     #[test]
     fn stage91_initramfs_max_inodes_covers_all_sbin_servers() {
-        // MAX_INITRAMFS_INODES = 14 must cover all registered inodes including
-        // the six sbin servers (driver_manager, blkcache_srv, virtio_blk_srv,
-        // fat_srv, ramfs_srv, ext4_srv).
+        // MAX_INITRAMFS_INODES = 15 must cover all registered inodes including
+        // the normal sbin servers and the gated crash-test server path.
         let src = include_str!("fs/initramfs/archive.rs");
         assert!(
             src.contains("MAX_INITRAMFS_INODES"),
             "archive.rs must define MAX_INITRAMFS_INODES"
         );
-        // Verify 14 is the current constant value.
+        // Verify 15 is the current constant value.
         assert!(
-            src.contains("const MAX_INITRAMFS_INODES: usize = 14"),
-            "MAX_INITRAMFS_INODES must equal 14 (6 core + 6 sbin servers + 2 others)"
+            src.contains("const MAX_INITRAMFS_INODES: usize = 15"),
+            "MAX_INITRAMFS_INODES must equal 15 after reserving crash_test_srv"
         );
     }
 

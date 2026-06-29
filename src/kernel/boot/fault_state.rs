@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-use super::{FaultBookkeepingMode, KernelError, KernelState, TrapHandleError};
+use super::{FaultBookkeepingMode, KernelError, KernelState, TrapHandleError, kernel_ref};
 use crate::arch::hal::Hal;
-use crate::kernel::ipc::Message;
-use crate::kernel::syscall::{Syscall, SyscallError, dispatch as dispatch_syscall};
+use crate::kernel::ipc::{Message, ThreadId};
+use crate::kernel::syscall::{
+    Syscall, SyscallError, complete_blocked_recv_for_waiter, dispatch as dispatch_syscall,
+};
 use crate::kernel::task::FaultPolicy;
 use crate::kernel::task::TaskStatus;
 use crate::kernel::trap::{FaultAccess, FaultInfo, Trap, TrapEvent};
@@ -102,6 +104,29 @@ impl SupervisorFaultReportWire {
 }
 
 impl KernelState {
+    fn endpoint_fault_report_waiter(&self, endpoint_idx: usize) -> Option<ThreadId> {
+        self.with_ipc_state(|ipc| ipc.endpoint_waiters.get(endpoint_idx).copied().flatten())
+    }
+
+    fn endpoint_fault_report_stats(&self, endpoint_idx: usize) -> Option<(u64, usize, usize)> {
+        self.with_ipc_state(|ipc| {
+            let generation = *ipc.endpoint_generations.get(endpoint_idx)?;
+            let queued = ipc
+                .endpoints
+                .get(endpoint_idx)?
+                .as_ref()
+                .map(|endpoint| kernel_ref(endpoint).queued())?;
+            let waiters = usize::from(
+                ipc.endpoint_waiters
+                    .get(endpoint_idx)
+                    .copied()
+                    .flatten()
+                    .is_some(),
+            );
+            Some((generation, waiters, queued))
+        })
+    }
+
     fn fault_addr_in_demand_backed_region(&self, tid: u64, fault_addr: u64) -> bool {
         if let Some((base, end)) = self.task_brk_bounds(tid)
             && fault_addr >= base as u64
@@ -310,10 +335,46 @@ impl KernelState {
     }
 
     fn emit_fault_report_for_fault(&mut self, faulted_tid: u64, fault: FaultInfo) {
-        let endpoint_idx = self.with_fault_state(|faults| faults.fault_handler_endpoint);
-        let Some(endpoint_idx) = endpoint_idx else {
+        crate::yarm_log!("TASK_FAULT_REPORT_BEGIN tid={}", faulted_tid);
+        let route = self.with_fault_state(|faults| {
+            faults
+                .fault_handler_endpoint
+                .map(|endpoint_idx| (endpoint_idx, "fault-handler"))
+                .or_else(|| {
+                    faults
+                        .supervisor_endpoint
+                        .map(|endpoint_idx| (endpoint_idx, "supervisor"))
+                })
+        });
+        let Some((endpoint_idx, target)) = route else {
+            crate::yarm_log!(
+                "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
+                faulted_tid
+            );
             return;
         };
+        let Some((generation, waiters_before, queued_before)) =
+            self.endpoint_fault_report_stats(endpoint_idx)
+        else {
+            crate::yarm_log!(
+                "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason=missing-endpoint",
+                faulted_tid,
+                endpoint_idx
+            );
+            return;
+        };
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_TARGET tid={} endpoint={} generation={}",
+            faulted_tid,
+            endpoint_idx,
+            generation
+        );
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_QUEUE_STATE_BEFORE endpoint={} waiters={} queued={}",
+            endpoint_idx,
+            waiters_before,
+            queued_before
+        );
 
         let payload = SupervisorFaultReportWire {
             faulting_tid: faulted_tid,
@@ -324,12 +385,153 @@ impl KernelState {
 
         let msg = match Message::new(0, &payload) {
             Ok(msg) => msg,
-            Err(_) => return,
+            Err(_) => {
+                crate::yarm_log!("TASK_FAULT_REPORT_FAIL tid={} reason=message", faulted_tid);
+                return;
+            }
         };
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_SENDER tid={} sender_tid=0 opcode={} len={}",
+            faulted_tid,
+            msg.opcode,
+            msg.len
+        );
+        if let Some(waiter_tid) = self.endpoint_fault_report_waiter(endpoint_idx) {
+            crate::yarm_log!(
+                "TASK_FAULT_REPORT_BLOCKED_WAITER_FOUND endpoint={} waiter_tid={}",
+                endpoint_idx,
+                waiter_tid.0
+            );
+            if self.is_task_recv_v2_blocked(waiter_tid.0) {
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_BLOCKED_COMPLETE_BEGIN endpoint={} waiter_tid={}",
+                    endpoint_idx,
+                    waiter_tid.0
+                );
+                match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
+                    Ok(()) => {
+                        self.ipc_clear_plain_receiver_waiter_only(endpoint_idx, waiter_tid);
+                        crate::yarm_log!(
+                            "TASK_FAULT_REPORT_WAKE_RUNNABLE endpoint={} waiter_tid={}",
+                            endpoint_idx,
+                            waiter_tid.0
+                        );
+                        match self.apply_split_receiver_wake_plan(waiter_tid) {
+                            Ok(()) => {
+                                let (generation_after, waiters_after, queued_after) = self
+                                    .endpoint_fault_report_stats(endpoint_idx)
+                                    .unwrap_or((generation, usize::MAX, usize::MAX));
+                                crate::yarm_log!(
+                                    "TASK_FAULT_REPORT_QUEUE_STATE_AFTER endpoint={} waiters={} queued={}",
+                                    endpoint_idx,
+                                    waiters_after,
+                                    queued_after
+                                );
+                                crate::yarm_log!(
+                                    "TASK_FAULT_REPORT_BLOCKED_COMPLETE_OK endpoint={} waiter_tid={}",
+                                    endpoint_idx,
+                                    waiter_tid.0
+                                );
+                                crate::yarm_log!(
+                                    "TASK_FAULT_REPORT_SENT tid={} target={}",
+                                    faulted_tid,
+                                    target
+                                );
+                                crate::yarm_log!(
+                                    "TASK_FAULT_REPORT_SENT tid={} target={} endpoint={} generation={}",
+                                    faulted_tid,
+                                    target,
+                                    endpoint_idx,
+                                    generation_after
+                                );
+                            }
+                            Err(err) => {
+                                crate::yarm_log!(
+                                    "TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL endpoint={} waiter_tid={} reason={:?}",
+                                    endpoint_idx,
+                                    waiter_tid.0,
+                                    err
+                                );
+                                crate::yarm_log!(
+                                    "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
+                                    faulted_tid,
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        crate::yarm_log!(
+                            "TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL endpoint={} waiter_tid={} reason={:?}",
+                            endpoint_idx,
+                            waiter_tid.0,
+                            err
+                        );
+                        crate::yarm_log!(
+                            "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
+                            faulted_tid,
+                            err
+                        );
+                    }
+                }
+                return;
+            }
+        }
+
+        crate::yarm_log!(
+            "TASK_FAULT_REPORT_ENQUEUE_BEGIN tid={} endpoint={} generation={}",
+            faulted_tid,
+            endpoint_idx,
+            generation
+        );
 
         // send_message_to_endpoint_and_wake enqueues under ipc_state_lock
         // (rank 3) and wakes outside the lock (task lock rank 2 < ipc rank 3).
-        let _ = self.send_message_to_endpoint_and_wake(endpoint_idx, msg);
+        match self.send_message_to_endpoint_and_wake(endpoint_idx, msg) {
+            Ok(()) => {
+                let (generation_after, waiters_after, queued_after) = self
+                    .endpoint_fault_report_stats(endpoint_idx)
+                    .unwrap_or((generation, usize::MAX, usize::MAX));
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_QUEUE_STATE_AFTER endpoint={} waiters={} queued={}",
+                    endpoint_idx,
+                    waiters_after,
+                    queued_after
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_ENQUEUE_OK tid={} endpoint={} queued={} woke={}",
+                    faulted_tid,
+                    endpoint_idx,
+                    queued_after,
+                    usize::from(waiters_before > 0)
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_SENT tid={} target={}",
+                    faulted_tid,
+                    target
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_SENT tid={} target={} endpoint={} generation={}",
+                    faulted_tid,
+                    target,
+                    endpoint_idx,
+                    generation_after
+                );
+            }
+            Err(err) => {
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason={:?}",
+                    faulted_tid,
+                    endpoint_idx,
+                    err
+                );
+                crate::yarm_log!(
+                    "TASK_FAULT_REPORT_FAIL tid={} reason={:?}",
+                    faulted_tid,
+                    err
+                );
+            }
+        }
     }
 
     fn emit_fault_report(&mut self, faulted_tid: u64) {
