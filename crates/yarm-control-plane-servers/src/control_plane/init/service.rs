@@ -1274,12 +1274,25 @@ fn run_ipc_recv_proof_sender_wake(
     // Defensive clamp so a misconfigured capacity can never loop pathologically.
     const FILL_CAP_MAX: usize = 256;
     const PREDRAIN_MAX: usize = 512;
-    // Blocking deadline for the parent to wait on E2 coordination signal: the
-    // kernel pushes the signal as soon as the child becomes a waiter, so this
-    // just needs to be long enough for the child to be scheduled and execute its
-    // blocking send.  Must be < SENDER_SEND_TIMEOUT_TICKS so we bail before
-    // the child's own timeout expires.
-    const E2_WAIT_DEADLINE_TICKS: u64 = 500_000_000;
+    // Stage 163N Task A: E2 coordination uses a bounded poll-then-yield loop
+    // instead of a single blocking recv.  The kernel pushes the signal from
+    // within `enqueue_sender_waiter` while holding `ipc_state_lock`, using
+    // `endpoint.send(msg)` directly — it does NOT wake blocked receivers
+    // (would require acquiring the scheduler lock while holding the IPC lock,
+    // violating lock-order rank 1 < rank 3/4).  A single blocking recv would
+    // therefore hang until the deadline; polling with short blocking yields
+    // lets the parent give the child CPU time while Phase 1 of each
+    // `ipc_recv_with_deadline` check immediately returns the queued signal
+    // once the kernel has pushed it.
+    //
+    // E2_POLL_YIELD_TICKS: each iteration blocks for this many ticks so the
+    // scheduler can run the child. Must be small relative to SENDER_SEND_TIMEOUT_TICKS
+    // but large enough to give the child a meaningful scheduling slot.
+    const E2_POLL_YIELD_TICKS: u64 = 5_000_000;
+    // E2_POLL_MAX_ITERS: total wait budget = E2_POLL_MAX_ITERS * E2_POLL_YIELD_TICKS
+    // = 100 * 5_000_000 = 500_000_000 ticks.  Must stay below SENDER_SEND_TIMEOUT_TICKS
+    // so we bail before the child's own blocking-send timeout expires.
+    const E2_POLL_MAX_ITERS: usize = 100;
     const DRAIN_MAX: usize = 72;
 
     let fill_target = if e1_capacity == 0 || e1_capacity > FILL_CAP_MAX {
@@ -1457,18 +1470,42 @@ fn run_ipc_recv_proof_sender_wake(
         pid
     );
     let mut waiter_tid: Option<u64> = None;
-    // SAFETY: e2_recv is init's RECV cap to the proof coordination endpoint.
-    // Block until the kernel pushes the waiter-present signal (which happens
-    // atomically when the child becomes a sender-waiter on E1) or the deadline
-    // expires.  A single blocking recv lets the child get CPU time instead of
-    // the parent busy-polling with NoWait + yield, which on AArch64 and RISC-V
-    // starves the child because yield(nr=0) doesn't give them a scheduling slot.
-    match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS) }
-    {
-        Ok(Some(sig)) => {
-            waiter_tid = Some(sig.sender_tid.0);
+    // Stage 163N Task A: poll E2 with short blocking yields so the scheduler
+    // can run the child on the same CPU (AArch64/RISC-V single-core paths).
+    // Each iteration calls ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS):
+    //   Phase 1 (immediate): if the kernel already pushed the signal, returns
+    //   Ok(Some(sig)) immediately without blocking.
+    //   Phase 2 (block): if not yet pushed, blocks for E2_POLL_YIELD_TICKS
+    //   ticks, yielding the CPU so the child can be scheduled, then returns
+    //   Ok(None) on timeout.
+    // This avoids the lock-order hazard: the kernel push path holds
+    // ipc_state_lock and cannot acquire the scheduler lock to wake a blocked
+    // receiver; polling means we never block long enough to miss the signal.
+    yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN");
+    'e2_poll: for poll_iter in 0..E2_POLL_MAX_ITERS {
+        // SAFETY: e2_recv is init's RECV cap to the proof coordination endpoint.
+        match unsafe {
+            yarm_user_rt::syscall::ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)
+        } {
+            Ok(Some(sig)) => {
+                yarm_user_rt::user_log!(
+                    "IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT iter={}",
+                    poll_iter
+                );
+                waiter_tid = Some(sig.sender_tid.0);
+                break 'e2_poll;
+            }
+            Ok(None) => {
+                // Timeout — child not yet a sender-waiter; loop and yield again.
+            }
+            Err(_) => {
+                // Unexpected error — break out and let the no-waiter path handle it.
+                break 'e2_poll;
+            }
         }
-        _ => {}
+    }
+    if waiter_tid.is_none() {
+        yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_EXHAUSTED");
     }
     let Some(waiter_tid) = waiter_tid else {
         yarm_user_rt::user_log!(

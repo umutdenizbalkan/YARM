@@ -801,6 +801,15 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
     // resume after IPC block).
     let resume_tid = kernel.current_tid().unwrap_or(entering_tid);
     let task_switched = resume_tid != entering_tid;
+    if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+        crate::yarm_log!(
+            "RISCV_FORK_PARENT_A0_EXPORT entering_tid={} resume_tid={} task_switched={} scause={:#x}",
+            entering_tid,
+            resume_tid,
+            task_switched,
+            scause
+        );
+    }
 
     // PC/SP always come from the (possibly task-switched) generic frame.
     frame.sepc = tframe.saved_pc() as u64;
@@ -854,6 +863,15 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             frame.regs[RiscvTrapFrame::A2] = 0;
             frame.regs[RiscvTrapFrame::A3] = err as u64;
         } else {
+            if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                crate::yarm_log!(
+                    "RISCV_TCB_A0_SAVE_AFTER_EXPORT tid={} ret0={} ret1={} err={}",
+                    resume_tid,
+                    tframe.ret0(),
+                    tframe.ret1(),
+                    tframe.error
+                );
+            }
             frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
             frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
             frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
