@@ -1748,14 +1748,33 @@ impl KernelState {
             );
             crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_BEGIN child_tid={}", child_tid);
         }
-        if let Err(e) = self.enqueue_task(child_tid) {
-            if proof {
-                crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_FAIL reason={:?}", e);
+        // Stage 163N Task B: use enqueue_woken_task so the fork child is placed
+        // on the SAME CPU as the parent (current_cpu).  enqueue_task uses
+        // enqueue_balanced which picks the least-loaded online CPU — on AArch64
+        // with 4 online CPUs this puts the child on CPU1-3 while the parent is
+        // on CPU0.  When the parent then blocks on E2 (or any IPC recv), CPU0
+        // goes idle and no IPI is sent to wake the child on the remote CPU, so
+        // the child never gets scheduled.  enqueue_woken_task always uses
+        // current_cpu() (or the task's pinned affinity), guaranteeing the child
+        // shares a scheduler queue with the parent and is picked up at the next
+        // dispatch without cross-CPU IPIs.
+        match self.enqueue_woken_task(child_tid) {
+            Ok((cpu, reason)) => {
+                if proof {
+                    crate::yarm_log!(
+                        "FORK_PROOF_CHILD_ENQUEUE_OK child_tid={} cpu={} reason={}",
+                        child_tid,
+                        cpu.0,
+                        reason
+                    );
+                }
             }
-            return Err(e);
-        }
-        if proof {
-            crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_OK child_tid={}", child_tid);
+            Err(e) => {
+                if proof {
+                    crate::yarm_log!("FORK_PROOF_CHILD_ENQUEUE_FAIL reason={:?}", e);
+                }
+                return Err(e);
+            }
         }
         Ok(child_tid)
     }

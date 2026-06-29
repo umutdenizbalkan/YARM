@@ -4124,6 +4124,143 @@ parent returns `ret0=child_tid, err=0` on those arches.
   (`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`), RPi5 untouched,
   `MAX_ADDRESS_SPACES` remains 32.
 
+#### 5.1.9.19 Stage 163M — x86_64 IpcSend nonfatal classification + E2 blocking recv
+
+**Goal.** After Stage 163L, the sender-wake proof still blocked indefinitely
+on x86_64 when the child's `IpcSend` on E1 returned `WouldBlock` (sender-waiter
+enqueue raced the recv).  Two sub-issues:
+
+1. **`IpcSend` was classified as non-blocking** in `dispatch_syscall`.  A
+   sender-waiter `IpcSend` that blocks legitimately was treated as a fatal
+   `WouldBlock`, killing the proof.
+2. **E2 wait used `ipc_recv_no_wait`** (busy-polling), which starved the
+   child on AArch64/RISC-V because the child never got scheduled.
+
+**Fix — Task A (`src/kernel/syscall.rs`):**
+
+`IpcSend` is now always classified `blocking_syscall = true`.  A `WouldBlock`
+result causes `dispatch_next_task` to yield the current thread, letting the
+child make progress.  A `BLOCKED_OK` marker (proof-gated) distinguishes the
+expected sender-waiter park from real fatal errors.
+
+**Fix — Task B (`service.rs`):**
+
+Replaced `ipc_recv_no_wait` polling with a single blocking
+`ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS=500_000_000)`.
+
+*Note: Stage 163N superseded this; see §5.1.9.20 for the final E2 wait design.*
+
+**Preserved invariants:** x86_64 child return lane (Stage 163J), no-smoke
+interference (Stage 163K), Stage 163L AArch64/RISC-V parent return fix, no
+syscall/IPC ABI changes.
+
+---
+
+#### 5.1.9.20 Stage 163N — E2 coordination polling + AArch64 fork-child CPU affinity
+
+**Goal.** After Stage 163M, two root causes remained on AArch64 and RISC-V:
+
+1. **E2 blocking recv deadlocked on AArch64/RISC-V.**
+   `proof_sender_wake_push_coordination_locked` runs inside
+   `enqueue_sender_waiter` while holding the IPC state lock (rank 3/4).  It
+   cannot acquire the scheduler lock (rank 1) to wake blocked receivers.
+   Therefore `ipc_recv_with_deadline(e2_recv, 500_000_000)` blocks the parent
+   forever — the E2 signal is queued but the parent is never woken.
+
+2. **Fork child placed on wrong CPU on AArch64 (4 CPUs online).**
+   `enqueue_task` calls `enqueue_balanced` → `least_loaded_online_cpu`, which
+   picks CPU1-3 while the parent is on CPU0.  When the parent then blocks on
+   E2, CPU0 goes idle.  No IPI is sent to wake the child on its remote CPU, so
+   the proof stalls until the scheduler timer fires.
+
+**Fix — Task A: E2 polling loop** (`service.rs`):
+
+Replaced the single blocking recv with a bounded polling loop:
+
+```rust
+const E2_POLL_YIELD_TICKS: u64 = 5_000_000;   // yield budget per iteration
+const E2_POLL_MAX_ITERS: usize = 100;           // total budget = 500_000_000 ticks
+
+'e2_poll: for poll_iter in 0..E2_POLL_MAX_ITERS {
+    match ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS) {
+        Ok(Some(sig)) => { waiter_tid = Some(sig.sender_tid.0); break 'e2_poll; }
+        Ok(None)  => { /* timeout: loop and yield again */ }
+        Err(_)    => { break 'e2_poll; }
+    }
+}
+```
+
+Each iteration's `ipc_recv_with_deadline` Phase 1 immediately catches an
+already-queued E2 signal; Phase 2 blocks briefly to yield the CPU so the
+child can run.  Total budget = 500 M ticks, same as Stage 163M.
+
+**Fix — Task B: `enqueue_woken_task` in fork** (`src/kernel/boot/thread_state.rs`):
+
+`fork_complete_post_clone` now calls `enqueue_woken_task(child_tid)` instead
+of `enqueue_task(child_tid)`.  `enqueue_woken_task` uses `current_cpu()` and
+places the child on the **same CPU** as the fork-calling parent, eliminating
+the need for cross-CPU IPIs and ensuring the child is scheduled before the
+parent's next timer tick.
+
+**Fix — Task C: RISC-V diagnostic markers** (`src/arch/riscv64/boot.rs`):
+
+Added proof-gated markers at the boot bridge writeback point to confirm at
+runtime whether `task_switched` is set correctly during fork:
+
+| Marker | Where |
+|--------|-------|
+| `RISCV_FORK_PARENT_A0_EXPORT entering_tid=<t> resume_tid=<r> task_switched=<b> scause=<s>` | After `resume_tid`/`task_switched` computed, before writeback |
+| `RISCV_TCB_A0_SAVE_AFTER_EXPORT tid=<t> ret0=<r> ret1=<r1> err=<e>` | Inside ecall return path, just before `frame.regs[A0] = tframe.ret0()` |
+
+Both markers gated on `ipc_recv_proof_sender_wake_active()`.
+
+**New poll-loop log markers** (all gated on `ipc_recv_proof_sender_wake_active()`):
+
+| Marker | When |
+|--------|------|
+| `IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN` | Before poll loop starts |
+| `IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT iter=<n>` | E2 signal received at iteration `n` |
+| `IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_EXHAUSTED` | All `E2_POLL_MAX_ITERS` timed out |
+
+**Unit-test guards added** (`src/kernel/boot/tests.rs`, module
+`stage163n_sender_wake_fix`):
+
+| Test | What it verifies |
+|------|-----------------|
+| `stage163n_e2_uses_polling_loop_not_blocking_recv` | Polling loop + marker presence |
+| `stage163n_e2_poll_iter_uses_yield_ticks` | `E2_POLL_YIELD_TICKS=5_000_000`, `E2_POLL_MAX_ITERS=100` |
+| `stage163n_e2_poll_budget_bounded_below_send_timeout` | `5M * 100 = 500M <= 1_000_000_000` |
+| `stage163n_fork_child_enqueued_with_woken_task` | `enqueue_woken_task`, not `enqueue_task` |
+| `stage163n_fork_child_enqueue_log_includes_cpu_reason` | Log includes `cpu=` and `reason=` |
+| `stage163n_riscv_boot_bridge_has_a0_export_marker` | `RISCV_FORK_PARENT_A0_EXPORT` present |
+| `stage163n_riscv_boot_bridge_has_tcb_a0_save_marker` | `RISCV_TCB_A0_SAVE_AFTER_EXPORT` present |
+
+**Preserved invariants:**
+
+- Stage 163J x86_64 child return lane (`user_gprs[0]=0`) untouched.
+- Stage 163K no-smoke-interference untouched.
+- Stage 163L AArch64/RISC-V parent return fix untouched.
+- Stage 163M x86_64 nonfatal `IpcSend` classification untouched.
+- No syscall/IPC ABI change, no IPC/cap seam moved.
+- Counts unchanged (`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`,
+  `MAX_ADDRESS_SPACES == 32`).
+- RPi5 boot behavior untouched.
+
+**User action required (QEMU smoke):**
+
+Run `yarm.ipc_recv_proof=1 yarm.ipc_recv_proof_sender_wake=1` on all three
+architectures and verify:
+
+- `IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT iter=0` appears (E2 signal caught
+  immediately by Phase 1 — confirms the polling fix works).
+- `RISCV_FORK_PARENT_A0_EXPORT ... task_switched=false` appears on RISC-V
+  (confirms single-core path: parent returns without switching).
+- `RISCV_TCB_A0_SAVE_AFTER_EXPORT tid=1 ret0=<child_tid>` appears on RISC-V
+  (confirms parent's fork return value is the child TID).
+- `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` is reached on all architectures.
+
+---
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

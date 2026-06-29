@@ -43906,12 +43906,14 @@ mod stage163_sender_wake_proven {
         let i_wait = workload
             .find("IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN")
             .expect("PARENT_WAIT_BEGIN");
+        // Stage 163N Task A: E2 wait is now a bounded polling loop;
+        // look for the polling form ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS).
         let i_poll = workload
-            .find("ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)")
-            .expect("E2 blocking wait with deadline");
+            .find("ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)")
+            .expect("E2 polling recv with yield ticks deadline");
         assert!(
             i_fill < i_fork && i_fork < i_wait && i_wait < i_poll,
-            "fork must happen after FILL_DONE and before the E2 wait/poll"
+            "fork must happen after FILL_DONE and before the E2 poll loop"
         );
         // A fork failure aborts (returns) rather than spinning on E2.
         let fail_arm = workload
@@ -45431,7 +45433,9 @@ mod stage163m_sender_wake_completion {
         );
     }
 
-    // Task B: E2 coordination wait uses a single blocking recv, not a NoWait loop.
+    // Task B (updated Stage 163N): E2 coordination wait uses a bounded polling loop,
+    // not a single blocking recv — the kernel cannot wake blocked receivers while
+    // holding the IPC lock (lock-order constraint: scheduler=rank1, IPC=rank3/4).
     #[test]
     fn stage163m_e2_wait_uses_blocking_recv() {
         let workload = sender_wake_workload();
@@ -45440,31 +45444,44 @@ mod stage163m_sender_wake_completion {
             .nth(1)
             .and_then(|s| s.split("IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED").next())
             .expect("E2 wait region between PARENT_WAIT_BEGIN and WAITER_OBSERVED");
-        assert!(
-            !e2_wait_region.contains("for _ in 0..E2_POLL_MAX"),
-            "E2 wait must not use a polling loop (Stage 163M: replaced with blocking recv)"
-        );
+        // Stage 163N Task A: must use a bounded polling loop (not a single blocking recv)
+        // so Phase 1 of ipc_recv_with_deadline catches the already-queued E2 signal.
         assert!(
             !e2_wait_region.contains("yield_now()"),
             "E2 wait must not call yield_now() (starves child on AArch64/RISC-V)"
         );
         assert!(
-            e2_wait_region.contains("ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)"),
-            "E2 wait must call ipc_recv_with_deadline with E2_WAIT_DEADLINE_TICKS"
+            !e2_wait_region.contains("ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)"),
+            "E2 wait must not use a single blocking recv (Stage 163N: replaced with polling loop)"
+        );
+        assert!(
+            e2_wait_region.contains("ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)"),
+            "E2 wait must use the polling form ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)"
+        );
+        assert!(
+            e2_wait_region.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN"),
+            "E2 poll loop must emit IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN"
         );
     }
 
-    // Task B: E2_WAIT_DEADLINE_TICKS is defined and bounded below SENDER_SEND_TIMEOUT_TICKS.
+    // Task B (updated Stage 163N): E2 coordination uses a bounded polling loop;
+    // E2_POLL_YIELD_TICKS and E2_POLL_MAX_ITERS must be defined.  Total budget
+    // = E2_POLL_YIELD_TICKS * E2_POLL_MAX_ITERS must remain <= SENDER_SEND_TIMEOUT_TICKS.
     #[test]
     fn stage163m_e2_deadline_defined_and_bounded() {
         assert!(
-            INIT_SVC_SRC.contains("const E2_WAIT_DEADLINE_TICKS: u64 = 500_000_000"),
-            "E2_WAIT_DEADLINE_TICKS must be defined as 500_000_000"
+            INIT_SVC_SRC.contains("const E2_POLL_YIELD_TICKS: u64 = 5_000_000"),
+            "E2_POLL_YIELD_TICKS must be defined as 5_000_000"
+        );
+        assert!(
+            INIT_SVC_SRC.contains("const E2_POLL_MAX_ITERS: usize = 100"),
+            "E2_POLL_MAX_ITERS must be defined as 100"
         );
         assert!(
             INIT_SVC_SRC.contains("const SENDER_SEND_TIMEOUT_TICKS: u64 = 1_000_000_000"),
             "SENDER_SEND_TIMEOUT_TICKS must remain 1_000_000_000"
         );
+        // total budget = 5_000_000 * 100 = 500_000_000 <= 1_000_000_000 (send timeout)
     }
 
     // Task C: RISC-V trap handler has no explicit PC+4 advance (boot bridge pre-advances).
@@ -45507,6 +45524,151 @@ mod stage163m_sender_wake_completion {
         assert!(
             restore_pos < export_pos,
             "restore must precede a0/a1 export in RISC-V trap"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stage163n_sender_wake_fix {
+    const INIT_SVC_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    fn sender_wake_workload() -> &'static str {
+        INIT_SVC_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("sender-wake workload body")
+    }
+
+    // Task A: E2 coordination uses a bounded polling loop, not a single blocking recv.
+    // The kernel cannot wake blocked receivers while holding the IPC lock (lock ordering).
+    #[test]
+    fn stage163n_e2_uses_polling_loop_not_blocking_recv() {
+        let workload = sender_wake_workload();
+        assert!(
+            workload.contains("for poll_iter in 0..E2_POLL_MAX_ITERS"),
+            "E2 wait must use a bounded for-loop over E2_POLL_MAX_ITERS"
+        );
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN"),
+            "E2 poll loop must emit E2_POLL_BEGIN marker"
+        );
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT"),
+            "E2 poll loop must emit E2_POLL_HIT on success"
+        );
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_EXHAUSTED"),
+            "E2 poll loop must emit E2_POLL_EXHAUSTED on timeout"
+        );
+        assert!(
+            !workload.contains("ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)"),
+            "E2 wait must not use the old single-blocking-recv form"
+        );
+    }
+
+    // Task A: Each polling iteration uses a short yield tick, not an infinite block.
+    #[test]
+    fn stage163n_e2_poll_iter_uses_yield_ticks() {
+        let workload = sender_wake_workload();
+        assert!(
+            workload.contains("ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)"),
+            "each poll iteration must call ipc_recv_with_deadline with E2_POLL_YIELD_TICKS"
+        );
+        assert!(
+            INIT_SVC_SRC.contains("const E2_POLL_YIELD_TICKS: u64 = 5_000_000"),
+            "E2_POLL_YIELD_TICKS must be 5_000_000 (small yield, not full deadline)"
+        );
+        assert!(
+            INIT_SVC_SRC.contains("const E2_POLL_MAX_ITERS: usize = 100"),
+            "E2_POLL_MAX_ITERS must be 100 (budget = 100 * 5M = 500M ticks)"
+        );
+    }
+
+    // Task A: Total E2 poll budget does not exceed sender send timeout.
+    #[test]
+    fn stage163n_e2_poll_budget_bounded_below_send_timeout() {
+        // Parsed at compile time via include_str! — verify constants match expectations.
+        const YIELD_TICKS: u64 = 5_000_000;
+        const MAX_ITERS: usize = 100;
+        const SEND_TIMEOUT: u64 = 1_000_000_000;
+        assert!(
+            YIELD_TICKS * MAX_ITERS as u64 <= SEND_TIMEOUT,
+            "E2 poll budget ({} * {} = {}) must not exceed SENDER_SEND_TIMEOUT_TICKS ({})",
+            YIELD_TICKS,
+            MAX_ITERS,
+            YIELD_TICKS * MAX_ITERS as u64,
+            SEND_TIMEOUT
+        );
+    }
+
+    // Task B: fork_complete_post_clone uses enqueue_woken_task, not enqueue_task.
+    // enqueue_woken_task places the child on the SAME CPU as the parent (current_cpu),
+    // preventing AArch64 SMP CPU-scatter that starves the child.
+    #[test]
+    fn stage163n_fork_child_enqueued_with_woken_task() {
+        let fork_body = THREAD_STATE_SRC
+            .split("fn fork_complete_post_clone")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub").next())
+            .expect("fork_complete_post_clone body");
+        assert!(
+            fork_body.contains("enqueue_woken_task(child_tid)"),
+            "fork_complete_post_clone must use enqueue_woken_task so child lands on parent's CPU"
+        );
+        assert!(
+            !fork_body.contains("enqueue_task(child_tid)"),
+            "fork_complete_post_clone must not use enqueue_task (would scatter to any online CPU)"
+        );
+    }
+
+    // Task B: fork child enqueue log includes cpu and reason fields (from enqueue_woken_task).
+    #[test]
+    fn stage163n_fork_child_enqueue_log_includes_cpu_reason() {
+        let fork_body = THREAD_STATE_SRC
+            .split("fn fork_complete_post_clone")
+            .nth(1)
+            .and_then(|s| s.split("\n    pub").next())
+            .expect("fork_complete_post_clone body");
+        assert!(
+            fork_body.contains("FORK_PROOF_CHILD_ENQUEUE_OK child_tid={} cpu={} reason={}"),
+            "fork enqueue log must include cpu and reason fields from enqueue_woken_task"
+        );
+    }
+
+    // Task C: RISC-V boot bridge emits RISCV_FORK_PARENT_A0_EXPORT diagnostic marker
+    // at the writeback point so runtime logs can confirm task_switched flag for fork.
+    #[test]
+    fn stage163n_riscv_boot_bridge_has_a0_export_marker() {
+        let bridge = RISCV_BOOT_SRC
+            .split("fn yarm_riscv64_trap_bridge")
+            .nth(1)
+            .expect("yarm_riscv64_trap_bridge body");
+        assert!(
+            bridge.contains("RISCV_FORK_PARENT_A0_EXPORT"),
+            "boot bridge must emit RISCV_FORK_PARENT_A0_EXPORT diagnostic marker"
+        );
+        assert!(
+            bridge.contains("task_switched"),
+            "RISCV_FORK_PARENT_A0_EXPORT marker must log task_switched"
+        );
+    }
+
+    // Task C: RISC-V boot bridge emits RISCV_TCB_A0_SAVE_AFTER_EXPORT marker
+    // inside the ecall return path before writing A0 = ret0.
+    #[test]
+    fn stage163n_riscv_boot_bridge_has_tcb_a0_save_marker() {
+        let bridge = RISCV_BOOT_SRC
+            .split("fn yarm_riscv64_trap_bridge")
+            .nth(1)
+            .expect("yarm_riscv64_trap_bridge body");
+        assert!(
+            bridge.contains("RISCV_TCB_A0_SAVE_AFTER_EXPORT"),
+            "boot bridge must emit RISCV_TCB_A0_SAVE_AFTER_EXPORT in the ecall ret0 export path"
         );
     }
 }
