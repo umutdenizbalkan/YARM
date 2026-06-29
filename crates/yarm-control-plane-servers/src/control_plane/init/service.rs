@@ -1175,12 +1175,19 @@ const fn fork_err_meaning(code: u64) -> &'static str {
     }
 }
 
-/// Stage 163C: clean-state fork smoke, run BEFORE E1 is filled. Determines whether
-/// a full E1 / queued IPC state is implicated in a fork failure — if this fails too,
-/// the full buffer is ruled out. Runs only inside the sub-knob-gated sender-wake
-/// workload, so base queued-split/rollback proofs are unaffected. The smoke child
-/// parks; the parent logs the outcome and returns.
+/// Stage 163C: clean-state fork smoke. Determines whether a full E1 / queued IPC
+/// state is implicated in a fork failure — if this fails too, the full buffer is
+/// ruled out.
+///
+/// Stage 163K: this is now a DIAGNOSTIC-ONLY helper and is intentionally NOT
+/// called from the required sender-wake acceptance path. Its child parks and
+/// yields forever, permanently holding a CNode-space reservation against the
+/// global `max_total_cnode_slots` budget, which starved the real sender-wake
+/// fork (`CapabilityFull step=register`). Acceptance now relies on the single
+/// real sender-wake fork as the fork proof. Kept compiled (allow(dead_code)) so
+/// it can be re-enabled for ad-hoc diagnosis without reintroducing the helper.
 #[cfg(not(test))]
+#[allow(dead_code)]
 fn run_ipc_recv_proof_fork_smoke() {
     yarm_user_rt::user_log!("IPC_RECV_PROOF_FORK_SMOKE_BEGIN");
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_FORK_SYSCALL_BEGIN smoke=1");
@@ -1288,9 +1295,14 @@ fn run_ipc_recv_proof_sender_wake(
     );
     yarm_user_rt::user_log!("IPC_RECV_PROOF_SENDER_WAKE_SETUP_DONE");
 
-    // (pre) Clean-state fork smoke BEFORE E1 is filled (Stage 163C). If fork fails
-    // here too, a full E1 / queued IPC state is ruled out as the cause.
-    run_ipc_recv_proof_fork_smoke();
+    // Stage 163K: the clean-state fork smoke (Stage 163C) is NO LONGER run in the
+    // required sender-wake path. Its child parks and yields forever, permanently
+    // holding a CNode-space reservation against the GLOBAL `max_total_cnode_slots`
+    // budget; the subsequent REAL sender-wake fork then failed with
+    // `CapabilityFull step=register`. The sender-wake fork below is itself the
+    // fork proof, so acceptance needs exactly ONE live fork child. The smoke
+    // remains defined as a diagnostic-only helper (see `run_ipc_recv_proof_fork_
+    // smoke`), not part of acceptance.
 
     // (0) Drain any leftover messages from the base subtests so the fill starts
     // empty (non-blocking; empty returns Ok(None)/WouldBlock — never blocks init).
