@@ -4370,6 +4370,117 @@ architectures and verify:
 - RISC-V: `RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT` appears when a COW
   fault fires after fork (confirms a0=child_tid was preserved).
 
+#### 5.1.9.22 Stage 163P — cooperative E2 poll + RISC-V full-frame fault preservation
+
+**Goal.** Stage 163O's fixes were not accepted by QEMU on any architecture. Two
+distinct root causes remained, both confirmed by runtime logs and (for RISC-V)
+disassembly.
+
+**Root cause — Task A: parent blocks on E2 and is never re-scheduled**
+
+The Stage 163N/O E2 poll used `ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)`
+per iteration. On an empty E2 this **blocks** the parent (TCB → `Blocked`, removed
+from the run queue) and dispatches the child; the syscall then returns
+`Err(TimedOut)` synchronously into the parent's saved frame, but the parent's TCB
+is left `Blocked` and **off the run queue**. It can only be made runnable again by
+`process_ipc_timeout_deadlines` on a **timer interrupt**. Once both parent (blocked
+on E2) and child (blocked on its E1 send) are parked, the CPU idles; the parent
+never resumes to run the next poll iteration, so it never observes the queued E2
+signal (no `E2_POLL_HIT`), and the proof stalls on every arch. Runtime logs
+confirmed: child reaches the E1 waiter state, but no `E2_POLL_HIT` /
+`WAITER_OBSERVED` / `SEQUENCE_DONE` ever follows.
+
+**Fix — Task A** (`service.rs`): replace the blocking poll with a **non-blocking
+probe + explicit yield**:
+
+```rust
+'e2_poll: for poll_iter in 0..E2_POLL_MAX_ITERS {
+    match ipc_recv_with_deadline(e2_recv, 0) {        // timeout 0 → never blocks
+        Ok(Some(sig)) => { /* HIT */ break 'e2_poll; }
+        Ok(None) | Err(WouldBlock) | Err(TimedOut) => {} // transient — retry
+        Err(e) => break 'e2_poll,                          // genuine error
+    }
+    yield_now();   // hand CPU to child; parent stays Runnable
+}
+```
+
+`yield_current` marks the parent `Runnable` (keeps it on the run queue) and
+switches to the child. When the child becomes a sender-waiter and parks, the
+scheduler returns to the parent, which finds the queued E2 signal on its next
+non-blocking probe. No timer dependency; portable across all three arches. The
+kernel still pushes the E2 signal atomically inside `enqueue_sender_waiter`
+(race-free); the child does **not** send E2 itself. `E2_POLL_YIELD_TICKS` is
+removed. New diagnostics: `E2_CAPS`, `E2_POLL_RET iter=<n> result=<...>`.
+
+**Root cause — Task B: RISC-V page-fault path overlays a stale TCB snapshot**
+
+Disassembly of the parent's fork return (release build) showed userspace is
+correct — it banks the syscall return in a callee-saved register before reusing
+a0:
+
+```
+ecall            # a0 = child_tid (10008)
+mv   s2, a0      # s2 = child_tid  (banked BEFORE a0 is reused)
+auipc a0, 0x5    # a0 := format-string addr (~0x4073d9)
+sd   a0, 0x40(sp)  # FIRST stack store after fork → COW page fault (scause=0xf)
+...
+sd   s2, 0x50(sp)  # fork return stored from s2
+```
+
+The fault is the parent's first COW stack write. In the RISC-V trap bridge,
+`restore_arch_thread_state → apply_user_context` reloads `tframe.user_gprs`/`args`
+from the TCB's `user_context`, which was last synced at the previous **syscall**
+entry (`sync_current_thread_from_frame` runs only on the Syscall arm; page faults
+never re-sync). The bridge's mirror loop then copied that **stale** snapshot over
+the **live hardware-saved frame**, resetting every callee-saved/temp register —
+including `s2` — to its pre-fork value (here `s2` held a stale format-string text
+address `0x4073d9`). Userspace then stored that as the fork return
+(`ret0=4223961`), so the parent decoded itself as the child → role-swap. Stage
+163O only protected A0–A7; the mirror loop still clobbered `s2`.
+
+**Fix — Task B** (`src/arch/riscv64/boot.rs`): gate the entire `tframe → frame`
+writeback (sepc/SP reload, the GPR mirror loop, and the ABI-lane writes) behind
+`if task_switched || scause == EXC_USER_ECALL`. For a **same-task non-syscall
+trap** (COW/demand page fault) take the `else` branch and leave the hardware-saved
+`frame` **entirely untouched** — `frame.regs`/`sepc`/`SP` already hold the exact
+state the CPU trapped on, so the faulting instruction re-executes transparently
+after the COW copy. This is a general RISC-V correctness fix: any callee-saved or
+temp register mutated since the last syscall now survives a fault. Markers
+retained, and `RISCV_PAGE_FAULT_PRESERVE_GPRS` now also logs `s2`.
+
+**Unit-test guards** (`src/kernel/boot/tests.rs`, module `stage163p_sender_wake_fix`):
+
+| Test | Verifies |
+|------|----------|
+| `stage163p_e2_poll_is_nonblocking` | probe is `ipc_recv_with_deadline(e2_recv, 0)`; no yield-ticks |
+| `stage163p_e2_poll_yields_between_probes` | `yield_now()` between probes |
+| `stage163p_e2_poll_transient_arms_do_not_break` | TimedOut/WouldBlock/none are retry arms |
+| `stage163p_e2_poll_emits_diag_markers` | `E2_CAPS` / `E2_POLL_RET` / `E2_POLL_HIT` |
+| `stage163p_riscv_non_syscall_branch_preserves_full_hw_frame` | no `tframe.*`/mirror writes in the fault branch |
+| `stage163p_riscv_writeback_gated_on_switch_or_ecall` | writeback gated on `task_switched || ecall` |
+| `stage163p_riscv_non_syscall_branch_has_markers` | preserve markers incl. `s2=` |
+
+The Stage 163M/N tests that asserted the blocking yield-ticks design were updated
+to the cooperative non-blocking form.
+
+**Preserved invariants:** Stage 163J/K/M, Stage 163N `enqueue_woken_task` child
+placement; no syscall/IPC ABI change, no IPC/cap seam moved; `SYSCALL_COUNT == 31`,
+`VARIANT_COUNT == 23`, `MAX_ADDRESS_SPACES == 32`; RPi5 boot untouched; no
+`BLOCKED_WOULDBLOCK_FATAL` for the expected proof child block.
+
+**User action required (QEMU smoke).** This environment has no QEMU; the matrix
+below must be run by the user. Run `yarm.ipc_recv_proof=1
+yarm.ipc_recv_proof_sender_wake=1` on x86_64, AArch64, RISC-V and verify:
+
+- All arches: `USER_LOG .*msg=IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT`,
+  `...WAITER_OBSERVED`, `...SEQUENCE_DONE`.
+- x86_64: a real line matching `^IPC_RECV_V2_SENDER_WAKE_ORDER_OK`.
+- RISC-V: `FORK_SYSCALL_RET ret0=<child_tid>` / `FORK_RET raw=<child_tid> role=parent`
+  in the parent and `FORK_RET raw=0 role=child` in the child (no `raw=4223961`,
+  no `arch_code=0xc`); `RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT` on the COW
+  fault.
+- No `BLOCKED_WOULDBLOCK_FATAL`, `CapabilityFull`, `TaskTableFull`.
+
 ---
 
 ### 5.2 D1 audit — answers to the seven readiness questions

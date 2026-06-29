@@ -551,6 +551,7 @@ impl RiscvTrapFrame {
     pub(crate) const A4: usize = 13; // x14
     pub(crate) const A5: usize = 14; // x15
     pub(crate) const A7: usize = 16; // x17
+    pub(crate) const S2: usize = 17; // x18 (callee-saved; banks fork return child_tid)
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
@@ -811,105 +812,129 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         );
     }
 
-    // PC/SP always come from the (possibly task-switched) generic frame.
-    frame.sepc = tframe.saved_pc() as u64;
-    frame.regs[RiscvTrapFrame::SP] = tframe.saved_sp() as u64;
+    if task_switched || scause == EXC_USER_ECALL {
+        // PC/SP come from the (possibly task-switched) generic frame.
+        frame.sepc = tframe.saved_pc() as u64;
+        frame.regs[RiscvTrapFrame::SP] = tframe.saved_sp() as u64;
 
-    // Mirror non-SP, non-ABI integer GPRs from the generic frame so non-ABI
-    // registers are restored from the resumed task's saved context. SP comes
-    // from `saved_sp` (above) and the A0..A5/A7 lanes are written below
-    // depending on switch/syscall semantics — including them in this mirror
-    // would clobber the canonical SP with the fresh-spawn user_gprs[2]==0 and
-    // overwrite the ABI args/returns with stale user_gpr values.
-    for n in 1..32usize {
-        let i = n - 1;
-        if i == RiscvTrapFrame::SP
-            || i == RiscvTrapFrame::A0
-            || i == RiscvTrapFrame::A1
-            || i == RiscvTrapFrame::A2
-            || i == RiscvTrapFrame::A3
-            || i == RiscvTrapFrame::A4
-            || i == RiscvTrapFrame::A5
-            || i == RiscvTrapFrame::A7
-        {
-            continue;
-        }
-        frame.regs[i] = tframe.user_gpr(n) as usize as u64;
-    }
-
-    if task_switched {
-        // First instruction the resumed task will execute consumes the YARM
-        // startup ABI in a0..a5. UserRegisterContext stores those in
-        // `args[0..5]` (apply_user_context copied them into `tframe.args`).
-        // The freshly-spawned task's `user_gprs` are still all-zero, so
-        // mirroring those would clobber the startup args — write args[]
-        // directly into a0..a5.
-        frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;
-        frame.regs[RiscvTrapFrame::A1] = tframe.arg(1) as u64;
-        frame.regs[RiscvTrapFrame::A2] = tframe.arg(2) as u64;
-        frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
-        frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;
-        frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
-        // a7 holds the syscall-number lane on RISC-V; on first run it can
-        // remain whatever the user code expects (0 for a freshly-zeroed
-        // context is fine — task hasn't issued any ecall yet).
-        frame.regs[RiscvTrapFrame::A7] = 0;
-    } else if scause == EXC_USER_ECALL {
-        // Same task continuing past its own ecall: YARM ABI returns
-        // a0=ret0, a1=ret1, a2=ret2, a3=error (mirrors AArch64).
-        if let Some(err) = tframe.error_code() {
-            frame.regs[RiscvTrapFrame::A0] = err as u64;
-            frame.regs[RiscvTrapFrame::A1] = 0;
-            frame.regs[RiscvTrapFrame::A2] = 0;
-            frame.regs[RiscvTrapFrame::A3] = err as u64;
-        } else {
-            if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
-                crate::yarm_log!(
-                    "RISCV_TCB_A0_SAVE_AFTER_EXPORT tid={} ret0={} ret1={} err={}",
-                    resume_tid,
-                    tframe.ret0(),
-                    tframe.ret1(),
-                    tframe.error
-                );
+        // Mirror non-SP, non-ABI integer GPRs from the generic frame so non-ABI
+        // registers are restored from the resumed task's saved context. SP comes
+        // from `saved_sp` (above) and the A0..A5/A7 lanes are written below
+        // depending on switch/syscall semantics — including them in this mirror
+        // would clobber the canonical SP with the fresh-spawn user_gprs[2]==0 and
+        // overwrite the ABI args/returns with stale user_gpr values.
+        for n in 1..32usize {
+            let i = n - 1;
+            if i == RiscvTrapFrame::SP
+                || i == RiscvTrapFrame::A0
+                || i == RiscvTrapFrame::A1
+                || i == RiscvTrapFrame::A2
+                || i == RiscvTrapFrame::A3
+                || i == RiscvTrapFrame::A4
+                || i == RiscvTrapFrame::A5
+                || i == RiscvTrapFrame::A7
+            {
+                continue;
             }
-            frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
-            frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
-            frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
-            frame.regs[RiscvTrapFrame::A3] = 0;
+            frame.regs[i] = tframe.user_gpr(n) as usize as u64;
         }
-        // a4, a5, a7 keep their user-side values from the saved frame at
-        // trap time (they're caller-saved temps in the RISC-V ABI but YARM
-        // userspace may rely on a7 staying as the syscall nr until next call).
-        // The asm save preserved them and the mirror loop skipped them.
-        frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
-        frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
-        frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+
+        if task_switched {
+            // First instruction the resumed task will execute consumes the YARM
+            // startup ABI in a0..a5. UserRegisterContext stores those in
+            // `args[0..5]` (apply_user_context copied them into `tframe.args`).
+            // The freshly-spawned task's `user_gprs` are still all-zero, so
+            // mirroring those would clobber the startup args — write args[]
+            // directly into a0..a5.
+            frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;
+            frame.regs[RiscvTrapFrame::A1] = tframe.arg(1) as u64;
+            frame.regs[RiscvTrapFrame::A2] = tframe.arg(2) as u64;
+            frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;
+            frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;
+            frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;
+            // a7 holds the syscall-number lane on RISC-V; on first run it can
+            // remain whatever the user code expects (0 for a freshly-zeroed
+            // context is fine — task hasn't issued any ecall yet).
+            frame.regs[RiscvTrapFrame::A7] = 0;
+        } else {
+            // Same task continuing past its own ecall: YARM ABI returns
+            // a0=ret0, a1=ret1, a2=ret2, a3=error (mirrors AArch64).
+            if let Some(err) = tframe.error_code() {
+                frame.regs[RiscvTrapFrame::A0] = err as u64;
+                frame.regs[RiscvTrapFrame::A1] = 0;
+                frame.regs[RiscvTrapFrame::A2] = 0;
+                frame.regs[RiscvTrapFrame::A3] = err as u64;
+            } else {
+                if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                    crate::yarm_log!(
+                        "RISCV_TCB_A0_SAVE_AFTER_EXPORT tid={} ret0={} ret1={} err={}",
+                        resume_tid,
+                        tframe.ret0(),
+                        tframe.ret1(),
+                        tframe.error
+                    );
+                }
+                frame.regs[RiscvTrapFrame::A0] = tframe.ret0() as u64;
+                frame.regs[RiscvTrapFrame::A1] = tframe.ret1() as u64;
+                frame.regs[RiscvTrapFrame::A2] = tframe.ret2() as u64;
+                frame.regs[RiscvTrapFrame::A3] = 0;
+            }
+            // a4, a5, a7 keep their user-side values from the saved frame at
+            // trap time (they're caller-saved temps in the RISC-V ABI but YARM
+            // userspace may rely on a7 staying as the syscall nr until next call).
+            // The asm save preserved them and the mirror loop skipped them.
+            frame.regs[RiscvTrapFrame::A4] = tframe.user_gpr(14) as u64;
+            frame.regs[RiscvTrapFrame::A5] = tframe.user_gpr(15) as u64;
+            frame.regs[RiscvTrapFrame::A7] = tframe.user_gpr(17) as u64;
+        }
     } else {
-        // Non-syscall trap (e.g. COW/demand page fault), same task.
-        // frame.regs[A0..A7] already hold the hardware-saved values from the
-        // ASM trap saver: the mirror loop above skips them, so they are
-        // intact. Do NOT overwrite from tframe.user_gpr() — apply_user_context
-        // reloads tframe.user_gprs from the TCB snapshot taken at the last
-        // ecall entry, which does not include post-syscall ret0 exports (e.g.
-        // fork sets ret0=child_tid after sync_current_thread_from_frame, so
-        // TCB still has user_gprs[10]=0; writing frame.regs[A0] from it
-        // clobbers the parent's a0=child_tid and causes a role-swap bug).
+        // Stage 163P: same-task NON-SYSCALL trap (e.g. COW/demand page fault).
+        //
+        // The hardware-saved `frame` (regs[], sepc, SP — captured by the ASM
+        // trap entry exactly as the CPU trapped) IS the precise live state to
+        // resume. We deliberately leave the ENTIRE frame untouched here.
+        //
+        // Crucially we must NOT mirror the generic `tframe` over it. Inside
+        // handle_trap_entry, `restore_arch_thread_state` → `apply_user_context`
+        // reloaded `tframe.user_gprs`/`args` from the TCB's user_context, which
+        // was last synced at the previous *syscall* entry
+        // (`sync_current_thread_from_frame`, only on the Syscall arm — page
+        // faults never re-sync). That snapshot predates every register write
+        // userspace made AFTER returning from that syscall. The fork return is
+        // the fatal case: the parent's `ecall` returns child_tid in a0, the
+        // very next userspace instruction does `mv s2, a0` to bank child_tid in
+        // a callee-saved register, and the FIRST stack store after that is the
+        // COW write that faults here (scause=0xf). Mirroring the stale snapshot
+        // would reset s2 (and t0-t6/s0-s11/ra) to their pre-fork values —
+        // overwriting child_tid in s2 with whatever s2 held before the fork
+        // (observed: a stale format-string text address ~0x4073d9), which
+        // userspace then stores as the fork return. Preserving the hardware
+        // frame re-executes the faulting instruction with the exact registers
+        // the CPU trapped on, so the COW copy is transparent to userspace.
+        //
+        // This is a general RISC-V correctness fix (any callee-saved/temp reg
+        // mutated since the last syscall must survive a fault), not a proof
+        // special-case.
         if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
             crate::yarm_log!(
-                "RISCV_NON_SYSCALL_TRAP_FRAME_SAVE tid={} scause={:#x}",
+                "RISCV_NON_SYSCALL_TRAP_FRAME_SAVE tid={} scause={:#x} sepc={:#x}",
                 resume_tid,
-                scause
+                scause,
+                frame.sepc
             );
             crate::yarm_log!(
-                "RISCV_PAGE_FAULT_PRESERVE_GPRS tid={} a0={:#x} a1={:#x}",
+                "RISCV_PAGE_FAULT_PRESERVE_GPRS tid={} a0={:#x} a1={:#x} s2={:#x} sp={:#x}",
                 resume_tid,
                 frame.regs[RiscvTrapFrame::A0],
-                frame.regs[RiscvTrapFrame::A1]
+                frame.regs[RiscvTrapFrame::A1],
+                frame.regs[RiscvTrapFrame::S2],
+                frame.regs[RiscvTrapFrame::SP]
             );
             crate::yarm_log!(
-                "RISCV_POST_FAULT_TRAP_RETURN tid={} a0={:#x}",
+                "RISCV_POST_FAULT_TRAP_RETURN tid={} a0={:#x} s2={:#x}",
                 resume_tid,
-                frame.regs[RiscvTrapFrame::A0]
+                frame.regs[RiscvTrapFrame::A0],
+                frame.regs[RiscvTrapFrame::S2]
             );
             if frame.regs[RiscvTrapFrame::A0] != 0 {
                 crate::yarm_log!(
