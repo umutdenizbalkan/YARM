@@ -43774,11 +43774,11 @@ mod stage163_sender_wake_proven {
         let i_wait = workload
             .find("IPC_RECV_PROOF_SENDER_WAKE_PARENT_WAIT_BEGIN")
             .expect("PARENT_WAIT_BEGIN");
-        // Stage 163N Task A: E2 wait is now a bounded polling loop;
-        // look for the polling form ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS).
+        // Stage 163P: E2 wait is a bounded cooperative poll; look for the
+        // non-blocking probe form ipc_recv_with_deadline(e2_recv, 0).
         let i_poll = workload
-            .find("ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)")
-            .expect("E2 polling recv with yield ticks deadline");
+            .find("ipc_recv_with_deadline(e2_recv, 0)")
+            .expect("E2 non-blocking probe");
         assert!(
             i_fill < i_fork && i_fork < i_wait && i_wait < i_poll,
             "fork must happen after FILL_DONE and before the E2 poll loop"
@@ -45304,6 +45304,10 @@ mod stage163m_sender_wake_completion {
     // Task B (updated Stage 163N): E2 coordination wait uses a bounded polling loop,
     // not a single blocking recv — the kernel cannot wake blocked receivers while
     // holding the IPC lock (lock-order constraint: scheduler=rank1, IPC=rank3/4).
+    // Stage 163P SUPERSEDES the blocking-recv/yield-ticks design: the E2 wait is
+    // now a NON-BLOCKING probe (timeout 0) plus an explicit yield_now() between
+    // probes, so the parent never blocks off the run queue waiting for a wake the
+    // kernel cannot deliver under the IPC lock.
     #[test]
     fn stage163m_e2_wait_uses_blocking_recv() {
         let workload = sender_wake_workload();
@@ -45312,19 +45316,17 @@ mod stage163m_sender_wake_completion {
             .nth(1)
             .and_then(|s| s.split("IPC_RECV_PROOF_SENDER_WAKE_WAITER_OBSERVED").next())
             .expect("E2 wait region between PARENT_WAIT_BEGIN and WAITER_OBSERVED");
-        // Stage 163N Task A: must use a bounded polling loop (not a single blocking recv)
-        // so Phase 1 of ipc_recv_with_deadline catches the already-queued E2 signal.
         assert!(
-            !e2_wait_region.contains("yield_now()"),
-            "E2 wait must not call yield_now() (starves child on AArch64/RISC-V)"
+            e2_wait_region.contains("yield_now()"),
+            "Stage 163P: E2 wait must yield_now() between non-blocking probes"
         );
         assert!(
-            !e2_wait_region.contains("ipc_recv_with_deadline(e2_recv, E2_WAIT_DEADLINE_TICKS)"),
-            "E2 wait must not use a single blocking recv (Stage 163N: replaced with polling loop)"
+            e2_wait_region.contains("ipc_recv_with_deadline(e2_recv, 0)"),
+            "Stage 163P: E2 wait must use a non-blocking probe (timeout 0)"
         );
         assert!(
-            e2_wait_region.contains("ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)"),
-            "E2 wait must use the polling form ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)"
+            !e2_wait_region.contains("E2_POLL_YIELD_TICKS"),
+            "Stage 163P: the blocking yield-ticks deadline form must be gone"
         );
         assert!(
             e2_wait_region.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN"),
@@ -45332,14 +45334,13 @@ mod stage163m_sender_wake_completion {
         );
     }
 
-    // Task B (updated Stage 163N): E2 coordination uses a bounded polling loop;
-    // E2_POLL_YIELD_TICKS and E2_POLL_MAX_ITERS must be defined.  Total budget
-    // = E2_POLL_YIELD_TICKS * E2_POLL_MAX_ITERS must remain <= SENDER_SEND_TIMEOUT_TICKS.
+    // Stage 163P: E2 coordination uses a bounded cooperative poll; E2_POLL_MAX_ITERS
+    // bounds it. The blocking yield-ticks deadline constant is removed.
     #[test]
     fn stage163m_e2_deadline_defined_and_bounded() {
         assert!(
-            INIT_SVC_SRC.contains("const E2_POLL_YIELD_TICKS: u64 = 5_000_000"),
-            "E2_POLL_YIELD_TICKS must be defined as 5_000_000"
+            !INIT_SVC_SRC.contains("const E2_POLL_YIELD_TICKS"),
+            "Stage 163P: E2_POLL_YIELD_TICKS must be removed (no blocking deadline)"
         );
         assert!(
             INIT_SVC_SRC.contains("const E2_POLL_MAX_ITERS: usize = 100"),
@@ -45349,7 +45350,6 @@ mod stage163m_sender_wake_completion {
             INIT_SVC_SRC.contains("const SENDER_SEND_TIMEOUT_TICKS: u64 = 1_000_000_000"),
             "SENDER_SEND_TIMEOUT_TICKS must remain 1_000_000_000"
         );
-        // total budget = 5_000_000 * 100 = 500_000_000 <= 1_000_000_000 (send timeout)
     }
 
     // Task C: RISC-V trap handler has no explicit PC+4 advance (boot bridge pre-advances).
@@ -45439,25 +45439,31 @@ mod stage163n_sender_wake_fix {
         );
     }
 
-    // Task A: Each polling iteration uses a short yield tick, not an infinite block.
+    // Stage 163P: each poll iteration is a NON-BLOCKING probe (timeout 0) followed
+    // by yield_now() — no per-iteration blocking deadline.
     #[test]
     fn stage163n_e2_poll_iter_uses_yield_ticks() {
         let workload = sender_wake_workload();
         assert!(
-            workload.contains("ipc_recv_with_deadline(e2_recv, E2_POLL_YIELD_TICKS)"),
-            "each poll iteration must call ipc_recv_with_deadline with E2_POLL_YIELD_TICKS"
+            workload.contains("ipc_recv_with_deadline(e2_recv, 0)"),
+            "Stage 163P: each poll iteration must call ipc_recv_with_deadline(e2_recv, 0)"
         );
         assert!(
-            INIT_SVC_SRC.contains("const E2_POLL_YIELD_TICKS: u64 = 5_000_000"),
-            "E2_POLL_YIELD_TICKS must be 5_000_000 (small yield, not full deadline)"
+            workload.contains("yield_now()"),
+            "Stage 163P: each poll iteration must yield_now() to hand CPU to the child"
+        );
+        assert!(
+            !INIT_SVC_SRC.contains("const E2_POLL_YIELD_TICKS"),
+            "Stage 163P: E2_POLL_YIELD_TICKS must be removed"
         );
         assert!(
             INIT_SVC_SRC.contains("const E2_POLL_MAX_ITERS: usize = 100"),
-            "E2_POLL_MAX_ITERS must be 100 (budget = 100 * 5M = 500M ticks)"
+            "E2_POLL_MAX_ITERS must be 100"
         );
     }
 
-    // Task A: Total E2 poll budget does not exceed sender send timeout.
+    // Stage 163P: the cooperative poll is bounded by E2_POLL_MAX_ITERS (one
+    // non-blocking probe + one yield per iteration), independent of any timer.
     #[test]
     fn stage163n_e2_poll_budget_bounded_below_send_timeout() {
         // Parsed at compile time via include_str! — verify constants match expectations.
@@ -45541,8 +45547,8 @@ mod stage163n_sender_wake_fix {
     }
 }
 
-// ── Stage 163O: E2 poll retry-on-timeout + RISC-V A0 preservation ───────────
-mod stage163o_e2_poll_fix {
+// ── Stage 163P: cooperative E2 poll + RISC-V full-frame fault preservation ──
+mod stage163p_sender_wake_fix {
     const INIT_SVC_SRC: &str = include_str!(
         "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
     );
@@ -45552,124 +45558,142 @@ mod stage163o_e2_poll_fix {
         INIT_SVC_SRC
             .split("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_BEGIN")
             .nth(1)
-            .and_then(|s| s.split("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_EXHAUSTED").next())
+            .and_then(|s| {
+                s.split("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_EXHAUSTED")
+                    .next()
+            })
             .expect("E2 poll loop body")
     }
 
     fn non_syscall_else_body() -> &'static str {
-        // Isolate the non-syscall else branch in the RISC-V trap bridge.
-        // It follows the ecall branch (`} else if scause == EXC_USER_ECALL {`)
-        // and ends before the next statement.
+        // Isolate the same-task non-syscall else branch in the RISC-V trap
+        // bridge. It is the `else` of `if task_switched || scause == EXC_USER_ECALL`
+        // and ends before the satp-activation comment.
         RISCV_BOOT_SRC
-            .split("} else {\n        // Non-syscall trap")
+            .split("} else {\n        // Stage 163P: same-task NON-SYSCALL trap")
             .nth(1)
             .and_then(|s| s.split("\n    }\n\n    // The active satp").next())
             .expect("non-syscall else branch body in RISC-V boot bridge")
     }
 
-    // Task A: E2 poll loop treats Err(TimedOut) as retry, not break.
-    // Root cause: on iter 0, Phase 2 of ipc_recv_with_optional_deadline
-    // runs in the same kernel call before the child is scheduled, so
-    // received.is_none()=true → timed_out=true → Err(TimedOut). The old
-    // Err(_) arm broke the loop; the fix groups TimedOut/WouldBlock with
-    // Ok(None) as retry conditions.
+    // Task A: the parent must probe E2 non-blockingly (timeout 0) — never block on
+    // a deadline that strands it off the run queue until a timer fires.
     #[test]
-    fn stage163o_e2_poll_timed_out_grouped_with_ok_none() {
+    fn stage163p_e2_poll_is_nonblocking() {
         let body = e2_poll_body();
         assert!(
-            body.contains("SyscallError::TimedOut"),
-            "E2 poll loop must handle SyscallError::TimedOut"
+            body.contains("ipc_recv_with_deadline(e2_recv, 0)"),
+            "E2 poll must use a non-blocking probe ipc_recv_with_deadline(e2_recv, 0)"
         );
         assert!(
-            body.contains("SyscallError::WouldBlock"),
-            "E2 poll loop must handle SyscallError::WouldBlock"
-        );
-        // The TimedOut/WouldBlock arms must be retry arms (no break after them).
-        // Find TimedOut, then WouldBlock, then the slice between WouldBlock
-        // and the next Err(_) break arm — that slice must not contain a break.
-        let timed_out_pos = body
-            .find("SyscallError::TimedOut")
-            .expect("TimedOut arm must exist");
-        let would_block_pos = body
-            .find("SyscallError::WouldBlock")
-            .expect("WouldBlock arm must exist");
-        assert!(
-            timed_out_pos < would_block_pos,
-            "SyscallError::TimedOut must appear before SyscallError::WouldBlock (multi-arm pattern)"
-        );
-        // After WouldBlock arm, there must be a break in the subsequent Err(_) arm.
-        let after_would_block = &body[would_block_pos..];
-        let break_pos_rel = after_would_block
-            .find("break 'e2_poll")
-            .expect("break arm must exist after WouldBlock");
-        // Verify nothing between WouldBlock and the break constitutes a retry-path break.
-        let between = &after_would_block[..break_pos_rel];
-        assert!(
-            !between.contains("break 'e2_poll"),
-            "No break must appear between WouldBlock and the final break arm"
+            !body.contains("E2_POLL_YIELD_TICKS"),
+            "E2 poll must not block on a yield-ticks deadline (removed in Stage 163P)"
         );
     }
 
-    // Task A: Err(TimedOut) arm must NOT itself contain break 'e2_poll.
+    // Task A: the parent must yield_now between probes so the child gets the CPU
+    // while the parent stays Runnable (cooperative, timer-independent).
     #[test]
-    fn stage163o_e2_poll_timed_out_arm_is_not_break() {
+    fn stage163p_e2_poll_yields_between_probes() {
         let body = e2_poll_body();
-        // Extract the slice from TimedOut to the next Err(_) arm to verify
-        // there is no break between them.
-        let timed_out_pos = body
-            .find("SyscallError::TimedOut")
-            .expect("TimedOut arm must exist");
-        let after = &body[timed_out_pos..];
-        // The break arm (Err(_) => { break }) appears after the retry arm.
-        // There must NOT be a `break 'e2_poll` between TimedOut and WouldBlock.
-        let to_would_block = after
-            .find("SyscallError::WouldBlock")
-            .expect("WouldBlock arm must follow TimedOut");
-        let between = &after[..to_would_block];
         assert!(
-            !between.contains("break 'e2_poll"),
-            "No break must appear between TimedOut and WouldBlock arms"
+            body.contains("yield_now()"),
+            "E2 poll must call yield_now() between non-blocking probes"
         );
     }
 
-    // Task C: Non-syscall else branch in RISC-V boot bridge must NOT write
-    // frame.regs[A0] from tframe.user_gpr(10). The TCB snapshot used by
-    // apply_user_context is stale: it was synced at ecall entry, not updated
-    // when the fork handler exports ret0=child_tid. A COW fault firing
-    // immediately after fork return would clobber a0=child_tid to 0.
+    // Task A: TimedOut and WouldBlock are retry arms (no break); only the
+    // catch-all Err(e) breaks.
     #[test]
-    fn stage163o_riscv_non_syscall_else_does_not_write_a0_from_tframe() {
+    fn stage163p_e2_poll_transient_arms_do_not_break() {
+        let body = e2_poll_body();
+        assert!(body.contains("SyscallError::TimedOut"));
+        assert!(body.contains("SyscallError::WouldBlock"));
+        for arm in ["result=timedout", "result=wouldblock", "result=none"] {
+            let pos = body.find(arm).expect("retry-arm marker present");
+            let window = &body[pos..(pos + 80).min(body.len())];
+            assert!(
+                !window.contains("break 'e2_poll"),
+                "retry arm '{arm}' must not break the E2 poll loop"
+            );
+        }
+    }
+
+    // Task A: diagnostic markers required by the brief.
+    #[test]
+    fn stage163p_e2_poll_emits_diag_markers() {
+        assert!(INIT_SVC_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_CAPS"));
+        assert!(INIT_SVC_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_RET iter="));
+        assert!(INIT_SVC_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_E2_POLL_HIT"));
+    }
+
+    // Task B: the same-task non-syscall (page-fault) branch must NOT mirror the
+    // generic tframe over the live hardware frame at all — no user_gpr reads, no
+    // sepc/SP reload. Mirroring the stale TCB snapshot corrupts callee-saved regs
+    // (e.g. s2 banking the fork return child_tid) across a COW fault.
+    #[test]
+    fn stage163p_riscv_non_syscall_branch_preserves_full_hw_frame() {
         let body = non_syscall_else_body();
+        // Check for executable forms (open-paren / assignment), not prose in the
+        // explanatory comment which legitimately names these APIs.
         assert!(
-            !body.contains("tframe.user_gpr(10)"),
-            "non-syscall else branch must NOT write frame.regs[A0] from tframe.user_gpr(10) \
-             (stale TCB would clobber fork return a0=child_tid)"
+            !body.contains("tframe.user_gpr("),
+            "non-syscall branch must not read tframe.user_gpr(...) (stale snapshot would \
+             clobber live callee-saved regs like s2 holding the fork return)"
         );
         assert!(
-            !body.contains("tframe.user_gpr(11)"),
-            "non-syscall else branch must NOT write A1 from tframe.user_gpr(11)"
+            !body.contains("tframe.saved_pc("),
+            "non-syscall branch must not reload sepc from tframe (hardware sepc is the \
+             faulting PC to re-execute)"
+        );
+        assert!(
+            !body.contains("tframe.saved_sp("),
+            "non-syscall branch must not reload SP from tframe"
+        );
+        assert!(
+            !body.contains("frame.regs[RiscvTrapFrame::A0] ="),
+            "non-syscall branch must not write A0 (hardware value is the live one)"
+        );
+        assert!(
+            !body.contains("frame.regs[i] ="),
+            "non-syscall branch must not run the GPR mirror loop"
         );
     }
 
-    // Task C: Non-syscall else branch must emit the RISC-V A0 preserve markers.
+    // Task B: the mirror loop and ABI-lane writes must be gated behind
+    // `task_switched || scause == EXC_USER_ECALL`, so a same-task page fault skips
+    // them entirely.
     #[test]
-    fn stage163o_riscv_non_syscall_else_has_preserve_markers() {
+    fn stage163p_riscv_writeback_gated_on_switch_or_ecall() {
+        let bridge = RISCV_BOOT_SRC
+            .split("fn yarm_riscv64_trap_bridge")
+            .nth(1)
+            .expect("trap bridge body");
+        assert!(
+            bridge.contains("if task_switched || scause == EXC_USER_ECALL {"),
+            "tframe→frame writeback must be gated on task_switched || ecall"
+        );
+    }
+
+    // Task B: preserve markers retained for runtime confirmation.
+    #[test]
+    fn stage163p_riscv_non_syscall_branch_has_markers() {
         let body = non_syscall_else_body();
+        for marker in [
+            "RISCV_NON_SYSCALL_TRAP_FRAME_SAVE",
+            "RISCV_PAGE_FAULT_PRESERVE_GPRS",
+            "RISCV_POST_FAULT_TRAP_RETURN",
+            "RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT",
+        ] {
+            assert!(
+                body.contains(marker),
+                "non-syscall branch must emit {marker}"
+            );
+        }
+        // The preserve-GPRS marker now also logs s2 (the fork-return bank reg).
         assert!(
-            body.contains("RISCV_NON_SYSCALL_TRAP_FRAME_SAVE"),
-            "non-syscall else branch must emit RISCV_NON_SYSCALL_TRAP_FRAME_SAVE marker"
-        );
-        assert!(
-            body.contains("RISCV_PAGE_FAULT_PRESERVE_GPRS"),
-            "non-syscall else branch must emit RISCV_PAGE_FAULT_PRESERVE_GPRS marker"
-        );
-        assert!(
-            body.contains("RISCV_POST_FAULT_TRAP_RETURN"),
-            "non-syscall else branch must emit RISCV_POST_FAULT_TRAP_RETURN marker"
-        );
-        assert!(
-            body.contains("RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT"),
-            "non-syscall else branch must emit RISCV_FORK_PARENT_A0_PRESERVED_AFTER_FAULT marker"
+            body.contains("s2="),
+            "RISCV_PAGE_FAULT_PRESERVE_GPRS must log s2 to prove the fork return survives"
         );
     }
 }
