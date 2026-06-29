@@ -4039,6 +4039,91 @@ Stage 163I PF/intermediate-permission behavior all remain intact. No syscall/IPC
 ABI change, no IPC/cap seam moved, counts unchanged (`SYSCALL_COUNT == 31`,
 `VARIANT_COUNT == 23`), RPi5 untouched, `MAX_ADDRESS_SPACES` remains 32.
 
+#### 5.1.9.18 Stage 163L — non-x86 fork return-lane fix + post-proof child parking
+
+**Goal.** Two issues remained after Stage 163K:
+
+1. **RISC-V and AArch64 fork parent return lanes were broken.**  The parent
+   saw `ret0=0` instead of the child TID because the arch restore path
+   (`apply_user_context`) overwrote the return registers with the pre-syscall
+   TCB snapshot before the `+4` PC advance and export could set them.
+2. **Child post-proof park loop spun on `yield_now()` (nr=0)**, polluting the
+   syscall trace with repeated nr=0 noise during sender-wake verification.
+
+**RISC-V root cause and fix** (`src/arch/riscv64/trap.rs`):
+
+`handle_trap_entry_with_fault_bookkeeping_mode` previously advanced `saved_pc`
+by 4 *before* `restore_arch_thread_state`.  `restore_arch_thread_state` calls
+`resume_current_thread_with_frame` → `apply_user_context`, which overwrites
+`frame.saved_pc` with the TCB's `instruction_ptr = ecall_addr`, undoing the
+advance.  The same call also set `frame.user_gprs[10] = TCB.user_gprs[10] = 0`
+(pre-syscall a0), wiping any `ret0` value.
+
+Fix: call `restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())` first
+(preserving `frame` for later use), then advance `saved_pc += 4`, then export
+`ret0 → user_gpr(10)` and `ret1 → user_gpr(11)` (or `error → user_gpr(10)` on
+error).
+
+**AArch64 root cause and fix** (`src/arch/aarch64/trap.rs`):
+
+`export_syscall_result_to_user_gprs` correctly placed `ret0=child_tid` in
+`user_gprs[REG_X0]` on the direct-ERET path.  But the TCB had been saved
+earlier (lines 385–395) with `user_gprs[0]=0` (pre-syscall frame state before
+export ran).  When the Stage 117 switch-plan stash is active (`switch_pending =
+true`) `restore_arch_thread_state(syscall_return=true)` is skipped; the task is
+later resumed via `restore_arch_thread_state_post_switch(syscall_return=false)`,
+which runs the arg-mirror (`user_gprs[x0..x2] = args[0..2]`).  Since
+`args[0..2]` still held the original input arguments (e.g. `args[0]=0` for
+fork), the mirror overwrote the exported `user_gprs[REG_X0]=child_tid` with 0.
+
+Fix: after `export_syscall_result_to_user_gprs(trapframe)`, unconditionally sync
+`args[0..2]` from the just-exported `user_gprs[x0..x2]`, then re-call
+`set_thread_user_context` to persist the updated context to the TCB.  This makes
+the arg-mirror idempotent: `user_gprs[REG_X0] = args[0] = child_tid`.
+
+**Proof-gated diagnostic markers added (Task A):**
+
+| Marker | Architecture | Emitted when |
+|--------|-------------|--------------|
+| `RISCV_FORK_PARENT_RET_BEFORE_RETURN tid=<t> ret0=<r> a0=<a0> err=<e>` | riscv64 | Before a0 export, on ecall return |
+| `RISCV_TRAP_RETURN_FRAME tid=<t> a0=<a0> a1=<a1> a2=<a2> err=<e>` | riscv64 | After a0/a1 export |
+| `NONX86_SYSCALL_RETURN_LANE_SET arch=riscv64 tid=<t> nr=<nr> ret0=<r> err=<e>` | riscv64 | After export |
+| `AARCH64_FORK_PARENT_RET_BEFORE_RETURN tid=<t> ret0=<r> x0=<x0> err=<e>` | aarch64 | Before export, in the !task_switched Syscall block |
+| `AARCH64_TRAP_RETURN_FRAME tid=<t> x0=<x0> x1=<x1> x2=<x2> err=<e>` | aarch64 | After export and arg sync |
+| `NONX86_SYSCALL_RETURN_LANE_SET arch=aarch64 tid=<t> nr=<nr> ret0=<r> err=<e>` | aarch64 | After export and arg sync |
+
+All markers gated on `crate::kernel::boot::ipc_recv_proof_sender_wake_active()`.
+
+**Task D: child parking + completion markers** (`service.rs`):
+
+The child's `loop { yield_now() }` park was replaced by
+`loop { ipc_recv(e1_recv) }` (blocking on the proof endpoint, emitting nr=2
+instead of nr=0).  New markers bracket both roles:
+
+| Marker | Role | Where |
+|--------|------|-------|
+| `IPC_RECV_PROOF_SENDER_WAKE_CHILD_DONE` | child | Replaces `SENDER_DONE` (child path); before park loop |
+| `IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=child` | child | Before blocking park loop |
+| `IPC_RECV_PROOF_SENDER_WAKE_PARENT_DONE` | parent | After `SEQUENCE_DONE` |
+| `IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=parent` | parent | After `PARENT_DONE` |
+| `IPC_RECV_PROOF_SENDER_WAKE_PARKED role=parent` | parent | Before function return |
+
+**Task C (user action required):** Rerun sender-wake on AArch64 and RISC-V to
+observe `AARCH64_FORK_PARENT_RET_BEFORE_RETURN`, `RISCV_FORK_PARENT_RET_BEFORE_RETURN`,
+and the `NONX86_SYSCALL_RETURN_LANE_SET` markers in the proof log and confirm
+parent returns `ret0=child_tid, err=0` on those arches.
+
+**Preserved invariants:**
+
+- Stage 163J x86_64 child return lane (`user_gprs[0]=0` in
+  `fork_complete_post_clone`) untouched.
+- Stage 163K no-smoke-interference (smoke not called in sender-wake path) untouched.
+- Stage 163E COW behavior and Stage 163I PF/intermediate-permission behavior
+  intact.
+- No syscall/IPC ABI change, no IPC/cap seam moved, counts unchanged
+  (`SYSCALL_COUNT == 31`, `VARIANT_COUNT == 23`), RPi5 untouched,
+  `MAX_ADDRESS_SPACES` remains 32.
+
 ### 5.2 D1 audit — answers to the seven readiness questions
 
 Q1 — Does `recv_core.rs` already plumb a `RecvCapTransferPlan` through

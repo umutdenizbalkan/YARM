@@ -45124,3 +45124,227 @@ mod stage163k_no_smoke_interference {
         );
     }
 }
+
+mod stage163l_nonx86_fork_return {
+    const RISCV_TRAP_SRC: &str = include_str!("../../arch/riscv64/trap.rs");
+    const AARCH64_TRAP_SRC: &str = include_str!("../../arch/aarch64/trap.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const X86_VM_LAYOUT_SRC: &str = include_str!("../../arch/x86_64/vm_layout.rs");
+    const INIT_SVC_SRC: &str = include_str!(
+        "../../../crates/yarm-control-plane-servers/src/control_plane/init/service.rs"
+    );
+
+    fn riscv_trap_entry() -> &'static str {
+        RISCV_TRAP_SRC
+            .split("fn handle_trap_entry_with_fault_bookkeeping_mode")
+            .nth(1)
+            .and_then(|s| s.split("\npub fn ").next())
+            .expect("RISC-V handle_trap_entry_with_fault_bookkeeping_mode body")
+    }
+
+    fn aarch64_export_block() -> &'static str {
+        AARCH64_TRAP_SRC
+            .split("export_syscall_result_to_user_gprs(trapframe);")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("AArch64 export block")
+    }
+
+    fn sender_wake_workload() -> &'static str {
+        INIT_SVC_SRC
+            .split("fn run_ipc_recv_proof_sender_wake")
+            .nth(1)
+            .and_then(|s| s.split("\nfn ").next())
+            .expect("sender-wake workload body")
+    }
+
+    // 1. RISC-V: restore must happen BEFORE the PC+4 advance and a0 export.
+    #[test]
+    fn stage163l_riscv_restore_before_pc_advance() {
+        let body = riscv_trap_entry();
+        let restore_pos = body
+            .find("restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())")
+            .expect("restore_arch_thread_state must use as_deref_mut in RISC-V trap");
+        let advance_pos = body
+            .find("f.saved_pc = f.saved_pc.wrapping_add(4)")
+            .expect("PC+4 advance must exist in RISC-V trap");
+        assert!(
+            restore_pos < advance_pos,
+            "restore_arch_thread_state must come BEFORE saved_pc += 4 in RISC-V trap"
+        );
+    }
+
+    // 2. RISC-V: ret0 must be exported to a0 (user_gpr 10) after restore.
+    #[test]
+    fn stage163l_riscv_ret0_exported_to_a0() {
+        let body = riscv_trap_entry();
+        assert!(
+            body.contains("f.set_user_gpr(10, f.ret0())"),
+            "RISC-V trap must export ret0 → a0 (user_gpr 10) on success"
+        );
+        assert!(
+            body.contains("f.set_user_gpr(11, f.ret1())"),
+            "RISC-V trap must export ret1 → a1 (user_gpr 11) on success"
+        );
+        assert!(
+            body.contains("f.set_user_gpr(10, err)"),
+            "RISC-V trap must export error code → a0 on error"
+        );
+    }
+
+    // 3. RISC-V: proof-gated diagnostic markers are present and gated.
+    #[test]
+    fn stage163l_riscv_diagnostic_markers_proof_gated() {
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_FORK_PARENT_RET_BEFORE_RETURN"),
+            "RISCV_FORK_PARENT_RET_BEFORE_RETURN marker must exist"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("RISCV_TRAP_RETURN_FRAME"),
+            "RISCV_TRAP_RETURN_FRAME marker must exist"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("NONX86_SYSCALL_RETURN_LANE_SET arch=riscv64"),
+            "NONX86_SYSCALL_RETURN_LANE_SET arch=riscv64 marker must exist"
+        );
+        assert!(
+            RISCV_TRAP_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "RISC-V arch diagnostics must be proof-gated"
+        );
+    }
+
+    // 4. AArch64: args[0..2] are synced from exported user_gprs after export.
+    #[test]
+    fn stage163l_aarch64_args_synced_after_export() {
+        assert!(
+            AARCH64_TRAP_SRC.contains(
+                "trapframe.set_arg(0, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X0))"
+            ),
+            "AArch64 must sync arg(0) from user_gpr(REG_X0) after export"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains(
+                "trapframe.set_arg(1, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X1))"
+            ),
+            "AArch64 must sync arg(1) from user_gpr(REG_X1) after export"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains(
+                "trapframe.set_arg(2, trapframe.user_gpr(crate::arch::aarch64::syscall_abi::REG_X2))"
+            ),
+            "AArch64 must sync arg(2) from user_gpr(REG_X2) after export"
+        );
+    }
+
+    // 5. AArch64: TCB is re-saved after export (set_thread_user_context call).
+    #[test]
+    fn stage163l_aarch64_tcb_resaved_after_export() {
+        let block = aarch64_export_block();
+        assert!(
+            block.contains("kernel.set_thread_user_context(tid, ctx)"),
+            "AArch64 must re-save TCB after export and arg sync"
+        );
+    }
+
+    // 6. AArch64: proof-gated diagnostic markers are present and gated.
+    #[test]
+    fn stage163l_aarch64_diagnostic_markers_proof_gated() {
+        assert!(
+            AARCH64_TRAP_SRC.contains("AARCH64_FORK_PARENT_RET_BEFORE_RETURN"),
+            "AARCH64_FORK_PARENT_RET_BEFORE_RETURN marker must exist"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("AARCH64_TRAP_RETURN_FRAME"),
+            "AARCH64_TRAP_RETURN_FRAME marker must exist"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("NONX86_SYSCALL_RETURN_LANE_SET arch=aarch64"),
+            "NONX86_SYSCALL_RETURN_LANE_SET arch=aarch64 marker must exist"
+        );
+        assert!(
+            AARCH64_TRAP_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "AArch64 arch diagnostics must be proof-gated"
+        );
+    }
+
+    // 7. Sender-wake ordering: child uses blocking ipc_recv (not yield_now) to park.
+    #[test]
+    fn stage163l_child_park_uses_blocking_ipc_recv() {
+        let workload = sender_wake_workload();
+        // The old SENDER_DONE + yield_now parking must be gone.
+        assert!(
+            !workload.contains("IPC_RECV_PROOF_SENDER_WAKE_SENDER_DONE\")"),
+            "old SENDER_DONE marker (standalone, not with observed=1) must be replaced by CHILD_DONE"
+        );
+        // The park loop must be driven by ipc_recv, not yield_now.
+        let park_begin_pos = workload
+            .find("IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=child")
+            .expect("PARK_BEGIN role=child must exist in workload");
+        let park_region = &workload[park_begin_pos..];
+        let next_loop = park_region.find("loop {").expect("park loop must exist after PARK_BEGIN");
+        let loop_body = &park_region[next_loop..park_region[next_loop..].find('}').map(|p| next_loop + p + 1).unwrap_or(park_region.len())];
+        assert!(
+            !loop_body.contains("yield_now"),
+            "child park loop must not use yield_now"
+        );
+        assert!(
+            workload.contains("ipc_recv(e1_recv)"),
+            "child parking must use blocking ipc_recv on the proof endpoint"
+        );
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_CHILD_DONE"),
+            "child must emit CHILD_DONE marker"
+        );
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=child"),
+            "child must emit PARK_BEGIN role=child marker"
+        );
+    }
+
+    // 8. Parent emits done/park markers after sequence completion.
+    #[test]
+    fn stage163l_parent_emits_done_and_park_markers() {
+        let workload = sender_wake_workload();
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_PARENT_DONE"),
+            "parent must emit PARENT_DONE marker after sequence"
+        );
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_PARK_BEGIN role=parent"),
+            "parent must emit PARK_BEGIN role=parent marker"
+        );
+        assert!(
+            workload.contains("IPC_RECV_PROOF_SENDER_WAKE_PARKED role=parent"),
+            "parent must emit PARKED role=parent marker"
+        );
+    }
+
+    // 9. Confinement: IPC/cap seams untouched, counts unchanged,
+    //    MAX_ADDRESS_SPACES stays 32.
+    #[test]
+    fn stage163l_confinement_counts_and_bounds() {
+        for def in &[
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_endpoint_split_recv(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+            "fn try_split_recv_queued_plain_into_frame_locked(",
+            "fn clear_blocked_recv_state(",
+        ] {
+            assert!(
+                SYSCALL_SRC.contains(def),
+                "stateful seam `{def}` must remain in syscall.rs"
+            );
+        }
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31;")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23;"),
+            "syscall/IPC counts unchanged"
+        );
+        assert!(
+            X86_VM_LAYOUT_SRC.contains(
+                "#[cfg(not(feature = \"hosted-dev\"))]\npub const MAX_ADDRESS_SPACES: usize = 32;"
+            ),
+            "MAX_ADDRESS_SPACES stays 32"
+        );
+    }
+}

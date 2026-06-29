@@ -113,14 +113,56 @@ pub(crate) fn handle_trap_entry_with_fault_bookkeeping_mode(
         frame.as_deref_mut(),
         fault_bookkeeping_mode,
     )?;
-    // RISC-V ecall does not advance SEPC automatically; advance by 4 so sret
-    // resumes at the instruction after the ecall instead of re-executing it.
+    // Stage 163L: restore FIRST so apply_user_context (called inside
+    // resume_current_thread_with_frame) does not overwrite saved_pc with the
+    // TCB's pre-syscall ecall address, undoing the +4 advance below, and does
+    // not zero a0 (user_gprs[10]) from the pre-syscall TCB snapshot.
+    restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())?;
+    // RISC-V ecall does not advance SEPC automatically.  Advance saved_pc by 4
+    // AFTER restore so sret resumes at the instruction after the ecall.  Also
+    // export ret0→a0 and ret1→a1 (or error→a0) so userspace sees the correct
+    // syscall return value — apply_user_context zeroed a0 from the pre-syscall
+    // TCB snapshot.
     if context.scause == EXC_USER_ECALL {
         if let Some(f) = frame.as_deref_mut() {
+            if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                let tid = kernel.current_tid().unwrap_or(0);
+                crate::yarm_log!(
+                    "RISCV_FORK_PARENT_RET_BEFORE_RETURN tid={} ret0={} a0={} err={}",
+                    tid,
+                    f.ret0(),
+                    f.user_gpr(10),
+                    f.error
+                );
+            }
             f.saved_pc = f.saved_pc.wrapping_add(4);
+            if let Some(err) = f.error_code() {
+                f.set_user_gpr(10, err);
+            } else {
+                f.set_user_gpr(10, f.ret0());
+                f.set_user_gpr(11, f.ret1());
+            }
+            if crate::kernel::boot::ipc_recv_proof_sender_wake_active() {
+                let tid = kernel.current_tid().unwrap_or(0);
+                let nr = f.syscall_num();
+                crate::yarm_log!(
+                    "NONX86_SYSCALL_RETURN_LANE_SET arch=riscv64 tid={} nr={} ret0={} err={}",
+                    tid,
+                    nr,
+                    f.ret0(),
+                    f.error
+                );
+                crate::yarm_log!(
+                    "RISCV_TRAP_RETURN_FRAME tid={} a0={} a1={} a2={} err={}",
+                    tid,
+                    f.user_gpr(10),
+                    f.user_gpr(11),
+                    f.user_gpr(12),
+                    f.error
+                );
+            }
         }
     }
-    restore_arch_thread_state(kernel, cpu, frame)?;
     Ok(())
 }
 
