@@ -1152,6 +1152,36 @@ impl KernelState {
                 );
                 return Ok(());
             }
+            // Stage 165B: the per-tid full-stack maps above cover only
+            // `[stack_base, stack_top)`.  The proof's deep post-switch call chain
+            // (`handle_trap` → `process_ipc_timeout_deadlines`, ~8 KiB frame)
+            // grows the LIVE kernel stack below `stack_base` into the region's
+            // guard-adjacent page, where the next trap frame faulted (#PF write,
+            // CR2 = RSP − 8, both inside `[region_base, stack_base)`).  Sample the
+            // live RSP now — it is on the outgoing task's kernel trap stack, the
+            // same region the post-proof path runs on — and map the FULL region
+            // containing it (including the page below `stack_base`).  Selection is
+            // by RSP containment, not target task identity.
+            #[cfg(not(feature = "hosted-dev"))]
+            {
+                let sampled_rsp: usize;
+                // SAFETY: read-only RSP sample; touches no memory.
+                unsafe {
+                    core::arch::asm!(
+                        "mov {}, rsp",
+                        out(reg) sampled_rsp,
+                        options(nomem, nostack, preserves_flags)
+                    );
+                }
+                if let Err(err) = self.d6_ensure_live_rsp_region_mapped(sampled_rsp) {
+                    crate::yarm_log!(
+                        "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED rsp=0x{:x} err={:?}",
+                        sampled_rsp,
+                        err
+                    );
+                    return Ok(());
+                }
+            }
             // Stage 139: capture hardware CR3 just before the proof switch so the
             // cleanup can detect any divergence and restore it.
             #[cfg(not(feature = "hosted-dev"))]

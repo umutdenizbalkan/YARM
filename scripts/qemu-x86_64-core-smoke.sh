@@ -547,7 +547,25 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
       proof_fail=1
     fi
   done
-  if [[ "$proof_fail" -eq 1 ]]; then
+  # Stage 165B: early proof markers alone do NOT prove success.  A healthy D6
+  # proof boot must not emit ANY raw fatal breadcrumb AFTER the proof begins.
+  # The Stage 165 crash printed `[ok]` for every early marker and then faulted
+  # (#PF `!Fv…`/`!BNv…`) in the post-proof trap path, which this gate now rejects.
+  fatal_after_proof=0
+  if [[ -f "$LOGFILE" ]]; then
+    proof_tail="$(tr '\r' '\n' <"$LOGFILE" \
+      | awk '/D6_CONTROLLED_SWITCH_PROOF_BEGIN/{seen=1} seen{print}')"
+    for fatal_pat in '!Fv' '!BNv' 'PAGE_FAULT' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$proof_tail" | rg -a -F -q -- "$fatal_pat"; then
+        echo "[error] D6 switch proof: fatal breadcrumb after proof start: $fatal_pat"
+        fatal_after_proof=1
+      fi
+    done
+  fi
+  if [[ "$fatal_after_proof" -eq 0 ]]; then
+    echo "[ok] D6 switch proof: no fatal breadcrumb after proof start"
+  fi
+  if [[ "$proof_fail" -eq 1 || "$fatal_after_proof" -eq 1 ]]; then
     echo "[error] D6 switch proof mode FAILED"
     exit 1
   fi

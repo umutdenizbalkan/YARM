@@ -35616,10 +35616,12 @@ mod stage127_target_asid_switch_stack_mapping {
         let start = THREAD_STATE_SRC
             .find("Stage 126/127/128 kernel switch-stack invariant gate")
             .expect("Stage 127 stack check helper");
+        // End before the Stage 165B live-RSP region map (which legitimately maps
+        // the full region by RSP containment) so this narrow-gate slice excludes it.
         let end = THREAD_STATE_SRC[start..]
-            .find("pub fn initialize_thread_kernel_switch_frame")
+            .find("fn d6_ensure_live_rsp_region_mapped")
             .map(|offset| start + offset)
-            .expect("init helper after stack check");
+            .expect("live-RSP region map after stack check");
         &THREAD_STATE_SRC[start..end]
     }
 
@@ -36186,10 +36188,12 @@ mod stage128_active_cr3_switch_stack_mapping {
         let start = THREAD_STATE_SRC
             .find("Stage 126/127/128 kernel switch-stack invariant gate")
             .expect("Stage 128 stack check helper");
+        // End before the Stage 165B live-RSP region map (which legitimately maps
+        // the full region by RSP containment) so this narrow-gate slice excludes it.
         let end = THREAD_STATE_SRC[start..]
-            .find("pub fn initialize_thread_kernel_switch_frame")
+            .find("fn d6_ensure_live_rsp_region_mapped")
             .map(|offset| start + offset)
-            .expect("init helper after stack check");
+            .expect("live-RSP region map after stack check");
         &THREAD_STATE_SRC[start..end]
     }
 
@@ -37051,10 +37055,12 @@ mod stage132_post_cleanup_pf_diagnosis {
         let start = THREAD_STATE_SRC
             .find("fn d6_ensure_full_proof_switch_stack_mapped")
             .expect("Stage 132 full-stack map function");
+        // End at the Stage 165B live-RSP region map (inserted after the full-stack
+        // map + its stub) so this slice covers only the full-stack map functions.
         let end = THREAD_STATE_SRC[start..]
-            .find("pub fn initialize_thread_kernel_switch_frame")
+            .find("fn d6_ensure_live_rsp_region_mapped")
             .map(|offset| start + offset)
-            .expect("init function after full-stack map");
+            .expect("live-RSP region map after full-stack map");
         &THREAD_STATE_SRC[start..end]
     }
 
@@ -45826,6 +45832,167 @@ mod stage163p_sender_wake_fix {
         assert!(
             body.contains("s2="),
             "RISCV_PAGE_FAULT_PRESERVE_GPRS must log s2 to prove the fork return survives"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
+//
+// The Stage 165 D6 switch proof printed every early proof marker `[ok]` and
+// then faulted in the post-proof trap path: a supervisor write (#PF, error
+// 0x2) to `CR2 = RSP − 8`, both inside the guard-adjacent page below the
+// proof stack's `stack_base` (observed `CR2=0xffff_8000_0001_8dd8`,
+// `RSP=0xffff_8000_0001_8de0`, region idx 3 whose mapped stack starts at
+// `0xffff_8000_0001_9000`).  `d6_ensure_full_proof_switch_stack_mapped` maps
+// only `[stack_base, stack_top)` selected by tid; the live kernel stack grew
+// below that.  These guards pin the live-RSP full-region mapping so a
+// single-top-page-only (or stack_base-only) mapping can never return.
+// ===========================================================================
+#[cfg(test)]
+mod stage165b_d6_live_rsp_stack_map {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+
+    fn live_rsp_map_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_live_rsp_region_mapped")
+            .expect("Stage 165B live-RSP region map function must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("function after live-RSP region map");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    fn proof_source() -> &'static str {
+        let start = EXEC_STATE_SRC
+            .find("fn maybe_run_d6_controlled_switch_proof")
+            .expect("D6 proof function must exist");
+        let end = EXEC_STATE_SRC[start..]
+            .find("pub fn futex_wait_current")
+            .map(|offset| start + offset)
+            .expect("next fn after proof");
+        &EXEC_STATE_SRC[start..end]
+    }
+
+    // 1. The live-RSP region map function is declared in thread_state.rs.
+    #[test]
+    fn stage165b_live_rsp_region_map_declared() {
+        assert!(
+            THREAD_STATE_SRC.contains("fn d6_ensure_live_rsp_region_mapped"),
+            "thread_state.rs must declare d6_ensure_live_rsp_region_mapped"
+        );
+    }
+
+    // 2. Selection is by SAMPLED RSP containment, not target task identity:
+    //    the region base/top derive from KERNEL_STACK_REGION_BASE/SIZE and the
+    //    sampled_rsp argument, never from a tid's stack_base.
+    #[test]
+    fn stage165b_region_selected_by_sampled_rsp() {
+        let body = live_rsp_map_source();
+        assert!(
+            body.contains("sampled_rsp"),
+            "live-RSP map must take the sampled RSP as its selector"
+        );
+        assert!(
+            body.contains("KERNEL_STACK_REGION_BASE") && body.contains("KERNEL_STACK_REGION_SIZE"),
+            "region must be derived from KERNEL_STACK_REGION_BASE/SIZE (RSP containment)"
+        );
+        assert!(
+            body.contains("sampled_rsp - KERNEL_STACK_REGION_BASE"),
+            "region index must be computed from the sampled RSP offset"
+        );
+    }
+
+    // 3. The mapping covers the FULL region (region_base..region_top), NOT just
+    //    the top page and NOT just stack_base..stack_top.  This is the core
+    //    guard against a single-top-page-only mapping returning.
+    #[test]
+    fn stage165b_maps_full_region_not_single_page() {
+        let body = live_rsp_map_source();
+        assert!(
+            body.contains("let mut page_addr = region_base;"),
+            "mapping must start at region_base (includes the page below stack_base)"
+        );
+        assert!(
+            body.contains("while page_addr < region_top"),
+            "mapping must iterate the full region with a while loop, not map one page"
+        );
+        // Must NOT seed the loop from stack_base (that was the Stage 132 behavior
+        // that left the guard-adjacent page unmapped).
+        assert!(
+            !body.contains("page_addr = stack_base"),
+            "live-RSP map must not start from stack_base (would skip the faulting page)"
+        );
+    }
+
+    // 4. Pages are mapped supervisor-only writable (KERNEL_RW, USER bit clear);
+    //    never user-accessible.
+    #[test]
+    fn stage165b_pages_are_supervisor_only() {
+        let body = live_rsp_map_source();
+        assert!(
+            body.contains("PageFlags::KERNEL_RW"),
+            "live-RSP map must use PageFlags::KERNEL_RW (supervisor-only writable)"
+        );
+        assert!(
+            body.contains("PageTableEntry::USER) == 0"),
+            "live-RSP map must validate that mapped entries are NOT user-accessible"
+        );
+    }
+
+    // 5. A coverage marker proves the mapped range includes the faulting RSP page.
+    #[test]
+    fn stage165b_emits_coverage_marker() {
+        let body = live_rsp_map_source();
+        assert!(
+            body.contains("D6_PROOF_LIVE_RSP_STACK_MAP_BEGIN"),
+            "must emit D6_PROOF_LIVE_RSP_STACK_MAP_BEGIN"
+        );
+        assert!(
+            body.contains("D6_PROOF_LIVE_RSP_STACK_MAP_DONE") && body.contains("covers_rsp_page"),
+            "must emit D6_PROOF_LIVE_RSP_STACK_MAP_DONE with covers_rsp_page proof"
+        );
+    }
+
+    // 6. The proof samples the live RSP and calls the live-RSP region map before
+    //    the switch.
+    #[test]
+    fn stage165b_proof_samples_rsp_and_maps() {
+        let body = proof_source();
+        assert!(
+            body.contains("mov {}, rsp"),
+            "proof must sample the live RSP via inline asm"
+        );
+        assert!(
+            body.contains("d6_ensure_live_rsp_region_mapped(sampled_rsp)"),
+            "proof must call d6_ensure_live_rsp_region_mapped with the sampled RSP"
+        );
+    }
+
+    // 7. The per-participant full-stack map now backs the guard-adjacent page
+    //    (starts one guard page below stack_base) so whichever proof participant
+    //    owns the faulting region survives its overflow.  This prevents a
+    //    stack_base-only (guard-excluding) mapping from returning.
+    #[test]
+    fn stage165b_full_proof_map_includes_guard_adjacent_page() {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_full_proof_switch_stack_mapped")
+            .expect("full-stack map function must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("fn d6_ensure_live_rsp_region_mapped")
+            .map(|offset| start + offset)
+            .expect("live-RSP region map after full-stack map");
+        let body = &THREAD_STATE_SRC[start..end];
+        assert!(
+            body.contains("saturating_sub(KERNEL_STACK_GUARD_SIZE)")
+                && body.contains("let mut page_addr = region_base;"),
+            "full-proof map must start one guard page below stack_base (region_base)"
+        );
+        assert!(
+            !body.contains("let mut page_addr = stack_base &"),
+            "full-proof map must not start at stack_base (would skip the guard-adjacent page)"
         );
     }
 }
