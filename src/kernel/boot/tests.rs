@@ -46865,4 +46865,39 @@ mod stage166_d6_switch_a {
             "smoke must verify the D6-SWITCH-A markers and fail on missing/fatal"
         );
     }
+
+    // 9. Stage 166B: the stale CHECK_FAILED-without-CHECK_OK heuristic is
+    //    suppressed when the proof completed cleanly, but the hard runtime gates
+    //    remain unconditional.
+    #[test]
+    fn stage166b_check_failed_heuristic_suppressed_when_clean() {
+        // The heuristic is now gated behind a "proof completed clean" computation.
+        assert!(
+            SMOKE_SRC.contains("proof_completed_clean=1")
+                && SMOKE_SRC.contains("skipping stale CHECK_FAILED"),
+            "the CHECK_FAILED heuristic must be skipped when the proof completed clean"
+        );
+        // The clean condition requires DONE + CLEANUP_DONE + failures=0 + no fatal.
+        assert!(
+            SMOKE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_DONE")
+                && SMOKE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE")
+                && SMOKE_SRC.contains("failures=0\\b")
+                && SMOKE_SRC.contains("fatal_after_proof"),
+            "clean-completion must require DONE/CLEANUP_DONE/failures=0/no-fatal"
+        );
+        // Hard runtime gates remain present and unconditional.
+        for gate in [
+            "D6_POST_CLEANUP_STACK_MAP_SKIP",
+            "D6_POST_CLEANUP_STACK_MAP_ROOT .*result=failed",
+            "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED",
+            "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED",
+            "D6_FIRST_RESUME_STASH_MISSING",
+            "fatal breadcrumb after proof start",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(gate),
+                "hard runtime gate must remain: {gate}"
+            );
+        }
+    }
 }

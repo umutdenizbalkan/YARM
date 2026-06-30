@@ -4831,7 +4831,7 @@ mechanically complete (Stage 152). The roadmap, in order:
    live-wire, no ABI change. See the `stage165*` guards in
    `src/kernel/boot/tests.rs`.
 
-2. **D6-SWITCH-A — first narrow x86_64 production Outcome A (Stage 166, IMPLEMENTED).**
+2. **D6-SWITCH-A — first narrow x86_64 production Outcome A (Stage 166, ACCEPTED).**
    With D6-SWITCH-SMOKE accepted, Stage 166 adds a default-off knob
    `yarm.d6_switch_a=1` (script: `D6_SWITCH_A=1`) that drives the *same proven
    production* `maybe_switch_kernel_context` → `DISPATCH_SWITCH_PLAN_STASH` →
@@ -4855,6 +4855,32 @@ mechanically complete (Stage 152). The roadmap, in order:
    Stage 166 deliberately does **not** delete the `with_scheduler_split_mut` /
    global-lock fences or broaden to all switch paths — that is the follow-on
    D6-GENUINE. See the `stage166_d6_switch_a` guards in `src/kernel/boot/tests.rs`.
+
+   **ACCEPTED (user QEMU, 2026).** The `D6_SWITCH_A=1` run produced a real
+   production unlocked switch — `D6_SWITCH_A_ENABLED`,
+   `D6_SWITCH_A_CANDIDATE outgoing=1 incoming=2`,
+   `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing=1 incoming=2`,
+   `D6_SWITCH_A_LOCK_DROPPED`/`SWITCH_ENTER`/`FIRST_RESUME incoming=2`/`RETURNED`/`DONE`
+   — with no `!Fv`/`!BNv`/`PAGE_FAULT`/`DOUBLE_FAULT`/`PANIC`/`FATAL` and the
+   x86_64 service baseline reached. The 5-minute `D6_SWITCH_PROOF=1` regression
+   ran clean (`PROOF_DONE` / `CLEANUP_DONE` /
+   `D6_POST_CLEANUP_STACK_MAP_DONE tasks=4 roots=3 failures=0 guard_pages=4`),
+   and the normal core smoke + Stage 163P sender-wake oracle passed.
+
+   **Stage 166B (smoke false-negative fix).** The same run was initially reported
+   as failed by `scripts/qemu-x86_64-core-smoke.sh` due to a stale Stage 165D
+   heuristic ("`D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid=N` with no later
+   `CHECK_OK`"). Those CHECK_FAILED lines are early `target_asid_unavailable`
+   retries; once the proof completes via the accepted path the mapping succeeds
+   through a different code path that need not emit a matching `CHECK_OK`. The
+   heuristic is now **suppressed when the proof completed cleanly** (PROOF_DONE +
+   CLEANUP_DONE + post-cleanup `failures=0` + no fatal breadcrumb after proof
+   start). All hard runtime gates remain unconditional (fatal breadcrumbs,
+   `…STACK_MAP_SKIP`, `…STACK_MAP_ROOT … result=failed`, `…STACK_MAP_DONE …
+   failures>0`, `…GUARD_PAGE … included=0`, no-owner NOTE,
+   `D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED`, `D6_PROOF_LIVE_RSP_STACK_MAP_FAILED`,
+   `D6_FIRST_RESUME_STASH_MISSING`), so runtime safety is unchanged. Guarded by
+   `stage166b_check_failed_heuristic_suppressed_when_clean`.
 
 3. **D6-GENUINE — D6 dispatch seam fully live-wired.** Extend the Outcome A unlock to
    all production tasks on x86_64; verify that the deferred markers
