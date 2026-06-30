@@ -4887,6 +4887,43 @@ mechanically complete (Stage 152). The roadmap, in order:
    (`D6_GLOBAL_LOCK_DROP_DEFERRED`) no longer appear in the default x86_64 smoke.
    Gated on D6-SWITCH-A.
 
+   **D6-GENUINE-A — first live caller of the rank-1 scheduler seam (Stage 167).**
+   The intermediate step that makes `SharedKernel::with_scheduler_split_mut`
+   (rank 1) its **first live production caller**, ending its `M2_SEAM_HELPER_ONLY`
+   status, behind a default-off knob `yarm.d6_genuine=1` (script: `D6_GENUINE=1`;
+   x86_64-only, single-CPU). After `handle_trap_entry_shared`'s `with_cpu` returns
+   and the global `SpinLock<KernelState>` guard is dropped, the trap-entry path
+   calls `SharedKernel::d6_genuine_local_dispatch_observe(cpu)`, which runs **one
+   `local_dispatch_step_split` dispatch observation through the seam holding ONLY
+   the scheduler lock** — the global lock is genuinely not held. The observation
+   is **non-mutating** (it reads the committed dispatch decision via
+   `current_tid_on` / `runnable_count_on`, never `dispatch_next_on`), so it can
+   never double-advance the run queue; the **in-lock `local_dispatch_step_split`
+   inside `with_cpu` stays the authoritative dispatch decision and the preserved
+   fallback**. The knob is mutually exclusive with `d6_switch_proof` /
+   `d6_switch_a` so those paths are untouched. Markers: `D6_GENUINE_ENABLED`,
+   `D6_LOCAL_DISPATCH_SEAM_CANDIDATE`, `D6_LOCAL_DISPATCH_SEAM_ENTER`,
+   `D6_LOCAL_DISPATCH_SEAM_LOCK_SCOPE_DROPPED`,
+   `D6_LOCAL_DISPATCH_STEP_SPLIT cpu=<n> tid=<…> runnable=<n>`,
+   `D6_LOCAL_DISPATCH_SEAM_COUNT cpu=<n> n=<n> tid=<…>`,
+   `D6_LOCAL_DISPATCH_SEAM_DONE`, and `D6_LOCAL_DISPATCH_SEAM_FALLBACK` for the
+   ineligible (multi-CPU) case. Stage 167 deliberately does **not** relocate the
+   in-lock authoritative dispatch out of the global lock (that is the remaining
+   D6-GENUINE work, which requires moving the dispatch entry point ahead of
+   `with_cpu` — see the documented blocker on `local_dispatch_step_split`), nor
+   broaden to mutating the scheduler from the new out-of-lock path, nor live-wire
+   the D2/D3/D5 seams. The scheduler seam's validation label moves from
+   `M2_SEAM_HELPER_ONLY` to `M2_SEAM_LIVE_D6_GENUINE` in `runtime.rs`; the other
+   seams keep their fences. Guarded by the `stage167_d6_genuine` module in
+   `src/kernel/boot/tests.rs`; all three arches cross-build (the wire is
+   x86_64-only and a no-op elsewhere). Acceptance (user QEMU): (A) production
+   gate — `TIMEOUT_SECS=120 D6_GENUINE=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`
+   (must show the `D6_LOCAL_DISPATCH_SEAM_*` markers and reach service baseline
+   with no fatal breadcrumb after the seam wire begins); (B) D6-SWITCH-A
+   regression (`D6_SWITCH_A=1`); (C) D6 proof regression (`D6_SWITCH_PROOF=1`);
+   (D) normal core smoke; (E) Stage 163P sender-wake oracle. **PENDING user QEMU
+   acceptance.**
+
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
    `block_current_on_receive_with_deadline` call boundary ahead of

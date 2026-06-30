@@ -666,6 +666,37 @@ pub(crate) fn d6_switch_a_enabled() -> bool {
     D6_SWITCH_A_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 167 (D6-GENUINE-A): x86_64-only, default-off gate that turns the
+/// rank-1 scheduler split seam (`SharedKernel::with_scheduler_split_mut`) into
+/// its first live production caller.  When OFF (default) the seam stays
+/// helper-only and the authoritative dispatch decision is taken exclusively by
+/// the in-lock `local_dispatch_step_split` (`self.scheduler_state()` under the
+/// global `with_cpu` borrow) — no behavior change.  When ON, after `with_cpu`
+/// has returned and the global `SpinLock<KernelState>` guard is dropped, the
+/// trap-entry path runs one genuine `local_dispatch_step_split` observation
+/// through the seam holding ONLY the rank-1 scheduler lock, proving the
+/// scheduler dispatch step can execute outside the global lock.  The
+/// observation is non-mutating (it reads the committed dispatch decision), so
+/// it never double-advances the run queue, and the in-lock path remains the
+/// authoritative fallback.  This is the narrow Outcome A for the scheduler
+/// seam; it is not scheduler policy and is reversible by dropping the knob.
+/// VALIDATION: D6_GENUINE_ENABLED.
+pub(crate) static D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 167: per-CPU count of genuine scheduler-seam dispatch observations.
+pub(crate) static D6_GENUINE_SEAM_COUNT: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
+
+pub(crate) fn set_d6_genuine_enabled(enabled: bool) {
+    D6_GENUINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn d6_genuine_enabled() -> bool {
+    D6_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

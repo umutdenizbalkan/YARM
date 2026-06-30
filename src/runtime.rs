@@ -442,8 +442,9 @@ impl SharedKernel {
 
     // ── Stage 108 / Milestone 2 Pass 1: per-domain split-mut seams ────────────
     //
-    // VALIDATION: M2_SEAM_HELPER_ONLY (with_scheduler_split_mut,
-    //   with_ipc_split_mut — see below)
+    // VALIDATION: M2_SEAM_HELPER_ONLY (with_ipc_split_mut — see below)
+    // VALIDATION: M2_SEAM_LIVE_D6_GENUINE (with_scheduler_split_mut — Stage 167
+    //   default-off `yarm.d6_genuine=1` observe wire, see below)
     // VALIDATION: M2_SEAM_LIVE_D3_BRK_SHRINK (with_task_tcbs_split_mut /
     //   with_vm_user_spaces_split_mut / with_memory_split_mut)
     // VALIDATION: FALLBACK_GLOBAL_LOCK
@@ -458,10 +459,17 @@ impl SharedKernel {
     // longer helper-only — `try_split_vm_brk_shrink_into_frame` below calls
     // all three from the live pre-`with_cpu` trap path (via
     // `syscall_split::try_split_dispatch_into_frame`'s NR 14 case) for the
-    // single-CPU-online-gated VmBrk shrink. `with_scheduler_split_mut` has NO
-    // live caller — D6 (`local_dispatch_step_split`) remains deferred (see
-    // its doc comment in `scheduler_state.rs`) — so its `M2_SEAM_HELPER_ONLY`
-    // / dead-code fence is unchanged.
+    // single-CPU-online-gated VmBrk shrink.
+    //
+    // Stage 167 / D6-GENUINE-A update: `with_scheduler_split_mut` is no longer
+    // helper-only either — `d6_genuine_local_dispatch_observe` below calls it
+    // from the live post-`with_cpu` trap path (global lock dropped) under the
+    // default-off `yarm.d6_genuine=1` knob, running one `local_dispatch_step_split`
+    // observation holding ONLY the rank-1 scheduler lock. The other seams keep
+    // their `M2_SEAM_HELPER_ONLY` / dead-code fences; the in-lock D6 dispatch
+    // path in `scheduler_state.rs` still does NOT call the seam (calling it
+    // from inside `with_cpu` would alias the same backing lock — see that
+    // method's doc comment for the documented blocker).
     //
     // Stage 115 / D2+D6 Outcome B: `with_ipc_split_mut` (rank 3) is added,
     // completing the IPC domain seam. It is helper-only; D2 Phase C cannot be
@@ -480,9 +488,16 @@ impl SharedKernel {
     /// Stage 108: scheduler (rank 1) split-mut seam.
     ///
     /// # Validation status
-    /// - M2_SEAM_HELPER_ONLY — still no live caller as of Stage 114. D6
-    ///   (`local_dispatch_step_split`) remains deferred; see
-    ///   `stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker`.
+    /// - M2_SEAM_LIVE_D6_GENUINE (Stage 167) — first live caller is the
+    ///   default-off `yarm.d6_genuine=1` observe wire
+    ///   (`d6_genuine_local_dispatch_observe`, called from
+    ///   `arch/trap_entry.rs::handle_trap_entry_shared` AFTER `with_cpu`
+    ///   returns and the global lock is dropped). When the knob is OFF
+    ///   (default) the seam has no live caller and the authoritative dispatch
+    ///   decision stays in the in-lock `local_dispatch_step_split`; see
+    ///   `stage113_d6_with_scheduler_split_mut_not_called_with_documented_blocker`
+    ///   (the in-lock path still does NOT call the seam — calling it from
+    ///   inside the `with_cpu` borrow would alias the same backing lock).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn with_scheduler_split_mut<R>(
         &self,
@@ -497,6 +512,36 @@ impl SharedKernel {
         let scheduler_lock = unsafe { &*scheduler_lock };
         let mut guard = scheduler_lock.lock();
         f(&mut guard)
+    }
+
+    /// Stage 167 (D6-GENUINE-A): the first LIVE production caller of the rank-1
+    /// scheduler split seam above. Runs one `local_dispatch_step_split`
+    /// dispatch observation through `with_scheduler_split_mut`, holding ONLY
+    /// the scheduler lock with the global `SpinLock<KernelState>` already
+    /// dropped by the trap-entry path. The observation is NON-mutating — it
+    /// reads the committed dispatch decision (current TID + runnable count)
+    /// that the in-lock `local_dispatch_step_split` already produced inside
+    /// `with_cpu` — so it never double-advances the run queue and the in-lock
+    /// path remains the authoritative fallback. Returns the observed current
+    /// TID. Default-off behind `yarm.d6_genuine=1` (gated by the caller).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_genuine_local_dispatch_observe(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            // Mirror `local_dispatch_step_split`'s CPU selection: it reads the
+            // scheduler's own `current_cpu` under the scheduler lock.
+            let observe_cpu = sched.current_cpu;
+            let current = kernel_ref(&sched.scheduler)
+                .current_tid_on(observe_cpu)
+                .map(|tid| tid.0);
+            let runnable = kernel_ref(&sched.scheduler).runnable_count_on(observe_cpu);
+            crate::yarm_log!(
+                "D6_LOCAL_DISPATCH_STEP_SPLIT cpu={} tid={:?} runnable={}",
+                cpu.0,
+                current,
+                runnable
+            );
+            current
+        })
     }
 
     /// Stage 108: task/TCB (rank 2) split-mut seam.
@@ -2386,14 +2431,17 @@ mod tests {
 
     #[test]
     fn stage108_seams_are_helper_only_no_live_callers() {
-        // M2_SEAM_HELPER_ONLY: the four Stage 108 seams must not be called
-        // from any live trap/syscall path yet.
+        // M2_SEAM_HELPER_ONLY: the Stage 108 seams must not be called directly
+        // from syscall.rs / trap_entry.rs. The scheduler seam
+        // (`with_scheduler_split_mut`) is the Stage 167 (D6-GENUINE-A)
+        // exception: its sole live caller is the runtime.rs wrapper
+        // `d6_genuine_local_dispatch_observe` (default-off behind
+        // `yarm.d6_genuine=1`), so it is checked separately below.
         let syscall_src = include_str!("kernel/syscall.rs");
         let trap_entry_src = include_str!("arch/trap_entry.rs");
         // Build needles at runtime so doc/test mentions of the names in other
         // files' test modules cannot self-match.
         let names = [
-            ["with_scheduler_", "split_mut("].concat(),
             ["with_task_tcbs_", "split_mut("].concat(),
             ["with_vm_user_spaces_", "split_mut("].concat(),
             ["with_memory_", "split_mut("].concat(),
@@ -2408,8 +2456,25 @@ mod tests {
                 "{name} must not be called from trap_entry.rs"
             );
         }
-        // Labels present.
+        // The scheduler seam's only live caller is the Stage 167 default-off
+        // observe wrapper, defined in runtime.rs and invoked from trap_entry.rs.
+        let scheduler_seam = ["with_scheduler_", "split_mut("].concat();
+        assert!(
+            !syscall_src.contains(scheduler_seam.as_str()),
+            "scheduler seam must not be called directly from syscall.rs"
+        );
+        assert!(
+            !trap_entry_src.contains(scheduler_seam.as_str()),
+            "scheduler seam must only be reached via the d6_genuine wrapper, not called directly in trap_entry.rs"
+        );
+        assert!(
+            trap_entry_src.contains("d6_genuine_local_dispatch_observe"),
+            "Stage 167: trap_entry.rs must invoke the d6_genuine scheduler-seam wrapper"
+        );
+        // Labels present (the scheduler seam is now M2_SEAM_LIVE_D6_GENUINE;
+        // the helper-only label still covers the remaining seam).
         let runtime_src = include_str!("runtime.rs");
         assert!(runtime_src.contains("VALIDATION: M2_SEAM_HELPER_ONLY"));
+        assert!(runtime_src.contains("VALIDATION: M2_SEAM_LIVE_D6_GENUINE"));
     }
 }

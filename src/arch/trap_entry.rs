@@ -308,6 +308,46 @@ pub fn handle_trap_entry_shared(
     // `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.
     // `inner_result: Result<(), TrapHandleError>` from the arch handler.
 
+    // Stage 167 (D6-GENUINE-A): first LIVE production use of the rank-1
+    // scheduler split seam. With the global `SpinLock<KernelState>` guard from
+    // `with_cpu` already dropped above, run one genuine `local_dispatch_step_split`
+    // observation through `SharedKernel::with_scheduler_split_mut`, holding ONLY
+    // the scheduler lock. Default-off behind `yarm.d6_genuine=1`; mutually
+    // exclusive with the proof/switch-a knobs so those paths stay intact. The
+    // observation is non-mutating, so it cannot double-advance the run queue;
+    // the authoritative dispatch decision was already taken by the in-lock
+    // `local_dispatch_step_split` inside `with_cpu` (the preserved fallback).
+    #[cfg(target_arch = "x86_64")]
+    {
+        let d6_genuine_mode = crate::kernel::boot::d6_genuine_enabled()
+            && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+            && !crate::kernel::boot::d6_switch_a_enabled();
+        if d6_genuine_mode {
+            crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_CANDIDATE cpu={}", cpu.0);
+            // Eligibility: single-CPU online and a valid per-CPU slot. The
+            // global lock is genuinely dropped at this point regardless.
+            let eligible = shared.online_cpu_count_split_read() <= 1
+                && cpu_idx < crate::kernel::scheduler::MAX_CPUS;
+            if eligible {
+                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_ENTER cpu={}", cpu.0);
+                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_LOCK_SCOPE_DROPPED cpu={}", cpu.0);
+                let observed = shared.d6_genuine_local_dispatch_observe(cpu);
+                let n = crate::kernel::boot::D6_GENUINE_SEAM_COUNT[cpu_idx]
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                crate::yarm_log!(
+                    "D6_LOCAL_DISPATCH_SEAM_COUNT cpu={} n={} tid={:?}",
+                    cpu.0,
+                    n,
+                    observed
+                );
+                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_DONE cpu={}", cpu.0);
+            } else {
+                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_FALLBACK cpu={}", cpu.0);
+            }
+        }
+    }
+
     // Stage 117: drain the per-CPU switch plan stash.
     //
     // If `maybe_switch_kernel_context` stashed a `DispatchSwitchPlan` (single-CPU
