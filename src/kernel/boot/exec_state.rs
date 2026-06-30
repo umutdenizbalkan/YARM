@@ -1152,16 +1152,15 @@ impl KernelState {
                 );
                 return Ok(());
             }
-            // Stage 165B: the per-tid full-stack maps above cover only
-            // `[stack_base, stack_top)`.  The proof's deep post-switch call chain
-            // (`handle_trap` → `process_ipc_timeout_deadlines`, ~8 KiB frame)
-            // grows the LIVE kernel stack below `stack_base` into the region's
-            // guard-adjacent page, where the next trap frame faulted (#PF write,
-            // CR2 = RSP − 8, both inside `[region_base, stack_base)`).  Sample the
-            // live RSP now — it is on the outgoing task's kernel trap stack, the
-            // same region the post-proof path runs on — and map the FULL region
-            // containing it (including the page below `stack_base`).  Selection is
-            // by RSP containment, not target task identity.
+            // Stage 165B/165C: ensure the kernel stack the proof is running on is
+            // fully backed.  The per-tid full-stack maps above cover the per-task
+            // `[region_base, stack_top)` ranges; this additionally ensures the
+            // region containing the *sampled live RSP*.  Stage 165C: that sampled
+            // RSP is the boot/CPU kernel stack in the image high half
+            // (`>= KERNEL_BOOTSTRAP_VIRT_BASE`), which is already kernel-mapped in
+            // every root — `d6_ensure_live_rsp_region_mapped` classifies it and
+            // verifies (it does NOT allocate or it would trip VmFull).  Selection
+            // is by RSP containment, not target task identity.
             #[cfg(not(feature = "hosted-dev"))]
             {
                 let sampled_rsp: usize;

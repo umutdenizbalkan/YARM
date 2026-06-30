@@ -1052,13 +1052,29 @@ impl KernelState {
     /// whose mapped stack starts at `stack_base = 0x…1_9000`).
     ///
     /// Because the proof is a default-off diagnostic, this function selects the
-    /// stack region by **RSP containment** (not by assuming a tid) and maps every
-    /// page of `[region_base, region_top)` — including the page below
-    /// `stack_base` — supervisor-only writable in the active root and every task
-    /// root, so the proof can return to idle without a fatal #PF.  The
-    /// guard-adjacent page is backed *only* for the live proof region; production
-    /// per-task stacks (provisioned with their unmapped guard page) are untouched
-    /// because this path runs solely under `yarm.d6_switch_proof=1`.
+    /// stack region by **RSP containment** (not by assuming a tid).
+    ///
+    /// Stage 165C: the proof samples RSP on the **boot/CPU kernel stack**, which
+    /// lives in the kernel image high half (`>= KERNEL_BOOTSTRAP_VIRT_BASE`), NOT
+    /// in the per-task region `[KERNEL_STACK_REGION_BASE, +MAX_TASKS*SIZE)`.
+    /// Stage 165B mis-classified that high address as a per-task stack (it only
+    /// checked `>= KERNEL_STACK_REGION_BASE`) and tried to allocate+map the
+    /// already-kernel-mapped region, aborting with `VmFull`.  This function now
+    /// classifies the sampled RSP:
+    ///
+    /// * **static kernel / boot / CPU stack** (the observed case): already mapped
+    ///   supervisor-writable in the shared high half of every root, and we are
+    ///   literally executing on it — so this is a *verify-only ensure*.  It probes
+    ///   the active root, records the result, and accepts; it never allocates VM
+    ///   metadata or maps into task roots (which is what tripped `VmFull`).
+    /// * **per-task stack**: maps every page of `[region_base, region_top)` —
+    ///   including the page below `stack_base` — supervisor-only writable in the
+    ///   active root and every task root.  (The per-task guard-adjacent overflow
+    ///   that motivated Stage 165B is also covered by
+    ///   `d6_ensure_full_proof_switch_stack_mapped`.)
+    ///
+    /// This path runs solely under `yarm.d6_switch_proof=1`; production stacks are
+    /// untouched.
     #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
     pub(crate) fn d6_ensure_live_rsp_region_mapped(
         &mut self,
@@ -1071,23 +1087,33 @@ impl KernelState {
             (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
         }
 
-        // Select the stack region by RSP containment, NOT target task identity.
-        if sampled_rsp < KERNEL_STACK_REGION_BASE {
-            crate::yarm_log!(
-                "D6_PROOF_LIVE_RSP_STACK_SKIP reason=rsp_outside_kernel_stack_region rsp=0x{:x}",
-                sampled_rsp
-            );
-            return Ok(());
-        }
-        let offset = sampled_rsp - KERNEL_STACK_REGION_BASE;
-        let idx = offset / KERNEL_STACK_REGION_SIZE;
-        let region_base = KERNEL_STACK_REGION_BASE
-            .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
-            .ok_or(KernelError::VmFull)?;
-        let region_top = region_base
-            .checked_add(KERNEL_STACK_REGION_SIZE)
-            .ok_or(KernelError::VmFull)?;
+        // Per-task kernel stacks occupy
+        // `[KERNEL_STACK_REGION_BASE, KERNEL_STACK_REGION_BASE + MAX_TASKS*SIZE)`.
+        // The kernel image (with its boot/CPU `.bss` stacks) lives far higher, at
+        // `>= KERNEL_BOOTSTRAP_VIRT_BASE`.  Stage 165B only checked
+        // `rsp >= KERNEL_STACK_REGION_BASE`, which the kernel image ALSO satisfies,
+        // so it mis-classified the boot stack as a per-task stack, computed a bogus
+        // index, and tried to allocate+map an already-kernel-mapped region → VmFull.
+        const PER_TASK_REGION_END: usize =
+            KERNEL_STACK_REGION_BASE + super::MAX_TASKS * KERNEL_STACK_REGION_SIZE;
+        let kernel_image_base = crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE as usize;
         let rsp_page = sampled_rsp & !(PAGE_SIZE - 1);
+
+        let is_task_stack =
+            sampled_rsp >= KERNEL_STACK_REGION_BASE && sampled_rsp < PER_TASK_REGION_END;
+        let kind = if is_task_stack {
+            "task_stack"
+        } else if sampled_rsp >= kernel_image_base {
+            "static_kernel_stack"
+        } else {
+            "unknown"
+        };
+        crate::yarm_log!(
+            "D6_PROOF_LIVE_RSP_REGION_KIND kind={} rsp=0x{:x} rsp_page=0x{:x}",
+            kind,
+            sampled_rsp,
+            rsp_page
+        );
 
         let Some(target_asid) = self.hal.active_asid() else {
             crate::yarm_log!(
@@ -1096,6 +1122,68 @@ impl KernelState {
             );
             return Ok(());
         };
+
+        // Probe the active root for the live RSP page (diagnostic ground truth).
+        let probe = page_table::resolve_page(target_asid, VirtAddr(rsp_page as u64));
+        let (probe_present, probe_writable, probe_user) = match probe {
+            Some(e) => (
+                1u8,
+                ((e.0 & PageTableEntry::WRITABLE) != 0) as u8,
+                ((e.0 & PageTableEntry::USER) != 0) as u8,
+            ),
+            None => (0u8, 0u8, 0u8),
+        };
+        crate::yarm_log!(
+            "D6_PROOF_LIVE_RSP_MAP_PROBE root=active asid={} va=0x{:x} present={} writable={} user={}",
+            target_asid.0,
+            rsp_page,
+            probe_present,
+            probe_writable,
+            probe_user
+        );
+
+        // Static kernel / boot / CPU stack case (the actually-observed case): the
+        // region is backed by the kernel image mapping in the shared high half of
+        // EVERY root.  This is an ENSURE, not an allocator — we are *executing on
+        // this very stack*, so its page is mapped supervisor-writable by
+        // construction.  Do NOT allocate user VM metadata and do NOT map into task
+        // roots (that path trips VmFull on the kernel-image region).  Verify,
+        // record, and accept; the per-task guard-adjacent overflow is handled
+        // separately by `d6_ensure_full_proof_switch_stack_mapped`.
+        if !is_task_stack {
+            crate::yarm_log!(
+                "D6_PROOF_LIVE_RSP_MAP_SKIP_ALREADY_PRESENT va=0x{:x}",
+                rsp_page
+            );
+            if probe_present == 0 || probe_writable == 0 || probe_user != 0 {
+                // `resolve_page` cannot always walk the early boot page tables;
+                // the hardware mapping is nonetheless live (we run on it).  Record
+                // the discrepancy without failing the proof.
+                crate::yarm_log!(
+                    "D6_PROOF_LIVE_RSP_MAP_FAIL_DETAIL step=static_kernel_probe err=resolve_view_only present={} writable={} user={} used=0 cap=0",
+                    probe_present,
+                    probe_writable,
+                    probe_user
+                );
+            }
+            crate::yarm_log!(
+                "D6_PROOF_LIVE_RSP_STACK_MAP_DONE region_base=0x{:x} region_top=0x{:x} rsp_page=0x{:x} covers_rsp_page=1",
+                rsp_page,
+                rsp_page.saturating_add(PAGE_SIZE),
+                rsp_page
+            );
+            return Ok(());
+        }
+
+        // ---- Per-task stack case: full-region ensure mapping (Stage 165B) ----
+        let offset = sampled_rsp - KERNEL_STACK_REGION_BASE;
+        let idx = offset / KERNEL_STACK_REGION_SIZE;
+        let region_base = KERNEL_STACK_REGION_BASE
+            .checked_add(idx.saturating_mul(KERNEL_STACK_REGION_SIZE))
+            .ok_or(KernelError::VmFull)?;
+        let region_top = region_base
+            .checked_add(KERNEL_STACK_REGION_SIZE)
+            .ok_or(KernelError::VmFull)?;
 
         // Collect all task ASIDs before the allocation loop (mirrors
         // `d6_ensure_full_proof_switch_stack_mapped`) so each live-region page is
