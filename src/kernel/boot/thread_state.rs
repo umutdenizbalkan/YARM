@@ -1289,13 +1289,26 @@ impl KernelState {
     /// their own root, so the supervisor stack write (#PF error 0x2) faulted on
     /// `0xffff_8000_0001_7f98` (tid=3 top page) under asid 1.
     ///
-    /// This default-off, proof-only "ensure" shares every live task's kernel
-    /// stack pages — by their authoritative owner-root physical frame — into the
-    /// active root AND every other live task root, so whichever kernel stack a
-    /// post-cleanup trap selects is supervisor-writable under whatever CR3 is
-    /// active.  It never allocates new frames (only shares existing owner-mapped
-    /// pages, so a task's stack content is never diverged) and never maps a page
-    /// user-accessible.  Already-shared pages are accepted as `already_ok`.
+    /// This default-off, proof-only "ensure" shares every schedulable task's
+    /// kernel stack pages — by their authoritative owner-root physical frame —
+    /// into the active root AND every other live task root, so whichever kernel
+    /// stack a post-cleanup trap selects is supervisor-writable under whatever
+    /// CR3 is active.
+    ///
+    /// Stage 165E: kernel stacks are demand-paged, so a schedulable task's stack
+    /// page may not yet be mapped in its OWN (owner) root at cleanup time — the
+    /// observed tid=3 case, where the Stage 165D mapper found no source frame and
+    /// silently skipped, leaving asid 1 without tid=3's page and falsely reporting
+    /// `failures=0`.  The mapper now, for each page: (1) SOURCE — take the frame
+    /// from the owner root, or, if the owner lacks it, allocate the owner's real
+    /// backing frame (`result=created`); frames are only ever created in the
+    /// OWNER root, never fabricated into a non-owner root; (2) ROOT — share that
+    /// exact frame into every root, accepting already-shared pages as
+    /// `already_ok`.  Any schedulable page that cannot be sourced is an explicit
+    /// `D6_POST_CLEANUP_STACK_MAP_SKIP` + a counted failure (never a silent skip).
+    /// Tasks without an owner asid are not schedulable to user mode, so their
+    /// kernel stack cannot be an active-root trap target; their unmapped pages are
+    /// a non-failing NOTE.  No page is ever mapped user-accessible.
     #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
     pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped(&mut self) -> Result<(), KernelError> {
         use crate::arch::selected_isa::page_table::{self, PageTableEntry};
@@ -1393,6 +1406,7 @@ impl KernelState {
             }
             let top_page = top.saturating_sub(8) & !(PAGE_SIZE - 1);
             let owner = self.task_asid(tid);
+            let owner_num: i64 = owner.map(|a| a.0 as i64).unwrap_or(-1);
             crate::yarm_log!(
                 "D6_POST_CLEANUP_STACK_MAP_TASK tid={} base=0x{:x} top=0x{:x} page=0x{:x}",
                 tid,
@@ -1403,27 +1417,93 @@ impl KernelState {
             let mut page_addr = base & !(PAGE_SIZE - 1);
             while page_addr < top {
                 let page = VirtAddr(page_addr as u64);
-                // Authoritative physical frame: prefer the task's own root, then
-                // any root that already maps it.  Never allocate — a page no root
-                // maps (e.g. a guard page) is left unmapped.
-                let mut phys = owner
-                    .and_then(|a| page_table::resolve_page(a, page))
-                    .filter(|e| validate_entry(*e))
-                    .map(|e| e.addr());
-                if phys.is_none() {
+                let is_top = page_addr == top_page;
+
+                // Step 1 — SOURCE: obtain the authoritative physical frame for this
+                // stack page.  Stage 165E: do NOT silently skip when no root maps
+                // it.  A schedulable task (one with an owner asid) MUST have its
+                // kernel stack backed; if the owner root does not yet map the page
+                // (kernel stacks are demand-paged, so e.g. tid=3's top page may be
+                // unmapped at cleanup time), allocate the owner's real backing
+                // frame.  Frames are only ever created in the OWNER root — never
+                // fabricated into a non-owner root — and the SAME frame is shared.
+                let mut phys = None;
+                let mut source = "missing";
+                if let Some(oa) = owner {
+                    if let Some(e) = page_table::resolve_page(oa, page) {
+                        if validate_entry(e) {
+                            phys = Some(e.addr());
+                            source = "found";
+                        }
+                    }
+                    if phys.is_none() {
+                        match self.alloc_user_data_frame() {
+                            Ok(p) => match page_table::map_page(
+                                oa,
+                                page,
+                                PhysAddr(p),
+                                PageFlags::KERNEL_RW,
+                            ) {
+                                Ok(_) => {
+                                    phys = Some(p);
+                                    source = "created";
+                                }
+                                Err(_) => source = "failed",
+                            },
+                            Err(_) => source = "failed",
+                        }
+                    }
+                } else {
+                    // No owner asid: the task is not schedulable to user mode, so
+                    // its kernel stack cannot be a trap target under the active
+                    // root.  Only share an already-existing frame; never allocate.
                     for root in roots[..roots_len].iter().flatten().copied() {
                         if let Some(e) = page_table::resolve_page(root, page) {
                             if validate_entry(e) {
                                 phys = Some(e.addr());
+                                source = "found";
                                 break;
                             }
                         }
                     }
                 }
+
+                if is_top {
+                    crate::yarm_log!(
+                        "D6_POST_CLEANUP_STACK_MAP_SOURCE tid={} owner_asid={} page=0x{:x} result={}",
+                        tid,
+                        owner_num,
+                        page_addr,
+                        source
+                    );
+                }
+
                 let Some(phys) = phys else {
+                    // No frame obtained.  For a schedulable (owner-asid) task this
+                    // is a hard failure: its stack page MUST be backed.  For a
+                    // no-owner task the page is unmapped everywhere and the task is
+                    // not schedulable, so leaving it unmapped is safe (recorded as
+                    // a non-failing NOTE, never counted, never a SKIP).
+                    if owner.is_some() {
+                        crate::yarm_log!(
+                            "D6_POST_CLEANUP_STACK_MAP_SKIP tid={} reason=no_source_frame page=0x{:x}",
+                            tid,
+                            page_addr
+                        );
+                        failures += 1;
+                    } else if is_top {
+                        crate::yarm_log!(
+                            "D6_POST_CLEANUP_STACK_MAP_NOTE tid={} reason=no_owner_asid_unmapped_not_schedulable page=0x{:x}",
+                            tid,
+                            page_addr
+                        );
+                    }
                     page_addr = page_addr.saturating_add(PAGE_SIZE);
                     continue;
                 };
+
+                // Step 2 — ROOT: share the authoritative frame into every root a
+                // post-cleanup trap can run under.
                 for root in roots[..roots_len].iter().flatten().copied() {
                     let result = match page_table::resolve_page(root, page) {
                         Some(e) if validate_entry(e) && e.addr() == phys => "already_ok",
@@ -1450,7 +1530,7 @@ impl KernelState {
                             }
                         },
                     };
-                    if page_addr == top_page {
+                    if is_top {
                         crate::yarm_log!(
                             "D6_POST_CLEANUP_STACK_MAP_ROOT tid={} asid={} page=0x{:x} result={}",
                             tid,
@@ -1465,8 +1545,9 @@ impl KernelState {
         }
 
         crate::yarm_log!(
-            "D6_POST_CLEANUP_STACK_MAP_DONE tasks={} failures={}",
+            "D6_POST_CLEANUP_STACK_MAP_DONE tasks={} roots={} failures={}",
             n,
+            roots_len,
             failures
         );
         if failures > 0 {

@@ -573,6 +573,7 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
     "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED" \
     "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED" \
     "D6_POST_CLEANUP_STACK_MAP_FAILED" \
+    "D6_POST_CLEANUP_STACK_MAP_SKIP" \
     "D6_FIRST_RESUME_STASH_MISSING"; do
     if log_has_pattern "$map_fail_marker"; then
       echo "[error] D6 switch proof: failure marker present: $map_fail_marker"

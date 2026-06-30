@@ -46177,15 +46177,13 @@ mod stage165d_d6_post_cleanup_stack_map {
         );
     }
 
-    // 3. It SHARES owner-root frames and never allocates — a task's stack content
-    //    must not be diverged by a freshly allocated frame.
+    // 3. It resolves the owner root for authoritative frames and accepts
+    //    already-shared pages as already_ok.  (Stage 165E: allocation into the
+    //    owner is now permitted; the no-fabrication rule is pinned in the
+    //    stage165e module below.)
     #[test]
-    fn stage165d_shares_owner_frames_never_allocates() {
+    fn stage165d_resolves_owner_and_accepts_already_ok() {
         let body = post_cleanup_map_source();
-        assert!(
-            !body.contains("alloc_user_data_frame"),
-            "post-cleanup map must not allocate frames (share owner-mapped pages only)"
-        );
         assert!(
             body.contains("self.task_asid(tid)"),
             "post-cleanup map must resolve the owner root for authoritative frames"
@@ -46251,6 +46249,126 @@ mod stage165d_d6_post_cleanup_stack_map {
             SMOKE_SRC.contains("fatal breadcrumb after proof start")
                 && SMOKE_SRC.contains("D6_PROOF_LIVE_RSP_STACK_MAP_FAILED"),
             "the fatal-breadcrumb and LIVE_RSP_STACK_MAP_FAILED gates must remain"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 165E — D6 post-cleanup stack-map false-success fix.  The 165D mapper
+// logged D6_POST_CLEANUP_STACK_MAP_TASK tid=3 but no ROOT lines and still
+// reported failures=0: kernel stacks are demand-paged, tid=3's top page was
+// unmapped in every consulted root, and the loop silently `continue`d.  165E
+// makes every page explicit: SOURCE (found|created|missing|failed), ROOT for
+// every root, and SKIP+failure for any schedulable page with no source frame.
+// ===========================================================================
+#[cfg(test)]
+mod stage165e_d6_post_cleanup_source {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    fn post_cleanup_map_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_post_cleanup_task_stacks_mapped")
+            .expect("post-cleanup stack map function must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("function after post-cleanup stack map");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    // 1. The SOURCE step is emitted with the full result vocabulary.
+    #[test]
+    fn stage165e_emits_source_marker() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("D6_POST_CLEANUP_STACK_MAP_SOURCE tid="),
+            "must emit D6_POST_CLEANUP_STACK_MAP_SOURCE"
+        );
+        for result in ["\"found\"", "\"created\"", "\"missing\"", "\"failed\""] {
+            assert!(
+                body.contains(result),
+                "SOURCE must use result vocabulary including {result}"
+            );
+        }
+    }
+
+    // 2. There is NO silent skip: the no-source case for a schedulable task emits
+    //    a SKIP and increments failures.
+    #[test]
+    fn stage165e_no_silent_skip() {
+        let body = post_cleanup_map_source();
+        // The old silent skip (`let Some(phys) = phys else { ...continue }` with
+        // no logging/failure) must be gone: the else arm must reference SKIP.
+        assert!(
+            body.contains("D6_POST_CLEANUP_STACK_MAP_SKIP tid="),
+            "no-source case must emit D6_POST_CLEANUP_STACK_MAP_SKIP"
+        );
+        assert!(
+            body.contains("reason=no_source_frame"),
+            "SKIP must carry a reason"
+        );
+        // The SKIP path must increment failures (owner.is_some branch).
+        let skip_idx = body
+            .find("D6_POST_CLEANUP_STACK_MAP_SKIP")
+            .expect("SKIP present");
+        let after = &body[skip_idx..];
+        assert!(
+            after[..after.find("page_addr = page_addr").unwrap_or(after.len())]
+                .contains("failures += 1"),
+            "the SKIP path must increment failures"
+        );
+    }
+
+    // 3. Allocation, when it happens, targets ONLY the owner root (result=created);
+    //    frames are never fabricated into a non-owner root.  The shared frame is a
+    //    single authoritative `phys`.
+    #[test]
+    fn stage165e_allocates_into_owner_only() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("alloc_user_data_frame"),
+            "must allocate the owner's backing frame for demand-paged stack pages"
+        );
+        assert!(
+            body.contains("source = \"created\""),
+            "owner allocation must be labeled result=created"
+        );
+        // The allocation lives inside the `if let Some(oa) = owner` block (created
+        // path) and maps into `oa`; the no-owner branch must explicitly NOT
+        // allocate.
+        assert!(
+            body.contains("if let Some(oa) = owner") && body.contains("never allocate"),
+            "allocation must be owner-only; the no-owner branch must never allocate"
+        );
+    }
+
+    // 4. A no-owner (non-schedulable) task uses a non-failing NOTE, not a SKIP.
+    #[test]
+    fn stage165e_no_owner_is_note_not_failure() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("D6_POST_CLEANUP_STACK_MAP_NOTE") && body.contains("not_schedulable"),
+            "no-owner unmapped pages must be a non-failing NOTE"
+        );
+    }
+
+    // 5. The DONE marker now reports the root count too.
+    #[test]
+    fn stage165e_done_reports_roots() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("D6_POST_CLEANUP_STACK_MAP_DONE tasks={} roots={} failures={}"),
+            "DONE must report tasks, roots, and failures"
+        );
+    }
+
+    // 6. Smoke script fails on D6_POST_CLEANUP_STACK_MAP_SKIP.
+    #[test]
+    fn stage165e_smoke_fails_on_skip() {
+        assert!(
+            SMOKE_SRC.contains("D6_POST_CLEANUP_STACK_MAP_SKIP"),
+            "smoke must fail the D6 proof on D6_POST_CLEANUP_STACK_MAP_SKIP"
         );
     }
 }
