@@ -599,6 +599,12 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
       echo "[error] D6 switch proof: post-cleanup guard-adjacent page not included"
       map_fail=1
     fi
+    # Stage 165G: a no-owner (idle/trap-capable, e.g. tid=0) stack must be mapped,
+    # not left as an "ignorable" NOTE — its kernel stack can still take a trap.
+    if tr '\r' '\n' <"$LOGFILE" | rg -a -q -- 'D6_POST_CLEANUP_STACK_MAP_NOTE .*reason=no_owner_asid_unmapped_not_schedulable'; then
+      echo "[error] D6 switch proof: no-owner kernel stack left unmapped (NOTE)"
+      map_fail=1
+    fi
   fi
   # Stage 165D: D6_KERNEL_SWITCH_STACK_CHECK_FAILED is only fatal if NO later
   # matching CHECK_OK exists for that tid.  Early `target_asid_unavailable`
