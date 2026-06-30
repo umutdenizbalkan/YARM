@@ -1309,6 +1309,15 @@ impl KernelState {
     /// Tasks without an owner asid are not schedulable to user mode, so their
     /// kernel stack cannot be an active-root trap target; their unmapped pages are
     /// a non-failing NOTE.  No page is ever mapped user-accessible.
+    ///
+    /// Stage 165F: the deep post-cleanup call chain can overflow `[base, top)`
+    /// into the guard-adjacent page below `stack_base` (observed tid=3 #PF at
+    /// `0xffff_8000_0001_0dd8`, page `0x…1_0000` = `base − KERNEL_STACK_GUARD_SIZE`).
+    /// For a schedulable task the mapped range is therefore extended to
+    /// `[base − guard, top)`; the guard page is sourced/created in the owner root
+    /// and shared like any other page, logged with
+    /// `D6_POST_CLEANUP_STACK_MAP_GUARD_PAGE … included=1`.  Production guard pages
+    /// are untouched (this runs only under `yarm.d6_switch_proof=1`).
     #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
     pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped(&mut self) -> Result<(), KernelError> {
         use crate::arch::selected_isa::page_table::{self, PageTableEntry};
@@ -1399,6 +1408,7 @@ impl KernelState {
         );
 
         let mut failures = 0usize;
+        let mut guard_pages = 0usize;
         for i in 0..n {
             let (tid, base, top) = stacks[i];
             if base == 0 || base >= top {
@@ -1407,17 +1417,33 @@ impl KernelState {
             let top_page = top.saturating_sub(8) & !(PAGE_SIZE - 1);
             let owner = self.task_asid(tid);
             let owner_num: i64 = owner.map(|a| a.0 as i64).unwrap_or(-1);
+            // Stage 165F: for a schedulable (owner-asid) task, extend the mapped
+            // range one guard page BELOW stack_base.  The deep post-cleanup call
+            // chain (handle_trap → printk → process_ipc_timeout_deadlines) can
+            // overflow `[base, top)` into the guard-adjacent page (observed: tid=3
+            // #PF at 0xffff_8000_0001_0dd8, region_base 0x…1_0000 = base − guard).
+            // Non-schedulable (no-owner) tasks keep `[base, top)`; production guard
+            // pages are untouched because this path runs only under the proof knob.
+            let region_base = if owner.is_some() {
+                (base & !(PAGE_SIZE - 1)).saturating_sub(KERNEL_STACK_GUARD_SIZE)
+            } else {
+                base & !(PAGE_SIZE - 1)
+            };
             crate::yarm_log!(
-                "D6_POST_CLEANUP_STACK_MAP_TASK tid={} base=0x{:x} top=0x{:x} page=0x{:x}",
+                "D6_POST_CLEANUP_STACK_MAP_TASK tid={} region_base=0x{:x} base=0x{:x} top=0x{:x} page=0x{:x}",
                 tid,
+                region_base,
                 base,
                 top,
                 top_page
             );
-            let mut page_addr = base & !(PAGE_SIZE - 1);
+            let mut page_addr = region_base;
             while page_addr < top {
                 let page = VirtAddr(page_addr as u64);
                 let is_top = page_addr == top_page;
+                // The guard-adjacent page(s) below stack_base (schedulable tasks).
+                let is_guard = page_addr < (base & !(PAGE_SIZE - 1));
+                let log_page = is_top || is_guard;
 
                 // Step 1 — SOURCE: obtain the authoritative physical frame for this
                 // stack page.  Stage 165E: do NOT silently skip when no root maps
@@ -1468,7 +1494,20 @@ impl KernelState {
                     }
                 }
 
-                if is_top {
+                if is_guard {
+                    let included = if phys.is_some() { 1 } else { 0 };
+                    crate::yarm_log!(
+                        "D6_POST_CLEANUP_STACK_MAP_GUARD_PAGE tid={} page=0x{:x} included={}",
+                        tid,
+                        page_addr,
+                        included
+                    );
+                    if included == 1 {
+                        guard_pages += 1;
+                    }
+                }
+
+                if log_page {
                     crate::yarm_log!(
                         "D6_POST_CLEANUP_STACK_MAP_SOURCE tid={} owner_asid={} page=0x{:x} result={}",
                         tid,
@@ -1530,7 +1569,7 @@ impl KernelState {
                             }
                         },
                     };
-                    if is_top {
+                    if log_page {
                         crate::yarm_log!(
                             "D6_POST_CLEANUP_STACK_MAP_ROOT tid={} asid={} page=0x{:x} result={}",
                             tid,
@@ -1545,10 +1584,11 @@ impl KernelState {
         }
 
         crate::yarm_log!(
-            "D6_POST_CLEANUP_STACK_MAP_DONE tasks={} roots={} failures={}",
+            "D6_POST_CLEANUP_STACK_MAP_DONE tasks={} roots={} failures={} guard_pages={}",
             n,
             roots_len,
-            failures
+            failures,
+            guard_pages
         );
         if failures > 0 {
             return Err(KernelError::VmFull);

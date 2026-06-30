@@ -594,6 +594,11 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
       echo "[error] D6 switch proof: post-cleanup stack map reported failures>0"
       map_fail=1
     fi
+    # Stage 165F: a schedulable task's guard-adjacent page must be included.
+    if tr '\r' '\n' <"$LOGFILE" | rg -a -q -- 'D6_POST_CLEANUP_STACK_MAP_GUARD_PAGE .*included=0'; then
+      echo "[error] D6 switch proof: post-cleanup guard-adjacent page not included"
+      map_fail=1
+    fi
   fi
   # Stage 165D: D6_KERNEL_SWITCH_STACK_CHECK_FAILED is only fatal if NO later
   # matching CHECK_OK exists for that tid.  Early `target_asid_unavailable`

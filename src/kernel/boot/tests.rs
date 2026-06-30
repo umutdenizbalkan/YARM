@@ -46372,3 +46372,104 @@ mod stage165e_d6_post_cleanup_source {
         );
     }
 }
+
+// ===========================================================================
+// Stage 165F — D6 post-cleanup guard-adjacent page inclusion.  The deep
+// post-cleanup call chain overflowed `[base, top)` into tid=3's guard-adjacent
+// page (0xffff_8000_0001_0000 = base − KERNEL_STACK_GUARD_SIZE), still unmapped
+// in asid 1.  The mapper now extends a schedulable task's range to
+// `[base − guard, top)` and proves inclusion with a GUARD_PAGE marker.
+// ===========================================================================
+#[cfg(test)]
+mod stage165f_d6_post_cleanup_guard_page {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    fn post_cleanup_map_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_post_cleanup_task_stacks_mapped")
+            .expect("post-cleanup stack map function must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("function after post-cleanup stack map");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    // 1. A schedulable task's range starts one guard page below stack_base; the
+    //    loop iterates from region_base, not stack_base.
+    #[test]
+    fn stage165f_extends_range_below_base() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("saturating_sub(KERNEL_STACK_GUARD_SIZE)"),
+            "region_base must be stack_base - KERNEL_STACK_GUARD_SIZE for owner tasks"
+        );
+        assert!(
+            body.contains("let mut page_addr = region_base;"),
+            "the page loop must start at region_base (includes the guard-adjacent page)"
+        );
+        // The guard extension is gated on owner.is_some() (schedulable only).
+        assert!(
+            body.contains("let region_base = if owner.is_some() {"),
+            "guard extension must apply only to schedulable (owner-asid) tasks"
+        );
+    }
+
+    // 2. The TASK marker reports region_base; DONE reports guard_pages.
+    #[test]
+    fn stage165f_markers_report_region_and_count() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("D6_POST_CLEANUP_STACK_MAP_TASK tid={} region_base=0x{:x}"),
+            "TASK marker must report region_base"
+        );
+        assert!(
+            body.contains(
+                "D6_POST_CLEANUP_STACK_MAP_DONE tasks={} roots={} failures={} guard_pages={}"
+            ),
+            "DONE marker must report guard_pages"
+        );
+    }
+
+    // 3. A GUARD_PAGE marker proves inclusion of the guard-adjacent page, and the
+    //    guard page is sourced/shared (SOURCE+ROOT) via the log_page path.
+    #[test]
+    fn stage165f_guard_page_marker_and_sharing() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("D6_POST_CLEANUP_STACK_MAP_GUARD_PAGE tid={} page=0x{:x} included={}"),
+            "must emit GUARD_PAGE with included flag"
+        );
+        assert!(
+            body.contains("let is_guard = page_addr < (base & !(PAGE_SIZE - 1));")
+                && body.contains("let log_page = is_top || is_guard;"),
+            "guard page must be detected and logged via log_page (SOURCE+ROOT)"
+        );
+        // SOURCE and ROOT must be emitted for log_page (guard OR top), not is_top.
+        assert!(
+            body.matches("if log_page {").count() >= 2,
+            "SOURCE and ROOT must both emit on log_page (guard + top)"
+        );
+    }
+
+    // 4. The guard page is created in the OWNER root (it routes through the same
+    //    owner-allocation SOURCE path), never user-accessible.
+    #[test]
+    fn stage165f_guard_supervisor_only() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("PageFlags::KERNEL_RW") && body.contains("PageTableEntry::USER) == 0"),
+            "guard page mapping must remain supervisor-only writable"
+        );
+    }
+
+    // 5. Smoke script fails on a schedulable guard page not being included.
+    #[test]
+    fn stage165f_smoke_fails_on_guard_excluded() {
+        assert!(
+            SMOKE_SRC.contains("D6_POST_CLEANUP_STACK_MAP_GUARD_PAGE .*included=0"),
+            "smoke must fail when a schedulable guard-adjacent page is not included"
+        );
+    }
+}
