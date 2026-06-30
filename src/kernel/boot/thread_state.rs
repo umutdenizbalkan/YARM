@@ -1282,6 +1282,199 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 165D: after the D6 proof switches back to tid=1 and restores CR3 to
+    /// asid 1, normal scheduling/trap/idle can land a trap on *another* task's
+    /// kernel stack (observed: tid=3, stack `[0x…1_1000, 0x…1_8000)`) while the
+    /// active root is still asid 1.  Per-task kernel stacks are mapped only in
+    /// their own root, so the supervisor stack write (#PF error 0x2) faulted on
+    /// `0xffff_8000_0001_7f98` (tid=3 top page) under asid 1.
+    ///
+    /// This default-off, proof-only "ensure" shares every live task's kernel
+    /// stack pages — by their authoritative owner-root physical frame — into the
+    /// active root AND every other live task root, so whichever kernel stack a
+    /// post-cleanup trap selects is supervisor-writable under whatever CR3 is
+    /// active.  It never allocates new frames (only shares existing owner-mapped
+    /// pages, so a task's stack content is never diverged) and never maps a page
+    /// user-accessible.  Already-shared pages are accepted as `already_ok`.
+    #[cfg(all(target_arch = "x86_64", not(test), not(feature = "hosted-dev")))]
+    pub(crate) fn d6_ensure_post_cleanup_task_stacks_mapped(&mut self) -> Result<(), KernelError> {
+        use crate::arch::selected_isa::page_table::{self, PageTableEntry};
+        use crate::kernel::vm::{PAGE_SIZE, PageFlags, PhysAddr, VirtAddr};
+
+        fn validate_entry(entry: PageTableEntry) -> bool {
+            (entry.0 & PageTableEntry::WRITABLE) != 0 && (entry.0 & PageTableEntry::USER) == 0
+        }
+
+        let Some(active_asid) = self.hal.active_asid() else {
+            crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_BEGIN active_asid=none");
+            crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_DONE tasks=0 failures=0");
+            return Ok(());
+        };
+        let current_tid = self.current_tid().unwrap_or(u64::MAX);
+        let hw_cr3 = crate::arch::x86_64::page_table::read_hw_cr3();
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_STACK_MAP_BEGIN active_asid={}",
+            active_asid.0
+        );
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_CURRENT_STATE current_tid={} active_asid={} cr3=0x{:016x}",
+            current_tid,
+            active_asid.0,
+            hw_cr3
+        );
+
+        // Collect every live task's kernel stack (tid, base, top) up front.
+        let mut stacks = [(0u64, 0usize, 0usize); super::MAX_TASKS];
+        let mut n = 0usize;
+        self.with_tcbs(|tcbs| {
+            for tcb in tcbs.iter().flatten() {
+                let (Some(base), Some(top)) =
+                    (tcb.kernel_context.stack_base, tcb.kernel_context.stack_top)
+                else {
+                    continue;
+                };
+                if n < stacks.len() {
+                    stacks[n] = (tcb.tid.0, base.0 as usize, top.0 as usize);
+                    n += 1;
+                }
+            }
+        });
+
+        // The set of roots a post-cleanup trap can run under: the active root plus
+        // every live task root.
+        let mut roots = [None; super::MAX_TASKS];
+        roots[0] = Some(active_asid);
+        let mut roots_len = 1usize;
+        for i in 0..n {
+            let Some(asid) = self.task_asid(stacks[i].0) else {
+                continue;
+            };
+            if roots[..roots_len].iter().any(|e| *e == Some(asid)) {
+                continue;
+            }
+            if roots_len < roots.len() {
+                roots[roots_len] = Some(asid);
+                roots_len += 1;
+            }
+        }
+
+        // TSS RSP0 audit: which kernel stack will the next user→kernel trap use,
+        // and is its page mapped supervisor-writable in the active root?
+        let rsp0 = crate::arch::x86_64::descriptor_tables::read_boot_tss_rsp0() as usize;
+        let rsp0_page = rsp0.saturating_sub(8) & !(PAGE_SIZE - 1);
+        let rsp0_tid = {
+            let mut found = u64::MAX;
+            for i in 0..n {
+                let (tid, base, top) = stacks[i];
+                if base <= rsp0 && rsp0 <= top {
+                    found = tid;
+                    break;
+                }
+            }
+            found
+        };
+        let rsp0_mapped = rsp0_page != 0
+            && page_table::resolve_page(active_asid, VirtAddr(rsp0_page as u64))
+                .map(validate_entry)
+                .unwrap_or(false);
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_TSS_RSP0 tid={} rsp0=0x{:016x} page=0x{:x} mapped_active={}",
+            rsp0_tid,
+            rsp0,
+            rsp0_page,
+            rsp0_mapped as u8
+        );
+
+        let mut failures = 0usize;
+        for i in 0..n {
+            let (tid, base, top) = stacks[i];
+            if base == 0 || base >= top {
+                continue;
+            }
+            let top_page = top.saturating_sub(8) & !(PAGE_SIZE - 1);
+            let owner = self.task_asid(tid);
+            crate::yarm_log!(
+                "D6_POST_CLEANUP_STACK_MAP_TASK tid={} base=0x{:x} top=0x{:x} page=0x{:x}",
+                tid,
+                base,
+                top,
+                top_page
+            );
+            let mut page_addr = base & !(PAGE_SIZE - 1);
+            while page_addr < top {
+                let page = VirtAddr(page_addr as u64);
+                // Authoritative physical frame: prefer the task's own root, then
+                // any root that already maps it.  Never allocate — a page no root
+                // maps (e.g. a guard page) is left unmapped.
+                let mut phys = owner
+                    .and_then(|a| page_table::resolve_page(a, page))
+                    .filter(|e| validate_entry(*e))
+                    .map(|e| e.addr());
+                if phys.is_none() {
+                    for root in roots[..roots_len].iter().flatten().copied() {
+                        if let Some(e) = page_table::resolve_page(root, page) {
+                            if validate_entry(e) {
+                                phys = Some(e.addr());
+                                break;
+                            }
+                        }
+                    }
+                }
+                let Some(phys) = phys else {
+                    page_addr = page_addr.saturating_add(PAGE_SIZE);
+                    continue;
+                };
+                for root in roots[..roots_len].iter().flatten().copied() {
+                    let result = match page_table::resolve_page(root, page) {
+                        Some(e) if validate_entry(e) && e.addr() == phys => "already_ok",
+                        Some(e) if validate_entry(e) => {
+                            // A different supervisor frame already maps this VA in
+                            // this root — a genuine conflict; surface, do not hide.
+                            failures += 1;
+                            "failed"
+                        }
+                        Some(_) => {
+                            failures += 1;
+                            "failed"
+                        }
+                        None => match page_table::map_page(
+                            root,
+                            page,
+                            PhysAddr(phys),
+                            PageFlags::KERNEL_RW,
+                        ) {
+                            Ok(_) => "mapped",
+                            Err(_) => {
+                                failures += 1;
+                                "failed"
+                            }
+                        },
+                    };
+                    if page_addr == top_page {
+                        crate::yarm_log!(
+                            "D6_POST_CLEANUP_STACK_MAP_ROOT tid={} asid={} page=0x{:x} result={}",
+                            tid,
+                            root.0,
+                            page_addr,
+                            result
+                        );
+                    }
+                }
+                page_addr = page_addr.saturating_add(PAGE_SIZE);
+            }
+        }
+
+        crate::yarm_log!(
+            "D6_POST_CLEANUP_STACK_MAP_DONE tasks={} failures={}",
+            n,
+            failures
+        );
+        if failures > 0 {
+            return Err(KernelError::VmFull);
+        }
+        Ok(())
+    }
+
     pub fn initialize_thread_kernel_switch_frame(
         &mut self,
         tid: u64,

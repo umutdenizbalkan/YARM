@@ -46122,3 +46122,135 @@ mod stage165c_d6_live_rsp_region_kind {
         );
     }
 }
+
+// ===========================================================================
+// Stage 165D — D6 post-cleanup shared kernel-stack mapping (tid=3 #PF under
+// active ASID).  After the proof restores CR3 to asid 1, a post-cleanup trap
+// landed on tid=3's kernel stack (page 0xffff_8000_0001_7000) which asid 1 does
+// not map → supervisor write #PF.  The fix shares every live task's kernel
+// stack pages into the active root and all task roots.
+// ===========================================================================
+#[cfg(test)]
+mod stage165d_d6_post_cleanup_stack_map {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    fn post_cleanup_map_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_post_cleanup_task_stacks_mapped")
+            .expect("Stage 165D post-cleanup stack map function must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("function after post-cleanup stack map");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    // 1. The function exists and emits the full required marker set.
+    #[test]
+    fn stage165d_emits_required_markers() {
+        let body = post_cleanup_map_source();
+        for marker in [
+            "D6_POST_CLEANUP_STACK_MAP_BEGIN active_asid=",
+            "D6_POST_CLEANUP_CURRENT_STATE current_tid=",
+            "D6_POST_CLEANUP_TSS_RSP0 tid=",
+            "D6_POST_CLEANUP_STACK_MAP_TASK tid=",
+            "D6_POST_CLEANUP_STACK_MAP_ROOT tid=",
+            "D6_POST_CLEANUP_STACK_MAP_DONE tasks=",
+        ] {
+            assert!(body.contains(marker), "post-cleanup map must emit {marker}");
+        }
+    }
+
+    // 2. Mappings are supervisor-only writable; never user-accessible.
+    #[test]
+    fn stage165d_maps_supervisor_only() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("PageFlags::KERNEL_RW"),
+            "post-cleanup map must use PageFlags::KERNEL_RW"
+        );
+        assert!(
+            body.contains("PageTableEntry::USER) == 0"),
+            "post-cleanup map must validate entries are NOT user-accessible"
+        );
+    }
+
+    // 3. It SHARES owner-root frames and never allocates — a task's stack content
+    //    must not be diverged by a freshly allocated frame.
+    #[test]
+    fn stage165d_shares_owner_frames_never_allocates() {
+        let body = post_cleanup_map_source();
+        assert!(
+            !body.contains("alloc_user_data_frame"),
+            "post-cleanup map must not allocate frames (share owner-mapped pages only)"
+        );
+        assert!(
+            body.contains("self.task_asid(tid)"),
+            "post-cleanup map must resolve the owner root for authoritative frames"
+        );
+        assert!(
+            body.contains("already_ok"),
+            "post-cleanup map must accept already-shared pages as already_ok"
+        );
+    }
+
+    // 4. A nonzero failure count is surfaced (not hidden).
+    #[test]
+    fn stage165d_surfaces_failures() {
+        let body = post_cleanup_map_source();
+        assert!(
+            body.contains("failures > 0") && body.contains("KernelError::VmFull"),
+            "post-cleanup map must surface failures as an error, not hide them"
+        );
+        assert!(
+            body.contains("result=failed") || body.contains("\"failed\""),
+            "post-cleanup map must label failed per-root results"
+        );
+    }
+
+    // 5. The cleanup path invokes the post-cleanup mapping before CLEANUP_DONE.
+    #[test]
+    fn stage165d_invoked_from_cleanup_path() {
+        let begin = TRAP_ENTRY_SRC
+            .find("d6_ensure_post_cleanup_task_stacks_mapped")
+            .expect("trap_entry.rs must call d6_ensure_post_cleanup_task_stacks_mapped");
+        let done = TRAP_ENTRY_SRC
+            .find("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE")
+            .expect("cleanup must still emit CLEANUP_DONE");
+        assert!(
+            begin < done,
+            "post-cleanup stack mapping must run before CLEANUP_DONE"
+        );
+    }
+
+    // 6. Smoke script: CHECK_FAILED is now conditional on a later CHECK_OK; the
+    //    script fails on post-cleanup failures and FIRST_RESUME_STASH_MISSING,
+    //    and keeps the fatal-breadcrumb + LIVE_RSP gates.
+    #[test]
+    fn stage165d_smoke_hardening_correct() {
+        assert!(
+            SMOKE_SRC.contains("D6_KERNEL_SWITCH_STACK_CHECK_OK ${ft}"),
+            "smoke must treat CHECK_FAILED as resolved when a later CHECK_OK exists for the tid"
+        );
+        assert!(
+            SMOKE_SRC.contains("D6_POST_CLEANUP_STACK_MAP_ROOT .*result=failed"),
+            "smoke must fail on a post-cleanup per-root result=failed"
+        );
+        assert!(
+            SMOKE_SRC.contains("post-cleanup stack map reported failures>0"),
+            "smoke must fail on a post-cleanup DONE with failures>0"
+        );
+        assert!(
+            SMOKE_SRC.contains("D6_FIRST_RESUME_STASH_MISSING"),
+            "smoke must fail on D6_FIRST_RESUME_STASH_MISSING"
+        );
+        // Gates that must remain.
+        assert!(
+            SMOKE_SRC.contains("fatal breadcrumb after proof start")
+                && SMOKE_SRC.contains("D6_PROOF_LIVE_RSP_STACK_MAP_FAILED"),
+            "the fatal-breadcrumb and LIVE_RSP_STACK_MAP_FAILED gates must remain"
+        );
+    }
+}

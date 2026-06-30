@@ -435,6 +435,17 @@ pub fn handle_trap_entry_shared(
                         // Stage 133: verify ASID 1 maps the fault page before emitting DONE.
                         #[cfg(target_arch = "x86_64")]
                         kernel.d6_check_asid1_stack_page_mapped();
+                        // Stage 165D: the proof restored CR3 to asid 1, but normal
+                        // scheduling/trap/idle can land a post-cleanup trap on
+                        // another task's kernel stack (observed: tid=3) while asid 1
+                        // is active — and per-task kernel stacks are mapped only in
+                        // their own root.  Share every live task's kernel stack
+                        // pages into the active root and all task roots so no
+                        // post-cleanup trap faults on a supervisor stack write.
+                        #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+                        if let Err(err) = kernel.d6_ensure_post_cleanup_task_stacks_mapped() {
+                            crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_FAILED err={:?}", err);
+                        }
                         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
                     }
                     result

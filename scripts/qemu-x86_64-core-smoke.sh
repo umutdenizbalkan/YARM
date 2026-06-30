@@ -565,21 +565,53 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
   if [[ "$fatal_after_proof" -eq 0 ]]; then
     echo "[ok] D6 switch proof: no fatal breadcrumb after proof start"
   fi
-  # Stage 165C: the proof must also fail explicitly if any D6 stack-mapping step
-  # aborts (e.g. the live-RSP mapper hitting VmFull), even when no raw fatal
-  # breadcrumb is printed.  These are hard proof-setup failures.
+  # Stage 165C/165D: hard proof-setup/cleanup failure markers (unconditional).
+  # These indicate a D6 stack-mapping step aborted even if no raw fatal
+  # breadcrumb was printed.
   map_fail=0
   for map_fail_marker in \
     "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED" \
     "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED" \
-    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED"; do
+    "D6_POST_CLEANUP_STACK_MAP_FAILED" \
+    "D6_FIRST_RESUME_STASH_MISSING"; do
     if log_has_pattern "$map_fail_marker"; then
-      echo "[error] D6 switch proof: stack-mapping failure marker present: $map_fail_marker"
+      echo "[error] D6 switch proof: failure marker present: $map_fail_marker"
       map_fail=1
     fi
   done
+  # Stage 165D: the post-cleanup shared-stack mapping must not report any failure
+  # (per-root result=failed, or a DONE line with a nonzero failure count).
+  if [[ -f "$LOGFILE" ]]; then
+    if tr '\r' '\n' <"$LOGFILE" | rg -a -q -- 'D6_POST_CLEANUP_STACK_MAP_ROOT .*result=failed'; then
+      echo "[error] D6 switch proof: post-cleanup stack map root result=failed"
+      map_fail=1
+    fi
+    if tr '\r' '\n' <"$LOGFILE" \
+        | rg -a -- 'D6_POST_CLEANUP_STACK_MAP_DONE' \
+        | rg -av -- 'failures=0' \
+        | rg -aq -- 'failures='; then
+      echo "[error] D6 switch proof: post-cleanup stack map reported failures>0"
+      map_fail=1
+    fi
+  fi
+  # Stage 165D: D6_KERNEL_SWITCH_STACK_CHECK_FAILED is only fatal if NO later
+  # matching CHECK_OK exists for that tid.  Early `target_asid_unavailable`
+  # retries are expected and later become CHECK_OK, so do not fail on those.
+  if [[ -f "$LOGFILE" ]]; then
+    check_failed_tids="$(tr '\r' '\n' <"$LOGFILE" \
+      | rg -a -o -- 'D6_KERNEL_SWITCH_STACK_CHECK_FAILED tid=[0-9]+' \
+      | rg -a -o -- 'tid=[0-9]+' | sort -u)"
+    for ft in $check_failed_tids; do
+      if tr '\r' '\n' <"$LOGFILE" | rg -a -q -- "D6_KERNEL_SWITCH_STACK_CHECK_OK ${ft}\b"; then
+        echo "[ok] D6 switch proof: ${ft} CHECK_FAILED was retried and later CHECK_OK"
+      else
+        echo "[error] D6 switch proof: ${ft} CHECK_FAILED with no later CHECK_OK"
+        map_fail=1
+      fi
+    done
+  fi
   if [[ "$map_fail" -eq 0 ]]; then
-    echo "[ok] D6 switch proof: no stack-mapping failure markers"
+    echo "[ok] D6 switch proof: no unresolved stack-mapping failures"
   fi
   if [[ "$proof_fail" -eq 1 || "$fatal_after_proof" -eq 1 || "$map_fail" -eq 1 ]]; then
     echo "[error] D6 switch proof mode FAILED"
