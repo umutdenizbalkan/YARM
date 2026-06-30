@@ -21,6 +21,19 @@ pub(crate) const KERNEL_STACK_REGION_SIZE: usize = 0x8000;
 /// stack region.  `provision_default_kernel_context` sets stack_base =
 /// region_base + KERNEL_STACK_GUARD_SIZE so the guard is never backed.
 pub(crate) const KERNEL_STACK_GUARD_SIZE: usize = 0x1000;
+/// Stage 165H: bound for the default-off D6 proof's scratch arrays.  The proof
+/// helpers previously sized their per-task scratch at `MAX_TASKS` (512): a
+/// `[(u64, usize, usize); 512]` is 12 KiB and a `[Option<Asid>; 512]` ~2 KiB of
+/// **stack**.  Those arrays live on the deep D6 post-switch / cleanup call chain,
+/// and combined with handle_trap's ~8 KiB frame they overflowed the 32 KiB
+/// kernel stack — sliding off the bottom of tid=0's region (the canonical
+/// boundary `0xffff_8000_0000_0000`) into NON-canonical space, which #GPs on the
+/// stack push and escalates to a #DF (vector 8, CR2=0).  The proof only ever
+/// touches the handful of bootstrap/service tasks, so a much smaller bound
+/// removes ~10 KiB of stack pressure with no behavior change.  (Mapping below the
+/// canonical boundary is physically impossible, so the depth must be reduced, not
+/// the range extended.)
+const D6_PROOF_MAX_TASKS: usize = 128;
 const USER_STACK_STRIDE_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(target_arch = "x86_64")]
 const USER_VIRT_TOP_EXCLUSIVE: u64 = 0x0000_8000_0000_0000;
@@ -494,7 +507,7 @@ impl KernelState {
         // existing task root (plus the target root) instead of relying on a
         // target-ASID-only mapping. This is intentionally narrow: one page, not
         // the full kernel-stack arena.
-        let mut roots = [None; super::MAX_TASKS];
+        let mut roots = [None; D6_PROOF_MAX_TASKS];
         roots[0] = Some(target_asid);
         self.with_tcbs(|tcbs| {
             let mut len = 1usize;
@@ -937,7 +950,7 @@ impl KernelState {
 
         // Collect all ASIDs before the allocation loop so &mut self is free for
         // alloc_user_data_frame without nested borrow conflicts.
-        let mut roots = [None; super::MAX_TASKS];
+        let mut roots = [None; D6_PROOF_MAX_TASKS];
         roots[0] = Some(target_asid);
         self.with_tcbs(|tcbs| {
             let mut len = 1usize;
@@ -1188,7 +1201,7 @@ impl KernelState {
         // Collect all task ASIDs before the allocation loop (mirrors
         // `d6_ensure_full_proof_switch_stack_mapped`) so each live-region page is
         // shared into every root that may be active during a post-proof trap.
-        let mut roots = [None; super::MAX_TASKS];
+        let mut roots = [None; D6_PROOF_MAX_TASKS];
         roots[0] = Some(target_asid);
         self.with_tcbs(|tcbs| {
             let mut len = 1usize;
@@ -1352,7 +1365,7 @@ impl KernelState {
         );
 
         // Collect every live task's kernel stack (tid, base, top) up front.
-        let mut stacks = [(0u64, 0usize, 0usize); super::MAX_TASKS];
+        let mut stacks = [(0u64, 0usize, 0usize); D6_PROOF_MAX_TASKS];
         let mut n = 0usize;
         self.with_tcbs(|tcbs| {
             for tcb in tcbs.iter().flatten() {
@@ -1370,7 +1383,7 @@ impl KernelState {
 
         // The set of roots a post-cleanup trap can run under: the active root plus
         // every live task root.
-        let mut roots = [None; super::MAX_TASKS];
+        let mut roots = [None; D6_PROOF_MAX_TASKS];
         roots[0] = Some(active_asid);
         let mut roots_len = 1usize;
         for i in 0..n {
