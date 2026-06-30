@@ -46334,22 +46334,28 @@ mod stage165e_d6_post_cleanup_source {
             body.contains("source = \"created\""),
             "owner allocation must be labeled result=created"
         );
-        // The allocation lives inside the `if let Some(oa) = owner` block (created
-        // path) and maps into `oa`; the no-owner branch must explicitly NOT
-        // allocate.
+        // The owner-task allocation lives inside the `if let Some(oa) = owner`
+        // block and maps into the owner root `oa`.  (Stage 165G: the no-owner
+        // branch allocates into the active root instead — covered by the
+        // stage165g module — so the old "never allocate" rule no longer applies.)
         assert!(
-            body.contains("if let Some(oa) = owner") && body.contains("never allocate"),
-            "allocation must be owner-only; the no-owner branch must never allocate"
+            body.contains("if let Some(oa) = owner"),
+            "owner-task allocation must map the created frame into the owner root (oa)"
         );
     }
 
-    // 4. A no-owner (non-schedulable) task uses a non-failing NOTE, not a SKIP.
+    // 4. Stage 165G superseded the no-owner NOTE: a no-owner (idle/trap-capable)
+    //    stack is now mapped, never left as an ignorable NOTE.
     #[test]
-    fn stage165e_no_owner_is_note_not_failure() {
+    fn stage165g_no_owner_is_mapped_not_noted() {
         let body = post_cleanup_map_source();
         assert!(
-            body.contains("D6_POST_CLEANUP_STACK_MAP_NOTE") && body.contains("not_schedulable"),
-            "no-owner unmapped pages must be a non-failing NOTE"
+            !body.contains("D6_POST_CLEANUP_STACK_MAP_NOTE"),
+            "the ignorable no-owner NOTE must be gone (165G maps no-owner stacks)"
+        );
+        assert!(
+            body.contains("D6_POST_CLEANUP_STACK_MAP_NO_OWNER_ACTIVE_SOURCE"),
+            "no-owner stacks must source/allocate in the active root"
         );
     }
 
@@ -46396,23 +46402,21 @@ mod stage165f_d6_post_cleanup_guard_page {
         &THREAD_STATE_SRC[start..end]
     }
 
-    // 1. A schedulable task's range starts one guard page below stack_base; the
-    //    loop iterates from region_base, not stack_base.
+    // 1. Every task's range starts one guard page below stack_base; the loop
+    //    iterates from region_base, not stack_base.  (Stage 165G: the guard
+    //    extension now applies to all tasks, including no-owner tid=0.)
     #[test]
     fn stage165f_extends_range_below_base() {
         let body = post_cleanup_map_source();
         assert!(
-            body.contains("saturating_sub(KERNEL_STACK_GUARD_SIZE)"),
-            "region_base must be stack_base - KERNEL_STACK_GUARD_SIZE for owner tasks"
+            body.contains(
+                "let region_base = (base & !(PAGE_SIZE - 1)).saturating_sub(KERNEL_STACK_GUARD_SIZE);"
+            ),
+            "region_base must be stack_base - KERNEL_STACK_GUARD_SIZE for every task"
         );
         assert!(
             body.contains("let mut page_addr = region_base;"),
             "the page loop must start at region_base (includes the guard-adjacent page)"
-        );
-        // The guard extension is gated on owner.is_some() (schedulable only).
-        assert!(
-            body.contains("let region_base = if owner.is_some() {"),
-            "guard extension must apply only to schedulable (owner-asid) tasks"
         );
     }
 
@@ -46470,6 +46474,97 @@ mod stage165f_d6_post_cleanup_guard_page {
         assert!(
             SMOKE_SRC.contains("D6_POST_CLEANUP_STACK_MAP_GUARD_PAGE .*included=0"),
             "smoke must fail when a schedulable guard-adjacent page is not included"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 165G — D6 post-cleanup no-owner (tid=0) kernel stack mapping.  A long
+// proof run faulted on tid=0's stack (0xffff_8000_0000_7000, range
+// [0x…1000,0x…8000)) under asid 1: 165F treated no-owner stacks as ignorable
+// NOTEs, but idle/trap/interrupt/kernel-continuation paths can run on them.
+// 165G maps no-owner stacks too (reuse existing frame, else allocate proof-only
+// in the active root) and shares into all roots.
+// ===========================================================================
+#[cfg(test)]
+mod stage165g_d6_post_cleanup_no_owner {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    fn post_cleanup_map_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_post_cleanup_task_stacks_mapped")
+            .expect("post-cleanup stack map function must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("function after post-cleanup stack map");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    // 1. The no-owner branch allocates a proof-only frame in the ACTIVE root when
+    //    no existing frame is found, then the page is shared like any other.
+    #[test]
+    fn stage165g_no_owner_allocates_in_active_root() {
+        let body = post_cleanup_map_source();
+        let else_idx = body
+            .find("// No owner asid (e.g. tid=0).")
+            .expect("no-owner branch must exist");
+        // Find the end of the else branch (the GUARD_PAGE marker that follows it).
+        let end = body[else_idx..]
+            .find("if is_guard {")
+            .map(|o| else_idx + o)
+            .unwrap_or(body.len());
+        let branch = &body[else_idx..end];
+        assert!(
+            branch.contains("alloc_user_data_frame") && branch.contains("active_asid,"),
+            "no-owner branch must allocate a proof-only frame in the active root"
+        );
+        assert!(
+            branch.contains("D6_POST_CLEANUP_STACK_MAP_NO_OWNER_ACTIVE_SOURCE"),
+            "no-owner branch must emit NO_OWNER_ACTIVE_SOURCE"
+        );
+    }
+
+    // 2. The ignorable NOTE is gone; an unbacked page is now a hard SKIP+failure
+    //    for ALL tasks (owner and no-owner).
+    #[test]
+    fn stage165g_no_note_unbacked_is_failure() {
+        let body = post_cleanup_map_source();
+        assert!(
+            !body.contains("D6_POST_CLEANUP_STACK_MAP_NOTE"),
+            "the ignorable no-owner NOTE must be removed"
+        );
+        // The phys-None arm must unconditionally SKIP + increment failures (no
+        // owner.is_some() gate).
+        let skip_idx = body.find("reason=no_source_frame").expect("SKIP present");
+        let before = &body[..skip_idx];
+        let arm_start = before
+            .rfind("let Some(phys) = phys else")
+            .expect("phys-None arm");
+        let arm = &body[arm_start..skip_idx + 200];
+        assert!(
+            !arm.contains("if owner.is_some()"),
+            "the unbacked-page failure must not be gated on owner.is_some()"
+        );
+    }
+
+    // 3. The guard-adjacent extension now applies to every task (no owner gate).
+    #[test]
+    fn stage165g_guard_extension_unconditional() {
+        let body = post_cleanup_map_source();
+        assert!(
+            !body.contains("let region_base = if owner.is_some()"),
+            "region_base must no longer be gated on owner.is_some() (applies to all tasks)"
+        );
+    }
+
+    // 4. Smoke fails if a no-owner stack is left as an ignorable NOTE.
+    #[test]
+    fn stage165g_smoke_fails_on_no_owner_note() {
+        assert!(
+            SMOKE_SRC.contains("no_owner_asid_unmapped_not_schedulable"),
+            "smoke must fail on a no-owner unmapped NOTE for tid=0"
         );
     }
 }
