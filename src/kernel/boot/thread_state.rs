@@ -12,10 +12,30 @@ use crate::kernel::trapframe::TrapFrame;
 use crate::kernel::vm::Asid;
 
 pub(crate) const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
+/// Per-task kernel-stack region size.
+///
 /// Stage 134: increased from 0x4000 (16 KB) to 0x8000 (32 KB) per slot to
 /// accommodate the handle_trap → syscall → spawn → create_user_space call
 /// chain that overflowed a 16 KB stack by ~0x40 bytes (RSP descended to
 /// 0xffff80000000bfc0, 0x40 below the old base 0xffff80000000c000).
+///
+/// Stage 165I (x86_64 only): increased again from 0x8000 (32 KB) to 0x10000
+/// (64 KB).  The D6 controlled-switch proof's deep post-cleanup trap path
+/// (handle_trap ~8 KB frame + process_ipc_timeout_deadlines' `[None; 512]` ~8 KB
+/// + nested call chain) reaches ~33 KB, overflowing the 32 KB region.  Because
+/// tid=0's region sits exactly at the canonical boundary 0xFFFF_8000_0000_0000,
+/// that overflow descends into NON-canonical space and #DFs (vector 8, CR2=0)
+/// instead of #PF'ing — and non-canonical pages cannot be mapped, so the region
+/// must be enlarged.  64 KB (60 KB usable above the guard page) gives ample
+/// headroom.  AArch64/RISC-V keep 32 KB: their trap paths fit and the D6 proof
+/// is x86_64-only, so this is gated to avoid changing their layout/memory.
+/// The region span is MAX_TASKS(512) × 64 KB = 32 MiB
+/// ([0xFFFF_8000_0000_0000, 0xFFFF_8000_0200_0000)), which is sparse on-demand
+/// VA dedicated to kernel stacks (the image/direct-map live at 0xFFFF_FF80_…),
+/// so no collision.
+#[cfg(target_arch = "x86_64")]
+pub(crate) const KERNEL_STACK_REGION_SIZE: usize = 0x10000;
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) const KERNEL_STACK_REGION_SIZE: usize = 0x8000;
 /// Stage 134: one unmapped guard page at the bottom of every kernel-switch-
 /// stack region.  `provision_default_kernel_context` sets stack_base =

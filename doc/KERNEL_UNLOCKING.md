@@ -4793,6 +4793,30 @@ mechanically complete (Stage 152). The roadmap, in order:
    without the proof knob; `D6_GLOBAL_LOCK_DROP_DEFERRED` must no longer appear for
    the switched task pair. (Outcome B: preparatory phase split, no genuine seam call.)
 
+   **Stage 165B–165I (D6-SWITCH-SMOKE stabilization, x86_64).** Bringing the
+   `D6_SWITCH_PROOF=1` harness through a clean QEMU run surfaced a chain of
+   post-cleanup faults: a guard-adjacent #PF on tid=3's switch stack (165B/165F),
+   a `VmFull` from mis-classifying the boot/CPU stack as a per-task stack
+   (165C), a false-success when a demand-paged stack page had no source frame
+   (165E), and the no-owner tid=0 idle/trap stack being skipped (165G). These
+   were fixed with proof-only post-cleanup stack mapping that shares every live
+   task's kernel stack (owner-root or active-root sourced, supervisor-only,
+   guard-adjacent page included) across all roots, with explicit
+   `D6_POST_CLEANUP_STACK_MAP_*` markers and a hardened smoke gate. The terminal
+   issue (165H/165I) was a genuine **kernel-stack overflow**: the deep
+   post-cleanup trap path (`handle_trap` ~8 KiB frame +
+   `process_ipc_timeout_deadlines`' `[None; 512]` ~8 KiB + nested chain) reaches
+   ~33 KiB, overflowing the 32 KiB per-task region; at tid=0's region — which
+   sits exactly at the canonical boundary `0xFFFF_8000_0000_0000` — the overflow
+   descends into **non-canonical** space and escalates to a #DF (vector 8,
+   CR2=0). Non-canonical pages cannot be mapped, so the durable fix (**Stage
+   165I**) enlarges the x86_64 per-task kernel stack region from 32 KiB to 64 KiB
+   (`KERNEL_STACK_REGION_SIZE 0x8000 → 0x10000`, `#[cfg(target_arch = "x86_64")]`;
+   AArch64/RISC-V keep 32 KiB and are untouched). All of this is default-off proof
+   path / stack-capacity only: no D6-SWITCH-A, no production Outcome A, no genuine
+   seam live-wire, no ABI change. See the `stage165*` guards in
+   `src/kernel/boot/tests.rs`.
+
 2. **D6-SWITCH-A — genuine Outcome A on x86_64: drop global lock before `switch_frames`
    in the production trap path.** The `PerCpuSwitchPlanStash` /
    `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` stash infrastructure (Stage 117) and the

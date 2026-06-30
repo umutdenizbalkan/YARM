@@ -37728,8 +37728,10 @@ mod stage134_kernel_stack_audit {
         let base = ctx.stack_base.expect("stack_base set").0 as usize;
         let top = ctx.stack_top.expect("stack_top set").0 as usize;
 
-        let new_region_size: usize = 0x8000;
-        let new_guard_size: usize = 0x1000;
+        // Stage 165I: derive from the actual constant so the test tracks the
+        // arch-conditional size (64 KB on x86_64, 32 KB elsewhere).
+        let new_region_size: usize = crate::kernel::boot::thread_state::KERNEL_STACK_REGION_SIZE;
+        let new_guard_size: usize = crate::kernel::boot::thread_state::KERNEL_STACK_GUARD_SIZE;
 
         // base must be at guard_size offset within its region slot.
         assert_eq!(
@@ -37834,9 +37836,16 @@ mod stage135_pt_allocator_no_stack_scratch {
         use crate::kernel::boot::thread_state::{
             KERNEL_STACK_GUARD_SIZE, KERNEL_STACK_REGION_SIZE,
         };
+        // Stage 165I: x86_64 kernel stacks are 64 KB; other arches remain 32 KB.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            KERNEL_STACK_REGION_SIZE, 0x10000,
+            "Stage 165I increased x86_64 KERNEL_STACK_REGION_SIZE to 64 KB"
+        );
+        #[cfg(not(target_arch = "x86_64"))]
         assert_eq!(
             KERNEL_STACK_REGION_SIZE, 0x8000,
-            "Stage 134 increased KERNEL_STACK_REGION_SIZE to 32 KB"
+            "non-x86_64 KERNEL_STACK_REGION_SIZE remains 32 KB"
         );
         assert_eq!(
             KERNEL_STACK_GUARD_SIZE, 0x1000,
@@ -46620,6 +46629,81 @@ mod stage165h_d6_proof_stack_pressure {
         assert!(
             THREAD_STATE_SRC.contains("super::MAX_TASKS * KERNEL_STACK_REGION_SIZE"),
             "the per-task region VA bound must still use MAX_TASKS"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 165I — x86_64 per-task kernel stacks enlarged 32 KiB -> 64 KiB.  The D6
+// proof's deep post-cleanup trap path reaches ~33 KiB, overflowing the 32 KiB
+// region; at tid=0's region (the canonical boundary) that overflow descends into
+// NON-canonical space and #DFs.  Non-canonical pages cannot be mapped, so the
+// durable fix is to enlarge the stack region.  x86_64-only (cfg-gated); other
+// arches keep 32 KiB.
+// ===========================================================================
+#[cfg(test)]
+mod stage165i_kernel_stack_64k {
+    use crate::kernel::boot::thread_state::{KERNEL_STACK_GUARD_SIZE, KERNEL_STACK_REGION_SIZE};
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+
+    // 1. x86_64 kernel stack region is 64 KiB; the change is cfg-gated so other
+    //    arches keep 32 KiB.
+    #[test]
+    fn stage165i_x86_64_stack_region_is_64k() {
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            KERNEL_STACK_REGION_SIZE, 0x10000,
+            "x86_64 kernel stack region must be 64 KiB"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("#[cfg(target_arch = \"x86_64\")]")
+                && THREAD_STATE_SRC.contains("KERNEL_STACK_REGION_SIZE: usize = 0x10000")
+                && THREAD_STATE_SRC.contains("KERNEL_STACK_REGION_SIZE: usize = 0x8000"),
+            "size must be cfg-gated: 0x10000 on x86_64, 0x8000 elsewhere"
+        );
+    }
+
+    // 2. Usable stack (region - guard) clears the observed ~33 KiB overflow on
+    //    x86_64 with margin.
+    #[test]
+    fn stage165i_usable_stack_clears_observed_overflow() {
+        let usable = KERNEL_STACK_REGION_SIZE - KERNEL_STACK_GUARD_SIZE;
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            usable >= 0xC000, // >= 48 KiB usable; observed overflow was ~33 KiB (0x8160)
+            "x86_64 usable kernel stack 0x{usable:x} must clear the ~33 KiB overflow"
+        );
+        assert!(
+            usable >= 24 * 1024,
+            "usable kernel stack must be at least 24 KiB on any arch"
+        );
+    }
+
+    // 3. Stack range math and D6 proof helpers derive from the constant (so they
+    //    track the new size automatically), and mappings stay supervisor-only.
+    #[test]
+    fn stage165i_derived_logic_uses_constant_and_supervisor_only() {
+        // provision_default_kernel_context derives region/base/top from the const.
+        let prov_start = THREAD_STATE_SRC
+            .find("fn provision_default_kernel_context")
+            .expect("provision fn");
+        let prov = &THREAD_STATE_SRC[prov_start..prov_start + 1200];
+        assert!(
+            prov.contains("idx.saturating_mul(KERNEL_STACK_REGION_SIZE)")
+                && prov.contains("checked_add(KERNEL_STACK_REGION_SIZE)"),
+            "stack range math must derive from KERNEL_STACK_REGION_SIZE"
+        );
+        // D6 post-cleanup map and guard helpers derive from the const/guard, and
+        // every kernel-stack mapping in the file is supervisor-only (KERNEL_RW,
+        // USER bit cleared) — never user-accessible.
+        assert!(
+            THREAD_STATE_SRC.contains("saturating_sub(KERNEL_STACK_GUARD_SIZE)"),
+            "guard-adjacent helpers must derive from KERNEL_STACK_GUARD_SIZE"
+        );
+        assert!(
+            THREAD_STATE_SRC.contains("PageFlags::KERNEL_RW")
+                && THREAD_STATE_SRC.contains("PageTableEntry::USER) == 0"),
+            "kernel stack mappings must be supervisor-only (KERNEL_RW, USER bit cleared)"
         );
     }
 }
