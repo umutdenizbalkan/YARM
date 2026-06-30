@@ -30,6 +30,12 @@ D6_SWITCH_PROOF=${D6_SWITCH_PROOF:-0}
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
+# Stage 166 (D6-SWITCH-A): D6_SWITCH_A=1 appends yarm.d6_switch_a=1 to opt the
+# first narrow production unlocked switch in (default-off; x86_64-only).
+D6_SWITCH_A=${D6_SWITCH_A:-0}
+if [[ "$D6_SWITCH_A" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_a="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_a=1"
+fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
 # whenever any proof requirement env var is enabled, so honor it here.
@@ -629,6 +635,41 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
     echo "[error] D6 switch proof mode FAILED"
     exit 1
   fi
+fi
+
+# Stage 166 (D6-SWITCH-A): when booted with yarm.d6_switch_a=1, require evidence
+# of at least one real production unlocked switch, and reject any fatal
+# breadcrumb after the switch begins.
+if [[ "$D6_SWITCH_A" == "1" ]]; then
+  switch_a_fail=0
+  echo "[ok] D6_SWITCH_A enabled marker:" $(log_has_pattern "D6_SWITCH_A_ENABLED" && echo present || echo MISSING)
+  for sa_marker in \
+    "D6_SWITCH_A_CANDIDATE" \
+    "D6_SWITCH_A_LOCK_DROPPED" \
+    "D6_SWITCH_A_SWITCH_ENTER" \
+    "D6_SWITCH_A_RETURNED" \
+    "D6_SWITCH_A_DONE"; do
+    if log_has_pattern "$sa_marker"; then
+      echo "[ok] D6-SWITCH-A marker present: $sa_marker"
+    else
+      echo "[error] D6-SWITCH-A marker missing: $sa_marker"
+      switch_a_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    sa_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/D6_SWITCH_A_CANDIDATE/{seen=1} seen{print}')"
+    for fatal_pat in '!Fv' '!BNv' 'PAGE_FAULT' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$sa_tail" | rg -a -F -q -- "$fatal_pat"; then
+        echo "[error] D6-SWITCH-A: fatal breadcrumb after switch start: $fatal_pat"
+        switch_a_fail=1
+      fi
+    done
+  fi
+  if [[ "$switch_a_fail" -eq 1 ]]; then
+    echo "[error] D6-SWITCH-A mode FAILED"
+    exit 1
+  fi
+  echo "[ok] D6-SWITCH-A: real production unlocked switch observed"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

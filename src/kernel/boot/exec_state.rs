@@ -1049,7 +1049,18 @@ impl KernelState {
 
         #[cfg(target_arch = "x86_64")]
         {
-            if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+            // Stage 166 (D6-SWITCH-A): the same proven production kernel-context
+            // switch path (the stash → unlocked `switch_frames` path below) is
+            // driven either by the diagnostic proof knob (`yarm.d6_switch_proof=1`)
+            // or by the first-narrow production Outcome A knob
+            // (`yarm.d6_switch_a=1`).  Both are x86_64-only, single-CPU, one-shot,
+            // default-off.  When `d6_switch_a` drives it (and the proof knob is
+            // off), additional `D6_SWITCH_A_*` markers tag the run as a real
+            // production unlocked switch.
+            let proof_enabled = crate::kernel::boot::d6_controlled_switch_proof_enabled();
+            let switch_a_enabled = crate::kernel::boot::d6_switch_a_enabled();
+            let switch_a_mode = switch_a_enabled && !proof_enabled;
+            if (!proof_enabled && !switch_a_enabled)
                 || crate::kernel::boot::d6_controlled_switch_proof_done()
             {
                 return Ok(());
@@ -1059,6 +1070,9 @@ impl KernelState {
                     "D6_CONTROLLED_SWITCH_PROOF_DEFERRED reason=multi_cpu online_cpus={}",
                     self.online_cpu_count()
                 );
+                if switch_a_mode {
+                    crate::yarm_log!("D6_SWITCH_A_FALLBACK reason=multi_cpu");
+                }
                 return Ok(());
             }
             let cpu_idx = self.current_cpu().0 as usize;
@@ -1100,6 +1114,9 @@ impl KernelState {
                     outgoing_tid,
                     incoming_tid
                 );
+                if switch_a_mode {
+                    crate::yarm_log!("D6_SWITCH_A_FALLBACK reason=frames_uninitialized");
+                }
                 return Ok(());
             }
             // Stage 128: `switch_frames` does not switch CR3; it changes the
@@ -1113,6 +1130,9 @@ impl KernelState {
                     incoming_tid,
                     err
                 );
+                if switch_a_mode {
+                    crate::yarm_log!("D6_SWITCH_A_FALLBACK reason=active_stack_unmapped");
+                }
                 return Ok(());
             }
             if !crate::kernel::boot::d6_controlled_switch_proof_try_start() {
@@ -1124,6 +1144,13 @@ impl KernelState {
                 outgoing_tid,
                 incoming_tid
             );
+            if switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_CANDIDATE outgoing={} incoming={}",
+                    outgoing_tid,
+                    incoming_tid
+                );
+            }
             // Stage 131: ArchSwitchContext / switch_frames ABI audit markers.
             // Emitted once per proof run to record that the layout was verified:
             // words[0..7] at offsets 0,8,16..56 (rsp,rip,rbx,rbp,r12-r15);

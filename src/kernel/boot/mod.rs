@@ -646,6 +646,26 @@ pub(crate) fn d6_controlled_switch_proof_enabled() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 166 (D6-SWITCH-A): x86_64-only, default-off gate that opts a real
+/// production `switch_frames` context switch into the unlocked (global-lock-
+/// dropped) path proven by D6-SWITCH-SMOKE.  Separate from the diagnostic
+/// `d6_switch_proof` knob.  When OFF (default), production initialized-pair
+/// switches use the proven Stage 116 lock-held fallback (no behavior change);
+/// when ON, the first such production switch drops the global `SpinLock<KernelState>`
+/// before `switch_frames` and emits `D6_SWITCH_A_*` markers.  This is the first
+/// narrow production Outcome A; it is not scheduler policy and is reversible by
+/// dropping the knob.  VALIDATION: D6_SWITCH_A_ENABLED.
+pub(crate) static D6_SWITCH_A_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_d6_switch_a_enabled(enabled: bool) {
+    D6_SWITCH_A_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn d6_switch_a_enabled() -> bool {
+    D6_SWITCH_A_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }
