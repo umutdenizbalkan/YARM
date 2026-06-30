@@ -37836,11 +37836,11 @@ mod stage135_pt_allocator_no_stack_scratch {
         use crate::kernel::boot::thread_state::{
             KERNEL_STACK_GUARD_SIZE, KERNEL_STACK_REGION_SIZE,
         };
-        // Stage 165I: x86_64 kernel stacks are 64 KB; other arches remain 32 KB.
+        // Stage 165J: x86_64 kernel stacks are 128 KB; other arches remain 32 KB.
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
-            KERNEL_STACK_REGION_SIZE, 0x10000,
-            "Stage 165I increased x86_64 KERNEL_STACK_REGION_SIZE to 64 KB"
+            KERNEL_STACK_REGION_SIZE, 0x20000,
+            "Stage 165J increased x86_64 KERNEL_STACK_REGION_SIZE to 128 KB"
         );
         #[cfg(not(target_arch = "x86_64"))]
         assert_eq!(
@@ -46634,44 +46634,44 @@ mod stage165h_d6_proof_stack_pressure {
 }
 
 // ===========================================================================
-// Stage 165I — x86_64 per-task kernel stacks enlarged 32 KiB -> 64 KiB.  The D6
-// proof's deep post-cleanup trap path reaches ~33 KiB, overflowing the 32 KiB
-// region; at tid=0's region (the canonical boundary) that overflow descends into
-// NON-canonical space and #DFs.  Non-canonical pages cannot be mapped, so the
-// durable fix is to enlarge the stack region.  x86_64-only (cfg-gated); other
-// arches keep 32 KiB.
+// Stage 165J — x86_64 per-task kernel stacks enlarged 64 KiB -> 128 KiB.  Stage
+// 165I's 64 KiB still #DF'd: the deep post-cleanup trap path overflowed the
+// 64 KiB region too (observed depth ~64 KiB).  Because tid=0's region bottoms at
+// the canonical boundary 0xFFFF_8000_0000_0000, the overflow goes non-canonical
+// and #DFs (vector 8, CR2=0); non-canonical pages cannot be mapped, so the
+// region is enlarged to 128 KiB (~124 KiB usable).  x86_64-only (cfg-gated);
+// other arches keep 32 KiB.
 // ===========================================================================
 #[cfg(test)]
-mod stage165i_kernel_stack_64k {
+mod stage165j_kernel_stack_128k {
     use crate::kernel::boot::thread_state::{KERNEL_STACK_GUARD_SIZE, KERNEL_STACK_REGION_SIZE};
     const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
 
-    // 1. x86_64 kernel stack region is 64 KiB; the change is cfg-gated so other
-    //    arches keep 32 KiB.
+    // 1. x86_64 kernel stack region is 128 KiB; cfg-gated so other arches keep
+    //    32 KiB.
     #[test]
-    fn stage165i_x86_64_stack_region_is_64k() {
+    fn stage165j_x86_64_stack_region_is_128k() {
         #[cfg(target_arch = "x86_64")]
         assert_eq!(
-            KERNEL_STACK_REGION_SIZE, 0x10000,
-            "x86_64 kernel stack region must be 64 KiB"
+            KERNEL_STACK_REGION_SIZE, 0x20000,
+            "x86_64 kernel stack region must be 128 KiB"
         );
         assert!(
             THREAD_STATE_SRC.contains("#[cfg(target_arch = \"x86_64\")]")
-                && THREAD_STATE_SRC.contains("KERNEL_STACK_REGION_SIZE: usize = 0x10000")
+                && THREAD_STATE_SRC.contains("KERNEL_STACK_REGION_SIZE: usize = 0x20000")
                 && THREAD_STATE_SRC.contains("KERNEL_STACK_REGION_SIZE: usize = 0x8000"),
-            "size must be cfg-gated: 0x10000 on x86_64, 0x8000 elsewhere"
+            "size must be cfg-gated: 0x20000 on x86_64, 0x8000 elsewhere"
         );
     }
 
-    // 2. Usable stack (region - guard) clears the observed ~33 KiB overflow on
-    //    x86_64 with margin.
+    // 2. Usable stack (region - guard) is >= 120 KiB on x86_64.
     #[test]
-    fn stage165i_usable_stack_clears_observed_overflow() {
+    fn stage165j_usable_stack_at_least_120k() {
         let usable = KERNEL_STACK_REGION_SIZE - KERNEL_STACK_GUARD_SIZE;
         #[cfg(target_arch = "x86_64")]
         assert!(
-            usable >= 0xC000, // >= 48 KiB usable; observed overflow was ~33 KiB (0x8160)
-            "x86_64 usable kernel stack 0x{usable:x} must clear the ~33 KiB overflow"
+            usable >= 120 * 1024, // 128 KiB - 4 KiB guard = 124 KiB
+            "x86_64 usable kernel stack 0x{usable:x} must be at least 120 KiB"
         );
         assert!(
             usable >= 24 * 1024,
@@ -46682,7 +46682,7 @@ mod stage165i_kernel_stack_64k {
     // 3. Stack range math and D6 proof helpers derive from the constant (so they
     //    track the new size automatically), and mappings stay supervisor-only.
     #[test]
-    fn stage165i_derived_logic_uses_constant_and_supervisor_only() {
+    fn stage165j_derived_logic_uses_constant_and_supervisor_only() {
         // provision_default_kernel_context derives region/base/top from the const.
         let prov_start = THREAD_STATE_SRC
             .find("fn provision_default_kernel_context")
