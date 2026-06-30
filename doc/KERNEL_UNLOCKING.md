@@ -4809,12 +4809,19 @@ mechanically complete (Stage 152). The roadmap, in order:
    ~33 KiB, overflowing the 32 KiB per-task region; at tid=0's region — which
    sits exactly at the canonical boundary `0xFFFF_8000_0000_0000` — the overflow
    descends into **non-canonical** space and escalates to a #DF (vector 8,
-   CR2=0). Non-canonical pages cannot be mapped, so the durable fix (**Stage
-   165I**) enlarges the x86_64 per-task kernel stack region from 32 KiB to 64 KiB
-   (`KERNEL_STACK_REGION_SIZE 0x8000 → 0x10000`, `#[cfg(target_arch = "x86_64")]`;
-   AArch64/RISC-V keep 32 KiB and are untouched). All of this is default-off proof
-   path / stack-capacity only: no D6-SWITCH-A, no production Outcome A, no genuine
-   seam live-wire, no ABI change. See the `stage165*` guards in
+   CR2=0). Non-canonical pages cannot be mapped, so the durable fix enlarges the
+   x86_64 per-task kernel stack region: **Stage 165I** 32 KiB → 64 KiB
+   (`0x8000 → 0x10000`), **Stage 165J** 64 KiB → 128 KiB (`0x10000 → 0x20000`),
+   both `#[cfg(target_arch = "x86_64")]`; AArch64/RISC-V keep 32 KiB and are
+   untouched. **Caveat:** the observed overflow depth tracked the region size
+   (~33 KiB at 32 KiB, ~64 KiB at 64 KiB) because tid=0 always bottoms at the
+   canonical boundary — and a single timer-trap chain is only ~16–20 KiB, so
+   reaching 64 KiB implies ~4× nesting. If 128 KiB still #DFs, the post-cleanup
+   path is nested/recursive (interrupts re-enabled during the handler, or a
+   re-entrant fault loop) rather than fixed-deep, and the fix is to bound the
+   nesting, not enlarge the stack again. All of this is default-off proof path /
+   stack-capacity only: no D6-SWITCH-A, no production Outcome A, no genuine seam
+   live-wire, no ABI change. See the `stage165*` guards in
    `src/kernel/boot/tests.rs`.
 
 2. **D6-SWITCH-A — genuine Outcome A on x86_64: drop global lock before `switch_frames`

@@ -19,22 +19,27 @@ pub(crate) const KERNEL_STACK_REGION_BASE: usize = 0xFFFF_8000_0000_0000;
 /// chain that overflowed a 16 KB stack by ~0x40 bytes (RSP descended to
 /// 0xffff80000000bfc0, 0x40 below the old base 0xffff80000000c000).
 ///
-/// Stage 165I (x86_64 only): increased again from 0x8000 (32 KB) to 0x10000
-/// (64 KB).  The D6 controlled-switch proof's deep post-cleanup trap path
-/// (handle_trap ~8 KB frame + process_ipc_timeout_deadlines' `[None; 512]` ~8 KB
-/// + nested call chain) reaches ~33 KB, overflowing the 32 KB region.  Because
-/// tid=0's region sits exactly at the canonical boundary 0xFFFF_8000_0000_0000,
-/// that overflow descends into NON-canonical space and #DFs (vector 8, CR2=0)
-/// instead of #PF'ing — and non-canonical pages cannot be mapped, so the region
-/// must be enlarged.  64 KB (60 KB usable above the guard page) gives ample
-/// headroom.  AArch64/RISC-V keep 32 KB: their trap paths fit and the D6 proof
-/// is x86_64-only, so this is gated to avoid changing their layout/memory.
-/// The region span is MAX_TASKS(512) × 64 KB = 32 MiB
-/// ([0xFFFF_8000_0000_0000, 0xFFFF_8000_0200_0000)), which is sparse on-demand
-/// VA dedicated to kernel stacks (the image/direct-map live at 0xFFFF_FF80_…),
-/// so no collision.
+/// Stage 165I/165J (x86_64 only): increased from 0x8000 (32 KB) to 0x10000
+/// (64 KB, 165I) and then to 0x20000 (128 KB, 165J).  The D6 controlled-switch
+/// proof's deep post-cleanup trap path (handle_trap ~8 KB frame +
+/// process_ipc_timeout_deadlines' `[None; 512]` ~8 KB + nested call chain)
+/// overflowed the 32 KB region (~33 KB observed) and then the 64 KB region
+/// (~64 KB observed).  Because tid=0's region sits exactly at the canonical
+/// boundary 0xFFFF_8000_0000_0000, the overflow descends into NON-canonical
+/// space and #DFs (vector 8, CR2=0) instead of #PF'ing — and non-canonical pages
+/// cannot be mapped, so the region must be enlarged.  128 KB gives ~124 KB usable
+/// above the guard page.  NOTE: the observed depth tracked the region size
+/// (33 KB at 32 KB, 64 KB at 64 KB) because tid=0 always bottoms at the canonical
+/// boundary; if 128 KB still #DFs, the post-cleanup path is genuinely
+/// unbounded/recursive rather than fixed-deep, and the bound (not the size) is
+/// the fix.  AArch64/RISC-V keep 32 KB: their trap paths fit and the D6 proof is
+/// x86_64-only, so this is gated to avoid changing their layout/memory.  The
+/// region span is MAX_TASKS(512) × 128 KB = 64 MiB
+/// ([0xFFFF_8000_0000_0000, 0xFFFF_8000_0400_0000)), still sparse on-demand VA
+/// dedicated to kernel stacks (the image/direct-map live at 0xFFFF_FF80_…), so no
+/// collision.
 #[cfg(target_arch = "x86_64")]
-pub(crate) const KERNEL_STACK_REGION_SIZE: usize = 0x10000;
+pub(crate) const KERNEL_STACK_REGION_SIZE: usize = 0x20000;
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) const KERNEL_STACK_REGION_SIZE: usize = 0x8000;
 /// Stage 134: one unmapped guard page at the bottom of every kernel-switch-

@@ -171,11 +171,11 @@ fn find_kernel_stack_bounds_containing_rsp(kernel: &KernelState, rsp: u64) -> (u
     found.unwrap_or_else(|| {
         const PAGE_SZ: u64 = 4096;
         const STACK_FLOOR: u64 = 0xFFFF_8000_0000_1000;
-        // Stage 165I: x86_64 per-task kernel stacks are 64 KiB (60 KiB usable
-        // above the guard page), so the fallback estimate spans 60 KiB.
+        // Stage 165J: x86_64 per-task kernel stacks are 128 KiB (124 KiB usable
+        // above the guard page), so the fallback estimate spans 124 KiB.
         let top = (rsp & !(PAGE_SZ - 1)) + PAGE_SZ;
         let base = (rsp & !(PAGE_SZ - 1))
-            .saturating_sub(60 * 1024)
+            .saturating_sub(124 * 1024)
             .max(STACK_FLOOR);
         (base, top, 0)
     })
