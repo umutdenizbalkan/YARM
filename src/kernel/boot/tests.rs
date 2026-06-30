@@ -36242,7 +36242,7 @@ mod stage128_active_cr3_switch_stack_mapping {
                 && check.contains("D6_KERNEL_SWITCH_STACK_MAP_SHARED_ROOT")
                 && check.contains("D6_KERNEL_SWITCH_STACK_MAP_SHARED_DONE")
                 && check.contains("D6_KERNEL_SWITCH_STACK_MAP_SHARED_DEFERRED")
-                && check.contains("let mut roots = [None; super::MAX_TASKS]")
+                && check.contains("let mut roots = [None; D6_PROOF_MAX_TASKS]")
                 && check.contains("tcb.asid")
                 && check.contains(
                     "page_table::map_page(asid, stack_page, PhysAddr(phys), PageFlags::KERNEL_RW)"
@@ -46565,6 +46565,61 @@ mod stage165g_d6_post_cleanup_no_owner {
         assert!(
             SMOKE_SRC.contains("no_owner_asid_unmapped_not_schedulable"),
             "smoke must fail on a no-owner unmapped NOTE for tid=0"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 165H — bound the D6 proof's scratch arrays to cut stack pressure.  A
+// 5-minute run double-faulted (vector 8, CR2=0) with RSP at a NON-canonical
+// address below tid=0's region (0xffff7ffffffffea0 < 0xffff800000000000): a
+// genuine kernel-stack overflow, not something mappable (mapping below the
+// canonical boundary is impossible).  The D6 helpers' `[_; MAX_TASKS=512]`
+// scratch (a 12 KiB `[(u64,usize,usize); 512]` + ~2 KiB roots arrays) sat on the
+// deep proof call chain; bounding them to D6_PROOF_MAX_TASKS removes ~10 KiB.
+// ===========================================================================
+#[cfg(test)]
+mod stage165h_d6_proof_stack_pressure {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+
+    #[test]
+    fn stage165h_bound_const_declared() {
+        assert!(
+            THREAD_STATE_SRC.contains("const D6_PROOF_MAX_TASKS: usize = 128;"),
+            "D6_PROOF_MAX_TASKS bound must be declared"
+        );
+    }
+
+    #[test]
+    fn stage165h_proof_arrays_use_bounded_const_not_max_tasks() {
+        // The post-cleanup scratch arrays must use the bounded const, not the
+        // 512-element MAX_TASKS (which is 12 KiB+ of stack on the deep chain).
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_post_cleanup_task_stacks_mapped")
+            .expect("post-cleanup fn");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|o| start + o)
+            .expect("fn after post-cleanup");
+        let body = &THREAD_STATE_SRC[start..end];
+        assert!(
+            body.contains("[(0u64, 0usize, 0usize); D6_PROOF_MAX_TASKS]"),
+            "post-cleanup stacks scratch must use D6_PROOF_MAX_TASKS"
+        );
+        assert!(
+            body.contains("[None; D6_PROOF_MAX_TASKS]"),
+            "post-cleanup roots scratch must use D6_PROOF_MAX_TASKS"
+        );
+        assert!(
+            !body.contains("[(0u64, 0usize, 0usize); super::MAX_TASKS]"),
+            "post-cleanup must not keep the 512-element MAX_TASKS stacks array"
+        );
+        // The region UPPER BOUND (PER_TASK_REGION_END, in the live-RSP mapper)
+        // legitimately still uses MAX_TASKS — that is a VA bound, not a stack
+        // array — so it must remain somewhere in the file.
+        assert!(
+            THREAD_STATE_SRC.contains("super::MAX_TASKS * KERNEL_STACK_REGION_SIZE"),
+            "the per-task region VA bound must still use MAX_TASKS"
         );
     }
 }
