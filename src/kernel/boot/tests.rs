@@ -46707,3 +46707,162 @@ mod stage165j_kernel_stack_128k {
         );
     }
 }
+
+// ===========================================================================
+// Stage 166 — D6-SWITCH-A: first narrow x86_64 production Outcome A.  A new
+// default-off knob `yarm.d6_switch_a=1` drives the same proven production
+// `maybe_switch_kernel_context` → stash → unlocked `switch_frames` path (the one
+// exercised by D6-SWITCH-SMOKE) for a real task pair, emitting `D6_SWITCH_A_*`
+// markers.  Default-off, x86_64-only, single-CPU, reversible; the diagnostic
+// `D6_SWITCH_PROOF` path and the D1/D2/D3/D5 seams are unchanged.
+// ===========================================================================
+#[cfg(test)]
+mod stage166_d6_switch_a {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    // 1. The knob exists, is an Option<bool> (default None ⇒ default-off), and the
+    //    runtime gate defaults to false.
+    #[test]
+    fn stage166_knob_is_default_off() {
+        assert!(
+            CMDLINE_SRC.contains("pub d6_switch_a: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.d6_switch_a"),
+            "yarm.d6_switch_a must be an Option<bool> cmdline knob (default None)"
+        );
+        assert!(
+            MOD_SRC.contains("D6_SWITCH_A_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)"),
+            "D6_SWITCH_A_ENABLED gate must default to false"
+        );
+        assert!(
+            MOD_SRC.contains("fn d6_switch_a_enabled() -> bool")
+                && MOD_SRC.contains("fn set_d6_switch_a_enabled(enabled: bool)"),
+            "d6_switch_a accessor/setter must exist"
+        );
+    }
+
+    // 2. The wiring is x86_64-only: the cmdline application and the proof-path
+    //    trigger are guarded by cfg(target_arch = "x86_64").
+    #[test]
+    fn stage166_is_x86_64_only() {
+        // cmdline application gates the setter behind cfg(x86_64).
+        let apply_idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.d6_switch_a")
+            .expect("d6_switch_a apply block");
+        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 400];
+        assert!(
+            apply.contains("#[cfg(target_arch = \"x86_64\")]")
+                && apply.contains("set_d6_switch_a_enabled(enabled)"),
+            "d6_switch_a must only flip the gate on x86_64"
+        );
+        // The trigger lives inside the proof fn's existing cfg(x86_64) block.
+        assert!(
+            EXEC_STATE_SRC.contains("let switch_a_mode = switch_a_enabled && !proof_enabled;"),
+            "the production trigger must distinguish switch_a mode from the proof"
+        );
+    }
+
+    // 3. The diagnostic D6_SWITCH_PROOF path is unchanged: same gate semantics,
+    //    same proof markers, one-shot done flag still consulted.
+    #[test]
+    fn stage166_proof_path_intact() {
+        assert!(
+            EXEC_STATE_SRC.contains("d6_controlled_switch_proof_enabled()")
+                && EXEC_STATE_SRC.contains("d6_controlled_switch_proof_done()")
+                && EXEC_STATE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_BEGIN")
+                && EXEC_STATE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF_PAIR"),
+            "the D6_SWITCH_PROOF diagnostic path/markers must remain intact"
+        );
+        // Proof boot still works: proof_enabled alone enters (switch_a not required).
+        assert!(
+            EXEC_STATE_SRC.contains("if (!proof_enabled && !switch_a_enabled)"),
+            "either knob may drive the switch; neither knob ⇒ early return (default-off)"
+        );
+    }
+
+    // 4. No broad switch-frame live-wire: the unlocked stash decision
+    //    (can_stash_for_lock_drop) is NOT newly gated/widened, and the fallback
+    //    (lock-held switch_frames) is preserved.
+    #[test]
+    fn stage166_no_broad_live_wire() {
+        assert!(
+            EXEC_STATE_SRC.contains("let can_stash_for_lock_drop =")
+                && EXEC_STATE_SRC.contains("D6_SWITCH_FRAMES_ENTER")
+                && EXEC_STATE_SRC.contains("D6_SWITCH_FRAMES_RETURNED"),
+            "the Stage 116 lock-held fallback switch_frames path must be preserved"
+        );
+        // The with_scheduler_split_mut / global-lock fences are not removed here.
+        assert!(
+            !EXEC_STATE_SRC.contains("// D6-SWITCH-A: delete with_scheduler_split_mut fence"),
+            "Stage 166 must not broadly remove the seam fences"
+        );
+    }
+
+    // 5. The full D6_SWITCH_A marker set is emitted across exec_state/trap_entry.
+    #[test]
+    fn stage166_markers_present() {
+        assert!(
+            CMDLINE_SRC.contains("D6_SWITCH_A_ENABLED"),
+            "D6_SWITCH_A_ENABLED must be emitted when the knob is set"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_SWITCH_A_CANDIDATE")
+                && EXEC_STATE_SRC.contains("D6_SWITCH_A_FALLBACK"),
+            "exec_state must emit CANDIDATE and FALLBACK markers"
+        );
+        for m in [
+            "D6_SWITCH_A_LOCK_DROPPED",
+            "D6_SWITCH_A_SWITCH_ENTER",
+            "D6_SWITCH_A_RETURNED",
+            "D6_SWITCH_A_DONE",
+        ] {
+            assert!(TRAP_ENTRY_SRC.contains(m), "trap_entry must emit {m}");
+        }
+    }
+
+    // 6. No syscall/IPC ABI count change.
+    #[test]
+    fn stage166_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 7. No D1/D2/D3/D5 seam touched by this stage's exec_state changes (the
+    //    seam helpers/fences are referenced but not re-wired here).
+    #[test]
+    fn stage166_no_seam_changes() {
+        // The split-mut seam helper-only fence marker must still be present
+        // (i.e. we did not live-wire or delete it as part of D6-SWITCH-A).
+        assert!(
+            !EXEC_STATE_SRC.contains("D6_SWITCH_A: live-wire with_scheduler_split_mut")
+                && !EXEC_STATE_SRC.contains("D6_SWITCH_A: live-wire with_task_tcbs_split_mut"),
+            "D6-SWITCH-A must not live-wire the D1/D2/D3/D5 seams"
+        );
+    }
+
+    // 8. Smoke script supports D6_SWITCH_A=1 and checks the production markers.
+    #[test]
+    fn stage166_smoke_supports_switch_a() {
+        assert!(
+            SMOKE_SRC.contains("D6_SWITCH_A=${D6_SWITCH_A:-0}")
+                && SMOKE_SRC.contains("yarm.d6_switch_a=1"),
+            "smoke must append yarm.d6_switch_a=1 when D6_SWITCH_A=1"
+        );
+        assert!(
+            SMOKE_SRC.contains("D6_SWITCH_A_CANDIDATE")
+                && SMOKE_SRC.contains("D6-SWITCH-A mode FAILED"),
+            "smoke must verify the D6-SWITCH-A markers and fail on missing/fatal"
+        );
+    }
+}

@@ -215,6 +215,13 @@ pub extern "C" fn yarm_kernel_thread_switch_trampoline_rust_real() -> ! {
             ctx.incoming_tid,
             ctx.cpu_id.0
         );
+        // Stage 166 (D6-SWITCH-A): tag the first-resume when driven by the
+        // production Outcome A knob (proof knob off).
+        if crate::kernel::boot::d6_switch_a_enabled()
+            && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+        {
+            crate::yarm_log!("D6_SWITCH_A_FIRST_RESUME incoming={}", ctx.incoming_tid);
+        }
         let Some(shared) = super::Bootstrap::shared_static_ref() else {
             crate::yarm_log!("D6_FIRST_RESUME_DEFERRED reason=shared_not_ready");
             loop {

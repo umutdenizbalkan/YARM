@@ -4819,21 +4819,42 @@ mechanically complete (Stage 152). The roadmap, in order:
    reaching 64 KiB implies ~4× nesting. If 128 KiB still #DFs, the post-cleanup
    path is nested/recursive (interrupts re-enabled during the handler, or a
    re-entrant fault loop) rather than fixed-deep, and the fix is to bound the
-   nesting, not enlarge the stack again. All of this is default-off proof path /
-   stack-capacity only: no D6-SWITCH-A, no production Outcome A, no genuine seam
+   nesting, not enlarge the stack again. **Stage 165J is ACCEPTED** (user QEMU,
+   2026): the 5-minute `D6_SWITCH_PROOF=1` run reached the 300 s idle timeout with
+   no `!Fv`/`!BNv`/`PAGE_FAULT`/`DOUBLE_FAULT`/`PANIC`/`FATAL`, with
+   `D6_CONTROLLED_SWITCH_PROOF_DONE` / `…CLEANUP_DONE` /
+   `D6_POST_CLEANUP_STACK_MAP_DONE … failures=0` present and 128 KiB stack regions
+   in `KERNEL_STACK_RANGE`; normal core smoke and the Stage 163P sender-wake oracle
+   also passed. So the 64 KiB depth was a fixed-deep path (handle_trap + IPC-timeout
+   chain), not unbounded recursion — 128 KiB cleared it. All of this is default-off
+   proof path / stack-capacity only: no production Outcome A, no genuine seam
    live-wire, no ABI change. See the `stage165*` guards in
    `src/kernel/boot/tests.rs`.
 
-2. **D6-SWITCH-A — genuine Outcome A on x86_64: drop global lock before `switch_frames`
-   in the production trap path.** The `PerCpuSwitchPlanStash` /
-   `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE` stash infrastructure (Stage 117) and the
-   first-resume handler (Stage 118) are already in place. Wire
-   `initialize_thread_kernel_switch_frame` into the production boot path for at least
-   one tid (supervisor, tid=2, is the canonical first target) and verify that
-   `D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH` + `D6_SWITCH_FRAMES_ENTER_UNLOCKED` +
-   `D6_SWITCH_FRAMES_RETURNED_UNLOCKED` appear in the x86_64 core smoke without the
-   proof knob. The helper-only fence on `with_scheduler_split_mut` (rank 1) must be
-   deleted in the same PR. (Outcome A: genuine seam live-wire, helper-only fence deleted.)
+2. **D6-SWITCH-A — first narrow x86_64 production Outcome A (Stage 166, IMPLEMENTED).**
+   With D6-SWITCH-SMOKE accepted, Stage 166 adds a default-off knob
+   `yarm.d6_switch_a=1` (script: `D6_SWITCH_A=1`) that drives the *same proven
+   production* `maybe_switch_kernel_context` → `DISPATCH_SWITCH_PLAN_STASH` →
+   trap-entry drain → unlocked `switch_frames` path (the one validated by
+   D6-SWITCH-SMOKE) for a real task pair (tid=1 → tid=2, both
+   `initialize_thread_kernel_switch_frame`-initialized in the production boot path),
+   with the global `SpinLock<KernelState>` genuinely dropped before `switch_frames`.
+   It is x86_64-only, single-CPU, one-shot, and **reversible** (default-off ⇒ the
+   diagnostic `D6_SWITCH_PROOF` path and all other switch paths are unchanged; the
+   Stage 116 lock-held fallback is preserved). Markers:
+   `D6_SWITCH_A_ENABLED`, `D6_SWITCH_A_CANDIDATE outgoing=<tid> incoming=<tid>`,
+   `D6_SWITCH_A_LOCK_DROPPED`, `D6_SWITCH_A_SWITCH_ENTER`,
+   `D6_SWITCH_A_FIRST_RESUME incoming=<tid>`, `D6_SWITCH_A_RETURNED`,
+   `D6_SWITCH_A_DONE`, and `D6_SWITCH_A_FALLBACK reason=<…>` on a deferral.
+   Acceptance (user QEMU): (A) D6 proof regression —
+   `TIMEOUT_SECS=300 D6_SWITCH_PROOF=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`;
+   (B) production gate —
+   `TIMEOUT_SECS=120 D6_SWITCH_A=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`
+   (must show the `D6_SWITCH_A_*` markers and reach service baseline with no fatal
+   breadcrumb); (C) normal core smoke; (D) Stage 163P sender-wake oracle.
+   Stage 166 deliberately does **not** delete the `with_scheduler_split_mut` /
+   global-lock fences or broaden to all switch paths — that is the follow-on
+   D6-GENUINE. See the `stage166_d6_switch_a` guards in `src/kernel/boot/tests.rs`.
 
 3. **D6-GENUINE — D6 dispatch seam fully live-wired.** Extend the Outcome A unlock to
    all production tasks on x86_64; verify that the deferred markers

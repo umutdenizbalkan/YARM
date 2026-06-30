@@ -324,16 +324,37 @@ pub fn handle_trap_entry_shared(
         // SAFETY: single CPU, interrupts disabled, no concurrent accessor.
         let plan = unsafe { crate::kernel::boot::DISPATCH_SWITCH_PLAN_STASH[cpu_idx].take() };
         if let Some(plan) = plan {
+            // Stage 166 (D6-SWITCH-A): tag this as a real production unlocked
+            // switch when driven by `yarm.d6_switch_a=1` (proof knob off).
+            #[cfg(target_arch = "x86_64")]
+            let d6_switch_a_mode = crate::kernel::boot::d6_switch_a_enabled()
+                && !crate::kernel::boot::d6_controlled_switch_proof_enabled();
+            #[cfg(not(target_arch = "x86_64"))]
+            let d6_switch_a_mode = false;
             crate::yarm_log!(
                 "D6_GLOBAL_LOCK_DROPPED_BEFORE_SWITCH outgoing={} incoming={}",
                 plan.outgoing_tid,
                 plan.incoming_tid
             );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_LOCK_DROPPED outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
             crate::yarm_log!(
                 "D6_SWITCH_FRAMES_ENTER_UNLOCKED outgoing={} incoming={}",
                 plan.outgoing_tid,
                 plan.incoming_tid
             );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_SWITCH_ENTER outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
             // Stage 118 Part D: detect first-resume path (x86_64 only).
             // If the incoming frame's RIP points to the trampoline, stash a
             // FirstResumeContext so the trampoline can switch back after
@@ -381,6 +402,13 @@ pub fn handle_trap_entry_shared(
                 plan.outgoing_tid,
                 plan.incoming_tid
             );
+            if d6_switch_a_mode {
+                crate::yarm_log!(
+                    "D6_SWITCH_A_RETURNED outgoing={} incoming={}",
+                    plan.outgoing_tid,
+                    plan.incoming_tid
+                );
+            }
             // Stage 139: hardware CR3 snapshot at POINT 2, before proof cleanup
             // restores the correct address space.  The proof path does not touch
             // CR3 in switch_frames or the trampoline, so this captures any
@@ -447,6 +475,9 @@ pub fn handle_trap_entry_shared(
                             crate::yarm_log!("D6_POST_CLEANUP_STACK_MAP_FAILED err={:?}", err);
                         }
                         crate::yarm_log!("D6_CONTROLLED_SWITCH_PROOF_CLEANUP_DONE");
+                        if d6_switch_a_mode {
+                            crate::yarm_log!("D6_SWITCH_A_DONE");
+                        }
                     }
                     result
                 })
