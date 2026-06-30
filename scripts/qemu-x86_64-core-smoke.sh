@@ -565,7 +565,23 @@ if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
   if [[ "$fatal_after_proof" -eq 0 ]]; then
     echo "[ok] D6 switch proof: no fatal breadcrumb after proof start"
   fi
-  if [[ "$proof_fail" -eq 1 || "$fatal_after_proof" -eq 1 ]]; then
+  # Stage 165C: the proof must also fail explicitly if any D6 stack-mapping step
+  # aborts (e.g. the live-RSP mapper hitting VmFull), even when no raw fatal
+  # breadcrumb is printed.  These are hard proof-setup failures.
+  map_fail=0
+  for map_fail_marker in \
+    "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED" \
+    "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED" \
+    "D6_KERNEL_SWITCH_STACK_CHECK_FAILED"; do
+    if log_has_pattern "$map_fail_marker"; then
+      echo "[error] D6 switch proof: stack-mapping failure marker present: $map_fail_marker"
+      map_fail=1
+    fi
+  done
+  if [[ "$map_fail" -eq 0 ]]; then
+    echo "[ok] D6 switch proof: no stack-mapping failure markers"
+  fi
+  if [[ "$proof_fail" -eq 1 || "$fatal_after_proof" -eq 1 || "$map_fail" -eq 1 ]]; then
     echo "[error] D6 switch proof mode FAILED"
     exit 1
   fi

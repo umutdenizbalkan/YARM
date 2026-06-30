@@ -45996,3 +45996,129 @@ mod stage165b_d6_live_rsp_stack_map {
         );
     }
 }
+
+// ===========================================================================
+// Stage 165C — D6 proof live-RSP region classification (boot/CPU stack VmFull)
+//
+// The Stage 165B live-RSP mapper aborted with VmFull because it only checked
+// `rsp >= KERNEL_STACK_REGION_BASE`, which the kernel image high half
+// (`0xffff_ffff_81…`, the boot/CPU `.bss` stack) ALSO satisfies.  It computed a
+// bogus per-task index and tried to allocate+map an already-kernel-mapped
+// region.  The fix classifies the sampled RSP and treats the static kernel /
+// boot / CPU stack as a verify-only ensure (no allocation, no task-root map).
+// ===========================================================================
+#[cfg(test)]
+mod stage165c_d6_live_rsp_region_kind {
+    const THREAD_STATE_SRC: &str = include_str!("thread_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    fn live_rsp_map_source() -> &'static str {
+        let start = THREAD_STATE_SRC
+            .find("fn d6_ensure_live_rsp_region_mapped")
+            .expect("Stage 165C live-RSP region map function must exist");
+        let end = THREAD_STATE_SRC[start..]
+            .find("pub fn initialize_thread_kernel_switch_frame")
+            .map(|offset| start + offset)
+            .expect("function after live-RSP region map");
+        &THREAD_STATE_SRC[start..end]
+    }
+
+    // The static-kernel short-circuit block: from `if !is_task_stack {` to the
+    // first `return Ok(());` after it.
+    fn static_kernel_branch_source() -> &'static str {
+        let body = live_rsp_map_source();
+        let start = body
+            .find("if !is_task_stack {")
+            .expect("must branch on is_task_stack");
+        let end = body[start..]
+            .find("return Ok(());")
+            .map(|offset| start + offset)
+            .expect("static-kernel branch must return Ok");
+        &body[start..end]
+    }
+
+    // 1. Classification bounds the per-task region (not just a lower bound) and
+    //    distinguishes the kernel image high half.
+    #[test]
+    fn stage165c_classifies_region_by_bounds() {
+        let body = live_rsp_map_source();
+        assert!(
+            body.contains("PER_TASK_REGION_END")
+                && body.contains("super::MAX_TASKS * KERNEL_STACK_REGION_SIZE"),
+            "must bound the per-task region with MAX_TASKS * KERNEL_STACK_REGION_SIZE"
+        );
+        assert!(
+            body.contains("KERNEL_BOOTSTRAP_VIRT_BASE"),
+            "must classify the kernel image high half via KERNEL_BOOTSTRAP_VIRT_BASE"
+        );
+        assert!(
+            body.contains("sampled_rsp < PER_TASK_REGION_END"),
+            "per-task classification must use an upper bound, not just >= base"
+        );
+    }
+
+    // 2. The region-kind and probe diagnostics are emitted.
+    #[test]
+    fn stage165c_emits_kind_and_probe_markers() {
+        let body = live_rsp_map_source();
+        assert!(
+            body.contains("D6_PROOF_LIVE_RSP_REGION_KIND")
+                && body.contains("static_kernel_stack")
+                && body.contains("task_stack")
+                && body.contains("unknown"),
+            "must emit D6_PROOF_LIVE_RSP_REGION_KIND with all kinds"
+        );
+        assert!(
+            body.contains("D6_PROOF_LIVE_RSP_MAP_PROBE"),
+            "must emit D6_PROOF_LIVE_RSP_MAP_PROBE for the active root"
+        );
+    }
+
+    // 3. The static-kernel branch is a VERIFY-ONLY ensure: it must NOT allocate or
+    //    map, and it must accept with covers_rsp_page=1.  This is the core guard
+    //    against the VmFull regression.
+    #[test]
+    fn stage165c_static_kernel_branch_does_not_allocate() {
+        let branch = static_kernel_branch_source();
+        assert!(
+            !branch.contains("alloc_user_data_frame"),
+            "static-kernel branch must not allocate VM frames"
+        );
+        assert!(
+            !branch.contains("map_page"),
+            "static-kernel branch must not map pages (would trip VmFull on kernel image)"
+        );
+        assert!(
+            branch.contains("D6_PROOF_LIVE_RSP_MAP_SKIP_ALREADY_PRESENT"),
+            "static-kernel branch must emit D6_PROOF_LIVE_RSP_MAP_SKIP_ALREADY_PRESENT"
+        );
+        assert!(
+            branch.contains("covers_rsp_page=1"),
+            "static-kernel branch must accept with covers_rsp_page=1"
+        );
+        assert!(
+            branch.contains("D6_PROOF_LIVE_RSP_MAP_FAIL_DETAIL"),
+            "static-kernel branch must surface a FAIL_DETAIL diagnostic on a bad probe"
+        );
+    }
+
+    // 4. The smoke script fails the D6 proof on the stack-mapping failure markers.
+    #[test]
+    fn stage165c_smoke_fails_on_map_failure_markers() {
+        for marker in [
+            "D6_PROOF_LIVE_RSP_STACK_MAP_FAILED",
+            "D6_KERNEL_SWITCH_STACK_MAP_ACTIVE_FAILED",
+            "D6_KERNEL_SWITCH_STACK_CHECK_FAILED",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(marker),
+                "qemu-x86_64-core-smoke.sh must fail the D6 proof on {marker}"
+            );
+        }
+        // The fatal-breadcrumb gate must remain in place (not weakened).
+        assert!(
+            SMOKE_SRC.contains("fatal breadcrumb after proof start"),
+            "the Stage 165B fatal-breadcrumb gate must remain"
+        );
+    }
+}
