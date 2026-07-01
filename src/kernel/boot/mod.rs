@@ -697,6 +697,87 @@ pub(crate) fn d6_genuine_enabled() -> bool {
     D6_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 168 (D6-GENUINE-B): global count of authoritative mutating dispatch
+/// steps that ran through the scheduler seam OUTSIDE the global KernelState
+/// lock. Emitted as `D6_GENUINE_MUT_DISPATCH_COUNT value=<n>`.
+pub(crate) static D6_GENUINE_MUT_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 168 (D6-GENUINE-B): per-CPU "authoritative dispatch deferred" flag.
+/// Set by the in-lock `dispatch_next_task` when it declines to perform the
+/// authoritative mutating dispatch (eligible, queue-neutral d6_genuine case)
+/// and instead defers it to the out-of-global-lock seam drained by the trap
+/// entry. Cleared by the drain (or by any in-lock fallback dispatch that
+/// supersedes the deferral). VALIDATION: D6_GENUINE_MUT_DISPATCH_PREPARED.
+pub(crate) static D6_GENUINE_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 168: per-CPU outgoing TID recorded when a dispatch is deferred
+/// (`u64::MAX` sentinel for "no current task / idle"). Diagnostic only.
+pub(crate) static D6_GENUINE_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 168: record a deferred authoritative dispatch intent for `cpu`.
+/// Returns false (declining to defer) if an intent is already pending — the
+/// caller must then fall back to the in-lock dispatch (no nested deferral).
+pub(crate) fn d6_genuine_dispatch_try_defer(cpu_idx: usize, outgoing: Option<u64>) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    if D6_GENUINE_DISPATCH_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    D6_GENUINE_DISPATCH_OUTGOING[cpu_idx].store(
+        outgoing.unwrap_or(u64::MAX),
+        core::sync::atomic::Ordering::Release,
+    );
+    true
+}
+
+/// Stage 168: is a deferred authoritative dispatch pending for `cpu`?
+pub(crate) fn d6_genuine_dispatch_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && D6_GENUINE_DISPATCH_DEFERRED[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 168: clear the deferred flag for `cpu` (drain complete, or an in-lock
+/// fallback dispatch superseded the deferral). Returns the prior state.
+pub(crate) fn d6_genuine_dispatch_clear_deferred(cpu_idx: usize) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    D6_GENUINE_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
+    D6_GENUINE_DISPATCH_DEFERRED[cpu_idx].swap(false, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Stage 168 (D2-GENUINE-RECV): x86_64-only, default-off gate that runs the
+/// blocking-receive path through explicit rank-clean scheduler/task/IPC phase
+/// markers and uses the Stage 168 out-of-global-lock dispatch seam where the
+/// resulting dispatch is queue-neutral-eligible. When OFF (default) the recv
+/// path is byte-identical to Stage 163P (no behavior change). Immediate /
+/// NoWait / timeout / rollback semantics are preserved on both paths.
+/// VALIDATION: D2_RECV_GENUINE_ENABLED.
+pub(crate) static D2_RECV_GENUINE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_d2_recv_genuine_enabled(enabled: bool) {
+    D2_RECV_GENUINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn d2_recv_genuine_enabled() -> bool {
+    D2_RECV_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

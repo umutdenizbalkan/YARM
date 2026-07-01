@@ -323,27 +323,61 @@ pub fn handle_trap_entry_shared(
             && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
             && !crate::kernel::boot::d6_switch_a_enabled();
         if d6_genuine_mode {
-            crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_CANDIDATE cpu={}", cpu.0);
-            // Eligibility: single-CPU online and a valid per-CPU slot. The
-            // global lock is genuinely dropped at this point regardless.
-            let eligible = shared.online_cpu_count_split_read() <= 1
-                && cpu_idx < crate::kernel::scheduler::MAX_CPUS;
-            if eligible {
-                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_ENTER cpu={}", cpu.0);
-                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_LOCK_SCOPE_DROPPED cpu={}", cpu.0);
-                let observed = shared.d6_genuine_local_dispatch_observe(cpu);
-                let n = crate::kernel::boot::D6_GENUINE_SEAM_COUNT[cpu_idx]
-                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                crate::yarm_log!(
-                    "D6_LOCAL_DISPATCH_SEAM_COUNT cpu={} n={} tid={:?}",
-                    cpu.0,
-                    n,
-                    observed
-                );
-                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_DONE cpu={}", cpu.0);
+            if crate::kernel::boot::d6_genuine_dispatch_is_deferred(cpu_idx) {
+                // Stage 168 (D6-GENUINE-B): the in-lock `dispatch_next_task`
+                // declined to perform the authoritative mutating dispatch for
+                // this eligible, queue-neutral cycle. Perform it now through the
+                // rank-1 scheduler seam with the global lock genuinely dropped —
+                // this is the single authoritative `local_dispatch_step_split`
+                // for the cycle.
+                crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_GLOBAL_DROPPED cpu={}", cpu.0);
+                // Re-verify queue-neutrality out of lock (single-CPU, IRQ-off ⇒
+                // unchanged unless an in-lock fallback superseded the deferral).
+                if shared.d6_genuine_dispatch_queue_neutral(cpu) {
+                    crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_ENTER cpu={}", cpu.0);
+                    let incoming = shared.d6_genuine_local_dispatch_step_mut(cpu);
+                    // Deferred Phase B (idempotent for the same running task).
+                    shared.d6_genuine_mark_running_via_task_seam(incoming);
+                    let n = crate::kernel::boot::D6_GENUINE_MUT_DISPATCH_COUNT
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    crate::yarm_log!(
+                        "D6_GENUINE_MUT_DISPATCH_DONE cpu={} incoming={:?}",
+                        cpu.0,
+                        incoming
+                    );
+                    crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_COUNT value={}", n);
+                } else {
+                    crate::yarm_log!(
+                        "D6_GENUINE_MUT_DISPATCH_FALLBACK reason=state_changed cpu={}",
+                        cpu.0
+                    );
+                }
+                crate::kernel::boot::d6_genuine_dispatch_clear_deferred(cpu_idx);
             } else {
-                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_FALLBACK cpu={}", cpu.0);
+                // Stage 167 observation: no dispatch was deferred this cycle;
+                // prove the scheduler seam still executes live outside the
+                // global lock (non-mutating).
+                crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_CANDIDATE cpu={}", cpu.0);
+                let eligible = shared.online_cpu_count_split_read() <= 1
+                    && cpu_idx < crate::kernel::scheduler::MAX_CPUS;
+                if eligible {
+                    crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_ENTER cpu={}", cpu.0);
+                    crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_LOCK_SCOPE_DROPPED cpu={}", cpu.0);
+                    let observed = shared.d6_genuine_local_dispatch_observe(cpu);
+                    let n = crate::kernel::boot::D6_GENUINE_SEAM_COUNT[cpu_idx]
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    crate::yarm_log!(
+                        "D6_LOCAL_DISPATCH_SEAM_COUNT cpu={} n={} tid={:?}",
+                        cpu.0,
+                        n,
+                        observed
+                    );
+                    crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_DONE cpu={}", cpu.0);
+                } else {
+                    crate::yarm_log!("D6_LOCAL_DISPATCH_SEAM_FALLBACK cpu={}", cpu.0);
+                }
             }
         }
     }

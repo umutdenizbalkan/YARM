@@ -544,6 +544,71 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 168 (D6-GENUINE-B): the authoritative **mutating** dispatch step,
+    /// run through the rank-1 scheduler seam with the global
+    /// `SpinLock<KernelState>` already dropped by the trap-entry drain. This
+    /// is the single authoritative `local_dispatch_step_split` for an eligible
+    /// (queue-neutral) d6_genuine dispatch cycle — the in-lock path deferred
+    /// instead of performing it. It calls the same mutating `dispatch_next_on`
+    /// the in-lock path would; because the caller only defers when the pick is
+    /// queue-neutral (current task continues, or idle stays idle with nothing
+    /// runnable), `dispatch_next_on` provably does not dequeue here, so it can
+    /// never double-advance the run queue. Returns the incoming TID.
+    /// Default-off behind `yarm.d6_genuine=1` (gated by the caller).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_genuine_local_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            let incoming = kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(dispatch_cpu)
+                .map(|tid| tid.0);
+            crate::yarm_log!(
+                "D6_GENUINE_MUT_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
+                cpu.0,
+                if incoming.is_some() { "some" } else { "none" },
+                incoming
+            );
+            incoming
+        })
+    }
+
+    /// Stage 168 (D6-GENUINE-B): out-of-global-lock re-verification that the
+    /// deferred dispatch is still queue-neutral (single-CPU, IRQ-off ⇒ nothing
+    /// changed since the in-lock peek unless an in-lock fallback superseded the
+    /// deferral). Reads current TID + runnable count through the rank-1 seam.
+    /// Returns `true` when `dispatch_next_on` would NOT dequeue (safe to run
+    /// the mutating step out of lock).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_genuine_dispatch_queue_neutral(&self, _cpu: CpuId) -> bool {
+        self.with_scheduler_split_mut(|sched| {
+            let scpu = sched.current_cpu;
+            let current = kernel_ref(&sched.scheduler)
+                .current_tid_on(scpu)
+                .map(|tid| tid.0);
+            let runnable = kernel_ref(&sched.scheduler).runnable_count_on(scpu);
+            // dispatch_next_on dequeues iff (current is None or idle tid 0) AND
+            // there is something runnable. Everything else is queue-neutral.
+            !(runnable > 0 && matches!(current, None | Some(0)))
+        })
+    }
+
+    /// Stage 168 (D6-GENUINE-B): the deferred Phase-B TCB status write, applied
+    /// out of the global lock through the rank-2 task seam. For an eligible
+    /// (queue-neutral, same-running-task) dispatch the target is already
+    /// `Running`, so this is idempotent; it is kept for faithfulness to the
+    /// in-lock path it replaces. No-op when `incoming` is `None` (idle).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d6_genuine_mark_running_via_task_seam(&self, incoming: Option<u64>) {
+        let Some(tid) = incoming else {
+            return;
+        };
+        self.with_task_tcbs_split_mut(|tcbs| {
+            if let Some(tcb) = tcbs.iter_mut().flatten().find(|tcb| tcb.tid.0 == tid) {
+                tcb.status = crate::kernel::task::TaskStatus::Running;
+            }
+        });
+    }
+
     /// Stage 108: task/TCB (rank 2) split-mut seam.
     ///
     /// # Validation status

@@ -4921,8 +4921,77 @@ mechanically complete (Stage 152). The roadmap, in order:
    (must show the `D6_LOCAL_DISPATCH_SEAM_*` markers and reach service baseline
    with no fatal breadcrumb after the seam wire begins); (B) D6-SWITCH-A
    regression (`D6_SWITCH_A=1`); (C) D6 proof regression (`D6_SWITCH_PROOF=1`);
-   (D) normal core smoke; (E) Stage 163P sender-wake oracle. **PENDING user QEMU
-   acceptance.**
+   (D) normal core smoke; (E) Stage 163P sender-wake oracle.
+
+   **ACCEPTED (user QEMU, 2026).** The `D6_GENUINE=1` run passed (the
+   `D6_LOCAL_DISPATCH_SEAM_*` markers appeared and the x86_64 service baseline was
+   reached with no fatal breadcrumb), and the D6 proof, `D6_SWITCH_A`, normal
+   x86_64 smoke, and Stage 163P sender-wake oracle regressions all passed. Stage
+   167 is **observation-only**: it proved the scheduler seam can execute live
+   outside the global lock, but the authoritative **mutating** dispatch decision
+   still ran in-lock. Stage 168 (below) begins the mutating dispatch relocation.
+
+   **D6-GENUINE-B — relocate the authoritative mutating dispatch out of the global
+   lock (Stage 168).** Under the same default-off `yarm.d6_genuine=1` gate
+   (x86_64-only, single-CPU), the in-lock `dispatch_next_task` now **declines to
+   perform the authoritative mutating `local_dispatch_step_split`** for the
+   *eligible, queue-neutral* slice: it records a per-CPU deferral
+   (`D6_GENUINE_DISPATCH_DEFERRED`) and returns the peeked next TID. After
+   `handle_trap_entry_shared`'s `with_cpu` returns and the global
+   `SpinLock<KernelState>` guard is dropped, the trap-entry drain runs the single
+   authoritative mutating step through `SharedKernel::d6_genuine_local_dispatch_step_mut`
+   — calling the real mutating `dispatch_next_on` under ONLY the rank-1 scheduler
+   lock — plus the deferred (idempotent) Phase-B TCB `Running` write through the
+   rank-2 task seam. Eligibility is restricted to the **queue-neutral** case
+   (`!(runnable > 0 && current ∈ {none, idle-tid-0})`) so `dispatch_next_on`
+   provably never dequeues out of lock — it **cannot double-advance the run
+   queue** — and the drain re-verifies queue-neutrality before running. Every
+   ineligible case (switch required / idle→runnable, multi-CPU, no trap drainer,
+   already deferred) emits `D6_GENUINE_MUT_DISPATCH_FALLBACK reason=<…>` and takes
+   the **unchanged in-lock `local_dispatch_step_split`**. Markers:
+   `D6_GENUINE_MUT_DISPATCH_CANDIDATE/ELIGIBLE/PREPARED/FALLBACK` (exec_state) and
+   `…_GLOBAL_DROPPED/ENTER/STEP_SPLIT/DONE/COUNT` (trap_entry / seam). The
+   remaining, queue-*advancing* dispatch (the real context switch that a blocking
+   recv or preemption needs) still uses the in-lock fallback — its relocation
+   requires moving Phase B (ASID switch + `switch_frames` stash + TCB status) out
+   of the global lock and is deferred to a follow-on stage. Guarded by
+   `stage168_d6_genuine_b_and_d2_recv`.
+
+4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
+   global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
+   `block_current_on_receive_with_deadline` call boundary ahead of
+   `SharedKernel::with_cpu` so that `with_scheduler_split_mut` (rank 1) and
+   `with_task_tcbs_split_mut` (rank 2) are called without the outer global-lock
+   borrow. Delete the helper-only fences for those two seams in the same PR.
+   Gated on D6-GENUINE.
+
+   **D2-GENUINE-RECV — rank-clean blocking-recv phase live-wire (Stage 168).**
+   Under a new default-off `yarm.d2_recv_genuine=1` gate (x86_64-only; script:
+   `D2_RECV_GENUINE=1`), the canonical blocking-recv path
+   (`ipc_recv_with_optional_deadline` → `block_current_on_receive_with_deadline`,
+   which backs both `IpcRecv` and `IpcRecvTimeout`, plain and recv-v2) exposes its
+   existing **rank-ordered scheduler(1) → task(2) → ipc(3) → dispatch** phase
+   boundaries live, with explicit markers: `D2_RECV_GENUINE_ENABLED`,
+   `…_CANDIDATE tid=<t> endpoint=<id>`, `…_PHASE_CAP_OK`, `…_PHASE_IPC_LOCK`,
+   `…_PHASE_TASK_BLOCK`, `…_PHASE_DISPATCH`, `…_BLOCKED_OK`, `…_IMMEDIATE_OK`,
+   `…_TIMEOUT_OK`, `…_NOWAIT_OK`, `…_ROLLBACK_OK` (the no-lost-wakeup
+   `recv_block_unwind_race`), `…_FALLBACK`, and `…_DONE result=<…>`. When combined
+   with `yarm.d6_genuine=1`, the recv-block's `dispatch_next_task` routes an
+   eligible (queue-neutral) dispatch through the Stage 168 out-of-global-lock
+   scheduler seam; a blocking recv usually requires a real switch, which stays on
+   the preserved in-lock fallback. Immediate delivery, NoWait probe, timeout, and
+   the no-lost-wakeup rollback are **byte-identical** whether the knob is on or
+   off — the knob only exposes the phase boundaries (and uses the D6 seam where
+   eligible); the full relocation of the recv phase *mutations* out of the global
+   lock is deferred (it depends on the queue-advancing switch relocation above,
+   Stage 169+). The D2 **send** path, D3/D5 seams, and IPC-FINAL are untouched.
+   Guarded by `stage168_d6_genuine_b_and_d2_recv`. Acceptance (user QEMU): the six
+   commands in §7.1.5-acceptance below — D6 proof, `D6_SWITCH_A`, `D6_GENUINE=1`
+   (must emit `D6_GENUINE_MUT_DISPATCH_ENTER/STEP_SPLIT/DONE`),
+   `D6_GENUINE=1 D2_RECV_GENUINE=1` (must emit the D2 recv phase markers), normal
+   x86_64 smoke, and the Stage 163P sender-wake oracle — all reaching service
+   baseline with no `!Fv`/`!BNv`/`PAGE_FAULT`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/`FATAL`.
+   **PENDING user QEMU acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

@@ -46944,7 +46944,7 @@ mod stage167_d6_genuine {
         let apply_idx = CMDLINE_SRC
             .find("if let Some(enabled) = parsed.d6_genuine")
             .expect("d6_genuine apply block");
-        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 400];
+        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 700];
         assert!(
             apply.contains("#[cfg(target_arch = \"x86_64\")]")
                 && apply.contains("set_d6_genuine_enabled(enabled)"),
@@ -47107,6 +47107,340 @@ mod stage167_d6_genuine {
             SMOKE_SRC.contains("D6_LOCAL_DISPATCH_SEAM_CANDIDATE")
                 && SMOKE_SRC.contains("D6-GENUINE mode FAILED"),
             "smoke must verify the D6-GENUINE markers and fail on missing/fatal"
+        );
+    }
+}
+
+// Stage 168 (D6-GENUINE-B + D2-GENUINE-RECV): the authoritative mutating
+// dispatch is relocated out of the global lock for the eligible queue-neutral
+// slice, and the blocking-recv path gains explicit rank-clean phase markers.
+// Both are default-off (x86_64-only) and preserve the in-lock fallback.
+mod stage168_d6_genuine_b_and_d2_recv {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const SYSCALL_IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    // Task A: Stage 167 accepted evidence recorded in the doc.
+    #[test]
+    fn stage168_stage167_accepted_recorded() {
+        assert!(
+            DOC_SRC.contains("D6-GENUINE-A") && DOC_SRC.contains("ACCEPTED"),
+            "doc must record D6-GENUINE-A acceptance"
+        );
+        assert!(
+            DOC_SRC.contains("observation-only") || DOC_SRC.contains("observation only"),
+            "doc must state Stage 167 was observation-only"
+        );
+        assert!(
+            DOC_SRC.contains("D6-GENUINE-B") && DOC_SRC.contains("D2-GENUINE-RECV"),
+            "doc must introduce Stage 168 D6-GENUINE-B and D2-GENUINE-RECV"
+        );
+    }
+
+    // d6_genuine still default-off (gate untouched).
+    #[test]
+    fn stage168_d6_genuine_default_off() {
+        assert!(
+            MOD_SRC.contains("D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)"),
+            "D6_GENUINE_ENABLED must remain default-false"
+        );
+    }
+
+    // The mutating dispatch relocation is x86_64-only.
+    #[test]
+    fn stage168_mut_dispatch_is_x86_64_only() {
+        let method_idx = RUNTIME_SRC
+            .find("fn d6_genuine_local_dispatch_step_mut")
+            .expect("mutating dispatch seam method must exist");
+        let before = &RUNTIME_SRC[method_idx.saturating_sub(80)..method_idx];
+        assert!(
+            before.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "the mutating dispatch seam method must be x86_64-only"
+        );
+        // The in-lock defer block is guarded by cfg(x86_64).
+        let defer_idx = EXEC_STATE_SRC
+            .find("D6_GENUINE_MUT_DISPATCH_CANDIDATE")
+            .expect("defer candidate marker must exist in exec_state");
+        let defer_before = &EXEC_STATE_SRC[defer_idx.saturating_sub(400)..defer_idx];
+        assert!(
+            defer_before.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "the in-lock dispatch defer block must be x86_64-only"
+        );
+    }
+
+    // D6_SWITCH_PROOF and D6_SWITCH_A paths remain intact and mutually exclusive.
+    #[test]
+    fn stage168_switch_proof_and_switch_a_untouched() {
+        // exec_state gate excludes proof + switch_a.
+        let gate_idx = EXEC_STATE_SRC
+            .find("D6_GENUINE_MUT_DISPATCH_CANDIDATE")
+            .map(|i| EXEC_STATE_SRC[..i].rfind("d6_genuine_enabled()").expect("gate"))
+            .expect("gate");
+        let gate = &EXEC_STATE_SRC[gate_idx..gate_idx + 220];
+        assert!(
+            gate.contains("!crate::kernel::boot::d6_controlled_switch_proof_enabled()")
+                && gate.contains("!crate::kernel::boot::d6_switch_a_enabled()"),
+            "the dispatch relocation must be disabled under the proof / switch-a knobs"
+        );
+        // trap_entry still emits the switch-a markers (path intact).
+        for m in [
+            "D6_SWITCH_A_LOCK_DROPPED",
+            "D6_SWITCH_A_SWITCH_ENTER",
+            "D6_SWITCH_A_DONE",
+        ] {
+            assert!(TRAP_ENTRY_SRC.contains(m), "switch-a marker must remain: {m}");
+        }
+        assert!(
+            IPC_STATE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF")
+                || TRAP_ENTRY_SRC.contains("d6_controlled_switch_proof"),
+            "the D6 proof path references must remain"
+        );
+    }
+
+    // The mutating local_dispatch_step_split has a real out-of-global-lock
+    // production call site (the trap-entry drain calls the seam method).
+    #[test]
+    fn stage168_mut_dispatch_out_of_lock_call_site() {
+        assert!(
+            RUNTIME_SRC.contains("dispatch_next_on(dispatch_cpu)")
+                && RUNTIME_SRC.contains("self.with_scheduler_split_mut("),
+            "the mutating dispatch seam must call dispatch_next_on under the scheduler seam"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("shared.d6_genuine_local_dispatch_step_mut(cpu)"),
+            "trap_entry must call the mutating dispatch seam after the global lock is dropped"
+        );
+        // Ordering: the mutating call is after `with_cpu` returns (global dropped).
+        let with_cpu_ret = TRAP_ENTRY_SRC
+            .find("let inner_result = inner_result?;")
+            .expect("global-lock drop point");
+        let mut_call = TRAP_ENTRY_SRC
+            .find("shared.d6_genuine_local_dispatch_step_mut(cpu)")
+            .expect("mut dispatch call");
+        assert!(
+            mut_call > with_cpu_ret,
+            "the mutating dispatch must run after the global lock is dropped"
+        );
+    }
+
+    // The in-lock authoritative dispatch is skipped ONLY for eligible d6_genuine
+    // cases (early return before local_dispatch_step_split), and the ineligible
+    // path falls back to the unchanged in-lock local_dispatch_step_split.
+    #[test]
+    fn stage168_in_lock_skipped_only_when_eligible_else_fallback() {
+        let defer_idx = EXEC_STATE_SRC
+            .find("D6_GENUINE_MUT_DISPATCH_ELIGIBLE")
+            .expect("eligible marker");
+        let step_idx = EXEC_STATE_SRC
+            .find("let next = self.local_dispatch_step_split();")
+            .expect("in-lock authoritative dispatch must still exist");
+        assert!(
+            defer_idx < step_idx,
+            "the eligible defer/early-return must precede the in-lock dispatch"
+        );
+        // The eligible branch returns early (skips in-lock dispatch).
+        let defer_region = &EXEC_STATE_SRC[defer_idx..step_idx];
+        assert!(
+            defer_region.contains("return Ok(cur);"),
+            "the eligible case must early-return, skipping the in-lock dispatch"
+        );
+        assert!(
+            EXEC_STATE_SRC.contains("D6_GENUINE_MUT_DISPATCH_FALLBACK"),
+            "ineligible cases must emit a fallback marker and use the in-lock path"
+        );
+    }
+
+    // No double-advance: the eligible slice is queue-neutral by construction and
+    // the drain re-verifies before running the single mutating step.
+    #[test]
+    fn stage168_no_double_advance_guarantee() {
+        assert!(
+            EXEC_STATE_SRC.contains("let queue_neutral = !(runnable > 0 && matches!(cur, None | Some(0)));"),
+            "eligibility must be gated on the queue-neutral (never-dequeue) predicate"
+        );
+        assert!(
+            RUNTIME_SRC.contains("fn d6_genuine_dispatch_queue_neutral"),
+            "the drain must re-verify queue-neutrality out of lock"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("d6_genuine_dispatch_queue_neutral(cpu)")
+                && TRAP_ENTRY_SRC.contains("d6_genuine_dispatch_clear_deferred"),
+            "the drain must re-verify neutrality and clear the deferral (single step)"
+        );
+        // Deferral is a one-shot CAS (no nested deferral).
+        assert!(
+            MOD_SRC.contains("fn d6_genuine_dispatch_try_defer")
+                && MOD_SRC.contains("compare_exchange"),
+            "deferral must be a one-shot compare_exchange (no nested/double deferral)"
+        );
+    }
+
+    // Required D6 mutating-dispatch markers are present across the sources.
+    #[test]
+    fn stage168_d6_mut_markers_present() {
+        for m in [
+            "D6_GENUINE_MUT_DISPATCH_CANDIDATE",
+            "D6_GENUINE_MUT_DISPATCH_ELIGIBLE",
+            "D6_GENUINE_MUT_DISPATCH_PREPARED",
+            "D6_GENUINE_MUT_DISPATCH_FALLBACK",
+        ] {
+            assert!(EXEC_STATE_SRC.contains(m), "exec_state must emit {m}");
+        }
+        for m in [
+            "D6_GENUINE_MUT_DISPATCH_GLOBAL_DROPPED",
+            "D6_GENUINE_MUT_DISPATCH_ENTER",
+            "D6_GENUINE_MUT_DISPATCH_DONE",
+            "D6_GENUINE_MUT_DISPATCH_COUNT",
+        ] {
+            assert!(TRAP_ENTRY_SRC.contains(m), "trap_entry must emit {m}");
+        }
+        assert!(
+            RUNTIME_SRC.contains("D6_GENUINE_MUT_DISPATCH_STEP_SPLIT"),
+            "the seam must emit D6_GENUINE_MUT_DISPATCH_STEP_SPLIT"
+        );
+    }
+
+    // D2 recv genuine default off + x86_64-only.
+    #[test]
+    fn stage168_d2_recv_genuine_default_off_x86_only() {
+        assert!(
+            CMDLINE_SRC.contains("pub d2_recv_genuine: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.d2_recv_genuine"),
+            "yarm.d2_recv_genuine must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("D2_RECV_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("fn d2_recv_genuine_enabled() -> bool"),
+            "D2_RECV_GENUINE gate + accessor must exist (default false)"
+        );
+        let apply_idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.d2_recv_genuine")
+            .expect("d2_recv_genuine apply block");
+        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 500];
+        assert!(
+            apply.contains("#[cfg(target_arch = \"x86_64\")]")
+                && apply.contains("set_d2_recv_genuine_enabled(enabled)"),
+            "d2_recv_genuine must only flip the gate on x86_64"
+        );
+    }
+
+    // The D2 recv split has explicit cap / IPC / task / dispatch phases.
+    #[test]
+    fn stage168_d2_recv_explicit_phases() {
+        for m in [
+            "D2_RECV_GENUINE_CANDIDATE",
+            "D2_RECV_GENUINE_PHASE_CAP_OK",
+            "D2_RECV_GENUINE_PHASE_IPC_LOCK",
+            "D2_RECV_GENUINE_PHASE_TASK_BLOCK",
+            "D2_RECV_GENUINE_PHASE_DISPATCH",
+            "D2_RECV_GENUINE_BLOCKED_OK",
+            "D2_RECV_GENUINE_IMMEDIATE_OK",
+            "D2_RECV_GENUINE_TIMEOUT_OK",
+            "D2_RECV_GENUINE_ROLLBACK_OK",
+            "D2_RECV_GENUINE_DONE",
+        ] {
+            assert!(IPC_STATE_SRC.contains(m), "ipc_state must emit D2 recv marker {m}");
+        }
+        assert!(
+            SYSCALL_IPC_SRC.contains("D2_RECV_GENUINE_NOWAIT_OK"),
+            "the NoWait probe path must emit D2_RECV_GENUINE_NOWAIT_OK"
+        );
+        // Rank order preserved: the existing phase functions are still A→B→C.
+        let pa = IPC_STATE_SRC.find("recv_block_phase_a_scheduler").expect("phase A");
+        let pb = IPC_STATE_SRC.find("recv_block_phase_b_task").expect("phase B");
+        let pc = IPC_STATE_SRC
+            .find("recv_block_phase_c_ipc_publish")
+            .expect("phase C");
+        assert!(pa < pb && pb < pc, "recv block phases must stay rank-ordered A<B<C");
+    }
+
+    // D2 SEND path untouched (Stage 169 territory).
+    #[test]
+    fn stage168_d2_send_untouched() {
+        assert!(
+            !IPC_STATE_SRC.contains("D2_SEND_GENUINE"),
+            "Stage 168 must not add a genuine send path (deferred to Stage 169)"
+        );
+        // The send-block orchestrator is not instrumented with recv-genuine markers.
+        let send_idx = IPC_STATE_SRC
+            .find("fn block_current_on_send_with_deadline")
+            .expect("send-block orchestrator must exist");
+        let send_region = &IPC_STATE_SRC[send_idx..send_idx + 1200];
+        assert!(
+            !send_region.contains("D2_RECV_GENUINE"),
+            "the send path must not carry recv-genuine instrumentation"
+        );
+    }
+
+    // No D3/D5 live-wire and no IPC-FINAL work in this stage.
+    #[test]
+    fn stage168_no_d3_d5_livewire() {
+        for forbidden in [
+            "D3_GENUINE",
+            "D5_GENUINE",
+            "IPC_FINAL",
+            "with_vm_user_spaces_split_mut(",
+        ] {
+            assert!(
+                !TRAP_ENTRY_SRC.contains(forbidden),
+                "trap_entry must not live-wire {forbidden}"
+            );
+        }
+    }
+
+    // No syscall/IPC/ABI count changes.
+    #[test]
+    fn stage168_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+    }
+
+    // Stage 163P sender-wake workload knob is not changed by this stage.
+    #[test]
+    fn stage168_sender_wake_oracle_unchanged() {
+        assert!(
+            CMDLINE_SRC.contains("ipc_recv_proof_sender_wake"),
+            "the Stage 163P sender-wake sub-knob must remain intact"
+        );
+    }
+
+    // Smoke script supports D6_GENUINE + D2_RECV_GENUINE and checks markers.
+    #[test]
+    fn stage168_smoke_supports_both_knobs() {
+        assert!(
+            SMOKE_SRC.contains("D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}")
+                && SMOKE_SRC.contains("yarm.d2_recv_genuine=1"),
+            "smoke must append yarm.d2_recv_genuine=1 when D2_RECV_GENUINE=1"
+        );
+        assert!(
+            SMOKE_SRC.contains("D6_GENUINE_MUT_DISPATCH_ENTER")
+                && SMOKE_SRC.contains("D6_GENUINE_MUT_DISPATCH_STEP_SPLIT")
+                && SMOKE_SRC.contains("D6_GENUINE_MUT_DISPATCH_DONE"),
+            "smoke must verify the D6 mutating-dispatch markers"
+        );
+        assert!(
+            SMOKE_SRC.contains("D2_RECV_GENUINE_CANDIDATE")
+                && SMOKE_SRC.contains("D2-RECV-GENUINE mode FAILED"),
+            "smoke must verify the D2 recv markers and fail on missing/fatal"
         );
     }
 }

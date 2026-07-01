@@ -1727,6 +1727,69 @@ impl KernelState {
                 ipc.telemetry.scheduler_dispatch_calls.saturating_add(1);
         });
         let outgoing_tid = self.current_tid();
+        // Stage 168 (D6-GENUINE-B): relocate the authoritative mutating dispatch
+        // out of the global KernelState lock for the eligible, queue-neutral
+        // d6_genuine slice. When eligible, the in-lock path declines to perform
+        // the authoritative `local_dispatch_step_split` and instead records a
+        // per-CPU deferral drained by the trap entry AFTER the global guard is
+        // dropped (see `handle_trap_entry_shared` and
+        // `SharedKernel::d6_genuine_local_dispatch_step_mut`). Eligibility is
+        // restricted to the queue-neutral case (current task continues, or idle
+        // stays idle with nothing runnable) so the out-of-lock `dispatch_next_on`
+        // provably never dequeues — it cannot double-advance the run queue. Any
+        // ineligible case (switch required, multi-CPU, no trap drainer, already
+        // deferred) falls back to the unchanged in-lock path below.
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernel::boot::d6_genuine_enabled()
+            && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+            && !crate::kernel::boot::d6_switch_a_enabled()
+        {
+            let cpu = self.current_cpu();
+            let cpu_idx = cpu.0 as usize;
+            crate::yarm_log!(
+                "D6_GENUINE_MUT_DISPATCH_CANDIDATE cpu={} outgoing={:?}",
+                cpu.0,
+                outgoing_tid
+            );
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let cur = self.current_tid();
+            let runnable = self.runnable_count_on_cpu(cpu);
+            // Queue-neutral iff `dispatch_next_on` would NOT dequeue: that only
+            // happens when (no current / idle tid 0) AND something is runnable.
+            let queue_neutral = !(runnable > 0 && matches!(cur, None | Some(0)));
+            let single_cpu = self.online_cpu_count() <= 1;
+            let already_deferred = crate::kernel::boot::d6_genuine_dispatch_is_deferred(cpu_idx);
+            if trap_path && queue_neutral && single_cpu && !already_deferred {
+                if crate::kernel::boot::d6_genuine_dispatch_try_defer(cpu_idx, outgoing_tid) {
+                    crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_ELIGIBLE cpu={}", cpu.0);
+                    crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_PREPARED cpu={}", cpu.0);
+                    // `cur` is exactly what the authoritative `dispatch_next_on`
+                    // returns for this queue-neutral state, so in-lock callers
+                    // still get the correct next TID; the out-of-lock drain then
+                    // performs the single authoritative mutating dispatch step.
+                    return Ok(cur);
+                }
+            }
+            let reason = if !trap_path {
+                "no_trap_drainer"
+            } else if !queue_neutral {
+                "switch_required"
+            } else if !single_cpu {
+                "multi_cpu"
+            } else {
+                "already_deferred"
+            };
+            crate::yarm_log!(
+                "D6_GENUINE_MUT_DISPATCH_FALLBACK reason={} cpu={}",
+                reason,
+                cpu.0
+            );
+            // An in-lock authoritative dispatch is about to run; supersede any
+            // stale deferral so the trap-entry drain does not run a second step.
+            crate::kernel::boot::d6_genuine_dispatch_clear_deferred(cpu_idx);
+        }
         // VALIDATION: D6_LIVE_SPLIT (Stage 107); Phase A/B named Stage 113.
         // Phase A (scheduler rank 1 only): local_dispatch_step_split picks
         // the next runnable task and drops the scheduler lock before

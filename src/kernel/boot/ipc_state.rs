@@ -561,6 +561,12 @@ impl KernelState {
         crate::yarm_log!("D2_RECV_WAITER_RACE_UNWIND tid={}", plan.blocked_tid.0);
         self.note_d2_publish_race_unwind();
         self.wake_tid_to_runnable(plan.blocked_tid)?;
+        if crate::kernel::boot::d2_recv_genuine_enabled() {
+            // Stage 168 (D2-GENUINE-RECV): no-lost-wakeup rollback — Phase B was
+            // reversed (task → Runnable) and the scheduler re-entered before the
+            // redispatch below.
+            crate::yarm_log!("D2_RECV_GENUINE_ROLLBACK_OK tid={}", plan.blocked_tid.0);
+        }
         let _ = self.dispatch_next_task()?;
         Ok(plan.blocked_tid)
     }
@@ -604,8 +610,14 @@ impl KernelState {
         // B) BEFORE the publish becomes visible (Phase C), any sender that
         // observes the published waiter also observes a Blocked TCB — wake
         // cannot be lost on that edge (audit doc §15.2 / §18).
+        // Phase A (scheduler rank 1) → Phase B (task rank 2): block + Blocked TCB.
         let plan = self.recv_block_phase_a_scheduler(endpoint_idx, recv_cap)?;
         let plan = self.recv_block_phase_b_task(plan, deadline)?;
+        if crate::kernel::boot::d2_recv_genuine_enabled() {
+            // Stage 168 (D2-GENUINE-RECV): scheduler+task phases complete.
+            crate::yarm_log!("D2_RECV_GENUINE_PHASE_TASK_BLOCK tid={}", plan.blocked_tid.0);
+        }
+        // Phase C (ipc rank 3): publish waiter, with the no-lost-wakeup unwind.
         match self.recv_block_phase_c_ipc_publish(plan) {
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::Published => {}
             crate::kernel::recv_waiter_split::PublishWaiterOutcome::QueueNonEmpty => {
@@ -625,6 +637,15 @@ impl KernelState {
             plan.endpoint_idx,
             plan.blocked_tid.0
         );
+        if crate::kernel::boot::d2_recv_genuine_enabled() {
+            // Stage 168 (D2-GENUINE-RECV): ipc publish done; enter dispatch.
+            // Under `yarm.d6_genuine=1`, `dispatch_next_task` routes an eligible
+            // (queue-neutral) dispatch through the out-of-global-lock scheduler
+            // seam; a blocking recv usually requires a real switch, which stays
+            // on the preserved in-lock fallback (Stage 169+ relocates it).
+            crate::yarm_log!("D2_RECV_GENUINE_PHASE_IPC_LOCK tid={}", plan.blocked_tid.0);
+            crate::yarm_log!("D2_RECV_GENUINE_PHASE_DISPATCH tid={}", plan.blocked_tid.0);
+        }
         let _ = self.dispatch_next_task()?;
         Ok(plan.blocked_tid)
     }
@@ -2763,10 +2784,35 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        // Stage 168 (D2-GENUINE-RECV): rank-clean phase instrumentation for the
+        // canonical blocking-recv path, default-off behind `yarm.d2_recv_genuine=1`
+        // (settable on x86_64 only). The phase boundaries below are the SAME
+        // rank-ordered scheduler(1) → task(2) → ipc(3) → dispatch steps the path
+        // already runs; the knob only exposes them live (and, with
+        // `yarm.d6_genuine=1`, routes the block's dispatch through the Stage 168
+        // out-of-global-lock seam where eligible). Immediate / NoWait / timeout /
+        // rollback semantics are byte-identical whether the knob is on or off.
+        let d2_recv_genuine = crate::kernel::boot::d2_recv_genuine_enabled();
+        let d2_recv_tid = self.current_tid().unwrap_or(0);
+        if d2_recv_genuine {
+            crate::yarm_log!(
+                "D2_RECV_GENUINE_CANDIDATE tid={} endpoint={}",
+                d2_recv_tid,
+                endpoint_idx
+            );
+            crate::yarm_log!("D2_RECV_GENUINE_PHASE_CAP_OK tid={}", d2_recv_tid);
+        }
         // Phase 1: try immediate recv under ipc_state_lock.
         let (msg, wake_plan) = self.ipc_recv_endpoint_take(endpoint_idx)?;
+        if d2_recv_genuine {
+            crate::yarm_log!("D2_RECV_GENUINE_PHASE_IPC_LOCK tid={}", d2_recv_tid);
+        }
         self.apply_scheduler_wake_plan(wake_plan)?;
         if msg.is_some() {
+            if d2_recv_genuine {
+                crate::yarm_log!("D2_RECV_GENUINE_IMMEDIATE_OK tid={}", d2_recv_tid);
+                crate::yarm_log!("D2_RECV_GENUINE_DONE result=immediate tid={}", d2_recv_tid);
+            }
             return Ok(msg);
         }
 
@@ -2774,11 +2820,23 @@ impl KernelState {
             self.block_current_on_receive_with_deadline(endpoint_idx, recv_cap, deadline)?;
         let timed_out = self.consume_ipc_timeout_fired_for_tid(blocked_tid.0)?;
         if timed_out {
+            if d2_recv_genuine {
+                crate::yarm_log!("D2_RECV_GENUINE_TIMEOUT_OK tid={}", blocked_tid.0);
+                crate::yarm_log!("D2_RECV_GENUINE_DONE result=timeout tid={}", blocked_tid.0);
+            }
             return Ok(None);
         }
         // Phase 2: post-wake recv under ipc_state_lock (sender may have delivered directly).
         let (msg, wake_plan) = self.ipc_recv_endpoint_take(endpoint_idx)?;
         self.apply_scheduler_wake_plan(wake_plan)?;
+        if d2_recv_genuine {
+            crate::yarm_log!("D2_RECV_GENUINE_BLOCKED_OK tid={}", blocked_tid.0);
+            crate::yarm_log!(
+                "D2_RECV_GENUINE_DONE result={} tid={}",
+                if msg.is_some() { "delivered" } else { "woken_empty" },
+                blocked_tid.0
+            );
+        }
         Ok(msg)
     }
 }
