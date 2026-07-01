@@ -1340,15 +1340,14 @@ impl KernelState {
         // Stage 175 (SPAWN-LIFECYCLE): default-off lifecycle phase markers. Every
         // register/cnode/cap/thread step below is UNCHANGED — these only expose the
         // phase boundaries of the spawn/image-loading metadata path.
+        //
+        // Stage 175B: a duplicate-TID is NOT detectable by a pre-register presence
+        // scan — the bootstrap tasks (tid 1/2/3) legitimately pre-reserve their TCB
+        // slot before this spawn runs, so a pre-check flags every bootstrap spawn as
+        // a false duplicate. The only true duplicate is a *second live TCB* for the
+        // same tid, which the post-register invariant below (`tcb_count > 1`) detects
+        // after `register_task_with_class` has (idempotently) claimed the slot.
         let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
-        if spawn_lc {
-            // A TID that is already registered would be a duplicate-tid violation.
-            let already =
-                self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == spec.tid));
-            if already {
-                crate::yarm_log!("SPAWN_LIFECYCLE_DUPLICATE_TID tid={}", spec.tid);
-            }
-        }
         self.register_task_with_class(spec.tid, spec.class)?;
         crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
         if spawn_lc {
