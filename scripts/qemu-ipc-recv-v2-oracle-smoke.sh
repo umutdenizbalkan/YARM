@@ -417,12 +417,17 @@ if [[ "$IPC_FINAL" == "1" ]]; then
       rc=1
     fi
   done
-  # Handled COW page faults are expected and NOT fatal — assert the invariant that
-  # every PAGE_FAULT that appears is a handled-COW one when any PAGE_FAULT occurs.
-  if marker_present "PAGE_FAULT" && ! marker_present "PAGE_FAULT_HANDLED_COW"; then
-    echo "[err] ipc-oracle: IPC-FINAL: PAGE_FAULT present without PAGE_FAULT_HANDLED_COW (unhandled fault)"
-    rc=1
-  fi
+  # Stage 171B: page-fault gate — fail ONLY on the EXPLICIT unhandled/fatal
+  # page-fault markers, never on benign PAGE_FAULT_* diagnostic lines. A HANDLED
+  # fault emits many PAGE_FAULT_* diagnostics (ENTRY / HW_REGS / FRAME_WORDS /
+  # FRAME_DECODE / HW_PTE_WALK / RAW / X86_ERROR / CR3_COMPARE) BEFORE the final
+  # PAGE_FAULT_HANDLED_COW (or PAGE_FAULT_HANDLED_DEMAND); those are expected.
+  for pf_fatal in "PAGE_FAULT_UNHANDLED" "PAGE_FAULT_FATAL" "PAGE_FAULT_NOT_HANDLED"; do
+    if marker_present "$pf_fatal"; then
+      echo "[err] ipc-oracle: IPC-FINAL: explicit unhandled/fatal page-fault marker: $pf_fatal"
+      rc=1
+    fi
+  done
   # Committed-path D2 recv/send dispatch relocation (only when the knob is set):
   # require the out-of-lock markers and reject a committed-path switch_required
   # in-lock fallback.

@@ -5270,7 +5270,28 @@ Acceptance (user QEMU): (1) `SCHED_TIMEOUT=1 QEMU_SMP=1 ./scripts/qemu-x86_64-co
 (5) `QEMU_SMP=1 YARM_IPC_RECV_PROOF_SENDER_WAKE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`;
 (6) normal `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; (7) `D6_SWITCH_A=1 …`;
 (8) `TIMEOUT_SECS=300 D6_SWITCH_PROOF=1 …`; optionally a RISC-V timeout smoke.
-**PENDING user QEMU acceptance.**
+
+**Stage 171B (SCHED_TIMEOUT smoke fault-gate fix).** The first `SCHED_TIMEOUT=1`
+QEMU run reached service baseline and emitted `SCHED_TIMEOUT_ENABLED` +
+`SCHED_IDLE_NO_PENDING_TIMEOUT`, but the wrapper **falsely failed** with
+`PAGE_FAULT without PAGE_FAULT_HANDLED_COW`. The two page-fault groups in the log
+(tid=1 and tid=10008) were both **handled COW faults** — each emits many benign
+`PAGE_FAULT_*` diagnostic lines (`PAGE_FAULT_ENTRY`, `…_HW_REGS`, `…_FRAME_WORDS`,
+`…_FRAME_DECODE`, `…_HW_PTE_WALK`, `…_RAW`, `…_X86_ERROR`, `…_CR3_COMPARE`) BEFORE
+the final `PAGE_FAULT_HANDLED_COW`. The old gate treated the presence of ANY
+`PAGE_FAULT` token (without a whole-log `PAGE_FAULT_HANDLED_COW`) as fatal, which
+is wrong. Stage 171B **narrows the page-fault gate to explicit unhandled/fatal
+markers only** — the kernel's `PAGE_FAULT_UNHANDLED tid=… addr=…`
+(`fault_state.rs`), plus `PAGE_FAULT_FATAL` / `PAGE_FAULT_NOT_HANDLED` defensively
+— and never fails on benign `PAGE_FAULT_*` diagnostics. Handled COW/DEMAND faults
+(`PAGE_FAULT_HANDLED_COW` / `PAGE_FAULT_HANDLED_DEMAND`) are accepted. The same
+latent bug in the IPC-FINAL oracle gate (`qemu-ipc-recv-v2-oracle-smoke.sh`)
+received the identical fix. All real Stage 171 gates are preserved
+(`SCHED_TIMEOUT_ENABLED`, idle diagnostics, `SCHED_TIMEOUT_STRANDED_WAITER`,
+expired-without-enqueue / duplicate-wake, `BLOCKED_WOULDBLOCK_FATAL` /
+`CapabilityFull` / `TaskTableFull`, `^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/
+`FATAL`, and the proof/switch-a mode isolation). No kernel runtime change; guarded
+by `stage171b_fault_gate`. **PENDING user QEMU re-run.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

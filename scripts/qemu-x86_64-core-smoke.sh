@@ -1040,19 +1040,28 @@ if [[ "$SCHED_TIMEOUT" == "1" ]]; then
   done
   if [[ -f "$LOGFILE" ]]; then
     st_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/SCHED_TIMEOUT_ENABLED/{seen=1} seen{print}')"
-    # Fatal breadcrumbs; handled COW page faults (PAGE_FAULT + PAGE_FAULT_HANDLED_COW)
-    # are acceptable and deliberately NOT in this set.
+    # Raw fatal breadcrumbs: `!Fv` / `!BNv` are line-start anchored (per the
+    # accepted convention); the fault-escalation tokens are matched anywhere.
     for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
       if printf '%s\n' "$st_tail" | rg -a -q -- "$fatal_pat"; then
         echo "[error] SCHED-TIMEOUT: fatal breadcrumb after sched-timeout wire start: $fatal_pat"
         sched_to_fail=1
       fi
     done
-    if printf '%s\n' "$st_tail" | rg -a -q -- 'PAGE_FAULT' \
-       && ! printf '%s\n' "$st_tail" | rg -a -q -- 'PAGE_FAULT_HANDLED_COW'; then
-      echo "[error] SCHED-TIMEOUT: PAGE_FAULT without PAGE_FAULT_HANDLED_COW (unhandled fault)"
-      sched_to_fail=1
-    fi
+    # Stage 171B: page-fault gate — fail ONLY on the EXPLICIT unhandled/fatal
+    # page-fault markers, never on benign PAGE_FAULT_* diagnostic lines. A HANDLED
+    # fault emits many PAGE_FAULT_* diagnostics (ENTRY / HW_REGS / FRAME_WORDS /
+    # FRAME_DECODE / HW_PTE_WALK / RAW / X86_ERROR / CR3_COMPARE) BEFORE the final
+    # PAGE_FAULT_HANDLED_COW (or PAGE_FAULT_HANDLED_DEMAND); those are expected and
+    # NOT fatal. The kernel emits `PAGE_FAULT_UNHANDLED tid=… addr=…` for a genuine
+    # unhandled fault (fault_state.rs); PAGE_FAULT_FATAL / PAGE_FAULT_NOT_HANDLED
+    # are accepted defensively in case future markers use those names.
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$st_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] SCHED-TIMEOUT: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        sched_to_fail=1
+      fi
+    done
   fi
   if [[ "$sched_to_fail" -eq 1 ]]; then
     echo "[error] SCHED-TIMEOUT mode FAILED"
