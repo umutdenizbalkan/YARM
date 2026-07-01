@@ -138,6 +138,18 @@ impl KernelState {
     /// in-lock; it never double-advances the run queue, and when the knob is
     /// OFF (default) behavior and lock order are unchanged from Stage 107.
     ///
+    /// Stage 168B/169 update: the authoritative *queue-advancing* dispatch has
+    /// been relocated out of the global lock for the committed blocking-recv
+    /// (`yarm.d2_recv_genuine=1`) and blocking-send (`yarm.d2_send_genuine=1`)
+    /// paths, and for the queue-neutral D6 slice (`yarm.d6_genuine=1`). Those
+    /// paths run `dispatch_next_on` through `with_scheduler_split_mut` in the
+    /// trap-entry drain (`d2_recv_dispatch_step_mut` / `d2_send_dispatch_step_mut`
+    /// / `d6_genuine_local_dispatch_step_mut`), NOT through this method. This
+    /// in-lock `local_dispatch_step_split` is still the authoritative fallback
+    /// for every ineligible case and for all other (non-recv/-send) dispatch
+    /// sites; a full relocation of the general dispatch entry point remains
+    /// deferred. Behavior and lock order are unchanged when the knobs are OFF.
+    ///
     /// Telemetry: `d6_local_dispatch_calls` (+1 per call). Smoke marker:
     /// `D6_LOCAL_DISPATCH cpu=N tid=Some(T)|None` (unchanged). Optional Info
     /// markers for the phase boundary: `D6_DISPATCH_SPLIT_BEGIN`,

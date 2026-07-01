@@ -5101,7 +5101,87 @@ mechanically complete (Stage 152). The roadmap, in order:
    dispatch markers and the Stage 163P oracle markers, no fatal); (2)
    `D6_GENUINE=1 D2_RECV_GENUINE=1` recv regression; (3) `D6_GENUINE`; (4)
    `D6_SWITCH_A` + `D6_SWITCH_PROOF`; (5) Stage 163P sender-wake oracle; (6) normal
-   smoke. **PENDING user QEMU acceptance.**
+   smoke.
+
+   **ACCEPTED (user QEMU, 2026).** The `D2_SEND_GENUINE=1` run produced a real
+   blocking IpcSend that relocated its queue-advancing dispatch out of the global
+   lock — `D2_SEND_GENUINE_PHASE_TASK_BLOCK` → `PHASE_IPC_LOCK` → `PHASE_DISPATCH`
+   → `DISPATCH_DEFERRED` → `NO_INLOCK_DISPATCH` → `GLOBAL_DROPPED` →
+   `DISPATCH_REVERIFY_OK` → `DISPATCH_ENTER` → `DISPATCH_STEP_SPLIT result=switch`
+   → `SWITCH_STASHED`/`SWITCH_ENTER`/`FIRST_RESUME` → `DISPATCH_DONE` — while the
+   Stage 163P sender-wake markers remained present
+   (`IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK`, line-start
+   `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, and the `USER_LOG …SEQUENCE_DONE` line).
+   Normal, `D6_GENUINE`, `D2_RECV_GENUINE`, `D6_SWITCH_A`, `D6_SWITCH_PROOF`, and
+   sender-wake regressions all passed. Stage 169 is **ACCEPTED**; the D2 blocking
+   send and recv genuine paths are complete for single-CPU x86_64.
+
+### 7.1.6 Stage 170 — IPC-FINAL (recv-v2 IPC surface stability milestone)
+
+**This is a stability milestone, not a new behavior stage.** Stage 170 freezes
+the accepted IPC recv-v2 surface behind a single strict, repeatable acceptance
+profile (`IPC_FINAL=1` in `scripts/qemu-ipc-recv-v2-oracle-smoke.sh`). No runtime
+behavior changes; the only code change is a doc-comment refresh on
+`local_dispatch_step_split` (recording the 168B/169 relocations) — no syscall /
+IPC / message / cap / endpoint semantics change, and no D3/D5/VM/CNode live-wire.
+
+Accepted IPC surface (frozen):
+
+- **recv-v2 metadata paths** — `IPC_RECV_V2_META_BLOCKED_WAITER_OK`,
+  `IPC_RECV_V2_META_IMMEDIATE_OK`, `IPC_RECV_V2_META_QUEUED_SPLIT_OK`.
+- **immediate recv** — endpoint had a message; delivered under the ipc lock with
+  no block (recv side), `IPC_RECV_V2_META_IMMEDIATE_OK`.
+- **queued split recv** — the trap-entry split fast path
+  (`IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE` + `…_META_QUEUED_SPLIT_OK`).
+- **rollback** — recv-v2 meta user-copy fault unwinds cleanly
+  (`IPC_RECV_V2_ROLLBACK_OK` + `IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE`); the
+  no-lost-wakeup `recv_block_unwind_race` (`D2_RECV_GENUINE_ROLLBACK_OK`).
+- **reply-cap one-shot** — `IPC_REPLY_CAP_ONESHOT_OK` (single-use reply cap,
+  consumed exactly once; live D1/D5 split path every spawn cycle).
+- **transfer-cap materialization** — `IPC_TRANSFER_CAP_MATERIALIZE_OK`.
+- **sender-wake ordering** — line-start `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` +
+  `USER_LOG …IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; the proof-gated kernel
+  coordination hook (Stage 163P) makes the handshake deterministic.
+- **blocking recv (D2-GENUINE-RECV, Stage 168B)** — queue-advancing dispatch out
+  of the global lock: `D2_RECV_GENUINE_DISPATCH_DEFERRED` / `NO_INLOCK_DISPATCH`
+  / `GLOBAL_DROPPED` / `DISPATCH_REVERIFY_OK` / `DISPATCH_STEP_SPLIT` /
+  `DISPATCH_DONE` (checked when `D2_RECV_GENUINE=1`).
+- **blocking send (D2-GENUINE-SEND, Stage 169)** — same relocation on the send
+  side: `D2_SEND_GENUINE_DISPATCH_DEFERRED` / `NO_INLOCK_DISPATCH` /
+  `GLOBAL_DROPPED` / `DISPATCH_REVERIFY_OK` / `DISPATCH_STEP_SPLIT` /
+  `DISPATCH_DONE` (checked when `D2_SEND_GENUINE=1`).
+- **timeout/deadline behavior** — as currently accepted: `IpcRecvTimeout` with
+  `timeout_ticks==0` is NoWait; `>0` is a deadline; `process_ipc_timeout_deadlines`
+  wakes `Blocked(EndpointReceive|EndpointSend)` at expiry (`ipc_timeout_fired`).
+- **syscall error parity / nonfatal blocked syscall** — a blocking IpcSend/IpcRecv
+  is nonfatal (`caller_blocked=true` → `Ok`, dispatch switches away); normal
+  syscall errors are encoded into the trap frame and returned to userspace, never
+  turned into a fatal trap halt.
+
+**Strict `IPC_FINAL=1` profile.** Enables all three proof workloads (queued-split
++ rollback + sender-wake) and extended mode (reply-cap + transfer-cap), then
+HARD-requires the full accepted marker set with **line-start anchoring** for
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` (an "absent:"/"present:" wrapper echo can never
+satisfy it) and a **strict failure gate**: fails on `BLOCKED_WOULDBLOCK_FATAL`,
+`CapabilityFull`, `TaskTableFull`, a committed-recv/-send `reason=switch_required`
+in-lock fallback, missing sender-wake / rollback / queued-split sequences, and the
+fatal breadcrumbs `^!Fv`, `^!BNv`, `DOUBLE_FAULT`, `TRIPLE`, `PANIC`, `FATAL`.
+**Handled COW page faults are NOT fatal** (`PAGE_FAULT` accompanied by
+`PAGE_FAULT_HANDLED_COW`). Guarded by `stage170_ipc_final`.
+
+**Explicitly NOT in Stage 170:** no IPC-FINAL *behavior* change; no D3/D5/VM/CNode
+live-wire; no SMP broadening (single-CPU only); no AArch64/RISC-V D6 switch unlock
+(the D2 knobs are x86_64-only / no-op elsewhere); no syscall / IPC / service /
+image ABI change (SYSCALL_COUNT=31, VARIANT_COUNT=23, x86_64
+MAX_ADDRESS_SPACES=32); no RPi5 change.
+
+Acceptance (user QEMU): (1) `IPC_FINAL=1 QEMU_SMP=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`;
+(2) `D6_GENUINE=1 D2_RECV_GENUINE=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`;
+(3) `D2_SEND_GENUINE=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` (sender-wake
+auto-enabled); (4) `QEMU_SMP=1 YARM_IPC_RECV_PROOF_SENDER_WAKE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`;
+(5) normal `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; (6)
+`D6_SWITCH_A=1 …`; (7) `TIMEOUT_SECS=300 D6_SWITCH_PROOF=1 …`. **PENDING user QEMU
+acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
