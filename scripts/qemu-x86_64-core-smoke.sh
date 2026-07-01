@@ -40,21 +40,22 @@ D6_SWITCH_A=${D6_SWITCH_A:-0}
 D6_GENUINE=${D6_GENUINE:-0}
 D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}
 D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
-# Stage 171 (SCHED-TIMEOUT): a pure DIAGNOSTIC overlay (no behavior change). It is
-# orthogonal to the genuine modes but is forced off under the pure D6_SWITCH_PROOF
-# / D6_SWITCH_A regressions so those runs stay uncontaminated by timeout markers.
+# Stage 171/172 (SCHED-TIMEOUT / VM-COW): pure DIAGNOSTIC overlays (no behavior
+# change). Orthogonal to the genuine modes but forced off under the pure
+# D6_SWITCH_PROOF / D6_SWITCH_A regressions so those runs stay uncontaminated.
 SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
+VM_COW=${VM_COW:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -62,7 +63,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -112,6 +113,18 @@ SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
 if [[ "$SCHED_TIMEOUT" == "1" ]]; then
   if [[ "$KERNEL_CMDLINE" != *"yarm.sched_timeout="* ]]; then
     KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.sched_timeout=1"
+  fi
+  IPC_RECV_PROOF=${IPC_RECV_PROOF:-1}
+  IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}
+fi
+# Stage 172 (VM-COW): VM_COW=1 appends yarm.vm_cow=1 to emit the VM/COW/page-table/
+# fork phase-boundary diagnostic markers (arch-neutral; no behavior change). Also
+# auto-enables the sender-wake proof workload, which forks (COW clone) and writes
+# to shared pages (COW write faults) — deterministically exercising the COW path.
+VM_COW=${VM_COW:-0}
+if [[ "$VM_COW" == "1" ]]; then
+  if [[ "$KERNEL_CMDLINE" != *"yarm.vm_cow="* ]]; then
+    KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.vm_cow=1"
   fi
   IPC_RECV_PROOF=${IPC_RECV_PROOF:-1}
   IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}
@@ -1068,6 +1081,79 @@ if [[ "$SCHED_TIMEOUT" == "1" ]]; then
     exit 1
   fi
   echo "[ok] SCHED-TIMEOUT: timeout/deadline hardening diagnostics clean"
+fi
+
+# Stage 172 (VM-COW): when booted with yarm.vm_cow=1, require the VM/COW phase
+# diagnostics and reject VM/COW correctness regressions. VM_COW_ENABLED is
+# deterministic; the COW/fork/map phase markers are checked when they occur.
+if [[ "$VM_COW" == "1" ]]; then
+  vm_cow_fail=0
+  echo "[ok] VM_COW enabled marker:" $(log_has_pattern "VM_COW_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "VM_COW_ENABLED"; then
+    echo "[error] VM-COW: VM_COW_ENABLED missing (knob not applied)"
+    vm_cow_fail=1
+  fi
+  # If a COW write fault occurred, its full phase sequence must complete.
+  if log_has_pattern "VM_COW_FAULT_BEGIN"; then
+    echo "[info] VM-COW: COW write fault observed — checking phase sequence"
+    for m in "VM_COW_PHASE_METADATA" "VM_COW_PHASE_TLB_FLUSH" "VM_COW_DONE"; do
+      if log_has_pattern "$m"; then
+        echo "[ok] VM-COW phase marker present: $m"
+      else
+        echo "[error] VM-COW: COW fault occurred but phase marker missing: $m"
+        vm_cow_fail=1
+      fi
+    done
+  fi
+  # If a fork COW clone occurred, it must reach DONE (or a clean ROLLBACK_OK).
+  if log_has_pattern "VM_COW_FORK_BEGIN" \
+     && ! log_has_pattern "VM_COW_FORK_DONE" \
+     && ! log_has_pattern "VM_COW_FORK_ROLLBACK_OK"; then
+    echo "[error] VM-COW: fork COW clone began but neither DONE nor ROLLBACK_OK observed"
+    vm_cow_fail=1
+  fi
+  # TLB-shootdown prep markers must accompany a COW/unmap that changed a mapping.
+  if log_has_pattern "VM_TLB_LOCAL_FLUSH" && ! log_has_pattern "VM_TLB_SHOOTDOWN_DEFERRED"; then
+    echo "[error] VM-COW: local TLB flush without shootdown-deferred prep marker"
+    vm_cow_fail=1
+  fi
+  # Hard failure markers (must never appear).
+  for f in \
+    "VM_COW_FAIL" \
+    "VM_MAP_ROLLBACK_FAIL" \
+    "VM_UNMAP_ROLLBACK_FAIL" \
+    "VM_COW_REFCOUNT_UNDERFLOW" \
+    "VM_COW_WRITABLE_SHARED_ALIAS" \
+    "VM_COW_CHILD_ASID_LEAK" \
+    "BLOCKED_WOULDBLOCK_FATAL" \
+    "CapabilityFull" \
+    "TaskTableFull"; do
+    if log_has_pattern "$f"; then
+      echo "[error] VM-COW: fatal marker present: $f"
+      vm_cow_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    vc_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/VM_COW_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$vc_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] VM-COW: fatal breadcrumb after vm-cow wire start: $fatal_pat"
+        vm_cow_fail=1
+      fi
+    done
+    # Explicit unhandled/fatal page-fault markers only (handled COW/DEMAND are OK).
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$vc_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] VM-COW: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        vm_cow_fail=1
+      fi
+    done
+  fi
+  if [[ "$vm_cow_fail" -eq 1 ]]; then
+    echo "[error] VM-COW mode FAILED"
+    exit 1
+  fi
+  echo "[ok] VM-COW: VM/COW/page-table/fork phase diagnostics clean"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

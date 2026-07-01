@@ -354,8 +354,14 @@ impl KernelState {
         // parent byte-identical. Proof-gated diagnostics are active only under the
         // sender-wake sub-knob.
         let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+        // Stage 172 (VM-COW): default-off fork phase markers. Diagnostic only — the
+        // transactional preflight + `rollback_cow_clone` below are UNCHANGED.
+        let vm_cow = crate::kernel::boot::vm_cow_enabled();
         if self.with_user_spaces(|spaces| spaces.get(parent_asid).is_none()) {
             return Err(KernelError::Vm(VmError::InvalidAsid));
+        }
+        if vm_cow {
+            crate::yarm_log!("VM_COW_FORK_BEGIN parent_asid={}", parent_asid.0);
         }
 
         // Snapshot the parent's runs BEFORE any mutation: (head virt, phys, flags, pages).
@@ -489,6 +495,9 @@ impl KernelState {
                     }
                 });
             }
+            if vm_cow {
+                crate::yarm_log!("VM_COW_FORK_CHILD_MAP va=0x{:x} pages={}", virt.0, pages);
+            }
             if flags.write {
                 if proof {
                     crate::yarm_log!(
@@ -538,6 +547,13 @@ impl KernelState {
                         pu
                     );
                 }
+                if vm_cow {
+                    crate::yarm_log!(
+                        "VM_COW_FORK_PARENT_WRITE_PROTECT va=0x{:x} pages={}",
+                        virt.0,
+                        pages
+                    );
+                }
                 // Mark each page COW in both parent and child.
                 for p in 0..pages {
                     let pv = VirtAddr(virt.0 + p as u64 * page_sz);
@@ -563,6 +579,9 @@ impl KernelState {
                         self.rollback_cow_clone(child_asid, parent_asid, &wp_runs, proof);
                         return Err(err);
                     }
+                }
+                if vm_cow {
+                    crate::yarm_log!("VM_COW_FORK_REFCOUNT_OK va=0x{:x} pages={}", virt.0, pages);
                 }
             } else {
                 // Stage 163G fix: a run can be READ-ONLY in the parent yet still be
@@ -608,6 +627,13 @@ impl KernelState {
                 cu
             );
         }
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_FORK_DONE parent_asid={} child_asid={}",
+                parent_asid.0,
+                child_asid.0
+            );
+        }
         Ok(child_asid)
     }
 
@@ -634,6 +660,15 @@ impl KernelState {
                 cu
             );
         }
+        let vm_cow = crate::kernel::boot::vm_cow_enabled();
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_FORK_ROLLBACK_BEGIN parent_asid={} child_asid={} wp_runs={}",
+                parent_asid.0,
+                child_asid.0,
+                wp_runs.len()
+            );
+        }
         let _ = self.destroy_user_address_space_by_asid(child_asid);
         for &(virt, old, pages) in wp_runs {
             self.with_user_spaces_mut(|spaces| {
@@ -644,6 +679,13 @@ impl KernelState {
             for p in 0..pages {
                 self.clear_cow_page(parent_asid, VirtAddr(virt.0 + p as u64 * page_sz));
             }
+        }
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_FORK_ROLLBACK_OK parent_asid={} child_asid={}",
+                parent_asid.0,
+                child_asid.0
+            );
         }
         if proof {
             let pu =
@@ -701,6 +743,10 @@ impl KernelState {
     ) -> Result<bool, KernelError> {
         // Stage 163G: proof-gated COW-handler diagnostics (sender-wake sub-knob only).
         let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+        // Stage 172 (VM-COW): default-off phase-boundary markers. Diagnostic only —
+        // the transactional rollback below is UNCHANGED (each failure revokes the
+        // freshly-allocated MemoryObject cap, so no frame/cap leak).
+        let vm_cow = crate::kernel::boot::vm_cow_enabled();
         let page = fault_addr.page_align_down();
         if !self.is_cow_page(asid, page) {
             if proof {
@@ -719,9 +765,20 @@ impl KernelState {
                 page.0
             );
         }
+        if vm_cow {
+            crate::yarm_log!("VM_COW_FAULT_BEGIN asid={} va=0x{:x}", asid.0, page.0);
+        }
         let mapping = self
             .with_user_spaces(|spaces| spaces.get(asid).and_then(|aspace| aspace.resolve(page)))
             .ok_or(KernelError::UserMemoryFault)?;
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_PHASE_METADATA asid={} va=0x{:x} writable={}",
+                asid.0,
+                page.0,
+                mapping.flags.write as u8
+            );
+        }
         if mapping.flags.write {
             // Already writable (e.g. a stale COW mark after a prior copy): just clear
             // the mark; the write will now succeed.
@@ -734,12 +791,26 @@ impl KernelState {
                     mapping.phys.0
                 );
             }
+            if vm_cow {
+                crate::yarm_log!(
+                    "VM_COW_DONE asid={} va=0x{:x} path=already_writable",
+                    asid.0,
+                    page.0
+                );
+            }
             return Ok(true);
         }
         let (_id, new_mem_cap) = self.alloc_anonymous_memory_object()?;
         let new_phys = match self.resolve_memory_object_phys(new_mem_cap, PageFlags::USER_RW) {
             Ok(p) => p,
             Err(e) => {
+                if vm_cow {
+                    crate::yarm_log!(
+                        "VM_COW_ROLLBACK_BEGIN asid={} va=0x{:x} reason=resolve_phys",
+                        asid.0,
+                        page.0
+                    );
+                }
                 if let Some(cnode) = self.current_task_cnode() {
                     let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
                 }
@@ -750,16 +821,47 @@ impl KernelState {
                         page.0
                     );
                 }
+                if vm_cow {
+                    crate::yarm_log!("VM_COW_ROLLBACK_DONE asid={} va=0x{:x}", asid.0, page.0);
+                    crate::yarm_log!(
+                        "VM_COW_FAIL reason=resolve_phys asid={} va=0x{:x}",
+                        asid.0,
+                        page.0
+                    );
+                }
                 return Err(e);
             }
         };
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_PHASE_FRAME_ALLOC asid={} va=0x{:x} new_pa=0x{:x}",
+                asid.0,
+                page.0,
+                new_phys.0
+            );
+        }
         if let Err(e) = self.copy_frame_contents_for_cow(asid, mapping.phys, new_phys) {
+            if vm_cow {
+                crate::yarm_log!(
+                    "VM_COW_ROLLBACK_BEGIN asid={} va=0x{:x} reason=copy_frame",
+                    asid.0,
+                    page.0
+                );
+            }
             if let Some(cnode) = self.current_task_cnode() {
                 let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
             }
             if proof {
                 crate::yarm_log!(
                     "PF_PROOF_COW_HANDLE_FAIL asid={} va=0x{:x} reason=copy_frame",
+                    asid.0,
+                    page.0
+                );
+            }
+            if vm_cow {
+                crate::yarm_log!("VM_COW_ROLLBACK_DONE asid={} va=0x{:x}", asid.0, page.0);
+                crate::yarm_log!(
+                    "VM_COW_FAIL reason=copy_frame asid={} va=0x{:x}",
                     asid.0,
                     page.0
                 );
@@ -776,6 +878,13 @@ impl KernelState {
                 flags,
             },
         ) {
+            if vm_cow {
+                crate::yarm_log!(
+                    "VM_COW_ROLLBACK_BEGIN asid={} va=0x{:x} reason=remap",
+                    asid.0,
+                    page.0
+                );
+            }
             if let Some(cnode) = self.current_task_cnode() {
                 let _ = self.revoke_capability_in_cnode(cnode, new_mem_cap);
             }
@@ -786,9 +895,38 @@ impl KernelState {
                     page.0
                 );
             }
+            if vm_cow {
+                crate::yarm_log!("VM_COW_ROLLBACK_DONE asid={} va=0x{:x}", asid.0, page.0);
+                crate::yarm_log!("VM_COW_FAIL reason=remap asid={} va=0x{:x}", asid.0, page.0);
+            }
             return Err(e);
         }
+        if vm_cow {
+            // The private writable frame is now mapped; the write bit changed, so the
+            // stale read-only TLB entry for this page must not be reused. On this
+            // single-CPU x86_64 baseline the map + fault re-walk restore consistency
+            // locally; a real SMP shootdown is prepped (deferred) below.
+            crate::yarm_log!("VM_COW_PHASE_PT_UPDATE asid={} va=0x{:x}", asid.0, page.0);
+            crate::yarm_log!("VM_TLB_LOCAL_FLUSH asid={} va=0x{:x}", asid.0, page.0);
+            crate::yarm_log!(
+                "VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live asid={}",
+                asid.0
+            );
+            crate::yarm_log!(
+                "VM_TLB_SHOOTDOWN_PREP_DONE asid={} va=0x{:x}",
+                asid.0,
+                page.0
+            );
+            crate::yarm_log!("VM_COW_PHASE_TLB_FLUSH asid={} va=0x{:x}", asid.0, page.0);
+        }
         self.clear_cow_page(asid, page);
+        if vm_cow {
+            crate::yarm_log!(
+                "VM_COW_DONE asid={} va=0x{:x} path=private_copy",
+                asid.0,
+                page.0
+            );
+        }
         if proof {
             // Confirm the post-COW PTE is present + writable for the faulting ASID.
             let post =
@@ -1253,6 +1391,10 @@ impl KernelState {
         if !capability.has_right(CapRights::MAP) {
             return Err(KernelError::MissingRight);
         }
+        let vm_cow = crate::kernel::boot::vm_cow_enabled();
+        if vm_cow {
+            crate::yarm_log!("VM_UNMAP_PHASE_METADATA asid={} va=0x{:x}", asid.0, virt.0);
+        }
         let unmapped = self.with_user_spaces_mut(|spaces| {
             spaces
                 .get_mut(asid)
@@ -1261,9 +1403,19 @@ impl KernelState {
                 .map_err(KernelError::Vm)
         })?;
         if let Some(mapping) = unmapped {
+            if vm_cow {
+                crate::yarm_log!("VM_UNMAP_PHASE_PT_UPDATE asid={} va=0x{:x}", asid.0, virt.0);
+            }
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
+            if vm_cow {
+                crate::yarm_log!("VM_UNMAP_TLB_FLUSH asid={} va=0x{:x}", asid.0, virt.0);
+                crate::yarm_log!(
+                    "VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live asid={}",
+                    asid.0
+                );
+            }
             self.request_live_asid_shootdown(asid, virt)?;
         }
         Ok(unmapped)
@@ -1274,6 +1426,10 @@ impl KernelState {
         asid: Asid,
         virt: VirtAddr,
     ) -> Result<Option<Mapping>, KernelError> {
+        let vm_cow = crate::kernel::boot::vm_cow_enabled();
+        if vm_cow {
+            crate::yarm_log!("VM_UNMAP_PHASE_METADATA asid={} va=0x{:x}", asid.0, virt.0);
+        }
         let unmapped = self.with_user_spaces_mut(|spaces| {
             spaces
                 .get_mut(asid)
@@ -1282,9 +1438,19 @@ impl KernelState {
                 .map_err(KernelError::Vm)
         })?;
         if let Some(mapping) = unmapped {
+            if vm_cow {
+                crate::yarm_log!("VM_UNMAP_PHASE_PT_UPDATE asid={} va=0x{:x}", asid.0, virt.0);
+            }
             self.clear_cow_page(asid, virt);
             self.note_mapping_removed(mapping.phys);
             self.reclaim_memory_object_for_phys(mapping.phys);
+            if vm_cow {
+                crate::yarm_log!("VM_UNMAP_TLB_FLUSH asid={} va=0x{:x}", asid.0, virt.0);
+                crate::yarm_log!(
+                    "VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live asid={}",
+                    asid.0
+                );
+            }
             self.request_live_asid_shootdown(asid, virt)?;
         }
         Ok(unmapped)

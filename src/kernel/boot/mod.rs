@@ -964,6 +964,26 @@ pub(crate) fn sched_idle_marker_budget_remaining() -> bool {
         < SCHED_IDLE_MARKER_BUDGET
 }
 
+/// Stage 172 (VM-COW): arch-neutral, default-off DIAGNOSTIC gate for the
+/// VM/COW/page-table/fork phase-boundary markers. When OFF (default) the VM/COW
+/// paths run byte-identically and emit none of the `VM_COW_*` / `VM_MAP_*` /
+/// `VM_UNMAP_*` / `VM_TLB_*` markers. When ON, the COW fault handler, the fork COW
+/// clone + rollback, and the map/unmap syscall handlers emit rank-clean phase
+/// markers so a QEMU acceptance profile can prove phase boundaries, rollback, and
+/// TLB-shootdown prep. It changes NO VM behavior and no ABI (the existing
+/// transactional rollback and `PAGE_FAULT_HANDLED_COW` handling are untouched).
+/// VALIDATION: VM_COW_ENABLED.
+pub(crate) static VM_COW_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_vm_cow_enabled(enabled: bool) {
+    VM_COW_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn vm_cow_enabled() -> bool {
+    VM_COW_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

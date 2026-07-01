@@ -5293,6 +5293,92 @@ expired-without-enqueue / duplicate-wake, `BLOCKED_WOULDBLOCK_FATAL` /
 `FATAL`, and the proof/switch-a mode isolation). No kernel runtime change; guarded
 by `stage171b_fault_gate`. **PENDING user QEMU re-run.**
 
+**ACCEPTED (user QEMU, 2026).** After the Stage 171B gate fix, the `SCHED_TIMEOUT=1`
+x86_64 run reached service baseline, emitted `SCHED_TIMEOUT_ENABLED` + idle
+diagnostics, reported `[ok] SCHED-TIMEOUT: timeout/deadline hardening diagnostics
+clean` and `x86_64 boot markers detected`, and the fatal grep was empty. Stage 171
+SCHED-TIMEOUT is **ACCEPTED** (Stage 171B changed only the smoke fault gate — no
+kernel runtime change). Stage 172 (VM-COW) is the next frontier.
+
+### 7.1.8 Stage 172 — VM-COW (VM/COW/page-table split + hardening)
+
+**Next kernel-unlocking frontier after IPC-FINAL and SCHED-TIMEOUT.** Splits and
+instruments the VM/COW/page-table/frame/fork path with a default-off diagnostic
+profile (`yarm.vm_cow=1`, script `VM_COW=1`, marker `VM_COW_ENABLED`). This is an
+audit + instrumentation + hardening-verification stage: the existing COW/fork/map
+paths are ALREADY transactional (each failure rolls back), so **no VM runtime
+behavior changes** — the markers only expose the phase boundaries.
+
+**Explicitly NOT done in Stage 172:** no D2/D6 change; no IPC ABI change; no
+syscall count change (SYSCALL_COUNT=31, VARIANT_COUNT=23, x86_64
+MAX_ADDRESS_SPACES=32); no CNode/cap overhaul; no SMP shootdown live-wire (prep
+markers only); no AArch64/RISC-V D6 switch unlock (the knob is arch-neutral
+diagnostics / no-op behavior); no RPi5 change; IPC-FINAL / D2 recv/send / Stage
+163P / Stage 171 all preserved.
+
+**Audit (Task B).** Paths audited and confirmed already transactional:
+- **COW write fault** (`try_handle_cow_fault`, memory_state.rs): only WRITE faults
+  to COW pages copy (fault_state.rs gates on `FaultAccess::Write`); read faults
+  never copy. Phases: metadata (resolve mapping) → frame alloc
+  (`alloc_anonymous_memory_object` + `resolve_memory_object_phys`) → COW copy
+  (`copy_frame_contents_for_cow`) → PT update (`map_user_page_in_asid_raw`, writable)
+  → clear COW mark. **Rollback:** every failure path revokes the freshly-allocated
+  MemoryObject cap (no frame/cap leak). An already-writable stale-COW page just
+  clears the mark. Lock/rank: capability (4) → vm (5) → memory (6), sequential.
+- **Fork COW clone** (`clone_user_address_space_cow`): preflight rejects
+  over-capacity BEFORE any mutation; snapshots parent runs (never iterates the
+  live table); maps each run read-only/shared into the child; write-protects each
+  writable parent run IN PLACE (no split); marks COW in parent + child; read-only
+  parent runs that already carry a COW mark are inherited shared. **Rollback:**
+  `rollback_cow_clone` destroys the partial child and restores every
+  write-protected parent run + clears its COW marks (parent left byte-identical).
+- **VM map** (`handle_vm_map`, syscall/vm.rs): per-page frame alloc + map with
+  `rollback_anon_map` reclaiming caps/frames for the mapped prefix on any failure.
+- **VM unmap** (`unmap_user_page` / `unmap_user_page_in_asid`): unmap PTE → clear
+  COW → note removed → reclaim frame → `request_live_asid_shootdown` (TLB).
+- Remaining global-KernelState-held VM mutations are classified metadata /
+  page-table / frame-alloc / COW-refcount / TLB in the per-function comments; a
+  genuine out-of-global-lock relocation of the VM domain is a later stage (this
+  stage only instruments and verifies rollback).
+
+**Markers (Task C/D/E/F).** All default-off behind `vm_cow`:
+- COW fault: `VM_COW_FAULT_BEGIN`, `VM_COW_PHASE_METADATA`,
+  `VM_COW_PHASE_FRAME_ALLOC`, `VM_COW_PHASE_PT_UPDATE`, `VM_COW_PHASE_TLB_FLUSH`,
+  `VM_COW_ROLLBACK_BEGIN`/`VM_COW_ROLLBACK_DONE`, `VM_COW_DONE`,
+  `VM_COW_FAIL reason=…`.
+- Map/unmap: `VM_MAP_PHASE_METADATA`/`_FRAME_ALLOC`/`_PT_UPDATE`,
+  `VM_MAP_ROLLBACK_OK`, `VM_UNMAP_PHASE_METADATA`/`_PT_UPDATE`, `VM_UNMAP_TLB_FLUSH`.
+- Fork: `VM_COW_FORK_BEGIN`, `VM_COW_FORK_CHILD_MAP`,
+  `VM_COW_FORK_PARENT_WRITE_PROTECT`, `VM_COW_FORK_REFCOUNT_OK`,
+  `VM_COW_FORK_ROLLBACK_OK`, `VM_COW_FORK_DONE`.
+- TLB prep (Task F, NO real SMP shootdown yet): `VM_TLB_LOCAL_FLUSH`,
+  `VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live`, `VM_TLB_SHOOTDOWN_PREP_DONE`.
+  **Later SMP shootdown needs:** target-ASID tracking, a per-CPU active-ASID
+  bitmap, an IPI ACK path, a rank-clean/lock-free shootdown wait, and
+  timeout/failure handling — none live-wired here.
+
+**COW correctness (Task E).** Only write faults copy; read faults do not; the
+shared page stays shared until first write; the writable bit is restored only on
+the private copy; parent/child isolation holds after write; error paths return a
+normal syscall/fault result, not a fatal trap. `PAGE_FAULT_HANDLED_COW` /
+`PAGE_FAULT_HANDLED_DEMAND` are preserved; the Stage 163P fork sender-wake oracle
+is unaffected (the markers are gated; the workload is auto-enabled under `VM_COW=1`
+to exercise fork COW clone + COW write faults deterministically).
+
+**`VM_COW=1` acceptance profile (Task G).** Requires `VM_COW_ENABLED`; checks the
+COW/fork phase sequence when it occurs; fails on `VM_COW_FAIL`,
+`VM_MAP_ROLLBACK_FAIL`, `VM_UNMAP_ROLLBACK_FAIL`, `VM_COW_REFCOUNT_UNDERFLOW`,
+`VM_COW_WRITABLE_SHARED_ALIAS`, `VM_COW_CHILD_ASID_LEAK`, `PAGE_FAULT_UNHANDLED` /
+`PAGE_FAULT_FATAL` / `PAGE_FAULT_NOT_HANDLED`, `^!Fv`/`^!BNv`/`DOUBLE_FAULT`/
+`TRIPLE`/`PANIC`/`FATAL`, `CapabilityFull`, `TaskTableFull`. Handled COW/DEMAND
+faults are accepted. Mode isolation forces `VM_COW` off under proof/switch-a.
+Guarded by `stage172_vm_cow`.
+
+Acceptance (user QEMU): (1) `VM_COW=1` smoke; (2) `IPC_FINAL=1` oracle; (3)
+`D2_RECV_GENUINE=1`; (4) `D2_SEND_GENUINE=1`; (5) `SCHED_TIMEOUT=1`; (6) normal
+smoke; (7) `D6_SWITCH_A=1`; (8) 5-min `D6_SWITCH_PROOF=1`; (9) Stage 163P
+sender-wake oracle. **PENDING user QEMU acceptance.**
+
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
    `block_current_on_receive_with_deadline` call boundary ahead of
