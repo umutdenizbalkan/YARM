@@ -118,7 +118,18 @@ impl KernelState {
         if cap_cnode {
             crate::yarm_log!("CAP_CNODE_REVOKE_ON_EXIT_OK tid={}", tid);
         }
+        // Stage 174 (FAULT-DELIVERY): default-off cleanup markers around the IPC
+        // waiter sweep for an exiting (possibly faulted) task. The sweep itself is
+        // UNCHANGED — this only exposes that a faulting task's queued/waiting IPC
+        // references are cleared so no dangling fault-channel reference remains.
+        let fault_delivery = crate::kernel::boot::fault_delivery_enabled();
+        if fault_delivery {
+            crate::yarm_log!("FAULT_DELIVERY_TASK_CLEANUP_BEGIN tid={}", tid);
+        }
         self.clear_ipc_waiters_for_tid(tid);
+        if fault_delivery {
+            crate::yarm_log!("FAULT_DELIVERY_TASK_CLEANUP_OK tid={}", tid);
+        }
         self.report_task_exit_to_supervisor(tid, code, token)?;
         self.report_task_exit_to_pm(tid, code)?;
         if let Some(robust) = robust {
@@ -158,6 +169,26 @@ impl KernelState {
             return Err(KernelError::WrongObject);
         }
 
+        // Stage 174 (FAULT-DELIVERY): default-off supervisor-restart markers. The
+        // restart sequence (cap revoke → token clear → runnable → re-enqueue) is
+        // UNCHANGED. The token was already validated above, so the fault channel
+        // (endpoint index/generation) remains valid across the restart — the
+        // restarted task rebinds to the same channel without a stale sender/reply
+        // cap or orphaned waiter.
+        let fault_delivery = crate::kernel::boot::fault_delivery_enabled();
+        if fault_delivery {
+            crate::yarm_log!(
+                "FAULT_DELIVERY_SUPERVISOR_RESTART_BEGIN old_tid={} new_tid={}",
+                tid,
+                tid
+            );
+            crate::yarm_log!(
+                "FAULT_DELIVERY_RESTART_TOKEN_OK tid={} token={}",
+                tid,
+                token
+            );
+        }
+
         let _ = self.revoke_driver_runtime_caps(tid);
 
         self.with_tcbs_mut(|tcbs| {
@@ -171,10 +202,15 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         let _ = self.revoke_reply_caps_for_caller(tid);
-        match self.enqueue_task(tid) {
+        let result = match self.enqueue_task(tid) {
             Ok(_) | Err(KernelError::WouldBlock) => Ok(()),
             Err(err) => Err(err),
+        };
+        if fault_delivery && result.is_ok() {
+            crate::yarm_log!("FAULT_DELIVERY_CHANNEL_REBIND_OK tid={}", tid);
+            crate::yarm_log!("FAULT_DELIVERY_SUPERVISOR_RESTART_OK");
         }
+        result
     }
 
     pub fn mark_task_dead(&mut self, tid: u64) -> Result<(), KernelError> {

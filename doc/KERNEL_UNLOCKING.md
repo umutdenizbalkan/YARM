@@ -5494,8 +5494,139 @@ D6/D2 mode and is not auto-enabled by the IPC proof workloads). Guarded by
 Acceptance (user QEMU): (1) `CAP_CNODE=1` smoke (primary); (2) `VM_COW=1` smoke;
 (3) `IPC_FINAL=1` oracle; (4) `D2_RECV_GENUINE=1`; (5) `D2_SEND_GENUINE=1`; (6)
 `SCHED_TIMEOUT=1`; (7) normal smoke; (8) `D6_SWITCH_A=1`; (9) 5-min
-`D6_SWITCH_PROOF=1`; (10) Stage 163P sender-wake oracle. **PENDING user QEMU
-acceptance.**
+`D6_SWITCH_PROOF=1`; (10) Stage 163P sender-wake oracle.
+
+**ACCEPTED (user QEMU, 2026).** The primary `CAP_CNODE=1` run passed:
+`CAP_CNODE_ENABLED`, `CAP_CNODE_LOOKUP_OK`, `CAP_CNODE_RESERVE_OK`,
+`CAP_CNODE_MATERIALIZE_OK`, `CAP_CNODE_RELEASE_OK`, and `CAP_CNODE_INVARIANT_OK`
+present; the deterministic one-shot proof completed `CAP_CNODE_PROOF_DONE
+result=ok`; the stale lookup and the double-release were rejected; and none of the
+invariant-violation markers (`CAP_CNODE_REFCOUNT_UNDERFLOW`, `CAP_CNODE_SLOT_LEAK`,
+`CAP_CNODE_STALE_CAP_ACCEPTED`, `CAP_CNODE_RIGHTS_ESCALATION`,
+`CAP_CNODE_ROLLBACK_LEAK`) appeared. Stage 173 CAP-CNODE is **ACCEPTED** — it was
+instrumentation-only (the cap/CNode lifecycle was already transactional). The one
+follow-up was **Stage 173B**, a smoke-script false positive: the `D2_SEND_GENUINE=1`
+regression tripped on a generic `PAGE_FAULT` token emitted by the sender-wake
+workload's handled COW faults (`PAGE_FAULT_ENTRY … PAGE_FAULT_HANDLED_COW`, no
+`PAGE_FAULT_UNHANDLED`/`_FATAL`/`_NOT_HANDLED` and no crash breadcrumb). The
+`D2_SEND_GENUINE` fatal-after-send gate was narrowed to line-anchored crash
+breadcrumbs (`^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/`FATAL`) plus the
+explicit unhandled/fatal page-fault markers only — generic `PAGE_FAULT` is no
+longer a fatal token, matching the Stage 171B/VM-COW narrowing. No kernel/runtime
+change; all real `D2_SEND_GENUINE` gates (required marker set, committed send-path
+`DISPATCH_DEFERRED` + `NO_INLOCK_DISPATCH`, no in-lock `switch_required` fallback,
+the three Stage 163P sender-wake markers, `BLOCKED_WOULDBLOCK_FATAL`/`CapabilityFull`/
+`TaskTableFull`) are preserved. Stage 174 (FAULT-DELIVERY) is the next frontier.
+
+### 7.1.10 Stage 174 — FAULT-DELIVERY (kernel-fault → supervisor delivery + fault-channel lifecycle audit + diagnostics)
+
+**Next kernel-unlocking frontier after CAP-CNODE.** Audits and instruments the
+kernel-fault → supervisor delivery path and fault-channel lifecycle — fault
+classification, supervisor fault-endpoint routing, direct blocked-recv completion,
+queued delivery, faulting-task stop/cleanup, and supervisor restart/rebind — behind
+a default-off arch-neutral diagnostic profile (`yarm.fault_delivery=1`, script
+`FAULT_DELIVERY=1`, marker `FAULT_DELIVERY_ENABLED`). This is an audit +
+instrumentation + hardening-verification stage: the delivery path is ALREADY
+correct (handled faults never deliver; a blocked supervisor completes directly with
+no queued duplicate; an idle supervisor queues exactly one message consumed exactly
+once; kernel faults stay fatal), so **no fault/IPC runtime behavior changes** — the
+markers only expose the phase boundaries. This is **instrumentation only**; **no
+real bug** was found (the paths are pinned by pre-existing tests
+`page_fault_report_falls_back_to_supervisor_endpoint_when_no_fault_handler` and
+`kernel_fault_report_completes_blocked_supervisor_recv_v2_without_stranding_queue`).
+
+**Explicitly NOT done in Stage 174:** no syscall count change (SYSCALL_COUNT=31,
+Syscall::VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32); no fault-message ABI
+change (`SupervisorFaultReportWire` unchanged — the `decode` helper was merely
+un-gated from `#[cfg(test)]` for the proof's round-trip check); no D2/D6/IPC-FINAL
+behavior change; no VM/COW behavior change; no CNode/cap behavior change; no SMP
+fault-IPI broadening; no AArch64/RISC-V D6 switch unlock (the knob is arch-neutral
+diagnostics / no-op behavior); no RPi5 change.
+
+**Audit (Task B).** Paths audited and confirmed already correct — no bug fixed,
+diagnostics only:
+1. **Handled page fault** (`handle_trap` PageFault arm, fault_state.rs): only WRITE
+   faults route to COW; COW/demand handled faults emit `PAGE_FAULT_HANDLED_COW` /
+   `PAGE_FAULT_HANDLED_DEMAND` and `return Ok(())` BEFORE any supervisor delivery
+   (`FAULT_DELIVERY_CLASSIFY_HANDLED kind=cow|demand`). Not delivered.
+2. **Unhandled user fault** (`fault_current_task_with_fault` →
+   `emit_fault_report_for_fault`): classify user-unhandled, build the
+   `SupervisorFaultReportWire` (faulting tid/addr/access), route to
+   `fault_handler_endpoint` else `supervisor_endpoint`, deliver, then stop the task
+   per policy (`FaultPolicy::NotifyAndContinue` returns without stopping).
+3. **Kernel fault/fatal** (`handle_trap` Unknown arm): stays FATAL
+   (`FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL`), never reclassified as a
+   supervisor-deliverable user fault.
+4. **Supervisor already blocked** on the fault endpoint: `complete_blocked_recv_for_waiter`
+   completes the recv inline and clears the waiter — nothing is left queued
+   (`FAULT_DELIVERY_DIRECT_RECV_DONE`; a residual queued/​waiter count would emit
+   `FAULT_DELIVERY_DUPLICATE_MSG` / `FAULT_DELIVERY_ORPHANED_WAITER`).
+5. **Supervisor not blocked**: `send_message_to_endpoint_and_wake` queues exactly
+   one message (`FAULT_DELIVERY_QUEUE_OK`); a later recv consumes it exactly once.
+6. **Supervisor restart** (`restart_task`): the restart token is validated first, so
+   the fault channel (endpoint index/generation) stays valid across the restart; the
+   task rebinds to the same channel with no stale sender/reply cap or orphaned waiter
+   (`FAULT_DELIVERY_RESTART_TOKEN_OK` / `_CHANNEL_REBIND_OK` / `_SUPERVISOR_RESTART_OK`).
+7. **Exiting faulting task** (`exit_task`): `clear_ipc_waiters_for_tid` sweeps the
+   task's queued/waiting IPC references so no dangling fault-channel reference
+   remains (`FAULT_DELIVERY_TASK_CLEANUP_OK`).
+8. **Repeated fault from same task**: each unhandled fault enqueues one bounded
+   message into the fixed-depth endpoint queue (`QUEUE_FULL` on overflow — no
+   unbounded leak); duplicates are neither coalesced nor stranded (current policy:
+   one message per delivery, bounded by endpoint depth).
+
+**Lock/rank story.** Fault delivery routes through the endpoint/IPC domain (rank 3)
+and, for direct completion, the task domain (rank 2 < 3) — the same order as normal
+IPC send; capability materialization (rank 4) is only touched for reply/transfer
+caps, not fault reports. No lower-rank lock is taken while a higher-rank lock is
+held. The domain remains under the single global `SpinLock<KernelState>` (no
+relocation out of the global lock — a later stage).
+
+**Markers (Task C/D).** All default-off behind `fault_delivery_enabled()`:
+classification (`FAULT_DELIVERY_CLASSIFY_BEGIN`/`_HANDLED`/`_USER_UNHANDLED`/`_KERNEL_FATAL`),
+message build (`_MSG_BUILD_BEGIN`/`_OK`/`_FAIL`), endpoint lookup
+(`_ENDPOINT_LOOKUP_BEGIN`/`_OK`/`_FAIL`), direct recv (`_DIRECT_RECV_BEGIN`/`_WRITEBACK_OK`/`_DONE`),
+queue (`_QUEUE_BEGIN`/`_OK`/`_FULL`, `_DEQUEUE_BEGIN`/`_OK`), task state
+(`_TASK_STOP_BEGIN`/`_OK`, `_TASK_CLEANUP_BEGIN`/`_OK`), restart
+(`_SUPERVISOR_RESTART_BEGIN`/`_OK`, `_CHANNEL_REBIND_OK`, `_RESTART_TOKEN_OK`), and
+invariants (`_INVARIANT_OK`, `_STRANDED_QUEUE`, `_DUPLICATE_MSG`, `_ORPHANED_WAITER`,
+`_STALE_SUPERVISOR`, `_BAD_SENDER`, `_WRITEBACK_FAIL`, `_QUEUE_LEAK`).
+
+**Workload (Task E).** A default-off, deterministic, bounded **one-shot**
+fault-delivery proof (`maybe_run_fault_delivery_proof`) is hooked in the
+arch-neutral timer path and runs once when a real user task (tid != 0) with a CNode
+is current. It is **self-contained**: it creates a SCRATCH endpoint (never the real
+supervisor channel), classifies a synthetic user-unhandled fault, builds a real
+`SupervisorFaultReportWire`, queues exactly one message, dequeues it directly from
+the endpoint queue (`Endpoint::recv` — it never blocks or dispatches the live
+current task), verifies the report round-trips and the queue is empty
+(`FAULT_DELIVERY_INVARIANT_OK`), then tears down (revokes the scratch caps + frees
+the endpoint slot) — consuming no net slots and disturbing no real service. The live
+classify markers additionally fire naturally on the boot's handled COW faults; the
+direct-recv / task-stop / restart markers fire on the live path when a real
+supervisor fault occurs.
+
+**`FAULT_DELIVERY=1` acceptance profile (Task F/G).** Requires `FAULT_DELIVERY_ENABLED`,
+`FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED`, `FAULT_DELIVERY_MSG_BUILD_OK`, one of
+`FAULT_DELIVERY_DIRECT_RECV_DONE`/`FAULT_DELIVERY_DEQUEUE_OK`, and
+`FAULT_DELIVERY_INVARIANT_OK`; if a task-stop began it must complete
+(`_TASK_STOP_OK`). Fails hard on `FAULT_DELIVERY_STRANDED_QUEUE`,
+`_DUPLICATE_MSG`, `_ORPHANED_WAITER`, `_STALE_SUPERVISOR`, `_BAD_SENDER`,
+`_WRITEBACK_FAIL`, `_QUEUE_LEAK`, `CapabilityFull`, `TaskTableFull`,
+`BLOCKED_WOULDBLOCK_FATAL`, the fatal breadcrumbs
+(`^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/`FATAL`), `PAGE_FAULT_FATAL`/
+`PAGE_FAULT_NOT_HANDLED`, and a `PAGE_FAULT_UNHANDLED` that escaped WITHOUT a
+fault-delivery classification. A generic `PAGE_FAULT` is NOT fatal, and handled
+COW/DEMAND faults remain accepted (same as Stage 171B/173B). Mode isolation forces
+`FAULT_DELIVERY` off under `D6_SWITCH_PROOF` / `D6_SWITCH_A`; it is standalone (does
+not enable a D6/D2 mode and is not auto-enabled by the IPC proof workloads). Guarded
+by `stage174_fault_delivery`.
+
+Acceptance (user QEMU): (1) `FAULT_DELIVERY=1` smoke (primary); (2)
+`D2_SEND_GENUINE=1`; (3) `CAP_CNODE=1`; (4) `IPC_FINAL=1` oracle; (5) `VM_COW=1`;
+(6) `SCHED_TIMEOUT=1`; (7) `D2_RECV_GENUINE=1`; (8) normal smoke; (9)
+`D6_SWITCH_A=1`; (10) 5-min `D6_SWITCH_PROOF=1`; (11) Stage 163P sender-wake
+oracle. **PENDING user QEMU acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

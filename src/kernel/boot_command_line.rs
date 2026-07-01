@@ -221,6 +221,16 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("CAP_CNODE_ENABLED");
         }
     }
+    if let Some(enabled) = parsed.fault_delivery {
+        // Stage 174 (FAULT-DELIVERY): arch-neutral, default-off DIAGNOSTIC gate for
+        // the kernel-fault → supervisor delivery / fault-channel lifecycle markers +
+        // one-shot proof. Changes no fault/IPC behavior or ABI — only emits
+        // FAULT_DELIVERY_* markers.
+        crate::kernel::boot::set_fault_delivery_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("FAULT_DELIVERY_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -346,6 +356,10 @@ pub struct YarmBootOptions<'a> {
     /// capability/CNode phase-boundary DIAGNOSTIC markers + one-shot proof (no
     /// behavior/ABI change).
     pub cap_cnode: Option<bool>,
+    /// Stage 174 (FAULT-DELIVERY): `yarm.fault_delivery=1` gates the arch-neutral,
+    /// default-off kernel-fault → supervisor delivery / fault-channel lifecycle
+    /// DIAGNOSTIC markers + one-shot fault-delivery proof (no behavior/ABI change).
+    pub fault_delivery: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -452,6 +466,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.cap_cnode" {
             options.cap_cnode = parse_bool_knob(value);
+        }
+        if key == b"yarm.fault_delivery" {
+            options.fault_delivery = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

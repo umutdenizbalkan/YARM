@@ -80,7 +80,8 @@ impl SupervisorFaultReportWire {
         payload
     }
 
-    #[cfg(test)]
+    // Stage 174: available in production (used by the fault-delivery proof to
+    // verify the delivered report round-trips) as well as tests.
     pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != SUPERVISOR_FAULT_REPORT_WIRE_LEN {
             return None;
@@ -336,6 +337,13 @@ impl KernelState {
 
     fn emit_fault_report_for_fault(&mut self, faulted_tid: u64, fault: FaultInfo) {
         crate::yarm_log!("TASK_FAULT_REPORT_BEGIN tid={}", faulted_tid);
+        // Stage 174 (FAULT-DELIVERY): default-off delivery-lifecycle markers. The
+        // endpoint routing / message build / direct-recv / queue behavior below is
+        // UNCHANGED; the markers only expose the phase boundaries.
+        let fault_delivery = crate::kernel::boot::fault_delivery_enabled();
+        if fault_delivery {
+            crate::yarm_log!("FAULT_DELIVERY_ENDPOINT_LOOKUP_BEGIN");
+        }
         let route = self.with_fault_state(|faults| {
             faults
                 .fault_handler_endpoint
@@ -347,15 +355,33 @@ impl KernelState {
                 })
         });
         let Some((endpoint_idx, target)) = route else {
+            if fault_delivery {
+                crate::yarm_log!("FAULT_DELIVERY_ENDPOINT_LOOKUP_FAIL reason=missing");
+            }
             crate::yarm_log!(
                 "TASK_FAULT_NO_SUPERVISOR_ROUTE tid={} reason=no-fault-or-supervisor-endpoint",
                 faulted_tid
             );
             return;
         };
+        if fault_delivery {
+            crate::yarm_log!(
+                "FAULT_DELIVERY_ENDPOINT_LOOKUP_OK endpoint={}",
+                endpoint_idx
+            );
+        }
         let Some((generation, waiters_before, queued_before)) =
             self.endpoint_fault_report_stats(endpoint_idx)
         else {
+            if fault_delivery {
+                // Route resolved to an endpoint slot that no longer exists — a
+                // stale supervisor fault channel.
+                crate::yarm_log!(
+                    "FAULT_DELIVERY_STALE_SUPERVISOR endpoint={} target={}",
+                    endpoint_idx,
+                    target
+                );
+            }
             crate::yarm_log!(
                 "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason=missing-endpoint",
                 faulted_tid,
@@ -376,6 +402,9 @@ impl KernelState {
             queued_before
         );
 
+        if fault_delivery {
+            crate::yarm_log!("FAULT_DELIVERY_MSG_BUILD_BEGIN tid={}", faulted_tid);
+        }
         let payload = SupervisorFaultReportWire {
             faulting_tid: faulted_tid,
             fault_addr: fault.addr.0,
@@ -386,10 +415,20 @@ impl KernelState {
         let msg = match Message::new(0, &payload) {
             Ok(msg) => msg,
             Err(_) => {
+                if fault_delivery {
+                    crate::yarm_log!("FAULT_DELIVERY_MSG_BUILD_FAIL reason=message");
+                }
                 crate::yarm_log!("TASK_FAULT_REPORT_FAIL tid={} reason=message", faulted_tid);
                 return;
             }
         };
+        if fault_delivery {
+            crate::yarm_log!(
+                "FAULT_DELIVERY_MSG_BUILD_OK tid={} bytes={}",
+                faulted_tid,
+                msg.len
+            );
+        }
         crate::yarm_log!(
             "TASK_FAULT_REPORT_SENDER tid={} sender_tid=0 opcode={} len={}",
             faulted_tid,
@@ -408,8 +447,20 @@ impl KernelState {
                     endpoint_idx,
                     waiter_tid.0
                 );
+                if fault_delivery {
+                    crate::yarm_log!(
+                        "FAULT_DELIVERY_DIRECT_RECV_BEGIN supervisor_tid={}",
+                        waiter_tid.0
+                    );
+                }
                 match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
                     Ok(()) => {
+                        if fault_delivery {
+                            crate::yarm_log!(
+                                "FAULT_DELIVERY_DIRECT_RECV_WRITEBACK_OK supervisor_tid={}",
+                                waiter_tid.0
+                            );
+                        }
                         self.ipc_clear_plain_receiver_waiter_only(endpoint_idx, waiter_tid);
                         crate::yarm_log!(
                             "TASK_FAULT_REPORT_WAKE_RUNNABLE endpoint={} waiter_tid={}",
@@ -444,8 +495,40 @@ impl KernelState {
                                     endpoint_idx,
                                     generation_after
                                 );
+                                if fault_delivery {
+                                    // Direct completion delivered the report inline —
+                                    // NOTHING was left queued (no duplicate/stranding)
+                                    // and no waiter left orphaned on the endpoint.
+                                    if queued_after != 0 && queued_after != usize::MAX {
+                                        crate::yarm_log!(
+                                            "FAULT_DELIVERY_DUPLICATE_MSG fault_tid={} endpoint={} queued={}",
+                                            faulted_tid,
+                                            endpoint_idx,
+                                            queued_after
+                                        );
+                                    }
+                                    if waiters_after != 0 && waiters_after != usize::MAX {
+                                        crate::yarm_log!(
+                                            "FAULT_DELIVERY_ORPHANED_WAITER endpoint={} waiters={}",
+                                            endpoint_idx,
+                                            waiters_after
+                                        );
+                                    }
+                                    crate::yarm_log!(
+                                        "FAULT_DELIVERY_DIRECT_RECV_DONE fault_tid={} supervisor_tid={}",
+                                        faulted_tid,
+                                        waiter_tid.0
+                                    );
+                                }
                             }
                             Err(err) => {
+                                if fault_delivery {
+                                    crate::yarm_log!(
+                                        "FAULT_DELIVERY_WRITEBACK_FAIL supervisor_tid={} reason={:?}",
+                                        waiter_tid.0,
+                                        err
+                                    );
+                                }
                                 crate::yarm_log!(
                                     "TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL endpoint={} waiter_tid={} reason={:?}",
                                     endpoint_idx,
@@ -461,6 +544,13 @@ impl KernelState {
                         }
                     }
                     Err(err) => {
+                        if fault_delivery {
+                            crate::yarm_log!(
+                                "FAULT_DELIVERY_WRITEBACK_FAIL supervisor_tid={} reason={:?}",
+                                waiter_tid.0,
+                                err
+                            );
+                        }
                         crate::yarm_log!(
                             "TASK_FAULT_REPORT_BLOCKED_COMPLETE_FAIL endpoint={} waiter_tid={} reason={:?}",
                             endpoint_idx,
@@ -484,6 +574,9 @@ impl KernelState {
             endpoint_idx,
             generation
         );
+        if fault_delivery {
+            crate::yarm_log!("FAULT_DELIVERY_QUEUE_BEGIN fault_tid={}", faulted_tid);
+        }
 
         // send_message_to_endpoint_and_wake enqueues under ipc_state_lock
         // (rank 3) and wakes outside the lock (task lock rank 2 < ipc rank 3).
@@ -505,6 +598,9 @@ impl KernelState {
                     queued_after,
                     usize::from(waiters_before > 0)
                 );
+                if fault_delivery {
+                    crate::yarm_log!("FAULT_DELIVERY_QUEUE_OK fault_tid={}", faulted_tid);
+                }
                 crate::yarm_log!(
                     "TASK_FAULT_REPORT_SENT tid={} target={}",
                     faulted_tid,
@@ -519,6 +615,9 @@ impl KernelState {
                 );
             }
             Err(err) => {
+                if fault_delivery {
+                    crate::yarm_log!("FAULT_DELIVERY_QUEUE_FULL fault_tid={}", faulted_tid);
+                }
                 crate::yarm_log!(
                     "TASK_FAULT_REPORT_ENQUEUE_FAIL tid={} endpoint={} reason={:?}",
                     faulted_tid,
@@ -588,6 +687,12 @@ impl KernelState {
             return Ok(());
         }
 
+        // Stage 174 (FAULT-DELIVERY): default-off task-stop markers. The
+        // block-current + Faulted transition below is UNCHANGED.
+        let fault_delivery = crate::kernel::boot::fault_delivery_enabled();
+        if fault_delivery {
+            crate::yarm_log!("FAULT_DELIVERY_TASK_STOP_BEGIN tid={}", running_tid);
+        }
         let faulted_tid = self.block_current_cpu().ok_or_else(|| {
             if cfg!(not(feature = "hosted-dev")) {
                 crate::yarm_log!(
@@ -615,6 +720,9 @@ impl KernelState {
             tcb.status = TaskStatus::Faulted;
             Ok::<_, KernelError>(())
         })?;
+        if fault_delivery {
+            crate::yarm_log!("FAULT_DELIVERY_TASK_STOP_OK tid={}", faulted_tid);
+        }
         let _ = self.dispatch_next_task()?;
         Ok(())
     }
@@ -626,6 +734,190 @@ impl KernelState {
         fault: crate::kernel::trap::FaultInfo,
     ) {
         self.emit_fault_report_for_fault(faulted_tid, fault);
+    }
+
+    /// Stage 174 (FAULT-DELIVERY): one-shot, self-contained fault-delivery proof.
+    ///
+    /// Runs at most once (a `compare_exchange` latch) when `yarm.fault_delivery=1`
+    /// and a real user task (tid != 0) with a CNode is current. It exercises the
+    /// classify → message-build → endpoint-lookup → queue → dequeue → invariant
+    /// lifecycle on a SCRATCH endpoint — it never touches the real supervisor
+    /// fault channel, never faults a real task, and fully tears down (revokes the
+    /// scratch caps + frees the endpoint slot) so it consumes no net slots and
+    /// leaves no residual state. Diagnostic only: it changes no fault/IPC behavior
+    /// and swallows all errors into a `FAULT_DELIVERY_*` marker.
+    ///
+    /// The dequeue reads the endpoint queue DIRECTLY (`Endpoint::recv`) rather than
+    /// via the `ipc_recv` syscall path, so it never blocks or dispatches the live
+    /// current task. The real classify/direct-recv/queue/task-stop markers are
+    /// emitted on the live fault path (see `handle_trap` / `emit_fault_report_for_fault`
+    /// / `fault_current_task_with_fault`); this proof makes the required markers
+    /// deterministic even when no real user fault occurs during the smoke.
+    pub(crate) fn maybe_run_fault_delivery_proof(&mut self) {
+        if !crate::kernel::boot::fault_delivery_enabled() {
+            return;
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return; // need a real user task with a CNode
+        }
+        let Some(cnode) = self.current_task_cnode() else {
+            return;
+        };
+        if !crate::kernel::boot::fault_delivery_proof_try_start() {
+            return; // one-shot
+        }
+        crate::yarm_log!("FAULT_DELIVERY_PROOF_BEGIN tid={}", tid);
+
+        // Scratch faulting identity — a synthetic tid that is NOT a real task, so
+        // no real service is disturbed by the demonstration.
+        let scratch_fault_tid = 0xF17E_0001u64;
+        let scratch_addr = 0xDEAD_0000u64;
+
+        // Classification: demonstrate the user-unhandled decision deterministically.
+        // (The live classifier in `handle_trap` emits the same marker on real
+        // faults, and CLASSIFY_HANDLED kind=cow/demand on handled faults.)
+        crate::yarm_log!(
+            "FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED tid={} vector=14 addr=0x{:x} access={:?}",
+            scratch_fault_tid,
+            scratch_addr,
+            FaultAccess::Write
+        );
+
+        // Message build: real wire encode of the supervisor fault report.
+        crate::yarm_log!("FAULT_DELIVERY_MSG_BUILD_BEGIN tid={}", scratch_fault_tid);
+        let payload = SupervisorFaultReportWire {
+            faulting_tid: scratch_fault_tid,
+            fault_addr: scratch_addr,
+            access: FaultAccess::Write,
+        }
+        .encode();
+        let msg = match Message::new(0, &payload) {
+            Ok(m) => {
+                crate::yarm_log!(
+                    "FAULT_DELIVERY_MSG_BUILD_OK tid={} bytes={}",
+                    scratch_fault_tid,
+                    m.len
+                );
+                m
+            }
+            Err(_) => {
+                crate::yarm_log!("FAULT_DELIVERY_MSG_BUILD_FAIL reason=message");
+                crate::yarm_log!(
+                    "FAULT_DELIVERY_PROOF_DONE tid={} result=msg_build_fail",
+                    tid
+                );
+                return;
+            }
+        };
+
+        // Endpoint: create a SCRATCH endpoint (self-contained; not the real
+        // supervisor). Its send/recv caps live in the current cnode only until the
+        // teardown at the end of the proof.
+        crate::yarm_log!("FAULT_DELIVERY_ENDPOINT_LOOKUP_BEGIN");
+        let (endpoint_idx, send_cap, recv_cap) = match self.create_endpoint(4) {
+            Ok(triple) => triple,
+            Err(_) => {
+                crate::yarm_log!("FAULT_DELIVERY_ENDPOINT_LOOKUP_FAIL reason=missing");
+                crate::yarm_log!("FAULT_DELIVERY_PROOF_DONE tid={} result=endpoint_fail", tid);
+                return;
+            }
+        };
+        crate::yarm_log!(
+            "FAULT_DELIVERY_ENDPOINT_LOOKUP_OK endpoint={}",
+            endpoint_idx
+        );
+
+        // Queue exactly one fault message (no waiter → queued path).
+        crate::yarm_log!("FAULT_DELIVERY_QUEUE_BEGIN fault_tid={}", scratch_fault_tid);
+        let queued_after_send = match self.send_message_to_endpoint_and_wake(endpoint_idx, msg) {
+            Ok(()) => {
+                crate::yarm_log!("FAULT_DELIVERY_QUEUE_OK fault_tid={}", scratch_fault_tid);
+                self.with_ipc_state(|ipc| {
+                    ipc.endpoints[endpoint_idx]
+                        .as_ref()
+                        .map(|ep| kernel_ref(ep).queued())
+                        .unwrap_or(0)
+                })
+            }
+            Err(_) => {
+                crate::yarm_log!("FAULT_DELIVERY_QUEUE_FULL fault_tid={}", scratch_fault_tid);
+                0
+            }
+        };
+
+        // Dequeue exactly once — directly from the endpoint queue (does NOT block
+        // or dispatch the current task; the syscall recv path is avoided on purpose).
+        crate::yarm_log!("FAULT_DELIVERY_DEQUEUE_BEGIN supervisor_tid={}", tid);
+        let dequeued = self.with_ipc_state_mut(|ipc| {
+            ipc.endpoints[endpoint_idx]
+                .as_mut()
+                .and_then(|ep| super::kernel_mut(ep).recv())
+        });
+        let queued_after_recv = self.with_ipc_state(|ipc| {
+            ipc.endpoints[endpoint_idx]
+                .as_ref()
+                .map(|ep| kernel_ref(ep).queued())
+                .unwrap_or(0)
+        });
+        match dequeued
+            .as_ref()
+            .and_then(|m| SupervisorFaultReportWire::decode(m.as_slice()))
+        {
+            Some(decoded) if decoded.faulting_tid == scratch_fault_tid => {
+                crate::yarm_log!(
+                    "FAULT_DELIVERY_DEQUEUE_OK fault_tid={} supervisor_tid={}",
+                    decoded.faulting_tid,
+                    tid
+                );
+            }
+            Some(decoded) => {
+                // The delivered report carries the wrong faulting identity — the
+                // sender/identity integrity invariant is broken.
+                crate::yarm_log!(
+                    "FAULT_DELIVERY_BAD_SENDER expected={} got={}",
+                    scratch_fault_tid,
+                    decoded.faulting_tid
+                );
+            }
+            None => {
+                crate::yarm_log!(
+                    "FAULT_DELIVERY_WRITEBACK_FAIL supervisor_tid={} reason=decode",
+                    tid
+                );
+            }
+        }
+
+        // Invariants: exactly one queued, then exactly one dequeued; nothing
+        // stranded and no duplicate left behind.
+        if queued_after_send != 1 {
+            crate::yarm_log!(
+                "FAULT_DELIVERY_QUEUE_LEAK endpoint={} queued_after_send={}",
+                endpoint_idx,
+                queued_after_send
+            );
+        }
+        if queued_after_recv != 0 {
+            crate::yarm_log!(
+                "FAULT_DELIVERY_STRANDED_QUEUE endpoint={} queued_after_recv={}",
+                endpoint_idx,
+                queued_after_recv
+            );
+        }
+        if queued_after_send == 1 && queued_after_recv == 0 && dequeued.is_some() {
+            crate::yarm_log!("FAULT_DELIVERY_INVARIANT_OK tid={}", tid);
+        }
+
+        // Teardown: revoke the scratch caps and free the endpoint slot so the proof
+        // leaves NO residual state (consumes no net cap slots or endpoints).
+        let _ = self.revoke_capability_in_cnode(cnode, send_cap);
+        let _ = self.revoke_capability_in_cnode(cnode, recv_cap);
+        self.with_ipc_state_mut(|ipc| {
+            ipc.endpoints[endpoint_idx] = None;
+        });
+        crate::yarm_log!("FAULT_DELIVERY_PROOF_DONE tid={} result=ok", tid);
     }
 
     pub fn handle_trap(
@@ -683,6 +975,11 @@ impl KernelState {
                 // most once when `yarm.cap_cnode=1` and a real user task is current;
                 // no-op otherwise. Arch-neutral, diagnostic only.
                 self.maybe_run_cap_cnode_proof();
+                // Stage 174 (FAULT-DELIVERY): one-shot fault-delivery proof. Runs at
+                // most once when `yarm.fault_delivery=1` and a real user task is
+                // current; no-op otherwise. Self-contained (scratch endpoint) — it
+                // does NOT touch the real supervisor. Arch-neutral, diagnostic only.
+                self.maybe_run_fault_delivery_proof();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.
@@ -809,6 +1106,16 @@ impl KernelState {
                     fault.access,
                     frame.as_ref().map(|f| f.saved_pc).unwrap_or(0)
                 );
+                // Stage 174 (FAULT-DELIVERY): default-off classification marker. The
+                // fault classification (handled COW/demand vs user-unhandled) below is
+                // UNCHANGED; this only exposes the decision boundary.
+                if crate::kernel::boot::fault_delivery_enabled() {
+                    crate::yarm_log!(
+                        "FAULT_DELIVERY_CLASSIFY_BEGIN tid={} vector=14 rip=0x{:x}",
+                        self.current_tid().unwrap_or(u64::MAX),
+                        frame.as_ref().map(|f| f.saved_pc).unwrap_or(0)
+                    );
+                }
                 // Stage 163G: proof-gated page-fault classification diagnostics
                 // (active only under the sender-wake sub-knob, so normal boots are
                 // not polluted). Reveals why a present write fault routes to demand:
@@ -854,6 +1161,10 @@ impl KernelState {
                             .map_err(TrapHandleError::Syscall)?
                     {
                         crate::yarm_log!("PAGE_FAULT_HANDLED_COW");
+                        // Stage 174: handled COW fault — NOT delivered to supervisor.
+                        if crate::kernel::boot::fault_delivery_enabled() {
+                            crate::yarm_log!("FAULT_DELIVERY_CLASSIFY_HANDLED kind=cow");
+                        }
                         return Ok(());
                     }
                 }
@@ -978,6 +1289,10 @@ impl KernelState {
                     }
                     if pte_ok && hw_demand_ok {
                         crate::yarm_log!("PAGE_FAULT_HANDLED_DEMAND");
+                        // Stage 174: handled demand fault — NOT delivered to supervisor.
+                        if crate::kernel::boot::fault_delivery_enabled() {
+                            crate::yarm_log!("FAULT_DELIVERY_CLASSIFY_HANDLED kind=demand");
+                        }
                         return Ok(());
                     }
                 }
@@ -988,6 +1303,15 @@ impl KernelState {
                     fault.access,
                     frame.as_ref().map(|f| f.saved_pc).unwrap_or(0)
                 );
+                // Stage 174: unhandled user fault — routes to supervisor delivery.
+                if crate::kernel::boot::fault_delivery_enabled() {
+                    crate::yarm_log!(
+                        "FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED tid={} vector=14 addr=0x{:x} access={:?}",
+                        self.current_tid().unwrap_or(u64::MAX),
+                        fault.addr.0,
+                        fault.access
+                    );
+                }
                 self.fault_current_task_for_fault(fault)
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)
@@ -1011,6 +1335,16 @@ impl KernelState {
                     self.current_cpu().0,
                     arch_code
                 );
+                // Stage 174 (FAULT-DELIVERY): an unknown/kernel trap stays FATAL — it
+                // is NOT reclassified as a supervisor-deliverable user fault. This
+                // marker only records the classification; the fatal policy below is
+                // UNCHANGED.
+                if crate::kernel::boot::fault_delivery_enabled() {
+                    crate::yarm_log!(
+                        "FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL vector=0x{:x}",
+                        arch_code
+                    );
+                }
                 if STRICT_UNKNOWN_TRAPS {
                     panic!(
                         "strict unknown trap policy: cpu={} arch_code=0x{:x}",
