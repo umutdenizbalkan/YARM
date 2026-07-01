@@ -679,6 +679,10 @@ impl KernelState {
                     .process_ipc_timeout_deadlines(_tick.0)
                     .map_err(SyscallError::from)
                     .map_err(TrapHandleError::Syscall)?;
+                // Stage 173 (CAP-CNODE): one-shot cap/CNode lifecycle proof. Runs at
+                // most once when `yarm.cap_cnode=1` and a real user task is current;
+                // no-op otherwise. Arch-neutral, diagnostic only.
+                self.maybe_run_cap_cnode_proof();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

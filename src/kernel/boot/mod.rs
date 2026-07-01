@@ -984,6 +984,42 @@ pub(crate) fn vm_cow_enabled() -> bool {
     VM_COW_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 173 (CAP-CNODE): arch-neutral, default-off DIAGNOSTIC gate for the
+/// capability/CNode phase-boundary markers + a one-shot self-contained proof.
+/// When OFF (default) the cap/CNode paths run byte-identically and emit none of
+/// the `CAP_CNODE_*` markers. When ON, the reply-cap consume and cap-transfer
+/// production paths emit phase markers, and a bounded one-shot proof
+/// (`maybe_run_cap_cnode_proof`) deterministically exercises reserve →
+/// materialize → lookup → release → stale-lookup-rejected → double-release-
+/// rejected → invariant-check. It changes NO cap/CNode behavior and no ABI.
+/// VALIDATION: CAP_CNODE_ENABLED.
+pub(crate) static CAP_CNODE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 173: one-shot latch so the cap/CNode proof runs exactly once.
+pub(crate) static CAP_CNODE_PROOF_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_cap_cnode_enabled(enabled: bool) {
+    CAP_CNODE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn cap_cnode_enabled() -> bool {
+    CAP_CNODE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 173: try to claim the one-shot cap/CNode proof (true exactly once).
+pub(crate) fn cap_cnode_proof_try_start() -> bool {
+    CAP_CNODE_PROOF_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

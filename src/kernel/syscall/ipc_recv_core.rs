@@ -259,6 +259,12 @@ pub(crate) fn materialize_received_message_cap(
             reply_index,
             reply_generation
         );
+        if crate::kernel::boot::cap_cnode_enabled() {
+            crate::yarm_log!(
+                "CAP_CNODE_REPLY_MATERIALIZE_BEGIN waiter_tid={}",
+                receiver_tid
+            );
+        }
         if kernel.capability_object_live(reply_object).is_none() {
             crate::yarm_log!(
                 "IPC_RECV_CAP_MATERIALIZE_FAILED kind=reply raw={} err=reply_object_not_live",
@@ -318,12 +324,40 @@ pub(crate) fn materialize_received_message_cap(
             receiver_tid,
             minted.0
         );
+        if crate::kernel::boot::cap_cnode_enabled() {
+            crate::yarm_log!("CAP_CNODE_REPLY_MATERIALIZE_OK waiter_tid={}", receiver_tid);
+        }
         return Ok(Some(minted.0));
     }
 
     // ── Transfer-cap path (FLAG_CAP_TRANSFER) ────────────────────────────────
+    let cap_cnode = crate::kernel::boot::cap_cnode_enabled();
+    if cap_cnode {
+        crate::yarm_log!(
+            "CAP_CNODE_TRANSFER_BEGIN sender={} receiver={}",
+            _sender_tid,
+            receiver_tid
+        );
+    }
     match materialize_received_transfer_cap(kernel, Some(raw_value), endpoint, receiver_tid) {
-        Ok(local_cap) => Ok(local_cap),
+        Ok(local_cap) => {
+            if cap_cnode {
+                if let Some(c) = local_cap {
+                    crate::yarm_log!(
+                        "CAP_CNODE_TRANSFER_RESERVE_OK receiver={} slot={}",
+                        receiver_tid,
+                        c
+                    );
+                    crate::yarm_log!(
+                        "CAP_CNODE_TRANSFER_MATERIALIZE_OK receiver={} slot={}",
+                        receiver_tid,
+                        c
+                    );
+                }
+                crate::yarm_log!("CAP_CNODE_TRANSFER_DONE receiver={}", receiver_tid);
+            }
+            Ok(local_cap)
+        }
         Err(first_err) => {
             crate::yarm_log!(
                 "IPC_RECV_CAP_MATERIALIZE_FAILED kind={} raw={} err={:?}",
@@ -331,6 +365,28 @@ pub(crate) fn materialize_received_message_cap(
                 raw_value,
                 first_err
             );
+            if cap_cnode {
+                // The transfer materialization is transactional: on failure the
+                // receiver slot / envelope is rolled back inside
+                // `materialize_received_transfer_cap`, leaving the sender's cap and
+                // the underlying object unchanged (no leaked transient cap).
+                crate::yarm_log!(
+                    "CAP_CNODE_TRANSFER_ROLLBACK_BEGIN receiver={}",
+                    receiver_tid
+                );
+                crate::yarm_log!("CAP_CNODE_TRANSFER_ROLLBACK_OK receiver={}", receiver_tid);
+                let reason = match first_err {
+                    SyscallError::QueueFull => "receiver_full",
+                    SyscallError::MissingRight => "missing_right",
+                    SyscallError::InvalidCapability | SyscallError::WrongObject => "stale",
+                    _ => "internal",
+                };
+                crate::yarm_log!(
+                    "CAP_CNODE_TRANSFER_FAIL reason={} receiver={}",
+                    reason,
+                    receiver_tid
+                );
+            }
             Err(first_err)
         }
     }

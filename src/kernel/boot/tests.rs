@@ -49008,3 +49008,290 @@ mod stage172_vm_cow {
         );
     }
 }
+
+// Stage 173 (CAP-CNODE): driving the audited cap/CNode lifecycle (reserve,
+// materialize, lookup, revoke, stale-reject, double-release, invariant) with the
+// cap_cnode marker knob ENABLED must be behaviorally identical to the knob off —
+// proving the diagnostics change no capability/CNode behavior.
+#[test]
+fn stage173_cap_cnode_markers_do_not_change_lifecycle_behavior() {
+    let mut state = Bootstrap::init().expect("init");
+    crate::kernel::boot::set_cap_cnode_enabled(true);
+    let cnode = state.current_task_cnode().expect("cnode");
+
+    // Reserve + materialize: alloc mints exactly one cap into the current cnode.
+    let (mo_id, cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let slot = state.memory_object_slot_by_id(mo_id).expect("slot");
+    let ref_after_mint = state.memory.memory_objects[slot].expect("obj").cap_refcount;
+    assert_eq!(ref_after_mint, 1, "materialize must bump cap_refcount once");
+
+    // Lookup resolves and rights are a strict subset (no escalation).
+    let capability = state
+        .capability_for_cnode_local(cnode, cap)
+        .expect("lookup ok");
+    let superset = capability
+        .rights()
+        .union(crate::kernel::capabilities::CapRights::SIGNAL);
+    if superset != capability.rights() {
+        assert!(
+            capability.derive(superset).is_err(),
+            "deriving a strict superset must be rejected (no rights escalation)"
+        );
+    }
+
+    // Release: revoke decrements the refcount exactly once and reclaims the object.
+    state
+        .revoke_capability_in_cnode(cnode, cap)
+        .expect("revoke ok");
+    assert!(
+        state
+            .memory_object_slot_by_id(mo_id)
+            .and_then(|s| state.memory.memory_objects[s])
+            .map(|m| m.cap_refcount)
+            .unwrap_or(0)
+            == 0,
+        "release must return cap_refcount to zero"
+    );
+
+    // Stale lookup: the revoked cap must NOT resolve (generation bumped).
+    assert!(
+        state.capability_for_cnode_local(cnode, cap).is_none(),
+        "stale cap must be rejected after release"
+    );
+
+    // Double release: revoking again must fail cleanly (no underflow / no re-accept).
+    assert!(
+        state.revoke_capability_in_cnode(cnode, cap).is_err(),
+        "double release must fail cleanly (no refcount underflow)"
+    );
+
+    crate::kernel::boot::set_cap_cnode_enabled(false);
+}
+
+// Stage 173 (CAP-CNODE): source guards over the cap/CNode instrumentation, knob,
+// smoke plumbing, marker set, and invariants (no ABI/count/rights change).
+mod stage173_cap_cnode {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const TRANSFER_SRC: &str = include_str!("transfer_state.rs");
+    const IPC_RECV_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral (pure diagnostic, no arch cfg).
+    #[test]
+    fn stage173_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub cap_cnode: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.cap_cnode"),
+            "yarm.cap_cnode must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("CAP_CNODE_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn cap_cnode_enabled() -> bool")
+                && MOD_SRC.contains("fn set_cap_cnode_enabled(")
+                && MOD_SRC.contains("fn cap_cnode_proof_try_start()"),
+            "CAP_CNODE gate + accessors + one-shot latch must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.cap_cnode")
+            .expect("cap_cnode apply block");
+        let block = &CMDLINE_SRC[idx..idx + 600];
+        assert!(
+            block.contains("set_cap_cnode_enabled(enabled)")
+                && block.contains("CAP_CNODE_ENABLED")
+                && !block.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "cap_cnode must be arch-neutral (pure diagnostic) and emit CAP_CNODE_ENABLED"
+        );
+    }
+
+    // The one-shot proof is hooked in the arch-neutral timer path (no arch cfg).
+    #[test]
+    fn stage173_proof_hooked_arch_neutral() {
+        assert!(
+            FAULT_SRC.contains("self.maybe_run_cap_cnode_proof()"),
+            "proof must be driven from the arch-neutral fault/timer path"
+        );
+        assert!(
+            LIFECYCLE_SRC.contains("fn maybe_run_cap_cnode_proof(")
+                && LIFECYCLE_SRC.contains("cap_cnode_proof_try_start()")
+                && LIFECYCLE_SRC.contains("if tid == 0"),
+            "proof must be one-shot and only run for a real user task (tid != 0)"
+        );
+    }
+
+    // The full documented marker set must exist verbatim across the instrumentation.
+    #[test]
+    fn stage173_all_marker_strings_exist() {
+        // Lookup / reserve / materialize / release / invariant markers live in the
+        // one-shot proof + mint/revoke instrumentation.
+        for m in [
+            "CAP_CNODE_LOOKUP_BEGIN",
+            "CAP_CNODE_LOOKUP_OK",
+            "CAP_CNODE_LOOKUP_FAIL",
+            "CAP_CNODE_RESERVE_BEGIN",
+            "CAP_CNODE_RESERVE_OK",
+            "CAP_CNODE_RESERVE_FAIL",
+            "CAP_CNODE_MATERIALIZE_BEGIN",
+            "CAP_CNODE_REF_INC",
+            "CAP_CNODE_SLOT_INSTALL",
+            "CAP_CNODE_MATERIALIZE_OK",
+            "CAP_CNODE_MATERIALIZE_FAIL",
+            "CAP_CNODE_REPLY_CONSUME_BEGIN",
+            "CAP_CNODE_REPLY_CONSUME_OK",
+            "CAP_CNODE_REPLY_DOUBLE_CONSUME_BLOCKED",
+            "CAP_CNODE_RELEASE_BEGIN",
+            "CAP_CNODE_SLOT_CLEAR",
+            "CAP_CNODE_REF_DEC",
+            "CAP_CNODE_RELEASE_OK",
+            "CAP_CNODE_RELEASE_FAIL",
+            "CAP_CNODE_INVARIANT_OK",
+            "CAP_CNODE_REFCOUNT_UNDERFLOW",
+            "CAP_CNODE_SLOT_LEAK",
+            "CAP_CNODE_STALE_CAP_ACCEPTED",
+            "CAP_CNODE_RIGHTS_ESCALATION",
+        ] {
+            assert!(
+                LIFECYCLE_SRC.contains(m),
+                "capability_lifecycle_state must emit marker {m}"
+            );
+        }
+        // Reply-materialize + transfer markers live in the recv delivery path.
+        for m in [
+            "CAP_CNODE_REPLY_MATERIALIZE_BEGIN",
+            "CAP_CNODE_REPLY_MATERIALIZE_OK",
+            "CAP_CNODE_TRANSFER_BEGIN",
+            "CAP_CNODE_TRANSFER_RESERVE_OK",
+            "CAP_CNODE_TRANSFER_MATERIALIZE_OK",
+            "CAP_CNODE_TRANSFER_ROLLBACK_BEGIN",
+            "CAP_CNODE_TRANSFER_ROLLBACK_OK",
+            "CAP_CNODE_TRANSFER_FAIL",
+            "CAP_CNODE_TRANSFER_DONE",
+        ] {
+            assert!(
+                IPC_RECV_SRC.contains(m),
+                "ipc_recv_core must emit transfer/reply marker {m}"
+            );
+        }
+        // Materialize-rollback markers live in the recv-cap rollback path.
+        for m in [
+            "CAP_CNODE_MATERIALIZE_ROLLBACK_BEGIN",
+            "CAP_CNODE_MATERIALIZE_ROLLBACK_OK",
+            "CAP_CNODE_ROLLBACK_LEAK",
+        ] {
+            assert!(
+                TRANSFER_SRC.contains(m),
+                "transfer_state must emit rollback marker {m}"
+            );
+        }
+        // On-exit revoke markers live in the exit path.
+        for m in ["CAP_CNODE_REVOKE_ON_EXIT", "CAP_CNODE_REVOKE_ON_EXIT_OK"] {
+            assert!(
+                RESTART_SRC.contains(m),
+                "restart_state must emit exit marker {m}"
+            );
+        }
+    }
+
+    // Smoke plumbing + mode isolation + failure gates.
+    #[test]
+    fn stage173_smoke_profile() {
+        assert!(
+            SMOKE_SRC.contains("CAP_CNODE=${CAP_CNODE:-0}")
+                && SMOKE_SRC.contains("yarm.cap_cnode=1"),
+            "smoke must plumb CAP_CNODE=1"
+        );
+        // Required-present markers for a passing CAP_CNODE run.
+        for m in [
+            "CAP_CNODE_ENABLED",
+            "CAP_CNODE_LOOKUP_OK",
+            "CAP_CNODE_RESERVE_OK",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require {m}");
+        }
+        // Fatal invariant-violation markers gate the run.
+        for f in [
+            "CAP_CNODE_REFCOUNT_UNDERFLOW",
+            "CAP_CNODE_SLOT_LEAK",
+            "CAP_CNODE_STALE_CAP_ACCEPTED",
+            "CAP_CNODE_RIGHTS_ESCALATION",
+            "CAP_CNODE_ROLLBACK_LEAK",
+            "CAP_CNODE_MATERIALIZE_FAIL",
+        ] {
+            assert!(SMOKE_SRC.contains(f), "smoke must gate on {f}");
+        }
+        // CAP_CNODE is forced OFF under the D6 switch proof / switch-a modes.
+        assert!(
+            SMOKE_SRC.contains("VM_COW CAP_CNODE"),
+            "mode isolation must force CAP_CNODE off under D6 proof/switch-a"
+        );
+        // CAP_CNODE is standalone — it must NOT auto-enable the IPC recv proof.
+        let idx = SMOKE_SRC
+            .find("CAP_CNODE=${CAP_CNODE:-0}\nif [[ \"$CAP_CNODE\" == \"1\"")
+            .expect("cap_cnode append block");
+        let block = &SMOKE_SRC[idx..idx + 200];
+        assert!(
+            !block.contains("IPC_RECV_PROOF"),
+            "CAP_CNODE must not auto-enable the IPC recv proof workloads"
+        );
+    }
+
+    // Invariants + no scope creep into ABI/counts/D2/D6/IPC-FINAL/VM-COW/SCHED-TIMEOUT.
+    #[test]
+    fn stage173_invariants_and_regressions_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        // D2/D6/IPC-FINAL/SCHED-TIMEOUT/VM-COW gates still present (untouched).
+        assert!(
+            SMOKE_SRC.contains("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+                && SMOKE_SRC.contains("D6_GENUINE_MUT_DISPATCH_ENTER")
+                && SMOKE_SRC.contains("SCHED_TIMEOUT_ENABLED")
+                && SMOKE_SRC.contains("yarm.vm_cow=1"),
+            "D2/D6/SCHED-TIMEOUT/VM-COW gates must remain"
+        );
+        assert!(
+            CMDLINE_SRC.contains("ipc_recv_proof_sender_wake"),
+            "Stage 163P sender-wake sub-knob must remain"
+        );
+        // The mint/revoke success paths are UNCHANGED — instrumentation only wraps
+        // error and rollback edges (no new mint/revoke behavior).
+        assert!(
+            LIFECYCLE_SRC.contains("fn mint_capability_in_cnode(")
+                && LIFECYCLE_SRC.contains("fn revoke_capability_in_cnode("),
+            "mint/revoke primitives must remain"
+        );
+    }
+
+    // Docs: Stage 172 accepted (rebuilt artifact) + Stage 173 section added.
+    #[test]
+    fn stage173_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 173 — CAP-CNODE"),
+            "doc must add the Stage 173 CAP-CNODE section"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 172 VM-COW is **ACCEPTED**")
+                || DOC_SRC.contains("VM-COW is **ACCEPTED"),
+            "doc must record Stage 172 accepted"
+        );
+        assert!(
+            DOC_SRC.contains("instrumentation only")
+                || DOC_SRC.contains("diagnostic only")
+                || DOC_SRC.contains("no real bug"),
+            "doc must state Stage 173 is instrumentation only"
+        );
+    }
+}

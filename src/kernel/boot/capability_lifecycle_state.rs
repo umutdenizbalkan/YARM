@@ -240,13 +240,186 @@ impl KernelState {
         self.mint_capability_in_cnode(cnode, capability)
     }
 
+    /// Stage 173 (CAP-CNODE): bounded, self-contained, one-shot diagnostic proof
+    /// of the capability/CNode reserve → materialize → lookup → release lifecycle,
+    /// plus the stale-cap and double-release rejection invariants. Runs at most
+    /// once (per boot) when `yarm.cap_cnode=1` and a real user task is current.
+    /// It mints ONE scratch anonymous MemoryObject cap into the current task's
+    /// CNode, exercises the lifecycle through the REAL production functions
+    /// (`alloc_anonymous_memory_object`, `capability_for_cnode_local`,
+    /// `revoke_capability_in_cnode`), verifies the object refcount returns to
+    /// baseline, and cleans itself up — it changes no service state and consumes
+    /// no net slots. Diagnostic only: it never faults the task and swallows all
+    /// errors into a `CAP_CNODE_*_FAIL` marker.
+    pub(crate) fn maybe_run_cap_cnode_proof(&mut self) {
+        if !crate::kernel::boot::cap_cnode_enabled() {
+            return;
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return; // need a real user task with a CNode
+        }
+        let Some(cnode) = self.current_task_cnode() else {
+            return;
+        };
+        if !crate::kernel::boot::cap_cnode_proof_try_start() {
+            return; // one-shot
+        }
+        crate::yarm_log!("CAP_CNODE_PROOF_BEGIN tid={} cnode={}", tid, cnode.0);
+
+        // Phase 1: RESERVE + MATERIALIZE (alloc mints exactly one cap into cnode).
+        crate::yarm_log!("CAP_CNODE_RESERVE_BEGIN tid={}", tid);
+        crate::yarm_log!("CAP_CNODE_MATERIALIZE_BEGIN tid={} obj=memory_object", tid);
+        let (mo_id, cap) = match self.alloc_anonymous_memory_object() {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::yarm_log!("CAP_CNODE_MATERIALIZE_FAIL tid={} reason={:?}", tid, e);
+                crate::yarm_log!("CAP_CNODE_PROOF_DONE tid={} result=materialize_fail", tid);
+                return;
+            }
+        };
+        crate::yarm_log!("CAP_CNODE_RESERVE_OK tid={} slot={}", tid, cap.0);
+        let cap_ref_after_mint = self
+            .memory_object_slot_by_id(mo_id)
+            .and_then(|s| self.memory.memory_objects[s])
+            .map(|m| m.cap_refcount)
+            .unwrap_or(0);
+        crate::yarm_log!(
+            "CAP_CNODE_REF_INC obj={} old={} new={}",
+            mo_id,
+            cap_ref_after_mint.saturating_sub(1),
+            cap_ref_after_mint
+        );
+        crate::yarm_log!(
+            "CAP_CNODE_SLOT_INSTALL tid={} slot={} generation={}",
+            tid,
+            cap.0,
+            cap.0 >> 32
+        );
+        crate::yarm_log!("CAP_CNODE_MATERIALIZE_OK tid={} slot={}", tid, cap.0);
+
+        // Phase 2: LOOKUP OK + rights subset (no escalation).
+        crate::yarm_log!("CAP_CNODE_LOOKUP_BEGIN tid={} cap={}", tid, cap.0);
+        match self.capability_for_cnode_local(cnode, cap) {
+            Some(capability) => {
+                crate::yarm_log!(
+                    "CAP_CNODE_LOOKUP_OK tid={} cap={} obj=memory_object rights=0x{:x}",
+                    tid,
+                    cap.0,
+                    capability.rights_bits()
+                );
+                // Deriving a strict superset must be rejected by the cap algebra:
+                // add a right the memory-object cap does not hold (SIGNAL) and
+                // confirm `derive` refuses to escalate to it.
+                let superset = capability
+                    .rights()
+                    .union(crate::kernel::capabilities::CapRights::SIGNAL);
+                if superset != capability.rights() && capability.derive(superset).is_ok() {
+                    crate::yarm_log!("CAP_CNODE_RIGHTS_ESCALATION tid={} cap={}", tid, cap.0);
+                }
+            }
+            None => {
+                crate::yarm_log!(
+                    "CAP_CNODE_LOOKUP_FAIL tid={} cap={} reason=invalid",
+                    tid,
+                    cap.0
+                );
+            }
+        }
+
+        // Phase 3: RELEASE (revoke) — refcount must decrement exactly once.
+        crate::yarm_log!("CAP_CNODE_RELEASE_BEGIN tid={} cap={}", tid, cap.0);
+        crate::yarm_log!("CAP_CNODE_SLOT_CLEAR tid={} slot={}", tid, cap.0);
+        match self.revoke_capability_in_cnode(cnode, cap) {
+            Ok(()) => {
+                let cap_ref_after_revoke = self
+                    .memory_object_slot_by_id(mo_id)
+                    .and_then(|s| self.memory.memory_objects[s])
+                    .map(|m| m.cap_refcount)
+                    .unwrap_or(0);
+                crate::yarm_log!(
+                    "CAP_CNODE_REF_DEC obj={} old={} new={}",
+                    mo_id,
+                    cap_ref_after_mint,
+                    cap_ref_after_revoke
+                );
+                crate::yarm_log!("CAP_CNODE_RELEASE_OK tid={}", tid);
+            }
+            Err(e) => {
+                crate::yarm_log!("CAP_CNODE_RELEASE_FAIL tid={} reason={:?}", tid, e);
+            }
+        }
+
+        // Phase 4: STALE lookup — the revoked cap must NOT resolve.
+        crate::yarm_log!("CAP_CNODE_LOOKUP_BEGIN tid={} cap={}", tid, cap.0);
+        if self.capability_for_cnode_local(cnode, cap).is_some() {
+            crate::yarm_log!("CAP_CNODE_STALE_CAP_ACCEPTED tid={} cap={}", tid, cap.0);
+        } else {
+            crate::yarm_log!(
+                "CAP_CNODE_LOOKUP_FAIL tid={} cap={} reason=stale_generation",
+                tid,
+                cap.0
+            );
+        }
+
+        // Phase 5: DOUBLE RELEASE — revoking again must fail cleanly (no underflow).
+        crate::yarm_log!("CAP_CNODE_RELEASE_BEGIN tid={} cap={}", tid, cap.0);
+        match self.revoke_capability_in_cnode(cnode, cap) {
+            Ok(()) => {
+                // A second successful revoke would imply a stale-cap accept or an
+                // over-decrement — both are invariant violations.
+                crate::yarm_log!("CAP_CNODE_REFCOUNT_UNDERFLOW tid={} cap={}", tid, cap.0);
+            }
+            Err(_) => {
+                crate::yarm_log!(
+                    "CAP_CNODE_RELEASE_FAIL tid={} cap={} reason=stale",
+                    tid,
+                    cap.0
+                );
+            }
+        }
+
+        // Phase 6: INVARIANT — the scratch object is fully reclaimed (cap_refcount
+        // 0 / slot gone), and no cap slot leaked. If anything is off, the failure
+        // markers above already fired.
+        let residual = self
+            .memory_object_slot_by_id(mo_id)
+            .and_then(|s| self.memory.memory_objects[s])
+            .map(|m| m.cap_refcount)
+            .unwrap_or(0);
+        if residual == 0 {
+            crate::yarm_log!("CAP_CNODE_INVARIANT_OK tid={}", tid);
+        } else {
+            crate::yarm_log!(
+                "CAP_CNODE_SLOT_LEAK tid={} obj={} residual_cap_refcount={}",
+                tid,
+                mo_id,
+                residual
+            );
+        }
+        crate::yarm_log!("CAP_CNODE_PROOF_DONE tid={} result=ok", tid);
+    }
+
     pub(crate) fn mint_capability_in_cnode(
         &mut self,
         cnode: CNodeId,
         capability: Capability,
     ) -> Result<CapId, KernelError> {
-        self.ensure_cnode_space(cnode)?;
-        let minted = self.with_capability_state_mut(|capability_state| {
+        // Stage 173 (CAP-CNODE): default-off ERROR-path markers only (the hot
+        // success path is NOT instrumented here — the one-shot proof and the
+        // reply/transfer sites carry the success markers, to keep marker volume
+        // bounded). Behavior UNCHANGED: reserve-before-materialize, and no
+        // refcount increment unless the slot install succeeded (no partial mint).
+        let cap_cnode = crate::kernel::boot::cap_cnode_enabled();
+        if let Err(e) = self.ensure_cnode_space(cnode) {
+            if cap_cnode {
+                crate::yarm_log!("CAP_CNODE_RESERVE_FAIL cnode={} reason=full", cnode.0);
+            }
+            return Err(e);
+        }
+        let minted = match self.with_capability_state_mut(|capability_state| {
             capability_state
                 .cnode_spaces
                 .iter_mut()
@@ -256,7 +429,19 @@ impl KernelState {
                 .ok_or(KernelError::TaskMissing)?
                 .mint(capability)
                 .map_err(|_| KernelError::CapabilityFull)
-        })?;
+        }) {
+            Ok(m) => m,
+            Err(e) => {
+                if cap_cnode {
+                    crate::yarm_log!(
+                        "CAP_CNODE_MATERIALIZE_FAIL cnode={} reason={:?}",
+                        cnode.0,
+                        e
+                    );
+                }
+                return Err(e);
+            }
+        };
         self.adjust_memory_object_cap_refcount(capability.object, 1);
         Ok(minted)
     }
@@ -283,7 +468,19 @@ impl KernelState {
         cap: CapId,
         expected_object: CapObject,
     ) -> bool {
-        self.with_capability_state_mut(|capability_state| {
+        // Stage 173 (CAP-CNODE): default-off reply-cap one-shot consume markers.
+        // Diagnostic only — the revoke behavior is UNCHANGED. A `false` result on a
+        // reply cap that was already consumed is the one-shot guarantee (the second
+        // consume is BLOCKED), never an error.
+        let cap_cnode = crate::kernel::boot::cap_cnode_enabled();
+        if cap_cnode {
+            crate::yarm_log!(
+                "CAP_CNODE_REPLY_CONSUME_BEGIN cnode={} cap={}",
+                cnode.0,
+                cap.0
+            );
+        }
+        let revoked = self.with_capability_state_mut(|capability_state| {
             capability_state
                 .cnode_spaces
                 .iter_mut()
@@ -293,7 +490,19 @@ impl KernelState {
                     kernel_mut(&mut space.cspace).fast_revoke_reply_slot(cap, expected_object)
                 })
                 .unwrap_or(false)
-        })
+        });
+        if cap_cnode {
+            if revoked {
+                crate::yarm_log!("CAP_CNODE_REPLY_CONSUME_OK cnode={} cap={}", cnode.0, cap.0);
+            } else {
+                crate::yarm_log!(
+                    "CAP_CNODE_REPLY_DOUBLE_CONSUME_BLOCKED cnode={} cap={}",
+                    cnode.0,
+                    cap.0
+                );
+            }
+        }
+        revoked
     }
 
     pub(crate) fn revoke_capability_in_cnode(

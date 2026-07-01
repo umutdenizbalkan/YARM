@@ -212,6 +212,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("VM_COW_ENABLED");
         }
     }
+    if let Some(enabled) = parsed.cap_cnode {
+        // Stage 173 (CAP-CNODE): arch-neutral, default-off DIAGNOSTIC gate for the
+        // capability/CNode phase-boundary markers + one-shot proof. Changes no
+        // cap/CNode behavior or ABI — only emits CAP_CNODE_* markers.
+        crate::kernel::boot::set_cap_cnode_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("CAP_CNODE_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -333,6 +342,10 @@ pub struct YarmBootOptions<'a> {
     /// VM/COW/page-table/fork phase-boundary DIAGNOSTIC markers (no behavior/ABI
     /// change).
     pub vm_cow: Option<bool>,
+    /// Stage 173 (CAP-CNODE): `yarm.cap_cnode=1` gates the arch-neutral, default-off
+    /// capability/CNode phase-boundary DIAGNOSTIC markers + one-shot proof (no
+    /// behavior/ABI change).
+    pub cap_cnode: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -436,6 +449,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.vm_cow" {
             options.vm_cow = parse_bool_knob(value);
+        }
+        if key == b"yarm.cap_cnode" {
+            options.cap_cnode = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);
