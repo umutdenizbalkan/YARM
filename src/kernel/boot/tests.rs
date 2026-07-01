@@ -49883,3 +49883,85 @@ mod stage175_spawn_lifecycle {
         );
     }
 }
+
+// Stage 175B: SPAWN_LIFECYCLE_DUPLICATE_TID must fire ONLY for a true second live
+// TCB for a tid — never for the legitimate single (re-)registration of a task that
+// pre-reserved its slot (the bootstrap tids 1/2/3). A single registration keeps
+// exactly one TCB slot, so the `tcb_count > 1` invariant never trips for it.
+#[test]
+fn stage175b_single_registration_is_not_a_duplicate_tid() {
+    let mut state = Bootstrap::init().expect("init");
+    crate::kernel::boot::set_spawn_lifecycle_enabled(true);
+
+    state.register_task(4242).expect("register");
+    let count = state.with_tcbs(|tcbs| tcbs.iter().flatten().filter(|t| t.tid.0 == 4242).count());
+    assert_eq!(
+        count, 1,
+        "a single registration must produce exactly one TCB (not a duplicate)"
+    );
+
+    // Re-registering the same tid (as a bootstrap pre-reserved slot would appear to
+    // the spawn path) must NOT create a second live TCB — so the duplicate invariant
+    // (`tcb_count > 1`) does not trip.
+    let _ = state.register_task(4242);
+    let count2 = state.with_tcbs(|tcbs| tcbs.iter().flatten().filter(|t| t.tid.0 == 4242).count());
+    assert_eq!(
+        count2, 1,
+        "re-registering the same tid must not create a duplicate TCB slot"
+    );
+
+    crate::kernel::boot::set_spawn_lifecycle_enabled(false);
+}
+
+// Stage 175B: source guards proving the false-positive pre-register presence scan is
+// gone and DUPLICATE_TID is emitted only from the true `tcb_count > 1` invariant.
+mod stage175b_duplicate_tid_gate {
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    // The DUPLICATE_TID marker is emitted from exactly ONE site — the post-register
+    // `tcb_count > 1` invariant — and NOT from a pre-register presence scan.
+    #[test]
+    fn stage175b_duplicate_tid_only_from_count_invariant() {
+        assert_eq!(
+            EXEC_SRC.matches("SPAWN_LIFECYCLE_DUPLICATE_TID").count(),
+            1,
+            "DUPLICATE_TID must be emitted from exactly one site"
+        );
+        // That single site is the post-register invariant guarded by tcb_count > 1.
+        let idx = EXEC_SRC
+            .find("SPAWN_LIFECYCLE_DUPLICATE_TID")
+            .expect("duplicate-tid emission");
+        let before = &EXEC_SRC[idx.saturating_sub(120)..idx];
+        assert!(
+            before.contains("tcb_count > 1"),
+            "the DUPLICATE_TID emission must be guarded by the tcb_count > 1 invariant"
+        );
+        // The removed pre-register presence scan (`any(... tid.0 == spec.tid ...)`
+        // immediately emitting DUPLICATE_TID) must NOT be present anymore.
+        assert!(
+            EXEC_SRC.contains("Stage 175B"),
+            "exec_state must carry the Stage 175B rationale for the narrowed detector"
+        );
+    }
+
+    // The smoke still hard-fails on a real DUPLICATE_TID marker.
+    #[test]
+    fn stage175b_smoke_still_fails_on_real_duplicate_tid() {
+        assert!(
+            SMOKE_SRC.contains("SPAWN_LIFECYCLE_DUPLICATE_TID"),
+            "smoke must still gate on SPAWN_LIFECYCLE_DUPLICATE_TID"
+        );
+    }
+
+    // Counts unchanged.
+    #[test]
+    fn stage175b_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+    }
+}

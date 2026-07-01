@@ -5692,6 +5692,18 @@ only:
 `_ROLLBACK_LEAK`, `_ZOMBIE_LEAK`, `_CAP_LEAK`, `_ASPACE_LEAK`, `_TCB_LEAK`,
 `_DUPLICATE_TID`, `_BAD_IMAGE_ID`, `_SERVICE_ORDER_VIOLATION`.
 
+**Stage 175B — `_DUPLICATE_TID` false-positive fix.** The first `SPAWN_LIFECYCLE=1`
+run reached the service baseline with successful spawn/invariant markers but tripped
+because `SPAWN_LIFECYCLE_DUPLICATE_TID` was emitted for the bootstrap tasks tid=2/3/1
+immediately before their own `TCB_ALLOC_OK` / `PROCESS_READY` / `INVARIANT_OK` (the
+later 10000+ service tids never did). The cause was an instrumentation false
+positive: a *pre-register presence scan* flagged the legitimately pre-reserved
+bootstrap TCB slot as a duplicate. The fix removes the pre-register scan and keeps
+`_DUPLICATE_TID` gated solely on the *post-register* `tcb_count > 1` invariant — a
+true second live TCB for the same tid. Instrumentation-only; no runtime spawn
+behavior change, and the smoke still hard-fails on a real `_DUPLICATE_TID`. Guarded
+by `stage175b_duplicate_tid_gate`.
+
 **`SPAWN_LIFECYCLE=1` acceptance profile.** Requires `SPAWN_LIFECYCLE_ENABLED`, at
 least one successful spawn path, the service baseline, and (when exercised) the
 rollback/invariant diagnostics; fails hard on the failure markers plus
