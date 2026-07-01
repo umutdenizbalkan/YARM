@@ -47362,20 +47362,18 @@ mod stage168_d6_genuine_b_and_d2_recv {
         assert!(pa < pb && pb < pc, "recv block phases must stay rank-ordered A<B<C");
     }
 
-    // D2 SEND path untouched (Stage 169 territory).
+    // D2 SEND uses its OWN Stage 169 genuine path, never the recv machinery.
+    // (Stage 168/168B did not wire send; Stage 169 does via D2_SEND_GENUINE.)
     #[test]
     fn stage168_d2_send_untouched() {
-        assert!(
-            !IPC_STATE_SRC.contains("D2_SEND_GENUINE"),
-            "Stage 168 must not add a genuine send path (deferred to Stage 169)"
-        );
         // The send-block orchestrator is not instrumented with recv-genuine markers.
         let send_idx = IPC_STATE_SRC
             .find("fn block_current_on_send_with_deadline")
             .expect("send-block orchestrator must exist");
-        let send_region = &IPC_STATE_SRC[send_idx..send_idx + 1200];
+        let send_region = &IPC_STATE_SRC[send_idx..send_idx + 3200];
         assert!(
-            !send_region.contains("D2_RECV_GENUINE"),
+            !send_region.contains("D2_RECV_GENUINE")
+                && !send_region.contains("d2_recv_dispatch_try_defer"),
             "the send path must not carry recv-genuine instrumentation"
         );
     }
@@ -47609,17 +47607,14 @@ mod stage168b_d2_recv_genuine_completion {
         );
     }
 
-    // Task D/E: D2 SEND path untouched.
+    // Task D/E: the recv machinery does not leak into the send path (send is
+    // Stage 169's own D2_SEND_GENUINE path, not the recv deferral).
     #[test]
     fn stage168b_d2_send_untouched() {
-        assert!(
-            !IPC_STATE_SRC.contains("D2_SEND_GENUINE") && !IPC_STATE_SRC.contains("d2_send_genuine"),
-            "Stage 168B must not add a genuine send path (Stage 169)"
-        );
         let send_idx = IPC_STATE_SRC
             .find("fn block_current_on_send_with_deadline")
             .expect("send-block orchestrator");
-        let send_region = &IPC_STATE_SRC[send_idx..send_idx + 1400];
+        let send_region = &IPC_STATE_SRC[send_idx..send_idx + 3200];
         assert!(
             !send_region.contains("d2_recv_dispatch_try_defer")
                 && !send_region.contains("D2_RECV_GENUINE"),
@@ -47717,6 +47712,316 @@ mod stage168b_d2_recv_genuine_completion {
             SMOKE_SRC.contains("reason=switch_required")
                 && SMOKE_SRC.contains("Stage 168B incomplete"),
             "smoke must reject the recv-path switch_required in-lock fallback"
+        );
+    }
+}
+
+// Stage 169: D2-GENUINE-SEND — the blocking send path is moved onto rank-clean
+// scheduler/task/IPC phases and its queue-advancing dispatch is relocated OUT of
+// the global lock (mirroring Stage 168B recv), behind a default-off x86_64-only
+// knob, preserving the Stage 163P sender-wake oracle.
+mod stage169_d2_send_genuine {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    // Task B: knob default-off + x86_64-only.
+    #[test]
+    fn stage169_knob_default_off_x86_only() {
+        assert!(
+            CMDLINE_SRC.contains("pub d2_send_genuine: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.d2_send_genuine"),
+            "yarm.d2_send_genuine must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("D2_SEND_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("fn d2_send_genuine_enabled() -> bool")
+                && MOD_SRC.contains("fn set_d2_send_genuine_enabled(enabled: bool)"),
+            "D2_SEND_GENUINE gate + accessors must exist (default false)"
+        );
+        let apply_idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.d2_send_genuine")
+            .expect("d2_send_genuine apply block");
+        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 500];
+        assert!(
+            apply.contains("#[cfg(target_arch = \"x86_64\")]")
+                && apply.contains("set_d2_send_genuine_enabled(enabled)"),
+            "d2_send_genuine must only flip the gate on x86_64"
+        );
+    }
+
+    // Task B: script plumbing + mode isolation includes D2_SEND_GENUINE.
+    #[test]
+    fn stage169_script_plumbing_and_isolation() {
+        assert!(
+            SMOKE_SRC.contains("D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}")
+                && SMOKE_SRC.contains("yarm.d2_send_genuine=1"),
+            "smoke must append yarm.d2_send_genuine=1 when D2_SEND_GENUINE=1"
+        );
+        // Mode isolation forces D2_SEND_GENUINE off under proof / switch-a.
+        let proof_idx = SMOKE_SRC
+            .find("if [[ \"$D6_SWITCH_PROOF\" == \"1\" ]]; then")
+            .expect("proof precedence branch");
+        let proof = &SMOKE_SRC[proof_idx..proof_idx + 340];
+        assert!(
+            proof.contains("D2_SEND_GENUINE"),
+            "D6_SWITCH_PROOF=1 must force D2_SEND_GENUINE off"
+        );
+    }
+
+    // Task C: blocking send exposes rank-clean phase markers.
+    #[test]
+    fn stage169_blocking_send_phase_markers() {
+        for m in [
+            "D2_SEND_GENUINE_CANDIDATE",
+            "D2_SEND_GENUINE_PHASE_CAP_OK",
+            "D2_SEND_GENUINE_PHASE_TASK_BLOCK",
+            "D2_SEND_GENUINE_PHASE_IPC_LOCK",
+            "D2_SEND_GENUINE_PHASE_DISPATCH",
+            "D2_SEND_GENUINE_BLOCKED_OK",
+            "D2_SEND_GENUINE_DONE",
+        ] {
+            assert!(IPC_STATE_SRC.contains(m), "ipc_state must emit D2 send marker {m}");
+        }
+    }
+
+    // Task C: the sender-waiter is published (enqueue_sender_waiter) BEFORE the
+    // dispatch deferral, and the Blocked(EndpointSend) TCB precedes the publish.
+    #[test]
+    fn stage169_waiter_published_before_defer() {
+        let block_idx = IPC_STATE_SRC
+            .find("fn block_current_on_send_with_deadline")
+            .expect("send-block orchestrator");
+        let region = &IPC_STATE_SRC[block_idx..block_idx + 3200];
+        let blocked = region
+            .find("Blocked(WaitReason::EndpointSend(send_cap))")
+            .expect("sender must be Blocked(EndpointSend)");
+        let publish = region
+            .find("enqueue_sender_waiter")
+            .expect("sender-waiter publish");
+        let defer = region
+            .find("d2_send_dispatch_try_defer")
+            .expect("send dispatch defer");
+        assert!(
+            blocked < publish && publish < defer,
+            "order must be: Blocked(EndpointSend) -> publish waiter -> defer dispatch"
+        );
+    }
+
+    // Task D: no in-lock dispatch on the committed blocking-send path (early
+    // return before dispatch_next_task), and the drain runs out of lock.
+    #[test]
+    fn stage169_no_inlock_dispatch_and_out_of_lock_drain() {
+        assert!(
+            IPC_STATE_SRC.contains("D2_SEND_GENUINE_DISPATCH_DEFERRED")
+                && IPC_STATE_SRC.contains("D2_SEND_GENUINE_NO_INLOCK_DISPATCH"),
+            "the committed blocking send must defer and skip in-lock dispatch"
+        );
+        let defer_idx = IPC_STATE_SRC
+            .find("D2_SEND_GENUINE_DISPATCH_DEFERRED")
+            .expect("defer marker");
+        let inlock_idx = IPC_STATE_SRC[defer_idx..]
+            .find("let _ = self.dispatch_next_task()?;")
+            .map(|r| defer_idx + r)
+            .expect("in-lock send dispatch fallback must still exist");
+        assert!(
+            IPC_STATE_SRC[defer_idx..inlock_idx].contains("return Ok(ThreadId(blocked_tid));"),
+            "the eligible deferred send must early-return before the in-lock dispatch"
+        );
+        // Drain in trap entry runs after the global lock is dropped.
+        assert!(
+            TRAP_ENTRY_SRC.contains("d2_send_dispatch_is_deferred(cpu_idx)")
+                && TRAP_ENTRY_SRC.contains("shared.d2_send_dispatch_step_mut(cpu)")
+                && TRAP_ENTRY_SRC.contains("D2_SEND_GENUINE_GLOBAL_DROPPED")
+                && TRAP_ENTRY_SRC.contains("D2_SEND_GENUINE_DISPATCH_DONE"),
+            "trap entry must drain the deferred send dispatch out of the global lock"
+        );
+        let drop_idx = TRAP_ENTRY_SRC
+            .find("let inner_result = inner_result?;")
+            .expect("global-lock drop point");
+        let drain_idx = TRAP_ENTRY_SRC
+            .find("shared.d2_send_dispatch_step_mut(cpu)")
+            .expect("send dispatch drain");
+        assert!(drain_idx > drop_idx, "the send dispatch must run after the global lock is dropped");
+    }
+
+    // Task D: reverify Blocked(EndpointSend) + queue-advancing dispatch_next_on.
+    #[test]
+    fn stage169_reverify_and_queue_advancing() {
+        assert!(
+            RUNTIME_SRC.contains("fn d2_send_reverify_blocked")
+                && RUNTIME_SRC.contains("WaitReason::EndpointSend(_)"),
+            "the drain must re-verify the sender is still Blocked(EndpointSend)"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D2_SEND_GENUINE_DISPATCH_REVERIFY_OK"),
+            "the drain must emit the reverify-ok marker before dispatching"
+        );
+        let m_idx = RUNTIME_SRC
+            .find("fn d2_send_dispatch_step_mut")
+            .expect("send dispatch seam");
+        let body = &RUNTIME_SRC[m_idx..m_idx + 700];
+        assert!(
+            body.contains("dispatch_next_on(dispatch_cpu)"),
+            "the send dispatch must be the authoritative queue-advancing dispatch_next_on"
+        );
+    }
+
+    // Task D: reuses the hardened D6/168B restore path — no new switch mechanism.
+    #[test]
+    fn stage169_reuses_hardened_restore() {
+        let drain_start = TRAP_ENTRY_SRC
+            .find("D2_SEND_GENUINE_GLOBAL_DROPPED")
+            .expect("send drain start");
+        let drain_end = TRAP_ENTRY_SRC[drain_start..]
+            .find("Stage 168B (D2-GENUINE-RECV completion): drain")
+            .map(|r| drain_start + r)
+            .expect("recv drain follows send drain");
+        let drain = &TRAP_ENTRY_SRC[drain_start..drain_end];
+        assert!(
+            drain.contains("post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"),
+            "the send drain must reuse the hardened post_switch restore"
+        );
+        assert!(
+            !drain.contains("switch_frames("),
+            "the send drain must NOT introduce a new switch_frames call"
+        );
+    }
+
+    // Task E: fallback + rollback markers present.
+    #[test]
+    fn stage169_fallback_and_rollback_markers() {
+        assert!(
+            IPC_STATE_SRC.contains("D2_SEND_GENUINE_FALLBACK reason=")
+                && IPC_STATE_SRC.contains("D2_SEND_GENUINE_IMMEDIATE_OK"),
+            "in-lock fallback + immediate markers must exist"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D2_SEND_GENUINE_FALLBACK reason=state_changed"),
+            "the drain must emit a state_changed fallback"
+        );
+    }
+
+    // Task F: Stage 163P sender-wake preserved — the send drain touches neither
+    // the wake path nor the oracle markers, and the smoke auto-enables + checks
+    // the oracle under D2_SEND_GENUINE.
+    #[test]
+    fn stage169_sender_wake_oracle_preserved() {
+        // wake_waiter_for_endpoint / enqueue_sender_waiter unchanged and present.
+        assert!(
+            IPC_STATE_SRC.contains("fn wake_waiter_for_endpoint")
+                && IPC_STATE_SRC.contains("fn enqueue_sender_waiter"),
+            "the sender-wake / waiter-publish primitives must remain"
+        );
+        assert!(
+            CMDLINE_SRC.contains("ipc_recv_proof_sender_wake"),
+            "Stage 163P sender-wake sub-knob must remain intact"
+        );
+        // Smoke auto-enables the sender-wake workload and checks its markers.
+        assert!(
+            SMOKE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}")
+                && SMOKE_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK")
+                && SMOKE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "D2_SEND_GENUINE smoke must exercise + check the Stage 163P sender-wake oracle"
+        );
+    }
+
+    // Task H: D2 RECV path untouched by the send stage.
+    #[test]
+    fn stage169_d2_recv_untouched() {
+        // The recv orchestrator still defers via its own recv machinery.
+        assert!(
+            IPC_STATE_SRC.contains("d2_recv_dispatch_try_defer")
+                && TRAP_ENTRY_SRC.contains("shared.d2_recv_dispatch_step_mut(cpu)"),
+            "the Stage 168B recv path must remain intact"
+        );
+        // The send block orchestrator must not carry recv markers.
+        let send_idx = IPC_STATE_SRC
+            .find("fn block_current_on_send_with_deadline")
+            .expect("send orchestrator");
+        let send_region = &IPC_STATE_SRC[send_idx..send_idx + 3200];
+        assert!(
+            !send_region.contains("D2_RECV_GENUINE"),
+            "the send path must not carry recv-genuine markers"
+        );
+    }
+
+    // Task H: D3/D5 and D6 proof/switch-a untouched.
+    #[test]
+    fn stage169_d3_d5_d6proof_switcha_untouched() {
+        for forbidden in ["D3_GENUINE", "D5_GENUINE", "with_vm_user_spaces_split_mut("] {
+            assert!(
+                !TRAP_ENTRY_SRC.contains(forbidden),
+                "trap_entry must not live-wire {forbidden}"
+            );
+        }
+        // The send defer is gated to not run under proof / switch-a.
+        let gate_idx = IPC_STATE_SRC
+            .find("d2_send_dispatch_try_defer")
+            .map(|i| IPC_STATE_SRC[..i].rfind("d2_send_genuine_enabled()").expect("gate"))
+            .expect("gate");
+        let gate = &IPC_STATE_SRC[gate_idx..gate_idx + 240];
+        assert!(
+            gate.contains("!crate::kernel::boot::d6_controlled_switch_proof_enabled()")
+                && gate.contains("!crate::kernel::boot::d6_switch_a_enabled()"),
+            "the send deferral must be disabled under proof / switch-a"
+        );
+    }
+
+    // Task H: ABI / counts unchanged.
+    #[test]
+    fn stage169_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 and VARIANT_COUNT=23 must be unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+    }
+
+    // Task A / I: docs mark 168B accepted and add the Stage 169 section.
+    #[test]
+    fn stage169_docs_updated() {
+        assert!(
+            DOC_SRC.contains("Stage 168B") && DOC_SRC.contains("ACCEPTED"),
+            "doc must mark Stage 168B accepted"
+        );
+        assert!(
+            DOC_SRC.contains("D2-GENUINE-SEND") && DOC_SRC.contains("Stage 169"),
+            "doc must add the Stage 169 D2-GENUINE-SEND section"
+        );
+        assert!(
+            DOC_SRC.contains("no IPC-FINAL") || DOC_SRC.contains("IPC-FINAL is NOT")
+                || DOC_SRC.contains("NOT done"),
+            "doc must state what is explicitly not done"
+        );
+    }
+
+    // Task G: smoke requires the full out-of-lock send marker set.
+    #[test]
+    fn stage169_smoke_requires_out_of_lock_send_dispatch() {
+        for m in [
+            "D2_SEND_GENUINE_DISPATCH_DEFERRED",
+            "D2_SEND_GENUINE_GLOBAL_DROPPED",
+            "D2_SEND_GENUINE_DISPATCH_REVERIFY_OK",
+            "D2_SEND_GENUINE_DISPATCH_ENTER",
+            "D2_SEND_GENUINE_DISPATCH_STEP_SPLIT",
+            "D2_SEND_GENUINE_DISPATCH_DONE",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require the out-of-lock send marker {m}");
+        }
+        assert!(
+            SMOKE_SRC.contains("Stage 169 incomplete"),
+            "smoke must reject the send-path in-lock fallback"
         );
     }
 }

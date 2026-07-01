@@ -39,17 +39,18 @@ D6_SWITCH_PROOF=${D6_SWITCH_PROOF:-0}
 D6_SWITCH_A=${D6_SWITCH_A:-0}
 D6_GENUINE=${D6_GENUINE:-0}
 D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}
+D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -57,7 +58,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -81,6 +82,23 @@ fi
 D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}
 if [[ "$D2_RECV_GENUINE" == "1" && "$KERNEL_CMDLINE" != *"yarm.d2_recv_genuine="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d2_recv_genuine=1"
+fi
+# Stage 169 (D2-GENUINE-SEND): D2_SEND_GENUINE=1 appends yarm.d2_send_genuine=1 to
+# run the blocking-send path through explicit rank-clean phase markers and the
+# out-of-global-lock dispatch seam (x86_64-only). A blocking send only happens
+# when a sender must wait (endpoint full / synchronous no-waiter); the Stage 163P
+# sender-wake proof workload deterministically creates exactly that, so enabling
+# D2_SEND_GENUINE also enables the sender-wake workload (yarm.ipc_recv_proof +
+# yarm.ipc_recv_proof_sender_wake) — which simultaneously exercises the blocking
+# send AND regression-checks the Stage 163P oracle. Override by pre-setting
+# IPC_RECV_PROOF / IPC_RECV_PROOF_SENDER_WAKE.
+D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
+if [[ "$D2_SEND_GENUINE" == "1" ]]; then
+  if [[ "$KERNEL_CMDLINE" != *"yarm.d2_send_genuine="* ]]; then
+    KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d2_send_genuine=1"
+  fi
+  IPC_RECV_PROOF=${IPC_RECV_PROOF:-1}
+  IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -867,6 +885,76 @@ if [[ "$D2_RECV_GENUINE" == "1" ]]; then
     exit 1
   fi
   echo "[ok] D2-RECV-GENUINE: rank-clean blocking-recv phases observed"
+fi
+
+# Stage 169 (D2-GENUINE-SEND): when booted with yarm.d2_send_genuine=1, require
+# the rank-clean blocking-send phase markers AND evidence that the send's
+# queue-advancing dispatch ran OUTSIDE the global lock.
+if [[ "$D2_SEND_GENUINE" == "1" ]]; then
+  d2_send_fail=0
+  echo "[ok] D2_SEND_GENUINE enabled marker:" $(log_has_pattern "D2_SEND_GENUINE_ENABLED" && echo present || echo MISSING)
+  for d2s_marker in \
+    "D2_SEND_GENUINE_CANDIDATE" \
+    "D2_SEND_GENUINE_PHASE_CAP_OK" \
+    "D2_SEND_GENUINE_PHASE_IPC_LOCK" \
+    "D2_SEND_GENUINE_PHASE_TASK_BLOCK" \
+    "D2_SEND_GENUINE_PHASE_DISPATCH" \
+    "D2_SEND_GENUINE_DISPATCH_DEFERRED" \
+    "D2_SEND_GENUINE_NO_INLOCK_DISPATCH" \
+    "D2_SEND_GENUINE_GLOBAL_DROPPED" \
+    "D2_SEND_GENUINE_DISPATCH_REVERIFY_OK" \
+    "D2_SEND_GENUINE_DISPATCH_ENTER" \
+    "D2_SEND_GENUINE_DISPATCH_STEP_SPLIT" \
+    "D2_SEND_GENUINE_DISPATCH_DONE"; do
+    if log_has_pattern "$d2s_marker"; then
+      echo "[ok] D2-SEND-GENUINE marker present: $d2s_marker"
+    else
+      echo "[error] D2-SEND-GENUINE marker missing: $d2s_marker"
+      d2_send_fail=1
+    fi
+  done
+  # HARD (Stage 169): every blocking send PHASE_DISPATCH must be followed by
+  # DISPATCH_DEFERRED (queue-advancing dispatch relocated OUT of the global lock)
+  # — NOT a D6 switch_required in-lock fallback or a D2 send in-lock fallback.
+  if [[ -f "$LOGFILE" ]]; then
+    bad_send_fallback="$(tr '\r' '\n' <"$LOGFILE" | awk '
+      /D2_SEND_GENUINE_PHASE_DISPATCH/ { pending=1; next }
+      pending && /D2_SEND_GENUINE_DISPATCH_DEFERRED/ { pending=0; next }
+      pending && /D6_GENUINE_MUT_DISPATCH_FALLBACK reason=switch_required/ { print "BAD"; pending=0; next }
+      pending && /D2_SEND_GENUINE_FALLBACK reason=/ { print "BAD"; pending=0; next }
+    ')"
+    if [[ -n "$bad_send_fallback" ]]; then
+      echo "[error] D2-SEND-GENUINE: blocking send dispatch fell back in-lock instead of deferring out of lock (Stage 169 incomplete)"
+      d2_send_fail=1
+    fi
+  fi
+  # Stage 163P sender-wake oracle must remain intact under D2_SEND_GENUINE=1
+  # (the workload is auto-enabled above to exercise a blocking send).
+  for sw_marker in \
+    "IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK" \
+    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK" \
+    "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"; do
+    if log_has_pattern "$sw_marker"; then
+      echo "[ok] D2-SEND-GENUINE: Stage 163P marker preserved: $sw_marker"
+    else
+      echo "[error] D2-SEND-GENUINE: Stage 163P sender-wake marker missing: $sw_marker"
+      d2_send_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    d2s_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/D2_SEND_GENUINE_CANDIDATE/{seen=1} seen{print}')"
+    for fatal_pat in '!Fv' '!BNv' 'PAGE_FAULT' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$d2s_tail" | rg -a -F -q -- "$fatal_pat"; then
+        echo "[error] D2-SEND-GENUINE: fatal breadcrumb after send wire start: $fatal_pat"
+        d2_send_fail=1
+      fi
+    done
+  fi
+  if [[ "$d2_send_fail" -eq 1 ]]; then
+    echo "[error] D2-SEND-GENUINE mode FAILED"
+    exit 1
+  fi
+  echo "[ok] D2-SEND-GENUINE: rank-clean blocking-send dispatch ran outside the global lock"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

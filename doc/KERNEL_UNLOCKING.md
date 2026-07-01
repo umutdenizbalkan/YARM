@@ -5043,7 +5043,65 @@ mechanically complete (Stage 152). The roadmap, in order:
    → `DISPATCH_ENTER` → `DISPATCH_STEP_SPLIT` → `DISPATCH_DONE` and no fatal),
    normal x86_64 smoke, and the Stage 163P sender-wake oracle. **Stage 169
    (D2-GENUINE-SEND) must NOT start until Stage 168B QEMU acceptance passes.**
-   **PENDING user QEMU acceptance.**
+
+   **ACCEPTED (user QEMU, 2026).** The `D6_GENUINE=1 D2_RECV_GENUINE=1` run showed
+   a real blocking recv relocating its queue-advancing dispatch out of the global
+   lock — `D2_RECV_GENUINE_DISPATCH_DEFERRED`, `…_NO_INLOCK_DISPATCH`,
+   `…_GLOBAL_DROPPED`, `…_DISPATCH_REVERIFY_OK`,
+   `…_DISPATCH_STEP_SPLIT result=switch`, `…_DISPATCH_DONE` (and
+   `SWITCH_STASHED`/`SWITCH_ENTER`/`FIRST_RESUME` also observed) — reaching the
+   x86_64 service baseline with no fatal breadcrumb, and the D6 proof,
+   `D6_SWITCH_A`, `D6_GENUINE`, normal smoke, and Stage 163P sender-wake oracle
+   regressions all passed. Stage 168B is **ACCEPTED**; Stage 169 begins
+   D2-GENUINE-SEND (below) and must preserve the Stage 163P sender-wake oracle.
+
+   **D2-GENUINE-SEND (Stage 169).** Moves the blocking IpcSend / sender-waiter
+   path onto the same rank-clean seams and out-of-global-lock dispatch as
+   Stage 168B recv, behind a new default-off x86_64-only knob
+   `yarm.d2_send_genuine=1` (script `D2_SEND_GENUINE=1`, marker
+   `D2_SEND_GENUINE_ENABLED`). A blocking send occurs when a sender must wait
+   (synchronous endpoint with no waiter, or a full async queue): both call
+   `block_current_on_send_with_deadline`, which runs Phase A (`block_current`,
+   scheduler rank 1) → Phase B (TCB `Blocked(EndpointSend(cap))`, task rank 2,
+   `D2_SEND_GENUINE_PHASE_TASK_BLOCK`) → Phase C (`enqueue_sender_waiter` publish,
+   ipc rank 3, `D2_SEND_GENUINE_PHASE_IPC_LOCK`) → `PHASE_DISPATCH`. The
+   sender-waiter (message riding with it) is published BEFORE the deferral, so the
+   receiver-side wake/handoff and the Stage 163P sender-wake coordination are
+   unchanged. It then records a per-CPU deferral (`d2_send_dispatch_try_defer`,
+   `D2_SEND_GENUINE_DISPATCH_DEFERRED` + `…_NO_INLOCK_DISPATCH` + `…_BLOCKED_OK` +
+   `…_DONE result=blocked`) and returns WITHOUT dispatching in-lock. After
+   `handle_trap_entry_shared`'s `with_cpu` returns and the global
+   `SpinLock<KernelState>` guard is dropped, the trap entry drains it exactly like
+   recv: `D2_SEND_GENUINE_GLOBAL_DROPPED` → re-verify the sender is still
+   `Blocked(EndpointSend)` via the rank-2 task seam
+   (`D2_SEND_GENUINE_DISPATCH_REVERIFY_OK`) → `…_DISPATCH_ENTER` → authoritative
+   queue-advancing `dispatch_next_on` under ONLY the rank-1 scheduler seam
+   (`d2_send_dispatch_step_mut`, `…_DISPATCH_STEP_SPLIT result=switch|idle`) →
+   commit `Running` via the task seam → restore the incoming task's arch state via
+   the **hardened D6-SWITCH-A** `post_switch_restore_arch_thread_state` re-acquire
+   (no new switch mechanism; the dormant `D2_SEND_GENUINE_SWITCH_*` markers cover
+   the kernel-thread variant) → `…_DISPATCH_DONE`. Fallbacks
+   (`D2_SEND_GENUINE_FALLBACK reason=multi_cpu|no_trap_drainer|already_deferred|state_changed`),
+   immediate send (`…_IMMEDIATE_OK` / `…_DONE result=immediate`), and NoWait /
+   timeout are preserved; no message loss, no orphaned waiter, no duplicate wake,
+   no reply-cap change. **Stage 163P sender-wake preserved:** blocking IpcSend
+   stays nonfatal (`caller_blocked=true` → `Ok`), and the smoke auto-enables the
+   sender-wake proof workload under `D2_SEND_GENUINE=1` so a blocking send is
+   deterministically exercised AND `IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK`,
+   `^IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, and the
+   `USER_LOG …IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` oracle sequence are
+   re-checked. Mode isolation extends the precedence to
+   `D6_SWITCH_PROOF > D6_SWITCH_A > {D6_GENUINE, D2_RECV_GENUINE, D2_SEND_GENUINE}`.
+   **Explicitly NOT done in Stage 169:** no IPC-FINAL; no D3/D5 live-wire; no SMP
+   broadening (single-CPU only); no AArch64/RISC-V D6 switch unlock (knob is
+   x86_64-only / no-op elsewhere); no syscall/IPC/service/image ABI change
+   (SYSCALL_COUNT=31, VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32). Guarded by
+   `stage169_d2_send_genuine`. Acceptance (user QEMU): (1) `D2_SEND_GENUINE=1`
+   (must show the full `D2_SEND_GENUINE_*` blocking-send phase + out-of-lock
+   dispatch markers and the Stage 163P oracle markers, no fatal); (2)
+   `D6_GENUINE=1 D2_RECV_GENUINE=1` recv regression; (3) `D6_GENUINE`; (4)
+   `D6_SWITCH_A` + `D6_SWITCH_PROOF`; (5) Stage 163P sender-wake oracle; (6) normal
+   smoke. **PENDING user QEMU acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

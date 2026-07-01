@@ -179,6 +179,21 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = enabled;
     }
+    if let Some(enabled) = parsed.d2_send_genuine {
+        // Stage 169 (D2-GENUINE-SEND): x86_64-only gate that runs the blocking
+        // send path through explicit rank-clean scheduler/task/IPC phase markers
+        // and relocates its queue-advancing dispatch out of the global lock.
+        // No-op on other arches.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::kernel::boot::set_d2_send_genuine_enabled(enabled);
+            if enabled {
+                crate::yarm_log!("D2_SEND_GENUINE_ENABLED");
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = enabled;
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -287,6 +302,11 @@ pub struct YarmBootOptions<'a> {
     /// Default-off; non-x86_64 builds parse but ignore it so AArch64/RISC-V
     /// behavior is unchanged.
     pub d2_recv_genuine: Option<bool>,
+    /// Stage 169 (D2-GENUINE-SEND): `yarm.d2_send_genuine=1` gates the x86_64-only,
+    /// default-off blocking-send rank-clean phase live-wire (scheduler/task/IPC
+    /// phase markers + out-of-global-lock dispatch seam). Default-off; non-x86_64
+    /// builds parse but ignore it so AArch64/RISC-V behavior is unchanged.
+    pub d2_send_genuine: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -381,6 +401,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.d2_recv_genuine" {
             options.d2_recv_genuine = parse_bool_knob(value);
+        }
+        if key == b"yarm.d2_send_genuine" {
+            options.d2_send_genuine = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);
