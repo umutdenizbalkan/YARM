@@ -240,6 +240,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("SPAWN_LIFECYCLE_ENABLED");
         }
     }
+    if let Some(enabled) = parsed.global_state {
+        // Stage 176 (GLOBAL-STATE): arch-neutral, default-off DIAGNOSTIC gate for the
+        // remaining direct global-KernelState mutation audit + lock-rank markers +
+        // one-shot audit. Changes no state/ABI behavior — only emits GLOBAL_STATE_*.
+        crate::kernel::boot::set_global_state_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("GLOBAL_STATE_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -373,6 +382,10 @@ pub struct YarmBootOptions<'a> {
     /// default-off spawn / image-loading / lifecycle-metadata DIAGNOSTIC markers +
     /// one-shot rollback proof (no behavior/ABI/PM-policy change).
     pub spawn_lifecycle: Option<bool>,
+    /// Stage 176 (GLOBAL-STATE): `yarm.global_state=1` gates the arch-neutral,
+    /// default-off remaining direct global-`KernelState` mutation audit + lock-rank
+    /// discipline DIAGNOSTIC markers + one-shot audit (no behavior/ABI change).
+    pub global_state: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -485,6 +498,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.spawn_lifecycle" {
             options.spawn_lifecycle = parse_bool_knob(value);
+        }
+        if key == b"yarm.global_state" {
+            options.global_state = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

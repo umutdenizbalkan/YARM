@@ -985,6 +985,11 @@ impl KernelState {
                 // current; no-op otherwise. Self-contained (scratch address space) —
                 // it does NOT spawn a real task. Arch-neutral, diagnostic only.
                 self.maybe_run_spawn_lifecycle_proof();
+                // Stage 176 (GLOBAL-STATE): one-shot read-only global-state audit.
+                // Runs at most once when `yarm.global_state=1` and a real user task is
+                // current; no-op otherwise. Read-only (classifies global roots +
+                // re-checks lock-rank order). Arch-neutral, diagnostic only.
+                self.maybe_run_global_state_audit();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

@@ -49965,3 +49965,259 @@ mod stage175b_duplicate_tid_gate {
         );
     }
 }
+
+// Stage 176 (GLOBAL-STATE): toggling the global_state marker knob must be a pure
+// diagnostic switch — the accessor round-trips and defaults off, and the audit is
+// read-only (it never mutates KernelState), so it changes no runtime behavior.
+#[test]
+fn stage176_global_state_knob_is_pure_diagnostic_toggle() {
+    assert!(
+        !crate::kernel::boot::global_state_enabled(),
+        "global_state must default off"
+    );
+    crate::kernel::boot::set_global_state_enabled(true);
+    assert!(
+        crate::kernel::boot::global_state_enabled(),
+        "global_state accessor must round-trip"
+    );
+    crate::kernel::boot::set_global_state_enabled(false);
+    assert!(
+        !crate::kernel::boot::global_state_enabled(),
+        "global_state accessor must round-trip back to off"
+    );
+}
+
+// Stage 176 (GLOBAL-STATE): source guards over the global-state audit knob, the
+// lock-rank discipline, the site classification, the smoke plumbing, and invariants.
+mod stage176_global_state {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral (pure diagnostic, no arch cfg).
+    #[test]
+    fn stage176_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub global_state: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.global_state"),
+            "yarm.global_state must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("GLOBAL_STATE_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn global_state_enabled() -> bool")
+                && MOD_SRC.contains("fn set_global_state_enabled(")
+                && MOD_SRC.contains("fn global_state_audit_try_start()"),
+            "GLOBAL_STATE gate + accessors + one-shot latch must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.global_state")
+            .expect("global_state apply block");
+        let block = &CMDLINE_SRC[idx..idx + 600];
+        assert!(
+            block.contains("set_global_state_enabled(enabled)")
+                && block.contains("GLOBAL_STATE_ENABLED")
+                && !block.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "global_state must be arch-neutral (pure diagnostic) and emit GLOBAL_STATE_ENABLED"
+        );
+    }
+
+    // The audit is one-shot, arch-neutral, read-only, and hooked in the timer path.
+    #[test]
+    fn stage176_audit_hooked_arch_neutral() {
+        assert!(
+            FAULT_SRC.contains("self.maybe_run_global_state_audit()"),
+            "audit must be driven from the arch-neutral fault/timer path"
+        );
+        assert!(
+            ORCH_SRC.contains("fn maybe_run_global_state_audit(")
+                && ORCH_SRC.contains("global_state_audit_try_start()")
+                && ORCH_SRC.contains("if tid == 0"),
+            "audit must be one-shot and only run for a real user task (tid != 0)"
+        );
+    }
+
+    // The rank-order check reads the REAL lock_domain_rank mapping, which is the
+    // documented monotonic scheduler(1)<task(2)<ipc(3)<capability(4)<vm(5)<memory(6).
+    #[test]
+    fn stage176_lock_rank_order_preserved() {
+        for (domain, rank) in [
+            ("\"scheduler\" => 1", 1),
+            ("\"task\" => 2", 2),
+            ("\"ipc\" => 3", 3),
+            ("\"capability\" => 4", 4),
+            ("\"vm\" => 5", 5),
+            ("\"memory\" => 6", 6),
+        ] {
+            let _ = rank;
+            assert!(
+                ORCH_SRC.contains(domain),
+                "lock_domain_rank must keep the documented rank: {domain}"
+            );
+        }
+        // The audit compares against the real mapping (not a hardcoded copy).
+        assert!(
+            ORCH_SRC.contains("Self::lock_domain_rank(d)"),
+            "audit rank check must read the real lock_domain_rank mapping"
+        );
+    }
+
+    // Every remaining direct global-root site is classified (three documented kinds),
+    // and the guard-held / leak markers are gated on a real nested-probe signal.
+    #[test]
+    fn stage176_sites_classified_and_guards_gated() {
+        for kind in [
+            "kind=trap_entry_root",
+            "kind=owner_helper",
+            "kind=compat_fallback",
+        ] {
+            assert!(
+                ORCH_SRC.contains(kind),
+                "audit must classify the global-root site {kind}"
+            );
+        }
+        // The guard-held-across / mutation-leak / unclassified markers only fire when
+        // the scoped mutation probe is active (a real nested-guard signal).
+        let idx = ORCH_SRC
+            .find("let probe_active = WITH_TCBS_PROBE_ACTIVE.load")
+            .expect("probe-gated guard check");
+        let block = &ORCH_SRC[idx..idx + 700];
+        for m in [
+            "GLOBAL_STATE_GUARD_HELD_ACROSS_USER_COPY",
+            "GLOBAL_STATE_GUARD_HELD_ACROSS_SWITCH",
+            "GLOBAL_STATE_GUARD_HELD_ACROSS_IPC_WRITEBACK",
+            "GLOBAL_STATE_DIRECT_MUTATION_LEAK",
+            "GLOBAL_STATE_OWNER_HELPER_BYPASS",
+            "GLOBAL_STATE_UNCLASSIFIED_SITE",
+            "GLOBAL_STATE_NO_LEAKED_GLOBAL_GUARD",
+        ] {
+            assert!(
+                block.contains(m),
+                "guard/leak marker {m} must be gated on the probe-active check"
+            );
+        }
+    }
+
+    // All documented marker strings exist verbatim.
+    #[test]
+    fn stage176_all_marker_strings_exist() {
+        for m in [
+            "GLOBAL_STATE_AUDIT_BEGIN",
+            "GLOBAL_STATE_SITE_CLASSIFIED",
+            "GLOBAL_STATE_OWNER_HELPER_OK",
+            "GLOBAL_STATE_DIRECT_SITE_ALLOWED",
+            "GLOBAL_STATE_DIRECT_SITE_REJECTED",
+            "GLOBAL_STATE_RANK_ORDER_OK",
+            "GLOBAL_STATE_RANK_ORDER_FAIL",
+            "GLOBAL_STATE_RANK_INVERSION",
+            "GLOBAL_STATE_NO_LEAKED_GLOBAL_GUARD",
+            "GLOBAL_STATE_SEAM_INVARIANT_OK",
+            "GLOBAL_STATE_INVARIANT_OK",
+            "GLOBAL_STATE_INVARIANT_FAIL",
+            "GLOBAL_STATE_PROOF_DONE result=ok",
+            "GLOBAL_STATE_DIRECT_MUTATION_LEAK",
+        ] {
+            assert!(
+                ORCH_SRC.contains(m),
+                "orchestrator_state must emit marker {m}"
+            );
+        }
+        assert!(
+            CMDLINE_SRC.contains("GLOBAL_STATE_ENABLED"),
+            "cmdline apply must emit GLOBAL_STATE_ENABLED"
+        );
+    }
+
+    // Smoke plumbing + mode isolation + failure gates.
+    #[test]
+    fn stage176_smoke_profile() {
+        assert!(
+            SMOKE_SRC.contains("GLOBAL_STATE=${GLOBAL_STATE:-0}")
+                && SMOKE_SRC.contains("yarm.global_state=1"),
+            "smoke must plumb GLOBAL_STATE=1"
+        );
+        for m in [
+            "GLOBAL_STATE_ENABLED",
+            "GLOBAL_STATE_OWNER_HELPER_OK",
+            "GLOBAL_STATE_DIRECT_SITE_ALLOWED",
+            "GLOBAL_STATE_RANK_ORDER_OK",
+            "GLOBAL_STATE_NO_LEAKED_GLOBAL_GUARD",
+            "GLOBAL_STATE_INVARIANT_OK",
+            "GLOBAL_STATE_PROOF_DONE",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require {m}");
+        }
+        for f in [
+            "GLOBAL_STATE_DIRECT_MUTATION_LEAK",
+            "GLOBAL_STATE_RANK_INVERSION",
+            "GLOBAL_STATE_GUARD_HELD_ACROSS_USER_COPY",
+            "GLOBAL_STATE_GUARD_HELD_ACROSS_SWITCH",
+            "GLOBAL_STATE_GUARD_HELD_ACROSS_IPC_WRITEBACK",
+            "GLOBAL_STATE_OWNER_HELPER_BYPASS",
+            "GLOBAL_STATE_UNCLASSIFIED_SITE",
+            "GLOBAL_STATE_INVARIANT_FAIL",
+        ] {
+            assert!(SMOKE_SRC.contains(f), "smoke must gate on {f}");
+        }
+        assert!(
+            SMOKE_SRC.contains("FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE"),
+            "mode isolation must force GLOBAL_STATE off under D6 proof/switch-a"
+        );
+    }
+
+    // Invariants + no scope creep; D2/D6/... fallbacks preserved.
+    #[test]
+    fn stage176_invariants_and_fallbacks_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        // The D6/D2 fallback paths + prior-stage gates are untouched.
+        assert!(
+            SMOKE_SRC.contains("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+                && SMOKE_SRC.contains("D6_GENUINE_MUT_DISPATCH_ENTER")
+                && SMOKE_SRC.contains("yarm.vm_cow=1")
+                && SMOKE_SRC.contains("yarm.cap_cnode=1")
+                && SMOKE_SRC.contains("yarm.fault_delivery=1")
+                && SMOKE_SRC.contains("yarm.spawn_lifecycle=1"),
+            "D2/D6/VM-COW/CAP-CNODE/FAULT-DELIVERY/SPAWN-LIFECYCLE gates must remain"
+        );
+        // The audit is read-only: it must not call any *_mut seam.
+        let idx = ORCH_SRC
+            .find("fn maybe_run_global_state_audit(")
+            .expect("audit fn");
+        let body = &ORCH_SRC[idx..idx + 3200];
+        assert!(
+            !body.contains("_mut(") && !body.contains("_mut ("),
+            "the global-state audit must be read-only (no *_mut seam calls)"
+        );
+    }
+
+    // Docs: Stage 175/175B acceptance + Stage 176 section.
+    #[test]
+    fn stage176_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 176 — GLOBAL-STATE"),
+            "doc must add the Stage 176 GLOBAL-STATE section"
+        );
+        assert!(
+            DOC_SRC.contains("SPAWN-LIFECYCLE primary is\n**ACCEPTED**")
+                || DOC_SRC.contains("SPAWN-LIFECYCLE primary is **ACCEPTED**"),
+            "doc must record Stage 175/175B primary accepted"
+        );
+        assert!(
+            DOC_SRC.contains("instrumentation\nonly") || DOC_SRC.contains("instrumentation only"),
+            "doc must state Stage 176 is instrumentation only"
+        );
+    }
+}
