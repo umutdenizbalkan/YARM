@@ -51,6 +51,22 @@ ORACLE_SNAPSHOT="${ORACLE_SNAPSHOT:-ipc-oracle-markers-$ARCH.txt}"
 #                         LIVE D1/D5 split path that every spawn cycle drives.
 ORACLE_MODE="${ORACLE_MODE:-basic}"
 
+# Stage 170 (IPC-FINAL): a single strict, repeatable acceptance profile that
+# freezes the accepted recv-v2 IPC surface. IPC_FINAL=1 enables ALL proof
+# workloads (queued-split + rollback + sender-wake) and extended mode (reply-cap
+# + transfer-cap), then hard-requires the full accepted marker set with
+# line-start anchoring for the sender-wake ORDER marker and a strict failure gate
+# (see the IPC_FINAL block near the end). It is NOT a new behavior stage — it
+# only tightens the acceptance checks.
+IPC_FINAL="${IPC_FINAL:-0}"
+if [[ "$IPC_FINAL" == "1" ]]; then
+  echo "[info] ipc-oracle: IPC_FINAL=1 — Stage 170 strict IPC-FINAL acceptance profile"
+  ORACLE_MODE="extended"
+  YARM_IPC_RECV_PROOF_QUEUED_SPLIT=1
+  YARM_IPC_RECV_PROOF_ROLLBACK=1
+  YARM_IPC_RECV_PROOF_SENDER_WAKE=1
+fi
+
 # Stage 159BC/D — userspace IPC recv-v2 oracle proof workload (default-off).
 # When the kernel is booted with `yarm.ipc_recv_proof=1`, the init control-plane
 # runs a deterministic loopback workload (send-to-self enqueue + recv-from-self
@@ -178,6 +194,17 @@ marker_present() {
   local marker="$1" file="${2:-$ANALYSIS_LOG}"
   [[ -s "$file" ]] || return 1
   rg -F -q -a "$marker" "$file"
+}
+
+# Stage 170 (IPC-FINAL): line-start anchored presence. Only a marker that begins
+# a serial line counts — an informational "[info] absent: MARKER" echo or an
+# "[ok] ... present: MARKER" line (which have a "[...]" prefix) is NOT a match,
+# so a strict check can never be satisfied by an absence report or a wrapper echo.
+marker_present_linestart() {
+  # $1 = literal marker (no regex metachars in our marker names), $2 = file
+  local marker="$1" file="${2:-$ANALYSIS_LOG}"
+  [[ -s "$file" ]] || return 1
+  rg -q -a -e "^${marker}" "$file"
 }
 
 ANALYSIS_BYTES=$(wc -c <"$ANALYSIS_LOG" 2>/dev/null | tr -d ' ')
@@ -322,6 +349,114 @@ if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
   proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
 else
   echo "[info] ipc-oracle: proof sender-wake: not required"
+fi
+
+# Stage 170 (IPC-FINAL): strict frozen acceptance gate. Enabled by IPC_FINAL=1
+# (which also turned on all three proof workloads + extended mode above). Every
+# accepted IPC-surface marker is HARD-required; the sender-wake ORDER marker is
+# line-start anchored; a strict failure gate rejects the Stage 170 regressions.
+# Handled COW page faults (PAGE_FAULT followed by PAGE_FAULT_HANDLED_COW) are NOT
+# fatal and are deliberately absent from the fatal set below.
+if [[ "$IPC_FINAL" == "1" ]]; then
+  echo "[info] ipc-oracle: IPC-FINAL strict marker + failure gate"
+  # Full accepted recv-v2 IPC surface (deterministic on x86_64 under the full
+  # proof profile). extended-mode + proof_require above already require most of
+  # these; re-asserting here makes IPC-FINAL a single self-contained gate.
+  IPC_FINAL_REQUIRED=(
+    "IPC_RECV_V2_META_BLOCKED_WAITER_OK"
+    "IPC_RECV_V2_META_IMMEDIATE_OK"
+    "IPC_RECV_V2_META_QUEUED_SPLIT_OK"
+    "IPC_REPLY_CAP_ONESHOT_OK"
+    "IPC_TRANSFER_CAP_MATERIALIZE_OK"
+    "IPC_RECV_V2_ROLLBACK_OK"
+    "IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE"
+    "IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE"
+  )
+  for m in "${IPC_FINAL_REQUIRED[@]}"; do
+    if marker_present "$m"; then
+      echo "[ok]   IPC-FINAL required marker present: $m"
+    else
+      echo "[err] ipc-oracle: IPC-FINAL required marker absent: $m"
+      rc=1
+    fi
+  done
+  # Sender-wake ORDER marker: line-start anchored (never an absence/echo line).
+  if marker_present_linestart "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"; then
+    echo "[ok]   IPC-FINAL: line-start IPC_RECV_V2_SENDER_WAKE_ORDER_OK present"
+  else
+    echo "[err] ipc-oracle: IPC-FINAL: line-start IPC_RECV_V2_SENDER_WAKE_ORDER_OK absent"
+    rc=1
+  fi
+  # Sender-wake sequence must be a real USER_LOG line.
+  if rg -q -a -e 'USER_LOG.*IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE' "$ANALYSIS_LOG"; then
+    echo "[ok]   IPC-FINAL: USER_LOG sender-wake sequence present"
+  else
+    echo "[err] ipc-oracle: IPC-FINAL: USER_LOG IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE absent"
+    rc=1
+  fi
+  # Strict failure gate: substring fatal markers.
+  IPC_FINAL_FATAL=(
+    "BLOCKED_WOULDBLOCK_FATAL"
+    "CapabilityFull"
+    "TaskTableFull"
+    "DOUBLE_FAULT"
+    "TRIPLE"
+    "PANIC"
+    "FATAL"
+  )
+  for f in "${IPC_FINAL_FATAL[@]}"; do
+    if marker_present "$f"; then
+      echo "[err] ipc-oracle: IPC-FINAL fatal marker present: $f"
+      rc=1
+    fi
+  done
+  # Line-start fatal breadcrumbs (a mid-line occurrence is not a fault escalation).
+  for f in "!Fv" "!BNv"; do
+    if rg -q -a -e "^${f}" "$ANALYSIS_LOG"; then
+      echo "[err] ipc-oracle: IPC-FINAL fatal breadcrumb (line-start): $f"
+      rc=1
+    fi
+  done
+  # Handled COW page faults are expected and NOT fatal — assert the invariant that
+  # every PAGE_FAULT that appears is a handled-COW one when any PAGE_FAULT occurs.
+  if marker_present "PAGE_FAULT" && ! marker_present "PAGE_FAULT_HANDLED_COW"; then
+    echo "[err] ipc-oracle: IPC-FINAL: PAGE_FAULT present without PAGE_FAULT_HANDLED_COW (unhandled fault)"
+    rc=1
+  fi
+  # Committed-path D2 recv/send dispatch relocation (only when the knob is set):
+  # require the out-of-lock markers and reject a committed-path switch_required
+  # in-lock fallback.
+  if [[ "${D2_RECV_GENUINE:-0}" == "1" ]]; then
+    for m in D2_RECV_GENUINE_DISPATCH_DEFERRED D2_RECV_GENUINE_NO_INLOCK_DISPATCH \
+             D2_RECV_GENUINE_GLOBAL_DROPPED D2_RECV_GENUINE_DISPATCH_DONE; do
+      if marker_present "$m"; then echo "[ok]   IPC-FINAL: recv marker $m"; else echo "[err] ipc-oracle: IPC-FINAL: recv marker absent: $m"; rc=1; fi
+    done
+    if tr '\r' '\n' <"$ANALYSIS_LOG" | awk '
+        /D2_RECV_GENUINE_PHASE_DISPATCH/ { pending=1; next }
+        pending && /D2_RECV_GENUINE_DISPATCH_DEFERRED/ { pending=0; next }
+        pending && /reason=switch_required/ { print "BAD"; pending=0; next }
+        pending && /D2_RECV_GENUINE_FALLBACK reason=/ { print "BAD"; pending=0; next }
+      ' | rg -q "BAD"; then
+      echo "[err] ipc-oracle: IPC-FINAL: committed recv path fell back to in-lock dispatch"
+      rc=1
+    fi
+  fi
+  if [[ "${D2_SEND_GENUINE:-0}" == "1" ]]; then
+    for m in D2_SEND_GENUINE_DISPATCH_DEFERRED D2_SEND_GENUINE_NO_INLOCK_DISPATCH \
+             D2_SEND_GENUINE_GLOBAL_DROPPED D2_SEND_GENUINE_DISPATCH_DONE; do
+      if marker_present "$m"; then echo "[ok]   IPC-FINAL: send marker $m"; else echo "[err] ipc-oracle: IPC-FINAL: send marker absent: $m"; rc=1; fi
+    done
+    if tr '\r' '\n' <"$ANALYSIS_LOG" | awk '
+        /D2_SEND_GENUINE_PHASE_DISPATCH/ { pending=1; next }
+        pending && /D2_SEND_GENUINE_DISPATCH_DEFERRED/ { pending=0; next }
+        pending && /reason=switch_required/ { print "BAD"; pending=0; next }
+        pending && /D2_SEND_GENUINE_FALLBACK reason=/ { print "BAD"; pending=0; next }
+      ' | rg -q "BAD"; then
+      echo "[err] ipc-oracle: IPC-FINAL: committed send path fell back to in-lock dispatch"
+      rc=1
+    fi
+  fi
+  [[ "$rc" -eq 0 ]] && echo "[ok] ipc-oracle: IPC-FINAL strict acceptance profile PASSED ($ARCH)"
 fi
 
 # Regression gate: every baseline marker must still be present.

@@ -48025,3 +48025,250 @@ mod stage169_d2_send_genuine {
         );
     }
 }
+
+// Stage 170: IPC-FINAL — freeze the accepted recv-v2 IPC surface behind a single
+// strict `IPC_FINAL=1` oracle acceptance profile. Stability milestone: no runtime
+// behavior change. These are source-text guards over the oracle script, docs, and
+// invariants.
+mod stage170_ipc_final {
+    const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // Task B: IPC_FINAL=1 mode exists and enables all proof workloads + extended.
+    #[test]
+    fn stage170_ipc_final_mode_enables_full_profile() {
+        assert!(
+            ORACLE_SRC.contains("IPC_FINAL=\"${IPC_FINAL:-0}\""),
+            "oracle must define an IPC_FINAL mode"
+        );
+        let idx = ORACLE_SRC
+            .find("if [[ \"$IPC_FINAL\" == \"1\" ]]; then")
+            .expect("IPC_FINAL setup branch");
+        let setup = &ORACLE_SRC[idx..idx + 400];
+        assert!(
+            setup.contains("ORACLE_MODE=\"extended\"")
+                && setup.contains("YARM_IPC_RECV_PROOF_QUEUED_SPLIT=1")
+                && setup.contains("YARM_IPC_RECV_PROOF_ROLLBACK=1")
+                && setup.contains("YARM_IPC_RECV_PROOF_SENDER_WAKE=1"),
+            "IPC_FINAL must enable all proof workloads + extended mode"
+        );
+    }
+
+    // Task B: the full accepted IPC-surface marker set is hard-required.
+    #[test]
+    fn stage170_requires_full_accepted_marker_set() {
+        for m in [
+            "IPC_RECV_V2_META_BLOCKED_WAITER_OK",
+            "IPC_RECV_V2_META_IMMEDIATE_OK",
+            "IPC_RECV_V2_META_QUEUED_SPLIT_OK",
+            "IPC_REPLY_CAP_ONESHOT_OK",
+            "IPC_TRANSFER_CAP_MATERIALIZE_OK",
+            "IPC_RECV_V2_ROLLBACK_OK",
+            "IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE",
+            "IPC_RECV_PROOF_ROLLBACK_SEQUENCE_DONE",
+        ] {
+            assert!(
+                ORACLE_SRC.contains(m),
+                "IPC-FINAL required marker must be in the oracle: {m}"
+            );
+        }
+        assert!(
+            ORACLE_SRC.contains("IPC_FINAL_REQUIRED=("),
+            "IPC-FINAL must have a hard-required marker array"
+        );
+    }
+
+    // Task B/E: line-start anchoring for the sender-wake ORDER marker + no
+    // absent-marker false positives.
+    #[test]
+    fn stage170_line_start_sender_wake_order() {
+        assert!(
+            ORACLE_SRC.contains("marker_present_linestart"),
+            "oracle must define a line-start marker helper"
+        );
+        let idx = ORACLE_SRC
+            .find("fn marker_present_linestart")
+            .or_else(|| ORACLE_SRC.find("marker_present_linestart() {"))
+            .expect("line-start helper def");
+        let body = &ORACLE_SRC[idx..idx + 260];
+        assert!(
+            body.contains("^${marker}") || body.contains("^$marker"),
+            "the line-start helper must anchor with ^"
+        );
+        assert!(
+            ORACLE_SRC.contains("marker_present_linestart \"IPC_RECV_V2_SENDER_WAKE_ORDER_OK\""),
+            "the sender-wake ORDER marker must be checked line-start anchored"
+        );
+        // The USER_LOG sender-wake sequence must be a real USER_LOG line.
+        assert!(
+            ORACLE_SRC.contains("USER_LOG.*IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"),
+            "the sender-wake sequence must be matched as a USER_LOG line"
+        );
+    }
+
+    // Task C: failure gates present.
+    #[test]
+    fn stage170_failure_gates() {
+        for f in [
+            "BLOCKED_WOULDBLOCK_FATAL",
+            "CapabilityFull",
+            "TaskTableFull",
+            "DOUBLE_FAULT",
+            "TRIPLE",
+            "PANIC",
+            "FATAL",
+        ] {
+            assert!(
+                ORACLE_SRC.contains(f),
+                "IPC-FINAL failure gate must reject {f}"
+            );
+        }
+        assert!(
+            ORACLE_SRC.contains("IPC_FINAL_FATAL=("),
+            "IPC-FINAL must have a fatal-marker array"
+        );
+        // Line-start fatal breadcrumbs.
+        assert!(
+            ORACLE_SRC.contains("^${f}"),
+            "IPC-FINAL must anchor !Fv/!BNv breadcrumbs at line start"
+        );
+    }
+
+    // Task C: handled COW page faults are NOT fatal.
+    #[test]
+    fn stage170_handled_cow_not_fatal() {
+        // PAGE_FAULT is NOT in the fatal set.
+        let idx = ORACLE_SRC.find("IPC_FINAL_FATAL=(").expect("fatal array");
+        let arr = &ORACLE_SRC[idx..idx + 260];
+        assert!(
+            !arr.contains("PAGE_FAULT"),
+            "PAGE_FAULT must NOT be an IPC-FINAL fatal marker (handled COW is expected)"
+        );
+        assert!(
+            ORACLE_SRC.contains("PAGE_FAULT_HANDLED_COW"),
+            "IPC-FINAL must recognize handled-COW page faults"
+        );
+    }
+
+    // Task C: committed-path D2 recv/send switch_required fallback is rejected
+    // only when it occurs after PHASE_DISPATCH (awk pending-guard), and only when
+    // the respective knob is set.
+    #[test]
+    fn stage170_committed_fallback_rejected_conditionally() {
+        assert!(
+            ORACLE_SRC.contains("if [[ \"${D2_RECV_GENUINE:-0}\" == \"1\" ]]; then")
+                && ORACLE_SRC.contains("if [[ \"${D2_SEND_GENUINE:-0}\" == \"1\" ]]; then"),
+            "D2 recv/send IPC-FINAL checks must be conditional on the knob"
+        );
+        assert!(
+            ORACLE_SRC.contains("D2_RECV_GENUINE_PHASE_DISPATCH")
+                && ORACLE_SRC.contains("D2_SEND_GENUINE_PHASE_DISPATCH")
+                && ORACLE_SRC.contains("reason=switch_required"),
+            "IPC-FINAL must reject a committed-path switch_required fallback via the phase-anchored awk"
+        );
+    }
+
+    // Task E: D2 recv/send accepted out-of-lock marker sets required (conditional).
+    #[test]
+    fn stage170_d2_marker_sets_preserved() {
+        for m in [
+            "D2_RECV_GENUINE_DISPATCH_DEFERRED",
+            "D2_RECV_GENUINE_NO_INLOCK_DISPATCH",
+            "D2_RECV_GENUINE_GLOBAL_DROPPED",
+            "D2_RECV_GENUINE_DISPATCH_DONE",
+            "D2_SEND_GENUINE_DISPATCH_DEFERRED",
+            "D2_SEND_GENUINE_NO_INLOCK_DISPATCH",
+            "D2_SEND_GENUINE_GLOBAL_DROPPED",
+            "D2_SEND_GENUINE_DISPATCH_DONE",
+        ] {
+            assert!(ORACLE_SRC.contains(m), "IPC-FINAL must require D2 marker {m}");
+        }
+    }
+
+    // Task F: Stage 163P preserved — the oracle still requires the sender-wake
+    // sequence and the core smoke still auto-enables + checks it under send.
+    #[test]
+    fn stage170_stage163p_preserved() {
+        assert!(
+            ORACLE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE")
+                && ORACLE_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "the sender-wake oracle markers must remain required"
+        );
+        assert!(
+            SMOKE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK"),
+            "the core smoke must still check the sender-wake oracle under D2_SEND_GENUINE"
+        );
+    }
+
+    // Task E: invariants unchanged.
+    #[test]
+    fn stage170_invariants_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 and VARIANT_COUNT=23 must be unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+    }
+
+    // Task E: the x86_64-only D2 knobs are cfg-gated (no-op on AArch64/RISC-V).
+    #[test]
+    fn stage170_d2_knobs_x86_only() {
+        for apply in [
+            "if let Some(enabled) = parsed.d2_recv_genuine",
+            "if let Some(enabled) = parsed.d2_send_genuine",
+        ] {
+            let idx = CMDLINE_SRC.find(apply).unwrap_or_else(|| panic!("{apply} must exist"));
+            let block = &CMDLINE_SRC[idx..idx + 500];
+            assert!(
+                block.contains("#[cfg(target_arch = \"x86_64\")]"),
+                "{apply} must be x86_64-only"
+            );
+        }
+    }
+
+    // Task D/E: no new D3/D5/VM/CNode live-wire in this stage (freeze).
+    #[test]
+    fn stage170_no_scope_creep() {
+        for forbidden in [
+            "D3_GENUINE",
+            "D5_GENUINE",
+            "with_vm_user_spaces_split_mut(",
+            "with_memory_split_mut(",
+        ] {
+            assert!(
+                !TRAP_ENTRY_SRC.contains(forbidden),
+                "trap_entry must not live-wire {forbidden}"
+            );
+        }
+        // The send/recv paths carry only their D2 genuine instrumentation.
+        assert!(
+            !IPC_STATE_SRC.contains("D3_GENUINE") && !IPC_STATE_SRC.contains("D5_GENUINE"),
+            "ipc_state must not gain D3/D5 genuine wiring"
+        );
+    }
+
+    // Task A/I: docs record IPC-FINAL as a stability milestone.
+    #[test]
+    fn stage170_docs_ipc_final() {
+        assert!(
+            DOC_SRC.contains("Stage 170 — IPC-FINAL")
+                && DOC_SRC.contains("stability milestone"),
+            "doc must add the Stage 170 IPC-FINAL stability-milestone section"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 169 is **ACCEPTED**")
+                || (DOC_SRC.contains("Stage 169") && DOC_SRC.contains("D2_SEND_GENUINE=1 run produced")),
+            "doc must record Stage 169 accepted"
+        );
+    }
+}
