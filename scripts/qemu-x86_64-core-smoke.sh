@@ -26,7 +26,38 @@ QEMU_MEMORY=${QEMU_MEMORY:-512M}
 QEMU_SMP=1
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
+# Stage 168B (mode isolation): D6_SWITCH_PROOF, D6_SWITCH_A, and the
+# D6_GENUINE/D2_RECV_GENUINE family are MUTUALLY-EXCLUSIVE kernel modes.
+# Inherited/exported env from a prior run must never contaminate the current
+# one — a clean D6_SWITCH_PROOF=1 regression must not append the genuine cmdline
+# knobs nor check/require D6_GENUINE markers. Normalize here with a fixed
+# precedence before any cmdline knob is appended or any check block runs:
+#   D6_SWITCH_PROOF > D6_SWITCH_A > {D6_GENUINE, D2_RECV_GENUINE}
+# The genuine pair may run together; a higher-precedence mode forces the lower
+# ones off (with a warning). Set YARM_MODE_ISOLATION=0 to opt out.
 D6_SWITCH_PROOF=${D6_SWITCH_PROOF:-0}
+D6_SWITCH_A=${D6_SWITCH_A:-0}
+D6_GENUINE=${D6_GENUINE:-0}
+D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}
+YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
+if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
+  if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE; do
+      if [[ "${!_mode}" == "1" ]]; then
+        echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
+      fi
+      printf -v "$_mode" '%s' 0
+    done
+  elif [[ "$D6_SWITCH_A" == "1" ]]; then
+    for _mode in D6_GENUINE D2_RECV_GENUINE; do
+      if [[ "${!_mode}" == "1" ]]; then
+        echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
+      fi
+      printf -v "$_mode" '%s' 0
+    done
+  fi
+fi
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -787,6 +818,40 @@ if [[ "$D2_RECV_GENUINE" == "1" ]]; then
   else
     echo "[error] D2-RECV-GENUINE: no recv outcome marker observed"
     d2_recv_fail=1
+  fi
+  # Stage 168B: require evidence of at least one real BLOCKING recv whose
+  # queue-advancing dispatch was deferred and run OUTSIDE the global lock.
+  for d2b_marker in \
+    "D2_RECV_GENUINE_PHASE_TASK_BLOCK" \
+    "D2_RECV_GENUINE_PHASE_DISPATCH" \
+    "D2_RECV_GENUINE_DISPATCH_DEFERRED" \
+    "D2_RECV_GENUINE_GLOBAL_DROPPED" \
+    "D2_RECV_GENUINE_DISPATCH_ENTER" \
+    "D2_RECV_GENUINE_DISPATCH_STEP_SPLIT" \
+    "D2_RECV_GENUINE_DISPATCH_DONE"; do
+    if log_has_pattern "$d2b_marker"; then
+      echo "[ok] D2-RECV-GENUINE blocking-dispatch marker present: $d2b_marker"
+    else
+      echo "[error] D2-RECV-GENUINE blocking-dispatch marker missing: $d2b_marker"
+      d2_recv_fail=1
+    fi
+  done
+  # HARD requirement (Stage 168B): every blocking recv PHASE_DISPATCH must be
+  # followed by DISPATCH_DEFERRED (queue-advancing dispatch relocated OUT of the
+  # global lock) — NOT a D6 switch_required in-lock fallback or a D2 in-lock
+  # fallback. This is recv-path-specific: unrelated non-recv preemption may
+  # legitimately still emit D6_GENUINE_MUT_DISPATCH_FALLBACK reason=switch_required.
+  if [[ -f "$LOGFILE" ]]; then
+    bad_recv_fallback="$(tr '\r' '\n' <"$LOGFILE" | awk '
+      /D2_RECV_GENUINE_PHASE_DISPATCH/ { pending=1; next }
+      pending && /D2_RECV_GENUINE_DISPATCH_DEFERRED/ { pending=0; next }
+      pending && /D6_GENUINE_MUT_DISPATCH_FALLBACK reason=switch_required/ { print "BAD"; pending=0; next }
+      pending && /D2_RECV_GENUINE_FALLBACK reason=/ { print "BAD"; pending=0; next }
+    ')"
+    if [[ -n "$bad_recv_fallback" ]]; then
+      echo "[error] D2-RECV-GENUINE: blocking recv dispatch fell back in-lock (switch_required) instead of deferring out of lock (Stage 168B incomplete)"
+      d2_recv_fail=1
+    fi
   fi
   if [[ -f "$LOGFILE" ]]; then
     d2_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/D2_RECV_GENUINE_CANDIDATE/{seen=1} seen{print}')"

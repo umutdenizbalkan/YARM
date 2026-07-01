@@ -47444,3 +47444,279 @@ mod stage168_d6_genuine_b_and_d2_recv {
         );
     }
 }
+
+// Stage 168B: complete D2-GENUINE-RECV — the blocking recv's queue-advancing
+// dispatch is relocated OUT of the global lock (no longer falling back with
+// reason=switch_required), and the smoke script isolates the mutually-exclusive
+// modes so they cannot contaminate each other.
+mod stage168b_d2_recv_genuine_completion {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    // Task A: the smoke script isolates the mutually-exclusive modes so inherited
+    // env cannot contaminate a run (a clean D6_SWITCH_PROOF=1 run must not check
+    // or require D6_GENUINE markers).
+    #[test]
+    fn stage168b_script_mode_isolation() {
+        assert!(
+            SMOKE_SRC.contains("mode isolation")
+                && SMOKE_SRC.contains("YARM_MODE_ISOLATION"),
+            "smoke must have a mode-isolation normalization block"
+        );
+        // Proof precedence forces the genuine family off.
+        let iso_idx = SMOKE_SRC
+            .find("if [[ \"$D6_SWITCH_PROOF\" == \"1\" ]]; then")
+            .expect("proof precedence branch");
+        let iso = &SMOKE_SRC[iso_idx..iso_idx + 320];
+        assert!(
+            iso.contains("D6_GENUINE") && iso.contains("D2_RECV_GENUINE") && iso.contains("printf -v"),
+            "D6_SWITCH_PROOF=1 must force the genuine family off"
+        );
+        // The D6-GENUINE check block is gated on the (normalized) D6_GENUINE var,
+        // so a proof run (D6_GENUINE forced 0) does not check D6_GENUINE markers.
+        assert!(
+            SMOKE_SRC.contains("if [[ \"$D6_GENUINE\" == \"1\" ]]; then"),
+            "D6-GENUINE checks must be gated on the normalized D6_GENUINE variable"
+        );
+    }
+
+    // Task B: the blocking recv records a queue-advancing dispatch deferral and
+    // the trap entry drains it OUTSIDE the global lock (scheduler seam).
+    #[test]
+    fn stage168b_blocking_recv_defers_dispatch_out_of_lock() {
+        // ipc_state records the deferral instead of dispatching in-lock.
+        assert!(
+            IPC_STATE_SRC.contains("d2_recv_dispatch_try_defer")
+                && IPC_STATE_SRC.contains("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+                && IPC_STATE_SRC.contains("D2_RECV_GENUINE_NO_INLOCK_DISPATCH"),
+            "block_current_on_receive_with_deadline must defer the dispatch and skip in-lock dispatch"
+        );
+        // The trap-entry drain runs the queue-advancing dispatch via the seam.
+        assert!(
+            TRAP_ENTRY_SRC.contains("d2_recv_dispatch_is_deferred(cpu_idx)")
+                && TRAP_ENTRY_SRC.contains("shared.d2_recv_dispatch_step_mut(cpu)")
+                && TRAP_ENTRY_SRC.contains("D2_RECV_GENUINE_GLOBAL_DROPPED")
+                && TRAP_ENTRY_SRC.contains("D2_RECV_GENUINE_DISPATCH_ENTER")
+                && TRAP_ENTRY_SRC.contains("D2_RECV_GENUINE_DISPATCH_DONE"),
+            "trap entry must drain the deferred recv dispatch out of the global lock"
+        );
+        // The mutating dispatch runs dispatch_next_on under only the scheduler seam.
+        assert!(
+            RUNTIME_SRC.contains("fn d2_recv_dispatch_step_mut")
+                && RUNTIME_SRC.contains("D2_RECV_GENUINE_DISPATCH_STEP_SPLIT"),
+            "the D2 recv dispatch seam must call dispatch_next_on and emit STEP_SPLIT"
+        );
+        // Ordering: the drain runs after the global lock is dropped.
+        let drop_idx = TRAP_ENTRY_SRC
+            .find("let inner_result = inner_result?;")
+            .expect("global-lock drop point");
+        let drain_idx = TRAP_ENTRY_SRC
+            .find("shared.d2_recv_dispatch_step_mut(cpu)")
+            .expect("recv dispatch drain");
+        assert!(drain_idx > drop_idx, "the recv dispatch must run after the global lock is dropped");
+    }
+
+    // Task B/E: the accepted D2 recv path does NOT run the in-lock
+    // local_dispatch_step_split (it returns before dispatch_next_task).
+    #[test]
+    fn stage168b_no_inlock_dispatch_for_accepted_recv() {
+        let defer_idx = IPC_STATE_SRC
+            .find("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+            .expect("deferral marker");
+        // Between the deferral and the in-lock dispatch call there must be an
+        // early return that skips dispatch_next_task.
+        let inlock_idx = IPC_STATE_SRC[defer_idx..]
+            .find("let _ = self.dispatch_next_task()?;")
+            .map(|r| defer_idx + r)
+            .expect("in-lock recv dispatch fallback must still exist for ineligible cases");
+        let region = &IPC_STATE_SRC[defer_idx..inlock_idx];
+        assert!(
+            region.contains("return Ok(plan.blocked_tid);"),
+            "the eligible deferred recv must early-return before the in-lock dispatch"
+        );
+    }
+
+    // Task B: reverify + queue-advancing dispatch (not queue-neutral). The recv
+    // drain uses the real dispatch_next_on (advancing), not the observe read.
+    #[test]
+    fn stage168b_reverify_and_queue_advancing() {
+        assert!(
+            RUNTIME_SRC.contains("fn d2_recv_reverify_blocked")
+                && RUNTIME_SRC.contains("WaitReason::EndpointReceive(_)"),
+            "the drain must re-verify the recv task is still Blocked(EndpointReceive)"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK"),
+            "the drain must emit the reverify-ok marker before dispatching"
+        );
+        // The recv dispatch seam calls the MUTATING dispatch_next_on (advancing),
+        // distinct from the queue-neutral observe.
+        let m_idx = RUNTIME_SRC
+            .find("fn d2_recv_dispatch_step_mut")
+            .expect("recv dispatch seam");
+        let body = &RUNTIME_SRC[m_idx..m_idx + 700];
+        assert!(
+            body.contains("dispatch_next_on(dispatch_cpu)"),
+            "the recv dispatch must be the authoritative queue-advancing dispatch_next_on"
+        );
+    }
+
+    // Task B: the switch uses the hardened D6-SWITCH-A restore path, not a new
+    // switch mechanism.
+    #[test]
+    fn stage168b_reuses_hardened_switch_restore() {
+        assert!(
+            TRAP_ENTRY_SRC.contains("post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"),
+            "the recv drain must reuse the hardened post_switch restore"
+        );
+        // No new switch_frames call is introduced in the recv drain.
+        let drain_start = TRAP_ENTRY_SRC
+            .find("D2_RECV_GENUINE_GLOBAL_DROPPED")
+            .expect("recv drain start");
+        let drain_end = TRAP_ENTRY_SRC[drain_start..]
+            .find("Stage 117: drain the per-CPU switch plan stash")
+            .map(|r| drain_start + r)
+            .expect("stage 117 drain marker");
+        let drain = &TRAP_ENTRY_SRC[drain_start..drain_end];
+        assert!(
+            !drain.contains("switch_frames("),
+            "the recv drain must NOT introduce a new switch_frames call (reuse restore)"
+        );
+    }
+
+    // Task B/E: rollback / no-lost-wakeup preserved.
+    #[test]
+    fn stage168b_rollback_preserved() {
+        assert!(
+            IPC_STATE_SRC.contains("fn recv_block_unwind_race")
+                && IPC_STATE_SRC.contains("D2_RECV_GENUINE_ROLLBACK_OK"),
+            "the no-lost-wakeup unwind and its marker must be preserved"
+        );
+        // The deferral happens only on the committed (Published) path, after the
+        // QueueNonEmpty unwind branch.
+        let unwind_idx = IPC_STATE_SRC.find("recv_block_unwind_race(plan)").expect("unwind call");
+        let defer_idx = IPC_STATE_SRC.find("d2_recv_dispatch_try_defer").expect("defer");
+        assert!(
+            unwind_idx < defer_idx,
+            "the rollback branch must precede the commit/defer path"
+        );
+    }
+
+    // Task D/E: D2 SEND path untouched.
+    #[test]
+    fn stage168b_d2_send_untouched() {
+        assert!(
+            !IPC_STATE_SRC.contains("D2_SEND_GENUINE") && !IPC_STATE_SRC.contains("d2_send_genuine"),
+            "Stage 168B must not add a genuine send path (Stage 169)"
+        );
+        let send_idx = IPC_STATE_SRC
+            .find("fn block_current_on_send_with_deadline")
+            .expect("send-block orchestrator");
+        let send_region = &IPC_STATE_SRC[send_idx..send_idx + 1400];
+        assert!(
+            !send_region.contains("d2_recv_dispatch_try_defer")
+                && !send_region.contains("D2_RECV_GENUINE"),
+            "the send path must not carry the recv deferral or recv markers"
+        );
+    }
+
+    // Task D/E: no D3/D5 live-wire in the recv drain.
+    #[test]
+    fn stage168b_no_d3_d5_livewire() {
+        for forbidden in ["D3_GENUINE", "D5_GENUINE", "with_vm_user_spaces_split_mut("] {
+            assert!(
+                !TRAP_ENTRY_SRC.contains(forbidden),
+                "trap_entry must not live-wire {forbidden}"
+            );
+        }
+    }
+
+    // Task D/E: Stage 163P sender-wake and counts unchanged.
+    #[test]
+    fn stage168b_regressions_and_counts() {
+        assert!(
+            CMDLINE_SRC.contains("ipc_recv_proof_sender_wake"),
+            "Stage 163P sender-wake sub-knob must remain intact"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 and VARIANT_COUNT=23 must be unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+    }
+
+    // Task D: the deferral is x86_64-only and default-off (gate + cfg).
+    #[test]
+    fn stage168b_x86_only_default_off() {
+        assert!(
+            MOD_SRC.contains("D2_RECV_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;")
+                && MOD_SRC.contains("fn d2_recv_dispatch_try_defer"),
+            "the D2 recv dispatch deferral infra must exist"
+        );
+        // ipc_state defer block is x86_64-only.
+        let defer_idx = IPC_STATE_SRC
+            .find("d2_recv_dispatch_try_defer")
+            .expect("defer call");
+        let before = &IPC_STATE_SRC[defer_idx.saturating_sub(1000)..defer_idx];
+        assert!(
+            before.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "the recv dispatch deferral must be x86_64-only"
+        );
+        // runtime seam methods are x86_64-only.
+        for m in ["fn d2_recv_dispatch_step_mut", "fn d2_recv_reverify_blocked"] {
+            let idx = RUNTIME_SRC.find(m).unwrap_or_else(|| panic!("{m} must exist"));
+            let b = &RUNTIME_SRC[idx.saturating_sub(80)..idx];
+            assert!(b.contains("#[cfg(target_arch = \"x86_64\")]"), "{m} must be x86_64-only");
+        }
+    }
+
+    // Task E: docs mark 168A partial and 168B as the completion target, and gate
+    // Stage 169 (D2-GENUINE-SEND) on 168B QEMU acceptance.
+    #[test]
+    fn stage168b_docs_updated() {
+        assert!(
+            DOC_SRC.contains("Stage 168A") && DOC_SRC.contains("partial"),
+            "doc must mark Stage 168A as partially accepted"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 168B"),
+            "doc must add Stage 168B as the D2-GENUINE-RECV completion target"
+        );
+        assert!(
+            DOC_SRC.contains("D2-GENUINE-SEND") && DOC_SRC.contains("Stage 169"),
+            "doc must state Stage 169 (D2-GENUINE-SEND) is gated on 168B acceptance"
+        );
+    }
+
+    // Task E: the smoke recv checks require the out-of-lock dispatch markers and
+    // reject the recv-path switch_required fallback.
+    #[test]
+    fn stage168b_smoke_requires_out_of_lock_recv_dispatch() {
+        for m in [
+            "D2_RECV_GENUINE_DISPATCH_DEFERRED",
+            "D2_RECV_GENUINE_GLOBAL_DROPPED",
+            "D2_RECV_GENUINE_DISPATCH_ENTER",
+            "D2_RECV_GENUINE_DISPATCH_STEP_SPLIT",
+            "D2_RECV_GENUINE_DISPATCH_DONE",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require the out-of-lock recv marker {m}");
+        }
+        assert!(
+            SMOKE_SRC.contains("reason=switch_required")
+                && SMOKE_SRC.contains("Stage 168B incomplete"),
+            "smoke must reject the recv-path switch_required in-lock fallback"
+        );
+    }
+}

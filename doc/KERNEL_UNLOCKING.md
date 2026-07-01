@@ -4965,8 +4965,8 @@ mechanically complete (Stage 152). The roadmap, in order:
    borrow. Delete the helper-only fences for those two seams in the same PR.
    Gated on D6-GENUINE.
 
-   **D2-GENUINE-RECV — rank-clean blocking-recv phase live-wire (Stage 168).**
-   Under a new default-off `yarm.d2_recv_genuine=1` gate (x86_64-only; script:
+   **D2-GENUINE-RECV — rank-clean blocking-recv phase live-wire (Stage 168A,
+   PARTIAL).** Under a new default-off `yarm.d2_recv_genuine=1` gate (x86_64-only; script:
    `D2_RECV_GENUINE=1`), the canonical blocking-recv path
    (`ipc_recv_with_optional_deadline` → `block_current_on_receive_with_deadline`,
    which backs both `IpcRecv` and `IpcRecvTimeout`, plain and recv-v2) exposes its
@@ -4991,6 +4991,58 @@ mechanically complete (Stage 152). The roadmap, in order:
    `D6_GENUINE=1 D2_RECV_GENUINE=1` (must emit the D2 recv phase markers), normal
    x86_64 smoke, and the Stage 163P sender-wake oracle — all reaching service
    baseline with no `!Fv`/`!BNv`/`PAGE_FAULT`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/`FATAL`.
+
+   **Stage 168A PARTIAL result (user QEMU).** The queue-neutral D6 mutating
+   dispatch ran outside the global lock (`D6_GENUINE_MUT_DISPATCH_ELIGIBLE/
+   PREPARED/GLOBAL_DROPPED/ENTER/STEP_SPLIT/DONE/COUNT`) and the D2 recv phase
+   markers went live — but the **blocking recv is not complete**: every blocking
+   recv reached `D2_RECV_GENUINE_PHASE_DISPATCH` and then
+   `D6_GENUINE_MUT_DISPATCH_FALLBACK reason=switch_required`, i.e. the
+   queue-*advancing* dispatch a blocking recv needs still ran on the in-lock
+   fallback. So Stage 168A is **partial-accepted only**; the D2-GENUINE-RECV
+   target is finished by Stage 168B.
+
+   **D2-GENUINE-RECV COMPLETION (Stage 168B).** Moves the blocking recv's
+   queue-advancing dispatch OUT of the global lock. When
+   `block_current_on_receive_with_deadline` commits the block (waiter published,
+   recv task `Blocked` via Phase A `block_current` which removes it from
+   `current`), it no longer calls `dispatch_next_task` in-lock: instead it
+   records a per-CPU deferral (`d2_recv_dispatch_try_defer`) and emits
+   `D2_RECV_GENUINE_DISPATCH_DEFERRED` + `D2_RECV_GENUINE_NO_INLOCK_DISPATCH`,
+   returning without dispatching. After `handle_trap_entry_shared`'s `with_cpu`
+   returns and the global `SpinLock<KernelState>` guard is dropped, the trap
+   entry drains it: `D2_RECV_GENUINE_GLOBAL_DROPPED` → re-verify the recv task is
+   still `Blocked(EndpointReceive)` through the rank-2 task seam
+   (`D2_RECV_GENUINE_DISPATCH_REVERIFY_OK`) → `D2_RECV_GENUINE_DISPATCH_ENTER` →
+   run the authoritative **queue-advancing** `dispatch_next_on` through ONLY the
+   rank-1 scheduler seam (`d2_recv_dispatch_step_mut`,
+   `D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu=<n> result=switch|idle incoming=<t>`)
+   → commit `Running` via the rank-2 task seam → restore the incoming task's arch
+   thread state (frame + CR3) via the **hardened D6-SWITCH-A** re-acquire
+   (`post_switch_restore_arch_thread_state`; a user-task recv resumes via
+   trap-frame restore + syscall restart, so no new `switch_frames` mechanism is
+   introduced — the `D2_RECV_GENUINE_SWITCH_*` markers document the dormant
+   kernel-thread variant) → `D2_RECV_GENUINE_DISPATCH_DONE`. Fallbacks
+   (`D2_RECV_GENUINE_FALLBACK reason=…`) preserve the in-lock path for
+   `multi_cpu` / `no_trap_drainer` / `already_deferred` / `state_changed`; the
+   normal x86_64 `-smp 1` `D6_GENUINE=1 D2_RECV_GENUINE=1` blocking recv must NOT
+   fall back with `reason=switch_required` (the smoke gate enforces this on the
+   recv path specifically). The no-lost-wakeup rollback (`recv_block_unwind_race`
+   → `D2_RECV_GENUINE_ROLLBACK_OK`) is preserved (the deferral is only recorded
+   on the committed Published path). Task A hardens the smoke script with a
+   `YARM_MODE_ISOLATION` normalization (precedence
+   `D6_SWITCH_PROOF > D6_SWITCH_A > {D6_GENUINE, D2_RECV_GENUINE}`) so a clean
+   `D6_SWITCH_PROOF=1` run cannot inherit/require the genuine knobs or markers.
+   The D2 **send** path, D3/D5 seams, and IPC-FINAL remain untouched; ABI/counts
+   unchanged (SYSCALL_COUNT=31, VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32);
+   AArch64/RISC-V no-op. Guarded by `stage168b_d2_recv_genuine_completion`.
+   Acceptance (user QEMU, run each with `env -u` for the other modes): D6 proof
+   (clean, no D6_GENUINE markers), `D6_SWITCH_A`, `D6_GENUINE`,
+   `D6_GENUINE=1 D2_RECV_GENUINE=1` (must show a real blocking recv with
+   `PHASE_TASK_BLOCK` → `PHASE_DISPATCH` → `DISPATCH_DEFERRED` → `GLOBAL_DROPPED`
+   → `DISPATCH_ENTER` → `DISPATCH_STEP_SPLIT` → `DISPATCH_DONE` and no fatal),
+   normal x86_64 smoke, and the Stage 163P sender-wake oracle. **Stage 169
+   (D2-GENUINE-SEND) must NOT start until Stage 168B QEMU acceptance passes.**
    **PENDING user QEMU acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the

@@ -639,12 +639,57 @@ impl KernelState {
         );
         if crate::kernel::boot::d2_recv_genuine_enabled() {
             // Stage 168 (D2-GENUINE-RECV): ipc publish done; enter dispatch.
-            // Under `yarm.d6_genuine=1`, `dispatch_next_task` routes an eligible
-            // (queue-neutral) dispatch through the out-of-global-lock scheduler
-            // seam; a blocking recv usually requires a real switch, which stays
-            // on the preserved in-lock fallback (Stage 169+ relocates it).
             crate::yarm_log!("D2_RECV_GENUINE_PHASE_IPC_LOCK tid={}", plan.blocked_tid.0);
             crate::yarm_log!("D2_RECV_GENUINE_PHASE_DISPATCH tid={}", plan.blocked_tid.0);
+        }
+        // Stage 168B (D2-GENUINE-RECV completion): defer the queue-advancing
+        // dispatch OUT of the global KernelState lock. Phase A (`block_current`)
+        // removed the recv task from `current`, so the dispatch that follows
+        // genuinely advances the run queue — the case Stage 168A had to fall
+        // back on (reason=switch_required). When eligible, record a per-CPU
+        // deferral drained by the trap entry after the global guard drops and
+        // SKIP the in-lock authoritative dispatch entirely; the trap-entry drain
+        // runs the single authoritative `dispatch_next_on` under only the
+        // scheduler seam and the arch thread-state restore via the hardened
+        // D6-SWITCH-A path. Ineligible cases keep the in-lock dispatch fallback.
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernel::boot::d2_recv_genuine_enabled()
+            && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+            && !crate::kernel::boot::d6_switch_a_enabled()
+        {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.online_cpu_count() <= 1;
+            let already = crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx);
+            if trap_path
+                && single_cpu
+                && !already
+                && crate::kernel::boot::d2_recv_dispatch_try_defer(cpu_idx, plan.blocked_tid.0)
+            {
+                crate::yarm_log!(
+                    "D2_RECV_GENUINE_DISPATCH_DEFERRED tid={} cpu={}",
+                    plan.blocked_tid.0,
+                    cpu_idx
+                );
+                crate::yarm_log!("D2_RECV_GENUINE_NO_INLOCK_DISPATCH tid={}", plan.blocked_tid.0);
+                // The out-of-lock trap-entry drain performs the authoritative
+                // queue-advancing dispatch; do NOT dispatch in-lock here.
+                return Ok(plan.blocked_tid);
+            }
+            let reason = if !trap_path {
+                "no_trap_drainer"
+            } else if !single_cpu {
+                "multi_cpu"
+            } else {
+                "already_deferred"
+            };
+            crate::yarm_log!(
+                "D2_RECV_GENUINE_FALLBACK reason={} tid={}",
+                reason,
+                plan.blocked_tid.0
+            );
         }
         let _ = self.dispatch_next_task()?;
         Ok(plan.blocked_tid)
