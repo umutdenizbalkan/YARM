@@ -48476,12 +48476,12 @@ mod stage171_sched_timeout {
                 && SMOKE_SRC.contains("SCHED-TIMEOUT mode FAILED"),
             "smoke must reject stranded waiters / unsafe idle and fail the mode"
         );
-        // exactly-once wake check + fatal gate with handled-COW exception.
+        // exactly-once wake check + Stage 171B explicit unhandled-fault gate.
         assert!(
             SMOKE_SRC.contains("SCHED_TIMEOUT_RUNQUEUE_ENQUEUE")
                 && SMOKE_SRC.contains("BLOCKED_WOULDBLOCK_FATAL")
-                && SMOKE_SRC.contains("PAGE_FAULT_HANDLED_COW"),
-            "smoke must check exactly-once wake, fatal markers, and exempt handled COW"
+                && SMOKE_SRC.contains("PAGE_FAULT_UNHANDLED"),
+            "smoke must check exactly-once wake, fatal markers, and gate on explicit unhandled faults"
         );
         // sched_timeout is forced off under the pure proof/switch-a regressions.
         assert!(
@@ -48542,6 +48542,114 @@ mod stage171_sched_timeout {
         assert!(
             DOC_SRC.contains("indefinite by design"),
             "doc must state futex/join/poll are indefinite (no deadline)"
+        );
+    }
+}
+
+// Stage 171B: the SCHED_TIMEOUT (and IPC-FINAL) page-fault gate must fail ONLY on
+// explicit unhandled/fatal page-fault markers — never on benign PAGE_FAULT_*
+// diagnostic lines that a handled COW/DEMAND fault legitimately emits.
+mod stage171b_fault_gate {
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+
+    // The exact kernel markers this gate reasons about actually exist.
+    #[test]
+    fn stage171b_kernel_markers_exist() {
+        assert!(
+            FAULT_SRC.contains("\"PAGE_FAULT_HANDLED_COW\"")
+                && FAULT_SRC.contains("\"PAGE_FAULT_HANDLED_DEMAND\""),
+            "handled-fault markers must exist in fault_state.rs"
+        );
+        assert!(
+            FAULT_SRC.contains("PAGE_FAULT_UNHANDLED tid="),
+            "the explicit unhandled-fault marker must exist in fault_state.rs"
+        );
+    }
+
+    // The SCHED_TIMEOUT gate no longer uses the flawed "PAGE_FAULT without
+    // PAGE_FAULT_HANDLED_COW" heuristic.
+    #[test]
+    fn stage171b_smoke_gate_is_explicit_marker_based() {
+        assert!(
+            !SMOKE_SRC.contains("PAGE_FAULT without PAGE_FAULT_HANDLED_COW"),
+            "the flawed per-group PAGE_FAULT heuristic must be removed from the smoke"
+        );
+        // The SCHED-TIMEOUT block gates on the explicit unhandled/fatal markers.
+        let idx = SMOKE_SRC
+            .find("Stage 171B: page-fault gate")
+            .expect("Stage 171B fault-gate comment must be present in the smoke");
+        let block = &SMOKE_SRC[idx..idx + 600];
+        for m in ["PAGE_FAULT_UNHANDLED", "PAGE_FAULT_FATAL", "PAGE_FAULT_NOT_HANDLED"] {
+            assert!(block.contains(m), "smoke fault gate must fail on {m}");
+        }
+        // Benign diagnostic tokens must NOT be treated as fatal (not in the gate).
+        for benign in [
+            "'PAGE_FAULT_HW_REGS'",
+            "'PAGE_FAULT_ENTRY'",
+            "'PAGE_FAULT_FRAME_WORDS'",
+            "'PAGE_FAULT_RAW'",
+        ] {
+            assert!(
+                !SMOKE_SRC.contains(benign),
+                "benign diagnostic {benign} must not be a fatal pattern"
+            );
+        }
+    }
+
+    // The oracle IPC-FINAL gate received the same fix.
+    #[test]
+    fn stage171b_oracle_gate_is_explicit_marker_based() {
+        assert!(
+            !ORACLE_SRC.contains("PAGE_FAULT present without PAGE_FAULT_HANDLED_COW"),
+            "the flawed heuristic must be removed from the oracle too"
+        );
+        for m in ["PAGE_FAULT_UNHANDLED", "PAGE_FAULT_FATAL", "PAGE_FAULT_NOT_HANDLED"] {
+            assert!(
+                ORACLE_SRC.contains(m),
+                "oracle IPC-FINAL fault gate must fail on {m}"
+            );
+        }
+    }
+
+    // Raw fatal breadcrumbs and the real Stage 171 gates are preserved.
+    #[test]
+    fn stage171b_real_gates_preserved() {
+        // ^!Fv / ^!BNv still line-start fatal.
+        assert!(
+            SMOKE_SRC.contains("'^!Fv'") && SMOKE_SRC.contains("'^!BNv'"),
+            "line-start !Fv/!BNv fatal breadcrumbs must remain"
+        );
+        // Stranded waiter, enabled marker, idle diagnostics, exactly-once wake.
+        for m in [
+            "SCHED_TIMEOUT_STRANDED_WAITER",
+            "SCHED_TIMEOUT_ENABLED",
+            "SCHED_IDLE_NO_PENDING_TIMEOUT",
+            "SCHED_IDLE_TIMEOUT_SAFE",
+            "expired ($exp_n) != runqueue-enqueue",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "SCHED-TIMEOUT gate must still enforce: {m}");
+        }
+        // Mode isolation still forces SCHED_TIMEOUT off under proof/switch-a.
+        assert!(
+            SMOKE_SRC.contains("D2_SEND_GENUINE SCHED_TIMEOUT"),
+            "mode isolation must still force SCHED_TIMEOUT off under proof/switch-a"
+        );
+    }
+
+    // Task D: docs record the Stage 171B fix.
+    #[test]
+    fn stage171b_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 171B"),
+            "doc must add a Stage 171B note"
+        );
+        assert!(
+            DOC_SRC.contains("PAGE_FAULT_UNHANDLED")
+                && (DOC_SRC.contains("false") || DOC_SRC.contains("handled COW")),
+            "doc must explain the narrowed fault gate"
         );
     }
 }
