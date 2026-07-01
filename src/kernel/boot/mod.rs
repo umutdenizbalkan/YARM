@@ -848,6 +848,91 @@ pub(crate) fn d2_recv_dispatch_clear(cpu_idx: usize) {
     D2_RECV_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+/// Stage 169 (D2-GENUINE-SEND): x86_64-only, default-off gate that runs the
+/// blocking-SEND path (endpoint full / synchronous no-waiter) through explicit
+/// rank-clean scheduler/task/IPC phase markers and relocates its queue-advancing
+/// dispatch OUT of the global lock, exactly as Stage 168B did for recv. When OFF
+/// (default) the send path is byte-identical to Stage 168B (no behavior change);
+/// the Stage 163P sender-wake oracle is preserved on both paths.
+/// VALIDATION: D2_SEND_GENUINE_ENABLED.
+pub(crate) static D2_SEND_GENUINE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_d2_send_genuine_enabled(enabled: bool) {
+    D2_SEND_GENUINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn d2_send_genuine_enabled() -> bool {
+    D2_SEND_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 169: global count of blocking-send queue-advancing dispatches that ran
+/// through the scheduler seam OUTSIDE the global lock.
+pub(crate) static D2_SEND_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 169: per-CPU "blocking-send dispatch deferred" flag (mirrors the
+/// Stage 168B recv deferral). Set by the in-lock
+/// `block_current_on_send_with_deadline` after the sender-waiter is published
+/// and the sender is `Blocked(EndpointSend)`; drained out of the global lock by
+/// the trap entry. VALIDATION: D2_SEND_GENUINE_DISPATCH_DEFERRED.
+pub(crate) static D2_SEND_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 169: per-CPU blocked (outgoing) sender TID recorded with the deferral
+/// so the drain can re-verify `Blocked(EndpointSend)` before dispatching
+/// (`u64::MAX` sentinel = unset).
+pub(crate) static D2_SEND_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 169: record a deferred blocking-send dispatch intent for `cpu`.
+/// Returns false (caller must fall back to the in-lock dispatch) if an intent
+/// is already pending — no nested deferral.
+pub(crate) fn d2_send_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    if D2_SEND_DISPATCH_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    D2_SEND_DISPATCH_OUTGOING[cpu_idx].store(outgoing, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Stage 169: is a deferred blocking-send dispatch pending for `cpu`?
+pub(crate) fn d2_send_dispatch_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && D2_SEND_DISPATCH_DEFERRED[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 169: read the deferred blocking-send outgoing TID for `cpu`.
+pub(crate) fn d2_send_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let v = D2_SEND_DISPATCH_OUTGOING[cpu_idx].load(core::sync::atomic::Ordering::Acquire);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Stage 169: clear the blocking-send dispatch deferral for `cpu`.
+pub(crate) fn d2_send_dispatch_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    D2_SEND_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
+    D2_SEND_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

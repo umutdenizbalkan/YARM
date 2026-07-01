@@ -660,6 +660,52 @@ impl SharedKernel {
         })
     }
 
+    /// Stage 169 (D2-GENUINE-SEND): re-verify — out of the global lock, through
+    /// the rank-2 task seam — that the deferred blocking-SEND task is STILL
+    /// `Blocked(EndpointSend(_))` before the out-of-lock queue-advancing dispatch
+    /// drain runs. Same correctness fence as the recv reverify.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d2_send_reverify_blocked(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| {
+                    matches!(
+                        tcb.status,
+                        crate::kernel::task::TaskStatus::Blocked(
+                            crate::kernel::task::WaitReason::EndpointSend(_)
+                        )
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Stage 169 (D2-GENUINE-SEND): the authoritative queue-advancing dispatch
+    /// for a committed blocking send, run through the rank-1 scheduler seam with
+    /// the global `SpinLock<KernelState>` already dropped by the trap-entry
+    /// drain. The blocked sender was removed from `current` (Phase A
+    /// `block_current`), so `dispatch_next_on` genuinely dequeues the next
+    /// runnable task here. Emits `D2_SEND_GENUINE_DISPATCH_STEP_SPLIT`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d2_send_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            let incoming = kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(dispatch_cpu)
+                .map(|tid| tid.0);
+            let result = if incoming.is_some() { "switch" } else { "idle" };
+            crate::yarm_log!(
+                "D2_SEND_GENUINE_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
+                cpu.0,
+                result,
+                incoming
+            );
+            incoming
+        })
+    }
+
     /// Stage 168B (D2-GENUINE-RECV): does the incoming task have an initialized
     /// kernel switch context (a wired kernel thread)? Read out of the global
     /// lock through the rank-2 task seam. Blocking recv is done by USER tasks,

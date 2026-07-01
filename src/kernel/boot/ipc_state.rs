@@ -702,6 +702,7 @@ impl KernelState {
         msg: Message,
         deadline: Option<u64>,
     ) -> Result<ThreadId, KernelError> {
+        // Phase A (scheduler rank 1) → Phase B (task rank 2): block + Blocked TCB.
         let blocked_tid = self.block_current_cpu().ok_or(KernelError::TaskMissing)?;
         crate::yarm_log!("SCHED_BLOCK tid={}", blocked_tid);
         self.with_tcbs_mut(|tcbs| {
@@ -715,6 +716,12 @@ impl KernelState {
             tcb.ipc_timeout_fired = false;
             Ok::<_, KernelError>(())
         })?;
+        if crate::kernel::boot::d2_send_genuine_enabled() {
+            crate::yarm_log!("D2_SEND_GENUINE_PHASE_TASK_BLOCK tid={}", blocked_tid);
+        }
+        // Phase C (ipc rank 3): publish the sender-waiter (its message rides with
+        // it, so the receiver-side wake/handoff and the Stage 163P sender-wake
+        // oracle are unchanged).
         self.enqueue_sender_waiter(
             endpoint_idx,
             SenderWaiter {
@@ -722,6 +729,57 @@ impl KernelState {
                 msg,
             },
         )?;
+        if crate::kernel::boot::d2_send_genuine_enabled() {
+            crate::yarm_log!("D2_SEND_GENUINE_PHASE_IPC_LOCK tid={}", blocked_tid);
+            crate::yarm_log!("D2_SEND_GENUINE_PHASE_DISPATCH tid={}", blocked_tid);
+        }
+        // Stage 169 (D2-GENUINE-SEND): defer the queue-advancing dispatch OUT of
+        // the global lock, exactly as Stage 168B did for recv. Phase A
+        // (`block_current`) removed the sender from `current`, so the dispatch
+        // that follows genuinely advances the run queue. When eligible, record a
+        // per-CPU deferral drained by the trap entry after the global guard drops
+        // and SKIP the in-lock authoritative dispatch entirely.
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernel::boot::d2_send_genuine_enabled()
+            && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+            && !crate::kernel::boot::d6_switch_a_enabled()
+        {
+            let cpu_idx = self.current_cpu().0 as usize;
+            let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
+                && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+                    .load(core::sync::atomic::Ordering::Relaxed);
+            let single_cpu = self.online_cpu_count() <= 1;
+            let already = crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx);
+            if trap_path
+                && single_cpu
+                && !already
+                && crate::kernel::boot::d2_send_dispatch_try_defer(cpu_idx, blocked_tid)
+            {
+                crate::yarm_log!(
+                    "D2_SEND_GENUINE_DISPATCH_DEFERRED tid={} cpu={}",
+                    blocked_tid,
+                    cpu_idx
+                );
+                crate::yarm_log!("D2_SEND_GENUINE_NO_INLOCK_DISPATCH tid={}", blocked_tid);
+                crate::yarm_log!("D2_SEND_GENUINE_BLOCKED_OK tid={}", blocked_tid);
+                crate::yarm_log!("D2_SEND_GENUINE_DONE result=blocked tid={}", blocked_tid);
+                // The out-of-lock trap-entry drain performs the authoritative
+                // queue-advancing dispatch; do NOT dispatch in-lock here.
+                return Ok(ThreadId(blocked_tid));
+            }
+            let reason = if !trap_path {
+                "no_trap_drainer"
+            } else if !single_cpu {
+                "multi_cpu"
+            } else {
+                "already_deferred"
+            };
+            crate::yarm_log!(
+                "D2_SEND_GENUINE_FALLBACK reason={} tid={}",
+                reason,
+                blocked_tid
+            );
+        }
         let _ = self.dispatch_next_task()?;
         Ok(ThreadId(blocked_tid))
     }
@@ -2032,6 +2090,21 @@ impl KernelState {
         }
 
         let endpoint_idx = self.resolve_endpoint_index(capability.object)?;
+        // Stage 169 (D2-GENUINE-SEND): rank-clean phase instrumentation for the
+        // blocking-send path, default-off behind `yarm.d2_send_genuine=1`
+        // (settable on x86_64 only). CAP phase is complete here; the block +
+        // dispatch phases (and the out-of-global-lock dispatch relocation) are in
+        // `block_current_on_send_with_deadline`. Immediate delivery / queued send
+        // are byte-identical whether the knob is on or off.
+        if crate::kernel::boot::d2_send_genuine_enabled() {
+            let d2_send_tid = self.current_tid().unwrap_or(0);
+            crate::yarm_log!(
+                "D2_SEND_GENUINE_CANDIDATE tid={} endpoint={}",
+                d2_send_tid,
+                endpoint_idx
+            );
+            crate::yarm_log!("D2_SEND_GENUINE_PHASE_CAP_OK tid={}", d2_send_tid);
+        }
 
         // Phase 0: snapshot endpoint mode under ipc_state_lock.
         let endpoint_mode = self
@@ -2199,6 +2272,11 @@ impl KernelState {
             ipc.telemetry.queued_sends = ipc.telemetry.queued_sends.saturating_add(1);
         });
         self.wake_waiter_for_endpoint(endpoint_idx)?;
+        if crate::kernel::boot::d2_send_genuine_enabled() {
+            let d2_send_tid = self.current_tid().unwrap_or(0);
+            crate::yarm_log!("D2_SEND_GENUINE_IMMEDIATE_OK tid={}", d2_send_tid);
+            crate::yarm_log!("D2_SEND_GENUINE_DONE result=immediate tid={}", d2_send_tid);
+        }
         Ok(())
     }
 
