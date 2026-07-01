@@ -149,14 +149,31 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         let _ = enabled;
     }
     if let Some(enabled) = parsed.d6_genuine {
-        // Stage 167 (D6-GENUINE-A): x86_64-only gate that makes the rank-1
-        // scheduler split seam its first live production caller (default-off
-        // observe wire in handle_trap_entry_shared). No-op on other arches.
+        // Stage 167 (D6-GENUINE-A) / Stage 168 (D6-GENUINE-B): x86_64-only gate
+        // that makes the rank-1 scheduler split seam its first live production
+        // caller and (Stage 168) relocates the authoritative mutating dispatch
+        // out of the global lock for the eligible queue-neutral slice. No-op on
+        // other arches.
         #[cfg(target_arch = "x86_64")]
         {
             crate::kernel::boot::set_d6_genuine_enabled(enabled);
             if enabled {
                 crate::yarm_log!("D6_GENUINE_ENABLED");
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = enabled;
+    }
+    if let Some(enabled) = parsed.d2_recv_genuine {
+        // Stage 168 (D2-GENUINE-RECV): x86_64-only gate that runs the blocking
+        // recv path through explicit rank-clean scheduler/task/IPC phase markers
+        // and uses the Stage 168 out-of-global-lock dispatch seam where eligible.
+        // No-op on other arches.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::kernel::boot::set_d2_recv_genuine_enabled(enabled);
+            if enabled {
+                crate::yarm_log!("D2_RECV_GENUINE_ENABLED");
             }
         }
         #[cfg(not(target_arch = "x86_64"))]
@@ -264,6 +281,12 @@ pub struct YarmBootOptions<'a> {
     /// lock per eligible trap. Default-off; non-x86_64 builds parse but ignore
     /// it so AArch64/RISC-V behavior is unchanged.
     pub d6_genuine: Option<bool>,
+    /// Stage 168 (D2-GENUINE-RECV): `yarm.d2_recv_genuine=1` gates the x86_64-only,
+    /// default-off blocking-recv rank-clean phase live-wire (scheduler/task/IPC
+    /// phase markers + Stage 168 out-of-global-lock dispatch seam where eligible).
+    /// Default-off; non-x86_64 builds parse but ignore it so AArch64/RISC-V
+    /// behavior is unchanged.
+    pub d2_recv_genuine: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -355,6 +378,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.d6_genuine" {
             options.d6_genuine = parse_bool_knob(value);
+        }
+        if key == b"yarm.d2_recv_genuine" {
+            options.d2_recv_genuine = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

@@ -44,6 +44,13 @@ D6_GENUINE=${D6_GENUINE:-0}
 if [[ "$D6_GENUINE" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_genuine="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_genuine=1"
 fi
+# Stage 168 (D2-GENUINE-RECV): D2_RECV_GENUINE=1 appends yarm.d2_recv_genuine=1 to
+# run the blocking-recv path through explicit rank-clean phase markers and (with
+# D6_GENUINE=1) the out-of-global-lock dispatch seam where eligible (x86_64-only).
+D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}
+if [[ "$D2_RECV_GENUINE" == "1" && "$KERNEL_CMDLINE" != *"yarm.d2_recv_genuine="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d2_recv_genuine=1"
+fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
 # whenever any proof requirement env var is enabled, so honor it here.
@@ -730,11 +737,71 @@ if [[ "$D6_GENUINE" == "1" ]]; then
       fi
     done
   fi
+  # Stage 168 (D6-GENUINE-B): require evidence that the AUTHORITATIVE mutating
+  # dispatch ran through the scheduler seam AFTER the global lock was dropped.
+  for m_marker in \
+    "D6_GENUINE_MUT_DISPATCH_GLOBAL_DROPPED" \
+    "D6_GENUINE_MUT_DISPATCH_ENTER" \
+    "D6_GENUINE_MUT_DISPATCH_STEP_SPLIT" \
+    "D6_GENUINE_MUT_DISPATCH_DONE" \
+    "D6_GENUINE_MUT_DISPATCH_COUNT"; do
+    if log_has_pattern "$m_marker"; then
+      echo "[ok] D6-GENUINE-B mutating-dispatch marker present: $m_marker"
+    else
+      echo "[error] D6-GENUINE-B mutating-dispatch marker missing: $m_marker"
+      genuine_fail=1
+    fi
+  done
   if [[ "$genuine_fail" -eq 1 ]]; then
     echo "[error] D6-GENUINE mode FAILED"
     exit 1
   fi
-  echo "[ok] D6-GENUINE: genuine scheduler-seam dispatch observation outside the global lock"
+  echo "[ok] D6-GENUINE: authoritative mutating dispatch ran outside the global lock"
+fi
+
+# Stage 168 (D2-GENUINE-RECV): when booted with yarm.d2_recv_genuine=1, require
+# evidence of the rank-clean recv phase markers and reject any fatal breadcrumb
+# after the recv wire begins.
+if [[ "$D2_RECV_GENUINE" == "1" ]]; then
+  d2_recv_fail=0
+  echo "[ok] D2_RECV_GENUINE enabled marker:" $(log_has_pattern "D2_RECV_GENUINE_ENABLED" && echo present || echo MISSING)
+  # Core rank-clean phase markers that must appear for any blocking recv.
+  for d2_marker in \
+    "D2_RECV_GENUINE_CANDIDATE" \
+    "D2_RECV_GENUINE_PHASE_CAP_OK" \
+    "D2_RECV_GENUINE_PHASE_IPC_LOCK" \
+    "D2_RECV_GENUINE_DONE"; do
+    if log_has_pattern "$d2_marker"; then
+      echo "[ok] D2-RECV-GENUINE marker present: $d2_marker"
+    else
+      echo "[error] D2-RECV-GENUINE marker missing: $d2_marker"
+      d2_recv_fail=1
+    fi
+  done
+  # At least one of the block/immediate outcome markers must appear.
+  if log_has_pattern "D2_RECV_GENUINE_BLOCKED_OK" \
+     || log_has_pattern "D2_RECV_GENUINE_IMMEDIATE_OK" \
+     || log_has_pattern "D2_RECV_GENUINE_TIMEOUT_OK" \
+     || log_has_pattern "D2_RECV_GENUINE_NOWAIT_OK"; then
+    echo "[ok] D2-RECV-GENUINE outcome marker present (block/immediate/timeout/nowait)"
+  else
+    echo "[error] D2-RECV-GENUINE: no recv outcome marker observed"
+    d2_recv_fail=1
+  fi
+  if [[ -f "$LOGFILE" ]]; then
+    d2_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/D2_RECV_GENUINE_CANDIDATE/{seen=1} seen{print}')"
+    for fatal_pat in '!Fv' '!BNv' 'PAGE_FAULT' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$d2_tail" | rg -a -F -q -- "$fatal_pat"; then
+        echo "[error] D2-RECV-GENUINE: fatal breadcrumb after recv wire start: $fatal_pat"
+        d2_recv_fail=1
+      fi
+    done
+  fi
+  if [[ "$d2_recv_fail" -eq 1 ]]; then
+    echo "[error] D2-RECV-GENUINE mode FAILED"
+    exit 1
+  fi
+  echo "[ok] D2-RECV-GENUINE: rank-clean blocking-recv phases observed"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

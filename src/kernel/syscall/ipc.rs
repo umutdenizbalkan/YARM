@@ -739,7 +739,15 @@ pub(super) fn handle_ipc_recv_timeout(
         // the raw timeout_ticks==0 check.  Deadline logic is preserved as-is:
         // preread_deadline takes priority over ipc_recv_with_deadline.
         match request.blocking {
-            RecvBlockingPolicy::NoWait => kernel.try_ipc_recv(cap).map_err(SyscallError::from)?,
+            RecvBlockingPolicy::NoWait => {
+                // Stage 168 (D2-GENUINE-RECV): non-blocking probe preserves the
+                // existing immediate try-recv semantics (no block, no dispatch).
+                let r = kernel.try_ipc_recv(cap).map_err(SyscallError::from)?;
+                if crate::kernel::boot::d2_recv_genuine_enabled() {
+                    crate::yarm_log!("D2_RECV_GENUINE_NOWAIT_OK tid={}", recv_tid);
+                }
+                r
+            }
             RecvBlockingPolicy::Deadline(_) => {
                 if let Some(deadline) = preread_deadline {
                     kernel
