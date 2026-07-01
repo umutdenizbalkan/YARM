@@ -249,6 +249,16 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("GLOBAL_STATE_ENABLED");
         }
     }
+    if let Some(enabled) = parsed.smp_ready {
+        // Stage 177 (SMP-READY): arch-neutral, default-off DIAGNOSTIC gate for the
+        // x86_64 SMP-readiness audit markers + one-shot audit. Changes no state/ABI/
+        // SMP behavior (APs stay out of the production scheduler) — only emits
+        // SMP_READY_* markers.
+        crate::kernel::boot::set_smp_ready_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("SMP_READY_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -386,6 +396,10 @@ pub struct YarmBootOptions<'a> {
     /// default-off remaining direct global-`KernelState` mutation audit + lock-rank
     /// discipline DIAGNOSTIC markers + one-shot audit (no behavior/ABI change).
     pub global_state: Option<bool>,
+    /// Stage 177 (SMP-READY): `yarm.smp_ready=1` gates the arch-neutral, default-off
+    /// x86_64 SMP-readiness audit (AP bring-up / per-CPU / remote-wake + IPI
+    /// readiness) DIAGNOSTIC markers + one-shot audit (no behavior/ABI/SMP change).
+    pub smp_ready: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -501,6 +515,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.global_state" {
             options.global_state = parse_bool_knob(value);
+        }
+        if key == b"yarm.smp_ready" {
+            options.smp_ready = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

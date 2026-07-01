@@ -5813,8 +5813,97 @@ Acceptance (user QEMU): (1) `GLOBAL_STATE=1` smoke (primary); (2)
 `SPAWN_LIFECYCLE=1`; (3) `FAULT_DELIVERY=1`; (4) `CAP_CNODE=1`; (5) `VM_COW=1`; (6)
 `SCHED_TIMEOUT=1`; (7) `IPC_FINAL=1` oracle; (8) `D2_RECV_GENUINE=1`; (9)
 `D2_SEND_GENUINE=1`; (10) normal smoke; (11) `D6_SWITCH_A=1`; (12) 5-min
-`D6_SWITCH_PROOF=1`; (13) Stage 163P sender-wake oracle. **PENDING user QEMU
-acceptance.**
+`D6_SWITCH_PROOF=1`; (13) Stage 163P sender-wake oracle.
+
+**PRIMARY ACCEPTED (user QEMU, 2026).** The primary `GLOBAL_STATE=1` run reached the
+service baseline with `GLOBAL_STATE_ENABLED`, the site classifications
+(`OWNER_HELPER_OK` + `DIRECT_SITE_ALLOWED`), `RANK_ORDER_OK`,
+`NO_LEAKED_GLOBAL_GUARD`, `INVARIANT_OK`, and `PROOF_DONE result=ok`, and none of the
+`GLOBAL_STATE_*` failure markers or fatal breadcrumbs. Stage 176 GLOBAL-STATE primary
+is **ACCEPTED**; it was instrumentation-only (no unauthorized direct global mutation
+site was found). The full regression matrix (rows 2–13) is **PENDING user QEMU
+re-run**. Stage 177 (SMP-READY) is the next frontier.
+
+### 7.1.13 Stage 177 — SMP-READY (x86_64 SMP audit + AP bring-up / per-CPU / remote-wake readiness diagnostics)
+
+**Next kernel-unlocking frontier after GLOBAL-STATE.** Audits and instruments x86_64
+SMP readiness — AP bring-up, per-CPU scheduler/idle state, and remote-wake/IPI
+readiness — behind a default-off arch-neutral diagnostic profile
+(`yarm.smp_ready=1`, script `SMP_READY=1`, marker `SMP_READY_ENABLED`). This landed
+as **Option B (audit/refactor complete, explicit fallback markers, no behavior
+change)** — see the honesty note below. It is **instrumentation only**; **no real
+bug** was found.
+
+**x86_64 SMP audit result.** The audit found the SMP module is ALREADY in good shape:
+- **Trampoline/Rust split already done** (Stage 108, AI_AGENT_RULES §5.2): the AP
+  16/32/64-bit startup assembly + trampoline-page encoding live in the sibling
+  `smp_trampoline` module; `smp.rs` keeps only the Rust bring-up (LAPIC INIT-SIPI
+  sequencing, handoff construction, AP online/park accounting). **No further split
+  was needed** and none was forced (splitting a boot-critical path without QEMU
+  evidence would be reckless).
+- **AP bring-up state:** the BSP sends INIT-SIPI-SIPI; the AP reaches the trampoline
+  (`X86_AP_TRAMPOLINE_REACHED`), publishes Rust-online (`X86_AP_ENTER_RUST`), gets a
+  per-CPU record + env scaffold, then **parks in a `cli`/`hlt` loop**
+  (`X86_AP_RUST_PARK reason=no_ap_scheduler_yet`). Per-CPU **TSS/IDT/GS are honestly
+  DEFERRED** (the AP shares the trampoline-inherited GDT while IRQ-masked — safe for
+  a parked AP, NOT a production per-CPU env; no fake readiness).
+- **Per-CPU scheduler/idle state:** each CPU has a unique kernel/AP stack
+  (`ap_stack_top` is strictly increasing in CPU id — verified by the audit); the
+  **production scheduler stays BSP-only** (`online_cpus=1`, `scheduler_aps=0`). APs
+  are never admitted to the run queue and run no user tasks.
+- **Timer/IPI/remote-wake readiness:** the boot-CPU timer is live; **remote-wake and
+  IPI-driven scheduling are NOT live** — they are recorded as honest deferrals
+  (`SMP_READY_REMOTE_WAKE_DEFERRED reason=smp_not_live|ipi_not_live`,
+  `SMP_READY_IPI_DEFERRED reason=not_live`). The success markers
+  (`SMP_READY_REMOTE_WAKE_OK`/`_IPI_SEND_OK`/`_IPI_RECV_OK`) are gated on the
+  never-today `online > 1` path and never fire in this stage.
+
+**What is accepted now vs deferred.** Accepted: the `-smp 1` baseline is fully
+preserved; the opt-in `SMP_READY` profile audits the boot CPU + per-CPU invariants
+and, under `-smp 2/4`, exercises the real AP bring-up to the parked-online state with
+honest mirror markers. Deferred (later stages): admitting APs to the production
+scheduler, a real per-CPU TSS/IDT/GS, and live IPI/remote-wake — the whole
+lock-free-shootdown/IPI design. **This stage does NOT broaden production SMP.**
+
+**Relationship to D6/D2 and GLOBAL-STATE.** `D6_SWITCH_A`/`D6_GENUINE`/`D2_RECV`/
+`D2_SEND` remain **x86_64 `-smp 1` only**; nothing here broadens them. The audit
+re-checks the same lock-domain rank ordering as Stage 176 GLOBAL-STATE
+(`SMP_READY_RANK_ORDER_OK`) and the no-leaked-global-guard invariant
+(`SMP_READY_GLOBAL_STATE_OK`).
+
+**Markers.** All default-off behind `smp_ready_enabled()`: `SMP_READY_ENABLED`,
+`SMP_READY_AUDIT_BEGIN`, `SMP_READY_BOOT_CPU_OK`, AP mirror
+(`_AP_TRAMPOLINE_BEGIN`/`_AP_ENTRY_OK`/`_AP_STACK_OK`/`_AP_GDT_IDT_OK`/`_AP_TSS_OK`/
+`_AP_ONLINE`/`_AP_IDLE_OK`/`_AP_FALLBACK reason=…`), per-CPU
+(`_PERCPU_CURRENT_OK`/`_PERCPU_ASID_OK`/`_PERCPU_STACK_UNIQUE_OK`/`_PERCPU_NO_CLOBBER_OK`),
+scheduler (`_SCHED_ONLINE_BEGIN`/`_OK`, `_RUNQUEUE_LOCAL_OK`,
+`_REMOTE_WAKE_BEGIN`/`_DEFERRED`, `_IDLE_WITH_RUNNABLE_SAFE`), IPI/timer
+(`_IPI_DEFERRED`, `_TIMER_CPU_OK`; success `_REMOTE_WAKE_OK`/`_IPI_SEND_OK`/`_IPI_RECV_OK`
+gated on `online>1`), invariants (`_GLOBAL_STATE_OK`, `_RANK_ORDER_OK`,
+`_INVARIANT_OK`, `_PROOF_DONE result=ok`); failure markers `_AP_BOOT_FAIL`,
+`_AP_STACK_ALIAS`, `_AP_TSS_BAD`, `_PERCPU_CLOBBER`, `_CURRENT_TID_MISMATCH`,
+`_ASID_MISMATCH`, `_REMOTE_WAKE_LOST`, `_IPI_LOST`, `_RUNQUEUE_CORRUPT`,
+`_GLOBAL_GUARD_LEAK`, `_RANK_INVERSION`, `_INVARIANT_FAIL`.
+
+**`SMP_READY=1` acceptance profile.** The normal smoke stays `-smp 1`; only the
+`SMP_READY` profile raises `QEMU_SMP` to `SMP_READY_CPUS` (default 2, optionally 4).
+Requires `SMP_READY_ENABLED`, `SMP_READY_BOOT_CPU_OK`, either an AP
+online/idle OR an explicit `SMP_READY_AP_FALLBACK reason=…`, `SMP_READY_RANK_ORDER_OK`,
+`SMP_READY_GLOBAL_STATE_OK`, `SMP_READY_INVARIANT_OK`, and `SMP_READY_PROOF_DONE`;
+fails hard on every `SMP_READY_*` failure marker plus `CapabilityFull`,
+`TaskTableFull`, `BLOCKED_WOULDBLOCK_FATAL`, `PAGE_FAULT_UNHANDLED`/`_FATAL`/
+`_NOT_HANDLED`, and the fatal breadcrumbs. Handled COW/DEMAND faults remain accepted.
+Mode isolation forces `SMP_READY` off under `D6_SWITCH_PROOF` / `D6_SWITCH_A` (keeping
+those regressions `-smp 1`). Guarded by `stage177_smp_ready`.
+
+Acceptance (user QEMU): primary `SMP_READY=1 SMP_READY_CPUS=2 QEMU_SMP=2` smoke
+(optionally `SMP_READY_CPUS=4 QEMU_SMP=4` if `-smp 2` is stable); regression matrix:
+`GLOBAL_STATE=1`, `SPAWN_LIFECYCLE=1`, `FAULT_DELIVERY=1`, `CAP_CNODE=1`, `VM_COW=1`,
+`SCHED_TIMEOUT=1`, `IPC_FINAL=1` oracle, `D2_RECV_GENUINE=1`, `D2_SEND_GENUINE=1`,
+normal `-smp 1` smoke, `D6_SWITCH_A=1`, 5-min `D6_SWITCH_PROOF=1`, Stage 163P
+sender-wake oracle. **PENDING user QEMU acceptance** (whether x86_64 `-smp 2` reaches
+the service baseline or falls back to parked-AP is to be recorded from that run;
+cross-arch D6 unlock is explicitly Stage 178, not this stage).
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
