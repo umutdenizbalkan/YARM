@@ -46901,3 +46901,212 @@ mod stage166_d6_switch_a {
         }
     }
 }
+
+// Stage 167 (D6-GENUINE-A): the rank-1 scheduler split seam
+// (`with_scheduler_split_mut`) gains its first live production caller — the
+// default-off `yarm.d6_genuine=1` post-`with_cpu` observe wire — while the
+// in-lock authoritative dispatch and the seam fences for the other domains
+// stay intact. These are source-text guards over the wiring.
+mod stage167_d6_genuine {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const SCHED_SRC: &str = include_str!("scheduler_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+
+    // 1. The knob exists, is an Option<bool> (default None ⇒ default-off), and
+    //    the runtime gate + accessors default to false.
+    #[test]
+    fn stage167_knob_is_default_off() {
+        assert!(
+            CMDLINE_SRC.contains("pub d6_genuine: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.d6_genuine"),
+            "yarm.d6_genuine must be an Option<bool> cmdline knob (default None)"
+        );
+        assert!(
+            MOD_SRC.contains("D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)"),
+            "D6_GENUINE_ENABLED gate must default to false"
+        );
+        assert!(
+            MOD_SRC.contains("fn d6_genuine_enabled() -> bool")
+                && MOD_SRC.contains("fn set_d6_genuine_enabled(enabled: bool)"),
+            "d6_genuine accessor/setter must exist"
+        );
+    }
+
+    // 2. The wiring is x86_64-only: cmdline application, the seam method, and
+    //    the trap-entry observe block are all guarded by cfg(x86_64).
+    #[test]
+    fn stage167_is_x86_64_only() {
+        let apply_idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.d6_genuine")
+            .expect("d6_genuine apply block");
+        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 400];
+        assert!(
+            apply.contains("#[cfg(target_arch = \"x86_64\")]")
+                && apply.contains("set_d6_genuine_enabled(enabled)"),
+            "d6_genuine must only flip the gate on x86_64"
+        );
+        let method_idx = RUNTIME_SRC
+            .find("fn d6_genuine_local_dispatch_observe")
+            .expect("d6_genuine seam method must exist");
+        let before = &RUNTIME_SRC[method_idx.saturating_sub(80)..method_idx];
+        assert!(
+            before.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "the d6_genuine seam method must be x86_64-only"
+        );
+        // The genuine block opens with the x86_64 cfg immediately preceding the
+        // `d6_genuine_mode` gate.
+        let gate_idx = TRAP_ENTRY_SRC
+            .find("let d6_genuine_mode =")
+            .expect("d6_genuine_mode gate must exist in trap_entry");
+        let trap_before = &TRAP_ENTRY_SRC[gate_idx.saturating_sub(120)..gate_idx];
+        assert!(
+            trap_before.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "the trap-entry observe block must be x86_64-only"
+        );
+    }
+
+    // 3. The scheduler seam is genuinely live: the wrapper calls
+    //    with_scheduler_split_mut and trap_entry invokes the wrapper.
+    #[test]
+    fn stage167_scheduler_seam_is_live() {
+        let method_idx = RUNTIME_SRC
+            .find("fn d6_genuine_local_dispatch_observe")
+            .expect("seam method must exist");
+        let body = &RUNTIME_SRC[method_idx..method_idx + 900];
+        assert!(
+            body.contains("self.with_scheduler_split_mut("),
+            "the d6_genuine wrapper must call the rank-1 scheduler seam"
+        );
+        assert!(
+            TRAP_ENTRY_SRC.contains("shared.d6_genuine_local_dispatch_observe(cpu)"),
+            "trap_entry must invoke the d6_genuine seam wrapper from the post-with_cpu path"
+        );
+    }
+
+    // 4. The genuine wire is mutually exclusive with the proof / switch-a knobs,
+    //    so those paths remain intact.
+    #[test]
+    fn stage167_mutually_exclusive_with_proof_and_switch_a() {
+        let gate_idx = TRAP_ENTRY_SRC
+            .find("let d6_genuine_mode =")
+            .expect("d6_genuine_mode gate must exist in trap_entry");
+        let gate = &TRAP_ENTRY_SRC[gate_idx..gate_idx + 300];
+        assert!(
+            gate.contains("d6_genuine_enabled()")
+                && gate.contains("!crate::kernel::boot::d6_controlled_switch_proof_enabled()")
+                && gate.contains("!crate::kernel::boot::d6_switch_a_enabled()"),
+            "d6_genuine mode must be disabled when the proof or switch-a knobs are on"
+        );
+    }
+
+    // 5. The seam observation is NON-mutating (it must not call dispatch_next_on
+    //    through the seam), and the in-lock authoritative dispatch is preserved.
+    #[test]
+    fn stage167_observe_is_non_mutating_fallback_preserved() {
+        let method_idx = RUNTIME_SRC
+            .find("fn d6_genuine_local_dispatch_observe")
+            .expect("seam method must exist");
+        let body = &RUNTIME_SRC[method_idx..method_idx + 900];
+        assert!(
+            body.contains("current_tid_on(") && body.contains("runnable_count_on("),
+            "the observe wrapper must read the committed decision (current_tid/runnable_count)"
+        );
+        assert!(
+            !body.contains("dispatch_next_on("),
+            "the observe wrapper must NOT mutate the run queue via dispatch_next_on"
+        );
+        // The in-lock authoritative dispatch still takes the scheduler lock via
+        // self.scheduler_state() and must NOT call the seam (would alias).
+        assert!(
+            SCHED_SRC.contains("self.scheduler_state()")
+                && !SCHED_SRC.contains("with_scheduler_split_mut("),
+            "in-lock local_dispatch_step_split must remain the authoritative non-seam path"
+        );
+        assert!(
+            SCHED_SRC.contains("relocating the dispatch entry point"),
+            "the documented in-lock blocker must remain in scheduler_state.rs"
+        );
+    }
+
+    // 6. The full D6_GENUINE marker set is emitted across cmdline/runtime/trap.
+    #[test]
+    fn stage167_markers_present() {
+        assert!(
+            CMDLINE_SRC.contains("D6_GENUINE_ENABLED"),
+            "D6_GENUINE_ENABLED must be emitted when the knob is set"
+        );
+        assert!(
+            RUNTIME_SRC.contains("D6_LOCAL_DISPATCH_STEP_SPLIT"),
+            "the seam wrapper must emit D6_LOCAL_DISPATCH_STEP_SPLIT"
+        );
+        for m in [
+            "D6_LOCAL_DISPATCH_SEAM_CANDIDATE",
+            "D6_LOCAL_DISPATCH_SEAM_ENTER",
+            "D6_LOCAL_DISPATCH_SEAM_LOCK_SCOPE_DROPPED",
+            "D6_LOCAL_DISPATCH_SEAM_COUNT",
+            "D6_LOCAL_DISPATCH_SEAM_DONE",
+            "D6_LOCAL_DISPATCH_SEAM_FALLBACK",
+        ] {
+            assert!(TRAP_ENTRY_SRC.contains(m), "trap_entry must emit {m}");
+        }
+    }
+
+    // 7. No syscall/IPC ABI count change.
+    #[test]
+    fn stage167_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31"),
+            "SYSCALL_COUNT must remain 31"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "Syscall::VARIANT_COUNT must remain 23"
+        );
+    }
+
+    // 8. The broad seam / global-lock fences are not deleted: the helper-only
+    //    label still covers the remaining seam, and D2/D3/D5 paths are untouched.
+    #[test]
+    fn stage167_broad_fences_not_deleted() {
+        assert!(
+            RUNTIME_SRC.contains("VALIDATION: M2_SEAM_HELPER_ONLY"),
+            "the M2_SEAM_HELPER_ONLY fence label must remain in runtime.rs"
+        );
+        assert!(
+            RUNTIME_SRC.contains("VALIDATION: M2_SEAM_LIVE_D6_GENUINE"),
+            "the scheduler seam must be relabeled M2_SEAM_LIVE_D6_GENUINE"
+        );
+        // The other three split-mut seams must not be newly called from
+        // trap_entry.rs by this stage.
+        for other in [
+            "with_task_tcbs_split_mut(",
+            "with_vm_user_spaces_split_mut(",
+            "with_memory_split_mut(",
+        ] {
+            assert!(
+                !TRAP_ENTRY_SRC.contains(other),
+                "Stage 167 must not live-wire {other} from trap_entry.rs"
+            );
+        }
+    }
+
+    // 9. Smoke script supports D6_GENUINE=1 and checks the production markers.
+    #[test]
+    fn stage167_smoke_supports_genuine() {
+        assert!(
+            SMOKE_SRC.contains("D6_GENUINE=${D6_GENUINE:-0}")
+                && SMOKE_SRC.contains("yarm.d6_genuine=1"),
+            "smoke must append yarm.d6_genuine=1 when D6_GENUINE=1"
+        );
+        assert!(
+            SMOKE_SRC.contains("D6_LOCAL_DISPATCH_SEAM_CANDIDATE")
+                && SMOKE_SRC.contains("D6-GENUINE mode FAILED"),
+            "smoke must verify the D6-GENUINE markers and fail on missing/fatal"
+        );
+    }
+}

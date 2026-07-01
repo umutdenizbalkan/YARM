@@ -36,6 +36,14 @@ D6_SWITCH_A=${D6_SWITCH_A:-0}
 if [[ "$D6_SWITCH_A" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_a="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_a=1"
 fi
+# Stage 167 (D6-GENUINE-A): D6_GENUINE=1 appends yarm.d6_genuine=1 to make the
+# rank-1 scheduler split seam its first live production caller via the default-off
+# post-with_cpu observe wire (x86_64-only; mutually exclusive with the proof/
+# switch-a knobs in the kernel gate).
+D6_GENUINE=${D6_GENUINE:-0}
+if [[ "$D6_GENUINE" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_genuine="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_genuine=1"
+fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
 # whenever any proof requirement env var is enabled, so honor it here.
@@ -691,6 +699,42 @@ if [[ "$D6_SWITCH_A" == "1" ]]; then
     exit 1
   fi
   echo "[ok] D6-SWITCH-A: real production unlocked switch observed"
+fi
+
+# Stage 167 (D6-GENUINE-A): when booted with yarm.d6_genuine=1, require evidence
+# of at least one genuine scheduler-seam dispatch observation run outside the
+# global lock, and reject any fatal breadcrumb after the seam wire begins.
+if [[ "$D6_GENUINE" == "1" ]]; then
+  genuine_fail=0
+  echo "[ok] D6_GENUINE enabled marker:" $(log_has_pattern "D6_GENUINE_ENABLED" && echo present || echo MISSING)
+  for g_marker in \
+    "D6_LOCAL_DISPATCH_SEAM_CANDIDATE" \
+    "D6_LOCAL_DISPATCH_SEAM_ENTER" \
+    "D6_LOCAL_DISPATCH_SEAM_LOCK_SCOPE_DROPPED" \
+    "D6_LOCAL_DISPATCH_STEP_SPLIT" \
+    "D6_LOCAL_DISPATCH_SEAM_COUNT" \
+    "D6_LOCAL_DISPATCH_SEAM_DONE"; do
+    if log_has_pattern "$g_marker"; then
+      echo "[ok] D6-GENUINE marker present: $g_marker"
+    else
+      echo "[error] D6-GENUINE marker missing: $g_marker"
+      genuine_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    g_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/D6_LOCAL_DISPATCH_SEAM_CANDIDATE/{seen=1} seen{print}')"
+    for fatal_pat in '!Fv' '!BNv' 'PAGE_FAULT' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$g_tail" | rg -a -F -q -- "$fatal_pat"; then
+        echo "[error] D6-GENUINE: fatal breadcrumb after seam wire start: $fatal_pat"
+        genuine_fail=1
+      fi
+    done
+  fi
+  if [[ "$genuine_fail" -eq 1 ]]; then
+    echo "[error] D6-GENUINE mode FAILED"
+    exit 1
+  fi
+  echo "[ok] D6-GENUINE: genuine scheduler-seam dispatch observation outside the global lock"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

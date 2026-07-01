@@ -122,11 +122,21 @@ impl KernelState {
     /// regardless — the identical constraint already documented on D2
     /// PR-A's `block_current_on_receive_with_deadline` and D3 PR-B's
     /// `vm_brk_shrink_two_phase`. Genuinely exiting the global lock for this
-    /// path requires relocating the dispatch entry point to before
-    /// `SharedKernel::with_cpu` in trap dispatch, deferred to a follow-on PR
-    /// (see `doc/KERNEL_UNLOCKING.md` §D-NEXT-1 PR-C). The
-    /// `M2_SEAM_HELPER_ONLY` fence for the scheduler seam is therefore kept
-    /// as-is; behavior and lock order are unchanged from Stage 107.
+    /// IN-LOCK authoritative call still requires
+    /// relocating the dispatch entry point to before `SharedKernel::with_cpu`
+    /// in trap dispatch, deferred to a follow-on PR (see
+    /// `doc/KERNEL_UNLOCKING.md` §D-NEXT-1 PR-C). This method
+    /// therefore remains the authoritative, in-lock dispatch decision and does
+    /// NOT itself call the seam.
+    ///
+    /// Stage 167 (D6-GENUINE-A) update: the scheduler seam is no longer
+    /// helper-only. `SharedKernel::d6_genuine_local_dispatch_observe` now calls
+    /// `with_scheduler_split_mut` from the post-`with_cpu` trap path (global
+    /// lock dropped) under the default-off `yarm.d6_genuine=1` knob, running
+    /// one NON-mutating `local_dispatch_step_split` observation outside the
+    /// global lock. That live wire reads the decision THIS method committed
+    /// in-lock; it never double-advances the run queue, and when the knob is
+    /// OFF (default) behavior and lock order are unchanged from Stage 107.
     ///
     /// Telemetry: `d6_local_dispatch_calls` (+1 per call). Smoke marker:
     /// `D6_LOCAL_DISPATCH cpu=N tid=Some(T)|None` (unchanged). Optional Info

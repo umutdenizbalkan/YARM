@@ -148,6 +148,20 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = enabled;
     }
+    if let Some(enabled) = parsed.d6_genuine {
+        // Stage 167 (D6-GENUINE-A): x86_64-only gate that makes the rank-1
+        // scheduler split seam its first live production caller (default-off
+        // observe wire in handle_trap_entry_shared). No-op on other arches.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::kernel::boot::set_d6_genuine_enabled(enabled);
+            if enabled {
+                crate::yarm_log!("D6_GENUINE_ENABLED");
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = enabled;
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -243,6 +257,13 @@ pub struct YarmBootOptions<'a> {
     /// `switch_frames` that drops the global lock. Default-off; non-x86_64
     /// builds parse but ignore it so AArch64/RISC-V behavior is unchanged.
     pub d6_switch_a: Option<bool>,
+    /// Stage 167 (D6-GENUINE-A): `yarm.d6_genuine=1` gates the x86_64-only,
+    /// single-CPU-only, default-off live wire that makes the rank-1 scheduler
+    /// split seam (`with_scheduler_split_mut`) its first production caller,
+    /// running one `local_dispatch_step_split` observation outside the global
+    /// lock per eligible trap. Default-off; non-x86_64 builds parse but ignore
+    /// it so AArch64/RISC-V behavior is unchanged.
+    pub d6_genuine: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -331,6 +352,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.d6_switch_a" {
             options.d6_switch_a = parse_bool_knob(value);
+        }
+        if key == b"yarm.d6_genuine" {
+            options.d6_genuine = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);
