@@ -132,12 +132,30 @@ pub(super) fn handle_vm_map(
     // caps and reclaims frames for [addr, mapped_end) — same two-phase pattern
     // as handle_vm_anon_map. Anonymous memory is always allocated in the
     // current task's cnode regardless of which address space it is mapped into.
+    // Stage 172 (VM-COW): default-off map phase markers. Diagnostic only — the
+    // two-phase `rollback_anon_map` transaction below is UNCHANGED.
+    let vm_cow = crate::kernel::boot::vm_cow_enabled();
+    if vm_cow {
+        crate::yarm_log!(
+            "VM_MAP_PHASE_METADATA asid={} addr=0x{:x} len={}",
+            map_asid.0,
+            addr,
+            map_len
+        );
+    }
     let mut mapped_end = addr;
     while mapped_end < end {
         let (_, mem_cap) = match kernel.alloc_anonymous_memory_object() {
             Ok(pair) => pair,
             Err(e) => {
                 rollback_anon_map(kernel, map_asid, addr, mapped_end, None);
+                if vm_cow {
+                    crate::yarm_log!(
+                        "VM_MAP_ROLLBACK_OK asid={} addr=0x{:x} reason=frame_alloc",
+                        map_asid.0,
+                        addr
+                    );
+                }
                 return Err(SyscallError::from(e));
             }
         };
@@ -148,9 +166,30 @@ pub(super) fn handle_vm_map(
             flags,
         ) {
             rollback_anon_map(kernel, map_asid, addr, mapped_end, Some(mem_cap));
+            if vm_cow {
+                crate::yarm_log!(
+                    "VM_MAP_ROLLBACK_OK asid={} addr=0x{:x} reason=pt_update",
+                    map_asid.0,
+                    addr
+                );
+            }
             return Err(SyscallError::from(e));
         }
         mapped_end += PAGE_SIZE;
+    }
+    if vm_cow {
+        crate::yarm_log!(
+            "VM_MAP_PHASE_FRAME_ALLOC asid={} addr=0x{:x} len={}",
+            map_asid.0,
+            addr,
+            map_len
+        );
+        crate::yarm_log!(
+            "VM_MAP_PHASE_PT_UPDATE asid={} addr=0x{:x} len={}",
+            map_asid.0,
+            addr,
+            map_len
+        );
     }
     frame.set_ok(addr, map_len, 0);
     Ok(())

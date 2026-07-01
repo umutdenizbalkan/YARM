@@ -47182,7 +47182,11 @@ mod stage168_d6_genuine_b_and_d2_recv {
         // exec_state gate excludes proof + switch_a.
         let gate_idx = EXEC_STATE_SRC
             .find("D6_GENUINE_MUT_DISPATCH_CANDIDATE")
-            .map(|i| EXEC_STATE_SRC[..i].rfind("d6_genuine_enabled()").expect("gate"))
+            .map(|i| {
+                EXEC_STATE_SRC[..i]
+                    .rfind("d6_genuine_enabled()")
+                    .expect("gate")
+            })
             .expect("gate");
         let gate = &EXEC_STATE_SRC[gate_idx..gate_idx + 220];
         assert!(
@@ -47196,7 +47200,10 @@ mod stage168_d6_genuine_b_and_d2_recv {
             "D6_SWITCH_A_SWITCH_ENTER",
             "D6_SWITCH_A_DONE",
         ] {
-            assert!(TRAP_ENTRY_SRC.contains(m), "switch-a marker must remain: {m}");
+            assert!(
+                TRAP_ENTRY_SRC.contains(m),
+                "switch-a marker must remain: {m}"
+            );
         }
         assert!(
             IPC_STATE_SRC.contains("D6_CONTROLLED_SWITCH_PROOF")
@@ -47263,7 +47270,8 @@ mod stage168_d6_genuine_b_and_d2_recv {
     #[test]
     fn stage168_no_double_advance_guarantee() {
         assert!(
-            EXEC_STATE_SRC.contains("let queue_neutral = !(runnable > 0 && matches!(cur, None | Some(0)));"),
+            EXEC_STATE_SRC
+                .contains("let queue_neutral = !(runnable > 0 && matches!(cur, None | Some(0)));"),
             "eligibility must be gated on the queue-neutral (never-dequeue) predicate"
         );
         assert!(
@@ -47347,19 +47355,29 @@ mod stage168_d6_genuine_b_and_d2_recv {
             "D2_RECV_GENUINE_ROLLBACK_OK",
             "D2_RECV_GENUINE_DONE",
         ] {
-            assert!(IPC_STATE_SRC.contains(m), "ipc_state must emit D2 recv marker {m}");
+            assert!(
+                IPC_STATE_SRC.contains(m),
+                "ipc_state must emit D2 recv marker {m}"
+            );
         }
         assert!(
             SYSCALL_IPC_SRC.contains("D2_RECV_GENUINE_NOWAIT_OK"),
             "the NoWait probe path must emit D2_RECV_GENUINE_NOWAIT_OK"
         );
         // Rank order preserved: the existing phase functions are still A→B→C.
-        let pa = IPC_STATE_SRC.find("recv_block_phase_a_scheduler").expect("phase A");
-        let pb = IPC_STATE_SRC.find("recv_block_phase_b_task").expect("phase B");
+        let pa = IPC_STATE_SRC
+            .find("recv_block_phase_a_scheduler")
+            .expect("phase A");
+        let pb = IPC_STATE_SRC
+            .find("recv_block_phase_b_task")
+            .expect("phase B");
         let pc = IPC_STATE_SRC
             .find("recv_block_phase_c_ipc_publish")
             .expect("phase C");
-        assert!(pa < pb && pb < pc, "recv block phases must stay rank-ordered A<B<C");
+        assert!(
+            pa < pb && pb < pc,
+            "recv block phases must stay rank-ordered A<B<C"
+        );
     }
 
     // D2 SEND uses its OWN Stage 169 genuine path, never the recv machinery.
@@ -47464,8 +47482,7 @@ mod stage168b_d2_recv_genuine_completion {
     #[test]
     fn stage168b_script_mode_isolation() {
         assert!(
-            SMOKE_SRC.contains("mode isolation")
-                && SMOKE_SRC.contains("YARM_MODE_ISOLATION"),
+            SMOKE_SRC.contains("mode isolation") && SMOKE_SRC.contains("YARM_MODE_ISOLATION"),
             "smoke must have a mode-isolation normalization block"
         );
         // Proof precedence forces the genuine family off.
@@ -47474,7 +47491,9 @@ mod stage168b_d2_recv_genuine_completion {
             .expect("proof precedence branch");
         let iso = &SMOKE_SRC[iso_idx..iso_idx + 320];
         assert!(
-            iso.contains("D6_GENUINE") && iso.contains("D2_RECV_GENUINE") && iso.contains("printf -v"),
+            iso.contains("D6_GENUINE")
+                && iso.contains("D2_RECV_GENUINE")
+                && iso.contains("printf -v"),
             "D6_SWITCH_PROOF=1 must force the genuine family off"
         );
         // The D6-GENUINE check block is gated on the (normalized) D6_GENUINE var,
@@ -47518,7 +47537,10 @@ mod stage168b_d2_recv_genuine_completion {
         let drain_idx = TRAP_ENTRY_SRC
             .find("shared.d2_recv_dispatch_step_mut(cpu)")
             .expect("recv dispatch drain");
-        assert!(drain_idx > drop_idx, "the recv dispatch must run after the global lock is dropped");
+        assert!(
+            drain_idx > drop_idx,
+            "the recv dispatch must run after the global lock is dropped"
+        );
     }
 
     // Task B/E: the accepted D2 recv path does NOT run the in-lock
@@ -47571,7 +47593,9 @@ mod stage168b_d2_recv_genuine_completion {
     #[test]
     fn stage168b_reuses_hardened_switch_restore() {
         assert!(
-            TRAP_ENTRY_SRC.contains("post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"),
+            TRAP_ENTRY_SRC.contains(
+                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
+            ),
             "the recv drain must reuse the hardened post_switch restore"
         );
         // No new switch_frames call is introduced in the recv drain.
@@ -47599,8 +47623,12 @@ mod stage168b_d2_recv_genuine_completion {
         );
         // The deferral happens only on the committed (Published) path, after the
         // QueueNonEmpty unwind branch.
-        let unwind_idx = IPC_STATE_SRC.find("recv_block_unwind_race(plan)").expect("unwind call");
-        let defer_idx = IPC_STATE_SRC.find("d2_recv_dispatch_try_defer").expect("defer");
+        let unwind_idx = IPC_STATE_SRC
+            .find("recv_block_unwind_race(plan)")
+            .expect("unwind call");
+        let defer_idx = IPC_STATE_SRC
+            .find("d2_recv_dispatch_try_defer")
+            .expect("defer");
         assert!(
             unwind_idx < defer_idx,
             "the rollback branch must precede the commit/defer path"
@@ -47670,10 +47698,18 @@ mod stage168b_d2_recv_genuine_completion {
             "the recv dispatch deferral must be x86_64-only"
         );
         // runtime seam methods are x86_64-only.
-        for m in ["fn d2_recv_dispatch_step_mut", "fn d2_recv_reverify_blocked"] {
-            let idx = RUNTIME_SRC.find(m).unwrap_or_else(|| panic!("{m} must exist"));
+        for m in [
+            "fn d2_recv_dispatch_step_mut",
+            "fn d2_recv_reverify_blocked",
+        ] {
+            let idx = RUNTIME_SRC
+                .find(m)
+                .unwrap_or_else(|| panic!("{m} must exist"));
             let b = &RUNTIME_SRC[idx.saturating_sub(80)..idx];
-            assert!(b.contains("#[cfg(target_arch = \"x86_64\")]"), "{m} must be x86_64-only");
+            assert!(
+                b.contains("#[cfg(target_arch = \"x86_64\")]"),
+                "{m} must be x86_64-only"
+            );
         }
     }
 
@@ -47706,7 +47742,10 @@ mod stage168b_d2_recv_genuine_completion {
             "D2_RECV_GENUINE_DISPATCH_STEP_SPLIT",
             "D2_RECV_GENUINE_DISPATCH_DONE",
         ] {
-            assert!(SMOKE_SRC.contains(m), "smoke must require the out-of-lock recv marker {m}");
+            assert!(
+                SMOKE_SRC.contains(m),
+                "smoke must require the out-of-lock recv marker {m}"
+            );
         }
         assert!(
             SMOKE_SRC.contains("reason=switch_required")
@@ -47786,7 +47825,10 @@ mod stage169_d2_send_genuine {
             "D2_SEND_GENUINE_BLOCKED_OK",
             "D2_SEND_GENUINE_DONE",
         ] {
-            assert!(IPC_STATE_SRC.contains(m), "ipc_state must emit D2 send marker {m}");
+            assert!(
+                IPC_STATE_SRC.contains(m),
+                "ipc_state must emit D2 send marker {m}"
+            );
         }
     }
 
@@ -47847,7 +47889,10 @@ mod stage169_d2_send_genuine {
         let drain_idx = TRAP_ENTRY_SRC
             .find("shared.d2_send_dispatch_step_mut(cpu)")
             .expect("send dispatch drain");
-        assert!(drain_idx > drop_idx, "the send dispatch must run after the global lock is dropped");
+        assert!(
+            drain_idx > drop_idx,
+            "the send dispatch must run after the global lock is dropped"
+        );
     }
 
     // Task D: reverify Blocked(EndpointSend) + queue-advancing dispatch_next_on.
@@ -47884,7 +47929,9 @@ mod stage169_d2_send_genuine {
             .expect("recv drain follows send drain");
         let drain = &TRAP_ENTRY_SRC[drain_start..drain_end];
         assert!(
-            drain.contains("post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"),
+            drain.contains(
+                "post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())"
+            ),
             "the send drain must reuse the hardened post_switch restore"
         );
         assert!(
@@ -47963,7 +48010,11 @@ mod stage169_d2_send_genuine {
         // The send defer is gated to not run under proof / switch-a.
         let gate_idx = IPC_STATE_SRC
             .find("d2_send_dispatch_try_defer")
-            .map(|i| IPC_STATE_SRC[..i].rfind("d2_send_genuine_enabled()").expect("gate"))
+            .map(|i| {
+                IPC_STATE_SRC[..i]
+                    .rfind("d2_send_genuine_enabled()")
+                    .expect("gate")
+            })
             .expect("gate");
         let gate = &IPC_STATE_SRC[gate_idx..gate_idx + 240];
         assert!(
@@ -48000,7 +48051,8 @@ mod stage169_d2_send_genuine {
             "doc must add the Stage 169 D2-GENUINE-SEND section"
         );
         assert!(
-            DOC_SRC.contains("no IPC-FINAL") || DOC_SRC.contains("IPC-FINAL is NOT")
+            DOC_SRC.contains("no IPC-FINAL")
+                || DOC_SRC.contains("IPC-FINAL is NOT")
                 || DOC_SRC.contains("NOT done"),
             "doc must state what is explicitly not done"
         );
@@ -48017,7 +48069,10 @@ mod stage169_d2_send_genuine {
             "D2_SEND_GENUINE_DISPATCH_STEP_SPLIT",
             "D2_SEND_GENUINE_DISPATCH_DONE",
         ] {
-            assert!(SMOKE_SRC.contains(m), "smoke must require the out-of-lock send marker {m}");
+            assert!(
+                SMOKE_SRC.contains(m),
+                "smoke must require the out-of-lock send marker {m}"
+            );
         }
         assert!(
             SMOKE_SRC.contains("Stage 169 incomplete"),
@@ -48186,7 +48241,10 @@ mod stage170_ipc_final {
             "D2_SEND_GENUINE_GLOBAL_DROPPED",
             "D2_SEND_GENUINE_DISPATCH_DONE",
         ] {
-            assert!(ORACLE_SRC.contains(m), "IPC-FINAL must require D2 marker {m}");
+            assert!(
+                ORACLE_SRC.contains(m),
+                "IPC-FINAL must require D2 marker {m}"
+            );
         }
     }
 
@@ -48227,7 +48285,9 @@ mod stage170_ipc_final {
             "if let Some(enabled) = parsed.d2_recv_genuine",
             "if let Some(enabled) = parsed.d2_send_genuine",
         ] {
-            let idx = CMDLINE_SRC.find(apply).unwrap_or_else(|| panic!("{apply} must exist"));
+            let idx = CMDLINE_SRC
+                .find(apply)
+                .unwrap_or_else(|| panic!("{apply} must exist"));
             let block = &CMDLINE_SRC[idx..idx + 500];
             assert!(
                 block.contains("#[cfg(target_arch = \"x86_64\")]"),
@@ -48261,13 +48321,13 @@ mod stage170_ipc_final {
     #[test]
     fn stage170_docs_ipc_final() {
         assert!(
-            DOC_SRC.contains("Stage 170 — IPC-FINAL")
-                && DOC_SRC.contains("stability milestone"),
+            DOC_SRC.contains("Stage 170 — IPC-FINAL") && DOC_SRC.contains("stability milestone"),
             "doc must add the Stage 170 IPC-FINAL stability-milestone section"
         );
         assert!(
             DOC_SRC.contains("Stage 169 is **ACCEPTED**")
-                || (DOC_SRC.contains("Stage 169") && DOC_SRC.contains("D2_SEND_GENUINE=1 run produced")),
+                || (DOC_SRC.contains("Stage 169")
+                    && DOC_SRC.contains("D2_SEND_GENUINE=1 run produced")),
             "doc must record Stage 169 accepted"
         );
     }
@@ -48311,10 +48371,16 @@ fn stage171_chunked_timeout_wakes_all_expired_exactly_once() {
     }
     // Fire at the shared deadline: all N must expire across chunked passes.
     let expired = state.process_ipc_timeout_deadlines(5).expect("timeout");
-    assert_eq!(expired as u64, N, "every expired task must be woken exactly once");
+    assert_eq!(
+        expired as u64, N,
+        "every expired task must be woken exactly once"
+    );
     for i in 0..N {
         let tid = base + i;
-        assert!(state.task_is_runnable(tid), "tid {tid} must be Runnable after timeout");
+        assert!(
+            state.task_is_runnable(tid),
+            "tid {tid} must be Runnable after timeout"
+        );
         assert_eq!(
             state.ipc_deadline_count_for_tid(tid),
             0,
@@ -48387,7 +48453,8 @@ mod stage171_sched_timeout {
             "the timeout scan must not allocate a large [None; MAX_TASKS] scratch array"
         );
         assert!(
-            body.contains("TIMEOUT_SCAN_CHUNK") && body.contains("const TIMEOUT_SCAN_CHUNK: usize = 32"),
+            body.contains("TIMEOUT_SCAN_CHUNK")
+                && body.contains("const TIMEOUT_SCAN_CHUNK: usize = 32"),
             "the timeout scan must use a bounded TIMEOUT_SCAN_CHUNK batch"
         );
     }
@@ -48397,7 +48464,8 @@ mod stage171_sched_timeout {
     fn stage171_rank_order_documented() {
         let body = timeout_fn_body();
         assert!(
-            body.contains("with_tcbs_mut") && body.contains("with_ipc_state_mut")
+            body.contains("with_tcbs_mut")
+                && body.contains("with_ipc_state_mut")
                 && body.contains("enqueue_task"),
             "the timeout scan must run task -> ipc -> scheduler phases"
         );
@@ -48435,7 +48503,8 @@ mod stage171_sched_timeout {
     fn stage171_no_stranded_waiters() {
         let body = timeout_fn_body();
         assert!(
-            body.contains("endpoint_waiters") && body.contains("endpoint_sender_waiters")
+            body.contains("endpoint_waiters")
+                && body.contains("endpoint_sender_waiters")
                 && body.contains("notification_waiters"),
             "the timeout scan must clear every waiter structure"
         );
@@ -48453,7 +48522,10 @@ mod stage171_sched_timeout {
             "SCHED_IDLE_TIMEOUT_SAFE",
             "SCHED_IDLE_NO_PENDING_TIMEOUT",
         ] {
-            assert!(EXEC_STATE_SRC.contains(m), "exec_state idle branch must emit {m}");
+            assert!(
+                EXEC_STATE_SRC.contains(m),
+                "exec_state idle branch must emit {m}"
+            );
         }
         assert!(
             EXEC_STATE_SRC.contains("sched_timeout_earliest_pending()")
@@ -48522,8 +48594,16 @@ mod stage171_sched_timeout {
             "x86_64 MAX_ADDRESS_SPACES must remain 32"
         );
         let body = timeout_fn_body();
-        for forbidden in ["with_vm_user_spaces_split_mut", "with_memory_split_mut", "D3_GENUINE", "D5_GENUINE"] {
-            assert!(!body.contains(forbidden), "timeout scan must not touch {forbidden}");
+        for forbidden in [
+            "with_vm_user_spaces_split_mut",
+            "with_memory_split_mut",
+            "D3_GENUINE",
+            "D5_GENUINE",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "timeout scan must not touch {forbidden}"
+            );
         }
     }
 
@@ -48582,7 +48662,11 @@ mod stage171b_fault_gate {
             .find("Stage 171B: page-fault gate")
             .expect("Stage 171B fault-gate comment must be present in the smoke");
         let block = &SMOKE_SRC[idx..idx + 600];
-        for m in ["PAGE_FAULT_UNHANDLED", "PAGE_FAULT_FATAL", "PAGE_FAULT_NOT_HANDLED"] {
+        for m in [
+            "PAGE_FAULT_UNHANDLED",
+            "PAGE_FAULT_FATAL",
+            "PAGE_FAULT_NOT_HANDLED",
+        ] {
             assert!(block.contains(m), "smoke fault gate must fail on {m}");
         }
         // Benign diagnostic tokens must NOT be treated as fatal (not in the gate).
@@ -48606,7 +48690,11 @@ mod stage171b_fault_gate {
             !ORACLE_SRC.contains("PAGE_FAULT present without PAGE_FAULT_HANDLED_COW"),
             "the flawed heuristic must be removed from the oracle too"
         );
-        for m in ["PAGE_FAULT_UNHANDLED", "PAGE_FAULT_FATAL", "PAGE_FAULT_NOT_HANDLED"] {
+        for m in [
+            "PAGE_FAULT_UNHANDLED",
+            "PAGE_FAULT_FATAL",
+            "PAGE_FAULT_NOT_HANDLED",
+        ] {
             assert!(
                 ORACLE_SRC.contains(m),
                 "oracle IPC-FINAL fault gate must fail on {m}"
@@ -48630,7 +48718,10 @@ mod stage171b_fault_gate {
             "SCHED_IDLE_TIMEOUT_SAFE",
             "expired ($exp_n) != runqueue-enqueue",
         ] {
-            assert!(SMOKE_SRC.contains(m), "SCHED-TIMEOUT gate must still enforce: {m}");
+            assert!(
+                SMOKE_SRC.contains(m),
+                "SCHED-TIMEOUT gate must still enforce: {m}"
+            );
         }
         // Mode isolation still forces SCHED_TIMEOUT off under proof/switch-a.
         assert!(
@@ -48650,6 +48741,270 @@ mod stage171b_fault_gate {
             DOC_SRC.contains("PAGE_FAULT_UNHANDLED")
                 && (DOC_SRC.contains("false") || DOC_SRC.contains("handled COW")),
             "doc must explain the narrowed fault gate"
+        );
+    }
+}
+
+// Stage 172 (VM-COW): a fork + child COW write fault run with the vm_cow marker
+// knob ENABLED must be behaviorally identical (private child frame, parent
+// isolation, COW mark cleared) — proving the markers change nothing.
+#[test]
+fn stage172_vm_cow_markers_do_not_change_cow_behavior() {
+    let mut state = Bootstrap::init().expect("init");
+    crate::kernel::boot::set_vm_cow_enabled(true);
+    let (parent_asid, _) = state.create_user_address_space().expect("asid");
+    state.register_task(472).expect("parent");
+    state.bind_task_asid(472, parent_asid).expect("bind");
+    state.enqueue_current_cpu(472).expect("enqueue");
+    state.yield_current().expect("switch");
+
+    let (_mo_id, mem_cap) = state.alloc_anonymous_memory_object().expect("mem");
+    let original_phys = state
+        .resolve_memory_object_phys(mem_cap, PageFlags::USER_RW)
+        .expect("phys");
+    state
+        .map_user_page_in_asid_with_caps(parent_asid, mem_cap, VirtAddr(0x5000), PageFlags::USER_RW)
+        .expect("map");
+
+    let child_asid = state
+        .clone_user_address_space_cow(parent_asid)
+        .expect("clone");
+    assert!(state.is_cow_page(parent_asid, VirtAddr(0x5000)));
+    assert!(state.is_cow_page(child_asid, VirtAddr(0x5000)));
+
+    let handled = state
+        .try_handle_cow_fault(child_asid, VirtAddr(0x5000))
+        .expect("cow fault");
+    assert!(handled, "write to COW page must be handled with markers on");
+
+    let child_mapping = state
+        .with_user_spaces(|s| s.get(child_asid).and_then(|a| a.resolve(VirtAddr(0x5000))))
+        .expect("child mapping");
+    assert_ne!(
+        child_mapping.phys, original_phys,
+        "child must get a private frame"
+    );
+    assert!(
+        child_mapping.flags.write,
+        "child private frame must be writable"
+    );
+    let parent_mapping = state
+        .with_user_spaces(|s| s.get(parent_asid).and_then(|a| a.resolve(VirtAddr(0x5000))))
+        .expect("parent mapping");
+    assert_eq!(
+        parent_mapping.phys, original_phys,
+        "parent keeps the shared frame"
+    );
+    assert!(
+        !state.is_cow_page(child_asid, VirtAddr(0x5000)),
+        "child COW mark cleared after fault"
+    );
+    crate::kernel::boot::set_vm_cow_enabled(false);
+    let _ = state.destroy_user_address_space_by_asid(child_asid);
+}
+
+// Stage 172 (VM-COW): source guards over the VM/COW instrumentation, knob, smoke,
+// and invariants.
+mod stage172_vm_cow {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const MEM_SRC: &str = include_str!("memory_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const VM_SYSCALL_SRC: &str = include_str!("../syscall/vm.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral (pure diagnostic).
+    #[test]
+    fn stage172_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub vm_cow: Option<bool>") && CMDLINE_SRC.contains("yarm.vm_cow"),
+            "yarm.vm_cow must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("VM_COW_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn vm_cow_enabled() -> bool"),
+            "VM_COW gate + accessor must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.vm_cow")
+            .expect("vm_cow apply block");
+        let block = &CMDLINE_SRC[idx..idx + 400];
+        assert!(
+            block.contains("set_vm_cow_enabled(enabled)")
+                && !block.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "vm_cow must be arch-neutral (pure diagnostic)"
+        );
+    }
+
+    // COW fault phase + rollback markers present.
+    #[test]
+    fn stage172_cow_fault_markers() {
+        for m in [
+            "VM_COW_FAULT_BEGIN",
+            "VM_COW_PHASE_METADATA",
+            "VM_COW_PHASE_FRAME_ALLOC",
+            "VM_COW_PHASE_PT_UPDATE",
+            "VM_COW_PHASE_TLB_FLUSH",
+            "VM_COW_ROLLBACK_BEGIN",
+            "VM_COW_ROLLBACK_DONE",
+            "VM_COW_DONE",
+            "VM_COW_FAIL reason=",
+        ] {
+            assert!(MEM_SRC.contains(m), "memory_state must emit COW marker {m}");
+        }
+        // Only write faults route to COW (read faults never copy).
+        assert!(
+            FAULT_SRC.contains("if matches!(fault.access, FaultAccess::Write)")
+                && FAULT_SRC.contains("try_handle_cow_fault"),
+            "only write faults must trigger the COW handler"
+        );
+    }
+
+    // Fork markers + rollback present.
+    #[test]
+    fn stage172_fork_markers() {
+        for m in [
+            "VM_COW_FORK_BEGIN",
+            "VM_COW_FORK_CHILD_MAP",
+            "VM_COW_FORK_PARENT_WRITE_PROTECT",
+            "VM_COW_FORK_REFCOUNT_OK",
+            "VM_COW_FORK_ROLLBACK_OK",
+            "VM_COW_FORK_DONE",
+        ] {
+            assert!(
+                MEM_SRC.contains(m),
+                "memory_state must emit fork marker {m}"
+            );
+        }
+    }
+
+    // Map/unmap markers present.
+    #[test]
+    fn stage172_map_unmap_markers() {
+        for m in [
+            "VM_MAP_PHASE_METADATA",
+            "VM_MAP_PHASE_FRAME_ALLOC",
+            "VM_MAP_PHASE_PT_UPDATE",
+            "VM_MAP_ROLLBACK_OK",
+        ] {
+            assert!(
+                VM_SYSCALL_SRC.contains(m),
+                "syscall/vm.rs must emit map marker {m}"
+            );
+        }
+        for m in [
+            "VM_UNMAP_PHASE_METADATA",
+            "VM_UNMAP_PHASE_PT_UPDATE",
+            "VM_UNMAP_TLB_FLUSH",
+        ] {
+            assert!(
+                MEM_SRC.contains(m),
+                "memory_state must emit unmap marker {m}"
+            );
+        }
+    }
+
+    // TLB prep markers present, and NO real SMP shootdown broadening.
+    #[test]
+    fn stage172_tlb_prep_no_smp_broadening() {
+        for m in [
+            "VM_TLB_LOCAL_FLUSH",
+            "VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live",
+            "VM_TLB_SHOOTDOWN_PREP_DONE",
+        ] {
+            assert!(
+                MEM_SRC.contains(m),
+                "memory_state must emit TLB prep marker {m}"
+            );
+        }
+        // No new IPI / cross-CPU shootdown live-wire introduced by this stage.
+        assert!(
+            !MEM_SRC.contains("send_ipi_shootdown") && !MEM_SRC.contains("broadcast_shootdown"),
+            "Stage 172 must not live-wire a real SMP shootdown"
+        );
+    }
+
+    // Smoke plumbing + failure gates.
+    #[test]
+    fn stage172_smoke_profile() {
+        assert!(
+            SMOKE_SRC.contains("VM_COW=${VM_COW:-0}") && SMOKE_SRC.contains("yarm.vm_cow=1"),
+            "smoke must plumb VM_COW=1"
+        );
+        for f in [
+            "VM_COW_FAIL",
+            "VM_MAP_ROLLBACK_FAIL",
+            "VM_UNMAP_ROLLBACK_FAIL",
+            "VM_COW_REFCOUNT_UNDERFLOW",
+            "VM_COW_WRITABLE_SHARED_ALIAS",
+            "VM_COW_CHILD_ASID_LEAK",
+            "PAGE_FAULT_UNHANDLED",
+            "VM-COW mode FAILED",
+        ] {
+            assert!(SMOKE_SRC.contains(f), "smoke must gate on {f}");
+        }
+        // Handled COW/DEMAND faults are NOT in the VM-COW fatal set.
+        assert!(
+            SMOKE_SRC.contains("handled COW/DEMAND are OK") || SMOKE_SRC.contains("handled COW"),
+            "smoke must exempt handled COW/DEMAND faults"
+        );
+        // Mode isolation forces VM_COW off under proof/switch-a.
+        assert!(
+            SMOKE_SRC.contains("SCHED_TIMEOUT VM_COW"),
+            "mode isolation must force VM_COW off under proof/switch-a"
+        );
+    }
+
+    // Invariants + no scope creep into D2/D6/IPC-FINAL/Stage 171.
+    #[test]
+    fn stage172_invariants_and_regressions_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        // D2/D6/IPC-FINAL/Stage 171 markers still present (untouched).
+        assert!(
+            SMOKE_SRC.contains("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+                && SMOKE_SRC.contains("D6_GENUINE_MUT_DISPATCH_ENTER")
+                && SMOKE_SRC.contains("SCHED_TIMEOUT_ENABLED"),
+            "D2/D6/SCHED-TIMEOUT gates must remain"
+        );
+        assert!(
+            CMDLINE_SRC.contains("ipc_recv_proof_sender_wake"),
+            "Stage 163P sender-wake sub-knob must remain"
+        );
+        // The COW handler still preserves the accepted handled markers.
+        assert!(
+            FAULT_SRC.contains("PAGE_FAULT_HANDLED_COW")
+                && FAULT_SRC.contains("PAGE_FAULT_HANDLED_DEMAND"),
+            "handled COW/DEMAND markers must be preserved"
+        );
+    }
+
+    // Docs.
+    #[test]
+    fn stage172_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 172 — VM-COW"),
+            "doc must add the Stage 172 VM-COW section"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 171 SCHED-TIMEOUT is **ACCEPTED**")
+                || DOC_SRC.contains("SCHED-TIMEOUT is **ACCEPTED"),
+            "doc must record Stage 171 accepted"
+        );
+        assert!(
+            DOC_SRC.contains("no SMP shootdown live-wire"),
+            "doc must state no SMP shootdown live-wire"
         );
     }
 }

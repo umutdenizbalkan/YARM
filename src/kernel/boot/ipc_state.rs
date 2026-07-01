@@ -615,7 +615,10 @@ impl KernelState {
         let plan = self.recv_block_phase_b_task(plan, deadline)?;
         if crate::kernel::boot::d2_recv_genuine_enabled() {
             // Stage 168 (D2-GENUINE-RECV): scheduler+task phases complete.
-            crate::yarm_log!("D2_RECV_GENUINE_PHASE_TASK_BLOCK tid={}", plan.blocked_tid.0);
+            crate::yarm_log!(
+                "D2_RECV_GENUINE_PHASE_TASK_BLOCK tid={}",
+                plan.blocked_tid.0
+            );
         }
         // Phase C (ipc rank 3): publish waiter, with the no-lost-wakeup unwind.
         match self.recv_block_phase_c_ipc_publish(plan) {
@@ -673,7 +676,10 @@ impl KernelState {
                     plan.blocked_tid.0,
                     cpu_idx
                 );
-                crate::yarm_log!("D2_RECV_GENUINE_NO_INLOCK_DISPATCH tid={}", plan.blocked_tid.0);
+                crate::yarm_log!(
+                    "D2_RECV_GENUINE_NO_INLOCK_DISPATCH tid={}",
+                    plan.blocked_tid.0
+                );
                 // The out-of-lock trap-entry drain performs the authoritative
                 // queue-advancing dispatch; do NOT dispatch in-lock here.
                 return Ok(plan.blocked_tid);
@@ -925,9 +931,10 @@ impl KernelState {
                 for entry in expired.iter().take(n).flatten() {
                     let tid = entry.0;
                     let remains = ipc.endpoint_waiters.iter().any(|w| *w == Some(tid))
-                        || ipc.endpoint_sender_waiters.iter().any(|q| {
-                            q.iter().any(|s| s.as_ref().is_some_and(|w| w.tid == tid))
-                        })
+                        || ipc
+                            .endpoint_sender_waiters
+                            .iter()
+                            .any(|q| q.iter().any(|s| s.as_ref().is_some_and(|w| w.tid == tid)))
                         || ipc.notification_waiters.iter().any(|w| *w == Some(tid));
                     if remains {
                         stranded_in_batch = true;
@@ -3051,7 +3058,11 @@ impl KernelState {
             crate::yarm_log!("D2_RECV_GENUINE_BLOCKED_OK tid={}", blocked_tid.0);
             crate::yarm_log!(
                 "D2_RECV_GENUINE_DONE result={} tid={}",
-                if msg.is_some() { "delivered" } else { "woken_empty" },
+                if msg.is_some() {
+                    "delivered"
+                } else {
+                    "woken_empty"
+                },
                 blocked_tid.0
             );
         }

@@ -383,7 +383,10 @@ pub fn handle_trap_entry_shared(
                 crate::yarm_log!("D2_SEND_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
             }
         } else {
-            crate::yarm_log!("D2_SEND_GENUINE_FALLBACK reason=state_changed cpu={}", cpu.0);
+            crate::yarm_log!(
+                "D2_SEND_GENUINE_FALLBACK reason=state_changed cpu={}",
+                cpu.0
+            );
             crate::kernel::boot::d2_send_dispatch_clear(cpu_idx);
         }
     }
@@ -456,7 +459,10 @@ pub fn handle_trap_entry_shared(
                 crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
             }
         } else {
-            crate::yarm_log!("D2_RECV_GENUINE_FALLBACK reason=state_changed cpu={}", cpu.0);
+            crate::yarm_log!(
+                "D2_RECV_GENUINE_FALLBACK reason=state_changed cpu={}",
+                cpu.0
+            );
             crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
         }
     }
