@@ -5626,7 +5626,86 @@ Acceptance (user QEMU): (1) `FAULT_DELIVERY=1` smoke (primary); (2)
 `D2_SEND_GENUINE=1`; (3) `CAP_CNODE=1`; (4) `IPC_FINAL=1` oracle; (5) `VM_COW=1`;
 (6) `SCHED_TIMEOUT=1`; (7) `D2_RECV_GENUINE=1`; (8) normal smoke; (9)
 `D6_SWITCH_A=1`; (10) 5-min `D6_SWITCH_PROOF=1`; (11) Stage 163P sender-wake
-oracle. **PENDING user QEMU acceptance.**
+oracle.
+
+**ACCEPTED (user QEMU, 2026).** The full matrix passed. The primary
+`FAULT_DELIVERY=1` run reached the service baseline with `FAULT_DELIVERY_ENABLED`,
+`FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED`, `FAULT_DELIVERY_MSG_BUILD_OK`,
+`FAULT_DELIVERY_DEQUEUE_OK`, and `FAULT_DELIVERY_INVARIANT_OK` present, the
+one-shot self-contained proof completing cleanly, and none of the
+invariant-violation markers (`FAULT_DELIVERY_STRANDED_QUEUE`/`_DUPLICATE_MSG`/
+`_ORPHANED_WAITER`/`_STALE_SUPERVISOR`/`_BAD_SENDER`/`_WRITEBACK_FAIL`/`_QUEUE_LEAK`)
+or fatal breadcrumbs present; handled COW faults were accepted. The D2_SEND /
+CAP_CNODE / IPC_FINAL / VM_COW / SCHED_TIMEOUT / D2_RECV / normal / D6_SWITCH_A /
+5-min D6_SWITCH_PROOF / sender-wake regressions all passed. Stage 174 FAULT-DELIVERY
+is **ACCEPTED** — it was instrumentation-only (the fault-delivery path was already
+correct). Stage 175 (SPAWN-LIFECYCLE) is the next frontier.
+
+### 7.1.11 Stage 175 — SPAWN-LIFECYCLE (spawn / image-loading / lifecycle metadata audit + diagnostics)
+
+**Next kernel-unlocking frontier after FAULT-DELIVERY.** Audits and instruments the
+spawn / image-loading / lifecycle-metadata path — the init → process_manager spawn
+request handling, PM image-id resolution + initramfs/VFS image loading, ELF
+parse/load/zero-copy grant, process/thread creation metadata, CNode/bootstrap-cap
+setup, address-space creation + rollback, kernel task-table/TCB lifecycle, and the
+service startup sequence — behind a default-off arch-neutral diagnostic profile
+(`yarm.spawn_lifecycle=1`, script `SPAWN_LIFECYCLE=1`, marker
+`SPAWN_LIFECYCLE_ENABLED`). This is an audit + instrumentation stage: the spawn path
+is ALREADY transactional (each ELF-parse / image-missing / CNode-full / VM-full /
+task-table-full / cap-materialization failure rolls back), and **PM policy stays in
+userspace**, so **no spawn/PM runtime behavior changes** — the markers only expose
+the phase boundaries. This is **instrumentation only**; **no real bug** was found.
+
+**Explicitly NOT done in Stage 175:** no syscall count change (SYSCALL_COUNT=31,
+Syscall::VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32); no syscall/IPC ABI change;
+no image-id change; no service ABI change; no PM policy change (policy stays in
+userspace); no D2/D6/IPC-FINAL/VM-COW/SCHED-TIMEOUT/CAP-CNODE/FAULT-DELIVERY behavior
+change; no D3/D5 live-wire; no SMP change; no AArch64/RISC-V D6 switch unlock (the
+knob is arch-neutral diagnostics / no-op behavior); no RPi5 change.
+
+**Audit (paths).** All confirmed already transactional — no bug fixed, diagnostics
+only:
+- **Spawn request handling** (`SpawnV5` / `SpawnFromInitramfsFile`): the kernel
+  validates the request, resolves the image, parses+loads the ELF, creates the
+  address space + TCB + CNode, materializes bootstrap caps, and marks the thread
+  runnable — with a single rollback path that unwinds every partial resource
+  (address space, TCB, caps) on any failure.
+- **Image resolution + loading**: PM resolves an image id to an initramfs/VFS image;
+  a missing image is a clean typed error (no partial task).
+- **ELF parse/load/zero-copy grant**: parse validates headers before any mapping;
+  the zero-copy grant maps initramfs-backed frames read-only/shared; a parse or map
+  failure rolls back the mapped prefix.
+- **Address-space / TCB / CNode / bootstrap-cap setup**: each is created in order and
+  torn down in reverse on failure (address space destroyed, TCB freed, caps revoked).
+- **Service startup sequence**: `initramfs_srv`, `devfs_srv`, `vfs_server`,
+  `driver_manager`, `blkcache_srv`, `virtio_blk_srv`, optional `ramfs`/`ext4`
+  servers — started in a fixed dependency order that the smoke's service-baseline
+  markers already gate.
+- **Zombie/exit/restart cleanup**: a spawn that later exits/restarts routes through
+  the Stage 173/174 cap-revoke + fault-cleanup sweeps (no zombie/cap/aspace/TCB leak).
+
+**Markers.** All default-off behind `spawn_lifecycle_enabled()`:
+`SPAWN_LIFECYCLE_REQUEST_BEGIN`, `_IMAGE_RESOLVE_OK`/`_FAIL`, `_ELF_PARSE_BEGIN`/`_OK`,
+`_ELF_LOAD_BEGIN`/`_OK`, `_ZC_LOAD_OK`, `_ASPACE_CREATE_OK`, `_TCB_ALLOC_OK`,
+`_CNODE_SETUP_OK`, `_BOOTSTRAP_CAPS_OK`, `_THREAD_READY`, `_PROCESS_READY`,
+`_SERVICE_READY`, `_ROLLBACK_BEGIN`/`_OK`, `_INVARIANT_OK`; failure markers
+`_ROLLBACK_LEAK`, `_ZOMBIE_LEAK`, `_CAP_LEAK`, `_ASPACE_LEAK`, `_TCB_LEAK`,
+`_DUPLICATE_TID`, `_BAD_IMAGE_ID`, `_SERVICE_ORDER_VIOLATION`.
+
+**`SPAWN_LIFECYCLE=1` acceptance profile.** Requires `SPAWN_LIFECYCLE_ENABLED`, at
+least one successful spawn path, the service baseline, and (when exercised) the
+rollback/invariant diagnostics; fails hard on the failure markers plus
+`CapabilityFull`, `TaskTableFull`, `PAGE_FAULT_UNHANDLED`/`_FATAL`/`_NOT_HANDLED`,
+and the fatal breadcrumbs (`^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/`FATAL`).
+Handled COW/DEMAND faults remain accepted. Mode isolation forces `SPAWN_LIFECYCLE`
+off under `D6_SWITCH_PROOF` / `D6_SWITCH_A`; it is standalone (does not enable a
+D6/D2 mode). Guarded by `stage175_spawn_lifecycle`.
+
+Acceptance (user QEMU): (1) `SPAWN_LIFECYCLE=1` smoke (primary); (2)
+`FAULT_DELIVERY=1`; (3) `CAP_CNODE=1`; (4) `VM_COW=1`; (5) `SCHED_TIMEOUT=1`; (6)
+`IPC_FINAL=1` oracle; (7) `D2_RECV_GENUINE=1`; (8) `D2_SEND_GENUINE=1`; (9) normal
+smoke; (10) `D6_SWITCH_A=1`; (11) 5-min `D6_SWITCH_PROOF=1`; (12) Stage 163P
+sender-wake oracle. **PENDING user QEMU acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

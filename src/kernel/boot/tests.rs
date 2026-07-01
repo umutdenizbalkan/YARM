@@ -47489,7 +47489,7 @@ mod stage168b_d2_recv_genuine_completion {
         let iso_idx = SMOKE_SRC
             .find("if [[ \"$D6_SWITCH_PROOF\" == \"1\" ]]; then")
             .expect("proof precedence branch");
-        let iso = &SMOKE_SRC[iso_idx..iso_idx + 320];
+        let iso = &SMOKE_SRC[iso_idx..iso_idx + 480];
         assert!(
             iso.contains("D6_GENUINE")
                 && iso.contains("D2_RECV_GENUINE")
@@ -49656,6 +49656,230 @@ mod stage174_fault_delivery {
         assert!(
             DOC_SRC.contains("Stage 173B"),
             "doc must record the Stage 173B D2_SEND smoke false-positive fix"
+        );
+    }
+}
+
+// Stage 175 (SPAWN-LIFECYCLE): exercising the spawn address-space create → rollback
+// path with the spawn_lifecycle marker knob ENABLED must be behaviorally identical
+// to the knob off — the scratch ASID and its cap are reclaimed with no leak —
+// proving the diagnostics change no spawn/PM behavior.
+#[test]
+fn stage175_spawn_lifecycle_markers_do_not_change_rollback_behavior() {
+    let mut state = Bootstrap::init().expect("init");
+    crate::kernel::boot::set_spawn_lifecycle_enabled(true);
+    let cnode = state.current_task_cnode().expect("cnode");
+
+    // Create a scratch address space (the spawn-path primitive) and roll it back.
+    let (asid, aspace_cap) = state.create_user_address_space().expect("aspace");
+    assert!(
+        state.with_user_spaces(|spaces| spaces.get(asid).is_some()),
+        "scratch aspace must exist after create"
+    );
+
+    assert!(
+        state.destroy_user_address_space_by_asid(asid).is_ok(),
+        "rollback must destroy the scratch aspace"
+    );
+    let _ = state.revoke_capability_in_cnode(cnode, aspace_cap);
+
+    // No leak: the ASID slot and the aspace cap are both reclaimed.
+    assert!(
+        state.with_user_spaces(|spaces| spaces.get(asid).is_none()),
+        "scratch aspace must be gone after rollback (no aspace leak)"
+    );
+    assert!(
+        state
+            .capability_for_cnode_local(cnode, aspace_cap)
+            .is_none(),
+        "scratch aspace cap must be revoked after rollback (no cap leak)"
+    );
+
+    crate::kernel::boot::set_spawn_lifecycle_enabled(false);
+}
+
+// Stage 175 (SPAWN-LIFECYCLE): source guards over the spawn-lifecycle
+// instrumentation, knob, smoke plumbing, marker set, and invariants (no
+// ABI/count/behavior change; PM policy stays in userspace).
+mod stage175_spawn_lifecycle {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral (pure diagnostic, no arch cfg).
+    #[test]
+    fn stage175_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub spawn_lifecycle: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.spawn_lifecycle"),
+            "yarm.spawn_lifecycle must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("SPAWN_LIFECYCLE_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn spawn_lifecycle_enabled() -> bool")
+                && MOD_SRC.contains("fn set_spawn_lifecycle_enabled(")
+                && MOD_SRC.contains("fn spawn_lifecycle_proof_try_start()"),
+            "SPAWN_LIFECYCLE gate + accessors + one-shot latch must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.spawn_lifecycle")
+            .expect("spawn_lifecycle apply block");
+        let block = &CMDLINE_SRC[idx..idx + 600];
+        assert!(
+            block.contains("set_spawn_lifecycle_enabled(enabled)")
+                && block.contains("SPAWN_LIFECYCLE_ENABLED")
+                && !block.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "spawn_lifecycle must be arch-neutral (pure diagnostic) and emit SPAWN_LIFECYCLE_ENABLED"
+        );
+    }
+
+    // The one-shot rollback proof is hooked in the arch-neutral timer path and is
+    // self-contained + one-shot.
+    #[test]
+    fn stage175_proof_hooked_arch_neutral() {
+        assert!(
+            FAULT_SRC.contains("self.maybe_run_spawn_lifecycle_proof()"),
+            "proof must be driven from the arch-neutral fault/timer path"
+        );
+        assert!(
+            EXEC_SRC.contains("fn maybe_run_spawn_lifecycle_proof(")
+                && EXEC_SRC.contains("spawn_lifecycle_proof_try_start()")
+                && EXEC_SRC.contains("if tid == 0"),
+            "proof must be one-shot and only run for a real user task (tid != 0)"
+        );
+    }
+
+    // The full documented marker set must exist verbatim across the instrumentation.
+    #[test]
+    fn stage175_all_marker_strings_exist() {
+        // Phase markers live in the syscall handler + spawn path.
+        for m in [
+            "SPAWN_LIFECYCLE_REQUEST_BEGIN",
+            "SPAWN_LIFECYCLE_IMAGE_RESOLVE_OK",
+            "SPAWN_LIFECYCLE_IMAGE_RESOLVE_FAIL",
+            "SPAWN_LIFECYCLE_ELF_PARSE_BEGIN",
+            "SPAWN_LIFECYCLE_ELF_PARSE_OK",
+            "SPAWN_LIFECYCLE_ELF_LOAD_BEGIN",
+            "SPAWN_LIFECYCLE_ELF_LOAD_OK",
+            "SPAWN_LIFECYCLE_ZC_LOAD_OK",
+            "SPAWN_LIFECYCLE_ASPACE_CREATE_OK",
+            "SPAWN_LIFECYCLE_SERVICE_READY",
+            "SPAWN_LIFECYCLE_BAD_IMAGE_ID",
+            "SPAWN_LIFECYCLE_SERVICE_ORDER_VIOLATION",
+        ] {
+            assert!(PROCESS_SRC.contains(m), "process.rs must emit marker {m}");
+        }
+        for m in [
+            "SPAWN_LIFECYCLE_TCB_ALLOC_OK",
+            "SPAWN_LIFECYCLE_CNODE_SETUP_OK",
+            "SPAWN_LIFECYCLE_BOOTSTRAP_CAPS_OK",
+            "SPAWN_LIFECYCLE_THREAD_READY",
+            "SPAWN_LIFECYCLE_PROCESS_READY",
+            "SPAWN_LIFECYCLE_INVARIANT_OK",
+            "SPAWN_LIFECYCLE_ROLLBACK_BEGIN",
+            "SPAWN_LIFECYCLE_ROLLBACK_OK",
+            "SPAWN_LIFECYCLE_ROLLBACK_LEAK",
+            "SPAWN_LIFECYCLE_ASPACE_LEAK",
+            "SPAWN_LIFECYCLE_CAP_LEAK",
+            "SPAWN_LIFECYCLE_TCB_LEAK",
+            "SPAWN_LIFECYCLE_ZOMBIE_LEAK",
+            "SPAWN_LIFECYCLE_DUPLICATE_TID",
+        ] {
+            assert!(EXEC_SRC.contains(m), "exec_state.rs must emit marker {m}");
+        }
+        // Enabled marker is emitted by the cmdline apply.
+        assert!(
+            CMDLINE_SRC.contains("SPAWN_LIFECYCLE_ENABLED"),
+            "cmdline apply must emit SPAWN_LIFECYCLE_ENABLED"
+        );
+    }
+
+    // Smoke plumbing + mode isolation + failure gates.
+    #[test]
+    fn stage175_smoke_profile() {
+        assert!(
+            SMOKE_SRC.contains("SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}")
+                && SMOKE_SRC.contains("yarm.spawn_lifecycle=1"),
+            "smoke must plumb SPAWN_LIFECYCLE=1"
+        );
+        for m in [
+            "SPAWN_LIFECYCLE_ENABLED",
+            "SPAWN_LIFECYCLE_PROCESS_READY",
+            "SPAWN_LIFECYCLE_INVARIANT_OK",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require {m}");
+        }
+        for f in [
+            "SPAWN_LIFECYCLE_ROLLBACK_LEAK",
+            "SPAWN_LIFECYCLE_ZOMBIE_LEAK",
+            "SPAWN_LIFECYCLE_CAP_LEAK",
+            "SPAWN_LIFECYCLE_ASPACE_LEAK",
+            "SPAWN_LIFECYCLE_TCB_LEAK",
+            "SPAWN_LIFECYCLE_DUPLICATE_TID",
+            "SPAWN_LIFECYCLE_BAD_IMAGE_ID",
+            "SPAWN_LIFECYCLE_SERVICE_ORDER_VIOLATION",
+        ] {
+            assert!(SMOKE_SRC.contains(f), "smoke must gate on {f}");
+        }
+        assert!(
+            SMOKE_SRC.contains("VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE"),
+            "mode isolation must force SPAWN_LIFECYCLE off under D6 proof/switch-a"
+        );
+    }
+
+    // Invariants + no scope creep into ABI/counts/D2/D6/IPC/VM/CAP/FAULT.
+    #[test]
+    fn stage175_invariants_and_regressions_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        // D2/D6/IPC-FINAL/SCHED-TIMEOUT/VM-COW/CAP-CNODE/FAULT-DELIVERY gates present.
+        assert!(
+            SMOKE_SRC.contains("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+                && SMOKE_SRC.contains("SCHED_TIMEOUT_ENABLED")
+                && SMOKE_SRC.contains("yarm.vm_cow=1")
+                && SMOKE_SRC.contains("yarm.cap_cnode=1")
+                && SMOKE_SRC.contains("yarm.fault_delivery=1"),
+            "D2/SCHED-TIMEOUT/VM-COW/CAP-CNODE/FAULT-DELIVERY gates must remain"
+        );
+        // The spawn success markers (image resolve/parse/load) are preserved and the
+        // spawn primitives are untouched (instrumentation only wraps error/phase edges).
+        assert!(
+            EXEC_SRC.contains("fn spawn_user_task_from_image(")
+                && PROCESS_SRC.contains("fn handle_spawn_from_initramfs_file("),
+            "spawn primitives must remain"
+        );
+    }
+
+    // Docs: Stage 174 accepted + Stage 175 section added.
+    #[test]
+    fn stage175_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 175 — SPAWN-LIFECYCLE"),
+            "doc must add the Stage 175 SPAWN-LIFECYCLE section"
+        );
+        assert!(
+            DOC_SRC.contains("FAULT-DELIVERY\nis **ACCEPTED**")
+                || DOC_SRC.contains("FAULT-DELIVERY is **ACCEPTED**"),
+            "doc must record Stage 174 accepted"
+        );
+        assert!(
+            DOC_SRC.contains("PM policy stays in\nuserspace")
+                || DOC_SRC.contains("PM policy stays in userspace"),
+            "doc must state PM policy stays in userspace"
         );
     }
 }

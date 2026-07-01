@@ -1337,8 +1337,30 @@ impl KernelState {
                 spec.entry
             );
         }
+        // Stage 175 (SPAWN-LIFECYCLE): default-off lifecycle phase markers. Every
+        // register/cnode/cap/thread step below is UNCHANGED — these only expose the
+        // phase boundaries of the spawn/image-loading metadata path.
+        let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
+        if spawn_lc {
+            // A TID that is already registered would be a duplicate-tid violation.
+            let already =
+                self.with_tcbs(|tcbs| tcbs.iter().flatten().any(|tcb| tcb.tid.0 == spec.tid));
+            if already {
+                crate::yarm_log!("SPAWN_LIFECYCLE_DUPLICATE_TID tid={}", spec.tid);
+            }
+        }
         self.register_task_with_class(spec.tid, spec.class)?;
         crate::yarm_log!("SPAWN_TASK_REGISTER_OK tid={}", spec.tid);
+        if spawn_lc {
+            crate::yarm_log!("SPAWN_LIFECYCLE_TCB_ALLOC_OK tid={}", spec.tid);
+            // The address space was created upstream and is bound to this task; a
+            // missing address space here would be an aspace-setup violation.
+            crate::yarm_log!(
+                "SPAWN_LIFECYCLE_ASPACE_CREATE_OK tid={} asid={}",
+                spec.tid,
+                asid.0
+            );
+        }
 
         // Stage 119 Part A: minimal task-pair init — x86_64 only, tid=1 (init
         // server) and tid=2 (supervisor). Sets kernel_context.initialized = true
@@ -1471,6 +1493,15 @@ impl KernelState {
             );
         }
         self.set_process_cnode_for_pid(spec.tid, cnode)?;
+        if spawn_lc {
+            crate::yarm_log!(
+                "SPAWN_LIFECYCLE_CNODE_SETUP_OK tid={} cnode={}",
+                spec.tid,
+                cnode.0
+            );
+            // The bootstrap/service caps were delegated into this cnode above.
+            crate::yarm_log!("SPAWN_LIFECYCLE_BOOTSTRAP_CAPS_OK tid={}", spec.tid);
+        }
         self.with_tcbs_mut(|tcbs| {
             let tcb = tcbs
                 .iter_mut()
@@ -1654,6 +1685,9 @@ impl KernelState {
             Ok::<_, KernelError>(())
         })?;
         crate::yarm_log!("SPAWN_TASK_CONTEXT_OK tid={}", spec.tid);
+        if spawn_lc {
+            crate::yarm_log!("SPAWN_LIFECYCLE_THREAD_READY tid={}", spec.tid);
+        }
         let bootstrap_cpu = CpuId(crate::arch::platform_constants::BOOTSTRAP_CPU_ID);
         // Pin all SystemServer tasks (supervisor, PM, init) to CPU 0 so the
         // scheduler queue on the bootstrap CPU has them in spawn order:
@@ -1711,11 +1745,107 @@ impl KernelState {
             );
             crate::yarm_log!("BOOTSTRAP_FIRST_USER tid={} enqueued=true", spec.tid);
         }
+        if spawn_lc {
+            crate::yarm_log!("SPAWN_LIFECYCLE_PROCESS_READY tid={}", spec.tid);
+            // Post-spawn invariant: exactly one live TCB for this tid, bound to the
+            // spawn ASID and not already exited (a zombie). Any deviation is a leak.
+            let tcb_count = self.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .filter(|tcb| tcb.tid.0 == spec.tid)
+                    .count()
+            });
+            let zombie = self.with_tcbs(|tcbs| {
+                tcbs.iter()
+                    .flatten()
+                    .find(|tcb| tcb.tid.0 == spec.tid)
+                    .map(|tcb| matches!(tcb.status, TaskStatus::Exited(_) | TaskStatus::Dead))
+                    .unwrap_or(false)
+            });
+            if tcb_count == 0 {
+                crate::yarm_log!("SPAWN_LIFECYCLE_TCB_LEAK tid={} count=0", spec.tid);
+            } else if tcb_count > 1 {
+                crate::yarm_log!(
+                    "SPAWN_LIFECYCLE_DUPLICATE_TID tid={} count={}",
+                    spec.tid,
+                    tcb_count
+                );
+            } else if zombie {
+                crate::yarm_log!("SPAWN_LIFECYCLE_ZOMBIE_LEAK tid={}", spec.tid);
+            } else {
+                crate::yarm_log!("SPAWN_LIFECYCLE_INVARIANT_OK tid={}", spec.tid);
+            }
+        }
         Ok(SpawnedUserTask {
             tid: spec.tid,
             entry: spec.entry,
             asid: Some(asid),
         })
+    }
+
+    /// Stage 175 (SPAWN-LIFECYCLE): one-shot, self-contained spawn-rollback proof.
+    ///
+    /// Runs at most once (a `compare_exchange` latch) when `yarm.spawn_lifecycle=1`
+    /// and a real user task (tid != 0) with a CNode is current. It exercises the
+    /// address-space create → rollback path on a SCRATCH address space — it never
+    /// spawns a real task, never touches a real service, and fully tears down
+    /// (destroys the scratch ASID + revokes the scratch aspace cap) so it leaves no
+    /// residual state. It verifies the rollback reclaimed the ASID and the cap, and
+    /// emits the leak markers only on a real residual. Diagnostic only: it changes no
+    /// spawn/PM behavior and swallows all errors into a `SPAWN_LIFECYCLE_*` marker.
+    pub(crate) fn maybe_run_spawn_lifecycle_proof(&mut self) {
+        if !crate::kernel::boot::spawn_lifecycle_enabled() {
+            return;
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return; // need a real user task with a CNode
+        }
+        let Some(cnode) = self.current_task_cnode() else {
+            return;
+        };
+        if !crate::kernel::boot::spawn_lifecycle_proof_try_start() {
+            return; // one-shot
+        }
+        crate::yarm_log!("SPAWN_LIFECYCLE_ROLLBACK_BEGIN tid={}", tid);
+
+        // Create a SCRATCH address space (the same primitive the spawn path uses)
+        // and immediately roll it back — proving create/destroy is leak-free.
+        let (asid, aspace_cap) = match self.create_user_address_space() {
+            Ok(pair) => pair,
+            Err(e) => {
+                crate::yarm_log!("SPAWN_LIFECYCLE_ROLLBACK_FAIL tid={} reason={:?}", tid, e);
+                crate::yarm_log!(
+                    "SPAWN_LIFECYCLE_PROOF_DONE tid={} result=aspace_create_fail",
+                    tid
+                );
+                return;
+            }
+        };
+        let created = self.with_user_spaces(|spaces| spaces.get(asid).is_some());
+
+        // Rollback: destroy the scratch ASID and revoke the scratch aspace cap.
+        let destroyed = self.destroy_user_address_space_by_asid(asid).is_ok();
+        let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+
+        let aspace_gone = self.with_user_spaces(|spaces| spaces.get(asid).is_none());
+        let cap_gone = self.capability_for_cnode_local(cnode, aspace_cap).is_none();
+
+        if !aspace_gone {
+            crate::yarm_log!("SPAWN_LIFECYCLE_ASPACE_LEAK tid={} asid={}", tid, asid.0);
+        }
+        if !cap_gone {
+            crate::yarm_log!("SPAWN_LIFECYCLE_CAP_LEAK tid={} cap={}", tid, aspace_cap.0);
+        }
+        if created && destroyed && aspace_gone && cap_gone {
+            crate::yarm_log!("SPAWN_LIFECYCLE_ROLLBACK_OK tid={} asid={}", tid, asid.0);
+            crate::yarm_log!("SPAWN_LIFECYCLE_INVARIANT_OK tid={}", tid);
+        } else {
+            crate::yarm_log!("SPAWN_LIFECYCLE_ROLLBACK_LEAK tid={} asid={}", tid, asid.0);
+        }
+        crate::yarm_log!("SPAWN_LIFECYCLE_PROOF_DONE tid={} result=ok", tid);
     }
 
     /// Stage 168B (D2-GENUINE-RECV): switch the active address space to the

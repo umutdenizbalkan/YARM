@@ -592,6 +592,17 @@ pub(super) fn handle_spawn_from_initramfs_file(
     let startup_args_ptr = frame.arg(4);
     let startup_args_count = frame.arg(5);
 
+    // Stage 175 (SPAWN-LIFECYCLE): default-off phase markers. Every resolve/parse/
+    // load/spawn step is UNCHANGED — these only expose the phase boundaries.
+    let spawn_lc = crate::kernel::boot::spawn_lifecycle_enabled();
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_REQUEST_BEGIN image_id={} parent_pid={}",
+            image_id,
+            parent_pid
+        );
+    }
+
     if name_len == 0 || name_len > 128 {
         return Err(SyscallError::InvalidArgs);
     }
@@ -605,11 +616,23 @@ pub(super) fn handle_spawn_from_initramfs_file(
 
     let initrd =
         crate::kernel::boot::Bootstrap::boot_initrd_bytes().ok_or(SyscallError::InvalidArgs)?;
-    let entry = CpioArchive::new(initrd)
-        .find(name)
-        .map_err(|_| SyscallError::InvalidArgs)?
-        .ok_or(SyscallError::InvalidArgs)?;
+    let entry = match CpioArchive::new(initrd).find(name) {
+        Ok(Some(entry)) => entry,
+        Ok(None) | Err(_) => {
+            if spawn_lc {
+                crate::yarm_log!("SPAWN_LIFECYCLE_IMAGE_RESOLVE_FAIL image_id={}", image_id);
+            }
+            return Err(SyscallError::InvalidArgs);
+        }
+    };
     let data = entry.file_data();
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_IMAGE_RESOLVE_OK image_id={} bytes={}",
+            image_id,
+            data.len()
+        );
+    }
 
     crate::yarm_log!(
         "KSPAWN_FROM_CPIO image_id={} name={} file_size={}",
@@ -629,10 +652,28 @@ pub(super) fn handle_spawn_from_initramfs_file(
     staging[..elf_len].copy_from_slice(data);
     let elf_bytes = &staging[..elf_len];
 
-    let image_path = spawn_image_path_for_image_id(image_id).ok_or(SyscallError::InvalidArgs)?;
+    let image_path = match spawn_image_path_for_image_id(image_id) {
+        Some(path) => path,
+        None => {
+            if spawn_lc {
+                crate::yarm_log!("SPAWN_LIFECYCLE_BAD_IMAGE_ID image_id={}", image_id);
+            }
+            return Err(SyscallError::InvalidArgs);
+        }
+    };
     crate::yarm_log!("KSPAWN_FROM_CPIO path={}", image_path);
+    if spawn_lc {
+        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_PARSE_BEGIN image_id={}", image_id);
+    }
     let elf = ElfImageInfo::parse(image_id, elf_bytes).map_err(|_| SyscallError::InvalidArgs)?;
     crate::yarm_log!("KSPAWN_FROM_CPIO entry=0x{:x}", elf.entry);
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_ELF_PARSE_OK image_id={} entry=0x{:x}",
+            image_id,
+            elf.entry
+        );
+    }
 
     let mut startup_args = copy_spawn_startup_args(kernel, startup_args_ptr, startup_args_count)?;
     startup_args[2] = 0;
@@ -653,10 +694,24 @@ pub(super) fn handle_spawn_from_initramfs_file(
         .create_user_address_space()
         .map_err(SyscallError::from)?;
     crate::yarm_log!("KSPAWN_FROM_CPIO tid={} asid={}", tid, asid.0);
+    if spawn_lc {
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_ASPACE_CREATE_OK tid={} asid={}",
+            tid,
+            asid.0
+        );
+        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_LOAD_BEGIN tid={} asid={}", tid, asid.0);
+    }
 
     kernel
         .load_elf_pt_load_segments(asid, elf_bytes)
         .map_err(SyscallError::from)?;
+    if spawn_lc {
+        // load_elf_pt_load_segments finalizes the PT_LOAD segments (the
+        // initramfs-backed zero-copy grant / staged copy) into the new ASID.
+        crate::yarm_log!("SPAWN_LIFECYCLE_ELF_LOAD_OK tid={} asid={}", tid, asid.0);
+        crate::yarm_log!("SPAWN_LIFECYCLE_ZC_LOAD_OK tid={} asid={}", tid, asid.0);
+    }
 
     let spawner_tid = current_tid(kernel).unwrap_or(0);
     let (service_send_cap, service_recv_cap) = match kernel.create_endpoint(8) {
@@ -717,6 +772,26 @@ pub(super) fn handle_spawn_from_initramfs_file(
         .map_err(SyscallError::from)?;
 
     crate::yarm_log!("KSPAWN_FROM_CPIO spawned_tid={}", spawned.tid);
+    if spawn_lc {
+        // Spawned system servers become services as they come up. TIDs are
+        // monotonically allocated, so a spawned service tid that regresses below a
+        // previously-observed service tid indicates a startup-order anomaly.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static LAST_SERVICE_TID: AtomicU64 = AtomicU64::new(0);
+        let prev = LAST_SERVICE_TID.swap(spawned.tid, Ordering::Relaxed);
+        if prev != 0 && spawned.tid < prev {
+            crate::yarm_log!(
+                "SPAWN_LIFECYCLE_SERVICE_ORDER_VIOLATION tid={} prev={}",
+                spawned.tid,
+                prev
+            );
+        }
+        crate::yarm_log!(
+            "SPAWN_LIFECYCLE_SERVICE_READY tid={} image_id={}",
+            spawned.tid,
+            image_id
+        );
+    }
 
     let packed_ret2 =
         if parent_pid != 0 && service_send_cap != 0 && caller_send_cap != service_send_cap {

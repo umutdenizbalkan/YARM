@@ -47,17 +47,18 @@ SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
 VM_COW=${VM_COW:-0}
 CAP_CNODE=${CAP_CNODE:-0}
 FAULT_DELIVERY=${FAULT_DELIVERY:-0}
+SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -65,7 +66,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -152,6 +153,17 @@ fi
 FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 if [[ "$FAULT_DELIVERY" == "1" && "$KERNEL_CMDLINE" != *"yarm.fault_delivery="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.fault_delivery=1"
+fi
+# Stage 175 (SPAWN-LIFECYCLE): SPAWN_LIFECYCLE=1 appends yarm.spawn_lifecycle=1 to
+# emit the spawn / image-loading / lifecycle-metadata phase markers + run the
+# one-shot self-contained spawn-rollback proof (arch-neutral; no behavior change).
+# Standalone — it does NOT enable any D6/D2 mode and is NOT auto-enabled by the IPC
+# proof workloads. The phase markers fire naturally from the boot's service spawns
+# (every SpawnFromInitramfsFile); the one-shot proof provides the deterministic
+# rollback/invariant markers.
+SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
+if [[ "$SPAWN_LIFECYCLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.spawn_lifecycle="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.spawn_lifecycle=1"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1359,6 +1371,82 @@ if [[ "$FAULT_DELIVERY" == "1" ]]; then
     exit 1
   fi
   echo "[ok] FAULT-DELIVERY: kernel-fault → supervisor delivery diagnostics clean"
+fi
+
+# Stage 175 (SPAWN-LIFECYCLE): when booted with yarm.spawn_lifecycle=1, require the
+# spawn / image-loading / lifecycle-metadata diagnostics and reject spawn/rollback
+# regressions. The phase markers fire naturally from the boot's service spawns; the
+# one-shot proof provides the deterministic rollback/invariant markers. Handled
+# COW/DEMAND page faults remain accepted (Stage 171B/173B).
+if [[ "$SPAWN_LIFECYCLE" == "1" ]]; then
+  spawn_lc_fail=0
+  echo "[ok] SPAWN_LIFECYCLE enabled marker:" $(log_has_pattern "SPAWN_LIFECYCLE_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "SPAWN_LIFECYCLE_ENABLED"; then
+    echo "[error] SPAWN-LIFECYCLE: SPAWN_LIFECYCLE_ENABLED missing (knob not applied)"
+    spawn_lc_fail=1
+  fi
+  # At least one successful spawn path must have run to completion.
+  if log_has_pattern "SPAWN_LIFECYCLE_PROCESS_READY" || log_has_pattern "SPAWN_LIFECYCLE_SERVICE_READY"; then
+    echo "[ok] SPAWN-LIFECYCLE: successful spawn path observed"
+  else
+    echo "[error] SPAWN-LIFECYCLE: no successful spawn path observed"
+    spawn_lc_fail=1
+  fi
+  # The deterministic one-shot rollback proof invariant (must appear).
+  if log_has_pattern "SPAWN_LIFECYCLE_INVARIANT_OK"; then
+    echo "[ok] SPAWN-LIFECYCLE invariant OK"
+  else
+    echo "[error] SPAWN-LIFECYCLE: SPAWN_LIFECYCLE_INVARIANT_OK missing"
+    spawn_lc_fail=1
+  fi
+  # If a rollback began it must have completed cleanly.
+  if log_has_pattern "SPAWN_LIFECYCLE_ROLLBACK_BEGIN" && ! log_has_pattern "SPAWN_LIFECYCLE_ROLLBACK_OK"; then
+    echo "[error] SPAWN-LIFECYCLE: rollback began but did not complete"
+    spawn_lc_fail=1
+  fi
+  # Service baseline must still be reached (services came up).
+  if ! log_has_pattern "YARM_SERVICE_BASELINE" && ! log_has_pattern "SERVICE_BASELINE_READY" && ! log_has_pattern "YARM_BOOT_OK"; then
+    echo "[warn] SPAWN-LIFECYCLE: service baseline marker not observed"
+  fi
+  # Hard invariant-violation markers (must never appear).
+  for f in \
+    "SPAWN_LIFECYCLE_ROLLBACK_LEAK" \
+    "SPAWN_LIFECYCLE_ZOMBIE_LEAK" \
+    "SPAWN_LIFECYCLE_CAP_LEAK" \
+    "SPAWN_LIFECYCLE_ASPACE_LEAK" \
+    "SPAWN_LIFECYCLE_TCB_LEAK" \
+    "SPAWN_LIFECYCLE_DUPLICATE_TID" \
+    "SPAWN_LIFECYCLE_BAD_IMAGE_ID" \
+    "SPAWN_LIFECYCLE_SERVICE_ORDER_VIOLATION" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] SPAWN-LIFECYCLE: fatal marker present: $f"
+      spawn_lc_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    sl_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/SPAWN_LIFECYCLE_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$sl_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] SPAWN-LIFECYCLE: fatal breadcrumb after spawn-lifecycle wire start: $fatal_pat"
+        spawn_lc_fail=1
+      fi
+    done
+    # Explicit unhandled/fatal page-fault markers only (handled COW/DEMAND are OK).
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$sl_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] SPAWN-LIFECYCLE: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        spawn_lc_fail=1
+      fi
+    done
+  fi
+  if [[ "$spawn_lc_fail" -eq 1 ]]; then
+    echo "[error] SPAWN-LIFECYCLE mode FAILED"
+    exit 1
+  fi
+  echo "[ok] SPAWN-LIFECYCLE: spawn / image-loading / lifecycle-metadata diagnostics clean"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then
