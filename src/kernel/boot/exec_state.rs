@@ -1718,6 +1718,18 @@ impl KernelState {
         })
     }
 
+    /// Stage 168B (D2-GENUINE-RECV): switch the active address space to the
+    /// incoming task's ASID. Mirrors the in-lock dispatch's
+    /// `self.hal.switch_address_space` step; exposed so the out-of-global-lock
+    /// recv dispatch drain (in `arch/trap_entry.rs`) can perform it inside the
+    /// brief hardened restore re-acquire without touching the private `hal`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d2_recv_switch_incoming_asid(&mut self, incoming: u64) {
+        if let Some(asid) = self.task_asid(incoming) {
+            self.hal.switch_address_space(asid);
+        }
+    }
+
     pub(crate) fn dispatch_next_task(&mut self) -> Result<Option<u64>, KernelError> {
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!("DISPATCH: begin");

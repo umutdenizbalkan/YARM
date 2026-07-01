@@ -609,6 +609,75 @@ impl SharedKernel {
         });
     }
 
+    /// Stage 168B (D2-GENUINE-RECV): re-verify — out of the global lock, through
+    /// the rank-2 task seam — that the deferred blocking-recv task is STILL
+    /// `Blocked(EndpointReceive(_))`. Guards the out-of-lock queue-advancing
+    /// dispatch drain against a stale deferral (e.g. a sender woke the task, or
+    /// an in-lock fallback superseded it). Single-CPU + IRQ-off means nothing
+    /// mutates between the in-lock commit and this check, but the re-verify is
+    /// the correctness fence the spec requires before dispatching.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d2_recv_reverify_blocked(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| {
+                    matches!(
+                        tcb.status,
+                        crate::kernel::task::TaskStatus::Blocked(
+                            crate::kernel::task::WaitReason::EndpointReceive(_)
+                        )
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
+    /// Stage 168B (D2-GENUINE-RECV): the authoritative **queue-advancing**
+    /// dispatch for a committed blocking recv, run through the rank-1 scheduler
+    /// seam with the global `SpinLock<KernelState>` already dropped by the
+    /// trap-entry drain. The blocked recv task was removed from `current`
+    /// (Phase A `block_current`), so `dispatch_next_on` genuinely dequeues the
+    /// next runnable task here — the queue-advancing step Stage 168A had to
+    /// fall back on. Returns the incoming TID (`None` ⇒ idle). Emits
+    /// `D2_RECV_GENUINE_DISPATCH_STEP_SPLIT`. Default-off (gated by the caller).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d2_recv_dispatch_step_mut(&self, cpu: CpuId) -> Option<u64> {
+        self.with_scheduler_split_mut(|sched| {
+            let dispatch_cpu = sched.current_cpu;
+            let incoming = kernel_mut(&mut sched.scheduler)
+                .dispatch_next_on(dispatch_cpu)
+                .map(|tid| tid.0);
+            let result = if incoming.is_some() { "switch" } else { "idle" };
+            crate::yarm_log!(
+                "D2_RECV_GENUINE_DISPATCH_STEP_SPLIT cpu={} result={} incoming={:?}",
+                cpu.0,
+                result,
+                incoming
+            );
+            incoming
+        })
+    }
+
+    /// Stage 168B (D2-GENUINE-RECV): does the incoming task have an initialized
+    /// kernel switch context (a wired kernel thread)? Read out of the global
+    /// lock through the rank-2 task seam. Blocking recv is done by USER tasks,
+    /// which resume via trap-frame restore + syscall restart (kernel_context
+    /// initialized == false), so this returns false for the recv workload; it
+    /// gates the dormant `switch_frames` (D2_RECV_GENUINE_SWITCH_*) variant that
+    /// would reuse the hardened D6-SWITCH-A stash for a kernel-thread incoming.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn d2_recv_incoming_has_kernel_switch_ctx(&self, tid: u64) -> bool {
+        self.with_task_tcbs_split_mut(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .map(|tcb| tcb.kernel_context.initialized)
+                .unwrap_or(false)
+        })
+    }
+
     /// Stage 108: task/TCB (rank 2) split-mut seam.
     ///
     /// # Validation status

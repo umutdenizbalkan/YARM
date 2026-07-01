@@ -778,6 +778,76 @@ pub(crate) fn d2_recv_genuine_enabled() -> bool {
     D2_RECV_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+/// Stage 168B (D2-GENUINE-RECV completion): global count of blocking-recv
+/// queue-advancing dispatches that ran through the scheduler seam OUTSIDE the
+/// global KernelState lock. Emitted as `D2_RECV_GENUINE_DISPATCH_DONE`.
+pub(crate) static D2_RECV_DISPATCH_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Stage 168B: per-CPU "blocking-recv dispatch deferred" flag. Set by the
+/// in-lock `block_current_on_receive_with_deadline` when it commits the block
+/// (waiter published, current task `Blocked`) and defers the queue-advancing
+/// dispatch to the out-of-global-lock trap-entry drain instead of running the
+/// authoritative dispatch in-lock. Cleared by the drain.
+/// VALIDATION: D2_RECV_GENUINE_DISPATCH_DEFERRED.
+pub(crate) static D2_RECV_DISPATCH_DEFERRED: [core::sync::atomic::AtomicBool;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 168B: per-CPU blocked (outgoing) recv TID recorded with the deferral,
+/// so the drain can re-verify the task is still `Blocked(EndpointReceive)`
+/// before running the queue-advancing dispatch (`u64::MAX` sentinel = unset).
+pub(crate) static D2_RECV_DISPATCH_OUTGOING: [core::sync::atomic::AtomicU64;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(u64::MAX) }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 168B: record a deferred blocking-recv dispatch intent for `cpu`.
+/// Returns false (declining to defer, caller must fall back to the in-lock
+/// dispatch) if an intent is already pending — no nested deferral.
+pub(crate) fn d2_recv_dispatch_try_defer(cpu_idx: usize, outgoing: u64) -> bool {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return false;
+    }
+    if D2_RECV_DISPATCH_DEFERRED[cpu_idx]
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    D2_RECV_DISPATCH_OUTGOING[cpu_idx].store(outgoing, core::sync::atomic::Ordering::Release);
+    true
+}
+
+/// Stage 168B: is a deferred blocking-recv dispatch pending for `cpu`?
+pub(crate) fn d2_recv_dispatch_is_deferred(cpu_idx: usize) -> bool {
+    cpu_idx < crate::kernel::scheduler::MAX_CPUS
+        && D2_RECV_DISPATCH_DEFERRED[cpu_idx].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 168B: read the deferred blocking-recv outgoing TID for `cpu`
+/// (`None` if unset).
+pub(crate) fn d2_recv_dispatch_outgoing(cpu_idx: usize) -> Option<u64> {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return None;
+    }
+    let v = D2_RECV_DISPATCH_OUTGOING[cpu_idx].load(core::sync::atomic::Ordering::Acquire);
+    if v == u64::MAX { None } else { Some(v) }
+}
+
+/// Stage 168B: clear the blocking-recv dispatch deferral for `cpu`.
+pub(crate) fn d2_recv_dispatch_clear(cpu_idx: usize) {
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+        return;
+    }
+    D2_RECV_DISPATCH_OUTGOING[cpu_idx].store(u64::MAX, core::sync::atomic::Ordering::Release);
+    D2_RECV_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

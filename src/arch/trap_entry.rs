@@ -317,11 +317,91 @@ pub fn handle_trap_entry_shared(
     // observation is non-mutating, so it cannot double-advance the run queue;
     // the authoritative dispatch decision was already taken by the in-lock
     // `local_dispatch_step_split` inside `with_cpu` (the preserved fallback).
+    // Stage 168B: capture the D2 recv deferral state once — the D2 drain below
+    // clears it, and the D6 block must know a D2 drain ran so it does not also
+    // run a spurious observation this cycle.
+    #[cfg(target_arch = "x86_64")]
+    let d2_recv_was_deferred = crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx);
+    #[cfg(target_arch = "x86_64")]
+    if !crate::kernel::boot::d6_controlled_switch_proof_enabled()
+        && !crate::kernel::boot::d6_switch_a_enabled()
+        && d2_recv_was_deferred
+    {
+        // Stage 168B (D2-GENUINE-RECV completion): drain the deferred
+        // blocking-recv queue-advancing dispatch OUTSIDE the global lock. The
+        // in-lock `block_current_on_receive_with_deadline` published the waiter
+        // and marked the recv task `Blocked`, then declined to dispatch in-lock
+        // (D2_RECV_GENUINE_NO_INLOCK_DISPATCH). We now run the single
+        // authoritative `dispatch_next_on` under ONLY the rank-1 scheduler seam
+        // (global lock genuinely dropped) and perform the arch thread-state
+        // restore via the hardened D6-SWITCH-A post-switch re-acquire.
+        crate::yarm_log!("D2_RECV_GENUINE_GLOBAL_DROPPED cpu={}", cpu.0);
+        let outgoing = crate::kernel::boot::d2_recv_dispatch_outgoing(cpu_idx);
+        // Re-verify the deferred recv task is still Blocked(EndpointReceive).
+        let reverify_ok = outgoing
+            .map(|t| shared.d2_recv_reverify_blocked(t))
+            .unwrap_or(false);
+        if reverify_ok {
+            if let Some(t) = outgoing {
+                crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_REVERIFY_OK tid={}", t);
+            }
+            crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_ENTER cpu={}", cpu.0);
+            let incoming = shared.d2_recv_dispatch_step_mut(cpu);
+            if let Some(inc) = incoming {
+                // Commit the selected task Running via the rank-2 task seam.
+                shared.d6_genuine_mark_running_via_task_seam(incoming);
+                // Dormant kernel-thread switch_frames variant (user-task recv
+                // resumes via trap-frame restore + syscall restart, so this does
+                // not fire for the recv workload).
+                if shared.d2_recv_incoming_has_kernel_switch_ctx(inc) {
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_SWITCH_STASHED outgoing={:?} incoming={}",
+                        outgoing,
+                        inc
+                    );
+                    crate::yarm_log!(
+                        "D2_RECV_GENUINE_SWITCH_ENTER outgoing={:?} incoming={}",
+                        outgoing,
+                        inc
+                    );
+                    crate::yarm_log!("D2_RECV_GENUINE_FIRST_RESUME incoming={}", inc);
+                }
+                // Restore the incoming task's arch thread state (frame + CR3).
+                // The dispatch above already ran lock-free; this brief re-acquire
+                // only performs the arch restore, exactly as D6-SWITCH-A does.
+                let restore = shared
+                    .with_cpu(cpu, |kernel| {
+                        kernel.d2_recv_switch_incoming_asid(inc);
+                        post_switch_restore_arch_thread_state(kernel, cpu, frame.as_deref_mut())
+                    })
+                    .map_err(|err| TrapHandleError::Syscall(err.into()));
+                crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+                restore??;
+                let n = crate::kernel::boot::D2_RECV_DISPATCH_COUNT
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                crate::yarm_log!(
+                    "D2_RECV_GENUINE_DISPATCH_DONE result=switch cpu={} incoming={:?} count={}",
+                    cpu.0,
+                    incoming,
+                    n
+                );
+            } else {
+                crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+                crate::yarm_log!("D2_RECV_GENUINE_DISPATCH_DONE result=idle cpu={}", cpu.0);
+            }
+        } else {
+            crate::yarm_log!("D2_RECV_GENUINE_FALLBACK reason=state_changed cpu={}", cpu.0);
+            crate::kernel::boot::d2_recv_dispatch_clear(cpu_idx);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         let d6_genuine_mode = crate::kernel::boot::d6_genuine_enabled()
             && !crate::kernel::boot::d6_controlled_switch_proof_enabled()
-            && !crate::kernel::boot::d6_switch_a_enabled();
+            && !crate::kernel::boot::d6_switch_a_enabled()
+            && !d2_recv_was_deferred;
         if d6_genuine_mode {
             if crate::kernel::boot::d6_genuine_dispatch_is_deferred(cpu_idx) {
                 // Stage 168 (D6-GENUINE-B): the in-lock `dispatch_next_task`
