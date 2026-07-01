@@ -194,6 +194,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = enabled;
     }
+    if let Some(enabled) = parsed.sched_timeout {
+        // Stage 171 (SCHED-TIMEOUT): arch-neutral, default-off DIAGNOSTIC gate for
+        // the scheduler timeout/deadline hardening markers. Changes no scheduling
+        // behavior or ABI — only emits SCHED_TIMEOUT_* / SCHED_IDLE_* markers.
+        crate::kernel::boot::set_sched_timeout_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("SCHED_TIMEOUT_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -307,6 +316,10 @@ pub struct YarmBootOptions<'a> {
     /// phase markers + out-of-global-lock dispatch seam). Default-off; non-x86_64
     /// builds parse but ignore it so AArch64/RISC-V behavior is unchanged.
     pub d2_send_genuine: Option<bool>,
+    /// Stage 171 (SCHED-TIMEOUT): `yarm.sched_timeout=1` gates the arch-neutral,
+    /// default-off scheduler timeout/deadline DIAGNOSTIC markers (no behavior/ABI
+    /// change; the chunked-scan hardening is always on).
+    pub sched_timeout: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -404,6 +417,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.d2_send_genuine" {
             options.d2_send_genuine = parse_bool_knob(value);
+        }
+        if key == b"yarm.sched_timeout" {
+            options.sched_timeout = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

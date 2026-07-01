@@ -2004,6 +2004,25 @@ impl KernelState {
             crate::yarm_log!("SCHED_ENTER_IDLE");
             crate::yarm_log!("D6_DISPATCH_IDLE");
             crate::yarm_log!("D6_SWITCH_PLAN_IDLE");
+            // Stage 171 (SCHED-TIMEOUT), Task E: idle-with-pending-timeout safety
+            // diagnostics (knob-gated + rate-limited so the frequent idle path does
+            // not flood the UART). When a deadline is pending, the CPU must not
+            // enter an indefinite halt: on x86_64/AArch64 idle is `hlt`/`wfi`, which
+            // wakes on the periodic timer IRQ that drives `process_ipc_timeout_deadlines`
+            // — so the pending timeout is guaranteed to fire (SCHED_IDLE_TIMEOUT_SAFE).
+            if crate::kernel::boot::sched_timeout_enabled()
+                && crate::kernel::boot::sched_idle_marker_budget_remaining()
+            {
+                match self.sched_timeout_earliest_pending() {
+                    Some(earliest) => {
+                        crate::yarm_log!("SCHED_IDLE_PENDING_TIMEOUT earliest={}", earliest);
+                        crate::yarm_log!("SCHED_IDLE_TIMEOUT_SAFE earliest={}", earliest);
+                    }
+                    None => {
+                        crate::yarm_log!("SCHED_IDLE_NO_PENDING_TIMEOUT");
+                    }
+                }
+            }
             if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
                 crate::yarm_log!("DISPATCH: no_runnable_task");
             }
