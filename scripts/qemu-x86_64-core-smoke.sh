@@ -40,17 +40,21 @@ D6_SWITCH_A=${D6_SWITCH_A:-0}
 D6_GENUINE=${D6_GENUINE:-0}
 D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}
 D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
+# Stage 171 (SCHED-TIMEOUT): a pure DIAGNOSTIC overlay (no behavior change). It is
+# orthogonal to the genuine modes but is forced off under the pure D6_SWITCH_PROOF
+# / D6_SWITCH_A regressions so those runs stay uncontaminated by timeout markers.
+SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -58,7 +62,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -96,6 +100,18 @@ D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
 if [[ "$D2_SEND_GENUINE" == "1" ]]; then
   if [[ "$KERNEL_CMDLINE" != *"yarm.d2_send_genuine="* ]]; then
     KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d2_send_genuine=1"
+  fi
+  IPC_RECV_PROOF=${IPC_RECV_PROOF:-1}
+  IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}
+fi
+# Stage 171 (SCHED-TIMEOUT): SCHED_TIMEOUT=1 appends yarm.sched_timeout=1 to emit
+# the scheduler timeout/deadline diagnostic markers (arch-neutral; no behavior
+# change). Also auto-enables the sender-wake proof workload so blocking IPC
+# recv/send with deadlines is exercised (a superset of the idle-safety markers).
+SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
+if [[ "$SCHED_TIMEOUT" == "1" ]]; then
+  if [[ "$KERNEL_CMDLINE" != *"yarm.sched_timeout="* ]]; then
+    KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.sched_timeout=1"
   fi
   IPC_RECV_PROOF=${IPC_RECV_PROOF:-1}
   IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}
@@ -955,6 +971,94 @@ if [[ "$D2_SEND_GENUINE" == "1" ]]; then
     exit 1
   fi
   echo "[ok] D2-SEND-GENUINE: rank-clean blocking-send dispatch ran outside the global lock"
+fi
+
+# Stage 171 (SCHED-TIMEOUT): when booted with yarm.sched_timeout=1, require the
+# scheduler timeout/deadline diagnostics and reject stranded/duplicate/blocked
+# timeout regressions. The idle-safety markers are deterministic (idle occurs
+# during boot); the expiry markers are checked only when a timeout actually fires.
+if [[ "$SCHED_TIMEOUT" == "1" ]]; then
+  sched_to_fail=0
+  echo "[ok] SCHED_TIMEOUT enabled marker:" $(log_has_pattern "SCHED_TIMEOUT_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "SCHED_TIMEOUT_ENABLED"; then
+    echo "[error] SCHED-TIMEOUT: SCHED_TIMEOUT_ENABLED missing (knob not applied)"
+    sched_to_fail=1
+  fi
+  # Idle-with-pending-timeout safety (Task E): idle occurs during boot, so at
+  # least one idle marker must appear; and every PENDING idle must be SAFE.
+  if log_has_pattern "SCHED_IDLE_PENDING_TIMEOUT" \
+     || log_has_pattern "SCHED_IDLE_NO_PENDING_TIMEOUT"; then
+    echo "[ok] SCHED-TIMEOUT: idle-entry timeout diagnostics present"
+  else
+    echo "[error] SCHED-TIMEOUT: no idle-entry timeout marker observed"
+    sched_to_fail=1
+  fi
+  if log_has_pattern "SCHED_IDLE_PENDING_TIMEOUT" && ! log_has_pattern "SCHED_IDLE_TIMEOUT_SAFE"; then
+    echo "[error] SCHED-TIMEOUT: idle entered with pending timeout but not marked SAFE (timer progress at risk)"
+    sched_to_fail=1
+  fi
+  # Never-stranded invariant (Task D): the defensive re-check must never fire.
+  if log_has_pattern "SCHED_TIMEOUT_STRANDED_WAITER"; then
+    echo "[error] SCHED-TIMEOUT: stranded timed-out waiter detected"
+    sched_to_fail=1
+  fi
+  # If any timeout actually fired, require the full rank-clean phase sequence and
+  # exactly-once wake (EXPIRED count == RUNQUEUE_ENQUEUE count within the batch
+  # markers; each expired task clears its deadline so it cannot be woken twice).
+  if [[ -f "$LOGFILE" ]] && log_has_pattern "SCHED_TIMEOUT_EXPIRED"; then
+    echo "[info] SCHED-TIMEOUT: timeout expiry observed — checking full phase sequence"
+    for m in \
+      "SCHED_TIMEOUT_SCAN_BEGIN" \
+      "SCHED_TIMEOUT_TASK_WAKE_BEGIN" \
+      "SCHED_TIMEOUT_RUNQUEUE_ENQUEUE" \
+      "SCHED_TIMEOUT_TASK_WAKE_DONE" \
+      "SCHED_TIMEOUT_NO_STRANDED_WAITERS" \
+      "SCHED_TIMEOUT_SCAN_DONE"; do
+      if log_has_pattern "$m"; then
+        echo "[ok] SCHED-TIMEOUT phase marker present: $m"
+      else
+        echo "[error] SCHED-TIMEOUT: expiry occurred but phase marker missing: $m"
+        sched_to_fail=1
+      fi
+    done
+    exp_n="$(tr '\r' '\n' <"$LOGFILE" | rg -c -a '^SCHED_TIMEOUT_EXPIRED ' || true)"
+    enq_n="$(tr '\r' '\n' <"$LOGFILE" | rg -c -a '^SCHED_TIMEOUT_RUNQUEUE_ENQUEUE ' || true)"
+    exp_n="${exp_n:-0}"; enq_n="${enq_n:-0}"
+    if [[ "$exp_n" != "$enq_n" ]]; then
+      echo "[error] SCHED-TIMEOUT: expired ($exp_n) != runqueue-enqueue ($enq_n) — wake without enqueue or duplicate wake"
+      sched_to_fail=1
+    else
+      echo "[ok] SCHED-TIMEOUT: exactly-once wake (expired=$exp_n enqueue=$enq_n)"
+    fi
+  fi
+  # Failure gates.
+  for f in BLOCKED_WOULDBLOCK_FATAL CapabilityFull TaskTableFull; do
+    if log_has_pattern "$f"; then
+      echo "[error] SCHED-TIMEOUT: fatal marker present: $f"
+      sched_to_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    st_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/SCHED_TIMEOUT_ENABLED/{seen=1} seen{print}')"
+    # Fatal breadcrumbs; handled COW page faults (PAGE_FAULT + PAGE_FAULT_HANDLED_COW)
+    # are acceptable and deliberately NOT in this set.
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$st_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] SCHED-TIMEOUT: fatal breadcrumb after sched-timeout wire start: $fatal_pat"
+        sched_to_fail=1
+      fi
+    done
+    if printf '%s\n' "$st_tail" | rg -a -q -- 'PAGE_FAULT' \
+       && ! printf '%s\n' "$st_tail" | rg -a -q -- 'PAGE_FAULT_HANDLED_COW'; then
+      echo "[error] SCHED-TIMEOUT: PAGE_FAULT without PAGE_FAULT_HANDLED_COW (unhandled fault)"
+      sched_to_fail=1
+    fi
+  fi
+  if [[ "$sched_to_fail" -eq 1 ]]; then
+    echo "[error] SCHED-TIMEOUT mode FAILED"
+    exit 1
+  fi
+  echo "[ok] SCHED-TIMEOUT: timeout/deadline hardening diagnostics clean"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

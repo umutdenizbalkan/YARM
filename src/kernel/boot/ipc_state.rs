@@ -830,10 +830,141 @@ impl KernelState {
         &mut self,
         now_tick: u64,
     ) -> Result<usize, KernelError> {
-        let mut expired = [None; super::MAX_TASKS];
-        let mut expired_count = 0usize;
-        self.with_tcbs_mut(|tcbs| {
-            for tcb in tcbs.iter_mut().flatten() {
+        // Stage 171 (SCHED-TIMEOUT), Task F: bounded-stack chunked scan. The
+        // historical MAX_TASKS-wide `Option<ThreadId>` scratch array (512 entries,
+        // ~8 KiB) was allocated on EVERY timer-tick trap frame; this
+        // processes expirations in fixed `TIMEOUT_SCAN_CHUNK` batches so the stack
+        // frame is O(CHUNK) regardless of `MAX_TASKS`. Behavior-equivalent: returns
+        // the TOTAL expired count, clears every waiter slot for each expired task,
+        // and enqueues each expired task exactly once. Each expired task's deadline
+        // is cleared in the pass that wakes it, so no task is selected twice across
+        // passes (the loop terminates once a pass finds zero expirations).
+        //
+        // Rank order per batch: task (rank 2, mark Runnable + clear deadline) ->
+        // ipc (rank 3, clear waiter slots) -> scheduler (rank 1, enqueue OUTSIDE
+        // the task/ipc locks). Locks are acquired and released per phase, never
+        // nested, so no lower-rank lock is ever taken while a higher-rank lock is
+        // held.
+        const TIMEOUT_SCAN_CHUNK: usize = 32;
+        let proof = crate::kernel::boot::sched_timeout_enabled();
+        let mut total = 0usize;
+        let mut scan_announced = false;
+        loop {
+            // `(tid, is_send)` — `is_send` classifies the SCHED_TIMEOUT_EXPIRED kind.
+            let mut expired: [Option<(ThreadId, bool)>; TIMEOUT_SCAN_CHUNK] =
+                [None; TIMEOUT_SCAN_CHUNK];
+            let mut n = 0usize;
+            // Phase 1 (task rank 2): mark up to CHUNK expired tasks Runnable.
+            self.with_tcbs_mut(|tcbs| {
+                for tcb in tcbs.iter_mut().flatten() {
+                    if n >= TIMEOUT_SCAN_CHUNK {
+                        break;
+                    }
+                    let Some(deadline) = tcb.ipc_timeout_deadline else {
+                        continue;
+                    };
+                    let is_send = match tcb.status {
+                        TaskStatus::Blocked(WaitReason::EndpointReceive(_)) => false,
+                        TaskStatus::Blocked(WaitReason::EndpointSend(_)) => true,
+                        _ => continue,
+                    };
+                    if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {
+                        tcb.status = TaskStatus::Runnable;
+                        tcb.ipc_timeout_deadline = None;
+                        tcb.ipc_timeout_fired = true;
+                        expired[n] = Some((tcb.tid, is_send));
+                        n += 1;
+                    }
+                }
+                Ok::<_, KernelError>(())
+            })?;
+            if n == 0 {
+                break;
+            }
+            if proof {
+                if !scan_announced {
+                    crate::yarm_log!("SCHED_TIMEOUT_SCAN_BEGIN now={}", now_tick);
+                    scan_announced = true;
+                }
+                for entry in expired.iter().take(n).flatten() {
+                    crate::yarm_log!(
+                        "SCHED_TIMEOUT_EXPIRED tid={} kind={}",
+                        entry.0.0,
+                        if entry.1 { "send" } else { "recv" }
+                    );
+                }
+                crate::yarm_log!("SCHED_TIMEOUT_TASK_WAKE_BEGIN count={}", n);
+            }
+            // Phase 2 (ipc rank 3): remove every timed-out waiter from ALL waiter
+            // structures, then re-check none of the batch tids remain (Task D).
+            let mut stranded_in_batch = false;
+            self.with_ipc_state_mut(|ipc| {
+                for entry in expired.iter().take(n).flatten() {
+                    let tid = entry.0;
+                    for waiter in ipc.endpoint_waiters.iter_mut() {
+                        if *waiter == Some(tid) {
+                            *waiter = None;
+                        }
+                    }
+                    for queue in ipc.endpoint_sender_waiters.iter_mut() {
+                        for slot in queue.iter_mut() {
+                            if slot.as_ref().is_some_and(|w| w.tid == tid) {
+                                *slot = None;
+                            }
+                        }
+                    }
+                    for waiter in ipc.notification_waiters.iter_mut() {
+                        if *waiter == Some(tid) {
+                            *waiter = None;
+                        }
+                    }
+                }
+                // Task D re-check (single-lock, cheap): a stranded waiter would be a
+                // batch tid still referenced after the clear — provably impossible
+                // unless the clear loop has a bug.
+                for entry in expired.iter().take(n).flatten() {
+                    let tid = entry.0;
+                    let remains = ipc.endpoint_waiters.iter().any(|w| *w == Some(tid))
+                        || ipc.endpoint_sender_waiters.iter().any(|q| {
+                            q.iter().any(|s| s.as_ref().is_some_and(|w| w.tid == tid))
+                        })
+                        || ipc.notification_waiters.iter().any(|w| *w == Some(tid));
+                    if remains {
+                        stranded_in_batch = true;
+                    }
+                }
+            });
+            if stranded_in_batch {
+                crate::yarm_log!("SCHED_TIMEOUT_STRANDED_WAITER now={}", now_tick);
+            }
+            // Phase 3 (scheduler rank 1, OUTSIDE task/ipc locks): enqueue each once.
+            for entry in expired.iter().take(n).flatten() {
+                let _ = self.enqueue_task(entry.0.0)?;
+                if proof {
+                    crate::yarm_log!("SCHED_TIMEOUT_RUNQUEUE_ENQUEUE tid={}", entry.0.0);
+                }
+            }
+            if proof {
+                crate::yarm_log!("SCHED_TIMEOUT_TASK_WAKE_DONE count={}", n);
+            }
+            total += n;
+        }
+        if proof && total > 0 {
+            crate::yarm_log!("SCHED_TIMEOUT_NO_STRANDED_WAITERS woken={}", total);
+            crate::yarm_log!("SCHED_TIMEOUT_SCAN_DONE expired={}", total);
+        }
+        Ok(total)
+    }
+
+    /// Stage 171 (SCHED-TIMEOUT), Task E: the earliest pending IPC timeout
+    /// deadline across all `Blocked(EndpointReceive|EndpointSend)` tasks, or
+    /// `None` when no IPC timeout is armed. Read-only (task rank 2); used only by
+    /// the diagnostic idle-entry markers (knob-gated + rate-limited), never on the
+    /// hot path.
+    pub(crate) fn sched_timeout_earliest_pending(&self) -> Option<u64> {
+        self.with_tcbs(|tcbs| {
+            let mut earliest: Option<u64> = None;
+            for tcb in tcbs.iter().flatten() {
                 let Some(deadline) = tcb.ipc_timeout_deadline else {
                     continue;
                 };
@@ -845,49 +976,13 @@ impl KernelState {
                 if !blocked_ipc {
                     continue;
                 }
-                if now_tick.wrapping_sub(deadline) > 0 || now_tick == deadline {
-                    tcb.status = TaskStatus::Runnable;
-                    tcb.ipc_timeout_deadline = None;
-                    tcb.ipc_timeout_fired = true;
-                    if expired_count < expired.len() {
-                        expired[expired_count] = Some(tcb.tid);
-                        expired_count += 1;
-                    }
-                }
+                earliest = Some(match earliest {
+                    Some(e) if e <= deadline => e,
+                    _ => deadline,
+                });
             }
-            Ok::<_, KernelError>(())
-        })?;
-
-        if expired_count == 0 {
-            return Ok(0);
-        }
-
-        self.with_ipc_state_mut(|ipc| {
-            for tid in expired.iter().flatten().copied() {
-                for waiter in ipc.endpoint_waiters.iter_mut() {
-                    if *waiter == Some(tid) {
-                        *waiter = None;
-                    }
-                }
-                for queue in ipc.endpoint_sender_waiters.iter_mut() {
-                    for slot in queue.iter_mut() {
-                        if slot.as_ref().is_some_and(|w| w.tid == tid) {
-                            *slot = None;
-                        }
-                    }
-                }
-                for waiter in ipc.notification_waiters.iter_mut() {
-                    if *waiter == Some(tid) {
-                        *waiter = None;
-                    }
-                }
-            }
-        });
-
-        for tid in expired.iter().flatten().copied() {
-            let _ = self.enqueue_task(tid.0)?;
-        }
-        Ok(expired_count)
+            earliest
+        })
     }
 
     pub(crate) fn resolve_endpoint_index(&self, object: CapObject) -> Result<usize, KernelError> {

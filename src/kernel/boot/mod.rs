@@ -933,6 +933,37 @@ pub(crate) fn d2_send_dispatch_clear(cpu_idx: usize) {
     D2_SEND_DISPATCH_DEFERRED[cpu_idx].store(false, core::sync::atomic::Ordering::Release);
 }
 
+/// Stage 171 (SCHED-TIMEOUT): arch-neutral, default-off DIAGNOSTIC gate for the
+/// scheduler timeout/deadline hardening markers. When OFF (default) the timeout
+/// scan runs byte-identically (only the always-on chunked-scan hardening applies)
+/// and emits none of the `SCHED_TIMEOUT_*` / `SCHED_IDLE_*` markers. When ON, the
+/// per-tick timeout scan and the idle-entry path emit rank-clean phase markers so
+/// a QEMU acceptance profile can prove no stranded waiters, exactly-once wake, and
+/// idle-with-pending-timeout safety. It changes NO scheduling behavior and no ABI.
+/// VALIDATION: SCHED_TIMEOUT_ENABLED.
+pub(crate) static SCHED_TIMEOUT_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_sched_timeout_enabled(enabled: bool) {
+    SCHED_TIMEOUT_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn sched_timeout_enabled() -> bool {
+    SCHED_TIMEOUT_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 171: rate-limit for the (frequent) idle-entry timeout markers so the
+/// diagnostic profile does not flood the UART. Returns true for the first
+/// `SCHED_IDLE_MARKER_BUDGET` idle entries after the knob is enabled.
+pub(crate) static SCHED_IDLE_MARKER_SEQ: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(crate) const SCHED_IDLE_MARKER_BUDGET: u64 = 8;
+
+pub(crate) fn sched_idle_marker_budget_remaining() -> bool {
+    SCHED_IDLE_MARKER_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+        < SCHED_IDLE_MARKER_BUDGET
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

@@ -5180,8 +5180,97 @@ Acceptance (user QEMU): (1) `IPC_FINAL=1 QEMU_SMP=1 scripts/qemu-ipc-recv-v2-ora
 (3) `D2_SEND_GENUINE=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` (sender-wake
 auto-enabled); (4) `QEMU_SMP=1 YARM_IPC_RECV_PROOF_SENDER_WAKE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`;
 (5) normal `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; (6)
-`D6_SWITCH_A=1 …`; (7) `TIMEOUT_SECS=300 D6_SWITCH_PROOF=1 …`. **PENDING user QEMU
-acceptance.**
+`D6_SWITCH_A=1 …`; (7) `TIMEOUT_SECS=300 D6_SWITCH_PROOF=1 …`.
+
+**ACCEPTED (user QEMU, 2026).** All seven commands passed with `[ok]` and no fatal
+breadcrumbs: the `IPC_FINAL=1` oracle, `D2_RECV_GENUINE=1`, `D2_SEND_GENUINE=1`,
+the sender-wake oracle, normal x86_64 smoke, the `D6_SWITCH_A` regression, and the
+5-minute `D6_SWITCH_PROOF` regression. Stage 170 IPC-FINAL is **ACCEPTED** — the
+recv-v2 IPC surface is frozen. Stage 171 (SCHED-TIMEOUT) hardens the scheduler
+timeout/deadline behavior on top of this baseline.
+
+### 7.1.7 Stage 171 — SCHED-TIMEOUT (scheduler timeout/deadline hardening)
+
+**Stability/hardening stage before VM/COW and cap/CNode work.** Makes the
+timeout/deadline behavior rank-clean, deterministic, and bounded-stack, with a
+default-off diagnostic profile (`yarm.sched_timeout=1`, script `SCHED_TIMEOUT=1`,
+marker `SCHED_TIMEOUT_ENABLED`). No syscall/IPC/service/image ABI change; no
+D3/D5/VM/CNode live-wire; no SMP broadening; the D6/D2 knobs stay default-off.
+
+**Timeout frontier (audit, Task B).** The deadline field `ipc_timeout_deadline`
+is wired ONLY for `Blocked(EndpointReceive)` and `Blocked(EndpointSend)` — i.e.
+blocking IPC recv and send timeouts (and, transitively, an `ipc_call` reply-wait,
+which rides the recv-timeout path). `Futex`, `Join`, and `Poll` waits are
+**indefinite by design** (no deadline field; woken only by their explicit wake
+path), so `process_ipc_timeout_deadlines` deliberately filters to the two IPC
+wait reasons and never touches a futex/join/poll waiter. There is no separate
+sleep/nanosleep deadline path today. Exact lock/rank order of the single timeout
+driver (`process_ipc_timeout_deadlines`, called each serviced timer tick from the
+x86_64 timer-IRQ path in `fault_state.rs`): per batch, **task (rank 2)** mark
+Runnable + clear deadline → **ipc (rank 3)** remove the tid from every waiter slot
+(endpoint receive slot, sender-waiter queues, notification waiters) → **scheduler
+(rank 1)** enqueue OUTSIDE the task/ipc locks. Locks are acquired/released per
+phase, never nested; no lower-rank lock is taken while a higher-rank lock is held.
+
+**Bounded-stack chunked scan (Task F).** `process_ipc_timeout_deadlines` no longer
+allocates the historical `[None; MAX_TASKS]` (= `[None; 512]` of `Option<ThreadId>`,
+~8 KiB) scratch array on every timer-tick trap frame. It now processes expirations
+in fixed `TIMEOUT_SCAN_CHUNK` (32) batches — an O(CHUNK) ≈ 512-byte frame
+regardless of `MAX_TASKS` — looping until a pass finds zero expirations (each woken
+task clears its own deadline, so no task is selected twice and the loop
+terminates). Behavior is equivalent: same total expired count, same waiter
+clearance, each expired task enqueued exactly once. This removes the ~8 KiB
+contributor to the Stage 165 deep-trap kernel-stack pressure. A `stage171_*` guard
+rejects reintroducing a large timeout scratch array.
+
+**No stranded waiters (Task D).** For each expired batch, every waiter slot
+referencing a timed-out tid is cleared (receive slot, sparse sender-waiter queues
+scanned slot-by-slot, notification waiters), then a within-`ipc_state_lock`
+re-check confirms none of the batch tids remain — `SCHED_TIMEOUT_STRANDED_WAITER`
+fires only on a clear-loop bug (never expected). No later receiver can consume a
+timed-out sender (its queued waiter is nulled); no timed-out receiver stays
+blocked (status → Runnable in phase 1); each is enqueued exactly once; no
+duplicate wake, no orphaned waiter, no reply-cap / transfer-envelope leak. Stage
+163P sender-wake ordering is untouched (the timeout path only removes waiters that
+timed out; the wake/handoff coordination is unchanged).
+
+**Idle with pending timeout (Task E).** The scheduler idle branch emits (knob-gated
++ rate-limited to `SCHED_IDLE_MARKER_BUDGET`=8 to avoid UART flooding)
+`SCHED_IDLE_PENDING_TIMEOUT earliest=…` + `SCHED_IDLE_TIMEOUT_SAFE earliest=…`
+when a deadline is armed, else `SCHED_IDLE_NO_PENDING_TIMEOUT`. On x86_64 idle is
+`hlt`, which wakes on the periodic timer IRQ that drives
+`process_ipc_timeout_deadlines`, so a pending timeout is **guaranteed to fire** —
+the CPU never enters an indefinite halt that would strand a deadline. AArch64 `wfi`
+is equivalent. **RISC-V** uses the raw trap path with a deferred/coalesced timer
+(`record_timer_tick`); its IPC-timeout firing is serviced on the next handled timer
+tick, which remains a documented known characteristic (not changed here — no
+RISC-V behavior change). x86_64 `-smp 1` is the primary QEMU acceptance target.
+
+**Diagnostic markers (Task C).** Knob-gated in `process_ipc_timeout_deadlines`,
+emitted only when a timeout actually fires (quiet ticks produce nothing):
+`SCHED_TIMEOUT_SCAN_BEGIN`, `SCHED_TIMEOUT_EXPIRED tid=… kind=recv|send`,
+`SCHED_TIMEOUT_TASK_WAKE_BEGIN`, `…_RUNQUEUE_ENQUEUE tid=…`, `…_TASK_WAKE_DONE`,
+`…_NO_STRANDED_WAITERS`, `…_SCAN_DONE`. (`kind` is only ever `recv`/`send` — the
+only wait reasons with a deadline; there is no `reply`/`futex`/`sleep` timeout.)
+
+**`SCHED_TIMEOUT=1` acceptance profile (Task G).** Requires `SCHED_TIMEOUT_ENABLED`
+and the deterministic idle-entry markers; if any timeout fires, requires the full
+phase sequence and exactly-once wake (`SCHED_TIMEOUT_EXPIRED` count ==
+`SCHED_TIMEOUT_RUNQUEUE_ENQUEUE` count). Fails on `SCHED_TIMEOUT_STRANDED_WAITER`,
+an idle `PENDING` without `SAFE`, `BLOCKED_WOULDBLOCK_FATAL`, `CapabilityFull`,
+`TaskTableFull`, and the fatal breadcrumbs `^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/
+`PANIC`/`FATAL`. Handled COW page faults (`PAGE_FAULT` + `PAGE_FAULT_HANDLED_COW`)
+are NOT fatal. Guarded by `stage171_sched_timeout`. Invariants unchanged
+(SYSCALL_COUNT=31, VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32).
+
+Acceptance (user QEMU): (1) `SCHED_TIMEOUT=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`;
+(2) `IPC_FINAL=1 QEMU_SMP=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`;
+(3) `D2_RECV_GENUINE=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`;
+(4) `D2_SEND_GENUINE=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`;
+(5) `QEMU_SMP=1 YARM_IPC_RECV_PROOF_SENDER_WAKE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`;
+(6) normal `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; (7) `D6_SWITCH_A=1 …`;
+(8) `TIMEOUT_SECS=300 D6_SWITCH_PROOF=1 …`; optionally a RISC-V timeout smoke.
+**PENDING user QEMU acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

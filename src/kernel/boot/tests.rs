@@ -48272,3 +48272,276 @@ mod stage170_ipc_final {
         );
     }
 }
+
+// Stage 171 (SCHED-TIMEOUT): runtime proof that the bounded-stack chunked
+// timeout scan wakes ALL expired tasks exactly once, across the CHUNK (32)
+// boundary (40 > 32 forces the multi-pass loop), clearing every deadline.
+#[test]
+fn stage171_chunked_timeout_wakes_all_expired_exactly_once() {
+    let mut state = Bootstrap::init().expect("init");
+    // A clean init must have no already-expired IPC deadline (baseline).
+    assert_eq!(
+        state.process_ipc_timeout_deadlines(1).expect("baseline"),
+        0,
+        "clean init must have no pending expired IPC deadlines"
+    );
+    const N: u64 = 40; // > TIMEOUT_SCAN_CHUNK (32) — exercises the multi-pass loop.
+    let base: u64 = 400;
+    for i in 0..N {
+        let tid = base + i;
+        state.register_task(tid).expect("register");
+        state
+            .with_tcbs_mut(|tcbs| {
+                let tcb = tcbs
+                    .iter_mut()
+                    .flatten()
+                    .find(|t| t.tid.0 == tid)
+                    .expect("tcb");
+                // Alternate recv/send blocked reasons; both carry deadlines.
+                tcb.status = if i % 2 == 0 {
+                    TaskStatus::Blocked(WaitReason::EndpointReceive(CapId(1)))
+                } else {
+                    TaskStatus::Blocked(WaitReason::EndpointSend(CapId(1)))
+                };
+                tcb.ipc_timeout_deadline = Some(5);
+                tcb.ipc_timeout_fired = false;
+                Ok::<_, KernelError>(())
+            })
+            .expect("inject blocked");
+    }
+    // Fire at the shared deadline: all N must expire across chunked passes.
+    let expired = state.process_ipc_timeout_deadlines(5).expect("timeout");
+    assert_eq!(expired as u64, N, "every expired task must be woken exactly once");
+    for i in 0..N {
+        let tid = base + i;
+        assert!(state.task_is_runnable(tid), "tid {tid} must be Runnable after timeout");
+        assert_eq!(
+            state.ipc_deadline_count_for_tid(tid),
+            0,
+            "tid {tid} deadline must be cleared"
+        );
+    }
+    // A second pass at the same tick must find nothing (no duplicate wake).
+    assert_eq!(
+        state.process_ipc_timeout_deadlines(5).expect("second pass"),
+        0,
+        "already-woken tasks must not be re-expired (no duplicate wake)"
+    );
+}
+
+// Stage 171 (SCHED-TIMEOUT): source guards over the timeout/deadline hardening,
+// diagnostic markers, and invariants.
+mod stage171_sched_timeout {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const EXEC_STATE_SRC: &str = include_str!("exec_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    fn timeout_fn_body() -> &'static str {
+        let start = IPC_STATE_SRC
+            .find("fn process_ipc_timeout_deadlines")
+            .expect("process_ipc_timeout_deadlines must exist");
+        let end = IPC_STATE_SRC[start..]
+            .find("fn sched_timeout_earliest_pending")
+            .map(|r| start + r)
+            .expect("earliest-pending helper must follow the timeout fn");
+        &IPC_STATE_SRC[start..end]
+    }
+
+    // Task B: knob default-off + arch-neutral (diagnostic only).
+    #[test]
+    fn stage171_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub sched_timeout: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.sched_timeout"),
+            "yarm.sched_timeout must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("SCHED_TIMEOUT_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn sched_timeout_enabled() -> bool"),
+            "SCHED_TIMEOUT gate + accessor must exist (default false)"
+        );
+        // Arch-neutral: the apply block must NOT be cfg(x86_64)-gated.
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.sched_timeout")
+            .expect("sched_timeout apply block");
+        let block = &CMDLINE_SRC[idx..idx + 400];
+        assert!(
+            block.contains("set_sched_timeout_enabled(enabled)")
+                && !block.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "sched_timeout must be arch-neutral (pure diagnostic)"
+        );
+    }
+
+    // Task F: no large stack scratch array in the timeout scan; chunked instead.
+    #[test]
+    fn stage171_no_large_timeout_scratch_array() {
+        let body = timeout_fn_body();
+        assert!(
+            !body.contains("[None; super::MAX_TASKS]") && !body.contains("[None; 512]"),
+            "the timeout scan must not allocate a large [None; MAX_TASKS] scratch array"
+        );
+        assert!(
+            body.contains("TIMEOUT_SCAN_CHUNK") && body.contains("const TIMEOUT_SCAN_CHUNK: usize = 32"),
+            "the timeout scan must use a bounded TIMEOUT_SCAN_CHUNK batch"
+        );
+    }
+
+    // Task B: rank order documented in the timeout scan (task 2 -> ipc 3 -> sched 1).
+    #[test]
+    fn stage171_rank_order_documented() {
+        let body = timeout_fn_body();
+        assert!(
+            body.contains("with_tcbs_mut") && body.contains("with_ipc_state_mut")
+                && body.contains("enqueue_task"),
+            "the timeout scan must run task -> ipc -> scheduler phases"
+        );
+    }
+
+    // Task C: timeout phase markers present (kind is recv|send only).
+    #[test]
+    fn stage171_timeout_phase_markers() {
+        for m in [
+            "SCHED_TIMEOUT_SCAN_BEGIN",
+            "SCHED_TIMEOUT_EXPIRED",
+            "SCHED_TIMEOUT_TASK_WAKE_BEGIN",
+            "SCHED_TIMEOUT_RUNQUEUE_ENQUEUE",
+            "SCHED_TIMEOUT_TASK_WAKE_DONE",
+            "SCHED_TIMEOUT_NO_STRANDED_WAITERS",
+            "SCHED_TIMEOUT_SCAN_DONE",
+        ] {
+            assert!(IPC_STATE_SRC.contains(m), "ipc_state must emit {m}");
+        }
+        // kind classification is recv|send (the only wait reasons with a deadline).
+        assert!(
+            IPC_STATE_SRC.contains("if entry.1 { \"send\" } else { \"recv\" }"),
+            "SCHED_TIMEOUT_EXPIRED kind must be recv|send"
+        );
+        // Markers are knob-gated (only fire when a timeout actually occurs).
+        let body = timeout_fn_body();
+        assert!(
+            body.contains("sched_timeout_enabled()"),
+            "timeout markers must be knob-gated"
+        );
+    }
+
+    // Task D: no stranded waiters — sparse sender queues scanned, re-check present.
+    #[test]
+    fn stage171_no_stranded_waiters() {
+        let body = timeout_fn_body();
+        assert!(
+            body.contains("endpoint_waiters") && body.contains("endpoint_sender_waiters")
+                && body.contains("notification_waiters"),
+            "the timeout scan must clear every waiter structure"
+        );
+        assert!(
+            body.contains("SCHED_TIMEOUT_STRANDED_WAITER") && body.contains("let remains ="),
+            "the timeout scan must re-check for stranded waiters"
+        );
+    }
+
+    // Task E: idle-with-pending-timeout markers in the idle branch.
+    #[test]
+    fn stage171_idle_pending_timeout_markers() {
+        for m in [
+            "SCHED_IDLE_PENDING_TIMEOUT",
+            "SCHED_IDLE_TIMEOUT_SAFE",
+            "SCHED_IDLE_NO_PENDING_TIMEOUT",
+        ] {
+            assert!(EXEC_STATE_SRC.contains(m), "exec_state idle branch must emit {m}");
+        }
+        assert!(
+            EXEC_STATE_SRC.contains("sched_timeout_earliest_pending()")
+                && EXEC_STATE_SRC.contains("sched_idle_marker_budget_remaining()"),
+            "idle markers must be earliest-pending aware and rate-limited"
+        );
+    }
+
+    // Task G: smoke SCHED_TIMEOUT profile + failure gates.
+    #[test]
+    fn stage171_smoke_profile() {
+        assert!(
+            SMOKE_SRC.contains("SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}")
+                && SMOKE_SRC.contains("yarm.sched_timeout=1"),
+            "smoke must plumb SCHED_TIMEOUT=1"
+        );
+        assert!(
+            SMOKE_SRC.contains("SCHED_TIMEOUT_STRANDED_WAITER")
+                && SMOKE_SRC.contains("SCHED_IDLE_PENDING_TIMEOUT")
+                && SMOKE_SRC.contains("SCHED-TIMEOUT mode FAILED"),
+            "smoke must reject stranded waiters / unsafe idle and fail the mode"
+        );
+        // exactly-once wake check + fatal gate with handled-COW exception.
+        assert!(
+            SMOKE_SRC.contains("SCHED_TIMEOUT_RUNQUEUE_ENQUEUE")
+                && SMOKE_SRC.contains("BLOCKED_WOULDBLOCK_FATAL")
+                && SMOKE_SRC.contains("PAGE_FAULT_HANDLED_COW"),
+            "smoke must check exactly-once wake, fatal markers, and exempt handled COW"
+        );
+        // sched_timeout is forced off under the pure proof/switch-a regressions.
+        assert!(
+            SMOKE_SRC.contains("D2_SEND_GENUINE SCHED_TIMEOUT"),
+            "mode isolation must force SCHED_TIMEOUT off under proof/switch-a"
+        );
+    }
+
+    // Regression preservation: IPC-FINAL, D2 recv/send, Stage 163P intact.
+    #[test]
+    fn stage171_regressions_preserved() {
+        assert!(
+            ORACLE_SRC.contains("IPC_FINAL=\"${IPC_FINAL:-0}\""),
+            "IPC-FINAL profile must be preserved"
+        );
+        assert!(
+            IPC_STATE_SRC.contains("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+                && IPC_STATE_SRC.contains("D2_SEND_GENUINE_DISPATCH_DEFERRED"),
+            "D2 recv/send genuine paths must be intact"
+        );
+        assert!(
+            CMDLINE_SRC.contains("ipc_recv_proof_sender_wake"),
+            "Stage 163P sender-wake sub-knob must remain"
+        );
+    }
+
+    // Invariants + no scope creep.
+    #[test]
+    fn stage171_invariants_and_no_scope_creep() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 and VARIANT_COUNT=23 must be unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        let body = timeout_fn_body();
+        for forbidden in ["with_vm_user_spaces_split_mut", "with_memory_split_mut", "D3_GENUINE", "D5_GENUINE"] {
+            assert!(!body.contains(forbidden), "timeout scan must not touch {forbidden}");
+        }
+    }
+
+    // Task A: docs record IPC-FINAL accepted + the SCHED-TIMEOUT section.
+    #[test]
+    fn stage171_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 170 IPC-FINAL is **ACCEPTED**")
+                || DOC_SRC.contains("Stage 170 IPC-FINAL is **ACCEPTED"),
+            "doc must record Stage 170 IPC-FINAL accepted"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 171 — SCHED-TIMEOUT"),
+            "doc must add the Stage 171 SCHED-TIMEOUT section"
+        );
+        assert!(
+            DOC_SRC.contains("indefinite by design"),
+            "doc must state futex/join/poll are indefinite (no deadline)"
+        );
+    }
+}
