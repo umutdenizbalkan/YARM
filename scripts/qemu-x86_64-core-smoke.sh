@@ -45,17 +45,18 @@ D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
 # D6_SWITCH_PROOF / D6_SWITCH_A regressions so those runs stay uncontaminated.
 SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
 VM_COW=${VM_COW:-0}
+CAP_CNODE=${CAP_CNODE:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -63,7 +64,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -128,6 +129,17 @@ if [[ "$VM_COW" == "1" ]]; then
   fi
   IPC_RECV_PROOF=${IPC_RECV_PROOF:-1}
   IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}
+fi
+# Stage 173 (CAP-CNODE): CAP_CNODE=1 appends yarm.cap_cnode=1 to emit the
+# capability/CNode phase-boundary diagnostic markers + run the one-shot cap/CNode
+# lifecycle proof (arch-neutral; no behavior change). Standalone — it does NOT
+# enable any D6/D2 mode and is NOT auto-enabled by the IPC proof workloads. The
+# reply/transfer markers fire naturally from the boot's spawn IPC (reply caps +
+# cap transfer already occur every boot); the one-shot proof provides the
+# deterministic reserve/materialize/lookup/release/invariant markers.
+CAP_CNODE=${CAP_CNODE:-0}
+if [[ "$CAP_CNODE" == "1" && "$KERNEL_CMDLINE" != *"yarm.cap_cnode="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.cap_cnode=1"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1154,6 +1166,86 @@ if [[ "$VM_COW" == "1" ]]; then
     exit 1
   fi
   echo "[ok] VM-COW: VM/COW/page-table/fork phase diagnostics clean"
+fi
+
+# Stage 173 (CAP-CNODE): when booted with yarm.cap_cnode=1, require the cap/CNode
+# lifecycle diagnostics and reject cap/CNode correctness regressions.
+if [[ "$CAP_CNODE" == "1" ]]; then
+  cap_cnode_fail=0
+  echo "[ok] CAP_CNODE enabled marker:" $(log_has_pattern "CAP_CNODE_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "CAP_CNODE_ENABLED"; then
+    echo "[error] CAP-CNODE: CAP_CNODE_ENABLED missing (knob not applied)"
+    cap_cnode_fail=1
+  fi
+  # Deterministic one-shot proof markers (must appear).
+  for m in "CAP_CNODE_LOOKUP_OK" "CAP_CNODE_RESERVE_OK"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] CAP-CNODE marker present: $m"
+    else
+      echo "[error] CAP-CNODE: required marker missing: $m"
+      cap_cnode_fail=1
+    fi
+  done
+  # At least one materialize (proof mint or a transferred cap).
+  if log_has_pattern "CAP_CNODE_MATERIALIZE_OK" || log_has_pattern "CAP_CNODE_TRANSFER_MATERIALIZE_OK"; then
+    echo "[ok] CAP-CNODE materialize marker present"
+  else
+    echo "[error] CAP-CNODE: no materialize marker observed"
+    cap_cnode_fail=1
+  fi
+  # At least one release (proof revoke or on-exit revoke).
+  if log_has_pattern "CAP_CNODE_RELEASE_OK" || log_has_pattern "CAP_CNODE_REVOKE_ON_EXIT_OK"; then
+    echo "[ok] CAP-CNODE release marker present"
+  else
+    echo "[error] CAP-CNODE: no release marker observed"
+    cap_cnode_fail=1
+  fi
+  # If the proof emitted an invariant result, it must be OK.
+  if log_has_pattern "CAP_CNODE_INVARIANT_OK"; then
+    echo "[ok] CAP-CNODE invariant OK"
+  fi
+  # Hard invariant-violation markers (must never appear).
+  for f in \
+    "CAP_CNODE_REFCOUNT_UNDERFLOW" \
+    "CAP_CNODE_SLOT_LEAK" \
+    "CAP_CNODE_STALE_CAP_ACCEPTED" \
+    "CAP_CNODE_RIGHTS_ESCALATION" \
+    "CAP_CNODE_ROLLBACK_LEAK" \
+    "CAP_CNODE_MATERIALIZE_FAIL" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] CAP-CNODE: fatal marker present: $f"
+      cap_cnode_fail=1
+    fi
+  done
+  # A committed transfer that FAILs is only acceptable if it rolled back cleanly.
+  if log_has_pattern "CAP_CNODE_TRANSFER_FAIL" && ! log_has_pattern "CAP_CNODE_TRANSFER_ROLLBACK_OK"; then
+    echo "[error] CAP-CNODE: transfer failed without a clean rollback"
+    cap_cnode_fail=1
+  fi
+  if [[ -f "$LOGFILE" ]]; then
+    cc_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/CAP_CNODE_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$cc_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] CAP-CNODE: fatal breadcrumb after cap-cnode wire start: $fatal_pat"
+        cap_cnode_fail=1
+      fi
+    done
+    # Explicit unhandled/fatal page-fault markers only (handled COW/DEMAND are OK).
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$cc_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] CAP-CNODE: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        cap_cnode_fail=1
+      fi
+    done
+  fi
+  if [[ "$cap_cnode_fail" -eq 1 ]]; then
+    echo "[error] CAP-CNODE mode FAILED"
+    exit 1
+  fi
+  echo "[ok] CAP-CNODE: capability/CNode lifecycle diagnostics clean"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

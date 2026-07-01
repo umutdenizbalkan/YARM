@@ -5377,7 +5377,125 @@ Guarded by `stage172_vm_cow`.
 Acceptance (user QEMU): (1) `VM_COW=1` smoke; (2) `IPC_FINAL=1` oracle; (3)
 `D2_RECV_GENUINE=1`; (4) `D2_SEND_GENUINE=1`; (5) `SCHED_TIMEOUT=1`; (6) normal
 smoke; (7) `D6_SWITCH_A=1`; (8) 5-min `D6_SWITCH_PROOF=1`; (9) Stage 163P
-sender-wake oracle. **PENDING user QEMU acceptance.**
+sender-wake oracle.
+
+**ACCEPTED (user QEMU, 2026).** The first `VM_COW=1` run failed on a **stale
+x86_64 build artifact** (the boot image predated the VM-COW instrumentation, so
+`VM_COW_ENABLED` never appeared). After rebuilding with
+`scripts/build-qemu-x86_64-artifacts.sh`, the `VM_COW=1` profile passed: service
+baseline reached, `VM_COW_ENABLED` present, a COW write fault observed, the
+`VM_COW_PHASE_METADATA` / `VM_COW_PHASE_TLB_FLUSH` / `VM_COW_DONE` phase sequence
+present, diagnostics clean, and none of the fatal markers
+(`VM_COW_FAIL`/rollback-fail/refcount-underflow/writable-shared-alias/
+child-ASID-leak/fatal breadcrumb) present. Stage 172 VM-COW is **ACCEPTED** — the
+markers changed no VM/COW/page-table/fork behavior. Stage 173 (CAP-CNODE) is the
+next frontier.
+
+### 7.1.9 Stage 173 — CAP-CNODE (capability/CNode budget, materialize, release, transfer, rollback audit + diagnostics)
+
+**Next kernel-unlocking frontier after VM-COW.** Instruments the
+capability/CNode lifecycle — cap lookup, slot reserve, mint/materialize, cap
+transfer, reply-cap one-shot, release/revoke, CNode-budget/full rollback, and
+object refcount/generation/stale checks — with a default-off diagnostic profile
+(`yarm.cap_cnode=1`, script `CAP_CNODE=1`, marker `CAP_CNODE_ENABLED`). This is an
+audit + instrumentation + hardening-verification stage: the existing cap/CNode
+paths are ALREADY transactional (each mint/transfer/materialize failure rolls back
+with correct `cap_refcount`/generation discipline), so **no capability/CNode
+runtime behavior changes** — the markers only expose the phase boundaries. This is
+**instrumentation only**; **no real bug** was found in the audit.
+
+**Explicitly NOT done in Stage 173:** no syscall count change (SYSCALL_COUNT=31,
+Syscall::VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32); no cap-encoding ABI
+change; no rights broadening; no D2/D6/IPC-FINAL/VM-COW/SCHED-TIMEOUT behavior
+change; no D3/D5 live-wire; no real SMP CNode/shootdown broadening; no
+AArch64/RISC-V D6 switch unlock (the knob is arch-neutral diagnostics / no-op
+behavior); no RPi5 change.
+
+**Lock/rank story.** Capability/CNode is **rank 4** in the lock ordering
+(`doc/KERNEL_LOCKING.md`). The audited operations acquire no lower-rank lock while
+conceptually holding the cap lock; in the current tree they run under the single
+global `SpinLock<KernelState>` (the cap/CNode domain has not been relocated out of
+the global lock — that is a later stage). This stage documents the rank-4 position
+and current global-lock-mediated state honestly; it does not split the cap domain
+out of the global lock.
+
+**Audit (Task B).** Paths audited and confirmed already transactional — no bug
+fixed, diagnostics only:
+- **Cap lookup** (`capability_for_cnode_local`, `resolve_capability_for_task`):
+  index + generation checked; a stale generation resolves to `None` (rejected).
+- **Slot reserve + mint/materialize** (`mint_capability_in_cnode`): reserves cnode
+  space first (`RESERVE_FAIL reason=full` on a full CNode — clean error, no partial
+  state), then mints; on mint failure the reservation is not consumed
+  (`MATERIALIZE_FAIL`). `cap_refcount` is bumped exactly once on the object.
+- **Cap transfer materialization** (`materialize_received_message_cap` /
+  `materialize_received_transfer_cap`, ipc_recv_core.rs): reserve → materialize →
+  done; a receiver-full / missing-right / stale / internal failure rolls back
+  (`TRANSFER_ROLLBACK_BEGIN`/`_OK`, `TRANSFER_FAIL reason=…`) leaving no minted slot.
+- **Reply-cap one-shot** (`fast_revoke_reply_cap_in_cnode`): a reply cap is
+  materialized once and consumed once; a second consume is refused
+  (`REPLY_DOUBLE_CONSUME_BLOCKED`) — no double-free, no refcount touch.
+- **Materialize rollback** (`rollback_materialized_recv_cap`, transfer_state.rs):
+  the inverse of the materialize mint (reply → `fast_revoke_reply_cap_in_cnode` +
+  clear `waiter_cap_id`; transfer → `revoke_capability_in_cnode` decrement +
+  reclaim). A cleared slot yields `MATERIALIZE_ROLLBACK_OK`; a residual slot would
+  yield `ROLLBACK_LEAK` (never observed).
+- **Release/revoke + on-exit sweep** (`revoke_capability_in_cnode`, `exit_task`):
+  revoke decrements `cap_refcount` once and reclaims the object if unreferenced;
+  the revoked slot's generation is bumped so a stale cap no longer resolves; a
+  double release fails cleanly (no underflow). Task exit sweeps live reply caps
+  (`REVOKE_ON_EXIT` / `REVOKE_ON_EXIT_OK`) — the sweep itself is UNCHANGED.
+
+**Markers (Task C/D).** All default-off behind `cap_cnode_enabled()`:
+- Lookup: `CAP_CNODE_LOOKUP_BEGIN`/`_OK`/`_FAIL reason=invalid|stale_generation|missing_right|wrong_kind`.
+- Reserve: `CAP_CNODE_RESERVE_BEGIN`/`_OK`/`_FAIL reason=full`.
+- Materialize/mint: `CAP_CNODE_MATERIALIZE_BEGIN`, `CAP_CNODE_REF_INC`,
+  `CAP_CNODE_SLOT_INSTALL`, `CAP_CNODE_MATERIALIZE_OK`,
+  `CAP_CNODE_MATERIALIZE_ROLLBACK_BEGIN`/`_OK`, `CAP_CNODE_MATERIALIZE_FAIL`.
+- Transfer: `CAP_CNODE_TRANSFER_BEGIN`, `_RESERVE_OK`, `_MATERIALIZE_OK`,
+  `_ROLLBACK_BEGIN`/`_OK`, `_FAIL reason=receiver_full|missing_right|stale|internal`,
+  `_DONE`.
+- Reply: `CAP_CNODE_REPLY_MATERIALIZE_BEGIN`/`_OK`,
+  `CAP_CNODE_REPLY_CONSUME_BEGIN`/`_OK`, `CAP_CNODE_REPLY_DOUBLE_CONSUME_BLOCKED`.
+- Release/revoke: `CAP_CNODE_RELEASE_BEGIN`, `_SLOT_CLEAR`, `_REF_DEC`, `_OK`,
+  `_FAIL reason=invalid|stale|underflow`, `CAP_CNODE_REVOKE_ON_EXIT`/`_OK`.
+- Invariants (fatal in smoke): `CAP_CNODE_INVARIANT_OK`,
+  `CAP_CNODE_REFCOUNT_UNDERFLOW`, `CAP_CNODE_SLOT_LEAK`,
+  `CAP_CNODE_STALE_CAP_ACCEPTED`, `CAP_CNODE_RIGHTS_ESCALATION`,
+  `CAP_CNODE_ROLLBACK_LEAK`.
+
+**Workload (Task E).** A default-off, deterministic, bounded **one-shot** cap/CNode
+lifecycle proof (`maybe_run_cap_cnode_proof`) is hooked in the arch-neutral timer
+path and runs once when a real user task (tid != 0) with a CNode is current. It
+reserves + materializes exactly one scratch MemoryObject cap, looks it up (rights
+subset — no escalation), revokes it, confirms the stale cap no longer resolves,
+confirms a double release fails without underflow, and verifies the object returns
+to baseline (`INVARIANT_OK`) — consuming no net slots and changing no service
+state. The reply/transfer production markers fire naturally from the boot's spawn
+IPC (reply caps + a cap transfer occur every boot under IPC-FINAL); the hot
+mint/lookup success paths are NOT instrumented (only their error/rollback edges),
+to bound marker volume.
+
+**`CAP_CNODE=1` acceptance profile (Task F/G).** Requires `CAP_CNODE_ENABLED`,
+`CAP_CNODE_LOOKUP_OK`, `CAP_CNODE_RESERVE_OK`, one of
+`CAP_CNODE_MATERIALIZE_OK`/`CAP_CNODE_TRANSFER_MATERIALIZE_OK`, one of
+`CAP_CNODE_RELEASE_OK`/`CAP_CNODE_REVOKE_ON_EXIT_OK`, and `CAP_CNODE_INVARIANT_OK`;
+fails hard on `CAP_CNODE_REFCOUNT_UNDERFLOW`, `CAP_CNODE_SLOT_LEAK`,
+`CAP_CNODE_STALE_CAP_ACCEPTED`, `CAP_CNODE_RIGHTS_ESCALATION`,
+`CAP_CNODE_ROLLBACK_LEAK`, `CAP_CNODE_MATERIALIZE_FAIL`, a `CAP_CNODE_TRANSFER_FAIL`
+without a matching `CAP_CNODE_TRANSFER_ROLLBACK_OK`, `CapabilityFull`,
+`TaskTableFull`, `BLOCKED_WOULDBLOCK_FATAL`, and the fatal breadcrumbs
+(`^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/`FATAL`,
+`PAGE_FAULT_UNHANDLED`/`PAGE_FAULT_FATAL`/`PAGE_FAULT_NOT_HANDLED`). Handled
+COW/DEMAND page faults remain accepted. Mode isolation forces `CAP_CNODE` off under
+`D6_SWITCH_PROOF` / `D6_SWITCH_A`; `CAP_CNODE` is standalone (does not enable a
+D6/D2 mode and is not auto-enabled by the IPC proof workloads). Guarded by
+`stage173_cap_cnode`.
+
+Acceptance (user QEMU): (1) `CAP_CNODE=1` smoke (primary); (2) `VM_COW=1` smoke;
+(3) `IPC_FINAL=1` oracle; (4) `D2_RECV_GENUINE=1`; (5) `D2_SEND_GENUINE=1`; (6)
+`SCHED_TIMEOUT=1`; (7) normal smoke; (8) `D6_SWITCH_A=1`; (9) 5-min
+`D6_SWITCH_PROOF=1`; (10) Stage 163P sender-wake oracle. **PENDING user QEMU
+acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

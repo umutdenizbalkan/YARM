@@ -130,6 +130,16 @@ impl KernelState {
         materialized_cap: CapId,
         is_reply_cap: bool,
     ) -> bool {
+        // Stage 173 (CAP-CNODE): default-off materialize-rollback markers.
+        // Diagnostic only — the inverse-of-mint rollback is UNCHANGED.
+        let cap_cnode = crate::kernel::boot::cap_cnode_enabled();
+        if cap_cnode {
+            crate::yarm_log!(
+                "CAP_CNODE_MATERIALIZE_ROLLBACK_BEGIN tid={} slot={}",
+                receiver_tid,
+                materialized_cap.0
+            );
+        }
         let Some(receiver_cnode) = self.task_cnode(receiver_tid) else {
             return false;
         };
@@ -153,6 +163,21 @@ impl KernelState {
                 materialized_cap.0,
                 cleared
             );
+            if cap_cnode {
+                if cleared {
+                    crate::yarm_log!(
+                        "CAP_CNODE_MATERIALIZE_ROLLBACK_OK tid={} slot={}",
+                        receiver_tid,
+                        materialized_cap.0
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "CAP_CNODE_ROLLBACK_LEAK tid={} slot={} kind=reply",
+                        receiver_tid,
+                        materialized_cap.0
+                    );
+                }
+            }
             cleared
         } else {
             let ok = self
@@ -164,6 +189,21 @@ impl KernelState {
                 materialized_cap.0,
                 ok
             );
+            if cap_cnode {
+                if ok {
+                    crate::yarm_log!(
+                        "CAP_CNODE_MATERIALIZE_ROLLBACK_OK tid={} slot={}",
+                        receiver_tid,
+                        materialized_cap.0
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "CAP_CNODE_ROLLBACK_LEAK tid={} slot={} kind=transfer",
+                        receiver_tid,
+                        materialized_cap.0
+                    );
+                }
+            }
             ok
         }
     }

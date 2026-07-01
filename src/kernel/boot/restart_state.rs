@@ -103,8 +103,21 @@ impl KernelState {
             tcb.restart.token = Some(RestartToken(token));
             Ok::<_, KernelError>(())
         })?;
+        // Stage 173 (CAP-CNODE): default-off on-exit cap-revoke markers. Diagnostic
+        // only — the reply-cap sweep + waiter cleanup below is UNCHANGED.
+        let cap_cnode = crate::kernel::boot::cap_cnode_enabled();
+        if cap_cnode {
+            let count = self
+                .snapshot_live_capabilities_for_task(tid)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            crate::yarm_log!("CAP_CNODE_REVOKE_ON_EXIT tid={} count={}", tid, count);
+        }
         let _ = self.revoke_reply_caps_for_caller(tid);
         let _ = self.revoke_reply_caps_for_replier(tid);
+        if cap_cnode {
+            crate::yarm_log!("CAP_CNODE_REVOKE_ON_EXIT_OK tid={}", tid);
+        }
         self.clear_ipc_waiters_for_tid(tid);
         self.report_task_exit_to_supervisor(tid, code, token)?;
         self.report_task_exit_to_pm(tid, code)?;
