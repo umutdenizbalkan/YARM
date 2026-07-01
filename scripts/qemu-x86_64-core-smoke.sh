@@ -46,17 +46,18 @@ D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
 SCHED_TIMEOUT=${SCHED_TIMEOUT:-0}
 VM_COW=${VM_COW:-0}
 CAP_CNODE=${CAP_CNODE:-0}
+FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -64,7 +65,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -140,6 +141,17 @@ fi
 CAP_CNODE=${CAP_CNODE:-0}
 if [[ "$CAP_CNODE" == "1" && "$KERNEL_CMDLINE" != *"yarm.cap_cnode="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.cap_cnode=1"
+fi
+# Stage 174 (FAULT-DELIVERY): FAULT_DELIVERY=1 appends yarm.fault_delivery=1 to
+# emit the kernel-fault → supervisor delivery / fault-channel lifecycle diagnostic
+# markers + run the one-shot self-contained fault-delivery proof (arch-neutral; no
+# behavior change). Standalone — it does NOT enable any D6/D2 mode and is NOT
+# auto-enabled by the IPC proof workloads. The classify markers fire naturally
+# from the boot's handled COW faults; the one-shot proof provides the
+# deterministic classify/msg-build/endpoint/queue/dequeue/invariant markers.
+FAULT_DELIVERY=${FAULT_DELIVERY:-0}
+if [[ "$FAULT_DELIVERY" == "1" && "$KERNEL_CMDLINE" != *"yarm.fault_delivery="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.fault_delivery=1"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -984,9 +996,22 @@ if [[ "$D2_SEND_GENUINE" == "1" ]]; then
   done
   if [[ -f "$LOGFILE" ]]; then
     d2s_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/D2_SEND_GENUINE_CANDIDATE/{seen=1} seen{print}')"
-    for fatal_pat in '!Fv' '!BNv' 'PAGE_FAULT' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
-      if printf '%s\n' "$d2s_tail" | rg -a -F -q -- "$fatal_pat"; then
+    # Stage 173B: narrow the fatal gate. The sender-wake workload forks and emits
+    # handled COW fault groups (PAGE_FAULT_ENTRY … PAGE_FAULT_HANDLED_COW) whose
+    # benign PAGE_FAULT_* diagnostics (ENTRY / HW_REGS / FRAME_WORDS / FRAME_DECODE
+    # / HW_PTE_WALK / RAW / X86_ERROR / CR3_COMPARE) must NOT trip the fatal gate.
+    # Only line-anchored crash breadcrumbs are fatal here; generic PAGE_FAULT is
+    # NOT a fatal token — the explicit unhandled/fatal page-fault markers below are.
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$d2s_tail" | rg -a -q -- "$fatal_pat"; then
         echo "[error] D2-SEND-GENUINE: fatal breadcrumb after send wire start: $fatal_pat"
+        d2_send_fail=1
+      fi
+    done
+    # Explicit unhandled/fatal page-fault markers only (handled COW/DEMAND are OK).
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$d2s_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] D2-SEND-GENUINE: explicit unhandled/fatal page-fault marker: $pf_fatal"
         d2_send_fail=1
       fi
     done
@@ -1246,6 +1271,94 @@ if [[ "$CAP_CNODE" == "1" ]]; then
     exit 1
   fi
   echo "[ok] CAP-CNODE: capability/CNode lifecycle diagnostics clean"
+fi
+
+# Stage 174 (FAULT-DELIVERY): when booted with yarm.fault_delivery=1, require the
+# kernel-fault → supervisor delivery / fault-channel lifecycle diagnostics and
+# reject delivery/queue/channel regressions. The one-shot self-contained proof
+# provides the deterministic classify/msg-build/endpoint/queue/dequeue/invariant
+# markers; the live classify markers additionally fire on the boot's handled COW
+# faults. Handled COW/DEMAND page faults remain accepted (Stage 171B/173B).
+if [[ "$FAULT_DELIVERY" == "1" ]]; then
+  fault_delivery_fail=0
+  echo "[ok] FAULT_DELIVERY enabled marker:" $(log_has_pattern "FAULT_DELIVERY_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "FAULT_DELIVERY_ENABLED"; then
+    echo "[error] FAULT-DELIVERY: FAULT_DELIVERY_ENABLED missing (knob not applied)"
+    fault_delivery_fail=1
+  fi
+  # Deterministic proof / live-path required markers (must appear).
+  for m in \
+    "FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED" \
+    "FAULT_DELIVERY_MSG_BUILD_OK" \
+    "FAULT_DELIVERY_INVARIANT_OK"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] FAULT-DELIVERY marker present: $m"
+    else
+      echo "[error] FAULT-DELIVERY: required marker missing: $m"
+      fault_delivery_fail=1
+    fi
+  done
+  # At least one delivery completion — direct blocked-recv OR queued dequeue.
+  if log_has_pattern "FAULT_DELIVERY_DIRECT_RECV_DONE" || log_has_pattern "FAULT_DELIVERY_DEQUEUE_OK"; then
+    echo "[ok] FAULT-DELIVERY delivery-completion marker present"
+  else
+    echo "[error] FAULT-DELIVERY: no direct-recv/dequeue completion observed"
+    fault_delivery_fail=1
+  fi
+  # If the current policy stopped a faulting task, the stop must have completed.
+  if log_has_pattern "FAULT_DELIVERY_TASK_STOP_BEGIN" && ! log_has_pattern "FAULT_DELIVERY_TASK_STOP_OK"; then
+    echo "[error] FAULT-DELIVERY: task-stop began but did not complete"
+    fault_delivery_fail=1
+  fi
+  # Hard invariant-violation markers (must never appear).
+  for f in \
+    "FAULT_DELIVERY_STRANDED_QUEUE" \
+    "FAULT_DELIVERY_DUPLICATE_MSG" \
+    "FAULT_DELIVERY_ORPHANED_WAITER" \
+    "FAULT_DELIVERY_STALE_SUPERVISOR" \
+    "FAULT_DELIVERY_BAD_SENDER" \
+    "FAULT_DELIVERY_WRITEBACK_FAIL" \
+    "FAULT_DELIVERY_QUEUE_LEAK" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] FAULT-DELIVERY: fatal marker present: $f"
+      fault_delivery_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    fd_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/FAULT_DELIVERY_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$fd_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] FAULT-DELIVERY: fatal breadcrumb after fault-delivery wire start: $fatal_pat"
+        fault_delivery_fail=1
+      fi
+    done
+    # Explicit unhandled/fatal page-fault markers only. A generic PAGE_FAULT is
+    # NOT fatal here (handled COW/DEMAND emit many benign PAGE_FAULT_* diagnostics);
+    # an unhandled fault that escapes WITHOUT a fault-delivery success is fatal, but
+    # PAGE_FAULT_UNHANDLED routed into a FAULT_DELIVERY_* success is the expected
+    # user-fault delivery path.
+    for pf_fatal in 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$fd_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] FAULT-DELIVERY: explicit fatal page-fault marker: $pf_fatal"
+        fault_delivery_fail=1
+      fi
+    done
+    # PAGE_FAULT_UNHANDLED is only fatal if it did NOT route to a fault-delivery
+    # classification/build (i.e. it escaped the supervisor delivery path).
+    if printf '%s\n' "$fd_tail" | rg -a -F -q -- 'PAGE_FAULT_UNHANDLED' \
+       && ! log_has_pattern "FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED"; then
+      echo "[error] FAULT-DELIVERY: unhandled page fault escaped without supervisor delivery"
+      fault_delivery_fail=1
+    fi
+  fi
+  if [[ "$fault_delivery_fail" -eq 1 ]]; then
+    echo "[error] FAULT-DELIVERY mode FAILED"
+    exit 1
+  fi
+  echo "[ok] FAULT-DELIVERY: kernel-fault → supervisor delivery diagnostics clean"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

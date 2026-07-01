@@ -49295,3 +49295,367 @@ mod stage173_cap_cnode {
         );
     }
 }
+
+// Stage 173B: the D2_SEND_GENUINE fatal-after-send gate must not treat a generic
+// PAGE_FAULT (emitted by the sender-wake workload's handled COW faults) as fatal;
+// only line-anchored crash breadcrumbs + explicit unhandled/fatal page-fault
+// markers are fatal — matching the Stage 171B / VM-COW / CAP-CNODE narrowing.
+mod stage173b_d2_send_gate {
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The D2_SEND gate is narrowed: generic PAGE_FAULT is not a fatal token, and the
+    // page-fault gate uses the explicit markers.
+    #[test]
+    fn stage173b_d2_send_gate_narrowed() {
+        let idx = SMOKE_SRC
+            .find("Stage 173B: narrow the fatal gate")
+            .expect("Stage 173B narrowing comment must be present in the smoke");
+        // Scope the assertions to the D2_SEND gate region.
+        let block = &SMOKE_SRC[idx..idx + 1400];
+        // Line-anchored crash breadcrumbs only (not the old bare '!Fv'/'PAGE_FAULT').
+        assert!(
+            block.contains("'^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'"),
+            "D2_SEND gate must use line-anchored crash breadcrumbs"
+        );
+        // Explicit unhandled/fatal page-fault markers gate the run.
+        for m in [
+            "PAGE_FAULT_UNHANDLED",
+            "PAGE_FAULT_FATAL",
+            "PAGE_FAULT_NOT_HANDLED",
+        ] {
+            assert!(
+                block.contains(m),
+                "D2_SEND page-fault gate must fail on {m}"
+            );
+        }
+        // The narrowed D2_SEND breadcrumb loop must NOT list a bare 'PAGE_FAULT'
+        // token as fatal.
+        assert!(
+            !block.contains("'PAGE_FAULT'"),
+            "generic PAGE_FAULT must not be a fatal token in the D2_SEND gate"
+        );
+    }
+
+    // All real D2_SEND_GENUINE gates remain intact.
+    #[test]
+    fn stage173b_real_d2_send_gates_preserved() {
+        for m in [
+            "D2_SEND_GENUINE_DISPATCH_DEFERRED",
+            "D2_SEND_GENUINE_NO_INLOCK_DISPATCH",
+            "D6_GENUINE_MUT_DISPATCH_FALLBACK reason=switch_required",
+            "IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK",
+            "IPC_RECV_V2_SENDER_WAKE_ORDER_OK",
+            "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE",
+            "BLOCKED_WOULDBLOCK_FATAL",
+            "CapabilityFull",
+            "TaskTableFull",
+        ] {
+            assert!(
+                SMOKE_SRC.contains(m),
+                "D2_SEND gate must preserve real check: {m}"
+            );
+        }
+    }
+
+    // The SCHED_TIMEOUT and IPC-FINAL narrowed gates are unchanged (still explicit).
+    #[test]
+    fn stage173b_other_narrowed_gates_unchanged() {
+        // SCHED-TIMEOUT still uses the explicit page-fault markers.
+        assert!(
+            SMOKE_SRC.contains("Stage 171B: page-fault gate"),
+            "SCHED-TIMEOUT gate must remain explicit-marker based"
+        );
+        // Doc records the Stage 173B fix.
+        assert!(
+            DOC_SRC.contains("Stage 173B"),
+            "doc must record the Stage 173B fix"
+        );
+    }
+}
+
+// Stage 174 (FAULT-DELIVERY): driving the real kernel-fault → supervisor delivery
+// path with the fault_delivery marker knob ENABLED must be behaviorally identical
+// to the knob off — the report queues exactly once, decodes intact, and leaves no
+// duplicate/stranded message — proving the diagnostics change no delivery behavior.
+#[test]
+fn stage174_fault_delivery_markers_do_not_change_delivery_behavior() {
+    let mut state = Bootstrap::init().expect("init");
+    crate::kernel::boot::set_fault_delivery_enabled(true);
+    let (endpoint_idx, _send_cap, recv_cap) = state.create_endpoint(4).expect("endpoint");
+    state
+        .set_supervisor_endpoint(recv_cap)
+        .expect("set supervisor endpoint");
+
+    let fault = super::super::trap::FaultInfo {
+        addr: VirtAddr(0xBEEF),
+        access: super::super::trap::FaultAccess::Write,
+    };
+    state.emit_fault_report_for_fault_for_test(10008, fault);
+
+    // Exactly one queued (no duplicate/stranding) — identical to knob-off behavior.
+    let queued = state.with_ipc_state(|ipc| {
+        ipc.endpoints[endpoint_idx]
+            .as_ref()
+            .map(|ep| super::kernel_ref(ep).queued())
+            .unwrap_or(0)
+    });
+    assert_eq!(
+        queued, 1,
+        "fault report must queue exactly once with markers on"
+    );
+
+    let report = state
+        .ipc_recv(recv_cap)
+        .expect("supervisor recv")
+        .expect("fault report");
+    let decoded = super::fault_state::SupervisorFaultReportWire::decode(report.as_slice())
+        .expect("decode fault wire");
+    assert_eq!(decoded.faulting_tid, 10008);
+    assert_eq!(decoded.fault_addr, 0xBEEF);
+    assert_eq!(decoded.access, super::super::trap::FaultAccess::Write);
+
+    // No duplicate/stranded message after the single dequeue.
+    let queued_after = state.with_ipc_state(|ipc| {
+        ipc.endpoints[endpoint_idx]
+            .as_ref()
+            .map(|ep| super::kernel_ref(ep).queued())
+            .unwrap_or(0)
+    });
+    assert_eq!(
+        queued_after, 0,
+        "no duplicate/stranded fault message after dequeue"
+    );
+
+    crate::kernel::boot::set_fault_delivery_enabled(false);
+}
+
+// Stage 174 (FAULT-DELIVERY): source guards over the fault-delivery
+// instrumentation, knob, smoke plumbing, marker set, and invariants (no
+// ABI/count/behavior change).
+mod stage174_fault_delivery {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const RESTART_SRC: &str = include_str!("restart_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral (pure diagnostic, no arch cfg).
+    #[test]
+    fn stage174_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub fault_delivery: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.fault_delivery"),
+            "yarm.fault_delivery must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("FAULT_DELIVERY_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn fault_delivery_enabled() -> bool")
+                && MOD_SRC.contains("fn set_fault_delivery_enabled(")
+                && MOD_SRC.contains("fn fault_delivery_proof_try_start()"),
+            "FAULT_DELIVERY gate + accessors + one-shot latch must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.fault_delivery")
+            .expect("fault_delivery apply block");
+        let block = &CMDLINE_SRC[idx..idx + 600];
+        assert!(
+            block.contains("set_fault_delivery_enabled(enabled)")
+                && block.contains("FAULT_DELIVERY_ENABLED")
+                && !block.contains("#[cfg(target_arch = \"x86_64\")]"),
+            "fault_delivery must be arch-neutral (pure diagnostic) and emit FAULT_DELIVERY_ENABLED"
+        );
+    }
+
+    // The one-shot proof is hooked in the arch-neutral timer path (no arch cfg) and
+    // is self-contained + one-shot.
+    #[test]
+    fn stage174_proof_hooked_arch_neutral() {
+        assert!(
+            FAULT_SRC.contains("self.maybe_run_fault_delivery_proof()"),
+            "proof must be driven from the arch-neutral fault/timer path"
+        );
+        assert!(
+            FAULT_SRC.contains("fn maybe_run_fault_delivery_proof(")
+                && FAULT_SRC.contains("fault_delivery_proof_try_start()")
+                && FAULT_SRC.contains("if tid == 0"),
+            "proof must be one-shot and only run for a real user task (tid != 0)"
+        );
+    }
+
+    // Handled COW/demand faults are classified handled and DO NOT deliver to the
+    // supervisor (the handled arms return Ok before the user-unhandled delivery).
+    #[test]
+    fn stage174_handled_faults_do_not_deliver() {
+        assert!(
+            FAULT_SRC.contains("FAULT_DELIVERY_CLASSIFY_HANDLED kind=cow")
+                && FAULT_SRC.contains("FAULT_DELIVERY_CLASSIFY_HANDLED kind=demand"),
+            "handled COW/demand must emit the handled-classification marker"
+        );
+        // The COW handled arm returns before delivery.
+        let cow_idx = FAULT_SRC
+            .find("FAULT_DELIVERY_CLASSIFY_HANDLED kind=cow")
+            .expect("cow classify");
+        let after_cow = &FAULT_SRC[cow_idx..cow_idx + 120];
+        assert!(
+            after_cow.contains("return Ok(())"),
+            "handled COW fault must return before supervisor delivery"
+        );
+        // User-unhandled classification sits on the delivery path (next to the
+        // PAGE_FAULT_UNHANDLED marker), not the handled path.
+        assert!(
+            FAULT_SRC.contains("FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED")
+                && FAULT_SRC.contains("PAGE_FAULT_UNHANDLED"),
+            "user-unhandled fault must route to the delivery path"
+        );
+    }
+
+    // The full documented marker set must exist verbatim across the instrumentation.
+    #[test]
+    fn stage174_all_marker_strings_exist() {
+        // FAULT_DELIVERY_ENABLED is emitted by the cmdline apply, not fault_state.
+        assert!(
+            CMDLINE_SRC.contains("FAULT_DELIVERY_ENABLED"),
+            "cmdline apply must emit FAULT_DELIVERY_ENABLED"
+        );
+        for m in [
+            "FAULT_DELIVERY_CLASSIFY_BEGIN",
+            "FAULT_DELIVERY_CLASSIFY_HANDLED",
+            "FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED",
+            "FAULT_DELIVERY_CLASSIFY_KERNEL_FATAL",
+            "FAULT_DELIVERY_MSG_BUILD_BEGIN",
+            "FAULT_DELIVERY_MSG_BUILD_OK",
+            "FAULT_DELIVERY_MSG_BUILD_FAIL",
+            "FAULT_DELIVERY_ENDPOINT_LOOKUP_BEGIN",
+            "FAULT_DELIVERY_ENDPOINT_LOOKUP_OK",
+            "FAULT_DELIVERY_ENDPOINT_LOOKUP_FAIL",
+            "FAULT_DELIVERY_DIRECT_RECV_BEGIN",
+            "FAULT_DELIVERY_DIRECT_RECV_WRITEBACK_OK",
+            "FAULT_DELIVERY_DIRECT_RECV_DONE",
+            "FAULT_DELIVERY_QUEUE_BEGIN",
+            "FAULT_DELIVERY_QUEUE_OK",
+            "FAULT_DELIVERY_QUEUE_FULL",
+            "FAULT_DELIVERY_DEQUEUE_BEGIN",
+            "FAULT_DELIVERY_DEQUEUE_OK",
+            "FAULT_DELIVERY_TASK_STOP_BEGIN",
+            "FAULT_DELIVERY_TASK_STOP_OK",
+            "FAULT_DELIVERY_INVARIANT_OK",
+            "FAULT_DELIVERY_STRANDED_QUEUE",
+            "FAULT_DELIVERY_DUPLICATE_MSG",
+            "FAULT_DELIVERY_ORPHANED_WAITER",
+            "FAULT_DELIVERY_STALE_SUPERVISOR",
+            "FAULT_DELIVERY_BAD_SENDER",
+            "FAULT_DELIVERY_WRITEBACK_FAIL",
+            "FAULT_DELIVERY_QUEUE_LEAK",
+        ] {
+            assert!(FAULT_SRC.contains(m), "fault_state must emit marker {m}");
+        }
+        // Task-cleanup + supervisor-restart markers live in restart_state.
+        for m in [
+            "FAULT_DELIVERY_TASK_CLEANUP_BEGIN",
+            "FAULT_DELIVERY_TASK_CLEANUP_OK",
+            "FAULT_DELIVERY_SUPERVISOR_RESTART_BEGIN",
+            "FAULT_DELIVERY_SUPERVISOR_RESTART_OK",
+            "FAULT_DELIVERY_CHANNEL_REBIND_OK",
+            "FAULT_DELIVERY_RESTART_TOKEN_OK",
+        ] {
+            assert!(
+                RESTART_SRC.contains(m),
+                "restart_state must emit marker {m}"
+            );
+        }
+    }
+
+    // Smoke plumbing + mode isolation + failure gates.
+    #[test]
+    fn stage174_smoke_profile() {
+        assert!(
+            SMOKE_SRC.contains("FAULT_DELIVERY=${FAULT_DELIVERY:-0}")
+                && SMOKE_SRC.contains("yarm.fault_delivery=1"),
+            "smoke must plumb FAULT_DELIVERY=1"
+        );
+        for m in [
+            "FAULT_DELIVERY_ENABLED",
+            "FAULT_DELIVERY_CLASSIFY_USER_UNHANDLED",
+            "FAULT_DELIVERY_MSG_BUILD_OK",
+            "FAULT_DELIVERY_INVARIANT_OK",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require {m}");
+        }
+        for f in [
+            "FAULT_DELIVERY_STRANDED_QUEUE",
+            "FAULT_DELIVERY_DUPLICATE_MSG",
+            "FAULT_DELIVERY_ORPHANED_WAITER",
+            "FAULT_DELIVERY_STALE_SUPERVISOR",
+            "FAULT_DELIVERY_BAD_SENDER",
+            "FAULT_DELIVERY_WRITEBACK_FAIL",
+            "FAULT_DELIVERY_QUEUE_LEAK",
+        ] {
+            assert!(SMOKE_SRC.contains(f), "smoke must gate on {f}");
+        }
+        // FAULT_DELIVERY is forced OFF under the D6 switch proof / switch-a modes.
+        assert!(
+            SMOKE_SRC.contains("VM_COW CAP_CNODE FAULT_DELIVERY"),
+            "mode isolation must force FAULT_DELIVERY off under D6 proof/switch-a"
+        );
+        // Generic PAGE_FAULT is NOT a fatal token in the fault-delivery gate; only
+        // the explicit fatal page-fault markers are, and an unhandled fault is fatal
+        // only if it escaped without a fault-delivery classification.
+        assert!(
+            SMOKE_SRC.contains("escaped without supervisor delivery")
+                && SMOKE_SRC.contains("PAGE_FAULT_FATAL"),
+            "smoke must narrow the page-fault gate to explicit markers"
+        );
+    }
+
+    // Invariants + no scope creep into ABI/counts/D2/D6/IPC-FINAL/VM-COW/SCHED-TIMEOUT/CAP-CNODE.
+    #[test]
+    fn stage174_invariants_and_regressions_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        // D2/D6/IPC-FINAL/SCHED-TIMEOUT/VM-COW/CAP-CNODE gates still present.
+        assert!(
+            SMOKE_SRC.contains("D2_RECV_GENUINE_DISPATCH_DEFERRED")
+                && SMOKE_SRC.contains("D6_GENUINE_MUT_DISPATCH_ENTER")
+                && SMOKE_SRC.contains("SCHED_TIMEOUT_ENABLED")
+                && SMOKE_SRC.contains("yarm.vm_cow=1")
+                && SMOKE_SRC.contains("yarm.cap_cnode=1"),
+            "D2/D6/SCHED-TIMEOUT/VM-COW/CAP-CNODE gates must remain"
+        );
+        // The handled-fault markers preserved (Stage 171B/173B).
+        assert!(
+            FAULT_SRC.contains("PAGE_FAULT_HANDLED_COW")
+                && FAULT_SRC.contains("PAGE_FAULT_HANDLED_DEMAND"),
+            "handled COW/DEMAND markers must be preserved"
+        );
+    }
+
+    // Docs: Stage 173 accepted + 173B note + Stage 174 section added.
+    #[test]
+    fn stage174_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 174 — FAULT-DELIVERY"),
+            "doc must add the Stage 174 FAULT-DELIVERY section"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 173 CAP-CNODE is **ACCEPTED**")
+                || DOC_SRC.contains("CAP-CNODE is **ACCEPTED"),
+            "doc must record Stage 173 accepted"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 173B"),
+            "doc must record the Stage 173B D2_SEND smoke false-positive fix"
+        );
+    }
+}

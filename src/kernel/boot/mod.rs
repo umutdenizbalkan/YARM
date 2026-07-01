@@ -1020,6 +1020,37 @@ pub(crate) fn cap_cnode_proof_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 174 (FAULT-DELIVERY): arch-neutral, default-off DIAGNOSTIC gate for the
+/// kernel-fault → supervisor delivery / fault-channel lifecycle markers + the
+/// one-shot fault-delivery proof. It changes NO fault/IPC/ABI behavior — only
+/// emits FAULT_DELIVERY_* markers. VALIDATION: FAULT_DELIVERY_ENABLED.
+pub(crate) static FAULT_DELIVERY_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 174: one-shot latch so the fault-delivery proof runs exactly once.
+pub(crate) static FAULT_DELIVERY_PROOF_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_fault_delivery_enabled(enabled: bool) {
+    FAULT_DELIVERY_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn fault_delivery_enabled() -> bool {
+    FAULT_DELIVERY_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 174: try to claim the one-shot fault-delivery proof (true exactly once).
+pub(crate) fn fault_delivery_proof_try_start() -> bool {
+    FAULT_DELIVERY_PROOF_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }
