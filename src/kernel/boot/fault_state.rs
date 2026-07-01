@@ -980,6 +980,11 @@ impl KernelState {
                 // current; no-op otherwise. Self-contained (scratch endpoint) — it
                 // does NOT touch the real supervisor. Arch-neutral, diagnostic only.
                 self.maybe_run_fault_delivery_proof();
+                // Stage 175 (SPAWN-LIFECYCLE): one-shot spawn-rollback proof. Runs at
+                // most once when `yarm.spawn_lifecycle=1` and a real user task is
+                // current; no-op otherwise. Self-contained (scratch address space) —
+                // it does NOT spawn a real task. Arch-neutral, diagnostic only.
+                self.maybe_run_spawn_lifecycle_proof();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

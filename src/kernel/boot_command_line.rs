@@ -231,6 +231,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("FAULT_DELIVERY_ENABLED");
         }
     }
+    if let Some(enabled) = parsed.spawn_lifecycle {
+        // Stage 175 (SPAWN-LIFECYCLE): arch-neutral, default-off DIAGNOSTIC gate for
+        // the spawn / image-loading / lifecycle-metadata markers + one-shot proof.
+        // Changes no spawn/PM behavior or ABI — only emits SPAWN_LIFECYCLE_* markers.
+        crate::kernel::boot::set_spawn_lifecycle_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("SPAWN_LIFECYCLE_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -360,6 +369,10 @@ pub struct YarmBootOptions<'a> {
     /// default-off kernel-fault → supervisor delivery / fault-channel lifecycle
     /// DIAGNOSTIC markers + one-shot fault-delivery proof (no behavior/ABI change).
     pub fault_delivery: Option<bool>,
+    /// Stage 175 (SPAWN-LIFECYCLE): `yarm.spawn_lifecycle=1` gates the arch-neutral,
+    /// default-off spawn / image-loading / lifecycle-metadata DIAGNOSTIC markers +
+    /// one-shot rollback proof (no behavior/ABI/PM-policy change).
+    pub spawn_lifecycle: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -469,6 +482,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.fault_delivery" {
             options.fault_delivery = parse_bool_knob(value);
+        }
+        if key == b"yarm.spawn_lifecycle" {
+            options.spawn_lifecycle = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

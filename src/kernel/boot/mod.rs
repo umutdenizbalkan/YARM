@@ -1051,6 +1051,37 @@ pub(crate) fn fault_delivery_proof_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 175 (SPAWN-LIFECYCLE): arch-neutral, default-off DIAGNOSTIC gate for the
+/// spawn / image-loading / lifecycle-metadata phase markers + the one-shot
+/// spawn-lifecycle rollback proof. It changes NO spawn/PM/ABI behavior — only emits
+/// SPAWN_LIFECYCLE_* markers. VALIDATION: SPAWN_LIFECYCLE_ENABLED.
+pub(crate) static SPAWN_LIFECYCLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 175: one-shot latch so the spawn-lifecycle proof runs exactly once.
+pub(crate) static SPAWN_LIFECYCLE_PROOF_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_spawn_lifecycle_enabled(enabled: bool) {
+    SPAWN_LIFECYCLE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn spawn_lifecycle_enabled() -> bool {
+    SPAWN_LIFECYCLE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 175: try to claim the one-shot spawn-lifecycle proof (true exactly once).
+pub(crate) fn spawn_lifecycle_proof_try_start() -> bool {
+    SPAWN_LIFECYCLE_PROOF_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }
