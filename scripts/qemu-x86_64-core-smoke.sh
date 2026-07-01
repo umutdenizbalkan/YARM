@@ -48,17 +48,18 @@ VM_COW=${VM_COW:-0}
 CAP_CNODE=${CAP_CNODE:-0}
 FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
+GLOBAL_STATE=${GLOBAL_STATE:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -66,7 +67,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE"
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -164,6 +165,15 @@ fi
 SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 if [[ "$SPAWN_LIFECYCLE" == "1" && "$KERNEL_CMDLINE" != *"yarm.spawn_lifecycle="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.spawn_lifecycle=1"
+fi
+# Stage 176 (GLOBAL-STATE): GLOBAL_STATE=1 appends yarm.global_state=1 to emit the
+# remaining direct global-KernelState mutation audit + lock-rank discipline markers
+# + run the one-shot read-only global-state audit (arch-neutral; no behavior change).
+# Standalone — it does NOT enable any D6/D2 mode and is NOT auto-enabled by the IPC
+# proof workloads.
+GLOBAL_STATE=${GLOBAL_STATE:-0}
+if [[ "$GLOBAL_STATE" == "1" && "$KERNEL_CMDLINE" != *"yarm.global_state="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.global_state=1"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1447,6 +1457,76 @@ if [[ "$SPAWN_LIFECYCLE" == "1" ]]; then
     exit 1
   fi
   echo "[ok] SPAWN-LIFECYCLE: spawn / image-loading / lifecycle-metadata diagnostics clean"
+fi
+
+# Stage 176 (GLOBAL-STATE): when booted with yarm.global_state=1, require the
+# remaining direct global-KernelState mutation audit + lock-rank discipline
+# diagnostics and reject rank inversions / leaked global guards / unclassified
+# mutation sites. The one-shot read-only audit provides the deterministic markers.
+# Handled COW/DEMAND page faults remain accepted (Stage 171B/173B).
+if [[ "$GLOBAL_STATE" == "1" ]]; then
+  global_state_fail=0
+  echo "[ok] GLOBAL_STATE enabled marker:" $(log_has_pattern "GLOBAL_STATE_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "GLOBAL_STATE_ENABLED"; then
+    echo "[error] GLOBAL-STATE: GLOBAL_STATE_ENABLED missing (knob not applied)"
+    global_state_fail=1
+  fi
+  # Deterministic audit required markers (must appear).
+  for m in \
+    "GLOBAL_STATE_OWNER_HELPER_OK" \
+    "GLOBAL_STATE_DIRECT_SITE_ALLOWED" \
+    "GLOBAL_STATE_RANK_ORDER_OK" \
+    "GLOBAL_STATE_NO_LEAKED_GLOBAL_GUARD" \
+    "GLOBAL_STATE_INVARIANT_OK" \
+    "GLOBAL_STATE_PROOF_DONE"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] GLOBAL-STATE marker present: $m"
+    else
+      echo "[error] GLOBAL-STATE: required marker missing: $m"
+      global_state_fail=1
+    fi
+  done
+  # Hard invariant-violation markers (must never appear).
+  for f in \
+    "GLOBAL_STATE_DIRECT_MUTATION_LEAK" \
+    "GLOBAL_STATE_RANK_INVERSION" \
+    "GLOBAL_STATE_RANK_ORDER_FAIL" \
+    "GLOBAL_STATE_GUARD_HELD_ACROSS_USER_COPY" \
+    "GLOBAL_STATE_GUARD_HELD_ACROSS_SWITCH" \
+    "GLOBAL_STATE_GUARD_HELD_ACROSS_IPC_WRITEBACK" \
+    "GLOBAL_STATE_OWNER_HELPER_BYPASS" \
+    "GLOBAL_STATE_UNCLASSIFIED_SITE" \
+    "GLOBAL_STATE_DIRECT_SITE_REJECTED" \
+    "GLOBAL_STATE_INVARIANT_FAIL" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] GLOBAL-STATE: fatal marker present: $f"
+      global_state_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    gs_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/GLOBAL_STATE_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$gs_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] GLOBAL-STATE: fatal breadcrumb after global-state wire start: $fatal_pat"
+        global_state_fail=1
+      fi
+    done
+    # Explicit unhandled/fatal page-fault markers only (handled COW/DEMAND are OK).
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$gs_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] GLOBAL-STATE: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        global_state_fail=1
+      fi
+    done
+  fi
+  if [[ "$global_state_fail" -eq 1 ]]; then
+    echo "[error] GLOBAL-STATE mode FAILED"
+    exit 1
+  fi
+  echo "[ok] GLOBAL-STATE: global-KernelState mutation audit + lock-rank diagnostics clean"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

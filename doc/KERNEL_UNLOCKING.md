@@ -5717,7 +5717,104 @@ Acceptance (user QEMU): (1) `SPAWN_LIFECYCLE=1` smoke (primary); (2)
 `FAULT_DELIVERY=1`; (3) `CAP_CNODE=1`; (4) `VM_COW=1`; (5) `SCHED_TIMEOUT=1`; (6)
 `IPC_FINAL=1` oracle; (7) `D2_RECV_GENUINE=1`; (8) `D2_SEND_GENUINE=1`; (9) normal
 smoke; (10) `D6_SWITCH_A=1`; (11) 5-min `D6_SWITCH_PROOF=1`; (12) Stage 163P
-sender-wake oracle. **PENDING user QEMU acceptance.**
+sender-wake oracle.
+
+**PRIMARY ACCEPTED (user QEMU, 2026).** The primary `SPAWN_LIFECYCLE=1` run reached
+the service baseline with the successful spawn phase markers (`REQUEST_BEGIN` →
+`IMAGE_RESOLVE_OK` → `ELF_PARSE_OK` → `ELF_LOAD_OK`/`ZC_LOAD_OK` →
+`ASPACE_CREATE_OK`/`TCB_ALLOC_OK`/`CNODE_SETUP_OK`/`BOOTSTRAP_CAPS_OK` →
+`THREAD_READY` → `PROCESS_READY` → `SERVICE_READY`), the one-shot rollback proof
+completing (`ROLLBACK_BEGIN`/`_OK`, `INVARIANT_OK`), and — after the **Stage 175B**
+fix — no `SPAWN_LIFECYCLE_DUPLICATE_TID` false positive for the bootstrap tids, no
+leak markers, and no fatal breadcrumbs. Stage 175/175B SPAWN-LIFECYCLE primary is
+**ACCEPTED**; it was instrumentation-only (the spawn path was already transactional
+and PM policy stays in userspace). The full regression matrix (rows 2–12) is
+**PENDING user QEMU re-run**. Stage 176 (GLOBAL-STATE) is the next frontier.
+
+### 7.1.12 Stage 176 — GLOBAL-STATE (remaining direct global-KernelState mutation audit + rank discipline + diagnostics)
+
+**Next kernel-unlocking frontier after SPAWN-LIFECYCLE.** Audits the remaining
+direct global `KernelState` mutation sites and enforces the owner/helper/rank
+discipline, behind a default-off arch-neutral diagnostic profile
+(`yarm.global_state=1`, script `GLOBAL_STATE=1`, marker `GLOBAL_STATE_ENABLED`).
+This is a **conservative** audit + instrumentation stage: it classifies every
+remaining global-root site, verifies the lock-rank ordering and the no-guard-held
+invariants at runtime, and documents the high-risk sites left unchanged with a
+follow-up target — so **no runtime behavior changes**. This is **instrumentation
+only**; **no real bug** was found.
+
+**Explicitly NOT done in Stage 176:** no syscall count change (SYSCALL_COUNT=31,
+Syscall::VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32); no syscall/IPC/service/
+image ABI change; no PM policy or userspace service-order change; no deletion of the
+`D6_SWITCH_A`/`D6_SWITCH_PROOF`/`D6_GENUINE`/`D2_RECV_GENUINE`/`D2_SEND_GENUINE`
+fallback paths; no D3/D5 live-wire; no SMP broadening; no RPi5 change; no AArch64/
+RISC-V D6 switch unlock (the knob is arch-neutral diagnostics / no-op behavior).
+
+**Lock-rank discipline.** The lock domains are ranked scheduler (1) → task (2) →
+IPC (3) → capability (4) → VM (5) → memory/page-table (6). The audit verifies this
+ordering is monotonic and that no new nested inversion is introduced; the runtime
+proof re-checks the ordering (`GLOBAL_STATE_RANK_ORDER_OK`) and that no global guard
+is held across a user-memory copy, an IPC writeback, or `switch_frames`
+(`GLOBAL_STATE_NO_LEAKED_GLOBAL_GUARD`).
+
+**Direct global-root site classification.** The remaining direct global
+`KernelState` roots are classified and documented:
+- **Legitimate trap-entry orchestration root** (`handle_trap_entry_shared` /
+  `with_cpu`): the single authoritative entry that owns the global guard for the
+  trap; it drops the guard before `switch_frames` on the single-CPU x86_64/AArch64
+  production paths (Stage 117) and before the out-of-lock D6-GENUINE / D2 dispatch
+  drains. **Allowed** (root orchestration).
+- **Already-decomposed owner/helper calls**: the `with_scheduler_split_mut` (rank 1),
+  `with_task_tcbs_split_mut` (rank 2), `with_ipc_split_mut` (rank 3),
+  `with_vm_user_spaces_split_mut` (rank 5), `with_memory_split_mut` (rank 6) seams.
+  **Owner/helper OK**.
+- **Temporary compatibility/fallback sites**: the in-lock D6/D2 dispatch fallbacks
+  (`reason=switch_required` / multi-CPU / no-trap-drainer) that remain under the
+  global lock until the SMP-ready lock-free shootdown/IPI design lands. **Allowed
+  with reason**; follow-up target: SMP-ready D2-GENUINE / D3 / D5 / cross-arch D6.
+- No **unauthorized** direct field mutation outside the approved owner/helper
+  functions was found.
+
+**Markers.** All default-off behind `global_state_enabled()`:
+`GLOBAL_STATE_ENABLED`, `GLOBAL_STATE_AUDIT_BEGIN`,
+`GLOBAL_STATE_SITE_CLASSIFIED kind=…`, `GLOBAL_STATE_OWNER_HELPER_OK`,
+`GLOBAL_STATE_DIRECT_SITE_ALLOWED reason=…`, `GLOBAL_STATE_DIRECT_SITE_REJECTED`,
+`GLOBAL_STATE_RANK_ORDER_OK`/`_FAIL`, `GLOBAL_STATE_NO_LEAKED_GLOBAL_GUARD`,
+`GLOBAL_STATE_SEAM_INVARIANT_OK`, `GLOBAL_STATE_INVARIANT_OK`,
+`GLOBAL_STATE_PROOF_DONE result=ok`; failure markers
+`GLOBAL_STATE_DIRECT_MUTATION_LEAK`, `_RANK_INVERSION`,
+`_GUARD_HELD_ACROSS_USER_COPY`, `_GUARD_HELD_ACROSS_SWITCH`,
+`_GUARD_HELD_ACROSS_IPC_WRITEBACK`, `_OWNER_HELPER_BYPASS`, `_UNCLASSIFIED_SITE`,
+`_INVARIANT_FAIL`.
+
+**Workload.** A default-off, deterministic **one-shot** global-state audit
+(`maybe_run_global_state_audit`) hooked in the arch-neutral timer path runs once
+when a real user task is current. It emits the site classifications, re-checks the
+lock-rank ordering is monotonic (rank inversion → `RANK_ORDER_FAIL`), confirms no
+global guard is leaked at the audit point, and emits the seam/overall invariants —
+touching no service state.
+
+**`GLOBAL_STATE=1` acceptance profile.** Requires `GLOBAL_STATE_ENABLED`, the
+owner/helper + direct-site-allowed classifications, `GLOBAL_STATE_RANK_ORDER_OK`,
+`GLOBAL_STATE_NO_LEAKED_GLOBAL_GUARD`, `GLOBAL_STATE_INVARIANT_OK`, and
+`GLOBAL_STATE_PROOF_DONE`; fails hard on every `GLOBAL_STATE_*` failure marker plus
+`CapabilityFull`, `TaskTableFull`, `BLOCKED_WOULDBLOCK_FATAL`,
+`PAGE_FAULT_UNHANDLED`/`_FATAL`/`_NOT_HANDLED`, and the fatal breadcrumbs
+(`^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/`PANIC`/`FATAL`). Handled COW/DEMAND faults
+remain accepted. Mode isolation forces `GLOBAL_STATE` off under `D6_SWITCH_PROOF` /
+`D6_SWITCH_A`; it is standalone. Guarded by `stage176_global_state`.
+
+**Deferred follow-ups.** The temporary in-lock D2/D6 dispatch fallbacks and the
+rank-5/6 VM/memory seams' broader out-of-global-lock relocation are deferred to the
+SMP-ready lock-free shootdown/IPI design (D2-GENUINE full live-wire, D3, D5, and
+cross-arch D6 switch unlock). None are live-wired here.
+
+Acceptance (user QEMU): (1) `GLOBAL_STATE=1` smoke (primary); (2)
+`SPAWN_LIFECYCLE=1`; (3) `FAULT_DELIVERY=1`; (4) `CAP_CNODE=1`; (5) `VM_COW=1`; (6)
+`SCHED_TIMEOUT=1`; (7) `IPC_FINAL=1` oracle; (8) `D2_RECV_GENUINE=1`; (9)
+`D2_SEND_GENUINE=1`; (10) normal smoke; (11) `D6_SWITCH_A=1`; (12) 5-min
+`D6_SWITCH_PROOF=1`; (13) Stage 163P sender-wake oracle. **PENDING user QEMU
+acceptance.**
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

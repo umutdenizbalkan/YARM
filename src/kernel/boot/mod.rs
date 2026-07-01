@@ -1082,6 +1082,37 @@ pub(crate) fn spawn_lifecycle_proof_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 176 (GLOBAL-STATE): arch-neutral, default-off DIAGNOSTIC gate for the
+/// remaining direct global-`KernelState` mutation audit + lock-rank discipline
+/// markers + the one-shot global-state audit. It changes NO state/ABI behavior —
+/// only emits GLOBAL_STATE_* markers. VALIDATION: GLOBAL_STATE_ENABLED.
+pub(crate) static GLOBAL_STATE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 176: one-shot latch so the global-state audit runs exactly once.
+pub(crate) static GLOBAL_STATE_AUDIT_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_global_state_enabled(enabled: bool) {
+    GLOBAL_STATE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn global_state_enabled() -> bool {
+    GLOBAL_STATE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 176: try to claim the one-shot global-state audit (true exactly once).
+pub(crate) fn global_state_audit_try_start() -> bool {
+    GLOBAL_STATE_AUDIT_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }
