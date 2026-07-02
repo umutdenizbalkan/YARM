@@ -30,6 +30,15 @@ if [[ "$IPC_RECV_PROOF_SENDER_WAKE" == "1" && "$KERNEL_CMDLINE" != *"yarm.ipc_re
   KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.ipc_recv_proof_sender_wake=1"
 fi
 
+# Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
+# AArch64 D6 restore-path audit markers (model=trapframe_eret; read-only observe of
+# ELR/SPSR/SP + TTBR0/ASID). Live lock-dropped restore is DEFERRED — the audit records
+# the explicit deferral, not a fake live restore. No behavior change.
+CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}
+if [[ "$CROSS_ARCH_D6" == "1" && "$KERNEL_CMDLINE" != *"yarm.cross_arch_d6="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.cross_arch_d6=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64-hwe}
@@ -88,6 +97,79 @@ log_count_pattern() {
   [[ -f "$LOGFILE" ]] || { echo 0; return; }
   tr '\r' '\n' <"$LOGFILE" | rg -a -c "\\b${pattern}\\b" 2>/dev/null || echo 0
 }
+
+# Stage 178 (CROSS-ARCH-D6): when booted with yarm.cross_arch_d6=1, validate the
+# AArch64 D6 restore-path audit. Runs regardless of which boot-outcome exit path is
+# taken below. Acceptance is honest: either a live RESTORE_DONE OR an explicit
+# FALLBACK/DEFERRED reason, plus INVARIANT_OK + PROOF_DONE. AArch64 live restore is
+# DEFERRED in Stage 178, so the DEFERRED branch is the expected path.
+cad_has() { [[ -f "$LOGFILE" ]] && tr '\r' '\n' <"$LOGFILE" | rg -a -q -- "$1"; }
+if [[ "$CROSS_ARCH_D6" == "1" ]]; then
+  cross_arch_d6_fail=0
+  echo "[ok] CROSS_ARCH_D6 enabled marker:" $(cad_has "CROSS_ARCH_D6_ENABLED" && echo present || echo MISSING)
+  if ! cad_has "CROSS_ARCH_D6_ENABLED"; then
+    echo "[error] CROSS-ARCH-D6: CROSS_ARCH_D6_ENABLED missing (knob not applied)"
+    cross_arch_d6_fail=1
+  fi
+  for m in "CROSS_ARCH_D6_INVARIANT_OK" "CROSS_ARCH_D6_PROOF_DONE"; do
+    if cad_has "$m"; then
+      echo "[ok] CROSS-ARCH-D6 marker present: $m"
+    else
+      echo "[error] CROSS-ARCH-D6: required marker missing: $m"
+      cross_arch_d6_fail=1
+    fi
+  done
+  # AArch64 records model=trapframe_eret (not the x86_64 switch_frames model).
+  if cad_has "CROSS_ARCH_D6_ARCH_MODEL arch=aarch64 model=trapframe_eret"; then
+    echo "[ok] CROSS-ARCH-D6: AArch64 model=trapframe_eret (not switch_frames)"
+  else
+    echo "[warn] CROSS-ARCH-D6: aarch64 trapframe_eret model marker not observed"
+  fi
+  # Either a live restore completed OR an explicit fallback/deferred reason.
+  if cad_has "CROSS_ARCH_D6_RESTORE_DONE" || cad_has "CROSS_ARCH_D6_FALLBACK" || cad_has "CROSS_ARCH_D6_AARCH64_DEFERRED"; then
+    echo "[ok] CROSS-ARCH-D6: live restore-done or explicit fallback/deferred recorded"
+  else
+    echo "[error] CROSS-ARCH-D6: neither RESTORE_DONE nor an explicit fallback/deferred reason recorded"
+    cross_arch_d6_fail=1
+  fi
+  for f in \
+    "CROSS_ARCH_D6_GLOBAL_GUARD_HELD" \
+    "CROSS_ARCH_D6_BAD_TRAPFRAME" \
+    "CROSS_ARCH_D6_BAD_ASID" \
+    "CROSS_ARCH_D6_CURRENT_TID_MISMATCH" \
+    "CROSS_ARCH_D6_DOUBLE_DISPATCH" \
+    "CROSS_ARCH_D6_RESTORE_FAIL" \
+    "CROSS_ARCH_D6_UNSUPPORTED_MODEL" \
+    "CROSS_ARCH_D6_INVARIANT_FAIL" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if cad_has "$f"; then
+      echo "[error] CROSS-ARCH-D6: fatal marker present: $f"
+      cross_arch_d6_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    cad_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/CROSS_ARCH_D6_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$cad_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] CROSS-ARCH-D6: fatal breadcrumb after cross-arch-d6 wire start: $fatal_pat"
+        cross_arch_d6_fail=1
+      fi
+    done
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$cad_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] CROSS-ARCH-D6: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        cross_arch_d6_fail=1
+      fi
+    done
+  fi
+  if [[ "$cross_arch_d6_fail" -eq 1 ]]; then
+    echo "[error] CROSS-ARCH-D6 mode FAILED"
+    exit 1
+  fi
+  echo "[ok] CROSS-ARCH-D6: AArch64 D6 restore-path audit diagnostics clean (live restore DEFERRED)"
+fi
 
 BLOCKER_REGEX='IPC_CALL_FAIL|IPC_RECV_CAP_MATERIALIZE_FAILED|IPC_RECV_BLOCKED_COMPLETE_FAILED|CapabilityFull|VM_FULL|YARM_FIRST_USER_FAIL|MemoryObjectMissing|ELF_MISSING|PrivilegeViolation|failed to bootstrap first user task|panic|InvalidCapability|WrongObject|StaleCapability|MissingRight|UserMemoryFault|PM_RECV_DECODE_FAIL|bad_len expected=16 got=8|CAP_LOOKUP tid=1 cap=0|empty-elf|Malformed|Syscall\\(Internal\\)|memory allocation of|DELEGATE_FAIL|delegation.*fail|IPC_REPLY_FAST_REVOKE_FAIL|PM_PANIC|INIT_PANIC|DEVFS_PANIC|VFS_PANIC|INITRAMFS_PANIC|INITRAMFS_CPIO_EMPTY|D2_PUBLISH_RACE_UNWIND'
 BLOCKER_EXCLUDE_REGEX='YARM_AARCH64_EXCEPTION_KIND unknown|BLOCKED_WOULDBLOCK_CLASSIFY|reply replay|second reply|replay rejected'

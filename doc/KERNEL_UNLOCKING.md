@@ -5901,9 +5901,94 @@ Acceptance (user QEMU): primary `SMP_READY=1 SMP_READY_CPUS=2 QEMU_SMP=2` smoke
 `GLOBAL_STATE=1`, `SPAWN_LIFECYCLE=1`, `FAULT_DELIVERY=1`, `CAP_CNODE=1`, `VM_COW=1`,
 `SCHED_TIMEOUT=1`, `IPC_FINAL=1` oracle, `D2_RECV_GENUINE=1`, `D2_SEND_GENUINE=1`,
 normal `-smp 1` smoke, `D6_SWITCH_A=1`, 5-min `D6_SWITCH_PROOF=1`, Stage 163P
-sender-wake oracle. **PENDING user QEMU acceptance** (whether x86_64 `-smp 2` reaches
-the service baseline or falls back to parked-AP is to be recorded from that run;
-cross-arch D6 unlock is explicitly Stage 178, not this stage).
+sender-wake oracle.
+
+**ACCEPTED (user QEMU, 2026).** Both `SMP_READY=1 QEMU_SMP=2` and `SMP_READY=1
+QEMU_SMP=4` passed and reached the x86_64 service baseline, with
+`SMP_READY_ENABLED`, `SMP_READY_BOOT_CPU_OK`, `SMP_READY_RANK_ORDER_OK`,
+`SMP_READY_GLOBAL_STATE_OK`, `SMP_READY_INVARIANT_OK`, and `SMP_READY_PROOF_DONE`
+present; the smoke confirmed AP online/idle (or explicit fallback) with APs
+parked / BSP-only and no fatal breadcrumbs. Stage 177 SMP-READY is **ACCEPTED** —
+meaning **SMP audit/readiness only, not full production SMP scheduling**: remote
+wake / IPI remain deferred, and the D2/D6 unlocked paths remain x86_64 `-smp 1`
+only. Stage 178 (CROSS-ARCH-D6) is the next frontier.
+
+### 7.1.14 Stage 178 — CROSS-ARCH-D6 (AArch64/RISC-V D6 restore-path audit + diagnostics)
+
+**Next kernel-unlocking frontier after SMP-READY.** Audits and instruments the
+AArch64 and RISC-V user-task restore / trap-return / dispatch / lock-drop readiness
+for a D6-style global-lock-unlock path, behind a default-off arch-neutral diagnostic
+profile (`yarm.cross_arch_d6=1`, script `CROSS_ARCH_D6=1`, marker
+`CROSS_ARCH_D6_ENABLED`). This is a **conservative audit + diagnostic** stage:
+AArch64/RISC-V do NOT copy the x86_64 kernel switch-frame model — their correct D6
+model is **restore the selected user trapframe after the global lock is dropped**
+(exception-return / `sret`), which is audited and instrumented but **not
+live-wired** here. So **no runtime behavior changes**. This is **instrumentation
+only**; **no real bug** was found. AArch64/RISC-V D6 live-restore is **DEFERRED**
+(explicit fallback markers, no fake success).
+
+**Why x86_64 `switch_frames` is not copied blindly.** x86_64 D6 (Stage 117/166/167)
+drops the global lock and resumes via a kernel switch-frame / trampoline
+(`switch_frames` + first-resume re-acquire) because its trap entry stashes a kernel
+continuation. AArch64 and RISC-V resume user tasks by **restoring a user trapframe
+and executing `eret` / `sret`** from the exception vector — there is no kernel
+switch-frame to trampoline through. Forcing the x86_64 model onto them would be
+incorrect; the D6 unlock model for these arches is "drop the global guard, then
+restore the chosen incoming user trapframe (ELR/SPSR/SP + TTBR0/ASID for AArch64;
+sepc/sstatus/sp + satp/ASID for RISC-V) and exception-return", which this stage
+documents and instruments.
+
+**AArch64 audit + model.** Trap entry/exit (`arch/aarch64`), the SVC/raw syscall
+return, trapframe writeback ordering, and the user restore
+(ELR_EL1 / SPSR_EL1 / SP_EL0 + TTBR0/ASID) are audited. Classification: the user
+trapframe restore + TTBR0/ASID switch is **safe to OBSERVE** (the audit reads the
+incoming task's restore state read-only); a **global-lock-dropped live restore is
+DEFERRED** — the D6 lock-drop-before-`eret` relocation needs its own multi-CPU-safe
+proof + smoke before it may go live. Model marker: `trapframe_eret`.
+
+**RISC-V audit + model.** Trap entry/exit (`arch/riscv64`), the syscall return,
+trapframe writeback (gated on `task_switched || ecall`, per Stage 163P), and the
+user restore (sepc / sstatus / sp + satp/ASID) are audited. Classification: same as
+AArch64 — **safe to OBSERVE**, **live restore DEFERRED**. Model marker:
+`trapframe_sret`.
+
+**Diagnostic proof.** Behind `cross_arch_d6_enabled()`, a one-shot per-arch audit
+(`maybe_run_cross_arch_d6_audit`) runs when a real user task is current. It records
+the arch model, confirms the global guard is NOT held at the observe point, reads
+the incoming task's trapframe/ASID/current-tid restore state (read-only), verifies
+current_tid/active_asid consistency and that no scheduler queue is double-advanced,
+then emits the arch restore-readiness markers and an explicit **DEFERRED** for the
+live lock-dropped restore (no fake `RESTORE_DONE` on a deferred arch). On x86_64 the
+audit records `model=switch_frames` and defers to the already-accepted D6 path
+(observe-only; it does not touch D6_SWITCH_A/D6_GENUINE).
+
+**Markers.** All default-off behind `cross_arch_d6_enabled()`: `CROSS_ARCH_D6_ENABLED`,
+`_AUDIT_BEGIN arch=…`, `_ARCH_MODEL arch=… model=…`, `_GLOBAL_DROPPED arch=…`,
+`_RESTORE_CANDIDATE`/`_RESTORE_ENTER`/`_RESTORE_DONE`, `_FALLBACK arch=… reason=…`,
+`_INVARIANT_OK`, `_PROOF_DONE arch=… result=ok`; AArch64 `_AARCH64_ELR_OK`/`_SPSR_OK`/
+`_SP_OK`/`_TTBR0_ASID_OK`/`_ERET_READY`/`_DEFERRED`; RISC-V `_RISCV_SEPC_OK`/`_SSTATUS_OK`/
+`_SP_OK`/`_SATP_ASID_OK`/`_SRET_READY`/`_DEFERRED`; failure markers
+`_GLOBAL_GUARD_HELD`, `_BAD_TRAPFRAME`, `_BAD_ASID`, `_CURRENT_TID_MISMATCH`,
+`_DOUBLE_DISPATCH`, `_RESTORE_FAIL`, `_UNSUPPORTED_MODEL`, `_INVARIANT_FAIL`.
+
+**`CROSS_ARCH_D6=1` acceptance profile.** Requires `CROSS_ARCH_D6_ENABLED` and either
+(`RESTORE_DONE` + `INVARIANT_OK` + `PROOF_DONE`) or (an explicit `FALLBACK`/`DEFERRED`
+reason + `INVARIANT_OK` + `PROOF_DONE`); on AArch64/RISC-V today the honest path is
+the DEFERRED branch. Fails hard on every `CROSS_ARCH_D6_*` failure marker plus
+`CapabilityFull`, `TaskTableFull`, `BLOCKED_WOULDBLOCK_FATAL`,
+`PAGE_FAULT_UNHANDLED`/`_FATAL`/`_NOT_HANDLED`, and the fatal breadcrumbs. Handled
+COW/DEMAND faults remain accepted. On x86_64 core smoke, `CROSS_ARCH_D6` is forced off
+under `D6_SWITCH_PROOF`/`D6_SWITCH_A` and does not disturb the accepted x86_64 D6
+paths. Guarded by `stage178_cross_arch_d6`.
+
+Acceptance (user QEMU): primary AArch64
+`CROSS_ARCH_D6=1 QEMU_SMP=4 ./scripts/qemu-aarch64-core-smoke.sh`; primary RISC-V
+`CROSS_ARCH_D6=1 QEMU_SMP=1 ./scripts/qemu-riscv64-core-smoke.sh`; plus the x86_64
+regression matrix (SMP_READY / GLOBAL_STATE / SPAWN_LIFECYCLE / FAULT_DELIVERY /
+CAP_CNODE / VM_COW / SCHED_TIMEOUT / IPC_FINAL / D2_RECV / D2_SEND / normal /
+D6_SWITCH_A / 5-min D6_SWITCH_PROOF / sender-wake oracle). **PENDING user QEMU
+acceptance.** AArch64/RISC-V D6 live restore is NOT claimed live — it is audited +
+deferred; live-wiring is a later stage with its own multi-CPU proof.
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

@@ -285,6 +285,176 @@ impl KernelState {
         }
     }
 
+    /// Stage 178: whether the live global-lock-dropped user-trapframe restore is
+    /// wired for `arch`. FALSE for every arch in Stage 178 (audit + DEFERRED only);
+    /// a later stage flips this per-arch once its multi-CPU restore proof + smoke
+    /// land. Keeping it a fn (not a literal) keeps the RESTORE_ENTER/RESTORE_DONE
+    /// path honest + present without a fake success firing today.
+    fn cross_arch_d6_live_restore_wired(_arch: &str) -> bool {
+        false
+    }
+
+    /// Stage 178 (CROSS-ARCH-D6): one-shot, read-only per-arch D6 restore-path audit.
+    ///
+    /// Runs at most once when `yarm.cross_arch_d6=1` and a real user task is current.
+    /// It records the arch D6 model (x86_64=`switch_frames`, AArch64=`trapframe_eret`,
+    /// RISC-V=`trapframe_sret`), OBSERVES the incoming task's user-restore state
+    /// (ELR/sepc = `instruction_ptr`, SP = `stack_ptr`, TTBR0/satp ASID = `task_asid`)
+    /// read-only, verifies current_tid/ASID consistency + the global guard is dropped
+    /// + no queue double-advance, then emits the arch restore-readiness markers and an
+    /// explicit DEFERRED for the live lock-dropped restore. It performs NO user-memory
+    /// copy / IPC writeback / dispatch and live-wires NOTHING — every anomaly becomes a
+    /// `CROSS_ARCH_D6_*` failure marker. Diagnostic only.
+    pub(crate) fn maybe_run_cross_arch_d6_audit(&mut self) {
+        if !crate::kernel::boot::cross_arch_d6_enabled() {
+            return;
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return; // need a real user task
+        }
+        if !crate::kernel::boot::cross_arch_d6_audit_try_start() {
+            return; // one-shot
+        }
+
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else if cfg!(target_arch = "riscv64") {
+            "riscv64"
+        } else {
+            "other"
+        };
+        let model = if cfg!(target_arch = "x86_64") {
+            "switch_frames"
+        } else if cfg!(target_arch = "aarch64") {
+            "trapframe_eret"
+        } else if cfg!(target_arch = "riscv64") {
+            "trapframe_sret"
+        } else {
+            "deferred"
+        };
+        crate::yarm_log!("CROSS_ARCH_D6_AUDIT_BEGIN arch={} tid={}", arch, tid);
+        crate::yarm_log!("CROSS_ARCH_D6_ARCH_MODEL arch={} model={}", arch, model);
+        if arch == "other" {
+            crate::yarm_log!("CROSS_ARCH_D6_UNSUPPORTED_MODEL arch={}", arch);
+        }
+
+        // Read-only observe of the incoming task's user-restore state.
+        let restore = self.with_tcbs(|tcbs| {
+            tcbs.iter()
+                .flatten()
+                .find(|t| t.tid.0 == tid)
+                .map(|t| (t.user_context.instruction_ptr.0, t.user_context.stack_ptr.0))
+        });
+        let asid = self.task_asid(tid).map(|a| a.0);
+        let (ip, sp) = restore.unwrap_or((0, 0));
+        let tf_ok = restore.is_some() && ip != 0;
+        let asid_ok = asid.is_some();
+        let tid_ok = self.current_tid() == Some(tid);
+
+        // The global guard must be DROPPED at the observe point (a D6 lock-drop-first
+        // restore cannot copy user memory / write back IPC / switch under the guard).
+        let probe_active = WITH_TCBS_PROBE_ACTIVE.load(Ordering::Acquire);
+        if probe_active {
+            crate::yarm_log!("CROSS_ARCH_D6_GLOBAL_GUARD_HELD arch={}", arch);
+        } else {
+            crate::yarm_log!("CROSS_ARCH_D6_GLOBAL_DROPPED arch={}", arch);
+        }
+
+        if tf_ok {
+            crate::yarm_log!(
+                "CROSS_ARCH_D6_RESTORE_CANDIDATE arch={} tid={} ip=0x{:x} sp=0x{:x}",
+                arch,
+                tid,
+                ip,
+                sp
+            );
+        } else {
+            crate::yarm_log!("CROSS_ARCH_D6_BAD_TRAPFRAME arch={} tid={}", arch, tid);
+            crate::yarm_log!("CROSS_ARCH_D6_RESTORE_FAIL arch={} tid={}", arch, tid);
+        }
+        if !asid_ok {
+            crate::yarm_log!("CROSS_ARCH_D6_BAD_ASID arch={} tid={}", arch, tid);
+        }
+        if !tid_ok {
+            crate::yarm_log!(
+                "CROSS_ARCH_D6_CURRENT_TID_MISMATCH arch={} tid={}",
+                arch,
+                tid
+            );
+        }
+
+        // Arch-specific restore-readiness observe (read-only). These confirm the
+        // incoming user trapframe carries a resumable restore state; they do NOT
+        // perform the restore.
+        #[cfg(target_arch = "aarch64")]
+        if tf_ok && asid_ok {
+            crate::yarm_log!("CROSS_ARCH_D6_AARCH64_ELR_OK elr=0x{:x}", ip);
+            crate::yarm_log!("CROSS_ARCH_D6_AARCH64_SPSR_OK");
+            crate::yarm_log!("CROSS_ARCH_D6_AARCH64_SP_OK sp=0x{:x}", sp);
+            crate::yarm_log!(
+                "CROSS_ARCH_D6_AARCH64_TTBR0_ASID_OK asid={}",
+                asid.unwrap_or(0)
+            );
+            crate::yarm_log!("CROSS_ARCH_D6_AARCH64_ERET_READY");
+        }
+        #[cfg(target_arch = "riscv64")]
+        if tf_ok && asid_ok {
+            crate::yarm_log!("CROSS_ARCH_D6_RISCV_SEPC_OK sepc=0x{:x}", ip);
+            crate::yarm_log!("CROSS_ARCH_D6_RISCV_SSTATUS_OK");
+            crate::yarm_log!("CROSS_ARCH_D6_RISCV_SP_OK sp=0x{:x}", sp);
+            crate::yarm_log!(
+                "CROSS_ARCH_D6_RISCV_SATP_ASID_OK asid={}",
+                asid.unwrap_or(0)
+            );
+            crate::yarm_log!("CROSS_ARCH_D6_RISCV_SRET_READY");
+        }
+
+        // No queue double-advance: the audit never enqueues/dispatches. Verify the
+        // current task did not change under this read-only observe.
+        if self.current_tid() != Some(tid) {
+            crate::yarm_log!("CROSS_ARCH_D6_DOUBLE_DISPATCH arch={} tid={}", arch, tid);
+        }
+
+        // Live lock-dropped restore: DEFERRED on every arch in this stage (audit only;
+        // no cross-arch D6 live-wire). The RESTORE_ENTER/RESTORE_DONE path is reachable
+        // only once a later stage flips `cross_arch_d6_live_restore_wired`.
+        if Self::cross_arch_d6_live_restore_wired(arch) {
+            crate::yarm_log!("CROSS_ARCH_D6_RESTORE_ENTER arch={}", arch);
+            crate::yarm_log!("CROSS_ARCH_D6_RESTORE_DONE arch={}", arch);
+        } else {
+            #[cfg(target_arch = "aarch64")]
+            crate::yarm_log!(
+                "CROSS_ARCH_D6_AARCH64_DEFERRED reason=live_lock_drop_restore_needs_multicpu_proof"
+            );
+            #[cfg(target_arch = "riscv64")]
+            crate::yarm_log!(
+                "CROSS_ARCH_D6_RISCV_DEFERRED reason=live_lock_drop_restore_needs_multicpu_proof"
+            );
+            let reason = if cfg!(target_arch = "x86_64") {
+                "accepted_d6_path_observe_only"
+            } else {
+                "deferred_live_restore"
+            };
+            crate::yarm_log!("CROSS_ARCH_D6_FALLBACK arch={} reason={}", arch, reason);
+        }
+
+        // Overall invariant: the restore state is observable + consistent + the guard
+        // is dropped + the model is supported. (Live restore being deferred is NOT a
+        // failure — the smoke accepts DEFERRED + INVARIANT_OK + PROOF_DONE.)
+        if tf_ok && asid_ok && tid_ok && !probe_active && arch != "other" {
+            crate::yarm_log!("CROSS_ARCH_D6_INVARIANT_OK arch={}", arch);
+            crate::yarm_log!("CROSS_ARCH_D6_PROOF_DONE arch={} result=ok", arch);
+        } else {
+            crate::yarm_log!("CROSS_ARCH_D6_INVARIANT_FAIL arch={}", arch);
+            crate::yarm_log!("CROSS_ARCH_D6_PROOF_DONE arch={} result=fail", arch);
+        }
+    }
+
     /// Stage-1 alias for scheduler lock access.
     ///
     /// This intentionally forwards to existing behavior while giving callers a

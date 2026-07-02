@@ -44,6 +44,15 @@ while (( $# > 0 )); do
   esac
 done
 
+# Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
+# RISC-V D6 restore-path audit markers (model=trapframe_sret; read-only observe of
+# sepc/sstatus/sp + satp/ASID). Live lock-dropped restore is DEFERRED — the audit
+# records the explicit deferral, not a fake live restore. No behavior change.
+CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}
+if [[ "$CROSS_ARCH_D6" == "1" && "$KERNEL_CMDLINE" != *"yarm.cross_arch_d6="* ]]; then
+  KERNEL_CMDLINE="${KERNEL_CMDLINE:+$KERNEL_CMDLINE }yarm.cross_arch_d6=1"
+fi
+
 require_file_or_warn "$KERNEL_IMAGE" "$QEMU_SMOKE_STRICT" "kernel image"
 require_file_or_warn "$INITRAMFS_IMAGE" "$QEMU_SMOKE_STRICT" "initramfs image"
 
@@ -74,6 +83,76 @@ if run_qemu_timeout_to_log "$TIMEOUT_SECS" "$LOGFILE" "$QEMU_BIN" \
   QEMU_STATUS=0
 else
   QEMU_STATUS=$?
+fi
+
+# Stage 178 (CROSS-ARCH-D6): validate the RISC-V D6 restore-path audit when booted
+# with yarm.cross_arch_d6=1. Honest acceptance: either a live RESTORE_DONE OR an
+# explicit FALLBACK/DEFERRED reason, plus INVARIANT_OK + PROOF_DONE. RISC-V live
+# restore is DEFERRED in Stage 178, so the DEFERRED branch is the expected path.
+cad_has() { [[ -f "$LOGFILE" ]] && tr '\r' '\n' <"$LOGFILE" | rg -a -q -- "$1"; }
+if [[ "$CROSS_ARCH_D6" == "1" ]]; then
+  cross_arch_d6_fail=0
+  echo "[ok] CROSS_ARCH_D6 enabled marker:" $(cad_has "CROSS_ARCH_D6_ENABLED" && echo present || echo MISSING)
+  if ! cad_has "CROSS_ARCH_D6_ENABLED"; then
+    echo "[error] CROSS-ARCH-D6: CROSS_ARCH_D6_ENABLED missing (knob not applied)"
+    cross_arch_d6_fail=1
+  fi
+  for m in "CROSS_ARCH_D6_INVARIANT_OK" "CROSS_ARCH_D6_PROOF_DONE"; do
+    if cad_has "$m"; then
+      echo "[ok] CROSS-ARCH-D6 marker present: $m"
+    else
+      echo "[error] CROSS-ARCH-D6: required marker missing: $m"
+      cross_arch_d6_fail=1
+    fi
+  done
+  if cad_has "CROSS_ARCH_D6_ARCH_MODEL arch=riscv64 model=trapframe_sret"; then
+    echo "[ok] CROSS-ARCH-D6: RISC-V model=trapframe_sret (not switch_frames)"
+  else
+    echo "[warn] CROSS-ARCH-D6: riscv64 trapframe_sret model marker not observed"
+  fi
+  if cad_has "CROSS_ARCH_D6_RESTORE_DONE" || cad_has "CROSS_ARCH_D6_FALLBACK" || cad_has "CROSS_ARCH_D6_RISCV_DEFERRED"; then
+    echo "[ok] CROSS-ARCH-D6: live restore-done or explicit fallback/deferred recorded"
+  else
+    echo "[error] CROSS-ARCH-D6: neither RESTORE_DONE nor an explicit fallback/deferred reason recorded"
+    cross_arch_d6_fail=1
+  fi
+  for f in \
+    "CROSS_ARCH_D6_GLOBAL_GUARD_HELD" \
+    "CROSS_ARCH_D6_BAD_TRAPFRAME" \
+    "CROSS_ARCH_D6_BAD_ASID" \
+    "CROSS_ARCH_D6_CURRENT_TID_MISMATCH" \
+    "CROSS_ARCH_D6_DOUBLE_DISPATCH" \
+    "CROSS_ARCH_D6_RESTORE_FAIL" \
+    "CROSS_ARCH_D6_UNSUPPORTED_MODEL" \
+    "CROSS_ARCH_D6_INVARIANT_FAIL" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if cad_has "$f"; then
+      echo "[error] CROSS-ARCH-D6: fatal marker present: $f"
+      cross_arch_d6_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    cad_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/CROSS_ARCH_D6_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$cad_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] CROSS-ARCH-D6: fatal breadcrumb after cross-arch-d6 wire start: $fatal_pat"
+        cross_arch_d6_fail=1
+      fi
+    done
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$cad_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] CROSS-ARCH-D6: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        cross_arch_d6_fail=1
+      fi
+    done
+  fi
+  if [[ "$cross_arch_d6_fail" -eq 1 ]]; then
+    echo "[error] CROSS-ARCH-D6 mode FAILED"
+    exit 1
+  fi
+  echo "[ok] CROSS-ARCH-D6: RISC-V D6 restore-path audit diagnostics clean (live restore DEFERRED)"
 fi
 
 REQUIRED_PATTERNS=(
