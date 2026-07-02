@@ -22,7 +22,9 @@ QEMU_SMOKE_STRICT=${QEMU_SMOKE_STRICT:-0}
 QEMU_MACHINE=${QEMU_MACHINE:-q35}
 QEMU_CPU=${QEMU_CPU:-qemu64}
 QEMU_MEMORY=${QEMU_MEMORY:-512M}
-# SMP must always be 1; x86_64 SMP is out of scope for this smoke.
+# SMP defaults to 1 (x86_64 SMP is out of scope for the normal smoke). The Stage 177
+# opt-in SMP_READY profile is the ONLY thing that raises this, below, after mode
+# isolation (see the SMP_READY_CPUS override).
 QEMU_SMP=1
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
@@ -49,17 +51,18 @@ CAP_CNODE=${CAP_CNODE:-0}
 FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 GLOBAL_STATE=${GLOBAL_STATE:-0}
+SMP_READY=${SMP_READY:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -67,7 +70,16 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE SMP_READY=$SMP_READY"
+# Stage 177 (SMP-READY): the normal x86_64 core smoke stays -smp 1. Only the opt-in
+# SMP_READY profile (after mode isolation, so a forced-off SMP_READY keeps -smp 1)
+# raises QEMU_SMP to SMP_READY_CPUS (default 2). This is the single place x86_64 SMP
+# is allowed above 1, and only for the audit profile.
+SMP_READY_CPUS=${SMP_READY_CPUS:-2}
+if [[ "$SMP_READY" == "1" ]]; then
+  QEMU_SMP="$SMP_READY_CPUS"
+  echo "[info] SMP-READY profile: raising QEMU_SMP to $QEMU_SMP (SMP_READY_CPUS=$SMP_READY_CPUS)"
+fi
 if [[ "$D6_SWITCH_PROOF" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_proof="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_proof=1"
 fi
@@ -174,6 +186,14 @@ fi
 GLOBAL_STATE=${GLOBAL_STATE:-0}
 if [[ "$GLOBAL_STATE" == "1" && "$KERNEL_CMDLINE" != *"yarm.global_state="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.global_state=1"
+fi
+# Stage 177 (SMP-READY): SMP_READY=1 appends yarm.smp_ready=1 to emit the x86_64
+# SMP-readiness audit markers (AP bring-up mirror + one-shot per-CPU/scheduler/
+# remote-wake/IPI audit; arch-neutral, no behavior change — APs stay parked/BSP-only).
+# Standalone — it does NOT enable any D6/D2 mode.
+SMP_READY=${SMP_READY:-0}
+if [[ "$SMP_READY" == "1" && "$KERNEL_CMDLINE" != *"yarm.smp_ready="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.smp_ready=1"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1527,6 +1547,83 @@ if [[ "$GLOBAL_STATE" == "1" ]]; then
     exit 1
   fi
   echo "[ok] GLOBAL-STATE: global-KernelState mutation audit + lock-rank diagnostics clean"
+fi
+
+# Stage 177 (SMP-READY): when booted with yarm.smp_ready=1, require the x86_64
+# SMP-readiness audit diagnostics. Acceptance is honest per Option A/B: either an AP
+# reaches online/idle OR an explicit AP fallback reason is recorded; the per-CPU /
+# scheduler / rank invariants + PROOF_DONE must be clean. Remote-wake/IPI are
+# DEFERRED (APs stay parked, BSP-only) — not a failure. Handled COW/DEMAND accepted.
+if [[ "$SMP_READY" == "1" ]]; then
+  smp_ready_fail=0
+  echo "[ok] SMP_READY enabled marker:" $(log_has_pattern "SMP_READY_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "SMP_READY_ENABLED"; then
+    echo "[error] SMP-READY: SMP_READY_ENABLED missing (knob not applied)"
+    smp_ready_fail=1
+  fi
+  # Boot CPU + invariant + proof required.
+  for m in \
+    "SMP_READY_BOOT_CPU_OK" \
+    "SMP_READY_RANK_ORDER_OK" \
+    "SMP_READY_GLOBAL_STATE_OK" \
+    "SMP_READY_INVARIANT_OK" \
+    "SMP_READY_PROOF_DONE"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] SMP-READY marker present: $m"
+    else
+      echo "[error] SMP-READY: required marker missing: $m"
+      smp_ready_fail=1
+    fi
+  done
+  # Either an AP came online/idle OR an explicit AP fallback reason was recorded.
+  if log_has_pattern "SMP_READY_AP_ONLINE" || log_has_pattern "SMP_READY_AP_IDLE_OK" || log_has_pattern "SMP_READY_AP_FALLBACK"; then
+    echo "[ok] SMP-READY: AP online/idle or explicit fallback recorded"
+  else
+    echo "[error] SMP-READY: no AP online/idle and no AP fallback reason recorded"
+    smp_ready_fail=1
+  fi
+  # Hard invariant-violation markers (must never appear).
+  for f in \
+    "SMP_READY_AP_BOOT_FAIL" \
+    "SMP_READY_AP_STACK_ALIAS" \
+    "SMP_READY_AP_TSS_BAD" \
+    "SMP_READY_PERCPU_CLOBBER" \
+    "SMP_READY_CURRENT_TID_MISMATCH" \
+    "SMP_READY_ASID_MISMATCH" \
+    "SMP_READY_REMOTE_WAKE_LOST" \
+    "SMP_READY_IPI_LOST" \
+    "SMP_READY_RUNQUEUE_CORRUPT" \
+    "SMP_READY_GLOBAL_GUARD_LEAK" \
+    "SMP_READY_RANK_INVERSION" \
+    "SMP_READY_INVARIANT_FAIL" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] SMP-READY: fatal marker present: $f"
+      smp_ready_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    sr_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/SMP_READY_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$sr_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] SMP-READY: fatal breadcrumb after smp-ready wire start: $fatal_pat"
+        smp_ready_fail=1
+      fi
+    done
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$sr_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] SMP-READY: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        smp_ready_fail=1
+      fi
+    done
+  fi
+  if [[ "$smp_ready_fail" -eq 1 ]]; then
+    echo "[error] SMP-READY mode FAILED"
+    exit 1
+  fi
+  echo "[ok] SMP-READY: x86_64 SMP-readiness audit diagnostics clean (APs parked / BSP-only)"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

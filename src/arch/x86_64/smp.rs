@@ -166,7 +166,7 @@ fn spin_delay(iterations: usize) {
     }
 }
 
-fn ap_stack_top(cpu: CpuId) -> u64 {
+pub(crate) fn ap_stack_top(cpu: CpuId) -> u64 {
     AP_STACK_TOP_BASE + ((cpu.0 as u64 + 1) * AP_STACK_BYTES as u64)
 }
 
@@ -296,6 +296,19 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
             ap_stack_phys_end,
             BOOTSTRAP_LOW_IDENTITY_BYTES
         );
+        // Stage 177 (SMP-READY): the per-CPU AP stack range overflows the identity
+        // window — a real per-CPU stack aliasing / boot hazard.
+        if crate::kernel::boot::smp_ready_enabled() {
+            crate::yarm_log!(
+                "SMP_READY_AP_STACK_ALIAS end=0x{:x} identity_limit=0x{:x}",
+                ap_stack_phys_end,
+                BOOTSTRAP_LOW_IDENTITY_BYTES
+            );
+            crate::yarm_log!(
+                "SMP_READY_AP_BOOT_FAIL cpu={} reason=stack_range_invalid",
+                cpu.0
+            );
+        }
         return None;
     }
 
@@ -401,6 +414,18 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
     let present = kernel.present_cpu_bitmap();
     let mut rust_online_aps = 0usize;
 
+    // Stage 177 (SMP-READY): default-off AP bring-up mirror markers. These honestly
+    // MIRROR the existing X86_AP_* observability (they add no control flow); the AP
+    // stays PARKED and out of the production scheduler (BSP-only is unchanged).
+    let smp_ready = crate::kernel::boot::smp_ready_enabled();
+    if smp_ready {
+        crate::yarm_log!(
+            "SMP_READY_BOOT_CPU_OK cpu={} present=0x{:x}",
+            crate::arch::platform_constants::BOOTSTRAP_CPU_ID,
+            present
+        );
+    }
+
     for raw_cpu in 0..crate::arch::platform_constants::MAX_CPUS {
         let cpu = CpuId(raw_cpu as u8);
 
@@ -412,8 +437,15 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             continue;
         }
 
+        if smp_ready {
+            crate::yarm_log!("SMP_READY_AP_TRAMPOLINE_BEGIN cpu={}", cpu.0);
+        }
+
         let Some(handoff_off) = prepare_trampoline_for_cpu(kernel, cpu) else {
             crate::yarm_log!("YARM_SMP_AP_PREPARE_FAILED cpu={} apic_id={}", cpu.0, cpu.0);
+            if smp_ready {
+                crate::yarm_log!("SMP_READY_AP_FALLBACK cpu={} reason=prepare_failed", cpu.0);
+            }
             continue;
         };
 
@@ -477,11 +509,27 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                 handoff_off
             );
 
+            if smp_ready {
+                crate::yarm_log!(
+                    "SMP_READY_AP_FALLBACK cpu={} reason=trampoline_timeout",
+                    cpu.0
+                );
+            }
             continue;
         }
 
         AP_READY_FLAGS[cpu.0 as usize].store(true, Ordering::Release);
         crate::yarm_log!("X86_AP_TRAMPOLINE_REACHED cpu={}", cpu.0);
+        if smp_ready {
+            // The AP reached the (already-split) trampoline and its unique per-CPU
+            // stack slot is valid.
+            crate::yarm_log!("SMP_READY_AP_ENTRY_OK cpu={}", cpu.0);
+            crate::yarm_log!(
+                "SMP_READY_AP_STACK_OK cpu={} stack_top=0x{:x}",
+                cpu.0,
+                ap_stack_top(cpu)
+            );
+        }
 
         // Pass 2: poll the trampoline `ready_word` for value `2`. The Rust
         // AP entry (`yarm_x86_64_ap_entry`) writes `2` into the same
@@ -512,6 +560,12 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                 "X86_AP_RUST_TIMEOUT cpu={} reason=ap_did_not_publish_online_flag",
                 cpu.0
             );
+            if smp_ready {
+                crate::yarm_log!(
+                    "SMP_READY_AP_FALLBACK cpu={} reason=rust_entry_timeout",
+                    cpu.0
+                );
+            }
             continue;
         }
 
@@ -555,6 +609,27 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         );
         crate::yarm_log!("X86_AP_ONLINE cpu={}", cpu.0);
         crate::yarm_log!("X86_AP_RUST_PARK cpu={} reason=no_ap_scheduler_yet", cpu.0);
+        if smp_ready {
+            // Honest mirrors of the existing X86_AP_* state: the AP's GDT/IDT/TSS are
+            // the trampoline-inherited-while-masked set (safe for a parked, IRQ-masked
+            // AP — NOT a production per-CPU env), the AP is Rust-online, and it idles
+            // in a cli/hlt park loop. It is NOT admitted to the production scheduler
+            // (BSP-only) — recorded as an explicit AP scheduler fallback.
+            crate::yarm_log!(
+                "SMP_READY_AP_GDT_IDT_OK cpu={} reason=trampoline_inherited_while_masked",
+                cpu.0
+            );
+            crate::yarm_log!(
+                "SMP_READY_AP_TSS_OK cpu={} reason=trampoline_inherited_while_masked",
+                cpu.0
+            );
+            crate::yarm_log!("SMP_READY_AP_ONLINE cpu={}", cpu.0);
+            crate::yarm_log!("SMP_READY_AP_IDLE_OK cpu={} reason=cli_hlt_park", cpu.0);
+            crate::yarm_log!(
+                "SMP_READY_AP_FALLBACK cpu={} reason=scheduler_bsp_only",
+                cpu.0
+            );
+        }
         rust_online_aps += 1;
 
         // SAFETY FENCE: the AP is parked in a Rust cli/hlt loop with no

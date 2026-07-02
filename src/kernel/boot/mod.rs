@@ -1113,6 +1113,38 @@ pub(crate) fn global_state_audit_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 177 (SMP-READY): arch-neutral, default-off DIAGNOSTIC gate for the x86_64
+/// SMP-readiness audit (AP bring-up / per-CPU state / remote-wake + IPI readiness)
+/// markers + the one-shot SMP-readiness audit. It changes NO state/ABI/SMP behavior
+/// — only emits SMP_READY_* markers and does NOT bring APs into the production
+/// scheduler (BSP-only stays BSP-only). VALIDATION: SMP_READY_ENABLED.
+pub(crate) static SMP_READY_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 177: one-shot latch so the SMP-readiness audit runs exactly once.
+pub(crate) static SMP_READY_AUDIT_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_smp_ready_enabled(enabled: bool) {
+    SMP_READY_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub fn smp_ready_enabled() -> bool {
+    SMP_READY_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 177: try to claim the one-shot SMP-readiness audit (true exactly once).
+pub(crate) fn smp_ready_audit_try_start() -> bool {
+    SMP_READY_AUDIT_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

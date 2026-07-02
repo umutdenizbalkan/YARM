@@ -990,6 +990,11 @@ impl KernelState {
                 // current; no-op otherwise. Read-only (classifies global roots +
                 // re-checks lock-rank order). Arch-neutral, diagnostic only.
                 self.maybe_run_global_state_audit();
+                // Stage 177 (SMP-READY): one-shot read-only SMP-readiness audit. Runs
+                // at most once when `yarm.smp_ready=1` and a real user task is current;
+                // no-op otherwise. Read-only (per-CPU / scheduler / rank invariants +
+                // honest remote-wake/IPI deferral). Arch-neutral, diagnostic only.
+                self.maybe_run_smp_ready_audit();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

@@ -50221,3 +50221,270 @@ mod stage176_global_state {
         );
     }
 }
+
+// Stage 177 (SMP-READY): toggling the smp_ready marker knob must be a pure
+// diagnostic switch — the accessor round-trips and defaults off, the audit is
+// read-only, and it never admits APs to the production scheduler (BSP-only stays).
+#[test]
+fn stage177_smp_ready_knob_is_pure_diagnostic_toggle() {
+    assert!(
+        !crate::kernel::boot::smp_ready_enabled(),
+        "smp_ready must default off"
+    );
+    crate::kernel::boot::set_smp_ready_enabled(true);
+    assert!(
+        crate::kernel::boot::smp_ready_enabled(),
+        "smp_ready accessor must round-trip"
+    );
+    crate::kernel::boot::set_smp_ready_enabled(false);
+    assert!(
+        !crate::kernel::boot::smp_ready_enabled(),
+        "smp_ready accessor must round-trip back to off"
+    );
+}
+
+// Stage 177 (SMP-READY): source guards over the SMP-readiness knob, the AP bring-up
+// mirror markers, the one-shot audit, the smoke plumbing, and invariants.
+mod stage177_smp_ready {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral gate (pure diagnostic).
+    #[test]
+    fn stage177_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub smp_ready: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.smp_ready"),
+            "yarm.smp_ready must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("SMP_READY_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn smp_ready_enabled() -> bool")
+                && MOD_SRC.contains("fn set_smp_ready_enabled(")
+                && MOD_SRC.contains("fn smp_ready_audit_try_start()"),
+            "SMP_READY gate + accessors + one-shot latch must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.smp_ready")
+            .expect("smp_ready apply block");
+        let block = &CMDLINE_SRC[idx..idx + 600];
+        assert!(
+            block.contains("set_smp_ready_enabled(enabled)") && block.contains("SMP_READY_ENABLED"),
+            "smp_ready apply must set the gate and emit SMP_READY_ENABLED"
+        );
+    }
+
+    // The audit is one-shot, read-only, hooked in the arch-neutral timer path.
+    #[test]
+    fn stage177_audit_hooked_and_readonly() {
+        assert!(
+            FAULT_SRC.contains("self.maybe_run_smp_ready_audit()"),
+            "audit must be driven from the arch-neutral fault/timer path"
+        );
+        assert!(
+            ORCH_SRC.contains("fn maybe_run_smp_ready_audit(")
+                && ORCH_SRC.contains("smp_ready_audit_try_start()")
+                && ORCH_SRC.contains("if tid == 0"),
+            "audit must be one-shot and only run for a real user task (tid != 0)"
+        );
+        // Read-only: no *_mut seam call in the audit body.
+        let idx = ORCH_SRC
+            .find("fn maybe_run_smp_ready_audit(")
+            .expect("audit fn");
+        let body = &ORCH_SRC[idx..idx + 4200];
+        assert!(
+            !body.contains("_mut("),
+            "the SMP-readiness audit must be read-only (no *_mut seam calls)"
+        );
+    }
+
+    // The x86_64 trampoline is already SPLIT from the Rust SMP logic (smp_trampoline);
+    // smp.rs keeps only Rust bring-up + honest AP mirror markers (no fake readiness).
+    #[test]
+    fn stage177_trampoline_split_and_honest_ap_mirrors() {
+        assert!(
+            SMP_SRC.contains("use super::smp_trampoline::"),
+            "the AP trampoline asm must live in the split smp_trampoline module"
+        );
+        // Honest AP mirror markers (gated on smp_ready) + explicit BSP-only fallback.
+        for m in [
+            "SMP_READY_BOOT_CPU_OK",
+            "SMP_READY_AP_TRAMPOLINE_BEGIN",
+            "SMP_READY_AP_ENTRY_OK",
+            "SMP_READY_AP_STACK_OK",
+            "SMP_READY_AP_GDT_IDT_OK",
+            "SMP_READY_AP_TSS_OK",
+            "SMP_READY_AP_ONLINE",
+            "SMP_READY_AP_IDLE_OK",
+            "SMP_READY_AP_FALLBACK",
+            "SMP_READY_AP_STACK_ALIAS",
+            "SMP_READY_AP_BOOT_FAIL",
+        ] {
+            assert!(SMP_SRC.contains(m), "smp.rs must emit AP marker {m}");
+        }
+        // The AP scheduler is NOT broadened: the parked-AP + BSP-only fallback stays.
+        assert!(
+            SMP_SRC.contains("reason=scheduler_bsp_only") && SMP_SRC.contains("X86_AP_RUST_PARK"),
+            "APs must remain parked / BSP-only (no scheduler broadening)"
+        );
+    }
+
+    // Remote-wake / IPI success markers are gated on the (never-today) online>1 path;
+    // the honest deferral is what fires while APs are parked.
+    #[test]
+    fn stage177_remote_wake_ipi_are_honestly_deferred() {
+        let idx = ORCH_SRC
+            .find("if online > 1 {")
+            .expect("online>1 remote-wake gate");
+        let block = &ORCH_SRC[idx..idx + 700];
+        for m in [
+            "SMP_READY_IPI_SEND_OK",
+            "SMP_READY_IPI_RECV_OK",
+            "SMP_READY_REMOTE_WAKE_OK",
+        ] {
+            assert!(
+                block.contains(m),
+                "remote-wake/IPI success {m} must be gated on the online>1 (parked-AP: unreachable) path"
+            );
+        }
+        assert!(
+            ORCH_SRC.contains("SMP_READY_REMOTE_WAKE_DEFERRED")
+                && ORCH_SRC.contains("SMP_READY_IPI_DEFERRED reason=not_live"),
+            "the honest deferral markers must exist"
+        );
+    }
+
+    // All documented marker strings exist verbatim (audit + smp.rs).
+    #[test]
+    fn stage177_all_marker_strings_exist() {
+        for m in [
+            "SMP_READY_AUDIT_BEGIN",
+            "SMP_READY_PERCPU_CURRENT_OK",
+            "SMP_READY_PERCPU_ASID_OK",
+            "SMP_READY_PERCPU_STACK_UNIQUE_OK",
+            "SMP_READY_PERCPU_NO_CLOBBER_OK",
+            "SMP_READY_SCHED_ONLINE_BEGIN",
+            "SMP_READY_SCHED_ONLINE_OK",
+            "SMP_READY_RUNQUEUE_LOCAL_OK",
+            "SMP_READY_REMOTE_WAKE_BEGIN",
+            "SMP_READY_REMOTE_WAKE_DEFERRED",
+            "SMP_READY_IDLE_WITH_RUNNABLE_SAFE",
+            "SMP_READY_IPI_DEFERRED",
+            "SMP_READY_TIMER_CPU_OK",
+            "SMP_READY_GLOBAL_STATE_OK",
+            "SMP_READY_RANK_ORDER_OK",
+            "SMP_READY_INVARIANT_OK",
+            "SMP_READY_PROOF_DONE result=ok",
+            "SMP_READY_PERCPU_CLOBBER",
+            "SMP_READY_CURRENT_TID_MISMATCH",
+            "SMP_READY_ASID_MISMATCH",
+            "SMP_READY_REMOTE_WAKE_LOST",
+            "SMP_READY_IPI_LOST",
+            "SMP_READY_RUNQUEUE_CORRUPT",
+            "SMP_READY_GLOBAL_GUARD_LEAK",
+            "SMP_READY_RANK_INVERSION",
+            "SMP_READY_INVARIANT_FAIL",
+            "SMP_READY_AP_TSS_BAD",
+        ] {
+            assert!(
+                ORCH_SRC.contains(m),
+                "orchestrator audit must emit marker {m}"
+            );
+        }
+        assert!(
+            CMDLINE_SRC.contains("SMP_READY_ENABLED"),
+            "cmdline apply must emit SMP_READY_ENABLED"
+        );
+    }
+
+    // Smoke plumbing: SMP_READY profile raises QEMU_SMP; normal smoke stays -smp 1.
+    #[test]
+    fn stage177_smoke_profile_and_smp1_default() {
+        assert!(
+            SMOKE_SRC.contains("QEMU_SMP=1"),
+            "normal smoke must default to -smp 1"
+        );
+        assert!(
+            SMOKE_SRC.contains("SMP_READY_CPUS=${SMP_READY_CPUS:-2}")
+                && SMOKE_SRC.contains("QEMU_SMP=\"$SMP_READY_CPUS\"")
+                && SMOKE_SRC.contains("yarm.smp_ready=1"),
+            "SMP_READY profile must raise QEMU_SMP to SMP_READY_CPUS (default 2)"
+        );
+        for m in [
+            "SMP_READY_ENABLED",
+            "SMP_READY_BOOT_CPU_OK",
+            "SMP_READY_INVARIANT_OK",
+            "SMP_READY_PROOF_DONE",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require {m}");
+        }
+        for f in [
+            "SMP_READY_AP_BOOT_FAIL",
+            "SMP_READY_AP_STACK_ALIAS",
+            "SMP_READY_PERCPU_CLOBBER",
+            "SMP_READY_CURRENT_TID_MISMATCH",
+            "SMP_READY_ASID_MISMATCH",
+            "SMP_READY_REMOTE_WAKE_LOST",
+            "SMP_READY_IPI_LOST",
+            "SMP_READY_RUNQUEUE_CORRUPT",
+            "SMP_READY_GLOBAL_GUARD_LEAK",
+            "SMP_READY_RANK_INVERSION",
+            "SMP_READY_INVARIANT_FAIL",
+        ] {
+            assert!(SMOKE_SRC.contains(f), "smoke must gate on {f}");
+        }
+        // Mode isolation forces SMP_READY off under D6 proof/switch-a (keeps -smp 1).
+        assert!(
+            SMOKE_SRC.contains("GLOBAL_STATE SMP_READY"),
+            "mode isolation must force SMP_READY off under D6 proof/switch-a"
+        );
+    }
+
+    // Invariants + no scope creep; prior-stage gates preserved.
+    #[test]
+    fn stage177_invariants_and_regressions_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        assert!(
+            SMOKE_SRC.contains("yarm.vm_cow=1")
+                && SMOKE_SRC.contains("yarm.cap_cnode=1")
+                && SMOKE_SRC.contains("yarm.fault_delivery=1")
+                && SMOKE_SRC.contains("yarm.spawn_lifecycle=1")
+                && SMOKE_SRC.contains("yarm.global_state=1"),
+            "VM-COW/CAP-CNODE/FAULT-DELIVERY/SPAWN-LIFECYCLE/GLOBAL-STATE gates must remain"
+        );
+    }
+
+    // Docs: Stage 176 accepted + Stage 177 section.
+    #[test]
+    fn stage177_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 177 — SMP-READY"),
+            "doc must add the Stage 177 SMP-READY section"
+        );
+        assert!(
+            DOC_SRC.contains("GLOBAL-STATE primary\nis **ACCEPTED**")
+                || DOC_SRC.contains("GLOBAL-STATE primary is **ACCEPTED**"),
+            "doc must record Stage 176 primary accepted"
+        );
+        assert!(
+            DOC_SRC.contains("BSP-only") && DOC_SRC.contains("parked"),
+            "doc must state APs stay parked / BSP-only"
+        );
+    }
+}

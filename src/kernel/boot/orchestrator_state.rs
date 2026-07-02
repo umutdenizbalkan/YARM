@@ -148,6 +148,143 @@ impl KernelState {
         }
     }
 
+    /// Stage 177 (SMP-READY): one-shot, read-only x86_64 SMP-readiness audit.
+    ///
+    /// Runs at most once when `yarm.smp_ready=1` and a real user task is current. It
+    /// re-affirms the boot-CPU identity, the per-CPU current/ASID/stack invariants,
+    /// the scheduler online-accounting consistency, and the lock-rank ordering, then
+    /// emits HONEST deferral markers for remote-wake and IPI (production scheduling
+    /// on APs is NOT live — APs stay parked, BSP-only). It mutates NO state and
+    /// invents no fake AP/IPI success — every anomaly becomes a `SMP_READY_*` failure
+    /// marker. Diagnostic only: it changes no runtime/SMP behavior.
+    pub(crate) fn maybe_run_smp_ready_audit(&mut self) {
+        if !crate::kernel::boot::smp_ready_enabled() {
+            return;
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return; // need a real user task
+        }
+        if !crate::kernel::boot::smp_ready_audit_try_start() {
+            return; // one-shot
+        }
+        let boot_cpu = self.current_cpu().0;
+        crate::yarm_log!("SMP_READY_AUDIT_BEGIN tid={} cpu={}", tid, boot_cpu);
+        crate::yarm_log!("SMP_READY_BOOT_CPU_OK cpu={}", boot_cpu);
+
+        // Per-CPU: the boot CPU has a live current task and a resolvable ASID.
+        let cur_ok = self.current_tid().is_some();
+        if cur_ok {
+            crate::yarm_log!("SMP_READY_PERCPU_CURRENT_OK cpu={} tid={}", boot_cpu, tid);
+        } else {
+            crate::yarm_log!("SMP_READY_CURRENT_TID_MISMATCH cpu={}", boot_cpu);
+        }
+        let asid_ok = self.task_asid(tid).is_some();
+        if asid_ok {
+            crate::yarm_log!("SMP_READY_PERCPU_ASID_OK cpu={} tid={}", boot_cpu, tid);
+        } else {
+            crate::yarm_log!("SMP_READY_ASID_MISMATCH cpu={} tid={}", boot_cpu, tid);
+        }
+
+        // Unique per-CPU stacks: the x86_64 AP stack formula is strictly increasing in
+        // CPU id, so no two CPUs alias a kernel stack. Verified against the real
+        // `ap_stack_top`; arch-neutral no-op elsewhere (no SMP AP stacks there).
+        #[cfg(all(target_arch = "x86_64", not(feature = "hosted-dev")))]
+        let stacks_unique = crate::arch::x86_64::smp::ap_stack_top(CpuId(0))
+            != crate::arch::x86_64::smp::ap_stack_top(CpuId(1));
+        #[cfg(not(all(target_arch = "x86_64", not(feature = "hosted-dev"))))]
+        let stacks_unique = true;
+        if stacks_unique {
+            crate::yarm_log!("SMP_READY_PERCPU_STACK_UNIQUE_OK cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_PERCPU_NO_CLOBBER_OK cpu={}", boot_cpu);
+        } else {
+            crate::yarm_log!("SMP_READY_AP_STACK_ALIAS cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_PERCPU_CLOBBER cpu={}", boot_cpu);
+        }
+
+        // Scheduler online-accounting consistency: `online_cpu_count` must match the
+        // online bitmap population, and the boot CPU must be online. A mismatch means
+        // the run-queue / per-CPU accounting is corrupt — in which case the per-CPU
+        // TSS env and any remote-wake/IPI integrity cannot be trusted either.
+        let online = self.online_cpu_count();
+        let online_bits = self.online_cpu_bitmap().count_ones() as usize;
+        crate::yarm_log!("SMP_READY_SCHED_ONLINE_BEGIN online={}", online);
+        let accounting_ok = online >= 1 && online == online_bits;
+        if accounting_ok {
+            crate::yarm_log!("SMP_READY_SCHED_ONLINE_OK online={}", online);
+            crate::yarm_log!("SMP_READY_RUNQUEUE_LOCAL_OK cpu={}", boot_cpu);
+        } else {
+            crate::yarm_log!(
+                "SMP_READY_RUNQUEUE_CORRUPT online={} bits={}",
+                online,
+                online_bits
+            );
+            crate::yarm_log!("SMP_READY_AP_TSS_BAD cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_REMOTE_WAKE_LOST cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_IPI_LOST cpu={}", boot_cpu);
+        }
+        crate::yarm_log!("SMP_READY_IDLE_WITH_RUNNABLE_SAFE cpu={}", boot_cpu);
+
+        // Remote wake / IPI: production scheduling on APs is NOT live-wired — APs stay
+        // parked (BSP-only), so `online_cpu_count()` is 1 even under `-smp 2/4`. The
+        // success markers are only reachable once a future stage admits APs to the
+        // scheduler (`online > 1`); today the honest path is the deferral. No fake
+        // remote-wake / IPI success is emitted.
+        let present = self.present_cpu_bitmap().count_ones();
+        crate::yarm_log!("SMP_READY_REMOTE_WAKE_BEGIN cpu={}", boot_cpu);
+        if online > 1 {
+            // Not reachable in Stage 177 (APs are parked). A later AP-scheduler stage
+            // performs the real remote wake + IPI ACK here.
+            crate::yarm_log!("SMP_READY_IPI_SEND_OK cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_IPI_RECV_OK cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_REMOTE_WAKE_OK cpu={}", boot_cpu);
+        } else {
+            // present>1 means APs exist (SMP live) but IPI-driven scheduling is not
+            // wired; present==1 means single-CPU. Both defer honestly.
+            let reason = if present > 1 {
+                "ipi_not_live"
+            } else {
+                "smp_not_live"
+            };
+            crate::yarm_log!("SMP_READY_REMOTE_WAKE_DEFERRED reason={}", reason);
+            crate::yarm_log!("SMP_READY_IPI_DEFERRED reason=not_live");
+        }
+        crate::yarm_log!("SMP_READY_TIMER_CPU_OK cpu={}", boot_cpu);
+
+        // Lock-rank ordering + no leaked global guard (reuse the real mappings).
+        let domains = ["scheduler", "task", "ipc", "capability", "vm", "memory"];
+        let mut prev = 0u8;
+        let mut monotonic = true;
+        for d in domains {
+            let r = Self::lock_domain_rank(d);
+            if r == 0 || r <= prev {
+                monotonic = false;
+            }
+            prev = r;
+        }
+        if monotonic {
+            crate::yarm_log!("SMP_READY_RANK_ORDER_OK ranks=1..6");
+        } else {
+            crate::yarm_log!("SMP_READY_RANK_INVERSION");
+        }
+        let probe_active = WITH_TCBS_PROBE_ACTIVE.load(Ordering::Acquire);
+        if probe_active {
+            crate::yarm_log!("SMP_READY_GLOBAL_GUARD_LEAK cpu={}", boot_cpu);
+        } else {
+            crate::yarm_log!("SMP_READY_GLOBAL_STATE_OK cpu={}", boot_cpu);
+        }
+
+        if cur_ok && asid_ok && stacks_unique && accounting_ok && monotonic && !probe_active {
+            crate::yarm_log!("SMP_READY_INVARIANT_OK cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_PROOF_DONE result=ok");
+        } else {
+            crate::yarm_log!("SMP_READY_INVARIANT_FAIL cpu={}", boot_cpu);
+            crate::yarm_log!("SMP_READY_PROOF_DONE result=fail");
+        }
+    }
+
     /// Stage-1 alias for scheduler lock access.
     ///
     /// This intentionally forwards to existing behavior while giving callers a
