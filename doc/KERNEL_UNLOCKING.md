@@ -6621,7 +6621,44 @@ is a large low-level effort whose acceptance is entirely QEMU-SMP runs.
   in the single-CPU fast path today. **Category C** — must be proven once APs are live.
 - AArch64/RISC-V in-lock. **Category F — Stage 184**, out of scope here.
 
-**This increment (Task 6.A — establish the SMP baseline + audit, no guard flip).**
+**Increment 2 — AP scheduler *idle* admission (GS-initialized, interrupt-masked idle).**
+Host QEMU confirmed increment 1 (`-smp 2/4`: present=N online=1, APs parked, BSP graduated
+path green, no fallback). Increment 2 admits the APs out of the bare park loop into a
+**GS-initialized, interrupt-masked Rust idle loop** — idle-live only, no D2/D6 SMP seams.
+
+- Internal proof path (NOT a user knob): `smp_trampoline::AP_IDLE_ADMIT_PROOF` (compile-time
+  const). `-smp 1` has no APs, so production is unchanged.
+- The AP entry stays **100% inline asm** (the AP runs on the bootstrap PML4 — text + low
+  identity only, no `.bss`/`.data`/MMIO, CR4 has only PAE so no SSE). The BSP passes the
+  per-CPU record base through the (low, identity-mapped) `ApHandoff.percpu_record_ptr`, so
+  the AP can `wrmsr IA32_GS_BASE` + `rdmsr` readback-verify it **without any higher-half
+  access**, then publish its admit stage into the low `ready_word` and enter `cli/hlt`.
+- **TSS / local-APIC / APIC-timer stay DEFERRED** (`X86_AP_TSS_DEFERRED` /
+  `X86_AP_LAPIC_DEFERRED` / `X86_AP_LAPIC_TIMER_DEFERRED`) — they need a switch to the full
+  kernel CR3 + a per-CPU GDT TSS descriptor + LAPIC MMIO, which is the next increment. The
+  idle loop is interrupt-masked, so none are required for safe idle.
+- The BSP is the single serial writer (no AP log garbling): it polls the AP's admit stage
+  and emits `X86_AP_SCHED_ADMIT_BEGIN` / `X86_AP_GS_OK`|`X86_AP_GS_BAD` /
+  `X86_AP_TSS_DEFERRED` / `X86_AP_LAPIC_DEFERRED` / `X86_AP_LAPIC_TIMER_DEFERRED` /
+  `X86_AP_IDLE_ENTER` / `X86_AP_SCHED_ADMIT_DONE` (or `X86_AP_SCHED_ADMIT_FAIL` /
+  `X86_AP_IDLE_FAIL` on timeout).
+- **`ap_idle_live` is a SEPARATE count from `online_cpu_count()`**: these APs idle with
+  interrupts masked and are **NOT admitted to the production scheduler** (`bring_up_cpu` is
+  still BSP-only), so `online` stays 1, `single_cpu` stays true, and **no task is ever
+  enqueued onto an idle-only AP**. The SMP audit reports `X86_SMP_AP_IDLE_LIVE present=N
+  online=1 ap_idle_live=M` + `X86_SMP_UNLOCK_DONE result=ap_idle_live`, with the next
+  blocker `category=B reason=ap_full_scheduler_admission_required`.
+- Smoke (`-smp >1`) requires the admission markers + `result=ap_idle_live`, forbids
+  `X86_AP_GS_BAD` / `X86_AP_IDLE_FAIL` / `X86_AP_SCHED_ADMIT_FAIL` and any premature
+  `X86_SMP_APS_ADMITTED`. Guarded by `stage183_ap_idle_admit`.
+
+Risk/limitation: the AP bring-up path is only validatable on the host's `-smp 2/4` QEMU
+(none in the dev env). It is default-on for SMP boots so `smp2-core` exercises it directly;
+a fault would surface as an admit-stage timeout (`X86_AP_SCHED_ADMIT_FAIL`) rather than a
+silent hang, since the BSP poll is bounded. D2/D6 SMP-live remains gated behind full
+scheduler admission (next increments); `single_cpu` is NOT relaxed.
+
+**Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
   `smp4-sender-wake` profiles (`x86_64 2|4 …`); the x86_64 core smoke now honors

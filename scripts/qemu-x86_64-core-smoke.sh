@@ -1908,18 +1908,40 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" \
     "UNLOCK_GRADUATED_FALLBACK path=" \
     "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" \
-    "X86_SMP_ONLINE_ACCOUNTING_BAD"; do
+    "X86_SMP_ONLINE_ACCOUNTING_BAD" \
+    "X86_AP_GS_BAD" \
+    "X86_AP_IDLE_FAIL" \
+    "X86_AP_SCHED_ADMIT_FAIL"; do
     if log_has_pattern "$f"; then
       echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
       exit 1
     fi
   done
-  # If APs are admitted (aps_live) the graduated path must show no in-lock fallback.
-  if log_has_pattern "X86_SMP_APS_ADMITTED" && ! log_has_pattern "X86_SMP_UNLOCK_DONE result=aps_live"; then
-    echo "[error] SMP-LIVE: APs admitted but SMP-unlock verdict is not aps_live"
+  # Stage 183 increment 2: AP idle admission. The APs must leave the bare park loop and
+  # reach the GS-initialized, interrupt-masked idle loop. Require the admission markers +
+  # the GS-verified idle-live verdict (interrupt-masked, NOT scheduler-runnable yet).
+  for m in \
+    "X86_AP_SCHED_ADMIT_BEGIN" \
+    "X86_AP_GS_OK" \
+    "X86_AP_IDLE_ENTER" \
+    "X86_AP_SCHED_ADMIT_DONE"; do
+    if ! log_has_pattern "$m"; then
+      echo "[error] SMP-LIVE: AP idle-admission marker missing: $m"
+      exit 1
+    fi
+    echo "[ok] SMP-LIVE: AP admission marker present: $m"
+  done
+  if ! log_has_pattern "X86_SMP_UNLOCK_DONE result=ap_idle_live"; then
+    echo "[error] SMP-LIVE: expected X86_SMP_UNLOCK_DONE result=ap_idle_live (AP idle admission)"
     exit 1
   fi
-  echo "[ok] SMP-LIVE: no fallback/opt-out/in-lock-dispatch fired under -smp $QEMU_SMP"
+  # Scheduler admission (TSS/LAPIC/timer + online>1) is intentionally the NEXT increment:
+  # online must remain 1 (APs idle-live only, not scheduler-runnable).
+  if log_has_pattern "X86_SMP_APS_ADMITTED"; then
+    echo "[error] SMP-LIVE: APs must be idle-live only this increment, not scheduler-admitted"
+    exit 1
+  fi
+  echo "[ok] SMP-LIVE: APs reached GS-initialized idle admission; no fallback under -smp $QEMU_SMP"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

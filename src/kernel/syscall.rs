@@ -5816,7 +5816,7 @@ mod tests {
             "fallback assembly park must remain as defense-in-depth"
         );
         assert!(
-            tramp_src.contains("Emit '@' (Rust-entered breadcrumb)"),
+            tramp_src.contains("Rust-entered breadcrumb"),
             "Rust AP entry must emit the @ breadcrumb on entry"
         );
         let smp_src = include_str!("../arch/x86_64/smp.rs");

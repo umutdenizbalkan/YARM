@@ -52325,7 +52325,7 @@ mod stage183_smp_live {
         assert!(
             SMOKE_SRC.contains("QEMU_SMP=${QEMU_SMP:-1}")
                 && SMOKE_SRC.contains("X86_SMP_UNLOCK_DONE")
-                && SMOKE_SRC.contains("SMP-LIVE: no fallback/opt-out/in-lock-dispatch fired"),
+                && SMOKE_SRC.contains("no fallback under -smp"),
             "smoke must honor QEMU_SMP + assert the SMP verdict + forbid fallback"
         );
         assert!(
@@ -52368,6 +52368,115 @@ mod stage183_smp_live {
         assert!(
             DOC_SRC.contains("Stage 183"),
             "doc must record Stage 183 SMP-LIVE"
+        );
+    }
+}
+
+// Stage 183 increment 2 (AP idle admission): source guards proving APs are admitted to a
+// GS-initialized, interrupt-masked Rust idle loop via an internal proof path (no user
+// knob), tracked as a SEPARATE ap_idle_live count (NOT scheduler-online, so single_cpu
+// stays true), with TSS/LAPIC/timer explicitly deferred.
+mod stage183_ap_idle_admit {
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
+    const TRAMP_SRC: &str = include_str!("../../arch/x86_64/smp_trampoline.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+
+    // The AP entry admits via an internal compile-time proof const (not a user knob) and
+    // writes IA32_GS_BASE from the handoff (no higher-half .bss access) then idles.
+    #[test]
+    fn stage183_ap_entry_gs_admit_is_internal_proof_path() {
+        assert!(
+            TRAMP_SRC.contains("const AP_IDLE_ADMIT_PROOF: bool = true")
+                && TRAMP_SRC.contains("percpu_record_ptr: u64"),
+            "AP idle admission must be an internal const + handoff-passed per-CPU record ptr"
+        );
+        // The AP writes GS base via wrmsr IA32_GS_BASE and verifies via rdmsr readback.
+        assert!(
+            TRAMP_SRC.contains("0xC0000101")
+                && TRAMP_SRC.contains("wrmsr")
+                && TRAMP_SRC.contains("rdmsr"),
+            "AP entry must wrmsr+rdmsr IA32_GS_BASE for the GS-verified admit"
+        );
+        // It stays a 100%-asm, interrupt-masked idle loop (no SSE / .bss / IDT needed).
+        assert!(
+            TRAMP_SRC.contains("hlt") && TRAMP_SRC.contains("cli"),
+            "AP idle loop must remain a cli/hlt interrupt-masked loop"
+        );
+        // NOT a user boot knob: the const is internal; no yarm.* AP-admit knob exists.
+        assert!(
+            !TRAMP_SRC.contains("yarm.ap_") && !SMP_SRC.contains("yarm.ap_"),
+            "AP admission must not be selectable by a user boot knob"
+        );
+    }
+
+    // ap_idle_live is a SEPARATE count from scheduler online; scheduler stays BSP-only
+    // (no bring_up_cpu for APs) so single_cpu remains true and no task strands on an AP.
+    #[test]
+    fn stage183_ap_idle_live_is_not_scheduler_online() {
+        assert!(
+            SMP_SRC.contains("static AP_IDLE_LIVE_COUNT: AtomicUsize")
+                && SMP_SRC.contains("pub fn ap_idle_live_count() -> usize"),
+            "a separate ap_idle_live count must exist"
+        );
+        assert!(
+            !SMP_SRC.contains("kernel.bring_up_cpu(cpu)")
+                && !SMP_SRC.contains(".bring_up_cpu(cpu)"),
+            "APs must NOT be admitted to the production scheduler (BSP-only) this increment"
+        );
+        // The audit reports ap_idle_live without claiming aps_live (scheduler admission).
+        assert!(
+            ORCH_SRC.contains("ap_idle_live_count()")
+                && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=ap_idle_live"),
+            "the SMP audit must report the ap_idle_live verdict"
+        );
+    }
+
+    // The full AP admission marker set + failure markers exist; TSS/LAPIC/timer deferred.
+    #[test]
+    fn stage183_ap_admission_markers_present() {
+        for m in [
+            "X86_AP_SCHED_ADMIT_BEGIN",
+            "X86_AP_GS_OK",
+            "X86_AP_GS_BAD",
+            "X86_AP_TSS_DEFERRED",
+            "X86_AP_LAPIC_DEFERRED",
+            "X86_AP_LAPIC_TIMER_DEFERRED",
+            "X86_AP_IDLE_ENTER",
+            "X86_AP_SCHED_ADMIT_DONE",
+            "X86_AP_SCHED_ADMIT_FAIL",
+            "X86_AP_IDLE_FAIL",
+        ] {
+            assert!(SMP_SRC.contains(m), "AP admission marker must exist: {m}");
+        }
+        // Smoke requires the admission + forbids the failure markers under -smp >1.
+        assert!(
+            SMOKE_SRC.contains("X86_AP_IDLE_ENTER")
+                && SMOKE_SRC.contains("result=ap_idle_live")
+                && SMOKE_SRC.contains("X86_AP_GS_BAD")
+                && SMOKE_SRC.contains("X86_AP_IDLE_FAIL"),
+            "smoke must require AP idle admission + forbid the AP failure markers"
+        );
+        // Increment 2 must NOT claim scheduler admission (online stays 1).
+        assert!(
+            SMOKE_SRC.contains("must be idle-live only this increment, not scheduler-admitted"),
+            "smoke must reject premature scheduler admission this increment"
+        );
+    }
+
+    // Counts/limits unchanged (no ABI/limit drift from the SMP bring-up).
+    #[test]
+    fn stage183_inc2_counts_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
         );
     }
 }

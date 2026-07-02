@@ -6,7 +6,7 @@ use crate::kernel::scheduler::CpuId;
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Stage 108 / Milestone 2 Pass 1: the AP trampoline (16/32/64-bit startup
 // assembly + trampoline-page encoding) lives in the sibling module
@@ -49,6 +49,18 @@ const INIT_TO_SIPI_DELAY_ITERS: usize = 5_000_000;
 
 static AP_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
     [const { AtomicBool::new(false) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Stage 183 increment 2: count of APs that reached the GS-initialized, interrupt-masked
+/// Rust IDLE-ADMISSION loop (GS-base written + verified). This is DISTINCT from the
+/// scheduler `online_cpu_count()`: these APs idle with interrupts masked and are NOT
+/// admitted to the production scheduler, so `single_cpu` stays true and no task is ever
+/// enqueued onto them. The Stage 183 SMP-liveness audit reports this as `ap_idle_live`.
+static AP_IDLE_LIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of APs currently in the GS-initialized idle-admission loop (Stage 183 inc.2).
+pub fn ap_idle_live_count() -> usize {
+    AP_IDLE_LIVE_COUNT.load(Ordering::Acquire)
+}
 
 fn lapic_mmio_base() -> usize {
     super::platform_layout::LAPIC_MMIO_BASE
@@ -336,6 +348,9 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
         ready_flag_ptr: 0,
         ready_word: 0,
         reserved: 0,
+        // Stage 183 inc.2: per-CPU record base for this AP, so its Rust entry can
+        // wrmsr IA32_GS_BASE without a higher-half .bss access.
+        percpu_record_ptr: super::percpu::record_base(cpu) as u64,
     };
 
     crate::yarm_log!(
@@ -540,8 +555,10 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         // is mirrored for hosted-dev tests.
         let mut rust_online = false;
         for _ in 0..AP_READY_POLL_ITERS {
+            // Stage 183 inc.2: the AP fast-forwards ready_word past the trampoline's `2`
+            // (online) to its idle-admit stage, so accept `>= 2` for the online signal.
             #[cfg(all(not(test), not(feature = "hosted-dev")))]
-            let online = unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } == 2;
+            let online = unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) } >= 2;
             #[cfg(any(test, feature = "hosted-dev"))]
             let online =
                 super::smp_trampoline::AP_RUST_ONLINE[cpu.0 as usize].load(Ordering::Acquire);
@@ -608,7 +625,69 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
             cpu.0
         );
         crate::yarm_log!("X86_AP_ONLINE cpu={}", cpu.0);
+
+        // Stage 183 increment 2: poll the AP's idle-admission stage (published into the
+        // low identity-mapped ready_word by yarm_x86_64_ap_entry) and emit the admission
+        // markers BSP-side (single serial writer — no AP-side log garbling). The AP wrote
+        // its GS base (IA32_GS_BASE = per-CPU record) and verified it via rdmsr readback
+        // before entering the cli/hlt idle loop. TSS / local-APIC / APIC-timer stay
+        // DEFERRED (they need a CR3 switch to the full kernel map + MMIO — next increment).
+        #[cfg(all(not(test), not(feature = "hosted-dev")))]
+        {
+            use super::smp_trampoline::{
+                AP_IDLE_ADMIT_PROOF, AP_STAGE_IDLE_ADMIT_GS_BAD, AP_STAGE_IDLE_ADMIT_OK,
+            };
+            if AP_IDLE_ADMIT_PROOF {
+                crate::yarm_log!("X86_AP_SCHED_ADMIT_BEGIN cpu={}", cpu.0);
+                let mut stage = 0u32;
+                for _ in 0..AP_READY_POLL_ITERS {
+                    let v = unsafe { read_volatile(ap_ready_word_low_virt(handoff_off)) };
+                    if v == AP_STAGE_IDLE_ADMIT_OK || v == AP_STAGE_IDLE_ADMIT_GS_BAD {
+                        stage = v;
+                        break;
+                    }
+                    cpu_relax();
+                }
+                if stage == AP_STAGE_IDLE_ADMIT_OK {
+                    crate::yarm_log!("X86_AP_GS_OK cpu={}", cpu.0);
+                } else if stage == AP_STAGE_IDLE_ADMIT_GS_BAD {
+                    crate::yarm_log!("X86_AP_GS_BAD cpu={}", cpu.0);
+                } else {
+                    // The AP never published a terminal admit stage → it did not reach idle.
+                    crate::yarm_log!(
+                        "X86_AP_SCHED_ADMIT_FAIL cpu={} reason=admit_stage_timeout",
+                        cpu.0
+                    );
+                    crate::yarm_log!("X86_AP_IDLE_FAIL cpu={}", cpu.0);
+                }
+                if stage == AP_STAGE_IDLE_ADMIT_OK || stage == AP_STAGE_IDLE_ADMIT_GS_BAD {
+                    // TSS / LAPIC / APIC-timer remain deferred this increment.
+                    crate::yarm_log!(
+                        "X86_AP_TSS_DEFERRED cpu={} reason=needs_kernel_cr3_and_gdt_desc",
+                        cpu.0
+                    );
+                    crate::yarm_log!(
+                        "X86_AP_LAPIC_DEFERRED cpu={} reason=needs_kernel_cr3_and_mmio",
+                        cpu.0
+                    );
+                    crate::yarm_log!(
+                        "X86_AP_LAPIC_TIMER_DEFERRED cpu={} reason=ap_idle_interrupts_masked",
+                        cpu.0
+                    );
+                    crate::yarm_log!("X86_AP_IDLE_ENTER cpu={} reason=cli_hlt_idle", cpu.0);
+                    crate::yarm_log!("X86_AP_SCHED_ADMIT_DONE cpu={}", cpu.0);
+                    // Only a GS-verified admit counts as clean idle-live.
+                    if stage == AP_STAGE_IDLE_ADMIT_OK {
+                        AP_IDLE_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+                    }
+                }
+            } else {
+                crate::yarm_log!("X86_AP_RUST_PARK cpu={} reason=no_ap_scheduler_yet", cpu.0);
+            }
+        }
+        #[cfg(any(test, feature = "hosted-dev"))]
         crate::yarm_log!("X86_AP_RUST_PARK cpu={} reason=no_ap_scheduler_yet", cpu.0);
+
         if smp_ready {
             // Honest mirrors of the existing X86_AP_* state: the AP's GDT/IDT/TSS are
             // the trampoline-inherited-while-masked set (safe for a parked, IRQ-masked
