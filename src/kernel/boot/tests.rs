@@ -51747,7 +51747,7 @@ mod stage181c_fork_internal {
         let idx = ORCH_SRC
             .find("fn unlock_graduated_d3_scratch_check")
             .expect("scratch check fn");
-        let block = &ORCH_SRC[idx..idx + 3400];
+        let block = &ORCH_SRC[idx..idx + 5200];
         assert!(
             block.contains("drop_revoke_scratch_cache_for_cnode(cnode)")
                 && block.contains("UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED"),
@@ -51761,6 +51761,42 @@ mod stage181c_fork_internal {
         assert!(
             CAP_SRC.contains("pub fn drop_revoke_scratch_cache(&mut self) -> bool"),
             "CapabilitySpace must expose drop_revoke_scratch_cache"
+        );
+    }
+
+    // The scratch check emits proof-gated per-step PT-pool snapshots so any residual net
+    // delta is attributed to a specific step (create/mint/map/unmap/revoke/destroy/drop),
+    // not just the whole-proof BEFORE/AFTER total.
+    #[test]
+    fn stage181c_scratch_check_has_per_step_pool_snapshots() {
+        let idx = ORCH_SRC
+            .find("fn unlock_graduated_d3_scratch_check")
+            .expect("scratch check fn");
+        let block = &ORCH_SRC[idx..idx + 6400];
+        assert!(
+            block.contains("UNLOCK_GRADUATED_D3_STEP step="),
+            "scratch check must emit per-step PT-pool snapshots"
+        );
+        for label in [
+            "after_create_aspace",
+            "after_alloc_mo",
+            "after_map",
+            "after_unmap",
+            "after_revoke_mem_cap",
+            "after_destroy_aspace",
+            "after_revoke_aspace_cap",
+            "after_drop_revoke_scratch",
+        ] {
+            assert!(
+                block.contains(label),
+                "scratch check must snapshot the step boundary"
+            );
+        }
+        // The per-step snapshots stay behind the sender-wake proof gate (no core-smoke
+        // noise) — they must NOT be emitted unconditionally.
+        assert!(
+            block.contains("ipc_recv_proof_sender_wake_active()"),
+            "per-step snapshots must be gated on the sender-wake sub-knob"
         );
     }
 
@@ -51883,7 +51919,7 @@ mod stage181c_fork_internal {
         let idx = ORCH_SRC
             .find("fn unlock_graduated_d3_scratch_check")
             .expect("scratch check fn");
-        let block = &ORCH_SRC[idx..idx + 4600];
+        let block = &ORCH_SRC[idx..idx + 6400];
         assert!(
             block.contains("aspace_cap_leak")
                 && block.contains("capability_for_cnode_local(cnode, aspace_cap)"),

@@ -429,6 +429,19 @@ if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
     diagnose_sender_wake
   fi
   proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
+  # Stage 181C: advisory — even when sender-wake PASSES, surface any residual graduated
+  # one-shot proof PT-pool leak + the per-step breakdown so the net delta is localized.
+  # (This does not change pass/fail; the kernel's UNLOCK_GRADUATED_POOL_LEAK guard is the
+  # authoritative signal and is intentionally NOT silenced here.)
+  if marker_present "UNLOCK_GRADUATED_POOL_LEAK"; then
+    echo "[warn] ipc-oracle: graduated one-shot proof still shows a residual PT-pool delta:"
+    echo "[warn]   $(rg -N -a "UNLOCK_GRADUATED_POOL_BEFORE|UNLOCK_GRADUATED_POOL_AFTER|UNLOCK_GRADUATED_POOL_LEAK" "$ANALYSIS_LOG" | tail -n3)"
+    if marker_present "UNLOCK_GRADUATED_D3_STEP"; then
+      echo "[warn]   per-step PT-pool trace (attributes the residual to a step):"
+      rg -N -a "UNLOCK_GRADUATED_D3_STEP|UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED" "$ANALYSIS_LOG" \
+        | sed 's/^/[warn]     /'
+    fi
+  fi
 else
   echo "[info] ipc-oracle: proof sender-wake: not required"
 fi

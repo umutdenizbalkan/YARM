@@ -6400,9 +6400,49 @@ the graduated path now matches the opt-out path's pre-fork pool headroom. The
 else weakened: graduation still on, oracle unweakened, PT pool / `MAX_ADDRESS_SPACES` /
 cnode-slot / task limits unchanged, `AllocFailed`/`CapabilityFull` still surfaced.
 Guarded by `stage181c_fork_internal` + `drop_revoke_scratch_cache_releases_and_rebuilds`.
-**Stage 181 acceptance pends the confirming graduated QEMU run** (expected: no
-`UNLOCK_GRADUATED_POOL_LEAK`, `FORK_COW_DONE`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`,
-`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; opt-out still green).
+
+**Stage 181C — functional regression FIXED; residual 3-frame guard delta under
+investigation (PARTIAL).** The confirming graduated QEMU run showed the functional
+fix holds and the big leak is gone, but the guard still fires on a small residual:
+
+```
+UNLOCK_GRADUATED_POOL_BEFORE pt_pool_free_frames=186
+UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED cnode=2 dropped=true
+UNLOCK_GRADUATED_POOL_AFTER  pt_pool_free_frames=183 before=186
+UNLOCK_GRADUATED_POOL_LEAK   pt_pool_frames_leaked=3
+FORK_COW_BEGIN parent_tid=1 pt_pool_free_frames=35
+FORK_COW_DONE  child_tid=10008
+IPC_RECV_V2_SENDER_WAKE_ORDER_OK / IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE  (PASS)
+```
+Opt-out passes with identical fork-entry headroom (35). The 14→0 revoke-scratch-cache
+leak is fixed and sender-wake passes under graduated default-on; a residual **3**
+PT-pool frames remain net-consumed inside the one-shot proof.
+
+Analysis: the scratch address space is net-zero on PT frames — `remove_asid` →
+`free_table_hierarchy` returns the root + all intermediate page-table frames
+synchronously at destroy, and opt-out exercises the same primitives. `drop_revoke_
+scratch_cache` returns the three *large-alloc* RevokeScratch Vecs (`child_heads`,
+`next_sibling`, `stack`) directly to the PT pool, but `RevokeScratch.marked`
+(`Vec<bool>`, 512 B) is a *small-slab* allocation that leaves a reusable warm page,
+and `map`/`unmap`/`destroy` internals touch small-slab classes too. The residual 3 are
+therefore most likely **reusable slab warm pages** (the slab keeps one warm empty page
+per size class the proof first touched), which `pt_pool_free_frames` counts as
+unavailable even though a later allocation of that class reuses them.
+
+To attribute it precisely (not guess), the scratch check now emits **proof-gated
+per-step PT-pool snapshots** `UNLOCK_GRADUATED_D3_STEP step=<entry|after_create_aspace|
+after_alloc_mo|after_map|after_unmap|after_revoke_mem_cap|after_destroy_aspace|
+after_revoke_aspace_cap|after_drop_revoke_scratch> pt_pool_free_frames=N`, and the
+oracle surfaces the residual `UNLOCK_GRADUATED_POOL_LEAK` + the per-step trace as an
+advisory when it still fires. The kernel guard is **NOT** weakened or silenced.
+
+Next: with the per-step deltas the residual is localized to a specific step, then
+either eliminated at source (e.g. a leaf-cap delete that skips the RevokeScratch build,
+or a targeted small-slab reclaim) or, if proven to be irreducible reusable slab warm
+pages, the guard is adjusted with a precise documented warm-page-floor invariant (still
+firing above the floor) — never a blanket silence. **Stage 181 stays PARTIAL** until
+`UNLOCK_GRADUATED_POOL_LEAK` no longer fires (or is superseded by that documented
+invariant), with sender-wake + opt-out both green.
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

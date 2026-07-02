@@ -697,6 +697,22 @@ impl KernelState {
     /// + unmapped + reclaimed a scratch page with no leak. Emits `UNLOCK_GRADUATED_D3_*`
     /// failure markers on a real anomaly. Self-contained; consumes no net resources.
     fn unlock_graduated_d3_scratch_check(&mut self, cnode: CNodeId) -> bool {
+        // Stage 181C: per-step PT-pool snapshots (proof-gated on the sender-wake sub-knob
+        // so normal/core-smoke boots stay quiet). The kernel slab heap draws its backing
+        // pages from the PT frame pool, so this attributes any residual net delta to a
+        // specific scratch-check step (aspace create / cap mint / map / unmap / revoke /
+        // destroy / cache drop) instead of only the whole-proof BEFORE/AFTER total.
+        let step_trace = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+        let step = |label: &str| {
+            if step_trace {
+                crate::yarm_log!(
+                    "UNLOCK_GRADUATED_D3_STEP step={} pt_pool_free_frames={}",
+                    label,
+                    crate::kernel::frame_allocator::pt_pool_free_frames()
+                );
+            }
+        };
+        step("entry");
         let vaddr = VirtAddr(0x5100_0000);
         let (asid, aspace_cap) = match self.create_user_address_space() {
             Ok(pair) => pair,
@@ -705,6 +721,7 @@ impl KernelState {
                 return false;
             }
         };
+        step("after_create_aspace");
         let (mo_id, mem_cap) = match self.alloc_anonymous_memory_object() {
             Ok(pair) => pair,
             Err(_) => {
@@ -714,16 +731,22 @@ impl KernelState {
                 return false;
             }
         };
+        step("after_alloc_mo");
         let mapped = self
             .map_user_page_in_asid_with_caps(asid, mem_cap, vaddr, PageFlags::USER_RW)
             .is_ok()
             && self
                 .is_user_page_mapped_in_asid(asid, vaddr)
                 .unwrap_or(false);
+        step("after_map");
         let unmapped = matches!(self.unmap_user_page_in_asid(asid, vaddr), Ok(Some(_)));
+        step("after_unmap");
         let _ = self.revoke_capability_in_cnode(cnode, mem_cap);
+        step("after_revoke_mem_cap");
         let _ = self.destroy_user_address_space_by_asid(asid);
+        step("after_destroy_aspace");
         let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+        step("after_revoke_aspace_cap");
         // Stage 181C ROOT-CAUSE FIX: the two revokes above lazily built and CACHED a
         // per-cspace RevokeScratch working set on the CURRENT (init) cnode. For a
         // 512-slot cspace that scratch is ~12 pages pulled from the PT frame pool that
@@ -740,6 +763,7 @@ impl KernelState {
             cnode.0,
             scratch_dropped
         );
+        step("after_drop_revoke_scratch");
         // Stage 181C: verify NO net resource is left behind. Previously the aspace_cap
         // (minted by `create_user_address_space` into the current cnode) was revoked but
         // NOT leak-checked, so a stale aspace-cap slot could shrink the caller's cnode
