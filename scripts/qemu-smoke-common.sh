@@ -81,3 +81,64 @@ check_required_patterns() {
   done
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# Stage 180 (CI-PROFILES): shared fatal-marker policy helpers.
+#
+# Additive only — existing scripts keep their own inline gates; these give the
+# unified profile runner (and any new script) a single source of truth for the
+# fatal-marker taxonomy documented in doc/KERNEL_UNLOCKING.md §7.1.16.
+#
+# A generic PAGE_FAULT is NOT fatal: a handled COW/DEMAND fault emits many benign
+# PAGE_FAULT_* diagnostics (ENTRY / HW_REGS / FRAME_WORDS / FRAME_DECODE /
+# HW_PTE_WALK / RAW / X86_ERROR / CR3_COMPARE) before HANDLED_COW/HANDLED_DEMAND.
+# Only the EXPLICIT unhandled/fatal markers are fatal.
+# ---------------------------------------------------------------------------
+
+# Returns 0 (true) if the log contains a hard crash breadcrumb.
+log_has_fatal_breadcrumb() {
+  local logfile="$1"
+  [[ -f "$logfile" ]] || return 1
+  local tail
+  tail="$(tr '\r' '\n' <"$logfile")"
+  local pat
+  for pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+    if printf '%s\n' "$tail" | rg -a -q -- "$pat"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Returns 0 (true) if the log contains an EXPLICIT unhandled/fatal page fault.
+# Generic + handled PAGE_FAULT_* diagnostics do NOT match.
+log_has_unhandled_page_fault() {
+  local logfile="$1"
+  [[ -f "$logfile" ]] || return 1
+  local tail
+  tail="$(tr '\r' '\n' <"$logfile")"
+  local pat
+  for pat in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+    if printf '%s\n' "$tail" | rg -a -F -q -- "$pat"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Returns 0 (true) if the log contains any of the profile-specific / common
+# failure markers passed as arguments (fixed-string match, binary-safe).
+log_has_profile_failure() {
+  local logfile="$1"
+  shift
+  [[ -f "$logfile" ]] || return 1
+  local tail
+  tail="$(tr '\r' '\n' <"$logfile")"
+  local marker
+  for marker in "$@"; do
+    if printf '%s\n' "$tail" | rg -a -F -q -- "$marker"; then
+      return 0
+    fi
+  done
+  return 1
+}

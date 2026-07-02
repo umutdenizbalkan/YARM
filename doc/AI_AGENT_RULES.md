@@ -614,6 +614,38 @@ containers, remote agent sandboxes), the stage summary MUST say so explicitly
 ("QEMU not available; smoke not run"). It is **not** acceptable to claim a
 smoke result that was not actually executed.
 
+### 13.7 Acceptance rules for default-off diagnostic knobs (Stage 180 CI-PROFILES)
+
+The Stage 163P / 166–179 diagnostic profiles are collected into a single runner,
+`scripts/run-ci-profiles.sh` (`list` / `quick` / `full` / `extended` / individual
+profile names; `--dry-run`, `--keep-going`, `--logs-dir`, `--timeout`, `--build`).
+The shared fatal-marker policy lives in `scripts/qemu-smoke-common.sh`
+(`log_has_fatal_breadcrumb`, `log_has_unhandled_page_fault`,
+`log_has_profile_failure`). The following acceptance rules are BINDING:
+
+1. **No stage is "ACCEPTED" without QEMU/user evidence.** A green `cargo test` and
+   `--dry-run` are necessary but never sufficient; record the actual QEMU markers.
+2. **The `*_ENABLED` marker alone is NOT acceptance.** A profile is accepted only
+   when its invariant + proof/done markers are present (e.g. `*_INVARIANT_OK` +
+   `*_PROOF_DONE result=ok`), plus the profile-specific required sequence.
+3. **Handled `PAGE_FAULT_*` diagnostics are NOT fatal.** Only
+   `PAGE_FAULT_UNHANDLED` / `PAGE_FAULT_FATAL` / `PAGE_FAULT_NOT_HANDLED` are fatal
+   page-fault markers (see `log_has_unhandled_page_fault`); the benign
+   `PAGE_FAULT_ENTRY`/`_HW_REGS`/`_FRAME_WORDS`/`_FRAME_DECODE`/`_HW_PTE_WALK`/`_RAW`/
+   `_X86_ERROR`/`_CR3_COMPARE` and the handled `_HANDLED_COW`/`_HANDLED_DEMAND` are
+   not (Stage 171B/173B/175B/178B narrowing).
+4. **Default-off knobs are isolated under `D6_SWITCH_PROOF` / `D6_SWITCH_A`.** The
+   x86_64 core smoke forces every lower-risk diagnostic knob off under those two
+   proof modes; `SMP_READY` raises `QEMU_SMP` only for its own profile (normal smoke
+   stays `-smp 1`); `CROSS_ARCH_D6` does not disturb x86_64 D6 paths.
+5. **Counts are frozen:** SYSCALL_COUNT=31, Syscall::VARIANT_COUNT=23, x86_64
+   MAX_ADDRESS_SPACES=32. Any stage that would change these must justify it
+   explicitly; the diagnostic/CI stages never do.
+
+QEMU CI is **local/manual-first**: the runner is safe to invoke without QEMU via
+`list` and `--dry-run` (CI-safe); real QEMU jobs, if added, must be
+`workflow_dispatch`/nightly, never a mandatory PR gate.
+
 ---
 
 ## 14. Kernel Unlocking Live-Path Rules (Stage 104–106)

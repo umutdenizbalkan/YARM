@@ -51123,3 +51123,218 @@ mod stage179_d3_full {
         );
     }
 }
+
+// Stage 180 (CI-PROFILES): source guards over the unified profile runner, the shared
+// fatal-marker policy helpers, and the acceptance-rule invariants. Tooling only — no
+// kernel behavior; these assert the runner/policy shape and that no gate was weakened.
+mod stage180_ci_profiles {
+    const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
+    const COMMON_SRC: &str = include_str!("../../../scripts/qemu-smoke-common.sh");
+    const X86_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+    const RULES_SRC: &str = include_str!("../../../doc/AI_AGENT_RULES.md");
+
+    // The runner exists, is strict-mode bash, and exposes the documented commands.
+    #[test]
+    fn stage180_runner_shape() {
+        assert!(
+            RUNNER_SRC.contains("set -euo pipefail"),
+            "runner must use bash strict mode"
+        );
+        for cmd in ["list", "quick", "full", "extended"] {
+            assert!(
+                RUNNER_SRC.contains(cmd),
+                "runner must support the {cmd} command/group"
+            );
+        }
+        for opt in [
+            "--dry-run",
+            "--keep-going",
+            "--logs-dir",
+            "--timeout",
+            "--build",
+        ] {
+            assert!(
+                RUNNER_SRC.contains(opt),
+                "runner must support the {opt} option"
+            );
+        }
+        // It calls the existing scripts (no logic duplication).
+        assert!(
+            RUNNER_SRC.contains("qemu-x86_64-core-smoke.sh")
+                && RUNNER_SRC.contains("qemu-aarch64-core-smoke.sh")
+                && RUNNER_SRC.contains("qemu-riscv64-core-smoke.sh")
+                && RUNNER_SRC.contains("qemu-ipc-recv-v2-oracle-smoke.sh"),
+            "runner must invoke the existing smoke scripts"
+        );
+        // A final PASS/FAIL/SKIP summary + nonzero exit on failure.
+        assert!(
+            RUNNER_SRC.contains("CI PROFILE SUMMARY")
+                && RUNNER_SRC.contains("OVERALL_RC")
+                && RUNNER_SRC.contains("exit \"$OVERALL_RC\""),
+            "runner must print a summary and exit nonzero on failure"
+        );
+    }
+
+    // Every accepted profile is registered, and the groups include the expected names.
+    #[test]
+    fn stage180_profile_inventory_complete() {
+        for p in [
+            "x86_64-core",
+            "aarch64-core",
+            "riscv64-core",
+            "sender-wake",
+            "ipc-final",
+            "d6-switch-a",
+            "d6-switch-proof",
+            "d6-genuine",
+            "d2-recv",
+            "d2-send",
+            "sched-timeout",
+            "vm-cow",
+            "cap-cnode",
+            "fault-delivery",
+            "spawn-lifecycle",
+            "global-state",
+            "smp-ready",
+            "smp-ready-4",
+            "cross-arch-d6-aarch64",
+            "cross-arch-d6-riscv64",
+            "d3-full",
+        ] {
+            assert!(RUNNER_SRC.contains(p), "profile registry must include {p}");
+        }
+        // quick group is declared and includes its expected members.
+        let qidx = RUNNER_SRC
+            .find("QUICK_PROFILES=(")
+            .expect("QUICK_PROFILES group");
+        let qblock = &RUNNER_SRC[qidx..qidx + 120];
+        for p in [
+            "x86_64-core",
+            "sender-wake",
+            "d2-recv",
+            "d2-send",
+            "d3-full",
+        ] {
+            assert!(qblock.contains(p), "quick group must include {p}");
+        }
+        // d6-switch-proof carries the 5-min timeout; smp-ready and cross-arch aarch64
+        // carry raised SMP; the rest default to -smp 1.
+        assert!(
+            RUNNER_SRC.contains("d6-switch-proof)        echo \"x86_64 1 300 core"),
+            "d6-switch-proof must default to a 300s timeout at -smp 1"
+        );
+        assert!(
+            RUNNER_SRC.contains("smp-ready)              echo \"x86_64 2 120")
+                && RUNNER_SRC.contains("cross-arch-d6-aarch64)  echo \"aarch64 4 120"),
+            "SMP_READY runs -smp 2 and cross-arch-d6 aarch64 runs -smp 4"
+        );
+        // normal x86_64 core stays -smp 1.
+        assert!(
+            RUNNER_SRC.contains("x86_64-core)            echo \"x86_64 1 120 core"),
+            "normal x86_64 core profile must stay -smp 1"
+        );
+    }
+
+    // The shared fatal-marker policy helpers exist and the page-fault helper is
+    // narrowed to the EXPLICIT unhandled/fatal markers (no generic PAGE_FAULT).
+    #[test]
+    fn stage180_fatal_marker_policy() {
+        for helper in [
+            "log_has_fatal_breadcrumb()",
+            "log_has_unhandled_page_fault()",
+            "log_has_profile_failure()",
+        ] {
+            assert!(
+                COMMON_SRC.contains(helper),
+                "common lib must define {helper}"
+            );
+        }
+        // The page-fault helper matches only the explicit markers.
+        let idx = COMMON_SRC
+            .find("log_has_unhandled_page_fault()")
+            .expect("pf helper");
+        let body = &COMMON_SRC[idx..idx + 500];
+        for m in [
+            "PAGE_FAULT_UNHANDLED",
+            "PAGE_FAULT_FATAL",
+            "PAGE_FAULT_NOT_HANDLED",
+        ] {
+            assert!(body.contains(m), "pf helper must gate on {m}");
+        }
+        // It must NOT treat the benign diagnostics as fatal.
+        for benign in [
+            "PAGE_FAULT_HW_REGS",
+            "PAGE_FAULT_FRAME_WORDS",
+            "PAGE_FAULT_ENTRY",
+            "PAGE_FAULT_HANDLED_COW",
+        ] {
+            assert!(
+                !body.contains(benign),
+                "benign diagnostic {benign} must not be in the unhandled-page-fault helper"
+            );
+        }
+        // The fatal-breadcrumb helper uses the line-anchored crash tokens.
+        let bidx = COMMON_SRC
+            .find("log_has_fatal_breadcrumb()")
+            .expect("breadcrumb helper");
+        let bbody = &COMMON_SRC[bidx..bidx + 400];
+        assert!(
+            bbody.contains("'^!Fv'") && bbody.contains("'^!BNv'") && bbody.contains("DOUBLE_FAULT"),
+            "breadcrumb helper must use the line-anchored crash tokens"
+        );
+    }
+
+    // Accepted smoke gates are NOT removed: the x86_64 core smoke still carries every
+    // per-stage profile gate + mode isolation for the full diagnostic-knob set.
+    #[test]
+    fn stage180_accepted_gates_not_weakened() {
+        for gate in [
+            "yarm.vm_cow=1",
+            "yarm.cap_cnode=1",
+            "yarm.fault_delivery=1",
+            "yarm.spawn_lifecycle=1",
+            "yarm.global_state=1",
+            "yarm.smp_ready=1",
+            "yarm.cross_arch_d6=1",
+            "yarm.d3_full=1",
+        ] {
+            assert!(
+                X86_SMOKE_SRC.contains(gate),
+                "x86_64 smoke must still plumb {gate}"
+            );
+        }
+        // Mode isolation forces the whole diagnostic set off under D6 proof/switch-a.
+        assert!(
+            X86_SMOKE_SRC.contains("SMP_READY CROSS_ARCH_D6 D3_FULL"),
+            "mode isolation must still force the full diagnostic set off under D6 proof/switch-a"
+        );
+    }
+
+    // Counts frozen + docs/rules record the CI-profiles milestone + acceptance rules.
+    #[test]
+    fn stage180_counts_and_docs() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 180 — CI-PROFILES")
+                && (DOC_SRC.contains("D3-FULL is **ACCEPTED**")
+                    || DOC_SRC.contains("D3-FULL\nis **ACCEPTED**")),
+            "doc must add Stage 180 + record Stage 179 accepted"
+        );
+        assert!(
+            RULES_SRC.contains("Acceptance rules for default-off diagnostic knobs")
+                && RULES_SRC.contains("marker alone is NOT acceptance"),
+            "AI_AGENT_RULES must record the Stage 180 acceptance rules"
+        );
+    }
+}
