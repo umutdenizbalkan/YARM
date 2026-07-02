@@ -44868,7 +44868,7 @@ mod stage163j_fork_return_lane {
         let handler = PROCESS_SRC
             .split("fn handle_fork")
             .nth(1)
-            .map(|s| &s[..s.len().min(1200)])
+            .map(|s| &s[..s.len().min(1800)])
             .expect("handle_fork body");
         assert!(
             handler.contains("frame.set_ok(") && handler.contains("usize::try_from(child_tid)"),
@@ -51689,6 +51689,167 @@ mod stage181b_sender_wake_plumbing {
         assert!(
             DOC_SRC.contains("Stage 181B") && DOC_SRC.contains("PARTIAL (user QEMU, 2026)"),
             "doc must record Stage 181 PARTIAL + Stage 181B plumbing fix"
+        );
+    }
+}
+
+// Stage 181C: fork Internal under graduated default-on. Source guards proving the
+// fork/COW failure is now surfaced with a normalized reason (FORK_COW_FAIL reason=),
+// the oracle triages a fork failure distinctly from an absent workload, the graduated
+// D3 scratch proof leak-check covers the aspace cap (no net ASID/cap/frame/MO leak),
+// and the sender-wake profile/opt-out policy + counts are unchanged.
+mod stage181c_fork_internal {
+    const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
+    const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const X86_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The kernel maps the terminal fork/COW KernelError to a stable reason token and
+    // emits FORK_COW_BEGIN / FORK_COW_FAIL reason=<token> / FORK_COW_DONE. This exposes
+    // the real cause behind the opaque `Internal` (err=255) without changing behavior.
+    #[test]
+    fn stage181c_fork_failure_markers_include_reason() {
+        assert!(
+            PROCESS_SRC.contains("FORK_COW_BEGIN")
+                && PROCESS_SRC.contains("FORK_COW_DONE")
+                && PROCESS_SRC.contains("FORK_COW_FAIL reason="),
+            "handle_fork must emit FORK_COW_BEGIN/FORK_COW_FAIL reason=/FORK_COW_DONE"
+        );
+        assert!(
+            PROCESS_SRC.contains("fn fork_cow_fail_reason"),
+            "a normalized KernelError->reason mapping must exist"
+        );
+        // The mapping must cover the capacity variants that collapse to Internal so the
+        // reason is never itself opaque: asid_full / cow_capacity / task_full / cap_full.
+        for tok in [
+            "\"asid_full\"",
+            "\"cow_capacity\"",
+            "\"task_full\"",
+            "\"cap_full\"",
+            "\"current_tid\"",
+        ] {
+            assert!(
+                PROCESS_SRC.contains(tok),
+                "fork_cow_fail_reason must map a reason token"
+            );
+        }
+    }
+
+    // The mapping stays behind the proof gate (no normal-boot log noise).
+    #[test]
+    fn stage181c_fork_markers_are_proof_gated() {
+        let begin = PROCESS_SRC.find("FORK_COW_BEGIN").expect("FORK_COW_BEGIN");
+        // Walk back to the nearest `if proof {` guard; it must be within a small window.
+        let pre = &PROCESS_SRC[begin.saturating_sub(700)..begin];
+        assert!(
+            pre.contains("if proof {"),
+            "FORK_COW_BEGIN must be emitted under the sender-wake proof gate"
+        );
+        assert!(
+            PROCESS_SRC.contains("ipc_recv_proof_sender_wake_active()"),
+            "fork diagnostics gate on the sender-wake sub-knob"
+        );
+    }
+
+    // The oracle triages a started-but-fork-failed run distinctly from workload absent,
+    // and prints the fork failure + nearest kernel reason (Task F).
+    #[test]
+    fn stage181c_oracle_reports_fork_failed_distinctly() {
+        assert!(
+            ORACLE_SRC.contains("diagnose_sender_wake() {"),
+            "oracle must have a sender-wake triage helper"
+        );
+        assert!(
+            ORACLE_SRC.contains("WORKLOAD ABSENT")
+                && ORACLE_SRC.contains("WORKLOAD STARTED but FORK FAILED"),
+            "oracle must distinguish workload-absent from fork-failed"
+        );
+        assert!(
+            ORACLE_SRC.contains("IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED")
+                && ORACLE_SRC.contains("FORK_COW_FAIL reason="),
+            "oracle must key on the fork-failed marker and surface the FORK_COW_FAIL reason"
+        );
+        // Triage runs when the sequence did not complete, immediately before the
+        // proof_require "sender-wake" report (ordered snippet proves the sequencing).
+        assert!(
+            ORACLE_SRC.contains("diagnose_sender_wake\n  fi\n  proof_require \"sender-wake\""),
+            "triage must run (guarded by missing-sequence) right before proof_require"
+        );
+    }
+
+    // The graduated D3 scratch proof now leak-checks the aspace cap too (Task C#3 / G):
+    // no net ASID/cap/frame/MO consumption from the graduated one-shot proof.
+    #[test]
+    fn stage181c_graduated_scratch_checks_aspace_cap_leak() {
+        let idx = ORCH_SRC
+            .find("fn unlock_graduated_d3_scratch_check")
+            .expect("scratch check fn");
+        let block = &ORCH_SRC[idx..idx + 3400];
+        assert!(
+            block.contains("aspace_cap_leak")
+                && block.contains("capability_for_cnode_local(cnode, aspace_cap)"),
+            "scratch check must leak-check the aspace cap, not only the mem cap"
+        );
+        assert!(
+            block.contains("mem_cap_leak") && block.contains("mo_leak"),
+            "scratch check must still leak-check the mem cap + memory object"
+        );
+        assert!(
+            block.contains("UNLOCK_GRADUATED_D3_LEAK"),
+            "scratch check must still emit the leak marker on a real anomaly"
+        );
+    }
+
+    // Policy preserved: sender-wake profile does NOT opt out, and the emergency opt-out
+    // env still flows through the oracle to the core smoke (not forced graduated).
+    #[test]
+    fn stage181c_policy_optout_supported_not_forced() {
+        // sender-wake profile does not force UNLOCK_GRADUATED=0.
+        let sidx = RUNNER_SRC
+            .find("sender-wake)            echo")
+            .expect("sender-wake field");
+        assert!(
+            !RUNNER_SRC[sidx..sidx + 90].contains("UNLOCK_GRADUATED=0"),
+            "sender-wake profile must not force opt-out"
+        );
+        // The oracle must NOT unset/override the isolation env (it passes through to core
+        // smoke), so opt-out + per-seam bisect modes are supported by invocation.
+        assert!(
+            !ORACLE_SRC.contains("unset UNLOCK_GRADUATED")
+                && !ORACLE_SRC.contains("UNLOCK_GRADUATED=0 \"$CORE_SMOKE\""),
+            "oracle must not force graduation on/off — env passes through to core smoke"
+        );
+        // Core smoke reads the tri-state opt-out from the environment.
+        assert!(
+            X86_SMOKE_SRC.contains("UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-}"),
+            "core smoke must honor the UNLOCK_GRADUATED opt-out env"
+        );
+    }
+
+    // Counts unchanged + graduation not weakened.
+    #[test]
+    fn stage181c_counts_and_graduation_unchanged() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        // The umbrella still graduates the accepted seams together (not disabled).
+        assert!(
+            X86_SMOKE_SRC.contains("yarm.ipc_recv_proof_sender_wake=1"),
+            "core smoke still appends the sender-wake sub-knob"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 181C"),
+            "doc must record the Stage 181C fork-Internal investigation"
         );
     }
 }
