@@ -1145,6 +1145,38 @@ pub(crate) fn smp_ready_audit_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 178 (CROSS-ARCH-D6): arch-neutral, default-off DIAGNOSTIC gate for the
+/// AArch64/RISC-V D6 restore-path audit (user trapframe / exception-return / dispatch
+/// / lock-drop readiness) markers + the one-shot per-arch restore-readiness audit. It
+/// changes NO state/ABI/dispatch behavior and does NOT live-wire any cross-arch D6
+/// restore — only emits CROSS_ARCH_D6_* markers. VALIDATION: CROSS_ARCH_D6_ENABLED.
+pub(crate) static CROSS_ARCH_D6_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 178: one-shot latch so the cross-arch D6 audit runs exactly once.
+pub(crate) static CROSS_ARCH_D6_AUDIT_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_cross_arch_d6_enabled(enabled: bool) {
+    CROSS_ARCH_D6_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn cross_arch_d6_enabled() -> bool {
+    CROSS_ARCH_D6_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 178: try to claim the one-shot cross-arch D6 audit (true exactly once).
+pub(crate) fn cross_arch_d6_audit_try_start() -> bool {
+    CROSS_ARCH_D6_AUDIT_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

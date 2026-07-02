@@ -995,6 +995,12 @@ impl KernelState {
                 // no-op otherwise. Read-only (per-CPU / scheduler / rank invariants +
                 // honest remote-wake/IPI deferral). Arch-neutral, diagnostic only.
                 self.maybe_run_smp_ready_audit();
+                // Stage 178 (CROSS-ARCH-D6): one-shot read-only per-arch D6 restore-path
+                // audit. Runs at most once when `yarm.cross_arch_d6=1` and a real user
+                // task is current; no-op otherwise. Read-only (observes the incoming
+                // task's trapframe/ASID restore state + honest per-arch DEFERRED). It
+                // live-wires no restore. Arch-neutral, diagnostic only.
+                self.maybe_run_cross_arch_d6_audit();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

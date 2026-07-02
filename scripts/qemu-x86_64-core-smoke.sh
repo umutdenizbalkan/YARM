@@ -52,17 +52,18 @@ FAULT_DELIVERY=${FAULT_DELIVERY:-0}
 SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 GLOBAL_STATE=${GLOBAL_STATE:-0}
 SMP_READY=${SMP_READY:-0}
+CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -70,7 +71,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE SMP_READY=$SMP_READY"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE SMP_READY=$SMP_READY CROSS_ARCH_D6=$CROSS_ARCH_D6"
 # Stage 177 (SMP-READY): the normal x86_64 core smoke stays -smp 1. Only the opt-in
 # SMP_READY profile (after mode isolation, so a forced-off SMP_READY keeps -smp 1)
 # raises QEMU_SMP to SMP_READY_CPUS (default 2). This is the single place x86_64 SMP
@@ -194,6 +195,15 @@ fi
 SMP_READY=${SMP_READY:-0}
 if [[ "$SMP_READY" == "1" && "$KERNEL_CMDLINE" != *"yarm.smp_ready="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.smp_ready=1"
+fi
+# Stage 178 (CROSS-ARCH-D6): CROSS_ARCH_D6=1 appends yarm.cross_arch_d6=1 to emit the
+# per-arch D6 restore-path audit markers (arch-neutral; no behavior change / no
+# cross-arch D6 live-wire). On x86_64 the audit records model=switch_frames and defers
+# to the ALREADY-ACCEPTED D6 path (observe-only; it does NOT touch D6_SWITCH_A/GENUINE).
+# Standalone — it does NOT enable any D6/D2 mode.
+CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}
+if [[ "$CROSS_ARCH_D6" == "1" && "$KERNEL_CMDLINE" != *"yarm.cross_arch_d6="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.cross_arch_d6=1"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1624,6 +1634,73 @@ if [[ "$SMP_READY" == "1" ]]; then
     exit 1
   fi
   echo "[ok] SMP-READY: x86_64 SMP-readiness audit diagnostics clean (APs parked / BSP-only)"
+fi
+
+# Stage 178 (CROSS-ARCH-D6): when booted with yarm.cross_arch_d6=1, require the
+# per-arch D6 restore-path audit diagnostics. Acceptance is honest: either a live
+# RESTORE_DONE OR an explicit FALLBACK/DEFERRED reason, plus INVARIANT_OK + PROOF_DONE.
+# On x86_64 the audit records model=switch_frames and the accepted-D6 observe-only
+# fallback. Handled COW/DEMAND page faults remain accepted.
+if [[ "$CROSS_ARCH_D6" == "1" ]]; then
+  cross_arch_d6_fail=0
+  echo "[ok] CROSS_ARCH_D6 enabled marker:" $(log_has_pattern "CROSS_ARCH_D6_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "CROSS_ARCH_D6_ENABLED"; then
+    echo "[error] CROSS-ARCH-D6: CROSS_ARCH_D6_ENABLED missing (knob not applied)"
+    cross_arch_d6_fail=1
+  fi
+  for m in "CROSS_ARCH_D6_INVARIANT_OK" "CROSS_ARCH_D6_PROOF_DONE"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] CROSS-ARCH-D6 marker present: $m"
+    else
+      echo "[error] CROSS-ARCH-D6: required marker missing: $m"
+      cross_arch_d6_fail=1
+    fi
+  done
+  # Either a live restore completed OR an explicit fallback/deferred reason recorded.
+  if log_has_pattern "CROSS_ARCH_D6_RESTORE_DONE" || log_has_pattern "CROSS_ARCH_D6_FALLBACK"; then
+    echo "[ok] CROSS-ARCH-D6: live restore-done or explicit fallback/deferred recorded"
+  else
+    echo "[error] CROSS-ARCH-D6: neither RESTORE_DONE nor an explicit fallback reason recorded"
+    cross_arch_d6_fail=1
+  fi
+  # Hard invariant-violation markers (must never appear).
+  for f in \
+    "CROSS_ARCH_D6_GLOBAL_GUARD_HELD" \
+    "CROSS_ARCH_D6_BAD_TRAPFRAME" \
+    "CROSS_ARCH_D6_BAD_ASID" \
+    "CROSS_ARCH_D6_CURRENT_TID_MISMATCH" \
+    "CROSS_ARCH_D6_DOUBLE_DISPATCH" \
+    "CROSS_ARCH_D6_RESTORE_FAIL" \
+    "CROSS_ARCH_D6_UNSUPPORTED_MODEL" \
+    "CROSS_ARCH_D6_INVARIANT_FAIL" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] CROSS-ARCH-D6: fatal marker present: $f"
+      cross_arch_d6_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    cad_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/CROSS_ARCH_D6_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$cad_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] CROSS-ARCH-D6: fatal breadcrumb after cross-arch-d6 wire start: $fatal_pat"
+        cross_arch_d6_fail=1
+      fi
+    done
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$cad_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] CROSS-ARCH-D6: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        cross_arch_d6_fail=1
+      fi
+    done
+  fi
+  if [[ "$cross_arch_d6_fail" -eq 1 ]]; then
+    echo "[error] CROSS-ARCH-D6 mode FAILED"
+    exit 1
+  fi
+  echo "[ok] CROSS-ARCH-D6: x86_64 D6 restore-path audit diagnostics clean (accepted-D6 observe-only)"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

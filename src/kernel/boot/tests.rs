@@ -50488,3 +50488,289 @@ mod stage177_smp_ready {
         );
     }
 }
+
+// Stage 178 (CROSS-ARCH-D6): toggling the cross_arch_d6 marker knob must be a pure
+// diagnostic switch — the accessor round-trips and defaults off, and the audit is
+// read-only (observe-only; it live-wires no cross-arch D6 restore).
+#[test]
+fn stage178_cross_arch_d6_knob_is_pure_diagnostic_toggle() {
+    assert!(
+        !crate::kernel::boot::cross_arch_d6_enabled(),
+        "cross_arch_d6 must default off"
+    );
+    crate::kernel::boot::set_cross_arch_d6_enabled(true);
+    assert!(
+        crate::kernel::boot::cross_arch_d6_enabled(),
+        "cross_arch_d6 accessor must round-trip"
+    );
+    crate::kernel::boot::set_cross_arch_d6_enabled(false);
+    assert!(
+        !crate::kernel::boot::cross_arch_d6_enabled(),
+        "cross_arch_d6 accessor must round-trip back to off"
+    );
+}
+
+// Stage 178 (CROSS-ARCH-D6): source guards over the cross-arch D6 audit knob, the
+// per-arch restore model, the honest deferral, the smoke plumbing, and invariants.
+mod stage178_cross_arch_d6 {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const AARCH64_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const RISCV_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral gate.
+    #[test]
+    fn stage178_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub cross_arch_d6: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.cross_arch_d6"),
+            "yarm.cross_arch_d6 must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("CROSS_ARCH_D6_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn cross_arch_d6_enabled() -> bool")
+                && MOD_SRC.contains("fn set_cross_arch_d6_enabled(")
+                && MOD_SRC.contains("fn cross_arch_d6_audit_try_start()"),
+            "CROSS_ARCH_D6 gate + accessors + one-shot latch must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.cross_arch_d6")
+            .expect("cross_arch_d6 apply block");
+        let block = &CMDLINE_SRC[idx..idx + 600];
+        assert!(
+            block.contains("set_cross_arch_d6_enabled(enabled)")
+                && block.contains("CROSS_ARCH_D6_ENABLED"),
+            "cross_arch_d6 apply must set the gate and emit CROSS_ARCH_D6_ENABLED"
+        );
+    }
+
+    // The audit is one-shot, read-only, hooked in the arch-neutral timer path.
+    #[test]
+    fn stage178_audit_hooked_and_readonly() {
+        assert!(
+            FAULT_SRC.contains("self.maybe_run_cross_arch_d6_audit()"),
+            "audit must be driven from the arch-neutral fault/timer path"
+        );
+        assert!(
+            ORCH_SRC.contains("fn maybe_run_cross_arch_d6_audit(")
+                && ORCH_SRC.contains("cross_arch_d6_audit_try_start()")
+                && ORCH_SRC.contains("if tid == 0"),
+            "audit must be one-shot and only run for a real user task (tid != 0)"
+        );
+        let idx = ORCH_SRC
+            .find("fn maybe_run_cross_arch_d6_audit(")
+            .expect("audit fn");
+        let body = &ORCH_SRC[idx..idx + 5200];
+        assert!(
+            !body.contains("_mut("),
+            "the cross-arch D6 audit must be read-only (no *_mut seam calls)"
+        );
+    }
+
+    // AArch64 uses the trapframe_eret model (NOT x86_64 switch_frames) with the
+    // ELR/SPSR/SP/TTBR0-ASID/ERET restore-readiness markers gated under aarch64.
+    #[test]
+    fn stage178_aarch64_model_is_trapframe_eret_not_switch_frames() {
+        assert!(
+            ORCH_SRC.contains("\"trapframe_eret\""),
+            "aarch64 must map to the trapframe_eret model"
+        );
+        // The aarch64 restore markers exist under a target_arch = aarch64 cfg.
+        let idx = ORCH_SRC
+            .find("#[cfg(target_arch = \"aarch64\")]")
+            .expect("aarch64 cfg block");
+        // Scan forward far enough to cover the aarch64 restore block.
+        let block = &ORCH_SRC[idx..(idx + 900).min(ORCH_SRC.len())];
+        for m in [
+            "CROSS_ARCH_D6_AARCH64_ELR_OK",
+            "CROSS_ARCH_D6_AARCH64_SPSR_OK",
+            "CROSS_ARCH_D6_AARCH64_ERET_READY",
+        ] {
+            assert!(
+                block.contains(m),
+                "aarch64 restore-readiness marker {m} must be under the aarch64 cfg"
+            );
+        }
+        // aarch64 does NOT use the x86_64 switch-frame model.
+        assert!(
+            ORCH_SRC.contains("target_arch = \"aarch64\"") && ORCH_SRC.contains("trapframe_eret"),
+            "aarch64 must not adopt x86_64 switch_frames blindly"
+        );
+    }
+
+    // RISC-V uses the trapframe_sret model (NOT x86_64 switch_frames) with the
+    // sepc/sstatus/sp/satp-ASID/SRET restore-readiness markers gated under riscv64.
+    #[test]
+    fn stage178_riscv_model_is_trapframe_sret_not_switch_frames() {
+        assert!(
+            ORCH_SRC.contains("\"trapframe_sret\""),
+            "riscv64 must map to the trapframe_sret model"
+        );
+        for m in [
+            "CROSS_ARCH_D6_RISCV_SEPC_OK",
+            "CROSS_ARCH_D6_RISCV_SSTATUS_OK",
+            "CROSS_ARCH_D6_RISCV_SRET_READY",
+        ] {
+            assert!(ORCH_SRC.contains(m), "riscv restore marker {m} must exist");
+        }
+        assert!(
+            ORCH_SRC.contains("target_arch = \"riscv64\"") && ORCH_SRC.contains("trapframe_sret"),
+            "riscv64 must not adopt x86_64 switch_frames blindly"
+        );
+    }
+
+    // Global guard must be checked dropped before the observe point, and the
+    // ASID/current_tid invariants are validated; live restore is explicitly deferred.
+    #[test]
+    fn stage178_guard_dropped_and_deferred_are_explicit() {
+        assert!(
+            ORCH_SRC.contains("WITH_TCBS_PROBE_ACTIVE.load(Ordering::Acquire)")
+                && ORCH_SRC.contains("CROSS_ARCH_D6_GLOBAL_DROPPED")
+                && ORCH_SRC.contains("CROSS_ARCH_D6_GLOBAL_GUARD_HELD"),
+            "audit must check the global guard is dropped at the observe point"
+        );
+        assert!(
+            ORCH_SRC.contains("CROSS_ARCH_D6_BAD_ASID")
+                && ORCH_SRC.contains("CROSS_ARCH_D6_CURRENT_TID_MISMATCH"),
+            "audit must validate ASID + current_tid invariants"
+        );
+        // Live restore is deferred: the wired-check returns false in this stage.
+        assert!(
+            ORCH_SRC.contains("fn cross_arch_d6_live_restore_wired(")
+                && ORCH_SRC.contains("cross_arch_d6_live_restore_wired(arch)"),
+            "live restore must be gated behind the (false-today) wired check"
+        );
+        let idx = ORCH_SRC
+            .find("fn cross_arch_d6_live_restore_wired(")
+            .expect("wired fn");
+        let body = &ORCH_SRC[idx..idx + 220];
+        assert!(
+            body.contains("false"),
+            "cross_arch_d6_live_restore_wired must return false (deferred) in Stage 178"
+        );
+    }
+
+    // All documented marker strings exist verbatim.
+    #[test]
+    fn stage178_all_marker_strings_exist() {
+        for m in [
+            "CROSS_ARCH_D6_AUDIT_BEGIN",
+            "CROSS_ARCH_D6_ARCH_MODEL",
+            "CROSS_ARCH_D6_GLOBAL_DROPPED",
+            "CROSS_ARCH_D6_RESTORE_CANDIDATE",
+            "CROSS_ARCH_D6_RESTORE_ENTER",
+            "CROSS_ARCH_D6_RESTORE_DONE",
+            "CROSS_ARCH_D6_FALLBACK",
+            "CROSS_ARCH_D6_INVARIANT_OK",
+            "CROSS_ARCH_D6_PROOF_DONE",
+            "CROSS_ARCH_D6_AARCH64_TTBR0_ASID_OK",
+            "CROSS_ARCH_D6_AARCH64_SP_OK",
+            "CROSS_ARCH_D6_AARCH64_DEFERRED",
+            "CROSS_ARCH_D6_RISCV_SATP_ASID_OK",
+            "CROSS_ARCH_D6_RISCV_SP_OK",
+            "CROSS_ARCH_D6_RISCV_DEFERRED",
+            "CROSS_ARCH_D6_GLOBAL_GUARD_HELD",
+            "CROSS_ARCH_D6_BAD_TRAPFRAME",
+            "CROSS_ARCH_D6_DOUBLE_DISPATCH",
+            "CROSS_ARCH_D6_RESTORE_FAIL",
+            "CROSS_ARCH_D6_UNSUPPORTED_MODEL",
+            "CROSS_ARCH_D6_INVARIANT_FAIL",
+        ] {
+            assert!(ORCH_SRC.contains(m), "audit must emit marker {m}");
+        }
+        assert!(
+            CMDLINE_SRC.contains("CROSS_ARCH_D6_ENABLED"),
+            "cmdline apply must emit CROSS_ARCH_D6_ENABLED"
+        );
+    }
+
+    // Smoke plumbing across all three arch smokes + mode isolation + failure gates.
+    #[test]
+    fn stage178_smoke_profiles() {
+        // x86_64 core smoke: plumbing + mode isolation (forced off under D6 proof/A).
+        assert!(
+            SMOKE_SRC.contains("CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}")
+                && SMOKE_SRC.contains("yarm.cross_arch_d6=1"),
+            "x86_64 smoke must plumb CROSS_ARCH_D6=1"
+        );
+        assert!(
+            SMOKE_SRC.contains("SMP_READY CROSS_ARCH_D6"),
+            "mode isolation must force CROSS_ARCH_D6 off under D6 proof/switch-a"
+        );
+        // aarch64 + riscv smokes append the knob + validate the model + gate failures.
+        assert!(
+            AARCH64_SMOKE_SRC.contains("yarm.cross_arch_d6=1")
+                && AARCH64_SMOKE_SRC.contains("model=trapframe_eret"),
+            "aarch64 smoke must plumb the knob + validate the trapframe_eret model"
+        );
+        assert!(
+            RISCV_SMOKE_SRC.contains("yarm.cross_arch_d6=1")
+                && RISCV_SMOKE_SRC.contains("model=trapframe_sret"),
+            "riscv smoke must plumb the knob + validate the trapframe_sret model"
+        );
+        for smoke in [SMOKE_SRC, AARCH64_SMOKE_SRC, RISCV_SMOKE_SRC] {
+            for f in [
+                "CROSS_ARCH_D6_GLOBAL_GUARD_HELD",
+                "CROSS_ARCH_D6_BAD_TRAPFRAME",
+                "CROSS_ARCH_D6_RESTORE_FAIL",
+                "CROSS_ARCH_D6_UNSUPPORTED_MODEL",
+                "CROSS_ARCH_D6_INVARIANT_FAIL",
+            ] {
+                assert!(
+                    smoke.contains(f),
+                    "each smoke must gate on failure marker {f}"
+                );
+            }
+        }
+    }
+
+    // Invariants + accepted x86_64 D6 paths untouched.
+    #[test]
+    fn stage178_invariants_and_x86_d6_untouched() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        // The audit does not toggle any accepted x86_64 D6 gate.
+        let idx = ORCH_SRC
+            .find("fn maybe_run_cross_arch_d6_audit(")
+            .expect("audit fn");
+        let body = &ORCH_SRC[idx..idx + 5200];
+        assert!(
+            !body.contains("set_d6_switch_a_enabled")
+                && !body.contains("set_d6_genuine_enabled")
+                && !body.contains("set_d6_controlled_switch_proof_enabled"),
+            "the cross-arch D6 audit must not touch accepted x86_64 D6 gates"
+        );
+    }
+
+    // Docs: Stage 177 accepted + Stage 178 section.
+    #[test]
+    fn stage178_docs() {
+        assert!(
+            DOC_SRC.contains("Stage 178 — CROSS-ARCH-D6"),
+            "doc must add the Stage 178 CROSS-ARCH-D6 section"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 177 SMP-READY is **ACCEPTED**")
+                || DOC_SRC.contains("SMP-READY is **ACCEPTED**"),
+            "doc must record Stage 177 accepted"
+        );
+        assert!(
+            DOC_SRC.contains("trapframe_eret") && DOC_SRC.contains("trapframe_sret"),
+            "doc must document the per-arch restore models"
+        );
+    }
+}

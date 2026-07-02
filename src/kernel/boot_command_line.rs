@@ -259,6 +259,16 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("SMP_READY_ENABLED");
         }
     }
+    if let Some(enabled) = parsed.cross_arch_d6 {
+        // Stage 178 (CROSS-ARCH-D6): arch-neutral, default-off DIAGNOSTIC gate for the
+        // AArch64/RISC-V D6 restore-path audit markers + one-shot audit. Changes no
+        // state/ABI/dispatch behavior and live-wires no cross-arch D6 restore — only
+        // emits CROSS_ARCH_D6_* markers.
+        crate::kernel::boot::set_cross_arch_d6_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("CROSS_ARCH_D6_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -400,6 +410,11 @@ pub struct YarmBootOptions<'a> {
     /// x86_64 SMP-readiness audit (AP bring-up / per-CPU / remote-wake + IPI
     /// readiness) DIAGNOSTIC markers + one-shot audit (no behavior/ABI/SMP change).
     pub smp_ready: Option<bool>,
+    /// Stage 178 (CROSS-ARCH-D6): `yarm.cross_arch_d6=1` gates the arch-neutral,
+    /// default-off AArch64/RISC-V D6 restore-path audit (trapframe / exception-return
+    /// / dispatch / lock-drop readiness) DIAGNOSTIC markers + one-shot audit (no
+    /// behavior/ABI/dispatch change; no cross-arch D6 live-wire).
+    pub cross_arch_d6: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -518,6 +533,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.smp_ready" {
             options.smp_ready = parse_bool_knob(value);
+        }
+        if key == b"yarm.cross_arch_d6" {
+            options.cross_arch_d6 = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);
