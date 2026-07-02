@@ -726,7 +726,9 @@ impl KernelState {
             Ok(pair) => pair,
             Err(_) => {
                 let _ = self.destroy_user_address_space_by_asid(asid);
-                let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+                // aspace_cap is a childless leaf here (nothing mapped yet) — release it
+                // via the leaf path too so even this rollback builds no RevokeScratch.
+                let _ = self.delete_leaf_capability_in_cnode(cnode, aspace_cap);
                 crate::yarm_log!("UNLOCK_GRADUATED_D3_ROLLBACK_FAIL reason=mo");
                 return false;
             }
@@ -741,29 +743,43 @@ impl KernelState {
         step("after_map");
         let unmapped = matches!(self.unmap_user_page_in_asid(asid, vaddr), Ok(Some(_)));
         step("after_unmap");
-        let _ = self.revoke_capability_in_cnode(cnode, mem_cap);
-        step("after_revoke_mem_cap");
+        // Stage 181C ROOT-CAUSE FIX: the scratch caps (mem_cap, aspace_cap) are freshly
+        // minted CHILDLESS LEAVES that were never delegated (map only resolves mem_cap to
+        // a phys addr — it derives no child cap). Full `revoke` on a leaf still lazily
+        // builds AND CACHES a per-cspace RevokeScratch working set (≈12 PT-pool pages for
+        // a 512-slot cspace) — the residual net PT-pool draw the per-step trace pinned to
+        // `after_revoke_mem_cap` (182→168, only partially returned by the cache drop).
+        // Release the leaves with `delete_leaf_capability_in_cnode`, which skips the
+        // RevokeScratch build entirely while preserving every object-teardown side effect
+        // (MemoryObject refcount/reclaim, transfer-mapping + notification teardown). It
+        // transparently falls back to full revoke for a non-leaf, so semantics are intact.
+        let mem_leaf = self
+            .delete_leaf_capability_in_cnode(cnode, mem_cap)
+            .unwrap_or(false);
+        step("after_delete_mem_cap");
         let _ = self.destroy_user_address_space_by_asid(asid);
         step("after_destroy_aspace");
-        let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
-        step("after_revoke_aspace_cap");
-        // Stage 181C ROOT-CAUSE FIX: the two revokes above lazily built and CACHED a
-        // per-cspace RevokeScratch working set on the CURRENT (init) cnode. For a
-        // 512-slot cspace that scratch is ~12 pages pulled from the PT frame pool that
-        // backs the kernel heap, and it stays resident (cached) — stealing exactly the
-        // PT-pool headroom the later sender-wake fork needs for its child cnode-slot
-        // Vec (observed: UNLOCK_GRADUATED_POOL_LEAK pt_pool_frames_leaked=14, then the
-        // fork register hits CapabilityFull with pt_pool_free_frames=2). A one-shot
-        // diagnostic must not leave that cache resident, so drop it here; the next real
-        // revoke rebuilds it on demand (identically to the opt-out path, which never
-        // ran this proof). This returns the pool to its pre-proof headroom.
-        let scratch_dropped = self.drop_revoke_scratch_cache_for_cnode(cnode);
+        let aspace_leaf = self
+            .delete_leaf_capability_in_cnode(cnode, aspace_cap)
+            .unwrap_or(false);
+        step("after_delete_aspace_cap");
+        // A pure leaf release builds NO RevokeScratch, so there is nothing to drop (and
+        // dropping the cnode's real cache from unrelated revokes would penalize it). Only
+        // if a leaf release fell back to a full recursive revoke could a scratch have been
+        // built — drop it then. On the leaf path this reports dropped=false.
+        let scratch_dropped = if mem_leaf && aspace_leaf {
+            false
+        } else {
+            self.drop_revoke_scratch_cache_for_cnode(cnode)
+        };
         crate::yarm_log!(
-            "UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED cnode={} dropped={}",
+            "UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED cnode={} dropped={} mem_leaf={} aspace_leaf={}",
             cnode.0,
-            scratch_dropped
+            scratch_dropped,
+            mem_leaf,
+            aspace_leaf
         );
-        step("after_drop_revoke_scratch");
+        step("after_release_caps");
         // Stage 181C: verify NO net resource is left behind. Previously the aspace_cap
         // (minted by `create_user_address_space` into the current cnode) was revoked but
         // NOT leak-checked, so a stale aspace-cap slot could shrink the caller's cnode

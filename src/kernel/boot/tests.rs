@@ -51743,24 +51743,44 @@ mod stage181c_fork_internal {
     // throwaway cap revokes lazily built + cached on the current cnode, returning those
     // ~12 PT-pool pages so the later sender-wake fork is not starved.
     #[test]
-    fn stage181c_graduated_proof_drops_revoke_scratch_cache() {
+    fn stage181c_graduated_proof_releases_scratch_caps_as_leaves() {
         let idx = ORCH_SRC
             .find("fn unlock_graduated_d3_scratch_check")
             .expect("scratch check fn");
-        let block = &ORCH_SRC[idx..idx + 5200];
+        let block = &ORCH_SRC[idx..idx + 6400];
+        // ROOT-CAUSE FIX: the scratch caps are released via the childless-leaf delete
+        // (no RevokeScratch build), NOT full revoke — for BOTH mem_cap and aspace_cap.
         assert!(
-            block.contains("drop_revoke_scratch_cache_for_cnode(cnode)")
-                && block.contains("UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED"),
-            "scratch check must drop the revoke-scratch cache it triggered on the cnode"
-        );
-        // The kernel helper + CapabilitySpace primitive exist.
-        assert!(
-            CAP_LIFECYCLE_SRC.contains("fn drop_revoke_scratch_cache_for_cnode"),
-            "KernelState must expose drop_revoke_scratch_cache_for_cnode"
+            block.contains("delete_leaf_capability_in_cnode(cnode, mem_cap)")
+                && block.contains("delete_leaf_capability_in_cnode(cnode, aspace_cap)"),
+            "scratch check must release mem_cap + aspace_cap via the leaf-delete fast path"
         );
         assert!(
-            CAP_SRC.contains("pub fn drop_revoke_scratch_cache(&mut self) -> bool"),
-            "CapabilitySpace must expose drop_revoke_scratch_cache"
+            !block.contains("revoke_capability_in_cnode(cnode, mem_cap)")
+                && !block.contains("revoke_capability_in_cnode(cnode, aspace_cap)"),
+            "scratch check must NOT full-revoke the leaf scratch caps (that builds RevokeScratch)"
+        );
+        // The cache drop is now only a fallback (non-leaf), and still reports its marker.
+        assert!(
+            block.contains("UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED"),
+            "scratch check must still report the cache-drop marker (dropped=false on leaf path)"
+        );
+        // The kernel helper + CapabilitySpace leaf-delete primitive exist, and the leaf
+        // path preserves the MemoryObject teardown side effect.
+        assert!(
+            CAP_LIFECYCLE_SRC.contains("fn delete_leaf_capability_in_cnode")
+                && CAP_LIFECYCLE_SRC.contains("reclaim_memory_object_if_unreferenced"),
+            "KernelState leaf-delete must exist and preserve MemoryObject reclaim"
+        );
+        assert!(
+            CAP_SRC.contains("pub fn delete_if_leaf(&mut self, id: CapId)"),
+            "CapabilitySpace must expose delete_if_leaf"
+        );
+        // The full revoke path is preserved for real recursive revoke (untouched).
+        assert!(
+            CAP_SRC.contains("pub fn revoke(&mut self, id: CapId)")
+                && CAP_LIFECYCLE_SRC.contains("fn revoke_capability_in_cnode"),
+            "full revoke path must remain intact for non-leaf caps"
         );
     }
 
@@ -51782,10 +51802,10 @@ mod stage181c_fork_internal {
             "after_alloc_mo",
             "after_map",
             "after_unmap",
-            "after_revoke_mem_cap",
+            "after_delete_mem_cap",
             "after_destroy_aspace",
-            "after_revoke_aspace_cap",
-            "after_drop_revoke_scratch",
+            "after_delete_aspace_cap",
+            "after_release_caps",
         ] {
             assert!(
                 block.contains(label),
