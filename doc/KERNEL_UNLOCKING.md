@@ -6359,9 +6359,50 @@ instrumentation now attributes on the next run:
   a genuine slot-budget overflow.
 
 Graduation is preserved (no opt-out forced); emergency opt-out retained; no ABI or
-count change. **Stage 181 remains PARTIAL (user QEMU, 2026)**: the next graduated run's
-`FORK_PROOF_ALLOC_CHILD_POOL` + owner breakdown (or `UNLOCK_GRADUATED_POOL_LEAK`) will
-name the exact PT-pool owner so the targeted cleanup can land.
+count change.
+
+**Stage 181C — ROOT CAUSE FOUND + FIXED (revoke-scratch cache retained by the proof).**
+The instrumented graduated run pinned it exactly:
+
+```
+UNLOCK_GRADUATED_POOL_BEFORE pt_pool_free_frames=186
+UNLOCK_GRADUATED_POOL_AFTER  pt_pool_free_frames=172 before=186
+UNLOCK_GRADUATED_POOL_LEAK   pt_pool_frames_leaked=14
+...
+FORK_COW_BEGIN parent_tid=1 pt_pool_free_frames=24
+FORK_PROOF_ALLOC_CHILD_POOL child_class=SystemServer child_requested_slots=512 pt_pool_free_frames=2
+FORK_COW_FAIL reason=cap_full kernel_error=CapabilityFull syscall_code=255
+```
+Opt-out passes (`FORK_COW_BEGIN ... pt_pool_free_frames=35`, `FORK_COW_DONE`).
+
+Root cause: `CapabilitySpace::revoke()` lazily builds a `RevokeScratch` working set
+sized to the cspace capacity and **caches it** (`revoke_scratch_cache = Some(..)`).
+For the init cnode (512 slots) that scratch is four Vecs — `child_heads` (8 KB),
+`next_sibling` (8 KB), `stack` (4 KB), `marked` — i.e. **≈12–14 pages** taken from the
+PT frame pool that backs the kernel slab heap, and it stays **resident** (cached). The
+graduated one-shot proof's D3 scratch check revokes its two throwaway caps
+(`mem_cap`, `aspace_cap`) on the *current* (init) cnode, so it triggers that cache
+build **before** the sender-wake fork — permanently stealing exactly the PT-pool
+headroom the fork's 512-slot child cnode `Vec` needs (`try_reserve_exact` →
+`AllocFailed` → `CapabilityFull` → `Internal`). The emergency-opt-out path never runs
+the proof, so init's revoke-scratch cache is not built early and the fork keeps its
+headroom — precisely matching the 186→172 (−14) proof delta and the 35→24 fork-entry
+gap between opt-out and graduated.
+
+Fix (targeted, no behavior/ABI/count change): after the scratch check's revokes, drop
+the revoke-scratch cache it triggered on that cnode
+(`KernelState::drop_revoke_scratch_cache_for_cnode` →
+`CapabilitySpace::drop_revoke_scratch_cache`), returning those pages to the PT pool and
+emitting `UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED`. The cache is a pure performance
+optimization rebuilt on demand by the next real revoke, so correctness is unchanged and
+the graduated path now matches the opt-out path's pre-fork pool headroom. The
+`UNLOCK_GRADUATED_POOL_BEFORE/AFTER/LEAK` self-check stays as a regression guard. Nothing
+else weakened: graduation still on, oracle unweakened, PT pool / `MAX_ADDRESS_SPACES` /
+cnode-slot / task limits unchanged, `AllocFailed`/`CapabilityFull` still surfaced.
+Guarded by `stage181c_fork_internal` + `drop_revoke_scratch_cache_releases_and_rebuilds`.
+**Stage 181 acceptance pends the confirming graduated QEMU run** (expected: no
+`UNLOCK_GRADUATED_POOL_LEAK`, `FORK_COW_DONE`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`,
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; opt-out still green).
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

@@ -724,6 +724,22 @@ impl KernelState {
         let _ = self.revoke_capability_in_cnode(cnode, mem_cap);
         let _ = self.destroy_user_address_space_by_asid(asid);
         let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+        // Stage 181C ROOT-CAUSE FIX: the two revokes above lazily built and CACHED a
+        // per-cspace RevokeScratch working set on the CURRENT (init) cnode. For a
+        // 512-slot cspace that scratch is ~12 pages pulled from the PT frame pool that
+        // backs the kernel heap, and it stays resident (cached) — stealing exactly the
+        // PT-pool headroom the later sender-wake fork needs for its child cnode-slot
+        // Vec (observed: UNLOCK_GRADUATED_POOL_LEAK pt_pool_frames_leaked=14, then the
+        // fork register hits CapabilityFull with pt_pool_free_frames=2). A one-shot
+        // diagnostic must not leave that cache resident, so drop it here; the next real
+        // revoke rebuilds it on demand (identically to the opt-out path, which never
+        // ran this proof). This returns the pool to its pre-proof headroom.
+        let scratch_dropped = self.drop_revoke_scratch_cache_for_cnode(cnode);
+        crate::yarm_log!(
+            "UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED cnode={} dropped={}",
+            cnode.0,
+            scratch_dropped
+        );
         // Stage 181C: verify NO net resource is left behind. Previously the aspace_cap
         // (minted by `create_user_address_space` into the current cnode) was revoked but
         // NOT leak-checked, so a stale aspace-cap slot could shrink the caller's cnode

@@ -161,6 +161,23 @@ impl KernelState {
         })
     }
 
+    /// Stage 181C: drop the cached revoke-scratch working set for `cnode`, returning
+    /// its (PT-pool-backed) pages to the allocator. Used by the graduated one-shot
+    /// proof so its throwaway cap revokes do not leave a large cached scratch set
+    /// resident that would starve a later fork's cnode-slot allocation. Returns
+    /// `true` if a cache was actually released. The next real revoke rebuilds it.
+    pub(crate) fn drop_revoke_scratch_cache_for_cnode(&mut self, cnode: CNodeId) -> bool {
+        self.with_capability_state_mut(|capability| {
+            capability
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_mut(&mut space.cspace).drop_revoke_scratch_cache())
+                .unwrap_or(false)
+        })
+    }
+
     /// Returns the number of occupied (non-empty) slots in the given CNode.
     /// Used for diagnostics and test assertions.
     pub(crate) fn cnode_occupied_slots(&self, cnode: CNodeId) -> Option<usize> {
