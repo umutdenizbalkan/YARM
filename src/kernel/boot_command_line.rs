@@ -269,6 +269,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("CROSS_ARCH_D6_ENABLED");
         }
     }
+    if let Some(enabled) = parsed.d3_full {
+        // Stage 179 (D3-FULL): arch-neutral, default-off gate for the D3 VM
+        // anon-map/unmap two-phase markers + one-shot self-contained proof. Changes
+        // no production VM ABI and claims no real SMP shootdown — only emits D3_*.
+        crate::kernel::boot::set_d3_full_enabled(enabled);
+        if enabled {
+            crate::yarm_log!("D3_FULL_ENABLED");
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -415,6 +424,10 @@ pub struct YarmBootOptions<'a> {
     /// / dispatch / lock-drop readiness) DIAGNOSTIC markers + one-shot audit (no
     /// behavior/ABI/dispatch change; no cross-arch D6 live-wire).
     pub cross_arch_d6: Option<bool>,
+    /// Stage 179 (D3-FULL): `yarm.d3_full=1` gates the arch-neutral, default-off D3 VM
+    /// anonymous map/unmap two-phase diagnostic markers + one-shot self-contained D3
+    /// proof (local TLB flush live, remote shootdown prepped/deferred; no VM ABI change).
+    pub d3_full: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -536,6 +549,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.cross_arch_d6" {
             options.cross_arch_d6 = parse_bool_knob(value);
+        }
+        if key == b"yarm.d3_full" {
+            options.d3_full = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

@@ -940,6 +940,12 @@ impl KernelState {
                 // Read-only + default-off (`yarm.cross_arch_d6=1`); it live-wires no
                 // restore and changes no syscall behavior.
                 self.maybe_run_cross_arch_d6_audit();
+                // Stage 179 (D3-FULL): one-shot self-contained D3 VM anon-map/unmap
+                // proof on the reliable arch-neutral syscall path (a real user task is
+                // current). Default-off (`yarm.d3_full=1`); drives the real VM
+                // primitives on a scratch ASID with full teardown — no production VM
+                // ABI change, local flush live, remote shootdown deferred.
+                self.maybe_run_d3_full_proof();
                 // Encode normal user syscall errors into the frame instead of
                 // propagating as TrapHandleError. All three arch entry points
                 // (AArch64 yarm_aarch64_vector_entry, x86_64 halt_forever,
@@ -1011,6 +1017,9 @@ impl KernelState {
                 // task's trapframe/ASID restore state + honest per-arch DEFERRED). It
                 // live-wires no restore. Arch-neutral, diagnostic only.
                 self.maybe_run_cross_arch_d6_audit();
+                // Stage 179 (D3-FULL): one-shot D3 VM anon-map/unmap proof (timer path;
+                // x86_64 primary). One-shot latch shared with the syscall-path hook.
+                self.maybe_run_d3_full_proof();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

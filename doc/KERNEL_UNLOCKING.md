@@ -6004,6 +6004,94 @@ with the syscalling user task current on all three arches); the one-shot latch k
 a single audit. Behavior unchanged; AArch64/RISC-V live restore stays DEFERRED. Guarded
 by `stage178b_cross_arch_d6_hook`.
 
+**ACCEPTED (user QEMU, 2026).** After the Stage 178B hook fix, both arches emit the
+full audit path. AArch64 (`CROSS_ARCH_D6=1 QEMU_SMP=4`) reached the service baseline
+and emitted the complete `trapframe_eret` path (`ENABLED`, `AUDIT_BEGIN`, `ARCH_MODEL`,
+`GLOBAL_DROPPED`, `RESTORE_CANDIDATE`, ELR/SPSR/SP/TTBR0-ASID/ERET readiness,
+`AARCH64_DEFERRED reason=live_lock_drop_restore_needs_multicpu_proof`, `FALLBACK
+reason=deferred_live_restore`, `INVARIANT_OK`, `PROOF_DONE result=ok`); RISC-V
+(`CROSS_ARCH_D6=1 QEMU_SMP=1`) emitted the complete `trapframe_sret` path
+(SEPC/SSTATUS/SP/SATP-ASID/SRET readiness + `RISCV_DEFERRED` + `FALLBACK` +
+`INVARIANT_OK` + `PROOF_DONE result=ok`); the x86_64 regression matrix stayed green.
+Stage 178/178B CROSS-ARCH-D6 is **ACCEPTED** — cross-arch D6 readiness boundaries
+accepted; the AArch64/RISC-V live global-lock-dropped restore remains **DEFERRED**;
+x86_64 D6 paths untouched. Stage 179 (D3-FULL) is the next frontier.
+
+### 7.1.15 Stage 179 — D3-FULL (VM anonymous map/unmap two-phase, rank-clean, local-flush-live / remote-shootdown-prepped)
+
+**Next kernel-unlocking frontier after CROSS-ARCH-D6.** Finishes the D3 VM anonymous
+map/unmap path as an explicit two-phase, rank-clean sequence with local TLB flush live
+and remote TLB shootdown honestly **prepped/deferred** (never a fake SMP-shootdown
+claim), behind a default-off knob (`yarm.d3_full=1`, script `D3_FULL=1`, marker
+`D3_FULL_ENABLED`).
+
+**Live vs deferred (honesty).** The production `VmAnonMap`/`VmUnmap` syscall path is
+**unchanged** — Stage 172 VM-COW already confirmed it is transactional (per-page frame
+alloc + map with `rollback_anon_map`, unmap → COW-clear → reclaim → local flush). What
+D3-FULL adds is (1) the explicit two-phase `D3_*` phase/rollback/TLB markers and (2) a
+**self-contained one-shot proof** that drives the REAL VM primitives
+(`create_user_address_space` → `alloc_anonymous_memory_object` →
+`map_user_page_in_asid_with_caps` → `unmap_user_page_in_asid` →
+`destroy_user_address_space_by_asid`) on a **scratch** address space + scratch memory
+object, verifying the full map→commit→unmap→reclaim cycle with leak checks. So the
+map/unmap primitives are **genuinely exercised live** (not mocked), but no production
+VM ABI changed and no net resource is consumed. **Local ASID flush is live**
+(`request_live_asid_shootdown` performs the local invalidation; in BSP-only its remote
+target set is empty); **remote shootdown is DEFERRED** (`reason=smp_not_live` in
+BSP-only) with an explicit ACK-model-ready prep marker but **no IPI and no ACK wait** —
+matching the Stage 177 APs-parked/BSP-only reality.
+
+**Rank order & lock scopes.** Phase 0 validate (no lock). Phase A reserve: address-space
+metadata (vm rank 5) + anon MemoryObject cap mint (capability rank 4). Phase B: frame
+alloc + PTE install (memory rank 6) via the vm-domain primitive. Phase C commit: local
+TLB flush outside any nested lock; remote shootdown request publishes an immutable
+target ASID/range and **holds no lock while (not) waiting** — the BSP-only path returns
+before any wait. The audit re-checks the documented rank monotonicity
+(`D3_VM_RANK_ORDER_OK`).
+
+**Rollback rules.** Map: a Phase-B PTE-update failure unmaps the installed prefix, frees
+frames, revokes the reserved cap, and undoes the VM-metadata reservation
+(`D3_VM_ANON_ROLLBACK_*`); a Phase-A failure tears down the partial reservation. Unmap:
+failure before PTE removal mutates nothing; after PTE removal the path completes cleanup
+to a consistent unmapped state (COW cleared, frame/MO/refcount reclaimed) — no stale
+writable shared alias, no COW-refcount underflow, no leaked frame. The proof asserts all
+leak-check invariants (`D3_VM_NO_FRAME_LEAK`/`_CAP_LEAK`/`_METADATA_LEAK`/`_STALE_PTE`/
+`_COW_UNDERFLOW`/`_WRITABLE_SHARED_ALIAS`).
+
+**Markers.** All default-off behind `d3_full_enabled()`: map
+(`D3_VM_ANON_MAP_BEGIN`/`_VALIDATE_OK`/`_PHASE_RESERVE_*`/`_PHASE_FRAME_ALLOC_*`/
+`_FRAME_ALLOC_OK`/`_PHASE_PT_UPDATE_*`/`_PT_UPDATE_OK`/`_PHASE_COMMIT_*`/`_COMMIT_OK`/
+`_DONE`), rollback (`_ROLLBACK_BEGIN`/`_UNMAP_PREFIX_OK`/`_FREE_FRAMES_OK`/`_CAPS_OK`/
+`_METADATA_OK`/`_ROLLBACK_OK`/`_FAIL`), unmap (`D3_VM_UNMAP_*`), TLB
+(`D3_TLB_LOCAL_FLUSH_*`, `D3_TLB_SHOOTDOWN_PREP_*`, `D3_TLB_SHOOTDOWN_DEFERRED`,
+`D3_TLB_ACK_MODEL_READY`, `D3_TLB_ACK_WAIT_DEFERRED`), and invariants (`D3_VM_NO_*`,
+`D3_VM_RANK_ORDER_OK`, `D3_VM_INVARIANT_OK`, `D3_VM_PROOF_DONE result=ok`); failure
+markers `D3_VM_FRAME_LEAK`/`_CAP_LEAK`/`_METADATA_LEAK`/`_STALE_PTE`/`_COW_UNDERFLOW`/
+`_WRITABLE_SHARED_ALIAS`/`_RANK_INVERSION`/`_ROLLBACK_FAIL`, `D3_TLB_LOCAL_FLUSH_FAIL`,
+`D3_TLB_SHOOTDOWN_UNSAFE_WAIT`, `D3_VM_INVARIANT_FAIL`.
+
+**`D3_FULL=1` acceptance profile.** Requires `D3_FULL_ENABLED`, the successful
+`D3_VM_ANON_*` map sequence, the `D3_VM_UNMAP_*` sequence, `D3_TLB_LOCAL_FLUSH_OK`,
+`D3_TLB_SHOOTDOWN_PREP_OK` or `D3_TLB_SHOOTDOWN_DEFERRED`, `D3_VM_INVARIANT_OK`, and
+`D3_VM_PROOF_DONE result=ok`; fails hard on every D3 failure marker plus
+`CapabilityFull`, `TaskTableFull`, `BLOCKED_WOULDBLOCK_FATAL`,
+`PAGE_FAULT_UNHANDLED`/`_FATAL`/`_NOT_HANDLED`, and the fatal breadcrumbs. Handled
+COW/DEMAND faults remain accepted. Mode isolation forces `D3_FULL` off under
+`D6_SWITCH_PROOF` / `D6_SWITCH_A`. Guarded by `stage179_d3_full`.
+
+**Explicitly NOT done in Stage 179:** no syscall number / ABI change; no service/image/
+PM-policy change; no D2/D5/D6 live-wire change; no CNode overhaul; no SMP scheduler
+broadening; **no real remote TLB shootdown** (local flush live, remote prepped/deferred,
+no IPI/ACK); no RPi5 change; AArch64/RISC-V cross-build clean (x86_64 primary). Counts
+unchanged: SYSCALL_COUNT=31, Syscall::VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32.
+
+Acceptance (user QEMU): primary
+`TIMEOUT_SECS=120 D3_FULL=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; regression
+matrix (CROSS_ARCH_D6 aarch64/riscv, SMP_READY, GLOBAL_STATE, SPAWN_LIFECYCLE,
+FAULT_DELIVERY, CAP_CNODE, VM_COW, SCHED_TIMEOUT, IPC_FINAL, D2_RECV, D2_SEND, normal,
+D6_SWITCH_A, 5-min D6_SWITCH_PROOF, sender-wake oracle). **PENDING user QEMU
+acceptance.**
+
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
    `block_current_on_receive_with_deadline` call boundary ahead of

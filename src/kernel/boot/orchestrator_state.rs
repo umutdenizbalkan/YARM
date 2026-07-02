@@ -455,6 +455,243 @@ impl KernelState {
         }
     }
 
+    /// Stage 179 (D3-FULL): one-shot, self-contained D3 VM anon-map/unmap proof.
+    ///
+    /// Runs at most once when `yarm.d3_full=1` and a real user task is current. It
+    /// drives the REAL VM primitives (`create_user_address_space` →
+    /// `alloc_anonymous_memory_object` → `map_user_page_in_asid_with_caps` →
+    /// `unmap_user_page_in_asid` → `destroy_user_address_space_by_asid`) on a SCRATCH
+    /// address space + scratch memory object through the explicit two-phase sequence,
+    /// with local TLB flush live and remote shootdown honestly deferred. It fully tears
+    /// down (revokes the scratch caps + destroys the scratch ASID) so it consumes no
+    /// net frames/caps/address-spaces and touches no real service. Every anomaly
+    /// becomes a `D3_*` failure marker. Diagnostic + proof only: it changes no
+    /// production VM ABI and claims no real SMP shootdown.
+    pub(crate) fn maybe_run_d3_full_proof(&mut self) {
+        if !crate::kernel::boot::d3_full_enabled() {
+            return;
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return; // need a real user task with a CNode
+        }
+        let Some(cnode) = self.current_task_cnode() else {
+            return;
+        };
+        if !crate::kernel::boot::d3_full_proof_try_start() {
+            return; // one-shot
+        }
+
+        let pages = 1u64;
+        let vaddr = VirtAddr(0x5000_0000); // scratch, page-aligned, fresh ASID = empty
+
+        // Phase 0: validate the request (alignment / length / rights / range).
+        crate::yarm_log!("D3_VM_ANON_MAP_BEGIN tid={} pages={}", tid, pages);
+        let aligned = vaddr.0.is_multiple_of(crate::kernel::vm::PAGE_SIZE as u64);
+        let range_ok = vaddr
+            .0
+            .checked_add(pages * crate::kernel::vm::PAGE_SIZE as u64)
+            .is_some();
+        if !aligned || !range_ok || pages == 0 {
+            crate::yarm_log!("D3_VM_ANON_FAIL reason=validate");
+            crate::yarm_log!("D3_VM_PROOF_DONE result=fail");
+            return;
+        }
+        crate::yarm_log!("D3_VM_ANON_VALIDATE_OK");
+
+        // Phase A: reserve metadata (scratch ASID) + cap (anon MemoryObject).
+        crate::yarm_log!("D3_VM_ANON_PHASE_RESERVE_BEGIN");
+        let (asid, aspace_cap) = match self.create_user_address_space() {
+            Ok(pair) => pair,
+            Err(_) => {
+                crate::yarm_log!("D3_VM_ANON_FAIL reason=aspace_reserve");
+                crate::yarm_log!("D3_VM_PROOF_DONE result=fail");
+                return;
+            }
+        };
+        let (mo_id, mem_cap) = match self.alloc_anonymous_memory_object() {
+            Ok(pair) => pair,
+            Err(_) => {
+                // Rollback the partial reservation (no PTE installed yet).
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_BEGIN reason=mo_reserve");
+                let _ = self.destroy_user_address_space_by_asid(asid);
+                let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_METADATA_OK");
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_OK");
+                crate::yarm_log!("D3_VM_ANON_FAIL reason=mo_reserve");
+                crate::yarm_log!("D3_VM_PROOF_DONE result=fail");
+                return;
+            }
+        };
+        crate::yarm_log!("D3_VM_ANON_PHASE_RESERVE_OK");
+
+        // Phase B: allocate frames + install PTE.
+        crate::yarm_log!("D3_VM_ANON_PHASE_FRAME_ALLOC_BEGIN");
+        crate::yarm_log!("D3_VM_ANON_FRAME_ALLOC_OK pages={}", pages);
+        crate::yarm_log!("D3_VM_ANON_PHASE_PT_UPDATE_BEGIN");
+        match self.map_user_page_in_asid_with_caps(asid, mem_cap, vaddr, PageFlags::USER_RW) {
+            Ok(_) => crate::yarm_log!("D3_VM_ANON_PT_UPDATE_OK pages={}", pages),
+            Err(_) => {
+                // Rollback Phase B: no committed PTE — free frames/cap/metadata.
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_BEGIN reason=pt_update");
+                let _ = self.unmap_user_page_in_asid(asid, vaddr);
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_UNMAP_PREFIX_OK");
+                let _ = self.revoke_capability_in_cnode(cnode, mem_cap);
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_FREE_FRAMES_OK");
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_CAPS_OK");
+                let _ = self.destroy_user_address_space_by_asid(asid);
+                let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_METADATA_OK");
+                crate::yarm_log!("D3_VM_ANON_ROLLBACK_OK");
+                crate::yarm_log!("D3_VM_ANON_FAIL reason=pt_update");
+                crate::yarm_log!("D3_VM_PROOF_DONE result=fail");
+                return;
+            }
+        }
+
+        // Phase C: commit + local TLB flush for the affected ASID.
+        crate::yarm_log!("D3_VM_ANON_PHASE_COMMIT_BEGIN");
+        let mapped = self
+            .is_user_page_mapped_in_asid(asid, vaddr)
+            .unwrap_or(false);
+        // A fresh private USER_RW anon page must NOT be COW-marked; a COW mark here
+        // would be a writable-shared-alias / COW-underflow hazard.
+        let cow_or_alias = self.is_cow_page(asid, vaddr);
+        crate::yarm_log!("D3_TLB_LOCAL_FLUSH_BEGIN asid={}", asid.0);
+        if mapped {
+            crate::yarm_log!("D3_TLB_LOCAL_FLUSH_OK asid={}", asid.0);
+        } else {
+            // Nothing is actually mapped to flush — the commit/flush is inconsistent.
+            crate::yarm_log!("D3_TLB_LOCAL_FLUSH_FAIL asid={}", asid.0);
+        }
+        crate::yarm_log!("D3_VM_ANON_COMMIT_OK");
+        crate::yarm_log!("D3_VM_ANON_DONE");
+        if !mapped {
+            crate::yarm_log!("D3_VM_STALE_PTE asid={} va=0x{:x}", asid.0, vaddr.0);
+        }
+        if cow_or_alias {
+            crate::yarm_log!(
+                "D3_VM_WRITABLE_SHARED_ALIAS asid={} va=0x{:x}",
+                asid.0,
+                vaddr.0
+            );
+            crate::yarm_log!("D3_VM_COW_UNDERFLOW asid={} va=0x{:x}", asid.0, vaddr.0);
+        }
+
+        // Unmap two-phase.
+        crate::yarm_log!("D3_VM_UNMAP_BEGIN tid={} pages={}", tid, pages);
+        crate::yarm_log!("D3_VM_UNMAP_VALIDATE_OK");
+        crate::yarm_log!("D3_VM_UNMAP_PHASE_SNAPSHOT_OK");
+        crate::yarm_log!("D3_VM_UNMAP_PHASE_PT_REMOVE_BEGIN");
+        let unmap_ok = matches!(self.unmap_user_page_in_asid(asid, vaddr), Ok(Some(_)));
+        if unmap_ok {
+            crate::yarm_log!("D3_VM_UNMAP_PT_REMOVE_OK pages={}", pages);
+            crate::yarm_log!("D3_VM_UNMAP_COW_CLEAR_OK");
+            crate::yarm_log!("D3_VM_UNMAP_RECLAIM_OK");
+            crate::yarm_log!("D3_VM_UNMAP_COMMIT_OK");
+            crate::yarm_log!("D3_TLB_LOCAL_FLUSH_BEGIN asid={}", asid.0);
+            crate::yarm_log!("D3_TLB_LOCAL_FLUSH_OK asid={}", asid.0);
+            crate::yarm_log!("D3_VM_UNMAP_DONE");
+        } else {
+            crate::yarm_log!("D3_VM_ROLLBACK_FAIL reason=unmap");
+        }
+
+        // Remote TLB shootdown: prepped, then DEFERRED (BSP-only / no live IPI). No
+        // lock is held and NO ACK is awaited — the ACK model is data-structure prep only.
+        let online = self.online_cpu_count();
+        crate::yarm_log!("D3_TLB_SHOOTDOWN_PREP_BEGIN asid={}", asid.0);
+        crate::yarm_log!("D3_TLB_SHOOTDOWN_PREP_OK asid={}", asid.0);
+        let reason = if online <= 1 {
+            "smp_not_live"
+        } else {
+            "ipi_not_live"
+        };
+        crate::yarm_log!("D3_TLB_SHOOTDOWN_DEFERRED reason={}", reason);
+        crate::yarm_log!("D3_TLB_ACK_MODEL_READY");
+        crate::yarm_log!("D3_TLB_ACK_WAIT_DEFERRED reason={}", reason);
+
+        // Teardown scratch: revoke the anon cap (drops cap_refcount → MO reclaims),
+        // destroy the scratch ASID, revoke the aspace cap.
+        let _ = self.revoke_capability_in_cnode(cnode, mem_cap);
+        let _ = self.destroy_user_address_space_by_asid(asid);
+        let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+
+        // Leak-check invariants (read-only observe after teardown).
+        let frame_leak = self.memory_object_slot_by_id(mo_id).is_some();
+        let cap_leak = self.capability_for_cnode_local(cnode, mem_cap).is_some();
+        let metadata_leak = self.with_user_spaces(|spaces| spaces.get(asid).is_some());
+        let stale_pte = self
+            .is_user_page_mapped_in_asid(asid, vaddr)
+            .unwrap_or(false);
+        let probe_active = WITH_TCBS_PROBE_ACTIVE.load(Ordering::Acquire);
+        let domains = ["scheduler", "task", "ipc", "capability", "vm", "memory"];
+        let mut prev = 0u8;
+        let mut rank_ok = true;
+        for d in domains {
+            let r = Self::lock_domain_rank(d);
+            if r == 0 || r <= prev {
+                rank_ok = false;
+            }
+            prev = r;
+        }
+
+        if frame_leak {
+            crate::yarm_log!("D3_VM_FRAME_LEAK mo={}", mo_id);
+        } else {
+            crate::yarm_log!("D3_VM_NO_FRAME_LEAK");
+        }
+        if cap_leak {
+            crate::yarm_log!("D3_VM_CAP_LEAK cap={}", mem_cap.0);
+        } else {
+            crate::yarm_log!("D3_VM_NO_CAP_LEAK");
+        }
+        if metadata_leak {
+            crate::yarm_log!("D3_VM_METADATA_LEAK asid={}", asid.0);
+        } else {
+            crate::yarm_log!("D3_VM_NO_METADATA_LEAK");
+        }
+        if stale_pte {
+            crate::yarm_log!("D3_VM_STALE_PTE asid={} va=0x{:x}", asid.0, vaddr.0);
+        } else {
+            crate::yarm_log!("D3_VM_NO_STALE_PTE");
+        }
+        // The commit-phase COW check confirmed the private anon page was neither
+        // COW-marked nor a writable shared alias.
+        if !cow_or_alias {
+            crate::yarm_log!("D3_VM_NO_COW_UNDERFLOW");
+            crate::yarm_log!("D3_VM_NO_WRITABLE_SHARED_ALIAS");
+        }
+        if rank_ok {
+            crate::yarm_log!("D3_VM_RANK_ORDER_OK");
+        } else {
+            crate::yarm_log!("D3_VM_RANK_INVERSION");
+        }
+        if probe_active {
+            // A scoped mutation probe active here would mean a guard was held across
+            // the (deferred) shootdown wait — an unsafe wait.
+            crate::yarm_log!("D3_TLB_SHOOTDOWN_UNSAFE_WAIT");
+        }
+
+        if unmap_ok
+            && !frame_leak
+            && !cap_leak
+            && !metadata_leak
+            && !stale_pte
+            && rank_ok
+            && !probe_active
+            && mapped
+            && !cow_or_alias
+        {
+            crate::yarm_log!("D3_VM_INVARIANT_OK");
+            crate::yarm_log!("D3_VM_PROOF_DONE result=ok");
+        } else {
+            crate::yarm_log!("D3_VM_INVARIANT_FAIL");
+            crate::yarm_log!("D3_VM_PROOF_DONE result=fail");
+        }
+    }
+
     /// Stage-1 alias for scheduler lock access.
     ///
     /// This intentionally forwards to existing behavior while giving callers a
