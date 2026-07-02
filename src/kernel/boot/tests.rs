@@ -51338,3 +51338,240 @@ mod stage180_ci_profiles {
         );
     }
 }
+
+// Stage 181 (GRADUATE-KNOBS): the umbrella accessor round-trips; enabling it is a real
+// production-behavior request (not a diagnostic no-op).
+#[test]
+fn stage181_unlock_graduated_accessor_round_trips() {
+    let prev = crate::kernel::boot::unlock_graduated_enabled();
+    crate::kernel::boot::set_unlock_graduated_enabled(true);
+    assert!(crate::kernel::boot::unlock_graduated_enabled());
+    crate::kernel::boot::set_unlock_graduated_enabled(false);
+    assert!(!crate::kernel::boot::unlock_graduated_enabled());
+    crate::kernel::boot::set_unlock_graduated_enabled(prev);
+}
+
+// Stage 181 (GRADUATE-KNOBS): source guards over the umbrella knob, the default/opt-out
+// policy, the seam graduation, the proof, and the smoke/runner plumbing.
+mod stage181_graduate_knobs {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const MEM_SRC: &str = include_str!("memory_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // Umbrella knob exists (tri-state Option<bool>) + accessors + one-shot latch.
+    #[test]
+    fn stage181_knob_and_accessors() {
+        assert!(
+            CMDLINE_SRC.contains("pub unlock_graduated: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.unlock_graduated"),
+            "yarm.unlock_graduated must be an Option<bool> umbrella knob"
+        );
+        assert!(
+            MOD_SRC.contains("UNLOCK_GRADUATED_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("fn unlock_graduated_enabled() -> bool")
+                && MOD_SRC.contains("fn set_unlock_graduated_enabled(")
+                && MOD_SRC.contains("fn unlock_graduated_proof_try_start()"),
+            "umbrella gate + accessors + one-shot latch must exist"
+        );
+    }
+
+    // The apply graduates the ACCEPTED seams together on x86_64, defers under emergency
+    // opt-out / cross-arch / D6 proof-or-switch-a, and enables NO diagnostic-only knob.
+    #[test]
+    fn stage181_apply_policy() {
+        let idx = CMDLINE_SRC
+            .find("let desired = parsed.unlock_graduated;")
+            .expect("umbrella apply block");
+        let block = &CMDLINE_SRC[idx..idx + 2600];
+        // Emergency opt-out + cross-arch + proof/switch-a deferrals.
+        assert!(
+            block.contains("reason=emergency_optout")
+                && block.contains("reason=cross_arch_live_restore_deferred")
+                && block.contains("reason=d6_proof_or_switch_a_active"),
+            "apply must handle opt-out, cross-arch, and D6 proof/switch-a deferrals"
+        );
+        // Isolation reads the D6 proof / switch-a gates before graduating.
+        assert!(
+            block.contains("d6_controlled_switch_proof_enabled()")
+                && block.contains("d6_switch_a_enabled()"),
+            "apply must respect D6 proof / switch-a isolation"
+        );
+        // Graduates the three accepted seams together.
+        assert!(
+            block.contains("set_d2_recv_genuine_enabled(true)")
+                && block.contains("set_d2_send_genuine_enabled(true)")
+                && block.contains("set_d6_genuine_enabled(true)")
+                && block.contains("set_unlock_graduated_enabled(true)"),
+            "apply must graduate d2_recv + d2_send + d6 together"
+        );
+        // Graduation is x86_64-only.
+        assert!(
+            block.contains("#[cfg(target_arch = \"x86_64\")]")
+                && block.contains("#[cfg(not(target_arch = \"x86_64\"))]"),
+            "graduation of the seams must be x86_64-only"
+        );
+        // Does NOT default-enable any diagnostic-only profile.
+        for diag in [
+            "set_vm_cow_enabled(true)",
+            "set_cap_cnode_enabled(true)",
+            "set_fault_delivery_enabled(true)",
+            "set_spawn_lifecycle_enabled(true)",
+            "set_global_state_enabled(true)",
+            "set_smp_ready_enabled(true)",
+            "set_cross_arch_d6_enabled(true)",
+            "set_d3_full_enabled(true)",
+        ] {
+            assert!(
+                !block.contains(diag),
+                "umbrella must NOT default-enable diagnostic-only knob: {diag}"
+            );
+        }
+    }
+
+    // The one-shot proof defers under SMP, verifies each seam gate, runs the D3 scratch
+    // check, and is hooked in both the syscall and timer paths.
+    #[test]
+    fn stage181_proof_shape() {
+        assert!(
+            FAULT_SRC
+                .matches("self.maybe_run_unlock_graduated_proof()")
+                .count()
+                >= 2,
+            "graduation proof must be hooked in both syscall and timer paths"
+        );
+        assert!(
+            ORCH_SRC.contains("fn maybe_run_unlock_graduated_proof(")
+                && ORCH_SRC.contains("unlock_graduated_proof_try_start()")
+                && ORCH_SRC.contains("UNLOCK_GRADUATED_DEFERRED reason=smp_not_live"),
+            "proof must be one-shot and defer under SMP > 1"
+        );
+        // It verifies the accepted seam gates (an off gate = unexpected in-lock fallback).
+        assert!(
+            ORCH_SRC.contains("d2_recv_genuine_enabled()")
+                && ORCH_SRC.contains("d2_send_genuine_enabled()")
+                && ORCH_SRC.contains("d6_genuine_enabled()")
+                && ORCH_SRC.contains("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH"),
+            "proof must verify each seam gate + flag an unexpected in-lock fallback"
+        );
+        // D3 graduation = compact scratch check via the accepted primitives (no ABI change).
+        assert!(
+            ORCH_SRC.contains("fn unlock_graduated_d3_scratch_check(")
+                && ORCH_SRC.contains("map_user_page_in_asid_with_caps(")
+                && ORCH_SRC.contains("unmap_user_page_in_asid("),
+            "D3 graduation must exercise the accepted VM primitives via a scratch check"
+        );
+        // Production unmap primitive is untouched (no VmAnonMap ABI change).
+        assert!(
+            MEM_SRC.contains("fn unmap_user_page_in_asid("),
+            "production unmap primitive must remain (no ABI change)"
+        );
+    }
+
+    // All documented UNLOCK_GRADUATED markers exist.
+    #[test]
+    fn stage181_all_marker_strings_exist() {
+        for m in [
+            "UNLOCK_GRADUATED_ENABLED",
+            "UNLOCK_GRADUATED_BEGIN",
+            "UNLOCK_GRADUATED_PATH_ENABLED",
+            "UNLOCK_GRADUATED_D2_RECV_OK",
+            "UNLOCK_GRADUATED_D2_SEND_OK",
+            "UNLOCK_GRADUATED_D6_OK",
+            "UNLOCK_GRADUATED_D3_OK",
+            "UNLOCK_GRADUATED_INVARIANT_OK",
+            "UNLOCK_GRADUATED_DONE result=ok",
+            "UNLOCK_GRADUATED_FALLBACK",
+            "UNLOCK_GRADUATED_DEFERRED",
+            "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH",
+            "UNLOCK_GRADUATED_DOUBLE_DISPATCH",
+            "UNLOCK_GRADUATED_RESTORE_FAIL",
+            "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL",
+            "UNLOCK_GRADUATED_D3_LEAK",
+            "UNLOCK_GRADUATED_INVARIANT_FAIL",
+        ] {
+            assert!(
+                ORCH_SRC.contains(m) || CMDLINE_SRC.contains(m),
+                "marker {m} must exist"
+            );
+        }
+    }
+
+    // Smoke tri-state plumbing + isolation + graduated/opt-out gates + fallback fatal.
+    #[test]
+    fn stage181_smoke_plumbing() {
+        assert!(
+            SMOKE_SRC.contains("UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-}")
+                && SMOKE_SRC.contains("yarm.unlock_graduated=1")
+                && SMOKE_SRC.contains("yarm.unlock_graduated=0"),
+            "smoke must plumb the UNLOCK_GRADUATED tri-state"
+        );
+        // Isolation forces it off under D6 proof/switch-a.
+        assert!(
+            SMOKE_SRC.contains("D3_FULL UNLOCK_GRADUATED"),
+            "mode isolation must include UNLOCK_GRADUATED under D6 proof/switch-a"
+        );
+        // Graduated profile strict markers.
+        for m in [
+            "UNLOCK_GRADUATED_D2_RECV_OK",
+            "UNLOCK_GRADUATED_D2_SEND_OK",
+            "UNLOCK_GRADUATED_D6_OK",
+            "UNLOCK_GRADUATED_D3_OK",
+            "UNLOCK_GRADUATED_DONE result=ok",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "graduated smoke must require {m}");
+        }
+        // Unexpected fallback is fatal; opt-out expects emergency_optout deferral.
+        assert!(
+            SMOKE_SRC.contains("unexpected UNLOCK_GRADUATED_FALLBACK on the committed path")
+                && SMOKE_SRC.contains("reason=emergency_optout"),
+            "smoke must fail on unexpected fallback + validate the opt-out deferral"
+        );
+        // Stage 163P sender-wake preserved under graduation.
+        assert!(
+            SMOKE_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "graduated smoke must still observe the Stage 163P sender-wake markers"
+        );
+    }
+
+    // Runner exposes unlock-graduated (primary) in the quick group.
+    #[test]
+    fn stage181_runner_has_graduated_profile() {
+        assert!(
+            RUNNER_SRC.contains("unlock-graduated") && RUNNER_SRC.contains("unlock-optout"),
+            "runner must register the graduated + opt-out profiles"
+        );
+        let qidx = RUNNER_SRC.find("QUICK_PROFILES=(").expect("quick group");
+        let qblock = &RUNNER_SRC[qidx..qidx + 130];
+        assert!(
+            qblock.contains("unlock-graduated"),
+            "quick group must include unlock-graduated (primary graduation proof)"
+        );
+    }
+
+    // Counts frozen + docs record the graduation.
+    #[test]
+    fn stage181_counts_and_docs() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 181 — GRADUATE-KNOBS")
+                && (DOC_SRC.contains("CI-PROFILES\nis **ACCEPTED**")
+                    || DOC_SRC.contains("CI-PROFILES is **ACCEPTED**")),
+            "doc must add Stage 181 + record Stage 180 accepted"
+        );
+    }
+}

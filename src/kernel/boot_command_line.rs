@@ -278,6 +278,51 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("D3_FULL_ENABLED");
         }
     }
+    // Stage 181 (GRADUATE-KNOBS): the umbrella is applied AFTER the individual seam
+    // knobs above so an explicit per-stage knob still composes, and the umbrella has
+    // the final say on the graduated default. Absent knob ⇒ default (graduate on
+    // x86_64); `=0` is the emergency opt-out (conservative path); `=1` explicit graduate.
+    {
+        let desired = parsed.unlock_graduated;
+        if desired == Some(false) {
+            // Emergency opt-out: force the conservative per-stage-off path everywhere.
+            crate::kernel::boot::set_unlock_graduated_enabled(false);
+            crate::yarm_log!("UNLOCK_GRADUATED_DEFERRED reason=emergency_optout");
+        } else {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Isolation: the D6 controlled-switch proof and the D6_SWITCH_A first
+                // narrow production Outcome A own the switch path; the umbrella must
+                // not double-graduate D6 under them.
+                let proof_or_switch_a = crate::kernel::boot::d6_controlled_switch_proof_enabled()
+                    || crate::kernel::boot::d6_switch_a_enabled();
+                if proof_or_switch_a {
+                    crate::kernel::boot::set_unlock_graduated_enabled(false);
+                    crate::yarm_log!(
+                        "UNLOCK_GRADUATED_DEFERRED reason=d6_proof_or_switch_a_active"
+                    );
+                } else {
+                    // Graduate the accepted x86_64 -smp1 seams TOGETHER by enabling
+                    // their gates now (before the boot's first blocking recv/send). The
+                    // runtime D6/D2 eligibility still gates the out-of-lock slice to the
+                    // single-CPU case, so SMP boots fall back conservatively; the
+                    // one-shot proof records the final verdict (ENABLED / DEFERRED).
+                    crate::kernel::boot::set_unlock_graduated_enabled(true);
+                    crate::kernel::boot::set_d2_recv_genuine_enabled(true);
+                    crate::kernel::boot::set_d2_send_genuine_enabled(true);
+                    crate::kernel::boot::set_d6_genuine_enabled(true);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                // Cross-arch live D6 restore is deferred (Stage 178); do not graduate.
+                crate::kernel::boot::set_unlock_graduated_enabled(false);
+                crate::yarm_log!(
+                    "UNLOCK_GRADUATED_DEFERRED reason=cross_arch_live_restore_deferred"
+                );
+            }
+        }
+    }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
         // every arch (the AArch64 queued-split gap is the motivating case).
@@ -428,6 +473,11 @@ pub struct YarmBootOptions<'a> {
     /// anonymous map/unmap two-phase diagnostic markers + one-shot self-contained D3
     /// proof (local TLB flush live, remote shootdown prepped/deferred; no VM ABI change).
     pub d3_full: Option<bool>,
+    /// Stage 181 (GRADUATE-KNOBS): `yarm.unlock_graduated=0|1` umbrella. Absent ⇒
+    /// default (graduated on x86_64 single-CPU); `1` explicitly graduates; `0` is the
+    /// emergency opt-out that forces the conservative per-stage-off path. This is a
+    /// REAL production-behavior gate, not a diagnostic knob.
+    pub unlock_graduated: Option<bool>,
     /// Stage 159: `yarm.ipc_recv_proof=1` gates the default-off, arch-neutral
     /// userspace IPC recv-v2 oracle exercise client. When set, the control-plane
     /// bootstrap provisions a loopback endpoint into the exercise workload, which
@@ -552,6 +602,9 @@ pub fn parse_yarm_boot_options(raw: &[u8]) -> YarmBootOptions<'_> {
         }
         if key == b"yarm.d3_full" {
             options.d3_full = parse_bool_knob(value);
+        }
+        if key == b"yarm.unlock_graduated" {
+            options.unlock_graduated = parse_bool_knob(value);
         }
         if key == b"yarm.ipc_recv_proof" {
             options.ipc_recv_proof = parse_bool_knob(value);

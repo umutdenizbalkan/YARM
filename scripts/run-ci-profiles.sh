@@ -63,12 +63,15 @@ ALL_PROFILES=(
   cross-arch-d6-aarch64
   cross-arch-d6-riscv64
   d3-full
+  unlock-graduated
+  unlock-optout
 )
 
-QUICK_PROFILES=(x86_64-core sender-wake d2-recv d2-send d3-full)
+QUICK_PROFILES=(x86_64-core unlock-graduated sender-wake d2-recv d2-send d3-full)
 
 FULL_PROFILES=(
   x86_64-core aarch64-core riscv64-core
+  unlock-graduated unlock-optout
   sender-wake ipc-final
   d6-switch-a d6-switch-proof d6-genuine
   d2-recv d2-send
@@ -103,6 +106,8 @@ profile_desc() {
     cross-arch-d6-aarch64)  echo "CROSS_ARCH_D6=1 AArch64 D6 restore-path audit (deferred)";;
     cross-arch-d6-riscv64)  echo "CROSS_ARCH_D6=1 RISC-V D6 restore-path audit (deferred)";;
     d3-full)                echo "D3_FULL=1 VM anon map/unmap two-phase proof";;
+    unlock-graduated)       echo "UNLOCK_GRADUATED=1 accepted x86_64 -smp1 seams graduated (primary)";;
+    unlock-optout)          echo "UNLOCK_GRADUATED=0 emergency opt-out / conservative fallback boots";;
     *)                      echo "unknown profile";;
   esac
 }
@@ -131,6 +136,8 @@ profile_field() {
     cross-arch-d6-aarch64)  echo "aarch64 4 120 core CROSS_ARCH_D6=1";;
     cross-arch-d6-riscv64)  echo "riscv64 1 120 core CROSS_ARCH_D6=1";;
     d3-full)                echo "x86_64 1 120 core D3_FULL=1";;
+    unlock-graduated)       echo "x86_64 1 120 core UNLOCK_GRADUATED=1";;
+    unlock-optout)          echo "x86_64 1 120 core UNLOCK_GRADUATED=0";;
     *)                      return 1;;
   esac
 }

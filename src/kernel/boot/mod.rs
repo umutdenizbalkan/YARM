@@ -1209,6 +1209,38 @@ pub(crate) fn d3_full_proof_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 181 (GRADUATE-KNOBS): umbrella gate that graduates the accepted x86_64
+/// `-smp 1` unlock seams (D2-RECV/D2-SEND/D6 out-of-global-lock dispatch) to
+/// default-on. Unlike the per-stage diagnostic knobs this is a REAL production
+/// behavior gate. VALIDATION: UNLOCK_GRADUATED_ENABLED. Emergency opt-out:
+/// `yarm.unlock_graduated=0`.
+pub(crate) static UNLOCK_GRADUATED_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 181: one-shot latch so the graduation verification proof runs exactly once.
+pub(crate) static UNLOCK_GRADUATED_PROOF_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_unlock_graduated_enabled(enabled: bool) {
+    UNLOCK_GRADUATED_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn unlock_graduated_enabled() -> bool {
+    UNLOCK_GRADUATED_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 181: try to claim the one-shot graduation proof (true exactly once).
+pub(crate) fn unlock_graduated_proof_try_start() -> bool {
+    UNLOCK_GRADUATED_PROOF_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }
