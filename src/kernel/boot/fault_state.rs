@@ -951,6 +951,9 @@ impl KernelState {
                 // the accepted seam gates are on + the D3 scratch check; DEFERS under
                 // SMP. The gates were set at cmdline apply — this only reports.
                 self.maybe_run_unlock_graduated_proof();
+                // Stage 183 (SMP-LIVE): one-shot read-only x86_64 SMP-liveness audit
+                // (syscall path; shared one-shot latch with the timer-path hook).
+                self.maybe_run_x86_smp_unlock_audit();
                 // Encode normal user syscall errors into the frame instead of
                 // propagating as TrapHandleError. All three arch entry points
                 // (AArch64 yarm_aarch64_vector_entry, x86_64 halt_forever,
@@ -1028,6 +1031,10 @@ impl KernelState {
                 // Stage 181 (GRADUATE-KNOBS): one-shot graduated-unlock verification
                 // (timer path). Shared one-shot latch with the syscall-path hook.
                 self.maybe_run_unlock_graduated_proof();
+                // Stage 183 (SMP-LIVE): one-shot read-only x86_64 SMP-liveness audit.
+                // Emits the SMP-unlock readiness verdict / AP-admission blocker only when
+                // booted with >1 present CPU; no-op on -smp 1. Changes no behavior.
+                self.maybe_run_x86_smp_unlock_audit();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

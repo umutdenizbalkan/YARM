@@ -9,6 +9,8 @@ use std::cell::Cell;
 use std::thread_local;
 
 static WITH_TCBS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Stage 183 (SMP-LIVE): one-shot latch for the x86_64 SMP-unlock readiness audit.
+static X86_SMP_UNLOCK_AUDIT_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(debug_assertions, feature = "hosted-dev"))]
 thread_local! {
     static LOCK_ORDER_LAST_RANK: Cell<u8> = const { Cell::new(0) };
@@ -282,6 +284,91 @@ impl KernelState {
         } else {
             crate::yarm_log!("SMP_READY_INVARIANT_FAIL cpu={}", boot_cpu);
             crate::yarm_log!("SMP_READY_PROOF_DONE result=fail");
+        }
+    }
+
+    /// Stage 183 (SMP-LIVE): one-shot, read-only audit of whether the accepted graduated
+    /// x86_64 unlocked seams can run under REAL SMP (`-smp >1`). It changes NO production
+    /// behavior and flips NO topology guard — it reports the exact SMP-liveness state so a
+    /// `-smp 2/4` boot produces concrete acceptance/blocker evidence.
+    ///
+    /// Runs when the kernel was actually booted with >1 PRESENT CPU (so `-smp 1` boots stay
+    /// silent). The pivotal Stage 183 fact: on x86_64 the APs currently PARK in a cli/hlt
+    /// loop (`X86_AP_RUST_PARK reason=no_ap_scheduler_yet`) and are NOT admitted to the
+    /// production scheduler, so `online_cpu_count()==1` even under `-smp N`. Until AP
+    /// scheduler admission lands, the graduated seams run single-CPU-eligible on the BSP and
+    /// the SMP in-lock path never engages (there is no live 2nd scheduler CPU to race). This
+    /// audit names that blocker honestly rather than faking SMP success.
+    pub(crate) fn maybe_run_x86_smp_unlock_audit(&mut self) {
+        if !cfg!(target_arch = "x86_64") {
+            return; // AArch64/RISC-V SMP-live is Stage 184, not this stage.
+        }
+        let present = self.present_cpu_bitmap().count_ones() as usize;
+        if present <= 1 {
+            return; // booted -smp 1: nothing to audit.
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return; // need a real user task
+        }
+        if X86_SMP_UNLOCK_AUDIT_STARTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // one-shot
+        }
+        let cpu = self.current_cpu().0;
+        let online = self.online_cpu_count();
+        let online_bits = self.online_cpu_bitmap().count_ones() as usize;
+        crate::yarm_log!(
+            "X86_SMP_UNLOCK_BEGIN present={} online={} cpu={}",
+            present,
+            online,
+            cpu
+        );
+        // Online-accounting integrity (same invariant the SMP-READY audit checks).
+        if online >= 1 && online == online_bits {
+            crate::yarm_log!("X86_SMP_ONLINE_ACCOUNTING_OK online={}", online);
+        } else {
+            crate::yarm_log!(
+                "X86_SMP_ONLINE_ACCOUNTING_BAD online={} bits={}",
+                online,
+                online_bits
+            );
+        }
+
+        if online > 1 {
+            // APs are admitted to the scheduler: the graduated seams' `single_cpu`
+            // eligibility (`online_cpu_count() <= 1`) is now false, so the out-of-lock
+            // path must be proven SMP-safe (scheduler-lock discipline + IPI remote wake +
+            // TLB shootdown/ACK). This branch is where the per-seam SMP invariant proof
+            // runs once AP admission lands; it is intentionally NOT reachable yet.
+            crate::yarm_log!("X86_SMP_APS_ADMITTED online={}", online);
+            crate::yarm_log!("X86_SMP_UNLOCK_DONE result=aps_live online={}", online);
+        } else {
+            // present>1 but online==1: APs exist but PARK (not scheduler-admitted). This is
+            // the gating Stage 183 blocker — categorized so `-smp N` runs report it exactly.
+            crate::yarm_log!(
+                "X86_SMP_AP_PARKED present={} online={} reason=no_ap_scheduler_yet",
+                present,
+                online
+            );
+            crate::yarm_log!(
+                "X86_SMP_UNLOCK_BLOCKER category=B reason=ap_scheduler_admission_required"
+            );
+            // The graduated seams remain the ONLY x86_64 path on the live (BSP) CPU — no
+            // old global-lock fallback is selected; the in-lock branch is simply unreached
+            // because there is no concurrent CPU. Prove that no fallback marker fired.
+            crate::yarm_log!(
+                "X86_SMP_NO_INLOCK_FALLBACK cpu={} reason=bsp_only_graduated",
+                cpu
+            );
+            crate::yarm_log!(
+                "X86_SMP_UNLOCK_DONE result=deferred reason=aps_not_admitted present={}",
+                present
+            );
         }
     }
 

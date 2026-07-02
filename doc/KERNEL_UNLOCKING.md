@@ -6585,6 +6585,92 @@ Runtime behavior on every path is **identical** to accepted Stage 181 — only t
 to toggle back to the fallback is gone. Guarded by `stage182_remove_fallbacks` +
 updated `stage181_graduate_knobs` / `stage16{7,8,9}` / `stage170` negative source guards.
 
+### 7.1.19 Stage 183 — SMP-LIVE (x86_64 unlocked seams under real `-smp >1`)
+
+**Stage 182 is ACCEPTED** (graduated core smoke `UNLOCK_GRADUATED_DONE result=ok`;
+sender-wake `FORK_COW_DONE` + `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` +
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; no fallback / opt-out / in-lock-dispatch /
+pool-leak). Stage 183 makes the accepted x86_64 unlocked seams live under **real SMP**
+(`-smp 2/4`) instead of only `-smp 1`.
+
+**Pivotal current-state finding (the gating blocker).** On x86_64 the APs are started
+via the trampoline but **park in a `cli/hlt` loop** — `X86_AP_RUST_PARK cpu=N
+reason=no_ap_scheduler_yet`; they are *not admitted to the production scheduler* (GS-base
+MSR write, per-CPU TSS, and local-APIC timer are all deliberately deferred; see
+`arch/x86_64/smp.rs`). Consequently `online_cpu_count()` is **1 even under `-smp N`**, so
+the graduated seams' `single_cpu` eligibility (`online_cpu_count() <= 1`) is always true:
+they run single-CPU-eligible on the BSP and the SMP in-lock path never engages because
+there is no concurrent scheduler CPU to race. **There is no live SMP scheduling yet.** So
+the real Stage 183 work is **AP scheduler admission** (category B: IPI/remote-wake +
+per-CPU bring-up), then the concurrent-safety proof (category C: TLB shootdown/ACK). This
+is a large low-level effort whose acceptance is entirely QEMU-SMP runs.
+
+**SMP blocker inventory + classification.**
+
+- `exec_state.rs:~1903` (D6), `ipc_state.rs:~667` (D2-recv), `ipc_state.rs:~757` (D2-send):
+  `let single_cpu = self.online_cpu_count() <= 1;` gates the out-of-lock slice → in-lock
+  under SMP. **Category D (topology guard)** — correct as-is; relax *only after* AP
+  admission + invariants proven. Not a knob.
+- `orchestrator_state.rs:~841`: the graduated proof defers at `online > 1`
+  (`reason=smp_not_live`). **Category D**.
+- `arch/x86_64/smp.rs`: APs park, not scheduler-admitted (`no_ap_scheduler_yet`, GS/TSS/
+  APIC-timer deferred). **Category B — the primary blocker**: AP scheduler admission +
+  IPI-driven remote wake.
+- TLB shootdown request/wait/ACK (`request_live_asid_shootdown`,
+  `execute_tlb_shootdown_wait_plan`, `acknowledge_shootdown`) exist but are exercised only
+  in the single-CPU fast path today. **Category C** — must be proven once APs are live.
+- AArch64/RISC-V in-lock. **Category F — Stage 184**, out of scope here.
+
+**This increment (Task 6.A — establish the SMP baseline + audit, no guard flip).**
+
+- `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
+  `smp4-sender-wake` profiles (`x86_64 2|4 …`); the x86_64 core smoke now honors
+  `QEMU_SMP=${QEMU_SMP:-1}` so `-smp 2/4` boots can be driven (not a production knob — it
+  only selects the QEMU CPU topology).
+- `orchestrator_state.rs`: `maybe_run_x86_smp_unlock_audit` — a one-shot, **read-only**
+  audit (x86_64, `present>1` gated; silent on `-smp 1`) that emits `X86_SMP_UNLOCK_BEGIN`,
+  the online-accounting check, and the honest verdict: `X86_SMP_AP_PARKED … reason=
+  no_ap_scheduler_yet` + `X86_SMP_UNLOCK_BLOCKER category=B reason=
+  ap_scheduler_admission_required` + `X86_SMP_NO_INLOCK_FALLBACK` + `X86_SMP_UNLOCK_DONE
+  result=deferred reason=aps_not_admitted`. It flips **no** topology guard and mutates no
+  scheduler state; when AP admission later lands (`online>1`) it emits
+  `X86_SMP_APS_ADMITTED` + `result=aps_live` and the per-seam SMP invariant proof runs.
+- Smoke/oracle: under `-smp >1` they require the `X86_SMP_UNLOCK_DONE` verdict and forbid
+  `UNLOCK_GRADUATED_FALLBACK` / `UNEXPECTED_INLOCK_DISPATCH` / `emergency_optout` /
+  `X86_SMP_ONLINE_ACCOUNTING_BAD` / `X86_TLB_REMOTE_ACK_TIMEOUT` / `D6_SMP_LOST_WAKE_FAIL`
+  / `D6_SMP_DUP_WAKE_FAIL`.
+
+**x86_64 SMP invariants to enforce once APs are admitted (the next increments, B→G):**
+scheduler — no run-queue mutation without the rank-1 scheduler lock; no lost/duplicate
+remote wake; no stale current-task after remote wake; no cross-CPU access to another CPU's
+current task; IPC — endpoint waiter-queue ops atomic under the IPC lock; sender-wake stays
+*before writeback* and after the receiver commits metadata; reply-cap one-shot; cap
+transfer receiver-local; VM/TLB — page-table changes to a running ASID issue remote
+shootdowns and wait for ACK before frame/PT reuse; COW write-protect visible on all CPUs;
+no PT frame freed before remote ACK.
+
+**Deliberately NOT done this increment (and why):** the `single_cpu` guard is **not**
+relaxed and AP admission is **not** attempted — both require concurrent-execution proof
+that is only obtainable from the `-smp 2/4` QEMU runs, and flipping them blind would risk
+unverifiable data races / lost wakeups / use-after-free of page tables and would violate
+"do not fake SMP success". No production fallback knob, opt-out, or global-lock fallback
+was reintroduced; the in-lock path stays reachable only by topology (SMP>1 / non-x86_64).
+
+**Guards preserved:** `UNLOCK_GRADUATED_POOL_LEAK`, sender-wake oracle checks,
+allocation-free leaf-delete (`delete_if_leaf` + `has_any_delegated_child`), full recursive
+`revoke` for non-leaf caps, the Stage 182 no-fallback guarantee. No PT-pool / cnode-slot /
+task-limit / `MAX_ADDRESS_SPACES` change; no ABI/count change (`SYSCALL_COUNT=31`,
+`Syscall::VARIANT_COUNT=23`, x86_64 `MAX_ADDRESS_SPACES=32`). Guarded by
+`stage183_smp_live`. **Stage 184 is AArch64/RISC-V — not this stage.**
+
+QEMU targets (run on the user's host — no QEMU in the dev environment):
+`scripts/run-ci-profiles.sh smp2-core|smp2-sender-wake|smp4-core|smp4-sender-wake`, or
+`QEMU_SMP=2|4 scripts/qemu-x86_64-core-smoke.sh` and
+`QEMU_SMP=2|4 YARM_IPC_RECV_PROOF_SENDER_WAKE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`.
+Expected this increment: boots `-smp N`, `X86_SMP_AP_PARKED` + `X86_SMP_UNLOCK_DONE
+result=deferred reason=aps_not_admitted`, sender-wake still completes on the BSP, no
+fallback/SMP-error marker. AP admission + the guard relax follow in the next increments.
+
 ### 7.1.6 What must not be touched yet
 
 - D1/D5/D2 canonical fallbacks. `materialize_received_message_cap`

@@ -212,11 +212,17 @@ automatically upon successful spawn).
 
 ## 5. Architecture Rules
 
-### 5.1 x86_64 smoke stays at -smp 1
+### 5.1 x86_64 smoke defaults to -smp 1 (Stage 183 admits an explicit override)
 
-`scripts/qemu-x86_64-core-smoke.sh` hardcodes `QEMU_SMP=1`. This line must not be
-changed to allow SMP. x86_64 SMP is out of scope until the trampoline assembly is
-separated from `src/arch/x86_64/smp.rs`.
+`scripts/qemu-x86_64-core-smoke.sh` **defaults** to `-smp 1` via
+`QEMU_SMP=${QEMU_SMP:-1}`. Through Stage 182 this was a hard `QEMU_SMP=1` pin. **Stage 183
+(SMP-LIVE)** lifts the pin: the smoke now honors a caller-provided `QEMU_SMP` so the
+`smp2-*/smp4-*` SMP-LIVE profiles can drive `-smp >1`, while `-smp 1` stays the default.
+This selects only the QEMU CPU topology — it is NOT a production fallback knob, and the
+graduated seams remain the only x86_64 production path. Do not add a runtime knob that
+selects the old global-lock fallback. Until AP scheduler admission lands, `-smp N` boots
+park the APs (`X86_AP_RUST_PARK reason=no_ap_scheduler_yet`) and the SMP-liveness audit
+reports `X86_SMP_UNLOCK_DONE result=deferred reason=aps_not_admitted` honestly.
 
 ### 5.2 x86_64 SMP TODO
 

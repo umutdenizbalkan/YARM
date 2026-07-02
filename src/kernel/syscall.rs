@@ -5474,10 +5474,13 @@ mod tests {
                 "{forbidden} must not exist at Stage 106 (D6 is audit-only)"
             );
         }
+        // Stage 183 (SMP-LIVE): the smoke DEFAULTS to -smp 1 but now honors an explicit
+        // QEMU_SMP so the smp2/smp4 SMP-LIVE profiles can drive -smp >1. Still -smp 1 by
+        // default; the SMP override selects only QEMU topology, not a production knob.
         let smoke = include_str!("../../scripts/qemu-x86_64-core-smoke.sh");
         assert!(
-            smoke.contains("QEMU_SMP=1"),
-            "x86_64 core smoke must remain pinned to -smp 1 (AI_AGENT_RULES §5.1)"
+            smoke.contains("QEMU_SMP=${QEMU_SMP:-1}"),
+            "x86_64 core smoke must default to -smp 1 (honoring an explicit QEMU_SMP)"
         );
     }
 
@@ -5722,10 +5725,10 @@ mod tests {
             smp_src.contains("use super::smp_trampoline::"),
             "smp.rs must consume the trampoline module via imports"
         );
-        // The core smoke stays pinned to -smp 1 — the split is a prerequisite,
-        // not an SMP enablement.
+        // The core smoke DEFAULTS to -smp 1 (Stage 183 lets an explicit QEMU_SMP drive the
+        // smp2/smp4 SMP-LIVE profiles; the trampoline split remains a prerequisite).
         let smoke = include_str!("../../scripts/qemu-x86_64-core-smoke.sh");
-        assert!(smoke.contains("QEMU_SMP=1"));
+        assert!(smoke.contains("QEMU_SMP=${QEMU_SMP:-1}"));
     }
 
     // ── Stage 109 / Milestone 2 Pass 2 — AP Rust-entry scaffolding fences ────

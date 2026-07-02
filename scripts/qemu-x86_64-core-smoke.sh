@@ -25,7 +25,11 @@ QEMU_MEMORY=${QEMU_MEMORY:-512M}
 # SMP defaults to 1 (x86_64 SMP is out of scope for the normal smoke). The Stage 177
 # opt-in SMP_READY profile is the ONLY thing that raises this, below, after mode
 # isolation (see the SMP_READY_CPUS override).
-QEMU_SMP=1
+# Stage 183 (SMP-LIVE): honor a caller-provided QEMU_SMP (the runner's smp2/smp4
+# profiles pass QEMU_SMP=2/4) so x86_64 -smp >1 boots can be driven; default -smp 1.
+# The SMP_READY profile still overrides this below. NOT a production fallback knob —
+# it only selects the QEMU CPU topology.
+QEMU_SMP=${QEMU_SMP:-1}
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-"$DEFAULT_KERNEL_CMDLINE"}
 # Stage 168B (mode isolation): D6_SWITCH_PROOF, D6_SWITCH_A, and the
@@ -1886,6 +1890,37 @@ if [[ "$ug_fail" -eq 1 ]]; then
   exit 1
 fi
 echo "[ok] REMOVE-FALLBACKS: x86_64 -smp1 graduated seams are the only production path (no fallback)"
+
+# Stage 183 (SMP-LIVE): under x86_64 -smp >1, verify the SMP-liveness audit ran and no
+# fallback / fatal path fired. The graduated seams remain the ONLY x86_64 path; until AP
+# scheduler admission lands the APs park (online==1) and the audit reports the blocker
+# honestly (result=deferred reason=aps_not_admitted). Either the deferred verdict or a
+# future aps_live verdict is acceptable here; a FALLBACK/UNEXPECTED_INLOCK is fatal.
+if [[ "$QEMU_SMP" -gt 1 ]]; then
+  echo "[info] SMP-LIVE: x86_64 -smp $QEMU_SMP acceptance checks"
+  if ! log_has_pattern "X86_SMP_UNLOCK_DONE"; then
+    echo "[error] SMP-LIVE: X86_SMP_UNLOCK_DONE audit verdict missing under -smp $QEMU_SMP"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+  else
+    echo "[ok] SMP-LIVE: X86_SMP_UNLOCK audit verdict present"
+  fi
+  for f in \
+    "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" \
+    "UNLOCK_GRADUATED_FALLBACK path=" \
+    "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" \
+    "X86_SMP_ONLINE_ACCOUNTING_BAD"; do
+    if log_has_pattern "$f"; then
+      echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
+      exit 1
+    fi
+  done
+  # If APs are admitted (aps_live) the graduated path must show no in-lock fallback.
+  if log_has_pattern "X86_SMP_APS_ADMITTED" && ! log_has_pattern "X86_SMP_UNLOCK_DONE result=aps_live"; then
+    echo "[error] SMP-LIVE: APs admitted but SMP-unlock verdict is not aps_live"
+    exit 1
+  fi
+  echo "[ok] SMP-LIVE: no fallback/opt-out/in-lock-dispatch fired under -smp $QEMU_SMP"
+fi
 
 if log_has_pattern "YARM_BOOT_OK"; then
   echo "[ok] x86_64 boot markers detected"
