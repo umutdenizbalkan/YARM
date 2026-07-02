@@ -50893,3 +50893,233 @@ mod stage178b_cross_arch_d6_hook {
         );
     }
 }
+
+// Stage 179 (D3-FULL): toggling the d3_full knob is a pure diagnostic switch — the
+// accessor round-trips and defaults off; the one-shot proof self-contains its scratch
+// map/unmap and changes no production VM ABI.
+#[test]
+fn stage179_d3_full_knob_is_pure_diagnostic_toggle() {
+    assert!(
+        !crate::kernel::boot::d3_full_enabled(),
+        "d3_full must default off"
+    );
+    crate::kernel::boot::set_d3_full_enabled(true);
+    assert!(
+        crate::kernel::boot::d3_full_enabled(),
+        "d3_full accessor must round-trip"
+    );
+    crate::kernel::boot::set_d3_full_enabled(false);
+    assert!(
+        !crate::kernel::boot::d3_full_enabled(),
+        "d3_full accessor must round-trip back to off"
+    );
+}
+
+// Stage 179 (D3-FULL): source guards over the D3 two-phase map/unmap proof, markers,
+// TLB flush/shootdown honesty, rollback, smoke plumbing, and invariants.
+mod stage179_d3_full {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const MEM_SRC: &str = include_str!("memory_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // knob default-off + arch-neutral gate.
+    #[test]
+    fn stage179_knob_default_off_arch_neutral() {
+        assert!(
+            CMDLINE_SRC.contains("pub d3_full: Option<bool>")
+                && CMDLINE_SRC.contains("yarm.d3_full"),
+            "yarm.d3_full must be an Option<bool> cmdline knob"
+        );
+        assert!(
+            MOD_SRC.contains("D3_FULL_ENABLED: core::sync::atomic::AtomicBool =")
+                && MOD_SRC.contains("AtomicBool::new(false)")
+                && MOD_SRC.contains("fn d3_full_enabled() -> bool")
+                && MOD_SRC.contains("fn set_d3_full_enabled(")
+                && MOD_SRC.contains("fn d3_full_proof_try_start()"),
+            "D3_FULL gate + accessors + one-shot latch must exist (default false)"
+        );
+        let idx = CMDLINE_SRC
+            .find("if let Some(enabled) = parsed.d3_full")
+            .expect("d3_full apply block");
+        let block = &CMDLINE_SRC[idx..idx + 500];
+        assert!(
+            block.contains("set_d3_full_enabled(enabled)") && block.contains("D3_FULL_ENABLED"),
+            "d3_full apply must set the gate and emit D3_FULL_ENABLED"
+        );
+    }
+
+    // The proof is one-shot, hooked in the arch-neutral syscall + timer paths.
+    #[test]
+    fn stage179_proof_hooked_and_one_shot() {
+        assert!(
+            FAULT_SRC.matches("self.maybe_run_d3_full_proof()").count() >= 2,
+            "proof must be hooked in both the syscall and timer paths"
+        );
+        assert!(
+            ORCH_SRC.contains("fn maybe_run_d3_full_proof(")
+                && ORCH_SRC.contains("d3_full_proof_try_start()")
+                && ORCH_SRC.contains("if tid == 0"),
+            "proof must be one-shot and only run for a real user task (tid != 0)"
+        );
+    }
+
+    // The proof drives the REAL VM primitives (not mocked) through the two-phase order.
+    #[test]
+    fn stage179_proof_drives_real_vm_primitives_two_phase() {
+        let idx = ORCH_SRC
+            .find("fn maybe_run_d3_full_proof(")
+            .expect("proof fn");
+        let body = &ORCH_SRC[idx..idx + 7000];
+        for call in [
+            "self.create_user_address_space()",
+            "self.alloc_anonymous_memory_object()",
+            "self.map_user_page_in_asid_with_caps(",
+            "self.unmap_user_page_in_asid(",
+            "self.destroy_user_address_space_by_asid(",
+        ] {
+            assert!(
+                body.contains(call),
+                "proof must drive the real primitive {call}"
+            );
+        }
+        // Two-phase ordering: reserve → frame-alloc → pt-update → commit.
+        let reserve = body
+            .find("D3_VM_ANON_PHASE_RESERVE_BEGIN")
+            .expect("reserve");
+        let frame = body
+            .find("D3_VM_ANON_PHASE_FRAME_ALLOC_BEGIN")
+            .expect("frame");
+        let pt = body.find("D3_VM_ANON_PHASE_PT_UPDATE_BEGIN").expect("pt");
+        let commit = body.find("D3_VM_ANON_PHASE_COMMIT_BEGIN").expect("commit");
+        assert!(
+            reserve < frame && frame < pt && pt < commit,
+            "two-phase map order must be reserve < frame-alloc < pt-update < commit"
+        );
+    }
+
+    // Rollback releases the mapped prefix, frees frames, revokes caps, undoes metadata.
+    #[test]
+    fn stage179_rollback_releases_everything() {
+        for m in [
+            "D3_VM_ANON_ROLLBACK_BEGIN",
+            "D3_VM_ANON_ROLLBACK_UNMAP_PREFIX_OK",
+            "D3_VM_ANON_ROLLBACK_FREE_FRAMES_OK",
+            "D3_VM_ANON_ROLLBACK_CAPS_OK",
+            "D3_VM_ANON_ROLLBACK_METADATA_OK",
+            "D3_VM_ANON_ROLLBACK_OK",
+        ] {
+            assert!(ORCH_SRC.contains(m), "rollback marker {m} must exist");
+        }
+        // Leak-check invariants are asserted post-teardown.
+        for m in [
+            "D3_VM_NO_FRAME_LEAK",
+            "D3_VM_NO_CAP_LEAK",
+            "D3_VM_NO_METADATA_LEAK",
+            "D3_VM_NO_STALE_PTE",
+        ] {
+            assert!(ORCH_SRC.contains(m), "leak-check invariant {m} must exist");
+        }
+    }
+
+    // Local TLB flush is live; remote shootdown is explicitly prepped/deferred with NO
+    // fake IPI/ACK; no guard held across a (deferred) shootdown wait.
+    #[test]
+    fn stage179_tlb_flush_live_remote_deferred_no_fake_ipi() {
+        assert!(
+            ORCH_SRC.contains("D3_TLB_LOCAL_FLUSH_OK"),
+            "local TLB flush must be live"
+        );
+        assert!(
+            ORCH_SRC.contains("D3_TLB_SHOOTDOWN_DEFERRED")
+                && ORCH_SRC.contains("D3_TLB_ACK_WAIT_DEFERRED"),
+            "remote shootdown + ACK wait must be honestly deferred"
+        );
+        // The unsafe-wait failure marker exists and is gated on the probe (guard held).
+        assert!(
+            ORCH_SRC.contains("D3_TLB_SHOOTDOWN_UNSAFE_WAIT")
+                && ORCH_SRC.contains("WITH_TCBS_PROBE_ACTIVE.load(Ordering::Acquire)"),
+            "an unsafe shootdown-wait must be detectable via the guard probe"
+        );
+        // No new real IPI send is introduced by the proof.
+        let idx = ORCH_SRC
+            .find("fn maybe_run_d3_full_proof(")
+            .expect("proof fn");
+        let body = &ORCH_SRC[idx..idx + 7000];
+        assert!(
+            !body.contains("send_ipi") && !body.contains("submit_cross_cpu_work"),
+            "the D3 proof must not send a real IPI / cross-CPU work"
+        );
+    }
+
+    // VM-COW (Stage 172) behavior preserved; the production unmap primitive is untouched.
+    #[test]
+    fn stage179_vm_cow_and_production_unmap_preserved() {
+        assert!(
+            MEM_SRC.contains("fn unmap_user_page_in_asid(")
+                && MEM_SRC.contains("VM_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live"),
+            "the production unmap primitive + Stage 172 VM-COW markers must remain"
+        );
+    }
+
+    // Smoke plumbing + mode isolation + failure gates.
+    #[test]
+    fn stage179_smoke_profile() {
+        assert!(
+            SMOKE_SRC.contains("D3_FULL=${D3_FULL:-0}") && SMOKE_SRC.contains("yarm.d3_full=1"),
+            "smoke must plumb D3_FULL=1"
+        );
+        for m in [
+            "D3_FULL_ENABLED",
+            "D3_VM_ANON_COMMIT_OK",
+            "D3_VM_UNMAP_DONE",
+            "D3_TLB_LOCAL_FLUSH_OK",
+            "D3_VM_INVARIANT_OK",
+            "D3_VM_PROOF_DONE result=ok",
+        ] {
+            assert!(SMOKE_SRC.contains(m), "smoke must require {m}");
+        }
+        for f in [
+            "D3_VM_FRAME_LEAK",
+            "D3_VM_CAP_LEAK",
+            "D3_VM_METADATA_LEAK",
+            "D3_VM_STALE_PTE",
+            "D3_VM_COW_UNDERFLOW",
+            "D3_VM_WRITABLE_SHARED_ALIAS",
+            "D3_VM_RANK_INVERSION",
+            "D3_VM_ROLLBACK_FAIL",
+            "D3_TLB_LOCAL_FLUSH_FAIL",
+            "D3_TLB_SHOOTDOWN_UNSAFE_WAIT",
+            "D3_VM_INVARIANT_FAIL",
+        ] {
+            assert!(SMOKE_SRC.contains(f), "smoke must gate on {f}");
+        }
+        assert!(
+            SMOKE_SRC.contains("CROSS_ARCH_D6 D3_FULL"),
+            "mode isolation must force D3_FULL off under D6 proof/switch-a"
+        );
+    }
+
+    // Invariants + no scope creep.
+    #[test]
+    fn stage179_invariants_preserved() {
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 179 — D3-FULL"),
+            "doc must add the Stage 179 D3-FULL section"
+        );
+    }
+}

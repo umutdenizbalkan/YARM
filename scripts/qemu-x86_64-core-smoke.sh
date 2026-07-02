@@ -53,17 +53,18 @@ SPAWN_LIFECYCLE=${SPAWN_LIFECYCLE:-0}
 GLOBAL_STATE=${GLOBAL_STATE:-0}
 SMP_READY=${SMP_READY:-0}
 CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}
+D3_FULL=${D3_FULL:-0}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6 D3_FULL; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6 D3_FULL; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -71,7 +72,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE SMP_READY=$SMP_READY CROSS_ARCH_D6=$CROSS_ARCH_D6"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE SMP_READY=$SMP_READY CROSS_ARCH_D6=$CROSS_ARCH_D6 D3_FULL=$D3_FULL"
 # Stage 177 (SMP-READY): the normal x86_64 core smoke stays -smp 1. Only the opt-in
 # SMP_READY profile (after mode isolation, so a forced-off SMP_READY keeps -smp 1)
 # raises QEMU_SMP to SMP_READY_CPUS (default 2). This is the single place x86_64 SMP
@@ -204,6 +205,14 @@ fi
 CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}
 if [[ "$CROSS_ARCH_D6" == "1" && "$KERNEL_CMDLINE" != *"yarm.cross_arch_d6="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.cross_arch_d6=1"
+fi
+# Stage 179 (D3-FULL): D3_FULL=1 appends yarm.d3_full=1 to emit the D3 VM
+# anon-map/unmap two-phase markers + run the one-shot self-contained D3 proof (drives
+# the real VM primitives on a scratch ASID; local flush live, remote shootdown
+# deferred; no production VM ABI change). Standalone — does NOT enable any D6/D2 mode.
+D3_FULL=${D3_FULL:-0}
+if [[ "$D3_FULL" == "1" && "$KERNEL_CMDLINE" != *"yarm.d3_full="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d3_full=1"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1701,6 +1710,91 @@ if [[ "$CROSS_ARCH_D6" == "1" ]]; then
     exit 1
   fi
   echo "[ok] CROSS-ARCH-D6: x86_64 D6 restore-path audit diagnostics clean (accepted-D6 observe-only)"
+fi
+
+# Stage 179 (D3-FULL): when booted with yarm.d3_full=1, require the D3 VM
+# anon-map/unmap two-phase diagnostics + the self-contained proof. Local TLB flush is
+# live; remote shootdown is prepped/deferred (no fake SMP shootdown). Handled
+# COW/DEMAND page faults remain accepted.
+if [[ "$D3_FULL" == "1" ]]; then
+  d3_full_fail=0
+  echo "[ok] D3_FULL enabled marker:" $(log_has_pattern "D3_FULL_ENABLED" && echo present || echo MISSING)
+  if ! log_has_pattern "D3_FULL_ENABLED"; then
+    echo "[error] D3-FULL: D3_FULL_ENABLED missing (knob not applied)"
+    d3_full_fail=1
+  fi
+  # Required successful two-phase map + unmap + flush + invariant + proof markers.
+  for m in \
+    "D3_VM_ANON_VALIDATE_OK" \
+    "D3_VM_ANON_PT_UPDATE_OK" \
+    "D3_VM_ANON_COMMIT_OK" \
+    "D3_VM_ANON_DONE" \
+    "D3_VM_UNMAP_PT_REMOVE_OK" \
+    "D3_VM_UNMAP_DONE" \
+    "D3_TLB_LOCAL_FLUSH_OK" \
+    "D3_VM_INVARIANT_OK"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] D3-FULL marker present: $m"
+    else
+      echo "[error] D3-FULL: required marker missing: $m"
+      d3_full_fail=1
+    fi
+  done
+  # Proof must complete OK.
+  if log_has_pattern "D3_VM_PROOF_DONE result=ok"; then
+    echo "[ok] D3-FULL: proof done result=ok"
+  else
+    echo "[error] D3-FULL: D3_VM_PROOF_DONE result=ok missing"
+    d3_full_fail=1
+  fi
+  # Remote shootdown must be explicitly prepped or deferred (never a fake claim).
+  if log_has_pattern "D3_TLB_SHOOTDOWN_PREP_OK" || log_has_pattern "D3_TLB_SHOOTDOWN_DEFERRED"; then
+    echo "[ok] D3-FULL: remote shootdown prepped/deferred"
+  else
+    echo "[error] D3-FULL: no shootdown prep/deferred marker"
+    d3_full_fail=1
+  fi
+  # Hard invariant-violation markers (must never appear).
+  for f in \
+    "D3_VM_FRAME_LEAK" \
+    "D3_VM_CAP_LEAK" \
+    "D3_VM_METADATA_LEAK" \
+    "D3_VM_STALE_PTE" \
+    "D3_VM_COW_UNDERFLOW" \
+    "D3_VM_WRITABLE_SHARED_ALIAS" \
+    "D3_VM_RANK_INVERSION" \
+    "D3_VM_ROLLBACK_FAIL" \
+    "D3_TLB_LOCAL_FLUSH_FAIL" \
+    "D3_TLB_SHOOTDOWN_UNSAFE_WAIT" \
+    "D3_VM_INVARIANT_FAIL" \
+    "CapabilityFull" \
+    "TaskTableFull" \
+    "BLOCKED_WOULDBLOCK_FATAL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] D3-FULL: fatal marker present: $f"
+      d3_full_fail=1
+    fi
+  done
+  if [[ -f "$LOGFILE" ]]; then
+    d3_tail="$(tr '\r' '\n' <"$LOGFILE" | awk '/D3_FULL_ENABLED/{seen=1} seen{print}')"
+    for fatal_pat in '^!Fv' '^!BNv' 'DOUBLE_FAULT' 'TRIPLE' 'PANIC' 'FATAL'; do
+      if printf '%s\n' "$d3_tail" | rg -a -q -- "$fatal_pat"; then
+        echo "[error] D3-FULL: fatal breadcrumb after d3-full wire start: $fatal_pat"
+        d3_full_fail=1
+      fi
+    done
+    for pf_fatal in 'PAGE_FAULT_UNHANDLED' 'PAGE_FAULT_FATAL' 'PAGE_FAULT_NOT_HANDLED'; do
+      if printf '%s\n' "$d3_tail" | rg -a -F -q -- "$pf_fatal"; then
+        echo "[error] D3-FULL: explicit unhandled/fatal page-fault marker: $pf_fatal"
+        d3_full_fail=1
+      fi
+    done
+  fi
+  if [[ "$d3_full_fail" -eq 1 ]]; then
+    echo "[error] D3-FULL mode FAILED"
+    exit 1
+  fi
+  echo "[ok] D3-FULL: VM anon map/unmap two-phase diagnostics clean (local flush live, remote deferred)"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

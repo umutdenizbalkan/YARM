@@ -1177,6 +1177,38 @@ pub(crate) fn cross_arch_d6_audit_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 179 (D3-FULL): arch-neutral, default-off gate for the D3 VM anonymous
+/// map/unmap two-phase diagnostic markers + the one-shot self-contained D3 proof
+/// (drives the REAL VM primitives on a scratch address space; local TLB flush live,
+/// remote shootdown prepped/deferred). It changes NO production VM ABI and claims NO
+/// real SMP shootdown — only emits D3_* markers. VALIDATION: D3_FULL_ENABLED.
+pub(crate) static D3_FULL_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 179: one-shot latch so the D3 proof runs exactly once.
+pub(crate) static D3_FULL_PROOF_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_d3_full_enabled(enabled: bool) {
+    D3_FULL_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn d3_full_enabled() -> bool {
+    D3_FULL_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Stage 179: try to claim the one-shot D3 proof (true exactly once).
+pub(crate) fn d3_full_proof_try_start() -> bool {
+    D3_FULL_PROOF_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }
