@@ -946,6 +946,11 @@ impl KernelState {
                 // primitives on a scratch ASID with full teardown — no production VM
                 // ABI change, local flush live, remote shootdown deferred.
                 self.maybe_run_d3_full_proof();
+                // Stage 181 (GRADUATE-KNOBS): one-shot verification of the graduated
+                // x86_64 -smp1 unlock (syscall path; reliable across arches). Verifies
+                // the accepted seam gates are on + the D3 scratch check; DEFERS under
+                // SMP. The gates were set at cmdline apply — this only reports.
+                self.maybe_run_unlock_graduated_proof();
                 // Encode normal user syscall errors into the frame instead of
                 // propagating as TrapHandleError. All three arch entry points
                 // (AArch64 yarm_aarch64_vector_entry, x86_64 halt_forever,
@@ -1020,6 +1025,9 @@ impl KernelState {
                 // Stage 179 (D3-FULL): one-shot D3 VM anon-map/unmap proof (timer path;
                 // x86_64 primary). One-shot latch shared with the syscall-path hook.
                 self.maybe_run_d3_full_proof();
+                // Stage 181 (GRADUATE-KNOBS): one-shot graduated-unlock verification
+                // (timer path). Shared one-shot latch with the syscall-path hook.
+                self.maybe_run_unlock_graduated_proof();
                 // Emit timer health markers unconditionally but only for the
                 // first few ticks so that the smoke test can verify the timer
                 // fires and the scheduler advances without flooding the UART.

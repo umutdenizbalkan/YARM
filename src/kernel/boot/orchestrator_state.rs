@@ -692,6 +692,138 @@ impl KernelState {
         }
     }
 
+    /// Stage 181 (GRADUATE-KNOBS): compact scratch VM map/unmap check used as the D3
+    /// graduation evidence. Returns `true` if the accepted two-phase primitives mapped
+    /// + unmapped + reclaimed a scratch page with no leak. Emits `UNLOCK_GRADUATED_D3_*`
+    /// failure markers on a real anomaly. Self-contained; consumes no net resources.
+    fn unlock_graduated_d3_scratch_check(&mut self, cnode: CNodeId) -> bool {
+        let vaddr = VirtAddr(0x5100_0000);
+        let (asid, aspace_cap) = match self.create_user_address_space() {
+            Ok(pair) => pair,
+            Err(_) => {
+                crate::yarm_log!("UNLOCK_GRADUATED_D3_ROLLBACK_FAIL reason=aspace");
+                return false;
+            }
+        };
+        let (mo_id, mem_cap) = match self.alloc_anonymous_memory_object() {
+            Ok(pair) => pair,
+            Err(_) => {
+                let _ = self.destroy_user_address_space_by_asid(asid);
+                let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+                crate::yarm_log!("UNLOCK_GRADUATED_D3_ROLLBACK_FAIL reason=mo");
+                return false;
+            }
+        };
+        let mapped = self
+            .map_user_page_in_asid_with_caps(asid, mem_cap, vaddr, PageFlags::USER_RW)
+            .is_ok()
+            && self
+                .is_user_page_mapped_in_asid(asid, vaddr)
+                .unwrap_or(false);
+        let unmapped = matches!(self.unmap_user_page_in_asid(asid, vaddr), Ok(Some(_)));
+        let _ = self.revoke_capability_in_cnode(cnode, mem_cap);
+        let _ = self.destroy_user_address_space_by_asid(asid);
+        let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
+        let leak = self.memory_object_slot_by_id(mo_id).is_some()
+            || self.capability_for_cnode_local(cnode, mem_cap).is_some()
+            || self.with_user_spaces(|spaces| spaces.get(asid).is_some());
+        if !mapped || !unmapped {
+            crate::yarm_log!("UNLOCK_GRADUATED_D3_ROLLBACK_FAIL reason=map_unmap");
+            return false;
+        }
+        if leak {
+            crate::yarm_log!("UNLOCK_GRADUATED_D3_LEAK mo={}", mo_id);
+            return false;
+        }
+        true
+    }
+
+    /// Stage 181 (GRADUATE-KNOBS): one-shot verification of the graduated x86_64
+    /// `-smp 1` unlock. Runs when a real user task is current and the umbrella enabled
+    /// the seams at cmdline apply. It records the final verdict: under SMP > 1 it
+    /// DEFERS (the accepted seams are `-smp 1` only); otherwise it confirms each
+    /// accepted seam gate is on (an off gate = an unexpected in-lock fallback), runs
+    /// the compact D3 scratch check, and emits the graduated OK/INVARIANT/DONE markers.
+    /// It changes no behavior (the gates were already set at apply); it only verifies +
+    /// reports.
+    pub(crate) fn maybe_run_unlock_graduated_proof(&mut self) {
+        if !crate::kernel::boot::unlock_graduated_enabled() {
+            return; // emergency opt-out / deferred at cmdline apply
+        }
+        let Some(tid) = self.current_tid() else {
+            return;
+        };
+        if tid == 0 {
+            return;
+        }
+        let Some(cnode) = self.current_task_cnode() else {
+            return;
+        };
+        if !crate::kernel::boot::unlock_graduated_proof_try_start() {
+            return; // one-shot
+        }
+
+        // The accepted seams are x86_64 -smp 1 only: defer the verdict under SMP.
+        let online = self.online_cpu_count();
+        if online > 1 {
+            crate::yarm_log!("UNLOCK_GRADUATED_DEFERRED reason=smp_not_live");
+            return;
+        }
+
+        crate::yarm_log!("UNLOCK_GRADUATED_ENABLED");
+        crate::yarm_log!("UNLOCK_GRADUATED_BEGIN arch=x86_64 smp=1");
+
+        // Each accepted seam gate must be on (the umbrella enabled them at apply). An
+        // off gate means the committed path fell back to the conservative in-lock path.
+        let d2_recv = crate::kernel::boot::d2_recv_genuine_enabled();
+        let d2_send = crate::kernel::boot::d2_send_genuine_enabled();
+        let d6 = crate::kernel::boot::d6_genuine_enabled();
+
+        if d2_recv {
+            crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d2_recv");
+            crate::yarm_log!("UNLOCK_GRADUATED_D2_RECV_OK");
+        } else {
+            crate::yarm_log!("UNLOCK_GRADUATED_FALLBACK path=d2_recv reason=gate_off");
+            crate::yarm_log!("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH path=d2_recv");
+        }
+        if d2_send {
+            crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d2_send");
+            crate::yarm_log!("UNLOCK_GRADUATED_D2_SEND_OK");
+        } else {
+            crate::yarm_log!("UNLOCK_GRADUATED_FALLBACK path=d2_send reason=gate_off");
+            crate::yarm_log!("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH path=d2_send");
+        }
+        if d6 {
+            crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d6");
+            crate::yarm_log!("UNLOCK_GRADUATED_D6_OK");
+        } else {
+            crate::yarm_log!("UNLOCK_GRADUATED_FALLBACK path=d6 reason=gate_off");
+            crate::yarm_log!("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH path=d6");
+        }
+
+        // D3: production VmAnonMap/VmUnmap is ALREADY the accepted two-phase path
+        // (Stage 172/179); confirm the primitives via a compact scratch check.
+        crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d3");
+        let d3_ok = self.unlock_graduated_d3_scratch_check(cnode);
+        if d3_ok {
+            crate::yarm_log!("UNLOCK_GRADUATED_D3_OK");
+        }
+
+        // No queue double-advance from this read-mostly verification.
+        if self.current_tid() != Some(tid) {
+            crate::yarm_log!("UNLOCK_GRADUATED_DOUBLE_DISPATCH path=proof");
+            crate::yarm_log!("UNLOCK_GRADUATED_RESTORE_FAIL path=proof");
+        }
+
+        if d2_recv && d2_send && d6 && d3_ok && self.current_tid() == Some(tid) {
+            crate::yarm_log!("UNLOCK_GRADUATED_INVARIANT_OK");
+            crate::yarm_log!("UNLOCK_GRADUATED_DONE result=ok");
+        } else {
+            crate::yarm_log!("UNLOCK_GRADUATED_INVARIANT_FAIL");
+            crate::yarm_log!("UNLOCK_GRADUATED_DONE result=fail");
+        }
+    }
+
     /// Stage-1 alias for scheduler lock access.
     ///
     /// This intentionally forwards to existing behavior while giving callers a

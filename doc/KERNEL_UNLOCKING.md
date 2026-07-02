@@ -6157,8 +6157,90 @@ optional GitHub-Actions QEMU jobs (kept local/manual — the runner is local-fir
 
 Guarded by `stage180_ci_profiles`. Acceptance (user):
 `scripts/run-ci-profiles.sh quick --build --logs-dir logs/stage180-quick` (primary),
-`full` / `extended` optional/manual. **PENDING user QEMU acceptance** (the runner's
-`list` + `--dry-run` are verified locally and in tests).
+`full` / `extended` optional/manual.
+
+**ACCEPTED (user, 2026).** `scripts/run-ci-profiles.sh quick --build` passed:
+`x86_64-core PASS`, `sender-wake PASS`, `d2-recv PASS`, `d2-send PASS`, `d3-full PASS`;
+the explicit hard-failure grep returned no real fatal markers (the broad
+FAIL/SKIP/PAGE_FAULT grep matched only benign diagnostics — `target_asid_unavailable`
+probes, disabled-FAT `SKIPPED`, `*_FAIL count=0`, handled COW). Stage 180 CI-PROFILES
+is **ACCEPTED** — the runner + shared fatal-marker policy are the repeatable proof
+harness going forward. Stage 181 (GRADUATE-KNOBS / BIG-BANG UNLOCK) is the next
+frontier.
+
+### 7.1.17 Stage 181 — GRADUATE-KNOBS / BIG-BANG UNLOCK (accepted x86_64 -smp1 seams default-on)
+
+**Production-behavior graduation — no longer proof-only.** The accepted x86_64
+`-smp 1` unlock seams (D2-RECV-GENUINE, D2-SEND-GENUINE, D6-GENUINE/D6-SWITCH-A
+out-of-global-lock dispatch/switch) stop being permanent opt-in experiments: an
+umbrella knob `yarm.unlock_graduated` (script `UNLOCK_GRADUATED=1`, marker
+`UNLOCK_GRADUATED_ENABLED`) enables them **together, by default, on x86_64 single-CPU
+boots**, with a temporary emergency opt-out (`yarm.unlock_graduated=0`) that restores
+the conservative per-stage-off behavior. The old per-stage knobs
+(`d6_genuine`/`d2_recv_genuine`/`d2_send_genuine`) are retained as escape/debug
+overrides for this stage only; **Stage 182 removes/hard-disables the obsolete
+fallbacks** after this proves stable.
+
+**Default policy.** On x86_64 with a single online CPU: `unlock_graduated` defaults to
+**true** (absent knob ⇒ graduated). On x86_64 with SMP > 1: defaults **false**
+(`UNLOCK_GRADUATED_DEFERRED reason=smp_not_live`) — the accepted seams are `-smp 1`
+only, and the runtime D6/D2 eligibility already excludes multi-CPU, so the seam gates
+fall back to the conservative in-lock path there. On AArch64/RISC-V: defaults false
+(`UNLOCK_GRADUATED_DEFERRED reason=cross_arch_live_restore_deferred`) — cross-arch live
+D6 restore stays deferred (Stage 178). `yarm.unlock_graduated=0` forces the old
+conservative path everywhere (emergency rollback); `=1` explicitly requests graduation.
+Isolation: when `D6_SWITCH_PROOF` or `D6_SWITCH_A` is set, the umbrella does NOT
+graduate D6 (those proof modes own the switch path).
+
+**Paths graduated together (x86_64 -smp1):**
+- **D2-RECV-GENUINE** — blocking recv uses the accepted out-of-global-lock dispatch
+  (`PHASE_TASK_BLOCK` → `PHASE_IPC_LOCK` → `PHASE_DISPATCH` → `DISPATCH_DEFERRED` →
+  `NO_INLOCK_DISPATCH` → global dropped → reverify → out-of-lock dispatch → restore)
+  by default; an unexpected in-lock fallback emits `UNLOCK_GRADUATED_FALLBACK
+  path=d2_recv reason=…` and fails the graduated smoke.
+- **D2-SEND-GENUINE** — blocking send publishes the waiter before deferral (Stage 163P
+  sender-wake ordering preserved), out-of-lock by default; unexpected fallback fails.
+- **D6-GENUINE / D6-SWITCH-A** — the accepted x86_64 `-smp 1` global-lock-dropped
+  dispatch/switch runs by default where the readiness checks pass; `D6_SWITCH_PROOF`
+  is never disturbed; not enabled under SMP > 1.
+- **D3** — Stage 179 confirmed the production `VmAnonMap`/`VmUnmap` path is **already**
+  the accepted two-phase transactional path (validate → reserve → frame-alloc →
+  PT-update → commit → local flush; unmap snapshot → PT-remove → COW-clear → reclaim →
+  commit → local flush). Stage 181 does **NOT** change that ABI; it re-runs the
+  Stage 179 self-contained D3 proof as the graduation evidence (`UNLOCK_GRADUATED_D3_OK`)
+  and states explicitly that **production D3 is already transactional (no new
+  graduation wiring / no ABI change)**. Remote shootdown stays prep/deferred
+  `reason=smp_not_live` — no fake IPI/ACK.
+
+**Still diagnostic-only (NOT default-enabled):** `VM_COW`, `CAP_CNODE`,
+`FAULT_DELIVERY`, `SPAWN_LIFECYCLE`, `GLOBAL_STATE`, `SMP_READY`, `CROSS_ARCH_D6`
+remain default-off audit knobs (they carry no additional production seam beyond what is
+already always-on); `SCHED_TIMEOUT`'s chunked scan is already the always-on baseline
+and `SCHED_TIMEOUT=1` stays a diagnostic marker profile.
+
+**Markers.** `UNLOCK_GRADUATED_ENABLED`, `_BEGIN arch=x86_64 smp=1`,
+`_PATH_ENABLED path=d2_recv|d2_send|d6|d3`, `_D2_RECV_OK`/`_D2_SEND_OK`/`_D6_OK`/`_D3_OK`,
+`_INVARIANT_OK`, `_DONE result=ok`; fallback `_FALLBACK path=… reason=…`, `_DEFERRED
+reason=smp_not_live|cross_arch_live_restore_deferred|unsupported_arch`; failure
+`_UNEXPECTED_INLOCK_DISPATCH`, `_DOUBLE_DISPATCH`, `_RESTORE_FAIL`, `_D3_ROLLBACK_FAIL`,
+`_D3_LEAK`, `_INVARIANT_FAIL`.
+
+**Emergency opt-out.** `yarm.unlock_graduated=0` (script `UNLOCK_GRADUATED=0`) forces
+every accepted seam gate off and boots the conservative path — proven by a dedicated
+opt-out smoke. Retained for Stage 181 only.
+
+**Explicitly NOT done / deferred:** no syscall/ABI/service/image/PM-policy change; no
+SMP scheduler broadening (SMP > 1 defers); no AArch64/RISC-V live D6 restore; no real
+remote TLB shootdown ACK; fallback code is NOT deleted (Stage 182). Counts unchanged:
+SYSCALL_COUNT=31, Syscall::VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32.
+
+Guarded by `stage181_graduate_knobs`. Acceptance (user QEMU): primary
+`UNLOCK_GRADUATED=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; normal default-on
+`QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; emergency opt-out
+`UNLOCK_GRADUATED=0 QEMU_SMP=1 …`; `run-ci-profiles.sh quick`; regression matrix
+(legacy D2/D3 profiles, D6_SWITCH_A, 5-min D6_SWITCH_PROOF, SMP_READY, CROSS_ARCH_D6
+aarch64/riscv, normal aarch64/riscv). **PENDING user QEMU acceptance** (this is a real
+behavior change; QEMU evidence required before ACCEPTED).
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

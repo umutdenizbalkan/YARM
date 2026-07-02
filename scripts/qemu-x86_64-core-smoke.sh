@@ -54,17 +54,21 @@ GLOBAL_STATE=${GLOBAL_STATE:-0}
 SMP_READY=${SMP_READY:-0}
 CROSS_ARCH_D6=${CROSS_ARCH_D6:-0}
 D3_FULL=${D3_FULL:-0}
+# Stage 181: UNLOCK_GRADUATED is tri-state: "" (kernel default: graduated on -smp1),
+# "1" (explicit graduate), "0" (emergency opt-out / conservative). Under the D6 proof
+# / switch-a isolation it is forced to "0" so those proof modes own the switch path.
+UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-}
 YARM_MODE_ISOLATION=${YARM_MODE_ISOLATION:-1}
 if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
   if [[ "$D6_SWITCH_PROOF" == "1" ]]; then
-    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6 D3_FULL; do
+    for _mode in D6_SWITCH_A D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6 D3_FULL UNLOCK_GRADUATED; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_PROOF=1 active; forcing $_mode=0 (was 1)"
       fi
       printf -v "$_mode" '%s' 0
     done
   elif [[ "$D6_SWITCH_A" == "1" ]]; then
-    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6 D3_FULL; do
+    for _mode in D6_GENUINE D2_RECV_GENUINE D2_SEND_GENUINE SCHED_TIMEOUT VM_COW CAP_CNODE FAULT_DELIVERY SPAWN_LIFECYCLE GLOBAL_STATE SMP_READY CROSS_ARCH_D6 D3_FULL UNLOCK_GRADUATED; do
       if [[ "${!_mode}" == "1" ]]; then
         echo "[warn] mode isolation: D6_SWITCH_A=1 active; forcing $_mode=0 (was 1)"
       fi
@@ -72,7 +76,7 @@ if [[ "$YARM_MODE_ISOLATION" == "1" ]]; then
     done
   fi
 fi
-echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE SMP_READY=$SMP_READY CROSS_ARCH_D6=$CROSS_ARCH_D6 D3_FULL=$D3_FULL"
+echo "[info] mode isolation: D6_SWITCH_PROOF=$D6_SWITCH_PROOF D6_SWITCH_A=$D6_SWITCH_A D6_GENUINE=$D6_GENUINE D2_RECV_GENUINE=$D2_RECV_GENUINE D2_SEND_GENUINE=$D2_SEND_GENUINE SCHED_TIMEOUT=$SCHED_TIMEOUT VM_COW=$VM_COW CAP_CNODE=$CAP_CNODE FAULT_DELIVERY=$FAULT_DELIVERY SPAWN_LIFECYCLE=$SPAWN_LIFECYCLE GLOBAL_STATE=$GLOBAL_STATE SMP_READY=$SMP_READY CROSS_ARCH_D6=$CROSS_ARCH_D6 D3_FULL=$D3_FULL UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-<default>}"
 # Stage 177 (SMP-READY): the normal x86_64 core smoke stays -smp 1. Only the opt-in
 # SMP_READY profile (after mode isolation, so a forced-off SMP_READY keeps -smp 1)
 # raises QEMU_SMP to SMP_READY_CPUS (default 2). This is the single place x86_64 SMP
@@ -213,6 +217,16 @@ fi
 D3_FULL=${D3_FULL:-0}
 if [[ "$D3_FULL" == "1" && "$KERNEL_CMDLINE" != *"yarm.d3_full="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d3_full=1"
+fi
+# Stage 181 (GRADUATE-KNOBS): only append yarm.unlock_graduated when it is explicitly
+# 0 (emergency opt-out) or 1 (explicit graduate). An empty value leaves the kernel
+# default (graduated on x86_64 single-CPU) so the normal smoke exercises the graduated
+# path without any cmdline knob.
+UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-}
+if [[ "$UNLOCK_GRADUATED" == "1" && "$KERNEL_CMDLINE" != *"yarm.unlock_graduated="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.unlock_graduated=1"
+elif [[ "$UNLOCK_GRADUATED" == "0" && "$KERNEL_CMDLINE" != *"yarm.unlock_graduated="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.unlock_graduated=0"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1795,6 +1809,103 @@ if [[ "$D3_FULL" == "1" ]]; then
     exit 1
   fi
   echo "[ok] D3-FULL: VM anon map/unmap two-phase diagnostics clean (local flush live, remote deferred)"
+fi
+
+# Stage 181 (GRADUATE-KNOBS): the accepted x86_64 -smp1 unlock seams graduate to
+# default-on. Three cases:
+#   UNLOCK_GRADUATED=0  -> emergency opt-out: expect DEFERRED reason=emergency_optout,
+#                          NO graduated ENABLED marker; just prove the conservative
+#                          fallback still boots.
+#   UNLOCK_GRADUATED=1  -> explicit graduated profile: STRICT gate on the graduated
+#                          marker set + no unexpected fallback.
+#   (empty / default)   -> normal boot: graduated by default; SOFT-observe the markers
+#                          (do not fail the plain smoke on proof-timing), but any
+#                          UNLOCK_GRADUATED_* failure marker is still fatal.
+unlock_graduated_fatal_scan() {
+  local label="$1"
+  local rc=0
+  for f in \
+    "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" \
+    "UNLOCK_GRADUATED_DOUBLE_DISPATCH" \
+    "UNLOCK_GRADUATED_RESTORE_FAIL" \
+    "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL" \
+    "UNLOCK_GRADUATED_D3_LEAK" \
+    "UNLOCK_GRADUATED_INVARIANT_FAIL"; do
+    if log_has_pattern "$f"; then
+      echo "[error] $label: fatal graduated marker present: $f"
+      rc=1
+    fi
+  done
+  # An unexpected fallback on the committed normal path fails the graduated profile.
+  if log_has_pattern "UNLOCK_GRADUATED_FALLBACK path="; then
+    echo "[error] $label: unexpected UNLOCK_GRADUATED_FALLBACK on the committed path"
+    rc=1
+  fi
+  return $rc
+}
+
+if [[ "$UNLOCK_GRADUATED" == "0" ]]; then
+  echo "[info] GRADUATE-KNOBS: emergency opt-out profile (conservative fallback)"
+  if log_has_pattern "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout"; then
+    echo "[ok] GRADUATE-KNOBS: opt-out DEFERRED reason=emergency_optout present"
+  else
+    echo "[error] GRADUATE-KNOBS: opt-out did not record DEFERRED reason=emergency_optout"
+    exit 1
+  fi
+  if log_has_pattern "UNLOCK_GRADUATED_ENABLED"; then
+    echo "[error] GRADUATE-KNOBS: opt-out must NOT graduate (UNLOCK_GRADUATED_ENABLED present)"
+    exit 1
+  fi
+  echo "[ok] GRADUATE-KNOBS: emergency fallback boots conservatively"
+elif [[ "$UNLOCK_GRADUATED" == "1" ]]; then
+  echo "[info] GRADUATE-KNOBS: explicit graduated profile (STRICT)"
+  ug_fail=0
+  for m in \
+    "UNLOCK_GRADUATED_ENABLED" \
+    "UNLOCK_GRADUATED_D2_RECV_OK" \
+    "UNLOCK_GRADUATED_D2_SEND_OK" \
+    "UNLOCK_GRADUATED_D6_OK" \
+    "UNLOCK_GRADUATED_D3_OK" \
+    "UNLOCK_GRADUATED_INVARIANT_OK"; do
+    if log_has_pattern "$m"; then
+      echo "[ok] GRADUATE-KNOBS marker present: $m"
+    else
+      echo "[error] GRADUATE-KNOBS: required marker missing: $m"
+      ug_fail=1
+    fi
+  done
+  if ! log_has_pattern "UNLOCK_GRADUATED_DONE result=ok"; then
+    echo "[error] GRADUATE-KNOBS: UNLOCK_GRADUATED_DONE result=ok missing"
+    ug_fail=1
+  fi
+  # Stage 163P sender-wake ordering must be preserved under graduation.
+  for sw in \
+    "IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK" \
+    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK" \
+    "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"; do
+    if ! log_has_pattern "$sw"; then
+      echo "[warn] GRADUATE-KNOBS: Stage 163P sender-wake marker not observed: $sw"
+    fi
+  done
+  if ! unlock_graduated_fatal_scan "GRADUATE-KNOBS"; then ug_fail=1; fi
+  if [[ "$ug_fail" -eq 1 ]]; then
+    echo "[error] GRADUATE-KNOBS mode FAILED"
+    exit 1
+  fi
+  echo "[ok] GRADUATE-KNOBS: x86_64 -smp1 accepted seams graduated (d2_recv/d2_send/d6/d3)"
+else
+  # Normal default-on boot: soft-observe the graduated verdict; fatal markers still fail.
+  if log_has_pattern "UNLOCK_GRADUATED_DONE result=ok"; then
+    echo "[ok] GRADUATE-KNOBS: normal boot graduated by default (result=ok)"
+  elif log_has_pattern "UNLOCK_GRADUATED_DEFERRED"; then
+    echo "[info] GRADUATE-KNOBS: normal boot deferred graduation (see reason)"
+  else
+    echo "[info] GRADUATE-KNOBS: graduated verdict not observed on this normal run"
+  fi
+  if ! unlock_graduated_fatal_scan "GRADUATE-KNOBS"; then
+    echo "[error] GRADUATE-KNOBS: fatal graduated marker on normal boot"
+    exit 1
+  fi
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then
