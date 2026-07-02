@@ -6239,8 +6239,35 @@ Guarded by `stage181_graduate_knobs`. Acceptance (user QEMU): primary
 `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; emergency opt-out
 `UNLOCK_GRADUATED=0 QEMU_SMP=1 …`; `run-ci-profiles.sh quick`; regression matrix
 (legacy D2/D3 profiles, D6_SWITCH_A, 5-min D6_SWITCH_PROOF, SMP_READY, CROSS_ARCH_D6
-aarch64/riscv, normal aarch64/riscv). **PENDING user QEMU acceptance** (this is a real
-behavior change; QEMU evidence required before ACCEPTED).
+aarch64/riscv, normal aarch64/riscv).
+
+**PARTIAL (user QEMU, 2026).** The explicit `UNLOCK_GRADUATED=1 QEMU_SMP=1` run reached
+the service baseline with the full graduated marker set (`UNLOCK_GRADUATED_ENABLED`,
+`_D2_RECV_OK`, `_D2_SEND_OK`, `_D6_OK`, `_D3_OK`, `_INVARIANT_OK`) and NO unexpected
+fallback / double-dispatch / restore-fail / D3 leak; the runtime log showed
+D2-RECV-GENUINE out-of-global-lock dispatch and D6-GENUINE mutating dispatch active by
+default. The normal default-on smoke also passed (`graduated by default (result=ok)`).
+`run-ci-profiles.sh quick` was blocked only at the `sender-wake` profile: the oracle
+recorded the queued-split + rollback proof markers but not
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` / `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`
+(`have_seq=0 have_kern=0`) — the sender-wake workload did not run. Fixed in **Stage
+181B** (profile plumbing, not a kernel regression).
+
+**Stage 181B — sender-wake runner/oracle plumbing.** Root cause diagnosis: the
+runner→oracle→core-smoke chain was verified to correctly deliver the sub-knob — the
+`sender-wake` profile passes `YARM_IPC_RECV_PROOF_SENDER_WAKE=1`, the oracle exports
+`IPC_RECV_PROOF_SENDER_WAKE=1`, and the x86_64 core smoke appends
+`yarm.ipc_recv_proof_sender_wake=1` (confirmed by probing the built cmdline). To make
+the failure mode UNAMBIGUOUS and deterministic, the oracle now hard-checks the
+authoritative kernel marker `YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true` before
+the sequence check: if it is absent the oracle fails immediately with a clear
+"sub-knob did not reach the kernel — runner/oracle plumbing bug" message instead of the
+confusing downstream "workload did not run". Kernel behavior is **unchanged** and the
+Stage 181 graduation is **preserved** — the sender-wake oracle still boots under the
+graduated default-on D2/D6 paths (no `unlock_graduated=0`), proving Stage 163P
+sender-wake coexists with the graduated seams. Guarded by `stage181b_sender_wake_plumbing`.
+Counts unchanged. **Stage 181 remains PENDING full acceptance** until
+`run-ci-profiles.sh quick` (incl. sender-wake) is green under QEMU.
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

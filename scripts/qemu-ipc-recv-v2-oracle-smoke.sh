@@ -346,6 +346,21 @@ if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
   # AArch64/riscv64 (whose proof recv falls back to legacy_full_path) — exactly
   # the per-arch policy proof_require already applies.
   echo "[info] ipc-oracle: proof sender-wake: REQUIRED"
+  # Stage 181B: deterministic plumbing pre-check. The sender-wake WORKLOAD only runs
+  # if yarm.ipc_recv_proof_sender_wake=1 actually reached the kernel cmdline, which the
+  # kernel confirms with `YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true`. If that
+  # marker is ABSENT, the sub-knob never reached the kernel (a runner/oracle plumbing
+  # bug) — fail HERE with an unambiguous message instead of the confusing downstream
+  # "sequence marker absent / workload did not run". (Requires YARM_IPC_RECV_PROOF_
+  # SENDER_WAKE=1 which the oracle exports as IPC_RECV_PROOF_SENDER_WAKE=1 so the core
+  # smoke appends the sub-knob.)
+  if ! marker_present "YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true"; then
+    echo "[err] ipc-oracle: sender-wake requested but yarm.ipc_recv_proof_sender_wake=1 did NOT reach the kernel cmdline"
+    echo "[err]   (YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true absent) — runner/oracle plumbing bug, not a workload failure."
+    echo "[hint] invoke as: YARM_IPC_RECV_PROOF_SENDER_WAKE=1 scripts/qemu-ipc-recv-v2-oracle-smoke.sh $ARCH"
+    exit 1
+  fi
+  echo "[ok]   ipc-oracle: sender-wake sub-knob reached the kernel (YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true)"
   proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
 else
   echo "[info] ipc-oracle: proof sender-wake: not required"
