@@ -6313,6 +6313,56 @@ Counts unchanged. **Stage 181 remains PARTIAL (user QEMU, 2026)** until the grad
 sender-wake oracle passes; the added instrumentation makes the failing seam + reason
 deterministic on the next QEMU run.
 
+**Stage 181C (cont.) — QEMU pinned the failure to fork child-register (PARTIAL).**
+The next graduated-mode QEMU run reported:
+
+```
+FORK_PROOF_ALLOC_CHILD_CAPACITY step=register reason=CapabilityFull live_tasks=12
+  max_tasks=512 reserved_cnode_slots=6152 max_total_cnode_slots=262144
+FORK_COW_FAIL reason=cap_full kernel_error=CapabilityFull syscall_code=255
+```
+ASID/VMA capacity are fine (`asid_used=11/32`, `parent_used=80/128`, `child_used=4`).
+
+Key inference: `reserved_cnode_slots=6152` is `≈ 12 live tasks × 512` default slots and
+sits at **2.3 % of `max_total_cnode_slots=262144`** — so the register `CapabilityFull`
+is **NOT** the aggregate slot budget. Tracing `ensure_cnode_space_with_slots`, the
+budget check passes and a free `cnode_spaces` slot exists, so the `CapabilityFull`
+comes from `CapabilitySpace::try_with_slots(512)` — i.e. the child's cnode-slot `Vec`
+backing allocation (`Vec::try_reserve_exact`) returns `AllocFailed`. That allocation is
+served by the kernel slab heap, whose backing pages are drawn from the **PT frame
+pool** (`global_allocator` uses `alloc_pt_frame`) — the *same* pool every user
+page-table hierarchy uses. So the true mechanism is **PT-pool / kernel-heap
+exhaustion**, surfaced as `CapabilityFull` → `Internal`.
+
+Audit results this stage (ruling out false leads): the aspace/cnode primitives are
+sound — `remove_asid` → `free_table_hierarchy` returns the *entire* page-table
+hierarchy (root + intermediates) to the PT pool, and the emergency-opt-out path
+exercises the identical create/destroy primitives yet passes, so the D3 scratch
+destroy and normal teardown do not leak. The `d2_send_genuine` fill path only adds
+diagnostic markers + dispatch deferral (the 8 sender-waiters are enqueued identically
+under opt-out), so it adds no per-send allocation. The leak therefore lives in the
+graduated default-on runtime footprint reaching the fork, which the added
+instrumentation now attributes on the next run:
+
+- `thread_state.rs` fork-register failure now emits `FORK_PROOF_ALLOC_CHILD_POOL`
+  (`pt_pool_free_frames`, requested child slots, live cnode count) plus a per-owner
+  `FORK_PROOF_ALLOC_CHILD_CNODE_OWNER id/reserved/occupied` breakdown — answering
+  "who holds the slots/pool" directly.
+- `frame_allocator::pt_pool_free_frames()` exposes the exhausted pool's headroom.
+- `handle_fork` `FORK_COW_BEGIN` now records `pt_pool_free_frames` at fork entry.
+- The graduated one-shot proof snapshots the PT pool before/after
+  (`UNLOCK_GRADUATED_POOL_BEFORE/AFTER`) and flags a net-negative delta as
+  `UNLOCK_GRADUATED_POOL_LEAK` — making the graduated path a deterministic pool-leak
+  self-check on its own boot (not just via the later fork).
+- The oracle triage prints the pool headroom, the per-owner cnode breakdown, and any
+  `UNLOCK_GRADUATED_POOL_LEAK` when fork fails, distinguishing PT-pool exhaustion from
+  a genuine slot-budget overflow.
+
+Graduation is preserved (no opt-out forced); emergency opt-out retained; no ABI or
+count change. **Stage 181 remains PARTIAL (user QEMU, 2026)**: the next graduated run's
+`FORK_PROOF_ALLOC_CHILD_POOL` + owner breakdown (or `UNLOCK_GRADUATED_POOL_LEAK`) will
+name the exact PT-pool owner so the targeted cleanup can land.
+
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
    `block_current_on_receive_with_deadline` call boundary ahead of

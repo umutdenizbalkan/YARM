@@ -1191,6 +1191,19 @@ pub fn free_pt_contiguous_frames(base_phys: u64, pages: usize) -> Result<(), Fra
     PT_FRAME_ALLOCATOR.lock().free_contiguous(base_phys, pages)
 }
 
+/// Stage 181C: free-frame count of the PT frame pool. The kernel slab heap draws
+/// its backing pages from THIS pool (see `global_allocator`), and so do all user
+/// page-table hierarchies — so an unexpectedly low value here is exactly what
+/// starves a fork child's cnode-slot `Vec` allocation (surfacing as
+/// `CapabilityFull`/`Internal`). Diagnostic accessor only; returns 0 if the pool
+/// is not yet initialized.
+pub fn pt_pool_free_frames() -> usize {
+    if ensure_pt_allocator_initialized().is_err() {
+        return 0;
+    }
+    PT_FRAME_ALLOCATOR.lock().free_frames()
+}
+
 const fn align_down(value: u64) -> u64 {
     value & !(PAGE_SIZE_U64 - 1)
 }

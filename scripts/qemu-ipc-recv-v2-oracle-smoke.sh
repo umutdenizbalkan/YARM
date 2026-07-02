@@ -344,6 +344,27 @@ diagnose_sender_wake() {
     else
       echo "[diag]   kernel reason: (no FORK_COW_FAIL / FORK_PROOF_RETURN_ERR marker — rerun with the sender-wake sub-knob so proof-gated fork markers fire)"
     fi
+    # Stage 181C: a cap_full/CapabilityFull register failure is PT-pool/heap exhaustion
+    # (the child cnode-slot Vec cannot be allocated), NOT the aggregate slot budget.
+    # Surface the pool headroom + per-owner cnode breakdown + any graduated pool leak.
+    if marker_present "FORK_PROOF_ALLOC_CHILD_CAPACITY"; then
+      echo "[diag]   $(rg -N -a "FORK_PROOF_ALLOC_CHILD_CAPACITY" "$ANALYSIS_LOG" | tail -n1)"
+    fi
+    if marker_present "FORK_PROOF_ALLOC_CHILD_POOL"; then
+      echo "[diag]   $(rg -N -a "FORK_PROOF_ALLOC_CHILD_POOL" "$ANALYSIS_LOG" | tail -n1)"
+    fi
+    if marker_present "UNLOCK_GRADUATED_POOL_LEAK"; then
+      echo "[diag]   graduated one-shot proof LEAKED PT-pool frames:"
+      echo "[diag]   $(rg -N -a "UNLOCK_GRADUATED_POOL_LEAK|UNLOCK_GRADUATED_POOL_BEFORE|UNLOCK_GRADUATED_POOL_AFTER" "$ANALYSIS_LOG" | tail -n3)"
+      echo "[diag]   => the graduated one-shot proof itself is the PT-pool leaker."
+    fi
+    if marker_present "FORK_PROOF_ALLOC_CHILD_CNODE_OWNER"; then
+      local n_owners
+      n_owners=$(rg -N -c -a "FORK_PROOF_ALLOC_CHILD_CNODE_OWNER" "$ANALYSIS_LOG")
+      echo "[diag]   per-owner cnode breakdown ($n_owners owners; showing up to 12):"
+      rg -N -a "FORK_PROOF_ALLOC_CHILD_CNODE_OWNER" "$ANALYSIS_LOG" | tail -n12 \
+        | sed 's/^/[diag]     /'
+    fi
     echo "[diag]   => sender-wake fork failed under the current mode; this is a fork/COW regression, not a plumbing or missing-order-marker issue."
     return
   fi

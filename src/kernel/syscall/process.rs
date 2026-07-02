@@ -82,7 +82,14 @@ pub(super) fn handle_fork(
         // The per-phase reasons come from the FORK_PROOF_* markers emitted inside
         // `fork_user_process_cow`; FORK_COW_FAIL below normalizes the terminal
         // KernelError into a fixed reason vocabulary the oracle greps for.
-        crate::yarm_log!("FORK_COW_BEGIN parent_tid={}", parent_tid);
+        // Stage 181C: PT-pool headroom at fork entry. The child cnode-slot Vec is drawn
+        // from the slab heap backed by this pool, so a low value here predicts the
+        // CapabilityFull/AllocFailed register failure.
+        crate::yarm_log!(
+            "FORK_COW_BEGIN parent_tid={} pt_pool_free_frames={}",
+            parent_tid,
+            crate::kernel::frame_allocator::pt_pool_free_frames()
+        );
     }
     match kernel.fork_user_process_cow(parent_tid) {
         Ok(child_tid) => {

@@ -2282,6 +2282,45 @@ impl KernelState {
                     reserved_cnode_slots,
                     limits.max_total_cnode_slots
                 );
+                // Stage 181C: reserved_cnode_slots being WELL under max_total means the
+                // register `CapabilityFull` is NOT the aggregate slot budget — it is the
+                // child cspace-slot `Vec` backing allocation failing (AllocFailed) because
+                // the PT frame pool that backs the kernel slab heap is exhausted. Report
+                // the pool headroom + the requested child capacity + a per-owner cnode
+                // breakdown so the leaking owner is unambiguous on the next run.
+                let child_requested = match parent_class {
+                    crate::kernel::task::TaskClass::Driver => limits.driver_cnode_slot_capacity,
+                    _ => limits.default_cnode_slot_capacity,
+                };
+                let pt_pool_free = crate::kernel::frame_allocator::pt_pool_free_frames();
+                let cnode_count =
+                    self.with_capability_state(|cap| cap.cnode_spaces.iter().flatten().count());
+                crate::yarm_log!(
+                    "FORK_PROOF_ALLOC_CHILD_POOL child_class={:?} child_requested_slots={} pt_pool_free_frames={} live_cnodes={}",
+                    parent_class,
+                    child_requested,
+                    pt_pool_free,
+                    cnode_count
+                );
+                // Per-owner cnode breakdown: (id, reserved slot_capacity, occupied). A
+                // single bloated/leaked cnode, or a count of owners far above live_tasks,
+                // pinpoints the reservation owner. Bounded to keep the log finite.
+                let owners = self.with_capability_state(|cap| {
+                    let mut out = alloc::vec::Vec::new();
+                    for space in cap.cnode_spaces.iter().flatten().take(40) {
+                        out.push((space.id, space.slot_capacity));
+                    }
+                    out
+                });
+                for (id, cap_slots) in owners {
+                    let occupied = self.cnode_occupied_slots(id).unwrap_or(0);
+                    crate::yarm_log!(
+                        "FORK_PROOF_ALLOC_CHILD_CNODE_OWNER id={} reserved={} occupied={}",
+                        id.0,
+                        cap_slots,
+                        occupied
+                    );
+                }
                 crate::yarm_log!("FORK_PROOF_ALLOC_CHILD_FAIL reason={:?} step=register", e);
             }
             return Err(e);
