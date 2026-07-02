@@ -348,27 +348,56 @@ impl KernelState {
             crate::yarm_log!("X86_SMP_APS_ADMITTED online={}", online);
             crate::yarm_log!("X86_SMP_UNLOCK_DONE result=aps_live online={}", online);
         } else {
-            // present>1 but online==1: APs exist but PARK (not scheduler-admitted). This is
-            // the gating Stage 183 blocker — categorized so `-smp N` runs report it exactly.
-            crate::yarm_log!(
-                "X86_SMP_AP_PARKED present={} online={} reason=no_ap_scheduler_yet",
-                present,
-                online
-            );
-            crate::yarm_log!(
-                "X86_SMP_UNLOCK_BLOCKER category=B reason=ap_scheduler_admission_required"
-            );
-            // The graduated seams remain the ONLY x86_64 path on the live (BSP) CPU — no
-            // old global-lock fallback is selected; the in-lock branch is simply unreached
-            // because there is no concurrent CPU. Prove that no fallback marker fired.
+            // present>1 but online==1: APs exist and are NOT scheduler-admitted (online
+            // stays 1 so `single_cpu` is true and no task is enqueued onto an AP). Stage 183
+            // increment 2 admits APs to a GS-initialized, interrupt-masked Rust IDLE loop —
+            // a distinct `ap_idle_live` count, still NOT scheduler-runnable. Report it.
+            #[cfg(target_arch = "x86_64")]
+            let ap_idle_live = crate::arch::x86_64::smp::ap_idle_live_count();
+            #[cfg(not(target_arch = "x86_64"))]
+            let ap_idle_live = 0usize;
+
+            // The graduated seams remain the ONLY x86_64 path on the live (BSP) CPU — no old
+            // global-lock fallback is selected; the in-lock branch is simply unreached
+            // because no AP is scheduler-runnable. Prove no fallback marker fired.
             crate::yarm_log!(
                 "X86_SMP_NO_INLOCK_FALLBACK cpu={} reason=bsp_only_graduated",
                 cpu
             );
-            crate::yarm_log!(
-                "X86_SMP_UNLOCK_DONE result=deferred reason=aps_not_admitted present={}",
-                present
-            );
+
+            if ap_idle_live > 0 {
+                // Increment-2 milestone: APs reached the GS-initialized idle-admission loop.
+                crate::yarm_log!(
+                    "X86_SMP_AP_IDLE_LIVE present={} online={} ap_idle_live={}",
+                    present,
+                    online,
+                    ap_idle_live
+                );
+                // Full scheduler admission (TSS/LAPIC/timer + online>1) is the next blocker.
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_BLOCKER category=B reason=ap_full_scheduler_admission_required"
+                );
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_DONE result=ap_idle_live present={} online={} ap_idle_live={}",
+                    present,
+                    online,
+                    ap_idle_live
+                );
+            } else {
+                // APs present but still fully parked (increment-2 admit did not take).
+                crate::yarm_log!(
+                    "X86_SMP_AP_PARKED present={} online={} reason=no_ap_scheduler_yet",
+                    present,
+                    online
+                );
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_BLOCKER category=B reason=ap_scheduler_admission_required"
+                );
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_DONE result=deferred reason=aps_not_admitted present={}",
+                    present
+                );
+            }
         }
     }
 

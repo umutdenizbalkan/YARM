@@ -60,6 +60,12 @@ pub(super) struct ApHandoff {
 
     pub(super) ready_word: u32,
     pub(super) reserved: u32,
+
+    // Stage 183 increment 2 (AP idle admission): the per-CPU record base VA for THIS AP,
+    // computed BSP-side and passed via the (low, identity-mapped) handoff so the AP can
+    // `wrmsr IA32_GS_BASE` with it WITHOUT touching higher-half `.bss` (the bootstrap PML4
+    // the AP runs on maps only text + low identity). Offset 40 in the struct.
+    pub(super) percpu_record_ptr: u64,
 }
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -332,23 +338,86 @@ pub(super) static AP_RUST_ONLINE: [core::sync::atomic::AtomicBool;
 /// was published by the trampoline asm immediately before transferring
 /// control here, so the BSP poll observes online without depending on the
 /// Rust function being able to write back to identity-mapped low memory.
+/// Stage 183 increment 2 (AP idle admission): internal proof path that admits an AP to a
+/// GS-initialized, interrupt-masked Rust idle loop instead of a bare park. This is NOT a
+/// user boot knob and selects NO production fallback; it only chooses whether the AP does
+/// the GS-base MSR init before idling. `-smp 1` boots have no APs, so this never runs
+/// there — production behavior is unchanged. TSS / local-APIC / APIC-timer stay DEFERRED
+/// this increment (they require a CR3 switch to the full kernel map + MMIO, which the
+/// bootstrap-PML4-only AP cannot safely do yet), so the AP idles with interrupts masked.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_IDLE_ADMIT_PROOF: bool = true;
+
+/// AP ready_word stage values (published in the low, identity-mapped handoff slot at
+/// offset 32 so the BSP can poll them without any AP-side higher-half access).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_RUST_ONLINE: u32 = 2; // set by the trampoline asm before entry
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IDLE_ADMIT_OK: u32 = 3; // GS written+verified, entered idle
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch (still idles)
+
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 #[unsafe(no_mangle)]
 pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
+    // `AP_IDLE_ADMIT_PROOF` is a compile-time const, so exactly one arm survives — no
+    // Rust branch/prologue that could touch `.bss` or emit SSE (the AP's CR4 has only PAE
+    // and the bootstrap PML4 maps only text + low identity). Both arms are 100% inline asm.
     let _ = handoff_ptr;
-    unsafe {
-        core::arch::asm!(
-            "cli",
-            // Emit '@' (Rust-entered breadcrumb).
-            "mov dx, 0x3F8",
-            "mov al, 0x40",
-            "out dx, al",
-            // Park forever under Rust.
-            "2:",
-            "hlt",
-            "jmp 2b",
-            options(noreturn, nostack, nomem),
-        );
+    if AP_IDLE_ADMIT_PROOF {
+        // ApHandoff offsets: ready_word=32, percpu_record_ptr=40 (rdi = handoff_ptr).
+        // 1. '@' breadcrumb. 2. wrmsr IA32_GS_BASE = percpu_record_ptr. 3. rdmsr readback
+        // + compare → publish stage 3 (ok) / 254 (gs_bad) into ready_word. 4. cli/hlt idle.
+        unsafe {
+            core::arch::asm!(
+                "cli",
+                // '@' Rust-entered breadcrumb (proves higher-half text runs).
+                "mov dx, 0x3F8",
+                "mov al, 0x40",
+                "out dx, al",
+                // rsi = percpu_record_ptr (the GS base to install).
+                "mov rsi, [rdi + 40]",
+                // wrmsr IA32_GS_BASE(0xC000_0101) = rsi (edx:eax = hi:lo).
+                "mov ecx, 0xC0000101",
+                "mov rax, rsi",
+                "mov rdx, rsi",
+                "shr rdx, 32",
+                "wrmsr",
+                // rdmsr readback → reconstruct into rax, compare with rsi.
+                "mov ecx, 0xC0000101",
+                "rdmsr",
+                "shl rdx, 32",
+                "or rax, rdx",
+                "cmp rax, rsi",
+                "jne 8f",
+                // GS verified: publish stage 3.
+                "mov dword ptr [rdi + 32], 3",
+                "jmp 9f",
+                "8:",
+                // GS mismatch: publish stage 254 (still idle safely).
+                "mov dword ptr [rdi + 32], 254",
+                "9:",
+                // Idle loop: interrupts masked (no AP IDT/LAPIC yet).
+                "cli",
+                "7:",
+                "hlt",
+                "jmp 7b",
+                options(noreturn, nostack),
+            );
+        }
+    } else {
+        unsafe {
+            core::arch::asm!(
+                "cli",
+                "mov dx, 0x3F8",
+                "mov al, 0x40",
+                "out dx, al",
+                "2:",
+                "hlt",
+                "jmp 2b",
+                options(noreturn, nostack, nomem),
+            );
+        }
     }
 }
 
