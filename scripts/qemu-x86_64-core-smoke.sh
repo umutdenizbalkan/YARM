@@ -95,35 +95,21 @@ D6_SWITCH_A=${D6_SWITCH_A:-0}
 if [[ "$D6_SWITCH_A" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_switch_a="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_switch_a=1"
 fi
-# Stage 167 (D6-GENUINE-A): D6_GENUINE=1 appends yarm.d6_genuine=1 to make the
-# rank-1 scheduler split seam its first live production caller via the default-off
-# post-with_cpu observe wire (x86_64-only; mutually exclusive with the proof/
-# switch-a knobs in the kernel gate).
+# Stage 182 (REMOVE-FALLBACKS): the D6/D2-RECV/D2-SEND graduated seams are now the
+# only x86_64 -smp1 production path (compile-time gate in the kernel — no runtime
+# toggle). The old `yarm.d6_genuine` / `yarm.d2_recv_genuine` / `yarm.d2_send_genuine`
+# SELECTOR knobs are DELETED and no longer appended to the cmdline. The D6_GENUINE /
+# D2_RECV_GENUINE / D2_SEND_GENUINE env vars are retained ONLY as diagnostic marker-check
+# selectors (the seam markers appear on every normal boot now that the seam is always
+# active); they must not append an obsolete kernel knob or select any fallback path.
 D6_GENUINE=${D6_GENUINE:-0}
-if [[ "$D6_GENUINE" == "1" && "$KERNEL_CMDLINE" != *"yarm.d6_genuine="* ]]; then
-  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d6_genuine=1"
-fi
-# Stage 168 (D2-GENUINE-RECV): D2_RECV_GENUINE=1 appends yarm.d2_recv_genuine=1 to
-# run the blocking-recv path through explicit rank-clean phase markers and (with
-# D6_GENUINE=1) the out-of-global-lock dispatch seam where eligible (x86_64-only).
 D2_RECV_GENUINE=${D2_RECV_GENUINE:-0}
-if [[ "$D2_RECV_GENUINE" == "1" && "$KERNEL_CMDLINE" != *"yarm.d2_recv_genuine="* ]]; then
-  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d2_recv_genuine=1"
-fi
-# Stage 169 (D2-GENUINE-SEND): D2_SEND_GENUINE=1 appends yarm.d2_send_genuine=1 to
-# run the blocking-send path through explicit rank-clean phase markers and the
-# out-of-global-lock dispatch seam (x86_64-only). A blocking send only happens
-# when a sender must wait (endpoint full / synchronous no-waiter); the Stage 163P
-# sender-wake proof workload deterministically creates exactly that, so enabling
-# D2_SEND_GENUINE also enables the sender-wake workload (yarm.ipc_recv_proof +
-# yarm.ipc_recv_proof_sender_wake) — which simultaneously exercises the blocking
-# send AND regression-checks the Stage 163P oracle. Override by pre-setting
-# IPC_RECV_PROOF / IPC_RECV_PROOF_SENDER_WAKE.
+# A blocking send only happens when a sender must wait; the Stage 163P sender-wake proof
+# workload deterministically creates exactly that, so the D2_SEND_GENUINE marker-check
+# also turns on the sender-wake workload (which exercises the blocking send + regression-
+# checks the Stage 163P oracle). Override by pre-setting IPC_RECV_PROOF*.
 D2_SEND_GENUINE=${D2_SEND_GENUINE:-0}
 if [[ "$D2_SEND_GENUINE" == "1" ]]; then
-  if [[ "$KERNEL_CMDLINE" != *"yarm.d2_send_genuine="* ]]; then
-    KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d2_send_genuine=1"
-  fi
   IPC_RECV_PROOF=${IPC_RECV_PROOF:-1}
   IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-1}
 fi
@@ -218,15 +204,16 @@ D3_FULL=${D3_FULL:-0}
 if [[ "$D3_FULL" == "1" && "$KERNEL_CMDLINE" != *"yarm.d3_full="* ]]; then
   KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.d3_full=1"
 fi
-# Stage 181 (GRADUATE-KNOBS): only append yarm.unlock_graduated when it is explicitly
-# 0 (emergency opt-out) or 1 (explicit graduate). An empty value leaves the kernel
-# default (graduated on x86_64 single-CPU) so the normal smoke exercises the graduated
-# path without any cmdline knob.
+# Stage 182 (REMOVE-FALLBACKS): the graduated seams are the only x86_64 -smp1 production
+# path; the `yarm.unlock_graduated` umbrella knob (incl. its `=0` emergency opt-out) is
+# DELETED. The normal smoke exercises the graduated path with NO cmdline knob. The
+# UNLOCK_GRADUATED env is retained only so an OBSOLETE-knob passthrough can be verified
+# to NOT re-enable the old fallback (the acceptance block below asserts that). When it is
+# explicitly set we deliberately still pass the now-obsolete kernel token so the kernel's
+# UNLOCK_FALLBACK_KNOB_OBSOLETE "ignored" path is exercised — it must NOT change behavior.
 UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-}
-if [[ "$UNLOCK_GRADUATED" == "1" && "$KERNEL_CMDLINE" != *"yarm.unlock_graduated="* ]]; then
-  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.unlock_graduated=1"
-elif [[ "$UNLOCK_GRADUATED" == "0" && "$KERNEL_CMDLINE" != *"yarm.unlock_graduated="* ]]; then
-  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.unlock_graduated=0"
+if [[ -n "$UNLOCK_GRADUATED" && "$KERNEL_CMDLINE" != *"yarm.unlock_graduated="* ]]; then
+  KERNEL_CMDLINE="$KERNEL_CMDLINE yarm.unlock_graduated=$UNLOCK_GRADUATED"
 fi
 # Stage 159BC/D: the IPC recv-v2 oracle proof workload only runs when the kernel
 # is booted with yarm.ipc_recv_proof=1. The oracle script sets IPC_RECV_PROOF=1
@@ -1844,69 +1831,61 @@ unlock_graduated_fatal_scan() {
   return $rc
 }
 
-if [[ "$UNLOCK_GRADUATED" == "0" ]]; then
-  echo "[info] GRADUATE-KNOBS: emergency opt-out profile (conservative fallback)"
-  if log_has_pattern "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout"; then
-    echo "[ok] GRADUATE-KNOBS: opt-out DEFERRED reason=emergency_optout present"
+# Stage 182 (REMOVE-FALLBACKS): the old opt-out (emergency_optout) is GONE. The old
+# emergency opt-out and any UNLOCK_GRADUATED_FALLBACK are now impossible — assert their
+# ABSENCE unconditionally as a negative test that the fallback was removed, not disabled.
+if log_has_pattern "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout"; then
+  echo "[error] REMOVE-FALLBACKS: obsolete emergency opt-out fallback fired (must be removed)"
+  exit 1
+fi
+if log_has_pattern "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH"; then
+  echo "[error] REMOVE-FALLBACKS: unexpected in-lock fallback dispatch on the graduated path"
+  exit 1
+fi
+if ! unlock_graduated_fatal_scan "REMOVE-FALLBACKS"; then
+  echo "[error] REMOVE-FALLBACKS: fatal graduated marker present"
+  exit 1
+fi
+
+if [[ -n "$UNLOCK_GRADUATED" ]]; then
+  # An explicit (now-OBSOLETE) yarm.unlock_graduated=$UNLOCK_GRADUATED was passed. It must
+  # be reported obsolete + ignored, and must NOT re-enable any fallback: graduation still
+  # runs regardless of the value (including the old =0 opt-out).
+  echo "[info] REMOVE-FALLBACKS: obsolete UNLOCK_GRADUATED=$UNLOCK_GRADUATED passed (must be ignored)"
+  if log_has_pattern "UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.unlock_graduated"; then
+    echo "[ok] REMOVE-FALLBACKS: kernel reported yarm.unlock_graduated obsolete + ignored"
   else
-    echo "[error] GRADUATE-KNOBS: opt-out did not record DEFERRED reason=emergency_optout"
-    exit 1
-  fi
-  if log_has_pattern "UNLOCK_GRADUATED_ENABLED"; then
-    echo "[error] GRADUATE-KNOBS: opt-out must NOT graduate (UNLOCK_GRADUATED_ENABLED present)"
-    exit 1
-  fi
-  echo "[ok] GRADUATE-KNOBS: emergency fallback boots conservatively"
-elif [[ "$UNLOCK_GRADUATED" == "1" ]]; then
-  echo "[info] GRADUATE-KNOBS: explicit graduated profile (STRICT)"
-  ug_fail=0
-  for m in \
-    "UNLOCK_GRADUATED_ENABLED" \
-    "UNLOCK_GRADUATED_D2_RECV_OK" \
-    "UNLOCK_GRADUATED_D2_SEND_OK" \
-    "UNLOCK_GRADUATED_D6_OK" \
-    "UNLOCK_GRADUATED_D3_OK" \
-    "UNLOCK_GRADUATED_INVARIANT_OK"; do
-    if log_has_pattern "$m"; then
-      echo "[ok] GRADUATE-KNOBS marker present: $m"
-    else
-      echo "[error] GRADUATE-KNOBS: required marker missing: $m"
-      ug_fail=1
-    fi
-  done
-  if ! log_has_pattern "UNLOCK_GRADUATED_DONE result=ok"; then
-    echo "[error] GRADUATE-KNOBS: UNLOCK_GRADUATED_DONE result=ok missing"
-    ug_fail=1
-  fi
-  # Stage 163P sender-wake ordering must be preserved under graduation.
-  for sw in \
-    "IPC_RECV_PROOF_SENDER_WAKE_BLOCKED_OK" \
-    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK" \
-    "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"; do
-    if ! log_has_pattern "$sw"; then
-      echo "[warn] GRADUATE-KNOBS: Stage 163P sender-wake marker not observed: $sw"
-    fi
-  done
-  if ! unlock_graduated_fatal_scan "GRADUATE-KNOBS"; then ug_fail=1; fi
-  if [[ "$ug_fail" -eq 1 ]]; then
-    echo "[error] GRADUATE-KNOBS mode FAILED"
-    exit 1
-  fi
-  echo "[ok] GRADUATE-KNOBS: x86_64 -smp1 accepted seams graduated (d2_recv/d2_send/d6/d3)"
-else
-  # Normal default-on boot: soft-observe the graduated verdict; fatal markers still fail.
-  if log_has_pattern "UNLOCK_GRADUATED_DONE result=ok"; then
-    echo "[ok] GRADUATE-KNOBS: normal boot graduated by default (result=ok)"
-  elif log_has_pattern "UNLOCK_GRADUATED_DEFERRED"; then
-    echo "[info] GRADUATE-KNOBS: normal boot deferred graduation (see reason)"
-  else
-    echo "[info] GRADUATE-KNOBS: graduated verdict not observed on this normal run"
-  fi
-  if ! unlock_graduated_fatal_scan "GRADUATE-KNOBS"; then
-    echo "[error] GRADUATE-KNOBS: fatal graduated marker on normal boot"
+    echo "[error] REMOVE-FALLBACKS: kernel did not report the obsolete unlock_graduated knob"
     exit 1
   fi
 fi
+
+# The graduated path is the production path on every boot. Require the graduated verdict
+# (result=ok) and the accepted seam OK markers; a missing/failed verdict is fatal now
+# (no longer a soft-observe — there is no other path to fall back to).
+ug_fail=0
+for m in \
+  "UNLOCK_GRADUATED_D2_RECV_OK" \
+  "UNLOCK_GRADUATED_D2_SEND_OK" \
+  "UNLOCK_GRADUATED_D6_OK" \
+  "UNLOCK_GRADUATED_D3_OK" \
+  "UNLOCK_GRADUATED_INVARIANT_OK"; do
+  if log_has_pattern "$m"; then
+    echo "[ok] REMOVE-FALLBACKS marker present: $m"
+  else
+    echo "[error] REMOVE-FALLBACKS: required graduated marker missing: $m"
+    ug_fail=1
+  fi
+done
+if ! log_has_pattern "UNLOCK_GRADUATED_DONE result=ok"; then
+  echo "[error] REMOVE-FALLBACKS: UNLOCK_GRADUATED_DONE result=ok missing (graduated path must run)"
+  ug_fail=1
+fi
+if [[ "$ug_fail" -eq 1 ]]; then
+  echo "[error] REMOVE-FALLBACKS: graduated production path verification FAILED"
+  exit 1
+fi
+echo "[ok] REMOVE-FALLBACKS: x86_64 -smp1 graduated seams are the only production path (no fallback)"
 
 if log_has_pattern "YARM_BOOT_OK"; then
   echo "[ok] x86_64 boot markers detected"

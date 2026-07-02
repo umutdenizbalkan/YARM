@@ -856,33 +856,25 @@ impl KernelState {
             pt_free_before
         );
 
-        // Each accepted seam gate must be on (the umbrella enabled them at apply). An
-        // off gate means the committed path fell back to the conservative in-lock path.
-        let d2_recv = crate::kernel::boot::d2_recv_genuine_enabled();
-        let d2_send = crate::kernel::boot::d2_send_genuine_enabled();
-        let d6 = crate::kernel::boot::d6_genuine_enabled();
-
-        if d2_recv {
-            crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d2_recv");
-            crate::yarm_log!("UNLOCK_GRADUATED_D2_RECV_OK");
-        } else {
-            crate::yarm_log!("UNLOCK_GRADUATED_FALLBACK path=d2_recv reason=gate_off");
-            crate::yarm_log!("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH path=d2_recv");
-        }
-        if d2_send {
-            crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d2_send");
-            crate::yarm_log!("UNLOCK_GRADUATED_D2_SEND_OK");
-        } else {
-            crate::yarm_log!("UNLOCK_GRADUATED_FALLBACK path=d2_send reason=gate_off");
-            crate::yarm_log!("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH path=d2_send");
-        }
-        if d6 {
-            crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d6");
-            crate::yarm_log!("UNLOCK_GRADUATED_D6_OK");
-        } else {
-            crate::yarm_log!("UNLOCK_GRADUATED_FALLBACK path=d6 reason=gate_off");
-            crate::yarm_log!("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH path=d6");
-        }
+        // Stage 182 (REMOVE-FALLBACKS): the D2-RECV/D2-SEND/D6 seam gates are now
+        // compile-time production constants (`d*_genuine_enabled()` — no runtime toggle,
+        // no opt-out). The old `else { UNLOCK_GRADUATED_FALLBACK / UNEXPECTED_INLOCK }`
+        // branches were dead once the seams can no longer be turned off, so they are
+        // deleted (no dead fallback branches "just in case"). The PATH_ENABLED / *_OK
+        // markers below remain as positive evidence that the graduated path is the one
+        // in force. A `debug_assert` keeps the invariant honest in checked builds.
+        debug_assert!(
+            crate::kernel::boot::d2_recv_genuine_enabled()
+                && crate::kernel::boot::d2_send_genuine_enabled()
+                && crate::kernel::boot::d6_genuine_enabled(),
+            "graduated seams must be the compile-time production path when the proof runs"
+        );
+        crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d2_recv");
+        crate::yarm_log!("UNLOCK_GRADUATED_D2_RECV_OK");
+        crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d2_send");
+        crate::yarm_log!("UNLOCK_GRADUATED_D2_SEND_OK");
+        crate::yarm_log!("UNLOCK_GRADUATED_PATH_ENABLED path=d6");
+        crate::yarm_log!("UNLOCK_GRADUATED_D6_OK");
 
         // D3: production VmAnonMap/VmUnmap is ALREADY the accepted two-phase path
         // (Stage 172/179); confirm the primitives via a compact scratch check.
@@ -916,7 +908,7 @@ impl KernelState {
             );
         }
 
-        if d2_recv && d2_send && d6 && d3_ok && self.current_tid() == Some(tid) {
+        if d3_ok && self.current_tid() == Some(tid) {
             crate::yarm_log!("UNLOCK_GRADUATED_INVARIANT_OK");
             crate::yarm_log!("UNLOCK_GRADUATED_DONE result=ok");
         } else {

@@ -6534,6 +6534,57 @@ the confirming graduated QEMU run**: expected `UNLOCK_GRADUATED_POOL_AFTER == BE
    concurrent with D6-GENUINE / D2-GENUINE but must not introduce new seam callers
    without the helper-only fence rule (§6.6, §8).
 
+### 7.1.18 Stage 182 — REMOVE-FALLBACKS (graduated seams are the only production path)
+
+**Stage 181 is ACCEPTED** (graduated sender-wake reaches `FORK_COW_DONE` +
+`IPC_RECV_V2_SENDER_WAKE_ORDER_OK` + `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; opt-out
+passed; `UNLOCK_GRADUATED_POOL_AFTER == BEFORE`; no `UNLOCK_GRADUATED_POOL_LEAK`;
+allocation-free leaf-delete). Stage 182 **removes** the obsolete production fallback
+paths + knobs that Stage 181's graduation made redundant on x86_64 `-smp 1` — it deletes
+them, it does not hard-disable them.
+
+**What was removed (deleted, not dormant):**
+
+- The runtime seam-toggle plumbing: `UNLOCK_GRADUATED_ENABLED` / `D6_GENUINE_ENABLED` /
+  `D2_RECV_GENUINE_ENABLED` / `D2_SEND_GENUINE_ENABLED` `AtomicBool`s and their
+  `set_*_enabled()` setters. The gate accessors (`d6_genuine_enabled()` etc.) are now
+  **compile-time `cfg!(target_arch = "x86_64")` constants** (graduated on x86_64 unless a
+  category-D D6-switch diagnostic owns the switch path). There is no local boolean a
+  knob/env/flag can flip back to the old path.
+- The `yarm.unlock_graduated` umbrella knob **including its `=0` emergency opt-out** that
+  ran the old global-lock production path, and the per-seam SELECTOR knobs
+  `yarm.d6_genuine` / `yarm.d2_recv_genuine` / `yarm.d2_send_genuine`. They are still
+  *recognized* only to emit `UNLOCK_FALLBACK_KNOB_OBSOLETE knob=<...> action=ignored` — a
+  stale boot line can never re-enable the fallback.
+- The dead `else { UNLOCK_GRADUATED_FALLBACK / UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH }`
+  branches in the one-shot proof (the seams can no longer be off), replaced by a
+  `debug_assert!` on the compile-time seam invariant + the positive `PATH_ENABLED`/`*_OK`
+  evidence markers.
+- Scripts: the `unlock-optout` runner profile is deleted; the smoke no longer appends any
+  obsolete seam knob and its acceptance block is a **negative test** — it asserts the old
+  `emergency_optout` deferral / `UNLOCK_GRADUATED_FALLBACK` / `UNEXPECTED_INLOCK_DISPATCH`
+  markers never fire and requires the graduated verdict (`UNLOCK_GRADUATED_DONE
+  result=ok`). The oracle asserts the same absences on the graduated sender-wake run.
+
+**What was preserved (NOT a production fallback):**
+
+- The **eligibility-based in-lock path** (`single_cpu` runtime guard + `cfg(not(x86_64))`)
+  remains the sole path for SMP>1 (Stage 183 SMP-LIVE) and AArch64/RISC-V (Stage 184
+  CROSS-ARCH-LIVE). It is reached by hardware/topology, not by a knob — it is the future
+  live-unlock surface, not an obsolete production fallback.
+- The D6-SWITCH-PROOF / D6-SWITCH-A diagnostics (category D) and the per-seam
+  D2/D6 marker-check env selectors in the smoke stay as diagnostics that prove the
+  graduated seam markers appear; they no longer append any kernel knob and select no path.
+- **All Stage 181 guards**: `UNLOCK_GRADUATED_POOL_LEAK`, the sender-wake oracle checks,
+  the allocation-free leaf-delete (`delete_if_leaf` + `has_any_delegated_child`), and full
+  recursive `revoke` for real non-leaf caps. No warm-page allowance; no PT-pool /
+  cnode-slot / task-limit / `MAX_ADDRESS_SPACES` increase; no ABI/count change
+  (`SYSCALL_COUNT=31`, `Syscall::VARIANT_COUNT=23`, x86_64 `MAX_ADDRESS_SPACES=32`).
+
+Runtime behavior on every path is **identical** to accepted Stage 181 — only the ability
+to toggle back to the fallback is gone. Guarded by `stage182_remove_fallbacks` +
+updated `stage181_graduate_knobs` / `stage16{7,8,9}` / `stage170` negative source guards.
+
 ### 7.1.6 What must not be touched yet
 
 - D1/D5/D2 canonical fallbacks. `materialize_received_message_cap`

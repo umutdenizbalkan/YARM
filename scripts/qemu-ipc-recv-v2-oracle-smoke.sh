@@ -233,6 +233,19 @@ for f in "${FATAL_MARKERS[@]}"; do
   fi
 done
 
+# Stage 182 (REMOVE-FALLBACKS): the graduated seams are the ONLY x86_64 production path.
+# No old global-lock fallback, no emergency opt-out, and no unexpected in-lock dispatch
+# may ever appear — assert their ABSENCE (the fallback was removed, not disabled).
+for f in \
+  "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" \
+  "UNLOCK_GRADUATED_FALLBACK path=" \
+  "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH"; do
+  if marker_present "$f"; then
+    echo "[err] ipc-oracle: REMOVE-FALLBACKS: obsolete fallback/opt-out path fired: $f"
+    rc=1
+  fi
+done
+
 # At least one recv-v2 meta delivery must be proven.
 any_required=0
 for r in "${REQUIRED_ANY[@]}"; do
