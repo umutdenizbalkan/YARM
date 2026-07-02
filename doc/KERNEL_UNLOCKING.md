@@ -6658,6 +6658,35 @@ a fault would surface as an admit-stage timeout (`X86_AP_SCHED_ADMIT_FAIL`) rath
 silent hang, since the BSP poll is bounded. D2/D6 SMP-live remains gated behind full
 scheduler admission (next increments); `single_cpu` is NOT relaxed.
 
+**Increment 2 diagnostic — deterministic AP breadcrumb ⇄ stage trace.** The observed
+host symptom is that the AP reaches the `@` (Rust-entered) COM1 breadcrumb but never
+publishes a terminal admit stage, so the BSP times out. The interleaved post-SIPI serial
+bytes (`g P h 4 A 3 C e L S R @ …`) are **intentional breadcrumbs, not corruption**; each
+maps to an exact asm block. To turn that stream into a deterministic trace and name the
+*first failing transition* without guessing:
+
+- A dedicated **stage word** at `ApHandoff` offset 48 (`ap_stage`, distinct from the coarse
+  `ready_word` at offset 32) is written by the AP entry asm **before every risky action**,
+  paired with a distinct breadcrumb byte: `@`/`AP_STAGE_RUST_ENTERED(10)` → `H`/handoff
+  loaded(11) → `V`/validated(12) → `W`/before-wrmsr(13) → `w`/after-wrmsr(14) → `r`/
+  after-rdmsr(15) → `O`/`gs_verified(16)` (or `B`/`gs_mismatch(254)`, or `!`/`handoff_null
+  (253)`) → `I`/before-hlt(17) → `Z`/`idle(18)`. The full byte↔stage↔asm-block table (mapped
+  from the actual asm, incl. preconditions and "failure-after-this-byte" meaning) lives as a
+  comment block in `smp_trampoline.rs`.
+- The failing transition is instrumented at exactly the seams that can fault on an AP with
+  no IDT: loading + **validating** the handoff pointer (null → stage 253, skip wrmsr),
+  `wrmsr IA32_GS_BASE`, `rdmsr` readback, the GS-readback compare, and entering the first
+  `hlt`. `dx` is reloaded to `0x3F8` after each MSR op (wrmsr/rdmsr clobber `rdx`).
+- On admit-poll timeout the BSP now reads offset 48 and reports
+  `X86_AP_SCHED_ADMIT_FAIL cpu=<id> reason=timeout last_stage=<name> last_stage_raw=<hex>`
+  (via `ap_stage_word_low_virt` + `ap_stage_name`), so the next `smp2-core` run names the
+  last stage the AP reached — the first missing stage then drives the targeted admission fix.
+- Layout hardening: the trampoline handoff reservation grew `.zero 40` → `.zero 56` to hold
+  the full 56-byte `ApHandoff`, and a compile-time `offset_of!` guard locks `ready_word@32`,
+  `percpu_record_ptr@40`, `ap_stage@48` (the offsets the asm hardcodes). The AP path stays
+  ultra-minimal: no Rust calls / higher-half `.bss`/`.data` / LAPIC MMIO / TSS / AP timer /
+  scheduler-runnable AP / D2/D6 seam. Guarded by `stage183_ap_stage_trace_is_deterministic`.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

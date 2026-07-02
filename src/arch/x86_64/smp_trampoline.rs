@@ -33,14 +33,23 @@ pub(super) const AP_TRAMPOLINE_SIZE: usize = crate::kernel::vm::PAGE_SIZE;
 pub(super) const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 
 // ApHandoff layout:
-//   0  magic:            u32
-//   4  cpu_id:           u32
-//   8  stack_top:        u64
-//   16 kernel_state_ptr: u64   // production: CR3/PML4 physical address
-//   24 ready_flag_ptr:   u64   // diagnostic/layout only for now
-//   32 ready_word:       u32   // AP assembly writes 1 here directly
-//   36 reserved:         u32
+//   0  magic:             u32
+//   4  cpu_id:            u32
+//   8  stack_top:         u64
+//   16 kernel_state_ptr:  u64   // production: CR3/PML4 physical address
+//   24 ready_flag_ptr:    u64   // diagnostic/layout only for now
+//   32 ready_word:        u32   // AP assembly writes 1/2/3/254 here directly
+//   36 reserved:          u32
+//   40 percpu_record_ptr: u64   // Stage 183 inc.2: AP GS base (low identity handoff)
+//   48 ap_stage:          u32   // Stage 183 inc.2: fine-grained AP stage trace word
+//   52 <pad>:             u32   // struct is u64-aligned → size_of == 56
 pub(super) const AP_HANDOFF_READY_WORD_OFFSET: usize = 32;
+
+// Stage 183 inc.2: the AP writes an incrementing stage code here (offset 48) before
+// every risky action, so a BSP admit-poll timeout can report the LAST stage the AP
+// reached (`last_stage`) instead of only "it didn't finish". Distinct from ready_word
+// (offset 32), which stays the coarse online(2)/admit(3)/gs_bad(254) signal.
+pub(super) const AP_HANDOFF_STAGE_WORD_OFFSET: usize = 48;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -66,7 +75,26 @@ pub(super) struct ApHandoff {
     // `wrmsr IA32_GS_BASE` with it WITHOUT touching higher-half `.bss` (the bootstrap PML4
     // the AP runs on maps only text + low identity). Offset 40 in the struct.
     pub(super) percpu_record_ptr: u64,
+
+    // Stage 183 increment 2 (AP idle admission): fine-grained stage trace. The AP entry
+    // asm writes an `AP_STAGE_*` code here (offset 48) before every risky action so the
+    // BSP admit-poll can name the last stage the AP reached on timeout. u32 field; the
+    // struct is u64-aligned so `size_of::<ApHandoff>() == 56`.
+    pub(super) ap_stage: u32,
 }
+
+// Stage 183 inc.2 layout guard: the trampoline / AP-entry asm hardcodes these field
+// offsets ([rdi+32], [rdi+40], [rdi+48]) and the `.zero 56` handoff reservation. Lock
+// the Rust struct to them at compile time so a field reorder can never silently make the
+// asm read/write the wrong slot.
+const _: () = {
+    assert!(core::mem::size_of::<ApHandoff>() == 56);
+    assert!(core::mem::offset_of!(ApHandoff, ready_word) == AP_HANDOFF_READY_WORD_OFFSET);
+    assert!(core::mem::offset_of!(ApHandoff, ready_word) == 32);
+    assert!(core::mem::offset_of!(ApHandoff, percpu_record_ptr) == 40);
+    assert!(core::mem::offset_of!(ApHandoff, ap_stage) == AP_HANDOFF_STAGE_WORD_OFFSET);
+    assert!(core::mem::offset_of!(ApHandoff, ap_stage) == 48);
+};
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 struct TrampolineScratch(core::cell::UnsafeCell<[u8; AP_TRAMPOLINE_SIZE]>);
@@ -292,7 +320,11 @@ ap_long_entry:
 
     .align 8
 yarm_ap_trampoline_handoff:
-    .zero 40
+    // Reserve the FULL ApHandoff (size_of::<ApHandoff>() == 56): magic(0) cpu_id(4)
+    // stack_top(8) kernel_state_ptr(16) ready_flag_ptr(24) ready_word(32) reserved(36)
+    // percpu_record_ptr(40) ap_stage(48) pad(52). Under-reserving would place the AP
+    // stage word past `yarm_ap_trampoline_end`, shrinking the copied trampoline `len`.
+    .zero 56
 
 yarm_ap_trampoline_end:
     .code64
@@ -357,6 +389,105 @@ pub(super) const AP_STAGE_IDLE_ADMIT_OK: u32 = 3; // GS written+verified, entere
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch (still idles)
 
+// ---------------------------------------------------------------------------
+// Stage 183 increment 2 — AP breadcrumb ⇄ stage trace map (offset 48 stage word)
+// ---------------------------------------------------------------------------
+// The AP path emits a serial breadcrumb byte to COM1 (port 0x3F8) AND writes a
+// numeric AP_STAGE_* code to the low-memory stage word at [handoff+48] before
+// every risky action. The breadcrumb bytes are INTENTIONAL, not corruption; the
+// stage word turns the interleaved serial stream into a deterministic trace the
+// BSP can name on timeout (`last_stage=<name> last_stage_raw=<hex>`).
+//
+// Trampoline breadcrumbs (pre-Rust, no stage word — asm in the global_asm! above):
+//   byte  asm block / instruction boundary          meaning / precondition
+//   'g'   yarm_ap_trampoline_start (real mode)       AP executing @ phys 0x7000
+//   'G'   after ds/es/ss=0, sp=0x7c00                real-mode segments loaded
+//   'p'   after `lgdt cs:[AP_OFF_GDTR]`              GDTR loaded from low page
+//   'P'   after CR0.PE=1                              protected mode enabled
+//   'h'   ap_protected_entry (.code32)               reached 32-bit protected mode
+//   '4'   before CR4.PAE                              about to set PAE
+//   'A'   after CR4.PAE=1                             PAE on (no other CR4 bits!)
+//   '3'   before CR3 load                             about to load handoff.kernel_state_ptr
+//   'C'   after `mov cr3, eax`                        bootstrap PML4 installed
+//   'e'   before EFER.LME                             about to enable long mode
+//   'E'   after EFER.LME=1                            IA-32e mode enabled
+//   'x'   before CR0.PG                               about to enable paging
+//   'X'   after CR0.PG=1                              paging on
+//   'j'   before long-mode far jump                   about to jump to .code64
+//   'L'   ap_long_entry (.code64)                     reached 64-bit long mode
+//   's'   before stack load                           about to load handoff.stack_top
+//   'S'   after `mov rsp,[..8]; and rsp,-16`          AP stack installed + aligned
+//   'R'   after `[handoff+32]=1`                      ready_word=1 (trampoline reached)
+//   '2'   after `[handoff+32]=2`                      ready_word=2 (Rust online published)
+//   ...   `movabs rax,OFFSET yarm_x86_64_ap_entry; jmp rax` → higher-half Rust
+//
+// Rust AP entry breadcrumbs (paired with stage word [handoff+48], asm in
+// yarm_x86_64_ap_entry below). "failure after this byte" = the AP died between
+// this stage and the next expected one:
+//   byte  stage word                     next expected   failure-after meaning
+//   '@'   AP_STAGE_RUST_ENTERED (10)      'H'             higher-half text ran; died before handoff load
+//   'H'   AP_STAGE_HANDOFF_LOADED (11)    'V'/'!'         read [rdi+40]; died before null check
+//   'V'   AP_STAGE_HANDOFF_VALIDATED (12) 'W'             percpu_record_ptr non-null; died before wrmsr
+//   'W'   AP_STAGE_BEFORE_WRMSR (13)      'w'             about to wrmsr IA32_GS_BASE; #GP/fault in wrmsr
+//   'w'   AP_STAGE_AFTER_WRMSR (14)       'r'             wrmsr returned; died before rdmsr readback
+//   'r'   AP_STAGE_AFTER_RDMSR (15)       'O'/'B'         rdmsr returned; died before compare
+//   'O'   AP_STAGE_GS_VERIFIED (16)       'I'             GS readback == written; entering idle
+//   'B'   AP_STAGE_GS_MISMATCH (254)      'I'             GS readback != written (still idles safely)
+//   '!'   AP_STAGE_HANDOFF_NULL (253)     'I'             percpu_record_ptr was 0 (BSP handoff bug)
+//   'I'   AP_STAGE_BEFORE_HLT (17)        'Z'             about to cli;hlt; died before first hlt
+//   'Z'   AP_STAGE_IDLE (18)              (parked)        AP parked in cli/hlt idle loop — success
+//
+// Preconditions carried across the Rust jump: CR4=PAE-only (no SSE), bootstrap PML4
+// maps text + low identity ONLY (no .bss/.data/MMIO), interrupts masked (no AP IDT).
+// The stage word / ready_word / percpu_record_ptr all live in the low identity page.
+
+// Fine-grained AP stage-word codes (written to [handoff+48] by yarm_x86_64_ap_entry).
+// The BSP reads this on admit-poll timeout to name the last stage the AP reached.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_RUST_ENTERED: u32 = 10;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_HANDOFF_LOADED: u32 = 11;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_HANDOFF_VALIDATED: u32 = 12;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_BEFORE_WRMSR: u32 = 13;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_AFTER_WRMSR: u32 = 14;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_AFTER_RDMSR: u32 = 15;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_GS_VERIFIED: u32 = 16;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_BEFORE_HLT: u32 = 17;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IDLE: u32 = 18;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_HANDOFF_NULL: u32 = 253; // percpu_record_ptr == 0 (BSP bug)
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_GS_MISMATCH: u32 = 254; // rdmsr readback != value written
+
+/// Name a fine-grained AP stage-word code for the BSP admit-poll timeout log.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_stage_name(raw: u32) -> &'static str {
+    match raw {
+        0 => "none",
+        AP_STAGE_RUST_ONLINE => "rust_online",
+        AP_STAGE_IDLE_ADMIT_OK => "idle_admit_ok",
+        AP_STAGE_RUST_ENTERED => "rust_entered",
+        AP_STAGE_HANDOFF_LOADED => "handoff_loaded",
+        AP_STAGE_HANDOFF_VALIDATED => "handoff_validated",
+        AP_STAGE_BEFORE_WRMSR => "before_wrmsr",
+        AP_STAGE_AFTER_WRMSR => "after_wrmsr",
+        AP_STAGE_AFTER_RDMSR => "after_rdmsr",
+        AP_STAGE_GS_VERIFIED => "gs_verified",
+        AP_STAGE_BEFORE_HLT => "before_hlt",
+        AP_STAGE_IDLE => "idle",
+        AP_STAGE_HANDOFF_NULL => "handoff_null",
+        AP_STAGE_GS_MISMATCH => "gs_mismatch",
+        _ => "unknown",
+    }
+}
+
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 #[unsafe(no_mangle)]
 pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
@@ -365,43 +496,96 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
     // and the bootstrap PML4 maps only text + low identity). Both arms are 100% inline asm.
     let _ = handoff_ptr;
     if AP_IDLE_ADMIT_PROOF {
-        // ApHandoff offsets: ready_word=32, percpu_record_ptr=40 (rdi = handoff_ptr).
-        // 1. '@' breadcrumb. 2. wrmsr IA32_GS_BASE = percpu_record_ptr. 3. rdmsr readback
-        // + compare → publish stage 3 (ok) / 254 (gs_bad) into ready_word. 4. cli/hlt idle.
+        // ApHandoff offsets (rdi = handoff_ptr): ready_word=32, percpu_record_ptr=40,
+        // ap_stage=48. Every risky action is preceded by a paired serial breadcrumb byte
+        // AND a stage-word write to [rdi+48], so a BSP timeout can name the last stage.
+        // `dx` is reloaded to 0x3F8 before each `out` because rdmsr/wrmsr clobber rdx.
+        // See the "AP breadcrumb ⇄ stage trace map" table above for the byte↔stage↔block
+        // mapping and the "failure after this byte" semantics.
         unsafe {
             core::arch::asm!(
                 "cli",
-                // '@' Rust-entered breadcrumb (proves higher-half text runs).
+                // '@' / stage 10: the Rust-entered breadcrumb — higher-half Rust text ran.
                 "mov dx, 0x3F8",
-                "mov al, 0x40",
+                "mov al, 0x40", // '@'
                 "out dx, al",
-                // rsi = percpu_record_ptr (the GS base to install).
+                "mov dword ptr [rdi + 48], 10",
+                // 'H' / stage 11: load handoff pointer (percpu_record_ptr → GS base).
                 "mov rsi, [rdi + 40]",
+                "mov al, 0x48", // 'H'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 11",
+                // Validate the handoff pointer: null ⇒ BSP bug, skip wrmsr, idle at 253.
+                "test rsi, rsi",
+                "jz 6f",
+                // 'V' / stage 12: handoff pointer validated (non-null).
+                "mov al, 0x56", // 'V'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 12",
+                // 'W' / stage 13: about to wrmsr IA32_GS_BASE.
+                "mov al, 0x57", // 'W'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 13",
                 // wrmsr IA32_GS_BASE(0xC000_0101) = rsi (edx:eax = hi:lo).
                 "mov ecx, 0xC0000101",
                 "mov rax, rsi",
                 "mov rdx, rsi",
                 "shr rdx, 32",
                 "wrmsr",
-                // rdmsr readback → reconstruct into rax, compare with rsi.
+                // 'w' / stage 14: wrmsr returned.
+                "mov dx, 0x3F8",
+                "mov al, 0x77", // 'w'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 14",
+                // rdmsr IA32_GS_BASE readback → reconstruct into rax.
                 "mov ecx, 0xC0000101",
                 "rdmsr",
                 "shl rdx, 32",
                 "or rax, rdx",
-                "cmp rax, rsi",
+                // 'r' / stage 15: rdmsr returned (rax = readback).
+                "mov dx, 0x3F8",
+                "mov r8, rax",  // preserve readback across the breadcrumb
+                "mov al, 0x72", // 'r'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 15",
+                // Compare readback (r8) with the value written (rsi).
+                "cmp r8, rsi",
                 "jne 8f",
-                // GS verified: publish stage 3.
+                // 'O' / stage 16: GS verified. Publish ready_word=3 (admit ok).
+                "mov al, 0x4F", // 'O'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 16",
                 "mov dword ptr [rdi + 32], 3",
-                "jmp 9f",
+                "jmp 5f",
                 "8:",
-                // GS mismatch: publish stage 254 (still idle safely).
+                // 'B' / stage 254: GS readback mismatch. Publish ready_word=254; still idle.
+                "mov al, 0x42", // 'B'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 254",
                 "mov dword ptr [rdi + 32], 254",
-                "9:",
+                "jmp 5f",
+                "6:",
+                // '!' / stage 253: handoff pointer was null (BSP bug). ready_word=254; idle.
+                "mov al, 0x21", // '!'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 253",
+                "mov dword ptr [rdi + 32], 254",
+                "5:",
+                // 'I' / stage 17: about to enter the cli/hlt idle loop.
+                "mov al, 0x49", // 'I'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 17",
                 // Idle loop: interrupts masked (no AP IDT/LAPIC yet).
                 "cli",
+                // 'Z' / stage 18: parked in idle.
+                "mov al, 0x5A", // 'Z'
+                "out dx, al",
+                "mov dword ptr [rdi + 48], 18",
                 "7:",
                 "hlt",
                 "jmp 7b",
+                // No output/clobber operands: `noreturn` forbids outputs, and execution
+                // never returns here, so r8/rax/rcx/rdx clobbers are moot.
                 options(noreturn, nostack),
             );
         }
@@ -496,6 +680,7 @@ pub(super) fn encode_trampoline_page(
         (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_READY_WORD_OFFSET) as u64;
     patched.ready_word = 0;
     patched.reserved = 0;
+    patched.ap_stage = 0;
 
     let handoff_bytes = unsafe {
         core::slice::from_raw_parts(
@@ -535,6 +720,14 @@ pub(super) fn write_trampoline_page(page: &[u8; AP_TRAMPOLINE_SIZE]) {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) fn ap_ready_word_low_virt(handoff_off: usize) -> *const u32 {
     (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_READY_WORD_OFFSET) as *const u32
+}
+
+/// Stage 183 inc.2: low identity-mapped VA of the AP fine-grained stage word (offset 48).
+/// Read by the BSP admit-poll so a timeout can name the last stage the AP reached without
+/// any AP-side higher-half access.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_stage_word_low_virt(handoff_off: usize) -> *const u32 {
+    (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_STAGE_WORD_OFFSET) as *const u32
 }
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]

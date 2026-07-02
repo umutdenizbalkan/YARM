@@ -351,6 +351,8 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
         // Stage 183 inc.2: per-CPU record base for this AP, so its Rust entry can
         // wrmsr IA32_GS_BASE without a higher-half .bss access.
         percpu_record_ptr: super::percpu::record_base(cpu) as u64,
+        // Stage 183 inc.2: fine-grained AP stage trace word starts at "none" (0).
+        ap_stage: 0,
     };
 
     crate::yarm_log!(
@@ -636,6 +638,7 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         {
             use super::smp_trampoline::{
                 AP_IDLE_ADMIT_PROOF, AP_STAGE_IDLE_ADMIT_GS_BAD, AP_STAGE_IDLE_ADMIT_OK,
+                ap_stage_name, ap_stage_word_low_virt,
             };
             if AP_IDLE_ADMIT_PROOF {
                 crate::yarm_log!("X86_AP_SCHED_ADMIT_BEGIN cpu={}", cpu.0);
@@ -654,9 +657,14 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                     crate::yarm_log!("X86_AP_GS_BAD cpu={}", cpu.0);
                 } else {
                     // The AP never published a terminal admit stage → it did not reach idle.
+                    // Read the fine-grained stage word so the failure names the exact block
+                    // the AP died in instead of a bare "timeout" (Stage 183 inc.2 diagnostic).
+                    let last_raw = unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
                     crate::yarm_log!(
-                        "X86_AP_SCHED_ADMIT_FAIL cpu={} reason=admit_stage_timeout",
-                        cpu.0
+                        "X86_AP_SCHED_ADMIT_FAIL cpu={} reason=timeout last_stage={} last_stage_raw=0x{:x}",
+                        cpu.0,
+                        ap_stage_name(last_raw),
+                        last_raw
                     );
                     crate::yarm_log!("X86_AP_IDLE_FAIL cpu={}", cpu.0);
                 }
