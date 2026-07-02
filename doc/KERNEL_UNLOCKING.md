@@ -6687,6 +6687,40 @@ maps to an exact asm block. To turn that stream into a deterministic trace and n
   ultra-minimal: no Rust calls / higher-half `.bss`/`.data` / LAPIC MMIO / TSS / AP timer /
   scheduler-runnable AP / D2/D6 seam. Guarded by `stage183_ap_stage_trace_is_deterministic`.
 
+**Increment 2 `@ → H` ROOT CAUSE (found by disassembly + reference audit, host-pinned to
+the first rdi dereference).** Two independent defects, both fixed, both verified in the
+built ELF's disassembly:
+
+1. **Trampoline misassembly (the deterministic killer):** `add rdi, AP_OFF_HANDOFF`
+   assembled as `add rdi, QWORD PTR ds:0x140` — GAS Intel syntax treats a bare
+   symbol-difference `.set` as a **memory operand**, so the AP added the 8 bytes at
+   physical `0x140` (BIOS IVT vector 0x50 area — SeaBIOS junk) instead of the constant.
+   `rdi` was corrupt **before** `jmp rax`; the first store through it in the Rust entry
+   faulted (no AP IDT → triple fault → silence after `@`). Fixed to
+   `add rdi, OFFSET AP_OFF_HANDOFF` (immediate; same idiom as
+   `movabs rax, OFFSET yarm_x86_64_ap_entry`). Post-fix disassembly:
+   `48 81 c7 40 01 00 00 = add rdi, 0x140`. Pure-numeric `.set`s
+   (`mov rbx, AP_TRAMPOLINE_BASE` → `mov rbx, 0x7000`) and bracketed uses were never
+   affected. Increment 1 never tripped this because the parked AP never dereferenced rdi.
+2. **Formal UB in the entry (per the Rust reference, rule `asm.rules.reg-not-input`):**
+   the entry read `rdi` inside a regular `asm!` block without `in("rdi") handoff_ptr` —
+   "any registers not specified as inputs will contain an undefined value on entry to
+   the assembly code"; `let _ = handoff_ptr;` binds nothing at the register level.
+   `yarm_x86_64_ap_entry` is now **`#[unsafe(naked)]` + `naked_asm!`** (reference: no
+   compiler prologue/epilogue; "the assembly code may assume that the call stack and
+   register state are valid on entry as per the signature and calling convention"), so
+   `rdi == handoff_ptr` is guaranteed at the first instruction. This is the same
+   trampoline→naked-entry transfer Redox's kernel uses (`kstart_ap`:
+   `#[unsafe(naked)]` + `naked_asm!` reading `[rdi + offset_of!(KernelArgsAp, ...)]`
+   after its trampoline's `mov rdi, [trampoline.args_ptr]; jmp rax`). Verified: the
+   entry's first instruction in the ELF is `cli` — no prologue.
+
+   Determinism hardening: the trampoline now publishes `AP_STAGE_RUST_JUMP` (9) through
+   the **absolute** low stage-word address (not rdi) + a `>` breadcrumb immediately
+   before `jmp rax`, so even a broken register handoff or bad jump target can never
+   again stop the trace silently after `@` — the BSP timeout would name
+   `last_stage=rust_jump`. Guarded by `stage183_ap_entry_naked_abi_and_offset_fix`.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

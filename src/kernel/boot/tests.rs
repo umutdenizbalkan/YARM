@@ -52480,6 +52480,7 @@ mod stage183_ap_idle_admit {
         );
         // Every documented fine-grained stage code exists and is named for the log.
         for s in [
+            "AP_STAGE_RUST_JUMP",
             "AP_STAGE_RUST_ENTERED",
             "AP_STAGE_HANDOFF_LOADED",
             "AP_STAGE_HANDOFF_VALIDATED",
@@ -52517,6 +52518,57 @@ mod stage183_ap_idle_admit {
                 && SMP_SRC.contains("last_stage_raw=")
                 && SMP_SRC.contains("ap_stage_word_low_virt(handoff_off)"),
             "admit-poll timeout must report last_stage + last_stage_raw from the stage word"
+        );
+    }
+
+    // Stage 183 inc.2 `@ → H` root-cause fixes. Two independent defects made the first
+    // rdi dereference in the AP Rust entry fault (no AP IDT → triple fault → silence
+    // after '@'):
+    //  (1) `add rdi, AP_OFF_HANDOFF` without OFFSET: GAS Intel syntax assembles a bare
+    //      symbol-difference `.set` as a MEMORY operand (`add rdi, [0x140]` — BIOS IVT
+    //      junk), so rdi was corrupt before the jump. OFFSET forces the immediate.
+    //  (2) the entry read rdi inside a regular asm! block without `in("rdi")` — per the
+    //      Rust reference (asm.rules.reg-not-input) undeclared registers are UNDEFINED
+    //      at asm entry. The entry is now #[unsafe(naked)] + naked_asm! (no compiler
+    //      prologue; register state guaranteed per the calling convention — the same
+    //      trampoline→naked-entry transfer Redox uses for kstart_ap).
+    // The trampoline also publishes AP_STAGE_RUST_JUMP (9) via the ABSOLUTE low address
+    // (not rdi) before `jmp rax`, so even a broken register handoff can no longer stop
+    // the trace silently after '@'.
+    #[test]
+    fn stage183_ap_entry_naked_abi_and_offset_fix() {
+        // The entry must be naked: no compiler prologue, ABI registers valid at entry.
+        assert!(
+            TRAMP_SRC.contains("#[unsafe(naked)]")
+                && TRAMP_SRC.contains("core::arch::naked_asm!")
+                && TRAMP_SRC.contains("extern \"C\" fn yarm_x86_64_ap_entry"),
+            "the AP Rust entry must be a naked extern-C fn (naked_asm body)"
+        );
+        // The old UB shape (regular asm! consuming rdi without a register operand,
+        // 'bound' only by a discarded Rust binding) must not come back. Match the
+        // indented statement form so doc comments may still cite the phrase.
+        assert!(
+            !TRAMP_SRC.contains("\n    let _ = handoff_ptr;"),
+            "the non-binding `let _ = handoff_ptr;` statement must stay gone (naked entry)"
+        );
+        // The trampoline must pass the handoff pointer as an IMMEDIATE add (OFFSET),
+        // never as a bare symbol-difference operand (which GAS assembles as a load).
+        assert!(
+            TRAMP_SRC.contains("add rdi, OFFSET AP_OFF_HANDOFF"),
+            "trampoline must add the handoff offset as an immediate (OFFSET)"
+        );
+        assert!(
+            !TRAMP_SRC.contains("add rdi, AP_OFF_HANDOFF\n"),
+            "bare `add rdi, AP_OFF_HANDOFF` (memory-operand misassembly) must stay gone"
+        );
+        // The trampoline publishes stage 9 (rust_jump) via the absolute low address
+        // before `jmp rax`, so a broken register handoff is still visible as
+        // last_stage=rust_jump instead of silence after '@'.
+        assert!(
+            TRAMP_SRC.contains("AP_OFF_HANDOFF + 48], 9")
+                && TRAMP_SRC.contains("pub(super) const AP_STAGE_RUST_JUMP: u32 = 9")
+                && TRAMP_SRC.contains("AP_STAGE_RUST_JUMP => \"rust_jump\""),
+            "the pre-jump rust_jump stage must be published via the absolute address"
         );
     }
 
