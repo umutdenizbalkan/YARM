@@ -565,6 +565,72 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 181C: release a capability that is a childless leaf WITHOUT building the
+    /// `RevokeScratch` derivation-tree working set that full `revoke` allocates + caches
+    /// (≈12 PT-pool pages for a 512-slot cspace). Preserves every object-teardown side
+    /// effect of `revoke_capability_in_cnode` (delegation-link removal, transfer-mapping
+    /// revocation, MemoryObject refcount/reclaim, Notification destroy); only the
+    /// recursive derivation-tree walk is skipped. If the cap has cross-process delegated
+    /// descendants OR in-cspace derived children it is NOT a leaf, and this transparently
+    /// falls back to the full `revoke_capability_in_cnode` — so semantics are identical
+    /// for non-leaf caps. Returns `Ok(true)` if released via the leaf fast path, or
+    /// `Ok(false)` if it fell back to a full recursive revoke.
+    pub(crate) fn delete_leaf_capability_in_cnode(
+        &mut self,
+        cnode: CNodeId,
+        cap: CapId,
+    ) -> Result<bool, KernelError> {
+        let source_capability = self.with_capability_state(|capability_state| {
+            capability_state
+                .cnode_spaces
+                .iter()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .and_then(|space| kernel_ref(&space.cspace).get(cap))
+        });
+        let source_pid = self.tid_for_cnode(cnode).ok_or(KernelError::TaskMissing)?;
+        let root = DelegatedCapRef {
+            pid: source_pid,
+            cap,
+        };
+        // Cross-process delegated descendants make this a non-leaf; use full revoke.
+        let descendants = self.collect_delegated_descendants(root);
+        if !descendants.is_empty() {
+            self.revoke_capability_in_cnode(cnode, cap)?;
+            return Ok(false);
+        }
+        // Try the childless-leaf fast path (no RevokeScratch build). `None` => cnode
+        // missing; `Some(Ok(false))` => in-cspace children exist (fall back).
+        let leaf = self.with_capability_state_mut(|capability_state| {
+            capability_state
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+                .map(|space| kernel_mut(&mut space.cspace).delete_if_leaf(cap))
+        });
+        match leaf {
+            None => return Err(KernelError::TaskMissing),
+            Some(Err(_)) => return Err(KernelError::InvalidCapability),
+            Some(Ok(false)) => {
+                // Has in-cspace derived children — not a leaf; full recursive revoke.
+                self.revoke_capability_in_cnode(cnode, cap)?;
+                return Ok(false);
+            }
+            Some(Ok(true)) => {}
+        }
+        // Leaf removed. Preserve the remainder of `revoke_capability_in_cnode`'s teardown
+        // (all cheap, allocation-free for a leaf with no delegations).
+        self.remove_delegation_links_for(root, &descendants);
+        self.revoke_active_transfer_mappings_for_cap(source_pid, cap);
+        if let Some(capability) = source_capability {
+            self.adjust_memory_object_cap_refcount(capability.object, -1);
+            self.reclaim_memory_object_if_unreferenced(capability.object);
+            self.destroy_notification_for_revoked_cap(capability.object);
+        }
+        Ok(true)
+    }
+
     /// Stage 22: tear down a Notification object whose cap was just revoked.
     ///
     /// Notification caps are single-owner per object (the creator mints exactly a

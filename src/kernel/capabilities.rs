@@ -441,6 +441,44 @@ impl CapabilitySpace {
         Ok(())
     }
 
+    /// Stage 181C: delete a capability IFF it is a childless leaf, WITHOUT building the
+    /// `RevokeScratch` derivation-tree working set that [`Self::revoke`] allocates (and
+    /// caches). `revoke` is O(capacity) with a large scratch alloc even for a leaf; for
+    /// a proof/one-shot that mints and immediately releases a couple of leaf caps that
+    /// scratch (≈12 pages for a 512-slot cspace) is pure overhead that perturbs the
+    /// shared PT-frame pool. This fast path is allocation-free.
+    ///
+    /// Returns `Ok(true)` if the cap was a leaf and was removed; `Ok(false)` if it has
+    /// in-cspace derived children (the caller must fall back to full recursive `revoke`);
+    /// `Err(NotFound)` if the id is absent/stale. It only clears the one slot (and bumps
+    /// its generation), exactly as `revoke` does for a single matched slot — normal
+    /// revoke semantics for non-leaf caps are untouched.
+    pub fn delete_if_leaf(&mut self, id: CapId) -> Result<bool, CapabilityDeriveError> {
+        if self.get(id).is_none() {
+            return Err(CapabilityDeriveError::NotFound);
+        }
+        let target_idx = id.index();
+        let target_gen = id.generation();
+        // Any live slot whose parent points at this exact cap makes it a non-leaf.
+        for slot in self.slots.as_slice() {
+            if let Some(entry) = slot.entry
+                && let Some(parent) = entry.parent
+                && parent.index() == target_idx
+                && parent.generation() == target_gen
+            {
+                return Ok(false);
+            }
+        }
+        let slot = self
+            .slots
+            .get_mut(target_idx)
+            .ok_or(CapabilityDeriveError::NotFound)?;
+        slot.entry = None;
+        let next = slot.generation.wrapping_add(1);
+        slot.generation = if next == 0 { 1 } else { next };
+        Ok(true)
+    }
+
     fn take_revoke_scratch(&mut self) -> Result<RevokeScratch, CapabilityDeriveError> {
         if let Some(scratch) = self.revoke_scratch_cache.take()
             && scratch.capacity() >= self.capacity()
@@ -889,6 +927,47 @@ mod tests {
             cspace.revoke_scratch_telemetry().cache_misses > before,
             "revoke after a drop must rebuild the scratch (a fresh miss)"
         );
+    }
+
+    // Stage 181C: delete_if_leaf releases a childless leaf WITHOUT building the revoke
+    // scratch working set (no cache miss), and refuses a non-leaf (Ok(false)).
+    #[test]
+    fn delete_if_leaf_releases_leaf_without_building_scratch() {
+        let mut cspace = CapabilitySpace::with_slots(8);
+        let cap = Capability::new(CapObject::Kernel, CapRights::READ);
+
+        // A freshly minted, un-derived cap is a leaf: delete_if_leaf removes it and
+        // never touches take_revoke_scratch (so no cache miss/hit is recorded).
+        let leaf = cspace.mint_at(0, cap).expect("slot 0");
+        assert_eq!(cspace.delete_if_leaf(leaf), Ok(true));
+        assert!(cspace.get(leaf).is_none(), "leaf slot must be cleared");
+        let tel = cspace.revoke_scratch_telemetry();
+        assert_eq!(
+            tel.cache_misses + tel.cache_hits,
+            0,
+            "delete_if_leaf must not build the revoke scratch working set"
+        );
+        assert!(
+            cspace.drop_revoke_scratch_cache() == false,
+            "no scratch cache should exist after a leaf delete"
+        );
+
+        // A parent with a derived child is NOT a leaf: delete_if_leaf reports Ok(false)
+        // and leaves both caps intact (caller must use full revoke).
+        let root = cspace.mint_at(1, cap).expect("slot 1");
+        let child = cspace.mint_derived(root, CapRights::READ).expect("child");
+        assert_eq!(cspace.delete_if_leaf(root), Ok(false));
+        assert!(
+            cspace.get(root).is_some(),
+            "non-leaf root must be untouched"
+        );
+        assert!(cspace.get(child).is_some(), "child must be untouched");
+        // The child itself IS a leaf and can be leaf-deleted.
+        assert_eq!(cspace.delete_if_leaf(child), Ok(true));
+        assert!(cspace.get(child).is_none());
+        // Now root is childless and leaf-deletable.
+        assert_eq!(cspace.delete_if_leaf(root), Ok(true));
+        assert!(cspace.get(root).is_none());
     }
 
     #[test]

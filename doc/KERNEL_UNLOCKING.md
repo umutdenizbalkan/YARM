@@ -6436,13 +6436,48 @@ after_revoke_aspace_cap|after_drop_revoke_scratch> pt_pool_free_frames=N`, and t
 oracle surfaces the residual `UNLOCK_GRADUATED_POOL_LEAK` + the per-step trace as an
 advisory when it still fires. The kernel guard is **NOT** weakened or silenced.
 
-Next: with the per-step deltas the residual is localized to a specific step, then
-either eliminated at source (e.g. a leaf-cap delete that skips the RevokeScratch build,
-or a targeted small-slab reclaim) or, if proven to be irreducible reusable slab warm
-pages, the guard is adjusted with a precise documented warm-page-floor invariant (still
-firing above the floor) — never a blanket silence. **Stage 181 stays PARTIAL** until
-`UNLOCK_GRADUATED_POOL_LEAK` no longer fires (or is superseded by that documented
-invariant), with sender-wake + opt-out both green.
+The per-step trace localized the residual **decisively** (not warm-page noise):
+
+```
+entry                186
+after_create_aspace  185   (-1 root PT frame)
+after_alloc_mo       185
+after_map            182   (-3 PDPT/PD/PT intermediates)
+after_unmap          182
+after_revoke_mem_cap 168   (-14  ← full revoke(mem_cap) builds RevokeScratch)
+after_destroy_aspace 172   (+4  root+intermediates returned — VM teardown clean)
+after_revoke_aspace  172   (+0  cache HIT)
+after_drop_scratch   183   (+11 cache drop returns the large Vecs; 3 unrecovered)
+```
+So the residual 3 are the part of the `revoke(mem_cap)` RevokeScratch build that
+`drop_revoke_scratch_cache` does NOT return (the small-slab `marked` Vec + rounding) —
+i.e. a **removable full-revoke side effect**, not VM/COW/fork and not an irreducible
+warm-page floor.
+
+**Stage 181C — residual eliminated at source (childless-leaf cap delete).** The scratch
+caps `mem_cap`/`aspace_cap` are freshly minted **childless leaves** never delegated
+(`map_user_page_in_asid_with_caps` only resolves `mem_cap` to a phys addr — it derives
+no child cap). Full `revoke` on a leaf still lazily builds + caches the whole
+`RevokeScratch` derivation-tree working set (≈12 pages). Fix: add
+`CapabilitySpace::delete_if_leaf` (verifies no in-cspace derived children, clears the one
+slot + bumps its generation, **allocation-free** — no RevokeScratch) and
+`KernelState::delete_leaf_capability_in_cnode` (also checks no cross-process delegated
+descendants, then preserves EVERY object-teardown side effect of
+`revoke_capability_in_cnode`: delegation-link removal, transfer-mapping revocation,
+MemoryObject refcount/reclaim, Notification destroy). It **transparently falls back to
+full `revoke`** for any non-leaf, so recursive-revoke semantics are untouched. The D3
+scratch proof now releases both scratch caps (and the alloc-fail rollback) via the leaf
+path, so `after_revoke_mem_cap` no longer drops by 14 and there is no residual to drop
+(`UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED ... dropped=false mem_leaf=true
+aspace_leaf=true`). Expected: `UNLOCK_GRADUATED_POOL_AFTER == BEFORE`, no
+`UNLOCK_GRADUATED_POOL_LEAK`, sender-wake + opt-out both green. The full revoke path is
+unchanged; the guard is **NOT** weakened; no PT-pool/cnode/task/MAX_ADDRESS_SPACES limit
+changed; no ABI/count change. Guarded by
+`delete_if_leaf_releases_leaf_without_building_scratch` +
+`stage181c_graduated_proof_releases_scratch_caps_as_leaves`. **Stage 181 acceptance
+pends the confirming graduated QEMU run** (no `UNLOCK_GRADUATED_POOL_LEAK`,
+`FORK_COW_DONE`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`,
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; opt-out still green).
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
