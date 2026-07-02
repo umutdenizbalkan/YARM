@@ -930,6 +930,16 @@ impl KernelState {
                 self.clear_last_fault();
                 let trapframe = frame.ok_or(TrapHandleError::MissingTrapFrame)?;
                 let _ = self.sync_current_thread_from_frame(trapframe);
+                // Stage 178B (CROSS-ARCH-D6): reliable arch-neutral hook for the
+                // one-shot read-only cross-arch D6 restore-path audit. The syscall
+                // entry ALWAYS runs with the syscalling user task current (tid != 0)
+                // and its trapframe just synced — unlike the timer tick, whose
+                // `tid != 0` gate is not satisfied on the AArch64/RISC-V idle-context
+                // tick, so the timer-only hook never fired there. The one-shot latch
+                // makes this a single audit regardless of which path reaches it first.
+                // Read-only + default-off (`yarm.cross_arch_d6=1`); it live-wires no
+                // restore and changes no syscall behavior.
+                self.maybe_run_cross_arch_d6_audit();
                 // Encode normal user syscall errors into the frame instead of
                 // propagating as TrapHandleError. All three arch entry points
                 // (AArch64 yarm_aarch64_vector_entry, x86_64 halt_forever,

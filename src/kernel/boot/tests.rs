@@ -50774,3 +50774,122 @@ mod stage178_cross_arch_d6 {
         );
     }
 }
+
+// Stage 178B: the CROSS-ARCH-D6 audit must be reachable from the arch-neutral
+// syscall path (not only the timer tick, whose tid!=0 gate is not satisfied on the
+// AArch64/RISC-V idle-context tick). Guards over the hook placement + acceptance.
+mod stage178b_cross_arch_d6_hook {
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const AARCH64_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const RISCV_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The audit is invoked from the Trap::Syscall arm — the reliable arch-neutral
+    // point that always runs with the syscalling user task current on all arches.
+    #[test]
+    fn stage178b_audit_hooked_in_syscall_path() {
+        let sc_idx = FAULT_SRC
+            .find("Trap::Syscall => {")
+            .expect("Trap::Syscall arm");
+        // The audit call must appear within the syscall arm (before the timer arm).
+        let tick_idx = FAULT_SRC
+            .find("Trap::TimerInterrupt => {")
+            .expect("Trap::TimerInterrupt arm");
+        let syscall_arm = &FAULT_SRC[sc_idx..tick_idx];
+        assert!(
+            syscall_arm.contains("self.maybe_run_cross_arch_d6_audit()"),
+            "the cross-arch D6 audit must be invoked from the Trap::Syscall arm"
+        );
+    }
+
+    // The audit remains one-shot (a single latch guards all call sites).
+    #[test]
+    fn stage178b_audit_is_one_shot() {
+        assert!(
+            ORCH_SRC.contains("cross_arch_d6_audit_try_start()"),
+            "the audit must claim a one-shot latch"
+        );
+        // The latch is claimed AFTER the tid!=0 check (so a blocking syscall that
+        // lands on idle does not waste the one-shot).
+        let idx = ORCH_SRC
+            .find("fn maybe_run_cross_arch_d6_audit(")
+            .expect("audit fn");
+        let head = &ORCH_SRC[idx..idx + 700];
+        let tid_pos = head.find("if tid == 0").expect("tid gate");
+        let latch_pos = head
+            .find("cross_arch_d6_audit_try_start()")
+            .expect("latch claim");
+        assert!(
+            tid_pos < latch_pos,
+            "the one-shot latch must be claimed only after the tid!=0 gate"
+        );
+    }
+
+    // Enabled-marker-alone is NOT acceptance: the smoke requires the proof markers.
+    #[test]
+    fn stage178b_enabled_marker_alone_is_not_acceptance() {
+        for smoke in [SMOKE_SRC, AARCH64_SMOKE_SRC, RISCV_SMOKE_SRC] {
+            assert!(
+                smoke.contains("CROSS_ARCH_D6_INVARIANT_OK")
+                    && smoke.contains("CROSS_ARCH_D6_PROOF_DONE"),
+                "each smoke must require INVARIANT_OK + PROOF_DONE (not just ENABLED)"
+            );
+        }
+    }
+
+    // The audit stays read-only and does not touch accepted x86_64 D6 gates.
+    #[test]
+    fn stage178b_audit_readonly_and_x86_d6_untouched() {
+        let idx = ORCH_SRC
+            .find("fn maybe_run_cross_arch_d6_audit(")
+            .expect("audit fn");
+        let body = &ORCH_SRC[idx..idx + 5200];
+        assert!(!body.contains("_mut("), "audit must stay read-only");
+        assert!(
+            !body.contains("set_d6_switch_a_enabled")
+                && !body.contains("set_d6_genuine_enabled")
+                && !body.contains("set_d6_controlled_switch_proof_enabled"),
+            "audit must not touch accepted x86_64 D6 gates"
+        );
+    }
+
+    // AArch64/RISC-V still emit explicit deferred/fallback, not a fake RESTORE_DONE:
+    // the live-restore path stays behind the false-today wired check.
+    #[test]
+    fn stage178b_live_restore_still_deferred() {
+        let idx = ORCH_SRC
+            .find("fn cross_arch_d6_live_restore_wired(")
+            .expect("wired fn");
+        let body = &ORCH_SRC[idx..idx + 220];
+        assert!(
+            body.contains("false"),
+            "cross_arch_d6_live_restore_wired must remain false (deferred)"
+        );
+        assert!(
+            ORCH_SRC.contains("CROSS_ARCH_D6_AARCH64_DEFERRED")
+                && ORCH_SRC.contains("CROSS_ARCH_D6_RISCV_DEFERRED"),
+            "the per-arch deferral markers must remain"
+        );
+    }
+
+    // Mode isolation + ABI/count invariants unchanged.
+    #[test]
+    fn stage178b_isolation_and_counts_unchanged() {
+        assert!(
+            SMOKE_SRC.contains("SMP_READY CROSS_ARCH_D6"),
+            "mode isolation must still force CROSS_ARCH_D6 off under D6 proof/switch-a"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 178B"),
+            "doc must record the Stage 178B hook fix"
+        );
+    }
+}
