@@ -46916,39 +46916,36 @@ mod stage167_d6_genuine {
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
 
-    // 1. The knob exists, is an Option<bool> (default None ⇒ default-off), and
-    //    the runtime gate + accessors default to false.
+    // 1. Stage 182: the knob is still recognized (Option<bool>) but is obsolete + ignored
+    //    (it selects no path); the runtime gate is a compile-time cfg constant with no
+    //    AtomicBool and no setter.
     #[test]
     fn stage167_knob_is_default_off() {
         assert!(
             CMDLINE_SRC.contains("pub d6_genuine: Option<bool>")
                 && CMDLINE_SRC.contains("yarm.d6_genuine"),
-            "yarm.d6_genuine must be an Option<bool> cmdline knob (default None)"
+            "yarm.d6_genuine must still be parsed (to report it obsolete)"
         );
         assert!(
-            MOD_SRC.contains("D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
-                && MOD_SRC.contains("AtomicBool::new(false)"),
-            "D6_GENUINE_ENABLED gate must default to false"
+            !MOD_SRC.contains("D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && !MOD_SRC.contains("fn set_d6_genuine_enabled("),
+            "Stage 182: the D6_GENUINE AtomicBool + setter must be deleted"
         );
         assert!(
             MOD_SRC.contains("fn d6_genuine_enabled() -> bool")
-                && MOD_SRC.contains("fn set_d6_genuine_enabled(enabled: bool)"),
-            "d6_genuine accessor/setter must exist"
+                && MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            "d6_genuine_enabled must be a compile-time cfg accessor"
         );
     }
 
-    // 2. The wiring is x86_64-only: cmdline application, the seam method, and
-    //    the trap-entry observe block are all guarded by cfg(x86_64).
+    // 2. Stage 182: the cmdline knob is obsolete-ignored (no setter call); the seam
+    //    method + trap-entry observe block remain x86_64-only.
     #[test]
     fn stage167_is_x86_64_only() {
-        let apply_idx = CMDLINE_SRC
-            .find("if let Some(enabled) = parsed.d6_genuine")
-            .expect("d6_genuine apply block");
-        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 700];
         assert!(
-            apply.contains("#[cfg(target_arch = \"x86_64\")]")
-                && apply.contains("set_d6_genuine_enabled(enabled)"),
-            "d6_genuine must only flip the gate on x86_64"
+            CMDLINE_SRC.contains("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d6_genuine")
+                && !CMDLINE_SRC.contains("set_d6_genuine_enabled(enabled)"),
+            "d6_genuine cmdline apply must be obsolete-ignored, not a setter"
         );
         let method_idx = RUNTIME_SRC
             .find("fn d6_genuine_local_dispatch_observe")
@@ -47036,10 +47033,8 @@ mod stage167_d6_genuine {
     // 6. The full D6_GENUINE marker set is emitted across cmdline/runtime/trap.
     #[test]
     fn stage167_markers_present() {
-        assert!(
-            CMDLINE_SRC.contains("D6_GENUINE_ENABLED"),
-            "D6_GENUINE_ENABLED must be emitted when the knob is set"
-        );
+        // Stage 182: the D6_GENUINE_ENABLED cmdline-apply marker is gone (knob obsolete);
+        // the seam runtime marker remains (the seam is the production path).
         assert!(
             RUNTIME_SRC.contains("D6_LOCAL_DISPATCH_STEP_SPLIT"),
             "the seam wrapper must emit D6_LOCAL_DISPATCH_STEP_SPLIT"
@@ -47144,13 +47139,17 @@ mod stage168_d6_genuine_b_and_d2_recv {
         );
     }
 
-    // d6_genuine still default-off (gate untouched).
+    // Stage 182: d6_genuine is a compile-time production gate (AtomicBool/setter deleted).
     #[test]
     fn stage168_d6_genuine_default_off() {
         assert!(
-            MOD_SRC.contains("D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
-                && MOD_SRC.contains("AtomicBool::new(false)"),
-            "D6_GENUINE_ENABLED must remain default-false"
+            !MOD_SRC.contains("D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && !MOD_SRC.contains("fn set_d6_genuine_enabled("),
+            "Stage 182: D6_GENUINE AtomicBool + setter must be deleted"
+        );
+        assert!(
+            MOD_SRC.contains("fn d6_genuine_enabled() -> bool"),
+            "d6_genuine_enabled accessor must remain (compile-time)"
         );
     }
 
@@ -47316,27 +47315,24 @@ mod stage168_d6_genuine_b_and_d2_recv {
         );
     }
 
-    // D2 recv genuine default off + x86_64-only.
+    // Stage 182: d2_recv_genuine is a compile-time production gate; the knob is obsolete.
     #[test]
     fn stage168_d2_recv_genuine_default_off_x86_only() {
         assert!(
             CMDLINE_SRC.contains("pub d2_recv_genuine: Option<bool>")
                 && CMDLINE_SRC.contains("yarm.d2_recv_genuine"),
-            "yarm.d2_recv_genuine must be an Option<bool> cmdline knob"
+            "yarm.d2_recv_genuine must still be parsed (to report it obsolete)"
         );
         assert!(
-            MOD_SRC.contains("D2_RECV_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+            !MOD_SRC.contains("D2_RECV_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && !MOD_SRC.contains("fn set_d2_recv_genuine_enabled(")
                 && MOD_SRC.contains("fn d2_recv_genuine_enabled() -> bool"),
-            "D2_RECV_GENUINE gate + accessor must exist (default false)"
+            "Stage 182: D2_RECV_GENUINE AtomicBool + setter deleted; accessor remains"
         );
-        let apply_idx = CMDLINE_SRC
-            .find("if let Some(enabled) = parsed.d2_recv_genuine")
-            .expect("d2_recv_genuine apply block");
-        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 500];
         assert!(
-            apply.contains("#[cfg(target_arch = \"x86_64\")]")
-                && apply.contains("set_d2_recv_genuine_enabled(enabled)"),
-            "d2_recv_genuine must only flip the gate on x86_64"
+            CMDLINE_SRC.contains("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_recv_genuine")
+                && !CMDLINE_SRC.contains("set_d2_recv_genuine_enabled(enabled)"),
+            "d2_recv_genuine apply must be obsolete-ignored, not a setter"
         );
     }
 
@@ -47769,28 +47765,24 @@ mod stage169_d2_send_genuine {
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
 
-    // Task B: knob default-off + x86_64-only.
+    // Stage 182: d2_send_genuine is a compile-time production gate; the knob is obsolete.
     #[test]
     fn stage169_knob_default_off_x86_only() {
         assert!(
             CMDLINE_SRC.contains("pub d2_send_genuine: Option<bool>")
                 && CMDLINE_SRC.contains("yarm.d2_send_genuine"),
-            "yarm.d2_send_genuine must be an Option<bool> cmdline knob"
+            "yarm.d2_send_genuine must still be parsed (to report it obsolete)"
         );
         assert!(
-            MOD_SRC.contains("D2_SEND_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
-                && MOD_SRC.contains("fn d2_send_genuine_enabled() -> bool")
-                && MOD_SRC.contains("fn set_d2_send_genuine_enabled(enabled: bool)"),
-            "D2_SEND_GENUINE gate + accessors must exist (default false)"
+            !MOD_SRC.contains("D2_SEND_GENUINE_ENABLED: core::sync::atomic::AtomicBool =")
+                && !MOD_SRC.contains("fn set_d2_send_genuine_enabled(")
+                && MOD_SRC.contains("fn d2_send_genuine_enabled() -> bool"),
+            "Stage 182: D2_SEND_GENUINE AtomicBool + setter deleted; accessor remains"
         );
-        let apply_idx = CMDLINE_SRC
-            .find("if let Some(enabled) = parsed.d2_send_genuine")
-            .expect("d2_send_genuine apply block");
-        let apply = &CMDLINE_SRC[apply_idx..apply_idx + 500];
         assert!(
-            apply.contains("#[cfg(target_arch = \"x86_64\")]")
-                && apply.contains("set_d2_send_genuine_enabled(enabled)"),
-            "d2_send_genuine must only flip the gate on x86_64"
+            CMDLINE_SRC.contains("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_send_genuine")
+                && !CMDLINE_SRC.contains("set_d2_send_genuine_enabled(enabled)"),
+            "d2_send_genuine apply must be obsolete-ignored, not a setter"
         );
     }
 
@@ -48281,19 +48273,19 @@ mod stage170_ipc_final {
     // Task E: the x86_64-only D2 knobs are cfg-gated (no-op on AArch64/RISC-V).
     #[test]
     fn stage170_d2_knobs_x86_only() {
-        for apply in [
-            "if let Some(enabled) = parsed.d2_recv_genuine",
-            "if let Some(enabled) = parsed.d2_send_genuine",
-        ] {
-            let idx = CMDLINE_SRC
-                .find(apply)
-                .unwrap_or_else(|| panic!("{apply} must exist"));
-            let block = &CMDLINE_SRC[idx..idx + 500];
-            assert!(
-                block.contains("#[cfg(target_arch = \"x86_64\")]"),
-                "{apply} must be x86_64-only"
-            );
-        }
+        // Stage 182: the D2 seam SELECTOR knobs no longer flip a gate — they are parsed
+        // only to report obsolete + ignored. The seams themselves are compile-time
+        // x86_64-only production paths (`d2_*_genuine_enabled()` = cfg!(x86_64) ...).
+        assert!(
+            CMDLINE_SRC.contains("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_recv_genuine")
+                && CMDLINE_SRC.contains("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_send_genuine"),
+            "D2 seam knobs must be reported obsolete + ignored"
+        );
+        assert!(
+            !CMDLINE_SRC.contains("if let Some(enabled) = parsed.d2_recv_genuine")
+                && !CMDLINE_SRC.contains("if let Some(enabled) = parsed.d2_send_genuine"),
+            "Stage 182: the D2 seam apply/setter blocks must be deleted"
+        );
     }
 
     // Task D/E: no new D3/D5/VM/CNode live-wire in this stage (freeze).
@@ -51339,16 +51331,24 @@ mod stage180_ci_profiles {
     }
 }
 
-// Stage 181 (GRADUATE-KNOBS): the umbrella accessor round-trips; enabling it is a real
-// production-behavior request (not a diagnostic no-op).
+// Stage 182 (REMOVE-FALLBACKS): the umbrella is no longer a runtime toggle — the setter
+// was DELETED and the accessor is a compile-time constant equal to the graduated seam
+// gate. On x86_64 (test host) it is the production path (true unless a D6-switch
+// diagnostic owns the path); it is not settable back to a fallback.
 #[test]
-fn stage181_unlock_graduated_accessor_round_trips() {
-    let prev = crate::kernel::boot::unlock_graduated_enabled();
-    crate::kernel::boot::set_unlock_graduated_enabled(true);
-    assert!(crate::kernel::boot::unlock_graduated_enabled());
-    crate::kernel::boot::set_unlock_graduated_enabled(false);
-    assert!(!crate::kernel::boot::unlock_graduated_enabled());
-    crate::kernel::boot::set_unlock_graduated_enabled(prev);
+fn stage182_unlock_graduated_is_compile_time_production_gate() {
+    assert_eq!(
+        crate::kernel::boot::unlock_graduated_enabled(),
+        crate::kernel::boot::d6_genuine_enabled(),
+        "umbrella accessor must equal the graduated seam gate (single compile-time source)"
+    );
+    #[cfg(target_arch = "x86_64")]
+    assert!(
+        crate::kernel::boot::d2_recv_genuine_enabled()
+            && crate::kernel::boot::d2_send_genuine_enabled()
+            && crate::kernel::boot::d6_genuine_enabled(),
+        "graduated seams are the x86_64 production path (no runtime off-toggle)"
+    );
 }
 
 // Stage 181 (GRADUATE-KNOBS): source guards over the umbrella knob, the default/opt-out
@@ -51364,78 +51364,74 @@ mod stage181_graduate_knobs {
     const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
 
-    // Umbrella knob exists (tri-state Option<bool>) + accessors + one-shot latch.
+    // Stage 182 (REMOVE-FALLBACKS): the umbrella + per-seam SELECTOR knobs and their
+    // AtomicBool/setter plumbing are DELETED (not hard-disabled). The gate accessors are
+    // compile-time constants; there is no setter and no runtime toggle.
     #[test]
     fn stage181_knob_and_accessors() {
+        // Accessors + one-shot proof latch remain; the AtomicBool + setters are gone.
         assert!(
-            CMDLINE_SRC.contains("pub unlock_graduated: Option<bool>")
-                && CMDLINE_SRC.contains("yarm.unlock_graduated"),
-            "yarm.unlock_graduated must be an Option<bool> umbrella knob"
-        );
-        assert!(
-            MOD_SRC.contains("UNLOCK_GRADUATED_ENABLED: core::sync::atomic::AtomicBool =")
-                && MOD_SRC.contains("fn unlock_graduated_enabled() -> bool")
-                && MOD_SRC.contains("fn set_unlock_graduated_enabled(")
+            MOD_SRC.contains("fn unlock_graduated_enabled() -> bool")
+                && MOD_SRC.contains("fn d6_genuine_enabled() -> bool")
+                && MOD_SRC.contains("fn d2_recv_genuine_enabled() -> bool")
+                && MOD_SRC.contains("fn d2_send_genuine_enabled() -> bool")
                 && MOD_SRC.contains("fn unlock_graduated_proof_try_start()"),
-            "umbrella gate + accessors + one-shot latch must exist"
+            "gate accessors + one-shot proof latch must remain"
+        );
+        for gone in [
+            "UNLOCK_GRADUATED_ENABLED: core::sync::atomic::AtomicBool",
+            "D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool",
+            "D2_RECV_GENUINE_ENABLED: core::sync::atomic::AtomicBool",
+            "D2_SEND_GENUINE_ENABLED: core::sync::atomic::AtomicBool",
+            "fn set_unlock_graduated_enabled(",
+            "fn set_d6_genuine_enabled(",
+            "fn set_d2_recv_genuine_enabled(",
+            "fn set_d2_send_genuine_enabled(",
+        ] {
+            assert!(
+                !MOD_SRC.contains(gone),
+                "Stage 182 must DELETE the seam toggle plumbing: {gone}"
+            );
+        }
+        // The accessors are compile-time (cfg-based), not AtomicBool loads.
+        assert!(
+            MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            "seam gates must be compile-time cfg constants after Stage 182"
         );
     }
 
-    // The apply graduates the ACCEPTED seams together on x86_64, defers under emergency
-    // opt-out / cross-arch / D6 proof-or-switch-a, and enables NO diagnostic-only knob.
+    // Stage 182: the cmdline knobs no longer SELECT any path — they are recognized only
+    // to report they are obsolete + ignored, and the umbrella apply/opt-out is deleted.
     #[test]
-    fn stage181_apply_policy() {
-        let idx = CMDLINE_SRC
-            .find("let desired = parsed.unlock_graduated;")
-            .expect("umbrella apply block");
-        let block = &CMDLINE_SRC[idx..idx + 2600];
-        // Emergency opt-out + cross-arch + proof/switch-a deferrals.
-        assert!(
-            block.contains("reason=emergency_optout")
-                && block.contains("reason=cross_arch_live_restore_deferred")
-                && block.contains("reason=d6_proof_or_switch_a_active"),
-            "apply must handle opt-out, cross-arch, and D6 proof/switch-a deferrals"
-        );
-        // Isolation reads the D6 proof / switch-a gates before graduating.
-        assert!(
-            block.contains("d6_controlled_switch_proof_enabled()")
-                && block.contains("d6_switch_a_enabled()"),
-            "apply must respect D6 proof / switch-a isolation"
-        );
-        // Graduates the three accepted seams together.
-        assert!(
-            block.contains("set_d2_recv_genuine_enabled(true)")
-                && block.contains("set_d2_send_genuine_enabled(true)")
-                && block.contains("set_d6_genuine_enabled(true)")
-                && block.contains("set_unlock_graduated_enabled(true)"),
-            "apply must graduate d2_recv + d2_send + d6 together"
-        );
-        // Graduation is x86_64-only.
-        assert!(
-            block.contains("#[cfg(target_arch = \"x86_64\")]")
-                && block.contains("#[cfg(not(target_arch = \"x86_64\"))]"),
-            "graduation of the seams must be x86_64-only"
-        );
-        // Does NOT default-enable any diagnostic-only profile.
-        for diag in [
-            "set_vm_cow_enabled(true)",
-            "set_cap_cnode_enabled(true)",
-            "set_fault_delivery_enabled(true)",
-            "set_spawn_lifecycle_enabled(true)",
-            "set_global_state_enabled(true)",
-            "set_smp_ready_enabled(true)",
-            "set_cross_arch_d6_enabled(true)",
-            "set_d3_full_enabled(true)",
+    fn stage182_knobs_are_obsolete_ignored() {
+        for m in [
+            "UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d6_genuine",
+            "UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_recv_genuine",
+            "UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_send_genuine",
+            "UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.unlock_graduated",
         ] {
             assert!(
-                !block.contains(diag),
-                "umbrella must NOT default-enable diagnostic-only knob: {diag}"
+                CMDLINE_SRC.contains(m),
+                "cmdline apply must report the obsolete knob as ignored: {m}"
+            );
+        }
+        // No `set_*` seam-enabling calls and no emergency opt-out remain in the apply.
+        for gone in [
+            "set_unlock_graduated_enabled(",
+            "set_d6_genuine_enabled(",
+            "set_d2_recv_genuine_enabled(",
+            "set_d2_send_genuine_enabled(",
+            "reason=emergency_optout",
+        ] {
+            assert!(
+                !CMDLINE_SRC.contains(gone),
+                "Stage 182 must delete the umbrella apply / opt-out plumbing: {gone}"
             );
         }
     }
 
-    // The one-shot proof defers under SMP, verifies each seam gate, runs the D3 scratch
-    // check, and is hooked in both the syscall and timer paths.
+    // The one-shot proof still defers under SMP and exercises D3, but the dead
+    // UNEXPECTED_INLOCK/FALLBACK branches were removed (seams can no longer be off).
     #[test]
     fn stage181_proof_shape() {
         assert!(
@@ -51451,13 +51447,12 @@ mod stage181_graduate_knobs {
                 && ORCH_SRC.contains("UNLOCK_GRADUATED_DEFERRED reason=smp_not_live"),
             "proof must be one-shot and defer under SMP > 1"
         );
-        // It verifies the accepted seam gates (an off gate = unexpected in-lock fallback).
+        // Stage 182: the dead fallback branches are gone; a debug_assert keeps the
+        // compile-time seam invariant honest instead.
         assert!(
-            ORCH_SRC.contains("d2_recv_genuine_enabled()")
-                && ORCH_SRC.contains("d2_send_genuine_enabled()")
-                && ORCH_SRC.contains("d6_genuine_enabled()")
-                && ORCH_SRC.contains("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH"),
-            "proof must verify each seam gate + flag an unexpected in-lock fallback"
+            !ORCH_SRC.contains("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH")
+                && !ORCH_SRC.contains("UNLOCK_GRADUATED_FALLBACK path="),
+            "Stage 182 must remove the dead in-lock fallback branches from the proof"
         );
         // D3 graduation = compact scratch check via the accepted primitives (no ABI change).
         assert!(
@@ -51466,14 +51461,13 @@ mod stage181_graduate_knobs {
                 && ORCH_SRC.contains("unmap_user_page_in_asid("),
             "D3 graduation must exercise the accepted VM primitives via a scratch check"
         );
-        // Production unmap primitive is untouched (no VmAnonMap ABI change).
         assert!(
             MEM_SRC.contains("fn unmap_user_page_in_asid("),
             "production unmap primitive must remain (no ABI change)"
         );
     }
 
-    // All documented UNLOCK_GRADUATED markers exist.
+    // The retained positive graduated markers exist; the removed fallback markers do not.
     #[test]
     fn stage181_all_marker_strings_exist() {
         for m in [
@@ -51486,71 +51480,85 @@ mod stage181_graduate_knobs {
             "UNLOCK_GRADUATED_D3_OK",
             "UNLOCK_GRADUATED_INVARIANT_OK",
             "UNLOCK_GRADUATED_DONE result=ok",
-            "UNLOCK_GRADUATED_FALLBACK",
-            "UNLOCK_GRADUATED_DEFERRED",
-            "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH",
-            "UNLOCK_GRADUATED_DOUBLE_DISPATCH",
-            "UNLOCK_GRADUATED_RESTORE_FAIL",
-            "UNLOCK_GRADUATED_D3_ROLLBACK_FAIL",
-            "UNLOCK_GRADUATED_D3_LEAK",
             "UNLOCK_GRADUATED_INVARIANT_FAIL",
+            "UNLOCK_GRADUATED_D3_LEAK",
+        ] {
+            assert!(ORCH_SRC.contains(m), "graduated marker {m} must exist");
+        }
+        // The fallback/opt-out execution markers are removed from production.
+        for gone in [
+            "UNLOCK_GRADUATED_FALLBACK path=",
+            "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH",
         ] {
             assert!(
-                ORCH_SRC.contains(m) || CMDLINE_SRC.contains(m),
-                "marker {m} must exist"
+                !ORCH_SRC.contains(gone) && !CMDLINE_SRC.contains(gone),
+                "removed fallback marker must not remain in production: {gone}"
             );
         }
     }
 
-    // Smoke tri-state plumbing + isolation + graduated/opt-out gates + fallback fatal.
+    // Smoke asserts the graduated path is the ONLY path + the obsolete opt-out is gone.
     #[test]
     fn stage181_smoke_plumbing() {
+        // No obsolete seam knob is APPENDED to the kernel cmdline (comments/negative-tests
+        // may still name them). The opt-out cmdline append + its acceptance are gone.
+        for gone in [
+            "KERNEL_CMDLINE yarm.d6_genuine=1",
+            "KERNEL_CMDLINE yarm.d2_recv_genuine=1",
+            "KERNEL_CMDLINE yarm.d2_send_genuine=1",
+            "yarm.unlock_graduated=0",
+        ] {
+            assert!(
+                !SMOKE_SRC.contains(gone),
+                "smoke must not append the obsolete seam knob / opt-out: {gone}"
+            );
+        }
+        // The emergency opt-out is only referenced as a NEGATIVE test (assert ABSENT),
+        // never expected/required.
         assert!(
-            SMOKE_SRC.contains("UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-}")
-                && SMOKE_SRC.contains("yarm.unlock_graduated=1")
-                && SMOKE_SRC.contains("yarm.unlock_graduated=0"),
-            "smoke must plumb the UNLOCK_GRADUATED tri-state"
+            !SMOKE_SRC.contains("opt-out DEFERRED reason=emergency_optout present"),
+            "smoke must not expect the removed emergency opt-out to fire"
         );
-        // Isolation forces it off under D6 proof/switch-a.
-        assert!(
-            SMOKE_SRC.contains("D3_FULL UNLOCK_GRADUATED"),
-            "mode isolation must include UNLOCK_GRADUATED under D6 proof/switch-a"
-        );
-        // Graduated profile strict markers.
+        // The graduated production path is required + the removed fallbacks are negative-tested.
         for m in [
             "UNLOCK_GRADUATED_D2_RECV_OK",
-            "UNLOCK_GRADUATED_D2_SEND_OK",
             "UNLOCK_GRADUATED_D6_OK",
             "UNLOCK_GRADUATED_D3_OK",
             "UNLOCK_GRADUATED_DONE result=ok",
+            "UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.unlock_graduated",
         ] {
-            assert!(SMOKE_SRC.contains(m), "graduated smoke must require {m}");
+            assert!(
+                SMOKE_SRC.contains(m),
+                "smoke must assert graduated production: {m}"
+            );
         }
-        // Unexpected fallback is fatal; opt-out expects emergency_optout deferral.
         assert!(
-            SMOKE_SRC.contains("unexpected UNLOCK_GRADUATED_FALLBACK on the committed path")
-                && SMOKE_SRC.contains("reason=emergency_optout"),
-            "smoke must fail on unexpected fallback + validate the opt-out deferral"
+            SMOKE_SRC.contains("obsolete emergency opt-out fallback fired")
+                && SMOKE_SRC.contains("unexpected in-lock fallback dispatch"),
+            "smoke must negative-test that the removed fallbacks never fire"
         );
-        // Stage 163P sender-wake preserved under graduation.
         assert!(
             SMOKE_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
             "graduated smoke must still observe the Stage 163P sender-wake markers"
         );
     }
 
-    // Runner exposes unlock-graduated (primary) in the quick group.
+    // Runner keeps the graduated profile; the obsolete opt-out profile is removed.
     #[test]
     fn stage181_runner_has_graduated_profile() {
         assert!(
-            RUNNER_SRC.contains("unlock-graduated") && RUNNER_SRC.contains("unlock-optout"),
-            "runner must register the graduated + opt-out profiles"
+            RUNNER_SRC.contains("unlock-graduated"),
+            "runner must register the graduated profile"
+        );
+        assert!(
+            !RUNNER_SRC.contains("unlock-optout"),
+            "Stage 182 must remove the obsolete unlock-optout profile"
         );
         let qidx = RUNNER_SRC.find("QUICK_PROFILES=(").expect("quick group");
         let qblock = &RUNNER_SRC[qidx..qidx + 130];
         assert!(
             qblock.contains("unlock-graduated"),
-            "quick group must include unlock-graduated (primary graduation proof)"
+            "quick group must include unlock-graduated (graduated production verification)"
         );
     }
 
@@ -52055,6 +52063,144 @@ mod stage181c_fork_internal {
         assert!(
             DOC_SRC.contains("Stage 181C"),
             "doc must record the Stage 181C fork-Internal investigation"
+        );
+    }
+}
+
+// Stage 182 (REMOVE-FALLBACKS): the graduated seams are the ONLY production path. Source
+// guards proving the obsolete fallback knobs/opt-out/execution-branches are DELETED (not
+// hard-disabled), the graduated path is the sole path, and the Stage 181 guards (pool
+// leak, allocation-free leaf delete, full revoke for non-leaf) are preserved.
+mod stage182_remove_fallbacks {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const CMDLINE_SRC: &str = include_str!("../boot_command_line.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const CAP_SRC: &str = include_str!("../capabilities.rs");
+    const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The seam toggle plumbing (AtomicBool gates + setters) is deleted; the accessors are
+    // compile-time cfg constants — no dormant branch re-enablable by a local boolean.
+    #[test]
+    fn stage182_seam_gates_are_compile_time_only() {
+        for gone in [
+            "UNLOCK_GRADUATED_ENABLED: core::sync::atomic::AtomicBool",
+            "D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool",
+            "D2_RECV_GENUINE_ENABLED: core::sync::atomic::AtomicBool",
+            "D2_SEND_GENUINE_ENABLED: core::sync::atomic::AtomicBool",
+            "fn set_unlock_graduated_enabled(",
+            "fn set_d6_genuine_enabled(",
+            "fn set_d2_recv_genuine_enabled(",
+            "fn set_d2_send_genuine_enabled(",
+        ] {
+            assert!(!MOD_SRC.contains(gone), "Stage 182 must delete: {gone}");
+        }
+        assert!(
+            MOD_SRC.contains("fn d6_genuine_enabled() -> bool")
+                && MOD_SRC.contains("cfg!(target_arch = \"x86_64\")"),
+            "the seam gate must be a compile-time cfg accessor"
+        );
+    }
+
+    // No production opt-out / fallback knob selection remains in cmdline apply; obsolete
+    // knobs are recognized only to report they are ignored.
+    #[test]
+    fn stage182_cmdline_has_no_fallback_selector() {
+        for gone in [
+            "set_unlock_graduated_enabled(",
+            "set_d6_genuine_enabled(",
+            "set_d2_recv_genuine_enabled(",
+            "set_d2_send_genuine_enabled(",
+            "reason=emergency_optout",
+            "reason=d6_proof_or_switch_a_active",
+        ] {
+            assert!(
+                !CMDLINE_SRC.contains(gone),
+                "Stage 182 must remove the umbrella/opt-out apply: {gone}"
+            );
+        }
+        assert!(
+            CMDLINE_SRC.contains("UNLOCK_FALLBACK_KNOB_OBSOLETE"),
+            "obsolete knobs must be reported ignored (never select a path)"
+        );
+    }
+
+    // The proof has no dead in-lock fallback branch; a debug_assert keeps the invariant.
+    #[test]
+    fn stage182_proof_has_no_dead_fallback_branch() {
+        assert!(
+            !ORCH_SRC.contains("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH")
+                && !ORCH_SRC.contains("UNLOCK_GRADUATED_FALLBACK path="),
+            "the dead in-lock fallback branches must be removed from the proof"
+        );
+        assert!(
+            ORCH_SRC.contains("graduated seams must be the compile-time production path"),
+            "a debug_assert must enforce the compile-time seam invariant"
+        );
+    }
+
+    // Scripts: opt-out profile removed; smoke/oracle negative-test the removed fallbacks.
+    #[test]
+    fn stage182_scripts_negative_test_removed_fallbacks() {
+        assert!(
+            !RUNNER_SRC.contains("unlock-optout"),
+            "runner must remove the obsolete unlock-optout profile"
+        );
+        assert!(
+            SMOKE_SRC.contains("obsolete emergency opt-out fallback fired")
+                && SMOKE_SRC.contains("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.unlock_graduated"),
+            "smoke must negative-test the removed opt-out + assert the knob is ignored"
+        );
+        assert!(
+            ORACLE_SRC.contains("REMOVE-FALLBACKS: obsolete fallback/opt-out path fired"),
+            "oracle must assert no fallback/opt-out path fires on the graduated sender-wake"
+        );
+    }
+
+    // Stage 181 guards preserved: pool-leak guard, allocation-free leaf delete, full
+    // recursive revoke for non-leaf caps, frozen counts.
+    #[test]
+    fn stage182_preserves_stage181_guards() {
+        assert!(
+            ORCH_SRC.contains("UNLOCK_GRADUATED_POOL_LEAK"),
+            "the PT-pool leak guard must remain"
+        );
+        assert!(
+            CAP_SRC.contains("pub fn delete_if_leaf(&mut self, id: CapId)")
+                && CAP_SRC.contains("pub fn revoke(&mut self, id: CapId)"),
+            "leaf-delete + full revoke primitives must both remain"
+        );
+        let leaf_idx = CAP_LIFECYCLE_SRC
+            .find("fn delete_leaf_capability_in_cnode")
+            .expect("leaf-delete fn");
+        let leaf_rest = &CAP_LIFECYCLE_SRC[leaf_idx..];
+        let leaf_end = leaf_rest[3..]
+            .find("\n    fn ")
+            .map(|p| p + 3)
+            .unwrap_or(leaf_rest.len());
+        let leaf_body = &leaf_rest[..leaf_end];
+        assert!(
+            leaf_body.contains("has_any_delegated_child(root)")
+                && !leaf_body.contains("self.collect_delegated_descendants("),
+            "leaf-delete must keep the allocation-free delegated-child check"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 182"),
+            "doc must record Stage 182 REMOVE-FALLBACKS"
         );
     }
 }

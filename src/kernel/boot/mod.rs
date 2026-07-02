@@ -681,21 +681,24 @@ pub(crate) fn d6_switch_a_enabled() -> bool {
 /// authoritative fallback.  This is the narrow Outcome A for the scheduler
 /// seam; it is not scheduler policy and is reversible by dropping the knob.
 /// VALIDATION: D6_GENUINE_ENABLED.
-pub(crate) static D6_GENUINE_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+///
+/// Stage 182 (REMOVE-FALLBACKS): the graduated D6 seam is now the production path on
+/// x86_64 `-smp 1` and is no longer runtime-toggleable — the `yarm.d6_genuine` /
+/// `yarm.unlock_graduated` knobs and their `AtomicBool`/setter plumbing were deleted
+/// (not hard-disabled). This is a compile-time constant reproducing the accepted
+/// enabling condition exactly: graduated on x86_64 UNLESS a D6-switch diagnostic
+/// (`d6_switch_proof` / `d6_switch_a`, category-D debug knobs) owns the switch path.
+/// On AArch64/RISC-V it is compile-time `false` (in-lock path only — Stage 184), and
+/// the runtime `single_cpu` eligibility guard keeps SMP>1 on the in-lock path
+/// (Stage 183). There is NO production opt-out back to the old global-lock path.
+pub(crate) fn d6_genuine_enabled() -> bool {
+    cfg!(target_arch = "x86_64") && !d6_controlled_switch_proof_enabled() && !d6_switch_a_enabled()
+}
 
 /// Stage 167: per-CPU count of genuine scheduler-seam dispatch observations.
 pub(crate) static D6_GENUINE_SEAM_COUNT: [core::sync::atomic::AtomicU64;
     crate::kernel::scheduler::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; crate::kernel::scheduler::MAX_CPUS];
-
-pub(crate) fn set_d6_genuine_enabled(enabled: bool) {
-    D6_GENUINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
-}
-
-pub(crate) fn d6_genuine_enabled() -> bool {
-    D6_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
-}
 
 /// Stage 168 (D6-GENUINE-B): global count of authoritative mutating dispatch
 /// steps that ran through the scheduler seam OUTSIDE the global KernelState
@@ -767,15 +770,13 @@ pub(crate) fn d6_genuine_dispatch_clear_deferred(cpu_idx: usize) -> bool {
 /// path is byte-identical to Stage 163P (no behavior change). Immediate /
 /// NoWait / timeout / rollback semantics are preserved on both paths.
 /// VALIDATION: D2_RECV_GENUINE_ENABLED.
-pub(crate) static D2_RECV_GENUINE_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn set_d2_recv_genuine_enabled(enabled: bool) {
-    D2_RECV_GENUINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
-}
-
+///
+/// Stage 182 (REMOVE-FALLBACKS): compile-time production gate (see
+/// [`d6_genuine_enabled`]). The `yarm.d2_recv_genuine` knob + `AtomicBool`/setter were
+/// deleted; the graduated blocking-recv seam is the only x86_64 `-smp 1` path, with no
+/// runtime opt-out to the old in-lock production path.
 pub(crate) fn d2_recv_genuine_enabled() -> bool {
-    D2_RECV_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    d6_genuine_enabled()
 }
 
 /// Stage 168B (D2-GENUINE-RECV completion): global count of blocking-recv
@@ -855,15 +856,13 @@ pub(crate) fn d2_recv_dispatch_clear(cpu_idx: usize) {
 /// (default) the send path is byte-identical to Stage 168B (no behavior change);
 /// the Stage 163P sender-wake oracle is preserved on both paths.
 /// VALIDATION: D2_SEND_GENUINE_ENABLED.
-pub(crate) static D2_SEND_GENUINE_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn set_d2_send_genuine_enabled(enabled: bool) {
-    D2_SEND_GENUINE_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
-}
-
+///
+/// Stage 182 (REMOVE-FALLBACKS): compile-time production gate (see
+/// [`d6_genuine_enabled`]). The `yarm.d2_send_genuine` knob + `AtomicBool`/setter were
+/// deleted; the graduated blocking-send seam is the only x86_64 `-smp 1` path, with no
+/// runtime opt-out to the old in-lock production path.
 pub(crate) fn d2_send_genuine_enabled() -> bool {
-    D2_SEND_GENUINE_ENABLED.load(core::sync::atomic::Ordering::Acquire)
+    d6_genuine_enabled()
 }
 
 /// Stage 169: global count of blocking-send queue-advancing dispatches that ran
@@ -1209,25 +1208,20 @@ pub(crate) fn d3_full_proof_try_start() -> bool {
         .is_ok()
 }
 
-/// Stage 181 (GRADUATE-KNOBS): umbrella gate that graduates the accepted x86_64
-/// `-smp 1` unlock seams (D2-RECV/D2-SEND/D6 out-of-global-lock dispatch) to
-/// default-on. Unlike the per-stage diagnostic knobs this is a REAL production
-/// behavior gate. VALIDATION: UNLOCK_GRADUATED_ENABLED. Emergency opt-out:
-/// `yarm.unlock_graduated=0`.
-pub(crate) static UNLOCK_GRADUATED_ENABLED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// Stage 181 (GRADUATE-KNOBS) → Stage 182 (REMOVE-FALLBACKS): the graduated x86_64
+/// `-smp 1` unlock seams (D2-RECV/D2-SEND/D6 out-of-global-lock dispatch) are the
+/// production path. Stage 182 DELETED the `yarm.unlock_graduated` umbrella knob and its
+/// `AtomicBool`/setter (including the `=0` emergency opt-out that ran the old
+/// global-lock production path) — there is no runtime toggle back to the fallback.
+/// This is now a compile-time constant identical to the individual seam gate: the
+/// verification proof runs wherever the graduated seams are the production path.
+pub(crate) fn unlock_graduated_enabled() -> bool {
+    d6_genuine_enabled()
+}
 
 /// Stage 181: one-shot latch so the graduation verification proof runs exactly once.
 pub(crate) static UNLOCK_GRADUATED_PROOF_STARTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
-
-pub(crate) fn set_unlock_graduated_enabled(enabled: bool) {
-    UNLOCK_GRADUATED_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
-}
-
-pub(crate) fn unlock_graduated_enabled() -> bool {
-    UNLOCK_GRADUATED_ENABLED.load(core::sync::atomic::Ordering::Acquire)
-}
 
 /// Stage 181: try to claim the one-shot graduation proof (true exactly once).
 pub(crate) fn unlock_graduated_proof_try_start() -> bool {

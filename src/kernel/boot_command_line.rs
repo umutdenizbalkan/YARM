@@ -148,51 +148,21 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
         #[cfg(not(target_arch = "x86_64"))]
         let _ = enabled;
     }
-    if let Some(enabled) = parsed.d6_genuine {
-        // Stage 167 (D6-GENUINE-A) / Stage 168 (D6-GENUINE-B): x86_64-only gate
-        // that makes the rank-1 scheduler split seam its first live production
-        // caller and (Stage 168) relocates the authoritative mutating dispatch
-        // out of the global lock for the eligible queue-neutral slice. No-op on
-        // other arches.
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::kernel::boot::set_d6_genuine_enabled(enabled);
-            if enabled {
-                crate::yarm_log!("D6_GENUINE_ENABLED");
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = enabled;
+    // Stage 182 (REMOVE-FALLBACKS): the per-seam graduation SELECTOR knobs
+    // (`yarm.d6_genuine`, `yarm.d2_recv_genuine`, `yarm.d2_send_genuine`) are DELETED.
+    // The graduated out-of-lock dispatch seams are the only x86_64 `-smp 1` production
+    // path (a compile-time gate now — see `boot::d6_genuine_enabled`), so these knobs
+    // no longer select any execution path. They are still recognized ONLY to report
+    // that they are obsolete + ignored (proving a stale boot line cannot re-enable the
+    // old in-lock production fallback). They never toggle behavior.
+    if parsed.d6_genuine.is_some() {
+        crate::yarm_log!("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d6_genuine action=ignored");
     }
-    if let Some(enabled) = parsed.d2_recv_genuine {
-        // Stage 168 (D2-GENUINE-RECV): x86_64-only gate that runs the blocking
-        // recv path through explicit rank-clean scheduler/task/IPC phase markers
-        // and uses the Stage 168 out-of-global-lock dispatch seam where eligible.
-        // No-op on other arches.
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::kernel::boot::set_d2_recv_genuine_enabled(enabled);
-            if enabled {
-                crate::yarm_log!("D2_RECV_GENUINE_ENABLED");
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = enabled;
+    if parsed.d2_recv_genuine.is_some() {
+        crate::yarm_log!("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_recv_genuine action=ignored");
     }
-    if let Some(enabled) = parsed.d2_send_genuine {
-        // Stage 169 (D2-GENUINE-SEND): x86_64-only gate that runs the blocking
-        // send path through explicit rank-clean scheduler/task/IPC phase markers
-        // and relocates its queue-advancing dispatch out of the global lock.
-        // No-op on other arches.
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::kernel::boot::set_d2_send_genuine_enabled(enabled);
-            if enabled {
-                crate::yarm_log!("D2_SEND_GENUINE_ENABLED");
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = enabled;
+    if parsed.d2_send_genuine.is_some() {
+        crate::yarm_log!("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.d2_send_genuine action=ignored");
     }
     if let Some(enabled) = parsed.sched_timeout {
         // Stage 171 (SCHED-TIMEOUT): arch-neutral, default-off DIAGNOSTIC gate for
@@ -278,50 +248,15 @@ fn apply_boot_option_knobs(captured: &BootCommandLine) {
             crate::yarm_log!("D3_FULL_ENABLED");
         }
     }
-    // Stage 181 (GRADUATE-KNOBS): the umbrella is applied AFTER the individual seam
-    // knobs above so an explicit per-stage knob still composes, and the umbrella has
-    // the final say on the graduated default. Absent knob ⇒ default (graduate on
-    // x86_64); `=0` is the emergency opt-out (conservative path); `=1` explicit graduate.
-    {
-        let desired = parsed.unlock_graduated;
-        if desired == Some(false) {
-            // Emergency opt-out: force the conservative per-stage-off path everywhere.
-            crate::kernel::boot::set_unlock_graduated_enabled(false);
-            crate::yarm_log!("UNLOCK_GRADUATED_DEFERRED reason=emergency_optout");
-        } else {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // Isolation: the D6 controlled-switch proof and the D6_SWITCH_A first
-                // narrow production Outcome A own the switch path; the umbrella must
-                // not double-graduate D6 under them.
-                let proof_or_switch_a = crate::kernel::boot::d6_controlled_switch_proof_enabled()
-                    || crate::kernel::boot::d6_switch_a_enabled();
-                if proof_or_switch_a {
-                    crate::kernel::boot::set_unlock_graduated_enabled(false);
-                    crate::yarm_log!(
-                        "UNLOCK_GRADUATED_DEFERRED reason=d6_proof_or_switch_a_active"
-                    );
-                } else {
-                    // Graduate the accepted x86_64 -smp1 seams TOGETHER by enabling
-                    // their gates now (before the boot's first blocking recv/send). The
-                    // runtime D6/D2 eligibility still gates the out-of-lock slice to the
-                    // single-CPU case, so SMP boots fall back conservatively; the
-                    // one-shot proof records the final verdict (ENABLED / DEFERRED).
-                    crate::kernel::boot::set_unlock_graduated_enabled(true);
-                    crate::kernel::boot::set_d2_recv_genuine_enabled(true);
-                    crate::kernel::boot::set_d2_send_genuine_enabled(true);
-                    crate::kernel::boot::set_d6_genuine_enabled(true);
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                // Cross-arch live D6 restore is deferred (Stage 178); do not graduate.
-                crate::kernel::boot::set_unlock_graduated_enabled(false);
-                crate::yarm_log!(
-                    "UNLOCK_GRADUATED_DEFERRED reason=cross_arch_live_restore_deferred"
-                );
-            }
-        }
+    // Stage 182 (REMOVE-FALLBACKS): the `yarm.unlock_graduated` umbrella knob is DELETED,
+    // including its `=0` EMERGENCY OPT-OUT that forced the old global-lock production
+    // path. Graduation is no longer a runtime toggle — `boot::d6_genuine_enabled()` is a
+    // compile-time constant (graduated on x86_64 unless a D6-switch diagnostic owns the
+    // path; in-lock only on other arches / SMP>1 via the eligibility guard). The knob is
+    // recognized ONLY to report it is obsolete + ignored; it can never re-enable the
+    // fallback. (No `set_*` calls: the seam gates have no setter anymore.)
+    if parsed.unlock_graduated.is_some() {
+        crate::yarm_log!("UNLOCK_FALLBACK_KNOB_OBSOLETE knob=yarm.unlock_graduated action=ignored");
     }
     if let Some(enabled) = parsed.ipc_recv_proof {
         // Arch-neutral: the exercise drives the same recv-v2 delivery markers on
