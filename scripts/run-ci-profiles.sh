@@ -64,6 +64,10 @@ ALL_PROFILES=(
   cross-arch-d6-riscv64
   d3-full
   unlock-graduated
+  smp2-core
+  smp2-sender-wake
+  smp4-core
+  smp4-sender-wake
 )
 
 QUICK_PROFILES=(x86_64-core unlock-graduated sender-wake d2-recv d2-send d3-full)
@@ -78,6 +82,7 @@ FULL_PROFILES=(
   smp-ready
   cross-arch-d6-aarch64 cross-arch-d6-riscv64
   d3-full
+  smp2-core smp2-sender-wake smp4-core smp4-sender-wake
 )
 
 EXTENDED_PROFILES=("${FULL_PROFILES[@]}" smp-ready-4)
@@ -106,6 +111,10 @@ profile_desc() {
     cross-arch-d6-riscv64)  echo "CROSS_ARCH_D6=1 RISC-V D6 restore-path audit (deferred)";;
     d3-full)                echo "D3_FULL=1 VM anon map/unmap two-phase proof";;
     unlock-graduated)       echo "graduated x86_64 -smp1 seams are the ONLY production path; obsolete UNLOCK_GRADUATED knob ignored (Stage 182)";;
+    smp2-core)              echo "Stage 183: x86_64 -smp 2 core smoke (AP scheduler-admission readiness audit)";;
+    smp2-sender-wake)       echo "Stage 183: x86_64 -smp 2 sender-wake oracle (graduated path under SMP)";;
+    smp4-core)              echo "Stage 183: x86_64 -smp 4 core smoke (AP scheduler-admission readiness audit)";;
+    smp4-sender-wake)       echo "Stage 183: x86_64 -smp 4 sender-wake oracle (graduated path under SMP)";;
     *)                      echo "unknown profile";;
   esac
 }
@@ -135,6 +144,10 @@ profile_field() {
     cross-arch-d6-riscv64)  echo "riscv64 1 120 core CROSS_ARCH_D6=1";;
     d3-full)                echo "x86_64 1 120 core D3_FULL=1";;
     unlock-graduated)       echo "x86_64 1 120 core UNLOCK_GRADUATED=1";;
+    smp2-core)              echo "x86_64 2 120 core";;
+    smp2-sender-wake)       echo "x86_64 2 120 oracle YARM_IPC_RECV_PROOF_SENDER_WAKE=1";;
+    smp4-core)              echo "x86_64 4 120 core";;
+    smp4-sender-wake)       echo "x86_64 4 120 oracle YARM_IPC_RECV_PROOF_SENDER_WAKE=1";;
     *)                      return 1;;
   esac
 }

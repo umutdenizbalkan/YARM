@@ -236,12 +236,20 @@ done
 # Stage 182 (REMOVE-FALLBACKS): the graduated seams are the ONLY x86_64 production path.
 # No old global-lock fallback, no emergency opt-out, and no unexpected in-lock dispatch
 # may ever appear — assert their ABSENCE (the fallback was removed, not disabled).
+#
+# Stage 183 (SMP-LIVE): under x86_64 -smp >1, additionally forbid the SMP error markers
+# (TLB remote-ACK timeout, lost/duplicate wake, online-accounting corruption). These are
+# only emitted on a real SMP invariant violation, so their ABSENCE is the SMP proof.
 for f in \
   "UNLOCK_GRADUATED_DEFERRED reason=emergency_optout" \
   "UNLOCK_GRADUATED_FALLBACK path=" \
-  "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH"; do
+  "UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH" \
+  "X86_TLB_REMOTE_ACK_TIMEOUT" \
+  "D6_SMP_DUP_WAKE_FAIL" \
+  "D6_SMP_LOST_WAKE_FAIL" \
+  "X86_SMP_ONLINE_ACCOUNTING_BAD"; do
   if marker_present "$f"; then
-    echo "[err] ipc-oracle: REMOVE-FALLBACKS: obsolete fallback/opt-out path fired: $f"
+    echo "[err] ipc-oracle: REMOVE-FALLBACKS/SMP-LIVE: forbidden fallback/SMP-error marker fired: $f"
     rc=1
   fi
 done

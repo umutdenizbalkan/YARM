@@ -50396,12 +50396,14 @@ mod stage177_smp_ready {
         );
     }
 
-    // Smoke plumbing: SMP_READY profile raises QEMU_SMP; normal smoke stays -smp 1.
+    // Smoke plumbing: SMP_READY profile raises QEMU_SMP; normal smoke DEFAULTS to -smp 1.
+    // Stage 183: the smoke now honors a caller-provided QEMU_SMP (default 1) so the
+    // smp2/smp4 profiles can drive -smp >1; the default is still -smp 1.
     #[test]
     fn stage177_smoke_profile_and_smp1_default() {
         assert!(
-            SMOKE_SRC.contains("QEMU_SMP=1"),
-            "normal smoke must default to -smp 1"
+            SMOKE_SRC.contains("QEMU_SMP=${QEMU_SMP:-1}"),
+            "normal smoke must default to -smp 1 (honoring an explicit QEMU_SMP)"
         );
         assert!(
             SMOKE_SRC.contains("SMP_READY_CPUS=${SMP_READY_CPUS:-2}")
@@ -52156,7 +52158,7 @@ mod stage182_remove_fallbacks {
             "smoke must negative-test the removed opt-out + assert the knob is ignored"
         );
         assert!(
-            ORACLE_SRC.contains("REMOVE-FALLBACKS: obsolete fallback/opt-out path fired"),
+            ORACLE_SRC.contains("forbidden fallback/SMP-error marker fired"),
             "oracle must assert no fallback/opt-out path fires on the graduated sender-wake"
         );
     }
@@ -52201,6 +52203,171 @@ mod stage182_remove_fallbacks {
         assert!(
             DOC_SRC.contains("Stage 182"),
             "doc must record Stage 182 REMOVE-FALLBACKS"
+        );
+    }
+}
+
+// Stage 183 (SMP-LIVE): source guards. The x86_64 SMP topology limit is TOPOLOGY logic
+// (single_cpu eligibility), NOT a knob/fallback selector; a read-only SMP-liveness audit
+// reports the AP-admission blocker honestly under -smp>1; non-x86_64 stays Stage-184
+// gated; and the Stage 181/182 invariants are all preserved.
+mod stage183_smp_live {
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const EXEC_SRC: &str = include_str!("exec_state.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const CAP_SRC: &str = include_str!("../capabilities.rs");
+    const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+    const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The SMP topology limit is expressed as TOPOLOGY eligibility (online_cpu_count),
+    // not a runtime knob/env/bool selector — there is no fallback SELECTOR to re-add.
+    #[test]
+    fn stage183_smp_limit_is_topology_not_a_knob() {
+        // The graduated seams gate the out-of-lock slice on a runtime CPU-count check.
+        assert!(
+            EXEC_SRC.contains("let single_cpu = self.online_cpu_count() <= 1;")
+                && IPC_STATE_SRC.contains("let single_cpu = self.online_cpu_count() <= 1;"),
+            "SMP eligibility must be topology (online_cpu_count), the same on all seams"
+        );
+        // No Stage-182-removed seam selector knob was reintroduced.
+        for gone in [
+            "fn set_d6_genuine_enabled(",
+            "fn set_d2_recv_genuine_enabled(",
+            "fn set_d2_send_genuine_enabled(",
+            "fn set_unlock_graduated_enabled(",
+        ] {
+            assert!(
+                !MOD_SRC.contains(gone),
+                "Stage 183 must not reintroduce a seam selector knob: {gone}"
+            );
+        }
+    }
+
+    // A read-only SMP-liveness audit exists, is one-shot, x86_64+present>1 gated, and
+    // reports the AP-scheduler-admission blocker honestly (does not fake SMP success).
+    #[test]
+    fn stage183_smp_unlock_audit_is_read_only_and_honest() {
+        let idx = ORCH_SRC
+            .find("fn maybe_run_x86_smp_unlock_audit")
+            .expect("SMP-unlock audit fn");
+        let rest = &ORCH_SRC[idx..];
+        let end = rest[3..]
+            .find("\n    /// Stage")
+            .map(|p| p + 3)
+            .unwrap_or(rest.len());
+        let body = &rest[..end.min(rest.len())];
+        assert!(
+            body.contains("cfg!(target_arch = \"x86_64\")")
+                && body.contains("present_cpu_bitmap().count_ones()")
+                && body.contains("X86_SMP_UNLOCK_AUDIT_STARTED"),
+            "audit must be x86_64 + present>1 gated + one-shot"
+        );
+        assert!(
+            body.contains("X86_SMP_UNLOCK_BEGIN")
+                && body.contains("X86_SMP_UNLOCK_DONE")
+                && body.contains("X86_SMP_AP_PARKED")
+                && body.contains("reason=ap_scheduler_admission_required")
+                && body.contains("X86_SMP_NO_INLOCK_FALLBACK"),
+            "audit must report the AP-admission blocker + no-in-lock-fallback honestly"
+        );
+        // Read-only: it flips no eligibility gate (no set_current_cpu / bring_up_cpu /
+        // enqueue mutation inside the audit).
+        assert!(
+            !body.contains("bring_up_cpu(")
+                && !body.contains("set_current_cpu(")
+                && !body.contains("enqueue_"),
+            "the audit must be read-only (no scheduler mutation)"
+        );
+        // Hooked in both the syscall and timer fault paths.
+        assert!(
+            FAULT_SRC
+                .matches("self.maybe_run_x86_smp_unlock_audit()")
+                .count()
+                >= 2,
+            "SMP audit must be hooked in both fault paths"
+        );
+    }
+
+    // Non-x86_64 SMP-live is explicitly deferred to Stage 184 (the audit early-returns).
+    #[test]
+    fn stage183_non_x86_is_stage184_gated() {
+        let idx = ORCH_SRC
+            .find("fn maybe_run_x86_smp_unlock_audit")
+            .expect("audit fn");
+        let body = &ORCH_SRC[idx..idx + 900];
+        assert!(
+            body.contains("if !cfg!(target_arch = \"x86_64\")") && body.contains("Stage 184"),
+            "non-x86_64 must early-return and reference Stage 184"
+        );
+    }
+
+    // Scripts drive x86_64 -smp 2/4 and assert the SMP verdict + no fallback/SMP errors,
+    // without reintroducing any production fallback knob.
+    #[test]
+    fn stage183_scripts_drive_smp_and_forbid_fallback() {
+        for p in [
+            "smp2-core",
+            "smp2-sender-wake",
+            "smp4-core",
+            "smp4-sender-wake",
+        ] {
+            assert!(
+                RUNNER_SRC.contains(p),
+                "runner must register SMP profile: {p}"
+            );
+        }
+        assert!(
+            SMOKE_SRC.contains("QEMU_SMP=${QEMU_SMP:-1}")
+                && SMOKE_SRC.contains("X86_SMP_UNLOCK_DONE")
+                && SMOKE_SRC.contains("SMP-LIVE: no fallback/opt-out/in-lock-dispatch fired"),
+            "smoke must honor QEMU_SMP + assert the SMP verdict + forbid fallback"
+        );
+        assert!(
+            ORACLE_SRC.contains("X86_TLB_REMOTE_ACK_TIMEOUT")
+                && ORACLE_SRC.contains("D6_SMP_LOST_WAKE_FAIL")
+                && ORACLE_SRC.contains("D6_SMP_DUP_WAKE_FAIL"),
+            "oracle must forbid the SMP error markers (TLB timeout / lost / dup wake)"
+        );
+    }
+
+    // Stage 181/182 invariants preserved: pool-leak guard, allocation-free leaf-delete,
+    // full recursive revoke for non-leaf, no-fallback, frozen counts.
+    #[test]
+    fn stage183_preserves_prior_invariants() {
+        assert!(
+            ORCH_SRC.contains("UNLOCK_GRADUATED_POOL_LEAK"),
+            "PT-pool leak guard must remain"
+        );
+        assert!(
+            CAP_SRC.contains("pub fn delete_if_leaf(&mut self, id: CapId)")
+                && CAP_SRC.contains("pub fn revoke(&mut self, id: CapId)")
+                && CAP_LIFECYCLE_SRC.contains("has_any_delegated_child(root)"),
+            "allocation-free leaf-delete + full revoke must remain"
+        );
+        assert!(
+            !ORCH_SRC.contains("UNLOCK_GRADUATED_UNEXPECTED_INLOCK_DISPATCH")
+                && !ORCH_SRC.contains("UNLOCK_GRADUATED_FALLBACK path="),
+            "no fallback branch may return"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 183"),
+            "doc must record Stage 183 SMP-LIVE"
         );
     }
 }
