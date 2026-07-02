@@ -6089,8 +6089,76 @@ Acceptance (user QEMU): primary
 `TIMEOUT_SECS=120 D3_FULL=1 QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh`; regression
 matrix (CROSS_ARCH_D6 aarch64/riscv, SMP_READY, GLOBAL_STATE, SPAWN_LIFECYCLE,
 FAULT_DELIVERY, CAP_CNODE, VM_COW, SCHED_TIMEOUT, IPC_FINAL, D2_RECV, D2_SEND, normal,
-D6_SWITCH_A, 5-min D6_SWITCH_PROOF, sender-wake oracle). **PENDING user QEMU
-acceptance.**
+D6_SWITCH_A, 5-min D6_SWITCH_PROOF, sender-wake oracle).
+
+**ACCEPTED (user QEMU, 2026).** The `D3_FULL=1` x86_64 run reached the service
+baseline and exercised the real VM primitives on a scratch ASID/object
+(`create_user_address_space` → `alloc_anonymous_memory_object` →
+`map_user_page_in_asid_with_caps` → local TLB flush → `unmap_user_page_in_asid` →
+reclaim/destroy) with the full two-phase map/unmap marker sequence, the remote
+shootdown explicitly prep/deferred (`D3_TLB_SHOOTDOWN_DEFERRED reason=smp_not_live`,
+`D3_TLB_ACK_WAIT_DEFERRED reason=smp_not_live`), and all leak/invariant checks green
+(`D3_VM_NO_FRAME_LEAK`/`_NO_CAP_LEAK`/`_NO_METADATA_LEAK`/`_NO_STALE_PTE`/
+`_NO_COW_UNDERFLOW`/`_NO_WRITABLE_SHARED_ALIAS`/`RANK_ORDER_OK`/`INVARIANT_OK`/
+`PROOF_DONE result=ok`); the x86_64 regression matrix stayed green. Stage 179 D3-FULL
+is **ACCEPTED** — the D3 map/unmap primitives are genuinely exercised live in the
+scratch proof, the production `VmAnonMap`/`VmUnmap` syscall ABI is unchanged, local TLB
+flush is live, and remote shootdown/ACK is deferred. Stage 180 (CI-PROFILES) is the
+next frontier.
+
+### 7.1.16 Stage 180 — CI-PROFILES (repeatable profile runner + fatal-marker policy)
+
+**Reliability/tooling milestone after D3-FULL — not a kernel behavior stage.** Turns the
+accepted manual smoke/oracle profiles from Stages 163P and 166–179 into repeatable,
+documented profiles behind a single runner (`scripts/run-ci-profiles.sh`) with
+consistent logs, marker gates, mode isolation, and a shared fatal-marker policy. **No
+kernel runtime behavior changed**; no accepted gate weakened. No script bug required a
+fix beyond the shared-helper additions (the per-stage gates were already correct after
+Stages 171B/173B/175B/178B).
+
+**Profile inventory.** Core: `x86_64-core` (`-smp 1`), `aarch64-core`, `riscv64-core`.
+Oracle: `sender-wake` (Stage 163P), `ipc-final` (`IPC_FINAL=1`). Kernel-unlocking /
+diagnostics (x86_64 `-smp 1` unless noted): `d6-switch-proof` (5 min), `d6-switch-a`,
+`d6-genuine`, `d2-recv`, `d2-send`, `sched-timeout`, `vm-cow`, `cap-cnode`,
+`fault-delivery`, `spawn-lifecycle`, `global-state`, `smp-ready` (`SMP_READY_CPUS=2`),
+`smp-ready-4` (`SMP_READY_CPUS=4`, extended), `cross-arch-d6-aarch64`,
+`cross-arch-d6-riscv64`, `d3-full`. Each profile is a default timeout of 120 s (300 s
+for `d6-switch-proof`), the documented QEMU SMP setting (`-smp 1` except SMP_READY /
+CROSS_ARCH_D6 aarch64 = 4), the arch build artifacts, a deterministic log path, and the
+per-profile marker gate implemented in its underlying smoke script.
+
+**Groups.** `quick` = x86_64-core + sender-wake + d2-recv + d2-send + d3-full;
+`full` = every core/oracle/diagnostic profile at `-smp` defaults + 5-min d6-switch-proof
++ both cross-arch-d6; `extended` = full + smp-ready-4 + optional fs/strict profiles.
+`list` prints all profiles; `--dry-run` prints commands without launching QEMU;
+`--keep-going` continues past failures; `--logs-dir` fixes the wrapper+QEMU log
+location; `--timeout` overrides the default; `--build` rebuilds artifacts first. The
+runner calls the existing smoke scripts (no logic duplication) and prints a final
+PASS/FAIL/SKIP summary table, exiting nonzero if any required profile fails.
+
+**Shared fatal-marker policy** (`qemu-smoke-common.sh` helpers, additive — existing
+scripts unchanged): `log_has_fatal_breadcrumb` (`^!Fv`/`^!BNv`/`DOUBLE_FAULT`/`TRIPLE`/
+`PANIC`/`FATAL`), `log_has_unhandled_page_fault` (`PAGE_FAULT_UNHANDLED`/`_FATAL`/
+`_NOT_HANDLED` only — the benign `PAGE_FAULT_HW_REGS`/`_FRAME_WORDS`/`_FRAME_DECODE`/
+`_HW_PTE_WALK`/`_RAW`/`_X86_ERROR`/`_CR3_COMPARE`/`_ENTRY` and handled
+`_HANDLED_COW`/`_HANDLED_DEMAND` are NOT fatal), and `log_has_profile_failure`.
+
+**Acceptance-rule reminders** (also added to `doc/AI_AGENT_RULES.md`): a stage is not
+accepted without QEMU/user evidence; the `*_ENABLED` marker alone is never acceptance
+(the invariant/proof-done markers are required); handled `PAGE_FAULT_*` diagnostics are
+not fatal unless the explicit unhandled/fatal markers appear; default-off knobs are
+isolated under `D6_SWITCH_PROOF`/`D6_SWITCH_A`; counts stay SYSCALL_COUNT=31,
+VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32.
+
+**What remains deferred after Stage 180:** Stage 178 live AArch64/RISC-V global-lock-
+dropped restore; real SMP scheduler / IPI remote wake; real remote TLB shootdown ACK;
+optional GitHub-Actions QEMU jobs (kept local/manual — the runner is local-first;
+`--dry-run` is CI-safe).
+
+Guarded by `stage180_ci_profiles`. Acceptance (user):
+`scripts/run-ci-profiles.sh quick --build --logs-dir logs/stage180-quick` (primary),
+`full` / `extended` optional/manual. **PENDING user QEMU acceptance** (the runner's
+`list` + `--dry-run` are verified locally and in tests).
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
