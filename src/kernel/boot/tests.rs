@@ -52465,6 +52465,61 @@ mod stage183_ap_idle_admit {
         );
     }
 
+    // Stage 183 inc.2 diagnostic: the AP path writes a fine-grained stage word (offset 48)
+    // before every risky action so the BSP admit-poll can NAME the last stage on timeout
+    // instead of reporting a bare "timeout". The breadcrumb bytes are documented + paired
+    // with the stage word; they are intentional trace, not corruption.
+    #[test]
+    fn stage183_ap_stage_trace_is_deterministic() {
+        // A dedicated stage word at offset 48, distinct from the ready_word (offset 32).
+        assert!(
+            TRAMP_SRC.contains("AP_HANDOFF_STAGE_WORD_OFFSET: usize = 48")
+                && TRAMP_SRC.contains("pub(super) ap_stage: u32")
+                && TRAMP_SRC.contains("fn ap_stage_word_low_virt("),
+            "a dedicated low-memory AP stage word (offset 48) + reader must exist"
+        );
+        // Every documented fine-grained stage code exists and is named for the log.
+        for s in [
+            "AP_STAGE_RUST_ENTERED",
+            "AP_STAGE_HANDOFF_LOADED",
+            "AP_STAGE_HANDOFF_VALIDATED",
+            "AP_STAGE_BEFORE_WRMSR",
+            "AP_STAGE_AFTER_WRMSR",
+            "AP_STAGE_AFTER_RDMSR",
+            "AP_STAGE_GS_VERIFIED",
+            "AP_STAGE_BEFORE_HLT",
+            "AP_STAGE_IDLE",
+            "AP_STAGE_HANDOFF_NULL",
+            "AP_STAGE_GS_MISMATCH",
+        ] {
+            assert!(TRAMP_SRC.contains(s), "AP stage code must exist: {s}");
+        }
+        assert!(
+            TRAMP_SRC.contains("fn ap_stage_name("),
+            "stage codes must be nameable for the timeout log"
+        );
+        // The AP writes the stage word before each risky action (per-step trace).
+        assert!(
+            TRAMP_SRC.matches("[rdi + 48]").count() >= 9,
+            "the AP must publish the stage word before every risky action"
+        );
+        // The handoff reservation holds the FULL 56-byte struct + a compile-time layout guard
+        // locks the field offsets the asm hardcodes.
+        assert!(
+            TRAMP_SRC.contains(".zero 56")
+                && TRAMP_SRC.contains("size_of::<ApHandoff>() == 56")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, ap_stage) == 48"),
+            "the handoff reservation + layout guard must match the 56-byte struct"
+        );
+        // On admit timeout the BSP names the last stage it reached (deterministic trace).
+        assert!(
+            SMP_SRC.contains("reason=timeout last_stage=")
+                && SMP_SRC.contains("last_stage_raw=")
+                && SMP_SRC.contains("ap_stage_word_low_virt(handoff_off)"),
+            "admit-poll timeout must report last_stage + last_stage_raw from the stage word"
+        );
+    }
+
     // Counts/limits unchanged (no ABI/limit drift from the SMP bring-up).
     #[test]
     fn stage183_inc2_counts_unchanged() {
