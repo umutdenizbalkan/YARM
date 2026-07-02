@@ -6269,6 +6269,50 @@ sender-wake coexists with the graduated seams. Guarded by `stage181b_sender_wake
 Counts unchanged. **Stage 181 remains PENDING full acceptance** until
 `run-ci-profiles.sh quick` (incl. sender-wake) is green under QEMU.
 
+**Stage 181C — fork `Internal` under graduated default-on (PARTIAL).** With the
+181B plumbing hard-check in place, a decisive QEMU bisect (user, 2026) isolated a
+REAL graduation regression — NOT plumbing:
+
+- Explicit graduated core smoke (`UNLOCK_GRADUATED=1`) passes; normal default-on boot
+  passes; no `UNLOCK_GRADUATED_FALLBACK` / `UNEXPECTED_INLOCK_DISPATCH` /
+  `DOUBLE_DISPATCH` / `RESTORE_FAIL` / D3 leak markers observed.
+- **Graduated** sender-wake oracle FAILS: the workload starts, fills the endpoint,
+  reaches `fork`, and `fork` returns `IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED code=255
+  meaning=Internal` — the sequence/order markers never appear.
+- **Emergency opt-out** (`UNLOCK_GRADUATED=0`) sender-wake oracle PASSES:
+  `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` + `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`.
+
+Therefore the graduated default-on path makes `fork` return `SyscallError::Internal`
+during the sender-wake proof. The conservative path is unaffected. The fix must keep
+graduation on (no forcing `unlock_graduated=0` in the sender-wake profile) — Stage 182
+fallback deletion still comes after full Stage 181 acceptance.
+
+Instrumentation + triage added this stage so the exact seam and reason are surfaced
+on the next run (the syscall ABI is unchanged — `Internal`/err=255 is preserved; the
+*cause* is now logged, not hidden):
+
+- `handle_fork` emits `FORK_COW_BEGIN` / `FORK_COW_DONE` and, on failure, a normalized
+  `FORK_COW_FAIL reason=<asid_full|cow_capacity|task_full|cap_full|current_tid|…>`
+  mapped from the terminal `KernelError` (proof-gated; no normal-boot noise). The
+  existing `FORK_PROOF_*` per-phase markers already pinpoint the failing phase.
+- The oracle triages a non-completing sender-wake run into WORKLOAD ABSENT vs.
+  WORKLOAD STARTED-but-FORK-FAILED (printing the fork code + nearest `FORK_COW_FAIL`
+  reason) vs. send/order-marker-missing, instead of the opaque "sequence marker absent".
+- The graduated one-shot proof's D3 scratch check now leak-checks the **aspace cap**
+  (minted into the caller's cnode by `create_user_address_space`) in addition to the
+  mem cap / MO / live aspace slot, closing a gap in the "no net ASID/cap/frame/MO leak"
+  guarantee (a stale aspace-cap slot would shrink the caller cnode budget every
+  graduated boot and could starve the sender-wake fork's child-cnode setup).
+
+The per-seam bisect modes are already supported by invocation (the oracle passes the
+`UNLOCK_GRADUATED` / `D2_RECV_GENUINE` / `D2_SEND_GENUINE` / `D6_GENUINE` env through
+to the core smoke, which appends the matching `yarm.*` cmdline knobs), e.g.
+`UNLOCK_GRADUATED=0 D6_GENUINE=1 YARM_IPC_RECV_PROOF_SENDER_WAKE=1
+scripts/qemu-ipc-recv-v2-oracle-smoke.sh x86_64`. Guarded by `stage181c_fork_internal`.
+Counts unchanged. **Stage 181 remains PARTIAL (user QEMU, 2026)** until the graduated
+sender-wake oracle passes; the added instrumentation makes the failing seam + reason
+deterministic on the next QEMU run.
+
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
    `block_current_on_receive_with_deadline` call boundary ahead of

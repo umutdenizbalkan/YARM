@@ -37,6 +37,36 @@ pub(super) fn handle_spawn_thread(
     Ok(())
 }
 
+/// Stage 181C: map a `KernelError` returned by the fork/COW path to a stable,
+/// greppable reason token from a small fixed vocabulary. The syscall ABI still
+/// collapses most of these to `SyscallError::Internal` (err=255); this token
+/// exposes the *actual* cause so the oracle/smoke can report WHY fork failed
+/// (a capacity leak, a stale-state mismatch, or a genuine map/asid fault)
+/// instead of the opaque `Internal`. It maps, it does NOT change behavior.
+fn fork_cow_fail_reason(e: KernelError) -> &'static str {
+    use crate::kernel::vm::VmError;
+    match e {
+        KernelError::VmFull => "asid_full",
+        KernelError::Vm(VmError::Full) => "cow_capacity",
+        KernelError::Vm(VmError::InvalidAsid) => "active_asid",
+        KernelError::Vm(VmError::Misaligned)
+        | KernelError::Vm(VmError::PrivilegeViolation)
+        | KernelError::Vm(VmError::InvalidAddress) => "vm_fault",
+        KernelError::SchedulerFull | KernelError::TaskTableFull => "task_full",
+        KernelError::CapabilityFull => "cap_full",
+        KernelError::EndpointFull | KernelError::EndpointQueueFull => "endpoint_full",
+        KernelError::MemoryObjectFull => "mo_full",
+        KernelError::MemoryObjectMissing => "mo_missing",
+        KernelError::TaskMissing => "current_tid",
+        KernelError::MissingRight => "rights",
+        KernelError::InvalidCapability
+        | KernelError::WrongObject
+        | KernelError::StaleCapability => "cnode",
+        KernelError::UserMemoryFault => "user_fault",
+        KernelError::WouldBlock => "would_block",
+    }
+}
+
 pub(super) fn handle_fork(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -48,11 +78,17 @@ pub(super) fn handle_fork(
     let proof = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
     if proof {
         crate::yarm_log!("FORK_PROOF_ENTER parent_tid={}", parent_tid);
+        // Stage 181C: stable named span markers around the whole fork/COW attempt.
+        // The per-phase reasons come from the FORK_PROOF_* markers emitted inside
+        // `fork_user_process_cow`; FORK_COW_FAIL below normalizes the terminal
+        // KernelError into a fixed reason vocabulary the oracle greps for.
+        crate::yarm_log!("FORK_COW_BEGIN parent_tid={}", parent_tid);
     }
     match kernel.fork_user_process_cow(parent_tid) {
         Ok(child_tid) => {
             if proof {
                 crate::yarm_log!("FORK_PROOF_PARENT_RET child_tid={}", child_tid);
+                crate::yarm_log!("FORK_COW_DONE child_tid={}", child_tid);
             }
             frame.set_ok(
                 usize::try_from(child_tid).map_err(|_| SyscallError::Internal)?,
@@ -65,6 +101,13 @@ pub(super) fn handle_fork(
             let se = SyscallError::from(e);
             if proof {
                 crate::yarm_log!("FORK_PROOF_RETURN_ERR code={} reason={:?}", se as usize, e);
+                // Stage 181C: the actual cause behind an opaque `Internal` (err=255).
+                crate::yarm_log!(
+                    "FORK_COW_FAIL reason={} kernel_error={:?} syscall_code={}",
+                    fork_cow_fail_reason(e),
+                    e,
+                    se as usize
+                );
             }
             Err(se)
         }

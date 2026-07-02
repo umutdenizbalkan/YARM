@@ -315,6 +315,46 @@ proof_require() {
   fi
 }
 
+# Stage 181C: sender-wake failure triage. When the sender-wake sequence marker is
+# absent, distinguish (a) workload never started, (b) started but FORK failed,
+# (c) started but the blocking send failed, (d) started but only the order/seq
+# marker is missing. The graduated default-on regression manifests as (b): the
+# workload fills the endpoint, reaches fork, and fork returns Internal (err=255).
+# Surface the exact fork failure code + the kernel's normalized FORK_COW_FAIL
+# reason so the seam is unambiguous instead of the opaque "sequence marker absent".
+diagnose_sender_wake() {
+  echo "[info] ipc-oracle: sender-wake triage — mode UNLOCK_GRADUATED=${UNLOCK_GRADUATED:-<default:graduated>} D2_RECV_GENUINE=${D2_RECV_GENUINE:-0} D2_SEND_GENUINE=${D2_SEND_GENUINE:-0} D6_GENUINE=${D6_GENUINE:-0}"
+  if ! marker_present "IPC_RECV_PROOF_SENDER_WAKE_BEGIN"; then
+    echo "[diag] sender-wake: WORKLOAD ABSENT — no IPC_RECV_PROOF_SENDER_WAKE_BEGIN (the userspace workload never started)"
+    return
+  fi
+  if marker_present "IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED"; then
+    # Extract the last fork-failed line and its decoded code/meaning.
+    local ff dec reason
+    ff=$(rg -N -a "IPC_RECV_PROOF_SENDER_WAKE_FORK_FAILED" "$ANALYSIS_LOG" | tail -n1)
+    echo "[diag] sender-wake: WORKLOAD STARTED but FORK FAILED"
+    echo "[diag]   $ff"
+    # Nearest kernel-side normalized reason (Stage 181C FORK_COW_FAIL) if present.
+    if marker_present "FORK_COW_FAIL reason="; then
+      reason=$(rg -N -a "FORK_COW_FAIL reason=" "$ANALYSIS_LOG" | tail -n1)
+      echo "[diag]   kernel reason: $reason"
+    elif marker_present "FORK_PROOF_RETURN_ERR"; then
+      reason=$(rg -N -a "FORK_PROOF_RETURN_ERR" "$ANALYSIS_LOG" | tail -n1)
+      echo "[diag]   kernel reason: $reason"
+    else
+      echo "[diag]   kernel reason: (no FORK_COW_FAIL / FORK_PROOF_RETURN_ERR marker — rerun with the sender-wake sub-knob so proof-gated fork markers fire)"
+    fi
+    echo "[diag]   => sender-wake fork failed under the current mode; this is a fork/COW regression, not a plumbing or missing-order-marker issue."
+    return
+  fi
+  if marker_present "IPC_RECV_PROOF_SENDER_WAKE_FORK_BEGIN" \
+     && ! marker_present "IPC_RECV_PROOF_SENDER_WAKE_CHILD_ENTRY"; then
+    echo "[diag] sender-wake: WORKLOAD STARTED, fork reached but child never entered (no CHILD_ENTRY) — inspect FORK_COW_* / scheduler markers"
+    return
+  fi
+  echo "[diag] sender-wake: WORKLOAD STARTED and forked; sequence/order marker missing — inspect blocking-send + IPC_RECV_V2_SENDER_WAKE_ORDER_OK path"
+}
+
 if [[ "$YARM_IPC_RECV_PROOF_QUEUED_SPLIT" == "1" ]]; then
   echo "[info] ipc-oracle: proof queued-split: REQUIRED"
   proof_require "queued-split" "IPC_RECV_PROOF_QUEUED_SPLIT_SEQUENCE_DONE" "IPC_RECV_V2_META_QUEUED_SPLIT_OK"
@@ -361,6 +401,12 @@ if [[ "$YARM_IPC_RECV_PROOF_SENDER_WAKE" == "1" ]]; then
     exit 1
   fi
   echo "[ok]   ipc-oracle: sender-wake sub-knob reached the kernel (YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true)"
+  # Stage 181C: when the workload started but did NOT complete the sequence, run the
+  # fork/send/order triage so the failing seam (esp. fork Internal under graduated
+  # default-on) is reported explicitly rather than as an opaque missing marker.
+  if ! marker_present "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"; then
+    diagnose_sender_wake
+  fi
   proof_require "sender-wake" "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE" "IPC_RECV_V2_SENDER_WAKE_ORDER_OK"
 else
   echo "[info] ipc-oracle: proof sender-wake: not required"

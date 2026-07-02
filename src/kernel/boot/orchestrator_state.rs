@@ -724,15 +724,33 @@ impl KernelState {
         let _ = self.revoke_capability_in_cnode(cnode, mem_cap);
         let _ = self.destroy_user_address_space_by_asid(asid);
         let _ = self.revoke_capability_in_cnode(cnode, aspace_cap);
-        let leak = self.memory_object_slot_by_id(mo_id).is_some()
-            || self.capability_for_cnode_local(cnode, mem_cap).is_some()
-            || self.with_user_spaces(|spaces| spaces.get(asid).is_some());
+        // Stage 181C: verify NO net resource is left behind. Previously the aspace_cap
+        // (minted by `create_user_address_space` into the current cnode) was revoked but
+        // NOT leak-checked, so a stale aspace-cap slot could shrink the caller's cnode
+        // budget every graduated boot and later starve the sender-wake fork's child
+        // cnode setup (surfacing as fork `Internal`). Check both caps + the MO + the
+        // live aspace slot. (The retired-but-not-yet-ACKed ASID is intentionally NOT
+        // flagged: on -smp1 destroy retires the ASID pending the current CPU's own
+        // shootdown ACK, which is reclaimed at the next cross-CPU work drain — a
+        // transient, not a leak.)
+        let mo_leak = self.memory_object_slot_by_id(mo_id).is_some();
+        let mem_cap_leak = self.capability_for_cnode_local(cnode, mem_cap).is_some();
+        let aspace_cap_leak = self.capability_for_cnode_local(cnode, aspace_cap).is_some();
+        let aspace_leak = self.with_user_spaces(|spaces| spaces.get(asid).is_some());
+        let leak = mo_leak || mem_cap_leak || aspace_cap_leak || aspace_leak;
         if !mapped || !unmapped {
             crate::yarm_log!("UNLOCK_GRADUATED_D3_ROLLBACK_FAIL reason=map_unmap");
             return false;
         }
         if leak {
-            crate::yarm_log!("UNLOCK_GRADUATED_D3_LEAK mo={}", mo_id);
+            crate::yarm_log!(
+                "UNLOCK_GRADUATED_D3_LEAK mo={} mo_leak={} mem_cap_leak={} aspace_cap_leak={} aspace_leak={}",
+                mo_id,
+                mo_leak,
+                mem_cap_leak,
+                aspace_cap_leak,
+                aspace_leak
+            );
             return false;
         }
         true
