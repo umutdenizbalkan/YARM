@@ -44831,7 +44831,7 @@ mod stage163j_fork_return_lane {
         THREAD_SRC
             .split("fn fork_complete_post_clone")
             .nth(1)
-            .map(|s| &s[..s.len().min(6500)])
+            .map(|s| &s[..s.len().min(8500)])
             .expect("fork_complete_post_clone body")
     }
 
@@ -45089,7 +45089,7 @@ mod stage163k_no_smoke_interference {
         let body = THREAD_SRC
             .split("fn fork_complete_post_clone")
             .nth(1)
-            .map(|s| &s[..s.len().min(6500)])
+            .map(|s| &s[..s.len().min(8500)])
             .expect("fork_complete_post_clone body");
         assert!(
             body.contains("child.user_context.user_gprs[0] = 0;"),
@@ -51704,8 +51704,77 @@ mod stage181c_fork_internal {
     const X86_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
     const PROCESS_SRC: &str = include_str!("../syscall/process.rs");
     const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const THREAD_SRC: &str = include_str!("thread_state.rs");
+    const FRAME_SRC: &str = include_str!("../frame_allocator.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The register CapabilityFull is PT-pool/heap exhaustion (child cnode-slot Vec),
+    // NOT the aggregate slot budget: the fork failure path now reports the PT-pool
+    // headroom, the requested child capacity, and a per-owner cnode breakdown.
+    #[test]
+    fn stage181c_fork_failure_reports_pool_and_owner_breakdown() {
+        assert!(
+            THREAD_SRC.contains("FORK_PROOF_ALLOC_CHILD_POOL")
+                && THREAD_SRC.contains("pt_pool_free_frames")
+                && THREAD_SRC.contains("child_requested_slots="),
+            "fork failure must report PT-pool headroom + child requested slots"
+        );
+        assert!(
+            THREAD_SRC.contains("FORK_PROOF_ALLOC_CHILD_CNODE_OWNER")
+                && THREAD_SRC.contains("cnode_occupied_slots"),
+            "fork failure must emit a per-owner cnode breakdown (id/reserved/occupied)"
+        );
+    }
+
+    // The PT-pool free-frame accessor exists and documents that the slab heap draws
+    // from this pool (so its exhaustion is the CapabilityFull root mechanism).
+    #[test]
+    fn stage181c_pt_pool_free_accessor_exists() {
+        assert!(
+            FRAME_SRC.contains("pub fn pt_pool_free_frames() -> usize"),
+            "frame_allocator must expose pt_pool_free_frames()"
+        );
+    }
+
+    // The graduated one-shot proof self-checks that it returned every PT-pool frame it
+    // borrowed (net-leak detector) so a graduated-path leak is caught on its own boot.
+    #[test]
+    fn stage181c_graduated_proof_has_pool_leak_selfcheck() {
+        let idx = ORCH_SRC
+            .find("fn maybe_run_unlock_graduated_proof")
+            .expect("graduated proof fn");
+        let block = &ORCH_SRC[idx..];
+        assert!(
+            block.contains("UNLOCK_GRADUATED_POOL_BEFORE")
+                && block.contains("UNLOCK_GRADUATED_POOL_AFTER")
+                && block.contains("UNLOCK_GRADUATED_POOL_LEAK"),
+            "graduated proof must snapshot + diff the PT pool and flag a net leak"
+        );
+        // The leak marker fires only on a real net-negative delta.
+        let after = block
+            .find("pt_free_after < pt_free_before")
+            .expect("delta guard");
+        let leak = block
+            .find("UNLOCK_GRADUATED_POOL_LEAK")
+            .expect("leak marker");
+        assert!(
+            after < leak,
+            "leak marker must be gated on the net-negative delta"
+        );
+    }
+
+    // The oracle surfaces the pool exhaustion breakdown (headroom + owners + any
+    // graduated leak) when fork fails, distinguishing it from a slot-budget overflow.
+    #[test]
+    fn stage181c_oracle_surfaces_pool_breakdown() {
+        assert!(
+            ORACLE_SRC.contains("FORK_PROOF_ALLOC_CHILD_POOL")
+                && ORACLE_SRC.contains("FORK_PROOF_ALLOC_CHILD_CNODE_OWNER")
+                && ORACLE_SRC.contains("UNLOCK_GRADUATED_POOL_LEAK"),
+            "oracle triage must surface PT-pool headroom, cnode owners, and graduated leak"
+        );
+    }
 
     // The kernel maps the terminal fork/COW KernelError to a stable reason token and
     // emits FORK_COW_BEGIN / FORK_COW_FAIL reason=<token> / FORK_COW_DONE. This exposes

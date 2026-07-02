@@ -791,6 +791,15 @@ impl KernelState {
         crate::yarm_log!("UNLOCK_GRADUATED_ENABLED");
         crate::yarm_log!("UNLOCK_GRADUATED_BEGIN arch=x86_64 smp=1");
 
+        // Stage 181C: snapshot the PT frame pool (which backs the kernel slab heap AND
+        // all page tables) before the one-shot proof so a NET pool leak by the graduated
+        // path is deterministic evidence, not something only the later fork exposes.
+        let pt_free_before = crate::kernel::frame_allocator::pt_pool_free_frames();
+        crate::yarm_log!(
+            "UNLOCK_GRADUATED_POOL_BEFORE pt_pool_free_frames={}",
+            pt_free_before
+        );
+
         // Each accepted seam gate must be on (the umbrella enabled them at apply). An
         // off gate means the committed path fell back to the conservative in-lock path.
         let d2_recv = crate::kernel::boot::d2_recv_genuine_enabled();
@@ -831,6 +840,24 @@ impl KernelState {
         if self.current_tid() != Some(tid) {
             crate::yarm_log!("UNLOCK_GRADUATED_DOUBLE_DISPATCH path=proof");
             crate::yarm_log!("UNLOCK_GRADUATED_RESTORE_FAIL path=proof");
+        }
+
+        // Stage 181C: confirm the graduated one-shot proof returned every PT-pool frame
+        // it borrowed (scratch aspace root + intermediates + slab pages). A net-negative
+        // delta here is a REAL graduated-path pool leak that would later starve the
+        // sender-wake fork's child cspace allocation — emit it as an explicit fatal-style
+        // marker so this boot (not just the fork) records the regression.
+        let pt_free_after = crate::kernel::frame_allocator::pt_pool_free_frames();
+        crate::yarm_log!(
+            "UNLOCK_GRADUATED_POOL_AFTER pt_pool_free_frames={} before={}",
+            pt_free_after,
+            pt_free_before
+        );
+        if pt_free_after < pt_free_before {
+            crate::yarm_log!(
+                "UNLOCK_GRADUATED_POOL_LEAK pt_pool_frames_leaked={}",
+                pt_free_before - pt_free_after
+            );
         }
 
         if d2_recv && d2_send && d6 && d3_ok && self.current_tid() == Some(tid) {
