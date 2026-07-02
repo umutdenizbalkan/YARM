@@ -5986,9 +5986,23 @@ Acceptance (user QEMU): primary AArch64
 `CROSS_ARCH_D6=1 QEMU_SMP=1 ./scripts/qemu-riscv64-core-smoke.sh`; plus the x86_64
 regression matrix (SMP_READY / GLOBAL_STATE / SPAWN_LIFECYCLE / FAULT_DELIVERY /
 CAP_CNODE / VM_COW / SCHED_TIMEOUT / IPC_FINAL / D2_RECV / D2_SEND / normal /
-D6_SWITCH_A / 5-min D6_SWITCH_PROOF / sender-wake oracle). **PENDING user QEMU
-acceptance.** AArch64/RISC-V D6 live restore is NOT claimed live — it is audited +
-deferred; live-wiring is a later stage with its own multi-CPU proof.
+D6_SWITCH_A / 5-min D6_SWITCH_PROOF / sender-wake oracle). AArch64/RISC-V D6 live
+restore is NOT claimed live — it is audited + deferred; live-wiring is a later stage
+with its own multi-CPU proof.
+
+**PARTIAL (user QEMU, 2026).** The AArch64 and RISC-V manual runs with
+`yarm.cross_arch_d6=1` reached the service baseline and emitted `CROSS_ARCH_D6_ENABLED`
+with no fatal breadcrumbs, but the one-shot audit markers
+(`CROSS_ARCH_D6_AUDIT_BEGIN` / `_ARCH_MODEL` / the arch restore markers /
+`_INVARIANT_OK` / `_PROOF_DONE`) were **absent** — the cmdline parse/apply works and
+services boot, but the audit hook was placed only in the timer-interrupt path, whose
+`tid != 0` gate is not satisfied on the AArch64/RISC-V timer tick (the tick fires with
+the kernel/idle context current). This is an **instrumentation hook-placement bug, not
+a D6 restore-path failure**. Fixed in **Stage 178B**: the read-only audit is
+additionally invoked from the arch-neutral `Trap::Syscall` handling (which always runs
+with the syscalling user task current on all three arches); the one-shot latch keeps it
+a single audit. Behavior unchanged; AArch64/RISC-V live restore stays DEFERRED. Guarded
+by `stage178b_cross_arch_d6_hook`.
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2
