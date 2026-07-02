@@ -259,6 +259,23 @@ impl CapabilitySpace {
         Ok(())
     }
 
+    /// Stage 181C: release the cached revoke-scratch working set (the per-cspace
+    /// `RevokeScratch` Vecs sized to `capacity()`), returning its backing pages to
+    /// the allocator. `revoke()` lazily builds and CACHES this scratch on first use;
+    /// for a large (e.g. 512-slot) cspace it is ~12 pages drawn from the PT frame
+    /// pool that back the kernel heap. A one-shot diagnostic that only revokes a
+    /// couple of scratch caps should not leave that cache resident (it would steal
+    /// PT-pool headroom a later fork needs). Returns `true` if a cache was dropped.
+    /// The next real revoke rebuilds it on demand, so correctness is unchanged.
+    pub fn drop_revoke_scratch_cache(&mut self) -> bool {
+        if self.revoke_scratch_cache.take().is_some() {
+            self.revoke_scratch_cache_drops = self.revoke_scratch_cache_drops.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn occupied_slots(&self) -> usize {
         self.slots
             .as_slice()
@@ -841,6 +858,37 @@ mod tests {
         let telemetry = cspace.revoke_scratch_telemetry();
         assert!(telemetry.cache_misses >= 1);
         assert!(telemetry.cache_hits >= 1);
+    }
+
+    // Stage 181C: dropping the cached revoke scratch releases it (freeing its backing
+    // pages) and is idempotent; the next revoke rebuilds it (a fresh cache miss).
+    #[test]
+    fn drop_revoke_scratch_cache_releases_and_rebuilds() {
+        let mut cspace = CapabilitySpace::with_slots(8);
+        let cap = Capability::new(CapObject::Kernel, CapRights::READ);
+        let root = cspace.mint_at(0, cap).expect("slot 0");
+        cspace.revoke(root).expect("revoke builds + caches scratch");
+
+        // A cache is now resident; dropping it reports true, then false (idempotent).
+        assert!(
+            cspace.drop_revoke_scratch_cache(),
+            "cached revoke scratch must be dropped"
+        );
+        assert!(
+            !cspace.drop_revoke_scratch_cache(),
+            "second drop is a no-op (nothing cached)"
+        );
+        let before = cspace.revoke_scratch_telemetry().cache_misses;
+
+        // The next revoke rebuilds the scratch (another miss) — correctness intact.
+        let root2 = cspace.mint_at(1, cap).expect("slot 1");
+        cspace
+            .revoke(root2)
+            .expect("revoke after drop rebuilds scratch");
+        assert!(
+            cspace.revoke_scratch_telemetry().cache_misses > before,
+            "revoke after a drop must rebuild the scratch (a fresh miss)"
+        );
     }
 
     #[test]

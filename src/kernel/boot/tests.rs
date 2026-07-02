@@ -51706,6 +51706,8 @@ mod stage181c_fork_internal {
     const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
     const THREAD_SRC: &str = include_str!("thread_state.rs");
     const FRAME_SRC: &str = include_str!("../frame_allocator.rs");
+    const CAP_SRC: &str = include_str!("../capabilities.rs");
+    const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
 
@@ -51734,6 +51736,31 @@ mod stage181c_fork_internal {
         assert!(
             FRAME_SRC.contains("pub fn pt_pool_free_frames() -> usize"),
             "frame_allocator must expose pt_pool_free_frames()"
+        );
+    }
+
+    // ROOT-CAUSE FIX: the graduated scratch check drops the revoke-scratch cache its
+    // throwaway cap revokes lazily built + cached on the current cnode, returning those
+    // ~12 PT-pool pages so the later sender-wake fork is not starved.
+    #[test]
+    fn stage181c_graduated_proof_drops_revoke_scratch_cache() {
+        let idx = ORCH_SRC
+            .find("fn unlock_graduated_d3_scratch_check")
+            .expect("scratch check fn");
+        let block = &ORCH_SRC[idx..idx + 3400];
+        assert!(
+            block.contains("drop_revoke_scratch_cache_for_cnode(cnode)")
+                && block.contains("UNLOCK_GRADUATED_D3_SCRATCH_CACHE_DROPPED"),
+            "scratch check must drop the revoke-scratch cache it triggered on the cnode"
+        );
+        // The kernel helper + CapabilitySpace primitive exist.
+        assert!(
+            CAP_LIFECYCLE_SRC.contains("fn drop_revoke_scratch_cache_for_cnode"),
+            "KernelState must expose drop_revoke_scratch_cache_for_cnode"
+        );
+        assert!(
+            CAP_SRC.contains("pub fn drop_revoke_scratch_cache(&mut self) -> bool"),
+            "CapabilitySpace must expose drop_revoke_scratch_cache"
         );
     }
 
@@ -51856,7 +51883,7 @@ mod stage181c_fork_internal {
         let idx = ORCH_SRC
             .find("fn unlock_graduated_d3_scratch_check")
             .expect("scratch check fn");
-        let block = &ORCH_SRC[idx..idx + 3400];
+        let block = &ORCH_SRC[idx..idx + 4600];
         assert!(
             block.contains("aspace_cap_leak")
                 && block.contains("capability_for_cnode_local(cnode, aspace_cap)"),
