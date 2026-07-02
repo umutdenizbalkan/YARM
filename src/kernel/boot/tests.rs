@@ -51575,3 +51575,120 @@ mod stage181_graduate_knobs {
         );
     }
 }
+
+// Stage 181B: sender-wake runner/oracle plumbing after GRADUATE-KNOBS. Source guards
+// proving the sender-wake profile passes the accepted env and the oracle hard-checks
+// that the sub-knob actually reached the kernel (deterministic plumbing diagnosis).
+mod stage181b_sender_wake_plumbing {
+    const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
+    const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+    const X86_SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The sender-wake profile invokes the oracle for x86_64 with the accepted env.
+    #[test]
+    fn stage181b_sender_wake_profile_passes_env() {
+        // profile_field maps sender-wake to the oracle runner + the accepted env.
+        assert!(
+            RUNNER_SRC
+                .contains("sender-wake)            echo \"x86_64 1 120 oracle YARM_IPC_RECV_PROOF_SENDER_WAKE=1\""),
+            "sender-wake profile must run the oracle with YARM_IPC_RECV_PROOF_SENDER_WAKE=1"
+        );
+        assert!(
+            RUNNER_SRC.contains("qemu-ipc-recv-v2-oracle-smoke.sh")
+                && RUNNER_SRC.contains("\"$arch\""),
+            "oracle-runner profiles must invoke the oracle script with the arch arg"
+        );
+    }
+
+    // The oracle refuses to proceed with the sender-wake sequence check unless the
+    // authoritative kernel sub-knob marker is present (deterministic plumbing gate).
+    #[test]
+    fn stage181b_oracle_hard_checks_subknob_reached_kernel() {
+        // The hard-check reads the kernel SET marker and fails early with a clear msg.
+        assert!(
+            ORACLE_SRC.contains("YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true")
+                && ORACLE_SRC.contains("runner/oracle plumbing bug, not a workload failure."),
+            "oracle must hard-check the sender-wake sub-knob reached the kernel"
+        );
+        // The hard-check is inside the sender-wake REQUIRED block, before proof_require.
+        let idx = ORACLE_SRC
+            .find("proof sender-wake: REQUIRED")
+            .expect("sender-wake required block");
+        let block = &ORACLE_SRC[idx..idx + 1800];
+        let set_pos = block
+            .find("YARM_IPC_RECV_PROOF_SENDER_WAKE_SET enabled=true")
+            .expect("SET marker check in block");
+        let require_pos = block
+            .find("proof_require \"sender-wake\"")
+            .expect("proof_require in block");
+        assert!(
+            set_pos < require_pos,
+            "the sub-knob SET hard-check must run before proof_require"
+        );
+        // The oracle still exports the sub-knob from the accepted env name.
+        assert!(
+            ORACLE_SRC.contains("export IPC_RECV_PROOF_SENDER_WAKE=1")
+                && ORACLE_SRC.contains("YARM_IPC_RECV_PROOF_SENDER_WAKE"),
+            "oracle must export the sub-knob from YARM_IPC_RECV_PROOF_SENDER_WAKE"
+        );
+    }
+
+    // The core smoke still appends the sub-knob when IPC_RECV_PROOF_SENDER_WAKE=1.
+    #[test]
+    fn stage181b_core_smoke_appends_subknob() {
+        assert!(
+            X86_SMOKE_SRC.contains("yarm.ipc_recv_proof_sender_wake=1")
+                && X86_SMOKE_SRC
+                    .contains("IPC_RECV_PROOF_SENDER_WAKE=${IPC_RECV_PROOF_SENDER_WAKE:-0}"),
+            "core smoke must append yarm.ipc_recv_proof_sender_wake=1 from the env"
+        );
+    }
+
+    // Graduation is preserved: the sender-wake profile does NOT force unlock_graduated=0,
+    // so the oracle boots under the graduated default-on D2/D6 paths.
+    #[test]
+    fn stage181b_graduation_preserved_for_sender_wake() {
+        let idx = RUNNER_SRC
+            .find("sender-wake)            echo")
+            .expect("sender-wake field");
+        let line = &RUNNER_SRC[idx..idx + 90];
+        assert!(
+            !line.contains("UNLOCK_GRADUATED=0"),
+            "sender-wake profile must not disable graduation"
+        );
+        // quick group still includes both unlock-graduated (primary) and sender-wake.
+        let qidx = RUNNER_SRC.find("QUICK_PROFILES=(").expect("quick group");
+        let qblock = &RUNNER_SRC[qidx..qidx + 130];
+        assert!(
+            qblock.contains("unlock-graduated") && qblock.contains("sender-wake"),
+            "quick group must include unlock-graduated + sender-wake"
+        );
+    }
+
+    // No accepted fatal-marker gate weakened + counts unchanged.
+    #[test]
+    fn stage181b_gates_and_counts_unchanged() {
+        // The oracle still hard-fails on the accepted fatal IPC regressions.
+        assert!(
+            ORACLE_SRC.contains("IPC_RECV_CAP_MATERIALIZE_FAILED")
+                && ORACLE_SRC.contains("IPC_RECV_BLOCKED_COMPLETE_FAILED"),
+            "oracle fatal IPC regression gates must remain"
+        );
+        assert!(
+            SYSCALL_SRC.contains("pub const SYSCALL_COUNT: usize = 31")
+                && SYSCALL_SRC.contains("pub const VARIANT_COUNT: usize = 23"),
+            "SYSCALL_COUNT=31 / VARIANT_COUNT=23 unchanged"
+        );
+        assert!(
+            include_str!("../../arch/x86_64/vm_layout.rs")
+                .contains("pub const MAX_ADDRESS_SPACES: usize = 32;"),
+            "x86_64 MAX_ADDRESS_SPACES must remain 32"
+        );
+        assert!(
+            DOC_SRC.contains("Stage 181B") && DOC_SRC.contains("PARTIAL (user QEMU, 2026)"),
+            "doc must record Stage 181 PARTIAL + Stage 181B plumbing fix"
+        );
+    }
+}
