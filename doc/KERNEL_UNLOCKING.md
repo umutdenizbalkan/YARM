@@ -6472,12 +6472,41 @@ path, so `after_revoke_mem_cap` no longer drops by 14 and there is no residual t
 aspace_leaf=true`). Expected: `UNLOCK_GRADUATED_POOL_AFTER == BEFORE`, no
 `UNLOCK_GRADUATED_POOL_LEAK`, sender-wake + opt-out both green. The full revoke path is
 unchanged; the guard is **NOT** weakened; no PT-pool/cnode/task/MAX_ADDRESS_SPACES limit
-changed; no ABI/count change. Guarded by
-`delete_if_leaf_releases_leaf_without_building_scratch` +
-`stage181c_graduated_proof_releases_scratch_caps_as_leaves`. **Stage 181 acceptance
-pends the confirming graduated QEMU run** (no `UNLOCK_GRADUATED_POOL_LEAK`,
-`FORK_COW_DONE`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`,
-`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; opt-out still green).
+changed; no ABI/count change.
+
+**Stage 181C — leaf-delete cut the leak 3→2; residual traced to an allocation-free
+teardown and eliminated.** The leaf-delete run took the leak from 3 to **2** frames and
+the per-step trace isolated the last residual to `after_delete_mem_cap` (182→180) with
+`aspace_cap` flat and NO RevokeScratch built (`dropped=false mem_leaf=true`). Sub-step
+audit of `delete_leaf_capability_in_cnode`'s side effects found the culprit was NOT the
+MemoryObject reclaim (a single `free_frame` on a fixed-array slot — allocation-free) but
+the **delegation bookkeeping**: `collect_delegated_descendants` allocated a `Box`-cloned
+snapshot of the 2048-entry links array plus two `Vec::with_capacity(64)` worklists, and
+`remove_delegation_links_for` allocated more `Box` clones. Their small worklist Vecs
+warmed PT-pool-backed slab pages on the FIRST delete (`mem_cap`), reused by the second
+(`aspace_cap`) — exactly the −2-then-flat pattern.
+
+Fix: the leaf path needs only "is this cap delegated AT ALL?", so replace
+`collect_delegated_descendants` with a new **allocation-free** `has_any_delegated_child`
+(scans the links array in place under one lock, buffering the rare `source_cap`-numeric
+matches on a 16-entry stack array and resolving their owning pid outside the lock;
+conservative — returns `true` ⇒ full revoke — on the improbable overflow), and SKIP
+`remove_delegation_links_for` entirely on the leaf path (a leaf provably has no source
+links, so it would remove nothing). The remaining teardown (`revoke_active_transfer_
+mappings_for_cap` fixed-array scan, `adjust_memory_object_cap_refcount`,
+`reclaim_memory_object_if_unreferenced` single `free_frame`, notification destroy no-op)
+is allocation-free. Proof-gated `UNLOCK_GRADUATED_D3_LEAFDEL step=<...> pt_pool_free_
+frames=N` sub-steps were added to confirm each side effect is now flat.
+
+Non-leaf caps still route through full `revoke` (which uses the transitive
+`collect_delegated_descendants` unchanged), so semantics are identical. Guard NOT
+weakened; no warm-page floor; no PT-pool/cnode/task/MAX_ADDRESS_SPACES change; no
+ABI/count change. Guarded by `delete_if_leaf_releases_leaf_without_building_scratch`,
+`stage181c_graduated_proof_releases_scratch_caps_as_leaves`,
+`stage181c_leaf_delete_delegation_check_is_allocation_free`. **Stage 181 acceptance pends
+the confirming graduated QEMU run**: expected `UNLOCK_GRADUATED_POOL_AFTER == BEFORE`, no
+`UNLOCK_GRADUATED_POOL_LEAK`, `FORK_COW_DONE`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`,
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`; opt-out still green.
 
 4. **D2-GENUINE — D2 blocking-recv waiter-publish seam fully live-wired.** With the
    global lock no longer spanning `switch_frames` (D6-GENUINE), relocate the D2

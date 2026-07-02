@@ -10,6 +10,45 @@ impl KernelState {
         set.contains(&needle)
     }
 
+    /// Stage 181C: allocation-free "does `root` have any DIRECT delegated child?" check.
+    ///
+    /// [`Self::collect_delegated_descendants`] computes the full transitive closure and
+    /// allocates a `Box`-cloned links snapshot + two worklist `Vec`s — those small Vecs
+    /// warm PT-pool-backed slab pages that never come back (the residual `-2` the leaf
+    /// cap-delete trace pinned to `delete_mem_cap`). The leaf fast path only needs to
+    /// know whether the cap was delegated AT ALL (if so it is not a leaf and must take
+    /// the full recursive revoke). This scans the links array in place under one lock,
+    /// buffering the rare `source_cap`-numeric matches on the stack and resolving their
+    /// owning pid outside the lock — no heap allocation. On an improbable overflow of
+    /// numeric matches it is conservative (returns `true` ⇒ full revoke), never unsound.
+    pub(crate) fn has_any_delegated_child(&self, root: DelegatedCapRef) -> bool {
+        let mut cand_tids = [0u64; 16];
+        let mut n = 0usize;
+        let overflow = self.with_capability_state(|capability| {
+            for link in kernel_ref(&capability.delegated_capability_links)
+                .iter()
+                .flatten()
+            {
+                if link.source_cap != root.cap {
+                    continue;
+                }
+                if n < cand_tids.len() {
+                    cand_tids[n] = link.source_tid;
+                    n += 1;
+                } else {
+                    return true;
+                }
+            }
+            false
+        });
+        if overflow {
+            return true;
+        }
+        cand_tids[..n]
+            .iter()
+            .any(|&tid| self.process_id(tid).unwrap_or(tid) == root.pid)
+    }
+
     pub(crate) fn collect_delegated_descendants(
         &self,
         root: DelegatedCapRef,

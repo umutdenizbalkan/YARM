@@ -51708,8 +51708,61 @@ mod stage181c_fork_internal {
     const FRAME_SRC: &str = include_str!("../frame_allocator.rs");
     const CAP_SRC: &str = include_str!("../capabilities.rs");
     const CAP_LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+    const DELEGATION_SRC: &str = include_str!("delegation_state.rs");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The leaf cap-delete path is allocation-free: the delegated-descendant check uses
+    // the in-place has_any_delegated_child scan (NOT collect_delegated_descendants, which
+    // Box-clones the links array + allocates worklist Vecs), and it does NOT call
+    // remove_delegation_links_for (which also Box-clones). Those allocations were the
+    // residual -2 PT-pool warm pages the sub-step trace pinned to delete_mem_cap.
+    #[test]
+    fn stage181c_leaf_delete_delegation_check_is_allocation_free() {
+        let idx = CAP_LIFECYCLE_SRC
+            .find("fn delete_leaf_capability_in_cnode")
+            .expect("leaf delete fn");
+        // Body window up to the next fn.
+        let rest = &CAP_LIFECYCLE_SRC[idx..];
+        let end = rest[3..]
+            .find("\n    fn ")
+            .map(|p| p + 3)
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("has_any_delegated_child(root)"),
+            "leaf delete must use the allocation-free has_any_delegated_child check"
+        );
+        // Match call-syntax (the doc comment legitimately names these for context).
+        assert!(
+            !body.contains("self.collect_delegated_descendants("),
+            "leaf delete must NOT call collect_delegated_descendants (Box+Vec allocations)"
+        );
+        assert!(
+            !body.contains("self.remove_delegation_links_for("),
+            "leaf delete must NOT call remove_delegation_links_for (Box allocations) on the leaf path"
+        );
+        assert!(
+            body.contains("UNLOCK_GRADUATED_D3_LEAFDEL")
+                && body.contains("ipc_recv_proof_sender_wake_active()"),
+            "leaf delete must emit proof-gated per-side-effect PT-pool sub-steps"
+        );
+        // has_any_delegated_child itself must be allocation-free (no Box/Vec in its body).
+        let hidx = DELEGATION_SRC
+            .find("fn has_any_delegated_child")
+            .expect("has_any_delegated_child fn");
+        let hrest = &DELEGATION_SRC[hidx..];
+        // Next method is `pub(crate) fn collect_delegated_descendants`.
+        let hend = hrest[3..]
+            .find("\n    pub(crate) fn ")
+            .map(|p| p + 3)
+            .unwrap_or(hrest.len());
+        let hbody = &hrest[..hend];
+        assert!(
+            !hbody.contains("Box::new") && !hbody.contains("Vec::"),
+            "has_any_delegated_child must be allocation-free (no Box/Vec)"
+        );
+    }
 
     // The register CapabilityFull is PT-pool/heap exhaustion (child cnode-slot Vec),
     // NOT the aggregate slot budget: the fork failure path now reports the PT-pool

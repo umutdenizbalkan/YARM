@@ -593,12 +593,29 @@ impl KernelState {
             pid: source_pid,
             cap,
         };
-        // Cross-process delegated descendants make this a non-leaf; use full revoke.
-        let descendants = self.collect_delegated_descendants(root);
-        if !descendants.is_empty() {
+        // Stage 181C: proof-gated PT-pool sub-step trace (sender-wake only, so normal
+        // boots stay quiet) to attribute any per-side-effect net delta on the mem_cap
+        // path. The leaf path below is deliberately allocation-free.
+        let step_trace = crate::kernel::boot::ipc_recv_proof_sender_wake_active();
+        let substep = |label: &str| {
+            if step_trace {
+                crate::yarm_log!(
+                    "UNLOCK_GRADUATED_D3_LEAFDEL step={} pt_pool_free_frames={}",
+                    label,
+                    crate::kernel::frame_allocator::pt_pool_free_frames()
+                );
+            }
+        };
+        substep("before_delete_leaf");
+        // Any DIRECT delegation of this cap makes it a non-leaf; use full revoke (which
+        // computes the full transitive closure). This check is allocation-free — the old
+        // `collect_delegated_descendants` here allocated a Box-cloned links snapshot + two
+        // worklist Vecs whose small-slab warm pages were the residual leak.
+        if self.has_any_delegated_child(root) {
             self.revoke_capability_in_cnode(cnode, cap)?;
             return Ok(false);
         }
+        substep("after_descendant_check");
         // Try the childless-leaf fast path (no RevokeScratch build). `None` => cnode
         // missing; `Some(Ok(false))` => in-cspace children exist (fall back).
         let leaf = self.with_capability_state_mut(|capability_state| {
@@ -619,15 +636,23 @@ impl KernelState {
             }
             Some(Ok(true)) => {}
         }
-        // Leaf removed. Preserve the remainder of `revoke_capability_in_cnode`'s teardown
-        // (all cheap, allocation-free for a leaf with no delegations).
-        self.remove_delegation_links_for(root, &descendants);
+        substep("after_slot_clear");
+        // Leaf removed. Preserve the remainder of `revoke_capability_in_cnode`'s teardown.
+        // A leaf has NO delegated source links (verified above), so
+        // `remove_delegation_links_for` would remove nothing — skip it entirely; it also
+        // allocated Box-cloned snapshots (part of the residual). Transfer-mapping
+        // revocation + MemoryObject reclaim below are fixed-array scans / a single
+        // free_frame — allocation-free for the no-transfer scratch object.
         self.revoke_active_transfer_mappings_for_cap(source_pid, cap);
+        substep("after_transfer_revocation");
         if let Some(capability) = source_capability {
             self.adjust_memory_object_cap_refcount(capability.object, -1);
+            substep("after_mo_refcount_decrement");
             self.reclaim_memory_object_if_unreferenced(capability.object);
+            substep("after_mo_reclaim");
             self.destroy_notification_for_revoked_cap(capability.object);
         }
+        substep("after_delete_leaf_done");
         Ok(true)
     }
 
