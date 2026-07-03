@@ -2801,8 +2801,10 @@ mod tests {
             "SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 1",
             "SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK",
             "supervisor_drain_fault_endpoint",
-            "recv_with_deadline(fault_cap, 0)",
-            "recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)",
+            "supervisor_try_recv_fault(fault_cap)",
+            "ipc_recv_shared_v3_nonblocking",
+            "supervisor_recv_short_deadline(
+                    &mut transport",
             "SUPERVISOR_EVENT_LOOP_TICK",
             "SUPERVISOR_FAULT_DRAIN_BEGIN",
             "SUPERVISOR_FAULT_DRAIN_DONE count={}",
@@ -2814,6 +2816,12 @@ mod tests {
             "SUPERVISOR_CONTROL_POLL_EMPTY",
             "SUPERVISOR_CONTROL_WAIT_BEGIN timeout={}",
             "SUPERVISOR_CONTROL_WAIT_DONE result=",
+            "SUPERVISOR_IDLE_WAIT_SELECT mode=fault reason=managed_records_ready",
+            "SUPERVISOR_CONTROL_WAIT_SKIPPED reason=managed_records_ready",
+            "SUPERVISOR_FAULT_WAIT_BEGIN timeout={}",
+            "SUPERVISOR_FAULT_WAIT_RECV tid={}",
+            "SUPERVISOR_FAULT_WAIT_EMPTY",
+            "SUPERVISOR_FAULT_WAIT_DONE result=",
             "SUPERVISOR_FAULT_LOOKUP_BEGIN",
             "SUPERVISOR_FAULT_LOOKUP_OK",
             "SUPERVISOR_FAULT_LOOKUP_FAIL",
@@ -2846,10 +2854,47 @@ mod tests {
             supervisor_src.contains("ipc_call(req_cap, rep_cap, &msg)"),
             "SUP-L6N restart-token lookup must use the existing PM request/reply-cap call path"
         );
+        let token_query = supervisor_src
+            .split("fn query_restart_token_via_process_manager")
+            .nth(1)
+            .and_then(|tail| tail.split("fn query_lifecycle_via_process_manager").next())
+            .expect("token query function present");
         assert!(
-            supervisor_src.contains("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}")
-                && supervisor_src.contains("ipc_recv_v2(rep_cap)"),
-            "SUP-L6O token lookup must wait for and decode the PM reply before reporting missing-token"
+            token_query.contains("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}")
+                && token_query.contains(
+                    "ipc_recv_with_deadline(rep_cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS)"
+                )
+                && token_query.contains("SUPERVISOR_RESTART_TOKEN_QUERY_TIMEOUT tid={}"),
+            "SUP-L7G token lookup must use a bounded receive and report timeout"
+        );
+        assert!(
+            !token_query.contains("ipc_recv_v2(rep_cap)"),
+            "SUP-L7G token lookup must not use blocking ipc_recv_v2(rep_cap)"
+        );
+        let lifecycle_query = supervisor_src
+            .split("fn query_lifecycle_via_process_manager")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn send_pm_restart_v1_via_process_manager")
+                    .next()
+            })
+            .expect("lifecycle query function present");
+        assert!(
+            lifecycle_query
+                .contains("ipc_recv_with_deadline(rep_cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS)")
+                && lifecycle_query.contains("SUPERVISOR_LIFECYCLE_QUERY_TIMEOUT tid={}"),
+            "SUP-L7G lifecycle query must use a bounded receive and report timeout"
+        );
+        assert!(
+            !lifecycle_query.contains("ipc_recv_with_deadline(rep_cap, 0)"),
+            "SUP-L7G lifecycle query must not use ambiguous deadline 0"
+        );
+        assert!(
+            !supervisor_src.contains("recv_with_deadline(fault_cap, 0)")
+                && !supervisor_src.contains(
+                    "recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)"
+                ),
+            "SUP-L7G supervisor poll/drain paths must not use ambiguous deadline 0"
         );
         assert!(
             !supervisor_src.contains("spawn_process_with_startup_caps(")

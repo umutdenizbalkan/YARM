@@ -17,6 +17,8 @@ use yarm_ipc_abi::process_abi::{
     PM_RESTART_REPLY_V1_LEN, PROC_OP_PM_RESTART_REPLY_V1, PmRestartFailure, PmRestartReason,
     PmRestartReplyStatus, PmRestartRequestV1, PmRestartTokenDescriptor,
 };
+#[cfg(not(test))]
+use yarm_ipc_abi::recv_shared_v3_abi::RecvSharedV3Output;
 use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
     RegisterDriverRequest, SUPERVISOR_OP_ACK_REDELEGATION, SUPERVISOR_OP_QUERY_STATUS,
@@ -36,6 +38,8 @@ use yarm_user_rt::ipc::ThreadId;
 #[cfg(not(test))]
 use yarm_user_rt::runtime::{KernelIpcError as KernelError, StartupContext, startup_context};
 #[cfg(not(test))]
+use yarm_user_rt::syscall::recv_v3::ipc_recv_shared_v3_nonblocking;
+#[cfg(not(test))]
 use yarm_user_rt::syscall::{IpcTransport, SyscallIpcTransport};
 #[cfg(test)]
 use yarm_user_rt::task::{TaskClass, TaskStatus};
@@ -49,6 +53,8 @@ mod restart_model;
 pub(crate) use restart_model::*;
 
 const SUPERVISOR_FAULT_REPORT_WIRE_LEN: usize = 17;
+#[cfg(not(test))]
+const SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS: u64 = 1;
 const SUPERVISOR_FAULT_REPORT_TID_START: usize = 0;
 const SUPERVISOR_FAULT_REPORT_TID_END: usize = 8;
 const SUPERVISOR_FAULT_REPORT_ADDR_START: usize = 8;
@@ -737,6 +743,11 @@ impl SupervisorService {
             .iter_mut()
             .flatten()
             .find(|record| record.tid == tid)
+    }
+
+    #[cfg(not(test))]
+    fn has_managed_records(&self) -> bool {
+        self.managed.iter().any(Option::is_some)
     }
 
     fn stash_pending_fault(&mut self, fault: SupervisorFaultReportWire) -> bool {
@@ -1907,9 +1918,10 @@ pub fn run() {
                     made_progress = true;
                 }
                 yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
-                match transport
-                    .recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)
-                {
+                match supervisor_recv_short_deadline(
+                    &mut transport,
+                    supervisor.handoff.supervisor_control_recv_cap.0 as u32,
+                ) {
                     Ok(Some(msg)) => {
                         made_progress = true;
                         let payload = msg.as_slice();
@@ -2024,23 +2036,45 @@ pub fn run() {
                 }
 
                 if !made_progress {
-                    yarm_user_rt::user_log!(
-                        "SUPERVISOR_CONTROL_WAIT_BEGIN timeout={}",
-                        SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS
-                    );
-                    match supervisor_idle_wait(
-                        &mut transport,
-                        supervisor.handoff.supervisor_control_recv_cap.0 as u32,
-                    ) {
-                        Ok(true) => {
-                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=message");
-                        }
-                        Ok(false) => {
-                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=empty");
-                        }
-                        Err(err) => {
-                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=err");
-                            yarm_user_rt::user_log!("supervisor.srv idle wait error: {:?}", err)
+                    if supervisor.has_managed_records() {
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_IDLE_WAIT_SELECT mode=fault reason=managed_records_ready"
+                        );
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_CONTROL_WAIT_SKIPPED reason=managed_records_ready"
+                        );
+                        let _ = supervisor_fault_idle_wait(
+                            &mut supervisor,
+                            &mut transport,
+                            process_manager_caps,
+                            startup.task_id,
+                        );
+                    } else {
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_IDLE_WAIT_SELECT mode=control reason=no_managed_records"
+                        );
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_CONTROL_WAIT_BEGIN timeout={}",
+                            SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS
+                        );
+                        match supervisor_idle_wait(
+                            &mut transport,
+                            supervisor.handoff.supervisor_control_recv_cap.0 as u32,
+                        ) {
+                            Ok(true) => {
+                                yarm_user_rt::user_log!(
+                                    "SUPERVISOR_CONTROL_WAIT_DONE result=message"
+                                );
+                            }
+                            Ok(false) => {
+                                yarm_user_rt::user_log!(
+                                    "SUPERVISOR_CONTROL_WAIT_DONE result=empty"
+                                );
+                            }
+                            Err(err) => {
+                                yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=err");
+                                yarm_user_rt::user_log!("supervisor.srv idle wait error: {:?}", err)
+                            }
                         }
                     }
                     let _ = supervisor_drain_fault_endpoint(
@@ -2087,6 +2121,100 @@ pub fn run() {
     }
 }
 
+#[cfg(not(test))]
+fn supervisor_recv_short_deadline(
+    transport: &mut impl IpcTransport,
+    cap: u32,
+) -> Result<Option<Message>, KernelError> {
+    // SUP-L7G: legacy recv_with_deadline(..., 0) is not a try-receive in this
+    // runtime; use a small positive timeout for bounded control/reply waits.
+    transport
+        .recv_with_deadline(cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS)
+        .map_err(|_| KernelError::WrongObject)
+}
+
+#[cfg(not(test))]
+fn supervisor_try_recv_fault(cap: u32) -> Result<Option<Message>, KernelError> {
+    // SUP-L7G: NR 30 RecvSharedV3 is the live userspace nonblocking receive API.
+    // It preserves sender/transfer metadata but not the message opcode in its
+    // output record, so use it only on the dedicated supervisor fault endpoint,
+    // whose wire payload is always SUPERVISOR_OP_FAULT_REPORT_WIRE.
+    let mut payload = [0u8; yarm_user_rt::ipc::Message::MAX_PAYLOAD];
+    let mut output = RecvSharedV3Output::new_zeroed();
+    let delivery = unsafe {
+        ipc_recv_shared_v3_nonblocking(
+            cap as u64,
+            payload.as_mut_ptr() as u64,
+            payload.len() as u64,
+            &mut output,
+        )
+    }
+    .map_err(|_| KernelError::WrongObject)?;
+    let Some(delivery) = delivery else {
+        return Ok(None);
+    };
+    let len = delivery.message_len as usize;
+    if len > payload.len() {
+        return Err(KernelError::WrongObject);
+    }
+    Message::with_header(
+        delivery.sender_tid,
+        SUPERVISOR_OP_FAULT_REPORT_WIRE,
+        delivery.message_flags as u16,
+        delivery.transferred_cap,
+        &payload[..len],
+    )
+    .map(Some)
+    .map_err(|_| KernelError::WrongObject)
+}
+
+#[cfg(not(test))]
+fn supervisor_fault_idle_wait(
+    supervisor: &mut SupervisorService,
+    transport: &mut impl IpcTransport,
+    process_manager_caps: Option<(u32, u32)>,
+    supervisor_tid: u64,
+) -> usize {
+    let fault_cap = supervisor.handoff.supervisor_fault_recv_cap.0 as u32;
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_FAULT_WAIT_BEGIN timeout={}",
+        SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS
+    );
+    match transport.recv_with_deadline(fault_cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS) {
+        Ok(Some(msg)) => {
+            let queued_tid = if msg.opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE {
+                SupervisorFaultReportWire::decode(msg.as_slice()).map(|fault| fault.tid)
+            } else {
+                None
+            };
+            if let Some(tid) = queued_tid {
+                yarm_user_rt::user_log!("SUPERVISOR_FAULT_WAIT_RECV tid={}", tid);
+            } else {
+                yarm_user_rt::user_log!("SUPERVISOR_FAULT_WAIT_RECV tid=0");
+            }
+            let handled = supervisor_handle_fault_endpoint_message(
+                supervisor,
+                transport,
+                process_manager_caps,
+                supervisor_tid,
+                msg,
+            );
+            yarm_user_rt::user_log!("SUPERVISOR_FAULT_WAIT_DONE result=message");
+            usize::from(handled)
+        }
+        Ok(None) => {
+            yarm_user_rt::user_log!("SUPERVISOR_FAULT_WAIT_EMPTY");
+            yarm_user_rt::user_log!("SUPERVISOR_FAULT_WAIT_DONE result=empty");
+            0
+        }
+        Err(err) => {
+            yarm_user_rt::user_log!("SUPERVISOR_FAULT_WAIT_DONE result=err");
+            yarm_user_rt::user_log!("supervisor.srv fault wait error: {:?}", err);
+            0
+        }
+    }
+}
+
 /// Cooperative idle path for the production supervisor loop.
 ///
 /// Uses a bounded recv-timeout budget instead of aggressive yield polling.
@@ -2129,7 +2257,10 @@ fn query_restart_token_via_process_manager(
         KernelError::WrongObject
     })?;
     yarm_user_rt::user_log!("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}", tid);
-    let Some(received) = unsafe { yarm_user_rt::syscall::ipc_recv_v2(rep_cap) }.map_err(|_| {
+    let Some(reply_msg) = unsafe {
+        yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS)
+    }
+    .map_err(|_| {
         yarm_user_rt::user_log!(
             "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=recv",
             tid
@@ -2137,13 +2268,13 @@ fn query_restart_token_via_process_manager(
         KernelError::WrongObject
     })?
     else {
+        yarm_user_rt::user_log!("SUPERVISOR_RESTART_TOKEN_QUERY_TIMEOUT tid={}", tid);
         yarm_user_rt::user_log!(
-            "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=no-reply",
+            "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid={} reason=timeout",
             tid
         );
         return Ok(None);
     };
-    let reply_msg = received.message;
     let reply = match TaskRestartTokenReply::decode(reply_msg.as_slice()) {
         Ok(reply) => reply,
         Err(_) => {
@@ -2257,6 +2388,7 @@ fn supervisor_handle_fault_endpoint_message(
                                 "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=missing-record",
                                 fault.tid
                             );
+                            return false;
                         }
                     }
                     let token_result = supervisor
@@ -2467,7 +2599,7 @@ fn supervisor_drain_fault_endpoint(
     yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_BEGIN");
     let mut count = 0usize;
     while count < SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK {
-        match transport.recv_with_deadline(fault_cap, 0) {
+        match supervisor_try_recv_fault(fault_cap) {
             Ok(Some(msg)) => {
                 let queued_tid = if msg.opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE {
                     SupervisorFaultReportWire::decode(msg.as_slice()).map(|fault| fault.tid)
@@ -2528,8 +2660,11 @@ fn query_lifecycle_via_process_manager(
     // SAFETY: Uses kernel-provided startup caps for synchronous PM IPC call,
     // identical to the init → PM SpawnV5 pattern in init/service.rs.
     let _ = unsafe { yarm_user_rt::syscall::ipc_call(req_cap, rep_cap, &msg) };
-    let reply_result = unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) };
+    let reply_result = unsafe {
+        yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS)
+    };
     let Some(reply_msg) = reply_result.map_err(|_| KernelError::WrongObject)? else {
+        yarm_user_rt::user_log!("SUPERVISOR_LIFECYCLE_QUERY_TIMEOUT tid={}", tid);
         return Ok(None);
     };
     let reply =

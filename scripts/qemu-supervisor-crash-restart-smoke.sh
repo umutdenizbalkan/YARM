@@ -171,8 +171,6 @@ for marker in \
   SUPERVISOR_FAULT_DRAIN_RECV \
   SUPERVISOR_FAULT_QUEUE_PENDING_DRAIN \
   SUPERVISOR_FAULT_QUEUE_DRAINED \
-  SUPERVISOR_FAULT_PENDING_STASH \
-  SUPERVISOR_FAULT_PENDING_REPLAY_OK \
   SUPERVISOR_FAULT_LOOKUP_BEGIN \
   SUPERVISOR_FAULT_LOOKUP_OK \
   SUPERVISOR_RESTART_ATTEMPT_ADVANCE \
@@ -188,6 +186,15 @@ for marker in \
   SUPERVISOR_SERVICE_DEGRADED_FINAL; do
   require_present "$marker" || oracle_failed=1
 done
+
+# SUP-L7G: pending-fault replay is a race fallback, not an unconditional
+# smoke requirement. If the crash-test record was not ready before the first
+# fault, require the fallback stash/replay path; otherwise the direct
+# registered-fault path is sufficient.
+if ! grep -q "SUPERVISOR_CRASH_TEST_RECORD_READY tid=10008" "$LOG_FILE"; then
+  require_present "SUPERVISOR_FAULT_PENDING_STASH tid=10008" || oracle_failed=1
+  require_present "SUPERVISOR_FAULT_PENDING_REPLAY_OK tid=10008" || oracle_failed=1
+fi
 
 if [[ "$QEMU_STATUS" -ne 0 && "$QEMU_STATUS" -ne 124 ]]; then
   echo "[error] QEMU exited with unexpected status $QEMU_STATUS"
