@@ -1860,6 +1860,157 @@ pub(crate) fn ap_tss_rsp0(cpu: usize) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 183 inc.4 — AP-safe IDT (interrupt-safe idle)
+// ---------------------------------------------------------------------------
+// The shared kernel BOOT_IDT is NOT AP-safe: its gates enter the full Rust
+// trap path (global KernelState, logging, compiled-Rust SSE the AP's CR4 may
+// not dispatch). The APs therefore get a dedicated minimal IDT whose handlers
+// are pure asm and touch only gs:-relative per-CPU record fields + LAPIC EOI:
+//  - every vector defaults to a 16-byte catch-all stub that records
+//    (vector+1) into PerCpuRecord.irq_unexpected_vec via gs: and PARKS
+//    (cli/hlt, no iretq) — converting any unexpected interrupt/exception
+//    from a triple fault into a deterministic, BSP-readable state;
+//  - AP_IRQ_SMOKE_VECTOR gets a real handler: irq_hit_count += 1,
+//    irq_hit_vector = vector, LAPIC EOI, iretq — the controlled
+//    interrupt-smoke path (BSP sends one fixed IPI; the AP wakes from
+//    sti;hlt, handles it, and returns to idle).
+// IST policy: every gate uses ist=0 (current stack). No IST is required this
+// increment: the AP never leaves its known-good idle stack (no user mode, no
+// stack switching, no nesting — interrupts are only enabled inside the
+// controlled sti;hlt smoke window), so the interrupted rsp is always valid.
+// Real per-AP IST stacks arrive with the scheduler-online increment, BEFORE
+// any path can take an interrupt on a non-idle stack.
+
+/// The harmless fixed vector the BSP sends to each AP for the interrupt smoke.
+/// High, outside the exception range and unused by the BSP IDT paths.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) const AP_IRQ_SMOKE_VECTOR: u8 = 0xF0;
+
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+core::arch::global_asm!(
+    r#"
+    .section .text.ap_idt_stubs,"ax",@progbits
+    .global yarm_ap_idt_unexpected_stubs
+    .global yarm_ap_irq_smoke_stub
+
+    // 256 catch-all stubs, 16 bytes apart (vector = index). Each pushes its
+    // vector and parks in the common tail. NOTE: `yarm_ap_vec` is a pure
+    // NUMERIC .set, which GAS Intel syntax assembles as an immediate —
+    // unlike the symbol-difference `.set` that caused the Stage 183 inc.2
+    // `add rdi, AP_OFF_HANDOFF` memory-operand misassembly.
+    .align 16
+yarm_ap_idt_unexpected_stubs:
+    .set yarm_ap_vec, 0
+    .rept 256
+    push yarm_ap_vec
+    jmp yarm_ap_idt_unexpected_common
+    .align 16
+    .set yarm_ap_vec, yarm_ap_vec + 1
+    .endr
+
+yarm_ap_idt_unexpected_common:
+    // Deterministic park, never returns: record (vector+1) via gs: so the
+    // BSP can name the unexpected vector, then cli/hlt forever. rax is safe
+    // to clobber because this path never resumes the interrupted code.
+    pop rax
+    add eax, 1
+    mov dword ptr gs:[{unexpected_off}], eax
+    cli
+77:
+    hlt
+    jmp 77b
+
+    .align 16
+yarm_ap_irq_smoke_stub:
+    // Controlled smoke handler: count + record the vector via gs:, EOI the
+    // local APIC (this AP's own LAPIC at the shared MMIO VA), and iretq back
+    // into the sti;hlt window. Preserves every register it touches.
+    push rax
+    add dword ptr gs:[{hit_count_off}], 1
+    mov dword ptr gs:[{hit_vec_off}], {smoke_vec}
+    movabs rax, {lapic_eoi}
+    mov dword ptr [rax], 0
+    pop rax
+    iretq
+"#,
+    unexpected_off = const super::percpu::IRQ_UNEXPECTED_VEC_OFFSET,
+    hit_count_off = const super::percpu::IRQ_HIT_COUNT_OFFSET,
+    hit_vec_off = const super::percpu::IRQ_HIT_VECTOR_OFFSET,
+    smoke_vec = const AP_IRQ_SMOKE_VECTOR as u32,
+    lapic_eoi = const super::platform_layout::LAPIC_MMIO_BASE + 0xB0,
+);
+
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+unsafe extern "C" {
+    static yarm_ap_idt_unexpected_stubs: u8;
+    static yarm_ap_irq_smoke_stub: u8;
+}
+
+/// One shared AP IDT (identical gates for every AP; per-AP results land in the
+/// per-CPU record via gs:). Lives in `.bss`, mapped under the kernel CR3 the
+/// AP runs on when it executes `lidt`.
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut AP_IDT: [X86IdtEntry; IDT_ENTRIES] = [const { X86IdtEntry::missing() }; IDT_ENTRIES];
+
+/// BSP-side: the AP IDT stub table's base VA (for the prepare-time map check).
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_idt_stub_base() -> u64 {
+    unsafe { core::ptr::addr_of!(yarm_ap_idt_unexpected_stubs) as u64 }
+}
+
+/// BSP-side: the AP IDT table's base VA (for the X86_AP_IDT_OK marker).
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_idt_table_base() -> u64 {
+    core::ptr::addr_of!(AP_IDT) as u64
+}
+
+/// BSP-side IST-policy validation: TRUE if any AP IDT gate names an IST slot.
+/// This increment none may (ist=0 everywhere — no per-AP IST stacks exist yet);
+/// a nonzero IST here would dispatch onto TSS ist slots that are 0 → garbage
+/// stack on delivery. Graded as X86_AP_IST_BAD by the admit poll if violated.
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_idt_any_ist_nonzero() -> bool {
+    unsafe {
+        let idt = core::ptr::addr_of!(AP_IDT);
+        let mut i = 0usize;
+        while i < IDT_ENTRIES {
+            if (*idt)[i].ist & 0x7 != 0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+}
+
+/// BSP-side (before SIPI): populate the AP IDT — catch-all park stubs on every
+/// vector, the smoke handler on `AP_IRQ_SMOKE_VECTOR`, all gates CS=0x08
+/// (kernel code in the per-AP GDT), dpl=0, ist=0 (see the IST policy above).
+/// Idempotent. Returns `(idtr_limit, idt_base_va)` for the trampoline handoff.
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn prepare_ap_idt() -> (u16, u64) {
+    unsafe {
+        let stub_base = core::ptr::addr_of!(yarm_ap_idt_unexpected_stubs) as u64;
+        let idt = core::ptr::addr_of_mut!(AP_IDT);
+        let mut i = 0usize;
+        while i < IDT_ENTRIES {
+            // Stubs are laid out 16 bytes apart in vector order.
+            let handler = stub_base + (i as u64) * 16;
+            (*idt)[i] = X86IdtEntry::new_interrupt(handler, KERNEL_CODE_SELECTOR, 0, 0);
+            i += 1;
+        }
+        (*idt)[AP_IRQ_SMOKE_VECTOR as usize] = X86IdtEntry::new_interrupt(
+            core::ptr::addr_of!(yarm_ap_irq_smoke_stub) as u64,
+            KERNEL_CODE_SELECTOR,
+            0,
+            0,
+        );
+        let limit = (core::mem::size_of::<X86IdtEntry>() * IDT_ENTRIES - 1) as u16;
+        (limit, idt as u64)
+    }
+}
+
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 unsafe fn populate_boot_idt_from_stubs() {
     let idt_ptr = core::ptr::addr_of_mut!(BOOT_IDT).cast::<X86IdtEntry>();

@@ -46,6 +46,12 @@ pub const AP_ENV_CANARY: u32 = 0x0183_C0DE;
 /// `gs:[..]` stores (GS base == this record). Locked by tests below.
 pub const ENV_CANARY_OFFSET: usize = 48;
 pub const SAVED_RSP_OFFSET: usize = 56;
+/// Stage 183 inc.4 (interrupt-safe idle): offsets the AP IDT stubs write via `gs:`.
+/// `irq_hit_count`/`irq_hit_vector` are written by the smoke-vector handler;
+/// `irq_unexpected_vec` (vector+1; 0 = none) by the catch-all park stub.
+pub const IRQ_HIT_COUNT_OFFSET: usize = 96;
+pub const IRQ_HIT_VECTOR_OFFSET: usize = 100;
+pub const IRQ_UNEXPECTED_VEC_OFFSET: usize = 104;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -68,7 +74,10 @@ pub const SAVED_RSP_OFFSET: usize = 56;
 /// - `80` : idle_cr3        u64  (BSP: idle metadata — kernel CR3 the AP idles on)
 /// - `88` : idle_flags      u32  (see `idle_flag`)
 /// - `92` : _pad_idle       u32
-/// - `96` : _reserved_tail  [u64; 2]
+/// - `96` : irq_hit_count     u32 (AP IDT smoke handler: gs:[96] += 1)
+/// - `100`: irq_hit_vector    u32 (AP IDT smoke handler: vector delivered)
+/// - `104`: irq_unexpected_vec u32 (catch-all park stub: vector+1; 0 = none)
+/// - `108`: _pad_irq         u32
 ///
 /// Explicit-field bytes = 112; struct stride = 128 (padded to the 64-byte
 /// alignment so the slot table strides cleanly).
@@ -92,7 +101,10 @@ pub struct PerCpuRecord {
     pub idle_cr3: u64,
     pub idle_flags: u32,
     _pad_idle: u32,
-    _reserved_tail: [u64; 2],
+    pub irq_hit_count: u32,
+    pub irq_hit_vector: u32,
+    pub irq_unexpected_vec: u32,
+    _pad_irq: u32,
 }
 
 impl PerCpuRecord {
@@ -117,7 +129,10 @@ impl PerCpuRecord {
             idle_cr3: 0,
             idle_flags: 0,
             _pad_idle: 0,
-            _reserved_tail: [0; 2],
+            irq_hit_count: 0,
+            irq_hit_vector: 0,
+            irq_unexpected_vec: 0,
+            _pad_irq: 0,
         }
     }
 }
@@ -128,6 +143,9 @@ impl PerCpuRecord {
 const _: () = {
     assert!(core::mem::offset_of!(PerCpuRecord, env_canary) == ENV_CANARY_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, saved_rsp) == SAVED_RSP_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, irq_hit_count) == IRQ_HIT_COUNT_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, irq_hit_vector) == IRQ_HIT_VECTOR_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, irq_unexpected_vec) == IRQ_UNEXPECTED_VEC_OFFSET);
     assert!(core::mem::size_of::<PerCpuRecord>() == 128);
 };
 
@@ -176,7 +194,10 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             idle_cr3: 0,
             idle_flags: 0,
             _pad_idle: 0,
-            _reserved_tail: [0; 2],
+            irq_hit_count: 0,
+            irq_hit_vector: 0,
+            irq_unexpected_vec: 0,
+            _pad_irq: 0,
         };
         core::ptr::write_volatile(base, record);
     }

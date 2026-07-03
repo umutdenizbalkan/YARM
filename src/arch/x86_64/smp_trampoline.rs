@@ -51,7 +51,10 @@ pub(super) const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 //   80 lapic_id_reg_va:   u64   // inc.3: VA of the LAPIC ID register (0 = skip the read)
 //   88 env_flags:         u32   // inc.3: AP-written env-step bitmask (see AP_ENV_* bits)
 //   92 lapic_id_out:      u32   // inc.3: AP-written LAPIC ID readback (0xFFFF_FFFF = unread)
-//   → size_of == 96
+//   96 idtr_image:        [u8;10] // inc.4: AP IDTR (limit u16 + base u64, LE) for lidt
+//   106 <pad>:            [u8;6]
+//   112 bsp_cr4:          u64  // inc.4: BSP CR4 for the AP control-state sync (0 = skip)
+//   → size_of == 120
 pub(super) const AP_HANDOFF_READY_WORD_OFFSET: usize = 32;
 
 // Stage 183 inc.2: the AP writes an incrementing stage code here (offset 48) before
@@ -73,6 +76,9 @@ pub(super) mod ap_env {
     pub const TSS_LOADED: u32 = 1 << 2; // ltr 0x28 (per-AP TSS)
     pub const LAPIC_READ: u32 = 1 << 3; // LAPIC ID register MMIO read done
     pub const IDLE_CTX_PUBLISHED: u32 = 1 << 4; // canary + live rsp stored via gs:
+    // Stage 183 inc.4 (interrupt-safe idle):
+    pub const CR4_SYNCED: u32 = 1 << 5; // mov cr4 = handoff.bsp_cr4 survived
+    pub const IDT_LOADED: u32 = 1 << 6; // lidt of the AP-safe IDT done
 }
 
 #[repr(C)]
@@ -118,6 +124,15 @@ pub(super) struct ApHandoff {
     pub(super) lapic_id_reg_va: u64,
     pub(super) env_flags: u32,
     pub(super) lapic_id_out: u32,
+
+    // Stage 183 increment 4 (interrupt-safe idle), BSP-written: the AP-safe IDT's
+    // GDTR-style image (limit LE16 + base LE64) for `lidt [rdi+96]`, and the BSP's
+    // CR4 value the AP mirrors (`mov cr4`) so its control state converges on the
+    // BSP's (PGE/OSFXSR/…; 0 ⇒ skip). The IDT gates are pure-asm gs:-recording
+    // stubs — see descriptor_tables.rs `prepare_ap_idt`.
+    pub(super) idtr_image: [u8; 10],
+    pub(super) _pad_idtr: [u8; 6],
+    pub(super) bsp_cr4: u64,
 }
 
 // Stage 183 inc.2/inc.3 layout guard: the trampoline / AP-entry asm hardcodes these
@@ -125,7 +140,7 @@ pub(super) struct ApHandoff {
 // Lock the Rust struct to them at compile time so a field reorder can never silently
 // make the asm read/write the wrong slot.
 const _: () = {
-    assert!(core::mem::size_of::<ApHandoff>() == 96);
+    assert!(core::mem::size_of::<ApHandoff>() == 120);
     assert!(core::mem::offset_of!(ApHandoff, ready_word) == AP_HANDOFF_READY_WORD_OFFSET);
     assert!(core::mem::offset_of!(ApHandoff, ready_word) == 32);
     assert!(core::mem::offset_of!(ApHandoff, percpu_record_ptr) == 40);
@@ -138,6 +153,8 @@ const _: () = {
     assert!(core::mem::offset_of!(ApHandoff, env_flags) == 88);
     assert!(core::mem::offset_of!(ApHandoff, lapic_id_out) == AP_HANDOFF_LAPIC_ID_OUT_OFFSET);
     assert!(core::mem::offset_of!(ApHandoff, lapic_id_out) == 92);
+    assert!(core::mem::offset_of!(ApHandoff, idtr_image) == 96);
+    assert!(core::mem::offset_of!(ApHandoff, bsp_cr4) == 112);
 };
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -387,12 +404,13 @@ ap_long_entry:
 
     .align 8
 yarm_ap_trampoline_handoff:
-    // Reserve the FULL ApHandoff (size_of::<ApHandoff>() == 96): magic(0) cpu_id(4)
+    // Reserve the FULL ApHandoff (size_of::<ApHandoff>() == 120): magic(0) cpu_id(4)
     // stack_top(8) kernel_state_ptr(16) ready_flag_ptr(24) ready_word(32) reserved(36)
     // percpu_record_ptr(40) ap_stage(48) pad(52) kernel_cr3(56) gdtr_image(64) pad(74)
-    // lapic_id_reg_va(80) env_flags(88) lapic_id_out(92). Under-reserving would place
-    // AP-written fields past `yarm_ap_trampoline_end`, shrinking the copied `len`.
-    .zero 96
+    // lapic_id_reg_va(80) env_flags(88) lapic_id_out(92) idtr_image(96) pad(106)
+    // bsp_cr4(112). Under-reserving would place AP-written fields past
+    // `yarm_ap_trampoline_end`, shrinking the copied `len`.
+    .zero 120
 
 yarm_ap_trampoline_end:
     .code64
@@ -515,9 +533,17 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 //   'D'   AP_STAGE_GDT_LOADED (21)        'T'             about to lgdt + SS/DS/ES + far-return to
 //                                                         CS=0x08; died ⇒ per-AP GDT/CS reload bad
 //   'T'   AP_STAGE_TSS_LOADED (22)        'l'             about to `ltr 0x28`; died ⇒ TSS desc bad
-//   'l'   AP_STAGE_LAPIC_CHECKED (23)     'y'             about to read the LAPIC ID register;
+//   'l'   AP_STAGE_LAPIC_CHECKED (23)     'i'             about to read the LAPIC ID register;
 //                                                         died ⇒ LAPIC MMIO VA bad under kCR3
-//   'y'   AP_STAGE_IDLE_CTX_PUBLISHED (24) 'I'            about to store the live rsp via gs:
+//   'i'   AP_STAGE_IDT_LOADED (26)        'y'             about to lidt the AP-safe IDT
+//   'y'   AP_STAGE_IDLE_CTX_PUBLISHED (24) 'u'            about to store the live rsp via gs:
+//   'u'   AP_STAGE_IRQ_SMOKE_WAIT (27)    'v'             ready_word=3 published; waiting in the
+//                                                         race-free sti;hlt window for the BSP's
+//                                                         one controlled smoke IPI (vector 0xF0)
+//   'v'   AP_STAGE_IRQ_SMOKE_DONE (28)    'I'             smoke handled (gs: count+vector, EOI,
+//                                                         iretq); interrupts masked again
+//   (note: 'c' AP_STAGE_CR4_SYNCED (25) runs between 'k' and the gs: canary —
+//    numbering is by increment, not time order)
 //
 //   'I'   AP_STAGE_BEFORE_HLT (17)        'Z'             about to cli;hlt; died before first hlt
 //   'Z'   AP_STAGE_IDLE (18)              (parked)        AP parked in cli/hlt idle loop — success
@@ -564,6 +590,15 @@ pub(super) const AP_STAGE_TSS_LOADED: u32 = 22;
 pub(super) const AP_STAGE_LAPIC_CHECKED: u32 = 23;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_IDLE_CTX_PUBLISHED: u32 = 24;
+// Stage 183 inc.4 (interrupt-safe idle) stages.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_CR4_SYNCED: u32 = 25;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IDT_LOADED: u32 = 26;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IRQ_SMOKE_WAIT: u32 = 27;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IRQ_SMOKE_DONE: u32 = 28;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_HANDOFF_NULL: u32 = 253; // percpu_record_ptr == 0 (BSP bug)
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -592,6 +627,10 @@ pub(super) fn ap_stage_name(raw: u32) -> &'static str {
         AP_STAGE_TSS_LOADED => "tss_loaded",
         AP_STAGE_LAPIC_CHECKED => "lapic_checked",
         AP_STAGE_IDLE_CTX_PUBLISHED => "idle_ctx_published",
+        AP_STAGE_CR4_SYNCED => "cr4_synced",
+        AP_STAGE_IDT_LOADED => "idt_loaded",
+        AP_STAGE_IRQ_SMOKE_WAIT => "irq_smoke_wait",
+        AP_STAGE_IRQ_SMOKE_DONE => "irq_smoke_done",
         AP_STAGE_HANDOFF_NULL => "handoff_null",
         AP_STAGE_GS_MISMATCH => "gs_mismatch",
         _ => "unknown",
@@ -697,6 +736,18 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "out dx, al",
         "mov dword ptr [rdi + 48], 20",
         "or dword ptr [rdi + 88], 1", // env: KERNEL_CR3_RELOADED
+        // 'c' / stage 25 (inc.4): sync CR4 with the BSP's value (PGE/OSFXSR/… — the
+        // AP's control state converges on the BSP's; prerequisite for any future
+        // compiled-Rust execution on the AP). 0 ⇒ BSP said skip.
+        "mov al, 0x63", // 'c'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 25",
+        "mov rax, [rdi + 112]",
+        "test rax, rax",
+        "jz 63f",
+        "mov cr4, rax",
+        "or dword ptr [rdi + 88], 32", // env: CR4_SYNCED
+        "63:",
         // gs: canary store — proves higher-half .bss is writable on the AP under the
         // kernel CR3 AND that GS-relative addressing works (gs:[48] =
         // PerCpuRecord.env_canary; value = percpu::AP_ENV_CANARY).
@@ -740,6 +791,15 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "mov [rdi + 92], eax",        // lapic_id_out
         "or dword ptr [rdi + 88], 8", // env: LAPIC_READ
         "62:",
+        // 'i' / stage 26 (inc.4): load the AP-safe IDT (catch-all park stubs +
+        // the smoke-vector handler; see descriptor_tables.rs). From here an
+        // unexpected interrupt/exception parks deterministically instead of
+        // triple-faulting. Interrupts remain MASKED until the smoke window.
+        "mov al, 0x69", // 'i'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 26",
+        "lidt [rdi + 96]",
+        "or dword ptr [rdi + 88], 64", // env: IDT_LOADED
         // 'y' / stage 24: publish the live idle context — store the current rsp via
         // gs: (gs:[56] = PerCpuRecord.saved_rsp) for BSP validation against the
         // recorded idle metadata.
@@ -748,9 +808,31 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "mov dword ptr [rdi + 48], 24",
         "mov qword ptr gs:[56], rsp",
         "or dword ptr [rdi + 88], 16", // env: IDLE_CTX_PUBLISHED
+        // 'u' / stage 27 (inc.4): interrupt-smoke wait window. Publish ready_word=3,
+        // then wait INTERRUPTIBLY for the BSP's one controlled smoke IPI. The
+        // `sti; hlt` pair is the race-free idiom: sti's interrupt shadow defers
+        // delivery until hlt has begun, so an IPI sent any time after ready_word=3
+        // either wakes hlt or was already handled (gs:[96] != 0) — no lost wake.
+        "mov al, 0x75", // 'u'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 27",
+        "mov dword ptr [rdi + 32], 3",
+        "73:",
+        "sti",
+        "hlt",
+        "cli",
+        "cmp dword ptr gs:[96], 0", // irq_hit_count (smoke handler ran?)
+        "je 73b",
+        // 'v' / stage 28 (inc.4): smoke handled (handler counted + EOI'd + iretq'd
+        // back into the window). Interrupts are masked again; fall through to the
+        // permanent idle loop — "leave idle and return to idle" proven.
+        "mov al, 0x76", // 'v'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 28",
+        "jmp 5f",
         "60:",
-        // Env done: publish ready_word=3 (idle admission). Per-step results are in
-        // env_flags for the BSP to grade into OK/FAIL markers.
+        // Env skipped (kernel_cr3 == 0 ⇒ no GDT/IDT prep): publish ready_word=3 and
+        // idle with interrupts MASKED — no sti without a loaded AP IDT, ever.
         "mov dword ptr [rdi + 32], 3",
         "jmp 5f",
         "8:",

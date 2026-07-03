@@ -363,6 +363,12 @@ impl KernelState {
             let ap_env_ready = crate::arch::x86_64::smp::ap_env_ready_count();
             #[cfg(not(target_arch = "x86_64"))]
             let ap_env_ready = 0usize;
+            // Stage 183 inc.4: APs with interrupt-safe idle proven (AP-safe IDT + one
+            // controlled IPI handled + resumed to idle; no lost/dup wake).
+            #[cfg(target_arch = "x86_64")]
+            let ap_interrupt_ready = crate::arch::x86_64::smp::ap_interrupt_ready_count();
+            #[cfg(not(target_arch = "x86_64"))]
+            let ap_interrupt_ready = 0usize;
 
             // The graduated seams remain the ONLY x86_64 path on the live (BSP) CPU — no old
             // global-lock fallback is selected; the in-lock branch is simply unreached
@@ -388,17 +394,29 @@ impl KernelState {
                     ap_idle_live,
                     ap_env_ready
                 );
-                // Full scheduler admission (AP IDT + timer + runnable idle task +
-                // online>1) is the next blocker; prerequisites are now proven.
+                // Increment-4 milestone: interrupt-safe idle per AP (AP-safe IDT +
+                // controlled IPI smoke handled + resumed; no lost/dup wake).
                 crate::yarm_log!(
-                    "X86_SMP_UNLOCK_BLOCKER category=B reason=ap_full_scheduler_admission_required"
-                );
-                crate::yarm_log!(
-                    "X86_SMP_UNLOCK_DONE result=ap_idle_live present={} online={} ap_idle_live={} ap_env_ready={}",
+                    "X86_SMP_AP_INTERRUPT_READY present={} online={} ap_idle_live={} ap_env_ready={} ap_interrupt_ready={}",
                     present,
                     online,
                     ap_idle_live,
-                    ap_env_ready
+                    ap_env_ready,
+                    ap_interrupt_ready
+                );
+                // Remaining blocker for online>1: scheduler-online admission — a real
+                // runnable AP idle task + SMP-safe kernel-lock/dispatch discipline
+                // (D6/D2 seams + TLB ACK are gated behind it). 183.5/183.6.
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_BLOCKER category=B reason=ap_scheduler_online_admission_required"
+                );
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_DONE result=ap_idle_live present={} online={} ap_idle_live={} ap_env_ready={} ap_interrupt_ready={}",
+                    present,
+                    online,
+                    ap_idle_live,
+                    ap_env_ready,
+                    ap_interrupt_ready
                 );
             } else {
                 // APs present but still fully parked (increment-2 admit did not take).

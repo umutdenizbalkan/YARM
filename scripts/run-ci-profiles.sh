@@ -68,6 +68,8 @@ ALL_PROFILES=(
   smp2-sender-wake
   smp4-core
   smp4-sender-wake
+  smp6-core
+  smp6-sender-wake
 )
 
 QUICK_PROFILES=(x86_64-core unlock-graduated sender-wake d2-recv d2-send d3-full)
@@ -85,7 +87,7 @@ FULL_PROFILES=(
   smp2-core smp2-sender-wake smp4-core smp4-sender-wake
 )
 
-EXTENDED_PROFILES=("${FULL_PROFILES[@]}" smp-ready-4)
+EXTENDED_PROFILES=("${FULL_PROFILES[@]}" smp-ready-4 smp6-core smp6-sender-wake)
 
 profile_desc() {
   case "$1" in
@@ -115,6 +117,8 @@ profile_desc() {
     smp2-sender-wake)       echo "Stage 183: x86_64 -smp 2 sender-wake oracle (graduated path under SMP)";;
     smp4-core)              echo "Stage 183: x86_64 -smp 4 core smoke (AP scheduler-admission readiness audit)";;
     smp4-sender-wake)       echo "Stage 183: x86_64 -smp 4 sender-wake oracle (graduated path under SMP)";;
+    smp6-core)              echo "Stage 183: x86_64 -smp 6 core smoke (AP scheduler-admission readiness audit)";;
+    smp6-sender-wake)       echo "Stage 183: x86_64 -smp 6 sender-wake oracle (graduated path under SMP)";;
     *)                      echo "unknown profile";;
   esac
 }
@@ -148,6 +152,8 @@ profile_field() {
     smp2-sender-wake)       echo "x86_64 2 120 oracle YARM_IPC_RECV_PROOF_SENDER_WAKE=1";;
     smp4-core)              echo "x86_64 4 120 core";;
     smp4-sender-wake)       echo "x86_64 4 120 oracle YARM_IPC_RECV_PROOF_SENDER_WAKE=1";;
+    smp6-core)              echo "x86_64 6 120 core";;
+    smp6-sender-wake)       echo "x86_64 6 120 oracle YARM_IPC_RECV_PROOF_SENDER_WAKE=1";;
     *)                      return 1;;
   esac
 }

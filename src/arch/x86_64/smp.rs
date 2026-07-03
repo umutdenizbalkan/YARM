@@ -75,6 +75,18 @@ pub fn ap_env_ready_count() -> usize {
     AP_ENV_READY_COUNT.load(Ordering::Acquire)
 }
 
+/// Stage 183 increment 4: count of APs that passed the controlled interrupt smoke —
+/// AP-safe IDT loaded, exactly one BSP-sent fixed IPI delivered into the pure-asm
+/// handler (count + vector recorded via gs:, LAPIC EOI, iretq), and the AP resumed
+/// back into its interrupt-masked idle loop. No lost wake, no duplicate delivery, no
+/// unexpected vector. Still NOT scheduler-online.
+static AP_INTERRUPT_READY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of APs with interrupt-safe idle proven (Stage 183 inc.4).
+pub fn ap_interrupt_ready_count() -> usize {
+    AP_INTERRUPT_READY_COUNT.load(Ordering::Acquire)
+}
+
 fn lapic_mmio_base() -> usize {
     super::platform_layout::LAPIC_MMIO_BASE
 }
@@ -292,6 +304,22 @@ fn current_cr3() -> u64 {
     cr3
 }
 
+/// Stage 183 inc.4: the BSP's CR4, mirrored onto each AP (`mov cr4` in the AP env
+/// steps) so the APs' control state (PGE/OSFXSR/…) converges on the BSP's. The value
+/// is valid by construction — the BSP itself runs with it on identical QEMU vCPUs.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn current_cr4() -> u64 {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, cr4",
+            out(reg) cr4,
+            options(nostack, preserves_flags)
+        );
+    }
+    cr4
+}
+
 fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize> {
     #[cfg(all(not(test), not(feature = "hosted-dev")))]
     let _ = kernel;
@@ -366,6 +394,22 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
     gdtr_image[..2].copy_from_slice(&ap_gdtr_limit.to_le_bytes());
     gdtr_image[2..].copy_from_slice(&ap_gdt_base.to_le_bytes());
 
+    // Stage 183 inc.4: AP-safe IDT (catch-all park stubs + the smoke-vector handler)
+    // and the BSP CR4 the AP mirrors. Both BEFORE SIPI, like all other env prep.
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    let (ap_idtr_limit, ap_idt_base) = super::descriptor_tables::prepare_ap_idt();
+    #[cfg(any(test, feature = "hosted-dev"))]
+    let (ap_idtr_limit, ap_idt_base) = (0u16, 0u64);
+
+    let mut idtr_image = [0u8; 10];
+    idtr_image[..2].copy_from_slice(&ap_idtr_limit.to_le_bytes());
+    idtr_image[2..].copy_from_slice(&ap_idt_base.to_le_bytes());
+
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    let bsp_cr4 = current_cr4();
+    #[cfg(any(test, feature = "hosted-dev"))]
+    let bsp_cr4 = 0u64;
+
     #[cfg_attr(any(test, feature = "hosted-dev"), allow(unused_mut))]
     let mut handoff = ApHandoff {
         magic: AP_HANDOFF_MAGIC,
@@ -391,6 +435,10 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
         lapic_id_reg_va: 0,
         env_flags: 0,
         lapic_id_out: 0xFFFF_FFFF,
+        // Stage 183 inc.4: AP-safe IDT image + the BSP CR4 to mirror.
+        idtr_image,
+        _pad_idtr: [0; 6],
+        bsp_cr4,
     };
 
     crate::yarm_log!(
@@ -453,16 +501,29 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
             root,
             crate::kernel::vm::VirtAddr(lapic_id_reg),
         );
+        // Stage 183 inc.4: the AP IDT (.bss) and its stub text must also be mapped
+        // under the AP's kernel CR3 — unmapped would turn the smoke IPI into a
+        // triple fault instead of a handled interrupt.
+        let idt_ok = crate::arch::x86_64::page_table::debug_root_maps_virt(
+            root,
+            crate::kernel::vm::VirtAddr(ap_idt_base),
+        );
+        let stub_ok = crate::arch::x86_64::page_table::debug_root_maps_virt(
+            root,
+            crate::kernel::vm::VirtAddr(super::descriptor_tables::ap_idt_stub_base()),
+        );
         crate::yarm_log!(
-            "YARM_SMP_AP_ENV_MAP_CHECK cpu={} percpu={} gdt={} tss={} lapic={}",
+            "YARM_SMP_AP_ENV_MAP_CHECK cpu={} percpu={} gdt={} tss={} lapic={} idt={} idt_stubs={}",
             cpu.0,
             percpu_ok as u8,
             gdt_ok as u8,
             tss_ok as u8,
-            lapic_ok as u8
+            lapic_ok as u8,
+            idt_ok as u8,
+            stub_ok as u8
         );
-        if !percpu_ok || !gdt_ok || !tss_ok {
-            // The AP would triple-fault on lgdt/ltr/gs-store; refuse the SIPI instead.
+        if !percpu_ok || !gdt_ok || !tss_ok || !idt_ok || !stub_ok {
+            // The AP would triple-fault on lgdt/ltr/gs-store/lidt; refuse the SIPI.
             return None;
         }
         if lapic_ok {
@@ -874,13 +935,187 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                     } else {
                         crate::yarm_log!("X86_AP_SCHED_PREREQ_INCOMPLETE cpu={}", cpu.0);
                     }
+
+                    // ---- Stage 183 inc.4: AP-safe IDT + controlled interrupt smoke ----
+                    // 7. CR4 sync: the AP mirrored the BSP's CR4 (control-state
+                    //    convergence — prerequisite for any future AP Rust execution).
+                    if (env & ap_env::CR4_SYNCED) != 0 {
+                        crate::yarm_log!("X86_AP_CR4_SYNC_OK cpu={}", cpu.0);
+                    } else {
+                        crate::yarm_log!(
+                            "X86_AP_CR4_SYNC_FAIL cpu={} reason=sync_flag_missing",
+                            cpu.0
+                        );
+                    }
+
+                    // 8. AP-safe IDT: catch-all park stubs + the smoke-vector handler,
+                    //    loaded by the AP via lidt. The shared kernel BOOT_IDT is NOT
+                    //    AP-safe (full Rust trap path); this dedicated IDT is pure asm.
+                    crate::yarm_log!("X86_AP_IDT_BEGIN cpu={}", cpu.0);
+                    let idt_ok = (env & ap_env::IDT_LOADED) != 0;
+                    if idt_ok {
+                        crate::yarm_log!(
+                            "X86_AP_IDT_OK cpu={} base=0x{:x}",
+                            cpu.0,
+                            super::descriptor_tables::ap_idt_table_base()
+                        );
+                    } else {
+                        crate::yarm_log!("X86_AP_IDT_BAD cpu={} reason=lidt_flag_missing", cpu.0);
+                    }
+                    // 9. IST policy: every AP IDT gate must use ist=0. No IST is
+                    //    required this increment — the AP never leaves its known-good
+                    //    idle stack (no user mode, no stack switch, no nesting;
+                    //    interrupts are enabled ONLY inside the controlled sti;hlt
+                    //    smoke window), so the interrupted rsp is always valid. A
+                    //    nonzero-IST gate would dispatch onto empty TSS ist slots —
+                    //    validated here. Real per-AP IST stacks land with
+                    //    scheduler-online, before any non-idle-stack interrupt path.
+                    if super::descriptor_tables::ap_idt_any_ist_nonzero() {
+                        crate::yarm_log!(
+                            "X86_AP_IST_BAD cpu={} reason=gate_ist_nonzero_without_per_ap_stacks",
+                            cpu.0
+                        );
+                    } else {
+                        crate::yarm_log!(
+                            "X86_AP_IST_OK cpu={} mode=not_required reason=idle_stack_only_no_nesting",
+                            cpu.0
+                        );
+                    }
+
+                    // 10. Interrupt smoke: exactly ONE fixed IPI to this AP. The AP
+                    //     waits in sti;hlt (race-free: pending IPIs deliver when hlt
+                    //     begins), the pure-asm handler counts + records the vector
+                    //     via gs:, EOIs, iretqs back, and the AP returns to the
+                    //     interrupt-masked idle loop. Proves: IDT delivery, EOI,
+                    //     iretq resume, leave-idle/return-to-idle, no lost wake, no
+                    //     duplicate delivery — all without a scheduler tick.
+                    crate::yarm_log!("X86_AP_INTERRUPT_SMOKE_BEGIN cpu={}", cpu.0);
+                    let mut irq_ok = false;
+                    if idt_ok {
+                        use super::descriptor_tables::AP_IRQ_SMOKE_VECTOR;
+                        wait_for_icr_idle(cpu.0, "before_irq_smoke");
+                        crate::yarm_log!(
+                            "X86_IPI_REMOTE_WAKE_SEND from=0 to={} vector=0x{:x}",
+                            cpu.0,
+                            AP_IRQ_SMOKE_VECTOR
+                        );
+                        write_icr(cpu.0, AP_IRQ_SMOKE_VECTOR as u32);
+
+                        let mut hit = false;
+                        for _ in 0..AP_READY_POLL_ITERS {
+                            let r = super::percpu::read_record(cpu);
+                            if r.irq_unexpected_vec != 0 {
+                                break; // AP parked in the catch-all stub — grade below
+                            }
+                            if r.irq_hit_count >= 1 {
+                                hit = true;
+                                break;
+                            }
+                            cpu_relax();
+                        }
+                        let r = super::percpu::read_record(cpu);
+                        if hit {
+                            crate::yarm_log!(
+                                "X86_IPI_REMOTE_WAKE_RECV cpu={} vector=0x{:x}",
+                                cpu.0,
+                                r.irq_hit_vector
+                            );
+                            // ACK = the AP resumed from the handler (iretq) and
+                            // re-reached the idle path (stage 28 → 17 → 18).
+                            let mut resumed = false;
+                            for _ in 0..AP_READY_POLL_ITERS {
+                                let s =
+                                    unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
+                                if s == 28 || s == 17 || s == 18 {
+                                    resumed = true;
+                                    break;
+                                }
+                                cpu_relax();
+                            }
+                            // Settle, then require EXACTLY one delivery (no dup) and
+                            // no unexpected vector.
+                            spin_delay(200_000);
+                            let r2 = super::percpu::read_record(cpu);
+                            if !resumed {
+                                crate::yarm_log!(
+                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=no_resume_after_handler",
+                                    cpu.0
+                                );
+                            } else if r2.irq_hit_count != 1 {
+                                crate::yarm_log!(
+                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=dup_delivery count={}",
+                                    cpu.0,
+                                    r2.irq_hit_count
+                                );
+                            } else if r2.irq_unexpected_vec != 0 {
+                                crate::yarm_log!(
+                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=unexpected_vector vec={}",
+                                    cpu.0,
+                                    r2.irq_unexpected_vec - 1
+                                );
+                            } else {
+                                crate::yarm_log!("X86_IPI_REMOTE_WAKE_ACK cpu={}", cpu.0);
+                                crate::yarm_log!(
+                                    "X86_AP_INTERRUPT_SMOKE_OK cpu={} vector=0x{:x}",
+                                    cpu.0,
+                                    r2.irq_hit_vector
+                                );
+                                irq_ok = true;
+                            }
+                        } else if r.irq_unexpected_vec != 0 {
+                            crate::yarm_log!(
+                                "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=unexpected_vector vec={}",
+                                cpu.0,
+                                r.irq_unexpected_vec - 1
+                            );
+                        } else {
+                            crate::yarm_log!(
+                                "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=no_handler_hit",
+                                cpu.0
+                            );
+                        }
+                    } else {
+                        crate::yarm_log!(
+                            "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=idt_not_loaded",
+                            cpu.0
+                        );
+                    }
+                    if irq_ok {
+                        AP_INTERRUPT_READY_COUNT.fetch_add(1, Ordering::AcqRel);
+                    }
                 }
                 if stage == AP_STAGE_IDLE_ADMIT_OK || stage == AP_STAGE_IDLE_ADMIT_GS_BAD {
-                    crate::yarm_log!("X86_AP_IDLE_ENTER cpu={} reason=cli_hlt_idle", cpu.0);
-                    crate::yarm_log!("X86_AP_SCHED_ADMIT_DONE cpu={}", cpu.0);
-                    // Only a GS-verified admit counts as clean idle-live.
-                    if stage == AP_STAGE_IDLE_ADMIT_OK {
-                        AP_IDLE_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+                    // Confirm the AP actually re-reached the permanent idle loop
+                    // (stage 18) before claiming IDLE_ENTER — a bounded wait, honest
+                    // on timeout.
+                    let mut idled = stage == AP_STAGE_IDLE_ADMIT_GS_BAD;
+                    if !idled {
+                        for _ in 0..AP_READY_POLL_ITERS {
+                            let s = unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
+                            if s == 18 {
+                                idled = true;
+                                break;
+                            }
+                            cpu_relax();
+                        }
+                    }
+                    if idled {
+                        crate::yarm_log!("X86_AP_IDLE_ENTER cpu={} reason=cli_hlt_idle", cpu.0);
+                        crate::yarm_log!("X86_AP_SCHED_ADMIT_DONE cpu={}", cpu.0);
+                        // Only a GS-verified admit counts as clean idle-live.
+                        if stage == AP_STAGE_IDLE_ADMIT_OK {
+                            AP_IDLE_LIVE_COUNT.fetch_add(1, Ordering::AcqRel);
+                        }
+                    } else {
+                        let last_raw =
+                            unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
+                        crate::yarm_log!(
+                            "X86_AP_SCHED_ADMIT_FAIL cpu={} reason=idle_reentry_timeout last_stage={} last_stage_raw=0x{:x}",
+                            cpu.0,
+                            ap_stage_name(last_raw),
+                            last_raw
+                        );
+                        crate::yarm_log!("X86_AP_IDLE_FAIL cpu={}", cpu.0);
                     }
                 }
             } else {
