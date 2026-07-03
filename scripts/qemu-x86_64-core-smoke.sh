@@ -1931,7 +1931,9 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "D6_SMP_DUP_WAKE_FAIL" \
     "SCHED_ENQUEUE_DENIED_WAKE_ONLY" \
     "X86_SMP_AP_INTERRUPT_NOT_READY" \
-    "X86_AP_SCHED_IDLE_POLL_PTR_BAD"; do
+    "X86_AP_SCHED_IDLE_POLL_PTR_BAD" \
+    "X86_TLB_REMOTE_ACK_TIMEOUT" \
+    "D6_SMP_DISPATCH_FALLBACK"; do
     if log_has_pattern "$f"; then
       echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
       exit 1
@@ -2008,8 +2010,23 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     echo "[error] SMP-LIVE: expected X86_SMP_ONLINE_READY present=${QEMU_SMP} online=${QEMU_SMP}"
     exit 1
   fi
-  if ! log_has_pattern "X86_SMP_UNLOCK_DONE result=aps_online"; then
-    echo "[error] SMP-LIVE: expected X86_SMP_UNLOCK_DONE result=aps_online (183.5 verdict)"
+  # Stage 183.6: real cross-CPU TLB shootdown ACK against the online APs (the audit
+  # drives it after admission). Both the COW and VM_UNMAP contexts must round-trip
+  # (SEND -> AP invlpg -> ACK -> DONE), and the final verdict must be smp_seams_ok.
+  for m in \
+    "X86_TLB_SHOOTDOWN_SEND" \
+    "X86_TLB_SHOOTDOWN_ACK" \
+    "X86_TLB_SHOOTDOWN_DONE" \
+    "COW_SMP_TLB_ACK_OK" \
+    "VM_UNMAP_SMP_TLB_ACK_OK"; do
+    if ! log_has_pattern "$m"; then
+      echo "[error] SMP-LIVE: Stage 183.6 TLB-ACK marker missing: $m"
+      exit 1
+    fi
+    echo "[ok] SMP-LIVE: 183.6 marker present: $m"
+  done
+  if ! log_has_pattern "X86_SMP_UNLOCK_DONE result=smp_seams_ok"; then
+    echo "[error] SMP-LIVE: expected X86_SMP_UNLOCK_DONE result=smp_seams_ok (183.6 verdict)"
     exit 1
   fi
   # Tripwire: the legacy premature-admission marker must never reappear.

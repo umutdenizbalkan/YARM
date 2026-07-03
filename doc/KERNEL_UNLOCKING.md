@@ -7000,6 +7000,63 @@ unproven-and-gated for 183.6:
   (that, plus the D2/D6 out-of-lock SMP proof, is exactly the
   `category=C reason=d2_d6_smp_seams_unproven` blocker).
 
+**183.5 ACCEPTED (user QEMU, 2026).** `smp2`: `X86_SMP_ONLINE_READY present=2
+online=2`, `D6_SMP_REMOTE_WAKE_OK cpu=1`, `X86_SMP_UNLOCK_DONE result=aps_online
+present=2 online=2 remote_wake_ok=1`. `smp4`: same for cpu=1/2/3, `online=4
+remote_wake_ok=3`. Interrupt smoke + persistent ACK + low-alias poll fix +
+sched-idle reenter all passed; no bad markers.
+
+**183.6 — REAL SMP SEAMS (D2/D6 out-of-lock under `online = N` + real cross-CPU TLB
+shootdown ACK).**
+
+- **D2/D6 out-of-lock dispatch under real SMP — the single-DISPATCHER predicate.**
+  The topology gate moves from `online_cpu_count() <= 1` to
+  `dispatching_cpu_count() <= 1`, where `dispatching = online & !wake_only`. This is
+  the correct predicate: the accepted out-of-lock deferred-dispatch slice is safe
+  when only ONE CPU dispatches user tasks, and wake-only APs (183.5) dispatch
+  nothing (no dispatcher runs on them; the scheduler denies task placement,
+  `SCHED_ENQUEUE_DENIED_WAKE_ONLY`). So under `online = N` with every AP wake-only
+  the predicate stays 1 and the seams keep their accepted single-CPU out-of-lock
+  path — no in-lock `multi_cpu` fallback. Under `online = 1` it is identical to the
+  prior value. It stays pure topology (a derivation of the online + wake-only
+  bitmaps), NOT a knob. The D6 genuine path emits `D6_SMP_DISPATCH_BEGIN` /
+  `D6_SMP_DISPATCH_OK` when it relocates a queue-advancing dispatch out of the lock
+  while `online > 1`; the blocking sender-wake workload drives it, and the oracle
+  requires it + `IPC_RECV_V2_SENDER_WAKE_ORDER_OK` /
+  `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` under `-smp >1`. Clearing an AP's
+  wake-only bit (a future AP-dispatcher increment) raises the count and re-gates the
+  seams automatically.
+- **Real cross-CPU TLB shootdown ACK — no simulation.** A lock-free per-CPU
+  shootdown mailbox lives in the (always-mapped) `PerCpuRecord`: `tlb_req_gen@128`,
+  `tlb_ack_gen@132`, `tlb_req_va@136` (single writer per field per direction, so no
+  lock and no `KernelState` access from the AP). The AP's managed sched-idle loop,
+  on every wake, services it: if `req_gen != ack_gen` it executes the invalidation
+  locally (`invlpg [tlb_req_va]`, or a CR3 reload when `va == 0`) and then advances
+  `ack_gen = req_gen` — a genuine remote acknowledgement. The BSP driver
+  `smp_tlb_shootdown_cpus` posts the request (VA before gen, so the AP always reads
+  the matching VA), sends the wake IPI (vector 0xF1 — the same one the idle loop
+  already services), and waits (bounded) for the ACK, emitting
+  `X86_TLB_SHOOTDOWN_SEND` / `X86_TLB_SHOOTDOWN_ACK` (or `X86_TLB_REMOTE_ACK_TIMEOUT`
+  on failure — forbidden in smoke, never a hang). The 183.6 one-shot
+  `ap_tlb_shootdown_proof` runs a full round-trip against every online AP for the
+  COW context (a representative write-protect VA) and the VM_UNMAP context (full
+  flush), emitting `X86_TLB_SHOOTDOWN_DONE` + `COW_SMP_TLB_ACK_OK` /
+  `VM_UNMAP_SMP_TLB_ACK_OK`. Because wake-only APs idle on the kernel CR3 and hold
+  no user ASID, invalidating any VA on them is correct-and-conservative
+  (over-invalidation is always safe) while the ACK is real; precise per-ASID
+  targeting on an AP arrives when that AP runs user tasks (its wake-only bit
+  cleared, re-joining `live_cpu_bitmap_for_asid`).
+- **Terminal verdict.** The audit drives the TLB proof after admission and emits
+  `X86_SMP_UNLOCK_DONE result=smp_seams_ok present=N online=N remote_wake_ok=K
+  tlb_ack=1` when both TLB contexts acked; otherwise
+  `X86_SMP_UNLOCK_BLOCKER category=C reason=tlb_shootdown_ack_unproven` +
+  `result=aps_online … tlb_ack=0` (honest, never faked). `PerCpuRecord` grew
+  128→192 bytes for the mailbox (stride only; not a limit/ABI constant). No user
+  knobs, no fallback selectors, no scheduler placement on APs, counts unchanged.
+  Guarded by `stage183_inc6_real_smp_seams`. Acceptance:
+  `scripts/run-ci-profiles.sh smp2-core` + `smp2-sender-wake` + `smp4-core` +
+  `smp4-sender-wake`.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

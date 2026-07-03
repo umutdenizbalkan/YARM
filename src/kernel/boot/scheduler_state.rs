@@ -284,6 +284,24 @@ impl KernelState {
         self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).online_cpu_count())
     }
 
+    /// Stage 183.6: number of online CPUs that actually DISPATCH user tasks —
+    /// online minus wake-only. Wake-only APs (Stage 183.5) are online for
+    /// accounting/wake but run no dispatcher and take no seam code, so for the
+    /// D2/D6 out-of-lock-dispatch topology gate the safe predicate is "only one
+    /// CPU dispatches", not "only one CPU is online". When online==1 this equals
+    /// 1 (identical to the accepted single-CPU behavior); when every AP is
+    /// wake-only it stays 1, so the accepted out-of-lock seam slices remain the
+    /// production path under real SMP. Clearing an AP's wake-only bit (a future
+    /// AP-dispatcher increment) raises this and re-gates the seams automatically.
+    pub fn dispatching_cpu_count(&self) -> usize {
+        self.with_scheduler_state(|sched| {
+            let s = kernel_ref(&sched.scheduler);
+            let online = s.online_cpu_bitmap();
+            let dispatching = online & !s.wake_only_bitmap();
+            dispatching.count_ones() as usize
+        })
+    }
+
     pub fn present_cpu_count(&self) -> usize {
         let sched = self.scheduler_state();
         kernel_ref(&sched.scheduler).present_cpu_count()

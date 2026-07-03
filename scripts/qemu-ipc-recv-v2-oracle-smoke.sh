@@ -254,6 +254,25 @@ for f in \
   fi
 done
 
+# Stage 183.6: under x86_64 -smp >1 the blocking sender-wake workload drives real
+# D6 out-of-lock dispatch while APs are scheduler-online. The single-DISPATCHER
+# topology (only the BSP dispatches; wake-only APs run no dispatcher) keeps the
+# accepted out-of-lock slice live, so the queue-advancing dispatch must NOT fall
+# back in-lock — require the D6-SMP-dispatch proof marker and the sender-wake order.
+if [[ "${QEMU_SMP:-1}" -gt 1 ]]; then
+  for m in \
+    "D6_SMP_DISPATCH_OK" \
+    "IPC_RECV_V2_SENDER_WAKE_ORDER_OK" \
+    "IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE"; do
+    if marker_present "$m"; then
+      echo "[ok]   183.6 SMP sender-wake marker present: $m"
+    else
+      echo "[err] ipc-oracle: 183.6: SMP sender-wake marker missing: $m"
+      rc=1
+    fi
+  done
+fi
+
 # At least one recv-v2 meta delivery must be proven.
 any_required=0
 for r in "${REQUIRED_ANY[@]}"; do

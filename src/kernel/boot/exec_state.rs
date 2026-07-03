@@ -1900,10 +1900,23 @@ impl KernelState {
             // Queue-neutral iff `dispatch_next_on` would NOT dequeue: that only
             // happens when (no current / idle tid 0) AND something is runnable.
             let queue_neutral = !(runnable > 0 && matches!(cur, None | Some(0)));
-            let single_cpu = self.online_cpu_count() <= 1;
+            // Stage 183.6: the out-of-lock dispatch is safe when only ONE CPU
+            // dispatches user tasks. Wake-only APs (183.5) dispatch nothing, so
+            // `dispatching_cpu_count() <= 1` (BSP-only) holds under real SMP and
+            // keeps the accepted single-CPU out-of-lock slice as the production
+            // path — no in-lock `multi_cpu` fallback while every AP is wake-only.
+            let single_cpu = self.dispatching_cpu_count() <= 1;
+            let smp_live = self.online_cpu_count() > 1;
             let already_deferred = crate::kernel::boot::d6_genuine_dispatch_is_deferred(cpu_idx);
             if trap_path && queue_neutral && single_cpu && !already_deferred {
                 if crate::kernel::boot::d6_genuine_dispatch_try_defer(cpu_idx, outgoing_tid) {
+                    if smp_live {
+                        // Real SMP (online>1): the D6 queue-advancing dispatch is
+                        // relocated OUT of the global lock while APs are scheduler-
+                        // online — the Stage 183.6 D6-SMP dispatch proof.
+                        crate::yarm_log!("D6_SMP_DISPATCH_BEGIN cpu={}", cpu.0);
+                        crate::yarm_log!("D6_SMP_DISPATCH_OK cpu={}", cpu.0);
+                    }
                     crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_ELIGIBLE cpu={}", cpu.0);
                     crate::yarm_log!("D6_GENUINE_MUT_DISPATCH_PREPARED cpu={}", cpu.0);
                     // `cur` is exactly what the authoritative `dispatch_next_on`

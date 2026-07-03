@@ -354,12 +354,8 @@ impl KernelState {
         }
 
         if online > 1 {
-            // Stage 183.5: APs are scheduler-online (wake-only — placement gated, no
-            // AP dispatcher yet) with the remote-wake proof graded above. The
-            // graduated seams' `single_cpu` eligibility is now false, so the D2/D6
-            // out-of-lock slices take their conservative in-lock route
-            // (`reason=multi_cpu`) — they stay gated until 183.6 proves them under
-            // real SMP (that is the remaining blocker, together with TLB ACK).
+            // Stage 183.5/183.6: APs are scheduler-online (wake-only — placement
+            // gated, no AP dispatcher yet) with the remote-wake proof graded above.
             #[cfg(target_arch = "x86_64")]
             let (ap_idle_live, ap_env_ready, ap_interrupt_ready, remote_wake_ok, wake_only) = (
                 crate::arch::x86_64::smp::ap_idle_live_count(),
@@ -382,18 +378,43 @@ impl KernelState {
                 remote_wake_ok
             );
             // Honesty about the intermediate state: online APs accept NO task
-            // placement until their dispatcher lands (183.6+).
+            // placement until their dispatcher lands (a later increment). The D2/D6
+            // seams DO run their out-of-lock slice under real SMP now — the
+            // dispatching-CPU count is still 1 (only the BSP dispatches; wake-only
+            // APs run no dispatcher), so the accepted out-of-lock path is safe.
             crate::yarm_log!(
                 "X86_SMP_PLACEMENT_GATED cpus=0x{:x} reason=ap_dispatcher_not_wired",
                 wake_only
             );
-            crate::yarm_log!("X86_SMP_UNLOCK_BLOCKER category=C reason=d2_d6_smp_seams_unproven");
-            crate::yarm_log!(
-                "X86_SMP_UNLOCK_DONE result=aps_online present={} online={} remote_wake_ok={}",
-                present,
-                online,
-                remote_wake_ok
-            );
+
+            // Stage 183.6: real cross-CPU TLB shootdown ACK against the online APs.
+            #[cfg(target_arch = "x86_64")]
+            let (cow_tlb_ok, unmap_tlb_ok) = crate::arch::x86_64::smp::ap_tlb_shootdown_proof(self);
+            #[cfg(not(target_arch = "x86_64"))]
+            let (cow_tlb_ok, unmap_tlb_ok) = (false, false);
+
+            // Final Stage 183.6 verdict. D6/D2 out-of-lock dispatch under real SMP is
+            // proven by the per-event `D6_SMP_DISPATCH_OK` / sender-wake-oracle
+            // markers on the trap path (single-dispatcher topology); the TLB ACK is
+            // proven here. `smp_seams_ok` requires BOTH TLB contexts to have acked.
+            if cow_tlb_ok && unmap_tlb_ok {
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_DONE result=smp_seams_ok present={} online={} remote_wake_ok={} tlb_ack=1",
+                    present,
+                    online,
+                    remote_wake_ok
+                );
+            } else {
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_BLOCKER category=C reason=tlb_shootdown_ack_unproven"
+                );
+                crate::yarm_log!(
+                    "X86_SMP_UNLOCK_DONE result=aps_online present={} online={} remote_wake_ok={} tlb_ack=0",
+                    present,
+                    online,
+                    remote_wake_ok
+                );
+            }
         } else {
             // present>1 but online==1: APs exist and are NOT scheduler-admitted (online
             // stays 1 so `single_cpu` is true and no task is enqueued onto an AP). Stage 183

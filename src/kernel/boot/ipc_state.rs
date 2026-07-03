@@ -664,7 +664,10 @@ impl KernelState {
             let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
                 && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
                     .load(core::sync::atomic::Ordering::Relaxed);
-            let single_cpu = self.online_cpu_count() <= 1;
+            // Stage 183.6: single-DISPATCHER predicate — wake-only APs run no
+            // dispatcher, so the accepted out-of-lock recv dispatch stays live
+            // under real SMP (online>1) with no in-lock multi_cpu fallback.
+            let single_cpu = self.dispatching_cpu_count() <= 1;
             let already = crate::kernel::boot::d2_recv_dispatch_is_deferred(cpu_idx);
             if trap_path
                 && single_cpu
@@ -754,7 +757,8 @@ impl KernelState {
             let trap_path = cpu_idx < crate::kernel::scheduler::MAX_CPUS
                 && crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
                     .load(core::sync::atomic::Ordering::Relaxed);
-            let single_cpu = self.online_cpu_count() <= 1;
+            // Stage 183.6: single-DISPATCHER predicate (see recv-side note).
+            let single_cpu = self.dispatching_cpu_count() <= 1;
             let already = crate::kernel::boot::d2_send_dispatch_is_deferred(cpu_idx);
             if trap_path
                 && single_cpu
