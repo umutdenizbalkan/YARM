@@ -54,6 +54,13 @@ pub const IRQ_HIT_VECTOR_OFFSET: usize = 100;
 pub const IRQ_UNEXPECTED_VEC_OFFSET: usize = 104;
 /// Stage 183.5: incremented by the remote-wake stub (vector 0xF1) via gs:.
 pub const REMOTE_WAKE_COUNT_OFFSET: usize = 108;
+/// Stage 183.5 fix (no_resume_after_handler): the smoke handler's sub-stage
+/// (IRQ_HANDLER_ENTER/EOI/IRET) written via gs:[112], and the PERSISTENT
+/// post-resume ACK the AP writes via gs:[116] after the hlt-return path
+/// confirms the handler ran. The BSP polls the persistent ACK — never a
+/// transient stage — so serial-logging latency can no longer lose the race.
+pub const IRQ_STAGE_OFFSET: usize = 112;
+pub const IRQ_ACK_OFFSET: usize = 116;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -80,9 +87,11 @@ pub const REMOTE_WAKE_COUNT_OFFSET: usize = 108;
 /// - `100`: irq_hit_vector    u32 (AP IDT smoke handler: vector delivered)
 /// - `104`: irq_unexpected_vec u32 (catch-all park stub: vector+1; 0 = none)
 /// - `108`: remote_wake_count u32 (AP wake stub, vector 0xF1: gs:[108] += 1)
+/// - `112`: irq_stage        u32 (smoke handler sub-stage: enter/EOI/iret)
+/// - `116`: irq_ack          u32 (persistent post-resume ACK; 1 = resumed+acked)
+/// - `120`: _pad_irq_tail    [u32; 2]
 ///
-/// Explicit-field bytes = 112; struct stride = 128 (padded to the 64-byte
-/// alignment so the slot table strides cleanly).
+/// Explicit-field bytes = 128 == struct stride (64-byte aligned).
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct PerCpuRecord {
@@ -107,6 +116,9 @@ pub struct PerCpuRecord {
     pub irq_hit_vector: u32,
     pub irq_unexpected_vec: u32,
     pub remote_wake_count: u32,
+    pub irq_stage: u32,
+    pub irq_ack: u32,
+    _pad_irq_tail: [u32; 2],
 }
 
 impl PerCpuRecord {
@@ -135,6 +147,9 @@ impl PerCpuRecord {
             irq_hit_vector: 0,
             irq_unexpected_vec: 0,
             remote_wake_count: 0,
+            irq_stage: 0,
+            irq_ack: 0,
+            _pad_irq_tail: [0; 2],
         }
     }
 }
@@ -149,6 +164,8 @@ const _: () = {
     assert!(core::mem::offset_of!(PerCpuRecord, irq_hit_vector) == IRQ_HIT_VECTOR_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, irq_unexpected_vec) == IRQ_UNEXPECTED_VEC_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, remote_wake_count) == REMOTE_WAKE_COUNT_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, irq_stage) == IRQ_STAGE_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, irq_ack) == IRQ_ACK_OFFSET);
     assert!(core::mem::size_of::<PerCpuRecord>() == 128);
 };
 
@@ -201,6 +218,9 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             irq_hit_vector: 0,
             irq_unexpected_vec: 0,
             remote_wake_count: 0,
+            irq_stage: 0,
+            irq_ack: 0,
+            _pad_irq_tail: [0; 2],
         };
         core::ptr::write_volatile(base, record);
     }

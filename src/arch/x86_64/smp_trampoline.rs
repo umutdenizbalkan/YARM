@@ -648,6 +648,19 @@ pub(super) const AP_STAGE_LAPIC_ENABLED: u32 = 29;
 pub(super) const AP_STAGE_SCHED_IDLE: u32 = 30;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_SCHED_WAKE_REENTER: u32 = 31;
+// Stage 183.5 fix (no_resume_after_handler): fine-grained smoke handler/resume
+// sub-stages. 32-34 are written by the 0xF0 handler stub via gs:[112]
+// (PerCpuRecord.irq_stage); 35/36 by the AP main flow into the stage word.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IRQ_HANDLER_ENTER: u32 = 32;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IRQ_HANDLER_EOI: u32 = 33;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IRQ_HANDLER_IRET: u32 = 34;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IRQ_RESUMED: u32 = 35;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IRQ_ACK_WRITTEN: u32 = 36;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_HANDOFF_NULL: u32 = 253; // percpu_record_ptr == 0 (BSP bug)
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -683,6 +696,11 @@ pub(super) fn ap_stage_name(raw: u32) -> &'static str {
         AP_STAGE_LAPIC_ENABLED => "lapic_enabled",
         AP_STAGE_SCHED_IDLE => "sched_idle",
         AP_STAGE_SCHED_WAKE_REENTER => "sched_wake_reenter",
+        AP_STAGE_IRQ_HANDLER_ENTER => "irq_handler_enter",
+        AP_STAGE_IRQ_HANDLER_EOI => "irq_handler_eoi",
+        AP_STAGE_IRQ_HANDLER_IRET => "irq_handler_iret",
+        AP_STAGE_IRQ_RESUMED => "irq_resumed",
+        AP_STAGE_IRQ_ACK_WRITTEN => "irq_ack_written",
         AP_STAGE_HANDOFF_NULL => "handoff_null",
         AP_STAGE_GS_MISMATCH => "gs_mismatch",
         _ => "unknown",
@@ -893,14 +911,27 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         // either wakes hlt or was already handled (gs:[96] != 0) — no lost wake.
         "mov al, 0x75", // 'u'
         "out dx, al",
-        "mov dword ptr [rdi + 48], 27",
         "mov dword ptr [rdi + 32], 3",
         "73:",
+        "mov dword ptr [rdi + 48], 27", // (re)enter irq_smoke_wait
         "sti",
         "hlt",
         "cli",
+        // 'IRQ_RESUMED' (35): hlt returned (iretq resumed the window), IF masked.
+        "mov dword ptr [rdi + 48], 35",
         "cmp dword ptr gs:[96], 0", // irq_hit_count (smoke handler ran?)
-        "je 73b",
+        "je 73b",                   // spurious wake without the handler: re-wait
+        // Handler confirmed: write the PERSISTENT ACK (gs:[116] = irq_ack). The
+        // BSP polls THIS — never a transient stage — so its serial-log latency
+        // can no longer lose the race against the AP's fast stage transitions
+        // (the 183.5 host failure: RECV printed for ~ms while the AP passed the
+        // transient stage 28 and parked at 30, so a 28|17|18 poll always missed).
+        "mov al, 0x61", // 'a'
+        "out dx, al",
+        "mov dword ptr gs:[116], 1",    // irq_ack = 1 (persistent)
+        "mov dword ptr [rdi + 48], 36", // IRQ_ACK_WRITTEN
+        "mov al, 0x64",                 // 'd'
+        "out dx, al",
         // 'v' / stage 28 (inc.4): smoke handled (handler counted + EOI'd + iretq'd
         // back into the window). Interrupts are masked again; fall through to the
         // MANAGED scheduler-owned idle loop (183.5) — NOT a bare cli/hlt park.
