@@ -6840,6 +6840,45 @@ deterministically instead of triple-faulting:
   Acceptance: `scripts/run-ci-profiles.sh smp2-core` + `smp4-core` (+ optional
   `smp6-core`), plus `smp2-sender-wake`/`smp4-sender-wake` for the BSP graduated path.
 
+**183.4 host failure ROOT CAUSE + fix (deterministic: every AP
+`X86_AP_INTERRUPT_SMOKE_FAIL reason=no_handler_hit`, `last_stage=irq_smoke_wait`).**
+The AP sat correctly in the race-free `sti;hlt` window — the IPI was dropped BEFORE
+delivery. Per the Intel SDM (state after INIT), the AP's local APIC resets to
+`SVR=0xFF` with **bit 8 (APIC software enable) CLEAR**: a software-disabled LAPIC
+accepts only INIT/SIPI/NMI/SMI and silently drops fixed IPIs (QEMU implements
+exactly this). That is why INIT/SIPI bring-up worked while vector 0xF0 never arrived
+— and why `X86_AP_LAPIC_OK` (an MMIO *read* of the APIC id) could pass while
+delivery was impossible. Fix (all before the smoke window):
+
+- **AP-side LAPIC interrupt-delivery readiness** (`'n'`/stage 29, env flag
+  `LAPIC_SW_ENABLED`): write `SVR=0x1FF` (software enable | spurious vector 0xFF —
+  parked by the catch-all stub if it ever fires), `TPR=0` (accept all priority
+  classes), write-clear `ESR`; publish all three readbacks through the handoff
+  (`svr_out@120`/`tpr_out@124`/`esr_out@128`; ApHandoff 120→136, `.zero 136` +
+  guard). BSP grades: `X86_AP_LAPIC_ENABLE_BEGIN`, `X86_AP_LAPIC_SVR_OK value=0x1ff`,
+  `X86_AP_LAPIC_TPR_OK value=0x0`, `X86_AP_LAPIC_ESR_OK value=0x0`,
+  `X86_AP_LAPIC_INTERRUPT_READY` (or `X86_AP_LAPIC_INTERRUPT_BAD
+  reason=enable_flag_missing|svr_sw_enable_clear|tpr_masking|esr_nonzero`).
+- **BSP-side instrumented fixed-IPI send**: `X86_IPI_FIXED_SEND_BEGIN … mode=physical`,
+  `X86_IPI_FIXED_ICR_WRITTEN to=N high=0x<apic<<24> low=0x000000f0`,
+  `X86_IPI_FIXED_DELIVERY_IDLE`, `X86_IPI_FIXED_ESR from=0 before=… after=…` (BSP ESR
+  write-latch read before/after), `X86_IPI_FIXED_SEND_DONE` /
+  `X86_IPI_FIXED_SEND_FAIL reason=delivery_status_stuck|esr_nonzero`.
+- **Smoke-vector DESCRIPTOR check** (not just the IDT base):
+  `ap_idt_smoke_vector_report` verifies present + interrupt gate (0xE) + selector
+  0x08 + ist 0 + offset == the smoke stub's linked VA →
+  `X86_AP_IDT_VECTOR_OK cpu=N vector=0xf0 selector=0x08 ist=0 type=0xe` /
+  `X86_AP_IDT_VECTOR_BAD reason=descriptor_mismatch …`.
+- **No fake success**: the smoke still hard-fails deterministically
+  (`no_handler_hit` / `idle_reentry_timeout last_stage=irq_smoke_wait`) and
+  `ap_interrupt_ready` still requires the actual delivery proof
+  (`X86_IPI_REMOTE_WAKE_RECV`/`ACK` + `X86_AP_INTERRUPT_SMOKE_OK`), never readiness
+  alone. All hard gates unchanged (no scheduler-online / `bring_up_cpu` /
+  `single_cpu` relax / D2/D6 seams / TLB-ACK proof). Smoke additionally requires the
+  readiness/vector/send markers and forbids `X86_AP_LAPIC_INTERRUPT_BAD` /
+  `X86_AP_IDT_VECTOR_BAD` / `X86_IPI_FIXED_SEND_FAIL`. Guarded by
+  `stage183_inc4_fix_lapic_sw_enable_for_ipi_delivery`.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

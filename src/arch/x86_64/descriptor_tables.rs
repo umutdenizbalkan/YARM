@@ -1965,6 +1965,29 @@ pub(crate) fn ap_idt_table_base() -> u64 {
     core::ptr::addr_of!(AP_IDT) as u64
 }
 
+/// Stage 183 inc.4 fix: BSP-side descriptor check of the smoke vector's gate —
+/// present, interrupt-gate type (0xE), selector 0x08, ist 0, and the handler
+/// offset equal to the smoke stub's linked VA. Returns
+/// `(ok, gate_type, selector, ist, offset, expected_offset)`.
+#[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_idt_smoke_vector_report() -> (bool, u8, u16, u8, u64, u64) {
+    unsafe {
+        let e = core::ptr::read_volatile(core::ptr::addr_of!(AP_IDT[AP_IRQ_SMOKE_VECTOR as usize]));
+        let offset =
+            (e.offset_low as u64) | ((e.offset_mid as u64) << 16) | ((e.offset_high as u64) << 32);
+        let expected = core::ptr::addr_of!(yarm_ap_irq_smoke_stub) as u64;
+        let present = (e.type_attr & 0x80) != 0;
+        let gate_type = e.type_attr & 0xF;
+        let ist = e.ist & 0x7;
+        let ok = present
+            && gate_type == IDT_GATE_INTERRUPT
+            && e.selector == KERNEL_CODE_SELECTOR
+            && ist == 0
+            && offset == expected;
+        (ok, gate_type, e.selector, ist, offset, expected)
+    }
+}
+
 /// BSP-side IST-policy validation: TRUE if any AP IDT gate names an IST slot.
 /// This increment none may (ist=0 everywhere — no per-AP IST stacks exist yet);
 /// a nonzero IST here would dispatch onto TSS ist slots that are 0 → garbage

@@ -52526,11 +52526,11 @@ mod stage183_ap_idle_admit {
             TRAMP_SRC.matches("[rdi + 48]").count() >= 9,
             "the AP must publish the stage word before every risky action"
         );
-        // The handoff reservation holds the FULL 120-byte struct + a compile-time layout
+        // The handoff reservation holds the FULL 136-byte struct + a compile-time layout
         // guard locks the field offsets the asm hardcodes.
         assert!(
-            TRAMP_SRC.contains(".zero 120")
-                && TRAMP_SRC.contains("size_of::<ApHandoff>() == 120")
+            TRAMP_SRC.contains(".zero 136")
+                && TRAMP_SRC.contains("size_of::<ApHandoff>() == 136")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, ap_stage) == 48")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, kernel_cr3) == 56")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, gdtr_image) == 64")
@@ -52538,8 +52538,10 @@ mod stage183_ap_idle_admit {
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, env_flags) == 88")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, lapic_id_out) == 92")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, idtr_image) == 96")
-                && TRAMP_SRC.contains("offset_of!(ApHandoff, bsp_cr4) == 112"),
-            "the handoff reservation + layout guard must match the 120-byte struct"
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, bsp_cr4) == 112")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, svr_out) == 120")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, esr_out) == 128"),
+            "the handoff reservation + layout guard must match the 136-byte struct"
         );
         // On admit timeout the BSP names the last stage it reached (deterministic trace).
         assert!(
@@ -52781,6 +52783,89 @@ mod stage183_ap_idle_admit {
         assert!(
             RUNNER_SRC.contains("smp6-core") && RUNNER_SRC.contains("smp6-sender-wake"),
             "runner must register the smp6 profiles"
+        );
+    }
+
+    // Stage 183 inc.4 FIX — host QEMU failed the smoke with reason=no_handler_hit at
+    // last_stage=irq_smoke_wait: the AP's LAPIC was software-DISABLED (post-INIT reset
+    // state, SVR bit 8 clear) and silently dropped the fixed IPI (only INIT/SIPI/NMI/
+    // SMI are accepted while disabled). X86_AP_LAPIC_OK only proved an MMIO READ. The
+    // AP must software-enable its LAPIC (SVR=0x1FF, TPR=0, ESR clear) before the smoke
+    // window, publish the readbacks, and the BSP must grade them + instrument the
+    // fixed-IPI send + verify the smoke vector's descriptor.
+    #[test]
+    fn stage183_inc4_fix_lapic_sw_enable_for_ipi_delivery() {
+        const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        // AP-side: SVR software-enable | spurious 0xFF, TPR=0, ESR write-clear, and
+        // the three readbacks published into the handoff before the sti;hlt window.
+        for s in [
+            "mov dword ptr [rax + 0xF0], 0x1FF", // SVR: sw-enable | spurious 0xFF
+            "mov dword ptr [rax + 0x80], 0",     // TPR: accept all
+            "mov dword ptr [rax + 0x280], 0",    // ESR: write-clear
+            "mov [rdi + 120], r8d",              // svr_out
+            "mov [rdi + 124], r8d",              // tpr_out
+            "mov [rdi + 128], r8d",              // esr_out
+            "AP_STAGE_LAPIC_ENABLED",
+            "LAPIC_SW_ENABLED",
+        ] {
+            assert!(
+                TRAMP_SRC.contains(s),
+                "LAPIC sw-enable step must exist: {s}"
+            );
+        }
+        // The enable step must run BEFORE the smoke-wait window in the asm stream.
+        let enable_pos = TRAMP_SRC
+            .find("mov dword ptr [rax + 0xF0], 0x1FF")
+            .expect("SVR write");
+        let smoke_wait_pos = TRAMP_SRC
+            .find("\"mov dword ptr [rdi + 48], 27\"")
+            .expect("smoke wait stage");
+        assert!(
+            enable_pos < smoke_wait_pos,
+            "LAPIC software-enable must precede the sti;hlt smoke window"
+        );
+        // BSP grading + instrumented fixed-IPI send + vector-descriptor check.
+        for m in [
+            "X86_AP_LAPIC_ENABLE_BEGIN",
+            "X86_AP_LAPIC_SVR_OK",
+            "X86_AP_LAPIC_TPR_OK",
+            "X86_AP_LAPIC_ESR_OK",
+            "X86_AP_LAPIC_INTERRUPT_READY",
+            "X86_AP_LAPIC_INTERRUPT_BAD",
+            "reason=svr_sw_enable_clear",
+            "reason=tpr_masking",
+            "reason=esr_nonzero",
+            "X86_IPI_FIXED_SEND_BEGIN",
+            "X86_IPI_FIXED_ICR_WRITTEN",
+            "X86_IPI_FIXED_DELIVERY_IDLE",
+            "X86_IPI_FIXED_ESR",
+            "X86_IPI_FIXED_SEND_DONE",
+            "X86_IPI_FIXED_SEND_FAIL",
+            "X86_AP_IDT_VECTOR_OK",
+            "X86_AP_IDT_VECTOR_BAD",
+        ] {
+            assert!(SMP_SRC.contains(m), "inc.4 fix marker must exist: {m}");
+        }
+        assert!(
+            DESC_SRC.contains("fn ap_idt_smoke_vector_report("),
+            "the smoke-vector descriptor check must exist"
+        );
+        // No fake success: the failure paths stay, and interrupt-ready still requires
+        // the actual delivery proof (RECV/ACK/SMOKE_OK), not just readiness.
+        assert!(
+            SMP_SRC.contains("reason=no_handler_hit")
+                && SMP_SRC.contains("reason=idle_reentry_timeout"),
+            "deterministic failure paths must remain"
+        );
+        // Smoke requires readiness + instrumented send and forbids the new BADs.
+        assert!(
+            SMOKE_SRC.contains("X86_AP_LAPIC_INTERRUPT_READY")
+                && SMOKE_SRC.contains("X86_AP_IDT_VECTOR_OK")
+                && SMOKE_SRC.contains("X86_IPI_FIXED_SEND_DONE")
+                && SMOKE_SRC.contains("X86_AP_LAPIC_INTERRUPT_BAD")
+                && SMOKE_SRC.contains("X86_AP_IDT_VECTOR_BAD")
+                && SMOKE_SRC.contains("X86_IPI_FIXED_SEND_FAIL"),
+            "smoke must require LAPIC readiness/vector/send markers + forbid the BADs"
         );
     }
 

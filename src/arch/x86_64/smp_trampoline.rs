@@ -54,7 +54,11 @@ pub(super) const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 //   96 idtr_image:        [u8;10] // inc.4: AP IDTR (limit u16 + base u64, LE) for lidt
 //   106 <pad>:            [u8;6]
 //   112 bsp_cr4:          u64  // inc.4: BSP CR4 for the AP control-state sync (0 = skip)
-//   → size_of == 120
+//   120 svr_out:          u32  // inc.4 fix: AP-written SVR readback after sw-enable
+//   124 tpr_out:          u32  // inc.4 fix: AP-written TPR readback
+//   128 esr_out:          u32  // inc.4 fix: AP-written ESR readback after write-clear
+//   132 <pad>:            u32
+//   → size_of == 136
 pub(super) const AP_HANDOFF_READY_WORD_OFFSET: usize = 32;
 
 // Stage 183 inc.2: the AP writes an incrementing stage code here (offset 48) before
@@ -66,6 +70,10 @@ pub(super) const AP_HANDOFF_STAGE_WORD_OFFSET: usize = 48;
 // Stage 183 inc.3: AP-written env-step results (offsets hardcoded in the entry asm).
 pub(super) const AP_HANDOFF_ENV_FLAGS_OFFSET: usize = 88;
 pub(super) const AP_HANDOFF_LAPIC_ID_OUT_OFFSET: usize = 92;
+// Stage 183 inc.4 fix: AP-written LAPIC interrupt-delivery readiness readbacks.
+pub(super) const AP_HANDOFF_SVR_OUT_OFFSET: usize = 120;
+pub(super) const AP_HANDOFF_TPR_OUT_OFFSET: usize = 124;
+pub(super) const AP_HANDOFF_ESR_OUT_OFFSET: usize = 128;
 
 /// Stage 183 inc.3: bits the AP entry asm ORs into `env_flags` ([handoff+88], low
 /// identity memory — always writable) as each per-CPU environment step completes.
@@ -79,6 +87,10 @@ pub(super) mod ap_env {
     // Stage 183 inc.4 (interrupt-safe idle):
     pub const CR4_SYNCED: u32 = 1 << 5; // mov cr4 = handoff.bsp_cr4 survived
     pub const IDT_LOADED: u32 = 1 << 6; // lidt of the AP-safe IDT done
+    // Stage 183 inc.4 fix (183.4 host failure — LAPIC was software-DISABLED after
+    // INIT, dropping fixed IPIs): AP wrote SVR (sw-enable | spurious 0xFF), TPR=0,
+    // ESR write-clear, and published the readbacks.
+    pub const LAPIC_SW_ENABLED: u32 = 1 << 7;
 }
 
 #[repr(C)]
@@ -133,6 +145,14 @@ pub(super) struct ApHandoff {
     pub(super) idtr_image: [u8; 10],
     pub(super) _pad_idtr: [u8; 6],
     pub(super) bsp_cr4: u64,
+
+    // Stage 183 inc.4 fix, AP-written: LAPIC interrupt-delivery readiness readbacks
+    // (SVR after software-enable, TPR after =0, ESR after write-clear). The BSP grades
+    // them into X86_AP_LAPIC_SVR_OK / TPR_OK / ESR_OK / INTERRUPT_READY.
+    pub(super) svr_out: u32,
+    pub(super) tpr_out: u32,
+    pub(super) esr_out: u32,
+    pub(super) _pad_lapic: u32,
 }
 
 // Stage 183 inc.2/inc.3 layout guard: the trampoline / AP-entry asm hardcodes these
@@ -140,7 +160,7 @@ pub(super) struct ApHandoff {
 // Lock the Rust struct to them at compile time so a field reorder can never silently
 // make the asm read/write the wrong slot.
 const _: () = {
-    assert!(core::mem::size_of::<ApHandoff>() == 120);
+    assert!(core::mem::size_of::<ApHandoff>() == 136);
     assert!(core::mem::offset_of!(ApHandoff, ready_word) == AP_HANDOFF_READY_WORD_OFFSET);
     assert!(core::mem::offset_of!(ApHandoff, ready_word) == 32);
     assert!(core::mem::offset_of!(ApHandoff, percpu_record_ptr) == 40);
@@ -155,6 +175,11 @@ const _: () = {
     assert!(core::mem::offset_of!(ApHandoff, lapic_id_out) == 92);
     assert!(core::mem::offset_of!(ApHandoff, idtr_image) == 96);
     assert!(core::mem::offset_of!(ApHandoff, bsp_cr4) == 112);
+    assert!(core::mem::offset_of!(ApHandoff, svr_out) == AP_HANDOFF_SVR_OUT_OFFSET);
+    assert!(core::mem::offset_of!(ApHandoff, svr_out) == 120);
+    assert!(core::mem::offset_of!(ApHandoff, tpr_out) == 124);
+    assert!(core::mem::offset_of!(ApHandoff, esr_out) == AP_HANDOFF_ESR_OUT_OFFSET);
+    assert!(core::mem::offset_of!(ApHandoff, esr_out) == 128);
 };
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -408,9 +433,10 @@ yarm_ap_trampoline_handoff:
     // stack_top(8) kernel_state_ptr(16) ready_flag_ptr(24) ready_word(32) reserved(36)
     // percpu_record_ptr(40) ap_stage(48) pad(52) kernel_cr3(56) gdtr_image(64) pad(74)
     // lapic_id_reg_va(80) env_flags(88) lapic_id_out(92) idtr_image(96) pad(106)
-    // bsp_cr4(112). Under-reserving would place AP-written fields past
-    // `yarm_ap_trampoline_end`, shrinking the copied `len`.
-    .zero 120
+    // bsp_cr4(112) svr_out(120) tpr_out(124) esr_out(128) pad(132). Under-reserving
+    // would place AP-written fields past `yarm_ap_trampoline_end`, shrinking the
+    // copied `len`.
+    .zero 136
 
 yarm_ap_trampoline_end:
     .code64
@@ -533,8 +559,12 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 //   'D'   AP_STAGE_GDT_LOADED (21)        'T'             about to lgdt + SS/DS/ES + far-return to
 //                                                         CS=0x08; died ⇒ per-AP GDT/CS reload bad
 //   'T'   AP_STAGE_TSS_LOADED (22)        'l'             about to `ltr 0x28`; died ⇒ TSS desc bad
-//   'l'   AP_STAGE_LAPIC_CHECKED (23)     'i'             about to read the LAPIC ID register;
+//   'l'   AP_STAGE_LAPIC_CHECKED (23)     'n'             about to read the LAPIC ID register;
 //                                                         died ⇒ LAPIC MMIO VA bad under kCR3
+//   'n'   AP_STAGE_LAPIC_ENABLED (29)     'i'             about to SW-ENABLE the LAPIC (SVR
+//                                                         0x1FF, TPR 0, ESR clear) — fixed IPIs
+//                                                         are DROPPED until this (183.4 root
+//                                                         cause); died ⇒ LAPIC MMIO write bad
 //   'i'   AP_STAGE_IDT_LOADED (26)        'y'             about to lidt the AP-safe IDT
 //   'y'   AP_STAGE_IDLE_CTX_PUBLISHED (24) 'u'            about to store the live rsp via gs:
 //   'u'   AP_STAGE_IRQ_SMOKE_WAIT (27)    'v'             ready_word=3 published; waiting in the
@@ -599,6 +629,9 @@ pub(super) const AP_STAGE_IDT_LOADED: u32 = 26;
 pub(super) const AP_STAGE_IRQ_SMOKE_WAIT: u32 = 27;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_IRQ_SMOKE_DONE: u32 = 28;
+// Stage 183 inc.4 fix: LAPIC software-enable (SVR/TPR/ESR) before the smoke window.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_LAPIC_ENABLED: u32 = 29;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_HANDOFF_NULL: u32 = 253; // percpu_record_ptr == 0 (BSP bug)
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -631,6 +664,7 @@ pub(super) fn ap_stage_name(raw: u32) -> &'static str {
         AP_STAGE_IDT_LOADED => "idt_loaded",
         AP_STAGE_IRQ_SMOKE_WAIT => "irq_smoke_wait",
         AP_STAGE_IRQ_SMOKE_DONE => "irq_smoke_done",
+        AP_STAGE_LAPIC_ENABLED => "lapic_enabled",
         AP_STAGE_HANDOFF_NULL => "handoff_null",
         AP_STAGE_GS_MISMATCH => "gs_mismatch",
         _ => "unknown",
@@ -791,6 +825,32 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "mov [rdi + 92], eax",        // lapic_id_out
         "or dword ptr [rdi + 88], 8", // env: LAPIC_READ
         "62:",
+        // 'n' / stage 29 (inc.4 fix): software-ENABLE this AP's local APIC for
+        // interrupt delivery. After INIT the LAPIC resets to SVR=0xFF with bit 8
+        // (APIC software enable) CLEAR — a software-disabled LAPIC accepts only
+        // INIT/SIPI/NMI/SMI and silently DROPS fixed IPIs, which is exactly why the
+        // 183.4 smoke IPI (vector 0xF0) never reached the handler on the host.
+        // Write SVR = 0x1FF (enable | spurious vector 0xFF — parked by the catch-all
+        // stub if it ever fires), TPR = 0 (accept all priority classes incl. 0xF0),
+        // write-clear ESR, and publish all three readbacks for BSP grading.
+        "mov al, 0x6E", // 'n'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 29",
+        "mov rax, [rdi + 80]",
+        "test rax, rax",
+        "jz 64f",        // LAPIC VA not provided → flag stays clear; BSP grades BAD
+        "sub rax, 0x20", // LAPIC MMIO base (id reg VA - 0x20)
+        "mov dword ptr [rax + 0xF0], 0x1FF", // SVR: software enable | spurious 0xFF
+        "mov dword ptr [rax + 0x80], 0", // TPR: accept all vectors
+        "mov dword ptr [rax + 0x280], 0", // ESR: write to latch/clear
+        "mov r8d, [rax + 0xF0]",
+        "mov [rdi + 120], r8d", // svr_out
+        "mov r8d, [rax + 0x80]",
+        "mov [rdi + 124], r8d", // tpr_out
+        "mov r8d, [rax + 0x280]",
+        "mov [rdi + 128], r8d",         // esr_out
+        "or dword ptr [rdi + 88], 128", // env: LAPIC_SW_ENABLED
+        "64:",
         // 'i' / stage 26 (inc.4): load the AP-safe IDT (catch-all park stubs +
         // the smoke-vector handler; see descriptor_tables.rs). From here an
         // unexpected interrupt/exception parks deterministically instead of
@@ -948,6 +1008,10 @@ pub(super) fn encode_trampoline_page(
     // sentinel so a skipped/failed MMIO read can never alias a real LAPIC id.
     patched.env_flags = 0;
     patched.lapic_id_out = 0xFFFF_FFFF;
+    // Stage 183 inc.4 fix: LAPIC readiness readbacks start cleared.
+    patched.svr_out = 0;
+    patched.tpr_out = 0;
+    patched.esr_out = 0;
 
     let handoff_bytes = unsafe {
         core::slice::from_raw_parts(
@@ -1007,6 +1071,22 @@ pub(super) fn ap_env_flags_low_virt(handoff_off: usize) -> *const u32 {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) fn ap_lapic_id_out_low_virt(handoff_off: usize) -> *const u32 {
     (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_LAPIC_ID_OUT_OFFSET) as *const u32
+}
+
+/// Stage 183 inc.4 fix: low identity-mapped VAs of the AP LAPIC readiness readbacks.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_svr_out_low_virt(handoff_off: usize) -> *const u32 {
+    (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_SVR_OUT_OFFSET) as *const u32
+}
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_tpr_out_low_virt(handoff_off: usize) -> *const u32 {
+    (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_TPR_OUT_OFFSET) as *const u32
+}
+
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_esr_out_low_virt(handoff_off: usize) -> *const u32 {
+    (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_ESR_OUT_OFFSET) as *const u32
 }
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
