@@ -1923,7 +1923,13 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_AP_IST_BAD" \
     "X86_AP_LAPIC_INTERRUPT_BAD" \
     "X86_IPI_FIXED_SEND_FAIL" \
-    "X86_AP_INTERRUPT_SMOKE_FAIL"; do
+    "X86_AP_INTERRUPT_SMOKE_FAIL" \
+    "X86_AP_IDLE_TASK_BAD" \
+    "X86_AP_SCHED_ONLINE_FAIL" \
+    "X86_AP_SCHED_IDLE_BAD" \
+    "D6_SMP_LOST_WAKE_FAIL" \
+    "D6_SMP_DUP_WAKE_FAIL" \
+    "SCHED_ENQUEUE_DENIED_WAKE_ONLY"; do
     if log_has_pattern "$f"; then
       echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
       exit 1
@@ -1973,24 +1979,42 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_AP_IDLE_ENTER" \
     "X86_AP_SCHED_ADMIT_DONE" \
     "X86_SMP_AP_ENV_READY" \
-    "X86_SMP_AP_INTERRUPT_READY"; do
+    "X86_SMP_AP_INTERRUPT_READY" \
+    "X86_AP_IDLE_TASK_CREATE_BEGIN" \
+    "X86_AP_IDLE_TASK_READY" \
+    "X86_AP_IDLE_TASK_ACTIVE" \
+    "X86_AP_SCHED_ONLINE_BEGIN" \
+    "X86_AP_SCHED_ONLINE_OK" \
+    "X86_AP_SCHED_IDLE_ENTER" \
+    "X86_AP_SCHED_IDLE_REENTER" \
+    "D6_SMP_REMOTE_WAKE_OK" \
+    "X86_SMP_AP_SCHED_ONLINE" \
+    "X86_SMP_PLACEMENT_GATED"; do
     if ! log_has_pattern "$m"; then
       echo "[error] SMP-LIVE: AP admission/prereq marker missing: $m"
       exit 1
     fi
     echo "[ok] SMP-LIVE: AP admission marker present: $m"
   done
-  if ! log_has_pattern "X86_SMP_UNLOCK_DONE result=ap_idle_live"; then
-    echo "[error] SMP-LIVE: expected X86_SMP_UNLOCK_DONE result=ap_idle_live (AP idle admission)"
+  # Stage 183.5: AP scheduler-online admission + remote-wake proof. All present APs
+  # must be scheduler-online (wake-only: placement gated until the AP dispatcher in
+  # 183.6) and the exactly-one-wake proof must pass per AP. The graduated one-shot
+  # proof runs BEFORE the admission (online==1 at proof time), so the unconditional
+  # UNLOCK_GRADUATED_DONE result=ok gate above still holds.
+  if ! log_has_pattern "X86_SMP_ONLINE_READY present=${QEMU_SMP} online=${QEMU_SMP}"; then
+    echo "[error] SMP-LIVE: expected X86_SMP_ONLINE_READY present=${QEMU_SMP} online=${QEMU_SMP}"
     exit 1
   fi
-  # Scheduler admission (AP IDT + timer + runnable idle task + online>1) is intentionally
-  # the NEXT increment: online must remain 1 (APs idle-live + env-ready only).
+  if ! log_has_pattern "X86_SMP_UNLOCK_DONE result=aps_online"; then
+    echo "[error] SMP-LIVE: expected X86_SMP_UNLOCK_DONE result=aps_online (183.5 verdict)"
+    exit 1
+  fi
+  # Tripwire: the legacy premature-admission marker must never reappear.
   if log_has_pattern "X86_SMP_APS_ADMITTED"; then
-    echo "[error] SMP-LIVE: APs must be idle-live only this increment, not scheduler-admitted"
+    echo "[error] SMP-LIVE: legacy X86_SMP_APS_ADMITTED marker must not be emitted"
     exit 1
   fi
-  echo "[ok] SMP-LIVE: APs idle-live + scheduler-admission prerequisites proven under -smp $QEMU_SMP"
+  echo "[ok] SMP-LIVE: APs scheduler-online (wake-only) + remote-wake proven under -smp $QEMU_SMP"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

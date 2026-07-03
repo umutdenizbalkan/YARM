@@ -313,12 +313,26 @@ impl KernelState {
         if tid == 0 {
             return; // need a real user task
         }
+        // Stage 183.5 sequencing gate: the AP scheduler-online admission (and this
+        // audit) run only AFTER the graduated one-shot proof has emitted its verdict
+        // on the BSP — the accepted graduated evidence must execute with online == 1
+        // (its out-of-lock seam slices require the single-CPU topology until 183.6).
+        // Not latched yet: retry on a later trap until the proof completes.
+        if !crate::kernel::boot::unlock_graduated_proof_completed() {
+            return;
+        }
         if X86_SMP_UNLOCK_AUDIT_STARTED
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return; // one-shot
         }
+
+        // Stage 183.5: AP scheduler-online admission + remote-wake proof (one-shot;
+        // per-AP hard gates inside — only interrupt-smoke-passed APs are admitted).
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::smp::ap_scheduler_online_admission(self);
+
         let cpu = self.current_cpu().0;
         let online = self.online_cpu_count();
         let online_bits = self.online_cpu_bitmap().count_ones() as usize;
@@ -340,13 +354,46 @@ impl KernelState {
         }
 
         if online > 1 {
-            // APs are admitted to the scheduler: the graduated seams' `single_cpu`
-            // eligibility (`online_cpu_count() <= 1`) is now false, so the out-of-lock
-            // path must be proven SMP-safe (scheduler-lock discipline + IPI remote wake +
-            // TLB shootdown/ACK). This branch is where the per-seam SMP invariant proof
-            // runs once AP admission lands; it is intentionally NOT reachable yet.
-            crate::yarm_log!("X86_SMP_APS_ADMITTED online={}", online);
-            crate::yarm_log!("X86_SMP_UNLOCK_DONE result=aps_live online={}", online);
+            // Stage 183.5: APs are scheduler-online (wake-only — placement gated, no
+            // AP dispatcher yet) with the remote-wake proof graded above. The
+            // graduated seams' `single_cpu` eligibility is now false, so the D2/D6
+            // out-of-lock slices take their conservative in-lock route
+            // (`reason=multi_cpu`) — they stay gated until 183.6 proves them under
+            // real SMP (that is the remaining blocker, together with TLB ACK).
+            #[cfg(target_arch = "x86_64")]
+            let (ap_idle_live, ap_env_ready, ap_interrupt_ready, remote_wake_ok, wake_only) = (
+                crate::arch::x86_64::smp::ap_idle_live_count(),
+                crate::arch::x86_64::smp::ap_env_ready_count(),
+                crate::arch::x86_64::smp::ap_interrupt_ready_count(),
+                crate::arch::x86_64::smp::ap_remote_wake_ok_count(),
+                self.wake_only_cpu_bitmap(),
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            let (ap_idle_live, ap_env_ready, ap_interrupt_ready, remote_wake_ok, wake_only) =
+                (0usize, 0usize, 0usize, 0usize, 0u64);
+
+            crate::yarm_log!(
+                "X86_SMP_AP_SCHED_ONLINE present={} online={} ap_idle_live={} ap_env_ready={} ap_interrupt_ready={} remote_wake_ok={}",
+                present,
+                online,
+                ap_idle_live,
+                ap_env_ready,
+                ap_interrupt_ready,
+                remote_wake_ok
+            );
+            // Honesty about the intermediate state: online APs accept NO task
+            // placement until their dispatcher lands (183.6+).
+            crate::yarm_log!(
+                "X86_SMP_PLACEMENT_GATED cpus=0x{:x} reason=ap_dispatcher_not_wired",
+                wake_only
+            );
+            crate::yarm_log!("X86_SMP_UNLOCK_BLOCKER category=C reason=d2_d6_smp_seams_unproven");
+            crate::yarm_log!(
+                "X86_SMP_UNLOCK_DONE result=aps_online present={} online={} remote_wake_ok={}",
+                present,
+                online,
+                remote_wake_ok
+            );
         } else {
             // present>1 but online==1: APs exist and are NOT scheduler-admitted (online
             // stays 1 so `single_cpu` is true and no task is enqueued onto an AP). Stage 183
@@ -1066,6 +1113,9 @@ impl KernelState {
             crate::yarm_log!("UNLOCK_GRADUATED_INVARIANT_FAIL");
             crate::yarm_log!("UNLOCK_GRADUATED_DONE result=fail");
         }
+        // Stage 183.5: the AP scheduler-online admission is gated on this — the
+        // graduated proof must have run (on the BSP, online==1) before APs go online.
+        crate::kernel::boot::set_unlock_graduated_proof_completed();
     }
 
     /// Stage-1 alias for scheduler lock access.

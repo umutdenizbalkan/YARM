@@ -1887,12 +1887,20 @@ pub(crate) fn ap_tss_rsp0(cpu: usize) -> u64 {
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub(crate) const AP_IRQ_SMOKE_VECTOR: u8 = 0xF0;
 
+/// Stage 183.5: the remote-wake vector for scheduler-online APs. Distinct from the
+/// 183.4 smoke vector — its handler increments `PerCpuRecord.remote_wake_count`
+/// (gs:[108]) and the AP's managed scheduler-idle loop observes the change,
+/// publishes a re-entry, and returns to idle.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) const AP_REMOTE_WAKE_VECTOR: u8 = 0xF1;
+
 #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
 core::arch::global_asm!(
     r#"
     .section .text.ap_idt_stubs,"ax",@progbits
     .global yarm_ap_idt_unexpected_stubs
     .global yarm_ap_irq_smoke_stub
+    .global yarm_ap_remote_wake_stub
 
     // 256 catch-all stubs, 16 bytes apart (vector = index). Each pushes its
     // vector and parks in the common tail. NOTE: `yarm_ap_vec` is a pure
@@ -1933,11 +1941,24 @@ yarm_ap_irq_smoke_stub:
     mov dword ptr [rax], 0
     pop rax
     iretq
+
+    .align 16
+yarm_ap_remote_wake_stub:
+    // Stage 183.5 remote-wake handler (vector 0xF1): count the wake via gs:,
+    // EOI, iretq. The scheduler-idle loop observes the count change, publishes
+    // the re-entry, and returns to idle. Preserves every register it touches.
+    push rax
+    add dword ptr gs:[{wake_count_off}], 1
+    movabs rax, {lapic_eoi}
+    mov dword ptr [rax], 0
+    pop rax
+    iretq
 "#,
     unexpected_off = const super::percpu::IRQ_UNEXPECTED_VEC_OFFSET,
     hit_count_off = const super::percpu::IRQ_HIT_COUNT_OFFSET,
     hit_vec_off = const super::percpu::IRQ_HIT_VECTOR_OFFSET,
     smoke_vec = const AP_IRQ_SMOKE_VECTOR as u32,
+    wake_count_off = const super::percpu::REMOTE_WAKE_COUNT_OFFSET,
     lapic_eoi = const super::platform_layout::LAPIC_MMIO_BASE + 0xB0,
 );
 
@@ -1945,6 +1966,7 @@ yarm_ap_irq_smoke_stub:
 unsafe extern "C" {
     static yarm_ap_idt_unexpected_stubs: u8;
     static yarm_ap_irq_smoke_stub: u8;
+    static yarm_ap_remote_wake_stub: u8;
 }
 
 /// One shared AP IDT (identical gates for every AP; per-AP results land in the
@@ -2025,6 +2047,13 @@ pub(crate) fn prepare_ap_idt() -> (u16, u64) {
         }
         (*idt)[AP_IRQ_SMOKE_VECTOR as usize] = X86IdtEntry::new_interrupt(
             core::ptr::addr_of!(yarm_ap_irq_smoke_stub) as u64,
+            KERNEL_CODE_SELECTOR,
+            0,
+            0,
+        );
+        // Stage 183.5: the scheduler remote-wake vector for online APs.
+        (*idt)[AP_REMOTE_WAKE_VECTOR as usize] = X86IdtEntry::new_interrupt(
+            core::ptr::addr_of!(yarm_ap_remote_wake_stub) as u64,
             KERNEL_CODE_SELECTOR,
             0,
             0,

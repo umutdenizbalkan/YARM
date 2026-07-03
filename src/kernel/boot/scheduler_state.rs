@@ -31,6 +31,34 @@ impl KernelState {
         Ok(())
     }
 
+    /// Stage 183.5: mark `cpu` wake-only — online for accounting/wake, but the
+    /// balanced placement skips it and explicit enqueues are denied (no AP
+    /// dispatcher yet; a placed task would strand). Set BEFORE `bring_up_cpu`
+    /// so there is no placement window.
+    pub fn mark_cpu_wake_only(&mut self, cpu: CpuId, wake_only: bool) -> Result<(), KernelError> {
+        self.with_scheduler_state_mut(|sched| {
+            kernel_mut(&mut sched.scheduler)
+                .set_cpu_wake_only(cpu, wake_only)
+                .map_err(map_scheduler_error)
+        })
+    }
+
+    /// Stage 183.5: install the scheduler-owned idle current (tid 0 — the
+    /// scheduler's existing idle placeholder convention) for a wake-only online AP.
+    pub fn install_ap_idle_current(&mut self, cpu: CpuId) -> Result<u64, KernelError> {
+        self.with_scheduler_state_mut(|sched| {
+            kernel_mut(&mut sched.scheduler)
+                .install_ap_idle_current(cpu)
+                .map(|tid| tid.0)
+                .map_err(map_scheduler_error)
+        })
+    }
+
+    /// Stage 183.5: the wake-only (online, no-placement) CPU bitmap.
+    pub fn wake_only_cpu_bitmap(&self) -> u64 {
+        self.with_scheduler_state(|sched| kernel_ref(&sched.scheduler).wake_only_bitmap())
+    }
+
     pub fn set_current_cpu(&mut self, cpu: CpuId) -> Result<(), KernelError> {
         self.with_scheduler_state_mut(|sched| {
             kernel_ref(&sched.scheduler)

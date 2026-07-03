@@ -6879,6 +6879,68 @@ delivery was impossible. Fix (all before the smoke window):
   `X86_AP_IDT_VECTOR_BAD` / `X86_IPI_FIXED_SEND_FAIL`. Guarded by
   `stage183_inc4_fix_lapic_sw_enable_for_ipi_delivery`.
 
+**183.4 ACCEPTED (user QEMU, 2026).** Per AP: `X86_AP_LAPIC_SVR_OK value=0x1ff`,
+`X86_AP_LAPIC_TPR_OK value=0x0`, `X86_AP_LAPIC_ESR_OK value=0x0`,
+`X86_AP_IDT_VECTOR_OK vector=0xf0 selector=0x08 ist=0 type=0xe`,
+`X86_IPI_REMOTE_WAKE_RECV`/`ACK`, `X86_AP_INTERRUPT_SMOKE_OK vector=0xf0`;
+summaries `X86_SMP_AP_INTERRUPT_READY present=2/4 … ap_interrupt_ready=1/3`. No
+LAPIC/IDT/SEND/SMOKE failure markers, no admit fail, no fallback/optout.
+
+**183.5 — AP SCHEDULER-ONLINE + REMOTE WAKE.** APs become `online_cpu_count()`
+members with real scheduler-owned idle and a per-AP exactly-one remote-wake proof —
+while task placement on them stays gated and the D2/D6 out-of-lock SMP seams stay
+unproven-and-gated for 183.6:
+
+- **Sequencing (the key safety decision):** the admission runs ONE-SHOT from the SMP
+  audit only AFTER the graduated one-shot proof emitted its verdict
+  (`unlock_graduated_proof_completed()`; the audit returns without latching until
+  then). The accepted graduated evidence therefore still executes on the BSP with
+  `online == 1` — its out-of-lock seam slices require the single-CPU topology until
+  183.6 — and the smoke's unconditional `UNLOCK_GRADUATED_DONE result=ok` gate keeps
+  holding under `-smp 2/4`. Boot-time `X86_SMP_STARTUP online_cpus=1` /
+  `X86_SMP_OBSERVATION_OK scheduler_aps=0` remain the boot-time truth.
+- **Wake-only online (stranding is impossible by construction):** `SmpScheduler`
+  gains a `wake_only` bitmap — such CPUs are online for accounting/wake but
+  `enqueue_balanced` skips them and explicit `enqueue_on_with_priority` is DENIED
+  (`SCHED_ENQUEUE_DENIED_WAKE_ONLY`, forbidden in smoke). Without this, any
+  runtime spawn without affinity could balance onto an AP run queue that no
+  dispatcher drains. The AP is marked wake-only BEFORE `bring_up_cpu` (no placement
+  window). 183.6+ clears the bit per CPU when the AP dispatcher lands. NOT a knob.
+- **Scheduler-owned idle task:** current = tid 0 — the scheduler's EXISTING idle
+  placeholder convention (`dispatch_next` already switches away from tid 0 when
+  real work arrives, so the representation is forward-correct for the 183.6 AP
+  dispatcher). `install_ap_idle_current` installs it on the online wake-only AP;
+  the AP's live body is the new MANAGED interruptible idle loop (stage 30
+  `sched_idle` / 31 `sched_wake_reenter`, breadcrumbs `'q'`/`'z'`): `sti;hlt`,
+  wake-capable via vector 0xF1, publishes `wake_reenter_out` ([handoff+132]) on
+  every observed wake and RETURNS TO IDLE — no bare unmanaged cli/hlt as the final
+  scheduler-online state (degraded GS_BAD/env-skip paths still park masked).
+- **Remote wake proof (per AP, after online):** dedicated vector 0xF1
+  (`yarm_ap_remote_wake_stub`: gs:[108] `remote_wake_count` += 1, EOI, iretq).
+  BSP sends EXACTLY ONE (`X86_IPI_REMOTE_WAKE_SEND from=0 to=N vector=0xf1`), then
+  grades: handler ran (`RECV`), idle re-entered with the re-enter count bumped and
+  stage back at 30 (`ACK` + `X86_AP_SCHED_IDLE_REENTER`), settle, wake delta == 1
+  (else `D6_SMP_DUP_WAKE_FAIL`), no missing wake (else `D6_SMP_LOST_WAKE_FAIL`),
+  and the idle current still coherent (`current_tid_on(ap) == idle tid`) →
+  `D6_SMP_REMOTE_WAKE_OK cpu=N` (+ separate `ap_remote_wake_ok_count`).
+- **Marker flow per AP:** `X86_AP_IDLE_TASK_CREATE_BEGIN` →
+  `X86_AP_IDLE_TASK_READY tid=0 stack entry` → `X86_AP_SCHED_ONLINE_BEGIN` →
+  `X86_AP_IDLE_TASK_ACTIVE tid=0` → `X86_AP_SCHED_ONLINE_OK` →
+  `X86_AP_SCHED_IDLE_ENTER tid=0` → wake trio → `D6_SMP_REMOTE_WAKE_OK`; then
+  `X86_SMP_ONLINE_READY present=N online=N`. Audit: `X86_SMP_AP_SCHED_ONLINE …
+  remote_wake_ok=K`, `X86_SMP_PLACEMENT_GATED cpus=0x<bitmap>
+  reason=ap_dispatcher_not_wired`, blocker `category=C
+  reason=d2_d6_smp_seams_unproven`, `X86_SMP_UNLOCK_DONE result=aps_online …`.
+- **D2/D6 seams under `single_cpu == false`:** the untouched topology gates route
+  the graduated seams onto their conservative in-lock slice
+  (`D6_GENUINE_MUT_DISPATCH_FALLBACK reason=multi_cpu` / `D2_*_GENUINE_FALLBACK
+  reason=multi_cpu`) — the designed Category-D behavior, NOT an old fallback knob.
+  The strict out-of-lock gates (d2-recv/d2-send profiles, IPC_FINAL) remain
+  `-smp 1` profiles; 183.6 proves the out-of-lock slices under SMP and graduates
+  them. Guarded by `stage183_inc5_ap_scheduler_online_and_remote_wake`.
+  Acceptance: `scripts/run-ci-profiles.sh smp2-core` + `smp4-core`
+  (+ optional `smp6-core`).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

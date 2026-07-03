@@ -52,6 +52,8 @@ pub const SAVED_RSP_OFFSET: usize = 56;
 pub const IRQ_HIT_COUNT_OFFSET: usize = 96;
 pub const IRQ_HIT_VECTOR_OFFSET: usize = 100;
 pub const IRQ_UNEXPECTED_VEC_OFFSET: usize = 104;
+/// Stage 183.5: incremented by the remote-wake stub (vector 0xF1) via gs:.
+pub const REMOTE_WAKE_COUNT_OFFSET: usize = 108;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -77,7 +79,7 @@ pub const IRQ_UNEXPECTED_VEC_OFFSET: usize = 104;
 /// - `96` : irq_hit_count     u32 (AP IDT smoke handler: gs:[96] += 1)
 /// - `100`: irq_hit_vector    u32 (AP IDT smoke handler: vector delivered)
 /// - `104`: irq_unexpected_vec u32 (catch-all park stub: vector+1; 0 = none)
-/// - `108`: _pad_irq         u32
+/// - `108`: remote_wake_count u32 (AP wake stub, vector 0xF1: gs:[108] += 1)
 ///
 /// Explicit-field bytes = 112; struct stride = 128 (padded to the 64-byte
 /// alignment so the slot table strides cleanly).
@@ -104,7 +106,7 @@ pub struct PerCpuRecord {
     pub irq_hit_count: u32,
     pub irq_hit_vector: u32,
     pub irq_unexpected_vec: u32,
-    _pad_irq: u32,
+    pub remote_wake_count: u32,
 }
 
 impl PerCpuRecord {
@@ -132,7 +134,7 @@ impl PerCpuRecord {
             irq_hit_count: 0,
             irq_hit_vector: 0,
             irq_unexpected_vec: 0,
-            _pad_irq: 0,
+            remote_wake_count: 0,
         }
     }
 }
@@ -146,6 +148,7 @@ const _: () = {
     assert!(core::mem::offset_of!(PerCpuRecord, irq_hit_count) == IRQ_HIT_COUNT_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, irq_hit_vector) == IRQ_HIT_VECTOR_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, irq_unexpected_vec) == IRQ_UNEXPECTED_VEC_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, remote_wake_count) == REMOTE_WAKE_COUNT_OFFSET);
     assert!(core::mem::size_of::<PerCpuRecord>() == 128);
 };
 
@@ -197,7 +200,7 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             irq_hit_count: 0,
             irq_hit_vector: 0,
             irq_unexpected_vec: 0,
-            _pad_irq: 0,
+            remote_wake_count: 0,
         };
         core::ptr::write_volatile(base, record);
     }

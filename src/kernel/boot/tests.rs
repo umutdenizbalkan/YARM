@@ -11826,14 +11826,24 @@ fn stage113_per_cpu_runqueue_sharding_remains_deferred() {
 
 #[test]
 fn stage113_x86_64_ap_scheduler_participation_remains_off() {
+    // Superseded by Stage 183.5: APs go scheduler-online AFTER the graduated proof
+    // (wake-only — task placement stays gated). The boot-time truth is unchanged:
+    // at X86_SMP_STARTUP time no AP is scheduler-admitted (scheduler_aps=0), and
+    // the bring-up is fenced behind the sequencing gate, not called in the boot loop.
     let smp_src = include_str!("../../arch/x86_64/smp.rs");
     assert!(
         smp_src.contains("scheduler_aps=0"),
-        "x86_64 AP scheduler participation must remain off (scheduler_aps=0)"
+        "boot-time AP scheduler participation must remain off (scheduler_aps=0)"
     );
     assert!(
-        smp_src.contains("production scheduler is BSP-only"),
-        "the AP scheduler-off fence comment must remain in smp.rs"
+        smp_src.contains("SEQUENCING FENCE (183.5)"),
+        "the AP scheduler bring-up sequencing fence comment must remain in smp.rs"
+    );
+    // Task placement on wake-only online APs is denied until the AP dispatcher lands.
+    let sched_src = include_str!("../../kernel/scheduler.rs");
+    assert!(
+        sched_src.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
+        "wake-only placement denial must exist"
     );
 }
 
@@ -33253,9 +33263,11 @@ mod stage114_d3_vm_brk_shrink_live {
 
     #[test]
     fn stage114_x86_64_ap_scheduler_participation_remains_off() {
+        // Superseded by Stage 183.5 (see stage113 twin): boot-time scheduler_aps=0
+        // holds; scheduler-online runs post-graduated-proof with placement gated.
         let smp_src = include_str!("../../arch/x86_64/smp.rs");
         assert!(smp_src.contains("scheduler_aps=0"));
-        assert!(smp_src.contains("production scheduler is BSP-only"));
+        assert!(smp_src.contains("SEQUENCING FENCE (183.5)"));
     }
 
     #[test]
@@ -52326,7 +52338,7 @@ mod stage183_smp_live {
             SMOKE_SRC.contains("QEMU_SMP=${QEMU_SMP:-1}")
                 && SMOKE_SRC.contains("X86_SMP_UNLOCK_DONE")
                 && SMOKE_SRC.contains("forbidden marker under SMP")
-                && SMOKE_SRC.contains("prerequisites proven under -smp"),
+                && SMOKE_SRC.contains("remote-wake proven under -smp"),
             "smoke must honor QEMU_SMP + assert the SMP verdict + forbid fallback"
         );
         assert!(
@@ -52412,8 +52424,10 @@ mod stage183_ap_idle_admit {
         );
     }
 
-    // ap_idle_live is a SEPARATE count from scheduler online; scheduler stays BSP-only
-    // (no bring_up_cpu for APs) so single_cpu remains true and no task strands on an AP.
+    // ap_idle_live is a SEPARATE count from scheduler online. Since 183.5 the APs DO
+    // go scheduler-online — but only via the sequenced admission (post-graduated-
+    // proof, gated on the per-AP interrupt smoke) and only wake-only (placement
+    // denied), so no task can strand on an AP.
     #[test]
     fn stage183_ap_idle_live_is_not_scheduler_online() {
         assert!(
@@ -52421,16 +52435,20 @@ mod stage183_ap_idle_admit {
                 && SMP_SRC.contains("pub fn ap_idle_live_count() -> usize"),
             "a separate ap_idle_live count must exist"
         );
+        // bring_up_cpu for APs exists ONLY inside the sequenced admission fn, gated
+        // on the interrupt-smoke verdict and the graduated-proof completion.
         assert!(
-            !SMP_SRC.contains("kernel.bring_up_cpu(cpu)")
-                && !SMP_SRC.contains(".bring_up_cpu(cpu)"),
-            "APs must NOT be admitted to the production scheduler (BSP-only) this increment"
+            SMP_SRC.contains("fn ap_scheduler_online_admission")
+                && SMP_SRC.contains("kernel.bring_up_cpu(cpu)")
+                && SMP_SRC.contains("AP_IRQ_READY_FLAGS[raw_cpu].load")
+                && ORCH_SRC.contains("unlock_graduated_proof_completed()"),
+            "AP bring-up must live in the sequenced, smoke-gated admission only"
         );
-        // The audit reports ap_idle_live without claiming aps_live (scheduler admission).
+        // The degraded verdict (no AP online) still reports ap_idle_live honestly.
         assert!(
             ORCH_SRC.contains("ap_idle_live_count()")
                 && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=ap_idle_live"),
-            "the SMP audit must report the ap_idle_live verdict"
+            "the SMP audit must keep the degraded ap_idle_live verdict"
         );
     }
 
@@ -52465,7 +52483,7 @@ mod stage183_ap_idle_admit {
         // Smoke requires the admission/prereq markers + forbids the failure markers.
         assert!(
             SMOKE_SRC.contains("X86_AP_IDLE_ENTER")
-                && SMOKE_SRC.contains("result=ap_idle_live")
+                && SMOKE_SRC.contains("result=aps_online")
                 && SMOKE_SRC.contains("X86_AP_GS_BAD")
                 && SMOKE_SRC.contains("X86_AP_IDLE_FAIL")
                 && SMOKE_SRC.contains("X86_AP_KERNEL_CR3_OK")
@@ -52480,10 +52498,10 @@ mod stage183_ap_idle_admit {
                 && SMOKE_SRC.contains("X86_AP_SCHED_PREREQ_INCOMPLETE"),
             "smoke must require AP idle admission + env prereqs and forbid the failure markers"
         );
-        // Still NOT scheduler admission (online stays 1).
+        // The legacy premature-admission marker stays a tripwire in the smoke.
         assert!(
-            SMOKE_SRC.contains("must be idle-live only this increment, not scheduler-admitted"),
-            "smoke must reject premature scheduler admission this increment"
+            SMOKE_SRC.contains("legacy X86_SMP_APS_ADMITTED marker must not be emitted"),
+            "smoke must keep the legacy APS_ADMITTED tripwire"
         );
     }
 
@@ -52663,13 +52681,14 @@ mod stage183_ap_idle_admit {
             ORCH_SRC.contains("X86_SMP_AP_ENV_READY") && ORCH_SRC.contains("ap_env_ready={}"),
             "the SMP audit must report the ap_env_ready count"
         );
-        // Conservative online semantics: APs stay NOT scheduler-runnable — no
-        // bring_up_cpu for APs, and the audit still reports result=ap_idle_live.
+        // Conservative online semantics: AP bring-up exists ONLY in the sequenced
+        // 183.5 admission (post-graduated-proof, smoke-gated, wake-only placement);
+        // the degraded audit verdict still reports result=ap_idle_live.
         assert!(
-            !SMP_SRC.contains("kernel.bring_up_cpu(cpu)")
-                && !SMP_SRC.contains(".bring_up_cpu(cpu)")
+            SMP_SRC.contains("fn ap_scheduler_online_admission")
+                && SMP_SRC.contains("mark_cpu_wake_only(cpu, true)")
                 && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=ap_idle_live"),
-            "APs must remain non-scheduler-runnable (online stays 1)"
+            "AP onlining must be the sequenced wake-only admission"
         );
         // Timer policy: explicitly deferred until the AP IDT exists.
         assert!(
@@ -52761,10 +52780,12 @@ mod stage183_ap_idle_admit {
                 && ORCH_SRC.contains("reason=ap_scheduler_online_admission_required"),
             "the audit must report ap_interrupt_ready + the scheduler-online blocker"
         );
+        // 183.5: scheduler-online is gated BEHIND this interrupt smoke — the
+        // admission only onlines APs whose smoke verdict passed.
         assert!(
-            !SMP_SRC.contains("kernel.bring_up_cpu(cpu)")
-                && !SMP_SRC.contains(".bring_up_cpu(cpu)"),
-            "APs must remain non-scheduler-runnable (183.5 gate not yet proven)"
+            SMP_SRC.contains("AP_IRQ_READY_FLAGS[cpu.0 as usize].store(irq_ok")
+                && SMP_SRC.contains("continue; // interrupt smoke did not pass"),
+            "scheduler-online must be gated on the per-AP interrupt-smoke verdict"
         );
         // Smoke requires the inc.4 markers and forbids the failure grades.
         assert!(
@@ -52866,6 +52887,115 @@ mod stage183_ap_idle_admit {
                 && SMOKE_SRC.contains("X86_AP_IDT_VECTOR_BAD")
                 && SMOKE_SRC.contains("X86_IPI_FIXED_SEND_FAIL"),
             "smoke must require LAPIC readiness/vector/send markers + forbid the BADs"
+        );
+    }
+
+    // Stage 183.5 — AP SCHEDULER-ONLINE + REMOTE WAKE. APs go scheduler-online only
+    // via the sequenced admission: after the graduated one-shot proof completed on
+    // the BSP (online==1 at proof time, preserving the accepted graduated evidence),
+    // gated per-AP on the 183.4 interrupt-smoke verdict, marked WAKE-ONLY first (no
+    // task placement — no AP dispatcher yet), with the scheduler-owned idle current
+    // (tid 0, the scheduler's existing idle convention) installed, and the
+    // exactly-one remote-wake proof (vector 0xF1) graded per AP. D2/D6 out-of-lock
+    // SMP seams stay gated (single_cpu=false takes the conservative in-lock slice).
+    #[test]
+    fn stage183_inc5_ap_scheduler_online_and_remote_wake() {
+        const SCHED_SRC: &str = include_str!("../../kernel/scheduler.rs");
+        const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+        // Sequencing: admission runs post-graduated-proof (audit gate) and is one-shot.
+        assert!(
+            ORCH_SRC.contains("unlock_graduated_proof_completed()")
+                && ORCH_SRC.contains("ap_scheduler_online_admission(self)")
+                && ORCH_SRC.contains("set_unlock_graduated_proof_completed()")
+                && SMP_SRC.contains("static AP_SCHED_ONLINE_ADMISSION_DONE: AtomicBool"),
+            "admission must be one-shot and sequenced after the graduated proof"
+        );
+        // Wake-only placement gating: balanced enqueue skips wake-only CPUs, explicit
+        // enqueues are denied, and the AP is marked wake-only BEFORE bring_up_cpu.
+        assert!(
+            SCHED_SRC.contains("wake_only: u64")
+                && SCHED_SRC.contains("fn set_cpu_wake_only")
+                && SCHED_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY")
+                && SCHED_SRC.contains("fn install_ap_idle_current"),
+            "the scheduler must gate placement on wake-only online CPUs"
+        );
+        let mark = SMP_SRC
+            .find("mark_cpu_wake_only(cpu, true)")
+            .expect("wake-only mark");
+        let bring = SMP_SRC.find("kernel.bring_up_cpu(cpu)").expect("bring_up");
+        assert!(
+            mark < bring,
+            "the AP must be wake-only BEFORE bring_up_cpu (no placement window)"
+        );
+        // Scheduler-owned idle: current = tid 0 (existing idle convention), managed
+        // interruptible loop (stage 30/31) — no bare cli/hlt as the final state.
+        assert!(
+            SCHED_SRC.contains("tid: ThreadId(0)")
+                && TRAMP_SRC.contains("AP_STAGE_SCHED_IDLE")
+                && TRAMP_SRC.contains("AP_STAGE_SCHED_WAKE_REENTER")
+                && TRAMP_SRC.contains("add dword ptr [rdi + 132], 1"),
+            "the AP idle must be the scheduler-owned managed interruptible loop"
+        );
+        // Remote wake: dedicated vector 0xF1 handler + per-AP proof markers with
+        // lost/dup grading; wake-ok is a separate count.
+        assert!(
+            DESC_SRC.contains("AP_REMOTE_WAKE_VECTOR: u8 = 0xF1")
+                && DESC_SRC.contains("yarm_ap_remote_wake_stub"),
+            "the remote-wake vector + pure-asm handler must exist"
+        );
+        for m in [
+            "X86_AP_IDLE_TASK_CREATE_BEGIN",
+            "X86_AP_IDLE_TASK_READY cpu={} tid=0",
+            "X86_AP_IDLE_TASK_BAD",
+            "X86_AP_IDLE_TASK_ACTIVE",
+            "X86_AP_SCHED_ONLINE_BEGIN",
+            "X86_AP_SCHED_ONLINE_OK",
+            "X86_AP_SCHED_ONLINE_FAIL",
+            "X86_AP_SCHED_IDLE_ENTER",
+            "X86_AP_SCHED_IDLE_REENTER",
+            "X86_AP_SCHED_IDLE_BAD",
+            "D6_SMP_REMOTE_WAKE_OK",
+            "D6_SMP_LOST_WAKE_FAIL",
+            "D6_SMP_DUP_WAKE_FAIL",
+            "X86_SMP_ONLINE_READY present={} online={}",
+        ] {
+            assert!(SMP_SRC.contains(m), "183.5 marker must exist: {m}");
+        }
+        assert!(
+            SMP_SRC.contains("pub fn ap_remote_wake_ok_count() -> usize"),
+            "remote-wake-ok must be a separate count"
+        );
+        // Audit reports the 183.5 state + the honest placement gate + the 183.6 blocker.
+        assert!(
+            ORCH_SRC.contains("X86_SMP_AP_SCHED_ONLINE")
+                && ORCH_SRC.contains("X86_SMP_PLACEMENT_GATED")
+                && ORCH_SRC.contains("reason=d2_d6_smp_seams_unproven")
+                && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=aps_online"),
+            "the audit must report scheduler-online + placement gate + 183.6 blocker"
+        );
+        // Smoke: online-ready with full counts, wake proof required, failures forbidden.
+        assert!(
+            SMOKE_SRC.contains("X86_SMP_ONLINE_READY present=${QEMU_SMP} online=${QEMU_SMP}")
+                && SMOKE_SRC.contains("D6_SMP_REMOTE_WAKE_OK")
+                && SMOKE_SRC.contains("X86_AP_SCHED_ONLINE_FAIL")
+                && SMOKE_SRC.contains("D6_SMP_LOST_WAKE_FAIL")
+                && SMOKE_SRC.contains("D6_SMP_DUP_WAKE_FAIL")
+                && SMOKE_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
+            "smoke must require the wake proof + forbid the 183.5 failure markers"
+        );
+        // Hard gates for 183.6 stay: no D2/D6 SMP seam relaxation (the single_cpu
+        // topology checks are untouched), no user knobs.
+        assert!(
+            include_str!("exec_state.rs")
+                .contains("let single_cpu = self.online_cpu_count() <= 1;")
+                && include_str!("ipc_state.rs")
+                    .contains("let single_cpu = self.online_cpu_count() <= 1;"),
+            "the D2/D6 single_cpu topology gates must remain untouched until 183.6"
+        );
+        assert!(
+            !SMP_SRC.contains("yarm.") || !SMP_SRC.contains("yarm.sched_online"),
+            "no user boot knob may control the admission"
         );
     }
 
