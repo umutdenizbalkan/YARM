@@ -821,3 +821,37 @@ change does not modify kernel code, architecture code, syscall ABI, RPi5 behavio
 driver-manager DRS behavior, or the PM restart codec layout. The frozen counts
 remain `PROC_OP_PM_RESTART_V1 = 15`, `PROC_OP_PM_RESTART_REPLY_V1 = 16`,
 `PROCESS_IPC_OPCODE_COUNT = 16`, and `SYSCALL_COUNT = 31`.
+
+## SUP-L6Q — PM trusted-supervisor runtime wiring
+
+User-local QEMU after SUP-L6P proved the sender-validation logic was fail-closed
+but not yet wired: PM logged `PM_RESTART_SENDER_CHECK_BEGIN sender_tid=2
+payload_supervisor_tid=2 trusted_supervisor_tid=0` followed by
+`PM_RESTART_SENDER_REJECTED ... reason=trusted_supervisor_unknown`. The exact
+reason is that PM's startup slot 9 (`startup_context().supervisor_tid`) is zero
+in this boot; that slot is only populated for tasks that receive it, and PM's
+existing diagnostics already treated zero as missing/unknown while seeding the
+supervisor lifecycle record from the deterministic bootstrap lifecycle order.
+
+SUP-L6Q wires `ProcessService::trusted_supervisor_tid` from that existing
+runtime lifecycle source. PM still first probes `startup_context` and emits
+`PM_RESTART_TRUSTED_SUPERVISOR_INIT_BEGIN/OK/UNKNOWN`; when the startup slot is
+unknown, PM uses the already-existing bootstrap lifecycle handoff that records
+supervisor image_id 1 as the task spawned immediately before PM. Updates emit
+`PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_OK old=0 new=<tid>
+source=lifecycle_bootstrap_order`; zero or conflicting updates are rejected with
+`PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED`.
+
+The expected user-local smoke sender check is now
+`PM_RESTART_SENDER_CHECK_BEGIN sender_tid=2 payload_supervisor_tid=2
+trusted_supervisor_tid=2`, followed by `PM_RESTART_SENDER_OK sender_tid=2`. PM
+accepts sender TID 2 only because runtime lifecycle state identified TID 2 as
+the supervisor; task 2 is not hardcoded as restart authority. Unknown trusted
+supervisor still fails closed, arbitrary senders remain rejected, the payload
+`supervisor_tid` anti-spoof check remains, token query stays read-only/non-
+authorizing, crash-test restart remains gated/narrow, supervisor still does not
+locally spawn or restart tasks, and PM remains the restart authority. No kernel,
+syscall ABI, RPi5, driver-manager DRS, PM restart codec, or arch behavior
+changes. Frozen counts remain `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`, and
+`SYSCALL_COUNT = 31`; request/reply codec lengths remain 110 and 50 bytes.

@@ -2698,6 +2698,39 @@ mod tests {
             !init_src.contains("crash_test_srv"),
             "normal init/service-core path must remain free of crash_test_srv"
         );
+        for marker in &[
+            "PM_RESTART_TRUSTED_SUPERVISOR_INIT_BEGIN source=startup_context",
+            "PM_RESTART_TRUSTED_SUPERVISOR_INIT_UNKNOWN source=startup_context",
+            "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_OK old=0 new={} source={}",
+            "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED reason=zero source={}",
+            "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED reason=mismatch old={} new={} source={}",
+            "lifecycle_bootstrap_order",
+            "PM_RESTART_SENDER_CHECK_BEGIN sender_tid={} payload_supervisor_tid={} trusted_supervisor_tid={}",
+            "PM_RESTART_SENDER_REJECTED sender_tid={} trusted=0 reason=trusted_supervisor_unknown",
+        ] {
+            assert!(
+                pm_src.contains(marker),
+                "SUP-L6Q PM trusted-supervisor marker missing: {marker}"
+            );
+        }
+        let handler_start = pm_src.find("fn handle_pm_restart_v1").expect("handler");
+        let handler_end = pm_src[handler_start..]
+            .find("let rejected")
+            .map(|offset| handler_start + offset)
+            .unwrap_or(pm_src.len());
+        let handler = &pm_src[handler_start..handler_end];
+        assert!(handler.contains("self.trusted_supervisor_tid"));
+        for forbidden in &[
+            ["sender_tid != ", "2"].concat(),
+            ["sender_tid != ", "4"].concat(),
+            ["trusted_supervisor_tid: ", "2"].concat(),
+            ["trusted_supervisor_tid: ", "4"].concat(),
+        ] {
+            assert!(
+                !handler.contains(forbidden.as_str()),
+                "hardcoded trusted supervisor pattern remains: {forbidden}"
+            );
+        }
         assert!(supervisor_src.contains("send_pm_restart_v1_via_process_manager"));
         assert!(
             supervisor_src.contains("ipc_call(req_cap, rep_cap, &msg)"),

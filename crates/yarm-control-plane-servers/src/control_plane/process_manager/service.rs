@@ -1571,6 +1571,26 @@ fn map_syscall_error(err: SyscallError) -> ProcessManagerError {
     }
 }
 
+fn trusted_supervisor_tid_from_startup_context() -> Option<u64> {
+    yarm_user_rt::user_log!("PM_RESTART_TRUSTED_SUPERVISOR_INIT_BEGIN source=startup_context");
+    let tid = yarm_user_rt::runtime::startup_context().supervisor_tid;
+    match tid {
+        Some(tid) if tid != 0 => {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_TRUSTED_SUPERVISOR_INIT_OK tid={} source=startup_context",
+                tid
+            );
+            Some(tid)
+        }
+        _ => {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_TRUSTED_SUPERVISOR_INIT_UNKNOWN source=startup_context"
+            );
+            None
+        }
+    }
+}
+
 impl ProcessService {
     pub fn new() -> Self {
         let supervisor_restart_test_enabled = supervisor_restart_test_build_gate_enabled();
@@ -1589,7 +1609,7 @@ impl ProcessService {
             supervisor_restart_test_enabled,
             sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection::None,
             pm_restart_in_progress: [None; PM_RESTART_MAX_IN_PROGRESS],
-            trusted_supervisor_tid: yarm_user_rt::runtime::startup_context().supervisor_tid,
+            trusted_supervisor_tid: trusted_supervisor_tid_from_startup_context(),
             crash_test_restart_specs: [None; PM_CRASH_TEST_RESTART_SPEC_MAX],
             handled: 0,
         }
@@ -1597,6 +1617,49 @@ impl ProcessService {
 
     pub fn lifecycle_table(&self) -> &LifecycleTable {
         &self.lifecycle_table
+    }
+
+    fn update_trusted_supervisor_tid(
+        &mut self,
+        new_tid: u64,
+        source: &'static str,
+    ) -> Result<(), ProcessManagerError> {
+        if new_tid == 0 {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED reason=zero source={}",
+                source
+            );
+            return Err(ProcessManagerError::Malformed);
+        }
+        match self.trusted_supervisor_tid {
+            Some(old) if old == new_tid => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_OK old={} new={} source={}",
+                    old,
+                    new_tid,
+                    source
+                );
+                Ok(())
+            }
+            Some(old) => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED reason=mismatch old={} new={} source={}",
+                    old,
+                    new_tid,
+                    source
+                );
+                Err(ProcessManagerError::PermissionDenied)
+            }
+            None => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_OK old=0 new={} source={}",
+                    new_tid,
+                    source
+                );
+                self.trusted_supervisor_tid = Some(new_tid);
+                Ok(())
+            }
+        }
     }
 
     #[cfg(test)]
@@ -4295,14 +4358,21 @@ pub fn run() {
     yarm_user_rt::user_log!("PM_STARTUP_SLOT_8_INIT_TID raw={}", raw_init_tid);
     yarm_user_rt::user_log!("PM_STARTUP_SLOT_9_SUPERVISOR_TID raw={}", raw_sup_tid);
 
-    // Seed supervisor lifecycle (image_id=1).
+    // Seed supervisor lifecycle (image_id=1) and wire PM restart's trusted
+    // supervisor from the same runtime lifecycle source. PM does not receive
+    // startup slot 9 in this boot, so zero means unknown for startup_context;
+    // the existing bootstrap lifecycle fallback derives the supervisor from
+    // the deterministic boot order instead of a literal task id.
     if raw_sup_tid != 0 {
         service.seed_bootstrap_lifecycle_record(raw_sup_tid, 1);
+        let _ = service.update_trusted_supervisor_tid(raw_sup_tid, "startup_context");
     } else {
         yarm_user_rt::user_log!("PM_LIFECYCLE_BOOTSTRAP_SKIP image_id=1 reason=missing_slot");
         // Supervisor is always spawned immediately before PM in the boot
         // sequence, so its TID is ctx.task_id - 1 deterministically.
-        service.seed_bootstrap_lifecycle_record(ctx.task_id - 1, 1);
+        let supervisor_tid = ctx.task_id - 1;
+        service.seed_bootstrap_lifecycle_record(supervisor_tid, 1);
+        let _ = service.update_trusted_supervisor_tid(supervisor_tid, "lifecycle_bootstrap_order");
     }
 
     // Seed init_server lifecycle (image_id=3).
