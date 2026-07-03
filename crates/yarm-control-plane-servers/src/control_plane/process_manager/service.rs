@@ -4454,17 +4454,23 @@ pub fn run() {
                                 .map(u64::from_le_bytes)
                                 .unwrap_or(0);
                             yarm_user_rt::user_log!(
-                                "PM_RESTART_REPLY_SEND_BEGIN request_id={} target_tid={}",
+                                "PM_RESTART_REPLY_SEND_BEGIN request_id={} target_tid={} opcode={} abi_opcode={} len={}",
                                 request_id,
-                                target_tid
+                                target_tid,
+                                0u16,
+                                PROC_OP_PM_RESTART_REPLY_V1,
+                                reply.as_slice().len()
                             );
                             // SAFETY: kernel validates reply capability rights/object.
                             let sent = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
                             if sent.is_ok() {
                                 yarm_user_rt::user_log!(
-                                    "PM_RESTART_REPLY_SEND_OK request_id={} target_tid={}",
+                                    "PM_RESTART_REPLY_SEND_OK request_id={} target_tid={} opcode={} abi_opcode={} len={}",
                                     request_id,
-                                    target_tid
+                                    target_tid,
+                                    0u16,
+                                    PROC_OP_PM_RESTART_REPLY_V1,
+                                    reply.as_slice().len()
                                 );
                             }
                         } else {

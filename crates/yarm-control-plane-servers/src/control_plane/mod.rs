@@ -2745,8 +2745,11 @@ mod tests {
             "SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN",
             "ipc_recv_v2(rep_cap)",
             "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_CAP_OPCODE",
             "PROC_OP_PM_RESTART_REPLY_V1",
             "PM_RESTART_REPLY_V1_LEN",
+            "SUPERVISOR_PM_RESTART_REPLY_SHAPE_OK",
+            "SUPERVISOR_PM_RESTART_REPLY_SHAPE_FAIL",
             "decode_pm_restart_reply_v1(reply_msg.as_slice())",
             "SUPERVISOR_PM_RESTART_REPLY_DECODE_OK",
             "SUPERVISOR_PM_RESTART_REPLY_DECODE_FAIL reason=shape",
@@ -2754,10 +2757,22 @@ mod tests {
             "reply.target_tid != client_request.target_tid",
             "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
             "SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID",
+            "reply.replacement_handle_value != 0",
         ] {
             assert!(
                 pm_restart_client.contains(needle),
                 "SUP-L7A supervisor PM reply path missing {needle}"
+            );
+        }
+        for needle in &[
+            "PM_RESTART_REPLY_SEND_BEGIN request_id={} target_tid={} opcode={} abi_opcode={} len={}",
+            "PM_RESTART_REPLY_SEND_OK request_id={} target_tid={} opcode={} abi_opcode={} len={}",
+            "PROC_OP_PM_RESTART_REPLY_V1",
+            "reply.as_slice().len()",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L7B PM reply send shape marker/source missing {needle}"
             );
         }
         let due_restart_start = supervisor_src

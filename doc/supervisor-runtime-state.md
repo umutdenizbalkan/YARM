@@ -562,3 +562,44 @@ non-authorizing. No kernel, syscall ABI, arch, RPi5, driver-manager DRS, or PM
 restart codec layout changes; `PROC_OP_PM_RESTART_V1 = 15`,
 `PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
 `SYSCALL_COUNT = 31`, and request/reply lengths 110/50 remain frozen.
+
+## SUP-L7B — PM restart reply wire-shape convention
+
+User-local QEMU after SUP-L7A proved reply delivery reached the supervisor:
+`SUPERVISOR_PM_RESTART_REPLY_RECV tid=10008 request_id=1` appeared after
+`PM_RESTART_REPLY_SEND_OK request_id=1 target_tid=10008`. The next blocker was
+reply shape validation: the supervisor received `opcode=0 len=50`, rejected the
+message before codec decode, and therefore did not emit
+`SUPERVISOR_PM_RESTART_REPLY_DECODE_OK`, `SUPERVISOR_PM_RESTART_REPLY_ACCEPTED`,
+or `SUPERVISOR_PM_RESTART_STATE_UPDATED`.
+
+SUP-L7B audits this as a userspace reply-cap wire convention, not a PM codec
+length bug. `ProcessService::pm_restart_reply_with_handle` builds a message with
+`PROC_OP_PM_RESTART_REPLY_V1` and a 50-byte payload, but the existing
+`ipc_reply` syscall wrapper passes only the payload pointer/length and transfer
+cap to the kernel. The kernel `handle_ipc_reply` reconstructs no-cap replies with
+`Message::new(...)`, so reply-cap deliveries have IPC opcode `0` while preserving
+the exact 50-byte PM restart reply payload. Changing that would be a syscall IPC
+ABI semantic change, which SUP-L7B does not do.
+
+Therefore the strict supervisor shape rule is: reply-cap IPC opcode `0`, ABI
+opcode `PROC_OP_PM_RESTART_REPLY_V1 = 16` as the decoded payload type, and
+payload length `PM_RESTART_REPLY_V1_LEN = 50`. The supervisor now emits
+`SUPERVISOR_PM_RESTART_REPLY_SHAPE_OK opcode=0 abi_opcode=16 len=50` for this
+valid reply-cap shape and still emits `SUPERVISOR_PM_RESTART_REPLY_SHAPE_FAIL`
+and `SUPERVISOR_PM_RESTART_REPLY_DECODE_FAIL reason=shape` for wrong opcode or
+wrong length. It then decodes the frozen 50-byte codec, rejects request_id or
+target_tid mismatch, rejects zero or non-task-TID replacement handles, records
+the replacement TID in the managed record, and emits
+`SUPERVISOR_PM_RESTART_STATE_UPDATED tid=<replacement> replacement_tid=<replacement> attempt=<n>`.
+
+`PM_RESTART_REPLY_ACCEPTED request_id=... target_tid=...` continues to mean PM
+accepted the restart operation and built an accepted reply. `PM_RESTART_REPLY_SEND_OK
+request_id=... target_tid=... opcode=0 abi_opcode=16 len=50` means the actual
+reply-cap IPC send completed using the established reply syscall convention.
+PM remains restart authority, the supervisor remains policy/state owner and does
+not locally spawn or restart, crash-test restart remains gated/narrow, and token
+query remains read-only/non-authorizing. No kernel, syscall ABI, arch, RPi5,
+driver-manager DRS, or PM restart codec layout changes; `PROC_OP_PM_RESTART_V1 =
+15`, `PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and request/reply lengths 110/50 remain frozen.
