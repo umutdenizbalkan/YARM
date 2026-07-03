@@ -946,8 +946,14 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         // the re-entry count into [rdi+132] for the BSP's lost/dup-wake grading.
         "mov al, 0x71", // 'q'
         "out dx, al",
+        // Publish sched-idle state BOTH into the low handoff stage word (boot-CR3
+        // trace) AND the per-CPU record via gs: (kernel .bss — the ONLY thing the
+        // post-boot admission polls: the low identity VAs are unmapped on the task
+        // address space the admission runs on; polling them page-faulted, #PF
+        // CR2=0x7170).
         "mov dword ptr [rdi + 48], 30",
-        "xor r9d, r9d", // last observed remote_wake_count
+        "mov dword ptr gs:[120], 30", // sched_stage mirror
+        "xor r9d, r9d",               // last observed remote_wake_count
         "75:",
         "sti",
         "hlt",
@@ -957,12 +963,16 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "je 75b", // hlt woke without a new remote wake -> re-idle
         "mov r9d, r8d",
         // 'z' / stage 31 (183.5): remote wake observed — publish the re-entry
-        // evidence, then return to the scheduler idle state.
+        // evidence (low trace + gs mirrors), then return to the scheduler idle
+        // state.
         "mov al, 0x7A", // 'z'
         "out dx, al",
         "mov dword ptr [rdi + 48], 31",
+        "mov dword ptr gs:[120], 31",   // sched_stage mirror
         "add dword ptr [rdi + 132], 1", // wake_reenter_out++
+        "add dword ptr gs:[124], 1",    // wake_reenter mirror++
         "mov dword ptr [rdi + 48], 30", // back to sched_idle
+        "mov dword ptr gs:[120], 30",   // sched_stage mirror
         "jmp 75b",
         "60:",
         // Env skipped (kernel_cr3 == 0 ⇒ no GDT/IDT prep): publish ready_word=3 and
@@ -1165,7 +1175,11 @@ pub(super) fn ap_esr_out_low_virt(handoff_off: usize) -> *const u32 {
 }
 
 /// Stage 183.5: low identity-mapped VA of the AP sched-idle wake re-entry count.
+/// Boot-CR3-only diagnostic alias; the post-boot admission polls the per-CPU
+/// record MIRROR instead (the low identity VAs are unmapped on task address
+/// spaces — the 183.5 #PF CR2=0x7170 root cause).
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
+#[allow(dead_code)]
 pub(super) fn ap_wake_reenter_low_virt(handoff_off: usize) -> *const u32 {
     (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_WAKE_REENTER_OFFSET) as *const u32
 }

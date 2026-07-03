@@ -6964,6 +6964,28 @@ unproven-and-gated for 183.6:
   stays gated on the smoke verdict — with the smoke failing, the run correctly
   refused `bring_up_cpu`/online>1. Guarded by
   `stage183_inc5_fix_persistent_smoke_ack`.
+- **183.5 host failure #2 ROOT CAUSE + fix (kernel `#PF CR2=0x7170`,
+  `RIP ∈ ap_scheduler_online_admission`, right after `X86_AP_SCHED_ONLINE_OK`).**
+  Symbolization pinned the crash to the sched-idle stage poll: `rdx = 0x140`
+  (= `handoff_off`) with displacement `0x7030` = `0x7000 + handoff_off + 0x30` —
+  exactly `ap_stage_word_low_virt(handoff_off)`, the LOW identity-mapped
+  trampoline VA. That alias is mapped only under the boot CR3; the admission
+  runs post-graduated-proof inside a trap on the CURRENT TASK address space,
+  where low `0x7000` is unmapped → deterministic page fault at the first low-VA
+  read. (All earlier polls of the same VAs ran at boot time on the boot CR3 —
+  which is why 183.1–183.4 never tripped this.) Fix: the AP now MIRRORS its
+  sched-idle stage (`gs:[120]` → `PerCpuRecord.sched_stage`) and wake-reenter
+  count (`gs:[124]` → `wake_reenter_mirror`) into the per-CPU record — kernel
+  `.bss`, mapped on every address space — and the admission polls ONLY those
+  mirrors. Before any poll it validates the pointer against the LIVE CR3
+  (high-half + `debug_root_maps_virt`) and emits
+  `X86_AP_SCHED_IDLE_POLL_PTR_OK cpu=N ptr=0x…` (or `…_PTR_BAD cpu=N ptr=0x…
+  reason=low_or_unmapped` and skips, instead of faulting; PTR_BAD forbidden in
+  smoke). The low-VA readers remain boot-CR3-only diagnostics. The persistent
+  smoke-ACK path (fix #1) is untouched and host-proven
+  (`X86_AP_INTERRUPT_SMOKE_OK` observed). Guarded by the extended
+  `stage183_inc5_ap_scheduler_online_and_remote_wake` (admission body must
+  contain no low-virt reader calls).
 - **Retired-ASID safety under `online = N` (found by audit, fixed pre-host):**
   `destroy_user_address_space_by_asid` retired ASIDs pending on the FULL
   `online_cpu_bitmap()`, but nothing drains a wake-only AP's cross-CPU work queue
