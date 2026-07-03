@@ -764,3 +764,11 @@ lineage-update, kernel, syscall ABI, arch, RPi5, driver-manager DRS, or PM
 restart codec layout changes. `PROC_OP_PM_RESTART_V1 = 15`,
 `PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
 `SYSCALL_COUNT = 31`, and PM restart request/reply lengths 110/50 remain frozen.
+
+## SUP-L7E — bounded replay for fault-before-registration startup race
+
+SUP-L7D made the supervisor fault endpoint fair by draining queued fault reports before long control waits. User-local QEMU then exposed a startup ordering race rather than a kernel fault-bind or PM replacement issue: the initial crash-test service fault for `tid=10008` was delivered and drained before the supervisor had processed the control registration that creates the managed record, producing `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` followed by `SUPERVISOR_FAULT_LOOKUP_FAIL fault_tid=10008 reason=unmanaged`.
+
+SUP-L7E keeps the SUP-L7D drain path and fixes the race with bounded pending-fault replay. A fault report whose sender is valid but whose task is not yet in the managed table is stashed in a fixed-size pending-fault list with `SUPERVISOR_FAULT_PENDING_STASH tid=... reason=record_not_ready`. When the corresponding control/lifecycle registration creates the managed record (`SUPERVISOR_MANAGED_RECORD_REGISTER_OK` and, for the crash-test service, `SUPERVISOR_CRASH_TEST_RECORD_READY`), the supervisor replays the pending fault through the same normal handler path (`SUPERVISOR_FAULT_PENDING_REPLAY_BEGIN` / `SUPERVISOR_FAULT_PENDING_REPLAY_OK`). The replay then performs the ordinary lookup, token handling, `handle_task_exit`, attempt accounting, and `SUPERVISOR_RESTART_SCHEDULED` emission.
+
+The pending list is intentionally bounded and grants no authority by itself: arbitrary unknown tasks are not accepted as supervised, are never scheduled solely because a pending fault exists, and are dropped fail-closed on overflow or after the bounded stale-fault age if no matching managed record is registered. PM remains the only restart execution authority; the supervisor remains the policy/state owner and still does not locally spawn replacement tasks. SUP-L7E does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM restart opcodes, or the frozen PM restart request/reply codec lengths.
