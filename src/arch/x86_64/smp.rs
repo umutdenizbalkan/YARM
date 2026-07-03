@@ -1409,7 +1409,6 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
     #[cfg(all(not(test), not(feature = "hosted-dev")))]
     {
         use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
-        use super::smp_trampoline::{ap_stage_word_low_virt, ap_wake_reenter_low_virt};
 
         for raw_cpu in 0..crate::arch::platform_constants::MAX_CPUS {
             let cpu = CpuId(raw_cpu as u8);
@@ -1423,6 +1422,34 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
             if handoff_off == usize::MAX {
                 continue;
             }
+
+            // 183.5 fix #2 (#PF CR2=0x7170): this admission runs post-boot on the
+            // CURRENT TASK address space, where the low identity trampoline VAs
+            // (0x7000 + handoff_off + …) are UNMAPPED — polling them page-faulted.
+            // All polling below therefore uses ONLY the per-CPU record (kernel
+            // .bss; the AP mirrors sched_stage / wake_reenter into it via gs:),
+            // and the poll pointer is validated against the LIVE CR3 first —
+            // reject low/unmapped pointers with a marker instead of faulting.
+            let poll_ptr = super::percpu::record_base(cpu) as u64;
+            let live_root = current_cr3() & !0xfffu64;
+            let poll_ptr_ok = poll_ptr >= crate::arch::platform_layout::KERNEL_BOOTSTRAP_VIRT_BASE
+                && crate::arch::x86_64::page_table::debug_root_maps_virt(
+                    live_root,
+                    crate::kernel::vm::VirtAddr(poll_ptr),
+                );
+            if !poll_ptr_ok {
+                crate::yarm_log!(
+                    "X86_AP_SCHED_IDLE_POLL_PTR_BAD cpu={} ptr=0x{:x} reason=low_or_unmapped",
+                    cpu.0,
+                    poll_ptr
+                );
+                continue;
+            }
+            crate::yarm_log!(
+                "X86_AP_SCHED_IDLE_POLL_PTR_OK cpu={} ptr=0x{:x}",
+                cpu.0,
+                poll_ptr
+            );
 
             // 1. Scheduler-owned idle task (represents the AP's live managed
             //    idle loop; nothing is enqueued — idle is the current).
@@ -1475,11 +1502,13 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
             crate::yarm_log!("X86_AP_IDLE_TASK_ACTIVE cpu={} tid={}", cpu.0, idle_tid);
             crate::yarm_log!("X86_AP_SCHED_ONLINE_OK cpu={}", cpu.0);
 
-            // 3. The AP must be in the managed scheduler-idle loop (stage 30/31).
+            // 3. The AP must be in the managed scheduler-idle loop — polled from
+            //    the gs:-mirrored sched_stage in the per-CPU record (mapped .bss),
+            //    NEVER the low trampoline VAs (unmapped on this address space).
             let mut sched_idle = false;
             for _ in 0..AP_READY_POLL_ITERS {
-                let s = unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
-                if s == 30 || s == 31 {
+                let stage = super::percpu::read_record(cpu).sched_stage;
+                if stage == 30 || stage == 31 {
                     sched_idle = true;
                     break;
                 }
@@ -1487,8 +1516,9 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
             }
             if !sched_idle {
                 crate::yarm_log!(
-                    "X86_AP_SCHED_IDLE_BAD cpu={} reason=sched_idle_not_reached",
-                    cpu.0
+                    "X86_AP_SCHED_IDLE_BAD cpu={} reason=sched_idle_not_reached sched_stage={}",
+                    cpu.0,
+                    super::percpu::read_record(cpu).sched_stage
                 );
                 continue;
             }
@@ -1496,7 +1526,7 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
 
             // 4. Remote-wake proof: exactly one wake, observed, re-idled.
             let wake_before = super::percpu::read_record(cpu).remote_wake_count;
-            let reenter_before = unsafe { read_volatile(ap_wake_reenter_low_virt(handoff_off)) };
+            let reenter_before = super::percpu::read_record(cpu).wake_reenter_mirror;
             wait_for_icr_idle(cpu.0, "before_remote_wake");
             crate::yarm_log!(
                 "X86_IPI_REMOTE_WAKE_SEND from=0 to={} vector=0x{:x}",
@@ -1521,9 +1551,8 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
 
             let mut reentered = false;
             for _ in 0..AP_READY_POLL_ITERS {
-                let reenter = unsafe { read_volatile(ap_wake_reenter_low_virt(handoff_off)) };
-                let s = unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
-                if reenter > reenter_before && s == 30 {
+                let r = super::percpu::read_record(cpu);
+                if r.wake_reenter_mirror > reenter_before && r.sched_stage == 30 {
                     reentered = true;
                     break;
                 }
@@ -1542,8 +1571,9 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
             // Settle, then require EXACTLY one wake (no dup) and coherent
             // idle-current state (no stale current task).
             spin_delay(200_000);
-            let wake_after = super::percpu::read_record(cpu).remote_wake_count;
-            let reenter_after = unsafe { read_volatile(ap_wake_reenter_low_virt(handoff_off)) };
+            let settle_record = super::percpu::read_record(cpu);
+            let wake_after = settle_record.remote_wake_count;
+            let reenter_after = settle_record.wake_reenter_mirror;
             let current_ok = kernel.current_tid_on_cpu(cpu) == Some(idle_tid);
             if wake_after - wake_before > 1 {
                 crate::yarm_log!(

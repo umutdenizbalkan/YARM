@@ -61,6 +61,13 @@ pub const REMOTE_WAKE_COUNT_OFFSET: usize = 108;
 /// transient stage — so serial-logging latency can no longer lose the race.
 pub const IRQ_STAGE_OFFSET: usize = 112;
 pub const IRQ_ACK_OFFSET: usize = 116;
+/// Stage 183.5 fix #2 (#PF at 0x7170): the admission phase runs on the current
+/// TASK address space where the low identity trampoline VAs are unmapped — the
+/// AP therefore MIRRORS its sched-idle stage and wake-reenter count into the
+/// per-CPU record (kernel .bss, always mapped) via gs:, and the BSP polls ONLY
+/// these mirrors post-boot.
+pub const SCHED_STAGE_OFFSET: usize = 120;
+pub const WAKE_REENTER_MIRROR_OFFSET: usize = 124;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -89,7 +96,8 @@ pub const IRQ_ACK_OFFSET: usize = 116;
 /// - `108`: remote_wake_count u32 (AP wake stub, vector 0xF1: gs:[108] += 1)
 /// - `112`: irq_stage        u32 (smoke handler sub-stage: enter/EOI/iret)
 /// - `116`: irq_ack          u32 (persistent post-resume ACK; 1 = resumed+acked)
-/// - `120`: _pad_irq_tail    [u32; 2]
+/// - `120`: sched_stage      u32 (AP mirror of the sched-idle stage 30/31 via gs:)
+/// - `124`: wake_reenter_mirror u32 (AP mirror of wake_reenter_out via gs:)
 ///
 /// Explicit-field bytes = 128 == struct stride (64-byte aligned).
 #[repr(C, align(64))]
@@ -118,7 +126,8 @@ pub struct PerCpuRecord {
     pub remote_wake_count: u32,
     pub irq_stage: u32,
     pub irq_ack: u32,
-    _pad_irq_tail: [u32; 2],
+    pub sched_stage: u32,
+    pub wake_reenter_mirror: u32,
 }
 
 impl PerCpuRecord {
@@ -149,7 +158,8 @@ impl PerCpuRecord {
             remote_wake_count: 0,
             irq_stage: 0,
             irq_ack: 0,
-            _pad_irq_tail: [0; 2],
+            sched_stage: 0,
+            wake_reenter_mirror: 0,
         }
     }
 }
@@ -166,6 +176,8 @@ const _: () = {
     assert!(core::mem::offset_of!(PerCpuRecord, remote_wake_count) == REMOTE_WAKE_COUNT_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, irq_stage) == IRQ_STAGE_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, irq_ack) == IRQ_ACK_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, sched_stage) == SCHED_STAGE_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, wake_reenter_mirror) == WAKE_REENTER_MIRROR_OFFSET);
     assert!(core::mem::size_of::<PerCpuRecord>() == 128);
 };
 
@@ -220,7 +232,8 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             remote_wake_count: 0,
             irq_stage: 0,
             irq_ack: 0,
-            _pad_irq_tail: [0; 2],
+            sched_stage: 0,
+            wake_reenter_mirror: 0,
         };
         core::ptr::write_volatile(base, record);
     }

@@ -52984,6 +52984,39 @@ mod stage183_ap_idle_admit {
                 && SMOKE_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
             "smoke must require the wake proof + forbid the 183.5 failure markers"
         );
+        // 183.5 fix #3 (#PF CR2=0x7170): the post-boot admission runs on the CURRENT
+        // task address space where the low identity trampoline VAs are unmapped —
+        // it must poll ONLY the per-CPU record mirrors (gs:-written sched_stage /
+        // wake_reenter_mirror, kernel .bss) with the poll pointer validated against
+        // the LIVE CR3 first (PTR_OK/PTR_BAD markers instead of a page fault).
+        const PERCPU2_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        assert!(
+            PERCPU2_SRC.contains("SCHED_STAGE_OFFSET: usize = 120")
+                && PERCPU2_SRC.contains("WAKE_REENTER_MIRROR_OFFSET: usize = 124")
+                && TRAMP_SRC.contains("mov dword ptr gs:[120], 30")
+                && TRAMP_SRC.contains("mov dword ptr gs:[120], 31")
+                && TRAMP_SRC.contains("add dword ptr gs:[124], 1"),
+            "the AP must mirror sched_stage/wake_reenter into the per-CPU record"
+        );
+        assert!(
+            SMP_SRC.contains("X86_AP_SCHED_IDLE_POLL_PTR_OK")
+                && SMP_SRC.contains("X86_AP_SCHED_IDLE_POLL_PTR_BAD")
+                && SMP_SRC.contains("reason=low_or_unmapped"),
+            "the admission must validate + marker-prove the poll pointer"
+        );
+        // The admission must NOT touch the low identity trampoline VAs: no
+        // low-virt reader calls inside ap_scheduler_online_admission.
+        let admission_body = &SMP_SRC[SMP_SRC
+            .find("fn ap_scheduler_online_admission")
+            .expect("admission fn")..];
+        assert!(
+            !admission_body.contains("ap_stage_word_low_virt")
+                && !admission_body.contains("ap_wake_reenter_low_virt")
+                && admission_body.contains(".sched_stage")
+                && admission_body.contains(".wake_reenter_mirror"),
+            "the admission must poll record mirrors, never low trampoline VAs"
+        );
+
         // Retired-ASID safety under online=N: wake-only APs are excluded from BOTH
         // shootdown-target computations (they run no dispatcher, never load a user
         // CR3, never touch user VAs — no user-ASID translations to invalidate, and
