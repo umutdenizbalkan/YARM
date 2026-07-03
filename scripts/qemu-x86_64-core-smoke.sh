@@ -1911,7 +1911,12 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_SMP_ONLINE_ACCOUNTING_BAD" \
     "X86_AP_GS_BAD" \
     "X86_AP_IDLE_FAIL" \
-    "X86_AP_SCHED_ADMIT_FAIL"; do
+    "X86_AP_SCHED_ADMIT_FAIL" \
+    "X86_AP_KERNEL_CR3_FAIL" \
+    "X86_AP_TSS_BAD" \
+    "X86_AP_LAPIC_BAD" \
+    "X86_AP_IDLE_CONTEXT_BAD" \
+    "X86_AP_SCHED_PREREQ_INCOMPLETE"; do
     if log_has_pattern "$f"; then
       echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
       exit 1
@@ -1920,13 +1925,27 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
   # Stage 183 increment 2: AP idle admission. The APs must leave the bare park loop and
   # reach the GS-initialized, interrupt-masked idle loop. Require the admission markers +
   # the GS-verified idle-live verdict (interrupt-masked, NOT scheduler-runnable yet).
+  # Stage 183 increment 3: scheduler-admission PREREQUISITES — the APs must additionally
+  # prove kernel CR3 live (.bss canary), per-AP GDT/TSS loaded (busy-bit readback), LAPIC
+  # access (ID readback match), timer explicitly deferred (no AP IDT yet), and the idle
+  # task metadata/context (recorded + live-rsp validated; nothing enqueued).
   for m in \
     "X86_AP_SCHED_ADMIT_BEGIN" \
     "X86_AP_GS_OK" \
+    "X86_AP_KERNEL_CR3_BEGIN" \
+    "X86_AP_KERNEL_CR3_OK" \
+    "X86_AP_GDT_LOCAL_OK" \
+    "X86_AP_TSS_OK" \
+    "X86_AP_LAPIC_OK" \
+    "X86_AP_LAPIC_TIMER_DEFERRED" \
+    "X86_AP_IDLE_TASK_READY" \
+    "X86_AP_IDLE_CONTEXT_OK" \
+    "X86_AP_SCHED_PREREQ_OK" \
     "X86_AP_IDLE_ENTER" \
-    "X86_AP_SCHED_ADMIT_DONE"; do
+    "X86_AP_SCHED_ADMIT_DONE" \
+    "X86_SMP_AP_ENV_READY"; do
     if ! log_has_pattern "$m"; then
-      echo "[error] SMP-LIVE: AP idle-admission marker missing: $m"
+      echo "[error] SMP-LIVE: AP admission/prereq marker missing: $m"
       exit 1
     fi
     echo "[ok] SMP-LIVE: AP admission marker present: $m"
@@ -1935,13 +1954,13 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     echo "[error] SMP-LIVE: expected X86_SMP_UNLOCK_DONE result=ap_idle_live (AP idle admission)"
     exit 1
   fi
-  # Scheduler admission (TSS/LAPIC/timer + online>1) is intentionally the NEXT increment:
-  # online must remain 1 (APs idle-live only, not scheduler-runnable).
+  # Scheduler admission (AP IDT + timer + runnable idle task + online>1) is intentionally
+  # the NEXT increment: online must remain 1 (APs idle-live + env-ready only).
   if log_has_pattern "X86_SMP_APS_ADMITTED"; then
     echo "[error] SMP-LIVE: APs must be idle-live only this increment, not scheduler-admitted"
     exit 1
   fi
-  echo "[ok] SMP-LIVE: APs reached GS-initialized idle admission; no fallback under -smp $QEMU_SMP"
+  echo "[ok] SMP-LIVE: APs idle-live + scheduler-admission prerequisites proven under -smp $QEMU_SMP"
 fi
 
 if log_has_pattern "YARM_BOOT_OK"; then

@@ -4752,7 +4752,7 @@ audit; nothing else in the repo should restate it.
 | Arch | Smoke | Status | Notes |
 |------|-------|--------|-------|
 | x86_64 | `QEMU_SMP=1 ./scripts/qemu-x86_64-core-smoke.sh` | **PASS** | all 6 service entries exactly once; boot markers detected. Core smoke stays `-smp 1` until the AP per-CPU environment exists and an SMP smoke is genuinely accepted (no fake SMP acceptance). |
-| x86_64 | AP Rust online / park status | scaffolded | per-CPU env scaffold + GS deferred (`X86_AP_GS_DEFERRED reason=ap_entry_is_asm_only_no_msr_write_yet`); APs reach env-ready but do not join the scheduler. |
+| x86_64 | AP Rust online / park status | scaffolded (superseded by Stage 183: idle-live + env-ready; GS/CR3/GDT/TSS/LAPIC proven by the AP, graded by the admit poll) | per-CPU env scaffold; APs reach env-ready but do not join the scheduler. |
 | x86_64 | AP scheduler participation | **off** | gated on AP per-CPU GDT/IDT/TSS + GS base + AP-safe printk + `bring_up_cpu(cpu)`. |
 | x86_64 | `QEMU_SMOKE_STRICT=1 ./scripts/qemu-x86_64-optional-fs-smoke.sh` | **PASS** | wrong-sender count=0. |
 | AArch64 | `./scripts/qemu-aarch64-core-smoke.sh` | **PASS** | core service chain reaches steady-state idle. |
@@ -6720,6 +6720,68 @@ built ELF's disassembly:
    before `jmp rax`, so even a broken register handoff or bad jump target can never
    again stop the trace silently after `@` — the BSP timeout would name
    `last_stage=rust_jump`. Guarded by `stage183_ap_entry_naked_abi_and_offset_fix`.
+
+**Increment 2 ACCEPTED (user QEMU, 2026).** `smp2-core`: `X86_AP_GS_OK cpu=1`,
+`X86_AP_IDLE_ENTER cpu=1`, `X86_AP_SCHED_ADMIT_DONE cpu=1`, `X86_SMP_AP_IDLE_LIVE
+present=2 online=1 ap_idle_live=1`, `X86_SMP_UNLOCK_DONE result=ap_idle_live`.
+`smp4-core`: same per cpu=1/2/3 with `present=4 online=1 ap_idle_live=3`. No
+`X86_AP_GS_BAD` / `X86_AP_SCHED_ADMIT_FAIL` / `X86_AP_IDLE_FAIL` /
+`X86_SMP_ONLINE_ACCOUNTING_BAD` / fallback / emergency_optout.
+
+**Increment 3 — AP scheduler-admission PREREQUISITES (per-CPU runtime env, still
+idle-only).** Moves from "idle-live with interrupts masked" toward "enough per-CPU
+runtime environment to become scheduler-online later". All AP-side steps stay in the
+naked entry asm (no AP Rust calls — the target has no SSE-disabling features, so
+compiled Rust remains unsafe on the AP's PAE-only CR4); each publishes a breadcrumb +
+stage word, results are AP-written into the handoff/per-CPU record and GRADED by the
+BSP (single serial writer):
+
+- **Kernel CR3 (controlled transition):** the BSP passes `ApHandoff.kernel_cr3` (the
+  same full kernel root the BSP runs on — it maps kernel text, low identity, `.bss`,
+  LAPIC MMIO); the AP reloads CR3 (`'K'/19 → 'k'/20`), then proves the space live by
+  storing the `AP_ENV_CANARY` (0x0183C0DE) into its per-CPU record **via gs:** (higher-
+  half `.bss` write + GS-relative addressing in one instruction). Markers:
+  `X86_AP_KERNEL_CR3_BEGIN/OK/FAIL cpu=<id> [reason=reload_flag_missing|
+  bss_canary_missing]`. Prepare-time `YARM_SMP_AP_ENV_MAP_CHECK` walk-checks the
+  per-CPU/GDT/TSS/LAPIC VAs under that root and refuses SIPI if the `.bss` VAs are
+  unmapped (the AP would triple-fault).
+- **Per-AP GDT/TSS:** `descriptor_tables::prepare_ap_descriptor_tables` builds one GDT +
+  one TSS per CPU in `.bss` — BOOT_GDT selector layout (0x08 kernel code / 0x10 kernel
+  data / 0x28 TSS) so the AP CONVERGES on the production kernel selectors; TSS `rsp0` =
+  the AP's own stack top; ISTs stay 0 (only consumed via IDT gates — the AP IDT
+  increment wires real per-AP IST stacks before any interrupt can fire). The AP does
+  `lgdt [rdi+64]` (GDTR image in the handoff), reloads SS/DS/ES=0x10, far-returns to
+  CS=0x08 (`'D'/21`), then `ltr 0x28` (`'T'/22`). The BSP grades via the AP-set env
+  flags AND the **TSS BUSY bit ltr wrote into that AP's GDT** (read back from `.bss`).
+  Markers: `X86_AP_GDT_LOCAL_OK`, `X86_AP_TSS_OK cpu=<id> rsp0=… busy=1` /
+  `X86_AP_TSS_BAD reason=gdt_not_loaded|ltr_flag_missing|busy_bit_not_set`.
+- **LAPIC access:** the AP reads ITS OWN LAPIC ID register (`[lapic_id_reg_va]`, VA
+  passed after the map check; 0 ⇒ skip) under the kernel CR3 (`'l'/23`) and publishes
+  the id; the BSP compares with the cpu's APIC id. Markers: `X86_AP_LAPIC_OK cpu=<id>
+  apic_id=<n>` / `X86_AP_LAPIC_BAD reason=read_skipped_or_unmapped|id_mismatch`.
+- **AP timer policy: DEFERRED** — `X86_AP_LAPIC_TIMER_DEFERRED cpu=<id>
+  reason=no_ap_idt_interrupts_masked` (a timer before the AP IDT exists would
+  triple-fault on the first tick; interrupts stay masked).
+- **Idle task/context:** BSP records idle METADATA (entry/stack/CR3 +
+  `IDLE_TASK_META_SET`) in the per-CPU record before SIPI — a reserved, validated
+  description, NOT an enqueued task; the AP publishes its live idle `rsp` via gs:
+  (`'y'/24`), validated against the stack bounds. Markers: `X86_AP_IDLE_TASK_READY
+  cpu=<id> entry=… stack=… enqueued=0`, `X86_AP_IDLE_CONTEXT_OK cpu=<id> rsp=…` (or
+  `X86_AP_IDLE_CONTEXT_BAD`).
+- **Conservative counts:** all prerequisites proven ⇒ `X86_AP_SCHED_PREREQ_OK` +
+  `ap_env_ready` (a SEPARATE `AP_ENV_READY_COUNT`, between `ap_idle_live` and the
+  future `scheduler_online`). `online_cpu_count()` STAYS 1 — `bring_up_cpu` is never
+  called for APs, `single_cpu` stays true, no D2/D6 SMP seams. The audit adds
+  `X86_SMP_AP_ENV_READY present=N online=1 ap_idle_live=M ap_env_ready=K` and appends
+  `ap_env_ready=K` to `X86_SMP_UNLOCK_DONE result=ap_idle_live …`.
+- Record-init race fix: `init_record_for_ap` + idle metadata + TSS pointer moved to
+  `prepare_trampoline_for_cpu` (BEFORE SIPI); `emit_ap_percpu_scaffold` is now
+  read-only (the AP concurrently writes canary/rsp into the same record via gs:).
+  ApHandoff grew 56→96 bytes (`.zero 96` + compile-time `offset_of!` guard). Smoke
+  requires the new OK/DEFERRED markers and forbids `X86_AP_KERNEL_CR3_FAIL` /
+  `X86_AP_TSS_BAD` / `X86_AP_LAPIC_BAD` / `X86_AP_IDLE_CONTEXT_BAD` /
+  `X86_AP_SCHED_PREREQ_INCOMPLETE`. Guarded by `stage183_inc3_ap_env_prereqs`.
+  Acceptance: `scripts/run-ci-profiles.sh smp2-core` + `smp4-core`.
 
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 

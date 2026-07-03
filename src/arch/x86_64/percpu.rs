@@ -28,6 +28,25 @@ pub mod flag {
     pub const GS_BASE_WRITTEN: u32 = 1 << 1;
 }
 
+/// Flags carried inside `PerCpuRecord.idle_flags` (Stage 183 inc.3).
+pub mod idle_flag {
+    /// BSP populated `idle_entry`/`idle_stack_top`/`idle_cr3` before SIPI. This is
+    /// idle-task METADATA (a reserved, validated description of the AP idle context) —
+    /// NOT a scheduler task; nothing is enqueued.
+    pub const IDLE_TASK_META_SET: u32 = 1 << 0;
+}
+
+/// Value the AP stores into `PerCpuRecord.env_canary` (via a `gs:`-relative write)
+/// after loading the kernel CR3 — proves higher-half `.bss` is writable on the AP
+/// under the kernel address space AND that GS-relative addressing works ('183' pun
+/// intended). Checked BSP-side for the `X86_AP_KERNEL_CR3_OK` verdict.
+pub const AP_ENV_CANARY: u32 = 0x0183_C0DE;
+
+/// Byte offsets of the AP-written per-CPU fields, hardcoded in the AP entry asm's
+/// `gs:[..]` stores (GS base == this record). Locked by tests below.
+pub const ENV_CANARY_OFFSET: usize = 48;
+pub const SAVED_RSP_OFFSET: usize = 56;
+
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
 ///
@@ -38,10 +57,18 @@ pub mod flag {
 /// - `8`  : stack_top       u64
 /// - `16` : flags           u32
 /// - `20` : _pad_flags      u32
-/// - `24` : tss_ptr         u64  (reserved for future per-CPU TSS)
+/// - `24` : tss_ptr         u64  (Stage 183 inc.3: VA of this AP's X86TaskStateSegment)
 /// - `32` : idt_ptr         u64  (reserved for future per-CPU IDT)
 /// - `40` : scheduler_ptr   u64  (reserved for future per-CPU scheduler bridge)
-/// - `48` : _reserved_tail  [u64; 8]
+/// - `48` : env_canary      u32  (AP-written via gs:[48] after kernel-CR3 load)
+/// - `52` : _pad_canary     u32
+/// - `56` : saved_rsp       u64  (AP-written via gs:[56]; live idle-loop rsp)
+/// - `64` : idle_entry      u64  (BSP: idle "task" metadata — entry VA, not enqueued)
+/// - `72` : idle_stack_top  u64  (BSP: idle metadata — the AP's stack top)
+/// - `80` : idle_cr3        u64  (BSP: idle metadata — kernel CR3 the AP idles on)
+/// - `88` : idle_flags      u32  (see `idle_flag`)
+/// - `92` : _pad_idle       u32
+/// - `96` : _reserved_tail  [u64; 2]
 ///
 /// Explicit-field bytes = 112; struct stride = 128 (padded to the 64-byte
 /// alignment so the slot table strides cleanly).
@@ -57,7 +84,15 @@ pub struct PerCpuRecord {
     pub tss_ptr: u64,
     pub idt_ptr: u64,
     pub scheduler_ptr: u64,
-    _reserved_tail: [u64; 8],
+    pub env_canary: u32,
+    _pad_canary: u32,
+    pub saved_rsp: u64,
+    pub idle_entry: u64,
+    pub idle_stack_top: u64,
+    pub idle_cr3: u64,
+    pub idle_flags: u32,
+    _pad_idle: u32,
+    _reserved_tail: [u64; 2],
 }
 
 impl PerCpuRecord {
@@ -74,10 +109,27 @@ impl PerCpuRecord {
             tss_ptr: 0,
             idt_ptr: 0,
             scheduler_ptr: 0,
-            _reserved_tail: [0; 8],
+            env_canary: 0,
+            _pad_canary: 0,
+            saved_rsp: 0,
+            idle_entry: 0,
+            idle_stack_top: 0,
+            idle_cr3: 0,
+            idle_flags: 0,
+            _pad_idle: 0,
+            _reserved_tail: [0; 2],
         }
     }
 }
+
+// Stage 183 inc.3 layout guard: the AP entry asm writes `gs:[48]` (env_canary) and
+// `gs:[56]` (saved_rsp) with GS base == the record base; lock the offsets so a field
+// reorder can never silently move the asm's targets.
+const _: () = {
+    assert!(core::mem::offset_of!(PerCpuRecord, env_canary) == ENV_CANARY_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, saved_rsp) == SAVED_RSP_OFFSET);
+    assert!(core::mem::size_of::<PerCpuRecord>() == 128);
+};
 
 /// Per-CPU slot table. Lives in `.bss` (aligned to 4 KiB so the table is
 /// page-aligned for future LDGS / direct-map use). Index by logical CPU
@@ -116,8 +168,44 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             tss_ptr: 0,
             idt_ptr: 0,
             scheduler_ptr: 0,
-            _reserved_tail: [0; 8],
+            env_canary: 0,
+            _pad_canary: 0,
+            saved_rsp: 0,
+            idle_entry: 0,
+            idle_stack_top: 0,
+            idle_cr3: 0,
+            idle_flags: 0,
+            _pad_idle: 0,
+            _reserved_tail: [0; 2],
         };
+        core::ptr::write_volatile(base, record);
+    }
+}
+
+/// Stage 183 inc.3: BSP records the AP idle-task METADATA (entry / stack / CR3) and the
+/// per-CPU TSS pointer before SIPI. This is a reserved, validated description of the AP
+/// idle context — NOT a scheduler task; nothing is enqueued and the scheduler never
+/// selects an AP. MUST be called before the AP runs (the AP later writes `env_canary` /
+/// `saved_rsp` into the same record via gs:, so BSP writes may not race it afterwards).
+pub fn set_idle_task_meta(cpu: CpuId, idle_entry: u64, idle_stack_top: u64, idle_cr3: u64) {
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    unsafe {
+        let mut record = core::ptr::read_volatile(base);
+        record.idle_entry = idle_entry;
+        record.idle_stack_top = idle_stack_top;
+        record.idle_cr3 = idle_cr3;
+        record.idle_flags |= idle_flag::IDLE_TASK_META_SET;
+        core::ptr::write_volatile(base, record);
+    }
+}
+
+/// Stage 183 inc.3: BSP records the AP-local TSS VA in the per-CPU record.
+/// Same before-SIPI-only contract as `set_idle_task_meta`.
+pub fn set_tss_ptr(cpu: CpuId, tss_ptr: u64) {
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    unsafe {
+        let mut record = core::ptr::read_volatile(base);
+        record.tss_ptr = tss_ptr;
         core::ptr::write_volatile(base, record);
     }
 }
@@ -160,6 +248,40 @@ mod tests {
             core::ptr::addr_of!(record.scheduler_ptr) as usize - base,
             40
         );
+        // Stage 183 inc.3: offsets the AP entry asm writes via gs:[..] + idle metadata.
+        assert_eq!(core::ptr::addr_of!(record.env_canary) as usize - base, 48);
+        assert_eq!(core::ptr::addr_of!(record.saved_rsp) as usize - base, 56);
+        assert_eq!(core::ptr::addr_of!(record.idle_entry) as usize - base, 64);
+        assert_eq!(
+            core::ptr::addr_of!(record.idle_stack_top) as usize - base,
+            72
+        );
+        assert_eq!(core::ptr::addr_of!(record.idle_cr3) as usize - base, 80);
+        assert_eq!(core::ptr::addr_of!(record.idle_flags) as usize - base, 88);
+    }
+
+    #[test]
+    fn set_idle_task_meta_records_metadata_without_enqueue() {
+        init_record_for_ap(CpuId(5), 5, 0x1234_0000);
+        set_idle_task_meta(CpuId(5), 0xFFFF_FFFF_8000_0000, 0x1234_0000, 0x0010_0000);
+        set_tss_ptr(CpuId(5), 0xFFFF_FF80_0042_0000);
+        let record = read_record(CpuId(5));
+        assert_eq!(record.idle_entry, 0xFFFF_FFFF_8000_0000);
+        assert_eq!(record.idle_stack_top, 0x1234_0000);
+        assert_eq!(record.idle_cr3, 0x0010_0000);
+        assert_eq!(record.tss_ptr, 0xFFFF_FF80_0042_0000);
+        assert_eq!(
+            record.idle_flags & idle_flag::IDLE_TASK_META_SET,
+            idle_flag::IDLE_TASK_META_SET
+        );
+        // Metadata only: the record init flag is preserved and the AP-written
+        // fields stay zero until the AP itself publishes them.
+        assert_eq!(
+            record.flags & flag::RECORD_INITIALIZED,
+            flag::RECORD_INITIALIZED
+        );
+        assert_eq!(record.env_canary, 0);
+        assert_eq!(record.saved_rsp, 0);
     }
 
     #[test]

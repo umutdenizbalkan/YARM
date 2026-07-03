@@ -112,18 +112,23 @@ What ships (outcome A):
 - The BSP polling site emits the full marker sequence per AP:
   `X86_AP_INIT_SENT`, `X86_AP_STARTUP_SENT`,
   `X86_AP_TRAMPOLINE_REACHED`, `X86_AP_ENTER_RUST`, the per-CPU record +
-  GS scaffold (`X86_AP_PERCPU_BEGIN` .. `X86_AP_GS_DEFERRED
-  reason=ap_entry_is_asm_only_no_msr_write_yet` .. `X86_AP_PERCPU_READY`),
+  GS scaffold (`X86_AP_PERCPU_BEGIN` .. `X86_AP_GS_INIT_BY_AP
+  reason=wrmsr_in_ap_entry_graded_by_admit_poll` .. `X86_AP_PERCPU_READY`),
   the env scaffold (`X86_AP_ENV_BEGIN` .. `X86_AP_ENV_READY`),
   `X86_AP_GDT_TSS_READY`, `X86_AP_IDT_READY`,
-  `X86_AP_CPU_LOCAL_READY`, `X86_AP_ONLINE`, `X86_AP_RUST_PARK`, then
-  once `X86_SMP_STARTUP started_secondary=N online_cpus=1
-  present_cpus=M` and `X86_SMP_OBSERVATION_OK rust_aps=N
-  scheduler_aps=0`.
-  Note: `X86_AP_GS_READY` is intentionally never emitted — GS-base is
-  not yet written, and a "READY" marker for it would be fake. Only
-  `X86_AP_GS_DEFERRED` is emitted until a real WRMSR IA32_GS_BASE +
-  readback path lands.
+  `X86_AP_CPU_LOCAL_READY`, `X86_AP_ONLINE`, then the Stage 183 admit
+  poll (`X86_AP_SCHED_ADMIT_BEGIN`, `X86_AP_GS_OK`,
+  `X86_AP_KERNEL_CR3_OK`, `X86_AP_GDT_LOCAL_OK`, `X86_AP_TSS_OK`,
+  `X86_AP_LAPIC_OK`, `X86_AP_LAPIC_TIMER_DEFERRED`,
+  `X86_AP_IDLE_TASK_READY`, `X86_AP_IDLE_CONTEXT_OK`,
+  `X86_AP_SCHED_PREREQ_OK`, `X86_AP_IDLE_ENTER`,
+  `X86_AP_SCHED_ADMIT_DONE`), then once `X86_SMP_STARTUP
+  started_secondary=N online_cpus=1 present_cpus=M` and
+  `X86_SMP_OBSERVATION_OK rust_aps=N scheduler_aps=0`.
+  Note: since Stage 183 inc.2/3 the AP itself performs the
+  `WRMSR IA32_GS_BASE` + rdmsr readback (graded `X86_AP_GS_OK`/`_BAD`),
+  the kernel-CR3 reload, per-AP lgdt/ltr, and the LAPIC ID readback; the
+  BSP grades each from AP-written results — no fake "READY" markers.
 - The `yarm.x86_ap_rust=` knob (`kernel/boot_command_line.rs`) flips
   `arch::x86_64::smp::set_ap_rust_entry_enabled`; the knob emits
   `YARM_X86_AP_RUST_SET enabled=true|false`. `1`, `true`, `yes`, `on` →

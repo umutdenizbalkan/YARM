@@ -356,6 +356,13 @@ impl KernelState {
             let ap_idle_live = crate::arch::x86_64::smp::ap_idle_live_count();
             #[cfg(not(target_arch = "x86_64"))]
             let ap_idle_live = 0usize;
+            // Stage 183 inc.3: APs whose scheduler-admission PREREQUISITES (kernel CR3,
+            // per-AP GDT/TSS, LAPIC access, idle task metadata/context) are all proven.
+            // Intermediate count — env-ready APs are still NOT scheduler-runnable.
+            #[cfg(target_arch = "x86_64")]
+            let ap_env_ready = crate::arch::x86_64::smp::ap_env_ready_count();
+            #[cfg(not(target_arch = "x86_64"))]
+            let ap_env_ready = 0usize;
 
             // The graduated seams remain the ONLY x86_64 path on the live (BSP) CPU — no old
             // global-lock fallback is selected; the in-lock branch is simply unreached
@@ -373,15 +380,25 @@ impl KernelState {
                     online,
                     ap_idle_live
                 );
-                // Full scheduler admission (TSS/LAPIC/timer + online>1) is the next blocker.
+                // Increment-3 milestone: scheduler-admission prerequisites per AP.
+                crate::yarm_log!(
+                    "X86_SMP_AP_ENV_READY present={} online={} ap_idle_live={} ap_env_ready={}",
+                    present,
+                    online,
+                    ap_idle_live,
+                    ap_env_ready
+                );
+                // Full scheduler admission (AP IDT + timer + runnable idle task +
+                // online>1) is the next blocker; prerequisites are now proven.
                 crate::yarm_log!(
                     "X86_SMP_UNLOCK_BLOCKER category=B reason=ap_full_scheduler_admission_required"
                 );
                 crate::yarm_log!(
-                    "X86_SMP_UNLOCK_DONE result=ap_idle_live present={} online={} ap_idle_live={}",
+                    "X86_SMP_UNLOCK_DONE result=ap_idle_live present={} online={} ap_idle_live={} ap_env_ready={}",
                     present,
                     online,
-                    ap_idle_live
+                    ap_idle_live,
+                    ap_env_ready
                 );
             } else {
                 // APs present but still fully parked (increment-2 admit did not take).

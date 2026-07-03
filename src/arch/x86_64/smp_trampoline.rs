@@ -4,20 +4,22 @@
 //! x86_64 AP trampoline: 16/32/64-bit startup assembly + trampoline-page
 //! encoding, split from the Rust SMP bring-up logic in `smp.rs`.
 //!
-//! Stage 108 / Milestone 2 Pass 1 — the mechanical split required by
-//! `doc/AI_AGENT_RULES.md §5.2` before any x86_64 SMP smoke work. Zero
-//! behavior change: every item here is byte-identical to its pre-split form
-//! in `smp.rs`; only visibility (`pub(super)`) changed so `smp.rs` can keep
-//! calling it.
+//! Originally split out in Stage 108 / Milestone 2 Pass 1 per
+//! `doc/AI_AGENT_RULES.md §5.2`; `smp.rs` keeps the Rust bring-up logic and
+//! this file owns the trampoline asm + the naked AP entry.
 //!
-//! Current AP state machine (Stage SMP-1 proof, unchanged):
+//! Current AP state machine (Stage 183 increment 3):
 //! SIPI vector 0x07 -> real-mode entry at 0x7000 -> protected mode -> long
-//! mode -> load stack from the handoff block -> write `ready_word = 1` ->
-//! park in an assembly `cli; hlt` loop. The AP NEVER enters Rust
-//! (`yarm_x86_64_ap_entry` is retained as the future entry point only); it
-//! has no per-CPU IDT/TSS/GS/scheduler/log environment. That gap — not the
-//! file layout — is the remaining blocker for real x86_64 SMP scheduling
-//! (see doc/KERNEL_UNLOCKING.md).
+//! mode -> stack from the handoff -> ready_word=1 then 2 -> jmp into the
+//! NAKED Rust entry `yarm_x86_64_ap_entry` (`@` breadcrumb) -> GS base
+//! wrmsr + rdmsr verify -> kernel-CR3 reload + .bss canary -> per-AP
+//! lgdt + kernel CS/SS reload -> ltr (per-AP TSS) -> LAPIC ID readback ->
+//! idle-context publish -> ready_word=3 -> interrupt-masked cli/hlt IDLE.
+//! The AP has NO IDT and takes NO interrupts; it is NOT scheduler-runnable
+//! (`online_cpu_count()` stays 1). Every step publishes a breadcrumb byte +
+//! a low-memory stage word so a BSP admit-poll timeout names the exact
+//! failing transition (see the trace-map table below and
+//! doc/KERNEL_UNLOCKING.md Stage 183).
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 use core::arch::global_asm;
@@ -42,7 +44,14 @@ pub(super) const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 //   36 reserved:          u32
 //   40 percpu_record_ptr: u64   // Stage 183 inc.2: AP GS base (low identity handoff)
 //   48 ap_stage:          u32   // Stage 183 inc.2: fine-grained AP stage trace word
-//   52 <pad>:             u32   // struct is u64-aligned → size_of == 56
+//   52 <pad>:             u32
+//   56 kernel_cr3:        u64   // Stage 183 inc.3: full kernel CR3 for the controlled reload
+//   64 gdtr_image:        [u8;10] // inc.3: per-AP GDTR (limit u16 + base u64, LE) for lgdt
+//   74 <pad>:             [u8;6]
+//   80 lapic_id_reg_va:   u64   // inc.3: VA of the LAPIC ID register (0 = skip the read)
+//   88 env_flags:         u32   // inc.3: AP-written env-step bitmask (see AP_ENV_* bits)
+//   92 lapic_id_out:      u32   // inc.3: AP-written LAPIC ID readback (0xFFFF_FFFF = unread)
+//   → size_of == 96
 pub(super) const AP_HANDOFF_READY_WORD_OFFSET: usize = 32;
 
 // Stage 183 inc.2: the AP writes an incrementing stage code here (offset 48) before
@@ -50,6 +59,21 @@ pub(super) const AP_HANDOFF_READY_WORD_OFFSET: usize = 32;
 // reached (`last_stage`) instead of only "it didn't finish". Distinct from ready_word
 // (offset 32), which stays the coarse online(2)/admit(3)/gs_bad(254) signal.
 pub(super) const AP_HANDOFF_STAGE_WORD_OFFSET: usize = 48;
+
+// Stage 183 inc.3: AP-written env-step results (offsets hardcoded in the entry asm).
+pub(super) const AP_HANDOFF_ENV_FLAGS_OFFSET: usize = 88;
+pub(super) const AP_HANDOFF_LAPIC_ID_OUT_OFFSET: usize = 92;
+
+/// Stage 183 inc.3: bits the AP entry asm ORs into `env_flags` ([handoff+88], low
+/// identity memory — always writable) as each per-CPU environment step completes.
+/// The BSP admit-poll reads them to emit the per-step OK/FAIL markers.
+pub(super) mod ap_env {
+    pub const KERNEL_CR3_RELOADED: u32 = 1 << 0; // mov cr3 + post-reload fetch survived
+    pub const GDT_LOADED: u32 = 1 << 1; // lgdt + SS/DS/ES + far-return CS=0x08
+    pub const TSS_LOADED: u32 = 1 << 2; // ltr 0x28 (per-AP TSS)
+    pub const LAPIC_READ: u32 = 1 << 3; // LAPIC ID register MMIO read done
+    pub const IDLE_CTX_PUBLISHED: u32 = 1 << 4; // canary + live rsp stored via gs:
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -78,22 +102,42 @@ pub(super) struct ApHandoff {
 
     // Stage 183 increment 2 (AP idle admission): fine-grained stage trace. The AP entry
     // asm writes an `AP_STAGE_*` code here (offset 48) before every risky action so the
-    // BSP admit-poll can name the last stage the AP reached on timeout. u32 field; the
-    // struct is u64-aligned so `size_of::<ApHandoff>() == 56`.
+    // BSP admit-poll can name the last stage the AP reached on timeout.
     pub(super) ap_stage: u32,
+    pub(super) _pad_stage: u32,
+
+    // Stage 183 increment 3 (scheduler-admission prerequisites), all BSP-written unless
+    // noted. kernel_cr3: the full kernel CR3 the AP reloads (controlled transition; the
+    // kernel address space maps text + low identity + .bss + LAPIC MMIO — everything the
+    // BSP itself uses). gdtr_image: the 10-byte GDTR (limit LE16 + base LE64) of this
+    // AP's per-CPU GDT for `lgdt [rdi+64]`. lapic_id_reg_va: VA of the LAPIC ID register
+    // (0 ⇒ AP skips the MMIO read). env_flags / lapic_id_out: AP-written results.
+    pub(super) kernel_cr3: u64,
+    pub(super) gdtr_image: [u8; 10],
+    pub(super) _pad_gdtr: [u8; 6],
+    pub(super) lapic_id_reg_va: u64,
+    pub(super) env_flags: u32,
+    pub(super) lapic_id_out: u32,
 }
 
-// Stage 183 inc.2 layout guard: the trampoline / AP-entry asm hardcodes these field
-// offsets ([rdi+32], [rdi+40], [rdi+48]) and the `.zero 56` handoff reservation. Lock
-// the Rust struct to them at compile time so a field reorder can never silently make the
-// asm read/write the wrong slot.
+// Stage 183 inc.2/inc.3 layout guard: the trampoline / AP-entry asm hardcodes these
+// field offsets ([rdi+32/40/48/56/64/80/88/92]) and the `.zero 96` handoff reservation.
+// Lock the Rust struct to them at compile time so a field reorder can never silently
+// make the asm read/write the wrong slot.
 const _: () = {
-    assert!(core::mem::size_of::<ApHandoff>() == 56);
+    assert!(core::mem::size_of::<ApHandoff>() == 96);
     assert!(core::mem::offset_of!(ApHandoff, ready_word) == AP_HANDOFF_READY_WORD_OFFSET);
     assert!(core::mem::offset_of!(ApHandoff, ready_word) == 32);
     assert!(core::mem::offset_of!(ApHandoff, percpu_record_ptr) == 40);
     assert!(core::mem::offset_of!(ApHandoff, ap_stage) == AP_HANDOFF_STAGE_WORD_OFFSET);
     assert!(core::mem::offset_of!(ApHandoff, ap_stage) == 48);
+    assert!(core::mem::offset_of!(ApHandoff, kernel_cr3) == 56);
+    assert!(core::mem::offset_of!(ApHandoff, gdtr_image) == 64);
+    assert!(core::mem::offset_of!(ApHandoff, lapic_id_reg_va) == 80);
+    assert!(core::mem::offset_of!(ApHandoff, env_flags) == AP_HANDOFF_ENV_FLAGS_OFFSET);
+    assert!(core::mem::offset_of!(ApHandoff, env_flags) == 88);
+    assert!(core::mem::offset_of!(ApHandoff, lapic_id_out) == AP_HANDOFF_LAPIC_ID_OUT_OFFSET);
+    assert!(core::mem::offset_of!(ApHandoff, lapic_id_out) == 92);
 };
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -343,11 +387,12 @@ ap_long_entry:
 
     .align 8
 yarm_ap_trampoline_handoff:
-    // Reserve the FULL ApHandoff (size_of::<ApHandoff>() == 56): magic(0) cpu_id(4)
+    // Reserve the FULL ApHandoff (size_of::<ApHandoff>() == 96): magic(0) cpu_id(4)
     // stack_top(8) kernel_state_ptr(16) ready_flag_ptr(24) ready_word(32) reserved(36)
-    // percpu_record_ptr(40) ap_stage(48) pad(52). Under-reserving would place the AP
-    // stage word past `yarm_ap_trampoline_end`, shrinking the copied trampoline `len`.
-    .zero 56
+    // percpu_record_ptr(40) ap_stage(48) pad(52) kernel_cr3(56) gdtr_image(64) pad(74)
+    // lapic_id_reg_va(80) env_flags(88) lapic_id_out(92). Under-reserving would place
+    // AP-written fields past `yarm_ap_trampoline_end`, shrinking the copied `len`.
+    .zero 96
 
 yarm_ap_trampoline_end:
     .code64
@@ -457,15 +502,31 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 //   'W'   AP_STAGE_BEFORE_WRMSR (13)      'w'             about to wrmsr IA32_GS_BASE; #GP/fault in wrmsr
 //   'w'   AP_STAGE_AFTER_WRMSR (14)       'r'             wrmsr returned; died before rdmsr readback
 //   'r'   AP_STAGE_AFTER_RDMSR (15)       'O'/'B'         rdmsr returned; died before compare
-//   'O'   AP_STAGE_GS_VERIFIED (16)       'I'             GS readback == written; entering idle
-//   'B'   AP_STAGE_GS_MISMATCH (254)      'I'             GS readback != written (still idles safely)
+//   'O'   AP_STAGE_GS_VERIFIED (16)       'K'             GS readback == written; env steps begin
+//   'B'   AP_STAGE_GS_MISMATCH (254)      'I'             GS readback != written (skips env; idles)
 //   '!'   AP_STAGE_HANDOFF_NULL (253)     'I'             percpu_record_ptr was 0 (BSP handoff bug)
+//
+// Stage 183 inc.3 env steps (between 'O' and 'I'; skipped on the 'B'/'!' paths):
+//   'K'   AP_STAGE_KCR3_BEGIN (19)        'k'             about to `mov cr3, handoff.kernel_cr3`;
+//                                                         died ⇒ kernel CR3 does not map this text
+//   'k'   AP_STAGE_KCR3_LIVE (20)         'D'             kernel CR3 live (post-reload fetch + low
+//                                                         store worked); died ⇒ gs: canary store
+//                                                         hit unmapped .bss under the kernel CR3
+//   'D'   AP_STAGE_GDT_LOADED (21)        'T'             about to lgdt + SS/DS/ES + far-return to
+//                                                         CS=0x08; died ⇒ per-AP GDT/CS reload bad
+//   'T'   AP_STAGE_TSS_LOADED (22)        'l'             about to `ltr 0x28`; died ⇒ TSS desc bad
+//   'l'   AP_STAGE_LAPIC_CHECKED (23)     'y'             about to read the LAPIC ID register;
+//                                                         died ⇒ LAPIC MMIO VA bad under kCR3
+//   'y'   AP_STAGE_IDLE_CTX_PUBLISHED (24) 'I'            about to store the live rsp via gs:
+//
 //   'I'   AP_STAGE_BEFORE_HLT (17)        'Z'             about to cli;hlt; died before first hlt
 //   'Z'   AP_STAGE_IDLE (18)              (parked)        AP parked in cli/hlt idle loop — success
 //
-// Preconditions carried across the Rust jump: CR4=PAE-only (no SSE), bootstrap PML4
-// maps text + low identity ONLY (no .bss/.data/MMIO), interrupts masked (no AP IDT).
-// The stage word / ready_word / percpu_record_ptr all live in the low identity page.
+// Preconditions carried across the Rust jump: CR4=PAE-only (no SSE), interrupts masked
+// (no AP IDT — every env step must be fault-free or the stage trace names it). The
+// stage word / ready_word / env_flags / percpu_record_ptr live in the low identity
+// page; the kernel CR3 additionally maps kernel text, .bss (per-CPU records, AP
+// GDT/TSS), and the LAPIC MMIO — everything the BSP itself uses under that root.
 
 // Fine-grained AP stage-word codes (written to [handoff+48] by yarm_x86_64_ap_entry,
 // except RUST_JUMP which the trampoline writes via the absolute low address).
@@ -490,6 +551,19 @@ pub(super) const AP_STAGE_GS_VERIFIED: u32 = 16;
 pub(super) const AP_STAGE_BEFORE_HLT: u32 = 17;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_IDLE: u32 = 18;
+// Stage 183 inc.3 env-step stages (executed between GS_VERIFIED and BEFORE_HLT).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_KCR3_BEGIN: u32 = 19;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_KCR3_LIVE: u32 = 20;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_GDT_LOADED: u32 = 21;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_TSS_LOADED: u32 = 22;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_LAPIC_CHECKED: u32 = 23;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_IDLE_CTX_PUBLISHED: u32 = 24;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_HANDOFF_NULL: u32 = 253; // percpu_record_ptr == 0 (BSP bug)
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -512,6 +586,12 @@ pub(super) fn ap_stage_name(raw: u32) -> &'static str {
         AP_STAGE_GS_VERIFIED => "gs_verified",
         AP_STAGE_BEFORE_HLT => "before_hlt",
         AP_STAGE_IDLE => "idle",
+        AP_STAGE_KCR3_BEGIN => "kcr3_begin",
+        AP_STAGE_KCR3_LIVE => "kcr3_live",
+        AP_STAGE_GDT_LOADED => "gdt_loaded",
+        AP_STAGE_TSS_LOADED => "tss_loaded",
+        AP_STAGE_LAPIC_CHECKED => "lapic_checked",
+        AP_STAGE_IDLE_CTX_PUBLISHED => "idle_ctx_published",
         AP_STAGE_HANDOFF_NULL => "handoff_null",
         AP_STAGE_GS_MISMATCH => "gs_mismatch",
         _ => "unknown",
@@ -596,10 +676,81 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         // Compare readback (r8) with the value written (rsi).
         "cmp r8, rsi",
         "jne 8f",
-        // 'O' / stage 16: GS verified. Publish ready_word=3 (admit ok).
+        // 'O' / stage 16: GS verified. Env steps follow; ready_word=3 is published
+        // only after them (label 60), so a mid-env fault shows up as an admit
+        // timeout whose last_stage names the env step that died.
         "mov al, 0x4F", // 'O'
         "out dx, al",
         "mov dword ptr [rdi + 48], 16",
+        // ---- Stage 183 inc.3 env steps (results OR'd into env_flags [rdi+88]) ----
+        // 'K' / stage 19: controlled reload of the FULL kernel CR3.
+        "mov al, 0x4B", // 'K'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 19",
+        "mov rax, [rdi + 56]",
+        "test rax, rax",
+        "jz 60f", // kernel_cr3 not provided → skip env; BSP grades the gap honestly
+        "mov cr3, rax",
+        // 'k' / stage 20: kernel CR3 live — this very instruction fetch plus the low
+        // stores below prove text and low identity are mapped under the new root.
+        "mov al, 0x6B", // 'k'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 20",
+        "or dword ptr [rdi + 88], 1", // env: KERNEL_CR3_RELOADED
+        // gs: canary store — proves higher-half .bss is writable on the AP under the
+        // kernel CR3 AND that GS-relative addressing works (gs:[48] =
+        // PerCpuRecord.env_canary; value = percpu::AP_ENV_CANARY).
+        "mov dword ptr gs:[48], 0x0183C0DE",
+        // 'D' / stage 21: per-AP GDT — lgdt from the handoff GDTR image, reload
+        // SS/DS/ES with the kernel data selector, then far-return to the kernel code
+        // selector. This converges the AP onto the BSP BOOT_GDT selector layout
+        // (0x08 kernel code / 0x10 kernel data / 0x28 TSS).
+        "mov al, 0x44", // 'D'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 21",
+        "lgdt [rdi + 64]",
+        "mov ax, 0x10",
+        "mov ss, ax",
+        "mov ds, ax",
+        "mov es, ax",
+        "lea rax, [rip + 61f]",
+        "push 0x08",
+        "push rax",
+        "retfq",
+        "61:",
+        "or dword ptr [rdi + 88], 2", // env: GDT_LOADED
+        // 'T' / stage 22: load the task register with the per-AP TSS selector. ltr
+        // writes the BUSY bit into this AP's GDT in .bss — the BSP reads it back.
+        "mov al, 0x54", // 'T'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 22",
+        "mov ax, 0x28",
+        "ltr ax",
+        "or dword ptr [rdi + 88], 4", // env: TSS_LOADED
+        // 'l' / stage 23: LAPIC access proof — read THIS AP's LAPIC ID register (VA
+        // from the handoff; 0 = BSP found it unmapped, skip) and publish the id.
+        "mov al, 0x6C", // 'l'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 23",
+        "mov rax, [rdi + 80]",
+        "test rax, rax",
+        "jz 62f",
+        "mov eax, [rax]",
+        "shr eax, 24",
+        "mov [rdi + 92], eax",        // lapic_id_out
+        "or dword ptr [rdi + 88], 8", // env: LAPIC_READ
+        "62:",
+        // 'y' / stage 24: publish the live idle context — store the current rsp via
+        // gs: (gs:[56] = PerCpuRecord.saved_rsp) for BSP validation against the
+        // recorded idle metadata.
+        "mov al, 0x79", // 'y'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 24",
+        "mov qword ptr gs:[56], rsp",
+        "or dword ptr [rdi + 88], 16", // env: IDLE_CTX_PUBLISHED
+        "60:",
+        // Env done: publish ready_word=3 (idle admission). Per-step results are in
+        // env_flags for the BSP to grade into OK/FAIL markers.
         "mov dword ptr [rdi + 32], 3",
         "jmp 5f",
         "8:",
@@ -711,6 +862,10 @@ pub(super) fn encode_trampoline_page(
     patched.ready_word = 0;
     patched.reserved = 0;
     patched.ap_stage = 0;
+    // Stage 183 inc.3: AP-written env results start cleared; lapic_id_out carries a
+    // sentinel so a skipped/failed MMIO read can never alias a real LAPIC id.
+    patched.env_flags = 0;
+    patched.lapic_id_out = 0xFFFF_FFFF;
 
     let handoff_bytes = unsafe {
         core::slice::from_raw_parts(
@@ -758,6 +913,18 @@ pub(super) fn ap_ready_word_low_virt(handoff_off: usize) -> *const u32 {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) fn ap_stage_word_low_virt(handoff_off: usize) -> *const u32 {
     (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_STAGE_WORD_OFFSET) as *const u32
+}
+
+/// Stage 183 inc.3: low identity-mapped VA of the AP env-step result bitmask (offset 88).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_env_flags_low_virt(handoff_off: usize) -> *const u32 {
+    (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_ENV_FLAGS_OFFSET) as *const u32
+}
+
+/// Stage 183 inc.3: low identity-mapped VA of the AP LAPIC-id readback (offset 92).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_lapic_id_out_low_virt(handoff_off: usize) -> *const u32 {
+    (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_LAPIC_ID_OUT_OFFSET) as *const u32
 }
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
