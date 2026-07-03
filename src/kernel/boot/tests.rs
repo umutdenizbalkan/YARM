@@ -52984,6 +52984,20 @@ mod stage183_ap_idle_admit {
                 && SMOKE_SRC.contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
             "smoke must require the wake proof + forbid the 183.5 failure markers"
         );
+        // Retired-ASID safety under online=N: wake-only APs are excluded from BOTH
+        // shootdown-target computations (they run no dispatcher, never load a user
+        // CR3, never touch user VAs — no user-ASID translations to invalidate, and
+        // nothing drains their work queues yet). Without this every post-admission
+        // task destroy leaks a retired-ASID slot → VmError::Full after 32 destroys.
+        const MEM_SRC: &str = include_str!("memory_state.rs");
+        assert_eq!(
+            MEM_SRC
+                .matches("self.online_cpu_bitmap() & !self.wake_only_cpu_bitmap()")
+                .count(),
+            2,
+            "both shootdown-target computations must exclude wake-only APs"
+        );
+
         // Hard gates for 183.6 stay: no D2/D6 SMP seam relaxation (the single_cpu
         // topology checks are untouched), no user knobs.
         assert!(

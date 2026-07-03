@@ -1978,7 +1978,7 @@ static mut AP_IDT: [X86IdtEntry; IDT_ENTRIES] = [const { X86IdtEntry::missing() 
 /// BSP-side: the AP IDT stub table's base VA (for the prepare-time map check).
 #[cfg(all(not(test), not(feature = "hosted-dev"), target_arch = "x86_64"))]
 pub(crate) fn ap_idt_stub_base() -> u64 {
-    unsafe { core::ptr::addr_of!(yarm_ap_idt_unexpected_stubs) as u64 }
+    core::ptr::addr_of!(yarm_ap_idt_unexpected_stubs) as u64
 }
 
 /// BSP-side: the AP IDT table's base VA (for the X86_AP_IDT_OK marker).

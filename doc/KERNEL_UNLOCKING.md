@@ -6940,6 +6940,19 @@ unproven-and-gated for 183.6:
   them. Guarded by `stage183_inc5_ap_scheduler_online_and_remote_wake`.
   Acceptance: `scripts/run-ci-profiles.sh smp2-core` + `smp4-core`
   (+ optional `smp6-core`).
+- **Retired-ASID safety under `online = N` (found by audit, fixed pre-host):**
+  `destroy_user_address_space_by_asid` retired ASIDs pending on the FULL
+  `online_cpu_bitmap()`, but nothing drains a wake-only AP's cross-CPU work queue
+  (only the BSP trap path drains its own) — every post-admission task destroy
+  would leak a retired-ASID slot and after 32 destroys every teardown returns
+  `VmError::Full`. Fix: both shootdown-target computations
+  (`live_cpu_bitmap_for_asid`, destroy's `pending_cpu_bitmap`) now exclude
+  wake-only CPUs — architecturally sound because a wake-only AP runs no
+  dispatcher, never loads a user CR3, and never touches user VAs, so it cannot
+  hold translations for any user ASID. 183.6 re-includes each CPU when its
+  dispatcher lands and the REAL remote shootdown IPI + AP-side drain are wired
+  (that, plus the D2/D6 out-of-lock SMP proof, is exactly the
+  `category=C reason=d2_d6_smp_seams_unproven` blocker).
 
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
