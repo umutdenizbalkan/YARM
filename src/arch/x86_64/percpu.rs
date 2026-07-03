@@ -68,6 +68,13 @@ pub const IRQ_ACK_OFFSET: usize = 116;
 /// these mirrors post-boot.
 pub const SCHED_STAGE_OFFSET: usize = 120;
 pub const WAKE_REENTER_MIRROR_OFFSET: usize = 124;
+/// Stage 183.6 real cross-CPU TLB shootdown mailbox (BSP writes req_gen/req_va,
+/// the AP sched-idle wake path executes invlpg + sets ack_gen == req_gen). Single
+/// writer per field per direction, so it needs no lock and no KernelState access
+/// from the AP — a real remote ACK entirely through the (always-mapped) record.
+pub const TLB_REQ_GEN_OFFSET: usize = 128;
+pub const TLB_ACK_GEN_OFFSET: usize = 132;
+pub const TLB_REQ_VA_OFFSET: usize = 136;
 
 /// Fixed per-CPU record layout, owned by the BSP and indexed by logical
 /// CPU id. Field offsets are stable and tested.
@@ -98,8 +105,11 @@ pub const WAKE_REENTER_MIRROR_OFFSET: usize = 124;
 /// - `116`: irq_ack          u32 (persistent post-resume ACK; 1 = resumed+acked)
 /// - `120`: sched_stage      u32 (AP mirror of the sched-idle stage 30/31 via gs:)
 /// - `124`: wake_reenter_mirror u32 (AP mirror of wake_reenter_out via gs:)
+/// - `128`: tlb_req_gen      u32 (BSP: shootdown request generation)
+/// - `132`: tlb_ack_gen      u32 (AP:  shootdown ack generation, via gs:)
+/// - `136`: tlb_req_va       u64 (BSP: shootdown VA; 0 = full flush)
 ///
-/// Explicit-field bytes = 128 == struct stride (64-byte aligned).
+/// Explicit-field bytes = 144; struct stride = 192 (64-byte aligned).
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct PerCpuRecord {
@@ -128,6 +138,9 @@ pub struct PerCpuRecord {
     pub irq_ack: u32,
     pub sched_stage: u32,
     pub wake_reenter_mirror: u32,
+    pub tlb_req_gen: u32,
+    pub tlb_ack_gen: u32,
+    pub tlb_req_va: u64,
 }
 
 impl PerCpuRecord {
@@ -160,6 +173,9 @@ impl PerCpuRecord {
             irq_ack: 0,
             sched_stage: 0,
             wake_reenter_mirror: 0,
+            tlb_req_gen: 0,
+            tlb_ack_gen: 0,
+            tlb_req_va: 0,
         }
     }
 }
@@ -178,7 +194,10 @@ const _: () = {
     assert!(core::mem::offset_of!(PerCpuRecord, irq_ack) == IRQ_ACK_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, sched_stage) == SCHED_STAGE_OFFSET);
     assert!(core::mem::offset_of!(PerCpuRecord, wake_reenter_mirror) == WAKE_REENTER_MIRROR_OFFSET);
-    assert!(core::mem::size_of::<PerCpuRecord>() == 128);
+    assert!(core::mem::offset_of!(PerCpuRecord, tlb_req_gen) == TLB_REQ_GEN_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, tlb_ack_gen) == TLB_ACK_GEN_OFFSET);
+    assert!(core::mem::offset_of!(PerCpuRecord, tlb_req_va) == TLB_REQ_VA_OFFSET);
+    assert!(core::mem::size_of::<PerCpuRecord>() == 192);
 };
 
 /// Per-CPU slot table. Lives in `.bss` (aligned to 4 KiB so the table is
@@ -234,6 +253,9 @@ pub fn init_record_for_ap(cpu: CpuId, apic_id: u8, stack_top: u64) {
             irq_ack: 0,
             sched_stage: 0,
             wake_reenter_mirror: 0,
+            tlb_req_gen: 0,
+            tlb_ack_gen: 0,
+            tlb_req_va: 0,
         };
         core::ptr::write_volatile(base, record);
     }
@@ -285,6 +307,28 @@ pub fn mark_gs_base_written(cpu: CpuId) {
         record.flags |= flag::GS_BASE_WRITTEN;
         core::ptr::write_volatile(base, record);
     }
+}
+
+/// Stage 183.6: BSP posts a TLB shootdown request for `cpu` (VA `va`; 0 = full
+/// flush) and returns the new request generation. Writes `tlb_req_va` BEFORE
+/// bumping `tlb_req_gen` so the AP — which reads gen first, then va — always sees
+/// the matching VA. Field-granular `write_volatile` (not a full-record write) so
+/// it never clobbers the AP-owned `tlb_ack_gen`.
+pub fn tlb_request_shootdown(cpu: CpuId, va: u64) -> u32 {
+    let base = record_base(cpu) as *mut PerCpuRecord;
+    unsafe {
+        let cur_gen = core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_req_gen));
+        let next = cur_gen.wrapping_add(1);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).tlb_req_va), va);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*base).tlb_req_gen), next);
+        next
+    }
+}
+
+/// Stage 183.6: BSP reads the AP's TLB shootdown ACK generation for `cpu`.
+pub fn tlb_ack_gen(cpu: CpuId) -> u32 {
+    let base = record_base(cpu) as *const PerCpuRecord;
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*base).tlb_ack_gen)) }
 }
 
 #[cfg(test)]
@@ -343,9 +387,9 @@ mod tests {
 
     #[test]
     fn percpu_record_size_and_alignment() {
-        // 112 bytes of explicit fields + 16 bytes tail padding so the
-        // struct stride is a multiple of the 64-byte alignment.
-        assert_eq!(PerCpuRecord::SIZE, 128);
+        // Stage 183.6: 144 bytes of explicit fields (through the TLB shootdown
+        // mailbox at 128/132/136) round up to a 192-byte stride at 64-byte align.
+        assert_eq!(PerCpuRecord::SIZE, 192);
         assert_eq!(core::mem::align_of::<PerCpuRecord>(), 64);
     }
 

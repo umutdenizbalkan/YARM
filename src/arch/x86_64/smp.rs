@@ -1610,3 +1610,86 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
         let _ = kernel;
     }
 }
+
+/// Stage 183.6: drive a REAL cross-CPU TLB shootdown against `targets` and wait
+/// for each AP's ACK. For each target CPU: post the request into its per-CPU
+/// record (VA; 0 = full flush), send the wake IPI (vector 0xF1 — the same IPI its
+/// managed sched-idle loop already services), and wait (bounded) for
+/// `tlb_ack_gen == req_gen`. The AP executes the invalidation locally and ACKs —
+/// a genuine remote acknowledgement, not a simulated one. Returns the number of
+/// APs that acknowledged; emits `X86_TLB_REMOTE_ACK_TIMEOUT` for any that did not.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
+    use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    let mut acked = 0usize;
+    for raw in 0..crate::arch::platform_constants::MAX_CPUS {
+        if targets & (1u64 << raw) == 0 {
+            continue;
+        }
+        let cpu = CpuId(raw as u8);
+        crate::yarm_log!("X86_TLB_SHOOTDOWN_SEND cpu={} va=0x{:x}", cpu.0, va);
+        let want = super::percpu::tlb_request_shootdown(cpu, va);
+        wait_for_icr_idle(cpu.0, "before_tlb_shootdown");
+        write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
+        let mut got = false;
+        for _ in 0..AP_READY_POLL_ITERS {
+            if super::percpu::tlb_ack_gen(cpu) == want {
+                got = true;
+                break;
+            }
+            cpu_relax();
+        }
+        if got {
+            crate::yarm_log!("X86_TLB_SHOOTDOWN_ACK cpu={} gen={}", cpu.0, want);
+            acked += 1;
+        } else {
+            crate::yarm_log!(
+                "X86_TLB_REMOTE_ACK_TIMEOUT cpu={} want_gen={} got_gen={}",
+                cpu.0,
+                want,
+                super::percpu::tlb_ack_gen(cpu)
+            );
+        }
+    }
+    acked
+}
+
+/// The online, wake-only APs (Stage 183.5) — the set that must acknowledge a TLB
+/// shootdown under real SMP. They idle on the kernel CR3 and hold no user ASID, so
+/// invalidating any VA on them is correct-and-conservative (over-invalidation is
+/// always safe); the ACK is nonetheless real. When a future AP dispatcher clears an
+/// AP's wake-only bit, that CPU joins the precise per-ASID target set instead.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn online_wake_only_ap_bitmap(kernel: &KernelState) -> u64 {
+    let bsp = 1u64 << crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
+    kernel.online_cpu_bitmap() & kernel.wake_only_cpu_bitmap() & !bsp
+}
+
+/// Stage 183.6 one-shot: prove the real SMP TLB shootdown ACK against every online
+/// AP, for both the COW and VM_UNMAP contexts. Returns `(cow_ok, unmap_ok)`.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub fn ap_tlb_shootdown_proof(kernel: &KernelState) -> (bool, bool) {
+    let targets = online_wake_only_ap_bitmap(kernel);
+    let want = targets.count_ones() as usize;
+    if want == 0 {
+        return (false, false);
+    }
+    // COW context: a representative parent write-protect VA — full round-trip.
+    let cow_ok = smp_tlb_shootdown_cpus(targets, 0x0000_1000) == want;
+    if cow_ok {
+        crate::yarm_log!("X86_TLB_SHOOTDOWN_DONE context=cow targets={}", want);
+        crate::yarm_log!("COW_SMP_TLB_ACK_OK acks={}", want);
+    }
+    // VM_UNMAP context: a full-flush shootdown (va=0) — full round-trip.
+    let unmap_ok = smp_tlb_shootdown_cpus(targets, 0) == want;
+    if unmap_ok {
+        crate::yarm_log!("X86_TLB_SHOOTDOWN_DONE context=vm_unmap targets={}", want);
+        crate::yarm_log!("VM_UNMAP_SMP_TLB_ACK_OK acks={}", want);
+    }
+    (cow_ok, unmap_ok)
+}
+
+#[cfg(any(test, feature = "hosted-dev"))]
+pub fn ap_tlb_shootdown_proof(_kernel: &KernelState) -> (bool, bool) {
+    (false, false)
+}

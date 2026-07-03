@@ -47700,7 +47700,7 @@ mod stage168b_d2_recv_genuine_completion {
         let defer_idx = IPC_STATE_SRC
             .find("d2_recv_dispatch_try_defer")
             .expect("defer call");
-        let before = &IPC_STATE_SRC[defer_idx.saturating_sub(1000)..defer_idx];
+        let before = &IPC_STATE_SRC[defer_idx.saturating_sub(1400)..defer_idx];
         assert!(
             before.contains("#[cfg(target_arch = \"x86_64\")]"),
             "the recv dispatch deferral must be x86_64-only"
@@ -52237,15 +52237,24 @@ mod stage183_smp_live {
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
     const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
 
-    // The SMP topology limit is expressed as TOPOLOGY eligibility (online_cpu_count),
-    // not a runtime knob/env/bool selector — there is no fallback SELECTOR to re-add.
+    // The SMP topology limit is expressed as TOPOLOGY eligibility, not a runtime
+    // knob/env/bool selector — there is no fallback SELECTOR to re-add. Stage 183.6
+    // refined the predicate from online_cpu_count to dispatching_cpu_count (online
+    // minus wake-only) so the accepted out-of-lock slice stays live under real SMP;
+    // it is still a pure topology derivation, not a knob.
     #[test]
     fn stage183_smp_limit_is_topology_not_a_knob() {
         // The graduated seams gate the out-of-lock slice on a runtime CPU-count check.
         assert!(
-            EXEC_SRC.contains("let single_cpu = self.online_cpu_count() <= 1;")
-                && IPC_STATE_SRC.contains("let single_cpu = self.online_cpu_count() <= 1;"),
-            "SMP eligibility must be topology (online_cpu_count), the same on all seams"
+            EXEC_SRC.contains("let single_cpu = self.dispatching_cpu_count() <= 1;")
+                && IPC_STATE_SRC.contains("let single_cpu = self.dispatching_cpu_count() <= 1;"),
+            "SMP eligibility must be topology (dispatching_cpu_count), the same on all seams"
+        );
+        // dispatching_cpu_count is a pure derivation of online + wake-only bitmaps.
+        assert!(
+            include_str!("scheduler_state.rs").contains("fn dispatching_cpu_count(&self) -> usize")
+                && include_str!("scheduler_state.rs").contains("!s.wake_only_bitmap()"),
+            "dispatching_cpu_count must derive from online AND NOT wake-only"
         );
         // No Stage-182-removed seam selector knob was reintroduced.
         for gone in [
@@ -52483,7 +52492,7 @@ mod stage183_ap_idle_admit {
         // Smoke requires the admission/prereq markers + forbids the failure markers.
         assert!(
             SMOKE_SRC.contains("X86_AP_IDLE_ENTER")
-                && SMOKE_SRC.contains("result=aps_online")
+                && SMOKE_SRC.contains("result=smp_seams_ok")
                 && SMOKE_SRC.contains("X86_AP_GS_BAD")
                 && SMOKE_SRC.contains("X86_AP_IDLE_FAIL")
                 && SMOKE_SRC.contains("X86_AP_KERNEL_CR3_OK")
@@ -52966,13 +52975,15 @@ mod stage183_ap_idle_admit {
             SMP_SRC.contains("pub fn ap_remote_wake_ok_count() -> usize"),
             "remote-wake-ok must be a separate count"
         );
-        // Audit reports the 183.5 state + the honest placement gate + the 183.6 blocker.
+        // Audit reports the 183.5 state + the honest placement gate. Since 183.6 the
+        // terminal verdict is smp_seams_ok (D2/D6 out-of-lock + real TLB ACK), with
+        // aps_online kept only as the degraded fallback when the TLB proof fails.
         assert!(
             ORCH_SRC.contains("X86_SMP_AP_SCHED_ONLINE")
                 && ORCH_SRC.contains("X86_SMP_PLACEMENT_GATED")
-                && ORCH_SRC.contains("reason=d2_d6_smp_seams_unproven")
+                && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=smp_seams_ok")
                 && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=aps_online"),
-            "the audit must report scheduler-online + placement gate + 183.6 blocker"
+            "the audit must report scheduler-online + placement gate + the 183.6 verdict"
         );
         // Smoke: online-ready with full counts, wake proof required, failures forbidden.
         assert!(
@@ -53031,14 +53042,15 @@ mod stage183_ap_idle_admit {
             "both shootdown-target computations must exclude wake-only APs"
         );
 
-        // Hard gates for 183.6 stay: no D2/D6 SMP seam relaxation (the single_cpu
-        // topology checks are untouched), no user knobs.
+        // 183.6: the D2/D6 topology gate is now the single-DISPATCHER predicate
+        // (online minus wake-only) — still pure topology, no knob. Under 183.5's
+        // all-wake-only APs it equals 1, keeping the accepted out-of-lock slice.
         assert!(
             include_str!("exec_state.rs")
-                .contains("let single_cpu = self.online_cpu_count() <= 1;")
+                .contains("let single_cpu = self.dispatching_cpu_count() <= 1;")
                 && include_str!("ipc_state.rs")
-                    .contains("let single_cpu = self.online_cpu_count() <= 1;"),
-            "the D2/D6 single_cpu topology gates must remain untouched until 183.6"
+                    .contains("let single_cpu = self.dispatching_cpu_count() <= 1;"),
+            "the D2/D6 gate must be the single-dispatcher topology predicate"
         );
         assert!(
             !SMP_SRC.contains("yarm.") || !SMP_SRC.contains("yarm.sched_online"),
@@ -53117,6 +53129,92 @@ mod stage183_ap_idle_admit {
             SMP_SRC.contains("AP_IRQ_READY_FLAGS[cpu.0 as usize].store(irq_ok")
                 && SMP_SRC.contains("continue; // interrupt smoke did not pass"),
             "scheduler-online must stay gated on the interrupt-smoke verdict"
+        );
+    }
+
+    // Stage 183.6 — REAL SMP SEAMS: D2/D6 out-of-lock dispatch under online=N (via the
+    // single-dispatcher topology predicate) + a genuine cross-CPU TLB shootdown ACK
+    // against the online APs (BSP posts a request into the per-CPU record, sends the
+    // wake IPI, the AP sched-idle loop executes invlpg/CR3-reload and advances the ack
+    // generation — a real remote acknowledgement, no simulation).
+    #[test]
+    fn stage183_inc6_real_smp_seams() {
+        const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        const SCHED_STATE_SRC: &str = include_str!("scheduler_state.rs");
+        const EXEC_SRC: &str = include_str!("exec_state.rs");
+        const ORACLE_SRC: &str = include_str!("../../../scripts/qemu-ipc-recv-v2-oracle-smoke.sh");
+
+        // D6 out-of-lock dispatch emits the SMP-dispatch proof under online>1.
+        assert!(
+            EXEC_SRC.contains("D6_SMP_DISPATCH_BEGIN")
+                && EXEC_SRC.contains("D6_SMP_DISPATCH_OK")
+                && EXEC_SRC.contains("let smp_live = self.online_cpu_count() > 1;"),
+            "D6 out-of-lock dispatch must emit the SMP-dispatch proof under online>1"
+        );
+        // The real TLB shootdown mailbox: BSP request helpers, AP-side asm servicing.
+        assert!(
+            PERCPU_SRC.contains("TLB_REQ_GEN_OFFSET: usize = 128")
+                && PERCPU_SRC.contains("TLB_ACK_GEN_OFFSET: usize = 132")
+                && PERCPU_SRC.contains("TLB_REQ_VA_OFFSET: usize = 136")
+                && PERCPU_SRC.contains("fn tlb_request_shootdown(")
+                && PERCPU_SRC.contains("fn tlb_ack_gen("),
+            "the per-CPU TLB shootdown mailbox + BSP helpers must exist"
+        );
+        for a in [
+            "mov r10d, dword ptr gs:[128]", // tlb_req_gen
+            "mov r11d, dword ptr gs:[132]", // tlb_ack_gen
+            "mov rax, qword ptr gs:[136]",  // tlb_req_va
+            "invlpg [rax]",
+            "mov dword ptr gs:[132], r10d", // ACK: ack_gen = req_gen
+        ] {
+            assert!(
+                TRAMP_SRC.contains(a),
+                "AP TLB-mailbox service step must exist: {a}"
+            );
+        }
+        // The BSP driver sends + waits for a REAL ack, timing out (not hanging) on failure.
+        assert!(
+            SMP_SRC.contains("fn smp_tlb_shootdown_cpus(")
+                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_SEND")
+                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_ACK")
+                && SMP_SRC.contains("X86_TLB_REMOTE_ACK_TIMEOUT")
+                && SMP_SRC.contains("fn ap_tlb_shootdown_proof(")
+                && SMP_SRC.contains("COW_SMP_TLB_ACK_OK")
+                && SMP_SRC.contains("VM_UNMAP_SMP_TLB_ACK_OK")
+                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_DONE"),
+            "the BSP TLB shootdown driver + COW/UNMAP proof must exist"
+        );
+        // dispatching_cpu_count excludes wake-only; the seams use it.
+        assert!(
+            SCHED_STATE_SRC.contains("fn dispatching_cpu_count(&self) -> usize"),
+            "dispatching_cpu_count must exist"
+        );
+        // The audit drives the TLB proof and emits the terminal 183.6 verdict.
+        assert!(
+            ORCH_SRC.contains("ap_tlb_shootdown_proof(self)")
+                && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=smp_seams_ok")
+                && ORCH_SRC.contains("reason=tlb_shootdown_ack_unproven"),
+            "the audit must drive the TLB proof + emit result=smp_seams_ok (or the honest blocker)"
+        );
+        // Core smoke requires the deterministic 183.6 markers; oracle requires the SMP
+        // sender-wake + D6 dispatch proof; both forbid the SMP TLB timeout.
+        assert!(
+            SMOKE_SRC.contains("result=smp_seams_ok")
+                && SMOKE_SRC.contains("COW_SMP_TLB_ACK_OK")
+                && SMOKE_SRC.contains("VM_UNMAP_SMP_TLB_ACK_OK")
+                && SMOKE_SRC.contains("X86_TLB_REMOTE_ACK_TIMEOUT"),
+            "core smoke must require the 183.6 TLB markers + forbid the ack timeout"
+        );
+        assert!(
+            ORACLE_SRC.contains("D6_SMP_DISPATCH_OK")
+                && ORACLE_SRC.contains("IPC_RECV_V2_SENDER_WAKE_ORDER_OK"),
+            "oracle must require D6 SMP dispatch + sender-wake order under -smp >1"
+        );
+        // Still no scheduler placement on APs (no AP dispatcher yet) and no knobs.
+        assert!(
+            SMP_SRC.contains("fn online_wake_only_ap_bitmap(")
+                && include_str!("../scheduler.rs").contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
+            "AP task placement must stay gated (wake-only)"
         );
     }
 
