@@ -2787,11 +2787,27 @@ mod tests {
             "SupervisorPmRestartClientResult::Accepted",
             "record.tid = replacement_handle_value",
             "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+            "SUPERVISOR_RESTART_LINEAGE_UPDATE_BEGIN",
+            "SUPERVISOR_RESTART_LINEAGE_UPDATE_OK",
+            "SUPERVISOR_RESTART_LINEAGE_INDEX_OK",
             "record.pending_pm_request_id = None",
         ] {
             assert!(
                 due_restart.contains(needle),
                 "SUP-L7A state update path missing {needle}"
+            );
+        }
+        for needle in &[
+            "SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 1",
+            "SUPERVISOR_FAULT_LOOKUP_BEGIN",
+            "SUPERVISOR_FAULT_LOOKUP_OK",
+            "SUPERVISOR_FAULT_LOOKUP_FAIL",
+            "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old={} new={}",
+            "SUPERVISOR_RESTART_NOT_SCHEDULED",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L7C fault lineage marker/source missing {needle}"
             );
         }
         assert!(supervisor_src.contains("send_pm_restart_v1_via_process_manager"));

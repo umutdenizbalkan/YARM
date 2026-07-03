@@ -731,3 +731,47 @@ query remains read-only/non-authorizing. No kernel, syscall ABI, arch, RPi5,
 driver-manager DRS, or PM restart codec layout changes; `PROC_OP_PM_RESTART_V1 =
 15`, `PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
 `SYSCALL_COUNT = 31`, and request/reply lengths 110/50 remain frozen.
+
+## SUP-L7C — replacement-fault lineage and prompt fault polling
+
+User-local QEMU after SUP-L7B reached the first accepted PM reply and the first
+supervisor state update:
+`SUPERVISOR_PM_RESTART_STATE_UPDATED tid=10009 replacement_tid=10009 attempt=1`.
+The replacement service then faulted as `PAGE_FAULT_UNHANDLED tid=10009`, but no
+`SUPERVISOR_RESTART_SCHEDULED tid=10009 attempt=2` appeared.
+
+SUP-L7C audits the blocker as a runtime fault-polling/lineage observability bug.
+The accepted PM reply did update the managed record's primary `tid` to the
+replacement TID, but after processing the PM reply the supervisor could enter its
+idle path waiting on the control endpoint for a long timeout. Because the current
+userspace loop has separate control and fault endpoints rather than a multi-cap
+wait, a long control-only idle wait can delay polling the queued fault endpoint
+and prevent the replacement fault from reaching the restart scheduler within the
+smoke oracle window.
+
+SUP-L7C keeps PM as restart authority and keeps supervisor as policy/state owner.
+It reduces the production supervisor idle wait budget to one tick so the loop
+continues polling the fault endpoint promptly, and adds explicit lineage markers
+when an accepted PM reply changes the managed record from the old TID to the
+replacement TID. The supervisor now logs
+`SUPERVISOR_RESTART_LINEAGE_UPDATE_BEGIN old_tid=<old> replacement_tid=<new> attempt=<n>`,
+`SUPERVISOR_RESTART_LINEAGE_UPDATE_OK`, and
+`SUPERVISOR_RESTART_LINEAGE_INDEX_OK replacement_tid=<new>` when the replacement
+TID becomes the managed record's current task.
+
+Fault handling now exposes lookup and scheduling state with
+`SUPERVISOR_FAULT_LOOKUP_BEGIN fault_tid=<tid>`,
+`SUPERVISOR_FAULT_LOOKUP_OK fault_tid=<tid> record_tid=<tid> attempt=<n>`,
+`SUPERVISOR_FAULT_LOOKUP_FAIL ...`, and
+`SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=<n> new=<n+1>`. This proves the second
+fault from the replacement TID maps to the same managed service lineage and that
+attempt count advances from 1 to 2 instead of resetting. Pending PM transaction
+fields are cleared after accepted replies, but supervision state and crash-test
+restart policy are preserved.
+
+No PM sender-validation, PM restart authorization, PM reply codec, kernel,
+syscall ABI, arch, RPi5, or driver-manager DRS behavior changes. The restart
+path remains gated to the crash-test image; the supervisor still does not spawn
+or restart locally. `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and PM restart request/reply lengths 110/50 remain frozen.

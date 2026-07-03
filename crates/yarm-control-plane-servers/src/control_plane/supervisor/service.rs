@@ -134,7 +134,7 @@ const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
 #[cfg(not(test))]
 const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 #[cfg(not(test))]
-const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 10_000;
+const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 1;
 const SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 const SUPERVISOR_PM_RESTART_REPLY_CAP_OPCODE: u16 = 0;
 
@@ -794,7 +794,14 @@ impl SupervisorService {
             record.window_start_tick = current_tick;
             record.restart_attempts = 0;
         }
+        let old_attempt = record.restart_attempts;
         record.restart_attempts = record.restart_attempts.saturating_add(1);
+        #[cfg(not(test))]
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old={} new={}",
+            old_attempt,
+            record.restart_attempts
+        );
         record.pending_restart_due = Some(current_tick + TickDuration(policy.backoff_ticks));
         record.pending_restart_token = Some(token);
         record.restart_blocked_no_pm_client = false;
@@ -1030,8 +1037,34 @@ impl SupervisorService {
                     record.restart_deferred_by_pm = false;
                     record.restart_rejected_by_pm = false;
                     record.restart_deferred_no_pm_client_logged = false;
+                    let old_tid = record.tid;
                     if replacement_handle_value != 0 {
+                        #[cfg(not(test))]
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_RESTART_LINEAGE_UPDATE_BEGIN old_tid={} replacement_tid={} attempt={}",
+                            old_tid,
+                            replacement_handle_value,
+                            record.restart_attempts
+                        );
                         record.tid = replacement_handle_value;
+                        #[cfg(not(test))]
+                        {
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RESTART_LINEAGE_UPDATE_OK old_tid={} replacement_tid={}",
+                                old_tid,
+                                replacement_handle_value
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RESTART_LINEAGE_INDEX_OK replacement_tid={}",
+                                replacement_handle_value
+                            );
+                        }
+                    } else {
+                        #[cfg(not(test))]
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_RESTART_LINEAGE_INDEX_FAIL replacement_tid={} reason=zero",
+                            replacement_handle_value
+                        );
                     }
                     record.pm_restart_state = SupervisorPmRestartState::RestartAccepted;
                     self.degraded = false;
@@ -1371,6 +1404,14 @@ impl SupervisorService {
                     event.tid
                 );
                 yarm_user_rt::user_log!(
+                    "SUPERVISOR_FAULT_LOOKUP_FAIL fault_tid={} reason=unmanaged",
+                    event.tid
+                );
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_RESTART_NOT_SCHEDULED tid={} reason=unmanaged",
+                    event.tid
+                );
+                yarm_user_rt::user_log!(
                     "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=ignored-missing-record",
                     event.tid
                 );
@@ -1381,6 +1422,12 @@ impl SupervisorService {
         #[cfg(not(test))]
         {
             yarm_user_rt::user_log!("SUPERVISOR_RECORD_LOOKUP tid={} result=found", event.tid);
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_FAULT_LOOKUP_OK fault_tid={} record_tid={} attempt={}",
+                event.tid,
+                snapshot.tid,
+                snapshot.restart_attempts
+            );
             yarm_user_rt::user_log!(
                 "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
                 event.tid,
@@ -1871,12 +1918,22 @@ pub fn run() {
                                                 "SUPERVISOR_POST_FAULT_ACCEPT_BEGIN tid={}",
                                                 fault.tid
                                             );
+                                            yarm_user_rt::user_log!(
+                                                "SUPERVISOR_FAULT_LOOKUP_BEGIN fault_tid={}",
+                                                fault.tid
+                                            );
                                             match supervisor.find_record(fault.tid) {
                                                 Some(record) => {
                                                     let policy = supervisor.policy_for(record);
                                                     yarm_user_rt::user_log!(
                                                         "SUPERVISOR_RECORD_LOOKUP tid={} result=found",
                                                         fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_FAULT_LOOKUP_OK fault_tid={} record_tid={} attempt={}",
+                                                        fault.tid,
+                                                        record.tid,
+                                                        record.restart_attempts
                                                     );
                                                     yarm_user_rt::user_log!(
                                                         "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
@@ -1893,6 +1950,14 @@ pub fn run() {
                                                 None => {
                                                     yarm_user_rt::user_log!(
                                                         "SUPERVISOR_RECORD_LOOKUP tid={} result=missing",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_FAULT_LOOKUP_FAIL fault_tid={} reason=unmanaged",
+                                                        fault.tid
+                                                    );
+                                                    yarm_user_rt::user_log!(
+                                                        "SUPERVISOR_RESTART_NOT_SCHEDULED tid={} reason=unmanaged",
                                                         fault.tid
                                                     );
                                                     yarm_user_rt::user_log!(
