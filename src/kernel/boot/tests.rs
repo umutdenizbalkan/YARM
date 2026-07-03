@@ -52526,18 +52526,20 @@ mod stage183_ap_idle_admit {
             TRAMP_SRC.matches("[rdi + 48]").count() >= 9,
             "the AP must publish the stage word before every risky action"
         );
-        // The handoff reservation holds the FULL 96-byte struct + a compile-time layout guard
-        // locks the field offsets the asm hardcodes.
+        // The handoff reservation holds the FULL 120-byte struct + a compile-time layout
+        // guard locks the field offsets the asm hardcodes.
         assert!(
-            TRAMP_SRC.contains(".zero 96")
-                && TRAMP_SRC.contains("size_of::<ApHandoff>() == 96")
+            TRAMP_SRC.contains(".zero 120")
+                && TRAMP_SRC.contains("size_of::<ApHandoff>() == 120")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, ap_stage) == 48")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, kernel_cr3) == 56")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, gdtr_image) == 64")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, lapic_id_reg_va) == 80")
                 && TRAMP_SRC.contains("offset_of!(ApHandoff, env_flags) == 88")
-                && TRAMP_SRC.contains("offset_of!(ApHandoff, lapic_id_out) == 92"),
-            "the handoff reservation + layout guard must match the 96-byte struct"
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, lapic_id_out) == 92")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, idtr_image) == 96")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, bsp_cr4) == 112"),
+            "the handoff reservation + layout guard must match the 120-byte struct"
         );
         // On admit timeout the BSP names the last stage it reached (deterministic trace).
         assert!(
@@ -52672,6 +52674,113 @@ mod stage183_ap_idle_admit {
             SMP_SRC
                 .contains("X86_AP_LAPIC_TIMER_DEFERRED cpu={} reason=no_ap_idt_interrupts_masked"),
             "the AP timer must stay deferred with the exact no-IDT reason"
+        );
+    }
+
+    // Stage 183 increment 4 — AP INTERRUPT-SAFE IDLE. The AP loads a dedicated
+    // pure-asm IDT (catch-all park stubs + one smoke-vector handler), syncs CR4 with
+    // the BSP, and proves one controlled BSP→AP IPI end-to-end (deliver → gs: record
+    // → LAPIC EOI → iretq → back to interrupt-masked idle). No scheduler tick, no
+    // scheduler-online, no D2/D6 seams — those are 183.5/183.6, gated on this.
+    #[test]
+    fn stage183_inc4_ap_interrupt_safe_idle() {
+        const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+        const RUNNER_SRC: &str = include_str!("../../../scripts/run-ci-profiles.sh");
+
+        // The AP-safe IDT: 256 catch-all park stubs (unexpected vector → gs: record +
+        // deterministic cli/hlt park, never a triple fault) + the smoke handler
+        // (gs: count/vector, LAPIC EOI, iretq). Shared kernel BOOT_IDT is NOT used.
+        assert!(
+            DESC_SRC.contains("yarm_ap_idt_unexpected_stubs")
+                && DESC_SRC.contains("yarm_ap_irq_smoke_stub")
+                && DESC_SRC.contains(".rept 256")
+                && DESC_SRC.contains("iretq")
+                && DESC_SRC.contains("static mut AP_IDT")
+                && DESC_SRC.contains("fn prepare_ap_idt(")
+                && DESC_SRC.contains("fn ap_idt_any_ist_nonzero(")
+                && DESC_SRC.contains("AP_IRQ_SMOKE_VECTOR: u8 = 0xF0"),
+            "the AP-safe IDT machinery must exist (stubs + smoke handler + builder)"
+        );
+        // AP-side env steps: CR4 sync, lidt, and the race-free sti;hlt smoke window.
+        for s in [
+            "mov rax, [rdi + 112]", // bsp_cr4 load
+            "mov cr4, rax",
+            "lidt [rdi + 96]",
+            "\"sti\"",
+            "cmp dword ptr gs:[96], 0", // irq_hit_count check in the wait loop
+            "AP_STAGE_CR4_SYNCED",
+            "AP_STAGE_IDT_LOADED",
+            "AP_STAGE_IRQ_SMOKE_WAIT",
+            "AP_STAGE_IRQ_SMOKE_DONE",
+        ] {
+            assert!(TRAMP_SRC.contains(s), "inc.4 AP step must exist: {s}");
+        }
+        // The per-CPU record carries the AP-written smoke results at locked offsets.
+        assert!(
+            PERCPU_SRC.contains("pub irq_hit_count: u32")
+                && PERCPU_SRC.contains("pub irq_hit_vector: u32")
+                && PERCPU_SRC.contains("pub irq_unexpected_vec: u32")
+                && PERCPU_SRC.contains("IRQ_HIT_COUNT_OFFSET: usize = 96"),
+            "per-CPU irq smoke result fields must exist at locked offsets"
+        );
+        // BSP grading: the full inc.4 marker set incl. IPI wake send/recv/ack and the
+        // no-dup / unexpected-vector / no-resume failure grades.
+        for m in [
+            "X86_AP_CR4_SYNC_OK",
+            "X86_AP_CR4_SYNC_FAIL",
+            "X86_AP_IDT_BEGIN",
+            "X86_AP_IDT_OK",
+            "X86_AP_IDT_BAD",
+            "X86_AP_IST_OK",
+            "X86_AP_IST_BAD",
+            "X86_AP_INTERRUPT_SMOKE_BEGIN",
+            "X86_IPI_REMOTE_WAKE_SEND",
+            "X86_IPI_REMOTE_WAKE_RECV",
+            "X86_IPI_REMOTE_WAKE_ACK",
+            "X86_AP_INTERRUPT_SMOKE_OK",
+            "X86_AP_INTERRUPT_SMOKE_FAIL",
+            "reason=dup_delivery",
+            "reason=unexpected_vector",
+            "reason=no_handler_hit",
+        ] {
+            assert!(SMP_SRC.contains(m), "inc.4 marker/grade must exist: {m}");
+        }
+        // Interrupt-ready is a SEPARATE count; the audit reports it; online stays 1
+        // and the blocker names scheduler-online admission as the next gate.
+        assert!(
+            SMP_SRC.contains("static AP_INTERRUPT_READY_COUNT: AtomicUsize")
+                && SMP_SRC.contains("pub fn ap_interrupt_ready_count() -> usize"),
+            "ap_interrupt_ready count must exist"
+        );
+        assert!(
+            ORCH_SRC.contains("X86_SMP_AP_INTERRUPT_READY")
+                && ORCH_SRC.contains("ap_interrupt_ready={}")
+                && ORCH_SRC.contains("reason=ap_scheduler_online_admission_required"),
+            "the audit must report ap_interrupt_ready + the scheduler-online blocker"
+        );
+        assert!(
+            !SMP_SRC.contains("kernel.bring_up_cpu(cpu)")
+                && !SMP_SRC.contains(".bring_up_cpu(cpu)"),
+            "APs must remain non-scheduler-runnable (183.5 gate not yet proven)"
+        );
+        // Smoke requires the inc.4 markers and forbids the failure grades.
+        assert!(
+            SMOKE_SRC.contains("X86_AP_IDT_OK")
+                && SMOKE_SRC.contains("X86_AP_IST_OK")
+                && SMOKE_SRC.contains("X86_AP_INTERRUPT_SMOKE_OK")
+                && SMOKE_SRC.contains("X86_IPI_REMOTE_WAKE_ACK")
+                && SMOKE_SRC.contains("X86_SMP_AP_INTERRUPT_READY")
+                && SMOKE_SRC.contains("X86_AP_IDT_BAD")
+                && SMOKE_SRC.contains("X86_AP_IST_BAD")
+                && SMOKE_SRC.contains("X86_AP_INTERRUPT_SMOKE_FAIL")
+                && SMOKE_SRC.contains("X86_AP_CR4_SYNC_FAIL"),
+            "smoke must require the interrupt-safe-idle markers + forbid the failures"
+        );
+        // smp6 profiles exist and select CPU count only (no knobs).
+        assert!(
+            RUNNER_SRC.contains("smp6-core") && RUNNER_SRC.contains("smp6-sender-wake"),
+            "runner must register the smp6 profiles"
         );
     }
 

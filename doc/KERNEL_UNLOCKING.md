@@ -6783,6 +6783,63 @@ BSP (single serial writer):
   `X86_AP_SCHED_PREREQ_INCOMPLETE`. Guarded by `stage183_inc3_ap_env_prereqs`.
   Acceptance: `scripts/run-ci-profiles.sh smp2-core` + `smp4-core`.
 
+**Increment 3 ACCEPTED (user QEMU, 2026).** `smp2-core`: `X86_AP_KERNEL_CR3_OK cpu=1`,
+`X86_AP_GDT_LOCAL_OK cpu=1`, `X86_AP_TSS_OK cpu=1 busy=1`, `X86_AP_LAPIC_OK cpu=1
+apic_id=1`, `X86_AP_IDLE_CONTEXT_OK cpu=1`, `X86_AP_SCHED_PREREQ_OK cpu=1`,
+`X86_SMP_AP_ENV_READY present=2 online=1 ap_idle_live=1 ap_env_ready=1`; `smp4-core`
+same for cpus 1/2/3. No CR3/TSS/LAPIC failure markers; online stayed 1.
+
+**Increment 4 — 183.4 AP INTERRUPT-SAFE IDLE (Task A).** The APs prove they can take
+one controlled interrupt without triple fault, and that any unexpected vector parks
+deterministically instead of triple-faulting:
+
+- **AP-safe IDT (dedicated, NOT the shared kernel BOOT_IDT).** The kernel IDT's gates
+  enter the full Rust trap path (global KernelState, logging, compiled-Rust SSE) — not
+  AP-safe. `descriptor_tables::prepare_ap_idt` builds one shared AP IDT in `.bss`:
+  every vector points at a 16-byte catch-all stub (`.rept 256`, `push vec; jmp common`)
+  that records (vector+1) into `PerCpuRecord.irq_unexpected_vec` via gs: and PARKS
+  (cli/hlt, no iretq); `AP_IRQ_SMOKE_VECTOR` (0xF0) gets the real handler:
+  `irq_hit_count += 1`, `irq_hit_vector = 0xF0`, LAPIC EOI, `iretq` — all pure asm,
+  register-preserving. Gates: CS=0x08 (per-AP GDT kernel code), dpl=0, ist=0. The AP
+  loads it via `lidt [rdi+96]` (IDTR image in the handoff; env flag `IDT_LOADED`).
+- **IST policy: not_required, validated.** Every gate uses ist=0 — the AP never leaves
+  its known-good idle stack (no user mode, no stack switch, no nesting; interrupts are
+  enabled ONLY inside the controlled sti;hlt window), so the interrupted rsp is always
+  valid. The BSP validates no gate names an IST slot (`ap_idt_any_ist_nonzero` →
+  `X86_AP_IST_BAD reason=gate_ist_nonzero_without_per_ap_stacks`; else `X86_AP_IST_OK
+  mode=not_required`). Real per-AP IST stacks land with scheduler-online (183.5).
+- **CR4 sync.** The AP mirrors the BSP's CR4 (`mov cr4 = handoff.bsp_cr4`; env flag
+  `CR4_SYNCED`, markers `X86_AP_CR4_SYNC_OK/FAIL`) — control-state convergence
+  (PGE/OSFXSR/…), the prerequisite for any future compiled-Rust execution on APs
+  (the target spec has no SSE-disabling features).
+- **Controlled interrupt smoke (one IPI, no scheduler tick).** After the env steps the
+  AP publishes `ready_word=3` and waits in the race-free `sti; hlt` pair (sti's
+  interrupt shadow defers delivery until hlt has begun — an IPI sent any time after
+  ready_word=3 either wakes hlt or was already handled; no lost wake), re-checking
+  `gs:[96]` under cli. The BSP sends EXACTLY ONE fixed IPI (`X86_IPI_REMOTE_WAKE_SEND
+  from=0 to=<cpu> vector=0xf0`), then grades: handler hit (`X86_IPI_REMOTE_WAKE_RECV`),
+  AP resumed to the idle path (stage 28→17→18, `X86_IPI_REMOTE_WAKE_ACK`), then after a
+  settle window requires hit_count==1 and no unexpected vector →
+  `X86_AP_INTERRUPT_SMOKE_OK vector=0xf0` (failure grades: `no_handler_hit`,
+  `dup_delivery`, `unexpected_vector`, `no_resume_after_handler`, `idt_not_loaded`).
+  `X86_AP_IDLE_ENTER` is now emitted only after the stage word confirms the AP
+  re-reached the permanent interrupt-masked idle loop (18).
+- New AP stages: `'c'`/25 cr4_synced, `'i'`/26 idt_loaded, `'u'`/27 irq_smoke_wait,
+  `'v'`/28 irq_smoke_done; ApHandoff grew 96→120 (`idtr_image@96`, `bsp_cr4@112`,
+  `.zero 120` + `offset_of!` guard); prepare-time map check extended with the IDT +
+  stub-text VAs (refuses SIPI if unmapped). `ap_interrupt_ready` is a new SEPARATE
+  count; the audit adds `X86_SMP_AP_INTERRUPT_READY present=N online=1 ap_idle_live=M
+  ap_env_ready=K ap_interrupt_ready=J` and the blocker becomes
+  `category=B reason=ap_scheduler_online_admission_required`.
+- **NOT graduated here (hard gates preserved):** scheduler-online (`bring_up_cpu` for
+  APs, `online>1`), periodic timer ticks, D6 SMP dispatch, D2 SMP sender-wake, live
+  TLB shootdown ACK — 183.5/183.6, each gated on the previous marker set passing on
+  the host. `single_cpu` untouched; no fallback knobs. Runner gains `smp6-core` /
+  `smp6-sender-wake` (CPU-count-only profiles). Guarded by
+  `stage183_inc4_ap_interrupt_safe_idle`.
+  Acceptance: `scripts/run-ci-profiles.sh smp2-core` + `smp4-core` (+ optional
+  `smp6-core`), plus `smp2-sender-wake`/`smp4-sender-wake` for the BSP graduated path.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

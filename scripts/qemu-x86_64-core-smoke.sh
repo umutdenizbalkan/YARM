@@ -1916,7 +1916,11 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_AP_TSS_BAD" \
     "X86_AP_LAPIC_BAD" \
     "X86_AP_IDLE_CONTEXT_BAD" \
-    "X86_AP_SCHED_PREREQ_INCOMPLETE"; do
+    "X86_AP_SCHED_PREREQ_INCOMPLETE" \
+    "X86_AP_CR4_SYNC_FAIL" \
+    "X86_AP_IDT_BAD" \
+    "X86_AP_IST_BAD" \
+    "X86_AP_INTERRUPT_SMOKE_FAIL"; do
     if log_has_pattern "$f"; then
       echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
       exit 1
@@ -1927,8 +1931,12 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
   # the GS-verified idle-live verdict (interrupt-masked, NOT scheduler-runnable yet).
   # Stage 183 increment 3: scheduler-admission PREREQUISITES — the APs must additionally
   # prove kernel CR3 live (.bss canary), per-AP GDT/TSS loaded (busy-bit readback), LAPIC
-  # access (ID readback match), timer explicitly deferred (no AP IDT yet), and the idle
-  # task metadata/context (recorded + live-rsp validated; nothing enqueued).
+  # access (ID readback match), timer explicitly deferred (no scheduler tick yet), and
+  # the idle task metadata/context (recorded + live-rsp validated; nothing enqueued).
+  # Stage 183 increment 4: INTERRUPT-SAFE IDLE — CR4 synced with the BSP, the AP-safe
+  # IDT loaded (catch-all park stubs + smoke handler; ist=0 policy validated), and the
+  # controlled interrupt smoke: exactly one BSP->AP fixed IPI handled (gs: count+vector,
+  # LAPIC EOI, iretq) with the AP returning to its interrupt-masked idle loop.
   for m in \
     "X86_AP_SCHED_ADMIT_BEGIN" \
     "X86_AP_GS_OK" \
@@ -1941,9 +1949,19 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_AP_IDLE_TASK_READY" \
     "X86_AP_IDLE_CONTEXT_OK" \
     "X86_AP_SCHED_PREREQ_OK" \
+    "X86_AP_CR4_SYNC_OK" \
+    "X86_AP_IDT_BEGIN" \
+    "X86_AP_IDT_OK" \
+    "X86_AP_IST_OK" \
+    "X86_AP_INTERRUPT_SMOKE_BEGIN" \
+    "X86_IPI_REMOTE_WAKE_SEND" \
+    "X86_IPI_REMOTE_WAKE_RECV" \
+    "X86_IPI_REMOTE_WAKE_ACK" \
+    "X86_AP_INTERRUPT_SMOKE_OK" \
     "X86_AP_IDLE_ENTER" \
     "X86_AP_SCHED_ADMIT_DONE" \
-    "X86_SMP_AP_ENV_READY"; do
+    "X86_SMP_AP_ENV_READY" \
+    "X86_SMP_AP_INTERRUPT_READY"; do
     if ! log_has_pattern "$m"; then
       echo "[error] SMP-LIVE: AP admission/prereq marker missing: $m"
       exit 1
