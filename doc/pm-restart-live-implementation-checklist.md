@@ -500,3 +500,39 @@ SUP-L6C does not change the restart ABI, restart counts, or supported-service sc
 The runtime must now prove each handoff boundary explicitly: initramfs CPIO indexing logs `INITRAMFS_CPIO_ENTRY_COUNT`; crash-test lookup logs `INITRAMFS_LOOKUP_BEGIN` / `INITRAMFS_LOOKUP_HIT`; initramfs reads or file-grant handling log `INITRAMFS_READ_DONE` and `INITRAMFS_READ_ELF_MAGIC_OK`; PM logs `PM_VFS_SPAWN_LOAD_REPLY`, `PM_VFS_SPAWN_LOAD_FIRST4`, and `PM_VFS_SPAWN_ELF_MAGIC_OK`; and failures are classified with `PM_VFS_SPAWN_FAIL_DETAIL site=<reply_decode|elf_parse|mo_create|spawn_from_mo>` instead of collapsing every failure to `Malformed`.
 
 The decision tree is unchanged: lookup miss means fix path normalization or the CPIO inode table; wrong hit size means fix CPIO indexing; bad initramfs first4 means fix runtime CPIO offset/read; good initramfs first4 but bad PM first4/len means fix VFS reply/copy/decode; good PM first4 and length with parse failure means fix ELF parsing only; `mo_create` and `spawn_from_mo` sites remain precise runtime blockers. No slot/cap fabrication, broad restart-any-image support, or kernel/arch changes are introduced.
+
+## SUP-L6P — runtime-authoritative PM restart sender validation
+
+SUP-L6O fixed the accepted-fault token path: supervisor now preserves a
+recorded restart token when present, falls back to the read-only Process Manager
+restart-token query, stores a successful PM-query token in the managed-service
+record, emits `SUPERVISOR_RESTART_TOKEN_STATE ... present=1 source=record|pm-query`,
+and only then enters the task-exit/restart scheduling path.
+
+SUP-L6P fixes the next live blocker in PM restart execution. The root cause was
+that `handle_pm_restart_v1` trusted a stale hardcoded supervisor TID (`4`) while
+the production boot observed by the crash-restart smoke ran the real supervisor
+as TID `2`. The request's `sender_tid=2` is kernel-authenticated IPC metadata,
+and the restart payload's `supervisor_tid=2` matched it, so the anti-spoofing
+cross-check passed; only the stale trusted-supervisor comparison rejected the
+request.
+
+The correct rule is now explicit: PM restart execution trusts the
+runtime-authoritative supervisor TID stored in PM runtime state from the startup
+lifecycle handoff (`startup_context().supervisor_tid`). If that value is absent,
+restart execution fails closed with `PM_RESTART_SENDER_REJECTED ...
+reason=trusted_supervisor_unknown`. If present, `sender_tid` must equal the
+trusted runtime supervisor TID, and any nonzero payload `supervisor_tid` must
+still equal `sender_tid` as an anti-spoofing cross-check. Rejections are marked
+with `PM_RESTART_SENDER_CHECK_BEGIN`, `PM_RESTART_SENDER_REJECTED ...
+reason=untrusted_supervisor`, or `PM_RESTART_SENDER_REJECTED ...
+reason=trusted_supervisor_unknown`; accepted senders emit `PM_RESTART_SENDER_OK`.
+
+Restart-token query behavior remains read-only/open as implemented by SUP-L6O
+and is not treated as execution authority. PM remains authoritative for restart
+execution; the supervisor does not locally spawn or restart tasks. The crash-test
+restart remains gated and narrow, with no broad restart-any-image support. This
+change does not modify kernel code, architecture code, syscall ABI, RPi5 behavior,
+driver-manager DRS behavior, or the PM restart codec layout. The frozen counts
+remain `PROC_OP_PM_RESTART_V1 = 15`, `PROC_OP_PM_RESTART_REPLY_V1 = 16`,
+`PROCESS_IPC_OPCODE_COUNT = 16`, and `SYSCALL_COUNT = 31`.

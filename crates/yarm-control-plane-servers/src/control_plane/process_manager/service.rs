@@ -220,7 +220,6 @@ const PM_RESTART_CONTRACT_VERSION_V1: u16 = 1;
 const PM_RESTART_MAX_ENTRIES: usize = 8;
 const PM_RESTART_MAX_ROLLBACK_STEPS: usize = 8;
 const PM_RESTART_AUTHORITY_MARKER: u32 = 0x504d_5253;
-const PM_RESTART_TRUSTED_SUPERVISOR_TID: u64 = 4;
 const PM_RESTART_MAX_ATTEMPTS_V1: u16 = 3;
 const SUP_L4_SUPPORTED_RESTART_IMAGE_ID: u64 = 6;
 const SUP_L4_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
@@ -425,7 +424,7 @@ pub enum PmRestartValidationFailure {
 pub struct PmRestartValidationPolicy {
     pub supported_version: u16,
     pub verified_supervisor_tid: Option<u64>,
-    pub trusted_supervisor_tid: u64,
+    pub trusted_supervisor_tid: Option<u64>,
     pub target_exists: bool,
     pub resource_preflight_available: bool,
     pub allow_running_duplicate_restart: bool,
@@ -438,8 +437,8 @@ impl Default for PmRestartValidationPolicy {
     fn default() -> Self {
         Self {
             supported_version: PM_RESTART_CONTRACT_VERSION_V1,
-            verified_supervisor_tid: Some(4),
-            trusted_supervisor_tid: 4,
+            verified_supervisor_tid: Some(2),
+            trusted_supervisor_tid: Some(2),
             target_exists: true,
             resource_preflight_available: true,
             allow_running_duplicate_restart: false,
@@ -603,7 +602,7 @@ pub fn validate_pm_restart_request(
 ) -> PmRestartValidationReport {
     let mut report = PmRestartValidationReport::empty();
     let sender_check = match policy.verified_supervisor_tid {
-        Some(tid) if tid == policy.trusted_supervisor_tid => PmRestartSenderCheck::Verified,
+        Some(tid) if Some(tid) == policy.trusted_supervisor_tid => PmRestartSenderCheck::Verified,
         Some(_) => PmRestartSenderCheck::Untrusted,
         None => PmRestartSenderCheck::MissingIdentity,
     };
@@ -633,7 +632,7 @@ pub fn validate_pm_restart_request(
             PmRestartValidationStatus::WouldReject,
             PmRestartValidationFailure::UntrustedSender,
         )
-    } else if request.supervisor_tid != Some(policy.trusted_supervisor_tid) {
+    } else if Some(request.supervisor_tid.unwrap_or_default()) != policy.trusted_supervisor_tid {
         (
             PmRestartValidationStatus::WouldReject,
             PmRestartValidationFailure::MissingRestartAuthority,
@@ -1185,6 +1184,7 @@ pub struct ProcessService {
     supervisor_restart_test_enabled: bool,
     sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection,
     pm_restart_in_progress: [Option<PmRestartInProgress>; PM_RESTART_MAX_IN_PROGRESS],
+    trusted_supervisor_tid: Option<u64>,
     crash_test_restart_specs: [Option<CrashTestRestartSpec>; PM_CRASH_TEST_RESTART_SPEC_MAX],
     handled: usize,
 }
@@ -1589,6 +1589,7 @@ impl ProcessService {
             supervisor_restart_test_enabled,
             sup_l4_pm_restart_rollback_injection: SupL4PmRestartRollbackInjection::None,
             pm_restart_in_progress: [None; PM_RESTART_MAX_IN_PROGRESS],
+            trusted_supervisor_tid: yarm_user_rt::runtime::startup_context().supervisor_tid,
             crash_test_restart_specs: [None; PM_CRASH_TEST_RESTART_SPEC_MAX],
             handled: 0,
         }
@@ -1596,6 +1597,11 @@ impl ProcessService {
 
     pub fn lifecycle_table(&self) -> &LifecycleTable {
         &self.lifecycle_table
+    }
+
+    #[cfg(test)]
+    fn set_trusted_supervisor_tid_for_tests(&mut self, tid: Option<u64>) {
+        self.trusted_supervisor_tid = tid;
     }
 
     #[cfg(test)]
@@ -2470,11 +2476,36 @@ impl ProcessService {
         request: AbiPmRestartRequestV1,
         sender_tid: u64,
     ) -> Result<Message, ProcessManagerError> {
-        if sender_tid == 0 || sender_tid != PM_RESTART_TRUSTED_SUPERVISOR_TID {
+        let trusted_supervisor_tid = self.trusted_supervisor_tid;
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SENDER_CHECK_BEGIN sender_tid={} payload_supervisor_tid={} trusted_supervisor_tid={}",
+            sender_tid,
+            request.supervisor_tid,
+            trusted_supervisor_tid.unwrap_or(0)
+        );
+        if trusted_supervisor_tid.is_none() {
             yarm_user_rt::user_log!(
-                "PM_RESTART_SENDER_REJECTED sender_tid={} payload_supervisor_tid={}",
+                "PM_RESTART_SENDER_REJECTED sender_tid={} trusted=0 reason=trusted_supervisor_unknown",
+                sender_tid
+            );
+            yarm_user_rt::user_log!(
+                "PM_RESTART_VALIDATE_REJECTED reason=trusted_supervisor_unknown"
+            );
+            yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=trusted_supervisor_unknown");
+            return Self::pm_restart_reply(
+                AbiPmRestartReplyStatus::Rejected,
+                AbiPmRestartFailure::MissingRight,
+                request.request_id,
+                request.target_tid,
+                0,
+            );
+        }
+        let trusted_supervisor_tid = trusted_supervisor_tid.unwrap();
+        if sender_tid == 0 || sender_tid != trusted_supervisor_tid {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_SENDER_REJECTED sender_tid={} trusted={} reason=untrusted_supervisor",
                 sender_tid,
-                request.supervisor_tid
+                trusted_supervisor_tid
             );
             yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=sender");
             yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=sender");
@@ -2488,9 +2519,9 @@ impl ProcessService {
         }
         if request.supervisor_tid != 0 && request.supervisor_tid != sender_tid {
             yarm_user_rt::user_log!(
-                "PM_RESTART_SENDER_REJECTED sender_tid={} payload_supervisor_tid={}",
+                "PM_RESTART_SENDER_REJECTED sender_tid={} trusted={} reason=spoofed_supervisor_tid",
                 sender_tid,
-                request.supervisor_tid
+                trusted_supervisor_tid
             );
             yarm_user_rt::user_log!("PM_RESTART_VALIDATE_REJECTED reason=spoofed_supervisor_tid");
             yarm_user_rt::user_log!("PM_RESTART_REPLY_REJECTED reason=spoofed_supervisor_tid");
@@ -4646,11 +4677,15 @@ mod tests {
         );
     }
 
+    const PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID: u64 = 44;
+
     fn seed_pm_restart_target(service: &mut ProcessService, tid: u64) {
+        service.set_trusted_supervisor_tid_for_tests(Some(PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID));
         assert!(service.seed_bootstrap_lifecycle_record(tid, 42));
     }
 
     fn seed_sup_l4_supported_pm_restart_target(service: &mut ProcessService, tid: u64) {
+        service.set_trusted_supervisor_tid_for_tests(Some(PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID));
         assert!(service.seed_bootstrap_lifecycle_record(tid, SUP_L4_SUPPORTED_RESTART_IMAGE_ID));
         service
             .record_restart_token(tid, 0xCAFE)
@@ -4696,10 +4731,10 @@ mod tests {
     fn pm_restart_v1_malformed_truncated_payload_rejected() {
         let mut service = ProcessService::new();
         seed_pm_restart_target(&mut service, 77);
-        let payload = pm_restart_request_payload(1, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let payload = pm_restart_request_payload(1, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
         let reply = pm_restart_call(
             &mut service,
-            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
             &payload[..109],
         );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
@@ -4711,17 +4746,25 @@ mod tests {
     fn pm_restart_v1_unsupported_version_and_invalid_enum_rejected() {
         let mut service = ProcessService::new();
         seed_pm_restart_target(&mut service, 77);
-        let mut payload = pm_restart_request_payload(2, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let mut payload = pm_restart_request_payload(2, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
         payload[0..2].copy_from_slice(&2u16.to_le_bytes());
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::UnsupportedVersion);
         assert_eq!(reply.failure, AbiPmRestartFailure::UnsupportedVersion);
 
-        let mut payload = pm_restart_request_payload(3, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let mut payload = pm_restart_request_payload(3, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
         payload[yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_REASON_OFFSET
             ..yarm_ipc_abi::process_abi::PM_RESTART_REQUEST_REASON_OFFSET + 2]
             .copy_from_slice(&99u16.to_le_bytes());
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
         assert_eq!(reply.replacement_handle_kind, 0);
     }
@@ -4730,13 +4773,17 @@ mod tests {
     fn pm_restart_v1_untrusted_and_spoofed_supervisor_rejected() {
         let mut service = ProcessService::new();
         seed_pm_restart_target(&mut service, 77);
-        let payload = pm_restart_request_payload(4, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let payload = pm_restart_request_payload(4, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
         let reply = pm_restart_call(&mut service, 3, &payload);
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
         assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
 
         let payload = pm_restart_request_payload(5, 99, 77);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
         assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
     }
@@ -4746,15 +4793,15 @@ mod tests {
         let mut service = ProcessService::new();
         seed_pm_restart_target(&mut service, 77);
 
-        let mut raw = pm_restart_request_payload(6, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
+        let mut raw = pm_restart_request_payload(6, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
         raw[96] = 0;
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &raw);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, &raw);
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
         assert_eq!(reply.failure, AbiPmRestartFailure::RawTokenUnsupported);
 
         let wrong_owner = AbiPmRestartRequestV1::new(
             7,
-            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
             77,
             1,
             b"svc",
@@ -4766,19 +4813,23 @@ mod tests {
             yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&wrong_owner).expect("encode");
         let reply = pm_restart_call(
             &mut service,
-            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
             &wrong_owner,
         );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
         assert_eq!(reply.failure, AbiPmRestartFailure::WrongTokenOwner);
 
-        let unknown = pm_restart_request_payload(8, PM_RESTART_TRUSTED_SUPERVISOR_TID, 404);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &unknown);
+        let unknown = pm_restart_request_payload(8, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 404);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &unknown,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::NoSuchTarget);
 
         let mut limit = AbiPmRestartRequestV1::new(
             9,
-            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
             77,
             1,
             b"svc",
@@ -4789,7 +4840,7 @@ mod tests {
         limit.attempt_count = PM_RESTART_MAX_ATTEMPTS_V1 + 1;
         let limit =
             yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&limit).expect("encode");
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &limit);
+        let reply = pm_restart_call(&mut service, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, &limit);
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
         assert_eq!(reply.failure, AbiPmRestartFailure::RestartLimitExceeded);
     }
@@ -4798,8 +4849,12 @@ mod tests {
     fn pm_restart_v1_valid_request_defers_without_replacement_handle() {
         let mut service = ProcessService::new();
         seed_pm_restart_target(&mut service, 77);
-        let payload = pm_restart_request_payload(10, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let payload = pm_restart_request_payload(10, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
         assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
         assert_eq!(reply.replacement_handle_kind, 0);
@@ -4810,8 +4865,12 @@ mod tests {
     fn pm_restart_v1_sup_l4_gate_off_supported_target_still_defers() {
         let mut service = ProcessService::new();
         seed_sup_l4_supported_pm_restart_target(&mut service, 77);
-        let payload = pm_restart_request_payload(11, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let payload = pm_restart_request_payload(11, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
         assert_eq!(reply.failure, AbiPmRestartFailure::ResourceUnavailable);
         assert_eq!(reply.replacement_handle_kind, 0);
@@ -4823,8 +4882,12 @@ mod tests {
         let mut service = ProcessService::new();
         service.enable_sup_l4_pm_restart_mechanism_for_tests();
         seed_pm_restart_target(&mut service, 77);
-        let payload = pm_restart_request_payload(12, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let payload = pm_restart_request_payload(12, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Deferred);
         assert_eq!(reply.replacement_handle_kind, 0);
         assert_eq!(reply.replacement_handle_value, 0);
@@ -4835,8 +4898,12 @@ mod tests {
         let mut service = ProcessService::new();
         service.enable_sup_l4_pm_restart_mechanism_for_tests();
         seed_sup_l4_supported_pm_restart_target(&mut service, 77);
-        let payload = pm_restart_request_payload(13, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let payload = pm_restart_request_payload(13, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Accepted);
         assert_eq!(reply.failure, AbiPmRestartFailure::None);
         assert_eq!(
@@ -4865,7 +4932,7 @@ mod tests {
         seed_sup_l4_supported_pm_restart_target(&mut service, 77);
         let request = AbiPmRestartRequestV1::new(
             14,
-            PM_RESTART_TRUSTED_SUPERVISOR_TID,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
             77,
             1,
             b"svc",
@@ -4875,7 +4942,11 @@ mod tests {
         .expect("request");
         let payload =
             yarm_ipc_abi::process_abi::encode_pm_restart_request_v1(&request).expect("encode");
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
         assert_eq!(reply.failure, AbiPmRestartFailure::WrongTokenOwner);
         assert_eq!(reply.replacement_handle_value, 0);
@@ -4889,8 +4960,12 @@ mod tests {
         service
             .reserve_pm_restart(99, 77)
             .expect("seed in-progress reservation");
-        let payload = pm_restart_request_payload(15, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let payload = pm_restart_request_payload(15, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         sup_l4_assert_rolled_back_without_replacement(reply);
         assert!(service.lifecycle_table().get_by_tid(77).is_some());
     }
@@ -4904,8 +4979,13 @@ mod tests {
         service.enable_sup_l4_pm_restart_rollback_injection_for_tests(injection);
         seed_sup_l4_supported_pm_restart_target(&mut service, 77);
         let before_len = service.lifecycle_table().len();
-        let payload = pm_restart_request_payload(request_id, PM_RESTART_TRUSTED_SUPERVISOR_TID, 77);
-        let reply = pm_restart_call(&mut service, PM_RESTART_TRUSTED_SUPERVISOR_TID, &payload);
+        let payload =
+            pm_restart_request_payload(request_id, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
         sup_l4_assert_rolled_back_without_replacement(reply);
         assert_eq!(service.lifecycle_table().len(), before_len);
         assert!(service.lifecycle_table().get_by_tid(77).is_some());
@@ -4982,14 +5062,19 @@ mod tests {
         );
         service.enable_supervisor_restart_test_for_tests();
         service
-            .register_crash_test_restart_spec_for_tests(77, 1, 4, 0xCAFE)
+            .register_crash_test_restart_spec_for_tests(
+                77,
+                1,
+                PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+                0xCAFE,
+            )
             .expect("register crash-test restart spec");
         let spec = service
             .crash_test_restart_spec_for_tid(77)
             .expect("restart spec");
         assert_eq!(spec.image_id, CRASH_TEST_SRV_IMAGE_ID);
         assert_eq!(spec.parent_tid, 1);
-        assert_eq!(spec.supervisor_tid, PM_RESTART_TRUSTED_SUPERVISOR_TID);
+        assert_eq!(spec.supervisor_tid, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID);
         assert_eq!(spec.max_restarts, CRASH_TEST_DEFAULT_MAX_RESTARTS);
         assert_eq!(spec.token_fingerprint, 0xCAFE);
         assert_eq!(spec.load_source, SpawnLoadSource::Vfs);
@@ -4998,6 +5083,51 @@ mod tests {
             CRASH_TEST_SRV_NAME
         );
         assert!(service.crash_test_restart_spec_for_tid(404).is_none());
+    }
+
+    #[test]
+    fn pm_restart_v1_trusted_supervisor_unknown_fails_closed() {
+        let mut service = ProcessService::new();
+        seed_pm_restart_target(&mut service, 77);
+        service.set_trusted_supervisor_tid_for_tests(None);
+        let payload = pm_restart_request_payload(21, PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID, 77);
+        let reply = pm_restart_call(
+            &mut service,
+            PM_RESTART_TEST_RUNTIME_SUPERVISOR_TID,
+            &payload,
+        );
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
+    }
+
+    #[test]
+    fn pm_restart_v1_tid_two_accepted_only_when_runtime_trusted() {
+        let mut service = ProcessService::new();
+        seed_sup_l4_supported_pm_restart_target(&mut service, 77);
+        service.enable_sup_l4_pm_restart_mechanism_for_tests();
+        service.set_trusted_supervisor_tid_for_tests(Some(2));
+        let payload = pm_restart_request_payload(22, 2, 77);
+        let reply = pm_restart_call(&mut service, 2, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Accepted);
+        assert_eq!(reply.failure, AbiPmRestartFailure::None);
+
+        let payload = pm_restart_request_payload(23, 2, 77);
+        let reply = pm_restart_call(&mut service, 44, &payload);
+        assert_eq!(reply.status, AbiPmRestartReplyStatus::Rejected);
+        assert_eq!(reply.failure, AbiPmRestartFailure::MissingRight);
+    }
+
+    #[test]
+    fn pm_restart_v1_sender_validation_source_guard_runtime_authoritative() {
+        let src = include_str!("service.rs");
+        let handler_start = src.find("fn handle_pm_restart_v1").expect("handler");
+        let handler = &src[handler_start..];
+        assert!(handler.contains("self.trusted_supervisor_tid"));
+        assert!(handler.contains("PM_RESTART_SENDER_CHECK_BEGIN"));
+        assert!(handler.contains("reason=trusted_supervisor_unknown"));
+        assert!(handler.contains("reason=untrusted_supervisor"));
+        assert!(!handler.contains("sender_tid != 4"));
+        assert!(!handler.contains("trusted_supervisor_tid: 4"));
     }
 
     #[test]
