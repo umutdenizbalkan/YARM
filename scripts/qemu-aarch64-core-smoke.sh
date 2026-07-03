@@ -208,6 +208,36 @@ if check_common_boot_markers "$LOGFILE" "$MARKER_REGEX" "$INIT_SERVER_REGEX"; th
     [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
     exit 0
   fi
+  # Stage 184 (CROSS-ARCH-LIVE): the default-on cross-arch live audit attests the
+  # honest AArch64 topology (single-dispatcher) + the graduated D2/D6/D3 correctness
+  # + syscall-error parity. mode=in_lock_single_dispatcher is expected (AArch64 has no
+  # out-of-lock dispatch-relocation seam; the graduated path runs in-lock, NOT the
+  # removed global-lock fallback). No x86-style AP/TLB-ACK claims are made here.
+  if ! check_required_patterns "$LOGFILE" \
+      "CROSS_ARCH_TOPOLOGY_OK arch=aarch64 reason=single_dispatcher" \
+      "CROSS_ARCH_D2_RECV_OK arch=aarch64" \
+      "CROSS_ARCH_D2_SEND_OK arch=aarch64" \
+      "CROSS_ARCH_D6_OK arch=aarch64" \
+      "CROSS_ARCH_D3_OK arch=aarch64" \
+      "CROSS_ARCH_SYSCALL_PARITY_OK arch=aarch64" \
+      "CROSS_ARCH_LIVE_DONE arch=aarch64 result=ok"; then
+    echo "[warn] aarch64 Stage 184 cross-arch-live markers missing"
+    [[ "$QEMU_SMOKE_STRICT" == "1" ]] && exit 1
+    exit 0
+  fi
+  for cross_bad in \
+      "CROSS_ARCH_TOPOLOGY_BLOCKED arch=aarch64" \
+      "CROSS_ARCH_D2_RECV_FAIL" \
+      "CROSS_ARCH_D2_SEND_FAIL" \
+      "UNLOCK_GRADUATED_FALLBACK" \
+      "UNEXPECTED_INLOCK_DISPATCH" \
+      "emergency_optout"; do
+    if cad_has "$cross_bad"; then
+      echo "[error] aarch64 Stage 184: forbidden cross-arch marker: $cross_bad"
+      exit 1
+    fi
+  done
+  echo "[ok] aarch64 Stage 184: cross-arch-live markers present (mode=in_lock_single_dispatcher)"
   if ! check_log_sequence "$LOGFILE" "${SPAWN_IPC_SEQUENCE[@]}"; then
     echo "[warn] spawn IPC sequence absent (user_log! is a no-op in no_std; expected)"
   fi

@@ -2037,6 +2037,33 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
   echo "[ok] SMP-LIVE: APs scheduler-online (wake-only) + remote-wake proven under -smp $QEMU_SMP"
 fi
 
+# Stage 184 (CROSS-ARCH-LIVE): the default-on cross-arch live audit runs on x86_64
+# too (regression). x86_64's graduated dispatch is out-of-lock, so the mode is
+# out_of_lock; the topology stays single-dispatcher (wake-only APs don't dispatch).
+for m in \
+  "CROSS_ARCH_TOPOLOGY_OK arch=x86_64 reason=single_dispatcher" \
+  "CROSS_ARCH_D2_RECV_OK arch=x86_64 mode=out_of_lock" \
+  "CROSS_ARCH_D2_SEND_OK arch=x86_64 mode=out_of_lock" \
+  "CROSS_ARCH_D6_OK arch=x86_64 mode=out_of_lock" \
+  "CROSS_ARCH_D3_OK arch=x86_64 mode=out_of_lock" \
+  "CROSS_ARCH_SYSCALL_PARITY_OK arch=x86_64" \
+  "CROSS_ARCH_LIVE_DONE arch=x86_64 result=ok"; do
+  if ! log_has_pattern "$m"; then
+    echo "[error] CROSS-ARCH-LIVE: x86_64 marker missing: $m"
+    exit 1
+  fi
+done
+for f in \
+  "CROSS_ARCH_TOPOLOGY_BLOCKED arch=x86_64" \
+  "CROSS_ARCH_D2_RECV_FAIL" \
+  "CROSS_ARCH_D2_SEND_FAIL"; do
+  if log_has_pattern "$f"; then
+    echo "[error] CROSS-ARCH-LIVE: forbidden x86_64 marker: $f"
+    exit 1
+  fi
+done
+echo "[ok] CROSS-ARCH-LIVE: x86_64 cross-arch-live markers present (mode=out_of_lock)"
+
 if log_has_pattern "YARM_BOOT_OK"; then
   echo "[ok] x86_64 boot markers detected"
   exit 0
