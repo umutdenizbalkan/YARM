@@ -132,6 +132,32 @@ fn wait_for_icr_idle(apic_id: u8, phase: &str) {
 #[cfg(any(test, feature = "hosted-dev"))]
 fn wait_for_icr_idle(_apic_id: u8, _phase: &str) {}
 
+/// Stage 183 inc.4 fix: read the BSP's own LAPIC ESR (write-to-latch, then read) for
+/// the fixed-IPI send diagnostics.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn bsp_lapic_esr_read() -> u32 {
+    let base = lapic_mmio_base();
+    unsafe {
+        write_volatile((base + 0x280) as *mut u32, 0);
+        read_volatile((base + 0x280) as *const u32)
+    }
+}
+
+/// Stage 183 inc.4 fix: bounded ICR delivery-status wait with a boolean verdict (the
+/// logging `wait_for_icr_idle` keeps its unit signature for the INIT/SIPI path).
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+fn icr_delivery_idle() -> bool {
+    let base = lapic_mmio_base();
+    for _ in 0..ICR_IDLE_POLL_ITERS {
+        let low = unsafe { read_volatile((base + LAPIC_ICR_LOW_OFFSET) as *const u32) };
+        if (low & ICR_DELIVERY_STATUS_PENDING) == 0 {
+            return true;
+        }
+        cpu_relax();
+    }
+    false
+}
+
 fn send_init_sipi_sipi(apic_id: u8) {
     crate::yarm_log!(
         "YARM_SMP_IPI_SEQUENCE_BEGIN apic_id={} trampoline_phys=0x{:x} vector=0x{:02x}",
@@ -439,6 +465,11 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
         idtr_image,
         _pad_idtr: [0; 6],
         bsp_cr4,
+        // Stage 183 inc.4 fix: AP-written LAPIC readiness readbacks start cleared.
+        svr_out: 0,
+        tpr_out: 0,
+        esr_out: 0,
+        _pad_lapic: 0,
     };
 
     crate::yarm_log!(
@@ -772,8 +803,8 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         {
             use super::smp_trampoline::{
                 AP_IDLE_ADMIT_PROOF, AP_STAGE_IDLE_ADMIT_GS_BAD, AP_STAGE_IDLE_ADMIT_OK, ap_env,
-                ap_env_flags_low_virt, ap_lapic_id_out_low_virt, ap_stage_name,
-                ap_stage_word_low_virt,
+                ap_env_flags_low_virt, ap_esr_out_low_virt, ap_lapic_id_out_low_virt,
+                ap_stage_name, ap_stage_word_low_virt, ap_svr_out_low_virt, ap_tpr_out_low_virt,
             };
             if AP_IDLE_ADMIT_PROOF {
                 crate::yarm_log!("X86_AP_SCHED_ADMIT_BEGIN cpu={}", cpu.0);
@@ -982,6 +1013,85 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                         );
                     }
 
+                    // 9b. (183.4 fix) LAPIC interrupt-delivery readiness. The old
+                    //     X86_AP_LAPIC_OK only proved an MMIO *read* (APIC id) — a
+                    //     software-DISABLED LAPIC (SVR bit 8 clear, the post-INIT
+                    //     reset state) still answers reads but silently DROPS fixed
+                    //     IPIs, which is exactly the observed no_handler_hit. The AP
+                    //     now writes SVR=0x1FF / TPR=0 / ESR-clear and publishes the
+                    //     readbacks; grade them here.
+                    crate::yarm_log!("X86_AP_LAPIC_ENABLE_BEGIN cpu={}", cpu.0);
+                    let svr = unsafe { read_volatile(ap_svr_out_low_virt(handoff_off)) };
+                    let tpr = unsafe { read_volatile(ap_tpr_out_low_virt(handoff_off)) };
+                    let esr = unsafe { read_volatile(ap_esr_out_low_virt(handoff_off)) };
+                    let sw_flag = (env & ap_env::LAPIC_SW_ENABLED) != 0;
+                    let svr_ok = sw_flag && (svr & 0x100) != 0;
+                    let tpr_ok = sw_flag && tpr == 0;
+                    let esr_ok = sw_flag && esr == 0;
+                    if svr_ok {
+                        crate::yarm_log!("X86_AP_LAPIC_SVR_OK cpu={} value=0x{:x}", cpu.0, svr);
+                    }
+                    if tpr_ok {
+                        crate::yarm_log!("X86_AP_LAPIC_TPR_OK cpu={} value=0x{:x}", cpu.0, tpr);
+                    }
+                    if esr_ok {
+                        crate::yarm_log!("X86_AP_LAPIC_ESR_OK cpu={} value=0x{:x}", cpu.0, esr);
+                    }
+                    let lapic_int_ready = svr_ok && tpr_ok && esr_ok;
+                    if lapic_int_ready {
+                        crate::yarm_log!("X86_AP_LAPIC_INTERRUPT_READY cpu={}", cpu.0);
+                    } else if !sw_flag {
+                        crate::yarm_log!(
+                            "X86_AP_LAPIC_INTERRUPT_BAD cpu={} reason=enable_flag_missing",
+                            cpu.0
+                        );
+                    } else if !svr_ok {
+                        crate::yarm_log!(
+                            "X86_AP_LAPIC_INTERRUPT_BAD cpu={} reason=svr_sw_enable_clear svr=0x{:x}",
+                            cpu.0,
+                            svr
+                        );
+                    } else if !tpr_ok {
+                        crate::yarm_log!(
+                            "X86_AP_LAPIC_INTERRUPT_BAD cpu={} reason=tpr_masking tpr=0x{:x}",
+                            cpu.0,
+                            tpr
+                        );
+                    } else {
+                        crate::yarm_log!(
+                            "X86_AP_LAPIC_INTERRUPT_BAD cpu={} reason=esr_nonzero esr=0x{:x}",
+                            cpu.0,
+                            esr
+                        );
+                    }
+
+                    // 9c. (183.4 fix) Verify the smoke vector's IDT DESCRIPTOR, not
+                    //     just the IDT base: present, interrupt gate, CS=0x08, ist=0,
+                    //     offset == the smoke stub's linked VA.
+                    {
+                        let (vec_ok, gate_type, selector, ist, offset, expected) =
+                            super::descriptor_tables::ap_idt_smoke_vector_report();
+                        if vec_ok {
+                            crate::yarm_log!(
+                                "X86_AP_IDT_VECTOR_OK cpu={} vector=0xf0 selector=0x{:02x} ist={} type=0x{:x}",
+                                cpu.0,
+                                selector,
+                                ist,
+                                gate_type
+                            );
+                        } else {
+                            crate::yarm_log!(
+                                "X86_AP_IDT_VECTOR_BAD cpu={} vector=0xf0 reason=descriptor_mismatch type=0x{:x} selector=0x{:02x} ist={} offset=0x{:x} expected=0x{:x}",
+                                cpu.0,
+                                gate_type,
+                                selector,
+                                ist,
+                                offset,
+                                expected
+                            );
+                        }
+                    }
+
                     // 10. Interrupt smoke: exactly ONE fixed IPI to this AP. The AP
                     //     waits in sti;hlt (race-free: pending IPIs deliver when hlt
                     //     begins), the pure-asm handler counts + records the vector
@@ -993,13 +1103,53 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                     let mut irq_ok = false;
                     if idt_ok {
                         use super::descriptor_tables::AP_IRQ_SMOKE_VECTOR;
+                        // (183.4 fix) fully-instrumented fixed-IPI send: ESR before/
+                        // after, exact ICR values, delivery-status verdict.
+                        crate::yarm_log!(
+                            "X86_IPI_FIXED_SEND_BEGIN from=0 to={} vector=0x{:x} mode=physical",
+                            cpu.0,
+                            AP_IRQ_SMOKE_VECTOR
+                        );
+                        let esr_before = bsp_lapic_esr_read();
                         wait_for_icr_idle(cpu.0, "before_irq_smoke");
                         crate::yarm_log!(
                             "X86_IPI_REMOTE_WAKE_SEND from=0 to={} vector=0x{:x}",
                             cpu.0,
                             AP_IRQ_SMOKE_VECTOR
                         );
-                        write_icr(cpu.0, AP_IRQ_SMOKE_VECTOR as u32);
+                        let icr_high = (cpu.0 as u32) << 24;
+                        let icr_low = AP_IRQ_SMOKE_VECTOR as u32; // fixed, physical, edge
+                        write_icr(cpu.0, icr_low);
+                        crate::yarm_log!(
+                            "X86_IPI_FIXED_ICR_WRITTEN to={} high=0x{:08x} low=0x{:08x}",
+                            cpu.0,
+                            icr_high,
+                            icr_low
+                        );
+                        let delivery_idle = icr_delivery_idle();
+                        if delivery_idle {
+                            crate::yarm_log!("X86_IPI_FIXED_DELIVERY_IDLE to={}", cpu.0);
+                        }
+                        let esr_after = bsp_lapic_esr_read();
+                        crate::yarm_log!(
+                            "X86_IPI_FIXED_ESR from=0 before=0x{:x} after=0x{:x}",
+                            esr_before,
+                            esr_after
+                        );
+                        if delivery_idle && esr_after == 0 {
+                            crate::yarm_log!("X86_IPI_FIXED_SEND_DONE to={}", cpu.0);
+                        } else if !delivery_idle {
+                            crate::yarm_log!(
+                                "X86_IPI_FIXED_SEND_FAIL to={} reason=delivery_status_stuck",
+                                cpu.0
+                            );
+                        } else {
+                            crate::yarm_log!(
+                                "X86_IPI_FIXED_SEND_FAIL to={} reason=esr_nonzero esr=0x{:x}",
+                                cpu.0,
+                                esr_after
+                            );
+                        }
 
                         let mut hit = false;
                         for _ in 0..AP_READY_POLL_ITERS {

@@ -1919,7 +1919,10 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_AP_SCHED_PREREQ_INCOMPLETE" \
     "X86_AP_CR4_SYNC_FAIL" \
     "X86_AP_IDT_BAD" \
+    "X86_AP_IDT_VECTOR_BAD" \
     "X86_AP_IST_BAD" \
+    "X86_AP_LAPIC_INTERRUPT_BAD" \
+    "X86_IPI_FIXED_SEND_FAIL" \
     "X86_AP_INTERRUPT_SMOKE_FAIL"; do
     if log_has_pattern "$f"; then
       echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
@@ -1952,8 +1955,17 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_AP_CR4_SYNC_OK" \
     "X86_AP_IDT_BEGIN" \
     "X86_AP_IDT_OK" \
+    "X86_AP_IDT_VECTOR_OK" \
     "X86_AP_IST_OK" \
+    "X86_AP_LAPIC_ENABLE_BEGIN" \
+    "X86_AP_LAPIC_SVR_OK" \
+    "X86_AP_LAPIC_TPR_OK" \
+    "X86_AP_LAPIC_ESR_OK" \
+    "X86_AP_LAPIC_INTERRUPT_READY" \
     "X86_AP_INTERRUPT_SMOKE_BEGIN" \
+    "X86_IPI_FIXED_SEND_BEGIN" \
+    "X86_IPI_FIXED_ICR_WRITTEN" \
+    "X86_IPI_FIXED_SEND_DONE" \
     "X86_IPI_REMOTE_WAKE_SEND" \
     "X86_IPI_REMOTE_WAKE_RECV" \
     "X86_IPI_REMOTE_WAKE_ACK" \
