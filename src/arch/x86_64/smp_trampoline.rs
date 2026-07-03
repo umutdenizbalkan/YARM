@@ -296,9 +296,23 @@ ap_long_entry:
     mov al, '2'        // online word written
     out dx, al
 
-    // Jump into Rust AP entry. The Rust function is a diverging
-    // `extern "C" fn` taking the handoff pointer. We use
-    // `movabs rax, OFFSET sym; jmp rax` so the linker resolves the
+    // Stage 183 inc.2 fix: publish stage 9 (rust_jump) through the KNOWN absolute
+    // low address BEFORE transferring to Rust — deliberately NOT via rdi, so this
+    // stage is recorded even if the jump target or the register handoff is broken.
+    // last_stage=rust_jump on a BSP timeout then means "died between jmp rax and
+    // the Rust entry's first store".
+    mov dword ptr [AP_TRAMPOLINE_BASE + AP_OFF_HANDOFF + 48], 9
+
+    mov al, '>'        // about to jmp into the Rust AP entry
+    out dx, al
+
+    // Jump into Rust AP entry. The Rust function is a diverging NAKED
+    // `extern "C" fn` taking the handoff pointer in rdi per the SysV
+    // calling convention. Because the entry is naked (no compiler
+    // prologue), the `mov rdi, ...` below IS the argument-passing
+    // contract — the first instruction of the entry sees rdi exactly as
+    // set here (same transfer pattern as Redox's trampoline→kstart_ap).
+    // We use `movabs rax, OFFSET sym; jmp rax` so the linker resolves the
     // absolute 64-bit virtual address of the Rust entry — no
     // handoff-field patching required. The bootstrap PML4 maps the
     // higher-half kernel text (`debug_root_maps_virt(ap_entry)` is
@@ -307,9 +321,18 @@ ap_long_entry:
     // FALLBACK SAFETY: if for any reason Rust returns (it shouldn't with
     // -> !), fall through to the assembly cli/hlt park loop. This
     // preserves the AP from runaway execution.
+    //
+    // Stage 183 inc.2 root cause: `add rdi, AP_OFF_HANDOFF` (bare, no OFFSET)
+    // assembled as `add rdi, QWORD PTR [0x140]` — GAS Intel syntax treats a
+    // bare symbol-difference `.set` as a MEMORY operand, so rdi got
+    // 0x7000 + <8 bytes of BIOS IVT junk at phys 0x140> instead of
+    // 0x7000 + 0x140. The first store through rdi in the Rust entry then
+    // faulted (no AP IDT → triple fault → silence after '@'). `OFFSET`
+    // forces the immediate, same idiom as the movabs above. Pure-numeric
+    // `.set`s (AP_TRAMPOLINE_BASE) and bracketed uses were never affected.
     movabs rax, OFFSET yarm_x86_64_ap_entry
     mov rdi, rbx
-    add rdi, AP_OFF_HANDOFF
+    add rdi, OFFSET AP_OFF_HANDOFF
     jmp rax
 
     // Fallback assembly park (unreachable if Rust does not return).
@@ -419,13 +442,16 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 //   'S'   after `mov rsp,[..8]; and rsp,-16`          AP stack installed + aligned
 //   'R'   after `[handoff+32]=1`                      ready_word=1 (trampoline reached)
 //   '2'   after `[handoff+32]=2`                      ready_word=2 (Rust online published)
-//   ...   `movabs rax,OFFSET yarm_x86_64_ap_entry; jmp rax` → higher-half Rust
+//   '>'   AP_STAGE_RUST_JUMP (9) written via the      about to `movabs rax,OFFSET
+//         ABSOLUTE low address (not rdi)              yarm_x86_64_ap_entry; jmp rax`
 //
-// Rust AP entry breadcrumbs (paired with stage word [handoff+48], asm in
+// Rust AP entry breadcrumbs (paired with stage word [handoff+48], naked_asm in
 // yarm_x86_64_ap_entry below). "failure after this byte" = the AP died between
 // this stage and the next expected one:
 //   byte  stage word                     next expected   failure-after meaning
 //   '@'   AP_STAGE_RUST_ENTERED (10)      'H'             higher-half text ran; died before handoff load
+//         (failure BETWEEN '>' and '@' → last_stage=rust_jump: the jmp target or
+//          the rdi register handoff broke — see the naked-entry contract below)
 //   'H'   AP_STAGE_HANDOFF_LOADED (11)    'V'/'!'         read [rdi+40]; died before null check
 //   'V'   AP_STAGE_HANDOFF_VALIDATED (12) 'W'             percpu_record_ptr non-null; died before wrmsr
 //   'W'   AP_STAGE_BEFORE_WRMSR (13)      'w'             about to wrmsr IA32_GS_BASE; #GP/fault in wrmsr
@@ -441,8 +467,11 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 // maps text + low identity ONLY (no .bss/.data/MMIO), interrupts masked (no AP IDT).
 // The stage word / ready_word / percpu_record_ptr all live in the low identity page.
 
-// Fine-grained AP stage-word codes (written to [handoff+48] by yarm_x86_64_ap_entry).
+// Fine-grained AP stage-word codes (written to [handoff+48] by yarm_x86_64_ap_entry,
+// except RUST_JUMP which the trampoline writes via the absolute low address).
 // The BSP reads this on admit-poll timeout to name the last stage the AP reached.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_RUST_JUMP: u32 = 9;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_RUST_ENTERED: u32 = 10;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -473,6 +502,7 @@ pub(super) fn ap_stage_name(raw: u32) -> &'static str {
         0 => "none",
         AP_STAGE_RUST_ONLINE => "rust_online",
         AP_STAGE_IDLE_ADMIT_OK => "idle_admit_ok",
+        AP_STAGE_RUST_JUMP => "rust_jump",
         AP_STAGE_RUST_ENTERED => "rust_entered",
         AP_STAGE_HANDOFF_LOADED => "handoff_loaded",
         AP_STAGE_HANDOFF_VALIDATED => "handoff_validated",
@@ -488,121 +518,121 @@ pub(super) fn ap_stage_name(raw: u32) -> &'static str {
     }
 }
 
+/// Stage 183 inc.2 `@ → H` root-cause fix: this entry is now a **naked function**.
+///
+/// The previous non-naked form read `rdi` inside a regular `asm!` block WITHOUT an
+/// `in("rdi") handoff_ptr` operand. Per the Rust reference inline-assembly rule
+/// `asm.rules.reg-not-input` — "Any registers not specified as inputs will contain
+/// an undefined value on entry to the assembly code" — `rdi` was formally undefined
+/// at the asm boundary, so the first instruction after the `@` breadcrumb
+/// (`mov dword ptr [rdi + 48], 10`) stored through an undefined pointer. On an AP
+/// with no IDT that faults → triple fault → the observed silent death after `@`
+/// (`let _ = handoff_ptr;` binds nothing at the register level).
+///
+/// Per the naked-functions reference, a `#[unsafe(naked)]` function has NO compiler
+/// prologue/epilogue and "may assume that the call stack and register state are
+/// valid on entry as per the signature and calling convention" — so `rdi ==
+/// handoff_ptr` is guaranteed at the FIRST instruction, and the trampoline's
+/// `mov rdi, rbx; add rdi, AP_OFF_HANDOFF; jmp rax` IS the whole ABI contract
+/// (the same trampoline→naked-entry transfer Redox uses for `kstart_ap`). This
+/// also removes any compiler-generated prologue that could touch the stack/SSE.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> ! {
-    // `AP_IDLE_ADMIT_PROOF` is a compile-time const, so exactly one arm survives — no
-    // Rust branch/prologue that could touch `.bss` or emit SSE (the AP's CR4 has only PAE
-    // and the bootstrap PML4 maps only text + low identity). Both arms are 100% inline asm.
-    let _ = handoff_ptr;
-    if AP_IDLE_ADMIT_PROOF {
-        // ApHandoff offsets (rdi = handoff_ptr): ready_word=32, percpu_record_ptr=40,
-        // ap_stage=48. Every risky action is preceded by a paired serial breadcrumb byte
-        // AND a stage-word write to [rdi+48], so a BSP timeout can name the last stage.
-        // `dx` is reloaded to 0x3F8 before each `out` because rdmsr/wrmsr clobber rdx.
-        // See the "AP breadcrumb ⇄ stage trace map" table above for the byte↔stage↔block
-        // mapping and the "failure after this byte" semantics.
-        unsafe {
-            core::arch::asm!(
-                "cli",
-                // '@' / stage 10: the Rust-entered breadcrumb — higher-half Rust text ran.
-                "mov dx, 0x3F8",
-                "mov al, 0x40", // '@'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 10",
-                // 'H' / stage 11: load handoff pointer (percpu_record_ptr → GS base).
-                "mov rsi, [rdi + 40]",
-                "mov al, 0x48", // 'H'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 11",
-                // Validate the handoff pointer: null ⇒ BSP bug, skip wrmsr, idle at 253.
-                "test rsi, rsi",
-                "jz 6f",
-                // 'V' / stage 12: handoff pointer validated (non-null).
-                "mov al, 0x56", // 'V'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 12",
-                // 'W' / stage 13: about to wrmsr IA32_GS_BASE.
-                "mov al, 0x57", // 'W'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 13",
-                // wrmsr IA32_GS_BASE(0xC000_0101) = rsi (edx:eax = hi:lo).
-                "mov ecx, 0xC0000101",
-                "mov rax, rsi",
-                "mov rdx, rsi",
-                "shr rdx, 32",
-                "wrmsr",
-                // 'w' / stage 14: wrmsr returned.
-                "mov dx, 0x3F8",
-                "mov al, 0x77", // 'w'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 14",
-                // rdmsr IA32_GS_BASE readback → reconstruct into rax.
-                "mov ecx, 0xC0000101",
-                "rdmsr",
-                "shl rdx, 32",
-                "or rax, rdx",
-                // 'r' / stage 15: rdmsr returned (rax = readback).
-                "mov dx, 0x3F8",
-                "mov r8, rax",  // preserve readback across the breadcrumb
-                "mov al, 0x72", // 'r'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 15",
-                // Compare readback (r8) with the value written (rsi).
-                "cmp r8, rsi",
-                "jne 8f",
-                // 'O' / stage 16: GS verified. Publish ready_word=3 (admit ok).
-                "mov al, 0x4F", // 'O'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 16",
-                "mov dword ptr [rdi + 32], 3",
-                "jmp 5f",
-                "8:",
-                // 'B' / stage 254: GS readback mismatch. Publish ready_word=254; still idle.
-                "mov al, 0x42", // 'B'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 254",
-                "mov dword ptr [rdi + 32], 254",
-                "jmp 5f",
-                "6:",
-                // '!' / stage 253: handoff pointer was null (BSP bug). ready_word=254; idle.
-                "mov al, 0x21", // '!'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 253",
-                "mov dword ptr [rdi + 32], 254",
-                "5:",
-                // 'I' / stage 17: about to enter the cli/hlt idle loop.
-                "mov al, 0x49", // 'I'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 17",
-                // Idle loop: interrupts masked (no AP IDT/LAPIC yet).
-                "cli",
-                // 'Z' / stage 18: parked in idle.
-                "mov al, 0x5A", // 'Z'
-                "out dx, al",
-                "mov dword ptr [rdi + 48], 18",
-                "7:",
-                "hlt",
-                "jmp 7b",
-                // No output/clobber operands: `noreturn` forbids outputs, and execution
-                // never returns here, so r8/rax/rcx/rdx clobbers are moot.
-                options(noreturn, nostack),
-            );
-        }
-    } else {
-        unsafe {
-            core::arch::asm!(
-                "cli",
-                "mov dx, 0x3F8",
-                "mov al, 0x40",
-                "out dx, al",
-                "2:",
-                "hlt",
-                "jmp 2b",
-                options(noreturn, nostack, nomem),
-            );
-        }
-    }
+    // ApHandoff offsets (rdi = handoff_ptr, guaranteed by the naked calling-convention
+    // contract): ready_word=32, percpu_record_ptr=40, ap_stage=48. Every risky action is
+    // preceded by a paired serial breadcrumb byte AND a stage-word write to [rdi+48], so
+    // a BSP timeout can name the last stage. `dx` is reloaded to 0x3F8 before each `out`
+    // because rdmsr/wrmsr clobber rdx. See the "AP breadcrumb ⇄ stage trace map" table
+    // above for the byte↔stage↔block mapping and "failure after this byte" semantics.
+    // `AP_IDLE_ADMIT_PROOF` (compile-time, non-knob) gates the BSP-side admit poll; this
+    // naked body IS the admit path (GS wrmsr/rdmsr verify → interrupt-masked idle).
+    core::arch::naked_asm!(
+        "cli",
+        // '@' / stage 10: the Rust-entered breadcrumb — higher-half Rust text ran.
+        "mov dx, 0x3F8",
+        "mov al, 0x40", // '@'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 10",
+        // 'H' / stage 11: load handoff pointer (percpu_record_ptr → GS base).
+        "mov rsi, [rdi + 40]",
+        "mov al, 0x48", // 'H'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 11",
+        // Validate the handoff pointer: null ⇒ BSP bug, skip wrmsr, idle at 253.
+        "test rsi, rsi",
+        "jz 6f",
+        // 'V' / stage 12: handoff pointer validated (non-null).
+        "mov al, 0x56", // 'V'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 12",
+        // 'W' / stage 13: about to wrmsr IA32_GS_BASE.
+        "mov al, 0x57", // 'W'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 13",
+        // wrmsr IA32_GS_BASE(0xC000_0101) = rsi (edx:eax = hi:lo).
+        "mov ecx, 0xC0000101",
+        "mov rax, rsi",
+        "mov rdx, rsi",
+        "shr rdx, 32",
+        "wrmsr",
+        // 'w' / stage 14: wrmsr returned.
+        "mov dx, 0x3F8",
+        "mov al, 0x77", // 'w'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 14",
+        // rdmsr IA32_GS_BASE readback → reconstruct into rax.
+        "mov ecx, 0xC0000101",
+        "rdmsr",
+        "shl rdx, 32",
+        "or rax, rdx",
+        // 'r' / stage 15: rdmsr returned (rax = readback).
+        "mov dx, 0x3F8",
+        "mov r8, rax",  // preserve readback across the breadcrumb
+        "mov al, 0x72", // 'r'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 15",
+        // Compare readback (r8) with the value written (rsi).
+        "cmp r8, rsi",
+        "jne 8f",
+        // 'O' / stage 16: GS verified. Publish ready_word=3 (admit ok).
+        "mov al, 0x4F", // 'O'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 16",
+        "mov dword ptr [rdi + 32], 3",
+        "jmp 5f",
+        "8:",
+        // 'B' / stage 254: GS readback mismatch. Publish ready_word=254; still idle.
+        "mov al, 0x42", // 'B'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 254",
+        "mov dword ptr [rdi + 32], 254",
+        "jmp 5f",
+        "6:",
+        // '!' / stage 253: handoff pointer was null (BSP bug). ready_word=254; idle.
+        "mov al, 0x21", // '!'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 253",
+        "mov dword ptr [rdi + 32], 254",
+        "5:",
+        // 'I' / stage 17: about to enter the cli/hlt idle loop.
+        "mov al, 0x49", // 'I'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 17",
+        // Idle loop: interrupts masked (no AP IDT/LAPIC yet).
+        "cli",
+        // 'Z' / stage 18: parked in idle.
+        "mov al, 0x5A", // 'Z'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 18",
+        "7:",
+        "hlt",
+        "jmp 7b",
+        // naked_asm! takes no operands/options: the body IS the function, it
+        // diverges (hlt loop), and register use is governed by the naked
+        // calling-convention contract (rdi = handoff_ptr at entry).
+    )
 }
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
