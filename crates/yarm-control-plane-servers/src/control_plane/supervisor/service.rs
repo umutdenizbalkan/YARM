@@ -1791,7 +1791,21 @@ pub fn run() {
                 }
             }
             loop {
+                yarm_user_rt::user_log!(
+                    "SUPERVISOR_EVENT_LOOP_TICK tick={}",
+                    supervisor.current_tick.0
+                );
                 let mut made_progress = false;
+                let drained = supervisor_drain_fault_endpoint(
+                    &mut supervisor,
+                    &mut transport,
+                    process_manager_caps,
+                    startup.task_id,
+                );
+                if drained > 0 {
+                    made_progress = true;
+                }
+                yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
                 match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
                     Ok(Some(msg)) => {
                         made_progress = true;
@@ -1866,7 +1880,9 @@ pub fn run() {
                             );
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_EMPTY");
+                    }
                     Err(err) => {
                         yarm_user_rt::user_log!("supervisor.srv control recv error: {:?}", err);
                     }
@@ -2161,14 +2177,34 @@ pub fn run() {
                 }
 
                 if !made_progress {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_CONTROL_WAIT_BEGIN timeout={}",
+                        SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS
+                    );
                     match supervisor_idle_wait(
                         &mut transport,
                         supervisor.handoff.supervisor_control_recv_cap.0 as u32,
                     ) {
-                        Ok(true) | Ok(false) => {}
+                        Ok(true) => {
+                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=message");
+                            made_progress = true;
+                        }
+                        Ok(false) => {
+                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=empty");
+                        }
                         Err(err) => {
+                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=err");
                             yarm_user_rt::user_log!("supervisor.srv idle wait error: {:?}", err)
                         }
+                    }
+                    let drained = supervisor_drain_fault_endpoint(
+                        &mut supervisor,
+                        &mut transport,
+                        process_manager_caps,
+                        startup.task_id,
+                    );
+                    if drained > 0 {
+                        made_progress = true;
                     }
                 }
 
@@ -2286,6 +2322,305 @@ fn query_restart_token_via_process_manager(
     Ok(reply.found_token())
 }
 
+#[cfg(not(test))]
+const SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK: usize = 8;
+
+#[cfg(not(test))]
+fn supervisor_handle_fault_endpoint_message(
+    supervisor: &mut SupervisorService,
+    transport: &mut impl IpcTransport,
+    process_manager_caps: Option<(u32, u32)>,
+    supervisor_tid: u64,
+    msg: Message,
+) -> bool {
+    match msg.opcode {
+        SUPERVISOR_OP_FAULT_REPORT_WIRE => {
+            match SupervisorFaultReportWire::decode(msg.as_slice()) {
+                Some(fault) => {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_FAULT_REPORT_RECV claimed_tid={} sender_tid={}",
+                        fault.tid,
+                        msg.sender_tid.0
+                    );
+                    if let Err(err) =
+                        supervisor.validate_fault_sender(msg.sender_tid.0, fault.tid, true)
+                    {
+                        yarm_user_rt::user_log!(
+                            "supervisor.srv fault sender rejected: tid={}, sender={}, err={:?}",
+                            fault.tid,
+                            msg.sender_tid.0,
+                            err
+                        );
+                        yarm_user_rt::user_log!("SUPERVISOR_FAULT_SENDER_REJECTED");
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_FAULT_REPORT_REJECTED tid={} sender={} reason={:?}",
+                            fault.tid,
+                            msg.sender_tid.0,
+                            err
+                        );
+                        return true;
+                    }
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_FAULT_SENDER_OK tid={} sender={}",
+                        fault.tid,
+                        msg.sender_tid.0
+                    );
+                    yarm_user_rt::user_log!("SUPERVISOR_FAULT_REPORT_ACCEPTED tid={}", fault.tid);
+                    yarm_user_rt::user_log!("SUPERVISOR_POST_FAULT_ACCEPT_BEGIN tid={}", fault.tid);
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_FAULT_LOOKUP_BEGIN fault_tid={}",
+                        fault.tid
+                    );
+                    match supervisor.find_record(fault.tid) {
+                        Some(record) => {
+                            let policy = supervisor.policy_for(record);
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RECORD_LOOKUP tid={} result=found",
+                                fault.tid
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_FAULT_LOOKUP_OK fault_tid={} record_tid={} attempt={}",
+                                fault.tid,
+                                record.tid,
+                                record.restart_attempts
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RECORD_STATE tid={} max_restarts={} attempts={} token_present={} pending={:?} degraded={}",
+                                fault.tid,
+                                policy.max_restarts,
+                                record.restart_attempts,
+                                usize::from(record.pending_restart_token.is_some()),
+                                record.pm_restart_state,
+                                supervisor.degraded
+                            );
+                        }
+                        None => {
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RECORD_LOOKUP tid={} result=missing",
+                                fault.tid
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_FAULT_LOOKUP_FAIL fault_tid={} reason=unmanaged",
+                                fault.tid
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RESTART_NOT_SCHEDULED tid={} reason=unmanaged",
+                                fault.tid
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=missing-record",
+                                fault.tid
+                            );
+                        }
+                    }
+                    let token_result = supervisor
+                        .find_record(fault.tid)
+                        .and_then(|record| record.pending_restart_token)
+                        .map(|token| Ok(Some((token, "record"))))
+                        .unwrap_or_else(|| {
+                            query_restart_token_via_process_manager(
+                                transport,
+                                process_manager_caps,
+                                fault.tid,
+                            )
+                            .map(|token| token.map(|token| (token, "pm-query")))
+                        });
+                    match token_result {
+                        Ok(Some((restart_token, token_source))) => {
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=1 source={}",
+                                fault.tid,
+                                token_source
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_RECEIVED tid={} fingerprint={}",
+                                fault.tid,
+                                (restart_token & 0xffff) as u16
+                            );
+                            if token_source == "pm-query" {
+                                if let Some(record) = supervisor.find_record_mut(fault.tid) {
+                                    record.pending_restart_token = Some(restart_token);
+                                }
+                            }
+                            let event = TaskExitedEvent {
+                                tid: fault.tid,
+                                exit_code: fault.synthetic_exit_code(),
+                                restart_token,
+                            };
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_POST_FAULT_ACCEPT_CALL_HANDLE_EXIT tid={}",
+                                fault.tid
+                            );
+                            let mut ops = RuntimeSupervisorTaskExitOps {
+                                token_tid: fault.tid,
+                                token: restart_token,
+                                supervisor_tid,
+                                process_manager_caps,
+                            };
+                            match supervisor.handle_task_exit(&mut ops, event) {
+                                Ok(SupervisorDecision::ScheduledRestart {
+                                    tid, due_tick, ..
+                                }) => {
+                                    yarm_user_rt::user_log!(
+                                        "supervisor.srv restart scheduled through due path only: tid={}, due_tick={}",
+                                        tid,
+                                        due_tick.0
+                                    );
+                                    let attempt = supervisor
+                                        .find_record(tid)
+                                        .map(|record| record.restart_attempts)
+                                        .unwrap_or(0);
+                                    yarm_user_rt::user_log!(
+                                        "SUPERVISOR_RESTART_DUE tid={} attempt={}",
+                                        tid,
+                                        attempt
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(err) => {
+                                    yarm_user_rt::user_log!(
+                                        "supervisor.srv failed to apply restart policy decision: tid={}, err={:?}",
+                                        fault.tid,
+                                        err
+                                    );
+                                    yarm_user_rt::user_log!(
+                                        "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=handle-exit-err",
+                                        fault.tid
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=0 source=missing",
+                                fault.tid
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=missing-token",
+                                fault.tid
+                            );
+                        }
+                        Err(err) => {
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RESTART_TOKEN_STATE tid={} present=0 source=missing",
+                                fault.tid
+                            );
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid={} reason=token-query-err",
+                                fault.tid
+                            );
+                            yarm_user_rt::user_log!(
+                                "supervisor.srv restart-token lookup failed: tid={}, err={:?}",
+                                fault.tid,
+                                err
+                            );
+                        }
+                    }
+                    true
+                }
+                None => {
+                    yarm_user_rt::user_log!(
+                        "supervisor.srv fault report decode failed: len={}",
+                        msg.as_slice().len()
+                    );
+                    true
+                }
+            }
+        }
+        SUPERVISOR_OP_TASK_EXITED => {
+            if let Some(event) = TaskExitedEvent::decode(msg.as_slice()) {
+                if let Err(err) =
+                    supervisor.validate_fault_sender(msg.sender_tid.0, event.tid, true)
+                {
+                    yarm_user_rt::user_log!(
+                        "supervisor.srv task-exited sender rejected: tid={}, sender={}, err={:?}",
+                        event.tid,
+                        msg.sender_tid.0,
+                        err
+                    );
+                    yarm_user_rt::user_log!("SUPERVISOR_FAULT_SENDER_REJECTED");
+                } else {
+                    let mut ops = RuntimeSupervisorTaskExitOps {
+                        token_tid: event.tid,
+                        token: event.restart_token,
+                        supervisor_tid,
+                        process_manager_caps,
+                    };
+                    match supervisor.handle_task_exit(&mut ops, event) {
+                        Ok(decision) => yarm_user_rt::user_log!(
+                            "supervisor.srv task-exited handled: decision={:?}",
+                            decision
+                        ),
+                        Err(err) => yarm_user_rt::user_log!(
+                            "supervisor.srv task-exited handler error: tid={}, err={:?}",
+                            event.tid,
+                            err
+                        ),
+                    }
+                }
+            }
+            true
+        }
+        _ => {
+            yarm_user_rt::user_log!(
+                "supervisor.srv fault/control unknown opcode: opcode={}",
+                msg.opcode
+            );
+            true
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn supervisor_drain_fault_endpoint(
+    supervisor: &mut SupervisorService,
+    transport: &mut impl IpcTransport,
+    process_manager_caps: Option<(u32, u32)>,
+    supervisor_tid: u64,
+) -> usize {
+    let fault_cap = supervisor.handoff.supervisor_fault_recv_cap.0 as u32;
+    yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_BEGIN");
+    let mut count = 0usize;
+    while count < SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK {
+        match transport.recv(fault_cap) {
+            Ok(Some(msg)) => {
+                let queued_tid = if msg.opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE {
+                    SupervisorFaultReportWire::decode(msg.as_slice()).map(|fault| fault.tid)
+                } else {
+                    None
+                };
+                if let Some(tid) = queued_tid {
+                    yarm_user_rt::user_log!("SUPERVISOR_FAULT_QUEUE_PENDING_DRAIN tid={}", tid);
+                    yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_RECV tid={}", tid);
+                } else {
+                    yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_RECV tid=0");
+                }
+                if supervisor_handle_fault_endpoint_message(
+                    supervisor,
+                    transport,
+                    process_manager_caps,
+                    supervisor_tid,
+                    msg,
+                ) {
+                    count += 1;
+                }
+                if let Some(tid) = queued_tid {
+                    yarm_user_rt::user_log!("SUPERVISOR_FAULT_QUEUE_DRAINED tid={}", tid);
+                }
+            }
+            Ok(None) => {
+                yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_EMPTY");
+                break;
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!("supervisor.srv fault recv error: {:?}", err);
+                break;
+            }
+        }
+    }
+    yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_DONE count={}", count);
+    count
+}
 /// Query PM's lifecycle table for `tid`.
 ///
 /// Uses the same `ipc_call` + `ipc_recv_with_deadline` pattern as

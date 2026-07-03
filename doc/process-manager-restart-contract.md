@@ -974,3 +974,39 @@ path remains gated to the crash-test image; the supervisor still does not spawn
 or restart locally. `PROC_OP_PM_RESTART_V1 = 15`,
 `PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
 `SYSCALL_COUNT = 31`, and PM restart request/reply lengths 110/50 remain frozen.
+
+## SUP-L7D — drain queued replacement fault reports
+
+User-local QEMU after SUP-L7C proved replacement fault delivery itself works:
+`TASK_FAULT_REPORT_ENQUEUE_OK tid=10009 endpoint=3 queued=1 woke=0` showed the
+kernel queued the replacement fault report on the supervisor fault endpoint. The
+missing markers were supervisor-side receive/lookup/schedule markers for tid
+10009, so the blocker was not PM replacement fault binding or kernel delivery;
+it was userspace supervisor event-loop fairness.
+
+The supervisor loop previously polled control before fault and only consumed one
+fault report in the main pass. If no task was blocked on the fault endpoint when
+the replacement fault was enqueued (`woke=0`), the report could remain queued
+until a later pass while the loop performed control polling/waiting and other
+work. SUP-L7D adds a bounded fault-drain phase at the top of each loop iteration
+and another drain immediately after the bounded control wait returns. The drain
+uses nonblocking `transport.recv(fault_cap)` repeatedly up to
+`SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK`, logging `SUPERVISOR_FAULT_DRAIN_BEGIN`,
+`SUPERVISOR_FAULT_DRAIN_RECV`, `SUPERVISOR_FAULT_DRAIN_EMPTY`, and
+`SUPERVISOR_FAULT_DRAIN_DONE count=<n>`.
+
+Queued fault reports now log `SUPERVISOR_FAULT_QUEUE_PENDING_DRAIN tid=<tid>`
+before processing and `SUPERVISOR_FAULT_QUEUE_DRAINED tid=<tid>` afterwards.
+The existing fault handling path is preserved: drained replacement faults still
+emit `SUPERVISOR_FAULT_REPORT_RECV`, `SUPERVISOR_FAULT_LOOKUP_BEGIN`,
+`SUPERVISOR_FAULT_LOOKUP_OK`, `SUPERVISOR_RESTART_ATTEMPT_ADVANCE`, and
+`SUPERVISOR_RESTART_SCHEDULED`. The bounded drain prevents busy-spinning, while
+control polling and the bounded control wait remain in the loop so control
+messages are not starved.
+
+PM remains restart authority; the supervisor remains policy/state owner and does
+not locally spawn or restart. No PM sender-validation, PM reply validation,
+lineage-update, kernel, syscall ABI, arch, RPi5, driver-manager DRS, or PM
+restart codec layout changes. `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and PM restart request/reply lengths 110/50 remain frozen.
