@@ -1235,6 +1235,22 @@ pub(crate) fn unlock_graduated_proof_try_start() -> bool {
         .is_ok()
 }
 
+/// Stage 183.5: set once the graduated one-shot proof has emitted its verdict
+/// (any result). The AP scheduler-online admission is sequenced AFTER this so
+/// the accepted graduated evidence still runs on the BSP with `online == 1`
+/// (the proof's out-of-lock seam slices require the single-CPU topology until
+/// 183.6 proves them under SMP).
+pub(crate) static UNLOCK_GRADUATED_PROOF_COMPLETED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn unlock_graduated_proof_completed() -> bool {
+    UNLOCK_GRADUATED_PROOF_COMPLETED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn set_unlock_graduated_proof_completed() {
+    UNLOCK_GRADUATED_PROOF_COMPLETED.store(true, core::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn d6_controlled_switch_proof_done() -> bool {
     D6_CONTROLLED_SWITCH_PROOF_DONE.load(core::sync::atomic::Ordering::Acquire)
 }

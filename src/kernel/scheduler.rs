@@ -366,6 +366,14 @@ pub struct SmpScheduler {
     schedulers: [PriorityScheduler; MAX_CPUS],
     topology: CpuTopology,
     next_balance_cpu: usize,
+    // Stage 183.5: CPUs that are ONLINE for accounting/wake (they idle, receive
+    // IPIs, and have a scheduler-owned idle current) but do NOT yet run a
+    // dispatcher, so task PLACEMENT on them is denied — `enqueue_balanced` skips
+    // them and explicit enqueues are rejected. This is the intermediate
+    // "wake-only online" admission state between idle-live and full dispatch;
+    // 183.6+ clears the bit per CPU when its dispatch loop is wired. NOT a
+    // fallback knob: no boot option touches it.
+    wake_only: u64,
 }
 
 impl Default for SmpScheduler {
@@ -374,6 +382,7 @@ impl Default for SmpScheduler {
             schedulers: core::array::from_fn(|_| PriorityScheduler::default()),
             topology: CpuTopology::from_present_bitmap(topology::default_present_cpu_bitmap()),
             next_balance_cpu: 0,
+            wake_only: 0,
         }
     }
 }
@@ -399,10 +408,58 @@ impl SmpScheduler {
         self.check_online_cpu(cpu).map(|_| ())
     }
 
+    /// Stage 183.5: mark/unmark `cpu` wake-only (online for accounting/wake, no task
+    /// placement — see the field doc). Idempotent.
+    pub fn set_cpu_wake_only(&mut self, cpu: CpuId, wake_only: bool) -> Result<(), SchedulerError> {
+        let idx = Self::check_cpu(cpu)?;
+        if wake_only {
+            self.wake_only |= 1u64 << idx;
+        } else {
+            self.wake_only &= !(1u64 << idx);
+        }
+        Ok(())
+    }
+
+    pub fn cpu_wake_only(&self, cpu: CpuId) -> bool {
+        Self::check_cpu(cpu)
+            .map(|idx| self.wake_only & (1u64 << idx) != 0)
+            .unwrap_or(false)
+    }
+
+    pub fn wake_only_bitmap(&self) -> u64 {
+        self.wake_only
+    }
+
+    /// Stage 183.5: install the scheduler-owned IDLE current for a wake-only online
+    /// AP. Uses the scheduler's existing idle convention — current = tid 0, the
+    /// placeholder `dispatch_next` already knows to switch away from when real work
+    /// arrives (so the representation is forward-correct for the 183.6 AP
+    /// dispatcher). Only valid on an online, wake-only CPU with no current task.
+    pub fn install_ap_idle_current(&mut self, cpu: CpuId) -> Result<ThreadId, SchedulerError> {
+        let idx = self.check_online_cpu(cpu)?;
+        if self.wake_only & (1u64 << idx) == 0 {
+            return Err(SchedulerError::CpuOffline);
+        }
+        if self.schedulers[idx].current_tid().is_some() {
+            return Err(SchedulerError::AlreadyQueued);
+        }
+        let idle = ScheduledTask {
+            tid: ThreadId(0),
+            priority: TaskPriority::Low,
+        };
+        self.schedulers[idx].current = Some(idle);
+        Ok(idle.tid)
+    }
+
     fn least_loaded_online_cpu(&self, start: usize) -> Result<CpuId, SchedulerError> {
         let mut best: Option<(usize, CpuId)> = None;
         for offset in 0..MAX_CPUS {
             let idx = (start + offset) % MAX_CPUS;
+            // Stage 183.5: wake-only CPUs are online but accept no task placement
+            // (no dispatcher runs on them yet) — never balance onto them.
+            if self.wake_only & (1u64 << idx) != 0 {
+                continue;
+            }
             if self.topology.cpu_online(idx as u8) {
                 let load = self.schedulers[idx].runnable_count()
                     + usize::from(self.schedulers[idx].current_tid().is_some());
@@ -475,6 +532,17 @@ impl SmpScheduler {
         priority: TaskPriority,
     ) -> Result<(), SchedulerError> {
         let idx = self.check_online_cpu(cpu)?;
+        // Stage 183.5: a wake-only online CPU runs no dispatcher — a task placed on
+        // its queue would strand forever. Deny placement explicitly (nothing pins
+        // work to APs today; 183.6 lifts this per CPU when the AP dispatcher lands).
+        if self.wake_only & (1u64 << idx) != 0 {
+            crate::yarm_log!(
+                "SCHED_ENQUEUE_DENIED_WAKE_ONLY cpu={} tid={} reason=no_ap_dispatcher_yet",
+                cpu.0,
+                tid.0
+            );
+            return Err(SchedulerError::CpuOffline);
+        }
         if cfg!(not(feature = "hosted-dev")) && DEBUG_DISPATCH_CONTEXT_LOG {
             crate::yarm_log!(
                 "ENQUEUE_QUEUE_INDEX tid={} requested_cpu={} queue_index={}",

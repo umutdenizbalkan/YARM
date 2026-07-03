@@ -57,7 +57,7 @@ pub(super) const AP_HANDOFF_MAGIC: u32 = 0x5952_4D41; // "YRMA"
 //   120 svr_out:          u32  // inc.4 fix: AP-written SVR readback after sw-enable
 //   124 tpr_out:          u32  // inc.4 fix: AP-written TPR readback
 //   128 esr_out:          u32  // inc.4 fix: AP-written ESR readback after write-clear
-//   132 <pad>:            u32
+//   132 wake_reenter_out: u32  // 183.5: AP-written count of sched-idle wake re-entries
 //   → size_of == 136
 pub(super) const AP_HANDOFF_READY_WORD_OFFSET: usize = 32;
 
@@ -74,6 +74,8 @@ pub(super) const AP_HANDOFF_LAPIC_ID_OUT_OFFSET: usize = 92;
 pub(super) const AP_HANDOFF_SVR_OUT_OFFSET: usize = 120;
 pub(super) const AP_HANDOFF_TPR_OUT_OFFSET: usize = 124;
 pub(super) const AP_HANDOFF_ESR_OUT_OFFSET: usize = 128;
+// Stage 183.5: AP-written scheduler-idle wake re-entry count.
+pub(super) const AP_HANDOFF_WAKE_REENTER_OFFSET: usize = 132;
 
 /// Stage 183 inc.3: bits the AP entry asm ORs into `env_flags` ([handoff+88], low
 /// identity memory — always writable) as each per-CPU environment step completes.
@@ -152,7 +154,10 @@ pub(super) struct ApHandoff {
     pub(super) svr_out: u32,
     pub(super) tpr_out: u32,
     pub(super) esr_out: u32,
-    pub(super) _pad_lapic: u32,
+    // Stage 183.5, AP-written: incremented each time the managed scheduler-idle
+    // loop observes a remote wake (handler ran) and re-enters idle. The BSP wake
+    // proof requires exactly one increment per sent wake (no lost/dup).
+    pub(super) wake_reenter_out: u32,
 }
 
 // Stage 183 inc.2/inc.3 layout guard: the trampoline / AP-entry asm hardcodes these
@@ -180,6 +185,8 @@ const _: () = {
     assert!(core::mem::offset_of!(ApHandoff, tpr_out) == 124);
     assert!(core::mem::offset_of!(ApHandoff, esr_out) == AP_HANDOFF_ESR_OUT_OFFSET);
     assert!(core::mem::offset_of!(ApHandoff, esr_out) == 128);
+    assert!(core::mem::offset_of!(ApHandoff, wake_reenter_out) == AP_HANDOFF_WAKE_REENTER_OFFSET);
+    assert!(core::mem::offset_of!(ApHandoff, wake_reenter_out) == 132);
 };
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -570,8 +577,12 @@ pub(super) const AP_STAGE_IDLE_ADMIT_GS_BAD: u32 = 254; // GS readback mismatch 
 //   'u'   AP_STAGE_IRQ_SMOKE_WAIT (27)    'v'             ready_word=3 published; waiting in the
 //                                                         race-free sti;hlt window for the BSP's
 //                                                         one controlled smoke IPI (vector 0xF0)
-//   'v'   AP_STAGE_IRQ_SMOKE_DONE (28)    'I'             smoke handled (gs: count+vector, EOI,
+//   'v'   AP_STAGE_IRQ_SMOKE_DONE (28)    'q'             smoke handled (gs: count+vector, EOI,
 //                                                         iretq); interrupts masked again
+//   'q'   AP_STAGE_SCHED_IDLE (30)        'z'/loop        183.5 scheduler-owned interruptible idle
+//                                                         (current=idle tid 0; sti;hlt; wake-capable)
+//   'z'   AP_STAGE_SCHED_WAKE_REENTER (31) 'q'            remote wake (vector 0xF1) observed;
+//                                                         wake_reenter_out++ then back to idle
 //   (note: 'c' AP_STAGE_CR4_SYNCED (25) runs between 'k' and the gs: canary —
 //    numbering is by increment, not time order)
 //
@@ -632,6 +643,11 @@ pub(super) const AP_STAGE_IRQ_SMOKE_DONE: u32 = 28;
 // Stage 183 inc.4 fix: LAPIC software-enable (SVR/TPR/ESR) before the smoke window.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_LAPIC_ENABLED: u32 = 29;
+// Stage 183.5: managed, scheduler-owned interruptible idle loop states.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_SCHED_IDLE: u32 = 30;
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) const AP_STAGE_SCHED_WAKE_REENTER: u32 = 31;
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) const AP_STAGE_HANDOFF_NULL: u32 = 253; // percpu_record_ptr == 0 (BSP bug)
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
@@ -665,6 +681,8 @@ pub(super) fn ap_stage_name(raw: u32) -> &'static str {
         AP_STAGE_IRQ_SMOKE_WAIT => "irq_smoke_wait",
         AP_STAGE_IRQ_SMOKE_DONE => "irq_smoke_done",
         AP_STAGE_LAPIC_ENABLED => "lapic_enabled",
+        AP_STAGE_SCHED_IDLE => "sched_idle",
+        AP_STAGE_SCHED_WAKE_REENTER => "sched_wake_reenter",
         AP_STAGE_HANDOFF_NULL => "handoff_null",
         AP_STAGE_GS_MISMATCH => "gs_mismatch",
         _ => "unknown",
@@ -885,11 +903,36 @@ pub(super) extern "C" fn yarm_x86_64_ap_entry(handoff_ptr: *const ApHandoff) -> 
         "je 73b",
         // 'v' / stage 28 (inc.4): smoke handled (handler counted + EOI'd + iretq'd
         // back into the window). Interrupts are masked again; fall through to the
-        // permanent idle loop — "leave idle and return to idle" proven.
+        // MANAGED scheduler-owned idle loop (183.5) — NOT a bare cli/hlt park.
         "mov al, 0x76", // 'v'
         "out dx, al",
         "mov dword ptr [rdi + 48], 28",
-        "jmp 5f",
+        // 'q' / stage 30 (183.5): scheduler-owned idle. The BSP installs
+        // current=idle(tid 0) for this CPU and brings it scheduler-online; this
+        // loop IS that idle task's body: interruptible (sti;hlt — race-free
+        // pending-IPI delivery), wake-capable (vector 0xF1 handler increments
+        // gs:[108]), and it RETURNS TO IDLE after every observed wake, publishing
+        // the re-entry count into [rdi+132] for the BSP's lost/dup-wake grading.
+        "mov al, 0x71", // 'q'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 30",
+        "xor r9d, r9d", // last observed remote_wake_count
+        "75:",
+        "sti",
+        "hlt",
+        "cli",
+        "mov r8d, dword ptr gs:[108]", // remote_wake_count (wake stub increments)
+        "cmp r8d, r9d",
+        "je 75b", // hlt woke without a new remote wake -> re-idle
+        "mov r9d, r8d",
+        // 'z' / stage 31 (183.5): remote wake observed — publish the re-entry
+        // evidence, then return to the scheduler idle state.
+        "mov al, 0x7A", // 'z'
+        "out dx, al",
+        "mov dword ptr [rdi + 48], 31",
+        "add dword ptr [rdi + 132], 1", // wake_reenter_out++
+        "mov dword ptr [rdi + 48], 30", // back to sched_idle
+        "jmp 75b",
         "60:",
         // Env skipped (kernel_cr3 == 0 ⇒ no GDT/IDT prep): publish ready_word=3 and
         // idle with interrupts MASKED — no sti without a loaded AP IDT, ever.
@@ -1012,6 +1055,7 @@ pub(super) fn encode_trampoline_page(
     patched.svr_out = 0;
     patched.tpr_out = 0;
     patched.esr_out = 0;
+    patched.wake_reenter_out = 0;
 
     let handoff_bytes = unsafe {
         core::slice::from_raw_parts(
@@ -1087,6 +1131,12 @@ pub(super) fn ap_tpr_out_low_virt(handoff_off: usize) -> *const u32 {
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub(super) fn ap_esr_out_low_virt(handoff_off: usize) -> *const u32 {
     (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_ESR_OUT_OFFSET) as *const u32
+}
+
+/// Stage 183.5: low identity-mapped VA of the AP sched-idle wake re-entry count.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+pub(super) fn ap_wake_reenter_low_virt(handoff_off: usize) -> *const u32 {
+    (AP_TRAMPOLINE_PHYS + handoff_off + AP_HANDOFF_WAKE_REENTER_OFFSET) as *const u32
 }
 
 #[cfg(all(not(test), not(feature = "hosted-dev")))]

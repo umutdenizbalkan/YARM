@@ -147,7 +147,13 @@ impl KernelState {
     }
 
     fn live_cpu_bitmap_for_asid(&self, asid: Asid) -> CpuBitmap {
-        let online = self.online_cpu_bitmap();
+        // Stage 183.5: wake-only online APs run no dispatcher, never load a user
+        // CR3, and never touch user VAs — they cannot hold translations for any
+        // user ASID, so they are never shootdown targets. (Their current is the
+        // idle placeholder tid 0, which must not alias a supervisor TCB here.)
+        // 183.6 clears the wake-only bit per CPU when the AP dispatcher lands,
+        // which re-includes that CPU in this computation automatically.
+        let online = self.online_cpu_bitmap() & !self.wake_only_cpu_bitmap();
         let mut bitmap: CpuBitmap = 0;
         for cpu in 0..u64::BITS as usize {
             let cpu_bit = 1u64 << cpu;
@@ -285,7 +291,14 @@ impl KernelState {
         asid: Asid,
     ) -> Result<(), KernelError> {
         self.clear_cow_pages_for_asid(asid);
-        let pending_cpu_bitmap = self.online_cpu_bitmap();
+        // Stage 183.5: exclude wake-only online APs from the retire-pending set.
+        // They cannot hold translations for this ASID (no dispatcher, no user CR3,
+        // no user-VA accesses), and nothing drains their cross-CPU work queues yet
+        // — including them would leak the retired-ASID slot forever (32 destroys →
+        // VmError::Full on every later teardown). 183.6 re-includes each CPU when
+        // its dispatcher lands and the real remote shootdown IPI + AP-side drain
+        // are wired.
+        let pending_cpu_bitmap = self.online_cpu_bitmap() & !self.wake_only_cpu_bitmap();
         let drained = self
             .with_user_spaces_mut(|spaces| {
                 spaces.destroy_and_collect_mappings(asid, pending_cpu_bitmap)

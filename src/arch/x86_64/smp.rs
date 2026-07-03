@@ -87,6 +87,29 @@ pub fn ap_interrupt_ready_count() -> usize {
     AP_INTERRUPT_READY_COUNT.load(Ordering::Acquire)
 }
 
+/// Stage 183.5: per-CPU handoff offset recorded at boot admit time (usize::MAX =
+/// none) so the post-graduated-proof scheduler-online admission phase can read the
+/// AP's low identity-mapped stage/wake words.
+static AP_HANDOFF_OFFS: [AtomicUsize; crate::arch::platform_constants::MAX_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Stage 183.5: per-CPU "interrupt smoke passed" flags — the hard gate for the
+/// scheduler-online admission of that AP.
+static AP_IRQ_READY_FLAGS: [AtomicBool; crate::arch::platform_constants::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; crate::arch::platform_constants::MAX_CPUS];
+
+/// Stage 183.5: count of scheduler-online APs whose remote-wake proof passed
+/// (exactly one wake delivered, observed, re-idled; no lost/dup).
+static AP_REMOTE_WAKE_OK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of APs with the scheduler remote-wake proof passed (Stage 183.5).
+pub fn ap_remote_wake_ok_count() -> usize {
+    AP_REMOTE_WAKE_OK_COUNT.load(Ordering::Acquire)
+}
+
+/// Stage 183.5: one-shot latch for the scheduler-online admission phase.
+static AP_SCHED_ONLINE_ADMISSION_DONE: AtomicBool = AtomicBool::new(false);
+
 fn lapic_mmio_base() -> usize {
     super::platform_layout::LAPIC_MMIO_BASE
 }
@@ -469,7 +492,7 @@ fn prepare_trampoline_for_cpu(kernel: &KernelState, cpu: CpuId) -> Option<usize>
         svr_out: 0,
         tpr_out: 0,
         esr_out: 0,
-        _pad_lapic: 0,
+        wake_reenter_out: 0,
     };
 
     crate::yarm_log!(
@@ -1233,16 +1256,23 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                     if irq_ok {
                         AP_INTERRUPT_READY_COUNT.fetch_add(1, Ordering::AcqRel);
                     }
+                    // Stage 183.5: record what the post-graduated-proof scheduler-
+                    // online admission phase needs (the boot loop's handoff_off and
+                    // the smoke verdict — the hard gate for onlining this AP).
+                    AP_HANDOFF_OFFS[cpu.0 as usize].store(handoff_off, Ordering::Release);
+                    AP_IRQ_READY_FLAGS[cpu.0 as usize].store(irq_ok, Ordering::Release);
                 }
                 if stage == AP_STAGE_IDLE_ADMIT_OK || stage == AP_STAGE_IDLE_ADMIT_GS_BAD {
-                    // Confirm the AP actually re-reached the permanent idle loop
-                    // (stage 18) before claiming IDLE_ENTER — a bounded wait, honest
-                    // on timeout.
+                    // Confirm the AP actually reached its terminal idle before
+                    // claiming IDLE_ENTER — a bounded wait, honest on timeout. The
+                    // smoke-OK path terminates in the MANAGED scheduler-idle loop
+                    // (stage 30/31 — interruptible, wake-capable, 183.5); degraded
+                    // paths (GS_BAD / env-skip) park masked at stage 18.
                     let mut idled = stage == AP_STAGE_IDLE_ADMIT_GS_BAD;
                     if !idled {
                         for _ in 0..AP_READY_POLL_ITERS {
                             let s = unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
-                            if s == 18 {
+                            if s == 30 || s == 31 || s == 18 {
                                 idled = true;
                                 break;
                             }
@@ -1250,7 +1280,10 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                         }
                     }
                     if idled {
-                        crate::yarm_log!("X86_AP_IDLE_ENTER cpu={} reason=cli_hlt_idle", cpu.0);
+                        crate::yarm_log!(
+                            "X86_AP_IDLE_ENTER cpu={} reason=sched_idle_interruptible",
+                            cpu.0
+                        );
                         crate::yarm_log!("X86_AP_SCHED_ADMIT_DONE cpu={}", cpu.0);
                         // Only a GS-verified admit counts as clean idle-live.
                         if stage == AP_STAGE_IDLE_ADMIT_OK {
@@ -1298,13 +1331,17 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         }
         rust_online_aps += 1;
 
-        // SAFETY FENCE: the AP is parked in a Rust cli/hlt loop with no
-        // production per-CPU env (no IDT/TSS/GS). DO NOT invoke the
-        // scheduler bring-up entry point: production scheduler is BSP-only
-        // for this pass. Continue to the next AP.
+        // SEQUENCING FENCE (183.5): the scheduler bring-up for this AP is NOT
+        // invoked here. It runs in `ap_scheduler_online_admission`, one-shot,
+        // AFTER the graduated one-shot proof completes on the BSP — so the
+        // accepted graduated evidence still executes with online == 1 (its
+        // out-of-lock seam slices require the single-CPU topology until 183.6
+        // proves them under SMP). Continue to the next AP.
     }
 
     let present_count = present.count_ones() as usize;
+    // Boot-time truth: the scheduler-online admission runs post-graduated-proof,
+    // so at THIS point online is still 1 and no AP is scheduler-admitted.
     crate::yarm_log!(
         "X86_SMP_STARTUP started_secondary={} online_cpus=1 present_cpus={}",
         rust_online_aps,
@@ -1315,8 +1352,208 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
         rust_online_aps
     );
 
-    // Pass 2 contract: return APs whose Rust runtime is online + parked.
-    // The production scheduler online count (kernel.online_cpu_count())
-    // intentionally stays at 1 (BSP-only).
     Ok(rust_online_aps)
+}
+
+/// Stage 183.5 — AP scheduler-online admission + remote-wake proof.
+///
+/// One-shot, called from the SMP audit AFTER the graduated one-shot proof
+/// completed (so the accepted BSP graduated evidence ran with `online == 1`).
+/// For every AP whose 183.4 interrupt smoke passed, in hard-gate order:
+///
+/// 1. **Idle task**: the scheduler-owned representation of the AP's managed
+///    interruptible idle loop (stage 30/31, wake-capable — NOT a bare cli/hlt
+///    park). Uses the scheduler's existing idle convention: current = tid 0,
+///    the placeholder `dispatch_next` already switches away from when real
+///    work arrives (forward-correct for the 183.6 AP dispatcher).
+/// 2. **Scheduler-online**: mark the CPU wake-only FIRST (placement denied —
+///    no AP dispatcher yet, a placed task would strand; `enqueue_balanced`
+///    skips wake-only CPUs), then `bring_up_cpu`, then install the idle
+///    current. After this `online_cpu_count()` grows and `single_cpu` becomes
+///    false — the D2/D6 seams take their conservative in-lock slice
+///    (`reason=multi_cpu`), which stays gated until 183.6 proves the
+///    out-of-lock slices under SMP.
+/// 3. **Remote wake**: exactly ONE fixed IPI (vector 0xF1) to the online AP;
+///    its pure-asm handler counts the wake via gs:, EOIs, iretqs; the idle
+///    loop observes the count, publishes a re-entry, and returns to idle.
+///    Graded: no lost wake, no duplicate wake, idle re-entered, idle current
+///    still coherent.
+pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
+    if AP_SCHED_ONLINE_ADMISSION_DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    #[cfg(all(not(test), not(feature = "hosted-dev")))]
+    {
+        use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+        use super::smp_trampoline::{ap_stage_word_low_virt, ap_wake_reenter_low_virt};
+
+        for raw_cpu in 0..crate::arch::platform_constants::MAX_CPUS {
+            let cpu = CpuId(raw_cpu as u8);
+            if cpu.0 == crate::arch::platform_constants::BOOTSTRAP_CPU_ID {
+                continue;
+            }
+            if !AP_IRQ_READY_FLAGS[raw_cpu].load(Ordering::Acquire) {
+                continue; // interrupt smoke did not pass — hard gate holds
+            }
+            let handoff_off = AP_HANDOFF_OFFS[raw_cpu].load(Ordering::Acquire);
+            if handoff_off == usize::MAX {
+                continue;
+            }
+
+            // 1. Scheduler-owned idle task (represents the AP's live managed
+            //    idle loop; nothing is enqueued — idle is the current).
+            crate::yarm_log!("X86_AP_IDLE_TASK_CREATE_BEGIN cpu={}", cpu.0);
+            let record = super::percpu::read_record(cpu);
+            let meta_ok = (record.idle_flags & super::percpu::idle_flag::IDLE_TASK_META_SET) != 0
+                && record.idle_entry != 0
+                && record.idle_stack_top == ap_stack_top(cpu);
+            if !meta_ok {
+                crate::yarm_log!(
+                    "X86_AP_IDLE_TASK_BAD cpu={} reason=idle_meta_invalid",
+                    cpu.0
+                );
+                continue;
+            }
+            crate::yarm_log!(
+                "X86_AP_IDLE_TASK_READY cpu={} tid=0 stack=0x{:x} entry=0x{:x}",
+                cpu.0,
+                record.idle_stack_top,
+                record.idle_entry
+            );
+
+            // 2. Scheduler-online transition (wake-only first: no placement window).
+            crate::yarm_log!("X86_AP_SCHED_ONLINE_BEGIN cpu={}", cpu.0);
+            if kernel.mark_cpu_wake_only(cpu, true).is_err() {
+                crate::yarm_log!(
+                    "X86_AP_SCHED_ONLINE_FAIL cpu={} reason=wake_only_mark_failed",
+                    cpu.0
+                );
+                continue;
+            }
+            if kernel.bring_up_cpu(cpu).is_err() {
+                let _ = kernel.mark_cpu_wake_only(cpu, false);
+                crate::yarm_log!(
+                    "X86_AP_SCHED_ONLINE_FAIL cpu={} reason=bring_up_failed",
+                    cpu.0
+                );
+                continue;
+            }
+            let idle_tid = match kernel.install_ap_idle_current(cpu) {
+                Ok(tid) => tid,
+                Err(_) => {
+                    crate::yarm_log!(
+                        "X86_AP_SCHED_ONLINE_FAIL cpu={} reason=idle_current_install_failed",
+                        cpu.0
+                    );
+                    continue;
+                }
+            };
+            crate::yarm_log!("X86_AP_IDLE_TASK_ACTIVE cpu={} tid={}", cpu.0, idle_tid);
+            crate::yarm_log!("X86_AP_SCHED_ONLINE_OK cpu={}", cpu.0);
+
+            // 3. The AP must be in the managed scheduler-idle loop (stage 30/31).
+            let mut sched_idle = false;
+            for _ in 0..AP_READY_POLL_ITERS {
+                let s = unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
+                if s == 30 || s == 31 {
+                    sched_idle = true;
+                    break;
+                }
+                cpu_relax();
+            }
+            if !sched_idle {
+                crate::yarm_log!(
+                    "X86_AP_SCHED_IDLE_BAD cpu={} reason=sched_idle_not_reached",
+                    cpu.0
+                );
+                continue;
+            }
+            crate::yarm_log!("X86_AP_SCHED_IDLE_ENTER cpu={} tid={}", cpu.0, idle_tid);
+
+            // 4. Remote-wake proof: exactly one wake, observed, re-idled.
+            let wake_before = super::percpu::read_record(cpu).remote_wake_count;
+            let reenter_before = unsafe { read_volatile(ap_wake_reenter_low_virt(handoff_off)) };
+            wait_for_icr_idle(cpu.0, "before_remote_wake");
+            crate::yarm_log!(
+                "X86_IPI_REMOTE_WAKE_SEND from=0 to={} vector=0x{:x}",
+                cpu.0,
+                AP_REMOTE_WAKE_VECTOR
+            );
+            write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
+
+            let mut recv = false;
+            for _ in 0..AP_READY_POLL_ITERS {
+                if super::percpu::read_record(cpu).remote_wake_count > wake_before {
+                    recv = true;
+                    break;
+                }
+                cpu_relax();
+            }
+            if !recv {
+                crate::yarm_log!("D6_SMP_LOST_WAKE_FAIL cpu={} reason=no_wake_recv", cpu.0);
+                continue;
+            }
+            crate::yarm_log!("X86_IPI_REMOTE_WAKE_RECV cpu={}", cpu.0);
+
+            let mut reentered = false;
+            for _ in 0..AP_READY_POLL_ITERS {
+                let reenter = unsafe { read_volatile(ap_wake_reenter_low_virt(handoff_off)) };
+                let s = unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
+                if reenter > reenter_before && s == 30 {
+                    reentered = true;
+                    break;
+                }
+                cpu_relax();
+            }
+            if !reentered {
+                crate::yarm_log!(
+                    "X86_AP_SCHED_IDLE_BAD cpu={} reason=no_idle_reentry_after_wake",
+                    cpu.0
+                );
+                continue;
+            }
+            crate::yarm_log!("X86_IPI_REMOTE_WAKE_ACK cpu={}", cpu.0);
+            crate::yarm_log!("X86_AP_SCHED_IDLE_REENTER cpu={} tid={}", cpu.0, idle_tid);
+
+            // Settle, then require EXACTLY one wake (no dup) and coherent
+            // idle-current state (no stale current task).
+            spin_delay(200_000);
+            let wake_after = super::percpu::read_record(cpu).remote_wake_count;
+            let reenter_after = unsafe { read_volatile(ap_wake_reenter_low_virt(handoff_off)) };
+            let current_ok = kernel.current_tid_on_cpu(cpu) == Some(idle_tid);
+            if wake_after - wake_before > 1 {
+                crate::yarm_log!(
+                    "D6_SMP_DUP_WAKE_FAIL cpu={} count={}",
+                    cpu.0,
+                    wake_after - wake_before
+                );
+            } else if reenter_after - reenter_before != 1 {
+                crate::yarm_log!(
+                    "X86_AP_SCHED_IDLE_BAD cpu={} reason=reenter_count_mismatch count={}",
+                    cpu.0,
+                    reenter_after - reenter_before
+                );
+            } else if !current_ok {
+                crate::yarm_log!(
+                    "X86_AP_SCHED_IDLE_BAD cpu={} reason=idle_current_not_coherent",
+                    cpu.0
+                );
+            } else {
+                crate::yarm_log!("D6_SMP_REMOTE_WAKE_OK cpu={}", cpu.0);
+                AP_REMOTE_WAKE_OK_COUNT.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        crate::yarm_log!(
+            "X86_SMP_ONLINE_READY present={} online={}",
+            kernel.present_cpu_count(),
+            kernel.online_cpu_count()
+        );
+    }
+
+    #[cfg(any(test, feature = "hosted-dev"))]
+    {
+        let _ = kernel;
+    }
 }

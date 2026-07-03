@@ -5820,9 +5820,14 @@ mod tests {
             "Rust AP entry must emit the @ breadcrumb on entry"
         );
         let smp_src = include_str!("../arch/x86_64/smp.rs");
+        // Stage 183.5 superseded the Pass-2 "never bring up APs" fence: the bring-up
+        // now exists but is SEQUENCED (post-graduated-proof, one-shot, gated on the
+        // per-AP interrupt smoke) and wake-only (placement denied). The boot loop
+        // itself still never onlines an AP.
         assert!(
-            !smp_src.contains("kernel.bring_up_cpu(cpu)"),
-            "production scheduler bring-up must remain BSP-only in Pass 2"
+            smp_src.contains("SEQUENCING FENCE (183.5)")
+                && smp_src.contains("fn ap_scheduler_online_admission"),
+            "AP scheduler bring-up must be the sequenced 183.5 admission, not boot-loop"
         );
         // Consolidated into doc/KERNEL_UNLOCKING.md (Milestone 2 sections).
         let m2 = include_str!("../../doc/KERNEL_UNLOCKING.md");
