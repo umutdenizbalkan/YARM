@@ -52325,7 +52325,8 @@ mod stage183_smp_live {
         assert!(
             SMOKE_SRC.contains("QEMU_SMP=${QEMU_SMP:-1}")
                 && SMOKE_SRC.contains("X86_SMP_UNLOCK_DONE")
-                && SMOKE_SRC.contains("no fallback under -smp"),
+                && SMOKE_SRC.contains("forbidden marker under SMP")
+                && SMOKE_SRC.contains("prerequisites proven under -smp"),
             "smoke must honor QEMU_SMP + assert the SMP verdict + forbid fallback"
         );
         assert!(
@@ -52433,16 +52434,27 @@ mod stage183_ap_idle_admit {
         );
     }
 
-    // The full AP admission marker set + failure markers exist; TSS/LAPIC/timer deferred.
+    // The full AP admission marker set + failure markers exist. Since inc.3 the
+    // TSS/LAPIC markers are graded OK/BAD (per-AP GDT/TSS + LAPIC access proven);
+    // only the AP timer stays DEFERRED (no AP IDT yet — interrupts masked).
     #[test]
     fn stage183_ap_admission_markers_present() {
         for m in [
             "X86_AP_SCHED_ADMIT_BEGIN",
             "X86_AP_GS_OK",
             "X86_AP_GS_BAD",
-            "X86_AP_TSS_DEFERRED",
-            "X86_AP_LAPIC_DEFERRED",
+            "X86_AP_KERNEL_CR3_BEGIN",
+            "X86_AP_KERNEL_CR3_OK",
+            "X86_AP_KERNEL_CR3_FAIL",
+            "X86_AP_GDT_LOCAL_OK",
+            "X86_AP_TSS_OK",
+            "X86_AP_TSS_BAD",
+            "X86_AP_LAPIC_OK",
+            "X86_AP_LAPIC_BAD",
             "X86_AP_LAPIC_TIMER_DEFERRED",
+            "X86_AP_IDLE_TASK_READY",
+            "X86_AP_IDLE_CONTEXT_OK",
+            "X86_AP_SCHED_PREREQ_OK",
             "X86_AP_IDLE_ENTER",
             "X86_AP_SCHED_ADMIT_DONE",
             "X86_AP_SCHED_ADMIT_FAIL",
@@ -52450,15 +52462,25 @@ mod stage183_ap_idle_admit {
         ] {
             assert!(SMP_SRC.contains(m), "AP admission marker must exist: {m}");
         }
-        // Smoke requires the admission + forbids the failure markers under -smp >1.
+        // Smoke requires the admission/prereq markers + forbids the failure markers.
         assert!(
             SMOKE_SRC.contains("X86_AP_IDLE_ENTER")
                 && SMOKE_SRC.contains("result=ap_idle_live")
                 && SMOKE_SRC.contains("X86_AP_GS_BAD")
-                && SMOKE_SRC.contains("X86_AP_IDLE_FAIL"),
-            "smoke must require AP idle admission + forbid the AP failure markers"
+                && SMOKE_SRC.contains("X86_AP_IDLE_FAIL")
+                && SMOKE_SRC.contains("X86_AP_KERNEL_CR3_OK")
+                && SMOKE_SRC.contains("X86_AP_TSS_OK")
+                && SMOKE_SRC.contains("X86_AP_LAPIC_OK")
+                && SMOKE_SRC.contains("X86_AP_IDLE_TASK_READY")
+                && SMOKE_SRC.contains("X86_AP_IDLE_CONTEXT_OK")
+                && SMOKE_SRC.contains("X86_SMP_AP_ENV_READY")
+                && SMOKE_SRC.contains("X86_AP_KERNEL_CR3_FAIL")
+                && SMOKE_SRC.contains("X86_AP_TSS_BAD")
+                && SMOKE_SRC.contains("X86_AP_LAPIC_BAD")
+                && SMOKE_SRC.contains("X86_AP_SCHED_PREREQ_INCOMPLETE"),
+            "smoke must require AP idle admission + env prereqs and forbid the failure markers"
         );
-        // Increment 2 must NOT claim scheduler admission (online stays 1).
+        // Still NOT scheduler admission (online stays 1).
         assert!(
             SMOKE_SRC.contains("must be idle-live only this increment, not scheduler-admitted"),
             "smoke must reject premature scheduler admission this increment"
@@ -52504,13 +52526,18 @@ mod stage183_ap_idle_admit {
             TRAMP_SRC.matches("[rdi + 48]").count() >= 9,
             "the AP must publish the stage word before every risky action"
         );
-        // The handoff reservation holds the FULL 56-byte struct + a compile-time layout guard
+        // The handoff reservation holds the FULL 96-byte struct + a compile-time layout guard
         // locks the field offsets the asm hardcodes.
         assert!(
-            TRAMP_SRC.contains(".zero 56")
-                && TRAMP_SRC.contains("size_of::<ApHandoff>() == 56")
-                && TRAMP_SRC.contains("offset_of!(ApHandoff, ap_stage) == 48"),
-            "the handoff reservation + layout guard must match the 56-byte struct"
+            TRAMP_SRC.contains(".zero 96")
+                && TRAMP_SRC.contains("size_of::<ApHandoff>() == 96")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, ap_stage) == 48")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, kernel_cr3) == 56")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, gdtr_image) == 64")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, lapic_id_reg_va) == 80")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, env_flags) == 88")
+                && TRAMP_SRC.contains("offset_of!(ApHandoff, lapic_id_out) == 92"),
+            "the handoff reservation + layout guard must match the 96-byte struct"
         );
         // On admit timeout the BSP names the last stage it reached (deterministic trace).
         assert!(
@@ -52569,6 +52596,82 @@ mod stage183_ap_idle_admit {
                 && TRAMP_SRC.contains("pub(super) const AP_STAGE_RUST_JUMP: u32 = 9")
                 && TRAMP_SRC.contains("AP_STAGE_RUST_JUMP => \"rust_jump\""),
             "the pre-jump rust_jump stage must be published via the absolute address"
+        );
+    }
+
+    // Stage 183 increment 3 — AP scheduler-admission PREREQUISITES. The AP proves the
+    // per-CPU runtime environment (kernel CR3 live + per-AP GDT/TSS + LAPIC access +
+    // idle task metadata/context) while remaining idle-only and NOT scheduler-runnable.
+    #[test]
+    fn stage183_inc3_ap_env_prereqs() {
+        const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+        // AP-side env steps live in the naked entry: controlled kernel-CR3 reload,
+        // gs: .bss canary, per-AP lgdt + kernel CS/SS convergence (far return to
+        // 0x08), ltr of the per-AP TSS, LAPIC ID MMIO readback, live-rsp publish.
+        for s in [
+            "mov rax, [rdi + 56]", // kernel_cr3 load
+            "mov cr3, rax",
+            "mov dword ptr gs:[48], 0x0183C0DE", // .bss canary via GS
+            "lgdt [rdi + 64]",
+            "retfq", // far return to kernel CS 0x08
+            "ltr ax",
+            "mov qword ptr gs:[56], rsp", // live idle rsp publish
+        ] {
+            assert!(TRAMP_SRC.contains(s), "AP env step must exist in asm: {s}");
+        }
+        for s in [
+            "AP_STAGE_KCR3_BEGIN",
+            "AP_STAGE_KCR3_LIVE",
+            "AP_STAGE_GDT_LOADED",
+            "AP_STAGE_TSS_LOADED",
+            "AP_STAGE_LAPIC_CHECKED",
+            "AP_STAGE_IDLE_CTX_PUBLISHED",
+        ] {
+            assert!(TRAMP_SRC.contains(s), "inc.3 stage code must exist: {s}");
+        }
+        // Per-AP GDT/TSS machinery + busy-bit readback proof.
+        assert!(
+            DESC_SRC.contains("fn prepare_ap_descriptor_tables(")
+                && DESC_SRC.contains("fn ap_tss_descriptor_busy(")
+                && DESC_SRC.contains("static mut AP_GDTS")
+                && DESC_SRC.contains("static mut AP_TSSS"),
+            "per-AP GDT/TSS prep + busy-bit readback must exist"
+        );
+        // Per-CPU record carries the AP-written canary/rsp + BSP idle metadata.
+        assert!(
+            PERCPU_SRC.contains("pub env_canary: u32")
+                && PERCPU_SRC.contains("pub saved_rsp: u64")
+                && PERCPU_SRC.contains("pub idle_entry: u64")
+                && PERCPU_SRC.contains("fn set_idle_task_meta(")
+                && PERCPU_SRC.contains("AP_ENV_CANARY: u32 = 0x0183_C0DE"),
+            "per-CPU record env/idle fields + idle metadata setter must exist"
+        );
+        // BSP grades the env results; ap_env_ready is a SEPARATE intermediate count.
+        assert!(
+            SMP_SRC.contains("static AP_ENV_READY_COUNT: AtomicUsize")
+                && SMP_SRC.contains("pub fn ap_env_ready_count() -> usize")
+                && SMP_SRC.contains("YARM_SMP_AP_ENV_MAP_CHECK"),
+            "ap_env_ready count + prepare-time env map check must exist"
+        );
+        assert!(
+            ORCH_SRC.contains("X86_SMP_AP_ENV_READY") && ORCH_SRC.contains("ap_env_ready={}"),
+            "the SMP audit must report the ap_env_ready count"
+        );
+        // Conservative online semantics: APs stay NOT scheduler-runnable — no
+        // bring_up_cpu for APs, and the audit still reports result=ap_idle_live.
+        assert!(
+            !SMP_SRC.contains("kernel.bring_up_cpu(cpu)")
+                && !SMP_SRC.contains(".bring_up_cpu(cpu)")
+                && ORCH_SRC.contains("X86_SMP_UNLOCK_DONE result=ap_idle_live"),
+            "APs must remain non-scheduler-runnable (online stays 1)"
+        );
+        // Timer policy: explicitly deferred until the AP IDT exists.
+        assert!(
+            SMP_SRC
+                .contains("X86_AP_LAPIC_TIMER_DEFERRED cpu={} reason=no_ap_idt_interrupts_masked"),
+            "the AP timer must stay deferred with the exact no-IDT reason"
         );
     }
 

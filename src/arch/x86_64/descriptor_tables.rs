@@ -1780,6 +1780,86 @@ pub fn ensure_boot_descriptor_tables_scaffolded() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 183 inc.3 — per-AP GDT/TSS (scheduler-admission prerequisites)
+// ---------------------------------------------------------------------------
+// One GDT + one TSS per possible CPU, in `.bss`. The AP GDT mirrors the BSP
+// BOOT_GDT selector layout exactly (0x08 kernel code, 0x10 kernel data, 0x18
+// user data, 0x20 user code, 0x28 TSS) so the AP converges on the kernel's
+// production selectors — after `lgdt` the AP entry asm reloads SS/DS/ES=0x10
+// and far-returns to CS=0x08, then `ltr 0x28` loads the per-AP TSS. TSS
+// `rsp0` = the AP's own kernel stack top; IST slots stay 0 this increment
+// (IST entries are only consumed via IDT gate `ist` fields, and the AP has no
+// IDT yet — interrupts remain masked; the AP IDT increment wires real per-AP
+// IST stacks before any interrupt can fire).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut AP_GDTS: [X86BootGdt; crate::arch::platform_constants::MAX_CPUS] = [const {
+    X86BootGdt {
+        entries: [0, 0, 0, 0, 0, 0, 0],
+    }
+};
+    crate::arch::platform_constants::MAX_CPUS];
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+static mut AP_TSSS: [X86TaskStateSegment; crate::arch::platform_constants::MAX_CPUS] =
+    [const { X86TaskStateSegment::new() }; crate::arch::platform_constants::MAX_CPUS];
+
+/// BSP-side (before SIPI): populate the per-AP TSS (`rsp0` = the AP kernel stack
+/// top, ISTs 0 — see the block comment) and the per-AP GDT (BOOT_GDT selector
+/// layout + this AP's TSS descriptor at 0x28). Returns
+/// `(gdtr_limit, gdt_base_va, tss_base_va)` for the trampoline handoff.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn prepare_ap_descriptor_tables(cpu: usize, rsp0: u64) -> (u16, u64, u64) {
+    let idx = cpu.min(crate::arch::platform_constants::MAX_CPUS - 1);
+    unsafe {
+        let tss = core::ptr::addr_of_mut!(AP_TSSS[idx]);
+        let mut t = X86TaskStateSegment::new();
+        t.rsp0 = rsp0;
+        core::ptr::write_volatile(tss, t);
+
+        let tss_base = tss as u64;
+        let tss_limit = (core::mem::size_of::<X86TaskStateSegment>() - 1) as u32;
+        let (tss_low, tss_high) = encode_tss_descriptor(tss_base, tss_limit);
+
+        let gdt = core::ptr::addr_of_mut!(AP_GDTS[idx]);
+        let entries = [
+            0x0000_0000_0000_0000u64, // null
+            0x00af_9a00_0000_ffff,    // 0x08 kernel code (same as BOOT_GDT)
+            0x00af_9200_0000_ffff,    // 0x10 kernel data
+            0x00af_f200_0000_ffff,    // 0x18 user data
+            0x00af_fa00_0000_ffff,    // 0x20 user code
+            tss_low,                  // 0x28 per-AP TSS (low)
+            tss_high,                 //      per-AP TSS (high)
+        ];
+        core::ptr::write_volatile(gdt, X86BootGdt { entries });
+
+        let limit = (core::mem::size_of::<X86BootGdt>() - 1) as u16;
+        (limit, gdt as u64, tss_base)
+    }
+}
+
+/// BSP-side readback (after the AP admits): `ltr` on the AP sets the TSS
+/// descriptor's BUSY type (0b1001 → 0b1011) in that AP's GDT — a memory write
+/// the BSP can observe, proving the AP really loaded the task register from
+/// the per-AP GDT under the kernel CR3.
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_tss_descriptor_busy(cpu: usize) -> bool {
+    let idx = cpu.min(crate::arch::platform_constants::MAX_CPUS - 1);
+    unsafe {
+        let low = core::ptr::read_volatile(core::ptr::addr_of!(AP_GDTS[idx].entries[5]));
+        ((low >> 40) & 0xF) == 0xB
+    }
+}
+
+/// BSP-side: the `rsp0` recorded in this AP's TSS (for the X86_AP_TSS_OK marker).
+#[cfg(all(not(feature = "hosted-dev"), target_arch = "x86_64"))]
+pub(crate) fn ap_tss_rsp0(cpu: usize) -> u64 {
+    let idx = cpu.min(crate::arch::platform_constants::MAX_CPUS - 1);
+    unsafe {
+        let tss = core::ptr::read_volatile(core::ptr::addr_of!(AP_TSSS[idx]));
+        tss.rsp0
+    }
+}
+
 #[cfg(all(any(not(feature = "hosted-dev"), test), target_arch = "x86_64"))]
 unsafe fn populate_boot_idt_from_stubs() {
     let idt_ptr = core::ptr::addr_of_mut!(BOOT_IDT).cast::<X86IdtEntry>();
