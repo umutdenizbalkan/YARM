@@ -14,8 +14,8 @@ use yarm_ipc_abi::process_abi::{
     decode_pm_restart_reply_v1, encode_pm_restart_request_v1,
 };
 use yarm_ipc_abi::process_abi::{
-    PmRestartFailure, PmRestartReason, PmRestartReplyStatus, PmRestartRequestV1,
-    PmRestartTokenDescriptor,
+    PM_RESTART_REPLY_V1_LEN, PROC_OP_PM_RESTART_REPLY_V1, PmRestartFailure, PmRestartReason,
+    PmRestartReplyStatus, PmRestartRequestV1, PmRestartTokenDescriptor,
 };
 use yarm_ipc_abi::supervisor_abi::{
     CoreServiceRegistrationKind, RedelegationAckRequest, RegisterCoreServiceRequest,
@@ -135,6 +135,7 @@ const SUPERVISOR_QUERY_STATUS_CALL_RECV_TIMEOUT_TICKS: u64 = 1;
 const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 #[cfg(not(test))]
 const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 10_000;
+const SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 
 #[cfg(not(test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2335,8 +2336,13 @@ fn send_pm_restart_v1_via_process_manager(
         client_request.target_tid,
         client_request.request_id
     );
-    let reply_msg = match unsafe { yarm_user_rt::syscall::ipc_recv_with_deadline(rep_cap, 0) } {
-        Ok(Some(reply_msg)) => reply_msg,
+    yarm_user_rt::user_log!(
+        "SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN tid={} request_id={}",
+        client_request.target_tid,
+        client_request.request_id
+    );
+    let reply_msg = match unsafe { yarm_user_rt::syscall::ipc_recv_v2(rep_cap) } {
+        Ok(Some(received)) => received.message,
         Ok(None) => return SupervisorPmRestartClientResult::SendFailed,
         Err(_err) => return SupervisorPmRestartClientResult::SendFailed,
     };
@@ -2345,9 +2351,29 @@ fn send_pm_restart_v1_via_process_manager(
         client_request.target_tid,
         client_request.request_id
     );
+    if reply_msg.opcode != PROC_OP_PM_RESTART_REPLY_V1
+        || reply_msg.as_slice().len() != PM_RESTART_REPLY_V1_LEN
+    {
+        yarm_user_rt::user_log!(
+            "SUPERVISOR_PM_RESTART_REPLY_DECODE_FAIL reason=shape opcode={} len={}",
+            reply_msg.opcode,
+            reply_msg.as_slice().len()
+        );
+        return SupervisorPmRestartClientResult::MalformedReply;
+    }
     let reply = match decode_pm_restart_reply_v1(reply_msg.as_slice()) {
-        Ok(reply) => reply,
-        Err(_err) => return SupervisorPmRestartClientResult::MalformedReply,
+        Ok(reply) => {
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_PM_RESTART_REPLY_DECODE_OK tid={} request_id={}",
+                client_request.target_tid,
+                client_request.request_id
+            );
+            reply
+        }
+        Err(_err) => {
+            yarm_user_rt::user_log!("SUPERVISOR_PM_RESTART_REPLY_DECODE_FAIL reason=codec");
+            return SupervisorPmRestartClientResult::MalformedReply;
+        }
     };
     if reply.request_id != client_request.request_id
         || reply.target_tid != client_request.target_tid
@@ -2403,7 +2429,8 @@ fn send_pm_restart_v1_via_process_manager(
         }
         PmRestartReplyStatus::Accepted => {
             if client_request.accepted_reply_enabled
-                && reply.replacement_handle_kind != 0
+                && reply.replacement_handle_kind
+                    == SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID
                 && reply.replacement_handle_value != 0
             {
                 yarm_user_rt::user_log!(

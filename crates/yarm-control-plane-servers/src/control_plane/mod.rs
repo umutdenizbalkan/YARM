@@ -2666,7 +2666,9 @@ mod tests {
         }
         for marker in &[
             "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN",
             "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_DECODE_OK",
             "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
             "PM_RESTART_V1_DECODE_OK",
             "PM_RESTART_SENDER_OK",
@@ -2729,6 +2731,52 @@ mod tests {
             assert!(
                 !handler.contains(forbidden.as_str()),
                 "hardcoded trusted supervisor pattern remains: {forbidden}"
+            );
+        }
+        let pm_restart_client_start = supervisor_src
+            .find("fn send_pm_restart_v1_via_process_manager")
+            .expect("pm restart client");
+        let pm_restart_client_end = supervisor_src[pm_restart_client_start..]
+            .find("fn execute_restart_via_process_manager")
+            .map(|offset| pm_restart_client_start + offset)
+            .unwrap_or(supervisor_src.len());
+        let pm_restart_client = &supervisor_src[pm_restart_client_start..pm_restart_client_end];
+        for needle in &[
+            "SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN",
+            "ipc_recv_v2(rep_cap)",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "PROC_OP_PM_RESTART_REPLY_V1",
+            "PM_RESTART_REPLY_V1_LEN",
+            "decode_pm_restart_reply_v1(reply_msg.as_slice())",
+            "SUPERVISOR_PM_RESTART_REPLY_DECODE_OK",
+            "SUPERVISOR_PM_RESTART_REPLY_DECODE_FAIL reason=shape",
+            "reply.request_id != client_request.request_id",
+            "reply.target_tid != client_request.target_tid",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID",
+        ] {
+            assert!(
+                pm_restart_client.contains(needle),
+                "SUP-L7A supervisor PM reply path missing {needle}"
+            );
+        }
+        let due_restart_start = supervisor_src
+            .find("fn execute_due_restarts")
+            .expect("due restarts");
+        let due_restart_end = supervisor_src[due_restart_start..]
+            .find("fn handle_task_exit")
+            .map(|offset| due_restart_start + offset)
+            .unwrap_or(supervisor_src.len());
+        let due_restart = &supervisor_src[due_restart_start..due_restart_end];
+        for needle in &[
+            "SupervisorPmRestartClientResult::Accepted",
+            "record.tid = replacement_handle_value",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+            "record.pending_pm_request_id = None",
+        ] {
+            assert!(
+                due_restart.contains(needle),
+                "SUP-L7A state update path missing {needle}"
             );
         }
         assert!(supervisor_src.contains("send_pm_restart_v1_via_process_manager"));

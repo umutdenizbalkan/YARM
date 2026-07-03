@@ -656,3 +656,37 @@ syscall ABI, RPi5, driver-manager DRS, PM restart codec, or arch behavior
 changes. Frozen counts remain `PROC_OP_PM_RESTART_V1 = 15`,
 `PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`, and
 `SYSCALL_COUNT = 31`; request/reply codec lengths remain 110 and 50 bytes.
+
+## SUP-L7A — supervisor PM restart reply receive and state update
+
+User-local QEMU after SUP-L6Q reached `PM_RESTART_SENDER_OK`,
+`PM_RESTART_VALIDATE_OK`, `PM_RESTART_SPAWN_OK`, and
+`PM_RESTART_REPLY_ACCEPTED request_id=1 target_tid=<old>`, proving PM restart
+execution accepted the runtime supervisor and spawned the first replacement. The
+next blocker was supervisor-side reply handling: `SUPERVISOR_PM_RESTART_REPLY_RECV`,
+`SUPERVISOR_PM_RESTART_REPLY_ACCEPTED`, and
+`SUPERVISOR_PM_RESTART_STATE_UPDATED` were absent, so the supervisor did not
+record the replacement lineage or drive attempts 2/3 and final degraded state.
+
+SUP-L7A fixes the first reply-path blocker. The supervisor PM restart client had
+sent with `ipc_call` and then performed an immediate zero-deadline receive on the
+reply cap. That could observe no message before PM ran and sent its reply, so the
+client returned a send failure before logging `SUPERVISOR_PM_RESTART_REPLY_RECV`.
+The client now emits `SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN` and waits on the
+existing PM reply cap with `ipc_recv_v2`, then validates opcode/length
+(`PROC_OP_PM_RESTART_REPLY_V1`, 50 bytes), decodes with the frozen reply codec,
+checks request_id and target_tid, accepts only a scoped task-TID replacement
+handle, and emits `SUPERVISOR_PM_RESTART_REPLY_DECODE_OK` and
+`SUPERVISOR_PM_RESTART_REPLY_ACCEPTED` before the state machine records the
+replacement TID and emits `SUPERVISOR_PM_RESTART_STATE_UPDATED`.
+
+`PM_RESTART_REPLY_ACCEPTED request_id=... target_tid=...` means PM accepted the
+restart operation and built an accepted reply; the PM runtime loop now also logs
+`PM_RESTART_REPLY_SEND_BEGIN` and `PM_RESTART_REPLY_SEND_OK` when it sends that
+reply through the kernel reply capability. PM remains restart authority, the
+supervisor remains policy/state owner and does not locally spawn or restart, the
+crash-test restart remains gated/narrow, and token query remains read-only and
+non-authorizing. No kernel, syscall ABI, arch, RPi5, driver-manager DRS, or PM
+restart codec layout changes; `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and request/reply lengths 110/50 remain frozen.

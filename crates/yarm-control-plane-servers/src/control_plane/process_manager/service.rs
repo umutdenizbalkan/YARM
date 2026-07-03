@@ -2368,6 +2368,11 @@ impl ProcessService {
         replacement_handle_value: u64,
         next_retry_tick: u64,
     ) -> Result<Message, ProcessManagerError> {
+        yarm_user_rt::user_log!(
+            "PM_RESTART_REPLY_BUILD_BEGIN request_id={} target_tid={}",
+            request_id,
+            target_tid
+        );
         let reply = AbiPmRestartReplyV1 {
             version: yarm_ipc_abi::process_abi::PM_RESTART_VERSION_V1,
             request_id,
@@ -2385,6 +2390,11 @@ impl ProcessService {
         };
         let encoded =
             encode_pm_restart_reply_v1(&reply).map_err(|_| ProcessManagerError::Malformed)?;
+        yarm_user_rt::user_log!(
+            "PM_RESTART_REPLY_BUILD_OK request_id={} target_tid={}",
+            request_id,
+            target_tid
+        );
         Message::with_header(0, PROC_OP_PM_RESTART_REPLY_V1, 0, None, &encoded)
             .map_err(|_| ProcessManagerError::Malformed)
     }
@@ -2823,7 +2833,11 @@ impl ProcessService {
             request.target_tid,
             replacement_tid
         );
-        yarm_user_rt::user_log!("PM_RESTART_REPLY_ACCEPTED");
+        yarm_user_rt::user_log!(
+            "PM_RESTART_REPLY_ACCEPTED request_id={} target_tid={}",
+            request.request_id,
+            request.target_tid
+        );
         Self::pm_restart_reply_with_handle(
             AbiPmRestartReplyStatus::Accepted,
             AbiPmRestartFailure::None,
@@ -4426,8 +4440,37 @@ pub fn run() {
                 );
                 if let Ok(reply) = service.handle(msg) {
                     if let Some(cap) = reply_cap {
-                        // SAFETY: kernel validates reply capability rights/object.
-                        let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
+                        if reply.opcode == PROC_OP_PM_RESTART_REPLY_V1 {
+                            let request_id = reply
+                                .as_slice()
+                                .get(2..10)
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .map(u64::from_le_bytes)
+                                .unwrap_or(0);
+                            let target_tid = reply
+                                .as_slice()
+                                .get(10..18)
+                                .and_then(|bytes| bytes.try_into().ok())
+                                .map(u64::from_le_bytes)
+                                .unwrap_or(0);
+                            yarm_user_rt::user_log!(
+                                "PM_RESTART_REPLY_SEND_BEGIN request_id={} target_tid={}",
+                                request_id,
+                                target_tid
+                            );
+                            // SAFETY: kernel validates reply capability rights/object.
+                            let sent = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
+                            if sent.is_ok() {
+                                yarm_user_rt::user_log!(
+                                    "PM_RESTART_REPLY_SEND_OK request_id={} target_tid={}",
+                                    request_id,
+                                    target_tid
+                                );
+                            }
+                        } else {
+                            // SAFETY: kernel validates reply capability rights/object.
+                            let _ = unsafe { yarm_user_rt::syscall::ipc_reply(cap, &reply) };
+                        }
                     }
                 } else {
                     yarm_user_rt::user_log!(
