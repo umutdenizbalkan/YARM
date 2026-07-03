@@ -2801,6 +2801,8 @@ mod tests {
             "SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 1",
             "SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK",
             "supervisor_drain_fault_endpoint",
+            "recv_with_deadline(fault_cap, 0)",
+            "recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)",
             "SUPERVISOR_EVENT_LOOP_TICK",
             "SUPERVISOR_FAULT_DRAIN_BEGIN",
             "SUPERVISOR_FAULT_DRAIN_DONE count={}",

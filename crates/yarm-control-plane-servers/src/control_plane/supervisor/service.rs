@@ -1907,7 +1907,9 @@ pub fn run() {
                     made_progress = true;
                 }
                 yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
-                match transport.recv(supervisor.handoff.supervisor_control_recv_cap.0 as u32) {
+                match transport
+                    .recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)
+                {
                     Ok(Some(msg)) => {
                         made_progress = true;
                         let payload = msg.as_slice();
@@ -2465,7 +2467,7 @@ fn supervisor_drain_fault_endpoint(
     yarm_user_rt::user_log!("SUPERVISOR_FAULT_DRAIN_BEGIN");
     let mut count = 0usize;
     while count < SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK {
-        match transport.recv(fault_cap) {
+        match transport.recv_with_deadline(fault_cap, 0) {
             Ok(Some(msg)) => {
                 let queued_tid = if msg.opcode == SUPERVISOR_OP_FAULT_REPORT_WIRE {
                     SupervisorFaultReportWire::decode(msg.as_slice()).map(|fault| fault.tid)
