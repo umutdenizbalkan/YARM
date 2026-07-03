@@ -1193,14 +1193,21 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                                 cpu.0,
                                 r.irq_hit_vector
                             );
-                            // ACK = the AP resumed from the handler (iretq) and
-                            // re-reached the idle path (stage 28 → 17 → 18).
-                            let mut resumed = false;
+                            // 183.5 host-failure fix (reason=no_resume_after_handler):
+                            // ACK is now graded from the PERSISTENT AP-written flag
+                            // (gs irq_ack = 1, written by the post-hlt resume path
+                            // after the handler is confirmed) — never from transient
+                            // stage words. The old poll accepted stages 28|17|18, but
+                            // the 183.5 managed-idle tail made 28 a microseconds-wide
+                            // transient and removed 17/18 from this path, while the
+                            // BSP spent milliseconds printing RECV through the QEMU
+                            // UART first — so the poll deterministically missed and
+                            // every AP failed. Handler sub-stages (irq_stage 32-34)
+                            // plus the resume stages (35/36) name any future failure.
+                            let mut acked = false;
                             for _ in 0..AP_READY_POLL_ITERS {
-                                let s =
-                                    unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
-                                if s == 28 || s == 17 || s == 18 {
-                                    resumed = true;
+                                if super::percpu::read_record(cpu).irq_ack == 1 {
+                                    acked = true;
                                     break;
                                 }
                                 cpu_relax();
@@ -1209,22 +1216,32 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                             // no unexpected vector.
                             spin_delay(200_000);
                             let r2 = super::percpu::read_record(cpu);
-                            if !resumed {
+                            let last_raw =
+                                unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
+                            if !acked {
                                 crate::yarm_log!(
-                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=no_resume_after_handler",
-                                    cpu.0
+                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=no_resume_after_handler last_stage={} last_stage_raw=0x{:x} irq_stage={} irq_stage_raw=0x{:x}",
+                                    cpu.0,
+                                    ap_stage_name(last_raw),
+                                    last_raw,
+                                    ap_stage_name(r2.irq_stage),
+                                    r2.irq_stage
                                 );
                             } else if r2.irq_hit_count != 1 {
                                 crate::yarm_log!(
-                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=dup_delivery count={}",
+                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=dup_delivery count={} last_stage={} last_stage_raw=0x{:x}",
                                     cpu.0,
-                                    r2.irq_hit_count
+                                    r2.irq_hit_count,
+                                    ap_stage_name(last_raw),
+                                    last_raw
                                 );
                             } else if r2.irq_unexpected_vec != 0 {
                                 crate::yarm_log!(
-                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=unexpected_vector vec={}",
+                                    "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=unexpected_vector vec={} last_stage={} last_stage_raw=0x{:x}",
                                     cpu.0,
-                                    r2.irq_unexpected_vec - 1
+                                    r2.irq_unexpected_vec - 1,
+                                    ap_stage_name(last_raw),
+                                    last_raw
                                 );
                             } else {
                                 crate::yarm_log!("X86_IPI_REMOTE_WAKE_ACK cpu={}", cpu.0);
@@ -1242,9 +1259,15 @@ pub fn start_secondary_cpus(kernel: &mut KernelState) -> Result<usize, KernelErr
                                 r.irq_unexpected_vec - 1
                             );
                         } else {
+                            let last_raw =
+                                unsafe { read_volatile(ap_stage_word_low_virt(handoff_off)) };
                             crate::yarm_log!(
-                                "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=no_handler_hit",
-                                cpu.0
+                                "X86_AP_INTERRUPT_SMOKE_FAIL cpu={} reason=no_handler_hit last_stage={} last_stage_raw=0x{:x} irq_stage={} irq_stage_raw=0x{:x}",
+                                cpu.0,
+                                ap_stage_name(last_raw),
+                                last_raw,
+                                ap_stage_name(r.irq_stage),
+                                r.irq_stage
                             );
                         }
                     } else {

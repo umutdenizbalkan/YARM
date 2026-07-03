@@ -1934,11 +1934,17 @@ yarm_ap_irq_smoke_stub:
     // Controlled smoke handler: count + record the vector via gs:, EOI the
     // local APIC (this AP's own LAPIC at the shared MMIO VA), and iretq back
     // into the sti;hlt window. Preserves every register it touches.
+    // 183.5 fix diagnostics: publish the handler sub-stage via gs:[irq_stage]
+    // (32 = entered, 33 = after EOI, 34 = before iretq) so a resume failure
+    // can name exactly where the handler path died.
     push rax
+    mov dword ptr gs:[{irq_stage_off}], 32
     add dword ptr gs:[{hit_count_off}], 1
     mov dword ptr gs:[{hit_vec_off}], {smoke_vec}
     movabs rax, {lapic_eoi}
     mov dword ptr [rax], 0
+    mov dword ptr gs:[{irq_stage_off}], 33
+    mov dword ptr gs:[{irq_stage_off}], 34
     pop rax
     iretq
 
@@ -1959,6 +1965,7 @@ yarm_ap_remote_wake_stub:
     hit_vec_off = const super::percpu::IRQ_HIT_VECTOR_OFFSET,
     smoke_vec = const AP_IRQ_SMOKE_VECTOR as u32,
     wake_count_off = const super::percpu::REMOTE_WAKE_COUNT_OFFSET,
+    irq_stage_off = const super::percpu::IRQ_STAGE_OFFSET,
     lapic_eoi = const super::platform_layout::LAPIC_MMIO_BASE + 0xB0,
 );
 

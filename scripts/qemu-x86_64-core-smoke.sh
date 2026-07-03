@@ -1929,7 +1929,8 @@ if [[ "$QEMU_SMP" -gt 1 ]]; then
     "X86_AP_SCHED_IDLE_BAD" \
     "D6_SMP_LOST_WAKE_FAIL" \
     "D6_SMP_DUP_WAKE_FAIL" \
-    "SCHED_ENQUEUE_DENIED_WAKE_ONLY"; do
+    "SCHED_ENQUEUE_DENIED_WAKE_ONLY" \
+    "X86_SMP_AP_INTERRUPT_NOT_READY"; do
     if log_has_pattern "$f"; then
       echo "[error] SMP-LIVE: forbidden marker under SMP: $f"
       exit 1

@@ -53013,6 +53013,80 @@ mod stage183_ap_idle_admit {
         );
     }
 
+    // Stage 183.5 host-failure fix — the interrupt smoke's ACK grading raced the
+    // AP's transient stage words: the 183.5 managed-idle tail made stage 28 a
+    // microseconds-wide transient (and removed 17/18 from the smoke-OK path) while
+    // the BSP spent milliseconds printing RECV through the QEMU UART before its
+    // resume poll started — so `resumed` (accepting 28|17|18) deterministically
+    // missed on every AP: X86_AP_INTERRUPT_SMOKE_FAIL reason=no_resume_after_handler
+    // with RECV present. Fix: the AP writes a PERSISTENT ACK (gs irq_ack=1) on the
+    // post-hlt handler-confirmed path and the BSP polls THAT; handler sub-stages
+    // (32-34 via gs irq_stage) + resume stages (35/36) name any future failure.
+    #[test]
+    fn stage183_inc5_fix_persistent_smoke_ack() {
+        const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        const DESC_SRC: &str = include_str!("../../arch/x86_64/descriptor_tables.rs");
+
+        // Persistent AP-side ACK fields at locked offsets.
+        assert!(
+            PERCPU_SRC.contains("pub irq_stage: u32")
+                && PERCPU_SRC.contains("pub irq_ack: u32")
+                && PERCPU_SRC.contains("IRQ_STAGE_OFFSET: usize = 112")
+                && PERCPU_SRC.contains("IRQ_ACK_OFFSET: usize = 116"),
+            "persistent irq_stage/irq_ack per-CPU fields must exist at 112/116"
+        );
+        // Handler sub-stages written INSIDE the 0xF0 stub (enter/EOI/iret), EOI
+        // before iretq, iretq terminal.
+        assert!(
+            DESC_SRC.contains("mov dword ptr gs:[{irq_stage_off}], 32")
+                && DESC_SRC.contains("mov dword ptr gs:[{irq_stage_off}], 33")
+                && DESC_SRC.contains("mov dword ptr gs:[{irq_stage_off}], 34"),
+            "the smoke handler must publish enter/EOI/iret sub-stages via gs:"
+        );
+        // AP resume path: stage 35 immediately after hlt, persistent ACK gs:[116]=1
+        // on the handler-confirmed exit, stage 36 after.
+        for a in [
+            "mov dword ptr [rdi + 48], 35",
+            "mov dword ptr gs:[116], 1",
+            "mov dword ptr [rdi + 48], 36",
+            "AP_STAGE_IRQ_RESUMED",
+            "AP_STAGE_IRQ_ACK_WRITTEN",
+            "AP_STAGE_IRQ_HANDLER_ENTER",
+        ] {
+            assert!(TRAMP_SRC.contains(a), "resume/ACK step must exist: {a}");
+        }
+        // BSP polls the PERSISTENT ACK — no transient-stage acceptance set remains.
+        assert!(
+            SMP_SRC.contains(".irq_ack == 1"),
+            "the BSP must poll the persistent irq_ack"
+        );
+        assert!(
+            !SMP_SRC.contains("s == 28 || s == 17 || s == 18"),
+            "the stale transient-stage resume poll must stay gone"
+        );
+        // Failures name the exact stage (main + handler sub-stage).
+        assert!(
+            SMP_SRC.contains(
+                "reason=no_resume_after_handler last_stage={} last_stage_raw=0x{:x} irq_stage={}"
+            ) && SMP_SRC
+                .contains("reason=no_handler_hit last_stage={} last_stage_raw=0x{:x} irq_stage={}"),
+            "smoke failures must report last_stage + irq_stage"
+        );
+        // Honest summary naming: READY only with a nonzero count; NOT_READY else,
+        // and the smoke forbids NOT_READY under -smp >1.
+        assert!(
+            ORCH_SRC.contains("X86_SMP_AP_INTERRUPT_NOT_READY")
+                && SMOKE_SRC.contains("X86_SMP_AP_INTERRUPT_NOT_READY"),
+            "the zero-count summary must be NOT_READY and forbidden in smoke"
+        );
+        // Scheduler-online remains gated on the smoke verdict (no bypass added).
+        assert!(
+            SMP_SRC.contains("AP_IRQ_READY_FLAGS[cpu.0 as usize].store(irq_ok")
+                && SMP_SRC.contains("continue; // interrupt smoke did not pass"),
+            "scheduler-online must stay gated on the interrupt-smoke verdict"
+        );
+    }
+
     // Counts/limits unchanged (no ABI/limit drift from the SMP bring-up).
     #[test]
     fn stage183_inc2_counts_unchanged() {

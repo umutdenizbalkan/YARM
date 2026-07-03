@@ -442,15 +442,28 @@ impl KernelState {
                     ap_env_ready
                 );
                 // Increment-4 milestone: interrupt-safe idle per AP (AP-safe IDT +
-                // controlled IPI smoke handled + resumed; no lost/dup wake).
-                crate::yarm_log!(
-                    "X86_SMP_AP_INTERRUPT_READY present={} online={} ap_idle_live={} ap_env_ready={} ap_interrupt_ready={}",
-                    present,
-                    online,
-                    ap_idle_live,
-                    ap_env_ready,
-                    ap_interrupt_ready
-                );
+                // controlled IPI smoke handled + resumed; no lost/dup wake). Honest
+                // naming: the READY marker is only emitted when at least one AP
+                // actually passed the smoke; a zero count gets NOT_READY instead of
+                // a misleading "READY ... ap_interrupt_ready=0".
+                if ap_interrupt_ready > 0 {
+                    crate::yarm_log!(
+                        "X86_SMP_AP_INTERRUPT_READY present={} online={} ap_idle_live={} ap_env_ready={} ap_interrupt_ready={}",
+                        present,
+                        online,
+                        ap_idle_live,
+                        ap_env_ready,
+                        ap_interrupt_ready
+                    );
+                } else {
+                    crate::yarm_log!(
+                        "X86_SMP_AP_INTERRUPT_NOT_READY present={} online={} ap_idle_live={} ap_env_ready={} ap_interrupt_ready=0",
+                        present,
+                        online,
+                        ap_idle_live,
+                        ap_env_ready
+                    );
+                }
                 // Remaining blocker for online>1: scheduler-online admission — a real
                 // runnable AP idle task + SMP-safe kernel-lock/dispatch discipline
                 // (D6/D2 seams + TLB ACK are gated behind it). 183.5/183.6.

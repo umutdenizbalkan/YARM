@@ -6940,6 +6940,30 @@ unproven-and-gated for 183.6:
   them. Guarded by `stage183_inc5_ap_scheduler_online_and_remote_wake`.
   Acceptance: `scripts/run-ci-profiles.sh smp2-core` + `smp4-core`
   (+ optional `smp6-core`).
+- **183.5 host failure #1 ROOT CAUSE + fix (every AP:
+  `X86_AP_INTERRUPT_SMOKE_FAIL reason=no_resume_after_handler` with RECV present).**
+  The fixed IPI was delivered and the handler ran (RECV proves `irq_hit_count`
+  bumped) — the failure was the BSP's resume grading, not the AP. The old
+  `resumed` poll accepted stages `28|17|18`; the 183.5 managed-idle tail made 28 a
+  microseconds-wide transient and removed 17/18 from the smoke-OK path (terminal
+  is now 30/31), while the BSP first spent milliseconds printing the RECV marker
+  through the QEMU UART — so the poll deterministically started after 28 was gone
+  and could never match. Fix: **grade from persistent state, never transients** —
+  the AP's post-`hlt`, handler-confirmed path now writes a PERSISTENT ACK
+  (`PerCpuRecord.irq_ack = 1` via `gs:[116]`, stage 36 `irq_ack_written` after
+  stage 35 `irq_resumed` written immediately after every `hlt` return) and the
+  BSP polls `irq_ack == 1`. The 0xF0 handler additionally publishes sub-stages
+  via `gs:[112]` (`32 irq_handler_enter` → `33 irq_handler_eoi` → `34
+  irq_handler_iret`), and every `X86_AP_INTERRUPT_SMOKE_FAIL` now reports
+  `last_stage=… last_stage_raw=… irq_stage=…` so a future failure names the exact
+  handler/resume transition. Stub audit (ELF-verified): interrupt gate 0xE,
+  CS=0x08, ist=0, no error code for vector 0xF0, `push rax`-preserving, LAPIC EOI
+  before `iretq`, terminal `iretq`, no park-path contamination. Honest summary:
+  `X86_SMP_AP_INTERRUPT_READY` is only emitted with a nonzero count; a zero count
+  emits `X86_SMP_AP_INTERRUPT_NOT_READY` (forbidden in smoke). Scheduler-online
+  stays gated on the smoke verdict — with the smoke failing, the run correctly
+  refused `bring_up_cpu`/online>1. Guarded by
+  `stage183_inc5_fix_persistent_smoke_ack`.
 - **Retired-ASID safety under `online = N` (found by audit, fixed pre-host):**
   `destroy_user_address_space_by_asid` retired ASIDs pending on the FULL
   `online_cpu_bitmap()`, but nothing drains a wake-only AP's cross-CPU work queue
