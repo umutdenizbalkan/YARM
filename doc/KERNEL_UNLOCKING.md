@@ -7206,6 +7206,39 @@ move the block/wake state mutation onto `scheduler_state` (rank 1) / `task_state
 release), reusing the existing `compute_wake_plan_for_tid` / `apply_scheduler_wake_plan`
 split that the D2/D6 dispatch relocation already established.
 
+**Stage 185S (SCHEDULER-BLOCK-WAKE-DECOMP) — audited, HARD-STOPPED, no code change.**
+The audit found the premise WRONG in the codebase's favour: **the scheduler block/wake
+mechanics are ALREADY subsystem-lock-decomposed and two-phase.** `apply_scheduler_
+wake_plan` is called at ~10 production sites, every one documented and structured to run
+the wake *after* dropping `ipc_state_lock` / all IPC/cap/VM/memory domain locks
+("Phase 3/4/5 outside all locks"); the wake itself (`wake_tid_to_runnable`) transitions
+`TaskStatus` via `with_tcbs_mut` (`task_state_lock`, rank 2) and enqueues via
+`enqueue_woken_task` (`scheduler_state`, rank 1), sequentially and non-nested, holding
+neither lock across a user-memory copy or a cap materialization; `block_current` mutates
+only scheduler-internal state under the scheduler lock. So the "move block/wake onto
+scheduler/task locks with a two-phase structure" work this stage asked for is **already
+implemented** — there is nothing un-converted to move.
+
+The only remaining coupling of block/wake to the global lock is that its ~10 callers are
+IPC syscalls (`ipc_send/recv/call/reply`) that hold the global lock. Removing the global
+lock from the wake therefore means removing it from those IPC ops and relocating the
+sender/receiver wake out of the global lock (the D6-style *stash then apply after the
+global lock drops* pattern) **without perturbing the sender-wake ORDERING oracle**
+(`IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, "sender-wake stays before writeback and after the
+receiver commits metadata"). That is IPC endpoint / sender-wake decomposition — the
+explicit hard-stop condition for this stage. No `SCHED_SPLIT_*` markers were introduced
+(they would be dishonest for paths still under the global lock).
+
+**Corrected dependency picture (final).** The chain is not a clean stack (cap ← IPC ←
+scheduler-block/wake). Block/wake is already decomposed; IPC and its sender-wake are
+mutually entangled with the global lock. The real next increment is a **vertical
+co-decomposition of a single IPC operation**: pick one op (e.g. `ipc_reply`), move it out
+of the global lock end-to-end using the proven D6 stash relocation for its sender-wake,
+and validate against the full sender-wake QEMU oracle (x86_64 `smp2/smp4-sender-wake`)
+before touching any other IPC op. Recommended next stage:
+`Stage 185V IPC-REPLY-VERTICAL-DECOMP` (one op, stash-relocated wake, oracle-gated) —
+a larger, riskier, single-operation slice, not another horizontal layer.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
