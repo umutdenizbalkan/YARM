@@ -119,6 +119,7 @@ fatal_patterns=(
   "Vm\\(Full\\)"
   "CapabilityFull"
   "MissingRight"
+  "BLOCKED_WOULDBLOCK_FATAL"
 )
 for pattern in "${fatal_patterns[@]}"; do
   if rg -a -n "$pattern" "$LOG_NORM" >/dev/null 2>&1; then
@@ -156,8 +157,22 @@ fi
 
 for marker in \
   SUPERVISOR_PM_RESTART_SEND_BEGIN \
+  SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN \
   SUPERVISOR_PM_RESTART_REPLY_RECV \
+  SUPERVISOR_PM_RESTART_REPLY_SHAPE_OK \
+  SUPERVISOR_PM_RESTART_REPLY_DECODE_OK \
   SUPERVISOR_PM_RESTART_REPLY_ACCEPTED \
+  SUPERVISOR_RESTART_LINEAGE_UPDATE_OK \
+  SUPERVISOR_RESTART_LINEAGE_INDEX_OK \
+  SUPERVISOR_EVENT_LOOP_TICK \
+  SUPERVISOR_MANAGED_RECORD_REGISTER_OK \
+  SUPERVISOR_CRASH_TEST_RECORD_READY \
+  SUPERVISOR_IDLE_WAIT_SELECT \
+  SUPERVISOR_CONTROL_WAIT_SKIPPED \
+  SUPERVISOR_FAULT_WAIT_BEGIN \
+  SUPERVISOR_FAULT_LOOKUP_BEGIN \
+  SUPERVISOR_FAULT_LOOKUP_OK \
+  SUPERVISOR_RESTART_ATTEMPT_ADVANCE \
   PM_RESTART_V1_DECODE_OK \
   PM_RESTART_SENDER_OK \
   PM_RESTART_VALIDATE_OK \
@@ -170,6 +185,23 @@ for marker in \
   SUPERVISOR_SERVICE_DEGRADED_FINAL; do
   require_present "$marker" || oracle_failed=1
 done
+
+require_present "SUPERVISOR_FAULT_LOOKUP_OK fault_tid=10008" || oracle_failed=1
+require_present "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=0 new=1" || oracle_failed=1
+require_present "SUPERVISOR_RESTART_SCHEDULED tid=10008" || oracle_failed=1
+if ! rg -a "SUPERVISOR_FAULT_(WAIT|DRAIN)_RECV tid=10008" "$LOG_FILE" >/dev/null 2>&1; then
+  echo "[error] required fault receive marker missing for tid=10008 (expected WAIT_RECV or DRAIN_RECV)"
+  oracle_failed=1
+fi
+
+# SUP-L7H: pending-fault replay is a race fallback, not an unconditional
+# smoke requirement. If the crash-test record was not ready before the first
+# fault, require the fallback stash/replay path; otherwise the direct
+# registered-fault path is sufficient.
+if ! grep -q "SUPERVISOR_CRASH_TEST_RECORD_READY tid=10008" "$LOG_FILE"; then
+  require_present "SUPERVISOR_FAULT_PENDING_STASH tid=10008" || oracle_failed=1
+  require_present "SUPERVISOR_FAULT_PENDING_REPLAY_OK tid=10008" || oracle_failed=1
+fi
 
 if [[ "$QEMU_STATUS" -ne 0 && "$QEMU_STATUS" -ne 124 ]]; then
   echo "[error] QEMU exited with unexpected status $QEMU_STATUS"

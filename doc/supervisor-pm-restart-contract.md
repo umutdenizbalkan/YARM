@@ -586,3 +586,268 @@ then calls `handle_task_exit`. The supervisor logs query begin/call/reply/decode
 markers plus token source (`record` or `pm-query`) and continues to use the
 existing scheduler. No new opcode, startup slot, cap path, PM Accepted shortcut,
 supervisor-local restart execution, or SUP-L6 marker-count oracle change is made.
+
+## SUP-L6P — runtime-authoritative PM restart sender validation
+
+SUP-L6O fixed the accepted-fault token path: supervisor now preserves a
+recorded restart token when present, falls back to the read-only Process Manager
+restart-token query, stores a successful PM-query token in the managed-service
+record, emits `SUPERVISOR_RESTART_TOKEN_STATE ... present=1 source=record|pm-query`,
+and only then enters the task-exit/restart scheduling path.
+
+SUP-L6P fixes the next live blocker in PM restart execution. The root cause was
+that `handle_pm_restart_v1` trusted a stale hardcoded supervisor TID (`4`) while
+the production boot observed by the crash-restart smoke ran the real supervisor
+as TID `2`. The request's `sender_tid=2` is kernel-authenticated IPC metadata,
+and the restart payload's `supervisor_tid=2` matched it, so the anti-spoofing
+cross-check passed; only the stale trusted-supervisor comparison rejected the
+request.
+
+The correct rule is now explicit: PM restart execution trusts the
+runtime-authoritative supervisor TID stored in PM runtime state from the startup
+lifecycle handoff (`startup_context().supervisor_tid`). If that value is absent,
+restart execution fails closed with `PM_RESTART_SENDER_REJECTED ...
+reason=trusted_supervisor_unknown`. If present, `sender_tid` must equal the
+trusted runtime supervisor TID, and any nonzero payload `supervisor_tid` must
+still equal `sender_tid` as an anti-spoofing cross-check. Rejections are marked
+with `PM_RESTART_SENDER_CHECK_BEGIN`, `PM_RESTART_SENDER_REJECTED ...
+reason=untrusted_supervisor`, or `PM_RESTART_SENDER_REJECTED ...
+reason=trusted_supervisor_unknown`; accepted senders emit `PM_RESTART_SENDER_OK`.
+
+Restart-token query behavior remains read-only/open as implemented by SUP-L6O
+and is not treated as execution authority. PM remains authoritative for restart
+execution; the supervisor does not locally spawn or restart tasks. The crash-test
+restart remains gated and narrow, with no broad restart-any-image support. This
+change does not modify kernel code, architecture code, syscall ABI, RPi5 behavior,
+driver-manager DRS behavior, or the PM restart codec layout. The frozen counts
+remain `PROC_OP_PM_RESTART_V1 = 15`, `PROC_OP_PM_RESTART_REPLY_V1 = 16`,
+`PROCESS_IPC_OPCODE_COUNT = 16`, and `SYSCALL_COUNT = 31`.
+
+## SUP-L6Q — PM trusted-supervisor runtime wiring
+
+User-local QEMU after SUP-L6P proved the sender-validation logic was fail-closed
+but not yet wired: PM logged `PM_RESTART_SENDER_CHECK_BEGIN sender_tid=2
+payload_supervisor_tid=2 trusted_supervisor_tid=0` followed by
+`PM_RESTART_SENDER_REJECTED ... reason=trusted_supervisor_unknown`. The exact
+reason is that PM's startup slot 9 (`startup_context().supervisor_tid`) is zero
+in this boot; that slot is only populated for tasks that receive it, and PM's
+existing diagnostics already treated zero as missing/unknown while seeding the
+supervisor lifecycle record from the deterministic bootstrap lifecycle order.
+
+SUP-L6Q wires `ProcessService::trusted_supervisor_tid` from that existing
+runtime lifecycle source. PM still first probes `startup_context` and emits
+`PM_RESTART_TRUSTED_SUPERVISOR_INIT_BEGIN/OK/UNKNOWN`; when the startup slot is
+unknown, PM uses the already-existing bootstrap lifecycle handoff that records
+supervisor image_id 1 as the task spawned immediately before PM. Updates emit
+`PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_OK old=0 new=<tid>
+source=lifecycle_bootstrap_order`; zero or conflicting updates are rejected with
+`PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED`.
+
+The expected user-local smoke sender check is now
+`PM_RESTART_SENDER_CHECK_BEGIN sender_tid=2 payload_supervisor_tid=2
+trusted_supervisor_tid=2`, followed by `PM_RESTART_SENDER_OK sender_tid=2`. PM
+accepts sender TID 2 only because runtime lifecycle state identified TID 2 as
+the supervisor; task 2 is not hardcoded as restart authority. Unknown trusted
+supervisor still fails closed, arbitrary senders remain rejected, the payload
+`supervisor_tid` anti-spoof check remains, token query stays read-only/non-
+authorizing, crash-test restart remains gated/narrow, supervisor still does not
+locally spawn or restart tasks, and PM remains the restart authority. No kernel,
+syscall ABI, RPi5, driver-manager DRS, PM restart codec, or arch behavior
+changes. Frozen counts remain `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`, and
+`SYSCALL_COUNT = 31`; request/reply codec lengths remain 110 and 50 bytes.
+
+## SUP-L7A — supervisor PM restart reply receive and state update
+
+User-local QEMU after SUP-L6Q reached `PM_RESTART_SENDER_OK`,
+`PM_RESTART_VALIDATE_OK`, `PM_RESTART_SPAWN_OK`, and
+`PM_RESTART_REPLY_ACCEPTED request_id=1 target_tid=<old>`, proving PM restart
+execution accepted the runtime supervisor and spawned the first replacement. The
+next blocker was supervisor-side reply handling: `SUPERVISOR_PM_RESTART_REPLY_RECV`,
+`SUPERVISOR_PM_RESTART_REPLY_ACCEPTED`, and
+`SUPERVISOR_PM_RESTART_STATE_UPDATED` were absent, so the supervisor did not
+record the replacement lineage or drive attempts 2/3 and final degraded state.
+
+SUP-L7A fixes the first reply-path blocker. The supervisor PM restart client had
+sent with `ipc_call` and then performed an immediate zero-deadline receive on the
+reply cap. That could observe no message before PM ran and sent its reply, so the
+client returned a send failure before logging `SUPERVISOR_PM_RESTART_REPLY_RECV`.
+The client now emits `SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN` and waits on the
+existing PM reply cap with `ipc_recv_v2`, then validates opcode/length
+(`PROC_OP_PM_RESTART_REPLY_V1`, 50 bytes), decodes with the frozen reply codec,
+checks request_id and target_tid, accepts only a scoped task-TID replacement
+handle, and emits `SUPERVISOR_PM_RESTART_REPLY_DECODE_OK` and
+`SUPERVISOR_PM_RESTART_REPLY_ACCEPTED` before the state machine records the
+replacement TID and emits `SUPERVISOR_PM_RESTART_STATE_UPDATED`.
+
+`PM_RESTART_REPLY_ACCEPTED request_id=... target_tid=...` means PM accepted the
+restart operation and built an accepted reply; the PM runtime loop now also logs
+`PM_RESTART_REPLY_SEND_BEGIN` and `PM_RESTART_REPLY_SEND_OK` when it sends that
+reply through the kernel reply capability. PM remains restart authority, the
+supervisor remains policy/state owner and does not locally spawn or restart, the
+crash-test restart remains gated/narrow, and token query remains read-only and
+non-authorizing. No kernel, syscall ABI, arch, RPi5, driver-manager DRS, or PM
+restart codec layout changes; `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and request/reply lengths 110/50 remain frozen.
+
+## SUP-L7B — PM restart reply wire-shape convention
+
+User-local QEMU after SUP-L7A proved reply delivery reached the supervisor:
+`SUPERVISOR_PM_RESTART_REPLY_RECV tid=10008 request_id=1` appeared after
+`PM_RESTART_REPLY_SEND_OK request_id=1 target_tid=10008`. The next blocker was
+reply shape validation: the supervisor received `opcode=0 len=50`, rejected the
+message before codec decode, and therefore did not emit
+`SUPERVISOR_PM_RESTART_REPLY_DECODE_OK`, `SUPERVISOR_PM_RESTART_REPLY_ACCEPTED`,
+or `SUPERVISOR_PM_RESTART_STATE_UPDATED`.
+
+SUP-L7B audits this as a userspace reply-cap wire convention, not a PM codec
+length bug. `ProcessService::pm_restart_reply_with_handle` builds a message with
+`PROC_OP_PM_RESTART_REPLY_V1` and a 50-byte payload, but the existing
+`ipc_reply` syscall wrapper passes only the payload pointer/length and transfer
+cap to the kernel. The kernel `handle_ipc_reply` reconstructs no-cap replies with
+`Message::new(...)`, so reply-cap deliveries have IPC opcode `0` while preserving
+the exact 50-byte PM restart reply payload. Changing that would be a syscall IPC
+ABI semantic change, which SUP-L7B does not do.
+
+Therefore the strict supervisor shape rule is: reply-cap IPC opcode `0`, ABI
+opcode `PROC_OP_PM_RESTART_REPLY_V1 = 16` as the decoded payload type, and
+payload length `PM_RESTART_REPLY_V1_LEN = 50`. The supervisor now emits
+`SUPERVISOR_PM_RESTART_REPLY_SHAPE_OK opcode=0 abi_opcode=16 len=50` for this
+valid reply-cap shape and still emits `SUPERVISOR_PM_RESTART_REPLY_SHAPE_FAIL`
+and `SUPERVISOR_PM_RESTART_REPLY_DECODE_FAIL reason=shape` for wrong opcode or
+wrong length. It then decodes the frozen 50-byte codec, rejects request_id or
+target_tid mismatch, rejects zero or non-task-TID replacement handles, records
+the replacement TID in the managed record, and emits
+`SUPERVISOR_PM_RESTART_STATE_UPDATED tid=<replacement> replacement_tid=<replacement> attempt=<n>`.
+
+`PM_RESTART_REPLY_ACCEPTED request_id=... target_tid=...` continues to mean PM
+accepted the restart operation and built an accepted reply. `PM_RESTART_REPLY_SEND_OK
+request_id=... target_tid=... opcode=0 abi_opcode=16 len=50` means the actual
+reply-cap IPC send completed using the established reply syscall convention.
+PM remains restart authority, the supervisor remains policy/state owner and does
+not locally spawn or restart, crash-test restart remains gated/narrow, and token
+query remains read-only/non-authorizing. No kernel, syscall ABI, arch, RPi5,
+driver-manager DRS, or PM restart codec layout changes; `PROC_OP_PM_RESTART_V1 =
+15`, `PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and request/reply lengths 110/50 remain frozen.
+
+## SUP-L7C — replacement-fault lineage and prompt fault polling
+
+User-local QEMU after SUP-L7B reached the first accepted PM reply and the first
+supervisor state update:
+`SUPERVISOR_PM_RESTART_STATE_UPDATED tid=10009 replacement_tid=10009 attempt=1`.
+The replacement service then faulted as `PAGE_FAULT_UNHANDLED tid=10009`, but no
+`SUPERVISOR_RESTART_SCHEDULED tid=10009 attempt=2` appeared.
+
+SUP-L7C audits the blocker as a runtime fault-polling/lineage observability bug.
+The accepted PM reply did update the managed record's primary `tid` to the
+replacement TID, but after processing the PM reply the supervisor could enter its
+idle path waiting on the control endpoint for a long timeout. Because the current
+userspace loop has separate control and fault endpoints rather than a multi-cap
+wait, a long control-only idle wait can delay polling the queued fault endpoint
+and prevent the replacement fault from reaching the restart scheduler within the
+smoke oracle window.
+
+SUP-L7C keeps PM as restart authority and keeps supervisor as policy/state owner.
+It reduces the production supervisor idle wait budget to one tick so the loop
+continues polling the fault endpoint promptly, and adds explicit lineage markers
+when an accepted PM reply changes the managed record from the old TID to the
+replacement TID. The supervisor now logs
+`SUPERVISOR_RESTART_LINEAGE_UPDATE_BEGIN old_tid=<old> replacement_tid=<new> attempt=<n>`,
+`SUPERVISOR_RESTART_LINEAGE_UPDATE_OK`, and
+`SUPERVISOR_RESTART_LINEAGE_INDEX_OK replacement_tid=<new>` when the replacement
+TID becomes the managed record's current task.
+
+Fault handling now exposes lookup and scheduling state with
+`SUPERVISOR_FAULT_LOOKUP_BEGIN fault_tid=<tid>`,
+`SUPERVISOR_FAULT_LOOKUP_OK fault_tid=<tid> record_tid=<tid> attempt=<n>`,
+`SUPERVISOR_FAULT_LOOKUP_FAIL ...`, and
+`SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=<n> new=<n+1>`. This proves the second
+fault from the replacement TID maps to the same managed service lineage and that
+attempt count advances from 1 to 2 instead of resetting. Pending PM transaction
+fields are cleared after accepted replies, but supervision state and crash-test
+restart policy are preserved.
+
+No PM sender-validation, PM restart authorization, PM reply codec, kernel,
+syscall ABI, arch, RPi5, or driver-manager DRS behavior changes. The restart
+path remains gated to the crash-test image; the supervisor still does not spawn
+or restart locally. `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and PM restart request/reply lengths 110/50 remain frozen.
+
+## SUP-L7D — drain queued replacement fault reports
+
+User-local QEMU after SUP-L7C proved replacement fault delivery itself works:
+`TASK_FAULT_REPORT_ENQUEUE_OK tid=10009 endpoint=3 queued=1 woke=0` showed the
+kernel queued the replacement fault report on the supervisor fault endpoint. The
+missing markers were supervisor-side receive/lookup/schedule markers for tid
+10009, so the blocker was not PM replacement fault binding or kernel delivery;
+it was userspace supervisor event-loop fairness.
+
+The supervisor loop previously polled control before fault and only consumed one
+fault report in the main pass. If no task was blocked on the fault endpoint when
+the replacement fault was enqueued (`woke=0`), the report could remain queued
+until a later pass while the loop performed control polling/waiting and other
+work. SUP-L7D adds a bounded fault-drain phase at the top of each loop iteration
+and another drain immediately after the bounded control wait returns. The drain
+uses nonblocking `transport.recv(fault_cap)` repeatedly up to
+`SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK`, logging `SUPERVISOR_FAULT_DRAIN_BEGIN`,
+`SUPERVISOR_FAULT_DRAIN_RECV`, `SUPERVISOR_FAULT_DRAIN_EMPTY`, and
+`SUPERVISOR_FAULT_DRAIN_DONE count=<n>`.
+
+Queued fault reports now log `SUPERVISOR_FAULT_QUEUE_PENDING_DRAIN tid=<tid>`
+before processing and `SUPERVISOR_FAULT_QUEUE_DRAINED tid=<tid>` afterwards.
+The existing fault handling path is preserved: drained replacement faults still
+emit `SUPERVISOR_FAULT_REPORT_RECV`, `SUPERVISOR_FAULT_LOOKUP_BEGIN`,
+`SUPERVISOR_FAULT_LOOKUP_OK`, `SUPERVISOR_RESTART_ATTEMPT_ADVANCE`, and
+`SUPERVISOR_RESTART_SCHEDULED`. The bounded drain prevents busy-spinning, while
+control polling and the bounded control wait remain in the loop so control
+messages are not starved.
+
+PM remains restart authority; the supervisor remains policy/state owner and does
+not locally spawn or restart. No PM sender-validation, PM reply validation,
+lineage-update, kernel, syscall ABI, arch, RPi5, driver-manager DRS, or PM
+restart codec layout changes. `PROC_OP_PM_RESTART_V1 = 15`,
+`PROC_OP_PM_RESTART_REPLY_V1 = 16`, `PROCESS_IPC_OPCODE_COUNT = 16`,
+`SYSCALL_COUNT = 31`, and PM restart request/reply lengths 110/50 remain frozen.
+
+## SUP-L7E — bounded replay for fault-before-registration startup race
+
+SUP-L7D made the supervisor fault endpoint fair by draining queued fault reports before long control waits. User-local QEMU then exposed a startup ordering race rather than a kernel fault-bind or PM replacement issue: the initial crash-test service fault for `tid=10008` was delivered and drained before the supervisor had processed the control registration that creates the managed record, producing `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` followed by `SUPERVISOR_FAULT_LOOKUP_FAIL fault_tid=10008 reason=unmanaged`.
+
+SUP-L7E keeps the SUP-L7D drain path and fixes the race with bounded pending-fault replay. A fault report whose sender is valid but whose task is not yet in the managed table is stashed in a fixed-size pending-fault list with `SUPERVISOR_FAULT_PENDING_STASH tid=... reason=record_not_ready`. When the corresponding control/lifecycle registration creates the managed record (`SUPERVISOR_MANAGED_RECORD_REGISTER_OK` and, for the crash-test service, `SUPERVISOR_CRASH_TEST_RECORD_READY`), the supervisor replays the pending fault through the same normal handler path (`SUPERVISOR_FAULT_PENDING_REPLAY_BEGIN` / `SUPERVISOR_FAULT_PENDING_REPLAY_OK`). The replay then performs the ordinary lookup, token handling, `handle_task_exit`, attempt accounting, and `SUPERVISOR_RESTART_SCHEDULED` emission.
+
+The pending list is intentionally bounded and grants no authority by itself: arbitrary unknown tasks are not accepted as supervised, are never scheduled solely because a pending fault exists, and are dropped fail-closed on overflow or after the bounded stale-fault age if no matching managed record is registered. PM remains the only restart execution authority; the supervisor remains the policy/state owner and still does not locally spawn replacement tasks. SUP-L7E does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM restart opcodes, or the frozen PM restart request/reply codec lengths.
+
+## SUP-L7F — nonblocking fault-drain exit after early pending-fault stash
+
+SUP-L7E successfully stashed the early crash-test fault (`SUPERVISOR_FAULT_PENDING_STASH tid=10008 reason=record_not_ready`), but user-local QEMU showed the supervisor did not then emit `SUPERVISOR_FAULT_DRAIN_DONE` or reach `SUPERVISOR_CONTROL_POLL_BEGIN`. The root cause was that the SUP-L7D/SUP-L7E drain loop used the transport's blocking `recv(fault_cap)` inside a loop that was intended to be a bounded nonblocking drain. After handling and stashing the first fault, the next drain iteration could block on an empty fault endpoint, preventing control registration and pending replay.
+
+SUP-L7F changes the production drain probe to `recv_with_deadline(fault_cap, 0)` so an empty fault endpoint returns as an empty/nonblocking poll result, logs `SUPERVISOR_FAULT_DRAIN_EMPTY`, and always reaches `SUPERVISOR_FAULT_DRAIN_DONE count=...` before returning to the runtime loop. The control poll phase also uses a zero-timeout receive before the bounded control wait, preserving prompt fault polling while still allowing control registration messages to be processed.
+
+After the early stash, the expected same-tick progression is now `SUPERVISOR_FAULT_DRAIN_DONE count=1` followed by `SUPERVISOR_CONTROL_POLL_BEGIN`. Once the crash-test registration creates the managed record (`SUPERVISOR_MANAGED_RECORD_REGISTER_OK`, `SUPERVISOR_CRASH_TEST_RECORD_READY`), the existing bounded replay path emits `SUPERVISOR_FAULT_PENDING_REPLAY_BEGIN` and `SUPERVISOR_FAULT_PENDING_REPLAY_OK`, then drives the normal lookup, token, `handle_task_exit`, attempt accounting, and `SUPERVISOR_RESTART_SCHEDULED` path.
+
+PM remains the only restart execution authority, and the supervisor remains the policy/state owner. SUP-L7F does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.
+
+## SUP-L7G — explicit supervisor receive semantics and bounded PM query waits
+
+SUP-L7F still used ambiguous deadline-zero receives in paths that were intended to be nonblocking. In this runtime, `recv_with_deadline(cap, 0)` is not a safe try-receive: it can act like an unbounded/blocking wait, so a fault drain, control poll, or PM lifecycle query that used deadline `0` could stall the supervisor or report misleading absence depending on the path.
+
+SUP-L7G makes the receive policy explicit. The dedicated fault-drain path now uses the live nonblocking `RecvSharedV3` syscall wrapper (`ipc_recv_shared_v3_nonblocking`) through a supervisor-local `supervisor_try_recv_fault` helper; this helper is intentionally limited to the supervisor fault endpoint because RecvSharedV3 preserves sender/transfer metadata but not the message opcode, and the fault endpoint has a single wire shape. Control polling and PM reply queries use `SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS` via `supervisor_recv_short_deadline`/bounded receive calls instead of deadline `0`.
+
+When managed records exist, the idle selector prioritizes the fault endpoint (`SUPERVISOR_IDLE_WAIT_SELECT mode=fault reason=managed_records_ready`) and skips a control-only wait (`SUPERVISOR_CONTROL_WAIT_SKIPPED reason=managed_records_ready`). The fault wait is bounded and routes a received fault immediately through the normal handler before the loop returns to polling control, so queued replacement faults with `woke=0` can be recovered without starving control messages.
+
+The PM restart-token query no longer uses blocking `ipc_recv_v2(rep_cap)`; it waits with the short bounded deadline, logs `SUPERVISOR_RESTART_TOKEN_QUERY_TIMEOUT` on timeout, and does not schedule without a valid token. The lifecycle query also uses the short bounded deadline and logs `SUPERVISOR_LIFECYCLE_QUERY_TIMEOUT` distinctly from a real lifecycle-missing reply. Unmanaged fault lookup now returns immediately after stash/drop logging, so unmanaged tasks cannot fall through into PM token-query logic.
+
+Pending-fault replay remains a bounded race fallback rather than a mandatory startup path. The smoke contract now accepts both registration-before-fault and fault-before-registration orderings, while still requiring the functional markers for lookup, attempt advancement, and restart scheduling. PM remains the restart execution authority, the supervisor remains the policy/state owner, and SUP-L7G does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.
+
+## SUP-L7H — fault-priority managed-mode wait before bounded control receives
+
+SUP-L7G fixed several receive-timeout hazards, but user-local QEMU still showed `SUPERVISOR_CONTROL_POLL_BEGIN` after `SUPERVISOR_CRASH_TEST_RECORD_READY`, followed by a crash-test fault queued on the separate fault endpoint with `woke=0` and no `SUPERVISOR_IDLE_WAIT_SELECT mode=fault`. The root issue was that the SUP-L7G control poll still used a short bounded receive on the control endpoint before the managed-mode fault wait, so an empty control endpoint could delay or block the supervisor while the fault endpoint accumulated work.
+
+SUP-L7H makes managed-record mode fault-priority before any blocking or bounded control receive. Once `SupervisorService::has_managed_records()` is true, the loop logs `SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready`, skips the bounded control receive, selects `SUPERVISOR_IDLE_WAIT_SELECT mode=fault reason=managed_records_ready`, logs `SUPERVISOR_CONTROL_WAIT_SKIPPED reason=managed_records_ready`, and waits only on the fault endpoint. A received fault is routed immediately through the normal supervisor fault handler, which preserves direct registered-fault scheduling and replacement-fault scheduling.
+
+SUP-L7H also avoids normal empty RecvSharedV3 fault-drain probes in the runtime hot loop. User QEMU showed empty nonblocking nr=30 probes could emit `BLOCKED_WOULDBLOCK_FATAL`; without kernel changes, the userspace fix is to stop using that empty probe as a normal polling heartbeat and rely on the bounded fault wait in managed mode. The smoke script treats `BLOCKED_WOULDBLOCK_FATAL` as a failure and requires either `SUPERVISOR_FAULT_WAIT_RECV tid=10008` or `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` plus the functional attempt-1 markers.
+
+Pending replay remains a bounded startup-race fallback, not an unconditional requirement. PM remains the restart execution authority, the supervisor remains the policy/state owner, and SUP-L7H does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.

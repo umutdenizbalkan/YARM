@@ -2666,7 +2666,9 @@ mod tests {
         }
         for marker in &[
             "SUPERVISOR_PM_RESTART_SEND_BEGIN",
+            "SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN",
             "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_DECODE_OK",
             "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
             "PM_RESTART_V1_DECODE_OK",
             "PM_RESTART_SENDER_OK",
@@ -2698,15 +2700,212 @@ mod tests {
             !init_src.contains("crash_test_srv"),
             "normal init/service-core path must remain free of crash_test_srv"
         );
+        for marker in &[
+            "PM_RESTART_TRUSTED_SUPERVISOR_INIT_BEGIN source=startup_context",
+            "PM_RESTART_TRUSTED_SUPERVISOR_INIT_UNKNOWN source=startup_context",
+            "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_OK old=0 new={} source={}",
+            "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED reason=zero source={}",
+            "PM_RESTART_TRUSTED_SUPERVISOR_UPDATE_REJECTED reason=mismatch old={} new={} source={}",
+            "lifecycle_bootstrap_order",
+            "PM_RESTART_SENDER_CHECK_BEGIN sender_tid={} payload_supervisor_tid={} trusted_supervisor_tid={}",
+            "PM_RESTART_SENDER_REJECTED sender_tid={} trusted=0 reason=trusted_supervisor_unknown",
+        ] {
+            assert!(
+                pm_src.contains(marker),
+                "SUP-L6Q PM trusted-supervisor marker missing: {marker}"
+            );
+        }
+        let handler_start = pm_src.find("fn handle_pm_restart_v1").expect("handler");
+        let handler_end = pm_src[handler_start..]
+            .find("let rejected")
+            .map(|offset| handler_start + offset)
+            .unwrap_or(pm_src.len());
+        let handler = &pm_src[handler_start..handler_end];
+        assert!(handler.contains("self.trusted_supervisor_tid"));
+        for forbidden in &[
+            ["sender_tid != ", "2"].concat(),
+            ["sender_tid != ", "4"].concat(),
+            ["trusted_supervisor_tid: ", "2"].concat(),
+            ["trusted_supervisor_tid: ", "4"].concat(),
+        ] {
+            assert!(
+                !handler.contains(forbidden.as_str()),
+                "hardcoded trusted supervisor pattern remains: {forbidden}"
+            );
+        }
+        let pm_restart_client_start = supervisor_src
+            .find("fn send_pm_restart_v1_via_process_manager")
+            .expect("pm restart client");
+        let pm_restart_client_end = supervisor_src[pm_restart_client_start..]
+            .find("fn execute_restart_via_process_manager")
+            .map(|offset| pm_restart_client_start + offset)
+            .unwrap_or(supervisor_src.len());
+        let pm_restart_client = &supervisor_src[pm_restart_client_start..pm_restart_client_end];
+        for needle in &[
+            "SUPERVISOR_PM_RESTART_REPLY_WAIT_BEGIN",
+            "ipc_recv_v2(rep_cap)",
+            "SUPERVISOR_PM_RESTART_REPLY_RECV",
+            "SUPERVISOR_PM_RESTART_REPLY_CAP_OPCODE",
+            "PROC_OP_PM_RESTART_REPLY_V1",
+            "PM_RESTART_REPLY_V1_LEN",
+            "SUPERVISOR_PM_RESTART_REPLY_SHAPE_OK",
+            "SUPERVISOR_PM_RESTART_REPLY_SHAPE_FAIL",
+            "decode_pm_restart_reply_v1(reply_msg.as_slice())",
+            "SUPERVISOR_PM_RESTART_REPLY_DECODE_OK",
+            "SUPERVISOR_PM_RESTART_REPLY_DECODE_FAIL reason=shape",
+            "reply.request_id != client_request.request_id",
+            "reply.target_tid != client_request.target_tid",
+            "SUPERVISOR_PM_RESTART_REPLY_ACCEPTED",
+            "SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID",
+            "reply.replacement_handle_value != 0",
+        ] {
+            assert!(
+                pm_restart_client.contains(needle),
+                "SUP-L7A supervisor PM reply path missing {needle}"
+            );
+        }
+        for needle in &[
+            "PM_RESTART_REPLY_SEND_BEGIN request_id={} target_tid={} opcode={} abi_opcode={} len={}",
+            "PM_RESTART_REPLY_SEND_OK request_id={} target_tid={} opcode={} abi_opcode={} len={}",
+            "PROC_OP_PM_RESTART_REPLY_V1",
+            "reply.as_slice().len()",
+        ] {
+            assert!(
+                pm_src.contains(needle),
+                "SUP-L7B PM reply send shape marker/source missing {needle}"
+            );
+        }
+        let due_restart_start = supervisor_src
+            .find("fn execute_due_restarts")
+            .expect("due restarts");
+        let due_restart_end = supervisor_src[due_restart_start..]
+            .find("fn handle_task_exit")
+            .map(|offset| due_restart_start + offset)
+            .unwrap_or(supervisor_src.len());
+        let due_restart = &supervisor_src[due_restart_start..due_restart_end];
+        for needle in &[
+            "SupervisorPmRestartClientResult::Accepted",
+            "record.tid = replacement_handle_value",
+            "SUPERVISOR_PM_RESTART_STATE_UPDATED",
+            "SUPERVISOR_RESTART_LINEAGE_UPDATE_BEGIN",
+            "SUPERVISOR_RESTART_LINEAGE_UPDATE_OK",
+            "SUPERVISOR_RESTART_LINEAGE_INDEX_OK",
+            "record.pending_pm_request_id = None",
+        ] {
+            assert!(
+                due_restart.contains(needle),
+                "SUP-L7A state update path missing {needle}"
+            );
+        }
+        for needle in &[
+            "SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 1",
+            "SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK",
+            "supervisor_drain_fault_endpoint",
+            "supervisor_try_recv_fault(fault_cap)",
+            "ipc_recv_shared_v3_nonblocking",
+            "supervisor_recv_short_deadline(
+                        &mut transport",
+            "SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready",
+            "SUPERVISOR_EVENT_LOOP_TICK",
+            "SUPERVISOR_FAULT_DRAIN_BEGIN",
+            "SUPERVISOR_FAULT_DRAIN_DONE count={}",
+            "SUPERVISOR_FAULT_DRAIN_EMPTY",
+            "SUPERVISOR_FAULT_DRAIN_RECV tid={}",
+            "SUPERVISOR_FAULT_QUEUE_PENDING_DRAIN tid={}",
+            "SUPERVISOR_FAULT_QUEUE_DRAINED tid={}",
+            "SUPERVISOR_CONTROL_POLL_BEGIN",
+            "SUPERVISOR_CONTROL_POLL_EMPTY",
+            "SUPERVISOR_CONTROL_WAIT_BEGIN timeout={}",
+            "SUPERVISOR_CONTROL_WAIT_DONE result=",
+            "SUPERVISOR_IDLE_WAIT_SELECT mode=fault reason=managed_records_ready",
+            "SUPERVISOR_CONTROL_WAIT_SKIPPED reason=managed_records_ready",
+            "SUPERVISOR_FAULT_WAIT_BEGIN timeout={}",
+            "SUPERVISOR_FAULT_WAIT_RECV tid={}",
+            "SUPERVISOR_FAULT_WAIT_EMPTY",
+            "SUPERVISOR_FAULT_WAIT_DONE result=",
+            "SUPERVISOR_FAULT_LOOKUP_BEGIN",
+            "SUPERVISOR_FAULT_LOOKUP_OK",
+            "SUPERVISOR_FAULT_LOOKUP_FAIL",
+            "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old={} new={}",
+            "SUPERVISOR_RESTART_NOT_SCHEDULED",
+            "SUPERVISOR_PENDING_FAULT_CAPACITY",
+            "SUPERVISOR_PENDING_FAULT_MAX_AGE_TICKS",
+            "pending_faults",
+            "stash_pending_fault",
+            "drop_stale_pending_faults",
+            "supervisor_replay_ready_pending_faults",
+            "SUPERVISOR_MANAGED_RECORD_REGISTER_BEGIN tid={}",
+            "SUPERVISOR_MANAGED_RECORD_REGISTER_OK tid={}",
+            "SUPERVISOR_CRASH_TEST_RECORD_READY tid={}",
+            "SUPERVISOR_FAULT_LOOKUP_FAIL fault_tid={} reason=unmanaged phase=startup",
+            "SUPERVISOR_FAULT_PENDING_STASH tid={} reason=record_not_ready",
+            "SUPERVISOR_FAULT_PENDING_REPLAY_BEGIN tid={}",
+            "SUPERVISOR_FAULT_PENDING_REPLAY_OK tid={}",
+            "SUPERVISOR_FAULT_PENDING_REPLAY_FAIL tid={} reason=",
+            "SUPERVISOR_FAULT_PENDING_DROP tid={} reason=overflow",
+            "SUPERVISOR_FAULT_PENDING_DROP tid={} reason=stale",
+        ] {
+            assert!(
+                supervisor_src.contains(needle),
+                "SUP-L7C fault lineage marker/source missing {needle}"
+            );
+        }
         assert!(supervisor_src.contains("send_pm_restart_v1_via_process_manager"));
         assert!(
             supervisor_src.contains("ipc_call(req_cap, rep_cap, &msg)"),
             "SUP-L6N restart-token lookup must use the existing PM request/reply-cap call path"
         );
+        let token_query = supervisor_src
+            .split("fn query_restart_token_via_process_manager")
+            .nth(1)
+            .and_then(|tail| tail.split("fn query_lifecycle_via_process_manager").next())
+            .expect("token query function present");
         assert!(
-            supervisor_src.contains("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}")
-                && supervisor_src.contains("ipc_recv_v2(rep_cap)"),
-            "SUP-L6O token lookup must wait for and decode the PM reply before reporting missing-token"
+            token_query.contains("SUPERVISOR_RESTART_TOKEN_QUERY_CALL_SENT tid={}")
+                && token_query.contains(
+                    "ipc_recv_with_deadline(rep_cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS)"
+                )
+                && token_query.contains("SUPERVISOR_RESTART_TOKEN_QUERY_TIMEOUT tid={}"),
+            "SUP-L7G token lookup must use a bounded receive and report timeout"
+        );
+        assert!(
+            !token_query.contains("ipc_recv_v2(rep_cap)"),
+            "SUP-L7G token lookup must not use blocking ipc_recv_v2(rep_cap)"
+        );
+        let lifecycle_query = supervisor_src
+            .split("fn query_lifecycle_via_process_manager")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("fn send_pm_restart_v1_via_process_manager")
+                    .next()
+            })
+            .expect("lifecycle query function present");
+        assert!(
+            lifecycle_query
+                .contains("ipc_recv_with_deadline(rep_cap, SUPERVISOR_SHORT_RECV_TIMEOUT_TICKS)")
+                && lifecycle_query.contains("SUPERVISOR_LIFECYCLE_QUERY_TIMEOUT tid={}"),
+            "SUP-L7G lifecycle query must use a bounded receive and report timeout"
+        );
+        assert!(
+            !lifecycle_query.contains("ipc_recv_with_deadline(rep_cap, 0)"),
+            "SUP-L7G lifecycle query must not use ambiguous deadline 0"
+        );
+        assert!(
+            !supervisor_src.contains("recv_with_deadline(fault_cap, 0)")
+                && !supervisor_src.contains(
+                    "recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)"
+                ),
+            "SUP-L7G supervisor poll/drain paths must not use ambiguous deadline 0"
+        );
+        let managed_branch = supervisor_src
+            .split("if supervisor.has_managed_records() {")
+            .nth(1)
+            .and_then(|tail| tail.split("} else {").next())
+            .expect("managed-record event-loop branch present");
+        assert!(
+            managed_branch.contains("SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready")
+                && !managed_branch.contains("supervisor_recv_short_deadline"),
+            "SUP-L7H managed-record mode must skip bounded control receive before fault wait"
         );
         assert!(
             !supervisor_src.contains("spawn_process_with_startup_caps(")
@@ -2932,6 +3131,16 @@ mod tests {
                 "SUP-L6B must not introduce {forbidden}"
             );
         }
+        let managed_branch = supervisor_src
+            .split("if supervisor.has_managed_records() {")
+            .nth(1)
+            .and_then(|tail| tail.split("} else {").next())
+            .expect("managed-record event-loop branch present");
+        assert!(
+            managed_branch.contains("SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready")
+                && !managed_branch.contains("supervisor_recv_short_deadline"),
+            "SUP-L7H managed-record mode must skip bounded control receive before fault wait"
+        );
         assert!(
             !supervisor_src.contains("spawn_process_with_startup_caps(")
                 && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),
