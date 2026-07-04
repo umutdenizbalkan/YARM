@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Umut Deniz Balkan
 
-//! Source-grep scope tests for the x86_64 AP per-CPU environment scaffold.
+//! Source-grep scope tests for the x86_64 AP per-CPU environment.
 //!
-//! Pins the contract introduced in this pass:
+//! Updated for the accepted Stage 183 (SMP-LIVE) model. APs are brought
+//! **online but WAKE-ONLY**: they set up a real per-CPU environment and idle in
+//! a scheduler-owned interruptible loop, but run no dispatcher and execute no
+//! user tasks (`dispatching_cpu_count` stays 1). This file pins:
 //! - AP env BEGIN/READY bracket markers
-//! - per-component READY-or-DEFERRED-with-reason markers (STACK, GDT, TSS,
-//!   IDT, GS, FPU)
+//! - the env scaffold no longer *defers* GDT/TSS/GS: they are really loaded and
+//!   graded by the admit poll (`X86_AP_GDT_LOCAL_OK` / `X86_AP_TSS_OK` /
+//!   `X86_AP_GS_OK`, with `..._BAD` on failure). IDT and FPU remain explicitly
+//!   deferred with reason (interrupts masked / AP runs no FP code).
 //! - X86_AP_RUST_PARK carries `reason=no_ap_scheduler_yet`
-//! - APs remain parked: no scheduler dispatch, no userspace entry, no
-//!   LAPIC timer arm, no runqueue participation
-//! - production scheduler `online_cpus` stays 1
+//! - APs run no scheduler dispatch, enter no userspace, arm no LAPIC timer, and
+//!   join no runqueue (wake-only)
+//! - the early `X86_SMP_STARTUP` summary keeps `online_cpus=1` (real AP
+//!   scheduler-online admission is graded separately via `X86_SMP_ONLINE_READY`)
 
 #[test]
 fn ap_env_begin_marker_is_emitted_per_cpu() {
@@ -39,18 +45,35 @@ fn ap_stack_marker_records_real_stack_top() {
 #[test]
 fn ap_gdt_is_marked_ready_with_explicit_reason() {
     let smp = include_str!("../src/arch/x86_64/smp.rs");
+    // Stage 183 inc.3: GDT is now PER-AP (the AP does lgdt + CS/SS reload),
+    // graded by the admit poll — no longer a shared-BSP-GDT deferral.
     assert!(
-        smp.contains("X86_AP_GDT_READY cpu={} reason=bsp_gdt_shared_safe_while_ap_masked"),
-        "X86_AP_GDT_READY must document why the BSP GDT is safe to share"
+        smp.contains("X86_AP_GDT_READY cpu={} reason=ap_local_gdt_graded_by_admit_poll"),
+        "X86_AP_GDT_READY must document that the per-AP GDT is graded by the admit poll"
+    );
+    assert!(
+        smp.contains("X86_AP_GDT_LOCAL_OK cpu={} reason=lgdt_plus_kernel_cs_ss_reload"),
+        "the admit poll must grade the real per-AP GDT load (lgdt + CS/SS reload)"
     );
 }
 
 #[test]
-fn ap_tss_is_explicitly_deferred() {
+fn ap_tss_is_really_loaded_and_graded() {
     let smp = include_str!("../src/arch/x86_64/smp.rs");
+    // Stage 183 inc.3: the AP now loads a real per-AP TSS (ltr; rsp0 = AP stack
+    // top, ISTs zero until an AP IDT exists), graded by the admit poll. The old
+    // "TSS deferred for a parked AP" marker must NOT come back.
     assert!(
-        smp.contains("X86_AP_TSS_DEFERRED cpu={} reason=no_ap_local_tss_required_for_parked_ap"),
-        "X86_AP_TSS_DEFERRED must record the real reason no AP-local TSS is installed"
+        !smp.contains("X86_AP_TSS_DEFERRED"),
+        "X86_AP_TSS_DEFERRED is obsolete — the AP loads a real per-AP TSS (Stage 183)"
+    );
+    assert!(
+        smp.contains("X86_AP_TSS_OK cpu={} rsp0=0x{:x} busy=1 ist=zero_until_ap_idt"),
+        "the admit poll must grade the real per-AP TSS load (ltr busy-bit + rsp0)"
+    );
+    assert!(
+        smp.contains("X86_AP_TSS_BAD cpu="),
+        "the TSS grade must have an explicit failure marker"
     );
 }
 
@@ -64,12 +87,47 @@ fn ap_idt_is_explicitly_deferred() {
 }
 
 #[test]
-fn ap_gs_is_explicitly_deferred() {
+fn ap_gs_is_really_initialized_and_graded() {
     let smp = include_str!("../src/arch/x86_64/smp.rs");
+    // Stage 183: the AP now performs a real GS-base write (WRMSR IA32_GS_BASE by
+    // the AP itself) and the admit poll grades it. The old "GS deferred, no
+    // per-CPU area" marker must NOT come back, and the grade must be real
+    // (X86_AP_GS_OK / X86_AP_GS_BAD), not a faked X86_AP_GS_READY (see
+    // ap_gs_ready_is_never_faked below).
     assert!(
-        smp.contains("X86_AP_GS_DEFERRED cpu={} reason=no_per_cpu_area_allocated"),
-        "X86_AP_GS_DEFERRED must record the per-CPU-area allocation reason"
+        !smp.contains("X86_AP_GS_DEFERRED"),
+        "X86_AP_GS_DEFERRED is obsolete — the AP writes a real GS base (Stage 183)"
     );
+    assert!(
+        smp.contains("X86_AP_GS_OK cpu={}"),
+        "the admit poll must grade the real per-AP GS-base write"
+    );
+    assert!(
+        smp.contains("X86_AP_GS_BAD cpu={}"),
+        "the GS grade must have an explicit failure marker"
+    );
+}
+
+// Stage 183 (SMP-LIVE) accepted model: the AP env is really set up and the AP is
+// admitted scheduler-online (wake-only). Pin the positive grade/admission markers
+// so a regression back to a "deferred / parked" AP env cannot silently pass.
+#[test]
+fn ap_env_reaches_accepted_live_online_grades() {
+    let smp = include_str!("../src/arch/x86_64/smp.rs");
+    for marker in [
+        "X86_AP_GDT_LOCAL_OK cpu=",
+        "X86_AP_TSS_OK cpu=",
+        "X86_AP_GS_OK cpu=",
+        "X86_AP_LAPIC_OK cpu=",
+        "X86_AP_SCHED_PREREQ_OK cpu=",
+        "X86_AP_SCHED_ONLINE_OK cpu=",
+        "X86_SMP_ONLINE_READY present=",
+    ] {
+        assert!(
+            smp.contains(marker),
+            "accepted Stage 183 live-env/admission marker must be present: {marker}"
+        );
+    }
 }
 
 #[test]
