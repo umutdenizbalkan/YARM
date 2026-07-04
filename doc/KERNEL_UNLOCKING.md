@@ -7239,6 +7239,53 @@ before touching any other IPC op. Recommended next stage:
 `Stage 185V IPC-REPLY-VERTICAL-DECOMP` (one op, stash-relocated wake, oracle-gated) —
 a larger, riskier, single-operation slice, not another horizontal layer.
 
+**Stage 185V (IPC-REPLY-VERTICAL-DECOMP) — audited, HARD-STOPPED, no code change.**
+The `ipc_reply` vertical slice was attempted and stopped: it cannot be moved out of the
+global lock in one pass without broad endpoint/waiter + capability decomposition (the
+hard-stop condition). Findings:
+
+- *`ipc_reply` is already impeccably phased.* Phase 1 snapshots the waiter under
+  `ipc_state_lock` (released immediately), Phase 3 (`complete_blocked_recv_for_waiter`)
+  does the user copy "outside all locks", Phase 4 clears the waiter under
+  `ipc_state_lock`, Phase 5 wakes via `apply_scheduler_wake_plan` outside all locks; the
+  reply cap is consumed exactly once (`ipc.reply_caps[slot] = None`), and `ipc_state_lock`
+  is never held across copy / cap materialization / wake. There is no phasing defect to
+  fix — the two-phase discipline the stage asked for already exists.
+- *The only coupling to the global lock is that `ipc_reply` accesses state through
+  `&mut KernelState` (from `with_cpu`).* It touches four subsystems via `self.*`: ipc-state
+  (7 ops), capability/cnode (6 ops: `fast_revoke_reply_cap_in_cnode`, `current_task_cnode`,
+  `resolve_send_cap_task_local`), task-state (`with_tcbs`), scheduler
+  (`apply_scheduler_wake_plan`).
+- *The infrastructure to run those subsystems lock-free does not exist.* Split-mut helpers
+  exist **only for the scheduler** (`with_scheduler_split_mut`); there is no
+  `with_ipc_state_split_mut` / `with_task_state_split_mut` / `with_cnode_split_mut` /
+  `with_capability_split_mut` (0 in tree). And `complete_blocked_recv_for_waiter` — the
+  user-copy/waiter-completion `ipc_reply` uses — takes `&mut KernelState` and is **shared
+  by 7 call sites** across send/recv/call/reply/fault delivery. Making it global-lock-free
+  converts it for every IPC op = broad endpoint/waiter decomposition. The split-dispatch
+  path services only narrow single-subsystem ops ("never blocks, yields, schedules, or
+  copies user memory"), so `ipc_reply` (multi-subsystem, user-copy, wake) cannot ride it.
+  Granting `ipc_reply` a raw `&mut KernelState` without the global lock is forbidden
+  (reintroduces the boot-only escape into live runtime, guarded by
+  `stage185_boot_only_global_borrow_confined`) and unsound on SMP (races wake-only APs;
+  the global lock is what serializes them). No `IPC_REPLY_SPLIT_*` markers were introduced.
+
+**Series conclusion (185BC → 185B → 185S → 185V, four honest stops).** Global-lock
+retirement cannot proceed by peeling one operation or one subsystem at a time: the IPC ops
+share wide `&mut KernelState` machinery (delivery/waiter/cnode/scheduler), and the only
+per-subsystem split-mut infrastructure that exists is the scheduler's. Retirement requires
+**building the per-subsystem split-mut layer (ipc-state, task-state, cnode/capability)
+first, as pure infrastructure**, before any IPC op can leave the global lock — a large,
+multi-stage effort. Moreover, on the accepted single-dispatcher model the global lock is
+**uncontended** (one dispatcher), so retirement yields **no functional benefit until the
+deferred multi-dispatcher work lands**. Honest recommendation: **defer global-lock
+retirement** and either (a) prioritize the multi-dispatcher enablement that would make it
+beneficial and give the sender-wake oracle a real concurrency surface to prove against, or
+(b) if retirement is still desired, run it as an explicit multi-stage
+`Stage 186 SPLIT-MUT-INFRA` track that builds `with_ipc_state_split_mut` /
+`with_task_state_split_mut` / cnode split-mut helpers + guards first, then revisits
+`ipc_reply`. Either way it is not a single-pass vertical slice.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
