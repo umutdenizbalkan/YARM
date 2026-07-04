@@ -7170,6 +7170,42 @@ cap-transfer split as follow-on increments. No `CAP_SPLIT_*` / `REPLY_CAP_SPLIT_
 `CAP_TRANSFER_SPLIT_*` markers were introduced — emitting split-success markers for
 paths still handled by the legacy global runtime would be dishonest.
 
+**Stage 185B (IPC-DOMAIN-DECOMPOSITION-PREP) — audited, HARD-STOPPED, no code change.**
+The follow-on IPC-domain decomposition was attempted and stopped per its own hard-stop
+rule (real IPC decomposition must not require scheduler-wide decomposition first).
+Two findings:
+
+- *The two-phase `ipc_state_lock` structure the previous note asked for ALREADY
+  EXISTS.* `ipc_reply` / recv-delivery / `create_reply_cap_for_caller` /
+  `take_transfer_envelope` already own their IPC-local state under `ipc_state_lock`
+  (rank 3) and perform cap materialization (rank 4), user-memory copy, and scheduler
+  wake **only after dropping `ipc_state_lock`** ("Phase 3/5 outside all locks"). The
+  reply-cap one-shot / `StaleCapability` / `WrongObject` / `MissingRight` /
+  `CapabilityFull` invariants are already enforced and heavily tested. So there is no
+  un-converted two-phase work to add — the discipline is in place.
+- *Genuine IPC decomposition — removing the global lock from IPC ops — is BLOCKED on
+  scheduler decomposition.* `ipc_send/recv/call/reply` intrinsically perform scheduler
+  **block/wake** as integral steps (`apply_scheduler_wake_plan`, `block_current`,
+  `enqueue_woken_task` — ~37 scheduler-mutation call sites across the IPC files). The
+  IPC-local sub-operations the task named as "safe" candidates (reply-cap table
+  lookup/mark-consumed, transfer-envelope validate/take) are **not standalone
+  syscalls** — they occur only inside those enclosing IPC ops, which need the
+  scheduler wake/block. Running any IPC syscall without the global lock therefore
+  requires the scheduler block/wake state mutation to be lock-free-safe first — the
+  explicit hard-stop condition. No `IPC_SPLIT_*` markers were introduced (they would
+  be dishonest for paths still under the global lock).
+
+**Corrected dependency ordering:** the 185BC note above proposed "IPC decomposition
+first, then reply-cap/cap-transfer". The 185B audit shows the real prerequisite is one
+level deeper: **scheduler-domain decomposition** (make `TaskStatus` block/wake +
+runqueue enqueue/dequeue safe outside the global lock) must come first, *then* IPC
+send/recv/call/reply can leave the global lock, *then* reply-cap/cap-transfer split
+becomes possible. Recommended next stage: `Stage 185S SCHEDULER-BLOCK-WAKE-DECOMP` —
+move the block/wake state mutation onto `scheduler_state` (rank 1) / `task_state_lock`
+(rank 2) with a documented two-phase (compute wake plan under lock, apply after
+release), reusing the existing `compute_wake_plan_for_tid` / `apply_scheduler_wake_plan`
+split that the D2/D6 dispatch relocation already established.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
