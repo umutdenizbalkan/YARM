@@ -140,6 +140,24 @@ so it cannot carry any of these. A cap-transfer seam therefore requires a joint
 capability↔memory decomposition first; deferred as `CAP_TRANSFER_SEAM_DEFERRED`.
 Pinned by `stage186d_cap_transfer_engine_seam_entanglement`.
 
+**Atomic capability↔memory mint (Stage 186D-proper, infrastructure only).** The
+mint/refcount half of that joint decomposition now exists as seam-only
+infrastructure: `SharedKernel::mint_capability_with_memory_ref_split` (in
+`boot/cap_memory_mint_split.rs`) mints a cap into an existing cnode while keeping
+the referenced memory-object `cap_refcount` (rank 6) and the published cnode slot
+(rank 4) consistent, using **Model A — pre-bump then install**: bump the object's
+`cap_refcount` under the memory seam (object protected before any slot references
+it), then publish the slot under the capability seam with a fresh receiver-local
+`CapId`, rolling the refcount back if the publish fails. The two critical sections
+are disjoint, so it holds only one subsystem lock at a time (deadlock-free) and
+never takes `ipc_state_lock` — no cap materialization under IPC, no cap→IPC rank
+inversion. It takes an object+rights `Capability` (never echoes a sender-local
+CapId as authority) and returns `StaleCapability`/`CapabilityFull`/`TaskMissing` as
+real errors. `M2_SEAM_HELPER_ONLY`: **not wired live** — it does not by itself
+convert `ipc_reply` or retire the lock, and does not solve the reply-cap IPC
+rank-inversion blocker. It is the atomic-mint building block for a future
+cap-transfer seam. Guarded by `stage186d_proper_cap_memory_mint_atomicity`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

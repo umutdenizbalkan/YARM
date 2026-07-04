@@ -2,6 +2,7 @@
 // Copyright 2026 Umut Deniz Balkan
 
 mod bootstrap_state;
+mod cap_memory_mint_split;
 mod capability_lifecycle_state;
 mod capability_service_state;
 mod capability_state;

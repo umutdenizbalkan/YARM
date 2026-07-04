@@ -46457,6 +46457,286 @@ mod stage186d_cap_transfer_engine_seam_entanglement {
 }
 
 // ===========================================================================
+// Stage 186D-proper (CAPABILITY-MEMORY-MINT-ATOMICITY) — atomic cap↔memory mint
+// helper (infrastructure only, NOT wired live).
+//
+// Functional tests exercise the real seam through a booted SharedKernel:
+// a successful mint bumps cap_refcount exactly once and publishes a fresh
+// receiver-local cap; a failed slot install rolls the refcount back (no leak);
+// a stale memory object is rejected before any slot is published; and revoke
+// decrements exactly once. Source guards pin the seam-only / no-broad
+// &mut KernelState / no-IPC-lock / rollback-present / real-error / not-wired
+// properties. See doc/KERNEL_UNLOCKING.md (Stage 186D-proper).
+// ===========================================================================
+#[cfg(test)]
+mod stage186d_proper_cap_memory_mint_atomicity {
+    use crate::kernel::boot::{Bootstrap, KernelError};
+    use crate::kernel::capabilities::{CNodeId, CapObject, CapRights, Capability};
+    use crate::runtime::SharedKernel;
+
+    const SRC: &str = include_str!("cap_memory_mint_split.rs");
+
+    fn cap_refcount(shared: &SharedKernel, id: u64) -> u32 {
+        shared.with(|k| {
+            let slot = k.memory_object_slot_by_id(id).expect("mem slot");
+            k.memory.memory_objects[slot].expect("mem obj").cap_refcount
+        })
+    }
+
+    // Code with comment lines stripped, so guards test the real code and never
+    // trip on doc-comment prose (e.g. the doc says "never a broad &mut KernelState").
+    fn code_only() -> alloc::string::String {
+        SRC.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // The public orchestrator body (up to the first private fn).
+    fn orchestrator() -> &'static str {
+        SRC.split("fn mint_capability_with_memory_ref_split(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    fn ").next())
+            .expect("orchestrator must exist")
+    }
+
+    // Successful mint bumps cap_refcount by exactly one and publishes a fresh
+    // receiver-local cap; a following revoke decrements by exactly one.
+    #[test]
+    fn stage186d_proper_success_bumps_once_then_revoke_balances() {
+        let mut boxed = Bootstrap::init().expect("init");
+        let (mem_id, mem_cap) = boxed.alloc_anonymous_memory_object().expect("mem");
+        let cnode = boxed.current_task_cnode().expect("cnode");
+        let object = boxed.current_task_capability(mem_cap).expect("cap").object;
+        let shared = SharedKernel::new(boxed);
+
+        let base = cap_refcount(&shared, mem_id);
+        let minted = shared
+            .mint_capability_with_memory_ref_split(cnode, Capability::new(object, CapRights::SEND))
+            .expect("split mint should succeed");
+        assert_eq!(
+            cap_refcount(&shared, mem_id),
+            base + 1,
+            "successful split mint must bump cap_refcount by exactly one"
+        );
+        assert!(
+            shared.with(|k| k.capability_for_cnode(cnode, minted).is_some()),
+            "minted cap must be a real receiver-local cap resolvable in the cnode"
+        );
+        shared
+            .with(|k| k.revoke_capability_in_cnode(cnode, minted))
+            .expect("revoke minted cap");
+        assert_eq!(
+            cap_refcount(&shared, mem_id),
+            base,
+            "revoke must decrement cap_refcount by exactly one (symmetric with mint)"
+        );
+    }
+
+    // Slot-install failure (destination cnode absent → TaskMissing) rolls the
+    // Phase-1 refcount bump back: no leak, real error.
+    #[test]
+    fn stage186d_proper_install_failure_rolls_back_refcount() {
+        let mut boxed = Bootstrap::init().expect("init");
+        let (mem_id, mem_cap) = boxed.alloc_anonymous_memory_object().expect("mem");
+        let object = boxed.current_task_capability(mem_cap).expect("cap").object;
+        let shared = SharedKernel::new(boxed);
+
+        let base = cap_refcount(&shared, mem_id);
+        let bogus = CNodeId(0xDEAD_BEEF);
+        let r = shared
+            .mint_capability_with_memory_ref_split(bogus, Capability::new(object, CapRights::SEND));
+        assert_eq!(
+            r,
+            Err(KernelError::TaskMissing),
+            "mint into a non-existent cnode must fail with a real error, not success"
+        );
+        assert_eq!(
+            cap_refcount(&shared, mem_id),
+            base,
+            "a failed slot install must roll the cap_refcount bump back — no leak"
+        );
+    }
+
+    // A memory-backed object that is not live is rejected with StaleCapability
+    // BEFORE any cnode slot is published (Phase 1 gate; no cap published).
+    #[test]
+    fn stage186d_proper_stale_object_rejected_before_publish() {
+        let boxed = Bootstrap::init().expect("init");
+        let cnode = boxed.current_task_cnode().expect("cnode");
+        let occupied_before = boxed.cnode_occupied_slots(cnode).expect("slots");
+        let shared = SharedKernel::new(boxed);
+
+        let dead = CapObject::MemoryObject { id: 0xFFFF_FFFF };
+        let r = shared
+            .mint_capability_with_memory_ref_split(cnode, Capability::new(dead, CapRights::SEND));
+        assert_eq!(
+            r,
+            Err(KernelError::StaleCapability),
+            "a non-live memory-backed object must be rejected as StaleCapability"
+        );
+        assert_eq!(
+            shared.with(|k| k.cnode_occupied_slots(cnode).expect("slots")),
+            occupied_before,
+            "no cnode slot may be published when the object is rejected in Phase 1"
+        );
+    }
+
+    // Guard: the helper never forms a broad &mut KernelState and never takes the
+    // global lock (.with / .with_cpu) or borrow_kernel_for_boot escape.
+    #[test]
+    fn stage186d_proper_no_broad_kernel_borrow() {
+        let code = code_only();
+        for forbidden in [
+            "&mut KernelState",
+            "borrow_kernel_for_boot",
+            ".with(",
+            ".with_cpu(",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "atomic mint helper must NOT use `{forbidden}` (seam-only, no broad kernel borrow)"
+            );
+        }
+    }
+
+    // Guard: the helper never acquires IPC (rank 3) — no cap materialization
+    // under ipc_state_lock, no cap→IPC rank inversion.
+    #[test]
+    fn stage186d_proper_no_ipc_lock() {
+        let code = code_only();
+        for forbidden in ["with_ipc_split_mut", "with_ipc_state", "ipc_state_lock"] {
+            assert!(
+                !code.contains(forbidden),
+                "atomic mint helper must NOT touch IPC (`{forbidden}`) — rank 4/6 only"
+            );
+        }
+    }
+
+    // Guard: the helper uses ONLY the rank-6 memory seam and the rank-4 capability
+    // seam.
+    #[test]
+    fn stage186d_proper_uses_only_memory_and_capability_seams() {
+        let code = code_only();
+        assert!(
+            code.contains("with_memory_split_mut"),
+            "Phase 1 / rollback must use the rank-6 memory seam"
+        );
+        assert!(
+            code.contains("with_capability_state_split_mut"),
+            "Phase 2 must use the rank-4 capability seam"
+        );
+    }
+
+    // Guard: cnode slot install and memory refcount are NOT separated without a
+    // rollback. The orchestrator must call install AND, on failure, rollback.
+    #[test]
+    fn stage186d_proper_install_and_refcount_have_rollback() {
+        let body = orchestrator();
+        assert!(
+            body.contains("bump_memory_ref_for_mint_split"),
+            "orchestrator must protect the object (Phase 1 bump) before publishing a slot"
+        );
+        assert!(
+            body.contains("install_cnode_slot_for_mint_split"),
+            "orchestrator must publish the slot in Phase 2"
+        );
+        assert!(
+            body.contains("rollback_memory_ref_for_mint_split"),
+            "orchestrator MUST roll the refcount back if the slot install fails — \
+             separating slot install from refcount without rollback is forbidden"
+        );
+    }
+
+    // Guard: real capability/memory errors are preserved, never hidden as success.
+    #[test]
+    fn stage186d_proper_errors_are_real() {
+        let code = code_only();
+        assert!(
+            code.contains("Err(KernelError::StaleCapability)"),
+            "stale memory object must be a real StaleCapability error"
+        );
+        assert!(
+            code.contains("KernelError::CapabilityFull"),
+            "a full cspace must be a real CapabilityFull error"
+        );
+        assert!(
+            code.contains("KernelError::TaskMissing"),
+            "a missing cnode space must be a real TaskMissing error"
+        );
+    }
+
+    // Guard: the helper mints a FRESH receiver-local cap and never echoes a
+    // sender-local CapId as authority — it takes an object+rights `Capability`,
+    // not a foreign `CapId`, and publishes via cspace `.mint(...)`.
+    #[test]
+    fn stage186d_proper_mints_fresh_receiver_local_cap() {
+        let sig = SRC
+            .split("fn mint_capability_with_memory_ref_split(")
+            .nth(1)
+            .and_then(|rest| rest.split("{").next())
+            .expect("orchestrator signature");
+        assert!(
+            sig.contains("capability: Capability"),
+            "helper must take an object+rights Capability, not a foreign CapId to echo"
+        );
+        assert!(
+            !sig.contains("source_cap") && !sig.contains(": CapId"),
+            "helper must NOT accept a sender-local CapId to copy as receiver authority"
+        );
+        assert!(
+            code_only().contains(".mint(capability)"),
+            "helper must publish a freshly-minted receiver-local cap via cspace .mint()"
+        );
+    }
+
+    // Guard: helper-only — not wired into any live IPC/syscall/cap-transfer path.
+    #[test]
+    fn stage186d_proper_not_wired_live() {
+        for (name, src) in [
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("../syscall.rs", include_str!("../syscall.rs")),
+            ("../syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+            (
+                "../syscall/ipc_recv_core.rs",
+                include_str!("../syscall/ipc_recv_core.rs"),
+            ),
+            (
+                "../cap_transfer_split.rs",
+                include_str!("../cap_transfer_split.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains("mint_capability_with_memory_ref_split"),
+                "Stage 186D-proper is helper-only: `{name}` must NOT call the atomic mint helper"
+            );
+        }
+        assert!(
+            SRC.contains("#[cfg_attr(not(test), allow(dead_code))]"),
+            "public helper must be dead_code-allowed under non-test (helper-only)"
+        );
+    }
+
+    // Guard: docs record 186D-proper honestly and do not overclaim.
+    #[test]
+    fn stage186d_proper_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 186D-proper"),
+            "KERNEL_UNLOCKING.md must document Stage 186D-proper"
+        );
+        assert!(
+            UNLOCK_DOC.contains("does not by itself"),
+            "docs must state 186D-proper does not by itself convert ipc_reply / retire the lock"
+        );
+        assert!(
+            UNLOCK_DOC.contains("rank-inversion") || UNLOCK_DOC.contains("rank inversion"),
+            "docs must state the reply-cap IPC rank-inversion blocker remains deferred"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

@@ -121,6 +121,26 @@ never emitted on a legacy path. No runtime change. Pinned by
 `stage186d_cap_transfer_engine_seam_entanglement`. The real next move is a joint
 capability↔memory decomposition giving the mint+refcount a shared atomicity discipline.
 
+### 0.4) Stage 186D-proper (CAPABILITY-MEMORY-MINT-ATOMICITY) — atomic cap↔memory mint
+
+Removes the mint/refcount atomicity blocker as seam-only infrastructure. `SharedKernel`
+gains `mint_capability_with_memory_ref_split` (in `boot/cap_memory_mint_split.rs`), which
+mints a capability into an existing cnode while keeping the referenced memory-object's
+`cap_refcount` and the published cnode slot mutually consistent. **Model A —
+pre-bump then install:** (1) rank-6 `with_memory_split_mut` validates object liveness and
+bumps `cap_refcount` so the object is protected *before* any slot references it; (2) rank-4
+`with_capability_state_split_mut` publishes the slot with a fresh receiver-local `CapId`;
+(3) if publish fails (`CapabilityFull` / absent space → `TaskMissing`), the refcount bump is
+rolled back — no leak. The two critical sections are disjoint (Phase 1 releases the memory
+lock before Phase 2 takes the capability lock), so despite rank 6 preceding rank 4 the helper
+holds only one subsystem lock at a time → deadlock-free; it never forms a broad
+`&mut KernelState` and never takes `ipc_state_lock` (no cap materialization under IPC, no
+cap→IPC rank inversion). Real errors (`StaleCapability`/`CapabilityFull`/`TaskMissing`) are
+never hidden. `M2_SEAM_HELPER_ONLY`: not wired into any live path — it does not by itself
+convert `ipc_reply` or retire the global lock, and does not solve the reply-cap IPC
+rank-inversion blocker. Guarded by `stage186d_proper_cap_memory_mint_atomicity`. This is the
+atomic-mint prerequisite a future cap-transfer materialization seam is built on top of.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

@@ -7426,6 +7426,68 @@ move is a joint capability↔memory decomposition (a `Stage 186D` proper) that g
 mint+refcount a shared atomicity discipline; only then does a cap-transfer seam become
 honest.
 
+**Stage 186D-proper (CAPABILITY-MEMORY-MINT-ATOMICITY) — DONE (infrastructure only, no
+live conversion).** This stage removes the mint/refcount atomicity blocker that 186D-prereq
+identified, as reusable seam-only infrastructure. Under the global lock,
+`mint_capability_in_cnode` installs a cnode slot (rank 4) and bumps the referenced
+memory-object `cap_refcount` (rank 6) in ONE critical section, so nothing observes a
+half-state. A future cap-transfer *seam* runs under per-domain marker locks, which makes the
+slot-install → refcount-bump window real: a concurrent `reclaim_memory_object_if_unreferenced`
+in that window could free an object a freshly-published slot already references
+(use-after-free). This stage builds the atomicity discipline for that mint.
+
+Added `mint_capability_with_memory_ref_split` on `SharedKernel` (in
+`boot/cap_memory_mint_split.rs`), plus its private phase helpers
+`bump_memory_ref_for_mint_split` (rank 6), `install_cnode_slot_for_mint_split` (rank 4), and
+`rollback_memory_ref_for_mint_split` (rank 6).
+
+**Atomicity model — Model A ("pre-bump then install"):**
+
+1. Phase 1 (rank 6, `with_memory_split_mut`): validate the memory-object is still live and
+   increment its `cap_refcount` by one — the object is now protected against reclaim *before
+   any cnode slot can reference it*. Non-memory-backed objects (`Reply`/`Endpoint`/…) are a
+   no-op (their liveness is the caller's / IPC's concern, out of scope).
+2. Phase 2 (rank 4, `with_capability_state_split_mut`): publish the capability into an
+   existing destination cnode slot, minting a fresh **receiver-local** `CapId`.
+3. Rollback: if Phase 2 fails (`CapabilityFull`, or absent cnode space → `TaskMissing`), drop
+   the Phase-1 bump so a failed mint leaks nothing.
+
+**Rollback proof / invariants.** At every instant a published slot exists, the object's
+`cap_refcount` already protects it → no reclaim race. The only transient is a briefly
+over-counted refcount when Phase 2 fails — harmless (can only delay a reclaim, never cause a
+premature free) and always rolled back → increment/decrement stay symmetric (exactly one
+each; the existing `revoke_capability_in_cnode` decrements the one this mint added).
+
+**Lock-scope / rank proof.** The two critical sections are **disjoint** — Phase 1 releases
+the memory lock before Phase 2 acquires the capability lock — so despite acquiring rank 6
+before rank 4, the helper never holds two subsystem locks at once and cannot be part of any
+lock-ordering cycle (deadlock-free). It never forms a broad `&mut KernelState`, never
+acquires `ipc_state_lock` (rank 3), so it materializes no cap under the IPC lock and
+introduces no cap→IPC rank inversion.
+
+**Capability-authority proof.** The helper takes an already-formed `Capability` (object +
+rights), not a foreign `CapId`, and publishes a freshly-minted receiver-local `CapId` via
+cspace `.mint()` — it never echoes a sender-local CapId as authority. Rights derivation /
+`WrongObject` / `MissingRight` happen upstream (before the mint) and pass through unchanged;
+`StaleCapability` (dead memory object), `CapabilityFull` (full cspace), and `TaskMissing`
+(absent cnode space) are all returned as real errors, never hidden as success.
+
+`M2_SEAM_HELPER_ONLY` — **not wired into `ipc_reply`, `ipc_send`/`recv`/`call`, or the
+cap-transfer materialization path.** It **does not by itself** convert any live path or
+retire the global lock, and it **does not solve** the reply-cap IPC rank-inversion blocker
+(the reply arm still records waiter-cap metadata into IPC rank 3 after the rank-4 mint — that
+remains deferred). The added helper is dead/uncalled in the release build → zero behavior
+change. Guarded by `stage186d_proper_cap_memory_mint_atomicity` (functional: success bumps
+once + revoke balances, install failure rolls back, stale object rejected before publish;
+source: no broad `&mut KernelState`, no IPC lock, only memory+capability seams, rollback
+present, real errors, fresh receiver-local cap, not wired live, docs don't overclaim).
+
+**Remaining `ipc_reply` blockers.** (a) The cap-transfer materialization *seam* still needs
+to be built on top of this helper (composing envelope-consume with the atomic mint), and
+(b) the reply-cap arm's IPC rank inversion (`set_reply_cap_waiter_cap` after mint) is still
+unsolved. Full global-lock retirement remains deferred; APs remain online but wake-only; no
+functional benefit until 187 (multi-dispatcher).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

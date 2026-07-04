@@ -289,6 +289,23 @@ seam, converting `ipc_reply`, or retiring the lock — it did none of those. Dis
 legacy path. Pinned by `stage186d_cap_transfer_engine_seam_entanglement`. See
 `doc/KERNEL_UNLOCKING.md` (Stage 186D-prereq) and `doc/KERNEL_LOCKING.md §0.3`.
 
+**Stage 186D-proper (CAPABILITY-MEMORY-MINT-ATOMICITY) status — infrastructure only, DO NOT
+OVERCLAIM.** `SharedKernel` now has `mint_capability_with_memory_ref_split` (in
+`boot/cap_memory_mint_split.rs`) — an atomic cap↔memory mint that keeps a memory-object's
+`cap_refcount` (rank 6) and a published cnode slot (rank 4) consistent via **Model A
+(pre-bump then install, rollback on publish failure)**. It never forms a broad
+`&mut KernelState`, never takes `ipc_state_lock` (no cap materialization under IPC, no
+cap→IPC rank inversion), holds only one subsystem lock at a time (disjoint critical sections,
+deadlock-free), takes an object+rights `Capability` (never echoes a sender-local CapId), and
+returns `StaleCapability`/`CapabilityFull`/`TaskMissing` as real errors. It is
+`M2_SEAM_HELPER_ONLY`: **not wired into `ipc_reply`, `ipc_send`/`recv`/`call`, or the
+cap-transfer materialization path.** Do **not** describe it as converting `ipc_reply`,
+building the cap-transfer seam, or retiring the lock — it did none of those, and it did
+**not** solve the reply-cap IPC rank-inversion blocker (still deferred). It is the
+atomic-mint building block a future cap-transfer seam sits on. Pinned by
+`stage186d_proper_cap_memory_mint_atomicity`. See `doc/KERNEL_UNLOCKING.md` (Stage
+186D-proper) and `doc/KERNEL_LOCKING.md §0.4`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
