@@ -47563,6 +47563,129 @@ mod stage186d3_cap_transfer_delegation_link_seam {
 }
 
 // ===========================================================================
+// Stage 186D4 (ORDINARY-CAP-TRANSFER-LIVE-WIRING) — audited, HARD-STOPPED.
+//
+// Live-wiring the ordinary cap-transfer seam is not safely possible in the
+// current architecture: both live materialization sites run inside a with/with_cpu
+// closure holding the global SpinLock<KernelState> and hand the body a
+// &mut KernelState, while the SharedKernel seam derives &mut Subsystem from
+// self.state.data_ptr() — calling it there would alias the global-lock &mut
+// (UB). Releasing the global lock before materialize is broad IPC decomposition
+// (Stage 187), forbidden here. These guards PIN the finding so no future edit can
+// silently wire the seam unsafely or dishonestly emit a LIVE_SEAM marker on the
+// legacy global-lock path. See doc/KERNEL_UNLOCKING.md (Stage 186D4).
+// ===========================================================================
+#[cfg(test)]
+mod stage186d4_ordinary_cap_transfer_live_wiring_hard_stop {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const CAP_TRANSFER_SPLIT_SRC: &str = include_str!("../cap_transfer_split.rs");
+
+    // The two LIVE materialization sites remain &mut KernelState (global-lock)
+    // functions calling the legacy router — NOT the SharedKernel seam.
+    #[test]
+    fn stage186d4_live_sites_remain_mut_kernelstate_on_legacy_router() {
+        for fn_name in [
+            "fn complete_blocked_recv_for_waiter(",
+            "fn try_split_recv_queued_plain_with_snapshot_locked(",
+        ] {
+            let sig = SYSCALL_SRC
+                .split(fn_name)
+                .nth(1)
+                .and_then(|rest| rest.split(" -> ").next())
+                .unwrap_or_else(|| panic!("live site `{fn_name}` must exist in syscall.rs"));
+            assert!(
+                sig.contains("kernel: &mut KernelState"),
+                "live materialization site `{fn_name}` must still take &mut KernelState \
+                 (it runs under the global lock; the seam cannot be called here without UB)"
+            );
+        }
+        // The live router itself is still the &mut KernelState legacy entry.
+        assert!(
+            RECV_CORE_SRC
+                .contains("pub(crate) fn materialize_received_message_cap_routed(\n    kernel: &mut KernelState,"),
+            "the live router must remain a &mut KernelState function"
+        );
+    }
+
+    // The SharedKernel seam helpers are NOT wired into any live recv/syscall path.
+    #[test]
+    fn stage186d4_seam_not_wired_into_live_recv() {
+        for (name, src) in [
+            ("syscall.rs", SYSCALL_SRC),
+            ("ipc_recv_core.rs", RECV_CORE_SRC),
+            ("ipc.rs", IPC_SRC),
+            ("ipc_state.rs", IPC_STATE_SRC),
+            ("cap_transfer_split.rs", CAP_TRANSFER_SPLIT_SRC),
+        ] {
+            for seam in [
+                "materialize_received_message_cap_routed_with_delegation_split",
+                "materialize_received_cap_snapshot_with_delegation_split",
+                "materialize_received_cap_snapshot_split",
+                "mint_capability_with_memory_ref_split",
+            ] {
+                assert!(
+                    !src.contains(seam),
+                    "Stage 186D4 HARD STOP: `{name}` must NOT call the SharedKernel seam \
+                     `{seam}` (would alias the global-lock &mut KernelState — UB)"
+                );
+            }
+        }
+    }
+
+    // No CAP_TRANSFER_LIVE_SEAM_* marker exists anywhere in the wired sources —
+    // no dishonest live marker on the legacy global-lock path, and no FAIL marker.
+    #[test]
+    fn stage186d4_no_live_seam_marker_in_src() {
+        for (name, src) in [
+            ("syscall.rs", SYSCALL_SRC),
+            ("ipc_recv_core.rs", RECV_CORE_SRC),
+            ("ipc.rs", IPC_SRC),
+            ("ipc_state.rs", IPC_STATE_SRC),
+            ("cap_transfer_split.rs", CAP_TRANSFER_SPLIT_SRC),
+            (
+                "cap_transfer_materialize_split.rs",
+                include_str!("cap_transfer_materialize_split.rs"),
+            ),
+            (
+                "cap_transfer_delegation_split.rs",
+                include_str!("cap_transfer_delegation_split.rs"),
+            ),
+            (
+                "cap_memory_mint_split.rs",
+                include_str!("cap_memory_mint_split.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains("CAP_TRANSFER_LIVE_SEAM"),
+                "no CAP_TRANSFER_LIVE_SEAM_* marker may exist in `{name}` — the ordinary \
+                 transfer seam is NOT live-wired (Stage 186D4 hard stop)"
+            );
+        }
+    }
+
+    // The hard stop is documented honestly (blocker named, not overclaimed).
+    #[test]
+    fn stage186d4_hard_stop_documented() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 186D4"),
+            "KERNEL_UNLOCKING.md must document the Stage 186D4 hard stop"
+        );
+        assert!(
+            UNLOCK_DOC.contains("HARD-STOP") || UNLOCK_DOC.contains("HARD STOP"),
+            "docs must record Stage 186D4 as a hard stop"
+        );
+        assert!(
+            UNLOCK_DOC.contains("data_ptr()") && UNLOCK_DOC.contains("aliasing"),
+            "docs must name the exact blocker (data_ptr aliasing the global-lock &mut)"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

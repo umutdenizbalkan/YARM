@@ -180,6 +180,20 @@ edge only — never resolved-to-mint / receiver authority. Reply objects stay `D
 not by itself convert `ipc_reply` or retire the global lock. Guarded by
 `stage186d3_cap_transfer_delegation_link_seam`.
 
+### 0.7) Stage 186D4 (ORDINARY-CAP-TRANSFER-LIVE-WIRING) — HARD-STOPPED
+
+Wiring the ordinary cap-transfer seam into the live recv path is **not safely possible** while
+the global lock stands. Both live materialization sites (`complete_blocked_recv_for_waiter`,
+`try_split_recv_queued_plain_with_snapshot_locked`) run inside a `with`/`with_cpu` closure that
+holds the global `SpinLock<KernelState>` and hands the body a `&mut KernelState`; the
+`SharedKernel` seam derives `&mut Subsystem` from `self.state.data_ptr()`, so calling it there
+would alias that live `&mut KernelState` — undefined behavior. Releasing the global lock before
+materialize (consume envelope under `ipc_state_lock` → drop lock → seam-materialize) is broad
+IPC/dispatch decomposition (Stage 187 multi-dispatcher), out of scope. No runtime code changed;
+no `CAP_TRANSFER_LIVE_SEAM_*` marker is emitted (that would dishonestly mark the legacy
+global-lock path). The 186D2/186D3 seam stays `M2_SEAM_HELPER_ONLY`. Pinned by
+`stage186d4_ordinary_cap_transfer_live_wiring_hard_stop`. Recommended next step: Stage 187.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

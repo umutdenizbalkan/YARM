@@ -199,6 +199,17 @@ remain real errors. `M2_SEAM_HELPER_ONLY`: **not wired live**; it does not by
 itself convert `ipc_reply` or retire the lock. Guarded by
 `stage186d3_cap_transfer_delegation_link_seam`.
 
+**Live-wiring hard stop (Stage 186D4).** Wiring the ordinary cap-transfer seam
+into the live recv path was audited and **stopped**: both live materialization
+sites run inside a `with`/`with_cpu` closure holding the global
+`SpinLock<KernelState>` with a live `&mut KernelState`, and the `SharedKernel`
+seam derives `&mut Subsystem` from `self.state.data_ptr()` — calling it there
+would alias the global-lock `&mut` (UB). Releasing the global lock before
+materialize is broad IPC decomposition (Stage 187), out of scope. The seam stays
+helper-only; no live seam marker is emitted. Reply-cap materialization, `ipc_reply`
+conversion, and full global-lock retirement remain deferred. Pinned by
+`stage186d4_ordinary_cap_transfer_live_wiring_hard_stop`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

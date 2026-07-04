@@ -7625,6 +7625,58 @@ transfer path (auditing every recv/delivery call site) is a separate future stag
 conversion and full global-lock retirement remain deferred; APs remain online but wake-only;
 no functional benefit until 187 (multi-dispatcher).
 
+**Stage 186D4 (ORDINARY-CAP-TRANSFER-LIVE-WIRING) — audited, HARD-STOPPED, no runtime
+conversion.** Goal was to wire the ordinary cap-transfer path to the seam live-equivalent
+helper (`materialize_received_message_cap_routed_with_delegation_split`). On audit this
+**cannot be done safely** in the current architecture without the broad IPC/dispatch
+decomposition this stage is told to stop before. No runtime code changed.
+
+*Materialization call-site inventory* (`materialize_received_message_cap_routed`, the D1/D5
+router in `ipc_recv_core.rs`):
+
+| Call site | File / fn | Class |
+|---|---|---|
+| blocked-waiter delivery | `syscall.rs:474` `complete_blocked_recv_for_waiter(kernel: &mut KernelState)` | `defer_needs_broad_ipc_decomposition` |
+| queued split-recv | `syscall.rs:872` `try_split_recv_queued_plain_with_snapshot_locked(kernel: &mut KernelState)` | `defer_needs_broad_ipc_decomposition` |
+| reply-cap arm (both above) | routed inside `materialize_received_message_cap_routed` D5 | `defer_reply_cap_ipc_rank_inversion` |
+| 11 remaining call sites | `syscall.rs` (4722/4756/4789/4824/4874/5001/5140/5184/5366) + equivalence tests | `test_only` |
+
+So there are exactly **two live call sites**, both in `&mut KernelState` functions invoked
+inside a `with`/`with_cpu` closure that holds the global `SpinLock<KernelState>` for the whole
+body (`runtime.rs:266` `let mut guard = self.state.lock(); … f(&mut guard)`).
+
+*Exact blocker.* The seam helpers are methods on `SharedKernel` that derive
+`&mut CapabilitySubsystem` / `&mut MemorySubsystem` from `self.state.data_ptr()`. At both live
+sites the body already holds a `&mut KernelState` (the global-lock guard) aliasing the *same*
+`KernelState`. Forming the seam's `&mut Subsystem` from `data_ptr()` while that `&mut
+KernelState` is live is **mutable aliasing = undefined behavior** (stacked/tree borrows).
+Calling the seam safely requires dropping the `&mut KernelState` / global lock *before*
+materialize — i.e. splitting the recv critical section (consume envelope under lock → drop
+lock → seam-materialize). That is "convert `ipc_recv` out of the global lock" / broad IPC
+decomposition (explicitly forbidden here), and it would also reorder the
+copy-to-user → meta-encode → sender-wake sequence that `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`
+pins.
+
+*Safe subset.* None that constitutes real seam wiring. A `&mut KernelState` re-implementation
+of mint+link+rollback callable from the live path would be byte-identical to the existing
+legacy `grant_task_to_task_with_rights` (already mint+link+rollback) — relabeling the legacy
+global-lock path and emitting `CAP_TRANSFER_LIVE_SEAM_*` markers on it would be dishonest
+(forbidden). So no `CAP_TRANSFER_LIVE_SEAM_*` success marker is emitted; the ordinary-transfer
+seam stays `M2_SEAM_HELPER_ONLY`. This is the same architectural wall Stage 115 documented for
+the IPC seam ("cannot be moved outside `with_cpu` until … is restructured").
+
+*Recommended next step.* Stage 187 (multi-dispatcher) is the prerequisite: once the recv
+delivery boundary releases the global lock before materialization (consume envelope under
+`ipc_state_lock`, drop it, then materialize at `SharedKernel` level), the ordinary-transfer
+seam (186D2/186D3) becomes wireable exactly as designed — the by-value snapshot + delegation +
+rollback are already built for that boundary. Reply-cap materialization additionally still
+needs the `reply_cap_ipc_rank_inversion` solution.
+
+Pinned by `stage186d4_ordinary_cap_transfer_live_wiring_hard_stop` (the two live sites remain
+`&mut KernelState` on the legacy router; the seam is not called from any live recv/syscall
+file; no `CAP_TRANSFER_LIVE_SEAM_*` marker exists in `src/`). Reply-cap materialization,
+`ipc_reply` conversion, and full global-lock retirement all remain deferred.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

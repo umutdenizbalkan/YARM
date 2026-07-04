@@ -340,6 +340,22 @@ future stage, and it did **not** solve the reply-cap IPC rank inversion. Pinned 
 `stage186d3_cap_transfer_delegation_link_seam`. See `doc/KERNEL_UNLOCKING.md` (Stage 186D3) and
 `doc/KERNEL_LOCKING.md §0.6`.
 
+**Stage 186D4 (ORDINARY-CAP-TRANSFER-LIVE-WIRING) status — HARD-STOPPED, DO NOT OVERCLAIM.**
+Live-wiring the ordinary cap-transfer seam was audited and stopped: no runtime path was
+converted. The two live materialization sites (`complete_blocked_recv_for_waiter`,
+`try_split_recv_queued_plain_with_snapshot_locked`) run inside a `with`/`with_cpu` closure that
+holds the global `SpinLock<KernelState>` and hands the body a `&mut KernelState`; the
+`SharedKernel` seam derives `&mut Subsystem` from `self.state.data_ptr()`, so calling it there
+would alias the live global-lock `&mut KernelState` — undefined behavior. Releasing the global
+lock before materialize is broad IPC decomposition (Stage 187 multi-dispatcher), forbidden in
+this stage. Do **not** describe the ordinary transfer seam as live-wired, and do **not** emit
+any `CAP_TRANSFER_LIVE_SEAM_*` marker (that would dishonestly mark the legacy global-lock path).
+A `&mut KernelState` re-implementation would just be the existing `grant_task_to_task_with_rights`
+(mint+link+rollback) relabeled — not real seam wiring. The seam stays `M2_SEAM_HELPER_ONLY`.
+Reply-cap materialization, `ipc_reply` conversion, and full global-lock retirement remain
+deferred. Pinned by `stage186d4_ordinary_cap_transfer_live_wiring_hard_stop`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 186D4) and `doc/KERNEL_LOCKING.md §0.7`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
