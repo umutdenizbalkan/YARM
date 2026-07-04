@@ -4242,6 +4242,22 @@ pub fn run() {
         ctx.pm_request_recv_cap.unwrap_or(0),
         ctx.process_manager_reply_recv_cap.unwrap_or(0)
     );
+    // RISC-V startup-cap attestation: prove PM received a usable request-recv cap
+    // via the RISC-V startup handoff (fresh-task trap-frame write-back). Emitted
+    // only on riscv64 so x86_64/AArch64 boot logs are unchanged.
+    #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+    {
+        if ctx.pm_request_recv_cap.unwrap_or(0) != 0 {
+            yarm_user_rt::user_log!(
+                "RISCV_PM_STARTUP_CAPS_OK task_id={} request_recv={} reply_recv={}",
+                ctx.task_id,
+                ctx.pm_request_recv_cap.unwrap_or(0),
+                ctx.process_manager_reply_recv_cap.unwrap_or(0)
+            );
+        } else {
+            yarm_user_rt::user_log!("RISCV_PM_STARTUP_CAPS_BAD task_id={}", ctx.task_id);
+        }
+    }
     let Some(recv_cap) = ctx.pm_request_recv_cap else {
         yarm_user_rt::user_log!("PM_NO_RECV_CAP");
         loop {

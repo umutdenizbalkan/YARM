@@ -1247,6 +1247,18 @@ pub mod runtime {
         startup_slots_ptr: usize,
         startup_slots_len: usize,
     ) {
+        // RISC-V startup-cap install attestation (riscv64 only; other arches keep
+        // their existing byte-identical logs). Proves the RISC-V startup handoff
+        // delivered the ABI registers before the slot block is materialized.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+        user_log!(
+            "RISCV_STARTUP_CAPS_INSTALL_BEGIN task_id={} pm_send={} pm_reply={} slots_ptr=0x{:x} slots_len={}",
+            startup_task_id,
+            startup_proc_mgr_request_send_cap,
+            startup_proc_mgr_reply_recv_cap,
+            startup_slots_ptr,
+            startup_slots_len
+        );
         let mut slots = [
             startup_task_id,
             startup_proc_mgr_request_send_cap,
@@ -1297,6 +1309,29 @@ pub mod runtime {
             slots[2],
             startup_slots_len
         );
+        // A valid startup handoff always carries a non-zero task_id (the kernel
+        // fills slot[0] with the allocated TID at spawn). task_id==0 means the
+        // RISC-V register handoff delivered nothing usable.
+        #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]
+        {
+            if slots[0] != 0 {
+                user_log!(
+                    "RISCV_STARTUP_CAPS_INSTALL_OK task_id={} pm_send={} pm_reply={} slots_len={}",
+                    slots[0],
+                    slots[1],
+                    slots[2],
+                    startup_slots_len
+                );
+            } else {
+                user_log!(
+                    "RISCV_STARTUP_CAPS_INSTALL_BAD task_id={} pm_send={} pm_reply={} slots_len={}",
+                    slots[0],
+                    slots[1],
+                    slots[2],
+                    startup_slots_len
+                );
+            }
+        }
         install_startup_arg_slots(slots);
     }
 

@@ -167,9 +167,27 @@ REQUIRED_PATTERNS=(
   "RISCV_LIVEEEEEEE"
   "RISCV_SYSCALL_ROUNDTRIP_OK"
   "RISCV_USER_RESUMED"
+  # Stage 184 follow-up (RISC-V startup handoff): the RISC-V startup-cap
+  # write-back must deliver the fresh task's ABI registers so process_manager
+  # boots with real caps. RISCV_STARTUP_ARGS proves the per-task register
+  # hand-off; the install-path OK marker proves userspace received them;
+  # RISCV_PM_STARTUP_CAPS_OK + PM_BLOCKING_RECV_LOOP prove PM got a usable
+  # request-recv cap and entered its blocking service loop (it must NOT fall
+  # into the PM_NO_RECV_CAP dead-yield loop — see REJECT_PATTERNS).
+  "RISCV_STARTUP_ARGS tid="
+  "RISCV_STARTUP_CAPS_INSTALL_BEGIN"
+  "RISCV_STARTUP_CAPS_INSTALL_OK"
+  "RISCV_PM_STARTUP_CAPS_OK"
+  "PM_BLOCKING_RECV_LOOP"
   "INITRAMFS_SRV_ENTRY"
   "DEVFS_SRV_ENTRY"
   "VFS_SRV_ENTRY"
+  # Downstream servers spawned by the driver stack. Before the startup-handoff
+  # fix these never spawned (PM stalled with zero caps), so require them to lock
+  # in the full RISC-V userspace service chain.
+  "DRIVER_MANAGER_ENTRY"
+  "BLKCACHE_SRV_ENTRY"
+  "VIRTIO_BLK_SRV_ENTRY"
   "VFS_MOUNT_TABLE_READY"
   "RAMFS_MOUNT_READY"
   "VFS_MOUNT_REGISTER_RAMFS_OK"
@@ -247,6 +265,17 @@ REJECT_PATTERNS=(
   # doc/AI_AGENT_RULES.md §14.3 / doc/KERNEL_UNLOCKING.md §3 this must be 0 —
   # any occurrence is a stop-ship bug.
   'D2_PUBLISH_RACE_UNWIND'
+  # Stage 184 follow-up (RISC-V startup handoff): a task that reached userspace
+  # with a zeroed startup register hand-off. PM_NO_RECV_CAP means PM never got a
+  # request-recv cap (the pre-fix failure that stalled the whole service chain);
+  # the *_BAD attestations mean the install/PM cap check saw task_id/caps == 0.
+  'PM_NO_RECV_CAP'
+  'RISCV_STARTUP_CAPS_INSTALL_BAD'
+  'RISCV_PM_STARTUP_CAPS_BAD'
+  # The S-mode illegal-instruction / page-fault trap the zeroed hand-off led to.
+  # A healthy boot reaches RISCV_KERNEL_IDLE_WAITING_FOR_IO, never a kernel trap.
+  'RISCV_TRAP_UNHANDLED'
+  'reason=trap_from_s_mode'
 )
 
 failures=0
