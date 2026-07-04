@@ -161,6 +161,25 @@ so it must not be wired into live delivery until that lands. It does not by itse
 `ipc_reply` or retire the global lock. Guarded by
 `stage186d2_cap_transfer_materialize_seam_first_slice`.
 
+### 0.6) Stage 186D3 (CAP-TRANSFER-DELEGATION-LINK-SEAM)
+
+Makes ordinary cap-transfer materialization seam **live-equivalent** by adding the
+sender→receiver delegation-link recording the legacy grant performs (so revoking a source cap
+propagates to the derived receiver cap). The delegation link is pure capability-domain (rank 4)
+metadata (`delegated_capability_links`), so `SharedKernel::record_cap_delegation_link_split`
+(in `boot/cap_transfer_delegation_split.rs`) records it via the rank-4 capability seam only —
+no IPC/task/memory lock. `materialize_received_cap_snapshot_with_delegation_split` mints via the
+Stage 186D2 seam (atomic mint), records the link (when `source_tid != dest_tid`), and on record
+failure rolls the mint back via `rollback_minted_cap_split` (in `boot/cap_memory_mint_split.rs`):
+clear the receiver cnode slot (rank 4) THEN drop `cap_refcount` + reclaim (rank 6) — teardown
+mirrors the mint's install order, so no live slot references a dropped-refcount object (no
+reclaim race, no stale slot, no stale delegation edge). Never `ipc_state_lock`, never a broad
+`&mut KernelState`, no cap→IPC rank inversion. The delegation carries `source_cap` as a recorded
+edge only — never resolved-to-mint / receiver authority. Reply objects stay `DeferredReplyCap`
+(`reply_cap_ipc_rank_inversion`), never delegated. `M2_SEAM_HELPER_ONLY`: not wired live; it does
+not by itself convert `ipc_reply` or retire the global lock. Guarded by
+`stage186d3_cap_transfer_delegation_link_seam`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

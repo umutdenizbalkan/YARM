@@ -47119,6 +47119,450 @@ mod stage186d2_cap_transfer_materialize_seam_first_slice {
 }
 
 // ===========================================================================
+// Stage 186D3 (CAP-TRANSFER-DELEGATION-LINK-SEAM) — delegation-link recording
+// seam that makes ordinary cap-transfer materialization seam live-equivalent
+// (mint + delegation link + rollback). Infrastructure only, NOT wired live.
+//
+// Functional tests: an ordinary transfer records a delegation link observable
+// by revoke propagation; a delegation-record failure (link table full) rolls the
+// freshly-minted cap back (slot + refcount); reply objects stay deferred. Source
+// guards pin: no broad &mut KernelState, no IPC lock, goes through the atomic
+// mint + its rollback (no bypass, records links only), no sender-local CapId as
+// authority, reply arm not faked, real errors, not wired live, docs honest, and
+// the rollback tears down slot-before-refcount.
+// See doc/KERNEL_UNLOCKING.md (Stage 186D3).
+// ===========================================================================
+#[cfg(test)]
+mod stage186d3_cap_transfer_delegation_link_seam {
+    use crate::kernel::boot::cap_transfer_delegation_split::TransferCapDelegation;
+    use crate::kernel::boot::cap_transfer_materialize_split::{
+        CapTransferMaterializeOutcome, TransferCapSnapshot,
+    };
+    use crate::kernel::boot::{Bootstrap, KernelError};
+    use crate::kernel::capabilities::{CapId, CapObject, CapRights};
+    use crate::runtime::SharedKernel;
+
+    const SRC: &str = include_str!("cap_transfer_delegation_split.rs");
+    const MINT_SRC: &str = include_str!("cap_memory_mint_split.rs");
+
+    fn cap_refcount(shared: &SharedKernel, id: u64) -> u32 {
+        shared.with(|k| {
+            let slot = k.memory_object_slot_by_id(id).expect("mem slot");
+            k.memory.memory_objects[slot].expect("mem obj").cap_refcount
+        })
+    }
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // Ordinary transfer records a delegation link that revoke propagation
+    // observes: revoking the source cap revokes the delegated receiver cap.
+    #[test]
+    fn stage186d3_ordinary_transfer_records_delegation_observed_by_revoke() {
+        let mut boxed = Bootstrap::init().expect("init");
+        boxed.register_task(1).expect("task1");
+        let (_mem_id, mem_cap) = boxed.alloc_anonymous_memory_object().expect("mem");
+        let cap = boxed.current_task_capability(mem_cap).expect("cap");
+        let object = cap.object;
+        let rights = cap.rights();
+        let cnode0 = boxed.current_task_cnode().expect("cnode0");
+        let cnode1 = boxed.task_cnode(1).expect("cnode1");
+        let shared = SharedKernel::new(boxed);
+
+        let minted = shared
+            .materialize_received_cap_snapshot_with_delegation_split(
+                TransferCapSnapshot {
+                    receiver_cnode: cnode1,
+                    object,
+                    rights,
+                },
+                Some(TransferCapDelegation {
+                    source_tid: 0,
+                    source_cap: mem_cap,
+                    dest_tid: 1,
+                }),
+            )
+            .expect("materialize + delegate");
+        assert!(
+            shared.with(|k| k.capability_for_cnode(cnode1, minted).is_some()),
+            "delegated receiver cap must be published"
+        );
+        // Revoke the source cap → delegation link must propagate the revoke.
+        shared
+            .with(|k| k.revoke_capability_in_cnode(cnode0, mem_cap))
+            .expect("revoke source cap");
+        assert!(
+            shared.with(|k| k.capability_for_cnode(cnode1, minted).is_none()),
+            "revoking the source cap must propagate to the delegated receiver cap \
+             (proves the delegation link was recorded and is observable)"
+        );
+    }
+
+    // Same-task transfer (source_tid == dest_tid) records no delegation link,
+    // matching the legacy `if source_tid != dest_tid` guard — but still mints.
+    #[test]
+    fn stage186d3_same_task_records_no_delegation_but_mints() {
+        let mut boxed = Bootstrap::init().expect("init");
+        let (_mem_id, mem_cap) = boxed.alloc_anonymous_memory_object().expect("mem");
+        let cap = boxed.current_task_capability(mem_cap).expect("cap");
+        let (object, rights) = (cap.object, cap.rights());
+        let cnode0 = boxed.current_task_cnode().expect("cnode0");
+        let shared = SharedKernel::new(boxed);
+
+        let minted = shared
+            .materialize_received_cap_snapshot_with_delegation_split(
+                TransferCapSnapshot {
+                    receiver_cnode: cnode0,
+                    object,
+                    rights,
+                },
+                Some(TransferCapDelegation {
+                    source_tid: 0,
+                    source_cap: mem_cap,
+                    dest_tid: 0,
+                }),
+            )
+            .expect("materialize");
+        assert!(shared.with(|k| k.capability_for_cnode(cnode0, minted).is_some()));
+    }
+
+    // Delegation-record failure (link table full) rolls the freshly-minted cap
+    // back: no published cap left AND the memory-object refcount is restored.
+    #[test]
+    fn stage186d3_delegation_full_rolls_back_cap_and_refcount() {
+        let mut boxed = Bootstrap::init().expect("init");
+        boxed.register_task(1).expect("task1");
+        let (mem_id, mem_cap) = boxed.alloc_anonymous_memory_object().expect("mem");
+        let cap = boxed.current_task_capability(mem_cap).expect("cap");
+        let (object, rights) = (cap.object, cap.rights());
+        let cnode1 = boxed.task_cnode(1).expect("cnode1");
+
+        // Fill the delegation-link table so the next record fails CapabilityFull.
+        let mut fill = 0u64;
+        loop {
+            match boxed.record_delegated_capability_link(
+                7,
+                CapId(1_000_000 + fill),
+                8,
+                CapId(2_000_000 + fill),
+            ) {
+                Ok(()) => fill += 1,
+                Err(KernelError::CapabilityFull) => break,
+                Err(other) => panic!("unexpected fill error: {other:?}"),
+            }
+            assert!(fill < 100_000, "delegation link table never filled");
+        }
+        let shared = SharedKernel::new(boxed);
+
+        let base = cap_refcount(&shared, mem_id);
+        let occupied_before = shared.with(|k| k.cnode_occupied_slots(cnode1).expect("occ"));
+        let r = shared.materialize_received_cap_snapshot_with_delegation_split(
+            TransferCapSnapshot {
+                receiver_cnode: cnode1,
+                object,
+                rights,
+            },
+            Some(TransferCapDelegation {
+                source_tid: 0,
+                source_cap: mem_cap,
+                dest_tid: 1,
+            }),
+        );
+        assert_eq!(
+            r,
+            Err(KernelError::CapabilityFull),
+            "a full delegation-link table must surface CapabilityFull, not success"
+        );
+        assert_eq!(
+            cap_refcount(&shared, mem_id),
+            base,
+            "delegation failure must roll the memory-object cap_refcount back — no leak"
+        );
+        assert_eq!(
+            shared.with(|k| k.cnode_occupied_slots(cnode1).expect("occ")),
+            occupied_before,
+            "delegation failure must leave no published receiver cap"
+        );
+    }
+
+    // Routing wrapper: reply objects stay DEFERRED (never delegated, never faked).
+    #[test]
+    fn stage186d3_reply_cap_still_deferred() {
+        let boxed = Bootstrap::init().expect("init");
+        let cnode0 = boxed.current_task_cnode().expect("cnode0");
+        let occupied_before = boxed.cnode_occupied_slots(cnode0).expect("occ");
+        let shared = SharedKernel::new(boxed);
+
+        let reply = CapObject::Reply {
+            index: 0,
+            generation: 1,
+        };
+        let out = shared
+            .materialize_received_message_cap_routed_with_delegation_split(
+                TransferCapSnapshot {
+                    receiver_cnode: cnode0,
+                    object: reply,
+                    rights: CapRights::SEND,
+                },
+                Some(TransferCapDelegation {
+                    source_tid: 0,
+                    source_cap: CapId(1),
+                    dest_tid: 1,
+                }),
+            )
+            .expect("route ok");
+        assert_eq!(out, CapTransferMaterializeOutcome::DeferredReplyCap);
+        assert_eq!(
+            shared.with(|k| k.cnode_occupied_slots(cnode0).expect("occ")),
+            occupied_before,
+            "a deferred reply-cap must publish no slot and record no delegation"
+        );
+    }
+
+    // Stale/wrong/missing-right + full-cnode errors remain real through the
+    // delegation path (stale memory object rejected before publish or delegation).
+    #[test]
+    fn stage186d3_stale_object_rejected_before_publish() {
+        let boxed = Bootstrap::init().expect("init");
+        let cnode0 = boxed.current_task_cnode().expect("cnode0");
+        let occupied_before = boxed.cnode_occupied_slots(cnode0).expect("occ");
+        let shared = SharedKernel::new(boxed);
+
+        let dead = CapObject::MemoryObject { id: 0xFFFF_FFFF };
+        let r = shared.materialize_received_cap_snapshot_with_delegation_split(
+            TransferCapSnapshot {
+                receiver_cnode: cnode0,
+                object: dead,
+                rights: CapRights::SEND,
+            },
+            Some(TransferCapDelegation {
+                source_tid: 0,
+                source_cap: CapId(1),
+                dest_tid: 1,
+            }),
+        );
+        assert_eq!(r, Err(KernelError::StaleCapability));
+        assert_eq!(
+            shared.with(|k| k.cnode_occupied_slots(cnode0).expect("occ")),
+            occupied_before,
+            "no slot / no delegation on a rejected stale object"
+        );
+    }
+
+    // Guard: delegation seam never forms a broad &mut KernelState / global lock.
+    #[test]
+    fn stage186d3_no_broad_kernel_borrow() {
+        let code = code_only(SRC);
+        for forbidden in [
+            "&mut KernelState",
+            "borrow_kernel_for_boot",
+            ".with(",
+            ".with_cpu(",
+        ] {
+            assert!(
+                !code.contains(forbidden),
+                "delegation seam must NOT use `{forbidden}`"
+            );
+        }
+    }
+
+    // Guard: delegation seam never touches IPC (rank 3).
+    #[test]
+    fn stage186d3_no_ipc_lock() {
+        let code = code_only(SRC);
+        for forbidden in ["with_ipc_split_mut", "with_ipc_state", "ipc_state_lock"] {
+            assert!(
+                !code.contains(forbidden),
+                "delegation seam must NOT touch IPC (`{forbidden}`)"
+            );
+        }
+    }
+
+    // Guard: goes THROUGH the atomic mint materializer + its rollback; records
+    // links only (no direct cspace mint, no memory seam, no cnode-space mint).
+    #[test]
+    fn stage186d3_uses_atomic_mint_and_records_links_only() {
+        let code = code_only(SRC);
+        assert!(
+            code.contains("materialize_received_cap_snapshot_split"),
+            "delegation seam must mint through the Stage 186D2 seam (atomic mint)"
+        );
+        assert!(
+            code.contains("rollback_minted_cap_split"),
+            "delegation seam must roll a failed delegation back via the atomic-mint inverse"
+        );
+        assert!(
+            code.contains("delegated_capability_links"),
+            "delegation recording must write the capability-domain delegation links"
+        );
+        for bypass in [".mint(", "cnode_spaces", "with_memory_split_mut", "cspace"] {
+            assert!(
+                !code.contains(bypass),
+                "delegation seam must NOT bypass the atomic mint via `{bypass}` \
+                 (it records links only; mint/rollback belong to the atomic-mint module)"
+            );
+        }
+    }
+
+    // Guard: sender-local CapId is bookkeeping only, never receiver authority —
+    // the seam never resolves the source cap to mint.
+    #[test]
+    fn stage186d3_sender_capid_not_authority() {
+        let code = code_only(SRC);
+        for resolve in [
+            "resolve_capability_for_task",
+            "task_capability",
+            "current_task_capability",
+        ] {
+            assert!(
+                !code.contains(resolve),
+                "delegation seam must NOT resolve the source cap (`{resolve}`) — the snapshot \
+                 already carries object+rights; source_cap is a recorded edge only"
+            );
+        }
+    }
+
+    // Guard: on delegation failure the orchestrator rolls back (both the record
+    // call and the rollback call must be present in the with-delegation helper).
+    #[test]
+    fn stage186d3_delegation_failure_rolls_back() {
+        let body = SRC
+            .split("fn materialize_received_cap_snapshot_with_delegation_split(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub").next())
+            .or_else(|| {
+                SRC.split("fn materialize_received_cap_snapshot_with_delegation_split(")
+                    .nth(1)
+                    .and_then(|rest| rest.split("\n    #[cfg_attr").next())
+            })
+            .expect("with-delegation helper body");
+        assert!(
+            body.contains("record_cap_delegation_link_split"),
+            "with-delegation helper must attempt the delegation record"
+        );
+        assert!(
+            body.contains("rollback_minted_cap_split"),
+            "with-delegation helper MUST roll the mint back if delegation recording fails"
+        );
+    }
+
+    // Guard: reply-cap arm deferred, never faked; no reply success marker.
+    #[test]
+    fn stage186d3_reply_arm_deferred_not_faked() {
+        assert!(
+            SRC.contains("CapObject::Reply { .. }")
+                && SRC.contains("CapTransferMaterializeOutcome::DeferredReplyCap"),
+            "router must route reply objects to the deferred branch"
+        );
+        assert!(
+            SRC.contains("reply_cap_ipc_rank_inversion"),
+            "reply-cap deferral must carry the rank-inversion reason"
+        );
+        assert!(
+            !SRC.contains("CAP_TRANSFER_DELEGATION_SEAM_DONE"),
+            "no seam success marker may be emitted (helper-only, not exercised live)"
+        );
+    }
+
+    // Guard: real errors are preserved (propagated), never hidden.
+    #[test]
+    fn stage186d3_errors_are_real_not_hidden() {
+        let code = code_only(SRC);
+        for swallow in [".unwrap_or(", ".ok()", "unwrap_or_default"] {
+            assert!(
+                !code.contains(swallow),
+                "delegation seam must not hide errors via `{swallow}`"
+            );
+        }
+        assert!(
+            code.contains("KernelError::CapabilityFull"),
+            "a full delegation-link table must surface a real CapabilityFull"
+        );
+        assert!(
+            code.contains('?'),
+            "delegation seam must propagate real errors"
+        );
+    }
+
+    // Guard: the atomic-mint inverse tears down slot BEFORE refcount (mirror of
+    // the mint install order) — no live slot referencing a dropped-refcount object.
+    #[test]
+    fn stage186d3_rollback_clears_slot_before_refcount() {
+        let body = MINT_SRC
+            .split("fn rollback_minted_cap_split(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }\n}").next())
+            .expect("rollback_minted_cap_split body");
+        let slot_pos = body
+            .find("fast_revoke_reply_slot")
+            .expect("rollback must clear the cnode slot");
+        let refcount_pos = body
+            .find("saturating_sub")
+            .expect("rollback must drop the refcount");
+        assert!(
+            slot_pos < refcount_pos,
+            "rollback MUST clear the cnode slot (rank 4) before dropping the refcount (rank 6)"
+        );
+    }
+
+    // Guard: helper-only — not wired into any live IPC/syscall/cap-transfer path.
+    #[test]
+    fn stage186d3_not_wired_live() {
+        for (name, src) in [
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("../syscall.rs", include_str!("../syscall.rs")),
+            ("../syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+            (
+                "../syscall/ipc_recv_core.rs",
+                include_str!("../syscall/ipc_recv_core.rs"),
+            ),
+            (
+                "../cap_transfer_split.rs",
+                include_str!("../cap_transfer_split.rs"),
+            ),
+        ] {
+            for helper in [
+                "materialize_received_cap_snapshot_with_delegation_split",
+                "materialize_received_message_cap_routed_with_delegation_split",
+                "record_cap_delegation_link_split",
+            ] {
+                assert!(
+                    !src.contains(helper),
+                    "Stage 186D3 is helper-only: `{name}` must NOT call `{helper}`"
+                );
+            }
+        }
+        assert!(
+            SRC.contains("#[cfg_attr(not(test), allow(dead_code))]"),
+            "seam helpers must be dead_code-allowed under non-test (helper-only)"
+        );
+    }
+
+    // Guard: docs record 186D3 honestly and do not overclaim.
+    #[test]
+    fn stage186d3_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 186D3"),
+            "KERNEL_UNLOCKING.md must document Stage 186D3"
+        );
+        assert!(
+            UNLOCK_DOC.contains("does not by itself"),
+            "docs must state 186D3 does not by itself convert ipc_reply / retire the lock"
+        );
+        assert!(
+            UNLOCK_DOC.contains("reply_cap_ipc_rank_inversion")
+                || (UNLOCK_DOC.contains("reply-cap") && UNLOCK_DOC.contains("deferred")),
+            "docs must state the reply-cap arm remains deferred"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

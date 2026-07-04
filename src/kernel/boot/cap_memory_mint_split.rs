@@ -182,4 +182,67 @@ impl crate::runtime::SharedKernel {
             }
         });
     }
+
+    /// Stage 186D3 — un-mint the inverse of
+    /// [`Self::mint_capability_with_memory_ref_split`]: roll back a *successful*
+    /// mint when a later step (e.g. delegation-link recording) fails, leaving the
+    /// receiver cnode slot, the memory-object `cap_refcount`, and the frame
+    /// allocator all back at their pre-mint state.
+    ///
+    /// Teardown order **mirrors the legacy grant rollback** and is the reverse of
+    /// the mint's install order: clear the published cnode slot FIRST (rank 4),
+    /// then drop the `cap_refcount` and reclaim if fully unreferenced (rank 6).
+    /// Clearing the slot first means no live slot ever references an object whose
+    /// refcount has already been dropped — no reclaim race, no stale cnode slot
+    /// (the cspace bumps the slot generation, invalidating the stale `CapId`).
+    ///
+    /// Rank 4 and rank 6 are taken in disjoint (non-nested) critical sections, so
+    /// this holds only one subsystem lock at a time (deadlock-free) and never
+    /// touches `ipc_state_lock`. Non-memory-backed objects (`Reply`/`Endpoint`/…)
+    /// only clear the slot — the refcount phase is a no-op for them.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn rollback_minted_cap_split(
+        &self,
+        cnode: CNodeId,
+        minted: CapId,
+        object: CapObject,
+    ) {
+        // Phase A (rank 4): clear the published receiver-local cnode slot.
+        self.with_capability_state_split_mut(|cap| {
+            if let Some(space) = cap
+                .cnode_spaces
+                .iter_mut()
+                .flatten()
+                .find(|space| space.id == cnode)
+            {
+                kernel_mut(&mut space.cspace).fast_revoke_reply_slot(minted, object);
+            }
+        });
+        // Phase B (rank 6): drop the mint's refcount bump and reclaim if the
+        // object is now fully unreferenced (drop + reclaim atomic under one lock).
+        let id = match object {
+            CapObject::MemoryObject { id } | CapObject::DmaRegion { id, .. } => id,
+            _ => return,
+        };
+        self.with_memory_split_mut(|memory| {
+            let Some(slot) = memory
+                .memory_objects
+                .iter()
+                .position(|entry| entry.is_some_and(|mem| mem.id == id))
+            else {
+                return;
+            };
+            if let Some(mem) = memory.memory_objects[slot].as_mut() {
+                mem.cap_refcount = mem.cap_refcount.saturating_sub(1);
+            }
+            if let Some(mem) = memory.memory_objects[slot]
+                && mem.cap_refcount == 0
+                && mem.map_refcount == 0
+                && mem.pin_refcount == 0
+            {
+                let _ = kernel_mut(&mut memory.frame_allocator).free_frame(mem.phys.0);
+                memory.memory_objects[slot] = None;
+            }
+        });
+    }
 }

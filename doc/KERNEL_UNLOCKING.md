@@ -7552,6 +7552,79 @@ transfer materialize, and (b) the reply-cap IPC rank inversion
 remains deferred; APs remain online but wake-only; no functional benefit until 187
 (multi-dispatcher).
 
+**Stage 186D3 (CAP-TRANSFER-DELEGATION-LINK-SEAM) — DONE (infrastructure only, no live
+conversion).** Closes the 186D2 live-equivalence gap for **ordinary** transferred caps: the
+legacy grant (`grant_task_to_task_with_rights`) records a sender→receiver **delegation link**
+so revoking the sender's source cap propagates to the derived receiver cap; without it a
+seam-materialized cap would be an orphan the revoke tree can't reach. On audit the delegation
+link is **pure capability-domain (rank 4)** metadata
+(`CapabilitySubsystem::delegated_capability_links`, written by
+`record_delegated_capability_link`) — no IPC/task/memory lock — so it is a clean seam
+candidate.
+
+Delegation-link inventory:
+
+| Concern | Where / how | Classification |
+|---|---|---|
+| link record | `record_delegated_capability_link` → `with_capability_state_mut` (rank 4) | `delegation_link_seam_candidate` |
+| link data | `DelegatedCapabilityLink { source_tid, source_cap, dest_tid, dest_cap }` | capability-domain only |
+| revoke dependency | `collect_delegated_descendants` + `revoke_capability_direct_in_process_cnode` read the links | preserved (revoke path unchanged) |
+| atomic w/ publish? | must be consistent with the mint: on record failure the mint must be undone | rollback via atomic-mint inverse |
+| refcount interaction | undo = clear slot (rank 4) then drop `cap_refcount` + reclaim (rank 6) | mirror of the mint install order |
+
+Added, in `boot/cap_transfer_delegation_split.rs` on `SharedKernel`:
+
+- `TransferCapDelegation { source_tid, source_cap, dest_tid }` — the source's **bookkeeping
+  identity** (the revoke edge). `source_cap` is recorded only, **never** resolved-to-mint /
+  treated as receiver authority.
+- `record_cap_delegation_link_split` — records the link under the rank-4 capability seam
+  (byte-for-byte the legacy table write; idempotent; `CapabilityFull` when the table is full).
+- `materialize_received_cap_snapshot_with_delegation_split` — the seam **live-equivalent** of
+  the legacy grant for ordinary caps: mints via the Stage 186D2 seam (atomic mint), then
+  records the link (when `source_tid != dest_tid`, mirroring legacy); on record failure rolls
+  the mint back.
+- `materialize_received_message_cap_routed_with_delegation_split` — routes ordinary caps
+  through the above and reply objects to `DeferredReplyCap` (never delegated, never faked).
+
+Plus, in `boot/cap_memory_mint_split.rs`, `rollback_minted_cap_split` — the inverse of the
+atomic mint: clear the receiver cnode slot (rank 4) THEN drop `cap_refcount` + reclaim
+(rank 6).
+
+**Delegation atomicity / rollback model.** (1) mint (atomic: pre-bump refcount, publish slot);
+(2) record link (rank 4); (3) on record failure, `rollback_minted_cap_split` undoes the mint.
+Teardown clears the slot **before** dropping the refcount (mirror of the mint's install order),
+so no live slot ever references an object whose refcount was already dropped — no reclaim
+race, no stale cnode slot (the cspace bumps the slot generation, invalidating the stale
+`CapId`), no stale delegation edge (the link is never recorded on the failure path).
+**Success ⇒ receiver slot + refcount + delegation metadata all consistent; failure ⇒ nothing
+left behind** (no published cap, no refcount leak).
+
+**Lock-scope / rank proof.** No `ipc_state_lock`, no broad `&mut KernelState`, no cap→IPC
+rank inversion; the seam holds only disjoint rank-4 / rank-6 sections. **Capability-authority
+proof:** the snapshot carries object + rights (authority) and the delegation carries
+`source_cap` only as a recorded edge; the seam never resolves the source cap to mint and never
+echoes a sender-local CapId as receiver authority. **Reply-cap deferral proof:** reply objects
+route to `DeferredReplyCap` (`reply_cap_ipc_rank_inversion`); no reply-cap success marker; reply
+caps are never delegated (they are one-shot, outside the delegation tree).
+
+`M2_SEAM_HELPER_ONLY` — **not wired** into `materialize_received_message_cap_routed`,
+`ipc_reply`, `ipc_send`/`recv`/`call`, or any live delivery path. It **does not by itself**
+convert any live path or retire the global lock. It brings ordinary cap-transfer
+materialization to seam **live-equivalence** (mint + delegation link + rollback). Guarded by
+`stage186d3_cap_transfer_delegation_link_seam` (functional: ordinary transfer records a link
+observed by revoke propagation; full link-table → CapabilityFull with cap + refcount rolled
+back; same-task records no link but mints; reply deferred; stale rejected; source: no broad
+`&mut KernelState`, no IPC lock, uses atomic mint + records links only / no bypass, no
+sender-local CapId authority, delegation-failure rollback present, reply arm not faked, real
+errors, rollback clears slot before refcount, not wired live, docs don't overclaim).
+Dead/uncalled in release → zero behavior change.
+
+**Remaining `ipc_reply` blockers.** The reply-cap arm's IPC rank inversion
+(`set_reply_cap_waiter_cap` after mint) is still unsolved, and live wiring of the ordinary
+transfer path (auditing every recv/delivery call site) is a separate future stage. `ipc_reply`
+conversion and full global-lock retirement remain deferred; APs remain online but wake-only;
+no functional benefit until 187 (multi-dispatcher).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

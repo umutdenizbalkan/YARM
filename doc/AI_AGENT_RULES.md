@@ -324,6 +324,22 @@ the reply-cap IPC rank inversion. Pinned by
 `stage186d2_cap_transfer_materialize_seam_first_slice`. See `doc/KERNEL_UNLOCKING.md` (Stage
 186D2) and `doc/KERNEL_LOCKING.md §0.5`.
 
+**Stage 186D3 (CAP-TRANSFER-DELEGATION-LINK-SEAM) status — infrastructure only, DO NOT
+OVERCLAIM.** `SharedKernel` now records the sender→receiver delegation link via the rank-4
+capability seam (`record_cap_delegation_link_split`) and materializes an ordinary transferred
+cap seam **live-equivalently** (`materialize_received_cap_snapshot_with_delegation_split`:
+atomic mint + delegation link, with `rollback_minted_cap_split` undoing the mint — clear slot
+then drop refcount + reclaim — if the link record fails). No `ipc_state_lock`, no broad
+`&mut KernelState`, no cap→IPC rank inversion; the delegation carries `source_cap` as a
+recorded edge only, never as receiver authority. Reply objects stay `DeferredReplyCap`
+(`reply_cap_ipc_rank_inversion`), never delegated. It is `M2_SEAM_HELPER_ONLY`: **not wired**
+into `materialize_received_message_cap_routed`, `ipc_reply`, `ipc_send`/`recv`/`call`, or any
+live delivery path. Do **not** describe it as converting a live path, retiring the lock, or
+live-wiring cap transfer — live wiring (auditing every recv/delivery call site) is a separate
+future stage, and it did **not** solve the reply-cap IPC rank inversion. Pinned by
+`stage186d3_cap_transfer_delegation_link_seam`. See `doc/KERNEL_UNLOCKING.md` (Stage 186D3) and
+`doc/KERNEL_LOCKING.md §0.6`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
