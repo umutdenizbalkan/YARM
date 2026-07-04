@@ -7137,6 +7137,39 @@ them), (c) confined + guarded the sole boot-only raw `&mut KernelState` escape
 is deferred to future per-subsystem increments, coupled to the multi-dispatcher
 work above. See `doc/KERNEL_LOCKING.md §0` for the classified inventory.
 
+**Stage 185BC (CAP / OBJECT-STORE / REPLY-CAP DECOMPOSITION) — audited, HARD-STOPPED,
+no code change.** A mega pass was attempted to split the capability/object-store
+(185B) and reply-cap/cap-transfer (185C) slices out of the global lock. The audit
+found **no safe new slice for either part** and stopped per its own hard-stop rule
+(no risky half-conversion):
+
+- *185C reply-cap / cap-transfer — BLOCKED (needs IPC decomposition first).*
+  `ReplyCapRecord` and `TransferEnvelope` are **IPC-subsystem state** in
+  `IpcSubsystem` under `ipc_state_lock` (rank 3, see `doc/CAPABILITY_MODEL.md`
+  §5/§6/§8). Reply caps are created (`create_reply_cap_for_caller`), consumed
+  (`ipc_reply`), and revoked (`revoke_reply_caps_for_caller`/`_replier`, incl.
+  task-exit/restart cleanup) **inside the IPC send/recv/call/reply path**, which
+  runs under the global lock. Transfer envelopes are taken/materialized on the
+  recv-delivery path via the mandatory two-phase pattern. Decomposing any of this
+  out of the global lock requires broad IPC endpoint/waiter decomposition first —
+  the explicit hard-stop condition.
+- *185B capability/object-store basic split — no standalone slice.* There is **no
+  standalone capability syscall** (no CapLookup/CapDelete/CapRevoke in the 23-variant
+  `Syscall` enum). `resolve_capability_for_task` (read-only lookup) and the
+  leaf-revoke helpers are internal, called from ~26 sites all inside global-lock-held
+  IPC/spawn/VM/exit handlers; leaf release/refcount runs on the TransferRelease /
+  IPC-reply / task-exit paths (IPC-domain, rank 3). The one standalone cnode-domain
+  operation that *was* safely splittable — `ControlPlaneSetCnodeSlots` — is already
+  split (Stage 29, `syscall_split.rs` whitelist). Adding any new lock-free cap path
+  would mean decomposing the IPC/spawn/VM callers, widening scope.
+
+**Recommended smaller next stage:** do the IPC-domain decomposition first as its own
+stage (endpoint/waiter/reply-cap/transfer-envelope under `ipc_state_lock` with the
+two-phase materialization moved after IPC-unlock), *then* revisit reply-cap and
+cap-transfer split as follow-on increments. No `CAP_SPLIT_*` / `REPLY_CAP_SPLIT_*` /
+`CAP_TRANSFER_SPLIT_*` markers were introduced — emitting split-success markers for
+paths still handled by the legacy global runtime would be dishonest.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
