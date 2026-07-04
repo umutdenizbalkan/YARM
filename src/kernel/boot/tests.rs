@@ -46338,6 +46338,125 @@ mod stage186e_vm_user_copy_seam {
 }
 
 // ===========================================================================
+// Stage 186D-prereq (CAP-TRANSFER-ENGINE-SEAM) — audited, HARD-STOPPED.
+//
+// A cap-transfer materialization ("materialize a received transfer/reply cap")
+// is NOT cap-only: it spans task (rank 2), IPC (rank 3), capability (rank 4),
+// and memory (rank 6). The rank-4 `with_capability_state_split_mut` seam hands
+// out only `&mut CapabilitySubsystem`, so it cannot express this path without a
+// broad capability↔memory↔ipc↔task co-decomposition. These guards PIN the
+// entanglement so no future edit can silently "wrap" the fused primitives and
+// dishonestly claim a cap-only cap-transfer seam. See doc/KERNEL_UNLOCKING.md
+// (Stage 186D-prereq) for the full inventory. Disposition:
+// CAP_TRANSFER_SEAM_DEFERRED (documented, never emitted on a legacy path).
+// ===========================================================================
+#[cfg(test)]
+mod stage186d_cap_transfer_engine_seam_entanglement {
+    const CNODE_SRC: &str = include_str!("cnode_state.rs");
+    const LIFECYCLE_SRC: &str = include_str!("capability_lifecycle_state.rs");
+    const DELEGATION_SRC: &str = include_str!("delegation_state.rs");
+    const CAP_TRANSFER_SRC: &str = include_str!("../cap_transfer_split.rs");
+    const RECV_CORE_SRC: &str = include_str!("../syscall/ipc_recv_core.rs");
+
+    // Blocker source 1: `task_cnode` fuses task (rank 2) and capability (rank 4)
+    // in one `with_task_then_capability` critical section. The cap-only seam
+    // cannot reach the task subsystem, so it cannot resolve the source/dest cnode.
+    #[test]
+    fn stage186d_task_cnode_fuses_task_and_capability() {
+        assert!(
+            CNODE_SRC.contains("fn task_cnode(") && CNODE_SRC.contains("with_task_then_capability"),
+            "task_cnode must remain a fused task+capability read; if this changes, re-audit \
+             whether a cap-only cnode-resolve seam is now possible before claiming one"
+        );
+    }
+
+    // Blocker source 2 (the load-bearing one): the cnode mint and the memory
+    // `cap_refcount` bump live in the SAME critical section inside
+    // `mint_capability_in_cnode`. Splitting them across seams opens a reclaim
+    // race (object freed while a cnode slot points at it). Pin the fusion.
+    #[test]
+    fn stage186d_mint_fuses_cnode_and_memory_refcount() {
+        let mint = LIFECYCLE_SRC
+            .split("fn mint_capability_in_cnode(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub").next())
+            .expect("mint_capability_in_cnode must exist");
+        assert!(
+            mint.contains("with_capability_state_mut"),
+            "mint must install the cnode slot under the capability (rank 4) lock"
+        );
+        assert!(
+            mint.contains("adjust_memory_object_cap_refcount"),
+            "mint must bump the memory-object cap_refcount (rank 6) in the same critical \
+             section as the cnode slot install; splitting these across seams opens a reclaim \
+             race and requires a joint capability<->memory decomposition, not a cap-only seam"
+        );
+    }
+
+    // Blocker source 3: `capability_object_live` reads IPC state (rank 3) for
+    // Endpoint/Notification objects — so even cap *validation* on a transfer can
+    // reach into IPC, another reason the cap-only seam is insufficient.
+    #[test]
+    fn stage186d_object_live_reads_ipc_state() {
+        let live = DELEGATION_SRC
+            .split("fn capability_object_live(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n    pub").next())
+            .expect("capability_object_live must exist");
+        assert!(
+            live.contains("with_ipc_state"),
+            "capability_object_live must still read IPC generations (rank 3) for endpoint / \
+             notification liveness; a cap-only seam cannot perform this read"
+        );
+    }
+
+    // Blocker source 4 (reply arm rank inversion): the D5 reply path must set the
+    // reply-record waiter cap (IPC rank 3) AFTER the rank-4 mint. A cap-only seam
+    // cannot perform the rank-3 record-set.
+    #[test]
+    fn stage186d_reply_arm_needs_ipc_record_after_mint() {
+        assert!(
+            CAP_TRANSFER_SRC.contains("fn phase_b_prime_record_reply_cap(")
+                && CAP_TRANSFER_SRC.contains("try_set_reply_cap_waiter_cap"),
+            "the reply-cap arm still records the waiter cap under IPC (rank 3) after the rank-4 \
+             mint — the documented rank inversion; a cap-only seam cannot do this"
+        );
+    }
+
+    // Honesty guard: NO cap-transfer split-seam is wired. The routed engine and
+    // the split module must NOT route materialization through
+    // `with_capability_state_split_mut` (that would claim a seam this stage
+    // proved does not yet exist), and NO source emits a CAP_TRANSFER_SEAM_*
+    // success/progress marker on the legacy global-lock path.
+    #[test]
+    fn stage186d_no_cap_transfer_seam_wired_or_marked() {
+        assert!(
+            !CAP_TRANSFER_SRC.contains("with_capability_state_split_mut"),
+            "cap_transfer_split.rs must NOT route through the rank-4 capability split seam — \
+             the cap-transfer materialize is not cap-only (see Stage 186D-prereq)"
+        );
+        assert!(
+            !RECV_CORE_SRC.contains("with_capability_state_split_mut"),
+            "the routed materialize engine must NOT claim a cap-only capability seam"
+        );
+        for marker in [
+            "CAP_TRANSFER_SEAM_BEGIN",
+            "CAP_TRANSFER_SEAM_VALIDATE_OK",
+            "CAP_TRANSFER_SEAM_DEST_INSERT_OK",
+            "CAP_TRANSFER_SEAM_LOCAL_ID_OK",
+            "CAP_TRANSFER_SEAM_ONESHOT_OK",
+            "CAP_TRANSFER_SEAM_DONE",
+        ] {
+            assert!(
+                !CAP_TRANSFER_SRC.contains(marker) && !RECV_CORE_SRC.contains(marker),
+                "no CAP_TRANSFER split-success marker (`{marker}`) may be emitted while the \
+                 legacy global-lock materialize path is still the live one"
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

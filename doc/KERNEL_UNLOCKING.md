@@ -7376,6 +7376,56 @@ seam (this stage) **and** the cap-transfer seam exist can `ipc_reply` be convert
 end-to-end. Full global-lock retirement remains deferred; APs remain online but wake-only;
 and the standing caveat holds — no functional benefit until 187 (multi-dispatcher).
 
+**Stage 186D-prereq (CAP-TRANSFER-ENGINE-SEAM) — audited, HARD-STOPPED, no runtime
+conversion.** Goal was a seam-based cap-transfer materialization helper (via the rank-4
+`with_capability_state_split_mut` seam added in 186A) that `ipc_reply` could later use
+without a broad `&mut KernelState` and without holding `ipc_state_lock` during
+capability/cnode materialization. On audit, the materialize path is **not cap-only** — a
+single "materialize a received transfer/reply cap" spans **four** subsystems, and the
+`with_capability_state_split_mut` seam structurally hands out only `&mut CapabilitySubsystem`
+(it cannot reach task, ipc, or memory). Subsystem-touch inventory
+(`cap_transfer_split.rs` → `capability_state.rs` / `capability_lifecycle_state.rs` /
+`cnode_state.rs` / `memory_lifecycle_state.rs`):
+
+| Step (transfer-cap arm) | Primitive | Subsystem(s) / rank |
+|---|---|---|
+| resolve source cnode | `task_cnode` → `with_task_then_capability` | task (2) **+** capability (4), fused |
+| resolve source cap | `resolve_capability_for_task` → `capability_object_live` | capability (4); for `Endpoint`/`Notification` objects reads `with_ipc_state` → **IPC (3)** |
+| mint into dest cnode | `mint_capability_in_cnode` → `ensure_cnode_space` + cnode mint | capability (4) |
+| refcount the object | `mint_capability_in_cnode` → `adjust_memory_object_cap_refcount(+1)` | **memory (6)**, in the *same* critical section as the mint |
+| record delegation | `record_delegated_capability_link` | capability (4) |
+| link-full rollback | `fast_revoke_reply_cap_in_cnode` + `adjust_memory_object_cap_refcount(-1)` + `reclaim_memory_object_if_unreferenced` | capability (4) **+** memory (6) |
+
+Two blockers make this a genuine hard stop, not a mechanical wrap:
+
+1. **capability↔memory fusion in the mint (reclaim atomicity window).**
+   `mint_capability_in_cnode` installs the cnode slot (rank 4) and increments the memory
+   object's `cap_refcount` (rank 6) inside one global-lock critical section. Expressing this
+   through a cap-only seam means dropping rank 4 and re-taking rank 6 between the two — which
+   opens a window where a concurrent `reclaim_memory_object_if_unreferenced` can free an
+   object that already has a cnode slot pointing at it (`cap_refcount` still 0). Closing that
+   window requires a new cross-subsystem capability↔memory atomicity protocol, i.e. exactly
+   the broad co-decomposition this stage is told to stop before.
+
+2. **capability→IPC rank inversion in the reply arm (already flagged in D5).** The reply-cap
+   arm additionally needs `try_set_reply_cap_waiter_cap` (IPC rank 3) *after* the rank-4
+   mint (`cap_transfer_split.rs` Phase B'). A cap-only seam cannot perform that rank-3
+   record-set; re-acquiring IPC after capability is the documented rank inversion.
+
+Because minting a *reply* object (`CapObject::Reply`) is a no-op for
+`adjust_memory_object_cap_refcount` (it early-returns on non-`MemoryObject`/`DmaRegion`),
+one might imagine a reply-only cap seam — but blocker (2) still applies to it, and the
+whole *point* of transfer caps is to move `MemoryObject`/`DmaRegion` authority, where
+blocker (1) is unavoidable. So neither arm is cleanly seam-able through
+`with_capability_state_split_mut` alone. Disposition: **`CAP_TRANSFER_SEAM_DEFERRED`** —
+documented here, **not** emitted as a live marker on any legacy global-lock path (that would
+dishonestly claim a split that does not exist). No runtime code changed. Pinned by
+`stage186d_cap_transfer_engine_seam_entanglement` (source-grep guard asserting the fusion
+points remain, so no future edit silently "wraps" them and overclaims a seam). The next real
+move is a joint capability↔memory decomposition (a `Stage 186D` proper) that gives the
+mint+refcount a shared atomicity discipline; only then does a cap-transfer seam become
+honest.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
