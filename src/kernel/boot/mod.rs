@@ -3,6 +3,7 @@
 
 mod bootstrap_state;
 mod cap_memory_mint_split;
+mod cap_transfer_materialize_split;
 mod capability_lifecycle_state;
 mod capability_service_state;
 mod capability_state;

@@ -141,6 +141,26 @@ convert `ipc_reply` or retire the global lock, and does not solve the reply-cap 
 rank-inversion blocker. Guarded by `stage186d_proper_cap_memory_mint_atomicity`. This is the
 atomic-mint prerequisite a future cap-transfer materialization seam is built on top of.
 
+### 0.5) Stage 186D2 (CAP-TRANSFER-MATERIALIZATION-SEAM-FIRST-SLICE)
+
+First seam-based cap-transfer materialization, built on §0.4's atomic mint. `SharedKernel`
+gains `materialize_received_cap_snapshot_split` and
+`materialize_received_message_cap_routed_split` (in `boot/cap_transfer_materialize_split.rs`),
+which take a plain IPC-lock-free `TransferCapSnapshot { receiver_cnode, object, rights }`
+(captured after the transfer envelope was consumed under `ipc_state_lock`) and mint an
+ordinary object cap into the receiver's cnode via `mint_capability_with_memory_ref_split` —
+rank-4 capability seam + rank-6 memory seam only, **never** `ipc_state_lock`, never a broad
+`&mut KernelState`, no cap→IPC rank inversion. The snapshot carries object + rights, never a
+sender-local `CapId` (local CapIds are not transferable authority); the receiver-local CapId
+is freshly minted. Reply objects route to an explicit `DeferredReplyCap`
+(`reply_cap_ipc_rank_inversion`) — never faked. Real errors
+(`StaleCapability`/`CapabilityFull`/`TaskMissing`) preserved; `WrongObject`/`MissingRight`
+are upstream. `M2_SEAM_HELPER_ONLY`: not wired live, and **not yet a live-equivalent of the
+legacy grant** — it does not yet record the source→dest delegation link (a rank-4 follow-on),
+so it must not be wired into live delivery until that lands. It does not by itself convert
+`ipc_reply` or retire the global lock. Guarded by
+`stage186d2_cap_transfer_materialize_seam_first_slice`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

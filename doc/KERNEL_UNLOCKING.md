@@ -7488,6 +7488,70 @@ to be built on top of this helper (composing envelope-consume with the atomic mi
 unsolved. Full global-lock retirement remains deferred; APs remain online but wake-only; no
 functional benefit until 187 (multi-dispatcher).
 
+**Stage 186D2 (CAP-TRANSFER-MATERIALIZATION-SEAM-FIRST-SLICE) — DONE (infrastructure only,
+no live conversion).** Builds the **first seam-based** cap-transfer materialization on top of
+the Stage 186D-proper atomic mint. The existing live D1/D5 path
+(`materialize_received_message_cap_routed` → `materialize_split_transfer_cap_equivalent`)
+factors the work into typed phase functions but still runs under the **global lock**
+(`grant_task_to_task_with_rights` on `&mut KernelState`). This slice adds a genuinely
+seam-based materializer that touches only the rank-4 capability seam and rank-6 memory seam
+(via the atomic mint) — never `ipc_state_lock`, never a broad `&mut KernelState`.
+
+Added, in `boot/cap_transfer_materialize_split.rs` on `SharedKernel`:
+
+- `TransferCapSnapshot { receiver_cnode, object, rights }` — a plain, IPC-lock-free snapshot
+  captured AFTER the transfer envelope was consumed under `ipc_state_lock` and the source cap
+  resolved to `(object, rights)`. It carries **object identity + rights**, never a
+  sender-local `CapId` (local CapIds are not transferable authority).
+- `materialize_received_cap_snapshot_split(snapshot) -> Result<CapId, _>` — mints the ordinary
+  object cap into the receiver's cnode via `mint_capability_with_memory_ref_split`
+  (pre-bump / publish / rollback), returning a fresh receiver-local `CapId`.
+- `materialize_received_message_cap_routed_split(snapshot) -> Result<CapTransferMaterializeOutcome, _>`
+  — routes ordinary object caps to the atomic mint (`Materialized(CapId)`) and **reply-cap
+  objects to an explicit `DeferredReplyCap`** (reason `reply_cap_ipc_rank_inversion`).
+
+**Snapshot / envelope-boundary proof.** The one-shot envelope is consumed under IPC (rank 3)
+*before* the snapshot exists; this seam takes the snapshot by value and never sees, re-takes,
+or reuses an envelope — one-shot semantics preserved at the interface boundary.
+
+**Atomic-mint usage proof.** The seam goes *through* `mint_capability_with_memory_ref_split`
+and never bypasses it (no direct cspace `.mint()`, no direct capability/memory seam) — so a
+cap is never published without memory-object refcount protection, and the 186D-proper rollback
+is preserved. Guarded functionally (memory transfer bumps `cap_refcount` +1; full cnode →
+`CapabilityFull` with the bump rolled back).
+
+**Lock-scope / rank proof.** No `ipc_state_lock`, no broad `&mut KernelState`, no cap→IPC
+rank inversion — the seam holds only the atomic mint's disjoint rank-6 then rank-4 sections.
+
+**Capability-authority proof.** Snapshot carries object + rights, never a sender-local CapId;
+the receiver-local CapId is freshly minted. `StaleCapability` / `CapabilityFull` /
+`TaskMissing` are real errors; `WrongObject` / `MissingRight` are produced upstream (source
+resolution / rights derivation) and never converted to `Ok`.
+
+**Reply-cap deferral proof.** Reply objects route to `DeferredReplyCap`
+(`reply_cap_ipc_rank_inversion`); no reply-cap seam success marker is emitted, and no cnode
+slot is published for a deferred reply.
+
+`M2_SEAM_HELPER_ONLY` — **not wired** into `materialize_received_message_cap_routed`,
+`ipc_reply`, `ipc_send`/`recv`/`call`, or any live delivery path. It **does not by itself**
+convert any live path or retire the global lock. **It is not yet a live-equivalent of
+`grant_task_to_task_with_rights`:** it materializes the cap (object + rights + fresh
+receiver-local CapId + atomic refcount) but does **not** yet record the source→dest
+**delegation link** the legacy grant records for revocation propagation. That delegation-link
+record is a rank-4-only follow-on slice; until it lands, this helper MUST NOT be wired into
+the live delivery path. Guarded by `stage186d2_cap_transfer_materialize_seam_first_slice`
+(functional: ordinary transfer mints fresh local cap via atomic mint, identity/rights
+preserved, stale rejected before publish, full cnode → CapabilityFull + rollback, reply
+deferred not faked; source: no broad `&mut KernelState`, no IPC lock, uses atomic mint / no
+bypass, no sender-local CapId authority, reply arm not faked, real errors, not wired live,
+docs don't overclaim). Dead/uncalled in release → zero behavior change.
+
+**Remaining `ipc_reply` blockers.** (a) the delegation-link follow-on for a live-equivalent
+transfer materialize, and (b) the reply-cap IPC rank inversion
+(`set_reply_cap_waiter_cap` after mint) — both still deferred. Full global-lock retirement
+remains deferred; APs remain online but wake-only; no functional benefit until 187
+(multi-dispatcher).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
