@@ -846,6 +846,31 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // The freshly-spawned task's `user_gprs` are still all-zero, so
             // mirroring those would clobber the startup args — write args[]
             // directly into a0..a5.
+            // RISCV_STARTUP_ARGS is a required startup-cap observability marker for
+            // each task resumed via the trap-frame write-back path. It also pins
+            // correctness: reading `tframe.arg(..)` into this opaque log call forces
+            // the optimizer to keep the whole `apply_user_context → tframe.args →
+            // frame.regs[A0..A5]` chain live. `frame`'s contents are otherwise read
+            // back only through the *raw* `frame_ptr` inside the extern
+            // `yarm_riscv64_trap_return` asm — an access LLVM does not model as
+            // aliasing the `&mut frame`/`&mut tframe` borrows — so without it the
+            // whole chain was eliminated as dead and a freshly-dispatched task
+            // resumed with a0..a5 = 0: PM booted with task_id=0 / pm caps=0
+            // (PM_NO_RECV_CAP), stalling the entire RISC-V service chain, with later
+            // resumes faulting on corrupted control flow. The marker must read
+            // `tframe.arg(..)` DIRECTLY (not via precomputed locals) so the same
+            // loads feed both the log and the register stores below.
+            crate::yarm_log!(
+                "RISCV_STARTUP_ARGS tid={} entering={} a0={} a1={} a2={} a3={} a4={} a5={}",
+                resume_tid,
+                entering_tid,
+                tframe.arg(0),
+                tframe.arg(1),
+                tframe.arg(2),
+                tframe.arg(3),
+                tframe.arg(4),
+                tframe.arg(5)
+            );
             frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;
             frame.regs[RiscvTrapFrame::A1] = tframe.arg(1) as u64;
             frame.regs[RiscvTrapFrame::A2] = tframe.arg(2) as u64;

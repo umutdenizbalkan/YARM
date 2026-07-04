@@ -52500,7 +52500,12 @@ mod stage183_ap_idle_admit {
                 && SMOKE_SRC.contains("X86_AP_LAPIC_OK")
                 && SMOKE_SRC.contains("X86_AP_IDLE_TASK_READY")
                 && SMOKE_SRC.contains("X86_AP_IDLE_CONTEXT_OK")
-                && SMOKE_SRC.contains("X86_SMP_AP_ENV_READY")
+                // Stage 183.6 drift fix: under online>1 the audit emits the
+                // X86_SMP_AP_SCHED_ONLINE summary (carrying ap_env_ready=/
+                // ap_interrupt_ready= as fields); X86_SMP_AP_ENV_READY /
+                // X86_SMP_AP_INTERRUPT_READY are the online==1-branch summaries and
+                // must NOT be required under the SMP profiles.
+                && SMOKE_SRC.contains("X86_SMP_AP_SCHED_ONLINE")
                 && SMOKE_SRC.contains("X86_AP_KERNEL_CR3_FAIL")
                 && SMOKE_SRC.contains("X86_AP_TSS_BAD")
                 && SMOKE_SRC.contains("X86_AP_LAPIC_BAD")
@@ -52802,7 +52807,10 @@ mod stage183_ap_idle_admit {
                 && SMOKE_SRC.contains("X86_AP_IST_OK")
                 && SMOKE_SRC.contains("X86_AP_INTERRUPT_SMOKE_OK")
                 && SMOKE_SRC.contains("X86_IPI_REMOTE_WAKE_ACK")
-                && SMOKE_SRC.contains("X86_SMP_AP_INTERRUPT_READY")
+                // 183.6 drift fix: the forbidden NOT_READY summary is the smoke's
+                // interrupt-ready gate under online>1 (the positive
+                // X86_SMP_AP_INTERRUPT_READY is the online==1-branch summary).
+                && SMOKE_SRC.contains("X86_SMP_AP_INTERRUPT_NOT_READY")
                 && SMOKE_SRC.contains("X86_AP_IDT_BAD")
                 && SMOKE_SRC.contains("X86_AP_IST_BAD")
                 && SMOKE_SRC.contains("X86_AP_INTERRUPT_SMOKE_FAIL")

@@ -7171,6 +7171,53 @@ Expected this increment: boots `-smp N`, `X86_SMP_AP_PARKED` + `X86_SMP_UNLOCK_D
 result=deferred reason=aps_not_admitted`, sender-wake still completes on the BSP, no
 fallback/SMP-error marker. AP admission + the guard relax follow in the next increments.
 
+#### 7.1.20.1 Stage 184 follow-up — two post-acceptance fixes (no invariant change)
+
+Two defects surfaced after Stage 184 acceptance; both are fixed without weakening any
+Stage 181–184 invariant (no fallback knob, no fake SMP / remote TLB ACK, no
+ABI/count/limit change; `SYSCALL_COUNT=31`, `VARIANT_COUNT=23`, x86_64
+`MAX_ADDRESS_SPACES=32` unchanged).
+
+- **Issue A — x86_64 SMP-LIVE oracle drift.** The `-smp >1` smoke still required the
+  obsolete `X86_SMP_AP_ENV_READY` / `X86_SMP_AP_INTERRUPT_READY` markers. After 183.5/183.6
+  the audit emits those two only on the `online==1` branch; under `online>1` (every
+  smp2/smp4 profile) it emits `X86_SMP_AP_SCHED_ONLINE` (carrying `ap_env_ready=`/
+  `ap_interrupt_ready=` as inline fields). The required-marker loop in
+  `scripts/qemu-x86_64-core-smoke.sh` now requires `X86_SMP_AP_SCHED_ONLINE` (already
+  present) and no longer the stale pair; the whole 183.6 chain (`X86_SMP_UNLOCK_DONE
+  result=smp_seams_ok`, `COW_SMP_TLB_ACK_OK`, `VM_UNMAP_SMP_TLB_ACK_OK`) and all
+  forbidden-marker checks are unchanged. Guard tests `stage183_ap_admission_markers_present`
+  / `stage183_inc4_ap_interrupt_safe_idle` track the modern marker.
+
+- **Issue B — RISC-V userspace startup handoff.** On riscv64, `process_manager` (tid 3)
+  reached userspace with a **zeroed** startup register hand-off
+  (`STARTUP_INSTALL_FINAL task_id=0 … slots_len=0` → `PM_STARTUP_CAPS request_recv=0` →
+  `PM_NO_RECV_CAP`), so it could not receive Init's SpawnV5, Init blocked, and the whole
+  service chain stalled, ending in `RISCV_TRAP_UNHANDLED … reason=trap_from_s_mode`.
+  Root cause: in the RISC-V trap bridge (`yarm_riscv64_trap_bridge`), the fresh-task
+  ABI-register write-back (`frame.regs[A0..A5] = tframe.arg(..)`) fed a chain the optimizer
+  proved dead — `frame` is reloaded only through the *raw* `frame_ptr` in the extern
+  `yarm_riscv64_trap_return` asm, an access LLVM does not model as observing the
+  `&mut frame`/`&mut tframe` stores, so it eliminated the whole
+  `apply_user_context → tframe.args → frame.regs` chain and the task resumed with
+  `a0..a5 = 0`. This only bit tasks resumed via the trap-frame write-back (PM); tasks
+  entered via the direct sret (supervisor) or the kernel-context switch (init) were fine.
+  The fix keeps the write-back's ABI-register loads observed by emitting the required
+  `RISCV_STARTUP_ARGS` startup-cap marker over `tframe.arg(0..5)` immediately before the
+  stores. New riscv64-gated attestations: `RISCV_STARTUP_ARGS` (trap bridge),
+  `RISCV_STARTUP_CAPS_INSTALL_BEGIN/OK/BAD` (`yarm-user-rt` install path),
+  `RISCV_PM_STARTUP_CAPS_OK/BAD` (`process_manager`). Result: PM boots with real caps
+  (`request_recv`/`reply_recv` non-zero, `PM_BLOCKING_RECV_LOOP`), the full service chain
+  spawns (`INITRAMFS_SRV_ENTRY … VIRTIO_BLK_SRV_ENTRY`), and the boot reaches the clean
+  `RISCV_KERNEL_IDLE_WAITING_FOR_IO` idle with **no** S-mode trap. The change is
+  `#[cfg(… target_arch = "riscv64")]`-gated; x86_64/AArch64 boot logs are byte-identical.
+  `scripts/qemu-riscv64-core-smoke.sh` now requires the new markers + the full
+  `DRIVER_MANAGER/BLKCACHE/VIRTIO_BLK` chain and rejects `PM_NO_RECV_CAP` /
+  `*_INSTALL_BAD` / `*_CAPS_BAD` / `RISCV_TRAP_UNHANDLED` / `reason=trap_from_s_mode`.
+
+QEMU acceptance: `QEMU_SMP=2 SMP_READY=1 scripts/qemu-x86_64-core-smoke.sh` (Issue A) and
+`scripts/qemu-riscv64-core-smoke.sh` (Issue B); AArch64/x86_64 cross-arch markers preserved.
+
 ### 7.1.6 What must not be touched yet
 
 - D1/D5/D2 canonical fallbacks. `materialize_received_message_cap`
