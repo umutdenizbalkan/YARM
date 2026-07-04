@@ -7309,6 +7309,42 @@ VM/COW/fork → 186F fault-report delivery → 187 AP user scheduling / multi-di
 on the single-dispatcher model the global lock is uncontended, so 186B+ yield no
 functional benefit until 187 — sequencing 187 earlier is a legitimate alternative.
 
+**Stage 186B (IPC-REPLY-VERTICAL-CONVERSION) — audited, HARD-STOPPED, no code change.**
+With the 186A seams in hand, `ipc_reply` conversion was attempted and stopped: the
+split-mut seams are necessary but **not sufficient**, because `ipc_reply` sits on top
+of two broad shared subsystems that Stage 186B may not convert. `ipc_reply`'s IPC
+reply-cap phase (`with_ipc_split_mut`) and the cnode fast-revoke
+(`with_capability_state_split_mut`) ARE seam-expressible — but its **delivery** to the
+blocked caller (`complete_blocked_recv_for_waiter`) requires:
+
+- **User-memory copy** (`copy_to_user` ×2 for payload+meta; and `copy_from_user` to
+  marshal the reply message). `copy_to_user` resolves the target ASID's page tables and
+  calls `validate_user_access_for_asid(.., write=true)`, whose write path triggers
+  **COW fault-in** (allocates a frame via the memory allocator, rewrites the PTE). There
+  is no seam-based user-copy helper; building one that soundly handles the write-fault/COW
+  case is VM/COW-domain work — **explicitly out of Stage 186B scope** ("do not convert
+  VM/fork/COW/futex").
+- **Cap materialization** (`materialize_received_message_cap_routed`, `ipc_recv_core.rs`),
+  the shared D1/D4/D5 cap-transfer engine with **13 call sites** across all IPC delivery
+  paths. Converting it is broad cap-transfer decomposition — **explicitly out of Stage
+  186B scope** ("do not convert broad cap-transfer paths") — and being shared, it cannot
+  be converted "for `ipc_reply` only".
+
+Even the narrow "enqueue-to-endpoint, no blocked-recv-v2 waiter" sub-case still needs
+`copy_from_user` to marshal the reply payload from the replier's address space, so no
+seam-only sub-case exists. No `IPC_REPLY_SPLIT_*` markers were introduced (they would be
+dishonest for a path still on the legacy boundary).
+
+**Corrected roadmap ordering.** `ipc_reply` (186B) sits ABOVE the VM user-copy path and
+the cap-transfer engine, so those are **prerequisites**, not successors. The roadmap
+`186B → 186D(cap-transfer) → 186E(VM)` is inverted for this slice. Do **186E-prereq**
+(a VM/memory-seam user-memory copy helper — `copy_to_user`/`copy_from_user` via
+`with_vm_user_spaces_split_mut` + `with_memory_split_mut`, COW-fault-safe) and
+**186D-prereq** (seam-based `materialize_received_message_cap_routed` on the capability
++ IPC seams) **first**; only then can `ipc_reply` be converted end-to-end. Standing
+caveat unchanged: none of this yields functional benefit until 187 (multi-dispatcher),
+so prioritizing 187 remains the honest alternative.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /
