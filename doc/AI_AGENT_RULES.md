@@ -220,9 +220,21 @@ automatically upon successful spawn).
 `smp2-*/smp4-*` SMP-LIVE profiles can drive `-smp >1`, while `-smp 1` stays the default.
 This selects only the QEMU CPU topology — it is NOT a production fallback knob, and the
 graduated seams remain the only x86_64 production path. Do not add a runtime knob that
-selects the old global-lock fallback. Until AP scheduler admission lands, `-smp N` boots
-park the APs (`X86_AP_RUST_PARK reason=no_ap_scheduler_yet`) and the SMP-liveness audit
-reports `X86_SMP_UNLOCK_DONE result=deferred reason=aps_not_admitted` honestly.
+selects the old global-lock fallback.
+
+**Stage 183/184 accepted status — DO NOT OVERCLAIM.** x86_64 SMP is accepted with APs
+**online but WAKE-ONLY**: they idle in a scheduler-owned interruptible loop, take real
+remote wakes, and acknowledge real TLB shootdowns, but they **run no dispatcher and
+execute NO user tasks** (`dispatching_cpu_count` stays 1; task placement on APs is
+denied). Stage 183 does NOT prove multi-dispatcher user scheduling. Stage 184
+(CROSS-ARCH-LIVE) attests the accepted graduated D2/D6/D3 correctness + syscall parity
+per arch under the single-dispatcher topology, with `mode=out_of_lock` on x86_64 and
+`mode=in_lock_single_dispatcher` on AArch64/RISC-V (the in-lock path is the graduated
+one, NOT the removed fallback). Stage 184 explicitly does NOT: retire the global lock
+(Stage 185), enable multi-dispatcher scheduling, let APs run user tasks, or fake remote
+TLB ACK on arches without real remote translation holders. When editing SMP/cross-arch
+code or docs, preserve these caveats; do not describe APs as running user tasks or claim
+multi-dispatcher scheduling.
 
 ### 5.2 x86_64 SMP TODO
 

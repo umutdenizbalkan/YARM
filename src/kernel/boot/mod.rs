@@ -1156,6 +1156,26 @@ pub(crate) static CROSS_ARCH_D6_ENABLED: core::sync::atomic::AtomicBool =
 pub(crate) static CROSS_ARCH_D6_AUDIT_STARTED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Stage 184 (CROSS-ARCH-LIVE): one-shot latch for the cross-arch live audit. This
+/// audit is DEFAULT-ON (no knob) and runs on every arch: it attests the honest
+/// per-arch topology (dispatching_cpu_count) and that the accepted graduated
+/// D2/D6/D3 correctness invariants + syscall-error parity are live for this arch's
+/// topology. It live-wires nothing and changes no dispatch/ABI behavior.
+pub(crate) static CROSS_ARCH_LIVE_AUDIT_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Stage 184: try to claim the one-shot cross-arch live audit (true exactly once).
+pub(crate) fn cross_arch_live_audit_try_start() -> bool {
+    CROSS_ARCH_LIVE_AUDIT_STARTED
+        .compare_exchange(
+            false,
+            true,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+}
+
 pub(crate) fn set_cross_arch_d6_enabled(enabled: bool) {
     CROSS_ARCH_D6_ENABLED.store(enabled, core::sync::atomic::Ordering::Release);
 }

@@ -182,6 +182,17 @@ REQUIRED_PATTERNS=(
   "RISCV_TIMER_MECHANISM value="
   "RISCV_PLIC_BASE value="
   "RISCV_PLIC_CONTEXT value="
+  # Stage 184 (CROSS-ARCH-LIVE): default-on cross-arch live audit. RISC-V is
+  # single-dispatcher (BSP-only scheduler), so mode=in_lock_single_dispatcher —
+  # the graduated D2/D6/D3 correctness runs in-lock (NOT the removed global-lock
+  # fallback); no x86-style AP/TLB-ACK is claimed.
+  "CROSS_ARCH_TOPOLOGY_OK arch=riscv64 reason=single_dispatcher"
+  "CROSS_ARCH_D2_RECV_OK arch=riscv64"
+  "CROSS_ARCH_D2_SEND_OK arch=riscv64"
+  "CROSS_ARCH_D6_OK arch=riscv64"
+  "CROSS_ARCH_D3_OK arch=riscv64"
+  "CROSS_ARCH_SYSCALL_PARITY_OK arch=riscv64"
+  "CROSS_ARCH_LIVE_DONE arch=riscv64 result=ok"
 )
 
 # Nothing optional today: all required RAMFS/EXT4 markers above are
@@ -220,6 +231,14 @@ REJECT_PATTERNS=(
   'Vm\(Full\)'
   '\boom\b'
   '\bcapacity\b'
+  # Stage 184 (CROSS-ARCH-LIVE): the cross-arch live audit must not report a
+  # blocked topology, an ungraduated seam, or any fallback/opt-out.
+  'CROSS_ARCH_TOPOLOGY_BLOCKED arch=riscv64'
+  'CROSS_ARCH_D2_RECV_FAIL'
+  'CROSS_ARCH_D2_SEND_FAIL'
+  'UNLOCK_GRADUATED_FALLBACK'
+  'UNEXPECTED_INLOCK_DISPATCH'
+  'emergency_optout'
   # A real QEMU virt DTB always has a well-formed /cpus node; a scan
   # failure here means the bitmap silently fell back to the single-hart
   # default instead of reflecting the real topology.

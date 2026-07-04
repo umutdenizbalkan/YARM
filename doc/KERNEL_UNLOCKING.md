@@ -7057,6 +7057,70 @@ shootdown ACK).**
   `scripts/run-ci-profiles.sh smp2-core` + `smp2-sender-wake` + `smp4-core` +
   `smp4-sender-wake`.
 
+**Stage 183 ACCEPTED CAVEAT (must not be overclaimed).** x86_64 SMP is accepted
+with APs **online but WAKE-ONLY**: they are `online_cpu_count()` members that idle
+in a scheduler-owned interruptible loop, receive real remote wakes, and acknowledge
+real TLB shootdowns — but they **run no dispatcher and execute NO user tasks**. Task
+placement on them is denied (`SCHED_ENQUEUE_DENIED_WAKE_ONLY`). Stage 183 therefore
+does **NOT** prove multi-dispatcher user scheduling; `dispatching_cpu_count` stays 1
+(BSP-only). Multi-dispatcher / user-tasks-on-APs is a **later** milestone (after
+Stage 185 global-lock retirement or a dedicated AP-dispatch stage), NOT part of
+Stage 183 or 184.
+
+### 7.1.20 Stage 184 — CROSS-ARCH-LIVE (accepted graduated paths, honest per-arch topology)
+
+Bring the accepted graduated kernel paths live across architectures **without**
+weakening the x86_64 Stage 181–183 results, and **without** faking SMP bring-up on
+architectures that do not have it.
+
+- **x86_64: regression only.** All Stage 183 markers stay required
+  (`X86_SMP_ONLINE_READY`, `D6_SMP_REMOTE_WAKE_OK`, `D6_SMP_DISPATCH_OK`,
+  `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, `IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE`,
+  `COW_SMP_TLB_ACK_OK`, `VM_UNMAP_SMP_TLB_ACK_OK`,
+  `X86_SMP_UNLOCK_DONE result=smp_seams_ok`).
+- **Generalized topology predicate.** The Stage 183.6 `dispatching_cpu_count =
+  online_cpu_count − wake_only_cpu_count` is arch-generic. The out-of-lock D2/D6/D3
+  slice is eligible when `dispatching_cpu_count ≤ 1` (single dispatcher), NOT merely
+  `online_cpu_count ≤ 1`. On arches without AP scheduler-online this naturally
+  collapses to the single-dispatcher case.
+- **The correctness invariants are already arch-generic and live.** No IPC-state
+  lock across the user-memory copy, sender-wake ordering, no lost/dup wake, no
+  fallback branch — these hold on AArch64/RISC-V today. The **only** x86-specific
+  piece is the *out-of-lock dispatch relocation*, which rides the x86 trap-entry
+  drain. So Stage 184 does not blindly copy x86 SMP: it attests the honest per-arch
+  reality with a `mode` field.
+- **Default-on cross-arch live audit** (`maybe_run_cross_arch_live_audit`, one-shot,
+  real-user-task gated, no knob, runs on every arch). It emits:
+  `CROSS_ARCH_TOPOLOGY_BEGIN` / `CROSS_ARCH_DISPATCHING_CPUS arch online wake_only
+  dispatching` / `CROSS_ARCH_TOPOLOGY_OK arch reason=single_dispatcher` (or
+  `_BLOCKED`); `CROSS_ARCH_D2_RECV_OK` / `_D2_SEND_OK` / `_D6_OK` / `_D3_OK` each with
+  `mode=out_of_lock` on x86_64 or `mode=in_lock_single_dispatcher` on aarch64/riscv;
+  `CROSS_ARCH_SYSCALL_PARITY_OK arch tid` (the audit runs from the syscall trap path
+  with a live user task that returned to userspace — direct runtime evidence the
+  Stage 81A parity holds); and `CROSS_ARCH_LIVE_DONE arch result=ok mode`. Honest
+  framing: `in_lock_single_dispatcher` means the graduated path runs **in-lock**
+  (correct, single-dispatcher-safe) — it is NOT the removed global-lock fallback, and
+  it is NOT an x86-style out-of-lock relocation.
+- **No fake remote TLB ACK off x86.** AArch64/RISC-V are single-dispatcher with no AP
+  user execution, so no remote CPU caches a user translation to acknowledge; the
+  audit emits the honest topology marker and makes **no** `*_TLB_ACK_OK` claim for
+  those arches. Only x86_64 (with real online APs holding the kernel CR3 and acking
+  via the per-CPU mailbox) emits the TLB-ACK markers.
+- **Stage 184 explicit NON-GOALS:** not Stage 185 global-lock retirement; not
+  multi-dispatcher scheduling; not AP user-task scheduling; **not fake remote TLB ACK
+  on architectures without real remote holders.** No fallback knobs, no emergency
+  opt-out, no ABI/count/limit changes (`SYSCALL_COUNT=31`, `VARIANT_COUNT=23`,
+  x86_64 `MAX_ADDRESS_SPACES=32`). Guarded by `stage184_cross_arch_live`. Acceptance:
+  `scripts/run-ci-profiles.sh {x86_64-core,smp2-core,smp2-sender-wake,smp4-core,
+  smp4-sender-wake,aarch64-core,riscv64-core}`.
+
+**What remains for Stage 185 (and beyond).** Global-lock retirement (the graduated
+seams still take the global `KernelState` lock for the in-lock authoritative
+dispatch; retiring it is Stage 185), then multi-dispatcher user scheduling / AP
+user-task execution (a dedicated later stage that clears an AP's wake-only bit and
+raises `dispatching_cpu_count` above 1, at which point the same predicate re-gates
+the seams and the per-ASID-precise TLB targeting on APs becomes meaningful).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

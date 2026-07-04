@@ -53233,3 +53233,142 @@ mod stage183_ap_idle_admit {
         );
     }
 }
+
+// Stage 184 — CROSS-ARCH-LIVE. A default-on, one-shot cross-arch live audit attests,
+// per arch, the honest topology (dispatching_cpu_count = online - wake_only) and that
+// the accepted graduated D2/D6/D3 correctness + syscall-error parity are the
+// production path. The out-of-lock dispatch relocation is x86-only (rides its
+// trap-entry drain), so each _OK carries mode=out_of_lock (x86_64) or
+// mode=in_lock_single_dispatcher (aarch64/riscv) — honest, not a fake x86 SMP copy.
+mod stage184_cross_arch_live {
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+    const MOD_SRC: &str = include_str!("mod.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SCHED_STATE_SRC: &str = include_str!("scheduler_state.rs");
+    const X86_SMOKE: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
+    const A64_SMOKE: &str = include_str!("../../../scripts/qemu-aarch64-core-smoke.sh");
+    const RV_SMOKE: &str = include_str!("../../../scripts/qemu-riscv64-core-smoke.sh");
+    const DOC_SRC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+
+    // The generalized topology predicate exists and is arch-generic (183.6 → 184).
+    #[test]
+    fn stage184_cross_arch_topology_predicate() {
+        assert!(
+            SCHED_STATE_SRC.contains("fn dispatching_cpu_count(&self) -> usize")
+                && SCHED_STATE_SRC.contains("!s.wake_only_bitmap()"),
+            "dispatching_cpu_count (online - wake_only) must exist"
+        );
+        assert!(
+            ORCH_SRC.contains("CROSS_ARCH_TOPOLOGY_BEGIN")
+                && ORCH_SRC.contains("CROSS_ARCH_DISPATCHING_CPUS")
+                && ORCH_SRC.contains("CROSS_ARCH_TOPOLOGY_OK arch={} reason=single_dispatcher")
+                && ORCH_SRC.contains("CROSS_ARCH_TOPOLOGY_BLOCKED"),
+            "the cross-arch topology markers must exist"
+        );
+    }
+
+    // The audit is default-on (no knob), one-shot, real-user-task gated, and hooked
+    // into BOTH fault paths.
+    #[test]
+    fn stage184_audit_default_on_and_hooked() {
+        assert!(
+            ORCH_SRC.contains("fn maybe_run_cross_arch_live_audit(&mut self)")
+                && ORCH_SRC.contains("cross_arch_live_audit_try_start()")
+                && ORCH_SRC.contains("if tid == 0"),
+            "the cross-arch live audit must be one-shot + real-user-task gated"
+        );
+        assert!(
+            MOD_SRC.contains("fn cross_arch_live_audit_try_start() -> bool")
+                && MOD_SRC.contains("CROSS_ARCH_LIVE_AUDIT_STARTED"),
+            "the one-shot latch must exist"
+        );
+        // No knob gates it (unlike the Stage 178 opt-in cross_arch_d6 audit).
+        assert!(
+            !MOD_SRC.contains("fn cross_arch_live_enabled")
+                && !MOD_SRC.contains("CROSS_ARCH_LIVE_ENABLED"),
+            "the cross-arch live audit must be default-on (no enable knob/flag)"
+        );
+        assert_eq!(
+            FAULT_SRC
+                .matches("self.maybe_run_cross_arch_live_audit();")
+                .count(),
+            2,
+            "the audit must be hooked into both the syscall and timer fault paths"
+        );
+    }
+
+    // Per-seam markers with an HONEST mode field; no fake x86 relocation off-x86.
+    #[test]
+    fn stage184_per_seam_markers_and_mode() {
+        for m in [
+            "CROSS_ARCH_D2_RECV_BEGIN",
+            "CROSS_ARCH_D2_RECV_OK arch={} mode={}",
+            "CROSS_ARCH_D2_SEND_BEGIN",
+            "CROSS_ARCH_D2_SEND_OK arch={} mode={}",
+            "CROSS_ARCH_D6_BEGIN",
+            "CROSS_ARCH_D6_OK arch={} mode={}",
+            "CROSS_ARCH_D3_BEGIN",
+            "CROSS_ARCH_D3_OK arch={} mode={}",
+            "CROSS_ARCH_SYSCALL_PARITY_OK arch={} tid={}",
+        ] {
+            assert!(
+                ORCH_SRC.contains(m),
+                "cross-arch live marker must exist: {m}"
+            );
+        }
+        // The mode is out_of_lock ONLY on x86_64; every other arch is in-lock. The
+        // ternary lives in the audit body between the topology-OK and the D2 markers.
+        let audit = &ORCH_SRC[ORCH_SRC.find("fn maybe_run_cross_arch_live_audit").unwrap()..];
+        let mode_region = &audit[..audit.find("CROSS_ARCH_D2_RECV_BEGIN").unwrap()];
+        assert!(
+            mode_region.contains("\"out_of_lock\"")
+                && mode_region.contains("\"in_lock_single_dispatcher\"")
+                && mode_region.contains("cfg!(target_arch = \"x86_64\")"),
+            "mode must be out_of_lock on x86_64 and in_lock_single_dispatcher elsewhere"
+        );
+    }
+
+    // All three core smokes require the per-arch markers; x86 stays out_of_lock.
+    #[test]
+    fn stage184_smokes_require_markers() {
+        assert!(
+            X86_SMOKE.contains("CROSS_ARCH_D6_OK arch=x86_64 mode=out_of_lock")
+                && X86_SMOKE.contains("CROSS_ARCH_SYSCALL_PARITY_OK arch=x86_64"),
+            "x86 smoke must require the out_of_lock cross-arch markers"
+        );
+        assert!(
+            A64_SMOKE.contains("CROSS_ARCH_TOPOLOGY_OK arch=aarch64 reason=single_dispatcher")
+                && A64_SMOKE.contains("CROSS_ARCH_D6_OK arch=aarch64")
+                && A64_SMOKE.contains("CROSS_ARCH_SYSCALL_PARITY_OK arch=aarch64"),
+            "aarch64 smoke must require the cross-arch markers"
+        );
+        assert!(
+            RV_SMOKE.contains("CROSS_ARCH_TOPOLOGY_OK arch=riscv64 reason=single_dispatcher")
+                && RV_SMOKE.contains("CROSS_ARCH_D6_OK arch=riscv64")
+                && RV_SMOKE.contains("CROSS_ARCH_SYSCALL_PARITY_OK arch=riscv64"),
+            "riscv64 smoke must require the cross-arch markers"
+        );
+        // x86_64 Stage 183 TLB-ACK markers stay intact (regression).
+        assert!(
+            X86_SMOKE.contains("COW_SMP_TLB_ACK_OK")
+                && X86_SMOKE.contains("VM_UNMAP_SMP_TLB_ACK_OK")
+                && X86_SMOKE.contains("X86_SMP_UNLOCK_DONE result=smp_seams_ok"),
+            "x86_64 Stage 183 TLB-ACK markers must remain required"
+        );
+    }
+
+    // The doc carries the Stage 183 wake-only caveat + the Stage 184 non-goals.
+    #[test]
+    fn stage184_doc_caveats() {
+        assert!(
+            DOC_SRC.contains("online but WAKE-ONLY")
+                && DOC_SRC.contains("multi-dispatcher user scheduling"),
+            "doc must carry the Stage 183 wake-only AP caveat"
+        );
+        assert!(
+            DOC_SRC.contains("not fake remote TLB ACK")
+                && DOC_SRC.contains("not Stage 185 global-lock retirement"),
+            "doc must carry the Stage 184 non-goals"
+        );
+    }
+}
