@@ -45948,6 +45948,102 @@ mod stage184_riscv_trap_return_provenance {
 }
 
 // ===========================================================================
+// Stage 185 (GLOBAL-LOCK-RETIRE) — boot-only global-state escape is confined.
+//
+// The `SharedKernel` global `SpinLock<KernelState>` (taken via `with`/`with_cpu`)
+// remains the authoritative LIVE-RUNTIME serialization boundary for the accepted
+// single-dispatcher model (x86_64 -smp1 and AArch64/RISC-V
+// `in_lock_single_dispatcher`); retiring it from live runtime is a per-subsystem
+// rewrite that `doc/KERNEL_LOCKING.md` §"Current status" explicitly does not
+// claim and that Stage 185 does NOT perform (it is not a rewrite stage).
+//
+// What Stage 185 *does* pin: the ONE place a raw `&mut KernelState` escapes the
+// global lock outside a `with`/`with_cpu` closure —
+// `SharedKernel::borrow_kernel_for_boot()` — is BOOT-ONLY. It is used solely
+// during bootstrap ELF load on the boot CPU (with the timer ISR quiesced and the
+// `BootRawKernelBorrowGuard` aliasing window active, see stage30 tests) and must
+// NEVER appear on a live syscall / IPC / scheduler / capability / VM / fault
+// dispatch path. These guards fail if that boot-only escape leaks into live
+// runtime, or if its crate-private `unsafe` definition is loosened.
+// ===========================================================================
+#[cfg(test)]
+mod stage185_boot_only_global_borrow_confined {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    // Boot ELF-load sites — the ONLY permitted callers.
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+
+    // Live-runtime dispatch surface, one representative file per required domain
+    // (syscall dispatch, IPC, scheduler, capability/cnode, VM, fault, thread).
+    // None may call the boot-only raw `&mut KernelState` escape.
+    const LIVE_RUNTIME_FILES: &[(&str, &str)] = &[
+        ("syscall.rs", include_str!("../syscall.rs")),
+        ("syscall_split.rs", include_str!("../syscall_split.rs")),
+        ("syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ("syscall/vm.rs", include_str!("../syscall/vm.rs")),
+        ("syscall/process.rs", include_str!("../syscall/process.rs")),
+        ("ipc_state.rs", include_str!("ipc_state.rs")),
+        ("scheduler_state.rs", include_str!("scheduler_state.rs")),
+        ("capability_state.rs", include_str!("capability_state.rs")),
+        ("cnode_state.rs", include_str!("cnode_state.rs")),
+        ("exec_state.rs", include_str!("exec_state.rs")),
+        ("memory_state.rs", include_str!("memory_state.rs")),
+        ("fault_state.rs", include_str!("fault_state.rs")),
+        (
+            "fault_endpoint_state.rs",
+            include_str!("fault_endpoint_state.rs"),
+        ),
+        ("thread_state.rs", include_str!("thread_state.rs")),
+    ];
+
+    const BOOT_ESCAPE_CALL: &str = ".borrow_kernel_for_boot()";
+
+    // The raw-borrow escape hatch stays crate-private and `unsafe` so it can only
+    // be reached from inside the kernel crate and never without an explicit
+    // `unsafe` block. Loosening it to `pub` or dropping `unsafe` is a regression.
+    #[test]
+    fn stage185_boot_escape_is_crate_private_unsafe() {
+        assert!(
+            RUNTIME_SRC.contains("pub(crate) unsafe fn borrow_kernel_for_boot"),
+            "borrow_kernel_for_boot must stay `pub(crate) unsafe` (boot-only escape hatch)"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("pub unsafe fn borrow_kernel_for_boot"),
+            "borrow_kernel_for_boot must NOT be exported `pub` — it is a boot-only escape"
+        );
+    }
+
+    // The boot-only escape must be reachable ONLY from the two arch boot
+    // ELF-load sites (non-vacuous: prove it IS called there).
+    #[test]
+    fn stage185_boot_escape_present_only_in_boot() {
+        assert!(
+            X86_BOOT_SRC.contains(BOOT_ESCAPE_CALL),
+            "x86_64 boot must call borrow_kernel_for_boot() (bootstrap ELF load)"
+        );
+        assert!(
+            AARCH64_BOOT_SRC.contains(BOOT_ESCAPE_CALL),
+            "aarch64 boot must call borrow_kernel_for_boot() (bootstrap ELF load)"
+        );
+    }
+
+    // No live-runtime dispatch path may call the boot-only raw `&mut` escape:
+    // live paths must go through the global lock (`with`/`with_cpu`) or a
+    // documented subsystem split helper, never the bootstrap alias.
+    #[test]
+    fn stage185_no_live_runtime_path_uses_boot_escape() {
+        for (name, src) in LIVE_RUNTIME_FILES {
+            assert!(
+                !src.contains(BOOT_ESCAPE_CALL),
+                "live-runtime file `{name}` must NOT call {BOOT_ESCAPE_CALL} — the raw \
+                 &mut KernelState borrow is boot-only; live paths use the global lock or a \
+                 documented subsystem split helper"
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

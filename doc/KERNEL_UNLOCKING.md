@@ -7121,6 +7121,22 @@ user-task execution (a dedicated later stage that clears an AP's wake-only bit a
 raises `dispatching_cpu_count` above 1, at which point the same predicate re-gates
 the seams and the per-ASID-precise TLB targeting on APs becomes meaningful).
 
+**Stage 185 (GLOBAL-LOCK-RETIRE) — honest status.** The Stage 185 pass established
+that the global `SpinLock<KernelState>` (`with`/`with_cpu`) is still the
+authoritative *live-runtime* serialization for the single-dispatcher model and is
+**not an obsolete crutch**: the lock-free split path is a whitelist-only scaffold
+(3 syscall sub-cases), and every other live syscall/IPC/scheduler/capability/
+VM/fault path runs inside the global lock by design. Fully retiring it is the
+per-subsystem rewrite `doc/KERNEL_LOCKING.md` §"Current status" disclaims, and
+Stage 185 is explicitly *not a rewrite stage* — so it did **not** retire the
+global lock from live runtime. It instead (a) inventoried + classified every
+global-lock site, (b) confirmed no obsolete fallbacks remain (Stage 182 removed
+them), (c) confined + guarded the sole boot-only raw `&mut KernelState` escape
+(`borrow_kernel_for_boot`, `stage185_boot_only_global_borrow_confined`), and
+(d) recorded the lock-rank rules in `doc/KERNEL_LOCKING.md §0`. Full retirement
+is deferred to future per-subsystem increments, coupled to the multi-dispatcher
+work above. See `doc/KERNEL_LOCKING.md §0` for the classified inventory.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

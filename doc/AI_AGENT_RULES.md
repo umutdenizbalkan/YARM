@@ -236,6 +236,20 @@ TLB ACK on arches without real remote translation holders. When editing SMP/cros
 code or docs, preserve these caveats; do not describe APs as running user tasks or claim
 multi-dispatcher scheduling.
 
+**Stage 185 (GLOBAL-LOCK-RETIRE) status — DO NOT OVERCLAIM.** The global
+`SpinLock<KernelState>` (`SharedKernel::with` / `with_cpu`) is **still the
+authoritative live-runtime serialization** for the accepted single-dispatcher
+model — it was **not** retired from live runtime in Stage 185 (which is *not a
+rewrite stage*). The lock-free split path is a whitelist-only scaffold; every
+other live syscall/IPC/scheduler/capability/VM/fault path runs inside the global
+lock by design. Do not describe the global lock as "retired" or live paths as
+"lock-free". The sole boot-only raw `&mut KernelState` escape,
+`SharedKernel::borrow_kernel_for_boot`, is `pub(crate) unsafe`, used only during
+bootstrap ELF load on the boot CPU from `arch/{x86_64,aarch64}/boot.rs`, and must
+never appear on a live-runtime dispatch path (guarded by
+`stage185_boot_only_global_borrow_confined`). See `doc/KERNEL_LOCKING.md §0` for
+the classified inventory and the deferred per-subsystem retirement plan.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
