@@ -845,21 +845,17 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
             // `args[0..5]` (apply_user_context copied them into `tframe.args`).
             // The freshly-spawned task's `user_gprs` are still all-zero, so
             // mirroring those would clobber the startup args — write args[]
-            // directly into a0..a5.
-            // RISCV_STARTUP_ARGS is a required startup-cap observability marker for
-            // each task resumed via the trap-frame write-back path. It also pins
-            // correctness: reading `tframe.arg(..)` into this opaque log call forces
-            // the optimizer to keep the whole `apply_user_context → tframe.args →
-            // frame.regs[A0..A5]` chain live. `frame`'s contents are otherwise read
-            // back only through the *raw* `frame_ptr` inside the extern
-            // `yarm_riscv64_trap_return` asm — an access LLVM does not model as
-            // aliasing the `&mut frame`/`&mut tframe` borrows — so without it the
-            // whole chain was eliminated as dead and a freshly-dispatched task
-            // resumed with a0..a5 = 0: PM booted with task_id=0 / pm caps=0
-            // (PM_NO_RECV_CAP), stalling the entire RISC-V service chain, with later
-            // resumes faulting on corrupted control flow. The marker must read
-            // `tframe.arg(..)` DIRECTLY (not via precomputed locals) so the same
-            // loads feed both the log and the register stores below.
+            // directly into a0..a5. Correctness of these stores no longer relies
+            // on the RISCV_STARTUP_ARGS log below (which is now pure
+            // observability): the trap-return tail reads the frame back through a
+            // pointer DERIVED FROM this same `&mut frame` (see the resume site), so
+            // LLVM models the extern read as observing these stores and cannot
+            // dead-strip them.
+            //
+            // RISCV_STARTUP_ARGS is a required startup-cap attestation marker for
+            // each task resumed via this write-back path. It is NO LONGER
+            // load-bearing for correctness (the provenance fix at the resume site
+            // is) — it is retained purely for boot observability.
             crate::yarm_log!(
                 "RISCV_STARTUP_ARGS tid={} entering={} a0={} a1={} a2={} a3={} a4={} a5={}",
                 resume_tid,
@@ -1012,7 +1008,21 @@ extern "C" fn yarm_riscv64_trap_bridge(frame_ptr: *mut RiscvTrapFrame) -> ! {
         }
     }
 
-    unsafe { yarm_riscv64_trap_return(frame_ptr) }
+    // Resume through a pointer DERIVED FROM the live `&mut frame`, NOT the raw
+    // `frame_ptr` argument. This is load-bearing for correctness, not cosmetic:
+    // every register write-back above (PC/SP, mirrored GPRs, and the fresh-task
+    // ABI lanes A0..A5) is performed through `frame`, a `&mut *frame_ptr` whose
+    // `noalias` provenance lets LLVM assume no access through an *unrelated*
+    // pointer observes those stores. Handing the extern `yarm_riscv64_trap_return`
+    // the raw `frame_ptr` (a separate provenance) is exactly such an unrelated
+    // access, so LLVM dead-stripped the A0..A5 stores and fresh tasks resumed with
+    // a0..a5 = 0 (PM booted with zero startup caps → PM_NO_RECV_CAP, stalling the
+    // whole RISC-V service chain). Reborrowing the pointer from `frame` keeps a
+    // single provenance chain (`frame_ptr → &mut frame → *const derived here`), so
+    // the extern read is modeled as observing the write-back and the stores
+    // survive optimization on their own — independent of any logging.
+    let frame_resume: *const RiscvTrapFrame = frame;
+    unsafe { yarm_riscv64_trap_return(frame_resume) }
 }
 
 #[cfg(all(not(feature = "hosted-dev"), target_arch = "riscv64"))]

@@ -45858,6 +45858,96 @@ mod stage163p_sender_wake_fix {
 }
 
 // ===========================================================================
+// Stage 184 follow-up hardening — RISC-V trap-frame write-back must be
+// intrinsically observed by the trap-return path.
+//
+// The trap bridge writes the resumed fresh task's startup ABI (a0..a5) into the
+// saved frame through `frame` (a `&mut *frame_ptr`), then the extern
+// `yarm_riscv64_trap_return` asm reads the frame back to sret into userspace.
+// If that extern read is handed the RAW `frame_ptr` (a provenance unrelated to
+// the `&mut frame`), LLVM's `noalias` on `frame` lets it assume the read does
+// not observe the A0..A5 stores and dead-strips them — the freshly-dispatched
+// task then resumes with a0..a5 = 0 (process_manager boots with zero startup
+// caps → PM_NO_RECV_CAP, stalling the entire RISC-V userspace service chain).
+//
+// The fix derives the trap-return pointer from the SAME `&mut frame`
+// (`let frame_resume: *const RiscvTrapFrame = frame;`), keeping a single
+// provenance chain so the stores are provably observed and survive optimization
+// WITHOUT depending on a logging side effect. These guards pin that shape: the
+// fragile raw-`frame_ptr` resume can never come back, and the A0..A5 write-back
+// + the RISCV_STARTUP_ARGS attestation must stay present.
+// ===========================================================================
+#[cfg(test)]
+mod stage184_riscv_trap_return_provenance {
+    const RISCV_BOOT_SRC: &str = include_str!("../../arch/riscv64/boot.rs");
+
+    fn trap_bridge_body() -> &'static str {
+        RISCV_BOOT_SRC
+            .split("fn yarm_riscv64_trap_bridge")
+            .nth(1)
+            .expect("yarm_riscv64_trap_bridge body")
+    }
+
+    // The resume must go through a pointer reborrowed from `&mut frame`, and the
+    // fragile raw-`frame_ptr` resume must be gone. This is the actual correctness
+    // fix — reverting it silently reintroduces the zero-args regression.
+    #[test]
+    fn stage184_trap_return_uses_frame_derived_pointer() {
+        let bridge = trap_bridge_body();
+        assert!(
+            bridge.contains("let frame_resume: *const RiscvTrapFrame = frame;"),
+            "trap bridge must derive the trap-return pointer from the &mut frame \
+             (single provenance) so the ABI-register write-back is observed"
+        );
+        assert!(
+            bridge.contains("yarm_riscv64_trap_return(frame_resume)"),
+            "trap bridge must resume via the frame-derived `frame_resume` pointer"
+        );
+        assert!(
+            !bridge.contains("yarm_riscv64_trap_return(frame_ptr)"),
+            "trap bridge must NOT hand the raw `frame_ptr` to yarm_riscv64_trap_return \
+             — its unrelated provenance lets LLVM dead-strip the A0..A5 stores \
+             (fresh tasks resume with a0..a5 = 0 → PM_NO_RECV_CAP)"
+        );
+    }
+
+    // The fresh-task ABI lanes must actually be written from the resumed thread's
+    // startup args in the task_switched branch.
+    #[test]
+    fn stage184_writeback_writes_all_abi_lanes() {
+        let bridge = trap_bridge_body();
+        for stmt in [
+            "frame.regs[RiscvTrapFrame::A0] = tframe.arg(0) as u64;",
+            "frame.regs[RiscvTrapFrame::A1] = tframe.arg(1) as u64;",
+            "frame.regs[RiscvTrapFrame::A2] = tframe.arg(2) as u64;",
+            "frame.regs[RiscvTrapFrame::A3] = tframe.arg(3) as u64;",
+            "frame.regs[RiscvTrapFrame::A4] = tframe.arg(4) as u64;",
+            "frame.regs[RiscvTrapFrame::A5] = tframe.arg(5) as u64;",
+        ] {
+            assert!(
+                bridge.contains(stmt),
+                "task-switch write-back must set the ABI lane from tframe: `{stmt}`"
+            );
+        }
+        assert!(
+            bridge.contains("frame.regs[RiscvTrapFrame::A7] = 0;"),
+            "task-switch write-back must clear a7 (syscall-number lane) on fresh entry"
+        );
+    }
+
+    // The RISCV_STARTUP_ARGS attestation marker must remain (now observability
+    // only — correctness is the provenance fix above, not this log).
+    #[test]
+    fn stage184_startup_args_marker_present() {
+        let bridge = trap_bridge_body();
+        assert!(
+            bridge.contains("RISCV_STARTUP_ARGS tid={} entering={}"),
+            "trap bridge must still emit the RISCV_STARTUP_ARGS startup-cap marker"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and
