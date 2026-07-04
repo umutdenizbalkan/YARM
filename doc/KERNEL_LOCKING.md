@@ -19,6 +19,91 @@ remove implicit global-lock coupling from syscall/trap paths.
 - Future work must remain narrow and independently validated; this document
   does **not** claim Stage 3/global-lock removal.
 
+## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
+
+Stage 185 inventoried every global-lock site and its finding is recorded here so
+later work is not misled: **the global `SpinLock<KernelState>` is still the
+authoritative live-runtime serialization boundary and was NOT retired from live
+runtime in this stage.** Retiring it from all live syscall/IPC/scheduler/
+capability/VM/fault paths means converting the whole
+`with_cpu → handle_trap → syscall::dispatch` model to per-subsystem locks with
+rank ordering — the multi-stage rewrite this document's *Current status*
+disclaims. Stage 185 is explicitly **not a rewrite stage**, so it did not perform
+that conversion. What it did do:
+
+- **Inventory (classified).**
+  - *Live runtime (by design, retained):* `SharedKernel::with` / `with_cpu`
+    (`src/runtime.rs`, ~94 `with` + ~20 `with_cpu` acquisition sites; the
+    `runtime.rs` methods are the global-lock-wrapped kernel API). This is the
+    authoritative serialization for the accepted single-dispatcher model
+    (x86_64 `-smp 1`; AArch64/RISC-V `in_lock_single_dispatcher`). NOT an
+    obsolete crutch.
+  - *Relocated out-of-lock seams (live, already proven + guarded):* the D2
+    recv/send and D6 dispatch/switch seams run with the global lock dropped via
+    `DISPATCH_SWITCH_PLAN_STASH` + `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE`
+    (`boot/exec_state.rs`, `boot/mod.rs`, `arch/*/trap.rs`, `arch/trap_entry.rs`).
+    Guarded by the Stage 116/117 `D6_GLOBAL_LOCK_DROP_*` tests.
+  - *Boot-only escape (confined + guarded):* `SharedKernel::borrow_kernel_for_boot`
+    (returns a raw `&mut KernelState` outside any `with` closure) is
+    `pub(crate) unsafe` and called from exactly two sites —
+    `arch/x86_64/boot.rs` and `arch/aarch64/boot.rs` — during bootstrap ELF load
+    on the boot CPU, with the timer ISR quiesced and `BootRawKernelBorrowGuard`
+    tracking the aliasing window (Stage 30 tests). Stage 185 adds
+    `stage185_boot_only_global_borrow_confined` guards that fail if this escape
+    is loosened to `pub`, loses `unsafe`, or appears on any live-runtime dispatch
+    file.
+  - *Obsolete fallbacks:* none remain to remove — Stage 182 (REMOVE-FALLBACKS)
+    already deleted them and the codebase forbids dead "just in case" fallback
+    branches (see `orchestrator_state.rs`).
+- **Non-goals (unchanged by Stage 185):** not a syscall ABI change; not a
+  userspace ABI change; not multi-dispatcher AP user scheduling (full retirement
+  is coupled to that later work); not RPi5 / DRS / SUP-L7H.
+
+Full live-runtime retirement remains future multi-stage work; it must be done
+per subsystem, each increment independently validated on the full QEMU matrix,
+preserving the Stage 181–184 markers and the capability/lock-rank invariants
+below.
+
+### 0.1) Stage 186A (SPLIT-MUT-INFRA) — per-domain split-mut seam set completed
+
+Stage 186A is **infrastructure only** — no live syscall/op was migrated. It adds
+the one missing per-domain split-mut seam so later vertical slices have the full
+set to build on. A split-mut seam exposes ONLY `&mut <Subsystem>` (never a broad
+`&mut KernelState`) under the subsystem's own `SpinLockIrq`, derived via raw field
+projectors (`*_split_mut_ptrs_from_raw`) so no whole-`KernelState` reference is
+formed; each is `M2_SEAM_HELPER_ONLY` until a live path is genuinely moved onto it.
+
+| Rank | Domain | Projector | `SharedKernel` seam | Since | Live callers |
+|------|--------|-----------|---------------------|-------|--------------|
+| 1 | scheduler | `scheduler_split_mut_ptr_from_raw` | `with_scheduler_split_mut` | 108 | D6 dispatch (graduated) |
+| 2 | task/TCB | `task_split_mut_ptrs_from_raw` | `with_task_tcbs_split_mut` | 108 | VmBrk-shrink split |
+| 3 | IPC | `ipc_split_mut_ptrs_from_raw` | `with_ipc_split_mut` | 115 | none (helper-only) |
+| **4** | **capability/cnode** | **`capability_split_mut_ptrs_from_raw`** | **`with_capability_state_split_mut`** | **186A** | **none (helper-only)** |
+| 5 | VM/user-spaces | `vm_split_mut_ptrs_from_raw` | `with_vm_user_spaces_split_mut` | 108 | VmBrk-shrink split |
+| 6 | memory/frames | `memory_split_mut_ptrs_from_raw` | `with_memory_split_mut` | 108 | VmBrk-shrink split |
+
+The rank-4 capability seam is the Stage 186A deliverable; ranks 1/2/3/5/6 predate
+it. The **rank order is strictly ascending** (`doc/CAPABILITY_MODEL.md §3`): a path
+needing IPC (rank 3) and capability (rank 4) acquires IPC first and drops it before
+the capability seam — i.e. **no cap materialization under `ipc_state_lock`**, the
+two-phase invariant these seams exist to enable. Guarded by
+`stage186a_capability_split_mut_infra`. This is **not** global-lock retirement: the
+`with`/`with_cpu` boundary in §1 remains authoritative for every live path.
+
+### 0.2) Stage 186E-prereq (VM-USER-COPY-SEAM) — seam-based user-memory copy
+
+Built on the rank-5 (VM) + rank-6 (memory) seams, `SharedKernel` gains
+`validate_user_access_for_asid_split`, `copy_from_user_split`, and
+`copy_to_user_split` (in `boot/user_memory_state.rs`) — seam mirrors of the legacy
+`KernelState::copy_to_user`/`copy_from_user`. They take ONLY the VM (rank 5) +
+memory (rank 6) locks, **never** IPC (3) / capability (4) / task (2) / scheduler (1),
+and **never** a broad `&mut KernelState`. Like the legacy path they perform **no COW
+fault-in** — a non-writable/unmapped target returns `UserMemoryFault` (byte-identical
+errors). `M2_SEAM_HELPER_ONLY`: not wired into any live path. This is the user-copy
+prerequisite for a future `ipc_reply` vertical conversion; the cap-transfer
+materialization engine remains a separate (not-yet-built) seam blocker. Guarded by
+`stage186e_vm_user_copy_seam`. Not global-lock retirement.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

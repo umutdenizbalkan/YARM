@@ -7121,6 +7121,261 @@ user-task execution (a dedicated later stage that clears an AP's wake-only bit a
 raises `dispatching_cpu_count` above 1, at which point the same predicate re-gates
 the seams and the per-ASID-precise TLB targeting on APs becomes meaningful).
 
+**Stage 185 (GLOBAL-LOCK-RETIRE) — honest status.** The Stage 185 pass established
+that the global `SpinLock<KernelState>` (`with`/`with_cpu`) is still the
+authoritative *live-runtime* serialization for the single-dispatcher model and is
+**not an obsolete crutch**: the lock-free split path is a whitelist-only scaffold
+(3 syscall sub-cases), and every other live syscall/IPC/scheduler/capability/
+VM/fault path runs inside the global lock by design. Fully retiring it is the
+per-subsystem rewrite `doc/KERNEL_LOCKING.md` §"Current status" disclaims, and
+Stage 185 is explicitly *not a rewrite stage* — so it did **not** retire the
+global lock from live runtime. It instead (a) inventoried + classified every
+global-lock site, (b) confirmed no obsolete fallbacks remain (Stage 182 removed
+them), (c) confined + guarded the sole boot-only raw `&mut KernelState` escape
+(`borrow_kernel_for_boot`, `stage185_boot_only_global_borrow_confined`), and
+(d) recorded the lock-rank rules in `doc/KERNEL_LOCKING.md §0`. Full retirement
+is deferred to future per-subsystem increments, coupled to the multi-dispatcher
+work above. See `doc/KERNEL_LOCKING.md §0` for the classified inventory.
+
+**Stage 185BC (CAP / OBJECT-STORE / REPLY-CAP DECOMPOSITION) — audited, HARD-STOPPED,
+no code change.** A mega pass was attempted to split the capability/object-store
+(185B) and reply-cap/cap-transfer (185C) slices out of the global lock. The audit
+found **no safe new slice for either part** and stopped per its own hard-stop rule
+(no risky half-conversion):
+
+- *185C reply-cap / cap-transfer — BLOCKED (needs IPC decomposition first).*
+  `ReplyCapRecord` and `TransferEnvelope` are **IPC-subsystem state** in
+  `IpcSubsystem` under `ipc_state_lock` (rank 3, see `doc/CAPABILITY_MODEL.md`
+  §5/§6/§8). Reply caps are created (`create_reply_cap_for_caller`), consumed
+  (`ipc_reply`), and revoked (`revoke_reply_caps_for_caller`/`_replier`, incl.
+  task-exit/restart cleanup) **inside the IPC send/recv/call/reply path**, which
+  runs under the global lock. Transfer envelopes are taken/materialized on the
+  recv-delivery path via the mandatory two-phase pattern. Decomposing any of this
+  out of the global lock requires broad IPC endpoint/waiter decomposition first —
+  the explicit hard-stop condition.
+- *185B capability/object-store basic split — no standalone slice.* There is **no
+  standalone capability syscall** (no CapLookup/CapDelete/CapRevoke in the 23-variant
+  `Syscall` enum). `resolve_capability_for_task` (read-only lookup) and the
+  leaf-revoke helpers are internal, called from ~26 sites all inside global-lock-held
+  IPC/spawn/VM/exit handlers; leaf release/refcount runs on the TransferRelease /
+  IPC-reply / task-exit paths (IPC-domain, rank 3). The one standalone cnode-domain
+  operation that *was* safely splittable — `ControlPlaneSetCnodeSlots` — is already
+  split (Stage 29, `syscall_split.rs` whitelist). Adding any new lock-free cap path
+  would mean decomposing the IPC/spawn/VM callers, widening scope.
+
+**Recommended smaller next stage:** do the IPC-domain decomposition first as its own
+stage (endpoint/waiter/reply-cap/transfer-envelope under `ipc_state_lock` with the
+two-phase materialization moved after IPC-unlock), *then* revisit reply-cap and
+cap-transfer split as follow-on increments. No `CAP_SPLIT_*` / `REPLY_CAP_SPLIT_*` /
+`CAP_TRANSFER_SPLIT_*` markers were introduced — emitting split-success markers for
+paths still handled by the legacy global runtime would be dishonest.
+
+**Stage 185B (IPC-DOMAIN-DECOMPOSITION-PREP) — audited, HARD-STOPPED, no code change.**
+The follow-on IPC-domain decomposition was attempted and stopped per its own hard-stop
+rule (real IPC decomposition must not require scheduler-wide decomposition first).
+Two findings:
+
+- *The two-phase `ipc_state_lock` structure the previous note asked for ALREADY
+  EXISTS.* `ipc_reply` / recv-delivery / `create_reply_cap_for_caller` /
+  `take_transfer_envelope` already own their IPC-local state under `ipc_state_lock`
+  (rank 3) and perform cap materialization (rank 4), user-memory copy, and scheduler
+  wake **only after dropping `ipc_state_lock`** ("Phase 3/5 outside all locks"). The
+  reply-cap one-shot / `StaleCapability` / `WrongObject` / `MissingRight` /
+  `CapabilityFull` invariants are already enforced and heavily tested. So there is no
+  un-converted two-phase work to add — the discipline is in place.
+- *Genuine IPC decomposition — removing the global lock from IPC ops — is BLOCKED on
+  scheduler decomposition.* `ipc_send/recv/call/reply` intrinsically perform scheduler
+  **block/wake** as integral steps (`apply_scheduler_wake_plan`, `block_current`,
+  `enqueue_woken_task` — ~37 scheduler-mutation call sites across the IPC files). The
+  IPC-local sub-operations the task named as "safe" candidates (reply-cap table
+  lookup/mark-consumed, transfer-envelope validate/take) are **not standalone
+  syscalls** — they occur only inside those enclosing IPC ops, which need the
+  scheduler wake/block. Running any IPC syscall without the global lock therefore
+  requires the scheduler block/wake state mutation to be lock-free-safe first — the
+  explicit hard-stop condition. No `IPC_SPLIT_*` markers were introduced (they would
+  be dishonest for paths still under the global lock).
+
+**Corrected dependency ordering:** the 185BC note above proposed "IPC decomposition
+first, then reply-cap/cap-transfer". The 185B audit shows the real prerequisite is one
+level deeper: **scheduler-domain decomposition** (make `TaskStatus` block/wake +
+runqueue enqueue/dequeue safe outside the global lock) must come first, *then* IPC
+send/recv/call/reply can leave the global lock, *then* reply-cap/cap-transfer split
+becomes possible. Recommended next stage: `Stage 185S SCHEDULER-BLOCK-WAKE-DECOMP` —
+move the block/wake state mutation onto `scheduler_state` (rank 1) / `task_state_lock`
+(rank 2) with a documented two-phase (compute wake plan under lock, apply after
+release), reusing the existing `compute_wake_plan_for_tid` / `apply_scheduler_wake_plan`
+split that the D2/D6 dispatch relocation already established.
+
+**Stage 185S (SCHEDULER-BLOCK-WAKE-DECOMP) — audited, HARD-STOPPED, no code change.**
+The audit found the premise WRONG in the codebase's favour: **the scheduler block/wake
+mechanics are ALREADY subsystem-lock-decomposed and two-phase.** `apply_scheduler_
+wake_plan` is called at ~10 production sites, every one documented and structured to run
+the wake *after* dropping `ipc_state_lock` / all IPC/cap/VM/memory domain locks
+("Phase 3/4/5 outside all locks"); the wake itself (`wake_tid_to_runnable`) transitions
+`TaskStatus` via `with_tcbs_mut` (`task_state_lock`, rank 2) and enqueues via
+`enqueue_woken_task` (`scheduler_state`, rank 1), sequentially and non-nested, holding
+neither lock across a user-memory copy or a cap materialization; `block_current` mutates
+only scheduler-internal state under the scheduler lock. So the "move block/wake onto
+scheduler/task locks with a two-phase structure" work this stage asked for is **already
+implemented** — there is nothing un-converted to move.
+
+The only remaining coupling of block/wake to the global lock is that its ~10 callers are
+IPC syscalls (`ipc_send/recv/call/reply`) that hold the global lock. Removing the global
+lock from the wake therefore means removing it from those IPC ops and relocating the
+sender/receiver wake out of the global lock (the D6-style *stash then apply after the
+global lock drops* pattern) **without perturbing the sender-wake ORDERING oracle**
+(`IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, "sender-wake stays before writeback and after the
+receiver commits metadata"). That is IPC endpoint / sender-wake decomposition — the
+explicit hard-stop condition for this stage. No `SCHED_SPLIT_*` markers were introduced
+(they would be dishonest for paths still under the global lock).
+
+**Corrected dependency picture (final).** The chain is not a clean stack (cap ← IPC ←
+scheduler-block/wake). Block/wake is already decomposed; IPC and its sender-wake are
+mutually entangled with the global lock. The real next increment is a **vertical
+co-decomposition of a single IPC operation**: pick one op (e.g. `ipc_reply`), move it out
+of the global lock end-to-end using the proven D6 stash relocation for its sender-wake,
+and validate against the full sender-wake QEMU oracle (x86_64 `smp2/smp4-sender-wake`)
+before touching any other IPC op. Recommended next stage:
+`Stage 185V IPC-REPLY-VERTICAL-DECOMP` (one op, stash-relocated wake, oracle-gated) —
+a larger, riskier, single-operation slice, not another horizontal layer.
+
+**Stage 185V (IPC-REPLY-VERTICAL-DECOMP) — audited, HARD-STOPPED, no code change.**
+The `ipc_reply` vertical slice was attempted and stopped: it cannot be moved out of the
+global lock in one pass without broad endpoint/waiter + capability decomposition (the
+hard-stop condition). Findings:
+
+- *`ipc_reply` is already impeccably phased.* Phase 1 snapshots the waiter under
+  `ipc_state_lock` (released immediately), Phase 3 (`complete_blocked_recv_for_waiter`)
+  does the user copy "outside all locks", Phase 4 clears the waiter under
+  `ipc_state_lock`, Phase 5 wakes via `apply_scheduler_wake_plan` outside all locks; the
+  reply cap is consumed exactly once (`ipc.reply_caps[slot] = None`), and `ipc_state_lock`
+  is never held across copy / cap materialization / wake. There is no phasing defect to
+  fix — the two-phase discipline the stage asked for already exists.
+- *The only coupling to the global lock is that `ipc_reply` accesses state through
+  `&mut KernelState` (from `with_cpu`).* It touches four subsystems via `self.*`: ipc-state
+  (7 ops), capability/cnode (6 ops: `fast_revoke_reply_cap_in_cnode`, `current_task_cnode`,
+  `resolve_send_cap_task_local`), task-state (`with_tcbs`), scheduler
+  (`apply_scheduler_wake_plan`).
+- *The infrastructure to run those subsystems lock-free does not exist.* Split-mut helpers
+  exist **only for the scheduler** (`with_scheduler_split_mut`); there is no
+  `with_ipc_state_split_mut` / `with_task_state_split_mut` / `with_cnode_split_mut` /
+  `with_capability_split_mut` (0 in tree). And `complete_blocked_recv_for_waiter` — the
+  user-copy/waiter-completion `ipc_reply` uses — takes `&mut KernelState` and is **shared
+  by 7 call sites** across send/recv/call/reply/fault delivery. Making it global-lock-free
+  converts it for every IPC op = broad endpoint/waiter decomposition. The split-dispatch
+  path services only narrow single-subsystem ops ("never blocks, yields, schedules, or
+  copies user memory"), so `ipc_reply` (multi-subsystem, user-copy, wake) cannot ride it.
+  Granting `ipc_reply` a raw `&mut KernelState` without the global lock is forbidden
+  (reintroduces the boot-only escape into live runtime, guarded by
+  `stage185_boot_only_global_borrow_confined`) and unsound on SMP (races wake-only APs;
+  the global lock is what serializes them). No `IPC_REPLY_SPLIT_*` markers were introduced.
+
+**Series conclusion (185BC → 185B → 185S → 185V, four honest stops).** Global-lock
+retirement cannot proceed by peeling one operation or one subsystem at a time: the IPC ops
+share wide `&mut KernelState` machinery (delivery/waiter/cnode/scheduler), and the only
+per-subsystem split-mut infrastructure that exists is the scheduler's. Retirement requires
+**building the per-subsystem split-mut layer (ipc-state, task-state, cnode/capability)
+first, as pure infrastructure**, before any IPC op can leave the global lock — a large,
+multi-stage effort. Moreover, on the accepted single-dispatcher model the global lock is
+**uncontended** (one dispatcher), so retirement yields **no functional benefit until the
+deferred multi-dispatcher work lands**. Honest recommendation: **defer global-lock
+retirement** and either (a) prioritize the multi-dispatcher enablement that would make it
+beneficial and give the sender-wake oracle a real concurrency surface to prove against, or
+(b) if retirement is still desired, run it as an explicit multi-stage
+`Stage 186 SPLIT-MUT-INFRA` track that builds `with_ipc_state_split_mut` /
+`with_task_state_split_mut` / cnode split-mut helpers + guards first, then revisits
+`ipc_reply`. Either way it is not a single-pass vertical slice.
+
+**Stage 186A (SPLIT-MUT-INFRA) — DONE (infrastructure only, no live conversion).**
+The four honest 185-series stops recommended building the per-subsystem split-mut
+layer before any IPC op can leave the global lock. On audit, that layer **already
+existed** for ranks 1 (scheduler), 2 (task/TCB), 3 (IPC), 5 (VM), 6 (memory) from
+Stage 108/115 — the only gap was the **rank-4 capability domain**. Stage 186A closes
+it: `capability_split_mut_ptrs_from_raw` (projector) + `with_capability_state_split_mut`
+(`SharedKernel` seam), exposing ONLY `&mut CapabilitySubsystem` (CNode spaces,
+`process_cnodes`, `delegated_capability_links`), `M2_SEAM_HELPER_ONLY`, **no live
+caller**. The per-domain seam set (ranks 1–6) is now complete — see
+`doc/KERNEL_LOCKING.md §0.1` for the table. **No live syscall/op was migrated**; the
+`with`/`with_cpu` legacy boundary remains authoritative for every runtime path;
+full global-lock retirement remains deferred; APs remain online but wake-only.
+Guarded by `stage186a_capability_split_mut_infra` (seam exists, is narrow, never
+exposes `&mut KernelState`, is not wired live, rank-4 two-phase contract documented).
+
+Roadmap (updated): **186A split-mut infra (done)** → 186B `ipc_reply` vertical
+conversion onto the seams (stash-relocated wake, sender-wake-oracle-gated on real
+QEMU) → 186C `ipc_send`/`recv`/`call` → 186D reply-cap/cap-transfer → 186E
+VM/COW/fork → 186F fault-report delivery → 187 AP user scheduling / multi-dispatcher
+→ 188 final live-runtime global-lock removal. Note the earlier honest finding stands:
+on the single-dispatcher model the global lock is uncontended, so 186B+ yield no
+functional benefit until 187 — sequencing 187 earlier is a legitimate alternative.
+
+**Stage 186B (IPC-REPLY-VERTICAL-CONVERSION) — audited, HARD-STOPPED, no code change.**
+With the 186A seams in hand, `ipc_reply` conversion was attempted and stopped: the
+split-mut seams are necessary but **not sufficient**, because `ipc_reply` sits on top
+of two broad shared subsystems that Stage 186B may not convert. `ipc_reply`'s IPC
+reply-cap phase (`with_ipc_split_mut`) and the cnode fast-revoke
+(`with_capability_state_split_mut`) ARE seam-expressible — but its **delivery** to the
+blocked caller (`complete_blocked_recv_for_waiter`) requires:
+
+- **User-memory copy** (`copy_to_user` ×2 for payload+meta; and `copy_from_user` to
+  marshal the reply message). `copy_to_user` resolves the target ASID's page tables and
+  calls `validate_user_access_for_asid(.., write=true)`, whose write path triggers
+  **COW fault-in** (allocates a frame via the memory allocator, rewrites the PTE). There
+  is no seam-based user-copy helper; building one that soundly handles the write-fault/COW
+  case is VM/COW-domain work — **explicitly out of Stage 186B scope** ("do not convert
+  VM/fork/COW/futex").
+- **Cap materialization** (`materialize_received_message_cap_routed`, `ipc_recv_core.rs`),
+  the shared D1/D4/D5 cap-transfer engine with **13 call sites** across all IPC delivery
+  paths. Converting it is broad cap-transfer decomposition — **explicitly out of Stage
+  186B scope** ("do not convert broad cap-transfer paths") — and being shared, it cannot
+  be converted "for `ipc_reply` only".
+
+Even the narrow "enqueue-to-endpoint, no blocked-recv-v2 waiter" sub-case still needs
+`copy_from_user` to marshal the reply payload from the replier's address space, so no
+seam-only sub-case exists. No `IPC_REPLY_SPLIT_*` markers were introduced (they would be
+dishonest for a path still on the legacy boundary).
+
+**Corrected roadmap ordering.** `ipc_reply` (186B) sits ABOVE the VM user-copy path and
+the cap-transfer engine, so those are **prerequisites**, not successors. The roadmap
+`186B → 186D(cap-transfer) → 186E(VM)` is inverted for this slice. Do **186E-prereq**
+(a VM/memory-seam user-memory copy helper — `copy_to_user`/`copy_from_user` via
+`with_vm_user_spaces_split_mut` + `with_memory_split_mut`, COW-fault-safe) and
+**186D-prereq** (seam-based `materialize_received_message_cap_routed` on the capability
++ IPC seams) **first**; only then can `ipc_reply` be converted end-to-end. Standing
+caveat unchanged: none of this yields functional benefit until 187 (multi-dispatcher),
+so prioritizing 187 remains the honest alternative.
+
+**Stage 186E-prereq (VM-USER-COPY-SEAM) — DONE (infrastructure only, no live conversion).**
+The 186B stop identified two blockers for `ipc_reply`: (1) user-memory copy and (2) the
+shared cap-transfer engine. This stage removes the **first** blocker as reusable
+infrastructure. On audit, the legacy user-copy path
+(`copy_to_user`/`copy_from_user`/`validate_user_access_for_asid`) turned out to touch
+**only** the rank-5 VM (`with_user_spaces`) and rank-6 memory (`with_memory_state` /
+direct-phys) domains, and to perform **no COW fault-in** (`validate_user_access_for_asid`
+returns `UserMemoryFault` on a non-writable/unmapped target — it never faults a page in;
+the 186B "COW-during-copy" fear was incorrect). So the seam is cleanly buildable. Added,
+in `boot/user_memory_state.rs` on `SharedKernel`:
+
+- `validate_user_access_for_asid_split` (rank-5 VM seam),
+- `copy_from_user_split`, `copy_to_user_split` (rank-5 VM validate + rank-6 memory / direct
+  phys byte access).
+
+They never form a broad `&mut KernelState` and never take the IPC (rank 3), capability
+(rank 4), task (rank 2), or scheduler (rank 1) locks, and they preserve byte-identical
+error semantics (`UserMemoryFault`/`InvalidAsid` never hidden). `M2_SEAM_HELPER_ONLY` — NOT
+wired into any live IPC/syscall path. **It does not by itself retire the global lock from
+IPC.** Guarded by `stage186e_vm_user_copy_seam` (seam callable + rejects unknown-ASID /
+unmapped page with real faults; uses only VM/memory seams; no `&mut KernelState`; not wired
+live). The added helpers are dead/uncalled in the release build → zero behavior change
+(riscv64 core smoke green: `RISCV_PM_STARTUP_CAPS_OK`, `CROSS_ARCH_LIVE_DONE result=ok`).
+
+**Remaining blocker for `ipc_reply` (186B):** the shared cap-transfer materialization engine
+`materialize_received_message_cap_routed` (13 call sites) still has no seam form —
+`Stage 186D-prereq CAP-TRANSFER-ENGINE-SEAM` is next. Only after **both** the VM user-copy
+seam (this stage) **and** the cap-transfer seam exist can `ipc_reply` be converted
+end-to-end. Full global-lock retirement remains deferred; APs remain online but wake-only;
+and the standing caveat holds — no functional benefit until 187 (multi-dispatcher).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

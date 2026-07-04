@@ -473,3 +473,185 @@ impl KernelState {
         Ok(())
     }
 }
+
+// ── Stage 186E-prereq: VM/user-copy split-mut seam ─────────────────────────────
+//
+// Seam-based mirrors of `KernelState::copy_to_user` / `copy_from_user` /
+// `validate_user_access_for_asid` that operate on `&SharedKernel` through the
+// rank-5 VM seam (`with_vm_user_spaces_split_mut`) and the rank-6 memory seam
+// (`with_memory_split_mut`, hosted) / direct physical map (bare-metal) ONLY.
+//
+// They NEVER form a broad `&mut KernelState`, and NEVER take the IPC (rank 3),
+// capability (rank 4), task (rank 2), or scheduler (rank 1) locks — so a future
+// IPC vertical conversion can copy user memory WITHOUT holding any of those. Like
+// the legacy copy path they perform NO COW fault-in: a non-writable / unmapped
+// target returns `UserMemoryFault` (byte-identical error semantics — the legacy
+// `validate_user_access_for_asid` also only validates flags and never faults in).
+//
+// M2_SEAM_HELPER_ONLY: infrastructure only — NOT wired into any live IPC/syscall
+// path in Stage 186E-prereq. Cap-transfer materialization
+// (`materialize_received_message_cap_routed`) remains a SEPARATE blocker for the
+// `ipc_reply` conversion (see doc/KERNEL_UNLOCKING.md).
+impl crate::runtime::SharedKernel {
+    /// Rank-5 VM-seam mirror of `KernelState::validate_user_access_for_asid`.
+    /// Read-only over `user_spaces`; returns the resolved physical address or a
+    /// real `UserMemoryFault` / `InvalidAsid` — never hides a fault.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn validate_user_access_for_asid_split(
+        &self,
+        asid: Asid,
+        va: usize,
+        need_write: bool,
+    ) -> Result<u64, KernelError> {
+        let page_base = va & !(crate::kernel::vm::PAGE_SIZE - 1usize);
+        let page_off = (va - page_base) as u64;
+
+        #[cfg(any(
+            feature = "hosted-dev",
+            not(any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            ))
+        ))]
+        {
+            self.with_vm_user_spaces_split_mut(|spaces| {
+                let aspace = spaces
+                    .get(asid)
+                    .ok_or(KernelError::Vm(VmError::InvalidAsid))?;
+                let mapping = aspace
+                    .resolve(VirtAddr(page_base as u64))
+                    .ok_or(KernelError::UserMemoryFault)?;
+                if !mapping.flags.user
+                    || !mapping.flags.read
+                    || (need_write && !mapping.flags.write)
+                {
+                    return Err(KernelError::UserMemoryFault);
+                }
+                mapping
+                    .phys
+                    .0
+                    .checked_add(page_off)
+                    .ok_or(KernelError::UserMemoryFault)
+            })
+        }
+        #[cfg(all(
+            not(feature = "hosted-dev"),
+            any(
+                target_arch = "x86_64",
+                target_arch = "aarch64",
+                target_arch = "riscv64"
+            )
+        ))]
+        {
+            // Existence check under the VM seam; the hardware PTE is the phys +
+            // permission authority (same as the legacy path).
+            let user_space_exists =
+                self.with_vm_user_spaces_split_mut(|spaces| spaces.get(asid).is_some());
+            if !user_space_exists {
+                return Err(KernelError::Vm(VmError::InvalidAsid));
+            }
+            let pte = crate::arch::selected_isa::page_table::resolve_page(
+                asid,
+                VirtAddr(page_base as u64),
+            )
+            .ok_or(KernelError::UserMemoryFault)?;
+            if !KernelState::pte_allows_user_access(pte, need_write) {
+                return Err(KernelError::UserMemoryFault);
+            }
+            pte.addr()
+                .checked_add(page_off)
+                .ok_or(KernelError::UserMemoryFault)
+        }
+    }
+
+    #[cfg(feature = "hosted-dev")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn read_user_byte_split(&self, asid: Asid, va: VirtAddr) -> Result<u8, KernelError> {
+        self.with_memory_split_mut(|memory| {
+            memory
+                .user_memory
+                .get(&(asid.0, va.0))
+                .copied()
+                .ok_or(KernelError::UserMemoryFault)
+        })
+    }
+
+    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn read_user_byte_split(&self, _asid: Asid, va: VirtAddr) -> Result<u8, KernelError> {
+        let ptr = KernelState::phys_to_direct_map_ptr(va.0).ok_or(KernelError::UserMemoryFault)?;
+        // SAFETY: `phys_to_direct_map_ptr` bounds-checks against the direct map;
+        // identical to the legacy `read_user_byte` bare-metal path.
+        Ok(unsafe { core::ptr::read_volatile(ptr) })
+    }
+
+    #[cfg(feature = "hosted-dev")]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_user_byte_split(
+        &self,
+        asid: Asid,
+        va: VirtAddr,
+        value: u8,
+    ) -> Result<(), KernelError> {
+        self.with_memory_split_mut(|memory| {
+            memory.user_memory.insert((asid.0, va.0), value);
+        });
+        Ok(())
+    }
+
+    #[cfg(not(feature = "hosted-dev"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn write_user_byte_split(
+        &self,
+        _asid: Asid,
+        va: VirtAddr,
+        value: u8,
+    ) -> Result<(), KernelError> {
+        let ptr = KernelState::phys_to_direct_map_ptr(va.0).ok_or(KernelError::UserMemoryFault)?;
+        // SAFETY: identical to the legacy `write_user_byte` bare-metal path.
+        unsafe {
+            core::ptr::write_volatile(ptr, value);
+        }
+        Ok(())
+    }
+
+    /// Rank-5/6-seam mirror of `KernelState::copy_from_user`. No IPC/cap/scheduler
+    /// lock is taken; error semantics are identical to the legacy path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn copy_from_user_split(
+        &self,
+        asid: Asid,
+        va: VirtAddr,
+        len: usize,
+    ) -> Result<[u8; Message::MAX_PAYLOAD], KernelError> {
+        if len > Message::MAX_PAYLOAD {
+            return Err(KernelError::UserMemoryFault);
+        }
+        let mut out = [0u8; Message::MAX_PAYLOAD];
+        for (i, slot) in out.iter_mut().take(len).enumerate() {
+            let addr = va.0 as usize + i;
+            let phys = self.validate_user_access_for_asid_split(asid, addr, false)?;
+            *slot = self.read_user_byte_split(asid, VirtAddr(phys))?;
+        }
+        Ok(out)
+    }
+
+    /// Rank-5/6-seam mirror of `KernelState::copy_to_user`. No IPC/cap/scheduler
+    /// lock is taken; performs NO COW fault-in (non-writable target ⇒
+    /// `UserMemoryFault`, identical to the legacy path).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn copy_to_user_split(
+        &self,
+        asid: Asid,
+        va: VirtAddr,
+        bytes: &[u8],
+    ) -> Result<(), KernelError> {
+        for (i, &byte) in bytes.iter().enumerate() {
+            let addr = va.0 as usize + i;
+            let phys = self.validate_user_access_for_asid_split(asid, addr, true)?;
+            self.write_user_byte_split(asid, VirtAddr(phys), byte)?;
+        }
+        Ok(())
+    }
+}

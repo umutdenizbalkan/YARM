@@ -45948,6 +45948,396 @@ mod stage184_riscv_trap_return_provenance {
 }
 
 // ===========================================================================
+// Stage 185 (GLOBAL-LOCK-RETIRE) — boot-only global-state escape is confined.
+//
+// The `SharedKernel` global `SpinLock<KernelState>` (taken via `with`/`with_cpu`)
+// remains the authoritative LIVE-RUNTIME serialization boundary for the accepted
+// single-dispatcher model (x86_64 -smp1 and AArch64/RISC-V
+// `in_lock_single_dispatcher`); retiring it from live runtime is a per-subsystem
+// rewrite that `doc/KERNEL_LOCKING.md` §"Current status" explicitly does not
+// claim and that Stage 185 does NOT perform (it is not a rewrite stage).
+//
+// What Stage 185 *does* pin: the ONE place a raw `&mut KernelState` escapes the
+// global lock outside a `with`/`with_cpu` closure —
+// `SharedKernel::borrow_kernel_for_boot()` — is BOOT-ONLY. It is used solely
+// during bootstrap ELF load on the boot CPU (with the timer ISR quiesced and the
+// `BootRawKernelBorrowGuard` aliasing window active, see stage30 tests) and must
+// NEVER appear on a live syscall / IPC / scheduler / capability / VM / fault
+// dispatch path. These guards fail if that boot-only escape leaks into live
+// runtime, or if its crate-private `unsafe` definition is loosened.
+// ===========================================================================
+#[cfg(test)]
+mod stage185_boot_only_global_borrow_confined {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    // Boot ELF-load sites — the ONLY permitted callers.
+    const X86_BOOT_SRC: &str = include_str!("../../arch/x86_64/boot.rs");
+    const AARCH64_BOOT_SRC: &str = include_str!("../../arch/aarch64/boot.rs");
+
+    // Live-runtime dispatch surface, one representative file per required domain
+    // (syscall dispatch, IPC, scheduler, capability/cnode, VM, fault, thread).
+    // None may call the boot-only raw `&mut KernelState` escape.
+    const LIVE_RUNTIME_FILES: &[(&str, &str)] = &[
+        ("syscall.rs", include_str!("../syscall.rs")),
+        ("syscall_split.rs", include_str!("../syscall_split.rs")),
+        ("syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ("syscall/vm.rs", include_str!("../syscall/vm.rs")),
+        ("syscall/process.rs", include_str!("../syscall/process.rs")),
+        ("ipc_state.rs", include_str!("ipc_state.rs")),
+        ("scheduler_state.rs", include_str!("scheduler_state.rs")),
+        ("capability_state.rs", include_str!("capability_state.rs")),
+        ("cnode_state.rs", include_str!("cnode_state.rs")),
+        ("exec_state.rs", include_str!("exec_state.rs")),
+        ("memory_state.rs", include_str!("memory_state.rs")),
+        ("fault_state.rs", include_str!("fault_state.rs")),
+        (
+            "fault_endpoint_state.rs",
+            include_str!("fault_endpoint_state.rs"),
+        ),
+        ("thread_state.rs", include_str!("thread_state.rs")),
+    ];
+
+    const BOOT_ESCAPE_CALL: &str = ".borrow_kernel_for_boot()";
+
+    // The raw-borrow escape hatch stays crate-private and `unsafe` so it can only
+    // be reached from inside the kernel crate and never without an explicit
+    // `unsafe` block. Loosening it to `pub` or dropping `unsafe` is a regression.
+    #[test]
+    fn stage185_boot_escape_is_crate_private_unsafe() {
+        assert!(
+            RUNTIME_SRC.contains("pub(crate) unsafe fn borrow_kernel_for_boot"),
+            "borrow_kernel_for_boot must stay `pub(crate) unsafe` (boot-only escape hatch)"
+        );
+        assert!(
+            !RUNTIME_SRC.contains("pub unsafe fn borrow_kernel_for_boot"),
+            "borrow_kernel_for_boot must NOT be exported `pub` — it is a boot-only escape"
+        );
+    }
+
+    // The boot-only escape must be reachable ONLY from the two arch boot
+    // ELF-load sites (non-vacuous: prove it IS called there).
+    #[test]
+    fn stage185_boot_escape_present_only_in_boot() {
+        assert!(
+            X86_BOOT_SRC.contains(BOOT_ESCAPE_CALL),
+            "x86_64 boot must call borrow_kernel_for_boot() (bootstrap ELF load)"
+        );
+        assert!(
+            AARCH64_BOOT_SRC.contains(BOOT_ESCAPE_CALL),
+            "aarch64 boot must call borrow_kernel_for_boot() (bootstrap ELF load)"
+        );
+    }
+
+    // No live-runtime dispatch path may call the boot-only raw `&mut` escape:
+    // live paths must go through the global lock (`with`/`with_cpu`) or a
+    // documented subsystem split helper, never the bootstrap alias.
+    #[test]
+    fn stage185_no_live_runtime_path_uses_boot_escape() {
+        for (name, src) in LIVE_RUNTIME_FILES {
+            assert!(
+                !src.contains(BOOT_ESCAPE_CALL),
+                "live-runtime file `{name}` must NOT call {BOOT_ESCAPE_CALL} — the raw \
+                 &mut KernelState borrow is boot-only; live paths use the global lock or a \
+                 documented subsystem split helper"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Stage 186A (SPLIT-MUT-INFRA) — capability (rank 4) split-mut seam completes
+// the per-domain seam set.
+//
+// The per-subsystem split-mut seam infrastructure (raw field projectors +
+// `with_*_split_mut` wrappers exposing ONLY `&mut <Subsystem>`, never a broad
+// `&mut KernelState`) already existed for ranks 1 (scheduler), 2 (task/TCB),
+// 3 (IPC), 5 (VM), 6 (memory) from Stage 108/115. Stage 186A adds the missing
+// rank-4 capability seam (`capability_split_mut_ptrs_from_raw` +
+// `with_capability_state_split_mut`) as M2_SEAM_HELPER_ONLY infrastructure — NO
+// live capability/cnode runtime path is migrated onto it in this stage. These
+// guards pin: the seam exists and is narrow, it is not wired live, it never
+// exposes `&mut KernelState`, and the rank-4 (> IPC rank 3) ordering is
+// documented (two-phase: cap materialization only after `ipc_state_lock` drops).
+// ===========================================================================
+#[cfg(test)]
+mod stage186a_capability_split_mut_infra {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+
+    // Functional: the seam is callable, holds capability_state_lock, and exposes
+    // exactly `&mut CapabilitySubsystem` (the closure receives it). This also
+    // keeps the `#[cfg_attr(not(test), allow(dead_code))]` wrapper live under test.
+    #[test]
+    fn stage186a_capability_seam_is_callable_and_narrow() {
+        let shared = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        // The closure argument type is `&mut CapabilitySubsystem`; returning a
+        // value proves the seam locks + hands out the subsystem and releases.
+        let process_cnode_slots = shared.with_capability_state_split_mut(
+            |cap: &mut crate::kernel::boot::CapabilitySubsystem| {
+                // Touch the subsystem to prove real access (count is stable/derived
+                // from the subsystem, not from a broad KernelState borrow).
+                cap.process_cnodes.iter().flatten().count()
+            },
+        );
+        // A fresh kernel has a bounded, well-defined number of process cnodes.
+        assert!(
+            process_cnode_slots <= crate::kernel::boot::MAX_TASKS,
+            "capability seam must expose the real CapabilitySubsystem"
+        );
+    }
+
+    // The rank-4 seam exists in both layers, follows the projector `(lock, data)`
+    // pattern, and returns a *narrow* `*mut CapabilitySubsystem` — never a
+    // `*mut KernelState`.
+    #[test]
+    fn stage186a_capability_projector_and_wrapper_exist_and_are_narrow() {
+        assert!(
+            ORCH_SRC.contains("fn capability_split_mut_ptrs_from_raw"),
+            "orchestrator_state.rs must define the rank-4 capability projector"
+        );
+        assert!(
+            ORCH_SRC.contains("*mut CapabilitySubsystem"),
+            "capability projector must return a narrow *mut CapabilitySubsystem"
+        );
+        assert!(
+            RUNTIME_SRC.contains("fn with_capability_state_split_mut"),
+            "runtime.rs must define the with_capability_state_split_mut seam"
+        );
+        assert!(
+            RUNTIME_SRC
+                .contains("f: impl FnOnce(&mut crate::kernel::boot::CapabilitySubsystem) -> R"),
+            "capability seam must expose ONLY &mut CapabilitySubsystem, never &mut KernelState"
+        );
+    }
+
+    // Infrastructure only: the capability seam is marked helper-only and is NOT
+    // wired into any live runtime path in Stage 186A.
+    #[test]
+    fn stage186a_capability_seam_is_helper_only_and_not_wired_live() {
+        // Helper-only attribute present on the seam.
+        assert!(
+            RUNTIME_SRC.contains("M2_SEAM_HELPER_ONLY"),
+            "the split-mut seams (incl. capability) must remain M2_SEAM_HELPER_ONLY"
+        );
+        // Not called from any live IPC / capability / dispatch runtime file.
+        for (name, src) in [
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("capability_state.rs", include_str!("capability_state.rs")),
+            ("cnode_state.rs", include_str!("cnode_state.rs")),
+            ("transfer_state.rs", include_str!("transfer_state.rs")),
+            ("exec_state.rs", include_str!("exec_state.rs")),
+            ("../syscall_split.rs", include_str!("../syscall_split.rs")),
+            ("../syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ] {
+            assert!(
+                !src.contains("with_capability_state_split_mut("),
+                "Stage 186A is infrastructure-only: `{name}` must NOT call \
+                 with_capability_state_split_mut (no live migration in this stage)"
+            );
+        }
+    }
+
+    // No split-mut wrapper may expose a broad `&mut KernelState` — they must each
+    // hand out only their own subsystem type. (The legacy `with` / `with_cpu`
+    // global-lock accessors DO take `FnOnce(&mut KernelState)` by design — Stage
+    // 185A documents they remain — so this guard checks each split-mut seam's own
+    // signature in isolation, not the whole file.)
+    #[test]
+    fn stage186a_no_split_mut_seam_exposes_broad_kernel_state() {
+        for (seam, marker) in [
+            ("with_scheduler_split_mut", "fn with_scheduler_split_mut"),
+            ("with_task_tcbs_split_mut", "fn with_task_tcbs_split_mut"),
+            ("with_ipc_split_mut", "fn with_ipc_split_mut"),
+            (
+                "with_capability_state_split_mut",
+                "fn with_capability_state_split_mut",
+            ),
+            (
+                "with_vm_user_spaces_split_mut",
+                "fn with_vm_user_spaces_split_mut",
+            ),
+            ("with_memory_split_mut", "fn with_memory_split_mut"),
+        ] {
+            let start = match RUNTIME_SRC.find(marker) {
+                Some(s) => s,
+                None => panic!("split-mut seam {seam} must exist in runtime.rs"),
+            };
+            // Signature = from `fn NAME` up to the opening brace of the body.
+            let sig_end = RUNTIME_SRC[start..]
+                .find('{')
+                .expect("seam signature must have a body");
+            let signature = &RUNTIME_SRC[start..start + sig_end];
+            assert!(
+                !signature.contains("KernelState"),
+                "split-mut seam {seam} must NOT expose &mut KernelState in its signature"
+            );
+        }
+    }
+
+    // Rank order is documented: capability is rank 4, ABOVE IPC (rank 3), so cap
+    // materialization runs only after ipc_state_lock is dropped (two-phase).
+    #[test]
+    fn stage186a_capability_rank_order_documented() {
+        // The seam doc pins the rank-4 / after-ipc-drop contract.
+        assert!(
+            RUNTIME_SRC.contains("no cap materialization under ipc_state_lock"),
+            "capability seam doc must state the rank-4 two-phase contract \
+             (no cap materialization under ipc_state_lock)"
+        );
+    }
+}
+
+// ===========================================================================
+// Stage 186E-prereq (VM-USER-COPY-SEAM) — seam-based user-memory copy helpers.
+//
+// copy_to_user_split / copy_from_user_split / validate_user_access_for_asid_split
+// mirror the legacy KernelState copy path but run over the rank-5 VM seam
+// (with_vm_user_spaces_split_mut) + rank-6 memory seam (with_memory_split_mut) /
+// direct-phys ONLY — never a broad &mut KernelState and never the IPC (rank 3),
+// capability (rank 4), task (rank 2), or scheduler (rank 1) locks. Helper-only:
+// NOT wired into any live IPC/syscall path. These guards pin: the seam exists and
+// is narrow, does not touch the forbidden locks, preserves real error semantics
+// (UserMemoryFault / InvalidAsid never hidden), and is not wired live.
+// ===========================================================================
+#[cfg(test)]
+mod stage186e_vm_user_copy_seam {
+    use crate::kernel::vm::{Asid, VirtAddr};
+
+    const UMS_SRC: &str = include_str!("user_memory_state.rs");
+
+    fn seam_impl_block() -> &'static str {
+        // The `impl SharedKernel { ... }` block at the end of user_memory_state.rs.
+        UMS_SRC
+            .split("impl crate::runtime::SharedKernel {")
+            .nth(1)
+            .expect("Stage 186E seam impl block must exist in user_memory_state.rs")
+    }
+
+    // Functional: on an unknown ASID the seam runs end-to-end (through the VM seam)
+    // and returns a REAL InvalidAsid — proving it is callable, uses the VM seam,
+    // and does not hide the fault. Also keeps the helper-only fns live under test.
+    #[test]
+    fn stage186e_copy_seam_rejects_unknown_asid() {
+        let shared = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let read = shared.copy_from_user_split(Asid(9999), VirtAddr(0x1000), 4);
+        assert!(
+            matches!(
+                read,
+                Err(crate::kernel::boot::KernelError::Vm(_))
+                    | Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "copy_from_user_split on an unknown ASID must return a real fault, not success: {read:?}"
+        );
+        let write = shared.copy_to_user_split(Asid(9999), VirtAddr(0x1000), &[1u8, 2, 3, 4]);
+        assert!(
+            matches!(
+                write,
+                Err(crate::kernel::boot::KernelError::Vm(_))
+                    | Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "copy_to_user_split on an unknown ASID must return a real fault, not success: {write:?}"
+        );
+    }
+
+    // Functional: a VALID (created) ASID with no mapping at the target VA yields a
+    // real UserMemoryFault from the seam validate — proving the seam walks the
+    // real user_spaces via the VM seam and does not hide an unmapped page.
+    #[test]
+    fn stage186e_copy_seam_rejects_unmapped_page_in_valid_asid() {
+        let mut boxed = crate::kernel::boot::Bootstrap::init().expect("init");
+        let (asid, _cap) = boxed
+            .create_user_address_space()
+            .expect("create user aspace");
+        let shared = crate::runtime::SharedKernel::new(boxed);
+        let r = shared.copy_from_user_split(asid, VirtAddr(0xDEAD_0000), 4);
+        assert!(
+            matches!(r, Err(crate::kernel::boot::KernelError::UserMemoryFault)),
+            "seam copy over a valid ASID but unmapped VA must be UserMemoryFault: {r:?}"
+        );
+    }
+
+    // The seam uses ONLY the VM (rank 5) and memory (rank 6) seams — never the
+    // IPC / capability / task / scheduler locks, and never a broad &mut KernelState.
+    #[test]
+    fn stage186e_seam_uses_only_vm_and_memory_seams() {
+        let seam = seam_impl_block();
+        assert!(
+            seam.contains("with_vm_user_spaces_split_mut"),
+            "seam must validate via the rank-5 VM seam"
+        );
+        assert!(
+            seam.contains("with_memory_split_mut") || seam.contains("phys_to_direct_map_ptr"),
+            "seam byte access must use the rank-6 memory seam (hosted) or direct phys (bare-metal)"
+        );
+        for forbidden in [
+            "with_ipc_split_mut",
+            "with_ipc_state",
+            "with_capability_state_split_mut",
+            "with_capability_state",
+            "with_scheduler_split_mut",
+            "with_scheduler_state",
+            "with_tcbs",
+            "with_task_tcbs_split_mut",
+            "&mut KernelState",
+            "borrow_kernel_for_boot",
+            ".with(",
+            ".with_cpu(",
+        ] {
+            assert!(
+                !seam.contains(forbidden),
+                "Stage 186E user-copy seam must NOT use `{forbidden}` (no IPC/cap/task/scheduler \
+                 lock, no broad &mut KernelState, no global-lock accessor across user copy)"
+            );
+        }
+    }
+
+    // Seam functions preserve real error semantics (return UserMemoryFault) and are
+    // helper-only (dead_code-allowed under non-test) — no live wiring.
+    #[test]
+    fn stage186e_seam_preserves_errors_and_is_helper_only() {
+        let seam = seam_impl_block();
+        assert!(
+            seam.contains("Err(KernelError::UserMemoryFault)"),
+            "seam must return real UserMemoryFault errors, never hide them"
+        );
+        assert!(
+            seam.contains("#[cfg_attr(not(test), allow(dead_code))]"),
+            "seam helpers must be helper-only (dead_code-allowed under non-test)"
+        );
+    }
+
+    // Not wired into any live IPC/syscall path in this stage.
+    #[test]
+    fn stage186e_seam_not_wired_live() {
+        for (name, src) in [
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("../syscall.rs", include_str!("../syscall.rs")),
+            ("../syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+            (
+                "../syscall/ipc_recv_core.rs",
+                include_str!("../syscall/ipc_recv_core.rs"),
+            ),
+            ("../syscall_split.rs", include_str!("../syscall_split.rs")),
+        ] {
+            for helper in [
+                "copy_to_user_split(",
+                "copy_from_user_split(",
+                "validate_user_access_for_asid_split(",
+            ] {
+                assert!(
+                    !src.contains(helper),
+                    "Stage 186E is helper-only: `{name}` must NOT call `{helper}` (no live \
+                     ipc_reply/IPC conversion in this stage)"
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

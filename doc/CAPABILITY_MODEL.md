@@ -115,6 +115,17 @@ needs both IPC (rank 3) and capability (rank 4) state must acquire IPC
 first. The two-phase create pattern (§5) is the canonical way to respect
 this order.
 
+**Split-mut seam (Stage 186A, infrastructure only).** The capability domain
+(rank 4) now has a `SharedKernel` split-mut seam,
+`with_capability_state_split_mut`, exposing only `&mut CapabilitySubsystem`
+under `capability_state_lock` — completing the per-domain seam set (ranks 1–6,
+see `doc/KERNEL_LOCKING.md §0.1`). It is `M2_SEAM_HELPER_ONLY`: **no live
+capability/cnode path is migrated onto it yet.** When a future vertical slice
+does use it, the rank order above is what makes it safe — a caller holding no
+IPC (rank 3) lock invokes it *after* dropping `ipc_state_lock`, so cap
+materialization never runs under the IPC lock (§8). This seam does not change
+the current locking behaviour of any live path.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

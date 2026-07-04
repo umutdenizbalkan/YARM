@@ -236,6 +236,45 @@ TLB ACK on arches without real remote translation holders. When editing SMP/cros
 code or docs, preserve these caveats; do not describe APs as running user tasks or claim
 multi-dispatcher scheduling.
 
+**Stage 185 (GLOBAL-LOCK-RETIRE) status — DO NOT OVERCLAIM.** The global
+`SpinLock<KernelState>` (`SharedKernel::with` / `with_cpu`) is **still the
+authoritative live-runtime serialization** for the accepted single-dispatcher
+model — it was **not** retired from live runtime in Stage 185 (which is *not a
+rewrite stage*). The lock-free split path is a whitelist-only scaffold; every
+other live syscall/IPC/scheduler/capability/VM/fault path runs inside the global
+lock by design. Do not describe the global lock as "retired" or live paths as
+"lock-free". The sole boot-only raw `&mut KernelState` escape,
+`SharedKernel::borrow_kernel_for_boot`, is `pub(crate) unsafe`, used only during
+bootstrap ELF load on the boot CPU from `arch/{x86_64,aarch64}/boot.rs`, and must
+never appear on a live-runtime dispatch path (guarded by
+`stage185_boot_only_global_borrow_confined`). See `doc/KERNEL_LOCKING.md §0` for
+the classified inventory and the deferred per-subsystem retirement plan.
+
+**Stage 186A (SPLIT-MUT-INFRA) status — infrastructure only, DO NOT OVERCLAIM.**
+The per-domain split-mut seam set (`with_*_split_mut`, exposing only
+`&mut <Subsystem>` never `&mut KernelState`) is now complete for ranks 1–6 — Stage
+186A added the missing rank-4 `with_capability_state_split_mut` seam. These seams
+are `M2_SEAM_HELPER_ONLY`: **no live syscall/IPC/cap/VM path was migrated onto
+them** (only the pre-existing VmBrk-shrink and D6-dispatch callers use any seam).
+Do **not** describe Stage 186A as retiring the global lock, converting `ipc_reply`,
+or making any IPC/cap path "lock-free" — it did none of those. When adding a seam
+or a future migration, keep the rank order (`doc/CAPABILITY_MODEL.md §3`): a seam
+of rank N must not be entered while holding a lock of rank ≥ N, and cap
+materialization (rank 4) must never run under `ipc_state_lock` (rank 3). See
+`doc/KERNEL_LOCKING.md §0.1` for the seam table.
+
+**Stage 186E-prereq (VM-USER-COPY-SEAM) status — infrastructure only, DO NOT
+OVERCLAIM.** `SharedKernel` now has seam-based user-memory copy helpers
+(`copy_to_user_split` / `copy_from_user_split` / `validate_user_access_for_asid_split`,
+in `boot/user_memory_state.rs`) built on the VM (rank 5) + memory (rank 6) seams.
+They never form a broad `&mut KernelState` and never take the IPC/cap/task/scheduler
+locks, and — like the legacy copy path — perform **no COW fault-in** (non-writable ⇒
+`UserMemoryFault`). They are `M2_SEAM_HELPER_ONLY`: **not wired into `ipc_reply` or any
+live path.** Do not describe Stage 186E-prereq as converting `ipc_reply` or retiring
+the global lock — it did neither. `ipc_reply` conversion still additionally needs a
+seam form of the cap-transfer engine (`materialize_received_message_cap_routed`), which
+does not yet exist. See `doc/KERNEL_LOCKING.md §0.2`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
