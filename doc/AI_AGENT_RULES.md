@@ -263,6 +263,18 @@ of rank N must not be entered while holding a lock of rank ≥ N, and cap
 materialization (rank 4) must never run under `ipc_state_lock` (rank 3). See
 `doc/KERNEL_LOCKING.md §0.1` for the seam table.
 
+**Stage 186E-prereq (VM-USER-COPY-SEAM) status — infrastructure only, DO NOT
+OVERCLAIM.** `SharedKernel` now has seam-based user-memory copy helpers
+(`copy_to_user_split` / `copy_from_user_split` / `validate_user_access_for_asid_split`,
+in `boot/user_memory_state.rs`) built on the VM (rank 5) + memory (rank 6) seams.
+They never form a broad `&mut KernelState` and never take the IPC/cap/task/scheduler
+locks, and — like the legacy copy path — perform **no COW fault-in** (non-writable ⇒
+`UserMemoryFault`). They are `M2_SEAM_HELPER_ONLY`: **not wired into `ipc_reply` or any
+live path.** Do not describe Stage 186E-prereq as converting `ipc_reply` or retiring
+the global lock — it did neither. `ipc_reply` conversion still additionally needs a
+seam form of the cap-transfer engine (`materialize_received_message_cap_routed`), which
+does not yet exist. See `doc/KERNEL_LOCKING.md §0.2`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

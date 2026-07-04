@@ -46189,6 +46189,155 @@ mod stage186a_capability_split_mut_infra {
 }
 
 // ===========================================================================
+// Stage 186E-prereq (VM-USER-COPY-SEAM) — seam-based user-memory copy helpers.
+//
+// copy_to_user_split / copy_from_user_split / validate_user_access_for_asid_split
+// mirror the legacy KernelState copy path but run over the rank-5 VM seam
+// (with_vm_user_spaces_split_mut) + rank-6 memory seam (with_memory_split_mut) /
+// direct-phys ONLY — never a broad &mut KernelState and never the IPC (rank 3),
+// capability (rank 4), task (rank 2), or scheduler (rank 1) locks. Helper-only:
+// NOT wired into any live IPC/syscall path. These guards pin: the seam exists and
+// is narrow, does not touch the forbidden locks, preserves real error semantics
+// (UserMemoryFault / InvalidAsid never hidden), and is not wired live.
+// ===========================================================================
+#[cfg(test)]
+mod stage186e_vm_user_copy_seam {
+    use crate::kernel::vm::{Asid, VirtAddr};
+
+    const UMS_SRC: &str = include_str!("user_memory_state.rs");
+
+    fn seam_impl_block() -> &'static str {
+        // The `impl SharedKernel { ... }` block at the end of user_memory_state.rs.
+        UMS_SRC
+            .split("impl crate::runtime::SharedKernel {")
+            .nth(1)
+            .expect("Stage 186E seam impl block must exist in user_memory_state.rs")
+    }
+
+    // Functional: on an unknown ASID the seam runs end-to-end (through the VM seam)
+    // and returns a REAL InvalidAsid — proving it is callable, uses the VM seam,
+    // and does not hide the fault. Also keeps the helper-only fns live under test.
+    #[test]
+    fn stage186e_copy_seam_rejects_unknown_asid() {
+        let shared = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        let read = shared.copy_from_user_split(Asid(9999), VirtAddr(0x1000), 4);
+        assert!(
+            matches!(
+                read,
+                Err(crate::kernel::boot::KernelError::Vm(_))
+                    | Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "copy_from_user_split on an unknown ASID must return a real fault, not success: {read:?}"
+        );
+        let write = shared.copy_to_user_split(Asid(9999), VirtAddr(0x1000), &[1u8, 2, 3, 4]);
+        assert!(
+            matches!(
+                write,
+                Err(crate::kernel::boot::KernelError::Vm(_))
+                    | Err(crate::kernel::boot::KernelError::UserMemoryFault)
+            ),
+            "copy_to_user_split on an unknown ASID must return a real fault, not success: {write:?}"
+        );
+    }
+
+    // Functional: a VALID (created) ASID with no mapping at the target VA yields a
+    // real UserMemoryFault from the seam validate — proving the seam walks the
+    // real user_spaces via the VM seam and does not hide an unmapped page.
+    #[test]
+    fn stage186e_copy_seam_rejects_unmapped_page_in_valid_asid() {
+        let mut boxed = crate::kernel::boot::Bootstrap::init().expect("init");
+        let (asid, _cap) = boxed
+            .create_user_address_space()
+            .expect("create user aspace");
+        let shared = crate::runtime::SharedKernel::new(boxed);
+        let r = shared.copy_from_user_split(asid, VirtAddr(0xDEAD_0000), 4);
+        assert!(
+            matches!(r, Err(crate::kernel::boot::KernelError::UserMemoryFault)),
+            "seam copy over a valid ASID but unmapped VA must be UserMemoryFault: {r:?}"
+        );
+    }
+
+    // The seam uses ONLY the VM (rank 5) and memory (rank 6) seams — never the
+    // IPC / capability / task / scheduler locks, and never a broad &mut KernelState.
+    #[test]
+    fn stage186e_seam_uses_only_vm_and_memory_seams() {
+        let seam = seam_impl_block();
+        assert!(
+            seam.contains("with_vm_user_spaces_split_mut"),
+            "seam must validate via the rank-5 VM seam"
+        );
+        assert!(
+            seam.contains("with_memory_split_mut") || seam.contains("phys_to_direct_map_ptr"),
+            "seam byte access must use the rank-6 memory seam (hosted) or direct phys (bare-metal)"
+        );
+        for forbidden in [
+            "with_ipc_split_mut",
+            "with_ipc_state",
+            "with_capability_state_split_mut",
+            "with_capability_state",
+            "with_scheduler_split_mut",
+            "with_scheduler_state",
+            "with_tcbs",
+            "with_task_tcbs_split_mut",
+            "&mut KernelState",
+            "borrow_kernel_for_boot",
+            ".with(",
+            ".with_cpu(",
+        ] {
+            assert!(
+                !seam.contains(forbidden),
+                "Stage 186E user-copy seam must NOT use `{forbidden}` (no IPC/cap/task/scheduler \
+                 lock, no broad &mut KernelState, no global-lock accessor across user copy)"
+            );
+        }
+    }
+
+    // Seam functions preserve real error semantics (return UserMemoryFault) and are
+    // helper-only (dead_code-allowed under non-test) — no live wiring.
+    #[test]
+    fn stage186e_seam_preserves_errors_and_is_helper_only() {
+        let seam = seam_impl_block();
+        assert!(
+            seam.contains("Err(KernelError::UserMemoryFault)"),
+            "seam must return real UserMemoryFault errors, never hide them"
+        );
+        assert!(
+            seam.contains("#[cfg_attr(not(test), allow(dead_code))]"),
+            "seam helpers must be helper-only (dead_code-allowed under non-test)"
+        );
+    }
+
+    // Not wired into any live IPC/syscall path in this stage.
+    #[test]
+    fn stage186e_seam_not_wired_live() {
+        for (name, src) in [
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("../syscall.rs", include_str!("../syscall.rs")),
+            ("../syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+            (
+                "../syscall/ipc_recv_core.rs",
+                include_str!("../syscall/ipc_recv_core.rs"),
+            ),
+            ("../syscall_split.rs", include_str!("../syscall_split.rs")),
+        ] {
+            for helper in [
+                "copy_to_user_split(",
+                "copy_from_user_split(",
+                "validate_user_access_for_asid_split(",
+            ] {
+                assert!(
+                    !src.contains(helper),
+                    "Stage 186E is helper-only: `{name}` must NOT call `{helper}` (no live \
+                     ipc_reply/IPC conversion in this stage)"
+                );
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

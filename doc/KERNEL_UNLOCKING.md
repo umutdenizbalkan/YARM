@@ -7345,6 +7345,37 @@ the cap-transfer engine, so those are **prerequisites**, not successors. The roa
 caveat unchanged: none of this yields functional benefit until 187 (multi-dispatcher),
 so prioritizing 187 remains the honest alternative.
 
+**Stage 186E-prereq (VM-USER-COPY-SEAM) — DONE (infrastructure only, no live conversion).**
+The 186B stop identified two blockers for `ipc_reply`: (1) user-memory copy and (2) the
+shared cap-transfer engine. This stage removes the **first** blocker as reusable
+infrastructure. On audit, the legacy user-copy path
+(`copy_to_user`/`copy_from_user`/`validate_user_access_for_asid`) turned out to touch
+**only** the rank-5 VM (`with_user_spaces`) and rank-6 memory (`with_memory_state` /
+direct-phys) domains, and to perform **no COW fault-in** (`validate_user_access_for_asid`
+returns `UserMemoryFault` on a non-writable/unmapped target — it never faults a page in;
+the 186B "COW-during-copy" fear was incorrect). So the seam is cleanly buildable. Added,
+in `boot/user_memory_state.rs` on `SharedKernel`:
+
+- `validate_user_access_for_asid_split` (rank-5 VM seam),
+- `copy_from_user_split`, `copy_to_user_split` (rank-5 VM validate + rank-6 memory / direct
+  phys byte access).
+
+They never form a broad `&mut KernelState` and never take the IPC (rank 3), capability
+(rank 4), task (rank 2), or scheduler (rank 1) locks, and they preserve byte-identical
+error semantics (`UserMemoryFault`/`InvalidAsid` never hidden). `M2_SEAM_HELPER_ONLY` — NOT
+wired into any live IPC/syscall path. **It does not by itself retire the global lock from
+IPC.** Guarded by `stage186e_vm_user_copy_seam` (seam callable + rejects unknown-ASID /
+unmapped page with real faults; uses only VM/memory seams; no `&mut KernelState`; not wired
+live). The added helpers are dead/uncalled in the release build → zero behavior change
+(riscv64 core smoke green: `RISCV_PM_STARTUP_CAPS_OK`, `CROSS_ARCH_LIVE_DONE result=ok`).
+
+**Remaining blocker for `ipc_reply` (186B):** the shared cap-transfer materialization engine
+`materialize_received_message_cap_routed` (13 call sites) still has no seam form —
+`Stage 186D-prereq CAP-TRANSFER-ENGINE-SEAM` is next. Only after **both** the VM user-copy
+seam (this stage) **and** the cap-transfer seam exist can `ipc_reply` be converted
+end-to-end. Full global-lock retirement remains deferred; APs remain online but wake-only;
+and the standing caveat holds — no functional benefit until 187 (multi-dispatcher).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

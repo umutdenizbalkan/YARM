@@ -90,6 +90,20 @@ two-phase invariant these seams exist to enable. Guarded by
 `stage186a_capability_split_mut_infra`. This is **not** global-lock retirement: the
 `with`/`with_cpu` boundary in §1 remains authoritative for every live path.
 
+### 0.2) Stage 186E-prereq (VM-USER-COPY-SEAM) — seam-based user-memory copy
+
+Built on the rank-5 (VM) + rank-6 (memory) seams, `SharedKernel` gains
+`validate_user_access_for_asid_split`, `copy_from_user_split`, and
+`copy_to_user_split` (in `boot/user_memory_state.rs`) — seam mirrors of the legacy
+`KernelState::copy_to_user`/`copy_from_user`. They take ONLY the VM (rank 5) +
+memory (rank 6) locks, **never** IPC (3) / capability (4) / task (2) / scheduler (1),
+and **never** a broad `&mut KernelState`. Like the legacy path they perform **no COW
+fault-in** — a non-writable/unmapped target returns `UserMemoryFault` (byte-identical
+errors). `M2_SEAM_HELPER_ONLY`: not wired into any live path. This is the user-copy
+prerequisite for a future `ipc_reply` vertical conversion; the cap-transfer
+materialization engine remains a separate (not-yet-built) seam blocker. Guarded by
+`stage186e_vm_user_copy_seam`. Not global-lock retirement.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:
