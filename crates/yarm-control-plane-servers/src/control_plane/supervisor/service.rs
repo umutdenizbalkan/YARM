@@ -1908,181 +1908,161 @@ pub fn run() {
                 );
                 let mut made_progress = false;
                 supervisor.drop_stale_pending_faults();
-                let drained = supervisor_drain_fault_endpoint(
-                    &mut supervisor,
-                    &mut transport,
-                    process_manager_caps,
-                    startup.task_id,
-                );
-                if drained > 0 {
-                    made_progress = true;
-                }
-                yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
-                match supervisor_recv_short_deadline(
-                    &mut transport,
-                    supervisor.handoff.supervisor_control_recv_cap.0 as u32,
-                ) {
-                    Ok(Some(msg)) => {
-                        made_progress = true;
-                        let payload = msg.as_slice();
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_CONTROL_RECV sender={} opcode={} len={}",
-                            msg.sender_tid.0,
-                            msg.opcode,
-                            payload.len()
-                        );
-                        let first = [
-                            payload.first().copied().unwrap_or(0),
-                            payload.get(1).copied().unwrap_or(0),
-                            payload.get(2).copied().unwrap_or(0),
-                            payload.get(3).copied().unwrap_or(0),
-                            payload.get(4).copied().unwrap_or(0),
-                            payload.get(5).copied().unwrap_or(0),
-                            payload.get(6).copied().unwrap_or(0),
-                            payload.get(7).copied().unwrap_or(0),
-                        ];
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_CONTROL_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
-                            first[0],
-                            first[1],
-                            first[2],
-                            first[3],
-                            first[4],
-                            first[5],
-                            first[6],
-                            first[7],
-                            payload.len()
-                        );
-                        yarm_user_rt::user_log!(
-                            "supervisor.srv control msg: opcode={}",
-                            msg.opcode
-                        );
-                        let msg = if msg.opcode == 0 && payload.len() >= 2 {
-                            let framed_opcode = u16::from_le_bytes([payload[0], payload[1]]);
+                if supervisor.has_managed_records() {
+                    // SUP-L7H: once fault-bearing records exist, do not perform a
+                    // bounded control receive before fault wait. The previous
+                    // SUP-L7G control poll could block on the control endpoint
+                    // while faults queued on the separate fault endpoint with
+                    // woke=0.
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready"
+                    );
+                } else {
+                    yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
+                    match supervisor_recv_short_deadline(
+                        &mut transport,
+                        supervisor.handoff.supervisor_control_recv_cap.0 as u32,
+                    ) {
+                        Ok(Some(msg)) => {
+                            made_progress = true;
+                            let payload = msg.as_slice();
                             yarm_user_rt::user_log!(
-                                "SUPERVISOR_CONTROL_DISPATCH opcode={}",
-                                framed_opcode
-                            );
-                            match Message::with_header(
+                                "SUPERVISOR_CONTROL_RECV sender={} opcode={} len={}",
                                 msg.sender_tid.0,
-                                framed_opcode,
-                                msg.flags,
-                                msg.transferred_cap().map(|cap| cap.0),
-                                &payload[2..],
-                            ) {
-                                Ok(normalized) => normalized,
-                                Err(_) => {
-                                    yarm_user_rt::user_log!(
-                                        "SUPERVISOR_CONTROL_WRONG_OBJECT site=inline-normalize opcode={} reason=message",
-                                        framed_opcode
-                                    );
-                                    msg
+                                msg.opcode,
+                                payload.len()
+                            );
+                            let first = [
+                                payload.first().copied().unwrap_or(0),
+                                payload.get(1).copied().unwrap_or(0),
+                                payload.get(2).copied().unwrap_or(0),
+                                payload.get(3).copied().unwrap_or(0),
+                                payload.get(4).copied().unwrap_or(0),
+                                payload.get(5).copied().unwrap_or(0),
+                                payload.get(6).copied().unwrap_or(0),
+                                payload.get(7).copied().unwrap_or(0),
+                            ];
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_CONTROL_PAYLOAD first8=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}] len={}",
+                                first[0],
+                                first[1],
+                                first[2],
+                                first[3],
+                                first[4],
+                                first[5],
+                                first[6],
+                                first[7],
+                                payload.len()
+                            );
+                            yarm_user_rt::user_log!(
+                                "supervisor.srv control msg: opcode={}",
+                                msg.opcode
+                            );
+                            let msg = if msg.opcode == 0 && payload.len() >= 2 {
+                                let framed_opcode = u16::from_le_bytes([payload[0], payload[1]]);
+                                yarm_user_rt::user_log!(
+                                    "SUPERVISOR_CONTROL_DISPATCH opcode={}",
+                                    framed_opcode
+                                );
+                                match Message::with_header(
+                                    msg.sender_tid.0,
+                                    framed_opcode,
+                                    msg.flags,
+                                    msg.transferred_cap().map(|cap| cap.0),
+                                    &payload[2..],
+                                ) {
+                                    Ok(normalized) => normalized,
+                                    Err(_) => {
+                                        yarm_user_rt::user_log!(
+                                            "SUPERVISOR_CONTROL_WRONG_OBJECT site=inline-normalize opcode={} reason=message",
+                                            framed_opcode
+                                        );
+                                        msg
+                                    }
+                                }
+                            } else {
+                                msg
+                            };
+                            let mut ops = RuntimeSupervisorTaskExitOps {
+                                token_tid: 0,
+                                token: 0,
+                                supervisor_tid: startup.task_id,
+                                process_manager_caps,
+                            };
+                            let registered_tid = match msg.opcode {
+                                SUPERVISOR_OP_REGISTER_CORE_SERVICE => {
+                                    RegisterCoreServiceRequest::decode(msg.as_slice())
+                                        .map(|request| request.tid)
+                                }
+                                SUPERVISOR_OP_REGISTER_DRIVER => {
+                                    RegisterDriverRequest::decode(msg.as_slice())
+                                        .map(|request| request.tid)
+                                }
+                                _ => None,
+                            };
+                            if let Err(err) = supervisor.handle_control_request(&mut ops, msg) {
+                                yarm_user_rt::user_log!(
+                                    "supervisor.srv control handler error: {:?}",
+                                    err
+                                );
+                            } else if let Some(registered_tid) = registered_tid {
+                                let replayed = supervisor_replay_ready_pending_faults(
+                                    &mut supervisor,
+                                    &mut transport,
+                                    process_manager_caps,
+                                    startup.task_id,
+                                    registered_tid,
+                                );
+                                if replayed > 0 {
+                                    made_progress = true;
                                 }
                             }
-                        } else {
-                            msg
-                        };
-                        let mut ops = RuntimeSupervisorTaskExitOps {
-                            token_tid: 0,
-                            token: 0,
-                            supervisor_tid: startup.task_id,
-                            process_manager_caps,
-                        };
-                        let registered_tid = match msg.opcode {
-                            SUPERVISOR_OP_REGISTER_CORE_SERVICE => {
-                                RegisterCoreServiceRequest::decode(msg.as_slice())
-                                    .map(|request| request.tid)
-                            }
-                            SUPERVISOR_OP_REGISTER_DRIVER => {
-                                RegisterDriverRequest::decode(msg.as_slice())
-                                    .map(|request| request.tid)
-                            }
-                            _ => None,
-                        };
-                        if let Err(err) = supervisor.handle_control_request(&mut ops, msg) {
-                            yarm_user_rt::user_log!(
-                                "supervisor.srv control handler error: {:?}",
-                                err
-                            );
-                        } else if let Some(registered_tid) = registered_tid {
-                            let replayed = supervisor_replay_ready_pending_faults(
-                                &mut supervisor,
-                                &mut transport,
-                                process_manager_caps,
-                                startup.task_id,
-                                registered_tid,
-                            );
-                            if replayed > 0 {
-                                made_progress = true;
-                            }
                         }
-                    }
-                    Ok(None) => {
-                        yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_EMPTY");
-                    }
-                    Err(err) => {
-                        yarm_user_rt::user_log!("supervisor.srv control recv error: {:?}", err);
+                        Ok(None) => {
+                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_EMPTY");
+                        }
+                        Err(err) => {
+                            yarm_user_rt::user_log!("supervisor.srv control recv error: {:?}", err);
+                        }
                     }
                 }
 
-                let drained = supervisor_drain_fault_endpoint(
-                    &mut supervisor,
-                    &mut transport,
-                    process_manager_caps,
-                    startup.task_id,
-                );
-                if drained > 0 {
-                    made_progress = true;
-                }
-
-                if !made_progress {
-                    if supervisor.has_managed_records() {
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_IDLE_WAIT_SELECT mode=fault reason=managed_records_ready"
-                        );
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_CONTROL_WAIT_SKIPPED reason=managed_records_ready"
-                        );
-                        let _ = supervisor_fault_idle_wait(
-                            &mut supervisor,
-                            &mut transport,
-                            process_manager_caps,
-                            startup.task_id,
-                        );
-                    } else {
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_IDLE_WAIT_SELECT mode=control reason=no_managed_records"
-                        );
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_CONTROL_WAIT_BEGIN timeout={}",
-                            SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS
-                        );
-                        match supervisor_idle_wait(
-                            &mut transport,
-                            supervisor.handoff.supervisor_control_recv_cap.0 as u32,
-                        ) {
-                            Ok(true) => {
-                                yarm_user_rt::user_log!(
-                                    "SUPERVISOR_CONTROL_WAIT_DONE result=message"
-                                );
-                            }
-                            Ok(false) => {
-                                yarm_user_rt::user_log!(
-                                    "SUPERVISOR_CONTROL_WAIT_DONE result=empty"
-                                );
-                            }
-                            Err(err) => {
-                                yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=err");
-                                yarm_user_rt::user_log!("supervisor.srv idle wait error: {:?}", err)
-                            }
-                        }
-                    }
-                    let _ = supervisor_drain_fault_endpoint(
+                if !made_progress && supervisor.has_managed_records() {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_IDLE_WAIT_SELECT mode=fault reason=managed_records_ready"
+                    );
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_CONTROL_WAIT_SKIPPED reason=managed_records_ready"
+                    );
+                    let _ = supervisor_fault_idle_wait(
                         &mut supervisor,
                         &mut transport,
                         process_manager_caps,
                         startup.task_id,
                     );
+                } else if !made_progress {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_IDLE_WAIT_SELECT mode=control reason=no_managed_records"
+                    );
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_CONTROL_WAIT_BEGIN timeout={}",
+                        SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS
+                    );
+                    match supervisor_idle_wait(
+                        &mut transport,
+                        supervisor.handoff.supervisor_control_recv_cap.0 as u32,
+                    ) {
+                        Ok(true) => {
+                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=message");
+                        }
+                        Ok(false) => {
+                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=empty");
+                        }
+                        Err(err) => {
+                            yarm_user_rt::user_log!("SUPERVISOR_CONTROL_WAIT_DONE result=err");
+                            yarm_user_rt::user_log!("supervisor.srv idle wait error: {:?}", err)
+                        }
+                    }
                 }
 
                 supervisor.advance_ticks(TickDuration(1));
@@ -2134,6 +2114,7 @@ fn supervisor_recv_short_deadline(
 }
 
 #[cfg(not(test))]
+#[allow(dead_code)]
 fn supervisor_try_recv_fault(cap: u32) -> Result<Option<Message>, KernelError> {
     // SUP-L7G: NR 30 RecvSharedV3 is the live userspace nonblocking receive API.
     // It preserves sender/transfer metadata but not the message opcode in its
@@ -2297,6 +2278,7 @@ fn query_restart_token_via_process_manager(
 }
 
 #[cfg(not(test))]
+#[allow(dead_code)]
 const SUPERVISOR_FAULT_DRAIN_MAX_PER_TICK: usize = 8;
 
 #[cfg(not(test))]
@@ -2589,6 +2571,7 @@ fn supervisor_replay_ready_pending_faults(
 }
 
 #[cfg(not(test))]
+#[allow(dead_code)]
 fn supervisor_drain_fault_endpoint(
     supervisor: &mut SupervisorService,
     transport: &mut impl IpcTransport,

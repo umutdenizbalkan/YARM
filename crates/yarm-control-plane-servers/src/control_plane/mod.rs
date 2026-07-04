@@ -2804,7 +2804,8 @@ mod tests {
             "supervisor_try_recv_fault(fault_cap)",
             "ipc_recv_shared_v3_nonblocking",
             "supervisor_recv_short_deadline(
-                    &mut transport",
+                        &mut transport",
+            "SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready",
             "SUPERVISOR_EVENT_LOOP_TICK",
             "SUPERVISOR_FAULT_DRAIN_BEGIN",
             "SUPERVISOR_FAULT_DRAIN_DONE count={}",
@@ -2895,6 +2896,16 @@ mod tests {
                     "recv_with_deadline(supervisor.handoff.supervisor_control_recv_cap.0 as u32, 0)"
                 ),
             "SUP-L7G supervisor poll/drain paths must not use ambiguous deadline 0"
+        );
+        let managed_branch = supervisor_src
+            .split("if supervisor.has_managed_records() {")
+            .nth(1)
+            .and_then(|tail| tail.split("} else {").next())
+            .expect("managed-record event-loop branch present");
+        assert!(
+            managed_branch.contains("SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready")
+                && !managed_branch.contains("supervisor_recv_short_deadline"),
+            "SUP-L7H managed-record mode must skip bounded control receive before fault wait"
         );
         assert!(
             !supervisor_src.contains("spawn_process_with_startup_caps(")
@@ -3120,6 +3131,16 @@ mod tests {
                 "SUP-L6B must not introduce {forbidden}"
             );
         }
+        let managed_branch = supervisor_src
+            .split("if supervisor.has_managed_records() {")
+            .nth(1)
+            .and_then(|tail| tail.split("} else {").next())
+            .expect("managed-record event-loop branch present");
+        assert!(
+            managed_branch.contains("SUPERVISOR_CONTROL_POLL_SKIPPED reason=managed_records_ready")
+                && !managed_branch.contains("supervisor_recv_short_deadline"),
+            "SUP-L7H managed-record mode must skip bounded control receive before fault wait"
+        );
         assert!(
             !supervisor_src.contains("spawn_process_with_startup_caps(")
                 && !supervisor_src.contains("KernelProcessSpawnBackend::new()"),

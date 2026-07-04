@@ -119,6 +119,7 @@ fatal_patterns=(
   "Vm\\(Full\\)"
   "CapabilityFull"
   "MissingRight"
+  "BLOCKED_WOULDBLOCK_FATAL"
 )
 for pattern in "${fatal_patterns[@]}"; do
   if rg -a -n "$pattern" "$LOG_NORM" >/dev/null 2>&1; then
@@ -166,11 +167,9 @@ for marker in \
   SUPERVISOR_EVENT_LOOP_TICK \
   SUPERVISOR_MANAGED_RECORD_REGISTER_OK \
   SUPERVISOR_CRASH_TEST_RECORD_READY \
-  SUPERVISOR_FAULT_DRAIN_BEGIN \
-  SUPERVISOR_FAULT_DRAIN_DONE \
-  SUPERVISOR_FAULT_DRAIN_RECV \
-  SUPERVISOR_FAULT_QUEUE_PENDING_DRAIN \
-  SUPERVISOR_FAULT_QUEUE_DRAINED \
+  SUPERVISOR_IDLE_WAIT_SELECT \
+  SUPERVISOR_CONTROL_WAIT_SKIPPED \
+  SUPERVISOR_FAULT_WAIT_BEGIN \
   SUPERVISOR_FAULT_LOOKUP_BEGIN \
   SUPERVISOR_FAULT_LOOKUP_OK \
   SUPERVISOR_RESTART_ATTEMPT_ADVANCE \
@@ -187,7 +186,15 @@ for marker in \
   require_present "$marker" || oracle_failed=1
 done
 
-# SUP-L7G: pending-fault replay is a race fallback, not an unconditional
+require_present "SUPERVISOR_FAULT_LOOKUP_OK fault_tid=10008" || oracle_failed=1
+require_present "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=0 new=1" || oracle_failed=1
+require_present "SUPERVISOR_RESTART_SCHEDULED tid=10008" || oracle_failed=1
+if ! rg -a "SUPERVISOR_FAULT_(WAIT|DRAIN)_RECV tid=10008" "$LOG_FILE" >/dev/null 2>&1; then
+  echo "[error] required fault receive marker missing for tid=10008 (expected WAIT_RECV or DRAIN_RECV)"
+  oracle_failed=1
+fi
+
+# SUP-L7H: pending-fault replay is a race fallback, not an unconditional
 # smoke requirement. If the crash-test record was not ready before the first
 # fault, require the fallback stash/replay path; otherwise the direct
 # registered-fault path is sufficient.
