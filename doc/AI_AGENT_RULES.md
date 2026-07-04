@@ -275,6 +275,20 @@ the global lock — it did neither. `ipc_reply` conversion still additionally ne
 seam form of the cap-transfer engine (`materialize_received_message_cap_routed`), which
 does not yet exist. See `doc/KERNEL_LOCKING.md §0.2`.
 
+**Stage 186D-prereq (CAP-TRANSFER-ENGINE-SEAM) status — audited, HARD-STOPPED, DO NOT
+OVERCLAIM.** The cap-transfer materialization engine has **no** seam form and this stage
+did **not** build one. On audit the materialize path is not cap-only: it spans task
+(rank 2), IPC (rank 3), capability (rank 4), and memory (rank 6). `task_cnode` fuses
+task+capability; `capability_object_live` reads IPC generations; `mint_capability_in_cnode`
+bumps the memory `cap_refcount` (rank 6) in the same critical section as the cnode-slot
+install (rank 4) — splitting opens a reclaim race; and the reply arm sets the waiter cap
+under IPC (rank 3) after the rank-4 mint. The rank-4 `with_capability_state_split_mut`
+seam cannot carry any of this. Do **not** describe 186D-prereq as building a cap-transfer
+seam, converting `ipc_reply`, or retiring the lock — it did none of those. Disposition
+`CAP_TRANSFER_SEAM_DEFERRED`; no `CAP_TRANSFER_SEAM_*` success marker may be emitted on the
+legacy path. Pinned by `stage186d_cap_transfer_engine_seam_entanglement`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 186D-prereq) and `doc/KERNEL_LOCKING.md §0.3`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

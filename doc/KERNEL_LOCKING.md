@@ -104,6 +104,23 @@ prerequisite for a future `ipc_reply` vertical conversion; the cap-transfer
 materialization engine remains a separate (not-yet-built) seam blocker. Guarded by
 `stage186e_vm_user_copy_seam`. Not global-lock retirement.
 
+### 0.3) Stage 186D-prereq (CAP-TRANSFER-ENGINE-SEAM) — HARD-STOPPED
+
+The second `ipc_reply` blocker — a cap-transfer materialization seam via the rank-4
+`with_capability_state_split_mut` seam — was audited and **hard-stopped**: the
+materialize path is not cap-only. A single "materialize a received transfer/reply
+cap" spans task (2), IPC (3), capability (4), and memory (6): `task_cnode` fuses
+task+capability (`with_task_then_capability`); `capability_object_live` reads IPC
+generations for endpoint/notification objects; `mint_capability_in_cnode` installs
+the cnode slot (rank 4) **and** bumps the memory-object `cap_refcount` (rank 6) in the
+**same** critical section (splitting opens a reclaim race); and the reply arm records
+the waiter cap under IPC (rank 3) after the rank-4 mint (rank inversion). The rank-4
+capability seam hands out only `&mut CapabilitySubsystem`, so it cannot express any of
+these cross-subsystem steps. Disposition `CAP_TRANSFER_SEAM_DEFERRED` — documented,
+never emitted on a legacy path. No runtime change. Pinned by
+`stage186d_cap_transfer_engine_seam_entanglement`. The real next move is a joint
+capability↔memory decomposition giving the mint+refcount a shared atomicity discipline.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

@@ -126,6 +126,20 @@ IPC (rank 3) lock invokes it *after* dropping `ipc_state_lock`, so cap
 materialization never runs under the IPC lock (§8). This seam does not change
 the current locking behaviour of any live path.
 
+**Cap-transfer materialize is not cap-only (Stage 186D-prereq, HARD-STOP).** An
+attempt to migrate the received-cap materialization engine onto this rank-4 seam
+was audited and stopped: materializing a received transfer/reply cap spans four
+subsystems, not one. `task_cnode` fuses task (rank 2) + capability (rank 4);
+`capability_object_live` reads IPC (rank 3) for endpoint/notification objects;
+`mint_capability_in_cnode` installs the cnode slot (rank 4) **and** bumps the
+memory-object `cap_refcount` (rank 6) in the *same* critical section — splitting
+them opens a reclaim race (object freed while a fresh cnode slot references it);
+and the reply arm records the waiter cap under IPC (rank 3) *after* the rank-4
+mint. `with_capability_state_split_mut` exposes only `&mut CapabilitySubsystem`,
+so it cannot carry any of these. A cap-transfer seam therefore requires a joint
+capability↔memory decomposition first; deferred as `CAP_TRANSFER_SEAM_DEFERRED`.
+Pinned by `stage186d_cap_transfer_engine_seam_entanglement`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)
