@@ -7286,6 +7286,29 @@ beneficial and give the sender-wake oracle a real concurrency surface to prove a
 `with_task_state_split_mut` / cnode split-mut helpers + guards first, then revisits
 `ipc_reply`. Either way it is not a single-pass vertical slice.
 
+**Stage 186A (SPLIT-MUT-INFRA) — DONE (infrastructure only, no live conversion).**
+The four honest 185-series stops recommended building the per-subsystem split-mut
+layer before any IPC op can leave the global lock. On audit, that layer **already
+existed** for ranks 1 (scheduler), 2 (task/TCB), 3 (IPC), 5 (VM), 6 (memory) from
+Stage 108/115 — the only gap was the **rank-4 capability domain**. Stage 186A closes
+it: `capability_split_mut_ptrs_from_raw` (projector) + `with_capability_state_split_mut`
+(`SharedKernel` seam), exposing ONLY `&mut CapabilitySubsystem` (CNode spaces,
+`process_cnodes`, `delegated_capability_links`), `M2_SEAM_HELPER_ONLY`, **no live
+caller**. The per-domain seam set (ranks 1–6) is now complete — see
+`doc/KERNEL_LOCKING.md §0.1` for the table. **No live syscall/op was migrated**; the
+`with`/`with_cpu` legacy boundary remains authoritative for every runtime path;
+full global-lock retirement remains deferred; APs remain online but wake-only.
+Guarded by `stage186a_capability_split_mut_infra` (seam exists, is narrow, never
+exposes `&mut KernelState`, is not wired live, rank-4 two-phase contract documented).
+
+Roadmap (updated): **186A split-mut infra (done)** → 186B `ipc_reply` vertical
+conversion onto the seams (stash-relocated wake, sender-wake-oracle-gated on real
+QEMU) → 186C `ipc_send`/`recv`/`call` → 186D reply-cap/cap-transfer → 186E
+VM/COW/fork → 186F fault-report delivery → 187 AP user scheduling / multi-dispatcher
+→ 188 final live-runtime global-lock removal. Note the earlier honest finding stands:
+on the single-dispatcher model the global lock is uncontended, so 186B+ yield no
+functional benefit until 187 — sequencing 187 earlier is a legitimate alternative.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

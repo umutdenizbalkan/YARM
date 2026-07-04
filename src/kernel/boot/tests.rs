@@ -46044,6 +46044,151 @@ mod stage185_boot_only_global_borrow_confined {
 }
 
 // ===========================================================================
+// Stage 186A (SPLIT-MUT-INFRA) — capability (rank 4) split-mut seam completes
+// the per-domain seam set.
+//
+// The per-subsystem split-mut seam infrastructure (raw field projectors +
+// `with_*_split_mut` wrappers exposing ONLY `&mut <Subsystem>`, never a broad
+// `&mut KernelState`) already existed for ranks 1 (scheduler), 2 (task/TCB),
+// 3 (IPC), 5 (VM), 6 (memory) from Stage 108/115. Stage 186A adds the missing
+// rank-4 capability seam (`capability_split_mut_ptrs_from_raw` +
+// `with_capability_state_split_mut`) as M2_SEAM_HELPER_ONLY infrastructure — NO
+// live capability/cnode runtime path is migrated onto it in this stage. These
+// guards pin: the seam exists and is narrow, it is not wired live, it never
+// exposes `&mut KernelState`, and the rank-4 (> IPC rank 3) ordering is
+// documented (two-phase: cap materialization only after `ipc_state_lock` drops).
+// ===========================================================================
+#[cfg(test)]
+mod stage186a_capability_split_mut_infra {
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
+
+    // Functional: the seam is callable, holds capability_state_lock, and exposes
+    // exactly `&mut CapabilitySubsystem` (the closure receives it). This also
+    // keeps the `#[cfg_attr(not(test), allow(dead_code))]` wrapper live under test.
+    #[test]
+    fn stage186a_capability_seam_is_callable_and_narrow() {
+        let shared = crate::runtime::SharedKernel::new(
+            crate::kernel::boot::Bootstrap::init().expect("init"),
+        );
+        // The closure argument type is `&mut CapabilitySubsystem`; returning a
+        // value proves the seam locks + hands out the subsystem and releases.
+        let process_cnode_slots = shared.with_capability_state_split_mut(
+            |cap: &mut crate::kernel::boot::CapabilitySubsystem| {
+                // Touch the subsystem to prove real access (count is stable/derived
+                // from the subsystem, not from a broad KernelState borrow).
+                cap.process_cnodes.iter().flatten().count()
+            },
+        );
+        // A fresh kernel has a bounded, well-defined number of process cnodes.
+        assert!(
+            process_cnode_slots <= crate::kernel::boot::MAX_TASKS,
+            "capability seam must expose the real CapabilitySubsystem"
+        );
+    }
+
+    // The rank-4 seam exists in both layers, follows the projector `(lock, data)`
+    // pattern, and returns a *narrow* `*mut CapabilitySubsystem` — never a
+    // `*mut KernelState`.
+    #[test]
+    fn stage186a_capability_projector_and_wrapper_exist_and_are_narrow() {
+        assert!(
+            ORCH_SRC.contains("fn capability_split_mut_ptrs_from_raw"),
+            "orchestrator_state.rs must define the rank-4 capability projector"
+        );
+        assert!(
+            ORCH_SRC.contains("*mut CapabilitySubsystem"),
+            "capability projector must return a narrow *mut CapabilitySubsystem"
+        );
+        assert!(
+            RUNTIME_SRC.contains("fn with_capability_state_split_mut"),
+            "runtime.rs must define the with_capability_state_split_mut seam"
+        );
+        assert!(
+            RUNTIME_SRC
+                .contains("f: impl FnOnce(&mut crate::kernel::boot::CapabilitySubsystem) -> R"),
+            "capability seam must expose ONLY &mut CapabilitySubsystem, never &mut KernelState"
+        );
+    }
+
+    // Infrastructure only: the capability seam is marked helper-only and is NOT
+    // wired into any live runtime path in Stage 186A.
+    #[test]
+    fn stage186a_capability_seam_is_helper_only_and_not_wired_live() {
+        // Helper-only attribute present on the seam.
+        assert!(
+            RUNTIME_SRC.contains("M2_SEAM_HELPER_ONLY"),
+            "the split-mut seams (incl. capability) must remain M2_SEAM_HELPER_ONLY"
+        );
+        // Not called from any live IPC / capability / dispatch runtime file.
+        for (name, src) in [
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("capability_state.rs", include_str!("capability_state.rs")),
+            ("cnode_state.rs", include_str!("cnode_state.rs")),
+            ("transfer_state.rs", include_str!("transfer_state.rs")),
+            ("exec_state.rs", include_str!("exec_state.rs")),
+            ("../syscall_split.rs", include_str!("../syscall_split.rs")),
+            ("../syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+        ] {
+            assert!(
+                !src.contains("with_capability_state_split_mut("),
+                "Stage 186A is infrastructure-only: `{name}` must NOT call \
+                 with_capability_state_split_mut (no live migration in this stage)"
+            );
+        }
+    }
+
+    // No split-mut wrapper may expose a broad `&mut KernelState` — they must each
+    // hand out only their own subsystem type. (The legacy `with` / `with_cpu`
+    // global-lock accessors DO take `FnOnce(&mut KernelState)` by design — Stage
+    // 185A documents they remain — so this guard checks each split-mut seam's own
+    // signature in isolation, not the whole file.)
+    #[test]
+    fn stage186a_no_split_mut_seam_exposes_broad_kernel_state() {
+        for (seam, marker) in [
+            ("with_scheduler_split_mut", "fn with_scheduler_split_mut"),
+            ("with_task_tcbs_split_mut", "fn with_task_tcbs_split_mut"),
+            ("with_ipc_split_mut", "fn with_ipc_split_mut"),
+            (
+                "with_capability_state_split_mut",
+                "fn with_capability_state_split_mut",
+            ),
+            (
+                "with_vm_user_spaces_split_mut",
+                "fn with_vm_user_spaces_split_mut",
+            ),
+            ("with_memory_split_mut", "fn with_memory_split_mut"),
+        ] {
+            let start = match RUNTIME_SRC.find(marker) {
+                Some(s) => s,
+                None => panic!("split-mut seam {seam} must exist in runtime.rs"),
+            };
+            // Signature = from `fn NAME` up to the opening brace of the body.
+            let sig_end = RUNTIME_SRC[start..]
+                .find('{')
+                .expect("seam signature must have a body");
+            let signature = &RUNTIME_SRC[start..start + sig_end];
+            assert!(
+                !signature.contains("KernelState"),
+                "split-mut seam {seam} must NOT expose &mut KernelState in its signature"
+            );
+        }
+    }
+
+    // Rank order is documented: capability is rank 4, ABOVE IPC (rank 3), so cap
+    // materialization runs only after ipc_state_lock is dropped (two-phase).
+    #[test]
+    fn stage186a_capability_rank_order_documented() {
+        // The seam doc pins the rank-4 / after-ipc-drop contract.
+        assert!(
+            RUNTIME_SRC.contains("no cap materialization under ipc_state_lock"),
+            "capability seam doc must state the rank-4 two-phase contract \
+             (no cap materialization under ipc_state_lock)"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

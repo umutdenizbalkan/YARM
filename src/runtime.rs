@@ -813,6 +813,46 @@ impl SharedKernel {
         f(kernel_mut(ipc))
     }
 
+    /// Stage 186A: capability/cnode/object-store (rank 4) split-mut seam.
+    ///
+    /// Completes the per-domain split-mut seam set — ranks 1/2/3/5/6 predate this
+    /// stage (Stage 108/115); Stage 186A adds rank 4, the last core subsystem
+    /// seam. Exposes ONLY `&mut CapabilitySubsystem` (CNode spaces,
+    /// `process_cnodes`, `delegated_capability_links`) — never a broad
+    /// `&mut KernelState`. `capability_state_lock` (rank 4) serializes the
+    /// `capability` field.
+    ///
+    /// # Validation status
+    /// - M2_SEAM_HELPER_ONLY — infrastructure only; NO live caller as of
+    ///   Stage 186A. Migrating capability/cnode runtime paths (e.g. the reply-cap
+    ///   fast-revoke and cnode insertion in a future `ipc_reply` vertical slice)
+    ///   onto this seam is deferred to Stage 186B+.
+    ///
+    /// Lock-rank contract (`doc/CAPABILITY_MODEL.md §3`): the capability domain is
+    /// rank 4, ABOVE IPC (rank 3). A caller MUST hold NO IPC (rank 3), task
+    /// (rank 2), or scheduler (rank 1) lock when invoking this seam — i.e. cap
+    /// materialization runs here AFTER `ipc_state_lock` is dropped (the two-phase
+    /// invariant, §8: "no cap materialization under ipc_state_lock"). Callers MUST
+    /// NOT perform user-memory copy inside the closure.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_capability_state_split_mut<R>(
+        &self,
+        f: impl FnOnce(&mut crate::kernel::boot::CapabilitySubsystem) -> R,
+    ) -> R {
+        // SAFETY: `state.data_ptr()` is the stable KernelState storage owned by
+        // this SharedKernel. `capability_split_mut_ptrs_from_raw` derives raw
+        // field pointers via addr_of!/addr_of_mut! without forming a reference to
+        // the whole KernelState; `capability_state_lock` serializes access to the
+        // `capability` field. `capability` is a direct (non-`KernelStorage`)
+        // field, so no `kernel_mut` unwrap is needed.
+        let (capability_lock, capability) =
+            unsafe { KernelState::capability_split_mut_ptrs_from_raw(self.state.data_ptr()) };
+        let capability_lock = unsafe { &*capability_lock };
+        let _guard = capability_lock.lock();
+        let capability = unsafe { &mut *capability };
+        f(capability)
+    }
+
     fn with_fault_split_read<R>(&self, f: impl FnOnce(&FaultSubsystem) -> R) -> R {
         // Stage 4T+5 split-read: acquires fault_state_lock (rank 8) only.
         // Does not acquire the outer SharedKernel lock. Does not mutate any state.

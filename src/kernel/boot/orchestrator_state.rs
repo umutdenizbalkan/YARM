@@ -1457,6 +1457,33 @@ impl KernelState {
         }
     }
 
+    /// Stage 186A: capability/cnode/object-store (rank 4) seam projector.
+    ///
+    /// Completes the per-domain split-mut seam set: ranks 1 (scheduler),
+    /// 2 (task/TCB), 3 (IPC), 5 (VM), 6 (memory) already had projectors from
+    /// Stage 108/115; this adds rank 4 — the capability domain (CNode spaces,
+    /// `process_cnodes`, `delegated_capability_links`), per
+    /// `doc/CAPABILITY_MODEL.md §3`. Unlike the `KernelStorage`-wrapped
+    /// subsystems, `self.capability` is a direct `CapabilitySubsystem` field, so
+    /// the data pointer is a plain `addr_of_mut!((*state).capability)` (no
+    /// `KernelStorage` indirection). Infrastructure-only; no live caller — the
+    /// capability/cnode runtime paths are NOT migrated onto this seam in
+    /// Stage 186A (see `doc/KERNEL_UNLOCKING.md`).
+    pub(crate) unsafe fn capability_split_mut_ptrs_from_raw(
+        state: *mut KernelState,
+    ) -> (
+        *const crate::kernel::lock::SpinLockIrq<()>,
+        *mut CapabilitySubsystem,
+    ) {
+        // SAFETY: see module pattern note above.
+        unsafe {
+            (
+                core::ptr::addr_of!((*state).capability_state_lock),
+                core::ptr::addr_of_mut!((*state).capability),
+            )
+        }
+    }
+
     /// Stage 4T+7 split-read: look up the ASID bound to `tid` under only the
     /// task lock (rank 2). Returns `0` if the task is not found or has no ASID.
     ///

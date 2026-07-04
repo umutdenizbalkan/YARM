@@ -250,6 +250,19 @@ never appear on a live-runtime dispatch path (guarded by
 `stage185_boot_only_global_borrow_confined`). See `doc/KERNEL_LOCKING.md §0` for
 the classified inventory and the deferred per-subsystem retirement plan.
 
+**Stage 186A (SPLIT-MUT-INFRA) status — infrastructure only, DO NOT OVERCLAIM.**
+The per-domain split-mut seam set (`with_*_split_mut`, exposing only
+`&mut <Subsystem>` never `&mut KernelState`) is now complete for ranks 1–6 — Stage
+186A added the missing rank-4 `with_capability_state_split_mut` seam. These seams
+are `M2_SEAM_HELPER_ONLY`: **no live syscall/IPC/cap/VM path was migrated onto
+them** (only the pre-existing VmBrk-shrink and D6-dispatch callers use any seam).
+Do **not** describe Stage 186A as retiring the global lock, converting `ipc_reply`,
+or making any IPC/cap path "lock-free" — it did none of those. When adding a seam
+or a future migration, keep the rank order (`doc/CAPABILITY_MODEL.md §3`): a seam
+of rank N must not be entered while holding a lock of rank ≥ N, and cap
+materialization (rank 4) must never run under `ipc_state_lock` (rank 3). See
+`doc/KERNEL_LOCKING.md §0.1` for the seam table.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
