@@ -927,7 +927,7 @@ fn copy_spawn_startup_args(
 /// only PM (TID 3) may call it, the caller may not target itself, and only
 /// terminal Faulted/Exited/Dead tasks are accepted. Cleanup is delegated to the
 /// existing `mark_task_dead` path so VM/CNode/IPC/reply-cap/runtime-cap teardown
-/// stays identical to established task-death cleanup.
+/// uses the SUP-L7K-C no-allocation cleanup path for reap safety.
 pub(super) fn handle_reap_faulted_task(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
@@ -973,7 +973,9 @@ pub(super) fn handle_reap_faulted_task(
         }
     }
 
-    kernel.mark_task_dead(target).map_err(SyscallError::from)?;
+    kernel
+        .reap_faulted_task_noalloc_cleanup(target)
+        .map_err(SyscallError::from)?;
     crate::yarm_log!("TASK_REAP_FAULTED_OK target_tid={}", target);
     frame.set_ok(0, 0, 0);
     Ok(())

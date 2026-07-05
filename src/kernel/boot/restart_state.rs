@@ -236,4 +236,49 @@ impl KernelState {
         self.maybe_cleanup_process_cnode_for_pid(process_pid);
         Ok(())
     }
+
+    pub fn reap_faulted_task_noalloc_cleanup(&mut self, tid: u64) -> Result<(), KernelError> {
+        let process_pid = self
+            .thread_group_id(tid)
+            .map(|group| group.0)
+            .ok_or(KernelError::TaskMissing)?;
+        crate::yarm_log!("TASK_REAP_FAULTED_NOALLOC_CLEANUP_BEGIN target_tid={}", tid);
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=mark_dead_clear_restart",
+            tid
+        );
+        self.with_tcbs_mut(|tcbs| {
+            let tcb = tcbs
+                .iter_mut()
+                .flatten()
+                .find(|tcb| tcb.tid.0 == tid)
+                .ok_or(KernelError::TaskMissing)?;
+            tcb.status = TaskStatus::Dead;
+            tcb.restart.token = None;
+            Ok::<_, KernelError>(())
+        })?;
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=reply_caps",
+            tid
+        );
+        let _ = self.revoke_reply_caps_for_caller(tid);
+        let _ = self.revoke_reply_caps_for_replier(tid);
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=ipc_waiters",
+            tid
+        );
+        self.clear_ipc_waiters_for_tid(tid);
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=kernel_context",
+            tid
+        );
+        let _ = self.release_kernel_context(tid);
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_CLEANUP_STEP target_tid={} step=process_cnode_noalloc",
+            tid
+        );
+        let _ = self.maybe_cleanup_process_cnode_for_pid_noalloc_reap(process_pid);
+        crate::yarm_log!("TASK_REAP_FAULTED_NOALLOC_CLEANUP_OK target_tid={}", tid);
+        Ok(())
+    }
 }

@@ -3569,6 +3569,7 @@ mod tests {
         state.register_task(42).expect("faulted target");
         let (asid, _cap) = state.create_user_address_space().expect("asid");
         state.bind_task_asid(42, asid).expect("bind asid");
+        let cnode = state.task_cnode(42).expect("target cnode");
         state.tcb_mut(42).expect("tcb").status = crate::kernel::task::TaskStatus::Faulted;
         assert!(state.asid_is_live_for_test(asid), "asid live before reap");
         reap_faulted_task_syscall(&mut state, 42).expect("reap faulted");
@@ -3578,7 +3579,11 @@ mod tests {
         );
         assert!(
             !state.asid_is_live_for_test(asid),
-            "asid destroyed by mark_task_dead cleanup"
+            "asid destroyed by no-alloc reap cleanup"
+        );
+        assert!(
+            state.cnode_slot_capacity(cnode).is_none(),
+            "target process cnode removed by no-alloc reap cleanup"
         );
 
         state.register_task(43).expect("exited target");
@@ -3628,6 +3633,41 @@ mod tests {
             reap_faulted_task_syscall(&mut state, 44),
             Err(SyscallError::MissingRight)
         );
+    }
+
+    #[test]
+    fn task_reap_noalloc_cleanup_source_guard() {
+        let restart_src = include_str!("boot/restart_state.rs");
+        let helper_start = restart_src
+            .find("pub fn reap_faulted_task_noalloc_cleanup")
+            .expect("reap helper");
+        let helper_end = restart_src[helper_start..]
+            .find("\n    }\n}")
+            .map(|offset| helper_start + offset)
+            .expect("reap helper end");
+        let helper = &restart_src[helper_start..helper_end];
+        for forbidden in &["Vec<", "alloc::vec", "Box<", "Box::", "collect(", "clone()"] {
+            assert!(
+                !helper.contains(forbidden),
+                "reap noalloc cleanup helper must not contain allocation pattern {forbidden}"
+            );
+        }
+
+        let cnode_src = include_str!("boot/cnode_state.rs");
+        let cleanup_start = cnode_src
+            .find("pub(crate) fn maybe_cleanup_process_cnode_for_pid_noalloc_reap")
+            .expect("cnode noalloc helper");
+        let cleanup_end = cnode_src[cleanup_start..]
+            .find("\n    pub(crate) fn purge_transfer_envelopes_for_pid")
+            .map(|offset| cleanup_start + offset)
+            .expect("cnode noalloc helper end");
+        let cleanup = &cnode_src[cleanup_start..cleanup_end];
+        for forbidden in &["Vec<", "alloc::vec", "Box<", "Box::", "collect(", "clone()"] {
+            assert!(
+                !cleanup.contains(forbidden),
+                "cnode noalloc cleanup helper must not contain allocation pattern {forbidden}"
+            );
+        }
     }
 
     #[test]

@@ -76,7 +76,7 @@ Status terms used by this matrix:
 | `28` | `CreateInitramfsFileSliceMo` | privileged extension | SystemServer only | Phase 3A initramfs MemoryObject helper; not part of public v10 count. |
 | `29` | `SpawnFromMemoryObject` | privileged extension | PM TID `3` only | Phase 3A zero-copy spawn helper; not part of public v10 count. |
 | `30` | `RecvSharedV3` | non-blocking recv extension | any user task | Stage 42+43: non-blocking `recv_shared_v3` (NR 30); `timeout_ticks=0` only; no mapped receive. See `KERNEL_LOCKING.md §58`. |
-| `31` | `ReapFaultedTask` | privileged PM restart-cleanup extension | PM TID `3` only | SUP-L7K-A: reaps an old terminal Faulted/Exited/Dead task after PM has successfully spawned and recorded a restart replacement. `arg0=target_tid`; self-target returns `InvalidArgs`; non-PM returns `MissingRight`; Running/Runnable/Blocked targets return `WrongObject`; missing targets are treated as already gone and return success. Uses existing `mark_task_dead` cleanup; not a kill-running-task syscall. |
+| `31` | `ReapFaultedTask` | privileged PM restart-cleanup extension | PM TID `3` only | SUP-L7K-A: reaps an old terminal Faulted/Exited/Dead task after PM has successfully spawned and recorded a restart replacement. `arg0=target_tid`; self-target returns `InvalidArgs`; non-PM returns `MissingRight`; Running/Runnable/Blocked targets return `WrongObject`; missing targets are treated as already gone and return success. Uses the no-allocation terminal-task reap cleanup path (`reap_faulted_task_noalloc_cleanup`) for VM/task/cnode release; not a kill-running-task syscall. |
 | `32+` | — | removed/invalid | none | Outside `SYSCALL_COUNT = 32`; not dispatched. |
 
 ## ABI versioning and deprecation policy
