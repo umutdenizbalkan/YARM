@@ -42,8 +42,10 @@ pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
 /// Stage 42+43: versioned receive with cap-transfer through canonical receive core.
 /// Non-blocking only in this stage (timeout_ticks == 0 required).
 pub const SYSCALL_RECV_SHARED_V3_NR: usize = 30;
-pub const SYSCALL_COUNT: usize = 31;
-const _: [(); SYSCALL_COUNT] = [(); 31];
+/// SUP-L7K-A: PM-only reap of terminal faulted/exited tasks after restart replacement.
+pub const SYSCALL_REAP_FAULTED_TASK_NR: usize = 31;
+pub const SYSCALL_COUNT: usize = 32;
+const _: [(); SYSCALL_COUNT] = [(); 32];
 pub const SYSCALL_ARG_CAP: usize = 0;
 pub const SYSCALL_ARG_PTR: usize = 1;
 pub const SYSCALL_ARG_LEN: usize = 2;
@@ -302,6 +304,7 @@ pub enum Syscall {
     /// Stage 42+43: versioned receive with cap-transfer on the split path.
     /// Non-blocking only in this stage; full blocking requires a future stage.
     RecvSharedV3 = SYSCALL_RECV_SHARED_V3_NR,
+    ReapFaultedTask = SYSCALL_REAP_FAULTED_TASK_NR,
 }
 
 impl Syscall {
@@ -335,6 +338,7 @@ impl Syscall {
             SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR => Ok(Self::CreateInitramfsFileSliceMo),
             SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR => Ok(Self::SpawnFromMemoryObject),
             SYSCALL_RECV_SHARED_V3_NR => Ok(Self::RecvSharedV3),
+            SYSCALL_REAP_FAULTED_TASK_NR => Ok(Self::ReapFaultedTask),
             _ => Err(SyscallError::InvalidNumber),
         }
     }
@@ -342,6 +346,7 @@ impl Syscall {
 
 const _: () = assert!(SYSCALL_SPAWN_PROCESS_NR < SYSCALL_COUNT);
 const _: () = assert!(SYSCALL_RECV_SHARED_V3_NR < SYSCALL_COUNT);
+const _: () = assert!(SYSCALL_REAP_FAULTED_TASK_NR < SYSCALL_COUNT);
 const _: [(); syscall_abi::TRAPFRAME_ARG_REGS] = [(); 6];
 const _: () = assert!(SYSCALL_ARG_TRANSFER_CAP < syscall_abi::TRAPFRAME_ARG_REGS);
 const _: () = assert!(syscall_abi::TRAPFRAME_ARG_REGS > SYSCALL_ARG_INLINE_PAYLOAD1);
@@ -1096,6 +1101,13 @@ fn handle_spawn_from_memory_object(
     self::process::handle_spawn_from_memory_object(kernel, frame)
 }
 
+fn handle_reap_faulted_task(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    self::process::handle_reap_faulted_task(kernel, frame)
+}
+
 fn handle_vm_anon_map(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), SyscallError> {
     self::vm::handle_vm_anon_map(kernel, frame)
 }
@@ -1156,6 +1168,7 @@ pub fn dispatch(kernel: &mut KernelState, frame: &mut TrapFrame) -> Result<(), S
         Syscall::CreateInitramfsFileSliceMo => handle_create_initramfs_file_slice_mo(kernel, frame),
         Syscall::SpawnFromMemoryObject => handle_spawn_from_memory_object(kernel, frame),
         Syscall::RecvSharedV3 => handle_recv_shared_v3(kernel, frame),
+        Syscall::ReapFaultedTask => handle_reap_faulted_task(kernel, frame),
     };
     if result == Err(SyscallError::WouldBlock) {
         let caller_status = caller_tid.and_then(|tid| kernel.task_status(tid));
@@ -3517,6 +3530,105 @@ mod tests {
         );
         let err = dispatch(&mut state, &mut release).expect_err("unaligned");
         assert_eq!(err, SyscallError::InvalidArgs);
+    }
+
+    fn switch_to_task_for_reap_test(state: &mut KernelState, tid: u64) {
+        state.enqueue_current_cpu(tid).expect("enqueue task");
+        state.dispatch_next_task().expect("dispatch task");
+        if state.current_tid() != Some(tid) {
+            state.yield_current().expect("switch task");
+        }
+        assert_eq!(state.current_tid(), Some(tid));
+    }
+
+    fn register_pm_for_reap_test(state: &mut KernelState) {
+        state
+            .register_task_with_class(
+                PM_BOOTSTRAP_TID,
+                crate::kernel::task::TaskClass::SystemServer,
+            )
+            .expect("register pm");
+        switch_to_task_for_reap_test(state, PM_BOOTSTRAP_TID);
+    }
+
+    fn reap_faulted_task_syscall(
+        state: &mut KernelState,
+        target_tid: u64,
+    ) -> Result<(), SyscallError> {
+        let mut frame = TrapFrame::new(
+            Syscall::ReapFaultedTask as usize,
+            [target_tid as usize, 0, 0, 0, 0, 0],
+        );
+        dispatch(state, &mut frame)
+    }
+
+    #[test]
+    fn task_reap_faulted_contract() {
+        let mut state = Bootstrap::init().expect("kernel");
+        register_pm_for_reap_test(&mut state);
+
+        state.register_task(42).expect("faulted target");
+        let (asid, _cap) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(42, asid).expect("bind asid");
+        state.tcb_mut(42).expect("tcb").status = crate::kernel::task::TaskStatus::Faulted;
+        assert!(state.asid_is_live_for_test(asid), "asid live before reap");
+        reap_faulted_task_syscall(&mut state, 42).expect("reap faulted");
+        assert_eq!(
+            state.task_status(42),
+            Some(crate::kernel::task::TaskStatus::Dead)
+        );
+        assert!(
+            !state.asid_is_live_for_test(asid),
+            "asid destroyed by mark_task_dead cleanup"
+        );
+
+        state.register_task(43).expect("exited target");
+        state.tcb_mut(43).expect("tcb").status = crate::kernel::task::TaskStatus::Exited(9);
+        reap_faulted_task_syscall(&mut state, 43).expect("reap exited");
+        assert_eq!(
+            state.task_status(43),
+            Some(crate::kernel::task::TaskStatus::Dead)
+        );
+        reap_faulted_task_syscall(&mut state, 43).expect("reap already-dead idempotent");
+        assert_eq!(
+            state.task_status(43),
+            Some(crate::kernel::task::TaskStatus::Dead)
+        );
+
+        assert_eq!(
+            reap_faulted_task_syscall(&mut state, PM_BOOTSTRAP_TID),
+            Err(SyscallError::InvalidArgs)
+        );
+
+        state.register_task(44).expect("non-terminal target");
+        state.tcb_mut(44).expect("tcb").status = crate::kernel::task::TaskStatus::Runnable;
+        assert_eq!(
+            reap_faulted_task_syscall(&mut state, 44),
+            Err(SyscallError::WrongObject)
+        );
+        state.tcb_mut(44).expect("tcb").status = crate::kernel::task::TaskStatus::Running;
+        assert_eq!(
+            reap_faulted_task_syscall(&mut state, 44),
+            Err(SyscallError::WrongObject)
+        );
+        state.tcb_mut(44).expect("tcb").status =
+            crate::kernel::task::TaskStatus::Blocked(crate::kernel::task::WaitReason::Poll);
+        assert_eq!(
+            reap_faulted_task_syscall(&mut state, 44),
+            Err(SyscallError::WrongObject)
+        );
+
+        reap_faulted_task_syscall(&mut state, 404).expect("missing treated already gone");
+
+        state
+            .register_task_with_class(45, crate::kernel::task::TaskClass::App)
+            .expect("non-pm");
+        switch_to_task_for_reap_test(&mut state, 45);
+        state.tcb_mut(44).expect("tcb").status = crate::kernel::task::TaskStatus::Faulted;
+        assert_eq!(
+            reap_faulted_task_syscall(&mut state, 44),
+            Err(SyscallError::MissingRight)
+        );
     }
 
     #[test]

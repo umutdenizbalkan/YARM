@@ -74,6 +74,8 @@ pub mod syscall {
     pub const SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR: usize = 28;
     /// Phase 3A: Spawn a process from a MemoryObject capability.
     pub const SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR: usize = 29;
+    /// SUP-L7K-A: PM-only reap of a terminal faulted/exited task after restart.
+    pub const SYSCALL_REAP_FAULTED_TASK_NR: usize = 31;
     const SYSCALL_NO_TRANSFER_CAP: u64 = Message::NO_TRANSFER_CAP;
     const SYSCALL_RECV_MAP_INTENT_DEFAULT: usize = 0;
     const SYSCALL_RECV_META_REPLY_CAP: usize = 1 << 0;
@@ -1019,6 +1021,35 @@ pub mod syscall {
         let caller_cap = (ret.ret2 & 0xFFFF_FFFF) as u32;
         let spawner_cap = (ret.ret2 >> 32) as u32;
         Ok((ret.ret1 as u64, caller_cap, spawner_cap))
+    }
+
+    /// Reap a terminal faulted/exited/dead task after PM has successfully spawned
+    /// a restart replacement.
+    ///
+    /// Only callable by PM (TID=3). This is not a generic kill syscall: the
+    /// kernel rejects the caller targeting itself and rejects non-terminal
+    /// Running/Runnable/Blocked tasks.
+    ///
+    /// # Safety
+    /// The caller must only use this after it has established restart ownership
+    /// for `target_tid`; the kernel enforces PM-only authority and terminal state.
+    #[inline]
+    pub unsafe fn reap_faulted_task(target_tid: u64) -> core::result::Result<(), SyscallError> {
+        let ret = unsafe {
+            crate::arch::raw_syscall(
+                SYSCALL_REAP_FAULTED_TASK_NR,
+                [target_tid as usize, 0, 0, 0, 0, 0],
+            )
+        };
+        #[cfg(target_arch = "x86_64")]
+        if ret.error != 0 {
+            return Err(decode_syscall_error(ret.error));
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        if ret.ret0 != 0 {
+            return Err(decode_syscall_error(ret.ret0));
+        }
+        Ok(())
     }
 
     #[inline]

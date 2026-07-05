@@ -922,6 +922,63 @@ fn copy_spawn_startup_args(
     Ok(out)
 }
 
+/// SUP-L7K-A: PM-only terminal-task reap used after PM has successfully created
+/// a restart replacement. This is deliberately not a generic kill syscall:
+/// only PM (TID 3) may call it, the caller may not target itself, and only
+/// terminal Faulted/Exited/Dead tasks are accepted. Cleanup is delegated to the
+/// existing `mark_task_dead` path so VM/CNode/IPC/reply-cap/runtime-cap teardown
+/// stays identical to established task-death cleanup.
+pub(super) fn handle_reap_faulted_task(
+    kernel: &mut KernelState,
+    frame: &mut TrapFrame,
+) -> Result<(), SyscallError> {
+    let caller = current_tid(kernel)?;
+    let target = frame.arg(0) as u64;
+    crate::yarm_log!(
+        "TASK_REAP_FAULTED_BEGIN caller_tid={} target_tid={}",
+        caller,
+        target
+    );
+
+    if caller != PM_BOOTSTRAP_TID {
+        crate::yarm_log!(
+            "TASK_REAP_FAULTED_REJECT target_tid={} reason=not_pm",
+            target
+        );
+        return Err(SyscallError::MissingRight);
+    }
+    if target == caller {
+        crate::yarm_log!("TASK_REAP_FAULTED_REJECT target_tid={} reason=self", target);
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    let Some(status) = kernel.task_status(target) else {
+        crate::yarm_log!("TASK_REAP_FAULTED_ALREADY_GONE target_tid={}", target);
+        frame.set_ok(0, 0, 0);
+        return Ok(());
+    };
+
+    match status {
+        crate::kernel::task::TaskStatus::Faulted
+        | crate::kernel::task::TaskStatus::Exited(_)
+        | crate::kernel::task::TaskStatus::Dead => {}
+        crate::kernel::task::TaskStatus::Runnable
+        | crate::kernel::task::TaskStatus::Running
+        | crate::kernel::task::TaskStatus::Blocked(_) => {
+            crate::yarm_log!(
+                "TASK_REAP_FAULTED_REJECT target_tid={} reason=non_terminal",
+                target
+            );
+            return Err(SyscallError::WrongObject);
+        }
+    }
+
+    kernel.mark_task_dead(target).map_err(SyscallError::from)?;
+    crate::yarm_log!("TASK_REAP_FAULTED_OK target_tid={}", target);
+    frame.set_ok(0, 0, 0);
+    Ok(())
+}
+
 /// Phase 3A: Spawn a process from an InitramfsFileSlice MemoryObject capability.
 ///
 /// Access control: caller must be PM (TID == PM_BOOTSTRAP_TID).
