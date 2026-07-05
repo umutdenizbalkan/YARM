@@ -1998,8 +1998,13 @@ pub fn run() {
                     );
                 } else {
                     yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
+                    if supervisor_restart_test_build_gate_enabled() {
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_CONTROL_OPTIONAL_PROBE_SKIP reason=registration_receive_required"
+                        );
+                    }
                     yarm_user_rt::user_log!(
-                        "SUPERVISOR_CONTROL_RECV_BEGIN cap={} mode=bounded_poll",
+                        "SUPERVISOR_CONTROL_REQUIRED_RECV_BEGIN mode=registration cap={}",
                         supervisor.handoff.supervisor_control_recv_cap.0
                     );
                     match supervisor_recv_short_deadline(
@@ -2009,6 +2014,12 @@ pub fn run() {
                         Ok(Some(msg)) => {
                             made_progress = true;
                             let payload = msg.as_slice();
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_CONTROL_REQUIRED_RECV_OK sender={} opcode={} len={}",
+                                msg.sender_tid.0,
+                                msg.opcode,
+                                payload.len()
+                            );
                             yarm_user_rt::user_log!(
                                 "SUPERVISOR_CONTROL_RECV sender={} opcode={} len={}",
                                 msg.sender_tid.0,
@@ -2105,18 +2116,11 @@ pub fn run() {
                             yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_EMPTY");
                         }
                         Err(err) => {
-                            if supervisor_restart_test_build_gate_enabled()
-                                && matches!(err, KernelError::WrongObject)
-                            {
-                                yarm_user_rt::user_log!(
-                                    "SUPERVISOR_CONTROL_RECV_SKIP reason=restart_test_optional_control_probe_wrong_object"
-                                );
-                            } else {
-                                yarm_user_rt::user_log!(
-                                    "supervisor.srv control recv error: {:?}",
-                                    err
-                                );
-                            }
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_CONTROL_REQUIRED_RECV_ERR err={:?}",
+                                err
+                            );
+                            let _ = yarm_user_rt::syscall::yield_now();
                         }
                     }
                 }
