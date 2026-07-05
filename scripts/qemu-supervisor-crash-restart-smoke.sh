@@ -10,34 +10,57 @@
 set -euo pipefail
 
 ARCH=${1:-x86_64}
-if [[ "$ARCH" != "x86_64" ]]; then
-  echo "[error] SUP-L6 crash restart smoke currently supports x86_64 only (got: $ARCH)"
-  exit 2
-fi
+case "$ARCH" in
+  x86_64)
+    OUT_DIR=${OUT_DIR:-build-x86_64-crash-restart}
+    ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
+    KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/kernel_boot.elf}
+    INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
+    QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
+    QEMU_MACHINE=${QEMU_MACHINE:-q35}
+    QEMU_CPU=${QEMU_CPU:-qemu64}
+    QEMU_MEMORY=${QEMU_MEMORY:-512M}
+    QEMU_SMP=${QEMU_SMP:-1}
+    BUILD_SCRIPT=scripts/build-qemu-x86_64-artifacts.sh
+    ;;
+  aarch64)
+    OUT_DIR=${OUT_DIR:-build-aarch64-crash-restart}
+    ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
+    KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/yarm-aarch64.bin}
+    INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
+    QEMU_BIN=${QEMU_BIN:-qemu-system-aarch64-hwe}
+    if ! command -v "$QEMU_BIN" >/dev/null 2>&1 && [[ "$QEMU_BIN" == "qemu-system-aarch64-hwe" ]]; then
+      QEMU_BIN=qemu-system-aarch64
+    fi
+    QEMU_MACHINE=${QEMU_MACHINE:-virt}
+    QEMU_CPU=${QEMU_CPU:-cortex-a72}
+    QEMU_MEMORY=${QEMU_MEMORY:-1024M}
+    QEMU_SMP=${QEMU_SMP:-2}
+    BUILD_SCRIPT=scripts/build-qemu-aarch64-artifacts.sh
+    ;;
+  *)
+    echo "[error] SUP-L6 crash restart smoke currently supports x86_64 and aarch64 only (got: $ARCH)"
+    exit 2
+    ;;
+esac
 
-OUT_DIR=${OUT_DIR:-build-x86_64-crash-restart}
-ROOTFS_DIR=${ROOTFS_DIR:-$OUT_DIR/rootfs}
-KERNEL_IMAGE=${KERNEL_IMAGE:-$OUT_DIR/kernel_boot.elf}
-INITRAMFS_IMAGE=${INITRAMFS_IMAGE:-$OUT_DIR/initramfs-core.cpio}
 LOGFILE=${LOGFILE:-$OUT_DIR/qemu-supervisor-crash-restart.log}
 SNAPSHOT=${SNAPSHOT:-$OUT_DIR/qemu-supervisor-crash-restart.markers}
 TIMEOUT_SECS=${TIMEOUT_SECS:-90}
-QEMU_BIN=${QEMU_BIN:-qemu-system-x86_64}
-QEMU_MACHINE=${QEMU_MACHINE:-q35}
-QEMU_CPU=${QEMU_CPU:-qemu64}
-QEMU_MEMORY=${QEMU_MEMORY:-512M}
-QEMU_SMP=1
 DEFAULT_KERNEL_CMDLINE="console=ttyS0 rdinit=/init yarm.supervisor_restart_test=1 yarm.crash_test_max_restarts=3 yarm.crash_test_delay_ms=1000"
 KERNEL_CMDLINE=${KERNEL_CMDLINE:-$DEFAULT_KERNEL_CMDLINE}
 
 mkdir -p "$OUT_DIR"
 
-export OUT_DIR ROOTFS_DIR
 export YARM_SUPERVISOR_RESTART_TEST=1
 export SUPERVISOR_RESTART_TEST=1
 
 echo "[info] building gated crash-test QEMU artifacts for $ARCH"
-scripts/build-qemu-x86_64-artifacts.sh
+if [[ "$ARCH" == "aarch64" ]]; then
+  env OUT_DIR="$OUT_DIR" ROOTFS_DIR="$ROOTFS_DIR" INITRAMFS_IMAGE="$INITRAMFS_IMAGE" KERNEL_BIN_IMAGE="$KERNEL_IMAGE" "$BUILD_SCRIPT"
+else
+  env OUT_DIR="$OUT_DIR" ROOTFS_DIR="$ROOTFS_DIR" INITRAMFS_IMAGE="$INITRAMFS_IMAGE" KERNEL_IMAGE="$KERNEL_IMAGE" "$BUILD_SCRIPT"
+fi
 
 if [[ ! -f "$KERNEL_IMAGE" ]]; then
   echo "[error] kernel image missing after build: $KERNEL_IMAGE"
@@ -111,6 +134,7 @@ fatal_patterns=(
   "panic"
   "PANIC"
   "FATAL"
+  "memory allocation"
   "DOUBLE_FAULT"
   "DATA_ABORT"
   "SERROR"
@@ -144,13 +168,8 @@ oracle_failed=0
 require_count "CRASH_TEST_SRV_ENTRY" 4 || oracle_failed=1
 require_count "CRASH_TEST_SRV_READY" 4 || oracle_failed=1
 exit_count=$(count_marker "CRASH_TEST_SRV_EXIT_NOW")
-fault_count=$(count_marker "CRASH_TEST_SRV_FAULT_NOW")
 printf 'CRASH_TEST_SRV_EXIT_NOW=%s\n' "$exit_count" >>"$SNAPSHOT"
-printf 'CRASH_TEST_SRV_FAULT_NOW=%s\n' "$fault_count" >>"$SNAPSHOT"
-if [[ "$exit_count" -ne 4 && "$fault_count" -ne 4 ]]; then
-  echo "[error] terminal marker count mismatch: expected either EXIT_NOW=4 or FAULT_NOW=4, got EXIT_NOW=$exit_count FAULT_NOW=$fault_count"
-  oracle_failed=1
-fi
+require_count "CRASH_TEST_SRV_FAULT_NOW" 4 || oracle_failed=1
 require_count "PM_RESTART_REPLY_ACCEPTED" 3 || oracle_failed=1
 require_count "SUPERVISOR_PM_RESTART_STATE_UPDATED" 3 || oracle_failed=1
 require_count "SUPERVISOR_RESTART_LIMIT_EXCEEDED" 1 || oracle_failed=1
@@ -182,6 +201,7 @@ for marker in \
   SUPERVISOR_IDLE_WAIT_SELECT \
   SUPERVISOR_CONTROL_WAIT_SKIPPED \
   SUPERVISOR_FAULT_WAIT_BEGIN \
+  SUPERVISOR_FAULT_WAIT_RECV \
   SUPERVISOR_FAULT_LOOKUP_BEGIN \
   SUPERVISOR_FAULT_LOOKUP_OK \
   SUPERVISOR_RESTART_ATTEMPT_ADVANCE \
@@ -193,6 +213,7 @@ for marker in \
   PM_RESTART_SPAWN_BEGIN \
   PM_RESTART_TEARDOWN_OLD_BEGIN \
   PM_RESTART_TEARDOWN_OLD_OK \
+  TASK_REAP_FAULTED_OK \
   PM_RESTART_SPAWN_OK \
   PM_RESTART_REPLY_ACCEPTED \
   SUPERVISOR_RESTART_LIMIT_EXCEEDED \
@@ -206,6 +227,9 @@ require_present "SUPERVISOR_RESTART_TOKEN_STATE tid=10008 present=1" || oracle_f
 require_present "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=0 new=1" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_SCHEDULED tid=10008" || oracle_failed=1
 require_present "PM_RESTART_TEARDOWN_OLD_OK old_tid=10008" || oracle_failed=1
+require_present "TASK_REAP_FAULTED_OK target_tid=10008" || oracle_failed=1
+require_present "TASK_REAP_FAULTED_OK target_tid=10009" || oracle_failed=1
+require_present "TASK_REAP_FAULTED_OK target_tid=10010" || oracle_failed=1
 require_present "PM_RESTART_SPAWN_OK target_tid=10009 replacement_tid=10010" || oracle_failed=1
 require_present "SUPERVISOR_PM_RESTART_STATE_UPDATED tid=10010 replacement_tid=10010 attempt=2" || oracle_failed=1
 if ! rg -a "SUPERVISOR_FAULT_(WAIT|DRAIN)_RECV tid=10008" "$LOG_NORM" >/dev/null 2>&1; then

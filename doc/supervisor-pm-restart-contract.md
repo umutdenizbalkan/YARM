@@ -884,3 +884,7 @@ No CapID or reply-cap authority changes are introduced. CapIDs remain cspace-loc
 ## SUP-L7O terminal degraded completion
 
 The PM restart contract remains unchanged for attempts 1/2/3 and old-target teardown. After the fourth crash-test incarnation exceeds the restart limit, `SUPERVISOR_SERVICE_DEGRADED_FINAL` is terminal and handled. The supervisor may attempt task-exit and init-alert side effects, but in the crash-restart runtime those hooks are optional/unwired; `InvalidCapability` from those terminal side effects is logged as `SUPERVISOR_DEGRADED_TERMINAL_OPTIONAL_SKIP ... reason=unavailable` and the terminal decision completes with `SUPERVISOR_DEGRADED_TERMINAL_APPLY_OK`. Real PM restart, token, IPC, reply-cap, and ReapFaultedTask failures remain fail-closed.
+
+## SUP-L7P aarch64 crash-restart smoke plumbing
+
+`scripts/qemu-supervisor-crash-restart-smoke.sh` now accepts `x86_64` and `aarch64`. The aarch64 mode reuses the existing aarch64 QEMU/build plumbing from the core smoke (`scripts/build-qemu-aarch64-artifacts.sh`, `virt`, `cortex-a72`, and the aarch64 QEMU binary fallback) while preserving the same arch-neutral supervisor/PM/reap oracle: four crash-test entries, three accepted PM restarts, old-target reap markers, restart-limit degraded final state, and terminal degraded apply OK. No supervisor, PM, ReapFaultedTask, syscall ABI, kernel, or arch behavior is changed by this plumbing.
