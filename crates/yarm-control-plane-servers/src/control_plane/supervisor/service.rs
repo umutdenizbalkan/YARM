@@ -1654,6 +1654,8 @@ impl SupervisorService {
             #[cfg(not(test))]
             yarm_user_rt::user_log!("SUPERVISOR_SERVICE_DEGRADED_FINAL");
             self.degraded = true;
+            #[cfg(not(test))]
+            yarm_user_rt::user_log!("SUPERVISOR_DEGRADED_TERMINAL_APPLY_BEGIN tid={}", event.tid);
             let mark_result = task_exit_ops.mark_task_dead(event.tid);
             let alert_result = self.send_init_alert(
                 task_exit_ops,
@@ -1662,8 +1664,33 @@ impl SupervisorService {
                     kind: InitAlertKind::ServiceDegraded,
                 },
             );
-            mark_result?;
-            alert_result?;
+            #[cfg(test)]
+            {
+                mark_result?;
+                alert_result?;
+            }
+            #[cfg(not(test))]
+            {
+                if let Err(err) = mark_result {
+                    if matches!(err, KernelError::InvalidCapability) {
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_DEGRADED_TERMINAL_OPTIONAL_SKIP op=task_exit reason=unavailable"
+                        );
+                    } else {
+                        return Err(err);
+                    }
+                }
+                if let Err(err) = alert_result {
+                    if matches!(err, KernelError::InvalidCapability) {
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_DEGRADED_TERMINAL_OPTIONAL_SKIP op=init_alert reason=unavailable"
+                        );
+                    } else {
+                        return Err(err);
+                    }
+                }
+                yarm_user_rt::user_log!("SUPERVISOR_DEGRADED_TERMINAL_APPLY_OK tid={}", event.tid);
+            }
             #[cfg(not(test))]
             yarm_user_rt::user_log!(
                 "SUPERVISOR_HANDLE_TASK_EXIT_RESULT tid={} decision=degraded-final",

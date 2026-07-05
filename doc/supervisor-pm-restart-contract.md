@@ -880,3 +880,7 @@ PM now reaps the old faulted target after an accepted replacement spawn using th
 The old target is the request target TID, while the replacement TID is passed only for logging and is never reaped. Rollback remains separate: failed spawn or failed replacement accounting still uses the rolled-back/resource-unavailable path and does not tear down the old target. This preserves the SUP-L7J retry behavior for real resource failures while allowing successful chains such as `10008 -> 10009 -> 10010 -> 10011` to release old VM/task resources between attempts.
 
 No CapID or reply-cap authority changes are introduced. CapIDs remain cspace-local, reply caps remain one-shot, PM remains the restart execution authority, the supervisor remains policy/state owner, and trusted-supervisor plus PM-reply validation stay unchanged.
+
+## SUP-L7O terminal degraded completion
+
+The PM restart contract remains unchanged for attempts 1/2/3 and old-target teardown. After the fourth crash-test incarnation exceeds the restart limit, `SUPERVISOR_SERVICE_DEGRADED_FINAL` is terminal and handled. The supervisor may attempt task-exit and init-alert side effects, but in the crash-restart runtime those hooks are optional/unwired; `InvalidCapability` from those terminal side effects is logged as `SUPERVISOR_DEGRADED_TERMINAL_OPTIONAL_SKIP ... reason=unavailable` and the terminal decision completes with `SUPERVISOR_DEGRADED_TERMINAL_APPLY_OK`. Real PM restart, token, IPC, reply-cap, and ReapFaultedTask failures remain fail-closed.

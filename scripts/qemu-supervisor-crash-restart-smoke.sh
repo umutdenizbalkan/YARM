@@ -127,6 +127,9 @@ fatal_patterns=(
   "PM_RESTART_SPAWN_FAIL request_id=2 target_tid=10009 reason=TableFull"
   "PM_RESTART_TEARDOWN_OLD_FAIL old_tid=10008"
   "SUPERVISOR_RESTART_RETRY_EXHAUSTED tid=10009"
+  "supervisor\.srv failed to apply restart policy decision"
+  "SUPERVISOR_POST_FAULT_ACCEPT_FAIL tid=10011"
+  "failed to apply restart policy decision: tid=10011, err=InvalidCapability"
   "WrongObject.*token-query"
   "StaleCapability.*token-query"
 )
@@ -193,7 +196,8 @@ for marker in \
   PM_RESTART_SPAWN_OK \
   PM_RESTART_REPLY_ACCEPTED \
   SUPERVISOR_RESTART_LIMIT_EXCEEDED \
-  SUPERVISOR_SERVICE_DEGRADED_FINAL; do
+  SUPERVISOR_SERVICE_DEGRADED_FINAL \
+  SUPERVISOR_DEGRADED_TERMINAL_APPLY_OK; do
   require_present "$marker" || oracle_failed=1
 done
 
