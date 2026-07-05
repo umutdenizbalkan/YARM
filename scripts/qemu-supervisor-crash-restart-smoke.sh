@@ -127,6 +127,8 @@ fatal_patterns=(
   "PM_RESTART_SPAWN_FAIL request_id=2 target_tid=10009 reason=TableFull"
   "PM_RESTART_TEARDOWN_OLD_FAIL old_tid=10008"
   "SUPERVISOR_RESTART_RETRY_EXHAUSTED tid=10009"
+  "SUPERVISOR_LIFECYCLE_QUERY_ERR"
+  "supervisor\.srv control recv error: WrongObject"
   "WrongObject.*token-query"
   "StaleCapability.*token-query"
 )
