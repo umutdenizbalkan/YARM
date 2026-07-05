@@ -1935,49 +1935,29 @@ pub fn run() {
                 supervisor.degraded(),
             );
             // Query PM lifecycle table for the supervisor's own TID to establish
-            // truthful supervision metadata before entering the event loop. In
-            // the gated crash-restart runtime this self-probe is obsolete: the
-            // managed-record path is seeded by explicit supervisor registration
-            // messages and the PM restart contract, while early PM lifecycle
-            // request/reply caps may not yet be usable for this optional probe.
-            // Skip only that optional probe so real restart/token/PM errors
-            // remain fail-closed.
+            // truthful supervision metadata before entering the event loop.
             let supervisor_tid = startup.task_id;
-            yarm_user_rt::user_log!(
-                "SUPERVISOR_LIFECYCLE_QUERY_BEGIN tid={} cap_kind=pm_request_reply source=startup",
-                supervisor_tid
-            );
-            if supervisor_restart_test_build_gate_enabled() {
-                yarm_user_rt::user_log!(
-                    "SUPERVISOR_LIFECYCLE_QUERY_SKIP tid={} reason=restart_test_managed_record_probe_obsolete",
-                    supervisor_tid
-                );
-            } else {
-                yarm_user_rt::user_log!("SUPERVISOR_LIFECYCLE_QUERY tid={}", supervisor_tid);
-                match query_lifecycle_via_process_manager(process_manager_caps, supervisor_tid) {
-                    Ok(Some(reply)) if reply.is_found() => {
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_LIFECYCLE_FOUND tid={} image_id={} restart_supported=0",
-                            reply.tid,
-                            reply.image_id
-                        );
-                        yarm_user_rt::user_log!(
-                            "restart unsupported: PM lifecycle record found but no restart token source wired"
-                        );
-                    }
-                    Ok(Some(_)) | Ok(None) => {
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_LIFECYCLE_MISSING tid={}",
-                            supervisor_tid
-                        );
-                    }
-                    Err(err) => {
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_LIFECYCLE_QUERY_ERR tid={} err={:?}",
-                            supervisor_tid,
-                            err
-                        );
-                    }
+            yarm_user_rt::user_log!("SUPERVISOR_LIFECYCLE_QUERY tid={}", supervisor_tid);
+            match query_lifecycle_via_process_manager(process_manager_caps, supervisor_tid) {
+                Ok(Some(reply)) if reply.is_found() => {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_LIFECYCLE_FOUND tid={} image_id={} restart_supported=0",
+                        reply.tid,
+                        reply.image_id
+                    );
+                    yarm_user_rt::user_log!(
+                        "restart unsupported: PM lifecycle record found but no restart token source wired"
+                    );
+                }
+                Ok(Some(_)) | Ok(None) => {
+                    yarm_user_rt::user_log!("SUPERVISOR_LIFECYCLE_MISSING tid={}", supervisor_tid);
+                }
+                Err(err) => {
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_LIFECYCLE_QUERY_ERR tid={} err={:?}",
+                        supervisor_tid,
+                        err
+                    );
                 }
             }
             loop {
@@ -1998,15 +1978,6 @@ pub fn run() {
                     );
                 } else {
                     yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_BEGIN");
-                    if supervisor_restart_test_build_gate_enabled() {
-                        yarm_user_rt::user_log!(
-                            "SUPERVISOR_CONTROL_OPTIONAL_PROBE_SKIP reason=registration_receive_required"
-                        );
-                    }
-                    yarm_user_rt::user_log!(
-                        "SUPERVISOR_CONTROL_REQUIRED_RECV_BEGIN mode=registration cap={}",
-                        supervisor.handoff.supervisor_control_recv_cap.0
-                    );
                     match supervisor_recv_short_deadline(
                         &mut transport,
                         supervisor.handoff.supervisor_control_recv_cap.0 as u32,
@@ -2014,12 +1985,6 @@ pub fn run() {
                         Ok(Some(msg)) => {
                             made_progress = true;
                             let payload = msg.as_slice();
-                            yarm_user_rt::user_log!(
-                                "SUPERVISOR_CONTROL_REQUIRED_RECV_OK sender={} opcode={} len={}",
-                                msg.sender_tid.0,
-                                msg.opcode,
-                                payload.len()
-                            );
                             yarm_user_rt::user_log!(
                                 "SUPERVISOR_CONTROL_RECV sender={} opcode={} len={}",
                                 msg.sender_tid.0,
@@ -2116,11 +2081,7 @@ pub fn run() {
                             yarm_user_rt::user_log!("SUPERVISOR_CONTROL_POLL_EMPTY");
                         }
                         Err(err) => {
-                            yarm_user_rt::user_log!(
-                                "SUPERVISOR_CONTROL_REQUIRED_RECV_ERR err={:?}",
-                                err
-                            );
-                            let _ = yarm_user_rt::syscall::yield_now();
+                            yarm_user_rt::user_log!("supervisor.srv control recv error: {:?}", err);
                         }
                     }
                 }
