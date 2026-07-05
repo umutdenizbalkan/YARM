@@ -120,6 +120,9 @@ fatal_patterns=(
   "CapabilityFull"
   "MissingRight"
   "BLOCKED_WOULDBLOCK_FATAL"
+  "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid=10008 reason=recv"
+  "WrongObject.*token-query"
+  "StaleCapability.*token-query"
 )
 for pattern in "${fatal_patterns[@]}"; do
   if rg -a -n "$pattern" "$LOG_NORM" >/dev/null 2>&1; then
@@ -187,6 +190,7 @@ for marker in \
 done
 
 require_present "SUPERVISOR_FAULT_LOOKUP_OK fault_tid=10008" || oracle_failed=1
+require_present "SUPERVISOR_RESTART_TOKEN_STATE tid=10008 present=1" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=0 new=1" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_SCHEDULED tid=10008" || oracle_failed=1
 if ! rg -a "SUPERVISOR_FAULT_(WAIT|DRAIN)_RECV tid=10008" "$LOG_FILE" >/dev/null 2>&1; then

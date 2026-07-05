@@ -1050,3 +1050,30 @@ SUP-L7H makes managed-record mode fault-priority before any blocking or bounded 
 SUP-L7H also avoids normal empty RecvSharedV3 fault-drain probes in the runtime hot loop. User QEMU showed empty nonblocking nr=30 probes could emit `BLOCKED_WOULDBLOCK_FATAL`; without kernel changes, the userspace fix is to stop using that empty probe as a normal polling heartbeat and rely on the bounded fault wait in managed mode. The smoke script treats `BLOCKED_WOULDBLOCK_FATAL` as a failure and requires either `SUPERVISOR_FAULT_WAIT_RECV tid=10008` or `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` plus the functional attempt-1 markers.
 
 Pending replay remains a bounded startup-race fallback, not an unconditional requirement. PM remains the restart execution authority, the supervisor remains the policy/state owner, and SUP-L7H does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.
+
+## SUP-L7I — supervisor record-token precedence and PM fallback boundary
+
+SUP-L7I is a supervisor-side restart-token handling fix that preserves the PM
+restart contract. PM remains the restart authority and continues to validate the
+trusted supervisor, scoped token fingerprint, request shape, attempt limits, and
+Accepted reply fields exactly as before. No PM restart opcode, PM request/reply
+layout, syscall ABI, kernel/arch path, CapRights value, RPi5 path, or DRS path is
+changed.
+
+The CAPABILITY_MODEL constraints are explicit for this path: CapIDs are
+cspace-local and are not copied from logs or payloads as authority; reply caps are
+one-shot and must not be stored, reused, or delegated; and capability failures
+such as `WrongObject`, `StaleCapability`, and `MissingRight` are real hard
+failures. Restart-token source precedence is now managed-record first and bounded
+PM query fallback second. The supervisor does not schedule a restart without a
+valid token from one of those sources.
+
+For the gated crash-test service, `SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY` now
+means the supervisor managed record contains the crash-test restart token for the
+current TID before any fault replay or scheduling path runs. If that record token
+is present, the supervisor does not send `PROC_OP_TASK_RESTART_TOKEN`; if it is
+missing, the bounded PM query remains a fail-closed fallback and returned tokens
+are stored back into the record only after a successful PM reply. Accepted PM
+replacement replies continue to carry replacement lineage, and the supervisor
+reseeds the crash-test record token for the replacement TID so attempt 2 keeps a
+valid token while PM remains responsible for actual restart execution.

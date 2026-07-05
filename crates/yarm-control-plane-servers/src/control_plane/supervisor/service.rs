@@ -156,6 +156,11 @@ const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 1;
 const SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 const SUPERVISOR_PM_RESTART_REPLY_CAP_OPCODE: u16 = 0;
+const SUPERVISOR_CRASH_TEST_RESTART_TOKEN_TAG: u64 = 0x4352_4153_4854_0000;
+
+fn supervisor_crash_test_restart_token_for_tid(tid: u64) -> u64 {
+    SUPERVISOR_CRASH_TEST_RESTART_TOKEN_TAG | (tid & 0xffff)
+}
 
 #[cfg(not(test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1035,6 +1040,10 @@ impl SupervisorService {
                     return Err(err);
                 }
                 if crash_test_registration {
+                    let restart_token = supervisor_crash_test_restart_token_for_tid(req.tid);
+                    if let Some(record) = self.find_record_mut(req.tid) {
+                        record.pending_restart_token = Some(restart_token);
+                    }
                     yarm_user_rt::user_log!(
                         "SUPERVISOR_CRASH_TEST_REGISTER_OK tid={} max_restarts=3",
                         req.tid
@@ -1042,8 +1051,9 @@ impl SupervisorService {
                     yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_RECORD_READY tid={}", req.tid);
                     yarm_user_rt::user_log!("SUPERVISOR_CRASH_TEST_POLICY max_restarts=3");
                     yarm_user_rt::user_log!(
-                        "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY tid={}",
-                        req.tid
+                        "SUPERVISOR_CRASH_TEST_RESTART_TOKEN_READY tid={} fingerprint={}",
+                        req.tid,
+                        (restart_token & 0xffff) as u16
                     );
                 }
             }
@@ -1158,6 +1168,15 @@ impl SupervisorService {
                             record.restart_attempts
                         );
                         record.tid = replacement_handle_value;
+                        if self.pm_restart_acceptance_enabled
+                            && matches!(record.kind, ManagedServiceKind::Driver)
+                            && record.restart_group == 13
+                        {
+                            record.pending_restart_token =
+                                Some(supervisor_crash_test_restart_token_for_tid(
+                                    replacement_handle_value,
+                                ));
+                        }
                         #[cfg(not(test))]
                         {
                             yarm_user_rt::user_log!(
@@ -2373,18 +2392,29 @@ fn supervisor_handle_fault_endpoint_message(
                             return false;
                         }
                     }
-                    let token_result = supervisor
+                    yarm_user_rt::user_log!(
+                        "SUPERVISOR_RESTART_TOKEN_RECORD_CHECK tid={}",
+                        fault.tid
+                    );
+                    let token_result = match supervisor
                         .find_record(fault.tid)
                         .and_then(|record| record.pending_restart_token)
-                        .map(|token| Ok(Some((token, "record"))))
-                        .unwrap_or_else(|| {
-                            query_restart_token_via_process_manager(
-                                transport,
-                                process_manager_caps,
+                    {
+                        Some(token) => {
+                            yarm_user_rt::user_log!(
+                                "SUPERVISOR_RESTART_TOKEN_RECORD_HIT tid={} fingerprint={}",
                                 fault.tid,
-                            )
-                            .map(|token| token.map(|token| (token, "pm-query")))
-                        });
+                                (token & 0xffff) as u16
+                            );
+                            Ok(Some((token, "record")))
+                        }
+                        None => query_restart_token_via_process_manager(
+                            transport,
+                            process_manager_caps,
+                            fault.tid,
+                        )
+                        .map(|token| token.map(|token| (token, "pm-query"))),
+                    };
                     match token_result {
                         Ok(Some((restart_token, token_source))) => {
                             yarm_user_rt::user_log!(
