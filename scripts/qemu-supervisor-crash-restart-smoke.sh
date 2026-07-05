@@ -122,6 +122,11 @@ fatal_patterns=(
   "BLOCKED_WOULDBLOCK_FATAL"
   "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid=10008 reason=recv"
   "SUPERVISOR_PM_RESTART_REPLY_REJECTED_STATE tid=10009 request_id=2 failure=ResourceUnavailable"
+  "SPAWN_TASK_STACK_FAIL tid=10010"
+  "KSPAWN_SPAWN_TASK_FAIL tid=10010"
+  "PM_RESTART_SPAWN_FAIL request_id=2 target_tid=10009 reason=TableFull"
+  "PM_RESTART_TEARDOWN_OLD_FAIL old_tid=10008"
+  "SUPERVISOR_RESTART_RETRY_EXHAUSTED tid=10009"
   "WrongObject.*token-query"
   "StaleCapability.*token-query"
 )
@@ -183,6 +188,8 @@ for marker in \
   PM_RESTART_ACCOUNTING_BEGIN \
   PM_RESTART_RESERVE_REPLACEMENT_OK \
   PM_RESTART_SPAWN_BEGIN \
+  PM_RESTART_TEARDOWN_OLD_BEGIN \
+  PM_RESTART_TEARDOWN_OLD_OK \
   PM_RESTART_SPAWN_OK \
   PM_RESTART_REPLY_ACCEPTED \
   SUPERVISOR_RESTART_LIMIT_EXCEEDED \
@@ -194,9 +201,10 @@ require_present "SUPERVISOR_FAULT_LOOKUP_OK fault_tid=10008" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_TOKEN_STATE tid=10008 present=1" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=0 new=1" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_SCHEDULED tid=10008" || oracle_failed=1
-require_present "SUPERVISOR_PM_RESTART_REPLY_DEFERRED tid=10009 request_id=2 failure=ResourceUnavailable" || oracle_failed=1
-require_present "SUPERVISOR_RESTART_RESCHEDULED tid=10009 attempt=2" || oracle_failed=1
-if ! rg -a "SUPERVISOR_FAULT_(WAIT|DRAIN)_RECV tid=10008" "$LOG_FILE" >/dev/null 2>&1; then
+require_present "PM_RESTART_TEARDOWN_OLD_OK old_tid=10008" || oracle_failed=1
+require_present "PM_RESTART_SPAWN_OK target_tid=10009 replacement_tid=10010" || oracle_failed=1
+require_present "SUPERVISOR_PM_RESTART_STATE_UPDATED tid=10010 replacement_tid=10010 attempt=2" || oracle_failed=1
+if ! rg -a "SUPERVISOR_FAULT_(WAIT|DRAIN)_RECV tid=10008" "$LOG_NORM" >/dev/null 2>&1; then
   echo "[error] required fault receive marker missing for tid=10008 (expected WAIT_RECV or DRAIN_RECV)"
   oracle_failed=1
 fi
@@ -205,7 +213,7 @@ fi
 # smoke requirement. If the crash-test record was not ready before the first
 # fault, require the fallback stash/replay path; otherwise the direct
 # registered-fault path is sufficient.
-if ! grep -q "SUPERVISOR_CRASH_TEST_RECORD_READY tid=10008" "$LOG_FILE"; then
+if ! grep -q "SUPERVISOR_CRASH_TEST_RECORD_READY tid=10008" "$LOG_NORM"; then
   require_present "SUPERVISOR_FAULT_PENDING_STASH tid=10008" || oracle_failed=1
   require_present "SUPERVISOR_FAULT_PENDING_REPLAY_OK tid=10008" || oracle_failed=1
 fi

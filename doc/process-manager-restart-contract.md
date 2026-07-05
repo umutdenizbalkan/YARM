@@ -1108,3 +1108,11 @@ No kernel, arch, syscall ABI, CapRights, RPi5, or DRS path changes are made.
 CapIDs remain cspace-local, reply caps remain one-shot, and PM request/reply
 validation remains unchanged except for the supervisor-side retryable mapping of
 this specific rolled-back resource-unavailable reply.
+
+## SUP-L7K-B — PM old-target reap after accepted replacement
+
+SUP-L7K-B wires the SUP-L7K-A PM-only `ReapFaultedTask` syscall into the live PM restart accepted path. After PM has successfully spawned the replacement, recorded the replacement lifecycle/token state, and completed restart accounting, PM calls `reap_faulted_task(request.target_tid)` before emitting `PM_RESTART_SPAWN_OK` or `PM_RESTART_REPLY_ACCEPTED`.
+
+The teardown target is always the old request target (`request.target_tid`), never the accepted `replacement_tid`. The rollback path is unchanged: if spawn, lifecycle recording, reply construction, or accounting fails before acceptance, PM returns the existing rolled-back/resource-unavailable reply and does not reap the old target. Unexpected teardown syscall failure is logged with `PM_RESTART_TEARDOWN_OLD_FAIL old_tid=... err=...` and PM continues the accepted reply so it does not kill or discard the already-spawned replacement.
+
+The syscall used here is the narrow SUP-L7K-A kernel primitive: syscall nr `31`, `SYSCALL_COUNT = 32`, PM bootstrap TID `3` only, terminal `Faulted`/`Exited`/`Dead` targets only, and cleanup via `KernelState::mark_task_dead`. This path does not introduce CapID payload authority, does not store or reuse reply caps, does not alter PM trusted-supervisor validation, and does not broaden restart-any-image support.

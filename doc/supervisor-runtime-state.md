@@ -759,3 +759,9 @@ replacement TID. For the gated crash-test lineage, the supervisor reseeds the
 record token for the replacement TID so the next replacement fault can schedule
 attempt 2 through the same record-first path while PM remains the only restart
 execution authority.
+
+## SUP-L7K-B — accepted PM replacements reap old faulted targets
+
+The crash-restart runtime now expects PM to clean up old faulted targets after a successful replacement. PM uses the SUP-L7K-A PM-only `ReapFaultedTask` syscall (`nr=31`, `SYSCALL_COUNT=32`) after it records the replacement lifecycle/token state and before it emits the accepted spawn/reply markers. The expected PM markers are `PM_RESTART_TEARDOWN_OLD_BEGIN old_tid=... replacement_tid=...` followed by `PM_RESTART_TEARDOWN_OLD_OK old_tid=...` on the normal path.
+
+The replacement TID is never the teardown target, and rollback paths for failed replacement spawn do not reap the old target. This preserves the supervisor's SUP-L7J retry mapping for genuine resource-unavailable rollbacks while preventing successful restart chains from leaking old faulted task VM/task resources. Capability model rules are unchanged: no local CapID is copied as authority, reply caps remain one-shot, and capability failures remain hard failures.

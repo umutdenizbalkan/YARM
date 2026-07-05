@@ -3534,10 +3534,9 @@ mod tests {
 
     fn switch_to_task_for_reap_test(state: &mut KernelState, tid: u64) {
         state.enqueue_current_cpu(tid).expect("enqueue task");
-        state.dispatch_next_task().expect("dispatch task");
-        if state.current_tid() != Some(tid) {
-            state.yield_current().expect("switch task");
-        }
+        state
+            .yield_current_to(crate::kernel::ipc::ThreadId(tid))
+            .expect("yield to task");
         assert_eq!(state.current_tid(), Some(tid));
     }
 

@@ -872,3 +872,11 @@ restart replacements; the supervisor only schedules retry policy.
 PM emits spawn-failure and rollback-resource markers before returning the rolled
 back resource-unavailable reply, so the smoke log can distinguish a true spawn
 failure from validation failures and from successful `PM_RESTART_SPAWN_OK`.
+
+## SUP-L7K-B accepted replacement cleanup boundary
+
+PM now reaps the old faulted target after an accepted replacement spawn using the SUP-L7K-A PM-only `ReapFaultedTask` syscall (`nr=31`; kernel `SYSCALL_COUNT=32`). The call is placed in PM after replacement lifecycle/token state is recorded and restart accounting succeeds, but before `PM_RESTART_SPAWN_OK`, `PM_RESTART_REPLY_ACCEPTED`, and the Accepted reply are emitted.
+
+The old target is the request target TID, while the replacement TID is passed only for logging and is never reaped. Rollback remains separate: failed spawn or failed replacement accounting still uses the rolled-back/resource-unavailable path and does not tear down the old target. This preserves the SUP-L7J retry behavior for real resource failures while allowing successful chains such as `10008 -> 10009 -> 10010 -> 10011` to release old VM/task resources between attempts.
+
+No CapID or reply-cap authority changes are introduced. CapIDs remain cspace-local, reply caps remain one-shot, PM remains the restart execution authority, the supervisor remains policy/state owner, and trusted-supervisor plus PM-reply validation stay unchanged.
