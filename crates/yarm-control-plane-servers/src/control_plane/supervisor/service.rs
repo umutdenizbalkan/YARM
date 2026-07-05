@@ -156,6 +156,7 @@ const SUPERVISOR_RUNTIME_DEFAULT_RESTART_WINDOW_TICKS: u64 = 100;
 const SUPERVISOR_RUNTIME_IDLE_RECV_TIMEOUT_TICKS: u64 = 1;
 const SUPERVISOR_PM_RESTART_REPLACEMENT_HANDLE_KIND_TASK_TID: u16 = 1;
 const SUPERVISOR_PM_RESTART_REPLY_CAP_OPCODE: u16 = 0;
+const SUPERVISOR_PM_RESOURCE_UNAVAILABLE_RETRY_MAX: u8 = 3;
 const SUPERVISOR_CRASH_TEST_RESTART_TOKEN_TAG: u64 = 0x4352_4153_4854_0000;
 
 fn supervisor_crash_test_restart_token_for_tid(tid: u64) -> u64 {
@@ -452,6 +453,7 @@ struct ManagedServiceRecord {
     pm_restart_state: SupervisorPmRestartState,
     pending_restart_reason: SupervisorRestartReason,
     pending_pm_request_id: Option<u64>,
+    pm_resource_unavailable_retries: u8,
     pending_redelegation: bool,
     driver_policy: Option<ServiceRestartPolicy>,
     driver_plan: Option<DriverRecoveryPlan>,
@@ -688,6 +690,7 @@ impl SupervisorService {
             pm_restart_state: SupervisorPmRestartState::BlockedNoPmClient,
             pending_restart_reason: SupervisorRestartReason::Fault,
             pending_pm_request_id: None,
+            pm_resource_unavailable_retries: 0,
             pending_redelegation: false,
             driver_policy: None,
             driver_plan: None,
@@ -726,6 +729,7 @@ impl SupervisorService {
             pm_restart_state: SupervisorPmRestartState::BlockedNoPmClient,
             pending_restart_reason: SupervisorRestartReason::Fault,
             pending_pm_request_id: None,
+            pm_resource_unavailable_retries: 0,
             pending_redelegation: false,
             driver_policy: Some(policy),
             driver_plan: Some(plan),
@@ -926,6 +930,7 @@ impl SupervisorService {
         record.pm_restart_state = SupervisorPmRestartState::PendingDue;
         record.pending_restart_reason = reason;
         record.pending_pm_request_id = None;
+        record.pm_resource_unavailable_retries = 0;
         #[cfg(not(test))]
         yarm_user_rt::user_log!(
             "SUPERVISOR_RESTART_SCHEDULED tid={} due_tick={} attempt={} reason={:?} dependency_cause_tid={}",
@@ -1154,6 +1159,7 @@ impl SupervisorService {
                     record.pending_restart_due = None;
                     record.pending_restart_token = None;
                     record.pending_pm_request_id = None;
+                    record.pm_resource_unavailable_retries = 0;
                     record.restart_blocked_no_pm_client = false;
                     record.restart_deferred_by_pm = false;
                     record.restart_rejected_by_pm = false;
@@ -1219,6 +1225,40 @@ impl SupervisorService {
                     } else {
                         SupervisorPmRestartState::PmDeferred
                     };
+                    if failure == PmRestartFailure::ResourceUnavailable
+                        && record.pm_resource_unavailable_retries
+                            < SUPERVISOR_PM_RESOURCE_UNAVAILABLE_RETRY_MAX
+                    {
+                        record.pm_resource_unavailable_retries =
+                            record.pm_resource_unavailable_retries.saturating_add(1);
+                        let bounded_retry_tick = if retry_tick > self.current_tick.0 {
+                            TickInstant(retry_tick)
+                        } else {
+                            self.current_tick + TickDuration(1)
+                        };
+                        record.pending_restart_due = Some(bounded_retry_tick);
+                        record.pending_pm_request_id = None;
+                        #[cfg(not(test))]
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_RESTART_RESCHEDULED tid={} attempt={} retry_tick={} reason=pm_resource_unavailable retry_count={} retry_max={}",
+                            record.tid,
+                            record.restart_attempts,
+                            bounded_retry_tick.0,
+                            record.pm_resource_unavailable_retries,
+                            SUPERVISOR_PM_RESOURCE_UNAVAILABLE_RETRY_MAX
+                        );
+                    } else if failure == PmRestartFailure::ResourceUnavailable {
+                        record.pending_restart_due = None;
+                        record.restart_blocked_no_pm_client = true;
+                        #[cfg(not(test))]
+                        yarm_user_rt::user_log!(
+                            "SUPERVISOR_RESTART_RETRY_EXHAUSTED tid={} attempt={} reason=pm_resource_unavailable retry_count={} retry_max={}",
+                            record.tid,
+                            record.restart_attempts,
+                            record.pm_resource_unavailable_retries,
+                            SUPERVISOR_PM_RESOURCE_UNAVAILABLE_RETRY_MAX
+                        );
+                    }
                     #[cfg(not(test))]
                     yarm_user_rt::user_log!(
                         "SUPERVISOR_PM_RESTART_REPLY_DEFERRED_STATE tid={} request_id={} failure={:?} retry_tick={} state={:?}",
@@ -2849,6 +2889,21 @@ fn send_pm_restart_v1_via_process_manager(
         PmRestartReplyStatus::Deferred => {
             yarm_user_rt::user_log!(
                 "SUPERVISOR_PM_RESTART_REPLY_DEFERRED tid={} request_id={} failure={:?} retry_tick={}",
+                client_request.target_tid,
+                client_request.request_id,
+                reply.failure,
+                reply.next_retry_tick
+            );
+            SupervisorPmRestartClientResult::Deferred {
+                failure: reply.failure,
+                retry_tick: reply.next_retry_tick,
+            }
+        }
+        PmRestartReplyStatus::RolledBack
+            if reply.failure == PmRestartFailure::ResourceUnavailable =>
+        {
+            yarm_user_rt::user_log!(
+                "SUPERVISOR_PM_RESTART_REPLY_DEFERRED tid={} request_id={} failure={:?} retry_tick={} source=rolled_back",
                 client_request.target_tid,
                 client_request.request_id,
                 reply.failure,

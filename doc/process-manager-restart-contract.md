@@ -1077,3 +1077,34 @@ are stored back into the record only after a successful PM reply. Accepted PM
 replacement replies continue to carry replacement lineage, and the supervisor
 reseeds the crash-test record token for the replacement TID so attempt 2 keeps a
 valid token while PM remains responsible for actual restart execution.
+
+## SUP-L7J — rolled-back ResourceUnavailable retry and PM spawn-failure markers
+
+SUP-L7J keeps PM as the restart authority and changes only the supervisor's
+classification of one PM reply shape: `RolledBack + ResourceUnavailable` is now
+retryable/deferred instead of permanent rejection. Permanent validation and
+capability failures remain fail-closed: bad sender, missing authorization, bad or
+unscoped token, wrong token owner, unsupported startup-cap policy, bad image or
+unsupported service, `WrongObject`, `StaleCapability`, and `MissingRight` do not
+map to success or to a fabricated restart.
+
+The supervisor reschedules the same already-counted restart attempt when PM
+returns retryable resource unavailability, with a bounded retry counter and a
+minimum one-tick retry delay when PM provides no future retry tick. This prevents
+a tight loop and avoids incrementing restart attempts for PM resource retries.
+After the bound is exhausted the record remains fail-closed in the resource
+unavailable state rather than spawning locally or pretending success.
+
+PM now exposes rollback source markers around failed restart spawn work:
+`PM_RESTART_SPAWN_FAIL request_id=... target_tid=... reason=...`,
+`PM_RESTART_RESOURCE_STATE ... action=rollback`,
+`PM_RESTART_SPAWN_ROLLBACK_BEGIN ...`, and
+`PM_RESTART_SPAWN_ROLLBACK_DONE ...`. These markers expose the real source of a
+`ResourceUnavailable` rollback between `PM_RESTART_SPAWN_BEGIN` and the rolled
+back reply; they do not fake `PM_RESTART_SPAWN_OK` and do not broaden
+restart-any-image support.
+
+No kernel, arch, syscall ABI, CapRights, RPi5, or DRS path changes are made.
+CapIDs remain cspace-local, reply caps remain one-shot, and PM request/reply
+validation remains unchanged except for the supervisor-side retryable mapping of
+this specific rolled-back resource-unavailable reply.

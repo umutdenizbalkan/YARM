@@ -2481,9 +2481,27 @@ impl ProcessService {
         target_tid: u64,
         reason: &'static str,
     ) -> Result<Message, ProcessManagerError> {
+        yarm_user_rt::user_log!(
+            "PM_RESTART_RESOURCE_STATE request_id={} target_tid={} reason={} reserved=1 action=rollback",
+            request_id,
+            target_tid,
+            reason
+        );
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_ROLLBACK_BEGIN request_id={} target_tid={} reason={}",
+            request_id,
+            target_tid,
+            reason
+        );
         yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_BEGIN reason={}", reason);
         self.clear_pm_restart_reservation(request_id);
         yarm_user_rt::user_log!("PM_RESTART_ROLLBACK_DONE reason={}", reason);
+        yarm_user_rt::user_log!(
+            "PM_RESTART_SPAWN_ROLLBACK_DONE request_id={} target_tid={} reason={}",
+            request_id,
+            target_tid,
+            reason
+        );
         yarm_user_rt::user_log!("PM_RESTART_REPLY_ROLLED_BACK reason={}", reason);
         Self::pm_restart_reply(
             AbiPmRestartReplyStatus::RolledBack,
@@ -2758,11 +2776,30 @@ impl ProcessService {
         if self.sup_l4_pm_restart_rollback_injection
             == SupL4PmRestartRollbackInjection::SpawnFailure
         {
+            yarm_user_rt::user_log!(
+                "PM_RESTART_SPAWN_FAIL request_id={} target_tid={} reason=injected_spawn_failure",
+                request.request_id,
+                request.target_tid
+            );
             return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
         }
         let replacement_tid = match self.spawn_sup_l4_replacement(target_record) {
             Ok(tid) if tid != 0 => tid,
-            _ => {
+            Ok(_) => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_SPAWN_FAIL request_id={} target_tid={} reason=zero_replacement_tid",
+                    request.request_id,
+                    request.target_tid
+                );
+                return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
+            }
+            Err(err) => {
+                yarm_user_rt::user_log!(
+                    "PM_RESTART_SPAWN_FAIL request_id={} target_tid={} reason={:?}",
+                    request.request_id,
+                    request.target_tid,
+                    err
+                );
                 return self.rollback_pm_restart(request.request_id, request.target_tid, "spawn");
             }
         };

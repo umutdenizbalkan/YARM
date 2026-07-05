@@ -121,6 +121,7 @@ fatal_patterns=(
   "MissingRight"
   "BLOCKED_WOULDBLOCK_FATAL"
   "SUPERVISOR_RESTART_TOKEN_QUERY_FAIL tid=10008 reason=recv"
+  "SUPERVISOR_PM_RESTART_REPLY_REJECTED_STATE tid=10009 request_id=2 failure=ResourceUnavailable"
   "WrongObject.*token-query"
   "StaleCapability.*token-query"
 )
@@ -193,6 +194,8 @@ require_present "SUPERVISOR_FAULT_LOOKUP_OK fault_tid=10008" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_TOKEN_STATE tid=10008 present=1" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_ATTEMPT_ADVANCE old=0 new=1" || oracle_failed=1
 require_present "SUPERVISOR_RESTART_SCHEDULED tid=10008" || oracle_failed=1
+require_present "SUPERVISOR_PM_RESTART_REPLY_DEFERRED tid=10009 request_id=2 failure=ResourceUnavailable" || oracle_failed=1
+require_present "SUPERVISOR_RESTART_RESCHEDULED tid=10009 attempt=2" || oracle_failed=1
 if ! rg -a "SUPERVISOR_FAULT_(WAIT|DRAIN)_RECV tid=10008" "$LOG_FILE" >/dev/null 2>&1; then
   echo "[error] required fault receive marker missing for tid=10008 (expected WAIT_RECV or DRAIN_RECV)"
   oracle_failed=1

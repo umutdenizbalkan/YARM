@@ -851,3 +851,24 @@ SUP-L7H makes managed-record mode fault-priority before any blocking or bounded 
 SUP-L7H also avoids normal empty RecvSharedV3 fault-drain probes in the runtime hot loop. User QEMU showed empty nonblocking nr=30 probes could emit `BLOCKED_WOULDBLOCK_FATAL`; without kernel changes, the userspace fix is to stop using that empty probe as a normal polling heartbeat and rely on the bounded fault wait in managed mode. The smoke script treats `BLOCKED_WOULDBLOCK_FATAL` as a failure and requires either `SUPERVISOR_FAULT_WAIT_RECV tid=10008` or `SUPERVISOR_FAULT_DRAIN_RECV tid=10008` plus the functional attempt-1 markers.
 
 Pending replay remains a bounded startup-race fallback, not an unconditional requirement. PM remains the restart execution authority, the supervisor remains the policy/state owner, and SUP-L7H does not change kernel, syscall ABI, arch, RPi5, driver-manager DRS, PM trusted-supervisor validation, PM reply validation, broad restart policy, local supervisor spawn behavior, or PM restart codec/opcode counts.
+
+## SUP-L7J — retryable rolled-back resource unavailability
+
+SUP-L7J updates the live supervisor/PM restart contract at the reply-classification
+boundary. A PM reply with status `RolledBack` and failure
+`ResourceUnavailable` means PM reached the restart mechanism, had to roll back
+resource/spawn work, and is asking the supervisor to retry policy later. The
+supervisor therefore maps that exact shape to Deferred, logs
+`SUPERVISOR_PM_RESTART_REPLY_DEFERRED ... source=rolled_back`, and reschedules
+the same attempt with a bounded retry counter and at least one logical tick of
+backoff if PM does not provide a future retry tick.
+
+All other rolled-back, rejected, no-such-target, unsupported-version, and
+already-restarting replies keep fail-closed rejection semantics. The supervisor
+still validates reply request/target identity and rejects unexpected replacement
+handles on non-Accepted replies. PM remains the only component that may spawn or
+restart replacements; the supervisor only schedules retry policy.
+
+PM emits spawn-failure and rollback-resource markers before returning the rolled
+back resource-unavailable reply, so the smoke log can distinguish a true spawn
+failure from validation failures and from successful `PM_RESTART_SPAWN_OK`.
