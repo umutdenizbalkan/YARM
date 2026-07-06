@@ -539,25 +539,15 @@ pub(crate) fn complete_blocked_recv_for_waiter(
             return Err(SyscallError::InvalidArgs);
         }
     }
-    kernel.with_tcb_mut(waiter_tid, |tcb| {
-        tcb.user_context.arg0 = 0;
-        tcb.user_context.user_gprs[0] = 0; // RAX / x0  = ret0  = 0 (success)
-        // x86_64: the LSTAR entry asm does "mov rcx, r10" to forward arg3 (meta_ptr)
-        // into RCX before the GPR snapshot.  user_gprs[2]=RCX therefore holds the
-        // meta_ptr when the task blocks.  On the blocked-recv resumption path,
-        // write_task_gprs_to_saved_regs restores user_gprs verbatim (there is no
-        // write_trap_returns_to_saved_regs call on the task-switch path), so RCX is
-        // restored as meta_ptr ≠ 0.  user_rt reads error from RCX and misinterprets
-        // it as a syscall failure, causing the task to silently discard the message
-        // and loop back to ipc_recv.  Zero all four x86_64 return-register slots so
-        // the resumed task sees: rax=0 (ret0=ok), rcx=0 (error=0), rdx=0, r8=0.
-        #[cfg(target_arch = "x86_64")]
-        {
-            tcb.user_context.user_gprs[2] = 0; // RCX = error = 0 (success)
-            tcb.user_context.user_gprs[3] = 0; // RDX = ret2  = 0
-            tcb.user_context.user_gprs[7] = 0; // R8  = ret1  = 0
-        }
-    });
+    // Stage 188A: extracted into `KernelState::clear_blocked_recv_return_regs`
+    // (byte-identical) so the same completion can be applied by the dispatch-
+    // return executor. x86_64 rationale preserved there: the LSTAR entry asm does
+    // "mov rcx, r10" to forward arg3 (meta_ptr) into RCX before the GPR snapshot,
+    // and the blocked-recv resumption path restores `user_gprs` verbatim, so RCX
+    // must be zeroed or user_rt misreads it as a syscall error and discards the
+    // message. All four x86_64 return-register slots are zeroed: rax=0 (ret0=ok),
+    // rcx=0 (error=0), rdx=0 (ret2), r8=0 (ret1).
+    kernel.clear_blocked_recv_return_regs(waiter_tid);
     crate::yarm_log!(
         "IPC_RECV_BLOCKED_STATE_CLEAR tid={} reason=complete",
         waiter_tid

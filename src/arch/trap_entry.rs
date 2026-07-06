@@ -308,6 +308,16 @@ pub fn handle_trap_entry_shared(
     // `with_cpu` has returned; the outer `SpinLock<KernelState>` guard is dropped.
     // `inner_result: Result<(), TrapHandleError>` from the arch handler.
 
+    // Stage 188A: dispatch-return delivery channel drain. With the broad
+    // `&mut KernelState` borrow dropped above, execute any post-boundary work a
+    // handler stashed under the broad borrow, through `&SharedKernel` seams.
+    // Infrastructure only in Stage 188A: no live handler stashes work, so the
+    // stash is empty on every production trap and this is a no-op (one-shot
+    // `DISPATCH_RETURN_CHANNEL_READY mode=helper_only`). Placed FIRST among the
+    // post-`with_cpu` drains so a future blocked-waiter delivery completes before
+    // any context-switch drain.
+    shared.drain_dispatch_post_work(cpu)?;
+
     // Stage 167 (D6-GENUINE-A): first LIVE production use of the rank-1
     // scheduler split seam. With the global `SpinLock<KernelState>` guard from
     // `with_cpu` already dropped above, run one genuine `local_dispatch_step_split`

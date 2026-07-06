@@ -48761,6 +48761,289 @@ mod stage187d_blocked_waiter_delivery_hard_stop {
 }
 
 // ===========================================================================
+// Stage 188A (DISPATCH-RETURN-DELIVERY-CHANNEL) — typed dispatch-return channel
+// so a handler under the broad with_cpu / &mut KernelState borrow can hand
+// post-boundary work back to runtime, executed after the borrow drops through
+// &SharedKernel seams. INFRASTRUCTURE ONLY: no live handler produces work, so
+// the drain is a per-trap no-op (channel inert; one-shot READY marker only).
+//
+// Guards pin: the DispatchPostWork enum is by-value (no &mut KernelState, no
+// borrows, no CapId); the executor uses the 186E copy seam and no IPC lock; its
+// Phase-C with_cpu re-entry calls no seam; the drain runs AFTER with_cpu in the
+// trap entry; no production handler stashes work; no fallback/FAIL markers.
+// Functional tests drive the channel end-to-end: an empty stash is an inert
+// no-op, and a stashed BlockedWaiterPlainDelivery is executed by the drain,
+// copying payload+meta into user memory via the seam.
+// ===========================================================================
+#[cfg(test)]
+mod stage188a_dispatch_return_delivery_channel {
+    use super::*;
+    use crate::kernel::dispatch_post_work::{
+        BlockedWaiterPlainDeliverySnapshot, DISPATCH_POST_WORK_META_LEN, DispatchPostWork,
+    };
+    use crate::runtime::SharedKernel;
+
+    const POST_WORK_SRC: &str = include_str!("../dispatch_post_work.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+    const TRAP_ENTRY_SRC: &str = include_str!("../../arch/trap_entry.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn code_only(src: &str) -> alloc::string::String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with("///") && !t.starts_with("//!")
+            })
+            .collect::<alloc::vec::Vec<_>>()
+            .join("\n")
+    }
+
+    // The DispatchPostWork enum + its snapshot are by-value only: no
+    // &mut KernelState, no borrowed subsystem references, and no CapId (a plain
+    // delivery carries no sender-local authority).
+    #[test]
+    fn stage188a_post_work_is_by_value_no_borrow_no_cap() {
+        let code = code_only(POST_WORK_SRC);
+        // Slice both type definitions.
+        let enum_def = code
+            .split("pub(crate) enum DispatchPostWork {")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("DispatchPostWork enum");
+        let snap_def = code
+            .split("pub(crate) struct BlockedWaiterPlainDeliverySnapshot {")
+            .nth(1)
+            .and_then(|r| r.split("\n}").next())
+            .expect("snapshot struct");
+        for (name, def) in [("enum", enum_def), ("snapshot", snap_def)] {
+            assert!(
+                !def.contains("KernelState"),
+                "DispatchPostWork {name} must not carry KernelState"
+            );
+            assert!(
+                !def.contains('&'),
+                "DispatchPostWork {name} must be by-value (no borrows)"
+            );
+            assert!(
+                !def.contains("CapId"),
+                "DispatchPostWork {name} must not carry a CapId (no sender-local authority)"
+            );
+        }
+    }
+
+    // The executor uses the 186E copy seam, takes no IPC lock, and its Phase-C
+    // with_cpu re-entry calls no seam.
+    #[test]
+    fn stage188a_executor_uses_seam_no_ipc_lock() {
+        let body = RUNTIME_SRC
+            .split("fn execute_dispatch_post_work(")
+            .nth(1)
+            .and_then(|r| r.split("\n    /// # Validation status").next())
+            .or_else(|| {
+                RUNTIME_SRC
+                    .split("fn execute_dispatch_post_work(")
+                    .nth(1)
+                    .and_then(|r| r.split("\n    fn ").next())
+            })
+            .expect("execute_dispatch_post_work body");
+        let code = code_only(body);
+        assert!(
+            code.contains("copy_to_user_split"),
+            "executor must copy through the 186E seam"
+        );
+        for forbidden in ["with_ipc_split_mut", "with_ipc_state", "ipc_state_lock"] {
+            assert!(
+                !code.contains(forbidden),
+                "executor must not touch IPC (`{forbidden}`)"
+            );
+        }
+        // The only with_cpu re-entry (Phase C) must call no seam.
+        let phase_c = code
+            .split("self.with_cpu(cpu, |kernel| {")
+            .nth(1)
+            .and_then(|r| r.split("});").next())
+            .expect("Phase C with_cpu closure");
+        for seam in ["copy_to_user_split", "materialize_received", "_split_mut"] {
+            assert!(
+                !phase_c.contains(seam),
+                "the Phase-C with_cpu closure must call no seam (`{seam}`)"
+            );
+        }
+    }
+
+    // The drain runs AFTER with_cpu in the trap entry (post-boundary execution
+    // point), not inside a with_cpu closure.
+    #[test]
+    fn stage188a_drain_runs_after_with_cpu() {
+        let borrow_drop = TRAP_ENTRY_SRC
+            .find("let inner_result = inner_result?;")
+            .expect("trap entry drops the borrow via inner_result?");
+        let drain = TRAP_ENTRY_SRC
+            .find("shared.drain_dispatch_post_work(cpu)")
+            .expect("trap entry must drain the dispatch-return channel");
+        assert!(
+            drain > borrow_drop,
+            "the dispatch-return drain must run AFTER the broad with_cpu borrow is dropped"
+        );
+    }
+
+    // Infrastructure only: NO production handler stashes work (the channel is
+    // inert). The stash `.store` is exercised only by tests.
+    #[test]
+    fn stage188a_no_live_producer_stashes_work() {
+        for (name, src) in [
+            ("syscall.rs", include_str!("../syscall.rs")),
+            ("syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
+            ("ipc_state.rs", include_str!("ipc_state.rs")),
+            ("fault_state.rs", include_str!("fault_state.rs")),
+        ] {
+            assert!(
+                !src.contains("DISPATCH_POST_WORK_STASH"),
+                "`{name}` must NOT stash dispatch-return work — Stage 188A is infrastructure \
+                 only (no live producer); the channel stays inert"
+            );
+        }
+    }
+
+    // No fallback knobs / emergency opt-out / FAIL markers in the new code.
+    #[test]
+    fn stage188a_no_forbidden_markers() {
+        for (name, src) in [
+            ("dispatch_post_work.rs", POST_WORK_SRC),
+            ("runtime.rs (drain)", RUNTIME_SRC),
+        ] {
+            for forbidden in [
+                "DISPATCH_RETURN_CHANNEL_FAIL",
+                "DISPATCH_POST_WORK_FAIL",
+                "UNLOCK_GRADUATED_FALLBACK",
+                "emergency_optout",
+            ] {
+                assert!(
+                    !src.contains(forbidden),
+                    "`{name}` must not contain forbidden marker/knob `{forbidden}`"
+                );
+            }
+        }
+    }
+
+    // Functional: with an empty stash the drain is an inert no-op returning Ok.
+    #[test]
+    fn stage188a_empty_stash_drain_is_noop() {
+        let shared = SharedKernel::new(Bootstrap::init().expect("init"));
+        // Ensure the stash is empty for CPU0.
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        assert!(
+            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            "draining an empty stash must be an inert Ok no-op"
+        );
+    }
+
+    // Functional: a stashed BlockedWaiterPlainDelivery is executed by the drain,
+    // copying payload + meta into the waiter's user memory through the 186E seam.
+    #[test]
+    fn stage188a_executor_delivers_via_seam() {
+        let mut boxed = Bootstrap::init().expect("init");
+        boxed.register_task(1).expect("task1");
+        let (asid, _m) = boxed.create_user_address_space().expect("asid");
+        boxed.bind_task_asid(1, asid).expect("bind");
+        let (_bid, buf_cap) = boxed.alloc_anonymous_memory_object().expect("buf");
+        let buf_cap_t1 = boxed
+            .grant_capability_task_to_task(0, buf_cap, 1)
+            .expect("grant buf");
+        boxed.enqueue_current_cpu(1).expect("enqueue");
+        boxed.yield_current().expect("switch");
+        assert_eq!(boxed.current_tid(), Some(1));
+        boxed
+            .map_user_page_in_asid_with_caps(
+                asid,
+                buf_cap_t1,
+                VirtAddr(0x4000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                },
+            )
+            .expect("map buffer");
+        let shared = SharedKernel::new(boxed);
+
+        // Payload at 0x4000, meta at 0x4400 — both in the one mapped page.
+        let mut payload = [0u8; crate::kernel::ipc::Message::MAX_PAYLOAD];
+        payload[..5].copy_from_slice(b"hello");
+        let mut meta = [0u8; DISPATCH_POST_WORK_META_LEN];
+        for (i, b) in meta.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let snap = BlockedWaiterPlainDeliverySnapshot {
+            waiter_tid: 1,
+            waiter_asid: asid,
+            payload_user_ptr: 0x4000,
+            payload_len: 5,
+            payload,
+            meta_user_ptr: 0x4400,
+            meta,
+            wake_tid: None,
+        };
+        // Stash the work as a producing handler would (under the broad borrow),
+        // then drain it (post-boundary) exactly as the trap entry does.
+        unsafe {
+            crate::kernel::boot::DISPATCH_POST_WORK_STASH[0]
+                .store(DispatchPostWork::BlockedWaiterPlainDelivery(snap));
+        }
+        assert!(
+            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            "the executor must deliver the plain blocked-waiter work"
+        );
+        // Payload + meta landed in the waiter's user memory (via the 186E seam).
+        let got_payload = shared
+            .with(|k| k.copy_from_user(asid, VirtAddr(0x4000), 5))
+            .expect("read payload");
+        assert_eq!(&got_payload[..5], b"hello");
+        let got_meta = shared
+            .with(|k| k.copy_from_user(asid, VirtAddr(0x4400), DISPATCH_POST_WORK_META_LEN))
+            .expect("read meta");
+        assert_eq!(&got_meta[..DISPATCH_POST_WORK_META_LEN], &meta[..]);
+        // The stash is consumed (one-shot).
+        let leftover = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        assert!(
+            leftover.is_none(),
+            "the drain must consume the stashed work"
+        );
+    }
+
+    // The enum helpers behave.
+    #[test]
+    fn stage188a_enum_helpers() {
+        assert!(DispatchPostWork::None.is_none());
+        assert_eq!(DispatchPostWork::None.kind(), "none");
+    }
+
+    // Docs record 188A honestly (infrastructure only; not multi-dispatcher; not
+    // full retirement; reply-cap still blocked).
+    #[test]
+    fn stage188a_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 188A"),
+            "KERNEL_UNLOCKING.md must document Stage 188A"
+        );
+        for required in [
+            "infrastructure only",
+            "does not enable AP user-task scheduling",
+            "does not fully retire the global lock",
+            "reply_cap_ipc_rank_inversion",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 188A `{required}`"
+            );
+        }
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and

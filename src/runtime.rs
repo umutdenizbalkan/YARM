@@ -1374,6 +1374,107 @@ impl SharedKernel {
         result
     }
 
+    /// Stage 188A — dispatch-return delivery channel drain.
+    ///
+    /// Called by the trap entry (`handle_trap_entry_shared`) **after** the broad
+    /// `with_cpu` / `SpinLock<KernelState>` guard is dropped, alongside the
+    /// existing D2/D6 post-`with_cpu` drains. Takes the per-CPU
+    /// [`crate::kernel::boot::DISPATCH_POST_WORK_STASH`] item a handler produced
+    /// under the broad borrow and executes it through `&SharedKernel` seams.
+    ///
+    /// # Validation status
+    /// - DISPATCH_RETURN_CHANNEL (Stage 188A) — **infrastructure only**. No live
+    ///   handler stashes work in Stage 188A, so on every production trap the stash
+    ///   is empty and this is a no-op (a one-shot `DISPATCH_RETURN_CHANNEL_READY
+    ///   mode=helper_only` marker is emitted as honest evidence the channel is
+    ///   present and inert). The `BlockedWaiterPlainDelivery` executor arm is
+    ///   complete and unit-tested (186E copy seam) but produced by nothing live.
+    ///
+    /// Aliasing: this runs only AFTER `with_cpu` returned, so no broad
+    /// `&mut KernelState` is live when the 186E `copy_to_user_split` seam derives
+    /// its `&mut Subsystem` from `data_ptr()` (Stage 186D4's blocker does not
+    /// apply here). It touches no `ipc_state_lock`.
+    pub(crate) fn drain_dispatch_post_work(&self, cpu: CpuId) -> Result<(), TrapHandleError> {
+        let cpu_idx = cpu.0 as usize;
+        if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
+            return Ok(());
+        }
+        // One-shot readiness marker (honest boot-log evidence; additive).
+        if !crate::kernel::boot::DISPATCH_RETURN_CHANNEL_READY_LOGGED
+            .swap(true, core::sync::atomic::Ordering::Relaxed)
+        {
+            crate::yarm_log!("DISPATCH_RETURN_CHANNEL_READY mode=helper_only");
+        }
+        // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+        // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` drain.
+        let work = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx].take() };
+        let Some(work) = work else {
+            return Ok(()); // inert in Stage 188A: no live producer.
+        };
+        self.execute_dispatch_post_work(cpu, work)
+    }
+
+    /// Stage 188A — execute one drained [`DispatchPostWork`] item through
+    /// `&SharedKernel` seams (Phase B) and a brief `with_cpu` completion re-entry
+    /// (Phase C). Runs only outside `with_cpu` (see `drain_dispatch_post_work`).
+    fn execute_dispatch_post_work(
+        &self,
+        cpu: CpuId,
+        work: crate::kernel::dispatch_post_work::DispatchPostWork,
+    ) -> Result<(), TrapHandleError> {
+        use crate::kernel::dispatch_post_work::DispatchPostWork;
+        match work {
+            DispatchPostWork::None => Ok(()),
+            DispatchPostWork::BlockedWaiterPlainDelivery(snap) => {
+                crate::yarm_log!(
+                    "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_plain waiter_tid={}",
+                    snap.waiter_tid
+                );
+                crate::yarm_log!("DISPATCH_POST_WORK_GLOBAL_DROPPED_OK kind=blocked_waiter_plain");
+                // Phase B — user copy through the 186E seam (payload then meta),
+                // to the WAITER's ASID. No ipc_state_lock, no broad borrow.
+                if self
+                    .copy_to_user_split(
+                        snap.waiter_asid,
+                        crate::kernel::vm::VirtAddr(snap.payload_user_ptr as u64),
+                        &snap.payload[..snap.payload_len],
+                    )
+                    .is_err()
+                {
+                    return Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::InvalidArgs,
+                    ));
+                }
+                if self
+                    .copy_to_user_split(
+                        snap.waiter_asid,
+                        crate::kernel::vm::VirtAddr(snap.meta_user_ptr as u64),
+                        &snap.meta,
+                    )
+                    .is_err()
+                {
+                    return Err(TrapHandleError::Syscall(
+                        crate::kernel::syscall::SyscallError::InvalidArgs,
+                    ));
+                }
+                crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_SEAM_OK kind=blocked_waiter_plain");
+                crate::yarm_log!("DISPATCH_POST_WORK_EXECUTE_OK kind=blocked_waiter_plain");
+                // Phase C — clear the waiter's return regs + wake exactly once,
+                // via a brief global re-entry (no seam inside the closure).
+                let _ = self.with_cpu(cpu, |kernel| {
+                    kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
+                    if let Some(wake_tid) = snap.wake_tid {
+                        let _ = kernel.apply_scheduler_wake_plan(
+                            crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
+                        );
+                    }
+                });
+                crate::yarm_log!("DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain result=ok");
+                Ok(())
+            }
+        }
+    }
+
     /// # Validation status
     /// - M2_SEAM_LIVE_D3_BRK_SHRINK (Stage 114) — wired into the live
     ///   pre-`with_cpu` trap path via `syscall_split::try_split_dispatch_into_frame`'s

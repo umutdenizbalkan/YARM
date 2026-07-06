@@ -267,6 +267,24 @@ No runtime code changed; no `BLOCKED_WAITER_BOUNDARY_*` marker emitted. Recommen
 the Stage 188+ multi-dispatcher / dispatch-boundary restructuring. Pinned by
 `stage187d_blocked_waiter_delivery_hard_stop`.
 
+### 0.12) Stage 188A (DISPATCH-RETURN-DELIVERY-CHANNEL) — infrastructure only
+
+Builds the 187D prerequisite: a typed, by-value channel so a handler under the broad `with_cpu`
+/ `&mut KernelState` borrow can hand post-boundary work back to runtime, executed **after** the
+borrow drops through `&SharedKernel` seams. `DispatchPostWork` (`None` +
+`BlockedWaiterPlainDelivery`, by-value: no `&mut KernelState`, no borrows, no `CapId`) is
+stashed via a per-CPU `DISPATCH_POST_WORK_STASH` (mirroring the Stage 117 `PerCpuSwitchPlanStash`
+idiom) and drained by `SharedKernel::drain_dispatch_post_work(cpu)` in `handle_trap_entry_shared`
+right after the broad borrow drops (alongside the D2/D6 drains). The executor copies to the
+waiter's ASID via the 186E `copy_to_user_split` seam, then clears the waiter's return regs and
+wakes it in a brief `with_cpu` re-entry (no seam). **Infrastructure only:** no live handler
+stashes work, so the drain is a per-trap no-op (one-shot `DISPATCH_RETURN_CHANNEL_READY
+mode=helper_only`) — zero behavior change; the executor is unit-tested end-to-end but produced
+by nothing live. Does not enable AP user-task scheduling, does not fully retire the global lock,
+and does not solve `reply_cap_ipc_rank_inversion`. Enables future blocked-waiter delivery
+splitting and later `ipc_reply` conversion. Guarded by
+`stage188a_dispatch_return_delivery_channel`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

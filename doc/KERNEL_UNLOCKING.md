@@ -7950,6 +7950,61 @@ legacy path). Pinned by `stage187d_blocked_waiter_delivery_hard_stop` (the helpe
 in `src/`). Reply-cap materialization, broader IPC conversion, multi-dispatcher, and full
 global-lock retirement all remain deferred.
 
+**Stage 188A (DISPATCH-RETURN-DELIVERY-CHANNEL) — DONE (infrastructure only, inert).** Builds
+the prerequisite 187D identified: a typed, by-value channel by which a syscall/IPC handler
+running under the broad `with_cpu` / `&mut KernelState` borrow can hand *post-boundary work*
+back to runtime, which executes it **after** the borrow is dropped through `&SharedKernel`
+seams. This is the architectural mechanism that will let the shared blocked-waiter delivery
+(and later `ipc_reply`) be split without threading pending work through every handler
+signature.
+
+*Dispatch-return inventory:*
+
+| Element | Where | Class |
+|---|---|---|
+| post-`with_cpu` execution point | `arch/trap_entry.rs` (after `let inner_result = inner_result?;`, alongside the D2/D6 drains) | `dispatch_return_channel_candidate` — **used** |
+| per-CPU stash idiom | Stage 117 `PerCpuSwitchPlanStash` / `DISPATCH_SWITCH_PLAN_STASH` | `dispatch_return_channel_candidate` — **mirrored** |
+| 187A/187B runtime Phase B/C bridge | `runtime.rs` (`complete_recv_boundary_*`) | reused pattern |
+| the 6 blocked-waiter call sites | send/call/reply/deadline/fault handlers | `post_boundary_work_candidate` — **not wired** (future) |
+| reply-cap D5 arm | router | `defer_needs...` / `reply_cap_ipc_rank_inversion` |
+
+*Implemented.* `crate::kernel::dispatch_post_work::DispatchPostWork` (`None` +
+`BlockedWaiterPlainDelivery(BlockedWaiterPlainDeliverySnapshot)`) — **by value only**: no
+`&mut KernelState`, no borrows, and no `CapId` (the wired variant is a *plain, no-cap* delivery,
+so it carries no sender-local authority). Per-CPU stash `PerCpuDispatchPostWorkStash` /
+`DISPATCH_POST_WORK_STASH` (mirrors the Stage 117 stash exactly; local-CPU trap path, IRQs
+disabled). Runtime execution point `SharedKernel::drain_dispatch_post_work(cpu)` +
+`execute_dispatch_post_work` — wired into `handle_trap_entry_shared` right after the broad
+borrow drops. The `BlockedWaiterPlainDelivery` executor copies payload+meta to the waiter's
+ASID through the **186E `copy_to_user_split` seam** (Phase B), then clears the waiter's return
+registers (shared `KernelState::clear_blocked_recv_return_regs`, extracted byte-identically from
+`complete_blocked_recv_for_waiter`) and wakes it (Phase C, a brief `with_cpu` re-entry with no
+seam).
+
+*Exact live path converted.* **None.** This stage is **infrastructure only**: no live handler
+stashes work, so on every production trap the stash is empty and the drain is a no-op — **zero
+runtime behavior change** (the drain emits only a one-shot `DISPATCH_RETURN_CHANNEL_READY
+mode=helper_only`). The `BlockedWaiterPlainDelivery` executor is complete and **unit-tested
+end-to-end** (stash → drain → 186E seam copy verified in user memory) but is produced by
+nothing live; a future stage wires the blocked-waiter call sites to produce it.
+
+*Aliasing / by-value / seam-execution proofs.* The drain runs only after `with_cpu` returns
+(guard-pinned by source position), so no broad `&mut KernelState` is live when
+`copy_to_user_split` derives its `&mut Subsystem` from `data_ptr()`. The enum/snapshot are
+by-value (guard: no `KernelState`, no `&`, no `CapId`). The executor uses only the 186E seam and
+no `ipc_state_lock`; its Phase-C `with_cpu` closure calls no seam (guard-pinned). No production
+handler stashes work (guard: `DISPATCH_POST_WORK_STASH` absent from the syscall/IPC handler
+files).
+
+*Scope honesty.* This stage **does not enable AP user-task scheduling**, **does not fully
+retire the global lock**, does not convert any IPC syscall, and does not solve the reply-cap
+IPC rank inversion (`reply_cap_ipc_rank_inversion` — reply-cap materialization still blocked).
+It **enables** future blocked-waiter delivery splitting and later `ipc_reply` conversion by
+providing the dispatch-return execution point those need. Guarded by
+`stage188a_dispatch_return_delivery_channel` (by-value enum; executor seam + no IPC lock;
+drain after `with_cpu`; no live producer; no forbidden markers; empty-stash no-op; end-to-end
+executor delivery via the seam; docs honest).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

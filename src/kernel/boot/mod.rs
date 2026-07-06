@@ -594,6 +594,65 @@ pub(crate) static DISPATCH_SWITCH_PLAN_STASH: [PerCpuSwitchPlanStash;
     crate::kernel::scheduler::MAX_CPUS] =
     [const { PerCpuSwitchPlanStash::new() }; crate::kernel::scheduler::MAX_CPUS];
 
+/// Stage 188A: per-CPU stash cell for a [`crate::kernel::dispatch_post_work::DispatchPostWork`]
+/// item that a syscall/IPC handler produced under the broad `with_cpu` /
+/// `&mut KernelState` borrow, to be drained and executed by runtime AFTER the
+/// borrow is dropped. Mirrors [`PerCpuSwitchPlanStash`] exactly.
+///
+/// # Safety
+///
+/// Accessed only from the trap path on the local CPU with interrupts disabled
+/// (same discipline as `PerCpuSwitchPlanStash`). No cross-CPU sharing; at most
+/// one item stashed per CPU per trap.
+pub(crate) struct PerCpuDispatchPostWorkStash {
+    inner: core::cell::UnsafeCell<Option<crate::kernel::dispatch_post_work::DispatchPostWork>>,
+}
+
+// SAFETY: Accessed only from the local CPU's trap path with interrupts disabled.
+unsafe impl Sync for PerCpuDispatchPostWorkStash {}
+
+impl PerCpuDispatchPostWorkStash {
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: core::cell::UnsafeCell::new(None),
+        }
+    }
+
+    /// Store post-work in the stash.
+    ///
+    /// # Safety
+    /// Caller must ensure no concurrent access (interrupts disabled, single CPU).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) unsafe fn store(&self, work: crate::kernel::dispatch_post_work::DispatchPostWork) {
+        unsafe { *self.inner.get() = Some(work) }
+    }
+
+    /// Take the post-work from the stash (consumes it), leaving the slot empty.
+    ///
+    /// # Safety
+    /// Caller must ensure no concurrent access (interrupts disabled, single CPU).
+    pub(crate) unsafe fn take(
+        &self,
+    ) -> Option<crate::kernel::dispatch_post_work::DispatchPostWork> {
+        unsafe { (*self.inner.get()).take() }
+    }
+}
+
+/// Per-CPU dispatch-return work stash (Stage 188A). Index by `CpuId.0`. Accessed
+/// only from the trap path on the local CPU with interrupts disabled. Empty on
+/// every production trap in Stage 188A (no live producer) → drain is a no-op.
+///
+/// VALIDATION: DISPATCH_RETURN_CHANNEL (helper-only in Stage 188A)
+pub(crate) static DISPATCH_POST_WORK_STASH: [PerCpuDispatchPostWorkStash;
+    crate::kernel::scheduler::MAX_CPUS] =
+    [const { PerCpuDispatchPostWorkStash::new() }; crate::kernel::scheduler::MAX_CPUS];
+
+/// Stage 188A one-shot flag: emit `DISPATCH_RETURN_CHANNEL_READY mode=helper_only`
+/// exactly once (first post-`with_cpu` drain) as honest boot-log evidence the
+/// channel is present and inert.
+pub(crate) static DISPATCH_RETURN_CHANNEL_READY_LOGGED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Per-CPU flag indicating that `handle_trap_entry_shared` is active and will
 /// drain the stash AFTER `with_cpu` returns. When `false`, code calling
 /// `dispatch_next_task` directly (e.g., unit tests) must not stash — there

@@ -263,6 +263,18 @@ per-caller pre-dispatch forks) plus the reply-cap `reply_cap_ipc_rank_inversion`
 No cap is materialized under `ipc_state_lock` today; that invariant is unchanged.
 Pinned by `stage187d_blocked_waiter_delivery_hard_stop`.
 
+**Dispatch-return delivery channel (Stage 188A, infrastructure only).** A typed
+by-value `DispatchPostWork` channel now lets a handler under the broad borrow hand
+post-boundary work to runtime, executed after the borrow drops through
+`&SharedKernel` seams (per-CPU stash drained in the trap entry). The only wired
+variant is a *plain, no-cap* blocked-waiter delivery, so it carries no `CapId` and
+no sender-local authority; its executor copies via the 186E seam and touches no
+`ipc_state_lock`. Infrastructure only — no live handler produces work yet (the
+channel is inert), and it does not solve `reply_cap_ipc_rank_inversion`. It is the
+mechanism a future stage uses to split blocked-waiter delivery (including
+cap-transfer via the 186D2/186D3 seams). Guarded by
+`stage188a_dispatch_return_delivery_channel`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

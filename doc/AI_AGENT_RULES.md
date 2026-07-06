@@ -431,6 +431,24 @@ Reply-cap materialization, broader IPC conversion, multi-dispatcher, and full gl
 retirement remain deferred. Pinned by `stage187d_blocked_waiter_delivery_hard_stop`. See
 `doc/KERNEL_UNLOCKING.md` (Stage 187D) and `doc/KERNEL_LOCKING.md §0.11`.
 
+**Stage 188A (DISPATCH-RETURN-DELIVERY-CHANNEL) status — infrastructure only, DO NOT
+OVERCLAIM.** A typed by-value dispatch-return channel (`crate::kernel::dispatch_post_work::DispatchPostWork`:
+`None` + `BlockedWaiterPlainDelivery`) lets a handler under the broad `with_cpu` /
+`&mut KernelState` borrow stash post-boundary work into a per-CPU `DISPATCH_POST_WORK_STASH`
+(mirroring the Stage 117 `PerCpuSwitchPlanStash`); `SharedKernel::drain_dispatch_post_work(cpu)`
+executes it in `handle_trap_entry_shared` **after** the broad borrow drops, through the 186E
+copy seam. The enum is by-value (no `&mut KernelState`, no borrows, no `CapId`). **No live
+handler stashes work** — the channel is inert (one-shot `DISPATCH_RETURN_CHANNEL_READY
+mode=helper_only`; zero behavior change); the `BlockedWaiterPlainDelivery` executor is
+unit-tested but produced by nothing live. Do **not** describe 188A as converting any IPC path,
+enabling AP user-task scheduling, retiring the global lock, or solving the reply-cap rank
+inversion (`reply_cap_ipc_rank_inversion` still blocks reply-cap materialization). Do **not**
+stash work from a production handler until a focused follow-on wires + proves a specific
+blocked-waiter slice. `KernelState::clear_blocked_recv_return_regs` was extracted
+byte-identically from `complete_blocked_recv_for_waiter` (shared by the legacy path and the
+executor). Pinned by `stage188a_dispatch_return_delivery_channel`. See `doc/KERNEL_UNLOCKING.md`
+(Stage 188A) and `doc/KERNEL_LOCKING.md §0.12`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the
