@@ -412,6 +412,25 @@ focused reply-cap rank-inversion stage. Broader IPC conversion, multi-dispatcher
 global-lock retirement remain deferred. Pinned by `stage187c_ipc_reply_retry_hard_stop`. See
 `doc/KERNEL_UNLOCKING.md` (Stage 187C) and `doc/KERNEL_LOCKING.md §0.10`.
 
+**Stage 187D (BLOCKED-WAITER-DELIVERY-BOUNDARY-SPLIT) status — HARD-STOPPED, DO NOT OVERCLAIM.**
+Splitting `complete_blocked_recv_for_waiter` was audited and stopped: no runtime path was
+converted. The helper's seam-eligible shape matches the 187A queued path, but all 6 production
+call sites are `&mut KernelState` syscall handlers (`handle_ipc_send`, `handle_ipc_call`,
+`ipc_reply`, `ipc_send_with_optional_deadline`, `emit_fault_report_for_fault`) buried inside the
+single main-dispatch `with_cpu` closure — none has `&SharedKernel`, and the broad borrow only
+drops when the whole `dispatch()` closure returns. Unlike 187A's dedicated pre-dispatch recv
+fast path, blocked-waiter delivery has **no SharedKernel-level owner** (`try_split_dispatch_into_frame`
+routes only `IpcRecv`/`VmBrk`). Running Phase B/C on the seams needs a dispatch-return
+"pending post-boundary work" channel through every handler, or per-caller pre-dispatch forks
+(wholesale send/reply/call/fault duplication) — broad IPC/dispatch decomposition, out of scope;
+plus the reply-with-cap `reply_cap_ipc_rank_inversion`. Do **not** split the helper into inert
+Phase-A-only infra (no live Phase B/C caller — dead infra that masquerades as progress); do
+**not** emit any `BLOCKED_WAITER_BOUNDARY_*` marker. Recommended next step: the Stage 188+
+multi-dispatcher / dispatch-boundary restructuring (a typed dispatch-return delivery channel).
+Reply-cap materialization, broader IPC conversion, multi-dispatcher, and full global-lock
+retirement remain deferred. Pinned by `stage187d_blocked_waiter_delivery_hard_stop`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 187D) and `doc/KERNEL_LOCKING.md §0.11`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

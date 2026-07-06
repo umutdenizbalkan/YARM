@@ -249,6 +249,24 @@ later (already-split) recv. No runtime code changed; no `IPC_REPLY_BOUNDARY_*` m
 Recommended next step: Stage 187D (split the shared blocked-waiter delivery) then a focused
 reply-cap rank-inversion stage. Pinned by `stage187c_ipc_reply_retry_hard_stop`.
 
+### 0.11) Stage 187D (BLOCKED-WAITER-DELIVERY-BOUNDARY-SPLIT) — HARD-STOPPED
+
+Targeted `complete_blocked_recv_for_waiter`; it **cannot** be boundary-split in scope. The
+helper's seam-eligible shape matches the 187A queued path, but all 6 production call sites are
+`&mut KernelState` syscall handlers (`handle_ipc_send`, `handle_ipc_call`, `ipc_reply`,
+`ipc_send_with_optional_deadline`, `emit_fault_report_for_fault`) buried inside the **single
+main-dispatch `with_cpu` closure** (`shared.with_cpu(cpu, |kernel| … dispatch …)`). None has
+`&SharedKernel`; the broad borrow is only released when the whole `dispatch()` closure returns
+to the SharedKernel-level trap entry. Unlike 187A's dedicated pre-dispatch recv fast path,
+blocked-waiter delivery has **no SharedKernel-level owner** — `try_split_dispatch_into_frame`
+routes only `IpcRecv`/`VmBrk`. Running Phase B/C on the seams requires either a
+dispatch-return "pending post-boundary work" channel through every handler or forking each
+caller into a pre-dispatch split (wholesale send/reply/call/fault duplication) — broad
+IPC/dispatch decomposition, out of scope; plus the reply-with-cap `reply_cap_ipc_rank_inversion`.
+No runtime code changed; no `BLOCKED_WAITER_BOUNDARY_*` marker emitted. Recommended next step:
+the Stage 188+ multi-dispatcher / dispatch-boundary restructuring. Pinned by
+`stage187d_blocked_waiter_delivery_hard_stop`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

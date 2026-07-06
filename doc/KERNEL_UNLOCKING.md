@@ -7888,6 +7888,68 @@ calls no post-boundary seam; the D5 rank inversion is still present; no boundary
 `src/`). Broader IPC conversion, multi-dispatcher, and full global-lock retirement remain
 deferred.
 
+**Stage 187D (BLOCKED-WAITER-DELIVERY-BOUNDARY-SPLIT) — audited, HARD-STOPPED, no runtime
+conversion.** Targeted the shared blocked-waiter delivery engine
+`complete_blocked_recv_for_waiter` that 187C identified. On audit it **cannot** be
+boundary-split within this stage's scope. No runtime code changed.
+
+*Blocked-waiter delivery inventory* (production call sites of `complete_blocked_recv_for_waiter`):
+
+| Call site | Enclosing `&mut KernelState` handler | Class |
+|---|---|---|
+| `syscall/ipc.rs:445` | `handle_ipc_send` (send → blocked recv-v2 waiter) | `blocked_waiter_boundary_candidate` (but no SharedKernel owner) |
+| `syscall/ipc.rs:931` | `handle_ipc_call` | `blocked_waiter_boundary_candidate` (no owner) |
+| `boot/ipc_state.rs:1787` | `ipc_reply` (reply → blocked caller) | `blocked_waiter_boundary_candidate` (no owner) |
+| `boot/ipc_state.rs:2258/2333` | `ipc_send_with_optional_deadline` | `blocked_waiter_boundary_candidate` (no owner) |
+| `boot/fault_state.rs:456` | `emit_fault_report_for_fault` (fault delivery) | `legacy_authoritative_runtime` (extra fault semantics) |
+| reply-cap arm inside the router | D5 (`materialize_split_reply_cap_equivalent`) | `defer_reply_cap_ipc_rank_inversion` |
+| user-copy (payload+meta), waiter GPR clear, wake | inside the helper | seam-eligible, but see blocker |
+
+The helper's seam-eligible shape is identical to the 187A queued path (payload
+`copy_to_user` → `materialize_received_message_cap_routed` → meta `copy_to_user` →
+clear waiter GPRs → wake), so the *helper itself* could be refactored into a Phase-A
+snapshot builder.
+
+*Exact blocker (architectural).* All 6 call sites are `&mut KernelState` **syscall handlers**
+(send / call / reply / deadline-send / fault) invoked from inside the **single main-dispatch
+`with_cpu` closure** (`arch/trap_entry.rs`: `shared.with_cpu(cpu, |kernel| … dispatch …)`).
+`complete_blocked_recv_for_waiter` sits ~4–5 `&mut KernelState` frames deep in that closure.
+Running its Phase B/C (186E copy + 186D2/186D3 mint) requires `&SharedKernel` with the broad
+borrow **dropped** — but no call site has `&SharedKernel`, and the borrow is only released when
+the *entire* `dispatch()` closure returns to the SharedKernel-level trap entry. Contrast 187A:
+`try_split_ipc_recv_queued_plain_into_frame` is a **dedicated SharedKernel-level pre-dispatch
+fast path** (routed by `try_split_dispatch_into_frame` for NR2 only) that owns its own
+`with_cpu`, so Phase A runs inside and Phase B/C after. Blocked-waiter delivery has **no such
+SharedKernel-level owner** — `try_split_dispatch_into_frame` routes only `IpcRecv` and `VmBrk`;
+send/reply/call fall straight through to the global-lock `dispatch()`.
+
+*Safe subset.* Mechanically, `complete_blocked_recv_for_waiter` could be split into a pure
+Phase-A snapshot builder — but that is **inert infrastructure with no live caller able to run
+Phase B/C** (no real conversion), so this stage adds none (dead infra would masquerade as
+progress).
+
+*Unsafe subset.* Making Phase B/C run at the SharedKernel level requires either (1) a
+**dispatch-return "pending post-boundary work" channel** threaded through every syscall handler
+and the dispatcher, or (2) **forking each caller** (send/reply/call/deadline-send/fault) into a
+dedicated SharedKernel-level pre-dispatch split that duplicates its resolution logic (endpoint
+resolve, sender-waiter queue handling, reply-cap consume/revoke, fault semantics). Both are
+**broad IPC endpoint/waiter + dispatch decomposition**, explicitly out of scope and named in
+the hard-stop condition. The reply-with-cap sub-case additionally hits the unsolved
+`reply_cap_ipc_rank_inversion`.
+
+*Recommended next step.* This is genuinely the **multi-dispatcher / dispatch-boundary
+restructuring** the roadmap defers to Stage 188+: give the main dispatch a typed
+"pending post-boundary delivery" return channel so any handler can hand a blocked-waiter
+delivery snapshot back to the SharedKernel level, where a single shared Phase-B/C executor
+(reusing the 186E + 186D2/186D3 + 187A/187B machinery) finishes it. Only then can
+`complete_blocked_recv_for_waiter` be split and `ipc_reply` (187C) be converted. No runtime
+code changed; no `BLOCKED_WAITER_BOUNDARY_*` marker is emitted (that would dishonestly mark the
+legacy path). Pinned by `stage187d_blocked_waiter_delivery_hard_stop` (the helper stays broad
+`&mut KernelState` and copies/materializes under the borrow; all 6 call sites stay
+`&mut KernelState` handlers; no send/reply/call pre-dispatch split exists; no boundary marker
+in `src/`). Reply-cap materialization, broader IPC conversion, multi-dispatcher, and full
+global-lock retirement all remain deferred.
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

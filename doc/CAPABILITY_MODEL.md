@@ -251,6 +251,18 @@ reply-cap consume/revoke/enqueue/wake call no seam and need no boundary.
 Reply-cap materialization remains deferred. Pinned by
 `stage187c_ipc_reply_retry_hard_stop`.
 
+**Blocked-waiter delivery boundary hard stop (Stage 187D).** Splitting
+`complete_blocked_recv_for_waiter` (so its user copy + cap materialization run on
+the seams) was audited and **stopped**: all 6 production call sites are
+`&mut KernelState` syscall handlers (send/call/reply/deadline-send/fault) buried
+inside the single main-dispatch `with_cpu` closure, with no `&SharedKernel` and no
+point where the broad borrow drops. Unlike 187A's dedicated pre-dispatch recv fast
+path, blocked-waiter delivery has no SharedKernel-level owner; running Phase B/C on
+the seams needs broad dispatch/IPC decomposition (a dispatch-return channel or
+per-caller pre-dispatch forks) plus the reply-cap `reply_cap_ipc_rank_inversion`.
+No cap is materialized under `ipc_state_lock` today; that invariant is unchanged.
+Pinned by `stage187d_blocked_waiter_delivery_hard_stop`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

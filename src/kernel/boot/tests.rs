@@ -48607,6 +48607,160 @@ mod stage187c_ipc_reply_retry_hard_stop {
 }
 
 // ===========================================================================
+// Stage 187D (BLOCKED-WAITER-DELIVERY-BOUNDARY-SPLIT) — audited, HARD-STOPPED.
+//
+// complete_blocked_recv_for_waiter has the same seam-eligible shape as the 187A
+// queued path (two copy_to_user + materialize_received_message_cap_routed), BUT
+// all 6 production call sites are &mut KernelState syscall handlers (send / call /
+// reply / deadline-send / fault) buried inside the SINGLE main-dispatch
+// with_cpu closure (trap_entry: shared.with_cpu(cpu, |kernel| ... dispatch ...)).
+// None is at a SharedKernel level, so none can drop the broad borrow to run
+// Phase B/C on the seams (186D4 aliasing). Unlike 187A's dedicated pre-dispatch
+// recv fast path, blocked-waiter delivery has no SharedKernel-level owner:
+// splitting it needs either a dispatch-return "pending post-boundary work"
+// channel through every handler, or forking each caller into a pre-dispatch
+// split (wholesale send/reply/call/fault duplication) — broad IPC/dispatch
+// decomposition, out of scope. These guards PIN the finding so no future edit
+// half-converts the path or emits a boundary marker on the legacy path.
+// See doc/KERNEL_UNLOCKING.md (Stage 187D).
+// ===========================================================================
+#[cfg(test)]
+mod stage187d_blocked_waiter_delivery_hard_stop {
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const IPC_SRC: &str = include_str!("../syscall/ipc.rs");
+    const IPC_STATE_SRC: &str = include_str!("ipc_state.rs");
+    const FAULT_SRC: &str = include_str!("fault_state.rs");
+    const SPLIT_SRC: &str = include_str!("../syscall_split.rs");
+    const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+
+    // complete_blocked_recv_for_waiter is still a broad &mut KernelState function
+    // that performs its user copy + cap materialization under that borrow (NOT
+    // boundary-split).
+    #[test]
+    fn stage187d_delivery_helper_still_broad_and_unsplit() {
+        let sig = SYSCALL_SRC
+            .split("fn complete_blocked_recv_for_waiter(")
+            .nth(1)
+            .and_then(|rest| rest.split(" -> ").next())
+            .expect("complete_blocked_recv_for_waiter must exist");
+        assert!(
+            sig.contains("kernel: &mut KernelState"),
+            "the delivery helper must still take the broad &mut KernelState (not split)"
+        );
+        let body = SYSCALL_SRC
+            .split("fn complete_blocked_recv_for_waiter(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n// Stage 158").next())
+            .expect("delivery helper body");
+        // It still copies + materializes under the broad borrow (the work a split
+        // would move onto the seams). It does NOT call a post-boundary seam.
+        assert!(
+            body.contains("kernel.copy_to_user(")
+                && body.contains("materialize_received_message_cap_routed("),
+            "the delivery helper must still copy + materialize under the broad borrow"
+        );
+        for seam in [
+            "copy_to_user_split",
+            "materialize_received_message_cap_routed_with_delegation_split",
+            "mint_capability_with_memory_ref_split",
+        ] {
+            assert!(
+                !body.contains(seam),
+                "the delivery helper must NOT call the post-boundary seam `{seam}` while it \
+                 holds the broad &mut KernelState (186D4 aliasing) — no split was implemented"
+            );
+        }
+    }
+
+    // All 6 production call sites remain in &mut KernelState syscall handlers —
+    // none hoisted to a SharedKernel level.
+    #[test]
+    fn stage187d_all_call_sites_remain_mut_kernelstate_handlers() {
+        for (name, src, handler) in [
+            ("syscall/ipc.rs", IPC_SRC, "fn handle_ipc_send("),
+            ("syscall/ipc.rs", IPC_SRC, "fn handle_ipc_call("),
+            ("ipc_state.rs", IPC_STATE_SRC, "fn ipc_reply(&mut self"),
+            (
+                "ipc_state.rs",
+                IPC_STATE_SRC,
+                "fn ipc_send_with_optional_deadline(",
+            ),
+            (
+                "fault_state.rs",
+                FAULT_SRC,
+                "fn emit_fault_report_for_fault(&mut self",
+            ),
+        ] {
+            assert!(
+                src.contains(handler),
+                "{name} must still define the &mut KernelState handler `{handler}` that calls \
+                 complete_blocked_recv_for_waiter"
+            );
+        }
+    }
+
+    // No SharedKernel-level pre-dispatch split exists for send/reply/call — they
+    // still go straight to the global-lock dispatch (no half-converted blocked-
+    // waiter split path).
+    #[test]
+    fn stage187d_no_send_reply_call_pre_dispatch_split() {
+        // The only dedicated pre-dispatch split helpers are recv (NR2) and VmBrk.
+        for forbidden in [
+            "try_split_ipc_send",
+            "try_split_ipc_reply",
+            "try_split_ipc_call",
+            "try_split_blocked_waiter",
+            "complete_blocked_recv_for_waiter_phase_b",
+        ] {
+            assert!(
+                !SPLIT_SRC.contains(forbidden),
+                "syscall_split.rs must NOT contain a `{forbidden}` pre-dispatch split — \
+                 blocked-waiter delivery has no SharedKernel-level owner (Stage 187D hard stop)"
+            );
+        }
+    }
+
+    // No BLOCKED_WAITER_BOUNDARY_* marker anywhere — no dishonest marker on the
+    // legacy path, no half-converted boundary.
+    #[test]
+    fn stage187d_no_blocked_waiter_boundary_marker_in_src() {
+        for (name, src) in [
+            ("syscall.rs", SYSCALL_SRC),
+            ("syscall/ipc.rs", IPC_SRC),
+            ("ipc_state.rs", IPC_STATE_SRC),
+            ("fault_state.rs", FAULT_SRC),
+            ("syscall_split.rs", SPLIT_SRC),
+            ("runtime.rs", RUNTIME_SRC),
+        ] {
+            assert!(
+                !src.contains("BLOCKED_WAITER_BOUNDARY"),
+                "`{name}` must not emit any BLOCKED_WAITER_BOUNDARY_* marker — no live \
+                 blocked-waiter boundary split was implemented (Stage 187D hard stop)"
+            );
+        }
+    }
+
+    // The hard stop is documented honestly with the exact architectural blocker.
+    #[test]
+    fn stage187d_hard_stop_documented() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 187D"),
+            "KERNEL_UNLOCKING.md must document the Stage 187D hard stop"
+        );
+        assert!(
+            UNLOCK_DOC.contains("HARD-STOP") || UNLOCK_DOC.contains("HARD STOP"),
+            "docs must record Stage 187D as a hard stop"
+        );
+        assert!(
+            UNLOCK_DOC.contains("SharedKernel-level owner")
+                && UNLOCK_DOC.contains("complete_blocked_recv_for_waiter"),
+            "docs must name the exact blocker (no SharedKernel-level owner for the callers)"
+        );
+    }
+}
+
+// ===========================================================================
 // Stage 165B — D6 proof live-RSP full-region stack mapping (post-proof #PF fix)
 //
 // The Stage 165 D6 switch proof printed every early proof marker `[ok]` and
