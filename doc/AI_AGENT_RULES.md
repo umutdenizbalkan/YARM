@@ -449,6 +449,25 @@ byte-identically from `complete_blocked_recv_for_waiter` (shared by the legacy p
 executor). Pinned by `stage188a_dispatch_return_delivery_channel`. See `doc/KERNEL_UNLOCKING.md`
 (Stage 188A) and `doc/KERNEL_LOCKING.md §0.12`.
 
+**Stage 188B (BLOCKED-WAITER-PLAIN-DELIVERY-LIVE) status — first live producer, PLAIN PATH
+ONLY, DO NOT OVERCLAIM.** The 188A channel now has one live producer: `ipc_reply`'s
+recv-v2-blocked branch, **plain messages only** (no transferred cap, no reply cap). It calls
+`crate::kernel::syscall::produce_blocked_waiter_plain_delivery`, which (Phase A, under the broad
+borrow) consumes the waiter's `blocked_recv_state`, encodes the recv-v2 meta with
+`cap_id = NO_TRANSFER_CAP`, **pre-validates** both user buffers writable with no copy, and stashes
+a by-value `BlockedWaiterPlainDelivery`; the executor does the 186E-seam copy + endpoint
+slot-clear + single wake after the borrow drops (`DISPATCH_RETURN_CHANNEL_READY mode=live`,
+`DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain result=ok`). The producer only stashes with a
+trap-entry drainer active (`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`), so no orphaned stash; any
+non-plain message or drainerless caller returns `Ok(false)` → unchanged legacy path; a
+non-writable buffer faults **synchronously** (`UserMemoryFault`, no stash), matching legacy.
+**cap-transfer blocked-waiter delivery remains deferred** — do **not** extend this producer to
+cap-transfer / reply-cap / fault delivery, and do **not** describe 188B as converting broader IPC,
+enabling AP user-task scheduling, retiring the global lock, or solving
+`reply_cap_ipc_rank_inversion` (reply-cap materialization still blocked). It converts **only** the
+plain, no-cap reply. Pinned by `stage188b_blocked_waiter_plain_delivery_live`. See
+`doc/KERNEL_UNLOCKING.md` (Stage 188B) and `doc/KERNEL_LOCKING.md §0.13`.
+
 ### 5.2 x86_64 SMP TODO
 
 Before enabling x86_64 SMP smoke: split the AP trampoline assembly stub from the

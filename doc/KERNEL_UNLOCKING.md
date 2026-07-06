@@ -8005,6 +8005,67 @@ providing the dispatch-return execution point those need. Guarded by
 drain after `with_cpu`; no live producer; no forbidden markers; empty-stash no-op; end-to-end
 executor delivery via the seam; docs honest).
 
+**Stage 188B (BLOCKED-WAITER-PLAIN-DELIVERY-LIVE) — DONE (first live producer, plain path
+only).** Wires the *simplest* blocked-waiter delivery producer to the Stage 188A
+dispatch-return channel, flipping it from `mode=helper_only` to `mode=live`. The chosen
+producer is the `ipc_reply` recv-v2-blocked branch: a plain reply to a caller blocked in
+recv-v2, where the message carries **no transferred cap and no reply cap**. Nothing else is
+converted.
+
+*Exact live path converted.* `ipc_reply` (`boot/ipc_state.rs`), recv-v2-blocked branch only,
+plain messages only. Before the legacy `complete_blocked_recv_for_waiter` copy, the branch now
+calls `crate::kernel::syscall::produce_blocked_waiter_plain_delivery(self, waiter_tid, endpoint_idx,
+&msg)`:
+
+- **`Ok(true)`** — a plain reply with a trap-entry drainer active: Phase A ran under the broad
+  borrow (consumed `blocked_recv_state`, resolved the waiter ASID, stripped the inline opcode
+  prefix, encoded the 40-byte recv-v2 meta with `cap_id = NO_TRANSFER_CAP`, and **pre-validated**
+  both user buffers writable with *no copy*), stashed a by-value
+  `DispatchPostWork::BlockedWaiterPlainDelivery`, and returned. The endpoint slot-clear + wake are
+  **deferred to the executor** (Phase C). `ipc_reply` records the split delivery and returns `Ok`.
+- **`Ok(false)`** — not plain (cap-transfer / reply-cap / `transferred_cap().is_some()`), **or no
+  trap-entry drainer active** (direct/kernel-internal caller): falls through to the unchanged
+  legacy `complete_blocked_recv_for_waiter` path. Zero behavior change on those paths.
+- **`Err(..)`** — a buffer pre-validation failure (unmapped / non-writable waiter buffer):
+  returned synchronously as `KernelError::UserMemoryFault`, byte-for-byte matching the legacy
+  helper (which consumes the blocked state, then faults). **No stash, no wake.**
+
+The executor (`runtime.rs`, `execute_dispatch_post_work` `BlockedWaiterPlainDelivery` arm) runs
+after the broad borrow drops: two `copy_to_user_split` calls (payload then meta) through the
+**186E seam** (Phase B), then a brief `with_cpu` re-entry (Phase C) that clears the waiter's
+return registers, clears the endpoint receiver-waiter slot
+(`ipc_clear_plain_receiver_waiter_only`), and applies the one-shot wake
+(`apply_scheduler_wake_plan`). It emits `DISPATCH_POST_WORK_USER_COPY_OK`,
+`IPC_RECV_V2_META_BLOCKED_WAITER_OK`, and `DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain
+result=ok`.
+
+*Failure-semantics preservation.* The Phase-A pre-validation (a VM page-table walk with **no
+copy**) makes the deferred copy infallible on the supported single-CPU user-scheduling config:
+nothing runs between Phase A (inside `with_cpu`) and the drain (right after `with_cpu` returns)
+that could change the waiter's mapping. So a delivery that would have faulted still faults
+**synchronously** with the same `UserMemoryFault`, and a delivery that would have succeeded still
+delivers exactly once. `WrongObject` / `StaleCapability` / `MissingRight` / `CapabilityFull` /
+`UserMemoryFault` remain real errors on this path.
+
+*Wake-once / ordering proofs.* The producer consumes `blocked_recv_state` exactly once and only
+when it will stash (gated on `GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`, so no orphaned stash
+without a drainer). The executor performs the single slot-clear + wake in Phase C. The
+`IPC_RECV_V2_META_BLOCKED_WAITER_OK`, `IPC_RECV_V2_SENDER_WAKE_ORDER_OK`, and
+`IPC_RECV_PROOF_SENDER_WAKE_SEQUENCE_DONE` markers are preserved. No lost wake, no duplicate
+wake, no orphaned waiter.
+
+*Scope honesty.* **cap-transfer blocked-waiter delivery remains deferred** — any message with a
+transferred cap or reply cap stays on the legacy path (`Ok(false)`), because cap materialization
+under the IPC rank is still blocked by `reply_cap_ipc_rank_inversion` (reply-cap materialization
+still cannot run without broad IPC decomposition). This stage converts **only** the plain,
+no-cap reply; it does **not** convert send/call/deadline/fault blocked-waiter delivery, does
+**not** touch the multi-dispatcher, **does not enable AP user-task scheduling**, and **does not
+fully retire the global lock**. It is the first live use of the 188A channel, nothing more.
+Guarded by `stage188b_blocked_waiter_plain_delivery_live` (plain producer stashes + executor
+delivers via the seam and wakes once; cap/reply message → `Ok(false)`; no drainer → `Ok(false)`;
+unmapped buffer → synchronous `Err`, no stash; producer calls no seam under the broad borrow;
+snapshot by-value; executor Phase C slot-clear + wake + meta marker; docs honest).
+
 **Increment 1 (Task 6.A — establish the SMP baseline + audit, no guard flip).**
 
 - `run-ci-profiles.sh`: new `smp2-core` / `smp2-sender-wake` / `smp4-core` /

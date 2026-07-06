@@ -1783,7 +1783,41 @@ impl KernelState {
                     .is_some_and(|state| state.recv_abi == RecvAbiVariant::RecvV2)
             });
             if waiter_recv_v2_blocked {
-                // Phase 3: complete delivery outside all locks.
+                // Stage 188B: for a PLAIN (no-cap, no-reply-cap) reply, produce
+                // dispatch-return post-work instead of copying under the broad
+                // borrow. The trap-entry drain then runs the user copy through the
+                // 186E seam and does the slot-clear + wake (Phase C) — external
+                // behaviour byte-identical to the legacy sequence below. Cap /
+                // reply-cap replies (Ok(false)) fall through to the legacy path.
+                match crate::kernel::syscall::produce_blocked_waiter_plain_delivery(
+                    self,
+                    waiter_tid.0,
+                    endpoint_idx,
+                    &msg,
+                ) {
+                    Ok(true) => {
+                        crate::yarm_log!(
+                            "IPC_REPLY_DELIVER_TO_WAITER_CONSUMED tid={} endpoint={}",
+                            waiter_tid.0,
+                            endpoint_idx
+                        );
+                        self.note_ipc_reply_split_delivery();
+                        // Slot-clear + wake happen in Phase C (the executor), not
+                        // here — preserving the legacy order copy → clear → wake.
+                        return Ok(());
+                    }
+                    Ok(false) => { /* not plain / no drainer — use the legacy path */ }
+                    Err(e) => {
+                        crate::yarm_log!(
+                            "IPC_RECV_BLOCKED_COMPLETE_FAILED tid={} err={:?}",
+                            waiter_tid.0,
+                            e
+                        );
+                        return Err(KernelError::UserMemoryFault);
+                    }
+                }
+                // Phase 3: complete delivery outside all locks (legacy path for
+                // cap / reply-cap replies, or when no trap-entry drainer is active).
                 match complete_blocked_recv_for_waiter(self, waiter_tid.0, &msg) {
                     Ok(()) => {
                         crate::yarm_log!(

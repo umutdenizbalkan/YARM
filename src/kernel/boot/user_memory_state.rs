@@ -319,6 +319,43 @@ impl KernelState {
         user && readable && (!need_write || writable)
     }
 
+    /// Stage 188B: validate that `[user_ptr, user_ptr+len)` is user-readable and
+    /// writable in `asid`, WITHOUT copying — a read-only page-table walk, one
+    /// probe per 4 KiB page boundary crossed. Returns the same
+    /// `UserMemoryFault` / `InvalidAsid` a subsequent `copy_to_user` would raise
+    /// for the same range (identical `validate_user_access_for_asid` checks).
+    ///
+    /// Used by the blocked-waiter plain-delivery producer to pre-validate the
+    /// waiter's buffers under the broad borrow so the deferred post-boundary copy
+    /// (Stage 186E seam) is infallible on the supported single-CPU config (nothing
+    /// runs between the producer and the trap-entry drain to change the mapping).
+    /// This performs NO user-memory copy and takes NO `ipc_state_lock`.
+    pub(crate) fn validate_user_range_writable_for_asid(
+        &self,
+        asid: Asid,
+        user_ptr: usize,
+        len: usize,
+    ) -> Result<(), KernelError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let page_size = crate::kernel::vm::PAGE_SIZE;
+        let mut probe = user_ptr;
+        let end = user_ptr
+            .checked_add(len)
+            .ok_or(KernelError::UserMemoryFault)?;
+        while probe < end {
+            self.validate_user_access_for_asid(asid, probe, true)?;
+            // Advance to the next page boundary (or the end).
+            let next_page = (probe & !(page_size - 1)).checked_add(page_size);
+            probe = match next_page {
+                Some(p) => p,
+                None => return Err(KernelError::UserMemoryFault),
+            };
+        }
+        Ok(())
+    }
+
     pub fn copy_to_current_user(
         &mut self,
         user_ptr: usize,

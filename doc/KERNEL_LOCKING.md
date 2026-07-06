@@ -285,6 +285,28 @@ and does not solve `reply_cap_ipc_rank_inversion`. Enables future blocked-waiter
 splitting and later `ipc_reply` conversion. Guarded by
 `stage188a_dispatch_return_delivery_channel`.
 
+### 0.13) Stage 188B (BLOCKED-WAITER-PLAIN-DELIVERY-LIVE) — first live producer, plain path only
+
+Wires the first live producer to the 188A channel, flipping it from `mode=helper_only` to
+`mode=live`. The producer is the `ipc_reply` recv-v2-blocked branch, **plain messages only** (no
+transferred cap, no reply cap). Under the broad borrow it runs Phase A —
+`produce_blocked_waiter_plain_delivery` consumes the waiter's `blocked_recv_state`, encodes the
+40-byte recv-v2 meta (`cap_id = NO_TRANSFER_CAP`), and **pre-validates** both user buffers
+writable with *no copy* — then stashes a by-value `BlockedWaiterPlainDelivery` and defers the
+copy + endpoint slot-clear + wake to the executor. The executor runs after the borrow drops: two
+`copy_to_user_split` (186E seam) writes, then a brief `with_cpu` Phase C that clears the return
+regs, clears the receiver-waiter slot (`ipc_clear_plain_receiver_waiter_only`), and applies the
+single wake — emitting `DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain result=ok` and
+preserving `IPC_RECV_V2_META_BLOCKED_WAITER_OK`. The producer only stashes when a trap-entry
+drainer is active (`GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu]`), so no orphaned stash; any non-plain
+message or drainerless caller returns `Ok(false)` and takes the unchanged legacy path; a
+non-writable buffer returns `UserMemoryFault` **synchronously** (no stash, no wake), matching
+legacy. Phase-A pre-validation keeps the deferred copy infallible on the supported single-CPU
+config, preserving failure semantics and wake-once ordering. **cap-transfer blocked-waiter
+delivery remains deferred** (`reply_cap_ipc_rank_inversion` still blocks reply-cap
+materialization); does not enable AP user-task scheduling, does not fully retire the global lock.
+Guarded by `stage188b_blocked_waiter_plain_delivery_live`.
+
 ## 1) Current global lock boundary (`SharedKernel`)
 
 `src/runtime.rs` wraps `KernelState` in a single `SpinLock<KernelState>`:

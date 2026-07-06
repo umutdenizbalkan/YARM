@@ -48887,22 +48887,33 @@ mod stage188a_dispatch_return_delivery_channel {
         );
     }
 
-    // Infrastructure only: NO production handler stashes work (the channel is
-    // inert). The stash `.store` is exercised only by tests.
+    // Stage 188B update: the ONLY producer that stashes dispatch-return work is
+    // the gated plain blocked-waiter delivery producer in syscall.rs
+    // (`produce_blocked_waiter_plain_delivery`). The other IPC handler files must
+    // NOT stash directly (they call the producer or use the legacy path).
     #[test]
     fn stage188a_no_live_producer_stashes_work() {
         for (name, src) in [
-            ("syscall.rs", include_str!("../syscall.rs")),
             ("syscall/ipc.rs", include_str!("../syscall/ipc.rs")),
             ("ipc_state.rs", include_str!("ipc_state.rs")),
             ("fault_state.rs", include_str!("fault_state.rs")),
         ] {
             assert!(
                 !src.contains("DISPATCH_POST_WORK_STASH"),
-                "`{name}` must NOT stash dispatch-return work — Stage 188A is infrastructure \
-                 only (no live producer); the channel stays inert"
+                "`{name}` must NOT stash dispatch-return work directly — the only producer is \
+                 the gated plain blocked-waiter producer in syscall.rs"
             );
         }
+        // The single producer in syscall.rs stashes only from the gated
+        // `produce_blocked_waiter_plain_delivery` (plain + trap-drainer-active).
+        let syscall_src = include_str!("../syscall.rs");
+        let store_count = syscall_src
+            .matches("DISPATCH_POST_WORK_STASH[cpu_idx]")
+            .count();
+        assert!(
+            store_count >= 1 && syscall_src.contains("fn produce_blocked_waiter_plain_delivery("),
+            "syscall.rs must contain exactly the gated plain blocked-waiter producer"
+        );
     }
 
     // No fallback knobs / emergency opt-out / FAIL markers in the new code.
@@ -48984,6 +48995,7 @@ mod stage188a_dispatch_return_delivery_channel {
             payload,
             meta_user_ptr: 0x4400,
             meta,
+            endpoint_idx: 0,
             wake_tid: None,
         };
         // Stash the work as a producing handler would (under the broad borrow),
@@ -49038,6 +49050,291 @@ mod stage188a_dispatch_return_delivery_channel {
             assert!(
                 UNLOCK_DOC.contains(required),
                 "docs must state 188A `{required}`"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// Stage 188B (BLOCKED-WAITER-PLAIN-DELIVERY-LIVE) — first live producer on the
+// dispatch-return channel: plain (no-cap, no-reply-cap) blocked recv-v2 reply
+// delivery. ipc_reply, for a plain reply to a blocked recv-v2 caller, produces
+// DispatchPostWork::BlockedWaiterPlainDelivery under the broad borrow (Phase A:
+// consume blocked state, pre-validate the waiter buffers, encode meta, stash)
+// instead of copying inline; the trap-entry drain runs the 186E copy + slot
+// clear + wake after the borrow drops.
+//
+// Functional tests drive the producer directly (with the trap-drainer flag set)
+// then the executor: plain -> stashed + delivered via seam + woken; cap/reply
+// -> Ok(false) (legacy); no drainer -> Ok(false); unmapped buffer -> synchronous
+// Err (no stash). Source guards pin: producer calls no seam under the broad
+// borrow; snapshot by-value; executor slot-clear+wake in Phase C.
+// ===========================================================================
+#[cfg(test)]
+mod stage188b_blocked_waiter_plain_delivery_live {
+    use super::*;
+    use crate::runtime::SharedKernel;
+
+    const SYSCALL_SRC: &str = include_str!("../syscall.rs");
+    const CPU0: CpuId = CpuId(0);
+
+    fn plain_msg() -> Message {
+        Message::new(0x42, b"reply-body").expect("plain msg")
+    }
+
+    // Register task 1 as a blocked recv-v2 waiter with a mapped RW buffer page at
+    // 0x4000 (payload @0x4000, meta @0x4400). Returns (state, recv_cap, endpoint_idx).
+    fn blocked_waiter_state() -> (KernelState, CapId, usize) {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid, _m) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(1, asid).expect("bind");
+        let (_bid, buf_cap) = state.alloc_anonymous_memory_object().expect("buf");
+        let buf_cap_t1 = state
+            .grant_capability_task_to_task(0, buf_cap, 1)
+            .expect("grant buf");
+        // Switch to task 1 to map its page, then back is unnecessary — map into asid.
+        state.enqueue_current_cpu(1).expect("enqueue");
+        state.yield_current().expect("switch");
+        assert_eq!(state.current_tid(), Some(1));
+        state
+            .map_user_page_in_asid_with_caps(
+                asid,
+                buf_cap_t1,
+                VirtAddr(0x4000),
+                PageFlags {
+                    read: true,
+                    write: true,
+                    execute: false,
+                    user: true,
+                    cache_policy: crate::kernel::vm::CachePolicy::WriteBack,
+                },
+            )
+            .expect("map buffer");
+        let (eid, _s, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        // Mark task 1 blocked on recv-v2 with payload @0x4000 / meta @0x4400.
+        state.with_tcb_mut(1, |tcb| {
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap,
+                payload_user_ptr: 0x4000,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: 0x4400,
+                meta_user_len: 40,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            });
+        });
+        (state, recv_cap, eid)
+    }
+
+    fn set_trap_drainer(active: bool) {
+        crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[0]
+            .store(active, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Plain reply to a blocked recv-v2 waiter: the producer stashes work, and the
+    // drain delivers payload + meta via the 186E seam and wakes the waiter once.
+    #[test]
+    fn stage188b_plain_producer_stashes_and_executor_delivers() {
+        let (mut state, _rc, eid) = blocked_waiter_state();
+        set_trap_drainer(true);
+        // Drain any leftover stash from other tests on this CPU.
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+
+        let msg = plain_msg();
+        let produced =
+            crate::kernel::syscall::produce_blocked_waiter_plain_delivery(&mut state, 1, eid, &msg)
+                .expect("producer");
+        assert!(
+            produced,
+            "a plain reply to a blocked recv-v2 waiter must be produced"
+        );
+        // blocked_recv_state consumed by the producer (Phase A).
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_none(),
+            "producer must consume the waiter's blocked_recv_state"
+        );
+
+        let shared = SharedKernel::new(state);
+        assert!(
+            shared.drain_dispatch_post_work(CPU0).is_ok(),
+            "the drain must deliver the stashed plain blocked-waiter work"
+        );
+        // Payload landed in the waiter's user memory via the seam (opcode prefix
+        // NOT stripped for this msg: full body delivered).
+        let got = shared
+            .with(|k| k.copy_from_user(k.task_asid(1).expect("asid"), VirtAddr(0x4000), 10))
+            .expect("read payload");
+        assert_eq!(&got[..10], b"reply-body");
+        // Waiter woken exactly once (Runnable/Running, not Blocked).
+        assert!(
+            matches!(
+                shared.with(|k| k.task_status(1)),
+                Some(TaskStatus::Runnable | TaskStatus::Running)
+            ),
+            "the waiter must be woken exactly once"
+        );
+        // Stash consumed (no duplicate delivery / double wake).
+        set_trap_drainer(false);
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "the drain must consume the stashed work (no double delivery)"
+        );
+    }
+
+    // A cap-transfer reply is NOT produced (Ok(false)) — stays legacy.
+    #[test]
+    fn stage188b_cap_message_not_produced() {
+        let (mut state, _rc, eid) = blocked_waiter_state();
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        // A message flagged FLAG_CAP_TRANSFER with a transferred cap handle.
+        let msg = Message::with_header(0, 0x42, Message::FLAG_CAP_TRANSFER, Some(0x10001), b"x")
+            .expect("cap msg");
+        let produced =
+            crate::kernel::syscall::produce_blocked_waiter_plain_delivery(&mut state, 1, eid, &msg)
+                .expect("producer");
+        set_trap_drainer(false);
+        assert!(
+            !produced,
+            "a cap-transfer message must NOT be produced (legacy path); reply caps stay deferred"
+        );
+        // blocked_recv_state NOT consumed (producer bailed before consuming).
+        assert!(
+            state
+                .with_tcb_mut(1, |tcb| tcb.blocked_recv_state)
+                .flatten()
+                .is_some(),
+            "a non-plain message must not consume the waiter state in the producer"
+        );
+    }
+
+    // With no trap-entry drainer active, the producer does NOT stash (falls back
+    // to legacy) — no stash without a drainer.
+    #[test]
+    fn stage188b_no_drainer_no_produce() {
+        let (mut state, _rc, eid) = blocked_waiter_state();
+        set_trap_drainer(false);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = plain_msg();
+        let produced =
+            crate::kernel::syscall::produce_blocked_waiter_plain_delivery(&mut state, 1, eid, &msg)
+                .expect("producer");
+        assert!(
+            !produced,
+            "without a trap-entry drainer the producer must fall back (no orphaned stash)"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no work may be stashed without a drainer"
+        );
+    }
+
+    // An unmapped/non-writable waiter buffer is rejected synchronously in Phase A
+    // (real error, no stash) — failure stays synchronous, matching legacy.
+    #[test]
+    fn stage188b_unmapped_buffer_synchronous_error_no_stash() {
+        let mut state = Bootstrap::init().expect("init");
+        state.register_task(1).expect("task1");
+        let (asid, _m) = state.create_user_address_space().expect("asid");
+        state.bind_task_asid(1, asid).expect("bind");
+        let (eid, _s, recv_cap) = state.create_endpoint(4).expect("endpoint");
+        // Blocked recv-v2 with buffers pointing at an UNMAPPED VA.
+        state.with_tcb_mut(1, |tcb| {
+            tcb.blocked_recv_state = Some(crate::kernel::task::BlockedRecvState {
+                recv_cap,
+                payload_user_ptr: 0xDEAD_0000,
+                payload_user_len: crate::kernel::ipc::Message::MAX_PAYLOAD,
+                meta_user_ptr: 0xDEAD_1000,
+                meta_user_len: 40,
+                recv_abi: crate::kernel::task::RecvAbiVariant::RecvV2,
+            });
+        });
+        set_trap_drainer(true);
+        let _ = unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() };
+        let msg = plain_msg();
+        let r =
+            crate::kernel::syscall::produce_blocked_waiter_plain_delivery(&mut state, 1, eid, &msg);
+        set_trap_drainer(false);
+        assert!(
+            r.is_err(),
+            "an unmapped waiter buffer must be a real synchronous Phase-A error"
+        );
+        assert!(
+            unsafe { crate::kernel::boot::DISPATCH_POST_WORK_STASH[0].take() }.is_none(),
+            "no work may be stashed on a Phase-A validation failure"
+        );
+    }
+
+    // Guard: the producer performs NO user copy and NO seam call under the broad
+    // borrow — only consume/validate/encode/stash. The copy is deferred.
+    #[test]
+    fn stage188b_producer_no_seam_no_copy_under_borrow() {
+        let body = SYSCALL_SRC
+            .split("fn produce_blocked_waiter_plain_delivery(")
+            .nth(1)
+            .and_then(|r| r.split("\n// Stage 158").next())
+            .expect("producer body");
+        for forbidden in [
+            "copy_to_user_split",
+            "copy_to_user(",
+            "copy_to_current_user",
+            "materialize_received",
+            "_split_mut",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the producer must NOT copy or call a seam under the broad borrow (`{forbidden}`)"
+            );
+        }
+        assert!(
+            body.contains("validate_user_range_writable_for_asid")
+                && body.contains("DISPATCH_POST_WORK_STASH"),
+            "the producer must pre-validate (no copy) and stash the snapshot"
+        );
+    }
+
+    // Guard: the executor's Phase C does the slot-clear + wake (moved from the
+    // legacy ipc_reply Phase 4/5) and preserves the blocked-waiter meta marker.
+    #[test]
+    fn stage188b_executor_phase_c_clears_slot_and_wakes() {
+        const RUNTIME_SRC: &str = include_str!("../../runtime.rs");
+        let body = RUNTIME_SRC
+            .split("DispatchPostWork::BlockedWaiterPlainDelivery(snap) =>")
+            .nth(1)
+            .and_then(|r| r.split("\n            }").next())
+            .expect("executor arm");
+        assert!(
+            body.contains("ipc_clear_plain_receiver_waiter_only")
+                && body.contains("apply_scheduler_wake_plan"),
+            "executor Phase C must clear the endpoint waiter slot and wake"
+        );
+        assert!(
+            body.contains("IPC_RECV_V2_META_BLOCKED_WAITER_OK")
+                && body.contains("DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain result=ok"),
+            "executor must preserve the blocked-waiter meta marker and emit DONE"
+        );
+    }
+
+    // Docs record 188B honestly.
+    #[test]
+    fn stage188b_docs_do_not_overclaim() {
+        const UNLOCK_DOC: &str = include_str!("../../../doc/KERNEL_UNLOCKING.md");
+        assert!(
+            UNLOCK_DOC.contains("Stage 188B"),
+            "docs must document Stage 188B"
+        );
+        for required in [
+            "cap-transfer blocked-waiter delivery remains deferred",
+            "reply_cap_ipc_rank_inversion",
+            "does not enable AP user-task scheduling",
+            "does not fully retire the global lock",
+        ] {
+            assert!(
+                UNLOCK_DOC.contains(required),
+                "docs must state 188B `{required}`"
             );
         }
     }

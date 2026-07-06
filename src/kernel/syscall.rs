@@ -561,6 +561,143 @@ pub(crate) fn complete_blocked_recv_for_waiter(
     Ok(())
 }
 
+/// Stage 188B — Phase A producer for a PLAIN (no-cap, no-reply-cap) blocked
+/// recv-v2 waiter delivery, wired into the Stage 188A dispatch-return channel.
+///
+/// Instead of copying the payload+meta into the waiter's user buffers under the
+/// broad `&mut KernelState` borrow (as `complete_blocked_recv_for_waiter` does),
+/// this consumes the waiter's blocked state, resolves + **pre-validates** its
+/// user buffers (a read-only page-table walk — no copy), pre-encodes the recv-v2
+/// meta, and stashes a `DispatchPostWork::BlockedWaiterPlainDelivery` snapshot.
+/// The trap-entry drain then performs the user copy through the Stage 186E seam
+/// and clears the waiter slot + wakes it — all AFTER the broad borrow is dropped
+/// (`SharedKernel::execute_dispatch_post_work`).
+///
+/// Returns:
+/// - `Ok(true)`  — produced post-work; the caller must NOT clear the waiter slot
+///   or wake inline (the executor does both in Phase C). External behaviour is
+///   byte-identical to the legacy `complete_blocked_recv_for_waiter` + slot-clear
+///   + wake sequence for a plain message.
+/// - `Ok(false)` — NOT eligible (message carries a cap / reply-cap, or no
+///   trap-entry drainer is active); the caller MUST use the legacy path.
+/// - `Err(e)`    — a real Phase-A error (undersized buffer, unmapped/non-writable
+///   waiter buffer) the legacy path would also raise; caller maps it exactly as
+///   it maps a legacy delivery error.
+///
+/// Pre-validation makes the deferred copy infallible on the supported single-CPU
+/// user-scheduling config: nothing runs between here (inside `with_cpu`) and the
+/// drain (right after `with_cpu` returns) to change the waiter's mapping.
+pub(crate) fn produce_blocked_waiter_plain_delivery(
+    kernel: &mut KernelState,
+    waiter_tid: u64,
+    endpoint_idx: usize,
+    msg: &Message,
+) -> Result<bool, SyscallError> {
+    use crate::kernel::dispatch_post_work::{
+        BlockedWaiterPlainDeliverySnapshot, DISPATCH_POST_WORK_META_LEN, DispatchPostWork,
+    };
+    // Plain only: any cap / reply-cap message stays on the legacy path.
+    let plain = (msg.flags
+        & (Message::FLAG_CAP_TRANSFER
+            | Message::FLAG_CAP_TRANSFER_PLAIN
+            | Message::FLAG_REPLY_CAP))
+        == 0
+        && msg.transferred_cap().is_none();
+    if !plain {
+        return Ok(false);
+    }
+    // Only produce when a trap-entry drainer will run (mirrors the Stage 117
+    // stash discipline). Direct/kernel-internal callers (no drainer) fall back.
+    let cpu_idx = kernel.current_cpu().0 as usize;
+    if cpu_idx >= crate::kernel::scheduler::MAX_CPUS
+        || !crate::kernel::boot::GLOBAL_LOCK_DROP_TRAP_PATH_ACTIVE[cpu_idx]
+            .load(core::sync::atomic::Ordering::Relaxed)
+    {
+        return Ok(false);
+    }
+
+    // Phase A — consume blocked state (byte-identical to the legacy top-of-helper).
+    let blocked_state = kernel
+        .with_tcb_mut(waiter_tid, |tcb| tcb.blocked_recv_state.take())
+        .flatten()
+        .ok_or(SyscallError::InvalidArgs)?;
+    let waiter_asid = kernel
+        .task_asid(waiter_tid)
+        .ok_or(SyscallError::InvalidArgs)?;
+
+    let payload = msg.as_slice();
+    let (app_opcode, app_payload) = if should_strip_inline_opcode_prefix(msg) && payload.len() >= 2
+    {
+        (u16::from_le_bytes([payload[0], payload[1]]), &payload[2..])
+    } else {
+        (msg.opcode, payload)
+    };
+    if blocked_state.payload_user_len < app_payload.len() {
+        return Err(SyscallError::InvalidArgs);
+    }
+    if blocked_state.meta_user_len < IPC_RECV_META_V2_ENCODED_LEN {
+        return Err(SyscallError::InvalidArgs);
+    }
+
+    // Plain path: no transferred cap materialized (cap_id = NO_TRANSFER_CAP,
+    // recv_meta_flags = 0), byte-identical to the plain branch of the legacy
+    // helper's meta encoding (status=0, msg-flags word=0).
+    let meta = self::ipc_recv_core::encode_recv_v2_meta(
+        0,
+        app_opcode,
+        0,
+        app_payload.len() as u32,
+        SYSCALL_NO_TRANSFER_CAP,
+        0,
+        msg.sender_tid.0,
+    );
+
+    // Pre-validate BOTH user buffers writable (no copy) so the deferred copy is
+    // infallible. A validation failure is the same real error the legacy copy
+    // would raise, returned synchronously here (blocked state already consumed —
+    // matching the legacy helper, which consumes then faults).
+    kernel
+        .validate_user_range_writable_for_asid(
+            waiter_asid,
+            blocked_state.payload_user_ptr,
+            app_payload.len(),
+        )
+        .map_err(SyscallError::from)?;
+    kernel
+        .validate_user_range_writable_for_asid(
+            waiter_asid,
+            blocked_state.meta_user_ptr,
+            DISPATCH_POST_WORK_META_LEN,
+        )
+        .map_err(SyscallError::from)?;
+
+    let mut payload_buf = [0u8; Message::MAX_PAYLOAD];
+    payload_buf[..app_payload.len()].copy_from_slice(app_payload);
+
+    let snapshot = BlockedWaiterPlainDeliverySnapshot {
+        waiter_tid,
+        waiter_asid,
+        payload_user_ptr: blocked_state.payload_user_ptr,
+        payload_len: app_payload.len(),
+        payload: payload_buf,
+        meta_user_ptr: blocked_state.meta_user_ptr,
+        meta,
+        endpoint_idx,
+        wake_tid: Some(crate::kernel::ipc::ThreadId(waiter_tid)),
+    };
+    // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
+    // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` store.
+    unsafe {
+        crate::kernel::boot::DISPATCH_POST_WORK_STASH[cpu_idx]
+            .store(DispatchPostWork::BlockedWaiterPlainDelivery(snapshot));
+    }
+    crate::yarm_log!(
+        "DISPATCH_POST_WORK_SNAPSHOT_OK kind=blocked_waiter_plain waiter_tid={}",
+        waiter_tid
+    );
+    Ok(true)
+}
+
 // Stage 158: the cap-materialization cluster (router + two canonical helpers)
 // re-homed into `ipc_recv_core.rs`. Re-export the two entry points so every
 // existing call site here and every sibling `super::` import keeps resolving.

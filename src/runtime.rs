@@ -1399,11 +1399,13 @@ impl SharedKernel {
         if cpu_idx >= crate::kernel::scheduler::MAX_CPUS {
             return Ok(());
         }
-        // One-shot readiness marker (honest boot-log evidence; additive).
+        // One-shot readiness marker (honest boot-log evidence; additive). Stage
+        // 188B wires a live producer (plain blocked-waiter reply delivery), so the
+        // channel is now `mode=live`.
         if !crate::kernel::boot::DISPATCH_RETURN_CHANNEL_READY_LOGGED
             .swap(true, core::sync::atomic::Ordering::Relaxed)
         {
-            crate::yarm_log!("DISPATCH_RETURN_CHANNEL_READY mode=helper_only");
+            crate::yarm_log!("DISPATCH_RETURN_CHANNEL_READY mode=live");
         }
         // SAFETY: local-CPU trap path, interrupts disabled, no concurrent access —
         // identical discipline to the Stage 117 `DISPATCH_SWITCH_PLAN_STASH` drain.
@@ -1457,18 +1459,33 @@ impl SharedKernel {
                         crate::kernel::syscall::SyscallError::InvalidArgs,
                     ));
                 }
-                crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_SEAM_OK kind=blocked_waiter_plain");
+                crate::yarm_log!("DISPATCH_POST_WORK_USER_COPY_OK kind=blocked_waiter_plain");
                 crate::yarm_log!("DISPATCH_POST_WORK_EXECUTE_OK kind=blocked_waiter_plain");
-                // Phase C — clear the waiter's return regs + wake exactly once,
-                // via a brief global re-entry (no seam inside the closure).
+                // Phase C — completion, via a brief global re-entry (no seam
+                // inside the closure), preserving the legacy order copy → clear
+                // GPRs → clear endpoint waiter slot → wake exactly once:
+                //   1. clear the waiter's return regs (legacy
+                //      complete_blocked_recv_for_waiter completion),
+                //   2. clear the endpoint receiver-waiter slot (legacy Phase 4
+                //      ipc_clear_plain_receiver_waiter_only),
+                //   3. wake the waiter exactly once (legacy Phase 5).
                 let _ = self.with_cpu(cpu, |kernel| {
                     kernel.clear_blocked_recv_return_regs(snap.waiter_tid);
                     if let Some(wake_tid) = snap.wake_tid {
+                        kernel.ipc_clear_plain_receiver_waiter_only(snap.endpoint_idx, wake_tid);
                         let _ = kernel.apply_scheduler_wake_plan(
                             crate::kernel::boot::SchedulerWakePlan::Wake(wake_tid),
                         );
                     }
                 });
+                crate::yarm_log!("DISPATCH_POST_WORK_WAKE_OK kind=blocked_waiter_plain");
+                // Stage 156 IPC oracle: blocked-waiter recv-v2 meta (40 bytes)
+                // delivered (relocated here with the writeback in Stage 188B —
+                // same live path, same meaning as the legacy helper's marker).
+                crate::yarm_log!(
+                    "IPC_RECV_V2_META_BLOCKED_WAITER_OK tid={} len=40",
+                    snap.waiter_tid
+                );
                 crate::yarm_log!("DISPATCH_POST_WORK_DONE kind=blocked_waiter_plain result=ok");
                 Ok(())
             }

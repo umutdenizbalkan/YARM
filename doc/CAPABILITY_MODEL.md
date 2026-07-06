@@ -275,6 +275,17 @@ mechanism a future stage uses to split blocked-waiter delivery (including
 cap-transfer via the 186D2/186D3 seams). Guarded by
 `stage188a_dispatch_return_delivery_channel`.
 
+**Plain blocked-waiter delivery goes live (Stage 188B).** The first live producer —
+`ipc_reply`'s recv-v2-blocked branch, **plain messages only** — now produces the
+`BlockedWaiterPlainDelivery` variant instead of copying under the broad borrow. Because the
+delivery is plain, the snapshot still carries **no `CapId`** and transfers no authority; the
+recv-v2 meta is encoded with `cap_id = NO_TRANSFER_CAP`. **cap-transfer blocked-waiter delivery
+remains deferred** — any message with a transferred cap or reply cap returns `Ok(false)` and
+stays on the legacy path, because reply-cap materialization is still blocked by
+`reply_cap_ipc_rank_inversion`. The executor delivers via the 186E seam and touches no
+`ipc_state_lock`; a non-writable buffer faults synchronously (`UserMemoryFault`) with no stash.
+Guarded by `stage188b_blocked_waiter_plain_delivery_live`.
+
 ### What may NOT happen under each lock
 
 #### Under `ipc_state_lock` (rank 3)

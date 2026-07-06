@@ -107,6 +107,9 @@ pub(crate) struct BlockedWaiterPlainDeliverySnapshot {
     pub(crate) meta_user_ptr: usize,
     /// Pre-encoded 40-byte recv-v2 meta, by value.
     pub(crate) meta: [u8; DISPATCH_POST_WORK_META_LEN],
+    /// Endpoint index whose receiver-waiter slot the executor clears in Phase C
+    /// (the legacy `ipc_clear_plain_receiver_waiter_only` step).
+    pub(crate) endpoint_idx: usize,
     /// Optional task to wake exactly once after delivery completes.
     pub(crate) wake_tid: Option<ThreadId>,
 }
