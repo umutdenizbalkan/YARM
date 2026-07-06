@@ -57486,6 +57486,7 @@ mod stage183_ap_idle_admit {
     const ORCH_SRC: &str = include_str!("orchestrator_state.rs");
     const SMP_SRC: &str = include_str!("../../arch/x86_64/smp.rs");
     const TRAMP_SRC: &str = include_str!("../../arch/x86_64/smp_trampoline.rs");
+    const TLB_SRC: &str = include_str!("../../arch/x86_64/tlb_shootdown.rs");
     const SMOKE_SRC: &str = include_str!("../../../scripts/qemu-x86_64-core-smoke.sh");
     const SYSCALL_SRC: &str = include_str!("../syscall.rs");
 
@@ -58264,17 +58265,35 @@ mod stage183_ap_idle_admit {
                 "AP TLB-mailbox service step must exist: {a}"
             );
         }
-        // The BSP driver sends + waits for a REAL ack, timing out (not hanging) on failure.
+        // The BSP driver sends + waits for a REAL ack, timing out (not hanging) on
+        // failure. Stage 189A: the standard marker vocabulary is owned by the
+        // `tlb_shootdown` coordinator; the driver emits it via the MARK_* constants
+        // and keeps the legacy smoke markers additively.
         assert!(
             SMP_SRC.contains("fn smp_tlb_shootdown_cpus(")
-                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_SEND")
-                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_ACK")
+                && SMP_SRC.contains("tlb_shootdown::MARK_SEND")
+                && SMP_SRC.contains("tlb_shootdown::MARK_ACK")
+                && SMP_SRC.contains("tlb_shootdown::MARK_HANDLE")
                 && SMP_SRC.contains("X86_TLB_REMOTE_ACK_TIMEOUT")
                 && SMP_SRC.contains("fn ap_tlb_shootdown_proof(")
                 && SMP_SRC.contains("COW_SMP_TLB_ACK_OK")
                 && SMP_SRC.contains("VM_UNMAP_SMP_TLB_ACK_OK")
-                && SMP_SRC.contains("X86_TLB_SHOOTDOWN_DONE"),
+                && SMP_SRC.contains("tlb_shootdown::MARK_DONE"),
             "the BSP TLB shootdown driver + COW/UNMAP proof must exist"
+        );
+        // Stage 189A: the coordinator defines the full standard marker vocabulary
+        // and the anti-fake-ACK generation model.
+        assert!(
+            TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_IPI_READY\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_SEND\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_HANDLE\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_ACK\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_DONE\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_DEFERRED\"")
+                && TLB_SRC.contains("\"X86_TLB_SHOOTDOWN_FAIL\"")
+                && TLB_SRC.contains("fn ipi_capable_targets(")
+                && TLB_SRC.contains("fn observe_target_ack("),
+            "tlb_shootdown coordinator must own the standard marker vocabulary + ack model"
         );
         // dispatching_cpu_count excludes wake-only; the seams use it.
         assert!(
@@ -58307,6 +58326,61 @@ mod stage183_ap_idle_admit {
             SMP_SRC.contains("fn online_wake_only_ap_bitmap(")
                 && include_str!("../scheduler.rs").contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
             "AP task placement must stay gated (wake-only)"
+        );
+    }
+
+    // Stage 189A: the real TLB-shootdown ACK infra must never let the initiator
+    // fabricate a remote ACK. The AP asm (`gs:[132]`) is the sole writer of
+    // `tlb_ack_gen`; the BSP driver only ever READS it. This is a source guard
+    // against a future "self-ack" regression.
+    #[test]
+    fn stage189a_bsp_never_writes_ap_tlb_ack() {
+        // The ONLY ack_gen writer is the AP's own asm store.
+        assert!(
+            TRAMP_SRC.contains("mov dword ptr gs:[132], r10d"),
+            "the AP asm must publish its own ack (gs:[132] = req_gen)"
+        );
+        // The BSP driver must observe the AP-owned ack via the READ accessor only,
+        // and must contain no store to the mailbox ack slot (`gs:[132]`).
+        assert!(
+            SMP_SRC.contains("super::percpu::tlb_ack_gen(cpu)") && !SMP_SRC.contains("gs:[132],"),
+            "the BSP driver must only READ the AP-owned ack (no fake/self-ack)"
+        );
+        // The percpu BSP-side request helper writes only req_va/req_gen, never ack.
+        const PERCPU_SRC: &str = include_str!("../../arch/x86_64/percpu.rs");
+        assert!(
+            PERCPU_SRC.contains("fn tlb_request_shootdown(")
+                && !PERCPU_SRC.contains("fn tlb_ack_shootdown(")
+                && !PERCPU_SRC
+                    .contains("write_volatile(core::ptr::addr_of_mut!((*base).tlb_ack_gen)"),
+            "no BSP-side helper may write an AP's tlb_ack_gen"
+        );
+        // The coordinator's only ack writer is the target-modeling method, and it
+        // exposes no initiator-side ack writer.
+        assert!(
+            TLB_SRC.contains("fn observe_target_ack(")
+                && !TLB_SRC.contains("fn initiator_ack(")
+                && !TLB_SRC.contains("fn force_ack("),
+            "the coordinator must expose no initiator-side ack writer"
+        );
+    }
+
+    // Stage 189A: AP scheduling remains disabled — no wake-only bit is cleared for
+    // scheduling, and the shootdown coordinator never enables AP dispatch.
+    #[test]
+    fn stage189a_no_ap_user_dispatch_enabled() {
+        // The shootdown coordinator must not touch the wake-only bit or schedule.
+        assert!(
+            !TLB_SRC.contains("set_cpu_wake_only")
+                && !TLB_SRC.contains("mark_cpu_wake_only")
+                && !TLB_SRC.contains("enqueue")
+                && !TLB_SRC.contains("dispatch_next"),
+            "the TLB shootdown coordinator must not enable AP dispatch or clear wake-only"
+        );
+        // Placement on wake-only CPUs stays denied.
+        assert!(
+            include_str!("../scheduler.rs").contains("SCHED_ENQUEUE_DENIED_WAKE_ONLY"),
+            "wake-only placement denial must remain"
         );
     }
 

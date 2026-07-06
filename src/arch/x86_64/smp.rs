@@ -1611,28 +1611,60 @@ pub fn ap_scheduler_online_admission(kernel: &mut KernelState) {
     }
 }
 
-/// Stage 183.6: drive a REAL cross-CPU TLB shootdown against `targets` and wait
-/// for each AP's ACK. For each target CPU: post the request into its per-CPU
+/// Stage 189A: emitted once, the first time the real shootdown IPI path is driven,
+/// to attest the vector/mailbox path is live. Idempotent via this flag.
+#[cfg(all(not(test), not(feature = "hosted-dev")))]
+static TLB_SHOOTDOWN_IPI_READY: AtomicBool = AtomicBool::new(false);
+
+/// Stage 183.6 / 189A: drive a REAL cross-CPU TLB shootdown against `targets` and
+/// wait for each AP's ACK. For each target CPU: post the request into its per-CPU
 /// record (VA; 0 = full flush), send the wake IPI (vector 0xF1 — the same IPI its
 /// managed sched-idle loop already services), and wait (bounded) for
 /// `tlb_ack_gen == req_gen`. The AP executes the invalidation locally and ACKs —
-/// a genuine remote acknowledgement, not a simulated one. Returns the number of
-/// APs that acknowledged; emits `X86_TLB_REMOTE_ACK_TIMEOUT` for any that did not.
+/// a genuine remote acknowledgement, not a simulated one: the BSP here only ever
+/// *reads* `tlb_ack_gen`; the sole writer of that field is the AP's own asm
+/// (`gs:[132]`). Returns the number of APs that acknowledged; emits the standard
+/// `X86_TLB_SHOOTDOWN_FAIL` (and the legacy `X86_TLB_REMOTE_ACK_TIMEOUT`) for any
+/// that did not.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
     use super::descriptor_tables::AP_REMOTE_WAKE_VECTOR;
+    use super::tlb_shootdown;
+    if !TLB_SHOOTDOWN_IPI_READY.swap(true, Ordering::AcqRel) {
+        crate::yarm_log!(
+            "{} vector=0x{:x}",
+            tlb_shootdown::MARK_IPI_READY,
+            AP_REMOTE_WAKE_VECTOR
+        );
+    }
+    // Honest no-op: an empty target mask means there is nothing to shoot down
+    // remotely (BSP-local topology). Surface it, do not silently "succeed".
+    if targets == 0 {
+        crate::yarm_log!("{} reason=no_remote_target", tlb_shootdown::MARK_DEFERRED);
+        return 0;
+    }
     let mut acked = 0usize;
     for raw in 0..crate::arch::platform_constants::MAX_CPUS {
         if targets & (1u64 << raw) == 0 {
             continue;
         }
         let cpu = CpuId(raw as u8);
-        crate::yarm_log!("X86_TLB_SHOOTDOWN_SEND cpu={} va=0x{:x}", cpu.0, va);
+        // Post the request FIRST (writes req_va then bumps req_gen), then IPI. The
+        // returned `want` is the generation the target must publish into its own
+        // ack_gen; the BSP never writes ack_gen.
         let want = super::percpu::tlb_request_shootdown(cpu, va);
+        crate::yarm_log!(
+            "{} target_cpu={} gen={} va=0x{:x}",
+            tlb_shootdown::MARK_SEND,
+            cpu.0,
+            want,
+            va
+        );
         wait_for_icr_idle(cpu.0, "before_tlb_shootdown");
         write_icr(cpu.0, AP_REMOTE_WAKE_VECTOR as u32);
         let mut got = false;
         for _ in 0..AP_READY_POLL_ITERS {
+            // Read-only observation of the AP-owned ack generation.
             if super::percpu::tlb_ack_gen(cpu) == want {
                 got = true;
                 break;
@@ -1640,14 +1672,26 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
             cpu_relax();
         }
         if got {
-            crate::yarm_log!("X86_TLB_SHOOTDOWN_ACK cpu={} gen={}", cpu.0, want);
+            // The target published ack_gen == want, which it does only AFTER the
+            // local invalidation — so this observation attests both the handling
+            // and the acknowledgement.
+            crate::yarm_log!("{} cpu={} gen={}", tlb_shootdown::MARK_HANDLE, cpu.0, want);
+            crate::yarm_log!("{} cpu={} gen={}", tlb_shootdown::MARK_ACK, cpu.0, want);
             acked += 1;
         } else {
+            let got_gen = super::percpu::tlb_ack_gen(cpu);
+            crate::yarm_log!(
+                "{} reason=ack_timeout cpu={} want_gen={} got_gen={}",
+                tlb_shootdown::MARK_FAIL,
+                cpu.0,
+                want,
+                got_gen
+            );
             crate::yarm_log!(
                 "X86_TLB_REMOTE_ACK_TIMEOUT cpu={} want_gen={} got_gen={}",
                 cpu.0,
                 want,
-                super::percpu::tlb_ack_gen(cpu)
+                got_gen
             );
         }
     }
@@ -1661,30 +1705,66 @@ pub fn smp_tlb_shootdown_cpus(targets: u64, va: u64) -> usize {
 /// AP's wake-only bit, that CPU joins the precise per-ASID target set instead.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn online_wake_only_ap_bitmap(kernel: &KernelState) -> u64 {
-    let bsp = 1u64 << crate::arch::platform_constants::BOOTSTRAP_CPU_ID;
-    kernel.online_cpu_bitmap() & kernel.wake_only_cpu_bitmap() & !bsp
+    // Single source of truth: the Stage 189A coordinator's IPI-capability filter.
+    super::tlb_shootdown::ipi_capable_targets(
+        kernel.online_cpu_bitmap(),
+        kernel.wake_only_cpu_bitmap(),
+        crate::arch::platform_constants::BOOTSTRAP_CPU_ID,
+    )
 }
 
-/// Stage 183.6 one-shot: prove the real SMP TLB shootdown ACK against every online
-/// AP, for both the COW and VM_UNMAP contexts. Returns `(cow_ok, unmap_ok)`.
+/// Stage 183.6 / 189A one-shot: prove the real SMP TLB shootdown ACK against every
+/// online AP, for both the COW and VM_UNMAP contexts. Returns `(cow_ok, unmap_ok)`.
+///
+/// Routes the target set through the Stage 189A coordinator so the live path uses
+/// exactly the classification that the hosted-dev tests pin. Emits the standard
+/// terminal markers (`result=ok` / `result=bsp_local`) additively alongside the
+/// legacy context markers the smoke gates require.
 #[cfg(all(not(test), not(feature = "hosted-dev")))]
 pub fn ap_tlb_shootdown_proof(kernel: &KernelState) -> (bool, bool) {
-    let targets = online_wake_only_ap_bitmap(kernel);
+    use super::tlb_shootdown::{self, ShootdownTargets};
+    let targets = match tlb_shootdown::classify(online_wake_only_ap_bitmap(kernel)) {
+        ShootdownTargets::BspLocal => {
+            // Honest: no valid remote target — the shootdown collapses to a local
+            // flush. Nothing remote to acknowledge, so the remote proof is not
+            // asserted (the caller emits its honest ack-unproven blocker).
+            crate::yarm_log!("{} result=bsp_local targets=0x0", tlb_shootdown::MARK_DONE);
+            return (false, false);
+        }
+        ShootdownTargets::Remote(mask) => mask,
+    };
     let want = targets.count_ones() as usize;
-    if want == 0 {
-        return (false, false);
-    }
     // COW context: a representative parent write-protect VA — full round-trip.
     let cow_ok = smp_tlb_shootdown_cpus(targets, 0x0000_1000) == want;
     if cow_ok {
-        crate::yarm_log!("X86_TLB_SHOOTDOWN_DONE context=cow targets={}", want);
+        crate::yarm_log!(
+            "{} result=ok context=cow targets=0x{:x}",
+            tlb_shootdown::MARK_DONE,
+            targets
+        );
         crate::yarm_log!("COW_SMP_TLB_ACK_OK acks={}", want);
+    } else {
+        crate::yarm_log!(
+            "{} reason=cow_ack_incomplete targets=0x{:x}",
+            tlb_shootdown::MARK_FAIL,
+            targets
+        );
     }
     // VM_UNMAP context: a full-flush shootdown (va=0) — full round-trip.
     let unmap_ok = smp_tlb_shootdown_cpus(targets, 0) == want;
     if unmap_ok {
-        crate::yarm_log!("X86_TLB_SHOOTDOWN_DONE context=vm_unmap targets={}", want);
+        crate::yarm_log!(
+            "{} result=ok context=vm_unmap targets=0x{:x}",
+            tlb_shootdown::MARK_DONE,
+            targets
+        );
         crate::yarm_log!("VM_UNMAP_SMP_TLB_ACK_OK acks={}", want);
+    } else {
+        crate::yarm_log!(
+            "{} reason=vm_unmap_ack_incomplete targets=0x{:x}",
+            tlb_shootdown::MARK_FAIL,
+            targets
+        );
     }
     (cow_ok, unmap_ok)
 }

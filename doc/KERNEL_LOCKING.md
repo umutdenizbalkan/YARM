@@ -51,6 +51,39 @@ remove implicit global-lock coupling from syscall/trap paths.
     carries no `&mut KernelState` and no single-dispatcher assumption, so it is
     already per-CPU-safe. Pinned by
     `stage188h_reap_faulted_task_excluded_from_split_dispatch`.
+- **Stage 189A (X86_64-REAL-TLB-SHOOTDOWN-ACK-INFRA) — infra only, AP dispatch
+  still OFF.** x86_64 now has a real cross-CPU TLB-shootdown IPI + **genuine**
+  remote ACK, so a future AP dispatcher has the shootdown primitive it needs.
+  This stage does **not** clear any wake-only bit, schedule any user task on an
+  AP, retire the global lock, or change the syscall ABI.
+  * **Coordinator (single source of truth):** `arch/x86_64/tlb_shootdown.rs` owns
+    the target-set policy (`ipi_capable_targets = online & wake_only & !bsp`),
+    the `BspLocal`/`Remote` classification, the generation/ack model
+    (`GenTracker`), and the standard marker vocabulary. It is pure and
+    hosted-dev-unit-tested; the bare-metal driver in `smp.rs` uses exactly this
+    logic.
+  * **Genuine ACK, no fakes.** For each target the BSP posts `tlb_req_va` then
+    bumps `tlb_req_gen` (`percpu::tlb_request_shootdown`) and sends vector `0xF1`.
+    The **target AP** services the mailbox in its managed sched-idle loop
+    (`smp_trampoline.rs`), executes `invlpg`/CR3-reload locally, then publishes
+    `tlb_ack_gen = req_gen` via `gs:[132]`. The BSP only ever **reads**
+    `tlb_ack_gen`; it is the sole non-AP-owned field it never writes. A missing
+    ack is a visible `X86_TLB_SHOOTDOWN_FAIL reason=ack_timeout`, never hidden.
+  * **Generation, not boolean.** Acks are matched by generation, so a stale ack
+    from an earlier shootdown cannot satisfy a newer request. Guarded by
+    `arch::x86_64::tlb_shootdown::tests::ack_uses_generation_not_boolean_stale_state`
+    and `initiator_cannot_fabricate_a_remote_ack`; source-guarded by
+    `stage189a_bsp_never_writes_ap_tlb_ack`.
+  * **Wake-only policy.** Online wake-only APs *do* participate in the ACK: they
+    idle on the kernel CR3, hold no user ASID (over-invalidation is always safe),
+    and can service the mailbox IPI — so the ACK is real, not a shortcut. The
+    per-ASID VM liveness filter (`live_cpu_bitmap_for_asid`) is unchanged and
+    still excludes wake-only APs; `ipi_capable_targets` is the IPI-capability
+    filter, distinct from that per-ASID set. Markers (real 2-/4-CPU SMP):
+    `X86_TLB_SHOOTDOWN_IPI_READY`, `..._SEND target_cpu=N gen=g`,
+    `..._HANDLE cpu=N gen=g`, `..._ACK cpu=N gen=g`,
+    `..._DONE result=ok targets=0x…`; and the honest `..._DONE result=bsp_local`
+    / `..._DEFERRED reason=no_remote_target` when no remote target exists.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

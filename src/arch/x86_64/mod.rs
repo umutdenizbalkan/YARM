@@ -12,6 +12,7 @@ pub mod platform_layout;
 pub mod smp;
 pub(crate) mod smp_trampoline;
 pub mod syscall_abi;
+pub mod tlb_shootdown;
 pub mod trap;
 pub mod vm_layout;
 
