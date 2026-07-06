@@ -18,6 +18,16 @@ remove implicit global-lock coupling from syscall/trap paths.
   safe per-CPU/per-thread debug-local slot is introduced.
 - Future work must remain narrow and independently validated; this document
   does **not** claim Stage 3/global-lock removal.
+- **Post-merge ABI baseline (SUP/PM crash-restart):** `SYSCALL_COUNT == 32`.
+  NR 31 = `ReapFaultedTask` (PM-only terminal-task reap after an accepted
+  restart replacement). It is **global-lock-only**: it is not on the
+  `classify_split_eligible` whitelist (`src/kernel/syscall_split.rs`, default-deny
+  `_ => None`), so it is never serviced by `try_split_dispatch` /
+  `try_split_dispatch_into_frame` and always runs on the unchanged
+  `with_cpu → handle_trap → syscall::dispatch` global-lock path. Its cleanup is
+  no-allocation and does not call the broad `mark_task_dead` helper. Per-stage
+  history entries below that record `SYSCALL_COUNT == 30/31` describe the state at
+  those earlier stages and are left as historical record.
 
 ## 0) Stage 185 (GLOBAL-LOCK-RETIRE) — status and honest finding
 

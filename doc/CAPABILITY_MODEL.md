@@ -518,6 +518,25 @@ relevant milestone (e.g. Phase 3A falls back to Phase 2B on `Unsupported`
 from `VFS_OP_FILE_GRANT_RO` — see `doc/PROJECT_HISTORY.md`). All other
 capability errors must propagate as hard failures.
 
+### 10.1 `ReapFaultedTask` authority model (SUP/PM crash-restart)
+
+`ReapFaultedTask` (syscall NR 31, `SYSCALL_COUNT == 32`) is a production,
+PM-only task-management ABI — **not** a capability-mediated operation. It
+accepts a raw `target_tid` because it is scoped to PM's task-management
+authority, which is gated by caller identity rather than by a cap:
+
+- **Caller must be PM bootstrap (`tid == 3`).** A non-PM caller returns
+  `MissingRight` (never silently succeeds).
+- **Self-target returns `InvalidArgs`** (PM may not reap itself).
+- **Only terminal targets are reaped.** A `Running`/`Runnable`/`Blocked`
+  (live) target returns `WrongObject` — a live target is never hidden as
+  success. `Faulted`/`Exited`/`Dead` targets are cleaned up and return `Ok`.
+  A missing target is treated as already-gone success.
+- It performs **no cap transfer, no reply-cap reuse/delegation, and no
+  normal IPC send/recv**; cleanup is no-allocation and does not call the
+  broad `mark_task_dead` helper. Restart-count / degraded policy stays in the
+  userspace supervisor / PM.
+
 ---
 
 ## 11. Capability transfer rules

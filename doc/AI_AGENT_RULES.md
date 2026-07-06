@@ -835,7 +835,8 @@ doc wins.
 
 - SpawnV5 ABI (16-byte reply, argument layout)
 - Image IDs 7–12 frozen
-- SYSCALL_COUNT = 31, STARTUP_SLOT_COUNT = 18
+- SYSCALL_COUNT = 32 (NR 31 = ReapFaultedTask, added by the SUP/PM crash-restart
+  merge; existing NRs 0–30 unchanged), STARTUP_SLOT_COUNT = 18
 - recv_shared_v3 ABI offsets
 - Optional-FS smoke markers (RAMFS/ext4 expected; FAT skipped)
 - No deadline-0 required replies in vfs_client.rs or IpcBlockDevice
@@ -955,9 +956,10 @@ The shared fatal-marker policy lives in `scripts/qemu-smoke-common.sh`
    x86_64 core smoke forces every lower-risk diagnostic knob off under those two
    proof modes; `SMP_READY` raises `QEMU_SMP` only for its own profile (normal smoke
    stays `-smp 1`); `CROSS_ARCH_D6` does not disturb x86_64 D6 paths.
-5. **Counts are frozen:** SYSCALL_COUNT=31, Syscall::VARIANT_COUNT=23, x86_64
-   MAX_ADDRESS_SPACES=32. Any stage that would change these must justify it
-   explicitly; the diagnostic/CI stages never do.
+5. **Counts are frozen:** SYSCALL_COUNT=32 (NR 31 = ReapFaultedTask; existing
+   NRs 0–30 unchanged), Syscall::VARIANT_COUNT=23, x86_64 MAX_ADDRESS_SPACES=32.
+   Any stage that would change these must justify it explicitly; the
+   diagnostic/CI stages never do.
 
 QEMU CI is **local/manual-first**: the runner is safe to invoke without QEMU via
 `list` and `--dry-run` (CI-safe); real QEMU jobs, if added, must be

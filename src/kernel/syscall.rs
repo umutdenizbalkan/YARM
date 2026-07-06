@@ -133,7 +133,7 @@ const PM_BOOTSTRAP_TID: u64 = 3;
 // off. The "preferred safe groups" (debug, initramfs, control/cap, process,
 // sched, vm) all landed in earlier stages. Stage 152 instead locks the full
 // boundary surface (module set, visibilities, dispatch ownership,
-// SYSCALL_COUNT==31 / VARIANT_COUNT==23, the pinned IPC/cap functions, low-risk
+// SYSCALL_COUNT==32 / VARIANT_COUNT==23, the pinned IPC/cap functions, low-risk
 // module hygiene, no stale nonexistent-`mm`-submodule reference) via boot::tests::
 // stage152_syscall_decomposition_completeness_audit so future agents cannot
 // silently undo the boundaries. See doc/KERNEL_UNLOCKING.md §5.1.
@@ -1902,7 +1902,9 @@ mod tests {
         assert_eq!(SYSCALL_CREATE_INITRAMFS_FILE_SLICE_MO_NR, 28);
         assert_eq!(SYSCALL_SPAWN_FROM_MEMORY_OBJECT_NR, 29);
         assert_eq!(SYSCALL_RECV_SHARED_V3_NR, 30);
-        assert_eq!(SYSCALL_COUNT, 31);
+        // SUP/PM crash-restart: NR 31 is ReapFaultedTask; existing numbers frozen.
+        assert_eq!(SYSCALL_REAP_FAULTED_TASK_NR, 31);
+        assert_eq!(SYSCALL_COUNT, 32);
         assert_eq!(IPC_REGISTER_WORDS, 2);
     }
 
@@ -4746,14 +4748,14 @@ mod tests {
     fn stage81b_syscall_count_remains_31() {
         let src = include_str!("syscall.rs");
         assert!(
-            src.contains("pub const SYSCALL_COUNT: usize = 31;"),
-            "SYSCALL_COUNT must remain 31 after Stage 81B path table extension"
+            src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            "SYSCALL_COUNT must remain 32 (post SUP/PM crash-restart baseline) after Stage 81B path table extension"
         );
-        // Build the bad-count string at runtime to avoid self-referential match.
-        let bad_count = ["SYSCALL_COUNT: usize = ", "32"].concat();
+        // Build the stale-count string at runtime to avoid self-referential match.
+        let stale_count = ["SYSCALL_COUNT: usize = ", "31"].concat();
         assert!(
-            !src.contains(&bad_count),
-            "SYSCALL_COUNT must not be incremented by Stage 81B"
+            !src.contains(&stale_count),
+            "SYSCALL_COUNT must not regress to the pre-ReapFaultedTask value of 31"
         );
     }
 
@@ -4975,8 +4977,8 @@ mod tests {
         // Stage 101 hard invariants reaffirmed by source scan.
         let src = include_str!("syscall.rs");
         assert!(
-            src.contains("pub const SYSCALL_COUNT: usize = 31;"),
-            "SYSCALL_COUNT must remain 31 in Stage 101"
+            src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            "SYSCALL_COUNT must remain 32 in Stage 101"
         );
         // NR 30 RecvSharedV3 dispatch arm.
         assert!(
@@ -5055,7 +5057,7 @@ mod tests {
                     .contains("self::process::handle_spawn_from_memory_object(kernel, frame)"),
             "syscall.rs must keep minimal process delegation shims"
         );
-        assert_eq!(SYSCALL_COUNT, 31, "D4 step 2 must not change syscall count");
+        assert_eq!(SYSCALL_COUNT, 32, "D4 step 2 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
             23,
@@ -5119,7 +5121,7 @@ mod tests {
                 && syscall_src.contains("Syscall::FutexWake => handle_futex_wake(kernel, frame)"),
             "scheduler syscall dispatch arms must route through the same syscall variants"
         );
-        assert_eq!(SYSCALL_COUNT, 31, "D4 step 3 must not change syscall count");
+        assert_eq!(SYSCALL_COUNT, 32, "D4 step 3 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
             23,
@@ -5188,7 +5190,7 @@ mod tests {
             ),
             "capability syscall dispatch arms must route through the same syscall variants"
         );
-        assert_eq!(SYSCALL_COUNT, 31, "D4 step 4 must not change syscall count");
+        assert_eq!(SYSCALL_COUNT, 32, "D4 step 4 must not change syscall count");
         assert_eq!(
             Syscall::VARIANT_COUNT,
             23,

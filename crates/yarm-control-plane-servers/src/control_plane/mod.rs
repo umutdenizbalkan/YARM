@@ -251,7 +251,7 @@ mod tests {
         let pm_src = include_str!("process_manager/service.rs");
         assert!(
             !pm_src.contains("SYSCALL_COUNT = 32"),
-            "SYSCALL_COUNT must remain 31; Stage 80 must not add syscalls"
+            "SYSCALL_COUNT must remain 32; Stage 80 must not add syscalls"
         );
     }
 
@@ -1187,8 +1187,8 @@ mod tests {
             "SUP-5 must not change the process IPC opcode count"
         );
         assert!(
-            syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;")
-                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;")
+                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"),
             "SUP-5 must not change syscall count"
         );
     }
@@ -1346,8 +1346,8 @@ mod tests {
             "SUP-6 must keep process IPC opcode count unchanged"
         );
         assert!(
-            syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;")
-                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"),
+            syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;")
+                && !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"),
             "SUP-6 must not change syscall count"
         );
     }
@@ -1992,7 +1992,7 @@ mod tests {
         if live_abi_src.matches("pub const PROC_OP_").count() != 16 {
             failures.push(PmRestartLiveReadinessFailure::ProcessOpcodeCountChanged);
         }
-        if !syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;") {
+        if !syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;") {
             failures.push(PmRestartLiveReadinessFailure::SyscallCountChanged);
         }
         if !pm_src.contains("PROC_OP_PM_RESTART_V1") {
@@ -3160,7 +3160,7 @@ mod tests {
             abi_src.contains("pub const PROC_OP_PM_RESTART_V1: u16 = 15")
                 && abi_src.contains("pub const PROC_OP_PM_RESTART_REPLY_V1: u16 = 16")
         );
-        assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 31;"));
+        assert!(syscall_src.contains("pub const SYSCALL_COUNT: usize = 32;"));
         assert!(
             pm_src.contains("PROC_OP_PM_RESTART_V1")
                 && supervisor_src.contains("PROC_OP_PM_RESTART_V1"),

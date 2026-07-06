@@ -926,8 +926,10 @@ fn copy_spawn_startup_args(
 /// a restart replacement. This is deliberately not a generic kill syscall:
 /// only PM (TID 3) may call it, the caller may not target itself, and only
 /// terminal Faulted/Exited/Dead tasks are accepted. Cleanup is delegated to the
-/// existing `mark_task_dead` path so VM/CNode/IPC/reply-cap/runtime-cap teardown
-/// uses the SUP-L7K-C no-allocation cleanup path for reap safety.
+/// dedicated `reap_faulted_task_noalloc_cleanup` path (SUP-L7K-C): it does NOT
+/// call the broad `mark_task_dead` helper and performs no allocation, marking
+/// the TCB Dead in place and revoking reply-caps / IPC waiters / kernel context /
+/// process CNode via the no-allocation reap variants.
 pub(super) fn handle_reap_faulted_task(
     kernel: &mut KernelState,
     frame: &mut TrapFrame,
